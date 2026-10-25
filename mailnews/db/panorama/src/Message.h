@@ -7,6 +7,7 @@
 
 #include "DatabaseCore.h"
 #include "nsIMsgHdr.h"
+#include "nsTArray.h"
 
 namespace mozilla::mailnews {
 
@@ -25,6 +26,8 @@ class Message : public nsIMsgDBHdr {
   virtual ~Message() {};
 
  private:
+  nsresult ReadReferences(nsTArray<nsCString>& references);
+
   nsMsgKey mKey;
 
   FolderDatabase& FolderDB() const {

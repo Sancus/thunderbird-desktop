@@ -4,6 +4,9 @@
 
 #include "Message.h"
 
+#include <cstring>
+#include <limits>
+
 #include "mozilla/Components.h"
 #include "mozilla/Try.h"
 #include "nsIMsgAccountManager.h"
@@ -274,16 +277,68 @@ NS_IMETHODIMP Message::SetRecipients(const nsACString& recipients) {
 }
 
 NS_IMETHODIMP Message::SetReferences(const nsACString& references) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  nsTArray<nsCString> parsed;
+  const auto& raw = PromiseFlatCString(references);
+  const char* cursor = raw.get();
+  while (*cursor) {
+    const char* start = std::strchr(cursor, '<');
+    const char* end = start ? std::strchr(start + 1, '>') : nullptr;
+    nsAutoCString token;
+    if (end) {
+      token.Assign(start + 1, end - start - 1);
+    } else if (cursor == raw.get()) {
+      // Legacy accepts one undelimited first value, preserving internal space.
+      const char* first = cursor + std::strspn(cursor, " \r\n\t");
+      if (*first == '<') {
+        ++first;
+      }
+      token.Assign(first);
+    }
+    if (!token.IsEmpty()) {
+      parsed.AppendElement(token);
+    }
+    if (!end) {
+      break;
+    }
+    cursor = end + 1;
+  }
+  return MessageDB().SetMessageReferences(mKey, parsed);
+}
+
+nsresult Message::ReadReferences(nsTArray<nsCString>& references) {
+  MOZ_TRY(MessageDB().GetMessageReferences(mKey, references));
+  nsAutoCString messageId;
+  MOZ_TRY(MessageDB().GetMessageMessageId(mKey, messageId));
+  references.RemoveElementsBy([&](const nsCString& ref) {
+    return ref.IsEmpty() || ref.Equals(messageId);
+  });
+  return NS_OK;
 }
 
 NS_IMETHODIMP Message::GetNumReferences(uint16_t* numReferences) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  if (numReferences) {
+    *numReferences = 0;
+  }
+  nsTArray<nsCString> references;
+  MOZ_TRY(ReadReferences(references));
+  if (numReferences) {
+    if (references.Length() > std::numeric_limits<uint16_t>::max()) {
+      return NS_ERROR_LOSS_OF_SIGNIFICANT_DATA;
+    }
+    *numReferences = static_cast<uint16_t>(references.Length());
+  }
+  return NS_OK;
 }
 
 NS_IMETHODIMP Message::GetStringReference(int32_t refNum,
                                           nsACString& reference) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  nsTArray<nsCString> references;
+  MOZ_TRY(ReadReferences(references));
+  if (refNum < 0 || static_cast<uint32_t>(refNum) >= references.Length()) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+  reference = references[refNum];
+  return NS_OK;
 }
 
 NS_IMETHODIMP Message::GetMime2DecodedAuthor(nsAString& mime2DecodedAuthor) {

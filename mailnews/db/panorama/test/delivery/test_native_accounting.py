@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 33)
+        self.assertEqual(len(catalog["cases"]), 52)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -143,6 +143,54 @@ class NativeAccountingTests(unittest.TestCase):
             for path in [declaration["source"], *declaration["source_dependencies"]]:
                 self.assertTrue((comm / path).is_file(), path)
                 self.assertIn(path, run_native.COMM_INPUTS)
+
+    def test_message_references_has_only_the_reviewed_filters_and_dependencies(self):
+        suite = "DISABLED_DeliveryMessageReferences"
+        expected = {
+            "CountSuccessAssignsOnlyUint16", "CountKnownEmptyAssignsZero",
+            "CountUnavailableLeavesZero", "CountMissingLeavesZero",
+            "CountReadStepErrorLeavesZero", "CountOverflowLeavesZero",
+            "IndexedUnavailablePreservesSentinel", "IndexedMissingPreservesSentinel",
+            "IndexedReadStepErrorPreservesSentinel", "IndexedNegativePreservesSentinel",
+            "IndexedPastEndPreservesSentinel", "NullCountKnownOversizedSucceeds",
+            "NullCountUnavailablePropagates", "NullCountMissingPropagates",
+            "NullCountReadStepErrorPropagates", "EmbeddedNulStopsDelimitedReferences",
+            "EmbeddedNulStopsBareReference", "SetReferencesInsertAbortPreservesCommittedTokens",
+            "SetReferencesDeferredCommitFailurePreservesCommittedTokens",
+        }
+        declaration = native.CATALOG["suites"].get(suite)
+        self.assertIsNotNone(declaration, "The accepted suite must be registered")
+        self.assertEqual(declaration["source"],
+                         "mailnews/db/panorama/test/gtest/TestDeliveryMessageReferences.cpp")
+        dependencies = set(declaration["source_dependencies"])
+        self.assertTrue({"mailnews/db/panorama/src/Message.cpp",
+                         "mailnews/db/panorama/src/Message.h",
+                         "mailnews/base/public/nsIMsgHdr.idl"} <= dependencies)
+        rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
+        self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
+        self.assertEqual(len(rows), 19)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 52)
+        for row in rows:
+            large = row["filter"].rsplit(".", 1)[-1] in {
+                "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
+            self.assertEqual(row.get("timeout_seconds"), 1800 if large else None)
+            self.selected = row["filter"]
+            for index in (1, 4):
+                self.events[index]["name"] = suite
+            for index in (2, 3):
+                self.events[index]["test"] = self.selected
+            self.assertTrue(self.check(self.events)["log_complete"])
+        wrong = copy.deepcopy(self.events)
+        wrong[1]["name"] = "DISABLED_DeliveryCoreReferences"
+        self.reject(wrong)
+        self.reject(self.events, timed_out=True)
+        self.reject(self.events, returncode=1)
+        wrong = copy.deepcopy(self.events)
+        wrong[3]["status"] = "SKIP"
+        self.reject(wrong)
+        comm = native.HERE.parents[4]
+        build = (comm / "mailnews/db/panorama/test/gtest/moz.build").read_text()
+        self.assertIn('"TestDeliveryMessageReferences.cpp"', build)
 
 
 if __name__ == "__main__":

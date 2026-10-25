@@ -169,6 +169,103 @@
       "id": "compatibility-native:FolderInfo:BooleanMaxInt64IsTrue",
       "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanMaxInt64IsTrue",
       "expected": "Stored INT64_MAX reads as true and preserves all canary bytes."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:CountSuccessAssignsOnlyUint16",
+      "filter": "DISABLED_DeliveryMessageReferences.CountSuccessAssignsOnlyUint16",
+      "expected": "NS_OK: Independent raw fixture has first, empty, self, missing, first; visible count is 3. 1234 output is assigned to 3; all three adjacent uint16 canaries remain 0xa5c3."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:CountKnownEmptyAssignsZero",
+      "filter": "DISABLED_DeliveryMessageReferences.CountKnownEmptyAssignsZero",
+      "expected": "NS_OK: Fresh real message has a known-empty References set. 1234 becomes zero without adjacent writes."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:CountUnavailableLeavesZero",
+      "filter": "DISABLED_DeliveryMessageReferences.CountUnavailableLeavesZero",
+      "expected": "NS_ERROR_NOT_AVAILABLE: Message exists but its historical known marker is absent. Non-null count becomes zero, adjacent canaries unchanged."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:CountMissingLeavesZero",
+      "filter": "DISABLED_DeliveryMessageReferences.CountMissingLeavesZero",
+      "expected": "NS_ERROR_UNEXPECTED: Publicly obtained header is retained after its row is removed. Non-null count becomes zero, adjacent canaries unchanged."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:CountReadStepErrorLeavesZero",
+      "filter": "DISABLED_DeliveryMessageReferences.CountReadStepErrorLeavesZero",
+      "expected": "NS_ERROR_FAILURE: Non-null count becomes zero, adjacent canaries unchanged. Failing SQLite function is called once with the real message key."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:CountOverflowLeavesZero",
+      "filter": "DISABLED_DeliveryMessageReferences.CountOverflowLeavesZero",
+      "expected": "NS_ERROR_LOSS_OF_SIGNIFICANT_DATA: 65536 visible literal tokens. 1234 becomes zero without adjacent writes; no wrap/clamp result accepted.",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "compatibility-native:MessageReferences:IndexedUnavailablePreservesSentinel",
+      "filter": "DISABLED_DeliveryMessageReferences.IndexedUnavailablePreservesSentinel",
+      "expected": "NS_ERROR_NOT_AVAILABLE: Existing message has no References known marker; indexed error leaves output untouched."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:IndexedMissingPreservesSentinel",
+      "filter": "DISABLED_DeliveryMessageReferences.IndexedMissingPreservesSentinel",
+      "expected": "NS_ERROR_UNEXPECTED: Retained header of removed row propagates missing-row error without changing output."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:IndexedReadStepErrorPreservesSentinel",
+      "filter": "DISABLED_DeliveryMessageReferences.IndexedReadStepErrorPreservesSentinel",
+      "expected": "NS_ERROR_FAILURE: Prepare succeeds before call, function witness is zero before stepping. One function call with the real key during indexed read; output remains distinct sentinel."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:IndexedNegativePreservesSentinel",
+      "filter": "DISABLED_DeliveryMessageReferences.IndexedNegativePreservesSentinel",
+      "expected": "NS_ERROR_ILLEGAL_VALUE: One known token, index -1; distinct output sentinel unchanged."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:IndexedPastEndPreservesSentinel",
+      "filter": "DISABLED_DeliveryMessageReferences.IndexedPastEndPreservesSentinel",
+      "expected": "NS_ERROR_ILLEGAL_VALUE: One known token, index 1; distinct output sentinel unchanged."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:NullCountKnownOversizedSucceeds",
+      "filter": "DISABLED_DeliveryMessageReferences.NullCountKnownOversizedSucceeds",
+      "expected": "NS_OK: 65536 visible tokens; null count output succeeds without narrowing. Index 65535 is still accessible and equals literal last@invalid.",
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "compatibility-native:MessageReferences:NullCountUnavailablePropagates",
+      "filter": "DISABLED_DeliveryMessageReferences.NullCountUnavailablePropagates",
+      "expected": "NS_ERROR_NOT_AVAILABLE: Null count output does not bypass the unavailable-history error."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:NullCountMissingPropagates",
+      "filter": "DISABLED_DeliveryMessageReferences.NullCountMissingPropagates",
+      "expected": "NS_ERROR_UNEXPECTED: Null count output does not bypass the missing-row error."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:NullCountReadStepErrorPropagates",
+      "filter": "DISABLED_DeliveryMessageReferences.NullCountReadStepErrorPropagates",
+      "expected": "NS_ERROR_FAILURE: Null count output does not bypass real SQLite execution error. Function witness called once with the real message key."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:EmbeddedNulStopsDelimitedReferences",
+      "filter": "DISABLED_DeliveryMessageReferences.EmbeddedNulStopsDelimitedReferences",
+      "expected": "NS_OK: Length-aware nsDependentCString includes the NUL and ignored suffix; exact input length asserted. Live SetReferences stops at first NUL, count 1, index 0 literal first@invalid, independent storage snapshot exactly one ordinal/token."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:EmbeddedNulStopsBareReference",
+      "filter": "DISABLED_DeliveryMessageReferences.EmbeddedNulStopsBareReference",
+      "expected": "NS_OK: Length-aware input includes leading whitespace, NUL and ignored suffix; exact length asserted. Legacy first-value fallback yields literal bare@invalid only; indexed read and independent storage snapshot match."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:SetReferencesInsertAbortPreservesCommittedTokens",
+      "filter": "DISABLED_DeliveryMessageReferences.SetReferencesInsertAbortPreservesCommittedTokens",
+      "expected": "NS_ERROR_STORAGE_CONSTRAINT: Initial committed literal sequence checked with another connection before fault. BEFORE INSERT trigger only at ordinal 1 witnesses actual execution and raises ABORT. Live SetReferences error propagates; witness count 1 and correct key; no transaction remains. Independent connection observes the original complete ordinal/token sequence."
+    },
+    {
+      "id": "compatibility-native:MessageReferences:SetReferencesDeferredCommitFailurePreservesCommittedTokens",
+      "filter": "DISABLED_DeliveryMessageReferences.SetReferencesDeferredCommitFailurePreservesCommittedTokens",
+      "expected": "NS_ERROR_STORAGE_CONSTRAINT: Disposable parent/child tables declare a deferred foreign key; foreign_keys enabled. Independent mechanism probe: begin succeeds, violating write succeeds, commit fails with CONSTRAINT, transaction still active, explicit rollback succeeds. Live replacement has two successful AFTER-INSERT witnesses for the real key; deferred commit failure propagates. No transaction remains; another connection observes the original committed token/ordinal."
     }
   ],
   "suites": {
@@ -187,6 +284,18 @@
         "mailnews/db/panorama/src/PerFolderDatabase.h",
         "mailnews/db/msgdb/public/nsIDBFolderInfo.idl",
         "mailnews/db/msgdb/public/moz.build"
+      ]
+    },
+    "DISABLED_DeliveryMessageReferences": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryMessageReferences.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/Message.cpp",
+        "mailnews/db/panorama/src/Message.h",
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/base/public/nsIMsgHdr.idl",
+        "mailnews/base/public/moz.build"
       ]
     }
   }

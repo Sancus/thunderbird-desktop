@@ -25,11 +25,11 @@ from pathlib import Path
 name, raw, diagnostic, code = sys.argv[1:]
 events = [
  {"action":"suite_start","source":"gtest","name":"gtest","tests":{}},
- {"action":"group_start","name":"DISABLED_DeliveryCoreReferences"},
+ {"action":"group_start","name":name.partition(".")[0]},
  {"action":"test_start","test":name},
  {"action":"test_status","test":name,"status":"PASS","message":"Expected TEST-UNEXPECTED-FAIL text"},
  {"action":"test_end","test":name,"status":"PASS"},
- {"action":"group_end","name":"DISABLED_DeliveryCoreReferences"},
+ {"action":"group_end","name":name.partition(".")[0]},
  {"action":"suite_end","source":"gtest"}]
 text = "".join(json.dumps(e)+"\n" for e in events)
 Path(raw).write_text(text, encoding="utf-8")
@@ -461,6 +461,53 @@ class NativeRunnerTests(unittest.TestCase):
                 with self.subTest(path=relative), self.assertRaisesRegex(ValueError, "omits required"):
                     runner.prepare(config, time.monotonic()+5)
                 receipt["inputs"][path] = identity
+            verify.assert_not_called()
+
+
+    def test_message_references_boundary_uses_catalog_timeout_and_rejects_timeout_pass(self):
+        selected = "DISABLED_DeliveryMessageReferences.CountOverflowLeavesZero"
+        case = next((c for c in runner.CASES.values() if c["filter"] == selected), None)
+        self.assertIsNotNone(case, "The accepted overflow case must be selectable")
+        config = self.config()
+        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib"),
+                   "refcount_logging": False}
+        def capture(argv, env, cwd, output, timeout, *args):
+            self.assertEqual(timeout, 1800)
+            self.assertEqual(env["GTEST_FILTER"], selected)
+            self.assertIn("--gtest_also_run_disabled_tests", argv)
+            self.child(output, selected=selected)
+            runner.save(output / "process.json", {"pid": 123, "exit_code": 0,
+                        "timed_out": True, "terminated_pids": [], "survivor_pids": [],
+                        "loaded": {"maps": "synthetic", "pid": 123}})
+        with (patch.object(runner, "verify", return_value={"fixture": "unchanged"}),
+              patch.object(processes, "capture", capture)):
+            result = runner.run_case(config, receipt, case, self.root,
+                                     time.monotonic()+3600, time.monotonic()+3700)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["observed"], "FAIL")
+        self.assertEqual(result["timeout_seconds"], 1800)
+        self.assertEqual(result["timeout_kind"], "case-limit")
+        self.assertEqual(result["coverage"], "none")
+
+
+    def test_message_references_receipt_binds_adapter_fixture_and_fault_sources(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        source = Path(config["source"])
+        paths = [source / "comm" / name for name in (
+            "mailnews/db/panorama/test/gtest/TestDeliveryMessageReferences.cpp",
+            "mailnews/base/public/nsIMsgHdr.idl")]
+        paths += [source / name for name in (
+            "storage/mozStoragePrivateHelpers.cpp", "storage/mozStorageStatement.cpp",
+            "storage/mozIStorageFunction.idl", "storage/mozIStorageValueArray.idl")]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)),
+              patch.object(runner, "verify") as verify):
+            for path in paths:
+                identity = receipt["inputs"].pop(str(path), "0" * 64)
+                self.bind_receipt(config, receipt)
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "omits required"):
+                    runner.prepare(config, time.monotonic()+5)
+                receipt["inputs"][str(path)] = identity
             verify.assert_not_called()
 
     def test_capture_rechecks_images_after_initial_mapping_proof(self):

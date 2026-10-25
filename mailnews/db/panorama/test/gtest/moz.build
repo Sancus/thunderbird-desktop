@@ -7,4 +7,5 @@ FINAL_LIBRARY = "xul-gtest"
 UNIFIED_SOURCES += [
     "TestDeliveryCoreReferences.cpp",
     "TestDeliveryFolderInfoProperties.cpp",
+    "TestDeliveryMessageReferences.cpp",
 ]

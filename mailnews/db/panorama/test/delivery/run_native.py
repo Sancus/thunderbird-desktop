@@ -39,7 +39,9 @@ GECKO_INPUTS = ["testing/gtest/mozilla/GTestRunner.cpp", "xpcom/tests/TestHarnes
                 "xpcom/base/nsTraceRefcnt.cpp", "mfbt/Assertions.h",
                 "testing/gtest/rungtests.py", "testing/gtest/moz.build",
                 "testing/gtest/mozilla/moz.build", "storage/mozStorageConnection.cpp",
-                "xpcom/glue/standalone/nsXPCOMGlue.cpp"]
+                "xpcom/glue/standalone/nsXPCOMGlue.cpp", "storage/mozStorageStatement.cpp",
+                "storage/mozStoragePrivateHelpers.cpp", "storage/mozIStorageFunction.idl",
+                "storage/mozIStorageValueArray.idl"]
 
 
 def handle_termination(signum, frame):
@@ -197,6 +199,9 @@ def run_case(config, receipt, case, output, stop, final):
     try:
         require_running()
         check_leak_capability(receipt)
+        timeout = max(config["timeout_seconds"], case.get("timeout_seconds", 0))
+        if not 0 < timeout <= 1800:
+            raise ValueError("case timeout must be positive and at most 1800 seconds")
         before_profiles = sorted(str(p) for p in profile_root.glob("cpp-unit-profd*"))
         record["preexisting_profiles"] = before_profiles
         if before_profiles:
@@ -210,11 +215,11 @@ def run_case(config, receipt, case, output, stop, final):
         argv = [receipt["app"], "-unittest", "--gtest_death_test_style=threadsafe",
                 "--gtest_also_run_disabled_tests"]
         record.update(argv=argv, environment=env, cwd=str(output),
-                      timeout_seconds=config["timeout_seconds"], deadline_shortened=
-                      time.monotonic() + config["timeout_seconds"] + 3 > stop)
+                      timeout_seconds=timeout, deadline_shortened=
+                      time.monotonic() + timeout + 3 > stop)
         save(output / "request.json", record)
         require_running()
-        processes.capture(argv, env, output, output, config["timeout_seconds"],
+        processes.capture(argv, env, output, output, timeout,
                           stop, Path(receipt["app"]), Path(receipt["library"]))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         record["error"] = str(error)

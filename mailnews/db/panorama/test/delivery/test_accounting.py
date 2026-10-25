@@ -676,7 +676,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 38)
-        self.assertEqual(len({c["id"] for c in catalog}), 131)
+        self.assertEqual(len({c["id"] for c in catalog}), 151)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -689,6 +689,95 @@ support-files = ["fixture.sql"]
                              ("panorama", "none", "raw-db"))
             if "Count" in case["id"]:
                 self.assertEqual(case["timeout_seconds"], 1800)
+
+    def test_discovery_selector_phase_and_nested_target_bound_coverage(self):
+        case = {**self.case, "id": "imap:panorama:mbox:DiscoveryRepeat", "selector": "repeat",
+                "phase": "imap-discovery-repeat-verified", "folder_roles": {"target": "DeliveryChild"}}
+        contract = {**self.contract, "folderURI": "imap://test/DeliveryParent/DeliveryChild"}
+        folder = {**self.folder, **contract}
+        mode = self.diag("IMAP_FIXTURE", {"backend": "panorama", "store": "mbox",
+                         "mode": "preconfigured-store", "discoveryCase": "repeat"})
+        events = self.events[:3] + [mode, self.diag("STORE_CONTRACT", contract),
+                 self.diag("FOLDER", folder), self.diag("PHASE", {"phase": case["phase"]})] + self.events[5:]
+        self.assertTrue(self.check(events, case)["ok"])
+        for index in (3, 4, 5, 6):
+            self.assertFalse(self.check(events[:index] + events[index + 1:], case)["ok"])
+        wrong = copy.deepcopy(events)
+        wrong[3] = self.diag("IMAP_FIXTURE", {"backend": "panorama", "store": "mbox",
+                            "mode": "preconfigured-store", "discoveryCase": "child"})
+        self.assertFalse(self.check(wrong, case)["ok"])
+        wrong = copy.deepcopy(events)
+        wrong[4] = self.diag("STORE_CONTRACT", {**contract, "folderURI": "imap://test/DeliveryParent"})
+        wrong[5] = self.diag("FOLDER", {**folder, "folderURI": "imap://test/DeliveryParent"})
+        self.assertFalse(self.check(wrong, case)["ok"])
+        failed = events[:7] + [{"action": "test_status", "test": case["file"], "status": "FAIL"}] + events[7:]
+        result = self.check(failed, case)
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["completed_phase"])
+        self.assertEqual(result["coverage"], "none")
+
+    def test_discovery_catalog_is_explicit_manual_selection_in_all_four_lanes(self):
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        rows = [c for c in catalog if c.get("selector")]
+        self.assertEqual(len(rows), 20)
+        self.assertEqual({(c["backend"], c["store"], c["selector"]) for c in rows},
+                         {(b, s, n) for b in ("mork", "panorama") for s in ("mbox", "maildir")
+                          for n in ("child", "nested", "repeat", "online-name", "delimiter")})
+        comm = runner.HERE.parents[4]
+        for case in rows:
+            self.assertNotIn("task", case)
+            self.assertEqual(case["reference_only"], case["backend"] == "mork")
+            self.assertEqual(case["folder_roles"], {"target": "DeliveryParent" if case["selector"] == "child" else "DeliveryChild"})
+            doc = runner.tomllib.loads((comm / case["manifest"]).read_text())
+            self.assertEqual(set(doc), {"DEFAULT", "test_panoramaDeliveryDiscovery.js"})
+            self.assertIn("mail.test.panorama.discovery_case=" + case["selector"], doc["DEFAULT"]["prefs"])
+
+    def test_discovery_preflight_binds_selector_and_installed_fixture_bytes(self):
+        import shutil
+        comm = runner.HERE.parents[4]
+        source = self.root / "source"
+        obj = self.root / "obj"
+        config = {"source": str(source), "objdir": str(obj)}
+        rows = [c for c in json.loads((runner.HERE / "cases.json").read_text()) if c.get("selector")]
+        self.assertEqual(len(rows), 20)
+        names = [c["manifest"] for c in rows] + [
+            "mailnews/imap/test/unit/" + n for n in
+            ("test_panoramaDeliveryDiscovery.js", "head_server.js", "head_imap_maildir.js")]
+        names += ["mailnews/db/panorama/test/xpcshell/" + n for n in
+                  ("head_delivery.js", "head_delivery_paths.js")]
+        modules = {folder + "/" + name + ".sys.mjs": name + ".sys.mjs"
+                   for folder, nameset in (
+                       ("resources", ("IMAPpump", "LocalAccountUtils", "MailTestUtils", "MessageGenerator", "PromiseTestUtils")),
+                       ("fakeserver", ("Maild", "Imapd", "Auth", "Smtpd"))) for name in nameset}
+        names += ["mailnews/test/" + n for n in modules] + ["mailnews/moz.build", "mailnews/test/resources/mailShutdown.js"]
+        for name in names:
+            target = source / "comm" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(comm / name, target)
+        for relative, name in modules.items():
+            target = obj / "_tests/modules/mailnews" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / "comm/mailnews/test" / relative, target)
+        for name in ("AppInfo.sys.mjs", "MockRegistrar.sys.mjs", "moz.build"):
+            target = source / "testing/modules" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("// synthetic Gecko dependency; no JS execution")
+            if name != "moz.build":
+                (obj / "_tests/modules" / name).write_bytes(target.read_bytes())
+        shutdown = obj / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"
+        shutdown.parent.mkdir(parents=True)
+        shutil.copyfile(source / "comm/mailnews/test/resources/mailShutdown.js", shutdown)
+        for case in rows:
+            self.assertEqual(runner.prepare(config, case)[0].name, Path(case["manifest"]).name)
+        with self.assertRaisesRegex(ValueError, "selector differs"):
+            runner.prepare(config, {**rows[0], "selector": "repeat"})
+        installed = obj / "_tests/modules/mailnews/Imapd.sys.mjs"
+        installed.write_text("stale installed fake server")
+        with self.assertRaisesRegex(ValueError, "fixture differs"):
+            runner.prepare(config, rows[0])
+        installed.unlink()
+        with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+            runner.prepare(config, rows[0])
 
 
 if __name__ == "__main__":

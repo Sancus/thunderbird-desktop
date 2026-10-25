@@ -1,8 +1,9 @@
 # Manual native acceptance
 
 TestDeliveryCoreReferences.cpp (14 cases), TestDeliveryFolderInfoProperties.cpp
-(19 cases) and TestDeliveryMessageReferences.cpp (19 cases) are linked here. All
-52 filters retain DISABLED_ suites and pending-product status; no normal-CI
+(19 cases), TestDeliveryMessageReferences.cpp (19 cases) and
+TestDeliveryCoreMessageExistence.cpp (7 cases) are linked here. All 59 filters
+retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
 They have store none: no account/body-store or application-restart coverage.
@@ -146,3 +147,11 @@ sentinels, parse past NUL, disable the read UDF/insert ABORT/deferred FK, or mak
 CheckMessageRow vacuous. Each intended case must fail before qualification.
 The separate stale MessageExists cache and ingestion/setter parity findings remain
 with their owners. No Windows executor or interruption-contract change is included.
+
+The CoreMessageExistence suite uses stored membership and independent unshared
+readers while requiring retained warm-header fields during deletion notification.
+Cold means same-process core/connection reopen. Prepare and reached-step faults
+propagate errors without changing output sentinels; the step witness proves actual
+execution. Bind-failure injection, OOM/IO, process restart and cache eviction
+lifetime are outside these cases. Compile, fault sensitivity, restored negative
+controls and the OS-temp close/restoration/retention lifecycle remain pending.

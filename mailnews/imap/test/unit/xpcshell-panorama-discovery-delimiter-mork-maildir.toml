@@ -1,0 +1,13 @@
+# Manual acceptance; deliberately not registered in moz.build.
+[DEFAULT]
+head = "../../../db/panorama/test/xpcshell/head_delivery_paths.js head_imap_maildir.js ../../../db/panorama/test/xpcshell/head_delivery.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=mork:maildir"]
+prefs = [
+  "mail.panorama.enabled=false",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/maildirstore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/maildirstore;1",
+  "mail.test.panorama.discovery_case=delimiter",
+]
+tags = ["panorama-delivery"]
+
+["test_panoramaDeliveryDiscovery.js"]

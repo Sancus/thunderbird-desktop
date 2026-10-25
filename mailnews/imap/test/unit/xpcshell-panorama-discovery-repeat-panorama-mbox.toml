@@ -1,0 +1,13 @@
+# Manual acceptance; deliberately not registered in moz.build.
+[DEFAULT]
+head = "../../../db/panorama/test/xpcshell/head_delivery_paths.js head_server.js ../../../db/panorama/test/xpcshell/head_delivery.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:mbox"]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.test.panorama.discovery_case=repeat",
+]
+tags = ["panorama-delivery"]
+
+["test_panoramaDeliveryDiscovery.js"]

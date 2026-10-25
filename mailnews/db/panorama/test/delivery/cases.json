@@ -1549,5 +1549,325 @@
     "diagnostics": "backend",
     "fixture": "raw-db",
     "readiness": "pending-product"
+  },
+  {
+    "id": "imap:mork:mbox:DiscoveryChild",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-child-mork-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-child-verified",
+    "folder_roles": {
+      "target": "DeliveryParent"
+    },
+    "selector": "child"
+  },
+  {
+    "id": "imap:mork:mbox:DiscoveryNested",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-nested-mork-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-nested-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "nested"
+  },
+  {
+    "id": "imap:mork:mbox:DiscoveryRepeat",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-repeat-mork-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-repeat-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "repeat"
+  },
+  {
+    "id": "imap:mork:mbox:DiscoveryOnlineName",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-online-name-mork-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-online-name-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "online-name"
+  },
+  {
+    "id": "imap:mork:mbox:DiscoveryDelimiter",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-delimiter-mork-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-delimiter-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "delimiter"
+  },
+  {
+    "id": "imap:mork:maildir:DiscoveryChild",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-child-mork-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-child-verified",
+    "folder_roles": {
+      "target": "DeliveryParent"
+    },
+    "selector": "child"
+  },
+  {
+    "id": "imap:mork:maildir:DiscoveryNested",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-nested-mork-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-nested-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "nested"
+  },
+  {
+    "id": "imap:mork:maildir:DiscoveryRepeat",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-repeat-mork-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-repeat-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "repeat"
+  },
+  {
+    "id": "imap:mork:maildir:DiscoveryOnlineName",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-online-name-mork-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-online-name-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "online-name"
+  },
+  {
+    "id": "imap:mork:maildir:DiscoveryDelimiter",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-delimiter-mork-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "reference_only": true,
+    "phase": "imap-discovery-delimiter-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "delimiter"
+  },
+  {
+    "id": "imap:panorama:mbox:DiscoveryChild",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-child-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-child-verified",
+    "folder_roles": {
+      "target": "DeliveryParent"
+    },
+    "selector": "child"
+  },
+  {
+    "id": "imap:panorama:mbox:DiscoveryNested",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-nested-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-nested-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "nested"
+  },
+  {
+    "id": "imap:panorama:mbox:DiscoveryRepeat",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-repeat-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-repeat-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "repeat"
+  },
+  {
+    "id": "imap:panorama:mbox:DiscoveryOnlineName",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-online-name-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-online-name-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "online-name"
+  },
+  {
+    "id": "imap:panorama:mbox:DiscoveryDelimiter",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-delimiter-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-delimiter-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "delimiter"
+  },
+  {
+    "id": "imap:panorama:maildir:DiscoveryChild",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-child-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-child-verified",
+    "folder_roles": {
+      "target": "DeliveryParent"
+    },
+    "selector": "child"
+  },
+  {
+    "id": "imap:panorama:maildir:DiscoveryNested",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-nested-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-nested-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "nested"
+  },
+  {
+    "id": "imap:panorama:maildir:DiscoveryRepeat",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-repeat-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-repeat-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "repeat"
+  },
+  {
+    "id": "imap:panorama:maildir:DiscoveryOnlineName",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-online-name-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-online-name-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "online-name"
+  },
+  {
+    "id": "imap:panorama:maildir:DiscoveryDelimiter",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-discovery-delimiter-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryDiscovery.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "reference_only": false,
+    "phase": "imap-discovery-delimiter-verified",
+    "folder_roles": {
+      "target": "DeliveryChild"
+    },
+    "selector": "delimiter"
   }
 ]

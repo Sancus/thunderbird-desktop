@@ -161,7 +161,7 @@ Body verifies online streaming and two ARTICLE requests with no offline body;
 these lanes do not prove physical mbox/maildir persistence or restart durability.
 Native execution requires a new authorized allocation and matching source/package,
 test installation and harness dependencies. Registration is not runtime evidence.
-EWS, conversation/search/browser and native MessageReferences remain pending batches.
+EWS and conversation/search/browser remain pending batches.
 
 ## References metadata registration
 
@@ -181,3 +181,18 @@ must budget each process and its descendants; any timeout fails with zero covera
 No boundary or literal oracle is reduced. WriteError still needs the approved
 automation-guarded connectionForTests prerequisite; no guard bypass is added.
 Native build/runtime, negative controls and close/profile qualification are pending.
+
+## IMAP discovery selection
+
+Twenty one-entry manual manifests select child, nested, repeat, online-name or
+delimiter in four backend/store lanes. The ten Mork rows are reference-only;
+Panorama rows remain pending-product. Selector preference and fixture diagnostics
+must agree with the catalog, with its required terminal phase and target folder.
+These dynamic tasks do not use the metadata-only named-task policy. The nested
+roles name only DeliveryChild; the domain assertions prove its parent separately.
+Preflight binds matching installed direct IMAP fixture modules and shutdown bytes.
+
+Only complete passing files certify their declared phase. Discovery/online-name
+failures remain visible; an intermediate property phase gives no later credit.
+These cases check live slash delimiters and folder-DB reopening, not process
+restart, delimiter durability, UID/message ingest, body storage or offline replay.

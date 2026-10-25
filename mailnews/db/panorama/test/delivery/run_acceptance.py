@@ -132,7 +132,8 @@ def check_log(log, case, returncode=0):
             errors.append("missing required completion phase")
         if case["id"].startswith("imap:") and (not modes or any(
             d.get("mode") != case["fixture"] or d.get("backend") != case["backend"]
-            or d.get("store") != case["store"] for d in modes
+            or d.get("store") != case["store"]
+            or (case.get("selector") and d.get("discoveryCase") != case["selector"]) for d in modes
         )):
             errors.append("missing or mismatched IMAP fixture mode")
         if case["diagnostics"] == "folder":
@@ -221,6 +222,8 @@ def prepare(config, case):
         prefs = dict(v.split("=", 1) for v in defaults.get("prefs", []) + entry.get("prefs", []))
         if prefs.get("mail.panorama.enabled") != str(case["backend"] == "panorama").lower():
             raise ValueError("manifest backend preference differs from declared tuple")
+        if case.get("selector") and prefs.get("mail.test.panorama.discovery_case") != case["selector"]:
+            raise ValueError("manifest discovery selector differs from declared case")
         if case["fixture"] == "preconfigured-store":
             contract = "@mozilla.org/msgstore/" + CONTRACTS[case["store"]] + ";1"
             if any(prefs.get(p) != contract for p in (
@@ -232,6 +235,20 @@ def prepare(config, case):
     if case["id"].startswith("imap:"):
         paths += [manifest.parent / "head_server.js",
                   Path(config["objdir"]) / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"]
+    if case.get("selector"):
+        modules = {"mailnews/" + name + ".sys.mjs": comm / "mailnews/test" / folder / (name + ".sys.mjs")
+                   for folder, names in (
+                       ("resources", ("IMAPpump", "LocalAccountUtils", "MailTestUtils",
+                                      "MessageGenerator", "PromiseTestUtils")),
+                       ("fakeserver", ("Maild", "Imapd", "Auth", "Smtpd"))) for name in names}
+        modules.update({name: source / "testing/modules" / name
+                        for name in ("AppInfo.sys.mjs", "MockRegistrar.sys.mjs")})
+        module_pairs = [(original, Path(config["objdir"]) / "_tests/modules" / name)
+                        for name, original in modules.items()]
+        module_pairs.append((comm / "mailnews/test/resources/mailShutdown.js",
+                             Path(config["objdir"]) / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"))
+        paths += [p for pair in module_pairs for p in pair]
+        paths += [comm / "mailnews/moz.build", source / "testing/modules/moz.build"]
     if case["id"].startswith("news:"):
         modules = {
             "mailnews/LocalAccountUtils.sys.mjs": comm / "mailnews/test/resources/LocalAccountUtils.sys.mjs",
@@ -277,7 +294,7 @@ def prepare(config, case):
             raise ValueError("require one unconditional named task matching the catalog")
     for original, installed in module_pairs:
         if original.read_bytes() != installed.read_bytes():
-            raise ValueError("blocked-dependency: installed NNTP fixture differs from source: " + str(installed))
+            raise ValueError("blocked-dependency: installed protocol fixture differs from source: " + str(installed))
     return manifest, paths
 
 

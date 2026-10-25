@@ -266,6 +266,41 @@
       "id": "compatibility-native:MessageReferences:SetReferencesDeferredCommitFailurePreservesCommittedTokens",
       "filter": "DISABLED_DeliveryMessageReferences.SetReferencesDeferredCommitFailurePreservesCommittedTokens",
       "expected": "NS_ERROR_STORAGE_CONSTRAINT: Disposable parent/child tables declare a deferred foreign key; foreign_keys enabled. Independent mechanism probe: begin succeeds, violating write succeeds, commit fails with CONSTRAINT, transaction still active, explicit rollback succeeds. Live replacement has two successful AFTER-INSERT witnesses for the real key; deferred commit failure propagates. No transaction remains; another connection observes the original committed token/ordinal."
+    },
+    {
+      "id": "core-native:MessageExistence:WarmHeaderDeletionUsesStoredMembership",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.WarmHeaderDeletionUsesStoredMembership",
+      "expected": "A warmed removed header remains readable; independent unshared SQL enumeration loses only the deleted row, MessageExists returns false for it and true for the unrelated survivor."
+    },
+    {
+      "id": "core-native:MessageExistence:ColdRowDeletionUsesStoredMembership",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ColdRowDeletionUsesStoredMembership",
+      "expected": "After a same-process Core/connection reopen without header reads, deletion removes only the target row; MessageExists reports absent target and present survivor. This is not process restart."
+    },
+    {
+      "id": "core-native:MessageExistence:RemovalCallbackSeesAbsentRowAndReadableHeader",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.RemovalCallbackSeesAbsentRowAndReadableHeader",
+      "expected": "Exactly one removal callback observes missing stored membership via MessageExists and unshared SQL, while key, messageId, subject, author/recipients/cc/bcc, keywords, date, flags, priority, nonzero prior thread identity, parent and folder remain readable; oldFlags matches input."
+    },
+    {
+      "id": "core-native:MessageExistence:WarmHeaderPrepareFailurePropagates",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.WarmHeaderPrepareFailurePropagates",
+      "expected": "A warmed header cannot suppress a real missing-table preparation failure; NS_ERROR_FAILURE propagates, false output sentinel stays false and an unshared reader proves the renamed row remains."
+    },
+    {
+      "id": "core-native:MessageExistence:ColdRowPrepareFailurePropagates",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ColdRowPrepareFailurePropagates",
+      "expected": "A new cold MessageDatabase propagates the same preparation failure and preserves the false output sentinel and stored row."
+    },
+    {
+      "id": "core-native:MessageExistence:WarmHeaderStepFailurePropagates",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.WarmHeaderStepFailurePropagates",
+      "expected": "A warmed header cannot suppress a reached SQL function failure during stepping; NS_ERROR_FAILURE propagates, true output sentinel stays true, one function call records the actual key and unshared storage is unchanged."
+    },
+    {
+      "id": "core-native:MessageExistence:ColdRowStepFailurePropagates",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ColdRowStepFailurePropagates",
+      "expected": "A new cold MessageDatabase propagates the same reached step error, unchanged true output and exact function witness/storage assertions."
     }
   ],
   "suites": {
@@ -296,6 +331,17 @@
         "mailnews/db/panorama/public/nsIMessageDatabase.idl",
         "mailnews/base/public/nsIMsgHdr.idl",
         "mailnews/base/public/moz.build"
+      ]
+    },
+    "DISABLED_DeliveryCoreMessageExistence": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryCoreMessageExistence.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/src/Message.cpp",
+        "mailnews/db/panorama/src/Message.h",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/base/public/nsIMsgHdr.idl"
       ]
     }
   }

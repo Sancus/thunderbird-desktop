@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 52)
+        self.assertEqual(len(catalog["cases"]), 59)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -169,7 +169,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 52)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 59)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -191,6 +191,27 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         build = (comm / "mailnews/db/panorama/test/gtest/moz.build").read_text()
         self.assertIn('"TestDeliveryMessageReferences.cpp"', build)
+
+    def test_core_existence_exact_disabled_filters(self):
+        suite = "DISABLED_DeliveryCoreMessageExistence"
+        expected = {"WarmHeaderDeletionUsesStoredMembership", "ColdRowDeletionUsesStoredMembership",
+                    "RemovalCallbackSeesAbsentRowAndReadableHeader", "WarmHeaderPrepareFailurePropagates",
+                    "ColdRowPrepareFailurePropagates", "WarmHeaderStepFailurePropagates",
+                    "ColdRowStepFailurePropagates"}
+        rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
+        self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in expected})
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(native.CATALOG["suites"][suite]["source"],
+                         "mailnews/db/panorama/test/gtest/TestDeliveryCoreMessageExistence.cpp")
+        for row in rows:
+            self.selected = row["filter"]
+            for index in (1, 4):
+                self.events[index]["name"] = suite
+            for index in (2, 3):
+                self.events[index]["test"] = self.selected
+            self.assertTrue(self.check(self.events)["log_complete"])
+        self.reject(self.events, returncode=1)
+        self.reject(self.events, timed_out=True)
 
 
 if __name__ == "__main__":

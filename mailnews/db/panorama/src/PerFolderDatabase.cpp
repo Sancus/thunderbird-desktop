@@ -1137,10 +1137,13 @@ NS_IMETHODIMP FolderInfo::SetLocale(const nsAString& aLocale) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP FolderInfo::GetMailboxName(nsACString& aMailboxName) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  nsAutoCString mailboxName;
+  MOZ_TRY(GetCharProperty("mailboxName", mailboxName));
+  aMailboxName = mailboxName;
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetMailboxName(const nsACString& aMailboxName) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return SetCharProperty("mailboxName", aMailboxName);
 }
 NS_IMETHODIMP FolderInfo::GetKnownArtsSet(char** aKnownArtsSet) {
   return NS_ERROR_NOT_IMPLEMENTED;

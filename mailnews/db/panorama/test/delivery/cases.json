@@ -1,0 +1,394 @@
+[
+  {
+    "id": "core:AddRollback",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCoreAddRollback.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:FolderProperties",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCoreFolderProperties.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:GlobalIdentity",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCoreGlobalIdentity.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:HeaderFields",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCoreHeaderFields.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:MessageProperties",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCoreMessageProperties.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:Priority",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCorePriority.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:Publication",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCorePublication.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ReferencesCount",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityReferencesCount.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ReferencesOrder",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityReferencesOrder.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ReferencesMutation",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityReferencesMutation.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:Properties",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityProperties.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:Keywords",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityKeywords.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ThreadUnread",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityThreadUnread.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ThreadChildren",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityThreadChildren.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ThreadDeletion",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityThreadDeletion.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ThreadParents",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityThreadParents.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:Enumeration",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityEnumeration.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:AddedNotification",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityAddedNotification.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:ColdDeletion",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityColdDeletion.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:Publication",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityPublication.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "migration:NumericProperties",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryMigrationNumericProperties.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-contract"
+  },
+  {
+    "id": "migration:PropertyPresence",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryMigrationPropertyPresence.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "migration:References",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryMigrationReferences.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "migration:RepeatAfterSuccess",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryMigrationRepeatAfterSuccess.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "migration:StringProperties",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryMigrationStringProperties.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "migration:Threads",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryMigrationThreads.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "imap:mork:mbox:Backend",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryBackend.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "ready",
+    "phase": "imap-ready"
+  },
+  {
+    "id": "imap:mork:mbox:OverlappingUids",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryOverlappingUids.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "uid-isolation-verified"
+  },
+  {
+    "id": "imap:mork:mbox:UidFetch",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryUidFetch.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "uid-fetch-verified"
+  },
+  {
+    "id": "imap:mork:maildir:Backend",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryBackend.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "ready",
+    "phase": "imap-ready"
+  },
+  {
+    "id": "imap:mork:maildir:OverlappingUids",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryOverlappingUids.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "uid-isolation-verified"
+  },
+  {
+    "id": "imap:mork:maildir:UidFetch",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryUidFetch.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "uid-fetch-verified"
+  },
+  {
+    "id": "imap:panorama:mbox:Backend",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryBackend.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "pending-product",
+    "phase": "imap-ready"
+  },
+  {
+    "id": "imap:panorama:mbox:OverlappingUids",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryOverlappingUids.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "uid-isolation-verified"
+  },
+  {
+    "id": "imap:panorama:mbox:UidFetch",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryUidFetch.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "uid-fetch-verified"
+  },
+  {
+    "id": "imap:panorama:maildir:Backend",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryBackend.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "pending-product",
+    "phase": "imap-ready"
+  },
+  {
+    "id": "imap:panorama:maildir:OverlappingUids",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryOverlappingUids.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "uid-isolation-verified"
+  },
+  {
+    "id": "imap:panorama:maildir:UidFetch",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryUidFetch.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "uid-fetch-verified"
+  }
+]

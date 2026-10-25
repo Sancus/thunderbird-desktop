@@ -1,0 +1,22 @@
+# Manual acceptance; deliberately not registered in moz.build.
+[DEFAULT]
+head = "head.js head_delivery.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]
+prefs = [
+  "mail.panorama.enabled=true",
+]
+tags = ["panorama-delivery"]
+
+["test_deliveryCoreAddRollback.js"]
+
+["test_deliveryCoreFolderProperties.js"]
+
+["test_deliveryCoreGlobalIdentity.js"]
+
+["test_deliveryCoreHeaderFields.js"]
+
+["test_deliveryCoreMessageProperties.js"]
+
+["test_deliveryCorePriority.js"]
+
+["test_deliveryCorePublication.js"]

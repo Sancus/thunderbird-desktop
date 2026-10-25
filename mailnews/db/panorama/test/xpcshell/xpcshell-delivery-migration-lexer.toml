@@ -1,0 +1,13 @@
+# Manual format-reader acceptance; deliberately not registered in moz.build.
+[DEFAULT]
+head = ""
+support-files = [
+  "data/deliveryMigrationLexerSummary.mork",
+  "data/deliveryMigrationLexerCache.mork",
+]
+
+["test_deliveryMigrationMorkLexerTokens.js"]
+
+["test_deliveryMigrationMorkLexerErrors.js"]
+
+["test_deliveryMigrationMorkLexerLimits.js"]

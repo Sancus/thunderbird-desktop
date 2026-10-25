@@ -380,5 +380,97 @@ prefs = ["mail.panorama.enabled=true", "mail.serverDefaultStoreContractID=@mozil
                 runner.prepare({"source": str(self.root)}, {**self.case, "folder_roles": roles})
 
 
+    def format_fixture(self):
+        source = self.root / "comm/tests"
+        source.mkdir(parents=True)
+        manifest = source / "format.toml"
+        manifest.write_text('''[DEFAULT]
+head = ""
+support-files = ["fragment.mork"]
+["test_one.js"]
+''', encoding="utf-8")
+        for name in ("test_one.js", "fragment.mork", "reader.sys.mjs", "moz.build"):
+            (source / name).write_text("fixture", encoding="utf-8")
+        case = {**self.case, "id": "migration-format:unit", "backend": None, "store": None,
+                "diagnostics": "format-reader", "fixture": "format-reader",
+                "manifest": "tests/format.toml",
+                "source_dependencies": ["tests/reader.sys.mjs", "tests/moz.build"]}
+        return source, manifest, case
+
+    def test_format_reader_requires_complete_assertions_and_no_product_claims(self):
+        case = {**self.case, "backend": None, "store": None, "diagnostics": "format-reader"}
+        events = self.events[:2] + self.events[5:]
+        result = self.check(events, case)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["coverage"], "format-reader")
+        self.assertEqual(result["assertion_count"], 1)
+        self.assertEqual(result["folder_evidence"], {})
+        variants = [events[:2] + events[3:], events[1:], events[:-1],
+                    events[:2] + [self.events[2]] + events[2:],
+                    events[:2] + [self.diag("PHASE", {"phase": "pretend"})] + events[2:],
+                    events[:2] + [self.diag("UNKNOWN", {})] + events[2:],
+                    events[:2] + [{"action": "crash"}] + events[2:]]
+        for status in ("SKIP", "FAIL", "TIMEOUT"):
+            wrong = copy.deepcopy(events)
+            wrong[2].update(status=status, expected=status)
+            variants.append(wrong)
+        for wrong in variants:
+            with self.subTest(events=wrong):
+                rejected = self.check(wrong, case)
+                self.assertFalse(rejected["ok"])
+                self.assertEqual(rejected["coverage"], "none")
+        extra = copy.deepcopy(events)
+        extra[1]["test"] = "test_other.js"
+        self.assertFalse(self.check(extra, case)["ok"])
+
+    def test_format_reader_preflight_binds_fixtures_module_and_packaging(self):
+        source, manifest, case = self.format_fixture()
+        config = {"source": str(self.root)}
+        _, paths = runner.prepare(config, case)
+        self.assertTrue({source / n for n in ("fragment.mork", "reader.sys.mjs", "moz.build")} <= set(paths))
+        for changed in ({"backend": "panorama"}, {"store": "none"}, {"phase": "fake"},
+                        {"diagnostics": "backend"}, {"folder_roles": {"one": "Inbox"}},
+                        {"source_dependencies": []}, {"source_dependencies": ["../escape"]}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                runner.prepare(config, {**case, **changed})
+        original = manifest.read_text()
+        for declaration in ('prefs = ["mail.panorama.enabled=true"]',
+                            'environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]',
+                            'head = "head.js"'):
+            text = original.replace('head = ""', declaration)
+            manifest.write_text(text, encoding="utf-8")
+            with self.subTest(declaration=declaration), self.assertRaises(ValueError):
+                runner.prepare(config, case)
+        manifest.write_text(original, encoding="utf-8")
+        (source / "reader.sys.mjs").unlink()
+        with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+            runner.prepare(config, case)
+
+    def test_format_reader_unsets_lane_and_keeps_failure_then_later_result(self):
+        source, _, case = self.format_fixture()
+        config = {"source": str(self.root), "objdir": str(self.root / "obj"),
+                  "python": "python", "evidence": str(self.root / "evidence")}
+        (self.root / "obj/dist/bin").mkdir(parents=True)
+        binary = "xpcshell.exe" if os.name == "nt" else "xpcshell"
+        (self.root / "obj/dist/bin" / binary).write_text("fixture")
+        (self.root / "obj/mozinfo.json").write_text("{}")
+        calls = []
+        events = self.events[:2] + self.events[5:]
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            for name in ("MOZ_AUTOMATION", "PANORAMA_DELIVERY_EXPECT", "PANORAMA_DELIVERY_TEST_ROOT"):
+                self.assertNotIn(name, kwargs["env"])
+            Path(argv[argv.index("--log-raw") + 1]).write_text(
+                "".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+            return SimpleNamespace(returncode=1 if len(calls) == 1 else 0)
+        with patch.dict(os.environ, {"MOZ_AUTOMATION": "1", "PANORAMA_DELIVERY_EXPECT": "mork:mbox",
+                                     "PANORAMA_DELIVERY_TEST_ROOT": "stale"}), patch.object(runner.subprocess, "run", fake_run):
+            summary = runner.run_batch(config, [case, {**case, "id": "migration-format:two"}])
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(summary["ok"])
+        self.assertEqual([r["coverage"] for r in summary["results"]], ["none", "format-reader"])
+        self.assertEqual([r["observed"] for r in summary["results"]], ["FAIL", "PASS"])
+        self.assertIsNone(summary["results"][1]["environment"]["PANORAMA_DELIVERY_EXPECT"])
+
 if __name__ == "__main__":
     unittest.main()

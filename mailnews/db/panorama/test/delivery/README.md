@@ -102,3 +102,36 @@ correction is a separate owner commit awaiting review/integration; registration
 does not import that code. A first source/property failure can hide destination
 and later identity/body checks. Remote evidence must retain that first failure;
 terminal phases remain required, with no partial case pass.
+
+## Foundation registration and format readers
+
+The manual inventory includes the reviewed core ownership/error/migration cases,
+three factory cases in each Panorama store, and UIDVALIDITY in all four IMAP
+lanes. Manual manifests remain outside normal test registration. The strict Mork
+byte reader is packaged by `EXTRA_JS_MODULES.panorama`; its three files are lexical
+format tests, with 17/20/12 normal tasks. They prove no full-document import, native
+reader parity, database, account, body-store, or Mork-removal behavior.
+
+Format rows declare `backend: null`, `store: null`, `fixture: "format-reader"`,
+and `diagnostics: "format-reader"`. Their manifest has no heads, preferences or
+lane environment. `source_dependencies` binds the reviewed module and its
+packaging declaration; the two support fragments are also hashed. The runner
+unsets inherited lane/installed-root variables, requires assertions and exact
+file completion, and rejects product diagnostics. A missing packaged module
+fails its real import; no source-path substitution is used.
+
+UIDVALIDITY requires paired legacy reference results: run
+`imap:mork:mbox:UidValidity` before `imap:panorama:mbox:UidValidity`, and
+`imap:mork:maildir:UidValidity` before `imap:panorama:maildir:UidValidity`, each in
+a separate process/profile with its declared artifact. Preserve all later
+results if a reference fails, but do not accept the combined transition evidence
+until both references pass or the failure is reviewed as legacy behavior.
+Store diagnostics here prove selection/instantiation; online streaming does
+not prove persisted body-store or offline replay behavior.
+
+The new-source hold ledger may release `core:MessageProperties` and
+`core:FolderProperties` only with the accepted exact-name correction in ancestry
+(`4f9720478b4276bd45c5a24a5631d6c4a3739df2`, acceptance-009).
+`migration:NumericProperties` remains pending-contract and is refused before
+execution. Initial009 and its three frozen holds remain immutable. NNTP, EWS,
+conversation/search and remaining protocol registrations are later batches.

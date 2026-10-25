@@ -12,3 +12,7 @@ TEST_DIRS += [
 ]
 
 JAR_MANIFESTS += ["jar.mn"]
+
+EXTRA_JS_MODULES.panorama += [
+    "migration/StrictMorkReader.sys.mjs",
+]

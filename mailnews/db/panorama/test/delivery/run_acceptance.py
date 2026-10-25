@@ -26,6 +26,8 @@ def check_log(log, case, returncode=0):
     starts, ends, suites, suite_ends = [], [], [], 0
     backends, folders, contracts, phases, modes = [], [], {}, [], []
     active = False
+    assertions = 0
+    is_format = case["diagnostics"] == "format-reader"
     first_failure, folder_evidence = None, {}
     try:
         raw = Path(log).read_text(encoding="utf-8")
@@ -59,6 +61,8 @@ def check_log(log, case, returncode=0):
                     errors.append("invalid test_start order")
                 starts.append(event.get("test"))
                 active = True
+            if action == "test_status":
+                assertions += 1
             if action in ("test_status", "test_end"):
                 if not active:
                     errors.append("result outside active case")
@@ -76,6 +80,8 @@ def check_log(log, case, returncode=0):
             if message.startswith('"DELIVERY_') and message.endswith('"'):
                 message = message[1:-1]
             if message.startswith("DELIVERY_"):
+                if is_format:
+                    errors.append("format-reader case unexpectedly claimed product evidence")
                 if not active:
                     errors.append("diagnostic outside active case")
                 kind, payload = message.split(" ", 1)
@@ -101,10 +107,10 @@ def check_log(log, case, returncode=0):
             errors.append("suite selection/completion differs from requested case")
         if starts != [case["file"]] or ends != [case["file"]]:
             errors.append("require exactly one requested file start and end")
-        if not backends or any(
+        if not is_format and (not backends or any(
             d.get("expected") != case["backend"] or d.get("actualBackend") != case["backend"]
             for d in backends
-        ):
+        )):
             errors.append("missing or mismatched backend evidence")
         if case.get("phase") and case["phase"] not in phases:
             errors.append("missing required completion phase")
@@ -134,6 +140,9 @@ def check_log(log, case, returncode=0):
                     folder_evidence[role] = matching.pop()
             if len({uri.rsplit("/", 1)[0] for uri in folder_evidence.values()}) > 1:
                 errors.append("declared fixture folders do not share a parent")
+        elif is_format:
+            if not assertions:
+                errors.append("format-reader case executed no assertions")
         elif folders or contracts:
             errors.append("raw DB case unexpectedly claimed folder/store coverage")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
@@ -143,6 +152,7 @@ def check_log(log, case, returncode=0):
     return {"ok": not errors, "errors": errors,
             "factory_blocked": "imap-factory" in phases and "imap-ready" not in phases,
             "coverage": case["diagnostics"] if not errors else "none",
+            "assertion_count": assertions,
             "first_failure": first_failure, "last_phase": phases[-1] if phases else None,
             "folder_evidence": folder_evidence,
             "completed_phase": case.get("phase") if not errors else None}
@@ -155,12 +165,18 @@ def prepare(config, case):
     manifest = (comm / case["manifest"]).resolve()
     if not manifest.is_relative_to(comm.resolve()) or Path(case["file"]).name != case["file"]:
         raise ValueError("case paths must remain in source comm/")
-    if case["backend"] not in ("mork", "panorama") or case["store"] not in (*CONTRACTS, "none"):
-        raise ValueError("invalid expected tuple")
-    if case["diagnostics"] != ("backend" if case["store"] == "none" else "folder"):
-        raise ValueError("diagnostic policy must match fixture scope")
-    if (case["store"] == "none") != (case["fixture"] == "raw-db"):
-        raise ValueError("store=none is reserved for raw DB fixtures")
+    is_format = case["fixture"] == "format-reader"
+    if is_format:
+        if (case["backend"] is not None or case["store"] is not None
+            or case["diagnostics"] != "format-reader" or case.get("phase")):
+            raise ValueError("format-reader cases must not declare a backend/store/phase")
+    else:
+        if case["backend"] not in ("mork", "panorama") or case["store"] not in (*CONTRACTS, "none"):
+            raise ValueError("invalid expected tuple")
+        if case["diagnostics"] != ("backend" if case["store"] == "none" else "folder"):
+            raise ValueError("diagnostic policy must match fixture scope")
+        if (case["store"] == "none") != (case["fixture"] == "raw-db"):
+            raise ValueError("store=none is reserved for raw DB fixtures")
     roles = case.get("folder_roles", {})
     if (not isinstance(roles, dict) or (roles and case["diagnostics"] != "folder")
         or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", name)
@@ -176,24 +192,38 @@ def prepare(config, case):
     for section in (defaults, entry):
         if any(k in section for k in ("skip-if", "fail-if", "run-if", "disabled", "expected")):
             raise ValueError("conditional or expected-failure case is not acceptance")
-    env = dict(v.split("=", 1) for v in entry.get("environment", defaults["environment"]))
-    lane = case["backend"] + ":" + case["store"]
-    if env.get("PANORAMA_DELIVERY_EXPECT") != lane or "MOZ_AUTOMATION" in env:
-        raise ValueError("manifest environment differs from declared tuple")
-    prefs = dict(v.split("=", 1) for v in defaults.get("prefs", []) + entry.get("prefs", []))
-    if prefs.get("mail.panorama.enabled") != str(case["backend"] == "panorama").lower():
-        raise ValueError("manifest backend preference differs from declared tuple")
-    if case["fixture"] == "preconfigured-store":
-        contract = "@mozilla.org/msgstore/" + CONTRACTS[case["store"]] + ";1"
-        if any(prefs.get(p) != contract for p in (
-            "mail.serverDefaultStoreContractID", "mail.server.default.storeContractID"
-        )):
-            raise ValueError("preconfigured fixture must set both store preferences")
+    if is_format:
+        if any(section.get("head", "") or section.get("prefs") or section.get("environment")
+               for section in (defaults, entry)):
+            raise ValueError("format-reader manifest must have no product heads, prefs or environment")
+    else:
+        env = dict(v.split("=", 1) for v in entry.get("environment", defaults["environment"]))
+        lane = case["backend"] + ":" + case["store"]
+        if env.get("PANORAMA_DELIVERY_EXPECT") != lane or "MOZ_AUTOMATION" in env:
+            raise ValueError("manifest environment differs from declared tuple")
+        prefs = dict(v.split("=", 1) for v in defaults.get("prefs", []) + entry.get("prefs", []))
+        if prefs.get("mail.panorama.enabled") != str(case["backend"] == "panorama").lower():
+            raise ValueError("manifest backend preference differs from declared tuple")
+        if case["fixture"] == "preconfigured-store":
+            contract = "@mozilla.org/msgstore/" + CONTRACTS[case["store"]] + ";1"
+            if any(prefs.get(p) != contract for p in (
+                "mail.serverDefaultStoreContractID", "mail.server.default.storeContractID"
+            )):
+                raise ValueError("preconfigured fixture must set both store preferences")
     paths = [manifest] + [manifest.parent / name for name in doc if name != "DEFAULT"]
     if case["id"].startswith("imap:"):
         paths += [manifest.parent / "head_server.js",
                   Path(config["objdir"]) / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"]
     paths += [(manifest.parent / h).resolve() for h in entry.get("head", defaults["head"]).split()]
+    if is_format:
+        if not case.get("source_dependencies"):
+            raise ValueError("format-reader case must bind its source module/packaging")
+        dependencies = [(manifest.parent / name).resolve() for name in
+                        defaults.get("support-files", []) + entry.get("support-files", [])]
+        dependencies += [(comm / name).resolve() for name in case["source_dependencies"]]
+        if any(not p.is_relative_to(comm.resolve()) for p in dependencies):
+            raise ValueError("format-reader dependencies must remain in source comm/")
+        paths += dependencies
     if any(not p.is_file() for p in paths):
         missing = ", ".join(str(p) for p in paths if not p.is_file())
         raise ValueError("blocked-dependency: " + missing)
@@ -219,13 +249,16 @@ def run_case(config, case, output):
             str(manifest.parent / case["file"])]
     env = os.environ.copy()
     env.pop("MOZ_AUTOMATION", None)
-    env["PANORAMA_DELIVERY_EXPECT"] = case["backend"] + ":" + case["store"]
+    if case["diagnostics"] == "format-reader":
+        env.pop("PANORAMA_DELIVERY_EXPECT", None)
+    else:
+        env["PANORAMA_DELIVERY_EXPECT"] = case["backend"] + ":" + case["store"]
     env.pop("PANORAMA_DELIVERY_TEST_ROOT", None)
     if case["id"].startswith("imap:"):
         env["PANORAMA_DELIVERY_TEST_ROOT"] = str(obj / "_tests/xpcshell/comm") + os.sep
     record = {"case": case, "argv": argv, "cwd": str(source), "observed": "not-run",
               "environment": {"MOZ_AUTOMATION": None,
-                              "PANORAMA_DELIVERY_EXPECT": env["PANORAMA_DELIVERY_EXPECT"],
+                              "PANORAMA_DELIVERY_EXPECT": env.get("PANORAMA_DELIVERY_EXPECT"),
                               "PANORAMA_DELIVERY_TEST_ROOT": env.get("PANORAMA_DELIVERY_TEST_ROOT")},
               "logs": {"raw": str(raw), "stdout": str(stdout), "stderr": str(stderr)},
               "started_utc": datetime.now(timezone.utc).isoformat(), "exit_code": None}

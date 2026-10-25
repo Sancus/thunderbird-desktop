@@ -20,3 +20,7 @@ tags = ["panorama-delivery"]
 ["test_deliveryCorePriority.js"]
 
 ["test_deliveryCorePublication.js"]
+
+["test_deliveryCoreAddOwnership.js"]
+
+["test_deliveryCoreReferenceLookupError.js"]

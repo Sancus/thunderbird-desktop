@@ -14,3 +14,5 @@ tags = ["panorama-delivery"]
 ["test_panoramaDeliveryOverlappingUids.js"]
 
 ["test_panoramaDeliveryUidFetch.js"]
+
+["test_panoramaDeliveryUidValidity.js"]

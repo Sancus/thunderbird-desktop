@@ -656,5 +656,191 @@
       "outside": "searchOutside",
       "saved": "deliverySavedSearch"
     }
+  },
+  {
+    "id": "core:AddOwnership",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCoreAddOwnership.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:ReferenceLookupError",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml",
+    "file": "test_deliveryCoreReferenceLookupError.js",
+    "backend": "panorama",
+    "store": "none",
+    "diagnostics": "backend",
+    "fixture": "raw-db",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:NativeAfterMigration",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryCoreNativeAfterMigration.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "core:MigrationFailure",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration.toml",
+    "file": "test_deliveryCoreMigrationFailure.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "legacy-source",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:panorama:mbox:FolderFactories",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityFolderFactories.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:panorama:maildir:FolderFactories",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-factories-maildir.toml",
+    "file": "test_deliveryCompatibilityFolderFactories.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:panorama:mbox:FolderFactoryChildren",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityFolderFactoryChildren.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:panorama:maildir:FolderFactoryChildren",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-factories-maildir.toml",
+    "file": "test_deliveryCompatibilityFolderFactoryChildren.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:panorama:mbox:FolderFactoryRetry",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery.toml",
+    "file": "test_deliveryCompatibilityFolderFactoryRetry.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "compatibility:panorama:maildir:FolderFactoryRetry",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-factories-maildir.toml",
+    "file": "test_deliveryCompatibilityFolderFactoryRetry.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product"
+  },
+  {
+    "id": "migration-format:LexerTokens",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration-lexer.toml",
+    "file": "test_deliveryMigrationMorkLexerTokens.js",
+    "backend": null,
+    "store": null,
+    "diagnostics": "format-reader",
+    "fixture": "format-reader",
+    "readiness": "ready",
+    "source_dependencies": [
+      "mailnews/db/panorama/migration/StrictMorkReader.sys.mjs",
+      "mailnews/db/panorama/moz.build"
+    ]
+  },
+  {
+    "id": "migration-format:LexerErrors",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration-lexer.toml",
+    "file": "test_deliveryMigrationMorkLexerErrors.js",
+    "backend": null,
+    "store": null,
+    "diagnostics": "format-reader",
+    "fixture": "format-reader",
+    "readiness": "ready",
+    "source_dependencies": [
+      "mailnews/db/panorama/migration/StrictMorkReader.sys.mjs",
+      "mailnews/db/panorama/moz.build"
+    ]
+  },
+  {
+    "id": "migration-format:LexerLimits",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-migration-lexer.toml",
+    "file": "test_deliveryMigrationMorkLexerLimits.js",
+    "backend": null,
+    "store": null,
+    "diagnostics": "format-reader",
+    "fixture": "format-reader",
+    "readiness": "ready",
+    "source_dependencies": [
+      "mailnews/db/panorama/migration/StrictMorkReader.sys.mjs",
+      "mailnews/db/panorama/moz.build"
+    ]
+  },
+  {
+    "id": "imap:mork:mbox:UidValidity",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryUidValidity.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "uidvalidity-reset-verified"
+  },
+  {
+    "id": "imap:mork:maildir:UidValidity",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryUidValidity.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "uidvalidity-reset-verified"
+  },
+  {
+    "id": "imap:panorama:mbox:UidValidity",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryUidValidity.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "uidvalidity-reset-verified"
+  },
+  {
+    "id": "imap:panorama:maildir:UidValidity",
+    "manifest": "mailnews/imap/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryUidValidity.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "uidvalidity-reset-verified"
   }
 ]

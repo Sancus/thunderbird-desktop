@@ -25,3 +25,7 @@ support-files = ["data/**"]
 ["test_deliveryMigrationStringProperties.js"]
 
 ["test_deliveryMigrationThreads.js"]
+
+["test_deliveryCoreNativeAfterMigration.js"]
+
+["test_deliveryCoreMigrationFailure.js"]

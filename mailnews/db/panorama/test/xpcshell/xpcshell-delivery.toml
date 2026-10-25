@@ -104,3 +104,9 @@ prefs = [
   "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
   "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
 ]
+
+["test_deliveryCompatibilityFolderFactories.js"]
+
+["test_deliveryCompatibilityFolderFactoryChildren.js"]
+
+["test_deliveryCompatibilityFolderFactoryRetry.js"]

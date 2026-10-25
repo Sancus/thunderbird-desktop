@@ -150,7 +150,8 @@ def check_log(log, case, returncode=0):
     if case["readiness"] == "pending-contract":
         errors.append("contract approval is pending")
     return {"ok": not errors, "errors": errors,
-            "factory_blocked": "imap-factory" in phases and "imap-ready" not in phases,
+            "factory_blocked": any(p + "-factory" in phases and p + "-ready" not in phases
+                                   for p in ("imap", "news")),
             "coverage": case["diagnostics"] if not errors else "none",
             "assertion_count": assertions,
             "first_failure": first_failure, "last_phase": phases[-1] if phases else None,
@@ -179,7 +180,7 @@ def prepare(config, case):
             raise ValueError("store=none is reserved for raw DB fixtures")
     roles = case.get("folder_roles", {})
     if (not isinstance(roles, dict) or (roles and case["diagnostics"] != "folder")
-        or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", name)
+        or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*", name)
                for name in roles.values()) or len(set(roles.values())) != len(roles)):
         raise ValueError("folder roles require distinct literal fixture names and folder scope")
     if case["readiness"] not in ("ready", "pending-product", "pending-contract"):
@@ -210,10 +211,26 @@ def prepare(config, case):
                 "mail.serverDefaultStoreContractID", "mail.server.default.storeContractID"
             )):
                 raise ValueError("preconfigured fixture must set both store preferences")
+    module_pairs = []
     paths = [manifest] + [manifest.parent / name for name in doc if name != "DEFAULT"]
     if case["id"].startswith("imap:"):
         paths += [manifest.parent / "head_server.js",
                   Path(config["objdir"]) / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"]
+    if case["id"].startswith("news:"):
+        modules = {
+            "mailnews/LocalAccountUtils.sys.mjs": comm / "mailnews/test/resources/LocalAccountUtils.sys.mjs",
+            "mailnews/Maild.sys.mjs": comm / "mailnews/test/fakeserver/Maild.sys.mjs",
+            "mailnews/Nntpd.sys.mjs": comm / "mailnews/test/fakeserver/Nntpd.sys.mjs",
+            "mailnews/PromiseTestUtils.sys.mjs": comm / "mailnews/test/resources/PromiseTestUtils.sys.mjs",
+        }
+        modules.update({name: source / "testing/modules" / name
+                        for name in ("AppInfo.sys.mjs", "MockRegistrar.sys.mjs")})
+        module_pairs = [(original, Path(config["objdir"]) / "_tests/modules" / name)
+                        for name, original in modules.items()]
+        module_pairs.append((comm / "mailnews/test/resources/mailShutdown.js",
+                             Path(config["objdir"]) / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"))
+        paths += [p for pair in module_pairs for p in pair]
+        paths += [comm / "mailnews/moz.build", source / "testing/modules/moz.build"]
     paths += [(manifest.parent / h).resolve() for h in entry.get("head", defaults["head"]).split()]
     if is_format:
         if not case.get("source_dependencies"):
@@ -227,6 +244,9 @@ def prepare(config, case):
     if any(not p.is_file() for p in paths):
         missing = ", ".join(str(p) for p in paths if not p.is_file())
         raise ValueError("blocked-dependency: " + missing)
+    for original, installed in module_pairs:
+        if original.read_bytes() != installed.read_bytes():
+            raise ValueError("blocked-dependency: installed NNTP fixture differs from source: " + str(installed))
     return manifest, paths
 
 
@@ -254,7 +274,7 @@ def run_case(config, case, output):
     else:
         env["PANORAMA_DELIVERY_EXPECT"] = case["backend"] + ":" + case["store"]
     env.pop("PANORAMA_DELIVERY_TEST_ROOT", None)
-    if case["id"].startswith("imap:"):
+    if case["id"].startswith(("imap:", "news:")):
         env["PANORAMA_DELIVERY_TEST_ROOT"] = str(obj / "_tests/xpcshell/comm") + os.sep
     record = {"case": case, "argv": argv, "cwd": str(source), "observed": "not-run",
               "environment": {"MOZ_AUTOMATION": None,

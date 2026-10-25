@@ -133,5 +133,32 @@ The new-source hold ledger may release `core:MessageProperties` and
 `core:FolderProperties` only with the accepted exact-name correction in ancestry
 (`4f9720478b4276bd45c5a24a5631d6c4a3739df2`, acceptance-009).
 `migration:NumericProperties` remains pending-contract and is refused before
-execution. Initial009 and its three frozen holds remain immutable. NNTP, EWS,
+execution. Initial009 and its three frozen holds remain immutable. EWS,
 conversation/search and remaining protocol registrations are later batches.
+
+## NNTP manual lanes
+
+Five existing reviewed files run independently in four NNTP tuples (20 IDs):
+Backend, Identity, Body, Read and Flag. Run both Mork store lanes first as fixture
+references, then both Panorama lanes as pending-product. No pending-product
+failure is skipped or accepted. NumericProperties remains pending-contract.
+The previous 73 catalog rows are unchanged.
+
+The news head loads before head_delivery_paths.js so its default gDEPTH is replaced
+with the declared installed test root before cleanup. Its shutdown helper resolves
+to the same installed file as the normal suite. Preflight hashes and compares the
+installed shutdown, AppInfo, MockRegistrar, LocalAccountUtils, Maild, Nntpd and
+PromiseTestUtils helpers with their matching source bytes, and hashes their
+packaging declarations. Missing/stale fixture dependencies block execution with
+zero coverage; NNTP product/factory failures remain failures, not unsupported-build.
+No invented account-support preference is set.
+
+Backend checks the root factory/store only. Each behavioral case requires distinct
+same-account test.subscribe.simple and test.filter folder/store diagnostics and
+its declared terminal phase. A failure retains the first error and last phase,
+certifies no completed phase or coverage, and does not stop later selections.
+Body verifies online streaming and two ARTICLE requests with no offline body;
+these lanes do not prove physical mbox/maildir persistence or restart durability.
+Native execution requires a new authorized allocation and matching source/package,
+test installation and harness dependencies. Registration is not runtime evidence.
+EWS, conversation/search/browser and native gtests remain separate pending batches.

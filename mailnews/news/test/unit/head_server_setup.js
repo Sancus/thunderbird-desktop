@@ -231,5 +231,5 @@ function make_article(file) {
 }
 
 registerCleanupFunction(function () {
-  load("../../../resources/mailShutdown.js");
+  load(gDEPTH + "mailnews/resources/mailShutdown.js");
 });

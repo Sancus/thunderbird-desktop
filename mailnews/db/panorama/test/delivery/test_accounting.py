@@ -472,5 +472,127 @@ support-files = ["fragment.mork"]
         self.assertEqual([r["observed"] for r in summary["results"]], ["FAIL", "PASS"])
         self.assertIsNone(summary["results"][1]["environment"]["PANORAMA_DELIVERY_EXPECT"])
 
+
+    def test_news_requires_both_groups_and_completion_without_later_credit(self):
+        case = {**self.case, "id": "news:panorama:mbox:Identity",
+                "phase": "news-identity-verified", "folder_roles": {
+                    "first": "test.subscribe.simple", "second": "test.filter"}}
+        events = self.folder_events(list(case["folder_roles"].values()), case["phase"])
+        good = self.check(events, case)
+        self.assertTrue(good["ok"])
+        self.assertEqual(set(good["folder_evidence"]), {"first", "second"})
+        for names, phase in ((["test.subscribe.simple"], case["phase"]),
+                             (list(case["folder_roles"].values()), None)):
+            with self.subTest(names=names, phase=phase):
+                result = self.check(self.folder_events(names, phase), case)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["coverage"], "none")
+        failure = {"action": "test_status", "test": case["file"], "status": "FAIL",
+                   "expected": "PASS", "message": "first header has wrong identity"}
+        events.insert(3, failure)
+        failed = self.check(events, case)
+        self.assertEqual(failed["first_failure"], failure)
+        self.assertEqual(failed["last_phase"], case["phase"])
+        self.assertIsNone(failed["completed_phase"])
+        self.assertEqual(failed["coverage"], "none")
+        factory = self.events[:3] + [self.diag("PHASE", {"phase": "news-factory"}),
+                                   failure] + self.events[-2:]
+        blocked = self.check(factory, case)
+        self.assertTrue(blocked["factory_blocked"])
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["coverage"], "none")
+        self.assertEqual(blocked["last_phase"], "news-factory")
+
+    def news_fixture(self):
+        source = self.root / "comm/tests"
+        source.mkdir(parents=True)
+        (source / "manual.toml").write_text('''[DEFAULT]
+head = "head_server_setup.js head_delivery_paths.js head_delivery.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:mbox"]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+["test_one.js"]
+''', encoding="utf-8")
+        for name in ("head_server_setup.js", "head_delivery_paths.js", "head_delivery.js", "test_one.js"):
+            (source / name).write_text("// fixture", encoding="utf-8")
+        modules = {
+            "mailnews/LocalAccountUtils.sys.mjs": "comm/mailnews/test/resources/LocalAccountUtils.sys.mjs",
+            "mailnews/Maild.sys.mjs": "comm/mailnews/test/fakeserver/Maild.sys.mjs",
+            "mailnews/Nntpd.sys.mjs": "comm/mailnews/test/fakeserver/Nntpd.sys.mjs",
+            "mailnews/PromiseTestUtils.sys.mjs": "comm/mailnews/test/resources/PromiseTestUtils.sys.mjs",
+            "AppInfo.sys.mjs": "testing/modules/AppInfo.sys.mjs",
+            "MockRegistrar.sys.mjs": "testing/modules/MockRegistrar.sys.mjs",
+        }
+        for name, original in modules.items():
+            for path in (self.root / original, self.root / "obj/_tests/modules" / name):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("// matching " + name, encoding="utf-8")
+        for name in ("comm/mailnews/moz.build", "testing/modules/moz.build",
+                     "obj/_tests/xpcshell/comm/mailnews/resources/mailShutdown.js",
+                     "comm/mailnews/test/resources/mailShutdown.js",
+                     "obj/dist/bin/xpcshell" + (".exe" if os.name == "nt" else ""), "obj/mozinfo.json"):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture", encoding="utf-8")
+        config = {"source": str(self.root), "objdir": str(self.root / "obj"), "python": "python"}
+        return config, {**self.case, "id": "news:panorama:mbox:Identity"}
+
+    def test_news_missing_or_stale_installed_dependency_blocks_before_launch(self):
+        config, case = self.news_fixture()
+        _, paths = runner.prepare(config, case)
+        wanted = self.root / "obj/_tests/modules/mailnews/Nntpd.sys.mjs"
+        self.assertIn(wanted, paths)
+        self.assertIn(self.root / "comm/mailnews/test/fakeserver/Nntpd.sys.mjs", paths)
+        self.assertIn(self.root / "obj/_tests/xpcshell/comm/mailnews/resources/mailShutdown.js", paths)
+        for index, relative in enumerate(("obj/_tests/modules/mailnews/Nntpd.sys.mjs",
+                                          "obj/_tests/modules/AppInfo.sys.mjs",
+                                          "obj/_tests/xpcshell/comm/mailnews/resources/mailShutdown.js")):
+            target = self.root / relative
+            original = target.read_text()
+            for content in (None, "// stale installed fixture"):
+                if content is None:
+                    target.unlink()
+                else:
+                    target.write_text(content)
+                output = self.root / (str(index) + ("-missing" if content is None else "-stale"))
+                output.mkdir()
+                with patch.object(runner.subprocess, "run") as execute:
+                    result = runner.run_case(config, case, output)
+                execute.assert_not_called()
+                self.assertEqual(result["disposition"], "blocked")
+                self.assertIn("blocked-dependency:", result["observed"])
+                self.assertEqual(result["coverage"], "none")
+            target.write_text(original)
+            self.assertIn(target, runner.prepare(config, case)[1])
+        with self.assertRaisesRegex(ValueError, "folder roles"):
+            runner.prepare(config, {**case, "folder_roles": {"bad": "test..filter"}})
+
+    def test_news_launch_binds_installed_root_and_keeps_later_case_after_failure(self):
+        config, case = self.news_fixture()
+        config["evidence"] = str(self.root / "evidence")
+        calls = []
+        def execute(argv, **kwargs):
+            calls.append(argv)
+            self.assertNotIn("MOZ_AUTOMATION", kwargs["env"])
+            self.assertEqual(kwargs["env"]["PANORAMA_DELIVERY_EXPECT"], "panorama:mbox")
+            self.assertEqual(kwargs["env"]["PANORAMA_DELIVERY_TEST_ROOT"],
+                             str(self.root / "obj/_tests/xpcshell/comm") + os.sep)
+            self.assertEqual(Path(argv[-1]), self.root / "comm/tests/test_one.js")
+            Path(argv[argv.index("--log-raw") + 1]).write_text(
+                "".join(json.dumps(e) + "\n" for e in self.events), encoding="utf-8")
+            return SimpleNamespace(returncode=1 if len(calls) == 1 else 0)
+        with patch.dict(os.environ, {"MOZ_AUTOMATION": "1", "PANORAMA_DELIVERY_TEST_ROOT": "stale"}), patch.object(runner.subprocess, "run", execute):
+            result = runner.run_batch(config, [case, {**case, "id": "news:panorama:mbox:Body"}])
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(result["ok"])
+        self.assertEqual([r["observed"] for r in result["results"]], ["FAIL", "PASS"])
+        self.assertEqual([r["coverage"] for r in result["results"]], ["none", "folder"])
+        hashes = result["results"][1]["hashes_before"]
+        self.assertIn(str(self.root / "obj/_tests/modules/mailnews/Nntpd.sys.mjs"), hashes)
+        self.assertEqual(hashes, result["results"][1]["hashes_after"])
+
 if __name__ == "__main__":
     unittest.main()

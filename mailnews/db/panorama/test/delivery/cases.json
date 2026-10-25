@@ -842,5 +842,289 @@
     "fixture": "preconfigured-store",
     "readiness": "pending-product",
     "phase": "uidvalidity-reset-verified"
+  },
+  {
+    "id": "news:mork:mbox:Backend",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryNewsBackend.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "ready",
+    "phase": "news-ready"
+  },
+  {
+    "id": "news:mork:mbox:Identity",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryNewsIdentity.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-identity-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:mork:mbox:Body",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryNewsBody.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-body-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:mork:mbox:Read",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryNewsRead.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-read-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:mork:mbox:Flag",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryNewsFlag.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-flag-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:mork:maildir:Backend",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryNewsBackend.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "ready",
+    "phase": "news-ready"
+  },
+  {
+    "id": "news:mork:maildir:Identity",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryNewsIdentity.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-identity-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:mork:maildir:Body",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryNewsBody.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-body-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:mork:maildir:Read",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryNewsRead.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-read-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:mork:maildir:Flag",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryNewsFlag.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "news-flag-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:mbox:Backend",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryNewsBackend.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "pending-product",
+    "phase": "news-ready"
+  },
+  {
+    "id": "news:panorama:mbox:Identity",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryNewsIdentity.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-identity-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:mbox:Body",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryNewsBody.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-body-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:mbox:Read",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryNewsRead.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-read-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:mbox:Flag",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryNewsFlag.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-flag-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:maildir:Backend",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryNewsBackend.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "account-factory",
+    "readiness": "pending-product",
+    "phase": "news-ready"
+  },
+  {
+    "id": "news:panorama:maildir:Identity",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryNewsIdentity.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-identity-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:maildir:Body",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryNewsBody.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-body-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:maildir:Read",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryNewsRead.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-read-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
+  },
+  {
+    "id": "news:panorama:maildir:Flag",
+    "manifest": "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryNewsFlag.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "news-flag-verified",
+    "folder_roles": {
+      "first": "test.subscribe.simple",
+      "second": "test.filter"
+    }
   }
 ]

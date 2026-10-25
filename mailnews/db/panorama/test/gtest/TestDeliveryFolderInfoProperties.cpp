@@ -10,10 +10,20 @@
 #include "DatabaseCore.h"
 #include "PerFolderDatabase.h"
 #include "gtest/gtest.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozIStorageConnection.h"
+#include "nsAppDirectoryServiceDefs.h"
 #include "nsCOMPtr.h"
 #include "nsIDBFolderInfo.h"
+#include "nsIEventTarget.h"
+#include "nsIFile.h"
 #include "nsIFolderDatabase.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIProperties.h"
+#include "nsServiceManagerUtils.h"
 #include "nsString.h"
+#include "nsThreadUtils.h"
+#include "nsXPCOMCID.h"
 
 namespace mozilla::mailnews {
 namespace {
@@ -43,34 +53,82 @@ static_assert(std::is_standard_layout_v<GuardedBooleanOutput>);
 static_assert(offsetof(GuardedBooleanOutput, canary) == sizeof(bool));
 static_assert(sizeof(GuardedBooleanOutput) == sizeof(int64_t));
 
-class DISABLED_DeliveryFolderInfoProperties : public ::testing::Test {
+}  // namespace
+
+class DeliveryFolderInfoProperties : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
-    // Manual-only until profile setup and async shutdown are validated.
-    sStartedCore = false;
+    ASSERT_FALSE(DatabaseCore::sInstance);
+    ASSERT_FALSE(Connection());
+    sDirectories = do_GetService(NS_DIRECTORY_SERVICE_CONTRACTID);
+    ASSERT_TRUE(sDirectories);
+    ASSERT_EQ(NS_OK,
+              sDirectories->Get(NS_APP_USER_PROFILE_50_DIR, NS_GET_IID(nsIFile),
+                                getter_AddRefs(sOldProfile)));
+    ASSERT_TRUE(sOldProfile);
+    ASSERT_EQ(NS_OK, sOldProfile->Clone(getter_AddRefs(sProfile)));
+    ASSERT_EQ(NS_OK, sProfile->Append(u"delivery-folder-info"_ns));
+    ASSERT_EQ(NS_OK, sProfile->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    sProfileCreated = true;
+    nsresult rv = sDirectories->Undefine(NS_APP_USER_PROFILE_50_DIR);
+    sDirectoryChanged = NS_SUCCEEDED(rv);
+    ASSERT_EQ(NS_OK, rv);
+    rv = sDirectories->Set(NS_APP_USER_PROFILE_50_DIR, sProfile);
+    sProfileInstalled = NS_SUCCEEDED(rv);
+    ASSERT_EQ(NS_OK, rv);
+    nsCOMPtr<nsIFile> expectedFile;
+    ASSERT_EQ(NS_OK, sProfile->Clone(getter_AddRefs(expectedFile)));
+    ASSERT_EQ(NS_OK, expectedFile->Append(u"panorama.sqlite"_ns));
     sCore = DatabaseCore::GetInstanceForService();
+    ASSERT_EQ(NS_OK, sCore->Startup());
+    ASSERT_TRUE(Connection());
+    nsCOMPtr<nsIFile> actualFile;
+    ASSERT_EQ(NS_OK, Connection()->GetDatabaseFile(getter_AddRefs(actualFile)));
+    bool sameFile = false;
+    ASSERT_EQ(NS_OK, expectedFile->Equals(actualFile, &sameFile));
+    ASSERT_TRUE(sameFile);
     ASSERT_EQ(NS_OK, sCore->GetFolderDB(getter_AddRefs(sFolders)));
-    if (!sFolders) {
-      ASSERT_EQ(NS_OK, sCore->Startup());
-      sStartedCore = true;
-      ASSERT_EQ(NS_OK, sCore->GetFolderDB(getter_AddRefs(sFolders)));
-    }
     ASSERT_TRUE(sFolders);
-    ASSERT_EQ(NS_OK, sFolders->GetFolderChildNamed(
-                         0, "delivery-folder-info-width"_ns, &sRoot));
-    if (!sRoot) {
-      ASSERT_EQ(NS_OK,
-                sFolders->InsertRoot("delivery-folder-info-width"_ns, &sRoot));
-    }
+    ASSERT_EQ(NS_OK,
+              sFolders->InsertRoot("delivery-folder-info-width"_ns, &sRoot));
   }
 
   static void TearDownTestSuite() {
     sFolders = nullptr;
-    if (sStartedCore) {
-      EXPECT_EQ(NS_OK,
-                sCore->Observe(nullptr, "profile-before-change", nullptr));
+    bool closeDrained = true;
+    if (sCore) {
+      nsCOMPtr<mozIStorageConnection> connection = Connection();
+      nsCOMPtr<nsIEventTarget> target = do_GetInterface(connection);
+      if (connection) {
+        EXPECT_TRUE(target);
+      }
+      nsresult rv = sCore->Observe(nullptr, "profile-before-change", nullptr);
+      EXPECT_EQ(NS_OK, rv);
+      sCore = nullptr;
+      closeDrained = NS_SUCCEEDED(rv);
+      if (connection) {
+        closeDrained = target && WaitForClose(target) && closeDrained;
+      }
     }
-    sCore = nullptr;
+    bool restored = RestoreProfile();
+    if (sProfileCreated) {
+      EXPECT_TRUE(closeDrained);
+      EXPECT_TRUE(restored);
+      // Retain only our child directory if close or restoration failed.
+      if (closeDrained && restored) {
+        EXPECT_EQ(NS_OK, sProfile->Remove(true));
+        bool exists = true;
+        EXPECT_EQ(NS_OK, sProfile->Exists(&exists));
+        EXPECT_FALSE(exists);
+      }
+    }
+    sProfile = nullptr;
+    sOldProfile = nullptr;
+    sDirectories = nullptr;
+    sProfileCreated = false;
+    sDirectoryChanged = false;
+    sProfileInstalled = false;
+    sRoot = 0;
   }
 
   void SetUp() override {
@@ -131,13 +189,70 @@ class DISABLED_DeliveryFolderInfoProperties : public ::testing::Test {
     }
   }
 
+  static mozIStorageConnection* Connection() {
+    return DatabaseCore::sConnection.get();
+  }
+
+  static bool WaitForClose(nsIEventTarget* target) {
+    sCloseCompleted = false;
+    // Observe queues AsyncClose before this barrier, with no intervening spin.
+    nsresult rv = target->Dispatch(
+        NS_NewRunnableFunction(
+            "FolderInfoCloseBarrier",
+            [] {
+              MOZ_ALWAYS_SUCCEEDS(
+                  NS_DispatchToMainThread(NS_NewRunnableFunction(
+                      "FolderInfoClosed", [] { sCloseCompleted = true; })));
+            }),
+        NS_DISPATCH_NORMAL);
+    EXPECT_EQ(NS_OK, rv);
+    if (NS_FAILED(rv)) {
+      return false;
+    }
+    bool drained = SpinEventLoopUntil("FolderInfoClosed"_ns,
+                                      [] { return sCloseCompleted; });
+    EXPECT_TRUE(drained);
+    return drained;
+  }
+
+  static bool RestoreProfile() {
+    if (!sDirectoryChanged) {
+      return true;
+    }
+    if (sProfileInstalled) {
+      EXPECT_EQ(NS_OK, sDirectories->Undefine(NS_APP_USER_PROFILE_50_DIR));
+    }
+    EXPECT_EQ(NS_OK,
+              sDirectories->Set(NS_APP_USER_PROFILE_50_DIR, sOldProfile));
+    nsCOMPtr<nsIFile> restored;
+    nsresult rv =
+        sDirectories->Get(NS_APP_USER_PROFILE_50_DIR, NS_GET_IID(nsIFile),
+                          getter_AddRefs(restored));
+    EXPECT_EQ(NS_OK, rv);
+    bool sameProfile = false;
+    if (NS_SUCCEEDED(rv) && restored) {
+      EXPECT_EQ(NS_OK, sOldProfile->Equals(restored, &sameProfile));
+    }
+    EXPECT_TRUE(sameProfile);
+    return sameProfile;
+  }
+
   static inline RefPtr<DatabaseCore> sCore;
   static inline nsCOMPtr<nsIFolderDatabase> sFolders;
   static inline uint64_t sRoot = 0;
-  static inline bool sStartedCore = false;
+  static inline nsCOMPtr<nsIProperties> sDirectories;
+  static inline nsCOMPtr<nsIFile> sOldProfile, sProfile;
+  static inline bool sProfileCreated = false;
+  static inline bool sDirectoryChanged = false;
+  static inline bool sProfileInstalled = false;
+  static inline bool sCloseCompleted = false;
   RefPtr<PerFolderDatabase> mDatabase;
   nsCOMPtr<nsIDBFolderInfo> mInfo;
 };
+
+namespace {
+
+using DISABLED_DeliveryFolderInfoProperties = DeliveryFolderInfoProperties;
 
 TEST_F(DISABLED_DeliveryFolderInfoProperties, MissingUsesDefault) {
   CheckRead(NS_OK, kDefault);

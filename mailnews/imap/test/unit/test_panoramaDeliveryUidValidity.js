@@ -187,16 +187,30 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
     7202,
     "Production synchronization records the replacement UIDVALIDITY"
   );
-  Assert.equal(
-    folder.getTotalMessages(false),
-    1,
-    "Only the new message is live"
+  const folderCount = folder.getTotalMessages(false);
+  const messages = Array.from(folder.messages, header => ({
+    key: header.messageKey,
+    messageId: header.messageId,
+    subject: header.subject,
+  }));
+  info(
+    "DELIVERY_IMAP_MEMBERSHIP " +
+      JSON.stringify({
+        ...lane,
+        folderURI: folder.URI,
+        uidValidity: folder.msgDatabase.dBFolderInfo.imapUidValidity,
+        folderCount,
+        pendingCount: folder.numPendingTotalMessages,
+        databaseCount: folder.msgDatabase.dBFolderInfo.numMessages,
+        messages,
+      })
   );
   Assert.deepEqual(
-    Array.from(folder.messages, header => [header.messageId, header.subject]),
+    messages.map(header => [header.messageId, header.subject]),
     [["new-epoch-reused@example.invalid", "After reset, reused UID"]],
     "Client membership and metadata match only the replacement epoch"
   );
+  Assert.equal(folderCount, 1, "Only the new message is live");
   const newHeader = folder.msgDatabase.getMsgHdrForMessageID(
     "new-epoch-reused@example.invalid"
   );

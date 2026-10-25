@@ -27,6 +27,7 @@ namespace mozilla::mailnews {
 
 class PerFolderDatabase;
 class DeliveryCoreReferences;
+class DeliveryFolderInfoProperties;
 
 class DatabaseCore : public nsIDatabaseCore,
                      public nsIMsgDBService,
@@ -49,6 +50,7 @@ class DatabaseCore : public nsIDatabaseCore,
 
  private:
   friend class DeliveryCoreReferences;
+  friend class DeliveryFolderInfoProperties;
   friend class FolderDatabase;
   friend class FolderInfo;
   friend class FolderMigrator;

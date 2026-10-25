@@ -1,9 +1,9 @@
 # Manual native acceptance
 
-Only TestDeliveryCoreReferences.cpp is linked here. Its fourteen cases remain
-DISABLED_DeliveryCoreReferences; no normal-CI filter or execution is added.
-The 93 xpcshell rows and NumericProperties hold are unchanged. FolderInfo19,
-EWS and search/conversation/browser registration remain separate owner slices.
+TestDeliveryCoreReferences.cpp (14 cases) and TestDeliveryFolderInfoProperties.cpp
+(19 cases) are linked here. Both suites retain DISABLED_ names, exact manual
+filters and pending-product status; no normal-CI execution is added.
+MessageReferences19, EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
 They have store none: no account/body-store or application-restart coverage.
 
@@ -16,7 +16,10 @@ RUN_ALL_TESTS before its destructor. TestHarness.h:91-121 then removes its profi
 shuts down XPCOM and prints Finished running GTest tests. Thus JSONL plus exit 0
 alone cannot establish successful shutdown. :126-147 creates a unique cpp-unit-profd
 under NS_OS_CURRENT_PROCESS_DIR; :192-213 exposes the persistent profile provider.
-The core fixture independently creates/removes its unique child and closes the core.
+Both fixtures independently create/remove their unique child and close the core.
+FolderInfo uses the accepted lifecycle fixture with provider restoration and an
+async-close barrier. Full process output must include suite teardown; a case PASS
+alone cannot establish close/removal. Compile and real lifecycle proof are pending.
 
 gtest.cc:6819 parses --gtest_also_run_disabled_tests. The runner passes that flag
 and one exact GTEST_FILTER; it uses no wildcard, repeat, sharding or filter-set.
@@ -53,7 +56,9 @@ are refused. This slice requires false: true is held before launch because leak-
 collection and validation are not implemented. Every case and batch reports
 leak_check: unavailable; absent logs never mean zero leaks. Debug/refcount-logging
 qualification with measured leak collection remains a future requirement.
-prepare() declares mandatory test/product/build/driver/config inputs, app and
+native-cases.json schema 2 declares each suite source and tested implementation,
+header and interface dependencies. prepare() binds their union plus the common
+core/folder/storage helpers and build/driver/config inputs, app and
 objdir/dist/bin/gtest/libxul.so, dependentlibs.list.gtest, application.ini, platform.ini
 and config.status.
 Root must bind those exact hashes to the separate reviewed native build; HEAD alone

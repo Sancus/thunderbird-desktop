@@ -161,4 +161,23 @@ Body verifies online streaming and two ARTICLE requests with no offline body;
 these lanes do not prove physical mbox/maildir persistence or restart durability.
 Native execution requires a new authorized allocation and matching source/package,
 test installation and harness dependencies. Registration is not runtime evidence.
-EWS, conversation/search/browser and native gtests remain separate pending batches.
+EWS, conversation/search/browser and native MessageReferences remain pending batches.
+
+## References metadata registration
+
+The 38 additional References files each declare one exact named task in cases.json.
+They use panorama:none and existing production-schema metadata fixtures, with no
+account/body-store fixture. Backend evidence reports metadata-only scope and none;
+folder/store diagnostics are rejected. The original three References rows retain
+panorama:mbox. All prior 93 rows and the NumericProperties hold are unchanged.
+
+Preflight binds the single named task and db/messages.sql. Accounting requires its
+ordered pending/finished messages, assertions within that task, complete file PASS
+and exit 0. Skip/expected-failure/crash policy remains strict. The five 65535-65537
+token boundary cases have a 1800-second outer minimum and a supported efd2 harness
+timeout factor of 50 (1500 seconds); other new cases use at least 600/300 seconds.
+The runner records the effective outer limit and exact timeout-factor argv. Root
+must budget each process and its descendants; any timeout fails with zero coverage.
+No boundary or literal oracle is reduced. WriteError still needs the approved
+automation-guarded connectionForTests prerequisite; no guard bypass is added.
+Native build/runtime, negative controls and close/profile qualification are pending.

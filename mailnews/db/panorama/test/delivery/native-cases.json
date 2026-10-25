@@ -1,7 +1,5 @@
 {
-  "schema": 1,
-  "suite": "DISABLED_DeliveryCoreReferences",
-  "source": "mailnews/db/panorama/test/gtest/TestDeliveryCoreReferences.cpp",
+  "schema": 2,
   "backend": "panorama",
   "store": "none",
   "readiness": "pending-product",
@@ -76,6 +74,120 @@
       "id": "core-native:References:ChangedDeleteTriggerIsUnsupported",
       "filter": "DISABLED_DeliveryCoreReferences.ChangedDeleteTriggerIsUnsupported",
       "expected": "Replacing the cleanup trigger with a no-op under version 1 is rejected; restoring the original schema permits retry."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:MissingUsesDefault",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.MissingUsesDefault",
+      "expected": "Missing uint32 property returns the supplied default without changing its canary."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:StoredZeroKeepsCanary",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.StoredZeroKeepsCanary",
+      "expected": "Stored zero returns zero without changing the uint32 canary."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:StoredMaxKeepsCanary",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.StoredMaxKeepsCanary",
+      "expected": "Stored UINT32_MAX remains exact without changing the uint32 canary."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:RepeatedReadsKeepCanary",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.RepeatedReadsKeepCanary",
+      "expected": "Repeated uint32 reads preserve value and adjacent canary."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:NegativePreservesDefault",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.NegativePreservesDefault",
+      "expected": "Negative integer returns loss of significant data and preserves default/canary."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:TooLargePreservesDefault",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.TooLargePreservesDefault",
+      "expected": "2^32 returns loss of significant data and preserves default/canary."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:NullOutputFails",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.NullOutputFails",
+      "expected": "Null uint32 output returns invalid pointer."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanStoredFalseKeepsCanary",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanStoredFalseKeepsCanary",
+      "expected": "Stored false remains false without changing any boolean canary byte."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanStoredTrueKeepsCanary",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanStoredTrueKeepsCanary",
+      "expected": "Stored true remains true without changing any boolean canary byte."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanMissingDefaultsFalse",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanMissingDefaultsFalse",
+      "expected": "Missing boolean property returns false default and preserves every canary byte."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanMissingDefaultsTrue",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanMissingDefaultsTrue",
+      "expected": "Missing boolean property returns true default and preserves every canary byte."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanRepeatedReadsKeepCanary",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanRepeatedReadsKeepCanary",
+      "expected": "Repeated boolean reads preserve value and all adjacent canary bytes."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanNullOutputFails",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanNullOutputFails",
+      "expected": "Null boolean output returns invalid pointer."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanZeroIsFalse",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanZeroIsFalse",
+      "expected": "Stored integer zero reads as false and preserves all canary bytes."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanPositiveIsTrue",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanPositiveIsTrue",
+      "expected": "Stored integer two reads as true and preserves all canary bytes."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanNegativeIsTrue",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanNegativeIsTrue",
+      "expected": "Stored negative one reads as true and preserves all canary bytes."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanWideIsTrue",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanWideIsTrue",
+      "expected": "Stored 2^32 reads as true and preserves all canary bytes."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanMinInt64IsTrue",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanMinInt64IsTrue",
+      "expected": "Stored INT64_MIN reads as true and preserves all canary bytes."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:BooleanMaxInt64IsTrue",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.BooleanMaxInt64IsTrue",
+      "expected": "Stored INT64_MAX reads as true and preserves all canary bytes."
     }
-  ]
+  ],
+  "suites": {
+    "DISABLED_DeliveryCoreReferences": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryCoreReferences.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/Message.cpp",
+        "mailnews/db/panorama/src/Message.h",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl"
+      ]
+    },
+    "DISABLED_DeliveryFolderInfoProperties": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryFolderInfoProperties.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/PerFolderDatabase.cpp",
+        "mailnews/db/panorama/src/PerFolderDatabase.h",
+        "mailnews/db/msgdb/public/nsIDBFolderInfo.idl",
+        "mailnews/db/msgdb/public/moz.build"
+      ]
+    }
+  }
 }

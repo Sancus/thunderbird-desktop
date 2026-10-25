@@ -24,10 +24,15 @@ CASES = {c["id"]: c for c in accounting.CATALOG["cases"]}
 TERMINATION_REASON = None
 COMM_INPUTS = ["mailnews/db/panorama/" + name for name in (
     "src/DatabaseCore.cpp", "src/DatabaseCore.h", "src/MessageDatabase.cpp",
-    "src/MessageDatabase.h", "test/gtest/TestDeliveryCoreReferences.cpp",
+    "src/MessageDatabase.h", "src/FolderDatabase.cpp", "src/FolderDatabase.h",
+    "src/DatabaseUtils.cpp", "src/DatabaseUtils.h", "public/nsIDatabaseCore.idl",
+    "public/nsIFolderDatabase.idl", "public/moz.build",
     "src/moz.build", "test/moz.build", "test/gtest/moz.build")]
 COMM_INPUTS += ["mailnews/db/panorama/test/delivery/" + name for name in (
     "native_accounting.py", "native_process.py", "run_native.py", "native-cases.json")]
+for suite in accounting.CATALOG["suites"].values():
+    COMM_INPUTS += [suite["source"], *suite["source_dependencies"]]
+COMM_INPUTS = list(dict.fromkeys(COMM_INPUTS))
 GECKO_INPUTS = ["testing/gtest/mozilla/GTestRunner.cpp", "xpcom/tests/TestHarness.h",
                 "third_party/googletest/googletest/src/gtest.cc", "toolkit/xre/nsAppRunner.cpp",
                 "toolkit/library/gtest/moz.build", "xpcom/base/nsDebugImpl.cpp",

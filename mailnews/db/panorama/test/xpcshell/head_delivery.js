@@ -10,7 +10,8 @@
 /**
  * @typedef {object} DeliveryLane
  * @property {"mork"|"panorama"} backend - The expected DB backend.
- * @property {"mbox"|"maildir"|"none"} store - The expected store, or raw DB scope.
+ * @property {"mbox"|"maildir"|"none"} store - The expected body store, or
+ *   metadata-only scope.
  */
 
 const PanoramaDelivery = {
@@ -31,6 +32,7 @@ const PanoramaDelivery = {
 
   /**
    * Starts the account manager and checks the active message DB service.
+   * Checks the declared lane and reports metadata-only scope for store none.
    * Call after creating the profile and preparing any startup fixtures.
    *
    * @param {"mork"|"panorama"} backend - The backend required by the case.
@@ -40,6 +42,12 @@ const PanoramaDelivery = {
     Assert.ok(
       backend == "mork" || backend == "panorama",
       "The case specifies a supported backend"
+    );
+    const lane = this.expectedLane();
+    Assert.equal(
+      backend,
+      lane.backend,
+      "The backend matches the declared lane"
     );
     const { MailServices } = ChromeUtils.importESModule(
       "resource:///modules/MailServices.sys.mjs"
@@ -51,7 +59,13 @@ const PanoramaDelivery = {
     const actualBackend =
       service instanceof Ci.nsIDatabaseCore ? "panorama" : "mork";
     info(
-      "DELIVERY_BACKEND " + JSON.stringify({ expected: backend, actualBackend })
+      "DELIVERY_BACKEND " +
+        JSON.stringify({
+          expected: backend,
+          actualBackend,
+          store: lane.store,
+          scope: lane.store == "none" ? "metadata-only" : "folder",
+        })
     );
     Assert.equal(
       Services.prefs.getBoolPref("mail.panorama.enabled", false),

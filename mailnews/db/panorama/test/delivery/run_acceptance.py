@@ -27,6 +27,7 @@ def check_log(log, case, returncode=0):
     backends, folders, contracts, phases, modes = [], [], {}, [], []
     active = False
     assertions = 0
+    tasks, task_assertions = [], 0
     is_format = case["diagnostics"] == "format-reader"
     first_failure, folder_evidence = None, {}
     try:
@@ -63,6 +64,8 @@ def check_log(log, case, returncode=0):
                 active = True
             if action == "test_status":
                 assertions += 1
+                if tasks == [(case.get("task"), "pending")]:
+                    task_assertions += 1
             if action in ("test_status", "test_end"):
                 if not active:
                     errors.append("result outside active case")
@@ -79,6 +82,13 @@ def check_log(log, case, returncode=0):
             # xpcshell info() adds literal enclosing quotes, not JSON escaping.
             if message.startswith('"DELIVERY_') and message.endswith('"'):
                 message = message[1:-1]
+            if case.get("task"):
+                task = re.fullmatch(
+                    r"\(xpcshell/head\.js\) \| test (test_\w+) (pending|finished) \(\d+\)", message)
+                if task:
+                    if not active:
+                        errors.append("task event outside active file")
+                    tasks.append(task.groups())
             if message.startswith("DELIVERY_"):
                 if is_format:
                     errors.append("format-reader case unexpectedly claimed product evidence")
@@ -112,6 +122,12 @@ def check_log(log, case, returncode=0):
             for d in backends
         )):
             errors.append("missing or mismatched backend evidence")
+        if case.get("task") and (tasks != [(case["task"], "pending"), (case["task"], "finished")]
+                                 or not task_assertions):
+            errors.append("require one complete requested task with assertions")
+        if case.get("task") and any(d.get("store") != "none" or d.get("scope") != "metadata-only"
+                                    for d in backends):
+            errors.append("metadata-only case must not claim body-store coverage")
         if case.get("phase") and case["phase"] not in phases:
             errors.append("missing required completion phase")
         if case["id"].startswith("imap:") and (not modes or any(
@@ -232,18 +248,33 @@ def prepare(config, case):
         paths += [p for pair in module_pairs for p in pair]
         paths += [comm / "mailnews/moz.build", source / "testing/modules/moz.build"]
     paths += [(manifest.parent / h).resolve() for h in entry.get("head", defaults["head"]).split()]
-    if is_format:
-        if not case.get("source_dependencies"):
-            raise ValueError("format-reader case must bind its source module/packaging")
-        dependencies = [(manifest.parent / name).resolve() for name in
-                        defaults.get("support-files", []) + entry.get("support-files", [])]
-        dependencies += [(comm / name).resolve() for name in case["source_dependencies"]]
-        if any(not p.is_relative_to(comm.resolve()) for p in dependencies):
-            raise ValueError("format-reader dependencies must remain in source comm/")
-        paths += dependencies
+    if is_format and not case.get("source_dependencies"):
+        raise ValueError("format-reader case must bind its source module/packaging")
+    dependencies = []
+    for name in defaults.get("support-files", []) + entry.get("support-files", []):
+        if "*" in name:
+            pattern = name + ("/*" if name.endswith("**") else "")
+            matches = [p.resolve() for p in manifest.parent.glob(pattern) if p.is_file()]
+            if not matches:
+                raise ValueError("blocked-dependency: empty support-file glob: " + name)
+            dependencies += matches
+        else:
+            dependencies.append((manifest.parent / name).resolve())
+    dependencies += [(comm / name).resolve() for name in case.get("source_dependencies", [])]
+    if any(not p.is_relative_to(comm.resolve()) for p in dependencies):
+        raise ValueError("fixture dependencies must remain in source comm/")
+    paths += dependencies
     if any(not p.is_file() for p in paths):
         missing = ", ".join(str(p) for p in paths if not p.is_file())
         raise ValueError("blocked-dependency: " + missing)
+    if case.get("task"):
+        if case["store"] != "none" or case["backend"] != "panorama":
+            raise ValueError("named metadata tasks require panorama:none")
+        text = (manifest.parent / case["file"]).read_text(encoding="utf-8")
+        tasks = re.findall(r"\badd_task\s*\(\s*(?:async\s+)?function\s+(\w+)\s*\(", text)
+        if (tasks != [case["task"]] or len(re.findall(r"\badd_task\s*\(", text)) != 1
+            or re.search(r"\b(?:add_test|run_test)\s*\(", text)):
+            raise ValueError("require one unconditional named task matching the catalog")
     for original, installed in module_pairs:
         if original.read_bytes() != installed.read_bytes():
             raise ValueError("blocked-dependency: installed NNTP fixture differs from source: " + str(installed))
@@ -267,6 +298,12 @@ def run_case(config, case, output):
             "--build-info-json", str(obj / "mozinfo.json"), "--manifest", str(manifest),
             "--headless", "--sequential", "--verbose", "--log-raw", str(raw),
             str(manifest.parent / case["file"])]
+    timeout = config.get("timeout_seconds", 600)
+    if case.get("task"):
+        timeout = max(timeout, case.get("timeout_seconds", 600))
+        if type(timeout) is not int or not 600 <= timeout <= 3600:
+            raise ValueError("case timeout must be an integer from 600 to 3600 seconds")
+        argv[2:2] = ["--timeout-factor", str((timeout - 300) // 30)]
     env = os.environ.copy()
     env.pop("MOZ_AUTOMATION", None)
     if case["diagnostics"] == "format-reader":
@@ -281,7 +318,8 @@ def run_case(config, case, output):
                               "PANORAMA_DELIVERY_EXPECT": env.get("PANORAMA_DELIVERY_EXPECT"),
                               "PANORAMA_DELIVERY_TEST_ROOT": env.get("PANORAMA_DELIVERY_TEST_ROOT")},
               "logs": {"raw": str(raw), "stdout": str(stdout), "stderr": str(stderr)},
-              "started_utc": datetime.now(timezone.utc).isoformat(), "exit_code": None}
+              "started_utc": datetime.now(timezone.utc).isoformat(), "exit_code": None,
+              "timeout_seconds": timeout}
     (output / "request.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     try:
         _, paths = prepare(config, case)
@@ -289,7 +327,7 @@ def run_case(config, case, output):
         before = digest(paths)
         with stdout.open("wb") as out, stderr.open("wb") as err:
             result = subprocess.run(argv, cwd=source, env=env, stdout=out, stderr=err,
-                                    timeout=config.get("timeout_seconds", 600), check=False)
+                                    timeout=timeout, check=False)
         record.update(check_log(raw, case, result.returncode))
         record.update(observed="PASS" if record["ok"] else "FAIL",
                       disposition="passed" if record["ok"] else "failed", exit_code=result.returncode,

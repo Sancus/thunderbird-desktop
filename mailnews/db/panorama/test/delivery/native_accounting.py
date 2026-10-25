@@ -26,7 +26,9 @@ def check_log(path, selected_filter, returncode, *, timed_out=False):
         errors.append(f"process exit: {returncode}")
     if timed_out:
         errors.append("process timed out")
-    suite = CATALOG["suite"]
+    suite = selected_filter.partition(".")[0]
+    if suite not in CATALOG["suites"]:
+        errors.append("unregistered native suite")
     state = "before-suite"
     counts = {name: 0 for name in ("suite_start", "group_start", "test_start",
                                   "test_end", "group_end", "suite_end", "test_status")}

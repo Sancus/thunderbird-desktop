@@ -593,6 +593,103 @@ prefs = [
         hashes = result["results"][1]["hashes_before"]
         self.assertIn(str(self.root / "obj/_tests/modules/mailnews/Nntpd.sys.mjs"), hashes)
         self.assertEqual(hashes, result["results"][1]["hashes_after"])
+    def test_metadata_task_requires_exact_completion_assertions_and_scope(self):
+        case = {**self.case, "store": "none", "diagnostics": "backend",
+                "task": "test_references"}
+        backend = self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama",
+                                       "store": "none", "scope": "metadata-only"})
+        def task(name, state):
+            return {"action": "log", "message":
+                    f"(xpcshell/head.js) | test {name} {state} (2)"}
+        begin, end = task(case["task"], "pending"), task(case["task"], "finished")
+        events = self.events[:2] + [backend, begin, self.events[5], end] + self.events[6:]
+        self.assertTrue(self.check(events, case)["ok"])
+        for index in (3, 4, 5):
+            self.assertFalse(self.check(events[:index] + events[index + 1:], case)["ok"])
+        for extra in (begin, end, task("test_other", "pending"), self.events[4]):
+            self.assertFalse(self.check(events[:5] + [extra] + events[5:], case)["ok"])
+        for data in ({"store": "mbox", "scope": "folder"}, {"store": "none"}):
+            wrong = self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama", **data})
+            self.assertFalse(self.check(events[:2] + [wrong] + events[3:], case)["ok"])
+
+    def test_named_task_preflight_binds_source_and_support_file(self):
+        source = self.root / "comm/tests"
+        source.mkdir(parents=True)
+        (source / "manual.toml").write_text('''[DEFAULT]
+head = "head.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]
+prefs = ["mail.panorama.enabled=true"]
+support-files = ["fixture.sql"]
+["test_one.js"]
+''')
+        (source / "head.js").write_text("// fixture")
+        (source / "fixture.sql").write_text("-- captured layout")
+        case = {**self.case, "store": "none", "diagnostics": "backend",
+                "fixture": "raw-db", "task": "test_references"}
+        test = source / "test_one.js"
+        test.write_text("add_task(function test_references() {});")
+        self.assertIn(source / "fixture.sql", runner.prepare({"source": str(self.root)}, case)[1])
+
+        manifest = source / "manual.toml"
+        original = manifest.read_text()
+        manifest.write_text(original.replace('"fixture.sql"', '"data/**"'))
+        (source / "data").mkdir()
+        support = source / "data/row.sql"
+        support.write_text("-- observed fragment")
+        self.assertIn(support, runner.prepare({"source": str(self.root)}, case)[1])
+        support.unlink()
+        with self.assertRaisesRegex(ValueError, "empty support-file glob"):
+            runner.prepare({"source": str(self.root)}, case)
+        manifest.write_text(original)
+        for text in ("", "add_task(function test_wrong() {});",
+                     "add_task({skip_if: true}, function test_references() {});",
+                     "add_task(function test_references() {}); add_task(function test_extra() {});"):
+            test.write_text(text)
+            with self.assertRaisesRegex(ValueError, "named task"):
+                runner.prepare({"source": str(self.root)}, case)
+        test.write_text("add_task(function test_references() {});")
+        (source / "fixture.sql").unlink()
+        with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+            runner.prepare({"source": str(self.root)}, case)
+
+    def test_large_case_timeout_is_explicit_and_never_success(self):
+        case = {**self.case, "task": "test_references", "timeout_seconds": 1800}
+        config = {"source": str(self.root), "objdir": str(self.root / "obj"),
+                  "python": "python", "timeout_seconds": 600}
+        def timeout(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], 1800)
+            self.assertEqual(argv[argv.index("--timeout-factor") + 1], "50")
+            self.assertNotIn("--timeout-as-pass", argv)
+            self.assertEqual(Path(argv[-1]).name, case["file"])
+            raise runner.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        with (patch.object(runner, "prepare", return_value=(None, [])),
+              patch.object(runner, "digest", return_value={}),
+              patch.object(runner.subprocess, "run", timeout)):
+            record = runner.run_case(config, case, self.root)
+        self.assertFalse(record["ok"])
+        self.assertEqual(record["observed"], "TIMEOUT")
+        self.assertEqual(record["coverage"], "none")
+        self.assertEqual(record["disposition"], "failed")
+
+    def test_registered_metadata_files_select_one_task_without_a_store(self):
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        comm = runner.HERE.parents[4]
+        cases = [c for c in catalog if c.get("task")]
+        self.assertEqual(len(cases), 38)
+        self.assertEqual(len({c["id"] for c in catalog}), 131)
+        for case in cases:
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            for section in (doc["DEFAULT"], doc[case["file"]]):
+                self.assertFalse(set(section) & {"skip-if", "fail-if", "run-if", "disabled", "expected"})
+            text = (manifest.parent / case["file"]).read_text()
+            names = runner.re.findall(r"\badd_task\s*\(\s*(?:async\s+)?function\s+(\w+)\s*\(", text)
+            self.assertEqual(names, [case["task"]])
+            self.assertEqual((case["backend"], case["store"], case["fixture"]),
+                             ("panorama", "none", "raw-db"))
+            if "Count" in case["id"]:
+                self.assertEqual(case["timeout_seconds"], 1800)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -446,6 +446,23 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
             verify.assert_called_once()
 
+
+    def test_receipt_must_bind_each_suites_implementation_header_and_fixture(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        dependencies = ("src/Message.cpp", "src/Message.h", "src/PerFolderDatabase.cpp",
+                        "src/PerFolderDatabase.h", "test/gtest/TestDeliveryFolderInfoProperties.cpp")
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)),
+              patch.object(runner, "verify") as verify):
+            for relative in dependencies:
+                path = str(Path(config["source"]) / "comm/mailnews/db/panorama" / relative)
+                identity = receipt["inputs"].pop(path, "0" * 64)
+                self.bind_receipt(config, receipt)
+                with self.subTest(path=relative), self.assertRaisesRegex(ValueError, "omits required"):
+                    runner.prepare(config, time.monotonic()+5)
+                receipt["inputs"][path] = identity
+            verify.assert_not_called()
+
     def test_capture_rechecks_images_after_initial_mapping_proof(self):
         class Child:
             pid = 123

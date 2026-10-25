@@ -106,6 +106,44 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertFalse(native.check_log(self.log, self.selected, 0)["log_complete"])
         self.reject(self.events + [{"action": "unexpected"}])
 
+    def test_folder_info_selection_is_independent_and_teardown_failure_is_fatal(self):
+        self.selected = "DISABLED_DeliveryFolderInfoProperties.BooleanWideIsTrue"
+        for index in (1, 4):
+            self.events[index]["name"] = "DISABLED_DeliveryFolderInfoProperties"
+        for index in (2, 3):
+            self.events[index]["test"] = self.selected
+        self.assertTrue(self.check(self.events)["log_complete"])
+        wrong = copy.deepcopy(self.events)
+        wrong[4]["name"] = "DISABLED_DeliveryCoreReferences"
+        self.reject(wrong)
+        failure = {"action": "test_status", "test": self.selected,
+                   "status": "FAIL", "message": "suite close barrier failed"}
+        result = self.reject(self.events[:4] + [failure] + self.events[4:])
+        self.assertEqual(result["first_failure"], failure)
+        for status in ("SKIP", "FAIL"):
+            wrong = copy.deepcopy(self.events)
+            wrong[3]["status"] = status
+            self.reject(wrong)
+
+    def test_catalog_suites_match_integrated_disabled_sources_and_receipt_dependencies(self):
+        import re
+        import run_native
+        comm = native.HERE.parents[4]
+        catalog = native.CATALOG
+        self.assertEqual(catalog["schema"], 2)
+        self.assertEqual(len(catalog["cases"]), 33)
+        for suite, declaration in catalog["suites"].items():
+            self.assertTrue(suite.startswith("DISABLED_"))
+            source = comm / declaration["source"]
+            names = re.findall(r"TEST_F\(\s*" + suite + r",\s*(\w+)\s*\)", source.read_text())
+            filters = {suite + "." + name for name in names}
+            selected = [c["filter"] for c in catalog["cases"] if c["filter"].startswith(suite + ".")]
+            self.assertEqual(set(selected), filters)
+            self.assertEqual(len(selected), len(filters))
+            for path in [declaration["source"], *declaration["source_dependencies"]]:
+                self.assertTrue((comm / path).is_file(), path)
+                self.assertIn(path, run_native.COMM_INPUTS)
+
 
 if __name__ == "__main__":
     unittest.main()

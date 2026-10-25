@@ -65,6 +65,14 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult GetMessageProperty(nsMsgKey key, const nsACString& name,
                               uint32_t& value);
 
+  // Raw parsed tokens, in order, without normalization or self-exclusion.
+  // Missing row: NS_ERROR_UNEXPECTED; discarded history:
+  // NS_ERROR_NOT_AVAILABLE. On failure the output is unchanged.
+  nsresult GetMessageReferences(nsMsgKey key, nsTArray<nsCString>& references);
+  // Metadata only. Owns its transaction; rejects any transaction already open.
+  nsresult SetMessageReferences(nsMsgKey key,
+                                const nsTArray<nsCString>& references);
+
   nsresult GetMessageThreadId(nsMsgKey key, nsMsgKey& threadId);
   nsresult GetMessageThreadParent(nsMsgKey key, nsMsgKey& threadParent);
 
@@ -101,6 +109,12 @@ class MessageDatabase : public nsIMessageDatabase {
 
  private:
   friend class DatabaseCore;
+  friend class FolderMigrator;
+
+  // Caller owns the active transaction/savepoint and must roll it back on
+  // error.
+  nsresult WriteMessageReferencesInTransaction(
+      nsMsgKey key, const nsTArray<nsCString>& references);
 
   MessageDatabase() {};
   void Startup();

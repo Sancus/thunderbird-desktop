@@ -114,8 +114,10 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
 
   mFolderDatabase = nullptr;
 
-  mMessageDatabase->Shutdown();
-  mMessageDatabase = nullptr;
+  if (mMessageDatabase) {
+    mMessageDatabase->Shutdown();
+    mMessageDatabase = nullptr;
+  }
 
   if (sConnection) {
     sConnection->AsyncClose(nullptr);
@@ -159,17 +161,49 @@ nsresult DatabaseCore::EnsureConnection() {
       do_GetService("@mozilla.org/storage/service;1");
   NS_ENSURE_STATE(storage);
 
+  bool schemaCommitted = false;
+  bool cleanupSucceeded = true;
+  auto connectionGuard = MakeScopeExit([&] {
+    if (sConnection) {
+      nsresult closeRv = sConnection->Close();
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(closeRv),
+                           "Failed to close an uninitialized database");
+      sConnection = nullptr;
+      if (!exists && !schemaCommitted && cleanupSucceeded &&
+          NS_SUCCEEDED(closeRv)) {
+        nsresult removeRv = databaseFile->Remove(false);
+        NS_WARNING_ASSERTION(
+            NS_SUCCEEDED(removeRv),
+            "Failed to remove a newly created, rolled-back database");
+      }
+    }
+  });
   rv = storage->OpenUnsharedDatabase(databaseFile,
                                      mozIStorageService::CONNECTION_DEFAULT,
                                      getter_AddRefs(sConnection));
   NS_ENSURE_SUCCESS(rv, rv);
-
   if (!exists) {
-    rv = CreateNewDatabase();
-    NS_ENSURE_SUCCESS(rv, rv);
-
-    sDatabaseIsNew = true;
+    MOZ_TRY(sConnection->ExecuteSimpleSQL("PRAGMA journal_mode=WAL;"_ns));
   }
+  MOZ_TRY(sConnection->BeginTransaction());
+  auto transactionGuard = MakeScopeExit([&] {
+    bool active = false;
+    nsresult cleanupRv = sConnection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanupRv) && active) {
+      cleanupRv = sConnection->RollbackTransaction();
+    }
+    cleanupSucceeded = NS_SUCCEEDED(cleanupRv);
+    NS_WARNING_ASSERTION(cleanupSucceeded,
+                         "Database initialization rollback failed");
+  });
+  if (!exists) {
+    MOZ_TRY(CreateNewDatabase());
+  }
+  MOZ_TRY(UpgradeReferencesSchema());
+  MOZ_TRY(sConnection->CommitTransaction());
+  transactionGuard.release();
+  schemaCommitted = true;
+  sDatabaseIsNew = !exists;
 
   rv = sConnection->ExecuteSimpleSQL("PRAGMA cache_size=-200000;"_ns);
   NS_ENSURE_SUCCESS(rv, rv);
@@ -182,6 +216,95 @@ nsresult DatabaseCore::EnsureConnection() {
   RefPtr<GroupedByDateFunction> dateGroup = new GroupedByDateFunction();
   sConnection->CreateFunction("date_group"_ns, 1, dateGroup);
 
+  connectionGuard.release();
+  return NS_OK;
+}
+
+namespace {
+
+constexpr auto kReferenceDeleteTrigger =
+    "CREATE TRIGGER delete_message_references AFTER DELETE ON messages BEGIN "
+    "DELETE FROM message_references WHERE id = OLD.id; "
+    "DELETE FROM message_reference_sets WHERE id = OLD.id; END"_ns;
+
+nsresult CheckReferenceSchemaTable(mozIStorageConnection* connection,
+                                   const char* table, const char* columns) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(connection->CreateStatement(
+      "SELECT group_concat(name || ':' || type || ':' || \"notnull\" || ':' || "
+      "pk, ',') "
+      "FROM (SELECT * FROM pragma_table_info(:table) ORDER BY cid) "
+      "WHERE EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :table)"_ns,
+      getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindUTF8StringByName("table"_ns, nsDependentCString(table)));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  nsCString actual;
+  MOZ_TRY(stmt->GetUTF8String(0, actual));
+  NS_ENSURE_TRUE(actual.Equals(columns), NS_ERROR_FILE_CORRUPTED);
+  return NS_OK;
+}
+
+}  // namespace
+
+nsresult DatabaseCore::UpgradeReferencesSchema() {
+  int32_t version;
+  MOZ_TRY(sConnection->GetSchemaVersion(&version));
+  NS_ENSURE_TRUE(version == 0 || version == 1, NS_ERROR_NOT_AVAILABLE);
+  // Both the original production schema and the old test fixture have these
+  // columns. References discarded by either layout cannot be reconstructed.
+  static constexpr struct {
+    const char* table;
+    const char* columns;
+  } layouts[] = {
+      {"folders",
+       "id:INTEGER:0:1,parent:INTEGER:0:0,ordinal:INTEGER:0:0,name:TEXT:0:0,"
+       "flags:INTEGER:0:0"},
+      {"folder_properties", "id:INTEGER:0:1,name:TEXT:0:2,value:ANY:0:0"},
+      {"messages",
+       "id:INTEGER:0:1,folderId:INTEGER:0:0,threadId:INTEGER:0:0,threadParent:"
+       "INTEGER:0:0,messageId:TEXT:0:0,date:INTEGER:0:0,sender:TEXT:0:0,"
+       "recipients:TEXT:0:0,ccList:TEXT:0:0,bccList:TEXT:0:0,subject:TEXT:0:0,"
+       "flags:INTEGER:0:0,tags:TEXT:0:0,priority:INTEGER:0:0"},
+      {"message_properties", "id:INTEGER:0:1,name:TEXT:0:2,value:ANY:0:0"},
+      {"virtualFolder_folders",
+       "virtualFolderId:INTEGER:0:0,searchFolderId:INTEGER:0:0"},
+      {"search_folder_hits", "folder_id:INTEGER:0:1,message_id:INTEGER:0:2"},
+  };
+  for (const auto& layout : layouts) {
+    MOZ_TRY(
+        CheckReferenceSchemaTable(sConnection, layout.table, layout.columns));
+  }
+  if (version == 0) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE message_reference_sets(id INTEGER PRIMARY KEY REFERENCES messages(id))"_ns));
+    MOZ_TRY(
+        sConnection->ExecuteSimpleSQL("CREATE TABLE message_references("
+                                      "id INTEGER REFERENCES messages(id), "
+                                      "ordinal INTEGER, token TEXT NOT NULL, "
+                                      "PRIMARY KEY(id, ordinal))"_ns));
+    // Foreign key enforcement is not established by the existing database.
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kReferenceDeleteTrigger));
+    MOZ_TRY(sConnection->SetSchemaVersion(1));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(sConnection, "message_reference_sets",
+                                    "id:INTEGER:0:1"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "message_references",
+      "id:INTEGER:0:1,ordinal:INTEGER:0:2,token:TEXT:1:0"));
+  bool exists;
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(sConnection->CreateStatement(
+      "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+      "AND name = 'delete_message_references' AND tbl_name = 'messages'"_ns,
+      getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->ExecuteStep(&exists));
+  NS_ENSURE_TRUE(exists, NS_ERROR_FILE_CORRUPTED);
+  nsCString triggerSQL;
+  MOZ_TRY(stmt->GetUTF8String(0, triggerSQL));
+  NS_ENSURE_TRUE(triggerSQL.Equals(kReferenceDeleteTrigger),
+                 NS_ERROR_FILE_CORRUPTED);
   return NS_OK;
 }
 
@@ -190,9 +313,7 @@ nsresult DatabaseCore::CreateNewDatabase() {
           ("database file does not exist, creating"));
   // Please keep mailnews/db/panorama/test/xpcshell/head.js in sync with
   // changes to the following code.
-  nsresult rv = sConnection->ExecuteSimpleSQL("PRAGMA journal_mode=WAL;"_ns);
-  NS_ENSURE_SUCCESS(rv, rv);
-  rv = sConnection->ExecuteSimpleSQL(
+  nsresult rv = sConnection->ExecuteSimpleSQL(
       "CREATE TABLE folders ( \
         id INTEGER PRIMARY KEY, \
         parent INTEGER REFERENCES folders(id), \
@@ -520,6 +641,7 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
   nsMainThreadPtrHandle<Promise> mPromiseHolder;
 
   struct MessageData {
+    nsTArray<nsCString> references;
     nsMsgKey oldMessageKey;
     nsCString storeToken;
     uint32_t messageSize;
@@ -592,6 +714,10 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
                          mDestFolderPath);
     nsresult rv = NS_OK;
     if (mSavepointActive) {
+      if (!DatabaseCore::sConnection) {
+        mPromiseHolder.get()->MaybeReject(NS_ERROR_NOT_AVAILABLE);
+        return;
+      }
       if (success) {
         rv = DatabaseCore::ReleaseSavepoint("foldermigration"_ns);
       }
@@ -697,6 +823,13 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       // new keys of the messages.
 
       MessageData data;
+      uint16_t referenceCount;
+      MOZ_TRY(message->GetNumReferences(&referenceCount));
+      for (uint16_t i = 0; i < referenceCount; ++i) {
+        nsCString reference;
+        MOZ_TRY(message->GetStringReference(i, reference));
+        data.references.AppendElement(reference);
+      }
       message->GetMessageKey(&data.oldMessageKey);
       message->GetThreadId(&data.threadId);
       if (data.threadId == 0xfffffffe) {
@@ -854,6 +987,20 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
         guard.release();
         return NS_OK;
       }
+    }
+
+    // The migration owns the savepoint until Complete ends it.
+    RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+    NS_ENSURE_TRUE(core && core->mMessageDatabase, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(mNewMessageKeys.Length() == mMessageData.Length(),
+                   NS_ERROR_UNEXPECTED);
+    for (size_t i = 0; i < mMessageData.Length(); ++i) {
+      NS_ENSURE_TRUE(mNewMessageKeys[i] > 0 &&
+                         uint64_t(mNewMessageKeys[i]) < nsMsgKey_None,
+                     NS_ERROR_ILLEGAL_VALUE);
+      MOZ_TRY(core->MessageDB().WriteMessageReferencesInTransaction(
+          static_cast<nsMsgKey>(mNewMessageKeys[i]),
+          mMessageData[i].references));
     }
 
     // Step 3 had no properties to insert, or step 4 is complete.

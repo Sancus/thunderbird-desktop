@@ -159,6 +159,8 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
       cached.threadId = cached.key;
     }
 
+    MOZ_TRY(WriteMessageReferencesInTransaction(cached.key, aReferences));
+
     if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
       return NS_ERROR_OUT_OF_MEMORY;
     }
@@ -204,6 +206,120 @@ NS_IMETHODIMP MessageDatabase::GetMessage(nsMsgKey key, nsIMsgDBHdr** message) {
   *message = new Message(key);
   NS_IF_ADDREF(*message);
   return NS_OK;
+}
+
+nsresult MessageDatabase::GetMessageReferences(
+    nsMsgKey key, nsTArray<nsCString>& references) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "GetMessageReferences"_ns,
+      "SELECT s.id, r.token FROM messages m "
+      "LEFT JOIN message_reference_sets s ON s.id = m.id "
+      "LEFT JOIN message_references r ON r.id = s.id "
+      "WHERE m.id = :id ORDER BY r.ordinal"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (!more) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  bool isNull;
+  MOZ_TRY(stmt->GetIsNull(0, &isNull));
+  if (isNull) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  nsTArray<nsCString> result;
+  do {
+    MOZ_TRY(stmt->GetIsNull(1, &isNull));
+    if (!isNull) {
+      nsCString token;
+      MOZ_TRY(stmt->GetUTF8String(1, token));
+      result.AppendElement(token);
+    }
+    MOZ_TRY(stmt->ExecuteStep(&more));
+  } while (more);
+  references.SwapElements(result);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::WriteMessageReferencesInTransaction(
+    nsMsgKey key, const nsTArray<nsCString>& references) {
+  bool inTransaction;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&inTransaction));
+  NS_ENSURE_TRUE(inTransaction, NS_ERROR_UNEXPECTED);
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "RequireMessageForReferences"_ns,
+        "SELECT 1 FROM messages WHERE id = :id"_ns, getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    bool exists;
+    MOZ_TRY(stmt->ExecuteStep(&exists));
+    NS_ENSURE_TRUE(exists, NS_ERROR_UNEXPECTED);
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ClearMessageReferences"_ns,
+        "DELETE FROM message_references WHERE id = :id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->Execute());
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "MarkMessageReferencesKnown"_ns,
+        "INSERT OR IGNORE INTO message_reference_sets(id) VALUES(:id)"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->Execute());
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "InsertMessageReference"_ns,
+      "INSERT INTO message_references(id, ordinal, token) "
+      "VALUES(:id, :ordinal, :token)"_ns,
+      getter_AddRefs(stmt)));
+  for (uint32_t i = 0; i < references.Length(); ++i) {
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("ordinal"_ns, i));
+    MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, references[i]));
+    MOZ_TRY(stmt->Execute());
+  }
+  return NS_OK;
+}
+
+nsresult MessageDatabase::SetMessageReferences(
+    nsMsgKey key, const nsTArray<nsCString>& references) {
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool inTransaction;
+  MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
+  NS_ENSURE_FALSE(inTransaction, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = WriteMessageReferencesInTransaction(key, references);
+  if (NS_SUCCEEDED(rv)) {
+    rv = connection->CommitTransaction();
+  }
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&inTransaction);
+    if (NS_SUCCEEDED(cleanupRv) && inTransaction) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("References cleanup failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+  }
+  return rv;
 }
 
 nsresult MessageDatabase::MessageExists(nsMsgKey key, bool& exists) {

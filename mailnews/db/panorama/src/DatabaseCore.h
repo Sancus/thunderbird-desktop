@@ -26,6 +26,7 @@ class mozIStorageStatement;
 namespace mozilla::mailnews {
 
 class PerFolderDatabase;
+class DeliveryCoreReferences;
 
 class DatabaseCore : public nsIDatabaseCore,
                      public nsIMsgDBService,
@@ -47,6 +48,7 @@ class DatabaseCore : public nsIDatabaseCore,
   virtual ~DatabaseCore() {};
 
  private:
+  friend class DeliveryCoreReferences;
   friend class FolderDatabase;
   friend class FolderInfo;
   friend class FolderMigrator;
@@ -66,6 +68,7 @@ class DatabaseCore : public nsIDatabaseCore,
 
   static nsresult EnsureConnection();
   static nsresult CreateNewDatabase();
+  static nsresult UpgradeReferencesSchema();
 
   static nsresult GetStatement(const nsACString& aName, const nsACString& aSQL,
                                mozIStorageStatement** aStmt);

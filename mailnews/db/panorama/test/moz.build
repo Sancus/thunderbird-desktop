@@ -5,3 +5,6 @@
 XPCSHELL_TESTS_MANIFESTS += [
     "xpcshell/xpcshell.toml",
 ]
+
+# Pending delivery cases require explicit disabled-test opt-in.
+TEST_DIRS += ["gtest"]

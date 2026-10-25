@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "suite": "DISABLED_DeliveryCoreReferences",
+  "source": "mailnews/db/panorama/test/gtest/TestDeliveryCoreReferences.cpp",
+  "backend": "panorama",
+  "store": "none",
+  "readiness": "pending-product",
+  "execution_hold": "Exact efd2 native driver/output/profile/build sources and matching native execution remain unverified. This catalog does not authorize execution.",
+  "cases": [
+    {
+      "id": "core-native:References:AddNotificationSeesCommittedReferences",
+      "filter": "DISABLED_DeliveryCoreReferences.AddNotificationSeesCommittedReferences",
+      "expected": "One native addition callback sees the literal duplicate ancestor sequence through GetMessageReferences and an unshared committed reader."
+    },
+    {
+      "id": "core-native:References:ExactTokensSurviveReopen",
+      "filter": "DISABLED_DeliveryCoreReferences.ExactTokensSurviveReopen",
+      "expected": "Exact case, empty token, composed/decomposed Unicode, duplicates and unresolved IDs survive a real Core/connection shutdown and reopen in the same process; getter and unshared reader use literal independent arrays."
+    },
+    {
+      "id": "core-native:References:ReplaceAndClearDoNotRethread",
+      "filter": "DISABLED_DeliveryCoreReferences.ReplaceAndClearDoNotRethread",
+      "expected": "Atomic replacement and clear are visible in native reads/unshared storage; parent, shared thread identity, flags and count remain unchanged."
+    },
+    {
+      "id": "core-native:References:FailedReplacementPreservesCommittedSequence",
+      "filter": "DISABLED_DeliveryCoreReferences.FailedReplacementPreservesCommittedSequence",
+      "expected": "A reached ordinal-1 insert trigger records the actual key and fires once. Expected storage constraint leaves the prior sequence intact on native/unshared reads and no open transaction."
+    },
+    {
+      "id": "core-native:References:FailedClearPreservesCommittedSequence",
+      "filter": "DISABLED_DeliveryCoreReferences.FailedClearPreservesCommittedSequence",
+      "expected": "A reached delete trigger records the affected key; failed clear preserves the literal prior sequence through both readers."
+    },
+    {
+      "id": "core-native:References:FailedAddRollsBackMessageAndReferences",
+      "filter": "DISABLED_DeliveryCoreReferences.FailedAddRollsBackMessageAndReferences",
+      "expected": "Independently committed control survives a reached second-token fault; failed key is missing and has no token rows before retry; retry succeeds with its literal sequence."
+    },
+    {
+      "id": "core-native:References:MissingRowsAndStorageErrorsAreFailures",
+      "filter": "DISABLED_DeliveryCoreReferences.MissingRowsAndStorageErrorsAreFailures",
+      "expected": "Missing row get/set fail explicitly; getter output is unchanged. A renamed storage table yields the expected storage error rather than empty success."
+    },
+    {
+      "id": "core-native:References:UpgradeKeepsOldReferencesUnavailable",
+      "filter": "DISABLED_DeliveryCoreReferences.UpgradeKeepsOldReferencesUnavailable",
+      "expected": "Independent captured unversioned layout retains row 7 but native References is unavailable; explicit clear makes it known empty and that state survives reopen. Version becomes 1."
+    },
+    {
+      "id": "core-native:References:UnsupportedSchemaCanRetryAfterRepair",
+      "filter": "DISABLED_DeliveryCoreReferences.UnsupportedSchemaCanRetryAfterRepair",
+      "expected": "An extra core message column is rejected without poisoning the static connection; restoring the captured layout permits retry."
+    },
+    {
+      "id": "core-native:References:DeleteRemovesSequenceAndKnownMarker",
+      "filter": "DISABLED_DeliveryCoreReferences.DeleteRemovesSequenceAndKnownMarker",
+      "expected": "A raw unshared reader sees the known marker before deletion and its absence immediately afterward, before replacement; the native getter reports missing-row and token rows are absent. A later add has known-empty References; no key-reuse guarantee is asserted."
+    },
+    {
+      "id": "core-native:References:SetterDoesNotAdoptForeignTransaction",
+      "filter": "DISABLED_DeliveryCoreReferences.SetterDoesNotAdoptForeignTransaction",
+      "expected": "Existing caller-owned transaction remains active and committed sequence is unchanged when standalone setter rejects it."
+    },
+    {
+      "id": "core-native:References:FailedUpgradeRollsBackAndCanRetry",
+      "filter": "DISABLED_DeliveryCoreReferences.FailedUpgradeRollsBackAndCanRetry",
+      "expected": "A real DDL name conflict after the first new table is created fails initialization; no partial marker table/version increment survives; repair permits retry."
+    },
+    {
+      "id": "core-native:References:FutureSchemaIsNotSilentlyAccepted",
+      "filter": "DISABLED_DeliveryCoreReferences.FutureSchemaIsNotSilentlyAccepted",
+      "expected": "Version 99 is rejected and retained; explicitly restoring the supported old version permits retry."
+    },
+    {
+      "id": "core-native:References:ChangedDeleteTriggerIsUnsupported",
+      "filter": "DISABLED_DeliveryCoreReferences.ChangedDeleteTriggerIsUnsupported",
+      "expected": "Replacing the cleanup trigger with a no-op under version 1 is rejected; restoring the original schema permits retry."
+    }
+  ]
+}

@@ -205,22 +205,6 @@ add_task(async function test_movesExactMessageAndRetainsBystanders() {
   PanoramaDelivery.assertFolder(destination, lane);
 
   checkFolder(
-    source,
-    [
-      {
-        subject: "Keeper",
-        body: "Kept source body.\r\n",
-        flags: 0,
-        keywords: "",
-        text: "",
-        score: 0,
-        scoreText: "",
-        empty: false,
-      },
-    ],
-    1
-  );
-  checkFolder(
     destination,
     [
       {
@@ -244,6 +228,22 @@ add_task(async function test_movesExactMessageAndRetainsBystanders() {
         score: 42,
         scoreText: "2a",
         empty: true,
+      },
+    ],
+    1
+  );
+  checkFolder(
+    source,
+    [
+      {
+        subject: "Keeper",
+        body: "Kept source body.\r\n",
+        flags: 0,
+        keywords: "",
+        text: "",
+        score: 0,
+        scoreText: "",
+        empty: false,
       },
     ],
     1

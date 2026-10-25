@@ -206,11 +206,11 @@ add_task(async function test_copiesExactMessageAndRetainsSource() {
   PanoramaDelivery.assertFolder(destination, lane);
 
   checkFolder(
-    source,
+    destination,
     [
       {
-        subject: "Keeper",
-        body: "Kept source body.\r\n",
+        subject: "Resident",
+        body: "Existing destination.\r\n",
         flags: 0,
         keywords: "",
         text: "",
@@ -234,11 +234,11 @@ add_task(async function test_copiesExactMessageAndRetainsSource() {
     1
   );
   checkFolder(
-    destination,
+    source,
     [
       {
-        subject: "Resident",
-        body: "Existing destination.\r\n",
+        subject: "Keeper",
+        body: "Kept source body.\r\n",
         flags: 0,
         keywords: "",
         text: "",

@@ -537,6 +537,8 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
   nsCOMPtr<mozIStorageStatement> mStmt;
   nsCOMPtr<mozIStorageBindingParamsArray> mParamsArray;
   uint32_t mCurrentStep = 0;
+  bool mSavepointActive = false;
+  nsCString mErrorMessage;
 
   nsresult SetupAndRun(nsIMsgFolder* srcFolder, RefPtr<Promise> promise) {
     srcFolder->GetId(&mDestFolderId);
@@ -569,14 +571,15 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
     mMimeConverter = mozilla::components::MimeConverter::Service();
     NS_ENSURE_TRUE(mMimeConverter, NS_ERROR_FAILURE);
 
-    DatabaseCore::GetStatement("AddMessage"_ns,
-                               "INSERT INTO messages ( \
+    rv = DatabaseCore::GetStatement("AddMigratedMessage"_ns,
+                                    "INSERT INTO messages ( \
                                   folderId, messageId, date, sender, recipients, ccList, bccList, subject, flags, tags \
                                 ) VALUES ( \
                                   :folderId, :messageId, :date, :sender, :recipients, :ccList, :bccList, :subject, :flags, :tags \
                                 ) RETURNING "_ns MESSAGE_SQL_FIELDS,
-                               getter_AddRefs(mStmt));
-    mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray));
+                                    getter_AddRefs(mStmt));
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray));
     NS_ENSURE_SUCCESS(rv, rv);
 
     NS_DispatchToMainThread(this);
@@ -587,17 +590,41 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
     PROFILER_MARKER_TEXT("Folder Migration", MAILNEWS,
                          MarkerOptions(MarkerTiming::IntervalEnd()),
                          mDestFolderPath);
-    nsresult rv;
-    if (success) {
+    nsresult rv = NS_OK;
+    if (mSavepointActive) {
+      if (success) {
+        rv = DatabaseCore::ReleaseSavepoint("foldermigration"_ns);
+      }
+      if (!success || NS_FAILED(rv)) {
+        nsresult cleanupRv =
+            DatabaseCore::RollbackToSavepoint("foldermigration"_ns);
+        if (NS_SUCCEEDED(cleanupRv)) {
+          cleanupRv = DatabaseCore::ReleaseSavepoint("foldermigration"_ns);
+        }
+        if (NS_FAILED(cleanupRv)) {
+          // Cleanup errors take precedence when savepoint closure is uncertain.
+          mPromiseHolder.get()->MaybeReject(cleanupRv);
+          return;
+        }
+      }
+      mSavepointActive = false;
+    }
+
+    if (NS_FAILED(rv)) {
+      mPromiseHolder.get()->MaybeReject(rv);
+    } else if (success) {
       MOZ_LOG(gPanoramaLog, LogLevel::Info, ("migration complete"));
       mPromiseHolder.get()->MaybeResolveWithUndefined();
-      rv = DatabaseCore::ReleaseSavepoint("foldermigration"_ns);
     } else {
       MOZ_LOG(gPanoramaLog, LogLevel::Info, ("migration failed"));
-      mPromiseHolder.get()->MaybeRejectWithUndefined();
-      rv = DatabaseCore::RollbackToSavepoint("foldermigration"_ns);
+      if (mErrorMessage.IsEmpty()) {
+        mPromiseHolder.get()->MaybeRejectWithUnknownError(
+            "Folder migration failed.");
+      } else {
+        mPromiseHolder.get()->MaybeRejectWithUnknownError(
+            "Folder migration SQL failed: "_ns + mErrorMessage);
+      }
     }
-    NS_ENSURE_SUCCESS_VOID(rv);
   }
 
   NS_IMETHOD Run() override {
@@ -704,11 +731,12 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       if (length > 0) {
         // Execute the query.
         mCurrentStep = 2;
-        mStmt->BindParameters(mParamsArray);
+        MOZ_TRY(mStmt->BindParameters(mParamsArray));
         nsresult rv = DatabaseCore::CreateSavepoint("foldermigration"_ns);
         NS_ENSURE_SUCCESS(rv, rv);
+        mSavepointActive = true;
         nsCOMPtr<mozIStoragePendingStatement> unused;
-        mStmt->ExecuteAsync(this, getter_AddRefs(unused));
+        MOZ_TRY(mStmt->ExecuteAsync(this, getter_AddRefs(unused)));
       } else {
         // No messages to migrate. Stop here.
         Complete(true);
@@ -720,10 +748,9 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
   }
 
   NS_IMETHOD HandleError(mozIStorageError* error) override {
-    nsAutoCString errorMessage;
-    error->GetMessage(errorMessage);
+    error->GetMessage(mErrorMessage);
     MOZ_LOG(gPanoramaLog, LogLevel::Error,
-            ("migration failed, the database said: %s", errorMessage.get()));
+            ("migration failed, the database said: %s", mErrorMessage.get()));
     return NS_OK;
   }
   NS_IMETHOD HandleResult(mozIStorageResultSet* resultSet) override {
@@ -741,6 +768,7 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       Complete(false);
       return NS_OK;
     }
+    auto guard = mozilla::MakeScopeExit([&] { Complete(false); });
     if (mCurrentStep == 2) {
       mCurrentStep = 3;
       MOZ_ASSERT(mNewMessageKeys.Length() == mMessageData.Length());
@@ -779,9 +807,10 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       uint32_t length;
       mParamsArray->GetLength(&length);
       if (length > 0) {
-        mStmt->BindParameters(mParamsArray);
+        MOZ_TRY(mStmt->BindParameters(mParamsArray));
         nsCOMPtr<mozIStoragePendingStatement> unused;
-        mStmt->ExecuteAsync(this, getter_AddRefs(unused));
+        MOZ_TRY(mStmt->ExecuteAsync(this, getter_AddRefs(unused)));
+        guard.release();
         return NS_OK;
       }
     }
@@ -819,14 +848,16 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       uint32_t length;
       mParamsArray->GetLength(&length);
       if (length > 0) {
-        mStmt->BindParameters(mParamsArray);
+        MOZ_TRY(mStmt->BindParameters(mParamsArray));
         nsCOMPtr<mozIStoragePendingStatement> unused;
-        mStmt->ExecuteAsync(this, getter_AddRefs(unused));
+        MOZ_TRY(mStmt->ExecuteAsync(this, getter_AddRefs(unused)));
+        guard.release();
         return NS_OK;
       }
     }
 
     // Step 3 had no properties to insert, or step 4 is complete.
+    guard.release();
     Complete(true);
     return NS_OK;
   }

@@ -4,6 +4,8 @@
 
 #include "MessageDatabase.h"
 
+#include <utility>
+
 #include "DatabaseCore.h"
 #include "DatabaseUtils.h"
 #include "DetachedMsgHdr.h"
@@ -11,6 +13,7 @@
 #include "mozilla/Logging.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/Try.h"
+#include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
 #include "nsMsgMessageFlags.h"
@@ -65,108 +68,129 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
     const nsACString& aSubject, uint32_t aFlags, const nsACString& aTags,
     nsMsgPriorityValue aPriority, nsMsgKey* aKey) {
   NS_ENSURE_ARG_POINTER(aKey);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool inTransaction;
+  MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
+  if (inTransaction) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+
+  // This still assumes that referenced parents are already in the database.
+  nsMsgKey threadId = 0;
+  nsMsgKey parentId = 0;
+  if (!aReferences.IsEmpty()) {
+    threadId = MOZ_TRY(FindByMessageId(aReferences[0]));
+    parentId = MOZ_TRY(FindByMessageId(aReferences.LastElement()));
+  }
 
   CachedMsg cached;
-  {
-    // NOTE: THIS THREADING STUFF IS AN UNSUSTAINABLE HACK!
-    // It assumes that parent messages are already in the database.
-    // Fine for now, but we can't assume that'll be the case out in
-    // Real-Life Land (tm).
-    // For now, threadId is the key of root message, but assume
-    // that threads will one day have their own IDs!
-    nsMsgKey threadId = 0;
-    nsMsgKey parentId = 0;
-    if (aReferences.Length() > 0) {
-      threadId = FindByMessageId(aReferences[0]);
-      parentId = FindByMessageId(aReferences.LastElement());
+  RefPtr<Message> message;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCString messageId = MOZ_TRY(DatabaseUtils::Normalize(aMessageId));
+      nsCString sender = MOZ_TRY(DatabaseUtils::Normalize(aSender));
+      nsCString recipients = MOZ_TRY(DatabaseUtils::Normalize(aRecipients));
+      nsCString ccList = MOZ_TRY(DatabaseUtils::Normalize(aCcList));
+      nsCString bccList = MOZ_TRY(DatabaseUtils::Normalize(aBccList));
+      nsCString subject = MOZ_TRY(DatabaseUtils::Normalize(aSubject));
+      nsCString tags = MOZ_TRY(DatabaseUtils::Normalize(aTags));
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement("AddNativeMessage"_ns,
+                                         "INSERT INTO messages ( \
+             folderId, threadId, threadParent, messageId, date, sender, recipients, ccList, bccList, subject, flags, tags, priority \
+           ) VALUES ( \
+             :folderId, :threadId, :threadParent, :messageId, :date, :sender, :recipients, :ccList, :bccList, :subject, :flags, :tags, :priority \
+           ) RETURNING "_ns MESSAGE_SQL_FIELDS,
+                                         getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+
+      MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, aFolderId));
+      MOZ_TRY(stmt->BindInt32ByName("threadId"_ns, threadId));
+      MOZ_TRY(stmt->BindInt32ByName("threadParent"_ns, parentId));
+      MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
+      MOZ_TRY(stmt->BindInt64ByName("date"_ns, aDate));
+      MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, sender));
+      MOZ_TRY(stmt->BindUTF8StringByName("recipients"_ns, recipients));
+      MOZ_TRY(stmt->BindUTF8StringByName("ccList"_ns, ccList));
+      MOZ_TRY(stmt->BindUTF8StringByName("bccList"_ns, bccList));
+      MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, subject));
+      MOZ_TRY(stmt->BindInt32ByName("flags"_ns, aFlags));
+      MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
+      MOZ_TRY(stmt->BindInt32ByName("priority"_ns, aPriority));
+
+      bool hasResult;
+      MOZ_TRY(stmt->ExecuteStep(&hasResult));
+      if (!hasResult) {
+        return NS_ERROR_UNEXPECTED;
+      }
+      uint32_t len;
+      cached.key = (nsMsgKey)stmt->AsInt64(0);
+      cached.folderId = stmt->AsInt64(1);
+      cached.threadId = (nsMsgKey)stmt->AsInt64(2);
+      cached.threadParent = (nsMsgKey)stmt->AsInt64(3);
+      cached.messageId = stmt->AsSharedUTF8String(4, &len);
+      cached.date = (PRTime)stmt->AsInt64(5);
+      cached.sender = stmt->AsSharedUTF8String(6, &len);
+      cached.recipients = stmt->AsSharedUTF8String(7, &len);
+      cached.ccList = stmt->AsSharedUTF8String(8, &len);
+      cached.bccList = stmt->AsSharedUTF8String(9, &len);
+      cached.subject = stmt->AsSharedUTF8String(10, &len);
+      cached.flags = (uint32_t)stmt->AsInt64(11);
+      cached.tags = stmt->AsSharedUTF8String(12, &len);
+      cached.priority = (nsMsgPriorityValue)stmt->AsInt32(13);
+      MOZ_TRY(stmt->ExecuteStep(&hasResult));
+      if (hasResult) {
+        return NS_ERROR_UNEXPECTED;
+      }
     }
 
-    nsCOMPtr<mozIStorageStatement> stmt;
-    // Duplicate statement! Also in FolderMigrator::SetupAndRun.
-    nsresult rv = DatabaseCore::GetStatement("AddMessage"_ns,
-                                             "INSERT INTO messages ( \
-                                  folderId, threadId, threadParent, messageId, date, sender, recipients, ccList, bccList, subject, flags, tags, priority \
-                                ) VALUES ( \
-                                  :folderId, :threadId, :threadParent, :messageId, :date, :sender, :recipients, :ccList, :bccList, :subject, :flags, :tags, :priority \
-                                ) RETURNING "_ns MESSAGE_SQL_FIELDS,
-                                             getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
-
-    stmt->BindInt64ByName("folderId"_ns, aFolderId);
-    stmt->BindInt32ByName("threadId"_ns, threadId);
-    stmt->BindInt32ByName("threadParent"_ns, parentId);
-    stmt->BindUTF8StringByName("messageId"_ns,
-                               MOZ_TRY(DatabaseUtils::Normalize(aMessageId)));
-    stmt->BindInt64ByName("date"_ns, aDate);
-    stmt->BindUTF8StringByName("sender"_ns,
-                               MOZ_TRY(DatabaseUtils::Normalize(aSender)));
-    stmt->BindUTF8StringByName("recipients"_ns,
-                               MOZ_TRY(DatabaseUtils::Normalize(aRecipients)));
-    stmt->BindUTF8StringByName("ccList"_ns,
-                               MOZ_TRY(DatabaseUtils::Normalize(aCcList)));
-    stmt->BindUTF8StringByName("bccList"_ns,
-                               MOZ_TRY(DatabaseUtils::Normalize(aBccList)));
-    stmt->BindUTF8StringByName("subject"_ns,
-                               MOZ_TRY(DatabaseUtils::Normalize(aSubject)));
-    stmt->BindInt32ByName("flags"_ns, aFlags);
-    stmt->BindUTF8StringByName("tags"_ns,
-                               MOZ_TRY(DatabaseUtils::Normalize(aTags)));
-    stmt->BindInt32ByName("priority"_ns, aPriority);
-
-    bool hasResult;
-    rv = stmt->ExecuteStep(&hasResult);
-    NS_ENSURE_SUCCESS(rv, rv);
-    if (!hasResult) {
-      return NS_ERROR_UNEXPECTED;
+    // The root's key was unavailable until the insert completed.
+    if (cached.threadId == 0) {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "SetThreadIdToId"_ns,
+          "UPDATE messages SET threadId = id WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, cached.key));
+      MOZ_TRY(stmt->Execute());
+      cached.threadId = cached.key;
     }
 
-    // TODO: we've already got all the data, so all the SQL really needs to
-    // return is the key.
-    uint32_t len;
-    cached.key = (nsMsgKey)stmt->AsInt64(0);
-    cached.folderId = stmt->AsInt64(1);
-    cached.threadId = (nsMsgKey)stmt->AsInt64(2);
-    cached.threadParent = (nsMsgKey)stmt->AsInt64(3);
-    cached.messageId = stmt->AsSharedUTF8String(4, &len);
-    cached.date = (PRTime)stmt->AsInt64(5);
-    cached.sender = stmt->AsSharedUTF8String(6, &len);
-    cached.recipients = stmt->AsSharedUTF8String(7, &len);
-    cached.ccList = stmt->AsSharedUTF8String(8, &len);
-    cached.bccList = stmt->AsSharedUTF8String(9, &len);
-    cached.subject = stmt->AsSharedUTF8String(10, &len);
-    cached.flags = (uint32_t)stmt->AsInt64(11);
-    cached.tags = stmt->AsSharedUTF8String(12, &len);
+    if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    message = new Message(cached.key);
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&inTransaction);
+    if (NS_SUCCEEDED(cleanupRv) && inTransaction) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    // Preserve the write error; a cleanup error leaves rollback unconfirmed.
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("AddMessage cleanup failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+    return rv;
   }
 
-  // For root messages, we need to update the threadId to be the msgKey,
-  // as we didn't have it when we did the main insert.
-  if (cached.threadId == 0) {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetThreadIdToId"_ns,
-        "UPDATE messages SET threadId = id WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
-    stmt->BindInt64ByName("id"_ns, cached.key);
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
-
-    // Reflect in the cached data.
-    cached.threadId = cached.key;
+  // All fallible work precedes commit; no observer sees an unfinished write.
+  nsMsgKey key = cached.key;
+  auto entry = mMsgCache.lookup(key);
+  if (entry) {
+    entry->value() = std::move(cached);
+  } else {
+    mMsgCache.putNewInfallible(key, std::move(cached));
   }
-
-  // Add to cache.
-  if (!mMsgCache.put(cached.key, cached)) {
-    return NS_ERROR_FAILURE;
-  }
-
-  RefPtr<Message> message = new Message(cached.key);
+  *aKey = key;
   for (MessageListener* listener : mMessageListeners.EndLimitedRange()) {
     listener->OnMessageAdded(message);
   }
-  *aKey = cached.key;
   return NS_OK;
 }
 
@@ -480,22 +504,20 @@ nsresult MessageDatabase::GetMessageForMessageID(uint64_t aFolderId,
 // TODO: This is a quick hack.
 // Doesn't take into account various corner cases (eg multiple
 // messages with same message-id!).
-nsMsgKey MessageDatabase::FindByMessageId(nsACString const& messageId) {
+Result<nsMsgKey, nsresult> MessageDatabase::FindByMessageId(
+    nsACString const& messageId) {
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
+  MOZ_TRY(DatabaseCore::GetStatement(
       "FindByMessageId"_ns,
-      "SELECT id"_ns
-      " FROM messages WHERE messageId = :messageId"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, 0);
+      "SELECT id FROM messages WHERE messageId = :messageId"_ns,
+      getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindUTF8StringByName("messageId"_ns, messageId);
+  MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
 
   bool hasResult;
-  rv = stmt->ExecuteStep(&hasResult);
-  NS_ENSURE_SUCCESS(rv, 0);
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
   if (!hasResult) {
-    return 0;  // Not found.
+    return nsMsgKey{0};
   }
   return (nsMsgKey)stmt->AsInt64(0);
 }

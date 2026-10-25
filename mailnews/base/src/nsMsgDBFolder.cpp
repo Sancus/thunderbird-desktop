@@ -2741,44 +2741,57 @@ NS_IMETHODIMP nsMsgDBFolder::InitWithFolderId(uint64_t folderId) {
 
   // Set up the URI.
 
-  server->GetServerURI(mURI);
+  rv = server->GetServerURI(mURI);
+  NS_ENSURE_SUCCESS(rv, rv);
   nsCString path = MOZ_TRY(folderDB.GetFolderPath(folderId));
   rv = MsgEscapeString(path, nsINetUtil::ESCAPE_URL_PATH, path);
   NS_ENSURE_SUCCESS(rv, rv);
-  mURI.Append(Substring(path, path.FindChar('/')));
-  mBaseMessageURI = "mailbox-message:"_ns + Substring(mURI, 8);
+  int32_t pathStart = path.FindChar('/');
+  if (pathStart != kNotFound) {
+    mURI.Append(Substring(path, pathStart));
+  }
+  rv = CreateBaseMessageURI(mURI);
+  NS_ENSURE_SUCCESS(rv, rv);
   mHaveParsedURI = true;
   mInitializedFromCache = true;
 
   nsCOMPtr<nsIFolderLookupService> fls =
       do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
-  fls->Cache(mURI, this);
-
-  // Let's find the subfolders. This is going to fail horribly once servers
-  // are involved, but they're not, yet.
-
-  nsCOMPtr<nsIMsgPluggableStore> store;
-  rv = GetMsgStore(getter_AddRefs(store));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = fls->Cache(mURI, this);
   NS_ENSURE_SUCCESS(rv, rv);
 
-  nsTArray<nsCString> childNames;
-  rv = store->DiscoverChildFolders(this, childNames);
+  nsAutoCString localStoreType;
+  rv = server->GetLocalStoreType(localStoreType);
   NS_ENSURE_SUCCESS(rv, rv);
+  if (localStoreType.EqualsLiteral("mailbox")) {
+    // Only local folders take their hierarchy from the body store.
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    rv = GetMsgStore(getter_AddRefs(store));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  MOZ_TRY(folderDB.Reconcile(folderId, childNames));
+    nsTArray<nsCString> childNames;
+    rv = store->DiscoverChildFolders(this, childNames);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    MOZ_TRY(folderDB.Reconcile(folderId, childNames));
+  }
+
+  nsAutoCString contractId("@mozilla.org/mail/folder-factory;1?name=");
+  contractId.Append(localStoreType);
 
   // Add the subfolders.
   nsTArray<uint64_t> subFolderIds =
       MOZ_TRY(folderDB.GetFolderChildren(folderId));
   for (auto subFolderId : subFolderIds) {
-    nsCOMPtr<nsIMsgFolder> msgFolder =
-        do_CreateInstance("@mozilla.org/mail/folder;1?name=mailbox", &rv);
+    nsCOMPtr<nsIMsgFolder> msgFolder = do_CreateInstance(contractId.get(), &rv);
     NS_ENSURE_SUCCESS(rv, rv);
 
     rv = msgFolder->InitWithFolderId(subFolderId);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    msgFolder->SetParent(this);
+    rv = msgFolder->SetParent(this);
+    NS_ENSURE_SUCCESS(rv, rv);
     mSubFolders.AppendObject(msgFolder);
   }
 
@@ -3512,16 +3525,35 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
         mozilla::mailnews::DatabaseCore::GetInstanceForService();
     mozilla::mailnews::FolderDatabase& folderDB(dbCore->FolderDB());
 
-    // FolderDatabase might already have an entry? Unclear...
     uint64_t subFolderId =
         MOZ_TRY(folderDB.GetFolderChildNamed(mFolderId, actualName));
-    if (subFolderId == 0) {
+    if (subFolderId) {
+      // Reuse a child that was already restored or added.
+      for (nsIMsgFolder* existing : mSubFolders) {
+        uint64_t existingId;
+        rv = existing->GetId(&existingId);
+        NS_ENSURE_SUCCESS(rv, rv);
+        if (existingId == subFolderId) {
+          NS_ADDREF(*child = existing);
+          return NS_OK;
+        }
+      }
+    } else {
       rv = folderDB.InsertFolder(mFolderId, actualName, &subFolderId);
       NS_ENSURE_SUCCESS(rv, rv);
     }
 
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    rv = GetServer(getter_AddRefs(server));
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsAutoCString localStoreType;
+    rv = server->GetLocalStoreType(localStoreType);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsAutoCString contractId("@mozilla.org/mail/folder-factory;1?name=");
+    contractId.Append(localStoreType);
+
     // Set up the nsIMsgFolder.
-    folder = do_CreateInstance("@mozilla.org/mail/folder;1?name=mailbox", &rv);
+    folder = do_CreateInstance(contractId.get(), &rv);
     NS_ENSURE_SUCCESS(rv, rv);
 
     rv = folder->InitWithFolderId(subFolderId);

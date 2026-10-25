@@ -431,16 +431,23 @@ nsresult nsMsgIncomingServer::CreateRootFolder() {
     rv = folders->GetFolderChildNamed(0, m_serverKey, &rootId);
     NS_ENSURE_SUCCESS(rv, rv);
     if (!rootId) {
-      folders->InsertRoot(m_serverKey, &rootId);
+      rv = folders->InsertRoot(m_serverKey, &rootId);
       NS_ENSURE_SUCCESS(rv, rv);
     }
 
-    m_rootFolder =
-        do_CreateInstance("@mozilla.org/mail/folder;1?name=mailbox", &rv);
+    nsAutoCString localStoreType;
+    rv = GetLocalStoreType(localStoreType);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsAutoCString contractId("@mozilla.org/mail/folder-factory;1?name=");
+    contractId.Append(localStoreType);
+    m_rootFolder = do_CreateInstance(contractId.get(), &rv);
     NS_ENSURE_SUCCESS(rv, rv);
 
     rv = m_rootFolder->InitWithFolderId(rootId);
-    NS_ENSURE_SUCCESS(rv, rv);
+    if (NS_FAILED(rv)) {
+      m_rootFolder = nullptr;
+      return rv;
+    }
 
     return NS_OK;
   }

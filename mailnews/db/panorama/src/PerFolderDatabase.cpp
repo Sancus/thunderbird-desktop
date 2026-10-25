@@ -1096,9 +1096,13 @@ NS_IMETHODIMP FolderInfo::SetInt64Property(const char* propertyName,
 NS_IMETHODIMP FolderInfo::GetBooleanProperty(const char* propertyName,
                                              bool defaultValue,
                                              bool* propertyValue) {
+  NS_ENSURE_ARG_POINTER(propertyValue);
   *propertyValue = defaultValue;
-  return FolderDB().GetFolderProperty(
-      mFolderId, nsDependentCString(propertyName), (int64_t*)propertyValue);
+  int64_t value = defaultValue;
+  MOZ_TRY(FolderDB().GetFolderProperty(
+      mFolderId, nsDependentCString(propertyName), &value));
+  *propertyValue = value != 0;
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetBooleanProperty(const char* propertyName,
                                              bool propertyValue) {

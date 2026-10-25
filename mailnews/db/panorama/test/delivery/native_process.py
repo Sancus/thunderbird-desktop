@@ -70,15 +70,19 @@ def loaded_files(pid, app, library):
             return None
         maps = Path(f"/proc/{pid}/maps").read_text()
         wanted = library.stat()
+        found = False
         for line in maps.splitlines():
             fields = line.split(maxsplit=5)
-            if len(fields) == 6 and fields[5] == str(library.resolve()):
+            if len(fields) == 6 and Path(fields[5].removesuffix(" (deleted)")).name == library.name:
                 major, minor = (int(v, 16) for v in fields[3].split(":"))
-                if (int(fields[4]), major, minor) == (
+                if fields[5] != str(library.resolve()) or (int(fields[4]), major, minor) != (
                     wanted.st_ino, os.major(wanted.st_dev), os.minor(wanted.st_dev)
                 ):
-                    return {"pid": pid, "app": str(app.resolve()), "maps": maps,
-                            "library": str(library.resolve()), "inode": wanted.st_ino}
+                    raise ValueError("different libxul image mapping: " + line)
+                found = True
+        if found:
+            return {"pid": pid, "app": str(app.resolve()), "maps": maps,
+                    "library": str(library.resolve()), "inode": wanted.st_ino}
     except (FileNotFoundError, ProcessLookupError):
         pass
     return None
@@ -95,7 +99,9 @@ def capture(argv, env, cwd, output, timeout, deadline, app, library):
             record["pid"] = proc.pid
             until = min(deadline - 3, time.monotonic() + timeout)
             while proc.poll() is None:
-                record["loaded"] = record["loaded"] or loaded_files(proc.pid, app, library)
+                loaded = loaded_files(proc.pid, app, library)
+                if loaded:
+                    record["loaded"] = loaded
                 if time.monotonic() >= until:
                     record["timed_out"] = True
                     break

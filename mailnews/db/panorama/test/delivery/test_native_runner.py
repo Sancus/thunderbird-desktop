@@ -47,6 +47,9 @@ class NativeRunnerTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.case = next(iter(runner.CASES.values()))
+        cancellation = patch.object(runner, "TERMINATION_REASON", None)
+        cancellation.start()
+        self.addCleanup(cancellation.stop)
 
     def child(self, output, diagnostic="", code=0, selected=None):
         with (output / "stdout.log").open("xb") as out, (output / "stderr.log").open("xb") as err:
@@ -59,7 +62,7 @@ class NativeRunnerTests(unittest.TestCase):
                    "[123, Main Thread] ###!!! ASSERTION: fixture error",
                    "Assertion failure: false, at fixture.cpp:4",
                    "WARNING: Problem removing profile directory: file fixture.cpp:1",
-                   "   0 |TOTAL                                 | 4 8| 2 2|",
+                   "[123] Hit MOZ_CRASH(fixture) at fixture.cpp:4",
                    "PROCESS-CRASH | selected case | signal 11",
                    json.dumps({"action":"test_start","test":"Other.Extra"})]
         for index, marker in enumerate(markers):
@@ -74,13 +77,14 @@ class NativeRunnerTests(unittest.TestCase):
                 self.assertEqual(result["first_failure"]["stream"], "stderr")
                 self.assertIn(marker, result["first_failure"]["message"])
 
-    def test_expected_prose_zero_leaks_and_crash_reporting_setup_are_not_failures(self):
+    def test_expected_prose_and_crash_reporting_setup_are_not_failures(self):
         self.child(self.root, "Expected assertion failure; leak test data.\n"
-                             "Setting up crash reporting\n   0 |TOTAL | 4 0| 2 0|")
+                             "Setting up crash reporting")
         result = accounting.check_output(self.root / "native.jsonl", self.root / "stdout.log",
                                          self.root / "stderr.log", self.case["filter"], 0)
         self.assertTrue(result["ok"])
         self.assertEqual(result["coverage"], "none")
+        self.assertEqual(result["leak_check"], "unavailable")
         for code in (7, -11, None):
             self.assertFalse(accounting.check_output(self.root / "native.jsonl", self.root / "stdout.log",
                              self.root / "stderr.log", self.case["filter"], code)["ok"])
@@ -99,7 +103,8 @@ class NativeRunnerTests(unittest.TestCase):
 
     def test_failed_case_does_not_hide_later_case_and_exclusive_evidence(self):
         config = self.config()
-        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib")}
+        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib"),
+                   "refcount_logging": False}
         calls = []
         def capture(argv, env, cwd, output, *args):
             calls.append((argv, env, cwd))
@@ -119,6 +124,8 @@ class NativeRunnerTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual([r["observed"] for r in result["results"]], ["FAIL", "PASS"], [r.get("errors") for r in result["results"]])
         self.assertEqual(len(calls), 2)
+        self.assertEqual(result["leak_check"], "unavailable")
+        self.assertTrue(all(r["leak_check"] == "unavailable" for r in result["results"]))
         self.assertNotEqual(calls[0][1]["HOME"], calls[1][1]["HOME"])
         with self.assertRaises(FileExistsError):
             runner.run_batch(config)
@@ -139,7 +146,8 @@ class NativeRunnerTests(unittest.TestCase):
         config = self.config()
         output = self.root / "case"
         output.mkdir()
-        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib")}
+        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib"),
+                   "refcount_logging": False}
         def capture(argv, env, cwd, out, *args):
             self.child(out)
             runner.save(out / "process.json", {"pid": 123, "exit_code": 0, "timed_out": False,
@@ -230,9 +238,233 @@ class NativeRunnerTests(unittest.TestCase):
             maps.return_value = f"00-10 r-xp 0 00:00 {inode} {library.resolve()}\n"
             self.assertIsNotNone(processes.loaded_files(123, library, library))
             maps.return_value = f"00-10 r-xp 0 00:00 {inode+1} {library.resolve()}\n"
-            self.assertIsNone(processes.loaded_files(123, library, library))
+            with self.assertRaisesRegex(ValueError, "different libxul image"):
+                processes.loaded_files(123, library, library)
+            maps.return_value = (f"00-10 r-xp 0 00:00 {inode} {library.resolve()}\n"
+                                 f"10-20 r-xp 0 00:00 {inode+1} /different/libxul.so\n")
+            with self.assertRaisesRegex(ValueError, "different libxul image"):
+                processes.loaded_files(123, library, library)
             same.return_value = False
             self.assertIsNone(processes.loaded_files(123, library, library))
+
+
+    def test_refcount_capability_is_required_and_logging_builds_stay_held(self):
+        for index, capability in enumerate(({}, {"refcount_logging": True}, {"refcount_logging": "false"})):
+            with self.subTest(receipt=capability):
+                config, receipt, runner_path = self.receipt_fixture()
+                del receipt["refcount_logging"]
+                receipt.update(capability)
+                self.bind_receipt(config, receipt)
+                config["evidence"] = str(self.root / str(index))
+                with (patch.object(runner.sys, "platform", "linux"),
+                      patch.object(runner, "__file__", str(runner_path)),
+                      patch.object(runner, "verify", return_value={}),
+                      patch.object(processes, "capture") as capture):
+                    result = runner.run_batch(config)
+                capture.assert_not_called()
+                self.assertFalse(result["ok"])
+                self.assertIn("refcount", result["infrastructure_error"])
+                self.assertEqual(result["counts"]["NOTRUN"], 2)
+                self.assertTrue(all(r["leak_check"] == "unavailable" for r in result["results"]))
+        config, receipt, runner_path = self.receipt_fixture()
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)),
+              patch.object(runner, "verify", return_value={}),
+              patch.object(processes, "capture", side_effect=self.clean_capture)):
+            result = runner.run_batch(config)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["leak_check"], "unavailable")
+        self.assertTrue(all(r["leak_check"] == "unavailable" for r in result["results"]))
+
+    def clean_capture(self, argv, env, cwd, output, *args):
+        self.child(output, selected=env["GTEST_FILTER"])
+        runner.save(output / "process.json", {"pid": 123, "exit_code": 0, "timed_out": False,
+                    "loaded": {"maps":"synthetic", "pid":123}, "terminated_pids":[], "survivor_pids":[]})
+
+    def test_signal_during_hashes_after_permanently_refuses_later_launches(self):
+        config = self.config()
+        calls = []
+        def verify(*args):
+            calls.append(args)
+            if len(calls) == 2:
+                runner.handle_termination(runner.signal.SIGTERM, None)
+            return {"fixture":"unchanged"}
+        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib"),
+                   "refcount_logging": False}
+        with (patch.object(runner, "prepare", return_value=receipt),
+              patch.object(runner, "verify", verify),
+              patch.object(processes, "capture", side_effect=self.clean_capture) as capture):
+            result = runner.run_batch(config)
+            self.assertEqual(capture.call_count, 1)
+            second = runner.run_batch({**config, "evidence": str(self.root / "later-batch")})
+            self.assertEqual(capture.call_count, 1)
+        self.assertEqual([r["observed"] for r in result["results"]], ["FAIL", "NOTRUN"])
+        self.assertTrue(result["results"][0]["interrupted"])
+        self.assertIn("termination requested", result["results"][1]["reason"])
+        self.assertIn("termination requested", result["results"][0]["identity_error"])
+        self.assertEqual(second["counts"]["NOTRUN"], 2)
+        self.assertFalse(result["ok"])
+        original_reason = runner.TERMINATION_REASON
+        runner.handle_termination(runner.signal.SIGINT, None)
+        self.assertEqual(runner.TERMINATION_REASON, original_reason)
+        with self.assertRaisesRegex(InterruptedError, "termination requested"):
+            runner.require_running()
+
+    def test_result_finalization_cancellation_stops_but_io_failure_continues(self):
+        for cancelled in (True, False):
+            with self.subTest(cancelled=cancelled), patch.object(runner, "TERMINATION_REASON", None):
+                config = {**self.config(), "evidence": str(self.root / str(cancelled))}
+                receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib"),
+                           "refcount_logging": False}
+                save = runner.save
+                failed = []
+                def finalize(path, value):
+                    if Path(path).name == "result.json" and not failed:
+                        failed.append(path)
+                        if cancelled:
+                            runner.handle_termination(runner.signal.SIGINT, None)
+                        raise OSError("synthetic evidence write failure")
+                    save(path, value)
+                with (patch.object(runner, "prepare", return_value=receipt),
+                      patch.object(runner, "verify", return_value={"fixture":"unchanged"}),
+                      patch.object(runner, "save", finalize),
+                      patch.object(processes, "capture", side_effect=self.clean_capture) as capture):
+                    result = runner.run_batch(config)
+                self.assertEqual(capture.call_count, 1 if cancelled else 2)
+                self.assertEqual([r["observed"] for r in result["results"]],
+                                 ["FAIL", "NOTRUN" if cancelled else "PASS"])
+                first = result["results"][0]
+                self.assertEqual(first["interrupted"], cancelled)
+                self.assertEqual(first["first_failure"]["action"], "finalization")
+                self.assertFalse(result["ok"])
+                if cancelled:
+                    self.assertIn("termination requested", result["results"][1]["reason"])
+
+    def test_signal_during_summary_preserves_complete_failure_ledger(self):
+        config = self.config()
+        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib"),
+                   "refcount_logging": False}
+        save = runner.save
+        def finalize(path, value):
+            if Path(path).name == "summary.json":
+                Path(path).write_text('{"partial":')
+                runner.handle_termination(runner.signal.SIGTERM, None)
+            save(path, value)
+        with (patch.object(runner, "prepare", return_value=receipt),
+              patch.object(runner, "verify", return_value={"fixture":"unchanged"}),
+              patch.object(runner, "save", finalize),
+              patch.object(processes, "capture", side_effect=self.clean_capture)):
+            result = runner.run_batch(config)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["interrupted"])
+        self.assertEqual(result["requested"], 2)
+        self.assertEqual([r["id"] for r in result["results"]], config["select"])
+        self.assertEqual((Path(config["evidence"]) / "summary.json").read_text(), '{"partial":')
+        self.assertEqual(json.loads((Path(config["evidence"]) / "interrupted-summary.json").read_text()), result)
+
+    def test_stale_profile_in_resolved_executable_directory_refuses_launch(self):
+        config = self.config()
+        output, real = self.root / "case", self.root / "real-bin"
+        output.mkdir()
+        real.mkdir()
+        stale = real / "cpp-unit-profd-stale"
+        stale.mkdir()
+        receipt = {"app": str(self.root / "alias-bin/app"), "library": str(self.root / "lib"),
+                   "refcount_logging": False}
+        with (patch.object(Path, "resolve", return_value=real / "app"),
+              patch.object(runner, "verify", return_value={}),
+              patch.object(processes, "capture") as capture):
+            result = runner.run_case(config, receipt, self.case, output,
+                                     time.monotonic()+10, time.monotonic()+20)
+        capture.assert_not_called()
+        self.assertEqual(result["observed"], "NOTRUN")
+        self.assertEqual(result["profile_root"], str(real))
+        self.assertEqual(result["preexisting_profiles"], [str(stale)])
+        self.assertIn("stale cpp-unit-profd", result["error"])
+
+    def test_deadline_shortened_timeout_remains_failed_and_is_labelled(self):
+        config = {**self.config(), "timeout_seconds":20}
+        output = self.root / "case"
+        output.mkdir()
+        receipt = {"app": str(self.root / "app"), "library": str(self.root / "lib"),
+                   "refcount_logging": False}
+        def capture(*args):
+            self.clean_capture(*args)
+            path = output / "process.json"
+            record = json.loads(path.read_text())
+            record["timed_out"] = True
+            path.write_text(json.dumps(record))
+        with (patch.object(runner, "verify", return_value={}),
+              patch.object(processes, "capture", capture)):
+            result = runner.run_case(config, receipt, self.case, output,
+                                     time.monotonic()+10, time.monotonic()+20)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["observed"], "FAIL")
+        self.assertEqual(result["timeout_kind"], "deadline-shortened")
+
+
+    def receipt_fixture(self):
+        config = self.config()
+        source, obj = Path(config["source"]), Path(config["objdir"])
+        app, library = obj / "dist/bin/app", obj / "dist/bin/gtest/libxul.so"
+        runner_path = source / "comm/mailnews/db/panorama/test/delivery/run_native.py"
+        receipt = {"build_identity":"synthetic", "refcount_logging":False,
+                   "comm_revision":"1"*40, "gecko_revision":"efd2d1e6f77570ae6bc5294731a68101e45c81a3",
+                   "app":str(app), "library":str(library), "mozconfig":str(obj / "mozconfig")}
+        paths = ([source / "comm" / p for p in runner.COMM_INPUTS] +
+                 [source / p for p in runner.GECKO_INPUTS] +
+                 [app, library, obj / "dist/bin/dependentlibs.list.gtest",
+                  obj / "dist/bin/application.ini", obj / "dist/bin/platform.ini",
+                  obj / "config.status", Path(receipt["mozconfig"])])
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("synthetic fixture")
+        (source / "xpcom/base/nsDebugImpl.cpp").write_text("###!!! ASSERTION")
+        (source / "xpcom/base/nsTraceRefcnt.cpp").write_text("XPCOM_MEM_LEAK_LOG")
+        (source / "mfbt/Assertions.h").write_text("Assertion failure: Hit MOZ_CRASH(")
+        receipt["inputs"] = {str(p):runner.digest(p, time.monotonic()+5) for p in paths}
+        self.bind_receipt(config, receipt)
+        return config, receipt, runner_path
+
+    def bind_receipt(self, config, receipt):
+        Path(config["receipt"]).write_text(json.dumps(receipt))
+        config["receipt_sha256"] = runner.digest(config["receipt"], time.monotonic()+5)
+
+    def test_receipt_must_bind_the_gtest_dependency_list(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        dependency = str(Path(config["objdir"]) / "dist/bin/dependentlibs.list.gtest")
+        identity = receipt["inputs"].pop(dependency)
+        self.bind_receipt(config, receipt)
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)),
+              patch.object(runner, "verify") as verify):
+            with self.assertRaisesRegex(ValueError, "omits required"):
+                runner.prepare(config, time.monotonic()+5)
+            verify.assert_not_called()
+            receipt["inputs"][dependency] = identity
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
+            verify.assert_called_once()
+
+    def test_capture_rechecks_images_after_initial_mapping_proof(self):
+        class Child:
+            pid = 123
+            def poll(self):
+                return None
+            def wait(self, timeout):
+                return 0
+        with (patch.object(processes, "initialize"),
+              patch.object(processes.subprocess, "Popen", return_value=Child()),
+              patch.object(processes, "loaded_files", side_effect=[{"maps":"first"},
+                           ValueError("different libxul image mapping")]) as loaded,
+              patch.object(processes, "cleanup", return_value={"terminated_pids":[], "survivor_pids":[]}),
+              patch.object(os, "waitpid", side_effect=ChildProcessError, create=True)):
+            with self.assertRaisesRegex(ValueError, "different libxul image"):
+                processes.capture(["synthetic"], {}, self.root, self.root, 2,
+                                  time.monotonic()+5, Path("app"), Path("libxul.so"))
+        self.assertEqual(loaded.call_count, 2)
+        record = json.loads((self.root / "process.json").read_text())
+        self.assertIn("different libxul image", record["process_error"])
 
     def test_linux_orphan_cleanup_probe_or_windows_refusal(self):
         if sys.platform != "linux":

@@ -99,12 +99,11 @@ def check_log(path, selected_filter, returncode, *, timed_out=False):
 DIAGNOSTIC = re.compile(
     r"^(?:\x07)?(?:\[[^\]\r\n]+\]\s*)?(?:"
     r"TEST-UNEXPECTED-FAIL(?:[ |]|$)|PROCESS-CRASH(?:[ |]|$)|"
-    r"###!!! (?:ASSERTION|ABORT|BREAK):|Assertion failure:|MOZ_CRASH(?:\(|:)|"
+    r"###!!! (?:ASSERTION|ABORT|BREAK):|Assertion failure:|Hit MOZ_CRASH\(|MOZ_CRASH(?:\(|:)|"
     r"WARNING: Problem removing profile directory|"
     r"==\d+==(?:ERROR|WARNING): (?:Address|Leak|Thread)Sanitizer:|"
     r"SUMMARY: (?:Address|Leak|Thread)Sanitizer:)"
 )
-LEAK_TOTAL = re.compile(r"^\s*\d+\s+\|TOTAL\s*\|\s*\d+\s+(-?\d+)\s*\|\s*\d+\s+(-?\d+)\s*\|")
 
 
 def check_output(log, stdout, stderr, selected_filter, returncode, *, timed_out=False):
@@ -135,9 +134,7 @@ def check_output(log, stdout, stderr, selected_filter, returncode, *, timed_out=
                     if stream == "stdout" and event["action"] == "suite_end":
                         suite_end = number
                 else:
-                    leaked = LEAK_TOTAL.match(line)
-                    bad = bool(DIAGNOSTIC.match(line) or
-                               (leaked and any(int(v) != 0 for v in leaked.groups())))
+                    bad = bool(DIAGNOSTIC.match(line))
                     if stream == "stdout" and line == "Finished running GTest tests.":
                         finished = number
                 if bad:
@@ -157,5 +154,6 @@ def check_output(log, stdout, stderr, selected_filter, returncode, *, timed_out=
         result["first_failure"] = result["first_failure"] or console[0]
     if result["first_failure"] is None and (returncode != 0 or timed_out):
         result["first_failure"] = {"action": "process_exit", "exit_code": returncode, "timed_out": timed_out}
-    result.update(ok=result["log_complete"] and not console, console_failures=console)
+    result.update(ok=result["log_complete"] and not console, console_failures=console,
+                  leak_check="unavailable")
     return result

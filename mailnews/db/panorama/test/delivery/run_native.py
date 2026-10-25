@@ -21,6 +21,7 @@ import native_process as processes
 
 HERE = Path(__file__).resolve().parent
 CASES = {c["id"]: c for c in accounting.CATALOG["cases"]}
+TERMINATION_REASON = None
 COMM_INPUTS = ["mailnews/db/panorama/" + name for name in (
     "src/DatabaseCore.cpp", "src/DatabaseCore.h", "src/MessageDatabase.cpp",
     "src/MessageDatabase.h", "test/gtest/TestDeliveryCoreReferences.cpp",
@@ -34,6 +35,25 @@ GECKO_INPUTS = ["testing/gtest/mozilla/GTestRunner.cpp", "xpcom/tests/TestHarnes
                 "testing/gtest/rungtests.py", "testing/gtest/moz.build",
                 "testing/gtest/mozilla/moz.build", "storage/mozStorageConnection.cpp",
                 "xpcom/glue/standalone/nsXPCOMGlue.cpp"]
+
+
+def handle_termination(signum, frame):
+    global TERMINATION_REASON
+    if TERMINATION_REASON is None:
+        TERMINATION_REASON = f"termination requested (signal {signum})"
+        raise InterruptedError(TERMINATION_REASON)
+
+
+def require_running():
+    if TERMINATION_REASON:
+        raise InterruptedError(TERMINATION_REASON)
+
+
+def check_leak_capability(receipt):
+    if type(receipt.get("refcount_logging")) is not bool:
+        raise ValueError("build receipt must declare boolean refcount_logging capability")
+    if receipt["refcount_logging"]:
+        raise ValueError("refcount-logging build held: leak collection/validation not implemented")
 
 
 def save(path, value):
@@ -103,6 +123,7 @@ def prepare(config, deadline, evidence=None):
     if digest(config["receipt"], deadline) != config["receipt_sha256"]:
         raise ValueError("build receipt hash mismatch")
     receipt = json.loads(Path(config["receipt"]).read_text(encoding="utf-8"))
+    check_leak_capability(receipt)
     if not receipt.get("build_identity") or receipt.get("gecko_revision") != "efd2d1e6f77570ae6bc5294731a68101e45c81a3":
         raise ValueError("matching identified efd2 build receipt required")
     for name in ("comm_revision", "gecko_revision"):
@@ -117,7 +138,7 @@ def prepare(config, deadline, evidence=None):
         raise ValueError("app/gtest library must be matching object-directory artifacts")
     required = [source / "comm" / p for p in COMM_INPUTS] + [source / p for p in GECKO_INPUTS]
     required += [app, library, obj / "dist/bin/application.ini", obj / "dist/bin/platform.ini",
-                 obj / "config.status", Path(receipt["mozconfig"])]
+                 obj / "dist/bin/dependentlibs.list.gtest", obj / "config.status", Path(receipt["mozconfig"])]
     if any(str(p) not in receipt["inputs"] for p in required):
         raise ValueError("build receipt omits required source, binary, INI or config identity")
     if not Path(receipt["mozconfig"]).is_absolute():
@@ -136,8 +157,9 @@ def prepare(config, deadline, evidence=None):
             raise ValueError("receipt input outside declared source/build/config")
     # Diagnostic sources are bound to the exact checkout, including the formats.
     for relative, token in (("xpcom/base/nsDebugImpl.cpp", "###!!! ASSERTION"),
-                             ("xpcom/base/nsTraceRefcnt.cpp", "%4d |%-38.38s|"),
-                             ("mfbt/Assertions.h", "Assertion failure:")):
+                             ("xpcom/base/nsTraceRefcnt.cpp", "XPCOM_MEM_LEAK_LOG"),
+                             ("mfbt/Assertions.h", "Assertion failure:"),
+                             ("mfbt/Assertions.h", "Hit MOZ_CRASH(")):
         if token not in (source / relative).read_text(encoding="utf-8"):
             raise ValueError("diagnostic format requires renewed source review: " + relative)
     verify(config, receipt, deadline, evidence)
@@ -161,13 +183,19 @@ def environment(config, selected, output):
 
 def run_case(config, receipt, case, output, stop, final):
     record = {"id": case["id"], "filter": case["filter"], "observed": "NOTRUN",
-              "ok": False, "coverage": "none", "executed": False,
+              "ok": False, "coverage": "none", "executed": False, "leak_check": "unavailable",
               "backend": accounting.CATALOG["backend"], "store": accounting.CATALOG["store"],
               "logs": {name: str(output / file) for name, file in (("native", "native.jsonl"),
                        ("stdout", "stdout.log"), ("stderr", "stderr.log"), ("maps", "maps.log"))}, "started_utc": datetime.now(timezone.utc).isoformat()}
-    profile_root = Path(receipt["app"]).parent
-    before_profiles = set(profile_root.glob("cpp-unit-profd*"))
+    profile_root = Path(receipt["app"]).resolve().parent
+    record["profile_root"] = str(profile_root)
     try:
+        require_running()
+        check_leak_capability(receipt)
+        before_profiles = sorted(str(p) for p in profile_root.glob("cpp-unit-profd*"))
+        record["preexisting_profiles"] = before_profiles
+        if before_profiles:
+            raise ValueError("stale cpp-unit-profd entries in executable directory")
         record["hashes_before"] = verify(config, receipt, final, output / "identity-before.json")
         if time.monotonic() + 4 >= stop:
             raise TimeoutError("test-stop leaves no process/cleanup budget")
@@ -180,11 +208,12 @@ def run_case(config, receipt, case, output, stop, final):
                       timeout_seconds=config["timeout_seconds"], deadline_shortened=
                       time.monotonic() + config["timeout_seconds"] + 3 > stop)
         save(output / "request.json", record)
+        require_running()
         processes.capture(argv, env, output, output, config["timeout_seconds"],
                           stop, Path(receipt["app"]), Path(receipt["library"]))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         record["error"] = str(error)
-        record["interrupted"] = isinstance(error, InterruptedError)
+        record["interrupted"] = bool(TERMINATION_REASON) or isinstance(error, InterruptedError)
     if (output / "process.json").exists():
         record.update(json.loads((output / "process.json").read_text(encoding="utf-8")))
         record["executed"] = bool(record.get("pid"))
@@ -193,17 +222,24 @@ def run_case(config, receipt, case, output, stop, final):
         record.update(accounting.check_output(output / "native.jsonl", output / "stdout.log",
                                              output / "stderr.log", case["filter"],
                                              record["exit_code"], timed_out=record["timed_out"]))
-        record["leftover_profiles"] = [str(p) for p in set(profile_root.glob("cpp-unit-profd*")) - before_profiles]
+        record["leftover_profiles"] = [str(p) for p in profile_root.glob("cpp-unit-profd*")]
         if (record.get("error") or record.get("process_error") or record.get("cleanup_failed")
             or record.get("terminated_pids") or record.get("survivor_pids")
             or not record.get("loaded") or record["leftover_profiles"]):
             record["ok"] = False
             record["errors"].append("process/cleanup/profile or loaded-artifact identity incomplete")
         record["observed"] = "PASS" if record["ok"] else "FAIL"
+        if record["timed_out"]:
+            record["timeout_kind"] = "deadline-shortened" if record["deadline_shortened"] else "case-limit"
     try:
         record["hashes_after"] = verify(config, receipt, final, output / "identity-after.json")
     except (OSError, ValueError, KeyError, configparser.Error, subprocess.SubprocessError) as error:
-        record.update(ok=False, identity_error=str(error))
+        record.update(ok=False, identity_error=str(error),
+                      interrupted=bool(TERMINATION_REASON) or isinstance(error, InterruptedError))
+        if record["observed"] == "PASS":
+            record["observed"] = "FAIL"
+    if TERMINATION_REASON:
+        record.update(ok=False, interrupted=True, reason=TERMINATION_REASON)
         if record["observed"] == "PASS":
             record["observed"] = "FAIL"
     if not record["ok"] and record.get("first_failure") is None:
@@ -211,7 +247,14 @@ def run_case(config, receipt, case, output, stop, final):
     record["runtime_gates"] = ["native profile isolation/removal and close barrier require qualification",
                                "Windows executor held"]
     record["finished_utc"] = datetime.now(timezone.utc).isoformat()
-    save(output / "result.json", record)
+    try:
+        save(output / "result.json", record)
+    except OSError as error:
+        record.update(ok=False, observed="FAIL", finalization_error=str(error),
+                      interrupted=bool(TERMINATION_REASON) or isinstance(error, InterruptedError))
+        if record["interrupted"]:
+            record["reason"] = TERMINATION_REASON or str(error)
+        record["first_failure"] = record.get("first_failure") or {"action": "finalization", "message": str(error)}
     return record
 
 def run_batch(config, raw_config=None):
@@ -226,6 +269,7 @@ def run_batch(config, raw_config=None):
     requested = config.get("select", [])
     selected, results, error = requested if isinstance(requested, list) else [], [], None
     try:
+        require_running()
         if not selected or len(selected) != len(set(selected)) or any(i not in CASES for i in selected):
             raise ValueError("distinct explicit native catalog IDs required")
         stop_utc, final_utc = (datetime.fromisoformat(config[k]) for k in ("test_stop_utc", "finalize_utc"))
@@ -236,12 +280,15 @@ def run_batch(config, raw_config=None):
         if not 0 < config["timeout_seconds"] <= 600 or time.monotonic() + 4 >= stop:
             raise ValueError("bounded per-case timeout and future stop required")
         receipt = prepare(config, final, output / "preflight.json")
+        check_leak_capability(receipt)
         save(output / "build-receipt.json", receipt)
         (output / "original-build-receipt.json").write_bytes(Path(config["receipt"]).read_bytes())
         for index, name in enumerate(selected):
-            if time.monotonic() + 4 >= stop or error:
+            if time.monotonic() + 4 >= stop or error or TERMINATION_REASON:
                 results.append({"id": name, "observed": "NOTRUN", "ok": False,
-                                "reason": error or "test-stop reached", "coverage": "none"})
+                                "reason": TERMINATION_REASON or error or "test-stop reached",
+                                "interrupted": bool(TERMINATION_REASON), "coverage": "none",
+                                "leak_check": "unavailable"})
                 continue
             directory = output / f"{index:02}-{name.replace(':', '-')}"
             directory.mkdir()
@@ -249,20 +296,30 @@ def run_batch(config, raw_config=None):
                 row = run_case(config, receipt, CASES[name], directory, stop, final)
             except (OSError, ValueError, KeyError, TypeError) as failure:
                 row = {"id": name, "observed": "FAIL", "ok": False, "coverage": "none",
-                       "error": "case evidence finalization failed: " + str(failure)}
+                       "error": "case evidence finalization failed: " + str(failure),
+                       "interrupted": bool(TERMINATION_REASON) or isinstance(failure, InterruptedError),
+                       "reason": TERMINATION_REASON or str(failure), "leak_check": "unavailable",
+                       "first_failure": {"action": "finalization", "message": str(failure)}}
             results.append(row)
             if row.get("survivor_pids") or row.get("cleanup_failed") or row.get("interrupted"):
-                error = "cleanup unresolved or runner interrupted; later launches refused"
+                error = TERMINATION_REASON or "cleanup unresolved or runner interrupted; later launches refused"
         verify(config, receipt, final, output / "final-identity.json")
     except (OSError, ValueError, KeyError, TypeError, configparser.Error, subprocess.SubprocessError) as failure:
-        error = str(failure)
+        error = TERMINATION_REASON or str(failure)
+    error = TERMINATION_REASON or error
     results += [{"id": name, "observed": "NOTRUN", "ok": False, "reason": error,
-                 "coverage": "none"} for name in selected[len(results):]]
+                 "coverage": "none", "interrupted": bool(TERMINATION_REASON),
+                 "leak_check": "unavailable"} for name in selected[len(results):]]
     summary = {"ok": bool(results) and not error and all(r["ok"] for r in results),
-               "infrastructure_error": error, "results": results,
+               "infrastructure_error": error, "results": results, "leak_check": "unavailable",
+               "interrupted": bool(TERMINATION_REASON),
                "counts": {s: sum(r["observed"] == s for r in results) for s in ("PASS", "FAIL", "NOTRUN")},
                "requested": len(selected), "executed": sum(bool(r.get("executed")) for r in results)}
-    save(output / "summary.json", summary)
+    try:
+        save(output / "summary.json", summary)
+    except InterruptedError as failure:
+        summary.update(ok=False, interrupted=True, infrastructure_error=TERMINATION_REASON or str(failure))
+        save(output / "interrupted-summary.json", summary)
     return summary
 
 
@@ -270,10 +327,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     args = parser.parse_args()
-    def stop(signum, frame):
-        raise InterruptedError(f"termination signal {signum}")
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
     raw_config = args.config.read_bytes()
     return 0 if run_batch(json.loads(raw_config), raw_config)["ok"] else 1
 

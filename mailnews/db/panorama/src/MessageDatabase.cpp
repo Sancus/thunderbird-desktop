@@ -323,22 +323,16 @@ nsresult MessageDatabase::SetMessageReferences(
 }
 
 nsresult MessageDatabase::MessageExists(nsMsgKey key, bool& exists) {
-  if (mMsgCache.has(key)) {
-    exists = true;
-    return NS_OK;
-  }
-
+  // Removed headers stay cached for listeners; membership comes from storage.
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "MessageExists"_ns, "SELECT 1 FROM messages WHERE id = :id"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(DatabaseCore::GetStatement("MessageExists"_ns,
+                                     "SELECT 1 FROM messages WHERE id = :id"_ns,
+                                     getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindInt64ByName("id"_ns, key);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
 
   bool hasResult;
-  rv = stmt->ExecuteStep(&hasResult);
-  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
   exists = hasResult;
   return NS_OK;
 }

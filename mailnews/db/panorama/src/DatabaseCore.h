@@ -26,6 +26,7 @@ class mozIStorageStatement;
 namespace mozilla::mailnews {
 
 class PerFolderDatabase;
+class DeliveryCoreMessageExistence;
 class DeliveryCoreReferences;
 class DeliveryFolderInfoProperties;
 class DeliveryMessageReferences;
@@ -50,6 +51,7 @@ class DatabaseCore : public nsIDatabaseCore,
   virtual ~DatabaseCore() {};
 
  private:
+  friend class DeliveryCoreMessageExistence;
   friend class DeliveryCoreReferences;
   friend class DeliveryFolderInfoProperties;
   friend class DeliveryMessageReferences;

@@ -97,6 +97,8 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult SetMessageProperty(nsMsgKey key, const nsACString& name,
                               uint32_t value);
 
+  // Stored membership, independent of cached notification headers.
+  // On storage error, exists is unchanged.
   nsresult MessageExists(nsMsgKey key, bool& exists);
 
   // Find the message with the given "Message-Id:".

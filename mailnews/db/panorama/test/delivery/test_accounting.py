@@ -49,6 +49,7 @@ class AccountingTests(unittest.TestCase):
 
     def test_accepts_complete_folder_and_raw_db_evidence(self):
         self.assertTrue(self.check(self.events)["ok"])
+        self.assertIsNone(self.check(self.events)["first_failure"])
         raw_case = {**self.case, "store": "none", "diagnostics": "backend"}
         self.assertTrue(self.check(self.events[:3] + self.events[5:], raw_case)["ok"])
         self.assertFalse(self.check(self.events, raw_case)["ok"])
@@ -160,6 +161,7 @@ prefs = [
         self.assertEqual(len(calls), 2)
         self.assertFalse(summary["ok"])
         self.assertEqual([r["observed"] for r in summary["results"]], ["FAIL", "PASS"])
+        self.assertEqual([r["disposition"] for r in summary["results"]], ["failed", "passed"])
         self.assertEqual(summary["results"][0]["argv"], calls[0])
         empty = {**config, "evidence": str(self.root / "empty")}
         self.assertFalse(runner.run_batch(empty, [])["ok"])
@@ -211,6 +213,7 @@ prefs = ["mail.panorama.enabled=true", "mail.serverDefaultStoreContractID=@mozil
         with patch.object(runner.subprocess, "run") as execute:
             record = runner.run_case(config, self.case, output)
         execute.assert_not_called()
+        self.assertEqual(record["disposition"], "blocked")
         self.assertIn("blocked-dependency:", record["observed"])
         self.assertIn("test_peer.js", record["observed"])
         (source / "test_peer.js").write_text("// fixture")
@@ -279,6 +282,102 @@ prefs = ["mail.panorama.enabled=true", "mail.serverDefaultStoreContractID=@mozil
         self.assertFalse(result["ok"])
         self.assertEqual(result["observed"], "not-run")
         self.assertTrue((output / "request.json").is_file())
+
+    def folder_events(self, names, phase=None):
+        events = self.events[:3]
+        for name in names:
+            contract = {**self.contract, "folderURI": "mailbox://test/" + name}
+            events += [self.diag("STORE_CONTRACT", contract),
+                       self.diag("FOLDER", {**self.folder, **contract})]
+        if phase:
+            events.append(self.diag("PHASE", {"phase": phase}))
+        return events + self.events[-3:]
+
+    def test_transfer_requires_both_folders_and_terminal_phase(self):
+        case = {**self.case, "phase": "local-copy-verified",
+                "folder_roles": {"source": "source", "destination": "destination"}}
+        events = self.folder_events(["source", "destination"], case["phase"])
+        result = self.check(events, case)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["completed_phase"], case["phase"])
+        self.assertEqual(result["folder_evidence"], {
+            "source": "mailbox://test/source", "destination": "mailbox://test/destination"})
+        for names, phase in ((["source"], case["phase"]),
+                             (["source", "source"], case["phase"]),
+                             (["source", "destination"], None)):
+            with self.subTest(names=names, phase=phase):
+                failed = self.check(self.folder_events(names, phase), case)
+                self.assertFalse(failed["ok"])
+                self.assertEqual(failed["coverage"], "none")
+                self.assertIsNone(failed["completed_phase"])
+        for field, value in (("actualStore", "maildir"),
+                             ("backend", "mork"),
+                             ("folderURI", "mailbox://other/destination")):
+            changed = copy.deepcopy(events)
+            payload = {**self.folder, "folderURI": "mailbox://test/destination", field: value}
+            changed[6] = self.diag("FOLDER", payload)
+            if field == "folderURI":
+                changed[5] = self.diag("STORE_CONTRACT", {**self.contract, "folderURI": value})
+            with self.subTest(field=field):
+                result = self.check(changed, case)
+                self.assertFalse(result["ok"])
+                if field == "folderURI":
+                    self.assertIn("declared fixture folders do not share a parent", result["errors"])
+
+    def test_workflow_requires_declared_folder_scope_without_fabricated_phase(self):
+        case = {**self.case, "folder_roles": {
+            "first": "listFirst", "second": "listSecond", "outside": "listOutside"}}
+        good = self.check(self.folder_events(list(case["folder_roles"].values())), case)
+        self.assertTrue(good["ok"])
+        self.assertIsNone(good["last_phase"])
+        self.assertIsNone(good["completed_phase"])
+        self.assertFalse(self.check(self.folder_events(["listFirst", "listSecond"]), case)["ok"])
+
+    def test_first_failure_and_observed_phase_never_certify_later_coverage(self):
+        case = {**self.case, "phase": "local-copy-verified",
+                "folder_roles": {"source": "source", "destination": "destination"}}
+        events = self.folder_events(["source", "destination"])
+        failure = {"action": "test_status", "test": case["file"], "status": "FAIL",
+                   "expected": "PASS", "subtest": "source property value", "message": "wrong value"}
+        events[-3:-3] = [failure, self.diag("PHASE", {"phase": case["phase"]}),
+                         {"action": "log", "level": "ERROR", "message": "later error"}]
+        result = self.check(events, case)
+        self.assertEqual(result["first_failure"], failure)
+        self.assertEqual(result["last_phase"], case["phase"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["coverage"], "none")
+        self.assertIsNone(result["completed_phase"])
+
+    def test_changed_or_missing_inputs_cannot_certify_completed_phase(self):
+        case = {**self.case, "phase": "local-copy-verified"}
+        events = self.folder_events(["source"], case["phase"])
+        config = {"source": str(self.root), "objdir": str(self.root), "python": "python"}
+
+        def execute(argv, **kwargs):
+            raw = Path(argv[argv.index("--log-raw") + 1])
+            raw.write_text("".join(json.dumps(e) + "\n" for e in events))
+            return SimpleNamespace(returncode=0)
+
+        for name, after, disposition in (("changed", {"input": "new"}, "failed"),
+                                         ("missing", OSError("input removed"), "blocked")):
+            output = self.root / name
+            output.mkdir()
+            with (
+                patch.object(runner, "prepare", return_value=(self.root / "manual.toml", [])),
+                patch.object(runner, "digest", side_effect=[{"input": "old"}, after]),
+                patch.object(runner.subprocess, "run", execute),
+            ):
+                result = runner.run_case(config, case, output)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["disposition"], disposition)
+            self.assertEqual(result["coverage"], "none")
+            self.assertIsNone(result["completed_phase"])
+
+    def test_invalid_folder_role_declarations_block_before_manifest_read(self):
+        for roles in (["source"], {"one": "source", "two": "source"},
+                      {"source": "../source"}, {"source": 1}):
+            with self.subTest(roles=roles), self.assertRaisesRegex(ValueError, "folder roles"):
+                runner.prepare({"source": str(self.root)}, {**self.case, "folder_roles": roles})
 
 
 if __name__ == "__main__":

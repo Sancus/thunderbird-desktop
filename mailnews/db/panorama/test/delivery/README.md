@@ -75,3 +75,30 @@ Every entry in a selected manifest must exist; missing peers/resources are recor
 as blocked-dependency before execution. Compatibility and migration use separate
 manual manifests. NumericProperties is pending-contract and cannot execute.
 Keep configs/evidence outside the source repositories to keep source checks clean.
+
+
+Local-storage and workflow lanes are separate manual manifests (12 and 6 rows).
+The predeclared folder_roles map names roles using the fixture's literal URI leaf
+names; required folders must be distinct and share their account parent. Every
+folder diagnostic must still match the actual backend/store and earlier contract
+observation. Copy/Move require both source and destination, plus their terminal
+local-copy-verified/local-move-verified phase. Publication requires its target and
+local-publication-verified. Workflows have no artificial phase: the full file must
+pass and every declared source/outside/saved-search folder must be observed.
+These diagnostics establish instantiated stores, not body round-trip coverage
+for membership-only workflows.
+
+Results retain the first failing test/harness event and last observed phase.
+Only an entirely passing file can certify completed_phase or coverage. Folder
+setup evidence and a late phase after failure never grant later assertions credit.
+Preflight/launch errors have disposition=blocked, test failures/timeouts=failed;
+both fail the aggregate with zero coverage. These lanes require standard local
+mail/view facilities: missing product behavior remains a failed assertion, never
+inferred unsupported-build. Explicit optional-protocol unsupported-build gates
+belong to their later registration slice. They must also have zero coverage.
+
+Local Copy/Move here use the integrated source version. LS-N1's destination-first
+correction is a separate owner commit awaiting review/integration; registration
+does not import that code. A first source/property failure can hide destination
+and later identity/body checks. Remote evidence must retain that first failure;
+terminal phases remain required, with no partial case pass.

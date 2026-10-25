@@ -390,5 +390,271 @@
     "fixture": "preconfigured-store",
     "readiness": "pending-product",
     "phase": "uid-fetch-verified"
+  },
+  {
+    "id": "local:panorama:mbox:Publication",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryLocalPublication.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "local-publication-verified",
+    "folder_roles": {
+      "target": "publication"
+    }
+  },
+  {
+    "id": "local:panorama:mbox:Copy",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryLocalCopy.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "local-copy-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "local:panorama:mbox:Move",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryLocalMove.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "local-move-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "local:panorama:maildir:Publication",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryLocalPublication.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "local-publication-verified",
+    "folder_roles": {
+      "target": "publication"
+    }
+  },
+  {
+    "id": "local:panorama:maildir:Copy",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryLocalCopy.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "local-copy-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "local:panorama:maildir:Move",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryLocalMove.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "phase": "local-move-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "local:mork:mbox:Publication",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryLocalPublication.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "local-publication-verified",
+    "folder_roles": {
+      "target": "publication"
+    }
+  },
+  {
+    "id": "local:mork:mbox:Copy",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryLocalCopy.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "local-copy-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "local:mork:mbox:Move",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-mork-mbox.toml",
+    "file": "test_panoramaDeliveryLocalMove.js",
+    "backend": "mork",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "local-move-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "local:mork:maildir:Publication",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryLocalPublication.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "local-publication-verified",
+    "folder_roles": {
+      "target": "publication"
+    }
+  },
+  {
+    "id": "local:mork:maildir:Copy",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryLocalCopy.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "local-copy-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "local:mork:maildir:Move",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-mork-maildir.toml",
+    "file": "test_panoramaDeliveryLocalMove.js",
+    "backend": "mork",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "ready",
+    "phase": "local-move-verified",
+    "folder_roles": {
+      "source": "source",
+      "destination": "destination"
+    }
+  },
+  {
+    "id": "workflows:panorama:mbox:Filters",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-workflows-mbox.toml",
+    "file": "test_deliveryWorkflowFilters.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "source": "filterSource",
+      "outside": "filterOutside"
+    }
+  },
+  {
+    "id": "workflows:panorama:mbox:ListMembership",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-workflows-mbox.toml",
+    "file": "test_deliveryWorkflowListMembership.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "first": "listFirst",
+      "second": "listSecond",
+      "outside": "listOutside"
+    }
+  },
+  {
+    "id": "workflows:panorama:mbox:SavedSearch",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-workflows-mbox.toml",
+    "file": "test_deliveryWorkflowSavedSearch.js",
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "first": "searchFirst",
+      "second": "searchSecond",
+      "outside": "searchOutside",
+      "saved": "deliverySavedSearch"
+    }
+  },
+  {
+    "id": "workflows:panorama:maildir:Filters",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-workflows-maildir.toml",
+    "file": "test_deliveryWorkflowFilters.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "source": "filterSource",
+      "outside": "filterOutside"
+    }
+  },
+  {
+    "id": "workflows:panorama:maildir:ListMembership",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-workflows-maildir.toml",
+    "file": "test_deliveryWorkflowListMembership.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "first": "listFirst",
+      "second": "listSecond",
+      "outside": "listOutside"
+    }
+  },
+  {
+    "id": "workflows:panorama:maildir:SavedSearch",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-workflows-maildir.toml",
+    "file": "test_deliveryWorkflowSavedSearch.js",
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "first": "searchFirst",
+      "second": "searchSecond",
+      "outside": "searchOutside",
+      "saved": "deliverySavedSearch"
+    }
   }
 ]

@@ -14,6 +14,7 @@ import sys
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 HERE = Path(__file__).resolve().parent
 CONTRACTS = {"mbox": "berkeleystore", "maildir": "maildirstore"}
@@ -25,6 +26,7 @@ def check_log(log, case, returncode=0):
     starts, ends, suites, suite_ends = [], [], [], 0
     backends, folders, contracts, phases, modes = [], [], {}, [], []
     active = False
+    first_failure, folder_evidence = None, {}
     try:
         raw = Path(log).read_text(encoding="utf-8")
         if not raw.endswith("\n"):
@@ -34,6 +36,15 @@ def check_log(log, case, returncode=0):
             if not isinstance(event, dict) or not isinstance(event.get("action"), str):
                 raise ValueError("event must be an object with an action")
             action = event["action"]
+            if first_failure is None and (
+                action == "crash" or event.get("level") in ("ERROR", "CRITICAL", "FATAL")
+                or (action in ("test_status", "test_end")
+                    and (event.get("status") != "PASS"
+                         or event.get("expected", "PASS") != "PASS"))
+            ):
+                first_failure = {k: event[k] for k in
+                                 ("action", "test", "subtest", "status", "expected",
+                                  "message", "stack") if k in event}
             if action == "suite_start":
                 selected = event.get("tests", {})
                 suites.append([v for group in selected.values() for v in group])
@@ -114,6 +125,15 @@ def check_log(log, case, returncode=0):
                     or d["defaulted"] != (not d["contractBefore"])
                     or (d["contractBefore"] and d["contractBefore"] != wanted)):
                     errors.append("mismatched folder/store evidence")
+            for role, name in case.get("folder_roles", {}).items():
+                matching = {d["folderURI"] for d in folders
+                            if unquote(d["folderURI"].rsplit("/", 1)[-1]) == name}
+                if len(matching) != 1:
+                    errors.append("missing or ambiguous folder evidence: " + role)
+                else:
+                    folder_evidence[role] = matching.pop()
+            if len({uri.rsplit("/", 1)[0] for uri in folder_evidence.values()}) > 1:
+                errors.append("declared fixture folders do not share a parent")
         elif folders or contracts:
             errors.append("raw DB case unexpectedly claimed folder/store coverage")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
@@ -122,7 +142,10 @@ def check_log(log, case, returncode=0):
         errors.append("contract approval is pending")
     return {"ok": not errors, "errors": errors,
             "factory_blocked": "imap-factory" in phases and "imap-ready" not in phases,
-            "coverage": case["diagnostics"] if not errors else "none"}
+            "coverage": case["diagnostics"] if not errors else "none",
+            "first_failure": first_failure, "last_phase": phases[-1] if phases else None,
+            "folder_evidence": folder_evidence,
+            "completed_phase": case.get("phase") if not errors else None}
 
 
 def prepare(config, case):
@@ -138,6 +161,11 @@ def prepare(config, case):
         raise ValueError("diagnostic policy must match fixture scope")
     if (case["store"] == "none") != (case["fixture"] == "raw-db"):
         raise ValueError("store=none is reserved for raw DB fixtures")
+    roles = case.get("folder_roles", {})
+    if (not isinstance(roles, dict) or (roles and case["diagnostics"] != "folder")
+        or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", name)
+               for name in roles.values()) or len(set(roles.values())) != len(roles)):
+        raise ValueError("folder roles require distinct literal fixture names and folder scope")
     if case["readiness"] not in ("ready", "pending-product", "pending-contract"):
         raise ValueError("invalid readiness")
     if case["readiness"] == "pending-contract":
@@ -210,14 +238,19 @@ def run_case(config, case, output):
             result = subprocess.run(argv, cwd=source, env=env, stdout=out, stderr=err,
                                     timeout=config.get("timeout_seconds", 600), check=False)
         record.update(check_log(raw, case, result.returncode))
-        record.update(observed="PASS" if record["ok"] else "FAIL", exit_code=result.returncode,
+        record.update(observed="PASS" if record["ok"] else "FAIL",
+                      disposition="passed" if record["ok"] else "failed", exit_code=result.returncode,
                       hashes_before=before, hashes_after=digest(paths))
         if record["hashes_after"] != before:
             record["ok"] = False
             record["observed"] = "FAIL"
+            record["disposition"] = "failed"
+            record["coverage"] = "none"
+            record["completed_phase"] = None
             record["errors"].append("source/build inputs changed during execution")
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
-        record.update(ok=False, errors=[str(error)], coverage="none")
+        record.update(ok=False, errors=[str(error)], coverage="none", completed_phase=None,
+                      disposition="failed" if isinstance(error, subprocess.TimeoutExpired) else "blocked")
         if str(error).startswith("blocked-dependency:"):
             record["observed"] = str(error)
         if isinstance(error, subprocess.TimeoutExpired):

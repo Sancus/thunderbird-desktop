@@ -5,7 +5,7 @@
   "backend": "panorama",
   "store": "none",
   "readiness": "pending-product",
-  "execution_hold": "Exact efd2 native driver/output/profile/build sources and matching native execution remain unverified. This catalog does not authorize execution.",
+  "execution_hold": "Native build, new authorized allocation and Linux lifecycle validation remain required; Windows execution is held.",
   "cases": [
     {
       "id": "core-native:References:AddNotificationSeesCommittedReferences",

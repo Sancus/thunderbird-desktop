@@ -1,85 +1,94 @@
-# Manual native acceptance (verification hold)
+# Manual native acceptance
 
-This directory links only TestDeliveryCoreReferences.cpp into xul-gtest. All cases
-retain DISABLED_DeliveryCoreReferences, so ordinary gtest runs do not execute them.
-No normal suite filter is added. TestDeliveryFolderInfoProperties.cpp is excluded:
-its seven existing cases and owner-proposed boolean cases await corrected fixtures,
-disabled names and independent review. EWS/search/conversation/browser remain
-separate work. cases.json and its 93 xpcshell rows, including the NumericProperties
-contract hold, are unchanged.
+Only TestDeliveryCoreReferences.cpp is linked here. Its fourteen cases remain
+DISABLED_DeliveryCoreReferences; no normal-CI filter or execution is added.
+The 93 xpcshell rows and NumericProperties hold are unchanged. FolderInfo19,
+EWS and search/conversation/browser registration remain separate owner slices.
+Native cases select the concrete Panorama core and check panorama.sqlite identity.
+They have store none: no account/body-store or application-restart coverage.
 
-native-cases.json lists fourteen exact filters, independent observable expectations,
-and raw-DB scope (Panorama, store none). The fixture selects DatabaseCore directly
-and checks its panorama.sqlite file identity. There is no store/account fixture or
-mbox/maildir claim. Core/connection reopen within one process is not process restart.
-No automation or security preference is changed.
+## Verified driver and limits
 
-## Verified source and remaining pins
+Exact efd2 sources are hash-bound by delivery/reviews/pinned-gecko-efd2/native-inputs.json.
+GTestRunner.cpp:52-68 opens MOZ_GTEST_LOG_PATH with w and closes it at suite_end;
+:83-135 defines exact case events; :196-266 initializes ScopedXPCOM and returns
+RUN_ALL_TESTS before its destructor. TestHarness.h:91-121 then removes its profile,
+shuts down XPCOM and prints Finished running GTest tests. Thus JSONL plus exit 0
+alone cannot establish successful shutdown. :126-147 creates a unique cpp-unit-profd
+under NS_OS_CURRENT_PROCESS_DIR; :192-213 exposes the persistent profile provider.
+The core fixture independently creates/removes its unique child and closes the core.
 
-The exact efd2 mach_commands.py is available in delivery/state/pinned-gecko-harness,
-SHA-256 01608bd9c06d2ecc085997b6f0528c33f6f3ea8b114e30e403bc56e53ec320f5.
-Its gtest command dispatches a build of target gtest (1134-1136); running the command
-is therefore a build action. It constructs app -unittest and thread-safe death-test
-arguments (1194-1201), copies the environment and sets GTEST_FILTER (1216-1217),
-and launches one process for --combine-suites with --jobs 1 (1293-1312).
-Windows adds --wait-for-browser when MOZ_LAUNCHER_PROCESS is defined. Paths for
-MOZ_XRE_DIR and MOZ_GMP_PATH are native platform paths (1219-1226).
+gtest.cc:6819 parses --gtest_also_run_disabled_tests. The runner passes that flag
+and one exact GTEST_FILTER; it uses no wildcard, repeat, sharding or filter-set.
+nsAppRunner.cpp:5345-5360 enters the gtest runtime through MOZ_RUN_GTEST.
+toolkit/library/gtest/moz.build targets dist/bin/gtest. Exact pinned mach commands
+still build gtest before execution (:1134-1136); run_native.py never invokes mach.
+Root must build/configure the target separately and freeze the resulting receipt.
 
-The exact native logger, disabled-flag implementation, profile provider and linked
-runtime sources were requested from root. Local runtime/src is older evidence,
-not the pinned revision. Until those bytes are verified, the output format and
-launch/profile assumptions remain provisional. No execution entrypoint is supplied.
-The build declarations follow neighboring comm gtests; native compilation and
-linkage, including Windows exports and fixture cleanup, remain unverified.
+Additional exact nsDebugImpl.cpp, nsTraceRefcnt.cpp, mfbt/Assertions.h and
+nsXPCOMGlue.cpp pins have been requested from root for diagnostic/loader review.
+Assertion/leak formatting beyond the supplied TestHarness literals is provisionally
+corroborated by older source. These remaining pins/review are an execution hold;
+literal preflight checks are not a substitute for that review. No native run occurred.
 
-## Accounting and execution contract
+## Linux slice
 
-native_accounting.py checks only a proposed dedicated Mozilla gtest JSONL stream,
-independently of xpcshell diagnostics and suite selection rules. It requires one
-program/group/case start and end in order, the exact selected case ending PASS,
-and zero skips, failures, crashes, timeouts, extra executions or process errors.
-The program's empty tests declaration is not evidence of selection. Passing
-assertions need not emit events. log_complete is structural only; coverage remains
-none and the verification hold remains present even for a complete synthetic log.
-It is not an executor or artifact-identity gate.
+run_native.py requires a fresh root-reviewed request and build receipt. Windows
+is refused before launch: owned Job Object and conditional launcher waiting need
+a separate reviewed implementation. No platform earns credit from synthetic tests.
 
-Before an executor is approved, confirm from exact efd2 source that
-GTEST_ALSO_RUN_DISABLED_TESTS=1 or --gtest_also_run_disabled_tests actually enables
-the disabled suite, and that MOZ_GTEST_LOG_PATH produces the proposed dedicated
-stream. The verified mach command retains the environment variable, but that alone
-does not prove its native interpretation. Neither MOZ_AUTOMATION nor a security
-preference is a substitute. Avoid mach's repeated implicit builds during acceptance;
-root must separate the immutable native build from the per-case launch phase.
+Request fields are absolute source, objdir, evidence and receipt paths;
+receipt_sha256; an ordered, distinct select array of native-cases.json IDs;
+timeout_seconds (1-600); timezone-qualified test_stop_utc and finalize_utc with
+at least 60 seconds reserved for final checks. All dates/allocation identifiers must
+come from a newly approved allocation; the original allocation is closed.
+No scheduling or allocation is performed by this tool.
 
-The future reviewed launcher must use one exact catalog filter per fresh native
-process/profile, sequentially, with explicit disabled-test opt-in and no wildcard,
-sharding, repeat, listing, retry or filter-set override. Preserve raw stdout/stderr,
-dedicated native log, filter/argv/cwd/environment, PID, timestamps, exit code and
-counts. Record clean comm/Gecko revisions plus hashes of test/product/build inputs,
-app and loaded xul-gtest library, application/platform INIs, config.status and
-mozconfig before and after execution. Root supplies matching artifact provenance;
-HEAD alone does not establish binary identity. Use new evidence paths outside source
-and never overwrite earlier logs. An early failure grants no later contract credit.
+The receipt contains build_identity, full comm_revision/gecko_revision, absolute
+app/library/mozconfig paths, and inputs mapping absolute files to SHA-256 hashes.
+prepare() declares mandatory test/product/build/driver/config inputs, app and
+objdir/dist/bin/gtest/libxul.so, application.ini, platform.ini and config.status.
+Root must bind those exact hashes to the separate reviewed native build; HEAD alone
+is not artifact provenance. Source checkouts must be clean. Application [App] and
+platform [Build] SourceStamp must match comm and Gecko respectively.
 
-Require a new authorized allocation and root-reviewed deadlines before launch.
-Bound every process and reserve finalization headroom; a timeout must clean only
-that job's descendants, retain failure evidence and continue later eligible cases.
-Every requested ID needs a result or explicit NOTRUN reason, with a failing
-aggregate for any failure, timeout or incomplete selection. Linux needs verified
-session/descendant cleanup; Windows needs launcher waiting and an owned Job Object
-or an equivalently reviewed descendant mechanism. No name-based killing or unrelated
-process cleanup. Neither mechanism is implemented or claimed by this offline checker.
+Use Python 3.11+ on Linux with /proc, pidfds and PR_SET_CHILD_SUBREAPER available.
+The runner verifies source and hashes before/after each case and at finalization.
+It captures /proc/pid/exe plus the actual mapped library's path/device/inode;
+missing/stale mapping proof fails even when JSONL passes. A very fast process may
+exit before proof is observed; that remains a failed evidence result, not inferred
+success. No exe-name kill or process-name exemption exists.
 
-The native fixture creates a unique disposable profile directory, restores the
-previous directory provider and removes its own directory. Confirm the pinned
-ScopedXPCOM provider and per-process isolation, close barrier and profile removal
-on matching Linux and Windows before acceptance. Preserve crash stacks/symbol
-identity when available. Native compile/runtime and targeted restored negative
-controls remain pending; the existing compatibility/migration References lanes
-also require their owners' dependent slices.
+Every case uses a new process session and exclusive evidence directory, with a
+reserved native.jsonl, unfiltered stdout/stderr and a fresh HOME/TMPDIR. Environment
+is explicit: PATH/LANG/LC_ALL are retained, native driver paths/flags are recorded;
+other inherited variables, including GTEST overrides and MOZ_AUTOMATION, are absent.
+No security/automation preference is changed. Linux subreaping and pidfd ownership
+rechecks cover owned descendants, including reparented children. Cleanup is bounded;
+any required termination fails the case, and survivors/cleanup uncertainty stop
+later launches. Per-case failure otherwise does not stop later selected IDs.
 
-Lightweight verification from this directory (no native binary):
+JSONL completion, exit 0 and post-suite XPCOM completion are all required. The
+stdout native event sequence must match the dedicated log; extra successful events
+on either raw stream fail. Raw output also rejects anchored assertion/crash/profile failures and nonzero TOTAL
+leak bytes/objects. Structured expected text, ordinary prose, crash-reporter setup
+and zero-leak totals are not failures. First JSON failure is retained, otherwise the
+first raw failure in stdout then stderr; cross-stream chronology is not inferred.
+
+Every selected ID receives a result or NOTRUN reason; failures, timeouts, incomplete
+selection and final identity errors fail the aggregate. Config/receipt bytes,
+argv/cwd/environment, hashes, Git commands, PID/maps, deadlines, exit and counts
+remain outside source. Existing evidence is never overwritten. Observed PASS is a
+case/process result; coverage remains none while native profile isolation/removal,
+close-barrier qualification and restored negative controls are pending.
+
+Local lightweight checks use tiny Python children and temporary Git fixtures:
 
 ~~~powershell
-python -B -m unittest -v test_native_accounting.py test_accounting.py
+python -B -m unittest -v test_native_runner.py test_native_accounting.py test_accounting.py
 ~~~
+
+On Windows the Linux cleanup probe checks refusal only; Linux /proc/pidfd/subreaper
+execution remains pending. Native compile/link, lifecycle, leak-detector sensitivity
+and Linux runtime qualification require a new authorized allocation. No binary,
+build or cloud operation is authorized by this document.

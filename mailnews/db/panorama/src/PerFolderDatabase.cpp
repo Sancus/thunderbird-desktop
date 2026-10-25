@@ -9,6 +9,7 @@
 #include "MailNewsTypes.h"
 #include "Message.h"
 #include "MessageDatabase.h"
+#include "mozilla/CheckedInt.h"
 #include "mozilla/RefPtr.h"
 #include "mozilla/Preferences.h"
 #include "mozIStorageBindingParams.h"
@@ -1064,8 +1065,15 @@ NS_IMETHODIMP FolderInfo::GetUint32Property(const char* propertyName,
                                             uint32_t* propertyValue) {
   NS_ENSURE_ARG_POINTER(propertyValue);
   *propertyValue = defaultValue;
-  return FolderDB().GetFolderProperty(
-      mFolderId, nsDependentCString(propertyName), (int64_t*)propertyValue);
+  int64_t value = defaultValue;
+  MOZ_TRY(FolderDB().GetFolderProperty(
+      mFolderId, nsDependentCString(propertyName), &value));
+  CheckedInt<uint32_t> checkedValue(value);
+  if (!checkedValue.isValid()) {
+    return NS_ERROR_LOSS_OF_SIGNIFICANT_DATA;
+  }
+  *propertyValue = checkedValue.value();
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetUint32Property(const char* propertyName,
                                             uint32_t propertyValue) {

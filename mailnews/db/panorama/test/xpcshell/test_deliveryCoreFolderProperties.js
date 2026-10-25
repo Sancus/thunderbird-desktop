@@ -50,6 +50,7 @@ function readStoredRows(sql, columns) {
 }
 
 add_task(function test_persistFolderPropertiesByIdentity() {
+  // The body store is incidental; storage and process restart are not exercised.
   const account = MailServices.accounts.createLocalMailAccount();
   registerCleanupFunction(() => MailServices.accounts.removeAccount(account));
   const root = account.incomingServer.rootFolder.QueryInterface(
@@ -63,26 +64,57 @@ add_task(function test_persistFolderPropertiesByIdentity() {
 
   Assert.equal(first.getStringProperty("delivery.missing"), "");
   first.setStringProperty("delivery.café", "old value");
-  first.setStringProperty("delivery.cafe\u0301", "first value");
-  second.setStringProperty("delivery.café", "second value");
+  first.setStringProperty("delivery.cafe\u0301", "previous value");
+  first.setStringProperty("delivery.cafe\u0301", "raw cafe\u0301 value");
+  first.setStringProperty("delivery.case", "previous value");
+  first.setStringProperty("delivery.Case", "upper value");
+  first.setStringProperty("delivery.case", "lower value");
+  first.setStringProperty("delivery.leading", "00042");
+  first.setStringProperty("delivery.exponent", "1e3");
   first.setStringProperty("delivery.empty", "old value");
   first.setStringProperty("delivery.empty", "");
-  Assert.equal(first.getStringProperty("delivery.café"), "first value");
-  Assert.equal(first.getStringProperty("delivery.cafe\u0301"), "first value");
-  Assert.equal(second.getStringProperty("delivery.café"), "second value");
-  Assert.equal(first.getStringProperty("delivery.empty"), "");
-  Assert.equal(second.getStringProperty("delivery.empty"), "");
+  second.setStringProperty("delivery.café", "second value");
+  second.setStringProperty("delivery.cafe\u0301", "second decomposed value");
+
+  const expectedFirst = [
+    ["delivery.Case", "upper value"],
+    ["delivery.cafe\u0301", "raw cafe\u0301 value"],
+    ["delivery.café", "old value"],
+    ["delivery.case", "lower value"],
+    ["delivery.empty", ""],
+    ["delivery.exponent", "1e3"],
+    ["delivery.leading", "00042"],
+  ];
+  const expectedSecond = [
+    ["delivery.cafe\u0301", "second decomposed value"],
+    ["delivery.café", "second value"],
+  ];
   Assert.deepEqual(
-    readStoredRows(
-      "SELECT id, name, value FROM folder_properties " +
-        "WHERE name LIKE 'delivery.%' ORDER BY id, name",
-      ["id", "name", "value"]
-    ),
-    [
-      [first.id, "delivery.café", "first value"],
-      [first.id, "delivery.empty", ""],
-      [second.id, "delivery.café", "second value"],
-    ],
-    "Folder identity scopes replacements and preserves an explicitly empty value"
+    {
+      first: expectedFirst.map(([name]) => [
+        name,
+        first.getStringProperty(name),
+      ]),
+      second: expectedSecond.map(([name]) => [
+        name,
+        second.getStringProperty(name),
+      ]),
+      secondEmpty: second.getStringProperty("delivery.empty"),
+      stored: readStoredRows(
+        "SELECT id, name, value FROM folder_properties " +
+          "WHERE name LIKE 'delivery.%' ORDER BY id, name",
+        ["id", "name", "value"]
+      ),
+    },
+    {
+      first: expectedFirst,
+      second: expectedSecond,
+      secondEmpty: "",
+      stored: [
+        ...expectedFirst.map(([name, text]) => [first.id, name, text]),
+        ...expectedSecond.map(([name, text]) => [second.id, name, text]),
+      ],
+    },
+    "Exact property names and overwrites preserve values within each folder"
   );
 });

@@ -49,7 +49,7 @@ function readStoredRows(sql, columns) {
   }
 }
 
-add_task(function test_persistTypedProperties() {
+add_task(function test_persistPropertyNamesAndViews() {
   const root = folderDB.insertRoot("delivery-properties");
   const folderId = folderDB.insertFolder(root, "Inbox");
   const id = addMessage({ folderId, messageId: "properties@example.invalid" });
@@ -58,50 +58,77 @@ add_task(function test_persistTypedProperties() {
   Assert.equal(header.getStringProperty("delivery.missing"), "");
   Assert.equal(header.getUint32Property("delivery.missing"), 0);
   header.setStringProperty("delivery.café", "old value");
+  header.setStringProperty("delivery.cafe\u0301", "previous value");
   header.setStringProperty("delivery.cafe\u0301", "raw cafe\u0301 value");
+  header.setStringProperty("delivery.case", "previous value");
+  header.setStringProperty("delivery.Case", "upper value");
+  header.setStringProperty("delivery.case", "lower value");
+  header.setStringProperty("delivery.leading", "00042");
+  header.setStringProperty("delivery.exponent", "1e3");
   header.setStringProperty("delivery.empty", "previous value");
   header.setStringProperty("delivery.empty", "");
+  header.setUint32Property("delivery.answer", 42);
   header.setUint32Property("delivery.maximum", 0xffffffff);
   header.setUint32Property("delivery.zero", 17);
   header.setUint32Property("delivery.zero", 0);
   header.setStringProperty("keywords", "label1 label2");
 
+  const stringProperties = [
+    ["delivery.Case", "upper value", 0],
+    ["delivery.cafe\u0301", "raw cafe\u0301 value", 0],
+    ["delivery.café", "old value", 0],
+    ["delivery.case", "lower value", 0],
+    ["delivery.empty", "", 0],
+    ["delivery.exponent", "1e3", 483],
+    ["delivery.leading", "00042", 66],
+  ];
+  const expectedProperties = [
+    ...stringProperties,
+    ["delivery.answer", "2a", 42],
+    ["delivery.maximum", "ffffffff", 0xffffffff],
+    ["delivery.zero", "0", 0],
+  ];
+  const expectedNames = expectedProperties.map(([name]) => name).toSorted();
+
+  // Cached getters and an unshared SQL reader do not exercise process restart.
   const fetched = messageDB.getMessage(id);
-  Assert.equal(
-    fetched.getStringProperty("delivery.café"),
-    "raw cafe\u0301 value"
-  );
-  Assert.equal(
-    messageDB.getMessageProperty(id, "delivery.cafe\u0301"),
-    "raw cafe\u0301 value",
-    "Equivalent property names address the updated value"
-  );
-  Assert.equal(fetched.getStringProperty("delivery.empty"), "");
-  Assert.equal(fetched.getUint32Property("delivery.maximum"), 0xffffffff);
-  Assert.equal(fetched.getUint32Property("delivery.zero"), 0);
-  Assert.equal(fetched.getStringProperty("keywords"), "label1 label2");
-  Assert.deepEqual(fetched.properties.toSorted(), [
-    "delivery.café",
-    "delivery.empty",
-    "delivery.maximum",
-    "delivery.zero",
-  ]);
   Assert.deepEqual(
-    readStoredRows(
-      "SELECT id, name, value FROM message_properties ORDER BY name",
-      ["id", "name", "value"]
-    ),
-    [
-      [id, "delivery.café", "raw cafe\u0301 value"],
-      [id, "delivery.empty", ""],
-      [id, "delivery.maximum", 0xffffffff],
-      [id, "delivery.zero", 0],
-    ],
-    "Updates replace one property; empty and zero remain stored values"
-  );
-  Assert.deepEqual(
-    readStoredRows("SELECT id, tags FROM messages", ["id", "tags"]),
-    [[id, "label1 label2"]],
-    "Keywords persist as tags without a duplicate arbitrary property"
+    {
+      views: expectedProperties.map(([name]) => [
+        name,
+        fetched.getStringProperty(name),
+        fetched.getUint32Property(name),
+      ]),
+      names: fetched.properties.toSorted(),
+      nativeText: stringProperties.map(([name]) => [
+        name,
+        messageDB.getMessageProperty(id, name),
+      ]),
+      storedNames: readStoredRows(
+        "SELECT id, name FROM message_properties ORDER BY name",
+        ["id", "name"]
+      ),
+      storedStrings: readStoredRows(
+        "SELECT id, name, value FROM message_properties " +
+          "WHERE name NOT IN " +
+          "('delivery.answer', 'delivery.maximum', 'delivery.zero') ORDER BY name",
+        ["id", "name", "value"]
+      ),
+      keywords: fetched.getStringProperty("keywords"),
+      storedTags: readStoredRows("SELECT id, tags FROM messages", [
+        "id",
+        "tags",
+      ]),
+    },
+    {
+      views: expectedProperties,
+      names: expectedNames,
+      nativeText: stringProperties.map(([name, text]) => [name, text]),
+      storedNames: expectedNames.map(name => [id, name]),
+      storedStrings: stringProperties.map(([name, text]) => [id, name, text]),
+      keywords: "label1 label2",
+      storedTags: [[id, "label1 label2"]],
+    },
+    "Exact names, text, both header views and committed metadata stay independent"
   );
 });

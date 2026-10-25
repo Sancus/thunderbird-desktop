@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+"use strict";
+
 const tabmail = document.getElementById("tabmail");
 let win, doc;
 
@@ -200,5 +202,96 @@ add_task(function testToLabel() {
   const toLabel = element.querySelector(".message-to-label");
   Assert.ok(toLabel, "the To: label should be present");
   Assert.equal(toLabel.textContent, "to:", "the To: label should read 'to:'");
+  element.remove();
+});
+
+/**
+ * Renders a body with supplied FTS byte offsets in the isolated widget fixture.
+ * Sets the fixture collection to the supplied offsets.
+ *
+ * @param {string} body - The exact indexed body revision used by the offsets.
+ * @param {string} offsets - FTS column/term/UTF-8 offset/byte-length tuples.
+ * @returns {HTMLElement} The rendered result card.
+ */
+function renderSnippet(body, offsets) {
+  const element = doc.createElement("facet-result-message");
+  element.message = {
+    ...createMessage([]),
+    id: 1,
+    indexedBodyText: body,
+  };
+  win.FacetContext = {
+    collection: { stashedColumns: { 1: [offsets] } },
+    hoverFacet() {},
+    unhoverFacet() {},
+  };
+  registerCleanupFunction(() => element.remove());
+  doc.body.appendChild(element);
+  return element;
+}
+
+add_task(function test_snippetMultibyteOffsets() {
+  // Prefix: é (2), space (1), 😀 (4), space (1). Hits: café (5), 自動 (6).
+  const element = renderSnippet("é 😀 café 自動 end", "0 0 8 5 0 1 14 6");
+  const snippet = element.querySelector(".message-body");
+  Assert.ok(snippet, "Result has a body snippet");
+  Assert.equal(snippet.textContent, "é 😀 café 自動 end");
+  Assert.deepEqual(
+    [...snippet.querySelectorAll(".message-body-fulltext-match")].map(
+      node => node.textContent
+    ),
+    ["café", "自動"],
+    "UTF-8 offsets highlight whole multibyte words after a supplementary character"
+  );
+  Assert.equal(element.firstMatchText, "café");
+  element.remove();
+});
+
+add_task(function test_snippetSupplementaryHit() {
+  const element = renderSnippet("lead 😀 tail", "0 0 5 4");
+  const match = element.querySelector(".message-body-fulltext-match");
+  Assert.ok(match, "Supplementary character has a highlight");
+  Assert.equal(match.textContent, "😀", "Both surrogate halves stay together");
+  Assert.equal(element.firstMatchText, "😀");
+  const snippet = element.querySelector(".message-body");
+  Assert.ok(snippet, "Result has a body snippet");
+  Assert.equal(snippet.textContent, "lead 😀 tail");
+  element.remove();
+});
+
+add_task(function test_snippetMatchContext() {
+  // The ASCII hit begins after 5 + 4 + 4 + 6 bytes of preceding lines.
+  const element = renderSnippet(
+    "zero\none\ntwo\nthree\nneedle\nfive\nsix\nseven\neight\nnine\n",
+    "0 0 19 6"
+  );
+  const snippet = element.querySelector(".message-body");
+  Assert.ok(snippet, "Result has a body snippet");
+  Assert.equal(
+    snippet.textContent,
+    "…\ntwo\nthree\nneedle\nfive\nsix…",
+    "Snippet shows context around the first hit and marks omitted lines"
+  );
+  const match = snippet.querySelector(".message-body-fulltext-match");
+  Assert.ok(match, "Context snippet contains the requested hit");
+  Assert.equal(match.textContent, "needle");
+  Assert.equal(element.firstMatchText, "needle");
+  element.remove();
+});
+
+add_task(function test_snippetSubjectOnlyMatch() {
+  const element = renderSnippet("ordinary\ntext", "1 0 0 5");
+  const snippet = element.querySelector(".message-body");
+  Assert.ok(snippet, "Result has a body snippet");
+  Assert.equal(snippet.textContent, "ordinary\ntext");
+  Assert.equal(
+    snippet.querySelectorAll(".message-body-fulltext-match").length,
+    0
+  );
+  Assert.equal(
+    element.firstMatchText,
+    undefined,
+    "Subject offsets do not mark the body"
+  );
   element.remove();
 });

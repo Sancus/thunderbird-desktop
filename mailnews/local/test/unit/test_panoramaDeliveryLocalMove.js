@@ -171,7 +171,9 @@ add_task(async function test_movesExactMessageAndRetainsBystanders() {
   const lane = PanoramaDelivery.expectedLane();
   const { folder: source, rootFolder } =
     PanoramaDelivery.createLocalFixture("source");
-  const destination = rootFolder.createLocalSubfolder("destination");
+  const destination = rootFolder
+    .createLocalSubfolder("destination")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
   PanoramaDelivery.assertFolder(destination, lane);
 
   source.addMessage(makeMessage("Keeper", "Kept source body.\r\n"));

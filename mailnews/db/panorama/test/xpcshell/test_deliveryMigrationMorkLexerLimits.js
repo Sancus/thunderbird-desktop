@@ -99,7 +99,12 @@ add_task(function test_boundsTokenCount() {
 });
 
 add_task(function test_rejectsInvalidLimitsAndInput() {
-  Assert.throws(() => new MorkByteLexer("=x)"), TypeError);
+  // Built-in errors originate in the imported module's global.
+  Assert.throws(
+    () => new MorkByteLexer("=x)"),
+    error =>
+      error.name === "TypeError" && error.message === "Expected Uint8Array"
+  );
   for (const value of [0, -1, 1.5, NaN, Infinity]) {
     for (const name of [
       "maxInputBytes",
@@ -109,7 +114,8 @@ add_task(function test_rejectsInvalidLimitsAndInput() {
     ]) {
       Assert.throws(
         () => new MorkByteLexer(new Uint8Array(), { [name]: value }),
-        RangeError
+        error =>
+          error.name === "RangeError" && error.message === "Invalid " + name
       );
     }
   }

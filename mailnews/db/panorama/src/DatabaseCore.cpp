@@ -4,6 +4,8 @@
 
 #include "DatabaseCore.h"
 
+#include <utility>
+
 #include "DatabaseUtils.h"
 #include "FolderDatabase.h"
 #include "Message.h"
@@ -843,7 +845,7 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       }
       message->GetStoreToken(data.storeToken);
       message->GetMessageSize(&data.messageSize);
-      mMessageData.AppendElement(data);
+      mMessageData.AppendElement(std::move(data));
 
       mParamsArray->AddParams(params);
 

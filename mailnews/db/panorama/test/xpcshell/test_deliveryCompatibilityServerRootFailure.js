@@ -229,6 +229,11 @@ add_task(
             folder
           );
         }
+        Assert.strictEqual(known.server, server);
+        Assert.strictEqual(known.parent, root);
+        Assert.equal(known.URI, "mailbox://retry@root-cache.invalid/Known");
+        PanoramaDelivery._assertStore(known, lane);
+        Assert.notEqual(stableParent, root);
         Assert.deepEqual(root.subFolders.map(f => f.name).sort(), [
           "Inbox",
           "Known",
@@ -273,6 +278,9 @@ add_task(
         stable
       );
       Assert.deepEqual(events, [], phase + " emits no folder-added event");
+      Assert.strictEqual(stableParent, stable.server.rootFolder);
+      Assert.equal(stableParent.URI, "mailbox://nobody@Local%20Folders");
+      PanoramaDelivery._assertStore(stable, lane);
     }
     MockRegistrar.unregister(rootCID);
   }

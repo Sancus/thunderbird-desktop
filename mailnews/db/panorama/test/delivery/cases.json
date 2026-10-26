@@ -2592,5 +2592,143 @@
       "mailnews/moz.build",
       "mailnews/test/resources/MessageGenerator.sys.mjs"
     ]
+  },
+  {
+    "id": "local:panorama:mbox:PublicationCopy",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryLocalPublicationCopy.js",
+    "tasks": [
+      "test_copyPublishesDestinationStorage",
+      "test_movePublishesDestinationStorage",
+      "test_propertyReadFailurePrecedesBodyWrite",
+      "test_sqlFailureRetainsFinishedBody",
+      "test_opaqueNamesSurviveNativeStorageExclusions",
+      "test_copyDataPreservesNativeReadFailure",
+      "test_copyDefersFailedMailboxCompletion",
+      "test_moveDefersFailedMailboxCompletion",
+      "test_copyKeepsAbsentAccountAndCharsetAcrossServers"
+    ],
+    "setups": [
+      "setupLocalPublicationCopy"
+    ],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-contract",
+    "folder_roles": {
+      "source": "complete-copy-source",
+      "destination": "complete-copy-destination"
+    }
+  },
+  {
+    "id": "local:panorama:maildir:PublicationCopy",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryLocalPublicationCopy.js",
+    "tasks": [
+      "test_copyPublishesDestinationStorage",
+      "test_movePublishesDestinationStorage",
+      "test_propertyReadFailurePrecedesBodyWrite",
+      "test_sqlFailureRetainsFinishedBody",
+      "test_opaqueNamesSurviveNativeStorageExclusions",
+      "test_copyDataPreservesNativeReadFailure",
+      "test_copyDefersFailedMailboxCompletion",
+      "test_moveDefersFailedMailboxCompletion",
+      "test_copyKeepsAbsentAccountAndCharsetAcrossServers"
+    ],
+    "setups": [
+      "setupLocalPublicationCopy"
+    ],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-contract",
+    "folder_roles": {
+      "source": "complete-copy-source",
+      "destination": "complete-copy-destination"
+    }
+  },
+  {
+    "id": "compatibility:panorama:mbox:ServerRootFailure",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots.toml",
+    "file": "test_deliveryCompatibilityServerRootFailure.js",
+    "tasks": [
+      "test_rootGetterRetriesAfterNativeInitializationFailure"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-contract",
+    "requires_non_debug": true,
+    "folder_roles": {
+      "child": "Known",
+      "bystander": "root-bystander"
+    },
+    "folder_parent_uris": {
+      "child": "mailbox://retry@root-cache.invalid",
+      "bystander": "mailbox://nobody@Local%20Folders"
+    }
+  },
+  {
+    "id": "compatibility:panorama:mbox:ServerRootIdentity",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots.toml",
+    "file": "test_deliveryCompatibilityServerRootIdentity.js",
+    "tasks": [
+      "test_successfulRootKeepsIdentityDuringAndAfterInitialization"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-contract",
+    "requires_non_debug": false,
+    "folder_roles": {
+      "child": "Known"
+    }
+  },
+  {
+    "id": "compatibility:panorama:maildir:ServerRootFailure",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots-maildir.toml",
+    "file": "test_deliveryCompatibilityServerRootFailure.js",
+    "tasks": [
+      "test_rootGetterRetriesAfterNativeInitializationFailure"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-contract",
+    "requires_non_debug": true,
+    "folder_roles": {
+      "child": "Known",
+      "bystander": "root-bystander"
+    },
+    "folder_parent_uris": {
+      "child": "mailbox://retry@root-cache.invalid",
+      "bystander": "mailbox://nobody@Local%20Folders"
+    }
+  },
+  {
+    "id": "compatibility:panorama:maildir:ServerRootIdentity",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots-maildir.toml",
+    "file": "test_deliveryCompatibilityServerRootIdentity.js",
+    "tasks": [
+      "test_successfulRootKeepsIdentityDuringAndAfterInitialization"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-contract",
+    "requires_non_debug": false,
+    "folder_roles": {
+      "child": "Known"
+    }
   }
 ]

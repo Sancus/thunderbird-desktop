@@ -1,9 +1,9 @@
 # Manual native acceptance
 
-TestDeliveryCoreReferences.cpp (14 cases), TestDeliveryFolderInfoProperties.cpp
-(19), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties and
-6 DetachedThreadIdentity), TestDeliveryCoreMessageExistence.cpp (23) and
-TestDeliveryCoreProperties.cpp (11) are linked here. All 102 filters
+TestDeliveryCoreReferences.cpp (30 cases), TestDeliveryFolderInfoProperties.cpp
+(19), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties,
+6 DetachedThreadIdentity and 7 CompleteHeader), TestDeliveryCoreMessageExistence.cpp
+(24) and TestDeliveryCoreProperties.cpp (11) are linked here. All 126 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
@@ -203,7 +203,8 @@ need root verification before runtime admission. Matching SQLite planner, native
 close/profile lifecycle and restored old-code negative controls remain NOTRUN.
 
 The ten complete native publication controls and seven CompleteHeader adapter
-controls precede one snapshot031 control, bringing the manual catalog to 120.
+controls precede one snapshot031 control, bringing the manual catalog to 120 before the six captured-data controls.
+The current catalog contains 126 filters.
 Both existing source files are already in xul-gtest; all filters remain DISABLED and require exact isolated selection.
 Core publication binds the RawHdr declaration, named/default/extra/storage write
 path and helpers. CompleteHeader binds the detached/PerFolder/live adapters and
@@ -219,5 +220,22 @@ Snapshot031 adds only ConversationFilterRejectsThreadReadFailure, atomically wit
 its exact source and the nine-task Publication declaration. Its reached native
 getter writes a matching thread identity but returns failure; the filter must
 reject it while real matching/excluded controls and independent stored rows remain
-correct. This is not a SQL fault claim. All 120 cases remain manual/DISABLED and
+correct. This is not a SQL fault claim. All 126 cases remain manual/DISABLED and
 NOTRUN until matching compilation, isolated execution and close/profile evidence.
+
+## Captured-data prerequisites
+
+Six exact CoreReferences filters bind captured036 source and retain DISABLED and
+pending-product status. Source and registration must be composed atomically;
+the strict five-translation-unit filter inventory rejects either alone. Captures
+require all eleven historical facts, unchanged error sentinels, a reached SQL
+progress-handler interruption and recovery, owned prepared arrays, stable callback
+snapshots and staged-SQL reads without cache mutation. Default batch hooks are
+unwired data controls, with no producer/graph/queue or native consumer credit.
+
+Receipts additionally bind the exact progress-handler IDL, fallible allocation,
+mozalloc, nsTArray and nsTSubstring declarations. Source/API availability is not
+compiler qualification. Matching generated headers, toolchain/build configuration,
+xul-gtest linkage, fault sensitivity, actual loaded-image proof, full shutdown and
+profile/close qualification remain required. Linux-only execution and unavailable
+leak measurement are unchanged; no Windows or refcount qualification is added.

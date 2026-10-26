@@ -606,6 +606,36 @@
       "id": "core-native:MessageExistence:ConversationFilterRejectsThreadReadFailure",
       "filter": "DISABLED_DeliveryCoreMessageExistence.ConversationFilterRejectsThreadReadFailure",
       "expected": "Real matching and excluded stored-thread controls remain correct before and after a native GetThreadId fault that writes the matching identity but returns NS_ERROR_FAILURE; direct probe and exact call counts1/2 prove reach, filter rejects the failed output, and unshared SQL retains both rows."
+    },
+    {
+      "id": "core-native:CapturedThread:CaptureOwnsHistoricalRowFacts",
+      "filter": "DISABLED_DeliveryCoreReferences.CaptureOwnsHistoricalRowFacts",
+      "expected": "Independent literal expectations for all11 fields, microsecond PRTime/high-bit uint32 flags/actual physical parent; captured values survive later subject mutation and deletion. Missing-after-delete read fails without replacing history. Separate unshared SQL proves deleted row absent and parent control survives."
+    },
+    {
+      "id": "core-native:CapturedThread:CaptureMissingRowPreservesOutput",
+      "filter": "DISABLED_DeliveryCoreReferences.CaptureMissingRowPreservesOutput",
+      "expected": "Explicit missing-row error and all11 nondefault sentinel facts unchanged; isolated from storage-error scenario."
+    },
+    {
+      "id": "core-native:CapturedThread:CaptureReadErrorPreservesOutput",
+      "filter": "DISABLED_DeliveryCoreReferences.CaptureReadErrorPreservesOutput",
+      "expected": "Prewarmed capture statement and existing hot row; actual progress-handler witness must interrupt a SQL read exactly once with NS_ERROR_ABORT. All sentinel fields unchanged; removal succeeds, retry reads committed control and no transaction is introduced."
+    },
+    {
+      "id": "core-native:CapturedThread:PreparedBatchOwnsPendingPublication",
+      "filter": "DISABLED_DeliveryCoreReferences.PreparedBatchOwnsPendingPublication",
+      "expected": "Direct unwired data-record/default-hook control. Producer input arrays/strings are mutated/cleared after successful prepare; changed-old keys deliver ascending, unchanged component capture survives with no event. First callback mutates/deletes a later member and deletes pending new row; later snapshots/pending publication retain historical facts while borrowed live membership/fields reflect later state. One default publication, notifyLegacy=false preserved. No graph/queue/native live-consumer proof."
+    },
+    {
+      "id": "core-native:CapturedThread:BatchPreparationFailurePreservesOutput",
+      "filter": "DISABLED_DeliveryCoreReferences.BatchPreparationFailurePreservesOutput",
+      "expected": "A valid prepared publication remains intact after an invalid replacement request; preparation causes no callbacks and the retained record still delegates once to existing Message* bool publication hook."
+    },
+    {
+      "id": "core-native:CapturedThread:CaptureReadsStagedSqlWithoutCacheMutation",
+      "filter": "DISABLED_DeliveryCoreReferences.CaptureReadsStagedSqlWithoutCacheMutation",
+      "expected": "Fixture-owned transaction updates subject only; capture reads staged SQL, live cached header retains committed subject, transaction stays open. Explicit rollback restores capture and independent unshared SQL. No product derived-thread UPDATE or cache mutation introduced."
     }
   ],
   "suites": {

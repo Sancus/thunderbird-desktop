@@ -13,6 +13,7 @@
 #include "mozilla/Logging.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/Try.h"
+#include "mozilla/fallible.h"
 #include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
@@ -1445,6 +1446,166 @@ nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
 nsresult MessageDatabase::SetMessageUidOnServer(nsMsgKey key,
                                                 uint32_t uidOnServer) {
   return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+namespace {
+
+const CapturedMessage* FindThreadCapture(const nsTArray<CapturedMessage>& rows,
+                                         nsMsgKey key) {
+  for (const auto& row : rows) {
+    if (row.id == key) {
+      return &row;
+    }
+  }
+  return nullptr;
+}
+
+nsresult CopyThreadCaptures(const nsTArray<CapturedMessage>& source,
+                            nsTArray<CapturedMessage>& target) {
+  if (!target.SetLength(source.Length(), fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  for (size_t i = 0; i < source.Length(); ++i) {
+    const auto& from = source[i];
+    auto& to = target[i];
+    to.id = from.id;
+    to.folderId = from.folderId;
+    to.date = from.date;
+    to.flags = from.flags;
+    to.threadId = from.threadId;
+    to.threadParent = from.threadParent;
+    if (!to.messageId.Assign(from.messageId, fallible) ||
+        !to.sender.Assign(from.sender, fallible) ||
+        !to.recipients.Assign(from.recipients, fallible) ||
+        !to.subject.Assign(from.subject, fallible) ||
+        !to.tags.Assign(from.tags, fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  return NS_OK;
+}
+
+bool ValidThreadBatch(const MessageThreadBatch& batch) {
+  if (batch.publicationKey == 0 || batch.publicationKey == nsMsgKey_None ||
+      batch.after.Length() <= batch.before.Length() ||
+      batch.after.Length() - batch.before.Length() != 1 ||
+      FindThreadCapture(batch.before, batch.publicationKey) ||
+      !FindThreadCapture(batch.after, batch.publicationKey)) {
+    return false;
+  }
+  for (const auto& rows : {&batch.before, &batch.after}) {
+    for (const auto& row : *rows) {
+      if (row.id == 0 || row.id == nsMsgKey_None ||
+          FindThreadCapture(*rows, row.id) != &row) {
+        return false;
+      }
+    }
+  }
+  for (const auto& before : batch.before) {
+    const auto* after = FindThreadCapture(batch.after, before.id);
+    if (!after || before.folderId != after->folderId) {
+      return false;
+    }
+    bool changed = before.threadId != after->threadId ||
+                   before.threadParent != after->threadParent;
+    if (changed != batch.changedKeys.Contains(before.id)) {
+      return false;
+    }
+  }
+  nsMsgKey previous = 0;
+  for (nsMsgKey key : batch.changedKeys) {
+    if (key <= previous || !FindThreadCapture(batch.before, key)) {
+      return false;
+    }
+    previous = key;
+  }
+  return true;
+}
+
+}  // namespace
+
+nsresult MessageDatabase::CaptureMessage(nsMsgKey key,
+                                         CapturedMessage& output) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CaptureMessage"_ns,
+      "SELECT folderId, messageId, date, sender, recipients, subject, flags, "
+      "tags, threadId, threadParent FROM messages WHERE id = :id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+  CapturedMessage captured;
+  captured.id = key;
+  int64_t value;
+  MOZ_TRY(stmt->GetInt64(0, &value));
+  captured.folderId = static_cast<uint64_t>(value);
+  MOZ_TRY(stmt->GetUTF8String(1, captured.messageId));
+  MOZ_TRY(stmt->GetInt64(2, &value));
+  captured.date = static_cast<PRTime>(value);
+  MOZ_TRY(stmt->GetUTF8String(3, captured.sender));
+  MOZ_TRY(stmt->GetUTF8String(4, captured.recipients));
+  MOZ_TRY(stmt->GetUTF8String(5, captured.subject));
+  MOZ_TRY(stmt->GetInt64(6, &value));
+  captured.flags = static_cast<uint32_t>(value);
+  MOZ_TRY(stmt->GetUTF8String(7, captured.tags));
+  MOZ_TRY(stmt->GetInt64(8, &value));
+  captured.threadId = static_cast<nsMsgKey>(value);
+  MOZ_TRY(stmt->GetInt64(9, &value));
+  captured.threadParent = static_cast<nsMsgKey>(value);
+  output = std::move(captured);
+  return NS_OK;
+}
+
+PreparedThreadBatch::PreparedThreadBatch() = default;
+PreparedThreadBatch::~PreparedThreadBatch() = default;
+PreparedThreadBatch::PreparedThreadBatch(PreparedThreadBatch&&) = default;
+PreparedThreadBatch& PreparedThreadBatch::operator=(PreparedThreadBatch&&) =
+    default;
+
+nsresult MessageListener::PrepareThreadBatch(const MessageThreadBatch& batch,
+                                             PreparedThreadBatch& output) {
+  NS_ENSURE_TRUE(ValidThreadBatch(batch), NS_ERROR_INVALID_ARG);
+  PreparedThreadBatch prepared;
+  prepared.captured.batchId = batch.batchId;
+  prepared.captured.publicationKey = batch.publicationKey;
+  prepared.captured.notifyLegacy = batch.notifyLegacy;
+  MOZ_TRY(CopyThreadCaptures(batch.before, prepared.captured.before));
+  MOZ_TRY(CopyThreadCaptures(batch.after, prepared.captured.after));
+  if (!prepared.captured.changedKeys.Assign(batch.changedKeys, fallible) ||
+      !prepared.changedLive.SetLength(batch.changedKeys.Length(), fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  for (size_t i = 0; i < batch.changedKeys.Length(); ++i) {
+    prepared.changedLive[i] = new (fallible) Message(batch.changedKeys[i]);
+    if (!prepared.changedLive[i]) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  prepared.publicationLive = new (fallible) Message(batch.publicationKey);
+  if (!prepared.publicationLive) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  output = std::move(prepared);
+  return NS_OK;
+}
+
+void MessageListener::DeliverThreadBatch(const PreparedThreadBatch& prepared) {
+  const auto& batch = prepared.captured;
+  MOZ_ASSERT(prepared.changedLive.Length() == batch.changedKeys.Length());
+  for (size_t i = 0; i < batch.changedKeys.Length(); ++i) {
+    const auto* before = FindThreadCapture(batch.before, batch.changedKeys[i]);
+    const auto* after = FindThreadCapture(batch.after, batch.changedKeys[i]);
+    MOZ_ASSERT(before && after && prepared.changedLive[i]);
+    OnMessageThreadChanged(*before, *after, prepared.changedLive[i].get());
+  }
+  const auto* publication =
+      FindThreadCapture(batch.after, batch.publicationKey);
+  MOZ_ASSERT(publication && prepared.publicationLive);
+  OnMessagePublishedCaptured(*publication, prepared.publicationLive.get(),
+                             batch.notifyLegacy);
 }
 
 }  // namespace mozilla::mailnews

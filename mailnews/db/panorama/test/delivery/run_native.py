@@ -53,7 +53,9 @@ GECKO_INPUTS = ["testing/gtest/mozilla/GTestRunner.cpp", "xpcom/tests/TestHarnes
                 "storage/mozIStorageAsyncConnection.idl",
                 "xpcom/threads/nsIEventTarget.idl",
                 "storage/mozStorageBindingParams.cpp", "storage/mozStorageBindingParams.h",
-                "mfbt/Maybe.h", "mfbt/RefPtr.h"]
+                "mfbt/Maybe.h", "mfbt/RefPtr.h", "mfbt/fallible.h",
+                "storage/mozIStorageProgressHandler.idl", "memory/mozalloc/cxxalloc.h",
+                "xpcom/ds/nsTArray.h", "xpcom/string/nsTSubstring.h"]
 
 
 def handle_termination(signum, frame):

@@ -695,7 +695,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 43)
-        self.assertEqual(len({c["id"] for c in catalog}), 170)
+        self.assertEqual(len({c["id"] for c in catalog}), 176)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -987,8 +987,8 @@ support-files = ["fixture.sql"]
                  "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
                                               "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
         rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
-        self.assertEqual(len(catalog), 170)
-        self.assertEqual(len({c["id"] for c in catalog}), 170)
+        self.assertEqual(len(catalog), 176)
+        self.assertEqual(len({c["id"] for c in catalog}), 176)
         self.assertEqual(len(rows), 8)
         for store in ("mbox", "maildir"):
             lane = [c for c in rows if c["store"] == store]
@@ -1104,8 +1104,8 @@ support-files = ["fixture.sql"]
 
     def test_new_raw_catalog_and_view_lanes_are_exact_manual_cases(self):
         catalog = json.loads((runner.HERE / "cases.json").read_text())
-        self.assertEqual(len(catalog), 170)
-        self.assertEqual(len({c["id"] for c in catalog}), 170)
+        self.assertEqual(len(catalog), 176)
+        self.assertEqual(len({c["id"] for c in catalog}), 176)
         expected = {
             "core:Publication": ["test_publishCommittedMessageOnce",
                 "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
@@ -1379,6 +1379,216 @@ support-files = ["fixture.sql"]
                     self.assertFalse(result["ok"])
                     self.assertEqual(result["coverage"], "none")
         self.assertFalse(self.check(events[:-2], case)["ok"])
+
+    def test_local_publication_copy_binds_named_setup_modules_and_remains_held(self):
+        import shutil
+        comm = runner.HERE.parents[4]
+        rows = json.loads((runner.HERE / "cases.json").read_text())
+        rows = [c for c in rows if c["file"] == "test_panoramaDeliveryLocalPublicationCopy.js"]
+        self.assertEqual({c["store"] for c in rows}, {"mbox", "maildir"})
+        self.assertEqual(len(rows), 2)
+        expected = ["test_copyPublishesDestinationStorage", "test_movePublishesDestinationStorage",
+                    "test_propertyReadFailurePrecedesBodyWrite", "test_sqlFailureRetainsFinishedBody",
+                    "test_opaqueNamesSurviveNativeStorageExclusions", "test_copyDataPreservesNativeReadFailure",
+                    "test_copyDefersFailedMailboxCompletion", "test_moveDefersFailedMailboxCompletion",
+                    "test_copyKeepsAbsentAccountAndCharsetAcrossServers"]
+        config, _ = self.initializer_fixture()
+        target = Path(config["source"]) / "comm"
+        for index, case in enumerate(rows):
+            self.assertEqual(case["tasks"], expected)
+            self.assertEqual(case["setups"], ["setupLocalPublicationCopy"])
+            self.assertEqual(case["readiness"], "pending-contract")
+            self.assertNotIn("anonymous_setup", case)
+            self.assertEqual(case["folder_roles"], {"source": "complete-copy-source",
+                                                   "destination": "complete-copy-destination"})
+            manifest = comm / case["manifest"]
+            selected = manifest.with_name(case["file"])
+            text = selected.read_text()
+            self.assertEqual(runner.re.findall(r"add_task\s*\(\s*(?:async\s+)?function\s+(\w+)", text), expected)
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [manifest.parent / n for n in doc["DEFAULT"]["head"].split()]
+            paths += [(manifest.parent / n).resolve() for n in doc["DEFAULT"].get("support-files", []) + doc[case["file"]].get("support-files", [])]
+            for original in paths:
+                destination = target / original.relative_to(comm)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, destination)
+            modules = ("MessageGenerator.sys.mjs", "PromiseTestUtils.sys.mjs")
+            for name in modules:
+                original = comm / "mailnews/test/resources" / name
+                shutil.copyfile(original, target / original.relative_to(comm))
+                shutil.copyfile(original, Path(config["objdir"]) / "_tests/modules/mailnews" / name)
+            # Shape/dependency proof is not approval or runtime evidence.
+            ready = {**case, "readiness": "pending-product"}
+            _, bound = runner.prepare(config, ready)
+            for name in modules:
+                self.assertIn(target / "mailnews/test/resources" / name, bound)
+                self.assertIn(Path(config["objdir"]) / "_tests/modules/mailnews" / name, bound)
+            for changes in ({"setups": []}, {"setups": ["wrongSetup"]},
+                            {"tasks": expected[:-1]}):
+                with self.assertRaisesRegex(ValueError, "named tasks/setup differ from source"):
+                    runner.prepare(config, {**ready, **changes})
+            installed = Path(config["objdir"]) / "_tests/modules/mailnews/PromiseTestUtils.sys.mjs"
+            original_bytes = installed.read_bytes()
+            for fault, content in (("stale", b"stale module"), ("missing", None)):
+                if content is None:
+                    installed.unlink()
+                else:
+                    installed.write_bytes(content)
+                with patch.object(runner.subprocess, "run") as launch:
+                    output = self.root / ("local-promise-" + str(index) + "-" + fault)
+                    output.mkdir()
+                    result = runner.run_case(config, ready, output)
+                    launch.assert_not_called()
+                    self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                                     (None, "blocked", "none"))
+                    self.assertIn("blocked-dependency:", " ".join(result["errors"]))
+                installed.write_bytes(original_bytes)
+            with patch.object(runner.subprocess, "run") as launch:
+                output = self.root / ("held-local-" + str(index))
+                output.mkdir()
+                result = runner.run_case(config, case, output)
+                launch.assert_not_called()
+                self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                                 (None, "blocked", "none"))
+
+
+    def test_declared_folder_parents_match_each_role_without_relaxing_defaults(self):
+        parents = {"child": "mailbox://retry@root-cache.invalid",
+                   "bystander": "mailbox://nobody@Local%20Folders"}
+        case = {**self.case, "folder_roles": {"child": "Known", "bystander": "root-bystander"},
+                "folder_parent_uris": parents}
+        events = self.folder_events(["Known", "root-bystander"])
+        for event in events:
+            message = event.get("message", "")
+            for name, parent in (("Known", parents["child"]), ("root-bystander", parents["bystander"])):
+                message = message.replace("mailbox://test/" + name, parent + "/" + name)
+            if "message" in event:
+                event["message"] = message
+        self.assertTrue(self.check(events, case)["ok"])
+        default = {k: v for k, v in case.items() if k != "folder_parent_uris"}
+        self.assertIn("declared fixture folders do not share a parent", self.check(events, default)["errors"])
+        swapped = {"child": parents["bystander"], "bystander": parents["child"]}
+        self.assertFalse(self.check(events, {**case, "folder_parent_uris": swapped})["ok"])
+        for parent in (parents["bystander"], "mailbox://wrong", "Known"):
+            changed = copy.deepcopy(events)
+            for event in changed:
+                if "message" in event:
+                    event["message"] = event["message"].replace(parents["child"] + "/Known",
+                                                               parent if parent == "Known" else parent + "/Known")
+            self.assertFalse(self.check(changed, case)["ok"])
+        missing = [e for e in events if "/Known" not in e.get("message", "")]
+        self.assertIn("missing or ambiguous folder evidence: child", self.check(missing, case)["errors"])
+        extra = [self.diag("STORE_CONTRACT", {**self.contract, "folderURI": "mailbox://other/Known"}),
+                 self.diag("FOLDER", {**self.folder, "folderURI": "mailbox://other/Known"})]
+        self.assertIn("missing or ambiguous folder evidence: child",
+                      self.check(events[:-3] + extra + events[-3:], case)["errors"])
+        wrong = copy.deepcopy(events)
+        for event in wrong:
+            if "DELIVERY_FOLDER" in event.get("message", ""):
+                event["message"] = event["message"].replace('"actualStore": "mbox"', '"actualStore": "maildir"')
+        self.assertFalse(self.check(wrong, case)["ok"])
+
+    def test_folder_parent_declarations_require_exact_keys_and_literal_uris(self):
+        roles = {"child": "Known", "bystander": "root-bystander"}
+        good = {"child": "mailbox://retry@root-cache.invalid",
+                "bystander": "mailbox://nobody@Local%20Folders"}
+        invalid = (None, [], {}, {"child": good["child"]}, {**good, "extra": good["child"]},
+                   {**good, "bystander": ""}, {**good, "bystander": 7},
+                   *({**good, "child": uri} for uri in ("https://wrong", "mailbox://", "mailbox://x/path",
+                     "mailbox://x?query", "mailbox://x#fragment", "mailbox://x\\bad", "mailbox://x\n")))
+        for index, parents in enumerate(invalid):
+            with self.subTest(parents=parents):
+                case = {**self.case, "folder_roles": roles, "folder_parent_uris": parents}
+                self.assertFalse(self.check(self.events, case)["ok"])
+                with self.assertRaisesRegex(ValueError, "folder parent URI"):
+                    runner.prepare({"source": str(self.root)}, case)
+        raw = {**self.case, "store": "none", "fixture": "raw-db", "diagnostics": "backend",
+               "folder_parent_uris": good}
+        self.assertFalse(self.check(self.events[:3] + self.events[5:], raw)["ok"])
+
+
+    def test_server_root_requests_bind_actual_sources_and_remain_held(self):
+        import shutil
+        comm = runner.HERE.parents[4]
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityServerRoot")]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({(c["file"], c["store"]) for c in rows}, {
+            ("test_deliveryCompatibilityServerRoot" + kind + ".js", store)
+            for kind in ("Failure", "Identity") for store in ("mbox", "maildir")})
+        dependencies = {"mailnews/base/src/MsgIncomingServer.sys.mjs",
+                        "mailnews/local/src/Pop3IncomingServer.sys.mjs",
+                        "mailnews/local/public/nsIPop3IncomingServer.idl"}
+        config, _ = self.initializer_fixture()
+        target = Path(config["source"]) / "comm"
+        for index, case in enumerate(rows):
+            failure = case["file"].endswith("Failure.js")
+            self.assertEqual(case["tasks"], ["test_rootGetterRetriesAfterNativeInitializationFailure"
+                             if failure else "test_successfulRootKeepsIdentityDuringAndAfterInitialization"])
+            self.assertEqual(case["setups"], [])
+            self.assertEqual(case["requires_non_debug"], failure)
+            self.assertEqual(case["readiness"], "pending-contract")
+            self.assertEqual(case["folder_roles"], {"child": "Known", **(
+                {"bystander": "root-bystander"} if failure else {})})
+            if failure:
+                self.assertEqual(case["folder_parent_uris"], {
+                    "child": "mailbox://retry@root-cache.invalid",
+                    "bystander": "mailbox://nobody@Local%20Folders"})
+            else:
+                self.assertNotIn("folder_parent_uris", case)
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [manifest.parent / n for n in doc["DEFAULT"]["head"].split()]
+            paths += [(manifest.parent / n).resolve() for n in doc["DEFAULT"]["support-files"]]
+            self.assertTrue({comm / n for n in dependencies} <= set(paths))
+            for original in paths:
+                destination = target / original.relative_to(comm)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, destination)
+            for name in ("MessageGenerator.sys.mjs", "PromiseTestUtils.sys.mjs"):
+                module = "mailnews/test/resources/" + name
+                shutil.copyfile(comm / module, target / module)
+                shutil.copyfile(comm / module, Path(config["objdir"]) / "_tests/modules/mailnews" / name)
+            # This only checks future declaration/dependency shape, not runtime readiness.
+            _, bound = runner.prepare(config, {**case, "readiness": "pending-product"})
+            self.assertTrue({target / n for n in dependencies} <= set(bound))
+            self.assertIn(Path(config["source"]) / "testing/modules/MockRegistrar.sys.mjs", bound)
+            self.assertIn(Path(config["objdir"]) / "_tests/modules/MockRegistrar.sys.mjs", bound)
+            with patch.object(runner.subprocess, "run") as launch:
+                output = self.root / ("held-root-" + str(index))
+                output.mkdir()
+                result = runner.run_case(config, case, output)
+                launch.assert_not_called()
+                self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                                 (None, "blocked", "none"))
+                self.assertIn("contract approval is pending", " ".join(result["errors"]))
+                self.assertEqual(json.loads((output / "request.json").read_text())["case"], case)
+
+    def test_folder_tasks_bind_matching_installed_promise_module_before_launch(self):
+        config, case = self.initializer_fixture()
+        original = Path(config["source"]) / "comm/mailnews/test/resources/PromiseTestUtils.sys.mjs"
+        installed = Path(config["objdir"]) / "_tests/modules/mailnews/PromiseTestUtils.sys.mjs"
+        _, bound = runner.prepare(config, case)
+        self.assertIn(original, bound)
+        self.assertIn(installed, bound)
+        saved = installed.read_bytes()
+        for index, content in enumerate((b"stale installed module", None)):
+            if content is None:
+                installed.unlink()
+            else:
+                installed.write_bytes(content)
+            with patch.object(runner.subprocess, "run") as launch:
+                output = self.root / ("bad-promise-" + str(index))
+                output.mkdir()
+                result = runner.run_case(config, case, output)
+                launch.assert_not_called()
+                self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                                 (None, "blocked", "none"))
+                self.assertIn("blocked-dependency:", " ".join(result["errors"]))
+            installed.write_bytes(saved)
+
 
 if __name__ == "__main__":
     unittest.main()

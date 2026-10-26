@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 120)
+        self.assertEqual(len(catalog["cases"]), 126)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -169,7 +169,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 120)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 126)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -376,6 +376,34 @@ class NativeAccountingTests(unittest.TestCase):
                 wrong[3].update(status="PASS", test="OtherSuite.WrongCase")
                 self.reject(wrong)
                 self.assertFalse(native.check_log(self.log, suite + ".*", 0)["log_complete"])
+
+    def test_captured_thread_filters_are_exact_manual_isolated_cases(self):
+        suite = "DISABLED_DeliveryCoreReferences"
+        names = {"CaptureOwnsHistoricalRowFacts", "CaptureMissingRowPreservesOutput",
+                 "CaptureReadErrorPreservesOutput", "PreparedBatchOwnsPendingPublication",
+                 "BatchPreparationFailurePreservesOutput", "CaptureReadsStagedSqlWithoutCacheMutation"}
+        rows = [c for c in native.CATALOG["cases"] if c["id"].startswith("core-native:CapturedThread:")]
+        self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in names})
+        self.assertEqual(len(rows), 6)
+        for row in rows:
+            self.assertEqual(row["id"], "core-native:CapturedThread:" + row["filter"].partition(".")[2])
+            self.selected = row["filter"]
+            for index in (1, 4):
+                self.events[index]["name"] = suite
+            for index in (2, 3):
+                self.events[index]["test"] = self.selected
+            self.assertTrue(self.check(self.events)["log_complete"])
+            self.reject(self.events, returncode=1)
+            self.reject(self.events, timed_out=True)
+            wrong = copy.deepcopy(self.events)
+            wrong[3]["status"] = "SKIP"
+            self.reject(wrong)
+            wrong = copy.deepcopy(self.events)
+            wrong[3]["test"] = suite + ".differentCase"
+            self.reject(wrong)
+        for selected in (suite + ".*", self.selected + ":" + rows[0]["filter"]):
+            self.assertFalse(native.check_log(self.log, selected, 0)["log_complete"])
+
 
 if __name__ == "__main__":
     unittest.main()

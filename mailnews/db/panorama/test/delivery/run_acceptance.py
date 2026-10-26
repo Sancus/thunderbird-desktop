@@ -20,6 +20,19 @@ HERE = Path(__file__).resolve().parent
 CONTRACTS = {"mbox": "berkeleystore", "maildir": "maildirstore"}
 
 
+def _expected_folder_parents(case):
+    if "folder_parent_uris" not in case:
+        return None
+    parents = case["folder_parent_uris"]
+    roles = case.get("folder_roles", {})
+    if (case.get("diagnostics") != "folder" or not isinstance(roles, dict) or not roles
+        or not isinstance(parents, dict) or set(parents) != set(roles)
+        or any(not isinstance(uri, str) or not re.fullmatch(r"mailbox://[^\s/?#\\]+", uri)
+               for uri in parents.values())):
+        raise ValueError("folder parent URIs require exactly every role and literal mailbox roots")
+    return parents
+
+
 def check_log(log, case, returncode=0, raw_logs=()):
     """Check one raw mozlog file against a tuple declared before execution."""
     errors = [] if returncode == 0 else [f"process exit: {returncode}"]
@@ -34,6 +47,7 @@ def check_log(log, case, returncode=0, raw_logs=()):
     is_format = case["diagnostics"] == "format-reader"
     first_failure, folder_evidence = None, {}
     try:
+        expected_parents = _expected_folder_parents(case)
         raw = Path(log).read_text(encoding="utf-8")
         if not raw.endswith("\n"):
             errors.append("incomplete JSONL (missing final newline)")
@@ -195,7 +209,11 @@ def check_log(log, case, returncode=0, raw_logs=()):
                     errors.append("missing or ambiguous folder evidence: " + role)
                 else:
                     folder_evidence[role] = matching.pop()
-            if len({uri.rsplit("/", 1)[0] for uri in folder_evidence.values()}) > 1:
+            if expected_parents is not None:
+                for role, parent in expected_parents.items():
+                    if role in folder_evidence and folder_evidence[role].rsplit("/", 1)[0] != parent:
+                        errors.append("mismatched parent URI for folder role: " + role)
+            elif len({uri.rsplit("/", 1)[0] for uri in folder_evidence.values()}) > 1:
                 errors.append("declared fixture folders do not share a parent")
         elif is_format:
             if not assertions:
@@ -240,6 +258,7 @@ def prepare(config, case):
         or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:[.-][A-Za-z][A-Za-z0-9]*)*", name)
                for name in roles.values()) or len(set(roles.values())) != len(roles)):
         raise ValueError("folder roles require distinct literal fixture names and folder scope")
+    _expected_folder_parents(case)
     if case["readiness"] not in ("ready", "pending-product", "pending-contract"):
         raise ValueError("invalid readiness")
     if case["readiness"] == "pending-contract":
@@ -300,7 +319,8 @@ def prepare(config, case):
             paths += [source / "testing/xpcshell/head.js"]
         else:
             modules = {"MockRegistrar.sys.mjs": source / "testing/modules/MockRegistrar.sys.mjs",
-                       "mailnews/MessageGenerator.sys.mjs": comm / "mailnews/test/resources/MessageGenerator.sys.mjs"}
+                       "mailnews/MessageGenerator.sys.mjs": comm / "mailnews/test/resources/MessageGenerator.sys.mjs",
+                       "mailnews/PromiseTestUtils.sys.mjs": comm / "mailnews/test/resources/PromiseTestUtils.sys.mjs"}
             module_pairs = [(original, Path(config["objdir"]) / "_tests/modules" / name)
                             for name, original in modules.items()]
             paths += [p for pair in module_pairs for p in pair]

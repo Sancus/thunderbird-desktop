@@ -15,6 +15,7 @@
 #include "mozilla/SpinEventLoopUntil.h"
 #include "mozIStorageConnection.h"
 #include "mozIStorageFunction.h"
+#include "mozIStorageProgressHandler.h"
 #include "mozIStorageService.h"
 #include "mozIStorageStatement.h"
 #include "mozIStorageValueArray.h"
@@ -1198,6 +1199,354 @@ TEST_F(DISABLED_DeliveryCoreReferences,
         (nsTArray<nsCString>{"unresolved@invalid"_ns, "unresolved@invalid"_ns}),
         stored);
   }
+}
+
+CapturedMessage CaptureSentinel() {
+  CapturedMessage value;
+  value.id = 0xfffffff0;
+  value.folderId = 0x123456789ULL;
+  value.messageId = "sentinel-id"_ns;
+  value.date = -2001;
+  value.sender = "sentinel-sender"_ns;
+  value.recipients = "sentinel-recipients"_ns;
+  value.subject = "sentinel-subject"_ns;
+  value.flags = 0xfedcba98;
+  value.tags = "sentinel-tags"_ns;
+  value.threadId = 0xf0000001;
+  value.threadParent = 0xe0000001;
+  return value;
+}
+
+void ExpectCapture(const CapturedMessage& expected,
+                   const CapturedMessage& actual) {
+  EXPECT_EQ(expected.id, actual.id);
+  EXPECT_EQ(expected.folderId, actual.folderId);
+  EXPECT_EQ(expected.messageId, actual.messageId);
+  EXPECT_EQ(expected.date, actual.date);
+  EXPECT_EQ(expected.sender, actual.sender);
+  EXPECT_EQ(expected.recipients, actual.recipients);
+  EXPECT_EQ(expected.subject, actual.subject);
+  EXPECT_EQ(expected.flags, actual.flags);
+  EXPECT_EQ(expected.tags, actual.tags);
+  EXPECT_EQ(expected.threadId, actual.threadId);
+  EXPECT_EQ(expected.threadParent, actual.threadParent);
+}
+
+class CaptureReadAbort final : public mozIStorageProgressHandler {
+ public:
+  NS_DECL_ISUPPORTS
+  uint32_t mCalls = 0;
+  uint32_t mAborts = 0;
+  NS_IMETHOD OnProgress(mozIStorageConnection*, bool* interrupt) override {
+    ++mCalls;
+    *interrupt = mAborts == 0;
+    if (*interrupt) {
+      ++mAborts;
+    }
+    return NS_OK;
+  }
+
+ private:
+  ~CaptureReadAbort() = default;
+};
+NS_IMPL_ISUPPORTS(CaptureReadAbort, mozIStorageProgressHandler)
+
+class CapturedBatchObserver final : public MessageListener {
+ public:
+  NS_DECL_ISUPPORTS
+  std::function<void(const CapturedMessage&, const CapturedMessage&, Message*)>
+      mChanged;
+  std::function<void(const CapturedMessage&, Message*)> mCaptured;
+  uint32_t mAdded = 0;
+  bool mNotifyLegacy = true;
+  void OnMessageThreadChanged(const CapturedMessage& before,
+                              const CapturedMessage& after,
+                              Message* live) override {
+    mChanged(before, after, live);
+  }
+  void OnMessagePublishedCaptured(const CapturedMessage& after, Message* live,
+                                  bool notifyLegacy) override {
+    mCaptured(after, live);
+    MessageListener::OnMessagePublishedCaptured(after, live, notifyLegacy);
+  }
+  void OnMessagePublished(Message* live, bool notifyLegacy) override {
+    mNotifyLegacy = notifyLegacy;
+    MessageListener::OnMessagePublished(live, notifyLegacy);
+  }
+  void OnMessageAdded(Message*) override { ++mAdded; }
+  void OnMessageRemoved(Message*, uint32_t) override {}
+  void OnMessageFlagsChanged(nsIMsgDBHdr*, Message*, uint32_t,
+                             uint32_t) override {}
+  void OnMessageTagsChanged(nsIMsgDBHdr*, Message*, const nsACString&,
+                            const nsACString&) override {}
+
+ private:
+  ~CapturedBatchObserver() = default;
+};
+NS_IMPL_ISUPPORTS(CapturedBatchObserver, nsISupports)
+
+TEST_F(DISABLED_DeliveryCoreReferences, CaptureOwnsHistoricalRowFacts) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey parent;
+  ASSERT_EQ(NS_OK, Add("capture-parent@invalid"_ns, {}, parent));
+  nsMsgKey parentThread;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageThreadId(parent, parentThread));
+  RawHdr raw;
+  raw.messageId = "captured@invalid"_ns;
+  raw.references = {"capture-parent@invalid"_ns};
+  raw.date = 1700000000123456LL;
+  raw.sender = "sender-original"_ns;
+  raw.recipients = "recipients-original"_ns;
+  raw.subject = "subject-original"_ns;
+  raw.flags = 0x80000004;
+  raw.keywords = "tag-one tag-two"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, true, &key));
+  CapturedMessage expected;
+  expected.id = key;
+  expected.folderId = mFolderId;
+  expected.messageId = "captured@invalid"_ns;
+  expected.date = 1700000000123456LL;
+  expected.sender = "sender-original"_ns;
+  expected.recipients = "recipients-original"_ns;
+  expected.subject = "subject-original"_ns;
+  expected.flags = 0x80000004;
+  expected.tags = "tag-one tag-two"_ns;
+  expected.threadId = parentThread;
+  expected.threadParent = parent;
+  CapturedMessage captured;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(key, captured));
+  ExpectCapture(expected, captured);
+  RefPtr<Message> live = new Message(key);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageSubject(key, "later subject"_ns));
+  nsCString text;
+  ASSERT_EQ(NS_OK, live->GetSubject(text));
+  EXPECT_EQ("later subject"_ns, text);
+  ExpectCapture(expected, captured);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(key));
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  EXPECT_EQ(NS_ERROR_UNEXPECTED,
+            mCore->MessageDB().CaptureMessage(key, captured));
+  ExpectCapture(expected, captured);
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(reader, key,
+                      "SELECT count(*) FROM messages WHERE id = :id"_ns, text));
+  EXPECT_EQ("0"_ns, text);
+  ASSERT_EQ(NS_OK,
+            PublicationCell(reader, parent,
+                            "SELECT messageId FROM messages WHERE id = :id"_ns,
+                            text));
+  EXPECT_EQ("capture-parent@invalid"_ns, text);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, CaptureMissingRowPreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  CapturedMessage output = CaptureSentinel();
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, mCore->MessageDB().CaptureMessage(0, output));
+  ExpectCapture(CaptureSentinel(), output);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, CaptureReadErrorPreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("capture-control@invalid"_ns, {}, control));
+  CapturedMessage warm;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(control, warm));
+  RefPtr<CaptureReadAbort> fault = new CaptureReadAbort();
+  nsCOMPtr<mozIStorageProgressHandler> previous;
+  ASSERT_EQ(NS_OK, mConnection->SetProgressHandler(1, fault,
+                                                   getter_AddRefs(previous)));
+  auto cleanup = MakeScopeExit([&] {
+    nsCOMPtr<mozIStorageProgressHandler> removed;
+    EXPECT_EQ(NS_OK,
+              mConnection->RemoveProgressHandler(getter_AddRefs(removed)));
+  });
+  EXPECT_FALSE(previous);
+  CapturedMessage output = CaptureSentinel();
+  EXPECT_EQ(NS_ERROR_ABORT, mCore->MessageDB().CaptureMessage(control, output));
+  EXPECT_GT(fault->mCalls, 0u);
+  EXPECT_EQ(1u, fault->mAborts);
+  ExpectCapture(CaptureSentinel(), output);
+  nsCOMPtr<mozIStorageProgressHandler> removed;
+  ASSERT_EQ(NS_OK, mConnection->RemoveProgressHandler(getter_AddRefs(removed)));
+  cleanup.release();
+  EXPECT_EQ(fault.get(), removed.get());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(control, output));
+  EXPECT_EQ(control, output.id);
+  EXPECT_EQ(mFolderId, output.folderId);
+  EXPECT_EQ("capture-control@invalid"_ns, output.messageId);
+  EXPECT_EQ("subject"_ns, output.subject);
+  bool inTransaction = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&inTransaction));
+  EXPECT_FALSE(inTransaction);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, PreparedBatchOwnsPendingPublication) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey first, second, publication, control;
+  ASSERT_EQ(NS_OK, Add("batch-first@invalid"_ns, {}, first));
+  ASSERT_EQ(NS_OK, Add("batch-second@invalid"_ns, {}, second));
+  ASSERT_EQ(NS_OK, Add("batch-publication@invalid"_ns, {}, publication));
+  ASSERT_EQ(NS_OK, Add("batch-control@invalid"_ns, {}, control));
+  CapturedMessage oldFirst, oldSecond, added, unchanged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(first, oldFirst));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(second, oldSecond));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(publication, added));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(control, unchanged));
+  // Compose a delta without changing stored threads or enabling dispatch.
+  MessageThreadBatch batch;
+  batch.batchId = 42;
+  batch.before = {oldFirst, oldSecond, unchanged};
+  batch.after = {oldFirst, oldSecond, unchanged, added};
+  for (size_t i = 0; i < 2; ++i) {
+    batch.after[i].threadId = added.threadId;
+    batch.after[i].threadParent = publication;
+  }
+  batch.changedKeys = {first, second};
+  if (first > second) {
+    std::swap(batch.changedKeys[0], batch.changedKeys[1]);
+  }
+  nsTArray<nsMsgKey> expectedOrder = batch.changedKeys.Clone();
+  nsMsgKey later = expectedOrder[1];
+  batch.publicationKey = publication;
+  batch.notifyLegacy = false;
+  RefPtr<CapturedBatchObserver> observer = new CapturedBatchObserver();
+  nsTArray<nsMsgKey> delivered;
+  observer->mChanged = [&](const CapturedMessage& before,
+                           const CapturedMessage& after, Message* live) {
+    size_t index = delivered.Length();
+    ASSERT_LT(index, 2u);
+    EXPECT_EQ(expectedOrder[index], before.id);
+    ExpectCapture(before.id == first ? oldFirst : oldSecond, before);
+    EXPECT_EQ(before.id, after.id);
+    EXPECT_EQ(added.threadId, after.threadId);
+    EXPECT_EQ(publication, after.threadParent);
+    EXPECT_EQ(before.id, live->Key());
+    delivered.AppendElement(before.id);
+    if (index == 0) {
+      ASSERT_EQ(NS_OK,
+                mCore->MessageDB().SetMessageSubject(later, "later edit"_ns));
+      ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(later));
+      ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(publication));
+    } else {
+      nsCString text;
+      ASSERT_EQ(NS_OK, live->GetSubject(text));
+      EXPECT_EQ("later edit"_ns, text);
+      bool exists = true;
+      ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(later, exists));
+      EXPECT_FALSE(exists);
+    }
+  };
+  observer->mCaptured = [&](const CapturedMessage& after, Message* live) {
+    ExpectCapture(added, after);
+    EXPECT_EQ(publication, live->Key());
+    EXPECT_EQ(expectedOrder, delivered);
+    bool exists = true;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(publication, exists));
+    EXPECT_FALSE(exists);
+    delivered.AppendElement(publication);
+  };
+  PreparedThreadBatch prepared;
+  ASSERT_EQ(NS_OK, observer->PrepareThreadBatch(batch, prepared));
+  EXPECT_TRUE(delivered.IsEmpty());
+  EXPECT_EQ(0u, observer->mAdded);
+  ASSERT_EQ(4u, prepared.captured.after.Length());
+  ExpectCapture(unchanged, prepared.captured.after[2]);
+  batch.before[0].subject = "discarded before input"_ns;
+  batch.after[3].subject = "discarded publication input"_ns;
+  batch.before.Clear();
+  batch.after.Clear();
+  batch.changedKeys.Clear();
+  observer->DeliverThreadBatch(prepared);
+  expectedOrder.AppendElement(publication);
+  EXPECT_EQ(expectedOrder, delivered);
+  EXPECT_EQ(1u, observer->mAdded);
+  EXPECT_FALSE(observer->mNotifyLegacy);
+  EXPECT_EQ(42u, prepared.captured.batchId);
+  CapturedMessage kept;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(control, kept));
+  ExpectCapture(unchanged, kept);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       BatchPreparationFailurePreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey publication;
+  ASSERT_EQ(NS_OK, Add("prepare-publication@invalid"_ns, {}, publication));
+  CapturedMessage added;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(publication, added));
+  MessageThreadBatch batch;
+  batch.after = {added};
+  batch.publicationKey = publication;
+  batch.notifyLegacy = false;
+  uint32_t calls = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message* live, bool notifyLegacy) {
+        ++calls;
+        EXPECT_EQ(publication, live->Key());
+        EXPECT_FALSE(notifyLegacy);
+      });
+  PreparedThreadBatch output;
+  ASSERT_EQ(NS_OK, observer->PrepareThreadBatch(batch, output));
+  Message* sentinel = output.publicationLive.get();
+  EXPECT_EQ(0u, calls);
+  batch.after.Clear();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, observer->PrepareThreadBatch(batch, output));
+  EXPECT_EQ(sentinel, output.publicationLive.get());
+  ASSERT_EQ(1u, output.captured.after.Length());
+  ExpectCapture(added, output.captured.after[0]);
+  EXPECT_EQ(0u, calls);
+  observer->DeliverThreadBatch(output);
+  EXPECT_EQ(1u, calls);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       CaptureReadsStagedSqlWithoutCacheMutation) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("capture-staged@invalid"_ns, {}, key));
+  RefPtr<Message> live = new Message(key);
+  nsCString text;
+  ASSERT_EQ(NS_OK, live->GetSubject(text));
+  EXPECT_EQ("subject"_ns, text);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, mConnection->RollbackTransaction()); });
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->CreateStatement(
+          "UPDATE messages SET subject = 'staged subject' WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, key));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  CapturedMessage captured;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(key, captured));
+  EXPECT_EQ("staged subject"_ns, captured.subject);
+  ASSERT_EQ(NS_OK, live->GetSubject(text));
+  EXPECT_EQ("subject"_ns, text);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  rollback.release();
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(key, captured));
+  EXPECT_EQ("subject"_ns, captured.subject);
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+  ASSERT_EQ(NS_OK, PublicationCell(
+                       reader, key,
+                       "SELECT subject FROM messages WHERE id = :id"_ns, text));
+  EXPECT_EQ("subject"_ns, text);
 }
 
 }  // namespace

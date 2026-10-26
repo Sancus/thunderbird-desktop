@@ -1,0 +1,67 @@
+# Pending-contract root-cache requests; no execution until fixture evidence is reviewed.
+# Manual acceptance; deliberately not registered in moz.build.
+[DEFAULT]
+head = "head.js head_delivery.js"
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:maildir",
+]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/maildirstore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/maildirstore;1",
+]
+tags = ["panorama-delivery"]
+support-files = [
+  "../../../../base/src/nsMsgDBFolder.cpp",
+  "../../../../base/src/nsMsgDBFolder.h",
+  "../../../../base/src/FolderLookupService.cpp",
+  "../../../../base/src/FolderLookupService.h",
+  "../../../../base/public/nsIMsgFolder.idl",
+  "../../../../base/public/nsIFolderLookupService.idl",
+  "../../../../base/public/nsIMsgPluggableStore.idl",
+  "../../../../base/src/nsMsgAccountManager.cpp",
+  "../../../../base/src/nsMsgAccountManager.h",
+  "../../../../base/src/nsMsgIncomingServer.cpp",
+  "../../../../base/src/nsMsgIncomingServer.h",
+  "../../../../base/src/MsgIncomingServer.sys.mjs",
+  "../../../../base/src/MailServices.sys.mjs",
+  "../../../../base/src/nsMsgUtils.cpp",
+  "../../../../base/src/nsMsgUtils.h",
+  "../../../../base/src/components.conf",
+  "../../../../base/src/moz.build",
+  "../../../../local/src/nsLocalMailFolder.cpp",
+  "../../../../local/src/nsLocalMailFolder.h",
+  "../../../../local/src/nsNoIncomingServer.cpp",
+  "../../../../local/src/nsNoIncomingServer.h",
+  "../../../../local/src/nsMsgBrkMBoxStore.cpp",
+  "../../../../local/src/nsMsgBrkMBoxStore.h",
+  "../../../../local/src/nsMsgMaildirStore.cpp",
+  "../../../../local/src/nsMsgMaildirStore.h",
+  "../../../../local/src/nsMsgLocalStoreUtils.cpp",
+  "../../../../local/src/nsMsgLocalStoreUtils.h",
+  "../../../../local/src/components.conf",
+  "../../../../local/src/moz.build",
+  "../../src/FolderDatabase.cpp",
+  "../../src/FolderDatabase.h",
+  "../../src/DatabaseCore.cpp",
+  "../../src/DatabaseCore.h",
+  "../../public/nsIFolderDatabase.idl",
+  "../../../../local/src/Pop3IncomingServer.sys.mjs",
+  "../../../../local/public/nsIPop3IncomingServer.idl",
+  "../../../../local/public/nsILocalMailIncomingServer.idl",
+  "../../../../local/public/moz.build",
+  "../../../../base/public/nsIMsgIncomingServer.idl",
+  "../../../../base/public/nsIMsgAccountManager.idl",
+  "../../../../base/public/nsIMsgFolderNotificationService.idl",
+  "../../../../base/public/moz.build",
+  "../../src/DatabaseUtils.cpp",
+  "../../src/DatabaseUtils.h",
+  "../../src/moz.build",
+  "../../public/nsIDatabaseCore.idl",
+  "../../public/moz.build",
+]
+
+["test_deliveryCompatibilityServerRootFailure.js"]
+
+["test_deliveryCompatibilityServerRootIdentity.js"]

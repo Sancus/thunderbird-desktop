@@ -670,5 +670,25 @@ class NativeRunnerTests(unittest.TestCase):
             self.bind_receipt(config, receipt)
             self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
 
+    def test_captured_receipt_requires_progress_fallible_array_and_string_sources(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        paths = ("storage/mozIStorageProgressHandler.idl", "mfbt/fallible.h",
+                 "memory/mozalloc/cxxalloc.h", "xpcom/ds/nsTArray.h", "xpcom/string/nsTSubstring.h")
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)), patch.object(runner, "verify") as verify):
+            for relative in paths:
+                path = str(Path(config["source"]) / relative)
+                with self.subTest(path=relative):
+                    self.assertIn(path, receipt["inputs"])
+                    identity = receipt["inputs"].pop(path)
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic()+5)
+                    receipt["inputs"][path] = identity
+            verify.assert_not_called()
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
+
+
 if __name__ == "__main__":
     unittest.main()

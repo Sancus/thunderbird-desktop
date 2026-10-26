@@ -104,6 +104,9 @@ add_task(
       Assert.strictEqual(child.parent, root);
       Assert.equal(child.URI, root.URI + "/" + name);
       Assert.strictEqual(folderDB.getMsgFolderForFolder(id), child);
+      if (name == "Known") {
+        PanoramaDelivery._assertStore(child, lane);
+      }
     }
     Assert.strictEqual(server.rootFolder, root);
     Assert.strictEqual(server.rootMsgFolder, root);

@@ -11,6 +11,9 @@
 #include "mozilla/Result.h"
 #include "nsIMessageDatabase.h"
 #include "nsTObserverArray.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "prtime.h"
 
 struct RawHdr;
 
@@ -18,6 +21,46 @@ namespace mozilla::mailnews {
 
 class Folder;
 class Message;
+
+// Owned native fields corresponding to one CreateJSMessage row.
+struct CapturedMessage {
+  nsMsgKey id{nsMsgKey_None};
+  uint64_t folderId{0};
+  nsCString messageId;
+  PRTime date{0};
+  nsCString sender;
+  nsCString recipients;
+  nsCString subject;
+  uint32_t flags{0};
+  nsCString tags;
+  nsMsgKey threadId{0};
+  nsMsgKey threadParent{0};
+};
+
+// Includes unchanged component members; only publicationKey is after-only.
+// changedKeys contains exactly the changed old keys, in ascending order.
+struct MessageThreadBatch {
+  uint64_t batchId{0};
+  nsTArray<CapturedMessage> before;
+  nsTArray<CapturedMessage> after;
+  nsTArray<nsMsgKey> changedKeys;
+  nsMsgKey publicationKey{nsMsgKey_None};
+  bool notifyLegacy{true};
+};
+
+// Filled before commit; keep unchanged until its one delivery.
+struct PreparedThreadBatch {
+  PreparedThreadBatch();
+  ~PreparedThreadBatch();
+  PreparedThreadBatch(PreparedThreadBatch&&);
+  PreparedThreadBatch& operator=(PreparedThreadBatch&&);
+  PreparedThreadBatch(const PreparedThreadBatch&) = delete;
+  PreparedThreadBatch& operator=(const PreparedThreadBatch&) = delete;
+
+  MessageThreadBatch captured;
+  nsTArray<RefPtr<Message>> changedLive;
+  RefPtr<Message> publicationLive;
+};
 
 class MessageListener : public nsISupports {
  public:
@@ -33,6 +76,19 @@ class MessageListener : public nsISupports {
   virtual void OnMessageTagsChanged(nsIMsgDBHdr* oldMessage, Message* message,
                                     const nsACString& oldTags,
                                     const nsACString& newTags) = 0;
+  // Preparation owns history and live wrappers, without notifying observers.
+  // On failure prepared is unchanged. Production dispatch is not wired yet.
+  virtual nsresult PrepareThreadBatch(const MessageThreadBatch& batch,
+                                      PreparedThreadBatch& prepared);
+  virtual void DeliverThreadBatch(const PreparedThreadBatch& prepared);
+  virtual void OnMessageThreadChanged(const CapturedMessage& before,
+                                      const CapturedMessage& after,
+                                      Message* borrowedLive) {}
+  virtual void OnMessagePublishedCaptured(const CapturedMessage& after,
+                                          Message* borrowedLive,
+                                          bool notifyLegacy) {
+    OnMessagePublished(borrowedLive, notifyLegacy);
+  }
   virtual ~MessageListener() {};
 };
 
@@ -49,6 +105,10 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult AddMessage(uint64_t folderId, const ::RawHdr& header,
                       bool notifyLegacy, nsMsgKey* key,
                       Message** liveHeader = nullptr);
+
+  // Reads stored facts directly, including uncommitted owned changes.
+  // Missing row: NS_ERROR_UNEXPECTED. On failure output is unchanged.
+  nsresult CaptureMessage(nsMsgKey key, CapturedMessage& output);
 
   // A bunch of oddly-specific functions here purely to support implementing
   // legacy message interfaces (nsIMsgDBHdr and friends).

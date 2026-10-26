@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 62)
+        self.assertEqual(len(catalog["cases"]), 67)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -169,7 +169,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 62)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 67)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -198,10 +198,15 @@ class NativeAccountingTests(unittest.TestCase):
                     "RemovalCallbackSeesAbsentRowAndReadableHeader", "WarmHeaderPrepareFailurePropagates",
                     "ColdRowPrepareFailurePropagates", "WarmHeaderStepFailurePropagates",
                     "ColdRowStepFailurePropagates", "SingleFolderFilterUsesStoredIdentity",
-                    "MultiFolderFilterUsesStoredIdentity", "VirtualFolderFilterUsesStoredIdentity"}
+                    "MultiFolderFilterUsesStoredIdentity", "VirtualFolderFilterUsesStoredIdentity",
+                    "ColdRemovalCallbackSeesCommittedRowAndReadableHeader",
+                    "WarmRemovalUsesReturnedStoredFields",
+                    "RemovalStepFailureRollsBackWithoutNotification",
+                    "RemovalCommitFailureRollsBackWithoutNotification",
+                    "RemovalRejectsForeignTransaction"}
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in expected})
-        self.assertEqual(len(rows), 10)
+        self.assertEqual(len(rows), 15)
         self.assertEqual(native.CATALOG["suites"][suite]["source"],
                          "mailnews/db/panorama/test/gtest/TestDeliveryCoreMessageExistence.cpp")
         for row in rows:
@@ -220,6 +225,11 @@ class NativeAccountingTests(unittest.TestCase):
         self.reject(wrong)
         for selected in (suite + ".*", self.selected + ":" + rows[0]["filter"]):
             self.assertFalse(native.check_log(self.log, selected, 0)["log_complete"])
+        dependencies = set(native.CATALOG["suites"][suite]["source_dependencies"])
+        required = {"mailnews/db/panorama/src/" + name for name in (
+            "MessageDatabase.cpp", "MessageDatabase.h", "Message.cpp", "Message.h",
+            "DatabaseCore.cpp", "DatabaseCore.h", "FolderDatabase.cpp", "FolderDatabase.h")}
+        self.assertTrue(required <= dependencies, required - dependencies)
         self.assertEqual(native.CATALOG["backend"], "panorama")
         self.assertEqual(native.CATALOG["store"], "none")
         self.assertEqual(native.CATALOG["readiness"], "pending-product")

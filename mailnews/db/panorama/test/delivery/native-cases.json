@@ -316,6 +316,31 @@
       "id": "core-native:MessageExistence:VirtualFolderFilterUsesStoredIdentity",
       "filter": "DISABLED_DeliveryCoreMessageExistence.VirtualFolderFilterUsesStoredIdentity",
       "expected": "With ALL and two configured virtual search folders, both included stored folders match; the unrelated third folder and missing identity zero are excluded. Non-ALL search is outside this case."
+    },
+    {
+      "id": "core-native:MessageExistence:ColdRemovalCallbackSeesCommittedRowAndReadableHeader",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ColdRemovalCallbackSeesCommittedRowAndReadableHeader",
+      "expected": "After same-process core/connection reopen, exactly one callback and the retained header show all stored fields and actual old flags; the transaction is closed, membership is absent, count is 1 and unshared SQL contains only the survivor."
+    },
+    {
+      "id": "core-native:MessageExistence:WarmRemovalUsesReturnedStoredFields",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.WarmRemovalUsesReturnedStoredFields",
+      "expected": "A warmed header made stale by SQL reports Stored at deletion and priority 4 in the single callback and after return; independent SQL is empty and stored membership is absent."
+    },
+    {
+      "id": "core-native:MessageExistence:RemovalStepFailureRollsBackWithoutNotification",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.RemovalStepFailureRollsBackWithoutNotification",
+      "expected": "A reached BEFORE DELETE function fails once with the actual key and NS_ERROR_FAILURE; no callback or open transaction remains, both rows/property and warm fields survive, then fault removal permits one callback and property removal."
+    },
+    {
+      "id": "core-native:MessageExistence:RemovalCommitFailureRollsBackWithoutNotification",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.RemovalCommitFailureRollsBackWithoutNotification",
+      "expected": "A deferred foreign-key probe establishes successful write then COMMIT constraint failure with an active transaction. Removal returns NS_ERROR_STORAGE_CONSTRAINT without callback, closes its transaction and preserves both rows/property/header fields; removing the trigger permits one retry callback."
+    },
+    {
+      "id": "core-native:MessageExistence:RemovalRejectsForeignTransaction",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.RemovalRejectsForeignTransaction",
+      "expected": "NS_ERROR_IN_PROGRESS preserves the caller-owned transaction and emits no callback; writer sees Foreign pending while an unshared reader sees Stored subject, both rows and the property. Caller rollback then permits one successful removal callback and survivor-only storage."
     }
   ],
   "suites": {
@@ -376,7 +401,9 @@
         "mailnews/search/src/nsMsgFilter.cpp",
         "mailnews/search/src/nsMsgFilter.h",
         "mailnews/search/src/nsMsgSearchTerm.cpp",
-        "mailnews/search/src/nsMsgSearchTerm.h"
+        "mailnews/search/src/nsMsgSearchTerm.h",
+        "mailnews/db/panorama/src/DatabaseCore.cpp",
+        "mailnews/db/panorama/src/DatabaseCore.h"
       ]
     }
   }

@@ -2,7 +2,7 @@
 
 TestDeliveryCoreReferences.cpp (14 cases), TestDeliveryFolderInfoProperties.cpp
 (19 cases), TestDeliveryMessageReferences.cpp (19 cases) and
-TestDeliveryCoreMessageExistence.cpp (10 cases) are linked here. All 62 filters
+TestDeliveryCoreMessageExistence.cpp (15 cases) are linked here. All 67 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
@@ -158,7 +158,18 @@ controls and the OS-temp close/restoration/retention lifecycle remain pending.
 
 The three stored-identity filter cases cover single, multi and virtual folder
 matching without an account-backed folder object. Virtual coverage uses ALL;
-non-ALL search and cold-removal identity remain separate product limits. Each
-exact disabled filter requires its own fresh process/profile and bound receipt;
+non-ALL search is outside these cases. Each exact disabled filter requires its
+own fresh process/profile and bound receipt;
 missing identity zero must not match. The public event regression stays in the
 existing core:Publication case. Matching native compilation and runtime are pending.
+
+The five additional removal cases require committed cold-callback fields, stored
+values replacing a stale warm cache, atomic rollback after reached step/commit
+failure, and rejection of a caller-owned transaction without taking ownership.
+Failure cases require no callback, preserved independent storage and a successful
+retry after fixture recovery; an error alone is insufficient. Bind DatabaseCore
+schema/connection lifecycle, MessageDatabase, Message and FolderDatabase sources
+and headers. Same-process reopen is not application restart. Each exact disabled
+case still needs matching native compilation, fault sensitivity, full shutdown
+and profile/close qualification; the xpcshell ColdDeletion result gives no native
+gtest credit.

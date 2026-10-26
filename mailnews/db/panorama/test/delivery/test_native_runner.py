@@ -449,7 +449,8 @@ class NativeRunnerTests(unittest.TestCase):
 
     def test_receipt_must_bind_each_suites_implementation_header_and_fixture(self):
         config, receipt, runner_path = self.receipt_fixture()
-        dependencies = ("src/Message.cpp", "src/Message.h", "src/PerFolderDatabase.cpp",
+        dependencies = ("src/DatabaseCore.cpp", "src/DatabaseCore.h",
+                        "src/Message.cpp", "src/Message.h", "src/PerFolderDatabase.cpp",
                         "src/PerFolderDatabase.h", "test/gtest/TestDeliveryFolderInfoProperties.cpp")
         with (patch.object(runner.sys, "platform", "linux"),
               patch.object(runner, "__file__", str(runner_path)),

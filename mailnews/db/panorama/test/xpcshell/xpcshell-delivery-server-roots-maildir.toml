@@ -1,4 +1,4 @@
-# Pending-contract root-cache requests; no execution until fixture evidence is reviewed.
+# Pending-product root-cache requests; matching-build runtime remains NOTRUN.
 # Manual acceptance; deliberately not registered in moz.build.
 [DEFAULT]
 head = "head.js head_delivery.js"

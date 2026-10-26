@@ -2615,7 +2615,7 @@
     "store": "mbox",
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
-    "readiness": "pending-contract",
+    "readiness": "pending-product",
     "folder_roles": {
       "source": "complete-copy-source",
       "destination": "complete-copy-destination"
@@ -2643,7 +2643,7 @@
     "store": "maildir",
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
-    "readiness": "pending-contract",
+    "readiness": "pending-product",
     "folder_roles": {
       "source": "complete-copy-source",
       "destination": "complete-copy-destination"
@@ -2661,7 +2661,7 @@
     "store": "mbox",
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
-    "readiness": "pending-contract",
+    "readiness": "pending-product",
     "requires_non_debug": true,
     "folder_roles": {
       "child": "Known",
@@ -2684,7 +2684,7 @@
     "store": "mbox",
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
-    "readiness": "pending-contract",
+    "readiness": "pending-product",
     "requires_non_debug": false,
     "folder_roles": {
       "child": "Known"
@@ -2702,7 +2702,7 @@
     "store": "maildir",
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
-    "readiness": "pending-contract",
+    "readiness": "pending-product",
     "requires_non_debug": true,
     "folder_roles": {
       "child": "Known",
@@ -2725,7 +2725,7 @@
     "store": "maildir",
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
-    "readiness": "pending-contract",
+    "readiness": "pending-product",
     "requires_non_debug": false,
     "folder_roles": {
       "child": "Known"

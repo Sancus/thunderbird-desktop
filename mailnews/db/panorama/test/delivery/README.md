@@ -287,8 +287,8 @@ matching-source runtime and restored setter negative controls, not metadata cred
 ## Corrected local publication requests
 
 The two PublicationCopy requests declare the nine accepted local018 tasks and
-setupLocalPublicationCopy from local020. They remain pending-contract until the
-setup-only source candidate and registration are jointly reviewed and composed.
+setupLocalPublicationCopy from local020. They are pending-product and NOTRUN after
+joint source/registration review and the explicit readiness transition.
 Preflight binds both original and installed PromiseTestUtils modules; missing or
 stale installed bytes block launch. Actual module import/behavior still requires
 matching runtime. No callback or store scan grants direct final-stop order or
@@ -296,8 +296,8 @@ member-three stream-open credit; those independent witness gates remain held.
 
 ## Root-cache requests and declared parents
 
-All four ServerRoot requests remain pending-contract until exact compat033 source
-and registration receive joint review and composition. Commit 738d26a supplies
+All four ServerRoot requests are pending-product and NOTRUN after joint source/
+registration review and the explicit readiness transition. Commit 738d26a supplies
 actual Known and bystander diagnostics without changing product behavior. Failure
 requests declare their two real account parents, with an exact role keyset and
 observed-parent match. Identity retains the default common-parent rule. Failure

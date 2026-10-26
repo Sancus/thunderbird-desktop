@@ -1380,7 +1380,7 @@ support-files = ["fixture.sql"]
                     self.assertEqual(result["coverage"], "none")
         self.assertFalse(self.check(events[:-2], case)["ok"])
 
-    def test_local_publication_copy_binds_named_setup_modules_and_remains_held(self):
+    def test_local_publication_copy_binds_named_setup_modules(self):
         import shutil
         comm = runner.HERE.parents[4]
         rows = json.loads((runner.HERE / "cases.json").read_text())
@@ -1397,7 +1397,7 @@ support-files = ["fixture.sql"]
         for index, case in enumerate(rows):
             self.assertEqual(case["tasks"], expected)
             self.assertEqual(case["setups"], ["setupLocalPublicationCopy"])
-            self.assertEqual(case["readiness"], "pending-contract")
+            self.assertEqual(case["readiness"], "pending-product")
             self.assertNotIn("anonymous_setup", case)
             self.assertEqual(case["folder_roles"], {"source": "complete-copy-source",
                                                    "destination": "complete-copy-destination"})
@@ -1418,16 +1418,15 @@ support-files = ["fixture.sql"]
                 original = comm / "mailnews/test/resources" / name
                 shutil.copyfile(original, target / original.relative_to(comm))
                 shutil.copyfile(original, Path(config["objdir"]) / "_tests/modules/mailnews" / name)
-            # Shape/dependency proof is not approval or runtime evidence.
-            ready = {**case, "readiness": "pending-product"}
-            _, bound = runner.prepare(config, ready)
+            # Declaration/dependency checks do not grant runtime evidence.
+            _, bound = runner.prepare(config, case)
             for name in modules:
                 self.assertIn(target / "mailnews/test/resources" / name, bound)
                 self.assertIn(Path(config["objdir"]) / "_tests/modules/mailnews" / name, bound)
             for changes in ({"setups": []}, {"setups": ["wrongSetup"]},
                             {"tasks": expected[:-1]}):
                 with self.assertRaisesRegex(ValueError, "named tasks/setup differ from source"):
-                    runner.prepare(config, {**ready, **changes})
+                    runner.prepare(config, {**case, **changes})
             installed = Path(config["objdir"]) / "_tests/modules/mailnews/PromiseTestUtils.sys.mjs"
             original_bytes = installed.read_bytes()
             for fault, content in (("stale", b"stale module"), ("missing", None)):
@@ -1438,7 +1437,7 @@ support-files = ["fixture.sql"]
                 with patch.object(runner.subprocess, "run") as launch:
                     output = self.root / ("local-promise-" + str(index) + "-" + fault)
                     output.mkdir()
-                    result = runner.run_case(config, ready, output)
+                    result = runner.run_case(config, case, output)
                     launch.assert_not_called()
                     self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
                                      (None, "blocked", "none"))
@@ -1447,7 +1446,7 @@ support-files = ["fixture.sql"]
             with patch.object(runner.subprocess, "run") as launch:
                 output = self.root / ("held-local-" + str(index))
                 output.mkdir()
-                result = runner.run_case(config, case, output)
+                result = runner.run_case(config, {**case, "readiness": "pending-contract"}, output)
                 launch.assert_not_called()
                 self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
                                  (None, "blocked", "none"))
@@ -1508,7 +1507,7 @@ support-files = ["fixture.sql"]
         self.assertFalse(self.check(self.events[:3] + self.events[5:], raw)["ok"])
 
 
-    def test_server_root_requests_bind_actual_sources_and_remain_held(self):
+    def test_server_root_requests_bind_actual_sources(self):
         import shutil
         comm = runner.HERE.parents[4]
         catalog = json.loads((runner.HERE / "cases.json").read_text())
@@ -1528,7 +1527,7 @@ support-files = ["fixture.sql"]
                              if failure else "test_successfulRootKeepsIdentityDuringAndAfterInitialization"])
             self.assertEqual(case["setups"], [])
             self.assertEqual(case["requires_non_debug"], failure)
-            self.assertEqual(case["readiness"], "pending-contract")
+            self.assertEqual(case["readiness"], "pending-product")
             self.assertEqual(case["folder_roles"], {"child": "Known", **(
                 {"bystander": "root-bystander"} if failure else {})})
             if failure:
@@ -1551,20 +1550,21 @@ support-files = ["fixture.sql"]
                 module = "mailnews/test/resources/" + name
                 shutil.copyfile(comm / module, target / module)
                 shutil.copyfile(comm / module, Path(config["objdir"]) / "_tests/modules/mailnews" / name)
-            # This only checks future declaration/dependency shape, not runtime readiness.
-            _, bound = runner.prepare(config, {**case, "readiness": "pending-product"})
+            # Declaration/dependency checks do not grant runtime evidence.
+            _, bound = runner.prepare(config, case)
             self.assertTrue({target / n for n in dependencies} <= set(bound))
             self.assertIn(Path(config["source"]) / "testing/modules/MockRegistrar.sys.mjs", bound)
             self.assertIn(Path(config["objdir"]) / "_tests/modules/MockRegistrar.sys.mjs", bound)
             with patch.object(runner.subprocess, "run") as launch:
                 output = self.root / ("held-root-" + str(index))
                 output.mkdir()
-                result = runner.run_case(config, case, output)
+                held = {**case, "readiness": "pending-contract"}
+                result = runner.run_case(config, held, output)
                 launch.assert_not_called()
                 self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
                                  (None, "blocked", "none"))
                 self.assertIn("contract approval is pending", " ".join(result["errors"]))
-                self.assertEqual(json.loads((output / "request.json").read_text())["case"], case)
+                self.assertEqual(json.loads((output / "request.json").read_text())["case"], held)
 
     def test_folder_tasks_bind_matching_installed_promise_module_before_launch(self):
         config, case = self.initializer_fixture()

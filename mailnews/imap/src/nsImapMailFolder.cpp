@@ -2683,7 +2683,13 @@ nsresult nsImapMailFolder::HandleUidInvalidation(ImapUid newUidValidity) {
     mDatabase->ForceClosed();
     mDatabase = nullptr;
   } else if (NS_SUCCEEDED(rv) && mDatabase) {
-    if (transferInfo) SetDBTransferInfo(transferInfo);
+    if (transferInfo) {
+      SetDBTransferInfo(transferInfo);
+      // Preserve folder settings, but derive counts from the replacement DB
+      // before notifying listeners or adding messages from the new epoch.
+      rv = mDatabase->SyncCounts();
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
 
     SummaryChanged();
     if (mDatabase) {

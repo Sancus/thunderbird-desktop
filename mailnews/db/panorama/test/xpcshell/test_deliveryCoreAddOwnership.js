@@ -58,10 +58,10 @@ add_task(function test_rejectAddInsideForeignTransaction() {
     subject: "Committed control",
   });
   const control = messageDB.getMessage(controlId);
+  // Observe raw rows without requiring an account-backed nsIMsgFolder.
   const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
-  view.initWithFolder(folderId);
   registerCleanupFunction(() => view.clearListener());
   const events = [];
   view.setListener({

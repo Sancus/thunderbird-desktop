@@ -52,10 +52,10 @@ function readStoredRows(sql, columns) {
 add_task(async function test_failedAddLeavesNoMessageOrPublication() {
   const root = folderDB.insertRoot("delivery-rollback");
   const folderId = folderDB.insertFolder(root, "Inbox");
+  // Observe raw rows without requiring an account-backed nsIMsgFolder.
   const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
-  view.initWithFolder(folderId);
   registerCleanupFunction(() => view.clearListener());
   const events = [];
   view.setListener({

@@ -601,6 +601,11 @@
       "id": "compatibility-native:CompleteHeader:FailedAttachmentDoesNotReplay",
       "filter": "DISABLED_DeliveryCompleteHeader.FailedAttachmentDoesNotReplay",
       "expected": "Reached References insertion fault returns the exact constraint once, leaves no live output/rows/open transaction, and latches the error so repeat attach/mutation cannot replay it."
+    },
+    {
+      "id": "core-native:MessageExistence:ConversationFilterRejectsThreadReadFailure",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ConversationFilterRejectsThreadReadFailure",
+      "expected": "Real matching and excluded stored-thread controls remain correct before and after a native GetThreadId fault that writes the matching identity but returns NS_ERROR_FAILURE; direct probe and exact call counts1/2 prove reach, filter rejects the failed output, and unshared SQL retains both rows."
     }
   ],
   "suites": {

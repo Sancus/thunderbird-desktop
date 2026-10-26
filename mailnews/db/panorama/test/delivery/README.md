@@ -241,7 +241,8 @@ Native gtest build/qualification proceeds independently.
 ## Raw database task groups and physical view identity
 
 The manual catalog has 170 JS rows; NumericProperties remains pending-contract.
-Publication now declares its current five tasks and ConversationIngestion all four.
+Publication declares all nine tasks with the accepted snapshot031 source;
+ConversationIngestion retains all four.
 These panorama:none files each require one literal anonymous setup, assertions
 and backend evidence inside it, then every named task with assertions and exact
 file/suite completion. Preflight binds the pinned xpcshell head.js task logger.
@@ -276,3 +277,9 @@ attach, consumed-draft identity and no replay remain strict runtime assertions.
 Matching generated headers, source/build receipts, fresh cleanup and restored
 notification/alias/state negative controls remain pending. All unselected cases
 are NOTRUN. Mixed LocalStructure lanes remain held under strict skip rejection.
+
+Snapshot031 source and admission must land atomically: the five-task
+source fails the nine-task declaration, and the nine-task source fails the old
+declaration. The same core:Publication ID requires all task assertions and file
+completion; unselected cases remain NOTRUN. Date/thread membership controls need
+matching-source runtime and restored setter negative controls, not metadata credit.

@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 119)
+        self.assertEqual(len(catalog["cases"]), 120)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -169,7 +169,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 119)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 120)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -206,10 +206,11 @@ class NativeAccountingTests(unittest.TestCase):
                     "RemovalRejectsForeignTransaction",
                     "ThreadKeysPreserveMembershipAndDepthFirstOrder", "EmptyThreadKeysReplaceOutput",
                     "ThreadKeysFolderBindError", "ThreadKeysParentBindError", "ThreadKeysThreadBindError",
-                    "ThreadKeysPrepareError", "ThreadKeysFirstStepError", "ThreadKeysErrorAfterSeedRow"}
+                    "ThreadKeysPrepareError", "ThreadKeysFirstStepError", "ThreadKeysErrorAfterSeedRow",
+                    "ConversationFilterRejectsThreadReadFailure"}
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in expected})
-        self.assertEqual(len(rows), 23)
+        self.assertEqual(len(rows), 24)
         self.assertEqual(native.CATALOG["suites"][suite]["source"],
                          "mailnews/db/panorama/test/gtest/TestDeliveryCoreMessageExistence.cpp")
         for row in rows:
@@ -232,6 +233,10 @@ class NativeAccountingTests(unittest.TestCase):
         required = {"mailnews/db/panorama/src/" + name for name in (
             "MessageDatabase.cpp", "MessageDatabase.h", "Message.cpp", "Message.h",
             "DatabaseCore.cpp", "DatabaseCore.h", "FolderDatabase.cpp", "FolderDatabase.h")}
+        required.update({"mailnews/db/panorama/src/LiveViewFilters.h",
+                         "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+                         "mailnews/db/panorama/src/DetachedMsgHdr.h",
+                         "mailnews/base/public/nsIMsgHdr.idl"})
         self.assertTrue(required <= dependencies, required - dependencies)
         self.assertEqual(native.CATALOG["backend"], "panorama")
         self.assertEqual(native.CATALOG["store"], "none")

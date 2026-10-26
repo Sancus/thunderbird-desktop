@@ -118,7 +118,9 @@ class ConversationFilter final : public LiveViewFilter {
 
   bool Matches(nsIMsgDBHdr* message, uint64_t) override {
     nsMsgKey threadId;
-    message->GetThreadId(&threadId);
+    if (NS_FAILED(message->GetThreadId(&threadId))) {
+      return false;
+    }
     return threadId == mConversationId;
   }
 

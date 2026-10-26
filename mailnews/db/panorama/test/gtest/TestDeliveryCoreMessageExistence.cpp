@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "DatabaseCore.h"
+#include "DetachedMsgHdr.h"
 #include "LiveViewFilters.h"
 #include "Message.h"
 #include "MessageDatabase.h"
@@ -56,6 +57,26 @@ class MessageExistenceReadFault final : public mozIStorageFunction {
 NS_IMPL_ISUPPORTS(MessageExistenceReadFault, mozIStorageFunction)
 
 namespace {
+
+class ConversationThreadReadFault final : public DetachedMsgHdr {
+ public:
+  ConversationThreadReadFault(uint64_t folderId, nsMsgKey threadId)
+      : DetachedMsgHdr(folderId), mThreadId(threadId) {}
+
+  NS_IMETHOD GetThreadId(nsMsgKey* threadId) override {
+    NS_ENSURE_ARG_POINTER(threadId);
+    ++mCalls;
+    // An output written on failure is not a successful identity read.
+    *threadId = mThreadId;
+    return NS_ERROR_FAILURE;
+  }
+
+  uint32_t mCalls = 0;
+
+ private:
+  ~ConversationThreadReadFault() = default;
+  const nsMsgKey mThreadId;
+};
 
 class MessageExistenceRemovedObserver final : public MessageListener {
  public:
@@ -1076,6 +1097,35 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysFirstStepError) {
 
 TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysErrorAfterSeedRow) {
   ASSERT_NO_FATAL_FAILURE(CheckThreadStepFailure(true));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       ConversationFilterRejectsThreadReadFailure) {
+  nsMsgKey key, other, thread, otherThread;
+  ASSERT_EQ(NS_OK, Add("conversation-error@invalid"_ns, key));
+  ASSERT_EQ(NS_OK, Add("conversation-control@invalid"_ns, other));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(key, thread));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(other, otherThread));
+  ASSERT_NE(thread, otherThread);
+  ASSERT_NE(nsMsgKey_None, thread);
+  RefPtr<Message> matching = new Message(key);
+  RefPtr<Message> excluded = new Message(other);
+  ConversationFilter filter(thread);
+  EXPECT_TRUE(filter.Matches(matching, mFolder));
+  EXPECT_FALSE(filter.Matches(excluded, mFolder));
+
+  RefPtr<ConversationThreadReadFault> fault =
+      new ConversationThreadReadFault(mFolder, thread);
+  nsMsgKey written = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_FAILURE, fault->GetThreadId(&written));
+  EXPECT_EQ(thread, written);
+  EXPECT_EQ(1u, fault->mCalls);
+  EXPECT_FALSE(filter.Matches(fault, mFolder));
+  EXPECT_EQ(2u, fault->mCalls);
+
+  EXPECT_TRUE(filter.Matches(matching, mFolder));
+  EXPECT_FALSE(filter.Matches(excluded, mFolder));
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key, other}));
 }
 
 }  // namespace

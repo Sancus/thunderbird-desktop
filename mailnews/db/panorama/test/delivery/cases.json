@@ -73,7 +73,11 @@
       "test_folderFilteredEventsUseDatabaseIdentity",
       "test_tagThenReadPublishesEachMessageOnce",
       "test_tagChangesPreserveFlaggedMembership",
-      "test_tagChangesKeepReadMessagesOutOfUnreadView"
+      "test_tagChangesKeepReadMessagesOutOfUnreadView",
+      "test_flagChangesRetainDateMembership",
+      "test_tagChangesRetainDateMembership",
+      "test_flagChangesRetainConversationMembership",
+      "test_tagChangesRetainConversationMembership"
     ],
     "anonymous_setup": true,
     "source_dependencies": [

@@ -203,8 +203,8 @@ need root verification before runtime admission. Matching SQLite planner, native
 close/profile lifecycle and restored old-code negative controls remain NOTRUN.
 
 The ten complete native publication controls and seven CompleteHeader adapter
-controls bring the manual catalog to 119. Both existing source files are already
-in xul-gtest; all filters remain DISABLED and require exact isolated selection.
+controls precede one snapshot031 control, bringing the manual catalog to 120.
+Both existing source files are already in xul-gtest; all filters remain DISABLED and require exact isolated selection.
 Core publication binds the RawHdr declaration, named/default/extra/storage write
 path and helpers. CompleteHeader binds the detached/PerFolder/live adapters and
 the real shared fixture. Receipts also require pinned Maybe.h and RefPtr.h.
@@ -215,4 +215,9 @@ First-callback completeness, quiet internal delivery, keyword/name precedence,
 DR023 vectors and reentrant borrowing retain all original assertions. Native
 runtime, restored negative controls, raw shutdown/profile/loaded-image proof and
 refcount/debug qualification remain pending; leak checking stays unavailable.
-Snapshot031 native controls are not registered by this slice.
+Snapshot031 adds only ConversationFilterRejectsThreadReadFailure, atomically with
+its exact source and the nine-task Publication declaration. Its reached native
+getter writes a matching thread identity but returns failure; the filter must
+reject it while real matching/excluded controls and independent stored rows remain
+correct. This is not a SQL fault claim. All 120 cases remain manual/DISABLED and
+NOTRUN until matching compilation, isolated execution and close/profile evidence.

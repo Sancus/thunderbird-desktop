@@ -447,3 +447,626 @@ add_task(async function test_tagChangesKeepReadMessagesOutOfUnreadView() {
     view.clearListener();
   }
 });
+
+/**
+ * Record live-view callbacks with current date, thread, flags and tags.
+ *
+ * @param {nsILiveView} view - The view whose listener is replaced.
+ * @returns {Array<Array<string|number|null>>} Ordered callback fields and the
+ *   previous flags/tags value, or null for additions/removals.
+ */
+function recordSnapshotEvents(view) {
+  const events = [];
+  const record = (kind, message, previous = null) => {
+    events.push([
+      kind,
+      message.id,
+      message.date.valueOf(),
+      message.threadId,
+      message.flags,
+      message.tags,
+      previous,
+    ]);
+  };
+  view.setListener({
+    onMessageAdded(message) {
+      record("added", message);
+    },
+    onMessageRemoved(message) {
+      record("removed", message);
+    },
+    onMessageFlagsChanged(message, oldFlags) {
+      record("flags", message, oldFlags);
+    },
+    onMessageTagsChanged(message, oldTags) {
+      record("tags", message, oldTags);
+    },
+    onSelectedChunk() {},
+  });
+  registerCleanupFunction(() => view.clearListener());
+  return events;
+}
+
+add_task(async function test_flagChangesRetainDateMembership() {
+  const root = folderDB.insertRoot("delivery-date-snapshot-flag");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const targetDate = Date.UTC(2040, 0, 15, 12);
+  const epochDate = Date.UTC(1970, 0, 1, 12);
+  const excludedDate = Date.UTC(2041, 0, 15, 12);
+  const initialFlags = Ci.nsMsgMessageFlags.Marked;
+  const finalFlags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  view.initWithDateRange(
+    Date.UTC(2040, 0, 1) * 1000,
+    Date.UTC(2040, 1, 1) * 1000
+  );
+  const epochView = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  epochView.initWithDateRange(
+    Date.UTC(1969, 11, 31) * 1000,
+    Date.UTC(1970, 0, 2) * 1000
+  );
+  const events = recordSnapshotEvents(view);
+  const epochEvents = recordSnapshotEvents(epochView);
+  try {
+    const baseline = await view.countMessages();
+    const epochBaseline = await epochView.countMessages();
+    const target = addMessage({
+      folderId,
+      messageId: "date-flag-target@invalid",
+      date: "2040-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const epoch = addMessage({
+      folderId,
+      messageId: "date-flag-epoch@invalid",
+      date: "1970-01-01T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const excluded = addMessage({
+      folderId,
+      messageId: "date-flag-excluded@invalid",
+      date: "2041-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const threads = new Map(
+      readStoredRows(
+        "SELECT id, threadId FROM messages WHERE folderId = " + folderId,
+        ["id", "threadId"]
+      )
+    );
+    Assert.equal(threads.size, 3);
+    for (const thread of threads.values()) {
+      Assert.ok(thread > 0 && thread < 0xffffffff);
+    }
+    messageDB.getMessage(target).flags = finalFlags;
+    messageDB.getMessage(epoch).flags = finalFlags;
+    messageDB.getMessage(excluded).flags = finalFlags;
+    Assert.deepEqual(events, [
+      [
+        "added",
+        target,
+        targetDate,
+        threads.get(target),
+        initialFlags,
+        "snapshot-before",
+        null,
+      ],
+      [
+        "flags",
+        target,
+        targetDate,
+        threads.get(target),
+        finalFlags,
+        "snapshot-before",
+        initialFlags,
+      ],
+    ]);
+    Assert.deepEqual(epochEvents, [
+      [
+        "added",
+        epoch,
+        epochDate,
+        threads.get(epoch),
+        initialFlags,
+        "snapshot-before",
+        null,
+      ],
+      [
+        "flags",
+        epoch,
+        epochDate,
+        threads.get(epoch),
+        finalFlags,
+        "snapshot-before",
+        initialFlags,
+      ],
+    ]);
+    Assert.equal(await view.countMessages(), baseline + 1);
+    Assert.equal(await epochView.countMessages(), epochBaseline + 1);
+    const keys = [target, epoch, excluded];
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id).filter(
+        key => keys.includes(key)
+      ),
+      [target]
+    );
+    Assert.deepEqual(
+      Array.from(
+        await epochView.selectMessages(),
+        message => message.id
+      ).filter(key => keys.includes(key)),
+      [epoch]
+    );
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, folderId, date, threadId, flags, tags FROM messages " +
+          "WHERE folderId = " +
+          folderId +
+          " ORDER BY id",
+        ["id", "folderId", "date", "threadId", "flags", "tags"]
+      ),
+      [
+        [
+          target,
+          folderId,
+          targetDate * 1000,
+          threads.get(target),
+          finalFlags,
+          "snapshot-before",
+        ],
+        [
+          epoch,
+          folderId,
+          epochDate * 1000,
+          threads.get(epoch),
+          finalFlags,
+          "snapshot-before",
+        ],
+        [
+          excluded,
+          folderId,
+          excludedDate * 1000,
+          threads.get(excluded),
+          finalFlags,
+          "snapshot-before",
+        ],
+      ].sort((a, b) => a[0] - b[0]),
+      "Committed dates, folders and thread identities survive the mutation"
+    );
+  } finally {
+    view.clearListener();
+    epochView.clearListener();
+  }
+});
+
+add_task(async function test_tagChangesRetainDateMembership() {
+  const root = folderDB.insertRoot("delivery-date-snapshot-tag");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const targetDate = Date.UTC(2042, 0, 15, 12);
+  const epochDate = Date.UTC(1970, 0, 1, 12);
+  const excludedDate = Date.UTC(2043, 0, 15, 12);
+  const initialFlags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+  const finalFlags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  view.initWithDateRange(
+    Date.UTC(2042, 0, 1) * 1000,
+    Date.UTC(2042, 1, 1) * 1000
+  );
+  const epochView = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  epochView.initWithDateRange(
+    Date.UTC(1969, 11, 31) * 1000,
+    Date.UTC(1970, 0, 2) * 1000
+  );
+  const events = recordSnapshotEvents(view);
+  const epochEvents = recordSnapshotEvents(epochView);
+  try {
+    const baseline = await view.countMessages();
+    const epochBaseline = await epochView.countMessages();
+    const target = addMessage({
+      folderId,
+      messageId: "date-tag-target@invalid",
+      date: "2042-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const epoch = addMessage({
+      folderId,
+      messageId: "date-tag-epoch@invalid",
+      date: "1970-01-01T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const excluded = addMessage({
+      folderId,
+      messageId: "date-tag-excluded@invalid",
+      date: "2043-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const threads = new Map(
+      readStoredRows(
+        "SELECT id, threadId FROM messages WHERE folderId = " + folderId,
+        ["id", "threadId"]
+      )
+    );
+    Assert.equal(threads.size, 3);
+    for (const thread of threads.values()) {
+      Assert.ok(thread > 0 && thread < 0xffffffff);
+    }
+    messageDB
+      .getMessage(target)
+      .setStringProperty("keywords", "snapshot-after");
+    messageDB.getMessage(epoch).setStringProperty("keywords", "snapshot-after");
+    messageDB
+      .getMessage(excluded)
+      .setStringProperty("keywords", "snapshot-after");
+    Assert.deepEqual(events, [
+      [
+        "added",
+        target,
+        targetDate,
+        threads.get(target),
+        initialFlags,
+        "snapshot-before",
+        null,
+      ],
+      [
+        "tags",
+        target,
+        targetDate,
+        threads.get(target),
+        finalFlags,
+        "snapshot-after",
+        "snapshot-before",
+      ],
+    ]);
+    Assert.deepEqual(epochEvents, [
+      [
+        "added",
+        epoch,
+        epochDate,
+        threads.get(epoch),
+        initialFlags,
+        "snapshot-before",
+        null,
+      ],
+      [
+        "tags",
+        epoch,
+        epochDate,
+        threads.get(epoch),
+        finalFlags,
+        "snapshot-after",
+        "snapshot-before",
+      ],
+    ]);
+    Assert.equal(await view.countMessages(), baseline + 1);
+    Assert.equal(await epochView.countMessages(), epochBaseline + 1);
+    const keys = [target, epoch, excluded];
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id).filter(
+        key => keys.includes(key)
+      ),
+      [target]
+    );
+    Assert.deepEqual(
+      Array.from(
+        await epochView.selectMessages(),
+        message => message.id
+      ).filter(key => keys.includes(key)),
+      [epoch]
+    );
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, folderId, date, threadId, flags, tags FROM messages " +
+          "WHERE folderId = " +
+          folderId +
+          " ORDER BY id",
+        ["id", "folderId", "date", "threadId", "flags", "tags"]
+      ),
+      [
+        [
+          target,
+          folderId,
+          targetDate * 1000,
+          threads.get(target),
+          finalFlags,
+          "snapshot-after",
+        ],
+        [
+          epoch,
+          folderId,
+          epochDate * 1000,
+          threads.get(epoch),
+          finalFlags,
+          "snapshot-after",
+        ],
+        [
+          excluded,
+          folderId,
+          excludedDate * 1000,
+          threads.get(excluded),
+          finalFlags,
+          "snapshot-after",
+        ],
+      ].sort((a, b) => a[0] - b[0]),
+      "Committed dates, folders and thread identities survive the mutation"
+    );
+  } finally {
+    view.clearListener();
+    epochView.clearListener();
+  }
+});
+
+add_task(async function test_flagChangesRetainConversationMembership() {
+  const root = folderDB.insertRoot("delivery-thread-snapshot-flag");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const otherFolder = folderDB.insertFolder(root, "Other");
+  const date = Date.UTC(2028, 0, 15, 12);
+  const initialFlags = Ci.nsMsgMessageFlags.Marked;
+  const finalFlags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+  const parent = addMessage({
+    folderId,
+    messageId: "thread-flag-root@invalid",
+    date: "2028-01-15T12:00:00Z",
+    flags: initialFlags,
+    tags: "snapshot-before",
+  });
+  const threadRows = readStoredRows(
+    "SELECT threadId FROM messages WHERE id = " + parent,
+    ["threadId"]
+  );
+  Assert.equal(threadRows.length, 1);
+  const thread = threadRows[0][0];
+  Assert.ok(thread > 0 && thread < 0xffffffff);
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  view.initWithConversation(thread);
+  const events = recordSnapshotEvents(view);
+  try {
+    Assert.equal(await view.countMessages(), 1);
+    const reply = addMessage({
+      folderId: otherFolder,
+      messageId: "thread-flag-reply@invalid",
+      references: ["thread-flag-root@invalid"],
+      date: "2028-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const excluded = addMessage({
+      folderId: otherFolder,
+      messageId: "thread-flag-excluded@invalid",
+      date: "2028-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const excludedRows = readStoredRows(
+      "SELECT threadId FROM messages WHERE id = " + excluded,
+      ["threadId"]
+    );
+    Assert.equal(excludedRows.length, 1);
+    const excludedThread = excludedRows[0][0];
+    Assert.ok(excludedThread > 0 && excludedThread < 0xffffffff);
+    Assert.notEqual(excludedThread, thread);
+    messageDB.getMessage(parent).flags = finalFlags;
+    messageDB.getMessage(reply).flags = finalFlags;
+    messageDB.getMessage(excluded).flags = finalFlags;
+    Assert.deepEqual(events, [
+      ["added", reply, date, thread, initialFlags, "snapshot-before", null],
+      [
+        "flags",
+        parent,
+        date,
+        thread,
+        finalFlags,
+        "snapshot-before",
+        initialFlags,
+      ],
+      [
+        "flags",
+        reply,
+        date,
+        thread,
+        finalFlags,
+        "snapshot-before",
+        initialFlags,
+      ],
+    ]);
+    Assert.equal(await view.countMessages(), 2);
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id).sort(
+        (a, b) => a - b
+      ),
+      [parent, reply].sort((a, b) => a - b),
+      "The conversation contains both folders and excludes the other thread"
+    );
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, folderId, threadId, threadParent, date, flags, tags " +
+          "FROM messages WHERE folderId IN (" +
+          folderId +
+          ", " +
+          otherFolder +
+          ") ORDER BY id",
+        ["id", "folderId", "threadId", "threadParent", "date", "flags", "tags"]
+      ),
+      [
+        [
+          parent,
+          folderId,
+          thread,
+          0,
+          date * 1000,
+          finalFlags,
+          "snapshot-before",
+        ],
+        [
+          reply,
+          otherFolder,
+          thread,
+          parent,
+          date * 1000,
+          finalFlags,
+          "snapshot-before",
+        ],
+        [
+          excluded,
+          otherFolder,
+          excludedThread,
+          0,
+          date * 1000,
+          finalFlags,
+          "snapshot-before",
+        ],
+      ].sort((a, b) => a[0] - b[0]),
+      "SQL retains shared thread identity, parent, date and folder bindings"
+    );
+  } finally {
+    view.clearListener();
+  }
+});
+
+add_task(async function test_tagChangesRetainConversationMembership() {
+  const root = folderDB.insertRoot("delivery-thread-snapshot-tag");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const otherFolder = folderDB.insertFolder(root, "Other");
+  const date = Date.UTC(2028, 0, 15, 12);
+  const initialFlags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+  const finalFlags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+  const parent = addMessage({
+    folderId,
+    messageId: "thread-tag-root@invalid",
+    date: "2028-01-15T12:00:00Z",
+    flags: initialFlags,
+    tags: "snapshot-before",
+  });
+  const threadRows = readStoredRows(
+    "SELECT threadId FROM messages WHERE id = " + parent,
+    ["threadId"]
+  );
+  Assert.equal(threadRows.length, 1);
+  const thread = threadRows[0][0];
+  Assert.ok(thread > 0 && thread < 0xffffffff);
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  view.initWithConversation(thread);
+  const events = recordSnapshotEvents(view);
+  try {
+    Assert.equal(await view.countMessages(), 1);
+    const reply = addMessage({
+      folderId: otherFolder,
+      messageId: "thread-tag-reply@invalid",
+      references: ["thread-tag-root@invalid"],
+      date: "2028-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const excluded = addMessage({
+      folderId: otherFolder,
+      messageId: "thread-tag-excluded@invalid",
+      date: "2028-01-15T12:00:00Z",
+      flags: initialFlags,
+      tags: "snapshot-before",
+    });
+    const excludedRows = readStoredRows(
+      "SELECT threadId FROM messages WHERE id = " + excluded,
+      ["threadId"]
+    );
+    Assert.equal(excludedRows.length, 1);
+    const excludedThread = excludedRows[0][0];
+    Assert.ok(excludedThread > 0 && excludedThread < 0xffffffff);
+    Assert.notEqual(excludedThread, thread);
+    messageDB
+      .getMessage(parent)
+      .setStringProperty("keywords", "snapshot-after");
+    messageDB.getMessage(reply).setStringProperty("keywords", "snapshot-after");
+    messageDB
+      .getMessage(excluded)
+      .setStringProperty("keywords", "snapshot-after");
+    Assert.deepEqual(events, [
+      ["added", reply, date, thread, initialFlags, "snapshot-before", null],
+      [
+        "tags",
+        parent,
+        date,
+        thread,
+        finalFlags,
+        "snapshot-after",
+        "snapshot-before",
+      ],
+      [
+        "tags",
+        reply,
+        date,
+        thread,
+        finalFlags,
+        "snapshot-after",
+        "snapshot-before",
+      ],
+    ]);
+    Assert.equal(await view.countMessages(), 2);
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id).sort(
+        (a, b) => a - b
+      ),
+      [parent, reply].sort((a, b) => a - b),
+      "The conversation contains both folders and excludes the other thread"
+    );
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, folderId, threadId, threadParent, date, flags, tags " +
+          "FROM messages WHERE folderId IN (" +
+          folderId +
+          ", " +
+          otherFolder +
+          ") ORDER BY id",
+        ["id", "folderId", "threadId", "threadParent", "date", "flags", "tags"]
+      ),
+      [
+        [
+          parent,
+          folderId,
+          thread,
+          0,
+          date * 1000,
+          finalFlags,
+          "snapshot-after",
+        ],
+        [
+          reply,
+          otherFolder,
+          thread,
+          parent,
+          date * 1000,
+          finalFlags,
+          "snapshot-after",
+        ],
+        [
+          excluded,
+          otherFolder,
+          excludedThread,
+          0,
+          date * 1000,
+          finalFlags,
+          "snapshot-after",
+        ],
+      ].sort((a, b) => a[0] - b[0]),
+      "SQL retains shared thread identity, parent, date and folder bindings"
+    );
+  } finally {
+    view.clearListener();
+  }
+});

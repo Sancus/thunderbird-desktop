@@ -1096,11 +1096,17 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
 
   nsAutoCString tags;
   MOZ_TRY(GetMessageTags(key, tags));
+  PRTime date;
+  MOZ_TRY(GetMessageDate(key, date));
+  nsMsgKey threadId;
+  MOZ_TRY(GetMessageThreadId(key, threadId));
   uint64_t folderId;
   MOZ_TRY(GetMessageFolderId(key, folderId));
   RefPtr<DetachedMsgHdr> oldMessage = new DetachedMsgHdr(folderId);
   MOZ_TRY(oldMessage->SetFlags(oldFlags));
   MOZ_TRY(oldMessage->SetStringProperty("keywords", tags));
+  MOZ_TRY(oldMessage->SetDate(date));
+  MOZ_TRY(oldMessage->SetThreadId(threadId));
 
   // Update in DB.
   {
@@ -1394,11 +1400,17 @@ nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
 
   uint32_t flags;
   MOZ_TRY(GetMessageFlags(key, flags));
+  PRTime date;
+  MOZ_TRY(GetMessageDate(key, date));
+  nsMsgKey threadId;
+  MOZ_TRY(GetMessageThreadId(key, threadId));
   uint64_t folderId;
   MOZ_TRY(GetMessageFolderId(key, folderId));
   RefPtr<DetachedMsgHdr> oldMessage = new DetachedMsgHdr(folderId);
   MOZ_TRY(oldMessage->SetFlags(flags));
   MOZ_TRY(oldMessage->SetStringProperty("keywords", oldTags));
+  MOZ_TRY(oldMessage->SetDate(date));
+  MOZ_TRY(oldMessage->SetThreadId(threadId));
 
   // Update DB.
   {

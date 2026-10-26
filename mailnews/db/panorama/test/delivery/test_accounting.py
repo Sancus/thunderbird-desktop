@@ -1109,7 +1109,9 @@ support-files = ["fixture.sql"]
         expected = {
             "core:Publication": ["test_publishCommittedMessageOnce",
                 "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
-                "test_tagChangesPreserveFlaggedMembership", "test_tagChangesKeepReadMessagesOutOfUnreadView"],
+                "test_tagChangesPreserveFlaggedMembership", "test_tagChangesKeepReadMessagesOutOfUnreadView",
+                "test_flagChangesRetainDateMembership", "test_tagChangesRetainDateMembership",
+                "test_flagChangesRetainConversationMembership", "test_tagChangesRetainConversationMembership"],
             "search:panorama:none:ConversationIngestion": ["test_orderedCrossFolderIngestion",
                 "test_replyBeforeParentIngestion", "test_siblingsWithMissingParent", "test_siblingsThenParentArrival"]}
         comm = runner.HERE.parents[4]
@@ -1355,6 +1357,28 @@ support-files = ["fixture.sql"]
             with self.assertRaisesRegex(ValueError, "blocked-dependency"):
                 runner.prepare(config, case)
             missing.write_bytes(content)
+
+
+    def test_snapshot_publication_requires_all_nine_tasks(self):
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        case = next(c for c in catalog if c["id"] == "core:Publication")
+        self.assertEqual(len(case["tasks"]), 9)
+        events = self.raw_task_events(case)
+        for event in events:
+            if "test" in event:
+                event["test"] = case["file"]
+            if event["action"] == "suite_start":
+                event["tests"] = {case["manifest"]: [case["file"]]}
+        self.assertTrue(self.check(events, case)["ok"])
+        for name in case["tasks"]:
+            pending = next(i for i, e in enumerate(events)
+                           if name + " pending" in e.get("message", ""))
+            for index in (pending, pending + 1, pending + 2):
+                with self.subTest(task=name, missing=index):
+                    result = self.check(events[:index] + events[index + 1:], case)
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["coverage"], "none")
+        self.assertFalse(self.check(events[:-2], case)["ok"])
 
 if __name__ == "__main__":
     unittest.main()

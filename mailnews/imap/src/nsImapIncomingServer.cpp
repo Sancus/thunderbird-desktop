@@ -45,6 +45,10 @@
 #include "mozilla/LoadInfo.h"
 #include "nsNSSComponent.h"
 
+#ifdef MOZ_PANORAMA
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
+
 using namespace mozilla;
 using mozilla::net::LoadInfo;
 
@@ -1151,6 +1155,19 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
         nsCOMPtr<nsIImapMailFolderSink> folderSink = do_QueryInterface(child);
         if (folderSink) folderSink->SetFolderNeedsACLListed(true);
       }
+#ifdef MOZ_PANORAMA
+      if (StaticPrefs::mail_panorama_enabled_AtStartup() && found) {
+        bool isMail;
+        rv = child->GetFlag(nsMsgFolderFlags::Mail, &isMail);
+        NS_ENSURE_SUCCESS(rv, rv);
+        if (!isMail) {
+          // Complete cold-restored partial rows before normal LIST updates.
+          rv = hostFolder->CreateClientSubfolderInfo(
+              dupFolderPath, hierarchyDelimiter, boxFlags, true);
+          NS_ENSURE_SUCCESS(rv, rv);
+        }
+      }
+#endif
       imapFolder->SetVerifiedAsOnlineFolder(true);
       imapFolder->SetHierarchyDelimiter(hierarchyDelimiter);
       if (boxFlags & kImapTrash) {

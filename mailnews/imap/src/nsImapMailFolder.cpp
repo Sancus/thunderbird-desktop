@@ -87,6 +87,7 @@
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
 #  include "nsIFolderLookupService.h"
+#  include "nsImapUrl.h"
 #endif
 
 using mozilla::LazyLogModule;
@@ -542,7 +543,7 @@ nsresult nsImapMailFolder::CreateSubFolders(nsIFile* path) {
 
 NS_IMETHODIMP nsImapMailFolder::GetSubFolders(
     nsTArray<RefPtr<nsIMsgFolder>>& folders) {
-  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (mail_panorama_enabled_AtStartup()) {
     // Remote hierarchy comes from the database and LIST, never the body store.
     return nsMsgDBFolder::GetSubFolders(folders);
   }
@@ -1095,7 +1096,7 @@ NS_IMETHODIMP nsImapMailFolder::CreateClientSubfolderInfo(
     const nsACString& folderName, char hierarchyDelimiter, int32_t flags,
     bool suppressNotification) {
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (mail_panorama_enabled_AtStartup()) {
     return CreatePanoramaClientSubfolderInfo(folderName, hierarchyDelimiter,
                                              flags, suppressNotification);
   }
@@ -1320,7 +1321,7 @@ NS_IMETHODIMP nsImapMailFolder::GetOnlineDelimiter(char* onlineDelimiter) {
 NS_IMETHODIMP nsImapMailFolder::SetHierarchyDelimiter(
     char aHierarchyDelimiter) {
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (mail_panorama_enabled_AtStartup()) {
     nsCOMPtr<nsIDBFolderInfo> info;
     MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
     MOZ_TRY(info->SetUint32Property("hierDelim",
@@ -1350,7 +1351,7 @@ NS_IMETHODIMP nsImapMailFolder::GetHierarchyDelimiter(
     }
   }
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (mail_panorama_enabled_AtStartup()) {
     nsCOMPtr<nsIDBFolderInfo> info;
     MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
     uint32_t delimiter;
@@ -1434,7 +1435,7 @@ NS_IMETHODIMP nsImapMailFolder::SetBoxFlags(int32_t aBoxFlags) {
   if (m_boxFlags & kImapArchive) newFlags |= nsMsgFolderFlags::Archive;
 
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (mail_panorama_enabled_AtStartup()) {
     nsCOMPtr<nsIDBFolderInfo> info;
     MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
     MOZ_TRY(info->SetFlags(newFlags));
@@ -2201,7 +2202,7 @@ nsImapMailFolder::MarkMessagesFlagged(
 NS_IMETHODIMP
 nsImapMailFolder::GetName(nsACString& name) {
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup() && !mIsServer) {
+  if (mail_panorama_enabled_AtStartup() && !mIsServer) {
     nsCOMPtr<nsIDBFolderInfo> info;
     MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
     nsAutoCString displayName;
@@ -2218,7 +2219,7 @@ nsImapMailFolder::GetName(nsACString& name) {
 NS_IMETHODIMP
 nsImapMailFolder::SetName(const nsACString& name) {
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup() && !mIsServer) {
+  if (mail_panorama_enabled_AtStartup() && !mIsServer) {
     // LIST supplies a decoded display name, not a hierarchy rename. Keep the
     // wire component used by InitWithFolderId for the URI and body path.
     nsCOMPtr<nsIDBFolderInfo> info;
@@ -2237,7 +2238,7 @@ nsImapMailFolder::SetName(const nsACString& name) {
 NS_IMETHODIMP nsImapMailFolder::SetOnlineName(
     const nsACString& aOnlineFolderName) {
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (mail_panorama_enabled_AtStartup()) {
     nsCOMPtr<nsIDBFolderInfo> info;
     MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
     // Write the retry discriminator last: a partial failure must not make the
@@ -2270,7 +2271,7 @@ NS_IMETHODIMP nsImapMailFolder::SetOnlineName(
 
 NS_IMETHODIMP nsImapMailFolder::GetOnlineName(nsACString& aOnlineFolderName) {
 #ifdef MOZ_PANORAMA
-  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (mail_panorama_enabled_AtStartup()) {
     nsCOMPtr<nsIDBFolderInfo> info;
     MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
     nsAutoCString onlineName;

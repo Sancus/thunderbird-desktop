@@ -3819,10 +3819,20 @@ nsMsgDBView::GetMsgHdrAt(nsMsgViewIndex aIndex, nsIMsgDBHdr** aResult) {
 nsMsgViewIndex nsMsgDBView::FindHdr(nsIMsgDBHdr* msgHdr,
                                     nsMsgViewIndex startIndex,
                                     bool allowDummy) {
+  if (!msgHdr) {
+    return nsMsgViewIndex_None;
+  }
+
   nsMsgKey msgKey;
-  msgHdr->GetMessageKey(&msgKey);
+  nsCOMPtr<nsIMsgFolder> folder;
+  if (NS_FAILED(msgHdr->GetMessageKey(&msgKey)) ||
+      NS_FAILED(msgHdr->GetFolder(getter_AddRefs(folder))) || !folder) {
+    return nsMsgViewIndex_None;
+  }
   nsMsgViewIndex viewIndex = m_keys.IndexOf(msgKey, startIndex);
-  if (viewIndex == nsMsgViewIndex_None) return viewIndex;
+  if (!IsValidIndex(viewIndex) || GetFolderForViewIndex(viewIndex) != folder) {
+    return nsMsgViewIndex_None;
+  }
 
   // If we're supposed to allow dummies, and the previous index is a dummy that
   // is not elided, then it must be the dummy corresponding to our node and
@@ -3835,15 +3845,6 @@ nsMsgViewIndex nsMsgDBView::FindHdr(nsIMsgDBHdr* msgHdr,
     // We're not allowing dummies, and we found a dummy, look again
     // one past the dummy.
     return m_keys.IndexOf(msgKey, viewIndex + 1);
-  }
-
-  // Check that the message we found matches the message we were looking for.
-  if (viewIndex != nsMsgViewIndex_None) {
-    nsCOMPtr<nsIMsgDBHdr> foundMsgHdr;
-    nsresult rv = GetMsgHdrForViewIndex(viewIndex, getter_AddRefs(foundMsgHdr));
-    if (NS_FAILED(rv) || foundMsgHdr != msgHdr) {
-      viewIndex = nsMsgViewIndex_None;
-    }
   }
 
   return viewIndex;

@@ -132,17 +132,17 @@ NS_IMETHODIMP DetachedMsgHdr::GetProperties(nsTArray<nsCString>& properties) {
       names.AppendElement(extra.k);
     }
   }
-  if (mRaw.messageSize) {
-    names.AppendElementUnlessExists("messageSize"_ns);
+  if (mRaw.messageSize && !names.Contains("messageSize"_ns)) {
+    names.AppendElement("messageSize"_ns);
   }
-  if (mRaw.offlineMessageSize) {
-    names.AppendElementUnlessExists("offlineMessageSize"_ns);
+  if (mRaw.offlineMessageSize && !names.Contains("offlineMessageSize"_ns)) {
+    names.AppendElement("offlineMessageSize"_ns);
   }
-  if (mRaw.lineCount) {
-    names.AppendElementUnlessExists("lineCount"_ns);
+  if (mRaw.lineCount && !names.Contains("lineCount"_ns)) {
+    names.AppendElement("lineCount"_ns);
   }
-  if (mRaw.storeToken) {
-    names.AppendElementUnlessExists("storeToken"_ns);
+  if (mRaw.storeToken && !names.Contains("storeToken"_ns)) {
+    names.AppendElement("storeToken"_ns);
   }
   properties = std::move(names);
   return NS_OK;

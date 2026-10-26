@@ -2,8 +2,8 @@
 
 TestDeliveryCoreReferences.cpp (14 cases), TestDeliveryFolderInfoProperties.cpp
 (19), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties and
-6 DetachedThreadIdentity), TestDeliveryCoreMessageExistence.cpp (15) and
-TestDeliveryCoreProperties.cpp (11) are linked here. All 94 filters
+6 DetachedThreadIdentity), TestDeliveryCoreMessageExistence.cpp (23) and
+TestDeliveryCoreProperties.cpp (11) are linked here. All 102 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
@@ -190,4 +190,14 @@ app/loaded library/INIs/configuration and complete shutdown/profile evidence.
 Each exact filter still needs compilation, fault sensitivity and restored
 negative controls. Windows and refcount leak qualification remain held. The
 isolated 724 build packet retains its frozen 67-case catalog. Unregistered
-thread-key/date controls and further publication gtests receive no credit here.
+date/thread snapshot and further publication gtests receive no credit here.
+
+The eight ThreadKeys cases select depth-first membership/empty success, three
+separate named-bind failures, preparation failure and first/after-seed step
+failures. On failure the exact error and original caller keys must survive;
+independent rows and reached function/count/key witnesses remain required. The
+bind faults use a mismatched cached statement, not an ordinary production query.
+Receipts also bind the Thread consumer/interface, MsgUnhex sources and Gecko
+mozStorageBindingParams implementation/header. Those last two exact efd2 pins
+need root verification before runtime admission. Matching SQLite planner, native
+close/profile lifecycle and restored old-code negative controls remain NOTRUN.

@@ -621,5 +621,27 @@ class NativeRunnerTests(unittest.TestCase):
             self.bind_receipt(config, receipt)
             self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
 
+
+    def test_thread_and_uint32_receipts_require_consumer_parser_and_binding_sources(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        dependencies = ["comm/mailnews/db/panorama/src/Thread.cpp",
+                        "comm/mailnews/db/panorama/src/Thread.h",
+                        "comm/mailnews/base/public/nsIMsgThread.idl",
+                        "comm/mailnews/base/src/nsMsgUtils.cpp", "comm/mailnews/base/src/nsMsgUtils.h",
+                        "storage/mozStorageBindingParams.cpp", "storage/mozStorageBindingParams.h"]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)), patch.object(runner, "verify") as verify):
+            for relative in dependencies:
+                path = str(Path(config["source"]) / relative)
+                with self.subTest(path=relative):
+                    identity = receipt["inputs"].pop(path)
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic()+5)
+                    receipt["inputs"][path] = identity
+            verify.assert_not_called()
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
+
 if __name__ == "__main__":
     unittest.main()

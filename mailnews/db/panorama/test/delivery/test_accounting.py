@@ -694,8 +694,8 @@ support-files = ["fixture.sql"]
         catalog = json.loads((runner.HERE / "cases.json").read_text())
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
-        self.assertEqual(len(cases), 38)
-        self.assertEqual(len({c["id"] for c in catalog}), 163)
+        self.assertEqual(len(cases), 43)
+        self.assertEqual(len({c["id"] for c in catalog}), 168)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -987,8 +987,8 @@ support-files = ["fixture.sql"]
                  "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
                                               "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
         rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
-        self.assertEqual(len(catalog), 163)
-        self.assertEqual(len({c["id"] for c in catalog}), 163)
+        self.assertEqual(len(catalog), 168)
+        self.assertEqual(len({c["id"] for c in catalog}), 168)
         self.assertEqual(len(rows), 8)
         for store in ("mbox", "maildir"):
             lane = [c for c in rows if c["store"] == store]
@@ -1104,8 +1104,8 @@ support-files = ["fixture.sql"]
 
     def test_new_raw_catalog_and_view_lanes_are_exact_manual_cases(self):
         catalog = json.loads((runner.HERE / "cases.json").read_text())
-        self.assertEqual(len(catalog), 163)
-        self.assertEqual(len({c["id"] for c in catalog}), 163)
+        self.assertEqual(len(catalog), 168)
+        self.assertEqual(len({c["id"] for c in catalog}), 168)
         expected = {
             "core:Publication": ["test_publishCommittedMessageOnce",
                 "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
@@ -1179,6 +1179,100 @@ support-files = ["fixture.sql"]
                 self.assertEqual(result["coverage"], "none")
         missing = target / rows[-1]["source_dependencies"][0]
         missing.unlink()
+        with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+            runner.prepare(config, rows[-1])
+
+
+    def uint32_rows(self):
+        expected = {
+            "Read": "test_uint32ReadsBoundedHexPrefixes",
+            "ReadError": "test_uint32PropagatesReadStepError",
+            "Structural": "test_uint32StorageAliasesRemainNumeric",
+            "Write": "test_uint32WritesLowercaseHexAndReplacesBothViews",
+            "WriteError": "test_uint32WriteFailurePreservesCommittedText"}
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        ids = {"compatibility:PropertiesUint32" + suffix for suffix in expected}
+        rows = [c for c in catalog if c["id"] in ids]
+        self.assertEqual({c["id"] for c in rows}, ids)
+        for row in rows:
+            suffix = row["id"].removeprefix("compatibility:PropertiesUint32")
+            self.assertEqual(row["file"], "test_deliveryCompatibilityPropertiesUint32" + suffix + ".js")
+            self.assertEqual(row["task"], expected[suffix])
+            self.assertNotIn("tasks", row)
+            self.assertNotIn("anonymous_setup", row)
+            self.assertEqual((row["backend"], row["store"], row["fixture"]), ("panorama", "none", "raw-db"))
+            self.assertEqual(row["readiness"], "pending-product")
+        return rows
+
+    def test_uint32_single_tasks_require_complete_backend_and_assertion_evidence(self):
+        for case in self.uint32_rows():
+            def marker(state):
+                return {"action": "log", "message":
+                        f"(xpcshell/head.js) | test {case['task']} {state} (2)"}
+            events = self.events[:2] + [marker("pending"),
+                self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama",
+                                      "store": "none", "scope": "metadata-only"}),
+                self.events[5], marker("finished")] + self.events[6:]
+            events = copy.deepcopy(events)
+            for event in events:
+                if "test" in event:
+                    event["test"] = case["file"]
+                if event["action"] == "suite_start":
+                    event["tests"] = {case["manifest"]: [case["file"]]}
+            self.assertTrue(self.check(events, case)["ok"])
+            for index in range(len(events)):
+                with self.subTest(case=case["id"], missing=index):
+                    result = self.check(events[:index] + events[index + 1:], case)
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["coverage"], "none")
+            wrong = copy.deepcopy(events)
+            wrong[2]["message"] = wrong[2]["message"].replace(case["task"], "test_wrong")
+            self.assertFalse(self.check(wrong, case)["ok"])
+            self.assertFalse(self.check(events, case, returncode=1)["ok"])
+            wrong = copy.deepcopy(events)
+            wrong[4]["status"] = "SKIP"
+            self.assertFalse(self.check(wrong, case)["ok"])
+
+    def test_uint32_literal_files_pass_existing_preflight_before_mock_launch(self):
+        import shutil
+        comm = runner.HERE.parents[4]
+        source = self.root / "comm"
+        config = {"source": str(self.root), "objdir": str(self.root / "obj"),
+                  "python": "python", "timeout_seconds": 600}
+        obj = Path(config["objdir"])
+        executable = obj / "dist/bin" / ("xpcshell.exe" if runner.os.name == "nt" else "xpcshell")
+        executable.parent.mkdir(parents=True)
+        executable.write_text("synthetic file; subprocess is mocked")
+        (obj / "mozinfo.json").write_text("{}")
+        rows = self.uint32_rows()
+        for case in rows:
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [manifest.parent / n for n in doc["DEFAULT"]["head"].split()]
+            paths += [manifest.parent / n for n in doc["DEFAULT"].get("support-files", [])]
+            paths += [comm / n for n in case["source_dependencies"]]
+            for original in paths:
+                target = source / original.resolve().relative_to(comm)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, target)
+        with patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=7)) as launch:
+            for index, case in enumerate(rows):
+                manifest, paths = runner.prepare(config, case)
+                self.assertTrue({source / n for n in case["source_dependencies"]} <= set(paths))
+                output = self.root / ("uint32-" + str(index))
+                output.mkdir()
+                launch.reset_mock()
+                result = runner.run_case(config, case, output)
+                launch.assert_called_once()
+                self.assertEqual(Path(launch.call_args.args[0][-1]).name, case["file"])
+                self.assertEqual((result["exit_code"], result["coverage"]), (7, "none"))
+        selected = source / rows[0]["manifest"]
+        selected = selected.with_name(rows[0]["file"])
+        selected.write_text(selected.read_text().replace(rows[0]["task"], "test_wrong"))
+        with self.assertRaisesRegex(ValueError, "named task"):
+            runner.prepare(config, rows[0])
+        (source / rows[-1]["source_dependencies"][0]).unlink()
         with self.assertRaisesRegex(ValueError, "blocked-dependency"):
             runner.prepare(config, rows[-1])
 

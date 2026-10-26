@@ -240,7 +240,7 @@ Native gtest build/qualification proceeds independently.
 
 ## Raw database task groups and physical view identity
 
-The manual catalog has 163 JS rows; NumericProperties remains pending-contract.
+The manual catalog has 168 JS rows; NumericProperties remains pending-contract.
 Publication now declares its current five tasks and ConversationIngestion all four.
 These panorama:none files each require one literal anonymous setup, assertions
 and backend evidence inside it, then every named task with assertions and exact
@@ -255,3 +255,11 @@ task completion, fresh-header lookup, exact rows and live deletion assertions.
 Store selection gives no extra body-persistence credit. Matching build/source,
 installed fixtures, fresh profiles, cleanup and negative controls remain required.
 Unselected rows are NOTRUN; historical isolated jobs do not qualify this source.
+
+The five PropertiesUint32 files each declare one existing singular metadata task.
+Their task performs its own raw DatabaseCore/file/backend setup, so no anonymous
+setup or folder/store scope is added. All fixed prefix/text/typed-field and
+overwrite assertions remain; read/write fault cases require reached witnesses,
+exact errors, unchanged committed state and recovery. Binding source is not
+runtime fault qualification. Root must verify the exact string/SQLite APIs and
+retain the approved write-trigger hex witness; no oracle is rewritten here.

@@ -103,3 +103,13 @@ support-files = ["db/messages.sql"]
 ["test_deliveryCompatibilityReferencesLegacyParsing24.js"]
 
 ["test_deliverySearchConversationIngestion.js"]
+
+["test_deliveryCompatibilityPropertiesUint32Read.js"]
+
+["test_deliveryCompatibilityPropertiesUint32Write.js"]
+
+["test_deliveryCompatibilityPropertiesUint32Structural.js"]
+
+["test_deliveryCompatibilityPropertiesUint32ReadError.js"]
+
+["test_deliveryCompatibilityPropertiesUint32WriteError.js"]

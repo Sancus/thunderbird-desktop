@@ -476,6 +476,46 @@
       "id": "compatibility-native:DetachedThreadIdentity:IdentityIsIndependentOfMetadata",
       "filter": "DISABLED_DeliveryDetachedThreadIdentity.IdentityIsIndependentOfMetadata",
       "expected": "Two detached objects retain independent thread IDs; References, flags and keywords do not overwrite thread identity or each other."
+    },
+    {
+      "id": "core-native:MessageExistence:ThreadKeysPreserveMembershipAndDepthFirstOrder",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysPreserveMembershipAndDepthFirstOrder",
+      "expected": "Independent expected root/child/grandchild/peer order; exclude wrong thread and other folder; include exact subtree and separately queried foreign folder. Unshared storage proves all rows survive."
+    },
+    {
+      "id": "core-native:MessageExistence:EmptyThreadKeysReplaceOutput",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.EmptyThreadKeysReplaceOutput",
+      "expected": "A successful query of an empty folder replaces sentinel keys with an empty list; an unrelated stored message remains."
+    },
+    {
+      "id": "core-native:MessageExistence:ThreadKeysFolderBindError",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysFolderBindError",
+      "expected": "Real cached statement lacks folderId; GetParameterIndex proves invalid parameter, exact NS_ERROR_INVALID_ARG propagates, caller sentinels and stored row remain."
+    },
+    {
+      "id": "core-native:MessageExistence:ThreadKeysParentBindError",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysParentBindError",
+      "expected": "Real cached statement lacks parent; exact NS_ERROR_INVALID_ARG propagates and caller sentinels remain."
+    },
+    {
+      "id": "core-native:MessageExistence:ThreadKeysThreadBindError",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysThreadBindError",
+      "expected": "Real cached statement lacks threadId; exact NS_ERROR_INVALID_ARG propagates and caller sentinels remain."
+    },
+    {
+      "id": "core-native:MessageExistence:ThreadKeysPrepareError",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysPrepareError",
+      "expected": "Renamed messages table forces preparation error; exact NS_ERROR_FAILURE preserves caller keys and stored row; restore and retry returns the row."
+    },
+    {
+      "id": "core-native:MessageExistence:ThreadKeysFirstStepError",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysFirstStepError",
+      "expected": "Reached registered mozStorage SQL function fails before the first result; exact NS_ERROR_FAILURE, call count/key, unchanged output and stored rows, successful retry."
+    },
+    {
+      "id": "core-native:MessageExistence:ThreadKeysErrorAfterSeedRow",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysErrorAfterSeedRow",
+      "expected": "The valid nonzero seed row precedes a reached child SQL-function failure; exact NS_ERROR_FAILURE leaves caller sentinels untouched instead of publishing the partial root; rows survive and retry completes."
     }
   ],
   "suites": {
@@ -539,7 +579,10 @@
         "mailnews/search/src/nsMsgSearchTerm.cpp",
         "mailnews/search/src/nsMsgSearchTerm.h",
         "mailnews/db/panorama/src/DatabaseCore.cpp",
-        "mailnews/db/panorama/src/DatabaseCore.h"
+        "mailnews/db/panorama/src/DatabaseCore.h",
+        "mailnews/db/panorama/src/Thread.cpp",
+        "mailnews/db/panorama/src/Thread.h",
+        "mailnews/base/public/nsIMsgThread.idl"
       ]
     },
     "DISABLED_DeliveryCoreProperties": {
@@ -597,7 +640,9 @@
         "mailnews/db/panorama/public/moz.build",
         "mailnews/db/panorama/src/moz.build",
         "mailnews/db/panorama/test/moz.build",
-        "mailnews/db/panorama/test/gtest/moz.build"
+        "mailnews/db/panorama/test/gtest/moz.build",
+        "mailnews/base/src/nsMsgUtils.cpp",
+        "mailnews/base/src/nsMsgUtils.h"
       ]
     },
     "DISABLED_DeliveryDetachedThreadIdentity": {

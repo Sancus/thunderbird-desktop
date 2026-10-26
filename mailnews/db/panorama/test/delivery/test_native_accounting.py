@@ -131,23 +131,15 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 94)
-        pending_thread_keys = {"ThreadKeysPreserveMembershipAndDepthFirstOrder",
-            "EmptyThreadKeysReplaceOutput", "ThreadKeysPrepareError", "ThreadKeysFirstStepError",
-            "ThreadKeysErrorAfterSeedRow", "ThreadKeysFolderBindError", "ThreadKeysThreadBindError",
-            "ThreadKeysParentBindError"}
+        self.assertEqual(len(catalog["cases"]), 102)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
             names = re.findall(r"TEST_F\(\s*" + suite + r",\s*(\w+)\s*\)", source.read_text())
             filters = {suite + "." + name for name in names}
             selected = [c["filter"] for c in catalog["cases"] if c["filter"].startswith(suite + ".")]
-            pending = set()
-            if suite == "DISABLED_DeliveryCoreMessageExistence":
-                pending = {suite + "." + n for n in pending_thread_keys}
-            self.assertEqual(set(selected) | pending, filters)
-            self.assertFalse(set(selected) & pending)
-            self.assertEqual(len(selected) + len(pending), len(filters))
+            self.assertEqual(set(selected), filters)
+            self.assertEqual(len(selected), len(filters))
             for path in [declaration["source"], *declaration["source_dependencies"]]:
                 self.assertTrue((comm / path).is_file(), path)
                 self.assertIn(path, run_native.COMM_INPUTS)
@@ -177,7 +169,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 94)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 102)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -211,10 +203,13 @@ class NativeAccountingTests(unittest.TestCase):
                     "WarmRemovalUsesReturnedStoredFields",
                     "RemovalStepFailureRollsBackWithoutNotification",
                     "RemovalCommitFailureRollsBackWithoutNotification",
-                    "RemovalRejectsForeignTransaction"}
+                    "RemovalRejectsForeignTransaction",
+                    "ThreadKeysPreserveMembershipAndDepthFirstOrder", "EmptyThreadKeysReplaceOutput",
+                    "ThreadKeysFolderBindError", "ThreadKeysParentBindError", "ThreadKeysThreadBindError",
+                    "ThreadKeysPrepareError", "ThreadKeysFirstStepError", "ThreadKeysErrorAfterSeedRow"}
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in expected})
-        self.assertEqual(len(rows), 15)
+        self.assertEqual(len(rows), 23)
         self.assertEqual(native.CATALOG["suites"][suite]["source"],
                          "mailnews/db/panorama/test/gtest/TestDeliveryCoreMessageExistence.cpp")
         for row in rows:
@@ -292,6 +287,36 @@ class NativeAccountingTests(unittest.TestCase):
                 wrong[3]["test"] = "DISABLED_DeliveryCoreReferences.ExactTokensSurviveReopen"
                 self.reject(wrong)
                 self.assertFalse(native.check_log(self.log, suite + ".*", 0)["log_complete"])
+
+
+    def test_thread_query_controls_are_individually_selectable_without_runtime_credit(self):
+        suite = "DISABLED_DeliveryCoreMessageExistence"
+        names = {
+            "ThreadKeysPreserveMembershipAndDepthFirstOrder", "EmptyThreadKeysReplaceOutput",
+            "ThreadKeysFolderBindError", "ThreadKeysParentBindError", "ThreadKeysThreadBindError",
+            "ThreadKeysPrepareError", "ThreadKeysFirstStepError", "ThreadKeysErrorAfterSeedRow"}
+        rows = [c for c in native.CATALOG["cases"] if c["filter"] in {suite + "." + n for n in names}]
+        self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in names})
+        self.assertEqual(len(rows), 8)
+        for row in rows:
+            self.assertEqual(row["id"], "core-native:MessageExistence:" + row["filter"].split(".")[1])
+            self.selected = row["filter"]
+            for index in (1, 4):
+                self.events[index]["name"] = suite
+            for index in (2, 3):
+                self.events[index]["test"] = self.selected
+            result = self.check(self.events)
+            self.assertTrue(result["log_complete"])
+            self.assertEqual(result["coverage"], "none")
+            self.assertTrue(result["execution_hold"])
+            for index in (2, 3):
+                self.reject(self.events[:index] + self.events[index + 1:])
+                self.reject(self.events[:index] + [self.events[index]] + self.events[index:])
+            self.reject(self.events, timed_out=True)
+            self.reject(self.events, returncode=1)
+            wrong = copy.deepcopy(self.events)
+            wrong[3]["status"] = "SKIP"
+            self.reject(wrong)
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,11 @@ void PerFolderDatabase::OnMessageAdded(Message* message) {
     uint32_t flags;
     rv = message->GetFlags(&flags);
     NS_ENSURE_SUCCESS_VOID(rv);
-    NotifyHdrAddedAll(message, nsMsgKey_None, flags, nullptr);
+    nsMsgKey parent;
+    rv = message->GetThreadParent(&parent);
+    NS_ENSURE_SUCCESS_VOID(rv);
+    // Panorama stores an absent parent as zero.
+    NotifyHdrAddedAll(message, parent ? parent : nsMsgKey_None, flags, nullptr);
   }
 }
 

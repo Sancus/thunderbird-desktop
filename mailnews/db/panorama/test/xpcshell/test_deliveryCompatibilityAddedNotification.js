@@ -27,6 +27,56 @@ add_setup(function () {
   db = PanoramaDelivery.assertFolder(folder, lane);
 });
 
+add_task(function test_onHdrAddedWithoutParent() {
+  const noParentFolder = rootFolder
+    .createLocalSubfolder("notification-root")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const noParentDB = PanoramaDelivery.assertFolder(
+    noParentFolder,
+    PanoramaDelivery.expectedLane()
+  );
+  const added = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged() {},
+    onHdrDeleted() {},
+    onParentChanged() {},
+    onAnnouncerGoingAway() {},
+    onReadChanged() {},
+    onJunkScoreChanged() {},
+    onHdrPropertyChanged() {},
+    onEvent() {},
+    onHdrAdded(header, parent, flags, instigator) {
+      Assert.equal(header.threadParent, 0, "The root has no stored parent");
+      Assert.equal(
+        header.threadId,
+        header.messageKey,
+        "The root owns its thread"
+      );
+      Assert.equal(header.flags, 0, "The callback header has the root flags");
+      added.push([
+        header.messageKey,
+        header.folder.URI,
+        parent,
+        flags,
+        instigator,
+      ]);
+    },
+  };
+  noParentDB.addListener(listener);
+  registerCleanupFunction(() => noParentDB.removeListener(listener));
+
+  const root = noParentFolder.addMessage(
+    generator.makeMessage({ subject: "Notification root" }).toMessageString()
+  );
+  Assert.deepEqual(
+    added,
+    [[root.messageKey, noParentFolder.URI, 0xffffffff, 0, null]],
+    "Exactly one root addition uses the no-parent notification sentinel"
+  );
+  noParentDB.removeListener(listener);
+});
+
 add_task(function test_onHdrAddedIncludesParentAndFolder() {
   const first = generator.makeMessage({ subject: "Notification parent" });
   // The reply subject supplies HasRe; New is tracked in the DB new-message list.
@@ -49,6 +99,11 @@ add_task(function test_onHdrAddedIncludesParentAndFolder() {
     onHdrPropertyChanged() {},
     onEvent() {},
     onHdrAdded(header, parent, flags, instigator) {
+      Assert.equal(
+        header.threadParent,
+        root.messageKey,
+        "The callback header already has the committed reply parent"
+      );
       Assert.equal(
         flags,
         expectedFlags,

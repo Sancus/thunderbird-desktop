@@ -1,9 +1,9 @@
 # Manual native acceptance
 
 TestDeliveryCoreReferences.cpp (41 cases), TestDeliveryFolderInfoProperties.cpp
-(19), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties,
+(26), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties,
 6 DetachedThreadIdentity and 7 CompleteHeader), TestDeliveryCoreMessageExistence.cpp
-(24) and TestDeliveryCoreProperties.cpp (11) are linked here. All 137 filters
+(24) and TestDeliveryCoreProperties.cpp (11) are linked here. All 144 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
@@ -204,7 +204,7 @@ close/profile lifecycle and restored old-code negative controls remain NOTRUN.
 
 The ten complete native publication controls and seven CompleteHeader adapter
 controls precede one snapshot031 control, bringing the manual catalog to 120 before the six captured-data controls.
-The current catalog contains 137 filters.
+The current catalog contains 144 filters.
 Both existing source files are already in xul-gtest; all filters remain DISABLED and require exact isolated selection.
 Core publication binds the RawHdr declaration, named/default/extra/storage write
 path and helpers. CompleteHeader binds the detached/PerFolder/live adapters and
@@ -220,7 +220,7 @@ Snapshot031 adds only ConversationFilterRejectsThreadReadFailure, atomically wit
 its exact source and the nine-task Publication declaration. Its reached native
 getter writes a matching thread identity but returns failure; the filter must
 reject it while real matching/excluded controls and independent stored rows remain
-correct. This is not a SQL fault claim. All 137 cases remain manual/DISABLED and
+correct. This is not a SQL fault claim. All 144 cases remain manual/DISABLED and
 NOTRUN until matching compilation, isolated execution and close/profile evidence.
 
 ## Captured-data prerequisites
@@ -243,7 +243,7 @@ leak measurement are unchanged; no Windows or refcount qualification is added.
 ## Component discovery draft
 
 Eleven additional CoreReferences filters bind only component038 source c8f7d7ef.
-The 137-case catalog remains manual, DISABLED and NOTRUN. Source and registration
+The 144-case catalog remains manual, DISABLED and NOTRUN. Source and registration
 must land atomically after source acceptance and root checks; metadata alone and
 source alone fail the strict five-translation-unit inventory. The 047C captured
 source/126-case packet stays immutable. No extra JS case or readiness change is
@@ -265,3 +265,32 @@ generated headers, configuration/INIs and actual loaded image. Native compiler,
 query planner, fault sensitivity, restored negative controls and profile/close
 qualification remain NOTRUN. The helper is unwired: no AddMessage integration,
 graph mutation, queue, notification or native consumer qualification is implied.
+
+## KnownArts opaque property controls
+
+Seven additional FolderInfo filters bind corrected385 source and keep all144
+cases manual, DISABLED and NOTRUN. Source and registration must land atomically;
+source-only or metadata-only inventory fails. The original19 FolderInfo oracles,
+all137 prior native rows,176JS rows, seven holds and Publication9 are unchanged.
+The existing five-translation-unit build list needs no registration change.
+
+These raw-core cases have store none. They require owned non-null empty results,
+opaque UTF-8 bytes, a stable held copy, exact property aliases/folder scope and
+independent missing/present row counts. SQL faults require actual call count and
+folder ID, exact errors, cleared read output and preserved control values. Cold
+means checked same-process close/reconstruction for opaque and empty values, not
+application restart. An early failure supplies no later loop/fault/reopen credit.
+
+Receipts bind the public adapter/FolderInfo IDLs, concrete property storage,
+listener ownership and schema/fixture/close sources. Additional pinned inputs
+cover ToNewCString allocation/copy, nsCOMPtr, ScopeExit, the SQL witness variant
+IDL and the actual gtest fixture-subclass macro. These are source/API bindings,
+not configured compiler or allocation/fault/cleanup proof. Existing Linux-only,
+raw shutdown/profile/loaded-image and leak-unavailable gates remain unchanged.
+
+Compile/link, SQL fault sensitivity, ownership/close restoration, all19 original
+controls and restored alias/normalisation/error/null-result negatives remain
+NOTRUN. Preserve the source review limits: C-string NUL/missing-versus-empty,
+XPConnect, OOM/prepare/bind, configured SQLite and cold-reopen retention/leak or
+partial-reopen failure cascade remain unqualified. Full news/readSet/article
+mapping and GetDatabase QI remain HELD; no news011, graph or emission is admitted.

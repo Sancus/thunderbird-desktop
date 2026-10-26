@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 137)
+        self.assertEqual(len(catalog["cases"]), 144)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -170,7 +170,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 137)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 144)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -449,6 +449,51 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertTrue(required <= set(declaration["source_dependencies"]))
         self.assertEqual(declaration["source"],
                          "mailnews/db/panorama/test/gtest/TestDeliveryCoreReferences.cpp")
+
+
+    def test_known_arts_filters_require_exact_manual_case_and_lifecycle_sources(self):
+        suite = "DISABLED_DeliveryFolderInfoProperties"
+        names = {"KnownArtsMissingReturnsOwnedEmpty", "KnownArtsNullOutputFails",
+                 "KnownArtsOpaqueAliasIsFolderScoped", "KnownArtsEmptyAndNullRemainPresent",
+                 "KnownArtsReadStepFailureClearsOutput", "KnownArtsWriteAbortPreservesRows",
+                 "KnownArtsColdReopenRetainsValues"}
+        rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".KnownArts")]
+        self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in names})
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(len([c for c in native.CATALOG["cases"]
+                              if c["filter"].startswith(suite + ".")]), 26)
+        for row in rows:
+            self.assertEqual(row["id"], "compatibility-native:FolderInfo:" + row["filter"].partition(".")[2])
+            self.selected = row["filter"]
+            for index in (1, 4):
+                self.events[index]["name"] = suite
+            for index in (2, 3):
+                self.events[index]["test"] = self.selected
+            self.assertTrue(self.check(self.events)["log_complete"])
+            for missing in (2, 3):
+                self.reject(self.events[:missing] + self.events[missing + 1:])
+            wrong = copy.deepcopy(self.events)
+            wrong[3]["test"] = "DISABLED_DeliveryCoreReferences.ExactTokensSurviveReopen"
+            self.reject(wrong)
+            for status in ("SKIP", "FAIL"):
+                wrong = copy.deepcopy(self.events)
+                wrong[3]["status"] = status
+                self.reject(wrong)
+            self.reject(self.events, timed_out=True)
+            self.reject(self.events, returncode=1)
+        self.check(self.events)
+        for selected in (suite + ".*", self.selected + ":" + rows[0]["filter"]):
+            self.assertFalse(native.check_log(self.log, selected, 0)["log_complete"])
+        dependencies = set(native.CATALOG["suites"][suite]["source_dependencies"])
+        required = {"mailnews/db/panorama/" + name for name in (
+            "src/PerFolderDatabase.cpp", "src/PerFolderDatabase.h",
+            "src/DatabaseCore.cpp", "src/DatabaseCore.h", "src/FolderDatabase.cpp",
+            "src/FolderDatabase.h", "src/MessageDatabase.cpp", "src/MessageDatabase.h",
+            "public/nsIDatabaseCore.idl", "public/nsIFolderDatabase.idl",
+            "public/nsIMessageDatabase.idl", "test/gtest/moz.build")}
+        required.update({"mailnews/db/msgdb/public/nsIDBFolderInfo.idl",
+                         "mailnews/db/msgdb/public/nsIMsgDatabase.idl"})
+        self.assertTrue(required <= dependencies, required - dependencies)
 
 
 if __name__ == "__main__":

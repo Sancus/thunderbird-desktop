@@ -691,6 +691,41 @@
       "id": "core-native:ComponentDiscovery:DiscoverReadsStagedReferences",
       "filter": "DISABLED_DeliveryCoreReferences.DiscoverReadsStagedReferences",
       "expected": "Within a fixture-owned transaction, staged raw References connect the exact child/parent component without ending the transaction; rollback restores singleton membership and unshared original raw history."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:KnownArtsMissingReturnsOwnedEmpty",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsMissingReturnsOwnedEmpty",
+      "expected": "Missing knownArts returns a non-null caller-owned empty C string while an independent SQL count proves no property row was created."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:KnownArtsNullOutputFails",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsNullOutputFails",
+      "expected": "A null output pointer returns NS_ERROR_INVALID_POINTER."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:KnownArtsOpaqueAliasIsFolderScoped",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsOpaqueAliasIsFolderScoped",
+      "expected": "The opaque UTF-8 value is copied without parsing or aliasing; a later setter leaves the held copy unchanged, the literal knownArtsSet key/readSet/mailboxName and another folder retain their exact values."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:KnownArtsEmptyAndNullRemainPresent",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsEmptyAndNullRemainPresent",
+      "expected": "Writing empty or null stores an explicitly present knownArts row and returns a non-null owned empty string; the independent row count is one."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:KnownArtsReadStepFailureClearsOutput",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsReadStepFailureClearsOutput",
+      "expected": "A reached read-step UDF fails once for the actual folder ID, clears the output pointer and returns the exact error; removing the fault recovers the original value and unchanged readSet."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:KnownArtsWriteAbortPreservesRows",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsWriteAbortPreservesRows",
+      "expected": "A reached insert ABORT records one actual folder-ID call and returns the exact constraint error; the original opaque value, readSet and other folder value survive."
+    },
+    {
+      "id": "compatibility-native:FolderInfo:KnownArtsColdReopenRetainsValues",
+      "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsColdReopenRetainsValues",
+      "expected": "Opaque and empty values survive checked same-process core/connection close and reconstruction with exact row presence/readSet, core-release and close-barrier assertions; no application-restart claim."
     }
   ],
   "suites": {
@@ -731,7 +766,23 @@
         "mailnews/db/panorama/src/PerFolderDatabase.cpp",
         "mailnews/db/panorama/src/PerFolderDatabase.h",
         "mailnews/db/msgdb/public/nsIDBFolderInfo.idl",
-        "mailnews/db/msgdb/public/moz.build"
+        "mailnews/db/msgdb/public/moz.build",
+        "mailnews/db/panorama/src/DatabaseCore.cpp",
+        "mailnews/db/panorama/src/DatabaseCore.h",
+        "mailnews/db/panorama/src/FolderDatabase.cpp",
+        "mailnews/db/panorama/src/FolderDatabase.h",
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/src/DatabaseUtils.cpp",
+        "mailnews/db/panorama/src/DatabaseUtils.h",
+        "mailnews/db/panorama/public/nsIDatabaseCore.idl",
+        "mailnews/db/panorama/public/nsIFolderDatabase.idl",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/db/panorama/public/moz.build",
+        "mailnews/db/panorama/src/moz.build",
+        "mailnews/db/panorama/test/moz.build",
+        "mailnews/db/panorama/test/gtest/moz.build",
+        "mailnews/db/msgdb/public/nsIMsgDatabase.idl"
       ]
     },
     "DISABLED_DeliveryMessageReferences": {

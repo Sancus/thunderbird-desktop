@@ -19,6 +19,7 @@
 #include "nsIMsgDBView.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
+#include "nsReadableUtils.h"
 #include "nsServiceManagerUtils.h"
 #include "SearchFolderHits.h"
 #include "Thread.h"
@@ -1141,10 +1142,16 @@ NS_IMETHODIMP FolderInfo::SetMailboxName(const nsACString& aMailboxName) {
   return SetCharProperty("mailboxName", aMailboxName);
 }
 NS_IMETHODIMP FolderInfo::GetKnownArtsSet(char** aKnownArtsSet) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aKnownArtsSet);
+  *aKnownArtsSet = nullptr;
+  nsAutoCString value;
+  MOZ_TRY(GetCharProperty("knownArts", value));
+  *aKnownArtsSet = ToNewCString(value, mozilla::fallible);
+  return *aKnownArtsSet ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
 }
 NS_IMETHODIMP FolderInfo::SetKnownArtsSet(const char* aKnownArtsSet) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return SetCharProperty(
+      "knownArts", nsDependentCString(aKnownArtsSet ? aKnownArtsSet : ""));
 }
 NS_IMETHODIMP FolderInfo::GetFolderName(nsACString& aFolderName) {
   aFolderName = MOZ_TRY(FolderDB().GetFolderName(mFolderId));

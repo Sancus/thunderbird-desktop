@@ -10,16 +10,23 @@
 #include "DatabaseCore.h"
 #include "PerFolderDatabase.h"
 #include "gtest/gtest.h"
+#include "mozilla/ResultExtensions.h"
+#include "mozilla/ScopeExit.h"
 #include "mozilla/SpinEventLoopUntil.h"
 #include "mozIStorageConnection.h"
+#include "mozIStorageFunction.h"
+#include "mozIStorageStatement.h"
+#include "mozIStorageValueArray.h"
 #include "nsAppDirectoryServiceDefs.h"
 #include "nsCOMPtr.h"
+#include "nsComponentManagerUtils.h"
 #include "nsIDBFolderInfo.h"
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
 #include "nsIFolderDatabase.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIProperties.h"
+#include "nsIVariant.h"
 #include "nsServiceManagerUtils.h"
 #include "nsString.h"
 #include "nsThreadUtils.h"
@@ -193,6 +200,8 @@ class DeliveryFolderInfoProperties : public ::testing::Test {
     return DatabaseCore::sConnection.get();
   }
 
+  static bool CoreReleased() { return !DatabaseCore::sInstance; }
+
   static bool WaitForClose(nsIEventTarget* target) {
     sCloseCompleted = false;
     // Observe queues AsyncClose before this barrier, with no intervening spin.
@@ -253,6 +262,34 @@ class DeliveryFolderInfoProperties : public ::testing::Test {
 namespace {
 
 using DISABLED_DeliveryFolderInfoProperties = DeliveryFolderInfoProperties;
+
+class KnownArtsFaultWitness final : public mozIStorageFunction {
+ public:
+  NS_DECL_ISUPPORTS
+  explicit KnownArtsFaultWitness(bool fail = false) : mFail(fail) {}
+  uint32_t mCalls = 0;
+  int64_t mLastId = 0;
+  NS_IMETHOD OnFunctionCall(mozIStorageValueArray* args,
+                            nsIVariant** result) override {
+    ++mCalls;
+    MOZ_TRY(args->GetInt64(0, &mLastId));
+    if (mFail) {
+      return NS_ERROR_FAILURE;
+    }
+    nsCOMPtr<nsIWritableVariant> value =
+        do_CreateInstance("@mozilla.org/variant;1");
+    NS_ENSURE_STATE(value);
+    MOZ_TRY(value->SetAsInt32(0));
+    nsCOMPtr<nsIVariant> returned = value;
+    returned.forget(result);
+    return NS_OK;
+  }
+
+ private:
+  ~KnownArtsFaultWitness() = default;
+  bool mFail;
+};
+NS_IMPL_ISUPPORTS(KnownArtsFaultWitness, mozIStorageFunction)
 
 TEST_F(DISABLED_DeliveryFolderInfoProperties, MissingUsesDefault) {
   CheckRead(NS_OK, kDefault);
@@ -348,6 +385,232 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanMinInt64IsTrue) {
 TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanMaxInt64IsTrue) {
   ASSERT_NO_FATAL_FAILURE(Store(std::numeric_limits<int64_t>::max()));
   CheckBooleanRead(false, true);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       KnownArtsMissingReturnsOwnedEmpty) {
+  char* result = nullptr;
+  ASSERT_EQ(NS_OK, mInfo->GetKnownArtsSet(&result));
+  ASSERT_TRUE(result);
+  nsCString owned;
+  owned.Adopt(result);
+  EXPECT_TRUE(owned.IsEmpty());
+  nsCOMPtr<mozIStorageStatement> statement;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "SELECT count(*) FROM folder_properties "
+                       "WHERE id = :id AND name = 'knownArts'"_ns,
+                       getter_AddRefs(statement)));
+  ASSERT_EQ(NS_OK, statement->BindInt64ByName("id"_ns, mDatabase->FolderId()));
+  bool row;
+  ASSERT_EQ(NS_OK, statement->ExecuteStep(&row));
+  ASSERT_TRUE(row);
+  EXPECT_EQ(0, statement->AsInt32(0));
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties, KnownArtsNullOutputFails) {
+  EXPECT_EQ(NS_ERROR_INVALID_POINTER, mInfo->GetKnownArtsSet(nullptr));
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       KnownArtsOpaqueAliasIsFolderScoped) {
+  const nsLiteralCString opaque =
+      " 0007-0009,3,3-2,not-a-range,\xc3\xa9,e\xcc\x81 "_ns;
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("knownArts", opaque));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("knownArtsSet", "literal key"_ns));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("readSet", "2-4"_ns));
+  ASSERT_EQ(NS_OK, mInfo->SetMailboxName("Unchanged/InBoX"_ns));
+  uint64_t otherId;
+  ASSERT_EQ(NS_OK,
+            sFolders->InsertFolder(sRoot, "known-arts-other"_ns, &otherId));
+  RefPtr<PerFolderDatabase> otherDatabase =
+      new PerFolderDatabase(otherId, false);
+  nsCOMPtr<nsIDBFolderInfo> otherInfo;
+  auto cleanupOther = MakeScopeExit([&] {
+    otherInfo = nullptr;
+    sCore->MessageDB().RemoveMessageListener(otherDatabase);
+  });
+  ASSERT_EQ(NS_OK, otherDatabase->GetDBFolderInfo(getter_AddRefs(otherInfo)));
+  ASSERT_TRUE(otherInfo);
+  ASSERT_EQ(NS_OK, otherInfo->SetCharProperty("knownArts", "other group"_ns));
+  nsCString held;
+  ASSERT_EQ(NS_OK, mInfo->GetKnownArtsSet(getter_Copies(held)));
+  EXPECT_EQ(opaque, held);
+  ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet("9-1,0002,0002"));
+  EXPECT_EQ(opaque, held);
+  nsAutoCString value;
+  ASSERT_EQ(NS_OK, mInfo->GetCharProperty("knownArts", value));
+  EXPECT_EQ("9-1,0002,0002"_ns, value);
+  ASSERT_EQ(NS_OK, mInfo->GetCharProperty("knownArtsSet", value));
+  EXPECT_EQ("literal key"_ns, value);
+  ASSERT_EQ(NS_OK, mInfo->GetCharProperty("readSet", value));
+  EXPECT_EQ("2-4"_ns, value);
+  ASSERT_EQ(NS_OK, mInfo->GetMailboxName(value));
+  EXPECT_EQ("Unchanged/InBoX"_ns, value);
+  ASSERT_EQ(NS_OK, otherInfo->GetCharProperty("knownArts", value));
+  EXPECT_EQ("other group"_ns, value);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       KnownArtsEmptyAndNullRemainPresent) {
+  for (const char* empty : {"", static_cast<const char*>(nullptr)}) {
+    ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet("original"));
+    ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet(empty));
+    char* result = nullptr;
+    ASSERT_EQ(NS_OK, mInfo->GetKnownArtsSet(&result));
+    ASSERT_TRUE(result);
+    nsCString owned;
+    owned.Adopt(result);
+    EXPECT_TRUE(owned.IsEmpty());
+    nsCOMPtr<mozIStorageStatement> statement;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                         "SELECT count(*) FROM folder_properties "
+                         "WHERE id = :id AND name = 'knownArts'"_ns,
+                         getter_AddRefs(statement)));
+    ASSERT_EQ(NS_OK,
+              statement->BindInt64ByName("id"_ns, mDatabase->FolderId()));
+    bool row;
+    ASSERT_EQ(NS_OK, statement->ExecuteStep(&row));
+    ASSERT_TRUE(row);
+    EXPECT_EQ(1, statement->AsInt32(0));
+  }
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       KnownArtsReadStepFailureClearsOutput) {
+  ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet("original,0007"));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("readSet", "2-4"_ns));
+  RefPtr<KnownArtsFaultWitness> witness = new KnownArtsFaultWitness(true);
+  {
+    ASSERT_EQ(NS_OK,
+              Connection()->CreateFunction("known_arts_fault"_ns, 1, witness));
+    auto cleanup = MakeScopeExit([] {
+      EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                           "DROP VIEW IF EXISTS temp.folder_properties"_ns));
+      EXPECT_EQ(NS_OK, Connection()->RemoveFunction("known_arts_fault"_ns));
+    });
+    ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "CREATE TEMP VIEW folder_properties AS "
+                         "SELECT id, name, known_arts_fault(id) AS value "
+                         "FROM main.folder_properties"_ns));
+    nsCOMPtr<mozIStorageStatement> prepared;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                         "SELECT value FROM folder_properties "
+                         "WHERE id = :id AND name = :name"_ns,
+                         getter_AddRefs(prepared)));
+    ASSERT_EQ(NS_OK, prepared->Finalize());
+    EXPECT_EQ(0u, witness->mCalls);
+    char canary[] = "untouched";
+    char* result = canary;
+    EXPECT_EQ(NS_ERROR_FAILURE, mInfo->GetKnownArtsSet(&result));
+    nsCString owned;
+    if (result && result != canary) {
+      owned.Adopt(result);
+    }
+    EXPECT_EQ(nullptr, result);
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(int64_t(mDatabase->FolderId()), witness->mLastId);
+  }
+  nsCString value;
+  ASSERT_EQ(NS_OK, mInfo->GetKnownArtsSet(getter_Copies(value)));
+  EXPECT_EQ("original,0007"_ns, value);
+  ASSERT_EQ(NS_OK, mInfo->GetCharProperty("readSet", value));
+  EXPECT_EQ("2-4"_ns, value);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       KnownArtsWriteAbortPreservesRows) {
+  ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet("original,0007"));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("readSet", "2-4"_ns));
+  uint64_t otherId;
+  ASSERT_EQ(NS_OK, sFolders->InsertFolder(sRoot, "known-arts-write-control"_ns,
+                                          &otherId));
+  RefPtr<PerFolderDatabase> otherDatabase =
+      new PerFolderDatabase(otherId, false);
+  nsCOMPtr<nsIDBFolderInfo> otherInfo;
+  auto cleanupOther = MakeScopeExit([&] {
+    otherInfo = nullptr;
+    sCore->MessageDB().RemoveMessageListener(otherDatabase);
+  });
+  ASSERT_EQ(NS_OK, otherDatabase->GetDBFolderInfo(getter_AddRefs(otherInfo)));
+  ASSERT_TRUE(otherInfo);
+  ASSERT_EQ(NS_OK, otherInfo->SetCharProperty("knownArts", "other group"_ns));
+  RefPtr<KnownArtsFaultWitness> witness = new KnownArtsFaultWitness();
+  {
+    ASSERT_EQ(NS_OK,
+              Connection()->CreateFunction("known_arts_fault"_ns, 1, witness));
+    auto cleanup = MakeScopeExit([] {
+      EXPECT_EQ(NS_OK,
+                Connection()->ExecuteSimpleSQL(
+                    "DROP TRIGGER IF EXISTS temp.known_arts_write_fault"_ns));
+      EXPECT_EQ(NS_OK, Connection()->RemoveFunction("known_arts_fault"_ns));
+    });
+    ASSERT_EQ(NS_OK,
+              Connection()->ExecuteSimpleSQL(
+                  "CREATE TEMP TRIGGER known_arts_write_fault "
+                  "BEFORE INSERT ON main.folder_properties "
+                  "WHEN NEW.name = 'knownArts' BEGIN "
+                  "SELECT known_arts_fault(NEW.id); "
+                  "SELECT RAISE(ABORT, 'known arts write fault'); END"_ns));
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              mInfo->SetKnownArtsSet("replacement"));
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(int64_t(mDatabase->FolderId()), witness->mLastId);
+  }
+  nsCString value;
+  ASSERT_EQ(NS_OK, mInfo->GetKnownArtsSet(getter_Copies(value)));
+  EXPECT_EQ("original,0007"_ns, value);
+  ASSERT_EQ(NS_OK, mInfo->GetCharProperty("readSet", value));
+  EXPECT_EQ("2-4"_ns, value);
+  ASSERT_EQ(NS_OK, otherInfo->GetCharProperty("knownArts", value));
+  EXPECT_EQ("other group"_ns, value);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       KnownArtsColdReopenRetainsValues) {
+  const nsLiteralCString opaque = "0007-0009,3,3-2,\xc3\xa9,e\xcc\x81 "_ns;
+  for (const char* expected : {opaque.get(), ""}) {
+    ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet(expected));
+    ASSERT_EQ(NS_OK, mInfo->SetCharProperty("readSet", "2-4"_ns));
+    const uint64_t folderId = mDatabase->FolderId();
+    mInfo = nullptr;
+    sCore->MessageDB().RemoveMessageListener(mDatabase);
+    mDatabase = nullptr;
+    sFolders = nullptr;
+    nsCOMPtr<mozIStorageConnection> connection = Connection();
+    nsCOMPtr<nsIEventTarget> target = do_GetInterface(connection);
+    ASSERT_TRUE(target);
+    ASSERT_EQ(NS_OK, sCore->Observe(nullptr, "profile-before-change", nullptr));
+    sCore = nullptr;
+    ASSERT_TRUE(WaitForClose(target));
+    target = nullptr;
+    connection = nullptr;
+    ASSERT_FALSE(Connection());
+    ASSERT_TRUE(CoreReleased());
+    sCore = DatabaseCore::GetInstanceForService();
+    ASSERT_EQ(NS_OK, sCore->Startup());
+    ASSERT_EQ(NS_OK, sCore->GetFolderDB(getter_AddRefs(sFolders)));
+    mDatabase = new PerFolderDatabase(folderId, false);
+    ASSERT_EQ(NS_OK, mDatabase->GetDBFolderInfo(getter_AddRefs(mInfo)));
+    char* result = nullptr;
+    ASSERT_EQ(NS_OK, mInfo->GetKnownArtsSet(&result));
+    ASSERT_TRUE(result);
+    nsCString owned;
+    owned.Adopt(result);
+    EXPECT_STREQ(expected, owned.get());
+    nsAutoCString value;
+    ASSERT_EQ(NS_OK, mInfo->GetCharProperty("readSet", value));
+    EXPECT_EQ("2-4"_ns, value);
+    nsCOMPtr<mozIStorageStatement> statement;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                         "SELECT count(*) FROM folder_properties "
+                         "WHERE id = :id AND name = 'knownArts'"_ns,
+                         getter_AddRefs(statement)));
+    ASSERT_EQ(NS_OK, statement->BindInt64ByName("id"_ns, folderId));
+    bool row;
+    ASSERT_EQ(NS_OK, statement->ExecuteStep(&row));
+    ASSERT_TRUE(row);
+    EXPECT_EQ(1, statement->AsInt32(0));
+  }
 }
 
 }  // namespace

@@ -65,6 +65,12 @@ add_task(async function test_preservesNewsFolderIdentity() {
     saved instanceof Ci.nsIMsgNewsFolder,
     "Saved group is a news folder"
   );
+  Assert.ok(
+    new MsgKeySet(
+      saved.QueryInterface(Ci.nsIMsgNewsFolder).newsrcLine.split(":")[1].trim()
+    ).has(5001),
+    "The saved article read set is restored"
+  );
   Assert.equal(
     saved.parent.URI,
     rootFolder.URI,
@@ -109,12 +115,6 @@ add_task(async function test_preservesNewsFolderIdentity() {
       "Body path is stable"
     );
   }
-  Assert.ok(
-    new MsgKeySet(
-      saved.QueryInterface(Ci.nsIMsgNewsFolder).newsrcLine.split(":")[1].trim()
-    ).has(5001),
-    "The saved article read set is restored"
-  );
 
   const created = newsRoot.addNewsgroup("test.created", "6001");
   Assert.ok(

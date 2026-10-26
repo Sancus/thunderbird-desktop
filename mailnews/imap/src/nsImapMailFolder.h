@@ -28,6 +28,7 @@
 #include "nsAutoSyncState.h"
 
 class nsImapMoveCoalescer;
+class nsIFolderLookupService;
 class nsIMsgIdentity;
 class nsIMsgOfflineImapOperation;
 class nsIMsgThread;
@@ -218,6 +219,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
   NS_DECL_ISUPPORTS_INHERITED
 
   // nsIMsgFolder methods:
+  NS_IMETHOD GetName(nsACString& name) override;
+  NS_IMETHOD SetName(const nsACString& name) override;
   NS_IMETHOD GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) override;
 
   NS_IMETHOD UpdateFolder(nsIMsgWindow* aWindow) override;
@@ -362,6 +365,13 @@ class nsImapMailFolder : public nsMsgDBFolder,
  protected:
   virtual ~nsImapMailFolder();
   // Helper methods
+#ifdef MOZ_PANORAMA
+  nsresult CreatePanoramaClientSubfolderInfo(const nsACString& folderName,
+                                             char hierarchyDelimiter,
+                                             int32_t boxFlags,
+                                             bool suppressNotification);
+  void DiscardPanoramaDiscovery(nsIFolderLookupService* fls);
+#endif
   nsresult RenameSubFolders(nsIMsgWindow* msgWindow,
                             nsIMsgFolder* oldFolder) override;
   nsresult CreateFileForDB(const nsAString& userLeafName, nsIFile* baseDir,

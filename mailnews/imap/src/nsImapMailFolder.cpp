@@ -84,6 +84,11 @@
 #include "nsIObserverService.h"
 #include "nsIPropertyBag2.h"
 
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#  include "nsIFolderLookupService.h"
+#endif
+
 using mozilla::LazyLogModule;
 using mozilla::LogLevel;
 using mozilla::Preferences;
@@ -537,6 +542,11 @@ nsresult nsImapMailFolder::CreateSubFolders(nsIFile* path) {
 
 NS_IMETHODIMP nsImapMailFolder::GetSubFolders(
     nsTArray<RefPtr<nsIMsgFolder>>& folders) {
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Remote hierarchy comes from the database and LIST, never the body store.
+    return nsMsgDBFolder::GetSubFolders(folders);
+  }
+
   bool isServer;
   nsresult rv = GetIsServer(&isServer);
   NS_ENSURE_SUCCESS(rv, rv);
@@ -921,9 +931,175 @@ static nsresult StripSummarySuffix(nsIFile* dbPath, nsIFile** out) {
   return NS_OK;
 }
 
+#ifdef MOZ_PANORAMA
+static nsresult GetPanoramaFolderInfo(nsIMsgFolder* folder,
+                                      nsIDBFolderInfo** folderInfo) {
+  nsresult rv;
+  nsCOMPtr<nsIMsgDBService> service =
+      do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<nsIMsgDatabase> db;
+  rv = service->OpenFolderDB(folder, false, getter_AddRefs(db));
+  NS_ENSURE_SUCCESS(rv, rv);
+  return db->GetDBFolderInfo(folderInfo);
+}
+
+// Only used for a fresh, unpublished subtree created by this LIST attempt.
+void nsImapMailFolder::DiscardPanoramaDiscovery(nsIFolderLookupService* fls) {
+  for (nsIMsgFolder* child : mSubFolders) {
+    static_cast<nsImapMailFolder*>(child)->DiscardPanoramaDiscovery(fls);
+  }
+  MOZ_ALWAYS_SUCCEEDS(fls->EvictFolder(this));
+  SetParent(nullptr);
+  SetMsgDatabase(nullptr);
+  mSubFolders.Clear();
+}
+
+nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
+    const nsACString& folderName, char hierarchyDelimiter, int32_t boxFlags,
+    bool suppressNotification) {
+  NS_ENSURE_STATE(mFolderId);
+  NS_ENSURE_ARG(!folderName.IsEmpty());
+  int32_t slash = folderName.RFindChar('/');
+  if (slash > 0) {
+    nsAutoCString uri(mURI);
+    uri.Append('/');
+    uri.Append(Substring(folderName, 0, slash));
+    nsCOMPtr<nsIMsgFolder> parent;
+    nsresult rv = GetChildWithURI(uri, true, false, getter_AddRefs(parent));
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(parent, NS_MSG_ERROR_FOLDER_MISSING);
+    nsCOMPtr<nsIMsgImapMailFolder> imapParent = do_QueryInterface(parent, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    return imapParent->CreateClientSubfolderInfo(
+        Substring(folderName, slash + 1), hierarchyDelimiter, boxFlags,
+        suppressNotification);
+  }
+  // A literal leading slash needs a canonical-name/URI contract first.
+  NS_ENSURE_TRUE(slash == kNotFound, NS_ERROR_NOT_IMPLEMENTED);
+
+  RefPtr<mozilla::mailnews::DatabaseCore> core =
+      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+  auto& folderDB = core->FolderDB();
+  uint64_t id = MOZ_TRY(folderDB.GetFolderChildNamed(mFolderId, folderName));
+  if (!id) {
+    // The server row survives an object or metadata failure for the next LIST.
+    MOZ_TRY(folderDB.InsertFolder(mFolderId, folderName, &id));
+  }
+
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(GetCachedChild(id, getter_AddRefs(folder)));
+  bool fresh = !folder;
+  nsresult rv;
+  nsCOMPtr<nsIFolderLookupService> fls =
+      do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (fresh) {
+    folder =
+        do_CreateInstance("@mozilla.org/mail/folder-factory;1?name=imap", &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    // Failed instances are never reinitialized; the common initializer rolls
+    // back its own failed attempt, including descendant attachments/cache.
+    MOZ_TRY(folder->InitWithFolderId(id));
+  }
+  auto* child = static_cast<nsImapMailFolder*>(folder.get());
+  auto discard = mozilla::MakeScopeExit([&] {
+    if (fresh) child->DiscardPanoramaDiscovery(fls);
+  });
+
+  // Compare the common names-derived path with the parent's effective path.
+  // SetFilePath is not durable, so an override cannot silently be discarded.
+  nsCOMPtr<nsIFile> expectedPath;
+  MOZ_TRY(GetFilePath(getter_AddRefs(expectedPath)));
+  if (!mIsServer) MOZ_TRY(AddDirectorySeparator(expectedPath));
+  nsCString storedName = MOZ_TRY(folderDB.GetFolderName(id));
+  MOZ_TRY(expectedPath->Append(EncodeFilename(storedName)));
+  nsCOMPtr<nsIFile> actualPath;
+  MOZ_TRY(child->GetFilePath(getter_AddRefs(actualPath)));
+  bool samePath;
+  MOZ_TRY(actualPath->Equals(expectedPath, &samePath));
+  NS_ENSURE_TRUE(samePath, NS_ERROR_NOT_IMPLEMENTED);
+
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(GetPanoramaFolderInfo(child, getter_AddRefs(info)));
+  bool needsDefaults = !(child->mFlags & nsMsgFolderFlags::Mail);
+  nsAutoCString onlineName;
+  MOZ_TRY(GetOnlineName(onlineName));
+  nsAutoCString leaf(folderName);
+  if (hierarchyDelimiter != '/') nsImapUrl::UnescapeSlashes(leaf);
+  if (!onlineName.IsEmpty()) onlineName.Append(hierarchyDelimiter);
+  onlineName.Append(leaf);
+  if (boxFlags & kImapInbox) onlineName.AssignLiteral("INBOX");
+  MOZ_TRY(child->SetHierarchyDelimiter(hierarchyDelimiter));
+  MOZ_TRY(child->SetOnlineName(onlineName));
+  nsAutoString displayName;
+  MOZ_TRY(CopyFolderNameToUTF16(leaf, displayName));
+  MOZ_TRY(child->SetName(NS_ConvertUTF16toUTF8(displayName)));
+  MOZ_TRY(child->SetBoxFlags(boxFlags));
+
+  uint32_t flags = child->mFlags | nsMsgFolderFlags::Mail;
+  if (mIsServer && folderName.LowerCaseEqualsLiteral("inbox")) {
+    flags |= nsMsgFolderFlags::Inbox;
+  } else if (mIsServer || (mFlags & nsMsgFolderFlags::Inbox)) {
+    nsCOMPtr<nsIImapIncomingServer> server;
+    MOZ_TRY(GetImapIncomingServer(getter_AddRefs(server)));
+    nsMsgImapDeleteModel deleteModel;
+    MOZ_TRY(server->GetDeleteModel(&deleteModel));
+    nsAutoCString trashName;
+    MOZ_TRY(server->GetTrashFolderName(trashName));
+    if (deleteModel == nsMsgImapDeleteModels::MoveToTrash &&
+        folderName.Equals(trashName)) {
+      flags |= nsMsgFolderFlags::Trash;
+    }
+  }
+  if (needsDefaults) {
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    MOZ_TRY(GetServer(getter_AddRefs(server)));
+    bool offline;
+    MOZ_TRY(server->GetOfflineDownload(&offline));
+    if (offline &&
+        !(flags & (nsMsgFolderFlags::Trash | nsMsgFolderFlags::Junk))) {
+      flags |= nsMsgFolderFlags::Offline;
+    } else {
+      flags &= ~nsMsgFolderFlags::Offline;
+    }
+    flags |= nsMsgFolderFlags::Elided;
+    uint32_t imapFlags;
+    MOZ_TRY(info->GetUint32Property("imapFlags", 0, &imapFlags));
+    MOZ_TRY(info->SetUint32Property("imapFlags",
+                                    imapFlags | kImapMsgSupportUserFlag |
+                                        kImapMsgSupportForwardedFlag |
+                                        kImapMsgSupportMDNSentFlag));
+  }
+  MOZ_TRY(info->SetFlags(flags));
+  MOZ_TRY(child->SetFlags(flags));
+  MOZ_TRY(child->SetVerifiedAsOnlineFolder(true));
+  bool added = !mSubFolders.Contains(folder);
+  if (added) {
+    MOZ_TRY(child->SetParent(this));
+    mSubFolders.AppendObject(folder);
+  }
+  discard.release();
+  if (added && !suppressNotification) {
+    NotifyFolderAdded(child);
+    child->NotifyFolderEvent(kFolderCreateCompleted);
+    nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+        mozilla::components::FolderNotification::Service();
+    notifier->NotifyFolderAdded(child);
+  }
+  return NS_OK;
+}
+#endif
+
 NS_IMETHODIMP nsImapMailFolder::CreateClientSubfolderInfo(
     const nsACString& folderName, char hierarchyDelimiter, int32_t flags,
     bool suppressNotification) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return CreatePanoramaClientSubfolderInfo(folderName, hierarchyDelimiter,
+                                             flags, suppressNotification);
+  }
+#endif
   nsresult rv = NS_OK;
 
   // Get a directory based on our current path.
@@ -1143,6 +1319,14 @@ NS_IMETHODIMP nsImapMailFolder::GetOnlineDelimiter(char* onlineDelimiter) {
 
 NS_IMETHODIMP nsImapMailFolder::SetHierarchyDelimiter(
     char aHierarchyDelimiter) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
+    MOZ_TRY(info->SetUint32Property("hierDelim",
+                                    static_cast<uint8_t>(aHierarchyDelimiter)));
+  }
+#endif
   m_hierarchyDelimiter = aHierarchyDelimiter;
   return NS_OK;
 }
@@ -1165,6 +1349,18 @@ NS_IMETHODIMP nsImapMailFolder::GetHierarchyDelimiter(
       }
     }
   }
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
+    uint32_t delimiter;
+    MOZ_TRY(info->GetUint32Property(
+        "hierDelim", kOnlineHierarchySeparatorUnknown, &delimiter));
+    NS_ENSURE_TRUE(delimiter <= UINT8_MAX, NS_ERROR_ILLEGAL_VALUE);
+    *aHierarchyDelimiter = m_hierarchyDelimiter = static_cast<char>(delimiter);
+    return NS_OK;
+  }
+#endif
   // Avoid creating an empty summary file that is later to be orphaned when
   // subscribing to a folder.
   ReadDBFolderInfo(false, /* cacheOnly */ true);  // update cache first.
@@ -1237,6 +1433,13 @@ NS_IMETHODIMP nsImapMailFolder::SetBoxFlags(int32_t aBoxFlags) {
     newFlags |= nsMsgFolderFlags::Archive | nsMsgFolderFlags::AllMail;
   if (m_boxFlags & kImapArchive) newFlags |= nsMsgFolderFlags::Archive;
 
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
+    MOZ_TRY(info->SetFlags(newFlags));
+  }
+#endif
   mLockedFlags = newFlags & nsMsgFolderFlags::SpecialUse;
   SetFlags(newFlags);
   return NS_OK;
@@ -1995,8 +2198,56 @@ nsImapMailFolder::MarkMessagesFlagged(
   return rv;
 }
 
+NS_IMETHODIMP
+nsImapMailFolder::GetName(nsACString& name) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup() && !mIsServer) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
+    nsAutoCString displayName;
+    MOZ_TRY(info->GetCharProperty("imapDisplayName", displayName));
+    if (!displayName.IsEmpty()) {
+      name = displayName;
+      return NS_OK;
+    }
+  }
+#endif
+  return nsMsgDBFolder::GetName(name);
+}
+
+NS_IMETHODIMP
+nsImapMailFolder::SetName(const nsACString& name) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup() && !mIsServer) {
+    // LIST supplies a decoded display name, not a hierarchy rename. Keep the
+    // wire component used by InitWithFolderId for the URI and body path.
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
+    MOZ_TRY(info->SetCharProperty("imapDisplayName", name));
+    if (!mName.Equals(name)) {
+      mName = name;
+      NotifyPropertyChanged("Name"_ns, name, name);
+    }
+    return NS_OK;
+  }
+#endif
+  return nsMsgDBFolder::SetName(name);
+}
+
 NS_IMETHODIMP nsImapMailFolder::SetOnlineName(
     const nsACString& aOnlineFolderName) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
+    // Write the retry discriminator last: a partial failure must not make the
+    // next LIST believe both required names have already been stored.
+    MOZ_TRY(info->SetMailboxName(aOnlineFolderName));
+    MOZ_TRY(info->SetCharProperty("onlineName", aOnlineFolderName));
+    m_onlineFolderName = aOnlineFolderName;
+    return NS_OK;
+  }
+#endif
   nsresult rv;
   nsCOMPtr<nsIMsgDatabase> db;
   nsCOMPtr<nsIDBFolderInfo> folderInfo;
@@ -2018,6 +2269,16 @@ NS_IMETHODIMP nsImapMailFolder::SetOnlineName(
 }
 
 NS_IMETHODIMP nsImapMailFolder::GetOnlineName(nsACString& aOnlineFolderName) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetPanoramaFolderInfo(this, getter_AddRefs(info)));
+    nsAutoCString onlineName;
+    MOZ_TRY(info->GetCharProperty("onlineName", onlineName));
+    aOnlineFolderName = m_onlineFolderName = onlineName;
+    return NS_OK;
+  }
+#endif
   ReadDBFolderInfo(false);  // update cache first.
   aOnlineFolderName = m_onlineFolderName;
   return NS_OK;

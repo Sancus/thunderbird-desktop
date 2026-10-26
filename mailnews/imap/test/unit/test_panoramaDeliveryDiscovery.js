@@ -186,6 +186,77 @@ async function test_repeatedDiscoveryPreservesIdentity() {
   }
   PanoramaDelivery.assertFolder(parent, fixture.lane);
   PanoramaDelivery.assertFolder(child, fixture.lane);
+  if (fixture.core) {
+    const parentPath = parent.filePath;
+    const childPath = child.filePath.path;
+    const unsupportedPath = parentPath.clone();
+    unsupportedPath.leafName = "DifferentDeliveryParent";
+    let retryId;
+    parent.filePath = unsupportedPath;
+    try {
+      fixture.daemon.createMailbox("DeliveryParent/DeliveryRetry", {
+        subscribed: true,
+      });
+      Assert.deepEqual(
+        fixture.daemon.root.allChildren.map(mailbox => mailbox.fullName).sort(),
+        [
+          "DeliveryParent",
+          "DeliveryParent/DeliveryChild",
+          "DeliveryParent/DeliveryRetry",
+          "INBOX",
+        ]
+      );
+      await discover();
+      Assert.equal(
+        parent.getChildNamed("DeliveryRetry"),
+        null,
+        "An unsupported effective parent path cannot publish a child"
+      );
+      retryId = fixture.core.folderDB.getFolderChildNamed(
+        parent.id,
+        "DeliveryRetry"
+      );
+      Assert.greater(
+        retryId,
+        0,
+        "The server-known row survives the failed attempt"
+      );
+      Assert.equal(
+        MailServices.folderLookup.getFolderForURL(
+          parent.URI + "/DeliveryRetry"
+        ),
+        null,
+        "The failed object is absent from the live folder cache"
+      );
+      Assert.equal(parent.getChildNamed("DeliveryChild"), child);
+      Assert.equal(child.filePath.path, childPath);
+    } finally {
+      parent.filePath = parentPath;
+    }
+    await discover();
+    const retry = discoveredChild(
+      parent,
+      "DeliveryRetry",
+      parent.URI + "/DeliveryRetry"
+    );
+    Assert.equal(
+      retry.id,
+      retryId,
+      "Retry materializes the retained server row"
+    );
+    Assert.equal(retry.onlineName, "DeliveryParent/DeliveryRetry");
+    Assert.equal(retry.hierarchyDelimiter, "/");
+    const expectedPath = parentPath.clone();
+    expectedPath.leafName += ".sbd";
+    expectedPath.append("DeliveryRetry");
+    Assert.ok(retry.filePath.equals(expectedPath));
+    PanoramaDelivery.assertFolder(retry, fixture.lane);
+    await discover();
+    Assert.equal(parent.getChildNamed("DeliveryRetry"), retry);
+    Assert.equal(parent.getChildNamed("DeliveryChild"), child);
+    Assert.equal(child.filePath.path, childPath);
+    Assert.deepEqual([parent.id, child.id], ids);
+  }
   info('DELIVERY_PHASE {"phase":"imap-discovery-repeat-verified"}');
 }
 
@@ -240,8 +311,12 @@ async function test_discoveryReportsDelimiter() {
   );
   Assert.equal(parent.hierarchyDelimiter, "/");
   Assert.equal(child.hierarchyDelimiter, "/");
-  PanoramaDelivery.assertFolder(parent, fixture.lane);
-  PanoramaDelivery.assertFolder(child, fixture.lane);
+  const parentDB = PanoramaDelivery.assertFolder(parent, fixture.lane);
+  const childDB = PanoramaDelivery.assertFolder(child, fixture.lane);
+  if (fixture.core) {
+    Assert.equal(parentDB.dBFolderInfo.getUint32Property("hierDelim", 0), 47);
+    Assert.equal(childDB.dBFolderInfo.getUint32Property("hierDelim", 0), 47);
+  }
   info('DELIVERY_PHASE {"phase":"imap-discovery-delimiter-verified"}');
 }
 

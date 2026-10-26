@@ -3824,13 +3824,17 @@ nsMsgViewIndex nsMsgDBView::FindHdr(nsIMsgDBHdr* msgHdr,
   }
 
   nsMsgKey msgKey;
-  nsCOMPtr<nsIMsgFolder> folder;
-  if (NS_FAILED(msgHdr->GetMessageKey(&msgKey)) ||
-      NS_FAILED(msgHdr->GetFolder(getter_AddRefs(folder))) || !folder) {
+  if (NS_FAILED(msgHdr->GetMessageKey(&msgKey))) {
     return nsMsgViewIndex_None;
   }
   nsMsgViewIndex viewIndex = m_keys.IndexOf(msgKey, startIndex);
-  if (!IsValidIndex(viewIndex) || GetFolderForViewIndex(viewIndex) != folder) {
+  if (!IsValidIndex(viewIndex)) {
+    return nsMsgViewIndex_None;
+  }
+
+  nsCOMPtr<nsIMsgFolder> folder;
+  if (NS_FAILED(msgHdr->GetFolder(getter_AddRefs(folder))) || !folder ||
+      GetFolderForViewIndex(viewIndex) != folder) {
     return nsMsgViewIndex_None;
   }
 

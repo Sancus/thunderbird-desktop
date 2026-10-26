@@ -1608,4 +1608,65 @@ void MessageListener::DeliverThreadBatch(const PreparedThreadBatch& prepared) {
                              batch.notifyLegacy);
 }
 
+nsresult MessageDatabase::DiscoverConversationComponent(
+    nsMsgKey key, nsTArray<ConversationMember>& output) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "DiscoverConversationComponent"_ns,
+      "WITH availability(seedExists, unknownHistory) AS ("
+      "SELECT EXISTS(SELECT 1 FROM messages WHERE id = :id), "
+      "EXISTS(SELECT 1 FROM messages m LEFT JOIN message_reference_sets s "
+      "ON s.id = m.id WHERE s.id IS NULL)"
+      "), direct(id) AS ("
+      "SELECT id FROM messages WHERE id = :id "
+      "UNION SELECT p.id FROM message_references r "
+      "JOIN messages p ON p.messageId = r.token COLLATE BINARY "
+      "WHERE r.id = :id AND r.token <> '' "
+      "UNION SELECT child.id FROM messages added "
+      "JOIN message_references r ON r.token = added.messageId COLLATE BINARY "
+      "JOIN messages child ON child.id = r.id "
+      "WHERE added.id = :id AND added.messageId <> '' "
+      "UNION SELECT sibling.id FROM message_references incoming "
+      "JOIN message_references existing "
+      "ON existing.token = incoming.token COLLATE BINARY "
+      "JOIN messages sibling ON sibling.id = existing.id "
+      "WHERE incoming.id = :id AND incoming.token <> ''"
+      ") SELECT a.seedExists, a.unknownHistory, m.id, m.folderId "
+      "FROM availability a LEFT JOIN messages m "
+      "ON a.seedExists AND NOT a.unknownHistory AND ("
+      "m.id IN (SELECT id FROM direct) OR m.threadId IN ("
+      "SELECT old.threadId FROM messages old JOIN direct ON direct.id = old.id "
+      "WHERE old.threadId <> 0)) ORDER BY m.id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+  int32_t exists, unavailable;
+  MOZ_TRY(stmt->GetInt32(0, &exists));
+  MOZ_TRY(stmt->GetInt32(1, &unavailable));
+  NS_ENSURE_TRUE(exists, NS_ERROR_UNEXPECTED);
+  // Lost history anywhere could hide a reverse or shared-token edge.
+  NS_ENSURE_TRUE(!unavailable, NS_ERROR_NOT_AVAILABLE);
+
+  nsTArray<ConversationMember> result;
+  do {
+    int64_t id, folderId;
+    MOZ_TRY(stmt->GetInt64(2, &id));
+    MOZ_TRY(stmt->GetInt64(3, &folderId));
+    NS_ENSURE_TRUE(
+        id > 0 && id < static_cast<int64_t>(nsMsgKey_None) && folderId > 0,
+        NS_ERROR_FILE_CORRUPTED);
+    ConversationMember member{static_cast<nsMsgKey>(id),
+                              static_cast<uint64_t>(folderId)};
+    if (!result.AppendElement(member, fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    MOZ_TRY(stmt->ExecuteStep(&more));
+  } while (more);
+  output.SwapElements(result);
+  return NS_OK;
+}
+
 }  // namespace mozilla::mailnews

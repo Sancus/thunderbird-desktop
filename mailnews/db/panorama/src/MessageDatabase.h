@@ -22,6 +22,12 @@ namespace mozilla::mailnews {
 class Folder;
 class Message;
 
+// Physical identity only; never a Message-ID or protocol UID.
+struct ConversationMember {
+  nsMsgKey id{nsMsgKey_None};
+  uint64_t folderId{0};
+};
+
 // Owned native fields corresponding to one CreateJSMessage row.
 struct CapturedMessage {
   nsMsgKey id{nsMsgKey_None};
@@ -109,6 +115,14 @@ class MessageDatabase : public nsIMessageDatabase {
   // Reads stored facts directly, including uncommitted owned changes.
   // Missing row: NS_ERROR_UNEXPECTED. On failure output is unchanged.
   nsresult CaptureMessage(nsMsgKey key, CapturedMessage& output);
+
+  // Unwired insertion discovery: direct edges plus whole stored components.
+  // Requires known References history for every visible row; otherwise
+  // NS_ERROR_NOT_AVAILABLE. Missing seed: NS_ERROR_UNEXPECTED.
+  // Reads owned staging without changing cache/transactions.
+  // On failure output is unchanged.
+  nsresult DiscoverConversationComponent(nsMsgKey key,
+                                         nsTArray<ConversationMember>& output);
 
   // A bunch of oddly-specific functions here purely to support implementing
   // legacy message interfaces (nsIMsgDBHdr and friends).

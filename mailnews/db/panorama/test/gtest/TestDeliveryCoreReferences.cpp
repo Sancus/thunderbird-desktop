@@ -1549,5 +1549,346 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ("subject"_ns, text);
 }
 
+nsresult MakeDiscoveryFolders(DatabaseCore& core, uint64_t& a, uint64_t& b) {
+  uint64_t root;
+  MOZ_TRY(core.FolderDB().InsertRoot("discovery"_ns, &root));
+  MOZ_TRY(core.FolderDB().InsertFolder(root, "A"_ns, &a));
+  return core.FolderDB().InsertFolder(root, "B"_ns, &b);
+}
+
+nsresult AddDiscoveryMessage(MessageDatabase& db, uint64_t folderId,
+                             const nsACString& messageId,
+                             const nsTArray<nsCString>& references,
+                             nsMsgKey& key,
+                             const nsACString& subject = "subject"_ns) {
+  RawHdr header;
+  header.messageId = messageId;
+  header.references = references.Clone();
+  header.date = 1700000000000000;
+  header.sender = "sender@conversation.invalid"_ns;
+  header.recipients = "recipient@conversation.invalid"_ns;
+  header.subject = subject;
+  return db.AddMessage(folderId, header, true, &key);
+}
+
+void ExpectDiscovery(MessageDatabase& db, nsMsgKey seed,
+                     const nsTArray<ConversationMember>& expected) {
+  nsTArray<ConversationMember> actual;
+  ASSERT_EQ(NS_OK, db.DiscoverConversationComponent(seed, actual));
+  ASSERT_EQ(expected.Length(), actual.Length());
+  for (size_t i = 1; i < actual.Length(); ++i) {
+    EXPECT_LT(actual[i - 1].id, actual[i].id);
+  }
+  for (const auto& member : expected) {
+    uint32_t matches = 0;
+    for (const auto& found : actual) {
+      if (found.id == member.id) {
+        ++matches;
+        EXPECT_EQ(member.folderId, found.folderId);
+      }
+    }
+    EXPECT_EQ(1u, matches);
+  }
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverOrderedCrossFolder) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Ordered conversation");
+  nsMsgKey root, reply, tail, unrelated;
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, a, "ordered-root@conversation.invalid"_ns,
+                                {}, root, subject));
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, b, "ordered-reply@conversation.invalid"_ns,
+                                {"ordered-root@conversation.invalid"_ns}, reply,
+                                subject));
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, a, "ordered-tail@conversation.invalid"_ns,
+                                {"ordered-root@conversation.invalid"_ns,
+                                 "ordered-reply@conversation.invalid"_ns},
+                                tail, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "ordered-unrelated@conversation.invalid"_ns, {},
+                       unrelated, subject));
+  for (nsMsgKey seed : {root, reply, tail}) {
+    ExpectDiscovery(db, seed, {{root, a}, {reply, b}, {tail, a}});
+  }
+  ExpectDiscovery(db, unrelated, {{unrelated, b}});
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, Stored(tail, stored));
+  EXPECT_EQ((nsTArray<nsCString>{"ordered-root@conversation.invalid"_ns,
+                                 "ordered-reply@conversation.invalid"_ns}),
+            stored);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReplyBeforeParent) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Reply before parent");
+  nsMsgKey unrelated, reply, parent;
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "reply-first-unrelated@conversation.invalid"_ns,
+                       {}, unrelated, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "reply-first-child@conversation.invalid"_ns,
+                       {"reply-first-parent@conversation.invalid"_ns}, reply,
+                       subject));
+  ExpectDiscovery(db, reply, {{reply, b}});
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "reply-first-parent@conversation.invalid"_ns, {},
+                       parent, subject));
+  for (nsMsgKey seed : {reply, parent}) {
+    ExpectDiscovery(db, seed, {{reply, b}, {parent, a}});
+  }
+  ExpectDiscovery(db, unrelated, {{unrelated, a}});
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverSiblingsWithoutParent) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Siblings without parent");
+  nsMsgKey unrelated, first, second;
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(
+                db, a, "siblings-missing-unrelated@conversation.invalid"_ns, {},
+                unrelated, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "siblings-missing-first@conversation.invalid"_ns,
+                       {"siblings-missing-parent@conversation.invalid"_ns},
+                       first, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "siblings-missing-second@conversation.invalid"_ns,
+                       {"siblings-missing-parent@conversation.invalid"_ns},
+                       second, subject));
+  for (nsMsgKey seed : {first, second}) {
+    ExpectDiscovery(db, seed, {{first, a}, {second, b}});
+  }
+  ExpectDiscovery(db, unrelated, {{unrelated, a}});
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverSiblingsThenParent) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Siblings then parent");
+  nsMsgKey first, second, unrelated, parent;
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "siblings-late-first@conversation.invalid"_ns,
+                       {"siblings-late-parent@conversation.invalid"_ns}, first,
+                       subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "siblings-late-second@conversation.invalid"_ns,
+                       {"siblings-late-parent@conversation.invalid"_ns}, second,
+                       subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "siblings-late-unrelated@conversation.invalid"_ns,
+                       {}, unrelated, subject));
+  // Exercise the late arrival independently of the missing-parent assertion.
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "siblings-late-parent@conversation.invalid"_ns,
+                       {}, parent, subject));
+  for (nsMsgKey seed : {first, second, parent}) {
+    ExpectDiscovery(db, seed, {{first, a}, {second, b}, {parent, a}});
+  }
+  ExpectDiscovery(db, unrelated, {{unrelated, b}});
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverDuplicatePhysicalCopies) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  nsMsgKey first, second, child, unrelated;
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, a, "duplicate@invalid"_ns, {}, first));
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, b, "duplicate@invalid"_ns, {}, second));
+  ASSERT_NE(first, second);
+  ExpectDiscovery(db, first, {{first, a}});
+  ExpectDiscovery(db, second, {{second, b}});
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, b, "unrelated@invalid"_ns, {}, unrelated));
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, a, "child@invalid"_ns,
+                                {"duplicate@invalid"_ns, ""_ns,
+                                 "absent@invalid"_ns, "duplicate@invalid"_ns},
+                                child));
+  ExpectDiscovery(db, child, {{first, a}, {second, b}, {child, a}});
+  ExpectDiscovery(db, unrelated, {{unrelated, b}});
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, Stored(child, stored));
+  EXPECT_EQ((nsTArray<nsCString>{"duplicate@invalid"_ns, ""_ns,
+                                 "absent@invalid"_ns, "duplicate@invalid"_ns}),
+            stored);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverWholeStoredComponent) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey root, child, incoming;
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, mFolderId, "root@invalid"_ns, {}, root));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(db, mFolderId, "child@invalid"_ns,
+                                       {"root@invalid"_ns}, child));
+  CapturedMessage rootRow, childRow;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(root, rootRow));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(child, childRow));
+  ASSERT_NE(0u, rootRow.threadId);
+  ASSERT_EQ(rootRow.threadId, childRow.threadId);
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(child, {}));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(db, mFolderId, "incoming@invalid"_ns,
+                                       {"child@invalid"_ns}, incoming));
+  ExpectDiscovery(
+      db, incoming,
+      {{root, mFolderId}, {child, mFolderId}, {incoming, mFolderId}});
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverExactReferenceTokens) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey first, same, lower, spaced, composed, decomposed, emptyA, emptyB;
+  ASSERT_EQ(NS_OK, Add("first@invalid"_ns, {"Missing@invalid"_ns}, first));
+  ASSERT_EQ(NS_OK, Add("same@invalid"_ns, {"Missing@invalid"_ns}, same));
+  ASSERT_EQ(NS_OK, Add("lower@invalid"_ns, {"missing@invalid"_ns}, lower));
+  ASSERT_EQ(NS_OK, Add("spaced@invalid"_ns, {" Missing@invalid"_ns}, spaced));
+  ASSERT_EQ(NS_OK,
+            Add("composed@invalid"_ns, {"caf\xc3\xa9@invalid"_ns}, composed));
+  ASSERT_EQ(NS_OK, Add("decomposed@invalid"_ns, {"cafe\xcc\x81@invalid"_ns},
+                       decomposed));
+  ASSERT_EQ(NS_OK, Add(""_ns, {}, emptyA));
+  ASSERT_EQ(NS_OK, Add(""_ns, {}, emptyB));
+  CapturedMessage emptyRowA, emptyRowB;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(emptyA, emptyRowA));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(emptyB, emptyRowB));
+  ASSERT_NE(0u, emptyRowA.threadId);
+  ASSERT_NE(0u, emptyRowB.threadId);
+  ASSERT_NE(emptyRowA.threadId, emptyRowB.threadId);
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(emptyA, {""_ns}));
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(emptyB, {""_ns}));
+  for (nsMsgKey key : {emptyA, emptyB}) {
+    nsTArray<nsCString> emptyReferences;
+    ASSERT_EQ(NS_OK, Stored(key, emptyReferences));
+    ASSERT_EQ(1u, emptyReferences.Length());
+    EXPECT_EQ((nsTArray<nsCString>{""_ns}), emptyReferences);
+  }
+  ExpectDiscovery(db, first, {{first, mFolderId}, {same, mFolderId}});
+  for (nsMsgKey seed : {lower, spaced, composed, decomposed, emptyA, emptyB}) {
+    ExpectDiscovery(db, seed, {{seed, mFolderId}});
+  }
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, Stored(decomposed, stored));
+  EXPECT_EQ((nsTArray<nsCString>{"cafe\xcc\x81@invalid"_ns}), stored);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverMissingRowPreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<ConversationMember> output{{0xfffffff0, 0x123456789ULL}};
+  EXPECT_EQ(NS_ERROR_UNEXPECTED,
+            mCore->MessageDB().DiscoverConversationComponent(0, output));
+  ASSERT_EQ(1u, output.Length());
+  EXPECT_EQ(0xfffffff0u, output[0].id);
+  EXPECT_EQ(0x123456789ULL, output[0].folderId);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       DiscoverUnavailableHistoryPreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey known, unknown;
+  ASSERT_EQ(NS_OK, Add("known@invalid"_ns, {}, known));
+  ASSERT_EQ(NS_OK, Add("unknown@invalid"_ns, {}, unknown));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                       "DELETE FROM message_reference_sets WHERE id = :id"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, unknown));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  nsTArray<ConversationMember> output{{0xfffffff0, 0x123456789ULL}};
+  // Even unrelated lost history could hide a reverse/shared edge.
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.DiscoverConversationComponent(known, output));
+  ASSERT_EQ(1u, output.Length());
+  EXPECT_EQ(0xfffffff0u, output[0].id);
+  EXPECT_EQ(0x123456789ULL, output[0].folderId);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.DiscoverConversationComponent(unknown, output));
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(unknown, {}));
+  ExpectDiscovery(db, known, {{known, mFolderId}});
+  ExpectDiscovery(db, unknown, {{unknown, mFolderId}});
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReadErrorPreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("discovery-control@invalid"_ns, {}, control));
+  ExpectDiscovery(db, control, {{control, mFolderId}});
+  RefPtr<CaptureReadAbort> fault = new CaptureReadAbort();
+  nsCOMPtr<mozIStorageProgressHandler> previous;
+  ASSERT_EQ(NS_OK, mConnection->SetProgressHandler(1, fault,
+                                                   getter_AddRefs(previous)));
+  auto cleanup = MakeScopeExit([&] {
+    nsCOMPtr<mozIStorageProgressHandler> removed;
+    EXPECT_EQ(NS_OK,
+              mConnection->RemoveProgressHandler(getter_AddRefs(removed)));
+  });
+  EXPECT_FALSE(previous);
+  nsTArray<ConversationMember> output{{0xfffffff0, 0x123456789ULL}};
+  EXPECT_EQ(NS_ERROR_ABORT, db.DiscoverConversationComponent(control, output));
+  EXPECT_GT(fault->mCalls, 0u);
+  EXPECT_EQ(1u, fault->mAborts);
+  ASSERT_EQ(1u, output.Length());
+  EXPECT_EQ(0xfffffff0u, output[0].id);
+  EXPECT_EQ(0x123456789ULL, output[0].folderId);
+  nsCOMPtr<mozIStorageProgressHandler> removed;
+  ASSERT_EQ(NS_OK, mConnection->RemoveProgressHandler(getter_AddRefs(removed)));
+  cleanup.release();
+  EXPECT_EQ(fault.get(), removed.get());
+  ExpectDiscovery(db, control, {{control, mFolderId}});
+  bool inTransaction = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&inTransaction));
+  EXPECT_FALSE(inTransaction);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReadsStagedReferences) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey child, parent;
+  ASSERT_EQ(NS_OK, Add("child@invalid"_ns, {"absent@invalid"_ns}, child));
+  ASSERT_EQ(NS_OK, Add("present@invalid"_ns, {}, parent));
+  ExpectDiscovery(db, child, {{child, mFolderId}});
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, mConnection->RollbackTransaction()); });
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->CreateStatement(
+          "UPDATE message_references SET token = 'present@invalid' WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, child));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  ExpectDiscovery(db, child, {{child, mFolderId}, {parent, mFolderId}});
+  bool inTransaction = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&inTransaction));
+  EXPECT_TRUE(inTransaction);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  rollback.release();
+  ExpectDiscovery(db, child, {{child, mFolderId}});
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, Stored(child, stored));
+  EXPECT_EQ((nsTArray<nsCString>{"absent@invalid"_ns}), stored);
+}
+
 }  // namespace
 }  // namespace mozilla::mailnews

@@ -636,6 +636,61 @@
       "id": "core-native:CapturedThread:CaptureReadsStagedSqlWithoutCacheMutation",
       "filter": "DISABLED_DeliveryCoreReferences.CaptureReadsStagedSqlWithoutCacheMutation",
       "expected": "Fixture-owned transaction updates subject only; capture reads staged SQL, live cached header retains committed subject, transaction stays open. Explicit rollback restores capture and independent unshared SQL. No product derived-thread UPDATE or cache mutation introduced."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverOrderedCrossFolder",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverOrderedCrossFolder",
+      "expected": "Ordered cross-folder parent, reply and tail return exactly their physical keys/folders from each seed; an unrelated same-subject row stays separate and an unshared reader retains ordered raw References."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverReplyBeforeParent",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverReplyBeforeParent",
+      "expected": "A reply is initially a singleton; after the parent arrives both physical rows are discovered from either seed while the same-subject control stays separate."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverSiblingsWithoutParent",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverSiblingsWithoutParent",
+      "expected": "Two physical siblings sharing an absent parent token form exactly the two-row component; an unrelated same-subject row remains separate."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverSiblingsThenParent",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverSiblingsThenParent",
+      "expected": "After a shared-token siblings' parent arrives, each of the three seeds discovers the same exact physical membership; the unrelated control stays separate."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverDuplicatePhysicalCopies",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverDuplicatePhysicalCopies",
+      "expected": "Duplicate own Message-IDs initially remain distinct singletons. A referencing child discovers both physical copies with their actual folders; raw duplicate, empty and unresolved tokens remain exact."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverWholeStoredComponent",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverWholeStoredComponent",
+      "expected": "Discovery includes every member of an already stored component even after the child's References are cleared; checked stored thread identities establish the precondition."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverExactReferenceTokens",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverExactReferenceTokens",
+      "expected": "Exact case, leading space and NFC/NFD tokens remain distinct. Empty-own-ID rows first prove distinct stored components; exact raw empty tokens are preserved without connecting them."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverMissingRowPreservesOutput",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverMissingRowPreservesOutput",
+      "expected": "A missing seed returns NS_ERROR_UNEXPECTED and preserves the nondefault key and full-width folder sentinel."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverUnavailableHistoryPreservesOutput",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverUnavailableHistoryPreservesOutput",
+      "expected": "A reached missing-history row blocks both known and unknown seeds with NS_ERROR_NOT_AVAILABLE; known-seed output remains unchanged and restoring known-empty history permits exact singleton recovery."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverReadErrorPreservesOutput",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverReadErrorPreservesOutput",
+      "expected": "A prewarmed discovery reaches the SQL progress handler, aborts exactly once and preserves output sentinels; removing the actual handler permits exact recovery without a transaction."
+    },
+    {
+      "id": "core-native:ComponentDiscovery:DiscoverReadsStagedReferences",
+      "filter": "DISABLED_DeliveryCoreReferences.DiscoverReadsStagedReferences",
+      "expected": "Within a fixture-owned transaction, staged raw References connect the exact child/parent component without ending the transaction; rollback restores singleton membership and unshared original raw history."
     }
   ],
   "suites": {

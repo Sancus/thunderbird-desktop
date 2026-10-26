@@ -690,5 +690,32 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
 
 
+    def test_component_receipt_requires_schema_writer_fixture_and_storage_apis(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        dependencies = ["comm/mailnews/db/panorama/" + name for name in (
+            "src/MessageDatabase.cpp", "src/MessageDatabase.h", "src/DatabaseCore.cpp",
+            "src/DatabaseCore.h", "src/Message.cpp", "src/Message.h", "src/FolderDatabase.cpp",
+            "src/FolderDatabase.h", "src/DatabaseUtils.cpp", "src/DatabaseUtils.h",
+            "test/gtest/TestDeliveryCoreReferences.cpp", "test/gtest/moz.build")]
+        dependencies += ["storage/mozIStorageConnection.idl", "storage/mozIStorageAsyncConnection.idl",
+                         "storage/mozIStorageStatement.idl",
+                         "storage/mozIStorageProgressHandler.idl", "storage/mozStorageStatement.cpp",
+                         "xpcom/ds/nsTArray.h", "mfbt/fallible.h"]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)), patch.object(runner, "verify") as verify):
+            for relative in dependencies:
+                path = str(Path(config["source"]) / relative)
+                with self.subTest(path=relative):
+                    self.assertIn(path, receipt["inputs"])
+                    identity = receipt["inputs"].pop(path)
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic()+5)
+                    receipt["inputs"][path] = identity
+            verify.assert_not_called()
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
+
+
 if __name__ == "__main__":
     unittest.main()

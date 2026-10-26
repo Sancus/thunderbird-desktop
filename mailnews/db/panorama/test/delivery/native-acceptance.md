@@ -1,9 +1,9 @@
 # Manual native acceptance
 
-TestDeliveryCoreReferences.cpp (30 cases), TestDeliveryFolderInfoProperties.cpp
+TestDeliveryCoreReferences.cpp (41 cases), TestDeliveryFolderInfoProperties.cpp
 (19), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties,
 6 DetachedThreadIdentity and 7 CompleteHeader), TestDeliveryCoreMessageExistence.cpp
-(24) and TestDeliveryCoreProperties.cpp (11) are linked here. All 126 filters
+(24) and TestDeliveryCoreProperties.cpp (11) are linked here. All 137 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
@@ -204,7 +204,7 @@ close/profile lifecycle and restored old-code negative controls remain NOTRUN.
 
 The ten complete native publication controls and seven CompleteHeader adapter
 controls precede one snapshot031 control, bringing the manual catalog to 120 before the six captured-data controls.
-The current catalog contains 126 filters.
+The current catalog contains 137 filters.
 Both existing source files are already in xul-gtest; all filters remain DISABLED and require exact isolated selection.
 Core publication binds the RawHdr declaration, named/default/extra/storage write
 path and helpers. CompleteHeader binds the detached/PerFolder/live adapters and
@@ -220,7 +220,7 @@ Snapshot031 adds only ConversationFilterRejectsThreadReadFailure, atomically wit
 its exact source and the nine-task Publication declaration. Its reached native
 getter writes a matching thread identity but returns failure; the filter must
 reject it while real matching/excluded controls and independent stored rows remain
-correct. This is not a SQL fault claim. All 126 cases remain manual/DISABLED and
+correct. This is not a SQL fault claim. All 137 cases remain manual/DISABLED and
 NOTRUN until matching compilation, isolated execution and close/profile evidence.
 
 ## Captured-data prerequisites
@@ -239,3 +239,29 @@ compiler qualification. Matching generated headers, toolchain/build configuratio
 xul-gtest linkage, fault sensitivity, actual loaded-image proof, full shutdown and
 profile/close qualification remain required. Linux-only execution and unavailable
 leak measurement are unchanged; no Windows or refcount qualification is added.
+
+## Component discovery draft
+
+Eleven additional CoreReferences filters bind only component038 source c8f7d7ef.
+The 137-case catalog remains manual, DISABLED and NOTRUN. Source and registration
+must land atomically after source acceptance and root checks; metadata alone and
+source alone fail the strict five-translation-unit inventory. The 047C captured
+source/126-case packet stays immutable. No extra JS case or readiness change is
+included, and optional 047 A/B composition does not change these native rows.
+
+Discovery requires exact physical keys/folders and sorted unique membership,
+including late/absent parents, siblings, duplicate physical copies and whole
+stored components. Exact case, space, NFC/NFD and empty-token controls retain the
+038 stored-component preconditions and independent raw history. Missing-history
+production handling remains HELD: the unused helper returns NOT_AVAILABLE rather
+than fabricating lost References. Missing/read-error outputs retain sentinels;
+the progress abort witness, handler removal, recovery and staged rollback must
+execute. An early assertion supplies no later fault or membership credit.
+
+Receipts reuse the schema/writer, folder, raw-header, fixture/close and build
+sources plus the pinned storage/progress/fallible-array APIs from 047C. A receipt
+must bind exact c8 source bytes to a separately compiled matching app/xul-gtest,
+generated headers, configuration/INIs and actual loaded image. Native compiler,
+query planner, fault sensitivity, restored negative controls and profile/close
+qualification remain NOTRUN. The helper is unwired: no AddMessage integration,
+graph mutation, queue, notification or native consumer qualification is implied.

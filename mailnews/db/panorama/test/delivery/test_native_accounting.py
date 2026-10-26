@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 126)
+        self.assertEqual(len(catalog["cases"]), 137)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -140,6 +140,7 @@ class NativeAccountingTests(unittest.TestCase):
             selected = [c["filter"] for c in catalog["cases"] if c["filter"].startswith(suite + ".")]
             self.assertEqual(set(selected), filters)
             self.assertEqual(len(selected), len(filters))
+            self.assertEqual(len(names), len(filters))
             for path in [declaration["source"], *declaration["source_dependencies"]]:
                 self.assertTrue((comm / path).is_file(), path)
                 self.assertIn(path, run_native.COMM_INPUTS)
@@ -169,7 +170,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 126)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 137)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -403,6 +404,51 @@ class NativeAccountingTests(unittest.TestCase):
             self.reject(wrong)
         for selected in (suite + ".*", self.selected + ":" + rows[0]["filter"]):
             self.assertFalse(native.check_log(self.log, selected, 0)["log_complete"])
+
+
+    def test_component_discovery_filters_require_exact_single_case_evidence(self):
+        suite = "DISABLED_DeliveryCoreReferences"
+        names = {"DiscoverOrderedCrossFolder", "DiscoverReplyBeforeParent",
+                 "DiscoverSiblingsWithoutParent", "DiscoverSiblingsThenParent",
+                 "DiscoverDuplicatePhysicalCopies", "DiscoverWholeStoredComponent",
+                 "DiscoverExactReferenceTokens", "DiscoverMissingRowPreservesOutput",
+                 "DiscoverUnavailableHistoryPreservesOutput", "DiscoverReadErrorPreservesOutput",
+                 "DiscoverReadsStagedReferences"}
+        rows = [c for c in native.CATALOG["cases"] if c["id"].startswith("core-native:ComponentDiscovery:")]
+        self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in names})
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(native.CATALOG["readiness"], "pending-product")
+        for row in rows:
+            self.assertEqual(row["id"], "core-native:ComponentDiscovery:" + row["filter"].partition(".")[2])
+            self.selected = row["filter"]
+            for index in (1, 4):
+                self.events[index]["name"] = suite
+            for index in (2, 3):
+                self.events[index]["test"] = self.selected
+            self.assertTrue(self.check(self.events)["log_complete"])
+            for missing in (2, 3):
+                self.reject(self.events[:missing] + self.events[missing + 1:])
+            wrong = copy.deepcopy(self.events)
+            wrong[3]["test"] = suite + ".DiscoverDifferentCase"
+            self.reject(wrong)
+            for status in ("SKIP", "FAIL"):
+                wrong = copy.deepcopy(self.events)
+                wrong[3]["status"] = status
+                self.reject(wrong)
+            self.reject(self.events, returncode=1)
+            self.reject(self.events, timed_out=True)
+        self.check(self.events)
+        for selected in (suite + ".*", self.selected + ":" + rows[0]["filter"]):
+            self.assertFalse(native.check_log(self.log, selected, 0)["log_complete"])
+        declaration = native.CATALOG["suites"][suite]
+        required = {"mailnews/db/panorama/" + p for p in (
+            "src/MessageDatabase.cpp", "src/MessageDatabase.h", "src/DatabaseCore.cpp",
+            "src/DatabaseCore.h", "src/DatabaseUtils.cpp", "src/DatabaseUtils.h",
+            "src/Message.cpp", "src/Message.h", "src/FolderDatabase.cpp", "src/FolderDatabase.h",
+            "test/gtest/moz.build", "src/moz.build", "public/moz.build")}
+        self.assertTrue(required <= set(declaration["source_dependencies"]))
+        self.assertEqual(declaration["source"],
+                         "mailnews/db/panorama/test/gtest/TestDeliveryCoreReferences.cpp")
 
 
 if __name__ == "__main__":

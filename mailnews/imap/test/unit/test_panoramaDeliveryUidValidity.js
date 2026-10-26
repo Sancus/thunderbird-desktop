@@ -94,6 +94,23 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
     "The first production synchronization records the old UIDVALIDITY"
   );
   Assert.equal(folder.getTotalMessages(false), 2, "Both old messages are live");
+  Assert.equal(folder.getNumUnread(false), 2, "Both old messages are unread");
+  Assert.equal(
+    folder.msgDatabase.dBFolderInfo.numUnreadMessages,
+    2,
+    "The old database counts both unread messages"
+  );
+  Assert.notEqual(
+    folder.msgDatabase.dBFolderInfo.viewFlags,
+    Ci.nsMsgViewFlagsType.kUnreadOnly,
+    "The chosen view setting differs from the fixture default"
+  );
+  folder.msgDatabase.dBFolderInfo.viewFlags = Ci.nsMsgViewFlagsType.kUnreadOnly;
+  Assert.equal(
+    folder.msgDatabase.dBFolderInfo.viewFlags,
+    Ci.nsMsgViewFlagsType.kUnreadOnly,
+    "The old database records the folder view setting"
+  );
   Assert.deepEqual(
     Array.from(folder.messages, header => [
       header.messageId,
@@ -211,6 +228,17 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
     "Client membership and metadata match only the replacement epoch"
   );
   Assert.equal(folderCount, 1, "Only the new message is live");
+  Assert.equal(folder.getNumUnread(false), 1, "The new message is unread");
+  Assert.equal(
+    folder.msgDatabase.dBFolderInfo.numUnreadMessages,
+    1,
+    "The replacement database counts only the new unread message"
+  );
+  Assert.equal(
+    folder.msgDatabase.dBFolderInfo.viewFlags,
+    Ci.nsMsgViewFlagsType.kUnreadOnly,
+    "UIDVALIDITY invalidation preserves the folder view setting"
+  );
   const newHeader = folder.msgDatabase.getMsgHdrForMessageID(
     "new-epoch-reused@example.invalid"
   );

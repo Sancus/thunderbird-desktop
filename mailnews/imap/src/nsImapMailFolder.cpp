@@ -2678,6 +2678,7 @@ nsresult nsImapMailFolder::HandleUidInvalidation(ImapUid newUidValidity) {
   // Create a new summary file, update the folder message counts, and
   // Close the summary file db.
   rv = msgDBService->CreateNewDB(this, getter_AddRefs(mDatabase));
+  nsresult countsRv = NS_OK;
 
   if (NS_FAILED(rv) && mDatabase) {
     mDatabase->ForceClosed();
@@ -2687,8 +2688,7 @@ nsresult nsImapMailFolder::HandleUidInvalidation(ImapUid newUidValidity) {
       SetDBTransferInfo(transferInfo);
       // Preserve folder settings, but derive counts from the replacement DB
       // before notifying listeners or adding messages from the new epoch.
-      rv = mDatabase->SyncCounts();
-      NS_ENSURE_SUCCESS(rv, rv);
+      countsRv = mDatabase->SyncCounts();
     }
 
     SummaryChanged();
@@ -2710,7 +2710,7 @@ nsresult nsImapMailFolder::HandleUidInvalidation(ImapUid newUidValidity) {
     dbFolderInfo->SetUint32Property(kHighestRecordedUIDPropertyName, 0);
   }
   if (NS_FAILED(rv)) pathFile->Remove(false);
-  return rv;
+  return NS_SUCCEEDED(rv) && NS_FAILED(countsRv) ? countsRv : rv;
 }
 
 /**

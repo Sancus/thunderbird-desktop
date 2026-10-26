@@ -131,11 +131,11 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 144)
+        self.assertEqual(len(catalog["cases"]), 145)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
-            names = re.findall(r"TEST_F\(\s*" + suite + r",\s*(\w+)\s*\)", source.read_text())
+            names = re.findall(r"TEST(?:_F)?\(\s*" + suite + r",\s*(\w+)\s*\)", source.read_text())
             filters = {suite + "." + name for name in names}
             selected = [c["filter"] for c in catalog["cases"] if c["filter"].startswith(suite + ".")]
             self.assertEqual(set(selected), filters)
@@ -170,7 +170,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 144)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 145)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -494,6 +494,48 @@ class NativeAccountingTests(unittest.TestCase):
         required.update({"mailnews/db/msgdb/public/nsIDBFolderInfo.idl",
                          "mailnews/db/msgdb/public/nsIMsgDatabase.idl"})
         self.assertTrue(required <= dependencies, required - dependencies)
+
+
+
+    def test_quarantined_output_stream_is_exact_manual_non_database_control(self):
+        import re
+        import run_native
+        suite = "DISABLED_QuarantinedOutputStream"
+        rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
+        self.assertEqual(len(rows), 1)
+        self.selected = suite + ".RetainsInnerFinishFailure"
+        self.assertEqual(rows[0]["filter"], self.selected)
+        declaration = native.CATALOG["suites"][suite]
+        self.assertEqual(declaration["source"], "mailnews/base/test/gtest/TestQuarantinedOutputStream.cpp")
+        comm = native.HERE.parents[4]
+        source = (comm / declaration["source"]).read_text()
+        self.assertEqual(re.findall(r"TEST(?:_F)?\(\s*(\w+),\s*(\w+)\s*\)", source),
+                         [(suite, "RetainsInnerFinishFailure")])
+        build = (comm / "mailnews/base/test/gtest/moz.build").read_text()
+        self.assertEqual(build.count('"TestQuarantinedOutputStream.cpp"'), 1)
+        self.assertIn('FINAL_LIBRARY = "xul-gtest"', build)
+        for index in (1, 4):
+            self.events[index]["name"] = suite
+        for index in (2, 3):
+            self.events[index]["test"] = self.selected
+        result = self.check(self.events)
+        self.assertTrue(result["log_complete"])
+        self.assertTrue(result["execution_hold"])
+        self.assertEqual(result["coverage"], "none")
+        self.reject(self.events[:3] + self.events[4:])
+        self.reject(self.events, returncode=1)
+        self.reject(self.events, timed_out=True)
+        wrong = copy.deepcopy(self.events)
+        wrong[3]["status"] = "SKIP"
+        self.reject(wrong)
+        wrong[3].update(status="PASS", test=suite + ".Other")
+        self.reject(wrong)
+        self.assertFalse(native.check_log(self.log, suite + ".*", 0)["log_complete"])
+        required = {"mailnews/base/src/nsQuarantinedOutputStream.cpp",
+                    "mailnews/base/src/nsQuarantinedOutputStream.h", "mailnews/base/src/moz.build",
+                    "mailnews/base/test/moz.build", "mailnews/base/test/gtest/moz.build", "mailnews/moz.build"}
+        self.assertTrue(required <= set(declaration["source_dependencies"]))
+        self.assertTrue(required <= set(run_native.COMM_INPUTS))
 
 
 if __name__ == "__main__":

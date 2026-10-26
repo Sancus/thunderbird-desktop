@@ -746,5 +746,29 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
 
 
+
+    def test_quarantine_receipt_requires_stream_interfaces_wrapper_and_linkage(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        source = Path(config["source"])
+        paths = [source / "comm" / p for p in (
+            "mailnews/base/test/gtest/TestQuarantinedOutputStream.cpp",
+            "mailnews/base/src/nsQuarantinedOutputStream.cpp", "mailnews/base/src/nsQuarantinedOutputStream.h",
+            "mailnews/base/test/gtest/moz.build", "mailnews/base/src/moz.build")]
+        paths += [source / p for p in ("xpcom/io/nsIOutputStream.idl", "xpcom/io/nsISafeOutputStream.idl",
+            "xpcom/io/nsIInputStream.idl", "xpcom/io/nsIFile.idl", "xpcom/io/nsDirectoryServiceDefs.h",
+            "netwerk/base/nsNetUtil.h", "third_party/googletest/googletest/include/gtest/gtest.h")]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)), patch.object(runner, "verify") as verify):
+            for path in paths:
+                with self.subTest(path=str(path)):
+                    self.assertTrue(str(path) in receipt["inputs"], str(path))
+                    identity = receipt["inputs"].pop(str(path))
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic()+5)
+                    receipt["inputs"][str(path)] = identity
+            verify.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

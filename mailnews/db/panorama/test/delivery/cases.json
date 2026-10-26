@@ -2730,5 +2730,55 @@
     "folder_roles": {
       "child": "Known"
     }
+  },
+  {
+    "id": "local:panorama:mbox:PublicationWitness",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-mbox.toml",
+    "file": "test_panoramaDeliveryLocalPublicationWitness.js",
+    "tasks": [
+      "test_copyWaitsForRealMailboxStop",
+      "test_moveWaitsForRealMailboxStop"
+    ],
+    "setups": [
+      "setupLocalPublicationWitness"
+    ],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "copySource": "witness-copy-source",
+      "copySecondSource": "witness-copy-second-source",
+      "copyDestination": "witness-copy-destination",
+      "moveSource": "witness-move-source",
+      "moveSecondSource": "witness-move-second-source",
+      "moveDestination": "witness-move-destination"
+    }
+  },
+  {
+    "id": "local:panorama:maildir:PublicationWitness",
+    "manifest": "mailnews/local/test/unit/xpcshell-panorama-delivery-panorama-maildir.toml",
+    "file": "test_panoramaDeliveryLocalPublicationWitness.js",
+    "tasks": [
+      "test_copyWaitsForRealMailboxStop",
+      "test_moveWaitsForRealMailboxStop"
+    ],
+    "setups": [
+      "setupLocalPublicationWitness"
+    ],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "copySource": "witness-copy-source",
+      "copySecondSource": "witness-copy-second-source",
+      "copyDestination": "witness-copy-destination",
+      "moveSource": "witness-move-source",
+      "moveSecondSource": "witness-move-second-source",
+      "moveDestination": "witness-move-destination"
+    }
   }
 ]

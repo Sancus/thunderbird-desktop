@@ -303,3 +303,8 @@ requests declare their two real account parents, with an exact role keyset and
 observed-parent match. Identity retains the default common-parent rule. Failure
 still requires matching non-DEBUG configuration and no raw assertion diagnostic.
 Source availability and synthetic parser checks grant no runtime coverage.
+
+The two Panorama PublicationWitness file/store cases require both native-stop
+witness tasks and setupLocalPublicationWitness, with all six literal folders.
+They remain pending-product and provide no runtime credit before matching-build,
+XPConnect, fault/stop ordering, registrar restoration and process/profile checks.

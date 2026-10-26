@@ -59,6 +59,18 @@ GECKO_INPUTS = ["testing/gtest/mozilla/GTestRunner.cpp", "xpcom/tests/TestHarnes
                 "xpcom/string/nsReadableUtils.h", "xpcom/string/nsReadableUtils.cpp",
                 "xpcom/base/nsCOMPtr.h", "mfbt/ScopeExit.h", "xpcom/ds/nsIVariant.idl",
                 "third_party/googletest/googletest/include/gtest/internal/gtest-internal.h"]
+GECKO_INPUTS += [
+    "third_party/googletest/googletest/include/gtest/gtest.h",
+    "xpcom/string/nsString.h",
+    "xpcom/io/nsIInputStream.idl",
+    "xpcom/io/nsIOutputStream.idl",
+    "xpcom/io/nsISafeOutputStream.idl",
+    "xpcom/io/nsIFile.idl",
+    "xpcom/io/nsDirectoryServiceDefs.h",
+    "netwerk/base/nsNetUtil.h",
+    "xpcom/io/nsISeekableStream.idl",
+    "mfbt/UniquePtr.h"
+]
 
 
 def handle_termination(signum, frame):

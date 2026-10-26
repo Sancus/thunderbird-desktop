@@ -3,11 +3,14 @@
 TestDeliveryCoreReferences.cpp (41 cases), TestDeliveryFolderInfoProperties.cpp
 (26), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties,
 6 DetachedThreadIdentity and 7 CompleteHeader), TestDeliveryCoreMessageExistence.cpp
-(24) and TestDeliveryCoreProperties.cpp (11) are linked here. All 144 filters
+(24) and TestDeliveryCoreProperties.cpp (11) are linked to xul-gtest. The real
+quarantine wrapper control in TestQuarantinedOutputStream.cpp adds one case. All 145 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
-Native cases select the concrete Panorama core and check panorama.sqlite identity.
-They have store none: no account/body-store or application-restart coverage.
+The 144 Panorama cases select the concrete core and check panorama.sqlite identity.
+The quarantine control exercises real wrapper/temp-file I/O and an inner Finish
+failure; it claims no database, backend or body-store coverage. The catalog store
+none is not physical-store evidence. No application-restart coverage is claimed.
 
 ## Verified driver and limits
 

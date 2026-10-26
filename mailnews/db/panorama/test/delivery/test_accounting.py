@@ -695,7 +695,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 43)
-        self.assertEqual(len({c["id"] for c in catalog}), 176)
+        self.assertEqual(len({c["id"] for c in catalog}), 178)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -987,8 +987,8 @@ support-files = ["fixture.sql"]
                  "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
                                               "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
         rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
-        self.assertEqual(len(catalog), 176)
-        self.assertEqual(len({c["id"] for c in catalog}), 176)
+        self.assertEqual(len(catalog), 178)
+        self.assertEqual(len({c["id"] for c in catalog}), 178)
         self.assertEqual(len(rows), 8)
         for store in ("mbox", "maildir"):
             lane = [c for c in rows if c["store"] == store]
@@ -1104,8 +1104,8 @@ support-files = ["fixture.sql"]
 
     def test_new_raw_catalog_and_view_lanes_are_exact_manual_cases(self):
         catalog = json.loads((runner.HERE / "cases.json").read_text())
-        self.assertEqual(len(catalog), 176)
-        self.assertEqual(len({c["id"] for c in catalog}), 176)
+        self.assertEqual(len(catalog), 178)
+        self.assertEqual(len({c["id"] for c in catalog}), 178)
         expected = {
             "core:Publication": ["test_publishCommittedMessageOnce",
                 "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
@@ -1588,6 +1588,98 @@ support-files = ["fixture.sql"]
                                  (None, "blocked", "none"))
                 self.assertIn("blocked-dependency:", " ".join(result["errors"]))
             installed.write_bytes(saved)
+
+
+
+    def test_local_witness_preflight_binds_exact_tasks_roles_and_dependencies(self):
+        import shutil
+        comm = runner.HERE.parents[4]
+        rows = [c for c in json.loads((runner.HERE / "cases.json").read_text())
+                if c["file"] == "test_panoramaDeliveryLocalPublicationWitness.js"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({c["store"] for c in rows}, {"mbox", "maildir"})
+        expected = ["test_copyWaitsForRealMailboxStop", "test_moveWaitsForRealMailboxStop"]
+        roles = {kind + role: "witness-" + kind + suffix
+                 for kind in ("copy", "move")
+                 for role, suffix in (("Source", "-source"), ("SecondSource", "-second-source"),
+                                      ("Destination", "-destination"))}
+        config, _ = self.initializer_fixture()
+        target = Path(config["source"]) / "comm"
+        required = {"mailnews/base/public/nsIMsgMessageService.idl",
+                    "mailnews/base/src/nsMsgIncomingServer.cpp",
+                    "mailnews/base/src/nsMsgIncomingServer.h",
+                    "mailnews/base/src/CopyMessageStreamListener.cpp"}
+        for index, case in enumerate(rows):
+            self.assertEqual(case["tasks"], expected)
+            self.assertEqual(case["setups"], ["setupLocalPublicationWitness"])
+            self.assertEqual(case["folder_roles"], roles)
+            self.assertEqual(case["readiness"], "pending-product")
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [(manifest.parent / n).resolve() for n in doc["DEFAULT"]["head"].split()]
+            paths += [(manifest.parent / n).resolve() for n in doc[case["file"]]["support-files"]]
+            self.assertTrue({comm / n for n in required} <= set(paths))
+            for original in paths:
+                destination = target / original.relative_to(comm)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, destination)
+            for name in ("MessageGenerator.sys.mjs", "PromiseTestUtils.sys.mjs"):
+                original = comm / "mailnews/test/resources" / name
+                shutil.copyfile(original, target / original.relative_to(comm))
+                shutil.copyfile(original, Path(config["objdir"]) / "_tests/modules/mailnews" / name)
+            _, bound = runner.prepare(config, case)
+            self.assertTrue({target / n for n in required} <= set(bound))
+            for changes in ({"tasks": expected[:-1]}, {"setups": []},
+                            {"folder_roles": {"source": "ambiguous/name"}}, {"store": "maildir" if case["store"] == "mbox" else "mbox"}):
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    runner.prepare(config, {**case, **changes})
+            missing = target / "mailnews/base/public/nsIMsgMessageService.idl"
+            saved = missing.read_bytes()
+            missing.unlink()
+            with patch.object(runner.subprocess, "run") as launch:
+                output = self.root / ("witness-missing-" + str(index))
+                output.mkdir()
+                result = runner.run_case(config, case, output)
+                launch.assert_not_called()
+                self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                                 (None, "blocked", "none"))
+            missing.write_bytes(saved)
+            normal = (comm / "mailnews/local/test/unit/xpcshell.toml").read_text()
+            self.assertNotIn(case["file"], normal)
+
+    def test_local_witness_requires_both_tasks_and_all_six_literal_folders(self):
+        rows = [c for c in json.loads((runner.HERE / "cases.json").read_text())
+                if c["file"] == "test_panoramaDeliveryLocalPublicationWitness.js"]
+        self.assertEqual(len(rows), 2)
+        for case in rows:
+            file = case["file"]
+            events = [{"action": "suite_start", "tests": {"manual": [file]}},
+                      {"action": "test_start", "test": file},
+                      self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama"})]
+            for name in case["folder_roles"].values():
+                folder = {**self.folder, "folderURI": "mailbox://fixture/publication-witness/" + name,
+                          "contractBefore": "@mozilla.org/msgstore/" + runner.CONTRACTS[case["store"]] + ";1",
+                          "expectedStore": case["store"], "actualStore": case["store"]}
+                events += [self.diag("STORE_CONTRACT", folder), self.diag("FOLDER", folder)]
+            for name in case["setups"] + case["tasks"]:
+                events += [{"action": "log", "message": f"(xpcshell/head.js) | test {name} pending (1)"},
+                           {"action": "test_status", "test": file, "status": "PASS", "subtest": name},
+                           {"action": "log", "message": f"(xpcshell/head.js) | test {name} finished (1)"}]
+            events += [{"action": "test_end", "test": file, "status": "PASS"}, {"action": "suite_end"}]
+            self.assertTrue(self.check(events, case)["ok"])
+            for name in case["tasks"]:
+                for marker in (" pending", " finished"):
+                    changed = [e for e in events if name + marker not in e.get("message", "")]
+                    self.assertFalse(self.check(changed, case)["ok"])
+                self.assertFalse(self.check([e for e in events if e.get("subtest") != name], case)["ok"])
+            for name in case["folder_roles"].values():
+                changed = [e for e in events if "publication-witness/" + name + '"' not in e.get("message", "")]
+                self.assertFalse(self.check(changed, case)["ok"], name)
+            self.assertFalse(self.check(events[:-2], case)["ok"])
+            wrong = copy.deepcopy(events)
+            wrong[2] = self.diag("BACKEND", {"expected": "panorama", "actualBackend": "mork"})
+            self.assertFalse(self.check(wrong, case)["ok"])
 
 
 if __name__ == "__main__":

@@ -726,6 +726,11 @@
       "id": "compatibility-native:FolderInfo:KnownArtsColdReopenRetainsValues",
       "filter": "DISABLED_DeliveryFolderInfoProperties.KnownArtsColdReopenRetainsValues",
       "expected": "Opaque and empty values survive checked same-process core/connection close and reconstruction with exact row presence/readSet, core-release and close-barrier assertions; no application-restart claim."
+    },
+    {
+      "id": "local-native:QuarantinedOutputStream:RetainsInnerFinishFailure",
+      "filter": "DISABLED_QuarantinedOutputStream.RetainsInnerFinishFailure",
+      "expected": "The real quarantine wrapper preserves the first inner Finish error across Finish, Close and StreamStatus, with one inner Finish and exact copied bytes; no database/backend/store coverage."
     }
   ],
   "suites": {
@@ -958,6 +963,17 @@
         "mailnews/db/panorama/src/Thread.h",
         "mailnews/base/public/nsIMsgFolder.idl",
         "mailnews/db/msgdb/public/nsIDBChangeListener.idl"
+      ]
+    },
+    "DISABLED_QuarantinedOutputStream": {
+      "source": "mailnews/base/test/gtest/TestQuarantinedOutputStream.cpp",
+      "source_dependencies": [
+        "mailnews/base/src/nsQuarantinedOutputStream.cpp",
+        "mailnews/base/src/nsQuarantinedOutputStream.h",
+        "mailnews/base/src/moz.build",
+        "mailnews/base/test/gtest/moz.build",
+        "mailnews/base/test/moz.build",
+        "mailnews/moz.build"
       ]
     }
   }

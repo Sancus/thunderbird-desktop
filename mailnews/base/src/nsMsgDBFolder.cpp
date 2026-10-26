@@ -2698,8 +2698,82 @@ NS_IMETHODIMP nsMsgDBFolder::GetServer(nsIMsgIncomingServer** aServer) {
 NS_IMETHODIMP nsMsgDBFolder::InitWithFolderId(uint64_t folderId) {
 #ifdef MOZ_PANORAMA
   MOZ_ASSERT(StaticPrefs::mail_panorama_enabled_AtStartup());
+  nsresult rv;
+  nsCOMPtr<nsIFolderLookupService> fls =
+      do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
 
-  MOZ_ASSERT(!mFolderId);
+  nsTArray<FolderInitialization> initializedFolders;
+  auto rollback = mozilla::MakeScopeExit([&] {
+    // Only these objects and their new attachments belong to this attempt.
+    for (size_t i = initializedFolders.Length(); i > 0; --i) {
+      auto& entry = initializedFolders[i - 1];
+      nsMsgDBFolder* folder = entry.folder;
+      MOZ_ALWAYS_SUCCEEDS(fls->EvictFolder(folder));
+      for (const auto& child : entry.attachedChildren) {
+        folder->mSubFolders.RemoveObject(child);
+      }
+      folder->mParent = entry.parent;
+      folder->mFolderId = 0;
+      folder->mServer = nullptr;
+      folder->mPath = nullptr;
+      folder->mName.Truncate();
+      folder->mURI.Truncate();
+      folder->mBaseMessageURI.Truncate();
+      folder->mFlags = 0;
+      folder->mHaveParsedURI = false;
+      folder->mInitializedFromCache = false;
+      folder->mIsServerIsValid = false;
+      folder->mIsServer = false;
+    }
+  });
+  rv = InitWithFolderId(folderId, initializedFolders);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rollback.release();
+  return NS_OK;
+#else
+  return NS_ERROR_NOT_IMPLEMENTED;
+#endif
+}
+
+#ifdef MOZ_PANORAMA
+nsresult nsMsgDBFolder::GetCachedChild(uint64_t folderId,
+                                       nsIMsgFolder** child) {
+  NS_ENSURE_ARG_POINTER(child);
+  *child = nullptr;
+  RefPtr<mozilla::mailnews::DatabaseCore> dbCore =
+      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+  nsCString path = MOZ_TRY(dbCore->FolderDB().GetFolderPath(folderId));
+  MOZ_TRY(MsgEscapeString(path, nsINetUtil::ESCAPE_URL_PATH, path));
+  nsCOMPtr<nsIMsgIncomingServer> server;
+  MOZ_TRY(GetServer(getter_AddRefs(server)));
+  nsCString uri;
+  MOZ_TRY(server->GetServerURI(uri));
+  int32_t pathStart = path.FindChar('/');
+  NS_ENSURE_TRUE(pathStart != kNotFound, NS_ERROR_UNEXPECTED);
+  uri.Append(Substring(path, pathStart));
+  nsresult rv;
+  nsCOMPtr<nsIFolderLookupService> fls =
+      do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(fls->GetFolderForURL(uri, child));
+  if (*child) {
+    uint64_t existingId;
+    MOZ_TRY((*child)->GetId(&existingId));
+    nsCOMPtr<nsIMsgFolder> parent;
+    MOZ_TRY((*child)->GetParent(getter_AddRefs(parent)));
+    NS_ENSURE_TRUE(existingId == folderId && parent == this,
+                   NS_ERROR_UNEXPECTED);
+  }
+  return NS_OK;
+}
+
+nsresult nsMsgDBFolder::InitWithFolderId(
+    uint64_t folderId, nsTArray<FolderInitialization>& initializedFolders) {
+  NS_ENSURE_ARG(folderId);
+  NS_ENSURE_TRUE(!mFolderId, NS_ERROR_ALREADY_INITIALIZED);
+  size_t initializationIndex = initializedFolders.Length();
+  initializedFolders.AppendElement(FolderInitialization{this, mParent, {}});
   mFolderId = folderId;
 
   RefPtr<mozilla::mailnews::DatabaseCore> dbCore =
@@ -2784,22 +2858,29 @@ NS_IMETHODIMP nsMsgDBFolder::InitWithFolderId(uint64_t folderId) {
   nsTArray<uint64_t> subFolderIds =
       MOZ_TRY(folderDB.GetFolderChildren(folderId));
   for (auto subFolderId : subFolderIds) {
-    nsCOMPtr<nsIMsgFolder> msgFolder = do_CreateInstance(contractId.get(), &rv);
+    nsCOMPtr<nsIMsgFolder> msgFolder;
+    rv = GetCachedChild(subFolderId, getter_AddRefs(msgFolder));
     NS_ENSURE_SUCCESS(rv, rv);
-
-    rv = msgFolder->InitWithFolderId(subFolderId);
-    NS_ENSURE_SUCCESS(rv, rv);
-
-    rv = msgFolder->SetParent(this);
-    NS_ENSURE_SUCCESS(rv, rv);
-    mSubFolders.AppendObject(msgFolder);
+    if (!msgFolder) {
+      msgFolder = do_CreateInstance(contractId.get(), &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+      // All protocol folder factories implement nsMsgDBFolder.
+      rv = static_cast<nsMsgDBFolder*>(msgFolder.get())
+               ->InitWithFolderId(subFolderId, initializedFolders);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = msgFolder->SetParent(this);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+    if (!mSubFolders.Contains(msgFolder)) {
+      mSubFolders.AppendObject(msgFolder);
+      initializedFolders[initializationIndex].attachedChildren.AppendElement(
+          msgFolder);
+    }
   }
 
   return NS_OK;
-#else
-  return NS_ERROR_NOT_IMPLEMENTED;
-#endif  // MOZ_PANORAMA
 }
+#endif  // MOZ_PANORAMA
 
 NS_IMETHODIMP nsMsgDBFolder::GetId(uint64_t* id) {
 #ifdef MOZ_PANORAMA
@@ -3552,14 +3633,16 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
     nsAutoCString contractId("@mozilla.org/mail/folder-factory;1?name=");
     contractId.Append(localStoreType);
 
-    // Set up the nsIMsgFolder.
-    folder = do_CreateInstance(contractId.get(), &rv);
+    rv = GetCachedChild(subFolderId, getter_AddRefs(folder));
     NS_ENSURE_SUCCESS(rv, rv);
-
-    rv = folder->InitWithFolderId(subFolderId);
-    NS_ENSURE_SUCCESS(rv, rv);
-
-    folder->SetParent(this);
+    if (!folder) {
+      folder = do_CreateInstance(contractId.get(), &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = folder->InitWithFolderId(subFolderId);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = folder->SetParent(this);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
     mSubFolders.AppendObject(folder);
   } else {
 #endif  // MOZ_PANORAMA

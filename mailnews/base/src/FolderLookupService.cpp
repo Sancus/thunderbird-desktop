@@ -204,6 +204,8 @@ NS_IMETHODIMP FolderLookupService::Cache(const nsACString& url,
         "enabled.");
     return NS_ERROR_UNEXPECTED;
   }
+  nsCOMPtr<nsIMsgFolder> existing = GetExisting(url);
+  NS_ENSURE_TRUE(!existing || existing == folder, NS_ERROR_ALREADY_INITIALIZED);
   mFolderCache.InsertOrUpdate(url, do_GetWeakReference(folder));
   return NS_OK;
 }

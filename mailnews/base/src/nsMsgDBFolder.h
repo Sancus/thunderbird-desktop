@@ -117,6 +117,17 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
  protected:
   virtual ~nsMsgDBFolder();
 
+#ifdef MOZ_PANORAMA
+  struct FolderInitialization {
+    RefPtr<nsMsgDBFolder> folder;
+    nsWeakPtr parent;
+    nsTArray<RefPtr<nsIMsgFolder>> attachedChildren;
+  };
+  nsresult InitWithFolderId(uint64_t folderId,
+                            nsTArray<FolderInitialization>& initializedFolders);
+  nsresult GetCachedChild(uint64_t folderId, nsIMsgFolder** child);
+#endif
+
   virtual nsresult CreateBaseMessageURI(const nsACString& aURI);
 
   virtual nsresult RenameSubFolders(nsIMsgWindow* msgWindow,

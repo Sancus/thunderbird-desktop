@@ -1187,8 +1187,8 @@ add_task(async function test_group() {
   tests_for_all_views();
 
   // Specific tests for group.
-  await test_group_sort_collapseAll_expandAll_threading;
-  await test_group_dummies_under_mutation_by_date;
+  await test_group_sort_collapseAll_expandAll_threading();
+  await test_group_dummies_under_mutation_by_date();
 });
 
 add_task(function test_teardown() {

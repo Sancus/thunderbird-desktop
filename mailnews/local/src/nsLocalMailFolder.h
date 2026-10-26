@@ -65,6 +65,14 @@ struct nsLocalMailCopyState {
   bool m_copyingMultipleMessages;
   bool m_allowUndo;
   bool m_writeFailed;
+#ifdef MOZ_PANORAMA
+  nsresult m_copyError = NS_OK;
+  bool m_finishAttempted = false;
+  bool m_discardFailed = false;
+  nsCString m_storeToken;
+  nsMsgKey m_sourceKey = nsMsgKey_None;
+  uint32_t m_storedMessageSize = 0;
+#endif
   bool m_notifyFolderLoaded;
   nsCString m_newMsgKeywords;  // TODO: Remove. CopyFileMessage() only.
   nsCOMPtr<nsIMsgDBHdr> m_newHdr;
@@ -241,6 +249,10 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
   void CopyHdrPropertiesWithSkipList(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr,
                                      const nsCString& skipList);
   bool CopyLine(mozilla::Span<const char> line);
+#ifdef MOZ_PANORAMA
+  nsresult CompleteCopyMessage(nsIMsgDBHdr** liveHdr);
+  nsresult DiscardCopyMessage();
+#endif
 
   nsLocalMailCopyState* mCopyState;  // We only allow one of these at a time
   nsCString mType;

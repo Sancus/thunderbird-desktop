@@ -370,7 +370,13 @@
         "mailnews/base/src/nsMsgAccountManager.cpp",
         "mailnews/base/src/nsMsgAccountManager.h",
         "mailnews/search/src/nsMsgFilterService.cpp",
-        "mailnews/search/src/nsMsgFilterService.h"
+        "mailnews/search/src/nsMsgFilterService.h",
+        "mailnews/search/src/nsMsgFilterList.cpp",
+        "mailnews/search/src/nsMsgFilterList.h",
+        "mailnews/search/src/nsMsgFilter.cpp",
+        "mailnews/search/src/nsMsgFilter.h",
+        "mailnews/search/src/nsMsgSearchTerm.cpp",
+        "mailnews/search/src/nsMsgSearchTerm.h"
       ]
     }
   }

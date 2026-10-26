@@ -485,6 +485,12 @@ class NativeRunnerTests(unittest.TestCase):
             "mailnews/base/src/nsMsgAccountManager.h",
             "mailnews/search/src/nsMsgFilterService.cpp",
             "mailnews/search/src/nsMsgFilterService.h",
+            "mailnews/search/src/nsMsgFilterList.cpp",
+            "mailnews/search/src/nsMsgFilterList.h",
+            "mailnews/search/src/nsMsgFilter.cpp",
+            "mailnews/search/src/nsMsgFilter.h",
+            "mailnews/search/src/nsMsgSearchTerm.cpp",
+            "mailnews/search/src/nsMsgSearchTerm.h",
         ]
         with (patch.object(runner.sys, "platform", "linux"),
               patch.object(runner, "__file__", str(runner_path)),

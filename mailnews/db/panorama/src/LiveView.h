@@ -53,7 +53,7 @@ class LiveView : public nsILiveView, public MessageListener {
   void PrepareStatement(mozIStorageStatement* aStatement);
 
   // Are we interested in this message?
-  bool Matches(nsIMsgDBHdr* aMessage);
+  bool Matches(nsIMsgDBHdr* aMessage, uint64_t aFolderId);
   // Should we fire a notification to the listener?
   bool CheckIfChangeMatches(nsIMsgDBHdr* oldMessage, Message* newMessage);
 

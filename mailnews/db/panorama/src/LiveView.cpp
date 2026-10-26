@@ -238,8 +238,8 @@ void LiveView::PrepareStatement(mozIStorageStatement* statement) {
 /**
  * Test if `aMessage` matches the current filters.
  */
-bool LiveView::Matches(nsIMsgDBHdr* aMessage) {
-  if (mFolderFilter && !(mFolderFilter->Matches(aMessage))) {
+bool LiveView::Matches(nsIMsgDBHdr* aMessage, uint64_t aFolderId) {
+  if (mFolderFilter && !(mFolderFilter->Matches(aMessage, aFolderId))) {
     return false;
   }
   return true;
@@ -803,7 +803,7 @@ NS_IMETHODIMP LiveView::SelectMessagesInGroup(const nsACString& group,
 }
 
 void LiveView::OnMessageAdded(Message* aMessage) {
-  if (!mListener || !Matches((nsIMsgDBHdr*)aMessage)) {
+  if (!mListener || !Matches(aMessage, aMessage->FolderId())) {
     return;
   }
 
@@ -821,7 +821,7 @@ void LiveView::OnMessageAdded(Message* aMessage) {
 }
 
 void LiveView::OnMessageRemoved(Message* aMessage, uint32_t oldFlags) {
-  if (!mListener || !Matches((nsIMsgDBHdr*)aMessage)) {
+  if (!mListener || !Matches(aMessage, aMessage->FolderId())) {
     return;
   }
 
@@ -840,8 +840,10 @@ void LiveView::OnMessageRemoved(Message* aMessage, uint32_t oldFlags) {
 
 bool LiveView::CheckIfChangeMatches(nsIMsgDBHdr* oldMessage,
                                     Message* newMessage) {
-  bool matchesOld = Matches(oldMessage);
-  bool matchesNew = Matches((nsIMsgDBHdr*)newMessage);
+  // Flag and tag changes preserve the folder identity of both snapshots.
+  uint64_t folderId = newMessage->FolderId();
+  bool matchesOld = Matches(oldMessage, folderId);
+  bool matchesNew = Matches(newMessage, folderId);
 
   if (matchesNew && matchesOld) {
     // This is a change we are interested in. Return true so the caller files

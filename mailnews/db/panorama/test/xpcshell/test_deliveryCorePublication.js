@@ -163,3 +163,76 @@ add_task(async function test_publishCommittedMessageOnce() {
     "One add callback sees the complete, committed addMessage input"
   );
 });
+
+add_task(async function test_folderFilteredEventsUseDatabaseIdentity() {
+  const root = folderDB.insertRoot("delivery-filter-events");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const otherFolder = folderDB.insertFolder(root, "Other");
+  const controlId = addMessage({ folderId, messageId: "filter-control@invalid" });
+  Assert.throws(
+    () => messageDB.getMessage(controlId).folder,
+    /NS_ERROR_NOT_INITIALIZED/,
+    "The raw folder has no account-backed folder object"
+  );
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  registerCleanupFunction(() => view.clearListener());
+  view.initWithFolder(folderId);
+  const events = [];
+  view.setListener({
+    onMessageAdded(message) {
+      events.push(["added", message.id, message.folderId]);
+    },
+    onMessageRemoved(message) {
+      events.push(["removed", message.id, message.folderId]);
+    },
+    onMessageFlagsChanged(message) {
+      events.push(["flags", message.id, message.folderId]);
+    },
+    onMessageTagsChanged(message) {
+      events.push(["tags", message.id, message.folderId]);
+    },
+    onSelectedChunk() {},
+  });
+  try {
+    const id = addMessage({ folderId, messageId: "filter-added@invalid" });
+    const otherId = addMessage({
+      folderId: otherFolder,
+      messageId: "filter-excluded@invalid",
+    });
+    const header = messageDB.getMessage(id);
+    header.flags = Ci.nsMsgMessageFlags.Read;
+    header.setStringProperty("keywords", "filter-tag");
+    messageDB.removeMessage(id);
+    Assert.deepEqual(events, [
+      ["added", id, folderId],
+      ["flags", id, folderId],
+      ["tags", id, folderId],
+      ["removed", id, folderId],
+    ]);
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, folderId FROM messages WHERE folderId IN (" +
+          folderId +
+          ", " +
+          otherFolder +
+          ") ORDER BY messageId",
+        ["id", "folderId"]
+      ),
+      [
+        [controlId, folderId],
+        [otherId, otherFolder],
+      ],
+      "The removed row is absent while both control rows survive"
+    );
+    Assert.equal(await view.countMessages(), 1);
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id),
+      [controlId],
+      "SQL selection and live events agree on folder membership"
+    );
+  } finally {
+    view.clearListener();
+  }
+});

@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "DatabaseCore.h"
+#include "LiveViewFilters.h"
 #include "Message.h"
 #include "MessageDatabase.h"
 #include "gtest/gtest.h"
@@ -27,6 +28,7 @@
 #include "nsIMsgHdr.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
 #include "nsServiceManagerUtils.h"
 #include "nsThreadUtils.h"
@@ -339,6 +341,46 @@ class DeliveryCoreMessageExistence : public testing::Test {
         CheckStoredKeys({key}, "delivery_hidden_messages"_ns));
   }
 
+  void AddFilterMessages(nsTArray<RefPtr<Message>>& messages,
+                         nsTArray<uint64_t>& folders) {
+    uint64_t root, other, excluded;
+    ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderRoot(mFolder, &root));
+    ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(root, "Other"_ns, &other));
+    ASSERT_EQ(NS_OK,
+              mCore->FolderDB().InsertFolder(root, "Excluded"_ns, &excluded));
+    folders = {mFolder, other, excluded};
+    for (uint64_t folder : folders) {
+      nsMsgKey key;
+      ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(
+                           folder, "filter@invalid"_ns, {}, 123456, "sender"_ns,
+                           "recipient"_ns, ""_ns, ""_ns, "Filter message"_ns, 0,
+                           ""_ns, 0, &key));
+      messages.AppendElement(new Message(key));
+    }
+    ASSERT_NO_FATAL_FAILURE(CheckStoredKeys(
+        {messages[0]->Key(), messages[1]->Key(), messages[2]->Key()}));
+    nsCOMPtr<mozIStorageStatement> stored;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                         "SELECT folderId FROM messages WHERE id = :id"_ns,
+                         getter_AddRefs(stored)));
+    auto finalize =
+        MakeScopeExit([&] { EXPECT_EQ(NS_OK, stored->Finalize()); });
+    for (size_t i = 0; i < messages.Length(); ++i) {
+      ASSERT_EQ(NS_OK, stored->BindInt64ByName("id"_ns, messages[i]->Key()));
+      bool more = false;
+      ASSERT_EQ(NS_OK, stored->ExecuteStep(&more));
+      ASSERT_TRUE(more);
+      int64_t actualFolder = 0;
+      ASSERT_EQ(NS_OK, stored->GetInt64(0, &actualFolder));
+      EXPECT_EQ(folders[i], static_cast<uint64_t>(actualFolder));
+      ASSERT_EQ(NS_OK, stored->Reset());
+    }
+    nsCOMPtr<nsIMsgFolder> folder;
+    ASSERT_EQ(NS_ERROR_NOT_INITIALIZED,
+              messages[0]->GetFolder(getter_AddRefs(folder)));
+    ASSERT_FALSE(folder);
+  }
+
   RefPtr<DatabaseCore> mCore;
   nsCOMPtr<nsIProperties> mDirectories;
   nsCOMPtr<nsIFile> mOldProfile, mProfile, mFile;
@@ -354,6 +396,80 @@ class DeliveryCoreMessageExistence : public testing::Test {
 namespace {
 
 using DISABLED_DeliveryCoreMessageExistence = DeliveryCoreMessageExistence;
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       SingleFolderFilterUsesStoredIdentity) {
+  nsTArray<RefPtr<Message>> messages;
+  nsTArray<uint64_t> folders;
+  ASSERT_NO_FATAL_FAILURE(AddFilterMessages(messages, folders));
+  SingleFolderFilter filter(folders[0]);
+  EXPECT_TRUE(filter.Matches(messages[0], messages[0]->FolderId()));
+  EXPECT_FALSE(filter.Matches(messages[1], messages[1]->FolderId()));
+  EXPECT_FALSE(filter.Matches(messages[2], messages[2]->FolderId()));
+  RefPtr<Message> missing = new Message(nsMsgKey_None);
+  ASSERT_EQ(0u, missing->FolderId());
+  EXPECT_FALSE(filter.Matches(missing, missing->FolderId()));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       MultiFolderFilterUsesStoredIdentity) {
+  nsTArray<RefPtr<Message>> messages;
+  nsTArray<uint64_t> folders;
+  ASSERT_NO_FATAL_FAILURE(AddFilterMessages(messages, folders));
+  nsTArray<uint64_t> wanted = {folders[1], folders[0]};
+  MultiFolderFilter filter(wanted);
+  EXPECT_TRUE(filter.Matches(messages[0], messages[0]->FolderId()));
+  EXPECT_TRUE(filter.Matches(messages[1], messages[1]->FolderId()));
+  EXPECT_FALSE(filter.Matches(messages[2], messages[2]->FolderId()));
+  RefPtr<Message> missing = new Message(nsMsgKey_None);
+  ASSERT_EQ(0u, missing->FolderId());
+  EXPECT_FALSE(filter.Matches(missing, missing->FolderId()));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       VirtualFolderFilterUsesStoredIdentity) {
+  nsTArray<RefPtr<Message>> messages;
+  nsTArray<uint64_t> folders;
+  ASSERT_NO_FATAL_FAILURE(AddFilterMessages(messages, folders));
+  uint64_t root, virtualFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderRoot(mFolder, &root));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(root, "Virtual"_ns, &virtualFolder));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(virtualFolder,
+                                                 nsMsgFolderFlags::Virtual));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  auto finalize = MakeScopeExit([&] {
+    if (stmt) {
+      EXPECT_EQ(NS_OK, stmt->Finalize());
+    }
+  });
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "INSERT INTO folder_properties (id, name, value) "
+                       "VALUES (:id, 'searchStr', 'ALL')"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, virtualFolder));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  stmt = nullptr;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "INSERT INTO virtualFolder_folders "
+                       "(virtualFolderId, searchFolderId) "
+                       "VALUES (:virtual, :first), (:virtual, :second)"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("virtual"_ns, virtualFolder));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("first"_ns, folders[0]));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("second"_ns, folders[1]));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  stmt = nullptr;
+  VirtualFolderFilter filter(virtualFolder);
+  EXPECT_TRUE(filter.Matches(messages[0], messages[0]->FolderId()));
+  EXPECT_TRUE(filter.Matches(messages[1], messages[1]->FolderId()));
+  EXPECT_FALSE(filter.Matches(messages[2], messages[2]->FolderId()));
+  RefPtr<Message> missing = new Message(nsMsgKey_None);
+  ASSERT_EQ(0u, missing->FolderId());
+  EXPECT_FALSE(filter.Matches(missing, missing->FolderId()));
+}
 
 TEST_F(DISABLED_DeliveryCoreMessageExistence,
        WarmHeaderDeletionUsesStoredMembership) {

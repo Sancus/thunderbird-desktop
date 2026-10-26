@@ -29,7 +29,10 @@ class LiveViewFilter {
   LiveViewFilter() {}
   virtual ~LiveViewFilter() {}
 
-  virtual bool Matches(nsIMsgDBHdr* aMessage) { return false; }
+  // The folder ID also applies to detached snapshots of flag/tag changes.
+  virtual bool Matches(nsIMsgDBHdr* aMessage, uint64_t aFolderId) {
+    return false;
+  }
   virtual void Refresh() {}
 
  protected:
@@ -44,11 +47,10 @@ class SingleFolderFilter final : public LiveViewFilter {
     mSQLClause.AppendInt(mFolderId);
   }
 
-  bool Matches(nsIMsgDBHdr* message) {
-    nsCOMPtr<nsIMsgFolder> folder;
-    message->GetFolder(getter_AddRefs(folder));
-    uint64_t folderId;
-    folder->GetId(&folderId);
+  bool Matches(nsIMsgDBHdr*, uint64_t folderId) override {
+    if (folderId == 0) {
+      return false;
+    }
     return folderId == mFolderId;
   }
 
@@ -71,11 +73,10 @@ class MultiFolderFilter final : public LiveViewFilter {
     mSQLClause.Append(")");
   }
 
-  bool Matches(nsIMsgDBHdr* message) {
-    nsCOMPtr<nsIMsgFolder> folder;
-    message->GetFolder(getter_AddRefs(folder));
-    uint64_t folderId;
-    folder->GetId(&folderId);
+  bool Matches(nsIMsgDBHdr*, uint64_t folderId) override {
+    if (folderId == 0) {
+      return false;
+    }
     return mFolderIds.Contains(folderId);
   }
 
@@ -92,11 +93,10 @@ class VirtualFolderFilter final : public LiveViewFilter {
 
   void Refresh();
 
-  bool Matches(nsIMsgDBHdr* message) {
-    nsCOMPtr<nsIMsgFolder> folder;
-    message->GetFolder(getter_AddRefs(folder));
-    uint64_t folderId;
-    folder->GetId(&folderId);
+  bool Matches(nsIMsgDBHdr*, uint64_t folderId) override {
+    if (folderId == 0) {
+      return false;
+    }
     // TODO: This is incomplete. We haven't matched the message against the
     // search terms.
     return mSearchFolderIds.Contains(folderId);
@@ -116,7 +116,7 @@ class ConversationFilter final : public LiveViewFilter {
     mSQLClause.AppendInt(conversationId);
   }
 
-  bool Matches(nsIMsgDBHdr* message) {
+  bool Matches(nsIMsgDBHdr* message, uint64_t) override {
     nsMsgKey threadId;
     message->GetThreadId(&threadId);
     return threadId == mConversationId;
@@ -136,7 +136,7 @@ class MessageFlagsFilter : public LiveViewFilter {
     mSQLClause.AppendInt(aWanted);
   }
 
-  bool Matches(nsIMsgDBHdr* message) {
+  bool Matches(nsIMsgDBHdr* message, uint64_t) override {
     uint32_t flags;
     message->GetFlags(&flags);
     return (flags & mFlag) == mWanted;
@@ -168,6 +168,10 @@ class TaggedMessagesFilter final : public LiveViewFilter {
     mSQLParams.AppendElement(new mozilla::storage::UTF8TextVariant(mTag));
   }
 
+  bool Matches(nsIMsgDBHdr* message, uint64_t) override {
+    return Matches(message);
+  }
+
   bool Matches(nsIMsgDBHdr* message);
 
  protected:
@@ -184,7 +188,7 @@ class DateRangeFilter final : public LiveViewFilter {
     mSQLParams.AppendElement(new mozilla::storage::IntegerVariant(mEndDate));
   }
 
-  bool Matches(nsIMsgDBHdr* message) {
+  bool Matches(nsIMsgDBHdr* message, uint64_t) override {
     PRTime date;
     message->GetDate(&date);
     return date >= mStartDate && date <= mEndDate;

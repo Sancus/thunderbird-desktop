@@ -240,7 +240,7 @@ Native gtest build/qualification proceeds independently.
 
 ## Raw database task groups and physical view identity
 
-The manual catalog has 170 JS rows; NumericProperties remains pending-contract.
+The manual catalog has 179 JS rows; NumericProperties remains pending-contract.
 Publication declares all nine tasks with the accepted snapshot031 source;
 ConversationIngestion retains all four.
 These panorama:none files each require one literal anonymous setup, assertions
@@ -308,3 +308,25 @@ The two Panorama PublicationWitness file/store cases require both native-stop
 witness tasks and setupLocalPublicationWitness, with all six literal folders.
 They remain pending-product and provide no runtime credit before matching-build,
 XPConnect, fault/stop ordering, registrar restoration and process/profile checks.
+
+## Flat adapter task registration
+
+views:panorama:none:LiveViewDataAdapter is one manual raw-DB file case with all
+19 literal tasks: five existing CamelCase names and fourteen test_ names. Only
+this exact case admits the five legacy names; other naming rules are unchanged.
+The anonymous setup must assert the genuine nsIDatabaseCore backend after the
+fixture installation. Every task must assert and finish, with exact file/suite
+completion. No folder or physical store evidence is claimed or accepted.
+
+Compose the accepted adapter594e and witnessed tested521 source with this metadata
+atomically. The five-task source fails the nineteen-task admission. Matching
+packaged module, generated interfaces and fresh process/profile receipts remain
+required. The three unchanged Threaded, Conversations and Grouped adapter suites
+must also run completely through their existing ordinary manifest; this single
+manual row supplies none of their runtime credit.
+
+This covers an unwired, fully loaded flat consumer only. Grouped/sparse support,
+unknown listeners, producer generation, public native emission, graph mutation,
+native UI and full-view qualification remain held. Genuine missing-witness,
+wrong-lane/backend and consumer negative controls plus source restoration remain
+NOTRUN; source registration and synthetic logs are not qualification.

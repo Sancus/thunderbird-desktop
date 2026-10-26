@@ -19,6 +19,25 @@ from urllib.parse import unquote
 HERE = Path(__file__).resolve().parent
 CONTRACTS = {"mbox": "berkeleystore", "maildir": "maildirstore"}
 
+_LEGACY_VIEW_TASKS = (
+    "testColumnContents", "testAddRemoveDateDescending", "testAddRemoveDateAscending",
+    "testAddRemoveSubjectDescending", "testAddRemoveSubjectAscending",
+)
+
+
+def _legacy_view_tasks(case):
+    if case["id"] != "views:panorama:none:LiveViewDataAdapter":
+        return False
+    if (case["manifest"] != "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-db.toml"
+        or case["file"] != "test_liveViewDataAdapter.js"
+        or (case["backend"], case["store"], case["fixture"], case["diagnostics"])
+           != ("panorama", "none", "raw-db", "backend")
+        or case.get("anonymous_setup") is not True or case.get("folder_roles")
+        or case.get("task") or case.get("setups")
+        or not isinstance(case.get("tasks"), list) or not case["tasks"]):
+        raise ValueError("legacy view tasks require their exact manual raw-DB case and anonymous setup")
+    return True
+
 
 def _expected_folder_parents(case):
     if "folder_parent_uris" not in case:
@@ -48,6 +67,7 @@ def check_log(log, case, returncode=0, raw_logs=()):
     first_failure, folder_evidence = None, {}
     try:
         expected_parents = _expected_folder_parents(case)
+        task_names = r"[A-Za-z_$][\w$]*" if _legacy_view_tasks(case) else r"test_\w+"
         raw = Path(log).read_text(encoding="utf-8")
         if not raw.endswith("\n"):
             errors.append("incomplete JSONL (missing final newline)")
@@ -109,7 +129,7 @@ def check_log(log, case, returncode=0, raw_logs=()):
                 message = message[1:-1]
             if case.get("task") or declared_tasks:
                 task = re.fullmatch(
-                    r"\(xpcshell/head\.js\) \| test(?: (test_\w+))? (pending|finished) \(\d+\)", message)
+                    r"\(xpcshell/head\.js\) \| test(?: (" + task_names + r"))? (pending|finished) \(\d+\)", message)
                 if task:
                     if not active:
                         errors.append("task event outside active file")
@@ -238,6 +258,7 @@ def prepare(config, case):
     """Resolve native source paths and reject mismatched manifest declarations."""
     source = Path(config["source"])
     comm = source / "comm"
+    legacy_view = _legacy_view_tasks(case)
     manifest = (comm / case["manifest"]).resolve()
     if not manifest.is_relative_to(comm.resolve()) or Path(case["file"]).name != case["file"]:
         raise ValueError("case paths must remain in source comm/")
@@ -301,7 +322,8 @@ def prepare(config, case):
             or (not raw_tasks and case.get("anonymous_setup"))
             or not isinstance(names, list) or not names
             or not isinstance(setups, list)
-            or any(not isinstance(n, str) or not re.fullmatch(r"test_\w+", n) for n in names)
+            or any(not isinstance(n, str) or not (re.fullmatch(r"test_\w+", n)
+                   or legacy_view and n in _LEGACY_VIEW_TASKS) for n in names)
             or any(not isinstance(n, str) or not re.fullmatch(r"\w+", n) for n in setups)
             or len(set(names)) != len(names) or len(set(setups)) != len(setups)):
             raise ValueError("invalid named tasks/setup declaration")

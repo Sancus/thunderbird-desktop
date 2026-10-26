@@ -695,7 +695,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 43)
-        self.assertEqual(len({c["id"] for c in catalog}), 178)
+        self.assertEqual(len({c["id"] for c in catalog}), 179)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -987,8 +987,8 @@ support-files = ["fixture.sql"]
                  "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
                                               "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
         rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
-        self.assertEqual(len(catalog), 178)
-        self.assertEqual(len({c["id"] for c in catalog}), 178)
+        self.assertEqual(len(catalog), 179)
+        self.assertEqual(len({c["id"] for c in catalog}), 179)
         self.assertEqual(len(rows), 8)
         for store in ("mbox", "maildir"):
             lane = [c for c in rows if c["store"] == store]
@@ -1104,8 +1104,8 @@ support-files = ["fixture.sql"]
 
     def test_new_raw_catalog_and_view_lanes_are_exact_manual_cases(self):
         catalog = json.loads((runner.HERE / "cases.json").read_text())
-        self.assertEqual(len(catalog), 178)
-        self.assertEqual(len({c["id"] for c in catalog}), 178)
+        self.assertEqual(len(catalog), 179)
+        self.assertEqual(len({c["id"] for c in catalog}), 179)
         expected = {
             "core:Publication": ["test_publishCommittedMessageOnce",
                 "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
@@ -1680,6 +1680,133 @@ support-files = ["fixture.sql"]
             wrong = copy.deepcopy(events)
             wrong[2] = self.diag("BACKEND", {"expected": "panorama", "actualBackend": "mork"})
             self.assertFalse(self.check(wrong, case)["ok"])
+
+    def view_task_case(self):
+        rows = [case for case in json.loads((runner.HERE / "cases.json").read_text())
+                if case["id"] == "views:panorama:none:LiveViewDataAdapter"]
+        self.assertEqual(len(rows), 1)
+        case = rows[0]
+        self.assertEqual(case["tasks"], [
+            "testColumnContents",
+            "testAddRemoveDateDescending",
+            "testAddRemoveDateAscending",
+            "testAddRemoveSubjectDescending",
+            "testAddRemoveSubjectAscending",
+            "test_threadBatchKeepsEqualDateRowsAndSelection",
+            "test_threadBatchInstallsPublicationBeforeOneReset",
+            "test_threadBatchDepartedRowsDoNotSelectNeighbors",
+            "test_threadBatchValidationLeavesRowsUntouched",
+            "test_threadBatchDiscardsOldQueryAndDetachedChunks",
+            "test_threadBatchGroupedConsumersRemainHeld",
+            "test_threadBatchDiscardsStaleSelectCompletion",
+            "test_threadBatchRejectsSparseCacheAndIncompleteComponents",
+            "test_threadBatchVersionsNeverEnterOrdinaryOverrides",
+            "test_threadBatchRejectsInvalidPhysicalDomains",
+            "test_threadBatchRejectsInvalidNumericDomains",
+            "test_threadBatchRejectsGlobalKeyFolderConflicts",
+            "test_threadBatchAcceptsNativeNumericBoundaries",
+            "test_threadBatchPreservesCapturedThreadAbsenceValues",])
+        self.assertEqual((case["backend"], case["store"], case["fixture"], case["diagnostics"]),
+                         ("panorama", "none", "raw-db", "backend"))
+        self.assertTrue(case["anonymous_setup"])
+        self.assertEqual(case["readiness"], "pending-product")
+        self.assertFalse(case.get("folder_roles"))
+        self.assertNotIn("phase", case)
+        return case
+
+    def view_task_events(self, case):
+        events = copy.deepcopy(self.raw_task_events(case))
+        for event in events:
+            if "test" in event:
+                event["test"] = case["file"]
+            if event["action"] == "suite_start":
+                event["tests"] = {"manual": [case["file"]]}
+        return events
+
+    def test_view_tasks_require_all_nineteen_names_and_setup_evidence(self):
+        case = self.view_task_case()
+        events = self.view_task_events(case)
+        self.assertTrue(self.check(events, case)["ok"])
+        for index in range(len(events)):
+            with self.subTest(missing=index):
+                result = self.check(events[:index] + events[index + 1:], case)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["coverage"], "none")
+        for name in ("testUnexpectedViewTask", "$unexpectedViewTask", case["tasks"][0]):
+            extra = [{"action": "log", "message": f"(xpcshell/head.js) | test {name} pending (2)"},
+                     {"action": "test_status", "test": case["file"], "status": "PASS"},
+                     {"action": "log", "message": f"(xpcshell/head.js) | test {name} finished (2)"}]
+            self.assertFalse(self.check(events[:-2] + extra + events[-2:], case)["ok"])
+        for changes in ({"actualBackend": "mork"}, {"store": "mbox"}, {"scope": "folder"}):
+            wrong = copy.deepcopy(events)
+            wrong[4] = self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama",
+                                           "store": "none", "scope": "metadata-only", **changes})
+            self.assertFalse(self.check(wrong, case)["ok"])
+        moved = events[:4] + events[5:6] + [events[4]] + events[6:]
+        self.assertFalse(self.check(moved, case)["ok"])
+        self.assertFalse(self.check(events[:-2] + [self.diag("FOLDER", self.folder)] + events[-2:], case)["ok"])
+        self.assertFalse(self.check(events, {**case, "id": "unit:other"})["ok"])
+        wrong = copy.deepcopy(events)
+        wrong[7]["status"] = "SKIP"
+        self.assertFalse(self.check(wrong, case)["ok"])
+        wrong[7]["status"] = "FAIL"
+        self.assertIsNotNone(self.check(wrong, case)["first_failure"])
+        self.assertFalse(self.check(events, case, returncode=7)["ok"])
+
+    def test_view_preflight_binds_actual_source_and_rejects_partial_admission(self):
+        import shutil
+        case = self.view_task_case()
+        config, _ = self.initializer_fixture()
+        comm = runner.HERE.parents[4]
+        target = Path(config["source"]) / "comm"
+        manifest = comm / case["manifest"]
+        doc = runner.tomllib.loads(manifest.read_text())
+        paths = [manifest] + [manifest.parent / name for name in doc if name != "DEFAULT"]
+        paths += [manifest.parent / name for name in doc["DEFAULT"]["head"].split()]
+        paths += [manifest.parent / name for name in doc["DEFAULT"]["support-files"]]
+        paths += [comm / name for name in case["source_dependencies"]]
+        for original in paths:
+            destination = target / original.relative_to(comm)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, destination)
+        runtime = Path(config["source"]) / "testing/xpcshell/head.js"
+        runtime.write_text("// synthetic harness input; no xpcshell execution")
+        _, bound = runner.prepare(config, case)
+        self.assertTrue({target / name for name in case["source_dependencies"]} <= set(bound))
+        self.assertIn(runtime, bound)
+        for changes in ({"tasks": case["tasks"][5:]}, {"tasks": case["tasks"][:-1]},
+                        {"tasks": ["testInjected"] + case["tasks"][1:]},
+                        {"id": "unit:other"}, {"anonymous_setup": False},
+                        {"folder_roles": {"target": "invented"}}, {"store": "mbox"},
+                        {"backend": "mork"}, {"manifest": case["manifest"].replace("xpcshell-delivery-db", "xpcshell")}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                runner.prepare(config, {**case, **changes})
+        test = target / case["manifest"]
+        test = test.parent / case["file"]
+        text = test.read_text()
+        for changed in (text + "\nadd_task(function test_extra() {});",
+                        text.replace("function ()", "function setupRenamed()", 1),
+                        text.replace("add_setup(async function", "add_setup({skip_if: true}, async function", 1)):
+            test.write_text(changed)
+            with self.assertRaisesRegex(ValueError, "named tasks/setup"):
+                runner.prepare(config, case)
+        test.write_text(text)
+        for name in ("mailnews/db/panorama/content/LiveViewDataAdapter.mjs",
+                     "mailnews/db/msgdb/public/nsIMsgDatabase.idl"):
+            missing = target / name
+            saved = missing.read_bytes()
+            missing.unlink()
+            with patch.object(runner.subprocess, "run") as launch:
+                output = self.root / ("view-missing-" + missing.stem)
+                output.mkdir()
+                result = runner.run_case(config, case, output)
+                launch.assert_not_called()
+                self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                                 (None, "blocked", "none"))
+            missing.write_bytes(saved)
+        self.assertIn('["test_liveViewDataAdapter.js"]',
+                      (manifest.parent / "xpcshell.toml").read_text())
+        self.assertNotIn(manifest.name, (manifest.parent.parent / "moz.build").read_text())
 
 
 if __name__ == "__main__":

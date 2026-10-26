@@ -113,3 +113,5 @@ support-files = ["db/messages.sql"]
 ["test_deliveryCompatibilityPropertiesUint32ReadError.js"]
 
 ["test_deliveryCompatibilityPropertiesUint32WriteError.js"]
+
+["test_liveViewDataAdapter.js"]

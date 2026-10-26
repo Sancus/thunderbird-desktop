@@ -33,6 +33,7 @@
 #include "mozilla/Components.h"
 #include "mozilla/Logging.h"
 #include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_mail.h"
 
 static mozilla::LazyLogModule MailDirLog("MailDirStore");
 
@@ -1065,6 +1066,15 @@ nsMsgMaildirStore::CopyMessages(bool aIsMove,
   if (!destLocalFolder) return NS_OK;
   nsCOMPtr<nsIMsgLocalMailFolder> srcLocalFolder(do_QueryInterface(srcFolder));
   if (!srcLocalFolder) return NS_OK;
+
+#ifdef MOZ_PANORAMA
+  // Panorama cannot clone headers here. Decline before changing any files.
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    aDstHdrs.Clear();
+    *aUndoAction = nullptr;
+    return NS_OK;
+  }
+#endif
 
   // We should be able to use a file move for an efficient copy.
 

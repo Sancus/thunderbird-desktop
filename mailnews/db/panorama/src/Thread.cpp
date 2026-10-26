@@ -4,6 +4,7 @@
 
 #include "Thread.h"
 
+#include "nsMsgMessageFlags.h"
 #include "prtime.h"
 
 namespace mozilla::mailnews {
@@ -44,7 +45,22 @@ NS_IMETHODIMP Thread::GetNumChildren(uint32_t* aNumChildren) {
   return NS_OK;
 }
 NS_IMETHODIMP Thread::GetNumUnreadChildren(uint32_t* aNumUnreadChildren) {
+  NS_ENSURE_ARG_POINTER(aNumUnreadChildren);
   *aNumUnreadChildren = 0;
+  nsTArray<nsMsgKey> keys;
+  nsresult rv = GetKeys(keys);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  uint32_t unread = 0;
+  for (nsMsgKey key : keys) {
+    uint32_t flags;
+    rv = MessageDB().GetMessageFlags(key, flags);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (!(flags & nsMsgMessageFlags::Read)) {
+      ++unread;
+    }
+  }
+  *aNumUnreadChildren = unread;
   return NS_OK;
 }
 NS_IMETHODIMP Thread::GetNumNewChildren(uint32_t* aNumNewChildren) {
@@ -115,12 +131,7 @@ NS_IMETHODIMP Thread::EnumerateMessages(nsMsgKey parent,
 }
 
 nsresult Thread::GetKeys(nsTArray<nsMsgKey>& keys) {
-  if (mKeys.IsEmpty()) {
-    nsresult rv = MessageDB().ListThreadKeys(mFolderId, 0, mThreadId, mKeys);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-  keys = mKeys.Clone();
-  return NS_OK;
+  return MessageDB().ListThreadKeys(mFolderId, 0, mThreadId, keys);
 }
 
 NS_IMETHODIMP ThreadMessageEnumerator::GetNext(nsIMsgDBHdr** aItem) {

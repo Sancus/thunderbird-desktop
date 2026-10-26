@@ -47,6 +47,33 @@ add_task(function test_childMembershipUpdatesOnDeletion() {
     )
   );
 
+  const oldMessageId = reply.messageId;
+  const oldFlags = reply.flags;
+  const deleted = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged() {},
+    onHdrAdded() {},
+    onParentChanged() {},
+    onAnnouncerGoingAway() {},
+    onReadChanged() {},
+    onJunkScoreChanged() {},
+    onHdrPropertyChanged() {},
+    onEvent() {},
+    onHdrDeleted(header, _parent, flags) {
+      deleted.push({
+        key: header.messageKey,
+        messageId: header.messageId,
+        folder: header.folder,
+        headerFlags: header.flags,
+        flags,
+        count: thread.numChildren,
+        keys: [thread.getChildKeyAt(0), thread.getChildKeyAt(1)],
+      });
+    },
+  };
+  db.addListener(listener);
+  registerCleanupFunction(() => db.removeListener(listener));
   db.deleteMessage(reply.messageKey, null, false);
   Assert.equal(thread.numChildren, 2, "Deletion updates the held thread count");
   Assert.deepEqual(
@@ -56,5 +83,38 @@ add_task(function test_childMembershipUpdatesOnDeletion() {
     ].toSorted((a, b) => a - b),
     [root.messageKey, later.messageKey].toSorted((a, b) => a - b),
     "Child access excludes the deleted message after earlier child access"
+  );
+  Assert.deepEqual(
+    deleted,
+    [
+      {
+        key: reply.messageKey,
+        messageId: oldMessageId,
+        folder,
+        headerFlags: oldFlags,
+        flags: oldFlags,
+        count: 2,
+        keys: [root.messageKey, later.messageKey],
+      },
+    ],
+    "Removal callbacks retain the old header and expose current membership"
+  );
+  Assert.throws(() => thread.getChildKeyAt(2), /NS_ERROR_UNEXPECTED/);
+  Assert.throws(() => thread.getChildHdrAt(2), /NS_ERROR_UNEXPECTED/);
+
+  const statement = database.connectionForTests.createStatement(
+    "SELECT id FROM messages WHERE folderId = :folderId ORDER BY id"
+  );
+  registerCleanupFunction(() => statement.finalize());
+  statement.params.folderId = folder.id;
+  const remaining = [];
+  while (statement.executeStep()) {
+    remaining.push(statement.row.id);
+  }
+  statement.reset();
+  Assert.deepEqual(
+    remaining,
+    [root.messageKey, later.messageKey],
+    "Only the requested message row is removed"
   );
 });

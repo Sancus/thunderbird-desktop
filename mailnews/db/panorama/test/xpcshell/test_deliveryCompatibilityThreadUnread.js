@@ -65,4 +65,15 @@ add_task(function test_numUnreadChildrenFollowsFolderReadState() {
     "Other folders do not change this count"
   );
   Assert.equal(thread.numChildren, 2, "Read changes preserve total membership");
+
+  db.deleteMessage(reply.messageKey, null, false);
+  Assert.equal(thread.numChildren, 1);
+  Assert.equal(
+    thread.numUnreadChildren,
+    1,
+    "Deleted unread children are excluded"
+  );
+  root.markRead(true);
+  Assert.equal(thread.numUnreadChildren, 0);
+  Assert.equal(otherThread.numUnreadChildren, 0);
 });

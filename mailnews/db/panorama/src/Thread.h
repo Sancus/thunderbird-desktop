@@ -36,7 +36,6 @@ class Thread : public nsIMsgThread {
   uint64_t mMaxDate;
 
   nsresult GetKeys(nsTArray<nsMsgKey>& keys);
-  nsTArray<nsMsgKey> mKeys;
 };
 
 class ThreadMessageEnumerator : public nsBaseMsgEnumerator {

@@ -59,4 +59,12 @@ add_task(function test_childMembershipUpdatesOnInsertion() {
     ),
     "Child access includes the inserted message after earlier child access"
   );
+  Assert.deepEqual(
+    [0, 1, 2].map(index => thread.getChildKeyAt(index)),
+    [root.messageKey, reply.messageKey, later.messageKey],
+    "The held thread keeps root-first sibling order after insertion"
+  );
+  for (const index of [0, 1, 2]) {
+    Assert.equal(thread.getChildHdrAt(index).folder, folder);
+  }
 });

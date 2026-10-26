@@ -324,6 +324,21 @@ prefs = ["mail.panorama.enabled=true", "mail.serverDefaultStoreContractID=@mozil
                 if field == "folderURI":
                     self.assertIn("declared fixture folders do not share a parent", result["errors"])
 
+    def test_hyphenated_folder_diagnostics_keep_literal_and_ambiguous_identity(self):
+        case = {**self.case, "folder_roles": {"fixture": "init-failure"}}
+        for leaf in ("init-failure", "init%2Dfailure"):
+            with self.subTest(leaf=leaf):
+                result = self.check(self.folder_events([leaf]), case)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["folder_evidence"], {"fixture": "mailbox://test/" + leaf})
+        for leaves in (["init%252Dfailure"], ["init%2Ffailure"],
+                       ["init-failure", "init%2Dfailure"]):
+            with self.subTest(leaves=leaves):
+                result = self.check(self.folder_events(leaves), case)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["coverage"], "none")
+                self.assertIn("missing or ambiguous folder evidence: fixture", result["errors"])
+
     def test_workflow_requires_declared_folder_scope_without_fabricated_phase(self):
         case = {**self.case, "folder_roles": {
             "first": "listFirst", "second": "listSecond", "outside": "listOutside"}}
@@ -375,7 +390,11 @@ prefs = ["mail.panorama.enabled=true", "mail.serverDefaultStoreContractID=@mozil
 
     def test_invalid_folder_role_declarations_block_before_manifest_read(self):
         for roles in (["source"], {"one": "source", "two": "source"},
-                      {"source": "../source"}, {"source": 1}):
+                      {"source": "../source"}, {"source": 1},
+                      *({"source": name} for name in ("", "-init", "init-", "init--failure",
+                         "init..failure", "init.-failure", "init/failure", "init\\failure",
+                         "init%2Dfailure", "init%2Ffailure", "init?failure", "init#failure",
+                         "init failure", "init\nfailure", "init\0failure"))):
             with self.subTest(roles=roles), self.assertRaisesRegex(ValueError, "folder roles"):
                 runner.prepare({"source": str(self.root)}, {**self.case, "folder_roles": roles})
 
@@ -864,6 +883,58 @@ support-files = ["fixture.sql"]
                 with self.subTest(path=relative, stale=stale), self.assertRaisesRegex(ValueError, "blocked-dependency"):
                     runner.prepare(config, case)
             target.write_text(content)
+
+    def test_initializer_catalog_preflight_accepts_literal_folder_roles(self):
+        import shutil
+        config, _ = self.initializer_fixture()
+        comm = runner.HERE.parents[4]
+        source = Path(config["source"]) / "comm"
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        cases = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
+        self.assertEqual(len(cases), 8)
+        control = next(c for c in catalog if c["id"] == "local:panorama:mbox:Move")
+        for case in cases + [control]:
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [manifest.parent / n for n in doc["DEFAULT"]["head"].split()]
+            paths += [manifest.parent / n for n in doc["DEFAULT"].get("support-files", [])]
+            for original in paths:
+                target = source / original.resolve().relative_to(comm)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, target)
+        module = "mailnews/test/resources/MessageGenerator.sys.mjs"
+        shutil.copyfile(comm / module, source / module)
+        shutil.copyfile(comm / module, Path(config["objdir"]) / "_tests/modules/mailnews/MessageGenerator.sys.mjs")
+        with patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=7)) as execute:
+            for index, case in enumerate(cases + [control]):
+                with self.subTest(case=case["id"]):
+                    manifest, paths = runner.prepare(config, case)
+                    selected = manifest.parent / case["file"]
+                    self.assertIn(selected, paths)
+                    self.assertEqual(selected.read_bytes(), (comm / case["manifest"]).with_name(case["file"]).read_bytes())
+                    output = self.root / ("actual-" + str(index))
+                    output.mkdir()
+                    execute.reset_mock()
+                    record = runner.run_case(config, case, output)
+                    execute.assert_called_once()
+                    self.assertEqual(execute.call_args.args[0][-1], str(selected))
+                    self.assertEqual(record["exit_code"], 7)
+                    self.assertEqual(record["disposition"], "failed")
+                    self.assertEqual(record["coverage"], "none")
+            for index, roles in enumerate(({"fixture": "init/failure"},
+                    {"fixture": "init%2Dfailure"}, {"fixture": "init--failure"},
+                    {"first": "init-failure", "second": "init-failure"})):
+                with self.subTest(invalid=roles):
+                    output = self.root / ("invalid-" + str(index))
+                    output.mkdir()
+                    execute.reset_mock()
+                    record = runner.run_case(config, {**cases[0], "folder_roles": roles}, output)
+                    execute.assert_not_called()
+                    self.assertEqual(record["disposition"], "blocked")
+                    self.assertIsNone(record["exit_code"])
+                    self.assertEqual(record["coverage"], "none")
+                    self.assertIn("folder roles", " ".join(record["errors"]))
 
     def test_initializer_unknown_or_debug_mode_refuses_before_launch(self):
         config, case = self.initializer_fixture()

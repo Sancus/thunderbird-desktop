@@ -218,7 +218,7 @@ def prepare(config, case):
             raise ValueError("store=none is reserved for raw DB fixtures")
     roles = case.get("folder_roles", {})
     if (not isinstance(roles, dict) or (roles and case["diagnostics"] != "folder")
-        or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*", name)
+        or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:[.-][A-Za-z][A-Za-z0-9]*)*", name)
                for name in roles.values()) or len(set(roles.values())) != len(roles)):
         raise ValueError("folder roles require distinct literal fixture names and folder scope")
     if case["readiness"] not in ("ready", "pending-product", "pending-contract"):

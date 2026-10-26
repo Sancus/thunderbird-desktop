@@ -776,6 +776,10 @@ nsresult nsMsgMaildirStore::InternalGetNewMsgOutputStream(
         nsPrintfCString("Already writing to folder '%s'", folder->URI().get())
             .get());
 
+    if (NS_FAILED(existing->value().finishStatus)) {
+      return existing->value().finishStatus;
+    }
+
     // Close stream, delete partly-written file, remove from ongoing set.
     existing->value().stream->Close();
     nsCOMPtr<nsIFile> partial;
@@ -834,107 +838,114 @@ NS_IMETHODIMP
 nsMsgMaildirStore::FinishNewMessage(nsIMsgFolder* folder,
                                     nsIOutputStream* outStream,
                                     nsACString& storeToken) {
-  // To commit the message we want to:
-  // 1. Close the output stream.
-  // 2. Move the completed file from "tmp/" to "cur/".
-  // 3. Remove the entry in mOngoingWrites.
-  // 4. Return the filename in "cur/" as the storeToken.
-
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG(outStream);
 
   auto entry = mOngoingWrites.lookup(folder->URI());
-  if (!entry) {
-    // We should have a record of the write!
+  if (!entry || outStream != entry->value().stream) {
     return NS_ERROR_ILLEGAL_VALUE;
   }
+  auto& details = entry->value();
+  if (NS_FAILED(details.finishStatus)) {
+    return details.finishStatus;
+  }
+  auto fail = [&](nsresult status) {
+    details.finishStatus = status;
+    MOZ_LOG(
+        MailDirLog, mozilla::LogLevel::Error,
+        ("Finish failed: folder=%s token=%s mayHaveMoved=%d status=%" PRIx32,
+         folder->URI().get(), details.filename.get(), details.mayHaveMoved,
+         static_cast<uint32_t>(status)));
+    return status;
+  };
 
-  // Take a copy of the entry before we remove it.
-  StreamDetails details = entry->value();
-  mOngoingWrites.remove(entry);
-
-  // Should be the stream we issued originally!
-  MOZ_ASSERT(outStream == details.stream);
-
-  // Path to the new destination dir.
   nsCOMPtr<nsIFile> curDir;
   nsresult rv = EnsureSubDir(folder, u"cur"_ns, getter_AddRefs(curDir));
-  NS_ENSURE_SUCCESS(rv, rv);
+  if (NS_FAILED(rv)) return fail(rv);
 
-  // Path to the downloaded message in "tmp/".
   nsCOMPtr<nsIFile> tmpFile;
   rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
-  NS_ENSURE_SUCCESS(rv, rv);
-  tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
-
-  // In case we fail before moving the file into place.
-  auto tmpGuard = mozilla::MakeScopeExit([&] { tmpFile->Remove(false); });
+  if (NS_FAILED(rv)) return fail(rv);
+  rv = tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
+  if (NS_FAILED(rv)) return fail(rv);
 
   rv = outStream->Close();
-  NS_ENSURE_SUCCESS(rv, rv);
+  if (NS_FAILED(rv)) return fail(rv);
 
-  // While downloading messages, filter actions can shortcut things and
-  // move messages under us. They definitely should not do it like that
-  // (Bug 1028372), but for now we'll check to see if it's already been
-  // moved into "cur/".
+  // Filters can move the file into cur before the download finishes.
   bool exists;
-  tmpFile->Exists(&exists);
+  rv = tmpFile->Exists(&exists);
+  if (NS_FAILED(rv)) return fail(rv);
   if (!exists) {
-    tmpGuard.release();  // Won't need to delete it!
-    // Not in "tmp/"... is it in "cur/" now?
+    details.mayHaveMoved = true;
     nsCOMPtr<nsIFile> destPath;
-    curDir->Clone(getter_AddRefs(destPath));
-    destPath->Append(NS_ConvertUTF8toUTF16(details.filename));
-    destPath->Exists(&exists);
-    if (exists) {
-      // It's already been moved to "cur/". We'll just accept that.
-      return NS_OK;
+    rv = curDir->Clone(getter_AddRefs(destPath));
+    if (NS_FAILED(rv)) return fail(rv);
+    rv = destPath->Append(NS_ConvertUTF8toUTF16(details.filename));
+    if (NS_FAILED(rv)) return fail(rv);
+    rv = destPath->Exists(&exists);
+    if (NS_FAILED(rv)) return fail(rv);
+    if (!exists) {
+      rv = fail(NS_ERROR_FILE_NOT_FOUND);
+      NS_ERROR("FinishNewMessage - oops! file does not exist!");
+      return rv;
     }
-    NS_ERROR("FinishNewMessage - oops! file does not exist!");
-    return NS_ERROR_FILE_NOT_FOUND;
+  } else {
+    // A failed rename may still have settled bytes in cur. Keep its identity.
+    details.mayHaveMoved = true;
+    rv = tmpFile->MoveTo(curDir, EmptyString());
+    if (NS_FAILED(rv)) return fail(rv);
   }
 
-  // Move into "cur/".
-  rv = tmpFile->MoveTo(curDir, EmptyString());
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  tmpGuard.release();
   storeToken = details.filename;
+  mOngoingWrites.remove(entry);
   return NS_OK;
 }
 
 NS_IMETHODIMP
 nsMsgMaildirStore::DiscardNewMessage(nsIMsgFolder* folder,
                                      nsIOutputStream* outStream) {
-  // To throw away a message we want to:
-  // 1. Close the output stream.
-  // 2. Delete the partial file in "tmp/".
-  // 3. Remove the entry in mOngoingWrites.
-
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG(outStream);
 
   auto entry = mOngoingWrites.lookup(folder->URI());
-  if (!entry) {
-    // We should have a record of the write!
+  if (!entry || outStream != entry->value().stream) {
     return NS_ERROR_ILLEGAL_VALUE;
   }
+  auto& details = entry->value();
+  if (details.mayHaveMoved) {
+    // Discard only owns unfinished tmp bytes, never a possible cur message.
+    return NS_FAILED(details.finishStatus) ? details.finishStatus
+                                           : NS_ERROR_NOT_AVAILABLE;
+  }
+  auto fail = [&](nsresult status) {
+    if (NS_SUCCEEDED(details.finishStatus)) details.finishStatus = status;
+    MOZ_LOG(MailDirLog, mozilla::LogLevel::Error,
+            ("Discard failed: folder=%s token=%s status=%" PRIx32,
+             folder->URI().get(), details.filename.get(),
+             static_cast<uint32_t>(status)));
+    return status;
+  };
 
-  // Take a copy of the entry before we remove it.
-  StreamDetails details = entry->value();
-  mOngoingWrites.remove(entry);
-
-  // Should be the stream we issued originally!
-  MOZ_ASSERT(outStream == details.stream);
-
-  outStream->Close();
+  nsresult rv = outStream->Close();
+  if (NS_FAILED(rv)) return fail(rv);
 
   nsCOMPtr<nsIFile> tmpFile;
-  nsresult rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
-  NS_ENSURE_SUCCESS(rv, rv);
-  tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
+  rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(tmpFile));
+  if (NS_FAILED(rv)) return fail(rv);
+  rv = tmpFile->Append(NS_ConvertUTF8toUTF16(details.filename));
+  if (NS_FAILED(rv)) return fail(rv);
+  bool exists;
+  rv = tmpFile->Exists(&exists);
+  if (NS_FAILED(rv)) return fail(rv);
+  if (!exists) {
+    details.mayHaveMoved = true;
+    return fail(NS_ERROR_FILE_NOT_FOUND);
+  }
+  rv = tmpFile->Remove(false);
+  if (NS_FAILED(rv)) return fail(rv);
 
-  tmpFile->Remove(false);
+  mOngoingWrites.remove(entry);
   return NS_OK;
 }
 

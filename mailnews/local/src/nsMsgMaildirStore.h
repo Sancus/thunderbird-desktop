@@ -40,6 +40,8 @@ class nsMsgMaildirStore final : public nsMsgLocalStoreUtils,
   struct StreamDetails {
     nsAutoCString filename;
     nsCOMPtr<nsIOutputStream> stream;
+    nsresult finishStatus{NS_OK};
+    bool mayHaveMoved{false};
   };
   mozilla::HashMap<nsCString, StreamDetails> mOngoingWrites;
 

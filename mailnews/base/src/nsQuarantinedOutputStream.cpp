@@ -108,8 +108,11 @@ static nsresult copyStreamSafely(nsIInputStream* in, nsIOutputStream* out) {
 }
 
 NS_IMETHODIMP nsQuarantinedOutputStream::Close() {
+  if (mState == eError) {
+    return mError;
+  }
   if (mState != eOpen) {
-    // Already failed or closed or no data written. That's OK.
+    // Already closed or no data written. That's OK.
     return NS_OK;
   }
   nsresult rv = NS_OK;
@@ -121,10 +124,15 @@ NS_IMETHODIMP nsQuarantinedOutputStream::Close() {
     mTempFile->Remove(false);
     mTempFile = nullptr;
   }
-  mTarget->Close();
+  nsresult targetStatus = mTarget->Close();
   mTarget = nullptr;
+  if (NS_SUCCEEDED(rv)) rv = targetStatus;
+  if (NS_FAILED(rv)) {
+    EnterErrorState(rv);
+    return rv;
+  }
   mState = eClosed;
-  return rv;
+  return NS_OK;
 }
 
 NS_IMETHODIMP nsQuarantinedOutputStream::Finish() {
@@ -141,8 +149,12 @@ NS_IMETHODIMP nsQuarantinedOutputStream::Finish() {
   // and prevent us reopening any suspicious-looking file.
   MOZ_ASSERT(mTempStream);
   MOZ_ASSERT(mTempFile);
-  mTempStream->Flush();
-  nsresult rv = mTempStream->Close();
+  nsresult rv = mTempStream->Flush();
+  if (NS_FAILED(rv)) {
+    EnterErrorState(rv);
+    return rv;
+  }
+  rv = mTempStream->Close();
   if (NS_FAILED(rv)) {
     EnterErrorState(rv);
     return rv;
@@ -169,10 +181,10 @@ NS_IMETHODIMP nsQuarantinedOutputStream::Finish() {
   // All done!
   {
     nsCOMPtr<nsISafeOutputStream> safe = do_QueryInterface(mTarget);
-    if (safe) {
-      safe->Finish();
-    } else {
-      mTarget->Close();
+    rv = safe ? safe->Finish() : mTarget->Close();
+    if (NS_FAILED(rv)) {
+      EnterErrorState(rv);
+      return rv;
     }
     mTarget = nullptr;
   }
@@ -237,5 +249,6 @@ NS_IMETHODIMP nsQuarantinedOutputStream::IsNonBlocking(bool* nonBlocking) {
 }
 
 NS_IMETHODIMP nsQuarantinedOutputStream::StreamStatus() {
+  if (mState == eError) return mError;
   return mState == eOpen ? NS_OK : NS_BASE_STREAM_CLOSED;
 }

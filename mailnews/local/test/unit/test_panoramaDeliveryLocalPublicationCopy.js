@@ -17,7 +17,7 @@ const { PromiseTestUtils } = ChromeUtils.importESModule(
 /** @type {{folder: nsIMsgLocalMailFolder, rootFolder: nsIMsgLocalMailFolder}} */
 let publicationFixture;
 
-add_setup(function () {
+add_setup(function setupLocalPublicationCopy() {
   Assert.equal(
     PanoramaDelivery.expectedLane().backend,
     "panorama",

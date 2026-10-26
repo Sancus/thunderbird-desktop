@@ -1571,7 +1571,7 @@ nsMsgLocalMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
     mCopyState->m_copyingMultipleMessages = true;
     rv = CopyMessagesTo(keyArray, msgWindow, isMove);
     if (NS_FAILED(rv)) {
-      NS_ERROR("copy message failed");
+      NS_WARNING("copy message failed");
       (void)OnCopyCompleted(srcSupport, false);
     }
   } else {
@@ -2298,6 +2298,10 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
 
     if (!mCopyState->m_isMove) {
       // Keep completed messages, but report the transfer failure.
+      if (mDatabase) {
+        mDatabase->SetSummaryValid(true);
+        (void)CloseDB();
+      }
       (void)OnCopyCompleted(mCopyState->m_srcSupport, false);
       // enable the dest folder
       EnableNotifications(allMessageCountNotifications, true);
@@ -2569,6 +2573,10 @@ nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
     srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
 
     // Keep completed messages, but report the transfer failure.
+    if (mDatabase) {
+      mDatabase->SetSummaryValid(true);
+      (void)CloseDB();
+    }
     (void)OnCopyCompleted(mCopyState->m_srcSupport, false);
     // enable the dest folder
     EnableNotifications(allMessageCountNotifications, true);

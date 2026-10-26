@@ -7,6 +7,9 @@
 /* import-globals-from ../../../db/panorama/test/xpcshell/head.js */
 /* import-globals-from ../../../db/panorama/test/xpcshell/head_delivery.js */
 
+const { NetUtil } = ChromeUtils.importESModule(
+  "resource://gre/modules/NetUtil.sys.mjs"
+);
 const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
@@ -325,6 +328,189 @@ add_task(
   { skip_if: () => PanoramaDelivery.expectedLane().backend != "panorama" },
   async function test_emptyInputStructuralFailure() {
     await checkStructuralFailure(1, true);
+  }
+);
+
+add_task(
+  {
+    skip_if: () => {
+      const lane = PanoramaDelivery.expectedLane();
+      return lane.backend != "mork" || lane.store != "mbox";
+    },
+  },
+  async function test_partialCopyKeepsLegacySummaryValid() {
+    const lane = PanoramaDelivery.expectedLane();
+    const source = structureFixture.rootFolder
+      .createLocalSubfolder("copy-summary-source")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const destination = structureFixture.rootFolder
+      .createLocalSubfolder("copy-summary-destination")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    PanoramaDelivery.assertFolder(source, lane);
+    const db = PanoramaDelivery.assertFolder(destination, lane);
+    const messages = ["first", "second"].map(name =>
+      source.addMessage(
+        [
+          "Date: Tue, 01 Jan 2019 00:00:00 +0000",
+          "Message-ID: <summary-" + name + "@invalid>",
+          "Subject: " + name,
+          "",
+          name + " body.",
+          "",
+        ].join("\r\n")
+      )
+    );
+    destination.addMessage(
+      "Date: Tue, 01 Jan 2019 00:00:00 +0000\r\n" +
+        "Message-ID: <summary-resident@invalid>\r\n" +
+        "Subject: resident\r\n\r\nResident body.\r\n"
+    );
+    db.summaryValid = true;
+    Assert.ok(db.summaryValid, "The destination starts with a valid summary");
+    const keys = messages.map(header => header.messageKey);
+    const originalToken = messages[1].storeToken;
+    // Same native malformed-read seam as test_mboxMalformed.js.
+    Assert.less(source.filePath.fileSize, 12345678);
+    messages[1].storeToken = "12345678";
+    const tokens = messages.map(header => header.storeToken);
+    const sourceBytes = await IOUtils.read(source.filePath.path);
+    const residentBytes = await IOUtils.read(destination.filePath.path);
+    const additions = [];
+    const summaryDuringCopy = [];
+    const statuses = [];
+    const completed = [];
+    const observer = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged() {},
+      onHdrDeleted() {},
+      onParentChanged() {},
+      onAnnouncerGoingAway() {},
+      onReadChanged() {},
+      onJunkScoreChanged() {},
+      onHdrPropertyChanged() {},
+      onEvent() {},
+      onHdrAdded(header) {
+        additions.push(header.messageId);
+        summaryDuringCopy.push(db.summaryValid);
+      },
+    };
+    const notifier = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgFolderListener"]),
+      msgsMoveCopyCompleted(isMove, sourceHeaders, folder) {
+        if (folder == destination) {
+          completed.push(isMove);
+        }
+      },
+    };
+    Services.fog.testResetFOG();
+    db.addListener(observer);
+    MailServices.mfn.addListener(
+      notifier,
+      MailServices.mfn.msgsMoveCopyCompleted
+    );
+    try {
+      const listener = new PromiseTestUtils.PromiseCopyListener({
+        onStopCopy(status) {
+          statuses.push(status);
+        },
+      });
+      const stopped = listener.promise.then(
+        () => true,
+        () => false
+      );
+      MailServices.copy.copyMessages(
+        source,
+        messages,
+        destination,
+        false,
+        listener,
+        null,
+        false
+      );
+      Assert.equal(await stopped, false, "The partial transfer fails");
+      Assert.equal(
+        Glean.mail.mboxReadErrors.missing_from.testGetValue(),
+        1,
+        "The failed second native source read was reached once"
+      );
+      Assert.deepEqual(statuses, [Cr.NS_ERROR_FAILURE]);
+      Assert.deepEqual(completed, [], "No successful transfer notification");
+      Assert.deepEqual(additions, ["summary-first@invalid"]);
+      Assert.deepEqual(
+        summaryDuringCopy,
+        [false],
+        "The kept prefix changed the mbox before failure revalidation"
+      );
+      Assert.ok(db.summaryValid, "Failure completion revalidates the summary");
+      const destinationBytes = await IOUtils.read(destination.filePath.path);
+      Assert.deepEqual(
+        destinationBytes.subarray(0, residentBytes.length),
+        residentBytes,
+        "The resident bytes remain unchanged"
+      );
+      const reparseEvents = [];
+      destination.ForceDBClosed();
+      const reopened = destination.getDatabaseWithReparse(
+        {
+          QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+          OnStartRunningUrl() {
+            reparseEvents.push("start");
+          },
+          OnStopRunningUrl() {
+            reparseEvents.push("stop");
+          },
+        },
+        null
+      );
+      Assert.ok(reopened.summaryValid, "The reopened summary is valid");
+      Assert.deepEqual(reparseEvents, [], "Reopening did not start a reparse");
+      PanoramaDelivery.assertFolder(destination, lane);
+      const headers = Array.from(destination.messages).sort((a, b) =>
+        a.subject.localeCompare(b.subject)
+      );
+      Assert.deepEqual(
+        headers.map(header => header.messageId),
+        ["summary-first@invalid", "summary-resident@invalid"],
+        "Only the completed prefix and resident survive reopening"
+      );
+      for (const [index, header] of headers.entries()) {
+        const stream = destination.getMsgInputStream(header);
+        let raw = "";
+        try {
+          while (stream.available()) {
+            raw += NetUtil.readInputStreamToString(stream, stream.available());
+          }
+        } finally {
+          stream.close();
+        }
+        const separator = raw.indexOf("\r\n\r\n");
+        Assert.greaterOrEqual(separator, 0);
+        Assert.equal(
+          raw.slice(separator + 4),
+          ["first body.\r\n", "Resident body.\r\n"][index],
+          "Reopened destination bodies remain exact"
+        );
+      }
+      PanoramaDelivery.assertFolder(source, lane);
+      Assert.deepEqual(
+        source.msgDatabase.listAllKeys().sort((a, b) => a - b),
+        keys.toSorted((a, b) => a - b),
+        "Every source identity remains"
+      );
+      Assert.deepEqual(
+        messages.map(header => header.storeToken),
+        tokens
+      );
+      Assert.deepEqual(
+        await IOUtils.read(source.filePath.path),
+        sourceBytes,
+        "The failed transfer preserves all source bytes"
+      );
+    } finally {
+      db.removeListener(observer);
+      MailServices.mfn.removeListener(notifier);
+      messages[1].storeToken = originalToken;
+    }
   }
 );
 

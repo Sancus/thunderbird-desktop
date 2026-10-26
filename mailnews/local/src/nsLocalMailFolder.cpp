@@ -99,12 +99,6 @@ nsLocalMailCopyState::nsLocalMailCopyState()
       m_notifyFolderLoaded(false) {}
 
 nsLocalMailCopyState::~nsLocalMailCopyState() {
-#ifdef MOZ_PANORAMA
-  if (m_finishAttempted || m_discardFailed) {
-    // Settlement is uncertain. The provider retains the write identity.
-    m_fileStream = nullptr;
-  }
-#endif
   if (m_fileStream) m_fileStream->Close();
   if (m_messageService) {
     nsCOMPtr<nsIMsgFolder> srcFolder = do_QueryInterface(m_srcSupport);
@@ -1350,17 +1344,6 @@ NS_IMETHODIMP nsMsgLocalMailFolder::OnAnnouncerGoingAway(
 NS_IMETHODIMP
 nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
                                       bool moveCopySucceeded) {
-#ifdef MOZ_PANORAMA
-  if (mail_panorama_enabled_AtStartup() && mCopyState) {
-    if (NS_FAILED(mCopyState->m_copyError)) {
-      moveCopySucceeded = false;
-    }
-    if (!moveCopySucceeded) {
-      nsresult discardRv = DiscardCopyMessage();
-      NS_WARNING_ASSERTION(NS_SUCCEEDED(discardRv), "copy discard failed");
-    }
-  }
-#endif
   if (mCopyState && mCopyState->m_notifyFolderLoaded)
     NotifyFolderEvent(kFolderLoaded);
 
@@ -1374,11 +1357,7 @@ nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
                      "nsMsgLocalMailFolder::OnCopyCompleted"_ns);
 
   if (mCopyState && !mCopyState->m_newMsgKeywords.IsEmpty() &&
-      mCopyState->m_newHdr
-#ifdef MOZ_PANORAMA
-      && !mail_panorama_enabled_AtStartup()
-#endif
-  ) {
+      mCopyState->m_newHdr) {
     // This is only used by CopyFileMessage().
     AddKeywordsToMessages({&*mCopyState->m_newHdr},
                           mCopyState->m_newMsgKeywords);
@@ -1912,11 +1891,7 @@ nsMsgLocalMailFolder::CopyFileMessage(nsIFile* aFile, nsIMsgDBHdr* msgToReplace,
     }
   }
 
-  if (NS_FAILED(rv)
-#ifdef MOZ_PANORAMA
-      && (!mail_panorama_enabled_AtStartup() || mCopyState)
-#endif
-  ) {
+  if (NS_FAILED(rv)) {
     (void)OnCopyCompleted(fileSupport, false);
   }
 
@@ -2005,17 +1980,7 @@ nsresult nsMsgLocalMailFolder::WriteStartOfNewMessage() {
     char statusStrBuf[50];
     if (mCopyState->m_curCopyIndex < mCopyState->m_messages.Length()) {
       uint32_t dbFlags = 0;
-      nsresult flagsRv =
-          mCopyState->m_messages[mCopyState->m_curCopyIndex]->GetFlags(
-              &dbFlags);
-#ifdef MOZ_PANORAMA
-      if (mail_panorama_enabled_AtStartup() && NS_FAILED(flagsRv)) {
-        mCopyState->m_copyError = flagsRv;
-        mCopyState->m_writeFailed = true;
-        return flagsRv;
-      }
-#endif
-      (void)flagsRv;
+      mCopyState->m_messages[mCopyState->m_curCopyIndex]->GetFlags(&dbFlags);
 
       // write out x-mozilla-status, but make sure we don't write out
       // nsMsgMessageFlags::Offline
@@ -2026,61 +1991,27 @@ nsresult nsMsgLocalMailFolder::WriteStartOfNewMessage() {
       strcpy(statusStrBuf, "X-Mozilla-Status: 0001" MSG_LINEBREAK);
     }
 
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup()) {
-      if (!CopyLine(
-              mozilla::Span<const char>(statusStrBuf, strlen(statusStrBuf)))) {
-        return mCopyState->m_copyError;
-      }
-    } else
-#endif
-      mCopyState->m_fileStream->Write(statusStrBuf, strlen(statusStrBuf),
-                                      &bytesWritten);
-    if (mCopyState->m_parseMsgState
-#ifdef MOZ_PANORAMA
-        && !mail_panorama_enabled_AtStartup()
-#endif
-    ) {
+    mCopyState->m_fileStream->Write(statusStrBuf, strlen(statusStrBuf),
+                                    &bytesWritten);
+    if (mCopyState->m_parseMsgState) {
       mCopyState->m_parseMsgState->ParseAFolderLine(statusStrBuf,
                                                     strlen(statusStrBuf));
     }
 
     // Insert an X-Mozilla-Status2 header.
     result = "X-Mozilla-Status2: 00000000" MSG_LINEBREAK;
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup()) {
-      if (!CopyLine(mozilla::Span<const char>(result.get(), result.Length()))) {
-        return mCopyState->m_copyError;
-      }
-    } else
-#endif
-      mCopyState->m_fileStream->Write(result.get(), result.Length(),
-                                      &bytesWritten);
-    if (mCopyState->m_parseMsgState
-#ifdef MOZ_PANORAMA
-        && !mail_panorama_enabled_AtStartup()
-#endif
-    ) {
+    mCopyState->m_fileStream->Write(result.get(), result.Length(),
+                                    &bytesWritten);
+    if (mCopyState->m_parseMsgState) {
       mCopyState->m_parseMsgState->ParseAFolderLine(result.get(),
                                                     result.Length());
     }
 
     // Insert an X-Mozilla-Keys header.
     result = X_MOZILLA_KEYWORDS;
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup()) {
-      if (!CopyLine(mozilla::Span<const char>(result.get(), result.Length()))) {
-        return mCopyState->m_copyError;
-      }
-    } else
-#endif
-      mCopyState->m_fileStream->Write(result.get(), result.Length(),
-                                      &bytesWritten);
-    if (mCopyState->m_parseMsgState
-#ifdef MOZ_PANORAMA
-        && !mail_panorama_enabled_AtStartup()
-#endif
-    ) {
+    mCopyState->m_fileStream->Write(result.get(), result.Length(),
+                                    &bytesWritten);
+    if (mCopyState->m_parseMsgState) {
       mCopyState->m_parseMsgState->ParseAFolderLine(result.get(),
                                                     result.Length());
     }
@@ -2091,36 +2022,6 @@ nsresult nsMsgLocalMailFolder::WriteStartOfNewMessage() {
 }
 
 #ifdef MOZ_PANORAMA
-// Copy exact property text, excluding native source storage identities.
-static nsresult CopyLocalHdrProperties(nsIMsgDBHdr* destHdr,
-                                       nsIMsgDBHdr* srcHdr,
-                                       const nsACString& skipList) {
-  nsTArray<nsCString> properties;
-  MOZ_TRY(srcHdr->GetProperties(properties));
-  nsCString dontPreserveEx(" "_ns);
-  dontPreserveEx.Append(skipList);
-  dontPreserveEx.Append(' ');
-  for (const auto& property : properties) {
-    if (property.EqualsLiteral("storeToken") ||
-        property.EqualsLiteral("msgOffset") ||
-        property.EqualsLiteral("messageSize") ||
-        property.EqualsLiteral("offlineMessageSize") ||
-        property.EqualsLiteral("lineCount")) {
-      continue;
-    }
-    nsAutoCString name(" "_ns);
-    name.Append(property);
-    name.Append(' ');
-    if (dontPreserveEx.Find(name) != kNotFound) {
-      continue;
-    }
-    nsAutoCString value;
-    MOZ_TRY(srcHdr->GetStringProperty(property.get(), value));
-    MOZ_TRY(destHdr->SetStringProperty(property.get(), value));
-  }
-  return NS_OK;
-}
-
 // Structural fields are separate from GetProperties() in Panorama.
 static nsresult CopyHdrStructure(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr) {
   nsAutoCString value;
@@ -2146,10 +2047,6 @@ static nsresult CopyHdrStructure(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr) {
   nsMsgPriorityValue priority;
   MOZ_TRY(srcHdr->GetPriority(&priority));
   MOZ_TRY(destHdr->SetPriority(priority));
-  MOZ_TRY(srcHdr->GetCharset(value));
-  MOZ_TRY(destHdr->SetCharset(value));
-  MOZ_TRY(srcHdr->GetAccountKey(value));
-  MOZ_TRY(destHdr->SetAccountKey(value));
   MOZ_TRY(srcHdr->GetStringProperty("keywords", value));
   MOZ_TRY(destHdr->SetStringProperty("keywords", value));
 
@@ -2174,54 +2071,32 @@ static nsresult CopyHdrStructure(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr) {
 #endif
 
 nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
-  auto checked = [&](nsresult status) {
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup() && NS_FAILED(status)) {
-      mCopyState->m_copyError = status;
-      mCopyState->m_writeFailed = true;
-    }
-#endif
-    return status;
-  };
   nsresult rv = GetMsgStore(getter_AddRefs(mCopyState->m_msgStore));
-  NS_ENSURE_SUCCESS(rv, checked(rv));
+  NS_ENSURE_SUCCESS(rv, rv);
 
   // NOTE: you can copy into folders without a database... (sigh).
   // See also test_copyToInvalidDB.js.
   if (mCopyState->m_destDB) {
     rv = mCopyState->m_destDB->CreateNewHdr(
         getter_AddRefs(mCopyState->m_newHdr));
-    NS_ENSURE_SUCCESS(rv, checked(rv));
+    NS_ENSURE_SUCCESS(rv, rv);
 #ifdef MOZ_PANORAMA
     if (mail_panorama_enabled_AtStartup() && !mCopyState->m_parseMsgState &&
         mCopyState->m_curCopyIndex < mCopyState->m_messages.Length()) {
       rv = CopyHdrStructure(mCopyState->m_newHdr,
                             mCopyState->m_messages[mCopyState->m_curCopyIndex]);
-      if (NS_SUCCEEDED(rv)) {
-        rv = CopyLocalHdrProperties(
-            mCopyState->m_newHdr,
-            mCopyState->m_messages[mCopyState->m_curCopyIndex], EmptyCString());
-      }
       if (NS_FAILED(rv)) {
         mCopyState->m_newHdr = nullptr;
         mCopyState->m_writeFailed = true;
-        mCopyState->m_copyError = rv;
         return rv;
       }
     }
 #endif
   }
 
-#ifdef MOZ_PANORAMA
-  if (mail_panorama_enabled_AtStartup()) {
-    mCopyState->m_finishAttempted = false;
-    mCopyState->m_discardFailed = false;
-    mCopyState->m_storeToken.Truncate();
-  }
-#endif
   rv = mCopyState->m_msgStore->GetNewMsgOutputStream(
       this, getter_AddRefs(mCopyState->m_fileStream));
-  NS_ENSURE_SUCCESS(rv, checked(rv));
+  NS_ENSURE_SUCCESS(rv, rv);
   if (mCopyState->m_parseMsgState)
     mCopyState->m_parseMsgState->SetNewMsgHdr(mCopyState->m_newHdr);
   return rv;
@@ -2267,17 +2142,8 @@ NS_IMETHODIMP nsMsgLocalMailFolder::BeginCopy() {
   }
   // The flags of the source message can get changed when it is deleted, so
   // save them here.
-  if (mCopyState->m_message) {
-    nsresult flagsRv = mCopyState->m_message->GetFlags(&mCopyState->m_flags);
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup() && NS_FAILED(flagsRv)) {
-      mCopyState->m_copyError = flagsRv;
-      mCopyState->m_writeFailed = true;
-      return flagsRv;
-    }
-#endif
-    (void)flagsRv;
-  }
+  if (mCopyState->m_message)
+    mCopyState->m_message->GetFlags(&(mCopyState->m_flags));
   if (mCopyState->m_listener)
     mCopyState->m_listener->OnProgress(mCopyState->m_curCopyIndex,
                                        mCopyState->m_totalMsgCount);
@@ -2300,22 +2166,14 @@ NS_IMETHODIMP nsMsgLocalMailFolder::CopyData(nsIInputStream* aIStream,
   if (!mCopyState) return NS_ERROR_OUT_OF_MEMORY;
 
   while (aLength > 0 && !mCopyState->m_writeFailed) {
-    uint32_t readCount = 0;
+    uint32_t readCount;
     rv = aIStream->Read(
         mCopyState->m_dataBuffer.begin(),
         std::min((uint32_t)aLength, (uint32_t)mCopyState->m_dataBuffer.Length),
         &readCount);
-    if (NS_SUCCEEDED(rv) && readCount == 0) {
+    if (readCount == 0) {
       rv = NS_ERROR_UNEXPECTED;  // unexpected EOF.
     }
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv)) {
-      if (NS_SUCCEEDED(mCopyState->m_copyError)) {
-        mCopyState->m_copyError = rv;
-      }
-      mCopyState->m_writeFailed = true;
-    }
-#endif
     NS_ENSURE_SUCCESS(rv, rv);
     aLength -= readCount;
     auto data =
@@ -2340,9 +2198,6 @@ bool nsMsgLocalMailFolder::CopyLine(mozilla::Span<const char> line) {
   if (!mCopyState->m_fileStream) {
     ThrowAlertMsg("copyMsgWriteFailed", mCopyState->m_msgWindow);
     mCopyState->m_writeFailed = true;
-#ifdef MOZ_PANORAMA
-    mCopyState->m_copyError = NS_ERROR_FAILURE;
-#endif
     return false;  // Stop processing!
   }
 
@@ -2350,15 +2205,6 @@ bool nsMsgLocalMailFolder::CopyLine(mozilla::Span<const char> line) {
   uint32_t bytesWritten;
   nsresult rv = mCopyState->m_fileStream->Write(line.data(), line.Length(),
                                                 &bytesWritten);
-#ifdef MOZ_PANORAMA
-  if (mail_panorama_enabled_AtStartup() && NS_SUCCEEDED(rv) &&
-      bytesWritten != line.Length()) {
-    rv = NS_ERROR_UNEXPECTED;
-  }
-  if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv)) {
-    mCopyState->m_copyError = rv;
-  }
-#endif
   if (NS_FAILED(rv)) {
     ThrowAlertMsg("copyMsgWriteFailed", mCopyState->m_msgWindow);
     mCopyState->m_writeFailed = true;
@@ -2415,183 +2261,6 @@ void nsMsgLocalMailFolder::CopyHdrPropertiesWithSkipList(
   }
 }
 
-#ifdef MOZ_PANORAMA
-// Measure the retrievable destination bytes, excluding mbox framing/escaping.
-static nsresult ReadStoredMessageDetails(nsIMsgPluggableStore* store,
-                                         nsIMsgFolder* folder,
-                                         const nsACString& token,
-                                         uint32_t* size, uint32_t* lines) {
-  if (token.IsEmpty()) {
-    return NS_ERROR_UNEXPECTED;
-  }
-  nsCOMPtr<nsIInputStream> stream;
-  MOZ_TRY(store->GetMsgInputStream(folder, token, 0, getter_AddRefs(stream)));
-  uint64_t byteCount = 0;
-  uint64_t bodyLines = 0;
-  uint64_t lineLength = 0;
-  bool inHeaders = true;
-  char previous = 0;
-  nsresult rv;
-  char buffer[COPY_BUFFER_SIZE];
-  while (true) {
-    uint32_t count = 0;
-    rv = stream->Read(buffer, sizeof(buffer), &count);
-    if (NS_FAILED(rv) || !count) {
-      break;
-    }
-    byteCount += count;
-    if (byteCount > UINT32_MAX) {
-      rv = NS_ERROR_ILLEGAL_VALUE;
-      break;
-    }
-    for (uint32_t i = 0; i < count; ++i) {
-      ++lineLength;
-      if (buffer[i] == '\n') {
-        if (inHeaders) {
-          if (lineLength == 1 || (lineLength == 2 && previous == '\r')) {
-            inHeaders = false;
-          }
-        } else {
-          ++bodyLines;
-        }
-        lineLength = 0;
-      }
-      previous = buffer[i];
-    }
-  }
-  nsresult closeRv = stream->Close();
-  MOZ_TRY(rv);
-  MOZ_TRY(closeRv);
-  if (!inHeaders && lineLength) {
-    ++bodyLines;
-  }
-  *size = static_cast<uint32_t>(byteCount);
-  *lines = static_cast<uint32_t>(bodyLines);
-  return NS_OK;
-}
-
-nsresult nsMsgLocalMailFolder::DiscardCopyMessage() {
-  if (!mCopyState->m_fileStream || mCopyState->m_finishAttempted ||
-      mCopyState->m_discardFailed) {
-    return NS_OK;
-  }
-  nsresult rv =
-      mCopyState->m_msgStore->DiscardNewMessage(this, mCopyState->m_fileStream);
-  if (NS_FAILED(rv)) {
-    mCopyState->m_discardFailed = true;
-    if (NS_SUCCEEDED(mCopyState->m_copyError)) {
-      mCopyState->m_copyError = rv;
-    }
-  } else {
-    mCopyState->m_fileStream = nullptr;
-  }
-  return rv;
-}
-
-nsresult nsMsgLocalMailFolder::CompleteCopyMessage(nsIMsgDBHdr** liveHdr) {
-  NS_ENSURE_ARG_POINTER(liveHdr);
-  *liveHdr = nullptr;
-  if (!mCopyState->m_fileStream) {
-    return NS_OK;  // EndMessage already completed this member.
-  }
-  if (mCopyState->m_finishAttempted) {
-    return NS_FAILED(mCopyState->m_copyError) ? mCopyState->m_copyError
-                                              : NS_ERROR_UNEXPECTED;
-  }
-  nsCOMPtr<nsIMsgDBHdr> draft = mCopyState->m_newHdr;
-  if (mCopyState->m_parseMsgState) {
-    nsMailboxParseState state;
-    MOZ_TRY(mCopyState->m_parseMsgState->GetState(&state));
-    if (state == nsIMsgParseMailMsgState::ParseHeadersState) {
-      return NS_ERROR_FAILURE;
-    }
-    MOZ_TRY(mCopyState->m_parseMsgState->FinishHeader());
-    MOZ_TRY(mCopyState->m_parseMsgState->GetNewMsgHdr(getter_AddRefs(draft)));
-    if (!draft) {
-      return NS_ERROR_UNEXPECTED;
-    }
-    uint32_t flags;
-    MOZ_TRY(draft->GetFlags(&flags));
-    uint32_t carryOver = nsMsgMessageFlags::New | nsMsgMessageFlags::Read;
-    if (mCopyState->m_message) {
-      carryOver |= nsMsgMessageFlags::HasRe;
-      nsCString excluded;
-      Preferences::GetCString(
-          mCopyState->m_isMove ? "mailnews.database.summary.dontPreserveOnMove"
-                               : "mailnews.database.summary.dontPreserveOnCopy",
-          excluded);
-      MOZ_TRY(CopyLocalHdrProperties(draft, mCopyState->m_message, excluded));
-    } else {
-      carryOver |= nsMsgMessageFlags::Marked;
-    }
-    MOZ_TRY(draft->SetFlags((flags & ~carryOver) |
-                            (mCopyState->m_flags & carryOver)));
-  }
-  if (draft && !mCopyState->m_destDB) {
-    return NS_ERROR_NOT_AVAILABLE;
-  }
-  mCopyState->m_sourceKey = nsMsgKey_None;
-  if (mCopyState->m_message) {
-    MOZ_TRY(mCopyState->m_message->GetMessageKey(&mCopyState->m_sourceKey));
-  }
-  if (draft) {
-    uint32_t flags;
-    MOZ_TRY(draft->GetFlags(&flags));
-    MOZ_TRY(draft->SetFlags(flags & ~nsMsgMessageFlags::Offline));
-    // CopyFileMessage keywords must be complete at the first callback.
-    if (!mCopyState->m_newMsgKeywords.IsEmpty()) {
-      nsAutoCString keywords;
-      MOZ_TRY(draft->GetStringProperty("keywords", keywords));
-      nsTArray<nsCString> keywordsToAdd;
-      ParseString(mCopyState->m_newMsgKeywords, ' ', keywordsToAdd);
-      for (const auto& keyword : keywordsToAdd) {
-        int32_t start, length;
-        if (!MsgFindKeyword(keyword, keywords, &start, &length)) {
-          if (!keywords.IsEmpty()) {
-            keywords.Append(' ');
-          }
-          keywords.Append(keyword);
-        }
-      }
-      MOZ_TRY(draft->SetStringProperty("keywords", keywords));
-    }
-  }
-
-  // Once attempted, Finish is never retried, closed, or compensated here.
-  mCopyState->m_finishAttempted = true;
-  MOZ_TRY(mCopyState->m_msgStore->FinishNewMessage(
-      this, mCopyState->m_fileStream, mCopyState->m_storeToken));
-  if (mCopyState->m_storeToken.IsEmpty()) {
-    return NS_ERROR_UNEXPECTED;  // "0" is a valid token.
-  }
-  if (draft) {
-    MOZ_TRY(draft->SetStoreToken(mCopyState->m_storeToken));
-    if (!mCopyState->m_newMsgKeywords.IsEmpty()) {
-      MOZ_TRY(mCopyState->m_msgStore->ChangeKeywords(
-          {&*draft}, mCopyState->m_newMsgKeywords, true));
-    }
-    uint32_t size, lines;
-    MOZ_TRY(ReadStoredMessageDetails(mCopyState->m_msgStore, this,
-                                     mCopyState->m_storeToken, &size, &lines));
-    mCopyState->m_storedMessageSize = size;
-    MOZ_TRY(draft->SetMessageSize(size));
-    MOZ_TRY(draft->SetOfflineMessageSize(0));
-    MOZ_TRY(draft->SetLineCount(lines));
-    nsCOMPtr<nsIMsgDBHdr> live;
-    MOZ_TRY(mCopyState->m_destDB->AttachHdr(draft, true, getter_AddRefs(live)));
-    mCopyState->m_newHdr = live;
-    MOZ_TRY(live->GetMessageKey(&mCopyState->m_curDstKey));
-    mCopyState->m_destMessages.AppendElement(live);
-    live.forget(liveHdr);
-  }
-  mCopyState->m_fileStream = nullptr;
-  if (mCopyState->m_parseMsgState) {
-    mCopyState->m_parseMsgState->Clear();
-  }
-  return NS_OK;
-}
-#endif
-
 // nsICopyMessageListener.endCopy()
 MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
 nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
@@ -2622,17 +2291,7 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
   nsresult rv = aCopySucceeded ? NS_OK : NS_ERROR_FAILURE;
 
   if (!aCopySucceeded || mCopyState->m_writeFailed) {
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup()) {
-      if (NS_SUCCEEDED(mCopyState->m_copyError)) {
-        mCopyState->m_copyError = NS_ERROR_FAILURE;
-      }
-      mCopyState->m_writeFailed = true;
-      nsresult discardRv = DiscardCopyMessage();
-      NS_WARNING_ASSERTION(NS_SUCCEEDED(discardRv), "copy discard failed");
-    } else
-#endif
-        if (mCopyState->m_fileStream) {
+    if (mCopyState->m_fileStream) {
       mCopyState->m_msgStore->DiscardNewMessage(this, mCopyState->m_fileStream);
       mCopyState->m_fileStream = nullptr;
     }
@@ -2655,36 +2314,6 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
 
   RefPtr<nsLocalMoveCopyMsgTxn> localUndoTxn = mCopyState->m_undoMsgTxn;
 
-  nsCOMPtr<nsIMsgDBHdr> newHdr;
-  bool completeHeader = false;
-#ifdef MOZ_PANORAMA
-  completeHeader = mail_panorama_enabled_AtStartup();
-  if (completeHeader) {
-    rv = CompleteCopyMessage(getter_AddRefs(newHdr));
-    if (NS_FAILED(rv)) {
-      mCopyState->m_copyError = rv;
-      mCopyState->m_writeFailed = true;
-      bool isMove = mCopyState->m_isMove;
-      (void)EndCopy(false);
-      if (isMove && mCopyState) {
-        (void)EndMove(false);
-      }
-      return rv;
-    }
-    if (localUndoTxn && newHdr) {
-      if (mCopyState->m_message) {
-        localUndoTxn->AddSrcKey(mCopyState->m_sourceKey);
-      }
-      localUndoTxn->AddDstKey(mCopyState->m_curDstKey);
-      if (mCopyState->m_parseMsgState) {
-        localUndoTxn->AddDstMsgSize(mCopyState->m_storedMessageSize);
-      }
-    }
-    if (mCopyState->m_parseMsgState && mCopyState->m_listener && newHdr) {
-      mCopyState->m_listener->SetMessageKey(mCopyState->m_curDstKey);
-    }
-  }
-#endif
   // flush the copied message. We need a close at the end to get the
   // file size and time updated correctly.
   //
@@ -2697,7 +2326,7 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
   // Similarly, m_parseMsgState->GetNewMsgHdr() returns a null hdr if the hdr
   // has already been processed by EndMessage so it is not doubly added here.
 
-  if (!completeHeader && mCopyState->m_fileStream) {
+  if (mCopyState->m_fileStream) {
     nsAutoCString storeToken;
     rv = mCopyState->m_msgStore->FinishNewMessage(
         this, mCopyState->m_fileStream, storeToken);
@@ -2710,7 +2339,7 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
     mCopyState->m_fileStream = nullptr;
   }
   // Copy the header to the new database
-  if (!completeHeader && mCopyState->m_message) {
+  if (mCopyState->m_message) {
     //  CopyMessages() goes here, and CopyFileMessages() with metadata to save;
     if (!mCopyState->m_parseMsgState) {
       if (mCopyState->m_destDB) {
@@ -2761,8 +2390,9 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
       }
     }
   }
+  nsCOMPtr<nsIMsgDBHdr> newHdr;
   // CopyFileMessage() and CopyMessages() from servers other than mailbox
-  if (!completeHeader && mCopyState->m_parseMsgState) {
+  if (mCopyState->m_parseMsgState) {
     nsCOMPtr<nsIMsgDatabase> msgDb;
     mCopyState->m_parseMsgState->FinishHeader();
     GetDatabaseWOReparse(getter_AddRefs(msgDb));
@@ -3026,58 +2656,6 @@ NS_IMETHODIMP nsMsgLocalMailFolder::StartMessage() {
 // just finished the current message.
 NS_IMETHODIMP nsMsgLocalMailFolder::EndMessage(nsMsgKey key) {
   NS_ENSURE_ARG_POINTER(mCopyState);
-
-#ifdef MOZ_PANORAMA
-  if (mail_panorama_enabled_AtStartup()) {
-    if (mCopyState->m_writeFailed) {
-      return mCopyState->m_copyError;
-    }
-    auto complete = [&]() -> nsresult {
-      mCopyState->m_LineReader.Flush(std::bind(&nsMsgLocalMailFolder::CopyLine,
-                                               this, std::placeholders::_1));
-      if (mCopyState->m_writeFailed) {
-        return mCopyState->m_copyError;
-      }
-      if (mCopyState->m_parseMsgState) {
-        nsCOMPtr<nsIMsgFolder> source =
-            do_QueryInterface(mCopyState->m_srcSupport);
-        if (!source) {
-          return NS_ERROR_NO_INTERFACE;
-        }
-        nsCOMPtr<nsIMsgDatabase> sourceDB;
-        MOZ_TRY(source->GetMsgDatabase(getter_AddRefs(sourceDB)));
-        if (!sourceDB) {
-          return NS_ERROR_UNEXPECTED;
-        }
-        MOZ_TRY(sourceDB->GetMsgHdrForKey(
-            key, getter_AddRefs(mCopyState->m_message)));
-        if (!mCopyState->m_message) {
-          return NS_ERROR_UNEXPECTED;
-        }
-        MOZ_TRY(mCopyState->m_message->GetFlags(&mCopyState->m_flags));
-      }
-      nsCOMPtr<nsIMsgDBHdr> live;
-      MOZ_TRY(CompleteCopyMessage(getter_AddRefs(live)));
-      if (mCopyState->m_undoMsgTxn && live) {
-        mCopyState->m_undoMsgTxn->AddSrcKey(key);
-        mCopyState->m_undoMsgTxn->AddDstKey(mCopyState->m_curDstKey);
-        mCopyState->m_undoMsgTxn->AddDstMsgSize(
-            mCopyState->m_storedMessageSize);
-      }
-      if (mCopyState->m_parseMsgState && mCopyState->m_listener && live) {
-        mCopyState->m_listener->SetMessageKey(mCopyState->m_curDstKey);
-      }
-      return NS_OK;
-    };
-    nsresult rv = complete();
-    if (NS_FAILED(rv)) {
-      mCopyState->m_copyError = rv;
-      mCopyState->m_writeFailed = true;
-    }
-    mCopyState->m_addXMozillaHeaders = true;
-    return rv;
-  }
-#endif
 
   RefPtr<nsLocalMoveCopyMsgTxn> localUndoTxn = mCopyState->m_undoMsgTxn;
   nsresult rv;
@@ -3919,31 +3497,27 @@ nsresult nsMsgLocalMailFolder::AddMessageBatch2(
     }
     // TODO: Sanity check here? Are there cases where we'd reject a message?
 
-    // Finish the body before making its complete header visible.
+    nsCOMPtr<nsIMsgDBHdr> dbHdr;
+    rv = db->AddMsgHdr(&hdr, true, getter_AddRefs(dbHdr));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    // Write it to the local message store.
     nsCOMPtr<nsIOutputStream> outStream;
     rv = msgStore->GetNewMsgOutputStream(this, getter_AddRefs(outStream));
     NS_ENSURE_SUCCESS(rv, rv);
     rv = SyncWriteAll(outStream, raw.BeginReading(), raw.Length());
     if (NS_FAILED(rv)) {
-      nsresult discardRv = msgStore->DiscardNewMessage(this, outStream);
-      NS_WARNING_ASSERTION(NS_SUCCEEDED(discardRv),
-                           "add message discard failed");
+      msgStore->DiscardNewMessage(this, outStream);
       return rv;
     }
     nsAutoCString storeToken;
     rv = msgStore->FinishNewMessage(this, outStream, storeToken);
     NS_ENSURE_SUCCESS(rv, rv);
-    // Any subsequent error retains the finished bytes, even after SQL rollback.
-    uint32_t size, lines;
-    MOZ_TRY(
-        ReadStoredMessageDetails(msgStore, this, storeToken, &size, &lines));
-    hdr.messageSize = mozilla::Some(size);
-    hdr.storeToken = mozilla::Some(nsCString(storeToken));
-    hdr.offlineMessageSize = mozilla::Some(uint32_t(0));
-    hdr.lineCount = mozilla::Some(lines);
-    hdr.flags &= ~nsMsgMessageFlags::Offline;
-    nsCOMPtr<nsIMsgDBHdr> dbHdr;
-    MOZ_TRY(db->AddMsgHdr(&hdr, true, getter_AddRefs(dbHdr)));
+    rv = dbHdr->SetStoreToken(storeToken);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = dbHdr->SetMessageSize((uint32_t)raw.Length());
+    NS_ENSURE_SUCCESS(rv, rv);
+
     addedHdrs.AppendElement(dbHdr);
   }
   return NS_OK;

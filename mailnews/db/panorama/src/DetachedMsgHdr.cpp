@@ -134,11 +134,14 @@ NS_IMETHODIMP DetachedMsgHdr::AndFlags(uint32_t flags, uint32_t* outFlags) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetThreadId(nsMsgKey* threadId) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(threadId);
+  *threadId = mThreadId;
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetThreadId(nsMsgKey threadId) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  mThreadId = threadId;
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetMessageKey(nsMsgKey* messageKey) {

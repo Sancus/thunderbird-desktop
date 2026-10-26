@@ -5,6 +5,7 @@
 #ifndef COMM_MAILNEWS_DB_PANORAMA_SRC_DETACHEDMSGHDR_H_
 #define COMM_MAILNEWS_DB_PANORAMA_SRC_DETACHEDMSGHDR_H_
 
+#include "MailNewsTypes.h"
 #include "nsIMsgDatabase.h"  // For struct RawHdr
 #include "nsIMsgHdr.h"
 
@@ -36,6 +37,9 @@ class DetachedMsgHdr : public nsIMsgDBHdr {
 
   // Metadata that is gleaned from parsing the message headers.
   RawHdr mRaw;
+
+  // Snapshot identity is independent of the detached message key.
+  nsMsgKey mThreadId{nsMsgKey_None};
 
   // Metadata obtained by other means.
   uint32_t mMessageSize{0};

@@ -7,6 +7,7 @@
 #include <type_traits>
 
 #include "DatabaseCore.h"
+#include "DetachedMsgHdr.h"
 #include "MessageDatabase.h"
 #include "gtest/gtest.h"
 #include "mozilla/ResultExtensions.h"
@@ -391,6 +392,95 @@ class DeliveryMessageReferences : public testing::Test {
 namespace {
 
 using DISABLED_DeliveryMessageReferences = DeliveryMessageReferences;
+
+using DISABLED_DeliveryDetachedThreadIdentity = DeliveryMessageReferences;
+
+constexpr uint32_t kThreadIdCanary = 0xa53c7e19;
+struct alignas(uint64_t) GuardedThreadId {
+  nsMsgKey value;
+  volatile uint32_t canary;
+};
+static_assert(std::is_standard_layout_v<GuardedThreadId>);
+static_assert(std::is_unsigned_v<nsMsgKey>);
+static_assert(sizeof(nsMsgKey) == sizeof(uint32_t));
+static_assert(offsetof(GuardedThreadId, canary) == sizeof(nsMsgKey));
+static_assert(sizeof(GuardedThreadId) == sizeof(uint64_t));
+
+void CheckDetachedThreadId(nsIMsgDBHdr* header, nsMsgKey expected) {
+  GuardedThreadId output{0x31415926, kThreadIdCanary};
+  EXPECT_EQ(NS_OK, header->GetThreadId(&output.value));
+  EXPECT_EQ(expected, output.value);
+  EXPECT_EQ(kThreadIdCanary, static_cast<uint32_t>(output.canary));
+}
+
+TEST_F(DISABLED_DeliveryDetachedThreadIdentity, DefaultIsUnknown) {
+  RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
+  CheckDetachedThreadId(header, nsMsgKey_None);
+  nsMsgKey key = 123;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  EXPECT_EQ(nsMsgKey_None, key);
+  bool live = true;
+  ASSERT_EQ(NS_OK, header->GetIsLive(&live));
+  EXPECT_FALSE(live);
+}
+
+TEST_F(DISABLED_DeliveryDetachedThreadIdentity, PositiveIdRoundTrips) {
+  RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
+  ASSERT_EQ(NS_OK, header->SetThreadId(17));
+  CheckDetachedThreadId(header, 17);
+  nsMsgKey key = 123;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  EXPECT_EQ(nsMsgKey_None, key);
+}
+
+TEST_F(DISABLED_DeliveryDetachedThreadIdentity, FullWidthRepeatedReads) {
+  RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
+  ASSERT_EQ(NS_OK, header->SetThreadId(0xf1234567));
+  for (uint32_t i = 0; i < 3; ++i) {
+    CheckDetachedThreadId(header, 0xf1234567);
+  }
+  ASSERT_EQ(NS_OK, header->SetThreadId(0xfffffffe));
+  CheckDetachedThreadId(header, 0xfffffffe);
+}
+
+TEST_F(DISABLED_DeliveryDetachedThreadIdentity, ZeroAndSentinelRoundTrip) {
+  RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
+  ASSERT_EQ(NS_OK, header->SetThreadId(17));
+  ASSERT_EQ(NS_OK, header->SetThreadId(0));
+  CheckDetachedThreadId(header, 0);
+  ASSERT_EQ(NS_OK, header->SetThreadId(nsMsgKey_None));
+  CheckDetachedThreadId(header, nsMsgKey_None);
+}
+
+TEST_F(DISABLED_DeliveryDetachedThreadIdentity, NullOutputIsRejected) {
+  RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
+  EXPECT_EQ(NS_ERROR_NULL_POINTER, header->GetThreadId(nullptr));
+  ASSERT_EQ(NS_OK, header->SetThreadId(0x80000042));
+  EXPECT_EQ(NS_ERROR_NULL_POINTER, header->GetThreadId(nullptr));
+  CheckDetachedThreadId(header, 0x80000042);
+}
+
+TEST_F(DISABLED_DeliveryDetachedThreadIdentity,
+       IdentityIsIndependentOfMetadata) {
+  RefPtr<nsIMsgDBHdr> first = new DetachedMsgHdr(mFolder);
+  RefPtr<nsIMsgDBHdr> second = new DetachedMsgHdr(mFolder);
+  ASSERT_EQ(NS_OK, first->SetFlags(0x11));
+  ASSERT_EQ(NS_OK, first->SetStringProperty("keywords", "label1 label2"_ns));
+  ASSERT_EQ(NS_OK, first->SetThreadId(17));
+  ASSERT_EQ(NS_OK, second->SetThreadId(23));
+  ASSERT_EQ(NS_OK,
+            first->SetReferences("<parent@invalid> <missing@invalid>"_ns));
+  CheckDetachedThreadId(first, 17);
+  ASSERT_EQ(NS_OK, first->SetThreadId(71));
+  CheckDetachedThreadId(first, 71);
+  CheckDetachedThreadId(second, 23);
+  uint32_t flags = 0;
+  ASSERT_EQ(NS_OK, first->GetFlags(&flags));
+  EXPECT_EQ(0x11u, flags);
+  nsAutoCString tags;
+  ASSERT_EQ(NS_OK, first->GetStringProperty("keywords", tags));
+  EXPECT_EQ("label1 label2"_ns, tags);
+}
 
 TEST_F(DISABLED_DeliveryMessageReferences, CountSuccessAssignsOnlyUint16) {
   ASSERT_NO_FATAL_FAILURE(Create({"first@invalid"_ns, ""_ns, "child@invalid"_ns,

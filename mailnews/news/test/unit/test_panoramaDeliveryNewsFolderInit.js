@@ -15,30 +15,48 @@ add_task(async function test_preservesNewsFolderIdentity() {
   const lane = PanoramaDelivery.expectedLane();
   const service = PanoramaDelivery.assertBackend(lane.backend);
   const account = MailServices.accounts.createAccount();
-  let incomingServer;
+  let incomingServer, seededServerBranch;
   registerCleanupFunction(() => {
-    incomingServer?.closeCachedConnections();
-    MailServices.accounts.removeAccount(account, false);
+    try {
+      incomingServer?.closeCachedConnections();
+      MailServices.accounts.removeAccount(account, false);
+    } finally {
+      if (seededServerBranch) {
+        Services.prefs.deleteBranch(seededServerBranch);
+      }
+    }
   });
-  incomingServer = MailServices.accounts.createIncomingServer(
-    "",
-    "news-folder-init.invalid",
-    "nntp"
-  );
-  incomingServer.valid = false;
-  account.incomingServer = incomingServer;
-  incomingServer.QueryInterface(Ci.nsINntpIncomingServer);
-
   let core, rootId, savedId;
   if (lane.backend == "panorama") {
+    const key = "panoramaNewsFolderInit";
+    const branch = `mail.server.${key}.`;
+    Assert.equal(
+      Services.prefs.getChildList(branch).length,
+      0,
+      "The fixed Panorama server key is unused"
+    );
+    seededServerBranch = branch;
+    Services.prefs.setCharPref(`${branch}type`, "nntp");
+    Services.prefs.setCharPref(`${branch}hostname`, "news-folder-init.invalid");
+    Services.prefs.setBoolPref(`${branch}valid`, false);
     core = service.QueryInterface(Ci.nsIDatabaseCore);
-    rootId = core.folderDB.insertRoot(incomingServer.key);
+    rootId = core.folderDB.insertRoot(key);
     savedId = core.folderDB.insertFolder(rootId, "test.saved");
     core.folderDB.updateFlags(
       savedId,
       Ci.nsMsgFolderFlags.Newsgroup | Ci.nsMsgFolderFlags.Offline
     );
+    incomingServer = MailServices.accounts.getIncomingServer(key);
+  } else {
+    incomingServer = MailServices.accounts.createIncomingServer(
+      "",
+      "news-folder-init.invalid",
+      "nntp"
+    );
+    incomingServer.valid = false;
   }
+  account.incomingServer = incomingServer;
+  incomingServer.QueryInterface(Ci.nsINntpIncomingServer);
   const localPath = incomingServer.localPath;
   await IOUtils.writeUTF8(
     incomingServer.newsrcFilePath.path,

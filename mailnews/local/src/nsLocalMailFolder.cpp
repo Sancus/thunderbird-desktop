@@ -2043,7 +2043,7 @@ static nsresult CopyHdrStructure(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr) {
   MOZ_TRY(destHdr->SetDate(date));
   uint32_t flags;
   MOZ_TRY(srcHdr->GetFlags(&flags));
-  MOZ_TRY(destHdr->SetFlags(flags));
+  MOZ_TRY(destHdr->SetFlags(flags & ~nsMsgMessageFlags::Offline));
   nsMsgPriorityValue priority;
   MOZ_TRY(srcHdr->GetPriority(&priority));
   MOZ_TRY(destHdr->SetPriority(priority));
@@ -2085,7 +2085,11 @@ nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
         mCopyState->m_curCopyIndex < mCopyState->m_messages.Length()) {
       rv = CopyHdrStructure(mCopyState->m_newHdr,
                             mCopyState->m_messages[mCopyState->m_curCopyIndex]);
-      NS_ENSURE_SUCCESS(rv, rv);
+      if (NS_FAILED(rv)) {
+        mCopyState->m_newHdr = nullptr;
+        mCopyState->m_writeFailed = true;
+        return rv;
+      }
     }
 #endif
   }
@@ -2104,6 +2108,7 @@ nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
 // handled here.
 NS_IMETHODIMP nsMsgLocalMailFolder::BeginCopy() {
   if (!mCopyState) return NS_ERROR_NULL_POINTER;
+  if (mCopyState->m_writeFailed) return NS_ERROR_FAILURE;
   if (mCopyState->m_curCopyIndex < 2) {
     // Show the status only on the first and/or 2nd message transferred. When
     // IMAP to Local Folders transfer, index starts at 0; when transfer between
@@ -2292,11 +2297,8 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
     }
 
     if (!mCopyState->m_isMove) {
-      // passing true because the messages that have been successfully
-      // copied have their corresponding hdrs in place. The message that has
-      // failed has been truncated so the msf file and berkeley mailbox
-      // are in sync.
-      (void)OnCopyCompleted(mCopyState->m_srcSupport, true);
+      // Keep completed messages, but report the transfer failure.
+      (void)OnCopyCompleted(mCopyState->m_srcSupport, false);
       // enable the dest folder
       EnableNotifications(allMessageCountNotifications, true);
     }
@@ -2566,11 +2568,8 @@ nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
     NS_ENSURE_SUCCESS(rv, rv);
     srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
 
-    /* passing true because the messages that have been successfully copied have
-       their corresponding hdrs in place. The message that has failed has been
-       truncated so the msf file and berkeley mailbox are in sync*/
-
-    (void)OnCopyCompleted(mCopyState->m_srcSupport, true);
+    // Keep completed messages, but report the transfer failure.
+    (void)OnCopyCompleted(mCopyState->m_srcSupport, false);
     // enable the dest folder
     EnableNotifications(allMessageCountNotifications, true);
     return NS_OK;
@@ -2639,6 +2638,7 @@ NS_IMETHODIMP nsMsgLocalMailFolder::StartMessage() {
   // We get crashes that we don't understand (bug 284876), so stupidly prevent
   // that.
   NS_ENSURE_ARG_POINTER(mCopyState);
+  if (mCopyState->m_writeFailed) return NS_ERROR_FAILURE;
   nsresult rv = InitCopyMsgHdrAndFileStream();
   NS_ENSURE_SUCCESS(rv, rv);
   return WriteStartOfNewMessage();
@@ -2752,7 +2752,8 @@ nsresult nsMsgLocalMailFolder::CopyMessagesTo(nsTArray<nsMsgKey>& keyArray,
     nsCOMPtr<nsIMsgLocalMailFolder> srcLocalFolder =
         do_QueryInterface(srcFolder);
     if (srcLocalFolder) {
-      StartMessage();
+      rv = StartMessage();
+      NS_ENSURE_SUCCESS(rv, rv);
     }
 
     RefPtr<CopyMessageStreamListener> streamListener =

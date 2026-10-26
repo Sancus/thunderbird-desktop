@@ -30,6 +30,7 @@ def check_log(log, case, returncode=0, raw_logs=()):
     tasks, task_assertions = [], 0
     declared_tasks = case.get("tasks", [])
     counts = dict.fromkeys(declared_tasks, 0)
+    setup_events, setup_assertions, setup_backends = [], 0, 0
     is_format = case["diagnostics"] == "format-reader"
     first_failure, folder_evidence = None, {}
     try:
@@ -70,6 +71,8 @@ def check_log(log, case, returncode=0, raw_logs=()):
                 active = True
             if action == "test_status":
                 assertions += 1
+                if setup_events == ["pending"]:
+                    setup_assertions += 1
                 if tasks == [(case.get("task"), "pending")]:
                     task_assertions += 1
                 if tasks and tasks[-1][1] == "pending" and tasks[-1][0] in counts:
@@ -92,11 +95,19 @@ def check_log(log, case, returncode=0, raw_logs=()):
                 message = message[1:-1]
             if case.get("task") or declared_tasks:
                 task = re.fullmatch(
-                    r"\(xpcshell/head\.js\) \| test (test_\w+) (pending|finished) \(\d+\)", message)
+                    r"\(xpcshell/head\.js\) \| test(?: (test_\w+))? (pending|finished) \(\d+\)", message)
                 if task:
                     if not active:
                         errors.append("task event outside active file")
-                    tasks.append(task.groups())
+                    name, state = task.groups()
+                    if name:
+                        if case.get("anonymous_setup") and setup_events != ["pending", "finished"]:
+                            errors.append("task started before anonymous setup completed")
+                        tasks.append((name, state))
+                    elif case.get("anonymous_setup"):
+                        if tasks:
+                            errors.append("anonymous setup after named task")
+                        setup_events.append(state)
             if message.startswith("DELIVERY_"):
                 if is_format:
                     errors.append("format-reader case unexpectedly claimed product evidence")
@@ -108,6 +119,11 @@ def check_log(log, case, returncode=0, raw_logs=()):
                     raise ValueError("diagnostic must be an object")
                 if kind == "DELIVERY_BACKEND":
                     backends.append(data)
+                    if case.get("anonymous_setup"):
+                        if setup_events != ["pending"]:
+                            errors.append("backend evidence outside anonymous setup")
+                        else:
+                            setup_backends += 1
                 elif kind == "DELIVERY_STORE_CONTRACT":
                     contracts[data["folderURI"]] = data
                 elif kind == "DELIVERY_FOLDER":
@@ -146,7 +162,10 @@ def check_log(log, case, returncode=0, raw_logs=()):
         expected_tasks = [(name, state) for name in declared_tasks for state in ("pending", "finished")]
         if declared_tasks and (tasks != expected_tasks or not all(counts.values())):
             errors.append("require every declared task to finish with assertions")
-        if case.get("task") and any(d.get("store") != "none" or d.get("scope") != "metadata-only"
+        if case.get("anonymous_setup") and (setup_events != ["pending", "finished"]
+                                             or not setup_assertions or not setup_backends):
+            errors.append("require anonymous setup with assertions and backend evidence")
+        if (case.get("task") or case.get("anonymous_setup")) and any(d.get("store") != "none" or d.get("scope") != "metadata-only"
                                     for d in backends):
             errors.append("metadata-only case must not claim body-store coverage")
         if case.get("phase") and case["phase"] not in phases:
@@ -254,30 +273,40 @@ def prepare(config, case):
     module_pairs = []
     paths = [manifest] + [manifest.parent / name for name in doc if name != "DEFAULT"]
     if "tasks" in case:
+        raw_tasks = case["fixture"] == "raw-db" and case["store"] == "none"
         names = case["tasks"]
         setups = case.get("setups", [])
         if (case.get("task") or case["backend"] != "panorama"
-            or case["fixture"] != "preconfigured-store" or not isinstance(names, list) or not names
+            or (not raw_tasks and case["fixture"] != "preconfigured-store")
+            or (raw_tasks and (case.get("anonymous_setup") is not True or setups))
+            or (not raw_tasks and case.get("anonymous_setup"))
+            or not isinstance(names, list) or not names
             or not isinstance(setups, list)
             or any(not isinstance(n, str) or not re.fullmatch(r"test_\w+", n) for n in names)
             or any(not isinstance(n, str) or not re.fullmatch(r"\w+", n) for n in setups)
             or len(set(names)) != len(names) or len(set(setups)) != len(setups)):
-            raise ValueError("invalid initializer named tasks/setup declaration")
+            raise ValueError("invalid named tasks/setup declaration")
         text = (manifest.parent / case["file"]).read_text(encoding="utf-8")
         for kind, wanted in (("task", names), ("setup", setups)):
             actual = re.findall(r"\badd_" + kind + r"\s*\(\s*(?:async\s+)?function\s+(\w+)\s*\(", text)
-            if actual != wanted or len(re.findall(r"\badd_" + kind + r"\s*\(", text)) != len(wanted):
-                raise ValueError("initializer named tasks/setup differ from source")
+            anonymous = int(raw_tasks and kind == "setup")
+            if anonymous and len(re.findall(r"\badd_setup\s*\(\s*(?:async\s+)?function\s*\(", text)) != 1:
+                raise ValueError("raw DB named tasks/setup require one anonymous setup")
+            if actual != wanted or len(re.findall(r"\badd_" + kind + r"\s*\(", text)) != len(wanted) + anonymous:
+                raise ValueError("named tasks/setup differ from source")
         if re.search(r"\b(?:add_test|run_test)\s*\(", text):
-            raise ValueError("initializer named tasks/setup must be unconditional")
-        modules = {"MockRegistrar.sys.mjs": source / "testing/modules/MockRegistrar.sys.mjs",
-                   "mailnews/MessageGenerator.sys.mjs": comm / "mailnews/test/resources/MessageGenerator.sys.mjs"}
-        module_pairs = [(original, Path(config["objdir"]) / "_tests/modules" / name)
-                        for name, original in modules.items()]
-        paths += [p for pair in module_pairs for p in pair]
-        paths += [comm / "mailnews/moz.build", source / "testing/modules/moz.build",
-                  source / "testing/xpcshell/runxpcshelltests.py", source / "xpcom/base/nsDebug.h",
-                  source / "xpcom/base/nsDebugImpl.cpp"]
+            raise ValueError("named tasks/setup must be unconditional")
+        if raw_tasks:
+            paths += [source / "testing/xpcshell/head.js"]
+        else:
+            modules = {"MockRegistrar.sys.mjs": source / "testing/modules/MockRegistrar.sys.mjs",
+                       "mailnews/MessageGenerator.sys.mjs": comm / "mailnews/test/resources/MessageGenerator.sys.mjs"}
+            module_pairs = [(original, Path(config["objdir"]) / "_tests/modules" / name)
+                            for name, original in modules.items()]
+            paths += [p for pair in module_pairs for p in pair]
+            paths += [comm / "mailnews/moz.build", source / "testing/modules/moz.build",
+                      source / "testing/xpcshell/runxpcshelltests.py", source / "xpcom/base/nsDebug.h",
+                      source / "xpcom/base/nsDebugImpl.cpp"]
     if case.get("requires_non_debug"):
         info = Path(config["objdir"]) / "mozinfo.json"
         if json.loads(info.read_text(encoding="utf-8")).get("debug") is not False:

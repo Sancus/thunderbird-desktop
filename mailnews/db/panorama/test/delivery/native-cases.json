@@ -341,6 +341,141 @@
       "id": "core-native:MessageExistence:RemovalRejectsForeignTransaction",
       "filter": "DISABLED_DeliveryCoreMessageExistence.RemovalRejectsForeignTransaction",
       "expected": "NS_ERROR_IN_PROGRESS preserves the caller-owned transaction and emits no callback; writer sees Foreign pending while an unshared reader sees Stored subject, both rows and the property. Caller rollback then permits one successful removal callback and survivor-only storage."
+    },
+    {
+      "id": "core:PropertyStorage:MessageNamesAndTextAreExact",
+      "filter": "DISABLED_DeliveryCoreProperties.MessageNamesAndTextAreExact",
+      "expected": "Native UTF-8 composed/decomposed and case-distinct keys remain independent; exact overwrite, leading zeros, exponent text, empty presence, enumeration and unshared SQL agree."
+    },
+    {
+      "id": "core:PropertyStorage:FolderNamesAndTextAreExact",
+      "filter": "DISABLED_DeliveryCoreProperties.FolderNamesAndTextAreExact",
+      "expected": "Native folder keys and text remain exact with independent unshared SQL rows and exact-name overwrite."
+    },
+    {
+      "id": "core:PropertyStorage:NativeIntegersAndStructuralValuesRemainTyped",
+      "filter": "DISABLED_DeliveryCoreProperties.NativeIntegersAndStructuralValuesRemainTyped",
+      "expected": "Full uint32 survives native typed getter/storage; message-size and store-token paths keep numeric and exact string semantics."
+    },
+    {
+      "id": "core:PropertyStorage:CoreReopenKeepsExactTextAndPresence",
+      "filter": "DISABLED_DeliveryCoreProperties.CoreReopenKeepsExactTextAndPresence",
+      "expected": "Close/reopen DatabaseCore in the same process preserves Unicode keys, leading-zero/exponent text, empty-present and absent enumeration."
+    },
+    {
+      "id": "core:PropertyStorage:FailedMessageOverwritePreservesRows",
+      "filter": "DISABLED_DeliveryCoreProperties.FailedMessageOverwritePreservesRows",
+      "expected": "Reached BEFORE INSERT RAISE(ABORT) returns constraint error; old exact text and unrelated committed control remain."
+    },
+    {
+      "id": "core:PropertyStorage:FailedFolderOverwritePreservesRows",
+      "filter": "DISABLED_DeliveryCoreProperties.FailedFolderOverwritePreservesRows",
+      "expected": "Reached BEFORE INSERT RAISE(ABORT) returns constraint error; old folder text and unrelated control remain."
+    },
+    {
+      "id": "core:PropertyStorage:ReadErrorsAreNotAbsentProperties",
+      "filter": "DISABLED_DeliveryCoreProperties.ReadErrorsAreNotAbsentProperties",
+      "expected": "Missing property tables produce storage failure, with string/numeric/enumeration sentinels unchanged."
+    },
+    {
+      "id": "core:PropertyStorage:StepErrorsPreserveOutputSentinels",
+      "filter": "DISABLED_DeliveryCoreProperties.StepErrorsPreserveOutputSentinels",
+      "expected": "Valid SELECT over abs(INT64_MIN) reaches an evaluation error; getters/enumeration propagate it without replacing outputs."
+    },
+    {
+      "id": "core:PropertyStorage:UpgradePreservesExistingValues",
+      "filter": "DISABLED_DeliveryCoreProperties.UpgradePreservesExistingValues",
+      "expected": "Version-one upgrade preserves all stored cell classes/bytes including integer, UTF-8, blob and null; lost old leading zeros stay honestly unrecoverable; new writes retain exact text."
+    },
+    {
+      "id": "core:PropertyStorage:UpgradeDoesNotDropUnknownIndex",
+      "filter": "DISABLED_DeliveryCoreProperties.UpgradeDoesNotDropUnknownIndex",
+      "expected": "Unknown index prevents upgrade; original index/version/data remain and retry works after explicit fixture removal."
+    },
+    {
+      "id": "core:PropertyStorage:FailedUpgradeRollsBackAndRetries",
+      "filter": "DISABLED_DeliveryCoreProperties.FailedUpgradeRollsBackAndRetries",
+      "expected": "Collision at second replacement table rolls back first table and schema version; independent existing data survives retry."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32SuccessAssignsOnlyUint32",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32SuccessAssignsOnlyUint32",
+      "expected": "Hex text 2a yields 42 in only the uint32 output; adjacent canary is unchanged."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32MaximumAssignsOnlyUint32",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32MaximumAssignsOnlyUint32",
+      "expected": "UINT32_MAX round-trips as 4294967295 and exact ffffffff text without adjacent writes."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32MissingReplacesSentinelWithZero",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32MissingReplacesSentinelWithZero",
+      "expected": "Absent property replaces the sentinel with zero and is absent from property-name enumeration."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32EmptyReplacesSentinelWithZero",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32EmptyReplacesSentinelWithZero",
+      "expected": "Present empty property replaces the sentinel with zero and remains enumerated."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32InvalidPrefixReplacesSentinelWithZero",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32InvalidPrefixReplacesSentinelWithZero",
+      "expected": "Invalid hexadecimal prefix g2a yields zero without adjacent writes."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32NineDigitsUseFirstEight",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32NineDigitsUseFirstEight",
+      "expected": "Nine-digit text 100000000 uses its first eight hexadecimal digits and yields 0x10000000."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32NullKnownOutputIsRejected",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32NullKnownOutputIsRejected",
+      "expected": "Null output returns NS_ERROR_NULL_POINTER; a nonnull control still yields 42."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32NullOutputDoesNotEvaluateSQL",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32NullOutputDoesNotEvaluateSQL",
+      "expected": "Null output does not evaluate the SQL fault function; the nonnull getter then reaches one exact-ID failure and preserves sentinel/canary."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32PrepareErrorPreservesSentinel",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32PrepareErrorPreservesSentinel",
+      "expected": "A cold missing-table SELECT fails preparation with null statement; getter propagates failure and preserves sentinel/canary."
+    },
+    {
+      "id": "compatibility-native:HeaderProperties:Uint32ReadStepErrorPreservesSentinel",
+      "filter": "DISABLED_DeliveryHeaderProperties.Uint32ReadStepErrorPreservesSentinel",
+      "expected": "A prepared read evaluates the installed fault function once for the exact message ID; failure preserves sentinel/canary."
+    },
+    {
+      "id": "compatibility-native:DetachedThreadIdentity:DefaultIsUnknown",
+      "filter": "DISABLED_DeliveryDetachedThreadIdentity.DefaultIsUnknown",
+      "expected": "A new detached header has nsMsgKey_None thread and message keys and is not live; adjacent output canary is unchanged."
+    },
+    {
+      "id": "compatibility-native:DetachedThreadIdentity:PositiveIdRoundTrips",
+      "filter": "DISABLED_DeliveryDetachedThreadIdentity.PositiveIdRoundTrips",
+      "expected": "Detached thread ID 17 round-trips while its message key remains nsMsgKey_None."
+    },
+    {
+      "id": "compatibility-native:DetachedThreadIdentity:FullWidthRepeatedReads",
+      "filter": "DISABLED_DeliveryDetachedThreadIdentity.FullWidthRepeatedReads",
+      "expected": "Three reads preserve 0xf1234567 and a later 0xfffffffe without adjacent writes."
+    },
+    {
+      "id": "compatibility-native:DetachedThreadIdentity:ZeroAndSentinelRoundTrip",
+      "filter": "DISABLED_DeliveryDetachedThreadIdentity.ZeroAndSentinelRoundTrip",
+      "expected": "Zero and nsMsgKey_None replace a prior thread ID and round-trip exactly."
+    },
+    {
+      "id": "compatibility-native:DetachedThreadIdentity:NullOutputIsRejected",
+      "filter": "DISABLED_DeliveryDetachedThreadIdentity.NullOutputIsRejected",
+      "expected": "Null getter output is rejected before and after assignment; the high-bit ID 0x80000042 is preserved."
+    },
+    {
+      "id": "compatibility-native:DetachedThreadIdentity:IdentityIsIndependentOfMetadata",
+      "filter": "DISABLED_DeliveryDetachedThreadIdentity.IdentityIsIndependentOfMetadata",
+      "expected": "Two detached objects retain independent thread IDs; References, flags and keywords do not overwrite thread identity or each other."
     }
   ],
   "suites": {
@@ -370,7 +505,8 @@
         "mailnews/db/panorama/src/MessageDatabase.h",
         "mailnews/db/panorama/public/nsIMessageDatabase.idl",
         "mailnews/base/public/nsIMsgHdr.idl",
-        "mailnews/base/public/moz.build"
+        "mailnews/base/public/moz.build",
+        "mailnews/db/panorama/src/DetachedMsgHdr.h"
       ]
     },
     "DISABLED_DeliveryCoreMessageExistence": {
@@ -404,6 +540,93 @@
         "mailnews/search/src/nsMsgSearchTerm.h",
         "mailnews/db/panorama/src/DatabaseCore.cpp",
         "mailnews/db/panorama/src/DatabaseCore.h"
+      ]
+    },
+    "DISABLED_DeliveryCoreProperties": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryCoreProperties.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/DatabaseCore.cpp",
+        "mailnews/db/panorama/src/DatabaseCore.h",
+        "mailnews/db/panorama/src/FolderDatabase.cpp",
+        "mailnews/db/panorama/src/FolderDatabase.h",
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/src/DatabaseUtils.cpp",
+        "mailnews/db/panorama/src/DatabaseUtils.h",
+        "mailnews/db/panorama/src/Message.cpp",
+        "mailnews/db/panorama/src/Message.h",
+        "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+        "mailnews/db/panorama/src/DetachedMsgHdr.h",
+        "mailnews/db/panorama/public/nsIDatabaseCore.idl",
+        "mailnews/db/panorama/public/nsIFolderDatabase.idl",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/base/public/nsIMsgHdr.idl",
+        "mailnews/base/public/MailNewsTypes.h",
+        "mailnews/db/msgdb/public/nsIMsgDatabase.idl",
+        "mailnews/base/public/moz.build",
+        "mailnews/db/msgdb/public/moz.build",
+        "mailnews/db/panorama/public/moz.build",
+        "mailnews/db/panorama/src/moz.build",
+        "mailnews/db/panorama/test/moz.build",
+        "mailnews/db/panorama/test/gtest/moz.build"
+      ]
+    },
+    "DISABLED_DeliveryHeaderProperties": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryMessageReferences.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/DatabaseCore.cpp",
+        "mailnews/db/panorama/src/DatabaseCore.h",
+        "mailnews/db/panorama/src/FolderDatabase.cpp",
+        "mailnews/db/panorama/src/FolderDatabase.h",
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/src/DatabaseUtils.cpp",
+        "mailnews/db/panorama/src/DatabaseUtils.h",
+        "mailnews/db/panorama/src/Message.cpp",
+        "mailnews/db/panorama/src/Message.h",
+        "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+        "mailnews/db/panorama/src/DetachedMsgHdr.h",
+        "mailnews/db/panorama/public/nsIDatabaseCore.idl",
+        "mailnews/db/panorama/public/nsIFolderDatabase.idl",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/base/public/nsIMsgHdr.idl",
+        "mailnews/base/public/MailNewsTypes.h",
+        "mailnews/db/msgdb/public/nsIMsgDatabase.idl",
+        "mailnews/base/public/moz.build",
+        "mailnews/db/msgdb/public/moz.build",
+        "mailnews/db/panorama/public/moz.build",
+        "mailnews/db/panorama/src/moz.build",
+        "mailnews/db/panorama/test/moz.build",
+        "mailnews/db/panorama/test/gtest/moz.build"
+      ]
+    },
+    "DISABLED_DeliveryDetachedThreadIdentity": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryMessageReferences.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/DatabaseCore.cpp",
+        "mailnews/db/panorama/src/DatabaseCore.h",
+        "mailnews/db/panorama/src/FolderDatabase.cpp",
+        "mailnews/db/panorama/src/FolderDatabase.h",
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/src/DatabaseUtils.cpp",
+        "mailnews/db/panorama/src/DatabaseUtils.h",
+        "mailnews/db/panorama/src/Message.cpp",
+        "mailnews/db/panorama/src/Message.h",
+        "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+        "mailnews/db/panorama/src/DetachedMsgHdr.h",
+        "mailnews/db/panorama/public/nsIDatabaseCore.idl",
+        "mailnews/db/panorama/public/nsIFolderDatabase.idl",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/base/public/nsIMsgHdr.idl",
+        "mailnews/base/public/MailNewsTypes.h",
+        "mailnews/db/msgdb/public/nsIMsgDatabase.idl",
+        "mailnews/base/public/moz.build",
+        "mailnews/db/msgdb/public/moz.build",
+        "mailnews/db/panorama/public/moz.build",
+        "mailnews/db/panorama/src/moz.build",
+        "mailnews/db/panorama/test/moz.build",
+        "mailnews/db/panorama/test/gtest/moz.build"
       ]
     }
   }

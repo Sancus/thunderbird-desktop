@@ -17,3 +17,5 @@ tags = ["panorama-delivery"]
 ["test_deliveryWorkflowListMembership.js"]
 
 ["test_deliveryWorkflowSavedSearch.js"]
+
+["test_deliveryWorkflowSingleFolderIdentity.js"]

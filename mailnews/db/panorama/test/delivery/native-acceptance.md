@@ -1,8 +1,9 @@
 # Manual native acceptance
 
 TestDeliveryCoreReferences.cpp (14 cases), TestDeliveryFolderInfoProperties.cpp
-(19 cases), TestDeliveryMessageReferences.cpp (19 cases) and
-TestDeliveryCoreMessageExistence.cpp (15 cases) are linked here. All 67 filters
+(19), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties and
+6 DetachedThreadIdentity), TestDeliveryCoreMessageExistence.cpp (15) and
+TestDeliveryCoreProperties.cpp (11) are linked here. All 94 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
@@ -173,3 +174,20 @@ and headers. Same-process reopen is not application restart. Each exact disabled
 case still needs matching native compilation, fault sensitivity, full shutdown
 and profile/close qualification; the xpcshell ColdDeletion result gives no native
 gtest credit.
+
+The 27 property/identity additions remain manual and unqualified. CoreProperties
+requires exact text/name/presence, independent stored types, same-process reopen,
+reached write/read faults and schema-upgrade rollback/retry. HeaderProperties
+requires exact hexadecimal conversion, adjacent canaries, null-before-SQL and
+separate prepare/step witnesses. DetachedThreadIdentity requires independent
+full-width IDs/canaries, null rejection and metadata preservation. Same-width
+signed representations are not a runtime negative control for those IDs.
+
+Receipts now require the pinned storage-service/unshared-open interfaces and
+thread/event-target/async-close APIs in addition to schema, adapter, fixture,
+IDL and build sources. Root must bind actual compiler/build receipts, matching
+app/loaded library/INIs/configuration and complete shutdown/profile evidence.
+Each exact filter still needs compilation, fault sensitivity and restored
+negative controls. Windows and refcount leak qualification remain held. The
+isolated 724 build packet retains its frozen 67-case catalog. Unregistered
+thread-key/date controls and further publication gtests receive no credit here.

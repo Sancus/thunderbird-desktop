@@ -695,7 +695,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 38)
-        self.assertEqual(len({c["id"] for c in catalog}), 159)
+        self.assertEqual(len({c["id"] for c in catalog}), 163)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -987,8 +987,8 @@ support-files = ["fixture.sql"]
                  "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
                                               "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
         rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
-        self.assertEqual(len(catalog), 159)
-        self.assertEqual(len({c["id"] for c in catalog}), 159)
+        self.assertEqual(len(catalog), 163)
+        self.assertEqual(len({c["id"] for c in catalog}), 163)
         self.assertEqual(len(rows), 8)
         for store in ("mbox", "maildir"):
             lane = [c for c in rows if c["store"] == store]
@@ -1030,6 +1030,157 @@ support-files = ["fixture.sql"]
                 self.assertTrue(all(p.is_file() and p.is_relative_to(comm) for p in support))
                 self.assertNotIn(manifest.name, (manifest.parent.parent / "moz.build").read_text())
 
+
+
+    def raw_task_case(self):
+        return {**self.case, "backend": "panorama", "store": "none",
+                "diagnostics": "backend", "fixture": "raw-db",
+                "tasks": ["test_first", "test_second"], "anonymous_setup": True}
+
+    def raw_task_events(self, case):
+        def marker(name, state):
+            return {"action": "log", "message":
+                    f"(xpcshell/head.js) | test{name} {state} (2)"}
+        events = self.events[:2] + [marker("", "pending"), self.events[5],
+                 self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama",
+                                      "store": "none", "scope": "metadata-only"}),
+                 marker("", "finished")]
+        for name in case["tasks"]:
+            events += [marker(" " + name, "pending"), self.events[5], marker(" " + name, "finished")]
+        return events + self.events[6:]
+
+    def test_raw_plural_requires_setup_backend_every_task_and_file_completion(self):
+        case = self.raw_task_case()
+        events = self.raw_task_events(case)
+        self.assertTrue(self.check(events, case)["ok"])
+        for index in range(len(events)):
+            with self.subTest(missing=index):
+                result = self.check(events[:index] + events[index + 1:], case)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["coverage"], "none")
+        for index in (2, 5, 6, 8):
+            self.assertFalse(self.check(events[:index] + [events[index]] + events[index:], case)["ok"])
+        wrong = copy.deepcopy(events)
+        wrong[4] = self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama"})
+        self.assertFalse(self.check(wrong, case)["ok"])
+        moved = events[:4] + events[5:6] + [events[4]] + events[6:]
+        self.assertFalse(self.check(moved, case)["ok"])
+        wrong = copy.deepcopy(events)
+        wrong[7]["status"] = "SKIP"
+        self.assertFalse(self.check(wrong, case)["ok"])
+        wrong[7]["status"] = "FAIL"
+        self.assertEqual(self.check(wrong, case)["first_failure"], wrong[7])
+
+    def test_raw_plural_preflight_rejects_undeclared_or_conditional_setup(self):
+        source = self.root / "comm/tests"
+        source.mkdir(parents=True)
+        (source / "manual.toml").write_text('[DEFAULT]\nhead = "head.js"\n'
+            'environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]\n'
+            'prefs = ["mail.panorama.enabled=true"]\n["test_one.js"]\n')
+        (source / "head.js").write_text("// source head")
+        runtime = self.root / "testing/xpcshell/head.js"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text("// pinned harness receipt input")
+        case = self.raw_task_case()
+        test = source / case["file"]
+        text = ("add_setup(function () {});\nadd_task(function test_first() {});\n"
+                "add_task(async function test_second() {});")
+        test.write_text(text)
+        self.assertIn(runtime, runner.prepare({"source": str(self.root)}, case)[1])
+        for bad in (text.replace("function ()", "function setupWrong()"),
+                    text + "add_setup(function () {});", text.replace("test_second", "test_wrong"),
+                    text.replace("add_setup(function", "add_setup({skip_if: true}, function")):
+            test.write_text(bad)
+            with self.subTest(source=bad), self.assertRaisesRegex(ValueError, "named tasks/setup"):
+                runner.prepare({"source": str(self.root)}, case)
+        test.write_text(text)
+        for changed in ({"anonymous_setup": False}, {"setups": ["setupFolders"]},
+                        {"backend": "mork"}, {"task": "test_first"}):
+            with self.subTest(case=changed), self.assertRaises(ValueError):
+                runner.prepare({"source": str(self.root)}, {**case, **changed})
+        runtime.unlink()
+        with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+            runner.prepare({"source": str(self.root)}, case)
+
+    def test_new_raw_catalog_and_view_lanes_are_exact_manual_cases(self):
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        self.assertEqual(len(catalog), 163)
+        self.assertEqual(len({c["id"] for c in catalog}), 163)
+        expected = {
+            "core:Publication": ["test_publishCommittedMessageOnce",
+                "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
+                "test_tagChangesPreserveFlaggedMembership", "test_tagChangesKeepReadMessagesOutOfUnreadView"],
+            "search:panorama:none:ConversationIngestion": ["test_orderedCrossFolderIngestion",
+                "test_replyBeforeParentIngestion", "test_siblingsWithMissingParent", "test_siblingsThenParentArrival"]}
+        comm = runner.HERE.parents[4]
+        for case in [c for c in catalog if c["id"] in expected]:
+            self.assertEqual(case["tasks"], expected[case["id"]])
+            self.assertIs(case["anonymous_setup"], True)
+            self.assertEqual((case["backend"], case["store"], case["fixture"]), ("panorama", "none", "raw-db"))
+            source = (comm / case["manifest"]).parent / case["file"]
+            self.assertEqual(runner.re.findall(r"add_task\s*\(\s*(?:async\s+)?function\s+(\w+)", source.read_text()), case["tasks"])
+            events = self.raw_task_events(case)
+            for event in events:
+                if "test" in event:
+                    event["test"] = case["file"]
+                if event["action"] == "suite_start":
+                    event["tests"] = {case["manifest"]: [case["file"]]}
+            self.assertTrue(self.check(events, case)["ok"])
+            self.assertFalse(self.check(events[:-2], case)["ok"])
+        ids = {"workflows:panorama:mbox:SingleFolderIdentity",
+               "workflows:panorama:maildir:SingleFolderIdentity", "workflows:mork:mbox:CrossFolderIdentity"}
+        rows = [c for c in catalog if c["id"] in ids]
+        self.assertEqual({c["id"] for c in rows}, ids)
+        for case in rows:
+            doc = runner.tomllib.loads((comm / case["manifest"]).read_text())
+            self.assertIn(case["file"], doc)
+            self.assertNotIn("task", case)
+            self.assertNotIn("tasks", case)
+            self.assertTrue(case["folder_roles"])
+            self.assertEqual(case["readiness"], "pending-product")
+            self.assertFalse(set(doc[case["file"]]) & {"skip-if", "fail-if", "disabled"})
+
+
+    def test_registered_raw_and_view_cases_pass_real_preflight_before_mock_launch(self):
+        import shutil
+        config, _ = self.initializer_fixture()
+        comm = runner.HERE.parents[4]
+        target = Path(config["source"]) / "comm"
+        runtime = Path(config["source"]) / "testing/xpcshell/head.js"
+        runtime.write_text("// synthetic harness dependency; no xpcshell execution")
+        ids = {"core:Publication", "search:panorama:none:ConversationIngestion",
+               "workflows:panorama:mbox:SingleFolderIdentity",
+               "workflows:panorama:maildir:SingleFolderIdentity", "workflows:mork:mbox:CrossFolderIdentity"}
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        rows = [c for c in catalog if c["id"] in ids]
+        self.assertEqual({c["id"] for c in rows}, ids)
+        for case in rows:
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [manifest.parent / n for n in doc["DEFAULT"]["head"].split()]
+            paths += [manifest.parent / n for n in doc["DEFAULT"].get("support-files", [])]
+            paths += [comm / n for n in case["source_dependencies"]]
+            for original in paths:
+                copy_to = target / original.resolve().relative_to(comm)
+                copy_to.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, copy_to)
+        with patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=7)) as launch:
+            for index, case in enumerate(rows):
+                manifest, paths = runner.prepare(config, case)
+                self.assertIn(manifest.parent / case["file"], paths)
+                self.assertTrue({target / n for n in case["source_dependencies"]} <= set(paths))
+                output = self.root / ("registration-" + str(index))
+                output.mkdir()
+                launch.reset_mock()
+                result = runner.run_case(config, case, output)
+                launch.assert_called_once()
+                self.assertEqual(result["exit_code"], 7)
+                self.assertEqual(result["coverage"], "none")
+        missing = target / rows[-1]["source_dependencies"][0]
+        missing.unlink()
+        with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+            runner.prepare(config, rows[-1])
 
 if __name__ == "__main__":
     unittest.main()

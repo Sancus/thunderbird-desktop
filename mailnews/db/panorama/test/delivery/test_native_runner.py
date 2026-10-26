@@ -592,5 +592,34 @@ class NativeRunnerTests(unittest.TestCase):
         self.assertEqual(record["survivor_pids"], [])
 
 
+
+    def test_new_native_receipts_bind_properties_aliases_schema_and_close(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        comm_paths = ["mailnews/db/panorama/" + p for p in (
+            "test/gtest/TestDeliveryCoreProperties.cpp", "test/gtest/TestDeliveryMessageReferences.cpp",
+            "src/DatabaseCore.cpp", "src/DatabaseCore.h", "src/DatabaseUtils.cpp", "src/DatabaseUtils.h",
+            "src/Message.cpp", "src/Message.h", "src/MessageDatabase.cpp", "src/MessageDatabase.h",
+            "src/DetachedMsgHdr.cpp", "src/DetachedMsgHdr.h", "src/FolderDatabase.cpp", "src/FolderDatabase.h",
+            "public/nsIMessageDatabase.idl", "public/moz.build", "src/moz.build", "test/gtest/moz.build")]
+        gecko_paths = ["storage/" + p for p in (
+            "mozStorageService.cpp", "mozStorageService.h", "mozIStorageService.idl",
+            "mozIStorageConnection.idl", "mozIStorageStatement.idl", "mozIStorageAsyncConnection.idl")]
+        gecko_paths += ["xpcom/threads/" + p for p in (
+            "nsIEventTarget.idl", "nsThreadUtils.h", "nsThreadUtils.cpp", "SpinEventLoopUntil.h")]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)), patch.object(runner, "verify") as verify):
+            for relative in ["comm/" + p for p in comm_paths] + gecko_paths:
+                path = str(Path(config["source"]) / relative)
+                with self.subTest(path=relative):
+                    self.assertIn(path, receipt["inputs"])
+                    identity = receipt["inputs"].pop(path)
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic()+5)
+                    receipt["inputs"][path] = identity
+            verify.assert_not_called()
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
+
 if __name__ == "__main__":
     unittest.main()

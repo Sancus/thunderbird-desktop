@@ -237,3 +237,21 @@ and restored source, FolderFactoryChildren/Retry, local startup/Reconcile, root
 factory, MailboxName and native017-qualified regressions remain root runtime
 gates. Native017 and lightweight accounting checks give these new files no PASS.
 Native gtest build/qualification proceeds independently.
+
+## Raw database task groups and physical view identity
+
+The manual catalog has 163 JS rows; NumericProperties remains pending-contract.
+Publication now declares its current five tasks and ConversationIngestion all four.
+These panorama:none files each require one literal anonymous setup, assertions
+and backend evidence inside it, then every named task with assertions and exact
+file/suite completion. Preflight binds the pinned xpcshell head.js task logger.
+No account or body store is claimed; missing/extra tasks or setup evidence fail.
+The singular metadata task and folder-initializer gates remain separate.
+
+SingleFolderIdentity adds both Panorama stores; CrossFolderIdentity is a Mork
+mbox reference with equal folder-scoped keys. Both require every literal fixture
+folder/store diagnostic and full-file PASS. Root must also inspect their named
+task completion, fresh-header lookup, exact rows and live deletion assertions.
+Store selection gives no extra body-persistence credit. Matching build/source,
+installed fixtures, fresh profiles, cleanup and negative controls remain required.
+Unselected rows are NOTRUN; historical isolated jobs do not qualify this source.

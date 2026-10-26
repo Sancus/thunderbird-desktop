@@ -1,0 +1,15 @@
+# Manual acceptance; deliberately not registered in moz.build.
+[DEFAULT]
+head = "head.js head_delivery.js"
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=mork:mbox",
+]
+prefs = [
+  "mail.panorama.enabled=false",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+tags = ["panorama-delivery"]
+
+["test_deliveryWorkflowCrossFolderIdentity.js"]

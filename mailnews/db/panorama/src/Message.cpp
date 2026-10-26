@@ -4,6 +4,7 @@
 
 #include "Message.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 
@@ -11,10 +12,23 @@
 #include "mozilla/Try.h"
 #include "nsIMsgAccountManager.h"
 #include "nsMsgMessageFlags.h"
+#include "nsMsgUtils.h"
 #include "nsString.h"
 #include "prtime.h"
 
 namespace mozilla::mailnews {
+
+namespace {
+
+// Preserve the existing numeric path for storage fields and the keywords alias.
+bool UsesNativeUint32Property(const nsACString& name) {
+  return name.EqualsLiteral("messageSize") ||
+         name.EqualsLiteral("offlineMessageSize") ||
+         name.EqualsLiteral("lineCount") || name.EqualsLiteral("storeToken") ||
+         name.EqualsLiteral("keywords");
+}
+
+}  // namespace
 
 NS_IMPL_ISUPPORTS(Message, nsIMsgDBHdr)
 
@@ -50,14 +64,26 @@ NS_IMETHODIMP Message::GetStringProperty(const char* propertyName,
 NS_IMETHODIMP Message::GetUint32Property(const char* propertyName,
                                          uint32_t* propertyValue) {
   NS_ENSURE_ARG_POINTER(propertyValue);
-  return MessageDB().GetMessageProperty(mKey, nsDependentCString(propertyName),
-                                        *propertyValue);
+  nsDependentCString name(propertyName);
+  if (UsesNativeUint32Property(name)) {
+    return MessageDB().GetMessageProperty(mKey, name, *propertyValue);
+  }
+  nsAutoCString text;
+  MOZ_TRY(MessageDB().GetMessageProperty(mKey, name, text));
+  *propertyValue = static_cast<uint32_t>(
+      MsgUnhex(text.get(), std::min<uint32_t>(8, text.Length())));
+  return NS_OK;
 }
 
 NS_IMETHODIMP Message::SetUint32Property(const char* propertyName,
                                          uint32_t propertyValue) {
-  return MessageDB().SetMessageProperty(mKey, nsDependentCString(propertyName),
-                                        propertyValue);
+  nsDependentCString name(propertyName);
+  if (UsesNativeUint32Property(name)) {
+    return MessageDB().SetMessageProperty(mKey, name, propertyValue);
+  }
+  nsAutoCString text;
+  text.AppendInt(propertyValue, 16);
+  return MessageDB().SetMessageProperty(mKey, name, text);
 }
 
 NS_IMETHODIMP Message::GetProperties(nsTArray<nsCString>& properties) {

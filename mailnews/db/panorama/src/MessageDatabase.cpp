@@ -1024,11 +1024,13 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
     return NS_OK;
   }
 
+  nsAutoCString tags;
+  MOZ_TRY(GetMessageTags(key, tags));
   uint64_t folderId;
-  GetMessageFolderId(key, folderId);
+  MOZ_TRY(GetMessageFolderId(key, folderId));
   RefPtr<DetachedMsgHdr> oldMessage = new DetachedMsgHdr(folderId);
-  // TODO: This'll need filling properly once we have more complex filters.
-  oldMessage->SetFlags(oldFlags);
+  MOZ_TRY(oldMessage->SetFlags(oldFlags));
+  MOZ_TRY(oldMessage->SetStringProperty("keywords", tags));
 
   // Update in DB.
   {
@@ -1320,11 +1322,13 @@ nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
     return NS_OK;
   }
 
+  uint32_t flags;
+  MOZ_TRY(GetMessageFlags(key, flags));
   uint64_t folderId;
-  GetMessageFolderId(key, folderId);
+  MOZ_TRY(GetMessageFolderId(key, folderId));
   RefPtr<DetachedMsgHdr> oldMessage = new DetachedMsgHdr(folderId);
-  // TODO: This'll need filling properly once we have more complex filters.
-  oldMessage->SetStringProperty("keywords", oldTags);
+  MOZ_TRY(oldMessage->SetFlags(flags));
+  MOZ_TRY(oldMessage->SetStringProperty("keywords", oldTags));
 
   // Update DB.
   {

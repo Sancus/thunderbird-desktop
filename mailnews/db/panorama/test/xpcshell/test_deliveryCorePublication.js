@@ -236,3 +236,214 @@ add_task(async function test_folderFilteredEventsUseDatabaseIdentity() {
     view.clearListener();
   }
 });
+
+add_task(async function test_tagThenReadPublishesEachMessageOnce() {
+  const root = folderDB.insertRoot("delivery-tag-then-read");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const tag = "delivery-snapshot-tag";
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  view.initWithTag(tag);
+  registerCleanupFunction(() => view.clearListener());
+  const events = [];
+  view.setListener({
+    onMessageAdded(message) {
+      events.push(["added", message.id, message.flags, message.tags]);
+    },
+    onMessageRemoved(message) {
+      events.push(["removed", message.id, message.flags, message.tags]);
+    },
+    onMessageFlagsChanged(message, oldFlags) {
+      events.push(["flags", message.id, message.flags, message.tags, oldFlags]);
+    },
+    onMessageTagsChanged(message, oldTags) {
+      events.push(["tags", message.id, message.flags, message.tags, oldTags]);
+    },
+    onSelectedChunk() {},
+  });
+  try {
+    const first = addMessage({
+      folderId,
+      messageId: "snapshot-copy@invalid",
+      flags: 0,
+    });
+    const second = addMessage({
+      folderId,
+      messageId: "snapshot-copy@invalid",
+      flags: 0,
+    });
+    const control = addMessage({
+      folderId,
+      messageId: "snapshot-control@invalid",
+      flags: 0,
+    });
+    Assert.deepEqual(events, [], "Untagged rows do not enter the tag view");
+    const firstHeader = messageDB.getMessage(first);
+    const secondHeader = messageDB.getMessage(second);
+    secondHeader.setStringProperty("keywords", tag);
+    firstHeader.setStringProperty("keywords", tag);
+    secondHeader.flags = Ci.nsMsgMessageFlags.Read;
+    firstHeader.flags = Ci.nsMsgMessageFlags.Read;
+    messageDB.getMessage(control).flags = Ci.nsMsgMessageFlags.Read;
+    Assert.deepEqual(events, [
+      ["added", second, 0, tag],
+      ["added", first, 0, tag],
+      ["flags", second, Ci.nsMsgMessageFlags.Read, tag, 0],
+      ["flags", first, Ci.nsMsgMessageFlags.Read, tag, 0],
+    ]);
+    Assert.equal(await view.countMessages(), 2);
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id).sort(
+        (a, b) => a - b
+      ),
+      [first, second].sort((a, b) => a - b),
+      "SQL membership contains both physical copies exactly once"
+    );
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, flags, tags FROM messages WHERE folderId = " +
+          folderId +
+          " ORDER BY id",
+        ["id", "flags", "tags"]
+      ),
+      [
+        [first, Ci.nsMsgMessageFlags.Read, tag],
+        [second, Ci.nsMsgMessageFlags.Read, tag],
+        [control, Ci.nsMsgMessageFlags.Read, ""],
+      ].sort((a, b) => a[0] - b[0]),
+      "Independent committed rows retain the tags during flag changes"
+    );
+  } finally {
+    view.clearListener();
+  }
+});
+
+add_task(async function test_tagChangesPreserveFlaggedMembership() {
+  const root = folderDB.insertRoot("delivery-tag-flagged-snapshot");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const flags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  view.initWithFlaggedMessages();
+  registerCleanupFunction(() => view.clearListener());
+  const baseline = await view.countMessages();
+  const events = [];
+  view.setListener({
+    onMessageAdded(message) {
+      events.push(["added", message.id, message.flags, message.tags]);
+    },
+    onMessageRemoved(message) {
+      events.push(["removed", message.id, message.flags, message.tags]);
+    },
+    onMessageFlagsChanged(message, oldFlags) {
+      events.push(["flags", message.id, message.flags, message.tags, oldFlags]);
+    },
+    onMessageTagsChanged(message, oldTags) {
+      events.push(["tags", message.id, message.flags, message.tags, oldTags]);
+    },
+    onSelectedChunk() {},
+  });
+  try {
+    const id = addMessage({ folderId, flags, tags: "before" });
+    const control = addMessage({
+      folderId,
+      flags: Ci.nsMsgMessageFlags.Read,
+      tags: "before",
+    });
+    messageDB.getMessage(id).setStringProperty("keywords", "after");
+    messageDB.getMessage(control).setStringProperty("keywords", "after");
+    Assert.deepEqual(events, [
+      ["added", id, flags, "before"],
+      ["tags", id, flags, "after", "before"],
+    ]);
+    Assert.equal(await view.countMessages(), baseline + 1);
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id).filter(
+        key => key === id || key === control
+      ),
+      [id],
+      "Only the flagged row belongs to the view"
+    );
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, flags, tags FROM messages WHERE folderId = " +
+          folderId +
+          " ORDER BY id",
+        ["id", "flags", "tags"]
+      ),
+      [
+        [id, flags, "after"],
+        [control, Ci.nsMsgMessageFlags.Read, "after"],
+      ].sort((a, b) => a[0] - b[0]),
+      "Tag replacement preserves the committed flags of both rows"
+    );
+  } finally {
+    view.clearListener();
+  }
+});
+
+add_task(async function test_tagChangesKeepReadMessagesOutOfUnreadView() {
+  const root = folderDB.insertRoot("delivery-tag-unread-snapshot");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+    Ci.nsILiveView
+  );
+  view.initWithUnreadMessages();
+  registerCleanupFunction(() => view.clearListener());
+  const baseline = await view.countMessages();
+  const events = [];
+  view.setListener({
+    onMessageAdded(message) {
+      events.push(["added", message.id, message.flags, message.tags]);
+    },
+    onMessageRemoved(message) {
+      events.push(["removed", message.id, message.flags, message.tags]);
+    },
+    onMessageFlagsChanged(message, oldFlags) {
+      events.push(["flags", message.id, message.flags, message.tags, oldFlags]);
+    },
+    onMessageTagsChanged(message, oldTags) {
+      events.push(["tags", message.id, message.flags, message.tags, oldTags]);
+    },
+    onSelectedChunk() {},
+  });
+  try {
+    const unread = addMessage({ folderId, flags: 0, tags: "before" });
+    const read = addMessage({
+      folderId,
+      flags: Ci.nsMsgMessageFlags.Read,
+      tags: "before",
+    });
+    messageDB.getMessage(read).setStringProperty("keywords", "after");
+    messageDB.getMessage(unread).setStringProperty("keywords", "after");
+    Assert.deepEqual(events, [
+      ["added", unread, 0, "before"],
+      ["tags", unread, 0, "after", "before"],
+    ]);
+    Assert.equal(await view.countMessages(), baseline + 1);
+    Assert.deepEqual(
+      Array.from(await view.selectMessages(), message => message.id).filter(
+        key => key === read || key === unread
+      ),
+      [unread],
+      "The read control never belongs to the unread view"
+    );
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT id, flags, tags FROM messages WHERE folderId = " +
+          folderId +
+          " ORDER BY id",
+        ["id", "flags", "tags"]
+      ),
+      [
+        [unread, 0, "after"],
+        [read, Ci.nsMsgMessageFlags.Read, "after"],
+      ].sort((a, b) => a[0] - b[0]),
+      "Both committed rows preserve their read states during tag changes"
+    );
+  } finally {
+    view.clearListener();
+  }
+});

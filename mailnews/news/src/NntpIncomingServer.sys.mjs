@@ -80,6 +80,31 @@ export class NntpIncomingServer extends MsgIncomingServer {
     ]);
   }
 
+  /**
+   * Returns the news root, initializing its persisted Panorama identity.
+   *
+   * @returns {nsIMsgFolder} The account's news root.
+   */
+  get rootFolder() {
+    if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      return super.rootFolder;
+    }
+    if (!this._rootFolder) {
+      const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+        Ci.nsIDatabaseCore
+      );
+      const rootId =
+        core.folderDB.getFolderChildNamed(0, this.key) ||
+        core.folderDB.insertRoot(this.key);
+      const folder = Cc[
+        "@mozilla.org/mail/folder-factory;1?name=news"
+      ].createInstance(Ci.nsIMsgFolder);
+      folder.initWithFolderId(rootId);
+      this._rootFolder = folder;
+    }
+    return this._rootFolder;
+  }
+
   observe(subject, topic) {
     switch (topic) {
       case "profile-before-change":

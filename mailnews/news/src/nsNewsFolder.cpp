@@ -39,6 +39,13 @@
 #include "nsIInputStream.h"
 #include "nsIURIMutator.h"
 
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#  include "FolderDatabase.h"
+#  include "mozilla/ResultExtensions.h"
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
+
 #define kNewsRootURI "news:/"
 #define kNewsMessageRootURI "news-message:/"
 
@@ -99,6 +106,11 @@ NS_IMETHODIMP
 nsMsgNewsFolder::AddNewsgroup(const nsACString& name, const nsACString& setStr,
                               nsIMsgFolder** child) {
   NS_ENSURE_ARG_POINTER(child);
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return AddNewsgroupWithFolderId(name, setStr, child);
+  }
+#endif
   nsresult rv;
 
   nsCOMPtr<nsINntpIncomingServer> nntpServer;
@@ -149,6 +161,49 @@ nsMsgNewsFolder::AddNewsgroup(const nsACString& name, const nsACString& setStr,
   folder.forget(child);
   return rv;
 }
+
+#ifdef MOZ_PANORAMA
+nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
+                                                  const nsACString& setStr,
+                                                  nsIMsgFolder** child) {
+  *child = nullptr;
+  NS_ENSURE_STATE(mFolderId);
+  NS_ENSURE_ARG(!name.IsEmpty());
+  RefPtr<mozilla::mailnews::DatabaseCore> core =
+      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+  auto& folderDB = core->FolderDB();
+  uint64_t id = MOZ_TRY(folderDB.GetFolderChildNamed(mFolderId, name));
+  if (!id) {
+    MOZ_TRY(folderDB.InsertFolder(mFolderId, name, &id));
+  }
+
+  nsCOMPtr<nsIFile> path;
+  MOZ_TRY(CreateDirectoryForFolder(getter_AddRefs(path)));
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(GetCachedChild(id, getter_AddRefs(folder)));
+  nsresult rv;
+  if (!folder) {
+    folder =
+        do_CreateInstance("@mozilla.org/mail/folder-factory;1?name=news", &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    MOZ_TRY(folder->InitWithFolderId(id));
+    MOZ_TRY(folder->SetParent(this));
+  }
+  nsCOMPtr<nsIMsgNewsFolder> newsFolder = do_QueryInterface(folder, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(newsFolder->SetReadSetFromStr(setStr));
+  MOZ_TRY(folder->SetFlag(nsMsgFolderFlags::Newsgroup));
+
+  nsCOMPtr<nsINntpIncomingServer> nntpServer;
+  MOZ_TRY(GetNntpServer(getter_AddRefs(nntpServer)));
+  MOZ_TRY(nntpServer->AddNewsgroup(name));
+  if (!mSubFolders.Contains(folder)) {
+    mSubFolders.AppendObject(folder);
+  }
+  folder.forget(child);
+  return NS_OK;
+}
+#endif
 
 nsresult nsMsgNewsFolder::ParseFolder(nsIFile* path) {
   return NS_ERROR_NOT_IMPLEMENTED;

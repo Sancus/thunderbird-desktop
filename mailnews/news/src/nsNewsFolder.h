@@ -85,6 +85,12 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   nsresult AddDirectorySeparator(nsIFile* path);
   nsresult GetDatabase() override;
 
+#ifdef MOZ_PANORAMA
+  nsresult AddNewsgroupWithFolderId(const nsACString& name,
+                                    const nsACString& setStr,
+                                    nsIMsgFolder** child);
+#endif
+
   nsresult LoadNewsrcFileAndCreateNewsgroups();
   int32_t RememberLine(const nsACString& line);
   nsresult RememberUnsubscribedGroup(const nsACString& newsgroup,

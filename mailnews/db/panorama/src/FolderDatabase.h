@@ -48,6 +48,7 @@ class FolderDatabase : public nsIFolderDatabase {
  private:
   friend class DatabaseCore;
   friend class FolderInfo;
+  friend class DeliveryCoreProperties;
   friend class VirtualFolderFilter;
   friend class VirtualFolderWrapper;
 

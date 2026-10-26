@@ -443,14 +443,13 @@ nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, id);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(name)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
 
   bool hasResult;
-  if (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    uint32_t len;
-    value = stmt->AsSharedUTF8String(0, &len);
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
+  if (hasResult) {
+    return stmt->GetUTF8String(0, value);
   }
 
   return rv;
@@ -466,13 +465,13 @@ nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, id);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(name)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
 
   bool hasResult;
-  if (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    *value = stmt->AsInt64(0);
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
+  if (hasResult) {
+    return stmt->GetInt64(0, value);
   }
 
   return rv;
@@ -486,11 +485,11 @@ nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
       "REPLACE INTO folder_properties (id, name, value) VALUES (:id, :name, :value)"_ns,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
+  mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, id);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(name)));
-  stmt->BindUTF8StringByName("value"_ns, value);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
+  MOZ_TRY(stmt->BindUTF8StringByName("value"_ns, value));
   return stmt->Execute();
 }
 
@@ -502,11 +501,11 @@ nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
       "REPLACE INTO folder_properties (id, name, value) VALUES (:id, :name, :value)"_ns,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
+  mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, id);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(name)));
-  stmt->BindInt64ByName("value"_ns, value);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
+  MOZ_TRY(stmt->BindInt64ByName("value"_ns, value));
   return stmt->Execute();
 }
 

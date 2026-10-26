@@ -28,6 +28,7 @@ namespace mozilla::mailnews {
 class PerFolderDatabase;
 class DeliveryCoreMessageExistence;
 class DeliveryCoreReferences;
+class DeliveryCoreProperties;
 class DeliveryFolderInfoProperties;
 class DeliveryMessageReferences;
 
@@ -53,6 +54,7 @@ class DatabaseCore : public nsIDatabaseCore,
  private:
   friend class DeliveryCoreMessageExistence;
   friend class DeliveryCoreReferences;
+  friend class DeliveryCoreProperties;
   friend class DeliveryFolderInfoProperties;
   friend class DeliveryMessageReferences;
   friend class FolderDatabase;
@@ -74,7 +76,7 @@ class DatabaseCore : public nsIDatabaseCore,
 
   static nsresult EnsureConnection();
   static nsresult CreateNewDatabase();
-  static nsresult UpgradeReferencesSchema();
+  static nsresult UpgradeSchema();
 
   static nsresult GetStatement(const nsACString& aName, const nsACString& aSQL,
                                mozIStorageStatement** aStmt);

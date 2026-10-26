@@ -765,16 +765,20 @@ nsresult MessageDatabase::GetMessagePropertyNames(nsMsgKey key,
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, key);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
 
-  names.Clear();
-  bool hasResult;
-  uint32_t len;
-  nsAutoCString name;
-  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    name = stmt->AsSharedUTF8String(0, &len);
-    names.AppendElement(name);
+  nsTArray<nsCString> found;
+  while (true) {
+    bool hasResult;
+    MOZ_TRY(stmt->ExecuteStep(&hasResult));
+    if (!hasResult) {
+      break;
+    }
+    nsCString name;
+    MOZ_TRY(stmt->GetUTF8String(0, name));
+    found.AppendElement(std::move(name));
   }
+  names = std::move(found);
 
   return NS_OK;
 }
@@ -793,16 +797,15 @@ NS_IMETHODIMP MessageDatabase::GetMessageProperty(nsMsgKey aKey,
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, aKey);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(aName)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, aKey));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, aName));
 
-  aValue.Truncate();
   bool hasResult;
-  if (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    uint32_t len;
-    aValue = stmt->AsSharedUTF8String(0, &len);
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
+  if (hasResult) {
+    return stmt->GetUTF8String(0, aValue);
   }
+  aValue.Truncate();
   return NS_OK;
 }
 
@@ -818,15 +821,16 @@ nsresult MessageDatabase::GetMessageProperty(nsMsgKey key,
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, key);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(name)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
 
-  value = 0;
   bool hasResult;
-  if (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    value = (uint32_t)stmt->AsInt64(0);
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
+  int64_t stored = 0;
+  if (hasResult) {
+    MOZ_TRY(stmt->GetInt64(0, &stored));
   }
+  value = static_cast<uint32_t>(stored);
   return NS_OK;
 }
 
@@ -843,10 +847,9 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, aKey);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(aName)));
-  stmt->BindUTF8StringByName("value"_ns, aValue);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, aKey));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, aName));
+  MOZ_TRY(stmt->BindUTF8StringByName("value"_ns, aValue));
   rv = stmt->Execute();
   NS_ENSURE_SUCCESS(rv, rv);
   // TODO: might want to cache selected properties.
@@ -864,10 +867,9 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("id"_ns, aKey);
-  stmt->BindUTF8StringByName("name"_ns,
-                             MOZ_TRY(DatabaseUtils::Normalize(aName)));
-  stmt->BindInt64ByName("value"_ns, aValue);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, aKey));
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, aName));
+  MOZ_TRY(stmt->BindInt64ByName("value"_ns, aValue));
   rv = stmt->Execute();
   NS_ENSURE_SUCCESS(rv, rv);
   // TODO: might want to cache selected properties.

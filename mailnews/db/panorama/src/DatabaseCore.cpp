@@ -203,7 +203,7 @@ nsresult DatabaseCore::EnsureConnection() {
   if (!exists) {
     MOZ_TRY(CreateNewDatabase());
   }
-  MOZ_TRY(UpgradeReferencesSchema());
+  MOZ_TRY(UpgradeSchema());
   MOZ_TRY(sConnection->CommitTransaction());
   transactionGuard.release();
   schemaCommitted = true;
@@ -252,10 +252,10 @@ nsresult CheckReferenceSchemaTable(mozIStorageConnection* connection,
 
 }  // namespace
 
-nsresult DatabaseCore::UpgradeReferencesSchema() {
+nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version == 0 || version == 1, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 2, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -265,13 +265,11 @@ nsresult DatabaseCore::UpgradeReferencesSchema() {
       {"folders",
        "id:INTEGER:0:1,parent:INTEGER:0:0,ordinal:INTEGER:0:0,name:TEXT:0:0,"
        "flags:INTEGER:0:0"},
-      {"folder_properties", "id:INTEGER:0:1,name:TEXT:0:2,value:ANY:0:0"},
       {"messages",
        "id:INTEGER:0:1,folderId:INTEGER:0:0,threadId:INTEGER:0:0,threadParent:"
        "INTEGER:0:0,messageId:TEXT:0:0,date:INTEGER:0:0,sender:TEXT:0:0,"
        "recipients:TEXT:0:0,ccList:TEXT:0:0,bccList:TEXT:0:0,subject:TEXT:0:0,"
        "flags:INTEGER:0:0,tags:TEXT:0:0,priority:INTEGER:0:0"},
-      {"message_properties", "id:INTEGER:0:1,name:TEXT:0:2,value:ANY:0:0"},
       {"virtualFolder_folders",
        "virtualFolderId:INTEGER:0:0,searchFolderId:INTEGER:0:0"},
       {"search_folder_hits", "folder_id:INTEGER:0:1,message_id:INTEGER:0:2"},
@@ -279,6 +277,27 @@ nsresult DatabaseCore::UpgradeReferencesSchema() {
   for (const auto& layout : layouts) {
     MOZ_TRY(
         CheckReferenceSchemaTable(sConnection, layout.table, layout.columns));
+  }
+  const char* propertyColumns =
+      version < 2 ? "id:INTEGER:0:1,name:TEXT:0:2,value:ANY:0:0"
+                  : "id:INTEGER:0:1,name:TEXT:0:2,value:BLOB:0:0";
+  for (const char* table : {"folder_properties", "message_properties"}) {
+    MOZ_TRY(CheckReferenceSchemaTable(sConnection, table, propertyColumns));
+  }
+  if (version < 2) {
+    // Do not discard unrecognized indexes or triggers while replacing tables.
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN "
+        "('folder_properties', 'message_properties') UNION ALL "
+        "SELECT 1 FROM pragma_index_list('folder_properties') WHERE origin != "
+        "'pk' "
+        "UNION ALL SELECT 1 FROM pragma_index_list('message_properties') "
+        "WHERE origin != 'pk'"_ns,
+        getter_AddRefs(stmt)));
+    bool unexpected;
+    MOZ_TRY(stmt->ExecuteStep(&unexpected));
+    NS_ENSURE_TRUE(!unexpected, NS_ERROR_NOT_AVAILABLE);
   }
   if (version == 0) {
     MOZ_TRY(sConnection->ExecuteSimpleSQL(
@@ -297,18 +316,40 @@ nsresult DatabaseCore::UpgradeReferencesSchema() {
   MOZ_TRY(CheckReferenceSchemaTable(
       sConnection, "message_references",
       "id:INTEGER:0:1,ordinal:INTEGER:0:2,token:TEXT:1:0"));
-  bool exists;
-  nsCOMPtr<mozIStorageStatement> stmt;
-  MOZ_TRY(sConnection->CreateStatement(
-      "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
-      "AND name = 'delete_message_references' AND tbl_name = 'messages'"_ns,
-      getter_AddRefs(stmt)));
-  MOZ_TRY(stmt->ExecuteStep(&exists));
-  NS_ENSURE_TRUE(exists, NS_ERROR_FILE_CORRUPTED);
-  nsCString triggerSQL;
-  MOZ_TRY(stmt->GetUTF8String(0, triggerSQL));
-  NS_ENSURE_TRUE(triggerSQL.Equals(kReferenceDeleteTrigger),
-                 NS_ERROR_FILE_CORRUPTED);
+  {
+    bool exists;
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+        "AND name = 'delete_message_references' AND tbl_name = 'messages'"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(stmt->ExecuteStep(&exists));
+    NS_ENSURE_TRUE(exists, NS_ERROR_FILE_CORRUPTED);
+    nsCString triggerSQL;
+    MOZ_TRY(stmt->GetUTF8String(0, triggerSQL));
+    NS_ENSURE_TRUE(triggerSQL.Equals(kReferenceDeleteTrigger),
+                   NS_ERROR_FILE_CORRUPTED);
+  }
+  if (version < 2) {
+    // BLOB affinity preserves text and native integers without coercion.
+    // Existing cells are copied unchanged; previously lost text cannot be
+    // reconstructed.
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE folder_properties_v2(id INTEGER REFERENCES folders(id), "
+        "name TEXT, value BLOB, PRIMARY KEY(id, name));"
+        "INSERT INTO folder_properties_v2 "
+        "SELECT id, name, value FROM folder_properties;"
+        "DROP TABLE folder_properties;"
+        "ALTER TABLE folder_properties_v2 RENAME TO folder_properties;"
+        "CREATE TABLE message_properties_v2(id INTEGER REFERENCES "
+        "messages(id), "
+        "name TEXT, value BLOB, PRIMARY KEY(id, name));"
+        "INSERT INTO message_properties_v2 "
+        "SELECT id, name, value FROM message_properties;"
+        "DROP TABLE message_properties;"
+        "ALTER TABLE message_properties_v2 RENAME TO message_properties;"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(2));
+  }
   return NS_OK;
 }
 

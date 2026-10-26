@@ -4,59 +4,148 @@
 
 #include "DetachedMsgHdr.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <utility>
+
 #include "mozilla/Components.h"
+#include "mozilla/Try.h"
 #include "nsIDatabaseCore.h"
 #include "nsIFolderDatabase.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
-#include "nsPrintfCString.h"
 
 namespace mozilla::mailnews {
 
 NS_IMPL_ISUPPORTS(DetachedMsgHdr, nsIMsgDBHdr)
 
+nsresult DetachedMsgHdr::CheckMutable() const {
+  if (mAttachState == AttachState::Attaching) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  if (mAttachState == AttachState::Attached) {
+    return NS_ERROR_ALREADY_INITIALIZED;
+  }
+  return mAttachError;
+}
+
 NS_IMETHODIMP DetachedMsgHdr::SetStringProperty(
     const char* propertyName, const nsACString& propertyValue) {
-  if (nsDependentCString(propertyName).EqualsLiteral("keywords")) {
-    mRaw.keywords = propertyValue;
-    return NS_OK;
-  }
-
-  NS_WARNING(
-      nsPrintfCString(
-          "NS_ERROR_NOT_IMPLEMENTED DetachedMsgHdr::SetStringProperty(%s=%s)\n",
-          propertyName, PromiseFlatCString(propertyValue).get())
-          .get());
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(propertyName);
+  MOZ_TRY(CheckMutable());
+  auto& extra = *mRaw.extras.AppendElement();
+  extra.k = propertyName;
+  extra.v = propertyValue;
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetStringProperty(const char* propertyName,
                                                 nsACString& propertyValue) {
-  if (nsDependentCString(propertyName).EqualsLiteral("keywords")) {
-    propertyValue.Assign(mRaw.keywords);
-    return NS_OK;
+  NS_ENSURE_ARG_POINTER(propertyName);
+  nsDependentCString name(propertyName);
+  // Explicit destination storage fields take precedence over extras.
+  if (name.EqualsLiteral("messageSize") && mRaw.messageSize) {
+    propertyValue.Truncate();
+    propertyValue.AppendInt(*mRaw.messageSize);
+  } else if (name.EqualsLiteral("offlineMessageSize") &&
+             mRaw.offlineMessageSize) {
+    propertyValue.Truncate();
+    propertyValue.AppendInt(*mRaw.offlineMessageSize);
+  } else if (name.EqualsLiteral("lineCount") && mRaw.lineCount) {
+    propertyValue.Truncate();
+    propertyValue.AppendInt(*mRaw.lineCount);
+  } else if (name.EqualsLiteral("storeToken") && mRaw.storeToken) {
+    propertyValue = *mRaw.storeToken;
+  } else {
+    for (size_t i = mRaw.extras.Length(); i > 0; --i) {
+      const auto& extra = mRaw.extras[i - 1];
+      if (extra.k.Equals(name)) {
+        propertyValue = extra.v;
+        return NS_OK;
+      }
+    }
+    if (name.EqualsLiteral("keywords")) {
+      propertyValue = mRaw.keywords;
+    } else if (name.EqualsLiteral("msgCharSet")) {
+      propertyValue = mRaw.charset;
+    } else if (name.EqualsLiteral("account")) {
+      propertyValue = mRaw.accountKey;
+    } else if (name.EqualsLiteral("replyTo")) {
+      propertyValue = mRaw.replyTo;
+    } else {
+      propertyValue.Truncate();
+    }
   }
-
-  NS_WARNING(
-      nsPrintfCString(
-          "NS_ERROR_NOT_IMPLEMENTED DetachedMsgHdr::GetStringProperty(%s)\n",
-          propertyName)
-          .get());
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetUint32Property(const char* propertyName,
                                                 uint32_t* propertyValue) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(propertyName);
+  NS_ENSURE_ARG_POINTER(propertyValue);
+  nsDependentCString name(propertyName);
+  if (name.EqualsLiteral("keywords")) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  nsAutoCString text;
+  MOZ_TRY(GetStringProperty(propertyName, text));
+  if (name.EqualsLiteral("messageSize") ||
+      name.EqualsLiteral("offlineMessageSize") ||
+      name.EqualsLiteral("lineCount") || name.EqualsLiteral("storeToken")) {
+    // Match the live storage fields' SQLite decimal integer conversion.
+    *propertyValue =
+        static_cast<uint32_t>(std::strtoll(text.get(), nullptr, 10));
+  } else {
+    *propertyValue = static_cast<uint32_t>(
+        MsgUnhex(text.get(), std::min<uint32_t>(8, text.Length())));
+  }
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetUint32Property(const char* propertyName,
                                                 uint32_t propertyValue) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(propertyName);
+  MOZ_TRY(CheckMutable());
+  nsDependentCString name(propertyName);
+  if (name.EqualsLiteral("messageSize")) {
+    return SetMessageSize(propertyValue);
+  }
+  if (name.EqualsLiteral("offlineMessageSize")) {
+    return SetOfflineMessageSize(propertyValue);
+  }
+  if (name.EqualsLiteral("lineCount")) {
+    return SetLineCount(propertyValue);
+  }
+  // The live numeric keywords property is distinct from message tags.
+  if (name.EqualsLiteral("keywords")) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  nsAutoCString text;
+  text.AppendInt(propertyValue, name.EqualsLiteral("storeToken") ? 10 : 16);
+  return SetStringProperty(propertyName, text);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetProperties(nsTArray<nsCString>& properties) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  nsTArray<nsCString> names;
+  for (const auto& extra : mRaw.extras) {
+    if (!names.Contains(extra.k)) {
+      names.AppendElement(extra.k);
+    }
+  }
+  if (mRaw.messageSize) {
+    names.AppendElementUnlessExists("messageSize"_ns);
+  }
+  if (mRaw.offlineMessageSize) {
+    names.AppendElementUnlessExists("offlineMessageSize"_ns);
+  }
+  if (mRaw.lineCount) {
+    names.AppendElementUnlessExists("lineCount"_ns);
+  }
+  if (mRaw.storeToken) {
+    names.AppendElementUnlessExists("storeToken"_ns);
+  }
+  properties = std::move(names);
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetIsRead(bool* isRead) {
@@ -75,6 +164,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetIsKilled(bool* isKilled) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::MarkRead(bool read) {
+  MOZ_TRY(CheckMutable());
   if (read) {
     mRaw.flags |= nsMsgMessageFlags::Read;
   } else {
@@ -84,6 +174,7 @@ NS_IMETHODIMP DetachedMsgHdr::MarkRead(bool read) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::MarkFlagged(bool flagged) {
+  MOZ_TRY(CheckMutable());
   if (flagged) {
     mRaw.flags |= nsMsgMessageFlags::Marked;
   } else {
@@ -93,6 +184,7 @@ NS_IMETHODIMP DetachedMsgHdr::MarkFlagged(bool flagged) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::MarkHasAttachments(bool hasAttachments) {
+  MOZ_TRY(CheckMutable());
   if (hasAttachments) {
     mRaw.flags |= nsMsgMessageFlags::Attachment;
   } else {
@@ -107,6 +199,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetPriority(nsMsgPriorityValue* priority) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetPriority(nsMsgPriorityValue priority) {
+  MOZ_TRY(CheckMutable());
   mRaw.priority = priority;
   return NS_OK;
 }
@@ -117,17 +210,20 @@ NS_IMETHODIMP DetachedMsgHdr::GetFlags(uint32_t* flags) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetFlags(uint32_t flags) {
+  MOZ_TRY(CheckMutable());
   mRaw.flags = flags;
   return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::OrFlags(uint32_t flags, uint32_t* outFlags) {
+  MOZ_TRY(CheckMutable());
   mRaw.flags |= flags;
   *outFlags = mRaw.flags;
   return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::AndFlags(uint32_t flags, uint32_t* outFlags) {
+  MOZ_TRY(CheckMutable());
   mRaw.flags &= flags;
   *outFlags = mRaw.flags;
   return NS_OK;
@@ -140,6 +236,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetThreadId(nsMsgKey* threadId) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetThreadId(nsMsgKey threadId) {
+  MOZ_TRY(CheckMutable());
   mThreadId = threadId;
   return NS_OK;
 }
@@ -167,50 +264,47 @@ NS_IMETHODIMP DetachedMsgHdr::SetThreadParent(nsMsgKey threadParent) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetMessageSize(uint32_t* messageSize) {
-  *messageSize = mMessageSize;
-  return NS_OK;
+  NS_ENSURE_ARG_POINTER(messageSize);
+  return GetUint32Property("messageSize", messageSize);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetMessageSize(uint32_t messageSize) {
-  mMessageSize = messageSize;
+  MOZ_TRY(CheckMutable());
+  mRaw.messageSize = Some(messageSize);
   return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetLineCount(uint32_t* lineCount) {
-  *lineCount = mLineCount;
-  return NS_OK;
+  NS_ENSURE_ARG_POINTER(lineCount);
+  return GetUint32Property("lineCount", lineCount);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetLineCount(uint32_t lineCount) {
-  // Shouldn't be used until _after_ the message has been added to the DB.
-  NS_WARNING("DetachedMsgHdr::SetLineCount() called");
-  mLineCount = lineCount;
+  MOZ_TRY(CheckMutable());
+  mRaw.lineCount = Some(lineCount);
   return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetStoreToken(nsACString& storeToken) {
-  storeToken.Assign(mStoreToken);
-  return NS_OK;
+  return GetStringProperty("storeToken", storeToken);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetStoreToken(const nsACString& storeToken) {
-  // Shouldn't be used until _after_ the message has been added to the DB.
-  NS_WARNING("DetachedMsgHdr::SetStoreToken() called");
-  mStoreToken = storeToken;
+  MOZ_TRY(CheckMutable());
+  mRaw.storeToken = Some(nsCString(storeToken));
   return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetOfflineMessageSize(
     uint32_t* offlineMessageSize) {
-  *offlineMessageSize = mOfflineMessageSize;
-  return NS_OK;
+  NS_ENSURE_ARG_POINTER(offlineMessageSize);
+  return GetUint32Property("offlineMessageSize", offlineMessageSize);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetOfflineMessageSize(
     uint32_t offlineMessageSize) {
-  // Shouldn't be used until _after_ the message has been added to the DB.
-  NS_WARNING("DetachedMsgHdr::SetOfflineMessageSize() called");
-  mOfflineMessageSize = offlineMessageSize;
+  MOZ_TRY(CheckMutable());
+  mRaw.offlineMessageSize = Some(offlineMessageSize);
   return NS_OK;
 }
 
@@ -220,6 +314,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetDate(PRTime* date) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetDate(PRTime date) {
+  MOZ_TRY(CheckMutable());
   mRaw.date = date;
   return NS_OK;
 }
@@ -235,6 +330,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetMessageId(nsACString& messageId) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetMessageId(const nsACString& messageId) {
+  MOZ_TRY(CheckMutable());
   mRaw.messageId = messageId;
   return NS_OK;
 }
@@ -245,6 +341,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetCcList(nsACString& ccList) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetCcList(const nsACString& ccList) {
+  MOZ_TRY(CheckMutable());
   mRaw.ccList = ccList;
   return NS_OK;
 }
@@ -255,6 +352,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetBccList(nsACString& bccList) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetBccList(const nsACString& bccList) {
+  MOZ_TRY(CheckMutable());
   mRaw.bccList = bccList;
   return NS_OK;
 }
@@ -265,6 +363,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetAuthor(nsACString& author) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetAuthor(const nsACString& author) {
+  MOZ_TRY(CheckMutable());
   mRaw.sender = author;
   return NS_OK;
 }
@@ -275,6 +374,7 @@ NS_IMETHODIMP DetachedMsgHdr::GetSubject(nsACString& subject) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetSubject(const nsACString& subject) {
+  MOZ_TRY(CheckMutable());
   mRaw.subject = subject;
   return NS_OK;
 }
@@ -285,11 +385,13 @@ NS_IMETHODIMP DetachedMsgHdr::GetRecipients(nsACString& recipients) {
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetRecipients(const nsACString& recipients) {
+  MOZ_TRY(CheckMutable());
   mRaw.recipients = recipients;
   return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetReferences(const nsACString& references) {
+  MOZ_TRY(CheckMutable());
   mRaw.references = ParseIdentificationFields(references);
   return NS_OK;
 }
@@ -326,13 +428,11 @@ NS_IMETHODIMP DetachedMsgHdr::GetMime2DecodedRecipients(
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetCharset(nsACString& charset) {
-  charset.Assign(mRaw.charset);
-  return NS_OK;
+  return GetStringProperty("msgCharSet", charset);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetCharset(const nsACString& charset) {
-  mRaw.charset = charset;
-  return NS_OK;
+  return SetStringProperty("msgCharSet", charset);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetEffectiveCharset(
@@ -341,13 +441,11 @@ NS_IMETHODIMP DetachedMsgHdr::GetEffectiveCharset(
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetAccountKey(nsACString& accountKey) {
-  accountKey.Assign(mRaw.accountKey);
-  return NS_OK;
+  return GetStringProperty("account", accountKey);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::SetAccountKey(const nsACString& accountKey) {
-  mRaw.accountKey = accountKey;
-  return NS_OK;
+  return SetStringProperty("account", accountKey);
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetFolder(nsIMsgFolder** folder) {

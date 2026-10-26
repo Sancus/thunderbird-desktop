@@ -38,6 +38,7 @@ class PerFolderDatabase : public nsIMsgDatabase,
 
   // MessageListener functions.
   void OnMessageAdded(Message* message) override;
+  void OnMessagePublished(Message* message, bool notifyLegacy) override;
   void OnMessageRemoved(Message* message, uint32_t oldFlags) override;
   void OnMessageFlagsChanged(nsIMsgDBHdr* oldMessage, Message* message,
                              uint32_t oldFlags, uint32_t newFlags) override;

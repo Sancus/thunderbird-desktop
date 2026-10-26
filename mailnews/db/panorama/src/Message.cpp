@@ -387,13 +387,11 @@ NS_IMETHODIMP Message::GetMime2DecodedRecipients(
 }
 
 NS_IMETHODIMP Message::GetCharset(nsACString& charset) {
-  // TODO: actually implement this.
-  charset.Truncate();
-  return NS_OK;
+  return GetStringProperty("msgCharSet", charset);
 }
 
 NS_IMETHODIMP Message::SetCharset(const nsACString& charset) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return SetStringProperty("msgCharSet", charset);
 }
 
 NS_IMETHODIMP Message::GetEffectiveCharset(nsACString& effectiveCharset) {
@@ -401,8 +399,16 @@ NS_IMETHODIMP Message::GetEffectiveCharset(nsACString& effectiveCharset) {
 }
 
 NS_IMETHODIMP Message::GetAccountKey(nsACString& accountKey) {
+  nsTArray<nsCString> names;
+  MOZ_TRY(GetProperties(names));
+  if (names.Contains("account"_ns)) {
+    return GetStringProperty("account", accountKey);
+  }
+
+  uint64_t folderId;
+  MOZ_TRY(MessageDB().GetMessageFolderId(mKey, folderId));
   uint64_t rootId;
-  nsresult rv = FolderDB().GetFolderRoot(FolderId(), &rootId);
+  nsresult rv = FolderDB().GetFolderRoot(folderId, &rootId);
   NS_ENSURE_SUCCESS(rv, rv);
 
   // Get server name from name of root folder.
@@ -426,7 +432,7 @@ NS_IMETHODIMP Message::GetAccountKey(nsACString& accountKey) {
 }
 
 NS_IMETHODIMP Message::SetAccountKey(const nsACString& accountKey) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return SetStringProperty("account", accountKey);
 }
 
 NS_IMETHODIMP Message::GetFolder(nsIMsgFolder** aFolder) {

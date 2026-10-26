@@ -8,7 +8,9 @@
 
 #include "DatabaseCore.h"
 #include "DetachedMsgHdr.h"
+#include "Message.h"
 #include "MessageDatabase.h"
+#include "PerFolderDatabase.h"
 #include "gtest/gtest.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/ScopeExit.h"
@@ -747,6 +749,211 @@ TEST_F(DISABLED_DeliveryHeaderProperties,
   ASSERT_NO_FATAL_FAILURE(MakePropertyReadFault());
   CheckHeaderUint32Output(mHeader, NS_ERROR_FAILURE, kHeaderUint32Sentinel);
   CheckWitness();
+}
+
+using DISABLED_DeliveryCompleteHeader = DeliveryMessageReferences;
+
+TEST_F(DISABLED_DeliveryCompleteHeader, DetachedAliasesPreserveExplicitEmpty) {
+  RefPtr<nsIMsgDBHdr> draft = new DetachedMsgHdr(mFolder);
+  ASSERT_EQ(NS_OK, draft->SetCharset("UTF-8"_ns));
+  ASSERT_EQ(NS_OK, draft->SetAccountKey("received-account"_ns));
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("keywords", "first"_ns));
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("msgCharSet", "windows-1252"_ns));
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("account", EmptyCString()));
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("charset", "literal"_ns));
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("accountKey", "literal"_ns));
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, draft->GetCharset(text));
+  EXPECT_EQ("windows-1252"_ns, text);
+  ASSERT_EQ(NS_OK, draft->GetAccountKey(text));
+  EXPECT_TRUE(text.IsEmpty());
+  ASSERT_EQ(NS_OK, draft->SetAccountKey("later-account"_ns));
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("account", text));
+  EXPECT_EQ("later-account"_ns, text);
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("account", EmptyCString()));
+  ASSERT_EQ(NS_OK, draft->SetCharset(EmptyCString()));
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("msgCharSet", text));
+  EXPECT_TRUE(text.IsEmpty());
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("charset", text));
+  EXPECT_EQ("literal"_ns, text);
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("accountKey", text));
+  EXPECT_EQ("literal"_ns, text);
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("keywords", EmptyCString()));
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("keywords", text));
+  EXPECT_TRUE(text.IsEmpty());
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, draft->GetProperties(names));
+  EXPECT_TRUE(names.Contains("account"_ns));
+  EXPECT_TRUE(names.Contains("msgCharSet"_ns));
+  EXPECT_EQ(5u, names.Length());
+}
+
+TEST_F(DISABLED_DeliveryCompleteHeader, RawExtrasKeepOrderCaseAndUtf8) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr raw;
+  raw.messageId = "exact-extras@invalid"_ns;
+  raw.charset = "UTF-8"_ns;
+  raw.accountKey = "default-account"_ns;
+  raw.keywords = "initial"_ns;
+  raw.replyTo = "default@invalid"_ns;
+  raw.extras = {{"delivery.same"_ns, "first"_ns},
+                {"delivery.same"_ns, "last"_ns},
+                {"Delivery.same"_ns, "case"_ns},
+                {"delivery.\xc3\xa9"_ns, "snow \xe2\x98\x83"_ns},
+                {"msgCharSet"_ns, "windows-1252"_ns},
+                {"account"_ns, ""_ns},
+                {"keywords"_ns, "final"_ns},
+                {"replyTo"_ns, ""_ns},
+                {"charset"_ns, "literal-charset"_ns},
+                {"accountKey"_ns, "literal-accountKey"_ns}};
+  nsCOMPtr<nsIMsgDBHdr> live;
+  ASSERT_EQ(NS_OK, db->AddMsgHdr(&raw, false, getter_AddRefs(live)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, live->GetMessageKey(&key));
+  RefPtr<nsIMsgDBHdr> cold = new Message(key);
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, cold->GetStringProperty("delivery.same", text));
+  EXPECT_EQ("last"_ns, text);
+  ASSERT_EQ(NS_OK, cold->GetStringProperty("Delivery.same", text));
+  EXPECT_EQ("case"_ns, text);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageProperty(
+                       key, "delivery.\xc3\xa9"_ns, text));
+  EXPECT_EQ("snow \xe2\x98\x83"_ns, text);
+  ASSERT_EQ(NS_OK, cold->GetCharset(text));
+  EXPECT_EQ("windows-1252"_ns, text);
+  ASSERT_EQ(NS_OK, cold->GetAccountKey(text));
+  EXPECT_TRUE(text.IsEmpty());
+  ASSERT_EQ(NS_OK, cold->GetStringProperty("keywords", text));
+  EXPECT_EQ("final"_ns, text);
+  ASSERT_EQ(NS_OK, cold->GetStringProperty("replyTo", text));
+  EXPECT_TRUE(text.IsEmpty());
+  ASSERT_EQ(NS_OK, cold->GetStringProperty("charset", text));
+  EXPECT_EQ("literal-charset"_ns, text);
+  ASSERT_EQ(NS_OK, cold->GetStringProperty("accountKey", text));
+  EXPECT_EQ("literal-accountKey"_ns, text);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, cold->GetProperties(names));
+  EXPECT_TRUE(names.Contains("account"_ns));
+  EXPECT_TRUE(names.Contains("replyTo"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCompleteHeader, UnspecifiedStorageRemainsAbsent) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr raw;
+  raw.messageId = "unspecified-storage@invalid"_ns;
+  nsCOMPtr<nsIMsgDBHdr> live;
+  ASSERT_EQ(NS_OK, db->AddMsgHdr(&raw, false, getter_AddRefs(live)));
+  uint32_t value = 91;
+  ASSERT_EQ(NS_OK, live->GetMessageSize(&value));
+  EXPECT_EQ(0u, value);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, live->GetProperties(names));
+  EXPECT_FALSE(names.Contains("messageSize"_ns));
+  EXPECT_FALSE(names.Contains("storeToken"_ns));
+  EXPECT_FALSE(names.Contains("offlineMessageSize"_ns));
+  EXPECT_FALSE(names.Contains("lineCount"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCompleteHeader, AbsentStorageOptionalsPreserveExtras) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr raw;
+  raw.messageId = "storage-none@invalid"_ns;
+  raw.extras = {{"messageSize"_ns, "31"_ns},
+                {"offlineMessageSize"_ns, "17"_ns},
+                {"lineCount"_ns, "9"_ns},
+                {"storeToken"_ns, "original"_ns}};
+  nsCOMPtr<nsIMsgDBHdr> live;
+  ASSERT_EQ(NS_OK, db->AddMsgHdr(&raw, false, getter_AddRefs(live)));
+  uint32_t value;
+  ASSERT_EQ(NS_OK, live->GetMessageSize(&value));
+  EXPECT_EQ(31u, value);
+  ASSERT_EQ(NS_OK, live->GetOfflineMessageSize(&value));
+  EXPECT_EQ(17u, value);
+  ASSERT_EQ(NS_OK, live->GetLineCount(&value));
+  EXPECT_EQ(9u, value);
+  nsAutoCString token;
+  ASSERT_EQ(NS_OK, live->GetStoreToken(token));
+  EXPECT_EQ("original"_ns, token);
+}
+
+TEST_F(DISABLED_DeliveryCompleteHeader,
+       ExplicitStorageZeroAndEmptyOverrideExtras) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr raw;
+  raw.extras = {{"messageSize"_ns, "31"_ns},
+                {"offlineMessageSize"_ns, "17"_ns},
+                {"lineCount"_ns, "9"_ns},
+                {"storeToken"_ns, "original"_ns}};
+  nsCOMPtr<nsIMsgDBHdr> live;
+  uint32_t value;
+  raw.messageId = "storage-zero@invalid"_ns;
+  raw.messageSize = Some(0u);
+  raw.offlineMessageSize = Some(0u);
+  raw.lineCount = Some(0u);
+  raw.storeToken = Some(nsCString());
+  ASSERT_EQ(NS_OK, db->AddMsgHdr(&raw, false, getter_AddRefs(live)));
+  ASSERT_EQ(NS_OK, live->GetMessageSize(&value));
+  EXPECT_EQ(0u, value);
+  ASSERT_EQ(NS_OK, live->GetOfflineMessageSize(&value));
+  EXPECT_EQ(0u, value);
+  ASSERT_EQ(NS_OK, live->GetLineCount(&value));
+  EXPECT_EQ(0u, value);
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, live->GetStoreToken(text));
+  EXPECT_TRUE(text.IsEmpty());
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, live->GetProperties(names));
+  EXPECT_TRUE(names.Contains("storeToken"_ns));
+  EXPECT_TRUE(names.Contains("messageSize"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCompleteHeader, DetachedUint32RetainsTypedStorage) {
+  RefPtr<nsIMsgDBHdr> draft = new DetachedMsgHdr(mFolder);
+  ASSERT_EQ(NS_OK, draft->SetUint32Property("delivery.number", 42));
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("delivery.number", text));
+  EXPECT_EQ("2a"_ns, text);
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("delivery.number", "00042"_ns));
+  uint32_t value;
+  ASSERT_EQ(NS_OK, draft->GetUint32Property("delivery.number", &value));
+  EXPECT_EQ(66u, value);
+  ASSERT_EQ(NS_OK, draft->SetMessageSize(0xffffffff));
+  ASSERT_EQ(NS_OK, draft->GetUint32Property("messageSize", &value));
+  EXPECT_EQ(0xffffffffu, value);
+  ASSERT_EQ(NS_OK, draft->SetLineCount(0));
+  ASSERT_EQ(NS_OK, draft->GetLineCount(&value));
+  EXPECT_EQ(0u, value);
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            draft->GetUint32Property("delivery.number", nullptr));
+}
+
+TEST_F(DISABLED_DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(draft)));
+  ASSERT_EQ(NS_OK, draft->SetMessageId("failed-attach@invalid"_ns));
+  ASSERT_EQ(NS_OK, draft->SetReferences("<parent@invalid>"_ns));
+  ASSERT_NO_FATAL_FAILURE(InstallWitness());
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_add_fault "
+                       "BEFORE INSERT ON main.message_references BEGIN "
+                       "SELECT delivery_references_fault(NEW.id); "
+                       "SELECT RAISE(ABORT, 'delivery add fault'); END"_ns));
+  nsCOMPtr<nsIMsgDBHdr> live;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->AttachHdr(draft, true, getter_AddRefs(live)));
+  EXPECT_FALSE(live);
+  ASSERT_TRUE(mWitness);
+  EXPECT_EQ(1u, mWitness->mCalls);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  CheckNoTransaction();
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->AttachHdr(draft, true, getter_AddRefs(live)));
+  EXPECT_FALSE(live);
+  EXPECT_EQ(1u, mWitness->mCalls);
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, draft->SetSubject("retry"_ns));
 }
 
 }  // namespace

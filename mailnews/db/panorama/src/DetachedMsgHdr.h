@@ -6,6 +6,7 @@
 #define COMM_MAILNEWS_DB_PANORAMA_SRC_DETACHEDMSGHDR_H_
 
 #include "MailNewsTypes.h"
+#include "nsCOMPtr.h"
 #include "nsIMsgDatabase.h"  // For struct RawHdr
 #include "nsIMsgHdr.h"
 
@@ -41,16 +42,11 @@ class DetachedMsgHdr : public nsIMsgDBHdr {
   // Snapshot identity is independent of the detached message key.
   nsMsgKey mThreadId{nsMsgKey_None};
 
-  // Metadata obtained by other means.
-  uint32_t mMessageSize{0};
-
-  // Stuff that I _really_ don't want here, but the legacy code needs for now.
-  // These shouldn't be set after the message has been added to the DB,
-  // and this DetachedMsgHdr discarded...
-  // It'd be good to remove these and make the accessor methods fail.
-  nsCString mStoreToken;
-  uint32_t mOfflineMessageSize{0};
-  uint32_t mLineCount{0};
+  enum class AttachState { Editable, Attaching, Attached, Failed };
+  nsresult CheckMutable() const;
+  AttachState mAttachState = AttachState::Editable;
+  nsresult mAttachError = NS_OK;
+  nsCOMPtr<nsIMsgDBHdr> mAttachedHeader;
 
   // Stuff I _really_ _really_ don't want here.
   uint64_t mFolderId{0};

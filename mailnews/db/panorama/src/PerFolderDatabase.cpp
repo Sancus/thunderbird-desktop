@@ -30,6 +30,11 @@ NS_IMPL_ISUPPORTS(PerFolderDatabase, nsIDBChangeAnnouncer, nsIMsgDatabase)
 // MessageListener:
 
 void PerFolderDatabase::OnMessageAdded(Message* message) {
+  OnMessagePublished(message, true);
+}
+
+void PerFolderDatabase::OnMessagePublished(Message* message,
+                                           bool notifyLegacy) {
   uint64_t msgFolderId;
   nsresult rv = MessageDB().GetMessageFolderId(message->Key(), msgFolderId);
   NS_ENSURE_SUCCESS_VOID(rv);
@@ -37,6 +42,15 @@ void PerFolderDatabase::OnMessageAdded(Message* message) {
     uint32_t flags;
     rv = message->GetFlags(&flags);
     NS_ENSURE_SUCCESS_VOID(rv);
+    // Unread messages join NewList even when legacy notifications are
+    // suppressed.
+    if (!(flags & nsMsgMessageFlags::Read)) {
+      rv = AddToNewList(message->Key());
+      NS_ENSURE_SUCCESS_VOID(rv);
+    }
+    if (!notifyLegacy) {
+      return;
+    }
     nsMsgKey parent;
     rv = message->GetThreadParent(&parent);
     NS_ENSURE_SUCCESS_VOID(rv);
@@ -271,34 +285,28 @@ NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,
     return NS_ERROR_INVALID_ARG;
   }
 
-  // We know the concrete implementation.
-  DetachedMsgHdr* d = static_cast<DetachedMsgHdr*>(detachedHdr);
+  // CreateNewHdr supplies the native detached implementation.
+  RefPtr<DetachedMsgHdr> draft = static_cast<DetachedMsgHdr*>(detachedHdr);
+  if (draft->mFolderId != mFolderId) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (draft->mAttachState == DetachedMsgHdr::AttachState::Attached) {
+    nsCOMPtr<nsIMsgDBHdr> live = draft->mAttachedHeader;
+    live.forget(realHdr);
+    return NS_OK;
+  }
+  MOZ_TRY(draft->CheckMutable());
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attaching;
   nsCOMPtr<nsIMsgDBHdr> live;
-
-  rv = AddMsgHdr(&d->mRaw, notify, getter_AddRefs(live));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // Extra stuff to copy that's not covered by RawHdr.
-  if (d->mMessageSize > 0) {
-    rv = live->SetMessageSize(d->mMessageSize);
-    NS_ENSURE_SUCCESS(rv, rv);
+  rv = AddMsgHdr(&draft->mRaw, notify, getter_AddRefs(live));
+  if (NS_FAILED(rv)) {
+    // An error does not establish that SQL settlement permits replay.
+    draft->mAttachError = rv;
+    draft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+    return rv;
   }
-
-  // Hackery for legacy code. Really want to ditch this.
-  // It shouldn't be set on detached headers.
-  if (!d->mStoreToken.IsEmpty()) {
-    rv = live->SetStoreToken(d->mStoreToken);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-  if (d->mOfflineMessageSize > 0) {
-    rv = live->SetOfflineMessageSize(d->mOfflineMessageSize);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-  if (d->mLineCount > 0) {
-    rv = live->SetLineCount(d->mLineCount);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-
+  draft->mAttachedHeader = live;
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attached;
   live.forget(realHdr);
   return NS_OK;
 }
@@ -315,29 +323,12 @@ NS_IMETHODIMP PerFolderDatabase::AddMsgHdr(RawHdr* msg, bool notify,
   NS_ENSURE_ARG_POINTER(newHdr);
 
   nsMsgKey key;
-  nsresult rv = MessageDB().AddMessage(
-      mFolderId, msg->messageId, msg->references, msg->date, msg->sender,
-      msg->recipients, msg->ccList, msg->bccList, msg->subject, msg->flags,
-      msg->keywords, msg->priority, &key);
-  NS_ENSURE_SUCCESS(rv, rv);
-  MOZ_ASSERT(key != nsMsgKey_None);
-
-  // We do have enough info here to construct the header without
-  // doing another DB query, but let's keep it simple.
-  // (even better if the header only contained folderid and msgKey,
-  // anyway, and no data fields).
-  RefPtr<Message> newMsg;
-  rv = MessageDB().GetMessage(key, getter_AddRefs(newMsg));
-
-  // We'll consider any unread message to be New.
-  if (!(msg->flags & nsMsgMessageFlags::Read)) {
-    // TODO: there are some cases (threading?) where we don't want to add the
-    // message to the new list...
-    AddToNewList(key);
-  }
-
-  newMsg.forget(newHdr);
-  return rv;
+  RefPtr<Message> message;
+  MOZ_TRY(MessageDB().AddMessage(mFolderId, *msg, notify, &key,
+                                 getter_AddRefs(message)));
+  MOZ_ASSERT(key != nsMsgKey_None && message);
+  message.forget(newHdr);
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::ListAllKeys(nsTArray<nsMsgKey>& aKeys) {
   return MessageDB().ListAllKeys(mFolderId, aKeys);

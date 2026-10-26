@@ -55,6 +55,7 @@
 #include "mozilla/Preferences.h"
 #include "mozilla/ProfilerMarkers.h"
 #include "mozilla/StaticPrefs_mail.h"
+#include "mozilla/Try.h"
 #include "mozilla/UniquePtr.h"
 #include "StoreIndexer.h"
 #include "nsIPropertyBag2.h"
@@ -2020,6 +2021,55 @@ nsresult nsMsgLocalMailFolder::WriteStartOfNewMessage() {
   return NS_OK;
 }
 
+#ifdef MOZ_PANORAMA
+// Structural fields are separate from GetProperties() in Panorama.
+static nsresult CopyHdrStructure(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr) {
+  nsAutoCString value;
+  MOZ_TRY(srcHdr->GetSubject(value));
+  MOZ_TRY(destHdr->SetSubject(value));
+  MOZ_TRY(srcHdr->GetAuthor(value));
+  MOZ_TRY(destHdr->SetAuthor(value));
+  MOZ_TRY(srcHdr->GetRecipients(value));
+  MOZ_TRY(destHdr->SetRecipients(value));
+  MOZ_TRY(srcHdr->GetCcList(value));
+  MOZ_TRY(destHdr->SetCcList(value));
+  MOZ_TRY(srcHdr->GetBccList(value));
+  MOZ_TRY(destHdr->SetBccList(value));
+  MOZ_TRY(srcHdr->GetMessageId(value));
+  MOZ_TRY(destHdr->SetMessageId(value));
+
+  PRTime date;
+  MOZ_TRY(srcHdr->GetDate(&date));
+  MOZ_TRY(destHdr->SetDate(date));
+  uint32_t flags;
+  MOZ_TRY(srcHdr->GetFlags(&flags));
+  MOZ_TRY(destHdr->SetFlags(flags));
+  nsMsgPriorityValue priority;
+  MOZ_TRY(srcHdr->GetPriority(&priority));
+  MOZ_TRY(destHdr->SetPriority(priority));
+  MOZ_TRY(srcHdr->GetStringProperty("keywords", value));
+  MOZ_TRY(destHdr->SetStringProperty("keywords", value));
+
+  uint16_t count;
+  MOZ_TRY(srcHdr->GetNumReferences(&count));
+  nsTArray<nsCString> references;
+  nsAutoCString serialized;
+  for (uint16_t i = 0; i < count; ++i) {
+    MOZ_TRY(srcHdr->GetStringReference(i, value));
+    references.AppendElement(value);
+    serialized.Append('<');
+    serialized.Append(value);
+    serialized.AppendLiteral("> ");
+  }
+  // The detached setter uses this parser. Reject a lossy reconstruction before
+  // opening the destination stream.
+  if (ParseIdentificationFields(serialized) != references) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+  return destHdr->SetReferences(serialized);
+}
+#endif
+
 nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
   nsresult rv = GetMsgStore(getter_AddRefs(mCopyState->m_msgStore));
   NS_ENSURE_SUCCESS(rv, rv);
@@ -2030,6 +2080,14 @@ nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
     rv = mCopyState->m_destDB->CreateNewHdr(
         getter_AddRefs(mCopyState->m_newHdr));
     NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup() && !mCopyState->m_parseMsgState &&
+        mCopyState->m_curCopyIndex < mCopyState->m_messages.Length()) {
+      rv = CopyHdrStructure(mCopyState->m_newHdr,
+                            mCopyState->m_messages[mCopyState->m_curCopyIndex]);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+#endif
   }
 
   rv = mCopyState->m_msgStore->GetNewMsgOutputStream(

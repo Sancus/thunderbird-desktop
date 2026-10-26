@@ -63,6 +63,11 @@ function assertSearchMembers(wrapper, expected) {
   for (let i = 0; i < view.rowCount; i++) {
     const header = view.getMsgHdrAt(i);
     actual.push([header.folder.URI, header.messageKey, header.messageId]);
+    Assert.equal(
+      view.findIndexOfMsgHdr(header, false),
+      i,
+      "A fetched header resolves to its physical message row"
+    );
   }
   Assert.deepEqual(
     actual.sort((a, b) => a[1] - b[1]),

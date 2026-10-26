@@ -1091,18 +1091,27 @@ nsMsgSearchDBView::OpenWithHdrs(nsIMsgEnumerator* aHeaders,
 nsMsgViewIndex nsMsgSearchDBView::FindHdr(nsIMsgDBHdr* msgHdr,
                                           nsMsgViewIndex startIndex,
                                           bool allowDummy) {
-  nsCOMPtr<nsIMsgDBHdr> curHdr;
-  uint32_t index;
-  // It would be nice to take advantage of sorted views when possible.
-  for (index = startIndex; index < GetSize(); index++) {
-    GetMsgHdrForViewIndex(index, getter_AddRefs(curHdr));
-    if (curHdr == msgHdr &&
-        (allowDummy || !(m_flags[index] & MSG_VIEW_FLAG_DUMMY) ||
-         (m_flags[index] & nsMsgMessageFlags::Elided)))
-      break;
+  if (!msgHdr) {
+    return nsMsgViewIndex_None;
   }
 
-  return index < GetSize() ? index : nsMsgViewIndex_None;
+  nsMsgKey key;
+  nsCOMPtr<nsIMsgFolder> folder;
+  if (NS_FAILED(msgHdr->GetMessageKey(&key)) ||
+      NS_FAILED(msgHdr->GetFolder(getter_AddRefs(folder))) || !folder) {
+    return nsMsgViewIndex_None;
+  }
+
+  // Header objects can differ for the same message, including after deletion.
+  for (nsMsgViewIndex index = startIndex; index < GetSize(); index++) {
+    if (m_keys[index] == key && GetFolderForViewIndex(index) == folder &&
+        (allowDummy || !(m_flags[index] & MSG_VIEW_FLAG_DUMMY) ||
+         (m_flags[index] & nsMsgMessageFlags::Elided))) {
+      return index;
+    }
+  }
+
+  return nsMsgViewIndex_None;
 }
 
 // This method looks for the XF thread that corresponds to this message hdr,

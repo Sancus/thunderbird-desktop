@@ -464,6 +464,45 @@ class NativeRunnerTests(unittest.TestCase):
             verify.assert_not_called()
 
 
+    def test_filter_receipt_binds_predicates_identity_and_preconditions(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        dependencies = [
+            "mailnews/db/panorama/src/LiveView.cpp",
+            "mailnews/db/panorama/src/LiveView.h",
+            "mailnews/db/panorama/src/LiveViewFilters.h",
+            "mailnews/db/panorama/src/LiveViewFilters.cpp",
+            "mailnews/db/panorama/src/VirtualFolderWrapper.cpp",
+            "mailnews/db/panorama/src/VirtualFolderWrapper.h",
+            "mailnews/db/panorama/src/Message.cpp",
+            "mailnews/db/panorama/src/Message.h",
+            "mailnews/db/panorama/src/MessageDatabase.cpp",
+            "mailnews/db/panorama/src/MessageDatabase.h",
+            "mailnews/db/panorama/src/FolderDatabase.cpp",
+            "mailnews/db/panorama/src/FolderDatabase.h",
+            "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+            "mailnews/db/panorama/src/DetachedMsgHdr.h",
+            "mailnews/base/src/nsMsgAccountManager.cpp",
+            "mailnews/base/src/nsMsgAccountManager.h",
+            "mailnews/search/src/nsMsgFilterService.cpp",
+            "mailnews/search/src/nsMsgFilterService.h",
+        ]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)),
+              patch.object(runner, "verify") as verify):
+            for relative in dependencies:
+                path = str(Path(config["source"]) / "comm" / relative)
+                with self.subTest(path=relative):
+                    self.assertTrue(path in receipt["inputs"], relative)
+                    identity = receipt["inputs"].pop(path)
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic()+5)
+                    receipt["inputs"][path] = identity
+            verify.assert_not_called()
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
+            verify.assert_called_once()
+
     def test_message_references_boundary_uses_catalog_timeout_and_rejects_timeout_pass(self):
         selected = "DISABLED_DeliveryMessageReferences.CountOverflowLeavesZero"
         case = next((c for c in runner.CASES.values() if c["filter"] == selected), None)

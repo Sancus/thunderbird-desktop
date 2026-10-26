@@ -301,6 +301,21 @@
       "id": "core-native:MessageExistence:ColdRowStepFailurePropagates",
       "filter": "DISABLED_DeliveryCoreMessageExistence.ColdRowStepFailurePropagates",
       "expected": "A new cold MessageDatabase propagates the same reached step error, unchanged true output and exact function witness/storage assertions."
+    },
+    {
+      "id": "core-native:MessageExistence:SingleFolderFilterUsesStoredIdentity",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.SingleFolderFilterUsesStoredIdentity",
+      "expected": "Only the configured stored folder matches when account-backed folder resolution is unavailable; both other folders and missing identity zero are excluded."
+    },
+    {
+      "id": "core-native:MessageExistence:MultiFolderFilterUsesStoredIdentity",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.MultiFolderFilterUsesStoredIdentity",
+      "expected": "Both configured stored folders match in reverse input order; the unrelated third folder and missing identity zero are excluded."
+    },
+    {
+      "id": "core-native:MessageExistence:VirtualFolderFilterUsesStoredIdentity",
+      "filter": "DISABLED_DeliveryCoreMessageExistence.VirtualFolderFilterUsesStoredIdentity",
+      "expected": "With ALL and two configured virtual search folders, both included stored folders match; the unrelated third folder and missing identity zero are excluded. Non-ALL search is outside this case."
     }
   ],
   "suites": {
@@ -341,7 +356,21 @@
         "mailnews/db/panorama/src/Message.cpp",
         "mailnews/db/panorama/src/Message.h",
         "mailnews/db/panorama/public/nsIMessageDatabase.idl",
-        "mailnews/base/public/nsIMsgHdr.idl"
+        "mailnews/base/public/nsIMsgHdr.idl",
+        "mailnews/db/panorama/src/LiveView.cpp",
+        "mailnews/db/panorama/src/LiveView.h",
+        "mailnews/db/panorama/src/LiveViewFilters.h",
+        "mailnews/db/panorama/src/LiveViewFilters.cpp",
+        "mailnews/db/panorama/src/VirtualFolderWrapper.cpp",
+        "mailnews/db/panorama/src/VirtualFolderWrapper.h",
+        "mailnews/db/panorama/src/FolderDatabase.cpp",
+        "mailnews/db/panorama/src/FolderDatabase.h",
+        "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+        "mailnews/db/panorama/src/DetachedMsgHdr.h",
+        "mailnews/base/src/nsMsgAccountManager.cpp",
+        "mailnews/base/src/nsMsgAccountManager.h",
+        "mailnews/search/src/nsMsgFilterService.cpp",
+        "mailnews/search/src/nsMsgFilterService.h"
       ]
     }
   }

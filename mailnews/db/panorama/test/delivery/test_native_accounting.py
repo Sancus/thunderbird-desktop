@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 59)
+        self.assertEqual(len(catalog["cases"]), 62)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -169,7 +169,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 59)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 62)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -197,13 +197,16 @@ class NativeAccountingTests(unittest.TestCase):
         expected = {"WarmHeaderDeletionUsesStoredMembership", "ColdRowDeletionUsesStoredMembership",
                     "RemovalCallbackSeesAbsentRowAndReadableHeader", "WarmHeaderPrepareFailurePropagates",
                     "ColdRowPrepareFailurePropagates", "WarmHeaderStepFailurePropagates",
-                    "ColdRowStepFailurePropagates"}
+                    "ColdRowStepFailurePropagates", "SingleFolderFilterUsesStoredIdentity",
+                    "MultiFolderFilterUsesStoredIdentity", "VirtualFolderFilterUsesStoredIdentity"}
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + n for n in expected})
-        self.assertEqual(len(rows), 7)
+        self.assertEqual(len(rows), 10)
         self.assertEqual(native.CATALOG["suites"][suite]["source"],
                          "mailnews/db/panorama/test/gtest/TestDeliveryCoreMessageExistence.cpp")
         for row in rows:
+            name = row["filter"].partition(".")[2]
+            self.assertEqual(row["id"], "core-native:MessageExistence:" + name)
             self.selected = row["filter"]
             for index in (1, 4):
                 self.events[index]["name"] = suite
@@ -212,6 +215,15 @@ class NativeAccountingTests(unittest.TestCase):
             self.assertTrue(self.check(self.events)["log_complete"])
         self.reject(self.events, returncode=1)
         self.reject(self.events, timed_out=True)
+        wrong = copy.deepcopy(self.events)
+        wrong[3]["status"] = "SKIP"
+        self.reject(wrong)
+        for selected in (suite + ".*", self.selected + ":" + rows[0]["filter"]):
+            self.assertFalse(native.check_log(self.log, selected, 0)["log_complete"])
+        self.assertEqual(native.CATALOG["backend"], "panorama")
+        self.assertEqual(native.CATALOG["store"], "none")
+        self.assertEqual(native.CATALOG["readiness"], "pending-product")
+        self.assertTrue(native.CATALOG["execution_hold"])
 
 
 if __name__ == "__main__":

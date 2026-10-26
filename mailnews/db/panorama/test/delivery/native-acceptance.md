@@ -2,7 +2,7 @@
 
 TestDeliveryCoreReferences.cpp (14 cases), TestDeliveryFolderInfoProperties.cpp
 (19 cases), TestDeliveryMessageReferences.cpp (19 cases) and
-TestDeliveryCoreMessageExistence.cpp (7 cases) are linked here. All 59 filters
+TestDeliveryCoreMessageExistence.cpp (10 cases) are linked here. All 62 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
 Native cases select the concrete Panorama core and check panorama.sqlite identity.
@@ -155,3 +155,10 @@ propagate errors without changing output sentinels; the step witness proves actu
 execution. Bind-failure injection, OOM/IO, process restart and cache eviction
 lifetime are outside these cases. Compile, fault sensitivity, restored negative
 controls and the OS-temp close/restoration/retention lifecycle remain pending.
+
+The three stored-identity filter cases cover single, multi and virtual folder
+matching without an account-backed folder object. Virtual coverage uses ALL;
+non-ALL search and cold-removal identity remain separate product limits. Each
+exact disabled filter requires its own fresh process/profile and bound receipt;
+missing identity zero must not match. The public event regression stays in the
+existing core:Publication case. Matching native compilation and runtime are pending.

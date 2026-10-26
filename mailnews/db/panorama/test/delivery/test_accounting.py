@@ -676,7 +676,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 38)
-        self.assertEqual(len({c["id"] for c in catalog}), 151)
+        self.assertEqual(len({c["id"] for c in catalog}), 159)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -778,6 +778,186 @@ support-files = ["fixture.sql"]
         installed.unlink()
         with self.assertRaisesRegex(ValueError, "blocked-dependency"):
             runner.prepare(config, rows[0])
+
+
+
+    def initializer_fixture(self):
+        config, case = self.news_fixture()
+        case.update(id="compatibility:panorama:mbox:FolderInitParentConflict",
+                    tasks=["test_first", "test_second"], setups=["setupFolders"],
+                    requires_non_debug=True)
+        source = self.root / "comm/tests"
+        (source / "test_one.js").write_text(
+            "add_setup(function setupFolders() {});\n"
+            "add_task(function test_first() {});\nadd_task(async function test_second() {});")
+        for relative in ("mailnews/test/resources/MessageGenerator.sys.mjs",
+                         "obj/_tests/modules/mailnews/MessageGenerator.sys.mjs"):
+            path = self.root / ("comm/" + relative if not relative.startswith("obj/") else relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("// matching generator")
+        for relative in ("xpcom/base/nsDebug.h", "xpcom/base/nsDebugImpl.cpp",
+                         "testing/xpcshell/runxpcshelltests.py", "obj/config.status"):
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("// synthetic bound input")
+        (self.root / "obj/mozinfo.json").write_text('{"debug": false}')
+        return config, case
+
+    def initializer_events(self, case):
+        events = self.events[:5]
+        for name in case["tasks"]:
+            for state in ("pending", "finished"):
+                events.append({"action": "log", "message":
+                               f"(xpcshell/head.js) | test {name} {state} (2)"})
+                if state == "pending":
+                    events.append(self.events[5])
+        return events + self.events[6:]
+
+    def test_initializer_requires_all_named_tasks_and_assertions(self):
+        case = {**self.case, "tasks": ["test_first", "test_second"], "setups": ["setupFolders"]}
+        events = self.initializer_events(case)
+        self.assertTrue(self.check(events, case)["ok"])
+        for index in range(5, 11):
+            with self.subTest(missing=index):
+                rejected = self.check(events[:index] + events[index + 1:], case)
+                self.assertFalse(rejected["ok"])
+                self.assertEqual(rejected["coverage"], "none")
+        for extra in (events[5], {"action": "log", "message":
+                      "(xpcshell/head.js) | test test_extra pending (2)"}):
+            self.assertFalse(self.check(events[:6] + [extra] + events[6:], case)["ok"])
+        wrong = copy.deepcopy(events)
+        wrong[6] = {**wrong[6], "status": "FAIL", "message": "fault witness missing"}
+        failed = self.check(wrong, case)
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["first_failure"], wrong[6])
+        self.assertEqual(failed["coverage"], "none")
+
+    def test_initializer_preflight_binds_modules_mode_and_named_source(self):
+        config, case = self.initializer_fixture()
+        _, paths = runner.prepare(config, case)
+        required = ["testing/modules/MockRegistrar.sys.mjs",
+                    "obj/_tests/modules/MockRegistrar.sys.mjs",
+                    "comm/mailnews/test/resources/MessageGenerator.sys.mjs",
+                    "obj/_tests/modules/mailnews/MessageGenerator.sys.mjs",
+                    "testing/xpcshell/runxpcshelltests.py", "xpcom/base/nsDebug.h",
+                    "obj/mozinfo.json", "obj/config.status"]
+        self.assertTrue({self.root / p for p in required} <= set(paths))
+        test = self.root / "comm/tests/test_one.js"
+        original = test.read_text()
+        for text in (original.replace("test_second", "test_wrong"),
+                     original.replace("setupFolders", "setupWrong"),
+                     original + "add_task(function test_extra() {});",
+                     original.replace("function test_first", "function")):
+            test.write_text(text)
+            with self.subTest(source=text), self.assertRaisesRegex(ValueError, "named tasks/setup"):
+                runner.prepare(config, case)
+        test.write_text(original)
+        for relative in ("obj/_tests/modules/MockRegistrar.sys.mjs",
+                         "obj/_tests/modules/mailnews/MessageGenerator.sys.mjs"):
+            target = self.root / relative
+            content = target.read_text()
+            for stale in (None, "// stale installed module"):
+                if stale is None:
+                    target.unlink()
+                else:
+                    target.write_text(stale)
+                with self.subTest(path=relative, stale=stale), self.assertRaisesRegex(ValueError, "blocked-dependency"):
+                    runner.prepare(config, case)
+            target.write_text(content)
+
+    def test_initializer_unknown_or_debug_mode_refuses_before_launch(self):
+        config, case = self.initializer_fixture()
+        for index, info in enumerate(({}, {"debug": True}, {"debug": "false"}, {"debug": 0})):
+            (self.root / "obj/mozinfo.json").write_text(json.dumps(info))
+            output = self.root / str(index)
+            output.mkdir()
+            with patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as execute:
+                result = runner.run_case(config, case, output)
+            execute.assert_not_called()
+            self.assertEqual(result["disposition"], "blocked")
+            self.assertIn("held-build-mode", " ".join(result["errors"]))
+            self.assertEqual(result["coverage"], "none")
+
+    def test_initializer_raw_assertion_cannot_hide_behind_success(self):
+        config, case = self.initializer_fixture()
+        events = self.initializer_events(case)
+        for index, (stream, diagnostic) in enumerate((("stderr", ""),
+                ("stderr", "###!!! ASSERTION: Error: missing URI\n"),
+                ("stdout", "###!!! ASSERTION: Error: missing URI\n"))):
+            output = self.root / ("raw-" + str(index))
+            output.mkdir()
+            def execute(argv, **kwargs):
+                Path(argv[argv.index("--log-raw") + 1]).write_text(
+                    "".join(json.dumps(e) + "\n" for e in events))
+                kwargs[stream].write(diagnostic.encode())
+                return SimpleNamespace(returncode=0)
+            with patch.object(runner.subprocess, "run", execute):
+                result = runner.run_case(config, case, output)
+            self.assertEqual(result["ok"], not bool(diagnostic))
+            self.assertEqual(result["build_mode"]["debug"], False)
+            self.assertEqual(result["build_mode"]["harness_XPCOM_DEBUG_BREAK"], "stack-and-abort")
+            if diagnostic:
+                self.assertEqual(result["coverage"], "none")
+                self.assertIn("ASSERTION", result["first_failure"]["message"])
+        output = {"action": "process_output", "data": "###!!! ASSERTION: Error: missing URI"}
+        self.check(events[:6] + [output] + events[6:], case)
+        raw_logs = (self.root / "empty.stdout", self.root / "empty.stderr")
+        for path in raw_logs:
+            path.write_text("")
+        rejected = runner.check_log(self.log, case, raw_logs=raw_logs)
+        self.assertFalse(rejected["ok"])
+        self.assertIn("raw assertion diagnostic in non-DEBUG control", rejected["errors"])
+
+    def test_initializer_catalog_has_eight_file_store_cases_and_five_tasks_per_store(self):
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        names = {"FolderInitFailure": (["test_failedDescendantKeepsRowsBodiesAndExistingChild"], []),
+                 "FolderInitIdentity": (["test_reusesCachedChildWithoutDuplicateAttachment"], []),
+                 "FolderInitConflict": (["test_rejectsConflictingLiveIdentity"], []),
+                 "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
+                                              "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
+        rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
+        self.assertEqual(len(catalog), 159)
+        self.assertEqual(len({c["id"] for c in catalog}), 159)
+        self.assertEqual(len(rows), 8)
+        for store in ("mbox", "maildir"):
+            lane = [c for c in rows if c["store"] == store]
+            self.assertEqual({c["id"] for c in lane},
+                             {"compatibility:panorama:" + store + ":" + n for n in names})
+            self.assertEqual(sum(len(c["tasks"]) for c in lane), 5)
+            for case in lane:
+                name = case["id"].rsplit(":", 1)[1]
+                self.assertEqual((case["tasks"], case["setups"]), names[name])
+                self.assertEqual(case["backend"], "panorama")
+                self.assertEqual(case["readiness"], "pending-product")
+                self.assertEqual(case["fixture"], "preconfigured-store")
+                self.assertNotIn("task", case)
+                self.assertEqual(case.get("requires_non_debug", False), name == "FolderInitParentConflict")
+                comm = runner.HERE.parents[4]
+                manifest = comm / case["manifest"]
+                doc = runner.tomllib.loads(manifest.read_text())
+                text = (manifest.parent / case["file"]).read_text()
+                for kind, expected in (("task", case["tasks"]), ("setup", case["setups"])):
+                    actual = runner.re.findall(r"\badd_" + kind + r"\s*\(\s*(?:async\s+)?function\s+(\w+)\s*\(", text)
+                    self.assertEqual(actual, expected)
+                for section in (doc["DEFAULT"], doc[case["file"]]):
+                    self.assertFalse(set(section) & {"skip-if", "fail-if", "run-if", "disabled", "expected"})
+                support = {(manifest.parent / p).resolve() for p in doc["DEFAULT"]["support-files"]}
+                required = {comm / p for p in (
+                    "mailnews/base/src/nsMsgDBFolder.cpp", "mailnews/base/src/nsMsgDBFolder.h",
+                    "mailnews/base/src/FolderLookupService.cpp", "mailnews/base/src/FolderLookupService.h",
+                    "mailnews/local/src/components.conf", "mailnews/local/src/nsLocalMailFolder.cpp",
+                    "mailnews/local/src/nsLocalMailFolder.h", "mailnews/db/panorama/src/FolderDatabase.cpp",
+                    "mailnews/db/panorama/src/FolderDatabase.h", "mailnews/local/src/nsMsgBrkMBoxStore.cpp",
+                    "mailnews/local/src/nsMsgMaildirStore.cpp",
+                    "mailnews/local/src/nsMsgBrkMBoxStore.h", "mailnews/local/src/nsMsgMaildirStore.h",
+                    "mailnews/local/src/nsMsgLocalStoreUtils.cpp", "mailnews/local/src/nsMsgLocalStoreUtils.h",
+                    "mailnews/base/src/nsMsgAccountManager.cpp", "mailnews/base/src/nsMsgAccountManager.h",
+                    "mailnews/base/src/nsMsgIncomingServer.cpp", "mailnews/base/src/nsMsgIncomingServer.h",
+                    "mailnews/db/panorama/src/DatabaseCore.cpp", "mailnews/db/panorama/src/DatabaseCore.h",
+                    "mailnews/base/public/nsIMsgFolder.idl", "mailnews/base/public/nsIFolderLookupService.idl")}
+                self.assertTrue(required <= support, required - support)
+                self.assertTrue(all(p.is_file() and p.is_relative_to(comm) for p in support))
+                self.assertNotIn(manifest.name, (manifest.parent.parent / "moz.build").read_text())
 
 
 if __name__ == "__main__":

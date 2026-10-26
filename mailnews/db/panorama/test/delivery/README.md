@@ -196,3 +196,44 @@ Only complete passing files certify their declared phase. Discovery/online-name
 failures remain visible; an intermediate property phase gives no later credit.
 These cases check live slash delimiters and folder-DB reopening, not process
 restart, delimiter durability, UID/message ingest, body storage or offline replay.
+
+
+## Direct folder initializer registration
+
+Four reviewed files run as eight manual file/store cases (Panorama mbox/maildir).
+Each file gets a fresh process/profile. Failure, Identity and Conflict have one
+named task each; ParentConflict has two plus setupFolders. Thus each store runs
+five tasks across four files. The tasks/setups declarations are checked against
+source; every task must start, assert and finish in order. The earlier metadata
+single-task and IMAP selector conventions are unchanged.
+
+The two initializer manifests bind InitWithFolderId/lookup/cache, mailbox factory,
+local store discovery, Reconcile and account/root dependencies. Preflight also
+hashes the source and installed MessageGenerator/MockRegistrar modules and refuses
+missing or stale copies. Folder roles prove the actual Panorama/store fixture;
+Failure and ParentConflict additionally check retained body bytes in their tests.
+Identity/Conflict do not claim a body round trip. No first error grants later
+row, field, child, cache, body, fault-witness or recovery assertions credit.
+
+ParentConflict alone requires_non_debug. Its raw missing-URI eviction control
+reaches CreateDangling's NS_ERROR before NS_ERROR_UNEXPECTED. Pinned efd2
+nsDebug.h:111-121 compiles NS_ERROR out only without DEBUG; the pinned xpcshell
+harness:1641-1647 sets XPCOM_DEBUG_BREAK=stack-and-abort. Do not change that value.
+Preflight requires mozinfo.json debug to be exactly false and binds that file,
+config.status, the actual harness, nsDebug.h and nsDebugImpl.cpp. Root must verify
+these are matching build outputs and confirm non-DEBUG from actual configuration
+before input approval; an optimized/release label is insufficient. The recorded
+harness value comes from pinned source, not a sampled child environment.
+
+Unknown/DEBUG build mode blocks before launch (HOLD for a reviewed replacement
+control). Success also requires both raw output streams and no ###!!! ASSERTION
+in JSONL or stdout/stderr; a diagnostic fails the case, even after complete PASS
+JSON and exit zero. No skip, assertion suppression or expected-failure allowance
+is added. Failed-object numSubFolders remains a real runtime outcome.
+
+All eight rows remain pending-product and must fully pass on matching source and
+Gecko, with fresh profiles and complete cleanup. Negative controls against c460
+and restored source, FolderFactoryChildren/Retry, local startup/Reconcile, root
+factory, MailboxName and native017-qualified regressions remain root runtime
+gates. Native017 and lightweight accounting checks give these new files no PASS.
+Native gtest build/qualification proceeds independently.

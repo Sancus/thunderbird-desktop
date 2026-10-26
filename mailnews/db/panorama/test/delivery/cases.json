@@ -1869,5 +1869,151 @@
       "target": "DeliveryChild"
     },
     "selector": "delimiter"
+  },
+  {
+    "id": "compatibility:panorama:mbox:FolderInitFailure",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers.toml",
+    "file": "test_deliveryCompatibilityFolderInitFailure.js",
+    "tasks": [
+      "test_failedDescendantKeepsRowsBodiesAndExistingChild"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-failure"
+    }
+  },
+  {
+    "id": "compatibility:panorama:mbox:FolderInitParentConflict",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers.toml",
+    "file": "test_deliveryCompatibilityFolderInitParentConflict.js",
+    "tasks": [
+      "test_rejectsCachedChildWithConflictingParent",
+      "test_recursiveConflictPreservesCachedSubtree"
+    ],
+    "setups": [
+      "setupFolders"
+    ],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-parent",
+      "recursion": "init-recursion"
+    },
+    "requires_non_debug": true
+  },
+  {
+    "id": "compatibility:panorama:mbox:FolderInitIdentity",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers.toml",
+    "file": "test_deliveryCompatibilityFolderInitIdentity.js",
+    "tasks": [
+      "test_reusesCachedChildWithoutDuplicateAttachment"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-identity"
+    }
+  },
+  {
+    "id": "compatibility:panorama:mbox:FolderInitConflict",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers.toml",
+    "file": "test_deliveryCompatibilityFolderInitConflict.js",
+    "tasks": [
+      "test_rejectsConflictingLiveIdentity"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "mbox",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-conflict"
+    }
+  },
+  {
+    "id": "compatibility:panorama:maildir:FolderInitFailure",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers-maildir.toml",
+    "file": "test_deliveryCompatibilityFolderInitFailure.js",
+    "tasks": [
+      "test_failedDescendantKeepsRowsBodiesAndExistingChild"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-failure"
+    }
+  },
+  {
+    "id": "compatibility:panorama:maildir:FolderInitParentConflict",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers-maildir.toml",
+    "file": "test_deliveryCompatibilityFolderInitParentConflict.js",
+    "tasks": [
+      "test_rejectsCachedChildWithConflictingParent",
+      "test_recursiveConflictPreservesCachedSubtree"
+    ],
+    "setups": [
+      "setupFolders"
+    ],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-parent",
+      "recursion": "init-recursion"
+    },
+    "requires_non_debug": true
+  },
+  {
+    "id": "compatibility:panorama:maildir:FolderInitIdentity",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers-maildir.toml",
+    "file": "test_deliveryCompatibilityFolderInitIdentity.js",
+    "tasks": [
+      "test_reusesCachedChildWithoutDuplicateAttachment"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-identity"
+    }
+  },
+  {
+    "id": "compatibility:panorama:maildir:FolderInitConflict",
+    "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers-maildir.toml",
+    "file": "test_deliveryCompatibilityFolderInitConflict.js",
+    "tasks": [
+      "test_rejectsConflictingLiveIdentity"
+    ],
+    "setups": [],
+    "backend": "panorama",
+    "store": "maildir",
+    "diagnostics": "folder",
+    "fixture": "preconfigured-store",
+    "readiness": "pending-product",
+    "folder_roles": {
+      "fixture": "init-conflict"
+    }
   }
 ]

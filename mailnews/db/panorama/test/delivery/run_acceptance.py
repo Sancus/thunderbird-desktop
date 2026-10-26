@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 CONTRACTS = {"mbox": "berkeleystore", "maildir": "maildirstore"}
 
 
-def check_log(log, case, returncode=0):
+def check_log(log, case, returncode=0, raw_logs=()):
     """Check one raw mozlog file against a tuple declared before execution."""
     errors = [] if returncode == 0 else [f"process exit: {returncode}"]
     starts, ends, suites, suite_ends = [], [], [], 0
@@ -28,6 +28,8 @@ def check_log(log, case, returncode=0):
     active = False
     assertions = 0
     tasks, task_assertions = [], 0
+    declared_tasks = case.get("tasks", [])
+    counts = dict.fromkeys(declared_tasks, 0)
     is_format = case["diagnostics"] == "format-reader"
     first_failure, folder_evidence = None, {}
     try:
@@ -39,15 +41,19 @@ def check_log(log, case, returncode=0):
             if not isinstance(event, dict) or not isinstance(event.get("action"), str):
                 raise ValueError("event must be an object with an action")
             action = event["action"]
+            assertion = case.get("requires_non_debug") and any(
+                "###!!! ASSERTION" in str(event.get(k, "")) for k in ("data", "message"))
+            if assertion:
+                errors.append("raw assertion diagnostic in non-DEBUG control")
             if first_failure is None and (
-                action == "crash" or event.get("level") in ("ERROR", "CRITICAL", "FATAL")
+                assertion or action == "crash" or event.get("level") in ("ERROR", "CRITICAL", "FATAL")
                 or (action in ("test_status", "test_end")
                     and (event.get("status") != "PASS"
                          or event.get("expected", "PASS") != "PASS"))
             ):
                 first_failure = {k: event[k] for k in
                                  ("action", "test", "subtest", "status", "expected",
-                                  "message", "stack") if k in event}
+                                  "message", "stack", "data") if k in event}
             if action == "suite_start":
                 selected = event.get("tests", {})
                 suites.append([v for group in selected.values() for v in group])
@@ -66,6 +72,8 @@ def check_log(log, case, returncode=0):
                 assertions += 1
                 if tasks == [(case.get("task"), "pending")]:
                     task_assertions += 1
+                if tasks and tasks[-1][1] == "pending" and tasks[-1][0] in counts:
+                    counts[tasks[-1][0]] += 1
             if action in ("test_status", "test_end"):
                 if not active:
                     errors.append("result outside active case")
@@ -82,7 +90,7 @@ def check_log(log, case, returncode=0):
             # xpcshell info() adds literal enclosing quotes, not JSON escaping.
             if message.startswith('"DELIVERY_') and message.endswith('"'):
                 message = message[1:-1]
-            if case.get("task"):
+            if case.get("task") or declared_tasks:
                 task = re.fullmatch(
                     r"\(xpcshell/head\.js\) \| test (test_\w+) (pending|finished) \(\d+\)", message)
                 if task:
@@ -113,6 +121,16 @@ def check_log(log, case, returncode=0):
                     modes.append(data)
                 elif kind == "DELIVERY_PHASE":
                     phases.append(data.get("phase"))
+        if case.get("requires_non_debug"):
+            if len(raw_logs) != 2:
+                errors.append("non-DEBUG control requires both raw output streams")
+            for path in raw_logs:
+                text = Path(path).read_text(encoding="utf-8", errors="replace")
+                if "###!!! ASSERTION" in text:
+                    errors.append("raw assertion diagnostic: " + str(path))
+                    if first_failure is None:
+                        first_failure = {"action": "process_output", "message": next(
+                            line for line in text.splitlines() if "###!!! ASSERTION" in line)}
         if suites != [[case["file"]]] or suite_ends != 1:
             errors.append("suite selection/completion differs from requested case")
         if starts != [case["file"]] or ends != [case["file"]]:
@@ -125,6 +143,9 @@ def check_log(log, case, returncode=0):
         if case.get("task") and (tasks != [(case["task"], "pending"), (case["task"], "finished")]
                                  or not task_assertions):
             errors.append("require one complete requested task with assertions")
+        expected_tasks = [(name, state) for name in declared_tasks for state in ("pending", "finished")]
+        if declared_tasks and (tasks != expected_tasks or not all(counts.values())):
+            errors.append("require every declared task to finish with assertions")
         if case.get("task") and any(d.get("store") != "none" or d.get("scope") != "metadata-only"
                                     for d in backends):
             errors.append("metadata-only case must not claim body-store coverage")
@@ -232,6 +253,37 @@ def prepare(config, case):
                 raise ValueError("preconfigured fixture must set both store preferences")
     module_pairs = []
     paths = [manifest] + [manifest.parent / name for name in doc if name != "DEFAULT"]
+    if "tasks" in case:
+        names = case["tasks"]
+        setups = case.get("setups", [])
+        if (case.get("task") or case["backend"] != "panorama"
+            or case["fixture"] != "preconfigured-store" or not isinstance(names, list) or not names
+            or not isinstance(setups, list)
+            or any(not isinstance(n, str) or not re.fullmatch(r"test_\w+", n) for n in names)
+            or any(not isinstance(n, str) or not re.fullmatch(r"\w+", n) for n in setups)
+            or len(set(names)) != len(names) or len(set(setups)) != len(setups)):
+            raise ValueError("invalid initializer named tasks/setup declaration")
+        text = (manifest.parent / case["file"]).read_text(encoding="utf-8")
+        for kind, wanted in (("task", names), ("setup", setups)):
+            actual = re.findall(r"\badd_" + kind + r"\s*\(\s*(?:async\s+)?function\s+(\w+)\s*\(", text)
+            if actual != wanted or len(re.findall(r"\badd_" + kind + r"\s*\(", text)) != len(wanted):
+                raise ValueError("initializer named tasks/setup differ from source")
+        if re.search(r"\b(?:add_test|run_test)\s*\(", text):
+            raise ValueError("initializer named tasks/setup must be unconditional")
+        modules = {"MockRegistrar.sys.mjs": source / "testing/modules/MockRegistrar.sys.mjs",
+                   "mailnews/MessageGenerator.sys.mjs": comm / "mailnews/test/resources/MessageGenerator.sys.mjs"}
+        module_pairs = [(original, Path(config["objdir"]) / "_tests/modules" / name)
+                        for name, original in modules.items()]
+        paths += [p for pair in module_pairs for p in pair]
+        paths += [comm / "mailnews/moz.build", source / "testing/modules/moz.build",
+                  source / "testing/xpcshell/runxpcshelltests.py", source / "xpcom/base/nsDebug.h",
+                  source / "xpcom/base/nsDebugImpl.cpp"]
+    if case.get("requires_non_debug"):
+        info = Path(config["objdir"]) / "mozinfo.json"
+        if json.loads(info.read_text(encoding="utf-8")).get("debug") is not False:
+            raise ValueError("held-build-mode: raw missing-URI control requires verified non-DEBUG build")
+        paths += [info, Path(config["objdir"]) / "config.status", source / "xpcom/base/nsDebug.h",
+                  source / "testing/xpcshell/runxpcshelltests.py"]
     if case["id"].startswith("imap:"):
         paths += [manifest.parent / "head_server.js",
                   Path(config["objdir"]) / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"]
@@ -342,10 +394,14 @@ def run_case(config, case, output):
         _, paths = prepare(config, case)
         paths += [executable, obj / "mozinfo.json", Path(__file__)]
         before = digest(paths)
+        if case.get("requires_non_debug"):
+            record["build_mode"] = {"debug": False, "harness_XPCOM_DEBUG_BREAK": "stack-and-abort",
+                                    "evidence": str(obj / "mozinfo.json"),
+                                    "environment_basis": "pinned harness buildCoreEnvironment; not a child sample"}
         with stdout.open("wb") as out, stderr.open("wb") as err:
             result = subprocess.run(argv, cwd=source, env=env, stdout=out, stderr=err,
                                     timeout=timeout, check=False)
-        record.update(check_log(raw, case, result.returncode))
+        record.update(check_log(raw, case, result.returncode, (stdout, stderr)))
         record.update(observed="PASS" if record["ok"] else "FAIL",
                       disposition="passed" if record["ok"] else "failed", exit_code=result.returncode,
                       hashes_before=before, hashes_after=digest(paths))

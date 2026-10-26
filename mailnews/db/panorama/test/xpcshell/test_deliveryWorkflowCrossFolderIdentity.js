@@ -120,6 +120,37 @@ add_task(function test_crossFolderEqualKeysLegacy() {
     "The exclusion belongs to its own folder"
   );
 
+  const singleFolderView = Cc[
+    "@mozilla.org/messenger/msgdbview;1?type=threaded"
+  ].createInstance(Ci.nsIMsgDBView);
+  try {
+    singleFolderView.init(null, null);
+    singleFolderView.open(
+      first,
+      Ci.nsMsgViewSortType.bySubject,
+      Ci.nsMsgViewSortOrder.ascending,
+      Ci.nsMsgViewFlagsType.kNone
+    );
+    Assert.equal(
+      singleFolderView.findIndexOfMsgHdr(
+        firstDB.getMsgHdrForKey(SHARED_KEY),
+        false
+      ),
+      0,
+      "The single-folder view finds its own database-fetched header"
+    );
+    Assert.equal(
+      singleFolderView.findIndexOfMsgHdr(
+        outsideDB.getMsgHdrForKey(SHARED_KEY),
+        false
+      ),
+      NOT_IN_VIEW,
+      "The single-folder view excludes another folder's equal key"
+    );
+  } finally {
+    singleFolderView.close();
+  }
+
   const firstIdentity = [
     first.URI,
     SHARED_KEY,

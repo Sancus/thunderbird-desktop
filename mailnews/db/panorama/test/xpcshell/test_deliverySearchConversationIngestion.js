@@ -5,6 +5,7 @@
 "use strict";
 
 /* import-globals-from head.js */
+/* import-globals-from head_delivery.js */
 
 const ConversationLiveView = Components.Constructor(
   "@mozilla.org/mailnews/live-view;1",
@@ -24,6 +25,7 @@ add_setup(function () {
     database,
     "The account manager selected the Panorama database service"
   );
+  PanoramaDelivery.assertBackend("panorama");
 });
 
 /**

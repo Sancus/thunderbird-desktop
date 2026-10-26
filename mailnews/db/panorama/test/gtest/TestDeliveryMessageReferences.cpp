@@ -45,6 +45,25 @@ static_assert(std::is_standard_layout_v<GuardedCount>);
 static_assert(offsetof(GuardedCount, canary) == sizeof(uint16_t));
 static_assert(sizeof(GuardedCount) == sizeof(int64_t));
 
+constexpr uint32_t kHeaderUint32Sentinel = 0x6ac13f27;
+constexpr uint32_t kHeaderUint32Canary = 0xa5c39e71;
+struct alignas(int64_t) GuardedHeaderUint32 {
+  uint32_t value;
+  volatile uint32_t canary;
+};
+static_assert(std::is_standard_layout_v<GuardedHeaderUint32>);
+static_assert(offsetof(GuardedHeaderUint32, canary) == sizeof(uint32_t));
+static_assert(sizeof(GuardedHeaderUint32) == sizeof(int64_t));
+
+void CheckHeaderUint32Output(nsIMsgDBHdr* header, nsresult expectedResult,
+                             uint32_t expectedValue) {
+  GuardedHeaderUint32 output{kHeaderUint32Sentinel, kHeaderUint32Canary};
+  EXPECT_EQ(expectedResult,
+            header->GetUint32Property("delivery.uint32", &output.value));
+  EXPECT_EQ(expectedValue, output.value);
+  EXPECT_EQ(kHeaderUint32Canary, static_cast<uint32_t>(output.canary));
+}
+
 }  // namespace
 
 class DeliveryMessageReferencesFaultWitness final : public mozIStorageFunction {
@@ -279,6 +298,23 @@ class DeliveryMessageReferences : public testing::Test {
                   getter_AddRefs(prepared)));
     EXPECT_EQ(0u, mWitness->mCalls);
     ASSERT_EQ(NS_OK, prepared->Finalize());
+  }
+
+  void MakePropertyReadFault() {
+    ASSERT_NO_FATAL_FAILURE(Create({}));
+    ASSERT_EQ(NS_OK, mHeader->SetStringProperty("delivery.uint32", "2a"_ns));
+    ASSERT_NO_FATAL_FAILURE(InstallWitness(true));
+    ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "CREATE TEMP VIEW message_properties AS "
+                         "SELECT id, name, delivery_references_fault(id) "
+                         "AS value FROM main.message_properties"_ns));
+    nsCOMPtr<mozIStorageStatement> prepared;
+    ASSERT_EQ(NS_OK,
+              Connection()->CreateStatement(
+                  "SELECT value FROM message_properties WHERE id = :id"_ns,
+                  getter_AddRefs(prepared)));
+    ASSERT_EQ(NS_OK, prepared->Finalize());
+    EXPECT_EQ(0u, mWitness->mCalls);
   }
 
   void CheckWitness() {
@@ -533,6 +569,94 @@ TEST_F(DISABLED_DeliveryMessageReferences,
   EXPECT_EQ(int64_t(mKey), mWitness->mLastKey);
   CheckNoTransaction();
   CheckStored({"original@invalid"_ns});
+}
+
+using DISABLED_DeliveryHeaderProperties = DeliveryMessageReferences;
+
+TEST_F(DISABLED_DeliveryHeaderProperties, Uint32SuccessAssignsOnlyUint32) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("delivery.uint32", "2a"_ns));
+  CheckHeaderUint32Output(mHeader, NS_OK, 42);
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties, Uint32MaximumAssignsOnlyUint32) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK, mHeader->SetUint32Property("delivery.uint32", 0xffffffff));
+  CheckHeaderUint32Output(mHeader, NS_OK, 0xffffffff);
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, mHeader->GetStringProperty("delivery.uint32", text));
+  EXPECT_EQ("ffffffff"_ns, text);
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties,
+       Uint32MissingReplacesSentinelWithZero) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  CheckHeaderUint32Output(mHeader, NS_OK, 0);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, mHeader->GetProperties(names));
+  EXPECT_FALSE(names.Contains("delivery.uint32"_ns));
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties, Uint32EmptyReplacesSentinelWithZero) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK,
+            mHeader->SetStringProperty("delivery.uint32", EmptyCString()));
+  CheckHeaderUint32Output(mHeader, NS_OK, 0);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, mHeader->GetProperties(names));
+  EXPECT_TRUE(names.Contains("delivery.uint32"_ns));
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties,
+       Uint32InvalidPrefixReplacesSentinelWithZero) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("delivery.uint32", "g2a"_ns));
+  CheckHeaderUint32Output(mHeader, NS_OK, 0);
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NineDigitsUseFirstEight) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK,
+            mHeader->SetStringProperty("delivery.uint32", "100000000"_ns));
+  CheckHeaderUint32Output(mHeader, NS_OK, 0x10000000);
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NullKnownOutputIsRejected) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("delivery.uint32", "2a"_ns));
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            mHeader->GetUint32Property("delivery.uint32", nullptr));
+  CheckHeaderUint32Output(mHeader, NS_OK, 42);
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NullOutputDoesNotEvaluateSQL) {
+  ASSERT_NO_FATAL_FAILURE(MakePropertyReadFault());
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            mHeader->GetUint32Property("delivery.uint32", nullptr));
+  EXPECT_EQ(0u, mWitness->mCalls);
+  CheckHeaderUint32Output(mHeader, NS_ERROR_FAILURE, kHeaderUint32Sentinel);
+  CheckWitness();
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties, Uint32PrepareErrorPreservesSentinel) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  // Keep the getter's statement cold so the missing table fails preparation.
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP TABLE message_properties"_ns));
+  nsCOMPtr<mozIStorageStatement> prepared;
+  ASSERT_EQ(NS_ERROR_FAILURE,
+            Connection()->CreateStatement(
+                "SELECT value FROM message_properties WHERE id = :id"_ns,
+                getter_AddRefs(prepared)));
+  ASSERT_FALSE(prepared);
+  CheckHeaderUint32Output(mHeader, NS_ERROR_FAILURE, kHeaderUint32Sentinel);
+}
+
+TEST_F(DISABLED_DeliveryHeaderProperties,
+       Uint32ReadStepErrorPreservesSentinel) {
+  ASSERT_NO_FATAL_FAILURE(MakePropertyReadFault());
+  CheckHeaderUint32Output(mHeader, NS_ERROR_FAILURE, kHeaderUint32Sentinel);
+  CheckWitness();
 }
 
 }  // namespace

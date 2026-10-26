@@ -65,7 +65,7 @@ add_task(function test_customPropertiesAreSharedByHeaderAndDatabase() {
   stmt.reset();
   Assert.deepEqual(stored, [
     ["delivery-empty", ""],
-    ["delivery-number", 0],
+    ["delivery-number", "0"],
     ["delivery-text", "updated"],
   ]);
 });

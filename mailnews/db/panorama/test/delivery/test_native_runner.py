@@ -643,5 +643,32 @@ class NativeRunnerTests(unittest.TestCase):
             self.bind_receipt(config, receipt)
             self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
 
+
+    def test_complete_publication_receipts_bind_raw_header_adapter_and_optionals(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        dependencies = ["comm/mailnews/db/msgdb/public/nsIMsgDatabase.idl",
+                        "comm/mailnews/base/public/MailNewsTypes.h",
+                        "comm/mailnews/db/panorama/src/PerFolderDatabase.cpp",
+                        "comm/mailnews/db/panorama/src/PerFolderDatabase.h",
+                        "comm/mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+                        "comm/mailnews/db/panorama/src/DetachedMsgHdr.h",
+                        "comm/mailnews/base/src/nsMsgUtils.cpp",
+                        "comm/mailnews/base/src/nsMsgUtils.h",
+                        "mfbt/Maybe.h", "mfbt/RefPtr.h"]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)), patch.object(runner, "verify") as verify):
+            for relative in dependencies:
+                path = str(Path(config["source"]) / relative)
+                with self.subTest(path=relative):
+                    self.assertIn(path, receipt["inputs"])
+                    identity = receipt["inputs"].pop(path)
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic()+5)
+                    receipt["inputs"][path] = identity
+            verify.assert_not_called()
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic()+5), receipt)
+
 if __name__ == "__main__":
     unittest.main()

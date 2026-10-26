@@ -110,3 +110,7 @@ prefs = [
 ["test_deliveryCompatibilityFolderFactoryChildren.js"]
 
 ["test_deliveryCompatibilityFolderFactoryRetry.js"]
+
+["test_deliveryCompatibilityCompletePublication.js"]
+
+["test_deliveryCompatibilityQuietPublication.js"]

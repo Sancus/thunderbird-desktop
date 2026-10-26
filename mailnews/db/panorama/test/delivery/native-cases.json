@@ -516,6 +516,91 @@
       "id": "core-native:MessageExistence:ThreadKeysErrorAfterSeedRow",
       "filter": "DISABLED_DeliveryCoreMessageExistence.ThreadKeysErrorAfterSeedRow",
       "expected": "The valid nonzero seed row precedes a reached child SQL-function failure; exact NS_ERROR_FAILURE leaves caller sentinels untouched instead of publishing the partial root; rows survive and retry completes."
+    },
+    {
+      "id": "core-native:Publication:NativePublicationIsCompleteAtFirstCallback",
+      "filter": "DISABLED_DeliveryCoreReferences.NativePublicationIsCompleteAtFirstCallback",
+      "expected": "First callback sees complete structural fields, ordered duplicate References, exact text/defaults/extras and present storage values through the live header and unshared SQL; committed outputs precede one hook with no completion changes."
+    },
+    {
+      "id": "core-native:Publication:NativeQuietPublicationStillReachesInternalObservers",
+      "filter": "DISABLED_DeliveryCoreReferences.NativeQuietPublicationStillReachesInternalObservers",
+      "expected": "Quiet publication reaches both the new hook and default internal OnMessageAdded bridge exactly once, with one stored message and no completion property changes."
+    },
+    {
+      "id": "core-native:Publication:NativeExtrasKeepExactNamesTextAndOrder",
+      "filter": "DISABLED_DeliveryCoreReferences.NativeExtrasKeepExactNamesTextAndOrder",
+      "expected": "Exact case/UTF-8/empty property names and text survive; ordered duplicates use the last value, named aliases remain distinct, and final keywords occupy tags without a shadow property."
+    },
+    {
+      "id": "core-native:Publication:NativeEmptyKeywordsOverrideNamedDefault",
+      "filter": "DISABLED_DeliveryCoreReferences.NativeEmptyKeywordsOverrideNamedDefault",
+      "expected": "Last explicit empty keywords override the named default in both the public tags view and independent SQL."
+    },
+    {
+      "id": "core-native:Publication:NativeAbsentStorageRetainsExactExtras",
+      "filter": "DISABLED_DeliveryCoreReferences.NativeAbsentStorageRetainsExactExtras",
+      "expected": "Absent storage optionals preserve exact extras text while typed size/token/line getters expose the expected values."
+    },
+    {
+      "id": "core-native:Publication:NativePresentStorageOverridesExactExtras",
+      "filter": "DISABLED_DeliveryCoreReferences.NativePresentStorageOverridesExactExtras",
+      "expected": "Present zero, empty token and UINT32_MAX override extras and persist all four storage cells."
+    },
+    {
+      "id": "core-native:Publication:NativeReceivedDateUsesLegacySecondsText",
+      "filter": "DISABLED_DeliveryCoreReferences.NativeReceivedDateUsesLegacySecondsText",
+      "expected": "Six literal received-date vectors preserve legacy truncation/wrap and lowercase hexadecimal TEXT, presence and uint32 observations."
+    },
+    {
+      "id": "core-native:Publication:NativePropertyFailureLeavesOutputsAndControlIntact",
+      "filter": "DISABLED_DeliveryCoreReferences.NativePropertyFailureLeavesOutputsAndControlIntact",
+      "expected": "Reached late-property trigger fails once with the exact constraint, unchanged key/live outputs, no notification or failed-key rows/cache state, ended transaction and intact committed control; restored trigger permits success."
+    },
+    {
+      "id": "core-native:Publication:NativePublicationRejectsForeignTransactionAndNullKey",
+      "filter": "DISABLED_DeliveryCoreReferences.NativePublicationRejectsForeignTransactionAndNullKey",
+      "expected": "Null key and foreign transaction reject with exact errors and unchanged live/key sentinels; foreign transaction and its control property remain owned by the caller."
+    },
+    {
+      "id": "core-native:Publication:NativeBorrowedInputSupportsReentrantReuse",
+      "filter": "DISABLED_DeliveryCoreReferences.NativeBorrowedInputSupportsReentrantReuse",
+      "expected": "Reentrant reuse of borrowed input publishes two distinct messages once each, preserving duplicate References and exact extras without retaining or consuming the input."
+    },
+    {
+      "id": "compatibility-native:CompleteHeader:DetachedAliasesPreserveExplicitEmpty",
+      "filter": "DISABLED_DeliveryCompleteHeader.DetachedAliasesPreserveExplicitEmpty",
+      "expected": "Detached canonical charset/account/keywords aliases preserve explicit empty values and keep literal charset/accountKey properties distinct."
+    },
+    {
+      "id": "compatibility-native:CompleteHeader:RawExtrasKeepOrderCaseAndUtf8",
+      "filter": "DISABLED_DeliveryCompleteHeader.RawExtrasKeepOrderCaseAndUtf8",
+      "expected": "Complete borrowed add preserves ordered last-write extras, case and UTF-8 names/text, canonical aliases and final keywords through a cold Message header."
+    },
+    {
+      "id": "compatibility-native:CompleteHeader:UnspecifiedStorageRemainsAbsent",
+      "filter": "DISABLED_DeliveryCompleteHeader.UnspecifiedStorageRemainsAbsent",
+      "expected": "Unspecified storage fields remain absent from property enumeration while the public size getter returns zero."
+    },
+    {
+      "id": "compatibility-native:CompleteHeader:AbsentStorageOptionalsPreserveExtras",
+      "filter": "DISABLED_DeliveryCompleteHeader.AbsentStorageOptionalsPreserveExtras",
+      "expected": "Absent storage optionals retain exact supplied extras and their public size/token/line values."
+    },
+    {
+      "id": "compatibility-native:CompleteHeader:ExplicitStorageZeroAndEmptyOverrideExtras",
+      "filter": "DISABLED_DeliveryCompleteHeader.ExplicitStorageZeroAndEmptyOverrideExtras",
+      "expected": "Explicit zero sizes/line count and empty token override extras and remain present in property enumeration."
+    },
+    {
+      "id": "compatibility-native:CompleteHeader:DetachedUint32RetainsTypedStorage",
+      "filter": "DISABLED_DeliveryCompleteHeader.DetachedUint32RetainsTypedStorage",
+      "expected": "Detached uint32 conversion preserves exact hexadecimal text and typed full-width storage, zero line count and null-output rejection."
+    },
+    {
+      "id": "compatibility-native:CompleteHeader:FailedAttachmentDoesNotReplay",
+      "filter": "DISABLED_DeliveryCompleteHeader.FailedAttachmentDoesNotReplay",
+      "expected": "Reached References insertion fault returns the exact constraint once, leaves no live output/rows/open transaction, and latches the error so repeat attach/mutation cannot replay it."
     }
   ],
   "suites": {
@@ -524,7 +609,30 @@
       "source_dependencies": [
         "mailnews/db/panorama/src/Message.cpp",
         "mailnews/db/panorama/src/Message.h",
-        "mailnews/db/panorama/public/nsIMessageDatabase.idl"
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/db/panorama/src/DatabaseCore.cpp",
+        "mailnews/db/panorama/src/DatabaseCore.h",
+        "mailnews/db/panorama/src/FolderDatabase.cpp",
+        "mailnews/db/panorama/src/FolderDatabase.h",
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/src/DatabaseUtils.cpp",
+        "mailnews/db/panorama/src/DatabaseUtils.h",
+        "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+        "mailnews/db/panorama/src/DetachedMsgHdr.h",
+        "mailnews/db/panorama/public/nsIDatabaseCore.idl",
+        "mailnews/db/panorama/public/nsIFolderDatabase.idl",
+        "mailnews/base/public/nsIMsgHdr.idl",
+        "mailnews/base/public/MailNewsTypes.h",
+        "mailnews/db/msgdb/public/nsIMsgDatabase.idl",
+        "mailnews/base/public/moz.build",
+        "mailnews/db/msgdb/public/moz.build",
+        "mailnews/db/panorama/public/moz.build",
+        "mailnews/db/panorama/src/moz.build",
+        "mailnews/db/panorama/test/moz.build",
+        "mailnews/db/panorama/test/gtest/moz.build",
+        "mailnews/base/src/nsMsgUtils.cpp",
+        "mailnews/base/src/nsMsgUtils.h"
       ]
     },
     "DISABLED_DeliveryFolderInfoProperties": {
@@ -672,6 +780,43 @@
         "mailnews/db/panorama/src/moz.build",
         "mailnews/db/panorama/test/moz.build",
         "mailnews/db/panorama/test/gtest/moz.build"
+      ]
+    },
+    "DISABLED_DeliveryCompleteHeader": {
+      "source": "mailnews/db/panorama/test/gtest/TestDeliveryMessageReferences.cpp",
+      "source_dependencies": [
+        "mailnews/db/panorama/src/DatabaseCore.cpp",
+        "mailnews/db/panorama/src/DatabaseCore.h",
+        "mailnews/db/panorama/src/FolderDatabase.cpp",
+        "mailnews/db/panorama/src/FolderDatabase.h",
+        "mailnews/db/panorama/src/MessageDatabase.cpp",
+        "mailnews/db/panorama/src/MessageDatabase.h",
+        "mailnews/db/panorama/src/DatabaseUtils.cpp",
+        "mailnews/db/panorama/src/DatabaseUtils.h",
+        "mailnews/db/panorama/src/Message.cpp",
+        "mailnews/db/panorama/src/Message.h",
+        "mailnews/db/panorama/src/DetachedMsgHdr.cpp",
+        "mailnews/db/panorama/src/DetachedMsgHdr.h",
+        "mailnews/db/panorama/public/nsIDatabaseCore.idl",
+        "mailnews/db/panorama/public/nsIFolderDatabase.idl",
+        "mailnews/db/panorama/public/nsIMessageDatabase.idl",
+        "mailnews/base/public/nsIMsgHdr.idl",
+        "mailnews/base/public/MailNewsTypes.h",
+        "mailnews/db/msgdb/public/nsIMsgDatabase.idl",
+        "mailnews/base/public/moz.build",
+        "mailnews/db/msgdb/public/moz.build",
+        "mailnews/db/panorama/public/moz.build",
+        "mailnews/db/panorama/src/moz.build",
+        "mailnews/db/panorama/test/moz.build",
+        "mailnews/db/panorama/test/gtest/moz.build",
+        "mailnews/base/src/nsMsgUtils.cpp",
+        "mailnews/base/src/nsMsgUtils.h",
+        "mailnews/db/panorama/src/PerFolderDatabase.cpp",
+        "mailnews/db/panorama/src/PerFolderDatabase.h",
+        "mailnews/db/panorama/src/Thread.cpp",
+        "mailnews/db/panorama/src/Thread.h",
+        "mailnews/base/public/nsIMsgFolder.idl",
+        "mailnews/db/msgdb/public/nsIDBChangeListener.idl"
       ]
     }
   }

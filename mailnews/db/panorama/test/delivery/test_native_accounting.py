@@ -131,7 +131,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 102)
+        self.assertEqual(len(catalog["cases"]), 119)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -169,7 +169,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 102)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 119)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -317,6 +317,60 @@ class NativeAccountingTests(unittest.TestCase):
             wrong = copy.deepcopy(self.events)
             wrong[3]["status"] = "SKIP"
             self.reject(wrong)
+
+
+    def test_complete_publication_filters_are_isolated_manual_cases(self):
+        expected = {
+            "DISABLED_DeliveryCoreReferences": [
+                "NativePublicationIsCompleteAtFirstCallback",
+                "NativeQuietPublicationStillReachesInternalObservers",
+                "NativeExtrasKeepExactNamesTextAndOrder",
+                "NativeEmptyKeywordsOverrideNamedDefault",
+                "NativeAbsentStorageRetainsExactExtras",
+                "NativePresentStorageOverridesExactExtras",
+                "NativeReceivedDateUsesLegacySecondsText",
+                "NativePropertyFailureLeavesOutputsAndControlIntact",
+                "NativePublicationRejectsForeignTransactionAndNullKey",
+                "NativeBorrowedInputSupportsReentrantReuse",
+            ],
+            "DISABLED_DeliveryCompleteHeader": [
+                "DetachedAliasesPreserveExplicitEmpty",
+                "RawExtrasKeepOrderCaseAndUtf8",
+                "UnspecifiedStorageRemainsAbsent",
+                "AbsentStorageOptionalsPreserveExtras",
+                "ExplicitStorageZeroAndEmptyOverrideExtras",
+                "DetachedUint32RetainsTypedStorage",
+                "FailedAttachmentDoesNotReplay",
+            ],
+        }
+        for suite, names in expected.items():
+            rows = [c for c in native.CATALOG["cases"]
+                    if c["filter"].startswith(suite + ".") and c["filter"].split(".")[1] in names]
+            self.assertEqual([c["filter"] for c in rows], [suite + "." + name for name in names])
+            source = ("TestDeliveryCoreReferences.cpp" if suite.endswith("CoreReferences")
+                      else "TestDeliveryMessageReferences.cpp")
+            self.assertEqual(native.CATALOG["suites"][suite]["source"],
+                             "mailnews/db/panorama/test/gtest/" + source)
+            for row in rows:
+                self.selected = row["filter"]
+                for index in (1, 4):
+                    self.events[index]["name"] = suite
+                for index in (2, 3):
+                    self.events[index]["test"] = self.selected
+                checked = self.check(self.events)
+                self.assertTrue(checked["log_complete"])
+                self.assertEqual(checked["coverage"], "none")
+                self.assertTrue(checked["execution_hold"])
+                self.reject(self.events[:3] + self.events[4:])
+                self.reject(self.events[:3] + [self.events[2]] + self.events[3:])
+                self.reject(self.events, returncode=1)
+                self.reject(self.events, timed_out=True)
+                wrong = copy.deepcopy(self.events)
+                wrong[3]["status"] = "SKIP"
+                self.reject(wrong)
+                wrong[3].update(status="PASS", test="OtherSuite.WrongCase")
+                self.reject(wrong)
+                self.assertFalse(native.check_log(self.log, suite + ".*", 0)["log_complete"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -240,7 +240,7 @@ Native gtest build/qualification proceeds independently.
 
 ## Raw database task groups and physical view identity
 
-The manual catalog has 168 JS rows; NumericProperties remains pending-contract.
+The manual catalog has 170 JS rows; NumericProperties remains pending-contract.
 Publication now declares its current five tasks and ConversationIngestion all four.
 These panorama:none files each require one literal anonymous setup, assertions
 and backend evidence inside it, then every named task with assertions and exact
@@ -263,3 +263,16 @@ overwrite assertions remain; read/write fault cases require reached witnesses,
 exact errors, unchanged committed state and recovery. Binding source is not
 runtime fault qualification. Root must verify the exact string/SQLite APIs and
 retain the approved write-trigger hex witness; no oracle is rewritten here.
+
+## Complete header publication
+
+CompletePublication and QuietPublication each select one existing named task in
+a fresh Panorama mbox process/profile. Both require the literal fixture folder,
+actual backend and pre-getter store proof, task assertions and full-file end.
+Their synthetic token does not prove stored body bytes or retrieval. The first
+checks all fields and NewList inside the legacy callback; the second requires
+quiet legacy delivery and one complete internal LiveView publication. Reentrant
+attach, consumed-draft identity and no replay remain strict runtime assertions.
+Matching generated headers, source/build receipts, fresh cleanup and restored
+notification/alias/state negative controls remain pending. All unselected cases
+are NOTRUN. Mixed LocalStructure lanes remain held under strict skip rejection.

@@ -695,7 +695,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 43)
-        self.assertEqual(len({c["id"] for c in catalog}), 168)
+        self.assertEqual(len({c["id"] for c in catalog}), 170)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -987,8 +987,8 @@ support-files = ["fixture.sql"]
                  "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
                                               "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
         rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
-        self.assertEqual(len(catalog), 168)
-        self.assertEqual(len({c["id"] for c in catalog}), 168)
+        self.assertEqual(len(catalog), 170)
+        self.assertEqual(len({c["id"] for c in catalog}), 170)
         self.assertEqual(len(rows), 8)
         for store in ("mbox", "maildir"):
             lane = [c for c in rows if c["store"] == store]
@@ -1104,8 +1104,8 @@ support-files = ["fixture.sql"]
 
     def test_new_raw_catalog_and_view_lanes_are_exact_manual_cases(self):
         catalog = json.loads((runner.HERE / "cases.json").read_text())
-        self.assertEqual(len(catalog), 168)
-        self.assertEqual(len({c["id"] for c in catalog}), 168)
+        self.assertEqual(len(catalog), 170)
+        self.assertEqual(len({c["id"] for c in catalog}), 170)
         expected = {
             "core:Publication": ["test_publishCommittedMessageOnce",
                 "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
@@ -1275,6 +1275,86 @@ support-files = ["fixture.sql"]
         (source / rows[-1]["source_dependencies"][0]).unlink()
         with self.assertRaisesRegex(ValueError, "blocked-dependency"):
             runner.prepare(config, rows[-1])
+
+
+    def test_complete_publication_folder_tasks_require_real_preflight_and_evidence(self):
+        import shutil
+        config, _ = self.initializer_fixture()
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        expected = {
+            "compatibility:CompletePublication":
+                ("test_attachPublishesCompleteHeaderAndConsumesDraft", "complete-publication"),
+            "compatibility:QuietPublication":
+                ("test_quietAttachStillPublishesToLiveView", "quiet-publication"),
+        }
+        rows = [c for c in catalog if c["id"] in expected]
+        self.assertEqual({c["id"] for c in rows}, set(expected))
+        comm, target = runner.HERE.parents[4], Path(config["source"]) / "comm"
+        for case in rows:
+            task, folder = expected[case["id"]]
+            self.assertEqual(case["tasks"], [task])
+            self.assertEqual(case["setups"], [])
+            self.assertNotIn("anonymous_setup", case)
+            self.assertEqual((case["backend"], case["store"], case["fixture"]),
+                             ("panorama", "mbox", "preconfigured-store"))
+            self.assertEqual(case["folder_roles"], {"fixture": folder})
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [manifest.parent / n for n in doc["DEFAULT"]["head"].split()]
+            paths += [p for p in (manifest.parent / "data").rglob("*") if p.is_file()]
+            paths += [comm / n for n in case["source_dependencies"]]
+            for original in paths:
+                destination = target / original.relative_to(comm)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, destination)
+            shutil.copyfile(comm / "mailnews/test/resources/MessageGenerator.sys.mjs",
+                            Path(config["objdir"]) / "_tests/modules/mailnews/MessageGenerator.sys.mjs")
+            _, bound = runner.prepare(config, case)
+            self.assertTrue({target / n for n in case["source_dependencies"]} <= set(bound))
+            selected = (target / case["manifest"]).with_name(case["file"])
+            self.assertIn(selected, bound)
+            original = selected.read_text()
+            selected.write_text(original.replace(task, "test_wrongTask"))
+            with self.assertRaisesRegex(ValueError, "named tasks/setup"):
+                runner.prepare(config, case)
+            selected.write_text(original)
+            with patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=7)) as launch:
+                output = self.root / case["file"]
+                output.mkdir()
+                result = runner.run_case(config, case, output)
+                launch.assert_called_once()
+                self.assertEqual(launch.call_args.args[0][-1], str(selected))
+                self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                                 (7, "failed", "none"))
+            events = self.initializer_events(case)
+            contract = {**self.contract, "folderURI": "mailbox://test/" + folder}
+            events[3] = self.diag("STORE_CONTRACT", contract)
+            events[4] = self.diag("FOLDER", {**self.folder, **contract})
+            for event in events:
+                if "test" in event:
+                    event["test"] = case["file"]
+                if event["action"] == "suite_start":
+                    event["tests"] = {case["manifest"]: [case["file"]]}
+            self.assertTrue(self.check(events, case)["ok"])
+            for index in (2, 3, 4, 5, 6, 7, 8):
+                rejected = self.check(events[:index] + events[index + 1:], case)
+                self.assertFalse(rejected["ok"])
+                self.assertEqual(rejected["coverage"], "none")
+            wrong = copy.deepcopy(events)
+            wrong[6].update(status="FAIL", expected="FAIL", message="publication witness missing")
+            self.assertFalse(self.check(wrong, case)["ok"])
+            wrong[6].update(status="SKIP", expected="SKIP")
+            self.assertFalse(self.check(wrong, case)["ok"])
+            wrong = copy.deepcopy(events)
+            wrong[4] = self.diag("FOLDER", {**self.folder, **contract, "actualStore": "maildir"})
+            self.assertFalse(self.check(wrong, case)["ok"])
+            missing = target / "mailnews/db/panorama/src/PerFolderDatabase.cpp"
+            content = missing.read_bytes()
+            missing.unlink()
+            with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+                runner.prepare(config, case)
+            missing.write_bytes(content)
 
 if __name__ == "__main__":
     unittest.main()

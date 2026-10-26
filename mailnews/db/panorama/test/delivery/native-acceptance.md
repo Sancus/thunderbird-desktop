@@ -201,3 +201,18 @@ Receipts also bind the Thread consumer/interface, MsgUnhex sources and Gecko
 mozStorageBindingParams implementation/header. Those last two exact efd2 pins
 need root verification before runtime admission. Matching SQLite planner, native
 close/profile lifecycle and restored old-code negative controls remain NOTRUN.
+
+The ten complete native publication controls and seven CompleteHeader adapter
+controls bring the manual catalog to 119. Both existing source files are already
+in xul-gtest; all filters remain DISABLED and require exact isolated selection.
+Core publication binds the RawHdr declaration, named/default/extra/storage write
+path and helpers. CompleteHeader binds the detached/PerFolder/live adapters and
+the real shared fixture. Receipts also require pinned Maybe.h and RefPtr.h.
+Generated IDL/layout/vtable dependents need a matching rebuild and xul-gtest link.
+Late-property and References fault witnesses, unchanged outputs/control rows,
+ended transactions and no replay must execute; error returns alone give no credit.
+First-callback completeness, quiet internal delivery, keyword/name precedence,
+DR023 vectors and reentrant borrowing retain all original assertions. Native
+runtime, restored negative controls, raw shutdown/profile/loaded-image proof and
+refcount/debug qualification remain pending; leak checking stays unavailable.
+Snapshot031 native controls are not registered by this slice.

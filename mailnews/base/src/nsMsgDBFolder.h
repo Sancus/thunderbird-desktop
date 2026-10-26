@@ -233,6 +233,8 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
 #ifdef MOZ_PANORAMA
   // ID of this folder in FolderDatabase.
   uint64_t mFolderId{0};
+  // Failed initialization requires a fresh object.
+  bool mFolderInitAttempted{false};
 #endif  // MOZ_PANORAMA
 
   nsCOMPtr<nsIMsgDatabase> mDatabase;

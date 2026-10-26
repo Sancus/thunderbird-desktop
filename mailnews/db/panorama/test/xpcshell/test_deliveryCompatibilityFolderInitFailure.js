@@ -107,6 +107,11 @@ add_task(async function test_failedDescendantKeepsRowsBodiesAndExistingChild() {
   MockRegistrar.unregister(cid);
   Assert.ok(witnessed, "The fault occurred inside the descendant initializer");
   Assert.equal(calls, 4);
+  Assert.throws(
+    () => created[0].initWithFolderId(pendingId),
+    /NS_ERROR_ALREADY_INITIALIZED/,
+    "A retained failed object cannot be initialized again"
+  );
   statement.params.stable = stable.id;
   statement.params.pending = pendingId;
   statement.params.ready = readyId;

@@ -2770,8 +2770,10 @@ nsresult nsMsgDBFolder::GetCachedChild(uint64_t folderId,
 
 nsresult nsMsgDBFolder::InitWithFolderId(
     uint64_t folderId, nsTArray<FolderInitialization>& initializedFolders) {
+  NS_ENSURE_TRUE(!mFolderInitAttempted && !mFolderId,
+                 NS_ERROR_ALREADY_INITIALIZED);
+  mFolderInitAttempted = true;
   NS_ENSURE_ARG(folderId);
-  NS_ENSURE_TRUE(!mFolderId, NS_ERROR_ALREADY_INITIALIZED);
   size_t initializationIndex = initializedFolders.Length();
   initializedFolders.AppendElement(FolderInitialization{this, mParent, {}});
   mFolderId = folderId;

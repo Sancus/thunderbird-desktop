@@ -381,6 +381,70 @@ class DeliveryCoreMessageExistence : public testing::Test {
     ASSERT_FALSE(folder);
   }
 
+  void ReadStoredThread(nsMsgKey key, nsMsgKey& thread) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                         "SELECT threadId FROM messages WHERE id = :id"_ns,
+                         getter_AddRefs(stmt)));
+    auto finalize = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, key));
+    bool more = false;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    int64_t stored = 0;
+    ASSERT_EQ(NS_OK, stmt->GetInt64(0, &stored));
+    ASSERT_GT(stored, 0);
+    thread = static_cast<nsMsgKey>(stored);
+  }
+
+  void CheckRemovedState(Message* header, nsMsgKey removed, nsMsgKey survivor,
+                         nsMsgKey thread) {
+    bool inTransaction = true;
+    EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&inTransaction));
+    EXPECT_FALSE(inTransaction);
+    bool exists = true;
+    EXPECT_EQ(NS_OK, mCore->MessageDB().MessageExists(removed, exists));
+    EXPECT_FALSE(exists);
+    exists = false;
+    EXPECT_EQ(NS_OK, mCore->MessageDB().MessageExists(survivor, exists));
+    EXPECT_TRUE(exists);
+    uint64_t count = 0;
+    EXPECT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+    EXPECT_EQ(1u, count);
+    CheckStoredKeys({survivor});
+    CheckHeader(header, removed, thread);
+  }
+
+  void CheckRemovalProperty(nsMsgKey key, bool present) {
+    nsCOMPtr<mozIStorageService> storage =
+        do_GetService("@mozilla.org/storage/service;1");
+    ASSERT_TRUE(storage);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, storage->OpenUnsharedDatabase(
+                         mFile, mozIStorageService::CONNECTION_DEFAULT,
+                         getter_AddRefs(reader)));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    auto cleanup = MakeScopeExit([&] {
+      if (stmt) {
+        EXPECT_EQ(NS_OK, stmt->Finalize());
+      }
+      EXPECT_EQ(NS_OK, reader->Close());
+    });
+    ASSERT_EQ(NS_OK, reader->CreateStatement(
+                         "SELECT value FROM message_properties "
+                         "WHERE id = :id AND name = 'delivery.keep'"_ns,
+                         getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, key));
+    bool more = false;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    EXPECT_EQ(present, more);
+    if (more) {
+      nsAutoCString value;
+      EXPECT_EQ(NS_OK, stmt->GetUTF8String(0, value));
+      EXPECT_EQ("preserved"_ns, value);
+    }
+  }
+
   RefPtr<DatabaseCore> mCore;
   nsCOMPtr<nsIProperties> mDirectories;
   nsCOMPtr<nsIFile> mOldProfile, mProfile, mFile;
@@ -469,6 +533,269 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   RefPtr<Message> missing = new Message(nsMsgKey_None);
   ASSERT_EQ(0u, missing->FolderId());
   EXPECT_FALSE(filter.Matches(missing, missing->FolderId()));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       ColdRemovalCallbackSeesCommittedRowAndReadableHeader) {
+  nsMsgKey survivor, removed, thread;
+  ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
+  ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(removed, thread));
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({survivor, removed}));
+  ASSERT_TRUE(Stop());
+  ASSERT_NO_FATAL_FAILURE(Start());
+  // Reopening the core clears its header cache; this is not process restart.
+  uint32_t callbacks = 0;
+  RefPtr<Message> retained;
+  RefPtr<MessageExistenceRemovedObserver> observer =
+      new MessageExistenceRemovedObserver(
+          [&](Message* message, uint32_t oldFlags) {
+            ++callbacks;
+            EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked,
+                      oldFlags);
+            retained = message;
+            CheckRemovedState(message, removed, survivor, thread);
+          });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto cleanup = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(removed));
+  ASSERT_EQ(1u, callbacks);
+  ASSERT_TRUE(retained);
+  CheckRemovedState(retained, removed, survivor, thread);
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       WarmRemovalUsesReturnedStoredFields) {
+  nsMsgKey removed;
+  ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
+  RefPtr<Message> header = new Message(removed);
+  nsAutoCString subject;
+  ASSERT_EQ(NS_OK, header->GetSubject(subject));
+  ASSERT_EQ("Stored subject"_ns, subject);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE messages SET subject = 'Stored at deletion', "
+                       "priority = 4"_ns));
+  uint32_t callbacks = 0;
+  RefPtr<MessageExistenceRemovedObserver> observer =
+      new MessageExistenceRemovedObserver([&](Message* message, uint32_t) {
+        ++callbacks;
+        nsAutoCString value;
+        EXPECT_EQ(NS_OK, message->GetSubject(value));
+        EXPECT_EQ("Stored at deletion"_ns, value);
+        nsMsgPriorityValue priority = 0;
+        EXPECT_EQ(NS_OK, message->GetPriority(&priority));
+        EXPECT_EQ(4, priority);
+        CheckStoredKeys({});
+      });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto cleanup = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(removed));
+  EXPECT_EQ(1u, callbacks);
+  EXPECT_EQ(NS_OK, header->GetSubject(subject));
+  EXPECT_EQ("Stored at deletion"_ns, subject);
+  bool exists = true;
+  EXPECT_EQ(NS_OK, mCore->MessageDB().MessageExists(removed, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       RemovalStepFailureRollsBackWithoutNotification) {
+  nsMsgKey survivor, removed, thread;
+  ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
+  ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(removed, thread));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(
+                       removed, "delivery.keep"_ns, "preserved"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckRemovalProperty(removed, true));
+  RefPtr<Message> header = new Message(removed);
+  ASSERT_NO_FATAL_FAILURE(CheckHeader(header, removed, thread));
+  uint32_t callbacks = 0;
+  RefPtr<MessageExistenceRemovedObserver> observer =
+      new MessageExistenceRemovedObserver([&](Message* message, uint32_t) {
+        ++callbacks;
+        CheckRemovedState(message, removed, survivor, thread);
+      });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto unlisten = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  mFault = new MessageExistenceReadFault();
+  ASSERT_EQ(NS_OK, Connection()->CreateFunction("delivery_remove_fault"_ns, 1,
+                                                mFault));
+  bool faultInstalled = true;
+  auto cleanup = MakeScopeExit([&] {
+    if (faultInstalled) {
+      EXPECT_EQ(NS_OK,
+                Connection()->ExecuteSimpleSQL(
+                    "DROP TRIGGER IF EXISTS delivery_remove_failure"_ns));
+      EXPECT_EQ(NS_OK,
+                Connection()->RemoveFunction("delivery_remove_fault"_ns));
+    }
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_remove_failure "
+                       "BEFORE DELETE ON main.messages "
+                       "WHEN OLD.messageId = 'removed@invalid' "
+                       "BEGIN SELECT delivery_remove_fault(OLD.id); END"_ns));
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->MessageDB().RemoveMessage(removed));
+  EXPECT_EQ(1u, mFault->mCalls);
+  EXPECT_EQ(int64_t(removed), mFault->mLastKey);
+  EXPECT_EQ(0u, callbacks);
+  bool inTransaction = true;
+  EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&inTransaction));
+  EXPECT_FALSE(inTransaction);
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({survivor, removed}));
+  ASSERT_NO_FATAL_FAILURE(CheckRemovalProperty(removed, true));
+  ASSERT_NO_FATAL_FAILURE(CheckHeader(header, removed, thread));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER delivery_remove_failure"_ns));
+  ASSERT_EQ(NS_OK, Connection()->RemoveFunction("delivery_remove_fault"_ns));
+  faultInstalled = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(removed));
+  EXPECT_EQ(1u, callbacks);
+  CheckRemovalProperty(removed, false);
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       RemovalCommitFailureRollsBackWithoutNotification) {
+  nsMsgKey survivor, removed, thread;
+  ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
+  ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(removed, thread));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(
+                       removed, "delivery.keep"_ns, "preserved"_ns));
+  ASSERT_TRUE(Stop());
+  ASSERT_NO_FATAL_FAILURE(Start());
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("PRAGMA foreign_keys = ON"_ns));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TABLE delivery_remove_parent "
+                       "(id INTEGER PRIMARY KEY);"
+                       "CREATE TEMP TABLE delivery_remove_child "
+                       "(id INTEGER REFERENCES delivery_remove_parent(id) "
+                       "DEFERRABLE INITIALLY DEFERRED)"_ns));
+  // Prove the fault is deferred until COMMIT, after a successful write.
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+    if (active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "INSERT INTO delivery_remove_child VALUES(777)"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, Connection()->CommitTransaction());
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  ASSERT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_remove_commit_failure "
+                       "AFTER DELETE ON main.messages "
+                       "WHEN OLD.messageId = 'removed@invalid' "
+                       "BEGIN INSERT INTO delivery_remove_child "
+                       "VALUES(OLD.id); END"_ns));
+  uint32_t callbacks = 0;
+  RefPtr<MessageExistenceRemovedObserver> observer =
+      new MessageExistenceRemovedObserver([&](Message* message, uint32_t) {
+        ++callbacks;
+        CheckRemovedState(message, removed, survivor, thread);
+      });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto unlisten = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            mCore->MessageDB().RemoveMessage(removed));
+  EXPECT_EQ(0u, callbacks);
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({survivor, removed}));
+  ASSERT_NO_FATAL_FAILURE(CheckRemovalProperty(removed, true));
+  RefPtr<Message> header = new Message(removed);
+  ASSERT_NO_FATAL_FAILURE(CheckHeader(header, removed, thread));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER delivery_remove_commit_failure"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(removed));
+  EXPECT_EQ(1u, callbacks);
+  CheckRemovalProperty(removed, false);
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       RemovalRejectsForeignTransaction) {
+  nsMsgKey survivor, removed;
+  ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
+  ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(
+                       removed, "delivery.keep"_ns, "preserved"_ns));
+  uint32_t callbacks = 0;
+  RefPtr<MessageExistenceRemovedObserver> observer =
+      new MessageExistenceRemovedObserver(
+          [&](Message*, uint32_t) { ++callbacks; });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto unlisten = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool inTransaction = false;
+    EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&inTransaction));
+    if (inTransaction) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE messages SET subject = 'Foreign pending' "
+                       "WHERE messageId = 'survivor@invalid'"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, mCore->MessageDB().RemoveMessage(removed));
+  EXPECT_EQ(0u, callbacks);
+  bool inTransaction = false;
+  EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&inTransaction));
+  EXPECT_TRUE(inTransaction);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "SELECT subject FROM messages "
+                       "WHERE messageId = 'survivor@invalid'"_ns,
+                       getter_AddRefs(stmt)));
+  auto finalize = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
+  bool more = false;
+  ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+  ASSERT_TRUE(more);
+  nsAutoCString subject;
+  ASSERT_EQ(NS_OK, stmt->GetUTF8String(0, subject));
+  EXPECT_EQ("Foreign pending"_ns, subject);
+  ASSERT_EQ(NS_OK, stmt->Reset());
+  {
+    nsCOMPtr<mozIStorageService> storage =
+        do_GetService("@mozilla.org/storage/service;1");
+    ASSERT_TRUE(storage);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, storage->OpenUnsharedDatabase(
+                         mFile, mozIStorageService::CONNECTION_DEFAULT,
+                         getter_AddRefs(reader)));
+    nsCOMPtr<mozIStorageStatement> stored;
+    auto close = MakeScopeExit([&] {
+      if (stored) {
+        EXPECT_EQ(NS_OK, stored->Finalize());
+      }
+      EXPECT_EQ(NS_OK, reader->Close());
+    });
+    ASSERT_EQ(NS_OK,
+              reader->CreateStatement("SELECT subject FROM messages "
+                                      "WHERE messageId = 'survivor@invalid'"_ns,
+                                      getter_AddRefs(stored)));
+    ASSERT_EQ(NS_OK, stored->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    ASSERT_EQ(NS_OK, stored->GetUTF8String(0, subject));
+    EXPECT_EQ("Stored subject"_ns, subject);
+  }
+  CheckStoredKeys({survivor, removed});
+  CheckRemovalProperty(removed, true);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(removed));
+  EXPECT_EQ(1u, callbacks);
+  CheckStoredKeys({survivor});
+  CheckRemovalProperty(removed, false);
 }
 
 TEST_F(DISABLED_DeliveryCoreMessageExistence,

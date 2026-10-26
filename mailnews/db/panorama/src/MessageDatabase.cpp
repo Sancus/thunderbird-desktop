@@ -339,50 +339,100 @@ nsresult MessageDatabase::MessageExists(nsMsgKey key, bool& exists) {
 
 NS_IMETHODIMP MessageDatabase::RemoveMessage(nsMsgKey key) {
   MOZ_ASSERT(key != nsMsgKey_None);
-
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "RemoveMessage_properties"_ns,
-        "DELETE FROM message_properties WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
-    stmt->BindInt64ByName("id"_ns, (int64_t)key);
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool inTransaction;
+  MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
+  if (inTransaction) {
+    return NS_ERROR_IN_PROGRESS;
   }
 
-  uint32_t oldFlags = 0;
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "RemoveMessage"_ns,
-        "DELETE FROM messages WHERE id = :id RETURNING "_ns MESSAGE_SQL_FIELDS,
-        getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
-
-    stmt->BindInt64ByName("id"_ns, key);
-
-    bool hasResult;
-    rv = stmt->ExecuteStep(&hasResult);
-    NS_ENSURE_SUCCESS(rv, rv);
-    if (!hasResult) {
-      return NS_ERROR_UNEXPECTED;
+  CachedMsg cached;
+  RefPtr<Message> message;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RemoveMessage_properties"_ns,
+          "DELETE FROM message_properties WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->Execute());
     }
-    oldFlags = (uint32_t)stmt->AsInt64(11);
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RemoveMessage"_ns,
+          "DELETE FROM messages WHERE id = :id RETURNING "_ns MESSAGE_SQL_FIELDS,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      bool hasResult;
+      MOZ_TRY(stmt->ExecuteStep(&hasResult));
+      if (!hasResult) {
+        return NS_ERROR_UNEXPECTED;
+      }
+      int64_t value;
+      MOZ_TRY(stmt->GetInt64(0, &value));
+      cached.key = static_cast<nsMsgKey>(value);
+      MOZ_TRY(stmt->GetInt64(1, &value));
+      cached.folderId = static_cast<uint64_t>(value);
+      MOZ_TRY(stmt->GetInt64(2, &value));
+      cached.threadId = static_cast<nsMsgKey>(value);
+      MOZ_TRY(stmt->GetInt64(3, &value));
+      cached.threadParent = static_cast<nsMsgKey>(value);
+      MOZ_TRY(stmt->GetUTF8String(4, cached.messageId));
+      MOZ_TRY(stmt->GetInt64(5, &value));
+      cached.date = static_cast<PRTime>(value);
+      MOZ_TRY(stmt->GetUTF8String(6, cached.sender));
+      MOZ_TRY(stmt->GetUTF8String(7, cached.recipients));
+      MOZ_TRY(stmt->GetUTF8String(8, cached.ccList));
+      MOZ_TRY(stmt->GetUTF8String(9, cached.bccList));
+      MOZ_TRY(stmt->GetUTF8String(10, cached.subject));
+      MOZ_TRY(stmt->GetInt64(11, &value));
+      cached.flags = static_cast<uint32_t>(value);
+      MOZ_TRY(stmt->GetUTF8String(12, cached.tags));
+      int32_t priority;
+      MOZ_TRY(stmt->GetInt32(13, &priority));
+      cached.priority = static_cast<nsMsgPriorityValue>(priority);
+      MOZ_TRY(stmt->ExecuteStep(&hasResult));
+      if (hasResult) {
+        return NS_ERROR_UNEXPECTED;
+      }
+    }
+    if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    message = new Message(key);
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&inTransaction);
+    if (NS_SUCCEEDED(cleanupRv) && inTransaction) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("RemoveMessage cleanup failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+    return rv;
   }
 
-  // TODO: remove from cache. Left in until we sort out the notification issues.
-
-  // TODO: sort this out. It's problematic if listeners want to access data from
-  // deleted message.
-  RefPtr<Message> message = new Message(key);
+  // Retain the returned fields for observers, without restoring stored
+  // membership.
+  uint32_t oldFlags = cached.flags;
+  auto entry = mMsgCache.lookup(key);
+  if (entry) {
+    entry->value() = std::move(cached);
+  } else {
+    mMsgCache.putNewInfallible(key, std::move(cached));
+  }
   for (MessageListener* listener : mMessageListeners.EndLimitedRange()) {
     listener->OnMessageRemoved(message, oldFlags);
   }
-
   return NS_OK;
 }
 

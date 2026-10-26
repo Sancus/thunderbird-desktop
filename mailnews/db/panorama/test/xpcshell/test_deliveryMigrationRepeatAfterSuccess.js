@@ -58,6 +58,7 @@ add_task(async function test_repeatUnchangedSourceAfterSuccessfulImport() {
     mbox: do_get_file("data/migration"),
   });
   const originalMbox = await IOUtils.read(files.mailFilePath);
+  const originalSummary = await IOUtils.read(files.summaryFilePath);
   loadExistingDB();
   MailServices.accounts.accounts;
   const lane = PanoramaDelivery.expectedLane();
@@ -76,6 +77,7 @@ add_task(async function test_repeatUnchangedSourceAfterSuccessfulImport() {
   Assert.equal(folder.getTotalMessages(false), 0);
 
   await database.migrateFolderDatabase(folder);
+  Assert.ok(!database.connectionForTests.transactionInProgress);
   const first = readStoredMessages(folder.id);
   Assert.deepEqual(
     first.map(([, ...fields]) => fields),
@@ -87,6 +89,7 @@ add_task(async function test_repeatUnchangedSourceAfterSuccessfulImport() {
   );
   // The unchanged source must resolve again without changing imported data.
   await database.migrateFolderDatabase(folder);
+  Assert.ok(!database.connectionForTests.transactionInProgress);
   Assert.deepEqual(
     readStoredMessages(folder.id),
     first,
@@ -106,5 +109,33 @@ add_task(async function test_repeatUnchangedSourceAfterSuccessfulImport() {
     await IOUtils.read(files.mailFilePath),
     originalMbox,
     "Both migration calls preserve the original mbox bytes"
+  );
+  Assert.deepEqual(
+    await IOUtils.read(files.summaryFilePath),
+    originalSummary,
+    "Migration leaves its source summary unchanged"
+  );
+
+  const changedSummary = new Uint8Array(originalSummary.length + 1);
+  changedSummary.set(originalSummary);
+  changedSummary[originalSummary.length] = 10;
+  await IOUtils.write(files.summaryFilePath, changedSummary);
+  try {
+    await Assert.rejects(
+      Promise.resolve().then(() => database.migrateFolderDatabase(folder)),
+      error => error.result === Cr.NS_ERROR_ALREADY_INITIALIZED,
+      "A different summary cannot silently reuse the completed import"
+    );
+    Assert.deepEqual(readStoredMessages(folder.id), first);
+    Assert.ok(!database.connectionForTests.transactionInProgress);
+  } finally {
+    await IOUtils.write(files.summaryFilePath, originalSummary);
+  }
+  await database.migrateFolderDatabase(folder);
+  Assert.ok(!database.connectionForTests.transactionInProgress);
+  Assert.deepEqual(
+    readStoredMessages(folder.id),
+    first,
+    "The original source remains repeatable after a rejected changed source"
   );
 });

@@ -26,9 +26,11 @@
 #include "mozIStorageService.h"
 #include "mozIStorageStatement.h"
 #include "mozIStorageStatementCallback.h"
+#include "mozStorageHelper.h"
 #include "msgCore.h"
 #include "nsAppDirectoryServiceDefs.h"
 #include "nsIClassInfoImpl.h"
+#include "nsICryptoHash.h"
 #include "nsIFile.h"
 #include "nsIInputStream.h"
 #include "nsILineInputStream.h"
@@ -640,6 +642,9 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
 
   uint64_t mDestFolderId;
   nsAutoCString mDestFolderPath;
+  nsCOMPtr<nsIFile> mSummaryFile;
+  nsCString mSourceHash;
+  bool mAlreadyMigrated = false;
   nsMainThreadPtrHandle<Promise> mPromiseHolder;
 
   struct MessageData {
@@ -665,19 +670,27 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
   nsCString mErrorMessage;
 
   nsresult SetupAndRun(nsIMsgFolder* srcFolder, RefPtr<Promise> promise) {
-    srcFolder->GetId(&mDestFolderId);
-    srcFolder->GetPath(mDestFolderPath);
+    MOZ_TRY(DatabaseCore::EnsureConnection());
+    MOZ_TRY(RequireIdleConnection());
+    MOZ_TRY(srcFolder->GetId(&mDestFolderId));
+    NS_ENSURE_TRUE(mDestFolderId, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(srcFolder->GetPath(mDestFolderPath));
     mPromiseHolder = new nsMainThreadPtrHolder<Promise>(__func__, promise);
 
     MOZ_LOG(gPanoramaLog, LogLevel::Info,
             ("migrating %s to the new database", mDestFolderPath.get()));
 
-    nsCOMPtr<nsIFile> summaryFile;
-    nsresult rv = srcFolder->GetSummaryFile(getter_AddRefs(summaryFile));
-    NS_ENSURE_SUCCESS(rv, rv);
+    MOZ_TRY(srcFolder->GetSummaryFile(getter_AddRefs(mSummaryFile)));
+    MOZ_TRY(HashSource(mSourceHash));
+    MOZ_TRY(CheckCompletion());
+    if (mAlreadyMigrated) {
+      promise->MaybeResolveWithUndefined();
+      return NS_OK;
+    }
 
     mDB = do_CreateInstance("@mozilla.org/nsMsgDatabase/msgDB-mailbox");
-    rv = mDB->OpenFromFile(summaryFile);
+    NS_ENSURE_TRUE(mDB, NS_ERROR_NOT_AVAILABLE);
+    nsresult rv = mDB->OpenFromFile(mSummaryFile);
     NS_ENSURE_SUCCESS(rv, rv);
 
     rv = mDB->EnumerateMessages(getter_AddRefs(mEnumerator));
@@ -687,7 +700,10 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
                          MarkerOptions(MarkerTiming::IntervalStart()),
                          mDestFolderPath);
     bool hasMore;
-    if (NS_FAILED(mEnumerator->HasMoreElements(&hasMore)) || !hasMore) {
+    MOZ_TRY(mEnumerator->HasMoreElements(&hasMore));
+    if (!hasMore) {
+      MOZ_TRY(mDB->Close(false));
+      mDB = nullptr;
       Complete(true);
       return NS_OK;
     }
@@ -706,7 +722,7 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
     rv = mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray));
     NS_ENSURE_SUCCESS(rv, rv);
 
-    NS_DispatchToMainThread(this);
+    MOZ_TRY(NS_DispatchToMainThread(this));
     return NS_OK;
   }
 
@@ -715,12 +731,25 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
                          MarkerOptions(MarkerTiming::IntervalEnd()),
                          mDestFolderPath);
     nsresult rv = NS_OK;
+    if (success && !mAlreadyMigrated) {
+      nsCString sourceHash;
+      rv = HashSource(sourceHash);
+      if (NS_SUCCEEDED(rv) && !sourceHash.Equals(mSourceHash)) {
+        rv = NS_ERROR_ALREADY_INITIALIZED;
+      }
+      if (NS_SUCCEEDED(rv) && !mSavepointActive) {
+        rv = StartImport();
+      }
+      if (NS_SUCCEEDED(rv) && !mAlreadyMigrated) {
+        rv = WriteCompletion();
+      }
+    }
     if (mSavepointActive) {
       if (!DatabaseCore::sConnection) {
         mPromiseHolder.get()->MaybeReject(NS_ERROR_NOT_AVAILABLE);
         return;
       }
-      if (success) {
+      if (success && NS_SUCCEEDED(rv)) {
         rv = DatabaseCore::ReleaseSavepoint("foldermigration"_ns);
       }
       if (!success || NS_FAILED(rv)) {
@@ -761,64 +790,69 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
     mCurrentStep = 1;
     bool hasMore;
     uint64_t count = 0;
-    while (NS_SUCCEEDED(mEnumerator->HasMoreElements(&hasMore)) && hasMore) {
+    while (true) {
+      MOZ_TRY(mEnumerator->HasMoreElements(&hasMore));
+      if (!hasMore) {
+        break;
+      }
       nsCOMPtr<nsIMsgDBHdr> message;
-      mEnumerator->GetNext(getter_AddRefs(message));
+      MOZ_TRY(mEnumerator->GetNext(getter_AddRefs(message)));
+      NS_ENSURE_TRUE(message, NS_ERROR_UNEXPECTED);
 
       // Collect what we need to insert into the messages table.
 
       nsAutoCString messageId;
-      message->GetMessageId(messageId);
+      MOZ_TRY(message->GetMessageId(messageId));
       PRTime date;
-      message->GetDate(&date);
+      MOZ_TRY(message->GetDate(&date));
       nsAutoCString sender;
-      message->GetAuthor(sender);
+      MOZ_TRY(message->GetAuthor(sender));
       nsAutoCString recipients;
-      message->GetRecipients(recipients);
+      MOZ_TRY(message->GetRecipients(recipients));
       nsAutoCString ccList;
-      message->GetCcList(ccList);
+      MOZ_TRY(message->GetCcList(ccList));
       nsAutoCString bccList;
-      message->GetBccList(bccList);
+      MOZ_TRY(message->GetBccList(bccList));
       nsAutoCString subject;
-      message->GetSubject(subject);
+      MOZ_TRY(message->GetSubject(subject));
       uint32_t flags;
-      message->GetFlags(&flags);
+      MOZ_TRY(message->GetFlags(&flags));
       nsAutoCString tags;
-      message->GetStringProperty("keywords", tags);
+      MOZ_TRY(message->GetStringProperty("keywords", tags));
       nsAutoCString charset;
-      message->GetCharset(charset);
+      MOZ_TRY(message->GetCharset(charset));
 
-      mMimeConverter->DecodeMimeHeaderToUTF8(sender, charset.get(), true, true,
-                                             sender);
-      mMimeConverter->DecodeMimeHeaderToUTF8(recipients, charset.get(), true,
-                                             true, recipients);
-      mMimeConverter->DecodeMimeHeaderToUTF8(ccList, charset.get(), true, true,
-                                             ccList);
-      mMimeConverter->DecodeMimeHeaderToUTF8(bccList, charset.get(), true, true,
-                                             bccList);
-      mMimeConverter->DecodeMimeHeaderToUTF8(subject, charset.get(), true, true,
-                                             subject);
+      MOZ_TRY(mMimeConverter->DecodeMimeHeaderToUTF8(sender, charset.get(),
+                                                     true, true, sender));
+      MOZ_TRY(mMimeConverter->DecodeMimeHeaderToUTF8(recipients, charset.get(),
+                                                     true, true, recipients));
+      MOZ_TRY(mMimeConverter->DecodeMimeHeaderToUTF8(ccList, charset.get(),
+                                                     true, true, ccList));
+      MOZ_TRY(mMimeConverter->DecodeMimeHeaderToUTF8(bccList, charset.get(),
+                                                     true, true, bccList));
+      MOZ_TRY(mMimeConverter->DecodeMimeHeaderToUTF8(subject, charset.get(),
+                                                     true, true, subject));
 
       nsCOMPtr<mozIStorageBindingParams> params;
-      mParamsArray->NewBindingParams(getter_AddRefs(params));
+      MOZ_TRY(mParamsArray->NewBindingParams(getter_AddRefs(params)));
 
-      params->BindInt64ByName("folderId"_ns, mDestFolderId);
-      params->BindUTF8StringByName(
-          "messageId"_ns, MOZ_TRY(DatabaseUtils::Normalize(messageId)));
-      params->BindInt64ByName("date"_ns, date);
-      params->BindUTF8StringByName("sender"_ns,
-                                   MOZ_TRY(DatabaseUtils::Normalize(sender)));
-      params->BindUTF8StringByName(
-          "recipients"_ns, MOZ_TRY(DatabaseUtils::Normalize(recipients)));
-      params->BindUTF8StringByName("ccList"_ns,
-                                   MOZ_TRY(DatabaseUtils::Normalize(ccList)));
-      params->BindUTF8StringByName("bccList"_ns,
-                                   MOZ_TRY(DatabaseUtils::Normalize(bccList)));
-      params->BindUTF8StringByName("subject"_ns,
-                                   MOZ_TRY(DatabaseUtils::Normalize(subject)));
-      params->BindInt64ByName("flags"_ns, flags);
-      params->BindUTF8StringByName("tags"_ns,
-                                   MOZ_TRY(DatabaseUtils::Normalize(tags)));
+      MOZ_TRY(params->BindInt64ByName("folderId"_ns, mDestFolderId));
+      MOZ_TRY(params->BindUTF8StringByName(
+          "messageId"_ns, MOZ_TRY(DatabaseUtils::Normalize(messageId))));
+      MOZ_TRY(params->BindInt64ByName("date"_ns, date));
+      MOZ_TRY(params->BindUTF8StringByName(
+          "sender"_ns, MOZ_TRY(DatabaseUtils::Normalize(sender))));
+      MOZ_TRY(params->BindUTF8StringByName(
+          "recipients"_ns, MOZ_TRY(DatabaseUtils::Normalize(recipients))));
+      MOZ_TRY(params->BindUTF8StringByName(
+          "ccList"_ns, MOZ_TRY(DatabaseUtils::Normalize(ccList))));
+      MOZ_TRY(params->BindUTF8StringByName(
+          "bccList"_ns, MOZ_TRY(DatabaseUtils::Normalize(bccList))));
+      MOZ_TRY(params->BindUTF8StringByName(
+          "subject"_ns, MOZ_TRY(DatabaseUtils::Normalize(subject))));
+      MOZ_TRY(params->BindInt64ByName("flags"_ns, flags));
+      MOZ_TRY(params->BindUTF8StringByName(
+          "tags"_ns, MOZ_TRY(DatabaseUtils::Normalize(tags))));
 
       // Collect what we need to insert into the message_properties table, and
       // the things we need to update in the messages table once we have the
@@ -832,44 +866,49 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
         MOZ_TRY(message->GetStringReference(i, reference));
         data.references.AppendElement(reference);
       }
-      message->GetMessageKey(&data.oldMessageKey);
-      message->GetThreadId(&data.threadId);
+      MOZ_TRY(message->GetMessageKey(&data.oldMessageKey));
+      MOZ_TRY(message->GetThreadId(&data.threadId));
       if (data.threadId == 0xfffffffe) {
         // The first thread was always stored as -2.
         data.threadId = 1;
       }
-      message->GetThreadParent(&data.threadParent);
+      MOZ_TRY(message->GetThreadParent(&data.threadParent));
       if (data.threadParent == 0xffffffff) {
         // No parent.
         data.threadParent = 0;
       }
-      message->GetStoreToken(data.storeToken);
-      message->GetMessageSize(&data.messageSize);
+      MOZ_TRY(message->GetStoreToken(data.storeToken));
+      MOZ_TRY(message->GetMessageSize(&data.messageSize));
       mMessageData.AppendElement(std::move(data));
 
-      mParamsArray->AddParams(params);
+      MOZ_TRY(mParamsArray->AddParams(params));
 
       if (++count == 100) {
         break;
       }
     }
 
-    if (NS_SUCCEEDED(mEnumerator->HasMoreElements(&hasMore)) && hasMore) {
+    MOZ_TRY(mEnumerator->HasMoreElements(&hasMore));
+    if (hasMore) {
       // Push the remaining work to the end of the event loop.
-      NS_DispatchToMainThread(this);
+      MOZ_TRY(NS_DispatchToMainThread(this));
     } else {
-      mDB->ClearCachedHdrs();
-      mDB->Close(false);
+      MOZ_TRY(mDB->ClearCachedHdrs());
+      MOZ_TRY(mDB->Close(false));
+      mDB = nullptr;
 
       uint32_t length;
-      mParamsArray->GetLength(&length);
+      MOZ_TRY(mParamsArray->GetLength(&length));
       if (length > 0) {
         // Execute the query.
         mCurrentStep = 2;
+        MOZ_TRY(StartImport());
+        if (mAlreadyMigrated) {
+          guard.release();
+          Complete(true);
+          return NS_OK;
+        }
         MOZ_TRY(mStmt->BindParameters(mParamsArray));
-        nsresult rv = DatabaseCore::CreateSavepoint("foldermigration"_ns);
-        NS_ENSURE_SUCCESS(rv, rv);
-        mSavepointActive = true;
         nsCOMPtr<mozIStoragePendingStatement> unused;
         MOZ_TRY(mStmt->ExecuteAsync(this, getter_AddRefs(unused)));
       } else {
@@ -906,7 +945,8 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
     auto guard = mozilla::MakeScopeExit([&] { Complete(false); });
     if (mCurrentStep == 2) {
       mCurrentStep = 3;
-      MOZ_ASSERT(mNewMessageKeys.Length() == mMessageData.Length());
+      NS_ENSURE_TRUE(mNewMessageKeys.Length() == mMessageData.Length(),
+                     NS_ERROR_UNEXPECTED);
 
       // Update threading data.
 
@@ -917,30 +957,30 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       }
 
       // Duplicate statement! Also in MessageDatabase::AddMessage.
-      DatabaseCore::GetStatement(
+      MOZ_TRY(DatabaseCore::GetStatement(
           "UpdateThreadInfo"_ns,
           "UPDATE messages SET threadId = :threadId, threadParent = :threadParent WHERE id = :id"_ns,
-          getter_AddRefs(mStmt));
-      mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray));
+          getter_AddRefs(mStmt)));
+      MOZ_TRY(mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray)));
 
       for (size_t i = 0; i < mNewMessageKeys.Length(); i++) {
         nsCOMPtr<mozIStorageBindingParams> params;
-        mParamsArray->NewBindingParams(getter_AddRefs(params));
-        params->BindInt64ByName("id"_ns, mNewMessageKeys[i]);
+        MOZ_TRY(mParamsArray->NewBindingParams(getter_AddRefs(params)));
+        MOZ_TRY(params->BindInt64ByName("id"_ns, mNewMessageKeys[i]));
         int64_t newThreadId = 0;
         int64_t newThreadParent = 0;
         if (mMessageKeyMap.Get(mMessageData[i].threadId, &newThreadId) &&
             (mMessageData[i].threadParent == 0 ||
              mMessageKeyMap.Get(mMessageData[i].threadParent,
                                 &newThreadParent))) {
-          params->BindInt64ByName("threadId"_ns, newThreadId);
-          params->BindInt64ByName("threadParent"_ns, newThreadParent);
-          mParamsArray->AddParams(params);
+          MOZ_TRY(params->BindInt64ByName("threadId"_ns, newThreadId));
+          MOZ_TRY(params->BindInt64ByName("threadParent"_ns, newThreadParent));
+          MOZ_TRY(mParamsArray->AddParams(params));
         }
       }
 
       uint32_t length;
-      mParamsArray->GetLength(&length);
+      MOZ_TRY(mParamsArray->GetLength(&length));
       if (length > 0) {
         MOZ_TRY(mStmt->BindParameters(mParamsArray));
         nsCOMPtr<mozIStoragePendingStatement> unused;
@@ -954,34 +994,36 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       // Now pair the message keys with the properties collected in step 1,
       // and insert them into the database.
 
-      DatabaseCore::GetStatement(
+      MOZ_TRY(DatabaseCore::GetStatement(
           "SetMessageProperty"_ns,
           "REPLACE INTO message_properties (id, name, value) VALUES (:id, :name, :value)"_ns,
-          getter_AddRefs(mStmt));
-      mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray));
+          getter_AddRefs(mStmt)));
+      MOZ_TRY(mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray)));
 
       for (size_t i = 0; i < mMessageData.Length(); i++) {
         if (!mMessageData[i].storeToken.IsEmpty()) {
           nsCOMPtr<mozIStorageBindingParams> params;
-          mParamsArray->NewBindingParams(getter_AddRefs(params));
-          params->BindInt64ByName("id"_ns, mNewMessageKeys[i]);
-          params->BindUTF8StringByName("name"_ns, "storeToken"_ns);
-          params->BindUTF8StringByName("value"_ns, mMessageData[i].storeToken);
-          mParamsArray->AddParams(params);
+          MOZ_TRY(mParamsArray->NewBindingParams(getter_AddRefs(params)));
+          MOZ_TRY(params->BindInt64ByName("id"_ns, mNewMessageKeys[i]));
+          MOZ_TRY(params->BindUTF8StringByName("name"_ns, "storeToken"_ns));
+          MOZ_TRY(params->BindUTF8StringByName("value"_ns,
+                                               mMessageData[i].storeToken));
+          MOZ_TRY(mParamsArray->AddParams(params));
         }
 
         if (mMessageData[i].messageSize != 0) {
           nsCOMPtr<mozIStorageBindingParams> params;
-          mParamsArray->NewBindingParams(getter_AddRefs(params));
-          params->BindInt64ByName("id"_ns, mNewMessageKeys[i]);
-          params->BindUTF8StringByName("name"_ns, "messageSize"_ns);
-          params->BindInt64ByName("value"_ns, mMessageData[i].messageSize);
-          mParamsArray->AddParams(params);
+          MOZ_TRY(mParamsArray->NewBindingParams(getter_AddRefs(params)));
+          MOZ_TRY(params->BindInt64ByName("id"_ns, mNewMessageKeys[i]));
+          MOZ_TRY(params->BindUTF8StringByName("name"_ns, "messageSize"_ns));
+          MOZ_TRY(
+              params->BindInt64ByName("value"_ns, mMessageData[i].messageSize));
+          MOZ_TRY(mParamsArray->AddParams(params));
         }
       }
 
       uint32_t length;
-      mParamsArray->GetLength(&length);
+      MOZ_TRY(mParamsArray->GetLength(&length));
       if (length > 0) {
         MOZ_TRY(mStmt->BindParameters(mParamsArray));
         nsCOMPtr<mozIStoragePendingStatement> unused;
@@ -1011,6 +1053,82 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
     return NS_OK;
   }
 
+  // Keep the completion receipt in existing folder properties.
+  nsresult CheckCompletion() {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "GetMorkMigrationSource"_ns,
+        "SELECT value FROM folder_properties "
+        "WHERE id = :id AND name = 'morkMigrationSource'"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, mDestFolderId));
+    bool exists;
+    MOZ_TRY(stmt->ExecuteStep(&exists));
+    if (!exists) {
+      mAlreadyMigrated = false;
+      return NS_OK;
+    }
+    nsCString storedHash;
+    MOZ_TRY(stmt->GetUTF8String(0, storedHash));
+    NS_ENSURE_TRUE(storedHash.Equals(mSourceHash),
+                   NS_ERROR_ALREADY_INITIALIZED);
+    mAlreadyMigrated = true;
+    return NS_OK;
+  }
+
+  nsresult RequireIdleConnection() {
+    NS_ENSURE_TRUE(DatabaseCore::sConnection, NS_ERROR_NOT_AVAILABLE);
+    bool active;
+    MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+    return active ? NS_ERROR_IN_PROGRESS : NS_OK;
+  }
+
+  nsresult StartImport() {
+    MOZ_TRY(RequireIdleConnection());
+    // Another import may have finished while source enumeration yielded.
+    MOZ_TRY(CheckCompletion());
+    if (!mAlreadyMigrated) {
+      MOZ_TRY(DatabaseCore::CreateSavepoint("foldermigration"_ns));
+      mSavepointActive = true;
+    }
+    return NS_OK;
+  }
+
+  nsresult HashSource(nsACString& result) {
+    int64_t size;
+    MOZ_TRY(mSummaryFile->GetFileSize(&size));
+    NS_ENSURE_TRUE(size >= 0 && uint64_t(size) < UINT32_MAX,
+                   NS_ERROR_FILE_TOO_BIG);
+    nsCOMPtr<nsIInputStream> stream;
+    MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), mSummaryFile));
+    auto close = mozilla::MakeScopeExit([&] { stream->Close(); });
+    nsCOMPtr<nsICryptoHash> hash;
+    MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+    MOZ_TRY(hash->UpdateFromStream(stream, UINT32_MAX));
+    MOZ_TRY(stream->Close());
+    close.release();
+    nsCString digest;
+    MOZ_TRY(hash->Finish(true, digest));
+    result.Assign("v1:sha256:"_ns);
+    result.Append(digest);
+    return NS_OK;
+  }
+
+  nsresult WriteCompletion() {
+    MOZ_ASSERT(mSavepointActive);
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "SetMorkMigrationSource"_ns,
+        "INSERT INTO folder_properties (id, name, value) "
+        "VALUES (:id, 'morkMigrationSource', :source)"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, mDestFolderId));
+    MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, mSourceHash));
+    return stmt->Execute();
+  }
+
  private:
   ~FolderMigrator() = default;
 };
@@ -1024,7 +1142,7 @@ DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,
   ErrorResult err;
   RefPtr<Promise> promise = Promise::Create(xpc::CurrentNativeGlobal(aCx), err);
 
-  FolderMigrator* migrator = new FolderMigrator();
+  RefPtr<FolderMigrator> migrator = new FolderMigrator();
   nsresult rv = migrator->SetupAndRun(srcFolder, promise);
   NS_ENSURE_SUCCESS(rv, rv);
 

@@ -445,6 +445,76 @@ class DeliveryCoreMessageExistence : public testing::Test {
     }
   }
 
+  nsresult ThreadKeys(uint64_t folder, uint64_t parent, uint64_t thread,
+                      nsTArray<nsMsgKey>& keys) {
+    return mCore->MessageDB().ListThreadKeys(folder, parent, thread, keys);
+  }
+
+  void SetThreadLocation(nsMsgKey key, nsMsgKey thread, nsMsgKey parent,
+                         uint64_t folder) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(
+        NS_OK,
+        Connection()->CreateStatement(
+            "UPDATE messages SET threadId = :thread, "
+            "threadParent = :parent, folderId = :folder WHERE id = :id"_ns,
+            getter_AddRefs(stmt)));
+    auto cleanup = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("thread"_ns, thread));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("parent"_ns, parent));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("folder"_ns, folder));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, key));
+    ASSERT_EQ(NS_OK, stmt->Execute());
+  }
+
+  void CheckThreadBindFailure(const nsACString& sql,
+                              const nsACString& missingParameter) {
+    nsMsgKey key, thread;
+    ASSERT_EQ(NS_OK, Add("thread-bind@invalid"_ns, key));
+    ASSERT_NO_FATAL_FAILURE(ReadStoredThread(key, thread));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    // Inject a real cached statement with one missing bind parameter.
+    ASSERT_EQ(NS_OK, DatabaseCore::GetStatement("ListThreadKeys"_ns, sql,
+                                                getter_AddRefs(stmt)));
+    uint32_t index = 0;
+    ASSERT_EQ(NS_ERROR_INVALID_ARG,
+              stmt->GetParameterIndex(missingParameter, &index));
+    nsTArray<nsMsgKey> keys{77, 88};
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, ThreadKeys(mFolder, 0, thread, keys));
+    EXPECT_EQ((nsTArray<nsMsgKey>{77, 88}), keys);
+    ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key}));
+  }
+
+  void CheckThreadStepFailure(bool afterSeed) {
+    nsMsgKey root, child, thread;
+    ASSERT_EQ(NS_OK, Add("thread-root@invalid"_ns, root));
+    ASSERT_EQ(NS_OK, Add("thread-child@invalid"_ns, child));
+    ASSERT_NO_FATAL_FAILURE(ReadStoredThread(root, thread));
+    ASSERT_NO_FATAL_FAILURE(SetThreadLocation(child, thread, root, mFolder));
+    mFault = new MessageExistenceReadFault();
+    ASSERT_EQ(NS_OK, Connection()->CreateFunction("delivery_thread_fault"_ns, 1,
+                                                  mFault));
+    ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "PRAGMA automatic_index = OFF;"
+                         "CREATE TEMP VIEW messages AS SELECT "
+                         "delivery_thread_fault(id) AS id, folderId, "
+                         "threadId, threadParent FROM main.messages"_ns));
+    EXPECT_EQ(0u, mFault->mCalls);
+    nsTArray<nsMsgKey> keys{77, 88};
+    EXPECT_EQ(NS_ERROR_FAILURE,
+              ThreadKeys(mFolder, afterSeed ? root : 0, thread, keys));
+    EXPECT_EQ((nsTArray<nsMsgKey>{77, 88}), keys);
+    EXPECT_EQ(1u, mFault->mCalls);
+    EXPECT_EQ(int64_t(afterSeed ? child : root), mFault->mLastKey);
+    ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({root, child}));
+    ASSERT_EQ(NS_OK,
+              Connection()->ExecuteSimpleSQL(
+                  "DROP VIEW temp.messages; PRAGMA automatic_index = ON"_ns));
+    ASSERT_EQ(NS_OK, Connection()->RemoveFunction("delivery_thread_fault"_ns));
+    ASSERT_EQ(NS_OK, ThreadKeys(mFolder, 0, thread, keys));
+    EXPECT_EQ((nsTArray<nsMsgKey>{root, child}), keys);
+  }
+
   RefPtr<DatabaseCore> mCore;
   nsCOMPtr<nsIProperties> mDirectories;
   nsCOMPtr<nsIFile> mOldProfile, mProfile, mFile;
@@ -916,6 +986,96 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence, ColdRowStepFailurePropagates) {
   ASSERT_TRUE(Stop());
   ASSERT_NO_FATAL_FAILURE(Start());
   CheckStepFailure(key);
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence,
+       ThreadKeysPreserveMembershipAndDepthFirstOrder) {
+  nsMsgKey root, child, grandchild, peer, excluded, foreign, unrelated;
+  ASSERT_EQ(NS_OK, Add("thread-root@invalid"_ns, root));
+  ASSERT_EQ(NS_OK, Add("thread-child@invalid"_ns, child));
+  ASSERT_EQ(NS_OK, Add("thread-grandchild@invalid"_ns, grandchild));
+  ASSERT_EQ(NS_OK, Add("thread-peer@invalid"_ns, peer));
+  ASSERT_EQ(NS_OK, Add("thread-excluded@invalid"_ns, excluded));
+  ASSERT_EQ(NS_OK, Add("thread-foreign@invalid"_ns, foreign));
+  ASSERT_EQ(NS_OK, Add("thread-unrelated@invalid"_ns, unrelated));
+  nsMsgKey thread, otherThread;
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(root, thread));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(unrelated, otherThread));
+  ASSERT_NE(thread, otherThread);
+  uint64_t otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertRoot("other-thread-folder"_ns,
+                                                &otherFolder));
+  ASSERT_NO_FATAL_FAILURE(SetThreadLocation(child, thread, root, mFolder));
+  ASSERT_NO_FATAL_FAILURE(
+      SetThreadLocation(grandchild, thread, child, mFolder));
+  ASSERT_NO_FATAL_FAILURE(SetThreadLocation(peer, thread, root, mFolder));
+  ASSERT_NO_FATAL_FAILURE(
+      SetThreadLocation(excluded, otherThread, root, mFolder));
+  ASSERT_NO_FATAL_FAILURE(
+      SetThreadLocation(foreign, thread, root, otherFolder));
+  nsTArray<nsMsgKey> keys{77, 88};
+  ASSERT_EQ(NS_OK, ThreadKeys(mFolder, 0, thread, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{root, child, grandchild, peer}), keys);
+  ASSERT_EQ(NS_OK, ThreadKeys(mFolder, child, thread, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{child, grandchild}), keys);
+  ASSERT_EQ(NS_OK, ThreadKeys(otherFolder, 0, thread, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{foreign}), keys);
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys(
+      {root, child, grandchild, peer, excluded, foreign, unrelated}));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence, EmptyThreadKeysReplaceOutput) {
+  nsMsgKey key, thread;
+  ASSERT_EQ(NS_OK, Add("thread-control@invalid"_ns, key));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(key, thread));
+  uint64_t emptyFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertRoot("empty-thread-folder"_ns,
+                                                &emptyFolder));
+  nsTArray<nsMsgKey> keys{77, 88};
+  ASSERT_EQ(NS_OK, ThreadKeys(emptyFolder, 0, thread, keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key}));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysFolderBindError) {
+  ASSERT_NO_FATAL_FAILURE(CheckThreadBindFailure(
+      "SELECT :parent AS id WHERE :threadId > 0"_ns, "folderId"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysParentBindError) {
+  ASSERT_NO_FATAL_FAILURE(CheckThreadBindFailure(
+      "SELECT :folderId AS id WHERE :threadId > 0"_ns, "parent"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysThreadBindError) {
+  ASSERT_NO_FATAL_FAILURE(CheckThreadBindFailure(
+      "SELECT :folderId AS id WHERE :parent >= 0"_ns, "threadId"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysPrepareError) {
+  nsMsgKey key, thread;
+  ASSERT_EQ(NS_OK, Add("thread-control@invalid"_ns, key));
+  ASSERT_NO_FATAL_FAILURE(ReadStoredThread(key, thread));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "ALTER TABLE messages RENAME TO hidden_thread_messages"_ns));
+  nsTArray<nsMsgKey> keys{77, 88};
+  EXPECT_EQ(NS_ERROR_FAILURE, ThreadKeys(mFolder, 0, thread, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{77, 88}), keys);
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key}, "hidden_thread_messages"_ns));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "ALTER TABLE hidden_thread_messages RENAME TO messages"_ns));
+  ASSERT_EQ(NS_OK, ThreadKeys(mFolder, 0, thread, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysFirstStepError) {
+  ASSERT_NO_FATAL_FAILURE(CheckThreadStepFailure(false));
+}
+
+TEST_F(DISABLED_DeliveryCoreMessageExistence, ThreadKeysErrorAfterSeedRow) {
+  ASSERT_NO_FATAL_FAILURE(CheckThreadStepFailure(true));
 }
 
 }  // namespace

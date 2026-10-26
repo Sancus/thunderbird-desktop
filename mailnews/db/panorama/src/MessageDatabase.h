@@ -127,8 +127,10 @@ class MessageDatabase : public nsIMessageDatabase {
   friend class PerFolderDatabase;
   friend class Thread;
   friend class ThreadMessageEnumerator;
+  friend class DeliveryCoreMessageExistence;
 
   nsresult ListAllKeys(uint64_t aFolderId, nsTArray<nsMsgKey>& aKeys);
+  // Leaves keys unchanged on failure.
   nsresult ListThreadKeys(uint64_t folderId, uint64_t parent, uint64_t threadId,
                           nsTArray<nsMsgKey>& keys);
   nsresult GetThreadMaxDate(uint64_t folderId, uint64_t threadId,

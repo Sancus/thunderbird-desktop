@@ -459,8 +459,6 @@ nsresult MessageDatabase::ListAllKeys(uint64_t folderId,
 nsresult MessageDatabase::ListThreadKeys(uint64_t folderId, uint64_t parent,
                                          uint64_t threadId,
                                          nsTArray<nsMsgKey>& keys) {
-  keys.Clear();
-
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "ListThreadKeys"_ns,
@@ -480,14 +478,22 @@ nsresult MessageDatabase::ListThreadKeys(uint64_t folderId, uint64_t parent,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindInt64ByName("folderId"_ns, folderId);
-  stmt->BindInt64ByName("parent"_ns, parent);
-  stmt->BindInt64ByName("threadId"_ns, threadId);
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("parent"_ns, parent));
+  MOZ_TRY(stmt->BindInt64ByName("threadId"_ns, threadId));
 
-  bool hasResult;
-  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    keys.AppendElement((nsMsgKey)(stmt->AsInt64(0)));
+  nsTArray<nsMsgKey> found;
+  while (true) {
+    bool hasResult;
+    MOZ_TRY(stmt->ExecuteStep(&hasResult));
+    if (!hasResult) {
+      break;
+    }
+    int64_t key;
+    MOZ_TRY(stmt->GetInt64(0, &key));
+    found.AppendElement(static_cast<nsMsgKey>(key));
   }
+  keys = std::move(found);
 
   return NS_OK;
 }

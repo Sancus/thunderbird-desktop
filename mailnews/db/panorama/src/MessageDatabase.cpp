@@ -16,7 +16,9 @@
 #include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
+#include "nsIMsgDatabase.h"
 #include "nsMsgMessageFlags.h"
+#include "nsMsgUtils.h"
 
 using mozilla::LazyLogModule;
 using mozilla::LogLevel;
@@ -68,6 +70,25 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
     const nsACString& aSubject, uint32_t aFlags, const nsACString& aTags,
     nsMsgPriorityValue aPriority, nsMsgKey* aKey) {
   NS_ENSURE_ARG_POINTER(aKey);
+  RawHdr header;
+  header.messageId = aMessageId;
+  header.references = aReferences.Clone();
+  header.date = aDate;
+  header.sender = aSender;
+  header.recipients = aRecipients;
+  header.ccList = aCcList;
+  header.bccList = aBccList;
+  header.subject = aSubject;
+  header.flags = aFlags;
+  header.keywords = aTags;
+  header.priority = aPriority;
+  return AddMessage(aFolderId, header, true, aKey);
+}
+
+nsresult MessageDatabase::AddMessage(uint64_t aFolderId, const ::RawHdr& header,
+                                     bool notifyLegacy, nsMsgKey* aKey,
+                                     Message** liveHeader) {
+  NS_ENSURE_ARG_POINTER(aKey);
   MOZ_TRY(DatabaseCore::EnsureConnection());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool inTransaction;
@@ -79,9 +100,9 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
   // This still assumes that referenced parents are already in the database.
   nsMsgKey threadId = 0;
   nsMsgKey parentId = 0;
-  if (!aReferences.IsEmpty()) {
-    threadId = MOZ_TRY(FindByMessageId(aReferences[0]));
-    parentId = MOZ_TRY(FindByMessageId(aReferences.LastElement()));
+  if (!header.references.IsEmpty()) {
+    threadId = MOZ_TRY(FindByMessageId(header.references[0]));
+    parentId = MOZ_TRY(FindByMessageId(header.references.LastElement()));
   }
 
   CachedMsg cached;
@@ -89,13 +110,19 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
     {
-      nsCString messageId = MOZ_TRY(DatabaseUtils::Normalize(aMessageId));
-      nsCString sender = MOZ_TRY(DatabaseUtils::Normalize(aSender));
-      nsCString recipients = MOZ_TRY(DatabaseUtils::Normalize(aRecipients));
-      nsCString ccList = MOZ_TRY(DatabaseUtils::Normalize(aCcList));
-      nsCString bccList = MOZ_TRY(DatabaseUtils::Normalize(aBccList));
-      nsCString subject = MOZ_TRY(DatabaseUtils::Normalize(aSubject));
-      nsCString tags = MOZ_TRY(DatabaseUtils::Normalize(aTags));
+      nsCString messageId = MOZ_TRY(DatabaseUtils::Normalize(header.messageId));
+      nsCString sender = MOZ_TRY(DatabaseUtils::Normalize(header.sender));
+      nsCString recipients =
+          MOZ_TRY(DatabaseUtils::Normalize(header.recipients));
+      nsCString ccList = MOZ_TRY(DatabaseUtils::Normalize(header.ccList));
+      nsCString bccList = MOZ_TRY(DatabaseUtils::Normalize(header.bccList));
+      nsCString subject = MOZ_TRY(DatabaseUtils::Normalize(header.subject));
+      nsCString tags = MOZ_TRY(DatabaseUtils::Normalize(header.keywords));
+      for (const auto& extra : header.extras) {
+        if (extra.k.EqualsLiteral("keywords")) {
+          tags = extra.v;
+        }
+      }
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(DatabaseCore::GetStatement("AddNativeMessage"_ns,
                                          "INSERT INTO messages ( \
@@ -110,15 +137,15 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
       MOZ_TRY(stmt->BindInt32ByName("threadId"_ns, threadId));
       MOZ_TRY(stmt->BindInt32ByName("threadParent"_ns, parentId));
       MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
-      MOZ_TRY(stmt->BindInt64ByName("date"_ns, aDate));
+      MOZ_TRY(stmt->BindInt64ByName("date"_ns, header.date));
       MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, sender));
       MOZ_TRY(stmt->BindUTF8StringByName("recipients"_ns, recipients));
       MOZ_TRY(stmt->BindUTF8StringByName("ccList"_ns, ccList));
       MOZ_TRY(stmt->BindUTF8StringByName("bccList"_ns, bccList));
       MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, subject));
-      MOZ_TRY(stmt->BindInt32ByName("flags"_ns, aFlags));
+      MOZ_TRY(stmt->BindInt32ByName("flags"_ns, header.flags));
       MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
-      MOZ_TRY(stmt->BindInt32ByName("priority"_ns, aPriority));
+      MOZ_TRY(stmt->BindInt32ByName("priority"_ns, header.priority));
 
       bool hasResult;
       MOZ_TRY(stmt->ExecuteStep(&hasResult));
@@ -159,7 +186,46 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
       cached.threadId = cached.key;
     }
 
-    MOZ_TRY(WriteMessageReferencesInTransaction(cached.key, aReferences));
+    MOZ_TRY(WriteMessageReferencesInTransaction(cached.key, header.references));
+
+    if (!header.replyTo.IsEmpty()) {
+      MOZ_TRY(SetMessageProperty(cached.key, "replyTo"_ns, header.replyTo));
+    }
+    if (!header.charset.IsEmpty()) {
+      MOZ_TRY(SetMessageProperty(cached.key, "msgCharSet"_ns, header.charset));
+    }
+    if (!header.accountKey.IsEmpty()) {
+      MOZ_TRY(SetMessageProperty(cached.key, "account"_ns, header.accountKey));
+    }
+    if (header.dateReceived != 0) {
+      uint32_t seconds;
+      PRTime2Seconds(header.dateReceived, &seconds);
+      nsAutoCString text;
+      text.AppendInt(seconds, 16);
+      MOZ_TRY(SetMessageProperty(cached.key, "dateReceived"_ns, text));
+    }
+    for (const auto& extra : header.extras) {
+      if (!extra.k.EqualsLiteral("keywords")) {
+        MOZ_TRY(SetMessageProperty(cached.key, extra.k, extra.v));
+      }
+    }
+    // Only the new native storage inputs override matching extras.
+    if (header.messageSize) {
+      MOZ_TRY(SetMessageProperty(cached.key, "messageSize"_ns,
+                                 *header.messageSize));
+    }
+    if (header.storeToken) {
+      MOZ_TRY(
+          SetMessageProperty(cached.key, "storeToken"_ns, *header.storeToken));
+    }
+    if (header.offlineMessageSize) {
+      MOZ_TRY(SetMessageProperty(cached.key, "offlineMessageSize"_ns,
+                                 *header.offlineMessageSize));
+    }
+    if (header.lineCount) {
+      MOZ_TRY(
+          SetMessageProperty(cached.key, "lineCount"_ns, *header.lineCount));
+    }
 
     if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
       return NS_ERROR_OUT_OF_MEMORY;
@@ -190,8 +256,12 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
     mMsgCache.putNewInfallible(key, std::move(cached));
   }
   *aKey = key;
+  if (liveHeader) {
+    RefPtr<Message> result = message;
+    result.forget(liveHeader);
+  }
   for (MessageListener* listener : mMessageListeners.EndLimitedRange()) {
-    listener->OnMessageAdded(message);
+    listener->OnMessagePublished(message, notifyLegacy);
   }
   return NS_OK;
 }

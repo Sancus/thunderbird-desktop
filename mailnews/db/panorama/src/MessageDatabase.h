@@ -12,6 +12,8 @@
 #include "nsIMessageDatabase.h"
 #include "nsTObserverArray.h"
 
+struct RawHdr;
+
 namespace mozilla::mailnews {
 
 class Folder;
@@ -20,6 +22,11 @@ class Message;
 class MessageListener : public nsISupports {
  public:
   virtual void OnMessageAdded(Message* message) = 0;
+  // Internal observers always receive committed adds. Adapters use the flag
+  // only to gate legacy onHdrAdded callbacks.
+  virtual void OnMessagePublished(Message* message, bool) {
+    OnMessageAdded(message);
+  }
   virtual void OnMessageRemoved(Message* message, uint32_t oldFlags) = 0;
   virtual void OnMessageFlagsChanged(nsIMsgDBHdr* oldMessage, Message* message,
                                      uint32_t oldFlags, uint32_t newFlags) = 0;
@@ -36,6 +43,12 @@ class MessageDatabase : public nsIMessageDatabase {
  public:
   NS_DECL_THREADSAFE_ISUPPORTS
   NS_DECL_NSIMESSAGEDATABASE
+
+  // Borrows inputs until return; RawHdr::key is not an allocation request.
+  // Sets outputs after commit, before callbacks; the live result is owned.
+  nsresult AddMessage(uint64_t folderId, const ::RawHdr& header,
+                      bool notifyLegacy, nsMsgKey* key,
+                      Message** liveHeader = nullptr);
 
   // A bunch of oddly-specific functions here purely to support implementing
   // legacy message interfaces (nsIMsgDBHdr and friends).

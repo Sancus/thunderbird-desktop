@@ -23,6 +23,7 @@
 #include "nsIDBChangeAnnouncer.idl"
 %{C++
 #include "MailNewsTypes.h"
+#include "mozilla/Maybe.h"
 %}
 
 interface nsIMsgDatabase;
@@ -246,10 +247,11 @@ struct RawHdr {
   nsMsgPriorityValue priority{nsMsgPriority::notSet};  // 0 = notSet
   nsCString charset;
   nsCString accountKey;
-  //uint64_t msgSize{0};
-  //nsCString storeToken;
-  //uint64_t offlineMsgSize{0};
-  //uint32_t numLines{0};
+  // Omitted fields stay absent; explicit zero/empty values are retained.
+  mozilla::Maybe<uint32_t> messageSize;
+  mozilla::Maybe<nsCString> storeToken;
+  mozilla::Maybe<uint32_t> offlineMessageSize;
+  mozilla::Maybe<uint32_t> lineCount;
   //nsCString preview;
   //nsCString junkscoreorigin;
   //nsCString junkpercent;

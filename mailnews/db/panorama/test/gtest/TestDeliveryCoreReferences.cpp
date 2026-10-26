@@ -24,6 +24,7 @@
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
 #include "nsIInterfaceRequestorUtils.h"
+#include "nsIMsgDatabase.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
 #include "nsComponentManagerUtils.h"
@@ -630,6 +631,573 @@ TEST_F(DISABLED_DeliveryCoreReferences, ChangedDeleteTriggerIsUnsupported) {
   ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(original));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
+}
+
+class PublicationObserver final : public MessageListener {
+ public:
+  NS_DECL_ISUPPORTS
+  explicit PublicationObserver(std::function<void(Message*, bool)> published)
+      : mPublished(std::move(published)) {}
+  void OnMessagePublished(Message* message, bool notifyLegacy) override {
+    mPublished(message, notifyLegacy);
+  }
+  void OnMessageAdded(Message*) override { ADD_FAILURE() << "Unbridged add"; }
+  void OnMessageRemoved(Message*, uint32_t) override {}
+  void OnMessageFlagsChanged(nsIMsgDBHdr*, Message*, uint32_t,
+                             uint32_t) override {
+    ++mChanges;
+  }
+  void OnMessageTagsChanged(nsIMsgDBHdr*, Message*, const nsACString&,
+                            const nsACString&) override {
+    ++mChanges;
+  }
+  uint32_t mChanges = 0;
+
+ private:
+  ~PublicationObserver() = default;
+  std::function<void(Message*, bool)> mPublished;
+};
+NS_IMPL_ISUPPORTS(PublicationObserver, nsISupports)
+
+nsresult PublicationCell(mozIStorageConnection* reader, nsMsgKey key,
+                         const nsACString& sql, nsACString& value,
+                         const nsACString* name = nullptr) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(reader->CreateStatement(sql, getter_AddRefs(stmt)));
+  auto cleanup = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  if (name) {
+    MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, *name));
+  }
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  return stmt->GetUTF8String(0, value);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativePublicationIsCompleteAtFirstCallback) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey parent;
+  ASSERT_EQ(NS_OK, Add("parent@invalid"_ns, {}, parent));
+  RawHdr raw;
+  raw.key = parent;
+  raw.messageId = "complete@invalid"_ns;
+  raw.references = {"parent@invalid"_ns, "missing@invalid"_ns,
+                    "missing@invalid"_ns, "parent@invalid"_ns};
+  raw.date = 123456789;
+  raw.dateReceived = 483000000;
+  raw.sender = "author@invalid"_ns;
+  raw.recipients = "to@invalid"_ns;
+  raw.ccList = "cc@invalid"_ns;
+  raw.bccList = "bcc@invalid"_ns;
+  raw.subject = "complete subject"_ns;
+  raw.flags = 5;
+  raw.priority = 5;
+  raw.replyTo = "reply@invalid"_ns;
+  raw.charset = "UTF-8"_ns;
+  raw.accountKey = "account7"_ns;
+  raw.keywords = "old-tag"_ns;
+  raw.extras = {{"keywords"_ns, "final-tag"_ns}, {"custom"_ns, "00042"_ns}};
+  raw.messageSize = Some(uint32_t(42));
+  raw.storeToken = Some(nsCString("0"_ns));
+  raw.offlineMessageSize = Some(uint32_t(17));
+  raw.lineCount = Some(uint32_t(3));
+  nsMsgKey key = nsMsgKey_None;
+  Message* live = nullptr;
+  uint32_t notifications = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message* message, bool notifyLegacy) {
+        ++notifications;
+        EXPECT_TRUE(notifyLegacy);
+        EXPECT_EQ(message, live);
+        nsMsgKey observed, thread, parentThread, threadParent;
+        ASSERT_EQ(NS_OK, message->GetMessageKey(&observed));
+        EXPECT_EQ(key, observed);
+        EXPECT_NE(parent, observed);
+        EXPECT_EQ(mFolderId, message->FolderId());
+        ASSERT_EQ(NS_OK, message->GetThreadId(&thread));
+        ASSERT_EQ(NS_OK,
+                  mCore->MessageDB().GetMessageThreadId(parent, parentThread));
+        EXPECT_NE(0u, thread);
+        EXPECT_EQ(parentThread, thread);
+        ASSERT_EQ(NS_OK, message->GetThreadParent(&threadParent));
+        EXPECT_EQ(parent, threadParent);
+        bool inTransaction = true;
+        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&inTransaction));
+        EXPECT_FALSE(inTransaction);
+        nsCString text;
+        ASSERT_EQ(NS_OK, message->GetSubject(text));
+        EXPECT_EQ("complete subject"_ns, text);
+        ASSERT_EQ(NS_OK, message->GetMessageId(text));
+        EXPECT_EQ("complete@invalid"_ns, text);
+        ASSERT_EQ(NS_OK, message->GetAuthor(text));
+        EXPECT_EQ("author@invalid"_ns, text);
+        ASSERT_EQ(NS_OK, message->GetRecipients(text));
+        EXPECT_EQ("to@invalid"_ns, text);
+        ASSERT_EQ(NS_OK, message->GetCcList(text));
+        EXPECT_EQ("cc@invalid"_ns, text);
+        ASSERT_EQ(NS_OK, message->GetBccList(text));
+        EXPECT_EQ("bcc@invalid"_ns, text);
+        PRTime date;
+        ASSERT_EQ(NS_OK, message->GetDate(&date));
+        EXPECT_EQ(PRTime(123456789), date);
+        uint32_t number;
+        ASSERT_EQ(NS_OK, message->GetFlags(&number));
+        EXPECT_EQ(5u, number);
+        nsMsgPriorityValue priority;
+        ASSERT_EQ(NS_OK, message->GetPriority(&priority));
+        EXPECT_EQ(5, priority);
+        ASSERT_EQ(NS_OK, message->GetMessageSize(&number));
+        EXPECT_EQ(42u, number);
+        ASSERT_EQ(NS_OK, message->GetOfflineMessageSize(&number));
+        EXPECT_EQ(17u, number);
+        ASSERT_EQ(NS_OK, message->GetLineCount(&number));
+        EXPECT_EQ(3u, number);
+        ASSERT_EQ(NS_OK, message->GetStoreToken(text));
+        EXPECT_EQ("0"_ns, text);
+        nsCOMPtr<mozIStorageConnection> reader;
+        ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+        auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+        ASSERT_EQ(NS_OK,
+                  PublicationCell(reader, key,
+                                  "SELECT tags FROM messages WHERE id = :id"_ns,
+                                  text));
+        EXPECT_EQ("final-tag"_ns, text);
+        const RawHdr::kv expected[] = {{"replyTo"_ns, "reply@invalid"_ns},
+                                       {"msgCharSet"_ns, "UTF-8"_ns},
+                                       {"account"_ns, "account7"_ns},
+                                       {"custom"_ns, "00042"_ns},
+                                       {"dateReceived"_ns, "1e3"_ns}};
+        for (const auto& property : expected) {
+          SCOPED_TRACE(property.k.get());
+          ASSERT_EQ(NS_OK, message->GetStringProperty(property.k.get(), text));
+          EXPECT_EQ(property.v, text);
+          ASSERT_EQ(
+              NS_OK,
+              PublicationCell(
+                  reader, key,
+                  "SELECT value FROM message_properties WHERE id = :id AND name = :name"_ns,
+                  text, &property.k));
+          EXPECT_EQ(property.v, text);
+        }
+        ASSERT_EQ(NS_OK, message->GetStringProperty("keywords", text));
+        EXPECT_EQ("final-tag"_ns, text);
+        ASSERT_EQ(
+            NS_OK,
+            PublicationCell(
+                reader, key,
+                "SELECT count(*) FROM message_properties WHERE id = :id AND name = 'keywords'"_ns,
+                text));
+        EXPECT_EQ("0"_ns, text);
+        nsTArray<nsCString> refs;
+        ASSERT_EQ(NS_OK, Stored(key, refs));
+        EXPECT_EQ(
+            (nsTArray<nsCString>{"parent@invalid"_ns, "missing@invalid"_ns,
+                                 "missing@invalid"_ns, "parent@invalid"_ns}),
+            refs);
+      });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto cleanup = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolderId, raw, true, &key, &live));
+  RefPtr<Message> owned = dont_AddRef(live);
+  EXPECT_EQ(1u, notifications);
+  EXPECT_EQ(0u, observer->mChanges);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativeQuietPublicationStillReachesInternalObservers) {
+  ASSERT_EQ(NS_OK, Start());
+  uint32_t publications = 0, oldCallbacks = 0;
+  RefPtr<PublicationObserver> published =
+      new PublicationObserver([&](Message*, bool notifyLegacy) {
+        ++publications;
+        EXPECT_FALSE(notifyLegacy);
+      });
+  RefPtr<AddedObserver> internal =
+      new AddedObserver([&](Message*) { ++oldCallbacks; });
+  mCore->MessageDB().AddMessageListener(published);
+  mCore->MessageDB().AddMessageListener(internal);
+  auto cleanup = MakeScopeExit([&] {
+    mCore->MessageDB().RemoveMessageListener(published);
+    mCore->MessageDB().RemoveMessageListener(internal);
+  });
+  RawHdr raw;
+  raw.messageId = "quiet@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, false, &key));
+  EXPECT_EQ(1u, publications);
+  EXPECT_EQ(1u, oldCallbacks);
+  EXPECT_EQ(0u, published->mChanges);
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(1u, count);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativeExtrasKeepExactNamesTextAndOrder) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.replyTo = "default reply"_ns;
+  raw.charset = "default charset"_ns;
+  raw.accountKey = "default account"_ns;
+  raw.keywords = "default tags"_ns;
+  raw.dateReceived = 1000000;
+  raw.extras = {{"replyTo"_ns, ""_ns},
+                {"msgCharSet"_ns, "override charset"_ns},
+                {"account"_ns, ""_ns},
+                {"charset"_ns, "arbitrary charset"_ns},
+                {"accountKey"_ns, "arbitrary accountKey"_ns},
+                {"custom"_ns, "first"_ns},
+                {"custom"_ns, "00042"_ns},
+                {"Custom"_ns, "1e3"_ns},
+                {"\xc3\xa9"_ns, "composed"_ns},
+                {"e\xcc\x81"_ns, "decomposed"_ns},
+                {""_ns, "empty name"_ns},
+                {"dateReceived"_ns, "00042"_ns},
+                {"keywords"_ns, "first tag"_ns},
+                {"keywords"_ns, ""_ns},
+                {"keywords"_ns, "e\xcc\x81"_ns}};
+  nsMsgKey key;
+  Message* live = nullptr;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolderId, raw, true, &key, &live));
+  RefPtr<Message> owned = dont_AddRef(live);
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+  const RawHdr::kv expected[] = {{"replyTo"_ns, ""_ns},
+                                 {"msgCharSet"_ns, "override charset"_ns},
+                                 {"account"_ns, ""_ns},
+                                 {"charset"_ns, "arbitrary charset"_ns},
+                                 {"accountKey"_ns, "arbitrary accountKey"_ns},
+                                 {"custom"_ns, "00042"_ns},
+                                 {"Custom"_ns, "1e3"_ns},
+                                 {"\xc3\xa9"_ns, "composed"_ns},
+                                 {"e\xcc\x81"_ns, "decomposed"_ns},
+                                 {""_ns, "empty name"_ns},
+                                 {"dateReceived"_ns, "00042"_ns}};
+  for (const auto& property : expected) {
+    SCOPED_TRACE(property.k.get());
+    nsCString text;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageProperty(key, property.k, text));
+    EXPECT_EQ(property.v, text);
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, key,
+            "SELECT value FROM message_properties WHERE id = :id AND name = :name"_ns,
+            text, &property.k));
+    EXPECT_EQ(property.v, text);
+  }
+  nsCString tags;
+  ASSERT_EQ(NS_OK, live->GetStringProperty("keywords", tags));
+  EXPECT_EQ("e\xcc\x81"_ns, tags);
+  ASSERT_EQ(NS_OK, PublicationCell(
+                       reader, key,
+                       "SELECT tags FROM messages WHERE id = :id"_ns, tags));
+  EXPECT_EQ("e\xcc\x81"_ns, tags);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessagePropertyNames(key, names));
+  EXPECT_EQ(11u, names.Length());
+  for (const auto& property : expected) {
+    EXPECT_TRUE(names.Contains(property.k));
+  }
+  EXPECT_FALSE(names.Contains("keywords"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativeEmptyKeywordsOverrideNamedDefault) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.keywords = "named default"_ns;
+  raw.extras = {{"keywords"_ns, "first"_ns}, {"keywords"_ns, ""_ns}};
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, true, &key));
+  nsCString tags;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageTags(key, tags));
+  EXPECT_TRUE(tags.IsEmpty());
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+  ASSERT_EQ(NS_OK, PublicationCell(
+                       reader, key,
+                       "SELECT tags FROM messages WHERE id = :id"_ns, tags));
+  EXPECT_TRUE(tags.IsEmpty());
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences, NativeAbsentStorageRetainsExactExtras) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.extras = {{"messageSize"_ns, "00041"_ns},
+                {"storeToken"_ns, "extra"_ns},
+                {"offlineMessageSize"_ns, "17"_ns},
+                {"lineCount"_ns, "3"_ns}};
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, true, &key));
+  uint64_t size;
+  uint32_t lines;
+  nsCString text;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageSize(key, size));
+  EXPECT_EQ(41u, size);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "messageSize"_ns, text));
+  EXPECT_EQ("00041"_ns, text);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageStoreToken(key, text));
+  EXPECT_EQ("extra"_ns, text);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageOfflineMessageSize(key, size));
+  EXPECT_EQ(17u, size);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageLineCount(key, lines));
+  EXPECT_EQ(3u, lines);
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          reader, key,
+          "SELECT value FROM message_properties WHERE id = :id AND name = 'messageSize'"_ns,
+          text));
+  EXPECT_EQ("00041"_ns, text);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativePresentStorageOverridesExactExtras) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.extras = {{"messageSize"_ns, "41"_ns},
+                {"storeToken"_ns, "extra"_ns},
+                {"offlineMessageSize"_ns, "17"_ns},
+                {"lineCount"_ns, "3"_ns}};
+  raw.messageSize = Some(uint32_t(0));
+  raw.storeToken = Some(nsCString());
+  raw.offlineMessageSize = Some(uint32_t(0xffffffff));
+  raw.lineCount = Some(uint32_t(0));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, true, &key));
+  uint64_t size;
+  uint32_t lines;
+  nsCString text;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageSize(key, size));
+  EXPECT_EQ(0u, size);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageStoreToken(key, text));
+  EXPECT_TRUE(text.IsEmpty());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageOfflineMessageSize(key, size));
+  EXPECT_EQ(uint64_t(0xffffffff), size);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageLineCount(key, lines));
+  EXPECT_EQ(0u, lines);
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          reader, key,
+          "SELECT count(*) FROM message_properties WHERE id = :id AND name IN "
+          "('messageSize','storeToken','offlineMessageSize','lineCount')"_ns,
+          text));
+  EXPECT_EQ("4"_ns, text);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativeReceivedDateUsesLegacySecondsText) {
+  ASSERT_EQ(NS_OK, Start());
+  const struct {
+    PRTime received;
+    const char* text;
+    uint32_t number;
+    bool present;
+  } cases[] = {{0, "", 0, false},
+               {999999, "0", 0, true},
+               {483000000, "1e3", 483, true},
+               {-1000000, "ffffffff", 0xffffffff, true},
+               {-999999, "0", 0, true},
+               {4294967297000000LL, "1", 1, true}};
+  for (const auto& test : cases) {
+    SCOPED_TRACE(test.received);
+    RawHdr raw;
+    raw.dateReceived = test.received;
+    nsMsgKey key;
+    Message* live = nullptr;
+    nsresult rv =
+        mCore->MessageDB().AddMessage(mFolderId, raw, true, &key, &live);
+    EXPECT_EQ(NS_OK, rv);
+    if (NS_FAILED(rv)) {
+      continue;
+    }
+    RefPtr<Message> owned = dont_AddRef(live);
+    nsCString text;
+    EXPECT_EQ(NS_OK, live->GetStringProperty("dateReceived", text));
+    EXPECT_STREQ(test.text, text.get());
+    uint32_t number = 99;
+    EXPECT_EQ(NS_OK, live->GetUint32Property("dateReceived", &number));
+    EXPECT_EQ(test.number, number);
+    nsTArray<nsCString> names;
+    EXPECT_EQ(NS_OK, mCore->MessageDB().GetMessagePropertyNames(key, names));
+    EXPECT_EQ(test.present, names.Contains("dateReceived"_ns));
+  }
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativePropertyFailureLeavesOutputsAndControlIntact) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("control@invalid"_ns, {"kept@invalid"_ns}, control));
+  RefPtr<Message> sentinel = new Message(control);
+  Message* live = sentinel.get();
+  nsMsgKey key = 0x76543210;
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("publication_fault"_ns, 1, witness));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_publication BEFORE INSERT ON "
+          "message_properties "
+          "WHEN NEW.name = 'late' BEGIN SELECT publication_fault(NEW.id); "
+          "SELECT RAISE(ABORT, 'publication property fault'); END"_ns));
+  uint32_t notifications = 0;
+  RefPtr<AddedObserver> observer =
+      new AddedObserver([&](Message*) { ++notifications; });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto cleanup = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  RawHdr raw;
+  raw.messageId = "failed@invalid"_ns;
+  raw.references = {"missing@invalid"_ns, "missing@invalid"_ns};
+  raw.extras = {{"early"_ns, "00042"_ns}, {"late"_ns, "1e3"_ns}};
+  raw.storeToken = Some(nsCString("finished-bytes"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            mCore->MessageDB().AddMessage(mFolderId, raw, true, &key, &live));
+  EXPECT_EQ(1u, witness->mCalls);
+  ASSERT_GT(witness->mLastKey, 0);
+  ASSERT_LT(uint64_t(witness->mLastKey), uint64_t(nsMsgKey_None));
+  EXPECT_EQ(nsMsgKey(0x76543210), key);
+  EXPECT_EQ(sentinel.get(), live);
+  EXPECT_EQ(0u, notifications);
+  bool inTransaction = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&inTransaction));
+  EXPECT_FALSE(inTransaction);
+  nsMsgKey failed = static_cast<nsMsgKey>(witness->mLastKey);
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+  for (const auto& sql :
+       {"SELECT count(*) FROM messages WHERE id = :id"_ns,
+        "SELECT count(*) FROM message_properties WHERE id = :id"_ns,
+        "SELECT count(*) FROM message_references WHERE id = :id"_ns,
+        "SELECT count(*) FROM message_reference_sets WHERE id = :id"_ns}) {
+    nsCString text;
+    ASSERT_EQ(NS_OK, PublicationCell(reader, failed, sql, text));
+    EXPECT_EQ("0"_ns, text);
+  }
+  nsCString subject;
+  EXPECT_EQ(NS_ERROR_UNEXPECTED,
+            mCore->MessageDB().GetMessageSubject(failed, subject));
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, Stored(control, stored));
+  EXPECT_EQ((nsTArray<nsCString>{"kept@invalid"_ns}), stored);
+  nsCString text;
+  ASSERT_EQ(NS_OK, PublicationCell(
+                       reader, control,
+                       "SELECT subject FROM messages WHERE id = :id"_ns, text));
+  EXPECT_EQ("subject"_ns, text);
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER fail_publication"_ns));
+  live = nullptr;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolderId, raw, true, &key, &live));
+  RefPtr<Message> owned = dont_AddRef(live);
+  EXPECT_EQ(1u, notifications);
+  ASSERT_EQ(NS_OK, live->GetStoreToken(text));
+  EXPECT_EQ("finished-bytes"_ns, text);
+  ASSERT_EQ(NS_OK, PublicationCell(
+                       reader, control,
+                       "SELECT subject FROM messages WHERE id = :id"_ns, text));
+  EXPECT_EQ("subject"_ns, text);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativePublicationRejectsForeignTransactionAndNullKey) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.subject = "must not be inserted"_ns;
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("foreign-control@invalid"_ns, {}, control));
+  RefPtr<Message> sentinel = new Message(99);
+  Message* live = sentinel.get();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, mCore->MessageDB().AddMessage(
+                                      mFolderId, raw, true, nullptr, &live));
+  EXPECT_EQ(sentinel.get(), live);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, mConnection->RollbackTransaction()); });
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(control, "foreign"_ns,
+                                                         "kept"_ns));
+  nsMsgKey key = 0x12345678;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            mCore->MessageDB().AddMessage(mFolderId, raw, true, &key, &live));
+  EXPECT_EQ(nsMsgKey(0x12345678), key);
+  EXPECT_EQ(sentinel.get(), live);
+  bool inTransaction = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&inTransaction));
+  EXPECT_TRUE(inTransaction);
+  nsCString value;
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          mConnection, control,
+          "SELECT value FROM message_properties WHERE id = :id AND name = 'foreign'"_ns,
+          value));
+  EXPECT_EQ("kept"_ns, value);
+}
+
+TEST_F(DISABLED_DeliveryCoreReferences,
+       NativeBorrowedInputSupportsReentrantReuse) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.messageId = "reused@invalid"_ns;
+  raw.references = {"unresolved@invalid"_ns, "unresolved@invalid"_ns};
+  raw.extras = {{"custom"_ns, "00042"_ns}};
+  nsMsgKey outer = nsMsgKey_None, inner = nsMsgKey_None;
+  uint32_t notifications = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message* message, bool notifyLegacy) {
+        ++notifications;
+        nsMsgKey key;
+        ASSERT_EQ(NS_OK, message->GetMessageKey(&key));
+        if (notifications == 1) {
+          EXPECT_TRUE(notifyLegacy);
+          EXPECT_EQ(outer, key);
+          ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, false,
+                                                         &inner));
+        } else {
+          EXPECT_FALSE(notifyLegacy);
+          EXPECT_EQ(inner, key);
+        }
+      });
+  mCore->MessageDB().AddMessageListener(observer);
+  auto cleanup = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, true, &outer));
+  EXPECT_EQ(2u, notifications);
+  EXPECT_NE(outer, inner);
+  EXPECT_EQ(
+      (nsTArray<nsCString>{"unresolved@invalid"_ns, "unresolved@invalid"_ns}),
+      raw.references);
+  ASSERT_EQ(1u, raw.extras.Length());
+  EXPECT_EQ("custom"_ns, raw.extras[0].k);
+  EXPECT_EQ("00042"_ns, raw.extras[0].v);
+  for (nsMsgKey key : {outer, inner}) {
+    nsTArray<nsCString> stored;
+    ASSERT_EQ(NS_OK, Stored(key, stored));
+    EXPECT_EQ(
+        (nsTArray<nsCString>{"unresolved@invalid"_ns, "unresolved@invalid"_ns}),
+        stored);
+  }
 }
 
 }  // namespace

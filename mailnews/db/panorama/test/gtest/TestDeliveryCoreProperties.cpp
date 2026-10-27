@@ -625,6 +625,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidValuesAndViewsSurviveCoreReopen) {
     nsCOMPtr<nsIMsgDBHdr> header;
     ASSERT_EQ(NS_OK,
               mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+    uid = 99;
     ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
     EXPECT_EQ(item.uid, uid);
     nsCString text;
@@ -642,6 +643,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidValuesAndViewsSurviveCoreReopen) {
     nsCOMPtr<nsIMsgDBHdr> header;
     ASSERT_EQ(NS_OK,
               mCore->MessageDB().GetMessage(keys[i], getter_AddRefs(header)));
+    uid = 99;
     ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
     EXPECT_EQ(cases[i].uid, uid);
     nsCString text;
@@ -666,8 +668,9 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidTextPresenceAndNamesStayExact) {
   ASSERT_EQ(NS_OK, header->GetProperties(names));
   EXPECT_FALSE(names.Contains("uidOnServer"_ns));
 
-  ASSERT_EQ(NS_OK, header->SetStringProperty("UidOnServer", "upper"_ns));
-  ASSERT_EQ(NS_OK, header->SetStringProperty("uidonserver", "lower"_ns));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("UidOnServer", "a1"_ns));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("uidonserver", "b2"_ns));
+  uid = 99;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
   EXPECT_EQ(0u, uid);
   ASSERT_EQ(NS_OK, header->GetProperties(names));
@@ -699,6 +702,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidTextPresenceAndNamesStayExact) {
     uid = 99;
     ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
     EXPECT_EQ(item.uid, uid);
+    uid = 99;
     ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
     EXPECT_EQ(item.uid, uid);
     nsCString text;
@@ -709,9 +713,9 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidTextPresenceAndNamesStayExact) {
   }
   ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(key, 42));
   ASSERT_NO_FATAL_FAILURE(
-      CheckStored("message_properties"_ns, key, "UidOnServer"_ns, "upper"_ns));
+      CheckStored("message_properties"_ns, key, "UidOnServer"_ns, "a1"_ns));
   ASSERT_NO_FATAL_FAILURE(
-      CheckStored("message_properties"_ns, key, "uidonserver"_ns, "lower"_ns));
+      CheckStored("message_properties"_ns, key, "uidonserver"_ns, "b2"_ns));
 }
 
 TEST_F(DISABLED_DeliveryCoreProperties, UidIsIndependentOfGlobalAndFolderKeys) {
@@ -938,6 +942,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidWriteFailurePreservesOldRows) {
   EXPECT_EQ(UINT32_MAX, uid);
   nsCOMPtr<nsIMsgDBHdr> header;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+  uid = 99;
   ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
   EXPECT_EQ(UINT32_MAX, uid);
   nsCString text;

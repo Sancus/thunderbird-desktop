@@ -36,6 +36,7 @@
 #include "nsIMsgFolderNotificationService.h"
 #include "mozilla/Components.h"
 #include "mozilla/Preferences.h"
+#include "mozilla/ScopeExit.h"
 #include "nsIInputStream.h"
 #include "nsIURIMutator.h"
 
@@ -248,24 +249,63 @@ nsresult nsMsgNewsFolder::GetDatabase() {
         do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    // Get the database, blowing it away if it's out of date.
-    rv = msgDBService->OpenFolderDB(this, false, getter_AddRefs(mDatabase));
-    if (NS_FAILED(rv))
-      rv = msgDBService->CreateNewDB(this, getter_AddRefs(mDatabase));
+    nsCOMPtr<nsIMsgDatabase> database;
+    rv = msgDBService->OpenFolderDB(this, false, getter_AddRefs(database));
+    if (NS_FAILED(rv) && !mDatabase) {
+      rv = msgDBService->CreateNewDB(this, getter_AddRefs(database));
+    }
     NS_ENSURE_SUCCESS(rv, rv);
 
-    if (mAddListener) rv = mDatabase->AddListener(this);
+    nsCOMPtr<nsINewsDatabase> db = do_QueryInterface(database, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsMsgKeySet* previousSet = nullptr;
+    rv = db->GetReadSet(&previousSet);
+    NS_ENSURE_SUCCESS(rv, rv);
+    RefPtr<nsMsgKeySet> readSet = mReadSet;
+    NS_ENSURE_TRUE(!mDatabase, NS_ERROR_IN_PROGRESS);
 
-    nsCOMPtr<nsINewsDatabase> db = do_QueryInterface(mDatabase, &rv);
-    if (NS_FAILED(rv)) return rv;
-
-    rv = db->SetReadSet(mReadSet);
-    if (NS_FAILED(rv)) return rv;
+    // Summary updates re-enter through GetDBFolderInfoAndDB.
+    mDatabase = database;
+    bool listenerAdded = false;
+    bool readSetAttempted = false;
+    auto cleanup = mozilla::MakeScopeExit([&] {
+      if (listenerAdded) {
+        nsresult cleanupRv = database->RemoveListener(this);
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
+                             "Failed to detach news database listener");
+      }
+      if (readSetAttempted) {
+        nsMsgKeySet* currentSet = nullptr;
+        nsresult cleanupRv = db->GetReadSet(&currentSet);
+        if (NS_SUCCEEDED(cleanupRv) && currentSet == readSet.get() &&
+            currentSet != previousSet) {
+          cleanupRv = db->SetReadSet(nullptr);
+        }
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
+                             "Failed to clear news database read set");
+      }
+      if (mDatabase == database) {
+        mDatabase = nullptr;
+      }
+    });
+    if (mAddListener) {
+      rv = database->AddListener(this);
+      NS_ENSURE_SUCCESS(rv, rv);
+      listenerAdded = true;
+      NS_ENSURE_TRUE(mDatabase == database, NS_ERROR_IN_PROGRESS);
+    }
+    readSetAttempted = true;
+    rv = db->SetReadSet(readSet);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(mDatabase == database, NS_ERROR_IN_PROGRESS);
 
     rv = UpdateSummaryTotals(true);
-    if (NS_FAILED(rv)) return rv;
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(mDatabase == database, NS_ERROR_IN_PROGRESS);
+    cleanup.release();
   }
-  return NS_OK;
+  nsCOMPtr<nsINewsDatabase> db = do_QueryInterface(mDatabase, &rv);
+  return rv;
 }
 
 NS_IMETHODIMP

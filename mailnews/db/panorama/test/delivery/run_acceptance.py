@@ -39,6 +39,20 @@ def _legacy_view_tasks(case):
     return True
 
 
+def _news_init_case(case):
+    if case["id"] not in ("news:panorama:mbox:DatabaseInit", "news:panorama:maildir:DatabaseInit"):
+        return False
+    if (case["backend"] != "panorama" or case["store"] not in CONTRACTS
+        or case["id"] != "news:panorama:" + case["store"] + ":DatabaseInit"
+        or case["manifest"] != "mailnews/news/test/unit/xpcshell-panorama-delivery-panorama-" + case["store"] + ".toml"
+        or case["file"] != "test_panoramaDeliveryNewsDatabaseInit.js"
+        or (case["fixture"], case["diagnostics"]) != ("preconfigured-store", "folder")
+        or case.get("tasks") != ["test_retriesRejectedNewsDatabase"] or case.get("setups") != []
+        or any(k in case for k in ("task", "anonymous_setup", "phase", "folder_roles", "folder_parent_uris"))):
+        raise ValueError("news database init requires its exact root-store task without group roles or completion phase")
+    return True
+
+
 def _expected_folder_parents(case):
     if "folder_parent_uris" not in case:
         return None
@@ -65,7 +79,9 @@ def check_log(log, case, returncode=0, raw_logs=()):
     setup_events, setup_assertions, setup_backends = [], 0, 0
     is_format = case["diagnostics"] == "format-reader"
     first_failure, folder_evidence = None, {}
+    news_init = False
     try:
+        news_init = _news_init_case(case)
         expected_parents = _expected_folder_parents(case)
         task_names = r"[A-Za-z_$][\w$]*" if _legacy_view_tasks(case) else r"test_\w+"
         raw = Path(log).read_text(encoding="utf-8")
@@ -171,6 +187,8 @@ def check_log(log, case, returncode=0, raw_logs=()):
                     modes.append(data)
                 elif kind == "DELIVERY_PHASE":
                     phases.append(data.get("phase"))
+        if news_init and phases != ["news-database-init-factory", "news-database-init-qi-failure"]:
+            errors.append("require ordered news factory and QI attempt-entry phases")
         if case.get("requires_non_debug"):
             if len(raw_logs) != 2:
                 errors.append("non-DEBUG control requires both raw output streams")
@@ -246,12 +264,16 @@ def check_log(log, case, returncode=0, raw_logs=()):
         errors.append("contract approval is pending")
     return {"ok": not errors, "errors": errors,
             "factory_blocked": any(p + "-factory" in phases and p + "-ready" not in phases
-                                   for p in ("imap", "news")),
+                                   for p in ("imap", "news")) or (news_init and "news-database-init-qi-failure" not in phases),
             "coverage": case["diagnostics"] if not errors else "none",
             "assertion_count": assertions,
             "first_failure": first_failure, "last_phase": phases[-1] if phases else None,
             "folder_evidence": folder_evidence,
-            "completed_phase": case.get("phase") if not errors else None}
+            "completed_phase": case.get("phase") if not errors else None,
+            **({"news_database_init_boundary": (
+                "completed-qi-control" if not errors else "qi-attempt-entered"
+                if "news-database-init-qi-failure" in phases else "setup-or-fault-precondition")}
+               if news_init else {})}
 
 
 def prepare(config, case):
@@ -259,6 +281,7 @@ def prepare(config, case):
     source = Path(config["source"])
     comm = source / "comm"
     legacy_view = _legacy_view_tasks(case)
+    _news_init_case(case)
     manifest = (comm / case["manifest"]).resolve()
     if not manifest.is_relative_to(comm.resolve()) or Path(case["file"]).name != case["file"]:
         raise ValueError("case paths must remain in source comm/")
@@ -381,8 +404,8 @@ def prepare(config, case):
         }
         modules.update({name: source / "testing/modules" / name
                         for name in ("AppInfo.sys.mjs", "MockRegistrar.sys.mjs")})
-        module_pairs = [(original, Path(config["objdir"]) / "_tests/modules" / name)
-                        for name, original in modules.items()]
+        module_pairs += [(original, Path(config["objdir"]) / "_tests/modules" / name)
+                         for name, original in modules.items()]
         module_pairs.append((comm / "mailnews/test/resources/mailShutdown.js",
                              Path(config["objdir"]) / "_tests/xpcshell/comm/mailnews/resources/mailShutdown.js"))
         paths += [p for pair in module_pairs for p in pair]
@@ -473,6 +496,8 @@ def run_case(config, case, output):
             result = subprocess.run(argv, cwd=source, env=env, stdout=out, stderr=err,
                                     timeout=timeout, check=False)
         record.update(check_log(raw, case, result.returncode, (stdout, stderr)))
+        if "news_database_init_boundary" in record:
+            record["exit_code"] = result.returncode
         record.update(observed="PASS" if record["ok"] else "FAIL",
                       disposition="passed" if record["ok"] else "failed", exit_code=result.returncode,
                       hashes_before=before, hashes_after=digest(paths))
@@ -484,12 +509,15 @@ def run_case(config, case, output):
             record["completed_phase"] = None
             record["errors"].append("source/build inputs changed during execution")
     except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
-        record.update(ok=False, errors=[str(error)], coverage="none", completed_phase=None,
+        errors = record.get("errors", []) if "news_database_init_boundary" in record else []
+        record.update(ok=False, errors=errors + [str(error)], coverage="none", completed_phase=None,
                       disposition="failed" if isinstance(error, subprocess.TimeoutExpired) else "blocked")
         if str(error).startswith("blocked-dependency:"):
             record["observed"] = str(error)
         if isinstance(error, subprocess.TimeoutExpired):
             record["observed"] = "TIMEOUT"
+    if not record["ok"] and record.get("news_database_init_boundary") == "completed-qi-control":
+        record["news_database_init_boundary"] = "qi-attempt-entered"
     record["finished_utc"] = datetime.now(timezone.utc).isoformat()
     (output / "result.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     return record

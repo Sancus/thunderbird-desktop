@@ -695,7 +695,7 @@ support-files = ["fixture.sql"]
         comm = runner.HERE.parents[4]
         cases = [c for c in catalog if c.get("task")]
         self.assertEqual(len(cases), 43)
-        self.assertEqual(len({c["id"] for c in catalog}), 179)
+        self.assertEqual(len({c["id"] for c in catalog}), 181)
         for case in cases:
             manifest = comm / case["manifest"]
             doc = runner.tomllib.loads(manifest.read_text())
@@ -987,8 +987,8 @@ support-files = ["fixture.sql"]
                  "FolderInitParentConflict": (["test_rejectsCachedChildWithConflictingParent",
                                               "test_recursiveConflictPreservesCachedSubtree"], ["setupFolders"])}
         rows = [c for c in catalog if c["file"].startswith("test_deliveryCompatibilityFolderInit")]
-        self.assertEqual(len(catalog), 179)
-        self.assertEqual(len({c["id"] for c in catalog}), 179)
+        self.assertEqual(len(catalog), 181)
+        self.assertEqual(len({c["id"] for c in catalog}), 181)
         self.assertEqual(len(rows), 8)
         for store in ("mbox", "maildir"):
             lane = [c for c in rows if c["store"] == store]
@@ -1104,8 +1104,8 @@ support-files = ["fixture.sql"]
 
     def test_new_raw_catalog_and_view_lanes_are_exact_manual_cases(self):
         catalog = json.loads((runner.HERE / "cases.json").read_text())
-        self.assertEqual(len(catalog), 179)
-        self.assertEqual(len({c["id"] for c in catalog}), 179)
+        self.assertEqual(len(catalog), 181)
+        self.assertEqual(len({c["id"] for c in catalog}), 181)
         expected = {
             "core:Publication": ["test_publishCommittedMessageOnce",
                 "test_folderFilteredEventsUseDatabaseIdentity", "test_tagThenReadPublishesEachMessageOnce",
@@ -1807,6 +1807,243 @@ support-files = ["fixture.sql"]
         self.assertIn('["test_liveViewDataAdapter.js"]',
                       (manifest.parent / "xpcshell.toml").read_text())
         self.assertNotIn(manifest.name, (manifest.parent.parent / "moz.build").read_text())
+
+
+    def news_init_case(self, store="mbox"):
+        catalog = json.loads((runner.HERE / "cases.json").read_text())
+        return next(c for c in catalog if c["id"] == f"news:panorama:{store}:DatabaseInit")
+
+    def news_init_events(self, case):
+        file = case["file"]
+        task = case["tasks"][0]
+        folder = {**self.folder, "folderURI": "news://news-database-init.invalid",
+                  "expectedStore": case["store"], "actualStore": case["store"],
+                  "contractBefore": "@mozilla.org/msgstore/" + runner.CONTRACTS[case["store"]] + ";1"}
+        return [
+            {"action": "suite_start", "tests": {"manual": [file]}},
+            {"action": "test_start", "test": file},
+            {"action": "log", "message": f"(xpcshell/head.js) | test {task} pending (1)"},
+            self.diag("BACKEND", {"expected": "panorama", "actualBackend": "panorama"}),
+            self.diag("PHASE", {"phase": "news-database-init-factory"}),
+            self.diag("STORE_CONTRACT", folder), self.diag("FOLDER", folder),
+            {"action": "test_status", "test": file, "status": "PASS",
+             "subtest": "The held database supplies the concrete QI failure"},
+            self.diag("PHASE", {"phase": "news-database-init-qi-failure"}),
+            *({"action": "test_status", "test": file, "status": "PASS",
+               "subtest": f"Lookup {n} reports the original unsupported interface"} for n in (1, 2)),
+            {"action": "log", "message": f"(xpcshell/head.js) | test {task} finished (1)"},
+            {"action": "test_end", "test": file, "status": "PASS"}, {"action": "suite_end"},
+        ]
+
+    def test_news_init_separates_setup_failure_from_completed_control(self):
+        for store in ("mbox", "maildir"):
+            case = self.news_init_case(store)
+            events = self.news_init_events(case)
+            complete = self.check(events, case)
+            self.assertTrue(complete["ok"], complete)
+            self.assertEqual(complete["news_database_init_boundary"], "completed-qi-control")
+            self.assertEqual(complete["folder_evidence"], {})
+            self.assertIsNone(complete["completed_phase"])
+            for stop in (4, 5, 8, 9):
+                failure = {"action": "test_status", "test": case["file"], "status": "FAIL",
+                           "message": "unreached setup or lookup control"}
+                failed = self.check(events[:stop] + [failure] + events[-2:], case)
+                self.assertFalse(failed["ok"])
+                self.assertEqual(failed["coverage"], "none")
+                self.assertEqual(failed["first_failure"], failure)
+                entered = stop == 9
+                self.assertEqual(failed["factory_blocked"], not entered)
+                self.assertEqual(failed["news_database_init_boundary"],
+                                 "qi-attempt-entered" if entered else "setup-or-fault-precondition")
+            for index in (2, 3, 4, 5, 6, 8, 11, 12, 13):
+                self.assertFalse(self.check(events[:index] + events[index + 1:], case)["ok"])
+            reversed_phases = copy.deepcopy(events)
+            reversed_phases[4], reversed_phases[8] = reversed_phases[8], reversed_phases[4]
+            self.assertFalse(self.check(reversed_phases, case)["ok"])
+            for changes in ({"backend": "mork"}, {"store": "none"},
+                            {"folder_roles": {"group": "test.database-init"}},
+                            {"phase": "news-database-init-verified"}):
+                self.assertFalse(self.check(events, {**case, **changes})["ok"])
+            self.assertFalse(self.check(events, case, returncode=1)["ok"])
+
+    def test_news_init_preflight_binds_real_source_modules_and_manual_selection(self):
+        import shutil
+        config, _ = self.initializer_fixture()
+        comm = runner.HERE.parents[4]
+        target = Path(config["source"]) / "comm"
+        for store in ("mbox", "maildir"):
+            case = self.news_init_case(store)
+            self.assertEqual(case["tasks"], ["test_retriesRejectedNewsDatabase"])
+            self.assertEqual(case["setups"], [])
+            self.assertEqual(case["readiness"], "pending-product")
+            for field in ("task", "anonymous_setup", "folder_roles", "folder_parent_uris", "phase"):
+                self.assertNotIn(field, case)
+            required = {"mailnews/news/src/nsNewsFolder.cpp",
+                        "mailnews/db/msgdb/public/nsIMsgDatabase.idl",
+                        "mailnews/db/msgdb/public/nsINewsDatabase.idl",
+                        "mailnews/db/msgdb/src/nsNewsDatabase.cpp",
+                        "mailnews/db/panorama/src/PerFolderDatabase.cpp",
+                        "mailnews/base/src/nsMsgAccountManager.cpp",
+                        "mailnews/news/src/components.conf"}
+            self.assertTrue(required <= set(case["source_dependencies"]))
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [(manifest.parent / n).resolve() for n in doc["DEFAULT"]["head"].split()]
+            paths += [comm / n for n in case["source_dependencies"]]
+            for original in paths:
+                destination = target / original.relative_to(comm)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, destination)
+            for name in ("MessageGenerator.sys.mjs", "PromiseTestUtils.sys.mjs"):
+                original = comm / "mailnews/test/resources" / name
+                shutil.copyfile(original, target / original.relative_to(comm))
+                shutil.copyfile(original, Path(config["objdir"]) / "_tests/modules/mailnews" / name)
+            _, bound = runner.prepare(config, case)
+            self.assertTrue({target / n for n in case["source_dependencies"]} <= set(bound))
+            for module in ("Nntpd.sys.mjs", "MessageGenerator.sys.mjs", "PromiseTestUtils.sys.mjs"):
+                installed = Path(config["objdir"]) / "_tests/modules/mailnews" / module
+                saved = installed.read_bytes()
+                installed.write_bytes(b"stale installed fixture")
+                with self.assertRaisesRegex(ValueError, "blocked-dependency"):
+                    runner.prepare(config, case)
+                installed.write_bytes(saved)
+            selected = (target / case["manifest"]).with_name(case["file"])
+            text = selected.read_text()
+            for altered in ("", text.replace("test_retriesRejectedNewsDatabase", "test_wrong"),
+                            text + "\nadd_task(function test_extra() {});"):
+                selected.write_text(altered)
+                with self.assertRaisesRegex(ValueError, "named tasks/setup"):
+                    runner.prepare(config, case)
+            selected.write_text(text)
+            missing = target / "mailnews/news/src/nsNewsFolder.cpp"
+            saved = missing.read_bytes()
+            missing.unlink()
+            output = self.root / ("missing-news-source-" + store)
+            output.mkdir()
+            with patch.object(runner.subprocess, "run") as launch:
+                result = runner.run_case(config, case, output)
+            launch.assert_not_called()
+            self.assertEqual((result["exit_code"], result["disposition"], result["coverage"]),
+                             (None, "blocked", "none"))
+            missing.write_bytes(saved)
+            normal = (comm / "mailnews/news/test/unit/xpcshell.toml").read_text()
+            self.assertNotIn(case["file"], normal)
+            self.assertNotIn(manifest.name, (comm / "mailnews/news/test/moz.build").read_text())
+
+
+    def test_news_init_attempt_markers_cannot_replace_task_or_factory_evidence(self):
+        case = self.news_init_case()
+        events = self.news_init_events(case)
+        for phase in ("news-database-init-factory", "news-database-init-qi-failure"):
+            missing = [e for e in events if phase not in e.get("message", "")]
+            self.assertFalse(self.check(missing, case)["ok"])
+        no_task_end = [e for e in events if "finished" not in e.get("message", "")]
+        self.assertFalse(self.check(no_task_end, case)["ok"])
+
+
+    def news_init_run_fixture(self):
+        import shutil
+        config, _ = self.initializer_fixture()
+        comm = runner.HERE.parents[4]
+        target = Path(config["source"]) / "comm"
+        cases = [self.news_init_case(store) for store in ("mbox", "maildir")]
+        for case in cases:
+            manifest = comm / case["manifest"]
+            doc = runner.tomllib.loads(manifest.read_text())
+            paths = [manifest] + [manifest.parent / n for n in doc if n != "DEFAULT"]
+            paths += [(manifest.parent / n).resolve() for n in doc["DEFAULT"]["head"].split()]
+            paths += [comm / n for n in case["source_dependencies"]]
+            for original in paths:
+                destination = target / original.relative_to(comm)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, destination)
+        for name in ("MessageGenerator.sys.mjs", "PromiseTestUtils.sys.mjs"):
+            original = comm / "mailnews/test/resources" / name
+            shutil.copyfile(original, target / original.relative_to(comm))
+            shutil.copyfile(original, Path(config["objdir"]) / "_tests/modules/mailnews" / name)
+        return config, cases, target / "mailnews/news/src/nsNewsFolder.cpp"
+
+    def test_news_init_final_inputs_control_completion_boundary(self):
+        config, cases, pinned = self.news_init_run_fixture()
+        original = pinned.read_bytes()
+        for case in cases:
+            for change in ("unchanged", "mutated", "missing", "directory"):
+                with self.subTest(case=case["id"], change=change):
+                    events = self.news_init_events(case)
+                    output = self.root / (case["store"] + "-" + change)
+                    output.mkdir()
+
+                    def execute(argv, **kwargs):
+                        Path(argv[argv.index("--log-raw") + 1]).write_text(
+                            "".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+                        if change == "mutated":
+                            pinned.write_bytes(original + b"\n// changed input\n")
+                        elif change in ("missing", "directory"):
+                            pinned.unlink()
+                            if change == "directory":
+                                pinned.mkdir()
+                        return SimpleNamespace(returncode=0)
+
+                    try:
+                        with patch.object(runner.subprocess, "run", execute):
+                            result = runner.run_case(config, case, output)
+                        self.assertEqual(result, json.loads((output / "result.json").read_text()))
+                        self.assertEqual(result["last_phase"], "news-database-init-qi-failure")
+                        self.assertIsNone(result["first_failure"])
+                        self.assertIsNone(result["completed_phase"])
+                        if change == "unchanged":
+                            self.assertTrue(result["ok"], result)
+                            self.assertEqual(result["news_database_init_boundary"], "completed-qi-control")
+                            self.assertEqual(result["coverage"], "folder")
+                            self.assertEqual(result["hashes_before"], result["hashes_after"])
+                        else:
+                            self.assertFalse(result["ok"])
+                            self.assertEqual(result["coverage"], "none")
+                            self.assertEqual(result["news_database_init_boundary"], "qi-attempt-entered")
+                            self.assertEqual(result["disposition"], "failed" if change == "mutated" else "blocked")
+                            self.assertTrue(result["errors"])
+                            if change == "mutated":
+                                self.assertIn("source/build inputs changed during execution", result["errors"])
+                            else:
+                                self.assertIn(pinned.name, " ".join(result["errors"]))
+                        self.assertEqual(result["exit_code"], 0)
+                    finally:
+                        if pinned.is_dir():
+                            pinned.rmdir()
+                        pinned.write_bytes(original)
+
+    def test_news_init_final_input_error_preserves_prior_failure(self):
+        config, cases, pinned = self.news_init_run_fixture()
+        original = pinned.read_bytes()
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                events = self.news_init_events(case)
+                failure = {**events[9], "status": "FAIL", "message": "original QI error was not reported"}
+                events[9] = failure
+                output = self.root / (case["store"] + "-prior-failure")
+                output.mkdir()
+
+                def execute(argv, **kwargs):
+                    Path(argv[argv.index("--log-raw") + 1]).write_text(
+                        "".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+                    pinned.unlink()
+                    return SimpleNamespace(returncode=7)
+
+                try:
+                    with patch.object(runner.subprocess, "run", execute):
+                        result = runner.run_case(config, case, output)
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["coverage"], "none")
+                    self.assertEqual(result["news_database_init_boundary"], "qi-attempt-entered")
+                    self.assertEqual(result["first_failure"], failure)
+                    self.assertEqual(result["last_phase"], "news-database-init-qi-failure")
+                    self.assertIn("process exit: 7", result["errors"])
+                    self.assertIn("non-passing test_status: FAIL", result["errors"])
+                    self.assertIn(pinned.name, " ".join(result["errors"]))
+                    self.assertEqual(result["exit_code"], 7)
+                finally:
+                    pinned.write_bytes(original)
 
 
 if __name__ == "__main__":

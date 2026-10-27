@@ -240,7 +240,7 @@ Native gtest build/qualification proceeds independently.
 
 ## Raw database task groups and physical view identity
 
-The manual catalog has 179 JS rows; NumericProperties remains pending-contract.
+The manual catalog has 181 JS rows; NumericProperties remains pending-contract.
 Publication declares all nine tasks with the accepted snapshot031 source;
 ConversationIngestion retains all four.
 These panorama:none files each require one literal anonymous setup, assertions
@@ -330,3 +330,27 @@ unknown listeners, producer generation, public native emission, graph mutation,
 native UI and full-view qualification remain held. Genuine missing-witness,
 wrong-lane/backend and consumer negative controls plus source restoration remain
 NOTRUN; source registration and synthetic logs are not qualification.
+
+## News database initialization control
+
+The two NewsDatabaseInit manual rows select Panorama mbox/maildir with one
+literal task and no add_setup. Account/factory construction and the real
+unsupported nsINewsDatabase QI precondition run inside that task. Preflight binds
+the exact task, both store preferences, direct sources and matching installed
+news fixture/shutdown modules. It also retains the named-task module comparisons.
+
+The factory and QI phases are ordered attempt markers, not verified completion.
+A failure before QI entry is classified setup-or-fault-precondition; later failure
+records qi-attempt-entered. Both retain the first failure with zero coverage.
+Only full task/assertion/file/process completion records completed-qi-control.
+Root must inspect both original-error lookups, cold-cache/identity/count checks,
+foreign-listener retention and the direct observer positive control in raw logs.
+
+Store diagnostics describe the real server root only. No group folder role,
+body-store round trip, readSet ownership or terminal verified phase is claimed.
+The rows remain pending-product. Matching generated interfaces/build/modules,
+fresh process/profile/shutdown, restored false-success/leaked-listener negative
+controls and legacy news regressions are NOTRUN. Native readSet/cleanup faults,
+ordinary Mork reopen/recursion, listener freshness/ABA and full article mapping
+remain held. The source692 two-path change and this registration must land
+atomically; metadata alone is not a runnable acceptance target.

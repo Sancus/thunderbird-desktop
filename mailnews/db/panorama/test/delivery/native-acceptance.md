@@ -3,11 +3,11 @@
 TestDeliveryCoreReferences.cpp (41 cases), TestDeliveryFolderInfoProperties.cpp
 (26), TestDeliveryMessageReferences.cpp (19 References, 10 HeaderProperties,
 6 DetachedThreadIdentity and 7 CompleteHeader), TestDeliveryCoreMessageExistence.cpp
-(24) and TestDeliveryCoreProperties.cpp (11) are linked to xul-gtest. The real
-quarantine wrapper control in TestQuarantinedOutputStream.cpp adds one case. All 145 filters
+(24) and TestDeliveryCoreProperties.cpp (18) are registered for xul-gtest. The real
+quarantine wrapper control in TestQuarantinedOutputStream.cpp adds one case. All 152 filters
 retain DISABLED_ suites and pending-product status; no normal-CI
 execution is added. EWS and search/browser registration remain separate slices.
-The 144 Panorama cases select the concrete core and check panorama.sqlite identity.
+The 151 Panorama cases select the concrete core and check panorama.sqlite identity.
 The quarantine control exercises real wrapper/temp-file I/O and an inner Finish
 failure; it claims no database, backend or body-store coverage. The catalog store
 none is not physical-store evidence. No application-restart coverage is claimed.
@@ -297,3 +297,36 @@ NOTRUN. Preserve the source review limits: C-string NUL/missing-versus-empty,
 XPConnect, OOM/prepare/bind, configured SQLite and cold-reopen retention/leak or
 partial-reopen failure cascade remain unqualified. Full news/readSet/article
 mapping and GetDatabase QI remain HELD; no news011, graph or emission is admitted.
+
+## Server UID storage controls
+
+Seven additional CoreProperties filters bring the manual catalog to152 cases in
+nine suites;181 JS rows and NumericProperties pending-contract are unchanged.
+All seven UID controls and exact source041/042 must land atomically with this
+registration. The existing test file is already in xul-gtest UNIFIED_SOURCES.
+Source-only or registration-only inventory fails; no normal-CI execution is added.
+
+The primitive delegates exact case-sensitive uidOnServer TEXT to the existing
+public uint32 header view: lowerhex writes and at most eight hex-prefix reads.
+All uint32 values, including0 and UINT32_MAX, are storage values. Absent/empty
+properties read0 without a getter write; missing/deleted messages require
+UNEXPECTED, unchanged output and no orphan setter. Global and folder keys are
+distinct from UID. These controls do not qualify UIDVALIDITY, folder+UID routing,
+legacy import/migration, confirmation, body fetch or protocol validity.
+
+Each filter runs separately with a fresh process/profile and exact disabled-test
+opt-in through the existing Linux executor. Require literal independent stored
+cells/snapshots/control rows and public/native views, checked same-process core
+close/reopen, reached read-step and write-trigger faults, original errors,
+sentinels and restoration/retry. Early setup/assertion failure grants no later
+fault/reopen credit. Core Stop/Start is not process restart.
+
+Receipts retain schema/header/IDL/private fixture/build dependencies and add the
+public conversion/types, existing storage caller and direct storage/ownership/
+service API pins. Exact generated SDK, configured SQLite error mapping and fault
+reachability, compiler/link, app/libxul/dependent-library identity, raw shutdown,
+profile/close-barrier and only-owned cleanup proof remain NOTRUN. Require original
+stub, missing-membership guard, conversion/truncation/swallowed-error negatives
+on recorded temporary revisions, followed by exact restored-source reruns.
+No runner process policy changes; manual DISABLED, refcount/leak-unavailable,
+Windows, kernel and external-witness holds remain unchanged.

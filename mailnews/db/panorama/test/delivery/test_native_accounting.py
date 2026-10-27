@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import native_accounting as native
 
@@ -131,7 +132,7 @@ class NativeAccountingTests(unittest.TestCase):
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
         self.assertEqual(catalog["schema"], 2)
-        self.assertEqual(len(catalog["cases"]), 145)
+        self.assertEqual(len(catalog["cases"]), 152)
         for suite, declaration in catalog["suites"].items():
             self.assertTrue(suite.startswith("DISABLED_"))
             source = comm / declaration["source"]
@@ -170,7 +171,7 @@ class NativeAccountingTests(unittest.TestCase):
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]
         self.assertEqual({c["filter"] for c in rows}, {suite + "." + name for name in expected})
         self.assertEqual(len(rows), 19)
-        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 145)
+        self.assertEqual(len({c["id"] for c in native.CATALOG["cases"]}), 152)
         for row in rows:
             large = row["filter"].rsplit(".", 1)[-1] in {
                 "CountOverflowLeavesZero", "NullCountKnownOversizedSucceeds"}
@@ -255,6 +256,13 @@ class NativeAccountingTests(unittest.TestCase):
                 "ReadErrorsAreNotAbsentProperties", "StepErrorsPreserveOutputSentinels",
                 "UpgradePreservesExistingValues", "UpgradeDoesNotDropUnknownIndex",
                 "FailedUpgradeRollsBackAndRetries",
+                "UidValuesAndViewsSurviveCoreReopen",
+                "UidTextPresenceAndNamesStayExact",
+                "UidIsIndependentOfGlobalAndFolderKeys",
+                "UidMissingKeyPreservesOutputAndRows",
+                "UidDeletedWarmHeaderIsNotMembership",
+                "UidReadStepFailurePreservesOutput",
+                "UidWriteFailurePreservesOldRows",
             ],
             "HeaderProperties": [
                 "Uint32SuccessAssignsOnlyUint32", "Uint32MaximumAssignsOnlyUint32",
@@ -536,6 +544,29 @@ class NativeAccountingTests(unittest.TestCase):
                     "mailnews/base/test/moz.build", "mailnews/base/test/gtest/moz.build", "mailnews/moz.build"}
         self.assertTrue(required <= set(declaration["source_dependencies"]))
         self.assertTrue(required <= set(run_native.COMM_INPUTS))
+
+
+    def test_uid_catalog_requires_all_seven_exact_filters_without_substitution(self):
+        suite = "DISABLED_DeliveryCoreProperties"
+        names = [
+            "UidValuesAndViewsSurviveCoreReopen", "UidTextPresenceAndNamesStayExact",
+            "UidIsIndependentOfGlobalAndFolderKeys", "UidMissingKeyPreservesOutputAndRows",
+            "UidDeletedWarmHeaderIsNotMembership", "UidReadStepFailurePreservesOutput",
+            "UidWriteFailurePreservesOldRows",
+        ]
+        rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".Uid")]
+        self.assertEqual([c["filter"] for c in rows], [suite + "." + n for n in names])
+        self.assertEqual([c["id"] for c in rows], ["core:ServerUid:" + n for n in names])
+        self.assertEqual((native.CATALOG["backend"], native.CATALOG["store"],
+                          native.CATALOG["readiness"]), ("panorama", "none", "pending-product"))
+        self.assertTrue(native.CATALOG["execution_hold"])
+        # Keep the total unchanged: strict source equality must reject each omission.
+        for row in rows:
+            changed = copy.deepcopy(native.CATALOG)
+            next(c for c in changed["cases"] if c["id"] == row["id"])["filter"] = suite + ".UnregisteredUid"
+            with self.subTest(missing=row["filter"]), patch.object(native, "CATALOG", changed):
+                with self.assertRaises(AssertionError):
+                    self.test_catalog_suites_match_integrated_disabled_sources_and_receipt_dependencies()
 
 
 if __name__ == "__main__":

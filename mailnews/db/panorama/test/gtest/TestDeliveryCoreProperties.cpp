@@ -20,6 +20,7 @@
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
 #include "nsIInterfaceRequestorUtils.h"
+#include "nsIMsgHdr.h"
 #include "nsIProperties.h"
 #include "nsServiceManagerUtils.h"
 #include "nsThreadUtils.h"
@@ -599,6 +600,351 @@ TEST_F(DISABLED_DeliveryCoreProperties, FailedUpgradeRollsBackAndRetries) {
   ASSERT_EQ(NS_OK, Start());
   ASSERT_NO_FATAL_FAILURE(
       CheckStored("folder_properties"_ns, mFolder, "control"_ns, "exact"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreProperties, UidValuesAndViewsSurviveCoreReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  const struct {
+    uint32_t uid;
+    nsCString text;
+  } cases[] = {{0, "0"_ns},
+               {1, "1"_ns},
+               {42, "2a"_ns},
+               {0x80000000u, "80000000"_ns},
+               {0xfffffffeu, "fffffffe"_ns},
+               {UINT32_MAX, "ffffffff"_ns}};
+  nsTArray<nsMsgKey> keys;
+  for (const auto& item : cases) {
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, Add(key));
+    keys.AppendElement(key);
+    ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(key, item.uid));
+    uint32_t uid = 99;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+    EXPECT_EQ(item.uid, uid);
+    nsCOMPtr<nsIMsgDBHdr> header;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+    ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
+    EXPECT_EQ(item.uid, uid);
+    nsCString text;
+    ASSERT_EQ(NS_OK, header->GetStringProperty("uidOnServer", text));
+    EXPECT_EQ(item.text, text);
+    ASSERT_NO_FATAL_FAILURE(
+        CheckStored("message_properties"_ns, key, "uidOnServer"_ns, item.text));
+  }
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  for (size_t i = 0; i < keys.Length(); ++i) {
+    uint32_t uid = 99;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(keys[i], uid));
+    EXPECT_EQ(cases[i].uid, uid);
+    nsCOMPtr<nsIMsgDBHdr> header;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessage(keys[i], getter_AddRefs(header)));
+    ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
+    EXPECT_EQ(cases[i].uid, uid);
+    nsCString text;
+    ASSERT_EQ(NS_OK, header->GetStringProperty("uidOnServer", text));
+    EXPECT_EQ(cases[i].text, text);
+  }
+}
+
+TEST_F(DISABLED_DeliveryCoreProperties, UidTextPresenceAndNamesStayExact) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+  nsTArray<nsCString> before, after, names;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  uint32_t uid = 99;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(0u, uid);
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  ASSERT_EQ(NS_OK, header->GetProperties(names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+
+  ASSERT_EQ(NS_OK, header->SetStringProperty("UidOnServer", "upper"_ns));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("uidonserver", "lower"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(0u, uid);
+  ASSERT_EQ(NS_OK, header->GetProperties(names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  EXPECT_TRUE(names.Contains("UidOnServer"_ns));
+  EXPECT_TRUE(names.Contains("uidonserver"_ns));
+
+  ASSERT_EQ(NS_OK, header->SetStringProperty("uidOnServer", ""_ns));
+  uid = 99;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(0u, uid);
+  ASSERT_EQ(NS_OK, header->GetProperties(names));
+  EXPECT_TRUE(names.Contains("uidOnServer"_ns));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, key, "uidOnServer"_ns, ""_ns));
+
+  const struct {
+    nsCString text;
+    uint32_t uid;
+  } cases[] = {{"00042"_ns, 66},
+               {"1e3"_ns, 483},
+               {"2ag"_ns, 42},
+               {"xyz"_ns, 0},
+               {"100000000"_ns, 268435456},
+               {"-1"_ns, 0},
+               {"2a \xc3\xa9"_ns, 42}};
+  for (const auto& item : cases) {
+    ASSERT_EQ(NS_OK, header->SetStringProperty("uidOnServer", item.text));
+    uid = 99;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+    EXPECT_EQ(item.uid, uid);
+    ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
+    EXPECT_EQ(item.uid, uid);
+    nsCString text;
+    ASSERT_EQ(NS_OK, header->GetStringProperty("uidOnServer", text));
+    EXPECT_EQ(item.text, text);
+    ASSERT_NO_FATAL_FAILURE(
+        CheckStored("message_properties"_ns, key, "uidOnServer"_ns, item.text));
+  }
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(key, 42));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, key, "UidOnServer"_ns, "upper"_ns));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, key, "uidonserver"_ns, "lower"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreProperties, UidIsIndependentOfGlobalAndFolderKeys) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t root, otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertRoot("uid-other-root"_ns, &root));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(root, "Archive"_ns, &otherFolder));
+  ASSERT_NE(mFolder, otherFolder);
+  nsMsgKey first, second;
+  ASSERT_EQ(NS_OK, Add(first));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(
+                otherFolder, "other-uid@invalid"_ns, {}, 123456, "sender"_ns,
+                "recipient"_ns, EmptyCString(), EmptyCString(), "subject"_ns, 0,
+                EmptyCString(), 0, &second));
+  ASSERT_NE(first, second);
+  ASSERT_NE(0u, first);
+  ASSERT_NE(0u, second);
+  for (nsMsgKey key : {first, second}) {
+    uint32_t uid = 99;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+    EXPECT_EQ(0u, uid);
+    ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(key, 42));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+    EXPECT_EQ(42u, uid);
+  }
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(first, 1));
+  uint32_t uid = 99;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(second, uid));
+  EXPECT_EQ(42u, uid);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, first, "uidOnServer"_ns, "1"_ns));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, second, "uidOnServer"_ns, "2a"_ns));
+
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  auto cleanup = MakeScopeExit([&] {
+    if (stmt) {
+      EXPECT_EQ(NS_OK, stmt->Finalize());
+    }
+    EXPECT_EQ(NS_OK, reader->Close());
+  });
+  ASSERT_EQ(NS_OK, reader->CreateStatement(
+                       "SELECT COUNT(*), "
+                       "SUM(id = :first AND folderId = :firstFolder), "
+                       "SUM(id = :second AND folderId = :secondFolder) "
+                       "FROM messages"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("first"_ns, first));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("firstFolder"_ns, mFolder));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("second"_ns, second));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("secondFolder"_ns, otherFolder));
+  bool more;
+  ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+  ASSERT_TRUE(more);
+  int64_t count, firstMatches, secondMatches;
+  ASSERT_EQ(NS_OK, stmt->GetInt64(0, &count));
+  ASSERT_EQ(NS_OK, stmt->GetInt64(1, &firstMatches));
+  ASSERT_EQ(NS_OK, stmt->GetInt64(2, &secondMatches));
+  EXPECT_EQ(2, count);
+  EXPECT_EQ(1, firstMatches);
+  EXPECT_EQ(1, secondMatches);
+  ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+  EXPECT_FALSE(more);
+}
+
+TEST_F(DISABLED_DeliveryCoreProperties, UidMissingKeyPreservesOutputAndRows) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add(control));
+  nsCOMPtr<nsIMsgDBHdr> controlHeader;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(
+                       control, getter_AddRefs(controlHeader)));
+  ASSERT_EQ(NS_OK, controlHeader->SetUint32Property("uidOnServer", 1));
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(nsMsgKey_None, exists));
+  ASSERT_FALSE(exists);
+  nsTArray<nsCString> before, after;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  uint32_t uid = 0x12345678;
+  EXPECT_EQ(NS_ERROR_UNEXPECTED,
+            mCore->MessageDB().GetMessageUidOnServer(nsMsgKey_None, uid));
+  EXPECT_EQ(0x12345678u, uid);
+  EXPECT_EQ(NS_ERROR_UNEXPECTED,
+            mCore->MessageDB().SetMessageUidOnServer(nsMsgKey_None, 42));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, control, "uidOnServer"_ns, "1"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreProperties, UidDeletedWarmHeaderIsNotMembership) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK, Add(control));
+  {
+    nsCOMPtr<nsIMsgDBHdr> header, controlHeader;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(
+                         control, getter_AddRefs(controlHeader)));
+    ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", 42));
+    ASSERT_EQ(NS_OK, controlHeader->SetUint32Property("uidOnServer", 1));
+  }
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+  nsCString subject;
+  ASSERT_EQ(NS_OK, header->GetSubject(subject));
+  ASSERT_EQ("subject"_ns, subject);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(key));
+  ASSERT_EQ(NS_OK, header->GetSubject(subject));
+  EXPECT_EQ("subject"_ns, subject);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  ASSERT_FALSE(exists);
+  nsTArray<nsCString> before, after;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  uint32_t uid = 0x12345678;
+  EXPECT_EQ(NS_ERROR_UNEXPECTED,
+            mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(0x12345678u, uid);
+  EXPECT_EQ(NS_ERROR_UNEXPECTED,
+            mCore->MessageDB().SetMessageUidOnServer(key, 42));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, control, "uidOnServer"_ns, "1"_ns));
+}
+
+TEST_F(DISABLED_DeliveryCoreProperties, UidReadStepFailurePreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK, Add(control));
+  {
+    nsCOMPtr<nsIMsgDBHdr> header, controlHeader;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(
+                         control, getter_AddRefs(controlHeader)));
+    ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", 42));
+    ASSERT_EQ(NS_OK, controlHeader->SetUint32Property("uidOnServer", 1));
+  }
+  nsTArray<nsCString> before, after;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  // This valid view faults only when a property row's name is evaluated.
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "ALTER TABLE message_properties RENAME TO "
+                       "saved_message_properties;"
+                       "CREATE VIEW message_properties AS SELECT id, "
+                       "CAST(abs(-9223372036854775808) AS TEXT) AS name, value "
+                       "FROM saved_message_properties;"_ns));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  ASSERT_TRUE(exists);
+  {
+    nsCOMPtr<mozIStorageStatement> probe;
+    ASSERT_EQ(NS_OK,
+              Connection()->CreateStatement(
+                  "SELECT name FROM message_properties WHERE id = :id"_ns,
+                  getter_AddRefs(probe)));
+    auto cleanup = MakeScopeExit([&] { EXPECT_EQ(NS_OK, probe->Finalize()); });
+    ASSERT_EQ(NS_OK, probe->BindInt64ByName("id"_ns, key));
+    bool more;
+    EXPECT_EQ(NS_ERROR_FAILURE, probe->ExecuteStep(&more));
+  }
+  uint32_t uid = 0x12345678;
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(0x12345678u, uid);
+  ASSERT_NO_FATAL_FAILURE(CheckStored("saved_message_properties"_ns, key,
+                                      "uidOnServer"_ns, "2a"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckStored("saved_message_properties"_ns, control,
+                                      "uidOnServer"_ns, "1"_ns));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP VIEW message_properties;"
+                       "ALTER TABLE saved_message_properties RENAME TO "
+                       "message_properties;"_ns));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(42u, uid);
+}
+
+TEST_F(DISABLED_DeliveryCoreProperties, UidWriteFailurePreservesOldRows) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK, Add(control));
+  {
+    nsCOMPtr<nsIMsgDBHdr> header, controlHeader;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(
+                         control, getter_AddRefs(controlHeader)));
+    ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", 42));
+    ASSERT_EQ(NS_OK, controlHeader->SetUint32Property("uidOnServer", 1));
+  }
+  nsTArray<nsCString> before, after;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER fail_uid_write BEFORE INSERT ON "
+                       "message_properties WHEN NEW.name = 'uidOnServer' BEGIN "
+                       "SELECT RAISE(ABORT, 'UID write fault'); END"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            mCore->MessageDB().SetMessageUidOnServer(key, UINT32_MAX));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  uint32_t uid = 99;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(42u, uid);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, key, "uidOnServer"_ns, "2a"_ns));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, control, "uidOnServer"_ns, "1"_ns));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP TRIGGER fail_uid_write"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(key, UINT32_MAX));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageUidOnServer(key, uid));
+  EXPECT_EQ(UINT32_MAX, uid);
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
+  EXPECT_EQ(UINT32_MAX, uid);
+  nsCString text;
+  ASSERT_EQ(NS_OK, header->GetStringProperty("uidOnServer", text));
+  EXPECT_EQ("ffffffff"_ns, text);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, control, "uidOnServer"_ns, "1"_ns));
 }
 
 }  // namespace

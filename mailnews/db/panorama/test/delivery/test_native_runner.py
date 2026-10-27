@@ -770,5 +770,30 @@ class NativeRunnerTests(unittest.TestCase):
             verify.assert_not_called()
 
 
+    def test_uid_receipt_requires_public_view_storage_and_close_inputs(self):
+        config, receipt, runner_path = self.receipt_fixture()
+        comm = ["mailnews/base/public/ImapTypes.idl", "mailnews/base/public/MailNewsTypes2.idl",
+                "mailnews/base/src/nsMsgUtils.cpp", "mailnews/base/src/nsMsgUtils.h",
+                "mailnews/protocols/common/src/OfflineStorage.cpp"]
+        gecko = ["storage/mozIStorageBaseStatement.idl", "storage/mozIStorageBindingParams.idl",
+                 "storage/mozStorageHelper.h", "mfbt/Try.h", "mfbt/ResultExtensions.h",
+                 "xpcom/base/nsISupportsUtils.h", "xpcom/components/nsServiceManagerUtils.h",
+                 "xpcom/threads/nsIEventTarget.idl", "xpcom/threads/SpinEventLoopUntil.h"]
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner, "__file__", str(runner_path)), patch.object(runner, "verify") as verify):
+            for name in ["comm/" + p for p in comm] + gecko:
+                path = str(Path(config["source"]) / name)
+                with self.subTest(path=name):
+                    self.assertIn(path, receipt["inputs"])
+                    identity = receipt["inputs"].pop(path)
+                    self.bind_receipt(config, receipt)
+                    with self.assertRaisesRegex(ValueError, "omits required"):
+                        runner.prepare(config, time.monotonic() + 5)
+                    receipt["inputs"][path] = identity
+            verify.assert_not_called()
+            self.bind_receipt(config, receipt)
+            self.assertEqual(runner.prepare(config, time.monotonic() + 5), receipt)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -69,7 +69,14 @@ GECKO_INPUTS += [
     "xpcom/io/nsDirectoryServiceDefs.h",
     "netwerk/base/nsNetUtil.h",
     "xpcom/io/nsISeekableStream.idl",
-    "mfbt/UniquePtr.h"
+    "mfbt/UniquePtr.h",
+    "storage/mozIStorageBaseStatement.idl",
+    "storage/mozIStorageBindingParams.idl",
+    "storage/mozStorageHelper.h",
+    "mfbt/Try.h",
+    "mfbt/ResultExtensions.h",
+    "xpcom/base/nsISupportsUtils.h",
+    "xpcom/components/nsServiceManagerUtils.h",
 ]
 
 

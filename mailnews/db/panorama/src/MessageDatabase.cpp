@@ -1065,7 +1065,15 @@ nsresult MessageDatabase::GetMessageTags(nsMsgKey key, nsACString& tags) {
 
 nsresult MessageDatabase::GetMessageUidOnServer(nsMsgKey key,
                                                 uint32_t& uidOnServer) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  bool exists;
+  MOZ_TRY(MessageExists(key, exists));
+  NS_ENSURE_TRUE(exists, NS_ERROR_UNEXPECTED);
+
+  RefPtr<Message> message = new Message(key);
+  uint32_t value;
+  MOZ_TRY(message->GetUint32Property("uidOnServer", &value));
+  uidOnServer = value;
+  return NS_OK;
 }
 
 nsresult MessageDatabase::GetMessageThreadId(nsMsgKey key, nsMsgKey& threadId) {
@@ -1445,7 +1453,12 @@ nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
 
 nsresult MessageDatabase::SetMessageUidOnServer(nsMsgKey key,
                                                 uint32_t uidOnServer) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  bool exists;
+  MOZ_TRY(MessageExists(key, exists));
+  NS_ENSURE_TRUE(exists, NS_ERROR_UNEXPECTED);
+
+  RefPtr<Message> message = new Message(key);
+  return message->SetUint32Property("uidOnServer", uidOnServer);
 }
 
 namespace {

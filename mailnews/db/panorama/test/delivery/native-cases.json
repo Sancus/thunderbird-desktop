@@ -731,6 +731,41 @@
       "id": "local-native:QuarantinedOutputStream:RetainsInnerFinishFailure",
       "filter": "DISABLED_QuarantinedOutputStream.RetainsInnerFinishFailure",
       "expected": "The real quarantine wrapper preserves the first inner Finish error across Finish, Close and StreamStatus, with one inner Finish and exact copied bytes; no database/backend/store coverage."
+    },
+    {
+      "id": "core:ServerUid:UidValuesAndViewsSurviveCoreReopen",
+      "filter": "DISABLED_DeliveryCoreProperties.UidValuesAndViewsSurviveCoreReopen",
+      "expected": "Literal0/1/42/0x80000000/0xfffffffe/UINT32_MAX values and0/1/2a/80000000/fffffffe/ffffffff public text; native getter, public uint32/string, independent unshared stored cell; all six rows read again after actual Core Stop/Start. No process-restart claim."
+    },
+    {
+      "id": "core:ServerUid:UidTextPresenceAndNamesStayExact",
+      "filter": "DISABLED_DeliveryCoreProperties.UidTextPresenceAndNamesStayExact",
+      "expected": "Absent getter0 leaves opaque SQL snapshot and enumeration unchanged; present-empty returns0 but enumerates. Case variants remain independent. Literal exact text/prefix expectations00042->66,1e3->483,2ag->42,xyz->0,100000000->268435456,-1->0,2a+space+UTF8 e-acute->42; native/public values agree and exact supplied text is not rewritten."
+    },
+    {
+      "id": "core:ServerUid:UidIsIndependentOfGlobalAndFolderKeys",
+      "filter": "DISABLED_DeliveryCoreProperties.UidIsIndependentOfGlobalAndFolderKeys",
+      "expected": "Two FolderDatabase-created real folders, distinct physical/global row keys, initially absent UID0 instead of key fallback, equal server UID42 allowed, changing only first UID leaves second42; unshared SQL count2 and two exact id/folder mappings. No allocator ordering assumption, account/body-store coverage or UIDVALIDITY lookup claim."
+    },
+    {
+      "id": "core:ServerUid:UidMissingKeyPreservesOutputAndRows",
+      "filter": "DISABLED_DeliveryCoreProperties.UidMissingKeyPreservesOutputAndRows",
+      "expected": "Missing nsMsgKey_None is confirmed by stored MessageExists; getterUNEXPECTED with0x12345678 unchanged; setterUNEXPECTED; unshared whole-property snapshots identical and unrelated committed control row retained. Control is seeded by existing public header setter."
+    },
+    {
+      "id": "core:ServerUid:UidDeletedWarmHeaderIsNotMembership",
+      "filter": "DISABLED_DeliveryCoreProperties.UidDeletedWarmHeaderIsNotMembership",
+      "expected": "Warm public subject remains readable after RemoveMessage while MessageExists is false; native UID getterUNEXPECTED preserves sentinel and setterUNEXPECTED creates no orphan; property snapshots and surviving control UID unchanged. Initial UID data uses existing public setters, not the new setter."
+    },
+    {
+      "id": "core:ServerUid:UidReadStepFailurePreservesOutput",
+      "filter": "DISABLED_DeliveryCoreProperties.UidReadStepFailurePreservesOutput",
+      "expected": "Existing saved-table/fault-view pattern keeps messages/membership healthy. Independent statement prepares/binds successfully, then abs(INT64_MIN) fails at ExecuteStep; actual native getter must failNS_ERROR_FAILURE without changing sentinel. Unshared saved rows retain original UID/control values. Restore table, compare snapshots and read UID42 successfully. Runtime/configured SQLite/fault-point gate remainsNOTRUN."
+    },
+    {
+      "id": "core:ServerUid:UidWriteFailurePreservesOldRows",
+      "filter": "DISABLED_DeliveryCoreProperties.UidWriteFailurePreservesOldRows",
+      "expected": "Existing public setters independently seed old UID42 and controlUID1. Valid exact-name TEMP BEFORE INSERT trigger RAISE(ABORT) is installed before native write; native setter must returnNS_ERROR_STORAGE_CONSTRAINT. Opaque snapshots, old public/native value and unshared old/control rows preserved. Drop trigger, retry UINT32_MAX, verify native/public/text and control row."
     }
   ],
   "suites": {
@@ -865,7 +900,12 @@
         "mailnews/db/panorama/public/moz.build",
         "mailnews/db/panorama/src/moz.build",
         "mailnews/db/panorama/test/moz.build",
-        "mailnews/db/panorama/test/gtest/moz.build"
+        "mailnews/db/panorama/test/gtest/moz.build",
+        "mailnews/base/src/nsMsgUtils.cpp",
+        "mailnews/base/public/ImapTypes.idl",
+        "mailnews/base/public/MailNewsTypes2.idl",
+        "mailnews/base/src/nsMsgUtils.h",
+        "mailnews/protocols/common/src/OfflineStorage.cpp"
       ]
     },
     "DISABLED_DeliveryHeaderProperties": {

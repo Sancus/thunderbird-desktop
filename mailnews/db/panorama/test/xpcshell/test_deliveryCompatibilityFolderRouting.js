@@ -35,7 +35,7 @@ add_setup(function () {
   root = account.incomingServer.rootFolder.QueryInterface(
     Ci.nsIMsgLocalMailFolder,
   );
-  Assert.equal(root.server.getCharValue("storeContractID"), contract);
+  Assert.equal(root.server.getStringValue("storeContractID"), contract);
   Assert.equal(root.msgStore.storeType, "mbox");
 });
 

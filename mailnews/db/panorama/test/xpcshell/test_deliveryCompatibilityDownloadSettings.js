@@ -28,7 +28,7 @@ add_setup(function () {
     Ci.nsIMsgLocalMailFolder
   );
   Assert.equal(root.msgStore.storeType, "mbox");
-  Assert.equal(root.server.getCharValue("storeContractID"), contract);
+  Assert.equal(root.server.getStringValue("storeContractID"), contract);
 });
 
 add_task(function test_downloadSettingsDefaultsAndPersistence() {

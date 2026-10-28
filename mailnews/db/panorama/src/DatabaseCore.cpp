@@ -814,19 +814,46 @@ nsresult DatabaseCore::UpgradeSchema() {
 
 namespace {
 
+// Work on clones: normalizing must not rewrite the folder's stored path.
+nsresult NormalizeImportFile(nsCOMPtr<nsIFile>& file) {
+  NS_ENSURE_TRUE(file, NS_ERROR_INVALID_ARG);
+  nsCOMPtr<nsIFile> normalized;
+  MOZ_TRY(file->Clone(getter_AddRefs(normalized)));
+  bool linked;
+  nsresult rv = normalized->IsSymlink(&linked);
+  if (rv == NS_ERROR_FILE_NOT_FOUND) {
+    nsAutoString leaf;
+    MOZ_TRY(normalized->GetLeafName(leaf));
+    nsCOMPtr<nsIFile> parent;
+    MOZ_TRY(normalized->GetParent(getter_AddRefs(parent)));
+    NS_ENSURE_TRUE(parent, NS_ERROR_FILE_UNRECOGNIZED_PATH);
+    MOZ_TRY(parent->Normalize());
+    MOZ_TRY(parent->Append(leaf));
+    normalized = parent;
+  } else {
+    MOZ_TRY(rv);
+    NS_ENSURE_FALSE(linked, NS_ERROR_FILE_ACCESS_DENIED);
+    MOZ_TRY(normalized->Normalize());
+  }
+  file = normalized;
+  return NS_OK;
+}
+
 nsresult HashImportSource(nsIFile* file, const FolderImportSnapshot& input,
                           nsACString* legacyMarker = nullptr) {
   NS_ENSURE_ARG_POINTER(file);
+  nsCOMPtr<nsIFile> normalized = file;
+  MOZ_TRY(NormalizeImportFile(normalized));
   nsAutoString path;
-  MOZ_TRY(file->GetPath(path));
+  MOZ_TRY(normalized->GetPath(path));
   NS_ENSURE_TRUE(path == input.identity.sourcePath, NS_ERROR_INVALID_ARG);
   int64_t size;
-  MOZ_TRY(file->GetFileSize(&size));
+  MOZ_TRY(normalized->GetFileSize(&size));
   NS_ENSURE_TRUE(size >= 0 && uint64_t(size) == input.sourceSize,
                  NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_TRUE(uint64_t(size) < UINT32_MAX, NS_ERROR_FILE_TOO_BIG);
   nsCOMPtr<nsIInputStream> stream;
-  MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), file));
+  MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), normalized));
   auto close = MakeScopeExit([&] { stream->Close(); });
   nsCOMPtr<nsICryptoHash> hash;
   MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
@@ -2880,6 +2907,8 @@ nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
   MOZ_TRY(source->GetSummaryFile(getter_AddRefs(summary)));
   MOZ_TRY(source->GetFilePath(getter_AddRefs(storeFile)));
   NS_ENSURE_TRUE(summary && storeFile, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(NormalizeImportFile(summary));
+  MOZ_TRY(NormalizeImportFile(storeFile));
   nsAutoString summaryPath, storePath;
   MOZ_TRY(summary->GetPath(summaryPath));
   MOZ_TRY(storeFile->GetPath(storePath));

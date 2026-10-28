@@ -6,6 +6,12 @@
 
 /* import-globals-from head.js */
 
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+const { FileUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/FileUtils.sys.mjs"
+);
 const { ProfileCreator } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/ProfileCreator.sys.mjs"
 );
@@ -44,7 +50,15 @@ add_setup(async function () {
       mbox: empty,
     });
   }
-  for (const name of ["whole", "whole-properties", "whole-reject"]) {
+  for (const name of [
+    "whole",
+    "whole-properties",
+    "whole-reject",
+    "whole-alias",
+    "whole-summary-link",
+    "whole-store-link",
+    "whole-missing-store",
+  ]) {
     await server.rootFolder.addMailFolder(name, {
       summary: do_get_file("data/migration.msf"),
       mbox: do_get_file("data/migration"),
@@ -65,7 +79,15 @@ add_setup(async function () {
       root.getChildNamed(name),
     ])
   );
-  for (const name of ["whole", "whole-properties", "whole-reject"]) {
+  for (const name of [
+    "whole",
+    "whole-properties",
+    "whole-reject",
+    "whole-alias",
+    "whole-summary-link",
+    "whole-store-link",
+    "whole-missing-store",
+  ]) {
     importFolders.set(name, root.getChildNamed(name));
   }
   Assert.equal(importFolders.get("fields").msgStore.storeType, "mbox");
@@ -682,3 +704,193 @@ add_task(async function test_importFullSnapshotRejectsThreadState() {
     assertFullImportRejected(input, Cr.NS_ERROR_NOT_IMPLEMENTED);
   }
 });
+
+/**
+ * Creates a real Unix link at a disposable fixture path.
+ *
+ * @param {string} target - Existing physical target.
+ * @param {string} path - Unoccupied link path.
+ */
+function makeImportPathLink(target, path) {
+  const process = Cc["@mozilla.org/process/util;1"].createInstance(
+    Ci.nsIProcess
+  );
+  process.init(new FileUtils.File("/bin/ln"));
+  const args = ["-s", target, path];
+  process.run(true, args, args.length);
+  Assert.equal(process.exitValue, 0);
+  Assert.ok(new FileUtils.File(path).isSymlink());
+}
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_importCanonicalPhysicalPathsPreserveLogicalIdentity() {
+    const folder = importFolders.get("whole-alias");
+    const summary = folder.summaryFile.path;
+    const body = folder.filePath.path;
+    const summaryBytes = await IOUtils.read(summary);
+    const bodyBytes = await IOUtils.read(body);
+    const logicalPath = folder.path;
+    const parent = PathUtils.parent(summary);
+    const saved = parent + ".core-import-target";
+    Assert.ok(!(await IOUtils.exists(saved)));
+    const count = messageDB.totalCount;
+    await IOUtils.move(parent, saved, { noOverwrite: true });
+    let input;
+    let receipt;
+    try {
+      makeImportPathLink(saved, parent);
+      input = await fullImportInput("whole-alias");
+      Assert.equal(
+        input.source.path,
+        PathUtils.join(saved, PathUtils.filename(summary))
+      );
+      Assert.equal(input.folder.summaryPath, input.source.path);
+      Assert.equal(
+        input.folder.storePath,
+        PathUtils.join(saved, PathUtils.filename(body))
+      );
+      Assert.notEqual(input.source.path, summary);
+      Assert.equal(database.getFolderImportReceipt(folder, input), null);
+      receipt = await database.importFolderSnapshot(folder, input);
+      Assert.deepEqual(
+        receipt.keys.map(([key]) => key),
+        [1, 3]
+      );
+      Assert.equal(messageDB.totalCount, count + 2);
+      Assert.deepEqual(database.getFolderImportReceipt(folder, input), receipt);
+      Assert.deepEqual(
+        await database.importFolderSnapshot(folder, input),
+        receipt
+      );
+      Assert.equal(messageDB.totalCount, count + 2);
+      Assert.equal(folder.path, logicalPath);
+      Assert.equal(folder.summaryFile.path, summary);
+      Assert.equal(folder.filePath.path, body);
+      const reader = Services.storage.openUnsharedDatabase(
+        database.connectionForTests.databaseFile
+      );
+      const stmt = reader.createStatement(
+        "SELECT folderPath, sourcePath FROM folder_import_receipts WHERE token=:token"
+      );
+      try {
+        stmt.params.token = input.token;
+        Assert.ok(stmt.executeStep());
+        Assert.equal(stmt.row.folderPath, logicalPath);
+        Assert.equal(stmt.row.sourcePath, input.source.path);
+        Assert.ok(!stmt.executeStep());
+      } finally {
+        stmt.finalize();
+        reader.close();
+      }
+    } finally {
+      if (await IOUtils.exists(parent)) {
+        Assert.ok(new FileUtils.File(parent).isSymlink());
+        await IOUtils.remove(parent);
+      }
+      await IOUtils.move(saved, parent, { noOverwrite: true });
+    }
+    Assert.deepEqual(await IOUtils.read(summary), summaryBytes);
+    Assert.deepEqual(await IOUtils.read(body), bodyBytes);
+    Assert.ok(messageDB.getSearchState(importControl));
+    const movedIdentity = await fullImportInput("whole-alias");
+    Assert.notEqual(movedIdentity.source.path, input.source.path);
+    Assert.throws(
+      () => database.getFolderImportReceipt(folder, movedIdentity),
+      error => error.result == Cr.NS_ERROR_ALREADY_INITIALIZED
+    );
+    Assert.throws(
+      () => database.importFolderSnapshot(folder, movedIdentity),
+      error => error.result == Cr.NS_ERROR_ALREADY_INITIALIZED
+    );
+    Assert.equal(messageDB.totalCount, count + 2);
+    for (const [, key] of receipt.keys) {
+      Assert.equal(messageDB.getMessage(key).folder.id, folder.id);
+    }
+  }
+);
+
+/**
+ * Checks native leaf rejection using unchanged input from a real folder.
+ *
+ * @param {string} name - Isolated fixture folder.
+ * @param {string} path - Original summary or body-store path.
+ */
+async function checkImportLinkedLeaf(name, path) {
+  const folder = importFolders.get(name);
+  const input = await fullImportInput(name);
+  const before = await IOUtils.read(path);
+  const count = messageDB.totalCount;
+  const saved = path + ".core-import-target";
+  Assert.ok(!(await IOUtils.exists(saved)));
+  await IOUtils.move(path, saved, { noOverwrite: true });
+  try {
+    makeImportPathLink(saved, path);
+    Assert.throws(
+      () => database.getFolderImportReceipt(folder, input),
+      error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED
+    );
+    Assert.throws(
+      () => database.importFolderSnapshot(folder, input),
+      error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED
+    );
+    Assert.equal(messageDB.totalCount, count);
+    Assert.ok(!database.connectionForTests.transactionInProgress);
+    Assert.ok(messageDB.getSearchState(importControl));
+  } finally {
+    if (await IOUtils.exists(path)) {
+      Assert.ok(new FileUtils.File(path).isSymlink());
+      await IOUtils.remove(path);
+    }
+    await IOUtils.move(saved, path, { noOverwrite: true });
+  }
+  Assert.deepEqual(await IOUtils.read(path), before);
+  Assert.equal(database.getFolderImportReceipt(folder, input), null);
+}
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_importRejectsLinkedSummaryBeforeNormalization() {
+    await checkImportLinkedLeaf(
+      "whole-summary-link",
+      importFolders.get("whole-summary-link").summaryFile.path
+    );
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_importRejectsLinkedStoreBeforeNormalization() {
+    await checkImportLinkedLeaf(
+      "whole-store-link",
+      importFolders.get("whole-store-link").filePath.path
+    );
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_importDoesNotCreateAbsentBodyStore() {
+    const folder = importFolders.get("whole-missing-store");
+    const path = folder.filePath.path;
+    const before = await IOUtils.read(path);
+    const saved = path + ".core-import-target";
+    Assert.ok(!(await IOUtils.exists(saved)));
+    await IOUtils.move(path, saved, { noOverwrite: true });
+    try {
+      const input = await fullImportInput("whole-missing-store");
+      Assert.ok(!input.folder.storeExists);
+      const receipt = await database.importFolderSnapshot(folder, input);
+      Assert.deepEqual(
+        receipt.keys.map(([key]) => key),
+        [1, 3]
+      );
+      Assert.deepEqual(database.getFolderImportReceipt(folder, input), receipt);
+      Assert.ok(!(await IOUtils.exists(path)));
+      Assert.ok(messageDB.getSearchState(importControl));
+    } finally {
+      await IOUtils.move(saved, path, { noOverwrite: true });
+    }
+    Assert.deepEqual(await IOUtils.read(path), before);
+  }
+);

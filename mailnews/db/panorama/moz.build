@@ -16,6 +16,6 @@ JAR_MANIFESTS += ["jar.mn"]
 EXTRA_JS_MODULES.panorama += [
     "migration/MorkSummaryReader.sys.mjs",
     "migration/StrictMorkReader.sys.mjs",
-    "search/SearchTerms.sys.mjs",
     "search/PanoramaSearchIndex.sys.mjs",
+    "search/SearchTerms.sys.mjs",
 ]

@@ -28,6 +28,10 @@ tags = ["panorama"]
 
 ["test_deliveryCompatibilityFolderRouting.js"]
 
+["test_deliveryCompatibilityFolderVersion.js"]
+
+["test_deliveryCompatibilityTransferErrors.js"]
+
 ["test_deliveryCompatibilityUidValidity.js"]
 
 ["test_deliveryCompatibilityViewType.js"]

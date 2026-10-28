@@ -181,21 +181,32 @@ const POP3_STORES = {
  * @param {function(nsIPop3IncomingServer, nsIMsgLocalMailFolder): Promise<void>} fn
  */
 async function withPop3Store(store, fn) {
-  localAccountUtils.clearAll();
-  Services.prefs.setCharPref(
+  const storePrefs = [
     "mail.serverDefaultStoreContractID",
-    POP3_STORES[store]
-  );
-  localAccountUtils.loadLocalMailAccount();
-  const { server: incomingServer, account } =
-    localAccountUtils.create_incoming_server_and_account(
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
+  localAccountUtils.clearAll();
+  let account;
+  try {
+    // Panorama root discovery opens the store before account creation applies
+    // serverDefaultStoreContractID. Select the same provider at both boundaries.
+    for (const { name } of storePrefs) {
+      Services.prefs.setCharPref(name, POP3_STORES[store]);
+    }
+    localAccountUtils.loadLocalMailAccount();
+    const created = localAccountUtils.create_incoming_server_and_account(
       "pop3",
       server.port,
       "fred",
       "wilma"
     );
-  const folder = localAccountUtils.inboxFolder;
-  try {
+    account = created.account;
+    const incomingServer = created.server;
+    const folder = localAccountUtils.inboxFolder;
     Assert.equal(folder.msgStore.storeType, store);
     const dbService = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
       Ci.nsIMsgDBService
@@ -207,10 +218,30 @@ async function withPop3Store(store, fn) {
     );
     Assert.equal(dbService.openFolderDB(folder, false), folder.msgDatabase);
     Assert.equal(folder.server.msgStore.storeType, store);
+    Assert.equal(incomingServer.msgStore.storeType, store);
+    Assert.equal(
+      incomingServer.deferredToAccount,
+      localAccountUtils.msgAccount.key
+    );
     await fn(incomingServer, folder);
   } finally {
-    MailServices.accounts.removeAccount(account);
-    localAccountUtils.clearAll();
+    try {
+      if (account) {
+        MailServices.accounts.removeAccount(account);
+      }
+    } finally {
+      try {
+        localAccountUtils.clearAll();
+      } finally {
+        for (const { name, hadValue, value } of storePrefs) {
+          if (hadValue) {
+            Services.prefs.setCharPref(name, value);
+          } else {
+            Services.prefs.clearUserPref(name);
+          }
+        }
+      }
+    }
   }
 }
 

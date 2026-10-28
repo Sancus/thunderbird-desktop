@@ -488,3 +488,200 @@ add_task(async function testUnterminatedTableRecovery() {
     "should recover rows from an unterminated table"
   );
 });
+
+add_task(async function test_strictSummaryAndCache() {
+  const read = async path =>
+    new MorkParser().parseForImport(
+      MailStringUtils.uint8ArrayToByteString(await IOUtils.read(path))
+    );
+  const summary = await read(do_get_file("../../../data/love.msf").path);
+  const scope = "ns:msg:db:row:scope:msgs:all";
+  const row = summary.rows.get("1:" + scope);
+  Assert.equal(
+    row.cells.get("message-id"),
+    "fe06cac4-18ed-43aa-98a9-ee358e82b368@example.com"
+  );
+  Assert.ok(row.cells.has("references"), "Present empty is retained");
+  Assert.equal(row.cells.get("references"), "");
+  Assert.ok(!row.cells.has("absent-property"));
+  Assert.equal(
+    row.cells.get("gloda-id"),
+    "c1",
+    "Committed group updates apply"
+  );
+  Assert.deepEqual(summary.tables.get("1:" + scope).rows, ["1:" + scope]);
+  Assert.equal(
+    summary.rows
+      .get("1:ns:msg:db:row:scope:dbfolderinfo:all")
+      .cells.get("sortColumns"),
+    "\x122"
+  );
+
+  const cache = await read(do_get_file("data/panacea.dat").path);
+  const folders = "ns:msg:db:row:scope:folders:all";
+  Assert.equal(cache.tables.get("1:" + folders).rows.length, 13);
+  Assert.equal(
+    cache.rows.get("1:" + folders).cells.get("key"),
+    "/foo/bar/profile-default/ImapMail/imap.localhost/INBOX.msf"
+  );
+  Assert.equal(cache.rows.get("13:" + folders).cells.get("onlineName"), "");
+});
+
+add_task(function test_strictExactCellsAndMembership() {
+  const groupStart = "@$$" + "{";
+  const body = String.raw`// <!-- <mdb:mork:z v="1.4"/> -->
+< <(a=c)> (80=scope)(81=kind)(82=unknown)(83=empty)(84=columnStates)>
+<(80=)(81=  leading and trailing  )(82=slash\\$24$00\))>
+{1:^80 {(k^81:c)(s=9)} [1(^82^81)(^83^80)(^84={"x":1})] [2(^82^82)]}
+START_A
+[1:^80(^82=committed)]
+@$$}A}@
+{1:^80 {(k^81:c)(s=9)} -2}
+START_B
+[1:^80(^82=aborted)]
+@$$}~~}@
+`
+    .replace("START_A", () => groupStart + "A{@")
+    .replace("START_B", () => groupStart + "B{@");
+  const snapshot = new MorkParser().parseForImport(body);
+  Assert.deepEqual(snapshot.tables.get("1:scope").rows, ["1:scope"]);
+  Assert.equal(snapshot.rows.get("1:scope").cells.get("unknown"), "committed");
+  Assert.equal(snapshot.rows.get("1:scope").cells.get("empty"), "");
+  Assert.equal(
+    snapshot.rows.get("1:scope").cells.get("columnStates"),
+    '{"x":1}'
+  );
+  Assert.equal(
+    snapshot.rows.get("2:scope").cells.get("unknown"),
+    "slash\\$\0)"
+  );
+  Assert.ok(
+    snapshot.rows.has("2:scope"),
+    "Cut membership does not delete a shared row"
+  );
+  const original = new MorkParser().parseForImport(
+    body.slice(0, body.indexOf(groupStart))
+  );
+  Assert.equal(
+    original.rows.get("1:scope").cells.get("unknown"),
+    "  leading and trailing  "
+  );
+});
+
+add_task(function test_strictFailuresDoNotRecover() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  for (const [body, code] of [
+    ["[1:r(a=value)", "TRUNCATED_MORK"],
+    ["@$${A{@\n[1:r(a=value)]", "TRUNCATED_MORK"],
+    ["@$${A{@\n@$$}B}@", "MALFORMED_MORK"],
+    ["[1:r(a^FF)]", "MALFORMED_MORK"],
+    ["{1:r {(k=kind)(f=1)}}", "UNSUPPORTED_MORK"],
+    ["[1:r(a=value)] trailing", "MALFORMED_MORK"],
+  ]) {
+    Assert.throws(
+      () => new MorkParser().parseForImport(header + body),
+      error => error.name == "MorkImportError" && error.code == code,
+      body
+    );
+  }
+});
+
+add_task(function test_strictClearAndComments() {
+  const snapshot = new MorkParser()
+    .parseForImport(String.raw`// <!-- <mdb:mork:z v="1.4"/> -->
+/* Outer comment with } ] > /* nested */ end */
+{1:r {(k=kind)} [1(a=old)(b=old)] [2(a=other)]}
+{-1:r {(k=kind)} [1(a=changed)]}
+[-1:r(b=)]
+`);
+  Assert.deepEqual(snapshot.tables.get("1:r").rows, ["1:r"]);
+  Assert.ok(
+    !snapshot.rows.get("1:r").cells.has("a"),
+    "Clear row removes old cells"
+  );
+  Assert.equal(snapshot.rows.get("1:r").cells.get("b"), "");
+  Assert.equal(
+    snapshot.rows.get("2:r").cells.get("a"),
+    "other",
+    "Clear table keeps shared rows"
+  );
+});
+
+add_task(function test_strictMembershipUpdatesKeepNativeOrder() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const initial = Array.from(
+    { length: 64 },
+    (_, index) => "[" + (index + 1).toString(16) + "(a=v" + (index + 1) + ")]"
+  ).join(" ");
+  const body =
+    header +
+    [
+      "{1:r {(k=kind)} " + initial + "}",
+      "{1:r {(k=kind)} 10 10 -11 11}",
+      "@$$" + "{A{@",
+      "{1:r {(k=kind)} -1 1}",
+      "@$$}A}@",
+      "@$$" + "{B{@",
+      "{1:r {(k=kind)} -2}",
+      "@$$}~~}@",
+      "// Layout after the abort is allowed.",
+    ].join("\n");
+  const snapshot = new MorkParser().parseForImport(body);
+  const members = snapshot.tables.get("1:r").rows;
+  Assert.ok(
+    Array.isArray(members),
+    "Snapshot membership keeps its public array type"
+  );
+  Assert.deepEqual(members, [
+    ...Array.from({ length: 63 }, (_, index) => index + 2)
+      .filter(key => key != 17)
+      .map(key => key + ":r"),
+    "17:r",
+    "1:r",
+  ]);
+  Assert.equal(snapshot.rows.get("2:r").cells.get("a"), "v2");
+  Assert.equal(snapshot.rows.size, 64);
+});
+
+add_task(function test_strictRejectsRowsAfterAbort() {
+  const before =
+    '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
+    [
+      "[1:r(a=before)]",
+      "@$$" + "{A{@",
+      "[1:r(a=aborted)]",
+      "@$$}~~}@",
+      "",
+    ].join("\n");
+  Assert.throws(
+    () => new MorkParser().parseForImport(before + "[2:r(a=later)]"),
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == before.length,
+    "Later rows cannot produce a successful stale snapshot"
+  );
+});
+
+add_task(function test_strictRejectsGroupsAfterAbort() {
+  const before =
+    '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
+    [
+      "[1:r(a=before)]",
+      "@$$" + "{A{@",
+      "[1:r(a=aborted)]",
+      "@$$}~~}@",
+      "",
+    ].join("\n");
+  Assert.throws(
+    () =>
+      new MorkParser().parseForImport(
+        before + "@$$" + "{B{@\n[1:r(a=later)]\n@$$}B}@"
+      ),
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == before.length,
+    "A later committed group cannot hide an earlier aborted write"
+  );
+});

@@ -14,5 +14,6 @@ TEST_DIRS += [
 JAR_MANIFESTS += ["jar.mn"]
 
 EXTRA_JS_MODULES.panorama += [
+    "migration/MorkSummaryReader.sys.mjs",
     "migration/StrictMorkReader.sys.mjs",
 ]

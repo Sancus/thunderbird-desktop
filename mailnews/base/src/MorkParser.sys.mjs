@@ -28,6 +28,43 @@ ChromeUtils.defineESModuleGetters(lazy, {
 });
 
 /**
+ * @typedef {object} MorkImportRow
+ * @property {number} id - Original unsigned row ID.
+ * @property {string} scope - Resolved scope byte string.
+ * @property {Map<string, string>} cells - Exact column and value byte strings.
+ */
+
+/**
+ * @typedef {object} MorkImportTable
+ * @property {number} id - Original unsigned table ID.
+ * @property {string} scope - Resolved scope byte string.
+ * @property {Map<string, string>} cells - Exact table metadata.
+ * @property {string[]} rows - Ordered member keys in the snapshot's rows map.
+ * @property {string|null} metaRow - Metadata row key, separate from membership.
+ */
+
+/**
+ * @typedef {object} MorkImportSnapshot
+ * @property {Map<string, MorkImportRow>} rows - All scoped rows, including orphans.
+ * @property {Map<string, MorkImportTable>} tables - All tables and memberships.
+ */
+
+/** A strict import failure at an original byte-string offset. */
+export class MorkImportError extends SyntaxError {
+  /**
+   * @param {string} code - MALFORMED_MORK, TRUNCATED_MORK, UNSUPPORTED_MORK or RESOURCE_LIMIT.
+   * @param {number} offset - Original source byte offset.
+   * @param {string} message - Failure description.
+   */
+  constructor(code, offset, message) {
+    super(message + " at byte " + offset);
+    this.name = "MorkImportError";
+    this.code = code;
+    this.offset = offset;
+  }
+}
+
+/**
  * MorkParser. Reads Mork formatted Data from a (.msf) file and transforms it
  * to an object that can then be JSON'd.
  *
@@ -456,6 +493,446 @@ export class MorkParser {
     return result;
   }
   /**
+   * Reads a complete Mork 1.4 document without recovery or text conversion.
+   * Cell names and values are byte strings. Maps keep empty cells, arbitrary
+   * names, scoped row identity and table membership separate from metadata.
+   * Throws before returning any data if syntax or a supported form is invalid.
+   *
+   * @param {string} body - Original bytes, one byte per code unit.
+   * @param {number} [maxBytes=67108864] - Maximum document size.
+   * @returns {MorkImportSnapshot} Rows and tables, keyed by decimal ID followed
+   *   by ':' and resolved scope.
+   * @throws {MorkImportError} For malformed, truncated or unsupported input.
+   */
+  parseForImport(body, maxBytes = 64 * 1024 * 1024) {
+    if (typeof body != "string" || /[^\x00-\xff]/.test(body)) {
+      throw new TypeError("Expected a Mork byte string");
+    }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+      throw new RangeError("Invalid Mork input limit");
+    }
+    let pos = 0;
+    const fail = (code, message) => {
+      throw new MorkImportError(code, pos, message);
+    };
+    if (body.length > maxBytes) {
+      fail("RESOURCE_LIMIT", "Mork input exceeds byte limit");
+    }
+    if (!body.startsWith('// <!-- <mdb:mork:z v="1.4"/> -->')) {
+      fail("UNSUPPORTED_MORK", "Expected Mork 1.4 header");
+    }
+    let state = {
+      columns: new Map(),
+      values: new Map(),
+      rows: new Map(),
+      tables: new Map(),
+      rowScope: "r",
+    };
+    let group = null;
+    const cache = new Map();
+    const skip = () => {
+      while (pos < body.length) {
+        if (/[\x08\t\n\f\r \x7f]/.test(body[pos])) {
+          pos++;
+        } else if (body[pos] == "/") {
+          pos = this.importCommentEnd(body, pos);
+        } else if (body[pos] == "\\" && /[\r\n]/.test(body[pos + 1] || "")) {
+          pos++;
+          const first = body[pos++];
+          if (/[\r\n]/.test(body[pos] || "") && body[pos] != first) {
+            pos++;
+          }
+        } else {
+          break;
+        }
+      }
+    };
+    const take = expected => {
+      if (body[pos] != expected) {
+        fail(
+          pos == body.length ? "TRUNCATED_MORK" : "MALFORMED_MORK",
+          "Expected " + expected
+        );
+      }
+      pos++;
+    };
+    const hex = () => {
+      const match = /^[0-9a-f]+/i.exec(body.slice(pos));
+      if (!match || match[0].length > 8) {
+        fail("MALFORMED_MORK", "Invalid 32-bit Mork ID");
+      }
+      pos += match[0].length;
+      return parseInt(match[0], 16);
+    };
+    const name = () => {
+      const match = /^[a-z_:][a-z_:!+?\-]*/i.exec(body.slice(pos));
+      if (!match) {
+        fail("MALFORMED_MORK", "Expected column or scope name");
+      }
+      pos += match[0].length;
+      return match[0];
+    };
+    const column = id => {
+      if (state.columns.has(id)) {
+        return state.columns.get(id);
+      }
+      if (id > 0 && id < 128) {
+        return String.fromCharCode(id);
+      }
+      fail("MALFORMED_MORK", "Undefined column or scope alias");
+      return null;
+    };
+    const mid = defaultScope => {
+      const id = hex();
+      let scope = defaultScope;
+      if (body[pos] == ":") {
+        pos++;
+        if (body[pos] == "^") {
+          pos++;
+          scope = column(hex());
+        } else {
+          scope = name();
+        }
+      }
+      return { id, scope, key: id + ":" + scope };
+    };
+    const value = () => {
+      take("=");
+      let result = "";
+      while (pos < body.length) {
+        let ch = body[pos++];
+        if (ch == ")") {
+          return result;
+        }
+        if (ch == "\\") {
+          if (pos == body.length) {
+            break;
+          }
+          ch = body[pos++];
+          if (ch == "\r" || ch == "\n") {
+            if (/[\r\n]/.test(body[pos] || "") && body[pos] != ch) {
+              pos++;
+            }
+            continue;
+          }
+        } else if (ch == "$") {
+          const digits = body.slice(pos, pos + 2);
+          if (!/^[0-9a-f]{2}$/i.test(digits)) {
+            fail("MALFORMED_MORK", "Invalid byte escape");
+          }
+          pos += 2;
+          ch = String.fromCharCode(parseInt(digits, 16));
+        }
+        result += ch;
+      }
+      fail("TRUNCATED_MORK", "Unterminated value");
+      return null;
+    };
+    const cell = () => {
+      take("(");
+      let key;
+      if (body[pos] == "^") {
+        pos++;
+        const ref = mid("c");
+        if (ref.scope != "c") {
+          fail("UNSUPPORTED_MORK", "Non-column cell domain");
+        }
+        key = column(ref.id);
+      } else {
+        key = name();
+      }
+      skip();
+      if (body[pos] == "=") {
+        return [key, value()];
+      }
+      take("^");
+      const ref = mid("v");
+      const atoms = ref.scope == "c" ? state.columns : state.values;
+      if (ref.scope != "v" && ref.scope != "c") {
+        fail("UNSUPPORTED_MORK", "Unsupported value domain");
+      }
+      if (!atoms.has(ref.id)) {
+        fail("MALFORMED_MORK", "Undefined value alias");
+      }
+      skip();
+      take(")");
+      return [key, atoms.get(ref.id)];
+    };
+    const blockEnd = (open, close) => {
+      const block = this.consumeBlock(body, pos, open, close, cache, true);
+      if (!block) {
+        fail("TRUNCATED_MORK", "Unterminated " + open + " block");
+      }
+      pos++;
+      return block.nextPos - 1;
+    };
+    const dictionary = () => {
+      const end = blockEnd("<", ">");
+      let atoms = state.values;
+      while (pos < end) {
+        skip();
+        if (pos == end) {
+          break;
+        }
+        if (body[pos] == "<") {
+          pos++;
+          skip();
+          const [key, domain] = cell();
+          skip();
+          take(">");
+          if (key != "a" || (domain != "c" && domain != "v")) {
+            fail("UNSUPPORTED_MORK", "Unsupported dictionary metadata");
+          }
+          atoms = domain == "c" ? state.columns : state.values;
+          continue;
+        }
+        take("(");
+        const id = hex();
+        // Native alias IDs allow whitespace before '=', not comments.
+        while (/[\x08\t\n\f\r \x7f]/.test(body[pos] || "")) {
+          pos++;
+        }
+        if (body[pos] == "<") {
+          fail("UNSUPPORTED_MORK", "Per-alias form override");
+        }
+        const text = value();
+        if (atoms.has(id) && atoms.get(id) != text) {
+          fail("UNSUPPORTED_MORK", "Conflicting atom definition");
+        }
+        atoms.set(id, text);
+      }
+      take(">");
+    };
+    const row = (table, meta = false, cut = false) => {
+      const bracketed = body[pos] == "[";
+      let end = null;
+      let clear = false;
+      if (bracketed) {
+        end = blockEnd("[", "]");
+        skip();
+        if (body[pos] == "-") {
+          clear = true;
+          pos++;
+        }
+      }
+      const ref = mid(table?.scope ?? state.rowScope);
+      let record = state.rows.get(ref.key);
+      if (!record) {
+        record = { id: ref.id, scope: ref.scope, cells: new Map() };
+        state.rows.set(ref.key, record);
+      }
+      if (clear) {
+        record.cells.clear();
+      }
+      if (table) {
+        if (meta) {
+          if (table.metaRow && table.metaRow != ref.key) {
+            fail("MALFORMED_MORK", "Duplicate table metadata row");
+          }
+          table.metaRow = ref.key;
+        } else if (cut) {
+          table.rows.delete(ref.key);
+        } else {
+          table.rows.add(ref.key);
+        }
+      }
+      if (bracketed) {
+        while (pos < end) {
+          skip();
+          if (pos == end) {
+            break;
+          }
+          if (body[pos] == "[") {
+            fail("UNSUPPORTED_MORK", "Row metadata block");
+          }
+          let remove = false;
+          if (body[pos] == "-") {
+            pos++;
+            skip();
+            remove = true;
+          }
+          const [key, text] = cell();
+          if (remove) {
+            record.cells.delete(key);
+          } else {
+            record.cells.set(key, text);
+          }
+        }
+        take("]");
+      }
+      skip();
+      if (body[pos] == "!") {
+        fail("UNSUPPORTED_MORK", "Row position hints are not supported");
+      }
+    };
+    const table = () => {
+      const end = blockEnd("{", "}");
+      skip();
+      let clear = false;
+      if (body[pos] == "-") {
+        pos++;
+        clear = true;
+      }
+      const ref = mid("r");
+      let kindSeen = false;
+      let record = state.tables.get(ref.key);
+      if (!record) {
+        record = {
+          id: ref.id,
+          scope: ref.scope,
+          cells: new Map(),
+          rows: new Set(),
+          metaRow: null,
+        };
+        state.tables.set(ref.key, record);
+      }
+      if (clear) {
+        record.rows.clear();
+      }
+      state.rowScope = ref.scope;
+      while (pos < end) {
+        skip();
+        if (pos == end) {
+          break;
+        }
+        if (body[pos] == "{") {
+          const metaEnd = blockEnd("{", "}");
+          while (pos < metaEnd) {
+            skip();
+            if (pos == metaEnd) {
+              break;
+            }
+            if (body[pos] != "(") {
+              row(record, true);
+              continue;
+            }
+            const [key, text] = cell();
+            if (["a", "r", "f"].includes(key)) {
+              fail("UNSUPPORTED_MORK", "Table domain or form override");
+            }
+            if (key == "k") {
+              kindSeen = !!text;
+            }
+            record.cells.set(key, text);
+          }
+          take("}");
+        } else {
+          const cut = body[pos] == "-";
+          if (cut) {
+            pos++;
+            skip();
+          }
+          row(record, false, cut);
+        }
+      }
+      take("}");
+      if (!kindSeen) {
+        fail("MALFORMED_MORK", "Missing table kind");
+      }
+    };
+    while (true) {
+      skip();
+      if (pos == body.length) {
+        break;
+      }
+      switch (body[pos]) {
+        case "<":
+          dictionary();
+          break;
+        case "[":
+          row(null);
+          break;
+        case "{":
+          table();
+          break;
+        case "@": {
+          const marker = /^@\$\$([{}])([0-9a-f]+|~~)([{}])@/i.exec(
+            body.slice(pos)
+          );
+          if (!marker || marker[1] != marker[3]) {
+            fail("MALFORMED_MORK", "Invalid group marker");
+          }
+          const opening = marker[1] == "{";
+          const aborted = marker[2] == "~~";
+          const id = aborted ? null : parseInt(marker[2], 16);
+          if (opening) {
+            if (group || aborted || marker[2].length > 8) {
+              fail("MALFORMED_MORK", "Invalid or nested group");
+            }
+            group = { id, before: state };
+            state = structuredClone(state);
+          } else {
+            if (!group || (!aborted && group.id != id)) {
+              fail("MALFORMED_MORK", "Unmatched group end");
+            }
+            if (aborted) {
+              state = group.before;
+            }
+            group = null;
+          }
+          pos += marker[0].length;
+          if (aborted) {
+            skip();
+            if (pos != body.length) {
+              fail("UNSUPPORTED_MORK", "Content after aborted group");
+            }
+          }
+          break;
+        }
+        default:
+          fail("MALFORMED_MORK", "Unexpected document content");
+      }
+    }
+    if (group) {
+      fail("TRUNCATED_MORK", "Uncommitted group");
+    }
+    for (const record of state.tables.values()) {
+      record.rows = [...record.rows];
+    }
+    return { rows: state.rows, tables: state.tables };
+  }
+
+  /**
+   * Skips one native line or nested block comment for strict import.
+   *
+   * @param {string} body - Original byte string.
+   * @param {number} pos - Offset of the initial slash.
+   * @returns {number} Offset after the comment.
+   * @throws {MorkImportError} For malformed or truncated comments.
+   */
+  importCommentEnd(body, pos) {
+    const start = pos;
+    const kind = body[++pos];
+    if (kind == "/") {
+      pos++;
+      while (pos < body.length && !/[\r\n]/.test(body[pos])) {
+        pos++;
+      }
+      return pos;
+    }
+    if (kind != "*") {
+      throw new MorkImportError("MALFORMED_MORK", start, "Invalid comment");
+    }
+    let depth = 1;
+    pos++;
+    while (pos < body.length) {
+      const pair = body.slice(pos, pos + 2);
+      if (pair == "/*") {
+        depth++;
+        pos += 2;
+      } else if (pair == "*/") {
+        pos += 2;
+        if (!--depth) {
+          return pos;
+        }
+      } else {
+        pos++;
+      }
+    }
+    throw new MorkImportError("TRUNCATED_MORK", start, "Unterminated comment");
+  }
+
+  /**
    * Helper: Extracts a bracketed block of text safely, accounting for nested
    * brackets and escaped characters.
    *
@@ -469,11 +946,12 @@ export class MorkParser {
    * @param {Map} [cache] - Per-body cache. When a block is found to be
    *   unterminated, the positions of all blocks nested in it are stored here,
    *   so that later calls for the same body don't rescan to the end.
+   * @param {boolean} [strict=false] - Validate and skip native comments.
    * @returns {{text: string, nextPos: number}|null} An object containing the
    *   extracted text and the next cursor position, or null if the block is
    *   unterminated.
    */
-  consumeBlock(body, startPos, openChar, closeChar, cache) {
+  consumeBlock(body, startPos, openChar, closeChar, cache, strict = false) {
     const cached = cache?.get(openChar);
     if (cached && startPos >= cached.from) {
       const end = cached.ends.get(startPos);
@@ -491,6 +969,10 @@ export class MorkParser {
     while (i < length) {
       const char = body[i];
 
+      if (strict && !inParens && char == "/") {
+        i = this.importCommentEnd(body, i);
+        continue;
+      }
       if (char === "\\") {
         i += 2; // Skip the backslash and the escaped character
         continue;

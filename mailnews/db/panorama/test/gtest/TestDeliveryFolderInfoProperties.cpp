@@ -568,7 +568,8 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
 TEST_F(DISABLED_DeliveryFolderInfoProperties,
        KnownArtsColdReopenRetainsValues) {
   const nsLiteralCString opaque = "0007-0009,3,3-2,\xc3\xa9,e\xcc\x81 "_ns;
-  for (const char* expected : {opaque.get(), ""}) {
+  const char* const expectedValues[] = {opaque.get(), ""};
+  for (const char* expected : expectedValues) {
     ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet(expected));
     ASSERT_EQ(NS_OK, mInfo->SetCharProperty("readSet", "2-4"_ns));
     const uint64_t folderId = mDatabase->FolderId();

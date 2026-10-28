@@ -421,7 +421,7 @@ nsresult ReadDatabaseSourceId(mozIStorageConnection* connection,
   nsCString value;
   MOZ_TRY(stmt->GetUTF8String(0, value));
   nsID parsed;
-  NS_ENSURE_TRUE(value.Length() == NSID_LENGTH - 1 && parsed.Parse(value.get()),
+  NS_ENSURE_TRUE(value.Length() == NSID_LENGTH - 1 && parsed.Parse(value),
                  NS_ERROR_FILE_CORRUPTED);
   MOZ_TRY(stmt->ExecuteStep(&more));
   NS_ENSURE_TRUE(!more, NS_ERROR_FILE_CORRUPTED);

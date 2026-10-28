@@ -35,6 +35,8 @@
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ScopeExit.h"
+#include <charconv>
+#include <limits>
 #include <cstdlib>  // for std::abs(int/long)
 #include <cmath>    // for std::abs(float/double)
 
@@ -886,9 +888,15 @@ nsMsgBrkMBoxStore::GetMsgInputStream(nsIMsgFolder* aMsgFolder,
                                      nsIInputStream** aResult) {
   NS_ENSURE_ARG_POINTER(aMsgFolder);
   NS_ENSURE_ARG_POINTER(aResult);
-  MOZ_ASSERT(!aMsgToken.IsEmpty());
-
-  uint64_t offset = ParseUint64Str(PromiseFlatCString(aMsgToken).get());
+  // A corrupt token must not silently select the first message or a prefix
+  // offset. Seek() takes a signed offset, even though tokens are unsigned.
+  uint64_t offset = 0;
+  const char* end = aMsgToken.EndReading();
+  auto parsed = std::from_chars(aMsgToken.BeginReading(), end, offset);
+  if (parsed.ec != std::errc() || parsed.ptr != end ||
+      offset > std::numeric_limits<int64_t>::max()) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
   nsCOMPtr<nsIFile> mboxFile;
   nsresult rv = aMsgFolder->GetFilePath(getter_AddRefs(mboxFile));
   NS_ENSURE_SUCCESS(rv, rv);

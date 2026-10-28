@@ -970,20 +970,11 @@ nsMsgMaildirStore::GetMsgInputStream(nsIMsgFolder* aMsgFolder,
     return NS_ERROR_FAILURE;
   }
 
-  path->Append(u"cur"_ns);
-
-  // let's check if the folder exists
-  // XXX TODO: kill this and make sure maildir creation includes cur/tmp
-  bool exists;
-  path->Exists(&exists);
-  if (!exists) {
-    MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
-            ("GetMsgInputStream - oops! cur subfolder does not exist!"));
-    rv = path->Create(nsIFile::DIRECTORY_TYPE, 0755);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-
-  path->Append(NS_ConvertUTF8toUTF16(aMsgToken));
+  // Reading a missing body must not create or repair the store hierarchy.
+  rv = path->Append(u"cur"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = path->Append(NS_ConvertUTF8toUTF16(aMsgToken));
+  NS_ENSURE_SUCCESS(rv, rv);
   return NS_NewLocalFileInputStream(aResult, path);
 }
 

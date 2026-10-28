@@ -2,6 +2,8 @@
 
 ["test_localServerFromPrefs.js"]
 
+["test_mailStoreRead.js"]
+
 ["test_pop3Download.js"]
 
 ["test_pop3ServerFromPrefs.js"]

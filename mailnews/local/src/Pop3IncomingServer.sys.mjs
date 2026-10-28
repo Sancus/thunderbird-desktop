@@ -254,9 +254,28 @@ export class Pop3IncomingServer extends MsgIncomingServer {
   }
 
   downloadMailFromServers(servers, msgWindow, folder, urlListener) {
+    this._downloadMailFromServers(
+      servers,
+      msgWindow,
+      folder,
+      urlListener,
+      Cr.NS_OK
+    );
+  }
+
+  /**
+   * Download from the remaining accounts, retaining the first failure.
+   *
+   * @param {nsIPop3IncomingServer[]} servers - Remaining accounts, consumed in order.
+   * @param {?nsIMsgWindow} msgWindow - Window for download progress and prompts.
+   * @param {nsIMsgFolder} folder - Shared destination folder.
+   * @param {?nsIUrlListener} urlListener - Receives the final aggregate status.
+   * @param {nsresult} status - Status of the accounts already processed.
+   */
+  _downloadMailFromServers(servers, msgWindow, folder, urlListener, status) {
     const server = servers.shift();
     if (!server) {
-      urlListener?.OnStopRunningUrl(null, Cr.NS_OK);
+      urlListener?.OnStopRunningUrl(null, status);
       return;
     }
 
@@ -265,28 +284,45 @@ export class Pop3IncomingServer extends MsgIncomingServer {
     if (server == folder.server || server.deferGetNewMail) {
       // This recursive loop occurs on check new mail at startup and when
       // getting new mail for all servers.
-      MailServices.pop3.GetNewMail(
-        msgWindow,
-        {
-          OnStartRunningUrl() {},
-          OnStopRunningUrl: () => {
-            // Call GetNewMail for the next server only after it is finished for
-            // the current server.
-            // Note: this doesn't actually serialize the connections/clients
-            this.downloadMailFromServers(
-              servers,
-              msgWindow,
-              folder,
-              urlListener
-            );
+      try {
+        MailServices.pop3.GetNewMail(
+          msgWindow,
+          {
+            OnStartRunningUrl() {},
+            OnStopRunningUrl: (url, result) => {
+              // Continue other accounts without losing the first failure.
+              this._downloadMailFromServers(
+                servers,
+                msgWindow,
+                folder,
+                urlListener,
+                Components.isSuccessCode(status) ? result : status
+              );
+            },
           },
-        },
-        folder,
-        server
-      );
+          folder,
+          server
+        );
+      } catch (error) {
+        this._downloadMailFromServers(
+          servers,
+          msgWindow,
+          folder,
+          urlListener,
+          Components.isSuccessCode(status)
+            ? error.result || Cr.NS_ERROR_FAILURE
+            : status
+        );
+      }
       return;
     }
-    this.downloadMailFromServers(servers, msgWindow, folder, urlListener);
+    this._downloadMailFromServers(
+      servers,
+      msgWindow,
+      folder,
+      urlListener,
+      status
+    );
   }
 
   /**

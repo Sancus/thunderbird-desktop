@@ -237,3 +237,180 @@ add_task(async function testBareLFHeaderSeparator() {
   delete handler.postCommand;
   MailServices.accounts.removeIncomingServer(incomingServer, false);
 });
+
+/**
+ * Download two deferred accounts when one server rejects the connection.
+ *
+ * @param {string} store - Destination store type.
+ * @param {boolean} failingFirst - Process the failing account first.
+ */
+async function checkDeferredDownloadFailure(store, failingFirst) {
+  const storeID =
+    store == "mbox"
+      ? "@mozilla.org/msgstore/berkeleystore;1"
+      : "@mozilla.org/msgstore/maildirstore;1";
+  const previousStore = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  const [badDaemon, badServer, badHandler] = setupServerDaemon();
+  const [goodDaemon, goodServer] = setupServerDaemon();
+  const accounts = [];
+  badHandler.onStartup = () => "-ERR Delivery unavailable";
+  badDaemon.setMessages(["message1.eml"]);
+  goodDaemon.setMessages([
+    {
+      fileData:
+        "From: sender@example.invalid\r\n" +
+        "To: recipient@example.invalid\r\n" +
+        "Subject: Deferred download\r\n" +
+        "Message-ID: <deferred-download@example.invalid>\r\n" +
+        "Date: Tue, 01 Jan 2019 12:00:00 +0000\r\n" +
+        "\r\n" +
+        "Deferred download body.\r\n",
+    },
+  ]);
+  try {
+    badServer.start();
+    goodServer.start();
+    localAccountUtils.clearAll();
+    Services.prefs.setCharPref("mail.serverDefaultStoreContractID", storeID);
+    localAccountUtils.loadLocalMailAccount();
+    const inbox = localAccountUtils.inboxFolder;
+    Assert.equal(inbox.msgStore.storeType, store);
+    Assert.equal(inbox.server.msgStore.storeType, store);
+    const dbService = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && dbService instanceof Ci.nsIDatabaseCore,
+      Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    );
+    Assert.equal(dbService.openFolderDB(inbox, false), inbox.msgDatabase);
+
+    for (const popServer of [badServer, goodServer]) {
+      const accountAndServer =
+        localAccountUtils.create_incoming_server_and_account(
+          "pop3",
+          popServer.port,
+          "fred",
+          "wilma"
+        );
+      accounts.push(accountAndServer);
+      accountAndServer.server.deferGetNewMail = true;
+      Assert.equal(
+        accountAndServer.server.deferredToAccount,
+        localAccountUtils.msgAccount.key
+      );
+      Assert.equal(accountAndServer.server.rootMsgFolder, inbox.parent);
+    }
+    const [badIncoming, goodIncoming] = accounts.map(item => item.server);
+    const pending = failingFirst
+      ? [badIncoming, goodIncoming]
+      : [goodIncoming, badIncoming];
+    const { promise, resolve } = Promise.withResolvers();
+    const completions = [];
+    badIncoming.downloadMailFromServers(pending, null, inbox, {
+      OnStartRunningUrl() {},
+      OnStopRunningUrl(url, status) {
+        completions.push({ url, status });
+        resolve();
+      },
+    });
+    await promise;
+    await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+    Assert.deepEqual(completions, [{ url: null, status: Cr.NS_ERROR_FAILURE }]);
+    Assert.equal(badDaemon.getTotalMessages(), 1, "Failed source is retained");
+    Assert.equal(goodDaemon.getTotalMessages(), 0, "Other account completed");
+    do_check_transaction(goodServer.playTransaction(), [
+      "CAPA",
+      "AUTH PLAIN",
+      "STAT",
+      "LIST",
+      "UIDL",
+      "RETR 1",
+      "DELE 1",
+    ]);
+    const messages = [...inbox.messages];
+    Assert.equal(messages.length, 1);
+    Assert.equal(messages[0].subject, "Deferred download");
+    Assert.equal(messages[0].messageId, "deferred-download@example.invalid");
+    const raw = mailTestUtils
+      .loadMessageToString(inbox, messages[0])
+      .replaceAll("\r\n", "\n");
+    Assert.equal(
+      raw.slice(raw.indexOf("\n\n") + 2),
+      "Deferred download body.\n"
+    );
+    Assert.ok(!inbox.locked, "The destination is unlocked after completion");
+  } finally {
+    for (const { account } of accounts) {
+      MailServices.accounts.removeAccount(account);
+    }
+    localAccountUtils.clearAll();
+    Services.prefs.setCharPref(
+      "mail.serverDefaultStoreContractID",
+      previousStore
+    );
+    goodServer.stop();
+    badServer.stop();
+  }
+}
+
+add_task(async function test_deferredFailureBeforeSuccessMbox() {
+  await checkDeferredDownloadFailure("mbox", true);
+});
+
+add_task(async function test_deferredFailureBeforeSuccessMaildir() {
+  await checkDeferredDownloadFailure("maildir", true);
+});
+
+add_task(async function test_deferredFailureAfterSuccessMbox() {
+  await checkDeferredDownloadFailure("mbox", false);
+});
+
+add_task(async function test_deferredFailureAfterSuccessMaildir() {
+  await checkDeferredDownloadFailure("maildir", false);
+});
+
+add_task(async function test_deferredDownloadOfflineError() {
+  localAccountUtils.loadLocalMailAccount();
+  const { server: incomingServer, account } =
+    localAccountUtils.create_incoming_server_and_account(
+      "pop3",
+      server.port,
+      "fred",
+      "wilma"
+    );
+  incomingServer.deferGetNewMail = true;
+  const inbox = localAccountUtils.inboxFolder;
+  const previousOffline = Services.io.offline;
+  const previousManageOffline = Services.io.manageOfflineStatus;
+  const originalKeys = [...inbox.messages].map(hdr => hdr.messageKey);
+  try {
+    Services.io.manageOfflineStatus = false;
+    Services.io.offline = true;
+    const { promise, resolve } = Promise.withResolvers();
+    const completions = [];
+    incomingServer.downloadMailFromServers([incomingServer], null, inbox, {
+      OnStartRunningUrl() {},
+      OnStopRunningUrl(url, status) {
+        completions.push({ url, status });
+        resolve();
+      },
+    });
+    await promise;
+    Assert.deepEqual(completions, [
+      { url: null, status: Cr.NS_MSG_ERROR_OFFLINE },
+    ]);
+    Assert.deepEqual(
+      [...inbox.messages].map(hdr => hdr.messageKey),
+      originalKeys
+    );
+    Assert.ok(!inbox.locked);
+    Assert.ok(!incomingServer.serverBusy);
+  } finally {
+    Services.io.offline = previousOffline;
+    Services.io.manageOfflineStatus = previousManageOffline;
+    MailServices.accounts.removeAccount(account);
+  }
+});

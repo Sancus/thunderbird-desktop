@@ -31,11 +31,13 @@
 #include "nsAppDirectoryServiceDefs.h"
 #include "nsIClassInfoImpl.h"
 #include "nsICryptoHash.h"
+#include "nsID.h"
 #include "nsIFile.h"
 #include "nsIInputStream.h"
 #include "nsILineInputStream.h"
 #include "nsIMimeConverter.h"
 #include "nsIObserverService.h"
+#include "nsIUUIDGenerator.h"
 #include "nsMsgFolderFlags.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
@@ -231,6 +233,202 @@ constexpr auto kReferenceDeleteTrigger =
     "DELETE FROM message_references WHERE id = OLD.id; "
     "DELETE FROM message_reference_sets WHERE id = OLD.id; END"_ns;
 
+constexpr auto kMessageKeyGuard =
+    "CREATE TRIGGER guard_message_key BEFORE INSERT ON messages "
+    "WHEN NEW.id <= 0 OR NEW.id >= 4294967295 OR "
+    "NOT EXISTS(SELECT 1 FROM message_key_allocator WHERE singleton = 1) OR "
+    "NEW.id <= (SELECT highWater FROM message_key_allocator WHERE singleton = "
+    "1) "
+    "BEGIN SELECT RAISE(ABORT, 'invalid message key'); END"_ns;
+constexpr auto kMessageKeyRecord =
+    "CREATE TRIGGER record_message_key AFTER INSERT ON messages BEGIN "
+    "UPDATE message_key_allocator SET highWater = NEW.id WHERE singleton = 1; END"_ns;
+
+constexpr auto kMessageKeyImmutable =
+    "CREATE TRIGGER immutable_message_key BEFORE UPDATE OF id ON messages "
+    "WHEN NEW.id IS NOT OLD.id BEGIN SELECT RAISE(ABORT, 'immutable message key'); END"_ns;
+
+constexpr auto kStagedMessageKeyGuard =
+    "CREATE TRIGGER guard_message_key BEFORE INSERT ON messages "
+    "WHEN NEW.id <= 0 OR NEW.id >= 4294967295 OR "
+    "NOT EXISTS(SELECT 1 FROM message_key_allocator WHERE singleton = 1) OR "
+    "(NEW.id <= (SELECT highWater FROM message_key_allocator WHERE singleton = "
+    "1) "
+    "AND NOT EXISTS(SELECT 1 FROM staged_messages WHERE id = NEW.id "
+    "AND folderId = NEW.folderId)) "
+    "BEGIN SELECT RAISE(ABORT, 'invalid message key'); END"_ns;
+constexpr auto kStagedMessageKeyRecord =
+    "CREATE TRIGGER record_message_key AFTER INSERT ON messages BEGIN "
+    "UPDATE message_key_allocator SET highWater = MAX(highWater, NEW.id) "
+    "WHERE singleton = 1; END"_ns;
+constexpr auto kStagedDelete =
+    "CREATE TRIGGER delete_staged_header AFTER DELETE ON staged_messages BEGIN "
+    "DELETE FROM staged_message_properties WHERE id = OLD.id; "
+    "DELETE FROM staged_message_references WHERE id = OLD.id; "
+    "DELETE FROM staged_message_reference_sets WHERE id = OLD.id; END"_ns;
+
+nsCString SearchChangeSQL(const nsACString& id, const nsACString& contentDelta,
+                          const nsACString& locationDelta, bool deleted) {
+  nsCString sql(
+      "INSERT INTO message_changes(messageId, contentRevision, "
+      "locationRevision, deleted) VALUES ("_ns);
+  sql.Append(id);
+  for (const auto& field : {"contentRevision", "locationRevision"}) {
+    sql.AppendLiteral(", COALESCE((SELECT ");
+    sql.Append(field);
+    sql.AppendLiteral(" FROM message_changes WHERE messageId = ");
+    sql.Append(id);
+    sql.AppendLiteral(" ORDER BY sequence DESC LIMIT 1), 0) + (");
+    sql.Append(strcmp(field, "contentRevision") == 0 ? contentDelta
+                                                     : locationDelta);
+    sql.Append(')');
+  }
+  sql.Append(deleted ? ", 1);" : ", 0);");
+  return sql;
+}
+
+enum class SearchTriggerAction { CreateAll, CheckAll, ReplacePolicy };
+
+nsresult SearchChangeTriggers(mozIStorageConnection* connection,
+                              SearchTriggerAction action, bool legacyPolicy) {
+  struct Trigger {
+    nsCString name;
+    nsCString sql;
+  };
+  nsTArray<Trigger> triggers;
+  auto add = [&](const char* name, const char* event, const char* table,
+                 const nsACString& condition, const nsACString& write) {
+    Trigger trigger;
+    trigger.name.Assign(name);
+    trigger.sql.AssignLiteral("CREATE TRIGGER ");
+    trigger.sql.Append(name);
+    trigger.sql.AppendLiteral(" AFTER ");
+    trigger.sql.Append(event);
+    trigger.sql.AppendLiteral(" ON ");
+    trigger.sql.Append(table);
+    if (!condition.IsEmpty()) {
+      trigger.sql.AppendLiteral(" WHEN ");
+      trigger.sql.Append(condition);
+    }
+    trigger.sql.AppendLiteral(" BEGIN ");
+    trigger.sql.Append(write);
+    trigger.sql.AppendLiteral(" END");
+    triggers.AppendElement(std::move(trigger));
+  };
+  add("search_message_insert", "INSERT", "messages", EmptyCString(),
+      SearchChangeSQL("NEW.id"_ns, "1"_ns, "1"_ns, false));
+  add("search_message_update", "UPDATE", "messages", EmptyCString(),
+      SearchChangeSQL(
+          "NEW.id"_ns,
+          "CASE WHEN NEW.subject IS NOT OLD.subject OR NEW.sender IS NOT "
+          "OLD.sender "
+          "OR NEW.recipients IS NOT OLD.recipients OR NEW.ccList IS NOT "
+          "OLD.ccList "
+          "OR NEW.bccList IS NOT OLD.bccList THEN 1 ELSE 0 END"_ns,
+          "CASE WHEN NEW.folderId IS NOT OLD.folderId THEN 1 ELSE 0 END"_ns,
+          false));
+  add("search_message_delete", "DELETE", "messages", EmptyCString(),
+      SearchChangeSQL("OLD.id"_ns, "0"_ns, "1"_ns, true));
+  for (const char* table :
+       {"message_properties", "message_references", "message_reference_sets"}) {
+    for (const char* event : {"INSERT", "UPDATE", "DELETE"}) {
+      nsAutoCString prefix(strcmp(event, "DELETE") == 0 ? "OLD" : "NEW");
+      nsAutoCString id(prefix);
+      id.AppendLiteral(".id");
+      nsAutoCString condition("EXISTS(SELECT 1 FROM messages WHERE id = "_ns);
+      condition.Append(id);
+      condition.Append(')');
+      nsAutoCString content("0"_ns), location("0"_ns);
+      if (strcmp(table, "message_properties") == 0) {
+        content.AssignLiteral("CASE WHEN ");
+        content.Append(prefix);
+        content.AppendLiteral(
+            ".name IN ('storeToken', 'messageSize', 'offlineMessageSize', "
+            "'lineCount', 'msgCharSet') THEN 1 ELSE 0 END");
+        location.AssignLiteral("CASE WHEN ");
+        location.Append(prefix);
+        location.AppendLiteral(
+            ".name IN ('storeToken', 'uidOnServer') THEN 1 ELSE 0 END");
+      }
+      nsAutoCString name("search_"_ns);
+      name.Append(table);
+      name.Append('_');
+      name.Append(event);
+      add(name.get(), event, table, condition,
+          SearchChangeSQL(id, content, location, false));
+    }
+  }
+  const nsCString policy = SearchChangeSQL("NULL"_ns, "0"_ns, "0"_ns, false);
+  add("search_folder_policy", "UPDATE OF parent, name, flags", "folders",
+      EmptyCString(), policy);
+  if (!legacyPolicy) {
+    add("search_folder_delete", "DELETE", "folders", EmptyCString(), policy);
+  }
+  for (const char* event : {"INSERT", "UPDATE", "DELETE"}) {
+    nsAutoCString name("search_folder_properties_"_ns);
+    name.Append(event);
+    nsCString condition;
+    if (!legacyPolicy) {
+      if (strcmp(event, "UPDATE") == 0) {
+        condition.AssignLiteral(
+            "(NEW.name = 'indexingPriority' OR OLD.name = 'indexingPriority') "
+            "AND (NEW.id IS NOT OLD.id OR NEW.name IS NOT OLD.name "
+            "OR NEW.value IS NOT OLD.value)");
+      } else {
+        condition.Assign(strcmp(event, "DELETE") == 0 ? "OLD" : "NEW");
+        condition.AppendLiteral(".name = 'indexingPriority'");
+      }
+    }
+    add(name.get(), event, "folder_properties", condition, policy);
+  }
+  for (const auto& trigger : triggers) {
+    if (action == SearchTriggerAction::ReplacePolicy) {
+      if (trigger.name.Find("search_folder_") != 0) {
+        continue;
+      }
+      nsAutoCString drop("DROP TRIGGER IF EXISTS "_ns);
+      drop.Append(trigger.name);
+      MOZ_TRY(connection->ExecuteSimpleSQL(drop));
+    }
+    if (action != SearchTriggerAction::CheckAll) {
+      MOZ_TRY(connection->ExecuteSimpleSQL(trigger.sql));
+    } else {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(connection->CreateStatement(
+          "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = :name"_ns,
+          getter_AddRefs(stmt)));
+      MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, trigger.name));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+      nsCString sql;
+      MOZ_TRY(stmt->GetUTF8String(0, sql));
+      NS_ENSURE_TRUE(sql.Equals(trigger.sql), NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+  return NS_OK;
+}
+
+nsresult ReadDatabaseSourceId(mozIStorageConnection* connection,
+                              nsACString& sourceId) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(connection->CreateStatement(
+      "SELECT sourceId FROM database_identity WHERE singleton = 1"_ns,
+      getter_AddRefs(stmt)));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  nsCString value;
+  MOZ_TRY(stmt->GetUTF8String(0, value));
+  nsID parsed;
+  NS_ENSURE_TRUE(value.Length() == NSID_LENGTH - 1 && parsed.Parse(value.get()),
+                 NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(!more, NS_ERROR_FILE_CORRUPTED);
+  sourceId = value;
+  return NS_OK;
+}
+
 nsresult CheckReferenceSchemaTable(mozIStorageConnection* connection,
                                    const char* table, const char* columns) {
   nsCOMPtr<mozIStorageStatement> stmt;
@@ -255,7 +453,7 @@ nsresult CheckReferenceSchemaTable(mozIStorageConnection* connection,
 nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version >= 0 && version <= 2, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 8, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -350,6 +548,259 @@ nsresult DatabaseCore::UpgradeSchema() {
         "ALTER TABLE message_properties_v2 RENAME TO message_properties;"_ns));
     MOZ_TRY(sConnection->SetSchemaVersion(2));
   }
+  if (version < 3) {
+    nsCOMPtr<mozIStorageStatement> invalid;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT 1 FROM messages WHERE id <= 0 OR id >= 4294967295 LIMIT 1"_ns,
+        getter_AddRefs(invalid)));
+    bool badKey;
+    MOZ_TRY(invalid->ExecuteStep(&badKey));
+    NS_ENSURE_TRUE(!badKey, NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE message_key_allocator("
+        "singleton INTEGER PRIMARY KEY CHECK(singleton = 1), "
+        "highWater INTEGER NOT NULL CHECK(highWater >= 0 AND highWater <= "
+        "4294967294));"
+        "INSERT INTO message_key_allocator "
+        "SELECT 1, COALESCE(MAX(id), 0) FROM messages;"_ns));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kMessageKeyGuard));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kMessageKeyRecord));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kMessageKeyImmutable));
+    MOZ_TRY(sConnection->SetSchemaVersion(3));
+  }
+  MOZ_TRY(
+      CheckReferenceSchemaTable(sConnection, "message_key_allocator",
+                                "singleton:INTEGER:0:1,highWater:INTEGER:1:0"));
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT 1 FROM message_key_allocator WHERE singleton = 1 "
+        "AND typeof(highWater) = 'integer' AND highWater >= 0 "
+        "AND highWater <= 4294967294 "
+        "AND highWater >= (SELECT COALESCE(MAX(id), 0) FROM messages)"_ns,
+        getter_AddRefs(stmt)));
+    bool valid;
+    MOZ_TRY(stmt->ExecuteStep(&valid));
+    NS_ENSURE_TRUE(valid, NS_ERROR_FILE_CORRUPTED);
+  }
+
+  for (const char* name :
+       {"guard_message_key", "record_message_key", "immutable_message_key"}) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+        "AND name = :name AND tbl_name = 'messages'"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, nsDependentCString(name)));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+    nsCString sql;
+    MOZ_TRY(stmt->GetUTF8String(0, sql));
+    bool matches;
+    if (strcmp(name, "guard_message_key") == 0) {
+      matches =
+          sql.Equals(version >= 5 ? kStagedMessageKeyGuard : kMessageKeyGuard);
+    } else if (strcmp(name, "record_message_key") == 0) {
+      matches = sql.Equals(version >= 5 ? kStagedMessageKeyRecord
+                                        : kMessageKeyRecord);
+    } else {
+      matches = sql.Equals(kMessageKeyImmutable);
+    }
+    NS_ENSURE_TRUE(matches, NS_ERROR_FILE_CORRUPTED);
+  }
+
+  if (version < 4) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE message_changes("
+        "sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK(sequence <= "
+        "9007199254740991), "
+        "messageId INTEGER, contentRevision INTEGER NOT NULL, "
+        "locationRevision INTEGER NOT NULL, deleted INTEGER NOT NULL);"
+        "CREATE INDEX message_changes_messageId ON message_changes(messageId, "
+        "sequence);"
+        "INSERT INTO message_changes(messageId, contentRevision, "
+        "locationRevision, deleted) "
+        "SELECT id, 1, 1, 0 FROM messages ORDER BY id;"_ns));
+    MOZ_TRY(SearchChangeTriggers(sConnection, SearchTriggerAction::CreateAll,
+                                 true));
+    MOZ_TRY(sConnection->SetSchemaVersion(4));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "message_changes",
+      "sequence:INTEGER:0:1,messageId:INTEGER:0:0,contentRevision:INTEGER:1:0,"
+      "locationRevision:INTEGER:1:0,deleted:INTEGER:1:0"));
+  MOZ_TRY(SearchChangeTriggers(sConnection, SearchTriggerAction::CheckAll,
+                               version < 7));
+  if (version < 5) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE staged_messages("
+        "id INTEGER PRIMARY KEY CHECK(id > 0 AND id < 4294967295), "
+        "folderId INTEGER REFERENCES folders(id), threadId INTEGER, "
+        "threadParent INTEGER, messageId TEXT, date INTEGER, sender TEXT, "
+        "recipients TEXT, ccList TEXT, bccList TEXT, subject TEXT, flags "
+        "INTEGER, "
+        "tags TEXT, priority INTEGER);"
+        "CREATE TABLE staged_message_properties("
+        "id INTEGER REFERENCES staged_messages(id), name TEXT, value BLOB, "
+        "PRIMARY KEY(id, name));"
+        "CREATE TABLE staged_message_reference_sets("
+        "id INTEGER PRIMARY KEY REFERENCES staged_messages(id));"
+        "CREATE TABLE staged_message_references("
+        "id INTEGER REFERENCES staged_messages(id), ordinal INTEGER, "
+        "token TEXT NOT NULL, PRIMARY KEY(id, ordinal));"
+        "DROP TRIGGER guard_message_key; DROP TRIGGER record_message_key;"_ns));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kStagedMessageKeyGuard));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kStagedMessageKeyRecord));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kStagedDelete));
+    MOZ_TRY(sConnection->SetSchemaVersion(5));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(sConnection, "staged_messages",
+                                    layouts[1].columns));
+  MOZ_TRY(
+      CheckReferenceSchemaTable(sConnection, "staged_message_properties",
+                                "id:INTEGER:0:1,name:TEXT:0:2,value:BLOB:0:0"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "staged_message_reference_sets", "id:INTEGER:0:1"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "staged_message_references",
+      "id:INTEGER:0:1,ordinal:INTEGER:0:2,token:TEXT:1:0"));
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT 1 FROM staged_messages s WHERE "
+        "s.id > (SELECT highWater FROM message_key_allocator WHERE singleton = "
+        "1) "
+        "OR EXISTS(SELECT 1 FROM messages m WHERE m.id = s.id) LIMIT 1"_ns,
+        getter_AddRefs(stmt)));
+    bool invalid;
+    MOZ_TRY(stmt->ExecuteStep(&invalid));
+    NS_ENSURE_TRUE(!invalid, NS_ERROR_FILE_CORRUPTED);
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+        "AND name = 'delete_staged_header'"_ns,
+        getter_AddRefs(stmt)));
+    bool exists;
+    MOZ_TRY(stmt->ExecuteStep(&exists));
+    NS_ENSURE_TRUE(exists, NS_ERROR_FILE_CORRUPTED);
+    nsCString sql;
+    MOZ_TRY(stmt->GetUTF8String(0, sql));
+    NS_ENSURE_TRUE(sql.Equals(kStagedDelete), NS_ERROR_FILE_CORRUPTED);
+  }
+  if (version < 6) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE offline_operations("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, folderId INTEGER NOT NULL, "
+        "messageKey INTEGER NOT NULL, revision INTEGER NOT NULL, "
+        "epoch INTEGER, uid INTEGER, operation INTEGER NOT NULL, "
+        "flagOperation INTEGER NOT NULL, newFlags INTEGER NOT NULL, "
+        "sourceKey INTEGER NOT NULL, sourceUid INTEGER NOT NULL, "
+        "messageSize INTEGER NOT NULL, playingBack INTEGER NOT NULL, "
+        "sourceFolderURI TEXT NOT NULL, destinationFolderURI TEXT NOT NULL, "
+        "keywordsToAdd TEXT NOT NULL, keywordsToRemove TEXT NOT NULL, "
+        "folderEpoch INTEGER, UNIQUE(folderId, messageKey));"
+        "CREATE TABLE offline_copy_destinations("
+        "operationId INTEGER NOT NULL, ordinal INTEGER NOT NULL, uri TEXT NOT "
+        "NULL, "
+        "PRIMARY KEY(operationId, ordinal));"
+        "CREATE TABLE offline_attempts("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, operationId INTEGER NOT NULL, "
+        "revision INTEGER NOT NULL, state INTEGER NOT NULL CHECK(state IN "
+        "(0,1,2,3)), "
+        "sourceFolderId INTEGER, sourceKey INTEGER, sourceEpoch INTEGER, "
+        "sourceUid INTEGER, "
+        "destinationFolderId INTEGER, destinationKey INTEGER, destinationEpoch "
+        "INTEGER, "
+        "confirmedUid INTEGER, operationFolderId INTEGER NOT NULL, "
+        "operationEpoch INTEGER, operation INTEGER NOT NULL);"
+        "CREATE INDEX offline_attempts_operation ON "
+        "offline_attempts(operationId, id);"
+        "CREATE TRIGGER delete_offline_copies AFTER DELETE ON "
+        "offline_operations "
+        "BEGIN DELETE FROM offline_copy_destinations WHERE operationId = OLD.id; END;"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(6));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_operations",
+      "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
+      "INTEGER:1:0,"
+      "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
+      "INTEGER:1:0,"
+      "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
+      "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:1:"
+      "0,"
+      "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
+      "TEXT:1:0,folderEpoch:INTEGER:0:0"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_copy_destinations",
+      "operationId:INTEGER:1:1,ordinal:INTEGER:1:2,uri:TEXT:1:0"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_attempts",
+      "id:INTEGER:0:1,operationId:INTEGER:1:0,revision:INTEGER:1:0,state:"
+      "INTEGER:1:0,"
+      "sourceFolderId:INTEGER:0:0,sourceKey:INTEGER:0:0,sourceEpoch:INTEGER:0:"
+      "0,"
+      "sourceUid:INTEGER:0:0,destinationFolderId:INTEGER:0:0,destinationKey:"
+      "INTEGER:0:0,"
+      "destinationEpoch:INTEGER:0:0,confirmedUid:INTEGER:0:0,operationFolderId:"
+      "INTEGER:1:0,operationEpoch:INTEGER:0:0,operation:INTEGER:1:0"));
+  if (version < 7) {
+    MOZ_TRY(SearchChangeTriggers(sConnection,
+                                 SearchTriggerAction::ReplacePolicy, false));
+    MOZ_TRY(sConnection->SetSchemaVersion(7));
+  }
+  if (version < 8) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE database_identity (singleton INTEGER PRIMARY KEY "
+        "CHECK(singleton = 1), sourceId TEXT NOT NULL)"_ns));
+    nsCOMPtr<nsIUUIDGenerator> generator =
+        mozilla::components::UUIDGenerator::Service();
+    NS_ENSURE_TRUE(generator, NS_ERROR_FAILURE);
+    nsID id;
+    MOZ_TRY(generator->GenerateUUIDInPlace(&id));
+    char value[NSID_LENGTH];
+    id.ToProvidedString(value);
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "INSERT INTO database_identity(singleton, sourceId) VALUES(1, :sourceId)"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(
+        stmt->BindUTF8StringByName("sourceId"_ns, nsDependentCString(value)));
+    MOZ_TRY(stmt->Execute());
+    MOZ_TRY(sConnection->SetSchemaVersion(8));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(sConnection, "database_identity",
+                                    "singleton:INTEGER:0:1,sourceId:TEXT:1:0"));
+  nsCString sourceId;
+  MOZ_TRY(ReadDatabaseSourceId(sConnection, sourceId));
+  return NS_OK;
+}
+
+nsresult DatabaseCore::GetNextMessageKey(nsMsgKey& key) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(GetStatement(
+      "NextMessageKey"_ns,
+      "SELECT highWater, typeof(highWater) FROM message_key_allocator "
+      "WHERE singleton = 1"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  nsCString type;
+  MOZ_TRY(stmt->GetUTF8String(1, type));
+  int64_t highWater;
+  MOZ_TRY(stmt->GetInt64(0, &highWater));
+  NS_ENSURE_TRUE(type.EqualsLiteral("integer") && highWater >= 0 &&
+                     highWater < nsMsgKey_None,
+                 NS_ERROR_FILE_CORRUPTED);
+  if (highWater == nsMsgKey_None - 1) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+  key = static_cast<nsMsgKey>(highWater + 1);
   return NS_OK;
 }
 
@@ -754,9 +1205,9 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
 
     rv = DatabaseCore::GetStatement("AddMigratedMessage"_ns,
                                     "INSERT INTO messages ( \
-                                  folderId, messageId, date, sender, recipients, ccList, bccList, subject, flags, tags \
+                                  id, folderId, messageId, date, sender, recipients, ccList, bccList, subject, flags, tags \
                                 ) VALUES ( \
-                                  :folderId, :messageId, :date, :sender, :recipients, :ccList, :bccList, :subject, :flags, :tags \
+                                  (SELECT highWater + 1 FROM message_key_allocator WHERE singleton = 1), :folderId, :messageId, :date, :sender, :recipients, :ccList, :bccList, :subject, :flags, :tags \
                                 ) RETURNING "_ns MESSAGE_SQL_FIELDS,
                                     getter_AddRefs(mStmt));
     NS_ENSURE_SUCCESS(rv, rv);
@@ -1189,6 +1640,18 @@ DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,
 
   promise.forget(aPromise);
   return NS_OK;
+}
+
+NS_IMETHODIMP DatabaseCore::GetSourceId(nsACString& sourceId) {
+  if (sInstance.get() != this || !sConnection) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  bool active;
+  MOZ_TRY(sConnection->GetTransactionInProgress(&active));
+  if (active) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  return ReadDatabaseSourceId(sConnection, sourceId);
 }
 
 NS_IMETHODIMP

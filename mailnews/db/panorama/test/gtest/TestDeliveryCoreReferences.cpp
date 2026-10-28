@@ -242,6 +242,123 @@ class DeliveryCoreReferences : public testing::Test {
     return NS_OK;
   }
 
+  void CheckUsedDestinationRejected(OfflineAttemptState state) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& db = mCore->MessageDB();
+    uint32_t epoch = 91;
+    ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, epoch));
+    RawHdr raw;
+    raw.messageId = "used-destination@invalid"_ns;
+    nsMsgKey used, fresh;
+    ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &used));
+    raw.messageId = "fresh-destination@invalid"_ns;
+    ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &fresh));
+    OfflineOperationData payload;
+    payload.operation = 0x10;
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, used, payload));
+    uint64_t first;
+    ASSERT_EQ(NS_OK,
+              db.BeginOfflineAttempt(
+                  mFolderId, used, 0x10,
+                  Some(PendingDestination{mFolderId, used, epoch}), first));
+    if (state == OfflineAttemptState::Ambiguous) {
+      ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(first));
+    } else if (state == OfflineAttemptState::Confirmed) {
+      ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(
+                           first, Some(ServerUidConfirmation{epoch, 42})));
+      // Retiring the old binding does not make this physical key unused.
+      ++epoch;
+      ASSERT_EQ(NS_OK,
+                mCore->FolderDB().SetFolderUidValidity(mFolderId, epoch));
+    }
+    nsTArray<nsCString> names;
+    ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(used, names));
+    ASSERT_FALSE(names.Contains("uidOnServer"_ns));
+    OfflineAttempt original;
+    ASSERT_EQ(NS_OK, db.GetOfflineAttempt(first, original));
+    EXPECT_EQ(state, original.state);
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, fresh, payload));
+    uint64_t output = 123;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BeginOfflineAttempt(
+                  mFolderId, fresh, 0x10,
+                  Some(PendingDestination{mFolderId, used, epoch}), output));
+    EXPECT_EQ(123u, output);
+    OfflineAttempt untouched;
+    untouched.id = 88;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.GetCurrentOfflineAttempt(mFolderId, fresh, untouched));
+    EXPECT_EQ(88u, untouched.id);
+    ASSERT_EQ(NS_OK,
+              db.BeginOfflineAttempt(
+                  mFolderId, fresh, 0x10,
+                  Some(PendingDestination{mFolderId, fresh, epoch}), output));
+    EXPECT_NE(first, output);
+  }
+
+  void CheckSelfDestinationRejected(uint32_t action) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& db = mCore->MessageDB();
+    ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 92));
+    nsMsgKey source, destination;
+    ASSERT_EQ(NS_OK, Add("self-source@invalid"_ns, {}, source));
+    ASSERT_EQ(NS_OK, db.BindMessageToServerUid(source, mFolderId, 92, 42));
+    RawHdr raw;
+    raw.messageId = "distinct-destination@invalid"_ns;
+    ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &destination));
+    OfflineOperationData payload;
+    payload.operation = action;
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, source, payload));
+    uint64_t output = 123;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BeginOfflineAttempt(
+                  mFolderId, source, action,
+                  Some(PendingDestination{mFolderId, source, 92}), output));
+    EXPECT_EQ(123u, output);
+    ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(
+                         mFolderId, source, action,
+                         Some(PendingDestination{mFolderId, destination, 92}),
+                         output));
+    OfflineAttempt attempt;
+    ASSERT_EQ(NS_OK, db.GetOfflineAttempt(output, attempt));
+    ASSERT_TRUE(attempt.source);
+    ASSERT_TRUE(attempt.destination);
+    EXPECT_EQ(source, attempt.source->key);
+    EXPECT_EQ(destination, attempt.destination->key);
+  }
+
+  void CheckOfflineSource(nsMsgKey key, uint32_t expectedEpoch,
+                          uint32_t expectedUid) {
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    auto close = MakeScopeExit([&] {
+      if (stmt) {
+        EXPECT_EQ(NS_OK, stmt->Finalize());
+      }
+      EXPECT_EQ(NS_OK, reader->Close());
+    });
+    ASSERT_EQ(NS_OK,
+              reader->CreateStatement(
+                  "SELECT epoch, uid, folderEpoch FROM offline_operations "
+                  "WHERE folderId = :folder AND messageKey = :key"_ns,
+                  getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("folder"_ns, mFolderId));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, key));
+    bool more, folderWide;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    int64_t epoch, uid;
+    ASSERT_EQ(NS_OK, stmt->GetInt64(0, &epoch));
+    ASSERT_EQ(NS_OK, stmt->GetInt64(1, &uid));
+    ASSERT_EQ(NS_OK, stmt->GetIsNull(2, &folderWide));
+    EXPECT_EQ(expectedEpoch, epoch);
+    EXPECT_EQ(expectedUid, uid);
+    EXPECT_TRUE(folderWide);
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    EXPECT_FALSE(more);
+  }
+
   nsresult StoredKnownMarker(nsMsgKey key, bool& known) {
     nsCOMPtr<mozIStorageConnection> reader;
     MOZ_TRY(Open(getter_AddRefs(reader)));
@@ -504,7 +621,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   EXPECT_TRUE(got.IsEmpty());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(2, version);
+  EXPECT_EQ(8, version);
   Stop();
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(7, got));
@@ -1888,6 +2005,955 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReadsStagedReferences) {
   nsTArray<nsCString> stored;
   ASSERT_EQ(NS_OK, Stored(child, stored));
   EXPECT_EQ((nsTArray<nsCString>{"absent@invalid"_ns}), stored);
+}
+
+TEST_F(DeliveryCoreReferences, StagingKeepsPhysicalIdentityOutOfMembership) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("published@invalid"_ns, {}, control));
+  uint32_t publications = 0;
+  nsMsgKey staged = nsMsgKey_None;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message* message, bool notifyLegacy) {
+        ++publications;
+        EXPECT_FALSE(notifyLegacy);
+        nsMsgKey observed;
+        ASSERT_EQ(NS_OK, message->GetMessageKey(&observed));
+        EXPECT_EQ(staged, observed);
+        bool active = true;
+        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        EXPECT_FALSE(active);
+        nsCString text;
+        ASSERT_EQ(NS_OK, message->GetStoreToken(text));
+        EXPECT_EQ("finished-token"_ns, text);
+        ASSERT_EQ(NS_OK, message->GetStringProperty("keywords", text));
+        EXPECT_EQ("filtered"_ns, text);
+        uint32_t flags;
+        ASSERT_EQ(NS_OK, message->GetFlags(&flags));
+        EXPECT_EQ(5u, flags);
+        nsTArray<nsCString> stored;
+        ASSERT_EQ(NS_OK, Stored(observed, stored));
+        EXPECT_EQ(
+            (nsTArray<nsCString>{"missing@invalid"_ns, "missing@invalid"_ns}),
+            stored);
+        nsCOMPtr<mozIStorageConnection> reader;
+        ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+        auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+        const RawHdr::kv expected[] = {{"custom"_ns, "00042:text"_ns},
+                                       {"Custom"_ns, "1e3:text"_ns}};
+        for (const auto& property : expected) {
+          ASSERT_EQ(NS_OK,
+                    PublicationCell(
+                        reader, observed,
+                        "SELECT value || ':' || typeof(value) FROM "
+                        "message_properties WHERE id = :id AND name = :name"_ns,
+                        text, &property.k));
+          EXPECT_EQ(property.v, text);
+        }
+      });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  RawHdr raw;
+  raw.messageId = "staged@invalid"_ns;
+  raw.subject = "staged subject"_ns;
+  raw.references = {"missing@invalid"_ns, "missing@invalid"_ns};
+  raw.extras = {{"custom"_ns, "00042"_ns}, {"Custom"_ns, "1e3"_ns}};
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK,
+            db.StageMessage(mFolderId, raw, &staged, getter_AddRefs(header)));
+  EXPECT_NE(0u, staged);
+  EXPECT_NE(nsMsgKey_None, staged);
+  EXPECT_NE(control, staged);
+  nsCString text;
+  ASSERT_EQ(NS_OK, header->GetSubject(text));
+  EXPECT_EQ("staged subject"_ns, text);
+  ASSERT_EQ(NS_OK, header->GetStringProperty("custom", text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, header->GetStringProperty("Custom", text));
+  EXPECT_EQ("1e3"_ns, text);
+  ASSERT_EQ(NS_OK, header->SetFlags(5));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("keywords", "filtered"_ns));
+  ASSERT_EQ(NS_OK, header->SetStoreToken("finished-token"_ns));
+  EXPECT_EQ(0u, observer->mChanges);
+  EXPECT_EQ(0u, publications);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(staged, exists));
+  EXPECT_FALSE(exists);
+  uint64_t count = 99;
+  ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+  EXPECT_EQ(1u, count);
+  nsTArray<nsMsgKey> pending;
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(mFolderId, pending));
+  EXPECT_EQ((nsTArray<nsMsgKey>{staged}), pending);
+  ASSERT_EQ(NS_OK,
+            PublicationCell(
+                mConnection, staged,
+                "SELECT count(*) FROM message_changes WHERE messageId = :id"_ns,
+                text));
+  EXPECT_EQ("0"_ns, text);
+  ASSERT_EQ(NS_OK, db.PublishMessage(staged, false));
+  EXPECT_EQ(1u, publications);
+  ASSERT_EQ(NS_OK, db.MessageExists(staged, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+  EXPECT_EQ(2u, count);
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(mFolderId, pending));
+  EXPECT_TRUE(pending.IsEmpty());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.PublishMessage(staged, true));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.AbortMessage(staged));
+  EXPECT_EQ(1u, publications);
+}
+
+TEST_F(DeliveryCoreReferences, StagedHeaderAndReservedKeySurviveReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.messageId = "restart-staged@invalid"_ns;
+  raw.subject = "retained header"_ns;
+  raw.storeToken = Some(nsCString("retained-body"_ns));
+  raw.references = {"first@invalid"_ns, "last@invalid"_ns};
+  nsMsgKey staged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolderId, raw, &staged));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsTArray<nsMsgKey> pending;
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(mFolderId, pending));
+  EXPECT_EQ((nsTArray<nsMsgKey>{staged}), pending);
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, db.GetMessage(staged, getter_AddRefs(header)));
+  nsCString text;
+  ASSERT_EQ(NS_OK, header->GetStoreToken(text));
+  EXPECT_EQ("retained-body"_ns, text);
+  ASSERT_EQ(NS_OK, header->GetSubject(text));
+  EXPECT_EQ("retained header"_ns, text);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, db.GetMessageReferences(staged, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"first@invalid"_ns, "last@invalid"_ns}), refs);
+  nsMsgKey later, newest;
+  ASSERT_EQ(NS_OK, Add("later@invalid"_ns, {}, later));
+  EXPECT_GT(later, staged);
+  ASSERT_EQ(NS_OK, db.PublishMessage(staged, true));
+  ASSERT_EQ(NS_OK, Add("newest@invalid"_ns, {}, newest));
+  EXPECT_GT(newest, later);
+}
+
+TEST_F(DeliveryCoreReferences, AbortDropsOnlyStagedMetadataAndRetiresKey) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  RawHdr raw;
+  raw.messageId = "abort@invalid"_ns;
+  raw.storeToken = Some(nsCString("finished-body-owned-by-store"_ns));
+  raw.extras = {{"custom"_ns, "preserved text"_ns}};
+  raw.references = {"missing@invalid"_ns};
+  nsMsgKey staged, control;
+  ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  ASSERT_EQ(NS_OK, db.AbortMessage(staged));
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(staged, exists));
+  EXPECT_FALSE(exists);
+  nsCString text;
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          mConnection, staged,
+          "SELECT (SELECT count(*) FROM staged_messages WHERE id = :id) + "
+          "(SELECT count(*) FROM staged_message_properties WHERE id = :id) + "
+          "(SELECT count(*) FROM staged_message_references WHERE id = :id) + "
+          "(SELECT count(*) FROM staged_message_reference_sets WHERE id = :id)"_ns,
+          text));
+  EXPECT_EQ("0"_ns, text);
+  nsMsgKey next;
+  ASSERT_EQ(NS_OK, Add("next@invalid"_ns, {}, next));
+  EXPECT_GT(next, staged);
+}
+
+TEST_F(DeliveryCoreReferences, PublicationFailureRetainsStagingAndOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("control@invalid"_ns, {}, control));
+  uint32_t publications = 0;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message* message) {
+    ++publications;
+    nsCString value;
+    ASSERT_EQ(NS_OK, message->GetStringProperty("reject-publication", value));
+    EXPECT_EQ("complete"_ns, value);
+  });
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  RawHdr raw;
+  raw.messageId = "retry@invalid"_ns;
+  raw.extras = {{"reject-publication"_ns, "complete"_ns}};
+  nsMsgKey staged;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK,
+            db.StageMessage(mFolderId, raw, &staged, getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "CREATE TEMP TRIGGER reject_publication BEFORE INSERT ON "
+                "message_properties "
+                "WHEN NEW.name = 'reject-publication' BEGIN "
+                "SELECT RAISE(ABORT, 'publication property failure'); END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_publication"_ns));
+  });
+  Message* output = header.get();
+  EXPECT_TRUE(NS_FAILED(db.PublishMessage(staged, true, &output)));
+  EXPECT_EQ(header.get(), output);
+  EXPECT_EQ(0u, publications);
+  bool active = true, exists = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, db.MessageExists(staged, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  nsCString text;
+  ASSERT_EQ(NS_OK, header->GetStringProperty("reject-publication", text));
+  EXPECT_EQ("complete"_ns, text);
+  ASSERT_EQ(NS_OK,
+            PublicationCell(
+                mConnection, staged,
+                "SELECT count(*) FROM message_changes WHERE messageId = :id"_ns,
+                text));
+  EXPECT_EQ("0"_ns, text);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_publication"_ns));
+  ASSERT_EQ(NS_OK, db.PublishMessage(staged, true));
+  EXPECT_EQ(1u, publications);
+  ASSERT_EQ(NS_OK, db.MessageExists(staged, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StagingFailurePreservesOutputsAndForeignTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("staging-control@invalid"_ns, {}, control));
+  RefPtr<Message> controlHeader = new Message(control);
+  RawHdr raw;
+  raw.messageId = "failed-staging@invalid"_ns;
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_stage BEFORE INSERT ON "
+          "staged_message_reference_sets "
+          "BEGIN SELECT RAISE(ABORT, 'stage reference failure'); END"_ns));
+  nsMsgKey key = 123;
+  Message* outputHeader = controlHeader.get();
+  EXPECT_TRUE(NS_FAILED(db.StageMessage(mFolderId, raw, &key, &outputHeader)));
+  EXPECT_EQ(controlHeader.get(), outputHeader);
+  EXPECT_EQ(123u, key);
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER reject_stage"_ns));
+  nsTArray<nsMsgKey> pending;
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(mFolderId, pending));
+  EXPECT_TRUE(pending.IsEmpty());
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, mConnection->RollbackTransaction()); });
+  nsMsgKey output = 456;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.StageMessage(mFolderId, raw, &output));
+  EXPECT_EQ(456u, output);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.PublishMessage(key, true));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.AbortMessage(key));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+}
+
+TEST_F(DeliveryCoreReferences,
+       EpochChangeRetiresStagedBindingWithoutLosingHeader) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 11));
+  RawHdr raw;
+  raw.messageId = "old-epoch@invalid"_ns;
+  raw.storeToken = Some(nsCString("retained-body"_ns));
+  raw.extras = {{"uidOnServer"_ns, "2a"_ns}, {"UidOnServer"_ns, "keep"_ns}};
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK,
+            db.StageMessage(mFolderId, raw, &key, getter_AddRefs(header)));
+  uint32_t uid = 99;
+  ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
+  EXPECT_EQ(42u, uid);
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 12));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  EXPECT_TRUE(names.Contains("UidOnServer"_ns));
+  nsCString token;
+  ASSERT_EQ(NS_OK, header->GetStoreToken(token));
+  EXPECT_EQ("retained-body"_ns, token);
+  ASSERT_EQ(NS_OK, db.PublishMessage(key, true));
+  nsMsgKey output = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetMessageKeyForServerUid(mFolderId, 12, 42, output));
+  EXPECT_EQ(123u, output);
+}
+
+TEST_F(DeliveryCoreReferences, ImmediateAddRetainsMissingFolderCompatibility) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.messageId = "no-folder@invalid"_ns;
+  const uint64_t missingFolder = mFolderId + 1;
+  nsMsgKey published;
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.AddMessage(missingFolder, raw, true, &published));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(published, exists));
+  EXPECT_TRUE(exists);
+  nsMsgKey output = 77;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.StageMessage(missingFolder, raw, &output));
+  EXPECT_EQ(77u, output);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db.StageMessage(0, raw, &output));
+  EXPECT_EQ(77u, output);
+}
+
+TEST_F(DeliveryCoreReferences, MissingFolderPublicationRetainsStagedHeader) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t destination;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, "Destination"_ns,
+                                                  &destination));
+  RawHdr raw;
+  raw.messageId = "removed-folder@invalid"_ns;
+  raw.storeToken = Some(nsCString("retained-body"_ns));
+  nsMsgKey key;
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.StageMessage(destination, raw, &key));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().DeleteFolder(destination));
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, db.PublishMessage(key, true));
+  nsTArray<nsMsgKey> staged;
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(destination, staged));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), staged);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  nsCString token;
+  ASSERT_EQ(NS_OK, db.GetMessageStoreToken(key, token));
+  EXPECT_EQ("retained-body"_ns, token);
+}
+
+TEST_F(DeliveryCoreReferences,
+       CombinedOfflinePayloadSurvivesDeletionAndReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  auto& db = mCore->MessageDB();
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("offline@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, Add("control@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.SetMessageUidOnServer(key, 42));
+  OfflineOperationData input;
+  input.operation = 1 | 2 | 4 | 0x400 | 0x800;
+  input.flagOperation = 0x80000000;
+  input.newFlags = UINT32_MAX;
+  input.sourceKey = control;
+  input.sourceUid = UINT32_MAX;
+  input.messageSize = UINT32_MAX;
+  input.playingBack = false;
+  input.sourceFolderURI = "imap://source/Inbox"_ns;
+  input.destinationFolderURI = "imap://destination/Moved"_ns;
+  input.keywordsToAdd = "first second"_ns;
+  input.keywordsToRemove = "old"_ns;
+  input.copyDestinations = {"imap://destination/One"_ns,
+                            "imap://destination/Two"_ns,
+                            "imap://destination/One"_ns};
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, input));
+  ASSERT_EQ(NS_OK, db.SetOfflineOperationPlayingBack(mFolderId, key, true));
+  ASSERT_NO_FATAL_FAILURE(CheckOfflineSource(key, 7, 42));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(key));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  OfflineOperationData stored;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolderId, key, stored));
+  EXPECT_EQ(uint32_t(1 | 2 | 4 | 0x400 | 0x800), stored.operation);
+  EXPECT_EQ(0x80000000u, stored.flagOperation);
+  EXPECT_EQ(UINT32_MAX, stored.newFlags);
+  EXPECT_EQ(control, stored.sourceKey);
+  EXPECT_EQ(UINT32_MAX, stored.sourceUid);
+  EXPECT_EQ(UINT32_MAX, stored.messageSize);
+  EXPECT_TRUE(stored.playingBack);
+  EXPECT_EQ("imap://source/Inbox"_ns, stored.sourceFolderURI);
+  EXPECT_EQ("imap://destination/Moved"_ns, stored.destinationFolderURI);
+  EXPECT_EQ("first second"_ns, stored.keywordsToAdd);
+  EXPECT_EQ("old"_ns, stored.keywordsToRemove);
+  EXPECT_EQ((nsTArray<nsCString>{"imap://destination/One"_ns,
+                                 "imap://destination/Two"_ns,
+                                 "imap://destination/One"_ns}),
+            stored.copyDestinations);
+  nsTArray<nsMsgKey> deletes;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().ListOfflineOperations(mFolderId, true, deletes));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), deletes);
+  ASSERT_NO_FATAL_FAILURE(CheckOfflineSource(key, 7, 42));
+  stored.keywordsToAdd = "later edit"_ns;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().StoreOfflineOperation(mFolderId, key, stored));
+  ASSERT_NO_FATAL_FAILURE(CheckOfflineSource(key, 7, 42));
+  OfflineOperationData edited;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolderId, key, edited));
+  EXPECT_EQ("later edit"_ns, edited.keywordsToAdd);
+  EXPECT_EQ(stored.copyDestinations, edited.copyDestinations);
+  bool exists;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences,
+       OfflinePayloadErrorsPreservePayloadAndReadOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("offline-error@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, Add("control@invalid"_ns, {}, control));
+  OfflineOperationData input;
+  input.operation = 4;
+  input.keywordsToAdd = "original"_ns;
+  input.copyDestinations = {"first"_ns, "second"_ns};
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, input));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_offline_copy BEFORE INSERT ON "
+          "offline_copy_destinations "
+          "WHEN NEW.uri = 'reject' BEGIN SELECT RAISE(ABORT, 'copy failure'); END"_ns));
+  input.keywordsToAdd = "replacement"_ns;
+  input.copyDestinations = {"new-first"_ns, "reject"_ns};
+  EXPECT_TRUE(NS_FAILED(db.StoreOfflineOperation(mFolderId, key, input)));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_offline_copy"_ns));
+  OfflineOperationData stored;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, key, stored));
+  EXPECT_EQ("original"_ns, stored.keywordsToAdd);
+  EXPECT_EQ((nsTArray<nsCString>{"first"_ns, "second"_ns}),
+            stored.copyDestinations);
+  stored.keywordsToAdd = "sentinel"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetOfflineOperation(mFolderId, nsMsgKey_None, stored));
+  EXPECT_EQ("sentinel"_ns, stored.keywordsToAdd);
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP VIEW offline_copy_destinations AS SELECT * "
+          "FROM main.offline_copy_destinations WHERE abs(-9223372036854775808)"_ns));
+  EXPECT_TRUE(NS_FAILED(db.GetOfflineOperation(mFolderId, key, stored)));
+  EXPECT_EQ("sentinel"_ns, stored.keywordsToAdd);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.offline_copy_destinations"_ns));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, key, stored));
+  EXPECT_EQ("original"_ns, stored.keywordsToAdd);
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, ReservedOfflineKeySurvivesReopenWithoutMessage) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().ReserveOfflineOperationKey(mFolderId, key));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolderId, key, payload));
+  EXPECT_EQ(0u, payload.operation);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  nsMsgKey next;
+  ASSERT_EQ(NS_OK, Add("after-reservation@invalid"_ns, {}, next));
+  EXPECT_GT(next, key);
+}
+
+TEST_F(DeliveryCoreReferences,
+       AppendAttemptRetainsDestinationIdentityAcrossReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 17));
+  RawHdr raw;
+  raw.messageId = "append@invalid"_ns;
+  raw.storeToken = Some(nsCString("finished-destination-body"_ns));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolderId, raw, &key));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId = 99;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BeginOfflineAttempt(
+                mFolderId, key, 0x10,
+                Some(PendingDestination{mFolderId, key, 17}), attemptId));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, mCore->MessageDB().AbortMessage(key));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetCurrentOfflineAttempt(mFolderId, key, attempt));
+  EXPECT_EQ(attemptId, attempt.id);
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
+  OfflineAttempt unchanged;
+  unchanged.id = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.GetOfflineAttempt(INT64_MAX, unchanged));
+  EXPECT_EQ(123u, unchanged.id);
+  EXPECT_FALSE(attempt.source);
+  ASSERT_TRUE(attempt.destination);
+  EXPECT_EQ(key, attempt.destination->key);
+  EXPECT_EQ(mFolderId, attempt.destination->folderId);
+  EXPECT_EQ(17u, attempt.destination->epoch);
+  ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(attemptId));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& recovered = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, recovered.GetCurrentOfflineAttempt(mFolderId, key, attempt));
+  EXPECT_EQ(attemptId, attempt.id);
+  EXPECT_EQ(OfflineAttemptState::Ambiguous, attempt.state);
+  EXPECT_EQ(0x10u, attempt.operation);
+  ASSERT_EQ(NS_OK,
+            recovered.SetOfflineOperationPlayingBack(mFolderId, key, true));
+  ASSERT_EQ(NS_OK, recovered.GetCurrentOfflineAttempt(mFolderId, key, attempt));
+  EXPECT_EQ(OfflineAttemptState::Ambiguous, attempt.state);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            recovered.StoreOfflineOperation(mFolderId, key, payload));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            recovered.RemoveOfflineOperation(mFolderId, key));
+  ASSERT_EQ(NS_OK, recovered.ConfirmOfflineAttempt(
+                       attemptId, Some(ServerUidConfirmation{17, UINT32_MAX})));
+  ASSERT_EQ(NS_OK, recovered.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Confirmed, attempt.state);
+  EXPECT_EQ(Some(uint32_t(UINT32_MAX)), attempt.confirmedUid);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, recovered.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, recovered.PublishMessage(key, true));
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, recovered.GetMessageKeyForServerUid(mFolderId, 17,
+                                                       UINT32_MAX, found));
+  EXPECT_EQ(key, found);
+  ASSERT_EQ(NS_OK, recovered.ConfirmOfflineAttempt(
+                       attemptId, Some(ServerUidConfirmation{17, UINT32_MAX})));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            recovered.ConfirmOfflineAttempt(
+                attemptId, Some(ServerUidConfirmation{17, 42})));
+}
+
+TEST_F(DeliveryCoreReferences, StaleAttemptNeedsExplicitResolutionBeforeRetry) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 27));
+  RawHdr raw;
+  raw.messageId = "stale-append@invalid"_ns;
+  raw.storeToken = Some(nsCString("retained-body"_ns));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10,
+                                   Some(PendingDestination{mFolderId, key, 27}),
+                                   attemptId));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 28));
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db.ConfirmOfflineAttempt(attemptId, Some(ServerUidConfirmation{27, 42})));
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
+  uint64_t untouched = 123;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10,
+                                   Some(PendingDestination{mFolderId, key, 28}),
+                                   untouched));
+  EXPECT_EQ(123u, untouched);
+  // No network is dispatched in this fixture: the operation had no server
+  // effect.
+  ASSERT_EQ(NS_OK, db.ResolveOfflineAttemptNotApplied(attemptId));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Pending, attempt.state);
+  ASSERT_EQ(NS_OK, db.AbortMessage(key));
+}
+
+TEST_F(DeliveryCoreReferences, ConflictingConfirmationDoesNotBindDestination) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 31));
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("bound-control@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(control, mFolderId, 31, 55));
+  RawHdr raw;
+  raw.messageId = "pending-destination@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10,
+                                   Some(PendingDestination{mFolderId, key, 31}),
+                                   attemptId));
+  EXPECT_EQ(
+      NS_ERROR_FILE_CORRUPTED,
+      db.ConfirmOfflineAttempt(attemptId, Some(ServerUidConfirmation{31, 55})));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db.GetMessageKeyForServerUid(mFolderId, 31, 55, found));
+  EXPECT_EQ(control, found);
+}
+
+TEST_F(DeliveryCoreReferences, ConfirmationStorageFailureRollsBackUidAndState) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 41));
+  RawHdr raw;
+  raw.messageId = "confirm-error@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10,
+                                   Some(PendingDestination{mFolderId, key, 41}),
+                                   attemptId));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_confirmation BEFORE UPDATE ON "
+          "offline_attempts "
+          "WHEN NEW.state = 2 BEGIN SELECT RAISE(ABORT, 'confirmation failure'); END"_ns));
+  EXPECT_TRUE(NS_FAILED(db.ConfirmOfflineAttempt(
+      attemptId, Some(ServerUidConfirmation{41, 42}))));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_confirmation"_ns));
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(
+                       attemptId, Some(ServerUidConfirmation{41, 42})));
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_TRUE(names.Contains("uidOnServer"_ns));
+}
+
+TEST_F(DeliveryCoreReferences, FolderWideOperationHasNoInventedMessageBinding) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 51));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.ReserveOfflineOperationKey(mFolderId, key));
+  OfflineOperationData payload;
+  payload.operation = 0x200;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  bool exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(mFolderId, key, 0x200, Nothing(),
+                                          attemptId));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetCurrentOfflineAttempt(mFolderId, key,
+                                                               attempt));
+  EXPECT_EQ(attemptId, attempt.id);
+  EXPECT_FALSE(attempt.source);
+  EXPECT_FALSE(attempt.destination);
+  EXPECT_EQ(Some(uint32_t(51)), attempt.folderEpoch);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().ConfirmOfflineAttempt(attemptId, Nothing()));
+  nsMsgKey next;
+  ASSERT_EQ(NS_OK, Add("next@invalid"_ns, {}, next));
+  EXPECT_GT(next, key);
+}
+
+TEST_F(DeliveryCoreReferences, DeletedSourceRetainsExactDispatchedTuple) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 61));
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("deleted-source@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 61, 700));
+  OfflineOperationData payload;
+  payload.operation = 1;
+  payload.newFlags = 128;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(key));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 1, Nothing(), attemptId));
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  ASSERT_TRUE(attempt.source);
+  EXPECT_EQ(mFolderId, attempt.source->folderId);
+  EXPECT_EQ(key, attempt.source->key);
+  EXPECT_EQ(61u, attempt.source->epoch);
+  EXPECT_EQ(700u, attempt.source->uid);
+  EXPECT_EQ(1u, attempt.operation);
+  EXPECT_NE(key, attempt.source->uid);
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(attemptId, Nothing()));
+  ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, key));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Confirmed, attempt.state);
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, QueuedFolderWideOperationRejectsChangedEpoch) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 71));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.ReserveOfflineOperationKey(mFolderId, key));
+  OfflineOperationData payload;
+  payload.operation = 0x200;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 72));
+  // Saving other payload metadata does not retarget an existing deletion
+  // intent.
+  payload.keywordsToAdd = "retained metadata"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId = 123;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db.BeginOfflineAttempt(mFolderId, key, 0x200, Nothing(), attemptId));
+  EXPECT_EQ(123u, attemptId);
+  OfflineOperationData stored;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, key, stored));
+  EXPECT_EQ(0x200u, stored.operation);
+  EXPECT_EQ("retained metadata"_ns, stored.keywordsToAdd);
+}
+
+TEST_F(DeliveryCoreReferences, QueuedSourceIsNotSilentlyRetargeted) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 81));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("queued-source@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 81, 42));
+  OfflineOperationData payload;
+  payload.operation = 1;
+  payload.newFlags = 128;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 81, 43));
+  payload.keywordsToAdd = "another edit"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BeginOfflineAttempt(mFolderId, key, 1, Nothing(), attemptId));
+  EXPECT_EQ(123u, attemptId);
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db.GetMessageKeyForServerUid(mFolderId, 81, 43, found));
+  EXPECT_EQ(key, found);
+}
+
+TEST_F(DeliveryCoreReferences, SentAttemptDestinationCannotBeReused) {
+  CheckUsedDestinationRejected(OfflineAttemptState::Sent);
+}
+
+TEST_F(DeliveryCoreReferences, AmbiguousAttemptDestinationCannotBeReused) {
+  CheckUsedDestinationRejected(OfflineAttemptState::Ambiguous);
+}
+
+TEST_F(DeliveryCoreReferences, ConfirmedAttemptDestinationCannotBeReused) {
+  CheckUsedDestinationRejected(OfflineAttemptState::Confirmed);
+}
+
+TEST_F(DeliveryCoreReferences, CopyRequiresDistinctDestinationIdentity) {
+  CheckSelfDestinationRejected(4);
+}
+
+TEST_F(DeliveryCoreReferences, MoveRequiresDistinctDestinationIdentity) {
+  CheckSelfDestinationRejected(2);
+}
+
+TEST_F(DeliveryCoreReferences, BoundDestinationCannotStartAnotherAttempt) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 93));
+  RawHdr raw;
+  raw.messageId = "bound-destination@invalid"_ns;
+  nsMsgKey bound, fresh;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK,
+            db.StageMessage(mFolderId, raw, &bound, getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", 42));
+  raw.messageId = "unbound-destination@invalid"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &fresh));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, fresh, payload));
+  uint64_t output = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BeginOfflineAttempt(
+                mFolderId, fresh, 0x10,
+                Some(PendingDestination{mFolderId, bound, 93}), output));
+  EXPECT_EQ(123u, output);
+  ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(
+                       mFolderId, fresh, 0x10,
+                       Some(PendingDestination{mFolderId, fresh, 93}), output));
+  uint32_t uid = 77;
+  ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
+  EXPECT_EQ(42u, uid);
+}
+
+TEST_F(DeliveryCoreReferences, NotAppliedDestinationAllowsExplicitRetry) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 94));
+  RawHdr raw;
+  raw.messageId = "not-applied@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t first, retry;
+  auto destination = Some(PendingDestination{mFolderId, key, 94});
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10, destination, first));
+  // This fixture dispatched no network operation.
+  ASSERT_EQ(NS_OK, db.ResolveOfflineAttemptNotApplied(first));
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10, destination, retry));
+  EXPECT_NE(first, retry);
+  OfflineAttempt old;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(first, old));
+  EXPECT_EQ(OfflineAttemptState::Pending, old.state);
+}
+
+TEST_F(DeliveryCoreReferences,
+       PublishedBindingCannotCollideWithConfirmedStaging) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 95));
+  RawHdr raw;
+  raw.messageId = "confirmed-staging@invalid"_ns;
+  nsMsgKey staged, control;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  ASSERT_EQ(NS_OK, Add("published-control@invalid"_ns, {}, control));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, staged, payload));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(
+                mFolderId, staged, 0x10,
+                Some(PendingDestination{mFolderId, staged, 95}), attemptId));
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(
+                       attemptId, Some(ServerUidConfirmation{95, 55})));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.BindMessageToServerUid(control, mFolderId, 95, 55));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(control, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(control, mFolderId, 95, 56));
+  ASSERT_EQ(NS_OK, db.PublishMessage(staged, true));
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db.GetMessageKeyForServerUid(mFolderId, 95, 55, found));
+  EXPECT_EQ(staged, found);
+  ASSERT_EQ(NS_OK, db.GetMessageKeyForServerUid(mFolderId, 95, 56, found));
+  EXPECT_EQ(control, found);
+}
+
+TEST_F(DeliveryCoreReferences, ConfirmationDoesNotOverwriteDestinationUid) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 96));
+  RawHdr raw;
+  raw.messageId = "no-overwrite@invalid"_ns;
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK,
+            db.StageMessage(mFolderId, raw, &key, getter_AddRefs(header)));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10,
+                                   Some(PendingDestination{mFolderId, key, 96}),
+                                   attemptId));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("uidOnServer", "0002a"_ns));
+  EXPECT_EQ(
+      NS_ERROR_FILE_CORRUPTED,
+      db.ConfirmOfflineAttempt(attemptId, Some(ServerUidConfirmation{96, 43})));
+  uint32_t uid = 77;
+  ASSERT_EQ(NS_OK, header->GetUint32Property("uidOnServer", &uid));
+  EXPECT_EQ(42u, uid);
+  nsCString text;
+  ASSERT_EQ(NS_OK, header->GetStringProperty("uidOnServer", text));
+  EXPECT_EQ("0002a"_ns, text);
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
+  EXPECT_FALSE(attempt.confirmedUid);
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(
+                       attemptId, Some(ServerUidConfirmation{96, 42})));
+  ASSERT_EQ(NS_OK, header->GetStringProperty("uidOnServer", text));
+  EXPECT_EQ("0002a"_ns, text);
+}
+
+TEST_F(DeliveryCoreReferences, ConfirmationRequiresServerReportedEpoch) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 97));
+  RawHdr raw;
+  raw.messageId = "server-epoch@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+  OfflineOperationData payload;
+  payload.operation = 0x10;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key, 0x10,
+                                   Some(PendingDestination{mFolderId, key, 97}),
+                                   attemptId));
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db.ConfirmOfflineAttempt(attemptId, Some(ServerUidConfirmation{98, 42})));
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
+  EXPECT_FALSE(attempt.confirmedUid);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(
+                       attemptId, Some(ServerUidConfirmation{97, 42})));
+  EXPECT_EQ(
+      NS_ERROR_FILE_CORRUPTED,
+      db.ConfirmOfflineAttempt(attemptId, Some(ServerUidConfirmation{98, 42})));
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(
+                       attemptId, Some(ServerUidConfirmation{97, 42})));
 }
 
 }  // namespace

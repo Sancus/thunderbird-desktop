@@ -4,6 +4,7 @@
 
 #include "MessageDatabase.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 
@@ -11,14 +12,20 @@
 #include "DatabaseUtils.h"
 #include "DetachedMsgHdr.h"
 #include "Message.h"
+#include "js/Array.h"
+#include "js/CharacterEncoding.h"
+#include "js/String.h"
+#include "jsapi.h"
+#include "mozIStorageConnection.h"
+#include "mozIStorageStatement.h"
+#include "mozIStorageValueArray.h"
+#include "mozStorageHelper.h"
 #include "mozilla/Logging.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/Try.h"
 #include "mozilla/fallible.h"
-#include "mozIStorageConnection.h"
-#include "mozIStorageStatement.h"
-#include "mozStorageHelper.h"
 #include "nsIMsgDatabase.h"
+#include "nsIMsgOfflineImapOperation.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 
@@ -42,26 +49,358 @@ void MessageDatabase::Shutdown() {
   MOZ_LOG(gPanoramaLog, LogLevel::Info, ("MessageDatabase shutdown complete"));
 }
 
-NS_IMETHODIMP
-MessageDatabase::GetTotalCount(uint64_t* aTotalCount) {
-  NS_ENSURE_ARG_POINTER(aTotalCount);
-  *aTotalCount = 0;
-  nsCOMPtr<mozIStorageStatement> stmt;
+namespace {
 
-  nsresult rv = DatabaseCore::GetStatement("TotalCount"_ns,
-                                           "SELECT COUNT(*) FROM messages"_ns,
-                                           getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
-  mozStorageStatementScoper scoper(stmt);
+constexpr uint64_t kMaxSearchSequence = 9007199254740991;
 
-  bool hasResult;
-  rv = stmt->ExecuteStep(&hasResult);
-  NS_ENSURE_SUCCESS(rv, rv);
-  if (hasResult) {
-    *aTotalCount = stmt->AsInt64(0);
+bool SearchText(JSContext* cx, JS::Handle<JSObject*> object, const char* name,
+                const nsACString& text) {
+  nsAutoCString flat(text);
+  JS::Rooted<JSString*> string(
+      cx, JS_NewStringCopyUTF8Z(
+              cx, JS::ConstUTF8CharsZ(flat.get(), flat.Length())));
+  if (!string) {
+    return false;
   }
+  JS::Rooted<JS::Value> value(cx, JS::StringValue(string));
+  return JS_DefineProperty(cx, object, name, value, JSPROP_ENUMERATE);
+}
 
-  return rv;
+bool SearchRevision(JSContext* cx, JS::Handle<JSObject*> object,
+                    const char* name, int64_t revision) {
+  nsAutoCString text;
+  text.AppendInt(revision);
+  return SearchText(cx, object, name, text);
+}
+
+}  // namespace
+
+nsresult MessageDatabase::RequireCommittedSearchRead() {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mMessageDatabase.get() == this,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  return active ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
+nsresult MessageDatabase::GetSearchWatermark(uint64_t& sequence) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "SearchWatermark"_ns,
+      "SELECT COALESCE(MAX(sequence), 0) FROM message_changes"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  int64_t value;
+  MOZ_TRY(stmt->GetInt64(0, &value));
+  NS_ENSURE_TRUE(value >= 0 && uint64_t(value) <= kMaxSearchSequence,
+                 NS_ERROR_FILE_CORRUPTED);
+  sequence = value;
+  return NS_OK;
+}
+
+NS_IMETHODIMP MessageDatabase::GetSearchState(
+    nsMsgKey key, JSContext* cx, JS::MutableHandle<JS::Value> result) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "SearchMessageState"_ns,
+      "SELECT m.folderId, m.flags, f.flags, c.sequence, c.contentRevision, "
+      "c.locationRevision, (SELECT COALESCE(MAX(sequence), 0) FROM "
+      "message_changes "
+      "WHERE messageId IS NULL), "
+      "(SELECT value FROM message_properties WHERE id = m.id AND name = "
+      "'storeToken'), "
+      "(SELECT value FROM message_properties WHERE id = m.id AND name = "
+      "'junkscore'), f.id "
+      "FROM messages m LEFT JOIN folders f ON f.id = m.folderId JOIN "
+      "message_changes c "
+      "ON c.sequence = (SELECT MAX(sequence) FROM message_changes WHERE "
+      "messageId = m.id) "
+      "WHERE m.id = :id AND c.deleted = 0"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (!more) {
+    bool exists;
+    MOZ_TRY(MessageExists(key, exists));
+    NS_ENSURE_TRUE(!exists, NS_ERROR_FILE_CORRUPTED);
+    result.setNull();
+    return NS_OK;
+  }
+  int64_t folder, flags, folderFlags = 0, sequence, content, location, policy;
+  bool folderMissing;
+  MOZ_TRY(stmt->GetInt64(0, &folder));
+  MOZ_TRY(stmt->GetInt64(1, &flags));
+  MOZ_TRY(stmt->GetIsNull(9, &folderMissing));
+  if (!folderMissing) {
+    MOZ_TRY(stmt->GetInt64(2, &folderFlags));
+  }
+  MOZ_TRY(stmt->GetInt64(3, &sequence));
+  MOZ_TRY(stmt->GetInt64(4, &content));
+  MOZ_TRY(stmt->GetInt64(5, &location));
+  MOZ_TRY(stmt->GetInt64(6, &policy));
+  NS_ENSURE_TRUE(folder > 0 && uint64_t(folder) <= kMaxSearchSequence &&
+                     sequence > 0 && uint64_t(sequence) <= kMaxSearchSequence &&
+                     content > 0 && content <= sequence && location > 0 &&
+                     location <= sequence && policy >= 0 &&
+                     uint64_t(policy) <= kMaxSearchSequence,
+                 NS_ERROR_FILE_CORRUPTED);
+  nsCString token, junk;
+  MOZ_TRY(stmt->GetUTF8String(7, token));
+  MOZ_TRY(stmt->GetUTF8String(8, junk));
+  JS::Rooted<JSObject*> object(cx, JS_NewPlainObject(cx));
+  NS_ENSURE_TRUE(object, NS_ERROR_OUT_OF_MEMORY);
+  JS::Rooted<JS::Value> folderState(
+      cx,
+      folderMissing ? JS::NullValue() : JS::DoubleValue(uint32_t(folderFlags)));
+  if (!JS_DefineProperty(cx, object, "messageKey", double(key),
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "folderId", double(folder),
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "flags", double(uint32_t(flags)),
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "folderFlags", folderState,
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "generation",
+                         double(std::max(sequence, policy)),
+                         JSPROP_ENUMERATE) ||
+      !SearchRevision(cx, object, "metadataRevision", sequence) ||
+      !SearchRevision(cx, object, "contentRevision", content) ||
+      !SearchRevision(cx, object, "locationRevision", location) ||
+      !SearchRevision(cx, object, "policyRevision", policy) ||
+      !SearchText(cx, object, "storeToken", token) ||
+      !SearchText(cx, object, "junkScore", junk)) {
+    return NS_ERROR_FAILURE;
+  }
+  result.setObject(*object);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::GetMessageBodyState(nsMsgKey key,
+                                              MessageBodyState& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "MessageBodyState"_ns,
+      "SELECT m.folderId, p.id, p.value, c.contentRevision, c.locationRevision "
+      "FROM messages m LEFT JOIN message_properties p "
+      "ON p.id = m.id AND p.name = 'storeToken' JOIN message_changes c "
+      "ON c.sequence = (SELECT MAX(sequence) FROM message_changes "
+      "WHERE messageId = m.id) WHERE m.id = :id AND c.deleted = 0"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (!more) {
+    bool exists;
+    MOZ_TRY(MessageExists(key, exists));
+    NS_ENSURE_TRUE(!exists, NS_ERROR_FILE_CORRUPTED);
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  int64_t folder, content, location;
+  MOZ_TRY(stmt->GetInt64(0, &folder));
+  MOZ_TRY(stmt->GetInt64(3, &content));
+  MOZ_TRY(stmt->GetInt64(4, &location));
+  NS_ENSURE_TRUE(folder > 0 && content > 0 && location > 0,
+                 NS_ERROR_FILE_CORRUPTED);
+  MessageBodyState state;
+  state.key = key;
+  state.folderId = static_cast<uint64_t>(folder);
+  state.contentRevision = static_cast<uint64_t>(content);
+  state.locationRevision = static_cast<uint64_t>(location);
+  bool tokenAbsent;
+  MOZ_TRY(stmt->GetIsNull(1, &tokenAbsent));
+  if (!tokenAbsent) {
+    nsCString token;
+    MOZ_TRY(stmt->GetUTF8String(2, token));
+    state.storeToken = Some(std::move(token));
+  }
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  output = std::move(state);
+  return NS_OK;
+}
+
+NS_IMETHODIMP MessageDatabase::GetSearchChanges(
+    uint64_t after, uint32_t limit, JSContext* cx,
+    JS::MutableHandle<JS::Value> result) {
+  NS_ENSURE_ARG(limit > 0 && limit <= 1000 && after <= kMaxSearchSequence);
+  uint64_t watermark;
+  MOZ_TRY(GetSearchWatermark(watermark));
+  NS_ENSURE_TRUE(after <= watermark, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "SearchChanges"_ns,
+      "SELECT sequence, messageId, contentRevision, locationRevision, deleted "
+      "FROM message_changes WHERE sequence > :after AND sequence <= :watermark "
+      "ORDER BY sequence LIMIT :limit"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("after"_ns, after));
+  MOZ_TRY(stmt->BindInt64ByName("watermark"_ns, watermark));
+  MOZ_TRY(stmt->BindInt64ByName("limit"_ns, limit));
+  JS::Rooted<JSObject*> changes(cx, JS::NewArrayObject(cx, 0));
+  NS_ENSURE_TRUE(changes, NS_ERROR_OUT_OF_MEMORY);
+  uint32_t count = 0;
+  uint64_t next = after;
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t sequence, id = 0, content, location, deleted;
+    bool policy;
+    MOZ_TRY(stmt->GetInt64(0, &sequence));
+    MOZ_TRY(stmt->GetIsNull(1, &policy));
+    if (!policy) {
+      MOZ_TRY(stmt->GetInt64(1, &id));
+    }
+    MOZ_TRY(stmt->GetInt64(2, &content));
+    MOZ_TRY(stmt->GetInt64(3, &location));
+    MOZ_TRY(stmt->GetInt64(4, &deleted));
+    NS_ENSURE_TRUE(sequence > 0 && uint64_t(sequence) <= watermark &&
+                       (policy || (id > 0 && id < nsMsgKey_None)) &&
+                       content >= 0 && content <= sequence && location >= 0 &&
+                       location <= sequence && (deleted == 0 || deleted == 1),
+                   NS_ERROR_FILE_CORRUPTED);
+    JS::Rooted<JSObject*> row(cx, JS_NewPlainObject(cx));
+    NS_ENSURE_TRUE(row, NS_ERROR_OUT_OF_MEMORY);
+    JS::Rooted<JS::Value> key(cx,
+                              policy ? JS::NullValue() : JS::DoubleValue(id));
+    JS::Rooted<JS::Value> removed(cx, JS::BooleanValue(deleted != 0));
+    if (!JS_DefineProperty(cx, row, "sequence", double(sequence),
+                           JSPROP_ENUMERATE) ||
+        !JS_DefineProperty(cx, row, "messageKey", key, JSPROP_ENUMERATE) ||
+        !JS_DefineProperty(cx, row, "deleted", removed, JSPROP_ENUMERATE) ||
+        !SearchRevision(cx, row, "contentRevision", content) ||
+        !SearchRevision(cx, row, "locationRevision", location)) {
+      return NS_ERROR_FAILURE;
+    }
+    JS::Rooted<JS::Value> value(cx, JS::ObjectValue(*row));
+    if (!JS_DefineElement(cx, changes, count++, value, JSPROP_ENUMERATE)) {
+      return NS_ERROR_FAILURE;
+    }
+    next = sequence;
+  }
+  JS::Rooted<JSObject*> object(cx, JS_NewPlainObject(cx));
+  NS_ENSURE_TRUE(object, NS_ERROR_OUT_OF_MEMORY);
+  JS::Rooted<JS::Value> rows(cx, JS::ObjectValue(*changes));
+  if (!JS_DefineProperty(cx, object, "watermark", double(watermark),
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "nextSequence", double(next),
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "changes", rows, JSPROP_ENUMERATE)) {
+    return NS_ERROR_FAILURE;
+  }
+  result.setObject(*object);
+  return NS_OK;
+}
+
+NS_IMETHODIMP MessageDatabase::GetSearchSnapshot(
+    nsMsgKey after, uint32_t limit, JSContext* cx,
+    JS::MutableHandle<JS::Value> result) {
+  NS_ENSURE_ARG(limit > 0 && limit <= 1000 && after != nsMsgKey_None);
+  uint64_t watermark;
+  MOZ_TRY(GetSearchWatermark(watermark));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "SearchSnapshotKeys"_ns,
+      "SELECT id FROM messages WHERE id > :after ORDER BY id LIMIT :limit"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("after"_ns, after));
+  MOZ_TRY(stmt->BindInt64ByName("limit"_ns, limit));
+  JS::Rooted<JSObject*> messages(cx, JS::NewArrayObject(cx, 0));
+  NS_ENSURE_TRUE(messages, NS_ERROR_OUT_OF_MEMORY);
+  uint32_t count = 0;
+  nsMsgKey next = after;
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t id;
+    MOZ_TRY(stmt->GetInt64(0, &id));
+    NS_ENSURE_TRUE(id > 0 && id < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+    JS::Rooted<JS::Value> state(cx);
+    MOZ_TRY(GetSearchState(static_cast<nsMsgKey>(id), cx, &state));
+    NS_ENSURE_TRUE(state.isObject(), NS_ERROR_FILE_CORRUPTED);
+    if (!JS_DefineElement(cx, messages, count++, state, JSPROP_ENUMERATE)) {
+      return NS_ERROR_FAILURE;
+    }
+    next = id;
+  }
+  JS::Rooted<JSObject*> object(cx, JS_NewPlainObject(cx));
+  NS_ENSURE_TRUE(object, NS_ERROR_OUT_OF_MEMORY);
+  JS::Rooted<JS::Value> rows(cx, JS::ObjectValue(*messages));
+  if (!JS_DefineProperty(cx, object, "watermark", double(watermark),
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "nextKey", double(next),
+                         JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "messages", rows, JSPROP_ENUMERATE)) {
+    return NS_ERROR_FAILURE;
+  }
+  result.setObject(*object);
+  return NS_OK;
+}
+
+NS_IMETHODIMP MessageDatabase::NoteMessageContentChanged(nsMsgKey key) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  bool exists;
+  MOZ_TRY(MessageExists(key, exists));
+  NS_ENSURE_TRUE(exists, NS_ERROR_UNEXPECTED);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "RecordMessageContentChange"_ns,
+      "INSERT INTO message_changes(messageId, contentRevision, "
+      "locationRevision, deleted) "
+      "SELECT :id, contentRevision + 1, locationRevision, 0 FROM "
+      "message_changes "
+      "WHERE messageId = :id ORDER BY sequence DESC LIMIT 1 RETURNING sequence"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(!more, NS_ERROR_FILE_CORRUPTED);
+  return NS_OK;
+}
+
+NS_IMETHODIMP MessageDatabase::NoteSearchPolicyChanged() {
+  MOZ_TRY(RequireCommittedSearchRead());
+  return DatabaseCore::sConnection->ExecuteSimpleSQL(
+      "INSERT INTO message_changes(messageId, contentRevision, "
+      "locationRevision, deleted) "
+      "VALUES(NULL, 0, 0, 0)"_ns);
+}
+
+NS_IMETHODIMP MessageDatabase::GetTotalCount(uint64_t* totalCount) {
+  NS_ENSURE_ARG_POINTER(totalCount);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement("TotalCount"_ns,
+                                     "SELECT COUNT(*) FROM messages"_ns,
+                                     getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  int64_t count;
+  MOZ_TRY(stmt->GetInt64(0, &count));
+  NS_ENSURE_TRUE(count >= 0, NS_ERROR_FILE_CORRUPTED);
+  *totalCount = count;
+  return NS_OK;
 }
 
 NS_IMETHODIMP MessageDatabase::AddMessage(
@@ -87,10 +426,26 @@ NS_IMETHODIMP MessageDatabase::AddMessage(
   return AddMessage(aFolderId, header, true, aKey);
 }
 
-nsresult MessageDatabase::AddMessage(uint64_t aFolderId, const ::RawHdr& header,
-                                     bool notifyLegacy, nsMsgKey* aKey,
+nsresult MessageDatabase::AddMessage(uint64_t folderId, const ::RawHdr& header,
+                                     bool notifyLegacy, nsMsgKey* key,
                                      Message** liveHeader) {
+  return InsertMessage(folderId, header, false, notifyLegacy, key, liveHeader);
+}
+
+nsresult MessageDatabase::StageMessage(uint64_t folderId,
+                                       const ::RawHdr& header, nsMsgKey* key,
+                                       Message** liveHeader) {
+  return InsertMessage(folderId, header, true, false, key, liveHeader);
+}
+
+nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
+                                        const ::RawHdr& header, bool staged,
+                                        bool notifyLegacy, nsMsgKey* aKey,
+                                        Message** liveHeader) {
   NS_ENSURE_ARG_POINTER(aKey);
+  if (staged) {
+    NS_ENSURE_TRUE(aFolderId && aFolderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  }
   MOZ_TRY(DatabaseCore::EnsureConnection());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool inTransaction;
@@ -111,6 +466,19 @@ nsresult MessageDatabase::AddMessage(uint64_t aFolderId, const ::RawHdr& header,
   RefPtr<Message> message;
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
+    if (staged) {
+      nsCOMPtr<mozIStorageStatement> folder;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RequireHeaderFolder"_ns, "SELECT 1 FROM folders WHERE id = :id"_ns,
+          getter_AddRefs(folder)));
+      mozStorageStatementScoper scoper(folder);
+      MOZ_TRY(folder->BindInt64ByName("id"_ns, aFolderId));
+      bool exists;
+      MOZ_TRY(folder->ExecuteStep(&exists));
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+    }
+    nsMsgKey allocated;
+    MOZ_TRY(DatabaseCore::GetNextMessageKey(allocated));
     {
       nsCString messageId = MOZ_TRY(DatabaseUtils::Normalize(header.messageId));
       nsCString sender = MOZ_TRY(DatabaseUtils::Normalize(header.sender));
@@ -125,19 +493,23 @@ nsresult MessageDatabase::AddMessage(uint64_t aFolderId, const ::RawHdr& header,
           tags = extra.v;
         }
       }
-      nsCOMPtr<mozIStorageStatement> stmt;
-      MOZ_TRY(DatabaseCore::GetStatement("AddNativeMessage"_ns,
-                                         "INSERT INTO messages ( \
-             folderId, threadId, threadParent, messageId, date, sender, recipients, ccList, bccList, subject, flags, tags, priority \
+      nsAutoCString sql((staged ? "INSERT INTO staged_messages ( "_ns
+                                : "INSERT INTO messages ( "_ns) +
+                        " \
+             id, folderId, threadId, threadParent, messageId, date, sender, recipients, ccList, bccList, subject, flags, tags, priority \
            ) VALUES ( \
-             :folderId, :threadId, :threadParent, :messageId, :date, :sender, :recipients, :ccList, :bccList, :subject, :flags, :tags, :priority \
-           ) RETURNING "_ns MESSAGE_SQL_FIELDS,
-                                         getter_AddRefs(stmt)));
+             :id, :folderId, :threadId, :threadParent, :messageId, :date, :sender, :recipients, :ccList, :bccList, :subject, :flags, :tags, :priority \
+           ) RETURNING "_ns MESSAGE_SQL_FIELDS);
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          staged ? "StageNativeMessage"_ns : "AddNativeMessage"_ns, sql,
+          getter_AddRefs(stmt)));
       mozStorageStatementScoper scoper(stmt);
 
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, allocated));
       MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, aFolderId));
-      MOZ_TRY(stmt->BindInt32ByName("threadId"_ns, threadId));
-      MOZ_TRY(stmt->BindInt32ByName("threadParent"_ns, parentId));
+      MOZ_TRY(stmt->BindInt64ByName("threadId"_ns, threadId));
+      MOZ_TRY(stmt->BindInt64ByName("threadParent"_ns, parentId));
       MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
       MOZ_TRY(stmt->BindInt64ByName("date"_ns, header.date));
       MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, sender));
@@ -155,7 +527,10 @@ nsresult MessageDatabase::AddMessage(uint64_t aFolderId, const ::RawHdr& header,
         return NS_ERROR_UNEXPECTED;
       }
       uint32_t len;
-      cached.key = (nsMsgKey)stmt->AsInt64(0);
+      int64_t storedKey;
+      MOZ_TRY(stmt->GetInt64(0, &storedKey));
+      NS_ENSURE_TRUE(storedKey == allocated, NS_ERROR_FILE_CORRUPTED);
+      cached.key = allocated;
       cached.folderId = stmt->AsInt64(1);
       cached.threadId = (nsMsgKey)stmt->AsInt64(2);
       cached.threadParent = (nsMsgKey)stmt->AsInt64(3);
@@ -175,13 +550,23 @@ nsresult MessageDatabase::AddMessage(uint64_t aFolderId, const ::RawHdr& header,
       }
     }
 
+    if (staged) {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ReserveStagedKey"_ns,
+          "UPDATE message_key_allocator SET highWater = :id WHERE singleton = 1"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, allocated));
+      MOZ_TRY(stmt->Execute());
+    }
+
     // The root's key was unavailable until the insert completed.
     if (cached.threadId == 0) {
       nsCOMPtr<mozIStorageStatement> stmt;
-      MOZ_TRY(DatabaseCore::GetStatement(
-          "SetThreadIdToId"_ns,
-          "UPDATE messages SET threadId = id WHERE id = :id"_ns,
-          getter_AddRefs(stmt)));
+      MOZ_TRY(GetHeaderStatement(
+          cached.key, "SetThreadIdToId"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET threadId = id WHERE id = :id"_ns, getter_AddRefs(stmt)));
       mozStorageStatementScoper scoper(stmt);
       MOZ_TRY(stmt->BindInt64ByName("id"_ns, cached.key));
       MOZ_TRY(stmt->Execute());
@@ -262,10 +647,1064 @@ nsresult MessageDatabase::AddMessage(uint64_t aFolderId, const ::RawHdr& header,
     RefPtr<Message> result = message;
     result.forget(liveHeader);
   }
+  if (!staged) {
+    for (MessageListener* listener : mMessageListeners.EndLimitedRange()) {
+      listener->OnMessagePublished(message, notifyLegacy);
+    }
+  }
+  return NS_OK;
+}
+
+nsresult MessageDatabase::IsMessageStaged(nsMsgKey key, bool& staged) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "IsMessageStaged"_ns, "SELECT 1 FROM staged_messages WHERE id = :id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool found;
+  MOZ_TRY(stmt->ExecuteStep(&found));
+  staged = found;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::GetHeaderStatement(
+    nsMsgKey key, const nsACString& label, HeaderTable table,
+    const nsACString& prefix, const nsACString& suffix,
+    mozIStorageStatement** statement, bool* staged) {
+  bool pending;
+  MOZ_TRY(IsMessageStaged(key, pending));
+  const char* name = nullptr;
+  switch (table) {
+    case HeaderTable::Messages:
+      name = pending ? "staged_messages" : "messages";
+      break;
+    case HeaderTable::Properties:
+      name = pending ? "staged_message_properties" : "message_properties";
+      break;
+    case HeaderTable::References:
+      name = pending ? "staged_message_references" : "message_references";
+      break;
+    case HeaderTable::ReferenceSets:
+      name =
+          pending ? "staged_message_reference_sets" : "message_reference_sets";
+      break;
+  }
+  NS_ENSURE_TRUE(name, NS_ERROR_INVALID_ARG);
+  nsAutoCString statementLabel(label);
+  if (pending) {
+    statementLabel.AppendLiteral("_staged");
+  }
+  nsAutoCString sql(prefix);
+  sql.Append(name);
+  sql.Append(suffix);
+  MOZ_TRY(DatabaseCore::GetStatement(statementLabel, sql, statement));
+  if (staged) {
+    *staged = pending;
+  }
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ListStagedMessages(uint64_t folderId,
+                                             nsTArray<nsMsgKey>& keys) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ListStagedMessages"_ns,
+      "SELECT id FROM staged_messages WHERE folderId = :folderId ORDER BY id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+  nsTArray<nsMsgKey> found;
+  bool more;
+  while (true) {
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t key;
+    MOZ_TRY(stmt->GetInt64(0, &key));
+    NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+    found.AppendElement(static_cast<nsMsgKey>(key));
+  }
+  keys = std::move(found);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::AbortMessage(nsMsgKey key) {
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  {
+    nsCOMPtr<mozIStorageStatement> attempt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "StagedIdentityInFlight"_ns,
+        "SELECT 1 FROM offline_attempts WHERE (destinationKey = :key OR "
+        "sourceKey = :key) "
+        "AND state IN (1,3) LIMIT 1"_ns,
+        getter_AddRefs(attempt)));
+    mozStorageStatementScoper scoper(attempt);
+    MOZ_TRY(attempt->BindInt64ByName("key"_ns, key));
+    bool active;
+    MOZ_TRY(attempt->ExecuteStep(&active));
+    NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "AbortStagedMessage"_ns,
+      "DELETE FROM staged_messages WHERE id = :id RETURNING id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+  mMsgCache.remove(key);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
+                                         Message** liveHeader) {
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  CachedMsg cached;
+  RefPtr<Message> message;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    bool staged;
+    MOZ_TRY(IsMessageStaged(key, staged));
+    NS_ENSURE_TRUE(staged, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(FetchMsg(key, cached));
+    nsTArray<nsCString> references;
+    MOZ_TRY(GetMessageReferences(key, references));
+    cached.threadId = key;
+    cached.threadParent = 0;
+    if (!references.IsEmpty()) {
+      nsMsgKey root = MOZ_TRY(FindByMessageId(references[0]));
+      if (root) {
+        cached.threadId = root;
+      }
+      cached.threadParent = MOZ_TRY(FindByMessageId(references.LastElement()));
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "PublishStagedMessage"_ns,
+          "INSERT INTO messages ("_ns MESSAGE_SQL_FIELDS
+          ") SELECT "
+          "s.id, s.folderId, :threadId, :parent, s.messageId, s.date, "
+          "s.sender, "
+          "s.recipients, s.ccList, s.bccList, s.subject, s.flags, s.tags, "
+          "s.priority "
+          "FROM staged_messages s JOIN folders f ON f.id = s.folderId "
+          "WHERE s.id = :id RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindInt64ByName("threadId"_ns, cached.threadId));
+      MOZ_TRY(stmt->BindInt64ByName("parent"_ns, cached.threadParent));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+    }
+    // The staged row remains until all children have been copied successfully.
+    for (const auto& table : {"message_properties", "message_reference_sets",
+                              "message_references"}) {
+      nsAutoCString sql("INSERT INTO ");
+      sql.Append(table);
+      sql.AppendLiteral(" SELECT * FROM staged_");
+      sql.Append(table);
+      sql.AppendLiteral(" WHERE id = ");
+      sql.AppendInt(key);
+      MOZ_TRY(connection->ExecuteSimpleSQL(sql));
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ConsumeStagedMessage"_ns,
+          "DELETE FROM staged_messages WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->Execute());
+    }
+    if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    message = new Message(key);
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanupRv) && active) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Publication cleanup failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+    return rv;
+  }
+  auto entry = mMsgCache.lookup(key);
+  if (entry) {
+    entry->value() = std::move(cached);
+  } else {
+    mMsgCache.putNewInfallible(key, std::move(cached));
+  }
+  if (liveHeader) {
+    RefPtr<Message> result = message;
+    result.forget(liveHeader);
+  }
   for (MessageListener* listener : mMessageListeners.EndLimitedRange()) {
     listener->OnMessagePublished(message, notifyLegacy);
   }
   return NS_OK;
+}
+
+namespace {
+
+using OfflineOp = nsIMsgOfflineImapOperation;
+
+nsresult OfflineUint32(mozIStorageStatement* stmt, uint32_t column,
+                       uint32_t& output) {
+  int32_t type;
+  MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+  NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_INTEGER,
+                 NS_ERROR_FILE_CORRUPTED);
+  int64_t value;
+  MOZ_TRY(stmt->GetInt64(column, &value));
+  NS_ENSURE_TRUE(value >= 0 && value <= UINT32_MAX, NS_ERROR_FILE_CORRUPTED);
+  output = static_cast<uint32_t>(value);
+  return NS_OK;
+}
+
+nsresult FinishOfflineWrite(mozIStorageConnection* connection, nsresult rv) {
+  if (NS_FAILED(rv)) {
+    bool active;
+    nsresult cleanup = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanup) && active) {
+      cleanup = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanup)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Offline operation rollback failed: 0x%08x",
+               static_cast<uint32_t>(cleanup)));
+    }
+  }
+  return rv;
+}
+
+}  // namespace
+
+nsresult MessageDatabase::ReadOfflineOperationIdentity(
+    uint64_t folderId, nsMsgKey key, int64_t& id, int64_t& revision,
+    Maybe<ServerMessageLocation>& source, Maybe<uint32_t>* folderEpoch) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "OfflineOperationIdentity"_ns,
+      "SELECT id, revision, epoch, uid, folderEpoch FROM offline_operations "
+      "WHERE folderId = :folder AND messageKey = :key"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+  bool more, epochNull, uidNull;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  int64_t foundId, foundRevision;
+  MOZ_TRY(stmt->GetInt64(0, &foundId));
+  MOZ_TRY(stmt->GetInt64(1, &foundRevision));
+  NS_ENSURE_TRUE(foundId > 0 && foundRevision > 0, NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(stmt->GetIsNull(2, &epochNull));
+  MOZ_TRY(stmt->GetIsNull(3, &uidNull));
+  NS_ENSURE_TRUE(epochNull == uidNull, NS_ERROR_FILE_CORRUPTED);
+  Maybe<ServerMessageLocation> target;
+  if (!epochNull) {
+    ServerMessageLocation location{folderId, key};
+    MOZ_TRY(OfflineUint32(stmt, 2, location.epoch));
+    MOZ_TRY(OfflineUint32(stmt, 3, location.uid));
+    target = Some(location);
+  }
+  Maybe<uint32_t> scopeEpoch;
+  bool scopeNull;
+  MOZ_TRY(stmt->GetIsNull(4, &scopeNull));
+  if (!scopeNull) {
+    uint32_t epoch;
+    MOZ_TRY(OfflineUint32(stmt, 4, epoch));
+    scopeEpoch = Some(epoch);
+  }
+  if (folderEpoch) {
+    *folderEpoch = scopeEpoch;
+  }
+  id = foundId;
+  revision = foundRevision;
+  source = target;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::RequireOfflineOperationMutable(int64_t id) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "OfflineOperationInFlight"_ns,
+      "SELECT 1 FROM offline_attempts WHERE operationId = :id "
+      "AND state IN (1,3) LIMIT 1"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  bool active;
+  MOZ_TRY(stmt->ExecuteStep(&active));
+  return active ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
+nsresult MessageDatabase::GetOfflineOperation(uint64_t folderId, nsMsgKey key,
+                                              OfflineOperationData& output) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReadOfflineOperation"_ns,
+      "SELECT id, operation, flagOperation, newFlags, sourceKey, sourceUid, "
+      "messageSize, playingBack, sourceFolderURI, destinationFolderURI, "
+      "keywordsToAdd, keywordsToRemove FROM offline_operations "
+      "WHERE folderId = :folder AND messageKey = :key"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  int64_t id;
+  MOZ_TRY(stmt->GetInt64(0, &id));
+  NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+  OfflineOperationData found;
+  MOZ_TRY(OfflineUint32(stmt, 1, found.operation));
+  MOZ_TRY(OfflineUint32(stmt, 2, found.flagOperation));
+  MOZ_TRY(OfflineUint32(stmt, 3, found.newFlags));
+  MOZ_TRY(OfflineUint32(stmt, 4, found.sourceKey));
+  MOZ_TRY(OfflineUint32(stmt, 5, found.sourceUid));
+  MOZ_TRY(OfflineUint32(stmt, 6, found.messageSize));
+  uint32_t playing;
+  MOZ_TRY(OfflineUint32(stmt, 7, playing));
+  NS_ENSURE_TRUE(playing <= 1, NS_ERROR_FILE_CORRUPTED);
+  found.playingBack = playing;
+  MOZ_TRY(stmt->GetUTF8String(8, found.sourceFolderURI));
+  MOZ_TRY(stmt->GetUTF8String(9, found.destinationFolderURI));
+  MOZ_TRY(stmt->GetUTF8String(10, found.keywordsToAdd));
+  MOZ_TRY(stmt->GetUTF8String(11, found.keywordsToRemove));
+  nsCOMPtr<mozIStorageStatement> copies;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReadOfflineCopies"_ns,
+      "SELECT uri FROM offline_copy_destinations WHERE operationId = :id "
+      "ORDER BY ordinal"_ns,
+      getter_AddRefs(copies)));
+  mozStorageStatementScoper copyScoper(copies);
+  MOZ_TRY(copies->BindInt64ByName("id"_ns, id));
+  while (true) {
+    MOZ_TRY(copies->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    nsCString uri;
+    MOZ_TRY(copies->GetUTF8String(0, uri));
+    found.copyDestinations.AppendElement(std::move(uri));
+  }
+  output = std::move(found);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ReserveOfflineOperationKey(uint64_t folderId,
+                                                     nsMsgKey& key) {
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  nsMsgKey allocated = nsMsgKey_None;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(DatabaseCore::GetNextMessageKey(allocated));
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ReserveFolderOfflineOperation"_ns,
+          "INSERT INTO offline_operations(folderId, messageKey, revision, "
+          "operation, "
+          "flagOperation, newFlags, sourceKey, sourceUid, messageSize, "
+          "playingBack, "
+          "sourceFolderURI, destinationFolderURI, keywordsToAdd, "
+          "keywordsToRemove) "
+          "SELECT id, :key, 1, 0, 0, 0, 4294967295, 0, 0, 0, '', '', '', '' "
+          "FROM folders WHERE id = :folder RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+      MOZ_TRY(stmt->BindInt64ByName("key"_ns, allocated));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ReserveStagedKey"_ns,
+          "UPDATE message_key_allocator SET highWater = :id WHERE singleton = 1"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, allocated));
+      MOZ_TRY(stmt->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  key = allocated;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::StoreOfflineOperation(
+    uint64_t folderId, nsMsgKey key, const OfflineOperationData& input) {
+  NS_ENSURE_TRUE(
+      folderId && folderId <= INT64_MAX && key && key < nsMsgKey_None,
+      NS_ERROR_INVALID_ARG);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    int64_t id = 0, revision = 0;
+    Maybe<ServerMessageLocation> source;
+    Maybe<uint32_t> folderEpoch;
+    nsresult found = ReadOfflineOperationIdentity(folderId, key, id, revision,
+                                                  source, &folderEpoch);
+    if (NS_FAILED(found) && found != NS_ERROR_NOT_AVAILABLE) {
+      return found;
+    }
+    if (id) {
+      MOZ_TRY(RequireOfflineOperationMutable(id));
+      NS_ENSURE_TRUE(revision < INT64_MAX, NS_ERROR_ILLEGAL_VALUE);
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> member;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "OfflineOperationMember"_ns,
+          "SELECT folderId FROM messages WHERE id = :key UNION ALL "
+          "SELECT folderId FROM staged_messages WHERE id = :key"_ns,
+          getter_AddRefs(member)));
+      mozStorageStatementScoper scoper(member);
+      MOZ_TRY(member->BindInt64ByName("key"_ns, key));
+      bool exists;
+      MOZ_TRY(member->ExecuteStep(&exists));
+      if (!exists) {
+        // Existing operations survive local deletion with their captured tuple.
+        NS_ENSURE_TRUE(id, NS_ERROR_NOT_AVAILABLE);
+      } else {
+        int64_t actualFolder;
+        MOZ_TRY(member->GetInt64(0, &actualFolder));
+        NS_ENSURE_TRUE(actualFolder > 0 && uint64_t(actualFolder) == folderId,
+                       NS_ERROR_NOT_AVAILABLE);
+        nsTArray<nsCString> names;
+        MOZ_TRY(GetMessagePropertyNames(key, names));
+        if (!source && names.Contains("uidOnServer"_ns)) {
+          ServerMessageLocation location{folderId, key};
+          RefPtr<Message> header = new Message(key);
+          MOZ_TRY(header->GetUint32Property("uidOnServer", &location.uid));
+          NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+          MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+              folderId, location.epoch));
+          source = Some(location);
+        }
+      }
+    }
+    if (input.operation & OfflineOp::kDeleteAllMsgs) {
+      if (!folderEpoch) {
+        NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+        uint32_t epoch;
+        MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+            folderId, epoch));
+        folderEpoch = Some(epoch);
+      }
+    } else {
+      folderEpoch.reset();
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "StoreOfflineOperation"_ns,
+          "INSERT INTO offline_operations(folderId, messageKey, revision, "
+          "epoch, uid, folderEpoch, "
+          "operation, flagOperation, newFlags, sourceKey, sourceUid, "
+          "messageSize, "
+          "playingBack, sourceFolderURI, destinationFolderURI, keywordsToAdd, "
+          "keywordsToRemove) "
+          "VALUES(:folder, :key, :revision, :epoch, :uid, :folderEpoch, "
+          ":operation, :flags, "
+          ":newFlags, "
+          ":sourceKey, :sourceUid, :size, :playing, :sourceURI, "
+          ":destinationURI, :add, :remove) "
+          "ON CONFLICT(folderId, messageKey) DO UPDATE SET revision = "
+          "excluded.revision, "
+          "epoch = excluded.epoch, uid = excluded.uid, folderEpoch = "
+          "excluded.folderEpoch, operation = "
+          "excluded.operation, "
+          "flagOperation = excluded.flagOperation, newFlags = "
+          "excluded.newFlags, "
+          "sourceKey = excluded.sourceKey, sourceUid = excluded.sourceUid, "
+          "messageSize = excluded.messageSize, playingBack = "
+          "excluded.playingBack, "
+          "sourceFolderURI = excluded.sourceFolderURI, destinationFolderURI = "
+          "excluded.destinationFolderURI, "
+          "keywordsToAdd = excluded.keywordsToAdd, keywordsToRemove = "
+          "excluded.keywordsToRemove "
+          "RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+      MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+      MOZ_TRY(stmt->BindInt64ByName("revision"_ns, revision + 1));
+      if (source) {
+        MOZ_TRY(stmt->BindInt64ByName("epoch"_ns, source->epoch));
+        MOZ_TRY(stmt->BindInt64ByName("uid"_ns, source->uid));
+      } else {
+        MOZ_TRY(stmt->BindNullByName("epoch"_ns));
+        MOZ_TRY(stmt->BindNullByName("uid"_ns));
+      }
+      if (folderEpoch) {
+        MOZ_TRY(stmt->BindInt64ByName("folderEpoch"_ns, *folderEpoch));
+      } else {
+        MOZ_TRY(stmt->BindNullByName("folderEpoch"_ns));
+      }
+      MOZ_TRY(stmt->BindInt64ByName("operation"_ns, input.operation));
+      MOZ_TRY(stmt->BindInt64ByName("flags"_ns, input.flagOperation));
+      MOZ_TRY(stmt->BindInt64ByName("newFlags"_ns, input.newFlags));
+      MOZ_TRY(stmt->BindInt64ByName("sourceKey"_ns, input.sourceKey));
+      MOZ_TRY(stmt->BindInt64ByName("sourceUid"_ns, input.sourceUid));
+      MOZ_TRY(stmt->BindInt64ByName("size"_ns, input.messageSize));
+      MOZ_TRY(stmt->BindInt32ByName("playing"_ns, input.playingBack));
+      MOZ_TRY(
+          stmt->BindUTF8StringByName("sourceURI"_ns, input.sourceFolderURI));
+      MOZ_TRY(stmt->BindUTF8StringByName("destinationURI"_ns,
+                                         input.destinationFolderURI));
+      MOZ_TRY(stmt->BindUTF8StringByName("add"_ns, input.keywordsToAdd));
+      MOZ_TRY(stmt->BindUTF8StringByName("remove"_ns, input.keywordsToRemove));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+      MOZ_TRY(stmt->GetInt64(0, &id));
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ClearOfflineCopies"_ns,
+          "DELETE FROM offline_copy_destinations WHERE operationId = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+      MOZ_TRY(stmt->Execute());
+    }
+    nsCOMPtr<mozIStorageStatement> copy;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "StoreOfflineCopy"_ns,
+        "INSERT INTO offline_copy_destinations(operationId, ordinal, uri) "
+        "VALUES(:id, :ordinal, :uri)"_ns,
+        getter_AddRefs(copy)));
+    for (size_t i = 0; i < input.copyDestinations.Length(); ++i) {
+      mozStorageStatementScoper scoper(copy);
+      MOZ_TRY(copy->BindInt64ByName("id"_ns, id));
+      MOZ_TRY(copy->BindInt64ByName("ordinal"_ns, i));
+      MOZ_TRY(copy->BindUTF8StringByName("uri"_ns, input.copyDestinations[i]));
+      MOZ_TRY(copy->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::SetOfflineOperationPlayingBack(uint64_t folderId,
+                                                         nsMsgKey key,
+                                                         bool playingBack) {
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "SetOfflinePlayingBack"_ns,
+      "UPDATE offline_operations SET playingBack = :playing "
+      "WHERE folderId = :folder AND messageKey = :key RETURNING id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+  MOZ_TRY(stmt->BindInt32ByName("playing"_ns, playingBack));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  return more ? NS_ERROR_UNEXPECTED : NS_OK;
+}
+
+nsresult MessageDatabase::RemoveOfflineOperation(uint64_t folderId,
+                                                 nsMsgKey key) {
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    int64_t id, revision;
+    Maybe<ServerMessageLocation> source;
+    MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source));
+    MOZ_TRY(RequireOfflineOperationMutable(id));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "RemoveOfflineOperation"_ns,
+        "DELETE FROM offline_operations WHERE id = :id"_ns,
+        getter_AddRefs(stmt)));
+    {
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+      MOZ_TRY(stmt->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::ListOfflineOperations(uint64_t folderId,
+                                                bool deletesOnly,
+                                                nsTArray<nsMsgKey>& keys) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ListOfflineOperations"_ns,
+      "SELECT messageKey FROM offline_operations WHERE folderId = :folder AND "
+      "(:deletesOnly = 0 OR (operation & :moved) != 0 OR "
+      "((operation & :flagsChanged) != 0 AND (newFlags & :deleted) != 0)) ORDER BY messageKey"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  MOZ_TRY(stmt->BindInt32ByName("deletesOnly"_ns, deletesOnly));
+  MOZ_TRY(stmt->BindInt64ByName("moved"_ns, OfflineOp::kMsgMoved));
+  MOZ_TRY(stmt->BindInt64ByName("flagsChanged"_ns, OfflineOp::kFlagsChanged));
+  MOZ_TRY(stmt->BindInt64ByName("deleted"_ns, OfflineOp::kMsgMarkedDeleted));
+  nsTArray<nsMsgKey> result;
+  bool more;
+  while (true) {
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t key;
+    MOZ_TRY(stmt->GetInt64(0, &key));
+    NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+    result.AppendElement(static_cast<nsMsgKey>(key));
+  }
+  keys = std::move(result);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::BeginOfflineAttempt(
+    uint64_t folderId, nsMsgKey key, uint32_t operation,
+    const Maybe<PendingDestination>& destination, uint64_t& attemptId) {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  int64_t created = 0;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    int64_t id, revision;
+    Maybe<ServerMessageLocation> source;
+    Maybe<uint32_t> folderEpoch;
+    MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source,
+                                         &folderEpoch));
+    MOZ_TRY(RequireOfflineOperationMutable(id));
+    OfflineOperationData payload;
+    MOZ_TRY(GetOfflineOperation(folderId, key, payload));
+    NS_ENSURE_TRUE(
+        operation && !(operation & (operation - 1)) &&
+            operation <= OfflineOp::kRemoveKeywords &&
+            !(operation & (OfflineOp::kMoveResult | OfflineOp::kAddedHeader)) &&
+            (payload.operation & operation),
+        NS_ERROR_INVALID_ARG);
+    // One dispatched action from the combined payload, never an implicit batch.
+    NS_ENSURE_TRUE(source || (operation & (OfflineOp::kAppendDraft |
+                                           OfflineOp::kAppendTemplate |
+                                           OfflineOp::kDeleteAllMsgs)),
+                   NS_ERROR_NOT_AVAILABLE);
+    if (operation == OfflineOp::kDeleteAllMsgs) {
+      NS_ENSURE_TRUE(folderEpoch, NS_ERROR_NOT_AVAILABLE);
+      uint32_t epoch;
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
+                                                                       epoch));
+      NS_ENSURE_TRUE(epoch == *folderEpoch, NS_ERROR_NOT_AVAILABLE);
+    } else {
+      folderEpoch.reset();
+    }
+    if (source) {
+      uint32_t epoch;
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+          source->folderId, epoch));
+      NS_ENSURE_TRUE(epoch == source->epoch, NS_ERROR_NOT_AVAILABLE);
+      bool exists;
+      MOZ_TRY(MessageExists(source->key, exists));
+      if (exists) {
+        nsCOMPtr<mozIStorageStatement> member;
+        MOZ_TRY(DatabaseCore::GetStatement(
+            "OfflineSourceFolder"_ns,
+            "SELECT folderId FROM messages WHERE id = :key"_ns,
+            getter_AddRefs(member)));
+        mozStorageStatementScoper scoper(member);
+        MOZ_TRY(member->BindInt64ByName("key"_ns, source->key));
+        bool found;
+        MOZ_TRY(member->ExecuteStep(&found));
+        NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
+        int64_t actualFolder;
+        MOZ_TRY(member->GetInt64(0, &actualFolder));
+        NS_ENSURE_TRUE(
+            actualFolder > 0 && uint64_t(actualFolder) == source->folderId,
+            NS_ERROR_NOT_AVAILABLE);
+        uint32_t uid;
+        nsTArray<nsCString> names;
+        MOZ_TRY(GetMessagePropertyNames(source->key, names));
+        NS_ENSURE_TRUE(names.Contains("uidOnServer"_ns),
+                       NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(GetMessageUidOnServer(source->key, uid));
+        NS_ENSURE_TRUE(uid == source->uid, NS_ERROR_NOT_AVAILABLE);
+      }
+    }
+    NS_ENSURE_TRUE(destination || !(operation & (OfflineOp::kMsgMoved |
+                                                 OfflineOp::kMsgCopy |
+                                                 OfflineOp::kAppendDraft |
+                                                 OfflineOp::kAppendTemplate)),
+                   NS_ERROR_INVALID_ARG);
+    if (destination) {
+      NS_ENSURE_TRUE(
+          !(operation & (OfflineOp::kMsgMoved | OfflineOp::kMsgCopy)) ||
+              destination->key != key,
+          NS_ERROR_NOT_AVAILABLE);
+      uint32_t epoch;
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+          destination->folderId, epoch));
+      NS_ENSURE_TRUE(epoch == destination->epoch, NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<mozIStorageStatement> member;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "OfflineDestinationMember"_ns,
+          "SELECT folderId FROM messages WHERE id = :key UNION ALL "
+          "SELECT folderId FROM staged_messages WHERE id = :key"_ns,
+          getter_AddRefs(member)));
+      mozStorageStatementScoper scoper(member);
+      MOZ_TRY(member->BindInt64ByName("key"_ns, destination->key));
+      bool exists;
+      MOZ_TRY(member->ExecuteStep(&exists));
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+      int64_t actual;
+      MOZ_TRY(member->GetInt64(0, &actual));
+      NS_ENSURE_TRUE(actual > 0 && uint64_t(actual) == destination->folderId,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsTArray<nsCString> names;
+      MOZ_TRY(GetMessagePropertyNames(destination->key, names));
+      NS_ENSURE_FALSE(names.Contains("uidOnServer"_ns), NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<mozIStorageStatement> used;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "OfflineDestinationAlreadyUsed"_ns,
+          "SELECT 1 FROM offline_attempts WHERE destinationKey = :key "
+          "AND state IN (1, 2, 3) LIMIT 1"_ns,
+          getter_AddRefs(used)));
+      mozStorageStatementScoper usedScoper(used);
+      MOZ_TRY(used->BindInt64ByName("key"_ns, destination->key));
+      MOZ_TRY(used->ExecuteStep(&exists));
+      NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "BeginOfflineAttempt"_ns,
+          "INSERT INTO offline_attempts(operationId, revision, state, "
+          "sourceFolderId, sourceKey, sourceEpoch, sourceUid, "
+          "destinationFolderId, destinationKey, destinationEpoch, "
+          "operationFolderId, operationEpoch, operation) "
+          "VALUES(:operation, :revision, 1, :sourceFolder, :sourceKey, "
+          ":sourceEpoch, "
+          ":sourceUid, :destinationFolder, :destinationKey, :destinationEpoch, :folder, :folderEpoch, :action) RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("operation"_ns, id));
+      MOZ_TRY(stmt->BindInt64ByName("revision"_ns, revision));
+      MOZ_TRY(stmt->BindInt64ByName("action"_ns, operation));
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+      if (folderEpoch) {
+        MOZ_TRY(stmt->BindInt64ByName("folderEpoch"_ns, *folderEpoch));
+      } else {
+        MOZ_TRY(stmt->BindNullByName("folderEpoch"_ns));
+      }
+      if (source) {
+        MOZ_TRY(stmt->BindInt64ByName("sourceFolder"_ns, source->folderId));
+        MOZ_TRY(stmt->BindInt64ByName("sourceKey"_ns, source->key));
+        MOZ_TRY(stmt->BindInt64ByName("sourceEpoch"_ns, source->epoch));
+        MOZ_TRY(stmt->BindInt64ByName("sourceUid"_ns, source->uid));
+      } else {
+        for (const char* name :
+             {"sourceFolder", "sourceKey", "sourceEpoch", "sourceUid"}) {
+          MOZ_TRY(stmt->BindNullByName(nsDependentCString(name)));
+        }
+      }
+      if (destination) {
+        MOZ_TRY(stmt->BindInt64ByName("destinationFolder"_ns,
+                                      destination->folderId));
+        MOZ_TRY(stmt->BindInt64ByName("destinationKey"_ns, destination->key));
+        MOZ_TRY(
+            stmt->BindInt64ByName("destinationEpoch"_ns, destination->epoch));
+      } else {
+        for (const char* name :
+             {"destinationFolder", "destinationKey", "destinationEpoch"}) {
+          MOZ_TRY(stmt->BindNullByName(nsDependentCString(name)));
+        }
+      }
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+      MOZ_TRY(stmt->GetInt64(0, &created));
+      NS_ENSURE_TRUE(created > 0, NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+    }
+    return connection->CommitTransaction();
+  }();
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  attemptId = static_cast<uint64_t>(created);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
+                                            OfflineAttempt& output) {
+  NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "GetOfflineAttempt"_ns,
+      "SELECT operationId, revision, state, sourceFolderId, sourceKey, "
+      "sourceEpoch, "
+      "sourceUid, destinationFolderId, destinationKey, destinationEpoch, "
+      "confirmedUid, "
+      "operationFolderId, operationEpoch, operation "
+      "FROM offline_attempts WHERE id = :id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, attemptId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  OfflineAttempt found;
+  found.id = attemptId;
+  int64_t id, revision, state;
+  MOZ_TRY(stmt->GetInt64(0, &id));
+  MOZ_TRY(stmt->GetInt64(1, &revision));
+  MOZ_TRY(stmt->GetInt64(2, &state));
+  NS_ENSURE_TRUE(id > 0 && revision > 0 && state >= 0 && state <= 3,
+                 NS_ERROR_FILE_CORRUPTED);
+  found.operationId = id;
+  found.revision = revision;
+  found.state = static_cast<OfflineAttemptState>(state);
+  bool sourceNull, destinationNull;
+  MOZ_TRY(stmt->GetIsNull(3, &sourceNull));
+  for (uint32_t column : {4, 5, 6}) {
+    bool null;
+    MOZ_TRY(stmt->GetIsNull(column, &null));
+    NS_ENSURE_TRUE(null == sourceNull, NS_ERROR_FILE_CORRUPTED);
+  }
+  if (!sourceNull) {
+    ServerMessageLocation location;
+    MOZ_TRY(stmt->GetInt64(3, &id));
+    NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+    location.folderId = id;
+    MOZ_TRY(OfflineUint32(stmt, 4, location.key));
+    NS_ENSURE_TRUE(location.key && location.key < nsMsgKey_None,
+                   NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(OfflineUint32(stmt, 5, location.epoch));
+    MOZ_TRY(OfflineUint32(stmt, 6, location.uid));
+    found.source = Some(location);
+  }
+  MOZ_TRY(stmt->GetIsNull(7, &destinationNull));
+  for (uint32_t column : {8, 9}) {
+    bool null;
+    MOZ_TRY(stmt->GetIsNull(column, &null));
+    NS_ENSURE_TRUE(null == destinationNull, NS_ERROR_FILE_CORRUPTED);
+  }
+  if (!destinationNull) {
+    PendingDestination location;
+    MOZ_TRY(stmt->GetInt64(7, &id));
+    NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+    location.folderId = id;
+    MOZ_TRY(OfflineUint32(stmt, 8, location.key));
+    NS_ENSURE_TRUE(location.key && location.key < nsMsgKey_None,
+                   NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(OfflineUint32(stmt, 9, location.epoch));
+    found.destination = Some(location);
+  }
+  bool uidNull;
+  MOZ_TRY(stmt->GetIsNull(10, &uidNull));
+  if (!uidNull) {
+    uint32_t uid;
+    MOZ_TRY(OfflineUint32(stmt, 10, uid));
+    found.confirmedUid = Some(uid);
+  }
+  MOZ_TRY(stmt->GetInt64(11, &id));
+  NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+  found.folderId = id;
+  MOZ_TRY(OfflineUint32(stmt, 13, found.operation));
+  bool epochNull;
+  MOZ_TRY(stmt->GetIsNull(12, &epochNull));
+  if (!epochNull) {
+    uint32_t epoch;
+    MOZ_TRY(OfflineUint32(stmt, 12, epoch));
+    found.folderEpoch = Some(epoch);
+  }
+  output = std::move(found);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::GetCurrentOfflineAttempt(uint64_t folderId,
+                                                   nsMsgKey key,
+                                                   OfflineAttempt& output) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CurrentOfflineAttempt"_ns,
+      "SELECT a.id FROM offline_attempts a JOIN offline_operations o "
+      "ON o.id = a.operationId AND o.revision = a.revision "
+      "WHERE o.folderId = :folder AND o.messageKey = :key "
+      "ORDER BY a.id DESC LIMIT 1"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  int64_t id;
+  MOZ_TRY(stmt->GetInt64(0, &id));
+  NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+  return GetOfflineAttempt(id, output);
+}
+
+nsresult MessageDatabase::ResolveOfflineAttemptNotApplied(uint64_t attemptId) {
+  NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ResolveOfflineAttemptNotApplied"_ns,
+      "UPDATE offline_attempts SET state = 0 WHERE id = :id AND state IN (1,3) "
+      "RETURNING id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, attemptId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  return more ? NS_ERROR_UNEXPECTED : NS_OK;
+}
+
+nsresult MessageDatabase::MarkOfflineAttemptAmbiguous(uint64_t attemptId) {
+  NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "MarkOfflineAttemptAmbiguous"_ns,
+      "UPDATE offline_attempts SET state = 3 WHERE id = :id AND state IN (1,3) "
+      "RETURNING id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, attemptId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  return more ? NS_ERROR_UNEXPECTED : NS_OK;
+}
+
+nsresult MessageDatabase::ConfirmOfflineAttempt(
+    uint64_t attemptId, const Maybe<ServerUidConfirmation>& destinationUid) {
+  NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    OfflineAttempt attempt;
+    MOZ_TRY(GetOfflineAttempt(attemptId, attempt));
+    NS_ENSURE_TRUE(attempt.destination.isSome() == destinationUid.isSome(),
+                   NS_ERROR_INVALID_ARG);
+    if (attempt.state == OfflineAttemptState::Confirmed) {
+      NS_ENSURE_TRUE(destinationUid
+                         ? (attempt.confirmedUid == Some(destinationUid->uid) &&
+                            attempt.destination->epoch == destinationUid->epoch)
+                         : attempt.confirmedUid.isNothing(),
+                     NS_ERROR_FILE_CORRUPTED);
+      return connection->CommitTransaction();
+    }
+    NS_ENSURE_TRUE(attempt.state == OfflineAttemptState::Sent ||
+                       attempt.state == OfflineAttemptState::Ambiguous,
+                   NS_ERROR_NOT_AVAILABLE);
+    if (attempt.folderEpoch) {
+      uint32_t epoch;
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+          attempt.folderId, epoch));
+      NS_ENSURE_TRUE(epoch == *attempt.folderEpoch, NS_ERROR_NOT_AVAILABLE);
+    }
+    if (attempt.source) {
+      uint32_t epoch;
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+          attempt.source->folderId, epoch));
+      NS_ENSURE_TRUE(epoch == attempt.source->epoch, NS_ERROR_NOT_AVAILABLE);
+    }
+    if (attempt.destination) {
+      NS_ENSURE_TRUE(destinationUid->epoch == attempt.destination->epoch,
+                     NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(BindMessageToServerUidInTransaction(
+          attempt.destination->key, attempt.destination->folderId,
+          destinationUid->epoch, destinationUid->uid, true));
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ConfirmOfflineAttempt"_ns,
+          "UPDATE offline_attempts SET state = 2, confirmedUid = :uid WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, attemptId));
+      if (destinationUid) {
+        MOZ_TRY(stmt->BindInt64ByName("uid"_ns, destinationUid->uid));
+      } else {
+        MOZ_TRY(stmt->BindNullByName("uid"_ns));
+      }
+      MOZ_TRY(stmt->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
 }
 
 nsresult MessageDatabase::GetMessage(nsMsgKey key, Message** message) {
@@ -282,13 +1721,19 @@ NS_IMETHODIMP MessageDatabase::GetMessage(nsMsgKey key, nsIMsgDBHdr** message) {
 
 nsresult MessageDatabase::GetMessageReferences(
     nsMsgKey key, nsTArray<nsCString>& references) {
+  bool staged;
+  MOZ_TRY(IsMessageStaged(key, staged));
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
-      "GetMessageReferences"_ns,
-      "SELECT s.id, r.token FROM messages m "
-      "LEFT JOIN message_reference_sets s ON s.id = m.id "
-      "LEFT JOIN message_references r ON r.id = s.id "
-      "WHERE m.id = :id ORDER BY r.ordinal"_ns,
+      staged ? "GetStagedReferences"_ns : "GetMessageReferences"_ns,
+      staged ? "SELECT s.id, r.token FROM staged_messages m "
+               "LEFT JOIN staged_message_reference_sets s ON s.id = m.id "
+               "LEFT JOIN staged_message_references r ON r.id = s.id "
+               "WHERE m.id = :id ORDER BY r.ordinal"_ns
+             : "SELECT s.id, r.token FROM messages m "
+               "LEFT JOIN message_reference_sets s ON s.id = m.id "
+               "LEFT JOIN message_references r ON r.id = s.id "
+               "WHERE m.id = :id ORDER BY r.ordinal"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
@@ -323,9 +1768,9 @@ nsresult MessageDatabase::WriteMessageReferencesInTransaction(
   NS_ENSURE_TRUE(inTransaction, NS_ERROR_UNEXPECTED);
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    MOZ_TRY(DatabaseCore::GetStatement(
-        "RequireMessageForReferences"_ns,
-        "SELECT 1 FROM messages WHERE id = :id"_ns, getter_AddRefs(stmt)));
+    MOZ_TRY(GetHeaderStatement(key, "RequireMessageForReferences"_ns,
+                               HeaderTable::Messages, "SELECT 1 FROM "_ns,
+                               " WHERE id = :id"_ns, getter_AddRefs(stmt)));
     mozStorageStatementScoper scoper(stmt);
     MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
     bool exists;
@@ -334,29 +1779,28 @@ nsresult MessageDatabase::WriteMessageReferencesInTransaction(
   }
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    MOZ_TRY(DatabaseCore::GetStatement(
-        "ClearMessageReferences"_ns,
-        "DELETE FROM message_references WHERE id = :id"_ns,
-        getter_AddRefs(stmt)));
+    MOZ_TRY(GetHeaderStatement(key, "ClearMessageReferences"_ns,
+                               HeaderTable::References, "DELETE FROM "_ns,
+                               " WHERE id = :id"_ns, getter_AddRefs(stmt)));
     mozStorageStatementScoper scoper(stmt);
     MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
     MOZ_TRY(stmt->Execute());
   }
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    MOZ_TRY(DatabaseCore::GetStatement(
-        "MarkMessageReferencesKnown"_ns,
-        "INSERT OR IGNORE INTO message_reference_sets(id) VALUES(:id)"_ns,
-        getter_AddRefs(stmt)));
+    MOZ_TRY(GetHeaderStatement(key, "MarkMessageReferencesKnown"_ns,
+                               HeaderTable::ReferenceSets,
+                               "INSERT OR IGNORE INTO "_ns,
+                               "(id) VALUES(:id)"_ns, getter_AddRefs(stmt)));
     mozStorageStatementScoper scoper(stmt);
     MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
     MOZ_TRY(stmt->Execute());
   }
   nsCOMPtr<mozIStorageStatement> stmt;
-  MOZ_TRY(DatabaseCore::GetStatement(
-      "InsertMessageReference"_ns,
-      "INSERT INTO message_references(id, ordinal, token) "
-      "VALUES(:id, :ordinal, :token)"_ns,
+  MOZ_TRY(GetHeaderStatement(
+      key, "InsertMessageReference"_ns, HeaderTable::References,
+      "INSERT INTO "_ns,
+      "(id, ordinal, token) VALUES(:id, :ordinal, :token)"_ns,
       getter_AddRefs(stmt)));
   for (uint32_t i = 0; i < references.Length(); ++i) {
     mozStorageStatementScoper scoper(stmt);
@@ -644,13 +2088,13 @@ nsresult MessageDatabase::FetchMsg(nsMsgKey key, CachedMsg& cached) {
   // TODO: Likely we'll eventually need to collect from multiple tables, either
   // with JOINs or multiple queries.
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement("FetchCachedMsg"_ns,
-                                           "SELECT "_ns MESSAGE_SQL_FIELDS
-                                           " FROM messages WHERE id = :id"_ns,
-                                           getter_AddRefs(stmt));
+  nsresult rv =
+      GetHeaderStatement(key, "FetchCachedMsg"_ns, HeaderTable::Messages,
+                         "SELECT "_ns MESSAGE_SQL_FIELDS " FROM "_ns,
+                         " WHERE id = :id"_ns, getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindInt64ByName("id"_ns, (uint64_t)key);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
 
   bool hasResult;
   rv = stmt->ExecuteStep(&hasResult);
@@ -799,53 +2243,50 @@ nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
 
 nsresult MessageDatabase::GetNumMessages(uint64_t folderId,
                                          uint64_t* numMessages) {
+  NS_ENSURE_ARG_POINTER(numMessages);
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
+  MOZ_TRY(DatabaseCore::GetStatement(
       "GetNumMessages"_ns,
       "SELECT COUNT(*) AS numMessages FROM messages WHERE folderId = :folderId"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
+      getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
-
-  stmt->BindInt64ByName("folderId"_ns, folderId);
-
-  *numMessages = 0;
-  bool hasResult;
-  if (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    *numMessages = (uint64_t)stmt->AsInt64(0);
-  }
-
-  return rv;
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  int64_t count;
+  MOZ_TRY(stmt->GetInt64(0, &count));
+  NS_ENSURE_TRUE(count >= 0, NS_ERROR_FILE_CORRUPTED);
+  *numMessages = count;
+  return NS_OK;
 }
 
 nsresult MessageDatabase::GetNumUnread(uint64_t folderId, uint64_t* numUnread) {
+  NS_ENSURE_ARG_POINTER(numUnread);
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
+  MOZ_TRY(DatabaseCore::GetStatement(
       "GetNumUnread"_ns,
       "SELECT COUNT(*) AS numUnread FROM messages WHERE folderId = :folderId AND flags & :flag = 0"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
+      getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
-
-  stmt->BindInt64ByName("folderId"_ns, folderId);
-  stmt->BindInt64ByName("flag"_ns, nsMsgMessageFlags::Read);
-
-  *numUnread = 0;
-  bool hasResult;
-  if (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    *numUnread = (uint64_t)stmt->AsInt64(0);
-  }
-
-  return rv;
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("flag"_ns, nsMsgMessageFlags::Read));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  int64_t count;
+  MOZ_TRY(stmt->GetInt64(0, &count));
+  NS_ENSURE_TRUE(count >= 0, NS_ERROR_FILE_CORRUPTED);
+  *numUnread = count;
+  return NS_OK;
 }
 
 nsresult MessageDatabase::GetMessagePropertyNames(nsMsgKey key,
                                                   nsTArray<nsCString>& names) {
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "GetMessageProperties"_ns,
-      "SELECT name FROM message_properties WHERE id = :id"_ns,
-      getter_AddRefs(stmt));
+  nsresult rv = GetHeaderStatement(
+      key, "GetMessageProperties"_ns, HeaderTable::Properties,
+      "SELECT name FROM "_ns, " WHERE id = :id"_ns, getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
@@ -874,9 +2315,9 @@ NS_IMETHODIMP MessageDatabase::GetMessageProperty(nsMsgKey aKey,
 
   // TODO: might want to cache selected properties.
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "GetMessageProperty"_ns,
-      "SELECT value FROM message_properties WHERE id = :id AND name = :name"_ns,
+  nsresult rv = GetHeaderStatement(
+      aKey, "GetMessageProperty"_ns, HeaderTable::Properties,
+      "SELECT value FROM "_ns, " WHERE id = :id AND name = :name"_ns,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
@@ -898,9 +2339,9 @@ nsresult MessageDatabase::GetMessageProperty(nsMsgKey key,
                                              uint32_t& value) {
   // TODO: might want to cache selected properties.
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "GetMessageProperty"_ns,
-      "SELECT value FROM message_properties WHERE id = :id AND name = :name"_ns,
+  nsresult rv = GetHeaderStatement(
+      key, "GetMessageProperty"_ns, HeaderTable::Properties,
+      "SELECT value FROM "_ns, " WHERE id = :id AND name = :name"_ns,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
@@ -924,9 +2365,9 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
   MOZ_ASSERT(!aName.EqualsLiteral("keywords"));  // Use SetMessageTags().
 
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "SetMessageProperty"_ns,
-      "REPLACE INTO message_properties (id, name, value) VALUES (:id, :name, :value)"_ns,
+  nsresult rv = GetHeaderStatement(
+      aKey, "SetMessageProperty"_ns, HeaderTable::Properties,
+      "REPLACE INTO "_ns, " (id, name, value) VALUES (:id, :name, :value)"_ns,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
@@ -944,9 +2385,9 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
                                              const nsACString& aName,
                                              uint32_t aValue) {
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "SetMessageProperty"_ns,
-      "REPLACE INTO message_properties (id, name, value) VALUES (:id, :name, :value)"_ns,
+  nsresult rv = GetHeaderStatement(
+      aKey, "SetMessageProperty"_ns, HeaderTable::Properties,
+      "REPLACE INTO "_ns, " (id, name, value) VALUES (:id, :name, :value)"_ns,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
@@ -1147,37 +2588,8 @@ nsresult MessageDatabase::BindMessageToServerUid(nsMsgKey key,
   }
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
-    uint32_t current;
-    MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
-                                                                     current));
-    if (current != epoch) {
-      return NS_ERROR_NOT_AVAILABLE;
-    }
-    {
-      nsCOMPtr<mozIStorageStatement> stmt;
-      MOZ_TRY(DatabaseCore::GetStatement(
-          "MessageInServerUidFolder"_ns,
-          "SELECT id FROM messages WHERE id = :id AND folderId = :folderId"_ns,
-          getter_AddRefs(stmt)));
-      mozStorageStatementScoper scoper(stmt);
-      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-      MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
-      bool more;
-      MOZ_TRY(stmt->ExecuteStep(&more));
-      if (!more) {
-        return NS_ERROR_NOT_AVAILABLE;
-      }
-    }
-    nsMsgKey existing;
-    nsresult lookupRv =
-        GetMessageKeyForServerUid(folderId, epoch, uid, existing);
-    if (NS_FAILED(lookupRv) && lookupRv != NS_ERROR_NOT_AVAILABLE) {
-      return lookupRv;
-    }
-    if (NS_SUCCEEDED(lookupRv) && existing != key) {
-      return NS_ERROR_FILE_CORRUPTED;
-    }
-    MOZ_TRY(SetMessageUidOnServer(key, uid));
+    MOZ_TRY(
+        BindMessageToServerUidInTransaction(key, folderId, epoch, uid, false));
     return connection->CommitTransaction();
   }();
   if (NS_FAILED(rv)) {
@@ -1192,6 +2604,87 @@ nsresult MessageDatabase::BindMessageToServerUid(nsMsgKey key,
     }
   }
   return rv;
+}
+
+nsresult MessageDatabase::BindMessageToServerUidInTransaction(
+    nsMsgKey key, uint64_t folderId, uint32_t epoch, uint32_t uid,
+    bool allowStaged) {
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_TRUE(active, NS_ERROR_UNEXPECTED);
+  uint32_t current;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
+                                                                   current));
+  if (current != epoch) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "MessageInServerUidFolderOrStaging"_ns,
+        "SELECT id FROM messages WHERE id = :id AND folderId = :folderId "
+        "UNION ALL SELECT id FROM staged_messages WHERE :allowStaged != 0 "
+        "AND id = :id AND folderId = :folderId"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+    MOZ_TRY(stmt->BindInt32ByName("allowStaged"_ns, allowStaged));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+  }
+  nsMsgKey existing;
+  nsresult lookupRv = GetMessageKeyForServerUid(folderId, epoch, uid, existing);
+  if (NS_FAILED(lookupRv) && lookupRv != NS_ERROR_NOT_AVAILABLE) {
+    return lookupRv;
+  }
+  if (NS_SUCCEEDED(lookupRv) && existing != key) {
+    return NS_ERROR_FILE_CORRUPTED;
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "StagedMembersWithServerUid"_ns,
+        "SELECT s.id FROM staged_messages s JOIN staged_message_properties p "
+        "ON p.id = s.id AND p.name = 'uidOnServer' WHERE s.folderId = :folder "
+        "AND s.id != :key"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+    bool more;
+    while (true) {
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (!more) {
+        break;
+      }
+      uint32_t otherKey, otherUid;
+      MOZ_TRY(OfflineUint32(stmt, 0, otherKey));
+      NS_ENSURE_TRUE(otherKey && otherKey < nsMsgKey_None,
+                     NS_ERROR_FILE_CORRUPTED);
+      RefPtr<Message> header = new Message(otherKey);
+      MOZ_TRY(header->GetUint32Property("uidOnServer", &otherUid));
+      NS_ENSURE_TRUE(otherUid != uid, NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+  if (allowStaged) {
+    RefPtr<Message> header = new Message(key);
+    nsTArray<nsCString> names;
+    MOZ_TRY(GetMessagePropertyNames(key, names));
+    if (names.Contains("uidOnServer"_ns)) {
+      uint32_t existingUid;
+      MOZ_TRY(header->GetUint32Property("uidOnServer", &existingUid));
+      NS_ENSURE_TRUE(existingUid == uid, NS_ERROR_FILE_CORRUPTED);
+      return NS_OK;
+    }
+    MOZ_TRY(header->SetUint32Property("uidOnServer", uid));
+  } else {
+    MOZ_TRY(SetMessageUidOnServer(key, uid));
+  }
+  return NS_OK;
 }
 
 nsresult MessageDatabase::GetMessageThreadId(nsMsgKey key, nsMsgKey& threadId) {
@@ -1235,18 +2728,18 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
   MOZ_TRY(oldMessage->SetDate(date));
   MOZ_TRY(oldMessage->SetThreadId(threadId));
 
+  bool staged;
   // Update in DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageFlags"_ns,
-        "UPDATE messages SET flags = :flags WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageFlags"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET flags = :flags WHERE id = :id"_ns, getter_AddRefs(stmt), &staged);
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindInt64ByName("flags"_ns, (int64_t)newFlags);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("flags"_ns, (int64_t)newFlags));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1255,6 +2748,10 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
   auto p = mMsgCache.lookup(key);
   if (p) {
     p->value().flags = newFlags;
+  }
+
+  if (staged) {
+    return NS_OK;
   }
 
   // Notify.
@@ -1282,15 +2779,14 @@ nsresult MessageDatabase::SetMessagePriority(nsMsgKey key,
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessagePriority"_ns,
-        "UPDATE messages SET priority = :priority WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessagePriority"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET priority = :priority WHERE id = :id"_ns, getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindInt32ByName("priority"_ns, priority);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindInt32ByName("priority"_ns, priority));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1314,15 +2810,14 @@ nsresult MessageDatabase::SetMessageDate(nsMsgKey key, PRTime date) {
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageDate"_ns,
-        "UPDATE messages SET date = :date WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageDate"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET date = :date WHERE id = :id"_ns, getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindInt64ByName("date"_ns, (int64_t)date);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("date"_ns, (int64_t)date));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1354,15 +2849,14 @@ nsresult MessageDatabase::SetMessageMessageId(nsMsgKey key,
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageMessageId"_ns,
-        "UPDATE messages SET messageId = :messageId WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageMessageId"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET messageId = :messageId WHERE id = :id"_ns, getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindUTF8StringByName("messageId"_ns, messageId);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1382,15 +2876,14 @@ nsresult MessageDatabase::SetMessageCcList(nsMsgKey key,
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageCcList"_ns,
-        "UPDATE messages SET ccList = :ccList WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageCcList"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET ccList = :ccList WHERE id = :id"_ns, getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindUTF8StringByName("ccList"_ns, ccList);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName("ccList"_ns, ccList));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1410,15 +2903,14 @@ nsresult MessageDatabase::SetMessageBccList(nsMsgKey key,
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageBccList"_ns,
-        "UPDATE messages SET bccList = :bccList WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageBccList"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET bccList = :bccList WHERE id = :id"_ns, getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindUTF8StringByName("bccList"_ns, bccList);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName("bccList"_ns, bccList));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1438,15 +2930,14 @@ nsresult MessageDatabase::SetMessageSender(nsMsgKey key,
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageSender"_ns,
-        "UPDATE messages SET sender = :sender WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageSender"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET sender = :sender WHERE id = :id"_ns, getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindUTF8StringByName("sender"_ns, sender);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, sender));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1466,15 +2957,14 @@ nsresult MessageDatabase::SetMessageSubject(nsMsgKey key,
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageSubject"_ns,
-        "UPDATE messages SET subject = :subject WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageSubject"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET subject = :subject WHERE id = :id"_ns, getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindUTF8StringByName("subject"_ns, subject);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, subject));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1494,15 +2984,15 @@ nsresult MessageDatabase::SetMessageRecipients(nsMsgKey key,
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageRecipients"_ns,
-        "UPDATE messages SET recipients = :recipients WHERE id = :id"_ns,
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageRecipients"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET recipients = :recipients WHERE id = :id"_ns,
         getter_AddRefs(stmt));
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindUTF8StringByName("recipients"_ns, recipients);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName("recipients"_ns, recipients));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1539,18 +3029,18 @@ nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
   MOZ_TRY(oldMessage->SetDate(date));
   MOZ_TRY(oldMessage->SetThreadId(threadId));
 
+  bool staged;
   // Update DB.
   {
     nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = DatabaseCore::GetStatement(
-        "SetMessageTags"_ns,
-        "UPDATE messages SET tags = :tags WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
+    nsresult rv = GetHeaderStatement(
+        key, "SetMessageTags"_ns, HeaderTable::Messages, "UPDATE "_ns,
+        " SET tags = :tags WHERE id = :id"_ns, getter_AddRefs(stmt), &staged);
     NS_ENSURE_SUCCESS(rv, rv);
     mozStorageStatementScoper scoper(stmt);
 
-    stmt->BindInt64ByName("id"_ns, key);
-    stmt->BindUTF8StringByName("tags"_ns, tags);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
     rv = stmt->Execute();
     NS_ENSURE_SUCCESS(rv, rv);
   }
@@ -1559,6 +3049,10 @@ nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
   auto p = mMsgCache.lookup(key);
   if (p) {
     p->value().tags = tags;
+  }
+
+  if (staged) {
+    return NS_OK;
   }
 
   // Notify.

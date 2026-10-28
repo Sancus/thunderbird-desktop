@@ -277,6 +277,9 @@ NS_IMETHODIMP nsMsgAccountManager::Observe(nsISupports* aSubject,
                                            const char* aTopic,
                                            const char16_t* someData) {
   if (!strcmp(aTopic, "search-folders-changed")) {
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      return NS_OK;
+    }
     nsCOMPtr<nsIMsgFolder> virtualFolder = do_QueryInterface(aSubject);
     nsCOMPtr<nsIMsgDatabase> db;
     nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;

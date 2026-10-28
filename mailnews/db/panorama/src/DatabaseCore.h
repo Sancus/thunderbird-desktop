@@ -77,6 +77,8 @@ class DatabaseCore : public nsIDatabaseCore,
   static nsresult EnsureConnection();
   static nsresult CreateNewDatabase();
   static nsresult UpgradeSchema();
+  // Caller owns the insert transaction; the insert advances the high-water mark.
+  static nsresult GetNextMessageKey(nsMsgKey& key);
 
   static nsresult GetStatement(const nsACString& aName, const nsACString& aSQL,
                                mozIStorageStatement** aStmt);

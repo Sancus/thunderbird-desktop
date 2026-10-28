@@ -14,7 +14,7 @@ class MessageListener;
 %}
 [ptr] native MessageListener(mozilla::mailnews::MessageListener);
 
-[scriptable, builtinclass, uuid(eb321750-ba3f-4acb-a2b8-380f2f873da8)]
+[scriptable, builtinclass, uuid(9a2d178c-72c8-4d5a-a399-f209a77bbdf0)]
 interface nsIMessageDatabase : nsISupports {
   /**
    * The count of all messages in the database.
@@ -51,6 +51,37 @@ interface nsIMessageDatabase : nsISupports {
    * Get any message property from the message_properties table.
    */
   AUTF8String getMessageProperty(in nsMsgKey id, in AUTF8String name);
+
+
+  /**
+   * Current stored search inputs, or null for a missing/deleted message.
+   * The caller applies eligibility policy and checks actual body availability.
+   * Missing revision history for an existing row is FILE_CORRUPTED.
+   * Closed/replaced core instances return NOT_AVAILABLE. Reads fail with
+   * IN_PROGRESS while a core transaction is active.
+   */
+  [implicit_jscontext] jsval getSearchState(in nsMsgKey id);
+
+  /**
+   * Bounded current-state page. Replay changes after the FIRST page's watermark
+   * after paging; pages are not an indefinitely retained historical snapshot.
+   */
+  [implicit_jscontext] jsval getSearchSnapshot(in nsMsgKey afterKey,
+                                             in unsigned long limit);
+
+  /**
+   * Durable changes after a sequence, with an upper watermark and nextSequence.
+   * A null messageKey denotes a global policy change. A cursor beyond the
+   * current watermark returns NOT_AVAILABLE and requires a new snapshot.
+   */
+  [implicit_jscontext] jsval getSearchChanges(in unsigned long long afterSequence,
+                                            in unsigned long limit);
+
+  /** Record completed content changes which did not update core body fields. */
+  void noteMessageContentChanged(in nsMsgKey id);
+
+  /** Record external eligibility policy changes, such as indexing preferences. */
+  void noteSearchPolicyChanged();
 
   /**
    * Add or remove a message listener (as defined in MessageDatabase.h).

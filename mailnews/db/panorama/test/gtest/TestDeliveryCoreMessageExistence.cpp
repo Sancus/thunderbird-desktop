@@ -468,6 +468,11 @@ class DeliveryCoreMessageExistence : public testing::Test {
     }
   }
 
+  nsresult FolderCount(uint64_t folder, bool unread, uint64_t& count) {
+    return unread ? mCore->MessageDB().GetNumUnread(folder, &count)
+                  : mCore->MessageDB().GetNumMessages(folder, &count);
+  }
+
   nsresult FolderKeys(uint64_t folder, nsTArray<nsMsgKey>& keys) {
     return mCore->MessageDB().ListAllKeys(folder, keys);
   }
@@ -1192,6 +1197,65 @@ TEST_F(DeliveryCoreMessageExistence, FolderKeysStepErrorsPreserveOutput) {
   ASSERT_EQ(NS_OK, FolderKeys(mFolder, keys));
   EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
 }
+
+
+TEST_F(DeliveryCoreMessageExistence,
+       CountsUseStoredFolderMembershipAndReadFlag) {
+  nsMsgKey read, unread;
+  ASSERT_EQ(NS_OK, Add("count-read@invalid"_ns, read));
+  ASSERT_EQ(NS_OK, Add("count-unread@invalid"_ns, unread));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageFlag(
+                       unread, nsMsgMessageFlags::Read, false));
+  uint64_t total = 99, folder = 99, unreadCount = 99;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&total));
+  ASSERT_EQ(NS_OK, FolderCount(mFolder, false, folder));
+  ASSERT_EQ(NS_OK, FolderCount(mFolder, true, unreadCount));
+  EXPECT_EQ(2u, total);
+  EXPECT_EQ(2u, folder);
+  EXPECT_EQ(1u, unreadCount);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(read));
+  ASSERT_EQ(NS_OK, FolderCount(mFolder, false, folder));
+  EXPECT_EQ(1u, folder);
+  ASSERT_EQ(NS_OK, FolderCount(mFolder, true, unreadCount));
+  EXPECT_EQ(1u, unreadCount);
+  ASSERT_EQ(NS_OK, FolderCount(0, false, folder));
+  EXPECT_EQ(0u, folder);
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({unread}));
+}
+
+TEST_F(DeliveryCoreMessageExistence, CountStepErrorsPreserveOutputs) {
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("count-error@invalid"_ns, key));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageFlag(
+                       key, nsMsgMessageFlags::Read, false));
+  uint64_t before = 99;
+  ASSERT_EQ(NS_OK, FolderCount(mFolder, true, before));
+  ASSERT_EQ(1u, before);
+  mFault = new MessageExistenceReadFault();
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateFunction("count_read_fault"_ns, 1, mFault));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "CREATE TEMP VIEW messages AS SELECT * FROM main.messages "
+                "WHERE count_read_fault(id)"_ns));
+  uint64_t total = 77, folder = 88, unread = 99;
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->MessageDB().GetTotalCount(&total));
+  EXPECT_EQ(77u, total);
+  EXPECT_EQ(NS_ERROR_FAILURE, FolderCount(mFolder, false, folder));
+  EXPECT_EQ(88u, folder);
+  EXPECT_EQ(NS_ERROR_FAILURE, FolderCount(mFolder, true, unread));
+  EXPECT_EQ(99u, unread);
+  EXPECT_GE(mFault->mCalls, 3u);
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key}));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP VIEW temp.messages"_ns));
+  ASSERT_EQ(NS_OK, Connection()->RemoveFunction("count_read_fault"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&total));
+  EXPECT_EQ(1u, total);
+  ASSERT_EQ(NS_OK, FolderCount(mFolder, true, unread));
+  EXPECT_EQ(1u, unread);
+}
+
 
 }  // namespace
 }  // namespace mozilla::mailnews

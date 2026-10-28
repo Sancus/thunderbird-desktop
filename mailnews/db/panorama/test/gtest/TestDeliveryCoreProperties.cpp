@@ -191,6 +191,40 @@ class DeliveryCoreProperties : public testing::Test {
     return mCore->FolderDB().GetFolderProperty(mFolder, name, value);
   }
 
+  nsresult SetScope(uint64_t id, nsTArray<uint64_t> folders) {
+    return mCore->FolderDB().SetVirtualFolderFolders(id, folders);
+  }
+
+  void CheckScope(uint64_t id, const nsTArray<uint64_t>& expected) {
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    auto close = MakeScopeExit([&] {
+      if (stmt) {
+        EXPECT_EQ(NS_OK, stmt->Finalize());
+      }
+      EXPECT_EQ(NS_OK, reader->Close());
+    });
+    ASSERT_EQ(NS_OK,
+              reader->CreateStatement(
+                  "SELECT searchFolderId FROM virtualFolder_folders "
+                  "WHERE virtualFolderId = :id ORDER BY searchFolderId"_ns,
+                  getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, id));
+    nsTArray<uint64_t> actual;
+    while (true) {
+      bool more;
+      ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+      if (!more) {
+        break;
+      }
+      int64_t folder;
+      ASSERT_EQ(NS_OK, stmt->GetInt64(0, &folder));
+      actual.AppendElement(static_cast<uint64_t>(folder));
+    }
+    EXPECT_EQ(expected, actual);
+  }
+
   void CheckStored(const nsACString& table, uint64_t id, const nsACString& name,
                    const nsACString& expected,
                    const nsACString& expectedType = "text"_ns) {
@@ -252,6 +286,50 @@ class DeliveryCoreProperties : public testing::Test {
     }
   }
 
+  nsresult DropSearchSchema(mozIStorageConnection* connection) {
+    MOZ_TRY(connection->ExecuteSimpleSQL(
+        "DROP TRIGGER delete_offline_copies;"
+        "DROP TABLE offline_copy_destinations; DROP TABLE offline_attempts;"
+        "DROP TABLE offline_operations;"_ns));
+    MOZ_TRY(connection->ExecuteSimpleSQL(
+        "DROP TRIGGER delete_staged_header;"
+        "DROP TABLE staged_message_properties; DROP TABLE "
+        "staged_message_references;"
+        "DROP TABLE staged_message_reference_sets; DROP TABLE staged_messages;"_ns));
+    for (const char* name :
+         {"search_message_insert", "search_message_update",
+          "search_message_delete", "search_message_properties_INSERT",
+          "search_message_properties_UPDATE",
+          "search_message_properties_DELETE",
+          "search_message_references_INSERT",
+          "search_message_references_UPDATE",
+          "search_message_references_DELETE",
+          "search_message_reference_sets_INSERT",
+          "search_message_reference_sets_UPDATE",
+          "search_message_reference_sets_DELETE", "search_folder_policy",
+          "search_folder_properties_INSERT", "search_folder_properties_UPDATE",
+          "search_folder_properties_DELETE", "search_folder_delete"}) {
+      nsAutoCString sql("DROP TRIGGER IF EXISTS "_ns);
+      sql.Append(name);
+      MOZ_TRY(connection->ExecuteSimpleSQL(sql));
+    }
+    return connection->ExecuteSimpleSQL(
+        "DROP TABLE message_changes; DROP TABLE database_identity"_ns);
+  }
+
+  nsresult MakeVersionTwo() {
+    NS_ENSURE_TRUE(Stop(), NS_ERROR_FAILURE);
+    nsCOMPtr<mozIStorageConnection> old;
+    MOZ_TRY(Open(getter_AddRefs(old)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, old->Close()); });
+    MOZ_TRY(old->ExecuteSimpleSQL("BEGIN"_ns));
+    MOZ_TRY(DropSearchSchema(old));
+    return old->ExecuteSimpleSQL(
+        "DROP TRIGGER guard_message_key; DROP TRIGGER record_message_key;"
+        "DROP TRIGGER immutable_message_key;"
+        "DROP TABLE message_key_allocator; PRAGMA user_version = 2; COMMIT;"_ns);
+  }
+
   nsresult MakeVersionOne() {
     if (!Stop()) {
       return NS_ERROR_FAILURE;
@@ -259,8 +337,12 @@ class DeliveryCoreProperties : public testing::Test {
     nsCOMPtr<mozIStorageConnection> old;
     MOZ_TRY(Open(getter_AddRefs(old)));
     auto cleanup = MakeScopeExit([&] { EXPECT_EQ(NS_OK, old->Close()); });
+    MOZ_TRY(old->ExecuteSimpleSQL("BEGIN"_ns));
+    MOZ_TRY(DropSearchSchema(old));
     MOZ_TRY(old->ExecuteSimpleSQL(
-        "BEGIN;"
+        "DROP TRIGGER guard_message_key; DROP TRIGGER record_message_key;"
+        "DROP TRIGGER immutable_message_key;"
+        "DROP TABLE message_key_allocator;"
         "CREATE TABLE old_folder_properties(id INTEGER REFERENCES folders(id),"
         "name TEXT, value ANY, PRIMARY KEY(id, name));"
         "INSERT INTO old_folder_properties SELECT * FROM folder_properties;"
@@ -535,7 +617,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UpgradePreservesExistingValues) {
   EXPECT_EQ(before, after);
   int32_t version;
   ASSERT_EQ(NS_OK, Connection()->GetSchemaVersion(&version));
-  EXPECT_EQ(2, version);
+  EXPECT_EQ(8, version);
   ASSERT_NO_FATAL_FAILURE(CheckStored("message_properties"_ns, key,
                                       "native.unsigned"_ns, "4294967295"_ns,
                                       "integer"_ns));
@@ -1302,6 +1384,440 @@ TEST_F(DeliveryCoreProperties, ServerUidWritesDoNotCommitAnotherTransaction) {
   nsCString text;
   ASSERT_EQ(NS_OK, GetFolder("uncommitted"_ns, text));
   EXPECT_TRUE(text.IsEmpty());
+}
+
+
+TEST_F(DeliveryCoreProperties, AllocatorNeverReusesCommittedDeletedKeys) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey first, removed, next;
+  ASSERT_EQ(NS_OK, Add(first));
+  ASSERT_EQ(NS_OK, Add(removed));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(removed));
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, Add(next));
+  EXPECT_GT(next, removed);
+  EXPECT_NE(first, next);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(removed, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(first, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreProperties, AllocatorRollsBackWithFailedInsertion) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add(control));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "CREATE TEMP TRIGGER fail_allocated_add AFTER INSERT "
+                "ON messages BEGIN SELECT RAISE(ABORT, 'add fault'); END"_ns));
+  nsMsgKey failed = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, Add(failed));
+  EXPECT_EQ(nsMsgKey_None, failed);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_allocated_add"_ns));
+  nsMsgKey retry;
+  ASSERT_EQ(NS_OK, Add(retry));
+  EXPECT_EQ(control + 1, retry);
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(2u, count);
+}
+
+TEST_F(DeliveryCoreProperties, AllocatorUsesFullKeyRangeAndRejectsExhaustion) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "UPDATE message_key_allocator SET highWater = 4294967293"_ns));
+  nsMsgKey last;
+  ASSERT_EQ(NS_OK, Add(last));
+  EXPECT_EQ(0xfffffffeu, last);
+  nsMsgKey thread = 0;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageThreadId(last, thread));
+  EXPECT_EQ(last, thread);
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey output = 77;
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE, Add(output));
+  EXPECT_EQ(77u, output);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(last, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreProperties, AllocatorUpgradeSeedsHighestExistingKey) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey first, highest;
+  ASSERT_EQ(NS_OK, Add(first));
+  ASSERT_EQ(NS_OK, Add(highest));
+  ASSERT_EQ(NS_OK, MakeVersionTwo());
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey next;
+  ASSERT_EQ(NS_OK, Add(next));
+  EXPECT_GT(next, highest);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(first, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreProperties, AllocatorUpgradeFailurePreservesVersionAndRows) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK, MakeVersionTwo());
+  nsCOMPtr<mozIStorageConnection> old;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
+  ASSERT_EQ(NS_OK,
+            old->ExecuteSimpleSQL(
+                "CREATE TABLE message_key_allocator(unrelated TEXT)"_ns));
+  ASSERT_EQ(NS_OK, old->Close());
+  EXPECT_EQ(NS_ERROR_FAILURE, Start());
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
+  int32_t version;
+  ASSERT_EQ(NS_OK, old->GetSchemaVersion(&version));
+  EXPECT_EQ(2, version);
+  ASSERT_EQ(NS_OK,
+            old->ExecuteSimpleSQL("DROP TABLE message_key_allocator"_ns));
+  ASSERT_EQ(NS_OK, old->Close());
+  ASSERT_EQ(NS_OK, Start());
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+}
+
+
+TEST_F(DeliveryCoreProperties, AllocatorRejectsChangingPhysicalKey) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "UPDATE messages SET id = :other WHERE id = :id"_ns,
+                       getter_AddRefs(stmt)));
+  auto finalize = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, key));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("other"_ns, key + 1));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, stmt->Execute());
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key + 1, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreProperties, AllocatorKeepsUnsignedThreadReferences) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "UPDATE message_key_allocator SET highWater = 2147483647"_ns));
+  nsMsgKey parent, child;
+  ASSERT_EQ(NS_OK, Add(parent));
+  ASSERT_EQ(0x80000000u, parent);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(
+                mFolder, "unsigned-child@invalid"_ns, {"properties@invalid"_ns},
+                123456, "sender"_ns, "recipient"_ns, EmptyCString(),
+                EmptyCString(), "child"_ns, 0, EmptyCString(), 0, &child));
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  auto close = MakeScopeExit([&] {
+    if (stmt) {
+      EXPECT_EQ(NS_OK, stmt->Finalize());
+    }
+    EXPECT_EQ(NS_OK, reader->Close());
+  });
+  ASSERT_EQ(NS_OK, reader->CreateStatement(
+                       "SELECT COUNT(*) FROM messages c JOIN messages p "
+                       "ON p.id = c.threadId AND p.id = c.threadParent "
+                       "WHERE c.id = :id AND p.id = :parent"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, child));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("parent"_ns, parent));
+  bool more;
+  ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+  ASSERT_TRUE(more);
+  int64_t matches;
+  ASSERT_EQ(NS_OK, stmt->GetInt64(0, &matches));
+  EXPECT_EQ(1, matches);
+}
+
+TEST_F(DeliveryCoreProperties,
+       SourceIdSurvivesReopenAndDistinguishesReplacement) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString original;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(original));
+  ASSERT_FALSE(original.IsEmpty());
+  nsMsgKey oldKey;
+  ASSERT_EQ(NS_OK, Add(oldKey));
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  nsCString reopened;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(reopened));
+  EXPECT_EQ(original, reopened);
+  ASSERT_TRUE(Stop());
+
+  nsCOMPtr<nsIFile> retained;
+  ASSERT_EQ(NS_OK, mFile->Clone(getter_AddRefs(retained)));
+  ASSERT_EQ(NS_OK, retained->MoveTo(nullptr, u"panorama-original.sqlite"_ns));
+  mFolder = 0;
+  ASSERT_EQ(NS_OK, Start());
+  nsCString replacement;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(replacement));
+  EXPECT_NE(original, replacement);
+  nsMsgKey newKey;
+  ASSERT_EQ(NS_OK, Add(newKey));
+  EXPECT_EQ(oldKey, newKey);
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  nsCString replacementReopened;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(replacementReopened));
+  EXPECT_EQ(replacement, replacementReopened);
+}
+
+TEST_F(DeliveryCoreProperties, SourceIdReadFailurePreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString expected;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(expected));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "CREATE TEMP VIEW database_identity AS SELECT singleton, "
+                "sourceId FROM main.database_identity "
+                "WHERE abs(-9223372036854775808)"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.database_identity"_ns));
+  });
+  nsCString actual = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->GetSourceId(actual));
+  EXPECT_EQ("unchanged"_ns, actual);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP VIEW temp.database_identity"_ns));
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(actual));
+  EXPECT_EQ(expected, actual);
+}
+
+TEST_F(DeliveryCoreProperties, SourceIdRejectsPendingAndRetiredConnections) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString expected;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(expected));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  nsCString actual = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, mCore->GetSourceId(actual));
+  EXPECT_EQ("unchanged"_ns, actual);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  RefPtr<DatabaseCore> retired = mCore;
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->GetSourceId(actual));
+  EXPECT_EQ("unchanged"_ns, actual);
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(actual));
+  EXPECT_EQ(expected, actual);
+}
+
+TEST_F(DeliveryCoreProperties, VirtualScopeReplacementPersistsAndClears) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t first, second, control;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "First"_ns, &first));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolder, "Second"_ns, &second));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolder, "Control"_ns, &control));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {first}));
+  ASSERT_EQ(NS_OK, SetScope(control, {second}));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {second, first}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(mFolder, {first, second}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(control, {second}));
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_NO_FATAL_FAILURE(CheckScope(mFolder, {first, second}));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(mFolder, {}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(control, {second}));
+}
+
+TEST_F(DeliveryCoreProperties, VirtualScopeInsertFailureKeepsPreviousScope) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t first, second, rejected, control;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "First"_ns, &first));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolder, "Second"_ns, &second));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolder, "Rejected"_ns, &rejected));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolder, "Control"_ns, &control));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {first}));
+  ASSERT_EQ(NS_OK, SetScope(control, {second}));
+  nsAutoCString sql(
+      "CREATE TEMP TRIGGER fail_scope_insert BEFORE INSERT ON "
+      "virtualFolder_folders WHEN NEW.searchFolderId = "_ns);
+  sql.AppendInt(rejected);
+  sql.AppendLiteral(" BEGIN SELECT RAISE(ABORT, 'scope fault'); END");
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(sql));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_scope_insert"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, SetScope(mFolder, {second, rejected}));
+  bool active = true;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_NO_FATAL_FAILURE(CheckScope(mFolder, {first}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(control, {second}));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_scope_insert"_ns));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {second, rejected}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(mFolder, {second, rejected}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(control, {second}));
+}
+
+TEST_F(DeliveryCoreProperties, VirtualScopeRejectsUnrelatedTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t first, second;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "First"_ns, &first));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolder, "Second"_ns, &second));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {first}));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active;
+    if (NS_SUCCEEDED(Connection()->GetTransactionInProgress(&active)) &&
+        active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, SetScope(mFolder, {second}));
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_NO_FATAL_FAILURE(CheckScope(mFolder, {first}));
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {second}));
+  ASSERT_NO_FATAL_FAILURE(CheckScope(mFolder, {second}));
+}
+
+TEST_F(DeliveryCoreProperties, BodyStatePreservesTokenPresenceAndRevisions) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  MessageBodyState initial;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, initial));
+  EXPECT_EQ(key, initial.key);
+  EXPECT_EQ(mFolder, initial.folderId);
+  EXPECT_FALSE(initial.storeToken);
+  EXPECT_GT(initial.contentRevision, 0u);
+  EXPECT_GT(initial.locationRevision, 0u);
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, ""_ns));
+  MessageBodyState empty;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, empty));
+  ASSERT_TRUE(empty.storeToken);
+  EXPECT_TRUE(empty.storeToken->IsEmpty());
+  EXPECT_GT(empty.contentRevision, initial.contentRevision);
+  EXPECT_GT(empty.locationRevision, initial.locationRevision);
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "00042"_ns));
+  MessageBodyState stored;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, stored));
+  ASSERT_TRUE(stored.storeToken);
+  EXPECT_EQ("00042"_ns, *stored.storeToken);
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "unrelated"_ns, "1e3"_ns));
+  ASSERT_EQ(NS_OK, db.SetMessageFlags(key, 1));
+  MessageBodyState unrelated;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, unrelated));
+  EXPECT_EQ(stored.contentRevision, unrelated.contentRevision);
+  EXPECT_EQ(stored.locationRevision, unrelated.locationRevision);
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  MessageBodyState reopened;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(key, reopened));
+  EXPECT_EQ(key, reopened.key);
+  EXPECT_EQ(mFolder, reopened.folderId);
+  EXPECT_EQ(stored.storeToken, reopened.storeToken);
+  EXPECT_EQ(stored.contentRevision, reopened.contentRevision);
+  EXPECT_EQ(stored.locationRevision, reopened.locationRevision);
+}
+
+TEST_F(DeliveryCoreProperties, MissingBodyStateDoesNotUseCachedMembership) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey removed, control;
+  ASSERT_EQ(NS_OK, Add(removed));
+  ASSERT_EQ(NS_OK, Add(control));
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(removed, "old-body"_ns));
+  MessageBodyState output;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(removed, output));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetMessageBodyState(removed + 100, output));
+  EXPECT_EQ(removed, output.key);
+  EXPECT_EQ(Some(nsCString("old-body"_ns)), output.storeToken);
+  ASSERT_EQ(NS_OK, db.RemoveMessage(removed));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.GetMessageBodyState(removed, output));
+  EXPECT_EQ(removed, output.key);
+  EXPECT_EQ(Some(nsCString("old-body"_ns)), output.storeToken);
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(control, output));
+  EXPECT_EQ(control, output.key);
+}
+
+TEST_F(DeliveryCoreProperties, BodyStateSqlFailurePreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  MessageBodyState output;
+  output.key = 77;
+  output.folderId = 88;
+  output.storeToken = Some(nsCString("unchanged"_ns));
+  output.contentRevision = 99;
+  output.locationRevision = 100;
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW message_changes AS SELECT "
+                       "abs(-9223372036854775808) AS sequence, messageId, "
+                       "contentRevision, locationRevision, deleted "
+                       "FROM main.message_changes"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.message_changes"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            mCore->MessageDB().GetMessageBodyState(key, output));
+  EXPECT_EQ(77u, output.key);
+  EXPECT_EQ(88u, output.folderId);
+  EXPECT_EQ(Some(nsCString("unchanged"_ns)), output.storeToken);
+  EXPECT_EQ(99u, output.contentRevision);
+  EXPECT_EQ(100u, output.locationRevision);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP VIEW temp.message_changes"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(key, output));
+  EXPECT_EQ(key, output.key);
+}
+
+TEST_F(DeliveryCoreProperties, BodyStateRejectsUncommittedLocation) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "committed"_ns));
+  MessageBodyState before;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, before));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active;
+    if (NS_SUCCEEDED(Connection()->GetTransactionInProgress(&active)) &&
+        active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "pending"_ns));
+  MessageBodyState output;
+  output.key = 77;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.GetMessageBodyState(key, output));
+  EXPECT_EQ(77u, output.key);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, output));
+  EXPECT_EQ(before.storeToken, output.storeToken);
+  EXPECT_EQ(before.contentRevision, output.contentRevision);
+  EXPECT_EQ(before.locationRevision, output.locationRevision);
 }
 
 }  // namespace

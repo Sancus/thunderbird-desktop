@@ -9,13 +9,20 @@ interface nsIFolderDatabase;
 interface nsIMessageDatabase;
 interface nsIMsgFolder;
 
-[scriptable, builtinclass, uuid(f7aa8063-35b5-4692-829c-a49eff539064)]
+[scriptable, builtinclass, uuid(3b51b952-21c9-48dd-bb1f-365a531aa807)]
 interface nsIDatabaseCore : nsISupports {
   /**
    * Open a connection to the database and load in the folders from it.
    * Returns a promise that resolves (with no value) when loading is complete.
    */
   void startup();
+
+  /**
+   * Persistent identity of this database, available after startup. Reopening
+   * the same file retains it; a newly created database has a different ID.
+   * This read does not expose uncommitted schema or open a closed database.
+   */
+  readonly attribute AUTF8String sourceId;
 
   /**
    * Access to the folders and folder_properties tables on the database.

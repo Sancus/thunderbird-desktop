@@ -518,6 +518,17 @@ nsresult FolderDatabase::SetFolderUidValidity(uint64_t folderId,
         MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
         MOZ_TRY(stmt->Execute());
       }
+      {
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(DatabaseCore::GetStatement(
+            "RetireStagedFolderServerUids"_ns,
+            "DELETE FROM staged_message_properties WHERE name = 'uidOnServer' "
+            "AND id IN (SELECT id FROM staged_messages WHERE folderId = :folderId)"_ns,
+            getter_AddRefs(stmt)));
+        mozStorageStatementScoper scoper(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+        MOZ_TRY(stmt->Execute());
+      }
       MOZ_TRY(SetFolderProperty(folderId, "UIDValidity"_ns,
                                 static_cast<int64_t>(epoch)));
     }
@@ -637,31 +648,51 @@ nsresult FolderDatabase::GetVirtualFolderFolders(
 
 nsresult FolderDatabase::SetVirtualFolderFolders(
     uint64_t virtualFolderId, nsTArray<uint64_t>& searchFolderIds) {
-  nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "SetVirtualFolderFolders1"_ns,
-      "DELETE FROM virtualFolder_folders WHERE virtualFolderId = :virtualFolderId"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  stmt->BindInt64ByName("virtualFolderId"_ns, virtualFolderId);
-  rv = stmt->Execute();
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  rv = DatabaseCore::GetStatement(
-      "SetVirtualFolderFolders2"_ns,
-      "INSERT INTO virtualFolder_folders (virtualFolderId, searchFolderId) VALUES (:virtualFolderId, :searchFolderId)"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  for (auto searchFolderId : searchFolderIds) {
-    stmt->BindInt64ByName("virtualFolderId"_ns, virtualFolderId);
-    stmt->BindInt64ByName("searchFolderId"_ns, searchFolderId);
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  if (active) {
+    return NS_ERROR_IN_PROGRESS;
   }
-
-  return NS_OK;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "SetVirtualFolderFolders1"_ns,
+          "DELETE FROM virtualFolder_folders WHERE virtualFolderId = :virtualFolderId"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("virtualFolderId"_ns, virtualFolderId));
+      MOZ_TRY(stmt->Execute());
+    }
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "SetVirtualFolderFolders2"_ns,
+        "INSERT INTO virtualFolder_folders (virtualFolderId, searchFolderId) "
+        "VALUES (:virtualFolderId, :searchFolderId)"_ns,
+        getter_AddRefs(stmt)));
+    for (auto searchFolderId : searchFolderIds) {
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("virtualFolderId"_ns, virtualFolderId));
+      MOZ_TRY(stmt->BindInt64ByName("searchFolderId"_ns, searchFolderId));
+      MOZ_TRY(stmt->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanupRv) && active) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Virtual folder scope cleanup failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+  }
+  return rv;
 }
 
 Result<nsCString, nsresult> FolderDatabase::GetFolderName(uint64_t folderId) {

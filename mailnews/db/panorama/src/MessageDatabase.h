@@ -6,21 +6,83 @@
 #define COMM_MAILNEWS_DB_PANORAMA_SRC_MESSAGEDATABASE_H_
 
 #include "MailNewsTypes.h"
+#include "js/Context.h"
 #include "mozilla/HashTable.h"
+#include "mozilla/Maybe.h"
 #include "mozilla/RefPtr.h"
 #include "mozilla/Result.h"
 #include "nsIMessageDatabase.h"
-#include "nsTObserverArray.h"
 #include "nsString.h"
 #include "nsTArray.h"
+#include "nsTObserverArray.h"
 #include "prtime.h"
 
 struct RawHdr;
+class mozIStorageStatement;
 
 namespace mozilla::mailnews {
 
 class Folder;
 class Message;
+
+// Committed physical body location; Nothing distinguishes an absent token.
+struct MessageBodyState {
+  nsMsgKey key{nsMsgKey_None};
+  uint64_t folderId{0};
+  Maybe<nsCString> storeToken;
+  uint64_t contentRevision{0};
+  uint64_t locationRevision{0};
+};
+
+// Combined legacy operation payload; copy destinations retain their order.
+struct OfflineOperationData {
+  uint32_t operation{0};
+  uint32_t flagOperation{0};
+  uint32_t newFlags{0};
+  nsMsgKey sourceKey{nsMsgKey_None};
+  uint32_t sourceUid{0};
+  uint32_t messageSize{0};
+  bool playingBack{false};
+  nsCString sourceFolderURI;
+  nsCString destinationFolderURI;
+  nsCString keywordsToAdd;
+  nsCString keywordsToRemove;
+  nsTArray<nsCString> copyDestinations;
+};
+
+struct ServerMessageLocation {
+  uint64_t folderId{0};
+  nsMsgKey key{nsMsgKey_None};
+  uint32_t epoch{0};
+  uint32_t uid{0};
+};
+
+struct PendingDestination {
+  uint64_t folderId{0};
+  nsMsgKey key{nsMsgKey_None};
+  uint32_t epoch{0};
+};
+
+// Destination UIDVALIDITY and UID reported together by APPENDUID/COPYUID.
+struct ServerUidConfirmation {
+  uint32_t epoch{0};
+  uint32_t uid{0};
+};
+
+enum class OfflineAttemptState { Pending, Sent, Confirmed, Ambiguous };
+
+struct OfflineAttempt {
+  uint64_t id{0};
+  uint64_t operationId{0};
+  uint64_t revision{0};
+  uint64_t folderId{0};
+  uint32_t operation{0};
+  Maybe<uint32_t> folderEpoch;
+  OfflineAttemptState state{OfflineAttemptState::Pending};
+  Maybe<ServerMessageLocation> source;
+  Maybe<PendingDestination> destination;
+  Maybe<uint32_t> confirmedUid;
+};
 
 // Physical identity only; never a Message-ID or protocol UID.
 struct ConversationMember {
@@ -111,6 +173,49 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult AddMessage(uint64_t folderId, const ::RawHdr& header,
                       bool notifyLegacy, nsMsgKey* key,
                       Message** liveHeader = nullptr);
+
+  // Durable identity/header, excluded from published membership and events.
+  nsresult StageMessage(uint64_t folderId, const ::RawHdr& header,
+                        nsMsgKey* key, Message** liveHeader = nullptr);
+  // Caller finishes body storage before publishing the completed header.
+  nsresult PublishMessage(nsMsgKey key, bool notifyLegacy,
+                          Message** liveHeader = nullptr);
+  // Removes staged metadata only; never deletes stored body bytes.
+  nsresult AbortMessage(nsMsgKey key);
+  nsresult ListStagedMessages(uint64_t folderId, nsTArray<nsMsgKey>& keys);
+
+  // Published rows only. Missing: NOT_AVAILABLE; failure leaves output intact.
+  nsresult GetMessageBodyState(nsMsgKey key, MessageBodyState& output);
+
+  // Whole-payload writes are atomic. Sent/ambiguous attempts freeze payloads.
+  // Missing records return NOT_AVAILABLE; reads leave output unchanged on
+  // error. Reserves a disjoint key for folder-wide operations without a message
+  // row.
+  nsresult ReserveOfflineOperationKey(uint64_t folderId, nsMsgKey& key);
+  nsresult GetOfflineOperation(uint64_t folderId, nsMsgKey key,
+                               OfflineOperationData& output);
+  nsresult StoreOfflineOperation(uint64_t folderId, nsMsgKey key,
+                                 const OfflineOperationData& input);
+  nsresult SetOfflineOperationPlayingBack(uint64_t folderId, nsMsgKey key,
+                                          bool playingBack);
+  nsresult RemoveOfflineOperation(uint64_t folderId, nsMsgKey key);
+  nsresult ListOfflineOperations(uint64_t folderId, bool deletesOnly,
+                                 nsTArray<nsMsgKey>& keys);
+  // Dispatch snapshots the saved source tuple and explicit destination
+  // identity. No automatic replay of Sent/Ambiguous; confirmation alone binds a
+  // UID.
+  nsresult BeginOfflineAttempt(uint64_t folderId, nsMsgKey key,
+                               uint32_t operation,
+                               const Maybe<PendingDestination>& destination,
+                               uint64_t& attemptId);
+  nsresult GetOfflineAttempt(uint64_t attemptId, OfflineAttempt& output);
+  nsresult GetCurrentOfflineAttempt(uint64_t folderId, nsMsgKey key,
+                                    OfflineAttempt& output);
+  nsresult MarkOfflineAttemptAmbiguous(uint64_t attemptId);
+  // Caller has proved no server effect, not merely lost an acknowledgement.
+  nsresult ResolveOfflineAttemptNotApplied(uint64_t attemptId);
+  nsresult ConfirmOfflineAttempt(
+      uint64_t attemptId, const Maybe<ServerUidConfirmation>& destinationUid);
 
   // Reads stored facts directly, including uncommitted owned changes.
   // Missing row: NS_ERROR_UNEXPECTED. On failure output is unchanged.
@@ -212,6 +317,29 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult WriteMessageReferencesInTransaction(
       nsMsgKey key, const nsTArray<nsCString>& references);
 
+  enum class HeaderTable { Messages, Properties, References, ReferenceSets };
+  nsresult IsMessageStaged(nsMsgKey key, bool& staged);
+  nsresult GetHeaderStatement(nsMsgKey key, const nsACString& label,
+                              HeaderTable table, const nsACString& prefix,
+                              const nsACString& suffix,
+                              mozIStorageStatement** statement,
+                              bool* staged = nullptr);
+  nsresult InsertMessage(uint64_t folderId, const ::RawHdr& header, bool staged,
+                         bool notifyLegacy, nsMsgKey* key,
+                         Message** liveHeader);
+
+  nsresult ReadOfflineOperationIdentity(uint64_t folderId, nsMsgKey key,
+                                        int64_t& id, int64_t& revision,
+                                        Maybe<ServerMessageLocation>& source,
+                                        Maybe<uint32_t>* folderEpoch = nullptr);
+  nsresult RequireOfflineOperationMutable(int64_t operationId);
+  nsresult BindMessageToServerUidInTransaction(nsMsgKey key, uint64_t folderId,
+                                               uint32_t epoch, uint32_t uid,
+                                               bool allowStaged);
+
+  nsresult RequireCommittedSearchRead();
+  nsresult GetSearchWatermark(uint64_t& sequence);
+
   MessageDatabase() {};
   void Startup();
   void Shutdown();
@@ -239,6 +367,7 @@ class MessageDatabase : public nsIMessageDatabase {
                                   const nsACString& aMessageId,
                                   Message** aMessage);
   nsresult MarkAllRead(uint64_t aFolderId, nsTArray<nsMsgKey>& aMarkedKeys);
+  // Count read errors leave the output unchanged.
   nsresult GetNumMessages(uint64_t folderId, uint64_t* numMessages);
   nsresult GetNumUnread(uint64_t folderId, uint64_t* numUnread);
 

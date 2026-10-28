@@ -20,6 +20,8 @@ tags = ["panorama"]
 
 ["test_delete.js"]
 
+["test_deliveryCoreSearchState.js"]
+
 ["test_findFolders.js"]
 
 ["test_flags.js"]

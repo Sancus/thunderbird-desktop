@@ -30,6 +30,8 @@ tags = ["panorama"]
 
 ["test_deliveryCompatibilityUidValidity.js"]
 
+["test_deliveryCompatibilityViewType.js"]
+
 ["test_deliveryCoreAccountLifecycle.js"]
 
 ["test_deliveryCoreSearchState.js"]

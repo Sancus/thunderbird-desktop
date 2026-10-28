@@ -1341,12 +1341,19 @@ NS_IMETHODIMP FolderInfo::SetUserSortOrder(uint32_t userSortOrder) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP FolderInfo::GetViewType(nsMsgViewTypeValue* viewType) {
-  *viewType = nsMsgViewType::eShowAllThreads;
+  NS_ENSURE_ARG_POINTER(viewType);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  uint32_t value;
+  MOZ_TRY(
+      GetUint32Property("viewType", nsMsgViewType::eShowAllThreads, &value));
+  *viewType = static_cast<nsMsgViewTypeValue>(value);
   return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetViewType(nsMsgViewTypeValue aViewType) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return SetUint32Property("viewType", static_cast<uint32_t>(aViewType));
 }
+
 NS_IMETHODIMP FolderInfo::GetViewFlags(nsMsgViewFlagsTypeValue* viewFlags) {
   NS_ENSURE_ARG_POINTER(viewFlags);
   nsMsgViewFlagsTypeValue defaultViewFlags;

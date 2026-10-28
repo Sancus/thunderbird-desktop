@@ -1313,10 +1313,14 @@ NS_IMETHODIMP FolderInfo::SetImapUidValidity(ImapUid aImapUidValidity) {
   return FolderDB().SetFolderUidValidity(mFolderId, aImapUidValidity);
 }
 NS_IMETHODIMP FolderInfo::GetVersion(uint32_t* aVersion) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aVersion);
+  *aVersion = 0;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return GetUint32Property("version", 0, aVersion);
 }
 NS_IMETHODIMP FolderInfo::SetVersion(uint32_t aVersion) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return SetUint32Property("version", aVersion);
 }
 NS_IMETHODIMP FolderInfo::GetImapTotalPendingMessages(
     int32_t* aImapTotalPendingMessages) {

@@ -1841,9 +1841,13 @@ nsMsgDBFolder::MatchOrChangeFilterDestination(nsIMsgFolder* newFolder,
 
 NS_IMETHODIMP
 nsMsgDBFolder::GetDBTransferInfo(nsIPropertyBag2** aTransferInfo) {
+  NS_ENSURE_ARG_POINTER(aTransferInfo);
+  *aTransferInfo = nullptr;
   nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
   nsCOMPtr<nsIMsgDatabase> db;
-  GetDBFolderInfoAndDB(getter_AddRefs(dbFolderInfo), getter_AddRefs(db));
+  nsresult rv =
+      GetDBFolderInfoAndDB(getter_AddRefs(dbFolderInfo), getter_AddRefs(db));
+  NS_ENSURE_SUCCESS(rv, rv);
   NS_ENSURE_STATE(dbFolderInfo);
   return dbFolderInfo->GetTransferInfo(aTransferInfo);
 }
@@ -1851,18 +1855,21 @@ nsMsgDBFolder::GetDBTransferInfo(nsIPropertyBag2** aTransferInfo) {
 NS_IMETHODIMP
 nsMsgDBFolder::SetDBTransferInfo(nsIPropertyBag2* aTransferInfo) {
   NS_ENSURE_ARG(aTransferInfo);
+  nsresult rv = GetDatabase();
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+  NS_ENSURE_TRUE(db, NS_ERROR_FAILURE);
+  rv = db->SetLastUseTime(PR_Now());
+  NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
-  nsCOMPtr<nsIMsgDatabase> db;
-  GetMsgDatabase(getter_AddRefs(db));
-  if (db) {
-    db->GetDBFolderInfo(getter_AddRefs(dbFolderInfo));
-    if (dbFolderInfo) {
-      dbFolderInfo->InitFromTransferInfo(aTransferInfo);
-      dbFolderInfo->SetBooleanProperty("forceReparse", false);
-    }
-    db->SetSummaryValid(true);
-  }
-  return NS_OK;
+  rv = db->GetDBFolderInfo(getter_AddRefs(dbFolderInfo));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_STATE(dbFolderInfo);
+  rv = dbFolderInfo->InitFromTransferInfo(aTransferInfo);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = dbFolderInfo->SetBooleanProperty("forceReparse", false);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return db->SetSummaryValid(true);
 }
 
 NS_IMETHODIMP

@@ -766,3 +766,74 @@ add_task(async function test_onComposeStateChanged() {
   await extension.awaitFinish("finished");
   await extension.unload();
 });
+
+add_task(async function test_sendNow_without_fcc_succeeds() {
+  const root = gLocalAccount.incomingServer.rootFolder;
+  const storedMessages = () =>
+    root.subFolders.flatMap(folder =>
+      [...folder.messages].map(header => ({
+        folderURI: folder.URI,
+        key: header.messageKey,
+        messageId: header.messageId,
+      }))
+    );
+  const before = storedMessages();
+  const sentCount = gSentMessages.length;
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "background.js": async () => {
+        const tab = await browser.compose.beginNew({
+          to: ["nocopy@example.invalid"],
+          subject: "No-copy sendNow completion",
+          plainTextBody: "The SMTP message is sent without saving an FCC.",
+          overrideDefaultFccFolder: "",
+        });
+        const completed = window.waitForEvent("compose.onAfterSend");
+        const removed = window.waitForEvent("windows.onRemoved");
+        const result = await browser.compose.sendMessage(tab.id, {
+          mode: "sendNow",
+        });
+        const [sentTab, info] = await completed;
+        await removed;
+        browser.test.assertEq("sendNow", result.mode);
+        browser.test.assertTrue(!!result.headerMessageId);
+        browser.test.assertEq(0, result.messages.length);
+        browser.test.assertEq(tab.id, sentTab.id);
+        browser.test.assertEq("sendNow", info.mode);
+        browser.test.assertEq(undefined, info.error);
+        browser.test.assertEq(result.headerMessageId, info.headerMessageId);
+        browser.test.assertEq(0, info.messages.length);
+        const [delivered] = await window.sendMessage("getNoCopyDelivery");
+        browser.test.assertDeepEq([result.headerMessageId], delivered.sentIds);
+        browser.test.assertEq(
+          result.headerMessageId,
+          delivered.smtpMessage.match(/^message-id:\s*<([^>]+)>/im)?.[1],
+          "The successful result identifies the actual SMTP message"
+        );
+        browser.test.assertTrue(
+          delivered.smtpMessage.includes("No-copy sendNow completion")
+        );
+        browser.test.notifyPass("nocopy-sendNow");
+      },
+      "utils.js": await getUtilsJS(),
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["compose", "compose.send", "messagesRead", "accountsRead"],
+    },
+  });
+  extension.onMessage("getNoCopyDelivery", () =>
+    extension.sendMessage({
+      sentIds: gSentMessages.slice(sentCount),
+      smtpMessage: gServer._daemon.post,
+    })
+  );
+  await extension.startup();
+  await extension.awaitFinish("nocopy-sendNow");
+  await extension.unload();
+  Assert.deepEqual(
+    storedMessages(),
+    before,
+    "No-copy send preserves every physical stored message"
+  );
+});

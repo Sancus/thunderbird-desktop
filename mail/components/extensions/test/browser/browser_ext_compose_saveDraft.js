@@ -488,3 +488,208 @@ add_task(async function test_onAfterSave_MV3_event_pages() {
   await extension.unload();
   composeWindow.close();
 });
+
+/**
+ * Reject a failed or cancelled save, then save through the real store path.
+ *
+ * @param {"progress"|"abort"} failure - Existing completion callback to fail.
+ * @param {"draft"|"template"} [mode="draft"] - The saved message type.
+ * @returns {Promise<void>} Resolves after failure, retry and replacement checks.
+ */
+async function checkSaveFailure(failure, mode = "draft") {
+  const subject = `${mode} recovery after ${failure}`;
+  const folderName = mode == "template" ? "Templates" : "Drafts";
+  const identity = gPopAccount.defaultIdentity;
+  const oldTemplatesURI = identity.templatesFolderURI;
+  if (mode == "template") {
+    const folder = gLocalRootFolder.containsChildNamed(folderName)
+      ? gLocalRootFolder.getChildNamed(folderName)
+      : await createSubfolder(gLocalRootFolder, folderName);
+    identity.templatesFolderURI = folder.URI;
+    folder.setFlag(Ci.nsMsgFolderFlags.Templates);
+  }
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "background.js": async () => {
+        const [{ subject, mode, folderName }] =
+          await window.sendMessage("getConfig");
+        const [before] = await window.sendMessage("getStoredMessages");
+        const tab = await browser.compose.beginNew({
+          to: ["save-recovery@example.invalid"],
+          subject,
+        });
+        await window.sendMessage("failNextSave");
+        const failureEvent = window.waitForEvent("compose.onAfterSave");
+        await browser.test.assertRejects(
+          browser.compose.saveMessage(tab.id, { mode }),
+          /Message operation failed/,
+          "The failed save rejects instead of returning an empty success"
+        );
+        const [failedTab, failureInfo] = await failureEvent;
+        browser.test.assertEq(tab.id, failedTab.id);
+        browser.test.assertEq(mode, failureInfo.mode);
+        browser.test.assertEq("Message operation failed", failureInfo.error);
+        browser.test.assertEq(0, failureInfo.messages.length);
+        const [afterFailure] = await window.sendMessage("getStoredMessages");
+        browser.test.assertDeepEq(
+          before,
+          afterFailure,
+          "Failure before storage leaves every original physical draft intact"
+        );
+
+        const successEvent = window.waitForEvent("compose.onAfterSave");
+        const saved = await browser.compose.saveMessage(tab.id, { mode });
+        const [savedTab, successInfo] = await successEvent;
+        browser.test.assertEq(tab.id, savedTab.id);
+        browser.test.assertEq(mode, saved.mode);
+        browser.test.assertEq(1, saved.messages.length);
+        browser.test.assertEq(undefined, successInfo.error);
+        browser.test.assertDeepEq(saved.messages, successInfo.messages);
+        const [current] = await window.sendMessage("getStoredMessages");
+        browser.test.assertEq(before.length + 1, current.length);
+        const stored = current.filter(message => message.subject == subject);
+        browser.test.assertEq(1, stored.length);
+        browser.test.assertEq(
+          saved.messages[0].headerMessageId,
+          stored[0].messageId,
+          "The successful result identifies the actual stored message"
+        );
+        browser.test.assertEq(`/${folderName}`, saved.messages[0].folder.path);
+        browser.test.assertDeepEq(
+          before,
+          current.filter(message => message.subject != subject),
+          "The retry preserves the original physical drafts"
+        );
+        const fetched = await browser.messages.get(saved.messages[0].id);
+        browser.test.assertEq(subject, fetched.subject);
+        browser.test.assertEq(saved.messages[0].folder.id, fetched.folder.id);
+
+        const updatedSubject = subject + " updated";
+        await browser.compose.setComposeDetails(tab.id, {
+          subject: updatedSubject,
+        });
+        const replacementEvent = window.waitForEvent("compose.onAfterSave");
+        const replacement = await browser.compose.saveMessage(tab.id, { mode });
+        const [replacementTab, replacementInfo] = await replacementEvent;
+        browser.test.assertEq(tab.id, replacementTab.id);
+        browser.test.assertEq(mode, replacement.mode);
+        browser.test.assertEq(1, replacement.messages.length);
+        browser.test.assertDeepEq(
+          replacement.messages,
+          replacementInfo.messages
+        );
+        const [afterReplacement] =
+          await window.sendMessage("getStoredMessages");
+        browser.test.assertEq(before.length + 1, afterReplacement.length);
+        browser.test.assertFalse(
+          afterReplacement.some(message => message.key == stored[0].key),
+          "The replaced physical message has been removed"
+        );
+        browser.test.assertDeepEq(
+          before,
+          afterReplacement.filter(message => message.subject != updatedSubject),
+          "Replacement preserves all unrelated physical messages"
+        );
+        const [updated] = afterReplacement.filter(
+          message => message.subject == updatedSubject
+        );
+        browser.test.assertTrue(!!updated);
+        browser.test.assertEq(
+          replacement.messages[0].headerMessageId,
+          updated.messageId
+        );
+        browser.test.assertEq(
+          `/${folderName}`,
+          replacement.messages[0].folder.path
+        );
+        await browser.test.assertRejects(
+          browser.messages.get(saved.messages[0].id),
+          /Message not found:/,
+          "The replaced API identity no longer resolves"
+        );
+        const removed = window.waitForEvent("windows.onRemoved");
+        await browser.tabs.remove(tab.id);
+        await removed;
+        browser.test.notifyPass("save-recovery");
+      },
+      "utils.js": await getUtilsJS(),
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["compose", "compose.save", "messagesRead", "accountsRead"],
+    },
+  });
+  let composeWindow;
+  let originalSend;
+  let loaded = false;
+  const cleanup = async () => {
+    if (originalSend && !composeWindow.closed) {
+      composeWindow.CompleteGenericSendMessage = originalSend;
+    }
+    if (composeWindow && !composeWindow.closed) {
+      composeWindow.gMsgCompose.bodyModified = false;
+      composeWindow.gContentChanged = false;
+      composeWindow.close();
+    }
+    if (loaded) {
+      loaded = false;
+      await extension.unload();
+    }
+    identity.templatesFolderURI = oldTemplatesURI;
+  };
+  registerCleanupFunction(cleanup);
+  extension.onMessage("getConfig", () =>
+    extension.sendMessage({ subject, mode, folderName })
+  );
+  extension.onMessage("getStoredMessages", () => {
+    const folder = gLocalRootFolder.getChildNamed(folderName);
+    extension.sendMessage(
+      [...folder.messages]
+        .map(header => ({
+          key: header.messageKey,
+          messageId: header.messageId,
+          subject: header.subject,
+        }))
+        .sort((a, b) => a.key - b.key)
+    );
+  });
+  extension.onMessage("failNextSave", () => {
+    composeWindow = [...Services.wm.getEnumerator("msgcompose")].find(
+      win => win.gMsgCompose.compFields.subject == subject
+    );
+    Assert.ok(composeWindow, "The expected compose window exists");
+    originalSend = composeWindow.CompleteGenericSendMessage;
+    composeWindow.CompleteGenericSendMessage = async () => {
+      composeWindow.CompleteGenericSendMessage = originalSend;
+      if (failure == "progress") {
+        composeWindow.progressListener.onStateChange(
+          null,
+          null,
+          Ci.nsIWebProgressListener.STATE_STOP,
+          Cr.NS_ERROR_FAILURE
+        );
+      } else {
+        composeWindow.gMsgCompose.onSendNotPerformed(null, Cr.NS_ERROR_ABORT);
+      }
+      // Delivery can fail on an earlier turn than preparation completes.
+      await TestUtils.waitForTick();
+    };
+    extension.sendMessage();
+  });
+  await extension.startup();
+  loaded = true;
+  await extension.awaitFinish("save-recovery");
+  await cleanup();
+}
+
+add_task(async function test_save_copy_failure_then_retry() {
+  await checkSaveFailure("progress");
+});
+
+add_task(async function test_save_not_performed_then_retry() {
+  await checkSaveFailure("abort");
+});
+
+add_task(async function test_template_copy_failure_then_replace() {
+  await checkSaveFailure("progress", "template");
+});

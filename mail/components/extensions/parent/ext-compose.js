@@ -1102,8 +1102,12 @@ class MsgOperationObserver {
     // over to the send process.
     this.preperationTask = Promise.withResolvers();
 
-    // The deliveryTask fulfills when the message has been saved/send.
+    // Delivery can fail before preparation finishes collecting event details.
     this.deliveryTask = Promise.withResolvers();
+    this.deliveryResult = this.deliveryTask.promise.then(
+      () => null,
+      exception => exception
+    );
 
     Services.obs.addObserver(this, "mail:composeSendProgressStop");
     this.composeWindow.gMsgCompose.addMsgSendListener(this);
@@ -1138,9 +1142,20 @@ class MsgOperationObserver {
 
   // Observer for mail:composeSendProgressStop.
   observe(subject) {
-    const { composeWindow } = subject.wrappedJSObject;
+    const { composeWindow, status } = subject.wrappedJSObject;
     if (composeWindow == this.composeWindow) {
-      this.deliveryTask.resolve();
+      // A successful sendNow without FCC can force-close progress as a failure.
+      if (
+        ["draft", "template", "autoSave", "sendLater"].includes(this.mode) &&
+        status !== undefined &&
+        !Components.isSuccessCode(status)
+      ) {
+        this.deliveryTask.reject(
+          new ExtensionError("Message operation failed")
+        );
+      } else {
+        this.deliveryTask.resolve();
+      }
     }
   }
 
@@ -1164,7 +1179,11 @@ class MsgOperationObserver {
     const headerMessageId = msgID.replace(/^<|>$/g, "");
     this.savedMessages.push(JSON.stringify({ headerMessageId, folderURI }));
   }
-  onSendNotPerformed() {}
+  onSendNotPerformed(msgID, status) {
+    if (!Components.isSuccessCode(status)) {
+      this.deliveryTask.reject(new ExtensionError("Message operation failed"));
+    }
+  }
   onTransportSecurityError() {}
 
   // Implementation for nsIMsgFolderListener::msgsClassified
@@ -1192,7 +1211,10 @@ class MsgOperationObserver {
 
     try {
       await this.preperationTask.promise;
-      await this.deliveryTask.promise;
+      const deliveryException = await this.deliveryResult;
+      if (deliveryException) {
+        throw deliveryException;
+      }
       msgOperationInfo = {
         messages: this.savedMessages
           .map(m => this.classifiedMessages.get(m))

@@ -918,7 +918,7 @@ var gSendListener = {
  * @implements {nsIWebProgressListener}
  */
 var progressListener = {
-  onStateChange(aWebProgress, aRequest, aStateFlags) {
+  onStateChange(aWebProgress, aRequest, aStateFlags, aStatus) {
     const progressMeter = document.getElementById("compose-progressmeter");
     if (aStateFlags & Ci.nsIWebProgressListener.STATE_START) {
       progressMeter.hidden = false;
@@ -943,7 +943,7 @@ var progressListener = {
         0
       );
       Services.obs.notifyObservers(
-        { composeWindow: window },
+        { composeWindow: window, status: aStatus },
         "mail:composeSendProgressStop"
       );
     }

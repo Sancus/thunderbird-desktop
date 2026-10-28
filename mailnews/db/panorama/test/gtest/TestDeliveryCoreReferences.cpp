@@ -777,6 +777,36 @@ class PublicationObserver final : public MessageListener {
 };
 NS_IMPL_ISUPPORTS(PublicationObserver, nsISupports)
 
+class BodyObserver final : public MessageListener {
+ public:
+  NS_DECL_ISUPPORTS
+  explicit BodyObserver(
+      std::function<void(nsIMsgDBHdr*, Message*, const MessageBodyState&,
+                         const MessageBodyState&)>
+          changed)
+      : mChanged(std::move(changed)) {}
+  void OnMessageBodyChanged(nsIMsgDBHdr* old, Message* message,
+                            const MessageBodyState& before,
+                            const MessageBodyState& after) override {
+    mChanged(old, message, before, after);
+  }
+  void OnMessageAdded(Message*) override { ADD_FAILURE() << "Unexpected add"; }
+  void OnMessageRemoved(Message*, uint32_t) override {}
+  void OnMessageFlagsChanged(nsIMsgDBHdr*, Message*, uint32_t,
+                             uint32_t) override {
+    ADD_FAILURE() << "Body update split into a flag callback";
+  }
+  void OnMessageTagsChanged(nsIMsgDBHdr*, Message*, const nsACString&,
+                            const nsACString&) override {}
+
+ private:
+  ~BodyObserver() = default;
+  std::function<void(nsIMsgDBHdr*, Message*, const MessageBodyState&,
+                     const MessageBodyState&)>
+      mChanged;
+};
+NS_IMPL_ISUPPORTS(BodyObserver, nsISupports)
+
 nsresult PublicationCell(mozIStorageConnection* reader, nsMsgKey key,
                          const nsACString& sql, nsACString& value,
                          const nsACString* name = nullptr) {
@@ -2954,6 +2984,197 @@ TEST_F(DeliveryCoreReferences, ConfirmationRequiresServerReportedEpoch) {
       db.ConfirmOfflineAttempt(attemptId, Some(ServerUidConfirmation{98, 42})));
   ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(
                        attemptId, Some(ServerUidConfirmation{97, 42})));
+}
+
+TEST_F(DeliveryCoreReferences, BodySettlementPublishesCompleteStorageOnce) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK,
+            Add("body@invalid"_ns, {"raw@invalid"_ns, "raw@invalid"_ns}, key));
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "old-token"_ns));
+  ASSERT_EQ(NS_OK, db.SetMessageSize(key, 123));
+  ASSERT_EQ(NS_OK, db.SetMessageOfflineMessageSize(key, 111));
+  ASSERT_EQ(NS_OK, db.SetMessageLineCount(key, 12));
+  MessageBodyState expected;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  ASSERT_EQ(NS_OK, db.SetMessageFlags(key, 5));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "Case"_ns, "00042"_ns));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "case"_ns, "1e3"_ns));
+  uint32_t calls = 0;
+  RefPtr<BodyObserver> observer = new BodyObserver([&](nsIMsgDBHdr* old,
+                                                       Message* message,
+                                                       const MessageBodyState&
+                                                           before,
+                                                       const MessageBodyState&
+                                                           after) {
+    ++calls;
+    EXPECT_EQ(key, before.key);
+    EXPECT_EQ(key, after.key);
+    ASSERT_TRUE(before.storeToken);
+    EXPECT_EQ("old-token"_ns, *before.storeToken);
+    EXPECT_EQ(123u, before.messageSize);
+    EXPECT_EQ(5u, before.flags);
+    EXPECT_GT(after.contentRevision, expected.contentRevision);
+    EXPECT_GT(after.locationRevision, expected.locationRevision);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    nsCString token;
+    ASSERT_EQ(NS_OK, old->GetStoreToken(token));
+    EXPECT_EQ("old-token"_ns, token);
+    ASSERT_EQ(NS_OK, message->GetStoreToken(token));
+    EXPECT_EQ("finished-token"_ns, token);
+    uint32_t size, flags;
+    ASSERT_EQ(NS_OK, message->GetMessageSize(&size));
+    EXPECT_EQ(456u, size);
+    ASSERT_EQ(NS_OK, message->GetFlags(&flags));
+    EXPECT_EQ(after.flags, flags);
+    EXPECT_EQ(5u, flags & ~0x80u);
+    EXPECT_TRUE(flags & 0x80u);
+    nsTArray<nsCString> stored;
+    ASSERT_EQ(NS_OK, Stored(key, stored));
+    EXPECT_EQ((nsTArray<nsCString>{"raw@invalid"_ns, "raw@invalid"_ns}),
+              stored);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, key,
+            "SELECT value FROM message_properties WHERE id = :id AND name = 'storeToken'"_ns,
+            token));
+    EXPECT_EQ("finished-token"_ns, token);
+  });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  FinishedMessageBody finished{"finished-token"_ns, 456, 400, 30, true};
+  MessageBodyState output;
+  ASSERT_EQ(NS_OK, db.SettleMessageBody(expected, finished, output));
+  EXPECT_EQ(1u, calls);
+  EXPECT_EQ(key, output.key);
+  EXPECT_EQ(400u, output.offlineMessageSize);
+  EXPECT_EQ(30u, output.lineCount);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "Case"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "case"_ns, text));
+  EXPECT_EQ("1e3"_ns, text);
+  db.RemoveMessageListener(observer);
+  cleanup.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(key, expected));
+  EXPECT_EQ(output.storeToken, expected.storeToken);
+  EXPECT_EQ(output.contentRevision, expected.contentRevision);
+}
+
+TEST_F(DeliveryCoreReferences, BodySettlementRejectsStaleAndMissingGuards) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("body-stale@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, Add("body-control@invalid"_ns, {}, control));
+  MessageBodyState expected, output;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  FinishedMessageBody finished{"new"_ns, 20, 20, 2, true};
+  output.key = 77;
+  auto wrongDatabase = expected;
+  wrongDatabase.databaseSourceId = "replaced-database"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SettleMessageBody(wrongDatabase, finished, output));
+  EXPECT_EQ(77u, output.key);
+  auto wrongFolder = expected;
+  ++wrongFolder.folderId;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SettleMessageBody(wrongFolder, finished, output));
+  EXPECT_EQ(77u, output.key);
+  ASSERT_EQ(NS_OK, db.SetMessageSize(key, 21));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SettleMessageBody(expected, finished, output));
+  EXPECT_EQ(77u, output.key);
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(key));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SettleMessageBody(expected, finished, output));
+  EXPECT_EQ(77u, output.key);
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(control, output));
+  EXPECT_EQ(control, output.key);
+}
+
+TEST_F(DeliveryCoreReferences,
+       BodySettlementFailureRollsBackStorageAndJournal) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("body-failure@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "original"_ns));
+  MessageBodyState expected, output;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  uint32_t calls = 0;
+  RefPtr<BodyObserver> observer =
+      new BodyObserver([&](nsIMsgDBHdr*, Message*, const MessageBodyState&,
+                           const MessageBodyState&) { ++calls; });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_body_flags BEFORE UPDATE ON messages "
+          "BEGIN SELECT RAISE(ABORT, 'body flags'); END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_body_flags"_ns));
+  });
+  FinishedMessageBody finished{"finished"_ns, 20, 20, 2, true};
+  output.key = 77;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.SettleMessageBody(expected, finished, output));
+  EXPECT_EQ(77u, output.key);
+  EXPECT_EQ(0u, calls);
+  MessageBodyState retained;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, retained));
+  EXPECT_EQ(expected.storeToken, retained.storeToken);
+  EXPECT_EQ(expected.contentRevision, retained.contentRevision);
+  EXPECT_EQ(expected.locationRevision, retained.locationRevision);
+  EXPECT_EQ(expected.flags, retained.flags);
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER reject_body_flags"_ns));
+  ASSERT_EQ(NS_OK, db.SettleMessageBody(expected, finished, output));
+  EXPECT_EQ(1u, calls);
+  ASSERT_TRUE(output.storeToken);
+  EXPECT_EQ("finished"_ns, *output.storeToken);
+}
+
+TEST_F(DeliveryCoreReferences,
+       BodySettlementKeepsForeignTransactionAndFlagObservers) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("body-observers@invalid"_ns, {}, key));
+  MessageBodyState expected, output;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  FinishedMessageBody finished{"body"_ns, 10, 10, 1, false};
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.SettleMessageBody(expected, finished, output));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([](Message*, bool) {
+        ADD_FAILURE() << "Body settlement published a row";
+      });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, db.SettleMessageBody(expected, finished, output));
+  EXPECT_EQ(0u, observer->mChanges);
+  expected = output;
+  finished.offline = true;
+  ASSERT_EQ(NS_OK, db.SettleMessageBody(expected, finished, output));
+  EXPECT_EQ(1u, observer->mChanges);
 }
 
 }  // namespace

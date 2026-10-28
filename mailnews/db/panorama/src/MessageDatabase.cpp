@@ -186,14 +186,28 @@ NS_IMETHODIMP MessageDatabase::GetSearchState(
 nsresult MessageDatabase::GetMessageBodyState(nsMsgKey key,
                                               MessageBodyState& output) {
   MOZ_TRY(RequireCommittedSearchRead());
+  return ReadMessageBodyState(key, output);
+}
+
+nsresult MessageDatabase::ReadMessageBodyState(nsMsgKey key,
+                                               MessageBodyState& output) {
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
       "MessageBodyState"_ns,
-      "SELECT m.folderId, p.id, p.value, c.contentRevision, c.locationRevision "
+      "SELECT m.folderId, p.id, p.value, c.contentRevision, "
+      "c.locationRevision, "
+      "m.flags, "
+      "(SELECT value FROM message_properties WHERE id = m.id AND name = "
+      "'messageSize'), "
+      "(SELECT value FROM message_properties WHERE id = m.id AND name = "
+      "'offlineMessageSize'), "
+      "(SELECT value FROM message_properties WHERE id = m.id AND name = "
+      "'lineCount'), d.sourceId "
       "FROM messages m LEFT JOIN message_properties p "
       "ON p.id = m.id AND p.name = 'storeToken' JOIN message_changes c "
       "ON c.sequence = (SELECT MAX(sequence) FROM message_changes "
-      "WHERE messageId = m.id) WHERE m.id = :id AND c.deleted = 0"_ns,
+      "WHERE messageId = m.id) JOIN database_identity d ON d.singleton = 1 "
+      "WHERE m.id = :id AND c.deleted = 0"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
@@ -212,10 +226,21 @@ nsresult MessageDatabase::GetMessageBodyState(nsMsgKey key,
   NS_ENSURE_TRUE(folder > 0 && content > 0 && location > 0,
                  NS_ERROR_FILE_CORRUPTED);
   MessageBodyState state;
+  MOZ_TRY(stmt->GetUTF8String(9, state.databaseSourceId));
+  NS_ENSURE_TRUE(!state.databaseSourceId.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
   state.key = key;
   state.folderId = static_cast<uint64_t>(folder);
   state.contentRevision = static_cast<uint64_t>(content);
   state.locationRevision = static_cast<uint64_t>(location);
+  int64_t flags, size, offlineSize, lines;
+  MOZ_TRY(stmt->GetInt64(5, &flags));
+  MOZ_TRY(stmt->GetInt64(6, &size));
+  MOZ_TRY(stmt->GetInt64(7, &offlineSize));
+  MOZ_TRY(stmt->GetInt64(8, &lines));
+  state.flags = static_cast<uint32_t>(flags);
+  state.messageSize = static_cast<uint32_t>(size);
+  state.offlineMessageSize = static_cast<uint32_t>(offlineSize);
+  state.lineCount = static_cast<uint32_t>(lines);
   bool tokenAbsent;
   MOZ_TRY(stmt->GetIsNull(1, &tokenAbsent));
   if (!tokenAbsent) {
@@ -226,6 +251,123 @@ nsresult MessageDatabase::GetMessageBodyState(nsMsgKey key,
   MOZ_TRY(stmt->ExecuteStep(&more));
   NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
   output = std::move(state);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::SettleMessageBody(const MessageBodyState& expected,
+                                            const FinishedMessageBody& finished,
+                                            MessageBodyState& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  RefPtr<MessageDatabase> self(this);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MessageBodyState before, after, callerResult;
+  CachedMsg cached;
+  RefPtr<DetachedMsgHdr> oldMessage;
+  RefPtr<Message> message;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(ReadMessageBodyState(expected.key, before));
+    NS_ENSURE_TRUE(
+        before.databaseSourceId == expected.databaseSourceId &&
+            before.folderId == expected.folderId &&
+            before.storeToken == expected.storeToken &&
+            before.contentRevision == expected.contentRevision &&
+            before.locationRevision == expected.locationRevision &&
+            before.messageSize == expected.messageSize &&
+            before.offlineMessageSize == expected.offlineMessageSize &&
+            before.lineCount == expected.lineCount &&
+            !((before.flags ^ expected.flags) & nsMsgMessageFlags::Offline),
+        NS_ERROR_NOT_AVAILABLE);
+    {
+      nsCOMPtr<mozIStorageStatement> folder;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "BodySettlementFolder"_ns, "SELECT 1 FROM folders WHERE id = :id"_ns,
+          getter_AddRefs(folder)));
+      mozStorageStatementScoper scoper(folder);
+      MOZ_TRY(folder->BindInt64ByName("id"_ns, expected.folderId));
+      bool exists;
+      MOZ_TRY(folder->ExecuteStep(&exists));
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+    }
+    MOZ_TRY(FetchMsg(expected.key, cached));
+    oldMessage = new DetachedMsgHdr(before.folderId);
+    MOZ_TRY(oldMessage->SetMessageId(cached.messageId));
+    MOZ_TRY(oldMessage->SetAuthor(cached.sender));
+    MOZ_TRY(oldMessage->SetRecipients(cached.recipients));
+    MOZ_TRY(oldMessage->SetSubject(cached.subject));
+    MOZ_TRY(oldMessage->SetDate(cached.date));
+    MOZ_TRY(oldMessage->SetThreadId(cached.threadId));
+    MOZ_TRY(oldMessage->SetFlags(before.flags));
+    MOZ_TRY(oldMessage->SetStringProperty("keywords", cached.tags));
+    if (before.storeToken) {
+      MOZ_TRY(oldMessage->SetStoreToken(*before.storeToken));
+    }
+    MOZ_TRY(oldMessage->SetMessageSize(before.messageSize));
+    MOZ_TRY(oldMessage->SetOfflineMessageSize(before.offlineMessageSize));
+    MOZ_TRY(oldMessage->SetLineCount(before.lineCount));
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "SettleMessageBodyProperties"_ns,
+          "INSERT INTO message_properties(id, name, value) VALUES "
+          "(:id, 'storeToken', :token), (:id, 'messageSize', :size), "
+          "(:id, 'offlineMessageSize', :offlineSize), (:id, 'lineCount', "
+          ":lines) "
+          "ON CONFLICT(id, name) DO UPDATE SET value = excluded.value"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, expected.key));
+      MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, finished.storeToken));
+      MOZ_TRY(stmt->BindInt64ByName("size"_ns, finished.messageSize));
+      MOZ_TRY(
+          stmt->BindInt64ByName("offlineSize"_ns, finished.offlineMessageSize));
+      MOZ_TRY(stmt->BindInt64ByName("lines"_ns, finished.lineCount));
+      MOZ_TRY(stmt->Execute());
+    }
+    cached.flags = (before.flags & ~nsMsgMessageFlags::Offline) |
+                   (finished.offline ? nsMsgMessageFlags::Offline : 0);
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "SettleMessageBodyFlags"_ns,
+          "UPDATE messages SET flags = :flags WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, expected.key));
+      MOZ_TRY(stmt->BindInt64ByName("flags"_ns, cached.flags));
+      MOZ_TRY(stmt->Execute());
+    }
+    MOZ_TRY(ReadMessageBodyState(expected.key, after));
+    callerResult = after;
+    if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    message = new Message(expected.key);
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    bool active;
+    nsresult cleanup = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanup) && active) {
+      cleanup = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanup)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Body settlement rollback failed: 0x%08x",
+               static_cast<uint32_t>(cleanup)));
+    }
+    return rv;
+  }
+  auto entry = mMsgCache.lookup(expected.key);
+  if (entry) {
+    entry->value() = std::move(cached);
+  } else {
+    mMsgCache.putNewInfallible(expected.key, std::move(cached));
+  }
+  output = std::move(callerResult);
+  for (MessageListener* listener : mMessageListeners.EndLimitedRange()) {
+    listener->OnMessageBodyChanged(oldMessage, message, before, after);
+  }
   return NS_OK;
 }
 

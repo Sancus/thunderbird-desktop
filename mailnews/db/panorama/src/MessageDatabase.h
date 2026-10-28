@@ -27,11 +27,24 @@ class Message;
 
 // Committed physical body location; Nothing distinguishes an absent token.
 struct MessageBodyState {
+  nsCString databaseSourceId;
   nsMsgKey key{nsMsgKey_None};
   uint64_t folderId{0};
   Maybe<nsCString> storeToken;
   uint64_t contentRevision{0};
   uint64_t locationRevision{0};
+  uint32_t messageSize{0};
+  uint32_t offlineMessageSize{0};
+  uint32_t lineCount{0};
+  uint32_t flags{0};
+};
+
+struct FinishedMessageBody {
+  nsCString storeToken;
+  uint32_t messageSize{0};
+  uint32_t offlineMessageSize{0};
+  uint32_t lineCount{0};
+  bool offline{false};
 };
 
 // Combined legacy operation payload; copy destinations retain their order.
@@ -144,6 +157,14 @@ class MessageListener : public nsISupports {
   virtual void OnMessageTagsChanged(nsIMsgDBHdr* oldMessage, Message* message,
                                     const nsACString& oldTags,
                                     const nsACString& newTags) = 0;
+  // One complete storage update; default preserves existing flag observers.
+  virtual void OnMessageBodyChanged(nsIMsgDBHdr* oldMessage, Message* message,
+                                    const MessageBodyState& before,
+                                    const MessageBodyState& after) {
+    if (before.flags != after.flags) {
+      OnMessageFlagsChanged(oldMessage, message, before.flags, after.flags);
+    }
+  }
   // Preparation owns history and live wrappers, without notifying observers.
   // On failure prepared is unchanged. Production dispatch is not wired yet.
   virtual nsresult PrepareThreadBatch(const MessageThreadBatch& batch,
@@ -186,6 +207,11 @@ class MessageDatabase : public nsIMessageDatabase {
 
   // Published rows only. Missing: NOT_AVAILABLE; failure leaves output intact.
   nsresult GetMessageBodyState(nsMsgKey key, MessageBodyState& output);
+  // Provider has finished storage. Stale guard: NOT_AVAILABLE; no byte
+  // deletion.
+  nsresult SettleMessageBody(const MessageBodyState& expected,
+                             const FinishedMessageBody& finished,
+                             MessageBodyState& output);
 
   // Whole-payload writes are atomic. Sent/ambiguous attempts freeze payloads.
   // Missing records return NOT_AVAILABLE; reads leave output unchanged on
@@ -337,6 +363,7 @@ class MessageDatabase : public nsIMessageDatabase {
                                                uint32_t epoch, uint32_t uid,
                                                bool allowStaged);
 
+  nsresult ReadMessageBodyState(nsMsgKey key, MessageBodyState& output);
   nsresult RequireCommittedSearchRead();
   nsresult GetSearchWatermark(uint64_t& sequence);
 

@@ -8,6 +8,7 @@
 #include "mozilla/MemoryReporting.h"
 #include "nsIFile.h"
 #include "nsIMsgDatabase.h"
+#include "nsMsgDatabaseSettings.h"
 #include "nsMsgHdr.h"
 #include "nsIDBChangeAnnouncer.h"
 #include "nsMsgMessageFlags.h"
@@ -415,35 +416,6 @@ class nsMsgDatabase : public nsIMsgOfflineOpsDatabase {
  private:
   uint32_t m_cacheSize;
   RefPtr<mozilla::mailnews::MsgDBReporter> mMemReporter;
-};
-
-class nsMsgRetentionSettings : public nsIMsgRetentionSettings {
- public:
-  nsMsgRetentionSettings();
-
-  NS_DECL_ISUPPORTS
-  NS_DECL_NSIMSGRETENTIONSETTINGS
- protected:
-  virtual ~nsMsgRetentionSettings();
-  nsMsgRetainByPreference m_retainByPreference;
-  uint32_t m_daysToKeepHdrs;
-  uint32_t m_numHeadersToKeep;
-  bool m_useServerDefaults;
-  bool m_applyToFlaggedMessages;
-};
-
-class nsMsgDownloadSettings : public nsIMsgDownloadSettings {
- public:
-  nsMsgDownloadSettings();
-
-  NS_DECL_ISUPPORTS
-  NS_DECL_NSIMSGDOWNLOADSETTINGS
- protected:
-  virtual ~nsMsgDownloadSettings();
-  bool m_useServerDefaults;
-  bool m_downloadUnreadOnly;
-  bool m_downloadByDate;
-  int32_t m_ageLimitOfMsgsToDownload;
 };
 
 #endif  // COMM_MAILNEWS_DB_MSGDB_SRC_NSMSGDATABASE_H_

@@ -237,6 +237,33 @@ add_task(async function testFolderProperties() {
   const folderDatabase = database.openFolderDB(folderB, false);
   const folderInfo = folderDatabase.dBFolderInfo;
 
+  function readProperties(operator) {
+    const stmt = database.connectionForTests.createStatement(
+      `SELECT id, name, value FROM folder_properties
+       WHERE id ${operator} :id ORDER BY id, name`
+    );
+    stmt.params.id = folderB.id;
+    const properties = [];
+    try {
+      while (stmt.executeStep()) {
+        properties.push([stmt.row.id, stmt.row.name, stmt.row.value]);
+      }
+    } finally {
+      stmt.finalize();
+    }
+    return properties;
+  }
+
+  const unrelatedProperties = readProperties("!=");
+  for (const mailbox of ["Trash", "Unsent Messages"]) {
+    Assert.ok(
+      unrelatedProperties.some(
+        ([, name, value]) => name == "mailboxName" && value == mailbox
+      ),
+      `the account's ${mailbox} metadata is present`
+    );
+  }
+
   Assert.equal(folderInfo.getProperty("wibble"), "");
   folderInfo.setProperty("wibble", "wobble");
   Assert.equal(folderInfo.getProperty("wibble"), "wobble");
@@ -265,26 +292,20 @@ add_task(async function testFolderProperties() {
   folderInfo.setBooleanProperty("no!", true);
   Assert.equal(folderInfo.getBooleanProperty("no!", false), true);
 
-  // Check the database has a record of the properties.
-  // TODO: Should we remove properties set to an empty string or 0?
-
-  const stmt = database.connectionForTests.createStatement(
-    "SELECT id, name, value FROM folder_properties ORDER BY id, name"
-  );
-  const properties = [];
-  while (stmt.executeStep()) {
-    properties.push([stmt.row.id, stmt.row.name, stmt.row.value]);
-  }
-  stmt.finalize();
-
-  Assert.deepEqual(properties, [
-    [3, "answer", 42],
-    [3, "days", 365],
-    [3, "hack", ""],
-    [3, "no!", true],
-    [3, "wibble", ""],
-    [3, "yes?", false],
+  // Empty text and numeric zero remain present in the physical folder.
+  Assert.deepEqual(readProperties("="), [
+    [folderB.id, "answer", 42],
+    [folderB.id, "days", 365],
+    [folderB.id, "hack", ""],
+    [folderB.id, "no!", 1],
+    [folderB.id, "wibble", ""],
+    [folderB.id, "yes?", 0],
   ]);
+  Assert.deepEqual(
+    readProperties("!="),
+    unrelatedProperties,
+    "properties on the account's other folders are unchanged"
+  );
 });
 
 add_task(async function testHeaderMethods() {

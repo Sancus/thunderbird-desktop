@@ -4,6 +4,8 @@
 
 #include "FolderDatabase.h"
 
+#include <utility>
+
 #include <cstdint>
 
 #include "DatabaseCore.h"
@@ -548,6 +550,53 @@ nsresult FolderDatabase::SetFolderUidValidity(uint64_t folderId,
   return rv;
 }
 
+nsresult FolderDatabase::GetFolderProperties(
+    uint64_t id, nsTArray<FolderImportProperty>& output) {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mFolderDatabase.get() == this &&
+                     id && id <= INT64_MAX,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "GetPresentFolderProperties"_ns,
+      "SELECT p.id, p.name, p.value FROM folders f LEFT JOIN folder_properties "
+      "p "
+      "ON p.id = f.id WHERE f.id = :id ORDER BY p.name COLLATE BINARY"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<FolderImportProperty> properties;
+  do {
+    bool absent;
+    MOZ_TRY(stmt->GetIsNull(0, &absent));
+    if (!absent) {
+      int32_t type;
+      MOZ_TRY(stmt->GetTypeOfIndex(1, &type));
+      NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                     NS_ERROR_FILE_CORRUPTED);
+      FolderImportProperty property;
+      MOZ_TRY(stmt->GetUTF8String(1, property.name));
+      MOZ_TRY(stmt->GetTypeOfIndex(2, &type));
+      if (type == mozIStorageStatement::VALUE_TYPE_INTEGER) {
+        int64_t value;
+        MOZ_TRY(stmt->GetInt64(2, &value));
+        property.integer = Some(value);
+      } else {
+        NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        MOZ_TRY(stmt->GetUTF8String(2, property.text));
+      }
+      properties.AppendElement(std::move(property));
+    }
+    MOZ_TRY(stmt->ExecuteStep(&more));
+  } while (more);
+  output = std::move(properties);
+  return NS_OK;
+}
+
 nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
                                            nsACString& value) {
   nsCOMPtr<mozIStorageStatement> stmt;
@@ -634,15 +683,20 @@ nsresult FolderDatabase::GetVirtualFolderFolders(
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("virtualFolderId"_ns, virtualFolderId);
+  MOZ_TRY(stmt->BindInt64ByName("virtualFolderId"_ns, virtualFolderId));
 
-  searchFolderIds.Clear();
-  bool hasResult;
-  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    uint64_t searchFolderId = (uint64_t)stmt->AsInt64(0);
-    searchFolderIds.AppendElement(searchFolderId);
+  nsTArray<uint64_t> folders;
+  while (true) {
+    bool hasResult;
+    MOZ_TRY(stmt->ExecuteStep(&hasResult));
+    if (!hasResult) {
+      break;
+    }
+    int64_t folder;
+    MOZ_TRY(stmt->GetInt64(0, &folder));
+    folders.AppendElement(static_cast<uint64_t>(folder));
   }
-
+  searchFolderIds = std::move(folders);
   return NS_OK;
 }
 

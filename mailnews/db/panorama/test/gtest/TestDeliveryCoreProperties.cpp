@@ -12,6 +12,7 @@
 #include "mozilla/SpinEventLoopUntil.h"
 #include "mozilla/Try.h"
 #include "mozIStorageConnection.h"
+#include "mozIStorageProgressHandler.h"
 #include "mozIStorageService.h"
 #include "mozIStorageStatement.h"
 #include "nsAppDirectoryServiceDefs.h"
@@ -21,6 +22,7 @@
 #include "nsIFile.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgHdr.h"
+#include "nsMsgFolderFlags.h"
 #include "nsIProperties.h"
 #include "nsServiceManagerUtils.h"
 #include "nsString.h"
@@ -191,8 +193,43 @@ class DeliveryCoreProperties : public testing::Test {
     return mCore->FolderDB().GetFolderProperty(mFolder, name, value);
   }
 
+  nsresult FolderProperties(uint64_t folder,
+                            nsTArray<FolderImportProperty>& output) {
+    return mCore->FolderDB().GetFolderProperties(folder, output);
+  }
+
+  nsresult SetFolderAt(uint64_t folder, const nsACString& name,
+                       const nsACString& value) {
+    return mCore->FolderDB().SetFolderProperty(folder, name, value);
+  }
+
+  nsresult SetFolderInteger(const nsACString& name, int64_t value) {
+    return mCore->FolderDB().SetFolderProperty(mFolder, name, value);
+  }
+
+  static void ExpectProperties(const nsTArray<FolderImportProperty>& expected,
+                               const nsTArray<FolderImportProperty>& actual) {
+    ASSERT_EQ(expected.Length(), actual.Length());
+    for (const auto& wanted : expected) {
+      const FolderImportProperty* found = nullptr;
+      for (const auto& property : actual) {
+        if (property.name == wanted.name) {
+          EXPECT_FALSE(found);
+          found = &property;
+        }
+      }
+      ASSERT_TRUE(found);
+      EXPECT_EQ(wanted.integer, found->integer);
+      EXPECT_EQ(wanted.text, found->text);
+    }
+  }
+
   nsresult SetScope(uint64_t id, nsTArray<uint64_t> folders) {
     return mCore->FolderDB().SetVirtualFolderFolders(id, folders);
+  }
+
+  nsresult GetScope(uint64_t id, nsTArray<uint64_t>& output) {
+    return mCore->FolderDB().GetVirtualFolderFolders(id, output);
   }
 
   void CheckScope(uint64_t id, const nsTArray<uint64_t>& expected) {
@@ -1838,4 +1875,206 @@ TEST_F(DeliveryCoreProperties, BodyStateRejectsUncommittedLocation) {
 }
 
 }  // namespace
+namespace {
+
+class FolderPropertyReadAbort final : public mozIStorageProgressHandler {
+ public:
+  NS_DECL_ISUPPORTS
+  uint32_t mCalls = 0;
+  NS_IMETHOD OnProgress(mozIStorageConnection*, bool* interrupt) override {
+    ++mCalls;
+    *interrupt = mCalls == 1;
+    return NS_OK;
+  }
+
+ private:
+  ~FolderPropertyReadAbort() = default;
+};
+NS_IMPL_ISUPPORTS(FolderPropertyReadAbort, mozIStorageProgressHandler)
+
+}  // namespace
+
+TEST_F(DeliveryCoreProperties, PresentFolderPropertiesKeepExactTypesAndNames) {
+  ASSERT_EQ(NS_OK, Start());
+  const nsTArray<FolderImportProperty> expected{
+      {""_ns, "empty name"_ns, Nothing()},
+      {"Case"_ns, "upper"_ns, Nothing()},
+      {"case"_ns, "lower"_ns, Nothing()},
+      {"Caf\xC3\xA9"_ns, "composed"_ns, Nothing()},
+      {"Cafe\xCC\x81"_ns, "decomposed"_ns, Nothing()},
+      {"empty"_ns, ""_ns, Nothing()},
+      {"zeros"_ns, "00042"_ns, Nothing()},
+      {"exponent"_ns, "1e3"_ns, Nothing()},
+      {"min"_ns, ""_ns, Some(INT64_MIN)},
+      {"max"_ns, ""_ns, Some(INT64_MAX)},
+      {"id"_ns, "metadata id"_ns, Nothing()},
+      {"parent"_ns, "metadata parent"_ns, Nothing()},
+      {"path"_ns, "metadata path"_ns, Nothing()}};
+  for (const auto& property : expected) {
+    ASSERT_EQ(NS_OK, property.integer
+                         ? SetFolderInteger(property.name, *property.integer)
+                         : SetFolder(property.name, property.text));
+  }
+  auto parent = mCore->FolderDB().GetFolderParent(mFolder);
+  ASSERT_TRUE(parent.isOk());
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(parent.unwrap(), "other"_ns,
+                                                  &other));
+  ASSERT_EQ(NS_OK, SetFolderAt(other, "foreign"_ns, "excluded"_ns));
+  nsTArray<FolderImportProperty> output;
+  ASSERT_EQ(NS_OK, FolderProperties(mFolder, output));
+  ExpectProperties(expected, output);
+  auto name = mCore->FolderDB().GetFolderName(mFolder);
+  ASSERT_TRUE(name.isOk());
+  EXPECT_EQ("Inbox"_ns, name.unwrap());
+  ASSERT_TRUE(Stop());
+  // The returned strings and integers are owned, including across core close.
+  ExpectProperties(expected, output);
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<FolderImportProperty> reopened;
+  ASSERT_EQ(NS_OK, FolderProperties(mFolder, reopened));
+  ExpectProperties(expected, reopened);
+}
+
+TEST_F(DeliveryCoreProperties,
+       PresentFolderPropertiesDistinguishEmptyAndMissing) {
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<FolderImportProperty> output{
+      {"sentinel"_ns, "keep"_ns, Some(int64_t{-7})}};
+  ASSERT_EQ(NS_OK, FolderProperties(mFolder, output));
+  EXPECT_TRUE(output.IsEmpty());
+  ASSERT_TRUE(mCore->FolderDB().GetFolderName(mFolder).isOk());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().DeleteFolder(mFolder));
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "keep"_ns, Some(int64_t{-7})}};
+  for (uint64_t id : {uint64_t{0}, mFolder, UINT64_MAX}) {
+    output = sentinel.Clone();
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, FolderProperties(id, output));
+    ExpectProperties(sentinel, output);
+  }
+}
+
+TEST_F(DeliveryCoreProperties,
+       PresentFolderPropertiesRejectCorruptStoredTypes) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, SetFolder("first"_ns, "valid"_ns));
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "keep"_ns, Some(int64_t{-7})}};
+  for (const char* value : {"NULL", "1.5", "x'00'"}) {
+    nsAutoCString sql("DELETE FROM folder_properties WHERE id = ");
+    sql.AppendInt(mFolder);
+    sql.Append(
+        " AND name = 'z-corrupt'; INSERT INTO folder_properties "
+        "(id,name,value) VALUES (");
+    sql.AppendInt(mFolder);
+    sql.Append(", 'z-corrupt', ");
+    sql.Append(value);
+    sql.Append(')');
+    ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(sql));
+    nsTArray<FolderImportProperty> output = sentinel.Clone();
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, FolderProperties(mFolder, output));
+    ExpectProperties(sentinel, output);
+  }
+}
+
+TEST_F(DeliveryCoreProperties, PresentFolderPropertiesReadFailureKeepsOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, SetFolder("control"_ns, "unchanged"_ns));
+  nsTArray<FolderImportProperty> warm;
+  ASSERT_EQ(NS_OK, FolderProperties(mFolder, warm));
+  RefPtr<FolderPropertyReadAbort> fault = new FolderPropertyReadAbort();
+  nsCOMPtr<mozIStorageProgressHandler> previous;
+  ASSERT_EQ(NS_OK, Connection()->SetProgressHandler(1, fault,
+                                                    getter_AddRefs(previous)));
+  auto cleanup = MakeScopeExit([&] {
+    nsCOMPtr<mozIStorageProgressHandler> removed;
+    EXPECT_EQ(NS_OK,
+              Connection()->RemoveProgressHandler(getter_AddRefs(removed)));
+  });
+  ASSERT_FALSE(previous);
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "keep"_ns, Some(int64_t{-7})}};
+  nsTArray<FolderImportProperty> output = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_ABORT, FolderProperties(mFolder, output));
+  EXPECT_GT(fault->mCalls, 0u);
+  ExpectProperties(sentinel, output);
+  nsCOMPtr<mozIStorageProgressHandler> removed;
+  ASSERT_EQ(NS_OK,
+            Connection()->RemoveProgressHandler(getter_AddRefs(removed)));
+  cleanup.release();
+  ASSERT_EQ(NS_OK, FolderProperties(mFolder, output));
+  const nsTArray<FolderImportProperty> expected{
+      {"control"_ns, "unchanged"_ns, Nothing()}};
+  ExpectProperties(expected, output);
+}
+
+TEST_F(DeliveryCoreProperties,
+       VirtualScopeReadKeepsStoredMembershipAndTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t first, other;
+  auto parent = mCore->FolderDB().GetFolderParent(mFolder);
+  ASSERT_TRUE(parent.isOk());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(parent.inspect(), "first"_ns,
+                                                  &first));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(parent.inspect(), "other"_ns,
+                                                  &other));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().UpdateFlags(mFolder, nsMsgFolderFlags::Virtual));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().UpdateFlags(other, nsMsgFolderFlags::Virtual));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {first}));
+  ASSERT_EQ(NS_OK, SetScope(other, {mFolder}));
+  CheckScope(mFolder, {first});
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto cleanup = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+  nsTArray<uint64_t> output{UINT64_MAX};
+  ASSERT_EQ(NS_OK, GetScope(mFolder, output));
+  ASSERT_EQ(1u, output.Length());
+  EXPECT_EQ(first, output[0]);
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, GetScope(first, output));
+  EXPECT_TRUE(output.IsEmpty());
+}
+
+TEST_F(DeliveryCoreProperties,
+       VirtualScopeReadFailureKeepsOutputAndControlScope) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t member;
+  auto parent = mCore->FolderDB().GetFolderParent(mFolder);
+  ASSERT_TRUE(parent.isOk());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(parent.unwrap(), "member"_ns,
+                                                  &member));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().UpdateFlags(mFolder, nsMsgFolderFlags::Virtual));
+  ASSERT_EQ(NS_OK, SetScope(mFolder, {member}));
+  nsTArray<uint64_t> warm;
+  ASSERT_EQ(NS_OK, GetScope(mFolder, warm));
+  RefPtr<FolderPropertyReadAbort> fault = new FolderPropertyReadAbort();
+  nsCOMPtr<mozIStorageProgressHandler> previous;
+  ASSERT_EQ(NS_OK, Connection()->SetProgressHandler(1, fault,
+                                                    getter_AddRefs(previous)));
+  auto cleanup = MakeScopeExit([&] {
+    nsCOMPtr<mozIStorageProgressHandler> removed;
+    EXPECT_EQ(NS_OK,
+              Connection()->RemoveProgressHandler(getter_AddRefs(removed)));
+  });
+  ASSERT_FALSE(previous);
+  nsTArray<uint64_t> output{UINT64_MAX, 42};
+  EXPECT_EQ(NS_ERROR_ABORT, GetScope(mFolder, output));
+  EXPECT_GT(fault->mCalls, 0u);
+  const nsTArray<uint64_t> sentinel{UINT64_MAX, 42};
+  EXPECT_EQ(sentinel, output);
+  nsCOMPtr<mozIStorageProgressHandler> removed;
+  ASSERT_EQ(NS_OK,
+            Connection()->RemoveProgressHandler(getter_AddRefs(removed)));
+  cleanup.release();
+  ASSERT_EQ(NS_OK, GetScope(mFolder, output));
+  ASSERT_EQ(1u, output.Length());
+  EXPECT_EQ(member, output[0]);
+  CheckScope(mFolder, {member});
+}
+
 }  // namespace mozilla::mailnews

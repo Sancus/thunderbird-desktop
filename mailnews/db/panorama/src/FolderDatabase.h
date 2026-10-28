@@ -17,6 +17,8 @@ using mozilla::MozPromise;
 
 namespace mozilla::mailnews {
 
+struct FolderImportProperty;
+
 class FolderDatabase : public nsIFolderDatabase {
  public:
   NS_DECL_THREADSAFE_ISUPPORTS
@@ -57,6 +59,10 @@ class FolderDatabase : public nsIFolderDatabase {
   friend class DeliveryCoreProperties;
   friend class VirtualFolderFilter;
   friend class VirtualFolderWrapper;
+
+  // Present rows only. Missing folder/errors leave output unchanged.
+  nsresult GetFolderProperties(uint64_t id,
+                               nsTArray<FolderImportProperty>& output);
 
   nsresult GetFolderProperty(uint64_t id, const nsACString& name,
                              nsACString& value);

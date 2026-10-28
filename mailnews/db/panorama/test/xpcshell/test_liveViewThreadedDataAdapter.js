@@ -552,12 +552,12 @@ add_task(async function testAddRemoveDateAscending() {
     Assert.equal(adapter.rowAt(2).rowCount, 2);
     Assert.equal(adapter.getCellText(2, "threadId"), "3");
 
-    const added1 = addMessage({
+    const id1 = addMessage({
       messageId: "added1@invalid",
       references: ["message3@invalid"],
       date: new Date(),
     });
-    Assert.equal(added1, 11);
+    Assert.equal(messageDB.getMessage(id1).messageId, "added1@invalid");
     tree.assertInvalidated(2, 2);
     Assert.equal(adapter.rowCount, 6);
     Assert.equal(adapter.rowAt(2).rowCount, 3);
@@ -581,17 +581,28 @@ add_task(async function testAddRemoveDateAscending() {
     // Add a message to an expanded thread. As the latest child of a non-root
     // message, it goes at the end of that message's children.
 
-    const added2 = addMessage({
+    const id2 = addMessage({
       messageId: "added2@invalid",
       references: ["message3@invalid", "message5@invalid"],
       date: new Date(),
     });
-    Assert.equal(added2, 12);
+    Assert.equal(messageDB.getMessage(id2).messageId, "added2@invalid");
     tree.assertRowCountChanged(2, 1);
     Assert.equal(adapter.rowCount, 10);
     Assert.equal(adapter.rowAt(2).rowCount, 4);
 
-    Assert.deepEqual(listMessages(adapter), [1, 4, 3, 5, 6, 12, 11, 8, 9, 10]);
+    Assert.deepEqual(listMessages(adapter), [
+      1,
+      4,
+      3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+      9,
+      10,
+    ]);
     Assert.equal(adapter.getCellText(2, "messageId"), "message3@invalid");
     Assert.equal(adapter.getCellText(3, "messageId"), "message5@invalid");
     Assert.equal(adapter.getCellText(4, "messageId"), "message6@invalid");
@@ -609,12 +620,12 @@ add_task(async function testAddRemoveDateAscending() {
     // Add a message to a collapsed thread that has been expanded before. This
     // message is a child of the root message, but before existing siblings.
 
-    const added3 = addMessage({
+    const id3 = addMessage({
       messageId: "added3@invalid",
       references: ["message3@invalid"],
       date: "2025-09-04",
     });
-    Assert.equal(added3, 13);
+    Assert.equal(messageDB.getMessage(id3).messageId, "added3@invalid");
     tree.assertInvalidated(2, 2);
     Assert.equal(adapter.rowCount, 6);
     Assert.equal(adapter.rowAt(2).rowCount, 5);
@@ -629,31 +640,49 @@ add_task(async function testAddRemoveDateAscending() {
     tree.assertInvalidated(2, 2);
     Assert.equal(adapter.rowCount, 11);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [1, 4, 3, 13, 5, 6, 12, 11, 8, 9, 10]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+      9,
+      10,
+    ]);
 
     // Add a message to a non-thread.
 
     Assert.equal(adapter.rowAt(9).rowCount, 0);
     Assert.equal(adapter.getCellText(9, "threadId"), "9");
 
-    const added4 = addMessage({
+    const id4 = addMessage({
       messageId: "added4@invalid",
       references: ["message9@invalid"],
       date: new Date(),
     });
-    Assert.equal(added4, 14);
+    Assert.equal(messageDB.getMessage(id4).messageId, "added4@invalid");
     tree.assertInvalidated(9, 9);
     Assert.equal(adapter.rowCount, 11);
     Assert.ok(!adapter.rowAt(9).open);
     Assert.equal(adapter.rowAt(9).rowCount, 1);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [1, 4, 3, 13, 5, 6, 12, 11, 8, 9, 10]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+      9,
+      10,
+    ]);
     Assert.equal(adapter.getCellText(9, "messageId"), "message9@invalid");
 
     // Open the thread.
@@ -664,104 +693,189 @@ add_task(async function testAddRemoveDateAscending() {
     Assert.equal(adapter.rowCount, 12);
     await tree.promiseInvalidated(9, 10);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [1, 4, 3, 13, 5, 6, 12, 11, 8, 9, 14, 10]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+      9,
+      id4,
+      10,
+    ]);
     Assert.equal(adapter.getCellText(9, "messageId"), "message9@invalid");
     Assert.equal(adapter.getCellText(10, "messageId"), "added4@invalid");
 
     // Add a message that isn't part of a thread, at the end.
 
-    const added5 = addMessage({
+    const id5 = addMessage({
       messageId: "added5@invalid",
       date: "2026-03-03",
     });
-    Assert.equal(added5, 15);
+    Assert.equal(messageDB.getMessage(id5).messageId, "added5@invalid");
     tree.assertRowCountChanged(12, 1);
     Assert.equal(adapter.rowCount, 13);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [1, 4, 3, 13, 5, 6, 12, 11, 8, 9, 14, 10, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+      9,
+      id4,
+      10,
+      id5,
+    ]);
     Assert.equal(adapter.getCellText(12, "messageId"), "added5@invalid");
 
     // Add another message that isn't part of a thread, in the middle.
 
-    const added6 = addMessage({
+    const id6 = addMessage({
       messageId: "added6@invalid",
       date: "2025-09-07",
     });
-    Assert.equal(added6, 16);
+    Assert.equal(messageDB.getMessage(id6).messageId, "added6@invalid");
     tree.assertRowCountChanged(8, 1);
     Assert.equal(adapter.rowCount, 14);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [1, 4, 3, 13, 5, 6, 12, 11, 16, 8, 9, 14, 10, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      id6,
+      8,
+      9,
+      id4,
+      10,
+      id5,
+    ]);
     Assert.equal(adapter.getCellText(8, "messageId"), "added6@invalid");
 
     // Add another message that isn't part of a thread, at the start.
 
-    const added7 = addMessage({
+    const id7 = addMessage({
       messageId: "added7@invalid",
       date: "1998-03-03",
     });
-    Assert.equal(added7, 17);
+    Assert.equal(messageDB.getMessage(id7).messageId, "added7@invalid");
     tree.assertRowCountChanged(0, 1);
     Assert.equal(adapter.rowCount, 15);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 1, 4, 3, 13, 5, 6, 12, 11, 16, 8, 9, 14, 10, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      id6,
+      8,
+      9,
+      id4,
+      10,
+      id5,
+    ]);
     Assert.equal(adapter.getCellText(0, "messageId"), "added7@invalid");
 
     // Remove the messages in the order they were added.
 
-    messageDB.removeMessage(added1);
+    messageDB.removeMessage(id1);
     tree.assertRowCountChanged(8, -1);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 1, 4, 3, 13, 5, 6, 12, 16, 8, 9, 14, 10, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id6,
+      8,
+      9,
+      id4,
+      10,
+      id5,
+    ]);
 
-    messageDB.removeMessage(added2);
+    messageDB.removeMessage(id2);
     tree.assertRowCountChanged(7, -1);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 1, 4, 3, 13, 5, 6, 16, 8, 9, 14, 10, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      1,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id6,
+      8,
+      9,
+      id4,
+      10,
+      id5,
+    ]);
 
     adapter.toggleOpenState(3);
     tree.assertRowCountChanged(4, -3);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 1, 4, 6, 16, 8, 9, 14, 10, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      1,
+      4,
+      6,
+      id6,
+      8,
+      9,
+      id4,
+      10,
+      id5,
+    ]);
 
-    messageDB.removeMessage(added3);
+    messageDB.removeMessage(id3);
     tree.assertInvalidated(3, 3);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 1, 4, 6, 16, 8, 9, 14, 10, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      1,
+      4,
+      6,
+      id6,
+      8,
+      9,
+      id4,
+      10,
+      id5,
+    ]);
 
-    messageDB.removeMessage(added4);
+    messageDB.removeMessage(id4);
     tree.assertRowCountChanged(7, -1);
-    Assert.deepEqual(listMessages(adapter), [17, 1, 4, 6, 16, 8, 9, 10, 15]);
+    Assert.deepEqual(listMessages(adapter), [id7, 1, 4, 6, id6, 8, 9, 10, id5]);
 
-    messageDB.removeMessage(added5);
+    messageDB.removeMessage(id5);
     tree.assertRowCountChanged(8, -1);
-    Assert.deepEqual(listMessages(adapter), [17, 1, 4, 6, 16, 8, 9, 10]);
+    Assert.deepEqual(listMessages(adapter), [id7, 1, 4, 6, id6, 8, 9, 10]);
 
-    messageDB.removeMessage(added6);
+    messageDB.removeMessage(id6);
     tree.assertRowCountChanged(4, -1);
-    Assert.deepEqual(listMessages(adapter), [17, 1, 4, 6, 8, 9, 10]);
+    Assert.deepEqual(listMessages(adapter), [id7, 1, 4, 6, 8, 9, 10]);
 
-    messageDB.removeMessage(added7);
+    messageDB.removeMessage(id7);
     tree.assertRowCountChanged(0, -1);
     Assert.deepEqual(listMessages(adapter), [1, 4, 6, 8, 9, 10]);
   } finally {
@@ -824,13 +938,13 @@ add_task(async function testAddRemoveSubjectDescending() {
     Assert.equal(adapter.rowAt(1).rowCount, 2);
     Assert.equal(adapter.getCellText(1, "threadId"), "3");
 
-    const added1 = addMessage({
+    const id1 = addMessage({
       messageId: "added1@invalid",
       subject: "It really doesn't matter",
       references: ["message3@invalid"],
       date: new Date(),
     });
-    Assert.equal(added1, 11);
+    Assert.equal(messageDB.getMessage(id1).messageId, "added1@invalid");
     tree.assertInvalidated(1, 1);
     Assert.equal(adapter.rowCount, 6);
     Assert.equal(adapter.rowAt(1).rowCount, 3);
@@ -854,17 +968,28 @@ add_task(async function testAddRemoveSubjectDescending() {
     // Add a message to an expanded thread. As the latest child of a non-root
     // message, it goes at the end of that message's children.
 
-    const added2 = addMessage({
+    const id2 = addMessage({
       messageId: "added2@invalid",
       references: ["message3@invalid", "message5@invalid"],
       date: new Date(),
     });
-    Assert.equal(added2, 12);
+    Assert.equal(messageDB.getMessage(id2).messageId, "added2@invalid");
     tree.assertRowCountChanged(1, 1);
     Assert.equal(adapter.rowCount, 10);
     Assert.equal(adapter.rowAt(1).rowCount, 4);
 
-    Assert.deepEqual(listMessages(adapter), [8, 3, 5, 6, 12, 11, 4, 10, 1, 9]);
+    Assert.deepEqual(listMessages(adapter), [
+      8,
+      3,
+      5,
+      6,
+      id2,
+      id1,
+      4,
+      10,
+      1,
+      9,
+    ]);
 
     // Collapse the thread.
 
@@ -876,12 +1001,12 @@ add_task(async function testAddRemoveSubjectDescending() {
     // Add a message to a collapsed thread that has been expanded before. This
     // message is a child of the root message, but before existing siblings.
 
-    const added3 = addMessage({
+    const id3 = addMessage({
       messageId: "added3@invalid",
       references: ["message3@invalid"],
       date: "2025-09-04",
     });
-    Assert.equal(added3, 13);
+    Assert.equal(messageDB.getMessage(id3).messageId, "added3@invalid");
     tree.assertInvalidated(1, 1);
     Assert.equal(adapter.rowCount, 6);
     Assert.equal(adapter.rowAt(1).rowCount, 5);
@@ -896,31 +1021,49 @@ add_task(async function testAddRemoveSubjectDescending() {
     tree.assertInvalidated(1, 1);
     Assert.equal(adapter.rowCount, 11);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [8, 3, 13, 5, 6, 12, 11, 4, 10, 1, 9]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      8,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      4,
+      10,
+      1,
+      9,
+    ]);
 
     // Add a message to a non-thread.
 
     Assert.equal(adapter.rowAt(10).rowCount, 0);
     Assert.equal(adapter.getCellText(10, "threadId"), "9");
 
-    const added4 = addMessage({
+    const id4 = addMessage({
       messageId: "added4@invalid",
       references: ["message9@invalid"],
       date: new Date(),
     });
-    Assert.equal(added4, 14);
+    Assert.equal(messageDB.getMessage(id4).messageId, "added4@invalid");
     tree.assertInvalidated(10, 10);
     Assert.equal(adapter.rowCount, 11);
     Assert.ok(!adapter.rowAt(10).open);
     Assert.equal(adapter.rowAt(10).rowCount, 1);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [8, 3, 13, 5, 6, 12, 11, 4, 10, 1, 9]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      8,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      4,
+      10,
+      1,
+      9,
+    ]);
     Assert.equal(adapter.getCellText(10, "messageId"), "message9@invalid");
 
     // Open the thread.
@@ -931,107 +1074,192 @@ add_task(async function testAddRemoveSubjectDescending() {
     Assert.equal(adapter.rowCount, 12);
     await tree.promiseInvalidated(10, 11);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [8, 3, 13, 5, 6, 12, 11, 4, 10, 1, 9, 14]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      8,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      4,
+      10,
+      1,
+      9,
+      id4,
+    ]);
     Assert.equal(adapter.getCellText(10, "messageId"), "message9@invalid");
     Assert.equal(adapter.getCellText(11, "messageId"), "added4@invalid");
 
     // Add a message that isn't part of a thread, at the start.
 
-    const added5 = addMessage({
+    const id5 = addMessage({
       messageId: "added5@invalid",
       subject: "Team-oriented context-sensitive monitoring",
       date: "2026-03-03",
     });
-    Assert.equal(added5, 15);
+    Assert.equal(messageDB.getMessage(id5).messageId, "added5@invalid");
     tree.assertRowCountChanged(0, 1);
     Assert.equal(adapter.rowCount, 13);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [15, 8, 3, 13, 5, 6, 12, 11, 4, 10, 1, 9, 14]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id5,
+      8,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      4,
+      10,
+      1,
+      9,
+      id4,
+    ]);
     Assert.equal(adapter.getCellText(0, "messageId"), "added5@invalid");
 
     // Add another message that isn't part of a thread, in the middle.
 
-    const added6 = addMessage({
+    const id6 = addMessage({
       messageId: "added6@invalid",
       subject: "Networked even-keeled application",
       date: "2025-09-07",
     });
-    Assert.equal(added6, 16);
+    Assert.equal(messageDB.getMessage(id6).messageId, "added6@invalid");
     tree.assertRowCountChanged(2, 1);
     Assert.equal(adapter.rowCount, 14);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [15, 8, 16, 3, 13, 5, 6, 12, 11, 4, 10, 1, 9, 14]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id5,
+      8,
+      id6,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      4,
+      10,
+      1,
+      9,
+      id4,
+    ]);
     Assert.equal(adapter.getCellText(2, "messageId"), "added6@invalid");
 
     // Add another message that isn't part of a thread, at the end.
 
-    const added7 = addMessage({
+    const id7 = addMessage({
       messageId: "added7@invalid",
       subject: "Cross-platform tertiary open architecture",
       date: "1998-03-03",
     });
-    Assert.equal(added7, 17);
+    Assert.equal(messageDB.getMessage(id7).messageId, "added7@invalid");
     tree.assertRowCountChanged(14, 1);
     Assert.equal(adapter.rowCount, 15);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [15, 8, 16, 3, 13, 5, 6, 12, 11, 4, 10, 1, 9, 14, 17]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id5,
+      8,
+      id6,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      4,
+      10,
+      1,
+      9,
+      id4,
+      id7,
+    ]);
     Assert.equal(adapter.getCellText(14, "messageId"), "added7@invalid");
 
     // Remove the messages in the order they were added.
 
-    messageDB.removeMessage(added1);
+    messageDB.removeMessage(id1);
     tree.assertRowCountChanged(8, -1);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [15, 8, 16, 3, 13, 5, 6, 12, 4, 10, 1, 9, 14, 17]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id5,
+      8,
+      id6,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      4,
+      10,
+      1,
+      9,
+      id4,
+      id7,
+    ]);
 
-    messageDB.removeMessage(added2);
+    messageDB.removeMessage(id2);
     tree.assertRowCountChanged(7, -1);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [15, 8, 16, 3, 13, 5, 6, 4, 10, 1, 9, 14, 17]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id5,
+      8,
+      id6,
+      3,
+      id3,
+      5,
+      6,
+      4,
+      10,
+      1,
+      9,
+      id4,
+      id7,
+    ]);
 
     adapter.toggleOpenState(3);
     tree.assertRowCountChanged(4, -3);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [15, 8, 16, 6, 4, 10, 1, 9, 14, 17]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id5,
+      8,
+      id6,
+      6,
+      4,
+      10,
+      1,
+      9,
+      id4,
+      id7,
+    ]);
 
-    messageDB.removeMessage(added3);
+    messageDB.removeMessage(id3);
     tree.assertInvalidated(3, 3);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [15, 8, 16, 6, 4, 10, 1, 9, 14, 17]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id5,
+      8,
+      id6,
+      6,
+      4,
+      10,
+      1,
+      9,
+      id4,
+      id7,
+    ]);
 
-    messageDB.removeMessage(added4);
+    messageDB.removeMessage(id4);
     tree.assertRowCountChanged(8, -1);
-    Assert.deepEqual(listMessages(adapter), [15, 8, 16, 6, 4, 10, 1, 9, 17]);
+    Assert.deepEqual(listMessages(adapter), [id5, 8, id6, 6, 4, 10, 1, 9, id7]);
 
-    messageDB.removeMessage(added5);
+    messageDB.removeMessage(id5);
     tree.assertRowCountChanged(0, -1);
-    Assert.deepEqual(listMessages(adapter), [8, 16, 6, 4, 10, 1, 9, 17]);
+    Assert.deepEqual(listMessages(adapter), [8, id6, 6, 4, 10, 1, 9, id7]);
 
-    messageDB.removeMessage(added6);
+    messageDB.removeMessage(id6);
     tree.assertRowCountChanged(1, -1);
-    Assert.deepEqual(listMessages(adapter), [8, 6, 4, 10, 1, 9, 17]);
+    Assert.deepEqual(listMessages(adapter), [8, 6, 4, 10, 1, 9, id7]);
 
-    messageDB.removeMessage(added7);
+    messageDB.removeMessage(id7);
     tree.assertRowCountChanged(6, -1);
     Assert.deepEqual(listMessages(adapter), [8, 6, 4, 10, 1, 9]);
   } finally {
@@ -1094,13 +1322,13 @@ add_task(async function testAddRemoveSubjectAscending() {
     Assert.equal(adapter.rowAt(4).rowCount, 2);
     Assert.equal(adapter.getCellText(4, "threadId"), "3");
 
-    const added1 = addMessage({
+    const id1 = addMessage({
       messageId: "added1@invalid",
       subject: "It really doesn't matter",
       references: ["message3@invalid"],
       date: new Date(),
     });
-    Assert.equal(added1, 11);
+    Assert.equal(messageDB.getMessage(id1).messageId, "added1@invalid");
     tree.assertInvalidated(4, 4);
     Assert.equal(adapter.rowCount, 6);
     Assert.equal(adapter.rowAt(4).rowCount, 3);
@@ -1124,17 +1352,28 @@ add_task(async function testAddRemoveSubjectAscending() {
     // Add a message to an expanded thread. As the latest child of a non-root
     // message, it goes at the end of that message's children.
 
-    const added2 = addMessage({
+    const id2 = addMessage({
       messageId: "added2@invalid",
       references: ["message3@invalid", "message5@invalid"],
       date: new Date(),
     });
-    Assert.equal(added2, 12);
+    Assert.equal(messageDB.getMessage(id2).messageId, "added2@invalid");
     tree.assertRowCountChanged(4, 1);
     Assert.equal(adapter.rowCount, 10);
     Assert.equal(adapter.rowAt(4).rowCount, 4);
 
-    Assert.deepEqual(listMessages(adapter), [9, 1, 10, 4, 3, 5, 6, 12, 11, 8]);
+    Assert.deepEqual(listMessages(adapter), [
+      9,
+      1,
+      10,
+      4,
+      3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+    ]);
 
     // Collapse the thread.
 
@@ -1146,12 +1385,12 @@ add_task(async function testAddRemoveSubjectAscending() {
     // Add a message to a collapsed thread that has been expanded before. This
     // message is a child of the root message, but before existing siblings.
 
-    const added3 = addMessage({
+    const id3 = addMessage({
       messageId: "added3@invalid",
       references: ["message3@invalid"],
       date: "2025-09-04",
     });
-    Assert.equal(added3, 13);
+    Assert.equal(messageDB.getMessage(id3).messageId, "added3@invalid");
     tree.assertInvalidated(4, 4);
     Assert.equal(adapter.rowCount, 6);
     Assert.equal(adapter.rowAt(4).rowCount, 5);
@@ -1166,31 +1405,49 @@ add_task(async function testAddRemoveSubjectAscending() {
     tree.assertInvalidated(4, 4);
     Assert.equal(adapter.rowCount, 11);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [9, 1, 10, 4, 3, 13, 5, 6, 12, 11, 8]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      9,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+    ]);
 
     // Add a message to a non-thread.
 
     Assert.equal(adapter.rowAt(0).rowCount, 0);
     Assert.equal(adapter.getCellText(0, "threadId"), "9");
 
-    const added4 = addMessage({
+    const id4 = addMessage({
       messageId: "added4@invalid",
       references: ["message9@invalid"],
       date: new Date(),
     });
-    Assert.equal(added4, 14);
+    Assert.equal(messageDB.getMessage(id4).messageId, "added4@invalid");
     tree.assertInvalidated(0, 0);
     Assert.equal(adapter.rowCount, 11);
     Assert.ok(!adapter.rowAt(0).open);
     Assert.equal(adapter.rowAt(0).rowCount, 1);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [9, 1, 10, 4, 3, 13, 5, 6, 12, 11, 8]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      9,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+    ]);
     Assert.equal(adapter.getCellText(0, "messageId"), "message9@invalid");
 
     // Open the thread.
@@ -1201,107 +1458,192 @@ add_task(async function testAddRemoveSubjectAscending() {
     Assert.equal(adapter.rowCount, 12);
     await tree.promiseInvalidated(0, 1);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [9, 14, 1, 10, 4, 3, 13, 5, 6, 12, 11, 8]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      9,
+      id4,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+    ]);
     Assert.equal(adapter.getCellText(0, "messageId"), "message9@invalid");
     Assert.equal(adapter.getCellText(1, "messageId"), "added4@invalid");
 
     // Add a message that isn't part of a thread, at the end.
 
-    const added5 = addMessage({
+    const id5 = addMessage({
       messageId: "added5@invalid",
       subject: "Team-oriented context-sensitive monitoring",
       date: "2026-03-03",
     });
-    Assert.equal(added5, 15);
+    Assert.equal(messageDB.getMessage(id5).messageId, "added5@invalid");
     tree.assertRowCountChanged(12, 1);
     Assert.equal(adapter.rowCount, 13);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [9, 14, 1, 10, 4, 3, 13, 5, 6, 12, 11, 8, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      9,
+      id4,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      8,
+      id5,
+    ]);
     Assert.equal(adapter.getCellText(12, "messageId"), "added5@invalid");
 
     // Add another message that isn't part of a thread, in the middle.
 
-    const added6 = addMessage({
+    const id6 = addMessage({
       messageId: "added6@invalid",
       subject: "Networked even-keeled application",
       date: "2025-09-07",
     });
-    Assert.equal(added6, 16);
+    Assert.equal(messageDB.getMessage(id6).messageId, "added6@invalid");
     tree.assertRowCountChanged(11, 1);
     Assert.equal(adapter.rowCount, 14);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [9, 14, 1, 10, 4, 3, 13, 5, 6, 12, 11, 16, 8, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      9,
+      id4,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      id6,
+      8,
+      id5,
+    ]);
     Assert.equal(adapter.getCellText(11, "messageId"), "added6@invalid");
 
     // Add another message that isn't part of a thread, at the start.
 
-    const added7 = addMessage({
+    const id7 = addMessage({
       messageId: "added7@invalid",
       subject: "Cross-platform tertiary open architecture",
       date: "1998-03-03",
     });
-    Assert.equal(added7, 17);
+    Assert.equal(messageDB.getMessage(id7).messageId, "added7@invalid");
     tree.assertRowCountChanged(0, 1);
     Assert.equal(adapter.rowCount, 15);
 
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 9, 14, 1, 10, 4, 3, 13, 5, 6, 12, 11, 16, 8, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      9,
+      id4,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id1,
+      id6,
+      8,
+      id5,
+    ]);
     Assert.equal(adapter.getCellText(0, "messageId"), "added7@invalid");
 
     // Remove the messages in the order they were added.
 
-    messageDB.removeMessage(added1);
+    messageDB.removeMessage(id1);
     tree.assertRowCountChanged(11, -1);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 9, 14, 1, 10, 4, 3, 13, 5, 6, 12, 16, 8, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      9,
+      id4,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id2,
+      id6,
+      8,
+      id5,
+    ]);
 
-    messageDB.removeMessage(added2);
+    messageDB.removeMessage(id2);
     tree.assertRowCountChanged(10, -1);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 9, 14, 1, 10, 4, 3, 13, 5, 6, 16, 8, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      9,
+      id4,
+      1,
+      10,
+      4,
+      3,
+      id3,
+      5,
+      6,
+      id6,
+      8,
+      id5,
+    ]);
 
     adapter.toggleOpenState(6);
     tree.assertRowCountChanged(7, -3);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 9, 14, 1, 10, 4, 6, 16, 8, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      9,
+      id4,
+      1,
+      10,
+      4,
+      6,
+      id6,
+      8,
+      id5,
+    ]);
 
-    messageDB.removeMessage(added3);
+    messageDB.removeMessage(id3);
     tree.assertInvalidated(6, 6);
-    Assert.deepEqual(
-      listMessages(adapter),
-      [17, 9, 14, 1, 10, 4, 6, 16, 8, 15]
-    );
+    Assert.deepEqual(listMessages(adapter), [
+      id7,
+      9,
+      id4,
+      1,
+      10,
+      4,
+      6,
+      id6,
+      8,
+      id5,
+    ]);
 
-    messageDB.removeMessage(added4);
+    messageDB.removeMessage(id4);
     tree.assertRowCountChanged(2, -1);
-    Assert.deepEqual(listMessages(adapter), [17, 9, 1, 10, 4, 6, 16, 8, 15]);
+    Assert.deepEqual(listMessages(adapter), [id7, 9, 1, 10, 4, 6, id6, 8, id5]);
 
-    messageDB.removeMessage(added5);
+    messageDB.removeMessage(id5);
     tree.assertRowCountChanged(8, -1);
-    Assert.deepEqual(listMessages(adapter), [17, 9, 1, 10, 4, 6, 16, 8]);
+    Assert.deepEqual(listMessages(adapter), [id7, 9, 1, 10, 4, 6, id6, 8]);
 
-    messageDB.removeMessage(added6);
+    messageDB.removeMessage(id6);
     tree.assertRowCountChanged(6, -1);
-    Assert.deepEqual(listMessages(adapter), [17, 9, 1, 10, 4, 6, 8]);
+    Assert.deepEqual(listMessages(adapter), [id7, 9, 1, 10, 4, 6, 8]);
 
-    messageDB.removeMessage(added7);
+    messageDB.removeMessage(id7);
     tree.assertRowCountChanged(0, -1);
     Assert.deepEqual(listMessages(adapter), [9, 1, 10, 4, 6, 8]);
   } finally {

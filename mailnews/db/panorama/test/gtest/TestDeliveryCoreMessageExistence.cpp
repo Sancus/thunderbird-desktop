@@ -466,6 +466,23 @@ class DeliveryCoreMessageExistence : public testing::Test {
     }
   }
 
+  nsresult FolderKeys(uint64_t folder, nsTArray<nsMsgKey>& keys) {
+    return mCore->MessageDB().ListAllKeys(folder, keys);
+  }
+
+  void CheckFolderKeysBindFailure() {
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, Add("folder-bind@invalid"_ns, key));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(NS_OK, DatabaseCore::GetStatement("ListAllKeys"_ns,
+                                                "SELECT :other AS id"_ns,
+                                                getter_AddRefs(stmt)));
+    nsTArray<nsMsgKey> keys{77, 88};
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, FolderKeys(mFolder, keys));
+    EXPECT_EQ((nsTArray<nsMsgKey>{77, 88}), keys);
+    ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key}));
+  }
+
   nsresult ThreadKeys(uint64_t folder, uint64_t parent, uint64_t thread,
                       nsTArray<nsMsgKey>& keys) {
     return mCore->MessageDB().ListThreadKeys(folder, parent, thread, keys);
@@ -1126,6 +1143,52 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   EXPECT_TRUE(filter.Matches(matching, mFolder));
   EXPECT_FALSE(filter.Matches(excluded, mFolder));
   ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key, other}));
+}
+
+
+TEST_F(DeliveryCoreMessageExistence, FolderKeysReturnStoredMembership) {
+  nsMsgKey first, second;
+  ASSERT_EQ(NS_OK, Add("folder-first@invalid"_ns, first));
+  ASSERT_EQ(NS_OK, Add("folder-second@invalid"_ns, second));
+  nsTArray<nsMsgKey> keys{77, 88};
+  ASSERT_EQ(NS_OK, FolderKeys(mFolder, keys));
+  keys.Sort();
+  nsTArray<nsMsgKey> expected{first, second};
+  expected.Sort();
+  EXPECT_EQ(expected, keys);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(first));
+  ASSERT_EQ(NS_OK, FolderKeys(mFolder, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{second}), keys);
+  ASSERT_EQ(NS_OK, FolderKeys(0, keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({second}));
+}
+
+TEST_F(DeliveryCoreMessageExistence, FolderKeysBindErrorsPreserveOutput) {
+  ASSERT_NO_FATAL_FAILURE(CheckFolderKeysBindFailure());
+}
+
+TEST_F(DeliveryCoreMessageExistence, FolderKeysStepErrorsPreserveOutput) {
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("folder-error@invalid"_ns, key));
+  mFault = new MessageExistenceReadFault();
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateFunction("folder_key_fault"_ns, 1, mFault));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "CREATE TEMP VIEW messages AS SELECT "
+                "folder_key_fault(id) AS id, folderId FROM main.messages"_ns));
+  nsTArray<nsMsgKey> keys{77, 88};
+  EXPECT_EQ(NS_ERROR_FAILURE, FolderKeys(mFolder, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{77, 88}), keys);
+  EXPECT_EQ(1u, mFault->mCalls);
+  EXPECT_EQ(int64_t(key), mFault->mLastKey);
+  ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key}));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP VIEW temp.messages"_ns));
+  ASSERT_EQ(NS_OK, Connection()->RemoveFunction("folder_key_fault"_ns));
+  ASSERT_EQ(NS_OK, FolderKeys(mFolder, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
 }
 
 }  // namespace

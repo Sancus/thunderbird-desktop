@@ -223,6 +223,7 @@ class MessageDatabase : public nsIMessageDatabase {
   friend class ThreadMessageEnumerator;
   friend class DeliveryCoreMessageExistence;
 
+  // Leaves keys unchanged on failure.
   nsresult ListAllKeys(uint64_t aFolderId, nsTArray<nsMsgKey>& aKeys);
   // Leaves keys unchanged on failure.
   nsresult ListThreadKeys(uint64_t folderId, uint64_t parent, uint64_t threadId,

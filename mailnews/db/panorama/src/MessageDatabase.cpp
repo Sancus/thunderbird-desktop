@@ -510,21 +510,27 @@ NS_IMETHODIMP MessageDatabase::RemoveMessage(nsMsgKey key) {
 
 nsresult MessageDatabase::ListAllKeys(uint64_t folderId,
                                       nsTArray<nsMsgKey>& keys) {
-  keys.Clear();
-
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
+  MOZ_TRY(DatabaseCore::GetStatement(
       "ListAllKeys"_ns, "SELECT id FROM messages WHERE folderId = :folderId"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
+      getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindInt64ByName("folderId"_ns, folderId);
-
-  bool hasResult;
-  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    keys.AppendElement((nsMsgKey)(stmt->AsInt64(0)));
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+  nsTArray<nsMsgKey> found;
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t id;
+    MOZ_TRY(stmt->GetInt64(0, &id));
+    if (id <= 0 || id >= nsMsgKey_None) {
+      return NS_ERROR_FILE_CORRUPTED;
+    }
+    found.AppendElement(static_cast<nsMsgKey>(id));
   }
-
+  keys = std::move(found);
   return NS_OK;
 }
 

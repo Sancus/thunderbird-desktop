@@ -152,9 +152,10 @@ class DeliveryMessageReferences : public testing::Test {
         EXPECT_EQ(NS_OK, mProfile->Exists(&exists));
         EXPECT_FALSE(exists);
       } else {
-        nsAutoCString retained;
-        EXPECT_EQ(NS_OK, mProfile->GetNativePath(retained));
-        RecordProperty("retained_profile", retained.get());
+        nsAutoString retained;
+        EXPECT_EQ(NS_OK, mProfile->GetPath(retained));
+        RecordProperty("retained_profile",
+                       NS_ConvertUTF16toUTF8(retained).get());
       }
     }
   }

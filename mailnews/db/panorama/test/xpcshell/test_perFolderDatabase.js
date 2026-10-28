@@ -399,19 +399,21 @@ add_task(async function testHeaderProperties() {
   // TODO: Should we remove properties set to an empty string or 0?
 
   const stmt = database.connectionForTests.createStatement(
-    "SELECT id, name, value FROM message_properties ORDER BY id, name"
+    "SELECT id, name, typeof(value) AS type, value FROM message_properties " +
+      "WHERE id = :id ORDER BY name"
   );
+  stmt.params.id = header.messageKey;
   const properties = [];
   while (stmt.executeStep()) {
-    properties.push([stmt.row.id, stmt.row.name, stmt.row.value]);
+    properties.push([stmt.row.id, stmt.row.name, stmt.row.type, stmt.row.value]);
   }
   stmt.finalize();
 
   Assert.deepEqual(properties, [
-    [7, "answer", 42],
-    [7, "hack", ""],
-    [7, "messageSize", 500],
-    [7, "storeToken", "12345678"],
+    [header.messageKey, "answer", "text", "2a"],
+    [header.messageKey, "hack", "text", ""],
+    [header.messageKey, "messageSize", "integer", 500],
+    [header.messageKey, "storeToken", "text", "12345678"],
   ]);
 });
 
@@ -472,7 +474,7 @@ add_task(async function testListener() {
   const folderDatabaseC = database.openFolderDB(folderC, false);
   folderDatabaseC.addListener(listenerC);
 
-  const addedId = addMessage({ folderId: 4 });
+  const addedId = addMessage({ folderId: folderC.id });
   Assert.ok(!listenerB._headerAdded);
   Assert.ok(!listenerB._headerRemoved);
   Assert.ok(!listenerB._headerChanged);

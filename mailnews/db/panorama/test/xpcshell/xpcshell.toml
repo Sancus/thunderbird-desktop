@@ -70,6 +70,8 @@ tags = ["dataadapter"]
 
 ["test_perFolderDatabase.js"]
 
+["test_searchIndex.js"]
+
 ["test_reconcile.js"]
 
 ["test_relations.js"]

@@ -4,6 +4,9 @@
 
 #include "PerFolderDatabase.h"
 
+#include <algorithm>
+#include <utility>
+
 #include "DatabaseCore.h"
 #include "DetachedMsgHdr.h"
 #include "MailNewsTypes.h"
@@ -13,20 +16,27 @@
 #include "Thread.h"
 #include "mozIStorageBindingParams.h"
 #include "mozIStorageBindingParamsArray.h"
+#include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
 #include "mozilla/CheckedInt.h"
+#include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/RefPtr.h"
+#include "nsComponentManagerUtils.h"
 #include "nsIInputStream.h"
 #include "nsIMsgDBView.h"
 #include "nsIMsgPluggableStore.h"
+#include "nsIMsgSearchSession.h"
 #include "nsMsgMessageFlags.h"
+#include "nsMsgSearchCore.h"
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
 #include "nsServiceManagerUtils.h"
 
 namespace mozilla::mailnews {
+
+extern LazyLogModule gPanoramaLog;
 
 NS_IMPL_ISUPPORTS(PerFolderDatabase, nsIDBChangeAnnouncer, nsIMsgDatabase)
 
@@ -383,7 +393,77 @@ NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,
 NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
     nsMsgKey key, nsIMsgDBHdr* existingHdr, bool addHdrToDB,
     nsIMsgDBHdr** aRetVal) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aRetVal);
+  *aRetVal = nullptr;
+  NS_ENSURE_ARG(existingHdr);
+  MOZ_TRY(CheckFolderExists());
+  // Global keys are allocated by the core, not requested by callers.
+  NS_ENSURE_TRUE(key == nsMsgKey_None, NS_ERROR_NOT_IMPLEMENTED);
+
+  RefPtr<DetachedMsgHdr> draft = new DetachedMsgHdr(mFolderId);
+  RawHdr& raw = draft->mRaw;
+  MOZ_TRY(existingHdr->GetMessageId(raw.messageId));
+  MOZ_TRY(existingHdr->GetSubject(raw.subject));
+  MOZ_TRY(existingHdr->GetAuthor(raw.sender));
+  MOZ_TRY(existingHdr->GetRecipients(raw.recipients));
+  MOZ_TRY(existingHdr->GetCcList(raw.ccList));
+  MOZ_TRY(existingHdr->GetBccList(raw.bccList));
+  MOZ_TRY(existingHdr->GetDate(&raw.date));
+  MOZ_TRY(existingHdr->GetFlags(&raw.flags));
+  MOZ_TRY(existingHdr->GetPriority(&raw.priority));
+  MOZ_TRY(existingHdr->GetStringProperty("keywords", raw.keywords));
+
+  bool isLive;
+  MOZ_TRY(existingHdr->GetIsLive(&isLive));
+  if (isLive) {
+    nsMsgKey sourceKey;
+    MOZ_TRY(existingHdr->GetMessageKey(&sourceKey));
+    nsCOMPtr<nsIMsgFolder> folder;
+    MOZ_TRY(existingHdr->GetFolder(getter_AddRefs(folder)));
+    NS_ENSURE_TRUE(folder, NS_ERROR_NOT_AVAILABLE);
+    uint64_t folderId, storedFolderId;
+    MOZ_TRY(folder->GetId(&folderId));
+    MOZ_TRY(MessageDB().GetMessageFolderId(sourceKey, storedFolderId));
+    NS_ENSURE_TRUE(folderId == storedFolderId, NS_ERROR_ILLEGAL_VALUE);
+    // The public getter filters self/empty tokens and has a uint16 limit.
+    MOZ_TRY(MessageDB().GetMessageReferences(sourceKey, raw.references));
+  } else {
+    // Like AttachHdr, this accepts the native CreateNewHdr implementation.
+    auto* source = static_cast<DetachedMsgHdr*>(existingHdr);
+    MOZ_TRY(source->CheckMutable());
+    raw.references = source->mRaw.references.Clone();
+  }
+
+  nsTArray<nsCString> properties;
+  MOZ_TRY(existingHdr->GetProperties(properties));
+  for (const auto& name : properties) {
+    uint32_t value;
+    if (name.EqualsLiteral("messageSize")) {
+      MOZ_TRY(existingHdr->GetMessageSize(&value));
+      raw.messageSize = Some(value);
+    } else if (name.EqualsLiteral("offlineMessageSize")) {
+      MOZ_TRY(existingHdr->GetOfflineMessageSize(&value));
+      raw.offlineMessageSize = Some(value);
+    } else if (name.EqualsLiteral("lineCount")) {
+      MOZ_TRY(existingHdr->GetLineCount(&value));
+      raw.lineCount = Some(value);
+    } else if (name.EqualsLiteral("storeToken")) {
+      nsAutoCString token;
+      MOZ_TRY(existingHdr->GetStoreToken(token));
+      raw.storeToken = Some(nsCString(token));
+    } else {
+      nsAutoCString propertyValue;
+      MOZ_TRY(existingHdr->GetStringProperty(name.get(), propertyValue));
+      auto& extra = *raw.extras.AppendElement();
+      extra.k = name;
+      extra.v = propertyValue;
+    }
+  }
+  if (addHdrToDB) {
+    return AttachHdr(draft, true, aRetVal);
+  }
+  draft.forget(aRetVal);
+  return NS_OK;
 }
 
 NS_IMETHODIMP PerFolderDatabase::AddMsgHdr(RawHdr* msg, bool notify,
@@ -465,10 +545,85 @@ NS_IMETHODIMP PerFolderDatabase::EnumerateThreads(
   enumerator.forget(aEnumerator);
   return NS_OK;
 }
+
+namespace {
+
+class FilterEnumerator final : public nsBaseMsgEnumerator {
+ public:
+  FilterEnumerator(nsIMsgDatabase* db, nsIMsgSearchSession* session,
+                   nsTArray<nsMsgKey>&& keys)
+      : mDatabase(db), mSession(session), mKeys(std::move(keys)) {}
+
+  NS_IMETHOD HasMoreElements(bool* result) override {
+    NS_ENSURE_ARG_POINTER(result);
+    *result = false;
+    while (!mNext && mIndex < mKeys.Length()) {
+      bool contains;
+      MOZ_TRY(mDatabase->ContainsKey(mKeys[mIndex], &contains));
+      if (!contains) {
+        ++mIndex;
+        continue;
+      }
+      nsCOMPtr<nsIMsgDBHdr> header;
+      MOZ_TRY(
+          mDatabase->GetMsgHdrForKey(mKeys[mIndex], getter_AddRefs(header)));
+      bool matches = false;
+      MOZ_TRY(mSession->MatchHdr(header, mDatabase, &matches));
+      ++mIndex;
+      if (matches) {
+        mNext = header;
+      }
+    }
+    *result = !!mNext;
+    return NS_OK;
+  }
+
+  NS_IMETHOD GetNext(nsIMsgDBHdr** result) override {
+    NS_ENSURE_ARG_POINTER(result);
+    *result = nullptr;
+    bool more;
+    MOZ_TRY(HasMoreElements(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_FAILURE);
+    mNext.forget(result);
+    return NS_OK;
+  }
+
+ private:
+  ~FilterEnumerator() = default;
+  nsCOMPtr<nsIMsgDatabase> mDatabase;
+  nsCOMPtr<nsIMsgSearchSession> mSession;
+  nsTArray<nsMsgKey> mKeys;
+  size_t mIndex = 0;
+  nsCOMPtr<nsIMsgDBHdr> mNext;
+};
+
+}  // namespace
+
 NS_IMETHODIMP PerFolderDatabase::GetFilterEnumerator(
     const nsTArray<RefPtr<nsIMsgSearchTerm>>& searchTerms, bool reverse,
     nsIMsgEnumerator** aRetVal) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aRetVal);
+  *aRetVal = nullptr;
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+  nsresult rv;
+  nsCOMPtr<nsIMsgSearchSession> session =
+      do_CreateInstance("@mozilla.org/messenger/searchSession;1", &rv);
+  MOZ_TRY(rv);
+  MOZ_TRY(session->AddScopeTerm(nsMsgSearchScope::offlineMail, folder));
+  for (const auto& term : searchTerms) {
+    NS_ENSURE_ARG(term);
+    MOZ_TRY(session->AppendTerm(term));
+  }
+  nsTArray<nsMsgKey> keys;
+  MOZ_TRY(ListAllKeys(keys));
+  if (reverse) {
+    std::reverse(keys.begin(), keys.end());
+  }
+  RefPtr<FilterEnumerator> enumerator =
+      new FilterEnumerator(this, session, std::move(keys));
+  enumerator.forget(aRetVal);
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::SyncCounts() {
   return NS_ERROR_NOT_IMPLEMENTED;
@@ -656,11 +811,65 @@ NS_IMETHODIMP PerFolderDatabase::ApplyRetentionSettings(
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgDownloadSettings(
     nsIMsgDownloadSettings** aMsgDownloadSettings) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aMsgDownloadSettings);
+  *aMsgDownloadSettings = nullptr;
+  MOZ_TRY(CheckFolderExists());
+  RefPtr<FolderInfo> info = new FolderInfo(this);
+  bool useDefaults, byDate, unreadOnly;
+  uint32_t ageLimit;
+  MOZ_TRY(info->GetBooleanProperty("useServerDefaults", true, &useDefaults));
+  MOZ_TRY(info->GetBooleanProperty("downloadByDate", false, &byDate));
+  MOZ_TRY(info->GetBooleanProperty("downloadUnreadOnly", false, &unreadOnly));
+  MOZ_TRY(info->GetUint32Property("ageLimit", 0, &ageLimit));
+  nsresult rv;
+  nsCOMPtr<nsIMsgDownloadSettings> settings =
+      do_CreateInstance("@mozilla.org/msgDatabase/downloadSettings;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(settings->SetUseServerDefaults(useDefaults));
+  MOZ_TRY(settings->SetDownloadByDate(byDate));
+  MOZ_TRY(settings->SetDownloadUnreadOnly(unreadOnly));
+  MOZ_TRY(settings->SetAgeLimitOfMsgsToDownload(ageLimit));
+  settings.forget(aMsgDownloadSettings);
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::SetMsgDownloadSettings(
     nsIMsgDownloadSettings* aMsgDownloadSettings) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(CheckFolderExists());
+  if (!aMsgDownloadSettings) {
+    return NS_OK;
+  }
+  bool useDefaults, byDate, unreadOnly;
+  uint32_t ageLimit;
+  MOZ_TRY(aMsgDownloadSettings->GetUseServerDefaults(&useDefaults));
+  MOZ_TRY(aMsgDownloadSettings->GetDownloadByDate(&byDate));
+  MOZ_TRY(aMsgDownloadSettings->GetDownloadUnreadOnly(&unreadOnly));
+  MOZ_TRY(aMsgDownloadSettings->GetAgeLimitOfMsgsToDownload(&ageLimit));
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool inTransaction;
+  MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
+  NS_ENSURE_FALSE(inTransaction, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  RefPtr<FolderInfo> info = new FolderInfo(this);
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(info->SetBooleanProperty("useServerDefaults", useDefaults));
+    MOZ_TRY(info->SetBooleanProperty("downloadByDate", byDate));
+    MOZ_TRY(info->SetBooleanProperty("downloadUnreadOnly", unreadOnly));
+    MOZ_TRY(info->SetUint32Property("ageLimit", ageLimit));
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&inTransaction);
+    if (NS_SUCCEEDED(cleanupRv) && inTransaction) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Download settings rollback failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+  }
+  return rv;
 }
 NS_IMETHODIMP PerFolderDatabase::HasNew(bool* aHasNew) {
   NS_ENSURE_ARG_POINTER(aHasNew);

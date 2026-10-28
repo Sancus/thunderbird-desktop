@@ -437,7 +437,10 @@ NS_IMETHODIMP Message::SetAccountKey(const nsACString& accountKey) {
 
 NS_IMETHODIMP Message::GetFolder(nsIMsgFolder** aFolder) {
   NS_ENSURE_ARG_POINTER(aFolder);
-  return FolderDB().GetMsgFolderForFolder(FolderId(), aFolder);
+  *aFolder = nullptr;
+  uint64_t folderId;
+  MOZ_TRY(MessageDB().GetMessageFolderId(mKey, folderId));
+  return FolderDB().GetMsgFolderForFolder(folderId, aFolder);
 }
 
 NS_IMETHODIMP Message::GetIsLive(bool* isLive) {

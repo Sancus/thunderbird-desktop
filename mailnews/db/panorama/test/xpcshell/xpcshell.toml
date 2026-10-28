@@ -20,6 +20,16 @@ tags = ["panorama"]
 
 ["test_delete.js"]
 
+["test_deliveryCompatibilityCopyHdr.js"]
+
+["test_deliveryCompatibilityDownloadSettings.js"]
+
+["test_deliveryCompatibilityFilterEnumerator.js"]
+
+["test_deliveryCompatibilityFolderRouting.js"]
+
+["test_deliveryCompatibilityUidValidity.js"]
+
 ["test_deliveryCoreSearchState.js"]
 
 ["test_findFolders.js"]

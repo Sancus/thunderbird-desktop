@@ -1409,35 +1409,30 @@ NS_IMETHODIMP nsMsgDBFolder::SetRetentionSettings(
 NS_IMETHODIMP nsMsgDBFolder::GetDownloadSettings(
     nsIMsgDownloadSettings** settings) {
   NS_ENSURE_ARG_POINTER(settings);
-  nsresult rv = NS_OK;
-  if (!m_downloadSettings) {
-    GetDatabase();
-    if (mDatabase) {
-      // get the settings from the db - if the settings from the db say the
-      // folder is not overriding the incoming server settings, get the settings
-      // from the server.
-      rv =
-          mDatabase->GetMsgDownloadSettings(getter_AddRefs(m_downloadSettings));
-      if (NS_SUCCEEDED(rv) && m_downloadSettings) {
-        bool useServerDefaults;
-        m_downloadSettings->GetUseServerDefaults(&useServerDefaults);
-        if (useServerDefaults) {
-          nsCOMPtr<nsIMsgIncomingServer> incomingServer;
-          rv = GetServer(getter_AddRefs(incomingServer));
-          if (NS_SUCCEEDED(rv) && incomingServer)
-            incomingServer->GetDownloadSettings(
-                getter_AddRefs(m_downloadSettings));
-        }
-      }
-    }
+  *settings = nullptr;
+  MOZ_TRY(GetDatabase());
+  NS_ENSURE_TRUE(mDatabase, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDownloadSettings> stored;
+  MOZ_TRY(mDatabase->GetMsgDownloadSettings(getter_AddRefs(stored)));
+  NS_ENSURE_TRUE(stored, NS_ERROR_NOT_AVAILABLE);
+  bool useDefaults;
+  MOZ_TRY(stored->GetUseServerDefaults(&useDefaults));
+  if (useDefaults) {
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    MOZ_TRY(GetServer(getter_AddRefs(server)));
+    NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+    return server->GetDownloadSettings(settings);
   }
-  NS_IF_ADDREF(*settings = m_downloadSettings);
-  return rv;
+  stored.forget(settings);
+  return NS_OK;
 }
 
 NS_IMETHODIMP nsMsgDBFolder::SetDownloadSettings(
     nsIMsgDownloadSettings* settings) {
-  m_downloadSettings = settings;
+  MOZ_TRY(GetDatabase());
+  NS_ENSURE_TRUE(mDatabase, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(mDatabase->SetMsgDownloadSettings(settings));
+  m_downloadSettings = nullptr;
   return NS_OK;
 }
 
@@ -1499,49 +1494,70 @@ nsresult nsMsgDBFolder::StartNewOfflineMessage() {
 
 // Only news and IMAP folders use this.
 nsresult nsMsgDBFolder::EndNewOfflineMessage(nsresult status) {
-  // Whatever happens, we want to unlock the folder, release the output
-  // stream and offlineHeader objects.
+  // Detach this attempt before metadata notifications can re-enter the folder.
+  nsCOMPtr<nsIMsgDBHdr> header;
+  header.swap(m_offlineHeader);
+  nsCOMPtr<nsIOutputStream> stream;
+  stream.swap(m_tempMessageStream);
+  uint32_t size = m_tempMessageStreamBytesWritten;
+  uint32_t lines = m_numOfflineMsgLines;
   auto guard = mozilla::MakeScopeExit([&] {
-    ReleaseSemaphore(static_cast<nsIMsgFolder*>(this),
-                     "nsMsgDBFolder::EndNewOfflineMessage"_ns);
-    m_tempMessageStream = nullptr;
-    m_offlineHeader = nullptr;
+    if (!m_tempMessageStream) {
+      ReleaseSemaphore(static_cast<nsIMsgFolder*>(this),
+                       "nsMsgDBFolder::EndNewOfflineMessage"_ns);
+    }
   });
 
-  nsMsgKey messageKey;
-
-  nsresult rv = GetDatabase();
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  m_offlineHeader->GetMessageKey(&messageKey);
-
-  nsCOMPtr<nsIMsgPluggableStore> msgStore;
-  rv = GetMsgStore(getter_AddRefs(msgStore));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // Are we being asked to abort and clean up?
-  if (NS_FAILED(status)) {
-    mDatabase->MarkOffline(messageKey, false, nullptr);
-    if (m_tempMessageStream) {
-      msgStore->DiscardNewMessage(this, m_tempMessageStream);
+  // Preserve the first failure, including the caller's write error.
+  nsresult result = status;
+  auto recordError = [&](nsresult rv) {
+    if (NS_FAILED(rv)) {
+      if (NS_SUCCEEDED(result)) {
+        result = rv;
+      } else {
+        MOZ_LOG(gFolderLockLog, LogLevel::Error,
+                ("Offline message cleanup failed: 0x%08x",
+                 static_cast<uint32_t>(rv)));
+      }
     }
-    return NS_OK;
+  };
+  nsMsgKey key = nsMsgKey_None;
+  recordError(header ? header->GetMessageKey(&key) : NS_ERROR_NOT_INITIALIZED);
+  nsresult dbRv = GetDatabase();
+  recordError(dbRv);
+  nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+  if (NS_SUCCEEDED(dbRv) && !db) {
+    recordError(NS_ERROR_NOT_AVAILABLE);
+  }
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  recordError(GetMsgStore(getter_AddRefs(store)));
+  if (!store) {
+    recordError(NS_ERROR_NOT_AVAILABLE);
+  }
+  if (!stream) {
+    recordError(NS_ERROR_NOT_INITIALIZED);
   }
 
-  // Success! Finalise the message.
+  if (NS_FAILED(result)) {
+    if (NS_SUCCEEDED(dbRv) && db && key != nsMsgKey_None) {
+      recordError(db->MarkOffline(key, false, nullptr));
+    }
+    if (store && stream) {
+      recordError(store->DiscardNewMessage(this, stream));
+    }
+    return result;
+  }
+
+  // Once Finish is attempted, settlement may be uncertain. Do not replay or
+  // discard it here, including when later metadata writes fail.
   nsAutoCString storeToken;
-  rv = msgStore->FinishNewMessage(this, m_tempMessageStream, storeToken);
+  nsresult rv = store->FinishNewMessage(this, stream, storeToken);
   NS_ENSURE_SUCCESS(rv, rv);
-
-  rv = m_offlineHeader->SetStoreToken(storeToken);
-  NS_ENSURE_SUCCESS(rv, rv);
-  mDatabase->MarkOffline(messageKey, true, nullptr);
-  rv = m_offlineHeader->SetOfflineMessageSize(m_tempMessageStreamBytesWritten);
-  NS_ENSURE_SUCCESS(rv, rv);
-  rv = m_offlineHeader->SetLineCount(m_numOfflineMsgLines);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  return NS_OK;
+  NS_ENSURE_FALSE(storeToken.IsEmpty(), NS_ERROR_UNEXPECTED);
+  MOZ_TRY(header->SetStoreToken(storeToken));
+  MOZ_TRY(header->SetOfflineMessageSize(size));
+  MOZ_TRY(header->SetLineCount(lines));
+  return db->MarkOffline(key, true, nullptr);
 }
 
 class AutoCompactEvent : public mozilla::Runnable {

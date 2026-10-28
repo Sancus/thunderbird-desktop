@@ -31,6 +31,9 @@ class nsPop3Sink : public nsIPop3Sink {
  protected:
   virtual ~nsPop3Sink();
   nsresult WriteLineToMailbox(const nsACString& buffer);
+  nsresult IncorporateBeginInternal(const char* uidlString, uint32_t flags);
+  nsresult IncorporateCompleteInternal(nsIMsgWindow* msgWindow, int32_t size);
+  nsresult RecordIncorporateResult(nsresult status);
   nsresult ReleaseFolderLock();
   nsresult DiscardStalePartialMessages(nsIPop3Protocol* protocol);
 
@@ -48,6 +51,10 @@ class nsPop3Sink : public nsIPop3Sink {
   nsCOMPtr<nsIMsgPluggableStore> m_msgStore;
   bool m_uidlDownload;
   bool m_buildMessageUri;
+  // Finish owns settlement even when its result is uncertain.
+  bool m_finishCalled = false;
+  // Keep the first failure for the current delivery.
+  nsresult m_incorporateStatus = NS_OK;
   nsCOMPtr<nsIMsgWindow> m_window;
   nsCString m_messageUri;
   nsCString m_baseMessageUri;

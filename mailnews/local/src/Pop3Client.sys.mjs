@@ -1534,8 +1534,7 @@ export class Pop3Client {
           );
         } catch (e) {
           this._logger.error(`Incorporate begin FAILED! ${e.message}`, e);
-          this._actionError("pop3MessageWriteError");
-          this._sink.incorporateAbort();
+          this._actionMessageWriteError(e);
           return;
         }
       } else {
@@ -1554,8 +1553,7 @@ export class Pop3Client {
           this._sink.incorporateWrite(line, line.length);
         } catch (e) {
           this._logger.error(`Incorporate write FAILED! ${e.message}`, e);
-          this._actionError("pop3MessageWriteError");
-          this._sink.incorporateAbort();
+          this._actionMessageWriteError(e);
           throw e; // Stop reading.
         }
         this._sendNoopIfInactive();
@@ -1569,8 +1567,7 @@ export class Pop3Client {
           );
         } catch (e) {
           this._logger.error(`Incorporate complete FAILED! ${e.message}`, e);
-          this._actionError("pop3MessageWriteError");
-          this._sink.incorporateAbort();
+          this._actionMessageWriteError(e);
           return;
         }
 
@@ -1622,8 +1619,7 @@ export class Pop3Client {
         this._sink.incorporateBegin(this._currentMessage.uidl, 0);
       } catch (e) {
         this._logger.error(`Incorporate begin FAILED! ${e.message}`, e);
-        this._actionError("pop3MessageWriteError");
-        this._sink.incorporateAbort();
+        this._actionMessageWriteError(e);
         return;
       }
     }
@@ -1635,8 +1631,7 @@ export class Pop3Client {
           this._sink.incorporateWrite(line, line.length);
         } catch (e) {
           this._logger.error(`Incorporate write FAILED! ${e.message}`, e);
-          this._actionError("pop3MessageWriteError");
-          this._sink.incorporateAbort();
+          this._actionMessageWriteError(e);
           throw e; // Stop reading.
         }
         this._sendNoopIfInactive();
@@ -1651,8 +1646,7 @@ export class Pop3Client {
           );
         } catch (e) {
           this._logger.error(`Incorporate complete FAILED! ${e.message}`, e);
-          this._actionError("pop3MessageWriteError");
-          this._sink.incorporateAbort();
+          this._actionMessageWriteError(e);
           return;
         }
         if (this._server.leaveMessagesOnServer) {
@@ -1700,14 +1694,35 @@ export class Pop3Client {
   };
 
   /**
+   * Abort the current write without replacing its original error.
+   *
+   * @param {Error} error - The failed sink operation.
+   */
+  _actionMessageWriteError(error) {
+    const status = error.result || Cr.NS_ERROR_FAILURE;
+    try {
+      this._sink.incorporateAbort();
+    } catch (abortError) {
+      this._logger.error("Incorporate abort failed", abortError);
+    }
+    this._actionError("pop3MessageWriteError", undefined, undefined, status);
+  }
+
+  /**
    * Show an error prompt.
    *
    * @param {string} errorName - An error name corresponds to an entry of
    *   localMsgs.properties.
    * @param {?string[]} errorParams - Params to construct the error message.
    * @param {?string} serverErrorMsg - Error message returned by the server.
+   * @param {nsresult} [status=Cr.NS_ERROR_FAILURE] - Original operation status.
    */
-  _actionError(errorName, errorParams, serverErrorMsg) {
+  _actionError(
+    errorName,
+    errorParams,
+    serverErrorMsg,
+    status = Cr.NS_ERROR_FAILURE
+  ) {
     if (!serverErrorMsg) {
       this._logger.error(`Got an error; name=${errorName}`);
     } else {
@@ -1719,7 +1734,7 @@ export class Pop3Client {
       return;
     }
 
-    this._actionDone(Cr.NS_ERROR_FAILURE);
+    this._actionDone(status);
 
     let msgWindow = this._msgWindow;
     if (!msgWindow) {
@@ -1783,7 +1798,9 @@ export class Pop3Client {
       await this._writeUidlState(true);
     } catch (e) {
       this._logger.error("Done but writing UIDL state FAILED.", e);
-      status = Cr.NS_ERROR_FAILURE;
+      if (Components.isSuccessCode(status)) {
+        status = e.result || Cr.NS_ERROR_FAILURE;
+      }
     }
     // Normally we clean up after QUIT response.
     await this.quit(() => this._cleanUp(status));
@@ -1801,11 +1818,26 @@ export class Pop3Client {
    * @param {nsresult} status - Indicate if the last action succeeded.
    */
   _cleanUp = status => {
+    if (this._cleanedUp) {
+      return;
+    }
     // Ensure no phantom timeouts fire after cleanup.
     this._clearCommandTimeout();
 
     this._cleanedUp = true;
     this.close();
+    if (this._folderLocked) {
+      try {
+        this._sink.abortMailDelivery(this);
+      } catch (error) {
+        this._logger.error("Abort mail delivery failed", error);
+        if (Components.isSuccessCode(status)) {
+          status = error.result || Cr.NS_ERROR_FAILURE;
+        }
+      }
+      this._folderLocked = false;
+      this._logger.debug("Folder lock released.");
+    }
     const runningUrl = {};
     this.runningUri.GetUrlState(runningUrl);
     if (runningUrl.value) {
@@ -1813,11 +1845,6 @@ export class Pop3Client {
     }
     this.runningUri.SetUrlState(false, status);
     this.onDone?.(status);
-    if (this._folderLocked) {
-      this._sink.abortMailDelivery(this);
-      this._folderLocked = false;
-      this._logger.debug("Folder lock released.");
-    }
     this._server.wrappedJSObject.runningClient = null;
     this.onFree?.();
   };

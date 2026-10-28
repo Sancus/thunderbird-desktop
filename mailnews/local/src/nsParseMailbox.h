@@ -135,7 +135,7 @@ class nsParseNewMailState : public nsParseMailMessageState,
 
   NS_DECL_NSIMSGFILTERHITNOTIFY
 
-  virtual void PublishMsgHeader(nsIMsgWindow* msgWindow);
+  virtual nsresult PublishMsgHeader(nsIMsgWindow* msgWindow);
   void GetMsgWindow(nsIMsgWindow** aMsgWindow);
   nsresult EndMsgDownload();
 

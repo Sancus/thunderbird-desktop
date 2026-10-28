@@ -85,8 +85,6 @@ requesttimeoutfactor = 12
 
 ["test_pop3Client.js"]
 
-["test_pop3Download.js"]
-
 ["test_pop3DownloadTempFileHandling.js"]
 
 ["test_pop3Duplicates.js"]

@@ -39,6 +39,7 @@
 #include "nsIMimeConverter.h"
 #include "mozilla/Components.h"
 #include "mozilla/Preferences.h"
+#include "mozilla/ResultExtensions.h"
 #include "mozilla/ScopeExit.h"
 #include "mozilla/StaticPrefs_mail.h"
 #include "mozilla/Utf8.h"
@@ -282,8 +283,8 @@ NS_IMETHODIMP nsParseMailMessageState::SetMsgUid(ImapUid uid) {
 
 NS_IMETHODIMP nsParseMailMessageState::FinishHeader() {
   if (m_newMsgHdr) {
-    m_newMsgHdr->SetMessageSize(m_position - m_envelope_pos);
-    m_newMsgHdr->SetLineCount(m_body_lines);
+    MOZ_TRY(m_newMsgHdr->SetMessageSize(m_position - m_envelope_pos));
+    MOZ_TRY(m_newMsgHdr->SetLineCount(m_body_lines));
   }
   return NS_OK;
 }
@@ -1194,49 +1195,54 @@ void nsParseNewMailState::DoneParsing() {
   }
 }
 
-void nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
+nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
   bool moved = false;
-  FinishHeader();
+  MOZ_TRY(FinishHeader());
 
   if (m_newMsgHdr) {
     uint32_t newFlags, oldFlags;
-    m_newMsgHdr->GetFlags(&oldFlags);
+    MOZ_TRY(m_newMsgHdr->GetFlags(&oldFlags));
     if (!(oldFlags &
           nsMsgMessageFlags::Read))  // don't mark read messages as new.
-      m_newMsgHdr->OrFlags(nsMsgMessageFlags::New, &newFlags);
+      MOZ_TRY(m_newMsgHdr->OrFlags(nsMsgMessageFlags::New, &newFlags));
 
     if (!m_disableFilters) {
       nsCOMPtr<nsIMsgIncomingServer> server;
       nsresult rv = m_rootFolder->GetServer(getter_AddRefs(server));
-      NS_ENSURE_SUCCESS_VOID(rv);
+      NS_ENSURE_SUCCESS(rv, rv);
       int32_t duplicateAction;
-      server->GetIncomingDuplicateAction(&duplicateAction);
+      MOZ_TRY(server->GetIncomingDuplicateAction(&duplicateAction));
       if (duplicateAction != nsIMsgIncomingServer::keepDups) {
         bool isDup;
-        server->IsNewHdrDuplicate(m_newMsgHdr, &isDup);
+        MOZ_TRY(server->IsNewHdrDuplicate(m_newMsgHdr, &isDup));
         if (isDup) {
           // we want to do something similar to applying filter hits.
           // if a dup is marked read, it shouldn't trigger biff.
           // Same for deleting it or moving it to trash.
           switch (duplicateAction) {
             case nsIMsgIncomingServer::deleteDups: {
-              if (NS_FAILED(HardDeleteDetachedMessage(m_downloadFolder,
-                                                      m_mailDB, m_newMsgHdr))) {
+              rv = HardDeleteDetachedMessage(m_downloadFolder, m_mailDB,
+                                             m_newMsgHdr);
+              if (NS_FAILED(rv)) {
                 m_rootFolder->ThrowAlertMsg("dupDeleteFolderTruncateFailed",
                                             msgWindow);
+                return rv;
               }
             } break;
 
             case nsIMsgIncomingServer::moveDupsToTrash: {
               nsCOMPtr<nsIMsgFolder> trash;
-              GetTrashFolder(getter_AddRefs(trash));
+              MOZ_TRY(GetTrashFolder(getter_AddRefs(trash)));
+              NS_ENSURE_TRUE(trash, NS_ERROR_FAILURE);
               if (trash) {
                 uint32_t newFlags;
-                m_newMsgHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags);
+                MOZ_TRY(
+                    m_newMsgHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags));
                 rv = MoveIncorporatedMessage(m_newMsgHdr, m_mailDB, trash,
                                              nullptr, msgWindow);
                 if (NS_FAILED(rv)) {
                   NS_WARNING("moveDupsToTrash failed for some reason.");
+                  return rv;
                 }
               }
             } break;
@@ -1245,33 +1251,34 @@ void nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
               break;
           }
           int32_t numNewMessages;
-          m_downloadFolder->GetNumNewMessages(false, &numNewMessages);
-          m_downloadFolder->SetNumNewMessages(numNewMessages - 1);
+          MOZ_TRY(m_downloadFolder->GetNumNewMessages(false, &numNewMessages));
+          MOZ_TRY(m_downloadFolder->SetNumNewMessages(numNewMessages - 1));
 
           m_newMsgHdr = nullptr;
-          return;
+          return NS_OK;
         }
       }
 
       ApplyFilters(&moved, msgWindow);
     }
     if (!moved) {
+      NS_ENSURE_STATE(m_mailDB);
       if (m_mailDB) {
         nsresult rv;
         nsCOMPtr<nsIMsgDBHdr> detachedHdr = m_newMsgHdr;
         nsCOMPtr<nsIMsgDBHdr> liveHdr;
         m_newMsgHdr = nullptr;
         rv = m_mailDB->AttachHdr(detachedHdr, true, getter_AddRefs(liveHdr));
-        NS_ENSURE_SUCCESS_VOID(rv);
+        NS_ENSURE_SUCCESS(rv, rv);
         nsCOMPtr<nsIMsgFolderNotificationService> notifier =
             mozilla::components::FolderNotification::Service();
-        notifier->NotifyMsgAdded(liveHdr);
+        MOZ_TRY(notifier->NotifyMsgAdded(liveHdr));
 
         // Mark the header as not yet reported classified.
         nsMsgKey msgKey;
-        liveHdr->GetMessageKey(&msgKey);
-        m_downloadFolder->OrProcessingFlags(
-            msgKey, nsMsgProcessingFlags::NotReportedClassified);
+        MOZ_TRY(liveHdr->GetMessageKey(&msgKey));
+        MOZ_TRY(m_downloadFolder->OrProcessingFlags(
+            msgKey, nsMsgProcessingFlags::NotReportedClassified));
 
         // Ensure the forward/reply pointer is updated to the live header
         // otherwise the compose service may fail on the detached object.
@@ -1283,6 +1290,7 @@ void nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
        // nullptr
     m_newMsgHdr = nullptr;
   }
+  return NS_OK;
 }
 
 nsresult nsParseNewMailState::GetTrashFolder(nsIMsgFolder** pTrashFolder) {
@@ -2054,5 +2062,5 @@ void nsParseNewMailState::UpdateDBFolderInfo() { UpdateDBFolderInfo(m_mailDB); }
 
 // update folder info in db so we know not to reparse.
 void nsParseNewMailState::UpdateDBFolderInfo(nsIMsgDatabase* mailDB) {
-  mailDB->SetSummaryValid(true);
+  if (mailDB) mailDB->SetSummaryValid(true);
 }

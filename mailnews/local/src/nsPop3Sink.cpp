@@ -145,6 +145,11 @@ nsresult nsPop3Sink::DiscardStalePartialMessages(nsIPop3Protocol* protocol) {
 
 NS_IMETHODIMP nsPop3Sink::BeginMailDelivery(bool uidlDownload,
                                             nsIMsgWindow* aMsgWindow) {
+  if (m_outFileStream) {
+    return NS_FAILED(m_incorporateStatus) ? m_incorporateStatus
+                                          : NS_ERROR_IN_PROGRESS;
+  }
+  m_incorporateStatus = NS_OK;
   nsCOMPtr<nsIMsgIncomingServer> server = do_QueryInterface(m_popServer);
   if (!server) return NS_ERROR_UNEXPECTED;
 
@@ -187,6 +192,13 @@ NS_IMETHODIMP nsPop3Sink::BeginMailDelivery(bool uidlDownload,
 }
 
 NS_IMETHODIMP nsPop3Sink::EndMailDelivery(nsIPop3Protocol* protocol) {
+  if (m_outFileStream && NS_SUCCEEDED(m_incorporateStatus)) {
+    RecordIncorporateResult(NS_ERROR_UNEXPECTED);
+  }
+  if (NS_FAILED(m_incorporateStatus)) {
+    AbortMailDelivery(protocol);
+    return m_incorporateStatus;
+  }
   if (!m_uidlDownload) {
     DiscardStalePartialMessages(protocol);
   }
@@ -194,10 +206,6 @@ NS_IMETHODIMP nsPop3Sink::EndMailDelivery(nsIPop3Protocol* protocol) {
   if (m_newMailParser) {
     m_newMailParser->DoneParsing();
     m_newMailParser->EndMsgDownload();
-  }
-  if (m_outFileStream) {
-    m_outFileStream->Close();
-    m_outFileStream = nullptr;
   }
 
   // tell the parser to mark the db valid *after* closing the mailbox.
@@ -274,34 +282,43 @@ nsresult nsPop3Sink::ReleaseFolderLock() {
 }
 
 NS_IMETHODIMP nsPop3Sink::AbortMailDelivery(nsIPop3Protocol* protocol) {
-  // ### PS TODO - discard any new message?
+  IncorporateAbort();
 
-  if (m_outFileStream) {
-    m_outFileStream->Close();
-    m_outFileStream = nullptr;
+  if (!m_outFileStream && m_newMailParser) {
+    m_newMailParser->UpdateDBFolderInfo();
   }
-
-  /* tell the parser to mark the db valid *after* closing the mailbox.
-  we have truncated the inbox, so berkeley mailbox and msf file are in sync*/
-  if (m_newMailParser) m_newMailParser->UpdateDBFolderInfo();
   MOZ_LOG(POP3LOGMODULE, mozilla::LogLevel::Debug,
           (POP3LOG("Calling ReleaseFolderLock from AbortMailDelivery")));
 
   nsresult rv = ReleaseFolderLock();
   NS_ASSERTION(NS_SUCCEEDED(rv), "folder lock not released successfully");
+  RecordIncorporateResult(rv);
 
-#ifdef DEBUG
-  printf("Abort mail message delivery.\n");
-#endif
   nsCOMPtr<nsIPop3Service> pop3Service(
       do_GetService("@mozilla.org/messenger/popservice;1", &rv));
-  NS_ENSURE_SUCCESS(rv, rv);
-  pop3Service->NotifyDownloadCompleted(m_folder, 0);
-  return NS_OK;
+  if (NS_SUCCEEDED(rv)) {
+    rv = pop3Service->NotifyDownloadCompleted(m_folder, 0);
+  }
+  return RecordIncorporateResult(rv);
+}
+
+nsresult nsPop3Sink::RecordIncorporateResult(nsresult status) {
+  if (NS_SUCCEEDED(m_incorporateStatus) && NS_FAILED(status)) {
+    m_incorporateStatus = status;
+  }
+  return NS_FAILED(m_incorporateStatus) ? m_incorporateStatus : status;
 }
 
 NS_IMETHODIMP nsPop3Sink::IncorporateBegin(const char* uidlString,
                                            uint32_t flags) {
+  if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
+  if (m_outFileStream) return RecordIncorporateResult(NS_ERROR_IN_PROGRESS);
+  m_finishCalled = false;
+  return RecordIncorporateResult(IncorporateBeginInternal(uidlString, flags));
+}
+
+nsresult nsPop3Sink::IncorporateBeginInternal(const char* uidlString,
+                                              uint32_t flags) {
 #ifdef DEBUG
   printf("Incorporate message begin:\n");
   if (uidlString) printf("uidl string: %s\n", uidlString);
@@ -354,13 +371,7 @@ NS_IMETHODIMP nsPop3Sink::IncorporateBegin(const char* uidlString,
 
   if (m_uidlDownload) m_newMailParser->DisableFilters();
 
-  // If we failed to initialize the parser, then just don't use it!!!
-  // We can still continue without one.
-  if (NS_FAILED(rv)) {
-    m_newMailParser = nullptr;
-    MOZ_LOG(POP3LOGMODULE, mozilla::LogLevel::Warning,
-            (POP3LOG("Failed to initialize m_newMailParser")));
-  }
+  NS_ENSURE_SUCCESS(rv, rv);
 
   nsCString outputString;
   // Write out account-key before UIDL so the code that looks for
@@ -392,8 +403,7 @@ NS_IMETHODIMP nsPop3Sink::IncorporateBegin(const char* uidlString,
   NS_ENSURE_SUCCESS(rv, rv);
 
   // leave space for 60 bytes worth of keys/tags
-  rv = WriteLineToMailbox(nsLiteralCString(X_MOZILLA_KEYWORDS));
-  return NS_OK;
+  return WriteLineToMailbox(nsLiteralCString(X_MOZILLA_KEYWORDS));
 }
 
 NS_IMETHODIMP
@@ -444,24 +454,33 @@ NS_IMETHODIMP nsPop3Sink::IncorporateWrite(const char* block, int32_t length) {
 }
 
 nsresult nsPop3Sink::WriteLineToMailbox(const nsACString& buffer) {
-  if (!buffer.IsEmpty()) {
-    uint32_t bufferLen = buffer.Length();
-    if (m_newMailParser)
-      m_newMailParser->HandleLine(buffer.BeginReading(), bufferLen);
-    // The following (!m_outFileStream etc) was added to make sure that we don't
-    // write somewhere where for some reason or another we can't write to and
-    // lose the messages See bug 62480
-    NS_ENSURE_TRUE(m_outFileStream, NS_ERROR_OUT_OF_MEMORY);
-
-    nsresult rv =
-        SyncWriteAll(m_outFileStream, buffer.BeginReading(), bufferLen);
-    NS_ENSURE_SUCCESS(rv, rv);
+  if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
+  if (buffer.IsEmpty()) return NS_OK;
+  if (!m_outFileStream) {
+    return RecordIncorporateResult(NS_ERROR_NOT_INITIALIZED);
   }
-  return NS_OK;
+  nsresult rv =
+      SyncWriteAll(m_outFileStream, buffer.BeginReading(), buffer.Length());
+  if (NS_SUCCEEDED(rv) && m_newMailParser) {
+    rv = m_newMailParser->HandleLine(buffer.BeginReading(), buffer.Length());
+  }
+  return RecordIncorporateResult(rv);
 }
 
 NS_IMETHODIMP nsPop3Sink::IncorporateComplete(nsIMsgWindow* aMsgWindow,
                                               int32_t aSize) {
+  if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
+  if (m_finishCalled) {
+    return RecordIncorporateResult(NS_ERROR_ALREADY_INITIALIZED);
+  }
+  if (!m_outFileStream)
+    return RecordIncorporateResult(NS_ERROR_NOT_INITIALIZED);
+  return RecordIncorporateResult(
+      IncorporateCompleteInternal(aMsgWindow, aSize));
+}
+
+nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
+                                                 int32_t aSize) {
   if (m_buildMessageUri && !m_baseMessageUri.IsEmpty() && m_newMailParser) {
     nsCOMPtr<nsIMsgDBHdr> hdr;
     m_newMailParser->GetNewMsgHdr(getter_AddRefs(hdr));
@@ -512,19 +531,28 @@ NS_IMETHODIMP nsPop3Sink::IncorporateComplete(nsIMsgWindow* aMsgWindow,
                : localFolder->RetrieveHdrOfPartialMessage(
                      hdr, getter_AddRefs(oldMsgHdr));
       if (NS_SUCCEEDED(rv) && oldMsgHdr) {
-        localFolder->UpdateNewMsgHdr(oldMsgHdr, hdr);
+        rv = localFolder->UpdateNewMsgHdr(oldMsgHdr, hdr);
+        NS_ENSURE_SUCCESS(rv, rv);
       }
     }
 
+    if (aSize) {
+      rv = hdr->SetUint32Property("onlineSize", aSize);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+    m_finishCalled = true;
     nsAutoCString storeToken;
     rv = m_msgStore->FinishNewMessage(m_folder, m_outFileStream, storeToken);
     NS_ENSURE_SUCCESS(rv, rv);
+    // The provider owns finalization. Never Close or Discard after Finish.
+    m_outFileStream = nullptr;
     rv = hdr->SetStoreToken(storeToken);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    m_newMailParser->PublishMsgHeader(aMsgWindow);
-    m_newMailParser->ApplyForwardAndReplyFilter(aMsgWindow);
-    if (aSize) hdr->SetUint32Property("onlineSize", aSize);
+    rv = m_newMailParser->PublishMsgHeader(aMsgWindow);
+    NS_ENSURE_SUCCESS(rv, rv);
+    // The message is published; forward/reply failures do not undo delivery.
+    (void)m_newMailParser->ApplyForwardAndReplyFilter(aMsgWindow);
 
     if (oldMsgHdr) {
       // We had the partial message, but got the full now.
@@ -573,16 +601,17 @@ NS_IMETHODIMP nsPop3Sink::IncorporateComplete(nsIMsgWindow* aMsgWindow,
 }
 
 NS_IMETHODIMP nsPop3Sink::IncorporateAbort() {
-  if (m_msgStore && m_newMailParser) {
-    nsCOMPtr<nsIMsgDBHdr> hdr;
-    m_newMailParser->GetNewMsgHdr(getter_AddRefs(hdr));
-    m_msgStore->DiscardNewMessage(m_folder, m_outFileStream);
+  if (m_outFileStream && !m_finishCalled) {
+    nsresult rv = m_msgStore->DiscardNewMessage(m_folder, m_outFileStream);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "Could not discard unfinished POP3 write");
+    RecordIncorporateResult(rv);
+    if (NS_SUCCEEDED(rv)) m_outFileStream = nullptr;
   }
-  m_outFileStream = nullptr;
-#ifdef DEBUG
-  printf("Incorporate message abort.\n");
-#endif
-  return NS_OK;
+  // A failed/uncertain Finish retains its stream and provider identity.
+  // Drop only the unpublished draft, so later cleanup cannot publish it.
+  if (m_newMailParser) m_newMailParser->SetNewMsgHdr(nullptr);
+  return m_incorporateStatus;
 }
 
 NS_IMETHODIMP nsPop3Sink::SetBiffStateAndUpdateFE(uint32_t aBiffState,

@@ -3075,17 +3075,16 @@ var FeedSubscriptions = {
                 .QueryInterface(Ci.nsIMsgLocalMailFolder)
                 .createLocalSubfolder(folderName);
             } catch (exception) {
-              // An error creating. Skip it.
+              // A failed create does not establish ownership of a folder.
               FeedUtils.log.info(
                 "importOPMLOutlines: skipping, error creating folder - '" +
                   folderName +
                   "' from outlineName - '" +
                   outlineName +
                   "' in parent folder " +
-                  aParentFolder.filePath.path
+                  aParentFolder.filePath.path,
+                exception
               );
-              const xfolder = aParentFolder.getChildNamed(folderName);
-              aParentFolder.propagateDelete(xfolder, true);
               badTag = true;
               break;
             }

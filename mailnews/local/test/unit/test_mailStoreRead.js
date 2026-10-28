@@ -19,6 +19,18 @@ add_setup(function setupStoreReads() {
     }
   });
   localAccountUtils.clearAll();
+});
+
+/**
+ * Create a local account before checking the selected database and store.
+ *
+ * @param {string} contract - Store contract.
+ * @param {string} storeType - Expected store type.
+ * @returns {nsIMsgLocalMailFolder} The local inbox.
+ */
+function loadStore(contract, storeType) {
+  localAccountUtils.loadLocalMailAccount(contract);
+  const folder = localAccountUtils.inboxFolder;
   const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIMsgDBService
   );
@@ -27,7 +39,10 @@ add_setup(function setupStoreReads() {
     Services.prefs.getBoolPref("mail.panorama.enabled", false),
     "The active database service matches the selected backend"
   );
-});
+  Assert.equal(folder.msgStore.storeType, storeType);
+  Assert.equal(folder.server.msgStore.storeType, storeType);
+  return folder;
+}
 
 /**
  * Read a provider stream, including closing it on a read error.
@@ -56,19 +71,12 @@ function readAll(stream) {
  * Corrupt mbox tokens must fail instead of selecting a different body.
  */
 add_task(async function test_mboxReadTokenValidation() {
-  Services.prefs.setCharPref(
-    "mail.serverDefaultStoreContractID",
-    "@mozilla.org/msgstore/berkeleystore;1"
-  );
   try {
-    localAccountUtils.loadLocalMailAccount();
-    const folder = localAccountUtils.inboxFolder;
+    const folder = loadStore("@mozilla.org/msgstore/berkeleystore;1", "mbox");
     const store = folder.msgStore;
-    Assert.equal(store.storeType, "mbox");
-    Assert.equal(folder.server.msgStore.storeType, "mbox");
     const messages = [
-      "Subject: First offset\r\n\r\nFirst exact body.\r\n",
-      "Subject: Later offset\r\n\r\nLater exact body.\r\n",
+      "From: first@example.invalid\r\nSubject: First offset\r\n\r\nFirst exact body.\r\n",
+      "From: later@example.invalid\r\nSubject: Later offset\r\n\r\nLater exact body.\r\n",
     ];
     const tokens = [];
     for (const message of messages) {
@@ -76,6 +84,8 @@ add_task(async function test_mboxReadTokenValidation() {
       stream.write(message, message.length);
       tokens.push(store.finishNewMessage(folder, stream));
     }
+    Assert.equal(tokens[0], "0", "The first message starts at offset zero");
+    Assert.notEqual(tokens[1], "0", "The later message has its own location");
     const bytes = await IOUtils.read(folder.filePath.path);
     for (const token of [
       "",
@@ -121,18 +131,11 @@ add_task(async function test_mboxReadTokenValidation() {
  * A failed read must leave a missing maildir directory missing.
  */
 add_task(async function test_maildirReadMissingDirectory() {
-  Services.prefs.setCharPref(
-    "mail.serverDefaultStoreContractID",
-    "@mozilla.org/msgstore/maildirstore;1"
-  );
   try {
-    localAccountUtils.loadLocalMailAccount();
-    const folder = localAccountUtils.inboxFolder;
+    const folder = loadStore("@mozilla.org/msgstore/maildirstore;1", "maildir");
     const cur = PathUtils.join(folder.filePath.path, "cur");
     const saved = PathUtils.join(folder.filePath.path, "cur-for-read");
     const store = folder.msgStore;
-    Assert.equal(store.storeType, "maildir");
-    Assert.equal(folder.server.msgStore.storeType, "maildir");
     const message = "Subject: Retained maildir body\r\n\r\nExact body.\r\n";
     const stream = store.getNewMsgOutputStream(folder);
     stream.write(message, message.length);

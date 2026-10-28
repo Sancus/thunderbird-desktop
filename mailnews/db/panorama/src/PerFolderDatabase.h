@@ -49,11 +49,21 @@ class PerFolderDatabase : public nsIMsgDatabase,
   uint64_t FolderId() { return mFolderId; }
 
  private:
-  virtual ~PerFolderDatabase() {};
+   friend class FolderInfo;
 
+   virtual ~PerFolderDatabase(){};
+
+   FolderDatabase& FolderDB() const
+   {
+    return *DatabaseCore::sInstance->mFolderDatabase;
+   }
   MessageDatabase& MessageDB() const {
     return *DatabaseCore::sInstance->mMessageDatabase;
   }
+  nsresult CheckFolderExists() const;
+  nsresult GetMsgHdrForProperty(const nsACString& name,
+                                const nsACString& value,
+                                nsIMsgDBHdr** result);
 
   uint64_t mFolderId;
   bool mIsNewsFolder;

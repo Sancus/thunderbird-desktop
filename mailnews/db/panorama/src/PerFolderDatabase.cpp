@@ -9,20 +9,22 @@
 #include "MailNewsTypes.h"
 #include "Message.h"
 #include "MessageDatabase.h"
-#include "mozilla/CheckedInt.h"
-#include "mozilla/RefPtr.h"
-#include "mozilla/Preferences.h"
+#include "SearchFolderHits.h"
+#include "Thread.h"
 #include "mozIStorageBindingParams.h"
 #include "mozIStorageBindingParamsArray.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/RefPtr.h"
+#include "nsIInputStream.h"
 #include "nsIMsgDBView.h"
+#include "nsIMsgPluggableStore.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
 #include "nsServiceManagerUtils.h"
-#include "SearchFolderHits.h"
-#include "Thread.h"
 
 namespace mozilla::mailnews {
 
@@ -183,8 +185,34 @@ NS_IMETHODIMP PerFolderDatabase::GetDatabaseSize(int64_t* databaseSize) {
   *databaseSize = 0;
   return NS_OK;
 }
+nsresult
+PerFolderDatabase::CheckFolderExists() const
+{
+  CheckedInt<int64_t> id(mFolderId);
+  NS_ENSURE_TRUE(mFolderId && id.isValid(), NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement("PerFolderDatabaseFolderExists"_ns,
+                                     "SELECT 1 FROM folders WHERE id = :id"_ns,
+                                     getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id.value()));
+  bool exists;
+  MOZ_TRY(stmt->ExecuteStep(&exists));
+  return exists ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+
 NS_IMETHODIMP PerFolderDatabase::GetFolder(nsIMsgFolder** aFolder) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aFolder);
+  *aFolder = nullptr;
+  MOZ_TRY(CheckFolderExists());
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(FolderDB().GetMsgFolderForFolder(mFolderId, getter_AddRefs(folder)));
+  NS_ENSURE_TRUE(folder, NS_ERROR_NOT_AVAILABLE);
+  uint64_t id;
+  MOZ_TRY(folder->GetId(&id));
+  NS_ENSURE_TRUE(id == mFolderId, NS_ERROR_UNEXPECTED);
+  folder.forget(aFolder);
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::GetLastUseTime(PRTime* aLastUseTime) {
   return NS_ERROR_NOT_IMPLEMENTED;
@@ -195,6 +223,11 @@ NS_IMETHODIMP PerFolderDatabase::SetLastUseTime(PRTime aLastUseTime) {
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForKey(nsMsgKey key,
                                                  nsIMsgDBHdr** msgHdr) {
   NS_ENSURE_ARG_POINTER(msgHdr);
+  *msgHdr = nullptr;
+  MOZ_TRY(CheckFolderExists());
+  bool exists;
+  MOZ_TRY(MessageDB().MessageExists(key, exists));
+  NS_ENSURE_TRUE(exists, NS_ERROR_ILLEGAL_VALUE);
 
   RefPtr<Message> message;
   MOZ_TRY(MessageDB().GetMessage(key, getter_AddRefs(message)));
@@ -214,25 +247,60 @@ NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForKey(nsMsgKey key,
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForMessageID(const char* messageID,
                                                        nsIMsgDBHdr** msgHdr) {
   NS_ENSURE_ARG_POINTER(msgHdr);
+  *msgHdr = nullptr;
+  NS_ENSURE_ARG_POINTER(messageID);
+  MOZ_TRY(CheckFolderExists());
 
   RefPtr<Message> message;
   nsresult rv = MessageDB().GetMessageForMessageID(
       mFolderId, nsDependentCString(messageID), getter_AddRefs(message));
-  if (NS_FAILED(rv)) {
+  if (rv == NS_ERROR_UNEXPECTED) {
     return NS_ERROR_ILLEGAL_VALUE;
   }
+  NS_ENSURE_SUCCESS(rv, rv);
   NS_IF_ADDREF(*msgHdr = message);
   return NS_OK;
 }
+nsresult
+PerFolderDatabase::GetMsgHdrForProperty(const nsACString& name,
+                                        const nsACString& value,
+                                        nsIMsgDBHdr** result)
+{
+  NS_ENSURE_ARG_POINTER(result);
+  *result = nullptr;
+  MOZ_TRY(CheckFolderExists());
+  nsTArray<nsMsgKey> keys;
+  MOZ_TRY(ListAllKeys(keys));
+  nsCOMPtr<nsIMsgDBHdr> found;
+  for (nsMsgKey key : keys) {
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
+    nsTArray<nsCString> names;
+    MOZ_TRY(header->GetProperties(names));
+    if (!names.Contains(name)) {
+      continue;
+    }
+    nsAutoCString candidate;
+    MOZ_TRY(
+      header->GetStringProperty(PromiseFlatCString(name).get(), candidate));
+    if (candidate.Equals(value)) {
+      NS_ENSURE_FALSE(found, NS_ERROR_FILE_CORRUPTED);
+      found = header;
+    }
+  }
+  found.forget(result);
+  return NS_OK;
+}
+
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForGMMsgID(
     const char* aGmailMessageID, nsIMsgDBHdr** aRetVal) {
-  NS_ENSURE_ARG_POINTER(aRetVal);
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aGmailMessageID);
+  return GetMsgHdrForProperty(
+    "X-GM-MSGID"_ns, nsDependentCString(aGmailMessageID), aRetVal);
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForEwsItemID(const nsACString& itemID,
                                                        nsIMsgDBHdr** aRetVal) {
-  NS_ENSURE_ARG_POINTER(aRetVal);
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return GetMsgHdrForProperty("ewsId"_ns, itemID, aRetVal);
 }
 
 NS_IMETHODIMP PerFolderDatabase::ContainsKey(nsMsgKey key, bool* contains) {
@@ -548,6 +616,9 @@ NS_IMETHODIMP PerFolderDatabase::UndoDelete(nsIMsgDBHdr* msgHdr) {
 }
 NS_IMETHODIMP PerFolderDatabase::SetStringProperty(
     nsMsgKey key, const char* propertyName, const nsACString& propertyValue) {
+  NS_ENSURE_ARG_POINTER(propertyName);
+  nsCOMPtr<nsIMsgDBHdr> header;
+  MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
   return MessageDB().SetMessageProperty(key, nsDependentCString(propertyName),
                                         propertyValue);
 }
@@ -621,7 +692,48 @@ NS_IMETHODIMP PerFolderDatabase::SetSummaryValid(bool aSummaryValid) {
 }
 NS_IMETHODIMP PerFolderDatabase::ListAllOfflineMsgs(
     nsTArray<nsMsgKey>& aRetVal) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  aRetVal.Clear();
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+  nsTArray<nsMsgKey> keys;
+  MOZ_TRY(ListAllKeys(keys));
+  nsTArray<nsMsgKey> offline;
+  for (nsMsgKey key : keys) {
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
+    uint32_t flags;
+    MOZ_TRY(header->GetFlags(&flags));
+    if (!(flags & nsMsgMessageFlags::Offline) ||
+        (flags & nsMsgMessageFlags::Partial)) {
+      continue;
+    }
+    nsAutoCString token;
+    MOZ_TRY(header->GetStoreToken(token));
+    if (token.IsEmpty()) {
+      continue;
+    }
+    nsCOMPtr<nsIInputStream> stream;
+    nsresult rv =
+      store->GetMsgInputStream(folder, token, 0, getter_AddRefs(stream));
+    if (rv == NS_ERROR_FILE_NOT_FOUND) {
+      continue;
+    }
+    NS_ENSURE_SUCCESS(rv, rv);
+    // Opening an mbox stream alone does not validate the token's offset.
+    char firstByte;
+    uint32_t read;
+    rv = stream->Read(&firstByte, 1, &read);
+    nsresult closeRv = stream->Close();
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_SUCCESS(closeRv, closeRv);
+    if (read) {
+      offline.AppendElement(key);
+    }
+  }
+  aRetVal = std::move(offline);
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::SetAttributeOnPendingHdr(
     nsIMsgDBHdr* pendingHdr, const char* property, const char* propertyVal) {
@@ -976,10 +1088,20 @@ NS_IMETHODIMP FolderInfo::SetExpungedBytes(int64_t aExpungedBytes) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP FolderInfo::GetImapUidValidity(ImapUid* aImapUidValidity) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aImapUidValidity);
+  uint32_t epoch;
+  nsresult rv = FolderDB().GetFolderUidValidity(mFolderId, epoch);
+  if (rv == NS_ERROR_NOT_AVAILABLE) {
+    MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+    epoch = 0;
+  } else {
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  *aImapUidValidity = epoch;
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetImapUidValidity(ImapUid aImapUidValidity) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return FolderDB().SetFolderUidValidity(mFolderId, aImapUidValidity);
 }
 NS_IMETHODIMP FolderInfo::GetVersion(uint32_t* aVersion) {
   return NS_ERROR_NOT_IMPLEMENTED;

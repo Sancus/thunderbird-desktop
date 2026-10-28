@@ -49,6 +49,23 @@ interface nsIDatabaseCore : nsISupports {
   [implicit_jscontext] Promise migrateFolderDatabase(in nsIMsgFolder srcFolder);
 
   /**
+   * Import a checked version1 converted folder snapshot. The request carries
+   * the original folder/store descriptors, source digest and complete records.
+   * Unsupported records reject before insertion. A matching receipt is returned
+   * unchanged on retry. Source/body files are never written or removed.
+   */
+  [implicit_jscontext] Promise importFolderSnapshot(in nsIMsgFolder source,
+                                                   in jsval request);
+
+  /**
+   * Look up the committed receipt for the same version1 identity envelope.
+   * Returns null only when no receipt exists. Conflicting identities and old
+   * hash-only completions throw; callers must retain the database sourceId.
+   */
+  [implicit_jscontext] jsval getFolderImportReceipt(in nsIMsgFolder source,
+                                                    in jsval request);
+
+  /**
    * Access to the database for testing purposes only. If you are not a test,
    * you'll get NS_ERROR_NOT_AVAILABLE instead.
    */

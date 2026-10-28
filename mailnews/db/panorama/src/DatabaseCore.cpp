@@ -4,9 +4,18 @@
 
 #include "DatabaseCore.h"
 
+#include <algorithm>
+#include <cmath>
 #include <utility>
 
 #include "DatabaseUtils.h"
+#include "js/Array.h"
+#include "js/CharacterEncoding.h"
+#include "js/PropertyAndElement.h"
+#include "js/String.h"
+#include "jsapi.h"
+#include "nsJSUtils.h"
+#include "nsIMsgPluggableStore.h"
 #include "FolderDatabase.h"
 #include "Message.h"
 #include "MessageDatabase.h"
@@ -41,7 +50,9 @@
 #include "nsIObserverService.h"
 #include "nsIUUIDGenerator.h"
 #include "nsMsgFolderFlags.h"
+#include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
+#include "nsReadableUtils.h"
 #include "nsNetUtil.h"
 #include "PerFolderDatabase.h"
 #include "xpcpublic.h"
@@ -826,7 +837,7 @@ nsresult HashImportSource(nsIFile* file, const FolderImportSnapshot& input,
   close.release();
   nsCString bytes, hex;
   MOZ_TRY(hash->Finish(false, bytes));
-  for (unsigned char byte : bytes) {
+  for (unsigned char byte : bytes.View()) {
     hex.Append("0123456789abcdef"[byte >> 4]);
     hex.Append("0123456789abcdef"[byte & 15]);
   }
@@ -850,7 +861,7 @@ nsresult DatabaseCore::CheckFolderImportIdentity(
                      identity.folderId && identity.folderId <= INT64_MAX &&
                      identity.sourceSha256.Length() == 64,
                  NS_ERROR_INVALID_ARG);
-  for (char c : identity.sourceSha256) {
+  for (char c : identity.sourceSha256.View()) {
     NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
                    NS_ERROR_INVALID_ARG);
   }
@@ -2082,6 +2093,1059 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
   ~FolderMigrator() = default;
 };
 NS_IMPL_ISUPPORTS(FolderMigrator, nsIRunnable, mozIStorageStatementCallback)
+
+namespace {
+
+nsresult ImportMember(JSContext* cx, JS::HandleObject object, const char* name,
+                      JS::MutableHandleValue value, bool optional = false) {
+  bool present;
+  if (!JS_HasOwnProperty(cx, object, name, &present)) {
+    return NS_ERROR_FAILURE;
+  }
+  NS_ENSURE_TRUE(present || optional, NS_ERROR_INVALID_ARG);
+  if (!present) {
+    value.setUndefined();
+    return NS_OK;
+  }
+  return JS_GetProperty(cx, object, name, value) ? NS_OK : NS_ERROR_FAILURE;
+}
+
+nsresult ImportText(JSContext* cx, JS::HandleValue value, nsACString& output) {
+  NS_ENSURE_TRUE(value.isString(), NS_ERROR_INVALID_ARG);
+  nsAutoJSString text;
+  NS_ENSURE_TRUE(text.init(cx, value), NS_ERROR_OUT_OF_MEMORY);
+  for (uint32_t i = 0; i < text.Length(); ++i) {
+    char16_t c = text[i];
+    if (c >= 0xd800 && c <= 0xdbff) {
+      NS_ENSURE_TRUE(
+          ++i < text.Length() && text[i] >= 0xdc00 && text[i] <= 0xdfff,
+          NS_ERROR_INVALID_ARG);
+    } else {
+      NS_ENSURE_FALSE(c >= 0xdc00 && c <= 0xdfff, NS_ERROR_INVALID_ARG);
+    }
+  }
+  CopyUTF16toUTF8(text, output);
+  return NS_OK;
+}
+
+nsresult ImportNumber(JS::HandleValue value, double minimum, double maximum,
+                      int64_t& output) {
+  NS_ENSURE_TRUE(value.isNumber(), NS_ERROR_INVALID_ARG);
+  double number = value.toNumber();
+  NS_ENSURE_TRUE(std::isfinite(number) && std::trunc(number) == number &&
+                     number >= minimum && number <= maximum,
+                 NS_ERROR_INVALID_ARG);
+  output = static_cast<int64_t>(number);
+  return NS_OK;
+}
+
+nsresult ImportArray(JSContext* cx, JS::HandleValue value,
+                     JS::MutableHandleObject array, uint32_t& length) {
+  bool isArray;
+  if (!JS::IsArrayObject(cx, value, &isArray)) {
+    return NS_ERROR_FAILURE;
+  }
+  NS_ENSURE_TRUE(isArray, NS_ERROR_INVALID_ARG);
+  array.set(&value.toObject());
+  return JS::GetArrayLength(cx, array, &length) ? NS_OK : NS_ERROR_FAILURE;
+}
+
+nsresult ImportHeader(JSContext* cx, JS::HandleValue value, RawHdr& header) {
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject object(cx, &value.toObject());
+  JS::RootedValue field(cx);
+  bool hasKey;
+  NS_ENSURE_TRUE(JS_HasOwnProperty(cx, object, "key", &hasKey),
+                 NS_ERROR_FAILURE);
+  NS_ENSURE_FALSE(hasKey, NS_ERROR_INVALID_ARG);
+  for (auto pair : {std::pair{"messageId", &header.messageId},
+                    {"sender", &header.sender},
+                    {"recipients", &header.recipients},
+                    {"ccList", &header.ccList},
+                    {"bccList", &header.bccList},
+                    {"subject", &header.subject},
+                    {"keywords", &header.keywords},
+                    {"charset", &header.charset},
+                    {"accountKey", &header.accountKey}}) {
+    MOZ_TRY(ImportMember(cx, object, pair.first, &field));
+    MOZ_TRY(ImportText(cx, field, *pair.second));
+  }
+  MOZ_TRY(ImportMember(cx, object, "replyTo", &field, true));
+  if (!field.isUndefined()) {
+    MOZ_TRY(ImportText(cx, field, header.replyTo));
+  }
+  int64_t number;
+  for (auto pair : {std::pair{"date", &header.date},
+                    {"dateReceived", &header.dateReceived}}) {
+    MOZ_TRY(ImportMember(cx, object, pair.first, &field));
+    MOZ_TRY(ImportNumber(field, -9007199254740991., 9007199254740991., number));
+    *pair.second = number;
+  }
+  MOZ_TRY(ImportMember(cx, object, "flags", &field));
+  MOZ_TRY(ImportNumber(field, 0, UINT32_MAX, number));
+  header.flags = number;
+  MOZ_TRY(ImportMember(cx, object, "priority", &field));
+  MOZ_TRY(ImportNumber(field, nsMsgPriority::notSet, nsMsgPriority::highest,
+                       number));
+  header.priority = number;
+  MOZ_TRY(ImportMember(cx, object, "references", &field));
+  JS::RootedObject array(cx);
+  uint32_t length;
+  MOZ_TRY(ImportArray(cx, field, &array, length));
+  for (uint32_t i = 0; i < length; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
+    MOZ_TRY(ImportText(cx, field, *header.references.AppendElement()));
+  }
+  MOZ_TRY(ImportMember(cx, object, "extras", &field));
+  MOZ_TRY(ImportArray(cx, field, &array, length));
+  for (uint32_t i = 0; i < length; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::RootedObject extra(cx, &field.toObject());
+    RawHdr::kv* cell = header.extras.AppendElement();
+    MOZ_TRY(ImportMember(cx, extra, "k", &field));
+    MOZ_TRY(ImportText(cx, field, cell->k));
+    MOZ_TRY(ImportMember(cx, extra, "v", &field));
+    MOZ_TRY(ImportText(cx, field, cell->v));
+  }
+  bool present;
+  MOZ_TRY(ImportMember(cx, object, "storeToken", &field, true));
+  NS_ENSURE_TRUE(JS_HasOwnProperty(cx, object, "storeToken", &present),
+                 NS_ERROR_FAILURE);
+  if (present) {
+    nsCString token;
+    MOZ_TRY(ImportText(cx, field, token));
+    header.storeToken = Some(std::move(token));
+  }
+  for (auto pair : {std::pair{"messageSize", &header.messageSize},
+                    {"offlineMessageSize", &header.offlineMessageSize},
+                    {"lineCount", &header.lineCount}}) {
+    NS_ENSURE_TRUE(JS_HasOwnProperty(cx, object, pair.first, &present),
+                   NS_ERROR_FAILURE);
+    if (present) {
+      MOZ_TRY(ImportMember(cx, object, pair.first, &field));
+      MOZ_TRY(ImportNumber(field, 0, UINT32_MAX, number));
+      *pair.second = Some(static_cast<uint32_t>(number));
+    }
+  }
+  return NS_OK;
+}
+
+// Preserve the original explicit message-only converted-input boundary.
+nsresult CheckProjectedImportRecords(JSContext* cx, JS::HandleObject request,
+                                     const FolderImportSnapshot& input) {
+  JS::RootedValue field(cx);
+  MOZ_TRY(ImportMember(cx, request, "records", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject records(cx, &field.toObject()), rows(cx), tables(cx);
+  uint32_t length;
+  MOZ_TRY(ImportMember(cx, records, "tables", &field));
+  MOZ_TRY(ImportArray(cx, field, &tables, length));
+  NS_ENSURE_TRUE(length <= 1, NS_ERROR_NOT_IMPLEMENTED);
+  if (length) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, tables, 0, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::RootedObject table(cx, &field.toObject()), cells(cx), members(cx);
+    MOZ_TRY(ImportMember(cx, table, "id", &field));
+    int64_t tableId;
+    MOZ_TRY(ImportNumber(field, 0, UINT32_MAX, tableId));
+    MOZ_TRY(ImportMember(cx, table, "scope", &field));
+    nsCString text;
+    MOZ_TRY(ImportText(cx, field, text));
+    NS_ENSURE_TRUE(text.EqualsLiteral("ns:msg:db:row:scope:msgs:all"),
+                   NS_ERROR_NOT_IMPLEMENTED);
+    MOZ_TRY(ImportMember(cx, table, "metaRow", &field));
+    NS_ENSURE_TRUE(field.isNull(), NS_ERROR_NOT_IMPLEMENTED);
+    MOZ_TRY(ImportMember(cx, table, "cells", &field));
+    uint32_t count;
+    MOZ_TRY(ImportArray(cx, field, &cells, count));
+    bool messageKind = false;
+    for (uint32_t i = 0; i < count; ++i) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, cells, i, &field), NS_ERROR_FAILURE);
+      NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+      JS::RootedObject cell(cx, &field.toObject());
+      nsCString name;
+      MOZ_TRY(ImportMember(cx, cell, "k", &field));
+      MOZ_TRY(ImportText(cx, field, name));
+      MOZ_TRY(ImportMember(cx, cell, "v", &field));
+      MOZ_TRY(ImportText(cx, field, text));
+      if (name.EqualsLiteral("k")) {
+        NS_ENSURE_FALSE(messageKind, NS_ERROR_INVALID_ARG);
+        NS_ENSURE_TRUE(text.EqualsLiteral("ns:msg:db:table:kind:msgs"),
+                       NS_ERROR_NOT_IMPLEMENTED);
+        messageKind = true;
+      } else {
+        // Mork's storage layout parameter has no message semantics.
+        NS_ENSURE_TRUE(name.EqualsLiteral("s"), NS_ERROR_NOT_IMPLEMENTED);
+      }
+    }
+    NS_ENSURE_TRUE(messageKind, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportMember(cx, table, "rows", &field));
+    MOZ_TRY(ImportArray(cx, field, &members, count));
+    NS_ENSURE_TRUE(count == input.messages.Length(), NS_ERROR_INVALID_ARG);
+    for (uint32_t i = 0; i < count; ++i) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, members, i, &field), NS_ERROR_FAILURE);
+      MOZ_TRY(ImportText(cx, field, text));
+      nsAutoCString expected;
+      expected.AppendInt(input.messages[i].sourceKey);
+      expected.AppendLiteral(":ns:msg:db:row:scope:msgs:all");
+      NS_ENSURE_TRUE(text == expected, NS_ERROR_INVALID_ARG);
+    }
+  }
+  MOZ_TRY(ImportMember(cx, records, "rows", &field));
+  MOZ_TRY(ImportArray(cx, field, &rows, length));
+  NS_ENSURE_TRUE(length == input.messages.Length(), NS_ERROR_INVALID_ARG);
+  for (uint32_t i = 0; i < length; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, rows, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::RootedObject row(cx, &field.toObject()), cells(cx);
+    MOZ_TRY(ImportMember(cx, row, "id", &field));
+    int64_t id;
+    MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, id));
+    NS_ENSURE_TRUE(id == input.messages[i].sourceKey, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportMember(cx, row, "scope", &field));
+    nsCString scope;
+    MOZ_TRY(ImportText(cx, field, scope));
+    NS_ENSURE_TRUE(scope.EqualsLiteral("ns:msg:db:row:scope:msgs:all"),
+                   NS_ERROR_NOT_IMPLEMENTED);
+    MOZ_TRY(ImportMember(cx, row, "cells", &field));
+    uint32_t count;
+    MOZ_TRY(ImportArray(cx, field, &cells, count));
+    const auto& extras = input.messages[i].header.extras;
+    NS_ENSURE_TRUE(count == extras.Length(), NS_ERROR_INVALID_ARG);
+    for (uint32_t j = 0; j < count; ++j) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, cells, j, &field), NS_ERROR_FAILURE);
+      NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+      JS::RootedObject cell(cx, &field.toObject());
+      for (auto pair : {std::pair{"k", &extras[j].k}, {"v", &extras[j].v}}) {
+        MOZ_TRY(ImportMember(cx, cell, pair.first, &field));
+        NS_ENSURE_TRUE(field.isString(), NS_ERROR_INVALID_ARG);
+        nsAutoJSString bytes;
+        NS_ENSURE_TRUE(bytes.init(cx, field), NS_ERROR_OUT_OF_MEMORY);
+        nsCString raw;
+        for (char16_t c : bytes.View()) {
+          NS_ENSURE_TRUE(c <= 255, NS_ERROR_INVALID_ARG);
+          raw.Append(static_cast<char>(c));
+        }
+        NS_ENSURE_TRUE(raw == *pair.second, NS_ERROR_INVALID_ARG);
+      }
+    }
+  }
+  return NS_OK;
+}
+
+struct ImportSourceRecord {
+  uint32_t id{0};
+  nsCString scope;
+  nsTHashMap<nsCString, nsCString> cells;
+  nsTArray<nsCString> members;
+  nsTHashMap<nsCString, bool> memberSet;
+  nsCString meta;
+  bool accounted{false};
+};
+
+nsCString ImportSourceKey(uint32_t id, const nsACString& scope) {
+  nsCString key;
+  key.AppendInt(uint64_t(id));
+  key.Append(':');
+  key.Append(scope);
+  return key;
+}
+
+nsresult ImportByteText(JSContext* cx, JS::HandleValue value,
+                        nsACString& output) {
+  NS_ENSURE_TRUE(value.isString(), NS_ERROR_INVALID_ARG);
+  nsAutoJSString bytes;
+  NS_ENSURE_TRUE(bytes.init(cx, value), NS_ERROR_OUT_OF_MEMORY);
+  output.Truncate();
+  for (char16_t c : bytes.View()) {
+    NS_ENSURE_TRUE(c <= 255, NS_ERROR_INVALID_ARG);
+    output.Append(char(c));
+  }
+  nsCString roundtrip = NS_ConvertUTF16toUTF8(NS_ConvertUTF8toUTF16(output));
+  NS_ENSURE_TRUE(roundtrip == output, NS_ERROR_INVALID_ARG);
+  return NS_OK;
+}
+
+nsresult ImportSourceRecords(JSContext* cx, JS::HandleValue value, bool tables,
+                             nsTArray<UniquePtr<ImportSourceRecord>>& records,
+                             nsTHashMap<nsCString, uint32_t>& indexes) {
+  JS::RootedObject array(cx);
+  JS::RootedValue field(cx);
+  uint32_t count;
+  MOZ_TRY(ImportArray(cx, value, &array, count));
+  for (uint32_t i = 0; i < count; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::RootedObject object(cx, &field.toObject()), cells(cx);
+    auto record = MakeUnique<ImportSourceRecord>();
+    int64_t id;
+    MOZ_TRY(ImportMember(cx, object, "id", &field));
+    MOZ_TRY(ImportNumber(field, 0, UINT32_MAX, id));
+    record->id = id;
+    MOZ_TRY(ImportMember(cx, object, "scope", &field));
+    MOZ_TRY(ImportText(cx, field, record->scope));
+    nsCString key = ImportSourceKey(record->id, record->scope);
+    NS_ENSURE_FALSE(indexes.Contains(key), NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportMember(cx, object, "cells", &field));
+    uint32_t length;
+    MOZ_TRY(ImportArray(cx, field, &cells, length));
+    for (uint32_t j = 0; j < length; ++j) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, cells, j, &field), NS_ERROR_FAILURE);
+      NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+      JS::RootedObject cell(cx, &field.toObject());
+      nsCString name, text;
+      MOZ_TRY(ImportMember(cx, cell, "k", &field));
+      MOZ_TRY(ImportByteText(cx, field, name));
+      MOZ_TRY(ImportMember(cx, cell, "v", &field));
+      MOZ_TRY(ImportByteText(cx, field, text));
+      NS_ENSURE_FALSE(record->cells.Contains(name), NS_ERROR_INVALID_ARG);
+      record->cells.InsertOrUpdate(name, std::move(text));
+    }
+    if (tables) {
+      MOZ_TRY(ImportMember(cx, object, "metaRow", &field));
+      if (!field.isNull()) {
+        MOZ_TRY(ImportText(cx, field, record->meta));
+        NS_ENSURE_FALSE(record->meta.IsEmpty(), NS_ERROR_INVALID_ARG);
+      }
+      MOZ_TRY(ImportMember(cx, object, "rows", &field));
+      JS::RootedObject members(cx);
+      MOZ_TRY(ImportArray(cx, field, &members, length));
+      for (uint32_t j = 0; j < length; ++j) {
+        NS_ENSURE_TRUE(JS_GetElement(cx, members, j, &field), NS_ERROR_FAILURE);
+        nsCString member;
+        MOZ_TRY(ImportText(cx, field, member));
+        NS_ENSURE_FALSE(record->memberSet.Contains(member),
+                        NS_ERROR_INVALID_ARG);
+        record->memberSet.InsertOrUpdate(member, true);
+        record->members.AppendElement(std::move(member));
+      }
+    }
+    indexes.InsertOrUpdate(key, records.Length());
+    records.AppendElement(std::move(record));
+  }
+  return NS_OK;
+}
+
+// Only named legacy structural numbers are decoded; arbitrary text stays text.
+nsresult ImportHex(const nsACString& text, uint32_t digits, uint64_t& output) {
+  NS_ENSURE_TRUE(!text.IsEmpty() && text.Length() <= digits,
+                 NS_ERROR_INVALID_ARG);
+  uint64_t value = 0;
+  for (char c : text.View()) {
+    uint8_t digit;
+    if (c >= '0' && c <= '9') {
+      digit = c - '0';
+    } else if (c >= 'a' && c <= 'f') {
+      digit = c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'F') {
+      digit = c - 'A' + 10;
+    } else {
+      return NS_ERROR_INVALID_ARG;
+    }
+    value = (value << 4) | digit;
+  }
+  output = value;
+  return NS_OK;
+}
+
+nsresult ImportCellNumber(const ImportSourceRecord& row, const nsACString& name,
+                          uint32_t& value, uint32_t fallback = 0) {
+  nsCString text;
+  value = fallback;
+  if (row.cells.Get(name, &text)) {
+    uint64_t number;
+    MOZ_TRY(ImportHex(text, 8, number));
+    value = number;
+  }
+  return NS_OK;
+}
+
+nsresult CheckImportHeader(const ImportSourceRecord& row, const RawHdr& header,
+                           nsIMimeConverter* converter) {
+  NS_ENSURE_TRUE(row.cells.Count() == header.extras.Length(),
+                 NS_ERROR_INVALID_ARG);
+  nsTHashMap<nsCString, bool> seen;
+  for (const auto& extra : header.extras) {
+    nsCString text;
+    NS_ENSURE_TRUE(!seen.Contains(extra.k) && row.cells.Get(extra.k, &text) &&
+                       text == extra.v,
+                   NS_ERROR_INVALID_ARG);
+    seen.InsertOrUpdate(extra.k, true);
+  }
+  auto text = [&](const nsACString& name) {
+    nsCString value;
+    row.cells.Get(name, &value);
+    return value;
+  };
+  nsCString messageId = text("message-id"_ns);
+  nsCString normalized = MOZ_TRY(DatabaseUtils::Normalize(messageId));
+  NS_ENSURE_TRUE(header.messageId == normalized && header.replyTo.IsEmpty() &&
+                     header.charset == text("msgCharSet"_ns) &&
+                     header.accountKey == text("account"_ns),
+                 NS_ERROR_INVALID_ARG);
+  for (auto pair : {std::pair{"sender", &header.sender},
+                    {"recipients", &header.recipients},
+                    {"ccList", &header.ccList},
+                    {"bccList", &header.bccList},
+                    {"subject", &header.subject}}) {
+    nsCString decoded;
+    MOZ_TRY(converter->DecodeMimeHeaderToUTF8(
+        text(nsDependentCString(pair.first)), header.charset.get(), true, true,
+        decoded));
+    normalized = MOZ_TRY(DatabaseUtils::Normalize(decoded));
+    NS_ENSURE_TRUE(*pair.second == normalized, NS_ERROR_INVALID_ARG);
+  }
+  normalized = MOZ_TRY(DatabaseUtils::Normalize(text("keywords"_ns)));
+  NS_ENSURE_TRUE(header.keywords == normalized, NS_ERROR_INVALID_ARG);
+  uint32_t flags, date, received, priority, protoFlags;
+  MOZ_TRY(ImportCellNumber(row, "flags"_ns, flags));
+  MOZ_TRY(ImportCellNumber(row, "date"_ns, date));
+  MOZ_TRY(ImportCellNumber(row, "dateReceived"_ns, received));
+  MOZ_TRY(ImportCellNumber(row, "priority"_ns, priority));
+  MOZ_TRY(ImportCellNumber(row, "ProtoThreadFlags"_ns, protoFlags));
+  NS_ENSURE_TRUE(!(flags & nsMsgMessageFlags::Expunged) && !protoFlags,
+                 NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE(
+      header.flags == (flags & ~nsMsgMessageFlags::New) &&
+          header.date == PRTime(date) * PR_USEC_PER_SEC &&
+          header.dateReceived == PRTime(received) * PR_USEC_PER_SEC &&
+          header.priority == priority,
+      NS_ERROR_INVALID_ARG);
+  for (auto pair : {std::pair{"size", &header.messageSize},
+                    {"offlineMsgSize", &header.offlineMessageSize},
+                    {"numLines", &header.lineCount}}) {
+    NS_ENSURE_TRUE(bool(*pair.second) ==
+                       row.cells.Contains(nsDependentCString(pair.first)),
+                   NS_ERROR_INVALID_ARG);
+    if (*pair.second) {
+      uint32_t number;
+      MOZ_TRY(ImportCellNumber(row, nsDependentCString(pair.first), number));
+      NS_ENSURE_TRUE(**pair.second == number, NS_ERROR_INVALID_ARG);
+    }
+  }
+  nsCString token = text("storeToken"_ns);
+  if (token.IsEmpty() && row.cells.Contains("msgOffset"_ns)) {
+    uint64_t offset;
+    MOZ_TRY(ImportHex(text("msgOffset"_ns), 16, offset));
+    if (offset != UINT64_MAX) {
+      token.AppendInt(offset);
+    }
+  }
+  bool tokenPresent = row.cells.Contains("storeToken"_ns) || !token.IsEmpty();
+  NS_ENSURE_TRUE(bool(header.storeToken) == tokenPresent &&
+                     (!tokenPresent || *header.storeToken == token),
+                 NS_ERROR_INVALID_ARG);
+  // Match the reader's NUL-terminated legacy References view, preserving order.
+  nsCString references(text("references"_ns).get());
+  nsTArray<nsCString> expected;
+  uint32_t position = 0;
+  while (position < references.Length()) {
+    bool first = position == 0;
+    int32_t open = references.FindChar('<', position);
+    int32_t close = open < 0 ? -1 : references.FindChar('>', open + 1);
+    nsCString reference;
+    if (close >= 0) {
+      reference = Substring(references, open + 1, close - open - 1);
+      position = close + 1;
+    } else {
+      if (first) {
+        reference = Substring(references, position);
+        reference.Trim(" \r\n\t", true, false);
+        if (!reference.IsEmpty() && reference.First() == '<') {
+          reference.Cut(0, 1);
+        }
+      }
+      position = references.Length();
+    }
+    if (!reference.IsEmpty() && reference != messageId) {
+      expected.AppendElement(std::move(reference));
+    }
+  }
+  NS_ENSURE_TRUE(header.references == expected, NS_ERROR_INVALID_ARG);
+  return NS_OK;
+}
+
+nsresult ImportFolderProperties(JSContext* cx, JS::HandleObject request,
+                                const ImportSourceRecord& info, uint32_t flags,
+                                uint32_t total, uint32_t unread,
+                                nsTArray<FolderImportProperty>& output) {
+  JS::RootedValue field(cx);
+  JS::RootedObject array(cx);
+  uint32_t count;
+  MOZ_TRY(ImportMember(cx, request, "folderProperties", &field));
+  MOZ_TRY(ImportArray(cx, field, &array, count));
+  NS_ENSURE_TRUE(count == info.cells.Count(), NS_ERROR_INVALID_ARG);
+  nsTHashMap<nsCString, bool> seen;
+  for (uint32_t i = 0; i < count; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::RootedObject property(cx, &field.toObject());
+    FolderImportProperty value;
+    MOZ_TRY(ImportMember(cx, property, "name", &field));
+    MOZ_TRY(ImportText(cx, field, value.name));
+    MOZ_TRY(ImportMember(cx, property, "text", &field));
+    MOZ_TRY(ImportText(cx, field, value.text));
+    nsCString raw;
+    NS_ENSURE_TRUE(!seen.Contains(value.name) &&
+                       info.cells.Get(value.name, &raw) && raw == value.text,
+                   NS_ERROR_INVALID_ARG);
+    seen.InsertOrUpdate(value.name, true);
+    NS_ENSURE_TRUE(value.name != "morkMigrationSource"_ns,
+                   NS_ERROR_INVALID_ARG);
+    bool present;
+    NS_ENSURE_TRUE(JS_HasOwnProperty(cx, property, "integer", &present),
+                   NS_ERROR_FAILURE);
+    if (present) {
+      MOZ_TRY(ImportMember(cx, property, "integer", &field));
+      int64_t number;
+      MOZ_TRY(
+          ImportNumber(field, -9007199254740991., 9007199254740991., number));
+      value.integer = Some(number);
+    }
+    bool isUint32 = false;
+    for (const char* name : {"numMsgs",
+                             "numNewMsgs",
+                             "flags",
+                             "folderDate",
+                             "highWaterKey",
+                             "UIDValidity",
+                             "totPendingMsgs",
+                             "unreadPendingMsgs",
+                             "version",
+                             "userSortOrder",
+                             "viewType",
+                             "viewFlags",
+                             "sortType",
+                             "sortOrder",
+                             "retainBy",
+                             "daysToKeepHdrs",
+                             "numHdrsToKeep",
+                             "useServerDefaults",
+                             "applyToFlaggedMessages",
+                             "downloadByDate",
+                             "downloadUnreadOnly",
+                             "ageLimit",
+                             "forceReparse",
+                             "fixedBadRefThreading"}) {
+      isUint32 |= value.name.Equals(name);
+    }
+    bool isInt64 =
+        value.name == "folderSize"_ns || value.name == "expungedBytes"_ns;
+    NS_ENSURE_TRUE(bool(value.integer) == (isUint32 || isInt64),
+                   NS_ERROR_INVALID_ARG);
+    if (value.integer) {
+      uint64_t bits;
+      MOZ_TRY(ImportHex(value.text, isInt64 ? 16 : 8, bits));
+      bool negative = isInt64 && (bits >> 63);
+      uint64_t magnitude = negative ? (~bits + 1) : bits;
+      NS_ENSURE_TRUE(magnitude <= 9007199254740991ULL,
+                     NS_ERROR_NOT_IMPLEMENTED);
+      int64_t expected = negative ? -int64_t(magnitude) : int64_t(magnitude);
+      NS_ENSURE_TRUE(*value.integer == expected, NS_ERROR_INVALID_ARG);
+      if (value.name == "flags"_ns) {
+        NS_ENSURE_TRUE(expected == flags, NS_ERROR_NOT_IMPLEMENTED);
+      } else if (value.name == "numMsgs"_ns || value.name == "numNewMsgs"_ns) {
+        NS_ENSURE_TRUE(
+            expected == (value.name == "numMsgs"_ns ? total : unread),
+            NS_ERROR_INVALID_ARG);
+      } else if (value.name == "version"_ns) {
+        NS_ENSURE_TRUE(expected == 1, NS_ERROR_NOT_IMPLEMENTED);
+      } else if (value.name == "totPendingMsgs"_ns ||
+                 value.name == "unreadPendingMsgs"_ns ||
+                 value.name == "forceReparse"_ns) {
+        NS_ENSURE_TRUE(expected == 0, NS_ERROR_NOT_IMPLEMENTED);
+      }
+    }
+    output.AppendElement(std::move(value));
+  }
+  return NS_OK;
+}
+
+nsresult CheckFullImportRecords(JSContext* cx, JS::HandleObject request,
+                                nsIMsgFolder* folder,
+                                FolderImportSnapshot& input) {
+  nsCString protocol;
+  uint32_t folderFlags;
+  MOZ_TRY(folder->GetIncomingServerType(protocol));
+  MOZ_TRY(folder->GetFlags(&folderFlags));
+  NS_ENSURE_TRUE(protocol == "none"_ns, NS_ERROR_NOT_IMPLEMENTED);
+  JS::RootedValue field(cx);
+  JS::RootedObject records(cx);
+  MOZ_TRY(ImportMember(cx, request, "unhandledRecords", &field));
+  JS::RootedObject unhandled(cx);
+  uint32_t count;
+  MOZ_TRY(ImportArray(cx, field, &unhandled, count));
+  NS_ENSURE_TRUE(!count, NS_ERROR_NOT_IMPLEMENTED);
+  MOZ_TRY(ImportMember(cx, request, "records", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  records = &field.toObject();
+  nsTArray<UniquePtr<ImportSourceRecord>> rows, tables;
+  nsTHashMap<nsCString, uint32_t> rowIndexes, tableIndexes;
+  MOZ_TRY(ImportMember(cx, records, "rows", &field));
+  MOZ_TRY(ImportSourceRecords(cx, field, false, rows, rowIndexes));
+  MOZ_TRY(ImportMember(cx, records, "tables", &field));
+  MOZ_TRY(ImportSourceRecords(cx, field, true, tables, tableIndexes));
+  auto find = [&](const nsACString& key) -> ImportSourceRecord* {
+    uint32_t index;
+    return rowIndexes.Get(key, &index) ? rows[index].get() : nullptr;
+  };
+  constexpr auto messageScope = "ns:msg:db:row:scope:msgs:all"_ns;
+  constexpr auto threadScope = "ns:msg:db:row:scope:threads:all"_ns;
+  constexpr auto infoScope = "ns:msg:db:row:scope:dbfolderinfo:all"_ns;
+  ImportSourceRecord *messageTable = nullptr, *infoTable = nullptr,
+                     *allThreads = nullptr;
+  nsTHashMap<uint32_t, uint32_t> threadTables;
+  for (uint32_t i = 0; i < tables.Length(); ++i) {
+    auto& table = *tables[i];
+    for (auto cell = table.cells.ConstIter(); !cell.Done(); cell.Next()) {
+      NS_ENSURE_TRUE(cell.Key() == "k"_ns || cell.Key() == "s"_ns,
+                     NS_ERROR_NOT_IMPLEMENTED);
+    }
+    nsCString kind;
+    NS_ENSURE_TRUE(table.cells.Get("k"_ns, &kind), NS_ERROR_INVALID_ARG);
+    if (table.scope == messageScope && kind == "ns:msg:db:table:kind:msgs"_ns &&
+        !messageTable && table.meta.IsEmpty()) {
+      messageTable = &table;
+    } else if (table.scope == messageScope &&
+               kind == "ns:msg:db:table:kind:thread"_ns) {
+      threadTables.InsertOrUpdate(table.id, i);
+    } else if (table.scope == infoScope &&
+               kind == "ns:msg:db:table:kind:dbfolderinfo"_ns && !infoTable &&
+               table.meta.IsEmpty()) {
+      infoTable = &table;
+    } else if (table.scope == threadScope &&
+               kind == "ns:msg:db:table:kind:allthreads"_ns && !allThreads &&
+               table.meta.IsEmpty()) {
+      allThreads = &table;
+    } else {
+      return NS_ERROR_NOT_IMPLEMENTED;
+    }
+  }
+  NS_ENSURE_TRUE(
+      messageTable && infoTable && allThreads && !threadTables.IsEmpty(),
+      NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE(messageTable->members.Length() == input.messages.Length() &&
+                     infoTable->members.Length() == 1 &&
+                     allThreads->members.Length() == threadTables.Count(),
+                 NS_ERROR_INVALID_ARG);
+  nsTHashMap<nsMsgKey, uint32_t> messages;
+  nsCOMPtr<nsIMimeConverter> converter =
+      mozilla::components::MimeConverter::Service();
+  NS_ENSURE_TRUE(converter, NS_ERROR_NOT_AVAILABLE);
+  uint32_t unread = 0;
+  for (uint32_t i = 0; i < input.messages.Length(); ++i) {
+    const auto& message = input.messages[i];
+    nsCString key = ImportSourceKey(message.sourceKey, messageScope);
+    auto* row = find(key);
+    NS_ENSURE_TRUE(row && messageTable->memberSet.Contains(key),
+                   NS_ERROR_INVALID_ARG);
+    MOZ_TRY(CheckImportHeader(*row, message.header, converter));
+    row->accounted = true;
+    messages.InsertOrUpdate(message.sourceKey, i);
+    unread += !(message.header.flags & nsMsgMessageFlags::Read);
+  }
+  nsTHashMap<nsMsgKey, bool> assigned;
+  auto checkMeta = [&](ImportSourceRecord* meta, uint32_t id, uint32_t children,
+                       uint32_t unreadChildren, uint32_t newest,
+                       uint32_t& root) -> nsresult {
+    NS_ENSURE_TRUE(meta && !meta->accounted && meta->scope == "m"_ns &&
+                       meta->cells.Count() == 6,
+                   NS_ERROR_NOT_IMPLEMENTED);
+    uint32_t values[6];
+    const char* names[] = {"threadRoot",     "threadId",
+                           "threadFlags",    "children",
+                           "unreadChildren", "threadNewestMsgDate"};
+    for (uint32_t i = 0; i < 6; ++i) {
+      nsDependentCString name(names[i]);
+      NS_ENSURE_TRUE(meta->cells.Contains(name), NS_ERROR_NOT_IMPLEMENTED);
+      MOZ_TRY(ImportCellNumber(*meta, name, values[i]));
+    }
+    NS_ENSURE_TRUE(values[1] == id && !values[2] && values[3] == children &&
+                       values[4] == unreadChildren &&
+                       (!values[5] || values[5] == newest),
+                   NS_ERROR_NOT_IMPLEMENTED);
+    root = values[0];
+    meta->accounted = true;
+    return NS_OK;
+  };
+  for (auto entry = threadTables.ConstIter(); !entry.Done(); entry.Next()) {
+    const auto& table = *tables[entry.Data()];
+    NS_ENSURE_TRUE(!table.members.IsEmpty(), NS_ERROR_NOT_IMPLEMENTED);
+    uint32_t childrenUnread = 0, newest = 0;
+    for (const auto& key : table.members) {
+      auto* row = find(key);
+      uint32_t index;
+      NS_ENSURE_TRUE(row && row->scope == messageScope &&
+                         messages.Get(row->id, &index) &&
+                         !assigned.Contains(row->id),
+                     NS_ERROR_INVALID_ARG);
+      uint32_t id, parent;
+      MOZ_TRY(ImportCellNumber(*row, "msgThreadId"_ns, id));
+      MOZ_TRY(ImportCellNumber(*row, "threadParent"_ns, parent, nsMsgKey_None));
+      const auto& message = input.messages[index];
+      Maybe<nsMsgKey> expectedParent;
+      if (parent != nsMsgKey_None) {
+        expectedParent = Some(nsMsgKey(parent));
+      }
+      NS_ENSURE_TRUE(
+          id == table.id && message.parentSourceKey == expectedParent,
+          NS_ERROR_INVALID_ARG);
+      assigned.InsertOrUpdate(row->id, true);
+      childrenUnread += !(message.header.flags & nsMsgMessageFlags::Read);
+      newest =
+          std::max(newest, uint32_t(message.header.date / PR_USEC_PER_SEC));
+    }
+    uint32_t root, rootIndex;
+    MOZ_TRY(checkMeta(find(table.meta), table.id, table.members.Length(),
+                      childrenUnread, newest, root));
+    NS_ENSURE_TRUE(
+        messages.Get(root, &rootIndex) &&
+            table.memberSet.Contains(ImportSourceKey(root, messageScope)),
+        NS_ERROR_INVALID_ARG);
+    for (const auto& key : table.members) {
+      uint32_t index;
+      NS_ENSURE_TRUE(messages.Get(find(key)->id, &index) &&
+                         input.messages[index].rootSourceKey == root,
+                     NS_ERROR_INVALID_ARG);
+    }
+    nsCString subjectKey = ImportSourceKey(table.id, threadScope);
+    auto* subject = find(subjectKey);
+    auto* rootRow = find(ImportSourceKey(root, messageScope));
+    nsCString rawSubject, threadSubject;
+    rootRow->cells.Get("subject"_ns, &rawSubject);
+    NS_ENSURE_TRUE(subject && !subject->accounted &&
+                       subject->cells.Count() == 1 &&
+                       subject->cells.Get("threadSubject"_ns, &threadSubject) &&
+                       threadSubject == rawSubject &&
+                       allThreads->memberSet.Contains(subjectKey),
+                   NS_ERROR_NOT_IMPLEMENTED);
+    subject->accounted = true;
+  }
+  NS_ENSURE_TRUE(assigned.Count() == input.messages.Length(),
+                 NS_ERROR_INVALID_ARG);
+  auto* info = find(infoTable->members[0]);
+  NS_ENSURE_TRUE(info && info->id == 1 && info->scope == infoScope,
+                 NS_ERROR_NOT_IMPLEMENTED);
+  MOZ_TRY(ImportFolderProperties(cx, request, *info, folderFlags,
+                                 input.messages.Length(), unread,
+                                 input.folderProperties));
+  info->accounted = true;
+  for (const auto& row : rows) {
+    if (!row->accounted) {
+      uint32_t root;
+      MOZ_TRY(checkMeta(row.get(), row->id, 0, 0, 0, root));
+      NS_ENSURE_TRUE(root == row->id, NS_ERROR_NOT_IMPLEMENTED);
+    }
+  }
+  return NS_OK;
+}
+
+}  // namespace
+
+namespace {
+
+nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
+                        JS::HandleObject request,
+                        FolderImportIdentity& identity) {
+  NS_ENSURE_ARG_POINTER(source);
+  JS::RootedValue field(cx);
+  int64_t version;
+  MOZ_TRY(ImportMember(cx, request, "version", &field));
+  MOZ_TRY(ImportNumber(field, 1, 1, version));
+  for (auto pair : {std::pair{"token", &identity.token},
+                    {"sourceId", &identity.sourceId},
+                    {"databaseSourceId", &identity.databaseSourceId}}) {
+    MOZ_TRY(ImportMember(cx, request, pair.first, &field));
+    MOZ_TRY(ImportText(cx, field, *pair.second));
+    NS_ENSURE_TRUE(!pair.second->IsEmpty() && pair.second->FindChar(0) < 0,
+                   NS_ERROR_INVALID_ARG);
+  }
+  nsCString databaseId;
+  MOZ_TRY(core->GetSourceId(databaseId));
+  NS_ENSURE_TRUE(identity.databaseSourceId == databaseId,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ImportMember(cx, request, "folder", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject folder(cx, &field.toObject());
+  MOZ_TRY(ImportMember(cx, folder, "id", &field));
+  int64_t id;
+  MOZ_TRY(ImportNumber(field, 1, 9007199254740991., id));
+  identity.folderId = id;
+  uint64_t actualId;
+  MOZ_TRY(source->GetId(&actualId));
+  NS_ENSURE_TRUE(actualId == identity.folderId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(source->GetPath(identity.folderPath));
+  nsCOMPtr<nsIFile> summary, storeFile;
+  MOZ_TRY(source->GetSummaryFile(getter_AddRefs(summary)));
+  MOZ_TRY(source->GetFilePath(getter_AddRefs(storeFile)));
+  NS_ENSURE_TRUE(summary && storeFile, NS_ERROR_NOT_AVAILABLE);
+  nsAutoString summaryPath, storePath;
+  MOZ_TRY(summary->GetPath(summaryPath));
+  MOZ_TRY(storeFile->GetPath(storePath));
+  nsCString uri, storeType, protocol;
+  MOZ_TRY(source->GetURI(uri));
+  MOZ_TRY(source->GetIncomingServerType(protocol));
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(source->GetMsgStore(getter_AddRefs(store)));
+  NS_ENSURE_TRUE(store, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(store->GetStoreType(storeType));
+  nsCString summaryUtf8 = NS_ConvertUTF16toUTF8(summaryPath);
+  nsCString storeUtf8 = NS_ConvertUTF16toUTF8(storePath);
+  for (auto pair : {std::pair{"uri", &uri},
+                    {"summaryPath", &summaryUtf8},
+                    {"storePath", &storeUtf8},
+                    {"storeType", &storeType},
+                    {"protocol", &protocol}}) {
+    MOZ_TRY(ImportMember(cx, folder, pair.first, &field));
+    nsCString text;
+    MOZ_TRY(ImportText(cx, field, text));
+    NS_ENSURE_TRUE(text == *pair.second, NS_ERROR_NOT_AVAILABLE);
+  }
+  bool exists;
+  MOZ_TRY(storeFile->Exists(&exists));
+  MOZ_TRY(ImportMember(cx, folder, "storeExists", &field));
+  NS_ENSURE_TRUE(field.isBoolean(), NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(field.toBoolean() == exists, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ImportMember(cx, request, "source", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject original(cx, &field.toObject());
+  MOZ_TRY(ImportMember(cx, original, "path", &field));
+  nsCString text;
+  MOZ_TRY(ImportText(cx, field, text));
+  NS_ENSURE_TRUE(text == summaryUtf8, NS_ERROR_NOT_AVAILABLE);
+  identity.sourcePath = summaryPath;
+  MOZ_TRY(ImportMember(cx, original, "sha256", &field));
+  MOZ_TRY(ImportText(cx, field, identity.sourceSha256));
+  return NS_OK;
+}
+
+nsresult ImportMessages(JSContext* cx, JS::HandleObject request,
+                        nsIMsgFolder* folder, FolderImportSnapshot& input) {
+  NS_ENSURE_ARG_POINTER(folder);
+  bool full;
+  NS_ENSURE_TRUE(JS_HasOwnProperty(cx, request, "folderProperties", &full),
+                 NS_ERROR_FAILURE);
+  JS::RootedValue field(cx);
+  MOZ_TRY(ImportMember(cx, request, "source", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject source(cx, &field.toObject());
+  MOZ_TRY(ImportMember(cx, source, "size", &field));
+  int64_t number;
+  MOZ_TRY(ImportNumber(field, 0, UINT32_MAX - 1, number));
+  input.sourceSize = number;
+  // Nonempty summaries cannot opt out of full raw-record accounting.
+  full = full || input.sourceSize != 0;
+  MOZ_TRY(ImportMember(cx, source, "messageKeys", &field));
+  JS::RootedObject keys(cx), messages(cx);
+  uint32_t keyCount, count;
+  MOZ_TRY(ImportArray(cx, field, &keys, keyCount));
+  MOZ_TRY(ImportMember(cx, request, "messages", &field));
+  MOZ_TRY(ImportArray(cx, field, &messages, count));
+  NS_ENSURE_TRUE(count == keyCount, NS_ERROR_INVALID_ARG);
+  nsTHashMap<nsMsgKey, bool> sourceKeys;
+  if (full) {
+    for (uint32_t i = 0; i < keyCount; ++i) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, keys, i, &field), NS_ERROR_FAILURE);
+      MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+      NS_ENSURE_FALSE(sourceKeys.Contains(number), NS_ERROR_INVALID_ARG);
+      sourceKeys.InsertOrUpdate(number, true);
+    }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, messages, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::RootedObject message(cx, &field.toObject());
+    FolderImportMessage* row = input.messages.AppendElement();
+    MOZ_TRY(ImportMember(cx, message, "sourceKey", &field));
+    MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+    row->sourceKey = number;
+    if (full) {
+      NS_ENSURE_TRUE(sourceKeys.Contains(row->sourceKey), NS_ERROR_INVALID_ARG);
+    } else {
+      NS_ENSURE_TRUE(JS_GetElement(cx, keys, i, &field), NS_ERROR_FAILURE);
+      MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+      NS_ENSURE_TRUE(number == row->sourceKey, NS_ERROR_INVALID_ARG);
+    }
+    MOZ_TRY(ImportMember(cx, message, "rootSourceKey", &field));
+    MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+    row->rootSourceKey = number;
+    MOZ_TRY(ImportMember(cx, message, "parentSourceKey", &field));
+    if (!field.isNull()) {
+      MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+      row->parentSourceKey = Some(static_cast<nsMsgKey>(number));
+    }
+    MOZ_TRY(ImportMember(cx, message, "header", &field));
+    MOZ_TRY(ImportHeader(cx, field, row->header));
+  }
+  nsTHashMap<nsMsgKey, uint32_t> indexes;
+  for (uint32_t i = 0; i < count; ++i) {
+    nsMsgKey key = input.messages[i].sourceKey;
+    NS_ENSURE_FALSE(indexes.Contains(key), NS_ERROR_INVALID_ARG);
+    indexes.InsertOrUpdate(key, i);
+  }
+  for (const auto& row : input.messages) {
+    uint32_t index;
+    NS_ENSURE_TRUE(indexes.Get(row.rootSourceKey, &index) &&
+                       input.messages[index].rootSourceKey == row.rootSourceKey,
+                   NS_ERROR_INVALID_ARG);
+    if (row.parentSourceKey) {
+      NS_ENSURE_TRUE(
+          indexes.Get(*row.parentSourceKey, &index) &&
+              input.messages[index].rootSourceKey == row.rootSourceKey,
+          NS_ERROR_INVALID_ARG);
+    }
+  }
+  nsTArray<uint8_t> visited;
+  visited.SetLength(count);
+  for (auto& state : visited) {
+    state = 0;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t index = i;
+    nsTArray<uint32_t> chain;
+    while (visited[index] != 2) {
+      NS_ENSURE_TRUE(visited[index] == 0, NS_ERROR_INVALID_ARG);
+      visited[index] = 1;
+      chain.AppendElement(index);
+      const auto& parent = input.messages[index].parentSourceKey;
+      if (!parent) {
+        break;
+      }
+      NS_ENSURE_TRUE(indexes.Get(*parent, &index), NS_ERROR_INVALID_ARG);
+    }
+    for (uint32_t member : chain) {
+      visited[member] = 2;
+    }
+  }
+  if (full) {
+    MOZ_TRY(CheckFullImportRecords(cx, request, folder, input));
+  } else {
+    MOZ_TRY(CheckProjectedImportRecords(cx, request, input));
+  }
+  input.recordsComplete = true;
+  return NS_OK;
+}
+
+bool ImportReceiptValue(JSContext* cx, const FolderImportReceipt& receipt,
+                        JS::MutableHandleValue output) {
+  JS::RootedObject object(cx, JS_NewPlainObject(cx));
+  JS::RootedObject keys(cx, JS::NewArrayObject(cx, receipt.keys.Length()));
+  if (!object || !keys) {
+    return false;
+  }
+  for (auto pair : {std::pair{"token", &receipt.identity.token},
+                    {"sourceId", &receipt.identity.sourceId},
+                    {"databaseSourceId", &receipt.identity.databaseSourceId},
+                    {"sourceSha256", &receipt.identity.sourceSha256}}) {
+    JS::RootedString text(
+        cx, JS_NewStringCopyUTF8N(
+                cx, JS::UTF8Chars(pair.second->get(), pair.second->Length())));
+    if (!text) {
+      return false;
+    }
+    JS::RootedValue value(cx, JS::StringValue(text));
+    if (!JS_DefineProperty(cx, object, pair.first, value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+  for (uint32_t i = 0; i < receipt.keys.Length(); ++i) {
+    JS::RootedObject key(cx, JS::NewArrayObject(cx, 2));
+    if (!key ||
+        !JS_DefineElement(cx, key, 0, double(receipt.keys[i].source),
+                          JSPROP_ENUMERATE) ||
+        !JS_DefineElement(cx, key, 1, double(receipt.keys[i].destination),
+                          JSPROP_ENUMERATE) ||
+        !JS_DefineElement(cx, keys, i, key, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+  if (!JS_DefineProperty(cx, object, "folderId",
+                         double(receipt.identity.folderId), JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, object, "keys", keys, JSPROP_ENUMERATE)) {
+    return false;
+  }
+  output.setObject(*object);
+  return true;
+}
+
+}  // namespace
+
+NS_IMETHODIMP DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
+                                                 JS::Handle<JS::Value> request,
+                                                 JSContext* cx,
+                                                 Promise** output) {
+  NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject object(cx, &request.toObject());
+  FolderImportSnapshot input;
+  // Finish JS conversion before starting the owned SQL transaction.
+  MOZ_TRY(ImportMessages(cx, object, source, input));
+  MOZ_TRY(ImportIdentity(this, source, cx, object, input.identity));
+  Maybe<FolderImportReceipt> previous;
+  MOZ_TRY(GetFolderImportReceipt(input.identity, previous));
+  FolderImportReceipt prepared;
+  if (previous) {
+    prepared = std::move(*previous);
+  } else {
+    prepared.identity = input.identity;
+    for (const auto& row : input.messages) {
+      prepared.keys.AppendElement(FolderImportKey{row.sourceKey, 0});
+    }
+    std::sort(prepared.keys.begin(), prepared.keys.end(),
+              [](const auto& a, const auto& b) { return a.source < b.source; });
+  }
+  JS::RootedValue result(cx);
+  NS_ENSURE_TRUE(ImportReceiptValue(cx, prepared, &result),
+                 NS_ERROR_OUT_OF_MEMORY);
+  ErrorResult error;
+  RefPtr<Promise> promise =
+      Promise::Create(xpc::CurrentNativeGlobal(cx), error);
+  if (error.Failed()) {
+    return error.StealNSResult();
+  }
+  FolderImportReceipt receipt;
+  nsresult rv = ImportFolderSnapshot(source, input, receipt);
+  if (NS_SUCCEEDED(rv)) {
+    JS::RootedObject resultObject(cx, &result.toObject());
+    JS::RootedValue keys(cx), pair(cx);
+    if (receipt.keys.Length() != prepared.keys.Length() ||
+        !JS_GetProperty(cx, resultObject, "keys", &keys)) {
+      return NS_ERROR_FAILURE;
+    }
+    JS::RootedObject array(cx, &keys.toObject());
+    for (uint32_t i = 0; i < receipt.keys.Length(); ++i) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &pair), NS_ERROR_FAILURE);
+      JS::RootedObject tuple(cx, &pair.toObject());
+      JS::RootedValue key(cx, JS::NumberValue(receipt.keys[i].destination));
+      NS_ENSURE_TRUE(JS_SetElement(cx, tuple, 1, key), NS_ERROR_FAILURE);
+    }
+    promise->MaybeResolve(result);
+  } else {
+    promise->MaybeReject(rv);
+  }
+  promise.forget(output);
+  return NS_OK;
+}
+
+NS_IMETHODIMP DatabaseCore::GetFolderImportReceipt(
+    nsIMsgFolder* source, JS::Handle<JS::Value> request, JSContext* cx,
+    JS::MutableHandle<JS::Value> output) {
+  NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject object(cx, &request.toObject());
+  FolderImportIdentity identity;
+  MOZ_TRY(ImportIdentity(this, source, cx, object, identity));
+  Maybe<FolderImportReceipt> receipt;
+  MOZ_TRY(GetFolderImportReceipt(identity, receipt));
+  if (!receipt) {
+    output.setNull();
+    return NS_OK;
+  }
+  JS::RootedValue result(cx);
+  NS_ENSURE_TRUE(ImportReceiptValue(cx, *receipt, &result),
+                 NS_ERROR_OUT_OF_MEMORY);
+  output.set(result);
+  return NS_OK;
+}
 
 NS_IMETHODIMP
 DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,

@@ -359,6 +359,52 @@ class DeliveryCoreReferences : public testing::Test {
     EXPECT_FALSE(more);
   }
 
+  nsresult PrepareNativeImport(FolderImportSnapshot& input, nsIFile** source) {
+    uint64_t folder;
+    MOZ_TRY(mCore->FolderDB().InsertFolder(mFolderId, "Import"_ns, &folder));
+    input.identity.folderId = folder;
+    input.identity.folderPath =
+        MOZ_TRY(mCore->FolderDB().GetFolderPath(folder));
+    input.identity.token = "native-import-token"_ns;
+    input.identity.sourceId = "native-original-folder"_ns;
+    MOZ_TRY(mCore->GetSourceId(input.identity.databaseSourceId));
+    input.identity.sourceSha256 =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"_ns;
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(mProfile->Clone(getter_AddRefs(file)));
+    MOZ_TRY(file->Append(u"native-source.bin"_ns));
+    MOZ_TRY(file->Create(nsIFile::NORMAL_FILE_TYPE, 0600));
+    MOZ_TRY(file->GetPath(input.identity.sourcePath));
+    // Native transaction input, not a fabricated Mork/parser fixture.
+    input.recordsComplete = true;
+    FolderImportMessage* child = input.messages.AppendElement();
+    child->sourceKey = 9;
+    child->rootSourceKey = 0;
+    child->parentSourceKey = Some(nsMsgKey(0));
+    child->header.messageId = "child-import@invalid"_ns;
+    child->header.subject = "imported child"_ns;
+    child->header.storeToken = Some(nsCString("retained-original-body"_ns));
+    child->header.messageSize = Some(uint32_t(0));
+    child->header.references = {"root-import@invalid"_ns, "missing@invalid"_ns,
+                                "root-import@invalid"_ns};
+    child->header.extras = {{"Case"_ns, "00042"_ns},
+                            {"case"_ns, "1e3"_ns},
+                            {"keywords"_ns, "first"_ns},
+                            {"keywords"_ns, "last"_ns}};
+    FolderImportMessage* root = input.messages.AppendElement();
+    root->sourceKey = 0;
+    root->rootSourceKey = 0;
+    root->header.messageId = "root-import@invalid"_ns;
+    root->header.subject = "imported root"_ns;
+    file.forget(source);
+    return NS_OK;
+  }
+
+  nsresult ImportNativeFile(nsIFile* source, const FolderImportSnapshot& input,
+                            FolderImportReceipt& output) {
+    return mCore->ImportFolderSnapshotFromFile(source, input, output);
+  }
+
   nsresult StoredKnownMarker(nsMsgKey key, bool& known) {
     nsCOMPtr<mozIStorageConnection> reader;
     MOZ_TRY(Open(getter_AddRefs(reader)));
@@ -621,7 +667,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   EXPECT_TRUE(got.IsEmpty());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(8, version);
+  EXPECT_EQ(9, version);
   Stop();
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(7, got));
@@ -3175,6 +3221,278 @@ TEST_F(DeliveryCoreReferences,
   finished.offline = true;
   ASSERT_EQ(NS_OK, db.SettleMessageBody(expected, finished, output));
   EXPECT_EQ(1u, observer->mChanges);
+}
+
+TEST_F(DeliveryCoreReferences, NativeImportReceiptMapsForwardRootsAndReopens) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt receipt;
+  uint32_t callbacks = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message* message, bool notifyLegacy) {
+        ++callbacks;
+        EXPECT_FALSE(notifyLegacy);
+        ASSERT_EQ(2u, receipt.keys.Length());
+        EXPECT_EQ(0u, receipt.keys[0].source);
+        EXPECT_EQ(9u, receipt.keys[1].source);
+        nsMsgKey root = receipt.keys[0].destination;
+        nsMsgKey child = receipt.keys[1].destination;
+        nsMsgKey thread, parent;
+        ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageThreadId(child, thread));
+        ASSERT_EQ(NS_OK,
+                  mCore->MessageDB().GetMessageThreadParent(child, parent));
+        EXPECT_EQ(root, thread);
+        EXPECT_EQ(root, parent);
+        nsCString subject;
+        ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageSubject(root, subject));
+        EXPECT_EQ("imported root"_ns, subject);
+        nsTArray<nsCString> stored;
+        ASSERT_EQ(NS_OK, Stored(child, stored));
+        EXPECT_EQ(
+            (nsTArray<nsCString>{"root-import@invalid"_ns, "missing@invalid"_ns,
+                                 "root-import@invalid"_ns}),
+            stored);
+        bool active = true;
+        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        EXPECT_FALSE(active);
+        nsCString text;
+        ASSERT_EQ(NS_OK, message->GetSubject(text));
+        EXPECT_FALSE(text.IsEmpty());
+      });
+  auto& db = mCore->MessageDB();
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  EXPECT_EQ(2u, callbacks);
+  nsMsgKey root = receipt.keys[0].destination;
+  nsMsgKey child = receipt.keys[1].destination;
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(child, "Case"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(child, "case"_ns, text));
+  EXPECT_EQ("1e3"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageTags(child, text));
+  EXPECT_EQ("last"_ns, text);
+  FolderImportReceipt repeated;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, repeated));
+  EXPECT_EQ(2u, callbacks);
+  EXPECT_EQ(root, repeated.keys[0].destination);
+  EXPECT_EQ(child, repeated.keys[1].destination);
+  db.RemoveMessageListener(observer);
+  cleanup.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  Maybe<FolderImportReceipt> recovered;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, recovered));
+  ASSERT_TRUE(recovered);
+  ASSERT_EQ(2u, recovered->keys.Length());
+  EXPECT_EQ(root, recovered->keys[0].destination);
+  EXPECT_EQ(child, recovered->keys[1].destination);
+  EXPECT_EQ(input.identity.databaseSourceId,
+            recovered->identity.databaseSourceId);
+}
+
+TEST_F(DeliveryCoreReferences, NativeImportReceiptFailureRollsBackWholeUnit) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("prior-control@invalid"_ns, {}, control));
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_import_receipt BEFORE INSERT ON "
+          "folder_import_receipts BEGIN SELECT RAISE(ABORT, 'receipt failure'); END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_import_receipt"_ns));
+  });
+  FolderImportReceipt output;
+  output.identity.token = "unchanged"_ns;
+  uint32_t callbacks = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) { ++callbacks; });
+  auto& db = mCore->MessageDB();
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            ImportNativeFile(source, input, output));
+  EXPECT_EQ("unchanged"_ns, output.identity.token);
+  EXPECT_EQ(0u, callbacks);
+  uint64_t count;
+  ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+  EXPECT_EQ(1u, count);
+  bool exists = false, active = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  Maybe<FolderImportReceipt> absent;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, absent));
+  EXPECT_FALSE(absent);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_import_receipt"_ns));
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, output));
+  EXPECT_EQ(2u, callbacks);
+  ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+  EXPECT_EQ(3u, count);
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeImportRejectsUnhandledAndConflictingIdentity) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt output;
+  output.identity.token = "unchanged"_ns;
+  input.recordsComplete = false;
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, ImportNativeFile(source, input, output));
+  EXPECT_EQ("unchanged"_ns, output.identity.token);
+  input.recordsComplete = true;
+  input.unhandledRecords.AppendElement("unconverted-offline-row"_ns);
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, ImportNativeFile(source, input, output));
+  EXPECT_EQ("unchanged"_ns, output.identity.token);
+  input.unhandledRecords.Clear();
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, output));
+  auto conflict = input.identity;
+  conflict.token = "different-token"_ns;
+  Maybe<FolderImportReceipt> sentinel;
+  sentinel.emplace();
+  sentinel->identity.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED,
+            mCore->GetFolderImportReceipt(conflict, sentinel));
+  ASSERT_TRUE(sentinel);
+  EXPECT_EQ("unchanged"_ns, sentinel->identity.token);
+  conflict = input.identity;
+  conflict.databaseSourceId = "different-database"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->GetFolderImportReceipt(conflict, sentinel));
+  ASSERT_TRUE(sentinel);
+  EXPECT_EQ("unchanged"_ns, sentinel->identity.token);
+  conflict = input.identity;
+  conflict.sourceSha256.AssignLiteral(
+      "0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED,
+            mCore->GetFolderImportReceipt(conflict, sentinel));
+  ASSERT_TRUE(sentinel);
+  EXPECT_EQ("unchanged"_ns, sentinel->identity.token);
+}
+
+TEST_F(DeliveryCoreReferences, NativeImportDoesNotInventOldHashOnlyKeyMap) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->CreateStatement(
+          "INSERT INTO folder_properties(id, name, value) VALUES(:id, "
+          "'morkMigrationSource', 'v1:sha256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=')"_ns,
+          getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, input.identity.folderId));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  Maybe<FolderImportReceipt> output;
+  output.emplace();
+  output->identity.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->GetFolderImportReceipt(input.identity, output));
+  ASSERT_TRUE(output);
+  EXPECT_EQ("unchanged"_ns, output->identity.token);
+  FolderImportReceipt receipt;
+  receipt.identity.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ImportNativeFile(source, input, receipt));
+  EXPECT_EQ("unchanged"_ns, receipt.identity.token);
+}
+
+TEST_F(DeliveryCoreReferences, NativeImportReceiptSqlErrorPreservesOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP VIEW folder_import_keys AS SELECT token, sourceKey, "
+          "abs(-9223372036854775808) AS destinationKey FROM main.folder_import_keys"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.folder_import_keys"_ns));
+  });
+  Maybe<FolderImportReceipt> output;
+  output.emplace();
+  output->identity.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            mCore->GetFolderImportReceipt(input.identity, output));
+  ASSERT_TRUE(output);
+  EXPECT_EQ("unchanged"_ns, output->identity.token);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.folder_import_keys"_ns));
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, output));
+  ASSERT_TRUE(output);
+  EXPECT_EQ(2u, output->keys.Length());
+}
+
+TEST_F(DeliveryCoreReferences, NativeImportRejectsLostReceiptMapping) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, receipt));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "DELETE FROM folder_import_keys WHERE sourceKey = 9"_ns));
+  Maybe<FolderImportReceipt> output;
+  output.emplace();
+  output->identity.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            mCore->GetFolderImportReceipt(input.identity, output));
+  ASSERT_TRUE(output);
+  EXPECT_EQ("unchanged"_ns, output->identity.token);
+  receipt.identity.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, ImportNativeFile(source, input, receipt));
+  EXPECT_EQ("unchanged"_ns, receipt.identity.token);
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(2u, count);
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeImportChecksSourceSizeAndForeignTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  FolderImportReceipt output;
+  output.identity.token = "unchanged"_ns;
+  input.sourceSize = 1;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ImportNativeFile(source, input, output));
+  EXPECT_EQ("unchanged"_ns, output.identity.token);
+  input.sourceSize = 0;
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active;
+    if (NS_SUCCEEDED(mConnection->GetTransactionInProgress(&active)) &&
+        active) {
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    }
+  });
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, ImportNativeFile(source, input, output));
+  EXPECT_EQ("unchanged"_ns, output.identity.token);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, output));
+  EXPECT_EQ(2u, output.keys.Length());
 }
 
 }  // namespace

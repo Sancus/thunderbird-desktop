@@ -10,11 +10,13 @@
 #include "FolderDatabase.h"
 #include "Message.h"
 #include "MessageDatabase.h"
+#include "mozilla/Base64.h"
 #include "mozilla/Components.h"
 #include "mozilla/dom/Promise.h"
 #include "mozilla/Logging.h"
 #include "mozilla/ProfilerMarkers.h"
 #include "mozilla/Services.h"
+#include "mozilla/UniquePtr.h"
 #include "mozilla/ScopeExit.h"
 #include "mozIStorageBindingParams.h"
 #include "mozIStorageBindingParamsArray.h"
@@ -453,7 +455,7 @@ nsresult CheckReferenceSchemaTable(mozIStorageConnection* connection,
 nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version >= 0 && version <= 8, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 9, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -776,6 +778,461 @@ nsresult DatabaseCore::UpgradeSchema() {
                                     "singleton:INTEGER:0:1,sourceId:TEXT:1:0"));
   nsCString sourceId;
   MOZ_TRY(ReadDatabaseSourceId(sConnection, sourceId));
+  if (version < 9) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE folder_import_receipts (token TEXT PRIMARY KEY, "
+        "sourceId TEXT NOT NULL UNIQUE, databaseSourceId TEXT NOT NULL, "
+        "sourceSha256 TEXT NOT NULL, folderId INTEGER NOT NULL UNIQUE, "
+        "folderPath TEXT NOT NULL, sourcePath TEXT NOT NULL, messageCount "
+        "INTEGER NOT NULL);"
+        "CREATE TABLE folder_import_keys (token TEXT NOT NULL REFERENCES "
+        "folder_import_receipts(token), sourceKey INTEGER NOT NULL, "
+        "destinationKey INTEGER NOT NULL UNIQUE, PRIMARY KEY(token, sourceKey));"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(9));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "folder_import_receipts",
+      "token:TEXT:0:1,sourceId:TEXT:1:0,databaseSourceId:TEXT:1:0,"
+      "sourceSha256:TEXT:1:0,folderId:INTEGER:1:0,folderPath:TEXT:1:0,"
+      "sourcePath:TEXT:1:0,messageCount:INTEGER:1:0"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "folder_import_keys",
+      "token:TEXT:1:1,sourceKey:INTEGER:1:2,destinationKey:INTEGER:1:0"));
+  return NS_OK;
+}
+
+namespace {
+
+nsresult HashImportSource(nsIFile* file, const FolderImportSnapshot& input,
+                          nsACString* legacyMarker = nullptr) {
+  NS_ENSURE_ARG_POINTER(file);
+  nsAutoString path;
+  MOZ_TRY(file->GetPath(path));
+  NS_ENSURE_TRUE(path == input.identity.sourcePath, NS_ERROR_INVALID_ARG);
+  int64_t size;
+  MOZ_TRY(file->GetFileSize(&size));
+  NS_ENSURE_TRUE(size >= 0 && uint64_t(size) == input.sourceSize,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(uint64_t(size) < UINT32_MAX, NS_ERROR_FILE_TOO_BIG);
+  nsCOMPtr<nsIInputStream> stream;
+  MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), file));
+  auto close = MakeScopeExit([&] { stream->Close(); });
+  nsCOMPtr<nsICryptoHash> hash;
+  MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+  if (size) {
+    MOZ_TRY(hash->UpdateFromStream(stream, UINT32_MAX));
+  }
+  MOZ_TRY(stream->Close());
+  close.release();
+  nsCString bytes, hex;
+  MOZ_TRY(hash->Finish(false, bytes));
+  for (unsigned char byte : bytes) {
+    hex.Append("0123456789abcdef"[byte >> 4]);
+    hex.Append("0123456789abcdef"[byte & 15]);
+  }
+  NS_ENSURE_TRUE(hex == input.identity.sourceSha256, NS_ERROR_NOT_AVAILABLE);
+  if (legacyMarker) {
+    nsCString base64;
+    MOZ_TRY(Base64Encode(bytes, base64));
+    legacyMarker->Assign("v1:sha256:"_ns);
+    legacyMarker->Append(base64);
+  }
+  return NS_OK;
+}
+
+}  // namespace
+
+nsresult DatabaseCore::CheckFolderImportIdentity(
+    const FolderImportIdentity& identity) {
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection && mFolderDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(!identity.token.IsEmpty() && !identity.sourceId.IsEmpty() &&
+                     identity.folderId && identity.folderId <= INT64_MAX &&
+                     identity.sourceSha256.Length() == 64,
+                 NS_ERROR_INVALID_ARG);
+  for (char c : identity.sourceSha256) {
+    NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+                   NS_ERROR_INVALID_ARG);
+  }
+  nsCString sourceId;
+  MOZ_TRY(ReadDatabaseSourceId(sConnection, sourceId));
+  NS_ENSURE_TRUE(sourceId == identity.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(GetStatement("ImportDestinationExists"_ns,
+                       "SELECT 1 FROM folders WHERE id = :id"_ns,
+                       getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, identity.folderId));
+  bool exists;
+  MOZ_TRY(stmt->ExecuteStep(&exists));
+  NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+  nsCString path = MOZ_TRY(mFolderDatabase->GetFolderPath(identity.folderId));
+  NS_ENSURE_TRUE(path == identity.folderPath, NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult DatabaseCore::GetFolderImportReceipt(
+    const FolderImportIdentity& identity, Maybe<FolderImportReceipt>& output) {
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool active;
+  MOZ_TRY(sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(CheckFolderImportIdentity(identity));
+  return ReadFolderImportReceipt(identity, output);
+}
+
+nsresult DatabaseCore::ReadFolderImportReceipt(
+    const FolderImportIdentity& identity, Maybe<FolderImportReceipt>& output) {
+  FolderImportReceipt receipt;
+  int64_t expectedCount;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(GetStatement(
+        "ReadFolderImportReceipt"_ns,
+        "SELECT token, sourceId, databaseSourceId, sourceSha256, folderId, "
+        "folderPath, sourcePath, messageCount FROM folder_import_receipts "
+        "WHERE token = "
+        ":token OR "
+        "sourceId = :source OR folderId = :folder"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, identity.token));
+    MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, identity.sourceId));
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, identity.folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      nsCOMPtr<mozIStorageStatement> old;
+      MOZ_TRY(GetStatement("OldImportReceiptWithoutMap"_ns,
+                           "SELECT 1 FROM folder_properties WHERE id = :id "
+                           "AND name = 'morkMigrationSource'"_ns,
+                           getter_AddRefs(old)));
+      mozStorageStatementScoper oldScoper(old);
+      MOZ_TRY(old->BindInt64ByName("id"_ns, identity.folderId));
+      MOZ_TRY(old->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_NOT_AVAILABLE);
+      output.reset();
+      return NS_OK;
+    }
+    auto& found = receipt.identity;
+    MOZ_TRY(stmt->GetUTF8String(0, found.token));
+    MOZ_TRY(stmt->GetUTF8String(1, found.sourceId));
+    MOZ_TRY(stmt->GetUTF8String(2, found.databaseSourceId));
+    MOZ_TRY(stmt->GetUTF8String(3, found.sourceSha256));
+    int64_t folder;
+    MOZ_TRY(stmt->GetInt64(4, &folder));
+    MOZ_TRY(stmt->GetUTF8String(5, found.folderPath));
+    MOZ_TRY(stmt->GetString(6, found.sourcePath));
+    MOZ_TRY(stmt->GetInt64(7, &expectedCount));
+    NS_ENSURE_TRUE(expectedCount >= 0 && uint64_t(expectedCount) <= UINT32_MAX,
+                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(folder > 0, NS_ERROR_FILE_CORRUPTED);
+    found.folderId = static_cast<uint64_t>(folder);
+    NS_ENSURE_TRUE(found.token == identity.token &&
+                       found.sourceId == identity.sourceId &&
+                       found.databaseSourceId == identity.databaseSourceId &&
+                       found.sourceSha256 == identity.sourceSha256 &&
+                       found.folderId == identity.folderId &&
+                       found.folderPath == identity.folderPath &&
+                       found.sourcePath == identity.sourcePath,
+                   NS_ERROR_ALREADY_INITIALIZED);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(
+      GetStatement("ReadFolderImportKeys"_ns,
+                   "SELECT sourceKey, destinationKey FROM folder_import_keys "
+                   "WHERE token = :token ORDER BY sourceKey"_ns,
+                   getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, identity.token));
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t source, destination;
+    MOZ_TRY(stmt->GetInt64(0, &source));
+    MOZ_TRY(stmt->GetInt64(1, &destination));
+    NS_ENSURE_TRUE(source >= 0 && source < nsMsgKey_None && destination > 0 &&
+                       destination < nsMsgKey_None,
+                   NS_ERROR_FILE_CORRUPTED);
+    receipt.keys.AppendElement(FolderImportKey{
+        static_cast<nsMsgKey>(source), static_cast<nsMsgKey>(destination)});
+  }
+  NS_ENSURE_TRUE(receipt.keys.Length() == uint64_t(expectedCount),
+                 NS_ERROR_FILE_CORRUPTED);
+  output = Some(std::move(receipt));
+  return NS_OK;
+}
+
+nsresult DatabaseCore::WriteImportedMessage(uint64_t folderId, nsMsgKey key,
+                                            nsMsgKey root, nsMsgKey parent,
+                                            const RawHdr& header) {
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(GetStatement("ImportSnapshotMessage"_ns,
+                         "INSERT INTO messages ("_ns MESSAGE_SQL_FIELDS
+                         ") VALUES "
+                         "(:id, :folder, :root, :parent, :messageId, :date, "
+                         ":sender, :recipients, "
+                         ":cc, :bcc, :subject, :flags, :tags, :priority)"_ns,
+                         getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("root"_ns, root));
+    MOZ_TRY(stmt->BindInt64ByName("parent"_ns, parent));
+    MOZ_TRY(stmt->BindInt64ByName("date"_ns, header.date));
+    MOZ_TRY(stmt->BindInt64ByName("flags"_ns, header.flags));
+    MOZ_TRY(stmt->BindInt32ByName("priority"_ns, header.priority));
+    auto text = [&](const nsACString& name,
+                    const nsACString& value) -> nsresult {
+      nsCString normalized = MOZ_TRY(DatabaseUtils::Normalize(value));
+      return stmt->BindUTF8StringByName(name, normalized);
+    };
+    MOZ_TRY(text("messageId"_ns, header.messageId));
+    MOZ_TRY(text("sender"_ns, header.sender));
+    MOZ_TRY(text("recipients"_ns, header.recipients));
+    MOZ_TRY(text("cc"_ns, header.ccList));
+    MOZ_TRY(text("bcc"_ns, header.bccList));
+    MOZ_TRY(text("subject"_ns, header.subject));
+    nsCString tags = MOZ_TRY(DatabaseUtils::Normalize(header.keywords));
+    for (const auto& extra : header.extras) {
+      if (extra.k.EqualsLiteral("keywords")) {
+        tags = extra.v;
+      }
+    }
+    MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
+    MOZ_TRY(stmt->Execute());
+  }
+  auto& messages = MessageDB();
+  MOZ_TRY(messages.WriteMessageReferencesInTransaction(key, header.references));
+  if (!header.replyTo.IsEmpty()) {
+    MOZ_TRY(messages.SetMessageProperty(key, "replyTo"_ns, header.replyTo));
+  }
+  if (!header.charset.IsEmpty()) {
+    MOZ_TRY(messages.SetMessageProperty(key, "msgCharSet"_ns, header.charset));
+  }
+  if (!header.accountKey.IsEmpty()) {
+    MOZ_TRY(messages.SetMessageProperty(key, "account"_ns, header.accountKey));
+  }
+  if (header.dateReceived) {
+    uint32_t seconds;
+    PRTime2Seconds(header.dateReceived, &seconds);
+    nsAutoCString value;
+    value.AppendInt(seconds, 16);
+    MOZ_TRY(messages.SetMessageProperty(key, "dateReceived"_ns, value));
+  }
+  for (const auto& extra : header.extras) {
+    if (!extra.k.EqualsLiteral("keywords")) {
+      MOZ_TRY(messages.SetMessageProperty(key, extra.k, extra.v));
+    }
+  }
+  if (header.storeToken) {
+    MOZ_TRY(
+        messages.SetMessageProperty(key, "storeToken"_ns, *header.storeToken));
+  }
+  if (header.messageSize) {
+    MOZ_TRY(messages.SetMessageProperty(key, "messageSize"_ns,
+                                        *header.messageSize));
+  }
+  if (header.offlineMessageSize) {
+    MOZ_TRY(messages.SetMessageProperty(key, "offlineMessageSize"_ns,
+                                        *header.offlineMessageSize));
+  }
+  if (header.lineCount) {
+    MOZ_TRY(
+        messages.SetMessageProperty(key, "lineCount"_ns, *header.lineCount));
+  }
+  return NS_OK;
+}
+
+nsresult DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
+                                            const FolderImportSnapshot& input,
+                                            FolderImportReceipt& output) {
+  NS_ENSURE_ARG_POINTER(source);
+  uint64_t folder;
+  nsAutoCString path;
+  MOZ_TRY(source->GetId(&folder));
+  MOZ_TRY(source->GetPath(path));
+  NS_ENSURE_TRUE(
+      folder == input.identity.folderId && path == input.identity.folderPath,
+      NS_ERROR_INVALID_ARG);
+  nsCOMPtr<nsIFile> summary;
+  MOZ_TRY(source->GetSummaryFile(getter_AddRefs(summary)));
+  return ImportFolderSnapshotFromFile(summary, input, output);
+}
+
+nsresult DatabaseCore::ImportFolderSnapshotFromFile(
+    nsIFile* source, const FolderImportSnapshot& input,
+    FolderImportReceipt& output) {
+  NS_ENSURE_TRUE(input.recordsComplete && input.unhandledRecords.IsEmpty(),
+                 NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool active;
+  MOZ_TRY(sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(CheckFolderImportIdentity(input.identity));
+  nsCString legacyMarker;
+  MOZ_TRY(HashImportSource(source, input, &legacyMarker));
+  RefPtr<DatabaseCore> self(this);
+  RefPtr<MessageDatabase> messages = mMessageDatabase;
+  nsTHashMap<nsMsgKey, nsMsgKey> keys;
+  nsTArray<UniquePtr<MessageDatabase::CachedMsg>> prepared;
+  nsTArray<RefPtr<Message>> live;
+  Maybe<FolderImportReceipt> receipt;
+  MOZ_TRY(sConnection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(CheckFolderImportIdentity(input.identity));
+    MOZ_TRY(ReadFolderImportReceipt(input.identity, receipt));
+    if (receipt) {
+      return sConnection->CommitTransaction();
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(GetStatement(
+          "RequireEmptyImportDestination"_ns,
+          "SELECT 1 FROM messages WHERE folderId = :folder UNION ALL "
+          "SELECT 1 FROM staged_messages WHERE folderId = :folder UNION ALL "
+          "SELECT 1 FROM offline_operations WHERE folderId = :folder LIMIT 1"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, input.identity.folderId));
+      bool occupied;
+      MOZ_TRY(stmt->ExecuteStep(&occupied));
+      NS_ENSURE_FALSE(occupied, NS_ERROR_ALREADY_INITIALIZED);
+    }
+    nsMsgKey first = 0;
+    if (!input.messages.IsEmpty()) {
+      MOZ_TRY(GetNextMessageKey(first));
+      NS_ENSURE_TRUE(uint64_t(first) + input.messages.Length() <= nsMsgKey_None,
+                     NS_ERROR_ILLEGAL_VALUE);
+    }
+    for (uint32_t i = 0; i < input.messages.Length(); ++i) {
+      const auto& row = input.messages[i];
+      NS_ENSURE_TRUE(row.sourceKey != nsMsgKey_None &&
+                         !keys.Contains(row.sourceKey) &&
+                         row.header.key == nsMsgKey_None,
+                     NS_ERROR_INVALID_ARG);
+      keys.InsertOrUpdate(row.sourceKey, first + i);
+    }
+    for (const auto& row : input.messages) {
+      nsMsgKey key, root, parent = 0;
+      NS_ENSURE_TRUE(
+          keys.Get(row.sourceKey, &key) && keys.Get(row.rootSourceKey, &root),
+          NS_ERROR_INVALID_ARG);
+      if (row.parentSourceKey) {
+        NS_ENSURE_TRUE(keys.Get(*row.parentSourceKey, &parent),
+                       NS_ERROR_INVALID_ARG);
+      }
+      MOZ_TRY(WriteImportedMessage(input.identity.folderId, key, root, parent,
+                                   row.header));
+      auto cached = MakeUnique<MessageDatabase::CachedMsg>();
+      MOZ_TRY(messages->FetchMsg(key, *cached));
+      prepared.AppendElement(std::move(cached));
+      live.AppendElement(new Message(key));
+    }
+    for (const auto& property : input.folderProperties) {
+      NS_ENSURE_TRUE(!property.name.EqualsLiteral("morkMigrationSource"),
+                     NS_ERROR_INVALID_ARG);
+      if (property.name.EqualsLiteral("UIDValidity")) {
+        NS_ENSURE_TRUE(property.integer && *property.integer >= 0 &&
+                           uint64_t(*property.integer) <= UINT32_MAX,
+                       NS_ERROR_INVALID_ARG);
+      }
+      if (property.integer) {
+        MOZ_TRY(FolderDB().SetFolderProperty(input.identity.folderId,
+                                             property.name, *property.integer));
+      } else {
+        MOZ_TRY(FolderDB().SetFolderProperty(input.identity.folderId,
+                                             property.name, property.text));
+      }
+    }
+    MOZ_TRY(FolderDB().SetFolderProperty(
+        input.identity.folderId, "morkMigrationSource"_ns, legacyMarker));
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(GetStatement(
+          "WriteFolderImportReceipt"_ns,
+          "INSERT INTO folder_import_receipts(token, sourceId, "
+          "databaseSourceId, "
+          "sourceSha256, folderId, folderPath, sourcePath, messageCount) "
+          "VALUES "
+          "(:token, :source, :database, :hash, :folder, :path, :sourcePath, :count)"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.identity.token));
+      MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, input.identity.sourceId));
+      MOZ_TRY(stmt->BindUTF8StringByName("database"_ns,
+                                         input.identity.databaseSourceId));
+      MOZ_TRY(
+          stmt->BindUTF8StringByName("hash"_ns, input.identity.sourceSha256));
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, input.identity.folderId));
+      MOZ_TRY(stmt->BindUTF8StringByName("path"_ns, input.identity.folderPath));
+      MOZ_TRY(
+          stmt->BindStringByName("sourcePath"_ns, input.identity.sourcePath));
+      MOZ_TRY(stmt->BindInt64ByName("count"_ns, input.messages.Length()));
+      MOZ_TRY(stmt->Execute());
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(GetStatement(
+          "WriteFolderImportKey"_ns,
+          "INSERT INTO folder_import_keys(token, sourceKey, destinationKey) "
+          "VALUES (:token, :source, :destination)"_ns,
+          getter_AddRefs(stmt)));
+      for (const auto& row : input.messages) {
+        mozStorageStatementScoper scoper(stmt);
+        nsMsgKey key;
+        NS_ENSURE_TRUE(keys.Get(row.sourceKey, &key), NS_ERROR_UNEXPECTED);
+        MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.identity.token));
+        MOZ_TRY(stmt->BindInt64ByName("source"_ns, row.sourceKey));
+        MOZ_TRY(stmt->BindInt64ByName("destination"_ns, key));
+        MOZ_TRY(stmt->Execute());
+      }
+    }
+    MOZ_TRY(HashImportSource(source, input));
+    MOZ_TRY(ReadFolderImportReceipt(input.identity, receipt));
+    NS_ENSURE_TRUE(receipt, NS_ERROR_UNEXPECTED);
+    if (!messages->mMsgCache.reserve(messages->mMsgCache.count() +
+                                     prepared.Length())) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    return sConnection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanup = sConnection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanup) && active) {
+      cleanup = sConnection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanup)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Snapshot import rollback failed: 0x%08x",
+               static_cast<uint32_t>(cleanup)));
+    }
+    return rv;
+  }
+  for (auto& cached : prepared) {
+    nsMsgKey key = cached->key;
+    auto entry = messages->mMsgCache.lookup(key);
+    if (entry) {
+      entry->value() = std::move(*cached);
+    } else {
+      messages->mMsgCache.putNewInfallible(key, std::move(*cached));
+    }
+  }
+  output = std::move(*receipt);
+  for (const auto& message : live) {
+    for (MessageListener* listener :
+         messages->mMessageListeners.EndLimitedRange()) {
+      listener->OnMessagePublished(message, false);
+    }
+  }
   return NS_OK;
 }
 

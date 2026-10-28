@@ -314,7 +314,8 @@ class DeliveryCoreProperties : public testing::Test {
       MOZ_TRY(connection->ExecuteSimpleSQL(sql));
     }
     return connection->ExecuteSimpleSQL(
-        "DROP TABLE message_changes; DROP TABLE database_identity"_ns);
+        "DROP TABLE message_changes; DROP TABLE database_identity; "
+        "DROP TABLE folder_import_keys; DROP TABLE folder_import_receipts"_ns);
   }
 
   nsresult MakeVersionTwo() {
@@ -617,7 +618,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UpgradePreservesExistingValues) {
   EXPECT_EQ(before, after);
   int32_t version;
   ASSERT_EQ(NS_OK, Connection()->GetSchemaVersion(&version));
-  EXPECT_EQ(8, version);
+  EXPECT_EQ(9, version);
   ASSERT_NO_FATAL_FAILURE(CheckStored("message_properties"_ns, key,
                                       "native.unsigned"_ns, "4294967295"_ns,
                                       "integer"_ns));

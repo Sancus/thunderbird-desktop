@@ -22,6 +22,7 @@
 
 class mozIStorageConnection;
 class mozIStorageStatement;
+class nsIFile;
 
 namespace mozilla::mailnews {
 
@@ -31,6 +32,49 @@ class DeliveryCoreReferences;
 class DeliveryCoreProperties;
 class DeliveryFolderInfoProperties;
 class DeliveryMessageReferences;
+
+struct FolderImportIdentity {
+  nsCString token;
+  nsCString sourceId;
+  nsCString databaseSourceId;
+  nsCString sourceSha256;
+  uint64_t folderId{0};
+  nsCString folderPath;
+  nsString sourcePath;
+};
+
+struct FolderImportMessage {
+  nsMsgKey sourceKey{nsMsgKey_None};
+  nsMsgKey rootSourceKey{nsMsgKey_None};
+  Maybe<nsMsgKey> parentSourceKey;
+  RawHdr header;
+};
+
+struct FolderImportProperty {
+  nsCString name;
+  nsCString text;
+  Maybe<int64_t> integer;
+};
+
+struct FolderImportSnapshot {
+  FolderImportIdentity identity;
+  uint64_t sourceSize{0};
+  nsTArray<FolderImportMessage> messages;
+  nsTArray<FolderImportProperty> folderProperties;
+  // Set only after accounting for every required source row/table.
+  bool recordsComplete{false};
+  nsTArray<nsCString> unhandledRecords;
+};
+
+struct FolderImportKey {
+  nsMsgKey source{nsMsgKey_None};
+  nsMsgKey destination{nsMsgKey_None};
+};
+
+struct FolderImportReceipt {
+  FolderImportIdentity identity;
+  nsTArray<FolderImportKey> keys;
+};
 
 class DatabaseCore : public nsIDatabaseCore,
                      public nsIMsgDBService,
@@ -47,6 +91,13 @@ class DatabaseCore : public nsIDatabaseCore,
 
   FolderDatabase& FolderDB() { return *mFolderDatabase; }
   MessageDatabase& MessageDB() { return *mMessageDatabase; }
+
+  // Native converted snapshot boundary; no legacy database service is started.
+  nsresult ImportFolderSnapshot(nsIMsgFolder* source,
+                                const FolderImportSnapshot& input,
+                                FolderImportReceipt& output);
+  nsresult GetFolderImportReceipt(const FolderImportIdentity& identity,
+                                  Maybe<FolderImportReceipt>& output);
 
  protected:
   virtual ~DatabaseCore() {};
@@ -79,6 +130,14 @@ class DatabaseCore : public nsIDatabaseCore,
   static nsresult UpgradeSchema();
   // Caller owns the insert transaction; the insert advances the high-water mark.
   static nsresult GetNextMessageKey(nsMsgKey& key);
+  nsresult ImportFolderSnapshotFromFile(nsIFile* source,
+                                        const FolderImportSnapshot& input,
+                                        FolderImportReceipt& output);
+  nsresult CheckFolderImportIdentity(const FolderImportIdentity& identity);
+  nsresult ReadFolderImportReceipt(const FolderImportIdentity& identity,
+                                   Maybe<FolderImportReceipt>& output);
+  nsresult WriteImportedMessage(uint64_t folderId, nsMsgKey key, nsMsgKey root,
+                                nsMsgKey parent, const RawHdr& header);
 
   static nsresult GetStatement(const nsACString& aName, const nsACString& aSQL,
                                mozIStorageStatement** aStmt);

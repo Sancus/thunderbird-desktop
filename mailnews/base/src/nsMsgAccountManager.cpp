@@ -22,6 +22,7 @@
 #include "nscore.h"
 #include "prprf.h"
 #include "nsIMsgFolderCache.h"
+#include "nsIFolderLookupService.h"
 #include "nsMsgFolderCache.h"
 #include "nsMsgUtils.h"
 #include "nsMsgDBFolder.h"
@@ -586,6 +587,19 @@ nsMsgAccountManager::RemoveIncomingServer(nsIMsgIncomingServer* aServer,
                        nsIScriptError::warningFlag);
     }
   }
+  if (rootFolder && mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Retained folder objects must not be found under a replacement server.
+    nsCOMPtr<nsIFolderLookupService> lookup =
+        do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    for (const auto& folder : allDescendants) {
+      rv = lookup->EvictFolder(folder);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+    rv = lookup->EvictFolder(rootFolder);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
   // Invalidate the `FindServer()` cache entry for this server. We need to do
   // this after the folders have been removed from the folder cache, because the
   // folders might end up querying the account manager to get a reference on

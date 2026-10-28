@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <utility>
 
 #include "DatabaseUtils.h"
@@ -466,7 +467,7 @@ nsresult CheckReferenceSchemaTable(mozIStorageConnection* connection,
 nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version >= 0 && version <= 9, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 10, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -809,6 +810,120 @@ nsresult DatabaseCore::UpgradeSchema() {
   MOZ_TRY(CheckReferenceSchemaTable(
       sConnection, "folder_import_keys",
       "token:TEXT:1:1,sourceKey:INTEGER:1:2,destinationKey:INTEGER:1:0"));
+  if (version < 10) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE body_relocations(folderId INTEGER PRIMARY KEY, token "
+        "TEXT NOT NULL UNIQUE, "
+        "sourceId TEXT NOT NULL, original TEXT NOT NULL, compacted TEXT NOT "
+        "NULL, backup TEXT NOT NULL, "
+        "originalSize INTEGER NOT NULL, compactedSize INTEGER NOT NULL, state "
+        "INTEGER NOT NULL, "
+        "messageCount INTEGER NOT NULL);"
+        "CREATE TABLE body_relocation_rows(folderId INTEGER NOT NULL, id "
+        "INTEGER NOT NULL, "
+        "oldToken TEXT, content INTEGER NOT NULL, location INTEGER NOT NULL, "
+        "size INTEGER NOT NULL, "
+        "offlineSize INTEGER NOT NULL, lines INTEGER NOT NULL, flags INTEGER "
+        "NOT NULL, newToken TEXT, "
+        "newSize INTEGER NOT NULL, newOfflineSize INTEGER NOT NULL, newLines "
+        "INTEGER NOT NULL, "
+        "offline INTEGER NOT NULL, PRIMARY KEY(folderId,id));"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(10));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "body_relocations",
+      "folderId:INTEGER:0:1,token:TEXT:1:0,sourceId:TEXT:1:0,original:TEXT:1:0,"
+      "compacted:TEXT:1:0,backup:TEXT:1:0,originalSize:INTEGER:1:0,"
+      "compactedSize:INTEGER:1:0,"
+      "state:INTEGER:1:0,messageCount:INTEGER:1:0"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "body_relocation_rows",
+      "folderId:INTEGER:1:1,id:INTEGER:1:2,oldToken:TEXT:0:0,content:INTEGER:1:"
+      "0,location:INTEGER:1:0,"
+      "size:INTEGER:1:0,offlineSize:INTEGER:1:0,lines:INTEGER:1:0,flags:"
+      "INTEGER:1:0,newToken:TEXT:0:0,"
+      "newSize:INTEGER:1:0,newOfflineSize:INTEGER:1:0,newLines:INTEGER:1:0,"
+      "offline:INTEGER:1:0"));
+  for (const auto* table :
+       {"messages", "staged_messages", "folder_properties", "folders",
+        "offline_operations", "offline_attempts", "offline_copy_destinations",
+        "message_properties", "message_references", "message_reference_sets",
+        "staged_message_properties", "staged_message_references",
+        "staged_message_reference_sets"}) {
+    for (const auto* action : {"INSERT", "UPDATE", "DELETE"}) {
+      nsAutoCString sql("CREATE TRIGGER IF NOT EXISTS relocation_guard_");
+      sql.Append(table);
+      sql.Append('_');
+      sql.Append(action);
+      sql.AppendLiteral(" BEFORE ");
+      sql.Append(action);
+      sql.AppendLiteral(" ON ");
+      sql.Append(table);
+      sql.AppendLiteral(
+          " WHEN EXISTS(SELECT 1 FROM body_relocations r WHERE r.state NOT "
+          "IN(1,2) AND "
+          "(");
+      bool first = true;
+      for (const auto* row : {"OLD", "NEW"}) {
+        if ((strcmp(action, "INSERT") == 0 && strcmp(row, "OLD") == 0) ||
+            (strcmp(action, "DELETE") == 0 && strcmp(row, "NEW") == 0)) {
+          continue;
+        }
+        if (!first) {
+          sql.AppendLiteral(" OR ");
+        }
+        first = false;
+        if (strcmp(table, "messages") == 0 ||
+            strcmp(table, "staged_messages") == 0 ||
+            strcmp(table, "offline_operations") == 0) {
+          sql.AppendLiteral("r.folderId=");
+          sql.Append(row);
+          sql.AppendLiteral(".folderId");
+        } else if (strcmp(table, "offline_attempts") == 0) {
+          sql.AppendLiteral("r.folderId IN (");
+          sql.Append(row);
+          sql.AppendLiteral(".sourceFolderId,");
+          sql.Append(row);
+          sql.AppendLiteral(".destinationFolderId,");
+          sql.Append(row);
+          sql.AppendLiteral(".operationFolderId)");
+        } else if (strcmp(table, "offline_copy_destinations") == 0) {
+          sql.AppendLiteral(
+              "r.folderId IN (SELECT folderId FROM offline_operations WHERE "
+              "id=");
+          sql.Append(row);
+          sql.AppendLiteral(".operationId)");
+        } else if (strcmp(table, "folders") == 0) {
+          sql.AppendLiteral(
+              "r.folderId IN (WITH RECURSIVE children(id) AS (SELECT ");
+          sql.Append(row);
+          sql.AppendLiteral(
+              ".id UNION SELECT f.id FROM folders f JOIN children c ON "
+              "f.parent=c.id) SELECT id FROM children)");
+        } else if (strcmp(table, "folder_properties") == 0) {
+          sql.AppendLiteral("r.folderId=");
+          sql.Append(row);
+          sql.AppendLiteral(".id");
+        } else {
+          sql.AppendLiteral("r.folderId IN (SELECT folderId FROM ");
+          sql.Append(StringBeginsWith(nsDependentCString(table), "staged_"_ns)
+                         ? "staged_messages"
+                         : "messages");
+          sql.AppendLiteral(" WHERE id=");
+          sql.Append(row);
+          sql.AppendLiteral(".id)");
+        }
+      }
+      sql.AppendLiteral(
+          ")) BEGIN SELECT RAISE(ABORT,'pending body relocation'); END");
+      MOZ_TRY(sConnection->ExecuteSimpleSQL(sql));
+    }
+  }
+  MOZ_TRY(sConnection->ExecuteSimpleSQL(
+      "CREATE TRIGGER IF NOT EXISTS body_relocation_folder_delete AFTER DELETE "
+      "ON folders BEGIN "
+      "DELETE FROM body_relocation_rows WHERE folderId=OLD.id; "
+      "DELETE FROM body_relocations WHERE folderId=OLD.id; END"_ns));
   return NS_OK;
 }
 
@@ -904,6 +1019,7 @@ nsresult DatabaseCore::CheckFolderImportIdentity(
   bool exists;
   MOZ_TRY(stmt->ExecuteStep(&exists));
   NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(MessageDB().CheckPendingFolderRelocation(identity.folderId));
   nsCString path = MOZ_TRY(mFolderDatabase->GetFolderPath(identity.folderId));
   NS_ENSURE_TRUE(path == identity.folderPath, NS_ERROR_NOT_AVAILABLE);
   return NS_OK;

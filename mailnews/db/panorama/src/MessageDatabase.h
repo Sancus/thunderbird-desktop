@@ -47,6 +47,32 @@ struct FinishedMessageBody {
   bool offline{false};
 };
 
+enum class BodyRelocationState : uint32_t { Pending, Installed, Restored };
+enum class BodyRelocationOutcome { Installed, Restored };
+
+struct RelocatedMessageBody {
+  MessageBodyState before;
+  Maybe<nsCString> storeToken;
+  uint32_t messageSize{0};
+  uint32_t offlineMessageSize{0};
+  uint32_t lineCount{0};
+  bool offline{false};
+};
+
+struct FolderBodyRelocation {
+  nsCString databaseSourceId;
+  nsCString token;
+  uint64_t folderId{0};
+  nsString originalPath;
+  nsString compactedPath;
+  nsString backupPath;
+  uint64_t originalSize{0};
+  uint64_t compactedSize{0};
+  BodyRelocationState state{BodyRelocationState::Pending};
+  // Every published physical key in the folder, in ascending order.
+  nsTArray<RelocatedMessageBody> messages;
+};
+
 // Combined legacy operation payload; copy destinations retain their order.
 struct OfflineOperationData {
   uint32_t operation{0};
@@ -213,6 +239,17 @@ class MessageDatabase : public nsIMessageDatabase {
                              const FinishedMessageBody& finished,
                              MessageBodyState& output);
 
+  // Pending relocation blocks new body resolutions and folder mutation.
+  nsresult CheckFolderBodyAccess(uint64_t folderId);
+  nsresult CheckMessageBodyAccess(nsMsgKey key);
+  // Unpublished staged rows in this folder defer preparation with IN_PROGRESS.
+  nsresult PrepareBodyRelocation(const FolderBodyRelocation& input);
+  nsresult GetBodyRelocation(uint64_t folderId,
+                             Maybe<FolderBodyRelocation>& output);
+  nsresult ListPendingBodyRelocations(nsTArray<uint64_t>& output);
+  nsresult SettleBodyRelocation(uint64_t folderId, const nsACString& token,
+                                BodyRelocationOutcome outcome);
+
   // Whole-payload writes are atomic. Sent/ambiguous attempts freeze payloads.
   // Missing records return NOT_AVAILABLE; reads leave output unchanged on
   // error. Reserves a disjoint key for folder-wide operations without a message
@@ -364,6 +401,11 @@ class MessageDatabase : public nsIMessageDatabase {
                                                bool allowStaged);
 
   nsresult ReadMessageBodyState(nsMsgKey key, MessageBodyState& output);
+  nsresult ReadBodyRelocation(uint64_t folderId,
+                              Maybe<FolderBodyRelocation>& output);
+  nsresult VerifyBodyRelocationRows(const FolderBodyRelocation& plan);
+  nsresult CheckPendingFolderRelocation(uint64_t folderId);
+  nsresult CheckPendingMessageRelocation(nsMsgKey key);
   nsresult RequireCommittedSearchRead();
   nsresult GetSearchWatermark(uint64_t& sequence);
 

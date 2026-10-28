@@ -24,6 +24,7 @@
 #include "nsDirectoryServiceUtils.h"
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
+#include "nsLocalFile.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgDatabase.h"
 #include "nsIProperties.h"
@@ -359,6 +360,61 @@ class DeliveryCoreReferences : public testing::Test {
     EXPECT_FALSE(more);
   }
 
+  nsresult PrepareRelocation(FolderBodyRelocation& plan) {
+    plan.folderId = mFolderId;
+    plan.token = "relocation-unit"_ns;
+    MOZ_TRY(mCore->GetSourceId(plan.databaseSourceId));
+    plan.originalSize = 64;
+    plan.compactedSize = 32;
+    for (auto pair : {std::pair{u"body.old", &plan.originalPath},
+                      {u"body.compacted", &plan.compactedPath},
+                      {u"body.backup", &plan.backupPath}}) {
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(mProfile->Clone(getter_AddRefs(file)));
+      MOZ_TRY(file->Append(nsDependentString(pair.first)));
+      MOZ_TRY(file->GetPath(*pair.second));
+      if (pair.second != &plan.backupPath) {
+        MOZ_TRY(file->Create(nsIFile::NORMAL_FILE_TYPE, 0600));
+        MOZ_TRY(file->SetFileSize(pair.second == &plan.originalPath ? 64 : 32));
+      }
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+      nsMsgKey key;
+      nsAutoCString id("relocation-");
+      id.AppendInt(i);
+      MOZ_TRY(Add(id, {"ancestor"_ns, "ancestor"_ns}, key));
+      RelocatedMessageBody* row = plan.messages.AppendElement();
+      nsAutoCString token("old-");
+      token.AppendInt(i);
+      MOZ_TRY(mCore->MessageDB().SetMessageStoreToken(key, token));
+      MOZ_TRY(mCore->MessageDB().SetMessageFlags(key, 5));
+      MOZ_TRY(
+          mCore->MessageDB().SetMessageProperty(key, "Case"_ns, "00042"_ns));
+      MOZ_TRY(mCore->MessageDB().GetMessageBodyState(key, row->before));
+      token.AssignLiteral("new-");
+      token.AppendInt(i);
+      row->storeToken = Some(nsCString(token));
+      row->messageSize = 10 + i;
+      row->offlineMessageSize = 8 + i;
+      row->lineCount = 2 + i;
+      row->offline = true;
+    }
+    return NS_OK;
+  }
+
+  nsresult InstallRelocation(const FolderBodyRelocation& plan) {
+    nsCOMPtr<nsIFile> original, compacted, backup, directory;
+    MOZ_TRY(NS_NewLocalFile(plan.originalPath, getter_AddRefs(original)));
+    MOZ_TRY(NS_NewLocalFile(plan.compactedPath, getter_AddRefs(compacted)));
+    MOZ_TRY(NS_NewLocalFile(plan.backupPath, getter_AddRefs(backup)));
+    MOZ_TRY(original->GetParent(getter_AddRefs(directory)));
+    nsAutoString oldName, backupName;
+    MOZ_TRY(original->GetLeafName(oldName));
+    MOZ_TRY(backup->GetLeafName(backupName));
+    MOZ_TRY(original->RenameTo(directory, backupName));
+    return compacted->RenameTo(directory, oldName);
+  }
+
   nsresult PrepareNativeImport(FolderImportSnapshot& input, nsIFile** source) {
     uint64_t folder;
     MOZ_TRY(mCore->FolderDB().InsertFolder(mFolderId, "Import"_ns, &folder));
@@ -667,7 +723,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   EXPECT_TRUE(got.IsEmpty());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(9, version);
+  EXPECT_EQ(10, version);
   Stop();
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(7, got));
@@ -3496,4 +3552,294 @@ TEST_F(DeliveryCoreReferences,
 }
 
 }  // namespace
+
+TEST_F(DeliveryCoreReferences, RelocationPendingSurvivesReopenAndGatesAccess) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  auto key = plan.messages[0].before.key;
+  uint64_t other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Other"_ns, &other));
+  RawHdr controlHeader;
+  controlHeader.messageId = "unrelated-row"_ns;
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(other, controlHeader, false,
+                                                 &control));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().PrepareBodyRelocation(plan));
+  nsTArray<uint64_t> pending;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListPendingBodyRelocations(pending));
+  EXPECT_EQ((nsTArray<uint64_t>{mFolderId}), pending);
+  Stop();
+  ASSERT_FALSE(mCore);
+  ASSERT_FALSE(mConnection);
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  Maybe<FolderBodyRelocation> stored;
+  ASSERT_EQ(NS_OK, db.GetBodyRelocation(mFolderId, stored));
+  ASSERT_TRUE(stored);
+  EXPECT_EQ(plan.originalPath, stored->originalPath);
+  EXPECT_EQ(plan.backupPath, stored->backupPath);
+  EXPECT_EQ(BodyRelocationState::Pending, stored->state);
+  EXPECT_EQ(2u, stored->messages.Length());
+  MessageBodyState output;
+  output.key = 77;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.GetMessageBodyState(key, output));
+  EXPECT_EQ(77u, output.key);
+  nsCString token("sentinel");
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.GetMessageStoreToken(key, token));
+  EXPECT_EQ("sentinel"_ns, token);
+  EXPECT_EQ(NS_OK, db.SetMessageStoreToken(control, "unrelated-body"_ns));
+  ASSERT_EQ(NS_OK, db.GetMessageStoreToken(control, token));
+  EXPECT_EQ("unrelated-body"_ns, token);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.SetMessageFlags(key, 1));
+  nsMsgKey rejected = 77;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, Add("late"_ns, {}, rejected));
+  EXPECT_EQ(77u, rejected);
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, db.RemoveMessage(key));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SettleBodyRelocation(mFolderId, plan.token,
+                                    BodyRelocationOutcome::Installed));
+  ASSERT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Restored));
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, output));
+  EXPECT_EQ(plan.messages[0].before.storeToken, output.storeToken);
+  EXPECT_EQ(plan.messages[0].before.contentRevision, output.contentRevision);
+  EXPECT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Restored));
+}
+
+TEST_F(DeliveryCoreReferences, RelocationInstallsWholeSetBeforeFirstCallback) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.PrepareBodyRelocation(plan));
+  ASSERT_EQ(NS_OK, InstallRelocation(plan));
+  uint32_t calls = 0;
+  RefPtr<BodyObserver> observer = new BodyObserver([&](nsIMsgDBHdr* old,
+                                                       Message* live,
+                                                       const MessageBodyState&
+                                                           before,
+                                                       const MessageBodyState&
+                                                           after) {
+    ++calls;
+    bool active = true;
+    ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    for (const auto& expected : plan.messages) {
+      MessageBodyState current;
+      ASSERT_EQ(NS_OK, db.GetMessageBodyState(expected.before.key, current));
+      EXPECT_EQ(expected.storeToken, current.storeToken);
+      EXPECT_EQ(expected.messageSize, current.messageSize);
+      EXPECT_GT(current.locationRevision, expected.before.locationRevision);
+    }
+    nsCString token;
+    ASSERT_EQ(NS_OK, old->GetStoreToken(token));
+    EXPECT_EQ(*before.storeToken, token);
+    ASSERT_EQ(NS_OK, live->GetStoreToken(token));
+    EXPECT_EQ(*after.storeToken, token);
+    uint32_t flags = 0;
+    ASSERT_EQ(NS_OK, live->GetFlags(&flags));
+    EXPECT_EQ(5u | 0x80u, flags);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+    for (const auto& row : plan.messages) {
+      ASSERT_EQ(
+          NS_OK,
+          PublicationCell(
+              reader, row.before.key,
+              "SELECT value FROM message_properties WHERE id=:id AND name='storeToken'"_ns,
+              token));
+      EXPECT_EQ(*row.storeToken, token);
+    }
+  });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Installed));
+  EXPECT_EQ(2u, calls);
+  EXPECT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Installed));
+  EXPECT_EQ(2u, calls);
+  for (const auto& row : plan.messages) {
+    nsCString text;
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(row.before.key, "Case"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
+    nsTArray<nsCString> references;
+    ASSERT_EQ(NS_OK, Stored(row.before.key, references));
+    EXPECT_EQ((nsTArray<nsCString>{"ancestor"_ns, "ancestor"_ns}), references);
+  }
+  nsCOMPtr<nsIFile> backup;
+  ASSERT_EQ(NS_OK, NS_NewLocalFile(plan.backupPath, getter_AddRefs(backup)));
+  int64_t size = 0;
+  ASSERT_EQ(NS_OK, backup->GetFileSize(&size));
+  EXPECT_EQ(64, size);
+}
+
+TEST_F(DeliveryCoreReferences, RelocationFailureKeepsIntentAndAllOldRows) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.PrepareBodyRelocation(plan));
+  auto readScalar = [&](const nsACString& sql, int64_t& value) -> nsresult {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(Connection()->CreateStatement(sql, getter_AddRefs(stmt)));
+    auto finalize = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+    return stmt->GetInt64(0, &value);
+  };
+  int64_t watermark;
+  ASSERT_EQ(NS_OK, readScalar("SELECT MAX(sequence) FROM message_changes"_ns,
+                              watermark));
+  ASSERT_EQ(NS_OK, InstallRelocation(plan));
+  uint32_t calls = 0;
+  RefPtr<BodyObserver> observer =
+      new BodyObserver([&](nsIMsgDBHdr*, Message*, const MessageBodyState&,
+                           const MessageBodyState&) { ++calls; });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_relocation BEFORE INSERT ON message_properties WHEN NEW.name='storeToken' AND NEW.value='new-1' BEGIN SELECT RAISE(ABORT,'second relocation'); END"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.SettleBodyRelocation(mFolderId, plan.token,
+                                    BodyRelocationOutcome::Installed));
+  EXPECT_EQ(0u, calls);
+  int64_t sequence, oldTokens;
+  ASSERT_EQ(NS_OK, readScalar("SELECT MAX(sequence) FROM message_changes"_ns,
+                              sequence));
+  EXPECT_EQ(watermark, sequence);
+  ASSERT_EQ(
+      NS_OK,
+      readScalar(
+          "SELECT COUNT(*) FROM message_properties WHERE name='storeToken' AND value IN('old-0','old-1')"_ns,
+          oldTokens));
+  EXPECT_EQ(2, oldTokens);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.CheckFolderBodyAccess(mFolderId));
+  bool active = true;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP TRIGGER fail_relocation"_ns));
+  ASSERT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Installed));
+  EXPECT_EQ(2u, calls);
+}
+
+TEST_F(DeliveryCoreReferences, RelocationRejectsIncompleteAndStaleSets) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  auto& db = mCore->MessageDB();
+  auto last = plan.messages.LastElement();
+  plan.messages.RemoveLastElement();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.PrepareBodyRelocation(plan));
+  plan.messages.AppendElement(std::move(last));
+  nsMsgKey late;
+  ASSERT_EQ(NS_OK, Add("late-row"_ns, {}, late));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.PrepareBodyRelocation(plan));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(late));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(plan.messages[0].before.key, "Case"_ns,
+                                         "later"_ns));
+  ASSERT_EQ(NS_OK, db.NoteMessageContentChanged(plan.messages[0].before.key));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.PrepareBodyRelocation(plan));
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(plan.messages[0].before.key,
+                                          plan.messages[0].before));
+  --plan.originalSize;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.PrepareBodyRelocation(plan));
+  ++plan.originalSize;
+  ASSERT_EQ(NS_OK, db.PrepareBodyRelocation(plan));
+  ASSERT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Restored));
+}
+
+TEST_F(DeliveryCoreReferences, RelocationRejectsStagedBodyOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  auto& db = mCore->MessageDB();
+  RawHdr raw;
+  raw.messageId = "staged-body@invalid"_ns;
+  raw.storeToken = Some(nsCString("unpublished-body"_ns));
+  nsMsgKey staged;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  uint64_t otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, "Other"_ns,
+                                                  &otherFolder));
+  nsMsgKey otherStaged;
+  ASSERT_EQ(NS_OK, db.StageMessage(otherFolder, raw, &otherStaged));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.PrepareBodyRelocation(plan));
+  Maybe<FolderBodyRelocation> intent;
+  ASSERT_EQ(NS_OK, db.GetBodyRelocation(mFolderId, intent));
+  EXPECT_FALSE(intent);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(mFolderId, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{staged}), keys);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(staged, exists));
+  EXPECT_FALSE(exists);
+  nsCString token;
+  ASSERT_EQ(NS_OK, db.GetMessageStoreToken(staged, token));
+  EXPECT_EQ("unpublished-body"_ns, token);
+  MessageBodyState current;
+  ASSERT_EQ(NS_OK,
+            db.GetMessageBodyState(plan.messages[0].before.key, current));
+  EXPECT_EQ(plan.messages[0].before.storeToken, current.storeToken);
+  EXPECT_EQ(plan.messages[0].before.contentRevision, current.contentRevision);
+  bool active = true;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, db.AbortMessage(staged));
+  ASSERT_EQ(NS_OK, db.PrepareBodyRelocation(plan));
+  ASSERT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Restored));
+  EXPECT_EQ(NS_OK, db.CheckFolderBodyAccess(mFolderId));
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(otherFolder, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{otherStaged}), keys);
+  ASSERT_EQ(NS_OK, db.AbortMessage(otherStaged));
+}
+
+TEST_F(DeliveryCoreReferences, RelocationReadErrorsPreserveOutputAndGate) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.PrepareBodyRelocation(plan));
+  Maybe<FolderBodyRelocation> output = Some(FolderBodyRelocation{});
+  output->folderId = 77;
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP VIEW body_relocation_rows AS SELECT folderId,abs(-9223372036854775808) AS id,oldToken,content,location,size,offlineSize,lines,flags,newToken,newSize,newOfflineSize,newLines,offline FROM main.body_relocation_rows"_ns));
+  EXPECT_EQ(NS_ERROR_FAILURE, db.GetBodyRelocation(mFolderId, output));
+  ASSERT_TRUE(output);
+  EXPECT_EQ(77u, output->folderId);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP VIEW temp.body_relocation_rows"_ns));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  nsTArray<uint64_t> pending{77};
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.ListPendingBodyRelocations(pending));
+  EXPECT_EQ((nsTArray<uint64_t>{77}), pending);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db.GetBodyRelocation(mFolderId, output));
+  ASSERT_TRUE(output);
+  EXPECT_EQ(BodyRelocationState::Pending, output->state);
+  ASSERT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Restored));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.CheckMessageBodyAccess(plan.messages[0].before.key));
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  EXPECT_EQ(NS_OK, db.CheckMessageBodyAccess(plan.messages[0].before.key));
+}
+
 }  // namespace mozilla::mailnews

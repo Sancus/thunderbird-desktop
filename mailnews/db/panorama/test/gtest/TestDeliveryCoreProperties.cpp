@@ -287,6 +287,22 @@ class DeliveryCoreProperties : public testing::Test {
   }
 
   nsresult DropSearchSchema(mozIStorageConnection* connection) {
+    for (const auto* table :
+         {"messages", "staged_messages", "folder_properties", "folders",
+          "offline_operations", "offline_attempts", "offline_copy_destinations",
+          "message_properties", "message_references", "message_reference_sets",
+          "staged_message_properties", "staged_message_references",
+          "staged_message_reference_sets"}) {
+      for (const auto* action : {"INSERT", "UPDATE", "DELETE"}) {
+        nsAutoCString sql("DROP TRIGGER IF EXISTS relocation_guard_");
+        sql.Append(table);
+        sql.Append('_');
+        sql.Append(action);
+        MOZ_TRY(connection->ExecuteSimpleSQL(sql));
+      }
+    }
+    MOZ_TRY(connection->ExecuteSimpleSQL(
+        "DROP TRIGGER body_relocation_folder_delete; DROP TABLE body_relocation_rows; DROP TABLE body_relocations"_ns));
     MOZ_TRY(connection->ExecuteSimpleSQL(
         "DROP TRIGGER delete_offline_copies;"
         "DROP TABLE offline_copy_destinations; DROP TABLE offline_attempts;"
@@ -618,7 +634,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UpgradePreservesExistingValues) {
   EXPECT_EQ(before, after);
   int32_t version;
   ASSERT_EQ(NS_OK, Connection()->GetSchemaVersion(&version));
-  EXPECT_EQ(9, version);
+  EXPECT_EQ(10, version);
   ASSERT_NO_FATAL_FAILURE(CheckStored("message_properties"_ns, key,
                                       "native.unsigned"_ns, "4294967295"_ns,
                                       "integer"_ns));

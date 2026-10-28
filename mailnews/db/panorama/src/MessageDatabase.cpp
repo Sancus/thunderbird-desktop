@@ -24,10 +24,14 @@
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/Try.h"
 #include "mozilla/fallible.h"
+#include "mozilla/UniquePtr.h"
+#include "nsIFile.h"
+#include "nsLocalFile.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
+#include "nsReadableUtils.h"
 
 using mozilla::LazyLogModule;
 using mozilla::LogLevel;
@@ -137,6 +141,7 @@ NS_IMETHODIMP MessageDatabase::GetSearchState(
   int64_t folder, flags, folderFlags = 0, sequence, content, location, policy;
   bool folderMissing;
   MOZ_TRY(stmt->GetInt64(0, &folder));
+  MOZ_TRY(CheckFolderBodyAccess(static_cast<uint64_t>(folder)));
   MOZ_TRY(stmt->GetInt64(1, &flags));
   MOZ_TRY(stmt->GetIsNull(9, &folderMissing));
   if (!folderMissing) {
@@ -183,9 +188,568 @@ NS_IMETHODIMP MessageDatabase::GetSearchState(
   return NS_OK;
 }
 
+namespace {
+
+bool SameBodyGuard(const MessageBodyState& a, const MessageBodyState& b) {
+  return a.databaseSourceId == b.databaseSourceId && a.key == b.key &&
+         a.folderId == b.folderId && a.storeToken == b.storeToken &&
+         a.contentRevision == b.contentRevision &&
+         a.locationRevision == b.locationRevision &&
+         a.messageSize == b.messageSize &&
+         a.offlineMessageSize == b.offlineMessageSize &&
+         a.lineCount == b.lineCount &&
+         !((a.flags ^ b.flags) & nsMsgMessageFlags::Offline);
+}
+
+nsresult BodyFile(const nsAString& path, Maybe<uint64_t> size) {
+  nsCOMPtr<nsIFile> file;
+  MOZ_TRY(NS_NewLocalFile(path, getter_AddRefs(file)));
+  bool exists;
+  MOZ_TRY(file->Exists(&exists));
+  NS_ENSURE_TRUE(exists == size.isSome(), NS_ERROR_NOT_AVAILABLE);
+  if (exists) {
+    bool regular, link;
+    MOZ_TRY(file->IsFile(&regular));
+    MOZ_TRY(file->IsSymlink(&link));
+    NS_ENSURE_TRUE(regular && !link, NS_ERROR_NOT_AVAILABLE);
+    int64_t actual;
+    MOZ_TRY(file->GetFileSize(&actual));
+    NS_ENSURE_TRUE(actual >= 0 && uint64_t(actual) == *size,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  return NS_OK;
+}
+
+nsresult RelocationFiles(const FolderBodyRelocation& plan,
+                         Maybe<BodyRelocationOutcome> outcome = Nothing()) {
+  NS_ENSURE_TRUE(
+      !plan.originalPath.IsEmpty() && !plan.compactedPath.IsEmpty() &&
+          !plan.backupPath.IsEmpty() &&
+          plan.originalPath != plan.compactedPath &&
+          plan.originalPath != plan.backupPath &&
+          plan.compactedPath != plan.backupPath &&
+          plan.originalSize <= INT64_MAX && plan.compactedSize <= INT64_MAX,
+      NS_ERROR_INVALID_ARG);
+  bool installed = outcome && *outcome == BodyRelocationOutcome::Installed;
+  MOZ_TRY(BodyFile(plan.originalPath,
+                   Some(installed ? plan.compactedSize : plan.originalSize)));
+  MOZ_TRY(BodyFile(plan.compactedPath,
+                   installed ? Nothing() : Some(plan.compactedSize)));
+  return BodyFile(plan.backupPath,
+                  installed ? Some(plan.originalSize) : Nothing());
+}
+
+nsresult RollbackBody(mozIStorageConnection* connection, nsresult original) {
+  bool active;
+  nsresult cleanup = connection->GetTransactionInProgress(&active);
+  if (NS_SUCCEEDED(cleanup) && active) {
+    cleanup = connection->RollbackTransaction();
+  }
+  if (NS_FAILED(cleanup)) {
+    MOZ_LOG(gPanoramaLog, LogLevel::Error,
+            ("Body relocation rollback failed: 0x%08x",
+             static_cast<uint32_t>(cleanup)));
+  }
+  return original;
+}
+
+}  // namespace
+
+nsresult MessageDatabase::CheckFolderBodyAccess(uint64_t folderId) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  return CheckPendingFolderRelocation(folderId);
+}
+
+nsresult MessageDatabase::CheckPendingFolderRelocation(uint64_t folderId) {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mMessageDatabase.get() == this,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CheckFolderBodyAccess"_ns,
+      "SELECT 1 FROM body_relocations WHERE folderId=:folder AND state NOT IN(1,2)"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  return more ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
+nsresult MessageDatabase::CheckMessageBodyAccess(nsMsgKey key) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  return CheckPendingMessageRelocation(key);
+}
+
+nsresult MessageDatabase::CheckPendingMessageRelocation(nsMsgKey key) {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mMessageDatabase.get() == this,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CheckMessageBodyAccess"_ns,
+      "SELECT 1 FROM body_relocations WHERE state NOT IN(1,2) AND folderId IN "
+      "(SELECT folderId FROM messages WHERE id=:id UNION SELECT folderId FROM staged_messages WHERE id=:id)"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  return more ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
+nsresult MessageDatabase::GetBodyRelocation(
+    uint64_t folderId, Maybe<FolderBodyRelocation>& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  Maybe<FolderBodyRelocation> found;
+  MOZ_TRY(ReadBodyRelocation(folderId, found));
+  if (found) {
+    nsCString source;
+    MOZ_TRY(DatabaseCore::sInstance->GetSourceId(source));
+    NS_ENSURE_TRUE(found->databaseSourceId == source, NS_ERROR_NOT_AVAILABLE);
+  }
+  output = std::move(found);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ListPendingBodyRelocations(
+    nsTArray<uint64_t>& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ListPendingBodyRelocations"_ns,
+      "SELECT folderId FROM body_relocations WHERE state NOT IN(1,2) ORDER BY folderId"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  nsTArray<uint64_t> found;
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t folder;
+    MOZ_TRY(stmt->GetInt64(0, &folder));
+    NS_ENSURE_TRUE(folder > 0, NS_ERROR_FILE_CORRUPTED);
+    found.AppendElement(folder);
+  }
+  output = std::move(found);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ReadBodyRelocation(
+    uint64_t folderId, Maybe<FolderBodyRelocation>& output) {
+  FolderBodyRelocation plan;
+  plan.folderId = folderId;
+  int64_t count;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReadBodyRelocation"_ns,
+        "SELECT "
+        "token,sourceId,original,compacted,backup,originalSize,compactedSize,"
+        "state,messageCount "
+        "FROM body_relocations WHERE folderId=:folder"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      output.reset();
+      return NS_OK;
+    }
+    MOZ_TRY(stmt->GetUTF8String(0, plan.token));
+    MOZ_TRY(stmt->GetUTF8String(1, plan.databaseSourceId));
+    MOZ_TRY(stmt->GetString(2, plan.originalPath));
+    MOZ_TRY(stmt->GetString(3, plan.compactedPath));
+    MOZ_TRY(stmt->GetString(4, plan.backupPath));
+    int64_t original, compacted, state;
+    MOZ_TRY(stmt->GetInt64(5, &original));
+    MOZ_TRY(stmt->GetInt64(6, &compacted));
+    MOZ_TRY(stmt->GetInt64(7, &state));
+    MOZ_TRY(stmt->GetInt64(8, &count));
+    NS_ENSURE_TRUE(original >= 0 && compacted >= 0 && state >= 0 &&
+                       state <= 2 && count >= 0 &&
+                       uint64_t(count) <= UINT32_MAX && !plan.token.IsEmpty() &&
+                       !plan.databaseSourceId.IsEmpty(),
+                   NS_ERROR_FILE_CORRUPTED);
+    plan.originalSize = original;
+    plan.compactedSize = compacted;
+    plan.state = static_cast<BodyRelocationState>(state);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReadBodyRelocationRows"_ns,
+      "SELECT "
+      "id,oldToken,content,location,size,offlineSize,lines,flags,newToken,"
+      "newSize,newOfflineSize,newLines,offline "
+      "FROM body_relocation_rows WHERE folderId=:folder ORDER BY id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    RelocatedMessageBody* row = plan.messages.AppendElement();
+    row->before.folderId = folderId;
+    row->before.databaseSourceId = plan.databaseSourceId;
+    int64_t value;
+    MOZ_TRY(stmt->GetInt64(0, &value));
+    NS_ENSURE_TRUE(value > 0 && value < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+    row->before.key = value;
+    for (auto pair :
+         {std::pair{1, &row->before.storeToken}, {8, &row->storeToken}}) {
+      bool absent;
+      MOZ_TRY(stmt->GetIsNull(pair.first, &absent));
+      if (!absent) {
+        nsCString token;
+        MOZ_TRY(stmt->GetUTF8String(pair.first, token));
+        *pair.second = Some(std::move(token));
+      }
+    }
+    MOZ_TRY(stmt->GetInt64(2, &value));
+    NS_ENSURE_TRUE(value > 0, NS_ERROR_FILE_CORRUPTED);
+    row->before.contentRevision = value;
+    MOZ_TRY(stmt->GetInt64(3, &value));
+    NS_ENSURE_TRUE(value > 0, NS_ERROR_FILE_CORRUPTED);
+    row->before.locationRevision = value;
+    for (auto pair : {std::pair{4, &row->before.messageSize},
+                      {5, &row->before.offlineMessageSize},
+                      {6, &row->before.lineCount},
+                      {7, &row->before.flags},
+                      {9, &row->messageSize},
+                      {10, &row->offlineMessageSize},
+                      {11, &row->lineCount}}) {
+      MOZ_TRY(stmt->GetInt64(pair.first, &value));
+      NS_ENSURE_TRUE(value >= 0 && uint64_t(value) <= UINT32_MAX,
+                     NS_ERROR_FILE_CORRUPTED);
+      *pair.second = static_cast<uint32_t>(value);
+    }
+    MOZ_TRY(stmt->GetInt64(12, &value));
+    NS_ENSURE_TRUE(value == 0 || value == 1, NS_ERROR_FILE_CORRUPTED);
+    row->offline = value;
+  }
+  NS_ENSURE_TRUE(plan.messages.Length() == uint64_t(count),
+                 NS_ERROR_FILE_CORRUPTED);
+  output = Some(std::move(plan));
+  return NS_OK;
+}
+
+nsresult MessageDatabase::VerifyBodyRelocationRows(
+    const FolderBodyRelocation& plan) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "VerifyBodyRelocationRows"_ns,
+      "SELECT id FROM messages WHERE folderId=:folder ORDER BY id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, plan.folderId));
+  uint32_t index = 0;
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t id;
+    MOZ_TRY(stmt->GetInt64(0, &id));
+    NS_ENSURE_TRUE(
+        index < plan.messages.Length() && id == plan.messages[index].before.key,
+        NS_ERROR_NOT_AVAILABLE);
+    MessageBodyState current;
+    MOZ_TRY(ReadMessageBodyState(static_cast<nsMsgKey>(id), current));
+    NS_ENSURE_TRUE(current.folderId == plan.folderId &&
+                       current.databaseSourceId == plan.databaseSourceId &&
+                       SameBodyGuard(current, plan.messages[index].before),
+                   NS_ERROR_NOT_AVAILABLE);
+    ++index;
+  }
+  return index == plan.messages.Length() ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+
+nsresult MessageDatabase::PrepareBodyRelocation(
+    const FolderBodyRelocation& input) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(CheckFolderBodyAccess(input.folderId));
+  NS_ENSURE_TRUE(input.folderId && input.folderId <= INT64_MAX &&
+                     !input.token.IsEmpty() && input.token.FindChar(0) < 0 &&
+                     input.state == BodyRelocationState::Pending,
+                 NS_ERROR_INVALID_ARG);
+  nsCString source;
+  MOZ_TRY(DatabaseCore::sInstance->GetSourceId(source));
+  NS_ENSURE_TRUE(source == input.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(RelocationFiles(input));
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> folder;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RelocationFolderExists"_ns,
+          "SELECT 1 FROM folders WHERE id=:folder"_ns, getter_AddRefs(folder)));
+      mozStorageStatementScoper scope(folder);
+      MOZ_TRY(folder->BindInt64ByName("folder"_ns, input.folderId));
+      bool exists;
+      MOZ_TRY(folder->ExecuteStep(&exists));
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+    }
+    Maybe<FolderBodyRelocation> previous;
+    MOZ_TRY(ReadBodyRelocation(input.folderId, previous));
+    NS_ENSURE_TRUE(!previous || previous->state != BodyRelocationState::Pending,
+                   NS_ERROR_IN_PROGRESS);
+    NS_ENSURE_TRUE(!previous || previous->token != input.token,
+                   NS_ERROR_ALREADY_INITIALIZED);
+    {
+      nsCOMPtr<mozIStorageStatement> staged;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RelocationStagedOwners"_ns,
+          "SELECT 1 FROM staged_messages WHERE folderId=:folder LIMIT 1"_ns,
+          getter_AddRefs(staged)));
+      mozStorageStatementScoper scope(staged);
+      MOZ_TRY(staged->BindInt64ByName("folder"_ns, input.folderId));
+      bool exists;
+      MOZ_TRY(staged->ExecuteStep(&exists));
+      NS_ENSURE_FALSE(exists, NS_ERROR_IN_PROGRESS);
+    }
+    MOZ_TRY(VerifyBodyRelocationRows(input));
+    for (const auto* table : {"body_relocation_rows", "body_relocations"}) {
+      nsAutoCString sql("DELETE FROM ");
+      sql.Append(table);
+      sql.AppendLiteral(" WHERE folderId=:folder");
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsAutoCString label("Replace_");
+      label.Append(table);
+      MOZ_TRY(DatabaseCore::GetStatement(label, sql, getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, input.folderId));
+      MOZ_TRY(stmt->Execute());
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "PrepareBodyRelocation"_ns,
+          "INSERT INTO body_relocations "
+          "VALUES(:folder,:token,:source,:original,:compacted,:backup,"
+          ":originalSize,:compactedSize,0,:count)"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, input.folderId));
+      MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.token));
+      MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, input.databaseSourceId));
+      MOZ_TRY(stmt->BindStringByName("original"_ns, input.originalPath));
+      MOZ_TRY(stmt->BindStringByName("compacted"_ns, input.compactedPath));
+      MOZ_TRY(stmt->BindStringByName("backup"_ns, input.backupPath));
+      MOZ_TRY(stmt->BindInt64ByName("originalSize"_ns, input.originalSize));
+      MOZ_TRY(stmt->BindInt64ByName("compactedSize"_ns, input.compactedSize));
+      MOZ_TRY(stmt->BindInt64ByName("count"_ns, input.messages.Length()));
+      MOZ_TRY(stmt->Execute());
+    }
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "PrepareBodyRelocationRow"_ns,
+        "INSERT INTO body_relocation_rows "
+        "VALUES(:folder,:id,:oldToken,:content,:location,:size,"
+        ":offlineSize,:lines,:flags,:newToken,:newSize,:newOfflineSize,:newLines,:offline)"_ns,
+        getter_AddRefs(stmt)));
+    for (const auto& row : input.messages) {
+      NS_ENSURE_TRUE(row.storeToken || !row.offline, NS_ERROR_INVALID_ARG);
+      MessageBodyState current;
+      MOZ_TRY(ReadMessageBodyState(row.before.key, current));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, input.folderId));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, current.key));
+      for (auto pair : {std::pair<const char*, const Maybe<nsCString>*>{
+                            "oldToken", &current.storeToken},
+                        {"newToken", &row.storeToken}}) {
+        if (*pair.second) {
+          MOZ_TRY(stmt->BindUTF8StringByName(nsDependentCString(pair.first),
+                                             **pair.second));
+        } else {
+          MOZ_TRY(stmt->BindNullByName(nsDependentCString(pair.first)));
+        }
+      }
+      for (auto pair : {std::pair{"content", current.contentRevision},
+                        {"location", current.locationRevision},
+                        {"size", uint64_t(current.messageSize)},
+                        {"offlineSize", uint64_t(current.offlineMessageSize)},
+                        {"lines", uint64_t(current.lineCount)},
+                        {"flags", uint64_t(current.flags)},
+                        {"newSize", uint64_t(row.messageSize)},
+                        {"newOfflineSize", uint64_t(row.offlineMessageSize)},
+                        {"newLines", uint64_t(row.lineCount)},
+                        {"offline", uint64_t(row.offline)}}) {
+        MOZ_TRY(
+            stmt->BindInt64ByName(nsDependentCString(pair.first), pair.second));
+      }
+      MOZ_TRY(stmt->Execute());
+    }
+    MOZ_TRY(RelocationFiles(input));
+    return connection->CommitTransaction();
+  }();
+  return NS_FAILED(rv) ? RollbackBody(connection, rv) : NS_OK;
+}
+
+nsresult MessageDatabase::SettleBodyRelocation(uint64_t folderId,
+                                               const nsACString& token,
+                                               BodyRelocationOutcome outcome) {
+  NS_ENSURE_TRUE(outcome == BodyRelocationOutcome::Installed ||
+                     outcome == BodyRelocationOutcome::Restored,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  Maybe<FolderBodyRelocation> found;
+  MOZ_TRY(ReadBodyRelocation(folderId, found));
+  NS_ENSURE_TRUE(found && found->token == token, NS_ERROR_NOT_AVAILABLE);
+  auto desired = outcome == BodyRelocationOutcome::Installed
+                     ? BodyRelocationState::Installed
+                     : BodyRelocationState::Restored;
+  if (found->state != BodyRelocationState::Pending) {
+    return found->state == desired ? NS_OK : NS_ERROR_ALREADY_INITIALIZED;
+  }
+  nsCString source;
+  MOZ_TRY(DatabaseCore::sInstance->GetSourceId(source));
+  NS_ENSURE_TRUE(source == found->databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(RelocationFiles(*found, Some(outcome)));
+  RefPtr<MessageDatabase> self(this);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  nsTArray<UniquePtr<CachedMsg>> prepared;
+  nsTArray<RefPtr<DetachedMsgHdr>> oldHeaders;
+  nsTArray<RefPtr<Message>> live;
+  nsTArray<MessageBodyState> before, after;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    Maybe<FolderBodyRelocation> current;
+    MOZ_TRY(ReadBodyRelocation(folderId, current));
+    NS_ENSURE_TRUE(current && current->token == token &&
+                       current->databaseSourceId == source &&
+                       current->state == BodyRelocationState::Pending,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(VerifyBodyRelocationRows(*current));
+    MOZ_TRY(RelocationFiles(*current, Some(outcome)));
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ResolveBodyRelocation"_ns,
+          "UPDATE body_relocations SET state=:state WHERE folderId=:folder"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("state"_ns, uint32_t(desired)));
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+      MOZ_TRY(stmt->Execute());
+    }
+    if (outcome == BodyRelocationOutcome::Installed) {
+      for (const auto& row : current->messages) {
+        MessageBodyState actual;
+        MOZ_TRY(ReadMessageBodyState(row.before.key, actual));
+        uint32_t flags = (actual.flags & ~nsMsgMessageFlags::Offline) |
+                         (row.offline ? nsMsgMessageFlags::Offline : 0);
+        if (actual.storeToken == row.storeToken &&
+            actual.messageSize == row.messageSize &&
+            actual.offlineMessageSize == row.offlineMessageSize &&
+            actual.lineCount == row.lineCount && actual.flags == flags) {
+          continue;
+        }
+        auto cached = MakeUnique<CachedMsg>();
+        MOZ_TRY(FetchMsg(actual.key, *cached));
+        RefPtr<DetachedMsgHdr> old = new DetachedMsgHdr(folderId);
+        MOZ_TRY(old->SetMessageId(cached->messageId));
+        MOZ_TRY(old->SetAuthor(cached->sender));
+        MOZ_TRY(old->SetRecipients(cached->recipients));
+        MOZ_TRY(old->SetSubject(cached->subject));
+        MOZ_TRY(old->SetFlags(actual.flags));
+        MOZ_TRY(old->SetDate(cached->date));
+        MOZ_TRY(old->SetThreadId(cached->threadId));
+        MOZ_TRY(old->SetStringProperty("keywords", cached->tags));
+        if (actual.storeToken) {
+          MOZ_TRY(old->SetStoreToken(*actual.storeToken));
+        }
+        MOZ_TRY(old->SetMessageSize(actual.messageSize));
+        MOZ_TRY(old->SetOfflineMessageSize(actual.offlineMessageSize));
+        MOZ_TRY(old->SetLineCount(actual.lineCount));
+        {
+          nsCOMPtr<mozIStorageStatement> stmt;
+          MOZ_TRY(DatabaseCore::GetStatement(
+              "RelocateBodyFields"_ns,
+              "INSERT INTO message_properties(id,name,value) VALUES "
+              "(:id,'messageSize',:size),"
+              "(:id,'offlineMessageSize',:offlineSize),(:id,'lineCount',:lines)"
+              " "
+              "ON CONFLICT(id,name) DO UPDATE SET value=excluded.value"_ns,
+              getter_AddRefs(stmt)));
+          mozStorageStatementScoper scope(stmt);
+          MOZ_TRY(stmt->BindInt64ByName("id"_ns, actual.key));
+          MOZ_TRY(stmt->BindInt64ByName("size"_ns, row.messageSize));
+          MOZ_TRY(
+              stmt->BindInt64ByName("offlineSize"_ns, row.offlineMessageSize));
+          MOZ_TRY(stmt->BindInt64ByName("lines"_ns, row.lineCount));
+          MOZ_TRY(stmt->Execute());
+        }
+        if (row.storeToken) {
+          MOZ_TRY(
+              SetMessageProperty(actual.key, "storeToken"_ns, *row.storeToken));
+        } else {
+          nsCOMPtr<mozIStorageStatement> stmt;
+          MOZ_TRY(DatabaseCore::GetStatement(
+              "ForgetRelocatedBodyToken"_ns,
+              "DELETE FROM message_properties WHERE id=:id AND name='storeToken'"_ns,
+              getter_AddRefs(stmt)));
+          mozStorageStatementScoper scope(stmt);
+          MOZ_TRY(stmt->BindInt64ByName("id"_ns, actual.key));
+          MOZ_TRY(stmt->Execute());
+        }
+        {
+          nsCOMPtr<mozIStorageStatement> stmt;
+          MOZ_TRY(DatabaseCore::GetStatement(
+              "RelocateBodyFlags"_ns,
+              "UPDATE messages SET flags=:flags WHERE id=:id"_ns,
+              getter_AddRefs(stmt)));
+          mozStorageStatementScoper scope(stmt);
+          MOZ_TRY(stmt->BindInt64ByName("id"_ns, actual.key));
+          MOZ_TRY(stmt->BindInt64ByName("flags"_ns, flags));
+          MOZ_TRY(stmt->Execute());
+        }
+        MessageBodyState settled;
+        MOZ_TRY(ReadMessageBodyState(actual.key, settled));
+        cached->flags = flags;
+        before.AppendElement(std::move(actual));
+        after.AppendElement(std::move(settled));
+        oldHeaders.AppendElement(old);
+        live.AppendElement(new Message(cached->key));
+        prepared.AppendElement(std::move(cached));
+      }
+    }
+    if (!mMsgCache.reserve(mMsgCache.count() + prepared.Length())) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackBody(connection, rv);
+  }
+  for (auto& cached : prepared) {
+    auto entry = mMsgCache.lookup(cached->key);
+    if (entry) {
+      entry->value() = std::move(*cached);
+    } else {
+      mMsgCache.putNewInfallible(cached->key, std::move(*cached));
+    }
+  }
+  for (uint32_t i = 0; i < live.Length(); ++i) {
+    for (MessageListener* listener : mMessageListeners.EndLimitedRange()) {
+      listener->OnMessageBodyChanged(oldHeaders[i], live[i], before[i],
+                                     after[i]);
+    }
+  }
+  return NS_OK;
+}
+
 nsresult MessageDatabase::GetMessageBodyState(nsMsgKey key,
                                               MessageBodyState& output) {
   MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(CheckMessageBodyAccess(key));
   return ReadMessageBodyState(key, output);
 }
 
@@ -258,6 +822,7 @@ nsresult MessageDatabase::SettleMessageBody(const MessageBodyState& expected,
                                             const FinishedMessageBody& finished,
                                             MessageBodyState& output) {
   MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(CheckMessageBodyAccess(expected.key));
   RefPtr<MessageDatabase> self(this);
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   MessageBodyState before, after, callerResult;
@@ -498,6 +1063,7 @@ NS_IMETHODIMP MessageDatabase::GetSearchSnapshot(
 
 NS_IMETHODIMP MessageDatabase::NoteMessageContentChanged(nsMsgKey key) {
   MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(CheckMessageBodyAccess(key));
   bool exists;
   MOZ_TRY(MessageExists(key, exists));
   NS_ENSURE_TRUE(exists, NS_ERROR_UNEXPECTED);
@@ -595,6 +1161,8 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
   if (inTransaction) {
     return NS_ERROR_IN_PROGRESS;
   }
+
+  MOZ_TRY(CheckFolderBodyAccess(aFolderId));
 
   // This still assumes that referenced parents are already in the database.
   nsMsgKey threadId = 0;
@@ -816,6 +1384,9 @@ nsresult MessageDatabase::GetHeaderStatement(
     mozIStorageStatement** statement, bool* staged) {
   bool pending;
   MOZ_TRY(IsMessageStaged(key, pending));
+  if (!StringBeginsWith(prefix, "SELECT"_ns)) {
+    MOZ_TRY(CheckPendingMessageRelocation(key));
+  }
   const char* name = nullptr;
   switch (table) {
     case HeaderTable::Messages:
@@ -2453,6 +3024,11 @@ nsresult MessageDatabase::GetMessagePropertyNames(nsMsgKey key,
 NS_IMETHODIMP MessageDatabase::GetMessageProperty(nsMsgKey aKey,
                                                   const nsACString& aName,
                                                   nsACString& aValue) {
+  if (aName.EqualsLiteral("storeToken") || aName.EqualsLiteral("messageSize") ||
+      aName.EqualsLiteral("offlineMessageSize") ||
+      aName.EqualsLiteral("lineCount")) {
+    MOZ_TRY(CheckMessageBodyAccess(aKey));
+  }
   MOZ_ASSERT(!aName.EqualsLiteral("keywords"));  // Use GetMessageTags().
 
   // TODO: might want to cache selected properties.
@@ -2479,6 +3055,11 @@ NS_IMETHODIMP MessageDatabase::GetMessageProperty(nsMsgKey aKey,
 nsresult MessageDatabase::GetMessageProperty(nsMsgKey key,
                                              const nsACString& name,
                                              uint32_t& value) {
+  if (name.EqualsLiteral("storeToken") || name.EqualsLiteral("messageSize") ||
+      name.EqualsLiteral("offlineMessageSize") ||
+      name.EqualsLiteral("lineCount")) {
+    MOZ_TRY(CheckMessageBodyAccess(key));
+  }
   // TODO: might want to cache selected properties.
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(

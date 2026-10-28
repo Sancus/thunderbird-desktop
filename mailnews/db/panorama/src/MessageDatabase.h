@@ -147,6 +147,13 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult GetMessageRecipients(nsMsgKey key, nsACString& recipients);
   nsresult GetMessageTags(nsMsgKey key, nsACString& tags);
   nsresult GetMessageUidOnServer(nsMsgKey key, uint32_t& uidOnServer);
+  // Only present UID properties participate. Missing/stale: NOT_AVAILABLE;
+  // multiple physical matches: FILE_CORRUPTED. Failure leaves key unchanged.
+  nsresult GetMessageKeyForServerUid(uint64_t folderId, uint32_t epoch,
+                                     uint32_t uid, nsMsgKey& key);
+  // Owns its transaction; rejects stale epochs, wrong folders and collisions.
+  nsresult BindMessageToServerUid(nsMsgKey key, uint64_t folderId,
+                                  uint32_t epoch, uint32_t uid);
   nsresult GetMessageFolderId(nsMsgKey key, uint64_t& folderId);
   nsresult GetMessagePropertyNames(nsMsgKey key, nsTArray<nsCString>& names);
   nsresult GetMessageProperty(nsMsgKey key, const nsACString& name,

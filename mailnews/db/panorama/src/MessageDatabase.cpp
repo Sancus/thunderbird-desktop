@@ -4,6 +4,7 @@
 
 #include "MessageDatabase.h"
 
+#include <cstdint>
 #include <utility>
 
 #include "DatabaseCore.h"
@@ -1074,6 +1075,117 @@ nsresult MessageDatabase::GetMessageUidOnServer(nsMsgKey key,
   MOZ_TRY(message->GetUint32Property("uidOnServer", &value));
   uidOnServer = value;
   return NS_OK;
+}
+
+nsresult MessageDatabase::GetMessageKeyForServerUid(uint64_t folderId,
+                                                    uint32_t epoch,
+                                                    uint32_t uid,
+                                                    nsMsgKey& key) {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+  uint32_t current;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
+                                                                   current));
+  if (current != epoch) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "MembersWithServerUid"_ns,
+      "SELECT m.id FROM messages m JOIN message_properties p ON p.id = m.id "
+      "AND p.name = 'uidOnServer' WHERE m.folderId = :folderId ORDER BY m.id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+  nsMsgKey found = nsMsgKey_None;
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t storedKey;
+    MOZ_TRY(stmt->GetInt64(0, &storedKey));
+    if (storedKey <= 0 || storedKey >= nsMsgKey_None) {
+      return NS_ERROR_FILE_CORRUPTED;
+    }
+    uint32_t storedUid;
+    MOZ_TRY(GetMessageUidOnServer(static_cast<nsMsgKey>(storedKey), storedUid));
+    if (storedUid != uid) {
+      continue;
+    }
+    if (found != nsMsgKey_None) {
+      return NS_ERROR_FILE_CORRUPTED;
+    }
+    found = static_cast<nsMsgKey>(storedKey);
+  }
+  if (found == nsMsgKey_None) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  key = found;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::BindMessageToServerUid(nsMsgKey key,
+                                                 uint64_t folderId,
+                                                 uint32_t epoch, uint32_t uid) {
+  if (!key || key == nsMsgKey_None || !folderId || folderId > INT64_MAX) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  if (active) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    uint32_t current;
+    MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
+                                                                     current));
+    if (current != epoch) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "MessageInServerUidFolder"_ns,
+          "SELECT id FROM messages WHERE id = :id AND folderId = :folderId"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (!more) {
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+    }
+    nsMsgKey existing;
+    nsresult lookupRv =
+        GetMessageKeyForServerUid(folderId, epoch, uid, existing);
+    if (NS_FAILED(lookupRv) && lookupRv != NS_ERROR_NOT_AVAILABLE) {
+      return lookupRv;
+    }
+    if (NS_SUCCEEDED(lookupRv) && existing != key) {
+      return NS_ERROR_FILE_CORRUPTED;
+    }
+    MOZ_TRY(SetMessageUidOnServer(key, uid));
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanupRv) && active) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Server UID binding cleanup failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+  }
+  return rv;
 }
 
 nsresult MessageDatabase::GetMessageThreadId(nsMsgKey key, nsMsgKey& threadId) {

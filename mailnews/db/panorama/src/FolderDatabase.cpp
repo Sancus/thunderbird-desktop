@@ -4,12 +4,15 @@
 
 #include "FolderDatabase.h"
 
+#include <cstdint>
+
 #include "DatabaseCore.h"
 #include "DatabaseUtils.h"
 #include "FolderComparator.h"
 #include "mozilla/Components.h"
 #include "mozilla/Logging.h"
 #include "mozilla/ProfilerMarkers.h"
+#include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
 #include "nsCOMPtr.h"
@@ -431,6 +434,107 @@ FolderDatabase::UpdateFlags(uint64_t folderId, uint64_t newFlags) {
   }
 
   return NS_OK;
+}
+
+nsresult FolderDatabase::GetFolderUidValidity(uint64_t folderId,
+                                              uint32_t& epoch) {
+  if (!folderId || folderId > INT64_MAX) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "GetFolderUidValidity"_ns,
+      "SELECT p.id, p.value FROM folders f LEFT JOIN folder_properties p "
+      "ON p.id = f.id AND p.name = 'UIDValidity' WHERE f.id = :folderId"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (!more) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  bool absent;
+  MOZ_TRY(stmt->GetIsNull(0, &absent));
+  if (absent) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  int32_t type;
+  MOZ_TRY(stmt->GetTypeOfIndex(1, &type));
+  if (type != mozIStorageStatement::VALUE_TYPE_INTEGER) {
+    return NS_ERROR_FILE_CORRUPTED;
+  }
+  int64_t value;
+  MOZ_TRY(stmt->GetInt64(1, &value));
+  if (value < 0 || value > UINT32_MAX) {
+    return NS_ERROR_FILE_CORRUPTED;
+  }
+  epoch = static_cast<uint32_t>(value);
+  return NS_OK;
+}
+
+nsresult FolderDatabase::SetFolderUidValidity(uint64_t folderId,
+                                              uint32_t epoch) {
+  if (!folderId || folderId > INT64_MAX) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  MOZ_TRY(DatabaseCore::EnsureConnection());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  if (active) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "FolderExistsForUidValidity"_ns,
+          "SELECT id FROM folders WHERE id = :folderId"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (!more) {
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+    }
+    uint32_t previous;
+    nsresult previousRv = GetFolderUidValidity(folderId, previous);
+    if (NS_FAILED(previousRv) && previousRv != NS_ERROR_NOT_AVAILABLE) {
+      return previousRv;
+    }
+    if (NS_FAILED(previousRv) || previous != epoch) {
+      {
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(DatabaseCore::GetStatement(
+            "RetireFolderServerUids"_ns,
+            "DELETE FROM message_properties WHERE name = 'uidOnServer' "
+            "AND id IN (SELECT id FROM messages WHERE folderId = :folderId)"_ns,
+            getter_AddRefs(stmt)));
+        mozStorageStatementScoper scoper(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
+        MOZ_TRY(stmt->Execute());
+      }
+      MOZ_TRY(SetFolderProperty(folderId, "UIDValidity"_ns,
+                                static_cast<int64_t>(epoch)));
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanupRv) && active) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("UIDVALIDITY cleanup failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+  }
+  return rv;
 }
 
 nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,

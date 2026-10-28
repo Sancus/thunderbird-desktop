@@ -37,6 +37,12 @@ class FolderDatabase : public nsIFolderDatabase {
 
   Result<Maybe<uint64_t>, nsresult> GetFolderOrdinal(uint64_t folderId);
 
+  // Missing folder/epoch: NOT_AVAILABLE. Failure leaves epoch unchanged.
+  nsresult GetFolderUidValidity(uint64_t folderId, uint32_t& epoch);
+  // Owns its transaction. New/changed epochs retire exact server-UID bindings,
+  // retaining physical messages and body metadata. Same epoch is a no-op.
+  nsresult SetFolderUidValidity(uint64_t folderId, uint32_t epoch);
+
  protected:
   virtual ~FolderDatabase() {};
 

@@ -952,5 +952,355 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidWriteFailurePreservesOldRows) {
       CheckStored("message_properties"_ns, control, "uidOnServer"_ns, "1"_ns));
 }
 
+TEST_F(DeliveryCoreProperties, ServerUidLookupUsesFolderEpochAndPublicView) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, UINT32_MAX));
+  uint64_t root, otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertRoot("uid-lookup"_ns, &root));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(root, "Other"_ns, &otherFolder));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(otherFolder, 0));
+  const uint32_t values[] = {0, 1, 42, 0x80000000u, 0xfffffffeu, UINT32_MAX};
+  nsTArray<nsMsgKey> keys;
+  for (uint32_t uid : values) {
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, Add(key));
+    keys.AppendElement(key);
+    ASSERT_EQ(NS_OK, mCore->MessageDB().BindMessageToServerUid(
+                         key, mFolder, UINT32_MAX, uid));
+  }
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessage(keys[2], getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("uidOnServer", "0002ag"_ns));
+  nsMsgKey other;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(
+                       otherFolder, "other@invalid"_ns, {}, 1, "sender"_ns,
+                       "recipient"_ns, EmptyCString(), EmptyCString(),
+                       "other"_ns, 0, EmptyCString(), 0, &other));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().BindMessageToServerUid(other, otherFolder,
+                                                             0, 42));
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  uint32_t epoch = 7;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderUidValidity(mFolder, epoch));
+  EXPECT_EQ(UINT32_MAX, epoch);
+  for (size_t i = 0; i < keys.Length(); ++i) {
+    nsMsgKey found = nsMsgKey_None;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(
+                         mFolder, UINT32_MAX, values[i], found));
+    EXPECT_EQ(keys[i], found);
+  }
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(otherFolder, 0,
+                                                                42, found));
+  EXPECT_EQ(other, found);
+  found = nsMsgKey_None;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 0, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  ASSERT_NO_FATAL_FAILURE(CheckStored("message_properties"_ns, keys[2],
+                                      "uidOnServer"_ns, "0002ag"_ns));
+}
+
+TEST_F(DeliveryCoreProperties,
+       ServerUidEpochRetiresBindingsWithoutDeletingRows) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 10));
+  uint64_t root, otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertRoot("uid-retain"_ns, &root));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(root, "Other"_ns, &otherFolder));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(otherFolder, 20));
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(
+                       otherFolder, "control@invalid"_ns, {}, 1, "sender"_ns,
+                       "recipient"_ns, EmptyCString(), EmptyCString(),
+                       "control"_ns, 0, EmptyCString(), 0, &control));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().BindMessageToServerUid(
+                       control, otherFolder, 20, 42));
+  nsMsgKey key, unbound;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK, Add(unbound));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 10, 42));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageStoreToken(key, "body-token"_ns));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessage(key, getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("UidOnServer", "a1"_ns));
+  const nsTArray<nsCString> references = {"parent@invalid"_ns,
+                                          "parent@invalid"_ns};
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageReferences(key, references));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 10));
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 10, 42,
+                                                                found));
+  EXPECT_EQ(key, found);
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 11));
+  found = nsMsgKey_None;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 10, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 11, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 11, 0, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  nsTArray<nsCString> names, actualReferences;
+  ASSERT_EQ(NS_OK, header->GetProperties(names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  EXPECT_TRUE(names.Contains("UidOnServer"_ns));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageReferences(key, actualReferences));
+  EXPECT_EQ(references, actualReferences);
+  nsCString token, subject;
+  ASSERT_EQ(NS_OK, header->GetStoreToken(token));
+  EXPECT_EQ("body-token"_ns, token);
+  ASSERT_EQ(NS_OK, header->GetSubject(subject));
+  EXPECT_EQ("subject"_ns, subject);
+  for (nsMsgKey survivor : {key, unbound}) {
+    bool exists = false;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(survivor, exists));
+    EXPECT_TRUE(exists);
+  }
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 11, 42));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 11, 42,
+                                                                found));
+  EXPECT_EQ(key, found);
+  found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(otherFolder, 20,
+                                                                42, found));
+  EXPECT_EQ(control, found);
+  uint64_t count = 0;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(3u, count);
+  ASSERT_NO_FATAL_FAILURE(CheckStored("message_properties"_ns, key,
+                                      "storeToken"_ns, "body-token"_ns));
+}
+
+TEST_F(DeliveryCoreProperties, ServerUidLookupRejectsAmbiguousPhysicalRows) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 7));
+  nsMsgKey first, second;
+  ASSERT_EQ(NS_OK, Add(first));
+  ASSERT_EQ(NS_OK, Add(second));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(first, mFolder, 7, 42));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(second, mFolder, 7, 1));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            mCore->MessageDB().BindMessageToServerUid(second, mFolder, 7, 42));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, second, "uidOnServer"_ns, "1"_ns));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessage(second, getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, header->SetStringProperty("uidOnServer", "2ag"_ns));
+  nsMsgKey found = nsMsgKey_None;
+  EXPECT_EQ(
+      NS_ERROR_FILE_CORRUPTED,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 7, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(first, mFolder, 7, 43));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 7, 42,
+                                                                found));
+  EXPECT_EQ(second, found);
+}
+
+TEST_F(DeliveryCoreProperties, ServerUidMissingMembershipNeverCreatesBindings) {
+  ASSERT_EQ(NS_OK, Start());
+  uint32_t epoch = 99;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->FolderDB().GetFolderUidValidity(mFolder, epoch));
+  EXPECT_EQ(99u, epoch);
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  // Establishing the first known epoch must also retire unscoped old UIDs.
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(key, 42));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 7));
+  nsMsgKey found = nsMsgKey_None;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 7, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 7, key, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  nsTArray<nsCString> before, after;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->FolderDB().SetFolderUidValidity(UINT64_MAX, 8));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mCore->MessageDB().BindMessageToServerUid(
+                                        nsMsgKey_None, mFolder, 7, 1));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 8, 1));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  uint64_t root, otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertRoot("uid-wrong-folder"_ns, &root));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(root, "Other"_ns, &otherFolder));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(otherFolder, 7));
+  // Exclude the deliberate other-folder epoch write from the error snapshot.
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().BindMessageToServerUid(key, otherFolder, 7, 1));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(key));
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 7, 1));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+}
+
+TEST_F(DeliveryCoreProperties,
+       ServerUidEpochFailureRollsBackBindingRetirement) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 7));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 7, 42));
+  nsTArray<nsCString> before, after;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER fail_epoch BEFORE INSERT ON "
+                       "folder_properties WHEN NEW.name = 'UIDValidity' BEGIN "
+                       "SELECT RAISE(ABORT, 'epoch fault'); END"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            mCore->FolderDB().SetFolderUidValidity(mFolder, 8));
+  bool active = true;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 7, 42,
+                                                                found));
+  EXPECT_EQ(key, found);
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP TRIGGER fail_epoch"_ns));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 8));
+  found = nsMsgKey_None;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 8, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+}
+
+TEST_F(DeliveryCoreProperties,
+       ServerUidBindingFailurePreservesPreviousBinding) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 7));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 7, 42));
+  nsTArray<nsCString> before, after;
+  ASSERT_EQ(NS_OK, Snapshot(before));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER fail_binding BEFORE INSERT ON "
+                       "message_properties WHEN NEW.name = 'uidOnServer' BEGIN "
+                       "SELECT RAISE(ABORT, 'binding fault'); END"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 7, 1));
+  ASSERT_EQ(NS_OK, Snapshot(after));
+  EXPECT_EQ(before, after);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckStored("message_properties"_ns, key, "uidOnServer"_ns, "2a"_ns));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP TRIGGER fail_binding"_ns));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 7, 1));
+}
+
+TEST_F(DeliveryCoreProperties, ServerUidReadErrorsPreserveScalarOutputs) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 7));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 7, 42));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "ALTER TABLE message_properties RENAME TO saved_uid_properties;"
+                "CREATE VIEW message_properties AS SELECT "
+                "abs(-9223372036854775808) AS id, name, value "
+                "FROM saved_uid_properties"_ns));
+  nsMsgKey found = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->MessageDB().GetMessageKeyForServerUid(
+                                  mFolder, 7, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "DROP VIEW message_properties;"
+          "ALTER TABLE saved_uid_properties RENAME TO message_properties"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(mFolder, 7, 42,
+                                                                found));
+  EXPECT_EQ(key, found);
+  ASSERT_EQ(NS_OK, SetFolder("UIDValidity"_ns, "invalid"_ns));
+  uint32_t epoch = 99;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            mCore->FolderDB().GetFolderUidValidity(mFolder, epoch));
+  EXPECT_EQ(99u, epoch);
+}
+
+TEST_F(DeliveryCoreProperties, ServerUidEpochReadErrorsPreserveOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 7));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "ALTER TABLE folder_properties RENAME TO saved_uid_epochs;"
+                "CREATE VIEW folder_properties AS SELECT "
+                "abs(-9223372036854775808) AS id, name, value "
+                "FROM saved_uid_epochs"_ns));
+  uint32_t epoch = 99;
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            mCore->FolderDB().GetFolderUidValidity(mFolder, epoch));
+  EXPECT_EQ(99u, epoch);
+  nsMsgKey found = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->MessageDB().GetMessageKeyForServerUid(
+                                  mFolder, 7, 42, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "DROP VIEW folder_properties;"
+                "ALTER TABLE saved_uid_epochs RENAME TO folder_properties"_ns));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderUidValidity(mFolder, epoch));
+  EXPECT_EQ(7u, epoch);
+}
+
+TEST_F(DeliveryCoreProperties, ServerUidWritesDoNotCommitAnotherTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 7));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add(key));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  ASSERT_EQ(NS_OK, SetFolder("uncommitted"_ns, "pending"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            mCore->FolderDB().SetFolderUidValidity(mFolder, 8));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            mCore->MessageDB().BindMessageToServerUid(key, mFolder, 7, 42));
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  nsCString text;
+  ASSERT_EQ(NS_OK, GetFolder("uncommitted"_ns, text));
+  EXPECT_TRUE(text.IsEmpty());
+}
+
 }  // namespace
 }  // namespace mozilla::mailnews

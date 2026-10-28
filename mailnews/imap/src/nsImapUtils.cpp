@@ -18,6 +18,14 @@
 #include "nsImapFlagAndUidState.h"
 #include "nsImapNamespace.h"
 #include "nsIMsgHdr.h"
+#include "nsIMsgDatabase.h"
+#include "nsIMsgFolder.h"
+#include "mozilla/ResultExtensions.h"
+#include "mozilla/StaticPrefs_mail.h"
+
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#endif
 #include "nsMsgUtils.h"
 #include "nsString.h"
 
@@ -394,117 +402,132 @@ nsCString UidSetFromUids(nsTArray<ImapUid> const& uids) {
   return StringJoin(","_ns, fragments);
 }
 
+#ifdef MOZ_PANORAMA
+static mozilla::Result<uint64_t, nsresult> FolderIdFromDatabase(
+    nsIMsgDatabase* db) {
+  if (!db) {
+    return mozilla::Err(NS_ERROR_INVALID_ARG);
+  }
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(db->GetFolder(getter_AddRefs(folder)));
+  if (!folder) {
+    return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+  }
+  uint64_t folderId;
+  MOZ_TRY(folder->GetId(&folderId));
+  if (!folderId) {
+    return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+  }
+  return folderId;
+}
+#endif
+
 mozilla::Result<nsTArray<ImapUid>, nsresult> UidsFromHdrs(
     nsTArray<RefPtr<nsIMsgDBHdr>> const& hdrs) {
   nsTArray<ImapUid> uids(hdrs.Length());
   for (nsIMsgDBHdr* hdr : hdrs) {
-    // TODO: When we take the final step to separate nsMsgKey and UIDs,
-    // this function will have to be changed to use GetUidOnServer() instead
-    // of GetMessageKey().
-    // https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-
-    //    ImapUid uid;
-    //    nsresult rv = hdr->GetUidOnServer(&uid);
-    //    if (NS_FAILED(rv)) {
-    //      return mozilla::Err(rv);
-    //    }
-    //    // Ignore messages with no UID.
-    //    if (uid != 0) {
-    //      uids.AppendElement(uid);
-    //    }
-
-    // But for now the UID is the nsMsgKey...
-    nsMsgKey key;
-    nsresult rv = hdr->GetMessageKey(&key);
-    if (NS_FAILED(rv)) {
-      return mozilla::Err(rv);
-    }
-    MOZ_ASSERT(key != nsMsgKey_None);
-    uids.AppendElement((ImapUid)key);
+    uids.AppendElement(MOZ_TRY(UidFromHdr(hdr)));
   }
   return uids;
 }
 
 mozilla::Result<ImapUid, nsresult> UidFromHdr(nsIMsgDBHdr* hdr) {
-  // TODO: When we take the final step to separate nsMsgKey and UIDs,
-  // this function will have to be changed to use GetUidOnServer() instead
-  // of GetMessageKey().
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-
-  //    ImapUid uid;
-  //    nsresult rv = hdr->GetUidOnServer(&uid);
-  //    if (NS_FAILED(rv)) {
-  //      return mozilla::Err(rv);
-  //    }
-  //    // Ignore messages with no UID.
-  //    if (uid != 0) {
-  //      uids.AppendElement(uid);
-  //    }
-
-  // But for now the UID is the nsMsgKey...
-  nsMsgKey key;
-  nsresult rv = hdr->GetMessageKey(&key);
-  if (NS_FAILED(rv)) {
-    return mozilla::Err(rv);
+  if (!hdr) {
+    return mozilla::Err(NS_ERROR_INVALID_ARG);
   }
-  MOZ_ASSERT(key != nsMsgKey_None);
-  return (ImapUid)key;
+  nsMsgKey key;
+  MOZ_TRY(hdr->GetMessageKey(&key));
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIMsgFolder> folder;
+    MOZ_TRY(hdr->GetFolder(getter_AddRefs(folder)));
+    if (!folder) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+    return UidFromMsgKey(db, key);
+  }
+#endif
+  return UidFromMsgKey(nullptr, key);
 }
 
 mozilla::Result<nsTArray<ImapUid>, nsresult> UidsFromMsgKeys(
     nsIMsgDatabase* db, nsTArray<nsMsgKey> const& keys) {
-  // TODO: When we take the final step to separate nsMsgKey and UIDs,
-  // this function will have to be changed to use GetUidOnServer() instead
-  // of GetMessageKey().
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-
-  // But for now, UIDs are used as keys, so...
-  for (nsMsgKey k : keys) {
-    if (k == nsMsgKey_None) {
-      return mozilla::Err(NS_ERROR_UNEXPECTED);
-    }
+  nsTArray<ImapUid> uids(keys.Length());
+  for (nsMsgKey key : keys) {
+    uids.AppendElement(MOZ_TRY(UidFromMsgKey(db, key)));
   }
-  nsTArray<ImapUid> uids(keys.Clone());
   return uids;
 }
 
 mozilla::Result<ImapUid, nsresult> UidFromMsgKey(nsIMsgDatabase* db,
                                                  nsMsgKey key) {
-  MOZ_ASSERT(key != nsMsgKey_None);
-
-  // TODO: When we take the final step to separate nsMsgKey and UIDs,
-  // this function will have to be changed to use GetUidOnServer() instead
-  // of GetMessageKey().
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-
-  // But for now, UIDs are used as keys, so...
-  return (ImapUid)key;
+  if (!key || key == nsMsgKey_None) {
+    return mozilla::Err(NS_ERROR_INVALID_ARG);
+  }
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    uint64_t folderId = MOZ_TRY(FolderIdFromDatabase(db));
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    if (!core) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
+    uint32_t epoch;
+    MOZ_TRY(core->FolderDB().GetFolderUidValidity(folderId, epoch));
+    ImapUid uid;
+    MOZ_TRY(core->MessageDB().GetMessageUidOnServer(key, uid));
+    if (!uid || !epoch) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
+    nsMsgKey boundKey;
+    MOZ_TRY(core->MessageDB().GetMessageKeyForServerUid(folderId, epoch, uid,
+                                                        boundKey));
+    if (boundKey != key) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
+    return uid;
+  }
+#endif
+  return static_cast<ImapUid>(key);
 }
 
 mozilla::Result<nsMsgKey, nsresult> MsgKeyFromUid(nsIMsgDatabase* db,
                                                   ImapUid uid) {
-  MOZ_ASSERT(uid != 0);
-
-  // TODO: When we take the final step to separate nsMsgKey and UIDs,
-  // this function will have to be changed to do a database lookup!
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-
-  // But for now, UIDs are used as keys, so...
-  return (nsMsgKey)uid;
+  if (!uid) {
+    return mozilla::Err(NS_ERROR_INVALID_ARG);
+  }
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    uint64_t folderId = MOZ_TRY(FolderIdFromDatabase(db));
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    if (!core) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
+    uint32_t epoch;
+    MOZ_TRY(core->FolderDB().GetFolderUidValidity(folderId, epoch));
+    if (!epoch) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
+    nsMsgKey key;
+    MOZ_TRY(
+        core->MessageDB().GetMessageKeyForServerUid(folderId, epoch, uid, key));
+    return key;
+  }
+#endif
+  if (uid == nsMsgKey_None) {
+    return mozilla::Err(NS_ERROR_INVALID_ARG);
+  }
+  return static_cast<nsMsgKey>(uid);
 }
 
-mozilla::Result<nsTArray<ImapUid>, nsresult> MsgKeysFromUids(
+mozilla::Result<nsTArray<nsMsgKey>, nsresult> MsgKeysFromUids(
     nsIMsgDatabase* db, nsTArray<ImapUid> const& uids) {
-  // TODO: When we take the final step to separate nsMsgKey and UIDs,
-  // this function will have to be changed.
-  // https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-
-  // But for now, UIDs are used as keys, so...
+  nsTArray<nsMsgKey> keys(uids.Length());
   for (ImapUid uid : uids) {
-    if (uid == 0) {
-      return mozilla::Err(NS_ERROR_UNEXPECTED);
-    }
+    keys.AppendElement(MOZ_TRY(MsgKeyFromUid(db, uid)));
   }
-  nsTArray<nsMsgKey> keys(uids.Clone());
   return keys;
 }

@@ -68,53 +68,44 @@ void AppendUid(nsCString& msgIds, ImapUid uid);
 nsCString UidSetFromUids(nsTArray<ImapUid> const& uids);
 
 /**
- * Returns a list of UIDs for the given messages.
- * If a message doesn't have a UID, it will _not_ appear in the returned list.
- * So the size of the returned list may differ to the number of messages passed
- * in.
+ * Translate every header to a server UID, preserving order and duplicates.
+ * Fails if any message lacks a current, unique binding.
  */
 mozilla::Result<nsTArray<ImapUid>, nsresult> UidsFromHdrs(
     nsTArray<RefPtr<nsIMsgDBHdr>> const& hdrs);
 
 /**
- * Returns a UID for the given message.
- * If a message doesn't have a UID, zero will be returned.
+ * Translate a header to its server UID. Fails for an unpublished message or a
+ * missing, stale or ambiguous binding.
  */
 mozilla::Result<ImapUid, nsresult> UidFromHdr(nsIMsgDBHdr* hdr);
 
 /**
- * Returns a list of UIDs for the given message keys.
- * If any of the keys are nsMsgKey_None, this function will fail.
- * If a message doesn't have a UID, it will _not_ appear in the returned list.
- * So the size of the returned list may differ to the number of messages passed
- * in.
+ * Translate every key within db's folder and current UIDVALIDITY.
+ * Fails for invalid keys or missing, stale or ambiguous bindings; never returns
+ * a partial list.
  */
 mozilla::Result<nsTArray<ImapUid>, nsresult> UidsFromMsgKeys(
     nsIMsgDatabase* db, nsTArray<nsMsgKey> const& keys);
 
 /**
- * Returns a list of message keys for the given UIDs.
- * If any of the UIDs are zero, this function will fail.
- * If a message with the given UID can't be found, it will _not_ appear in the
- * returned list.
- * So the size of the returned list may differ to the number of UIDs passed
- * in.
+ * Translate every UID within db's folder and current UIDVALIDITY.
+ * Fails for UID zero or missing, stale or ambiguous bindings; never returns a
+ * partial list.
  */
-mozilla::Result<nsTArray<ImapUid>, nsresult> MsgKeysFromUids(
+mozilla::Result<nsTArray<nsMsgKey>, nsresult> MsgKeysFromUids(
     nsIMsgDatabase* db, nsTArray<ImapUid> const& uids);
 
 /**
- * Get UID for a single message.
- * The key MUST be a valid message, and not nsMsgKey_None.
- * Returns 0 if message has no UID.
+ * Translate a global key within db's folder and current UIDVALIDITY.
+ * Fails for an invalid key or a missing, stale or ambiguous binding.
  */
 mozilla::Result<ImapUid, nsresult> UidFromMsgKey(nsIMsgDatabase* db,
                                                  nsMsgKey key);
 
 /**
- * Get Key of message with the given UID.
- * The UID passed in MUST be non-zero.
- * Fails if message not found in database.
+ * Translate a UID within db's folder and current UIDVALIDITY.
+ * Fails for UID zero or a missing, stale or ambiguous binding.
  */
 mozilla::Result<nsMsgKey, nsresult> MsgKeyFromUid(nsIMsgDatabase* db,
                                                   ImapUid uid);

@@ -4198,15 +4198,17 @@ NS_IMETHODIMP nsImapMailFolder::StoreImapFlags(int32_t flags, bool addFlags,
                                                const nsTArray<nsMsgKey>& keys,
                                                nsIUrlListener* aUrlListener) {
   nsresult rv = NS_OK;
+  if (keys.IsEmpty()) return NS_OK;
   if (!WeAreOffline()) {
+    MOZ_TRY(GetDatabase());
     nsCOMPtr<nsIImapService> imapService = mozilla::components::Imap::Service();
     nsTArray<ImapUid> uids = MOZ_TRY(UidsFromMsgKeys(mDatabase, keys));
     nsAutoCString msgIds(UidSetFromUids(uids));
     if (addFlags)
-      imapService->AddMessageFlags(this, aUrlListener ? aUrlListener : this,
-                                   msgIds, flags, true);
+      rv = imapService->AddMessageFlags(
+          this, aUrlListener ? aUrlListener : this, msgIds, flags, true);
     else
-      imapService->SubtractMessageFlags(
+      rv = imapService->SubtractMessageFlags(
           this, aUrlListener ? aUrlListener : this, msgIds, flags, true);
   } else {
     rv = GetDatabase();
@@ -8635,6 +8637,7 @@ nsImapMailFolder::StoreCustomKeywords(nsIMsgWindow* aMsgWindow,
     return rv;
   }
 
+  MOZ_TRY(GetDatabase());
   nsTArray<ImapUid> uids = MOZ_TRY(UidsFromMsgKeys(mDatabase, aKeysToStore));
   nsCOMPtr<nsIURI> retUri;
   nsCOMPtr<nsIImapService> imapService = mozilla::components::Imap::Service();
@@ -9045,6 +9048,7 @@ NS_IMETHODIMP nsImapMailFolder::FetchMsgPreviewText(
     nsCOMPtr<nsIURI> outUri;
     rv = imapService->GetBodyStart(this, aUrlListener, messageIds, 2048,
                                    getter_AddRefs(outUri));
+    NS_ENSURE_SUCCESS(rv, rv);
     *aAsyncResults = true;  // the preview text will be available async...
   }
   return NS_OK;

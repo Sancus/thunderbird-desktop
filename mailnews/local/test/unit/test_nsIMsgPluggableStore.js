@@ -538,6 +538,201 @@ async function test_oneWritePerFolder() {
 }
 
 /**
+ * Rejects finishing a preempted stream without settling its replacement.
+ *
+ * @param {string} storeType - The expected selected store type.
+ */
+async function test_finishNewMessageWithPreemptedStream(storeType) {
+  localAccountUtils.loadLocalMailAccount();
+  try {
+    const folder = localAccountUtils.inboxFolder;
+    const store = folder.msgStore;
+    Assert.equal(store.storeType, storeType);
+    const original = "Subject: Original\r\n\r\nOriginal body.\r\n";
+    const replacement = "Subject: Replacement\r\n\r\nReplacement body.\r\n";
+    const originalStream = store.getNewMsgOutputStream(folder);
+    originalStream.write(original, original.length);
+    const originalToken = store.finishNewMessage(folder, originalStream);
+
+    const staleStream = store.getNewMsgOutputStream(folder);
+    const discarded = "Subject: Discarded\r\n";
+    staleStream.write(discarded, discarded.length);
+    const activeStream = store.getNewMsgOutputStream(folder);
+    activeStream.write(replacement.slice(0, 12), 12);
+
+    Assert.throws(
+      () => store.finishNewMessage(folder, staleStream),
+      error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE,
+      "A preempted stream must not finish the active write"
+    );
+
+    activeStream.write(replacement.slice(12), replacement.length - 12);
+    const replacementToken = store.finishNewMessage(folder, activeStream);
+    Assert.equal(
+      readAll(store.getMsgInputStream(folder, originalToken, 0)),
+      original,
+      "The original body and locator remain usable"
+    );
+    Assert.equal(
+      readAll(store.getMsgInputStream(folder, replacementToken, 0)),
+      replacement,
+      "The active write retains its own body and locator"
+    );
+
+    const scan = new PromiseTestUtils.PromiseStoreScanListener();
+    store.asyncScan(folder, scan);
+    await scan.promise;
+    Assert.deepEqual(
+      scan.messages.toSorted(),
+      [original, replacement].toSorted(),
+      "The preempted body is absent"
+    );
+  } finally {
+    localAccountUtils.clearAll();
+  }
+}
+
+/**
+ * Rejects finishing another folder's stream without changing either write.
+ *
+ * @param {string} storeType - The expected selected store type.
+ */
+async function test_finishNewMessageWithForeignStream(storeType) {
+  localAccountUtils.loadLocalMailAccount();
+  try {
+    const firstFolder = localAccountUtils.inboxFolder;
+    const secondFolder =
+      localAccountUtils.rootFolder.createLocalSubfolder("other-writer");
+    const store = firstFolder.msgStore;
+    Assert.equal(store.storeType, storeType);
+    Assert.equal(secondFolder.msgStore.storeType, storeType);
+
+    const firstBody = "Subject: First folder\r\n\r\nFirst body.\r\n";
+    const secondBody = "Subject: Second folder\r\n\r\nSecond body.\r\n";
+    const firstStream = store.getNewMsgOutputStream(firstFolder);
+    const secondStream = store.getNewMsgOutputStream(secondFolder);
+    firstStream.write(firstBody.slice(0, 12), 12);
+    secondStream.write(secondBody.slice(0, 12), 12);
+
+    Assert.throws(
+      () => store.finishNewMessage(firstFolder, secondStream),
+      error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE,
+      "A different folder's stream must not finish the active write"
+    );
+
+    firstStream.write(firstBody.slice(12), firstBody.length - 12);
+    secondStream.write(secondBody.slice(12), secondBody.length - 12);
+    const firstToken = store.finishNewMessage(firstFolder, firstStream);
+    const secondToken = store.finishNewMessage(secondFolder, secondStream);
+    Assert.equal(
+      readAll(store.getMsgInputStream(firstFolder, firstToken, 0)),
+      firstBody,
+      "The first folder keeps its exact body"
+    );
+    Assert.equal(
+      readAll(store.getMsgInputStream(secondFolder, secondToken, 0)),
+      secondBody,
+      "The second folder keeps its exact body"
+    );
+
+    for (const [folder, body] of [
+      [firstFolder, firstBody],
+      [secondFolder, secondBody],
+    ]) {
+      const scan = new PromiseTestUtils.PromiseStoreScanListener();
+      store.asyncScan(folder, scan);
+      await scan.promise;
+      Assert.deepEqual(
+        scan.messages,
+        [body],
+        "Each folder has only its own body"
+      );
+    }
+  } finally {
+    localAccountUtils.clearAll();
+  }
+}
+
+/**
+ * Rejects Finish after Close aborted an mbox write.
+ *
+ * @param {string} storeType - The expected selected store type.
+ */
+async function test_finishNewMessageWithClosedStream(storeType) {
+  const pref = "mailnews.downloadToTempFile";
+  const hadPref = Services.prefs.prefHasUserValue(pref);
+  const oldPref = Services.prefs.getBoolPref(pref, false);
+  try {
+    for (const quarantine of [false, true]) {
+      Services.prefs.setBoolPref(pref, quarantine);
+      localAccountUtils.loadLocalMailAccount();
+      try {
+        const folder = localAccountUtils.inboxFolder;
+        const store = folder.msgStore;
+        Assert.equal(storeType, "mbox");
+        Assert.equal(store.storeType, storeType);
+
+        const original = "Subject: Original\r\n\r\nOriginal body.\r\n";
+        const originalStream = store.getNewMsgOutputStream(folder);
+        originalStream.write(original, original.length);
+        const originalToken = store.finishNewMessage(folder, originalStream);
+        const originalFile = await IOUtils.read(folder.filePath.path);
+
+        const aborted = "Subject: Aborted\r\n\r\nAborted replacement.\r\n";
+        const stream = store.getNewMsgOutputStream(folder);
+        stream.write(aborted, aborted.length);
+        stream.close();
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          Assert.throws(
+            () => store.finishNewMessage(folder, stream),
+            error => error.result == Cr.NS_BASE_STREAM_CLOSED,
+            "An aborted write cannot return a committed token"
+          );
+        }
+        Assert.throws(
+          () => store.discardNewMessage(folder, stream),
+          error => error.result == Cr.NS_BASE_STREAM_CLOSED,
+          "Discard cannot erase the recorded settlement error"
+        );
+        Assert.throws(
+          () => store.getNewMsgOutputStream(folder),
+          error => error.result == Cr.NS_BASE_STREAM_CLOSED,
+          "A new write cannot silently clear the settlement error"
+        );
+
+        Assert.deepEqual(
+          await IOUtils.read(folder.filePath.path),
+          originalFile,
+          "The existing mbox bytes are unchanged"
+        );
+        Assert.equal(
+          readAll(store.getMsgInputStream(folder, originalToken, 0)),
+          original,
+          "The original locator still retrieves the exact body"
+        );
+        const scan = new PromiseTestUtils.PromiseStoreScanListener();
+        store.asyncScan(folder, scan);
+        await scan.promise;
+        Assert.deepEqual(
+          scan.messages,
+          [original],
+          "The aborted body is absent"
+        );
+      } finally {
+        localAccountUtils.clearAll();
+      }
+    }
+  } finally {
+    if (hadPref) {
+      Services.prefs.setBoolPref(pref, oldPref);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+}
+
+/**
  * Test that we can have multiple writes going at once, as long as they're
  * in different folders.
  */
@@ -807,12 +1002,126 @@ async function test_estimateFolderSize() {
   }
 }
 
-// Return a wrapper which sets the store type before running fn().
+/**
+ * Temporary quarantine failures leave the mbox untouched and allow later writes.
+ *
+ * @param {string} storeType - Expected store backend.
+ * @param {string} cleanup - Discard, preempt, or reject Finish on the failed write.
+ */
+async function checkQuarantinedTempFailure(storeType, cleanup) {
+  const pref = "mailnews.downloadToTempFile";
+  const hadPref = Services.prefs.prefHasUserValue(pref);
+  const oldPref = Services.prefs.getBoolPref(pref, false);
+  Services.prefs.setBoolPref(pref, true);
+  localAccountUtils.loadLocalMailAccount();
+  const badTemp = do_get_profile().clone();
+  badTemp.append("quarantine-temp-not-directory");
+  try {
+    const folder = localAccountUtils.inboxFolder;
+    const store = folder.msgStore;
+    Assert.equal(storeType, "mbox");
+    Assert.equal(store.storeType, storeType);
+    const original = "Subject: Original\r\n\r\nUnchanged original body.\r\n";
+    const originalStream = store.getNewMsgOutputStream(folder);
+    originalStream.write(original, original.length);
+    const originalToken = store.finishNewMessage(folder, originalStream);
+    const originalFile = await IOUtils.read(folder.filePath.path);
+    const failed = store.getNewMsgOutputStream(folder);
+    await IOUtils.writeUTF8(
+      badTemp.path,
+      "A regular file cannot contain temp files."
+    );
+    const originalTemp = Services.dirsvc.get("TmpD", Ci.nsIFile);
+    let writeError;
+    Services.dirsvc.undefine("TmpD");
+    try {
+      Services.dirsvc.set("TmpD", badTemp);
+      try {
+        const rejected = "Rejected quarantine bytes.";
+        failed.write(rejected, rejected.length);
+      } catch (error) {
+        writeError = error;
+      }
+    } finally {
+      if (Services.dirsvc.has("TmpD")) {
+        Services.dirsvc.undefine("TmpD");
+      }
+      Services.dirsvc.set("TmpD", originalTemp);
+    }
+    Assert.ok(writeError, "Creating the real quarantine temp file failed");
+    Assert.notEqual(writeError.result, Cr.NS_BASE_STREAM_CLOSED);
+    Assert.throws(
+      () => failed.streamStatus(),
+      error => error.result === writeError.result
+    );
+    if (cleanup == "discard") {
+      store.discardNewMessage(folder, failed);
+    } else if (cleanup == "finish") {
+      Assert.throws(
+        () => store.finishNewMessage(folder, failed),
+        error => error.result === writeError.result,
+        "Finish returns the original pre-Finish error"
+      );
+    }
+    const next = store.getNewMsgOutputStream(folder);
+    Assert.deepEqual(await IOUtils.read(folder.filePath.path), originalFile);
+    const replacement = "Subject: Next valid write\r\n\r\nSuccessful body.\r\n";
+    next.write(replacement, replacement.length);
+    const replacementToken = store.finishNewMessage(folder, next);
+    Assert.throws(
+      () => failed.close(),
+      error => error.result === writeError.result,
+      "The failed stream still owns its original error"
+    );
+    Assert.equal(
+      readAll(store.getMsgInputStream(folder, originalToken, 0)),
+      original
+    );
+    Assert.equal(
+      readAll(store.getMsgInputStream(folder, replacementToken, 0)),
+      replacement
+    );
+    const scan = new PromiseTestUtils.PromiseStoreScanListener();
+    store.asyncScan(folder, scan);
+    await scan.promise;
+    Assert.deepEqual(scan.messages, [original, replacement]);
+  } finally {
+    await IOUtils.remove(badTemp.path, { ignoreAbsent: true });
+    localAccountUtils.clearAll();
+    if (hadPref) {
+      Services.prefs.setBoolPref(pref, oldPref);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+}
+
+async function test_quarantinedTempFailureDiscard(storeType) {
+  await checkQuarantinedTempFailure(storeType, "discard");
+}
+
+async function test_quarantinedTempFailurePreemption(storeType) {
+  await checkQuarantinedTempFailure(storeType, "preempt");
+}
+
+async function test_quarantinedTempFailureFinish(storeType) {
+  await checkQuarantinedTempFailure(storeType, "finish");
+}
+
+/**
+ * Sets the store contract and passes its store type to the test.
+ *
+ * @param {string} store - The store contract.
+ * @param {function(string): Promise<void>} fn - The test function.
+ * @returns {function(): Promise<void>} The configured test.
+ */
 function withStore(store, fn) {
   return async () => {
     Services.prefs.setCharPref("mail.serverDefaultStoreContractID", store);
     dump(`*** Running ${fn.name} against ${store} ***\n`);
-    await fn();
+    const storeType =
+      store == "@mozilla.org/msgstore/maildirstore;1" ? "maildir" : "mbox";
+    await fn(storeType);
   };
 }
 
@@ -826,6 +1135,14 @@ for (const store of localAccountUtils.pluggableStores) {
   add_task(withStore(store, test_basicReadWrite));
   add_task(withStore(store, test_discardWrites));
   add_task(withStore(store, test_oneWritePerFolder));
+  add_task(withStore(store, test_finishNewMessageWithPreemptedStream));
+  add_task(withStore(store, test_finishNewMessageWithForeignStream));
+  if (store == "@mozilla.org/msgstore/berkeleystore;1") {
+    add_task(withStore(store, test_finishNewMessageWithClosedStream));
+    add_task(withStore(store, test_quarantinedTempFailureDiscard));
+    add_task(withStore(store, test_quarantinedTempFailurePreemption));
+    add_task(withStore(store, test_quarantinedTempFailureFinish));
+  }
   add_task(withStore(store, test_multiFolderWriting));
   add_task(withStore(store, test_changeFlags));
   add_task(withStore(store, test_estimateFolderSize));

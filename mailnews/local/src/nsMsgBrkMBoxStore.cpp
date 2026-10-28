@@ -674,6 +674,9 @@ nsresult nsMsgBrkMBoxStore::InvalidateOngoingWrite(nsIMsgFolder* folder) {
   MOZ_ASSERT(folder);
   auto existing = mOngoingWrites.lookup(folder->URI());
   if (existing) {
+    if (NS_FAILED(existing->value().status)) {
+      return existing->value().status;
+    }
     // boooo....
     MOZ_LOG(gMboxLog, LogLevel::Warning,
             ("PREEMPTING WRITE stream=0x%p folder='%s' (roll back to filepos "
@@ -683,9 +686,8 @@ nsresult nsMsgBrkMBoxStore::InvalidateOngoingWrite(nsIMsgFolder* folder) {
     NS_WARNING(
         nsPrintfCString("Already writing to folder '%s'", folder->URI().get())
             .get());
-    // Close the old stream - this will roll back everything it wrote.
-    existing->value().stream->Close();
-    mOngoingWrites.remove(existing);
+    nsCOMPtr<nsIOutputStream> stream = existing->value().stream;
+    return DiscardNewMessage(folder, stream);
   }
   return NS_OK;
 }
@@ -722,6 +724,8 @@ nsMsgBrkMBoxStore::GetNewMsgOutputStream(nsIMsgFolder* folder,
 
   // We want a buffered, mbox-aware stream. Some wrapping is required.
   nsCOMPtr<nsIOutputStream> stream;
+  const bool quarantined =
+      Preferences::GetBool("mailnews.downloadToTempFile", false);
   int64_t filePos = 0;
   {
     nsCOMPtr<nsIOutputStream> rawStream;
@@ -757,7 +761,7 @@ nsMsgBrkMBoxStore::GetNewMsgOutputStream(nsIMsgFolder* folder,
     RefPtr<MboxMsgOutputStream> mboxStream =
         new MboxMsgOutputStream(bufferedStream, true);
 
-    if (Preferences::GetBool("mailnews.downloadToTempFile", false)) {
+    if (quarantined) {
       // If quarantining, add another wrapping stream.
       stream = new nsQuarantinedOutputStream(mboxStream);
       MOZ_LOG(gMboxLog, LogLevel::Info,
@@ -772,8 +776,8 @@ nsMsgBrkMBoxStore::GetNewMsgOutputStream(nsIMsgFolder* folder,
   }
 
   // Up and running - add the stream to the set of ongoing writes.
-  MOZ_ALWAYS_TRUE(mOngoingWrites.putNew(folder->URI(),
-                                        StreamDetails{filePos, stream.get()}));
+  MOZ_ALWAYS_TRUE(mOngoingWrites.putNew(
+      folder->URI(), StreamDetails{filePos, stream.get(), quarantined}));
 
   stream.forget(outStream);
   return NS_OK;
@@ -787,13 +791,29 @@ nsMsgBrkMBoxStore::FinishNewMessage(nsIMsgFolder* folder,
   NS_ENSURE_ARG(outStream);
 
   auto details = mOngoingWrites.lookup(folder->URI());
-  if (!details) {
-    // We should have a record of the write!
-    return NS_ERROR_UNEXPECTED;
+  if (!details || outStream != details->value().stream) {
+    return NS_ERROR_ILLEGAL_VALUE;
   }
 
-  // Should be the stream we issued originally!
-  MOZ_ASSERT(outStream == details->value().stream);
+  if (NS_FAILED(details->value().status)) {
+    return details->value().status;
+  }
+  // Close aborts an mbox write. Finish on the closed stream cannot commit it.
+  nsresult status = outStream->StreamStatus();
+  if (status == NS_BASE_STREAM_CLOSED) {
+    details->value().status = NS_BASE_STREAM_CLOSED;
+    return NS_BASE_STREAM_CLOSED;
+  }
+
+  if (NS_FAILED(status) && details->value().quarantined) {
+    // A pre-Finish quarantine error has already discarded its temporary file
+    // and released the untouched target. It is not an mbox rollback failure.
+    MOZ_LOG(gMboxLog, LogLevel::Error,
+            ("QUARANTINE MSG failed before Finish stream=0x%p folder=%s rv=0x%x",
+             outStream, folder->URI().get(), static_cast<uint32_t>(status)));
+    mOngoingWrites.remove(details);
+    return status;
+  }
 
   // We are always dealing with nsISafeOutputStream.
   // It requires an explicit commit, or the data will be discarded.
@@ -801,7 +821,10 @@ nsMsgBrkMBoxStore::FinishNewMessage(nsIMsgFolder* folder,
   MOZ_ASSERT(safe);
   // Commit the write.
   nsresult rv = safe->Finish();
-  NS_ENSURE_SUCCESS(rv, rv);
+  if (NS_FAILED(rv)) {
+    details->value().status = rv;
+    return rv;
+  }
 
   storeToken = nsPrintfCString("%" PRId64, details->value().filePos);
 
@@ -828,21 +851,32 @@ nsMsgBrkMBoxStore::DiscardNewMessage(nsIMsgFolder* folder,
   // discarded and the mOngoingWrites table will refer to the more recent
   // write. We don't want to blat over that, so check first.
   if (details && outStream == details->value().stream) {
+    if (NS_FAILED(details->value().status)) {
+      return details->value().status;
+    }
+    nsresult rv = outStream->Close();
+    if (NS_FAILED(rv) && !details->value().quarantined) {
+      details->value().status = rv;
+      return rv;
+    }
+    if (NS_FAILED(rv)) {
+      // Close reports the old temporary-file error; the target was untouched.
+      MOZ_LOG(gMboxLog, LogLevel::Error,
+              ("DISCARD QUARANTINE MSG stream=0x%p folder=%s rv=0x%x", outStream,
+               folder->URI().get(), static_cast<uint32_t>(rv)));
+    }
+    int64_t filePos = details->value().filePos;
     mOngoingWrites.remove(details);
     MOZ_LOG(gMboxLog, LogLevel::Info,
             ("DISCARD MSG stream=0x%p folder=%s filePos=%" PRId64 "", outStream,
-             folder->URI().get(), details->value().filePos));
-
-  } else {
-    MOZ_LOG(gMboxLog, LogLevel::Warning,
-            ("DISCARD MSG (preempted) stream=0x%p folder=%s", outStream,
-             folder->URI().get()));
+             folder->URI().get(), filePos));
+    return NS_OK;
   }
+  MOZ_LOG(gMboxLog, LogLevel::Warning,
+          ("DISCARD MSG (preempted) stream=0x%p folder=%s", outStream,
+           folder->URI().get()));
 
-  // Safe to close the stream in any case.
-  outStream->Close();
-
-  return NS_OK;
+  return outStream->Close();
 }
 
 NS_IMETHODIMP

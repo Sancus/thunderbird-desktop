@@ -48,6 +48,9 @@ class nsMsgBrkMBoxStore final : public nsMsgLocalStoreUtils,
   struct StreamDetails {
     int64_t filePos{0};
     nsCOMPtr<nsIOutputStream> stream;
+    bool quarantined{false};
+    // Retain the first Finish or rollback error; later calls cannot clear it.
+    nsresult status{NS_OK};
   };
   mozilla::HashMap<nsCString, StreamDetails> mOngoingWrites;
 };

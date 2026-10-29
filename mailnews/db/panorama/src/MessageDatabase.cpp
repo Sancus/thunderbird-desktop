@@ -3905,7 +3905,8 @@ Result<MessageDatabase::CachedMsg*, nsresult> MessageDatabase::EnsureCached(
     if (NS_FAILED(rv)) {
       return Err(rv);
     }
-    if (!mMsgCache.add(p, key, msg)) {
+    // Trimming can invalidate the insertion slot captured by lookupForAdd.
+    if (!mMsgCache.relookupOrAdd(p, key, msg)) {
       return Err(NS_ERROR_FAILURE);
     }
   }

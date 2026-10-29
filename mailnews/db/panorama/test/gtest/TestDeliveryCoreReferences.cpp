@@ -296,6 +296,14 @@ class DeliveryCoreReferences : public testing::Test {
     mCore->MessageDB().NotifyImportedMessage(message);
   }
 
+  size_t CachedHeaderCount() const {
+    return mCore->MessageDB().mMsgCache.count();
+  }
+
+  bool HeaderIsCached(nsMsgKey key) const {
+    return bool(mCore->MessageDB().mMsgCache.lookup(key));
+  }
+
   nsresult Start() {
     // This native fixture selects the concrete Panorama implementation
     // directly.
@@ -9352,6 +9360,55 @@ TEST_F(DeliveryCoreReferences, WeakFolderImportPinsBeforeFirstCallback) {
   EXPECT_EQ(1u, first);
   EXPECT_EQ(1u, last);
   EXPECT_FALSE(weak);
+}
+
+TEST_F(DeliveryCoreReferences, HeaderCacheMissAcrossTrimKeepsPhysicalFields) {
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<nsMsgKey> keys;
+  nsTArray<nsCString> subjects;
+  constexpr uint32_t boundary = 512;
+  keys.SetCapacity(boundary + 1);
+  subjects.SetCapacity(boundary + 1);
+  for (uint32_t i = 0; i <= boundary; ++i) {
+    RawHdr raw;
+    raw.messageId = "cache-boundary-"_ns;
+    raw.messageId.AppendInt(i);
+    raw.subject = "physical subject "_ns;
+    raw.subject.AppendInt(i);
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, raw, true, &key));
+    keys.AppendElement(key);
+    subjects.AppendElement(raw.subject);
+  }
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(0u, CachedHeaderCount());
+  for (uint32_t i = 0; i < boundary; ++i) {
+    RefPtr<Message> message = new Message(keys[i]);
+    nsCString subject;
+    ASSERT_EQ(NS_OK, message->GetSubject(subject));
+    EXPECT_EQ(subjects[i], subject);
+  }
+  ASSERT_EQ(boundary, CachedHeaderCount());
+  RefPtr<Message> last = new Message(keys.LastElement());
+  nsCString subject;
+  // The cold miss must cross TrimCache's removal before inserting this row.
+  ASSERT_EQ(NS_OK, last->GetSubject(subject));
+  EXPECT_EQ(subjects.LastElement(), subject);
+  EXPECT_LE(CachedHeaderCount(), boundary);
+  EXPECT_TRUE(HeaderIsCached(keys.LastElement()));
+  bool reloaded = false;
+  for (uint32_t i = 0; i < boundary; ++i) {
+    if (!HeaderIsCached(keys[i])) {
+      RefPtr<Message> message = new Message(keys[i]);
+      ASSERT_EQ(NS_OK, message->GetSubject(subject));
+      EXPECT_EQ(subjects[i], subject);
+      EXPECT_TRUE(HeaderIsCached(keys[i]));
+      reloaded = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(reloaded);
 }
 
 }  // namespace mozilla::mailnews

@@ -34,6 +34,8 @@ tags = ["panorama"]
 
 ["test_deliveryCompatibilityUidValidity.js"]
 
+["test_deliveryCompatibilityTransferInfo.js"]
+
 ["test_deliveryCompatibilityViewType.js"]
 
 ["test_deliveryCoreAccountLifecycle.js"]

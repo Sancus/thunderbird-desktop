@@ -1804,6 +1804,7 @@ export class MessageList {
     this.messageListId = Services.uuid.generateUUID().number.substring(1, 37);
     this.extension = extension;
     this.isDone = false;
+    this.failure = null;
     this.pages = [];
     this._messageTracker = messageTracker;
     this.folderCache = new Map();
@@ -1910,18 +1911,37 @@ export class MessageList {
   }
 
   /**
+   * Reject page reads when producing this list fails.
+   *
+   * @param {*} error - The producer's failure.
+   */
+  fail(error) {
+    if (this.isDone) {
+      return;
+    }
+    this.failure = { error };
+    this.done();
+  }
+
+  /**
    * Returns the next unread message page.
    *
    * @returns {Promise<MessageList>}
    * @see /mail/components/extensions/schemas/messages.json
    */
   async getNextUnreadPage() {
+    if (this.failure) {
+      throw this.failure.error;
+    }
     const page = this.pages.find(p => !p.read);
     if (!page) {
       return null;
     }
 
     const messages = await page.promise;
+    if (this.failure) {
+      throw this.failure.error;
+    }
     page.read = true;
 
     return {
@@ -1983,7 +2003,11 @@ export class MessageListTracker {
     // Do not await _addMessages() here, to let the function return the Promise
     // for the first page as soon as possible and not after all messages have
     // been added.
-    setTimeout(() => this._addMessages(messages, messageList));
+    setTimeout(() =>
+      this._addMessages(messages, messageList).catch(error =>
+        messageList.fail(error)
+      )
+    );
 
     return this.getNextPage(messageList);
   }
@@ -2079,7 +2103,13 @@ export class MessageListTracker {
    * @see /mail/components/extensions/schemas/messages.json
    */
   async getNextPage(messageList) {
-    const page = await messageList.getNextUnreadPage();
+    let page;
+    try {
+      page = await messageList.getNextUnreadPage();
+    } catch (error) {
+      this._contextLists.get(messageList.extension)?.delete(messageList.id);
+      throw error;
+    }
     if (!page) {
       return null;
     }
@@ -2377,7 +2407,11 @@ export class MessageQuery {
     // is an asynchronous function, but it is not awaited here. Instead,
     // messageListTracker.getNextPage() returns a Promise, which will
     // fulfill after enough messages for a full page have been added.
-    setTimeout(() => this.searchFolders(folders, includeSubFolders));
+    setTimeout(() =>
+      this.searchFolders(folders, includeSubFolders).catch(error =>
+        this.messageList.fail(error)
+      )
+    );
 
     if (this.queryInfo.returnMessageListId) {
       return this.messageList.id;
@@ -2652,7 +2686,10 @@ export class MessageQuery {
         this.messageList.currentPage.messages.length
       ) {
         addPageTimer = setTimeout(
-          () => (addPagePromise = this.messageList.addPage()),
+          () =>
+            (addPagePromise = this.messageList
+              .addPage()
+              .catch(error => this.messageList.fail(error))),
           Math.max(
             0,
             this.autoPaginationTimeout -
@@ -2661,13 +2698,14 @@ export class MessageQuery {
         );
       }
 
-      if (await this.checkSearchCriteriaFn(msg, folder)) {
-        await this.messageList.addMessage(msg);
-      }
-
-      // Unschedule the new page.
-      if (addPageTimer != null) {
-        clearTimeout(addPageTimer);
+      try {
+        if (await this.checkSearchCriteriaFn(msg, folder)) {
+          await this.messageList.addMessage(msg);
+        }
+      } finally {
+        if (addPageTimer != null) {
+          clearTimeout(addPageTimer);
+        }
       }
 
       // If we added a page, wait for its Promise to fulfill.

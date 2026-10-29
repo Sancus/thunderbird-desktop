@@ -556,6 +556,312 @@ add_task(async function test_query_returnMessageListId() {
   await extension.unload();
 });
 
+add_task(async function test_query_failure_rejects_pending_page() {
+  const {
+    Management: {
+      global: { messageListTracker },
+    },
+  } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+  const { ExtensionError } = ChromeUtils.importESModule(
+    "resource://gre/modules/ExtensionUtils.sys.mjs"
+  );
+  messageListTracker.approvePageFnForTests = null;
+  messageListTracker.checkSearchCriteriaFnForTests = async () => {
+    throw new ExtensionError("Injected query failure");
+  };
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "utils.js": await getUtilsJS(),
+      "background.js": async () => {
+        const [folder] = await browser.folders.query({ name: "test1" });
+        await browser.test.assertRejects(
+          browser.messages.query({ folderId: folder.id }),
+          /Injected query failure/,
+          "A failed producer rejects the waiting query page"
+        );
+        await window.sendMessage("recover-query");
+        const page = await browser.messages.query({
+          folderId: folder.id,
+          messagesPerPage: 150,
+          autoPaginationTimeout: 0,
+        });
+        browser.test.assertEq(null, page.id);
+        browser.test.assertEq(99, page.messages.length);
+        browser.test.assertEq(
+          99,
+          new Set(page.messages.map(message => message.id)).size
+        );
+        browser.test.assertTrue(
+          page.messages.every(message => message.folder.id == folder.id)
+        );
+        browser.test.notifyPass("query-recovered");
+      },
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["accountsRead", "messagesRead"],
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitMessage("recover-query");
+    messageListTracker.checkSearchCriteriaFnForTests = null;
+    extension.sendMessage();
+    await extension.awaitFinish("query-recovered");
+    Assert.equal(subFolders.test1.getTotalMessages(false), 99);
+  } finally {
+    messageListTracker.checkSearchCriteriaFnForTests = null;
+    await extension.unload();
+  }
+});
+
+/**
+ * Hold the existing query predicate until a continuation is waiting or aborted.
+ *
+ * @param {boolean} abortFirst - Abort before delivering the predicate failure.
+ */
+async function checkLateQueryFailure(abortFirst) {
+  const {
+    Management: {
+      global: { messageListTracker },
+    },
+  } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+  const { ExtensionError } = ChromeUtils.importESModule(
+    "resource://gre/modules/ExtensionUtils.sys.mjs"
+  );
+  const resume = Promise.withResolvers();
+  let checked = 0;
+  messageListTracker.approvePageFnForTests = null;
+  messageListTracker.checkSearchCriteriaFnForTests = async () => {
+    if (!abortFirst && ++checked <= 11) {
+      return true;
+    }
+    await resume.promise;
+    throw new ExtensionError("Deferred query failure");
+  };
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "utils.js": await getUtilsJS(),
+      "background.js": async () => {
+        const [abort] = await window.sendMessage("get-abort");
+        const [folder] = await browser.folders.query({ name: "test1" });
+        const initial = await browser.messages.query({
+          folderId: folder.id,
+          messagesPerPage: 10,
+          autoPaginationTimeout: 0,
+          returnMessageListId: abort,
+        });
+        const id = abort ? initial : initial.id;
+        if (!abort) {
+          browser.test.assertEq(
+            10,
+            initial.messages.length,
+            "The first complete page was delivered before the later error"
+          );
+          browser.test.assertTrue(
+            initial.messages.every(message => message.folder.id == folder.id)
+          );
+        }
+        if (abort) {
+          await browser.messages.abortList(id);
+        }
+        const pending = browser.messages.continueList(id);
+        await window.sendMessage("fail-query");
+        if (abort) {
+          window.assertDeepEqual({ id: null, messages: [] }, await pending);
+        } else {
+          await browser.test.assertRejects(
+            pending,
+            /Deferred query failure/,
+            "A failed producer rejects a pending continuation"
+          );
+        }
+        await browser.test.assertRejects(
+          browser.messages.continueList(id),
+          new RegExp(`No message list for id ${id}`),
+          "The terminal list is removed from the tracker"
+        );
+        browser.test.notifyPass("query-terminal");
+      },
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["accountsRead", "messagesRead"],
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitMessage("get-abort");
+    extension.sendMessage(abortFirst);
+    await extension.awaitMessage("fail-query");
+    resume.resolve();
+    extension.sendMessage();
+    await extension.awaitFinish("query-terminal");
+    Assert.equal(subFolders.test1.getTotalMessages(false), 99);
+  } finally {
+    resume.resolve();
+    messageListTracker.checkSearchCriteriaFnForTests = null;
+    await extension.unload();
+  }
+}
+
+add_task(async function test_query_failure_rejects_pending_continuation() {
+  await checkLateQueryFailure(false);
+});
+
+add_task(async function test_aborted_query_ignores_late_failure() {
+  await checkLateQueryFailure(true);
+});
+
+add_task(
+  async function test_saved_search_query_failure_and_recovery_without_fts() {
+    const { VirtualFolderHelper } = ChromeUtils.importESModule(
+      "resource:///modules/VirtualFolderWrapper.sys.mjs"
+    );
+    const {
+      Management: {
+        global: { messageListTracker },
+      },
+    } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+    messageListTracker.approvePageFnForTests = null;
+    messageListTracker.checkSearchCriteriaFnForTests = null;
+    await SpecialPowers.pushPrefEnv({
+      set: [["mailnews.database.global.indexer.enabled", false]],
+    });
+    const saved = VirtualFolderHelper.createNewVirtualFolder(
+      "queryFailureSavedSearch",
+      rootFolder,
+      [subFolders.test1],
+      "ALL",
+      false
+    );
+    const [header] = subFolders.test1.messages;
+    subFolders.test1.msgDatabase.refreshCache(saved.virtualFolder.URI, [
+      header.messageKey,
+    ]);
+    saved.searchString = "AND (subject,unsupported-operation,scope)";
+    const extension = ExtensionTestUtils.loadExtension({
+      files: {
+        "utils.js": await getUtilsJS(),
+        "background.js": async () => {
+          const [folder] = await browser.folders.query({
+            name: "queryFailureSavedSearch",
+          });
+          const [physicalFolder] = await browser.folders.query({
+            name: "test1",
+          });
+          await browser.test.assertRejects(
+            browser.messages.query({ folderId: folder.id }),
+            /An unexpected error occurred/,
+            "The actual invalid saved-search condition rejects instead of hanging"
+          );
+          await window.sendMessage("repair-saved-search");
+          const result = await browser.messages.query({
+            folderId: folder.id,
+            messagesPerPage: 150,
+            autoPaginationTimeout: 0,
+          });
+          const physical = await browser.messages.list(physicalFolder.id);
+          browser.test.assertEq(null, result.id);
+          browser.test.assertEq(99, result.messages.length);
+          browser.test.assertTrue(
+            result.messages.every(
+              message => message.folder.id == physicalFolder.id
+            )
+          );
+          window.assertDeepEqual(
+            physical.messages.map(message => message.id).sort((a, b) => a - b),
+            result.messages.map(message => message.id).sort((a, b) => a - b)
+          );
+          browser.test.notifyPass("saved-search-query-recovered");
+        },
+      },
+      manifest: {
+        background: { scripts: ["utils.js", "background.js"] },
+        permissions: ["accountsRead", "messagesRead"],
+      },
+    });
+    try {
+      Assert.ok(
+        !Services.prefs.getBoolPref("mailnews.database.global.indexer.enabled")
+      );
+      await extension.startup();
+      await extension.awaitMessage("repair-saved-search");
+      saved.searchString = "ALL";
+      extension.sendMessage();
+      await extension.awaitFinish("saved-search-query-recovered");
+      Assert.equal(subFolders.test1.getTotalMessages(false), 99);
+    } finally {
+      await extension.unload();
+      saved.virtualFolder.deleteSelf(null);
+      await SpecialPowers.popPrefEnv();
+    }
+  }
+);
+
+add_task(async function test_list_failure_rejects_pending_page() {
+  const {
+    Management: {
+      global: { messageListTracker },
+    },
+  } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+  const { ExtensionError } = ChromeUtils.importESModule(
+    "resource://gre/modules/ExtensionUtils.sys.mjs"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [["extensions.webextensions.messagesPerPage", 10]],
+  });
+  messageListTracker.checkSearchCriteriaFnForTests = null;
+  messageListTracker.approvePageFnForTests = async () => {
+    throw new ExtensionError("Injected list failure");
+  };
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "utils.js": await getUtilsJS(),
+      "background.js": async () => {
+        const [folder] = await browser.folders.query({ name: "test1" });
+        await browser.test.assertRejects(
+          browser.messages.list(folder.id),
+          /Injected list failure/,
+          "List producer failure rejects its pending page"
+        );
+        await window.sendMessage("recover-list");
+        let page = await browser.messages.list(folder.id);
+        const messages = [...page.messages];
+        while (page.id) {
+          page = await browser.messages.continueList(page.id);
+          messages.push(...page.messages);
+        }
+        browser.test.assertEq(99, messages.length);
+        browser.test.assertEq(
+          99,
+          new Set(messages.map(message => message.id)).size
+        );
+        browser.test.assertTrue(
+          messages.every(message => message.folder.id == folder.id)
+        );
+        browser.test.notifyPass("list-recovered");
+      },
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["accountsRead", "messagesRead"],
+    },
+  });
+  try {
+    await extension.startup();
+    await extension.awaitMessage("recover-list");
+    messageListTracker.approvePageFnForTests = null;
+    extension.sendMessage();
+    await extension.awaitFinish("list-recovered");
+    Assert.equal(subFolders.test1.getTotalMessages(false), 99);
+  } finally {
+    messageListTracker.approvePageFnForTests = null;
+    await extension.unload();
+    await SpecialPowers.popPrefEnv();
+  }
+});
+
 /**
  * Test messages.list() to return pages as soon as they are filled, and not after
  * all messages have been processed and all pages have been filled. Also tests

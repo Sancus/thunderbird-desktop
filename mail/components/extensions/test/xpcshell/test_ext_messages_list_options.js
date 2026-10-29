@@ -504,6 +504,41 @@ function assertSavedSearchMembers(folder, expected) {
   );
 }
 
+add_task(async function test_savedSearchOnlineFlagReadsPersistedBoolean() {
+  const { VirtualFolderHelper } = ChromeUtils.importESModule(
+    "resource:///modules/VirtualFolderWrapper.sys.mjs"
+  );
+  const localAccount = await createAccount("none");
+  try {
+    const root = localAccount.incomingServer.rootFolder.QueryInterface(
+      Ci.nsIMsgLocalMailFolder
+    );
+    const folder = root.createLocalSubfolder("savedSearchOnlineFlag");
+    folder.setFlag(Ci.nsMsgFolderFlags.Virtual);
+    const first = VirtualFolderHelper.wrapVirtualFolder(folder);
+    Assert.equal(
+      first.onlineSearch,
+      false,
+      "An absent property defaults to false"
+    );
+    first.onlineSearch = true;
+    const second = VirtualFolderHelper.wrapVirtualFolder(folder);
+    Assert.equal(
+      second.onlineSearch,
+      true,
+      "A fresh wrapper reads persisted true"
+    );
+    second.onlineSearch = false;
+    Assert.equal(
+      first.onlineSearch,
+      false,
+      "Existing wrappers read the changed flag"
+    );
+  } finally {
+    cleanUpAccount(localAccount);
+  }
+});
+
 add_task(async function test_savedSearchUsesCurrentPhysicalMembership() {
   const { VirtualFolderHelper } = ChromeUtils.importESModule(
     "resource:///modules/VirtualFolderWrapper.sys.mjs"
@@ -557,6 +592,7 @@ add_task(async function test_savedSearchUsesCurrentPhysicalMembership() {
   Assert.equal(first.getTotalMessages(false), 2);
   Assert.equal(second.getTotalMessages(false), 1);
   Assert.equal(outside.getTotalMessages(false), 1);
+  cleanUpAccount(localAccount);
 });
 
 add_task(async function test_savedSearchCachedHitsDoNotHideInvalidTerms() {
@@ -587,4 +623,5 @@ add_task(async function test_savedSearchCachedHitsDoNotHideInvalidTerms() {
   Assert.throws(() => getMessagesInFolder(saved.virtualFolder), /NS_ERROR/);
   saved.searchString = "ALL";
   assertSavedSearchMembers(saved.virtualFolder, [message]);
+  cleanUpAccount(localAccount);
 });

@@ -150,9 +150,12 @@ NS_IMETHODIMP VirtualFolderWrapper::SetSearchTerms(
 }
 
 NS_IMETHODIMP VirtualFolderWrapper::GetOnlineSearch(bool* onlineSearch) {
-  *onlineSearch = 0;
-  return FolderDB().GetFolderProperty(mVirtualFolderId, "searchOnline"_ns,
-                                      (int64_t*)onlineSearch);
+  NS_ENSURE_ARG_POINTER(onlineSearch);
+  int64_t value = 0;
+  MOZ_TRY(FolderDB().GetFolderProperty(mVirtualFolderId, "searchOnline"_ns,
+                                       &value));
+  *onlineSearch = value != 0;
+  return NS_OK;
 }
 
 NS_IMETHODIMP VirtualFolderWrapper::SetOnlineSearch(bool onlineSearch) {

@@ -11,6 +11,7 @@
 #include "nsIMsgCopyService.h"
 #include "nsIMsgFolderNotificationService.h"
 #include "nsIMsgLocalMailFolder.h"
+#include "nsIMsgImapMailFolder.h"
 #include "nsIMsgMessageService.h"
 #include "nsIMsgNewsFolder.h"
 #include "nsISeekableStream.h"
@@ -21,6 +22,53 @@
 #include "OfflineStorage.h"
 #include "UrlListener.h"
 #include "mozilla/Components.h"
+
+// IMAP reports local deletion through OnStopCopy before STORE finishes. Wait
+// for its URL result, while still accepting a synchronous dispatch failure.
+class ImapSourceDeleteListener final : public CopyServiceListener,
+                                       public UrlListener {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+
+  ImapSourceDeleteListener(nsIUrlListener* folderListener,
+                           std::function<nsresult(nsresult)> onComplete)
+      : mFolderListener(folderListener), mOnComplete(std::move(onComplete)) {
+    mStartFn = [this](nsIURI* url) {
+      return mFolderListener->OnStartRunningUrl(url);
+    };
+    mStopFn = [this](nsIURI* url, nsresult status) {
+      if (mUrlStopped) {
+        return NS_OK;
+      }
+      mUrlStopped = true;
+      nsresult rv = mFolderListener->OnStopRunningUrl(url, status);
+      return Complete(NS_FAILED(status) ? status : rv);
+    };
+    mStopCopyFn = [this](nsresult status) {
+      return NS_FAILED(status) ? Complete(status) : NS_OK;
+    };
+  }
+
+ private:
+  ~ImapSourceDeleteListener() override = default;
+
+  nsresult Complete(nsresult status) {
+    if (mCompleted) {
+      return NS_OK;
+    }
+    mCompleted = true;
+    auto onComplete = std::move(mOnComplete);
+    return onComplete(status);
+  }
+
+  nsCOMPtr<nsIUrlListener> mFolderListener;
+  std::function<nsresult(nsresult)> mOnComplete;
+  bool mCompleted = false;
+  bool mUrlStopped = false;
+};
+
+NS_IMPL_ISUPPORTS_INHERITED(ImapSourceDeleteListener, CopyServiceListener,
+                            nsIUrlListener)
 
 ///////////////////////////////////////////////////////////////////////////////
 // Definition of `ExchangeMessageCopyHandler`, which handles a single copy
@@ -139,9 +187,11 @@ nsresult ExchangeMessageCopyHandler::StartCopyingNextMessage() {
         do_QueryInterface(mSrcFolder.value());
     nsCOMPtr<nsIMsgNewsFolder> newsSource =
         do_QueryInterface(mSrcFolder.value());
-    // Exchange reports final deletion through the listener. Local and news
-    // deletion is synchronous. Other sources need a confirmed completion API.
-    if (!exchangeSource && !localSource && !newsSource) {
+    nsCOMPtr<nsIMsgImapMailFolder> imapSource =
+        do_QueryInterface(mSrcFolder.value());
+    // Exchange and IMAP provide deletion completion. Local and news deletion
+    // is synchronous. Other sources need a confirmed completion API.
+    if (!exchangeSource && !localSource && !newsSource && !imapSource) {
       return NS_ERROR_NOT_IMPLEMENTED;
     }
   }
@@ -302,16 +352,36 @@ nsresult ExchangeMessageCopyHandler::OnCreateFinished(nsresult status,
     RefPtr<nsIMsgDBHdr> curHdr = mHeaders[mCurIndex];
     nsCOMPtr<IExchangeFolder> exchangeSource =
         do_QueryInterface(mSrcFolder.value());
-    if (exchangeSource) {
-      RefPtr<CopyServiceListener> listener = new CopyServiceListener();
-      listener->mStopCopyFn = [self = RefPtr(this),
-                               completed = false](nsresult status) mutable {
-        if (completed || self->mCompleted) {
-          return NS_OK;
+    nsCOMPtr<nsIMsgImapMailFolder> imapSource =
+        do_QueryInterface(mSrcFolder.value());
+    if (exchangeSource || imapSource) {
+      RefPtr<CopyServiceListener> listener;
+      if (imapSource) {
+        // Offline IMAP flags are queued, not confirmed by a URL callback.
+        if (WeAreOffline()) {
+          return OnCopyCompleted(NS_MSG_ERROR_OFFLINE);
         }
-        completed = true;
-        return self->OnMessageCompleted(status);
-      };
+        nsresult rv;
+        nsCOMPtr<nsIUrlListener> folderListener =
+            do_QueryInterface(mSrcFolder.value(), &rv);
+        if (NS_FAILED(rv)) {
+          return OnCopyCompleted(rv);
+        }
+        listener = new ImapSourceDeleteListener(
+            folderListener, [self = RefPtr(this)](nsresult status) {
+              return self->OnMessageCompleted(status);
+            });
+      } else {
+        listener = new CopyServiceListener();
+        listener->mStopCopyFn = [self = RefPtr(this),
+                                 completed = false](nsresult status) mutable {
+          if (completed || self->mCompleted) {
+            return NS_OK;
+          }
+          completed = true;
+          return self->OnMessageCompleted(status);
+        };
+      }
       nsresult rv = mSrcFolder.value()->DeleteMessages({curHdr}, mWindow, true,
                                                        true, listener, false);
       if (NS_FAILED(rv)) {

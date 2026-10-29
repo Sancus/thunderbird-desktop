@@ -138,11 +138,15 @@ static nsresult HandleMoveError(nsIMsgFolder* sourceFolder,
 // when the calling scope exits with the specified `nsresult` in a failed state.
 [[nodiscard]] static auto GuardCopyServiceExit(nsIMsgFolder* sourceFolder,
                                                nsIMsgFolder* destinationFolder,
-                                               const nsresult& rv) {
-  return mozilla::MakeScopeExit([sourceFolder, destinationFolder, &rv]() {
+                                               const nsresult& rv,
+                                               bool notifyCopyService = true) {
+  return mozilla::MakeScopeExit([sourceFolder, destinationFolder, &rv,
+                                 notifyCopyService]() {
     if (NS_FAILED(rv)) {
       sourceFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
-      NotifyMessageCopyServiceComplete(sourceFolder, destinationFolder, rv);
+      if (notifyCopyService) {
+        NotifyMessageCopyServiceComplete(sourceFolder, destinationFolder, rv);
+      }
     }
   });
 }
@@ -695,9 +699,10 @@ NS_IMETHODIMP ExchangeFolder::CopyMessages(
     NS_ENSURE_SUCCESS(rv, rv);
     const auto undoType = aIsMove ? nsIMsgTransactionService::eMoveMsg
                                   : nsIMsgTransactionService::eCopyMsg;
-    rv = CopyItemsOnSameServer(exchangeSourceFolder, aSrcHdrs, aIsMove,
-                               aMsgWindow, aCopyListener, aAllowUndo, undoType,
-                               nullptr);
+    // The copy service owns this request's listener notifications.
+    rv = CopyItemsOnSameServerInternal(exchangeSourceFolder, aSrcHdrs, aIsMove,
+                                       aMsgWindow, aCopyListener, aAllowUndo,
+                                       undoType, nullptr, true);
     NS_ENSURE_SUCCESS(rv, rv);
   } else {
     // Cross-server copy or move. Instantiate a `ExchangeMessageCopyHandler` for
@@ -736,6 +741,18 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
     nsIMsgCopyServiceListener* aCopyListener, bool aAllowUndo,
     int32_t undoOperationType,
     IExchangeFolderOperationListener* aOperationListener) {
+  return CopyItemsOnSameServerInternal(
+      aSrcFolder, aSrcHdrs, aIsMove, aMsgWindow, aCopyListener, aAllowUndo,
+      undoOperationType, aOperationListener, false);
+}
+
+nsresult ExchangeFolder::CopyItemsOnSameServerInternal(
+    IExchangeFolder* aSrcFolder, const nsTArray<RefPtr<nsIMsgDBHdr>>& aSrcHdrs,
+    bool aIsMove, nsIMsgWindow* aMsgWindow,
+    nsIMsgCopyServiceListener* aCopyListener, bool aAllowUndo,
+    int32_t undoOperationType,
+    IExchangeFolderOperationListener* aOperationListener,
+    bool notifyCopyService) {
   // Same server copy or move, perform operation remotely.
   nsTArray<nsCString> exchangeIds;
   nsresult rv = GetExchangeIdsForMessageHeaders(aSrcHdrs, exchangeIds);
@@ -747,7 +764,8 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
 
   const nsCOMPtr<nsIMsgWindow> msgWindow = aMsgWindow;
   const nsCOMPtr<IExchangeFolder> srcFolder = aSrcFolder;
-  const nsCOMPtr<nsIMsgCopyServiceListener> copyListener = aCopyListener;
+  const nsCOMPtr<nsIMsgCopyServiceListener> copyListener =
+      notifyCopyService ? nullptr : aCopyListener;
   const nsCOMPtr<IExchangeFolderOperationListener> operationListener =
       aOperationListener;
 
@@ -755,7 +773,7 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
       new ExchangeSimpleFallibleMessageListener(
           aSrcHdrs,
           [self = RefPtr(this), srcFolder, msgWindow, aIsMove, copyListener,
-           aAllowUndo, operationListener, undoOperationType](
+           aAllowUndo, operationListener, undoOperationType, notifyCopyService](
               const nsTArray<RefPtr<nsIMsgDBHdr>>& srcHdrs,
               const nsTArray<nsCString>& ids,
               bool useLegacyFallback) MOZ_CAN_RUN_SCRIPT_BOUNDARY_LAMBDA {
@@ -766,6 +784,8 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
             nsCOMPtr<nsIMsgFolder> genericFolder{
                 do_QueryInterface(srcFolder, &rv)};
             NS_ENSURE_SUCCESS(rv, rv);
+            auto notifyFailureOnExit = GuardCopyServiceExit(
+                genericFolder, self, rv, notifyCopyService);
 
             nsTArray<RefPtr<nsIMsgDBHdr>> newHeaders;
             if (useLegacyFallback) {
@@ -775,18 +795,24 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
               // The new IDs were returned from the server. In this case,
               // the order of the new IDs will correspond to the order of
               // the input IDs specified in the initial request.
-              NS_ENSURE_TRUE(ids.Length() == srcHdrs.Length(),
-                             NS_ERROR_UNEXPECTED);
+              if (ids.Length() != srcHdrs.Length()) {
+                rv = NS_ERROR_UNEXPECTED;
+                return rv;
+              }
 
               /// Copy the messages into the destination folder.
               rv = LocalCopyMessages(genericFolder, self, srcHdrs, newHeaders);
               NS_ENSURE_SUCCESS(rv, rv);
-              NS_ENSURE_TRUE(newHeaders.Length() == ids.Length(),
-                             NS_ERROR_UNEXPECTED);
+              if (newHeaders.Length() != ids.Length()) {
+                rv = NS_ERROR_UNEXPECTED;
+                return rv;
+              }
 
               // Set the Exchange ID property for each of the new headers.
               for (std::size_t i = 0; i < ids.Length(); ++i) {
-                newHeaders[i]->SetStringProperty(kExchangeIdProperty, ids[i]);
+                rv = newHeaders[i]->SetStringProperty(kExchangeIdProperty,
+                                                      ids[i]);
+                NS_ENSURE_SUCCESS(rv, rv);
               }
 
               nsCOMPtr<nsIMsgFolderNotificationService> notifier =
@@ -831,9 +857,13 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
               NS_ENSURE_SUCCESS(rv, rv);
             }
 
-            return NotifyMessageCopyServiceComplete(genericFolder, self, NS_OK);
+            notifyFailureOnExit.release();
+            return notifyCopyService ? NotifyMessageCopyServiceComplete(
+                                           genericFolder, self, NS_OK)
+                                     : NS_OK;
           },
-          [self = RefPtr(this), srcFolder, copyListener](nsresult status) {
+          [self = RefPtr(this), srcFolder, copyListener,
+           notifyCopyService](nsresult status) {
             if (copyListener) {
               copyListener->OnStopCopy(status);
             }
@@ -841,7 +871,11 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
             nsCOMPtr<nsIMsgFolder> genericFolder{
                 do_QueryInterface(srcFolder, &rv)};
             NS_ENSURE_SUCCESS(rv, rv);
-            return HandleMoveError(genericFolder, self, status);
+            if (notifyCopyService) {
+              return HandleMoveError(genericFolder, self, status);
+            }
+            genericFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
+            return NS_OK;
           });
 
   nsCOMPtr<IExchangeClient> client;
@@ -860,10 +894,12 @@ NS_IMETHODIMP ExchangeFolder::CopyItemsOnSameServer(
 static nsresult CompleteCopyMoveFolderOperation(
     nsIMsgFolder* srcFolder, nsIMsgFolder* destinationFolder,
     nsIMsgCopyServiceListener* copyListener, const nsACString& name,
-    const nsCString& newExchangeId) {
+    const nsCString& newExchangeId, bool notifyCopyService) {
   nsresult rv = NS_OK;
 
   auto listenerExitGuard = GuardCopyServiceListener(copyListener, rv);
+  auto notifyFailureOnExit =
+      GuardCopyServiceExit(srcFolder, destinationFolder, rv, notifyCopyService);
 
   nsCOMPtr<nsIMsgFolder> newFolder;
   rv = destinationFolder->GetChildNamed(name, getter_AddRefs(newFolder));
@@ -876,9 +912,13 @@ static nsresult CompleteCopyMoveFolderOperation(
     return rv;
   }
 
-  newFolder->SetStringProperty(kExchangeIdProperty, newExchangeId);
+  rv = newFolder->SetStringProperty(kExchangeIdProperty, newExchangeId);
+  NS_ENSURE_SUCCESS(rv, rv);
 
-  return NotifyMessageCopyServiceComplete(srcFolder, destinationFolder, NS_OK);
+  notifyFailureOnExit.release();
+  return notifyCopyService ? NotifyMessageCopyServiceComplete(
+                                 srcFolder, destinationFolder, NS_OK)
+                           : NS_OK;
 }
 
 NS_IMETHODIMP ExchangeFolder::CopyFolder(
@@ -906,8 +946,9 @@ NS_IMETHODIMP ExchangeFolder::CopyFolder(
 
   if (isSameServer) {
     // Same server move or copy.
-    rv = CopyFolderOnSameServer(aSrcFolder, aIsMoveFolder, aMsgWindow,
-                                aCopyListener);
+    // The copy service owns this request's listener notifications.
+    rv = CopyFolderOnSameServerInternal(aSrcFolder, aIsMoveFolder, aMsgWindow,
+                                        aCopyListener, true);
     NS_ENSURE_SUCCESS(rv, rv);
   } else {
     // Cross-server folder move (or copy). Instantiate a
@@ -925,6 +966,13 @@ NS_IMETHODIMP ExchangeFolder::CopyFolder(
 NS_IMETHODIMP ExchangeFolder::CopyFolderOnSameServer(
     nsIMsgFolder* aSourceFolder, bool aIsMoveFolder, nsIMsgWindow* aWindow,
     nsIMsgCopyServiceListener* aCopyListener) {
+  return CopyFolderOnSameServerInternal(aSourceFolder, aIsMoveFolder, aWindow,
+                                        aCopyListener, false);
+}
+
+nsresult ExchangeFolder::CopyFolderOnSameServerInternal(
+    nsIMsgFolder* aSourceFolder, bool aIsMoveFolder, nsIMsgWindow* aWindow,
+    nsIMsgCopyServiceListener* aCopyListener, bool notifyCopyService) {
   nsAutoCString sourceExchangeId;
   nsresult rv =
       aSourceFolder->GetStringProperty(kExchangeIdProperty, sourceExchangeId);
@@ -941,18 +989,25 @@ NS_IMETHODIMP ExchangeFolder::CopyFolderOnSameServer(
 
   const nsCOMPtr<nsIMsgFolder> srcFolder = aSourceFolder;
   const nsCOMPtr<nsIMsgWindow> msgWindow = aWindow;
-  const nsCOMPtr<nsIMsgCopyServiceListener> copyListener = aCopyListener;
+  const nsCOMPtr<nsIMsgCopyServiceListener> copyListener =
+      notifyCopyService ? nullptr : aCopyListener;
 
   RefPtr<ExchangeSimpleFallibleListener> listener =
       new ExchangeSimpleFallibleListener(
           [self = RefPtr(this), srcFolder, copyListener, msgWindow,
-           aIsMoveFolder](const nsTArray<nsCString>& ids,
-                          bool useLegacyFallback) {
-            NS_ENSURE_TRUE(ids.Length() == 1, NS_ERROR_UNEXPECTED);
+           aIsMoveFolder, notifyCopyService](const nsTArray<nsCString>& ids,
+                                             bool useLegacyFallback) {
+            nsresult rv = NS_OK;
+            auto notifyFailureOnExit =
+                GuardCopyServiceExit(srcFolder, self, rv, notifyCopyService);
+            if (ids.Length() != 1) {
+              rv = NS_ERROR_UNEXPECTED;
+              return rv;
+            }
             const auto& newExchangeId = ids[0];
 
             nsAutoCString name;
-            nsresult rv = srcFolder->GetName(name);
+            rv = srcFolder->GetName(name);
             NS_ENSURE_SUCCESS(rv, rv);
 
             // For a move, the Exchange IDs of any subfolders or items of the
@@ -966,9 +1021,10 @@ NS_IMETHODIMP ExchangeFolder::CopyFolderOnSameServer(
               rv =
                   LocalRenameOrReparentFolder(srcFolder, self, name, msgWindow);
               NS_ENSURE_SUCCESS(rv, rv);
-              rv = CompleteCopyMoveFolderOperation(
-                  srcFolder, self, copyListener, name, newExchangeId);
-              return rv;
+              notifyFailureOnExit.release();
+              return CompleteCopyMoveFolderOperation(
+                  srcFolder, self, copyListener, name, newExchangeId,
+                  notifyCopyService);
             }
 
             nsCOMPtr<nsIMsgIncomingServer> server;
@@ -993,20 +1049,26 @@ NS_IMETHODIMP ExchangeFolder::CopyFolderOnSameServer(
             const RefPtr<ExchangeSimpleListener> listener =
                 new ExchangeSimpleListener{
                     [self, srcFolder, msgWindow, copyListener, newExchangeId,
-                     name](const auto& ids, bool resyncRequired) {
-                      nsresult rv = NS_OK;
-                      rv = CompleteCopyMoveFolderOperation(
-                          srcFolder, self, copyListener, name, newExchangeId);
-                      return rv;
+                     name,
+                     notifyCopyService](const auto& ids, bool resyncRequired) {
+                      return CompleteCopyMoveFolderOperation(
+                          srcFolder, self, copyListener, name, newExchangeId,
+                          notifyCopyService);
                     }};
-            return exchangeServer->SyncFolderHierarchy(listener, msgWindow);
+            rv = exchangeServer->SyncFolderHierarchy(listener, msgWindow);
+            return rv;
           },
-          [self = RefPtr(this), srcFolder, copyListener](nsresult status) {
+          [self = RefPtr(this), srcFolder, copyListener,
+           notifyCopyService](nsresult status) {
             if (copyListener) {
               copyListener->OnStopCopy(status);
             }
 
-            return HandleMoveError(srcFolder, self, status);
+            if (notifyCopyService) {
+              return HandleMoveError(srcFolder, self, status);
+            }
+            srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
+            return NS_OK;
           });
 
   nsCOMPtr<IExchangeClient> client;
@@ -2049,8 +2111,8 @@ NS_IMETHODIMP ExchangeFolder::MarkMessagesFlagged(
   }
   RefPtr<ExchangeSimpleListener> listener = new ExchangeSimpleListener(
       [headersToChange = std::move(headersToChange), requestedIds = exchangeIds,
-       markFlagged](const nsTArray<nsCString>& ids, bool useLegacyFallback)
-          -> nsresult {
+       markFlagged](const nsTArray<nsCString>& ids,
+                    bool useLegacyFallback) -> nsresult {
         nsTHashSet<nsCString> confirmedIds(ids.Length());
         for (const auto& id : ids) {
           confirmedIds.Insert(id);

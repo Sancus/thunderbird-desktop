@@ -139,6 +139,17 @@ class ExchangeFolder : public nsMsgDBFolder, public IExchangeFolder {
    */
   nsresult GetProtocolClient(IExchangeClient** exchangeClient);
 
+  // Queued copies complete through the copy service; direct operations do not.
+  nsresult CopyItemsOnSameServerInternal(
+      IExchangeFolder* sourceFolder,
+      const nsTArray<RefPtr<nsIMsgDBHdr>>& headers, bool isMove,
+      nsIMsgWindow* window, nsIMsgCopyServiceListener* copyListener,
+      bool allowUndo, int32_t undoOperationType,
+      IExchangeFolderOperationListener* listener, bool notifyCopyService);
+  nsresult CopyFolderOnSameServerInternal(
+      nsIMsgFolder* sourceFolder, bool isMove, nsIMsgWindow* window,
+      nsIMsgCopyServiceListener* copyListener, bool notifyCopyService);
+
   /**
    * Look up the trash folder for the current account.
    */

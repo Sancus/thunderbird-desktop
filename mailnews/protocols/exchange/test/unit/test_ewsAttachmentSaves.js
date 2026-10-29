@@ -22,7 +22,7 @@ var { mailTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MailTestUtils.sys.mjs"
 );
 var { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/MimeMessage.sys.mjs"
+  "resource:///modules/panorama/MimeMessage.sys.mjs"
 );
 var { AttachmentInfo } = ChromeUtils.importESModule(
   "resource:///modules/AttachmentInfo.sys.mjs"
@@ -66,8 +66,20 @@ add_task(async function testEwsAttachmentDetach() {
     attachments: [{ filename: kAttachFileName, body: "I like cheese!" }],
   });
 
+  const otherMessage = messageGenerator.makeMessage({ subject: "Unrelated" });
+  const otherFolderId = "attachment-other-folder";
+  ewsServer.appendRemoteFolder(new RemoteFolder(otherFolderId, "root"));
+  ewsServer.addItemToFolder(
+    "other_attachment_message",
+    otherFolderId,
+    otherMessage
+  );
+
   const rootFolder = incomingServer.rootFolder;
   await syncFolder(incomingServer, rootFolder);
+  const otherFolder = rootFolder.getChildNamed(otherFolderId);
+  await syncFolder(incomingServer, otherFolder);
+  const otherKey = mailTestUtils.firstMsgHdr(otherFolder).messageKey;
 
   const inboxFolder = rootFolder.getChildNamed("Inbox");
   Assert.ok(!!inboxFolder, "Inbox folder should exist.");
@@ -84,6 +96,7 @@ add_task(async function testEwsAttachmentDetach() {
   );
   const msgHdr = mailTestUtils.firstMsgHdr(inboxFolder);
   Assert.ok(msgHdr instanceof Ci.nsIMsgDBHdr);
+  const originalKey = msgHdr.messageKey;
 
   // process the message through mime
   MsgHdrToMimeMessage(
@@ -106,19 +119,31 @@ add_task(async function testEwsAttachmentDetach() {
     checkFile.exists(),
     "Detached file should exist in the profile directory"
   );
+  Assert.equal(await IOUtils.readUTF8(checkFile.path), "I like cheese!");
 
   // The message should now have a detached attachment. Read the message,
   // and search for "AttachmentDetached" which is added on detachment.
 
-  // Get the message header - detached copy has UID 2. The original should be
-  // gone.
+  // Resolve the replacement independently of other folders' message keys.
   Assert.equal(
     inboxFolder.getTotalMessages(false),
     1,
     "Inbox should still have exactly one message after detach"
   );
-  const msgHdr2 = inboxFolder.GetMessageHeader(2);
+  const msgHdr2 = mailTestUtils.firstMsgHdr(inboxFolder);
   Assert.ok(!!msgHdr2, "Should have a message header");
+  Assert.equal(msgHdr2.folder.URI, inboxFolder.URI);
+  Assert.equal(msgHdr2.messageId, smsg.messageId);
+  Assert.ok(!inboxFolder.msgDatabase.containsKey(originalKey));
+  const remote = ewsServer.getItemInfo(msgHdr2.getStringProperty("ewsId"));
+  Assert.ok(remote, "The replacement header has its actual remote identity");
+  Assert.equal(remote.parentId, inboxFolder.getStringProperty("ewsId"));
+  Assert.ok(!ewsServer.getItemInfo("attach_test_msg"));
+  Assert.ok(inboxFolder.hasMsgOffline(msgHdr2.messageKey));
+  Assert.equal(
+    otherFolder.GetMessageHeader(otherKey).messageId,
+    otherMessage.messageId
+  );
 
   const messageContent = await getContentFromMessage(msgHdr2);
   Assert.stringContains(

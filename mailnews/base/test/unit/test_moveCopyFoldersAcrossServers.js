@@ -49,6 +49,14 @@ add_setup(async function () {
   srcRoots.push(await createServer("ewsSrc", "ews", ewsSrcServer.port));
   destRoots.push(await createServer("ewsDest", "ews", ewsDestServer.port));
 
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false)
+  );
+
   for (const srcRoot of srcRoots) {
     for (const destRoot of destRoots) {
       const moveName = `move_from_${srcRoot.server.type}_to_${destRoot.server.type}`;
@@ -108,6 +116,17 @@ async function createServer(username, type, port) {
 
   const account = MailServices.accounts.createAccount();
   account.incomingServer = incomingServer;
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  const store = {
+    "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+    "@mozilla.org/msgstore/maildirstore;1": "maildir",
+  }[contract];
+  Assert.ok(store);
+  Assert.equal(incomingServer.getStringValue("storeContractID"), contract);
+  Assert.equal(incomingServer.msgStore.storeType, store);
+  Assert.equal(incomingServer.rootFolder.msgStore.storeType, store);
   return incomingServer.rootFolder;
 }
 

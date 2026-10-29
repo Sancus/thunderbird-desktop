@@ -14,6 +14,9 @@ var { MessageGenerator } = ChromeUtils.importESModule(
 var { TestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/TestUtils.sys.mjs"
 );
+var { ServerTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/ServerTestUtils.sys.mjs"
+);
 
 var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
@@ -40,6 +43,14 @@ add_setup(async function () {
 
   [ewsServer, ewsIncomingServer] = setupBasicEwsTestServer({});
   [graphServer, graphIncomingServer] = setupBasicGraphTestServer({});
+
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false)
+  );
 });
 
 /**
@@ -130,7 +141,16 @@ async function copyItems(sourceFolder, destinationFolder, headers, isMove) {
     "msgsMoveCopyCompleted"
   );
 
-  const copyListener = new PromiseTestUtils.PromiseCopyListener();
+  let starts = 0;
+  const stops = [];
+  const copyListener = new PromiseTestUtils.PromiseCopyListener({
+    onStartCopy() {
+      starts++;
+    },
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
   MailServices.copy.copyMessages(
     sourceFolder,
     headers,
@@ -141,6 +161,8 @@ async function copyItems(sourceFolder, destinationFolder, headers, isMove) {
     false // allowUndo
   );
   await copyListener.promise;
+  Assert.equal(starts, 1, "The copy service starts the operation once");
+  Assert.deepEqual(stops, [Cr.NS_OK], "The copy service completes once");
 
   if (isMove) {
     await eventPromise;
@@ -204,6 +226,17 @@ async function subtestMoveItem(mockServer, incomingServer) {
     `${folder2.name} should have 2 messages`
   );
 
+  for (const header of folder2.messages) {
+    Assert.equal(header.folder.URI, folder2.URI);
+    const remote = mockServer.getItemInfo(header.getStringProperty("ewsId"));
+    Assert.ok(
+      remote,
+      "The published destination header has its real remote ID"
+    );
+    Assert.equal(remote.parentId, folder2.getStringProperty("ewsId"));
+    Assert.ok(msgs.some(message => message.messageId == header.messageId));
+  }
+
   // Check that the messages in `folder2` are the correct ones.
   const expectedSubjects = msgs.map(msg => msg.subject);
   const actualSubjects = [...folder2.messages].map(msg => msg.subject);
@@ -264,14 +297,157 @@ async function subtestCopyItem(mockServer, incomingServer) {
       `${folder2.name} should contain a message with the subject \"${subject}\"`
     );
   }
+
+  for (const header of folder2.messages) {
+    Assert.equal(header.folder.URI, folder2.URI);
+    const remote = mockServer.getItemInfo(header.getStringProperty("ewsId"));
+    Assert.ok(
+      remote,
+      "The published destination header has its real remote ID"
+    );
+    Assert.equal(remote.parentId, folder2.getStringProperty("ewsId"));
+    Assert.ok(msgs.some(message => message.messageId == header.messageId));
+  }
 }
 
+/**
+ * Checks a native remote-ID write failure and a following copy. Mork exercises
+ * the following copy without the native SQL fault.
+ *
+ * @param {MockServer} mockServer - The remote message fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - The configured protocol account.
+ */
+async function checkRemoteIdWriteFailure(mockServer, incomingServer) {
+  const [source, destination] = await setup_item_copymove_structure(
+    "id_write_failure",
+    mockServer,
+    incomingServer
+  );
+  const headers = [...source.messages];
+  const retained = {
+    key: headers[0].messageKey,
+    id: headers[0].messageId,
+    remoteId: headers[0].getStringProperty("ewsId"),
+    flags: headers[0].flags,
+    token: headers[0].storeToken,
+    offline: source.hasMsgOffline(headers[0].messageKey),
+  };
+
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    ).connectionForTests;
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER reject_copy_remote_id BEFORE INSERT ON message_properties " +
+        "WHEN NEW.name = 'ewsId' AND NEW.id IN " +
+        `(SELECT id FROM messages WHERE folderId = ${destination.id}) ` +
+        "BEGIN SELECT RAISE(ABORT, 'copy remote ID fault'); END"
+    );
+    try {
+      let starts = 0;
+      const stops = [];
+      const listener = new PromiseTestUtils.PromiseCopyListener({
+        onStartCopy() {
+          starts++;
+        },
+        onStopCopy(status) {
+          stops.push(status);
+        },
+      });
+      MailServices.copy.copyMessages(
+        source,
+        [headers[0]],
+        destination,
+        true,
+        listener,
+        null,
+        false
+      );
+      await Assert.rejects(
+        listener.promise,
+        new RegExp(Cr.NS_ERROR_STORAGE_CONSTRAINT),
+        "The real remote-ID write error fails the move"
+      );
+      await TestUtils.waitForCondition(
+        () => incomingServer.protocolClientIdle,
+        "Waiting for the failed ID binding to finish"
+      );
+      Assert.equal(starts, 1);
+      Assert.deepEqual(stops, [Cr.NS_ERROR_STORAGE_CONSTRAINT]);
+      const original = source.GetMessageHeader(retained.key);
+      Assert.equal(original.messageId, retained.id);
+      Assert.equal(original.getStringProperty("ewsId"), retained.remoteId);
+      Assert.equal(original.flags, retained.flags);
+      Assert.equal(original.storeToken, retained.token);
+      Assert.equal(source.hasMsgOffline(retained.key), retained.offline);
+      const partial = [...destination.messages];
+      Assert.equal(partial.length, 1, "The published destination is retained");
+      Assert.equal(partial[0].messageId, retained.id);
+      Assert.equal(partial[0].folder.URI, destination.URI);
+      Assert.ok(!partial[0].properties.includes("ewsId"));
+      Assert.equal(partial[0].getStringProperty("ewsId"), "");
+      Assert.ok(
+        !mockServer.getItemInfo(retained.remoteId),
+        "The server move already happened; no remote rollback is claimed"
+      );
+      Assert.equal(
+        mockServer.getItemsInFolder(destination.getStringProperty("ewsId"))
+          .length,
+        1
+      );
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER reject_copy_remote_id");
+    }
+  }
+
+  // A new request to the same destination must not remain behind a failed one.
+  let starts = 0;
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStartCopy() {
+      starts++;
+    },
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
+  MailServices.copy.copyMessages(
+    source,
+    [headers[1]],
+    destination,
+    false,
+    listener,
+    null,
+    false
+  );
+  await listener.promise;
+  Assert.equal(starts, 1);
+  Assert.deepEqual(stops, [Cr.NS_OK]);
+  const copied = [...destination.messages].find(
+    header => header.messageId == headers[1].messageId
+  );
+  Assert.ok(copied);
+  Assert.equal(copied.folder.URI, destination.URI);
+  const remote = mockServer.getItemInfo(copied.getStringProperty("ewsId"));
+  Assert.ok(remote);
+  Assert.equal(remote.parentId, destination.getStringProperty("ewsId"));
+  Assert.equal(source.GetMessageHeader(retained.key).messageId, retained.id);
+}
+
+add_task(async function test_remoteIdWriteFailureEws() {
+  await checkRemoteIdWriteFailure(ewsServer, ewsIncomingServer);
+});
+
+add_task(async function test_remoteIdWriteFailureGraph() {
+  await checkRemoteIdWriteFailure(graphServer, graphIncomingServer);
+});
+
 add_task(async function testCopyItemEws() {
-  subtestCopyItem(ewsServer, ewsIncomingServer);
+  await subtestCopyItem(ewsServer, ewsIncomingServer);
 });
 
 add_task(async function testCopyItemGraph() {
-  subtestCopyItem(graphServer, graphIncomingServer);
+  await subtestCopyItem(graphServer, graphIncomingServer);
 });
 
 add_task(async function test_move_copy_messages_from_another_server() {
@@ -681,7 +857,20 @@ async function runMoveFolderTest(mockServer, incomingServer) {
     incomingServer
   );
 
-  await copyFolder(child, parent2, true);
+  let starts = 0;
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStartCopy() {
+      starts++;
+    },
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
+  MailServices.copy.copyFolder(child, parent2, true, listener, null);
+  await listener.promise;
+  Assert.equal(starts, 1, "The folder operation starts once");
+  Assert.deepEqual(stops, [Cr.NS_OK], "The folder operation completes once");
 
   Assert.ok(
     !parent1.getChildNamed(child.name),
@@ -708,7 +897,20 @@ async function runCopyFolderTest(mockServer, incomingServer) {
     incomingServer
   );
 
-  await copyFolder(child, parent2, false);
+  let starts = 0;
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStartCopy() {
+      starts++;
+    },
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
+  MailServices.copy.copyFolder(child, parent2, false, listener, null);
+  await listener.promise;
+  Assert.equal(starts, 1, "The folder operation starts once");
+  Assert.deepEqual(stops, [Cr.NS_OK], "The folder operation completes once");
 
   Assert.ok(
     !!parent1.getChildNamed(child.name),
@@ -2463,3 +2665,233 @@ async function testPartialFlaggedIdentity(initiallyFlagged) {
     "The unrequested header is unchanged"
   );
 }
+
+/**
+ * Move from a real IMAP source, observing destination and deletion failures.
+ *
+ * @param {MockServer} destinationServer - The Exchange protocol fixture.
+ * @param {nsIMsgIncomingServer} destinationAccount - Its incoming server.
+ * @param {string} [failure] - Either "create" or "delete" to fail that stage.
+ * @returns {Promise<void>} Resolves after the copy listener and identity checks.
+ */
+async function checkImapSourceMove(
+  destinationServer,
+  destinationAccount,
+  failure = ""
+) {
+  const name = `imap_source_${destinationAccount.type}_${failure || "success"}`;
+  const imap = await ServerTestUtils.createServer({
+    type: "imap",
+    options: { username: name },
+  });
+  const incoming = MailServices.accounts.createIncomingServer(
+    name,
+    "localhost",
+    "imap"
+  );
+  incoming.port = imap.port;
+  incoming.password = "password";
+  const account = MailServices.accounts.createAccount();
+  account.incomingServer = incoming;
+  let publicationListener;
+  let publicationDatabase;
+  let publications = 0;
+  const addItem = destinationServer.addItemToFolder;
+  try {
+    const source = await incoming.rootFolder.createSubfolderAsync(name);
+    const contract = Services.prefs.getCharPref(
+      "mail.serverDefaultStoreContractID"
+    );
+    const store = {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[contract];
+    Assert.ok(store);
+    Assert.equal(incoming.getStringValue("storeContractID"), contract);
+    Assert.equal(source.msgStore.storeType, store);
+    Assert.equal(
+      destinationAccount.getStringValue("storeContractID"),
+      contract
+    );
+    Assert.equal(destinationAccount.msgStore.storeType, store);
+    source.QueryInterface(Ci.nsIMsgImapMailFolder);
+    const mailbox = imap.daemon.getMailbox(source.onlineName);
+    mailbox.uidnext = 6501;
+    const message = generator.makeMessage();
+    await imap.addMessages(source, [message]);
+    const original = await TestUtils.waitForCondition(
+      () => [...source.messages][0],
+      "The actual IMAP source header is published"
+    );
+    const key = original.messageKey;
+    Assert.equal(original.messageId, message.messageId);
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      Assert.equal(original.getUint32Property("uidOnServer"), 6501);
+      Assert.notEqual(
+        key,
+        6501,
+        "The physical key is independent of the server UID"
+      );
+      Assert.equal(
+        source.msgDatabase.dBFolderInfo.imapUidValidity,
+        mailbox.uidvalidity
+      );
+    } else {
+      Assert.equal(key, 6501);
+    }
+    const download = new PromiseTestUtils.PromiseUrlListener();
+    source.downloadAllForOffline(download, null);
+    await download.promise;
+    Assert.ok(source.hasMsgOffline(key));
+    Assert.ok(original.storeToken);
+    const sourceUri = source.getUriForMsg(original);
+    const sourceBody = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(sourceUri).streamMessage(
+      sourceUri,
+      sourceBody,
+      null,
+      null,
+      false,
+      "",
+      false
+    );
+    const expectedBody = await sourceBody.promise;
+    destinationServer.appendRemoteFolder(new RemoteFolder(name, "root"));
+    await syncFolder(destinationAccount, destinationAccount.rootFolder);
+    const destination = destinationAccount.rootFolder.getChildNamed(name);
+    Assert.ok(destination);
+    Assert.equal(destination.msgStore.storeType, store);
+
+    if (failure == "create") {
+      destinationServer.addItemToFolder = function (id, parentId, ...args) {
+        if (parentId == destination.getStringProperty("ewsId")) {
+          throw new Error("Destination creation failed");
+        }
+        return addItem.call(this, id, parentId, ...args);
+      };
+    } else if (failure == "delete") {
+      publicationDatabase = destination.msgDatabase;
+      publicationListener = {
+        QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+        onHdrAdded(header) {
+          Assert.equal(header.folder.URI, destination.URI);
+          publications++;
+          imap.daemon.commandToFail = "UID";
+        },
+        onHdrFlagsChanged() {},
+        onHdrDeleted() {},
+        onParentChanged() {},
+        onAnnouncerGoingAway() {},
+        onReadChanged() {},
+        onJunkScoreChanged() {},
+        onHdrPropertyChanged() {},
+        onEvent() {},
+      };
+      publicationDatabase.addListener(publicationListener);
+    }
+    let starts = 0;
+    const stops = [];
+    const listener = new PromiseTestUtils.PromiseCopyListener({
+      onStartCopy() {
+        starts++;
+      },
+      onStopCopy(status) {
+        stops.push(status);
+      },
+    });
+    MailServices.copy.copyMessages(
+      source,
+      [original],
+      destination,
+      true,
+      listener,
+      null,
+      false
+    );
+    // EWS rejects the server's HTTP500 error body during deserialization.
+    const error =
+      failure == "create"
+        ? Cr.NS_ERROR_UNEXPECTED
+        : Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+    if (failure) {
+      Assert.equal(typeof error, "number", "The native status is defined");
+      await Assert.rejects(listener.promise, new RegExp(error));
+    } else {
+      await listener.promise;
+    }
+    Assert.equal(publications, failure == "delete" ? 1 : 0);
+    Assert.equal(starts, 1);
+    Assert.deepEqual(stops, [failure ? error : Cr.NS_OK]);
+    const transaction = imap.server.playTransaction();
+    const commands = (Array.isArray(transaction) ? transaction : [transaction])
+      .flatMap(item => item.them)
+      .map(command => command.toUpperCase());
+    const deleted = commands.some(
+      command => command.includes("UID STORE") && command.includes("\\DELETED")
+    );
+    Assert.equal(deleted, failure != "create");
+    const remoteSource = imap.getMessagesInFolder(source)[0];
+    Assert.equal(remoteSource.flags.includes("\\Deleted"), !failure);
+    if (failure == "create") {
+      Assert.equal(source.GetMessageHeader(key).messageId, message.messageId);
+      Assert.equal(destination.getTotalMessages(false), 0);
+      Assert.equal(
+        destinationServer.getItemsInFolder(
+          destination.getStringProperty("ewsId")
+        ).length,
+        0
+      );
+      return;
+    }
+    const copied = [...destination.messages];
+    Assert.equal(copied.length, 1);
+    Assert.equal(copied[0].messageId, message.messageId);
+    Assert.equal(copied[0].folder.URI, destination.URI);
+    const remote = destinationServer.getItemInfo(
+      copied[0].getStringProperty("ewsId")
+    );
+    Assert.ok(remote);
+    Assert.equal(remote.parentId, destination.getStringProperty("ewsId"));
+    Assert.ok(destination.hasMsgOffline(copied[0].messageKey));
+    const uri = destination.getUriForMsg(copied[0]);
+    const body = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      body,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    Assert.equal(await body.promise, expectedBody);
+    if (!failure) {
+      Assert.equal(source.getTotalMessages(false), 0);
+      Assert.ok(!source.msgDatabase.containsKey(key));
+    }
+  } finally {
+    imap.daemon.commandToFail = "";
+    destinationServer.addItemToFolder = addItem;
+    if (publicationListener) {
+      publicationDatabase.removeListener(publicationListener);
+    }
+    incoming.closeCachedConnections();
+    MailServices.accounts.removeAccount(account, false);
+  }
+}
+
+add_task(async function testImapSourceMoveEws() {
+  await checkImapSourceMove(ewsServer, ewsIncomingServer);
+});
+
+add_task(async function testImapSourceMoveGraph() {
+  await checkImapSourceMove(graphServer, graphIncomingServer);
+});
+
+add_task(async function testImapSourceMoveCreateFailureEws() {
+  await checkImapSourceMove(ewsServer, ewsIncomingServer, "create");
+});
+
+add_task(async function testImapSourceMoveDeleteFailureEws() {
+  await checkImapSourceMove(ewsServer, ewsIncomingServer, "delete");
+});

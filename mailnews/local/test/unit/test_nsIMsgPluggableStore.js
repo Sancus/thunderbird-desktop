@@ -548,8 +548,10 @@ async function test_finishNewMessageWithPreemptedStream(storeType) {
     const folder = localAccountUtils.inboxFolder;
     const store = folder.msgStore;
     Assert.equal(store.storeType, storeType);
-    const original = "Subject: Original\r\n\r\nOriginal body.\r\n";
-    const replacement = "Subject: Replacement\r\n\r\nReplacement body.\r\n";
+    const original =
+      "From: writer@example.invalid\r\nSubject: Original\r\n\r\nOriginal body.\r\n";
+    const replacement =
+      "From: writer@example.invalid\r\nSubject: Replacement\r\n\r\nReplacement body.\r\n";
     const originalStream = store.getNewMsgOutputStream(folder);
     originalStream.write(original, original.length);
     const originalToken = store.finishNewMessage(folder, originalStream);
@@ -1021,7 +1023,8 @@ async function checkQuarantinedTempFailure(storeType, cleanup) {
     const store = folder.msgStore;
     Assert.equal(storeType, "mbox");
     Assert.equal(store.storeType, storeType);
-    const original = "Subject: Original\r\n\r\nUnchanged original body.\r\n";
+    const original =
+      "From: writer@example.invalid\r\nSubject: Original\r\n\r\nUnchanged original body.\r\n";
     const originalStream = store.getNewMsgOutputStream(folder);
     originalStream.write(original, original.length);
     const originalToken = store.finishNewMessage(folder, originalStream);
@@ -1065,7 +1068,8 @@ async function checkQuarantinedTempFailure(storeType, cleanup) {
     }
     const next = store.getNewMsgOutputStream(folder);
     Assert.deepEqual(await IOUtils.read(folder.filePath.path), originalFile);
-    const replacement = "Subject: Next valid write\r\n\r\nSuccessful body.\r\n";
+    const replacement =
+      "From: writer@example.invalid\r\nSubject: Next valid write\r\n\r\nSuccessful body.\r\n";
     next.write(replacement, replacement.length);
     const replacementToken = store.finishNewMessage(folder, next);
     Assert.throws(

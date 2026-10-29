@@ -2713,8 +2713,8 @@ NS_IMPL_ISUPPORTS(FolderMigrator, nsIRunnable, mozIStorageStatementCallback)
 
 namespace {
 
-nsresult ImportMember(JSContext* cx, JS::HandleObject object, const char* name,
-                      JS::MutableHandleValue value, bool optional = false) {
+nsresult ImportMember(JSContext* cx, JS::Handle<JSObject*> object, const char* name,
+                      JS::MutableHandle<JS::Value> value, bool optional = false) {
   bool present;
   if (!JS_HasOwnProperty(cx, object, name, &present)) {
     return NS_ERROR_FAILURE;
@@ -2727,7 +2727,7 @@ nsresult ImportMember(JSContext* cx, JS::HandleObject object, const char* name,
   return JS_GetProperty(cx, object, name, value) ? NS_OK : NS_ERROR_FAILURE;
 }
 
-nsresult ImportText(JSContext* cx, JS::HandleValue value, nsACString& output) {
+nsresult ImportText(JSContext* cx, JS::Handle<JS::Value> value, nsACString& output) {
   NS_ENSURE_TRUE(value.isString(), NS_ERROR_INVALID_ARG);
   nsAutoJSString text;
   NS_ENSURE_TRUE(text.init(cx, value), NS_ERROR_OUT_OF_MEMORY);
@@ -2745,7 +2745,7 @@ nsresult ImportText(JSContext* cx, JS::HandleValue value, nsACString& output) {
   return NS_OK;
 }
 
-nsresult ImportNumber(JS::HandleValue value, double minimum, double maximum,
+nsresult ImportNumber(JS::Handle<JS::Value> value, double minimum, double maximum,
                       int64_t& output) {
   NS_ENSURE_TRUE(value.isNumber(), NS_ERROR_INVALID_ARG);
   double number = value.toNumber();
@@ -2756,8 +2756,8 @@ nsresult ImportNumber(JS::HandleValue value, double minimum, double maximum,
   return NS_OK;
 }
 
-nsresult ImportArray(JSContext* cx, JS::HandleValue value,
-                     JS::MutableHandleObject array, uint32_t& length) {
+nsresult ImportArray(JSContext* cx, JS::Handle<JS::Value> value,
+                     JS::MutableHandle<JSObject*> array, uint32_t& length) {
   bool isArray;
   if (!JS::IsArrayObject(cx, value, &isArray)) {
     return NS_ERROR_FAILURE;
@@ -2767,10 +2767,10 @@ nsresult ImportArray(JSContext* cx, JS::HandleValue value,
   return JS::GetArrayLength(cx, array, &length) ? NS_OK : NS_ERROR_FAILURE;
 }
 
-nsresult ImportHeader(JSContext* cx, JS::HandleValue value, RawHdr& header) {
+nsresult ImportHeader(JSContext* cx, JS::Handle<JS::Value> value, RawHdr& header) {
   NS_ENSURE_TRUE(value.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject object(cx, &value.toObject());
-  JS::RootedValue field(cx);
+  JS::Rooted<JSObject*> object(cx, &value.toObject());
+  JS::Rooted<JS::Value> field(cx);
   bool hasKey;
   NS_ENSURE_TRUE(JS_HasOwnProperty(cx, object, "key", &hasKey),
                  NS_ERROR_FAILURE);
@@ -2806,7 +2806,7 @@ nsresult ImportHeader(JSContext* cx, JS::HandleValue value, RawHdr& header) {
                        number));
   header.priority = number;
   MOZ_TRY(ImportMember(cx, object, "references", &field));
-  JS::RootedObject array(cx);
+  JS::Rooted<JSObject*> array(cx);
   uint32_t length;
   MOZ_TRY(ImportArray(cx, field, &array, length));
   for (uint32_t i = 0; i < length; ++i) {
@@ -2818,7 +2818,7 @@ nsresult ImportHeader(JSContext* cx, JS::HandleValue value, RawHdr& header) {
   for (uint32_t i = 0; i < length; ++i) {
     NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-    JS::RootedObject extra(cx, &field.toObject());
+    JS::Rooted<JSObject*> extra(cx, &field.toObject());
     RawHdr::kv* cell = header.extras.AppendElement();
     MOZ_TRY(ImportMember(cx, extra, "k", &field));
     MOZ_TRY(ImportText(cx, field, cell->k));
@@ -2849,12 +2849,12 @@ nsresult ImportHeader(JSContext* cx, JS::HandleValue value, RawHdr& header) {
 }
 
 // Preserve the original explicit message-only converted-input boundary.
-nsresult CheckProjectedImportRecords(JSContext* cx, JS::HandleObject request,
+nsresult CheckProjectedImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                                      const FolderImportSnapshot& input) {
-  JS::RootedValue field(cx);
+  JS::Rooted<JS::Value> field(cx);
   MOZ_TRY(ImportMember(cx, request, "records", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject records(cx, &field.toObject()), rows(cx), tables(cx);
+  JS::Rooted<JSObject*> records(cx, &field.toObject()), rows(cx), tables(cx);
   uint32_t length;
   MOZ_TRY(ImportMember(cx, records, "tables", &field));
   MOZ_TRY(ImportArray(cx, field, &tables, length));
@@ -2862,7 +2862,7 @@ nsresult CheckProjectedImportRecords(JSContext* cx, JS::HandleObject request,
   if (length) {
     NS_ENSURE_TRUE(JS_GetElement(cx, tables, 0, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-    JS::RootedObject table(cx, &field.toObject()), cells(cx), members(cx);
+    JS::Rooted<JSObject*> table(cx, &field.toObject()), cells(cx), members(cx);
     MOZ_TRY(ImportMember(cx, table, "id", &field));
     int64_t tableId;
     MOZ_TRY(ImportNumber(field, 0, UINT32_MAX, tableId));
@@ -2880,7 +2880,7 @@ nsresult CheckProjectedImportRecords(JSContext* cx, JS::HandleObject request,
     for (uint32_t i = 0; i < count; ++i) {
       NS_ENSURE_TRUE(JS_GetElement(cx, cells, i, &field), NS_ERROR_FAILURE);
       NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-      JS::RootedObject cell(cx, &field.toObject());
+      JS::Rooted<JSObject*> cell(cx, &field.toObject());
       nsCString name;
       MOZ_TRY(ImportMember(cx, cell, "k", &field));
       MOZ_TRY(ImportText(cx, field, name));
@@ -2915,7 +2915,7 @@ nsresult CheckProjectedImportRecords(JSContext* cx, JS::HandleObject request,
   for (uint32_t i = 0; i < length; ++i) {
     NS_ENSURE_TRUE(JS_GetElement(cx, rows, i, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-    JS::RootedObject row(cx, &field.toObject()), cells(cx);
+    JS::Rooted<JSObject*> row(cx, &field.toObject()), cells(cx);
     MOZ_TRY(ImportMember(cx, row, "id", &field));
     int64_t id;
     MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, id));
@@ -2933,7 +2933,7 @@ nsresult CheckProjectedImportRecords(JSContext* cx, JS::HandleObject request,
     for (uint32_t j = 0; j < count; ++j) {
       NS_ENSURE_TRUE(JS_GetElement(cx, cells, j, &field), NS_ERROR_FAILURE);
       NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-      JS::RootedObject cell(cx, &field.toObject());
+      JS::Rooted<JSObject*> cell(cx, &field.toObject());
       for (auto pair : {std::pair{"k", &extras[j].k}, {"v", &extras[j].v}}) {
         MOZ_TRY(ImportMember(cx, cell, pair.first, &field));
         NS_ENSURE_TRUE(field.isString(), NS_ERROR_INVALID_ARG);
@@ -2969,7 +2969,7 @@ nsCString ImportSourceKey(uint32_t id, const nsACString& scope) {
   return key;
 }
 
-nsresult ImportByteText(JSContext* cx, JS::HandleValue value,
+nsresult ImportByteText(JSContext* cx, JS::Handle<JS::Value> value,
                         nsACString& output) {
   NS_ENSURE_TRUE(value.isString(), NS_ERROR_INVALID_ARG);
   nsAutoJSString bytes;
@@ -2984,17 +2984,17 @@ nsresult ImportByteText(JSContext* cx, JS::HandleValue value,
   return NS_OK;
 }
 
-nsresult ImportSourceRecords(JSContext* cx, JS::HandleValue value, bool tables,
+nsresult ImportSourceRecords(JSContext* cx, JS::Handle<JS::Value> value, bool tables,
                              nsTArray<UniquePtr<ImportSourceRecord>>& records,
                              nsTHashMap<nsCString, uint32_t>& indexes) {
-  JS::RootedObject array(cx);
-  JS::RootedValue field(cx);
+  JS::Rooted<JSObject*> array(cx);
+  JS::Rooted<JS::Value> field(cx);
   uint32_t count;
   MOZ_TRY(ImportArray(cx, value, &array, count));
   for (uint32_t i = 0; i < count; ++i) {
     NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-    JS::RootedObject object(cx, &field.toObject()), cells(cx);
+    JS::Rooted<JSObject*> object(cx, &field.toObject()), cells(cx);
     auto record = MakeUnique<ImportSourceRecord>();
     int64_t id;
     MOZ_TRY(ImportMember(cx, object, "id", &field));
@@ -3010,7 +3010,7 @@ nsresult ImportSourceRecords(JSContext* cx, JS::HandleValue value, bool tables,
     for (uint32_t j = 0; j < length; ++j) {
       NS_ENSURE_TRUE(JS_GetElement(cx, cells, j, &field), NS_ERROR_FAILURE);
       NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-      JS::RootedObject cell(cx, &field.toObject());
+      JS::Rooted<JSObject*> cell(cx, &field.toObject());
       nsCString name, text;
       MOZ_TRY(ImportMember(cx, cell, "k", &field));
       MOZ_TRY(ImportByteText(cx, field, name));
@@ -3026,7 +3026,7 @@ nsresult ImportSourceRecords(JSContext* cx, JS::HandleValue value, bool tables,
         NS_ENSURE_FALSE(record->meta.IsEmpty(), NS_ERROR_INVALID_ARG);
       }
       MOZ_TRY(ImportMember(cx, object, "rows", &field));
-      JS::RootedObject members(cx);
+      JS::Rooted<JSObject*> members(cx);
       MOZ_TRY(ImportArray(cx, field, &members, length));
       for (uint32_t j = 0; j < length; ++j) {
         NS_ENSURE_TRUE(JS_GetElement(cx, members, j, &field), NS_ERROR_FAILURE);
@@ -3185,12 +3185,12 @@ nsresult CheckImportHeader(const ImportSourceRecord& row, const RawHdr& header,
   return NS_OK;
 }
 
-nsresult ImportFolderProperties(JSContext* cx, JS::HandleObject request,
+nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
                                 const ImportSourceRecord& info, uint32_t flags,
                                 uint32_t total, uint32_t unread,
                                 nsTArray<FolderImportProperty>& output) {
-  JS::RootedValue field(cx);
-  JS::RootedObject array(cx);
+  JS::Rooted<JS::Value> field(cx);
+  JS::Rooted<JSObject*> array(cx);
   uint32_t count;
   MOZ_TRY(ImportMember(cx, request, "folderProperties", &field));
   MOZ_TRY(ImportArray(cx, field, &array, count));
@@ -3199,7 +3199,7 @@ nsresult ImportFolderProperties(JSContext* cx, JS::HandleObject request,
   for (uint32_t i = 0; i < count; ++i) {
     NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-    JS::RootedObject property(cx, &field.toObject());
+    JS::Rooted<JSObject*> property(cx, &field.toObject());
     FolderImportProperty value;
     MOZ_TRY(ImportMember(cx, property, "name", &field));
     MOZ_TRY(ImportText(cx, field, value.name));
@@ -3281,7 +3281,7 @@ nsresult ImportFolderProperties(JSContext* cx, JS::HandleObject request,
   return NS_OK;
 }
 
-nsresult CheckFullImportRecords(JSContext* cx, JS::HandleObject request,
+nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                                 nsIMsgFolder* folder,
                                 FolderImportSnapshot& input) {
   nsCString protocol;
@@ -3289,10 +3289,10 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::HandleObject request,
   MOZ_TRY(folder->GetIncomingServerType(protocol));
   MOZ_TRY(folder->GetFlags(&folderFlags));
   NS_ENSURE_TRUE(protocol == "none"_ns, NS_ERROR_NOT_IMPLEMENTED);
-  JS::RootedValue field(cx);
-  JS::RootedObject records(cx);
+  JS::Rooted<JS::Value> field(cx);
+  JS::Rooted<JSObject*> records(cx);
   MOZ_TRY(ImportMember(cx, request, "unhandledRecords", &field));
-  JS::RootedObject unhandled(cx);
+  JS::Rooted<JSObject*> unhandled(cx);
   uint32_t count;
   MOZ_TRY(ImportArray(cx, field, &unhandled, count));
   NS_ENSURE_TRUE(!count, NS_ERROR_NOT_IMPLEMENTED);
@@ -3467,9 +3467,9 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::HandleObject request,
 namespace {
 
 #ifdef XP_WIN
-nsresult ImportOriginalPath(JSContext* cx, JS::HandleObject object,
+nsresult ImportOriginalPath(JSContext* cx, JS::Handle<JSObject*> object,
                             FolderImportPathIdentity& path) {
-  JS::RootedValue field(cx);
+  JS::Rooted<JS::Value> field(cx);
   for (auto pair : {std::pair{"originalPath", &path.originalPath},
                     {"originalRoot", &path.originalRoot}}) {
     MOZ_TRY(ImportMember(cx, object, pair.first, &field));
@@ -3488,18 +3488,18 @@ nsresult ImportOriginalPath(JSContext* cx, JS::HandleObject object,
   return NS_OK;
 }
 
-nsresult ImportWindowsAdmission(JSContext* cx, JS::HandleObject request,
+nsresult ImportWindowsAdmission(JSContext* cx, JS::Handle<JSObject*> request,
                                 FolderImportIdentity& identity) {
-  JS::RootedValue field(cx);
+  JS::Rooted<JS::Value> field(cx);
   MOZ_TRY(ImportMember(cx, request, "windowsAdmission", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject admission(cx, &field.toObject());
+  JS::Rooted<JSObject*> admission(cx, &field.toObject());
   FolderImportWindowsIdentity paths;
   for (auto pair :
        {std::pair{"summary", &paths.summary}, {"store", &paths.store}}) {
     MOZ_TRY(ImportMember(cx, admission, pair.first, &field));
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-    JS::RootedObject path(cx, &field.toObject());
+    JS::Rooted<JSObject*> path(cx, &field.toObject());
     MOZ_TRY(ImportOriginalPath(cx, path, *pair.second));
   }
   identity.windows = Some(std::move(paths));
@@ -3508,11 +3508,11 @@ nsresult ImportWindowsAdmission(JSContext* cx, JS::HandleObject request,
 #endif
 
 nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
-                        JS::HandleObject request,
+                        JS::Handle<JSObject*> request,
                         FolderImportIdentity& identity,
                         FolderImportAdmission& admission) {
   NS_ENSURE_ARG_POINTER(source);
-  JS::RootedValue field(cx);
+  JS::Rooted<JS::Value> field(cx);
   int64_t version;
   MOZ_TRY(ImportMember(cx, request, "version", &field));
 #ifdef XP_WIN
@@ -3535,7 +3535,7 @@ nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
                  NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(ImportMember(cx, request, "folder", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject folder(cx, &field.toObject());
+  JS::Rooted<JSObject*> folder(cx, &field.toObject());
   MOZ_TRY(ImportMember(cx, folder, "id", &field));
   int64_t id;
   MOZ_TRY(ImportNumber(field, 1, 9007199254740991., id));
@@ -3592,7 +3592,7 @@ nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
   NS_ENSURE_TRUE(field.toBoolean() == exists, NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(ImportMember(cx, request, "source", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject original(cx, &field.toObject());
+  JS::Rooted<JSObject*> original(cx, &field.toObject());
   MOZ_TRY(ImportMember(cx, original, "path", &field));
   nsCString text;
   MOZ_TRY(ImportText(cx, field, text));
@@ -3603,16 +3603,16 @@ nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
   return NS_OK;
 }
 
-nsresult ImportMessages(JSContext* cx, JS::HandleObject request,
+nsresult ImportMessages(JSContext* cx, JS::Handle<JSObject*> request,
                         nsIMsgFolder* folder, FolderImportSnapshot& input) {
   NS_ENSURE_ARG_POINTER(folder);
   bool full;
   NS_ENSURE_TRUE(JS_HasOwnProperty(cx, request, "folderProperties", &full),
                  NS_ERROR_FAILURE);
-  JS::RootedValue field(cx);
+  JS::Rooted<JS::Value> field(cx);
   MOZ_TRY(ImportMember(cx, request, "source", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject source(cx, &field.toObject());
+  JS::Rooted<JSObject*> source(cx, &field.toObject());
   MOZ_TRY(ImportMember(cx, source, "size", &field));
   int64_t number;
   MOZ_TRY(ImportNumber(field, 0, UINT32_MAX - 1, number));
@@ -3620,7 +3620,7 @@ nsresult ImportMessages(JSContext* cx, JS::HandleObject request,
   // Nonempty summaries cannot opt out of full raw-record accounting.
   full = full || input.sourceSize != 0;
   MOZ_TRY(ImportMember(cx, source, "messageKeys", &field));
-  JS::RootedObject keys(cx), messages(cx);
+  JS::Rooted<JSObject*> keys(cx), messages(cx);
   uint32_t keyCount, count;
   MOZ_TRY(ImportArray(cx, field, &keys, keyCount));
   MOZ_TRY(ImportMember(cx, request, "messages", &field));
@@ -3638,7 +3638,7 @@ nsresult ImportMessages(JSContext* cx, JS::HandleObject request,
   for (uint32_t i = 0; i < count; ++i) {
     NS_ENSURE_TRUE(JS_GetElement(cx, messages, i, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
-    JS::RootedObject message(cx, &field.toObject());
+    JS::Rooted<JSObject*> message(cx, &field.toObject());
     FolderImportMessage* row = input.messages.AppendElement();
     MOZ_TRY(ImportMember(cx, message, "sourceKey", &field));
     MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
@@ -3711,8 +3711,8 @@ nsresult ImportMessages(JSContext* cx, JS::HandleObject request,
 }
 
 bool ImportPathValue(JSContext* cx, const FolderImportPathIdentity& path,
-                     JS::MutableHandleObject output) {
-  JS::RootedObject object(cx, JS_NewPlainObject(cx));
+                     JS::MutableHandle<JSObject*> output) {
+  JS::Rooted<JSObject*> object(cx, JS_NewPlainObject(cx));
   if (!object) {
     return false;
   }
@@ -3720,12 +3720,12 @@ bool ImportPathValue(JSContext* cx, const FolderImportPathIdentity& path,
                     {"originalRoot", &path.originalRoot},
                     {"canonicalPath", &path.canonicalPath},
                     {"canonicalRoot", &path.canonicalRoot}}) {
-    JS::RootedString text(
+    JS::Rooted<JSString*> text(
         cx, JS_NewUCStringCopyN(cx, pair.second->get(), pair.second->Length()));
     if (!text) {
       return false;
     }
-    JS::RootedValue value(cx, JS::StringValue(text));
+    JS::Rooted<JS::Value> value(cx, JS::StringValue(text));
     if (!JS_DefineProperty(cx, object, pair.first, value, JSPROP_ENUMERATE)) {
       return false;
     }
@@ -3733,13 +3733,13 @@ bool ImportPathValue(JSContext* cx, const FolderImportPathIdentity& path,
   for (auto pair : {std::pair{"id", &path.id},
                     {"parentId", &path.parentId},
                     {"rootId", &path.rootId}}) {
-    JS::RootedString text(
+    JS::Rooted<JSString*> text(
         cx, JS_NewStringCopyUTF8N(
                 cx, JS::UTF8Chars(pair.second->get(), pair.second->Length())));
     if (!text) {
       return false;
     }
-    JS::RootedValue value(cx, JS::StringValue(text));
+    JS::Rooted<JS::Value> value(cx, JS::StringValue(text));
     if (!JS_DefineProperty(cx, object, pair.first, value, JSPROP_ENUMERATE)) {
       return false;
     }
@@ -3749,10 +3749,10 @@ bool ImportPathValue(JSContext* cx, const FolderImportPathIdentity& path,
 }
 
 bool ImportWindowsValue(JSContext* cx, const FolderImportWindowsIdentity& paths,
-                        JS::HandleObject receipt) {
-  JS::RootedObject admission(cx, JS_NewPlainObject(cx));
-  JS::RootedObject summary(cx), store(cx);
-  JS::RootedObject physical(cx, JS_NewPlainObject(cx));
+                        JS::Handle<JSObject*> receipt) {
+  JS::Rooted<JSObject*> admission(cx, JS_NewPlainObject(cx));
+  JS::Rooted<JSObject*> summary(cx), store(cx);
+  JS::Rooted<JSObject*> physical(cx, JS_NewPlainObject(cx));
   if (!admission || !physical ||
       !ImportPathValue(cx, paths.summary, &summary) ||
       !ImportPathValue(cx, paths.store, &store) ||
@@ -3764,13 +3764,13 @@ bool ImportWindowsValue(JSContext* cx, const FolderImportWindowsIdentity& paths,
   }
   for (auto pair : {std::pair{"id", &paths.summary.id},
                     {"parentId", &paths.summary.parentId}}) {
-    JS::RootedString text(
+    JS::Rooted<JSString*> text(
         cx, JS_NewStringCopyUTF8N(
                 cx, JS::UTF8Chars(pair.second->get(), pair.second->Length())));
     if (!text) {
       return false;
     }
-    JS::RootedValue value(cx, JS::StringValue(text));
+    JS::Rooted<JS::Value> value(cx, JS::StringValue(text));
     if (!JS_DefineProperty(cx, physical, pair.first, value, JSPROP_ENUMERATE)) {
       return false;
     }
@@ -3784,9 +3784,9 @@ bool ImportWindowsValue(JSContext* cx, const FolderImportWindowsIdentity& paths,
 }
 
 bool ImportReceiptValue(JSContext* cx, const FolderImportReceipt& receipt,
-                        JS::MutableHandleValue output) {
-  JS::RootedObject object(cx, JS_NewPlainObject(cx));
-  JS::RootedObject keys(cx, JS::NewArrayObject(cx, receipt.keys.Length()));
+                        JS::MutableHandle<JS::Value> output) {
+  JS::Rooted<JSObject*> object(cx, JS_NewPlainObject(cx));
+  JS::Rooted<JSObject*> keys(cx, JS::NewArrayObject(cx, receipt.keys.Length()));
   if (!object || !keys) {
     return false;
   }
@@ -3794,19 +3794,19 @@ bool ImportReceiptValue(JSContext* cx, const FolderImportReceipt& receipt,
                     {"sourceId", &receipt.identity.sourceId},
                     {"databaseSourceId", &receipt.identity.databaseSourceId},
                     {"sourceSha256", &receipt.identity.sourceSha256}}) {
-    JS::RootedString text(
+    JS::Rooted<JSString*> text(
         cx, JS_NewStringCopyUTF8N(
                 cx, JS::UTF8Chars(pair.second->get(), pair.second->Length())));
     if (!text) {
       return false;
     }
-    JS::RootedValue value(cx, JS::StringValue(text));
+    JS::Rooted<JS::Value> value(cx, JS::StringValue(text));
     if (!JS_DefineProperty(cx, object, pair.first, value, JSPROP_ENUMERATE)) {
       return false;
     }
   }
   for (uint32_t i = 0; i < receipt.keys.Length(); ++i) {
-    JS::RootedObject key(cx, JS::NewArrayObject(cx, 2));
+    JS::Rooted<JSObject*> key(cx, JS::NewArrayObject(cx, 2));
     if (!key ||
         !JS_DefineElement(cx, key, 0, double(receipt.keys[i].source),
                           JSPROP_ENUMERATE) ||
@@ -3836,7 +3836,7 @@ NS_IMETHODIMP DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
                                                  JSContext* cx,
                                                  Promise** output) {
   NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject object(cx, &request.toObject());
+  JS::Rooted<JSObject*> object(cx, &request.toObject());
   FolderImportSnapshot input;
   // Finish admission and JS conversion before the owned SQL transaction.
   FolderImportAdmission admission;
@@ -3860,7 +3860,7 @@ NS_IMETHODIMP DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
     std::sort(prepared.keys.begin(), prepared.keys.end(),
               [](const auto& a, const auto& b) { return a.source < b.source; });
   }
-  JS::RootedValue result(cx);
+  JS::Rooted<JS::Value> result(cx);
   NS_ENSURE_TRUE(ImportReceiptValue(cx, prepared, &result),
                  NS_ERROR_OUT_OF_MEMORY);
   ErrorResult error;
@@ -3872,17 +3872,17 @@ NS_IMETHODIMP DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
   FolderImportReceipt receipt;
   nsresult rv = ImportFolderSnapshot(source, input, receipt);
   if (NS_SUCCEEDED(rv)) {
-    JS::RootedObject resultObject(cx, &result.toObject());
-    JS::RootedValue keys(cx), pair(cx);
+    JS::Rooted<JSObject*> resultObject(cx, &result.toObject());
+    JS::Rooted<JS::Value> keys(cx), pair(cx);
     if (receipt.keys.Length() != prepared.keys.Length() ||
         !JS_GetProperty(cx, resultObject, "keys", &keys)) {
       return NS_ERROR_FAILURE;
     }
-    JS::RootedObject array(cx, &keys.toObject());
+    JS::Rooted<JSObject*> array(cx, &keys.toObject());
     for (uint32_t i = 0; i < receipt.keys.Length(); ++i) {
       NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &pair), NS_ERROR_FAILURE);
-      JS::RootedObject tuple(cx, &pair.toObject());
-      JS::RootedValue key(cx, JS::NumberValue(receipt.keys[i].destination));
+      JS::Rooted<JSObject*> tuple(cx, &pair.toObject());
+      JS::Rooted<JS::Value> key(cx, JS::NumberValue(receipt.keys[i].destination));
       NS_ENSURE_TRUE(JS_SetElement(cx, tuple, 1, key), NS_ERROR_FAILURE);
     }
     promise->MaybeResolve(result);
@@ -3897,7 +3897,7 @@ NS_IMETHODIMP DatabaseCore::GetFolderImportReceipt(
     nsIMsgFolder* source, JS::Handle<JS::Value> request, JSContext* cx,
     JS::MutableHandle<JS::Value> output) {
   NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject object(cx, &request.toObject());
+  JS::Rooted<JSObject*> object(cx, &request.toObject());
   FolderImportIdentity identity;
   FolderImportAdmission admission;
   MOZ_TRY(ImportIdentity(this, source, cx, object, identity, admission));
@@ -3907,7 +3907,7 @@ NS_IMETHODIMP DatabaseCore::GetFolderImportReceipt(
     output.setNull();
     return NS_OK;
   }
-  JS::RootedValue result(cx);
+  JS::Rooted<JS::Value> result(cx);
   NS_ENSURE_TRUE(ImportReceiptValue(cx, *receipt, &result),
                  NS_ERROR_OUT_OF_MEMORY);
   output.set(result);
@@ -3952,10 +3952,10 @@ struct CacheImport {
   nsTArray<CacheFolder> folders;
 };
 
-bool CacheText(JSContext* cx, JS::HandleObject object, const char* name,
+bool CacheText(JSContext* cx, JS::Handle<JSObject*> object, const char* name,
                const nsACString& text) {
   NS_ConvertUTF8toUTF16 utf16(text);
-  JS::RootedString string(cx,
+  JS::Rooted<JSString*> string(cx,
                           JS_NewUCStringCopyN(cx, utf16.get(), utf16.Length()));
   return string &&
          JS_DefineProperty(cx, object, name, string, JSPROP_ENUMERATE);
@@ -3965,8 +3965,8 @@ bool CacheJSONWrite(const char16_t* buffer, uint32_t length, void* data) {
   static_cast<nsAString*>(data)->Append(buffer, length);
   return true;
 }
-nsresult CacheJSON(JSContext* cx, JS::HandleObject object, nsACString& output) {
-  JS::RootedValue value(cx, JS::ObjectValue(*object));
+nsresult CacheJSON(JSContext* cx, JS::Handle<JSObject*> object, nsACString& output) {
+  JS::Rooted<JS::Value> value(cx, JS::ObjectValue(*object));
   nsString text;
   NS_ENSURE_TRUE(JS_Stringify(cx, &value, nullptr, JS::NullHandleValue,
                               CacheJSONWrite, &text),
@@ -3975,7 +3975,7 @@ nsresult CacheJSON(JSContext* cx, JS::HandleObject object, nsACString& output) {
   return NS_OK;
 }
 nsresult CacheParseJSON(JSContext* cx, const nsACString& text,
-                        JS::MutableHandleValue output) {
+                        JS::MutableHandle<JS::Value> output) {
   NS_ConvertUTF8toUTF16 utf16(text);
   NS_ENSURE_TRUE(JS_ParseJSON(cx, utf16.get(), utf16.Length(), output) &&
                      output.isObject(),
@@ -3983,11 +3983,11 @@ nsresult CacheParseJSON(JSContext* cx, const nsACString& text,
   return NS_OK;
 }
 
-nsresult CacheRequest(JSContext* cx, JS::HandleValue value,
+nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
                       CacheImport& input) {
   NS_ENSURE_TRUE(value.isObject(), NS_ERROR_INVALID_ARG);
-  JS::RootedObject request(cx, &value.toObject()), object(cx), array(cx);
-  JS::RootedValue field(cx);
+  JS::Rooted<JSObject*> request(cx, &value.toObject()), object(cx), array(cx);
+  JS::Rooted<JS::Value> field(cx);
   int64_t number;
   MOZ_TRY(ImportMember(cx, request, "version", &field));
   MOZ_TRY(ImportNumber(field, 1, 1, number));
@@ -4126,9 +4126,9 @@ nsresult CheckCacheFolders(DatabaseCore* core,
 }
 
 nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
-                       JS::MutableHandleObject result) {
+                       JS::MutableHandle<JSObject*> result) {
   result.set(JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
-  JS::RootedObject folders(cx, JS::NewArrayObject(cx, input.folders.Length()));
+  JS::Rooted<JSObject*> folders(cx, JS::NewArrayObject(cx, input.folders.Length()));
   NS_ENSURE_TRUE(result && folders && JS_SetPrototype(cx, folders, nullptr),
                  NS_ERROR_OUT_OF_MEMORY);
   NS_ENSURE_TRUE(
@@ -4148,7 +4148,7 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
                  NS_ERROR_OUT_OF_MEMORY);
   for (uint32_t i = 0; i < input.folders.Length(); ++i) {
     const auto& folder = input.folders[i];
-    JS::RootedObject object(cx,
+    JS::Rooted<JSObject*> object(cx,
                             JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
     NS_ENSURE_TRUE(object, NS_ERROR_OUT_OF_MEMORY);
     for (auto pair : {std::pair{"originalKey", &folder.originalKey},
@@ -4160,7 +4160,7 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
       NS_ENSURE_TRUE(CacheText(cx, object, pair.first, *pair.second),
                      NS_ERROR_OUT_OF_MEMORY);
     }
-    JS::RootedValue server(cx, JS::BooleanValue(folder.isServer));
+    JS::Rooted<JS::Value> server(cx, JS::BooleanValue(folder.isServer));
     NS_ENSURE_TRUE(
         JS_DefineProperty(cx, object, "id", double(folder.id),
                           JSPROP_ENUMERATE) &&
@@ -4236,7 +4236,7 @@ bool CacheUnsupportedAlias(const nsACString& name) {
 
 nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
                          CacheImport& input) {
-  JS::RootedObject module(cx), buffer(cx, JS_NewUint8Array(cx, bytes.Length()));
+  JS::Rooted<JSObject*> module(cx), buffer(cx, JS_NewUint8Array(cx, bytes.Length()));
   NS_ENSURE_TRUE(buffer, NS_ERROR_OUT_OF_MEMORY);
   {
     JS::AutoCheckCannotGC nogc;
@@ -4244,14 +4244,14 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
     memcpy(JS_GetUint8ArrayData(buffer, &shared, nogc), bytes.BeginReading(),
            bytes.Length());
   }
-  JS::RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
+  JS::Rooted<JSObject*> global(cx, JS::CurrentGlobalOrNull(cx));
   dom::GlobalObject caller(cx, global);
   ErrorResult error;
   dom::ChromeUtils::ImportESModule(
       caller, u"resource:///modules/panorama/MorkFolderCache.sys.mjs"_ns,
       dom::ImportESModuleOptionsDictionary(), &module, error);
   if (error.Failed()) return error.StealNSResult();
-  JS::RootedValue function(cx), parsed(cx),
+  JS::Rooted<JS::Value> function(cx), parsed(cx),
       argument(cx, JS::ObjectValue(*buffer)), field(cx);
   NS_ENSURE_TRUE(
       JS_GetProperty(cx, module, "parseMorkFolderCache", &function) &&
@@ -4259,7 +4259,7 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
                    &parsed),
       NS_ERROR_FAILURE);
   NS_ENSURE_TRUE(parsed.isObject(), NS_ERROR_FAILURE);
-  JS::RootedObject object(cx, &parsed.toObject()), entries(cx), source(cx),
+  JS::Rooted<JSObject*> object(cx, &parsed.toObject()), entries(cx), source(cx),
       rows(cx);
   MOZ_TRY(ImportMember(cx, object, "entries", &field));
   NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
@@ -4274,12 +4274,12 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
                      JS::MapSize(cx, entries) == input.folders.Length(),
                  NS_ERROR_NOT_IMPLEMENTED);
   for (auto& folder : input.folders) {
-    JS::RootedString key(
+    JS::Rooted<JSString*> key(
         cx, JS_NewUCStringCopyN(
                 cx, NS_ConvertUTF8toUTF16(folder.originalKey).get(),
                 NS_ConvertUTF8toUTF16(folder.originalKey).Length()));
     NS_ENSURE_TRUE(key, NS_ERROR_OUT_OF_MEMORY);
-    JS::RootedValue keyValue(cx, JS::StringValue(key));
+    JS::Rooted<JS::Value> keyValue(cx, JS::StringValue(key));
     NS_ENSURE_TRUE(JS::MapGet(cx, entries, keyValue, &field), NS_ERROR_FAILURE);
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
     object = &field.toObject();
@@ -4288,7 +4288,7 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
     MOZ_TRY(ImportNumber(field, folder.sourceKey, folder.sourceKey, number));
     MOZ_TRY(ImportMember(cx, object, "values", &field));
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
-    JS::RootedObject values(cx, &field.toObject()), properties(cx);
+    JS::Rooted<JSObject*> values(cx, &field.toObject()), properties(cx);
     MOZ_TRY(ImportMember(cx, object, "properties", &field));
     NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
     properties = &field.toObject();
@@ -4300,17 +4300,17 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
       NS_ENSURE_TRUE(iterator.next(&field, &done), NS_ERROR_FAILURE);
       if (done) break;
       NS_ENSURE_TRUE(field.isObject(), NS_ERROR_FAILURE);
-      JS::RootedObject pair(cx, &field.toObject());
+      JS::Rooted<JSObject*> pair(cx, &field.toObject());
       FolderImportProperty property;
       NS_ENSURE_TRUE(JS_GetElement(cx, pair, 0, &field), NS_ERROR_FAILURE);
-      JS::RootedValue name(cx, field);
+      JS::Rooted<JS::Value> name(cx, field);
       MOZ_TRY(ImportText(cx, name, property.name));
       NS_ENSURE_TRUE(JS_GetElement(cx, pair, 1, &field), NS_ERROR_FAILURE);
       MOZ_TRY(ImportText(cx, field, property.text));
       NS_ENSURE_FALSE(CacheUnsupportedAlias(property.name),
                       NS_ERROR_NOT_IMPLEMENTED);
       if (!property.name.EqualsLiteral("key")) {
-        JS::RootedId id(cx);
+        JS::Rooted<JS::PropertyKey> id(cx);
         NS_ENSURE_TRUE(JS_ValueToId(cx, name, &id) &&
                            JS_GetPropertyById(cx, values, id, &field),
                        NS_ERROR_FAILURE);
@@ -4400,7 +4400,7 @@ nsresult ReadCacheReceipt(mozIStorageConnection* connection,
 #endif
 
 NS_IMETHODIMP DatabaseCore::GetFolderCacheImportReceipt(
-    JS::HandleValue request, JSContext* cx, JS::MutableHandleValue output) {
+    JS::Handle<JS::Value> request, JSContext* cx, JS::MutableHandle<JS::Value> output) {
 #ifdef XP_WIN
   return NS_ERROR_NOT_AVAILABLE;
 #else
@@ -4417,13 +4417,13 @@ NS_IMETHODIMP DatabaseCore::GetFolderCacheImportReceipt(
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
   MOZ_TRY(CheckCacheFolders(this, sConnection, input));
-  JS::RootedObject identityObject(cx);
+  JS::Rooted<JSObject*> identityObject(cx);
   MOZ_TRY(CacheIdentity(cx, input, &identityObject));
   nsCString identity;
   MOZ_TRY(CacheJSON(cx, identityObject, identity));
   Maybe<nsCString> receipt;
   MOZ_TRY(ReadCacheReceipt(sConnection, input, identity, receipt));
-  JS::RootedValue result(cx, JS::NullValue());
+  JS::Rooted<JS::Value> result(cx, JS::NullValue());
   if (receipt) MOZ_TRY(CacheParseJSON(cx, *receipt, &result));
   output.set(result);
   return NS_OK;
@@ -4431,7 +4431,7 @@ NS_IMETHODIMP DatabaseCore::GetFolderCacheImportReceipt(
 }
 
 NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
-    JS::HandleValue request, JSContext* cx, JS::MutableHandleValue output) {
+    JS::Handle<JS::Value> request, JSContext* cx, JS::MutableHandle<JS::Value> output) {
 #ifdef XP_WIN
   return NS_ERROR_NOT_AVAILABLE;
 #else
@@ -4447,7 +4447,7 @@ NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
   MOZ_TRY(CheckCacheFolders(this, sConnection, input));
-  JS::RootedObject identityObject(cx);
+  JS::Rooted<JSObject*> identityObject(cx);
   MOZ_TRY(CacheIdentity(cx, input, &identityObject));
   nsCString identity;
   MOZ_TRY(CacheJSON(cx, identityObject, identity));
@@ -4456,7 +4456,7 @@ NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
   if (prior) {
     nsCString checkedBytes;
     MOZ_TRY(ReadCacheBytes(input, checkedBytes));
-    JS::RootedValue result(cx);
+    JS::Rooted<JS::Value> result(cx);
     MOZ_TRY(CacheParseJSON(cx, *prior, &result));
     output.set(result);
     return NS_OK;
@@ -4466,8 +4466,8 @@ NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
   MOZ_TRY(ParseCacheBytes(cx, bytes, input));
   NS_ENSURE_TRUE(sInstance.get() == this && sConnection && !mShuttingDown,
                  NS_ERROR_NOT_AVAILABLE);
-  JS::RootedObject result(cx, JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
-  JS::RootedObject cells(cx, JS::NewArrayObject(cx, 0));
+  JS::Rooted<JSObject*> result(cx, JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
+  JS::Rooted<JSObject*> cells(cx, JS::NewArrayObject(cx, 0));
   NS_ENSURE_TRUE(
       result && cells && JS_SetPrototype(cx, cells, nullptr) &&
           JS_DefineProperty(cx, result, "identity", identityObject,
@@ -4496,7 +4496,7 @@ NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
       if (strcmp(disposition, "applied") == 0) {
         writes.AppendElement(Write{folder.id, property});
       }
-      JS::RootedObject cell(cx,
+      JS::Rooted<JSObject*> cell(cx,
                             JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
       NS_ENSURE_TRUE(cell &&
                          JS_DefineProperty(cx, cell, "id", double(folder.id),
@@ -4519,7 +4519,7 @@ NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
   }
   nsCString receipt;
   MOZ_TRY(CacheJSON(cx, result, receipt));
-  JS::RootedValue prepared(cx);
+  JS::Rooted<JS::Value> prepared(cx);
   MOZ_TRY(CacheParseJSON(cx, receipt, &prepared));
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);

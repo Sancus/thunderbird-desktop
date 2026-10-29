@@ -305,6 +305,7 @@ nsresult nsMsgNewsFolder::GetDatabase() {
     cleanup.release();
   }
   nsCOMPtr<nsINewsDatabase> db = do_QueryInterface(mDatabase, &rv);
+  (void)db;
   return rv;
 }
 

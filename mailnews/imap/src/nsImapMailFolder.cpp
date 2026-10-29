@@ -3229,7 +3229,7 @@ NS_IMETHODIMP nsImapMailFolder::ParseMsgHdrs(
           do_CreateInstance("@mozilla.org/io/string-input-stream;1", &rv);
       MOZ_TRY(rv);
       MOZ_TRY(inputStream->ShareData(msgHdrs.get(), msgHdrs.Length()));
-      MOZ_TRY(GetMsgPreviewTextFromStream(msgHdr, inputStream));
+      MOZ_TRY(StorePreviewText(msgHdr, inputStream));
       continue;
     }
     if (keyLookup.isOk()) {
@@ -9390,50 +9390,43 @@ void nsImapMailFolder::GetTrashFolderName(nsACString& aFolderName) {
   return;
 }
 
+nsresult nsImapMailFolder::StorePreviewText(nsIMsgDBHdr* header,
+                                            nsIInputStream* stream) {
+  nsAutoCString charset, contentType, preview;
+  MOZ_TRY(header->GetCharset(charset));
+  MOZ_TRY(GetMsgTextFromStream(stream, charset, 4096, 255, true, true,
+                               contentType, preview));
+  preview.CompressWhitespace();
+  return header->SetStringProperty("preview", preview);
+}
+
 NS_IMETHODIMP nsImapMailFolder::FetchMsgPreviewText(
     nsTArray<nsMsgKey> const& aKeysToFetch, nsIUrlListener* aUrlListener,
     bool* aAsyncResults) {
   NS_ENSURE_ARG_POINTER(aAsyncResults);
-
-  nsTArray<nsMsgKey> keysToFetchFromServer;
-
   *aAsyncResults = false;
-  nsresult rv = NS_OK;
+  nsTArray<nsMsgKey> keysToFetchFromServer;
+  for (nsMsgKey key : aKeysToFetch) {
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(GetMessageHeader(key, getter_AddRefs(header)));
+    NS_ENSURE_STATE(header);
+    nsAutoCString preview;
+    MOZ_TRY(header->GetStringProperty("preview", preview));
+    if (!preview.IsEmpty()) continue;
 
-  nsCOMPtr<nsIMsgMessageService> msgService =
-      do_GetService("@mozilla.org/messenger/messageservice;1?type=imap", &rv);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  for (uint32_t i = 0; i < aKeysToFetch.Length(); i++) {
-    nsCOMPtr<nsIMsgDBHdr> msgHdr;
-    nsCString prevBody;
-    rv = GetMessageHeader(aKeysToFetch[i], getter_AddRefs(msgHdr));
-    NS_ENSURE_SUCCESS(rv, rv);
-    // ignore messages that already have a preview body.
-    msgHdr->GetStringProperty("preview", prevBody);
-    if (!prevBody.IsEmpty()) continue;
-
-    /* check if message is in memory cache or offline store. */
-    nsCOMPtr<nsIURI> url;
-    nsCOMPtr<nsIInputStream> inputStream;
-    nsCString messageUri;
-    rv = GetUriForMsg(msgHdr, messageUri);
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = msgService->GetUrlForUri(messageUri, nullptr, getter_AddRefs(url));
-    NS_ENSURE_SUCCESS(rv, rv);
-
-    // Lets look in the offline store.
-    uint32_t msgFlags;
-    msgHdr->GetFlags(&msgFlags);
-    if (msgFlags & nsMsgMessageFlags::Offline) {
-      rv = GetMsgInputStream(msgHdr, getter_AddRefs(inputStream));
+    bool hasBody;
+    MOZ_TRY(HasMsgOffline(key, &hasBody));
+    if (hasBody) {
+      // Resolve the actual physical body, including another Gmail label.
+      nsCOMPtr<nsIInputStream> stream;
+      MOZ_TRY(GetMsgInputStream(header, getter_AddRefs(stream)));
+      NS_ENSURE_STATE(stream);
+      nsresult rv = StorePreviewText(header, stream);
+      nsresult closeRv = stream->Close();
       NS_ENSURE_SUCCESS(rv, rv);
-      rv = GetMsgPreviewTextFromStream(msgHdr, inputStream);
-      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_SUCCESS(closeRv, closeRv);
     } else {
-      nsMsgKey msgKey;
-      msgHdr->GetMessageKey(&msgKey);
-      keysToFetchFromServer.AppendElement(msgKey);
+      keysToFetchFromServer.AppendElement(key);
     }
   }
   if (!keysToFetchFromServer.IsEmpty()) {
@@ -9442,10 +9435,9 @@ NS_IMETHODIMP nsImapMailFolder::FetchMsgPreviewText(
     nsAutoCString messageIds(UidSetFromUids(uids));
     nsCOMPtr<nsIImapService> imapService = mozilla::components::Imap::Service();
     nsCOMPtr<nsIURI> outUri;
-    rv = imapService->GetBodyStart(this, aUrlListener, messageIds, 2048,
-                                   getter_AddRefs(outUri));
-    NS_ENSURE_SUCCESS(rv, rv);
-    *aAsyncResults = true;  // the preview text will be available async...
+    MOZ_TRY(imapService->GetBodyStart(this, aUrlListener, messageIds, 2048,
+                                      getter_AddRefs(outUri)));
+    *aAsyncResults = true;
   }
   return NS_OK;
 }
@@ -9677,6 +9669,9 @@ NS_IMETHODIMP nsImapMailFolder::HasMsgOffline(nsMsgKey msgKey, bool* _retval) {
   nsCOMPtr<nsIMsgFolder> msgFolder;
   nsresult rv = GetOfflineMsgFolder(msgKey, getter_AddRefs(msgFolder));
   if (NS_SUCCEEDED(rv) && msgFolder) *_retval = true;
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) return rv;
+#endif
   return NS_OK;
 }
 
@@ -9684,6 +9679,7 @@ nsresult nsImapMailFolder::GetOfflineMsgFolder(nsMsgKey msgKey,
                                                nsIMsgFolder** aMsgFolder) {
   // Check if we have the message in the current folder.
   NS_ENSURE_ARG_POINTER(aMsgFolder);
+  *aMsgFolder = nullptr;
   nsCOMPtr<nsIMsgFolder> subMsgFolder;
   nsresult rv = GetDatabase();
   NS_ENSURE_SUCCESS(rv, rv);
@@ -9691,10 +9687,24 @@ nsresult nsImapMailFolder::GetOfflineMsgFolder(nsMsgKey msgKey,
   nsCOMPtr<nsIMsgDBHdr> hdr;
   rv = mDatabase->GetMsgHdrForKey(msgKey, getter_AddRefs(hdr));
   if (NS_FAILED(rv)) return rv;
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::DatabaseCore> core;
+  if (mail_panorama_enabled_AtStartup()) {
+    core = mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_TRUE(core && hdr, NS_ERROR_NOT_AVAILABLE);
+    uint64_t folderId;
+    MOZ_TRY(core->MessageDB().GetMessageFolderId(msgKey, folderId));
+    NS_ENSURE_TRUE(folderId == mFolderId, NS_ERROR_ILLEGAL_VALUE);
+    MOZ_TRY(core->MessageDB().CheckMessageBodyAccess(msgKey));
+  }
+#endif
 
   if (hdr) {
     uint32_t msgFlags = 0;
-    hdr->GetFlags(&msgFlags);
+    rv = hdr->GetFlags(&msgFlags);
+#ifdef MOZ_PANORAMA
+    if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
     // Check if we already have this message body offline
     if ((msgFlags & nsMsgMessageFlags::Offline)) {
       NS_IF_ADDREF(*aMsgFolder = this);
@@ -9715,15 +9725,24 @@ nsresult nsImapMailFolder::GetOfflineMsgFolder(nsMsgKey msgKey,
     if (isGMail) {
       nsCString labels;
       nsTArray<nsCString> labelNames;
-      hdr->GetStringProperty("X-GM-LABELS", labels);
+      rv = hdr->GetStringProperty("X-GM-LABELS", labels);
+#ifdef MOZ_PANORAMA
+      if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
       ParseString(labels, ' ', labelNames);
       nsCOMPtr<nsIMsgFolder> rootFolder;
       nsCOMPtr<nsIMsgImapMailFolder> subFolder;
       for (uint32_t i = 0; i < labelNames.Length(); i++) {
         rv = GetRootFolder(getter_AddRefs(rootFolder));
+#ifdef MOZ_PANORAMA
+        if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
         if (NS_SUCCEEDED(rv) && (rootFolder)) {
           nsCOMPtr<nsIMsgImapMailFolder> imapRootFolder =
               do_QueryInterface(rootFolder);
+#ifdef MOZ_PANORAMA
+          if (core) NS_ENSURE_TRUE(imapRootFolder, NS_ERROR_NOT_AVAILABLE);
+#endif
           if (labelNames[i].EqualsLiteral("\"\\\\Draft\""))
             rv = rootFolder->GetFolderWithFlags(nsMsgFolderFlags::Drafts,
                                                 getter_AddRefs(subMsgFolder));
@@ -9742,30 +9761,65 @@ nsresult nsImapMailFolder::GetOfflineMsgFolder(nsMsgKey msgKey,
           if (labelNames[i].EqualsLiteral("\"\\\\Sent\""))
             rv = rootFolder->GetFolderWithFlags(nsMsgFolderFlags::SentMail,
                                                 getter_AddRefs(subMsgFolder));
+#ifdef MOZ_PANORAMA
+          if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
           if (CaseInsensitiveFindInReadable("[Imap]/"_ns, labelNames[i])) {
             labelNames[i].ReplaceSubstring("[Imap]/", "");
-            imapRootFolder->FindOnlineSubFolder(labelNames[i],
-                                                getter_AddRefs(subFolder));
+            rv = imapRootFolder->FindOnlineSubFolder(labelNames[i],
+                                                     getter_AddRefs(subFolder));
+#ifdef MOZ_PANORAMA
+            if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
             subMsgFolder = do_QueryInterface(subFolder);
           }
           if (!subMsgFolder) {
-            imapRootFolder->FindOnlineSubFolder(labelNames[i],
-                                                getter_AddRefs(subFolder));
+            rv = imapRootFolder->FindOnlineSubFolder(labelNames[i],
+                                                     getter_AddRefs(subFolder));
+#ifdef MOZ_PANORAMA
+            if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
             subMsgFolder = do_QueryInterface(subFolder);
           }
           if (subMsgFolder) {
             nsCOMPtr<nsIMsgDatabase> db;
-            subMsgFolder->GetMsgDatabase(getter_AddRefs(db));
+            rv = subMsgFolder->GetMsgDatabase(getter_AddRefs(db));
+#ifdef MOZ_PANORAMA
+            if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
             if (db) {
               nsCOMPtr<nsIMsgDBHdr> retHdr;
               nsCString gmMsgID;
-              hdr->GetStringProperty("X-GM-MSGID", gmMsgID);
+              rv = hdr->GetStringProperty("X-GM-MSGID", gmMsgID);
+#ifdef MOZ_PANORAMA
+              if (core) {
+                NS_ENSURE_SUCCESS(rv, rv);
+                if (gmMsgID.IsEmpty()) continue;
+              }
+#endif
               rv = db->GetMsgHdrForGMMsgID(gmMsgID.get(),
                                            getter_AddRefs(retHdr));
               if (NS_FAILED(rv)) return rv;
               if (retHdr) {
+#ifdef MOZ_PANORAMA
+                if (core) {
+                  nsMsgKey candidateKey;
+                  uint64_t expectedFolder, actualFolder;
+                  MOZ_TRY(retHdr->GetMessageKey(&candidateKey));
+                  MOZ_TRY(subMsgFolder->GetId(&expectedFolder));
+                  MOZ_TRY(core->MessageDB().GetMessageFolderId(candidateKey,
+                                                               actualFolder));
+                  NS_ENSURE_TRUE(expectedFolder == actualFolder,
+                                 NS_ERROR_ILLEGAL_VALUE);
+                  MOZ_TRY(
+                      core->MessageDB().CheckMessageBodyAccess(candidateKey));
+                }
+#endif
                 uint32_t gmFlags = 0;
-                retHdr->GetFlags(&gmFlags);
+                rv = retHdr->GetFlags(&gmFlags);
+#ifdef MOZ_PANORAMA
+                if (core) NS_ENSURE_SUCCESS(rv, rv);
+#endif
                 if ((gmFlags & nsMsgMessageFlags::Offline)) {
                   subMsgFolder.forget(aMsgFolder);
                   // Focus on first positive result.
@@ -9783,9 +9837,15 @@ nsresult nsImapMailFolder::GetOfflineMsgFolder(nsMsgKey msgKey,
 
 NS_IMETHODIMP nsImapMailFolder::GetMsgInputStream(nsIMsgDBHdr* hdr,
                                                   nsIInputStream** stream) {
+  NS_ENSURE_ARG_POINTER(hdr);
+  NS_ENSURE_ARG_POINTER(stream);
+  *stream = nullptr;
+  nsCOMPtr<nsIMsgFolder> sourceFolder;
+  MOZ_TRY(hdr->GetFolder(getter_AddRefs(sourceFolder)));
+  NS_ENSURE_TRUE(sourceFolder == this, NS_ERROR_NOT_AVAILABLE);
   // Gmail hack. Check if message is actually stored in another folder.
   nsMsgKey msgKey;
-  hdr->GetMessageKey(&msgKey);
+  MOZ_TRY(hdr->GetMessageKey(&msgKey));
   nsCOMPtr<nsIMsgFolder> otherFolder;
   nsresult rv = GetOfflineMsgFolder(msgKey, getter_AddRefs(otherFolder));
   NS_ENSURE_SUCCESS(rv, rv);
@@ -9796,9 +9856,16 @@ NS_IMETHODIMP nsImapMailFolder::GetMsgInputStream(nsIMsgDBHdr* hdr,
   if (otherFolder != this) {
     // It's in another folder. Find it.
     nsAutoCString gmMsgID;
-    hdr->GetStringProperty("X-GM-MSGID", gmMsgID);
+    rv = hdr->GetStringProperty("X-GM-MSGID", gmMsgID);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      MOZ_TRY(rv);
+      NS_ENSURE_TRUE(!gmMsgID.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    }
+#endif
     nsCOMPtr<nsIMsgDatabase> otherDB;
-    otherFolder->GetMsgDatabase(getter_AddRefs(otherDB));
+    MOZ_TRY(otherFolder->GetMsgDatabase(getter_AddRefs(otherDB)));
+    NS_ENSURE_TRUE(otherDB, NS_ERROR_NOT_AVAILABLE);
     nsCOMPtr<nsIMsgDBHdr> otherHdr;
     rv = otherDB->GetMsgHdrForGMMsgID(gmMsgID.get(), getter_AddRefs(otherHdr));
     NS_ENSURE_SUCCESS(rv, rv);

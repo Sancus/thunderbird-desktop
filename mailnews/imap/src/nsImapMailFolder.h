@@ -587,6 +587,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
   void DeleteStoreMessages(const nsTArray<nsMsgKey>& aMessages);
   static void DeleteStoreMessages(const nsTArray<nsMsgKey>& aMessages,
                                   nsIMsgFolder* aFolder);
+  nsresult StorePreviewText(nsIMsgDBHdr* header, nsIInputStream* stream);
+
   /**
    * This method is used to locate a folder where a msg could be present, not
    * just the folder where the message first arrives, this method searches for

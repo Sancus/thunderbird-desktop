@@ -119,11 +119,19 @@ tags = ["foldernames"]
 
 ["test_imapNtlmNoChallenge.js"]
 
+["test_imapOfflineBodyAdmission.js"]
+run-if = ["nightly_build"]
+prefs = ["mail.panorama.enabled=true"]
+
 ["test_imapPasswordFailure.js"]
 
 ["test_imapPendingCounts.js"]
 
 ["test_imapPreAuthUntaggedIgnored.js"]
+
+["test_imapPreviewIdentity.js"]
+run-if = ["nightly_build"]
+prefs = ["mail.panorama.enabled=true"]
 
 ["test_imapProtocols.js"]
 

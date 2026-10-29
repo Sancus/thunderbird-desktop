@@ -14,6 +14,7 @@
 #include "mozilla/Components.h"
 #include "mozilla/Logging.h"
 #include "mozilla/ProfilerMarkers.h"
+#include "mozilla/fallible.h"
 #include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
@@ -280,6 +281,17 @@ nsresult FolderDatabase::DeleteFolderTree(uint64_t folderId, bool root,
 
 NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
                                         const nsTArray<nsCString>& childNames) {
+  // InsertFolder/UpdateName store NFC names. Normalize the complete incoming
+  // list before comparing it, so equivalent spellings retain physical IDs and
+  // normalization failures occur before any existing child is removed.
+  nsTArray<nsCString> names;
+  if (!names.SetCapacity(childNames.Length(), fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  for (const auto &name : childNames) {
+    names.AppendElement(MOZ_TRY(DatabaseUtils::Normalize(name)));
+  }
+
   // Step One: delete any folders in the db that aren't in the list (but
   // not virtual folders).
   // TODO: (BenC) - I don't think we should do this step. Even for local
@@ -289,15 +301,14 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
   for (auto childId : childIds) {
     nsCString childName = MOZ_TRY(GetFolderName(childId));
     uint32_t childFlags = MOZ_TRY(GetFolderFlags(childId));
-    // TODO: really should be using an NFC-normalized `childNames` here.
-    if (!childNames.Contains(childName) &&
+    if (!names.Contains(childName) &&
         !(childFlags & nsMsgFolderFlags::Virtual)) {
       MOZ_TRY(DeleteFolder(childId));
     }
   }
 
   // Step Two: create any folders which are in `childNames`, but not in DB.
-  for (auto const& childName : childNames) {
+  for (auto const &childName : names) {
     uint64_t childId = MOZ_TRY(GetFolderChildNamed(parentId, childName));
     if (childId == 0) {
       // It's not in the DB!

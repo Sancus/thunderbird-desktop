@@ -32,6 +32,7 @@
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgOfflineImapOperation.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
 #include "nsImapCore.h"
 #include "nsIProperties.h"
@@ -787,6 +788,10 @@ class DeliveryCoreReferences : public testing::Test {
       }
     }
     return nullptr;
+  }
+
+  nsresult PhysicalFolderKeys(uint64_t folderId, nsTArray<nsMsgKey> &keys) {
+    return mCore->MessageDB().ListAllKeys(folderId, keys);
   }
 
   nsresult AdmissionSource(DatabaseCore *core, nsACString &output) {
@@ -7785,6 +7790,88 @@ TEST_F(DeliveryCoreReferences, FolderRemovalAccountsWideLocalBytesBeforeEvent) {
   bool exists = true;
   ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
   EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, ReconcileCanonicalNamesRetainPhysicalMembers) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  const nsCString nfc = "Caf\xC3\xA9"_ns;
+  const nsCString nfd = "Cafe\xCC\x81"_ns;
+  uint64_t child, nested;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, nfc, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(child, "Nested"_ns, &nested));
+  nsMsgKey key;
+  const nsTArray<nsCString> references = {"missing-root"_ns, ""_ns, "tail"_ns,
+                                          "missing-root"_ns};
+  ASSERT_EQ(NS_OK, AddAt(nested, "canonical-child"_ns, references, key));
+  auto &db = mCore->MessageDB();
+  const nsCString property = "Exact\xCC\x81"_ns;
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, property, ""_ns));
+  // Warm the original paths/identities before reconciliation.
+  auto path = folders.GetFolderPath(nested);
+  ASSERT_TRUE(path.isOk());
+  nsCString originalPath = path.unwrap();
+  ASSERT_EQ(NS_OK, folders.Reconcile(mFolderId, {nfd}));
+  for (const auto &name : {nfc, nfd}) {
+    auto found = folders.GetFolderChildNamed(mFolderId, name);
+    ASSERT_TRUE(found.isOk());
+    EXPECT_EQ(child, found.unwrap());
+  }
+  auto parent = folders.GetFolderParent(nested);
+  ASSERT_TRUE(parent.isOk());
+  EXPECT_EQ(child, parent.unwrap());
+  auto newPath = folders.GetFolderPath(nested);
+  ASSERT_TRUE(newPath.isOk());
+  EXPECT_EQ(originalPath, newPath.unwrap());
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, PhysicalFolderKeys(nested, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, db.GetMessageReferences(key, stored));
+  EXPECT_EQ(references, stored);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_TRUE(names.Contains(property));
+  nsCString value = "unchanged"_ns;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, property, value));
+  EXPECT_TRUE(value.IsEmpty());
+  ASSERT_EQ(NS_OK, folders.Reconcile(mFolderId, {nfc}));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto found = mCore->FolderDB().GetFolderChildNamed(mFolderId, nfd);
+  ASSERT_TRUE(found.isOk());
+  EXPECT_EQ(child, found.unwrap());
+  keys.Clear();
+  ASSERT_EQ(NS_OK, PhysicalFolderKeys(nested, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
+}
+
+TEST_F(DeliveryCoreReferences, ReconcileCanonicalDuplicatesKeepVirtualControl) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  const nsCString nfc = "Caf\xC3\xA9"_ns;
+  const nsCString nfd = "Cafe\xCC\x81"_ns;
+  uint64_t child, obsolete, control;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, nfd, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Obsolete"_ns, &obsolete));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Saved"_ns, &control));
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(control, nsMsgFolderFlags::Virtual));
+  ASSERT_EQ(NS_OK, folders.Reconcile(mFolderId, {nfd, nfc, nfd}));
+  auto found = folders.GetFolderChildNamed(mFolderId, nfc);
+  ASSERT_TRUE(found.isOk());
+  EXPECT_EQ(child, found.unwrap());
+  auto removed = folders.GetFolderChildNamed(mFolderId, "Obsolete"_ns);
+  ASSERT_TRUE(removed.isOk());
+  EXPECT_EQ(0u, removed.unwrap());
+  auto children = folders.GetFolderChildren(mFolderId);
+  ASSERT_TRUE(children.isOk());
+  auto ids = children.unwrap();
+  EXPECT_EQ(2u, ids.Length());
+  EXPECT_TRUE(ids.Contains(child));
+  EXPECT_TRUE(ids.Contains(control));
+  auto flags = folders.GetFolderFlags(control);
+  ASSERT_TRUE(flags.isOk());
+  EXPECT_EQ(nsMsgFolderFlags::Virtual, flags.unwrap());
 }
 
 TEST_F(DeliveryCoreReferences,

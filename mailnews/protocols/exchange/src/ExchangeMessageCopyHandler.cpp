@@ -26,27 +26,29 @@
 // IMAP reports local deletion through OnStopCopy before STORE finishes. Wait
 // for its URL result, while still accepting a synchronous dispatch failure.
 class ImapSourceDeleteListener final : public CopyServiceListener,
-                                       public UrlListener {
+                                       public nsIUrlListener {
  public:
   NS_DECL_ISUPPORTS_INHERITED
 
   ImapSourceDeleteListener(nsIUrlListener* folderListener,
                            std::function<nsresult(nsresult)> onComplete)
-      : mFolderListener(folderListener), mOnComplete(std::move(onComplete)) {
-    mStartFn = [this](nsIURI* url) {
-      return mFolderListener->OnStartRunningUrl(url);
-    };
-    mStopFn = [this](nsIURI* url, nsresult status) {
-      if (mUrlStopped) {
-        return NS_OK;
-      }
-      mUrlStopped = true;
-      nsresult rv = mFolderListener->OnStopRunningUrl(url, status);
-      return Complete(NS_FAILED(status) ? status : rv);
-    };
-    mStopCopyFn = [this](nsresult status) {
-      return NS_FAILED(status) ? Complete(status) : NS_OK;
-    };
+      : mFolderListener(folderListener), mOnComplete(std::move(onComplete)) {}
+
+  NS_IMETHOD OnStartRunningUrl(nsIURI* url) override {
+    return mFolderListener->OnStartRunningUrl(url);
+  }
+
+  NS_IMETHOD OnStopRunningUrl(nsIURI* url, nsresult status) override {
+    if (mUrlStopped) {
+      return NS_OK;
+    }
+    mUrlStopped = true;
+    nsresult rv = mFolderListener->OnStopRunningUrl(url, status);
+    return Complete(NS_FAILED(status) ? status : rv);
+  }
+
+  NS_IMETHOD OnStopCopy(nsresult status) override {
+    return NS_FAILED(status) ? Complete(status) : NS_OK;
   }
 
  private:

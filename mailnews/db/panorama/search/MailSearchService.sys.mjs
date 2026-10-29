@@ -7,7 +7,10 @@ import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { AsyncShutdown } from "resource://gre/modules/AsyncShutdown.sys.mjs";
 import { setTimeout, clearTimeout } from "resource://gre/modules/Timer.sys.mjs";
 import { PanoramaSearchIndex } from "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs";
-import { resolveMailSearchDocument } from "resource:///modules/panorama/MailSearchSource.sys.mjs";
+import {
+  mailSearchKey,
+  resolveMailSearchDocument,
+} from "resource:///modules/panorama/MailSearchSource.sys.mjs";
 import {
   loadMailSearchDocument,
   loadMailSearchMetadata,
@@ -915,6 +918,60 @@ export class MailSearchService {
       this.#sourceId,
       this.#messageDB,
       request,
+      { signal }
+    );
+  }
+
+  /**
+   * Retrieves a native conversation for an ordinary selected mail header.
+   * Settles preference invalidation before capturing native revisions. This
+   * requires no indexed text and does not enable background indexing.
+   *
+   * @param {nsIMsgDBHdr} header - Selected physical header from the active core.
+   * @param {object} [options] - Lookup controls.
+   * @param {AbortSignal} [options.signal] - Cancel selection and delivery.
+   * @returns {Promise<MailSearchConversationSnapshot|{status: string}>} Complete
+   *   eligible members, or deleted/ineligible/stale/unavailable without members.
+   * @throws {TypeError} For an invalid physical message key.
+   */
+  async getConversationForHeader(header, { signal } = {}) {
+    if (this.#closed) {
+      throw new Error("Mail search is closed");
+    }
+    signal = signal
+      ? AbortSignal.any([signal, this.#controller.signal])
+      : this.#controller.signal;
+    signal.throwIfAborted();
+    const id = String(header?.messageKey);
+    const key = mailSearchKey(id);
+    const folderId = header.folder?.id;
+    await this.#preparePreferences(signal);
+    signal.throwIfAborted();
+    const state = this.resolveDocument(id, signal);
+    if (!state) {
+      return { status: "deleted" };
+    }
+    if (!state.eligible) {
+      return { status: "ineligible" };
+    }
+    if (
+      state.location?.folderId !== folderId ||
+      state.location.messageKey !== key
+    ) {
+      return { status: "stale" };
+    }
+    return readMailSearchConversation(
+      this,
+      this.#sourceId,
+      this.#messageDB,
+      {
+        sourceId: this.#sourceId,
+        id,
+        generation: state.generation,
+        policyRevision: state.policyRevision,
+        contentRevision: state.contentRevision,
+        location: { ...state.location },
+      },
       { signal }
     );
   }

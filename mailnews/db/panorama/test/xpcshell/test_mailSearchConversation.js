@@ -368,4 +368,133 @@ add_task(async function test_moveUsesTheActualTransferKeyAndCurrentLocation() {
   ]);
   Assert.equal(current.selectedMessage.messageKey, moved.messageKey);
   Assert.equal(current.selectedMessage.folder.id, destination.id);
+  const fromHeader = await f.service.getConversationForHeader(moved);
+  assertConversationMembers(fromHeader, [
+    f.root,
+    f.reply,
+    moved,
+    f.tail,
+    f.missing,
+  ]);
+  Assert.equal(fromHeader.selectedMessage.messageKey, moved.messageKey);
+  Assert.equal(fromHeader.selectedMessage.folder.id, destination.id);
+});
+
+/**
+ * Reopens the same native messages with a fresh, unprepared sidecar.
+ *
+ * @param {string} name - Unique fixture suffix.
+ * @returns {Promise<object>} Native fixture with a cold service.
+ */
+async function coldConversationFixture(name) {
+  const fixture = await conversationFixture(name);
+  await fixture.service.close();
+  const file = do_get_profile().clone();
+  file.append("conversation-unprepared-" + name + ".sqlite");
+  const service = await MailSearchService.open(
+    file,
+    database.sourceId,
+    messageDB
+  );
+  registerCleanupFunction(() => service.close());
+  return { ...fixture, service };
+}
+
+add_task(
+  async function test_headerEntryIncludesUnindexedMissingBodySelection() {
+    const f = await coldConversationFixture("header-cold");
+    const snapshot = await f.service.getConversationForHeader(f.missing);
+    assertConversationMembers(snapshot, [
+      f.root,
+      f.reply,
+      f.clicked,
+      f.tail,
+      f.missing,
+    ]);
+    Assert.equal(snapshot.selectedId, String(f.missing.messageKey));
+    Assert.equal(snapshot.selectedMessage.messageKey, f.missing.messageKey);
+    Assert.equal(snapshot.selectedMessage.folder.id, f.b.id);
+    Assert.equal(snapshot.sourceId, database.sourceId);
+    const selected = snapshot.items.find(
+      item => item.id == snapshot.selectedId
+    );
+    Assert.equal(selected.originalContentAvailable, false);
+    Assert.equal(selected.canOpen, false);
+    Assert.equal(await f.service.getText(snapshot.selectedId), null);
+    assertConversationMembers(
+      await f.service.getConversationForHeader(f.unrelated),
+      [f.unrelated]
+    );
+  }
+);
+
+add_task(async function test_headerEntryKeepsPolicyAndDeletedCopyGuards() {
+  const f = await coldConversationFixture("header-policy");
+  const pending = f.service.getConversationForHeader(f.clicked);
+  messageDB.removeMessage(f.clicked.messageKey);
+  Assert.equal((await pending).status, "deleted");
+  Assert.ok(messageDB.getSearchState(f.reply.messageKey));
+  const pref = "mailnews.database.global.indexer.enabled";
+  const oldPref = Services.prefs.getBoolPref(pref, false);
+  try {
+    Services.prefs.setBoolPref(pref, false);
+    Assert.equal(
+      (await f.service.getConversationForHeader(f.reply)).status,
+      "ineligible"
+    );
+  } finally {
+    Services.prefs.setBoolPref(pref, oldPref);
+  }
+  f.reply.setStringProperty(
+    "junkscore",
+    Ci.nsIJunkMailPlugin.IS_SPAM_SCORE.toString()
+  );
+  Assert.equal(
+    (await f.service.getConversationForHeader(f.reply)).status,
+    "ineligible"
+  );
+});
+
+add_task(async function test_headerEntryPreservesCancellationAndErrors() {
+  const f = await coldConversationFixture("header-errors");
+  const resolveDocument = f.service.resolveDocument;
+  const failure = new Error("Original header conversation lookup failure");
+  let lookups = 0;
+  f.service.resolveDocument = () => {
+    lookups++;
+    throw failure;
+  };
+  try {
+    const controller = new AbortController();
+    const reason = new Error("Cancel header conversation lookup");
+    controller.abort(reason);
+    await Assert.rejects(
+      f.service.getConversationForHeader(f.clicked, {
+        signal: controller.signal,
+      }),
+      error => error === reason
+    );
+    Assert.equal(lookups, 0);
+    await Assert.rejects(
+      f.service.getConversationForHeader(f.clicked),
+      error => error === failure
+    );
+  } finally {
+    f.service.resolveDocument = resolveDocument;
+  }
+  await Assert.rejects(
+    f.service.getConversationForHeader(null),
+    /physical mail identity/
+  );
+  const controller = new AbortController();
+  const reason = new Error("Cancel header conversation preference preparation");
+  const pending = f.service.getConversationForHeader(f.clicked, {
+    signal: controller.signal,
+  });
+  controller.abort(reason);
+  await Assert.rejects(pending, error => error === reason);
+  const closingLookup = f.service.getConversationForHeader(f.clicked);
+  const closing = f.service.close();
+  await Assert.rejects(closingLookup, /Mail search closed/);
+  await closing;
 });

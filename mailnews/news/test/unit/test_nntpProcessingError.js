@@ -360,3 +360,112 @@ add_task(async function test_failedAfterLines() {
     );
   });
 });
+
+add_task(async function test_offlineDownloadFailure() {
+  await withServer(NNTP_RFC2980_handler, async () => {
+    const database = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && database instanceof Ci.nsIDatabaseCore,
+      Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    );
+    const contract = Services.prefs.getCharPref(
+      "mail.serverDefaultStoreContractID"
+    );
+    Assert.equal(localserver.getStringValue("storeContractID"), contract);
+    const expectedStore = {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[contract];
+    Assert.ok(expectedStore);
+    Assert.equal(folder.msgStore.storeType, expectedStore);
+    await getNewMessages();
+    const newsFolder = folder.QueryInterface(Ci.nsIMsgNewsFolder);
+    const articleNumber = 1;
+    const article = daemon.getGroup("test.filter")[articleNumber];
+    const id = article.messageID.slice(1, -1);
+    const hdr = [...folder.messages].find(message => message.messageId == id);
+    Assert.ok(hdr, "The requested article has a real published header");
+    const key = hdr.messageKey;
+    const messageId = hdr.messageId;
+    const wasRead = hdr.isRead;
+    const storeToken = hdr.storeToken;
+    Assert.ok(!folder.hasMsgOffline(key), "The article has no offline body");
+    const saveArticleOffline = newsFolder.saveArticleOffline;
+    const holder = Cc["@mozilla.org/supports-string;1"].createInstance(
+      Ci.nsISupportsString
+    );
+    folder.acquireSemaphore(holder, "test_offlineDownloadFailure");
+    try {
+      newsFolder.saveArticleOffline = true;
+      let busyStatus;
+      Assert.throws(
+        () => folder.acquireSemaphore(folder, "test busy folder"),
+        error => {
+          busyStatus = error.result;
+          return !Components.isSuccessCode(busyStatus);
+        },
+        "The fixture holds the folder lock"
+      );
+      Assert.throws(
+        () =>
+          newsFolder.notifyArticleDownloaded(
+            articleNumber,
+            "Subject: busy\r\n\r\nbody\r\n"
+          ),
+        error => error.result == busyStatus,
+        "A direct offline write reports the original lock error"
+      );
+      const result = await getArticle(articleNumber);
+      Assert.equal(
+        result.status,
+        busyStatus,
+        "The ARTICLE request reports the offline write error"
+      );
+      Assert.ok(
+        folder.testSemaphore(holder),
+        "The failed write preserves the foreign folder lock"
+      );
+      Assert.ok(!folder.hasMsgOffline(key), "The failed write stores no body");
+      Assert.equal(hdr.storeToken, storeToken, "The store token is unchanged");
+      Assert.equal(hdr.isRead, wasRead, "The failure preserves read state");
+    } finally {
+      folder.releaseSemaphore(holder, "test_offlineDownloadFailure");
+      newsFolder.saveArticleOffline = saveArticleOffline;
+    }
+
+    newsFolder.saveArticleOffline = true;
+    try {
+      const result = await getArticle(articleNumber);
+      Assert.equal(result.status, Cr.NS_OK, "A later download succeeds");
+      Assert.equal(
+        folder.GetMessageHeader(key).messageId,
+        messageId,
+        "Retry keeps the same message"
+      );
+      Assert.ok(folder.hasMsgOffline(key), "Retry stores the body offline");
+      const stream = folder.getMsgInputStream(hdr);
+      const input = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+        Ci.nsIScriptableInputStream
+      );
+      input.init(stream);
+      try {
+        let stored = "";
+        while (input.available()) {
+          stored += input.read(input.available());
+        }
+        Assert.stringContains(
+          stored,
+          "This is the first body post.",
+          "The stored body belongs to the requested article"
+        );
+      } finally {
+        input.close();
+      }
+      Assert.ok(!folder.locked, "The completed write releases its lock");
+    } finally {
+      newsFolder.saveArticleOffline = saveArticleOffline;
+    }
+  });
+});

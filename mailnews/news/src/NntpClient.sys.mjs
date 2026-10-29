@@ -1036,7 +1036,11 @@ export class NntpClient {
    */
   _actionReadDataFailed = e => {
     this._logger.error("Failed to process multi-line response.", e);
-    this._actionDone(Cr.NS_ERROR_FAILURE);
+    this._actionDone(
+      typeof e?.result == "number" && !Components.isSuccessCode(e.result)
+        ? e.result
+        : Cr.NS_ERROR_FAILURE
+    );
   };
 
   /**

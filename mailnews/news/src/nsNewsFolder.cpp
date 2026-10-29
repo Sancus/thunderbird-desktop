@@ -165,8 +165,8 @@ nsMsgNewsFolder::AddNewsgroup(const nsACString& name, const nsACString& setStr,
 
 #ifdef MOZ_PANORAMA
 nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
-                                                  const nsACString& setStr,
-                                                  nsIMsgFolder** child) {
+                                                   const nsACString& setStr,
+                                                   nsIMsgFolder** child) {
   *child = nullptr;
   NS_ENSURE_STATE(mFolderId);
   NS_ENSURE_ARG(!name.IsEmpty());
@@ -1203,19 +1203,35 @@ NS_IMETHODIMP nsMsgNewsFolder::NotifyArticleDownloaded(uint32_t articleNumber,
   if (!m_downloadMessageForOfflineUse) {
     return NS_OK;
   }
+  if (m_tempMessageStream) {
+    return NS_ERROR_IN_PROGRESS;
+  }
   nsresult rv =
       GetMessageHeader(articleNumber, getter_AddRefs(m_offlineHeader));
   NS_ENSURE_SUCCESS(rv, rv);
-  StartNewOfflineMessage();  // Sets up m_tempMessageStream et al.
+  rv = StartNewOfflineMessage();
+  if (NS_FAILED(rv)) {
+    if (m_tempMessageStream) {
+      EndNewOfflineMessage(rv);
+    } else {
+      m_offlineHeader = nullptr;
+    }
+    return rv;
+  }
+
   if (m_tempMessageStream) {
     m_numOfflineMsgLines += data.CountChar('\n');
-
     uint32_t count = 0;
     rv = m_tempMessageStream->Write(data.BeginReading(), data.Length(), &count);
     m_tempMessageStreamBytesWritten += count;
-    return EndNewOfflineMessage(rv);
+    if (NS_SUCCEEDED(rv) && count != data.Length()) {
+      rv = NS_ERROR_FAILURE;
+    }
+  } else {
+    rv = NS_ERROR_UNEXPECTED;
   }
-  return NS_OK;
+  nsresult finishRv = EndNewOfflineMessage(rv);
+  return NS_FAILED(rv) ? rv : finishRv;
 }
 
 NS_IMETHODIMP nsMsgNewsFolder::NotifyFinishedDownloadinghdrs() {

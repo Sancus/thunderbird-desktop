@@ -430,3 +430,45 @@ registerCleanupFunction(() => {
   // Remove created folders.
   folder.deleteSelf(null);
 });
+
+add_task(function test_attachmentPartIdentityAcrossMessageUrls() {
+  const { AttachmentInfo } = ChromeUtils.importESModule(
+    "resource:///modules/AttachmentInfo.sys.mjs"
+  );
+  for (const [url, expectedPart, external, expectedUrl = url] of [
+    ["mailbox:///mail/Inbox?number=7&part=1.2&filename=note.txt", "1.2", false],
+    [
+      "imap://user@localhost/fetch%3EUID%3EInbox%3E7?part=1.2.3",
+      "1.2.3",
+      false,
+    ],
+    [
+      "news://example.invalid/article?/;section=2?part=1.2&filename=note.txt",
+      "1.2",
+      false,
+    ],
+    ["mailbox:///mail/Inbox?number=7&filename=note.txt", null, false],
+    [
+      "file:///mail/attached.txt?part=1.4",
+      "1.4",
+      true,
+      "file:///mail/attached.txt",
+    ],
+    [
+      "https://example.invalid/attached.txt?download=1&part=1.5",
+      "1.5",
+      true,
+      "https://example.invalid/attached.txt?download=1",
+    ],
+  ]) {
+    const attachment = new AttachmentInfo({
+      contentType: "text/plain",
+      name: "note.txt",
+      uri: "mailbox-message://nobody@Local%20Folders/Inbox#7",
+      url,
+      isExternalAttachment: external,
+    });
+    Assert.equal(attachment.partID, expectedPart, `Part identity for ${url}`);
+    Assert.equal(attachment.url, expectedUrl, `Reader URL for ${url}`);
+  }
+});

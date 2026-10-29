@@ -11,9 +11,9 @@ ChromeUtils.defineESModuleGetters(lazy, {
   DownloadPaths: "resource://gre/modules/DownloadPaths.sys.mjs",
   Downloads: "resource://gre/modules/Downloads.sys.mjs",
   FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
-  GlodaUtils: "resource:///modules/gloda/GlodaUtils.sys.mjs",
   MailStringUtils: "resource:///modules/MailStringUtils.sys.mjs",
   MailUtils: "resource:///modules/MailUtils.sys.mjs",
+  MIME_PART_RE: "resource:///modules/panorama/MimeMessage.sys.mjs",
   NetUtil: "resource://gre/modules/NetUtil.sys.mjs",
 });
 
@@ -107,7 +107,7 @@ export class AttachmentInfo {
       this.partID = match && match.split("part=")[1];
       this.url = url.replace(match, "");
     } else {
-      const match = lazy.GlodaUtils.PART_RE.exec(url);
+      const match = lazy.MIME_PART_RE.exec(url);
       this.partID = match && match[1];
     }
   }

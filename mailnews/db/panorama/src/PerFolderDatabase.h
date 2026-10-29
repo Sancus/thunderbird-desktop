@@ -72,6 +72,13 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
 
   uint64_t FolderId() { return mFolderId; }
 
+  // Same-key completion from the actual parsed CreateNewHdr draft.
+  // Once claimed, a failure seals the draft; caller retains finished bytes.
+  nsresult CompletePartialHdr(const MessageBodyState& expected,
+                              nsIMsgDBHdr* parsed,
+                              const FinishedMessageBody& finished,
+                              nsIMsgDBHdr** realHdr);
+
  private:
   friend class FolderInfo;
   friend class OfflineOperation;

@@ -1829,5 +1829,196 @@ TEST_F(DISABLED_DeliveryHeaderAncestry,
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
 }
 
+class PartialDraftObserver final : public MessageListener {
+ public:
+  NS_DECL_ISUPPORTS
+  PartialDraftObserver(PerFolderDatabase* database, nsIMsgDBHdr* parsed)
+      : mDatabase(database), mParsed(parsed) {}
+  void OnMessageAdded(Message*) override { ++mAdds; }
+  void OnMessageRemoved(Message*, uint32_t) override {}
+  void OnMessageFlagsChanged(nsIMsgDBHdr*, Message*, uint32_t,
+                             uint32_t) override {
+    ++mChanges;
+    nsCOMPtr<nsIMsgDBHdr> duplicate;
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              mDatabase->AttachHdr(mParsed, false, getter_AddRefs(duplicate)));
+    EXPECT_FALSE(duplicate);
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, mParsed->SetSubject("reentrant"_ns));
+  }
+  void OnMessageTagsChanged(nsIMsgDBHdr*, Message*, const nsACString&,
+                            const nsACString&) override {}
+  uint32_t mAdds = 0;
+  uint32_t mChanges = 0;
+
+ private:
+  ~PartialDraftObserver() = default;
+  RefPtr<PerFolderDatabase> mDatabase;
+  nsCOMPtr<nsIMsgDBHdr> mParsed;
+};
+NS_IMPL_ISUPPORTS(PartialDraftObserver, nsISupports)
+
+using DISABLED_DeliveryPartialHeader = DeliveryMessageReferences;
+
+TEST_F(DISABLED_DeliveryPartialHeader, CompletesSameKeyAndConsumesParsedDraft) {
+  ASSERT_NO_FATAL_FAILURE(Create({"old@invalid"_ns}));
+  ASSERT_EQ(NS_OK, mHeader->SetFlags(nsMsgMessageFlags::Read |
+                                     nsMsgMessageFlags::Partial));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("keywords", "user-tags"_ns));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("unrelated", "keep"_ns));
+  ASSERT_EQ(NS_OK, mHeader->SetAccountKey("old-account"_ns));
+  ASSERT_EQ(NS_OK, mHeader->SetPriority(nsMsgPriority::highest));
+  MessageBodyState expected;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(mKey, expected));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("child@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetSubject("complete subject"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetPriority(nsMsgPriority::high));
+  ASSERT_EQ(NS_OK,
+            parsed->SetReferences(
+                "<first@invalid> <unresolved@invalid> <first@invalid>"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("Case", "earlier"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("case", "1e3"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("Case", "00042"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("empty", ""_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("account", ""_ns));
+  RefPtr<PartialDraftObserver> observer = new PartialDraftObserver(db, parsed);
+  mCore->MessageDB().AddMessageListener(observer);
+  auto remove = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(observer); });
+  // These are native settlement inputs, not proof of actual provider bytes.
+  FinishedMessageBody finished{"0"_ns, 42, 42, 3, true};
+  nsCOMPtr<nsIMsgDBHdr> completed;
+  ASSERT_EQ(NS_OK, db->CompletePartialHdr(expected, parsed, finished,
+                                          getter_AddRefs(completed)));
+  ASSERT_TRUE(completed);
+  nsMsgKey key, thread;
+  ASSERT_EQ(NS_OK, completed->GetMessageKey(&key));
+  EXPECT_EQ(mKey, key);
+  ASSERT_EQ(NS_OK, completed->GetThreadId(&thread));
+  EXPECT_EQ(mKey, thread);
+  nsMsgPriorityValue priority;
+  ASSERT_EQ(NS_OK, completed->GetPriority(&priority));
+  EXPECT_EQ(nsMsgPriority::high, priority);
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, completed->GetFlags(&flags));
+  EXPECT_TRUE(flags & nsMsgMessageFlags::Read);
+  EXPECT_TRUE(flags & nsMsgMessageFlags::Offline);
+  EXPECT_FALSE(flags & nsMsgMessageFlags::Partial);
+  nsCString text;
+  ASSERT_EQ(NS_OK, completed->GetSubject(text));
+  EXPECT_EQ("complete subject"_ns, text);
+  ASSERT_EQ(NS_OK, completed->GetStringProperty("keywords", text));
+  EXPECT_EQ("user-tags"_ns, text);
+  ASSERT_EQ(NS_OK, completed->GetStringProperty("unrelated", text));
+  EXPECT_EQ("keep"_ns, text);
+  ASSERT_EQ(NS_OK, completed->GetStringProperty("Case", text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, completed->GetStringProperty("case", text));
+  EXPECT_EQ("1e3"_ns, text);
+  ASSERT_EQ(NS_OK, completed->GetAccountKey(text));
+  EXPECT_TRUE(text.IsEmpty());
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, completed->GetProperties(names));
+  EXPECT_TRUE(names.Contains("empty"_ns));
+  EXPECT_TRUE(names.Contains("account"_ns));
+  uint16_t count = 0;
+  ASSERT_EQ(NS_OK, completed->GetNumReferences(&count));
+  EXPECT_EQ(3u, count);
+  ASSERT_EQ(NS_OK, completed->GetStringReference(2, text));
+  EXPECT_EQ("first@invalid"_ns, text);
+  MessageBodyState after;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(mKey, after));
+  EXPECT_EQ(Some(nsCString("0"_ns)), after.storeToken);
+  EXPECT_EQ(42u, after.messageSize);
+  EXPECT_EQ(42u, after.offlineMessageSize);
+  EXPECT_EQ(3u, after.lineCount);
+  nsCOMPtr<nsIMsgDBHdr> repeated;
+  ASSERT_EQ(NS_OK, db->AttachHdr(parsed, true, getter_AddRefs(repeated)));
+  EXPECT_EQ(completed, repeated);
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED, parsed->SetSubject("late"_ns));
+  EXPECT_EQ(0u, observer->mAdds);
+  EXPECT_EQ(1u, observer->mChanges);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{mKey}), keys);
+}
+
+TEST_F(DISABLED_DeliveryPartialHeader, StorageFailureSealsDraftAndKeepsSource) {
+  ASSERT_NO_FATAL_FAILURE(Create({"old@invalid"_ns}));
+  ASSERT_EQ(NS_OK, mHeader->SetFlags(nsMsgMessageFlags::Partial));
+  MessageBodyState expected;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(mKey, expected));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("child@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetSubject("uncommitted subject"_ns));
+  RefPtr<DeliveryMessageReferencesFaultWitness> witness =
+      new DeliveryMessageReferencesFaultWitness();
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateFunction("partial_draft_fault"_ns, 1, witness));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_partial_draft"_ns));
+    EXPECT_EQ(NS_OK, Connection()->RemoveFunction("partial_draft_fault"_ns));
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER fail_partial_draft BEFORE UPDATE "
+                       "OF subject ON messages BEGIN "
+                       "SELECT partial_draft_fault(NEW.id); "
+                       "SELECT RAISE(ABORT,'partial draft'); END"_ns));
+  FinishedMessageBody finished{"finished-retained"_ns, 23, 23, 1, true};
+  nsIMsgDBHdr* output = mHeader;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->CompletePartialHdr(expected, parsed, finished, &output));
+  EXPECT_EQ(nullptr, output);
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(mKey, witness->mLastKey);
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, parsed->SetSubject("retry"_ns));
+  nsCOMPtr<nsIMsgDBHdr> duplicate;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->AttachHdr(parsed, true, getter_AddRefs(duplicate)));
+  EXPECT_FALSE(duplicate);
+  MessageBodyState after;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(mKey, after));
+  EXPECT_EQ(expected.storeToken, after.storeToken);
+  EXPECT_EQ(expected.contentRevision, after.contentRevision);
+  EXPECT_EQ(expected.locationRevision, after.locationRevision);
+  EXPECT_TRUE(after.flags & nsMsgMessageFlags::Partial);
+  nsCString subject;
+  ASSERT_EQ(NS_OK, mHeader->GetSubject(subject));
+  EXPECT_EQ("subject"_ns, subject);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{mKey}), keys);
+}
+
+TEST_F(DISABLED_DeliveryPartialHeader,
+       RejectsAnotherPhysicalFolderBeforeClaim) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK, mHeader->SetFlags(nsMsgMessageFlags::Partial));
+  MessageBodyState expected;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(mKey, expected));
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(other, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  FinishedMessageBody finished;
+  nsIMsgDBHdr* output = mHeader;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->CompletePartialHdr(expected, parsed, finished, &output));
+  EXPECT_EQ(nullptr, output);
+  EXPECT_EQ(NS_OK, parsed->SetSubject("still editable"_ns));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(mKey, exists));
+  EXPECT_TRUE(exists);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+}
+
 }  // namespace
 }  // namespace mozilla::mailnews

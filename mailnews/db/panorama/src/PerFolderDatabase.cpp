@@ -705,9 +705,9 @@ NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForKey(nsMsgKey key,
   MOZ_TRY(MessageDB().GetMessage(key, getter_AddRefs(message)));
   {
     // Sanity check.
-    uint64_t msgFolderId;
-    MOZ_TRY(MessageDB().GetMessageFolderId(key, msgFolderId));
-    if (msgFolderId != mFolderId) {
+    CapturedMessage current;
+    MOZ_TRY(MessageDB().CaptureMessage(key, current));
+    if (current.folderId != mFolderId) {
       NS_WARNING("GetMsgHdrForKey() returned message not in folder");
       return NS_ERROR_ILLEGAL_VALUE;
     }
@@ -811,6 +811,43 @@ NS_IMETHODIMP PerFolderDatabase::AddNewHdrToDB(nsIMsgDBHdr* newHdr,
                                                bool notify) {
   NS_ERROR("AddNewHdrToDB() not supported");
   return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+nsresult PerFolderDatabase::CompletePartialHdr(
+    const MessageBodyState& expected, nsIMsgDBHdr* parsed,
+    const FinishedMessageBody& finished, nsIMsgDBHdr** realHdr) {
+  NS_ENSURE_ARG_POINTER(realHdr);
+  *realHdr = nullptr;
+  NS_ENSURE_ARG(parsed);
+  MOZ_TRY(CheckFolderExists());
+  NS_ENSURE_TRUE(expected.folderId == mFolderId, NS_ERROR_INVALID_ARG);
+  bool isLive;
+  MOZ_TRY(parsed->GetIsLive(&isLive));
+  NS_ENSURE_FALSE(isLive, NS_ERROR_INVALID_ARG);
+  // The parser uses the native CreateNewHdr implementation, as in AttachHdr.
+  RefPtr<DetachedMsgHdr> draft = static_cast<DetachedMsgHdr*>(parsed);
+  NS_ENSURE_TRUE(draft->mFolderId == mFolderId, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(draft->CheckMutable());
+  RefPtr<PerFolderDatabase> self(this);
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attaching;
+  nsCOMPtr<nsIMsgDBHdr> live;
+  nsresult rv = [&]() -> nsresult {
+    // Prepare the result before mutation; no read can fail after commit.
+    MOZ_TRY(GetMsgHdrForKey(expected.key, getter_AddRefs(live)));
+    MessageBodyState updated;
+    return MessageDB().CompletePartialMessage(expected, draft->mRaw, finished,
+                                              updated);
+  }();
+  if (NS_FAILED(rv)) {
+    // Finished bytes remain caller-owned; an error does not authorize replay.
+    draft->mAttachError = rv;
+    draft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+    return rv;
+  }
+  draft->mAttachedHeader = live;
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attached;
+  live.forget(realHdr);
+  return NS_OK;
 }
 
 NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,

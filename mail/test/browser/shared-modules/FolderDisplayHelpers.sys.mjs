@@ -1797,10 +1797,18 @@ async function _internal_assert_displayed(
     }
 
     const desiredMessage = get_db_view(troller).getMsgHdrAt(desiredIndices[0]);
+    const displayedMessage = aboutMessage.gMessage;
+    Assert.ok(desiredMessage, "the view should have the desired message header");
+    Assert.ok(displayedMessage, "about:message should have a message header");
     Assert.equal(
-      aboutMessage.gMessage,
-      desiredMessage,
-      "about:message should have the right gMessage"
+      displayedMessage.folder.URI,
+      desiredMessage.folder.URI,
+      "about:message should have the right physical folder"
+    );
+    Assert.equal(
+      displayedMessage.messageKey,
+      desiredMessage.messageKey,
+      "about:message should have the right physical message key"
     );
 
     const messagePane = aboutMessage.getMessagePaneBrowser();

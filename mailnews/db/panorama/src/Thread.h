@@ -40,8 +40,12 @@ class Thread : public nsIMsgThread {
 
 class ThreadMessageEnumerator : public nsBaseMsgEnumerator {
  public:
-  explicit ThreadMessageEnumerator(nsTArray<nsMsgKey>& keys)
-      : mKeys(keys.Clone()) {}
+  ThreadMessageEnumerator(uint64_t folderId, uint64_t threadId, nsMsgKey parent,
+                          const nsTArray<nsMsgKey>& keys)
+      : mFolderId(folderId),
+        mThreadId(threadId),
+        mParent(parent),
+        mKeys(keys.Clone()) {}
 
   // nsIMsgEnumerator support.
   NS_IMETHOD GetNext(nsIMsgDBHdr** aItem) override;
@@ -54,6 +58,11 @@ class ThreadMessageEnumerator : public nsBaseMsgEnumerator {
     return *DatabaseCore::sInstance->mMessageDatabase;
   }
 
+  nsresult Advance(bool* hasNext);
+
+  uint64_t mFolderId;
+  uint64_t mThreadId;
+  nsMsgKey mParent;
   nsTArray<nsMsgKey> mKeys;
   uint64_t mCurrent{0};
 };

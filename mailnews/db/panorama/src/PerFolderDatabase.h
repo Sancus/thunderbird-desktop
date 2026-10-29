@@ -83,7 +83,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   friend class FolderInfo;
   friend class OfflineOperation;
 
-  virtual ~PerFolderDatabase(){};
+  virtual ~PerFolderDatabase() {};
 
   FolderDatabase& FolderDB() const {
     return *DatabaseCore::sInstance->mFolderDatabase;
@@ -92,12 +92,13 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
     return *DatabaseCore::sInstance->mMessageDatabase;
   }
   nsresult CheckFolderExists() const;
+  nsresult MarkThreadFlag(nsIMsgThread* thread, nsMsgKey key, uint32_t flag,
+                          bool set, nsIDBChangeListener* instigator);
   nsresult ReadCount(bool unread, int32_t* count);
   nsresult WriteCount(bool unread, int32_t count);
   nsresult ChangeCount(bool unread, int32_t delta);
   void RememberLastUseTime() { mLastUseTime = PR_Now(); }
-  nsresult GetMsgHdrForProperty(const nsACString& name,
-                                const nsACString& value,
+  nsresult GetMsgHdrForProperty(const nsACString& name, const nsACString& value,
                                 nsIMsgDBHdr** result);
 
   uint64_t mFolderId;

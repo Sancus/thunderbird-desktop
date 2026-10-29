@@ -223,7 +223,7 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
                                                         mKey, data);
   }
   template <typename T>
-  nsresult ReadNumber(uint32_t OfflineOperationData::*member, T* value) {
+  nsresult ReadNumber(uint32_t OfflineOperationData::* member, T* value) {
     NS_ENSURE_ARG_POINTER(value);
     OfflineOperationData data;
     MOZ_TRY(Read(data));
@@ -233,20 +233,20 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
     return NS_OK;
   }
   template <typename T, typename U>
-  nsresult WriteField(T OfflineOperationData::*member, const U& value) {
+  nsresult WriteField(T OfflineOperationData::* member, const U& value) {
     return Update([&](auto& data) {
       data.*member = value;
       return NS_OK;
     });
   }
-  nsresult ReadString(nsCString OfflineOperationData::*member,
+  nsresult ReadString(nsCString OfflineOperationData::* member,
                       nsACString& value) {
     OfflineOperationData data;
     MOZ_TRY(Read(data));
     value = data.*member;
     return NS_OK;
   }
-  nsresult ReadCString(nsCString OfflineOperationData::*member, char** value) {
+  nsresult ReadCString(nsCString OfflineOperationData::* member, char** value) {
     NS_ENSURE_ARG_POINTER(value);
     *value = nullptr;
     OfflineOperationData data;
@@ -651,9 +651,7 @@ NS_IMETHODIMP PerFolderDatabase::GetDatabaseSize(int64_t* databaseSize) {
   *databaseSize = 0;
   return NS_OK;
 }
-nsresult
-PerFolderDatabase::CheckFolderExists() const
-{
+nsresult PerFolderDatabase::CheckFolderExists() const {
   NS_ENSURE_TRUE(!mForceClosed && DatabaseCore::sInstance &&
                      DatabaseCore::sInstance->mFolderDatabase,
                  NS_ERROR_NOT_AVAILABLE);
@@ -733,11 +731,9 @@ NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForMessageID(const char* messageID,
   NS_IF_ADDREF(*msgHdr = message);
   return NS_OK;
 }
-nsresult
-PerFolderDatabase::GetMsgHdrForProperty(const nsACString& name,
-                                        const nsACString& value,
-                                        nsIMsgDBHdr** result)
-{
+nsresult PerFolderDatabase::GetMsgHdrForProperty(const nsACString& name,
+                                                 const nsACString& value,
+                                                 nsIMsgDBHdr** result) {
   NS_ENSURE_ARG_POINTER(result);
   *result = nullptr;
   MOZ_TRY(CheckFolderExists());
@@ -754,7 +750,7 @@ PerFolderDatabase::GetMsgHdrForProperty(const nsACString& name,
     }
     nsAutoCString candidate;
     MOZ_TRY(
-      header->GetStringProperty(PromiseFlatCString(name).get(), candidate));
+        header->GetStringProperty(PromiseFlatCString(name).get(), candidate));
     if (candidate.Equals(value)) {
       NS_ENSURE_FALSE(found, NS_ERROR_FILE_CORRUPTED);
       found = header;
@@ -767,8 +763,8 @@ PerFolderDatabase::GetMsgHdrForProperty(const nsACString& name,
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForGMMsgID(
     const char* aGmailMessageID, nsIMsgDBHdr** aRetVal) {
   NS_ENSURE_ARG_POINTER(aGmailMessageID);
-  return GetMsgHdrForProperty(
-    "X-GM-MSGID"_ns, nsDependentCString(aGmailMessageID), aRetVal);
+  return GetMsgHdrForProperty("X-GM-MSGID"_ns,
+                              nsDependentCString(aGmailMessageID), aRetVal);
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForEwsItemID(const nsACString& itemID,
                                                        nsIMsgDBHdr** aRetVal) {
@@ -1176,18 +1172,20 @@ NS_IMETHODIMP PerFolderDatabase::SyncCounts() {
 }
 NS_IMETHODIMP PerFolderDatabase::GetThreadContainingMsgHdr(
     nsIMsgDBHdr* msgHdr, nsIMsgThread** thread) {
-  NS_ENSURE_ARG(msgHdr);
   NS_ENSURE_ARG_POINTER(thread);
-
+  *thread = nullptr;
+  NS_ENSURE_ARG(msgHdr);
   nsMsgKey key;
-  nsresult rv = msgHdr->GetMessageKey(&key);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  nsMsgKey threadId;
-  rv = MessageDB().GetMessageThreadId(key, threadId);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  NS_ADDREF(*thread = new Thread(mFolderId, threadId));
+  MOZ_TRY(msgHdr->GetMessageKey(&key));
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(member)));
+  CapturedMessage current;
+  MOZ_TRY(MessageDB().CaptureMessage(key, current));
+  NS_ENSURE_TRUE(current.folderId == mFolderId, NS_ERROR_ILLEGAL_VALUE);
+  NS_ENSURE_TRUE(current.threadId && current.threadId != nsMsgKey_None,
+                 NS_ERROR_NOT_AVAILABLE);
+  RefPtr<Thread> result = new Thread(mFolderId, current.threadId);
+  result.forget(thread);
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::MarkNotNew(nsMsgKey aKey,
@@ -1207,6 +1205,8 @@ NS_IMETHODIMP PerFolderDatabase::MarkMDNSent(nsMsgKey aKey, bool aSent,
 }
 NS_IMETHODIMP PerFolderDatabase::MarkRead(nsMsgKey aKey, bool aRead,
                                           nsIDBChangeListener* aInstigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Read, aRead);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkMarked(nsMsgKey aKey, bool aMarked,
@@ -1241,30 +1241,84 @@ NS_IMETHODIMP PerFolderDatabase::MarkImapDeleted(
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::IMAPDeleted,
                                     aDeleted);
 }
+nsresult PerFolderDatabase::MarkThreadFlag(nsIMsgThread* thread, nsMsgKey key,
+                                           uint32_t flag, bool set,
+                                           nsIDBChangeListener* instigator) {
+  NS_ENSURE_ARG(thread);
+  nsCOMPtr<nsIMsgDBHdr> header;
+  MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
+  nsMsgKey threadId;
+  MOZ_TRY(thread->GetThreadKey(&threadId));
+  CapturedMessage current;
+  MOZ_TRY(MessageDB().CaptureMessage(key, current));
+  NS_ENSURE_TRUE(current.folderId == mFolderId && current.threadId == threadId,
+                 NS_ERROR_ILLEGAL_VALUE);
+  nsCOMPtr<nsIMsgDBHdr> child;
+  MOZ_TRY(thread->GetChild(key, getter_AddRefs(child)));
+  NS_ENSURE_TRUE(child, NS_ERROR_UNEXPECTED);
+  uint32_t oldFlags;
+  MOZ_TRY(thread->GetFlags(&oldFlags));
+  uint32_t flags = oldFlags;
+  if (set) {
+    flags |= flag;
+    flags &= ~(flag == nsMsgMessageFlags::Ignored ? nsMsgMessageFlags::Watched
+                                                  : nsMsgMessageFlags::Ignored);
+  } else {
+    flags &= ~flag;
+  }
+  MOZ_TRY(thread->SetFlags(flags));
+  return NotifyHdrChangeAll(header, oldFlags | current.flags,
+                            flags | current.flags, instigator);
+}
+
 NS_IMETHODIMP PerFolderDatabase::MarkThreadIgnored(
-    nsIMsgThread* thread, nsMsgKey threadKey, bool bIgnored,
-    nsIDBChangeListener* aInstigator) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+    nsIMsgThread* thread, nsMsgKey threadKey, bool ignored,
+    nsIDBChangeListener* instigator) {
+  return MarkThreadFlag(thread, threadKey, nsMsgMessageFlags::Ignored, ignored,
+                        instigator);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkThreadWatched(
-    nsIMsgThread* thread, nsMsgKey threadKey, bool bWatched,
-    nsIDBChangeListener* aInstigator) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+    nsIMsgThread* thread, nsMsgKey threadKey, bool watched,
+    nsIDBChangeListener* instigator) {
+  return MarkThreadFlag(thread, threadKey, nsMsgMessageFlags::Watched, watched,
+                        instigator);
 }
-NS_IMETHODIMP PerFolderDatabase::MarkKilled(nsMsgKey aKey, bool aIgnored,
-                                            nsIDBChangeListener* aInstigator) {
-  return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Ignored, aIgnored);
+NS_IMETHODIMP PerFolderDatabase::MarkKilled(nsMsgKey key, bool killed,
+                                            nsIDBChangeListener* instigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(member)));
+  return MessageDB().SetMessageFlag(key, nsMsgMessageFlags::Ignored, killed);
 }
-NS_IMETHODIMP PerFolderDatabase::IsRead(nsMsgKey aKey, bool* aRead) {
-  return MessageDB().GetMessageFlag(aKey, nsMsgMessageFlags::Read, *aRead);
+NS_IMETHODIMP PerFolderDatabase::IsRead(nsMsgKey key, bool* read) {
+  NS_ENSURE_ARG_POINTER(read);
+  *read = false;
+  nsCOMPtr<nsIMsgDBHdr> header;
+  MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
+  return header->GetIsRead(read);
 }
-NS_IMETHODIMP PerFolderDatabase::IsIgnored(nsMsgKey aKey, bool* aIgnored) {
-  return MessageDB().GetMessageFlag(aKey, nsMsgMessageFlags::Ignored,
-                                    *aIgnored);
+NS_IMETHODIMP PerFolderDatabase::IsIgnored(nsMsgKey key, bool* ignored) {
+  NS_ENSURE_ARG_POINTER(ignored);
+  *ignored = false;
+  nsCOMPtr<nsIMsgDBHdr> header;
+  MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
+  nsCOMPtr<nsIMsgThread> thread;
+  MOZ_TRY(GetThreadContainingMsgHdr(header, getter_AddRefs(thread)));
+  uint32_t flags;
+  MOZ_TRY(thread->GetFlags(&flags));
+  *ignored = !!(flags & nsMsgMessageFlags::Ignored);
+  return NS_OK;
 }
-NS_IMETHODIMP PerFolderDatabase::IsWatched(nsMsgKey aKey, bool* aWatched) {
-  return MessageDB().GetMessageFlag(aKey, nsMsgMessageFlags::Watched,
-                                    *aWatched);
+NS_IMETHODIMP PerFolderDatabase::IsWatched(nsMsgKey key, bool* watched) {
+  NS_ENSURE_ARG_POINTER(watched);
+  *watched = false;
+  nsCOMPtr<nsIMsgDBHdr> header;
+  MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
+  nsCOMPtr<nsIMsgThread> thread;
+  MOZ_TRY(GetThreadContainingMsgHdr(header, getter_AddRefs(thread)));
+  uint32_t flags;
+  MOZ_TRY(thread->GetFlags(&flags));
+  *watched = !!(flags & nsMsgMessageFlags::Watched);
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::IsMarked(nsMsgKey aKey, bool* aMarked) {
   return MessageDB().GetMessageFlag(aKey, nsMsgMessageFlags::Marked, *aMarked);
@@ -1471,7 +1525,7 @@ NS_IMETHODIMP PerFolderDatabase::ListAllOfflineMsgs(
     }
     nsCOMPtr<nsIInputStream> stream;
     nsresult rv =
-      store->GetMsgInputStream(folder, token, 0, getter_AddRefs(stream));
+        store->GetMsgInputStream(folder, token, 0, getter_AddRefs(stream));
     if (rv == NS_ERROR_FILE_NOT_FOUND) {
       continue;
     }

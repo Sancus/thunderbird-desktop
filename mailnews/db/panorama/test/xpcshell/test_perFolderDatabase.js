@@ -13,7 +13,11 @@ const { ProfileCreator } = ChromeUtils.importESModule(
 let rootFolder;
 
 add_setup(async function () {
-  await installDBFromFile("db/messages.sql");
+  // The independent fixture messages are standalone native thread roots.
+  installDB(
+    (await IOUtils.readUTF8(do_get_file("db/messages.sql").path)) +
+      "\nUPDATE messages SET threadId = id, threadParent = 0;"
+  );
   const profile = new ProfileCreator(do_get_profile());
   const server = profile.addLocalServer();
   server.isMaildirStore = false;

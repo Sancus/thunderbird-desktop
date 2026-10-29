@@ -19,7 +19,7 @@ var { openLinkExternally } = ChromeUtils.importESModule(
 );
 
 ChromeUtils.defineESModuleGetters(this, {
-  MsgHdrToMimeMessage: "resource:///modules/gloda/MimeMessage.sys.mjs",
+  MsgHdrToMimeMessage: "resource:///modules/panorama/MimeMessage.sys.mjs",
 });
 
 var FeedMessageHandler = {

@@ -26,6 +26,10 @@ const panorama = Services.prefs.getBoolPref("mail.panorama.enabled", false);
 var gMessage;
 var gSecondFolder;
 var gSynthMessage;
+const modseqs = new Map();
+const changedSince = [];
+const sparseUids = new Map();
+const sparseResponses = [];
 
 add_setup(async function () {
   /*
@@ -37,7 +41,54 @@ add_setup(async function () {
     "mail.server.default.autosync_offline_stores",
     false
   );
+  // Supply the standard CONDSTORE responses only for explicitly marked boxes.
+  const proto = IMAP_RFC3501_handler.prototype;
+  const original = Object.fromEntries(
+    ["onStartup", "CAPABILITY", "SELECT", "FETCH"].map(name => [
+      name,
+      proto[name],
+    ])
+  );
+  proto.onStartup = function () {
+    this._argFormat.SELECT.push("[(atom)]");
+    this._argFormat.FETCH.push("[(atom)]");
+    return original.onStartup.call(this);
+  };
+  proto.CAPABILITY = function () {
+    return original.CAPABILITY.call(this).replace(
+      "IMAP4rev1",
+      "IMAP4rev1 CONDSTORE"
+    );
+  };
+  proto.SELECT = function (args) {
+    const response = original.SELECT.call(this, args);
+    return modseqs.has(args[0])
+      ? `* OK [HIGHESTMODSEQ ${modseqs.get(args[0])}]\0${response}`
+      : response;
+  };
+  proto.FETCH = function (args, uid) {
+    if (args[2]?.[0] == "CHANGEDSINCE") {
+      changedSince.push([this._selectedMailbox.name, String(args[2][1])]);
+    }
+    const response = original.FETCH.call(this, args, uid);
+    const changed = sparseUids.get(this._selectedMailbox.name);
+    if (changed && args[2]?.[0] == "CHANGEDSINCE") {
+      const filtered = response.split("\0").filter(line => {
+        if (!/^\* \d+ FETCH /.test(line)) {
+          return true;
+        }
+        return changed.has(Number(line.match(/\bUID (\d+)\b/)[1]));
+      });
+      sparseResponses.push(
+        filtered.filter(line => /^\* \d+ FETCH /.test(line))
+      );
+      return filtered.join("\0");
+    }
+    return response;
+  };
+  registerCleanupFunction(() => Object.assign(proto, original));
   setupIMAPPump();
+  IMAPPump.incomingServer.useCondStore = false;
   registerCleanupFunction(() => {
     if (IMAPPump.incomingServer) {
       teardownIMAPPump();
@@ -373,12 +424,125 @@ add_task(async function testSelectKeepsLivePendingMove() {
   await checkLivePendingSource("move");
 });
 
+add_task(async function testSparseChangedSinceSkipsSequenceGap() {
+  const { folder, db, headers, remote, messages } =
+    await makePendingFolder("sparse-condstore");
+  const keys = headers.map(header => header.messageKey);
+  const bytes = storedBody(folder, headers[0]);
+  const folderInfo = db.dBFolderInfo;
+  folderInfo.setCharProperty("highestModSeq", "10");
+  folderInfo.setUint32Property("highestRecordedUID", 6102);
+  messages[1].message.setFlag("\\Flagged");
+  modseqs.set(folder.onlineName, 20);
+  sparseUids.set(folder.onlineName, new Set([6102]));
+  const before = sparseResponses.length;
+  IMAPPump.incomingServer.useCondStore = true;
+  try {
+    await closeConnections();
+    await selectFolder(folder);
+    Assert.equal(folderInfo.getCharProperty("highestModSeq"), "20");
+    Assert.deepEqual(db.listAllKeys(), keys);
+    Assert.ok(
+      !(db.getMsgHdrForKey(keys[0]).flags & Ci.nsMsgMessageFlags.Marked)
+    );
+    Assert.ok(db.getMsgHdrForKey(keys[1]).flags & Ci.nsMsgMessageFlags.Marked);
+    Assert.equal(storedBody(folder, headers[0]), bytes);
+    Assert.deepEqual(
+      remote._messages.map(message => message.uid),
+      [6101, 6102]
+    );
+    Assert.equal(messages[0].message.getText(), messages[0].text);
+    const replies = sparseResponses.slice(before);
+    Assert.greater(replies.length, 0);
+    for (const reply of replies) {
+      Assert.equal(reply.length, 1);
+      Assert.ok(/^\* 2 FETCH /.test(reply[0]));
+      Assert.ok(/\bUID 6102\b/.test(reply[0]));
+    }
+    Assert.ok(
+      changedSince.some(
+        ([name, seq]) => name == folder.onlineName && seq == "10"
+      )
+    );
+  } finally {
+    sparseUids.delete(folder.onlineName);
+    modseqs.delete(folder.onlineName);
+    IMAPPump.incomingServer.useCondStore = false;
+  }
+});
+
+if (panorama) {
+  add_task(async function testSelectAllowsUnboundServerUidBeforeIngestion() {
+    const { folder, db, headers, remote } =
+      await makePendingFolder("unbound-new");
+    const keys = headers.map(header => header.messageKey);
+    const bytes = storedBody(folder, headers[0]);
+    const folderInfo = db.dBFolderInfo;
+    folderInfo.setCharProperty("highestModSeq", "10");
+    folderInfo.setUint32Property("highestRecordedUID", 6102);
+    const text =
+      "From: sender@example.invalid\r\n" +
+      "Message-ID: <unbound-new@example.invalid>\r\n" +
+      "Subject: New unbound server message\r\n\r\nNew server body.\r\n";
+    const message = new ImapMessage(
+      "data:text/plain;base64," + btoa(text),
+      6103,
+      []
+    );
+    remote.addMessage(message);
+    remote.uidnext = 6104;
+    modseqs.set(folder.onlineName, 20);
+    IMAPPump.incomingServer.useCondStore = true;
+    const before = sentCommands().length;
+    try {
+      // No native row is prepopulated for UID6103. This proves SELECT can reach
+      // header fetching, not that the separate native ingestor publishes it.
+      await closeConnections();
+      await selectFolder(folder);
+      Assert.equal(folderInfo.getCharProperty("highestModSeq"), "20");
+      Assert.deepEqual(
+        remote._messages.map(item => item.uid),
+        [6101, 6102, 6103]
+      );
+      Assert.equal(message.getText(), text);
+      for (const key of keys) {
+        Assert.ok(db.containsKey(key));
+      }
+      Assert.equal(storedBody(folder, headers[0]), bytes);
+      Assert.ok(
+        sentCommands()
+          .slice(before)
+          .some(
+            command =>
+              /^\S+ UID FETCH 6103\b/i.test(command) &&
+              /BODY\.PEEK\[HEADER|RFC822\.HEADER/i.test(command)
+          )
+      );
+    } finally {
+      modseqs.delete(folder.onlineName);
+      IMAPPump.incomingServer.useCondStore = false;
+    }
+  });
+}
+
 if (panorama) {
   add_task(async function testRemovedPendingSourceWithoutTupleFailsClosed() {
     const { folder, db, headers, remote, messages } =
       await makePendingFolder("removed-pending");
     const key = headers[0].messageKey;
+    const token = headers[0].storeToken;
+    const bytes = storedTokenBody(folder, token);
+    Assert.ok(bytes.includes("Keep this exact pending source body."));
+    const connection = nativeConnection();
+    connection.executeSimpleSQL(
+      `DELETE FROM message_properties WHERE id=${key} AND name='uidOnServer'`
+    );
     const op = queueIntent(folder, headers[0], "move");
+    headers[0].setUint32Property("uidOnServer", 6101);
+    // A later facade write must not backfill a tuple absent at creation.
+    const queuedFlags = op.newFlags;
+    op.newFlags = queuedFlags;
+    Assert.deepEqual(queuedIdentity(folder, key).slice(2), [null, null]);
     const intent = [op.operation, op.newFlags, op.destinationFolderURI];
     db.deleteMessages([key], null);
     Assert.ok(!db.containsKey(key));
@@ -401,6 +565,7 @@ if (panorama) {
       MailServices.imap.selectFolder(folder, listener, null);
       await failure;
       Assert.deepEqual(deleted, []);
+      Assert.equal(storedTokenBody(folder, token), bytes);
     } finally {
       MailServices.mfn.removeListener(notifications);
     }
@@ -472,6 +637,359 @@ if (panorama) {
     Assert.equal(op.newFlags, flags);
     Assert.equal(op.operation, Ci.nsIMsgOfflineImapOperation.kFlagsChanged);
     Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
+  });
+}
+
+function storedTokenBody(folder, token) {
+  const stream = folder.msgStore.getMsgInputStream(folder, token, 0);
+  try {
+    return NetUtil.readInputStreamToString(stream, stream.available());
+  } finally {
+    stream.close();
+  }
+}
+
+function nativeConnection() {
+  return Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  ).connectionForTests;
+}
+
+function queuedIdentity(folder, key) {
+  const statement = nativeConnection().createStatement(
+    `SELECT id,revision,epoch,uid FROM offline_operations ` +
+      `WHERE folderId=${folder.id} AND messageKey=${key}`
+  );
+  try {
+    Assert.ok(statement.executeStep());
+    const result = [0, 1, 2, 3].map(column =>
+      statement.getIsNull(column) ? null : statement.getInt64(column)
+    );
+    Assert.ok(!statement.executeStep());
+    return result;
+  } finally {
+    statement.finalize();
+  }
+}
+
+function sentCommands() {
+  return [IMAPPump.server.playTransaction()]
+    .flat()
+    .flatMap(transaction => transaction.them);
+}
+
+async function expectSelectFailure(folder, result) {
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  const failure = (async () => {
+    await Assert.rejects(
+      listener.promise,
+      error => error.message == String(result)
+    );
+  })();
+  MailServices.imap.selectFolder(folder, listener, null);
+  await failure;
+}
+
+if (panorama) {
+  add_task(async function testRemovedQueuedSourceSurvivesSelectAndReopen() {
+    const { folder, db, headers, remote, messages } =
+      await makePendingFolder("saved-source");
+    const key = headers[0].messageKey;
+    const token = headers[0].storeToken;
+    const bytes = storedTokenBody(folder, token);
+    Assert.ok(bytes.includes("Keep this exact pending source body."));
+    const op = queueIntent(folder, headers[0], "move");
+    const intent = [op.operation, op.newFlags, op.destinationFolderURI];
+    const identity = queuedIdentity(folder, key);
+    Assert.deepEqual(identity.slice(2), [7101, 6101]);
+    db.deleteMessages([key], null);
+    const added = [],
+      deleted = [];
+    const notifications = {
+      msgAdded(item) {
+        if (item.folder == folder) {
+          added.push(item.messageKey);
+        }
+      },
+      msgsDeleted(items) {
+        for (const item of items) {
+          if (item.folder == folder) {
+            deleted.push(item.messageKey);
+          }
+        }
+      },
+    };
+    MailServices.mfn.addListener(
+      notifications,
+      MailServices.mfn.msgAdded | MailServices.mfn.msgsDeleted
+    );
+    const before = sentCommands().length;
+    try {
+      for (let i = 0; i < 2; i++) {
+        await closeConnections();
+        folder.msgDatabase.forceClosed();
+        await selectFolder(folder);
+        const reopened = folder.msgDatabase.QueryInterface(
+          Ci.nsIMsgOfflineOpsDatabase
+        );
+        Assert.deepEqual(reopened.listAllKeys(), [headers[1].messageKey]);
+        Assert.deepEqual(reopened.listAllOfflineOpIds(), [key]);
+        Assert.deepEqual(queuedIdentity(folder, key), identity);
+        const retained = reopened.getOfflineOpForKey(key, false);
+        Assert.deepEqual(
+          [
+            retained.operation,
+            retained.newFlags,
+            retained.destinationFolderURI,
+          ],
+          intent
+        );
+        Assert.equal(reopened.dBFolderInfo.imapUidValidity, 7101);
+        Assert.equal(storedTokenBody(folder, token), bytes);
+        Assert.deepEqual(added, []);
+        Assert.deepEqual(deleted, []);
+        Assert.deepEqual(
+          remote._messages.map(item => item.uid),
+          [6101, 6102]
+        );
+        Assert.deepEqual(messages[0].message.flags, []);
+        Assert.equal(messages[0].message.getText(), messages[0].text);
+      }
+      const sent = sentCommands().slice(before);
+      Assert.equal(
+        sent.filter(command => /^\S+ SELECT\b/i.test(command)).length,
+        2
+      );
+      Assert.ok(
+        !sent.some(command =>
+          /^\S+ (?:UID )?(STORE|COPY|MOVE|EXPUNGE)\b/i.test(command)
+        )
+      );
+    } finally {
+      MailServices.mfn.removeListener(notifications);
+    }
+  });
+
+  for (const fault of [
+    "legacy-null",
+    "stale-epoch",
+    "collision",
+    "corrupt",
+    "read-error",
+  ]) {
+    add_task(async function testQueuedSourceRefusalPreservesCheckpoint() {
+      const { folder, db, headers, remote, messages } = await makePendingFolder(
+        `source-${fault}`
+      );
+      dump(`queued source refusal: ${fault}\n`);
+      const key = headers[0].messageKey;
+      const bytes = storedBody(folder, headers[0]);
+      const op = queueIntent(folder, headers[0], "move");
+      const intent = [op.operation, op.newFlags, op.destinationFolderURI];
+      const identity = queuedIdentity(folder, key);
+      Assert.deepEqual(identity.slice(2), [7101, 6101]);
+      const connection = nativeConnection();
+      const info = db.dBFolderInfo;
+      info.setCharProperty("highestModSeq", "10");
+      info.setUint32Property("highestRecordedUID", 6102);
+      modseqs.set(folder.onlineName, 20);
+      IMAPPump.incomingServer.useCondStore = true;
+      let restore;
+      let expected = Cr.NS_ERROR_NOT_AVAILABLE;
+      if (fault == "legacy-null" || fault == "corrupt") {
+        connection.executeSimpleSQL(
+          `UPDATE offline_operations SET epoch=NULL${fault == "legacy-null" ? ",uid=NULL" : ""} ` +
+            `WHERE folderId=${folder.id} AND messageKey=${key}`
+        );
+        if (fault == "corrupt") {
+          expected = Cr.NS_ERROR_FILE_CORRUPTED;
+        }
+        restore = () =>
+          connection.executeSimpleSQL(
+            `UPDATE offline_operations SET epoch=7101,uid=6101 ` +
+              `WHERE folderId=${folder.id} AND messageKey=${key}`
+          );
+      } else if (fault == "stale-epoch") {
+        remote.uidvalidity = 7202;
+        restore = () => {
+          remote.uidvalidity = 7101;
+        };
+      } else if (fault == "collision") {
+        // Another physical row now owns the same server location.
+        headers[0].setUint32Property("uidOnServer", 6103);
+        const collision = addPublishedFixtureHeader(
+          folder,
+          6101,
+          "collision@example.invalid",
+          messages[0].text
+        );
+        restore = () => {
+          db.deleteMessages([collision.messageKey], null);
+          headers[0].setUint32Property("uidOnServer", 6101);
+        };
+      } else {
+        // Enumeration remains available; the immutable tuple read itself fails.
+        connection.executeSimpleSQL(
+          "ALTER TABLE offline_operations RENAME TO saved_offline_operations"
+        );
+        connection.executeSimpleSQL(
+          "CREATE TEMP VIEW offline_operations AS SELECT id,revision,folderId," +
+            "messageKey,operation,newFlags,folderEpoch FROM saved_offline_operations"
+        );
+        expected = Cr.NS_ERROR_FAILURE;
+        restore = () => {
+          connection.executeSimpleSQL("DROP VIEW offline_operations");
+          connection.executeSimpleSQL(
+            "ALTER TABLE saved_offline_operations RENAME TO offline_operations"
+          );
+        };
+      }
+      const deleted = [];
+      const notifications = {
+        msgsDeleted(items) {
+          for (const item of items) {
+            if (item.folder == folder) {
+              deleted.push(item.messageKey);
+            }
+          }
+        },
+      };
+      MailServices.mfn.addListener(notifications, MailServices.mfn.msgsDeleted);
+      try {
+        for (let i = 0; i < 2; i++) {
+          await closeConnections();
+          await expectSelectFailure(folder, expected);
+          Assert.equal(info.getCharProperty("highestModSeq"), "10");
+          Assert.equal(info.imapUidValidity, 7101);
+          Assert.ok(db.containsKey(key));
+          Assert.equal(storedBody(folder, headers[0]), bytes);
+          Assert.deepEqual(deleted, []);
+          Assert.deepEqual(
+            remote._messages.map(item => item.uid),
+            [6101, 6102]
+          );
+          Assert.deepEqual(messages[0].message.flags, []);
+          Assert.equal(messages[0].message.getText(), messages[0].text);
+        }
+      } finally {
+        restore();
+        MailServices.mfn.removeListener(notifications);
+      }
+      try {
+        Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
+        Assert.deepEqual(queuedIdentity(folder, key), identity);
+        Assert.deepEqual(
+          [op.operation, op.newFlags, op.destinationFolderURI],
+          intent
+        );
+        await closeConnections();
+        await selectFolder(folder);
+        Assert.equal(info.getCharProperty("highestModSeq"), "20");
+        Assert.equal(storedBody(folder, headers[0]), bytes);
+        Assert.deepEqual(
+          db.listAllKeys(),
+          headers.map(header => header.messageKey)
+        );
+        Assert.ok(
+          changedSince.some(
+            ([name, seq]) => name == folder.onlineName && seq == "10"
+          )
+        );
+      } finally {
+        IMAPPump.incomingServer.useCondStore = false;
+        modseqs.delete(folder.onlineName);
+      }
+    });
+  }
+
+  add_task(async function testFlagWriteErrorDoesNotAdvanceCheckpoint() {
+    const { folder, db, headers } = await makePendingFolder("checkpoint-flags");
+    const key = headers[0].messageKey;
+    const bytes = storedBody(folder, headers[0]);
+    const op = queueIntent(folder, headers[0], "move");
+    const identity = queuedIdentity(folder, key);
+    const info = db.dBFolderInfo;
+    info.setCharProperty("highestModSeq", "10");
+    info.setUint32Property("highestRecordedUID", 6102);
+    modseqs.set(folder.onlineName, 20);
+    IMAPPump.incomingServer.useCondStore = true;
+    const connection = nativeConnection();
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER fail_reconcile_flags BEFORE UPDATE OF flags ON messages " +
+        `WHEN OLD.id=${key} BEGIN SELECT RAISE(ABORT,'flag update'); END`
+    );
+    try {
+      for (let i = 0; i < 2; i++) {
+        await closeConnections();
+        await expectSelectFailure(folder, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+        Assert.equal(info.getCharProperty("highestModSeq"), "10");
+        Assert.equal(storedBody(folder, headers[0]), bytes);
+        Assert.deepEqual(queuedIdentity(folder, key), identity);
+        Assert.equal(
+          op.operation,
+          Ci.nsIMsgOfflineImapOperation.kFlagsChanged |
+            Ci.nsIMsgOfflineImapOperation.kMsgMoved
+        );
+      }
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER fail_reconcile_flags");
+    }
+    try {
+      await closeConnections();
+      await selectFolder(folder);
+      Assert.equal(info.getCharProperty("highestModSeq"), "20");
+      Assert.ok(!(db.getMsgHdrForKey(key).flags & Ci.nsMsgMessageFlags.Marked));
+      Assert.equal(storedBody(folder, headers[0]), bytes);
+      Assert.deepEqual(queuedIdentity(folder, key), identity);
+    } finally {
+      IMAPPump.incomingServer.useCondStore = false;
+      modseqs.delete(folder.onlineName);
+    }
+  });
+
+  add_task(async function testCountResetErrorDoesNotAdvanceCheckpoint() {
+    const { folder, db, headers } = await makePendingFolder("checkpoint-count");
+    const info = db.dBFolderInfo;
+    info.setCharProperty("highestModSeq", "10");
+    info.setUint32Property("highestRecordedUID", 6102);
+    folder.changePendingTotal(1);
+    const bytes = storedBody(folder, headers[0]);
+    const connection = nativeConnection();
+    modseqs.set(folder.onlineName, 20);
+    IMAPPump.incomingServer.useCondStore = true;
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER fail_pending_reset BEFORE INSERT ON folder_properties " +
+        `WHEN NEW.id=${folder.id} AND NEW.name='totPendingMsgs' ` +
+        "BEGIN SELECT RAISE(ABORT,'count reset'); END"
+    );
+    try {
+      for (let i = 0; i < 2; i++) {
+        await closeConnections();
+        await expectSelectFailure(folder, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+        Assert.equal(info.getCharProperty("highestModSeq"), "10");
+        Assert.equal(storedBody(folder, headers[0]), bytes);
+        Assert.deepEqual(
+          db.listAllKeys(),
+          headers.map(header => header.messageKey)
+        );
+      }
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER fail_pending_reset");
+    }
+    try {
+      await closeConnections();
+      await selectFolder(folder);
+      Assert.equal(info.getCharProperty("highestModSeq"), "20");
+      Assert.equal(folder.numPendingTotalMessages, 0);
+      Assert.ok(
+        changedSince.some(
+          ([name, seq]) => name == folder.onlineName && seq == "10"
+        )
+      );
+    } finally {
+      IMAPPump.incomingServer.useCondStore = false;
+      modseqs.delete(folder.onlineName);
+    }
   });
 }
 

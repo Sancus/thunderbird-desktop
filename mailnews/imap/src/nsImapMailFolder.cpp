@@ -81,7 +81,6 @@
 #include "mozilla/ScopeExit.h"
 #include "mozilla/StaticPrefs_mail.h"
 #include "nsReadableUtils.h"
-#include "nsTHashSet.h"
 #include "UrlListener.h"
 #include "nsIObserverService.h"
 #include "nsIPropertyBag2.h"
@@ -2743,31 +2742,27 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
   MOZ_TRY(ResetPendingCounts());
   m_numServerRecentMessages = 0;  // clear this since we selected the folder.
 
-  if (!mDatabase) GetDatabase();
+  MOZ_TRY(GetDatabase());
+  NS_ENSURE_STATE(mDatabase);
+  ImapUid folderValidity;
+  MOZ_TRY(aSpec->GetFolder_UIDVALIDITY(&folderValidity));
+  uint64_t mailboxHighestModSeq;
+  MOZ_TRY(aSpec->GetHighestModSeq(&mailboxHighestModSeq));
+  nsTArray<ImapUid> pendingSourceUids;
+  nsTHashSet<ImapUid> removedSourceUids;
 
   bool folderSelected;
   rv = aSpec->GetFolderSelected(&folderSelected);
   NS_ENSURE_SUCCESS(rv, rv);
   nsTArray<nsMsgKey> existingKeys;
   nsTArray<nsMsgKey> keysToDelete;
-  uint32_t numNewUnread;
+  uint32_t numNewUnread = 0;
   nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
   ImapUid imapUIDValidity = 0;
   if (mDatabase) {
-    rv = mDatabase->GetDBFolderInfo(getter_AddRefs(dbFolderInfo));
-    if (NS_SUCCEEDED(rv) && dbFolderInfo) {
-      dbFolderInfo->GetImapUidValidity(&imapUIDValidity);
-      uint64_t mailboxHighestModSeq;
-      aSpec->GetHighestModSeq(&mailboxHighestModSeq);
-      MOZ_LOG(IMAP_CS, mozilla::LogLevel::Debug,
-              ("UpdateImapMailboxInfo(): Store highest MODSEQ=%" PRIu64
-               " for folder=%s",
-               mailboxHighestModSeq, m_onlineFolderName.get()));
-      char intStrBuf[40];
-      PR_snprintf(intStrBuf, sizeof(intStrBuf), "%llu", mailboxHighestModSeq);
-      dbFolderInfo->SetCharProperty(kModSeqPropertyName,
-                                    nsDependentCString(intStrBuf));
-    }
+    MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(dbFolderInfo)));
+    NS_ENSURE_STATE(dbFolderInfo);
+    MOZ_TRY(dbFolderInfo->GetImapUidValidity(&imapUIDValidity));
     rv = mDatabase->ListAllKeys(existingKeys);
     NS_ENSURE_SUCCESS(rv, rv);
     nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
@@ -2777,31 +2772,61 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
     MOZ_TRY(opsDb->ListAllOfflineDeletes(offlineDeletes));
     nsTHashSet<nsMsgKey> liveKeys;
     for (nsMsgKey key : existingKeys) liveKeys.Insert(key);
-    for (nsMsgKey key : offlineDeletes) {
-      if (!liveKeys.EnsureInserted(key)) continue;
-      // A removed Panorama source needs its saved epoch/UID, not its key.
-      // The current facade cannot supply that immutable tuple.
-      NS_ENSURE_TRUE(!mail_panorama_enabled_AtStartup(),
-                     NS_ERROR_NOT_AVAILABLE);
-      existingKeys.AppendElement(key);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup() && !offlineDeletes.IsEmpty()) {
+      uint64_t folderId;
+      MOZ_TRY(GetId(&folderId));
+      NS_ENSURE_TRUE(folderId, NS_ERROR_NOT_AVAILABLE);
+      RefPtr<mozilla::mailnews::DatabaseCore> core =
+          mozilla::mailnews::DatabaseCore::GetInstanceForService();
+      NS_ENSURE_STATE(core);
+      nsTHashSet<ImapUid> savedUids;
+      for (nsMsgKey key : offlineDeletes) {
+        mozilla::Maybe<mozilla::mailnews::ServerMessageLocation> source;
+        MOZ_TRY(
+            core->MessageDB().GetOfflineOperationSource(folderId, key, source));
+        NS_ENSURE_TRUE(source && source->folderId == folderId &&
+                           source->key == key && source->uid && source->epoch &&
+                           source->epoch == folderValidity &&
+                           source->epoch == imapUIDValidity,
+                       NS_ERROR_NOT_AVAILABLE);
+        NS_ENSURE_TRUE(savedUids.EnsureInserted(source->uid),
+                       NS_ERROR_FILE_CORRUPTED);
+        nsMsgKey boundKey;
+        nsresult lookup = core->MessageDB().GetMessageKeyForServerUid(
+            folderId, source->epoch, source->uid, boundKey);
+        if (NS_SUCCEEDED(lookup)) {
+          NS_ENSURE_TRUE(boundKey == key && liveKeys.Contains(key),
+                         NS_ERROR_NOT_AVAILABLE);
+        } else {
+          NS_ENSURE_TRUE(lookup == NS_ERROR_NOT_AVAILABLE, lookup);
+          NS_ENSURE_TRUE(!liveKeys.Contains(key), NS_ERROR_NOT_AVAILABLE);
+          removedSourceUids.Insert(source->uid);
+        }
+        pendingSourceUids.AppendElement(source->uid);
+      }
+    } else
+#endif
+    {
+      for (nsMsgKey key : offlineDeletes) {
+        if (liveKeys.EnsureInserted(key)) existingKeys.AppendElement(key);
+      }
     }
   }
-  ImapUid folderValidity;
-  aSpec->GetFolder_UIDVALIDITY(&folderValidity);
   nsCOMPtr<nsIImapFlagAndUidState> flagState;
-  aSpec->GetFlagState(getter_AddRefs(flagState));
+  MOZ_TRY(aSpec->GetFlagState(getter_AddRefs(flagState)));
 
   // remember what the supported user flags are.
   uint32_t supportedUserFlags;
-  aSpec->GetSupportedUserFlags(&supportedUserFlags);
-  SetSupportedUserFlags(supportedUserFlags);
+  MOZ_TRY(aSpec->GetSupportedUserFlags(&supportedUserFlags));
+  MOZ_TRY(SetSupportedUserFlags(supportedUserFlags));
 
   m_uidValidity = folderValidity;
 
   if (imapUIDValidity != folderValidity) {
     // Uh-oh. The server has invalidated all the old UIDs. Nothing to do
     // except ditch all the current messages and start from scratch.
-    rv = HandleUidInvalidation(folderValidity);
+    MOZ_TRY(HandleUidInvalidation(folderValidity));
     if (flagState) {
       // We'll want to download them all again.
       FindUidsToAdd({}, m_uidsToFetch, numNewUnread, flagState);
@@ -2811,7 +2836,7 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
     keysToDelete = existingKeys.Clone();
   } else {
     uint32_t boxFlags;
-    aSpec->GetBox_flags(&boxFlags);
+    MOZ_TRY(aSpec->GetBox_flags(&boxFlags));
     nsTArray<ImapUid> existingUids =
         MOZ_TRY(UidsFromMsgKeys(mDatabase, existingKeys));
     // FindUidsToDelete and FindUidsToAdd require sorted lists
@@ -2820,6 +2845,14 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
     FindUidsToDelete(existingUids, uidsToDelete, flagState, boxFlags);
     keysToDelete = MOZ_TRY(MsgKeysFromUids(mDatabase, uidsToDelete));
 
+    // Suppress retired queued sources only after deciding which LIVE rows
+    // the server removed. They must never enter the deletion/key lookup set.
+    nsTHashSet<ImapUid> knownUids;
+    for (ImapUid uid : existingUids) knownUids.Insert(uid);
+    for (ImapUid uid : pendingSourceUids) {
+      if (knownUids.EnsureInserted(uid)) existingUids.AppendElement(uid);
+    }
+    existingUids.Sort();
     // if this is the result of an expunge then don't grab headers
     if (!(boxFlags & kJustExpunged))
       FindUidsToAdd(existingUids, m_uidsToFetch, numNewUnread, flagState);
@@ -2827,7 +2860,7 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
 
   if (!keysToDelete.IsEmpty() && mDatabase) {
     nsTArray<RefPtr<nsIMsgDBHdr>> hdrsToDelete;
-    MsgGetHeadersFromKeys(mDatabase, keysToDelete, hdrsToDelete);
+    MOZ_TRY(MsgGetHeadersFromKeys(mDatabase, keysToDelete, hdrsToDelete));
     // Notify nsIMsgFolderListeners of a mass delete, but only if we actually
     // have headers
     if (!hdrsToDelete.IsEmpty()) {
@@ -2837,14 +2870,15 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
     }
     DeleteStoreMessages(hdrsToDelete);
     EnableNotifications(nsIMsgFolder::allMessageCountNotifications, false);
-    mDatabase->DeleteMessages(keysToDelete, nullptr);
+    nsresult deleteRv = mDatabase->DeleteMessages(keysToDelete, nullptr);
     EnableNotifications(nsIMsgFolder::allMessageCountNotifications, true);
+    NS_ENSURE_SUCCESS(deleteRv, deleteRv);
   }
   int32_t numUnreadFromServer;
-  aSpec->GetNumUnseenMessages(&numUnreadFromServer);
+  MOZ_TRY(aSpec->GetNumUnseenMessages(&numUnreadFromServer));
 
-  bool partialUIDFetch;
-  flagState->GetPartialUIDFetch(&partialUIDFetch);
+  bool partialUIDFetch = false;
+  if (flagState) MOZ_TRY(flagState->GetPartialUIDFetch(&partialUIDFetch));
 
   // For partial UID fetches (i.e., occurs when CONDSTORE in effect), we can
   // only trust the numUnread from the server. However, even that will only be
@@ -2852,7 +2886,7 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
   // numUnreadFromServer greater than -1.
   if (partialUIDFetch) numNewUnread = numUnreadFromServer;
 
-  SyncFlags(flagState);
+  if (flagState) MOZ_TRY(SyncFlags(flagState, removedSourceUids));
   // Syncing the flags may mark a formerly new message read, which resets the
   // new-message count through SetBiffState(nsMsgBiffState_NoMail). Set the
   // count only after the flags, so it survives until HeaderFetchCompleted()
@@ -2871,7 +2905,7 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
   if (mDatabase && numUnreadFromServer > -1 &&
       (int32_t)(mNumUnreadMessages + m_uidsToFetch.Length()) >
           numUnreadFromServer)
-    mDatabase->SyncCounts();
+    MOZ_TRY(mDatabase->SyncCounts());
 
   if (!m_uidsToFetch.IsEmpty() && aProtocol)
     PrepareToAddHeadersToMailDB(aProtocol);
@@ -2882,19 +2916,26 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
       ProgressStatusString(aProtocol, "imapNoNewMessages"_ns, ""_ns);
     SetPerformingBiff(false);
   }
-  aSpec->GetNumMessages(&m_numServerTotalMessages);
+  MOZ_TRY(aSpec->GetNumMessages(&m_numServerTotalMessages));
   if (numUnreadFromServer > -1) m_numServerUnseenMessages = numUnreadFromServer;
-  aSpec->GetNumRecentMessages(&m_numServerRecentMessages);
+  MOZ_TRY(aSpec->GetNumRecentMessages(&m_numServerRecentMessages));
 
   // some servers don't return UIDNEXT on SELECT - don't crunch
   // existing values in that case.
   ImapUid nextUID;
-  aSpec->GetNextUID(&nextUID);
+  MOZ_TRY(aSpec->GetNextUID(&nextUID));
   if (nextUID != 0) {
     m_nextUID = nextUID;
   }
 
-  return rv;
+  // UID invalidation can replace the database. Checkpoint only the current
+  // database after the checked reconciliation and count stages succeed.
+  MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(dbFolderInfo)));
+  NS_ENSURE_STATE(dbFolderInfo);
+  nsAutoCString modseq;
+  modseq.AppendInt(mailboxHighestModSeq);
+  MOZ_TRY(dbFolderInfo->SetCharProperty(kModSeqPropertyName, modseq));
+  return NS_OK;
 }
 
 // Helper to handle UIDVALIDITY change on the server.
@@ -5006,11 +5047,13 @@ nsresult nsImapMailFolder::HandleCustomFlags(nsMsgKey msgKey,
 }
 
 // synchronize the message flags in the database with the server flags
-nsresult nsImapMailFolder::SyncFlags(nsIImapFlagAndUidState* flagState) {
+nsresult nsImapMailFolder::SyncFlags(
+    nsIImapFlagAndUidState* flagState,
+    const nsTHashSet<ImapUid>& removedSourceUids) {
   nsresult rv = GetDatabase();  // we need a database for this
   NS_ENSURE_SUCCESS(rv, rv);
   bool partialUIDFetch;
-  flagState->GetPartialUIDFetch(&partialUIDFetch);
+  MOZ_TRY(flagState->GetPartialUIDFetch(&partialUIDFetch));
 
   // update all of the database flags
   int32_t messageIndex;
@@ -5020,17 +5063,26 @@ nsresult nsImapMailFolder::SyncFlags(nsIImapFlagAndUidState* flagState) {
   // partial (condstore) fetch.
   int64_t newFolderSize = 0;
 
-  flagState->GetNumberOfMessages(&messageIndex);
+  MOZ_TRY(flagState->GetNumberOfMessages(&messageIndex));
 
   uint16_t supportedUserFlags;
-  flagState->GetSupportedUserFlags(&supportedUserFlags);
+  MOZ_TRY(flagState->GetSupportedUserFlags(&supportedUserFlags));
 
   for (int32_t flagIndex = 0; flagIndex < messageIndex; flagIndex++) {
     ImapUid uidOfMessage;
-    flagState->GetUidOfMessage(flagIndex, &uidOfMessage);
+    MOZ_TRY(flagState->GetUidOfMessage(flagIndex, &uidOfMessage));
     imapMessageFlagsType flags;
-    flagState->GetMessageFlags(flagIndex, &flags);
-    nsMsgKey msgKey = MOZ_TRY(MsgKeyFromUid(mDatabase, uidOfMessage));
+    MOZ_TRY(flagState->GetMessageFlags(flagIndex, &flags));
+    // Sparse CHANGEDSINCE responses leave zero-filled sequence gaps.
+    if (!uidOfMessage || removedSourceUids.Contains(uidOfMessage)) continue;
+    auto keyLookup = MsgKeyFromUid(mDatabase, uidOfMessage);
+    if (keyLookup.isErr()) {
+      nsresult lookupRv = keyLookup.unwrapErr();
+      // New server messages have no physical row until header ingestion.
+      if (lookupRv == NS_ERROR_NOT_AVAILABLE) continue;
+      return lookupRv;
+    }
+    nsMsgKey msgKey = keyLookup.unwrap();
     // if we don't have the header, don't diddle the flags.
     // GetMsgHdrForKey will create the header if it doesn't exist.
     if (msgKey == nsMsgKey_None) {
@@ -5045,12 +5097,10 @@ nsresult nsImapMailFolder::SyncFlags(nsIImapFlagAndUidState* flagState) {
     }
 
     nsCString keywords;
-    if (NS_SUCCEEDED(
-            flagState->GetCustomFlags(uidOfMessage, getter_Copies(keywords)))) {
-      HandleCustomFlags(msgKey, dbHdr, supportedUserFlags, keywords);
-    }
+    MOZ_TRY(flagState->GetCustomFlags(uidOfMessage, getter_Copies(keywords)));
+    MOZ_TRY(HandleCustomFlags(msgKey, dbHdr, supportedUserFlags, keywords));
 
-    NotifyMessageFlagsFromHdr(dbHdr, msgKey, flags);
+    MOZ_TRY(NotifyMessageFlagsFromHdr(dbHdr, msgKey, flags));
   }
   if (!partialUIDFetch && newFolderSize != mFolderSize) {
     int64_t oldFolderSize = mFolderSize;
@@ -5078,19 +5128,22 @@ nsresult nsImapMailFolder::NotifyMessageFlagsFromHdr(nsIMsgDBHdr* dbHdr,
   nsCOMPtr<nsIMsgDatabase> database(mDatabase);
   NS_ENSURE_STATE(database);
 
-  database->MarkRead(msgKey, (flags & kImapMsgSeenFlag) != 0, nullptr);
-  database->MarkReplied(msgKey, (flags & kImapMsgAnsweredFlag) != 0, nullptr);
-  database->MarkMarked(msgKey, (flags & kImapMsgFlaggedFlag) != 0, nullptr);
-  database->MarkImapDeleted(msgKey, (flags & kImapMsgDeletedFlag) != 0,
-                            nullptr);
+  MOZ_TRY(database->MarkRead(msgKey, (flags & kImapMsgSeenFlag) != 0, nullptr));
+  MOZ_TRY(database->MarkReplied(msgKey, (flags & kImapMsgAnsweredFlag) != 0,
+                                nullptr));
+  MOZ_TRY(database->MarkMarked(msgKey, (flags & kImapMsgFlaggedFlag) != 0,
+                               nullptr));
+  MOZ_TRY(database->MarkImapDeleted(msgKey, (flags & kImapMsgDeletedFlag) != 0,
+                                    nullptr));
 
   uint32_t supportedFlags;
-  GetSupportedUserFlags(&supportedFlags);
+  MOZ_TRY(GetSupportedUserFlags(&supportedFlags));
   if (supportedFlags & kImapMsgSupportForwardedFlag)
-    database->MarkForwarded(msgKey, (flags & kImapMsgForwardedFlag) != 0,
-                            nullptr);
+    MOZ_TRY(database->MarkForwarded(
+        msgKey, (flags & kImapMsgForwardedFlag) != 0, nullptr));
   if (supportedFlags & kImapMsgSupportMDNSentFlag)
-    database->MarkMDNSent(msgKey, (flags & kImapMsgMDNSentFlag) != 0, nullptr);
+    MOZ_TRY(database->MarkMDNSent(msgKey, (flags & kImapMsgMDNSentFlag) != 0,
+                                  nullptr));
 
   return NS_OK;
 }
@@ -5104,27 +5157,18 @@ nsImapMailFolder::NotifyMessageFlags(uint32_t aFlags,
                                      ImapUid aMsgUid, uint64_t aHighestModSeq) {
   if (NS_SUCCEEDED(GetDatabase()) && mDatabase) {
     bool msgDeleted = aFlags & kImapMsgDeletedFlag;
-    if (aHighestModSeq || msgDeleted) {
+    // A FETCH may still be followed by a failed reconciliation. Persist the
+    // SELECT checkpoint only in UpdateImapMailboxInfo after that stage
+    // succeeds.
+    if (msgDeleted) {
       nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
-      mDatabase->GetDBFolderInfo(getter_AddRefs(dbFolderInfo));
+      MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(dbFolderInfo)));
       if (dbFolderInfo) {
-        if (aHighestModSeq) {
-          char intStrBuf[40];
-          PR_snprintf(intStrBuf, sizeof(intStrBuf), "%llu", aHighestModSeq);
-          MOZ_LOG(IMAP_CS, mozilla::LogLevel::Debug,
-                  ("NotifyMessageFlags(): Store highest MODSEQ=%" PRIu64
-                   " for folder=%s",
-                   aHighestModSeq, m_onlineFolderName.get()));
-          dbFolderInfo->SetCharProperty(kModSeqPropertyName,
-                                        nsDependentCString(intStrBuf));
-        }
-        if (msgDeleted) {
-          uint32_t oldDeletedCount;
-          dbFolderInfo->GetUint32Property(kDeletedHdrCountPropertyName, 0,
-                                          &oldDeletedCount);
-          dbFolderInfo->SetUint32Property(kDeletedHdrCountPropertyName,
-                                          oldDeletedCount + 1);
-        }
+        uint32_t oldDeletedCount;
+        dbFolderInfo->GetUint32Property(kDeletedHdrCountPropertyName, 0,
+                                        &oldDeletedCount);
+        dbFolderInfo->SetUint32Property(kDeletedHdrCountPropertyName,
+                                        oldDeletedCount + 1);
       }
     }
     nsCOMPtr<nsIMsgDBHdr> dbHdr;

@@ -24,6 +24,7 @@
 #include "nsIMsgFilterPlugin.h"
 #include "nsIMsgWindow.h"
 #include "nsTHashMap.h"
+#include "nsTHashSet.h"
 #include "nsITimer.h"
 #include "nsAutoSyncState.h"
 
@@ -388,7 +389,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
   void PrepareToAddHeadersToMailDB(nsIImapProtocol* aProtocol);
   void TweakHeaderFlags(nsIImapProtocol* aProtocol, nsIMsgDBHdr* tweakMe);
 
-  nsresult SyncFlags(nsIImapFlagAndUidState* flagState);
+  nsresult SyncFlags(nsIImapFlagAndUidState* flagState,
+                     const nsTHashSet<ImapUid>& removedSourceUids);
   nsresult HandleCustomFlags(nsMsgKey msgKey, nsIMsgDBHdr* dbHdr,
                              uint16_t userFlags, nsCString& keywords);
   nsresult NotifyMessageFlagsFromHdr(nsIMsgDBHdr* dbHdr, nsMsgKey msgKey,

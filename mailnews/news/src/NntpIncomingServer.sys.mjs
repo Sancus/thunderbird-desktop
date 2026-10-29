@@ -371,20 +371,20 @@ export class NntpIncomingServer extends MsgIncomingServer {
         prefix = "";
         suffix = ".rc";
       }
-      this._newsrcFilePath = this.newsrcRootPath;
-      this._newsrcFilePath.append(`${prefix}${this.hostname}${suffix}`);
-      this._newsrcFilePath.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
-      this.newsrcFilePath = this._newsrcFilePath;
+      const file = this.newsrcRootPath;
+      file.append(`${prefix}${this.hostname}${suffix}`);
+      file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
+      this.newsrcFilePath = file;
     }
     return this._newsrcFilePath;
   }
 
   set newsrcFilePath(value) {
-    this._newsrcFilePath = value;
-    if (!this._newsrcFilePath.exists) {
-      this._newsrcFilePath.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
+    if (!value.exists()) {
+      value.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
     }
-    this.setFileValue("newsrc.file-rel", "newsrc.file", this._newsrcFilePath);
+    this.setFileValue("newsrc.file-rel", "newsrc.file", value);
+    this._newsrcFilePath = value;
   }
 
   addNewsgroupToList(name) {

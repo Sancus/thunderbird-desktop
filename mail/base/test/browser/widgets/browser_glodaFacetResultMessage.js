@@ -20,6 +20,13 @@ add_setup(async function () {
   doc = win.document;
   await win.customElements.whenDefined("facet-result-message");
 
+  // The facet host supplies this context before any result cards are built.
+  win.FacetContext = {
+    collection: {},
+    hoverFacet() {},
+    unhoverFacet() {},
+  };
+
   registerCleanupFunction(() => {
     tabmail.closeOtherTabs(tabmail.tabInfo[0]);
   });
@@ -220,11 +227,7 @@ function renderSnippet(body, offsets) {
     id: 1,
     indexedBodyText: body,
   };
-  win.FacetContext = {
-    collection: { stashedColumns: { 1: [offsets] } },
-    hoverFacet() {},
-    unhoverFacet() {},
-  };
+  win.FacetContext.collection = { stashedColumns: { 1: [offsets] } };
   registerCleanupFunction(() => element.remove());
   doc.body.appendChild(element);
   return element;

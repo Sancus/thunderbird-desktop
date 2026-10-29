@@ -62,16 +62,16 @@ namespace mozilla::mailnews {
 class LiveViewBatchCapability final {
  public:
   NS_INLINE_DECL_REFCOUNTING(LiveViewBatchCapability)
-  LiveViewBatchCapability(JSContext* cx, JS::HandleObject receiver,
-                          JS::HandleObject owner, JS::HandleValue invalidate,
+  LiveViewBatchCapability(JSContext* cx, JS::Handle<JSObject*> receiver,
+                          JS::Handle<JSObject*> owner, JS::Handle<JS::Value> invalidate,
                           uint64_t generation)
       : object(cx, receiver),
         owner(cx, owner),
         invalidator(cx, invalidate),
         generation(generation) {}
-  JS::PersistentRootedObject object;
-  JS::PersistentRootedObject owner;
-  JS::PersistentRootedValue invalidator;
+  JS::PersistentRooted<JSObject*> object;
+  JS::PersistentRooted<JSObject*> owner;
+  JS::PersistentRooted<JS::Value> invalidator;
   const uint64_t generation;
 
  private:
@@ -112,7 +112,7 @@ class PreparedLiveViewThreadBatch final : public nsISupports {
   uint64_t attachment = 0, query = 0, configuration = 0, delivery = 0;
   nsCOMPtr<CapturedLiveView> before;
   bool hasPayload = false;
-  JS::PersistentRootedValue value;
+  JS::PersistentRooted<JS::Value> value;
 
  private:
   ~PreparedLiveViewThreadBatch() = default;
@@ -184,7 +184,7 @@ static nsresult ReadBatchCapability(nsILiveViewListener* listener,
   return output ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
 }
 
-static bool BatchString(JSContext* cx, JS::HandleObject object,
+static bool BatchString(JSContext* cx, JS::Handle<JSObject*> object,
                         const char* name, const nsACString& text) {
   Rooted<JSString*> string(
       cx, JS_NewStringCopyUTF8N(
@@ -193,26 +193,26 @@ static bool BatchString(JSContext* cx, JS::HandleObject object,
          JS_DefineProperty(cx, object, name, string, JSPROP_ENUMERATE);
 }
 
-static bool BatchNumber(JSContext* cx, JS::HandleObject object,
+static bool BatchNumber(JSContext* cx, JS::Handle<JSObject*> object,
                         const char* name, double number) {
   return JS_DefineProperty(cx, object, name, number, JSPROP_ENUMERATE);
 }
 
-static bool BatchBoolean(JSContext* cx, JS::HandleObject object,
+static bool BatchBoolean(JSContext* cx, JS::Handle<JSObject*> object,
                          const char* name, bool flag) {
   Rooted<Value> value(cx, JS::BooleanValue(flag));
   return JS_DefineProperty(cx, object, name, value, JSPROP_ENUMERATE);
 }
 
 static bool BatchPair(JSContext* cx, const CapturedMessage& row,
-                      JS::MutableHandleObject result) {
+                      JS::MutableHandle<JSObject*> result) {
   result.set(JS_NewPlainObject(cx));
   return result && BatchNumber(cx, result, "folderId", double(row.folderId)) &&
          BatchNumber(cx, result, "id", row.id);
 }
 
 static bool BatchMessage(JSContext* cx, const CapturedMessage& row,
-                         JS::MutableHandleObject result) {
+                         JS::MutableHandle<JSObject*> result) {
   auto date = TimeClip(row.date / PR_USEC_PER_MSEC);
   if (!row.id || row.id == nsMsgKey_None || !row.folderId ||
       row.folderId > 9007199254740991ULL || !date.isValid()) {
@@ -527,7 +527,7 @@ class LiveViewThreadBatchBuilder {
   }
 
   bool Serialize(JSContext* cx, uint64_t generation,
-                 JS::MutableHandleObject result) {
+                 JS::MutableHandle<JSObject*> result) {
     result.set(JS_NewPlainObject(cx));
     Rooted<JSObject*> rowArray(cx, NewArrayObject(cx, 0));
     Rooted<JSObject*> components(cx, JS_NewPlainObject(cx));
@@ -600,7 +600,7 @@ class LiveViewThreadBatchBuilder {
   }
 
   bool SerializeGroup(JSContext* cx, const Group& group, bool after,
-                      JS::MutableHandleObject result) {
+                      JS::MutableHandle<JSObject*> result) {
     result.set(JS_NewPlainObject(cx));
     Rooted<JSObject*> key(cx, JS_NewPlainObject(cx));
     Rooted<JSObject*> members(cx, NewArrayObject(cx, 0));
@@ -770,7 +770,7 @@ nsresult LiveView::CaptureThreadViewBeforeInsert(
 }
 
 static bool SerializeCapturedView(JSContext* cx, CapturedLiveView& captured,
-                                  JS::MutableHandleObject output,
+                                  JS::MutableHandle<JSObject*> output,
                                   bool includeDisplay = true) {
   output.set(JS_NewPlainObject(cx));
   Rooted<JSObject*> roots(cx, NewArrayObject(cx, 0));

@@ -47,12 +47,14 @@ add_setup(async () => {
     password,
   });
   ewsServer.start();
+  registerCleanupFunction(() => ewsServer.stop());
 
   graphServer = new GraphServer({
     username,
     password,
   });
   graphServer.start();
+  registerCleanupFunction(() => graphServer.stop());
 
   // Create and initialize the outgoing servers.
   ewsOutgoingServer = MailServices.outgoingServer.createServer("ews");
@@ -89,8 +91,6 @@ add_setup(async () => {
   await storePassword("graph://127.0.0.1");
 
   registerCleanupFunction(async () => {
-    ewsServer.stop();
-    graphServer.stop();
     MailServices.outgoingServer.deleteServer(ewsOutgoingServer);
     MailServices.outgoingServer.deleteServer(graphOutgoingServer);
     await Services.logins.removeAllLoginsAsync();

@@ -327,6 +327,7 @@ add_task(async function test_telemetry_graph() {
   // Create a new mock Graph server, and start it.
   const graphServer = new GraphServer();
   graphServer.start();
+  registerCleanupFunction(() => graphServer.stop());
 
   // Create and configure 5 Graph incoming servers.
   const graphIncomingServers = [];
@@ -351,6 +352,4 @@ add_task(async function test_telemetry_graph() {
     5,
     "Glean should have recorded 5 graph servers."
   );
-
-  graphServer.stop();
 });

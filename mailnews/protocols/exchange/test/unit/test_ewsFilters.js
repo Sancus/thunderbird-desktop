@@ -23,6 +23,7 @@ add_setup(async () => {
 
   ewsServer = new EwsServer();
   ewsServer.start();
+  registerCleanupFunction(() => ewsServer.stop());
 
   // Create and configure the EWS incoming server.
   incomingServer = localAccountUtils.create_incoming_server(
@@ -36,10 +37,17 @@ add_setup(async () => {
     "ews_url",
     `http://127.0.0.1:${ewsServer.port}/EWS/Exchange.asmx`
   );
-  await syncFolder(incomingServer, incomingServer.rootFolder);
-  registerCleanupFunction(() => {
-    ewsServer.stop();
+  const exchangeServer = incomingServer.QueryInterface(
+    Ci.IExchangeIncomingServer
+  );
+  registerCleanupFunction(async () => {
+    incomingServer.shutdown();
+    await TestUtils.waitForCondition(
+      () => !exchangeServer.protocolClientRunning,
+      "waiting for the EWS client to shut down"
+    );
   });
+  await syncFolder(incomingServer, incomingServer.rootFolder);
 });
 
 /**

@@ -140,3 +140,30 @@ export function getMailBodyText(bodyLines) {
   });
   return text;
 }
+
+/**
+ * Returns an ordinary-mail snippet and its source subject metadata.
+ * Removes quoted replies and their lead-ins using the mail content whittler.
+ *
+ * @param {MimeMessage} mimeMessage - Decoded MIME tree.
+ * @param {?nsIMsgFolder} folder - HTML conversion folder; plaintext permits null.
+ * @param {number} [length] - Snippet limit in UTF-16 code units, including ellipsis.
+ * @returns {[string, {subject: ?string}]} Snippet and metadata; no author override.
+ * @throws {Error} Original MIME conversion errors.
+ */
+export function mimeMsgToContentSnippetAndMeta(mimeMessage, folder, length) {
+  let text = getMailBodyText(
+    mimeMessage.coerceBodyToPlaintext(folder).split(/\r?\n/)
+  );
+  if (length + 1) {
+    text = text.substring(0, length + 1);
+  }
+  if (length && text.length > length) {
+    let end = length - 1;
+    if (text.codePointAt(end - 1) > 0xffff) {
+      end--;
+    }
+    text = text.substring(0, end) + "…";
+  }
+  return [text, { subject: mimeMessage.get("subject") }];
+}

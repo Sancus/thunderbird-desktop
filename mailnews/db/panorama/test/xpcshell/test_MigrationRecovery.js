@@ -91,9 +91,10 @@ async function lockedProfile() {
  * Only the existing genuine MSF/body inputs are copied; no legacy encoder runs.
  *
  * @param {string} [state="prepared"] - Prepared, restore-required or active selector.
+ * @param {boolean} [externalStore=false] - Include an independent external mail root.
  * @returns {Promise<object>} Held profile and real persisted recovery inputs.
  */
-async function recoveryInput(state = "prepared") {
+async function recoveryInput(state = "prepared", externalStore = false) {
   const input = await lockedProfile();
   const profilePath = input.lock.directory.path;
   const source = PathUtils.join(profilePath, "Inbox.msf");
@@ -102,38 +103,62 @@ async function recoveryInput(state = "prepared") {
   await IOUtils.copy(do_get_file("data/migration").path, body);
   const journalPath = PathUtils.join(input.root, "journal.json");
   const backupPath = PathUtils.join(input.root, "backup");
+  const mailPaths = [];
+  const sources = [
+    { id: "folder-source", path: source, destinationFolderId: 9 },
+  ];
+  let externalSource, externalBody;
+  if (externalStore) {
+    const mail = PathUtils.join(input.root, "external-mail");
+    await IOUtils.makeDirectory(mail);
+    externalSource = PathUtils.join(mail, "Inbox.msf");
+    externalBody = PathUtils.join(mail, "Inbox");
+    await IOUtils.copy(do_get_file("data/migration.msf").path, externalSource);
+    await IOUtils.copy(do_get_file("data/migration").path, externalBody);
+    mailPaths.push(mail);
+    sources.push({
+      id: "external-folder-source",
+      path: externalSource,
+      destinationFolderId: 10,
+    });
+  }
+  for (const entry of sources) {
+    entry.size = (await IOUtils.stat(entry.path)).size;
+    entry.sha256 = await IOUtils.computeHexDigest(entry.path, "sha256");
+    entry.messageKeys = [1, 3];
+    entry.databaseSourceId = "unit-database-incarnation";
+  }
   const journal = await MigrationJournal.create(journalPath, {
     profilePath,
-    mailPaths: [],
+    mailPaths,
     backupPath,
-    sources: [
-      {
-        id: "folder-source",
-        path: source,
-        size: (await IOUtils.stat(source)).size,
-        sha256: await IOUtils.computeHexDigest(source, "sha256"),
-        messageKeys: [1, 3],
-        destinationFolderId: 9,
-        databaseSourceId: "unit-database-incarnation",
-      },
-    ],
+    sources,
   });
   let snapshot;
   try {
     await journal.recordBackup(
-      await createMigrationBackup(profilePath, [], backupPath)
+      await createMigrationBackup(profilePath, mailPaths, backupPath)
     );
-    const token = await journal.beginImport("folder-source");
-    await journal.recordImport("folder-source", {
-      token,
-      sourceSha256: await IOUtils.computeHexDigest(source, "sha256"),
-      sourcePhysicalIdentity: journal.state.sources[0].physicalIdentity,
-      folderId: 9,
-      keys: [
-        [1, 401],
-        [3, 700],
-      ],
-    });
+    for (const entry of sources) {
+      const token = await journal.beginImport(entry.id);
+      const recorded = journal.state.sources.find(item => item.id == entry.id);
+      await journal.recordImport(entry.id, {
+        token,
+        sourceSha256: entry.sha256,
+        sourcePhysicalIdentity: recorded.physicalIdentity,
+        folderId: entry.destinationFolderId,
+        keys:
+          entry.id == "folder-source"
+            ? [
+                [1, 401],
+                [3, 700],
+              ]
+            : [
+                [1, 900],
+                [3, 901],
+              ],
+      });
+    }
     await journal.finishStage("import");
     await journal.finishStage("validate");
     if (state != "prepared") {
@@ -154,19 +179,26 @@ async function recoveryInput(state = "prepared") {
         profilePath: snapshot.profilePath,
         journalPath,
         backup: snapshot.backup,
-        imports: [
-          {
-            id: "folder-source",
-            token: snapshot.sources[0].token,
-            sha256: snapshot.sources[0].sha256,
-            folderId: 9,
-          },
-        ],
+        imports: snapshot.sources.map(entry => ({
+          id: entry.id,
+          token: entry.token,
+          sha256: entry.sha256,
+          folderId: entry.destinationFolderId,
+        })),
       },
     },
     { mode: "create" }
   );
-  return { ...input, source, body, marker, journalPath, backupPath };
+  return {
+    ...input,
+    source,
+    body,
+    marker,
+    journalPath,
+    backupPath,
+    externalSource,
+    externalBody,
+  };
 }
 
 add_task(async function test_requiresAProfileLock() {
@@ -513,6 +545,146 @@ add_task(
     const recorded = await IOUtils.readJSON(input.marker);
     Assert.equal(recorded.state, "restore-required");
     Assert.deepEqual(recorded.identity, result.profile.record.identity);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_lockedRestoreIncludesExternalMailRoot() {
+    const input = await recoveryInput("prepared", true);
+    const before = await inspectMigrationRecovery(input.lock);
+    Assert.equal(before.journal.sources.length, 2);
+    const journal = await IOUtils.read(input.journalPath);
+    const original = await IOUtils.read(input.externalBody);
+    const summary = await IOUtils.read(input.externalSource);
+    const later = new TextEncoder().encode("later external mail stays live");
+    await IOUtils.write(input.externalBody, later);
+    const parent = PathUtils.join(input.root, "restore-staging");
+    await IOUtils.makeDirectory(parent);
+    const result = await stageInterruptedMigrationRestore(input.lock, parent);
+    Assert.equal(result.roots.length, 2);
+    const external = new FileUtils.File(PathUtils.parent(input.externalBody));
+    external.normalize();
+    const root = result.roots.find(entry => entry.original == external.path);
+    Assert.ok(root, "The selected external root has its own restore mapping");
+    Assert.ok(
+      new FileUtils.File(result.path).contains(new FileUtils.File(root.staged))
+    );
+    Assert.notEqual(root.staged, external.path);
+    Assert.deepEqual(
+      await IOUtils.read(PathUtils.join(root.staged, "Inbox")),
+      original
+    );
+    Assert.deepEqual(
+      await IOUtils.read(PathUtils.join(root.staged, "Inbox.msf")),
+      summary
+    );
+    Assert.deepEqual(await IOUtils.read(input.externalBody), later);
+    Assert.deepEqual(await IOUtils.read(input.externalSource), summary);
+    Assert.deepEqual(await IOUtils.read(input.journalPath), journal);
+    Assert.deepEqual(result.journal, before.journal);
+    Assert.deepEqual(
+      result.profile.record.identity,
+      before.profile.record.identity
+    );
+    Assert.equal(result.profile.state, "restore-required");
+    Assert.ok(input.lock.directory.equals(input.profile.rootDir));
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_restoreCopyFailureRetainsOriginalsAndRetries() {
+    const { sinon } = ChromeUtils.importESModule(
+      "resource://testing-common/Sinon.sys.mjs"
+    );
+    const input = await recoveryInput();
+    const originals = new Map();
+    for (const path of [
+      input.marker,
+      input.journalPath,
+      input.source,
+      input.body,
+      PathUtils.join(input.backupPath, "manifest.json"),
+      PathUtils.join(input.backupPath, "root-0", "Inbox.msf"),
+      PathUtils.join(input.backupPath, "root-0", "Inbox"),
+    ]) {
+      originals.set(path, await IOUtils.read(path));
+    }
+    const parent = PathUtils.join(input.root, "restore-staging");
+    await IOUtils.makeDirectory(parent);
+    const backupIO = Cu.getGlobalForObject(createMigrationBackup).IOUtils;
+    const realCopy = backupIO.copy.bind(backupIO);
+    let copied;
+    let copyError;
+    let copies = 0;
+    const copy = sinon.stub(backupIO, "copy").callsFake(async (...args) => {
+      copies++;
+      await realCopy(...args);
+      copied = { source: args[0], destination: args[1] };
+      try {
+        // Reach a real filesystem error after completing one restore copy.
+        await realCopy(args[0], args[1], { noOverwrite: true });
+      } catch (error) {
+        copyError = error;
+        throw error;
+      }
+    });
+    try {
+      await Assert.rejects(
+        stageInterruptedMigrationRestore(input.lock, parent),
+        error => error === copyError,
+        "The first native copy error reaches the restore caller"
+      );
+    } finally {
+      copy.restore();
+    }
+    Assert.ok(copyError, "The real no-overwrite operation failed");
+    Assert.equal(copies, 1, "Stop after the first failed copy");
+    const failed = await IOUtils.getChildren(parent);
+    Assert.equal(failed.length, 1, "The failed staging directory is retained");
+    const staged = new FileUtils.File(failed[0]);
+    staged.normalize();
+    Assert.ok(staged.contains(new FileUtils.File(copied.destination)));
+    Assert.deepEqual(
+      await IOUtils.read(copied.destination),
+      await IOUtils.read(copied.source),
+      "The completed copy is retained after failure"
+    );
+    for (const [path, bytes] of originals) {
+      Assert.deepEqual(await IOUtils.read(path), bytes);
+    }
+    Assert.ok(input.lock.directory.equals(input.profile.rootDir));
+
+    const result = await stageInterruptedMigrationRestore(input.lock, parent);
+    Assert.equal(result.profile.state, "restore-required");
+    Assert.notEqual(result.path, staged.path, "Retry uses fresh staging");
+    Assert.equal((await IOUtils.getChildren(parent)).length, 2);
+    Assert.equal(result.roots.length, 1);
+    Assert.equal(result.roots[0].original, result.journal.profilePath);
+    for (const [leaf, original] of [
+      ["Inbox.msf", input.source],
+      ["Inbox", input.body],
+    ]) {
+      Assert.deepEqual(
+        await IOUtils.read(PathUtils.join(result.roots[0].staged, leaf)),
+        originals.get(original)
+      );
+    }
+    Assert.deepEqual(await IOUtils.readJSON(input.marker), {
+      ...JSON.parse(new TextDecoder().decode(originals.get(input.marker))),
+      state: "restore-required",
+    });
+    for (const [path, bytes] of originals) {
+      if (path != input.marker) {
+        Assert.deepEqual(await IOUtils.read(path), bytes);
+      }
+    }
+    Assert.deepEqual(
+      await IOUtils.read(copied.destination),
+      await IOUtils.read(copied.source)
+    );
+    Assert.ok(input.lock.directory.equals(input.profile.rootDir));
   }
 );
 

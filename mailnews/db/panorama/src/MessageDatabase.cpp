@@ -1362,9 +1362,10 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       nsCOMPtr<mozIStorageStatement> parent;
       MOZ_TRY(
           DatabaseCore::GetStatement("FindStagedMessageParent"_ns,
-                                     "SELECT id,threadId FROM messages WHERE "
-                                     "messageId=:token COLLATE BINARY "
-                                     "AND id<>:key ORDER BY id LIMIT 1"_ns,
+                                     "SELECT m.id,m.threadId FROM messages m "
+                                     "JOIN folders f ON f.id=m.folderId WHERE "
+                                     "m.messageId=:token COLLATE BINARY "
+                                     "AND m.id<>:key ORDER BY m.id LIMIT 1"_ns,
                                      getter_AddRefs(parent)));
       for (uint32_t ordinal = header.references.Length(); ordinal;) {
         const auto& token = header.references[--ordinal];
@@ -3496,15 +3497,14 @@ nsresult MessageDatabase::GetMessageForMessageID(uint64_t aFolderId,
   return NS_OK;
 }
 
-// TODO: This is a quick hack.
-// Doesn't take into account various corner cases (eg multiple
-// messages with same message-id!).
+// Retired folders retain message history, but cannot supply new parents.
 Result<nsMsgKey, nsresult> MessageDatabase::FindByMessageId(
     nsACString const& messageId) {
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
       "FindByMessageId"_ns,
-      "SELECT id FROM messages WHERE messageId = :messageId"_ns,
+      "SELECT m.id FROM messages m JOIN folders f ON f.id=m.folderId "
+      "WHERE m.messageId=:messageId COLLATE BINARY ORDER BY m.id LIMIT 1"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
@@ -3514,7 +3514,13 @@ Result<nsMsgKey, nsresult> MessageDatabase::FindByMessageId(
   if (!hasResult) {
     return nsMsgKey{0};
   }
-  return (nsMsgKey)stmt->AsInt64(0);
+  nsMsgKey key;
+  MOZ_TRY(ReadThreadKey(stmt, 0, false, key));
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
+  if (hasResult) {
+    return Err(NS_ERROR_FILE_CORRUPTED);
+  }
+  return key;
 }
 
 nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,

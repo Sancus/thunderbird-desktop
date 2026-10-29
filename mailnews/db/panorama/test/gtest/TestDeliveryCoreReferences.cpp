@@ -908,6 +908,115 @@ class DeliveryCoreReferences : public testing::Test {
     EXPECT_EQ(destination, attempt.destination->key);
   }
 
+  void CheckGroupingOff() {
+    ASSERT_FALSE(mCore->MessageDB().mConversationGroupingEnabled);
+  }
+
+  void CheckRetiredReferences(bool stagedReply) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& db = mCore->MessageDB();
+    auto& folders = mCore->FolderDB();
+    ASSERT_FALSE(db.mConversationGroupingEnabled);
+    uint64_t retired, first, second;
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Retired"_ns, &retired));
+    nsMsgKey oldRoot, oldCopy, oldReply;
+    ASSERT_EQ(NS_OK, AddAt(retired, "0@made.up.invalid"_ns, {}, oldRoot));
+    ASSERT_EQ(NS_OK, AddAt(retired, "0@made.up.invalid"_ns, {}, oldCopy));
+    ASSERT_EQ(NS_OK, AddAt(retired, "1@made.up.invalid"_ns,
+                           {"0@made.up.invalid"_ns}, oldReply));
+    ASSERT_EQ(NS_OK, db.SetMessageStoreToken(oldRoot, "retained-body"_ns));
+    MessageBodyState before;
+    ASSERT_EQ(NS_OK, db.GetMessageBodyState(oldRoot, before));
+    CapturedMessage historical;
+    ASSERT_EQ(NS_OK, db.CaptureMessage(oldReply, historical));
+    ASSERT_EQ(NS_OK, folders.DeleteFolder(retired));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "First"_ns, &first));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Second"_ns, &second));
+
+    RawHdr raw;
+    raw.messageId = "0@made.up.invalid"_ns;
+    raw.subject = "Conversation root outside query"_ns;
+    nsMsgKey root, reply, copy, tail, unrelated;
+    ASSERT_EQ(NS_OK, db.AddMessage(first, raw, true, &root));
+    ASSERT_GT(root, oldReply);
+    raw.messageId = "1@made.up.invalid"_ns;
+    raw.subject = "panoramafacetedphysicalneedle"_ns;
+    raw.references = {"0@made.up.invalid"_ns};
+    if (stagedReply) {
+      ASSERT_EQ(NS_OK, db.StageMessage(second, raw, &reply));
+      Maybe<CapturedMessage> staged;
+      ASSERT_EQ(NS_OK, db.CaptureHeaderState(reply, staged));
+      ASSERT_TRUE(staged);
+      EXPECT_EQ(root, staged->threadId);
+      EXPECT_EQ(root, staged->threadParent);
+      bool exists = true;
+      ASSERT_EQ(NS_OK, db.MessageExists(reply, exists));
+      EXPECT_FALSE(exists);
+      ASSERT_EQ(NS_OK, db.PublishMessage(reply, true));
+    } else {
+      ASSERT_EQ(NS_OK, db.AddMessage(second, raw, true, &reply));
+    }
+    ASSERT_EQ(NS_OK, db.AddMessage(first, raw, true, &copy));
+    raw.messageId = "2@made.up.invalid"_ns;
+    raw.subject = "Conversation tail outside query"_ns;
+    raw.references = {"0@made.up.invalid"_ns, "1@made.up.invalid"_ns};
+    ASSERT_EQ(NS_OK, db.AddMessage(second, raw, true, &tail));
+    raw.messageId = "unrelated@invalid"_ns;
+    raw.references.Clear();
+    ASSERT_EQ(NS_OK, db.AddMessage(first, raw, true, &unrelated));
+    for (auto pair : {std::pair{root, nsMsgKey{0}}, std::pair{reply, root},
+                      std::pair{copy, root}, std::pair{tail, reply}}) {
+      CapturedMessage stored;
+      ASSERT_EQ(NS_OK, db.CaptureMessage(pair.first, stored));
+      EXPECT_EQ(root, stored.threadId);
+      EXPECT_EQ(pair.second, stored.threadParent);
+    }
+    // The same stored threadId predicate used by ConversationFilter must
+    // include both nonmatching endpoints and both physical reply copies.
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(
+        NS_OK,
+        mConnection->CreateStatement(
+            "SELECT id FROM messages WHERE threadId=:thread ORDER BY id"_ns,
+            getter_AddRefs(stmt)));
+    auto finalize = MakeScopeExit([&] { EXPECT_EQ(NS_OK, stmt->Finalize()); });
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("thread"_ns, root));
+    nsTArray<nsMsgKey> members;
+    bool more;
+    while (true) {
+      ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+      if (!more) break;
+      int64_t key;
+      ASSERT_EQ(NS_OK, stmt->GetInt64(0, &key));
+      members.AppendElement(static_cast<nsMsgKey>(key));
+    }
+    EXPECT_EQ((nsTArray<nsMsgKey>{root, reply, copy, tail}), members);
+    nsTArray<nsCString> references;
+    ASSERT_EQ(NS_OK, Stored(tail, references));
+    EXPECT_EQ(
+        (nsTArray<nsCString>{"0@made.up.invalid"_ns, "1@made.up.invalid"_ns}),
+        references);
+    CapturedMessage control, retained;
+    ASSERT_EQ(NS_OK, db.CaptureMessage(unrelated, control));
+    EXPECT_EQ(unrelated, control.threadId);
+    ASSERT_EQ(NS_OK, db.CaptureMessage(oldReply, retained));
+    EXPECT_EQ(historical.threadId, retained.threadId);
+    EXPECT_EQ(historical.threadParent, retained.threadParent);
+    EXPECT_EQ(retired, retained.folderId);
+    for (nsMsgKey key : {oldRoot, oldCopy, oldReply}) {
+      bool exists = false;
+      ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+      EXPECT_TRUE(exists);
+    }
+    MessageBodyState after;
+    ASSERT_EQ(NS_OK, db.GetMessageBodyState(oldRoot, after));
+    EXPECT_EQ(retired, after.folderId);
+    EXPECT_EQ(Some(nsCString("retained-body"_ns)), after.storeToken);
+    EXPECT_EQ(before.contentRevision, after.contentRevision);
+    EXPECT_EQ(before.locationRevision, after.locationRevision);
+    ASSERT_FALSE(db.mConversationGroupingEnabled);
+  }
+
   void CheckOfflineSource(nsMsgKey key, uint32_t expectedEpoch,
                           uint32_t expectedUid) {
     nsCOMPtr<mozIStorageConnection> reader;
@@ -7115,6 +7224,72 @@ TEST_F(DeliveryCoreReferences, QueuedSourceCaptureFailureRollsBackIntent) {
   ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
   EXPECT_EQ(OfflineAttemptState::Ambiguous, attempt.state);
   EXPECT_EQ(1u, attempt.revision);
+}
+
+TEST_F(DeliveryCoreReferences, RetiredReferencesKeepLiveConversationMembers) {
+  ASSERT_NO_FATAL_FAILURE(CheckRetiredReferences(false));
+}
+
+TEST_F(DeliveryCoreReferences, StagedReferencesKeepLiveConversationMembers) {
+  ASSERT_NO_FATAL_FAILURE(CheckRetiredReferences(true));
+}
+
+TEST_F(DeliveryCoreReferences,
+       DefaultReferenceReadFailurePreservesPublication) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_NO_FATAL_FAILURE(CheckGroupingOff());
+  nsMsgKey root, control;
+  ASSERT_EQ(NS_OK, Add("reference-read-root"_ns, {}, root));
+  ASSERT_EQ(NS_OK, Add("reference-read-control"_ns, {}, control));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("reference_read_fault"_ns, 1, witness));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "CREATE TEMP VIEW messages AS SELECT * FROM main.messages "
+                "WHERE CASE WHEN reference_read_fault(id)=0 "
+                "THEN abs(-9223372036854775808) ELSE 1 END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.messages"_ns));
+  });
+  auto failed = db.FindByMessageId("reference-read-root"_ns);
+  ASSERT_TRUE(failed.isErr());
+  EXPECT_EQ(NS_ERROR_FAILURE, failed.unwrapErr());
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(root, witness->mLastKey);
+  uint32_t publications = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) { ++publications; });
+  db.AddMessageListener(observer);
+  auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  nsMsgKey output = 123;
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            Add("reference-read-child"_ns, {"reference-read-root"_ns}, output));
+  EXPECT_EQ(123u, output);
+  EXPECT_EQ(0u, publications);
+  bool active = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL("DROP VIEW temp.messages"_ns));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            Add("foreign-owner-child"_ns, {"reference-read-root"_ns}, output));
+  EXPECT_EQ(123u, output);
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK,
+            Add("reference-read-child"_ns, {"reference-read-root"_ns}, output));
+  EXPECT_EQ(1u, publications);
+  CapturedMessage child;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(output, child));
+  EXPECT_EQ(root, child.threadId);
+  EXPECT_EQ(root, child.threadParent);
 }
 
 }  // namespace mozilla::mailnews

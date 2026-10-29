@@ -430,9 +430,8 @@ class MessageDatabase : public nsIMessageDatabase {
   // On storage error, exists is unchanged.
   nsresult MessageExists(nsMsgKey key, bool& exists);
 
-  // Find the message with the given "Message-Id:".
+  // Lowest physical key with this exact Message-ID in an existing folder.
   // Returns 0 if not found; storage errors propagate.
-  // NOTE: undefined behaviour if multiple messages share the same message-id!
   Result<nsMsgKey, nsresult> FindByMessageId(nsACString const& messageId);
 
  protected:

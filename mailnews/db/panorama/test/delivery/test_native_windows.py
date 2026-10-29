@@ -4,21 +4,22 @@
 
 """Win32 ownership probes with tiny Python programs, never Thunderbird."""
 
-from contextlib import chdir
 import ctypes as C
-from ctypes import wintypes as W
 import json
 import os
 import shutil
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import chdir
+from ctypes import wintypes as W
+from pathlib import Path
 from unittest.mock import patch
 
 import native_windows as windows
+
 
 def child_env():
     return {k: os.environ[k] for k in ("SystemRoot", "WINDIR", "TEMP", "TMP") if k in os.environ}

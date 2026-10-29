@@ -59,14 +59,15 @@ export class MigrationJournal {
         AppConstants.platform == "win"
           ? captureWindowsMigrationRoots([plan.profilePath, ...plan.mailPaths])
           : null;
+      let version = MAIL_VERSION;
+      if (AppConstants.platform == "win") {
+        version = PHYSICAL_VERSION;
+      } else if (plan.books?.length) {
+        version = BOOK_VERSION;
+      }
       const state = {
         ...(originalRoots ? { originalRoots } : {}),
-        version:
-          AppConstants.platform == "win"
-            ? PHYSICAL_VERSION
-            : plan.books?.length
-              ? BOOK_VERSION
-              : MAIL_VERSION,
+        version,
         profilePath: normalizedPath(plan.profilePath),
         backupPath: normalizedPath(plan.backupPath),
         mailPaths: plan.mailPaths.map(normalizedPath),
@@ -956,6 +957,10 @@ export class MigrationJournal {
         throw new Error("Uncommitted migration source has a receipt");
       }
     }
+    this.#validateBooksAndStage(state, roots, file, ids, tokens, files);
+  }
+
+  #validateBooksAndStage(state, roots, file, ids, tokens, files) {
     const stages = [];
     for (const book of state.books ?? []) {
       if (
@@ -1101,14 +1106,13 @@ function normalizedPath(path) {
 
 /** @param {string} path - Existing original path. @param {boolean} [directory=false] - Expected directory. @param {boolean} [stage=false] - Caller-owned writable stage. @returns {object} Exact native pin. */
 function physicalIdentity(path, directory = false, stage = false) {
-  const lease = admitWindowsMigrationPath(
-    new FileUtils.File(path),
-    directory
-      ? Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
-      : stage
-        ? Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING
-        : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
-  );
+  let kind = Ci.nsIPanoramaMigrationFileSystem.KIND_FILE;
+  if (directory) {
+    kind = Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY;
+  } else if (stage) {
+    kind = Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING;
+  }
+  const lease = admitWindowsMigrationPath(new FileUtils.File(path), kind);
   try {
     return migrationPhysicalIdentity(lease);
   } finally {

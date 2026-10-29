@@ -4,15 +4,15 @@
 
 """Tiny Python children and temporary Git fixtures; never Thunderbird."""
 
-from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import native_accounting as accounting

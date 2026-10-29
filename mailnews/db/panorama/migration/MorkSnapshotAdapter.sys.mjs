@@ -525,8 +525,8 @@ function checkMeta(row, id, members, messages) {
   }
   const newest = hex(row.cells.get("threadNewestMsgDate"));
   const expected = members.reduce(
-    (newest, key) =>
-      Math.max(newest, messages.get(key).message.header.date / 1000000),
+    (latest, key) =>
+      Math.max(latest, messages.get(key).message.header.date / 1000000),
     0
   );
   if (newest != 0 && newest != expected) {
@@ -613,8 +613,8 @@ function cells(record) {
       typeof k != "string" ||
       typeof v != "string" ||
       values.has(k) ||
-      /[^\u0000-\u00ff]/.test(k) ||
-      /[^\u0000-\u00ff]/.test(v)
+      /[\u0100-\uffff]/.test(k) ||
+      /[\u0100-\uffff]/.test(v)
     ) {
       throw new Error("Invalid or duplicate Mork byte cell");
     }

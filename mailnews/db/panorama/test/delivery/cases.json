@@ -1914,9 +1914,7 @@
     "id": "compatibility:panorama:mbox:FolderInitFailure",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers.toml",
     "file": "test_deliveryCompatibilityFolderInitFailure.js",
-    "tasks": [
-      "test_failedDescendantKeepsRowsBodiesAndExistingChild"
-    ],
+    "tasks": ["test_failedDescendantKeepsRowsBodiesAndExistingChild"],
     "setups": [],
     "backend": "panorama",
     "store": "mbox",
@@ -1935,9 +1933,7 @@
       "test_rejectsCachedChildWithConflictingParent",
       "test_recursiveConflictPreservesCachedSubtree"
     ],
-    "setups": [
-      "setupFolders"
-    ],
+    "setups": ["setupFolders"],
     "backend": "panorama",
     "store": "mbox",
     "diagnostics": "folder",
@@ -1953,9 +1949,7 @@
     "id": "compatibility:panorama:mbox:FolderInitIdentity",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers.toml",
     "file": "test_deliveryCompatibilityFolderInitIdentity.js",
-    "tasks": [
-      "test_reusesCachedChildWithoutDuplicateAttachment"
-    ],
+    "tasks": ["test_reusesCachedChildWithoutDuplicateAttachment"],
     "setups": [],
     "backend": "panorama",
     "store": "mbox",
@@ -1970,9 +1964,7 @@
     "id": "compatibility:panorama:mbox:FolderInitConflict",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers.toml",
     "file": "test_deliveryCompatibilityFolderInitConflict.js",
-    "tasks": [
-      "test_rejectsConflictingLiveIdentity"
-    ],
+    "tasks": ["test_rejectsConflictingLiveIdentity"],
     "setups": [],
     "backend": "panorama",
     "store": "mbox",
@@ -1987,9 +1979,7 @@
     "id": "compatibility:panorama:maildir:FolderInitFailure",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers-maildir.toml",
     "file": "test_deliveryCompatibilityFolderInitFailure.js",
-    "tasks": [
-      "test_failedDescendantKeepsRowsBodiesAndExistingChild"
-    ],
+    "tasks": ["test_failedDescendantKeepsRowsBodiesAndExistingChild"],
     "setups": [],
     "backend": "panorama",
     "store": "maildir",
@@ -2008,9 +1998,7 @@
       "test_rejectsCachedChildWithConflictingParent",
       "test_recursiveConflictPreservesCachedSubtree"
     ],
-    "setups": [
-      "setupFolders"
-    ],
+    "setups": ["setupFolders"],
     "backend": "panorama",
     "store": "maildir",
     "diagnostics": "folder",
@@ -2026,9 +2014,7 @@
     "id": "compatibility:panorama:maildir:FolderInitIdentity",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers-maildir.toml",
     "file": "test_deliveryCompatibilityFolderInitIdentity.js",
-    "tasks": [
-      "test_reusesCachedChildWithoutDuplicateAttachment"
-    ],
+    "tasks": ["test_reusesCachedChildWithoutDuplicateAttachment"],
     "setups": [],
     "backend": "panorama",
     "store": "maildir",
@@ -2043,9 +2029,7 @@
     "id": "compatibility:panorama:maildir:FolderInitConflict",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-initializers-maildir.toml",
     "file": "test_deliveryCompatibilityFolderInitConflict.js",
-    "tasks": [
-      "test_rejectsConflictingLiveIdentity"
-    ],
+    "tasks": ["test_rejectsConflictingLiveIdentity"],
     "setups": [],
     "backend": "panorama",
     "store": "maildir",
@@ -2464,9 +2448,7 @@
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
     "readiness": "pending-product",
-    "tasks": [
-      "test_attachPublishesCompleteHeaderAndConsumesDraft"
-    ],
+    "tasks": ["test_attachPublishesCompleteHeaderAndConsumesDraft"],
     "setups": [],
     "folder_roles": {
       "fixture": "complete-publication"
@@ -2533,9 +2515,7 @@
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
     "readiness": "pending-product",
-    "tasks": [
-      "test_quietAttachStillPublishesToLiveView"
-    ],
+    "tasks": ["test_quietAttachStillPublishesToLiveView"],
     "setups": [],
     "folder_roles": {
       "fixture": "quiet-publication"
@@ -2608,9 +2588,7 @@
       "test_moveDefersFailedMailboxCompletion",
       "test_copyKeepsAbsentAccountAndCharsetAcrossServers"
     ],
-    "setups": [
-      "setupLocalPublicationCopy"
-    ],
+    "setups": ["setupLocalPublicationCopy"],
     "backend": "panorama",
     "store": "mbox",
     "diagnostics": "folder",
@@ -2636,9 +2614,7 @@
       "test_moveDefersFailedMailboxCompletion",
       "test_copyKeepsAbsentAccountAndCharsetAcrossServers"
     ],
-    "setups": [
-      "setupLocalPublicationCopy"
-    ],
+    "setups": ["setupLocalPublicationCopy"],
     "backend": "panorama",
     "store": "maildir",
     "diagnostics": "folder",
@@ -2653,9 +2629,7 @@
     "id": "compatibility:panorama:mbox:ServerRootFailure",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots.toml",
     "file": "test_deliveryCompatibilityServerRootFailure.js",
-    "tasks": [
-      "test_rootGetterRetriesAfterNativeInitializationFailure"
-    ],
+    "tasks": ["test_rootGetterRetriesAfterNativeInitializationFailure"],
     "setups": [],
     "backend": "panorama",
     "store": "mbox",
@@ -2676,9 +2650,7 @@
     "id": "compatibility:panorama:mbox:ServerRootIdentity",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots.toml",
     "file": "test_deliveryCompatibilityServerRootIdentity.js",
-    "tasks": [
-      "test_successfulRootKeepsIdentityDuringAndAfterInitialization"
-    ],
+    "tasks": ["test_successfulRootKeepsIdentityDuringAndAfterInitialization"],
     "setups": [],
     "backend": "panorama",
     "store": "mbox",
@@ -2694,9 +2666,7 @@
     "id": "compatibility:panorama:maildir:ServerRootFailure",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots-maildir.toml",
     "file": "test_deliveryCompatibilityServerRootFailure.js",
-    "tasks": [
-      "test_rootGetterRetriesAfterNativeInitializationFailure"
-    ],
+    "tasks": ["test_rootGetterRetriesAfterNativeInitializationFailure"],
     "setups": [],
     "backend": "panorama",
     "store": "maildir",
@@ -2717,9 +2687,7 @@
     "id": "compatibility:panorama:maildir:ServerRootIdentity",
     "manifest": "mailnews/db/panorama/test/xpcshell/xpcshell-delivery-server-roots-maildir.toml",
     "file": "test_deliveryCompatibilityServerRootIdentity.js",
-    "tasks": [
-      "test_successfulRootKeepsIdentityDuringAndAfterInitialization"
-    ],
+    "tasks": ["test_successfulRootKeepsIdentityDuringAndAfterInitialization"],
     "setups": [],
     "backend": "panorama",
     "store": "maildir",
@@ -2739,9 +2707,7 @@
       "test_copyWaitsForRealMailboxStop",
       "test_moveWaitsForRealMailboxStop"
     ],
-    "setups": [
-      "setupLocalPublicationWitness"
-    ],
+    "setups": ["setupLocalPublicationWitness"],
     "backend": "panorama",
     "store": "mbox",
     "diagnostics": "folder",
@@ -2764,9 +2730,7 @@
       "test_copyWaitsForRealMailboxStop",
       "test_moveWaitsForRealMailboxStop"
     ],
-    "setups": [
-      "setupLocalPublicationWitness"
-    ],
+    "setups": ["setupLocalPublicationWitness"],
     "backend": "panorama",
     "store": "maildir",
     "diagnostics": "folder",
@@ -2865,9 +2829,7 @@
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
     "readiness": "pending-product",
-    "tasks": [
-      "test_retriesRejectedNewsDatabase"
-    ],
+    "tasks": ["test_retriesRejectedNewsDatabase"],
     "setups": [],
     "source_dependencies": [
       "mailnews/news/src/nsNewsFolder.cpp",
@@ -2934,9 +2896,7 @@
     "diagnostics": "folder",
     "fixture": "preconfigured-store",
     "readiness": "pending-product",
-    "tasks": [
-      "test_retriesRejectedNewsDatabase"
-    ],
+    "tasks": ["test_retriesRejectedNewsDatabase"],
     "setups": [],
     "source_dependencies": [
       "mailnews/news/src/nsNewsFolder.cpp",

@@ -6,15 +6,15 @@
 
 import argparse
 import configparser
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import native_accounting as accounting
 import native_process as processes

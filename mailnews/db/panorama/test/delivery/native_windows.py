@@ -7,14 +7,14 @@
 Use in a dedicated single-threaded process. No breakaway or arbitrary PID kill.
 """
 
-from contextlib import ExitStack
 import ctypes as C
-from ctypes import wintypes as W
 import math
-from pathlib import Path
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
+from ctypes import wintypes as W
+from pathlib import Path
 
 
 class Limits(C.Structure):

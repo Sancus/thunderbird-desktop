@@ -32,8 +32,9 @@ add_setup(function () {
     ),
     database
   );
-  if (typeof PanoramaDelivery != "undefined")
+  if (typeof PanoramaDelivery != "undefined") {
     PanoramaDelivery.assertBackend("panorama");
+  }
 });
 
 /**
@@ -157,8 +158,9 @@ add_task(async function test_nativeLateParentUpdatesAllRetainedAdapters() {
           row?.message?.id ==
           (Adapter == LiveViewConversationsDataAdapter ? second : first)
       );
-      Assert.ok(
-        selected >= 0,
+      Assert.greaterOrEqual(
+        selected,
+        0,
         "The physical selected member is loaded before mutation"
       );
       adapter.selection.rangedSelect(selected, selected, false);
@@ -183,14 +185,16 @@ add_task(async function test_nativeLateParentUpdatesAllRetainedAdapters() {
       );
       const grouped = adapter instanceof LiveViewGroupedDataAdapter;
       const conversations = adapter instanceof LiveViewConversationsDataAdapter;
-      Assert.equal(
-        adapter._rowMap.length,
-        grouped
-          ? 1
-          : adapter instanceof LiveViewThreadedDataAdapter || conversations
-            ? 2
-            : 4
-      );
+      let expectedRows = 4;
+      if (grouped) {
+        expectedRows = 1;
+      } else if (
+        adapter instanceof LiveViewThreadedDataAdapter ||
+        conversations
+      ) {
+        expectedRows = 2;
+      }
+      Assert.equal(adapter._rowMap.length, expectedRows);
       const selected = adapter.rowAt(adapter.selection.currentIndex);
       Assert.equal(selected.message.id, conversations ? parent : first);
       Assert.equal(selected.message.folderId, folders[0]);
@@ -235,7 +239,9 @@ add_task(async function test_nativeLateParentUpdatesAllRetainedAdapters() {
       ].sort((a, b) => a[1] - b[1])
     );
   } finally {
-    for (const { adapter } of fixtures) adapter.setTree(null);
+    for (const { adapter } of fixtures) {
+      adapter.setTree(null);
+    }
   }
 });
 
@@ -313,6 +319,7 @@ add_task(function test_nativeUnknownListenerCapabilityNeverRunsGetters() {
     QueryInterface: ChromeUtils.generateQI(["nsILiveViewListener"]),
     get panoramaThreadBatchVersion() {
       Assert.ok(false, "Capability admission must not call an external getter");
+      return undefined;
     },
     onMessageAdded(message) {
       events.push(["add", message.folderId, message.id, message.messageId]);
@@ -350,7 +357,9 @@ add_task(function test_nativeUnknownListenerCapabilityNeverRunsGetters() {
     Assert.deepEqual(events[1].slice(1), events[0].slice(1));
   } finally {
     liveView.clearListener(listener);
-    if (id) messageDB.removeMessage(id);
+    if (id) {
+      messageDB.removeMessage(id);
+    }
   }
 });
 
@@ -451,7 +460,9 @@ add_task(
     const earlier = [],
       later = [];
     const a = capturedBatchListener(earlier, (kind, message) => {
-      if (kind == "add") messageDB.removeMessage(message.id);
+      if (kind == "add") {
+        messageDB.removeMessage(message.id);
+      }
     });
     const b = capturedBatchListener(later);
     first.setListener(a);
@@ -512,10 +523,12 @@ add_task(function test_nativeCapturedFlagsAndTagsSurviveEarlierMutation() {
     later = [];
   const read = Ci.nsMsgMessageFlags.Read;
   const a = capturedBatchListener(earlier, (kind, message) => {
-    if (kind == "flags" && message.flags == read)
+    if (kind == "flags" && message.flags == read) {
       header.flags = read | Ci.nsMsgMessageFlags.Marked;
-    if (kind == "tags" && message.tags == "first")
+    }
+    if (kind == "tags" && message.tags == "first") {
       header.setStringProperty("keywords", "second");
+    }
   });
   const b = capturedBatchListener(later);
   first.setListener(a);
@@ -605,7 +618,7 @@ add_task(
           const members =
             await liveView.selectMessagesInGroup("Retained subject");
           const child = members.findIndex(message => message.id == second);
-          Assert.ok(child >= 0);
+          Assert.greaterOrEqual(child, 0);
           root.open = true;
           adapter._clearFlatRowCache();
           adapter.selection.rangedSelect(child + 1, child + 1, false);
@@ -618,7 +631,7 @@ add_task(
           const index = adapter._rowMap.findIndex(
             row => row.message.id == second
           );
-          Assert.ok(index >= 0);
+          Assert.greaterOrEqual(index, 0);
           delete adapter._rowMap[index];
           adapter._clearFlatRowCache();
           adapter.selection.rangedSelect(index, index, false);
@@ -671,7 +684,9 @@ add_task(
         ].sort((a, b) => a[1] - b[1])
       );
     } finally {
-      for (const { adapter } of fixtures) adapter.setTree(null);
+      for (const { adapter } of fixtures) {
+        adapter.setTree(null);
+      }
     }
   }
 );
@@ -719,19 +734,20 @@ add_task(async function test_nativeBatchDuringCountKeepsAllAdapterSelections() {
         const index = adapter._rowMap.findIndex(
           row => row.message.id == second
         );
-        Assert.ok(index >= 0);
+        Assert.greaterOrEqual(index, 0);
         delete adapter._rowMap[index];
         adapter._clearFlatRowCache();
         adapter.selection.rangedSelect(index, index, false);
       }
     }
-    for (const { adapter } of fixtures)
+    for (const { adapter } of fixtures) {
       sorts.push(
         adapter.sortBy(
           adapter instanceof LiveViewGroupedDataAdapter ? "sender" : "date",
           "descending"
         )
       );
+    }
     const parent = insertBatchMessage(
       folders[0],
       "count-parent@views.invalid",
@@ -822,6 +838,8 @@ add_task(async function test_nativeBatchDuringCountKeepsAllAdapterSelections() {
       ].sort((a, b) => a[1] - b[1])
     );
   } finally {
-    for (const { adapter } of fixtures) adapter.setTree(null);
+    for (const { adapter } of fixtures) {
+      adapter.setTree(null);
+    }
   }
 });

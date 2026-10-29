@@ -11,10 +11,11 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
+
+import tomllib
 
 HERE = Path(__file__).resolve().parent
 CONTRACTS = {"mbox": "berkeleystore", "maildir": "maildirstore"}

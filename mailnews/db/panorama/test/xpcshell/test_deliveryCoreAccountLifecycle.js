@@ -198,11 +198,7 @@ add_task(function test_lookupFailureDoesNotInterruptAccountRemoval() {
     cache: (uri, folder) => genuine.cache(uri, folder),
     invalidateCache: () => genuine.invalidateCache(),
   };
-  const cid = MockRegistrar.registerEx(
-    "@mozilla.org/mail/folder-lookup;1",
-    { shouldCreateInstance: false },
-    mock
-  );
+  const cid = MockRegistrar.register("@mozilla.org/mail/folder-lookup;1", mock);
   try {
     MailServices.accounts.removeAccount(account, false);
     Assert.ok(attempted.includes(child), "The error point was reached");
@@ -286,7 +282,7 @@ add_task(
     Assert.strictEqual(after.folderFlags, null);
     Assert.equal(after.contentRevision, before.contentRevision);
     Assert.equal(after.locationRevision, before.locationRevision);
-    Assert.ok(BigInt(after.policyRevision) > BigInt(before.policyRevision));
+    Assert.greater(BigInt(after.policyRevision), BigInt(before.policyRevision));
     Assert.equal(header.messageId, "retained@invalid");
     Assert.equal(header.subject, "retained body");
     Assert.equal(header.storeToken, "0");
@@ -296,7 +292,7 @@ add_task(
     Assert.equal(database.connectionForTests, connection);
     // Exercise the same stored server key lookup used on a later startup.
     const replacement = folderDB.insertRoot(serverKey);
-    Assert.ok(replacement > Math.max(...ids));
+    Assert.greater(replacement, Math.max(...ids));
     Assert.deepEqual(folderDB.getFolderChildren(replacement), []);
     Assert.equal(folderDB.getFolderByPath(paths[1]), 0);
     Assert.equal(folderDB.getFolderByPath(paths[2]), 0);

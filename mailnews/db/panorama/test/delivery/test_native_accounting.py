@@ -6,9 +6,9 @@
 
 import copy
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import native_accounting as native
@@ -128,6 +128,7 @@ class NativeAccountingTests(unittest.TestCase):
 
     def test_catalog_suites_match_integrated_disabled_sources_and_receipt_dependencies(self):
         import re
+
         import run_native
         comm = native.HERE.parents[4]
         catalog = native.CATALOG
@@ -507,6 +508,7 @@ class NativeAccountingTests(unittest.TestCase):
 
     def test_quarantined_output_stream_is_exact_manual_non_database_control(self):
         import re
+
         import run_native
         suite = "DISABLED_QuarantinedOutputStream"
         rows = [c for c in native.CATALOG["cases"] if c["filter"].startswith(suite + ".")]

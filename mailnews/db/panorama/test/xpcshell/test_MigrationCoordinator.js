@@ -99,7 +99,7 @@ add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
   );
   const creator = new ProfileCreator(profile);
   const local = creator.addLocalServer();
-  for (const name of names.filter(name => name != "native-nonlocal")) {
+  for (const name of names.filter(value => value != "native-nonlocal")) {
     const files = await local.rootFolder.addMailFolder(name, {
       summary,
       mbox: body,
@@ -179,7 +179,7 @@ add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
   loadExistingDB();
   MailServices.accounts.accounts;
   const localRoot = MailServices.accounts.localFoldersServer.rootFolder;
-  for (const name of names.filter(name => name != "native-nonlocal")) {
+  for (const name of names.filter(value => value != "native-nonlocal")) {
     originals.set(name, localRoot.getChildNamed(name));
   }
   const rootId = folderDB.insertRoot(serverKey);
@@ -308,7 +308,7 @@ async function assertCommitted(input) {
       [header.messageId, header.storeToken, header.messageSize],
       expected.get(oldKey)
     );
-    Assert.ok(header.threadId > 0);
+    Assert.greater(header.threadId, 0);
     Assert.equal(header.threadParent, 0);
   }
   Assert.notEqual(headers.get(keys[0]).threadId, headers.get(keys[1]).threadId);
@@ -546,9 +546,7 @@ add_task(
   async function test_rejectsAnotherActualProfileLockBeforeIntent() {
     const input = await plannedImport("native-lock");
     const before = await IOUtils.read(input.path);
-    const { FileUtils } = ChromeUtils.importESModule(
-      "resource://gre/modules/FileUtils.sys.mjs"
-    );
+
     const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
       Ci.nsIToolkitProfileService
     );

@@ -1358,7 +1358,7 @@ add_task(
       liveView.listener.panoramaThreadBatchGeneration,
       adapter._viewGeneration
     );
-    Assert.ok(adapter._viewGeneration > 0);
+    Assert.greater(adapter._viewGeneration, 0);
     const fresh = adapter.rowAt(0);
     old.onSelectedChunk([threadBatchRow(99)], 0, 0);
     Assert.strictEqual(adapter.rowAt(0), fresh);
@@ -1393,8 +1393,9 @@ add_task(async function test_threadBatchEmptyQueryClearsRowsAndGroupMaps() {
       null,
       "No old physical identity survives an empty query"
     );
-    if (Adapter != LiveViewDataAdapter)
+    if (Adapter != LiveViewDataAdapter) {
       Assert.equal(adapter._getBatchGroupMap().size, 0);
+    }
   }
 });
 
@@ -1730,12 +1731,13 @@ function contextualBeforeView(adapter, current, displayed, order = displayed) {
   const captured = capturedBeforeView(adapter, current);
   captured.sortDescending = adapter.sortDirection == "descending";
   captured.displayView = displayed && capturedBeforeView(adapter, displayed);
-  if (captured.displayView)
+  if (captured.displayView) {
     captured.displayView.order = order.map(entry => ({
       folderId: entry.message.folderId,
       id: entry.message.id,
       group: entry.group ?? "",
     }));
+  }
   return captured;
 }
 
@@ -1860,15 +1862,20 @@ add_task(
         ? threadBatchDescriptor(adapter, [a, b])
         : groupedThreadBatch(adapter, [a, b], sort ? "subject" : "threadId");
       batch.rows.at(-1).matchesAfter = true;
-      if (!flat) batch.groups.after[0].representative = batch.publication;
-      const roots = flat
-        ? [{ message: a }, { message: b }]
-        : sort
-          ? [{ message: a, group: a.subject, members: [a, b] }]
-          : [
-              { message: a, group: "11", members: [a] },
-              { message: b, group: "12", members: [b] },
-            ];
+      if (!flat) {
+        batch.groups.after[0].representative = batch.publication;
+      }
+      let roots;
+      if (flat) {
+        roots = [{ message: a }, { message: b }];
+      } else if (sort) {
+        roots = [{ message: a, group: a.subject, members: [a, b] }];
+      } else {
+        roots = [
+          { message: a, group: "11", members: [a] },
+          { message: b, group: "12", members: [b] },
+        ];
+      }
       batch.beforeView = contextualBeforeView(adapter, roots, null);
       adapter.onMessageAdded(batch);
       Assert.strictEqual(adapter._liveView, liveView);

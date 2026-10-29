@@ -433,7 +433,13 @@ export async function stageMigrationRestore(backupPath, parentPath) {
             flush: true,
           });
           await verifyFile(output, entry);
-          await IOUtils.setModificationTime(output, entry.lastModified);
+          if (outputLease) {
+            Cc["@mozilla.org/mailnews/panorama-migration-file-system;1"]
+              .getService(Ci.nsIPanoramaMigrationFileSystem)
+              .setStageModificationTime(outputLease, entry.lastModified);
+          } else {
+            await IOUtils.setModificationTime(output, entry.lastModified);
+          }
           await IOUtils.setPermissions(output, entry.permissions, false);
           if (sourceLease) {
             migrationPhysicalIdentity(sourceLease);

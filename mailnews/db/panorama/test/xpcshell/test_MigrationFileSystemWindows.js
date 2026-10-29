@@ -219,6 +219,10 @@ add_task(
       () => fs.validate(null),
       error => error.result == Cr.NS_ERROR_NOT_IMPLEMENTED
     );
+    Assert.throws(
+      () => fs.setStageModificationTime(null, 1700000000123),
+      error => error.result == Cr.NS_ERROR_NOT_IMPLEMENTED
+    );
   }
 );
 
@@ -440,6 +444,20 @@ add_task(
       input.root
     );
     Assert.equal(staged.roots.length, 1);
+    const manifest = await IOUtils.readJSON(input.backup.path);
+    for (const entry of manifest.roots[0].entries) {
+      if (entry.type == "regular") {
+        Assert.equal(
+          (
+            await IOUtils.stat(
+              PathUtils.join(staged.roots[0].staged, ...entry.parts)
+            )
+          ).lastModified,
+          entry.lastModified,
+          "Restore retains recorded file metadata without releasing its lease"
+        );
+      }
+    }
     const copy = PathUtils.join(staged.roots[0].staged, "Inbox.msf");
     Assert.deepEqual(await IOUtils.read(copy), sourceBytes);
     Assert.deepEqual(
@@ -469,5 +487,58 @@ add_task(
       "import",
       "No activation checkpoint"
     );
+  }
+);
+
+add_task(
+  windowsOnly(),
+  async function test_stageTimeUsesRetainedNativeHandle() {
+    const path = PathUtils.join(work, "metadata-stage.msf");
+    await IOUtils.write(path, bytes, { mode: "create" });
+    const stage = admit(path, fs.KIND_FILE_OR_MISSING);
+    const source = admit(original, fs.KIND_FILE);
+    const absent = admit(path + ".absent", fs.KIND_FILE_OR_MISSING);
+    const directory = admit(work, fs.KIND_DIRECTORY);
+    const originalTime = (await IOUtils.stat(original)).lastModified;
+    try {
+      const modified = 1700000000123;
+      fs.setStageModificationTime(stage, modified);
+      Assert.equal((await IOUtils.stat(path)).lastModified, modified);
+      fs.validate(stage);
+      Assert.deepEqual(await IOUtils.read(path), bytes);
+      Assert.throws(
+        () =>
+          new FileUtils.File(path).moveTo(
+            null,
+            PathUtils.filename(path) + ".moved"
+          ),
+        error => error.result == Cr.NS_ERROR_FILE_IS_LOCKED
+      );
+      Assert.ok(await IOUtils.exists(path));
+      Assert.ok(!(await IOUtils.exists(path + ".moved")));
+      for (const lease of [source, absent, directory]) {
+        Assert.throws(
+          () => fs.setStageModificationTime(lease, modified),
+          error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      }
+      Assert.throws(
+        () => fs.setStageModificationTime({}, modified),
+        error => error.result == Cr.NS_ERROR_INVALID_ARG
+      );
+      stage.close();
+      Assert.throws(
+        () => fs.setStageModificationTime(stage, modified),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+      Assert.equal((await IOUtils.stat(original)).lastModified, originalTime);
+      Assert.deepEqual(await IOUtils.read(original), bytes);
+      await IOUtils.move(path, path + ".moved", { noOverwrite: true });
+    } finally {
+      directory.close();
+      absent.close();
+      source.close();
+      stage.close();
+    }
   }
 );

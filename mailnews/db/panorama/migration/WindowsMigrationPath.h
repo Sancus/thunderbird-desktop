@@ -44,8 +44,12 @@ class WindowsMigrationPath final {
   const nsCString& ParentIdentity() const { return mParentIdentity; }
   bool Exists() const { return !mIdentity.IsEmpty(); }
 
+  // Existing owner-writable stages only; retains every no-delete handle.
+  nsresult SetStageModificationTime(int64_t milliseconds);
+
  private:
   WindowsMigrationPath() = default;
+  Kind mKind = Kind::File;
   nsString mPath;
   nsString mRootPath;
   // Full 64-bit volume serial and 128-bit file ID, hexadecimal strings.

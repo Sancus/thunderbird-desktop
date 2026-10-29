@@ -6,7 +6,7 @@
 
 interface nsIFile;
 
-/** Retained native admission; metadata reads fail after close. Not writable IO. */
+/** Retained native admission; metadata reads fail after close. No data IO. */
 [scriptable, builtinclass, uuid(7abb067d-4629-4d51-80e9-6ba29b238dbc)]
 interface nsIPanoramaMigrationPath : nsISupports {
   readonly attribute AString canonicalPath;
@@ -24,7 +24,7 @@ interface nsIPanoramaMigrationPath : nsISupports {
 };
 
 /** Stateless filesystem admission; never opens a database or creates files. */
-[scriptable, builtinclass, uuid(ab93fcac-15a0-4e7b-b7dd-428605db0418)]
+[scriptable, builtinclass, uuid(87d09264-92ff-4d89-af9c-8be6cf1b8999)]
 interface nsIPanoramaMigrationFileSystem : nsISupports {
   const unsigned short KIND_FILE = 0;
   const unsigned short KIND_DIRECTORY = 1;
@@ -44,4 +44,11 @@ interface nsIPanoramaMigrationFileSystem : nsISupports {
    * formerly absent leaf which now exists. Does not rebind or change the lease.
    */
   void validate(in nsISupports lease);
+  /**
+   * Set Unix-millisecond mtime bound to an existing owner-writable stage lease,
+   * keeping its no-delete admission. Only a live, present FILE_OR_MISSING lease
+   * from this implementation is accepted; source/directory/future leases fail.
+   * Caller ownership/quiescence is still required. Never writes file contents.
+   */
+  void setStageModificationTime(in nsISupports lease, in long long milliseconds);
 };

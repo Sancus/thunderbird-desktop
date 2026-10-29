@@ -5,6 +5,7 @@
 #include "WindowsMigrationPath.h"
 
 #ifdef XP_WIN
+#  include "mozilla/CheckedInt.h"
 #  include "mozilla/Try.h"
 #  include "nsIFile.h"
 #  include "nsReadableUtils.h"
@@ -227,6 +228,7 @@ Result<UniquePtr<WindowsMigrationPath>, nsresult> WindowsMigrationPath::Admit(
     return Err(NS_ERROR_FILE_ACCESS_DENIED);
   }
   UniquePtr<WindowsMigrationPath> result(new WindowsMigrationPath());
+  result->mKind = kind;
   result->mPath = checked.path;
   result->mRootPath = checkedRoot.path;
   result->mIdentity = checked.identity;
@@ -237,6 +239,44 @@ Result<UniquePtr<WindowsMigrationPath>, nsresult> WindowsMigrationPath::Admit(
     result->mHandles.AppendElement(std::move(handle));
   }
   return result;
+}
+
+nsresult WindowsMigrationPath::SetStageModificationTime(int64_t milliseconds) {
+  if (mKind != Kind::FileOrMissing || !Exists() || mHandles.IsEmpty()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  // FILETIME uses 100ns ticks since 1601; inventory uses Unix milliseconds.
+  CheckedInt<int64_t> ticks(milliseconds);
+  ticks += 11644473600000LL;
+  ticks *= 10000;
+  if (!ticks.isValid() || ticks.value() <= 0) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+  uint64_t value = static_cast<uint64_t>(ticks.value());
+  FILETIME time = {static_cast<DWORD>(value), static_cast<DWORD>(value >> 32)};
+  // Keep the admission alive; nsIFile's share-zero setter cannot coexist
+  // with it. This open is metadata-only; the retained lease denies deletion.
+  nsAutoString path(u"\\\\?\\"_ns);
+  path.Append(mPath);
+  UniqueFileHandle attributes(
+      ::CreateFileW(path.get(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  DWORD error = ::GetLastError();
+  if (!FileHandleIsValid(attributes.get())) {
+    return FileError(error);
+  }
+  auto identity = FileIdentity(attributes.get());
+  if (identity.isErr()) {
+    return identity.unwrapErr();
+  }
+  if (identity.unwrap() != mIdentity) {
+    return NS_ERROR_FILE_CORRUPTED;
+  }
+  if (!::SetFileTime(attributes.get(), nullptr, nullptr, &time)) {
+    return FileError(::GetLastError());
+  }
+  return NS_OK;
 }
 
 }  // namespace mozilla::mailnews

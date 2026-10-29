@@ -182,8 +182,8 @@ TEST_F(MigrationWindowsPath, MissingFileIsNotASourceLease) {
   nsCOMPtr<nsIFile> file;
   ASSERT_EQ(NS_OK, mRoot->Clone(getter_AddRefs(file)));
   ASSERT_EQ(NS_OK, file->Append(u"absent-source.msf"_ns));
-  auto result = WindowsMigrationPath::Admit(
-      file, mRoot, WindowsMigrationPath::Kind::File);
+  auto result = WindowsMigrationPath::Admit(file, mRoot,
+                                            WindowsMigrationPath::Kind::File);
   ASSERT_TRUE(result.isErr());
   EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND, result.inspectErr());
   bool exists = true;
@@ -342,6 +342,38 @@ TEST_F(MigrationWindowsPath, StageLeaseAllowsWriteButDeniesDeleteAccess) {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, 0, nullptr));
   EXPECT_TRUE(FileHandleIsValid(deleter.get()));
+}
+
+TEST_F(MigrationWindowsPath, StageTimestampKeepsDeleteProtection) {
+  auto file = Child(u"metadata.sqlite"_ns);
+  auto result = WindowsMigrationPath::Admit(
+      file, mRoot, WindowsMigrationPath::Kind::FileOrMissing);
+  ASSERT_TRUE(result.isOk());
+  auto lease = result.unwrap();
+  constexpr int64_t modified = 1700000000123LL;
+  ASSERT_EQ(NS_OK, lease->SetStageModificationTime(modified));
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+            lease->SetStageModificationTime(-11644473600000LL));
+  int64_t actual = 0;
+  ASSERT_EQ(NS_OK, file->GetLastModifiedTimeOfLink(&actual));
+  EXPECT_EQ(modified, actual);
+  nsAutoString path;
+  ASSERT_EQ(NS_OK, file->GetPath(path));
+  UniqueFileHandle deleter(
+      ::CreateFileW(path.get(), DELETE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, 0, nullptr));
+  DWORD error = ::GetLastError();
+  EXPECT_FALSE(FileHandleIsValid(deleter.get()));
+  EXPECT_EQ(DWORD(ERROR_SHARING_VIOLATION), error);
+  lease.reset();
+  auto source = WindowsMigrationPath::Admit(file, mRoot,
+                                            WindowsMigrationPath::Kind::File);
+  ASSERT_TRUE(source.isOk());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            source.inspect()->SetStageModificationTime(modified + 1));
+  ASSERT_EQ(NS_OK, file->GetLastModifiedTimeOfLink(&actual));
+  EXPECT_EQ(modified, actual);
 }
 
 TEST_F(MigrationWindowsPath, ReservedDevicesAreNotMissingFiles) {

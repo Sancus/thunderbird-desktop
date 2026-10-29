@@ -54,6 +54,8 @@ const names = [
 ];
 
 add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
+  // Hashing must not leave certificate database writers in this mail fixture.
+  Services.prefs.setBoolPref("security.nocertdb", true);
   const profile = do_get_profile();
   const provider = Cc["@mozilla.org/xre/directory-provider;1"]
     .getService(Ci.nsIDirectoryServiceProvider)
@@ -91,7 +93,7 @@ add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
     await IOUtils.read(do_get_file("data/migration").path),
     { mode: "create" }
   );
-  // Initialize NSS before quiescing the profile for the backup.
+  // Initialize NSS in no-DB mode before inventorying the quiesced profile.
   Assert.equal(
     await IOUtils.computeHexDigest(summary.path, "sha256"),
     "7a262023b98fe964d105de06bf1ddca60f90ee19073e38afda8c885be5a47703",
@@ -171,6 +173,12 @@ add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
   registerCleanupFunction(() =>
     IOUtils.remove(backupRoot, { recursive: true })
   );
+  for (const name of ["cert9.db", "key4.db"]) {
+    Assert.ok(
+      !(await IOUtils.exists(PathUtils.join(profile.path, name))),
+      "The closed mail fixture has no live NSS database: " + name
+    );
+  }
   backup = await createMigrationBackup(
     profileLock.directory.path,
     [],

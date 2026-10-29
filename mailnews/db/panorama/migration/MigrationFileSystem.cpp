@@ -35,6 +35,7 @@ class MigrationPathLease final : public nsIPanoramaMigrationPath {
         mRoot(root),
         mKind(kind) {}
   nsresult Check();
+  nsresult SetStageModificationTime(int64_t milliseconds);
 
  private:
   ~MigrationPathLease() = default;
@@ -123,6 +124,19 @@ nsresult MigrationPathLease::Check() {
   return NS_OK;
 }
 
+nsresult MigrationPathLease::SetStageModificationTime(int64_t milliseconds) {
+  NS_ENSURE_TRUE(mAdmission, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(
+      mKind == nsIPanoramaMigrationFileSystem::KIND_FILE_OR_MISSING &&
+          mAdmission->Exists(),
+      NS_ERROR_NOT_AVAILABLE);
+  nsresult rv = Check();
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mAdmission->SetStageModificationTime(milliseconds);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return Check();
+}
+
 }  // namespace
 #endif
 
@@ -166,6 +180,17 @@ NS_IMETHODIMP MigrationFileSystem::Validate(nsISupports* lease) {
   RefPtr<MigrationPathLease> native = do_QueryObject(lease);
   NS_ENSURE_TRUE(native, NS_ERROR_INVALID_ARG);
   return native->Check();
+#else
+  return NS_ERROR_NOT_IMPLEMENTED;
+#endif
+}
+
+NS_IMETHODIMP MigrationFileSystem::SetStageModificationTime(
+    nsISupports* lease, int64_t milliseconds) {
+#ifdef XP_WIN
+  RefPtr<MigrationPathLease> native = do_QueryObject(lease);
+  NS_ENSURE_TRUE(native, NS_ERROR_INVALID_ARG);
+  return native->SetStageModificationTime(milliseconds);
 #else
   return NS_ERROR_NOT_IMPLEMENTED;
 #endif

@@ -262,6 +262,12 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   _liveView;
   _sortComparator = comparators.date;
   _viewGeneration = 0;
+  _queryGeneration = 0;
+  // Native LiveView reads these own data properties only at attachment.
+  panoramaThreadBatchVersion = 1;
+  panoramaThreadBatchGeneration = 0;
+  panoramaThreadBatchOwner = this;
+  panoramaThreadBatchInvalidated = () => this._invalidateThreadBatch();
   _queryListener = null;
   _threadBatchId = null;
   _threadBatchGrouping;
@@ -286,8 +292,10 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
    * @param {TreeView} tree
    */
   setTree(tree) {
-    if (!tree || (this._tree && tree != this._tree)) {
+    const replaced = tree && this._tree && tree != this._tree;
+    if (!tree || replaced) {
       this._viewGeneration++;
+      this._queryGeneration++;
     }
     if (!tree) {
       this._liveView?.clearListener(this._queryListener ?? this);
@@ -296,6 +304,12 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       this._clearFlatRowCache();
     }
     super.setTree(tree);
+    if (replaced && this._liveView) {
+      this._batchRefreshPromise = this.sortBy(
+        this.sortColumn,
+        this.sortDirection
+      ).catch(error => this._invalidateThreadBatch(error));
+    }
   }
 
   async sortBy(sortColumn, sortDirection, _resort = false) {
@@ -312,25 +326,32 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     this._liveView.sortDescending = sortDirection == "descending";
 
     const liveView = this._liveView;
-    const generation = ++this._viewGeneration;
-    if (this._threadBatchGrouping == Ci.nsILiveView.UNTHREADED) {
-      this._queryListener = this._makeQueryListener(generation);
+    const generation = ++this._queryGeneration;
+    this.panoramaThreadBatchGeneration = ++this._viewGeneration;
+    this._queryListener = this._makeQueryListener(generation);
+    liveView.setListener(this._queryListener);
+    try {
+      const count = await liveView.countMessages();
+      if (generation != this._queryGeneration || liveView != this._liveView)
+        return;
+      this._rowMap.length = 0;
+      this._rowMap.length = count;
+      this._clearFlatRowCache();
+      if (this._threadBatchGrouping != Ci.nsILiveView.UNTHREADED) {
+        this._setBatchGroupMap(new Map());
+      }
+      // Acknowledge the new positional map before starting its query.
       liveView.setListener(this._queryListener);
-    }
-    const count = await liveView.countMessages();
-    if (generation != this._viewGeneration || liveView != this._liveView) {
-      return;
-    }
-    this._rowMap.length = 0;
-    this._rowMap.length = count;
-    await liveView.selectMessages();
-    if (generation != this._viewGeneration || liveView != this._liveView) {
-      return;
+      await liveView.selectMessages();
+    } catch (error) {
+      if (generation != this._queryGeneration || liveView != this._liveView)
+        return;
+      throw error;
     }
   }
 
   /**
-   * Binds positional flat query chunks to the query that requested them.
+   * Binds positional query chunks to the query that requested them.
    *
    * @param {number} generation - The current query generation.
    * @returns {nsILiveViewListener} A listener with guarded chunk delivery.
@@ -339,6 +360,10 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     const adapter = this;
     return {
       QueryInterface: ChromeUtils.generateQI(["nsILiveViewListener"]),
+      panoramaThreadBatchVersion: 1,
+      panoramaThreadBatchGeneration: adapter._viewGeneration,
+      panoramaThreadBatchOwner: adapter,
+      panoramaThreadBatchInvalidated: adapter.panoramaThreadBatchInvalidated,
       onMessageAdded: message =>
         adapter._liveView && adapter.onMessageAdded(message),
       onMessageRemoved: message =>
@@ -348,7 +373,7 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       onMessageTagsChanged: (message, tags) =>
         adapter._liveView && adapter.onMessageTagsChanged(message, tags),
       onSelectedChunk(messages, start, end) {
-        if (adapter._liveView && generation == adapter._viewGeneration) {
+        if (adapter._liveView && generation == adapter._queryGeneration) {
           adapter.onSelectedChunk(messages, start, end);
         }
       },
@@ -356,8 +381,7 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   }
 
   /**
-   * Prepares a complete flat update without changing visible rows or selection.
-   * Grouped variants and sparse flat caches remain held in this draft.
+   * Prepares captured rows and complete affected groups without notifying the tree.
    *
    * @param {object} batch - The version 1 captured descriptor.
    * @returns {object} Prepared rows, updates and selected physical identities.
@@ -366,7 +390,7 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
   _prepareThreadBatch(batch) {
     if (
       typeof batch.batchId != "string" ||
-      !/^(0|[1-9][0-9]*)$/.test(batch.batchId) ||
+      !/^[1-9][0-9]*$/.test(batch.batchId) ||
       (this._threadBatchId !== null &&
         BigInt(batch.batchId) <= this._threadBatchId) ||
       !Array.isArray(batch.rows) ||
@@ -442,11 +466,94 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     }
     validateThreadBatchGroups(batch.groups.before, sides.before);
     validateThreadBatchGroups(batch.groups.after, sides.after);
-    if (this._threadBatchGrouping != Ci.nsILiveView.UNTHREADED) {
-      throw new Error("Thread batch grouped consumer is held");
+    if (this.selection && !("_shiftSelectPivot" in this.selection)) {
+      throw new Error("Thread batch requires concrete TreeSelection");
     }
-    if (Array.from(this._rowMap).some(row => !row)) {
-      throw new Error("Thread batch sparse flat consumer is held");
+    if (this._tree && typeof this._tree.reset != "function") {
+      throw new Error("Thread batch requires a tree reset");
+    }
+    this._validateCachedThreadBatch(
+      changes,
+      batch.componentThreadIds.before,
+      foldersByKey
+    );
+    const beforeView = this._prepareBatchBeforeView(
+      batch.beforeView,
+      foldersByKey,
+      changes
+    );
+    if (this._threadBatchGrouping != Ci.nsILiveView.UNTHREADED) {
+      const kind =
+        this._threadBatchGrouping == Ci.nsILiveView.THREADED
+          ? "thread"
+          : "sort";
+      for (const group of [...batch.groups.before, ...batch.groups.after]) {
+        if (
+          group.key.kind != kind ||
+          (kind == "thread" && !isThreadBatchUint32(group.key.value)) ||
+          (typeof group.key.value == "number" &&
+            !Number.isSafeInteger(group.key.value))
+        ) {
+          throw new Error("Invalid thread batch grouping key");
+        }
+      }
+      if (
+        (sides.before.size && !batch.groups.before.length) ||
+        (sides.after.size && !batch.groups.after.length)
+      ) {
+        throw new Error(
+          "Thread batch grouped consumer is held without complete groups"
+        );
+      }
+      return this._prepareGroupedThreadBatch(
+        batch,
+        changes,
+        sides,
+        foldersByKey,
+        beforeView
+      );
+    }
+    const cachedRows = new Map(
+      this._rowMap
+        .filter(Boolean)
+        .map(row => [threadBatchKey(row.message), row])
+    );
+    const saved = beforeView?.contextual
+      ? this._captureBatchSelection(beforeView)
+      : null;
+    const oldRows = beforeView?.contextual
+      ? beforeView.roots
+          .map(
+            entry =>
+              cachedRows.get(threadBatchKey(entry.message)) ??
+              this._setUpRow(entry.message)
+          )
+          .sort((a, b) => {
+            const ai = beforeView.oldOrder.indexOf(threadBatchKey(a.message));
+            const bi = beforeView.oldOrder.indexOf(threadBatchKey(b.message));
+            return (ai < 0 ? Infinity : ai) - (bi < 0 ? Infinity : bi);
+          })
+      : beforeView
+        ? Array.from(
+            this._rowMap,
+            (row, index) =>
+              row ?? this._setUpRow(beforeView.roots[index].message)
+          )
+        : this._rowMap;
+    if (Array.from(oldRows).some(row => !row)) {
+      if (
+        typeof this._liveView.countMessages != "function" ||
+        typeof this._liveView.selectMessages != "function"
+      ) {
+        throw new Error(
+          "Thread batch sparse flat consumer is held without query support"
+        );
+      }
+      return {
+        refresh: true,
+        selection: this._captureBatchSelection(beforeView),
+        beforeView,
+      };
     }
     const selection = this.selection;
     if (selection && !("_shiftSelectPivot" in selection)) {
@@ -456,12 +563,12 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       throw new Error("Thread batch requires a tree reset");
     }
     const selected = new Set();
-    const current = this._rowMap[selection?.currentIndex];
-    const pivot = this._rowMap[selection?.shiftSelectPivot];
+    const current = oldRows[selection?.currentIndex];
+    const pivot = oldRows[selection?.shiftSelectPivot];
     const existing = new Map();
     const next = [];
     const updates = [];
-    for (const [index, row] of this._rowMap.entries()) {
+    for (const [index, row] of oldRows.entries()) {
       const key = threadBatchKey(row.message, foldersByKey);
       if (existing.has(key)) {
         throw new Error("Duplicate cached physical row");
@@ -516,6 +623,7 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     return {
       rows: next.map(item => item.row),
       updates,
+      saved,
       selected,
       current,
       pivot,
@@ -544,6 +652,22 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       return true;
     }
     const plan = this._prepareThreadBatch(batch);
+    if (plan.refresh) {
+      for (const row of plan.pendingGroups ?? []) {
+        if (typeof row._childrenGeneration == "number")
+          row._childrenGeneration++;
+      }
+      this._threadBatchId = BigInt(batch.batchId);
+      this._batchRefreshPromise = this._refreshSparseThreadBatch(
+        plan.selection,
+        plan
+      ).catch(error => this._invalidateThreadBatch(error));
+      return true;
+    }
+    if (plan.grouped) {
+      this._installGroupedThreadBatch(plan, batch);
+      return true;
+    }
     const selection = this.selection;
     const suppressed = selection?.selectEventsSuppressed;
     if (selection) {
@@ -555,9 +679,10 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       }
       this._rowMap = plan.rows;
       this._clearFlatRowCache();
-      this._viewGeneration++;
+      this._queryGeneration++;
       this._threadBatchId = BigInt(batch.batchId);
-      if (selection) {
+      if (plan.saved) this._restoreBatchSelection(plan.saved);
+      else if (selection) {
         selection.clearSelection();
         for (const [index, row] of plan.rows.entries()) {
           if (plan.selected.has(row)) {
@@ -569,12 +694,1143 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
         selection._shiftSelectPivot = pivot < 0 ? null : pivot;
       }
       this._tree?.reset();
+    } catch (error) {
+      this._invalidateThreadBatch(error);
+      throw error;
     } finally {
       if (selection) {
         selection.selectEventsSuppressed = suppressed;
       }
     }
     return true;
+  }
+
+  /**
+   * Validates the native pre-insert query and copies its complete physical mapping.
+   *
+   * @param {object} [input] - Owned old roots and members from the native query.
+   * @param {Map<number, number>} foldersByKey - Global physical key bindings.
+   * @param {Map<string, object>} changes - Captured component preimages.
+   * @returns {object|null} Validated old query, or null for older private fixtures.
+   * @throws {Error} If the query configuration, membership or loaded roots differ.
+   */
+  _prepareBatchBeforeView(input, foldersByKey, changes) {
+    if (input === undefined) return null;
+    if (input && Object.hasOwn(input, "displayView"))
+      return this._prepareContextualBatchView(input, foldersByKey, changes);
+    if (
+      !input ||
+      input.grouping !== this._threadBatchGrouping ||
+      input.sortColumn !== columns[this.sortColumn] ||
+      input.sortDescending !== (this.sortDirection == "descending") ||
+      !Array.isArray(input.roots) ||
+      input.roots.length != this._rowMap.length
+    )
+      throw new Error("Thread batch old query configuration differs");
+    const seen = new Set();
+    const roots = input.roots.map((entry, index) => {
+      const message = copyThreadBatchRow(entry.message);
+      const key = threadBatchKey(message, foldersByKey);
+      if (typeof entry.group != "string" || !Array.isArray(entry.members))
+        throw new Error("Invalid thread batch old query root");
+      const members = entry.members.map(copyThreadBatchRow);
+      const grouped = this._threadBatchGrouping != Ci.nsILiveView.UNTHREADED;
+      if (grouped ? !members.length : members.length)
+        throw new Error("Incomplete thread batch old query members");
+      const identities = (grouped ? members : [message]).map(member => {
+        const identity = threadBatchKey(member, foldersByKey);
+        if (seen.has(identity))
+          throw new Error("Duplicate thread batch old query member");
+        seen.add(identity);
+        const change = changes.get(identity);
+        if (
+          change &&
+          (!change.matchesBefore ||
+            threadBatchFields.some(field =>
+              field == "date"
+                ? member.date.valueOf() != change.before.date.valueOf()
+                : member[field] !== change.before[field]
+            ))
+        )
+          throw new Error(
+            "Thread batch old query differs from captured preimage"
+          );
+        if (
+          this._threadBatchGrouping == Ci.nsILiveView.THREADED &&
+          member.threadId != message.threadId
+        )
+          throw new Error("Thread batch old query crosses threads");
+        return identity;
+      });
+      if (!identities.includes(key))
+        throw new Error("Missing old query representative");
+      const representative = grouped
+        ? members.find(member => threadBatchKey(member) == key)
+        : message;
+      if (
+        threadBatchFields.some(field =>
+          field == "date"
+            ? message.date.valueOf() != representative.date.valueOf()
+            : message[field] !== representative[field]
+        )
+      )
+        throw new Error(
+          "Thread batch old query representative differs from member"
+        );
+      if (
+        this._threadBatchGrouping == Ci.nsILiveView.THREADED &&
+        entry.group !== String(message.threadId)
+      )
+        throw new Error("Thread batch old query group differs");
+      const row = this._rowMap[index];
+      if (row) {
+        const summary = row.thread ?? row.message;
+        if (
+          (summary && threadBatchKey(summary, foldersByKey) != key) ||
+          (!summary && String(row.group) !== entry.group)
+        )
+          throw new Error(
+            "Thread batch old query order differs from cached roots"
+          );
+        if (
+          row instanceof LiveViewThreadDataRow &&
+          row.children.length != members.length - 1
+        )
+          throw new Error("Thread batch old query child count differs");
+        if (
+          row instanceof LiveViewGroupedHeaderRow &&
+          row.children.length != members.length
+        )
+          throw new Error("Thread batch old query child count differs");
+        const ordered =
+          row instanceof LiveViewThreadDataRow
+            ? LiveViewThreadedDataAdapter.sortThread(
+                members.map(member => ({ ...member }))
+              ).slice(1)
+            : members;
+        row.children.forEach((child, childIndex) => {
+          if (!child) return;
+          const expected = ordered[childIndex];
+          if (
+            !expected ||
+            threadBatchFields.some(field =>
+              field == "date"
+                ? child.message.date.valueOf() != expected.date.valueOf()
+                : child.message[field] !== expected[field]
+            )
+          )
+            throw new Error(
+              "Thread batch old query differs from cached children"
+            );
+        });
+      }
+      return { message, group: entry.group, members };
+    });
+    for (const [identity, change] of changes)
+      if (change.matchesBefore && !seen.has(identity))
+        throw new Error("Thread batch old query omits a component member");
+    return { roots };
+  }
+
+  /**
+   * Copies one complete native query independently of its current display position.
+   *
+   * @param {object} input - Captured configuration, roots and members.
+   * @param {Map<number, number>} folders - Global physical ownership bindings.
+   * @returns {object} Owned scalar rows and query metadata.
+   * @throws {Error} If physical membership or configuration is invalid.
+   */
+  _copyBatchQuery(input, folders) {
+    if (
+      !input ||
+      input.grouping !== this._threadBatchGrouping ||
+      !Object.values(columns).includes(input.sortColumn) ||
+      typeof input.sortDescending != "boolean" ||
+      !Array.isArray(input.roots)
+    )
+      throw new Error("Invalid captured query configuration");
+    const seen = new Set(),
+      groups = new Set();
+    const grouped = input.grouping != Ci.nsILiveView.UNTHREADED;
+    const roots = input.roots.map(entry => {
+      const message = copyThreadBatchRow(entry.message);
+      const key = threadBatchKey(message, folders);
+      if (
+        typeof entry.group != "string" ||
+        !Array.isArray(entry.members) ||
+        (grouped ? !entry.members.length : entry.members.length)
+      )
+        throw new Error("Incomplete captured query root");
+      const members = entry.members.map(copyThreadBatchRow);
+      const source = grouped ? members : [message];
+      for (const member of source) {
+        const identity = threadBatchKey(member, folders);
+        if (seen.has(identity))
+          throw new Error("Duplicate captured query member");
+        seen.add(identity);
+        if (
+          input.grouping == Ci.nsILiveView.THREADED &&
+          member.threadId != message.threadId
+        )
+          throw new Error("Captured query crosses threads");
+      }
+      const representative = source.find(
+        member => threadBatchKey(member) == key
+      );
+      if (
+        !representative ||
+        threadBatchFields.some(field =>
+          field == "date"
+            ? representative.date.valueOf() != message.date.valueOf()
+            : representative[field] !== message[field]
+        )
+      )
+        throw new Error("Captured query representative differs");
+      const groupKey = grouped ? entry.group : key;
+      if (groups.has(groupKey))
+        throw new Error("Duplicate captured query group");
+      groups.add(groupKey);
+      const aliases = entry.originalGroups ?? [];
+      if (
+        !Array.isArray(aliases) ||
+        aliases.some(alias => typeof alias != "string")
+      )
+        throw new Error("Invalid captured query group aliases");
+      return {
+        message,
+        group: entry.group,
+        members,
+        originalGroups: [...aliases],
+      };
+    });
+    return {
+      grouping: input.grouping,
+      sortColumn: input.sortColumn,
+      sortDescending: input.sortDescending,
+      roots,
+    };
+  }
+
+  /**
+   * Resolves the displayed query using original order and loaded physical anchors.
+   *
+   * @param {object} input - Current query plus the original displayed configuration.
+   * @param {Map<number, number>} folders - Global physical ownership bindings.
+   * @param {Map<string, object>} changes - Captured component preimages.
+   * @returns {object} Current roots, displayed root identities and stable old order.
+   * @throws {Error} If an unloaded identity has no original query evidence.
+   */
+  _prepareContextualBatchView(input, folders, changes) {
+    const current = this._copyBatchQuery(input, folders);
+    if (
+      current.sortColumn !== columns[this.sortColumn] ||
+      current.sortDescending !== (this.sortDirection == "descending")
+    )
+      throw new Error("Captured current query configuration differs");
+    const before = new Map(
+      current.roots.flatMap(entry =>
+        (current.grouping == Ci.nsILiveView.UNTHREADED
+          ? [entry.message]
+          : entry.members
+        ).map(message => [threadBatchKey(message), message])
+      )
+    );
+    for (const [key, change] of changes) {
+      const message = before.get(key);
+      if (
+        change.matchesBefore !== !!message ||
+        (message &&
+          threadBatchFields.some(field =>
+            field == "date"
+              ? message.date.valueOf() != change.before.date.valueOf()
+              : message[field] !== change.before[field]
+          ))
+      )
+        throw new Error("Captured query differs from component preimage");
+    }
+    const display =
+      input.displayView === null
+        ? null
+        : this._copyBatchQuery(input.displayView, folders);
+    const grouped = current.grouping != Ci.nsILiveView.UNTHREADED;
+    const keyFor = entry =>
+      grouped ? entry.group : threadBatchKey(entry.message);
+    const loadedKey = row =>
+      grouped
+        ? String(row.group ?? (row.thread ?? row.message).threadId)
+        : threadBatchKey(row.message);
+    const byKey = new Map();
+    for (const entry of display?.roots ?? []) {
+      byKey.set(keyFor(entry), entry);
+      for (const alias of entry.originalGroups) {
+        if (byKey.has(alias) && byKey.get(alias) !== entry)
+          throw new Error("Contradictory original query group alias");
+        byKey.set(alias, entry);
+      }
+    }
+    const order = input.displayView?.order ?? [];
+    if (!Array.isArray(order)) throw new Error("Invalid original query order");
+    const original = [],
+      originalKeys = new Set();
+    for (const entry of order) {
+      const pair = threadBatchKey(entry, folders);
+      if (typeof entry.group != "string")
+        throw new Error("Invalid original query group");
+      const key = grouped ? entry.group : pair;
+      if (originalKeys.has(key))
+        throw new Error("Duplicate original query root");
+      originalKeys.add(key);
+      const captured = byKey.get(key);
+      if (captured && !original.includes(captured)) original.push(captured);
+    }
+    const known = new Set(
+      this._rowMap.filter(Boolean).map(row => byKey.get(loadedKey(row)))
+    );
+    const remaining = original.filter(entry => !known.has(entry));
+    const holes = Array.from(this._rowMap).filter(row => !row).length;
+    if (holes && remaining.length != holes)
+      throw new Error("Incomplete original query identity mapping");
+    let index = 0;
+    const mappedRoots = Array.from(this._rowMap, row =>
+      row ? byKey.get(loadedKey(row)) : remaining[index++]
+    );
+    const oldOrder = mappedRoots.flatMap((entry, i) => {
+      const row = this._rowMap[i];
+      if (!grouped)
+        return row?.message
+          ? [threadBatchKey(row.message)]
+          : entry
+            ? [threadBatchKey(entry.message)]
+            : [];
+      if (row && !(this instanceof LiveViewConversationsDataAdapter)) {
+        const members = entry
+          ? this instanceof LiveViewGroupedDataAdapter
+            ? entry.members
+            : LiveViewThreadedDataAdapter.sortThread(
+                entry.members.map(message => ({ ...message }))
+              ).slice(1)
+          : [];
+        return [
+          row.message && threadBatchKey(row.message),
+          ...Array.from(row.children, (child, j) =>
+            child?.message
+              ? threadBatchKey(child.message)
+              : members[j] && threadBatchKey(members[j])
+          ),
+        ].filter(Boolean);
+      }
+      return (
+        entry?.members.map(message => threadBatchKey(message)) ??
+        (row?.message ? [threadBatchKey(row.message)] : [])
+      );
+    });
+    return { ...current, contextual: true, display, mappedRoots, oldOrder };
+  }
+
+  /**
+   * Captures selection identities without dereferencing unloaded rows.
+   *
+   * @param {object} [beforeView] - Validated old native roots and members.
+   * @returns {object} Selected, current and pivot physical keys or dummy rows.
+   * @throws {Error} If a selected slot has no loaded or captured physical identity.
+   */
+  _captureBatchSelection(beforeView = null) {
+    const selection = this.selection;
+    if (selection && !("_shiftSelectPivot" in selection)) {
+      throw new Error("Thread batch requires concrete TreeSelection");
+    }
+    const rows = this._batchVisibleRows(this._rowMap);
+    const fallback = [];
+    if (beforeView) {
+      const mappedRoots = beforeView.mappedRoots ?? beforeView.roots;
+      if (mappedRoots.length != this._rowMap.length)
+        throw new Error(
+          "Thread batch old query no longer matches visible roots"
+        );
+      for (const [i, entry] of mappedRoots.entries()) {
+        const row = this._rowMap[i];
+        const sortGroup = this instanceof LiveViewGroupedDataAdapter;
+        fallback.push(
+          sortGroup
+            ? entry && {
+                batchGroup: entry.group,
+                batchSortColumn: beforeView.display?.sortColumn,
+              }
+            : entry && threadBatchKey(entry.message)
+        );
+        if (!row?.open) continue;
+        if (!entry) {
+          fallback.push(...Array(row.children.length));
+          continue;
+        }
+        const members = sortGroup
+          ? entry.members
+          : LiveViewThreadedDataAdapter.sortThread(
+              entry.members.map(message => ({ ...message }))
+            ).slice(1);
+        if (members.length != row.children.length)
+          throw new Error(
+            "Thread batch old query no longer matches visible children"
+          );
+        fallback.push(...members.map(message => threadBatchKey(message)));
+      }
+    }
+    const required = [selection?.currentIndex, selection?.shiftSelectPivot];
+    const identities = rows.map((row, index) => {
+      const identity = row?.message
+        ? threadBatchKey(row.message)
+        : (row ?? fallback[index]);
+      if (
+        identity === undefined &&
+        (selection?.isSelected(index) || required.includes(index))
+      )
+        throw new Error(
+          "Thread batch cannot recover an unloaded selection identity"
+        );
+      return identity;
+    });
+    return {
+      selected: identities.filter(
+        (identity, index) =>
+          identity !== undefined && selection?.isSelected(index)
+      ),
+      current: identities[selection?.currentIndex],
+      pivot: identities[selection?.shiftSelectPivot],
+    };
+  }
+
+  /**
+   * Flattens open descendants while retaining unloaded slots.
+   *
+   * @param {TreeDataRow[]} roots - Top-level rows.
+   * @returns {TreeDataRow[]} Visible rows, including empty slots.
+   */
+  _batchVisibleRows(roots) {
+    const rows = [];
+    const append = list => {
+      for (const row of list) {
+        rows.push(row);
+        if (row?.open) append(row.children);
+      }
+    };
+    append(roots);
+    return rows;
+  }
+
+  /**
+   * Restores surviving physical selections before the final tree reset.
+   *
+   * @param {object} saved - Captured selection identities.
+   * @param {Map<string, TreeDataRow>} [membership] - Hidden conversation members.
+   */
+  _restoreBatchSelection(saved, membership = new Map()) {
+    const selection = this.selection;
+    if (!selection) return;
+    const rows = this._batchVisibleRows(this._rowMap);
+    const index = identity =>
+      rows.findIndex(
+        row =>
+          row &&
+          (row === identity ||
+            (identity?.batchGroup !== undefined &&
+              row instanceof LiveViewGroupedHeaderRow &&
+              String(row.group) === identity.batchGroup &&
+              (identity.batchSortColumn === undefined ||
+                identity.batchSortColumn === columns[this.sortColumn])) ||
+            (row.message && threadBatchKey(row.message) === identity) ||
+            row === membership.get(identity))
+      );
+    selection.clearSelection();
+    for (const identity of saved.selected) {
+      const position = index(identity);
+      if (position >= 0 && !selection.isSelected(position))
+        selection.toggleSelect(position);
+    }
+    selection.currentIndex = index(saved.current);
+    const pivot = index(saved.pivot);
+    selection._shiftSelectPivot = pivot < 0 ? null : pivot;
+  }
+
+  /**
+   * Buffers a new positional query and installs one settled view.
+   * Affected group facts come from the prepared descriptor.
+   *
+   * @param {object} saved - Loaded physical selection identities.
+   * @param {object} plan - Captured matching rows and complete affected groups.
+   * @returns {Promise<void>} Resolves after installation or consumer invalidation.
+   */
+  async _refreshSparseThreadBatch(saved, plan) {
+    const liveView = this._liveView;
+    const generation = ++this._queryGeneration;
+    const listener = this._makeQueryListener(generation);
+    const messages = [];
+    listener.onSelectedChunk = (chunk, start, end) => {
+      if (liveView != this._liveView || generation != this._queryGeneration)
+        return;
+      for (let i = start; i <= end; i++) messages[i] = chunk[i];
+    };
+    this._queryListener = listener;
+    liveView.setListener(listener);
+    try {
+      const count = await liveView.countMessages();
+      if (liveView != this._liveView || generation != this._queryGeneration)
+        return;
+      const complete = await liveView.selectMessages();
+      if (liveView != this._liveView || generation != this._queryGeneration)
+        return;
+      const result = complete ?? messages;
+      if (
+        result.length != count ||
+        Array.from(result).some(message => !message)
+      ) {
+        throw new Error("Incomplete thread batch refresh");
+      }
+      const cached = new Map();
+      const oldRoots = this._rowMap.filter(Boolean);
+      const collect = list =>
+        list.forEach(row => {
+          if (!row) return;
+          if (row.message) cached.set(threadBatchKey(row.message), row);
+          collect(row.children);
+        });
+      collect(oldRoots);
+      const rows = [],
+        installs = [],
+        membership = new Map(),
+        capturedGroups = new Set();
+      for (const selectedSummary of result) {
+        let summary = selectedSummary;
+        if (this._threadBatchGrouping == Ci.nsILiveView.UNTHREADED) {
+          rows.push(
+            cached.get(threadBatchKey(summary)) ?? new LiveViewDataRow(summary)
+          );
+          continue;
+        }
+        const sortGroups = this instanceof LiveViewGroupedDataAdapter;
+        const conversations = this instanceof LiveViewConversationsDataAdapter;
+        const key = sortGroups
+          ? summary[this.sortColumn == "date" ? "dateGroup" : this.sortColumn]
+          : summary.threadId;
+        const captured = plan?.groups?.after.find(
+          group =>
+            group.key.value === key ||
+            (sortGroups &&
+              this.sortColumn != "date" &&
+              group.members.some(
+                pair =>
+                  plan.sides.after.get(threadBatchKey(pair))[
+                    this.sortColumn
+                  ] === key
+              ))
+        );
+        if (captured) capturedGroups.add(captured);
+        const members = captured
+          ? captured.members.map(pair =>
+              plan.sides.after.get(threadBatchKey(pair))
+            )
+          : await liveView.selectMessagesInGroup(key);
+        const keys = new Set(members.map(message => threadBatchKey(message)));
+        const previous = oldRoots.filter(row => {
+          if ((sortGroups ? row.group : row.message.threadId) === key)
+            return true;
+          return (
+            !sortGroups &&
+            plan?.groups?.before.some(
+              group =>
+                group.key.value == row.message.threadId &&
+                group.members.some(pair => keys.has(threadBatchKey(pair)))
+            )
+          );
+        });
+        const old = previous[0];
+        if (captured) {
+          summary = {
+            ...plan.sides.after.get(threadBatchKey(captured.representative)),
+            messageCount: captured.messageCount,
+            newCount: captured.newCount,
+            unreadCount: captured.unreadCount,
+          };
+          if (sortGroups)
+            summary[this.sortColumn == "date" ? "dateGroup" : this.sortColumn] =
+              captured.key.value;
+        }
+        if (members.length != summary.messageCount)
+          throw new Error("Incomplete refreshed group");
+        const shouldOpen = () =>
+          !conversations &&
+          (previous.some(row => row.open) ||
+            [...saved.selected, saved.current, saved.pivot].some(identity =>
+              keys.has(identity)
+            ));
+        const sorted = conversations
+          ? []
+          : sortGroups
+            ? members.sort((a, b) =>
+                this._compareMessages(a, b)
+                  ? -1
+                  : this._compareMessages(b, a)
+                    ? 1
+                    : 0
+              )
+            : LiveViewThreadedDataAdapter.sortThread(members);
+        const first = !conversations && !sortGroups ? sorted.shift() : summary;
+        const displayed = shouldOpen() && !sortGroups ? first : summary;
+        const root = sortGroups
+          ? (old ?? this._newBatchGroupRow(summary))
+          : (previous.find(
+              row => threadBatchKey(row.message) == threadBatchKey(displayed)
+            ) ?? this._newBatchGroupRow(summary));
+        const children = [];
+        for (const message of sorted) {
+          let row = cached.get(threadBatchKey(message));
+          if (!row || row === root) row = new LiveViewDataRow(message);
+          children.push(row);
+          installs.push(() => {
+            if (row instanceof LiveViewThreadDataRow)
+              row._installThreadBatchLeaf(message);
+            else row._initFromMessage(message);
+          });
+        }
+        const preparedHeader = sortGroups
+          ? new LiveViewGroupedHeaderRow(summary, liveView)
+          : null;
+        installs.push(() => {
+          if (conversations) {
+            root._initFromMessage(summary);
+            root.messageCount = summary.messageCount;
+          } else
+            root._installThreadBatch({
+              summary,
+              first,
+              children,
+              open: shouldOpen(),
+              preparedHeader,
+            });
+        });
+        if (conversations)
+          for (const identity of keys) membership.set(identity, root);
+        rows.push(root);
+      }
+      if (liveView != this._liveView || generation != this._queryGeneration)
+        return;
+      if (
+        plan?.groups?.after.some(
+          group => group.members.length && !capturedGroups.has(group)
+        )
+      ) {
+        throw new Error("Refresh omits a captured affected group");
+      }
+      saved = this._captureBatchSelection(plan.beforeView);
+      const suppressed = this.selection?.selectEventsSuppressed;
+      if (this.selection) this.selection.selectEventsSuppressed = true;
+      try {
+        if (this._threadBatchGrouping == Ci.nsILiveView.UNTHREADED) {
+          rows.forEach((row, i) => row._initFromMessage(result[i]));
+        }
+        for (const install of installs) install();
+        this._rowMap = rows;
+        if (this._threadBatchGrouping != Ci.nsILiveView.UNTHREADED) {
+          this._setBatchGroupMap(
+            new Map(rows.map(row => [row.group ?? row.message.threadId, row]))
+          );
+        }
+        this._clearFlatRowCache();
+        this._restoreBatchSelection(saved, membership);
+        this._tree?.reset();
+      } finally {
+        if (this.selection) this.selection.selectEventsSuppressed = suppressed;
+      }
+    } catch (error) {
+      if (liveView == this._liveView && generation == this._queryGeneration) {
+        this._invalidateThreadBatch(error);
+      }
+    }
+  }
+
+  /**
+   * Allocates a group row without changing the adapter's group map.
+   *
+   * @param {object} message - Captured representative and aggregate totals.
+   * @returns {TreeDataRow} A detached row for the retained grouping mode.
+   */
+  _newBatchGroupRow(message) {
+    if (this instanceof LiveViewGroupedDataAdapter) {
+      return new LiveViewGroupedHeaderRow(message, this._liveView);
+    }
+    if (this instanceof LiveViewConversationsDataAdapter) {
+      const row = new LiveViewDataRow(message);
+      row.messageCount = message.messageCount;
+      return row;
+    }
+    return new LiveViewThreadDataRow(message, this._liveView);
+  }
+
+  /**
+   * Checks loaded preimages and records cached physical rows before mutation.
+   *
+   * @param {Map<string, object>} changes - Captured before/after rows.
+   * @param {number[]} componentIds - Complete affected old component IDs.
+   * @param {Map<number, number>} foldersByKey - Captured global key bindings.
+   * @returns {Map<string, LiveViewDataRow>} Loaded physical rows.
+   * @throws {Error} If a cached preimage differs or a component is incomplete.
+   */
+  _validateCachedThreadBatch(changes, componentIds, foldersByKey) {
+    const cached = new Map();
+    const allCached = list =>
+      list.forEach(row => {
+        if (!row) return;
+        if (row.message) {
+          const key = threadBatchKey(row.message, foldersByKey);
+          cached.set(key, row);
+          const change = changes.get(key);
+          if (
+            change &&
+            (!change.matchesBefore ||
+              threadBatchFields.some(field =>
+                field == "date"
+                  ? row.message.date.valueOf() != change.before.date.valueOf()
+                  : row.message[field] !== change.before[field]
+              ))
+          ) {
+            throw new Error("Thread batch preimage differs from cached row");
+          }
+          if (!change && componentIds.includes(row.message.threadId)) {
+            throw new Error("Thread batch omits a cached component member");
+          }
+        }
+        allCached(row.children);
+      });
+    allCached(this._rowMap);
+    return cached;
+  }
+
+  _matchesThreadBatchGroup(row, group, side) {
+    if (!(this instanceof LiveViewGroupedDataAdapter))
+      return row.message.threadId == group.key.value;
+    if (row.group === group.key.value) return true;
+    if (this.sortColumn == "date") return false;
+    return group.members.some(
+      pair => side.get(threadBatchKey(pair))?.[this.sortColumn] === row.group
+    );
+  }
+
+  /**
+   * Prepares an unloaded root from owned old query facts without a new query.
+   *
+   * @param {object} entry - Captured old representative, group key and members.
+   * @param {Map<string, LiveViewDataRow>} [cached] - Surviving physical rows.
+   * @returns {TreeDataRow} A detached closed root with complete physical children.
+   */
+  _rootFromBatchBefore(entry, cached = new Map()) {
+    const state = this._stateFromBatchBefore(entry, cached);
+    const root = this._newBatchGroupRow(state.summary);
+    if (!(this instanceof LiveViewConversationsDataAdapter))
+      root._installThreadBatch(state);
+    return root;
+  }
+
+  /**
+   * Prepares complete children for one captured group without updating cached rows.
+   *
+   * @param {object} entry - Captured representative and members.
+   * @param {Map<string, LiveViewDataRow>} cached - Surviving physical row objects.
+   * @param {TreeDataRow} [root] - An existing container that must not be its own child.
+   * @returns {object} Detached group state for atomic installation.
+   */
+  _stateFromBatchBefore(entry, cached, root) {
+    const sortGroups = this instanceof LiveViewGroupedDataAdapter;
+    const summary = {
+      ...entry.message,
+      messageCount: entry.members.length,
+      newCount: entry.members.filter(
+        message => message.flags & Ci.nsMsgMessageFlags.New
+      ).length,
+      unreadCount: entry.members.filter(
+        message => !(message.flags & Ci.nsMsgMessageFlags.Read)
+      ).length,
+    };
+    if (sortGroups)
+      summary[this.sortColumn == "date" ? "dateGroup" : this.sortColumn] =
+        this.sortColumn == "date" ? Number(entry.group) : entry.group;
+    const ordered = sortGroups
+      ? entry.members
+      : LiveViewThreadedDataAdapter.sortThread(
+          entry.members.map(message => ({ ...message }))
+        );
+    const first = sortGroups ? summary : ordered.shift();
+    return {
+      summary,
+      first,
+      children: ordered.map(message => {
+        const row = cached.get(threadBatchKey(message));
+        return row && row !== root ? row : new LiveViewDataRow(message);
+      }),
+      open: root?.open ?? false,
+      preparedHeader: sortGroups
+        ? new LiveViewGroupedHeaderRow(summary, this._liveView)
+        : null,
+    };
+  }
+
+  /**
+   * Prepares complete group replacements and reuses loaded physical rows.
+   *
+   * @param {object} batch - Validated captured memberships and group totals.
+   * @param {Map<string, object>} changes - Validated captured changes.
+   * @param {object} sides - Matching before/after rows keyed by physical identity.
+   * @param {Map<number, number>} foldersByKey - Captured global key bindings.
+   * @param {object|null} beforeView - Validated old native roots and members.
+   * @returns {object} Detached rows, map, selection and installation work.
+   */
+  _prepareGroupedThreadBatch(batch, changes, sides, foldersByKey, beforeView) {
+    const saved = this._captureBatchSelection(beforeView);
+    const cached = this._validateCachedThreadBatch(
+      changes,
+      batch.componentThreadIds.before,
+      foldersByKey
+    );
+    const baseInstalls = [];
+    const rootEntries = new Map();
+    const sameSortGroup =
+      !(this instanceof LiveViewGroupedDataAdapter) ||
+      !beforeView?.contextual ||
+      beforeView.display?.sortColumn === columns[this.sortColumn];
+    const roots = beforeView?.contextual
+      ? beforeView.roots.map(entry => {
+          const keys = new Set(
+            entry.members.map(message => threadBatchKey(message))
+          );
+          const old =
+            sameSortGroup &&
+            this._rowMap.find(
+              row =>
+                row &&
+                (this instanceof LiveViewGroupedDataAdapter
+                  ? String(row.group) === entry.group ||
+                    beforeView.mappedRoots[
+                      this._rowMap.indexOf(row)
+                    ]?.members.some(message =>
+                      keys.has(threadBatchKey(message))
+                    )
+                  : (row.thread ?? row.message).threadId ===
+                    entry.message.threadId)
+            );
+          if (old) {
+            rootEntries.set(old, entry);
+            if (
+              Array.from(old.children).some(child => !child) &&
+              !(this instanceof LiveViewConversationsDataAdapter)
+            )
+              baseInstalls.push({
+                ...this._stateFromBatchBefore(entry, cached, old),
+                root: old,
+                sortGroups: this instanceof LiveViewGroupedDataAdapter,
+                conversations: false,
+              });
+            return old;
+          }
+          const root = this._rootFromBatchBefore(entry, cached);
+          rootEntries.set(root, entry);
+          if (
+            !(this instanceof LiveViewConversationsDataAdapter) &&
+            this._rowMap.some(
+              (row, i) =>
+                row?.open &&
+                beforeView.mappedRoots[i]?.members.some(message =>
+                  keys.has(threadBatchKey(message))
+                )
+            )
+          )
+            root.open = true;
+          return root;
+        })
+      : beforeView
+        ? Array.from(
+            this._rowMap,
+            (row, index) =>
+              row ?? this._rootFromBatchBefore(beforeView.roots[index])
+          )
+        : this._rowMap;
+    if (Array.from(roots).some(row => !row)) {
+      return {
+        refresh: true,
+        selection: saved,
+        beforeView,
+        sides,
+        pendingGroups: this._rowMap.filter(
+          row =>
+            row &&
+            batch.groups.before.some(group =>
+              this._matchesThreadBatchGroup(row, group, sides.before)
+            )
+        ),
+        groups: {
+          before: batch.groups.before.map(group => ({
+            ...group,
+            key: { ...group.key },
+            members: group.members.map(pair => ({ ...pair })),
+          })),
+          after: batch.groups.after.map(group => ({
+            ...group,
+            key: { ...group.key },
+            representative: group.representative && { ...group.representative },
+            members: group.members.map(pair => ({ ...pair })),
+          })),
+        },
+      };
+    }
+    const collect = list =>
+      list.forEach(row => {
+        if (row.message && !cached.has(threadBatchKey(row.message)))
+          cached.set(threadBatchKey(row.message), row);
+        collect(row.children);
+      });
+    collect(roots);
+    const oldOrder = beforeView?.contextual
+      ? beforeView.oldOrder
+      : beforeView
+        ? beforeView.roots.flatMap(entry =>
+            entry.members.map(message => threadBatchKey(message))
+          )
+        : [...cached.keys()];
+    const sortGroups = this instanceof LiveViewGroupedDataAdapter;
+    const conversations = this instanceof LiveViewConversationsDataAdapter;
+    const matchesGroup = (row, group, side) => {
+      const entry = rootEntries.get(row);
+      if (entry)
+        return (
+          entry.group === String(group.key.value) ||
+          entry.members.some(message =>
+            group.members.some(
+              pair => threadBatchKey(pair) === threadBatchKey(message)
+            )
+          )
+        );
+      return this._matchesThreadBatchGroup(row, group, side);
+    };
+    const affected = new Set(
+      roots.filter(row =>
+        batch.groups.before.some(group =>
+          matchesGroup(row, group, sides.before)
+        )
+      )
+    );
+    const map = beforeView?.contextual
+      ? new Map()
+      : new Map(this._getBatchGroupMap());
+    for (const root of roots)
+      map.set(root.group ?? root.message.threadId, root);
+    for (const [key, row] of map) if (affected.has(row)) map.delete(key);
+    const rootOrder = row => {
+      const loaded = this._rowMap.indexOf(row);
+      if (loaded >= 0) return loaded;
+      if (beforeView?.contextual && sameSortGroup) {
+        const key = String(row.group ?? (row.thread ?? row.message).threadId);
+        const old = beforeView.mappedRoots.findIndex(
+          entry =>
+            entry && (entry.group === key || entry.originalGroups.includes(key))
+        );
+        if (old >= 0) return old;
+      }
+      return roots.indexOf(row);
+    };
+    const next = roots
+      .filter(row => !affected.has(row))
+      .map(row => ({
+        row,
+        message: row.thread ?? row.message,
+        order: rootOrder(row),
+      }));
+    const updates = new Map();
+    const installs = baseInstalls.filter(item => !affected.has(item.root));
+    const membership = new Map();
+    for (const group of batch.groups.after) {
+      if (!group.members.length) continue;
+      const members = group.members.map(pair =>
+        sides.after.get(threadBatchKey(pair))
+      );
+      const keys = new Set(group.members.map(pair => threadBatchKey(pair)));
+      const previous = [...affected].filter(row => {
+        if (
+          !sortGroups &&
+          batch.groups.before.some(
+            before =>
+              matchesGroup(row, before, sides.before) &&
+              before.members.some(pair => keys.has(threadBatchKey(pair)))
+          )
+        )
+          return true;
+        return sortGroups && matchesGroup(row, group, sides.after);
+      });
+      const selected = [...saved.selected, saved.current, saved.pivot].some(
+        key => keys.has(key)
+      );
+      const open =
+        !conversations && (previous.some(row => row.open) || selected);
+      const representative = sides.after.get(
+        threadBatchKey(group.representative)
+      );
+      const summary = {
+        ...representative,
+        messageCount: group.messageCount,
+        newCount: group.newCount,
+        unreadCount: group.unreadCount,
+      };
+      if (sortGroups)
+        summary[this.sortColumn == "date" ? "dateGroup" : this.sortColumn] =
+          group.key.value;
+      const ordered = members.toSorted((a, b) => {
+        const ai = oldOrder.indexOf(threadBatchKey(a));
+        const bi = oldOrder.indexOf(threadBatchKey(b));
+        return (ai < 0 ? Infinity : ai) - (bi < 0 ? Infinity : bi);
+      });
+      const sorted = conversations
+        ? []
+        : sortGroups
+          ? ordered.sort((a, b) =>
+              this._compareMessages(a, b)
+                ? -1
+                : this._compareMessages(b, a)
+                  ? 1
+                  : 0
+            )
+          : LiveViewThreadedDataAdapter.sortThread(ordered);
+      const first =
+        !conversations && !sortGroups ? sorted.shift() : representative;
+      const displayed = open && !sortGroups ? first : representative;
+      const root = sortGroups
+        ? (previous[0] ?? this._newBatchGroupRow(summary))
+        : (previous.find(
+            row => threadBatchKey(row.message) == threadBatchKey(displayed)
+          ) ?? this._newBatchGroupRow(summary));
+      const children = [];
+      for (const message of sorted) {
+        let row = cached.get(threadBatchKey(message));
+        if (!row || row === root) row = new LiveViewDataRow(message);
+        new LiveViewDataRow(message).getText("date");
+        updates.set(row, message);
+        children.push(row);
+      }
+      const preparedHeader = sortGroups
+        ? new LiveViewGroupedHeaderRow(summary, this._liveView)
+        : null;
+      installs.push({
+        root,
+        summary,
+        first,
+        children,
+        open,
+        sortGroups,
+        conversations,
+        preparedHeader,
+      });
+      const key = sortGroups ? group.key.value : representative.threadId;
+      map.set(key, root);
+      next.push({
+        row: root,
+        message: summary,
+        order: Math.min(...previous.map(rootOrder)),
+      });
+      if (conversations)
+        for (const pair of group.members)
+          membership.set(threadBatchKey(pair), root);
+    }
+    next.sort((a, b) => {
+      if (sortGroups) {
+        const aKey =
+          installs.find(item => item.root === a.row)?.summary[
+            this.sortColumn == "date" ? "dateGroup" : this.sortColumn
+          ] ?? a.row.group;
+        const bKey =
+          installs.find(item => item.root === b.row)?.summary[
+            this.sortColumn == "date" ? "dateGroup" : this.sortColumn
+          ] ?? b.row.group;
+        const compared =
+          typeof aKey == "number"
+            ? aKey - bKey
+            : lazy.collator.compare(aKey, bKey);
+        return (
+          (this.sortDirection == "ascending" ? compared : -compared) ||
+          a.order - b.order
+        );
+      }
+      return this._compareMessages(a.message, b.message)
+        ? -1
+        : this._compareMessages(b.message, a.message)
+          ? 1
+          : a.order - b.order;
+    });
+    return {
+      grouped: true,
+      rows: next.map(item => item.row),
+      updates,
+      installs,
+      map,
+      saved,
+      membership,
+    };
+  }
+
+  /**
+   * Installs prepared groups and restores selection before one tree reset.
+   *
+   * @param {object} plan - Detached replacements and surviving row updates.
+   * @param {object} batch - The committed batch identifier.
+   */
+  _installGroupedThreadBatch(plan, batch) {
+    const selection = this.selection;
+    const suppressed = selection?.selectEventsSuppressed;
+    if (selection) selection.selectEventsSuppressed = true;
+    try {
+      for (const [row, message] of plan.updates) {
+        if (row instanceof LiveViewThreadDataRow)
+          row._installThreadBatchLeaf(message);
+        else row._initFromMessage(message);
+      }
+      for (const item of plan.installs) {
+        if (item.conversations) {
+          item.root._initFromMessage(item.summary);
+          item.root.messageCount = item.summary.messageCount;
+        } else item.root._installThreadBatch(item);
+      }
+      this._rowMap = plan.rows;
+      this._setBatchGroupMap(plan.map);
+      this._clearFlatRowCache();
+      this._queryGeneration++;
+      this._threadBatchId = BigInt(batch.batchId);
+      this._restoreBatchSelection(plan.saved, plan.membership);
+      this._tree?.reset();
+    } catch (error) {
+      this._invalidateThreadBatch(error);
+      throw error;
+    } finally {
+      if (selection) selection.selectEventsSuppressed = suppressed;
+    }
+  }
+
+  /**
+   * Detaches a failed committed consumer and clears its invalid visible state.
+   *
+   * @param {Error} [error] - The reported consumer failure.
+   */
+  _invalidateThreadBatch(error) {
+    this._queryGeneration++;
+    this._viewGeneration++;
+    this._liveView?.clearListener(this._queryListener ?? this);
+    this._liveView = null;
+    this._rowMap = [];
+    this._clearFlatRowCache();
+    this.selection?.clearSelection();
+    if (this.selection) {
+      this.selection.currentIndex = -1;
+      this.selection._shiftSelectPivot = null;
+    }
+    try {
+      this._tree?.reset();
+    } catch (resetError) {
+      console.error(resetError);
+    }
+    console.error(error ?? "Committed thread batch consumer invalidated");
   }
 
   /**
@@ -753,6 +2009,13 @@ export class LiveViewThreadedDataAdapter extends LiveViewDataAdapter {
    */
   #threads = new Map();
 
+  _getBatchGroupMap() {
+    return this.#threads;
+  }
+  _setBatchGroupMap(map) {
+    this.#threads = map;
+  }
+
   /**
    * @param {nsILiveView} liveView
    */
@@ -877,6 +2140,13 @@ export class LiveViewConversationsDataAdapter extends LiveViewDataAdapter {
    * @type {Map<number, LiveViewDataRow>}
    */
   #threads = new Map();
+
+  _getBatchGroupMap() {
+    return this.#threads;
+  }
+  _setBatchGroupMap(map) {
+    this.#threads = map;
+  }
 
   /**
    * @param {nsILiveView} liveView
@@ -1003,6 +2273,13 @@ export class LiveViewGroupedDataAdapter extends LiveViewDataAdapter {
    * @type {Map<(number|string), LiveViewGroupedHeaderRow>}
    */
   #groups = new Map();
+
+  _getBatchGroupMap() {
+    return this.#groups;
+  }
+  _setBatchGroupMap(map) {
+    this.#groups = map;
+  }
 
   /**
    * @param {nsILiveView} liveView
@@ -1271,6 +2548,39 @@ class LiveViewThreadDataRow extends LiveViewDataRow {
     this.toggleProperty("hasUnread", !!value);
   }
 
+  _childrenGeneration = 0;
+
+  /**
+   * Reuses a former thread container as one physical child row.
+   *
+   * @param {Message} message - The captured surviving physical message.
+   */
+  _installThreadBatchLeaf(message) {
+    this._childrenGeneration++;
+    this.children = [];
+    this._open = false;
+    this.thread = this.#closedMessage = this.#openMessage = message;
+    this.newCount = this.unreadCount = 0;
+    this._initFromMessage(message);
+  }
+
+  /**
+   * Replaces one thread with captured facts and invalidates pending child queries.
+   *
+   * @param {object} state - Prepared summary, first message, children and expansion.
+   */
+  _installThreadBatch(state) {
+    const { summary, first, children, open } = state;
+    this._childrenGeneration++;
+    this.thread = this.#closedMessage = summary;
+    this.#openMessage = first;
+    this.children = children;
+    this._open = open;
+    this.newCount = summary.newCount;
+    this.unreadCount = summary.unreadCount;
+    this._initFromMessage(open ? first : summary);
+  }
+
   /**
    * Trigger loading of the child rows – it is an async function but you
    * should not wait for it. This is called before `open` is set.
@@ -1283,9 +2593,34 @@ class LiveViewThreadDataRow extends LiveViewDataRow {
       return;
     }
 
-    const messages = await this.#liveView.selectMessagesInGroup(
-      this.thread.threadId
-    );
+    const generation = this._childrenGeneration;
+    const attachment = dataAdapter._viewGeneration;
+    const liveView = this.#liveView;
+    let messages;
+    try {
+      messages = await this.#liveView.selectMessagesInGroup(
+        this.thread.threadId
+      );
+    } catch (error) {
+      if (
+        generation == this._childrenGeneration &&
+        attachment == dataAdapter._viewGeneration &&
+        liveView == dataAdapter._liveView &&
+        error.name != "AbortError"
+      ) {
+        this._childrenError = error;
+        console.error(error);
+        dataAdapter._tree?.invalidateRow(rootIndex);
+      }
+      return;
+    }
+    if (
+      generation != this._childrenGeneration ||
+      attachment != dataAdapter._viewGeneration ||
+      liveView != dataAdapter._liveView
+    )
+      return;
+    this._childrenError = null;
     const sortedMessages = LiveViewThreadedDataAdapter.sortThread(messages);
     this.#openMessage = sortedMessages[0];
 
@@ -1517,6 +2852,25 @@ class LiveViewGroupedHeaderRow extends TreeDataRow {
     this.toggleProperty("hasUnread", !!value);
   }
 
+  _childrenGeneration = 0;
+
+  /**
+   * Replaces a dummy group's captured members, totals and prepared display text.
+   *
+   * @param {object} state - Prepared summary, children, expansion and header row.
+   */
+  _installThreadBatch(state) {
+    const { summary, children, open, preparedHeader: prepared } = state;
+    this._childrenGeneration++;
+    this.texts = prepared.texts;
+    this.values = prepared.values;
+    this.group = prepared.group;
+    this.children = children;
+    this._open = open;
+    this.newCount = summary.newCount;
+    this.unreadCount = summary.unreadCount;
+  }
+
   /**
    * Trigger loading of the child rows – it is an async function but you
    * should not wait for it. This is called before `open` is set.
@@ -1529,7 +2883,32 @@ class LiveViewGroupedHeaderRow extends TreeDataRow {
       return;
     }
 
-    const messages = await this.#liveView.selectMessagesInGroup(this.group);
+    const generation = this._childrenGeneration;
+    const attachment = dataAdapter._viewGeneration;
+    const liveView = this.#liveView;
+    let messages;
+    try {
+      messages = await this.#liveView.selectMessagesInGroup(this.group);
+    } catch (error) {
+      if (
+        generation == this._childrenGeneration &&
+        attachment == dataAdapter._viewGeneration &&
+        liveView == dataAdapter._liveView &&
+        error.name != "AbortError"
+      ) {
+        this._childrenError = error;
+        console.error(error);
+        dataAdapter._tree?.invalidateRow(rootIndex);
+      }
+      return;
+    }
+    if (
+      generation != this._childrenGeneration ||
+      attachment != dataAdapter._viewGeneration ||
+      liveView != dataAdapter._liveView
+    )
+      return;
+    this._childrenError = null;
     for (let i = 0; i < this.children.length; i++) {
       const message = messages[i];
       this.children[i] = new LiveViewDataRow(message);

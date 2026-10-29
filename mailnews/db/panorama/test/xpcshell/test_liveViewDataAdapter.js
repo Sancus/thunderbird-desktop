@@ -245,9 +245,10 @@ function threadBatchRow(id, folderId = 1) {
  * Creates a flat adapter without a native emitter, retaining real row/selection code.
  *
  * @param {object[]} messages - Existing loaded rows.
+ * @param {Function} [Adapter=LiveViewDataAdapter] - The retained adapter type.
  * @returns {object} The adapter, input facade, tree observations and selection.
  */
-function threadBatchFixture(messages) {
+function threadBatchFixture(messages, Adapter = LiveViewDataAdapter) {
   const liveView = {
     listener: null,
     setListener(listener) {
@@ -259,8 +260,13 @@ function threadBatchFixture(messages) {
       }
     },
   };
-  const adapter = new LiveViewDataAdapter(liveView);
-  adapter.sortColumn = "date";
+  const adapter = new Adapter(liveView);
+  liveView.sortColumn =
+    Adapter == LiveViewGroupedDataAdapter
+      ? Ci.nsILiveView.SUBJECT
+      : Ci.nsILiveView.DATE;
+  adapter.sortColumn =
+    Adapter == LiveViewGroupedDataAdapter ? "subject" : "date";
   adapter.sortDirection = "ascending";
   adapter.onSelectedChunk(messages, 0, messages.length - 1);
   const tree = {
@@ -273,8 +279,8 @@ function threadBatchFixture(messages) {
     reset() {
       this.resets.push(
         Array.from({ length: adapter.rowCount }, (_, i) => [
-          adapter.rowAt(i).message.folderId,
-          adapter.rowAt(i).message.id,
+          adapter.rowAt(i).message?.folderId,
+          adapter.rowAt(i).message?.id,
         ])
       );
     },
@@ -758,3 +764,1361 @@ add_task(function test_threadBatchPreservesCapturedThreadAbsenceValues() {
   Assert.equal(adapter.rowAt(0).message.threadParent, 0);
   Assert.equal(tree.resets.length, 1);
 });
+
+/**
+ * Captures complete groups from literal rows, without consulting the live facade.
+ *
+ * @param {object[]} messages - Matching captured facts for one side.
+ * @param {string} [column="threadId"] - The grouping field.
+ * @returns {object[]} Complete group memberships and independently counted totals.
+ */
+function capturedThreadGroups(messages, column = "threadId") {
+  const groups = new Map();
+  for (const message of messages) {
+    const value = message[column];
+    if (!groups.has(value)) {
+      groups.set(value, {
+        key: { kind: column == "threadId" ? "thread" : "sort", value },
+        representative: { folderId: message.folderId, id: message.id },
+        members: [],
+        messageCount: 0,
+        newCount: 0,
+        unreadCount: 0,
+      });
+    }
+    const group = groups.get(value);
+    group.members.push({ folderId: message.folderId, id: message.id });
+    group.messageCount++;
+    group.newCount += !!(message.flags & Ci.nsMsgMessageFlags.New);
+    group.unreadCount += !(message.flags & Ci.nsMsgMessageFlags.Read);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * Adds complete captured groups to the existing physical merge fixture.
+ *
+ * @param {LiveViewDataAdapter} adapter - The attached retained consumer.
+ * @param {object[]} before - Complete affected preimages.
+ * @param {string} [column="threadId"] - The grouping field.
+ * @returns {object} A complete merge with one matching publication.
+ */
+function groupedThreadBatch(adapter, before, column = "threadId") {
+  const batch = threadBatchDescriptor(adapter, before);
+  batch.rows.at(-1).matchesAfter = true;
+  batch.groups.before = capturedThreadGroups(before, column);
+  batch.groups.after = capturedThreadGroups(
+    batch.rows.map(row => row.after),
+    column
+  );
+  return batch;
+}
+
+/**
+ * Creates a retained closed thread summary from independently supplied members.
+ *
+ * @param {object[]} members - Literal physical members, representative first.
+ * @returns {object} The summary expected by the existing native select API.
+ */
+function threadBatchSummary(members) {
+  const group = capturedThreadGroups(members)[0];
+  return {
+    ...members[0],
+    messageCount: group.messageCount,
+    newCount: group.newCount,
+    unreadCount: group.unreadCount,
+  };
+}
+
+add_task(function test_threadBatchCapabilityAndSequentialGenerations() {
+  for (const Adapter of [
+    LiveViewDataAdapter,
+    LiveViewThreadedDataAdapter,
+    LiveViewConversationsDataAdapter,
+    LiveViewGroupedDataAdapter,
+  ]) {
+    const { adapter } = threadBatchFixture([], Adapter);
+    for (const listener of [adapter, adapter._makeQueryListener(0)]) {
+      for (const name of [
+        "panoramaThreadBatchVersion",
+        "panoramaThreadBatchGeneration",
+        "panoramaThreadBatchOwner",
+        "panoramaThreadBatchInvalidated",
+      ]) {
+        Assert.ok(
+          Object.hasOwn(
+            Object.getOwnPropertyDescriptor(listener, name),
+            "value"
+          )
+        );
+      }
+      Assert.equal(listener.panoramaThreadBatchVersion, 1);
+      Assert.strictEqual(listener.panoramaThreadBatchOwner, adapter);
+    }
+  }
+  const { adapter, liveView, tree } = threadBatchFixture([threadBatchRow(11)]);
+  const oldQuery = adapter._makeQueryListener(adapter._queryGeneration);
+  adapter.onMessageAdded(threadBatchDescriptor(adapter, [threadBatchRow(11)]));
+  const second = threadBatchDescriptor(adapter, [
+    { ...threadBatchRow(11), threadId: 13, threadParent: 13 },
+  ]);
+  second.batchId = "2";
+  second.publication.id = second.rows.at(-1).after.id = 16;
+  second.componentThreadIds.after = [16];
+  second.rows[0].after.threadId = second.rows[0].after.threadParent = 16;
+  second.rows.at(-1).after.threadId = 16;
+  adapter.onMessageAdded(second);
+  Assert.equal(
+    adapter._viewGeneration,
+    0,
+    "Attachment generation survives consecutive batches"
+  );
+  Assert.equal(
+    adapter._queryGeneration,
+    2,
+    "Both positional queries are invalidated"
+  );
+  Assert.equal(adapter.rowAt(0).message.threadId, 16);
+  oldQuery.onSelectedChunk([threadBatchRow(11)], 0, 0);
+  Assert.equal(
+    adapter.rowAt(0).message.threadId,
+    16,
+    "Old chunks cannot restore the old thread"
+  );
+  Assert.strictEqual(liveView.listener, adapter);
+  Assert.equal(tree.resets.length, 2);
+});
+
+add_task(function test_threadBatchNeverOpenedThreadsMergeWithoutReadingHoles() {
+  const a = threadBatchRow(11),
+    child = { ...threadBatchRow(15), threadId: 11, threadParent: 11 };
+  const b = threadBatchRow(12),
+    control = threadBatchRow(14);
+  const { adapter, tree } = threadBatchFixture(
+    [
+      threadBatchSummary([a, child]),
+      threadBatchSummary([b]),
+      threadBatchSummary([control]),
+    ],
+    LiveViewThreadedDataAdapter
+  );
+  const untouched = adapter.rowAt(2);
+  Assert.equal(adapter.rowAt(0).children[0], undefined);
+  adapter.onMessageAdded(groupedThreadBatch(adapter, [a, child, b]));
+  Assert.equal(adapter.rowCount, 2);
+  Assert.equal(adapter.rowAt(0).thread.messageCount, 4);
+  Assert.equal(adapter.rowAt(0).children.length, 3);
+  Assert.ok(adapter.rowAt(0).children.every(Boolean));
+  Assert.ok(!adapter.rowAt(0).open);
+  Assert.strictEqual(adapter.rowAt(1), untouched);
+  Assert.equal(adapter.rowAt(0).unreadCount, 4);
+  Assert.deepEqual(tree.resets, [
+    [
+      [1, 11],
+      [1, 14],
+    ],
+  ]);
+});
+
+add_task(
+  async function test_threadBatchMergeKeepsExpandedSelectedPhysicalChild() {
+    const a = threadBatchRow(11),
+      child = { ...threadBatchRow(15), threadId: 11, threadParent: 11 };
+    const b = threadBatchRow(12),
+      control = threadBatchRow(14);
+    const { adapter, liveView, selection, tree } = threadBatchFixture(
+      [
+        threadBatchSummary([a, child]),
+        threadBatchSummary([b]),
+        threadBatchSummary([control]),
+      ],
+      LiveViewThreadedDataAdapter
+    );
+    liveView.selectMessagesInGroup = async () =>
+      [a, child].map(row => ({ ...row }));
+    const oldRoot = adapter.rowAt(0),
+      untouched = adapter.rowAt(2);
+    await oldRoot.ensureChildren(adapter, 0);
+    oldRoot.open = true;
+    adapter._clearFlatRowCache();
+    const selected = adapter.rowAt(1);
+    selection.rangedSelect(1, 1, false);
+    const batch = groupedThreadBatch(adapter, [a, child, b]);
+    // The actual publication is the new root; both old roots become children.
+    batch.groups.after[0].representative = batch.publication;
+    adapter.onMessageAdded(batch);
+    Assert.equal(adapter.rowCount, 5);
+    Assert.ok(adapter.rowAt(0).open);
+    Assert.strictEqual(
+      adapter.rowAt(1),
+      oldRoot,
+      "Demoted root retains its physical row object"
+    );
+    Assert.strictEqual(adapter.rowAt(2), selected);
+    Assert.equal(adapter.rowAt(2).message.id, 15);
+    Assert.ok(selection.isSelected(2));
+    Assert.equal(selection.currentIndex, 2);
+    Assert.equal(selection.shiftSelectPivot, 2);
+    Assert.strictEqual(adapter.rowAt(4), untouched);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  function test_threadBatchConversationSelectionFollowsCapturedMembership() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12),
+      control = threadBatchRow(14);
+    const { adapter, selection } = threadBatchFixture(
+      [
+        threadBatchSummary([a]),
+        threadBatchSummary([b]),
+        threadBatchSummary([control]),
+      ],
+      LiveViewConversationsDataAdapter
+    );
+    selection.rangedSelect(1, 1, false);
+    const batch = groupedThreadBatch(adapter, [a, b]);
+    batch.groups.after[0].representative = batch.publication;
+    adapter.onMessageAdded(batch);
+    Assert.equal(adapter.rowCount, 2);
+    Assert.equal(adapter.rowAt(0).message.id, 13);
+    Assert.equal(adapter.rowAt(0).messageCount, 3);
+    Assert.ok(selection.isSelected(0));
+    Assert.equal(selection.currentIndex, 0);
+    Assert.equal(selection.shiftSelectPivot, 0);
+  }
+);
+
+add_task(async function test_threadBatchDiscardsStaleChildCompletion() {
+  const a = threadBatchRow(11),
+    child = { ...threadBatchRow(15), threadId: 11, threadParent: 11 };
+  const { adapter, liveView, tree } = threadBatchFixture(
+    [threadBatchSummary([a, child])],
+    LiveViewThreadedDataAdapter
+  );
+  let complete;
+  liveView.selectMessagesInGroup = () =>
+    new Promise(resolve => {
+      complete = resolve;
+    });
+  const root = adapter.rowAt(0);
+  const pending = root.ensureChildren(adapter, 0);
+  adapter.onMessageAdded(groupedThreadBatch(adapter, [a, child]));
+  const installed = root.children;
+  complete([a, child]);
+  await pending;
+  Assert.strictEqual(root.children, installed);
+  Assert.equal(root.thread.messageCount, 3);
+  Assert.equal(root.children.length, 2);
+  Assert.ok(root.children.every(Boolean));
+  Assert.equal(tree.resets.length, 1);
+});
+
+add_task(
+  async function test_threadBatchSparseRefreshKeepsLoadedSelectionAndRejectsOldCompletion() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12);
+    const { adapter, liveView, selection, tree } = threadBatchFixture([a, b]);
+    const selected = adapter.rowAt(0);
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.select(0);
+    const staleQuery = adapter._makeQueryListener(0);
+    let finishCount;
+    liveView.countMessages = () =>
+      new Promise(resolve => {
+        finishCount = resolve;
+      });
+    liveView.selectMessages = async () => [
+      { ...a, threadId: 13, threadParent: 13 },
+      { ...b, threadId: 13, threadParent: 13 },
+    ];
+    adapter.onMessageAdded(threadBatchDescriptor(adapter, [a, b]));
+    Assert.equal(
+      tree.resets.length,
+      0,
+      "Pending refresh leaves visible state intact"
+    );
+    finishCount(2);
+    await adapter._batchRefreshPromise;
+    Assert.strictEqual(adapter.rowAt(0), selected);
+    Assert.ok(selection.isSelected(0));
+    Assert.equal(adapter.rowAt(1).message.threadId, 13);
+    staleQuery.onSelectedChunk([a, b], 0, 1);
+    Assert.equal(adapter.rowAt(0).message.threadId, 13);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  function test_threadBatchRejectsInvalidSequenceAndGroupTotalsBeforeMutation() {
+    assertThreadBatchDomainRejected(batch => {
+      batch.batchId = "0";
+    }, /Invalid thread batch descriptor/);
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12);
+    const { adapter, tree, selection } = threadBatchFixture(
+      [threadBatchSummary([a]), threadBatchSummary([b])],
+      LiveViewThreadedDataAdapter
+    );
+    selection.select(1);
+    const root = adapter.rowAt(0),
+      rowMap = adapter._rowMap;
+    const batch = groupedThreadBatch(adapter, [a, b]);
+    batch.groups.after[0].unreadCount--;
+    Assert.throws(
+      () => adapter.onMessageAdded(batch),
+      /Invalid captured thread batch group totals/
+    );
+    Assert.strictEqual(adapter._rowMap, rowMap);
+    Assert.strictEqual(adapter.rowAt(0), root);
+    Assert.equal(root.message.threadId, 11);
+    Assert.ok(selection.isSelected(1));
+    Assert.equal(adapter._queryGeneration, 0);
+    Assert.equal(tree.resets.length, 0);
+  }
+);
+
+add_task(
+  function test_threadBatchSortGroupRetainsUnrelatedMembersAndDummySelection() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12),
+      unrelated = threadBatchRow(14);
+    const summary = { ...a, messageCount: 3, newCount: 0, unreadCount: 3 };
+    const { adapter, selection, tree } = threadBatchFixture(
+      [summary],
+      LiveViewGroupedDataAdapter
+    );
+    const dummy = adapter.rowAt(0);
+    selection.rangedSelect(0, 0, false);
+    const batch = groupedThreadBatch(adapter, [a, b, unrelated], "subject");
+    batch.componentThreadIds.before = [11, 12];
+    batch.rows[2].after.threadId = unrelated.threadId;
+    batch.rows[2].after.threadParent = unrelated.threadParent;
+    adapter.onMessageAdded(batch);
+    Assert.strictEqual(adapter.rowAt(0), dummy);
+    Assert.ok(
+      !dummy.open,
+      "A selected dummy does not invent a selected physical child"
+    );
+    Assert.equal(dummy.children.length, 4);
+    Assert.deepEqual(
+      dummy.children.map(row => [row.message.folderId, row.message.id]),
+      [
+        [1, 11],
+        [1, 12],
+        [1, 14],
+        [2, 13],
+      ]
+    );
+    Assert.equal(dummy.unreadCount, 4);
+    Assert.ok(selection.isSelected(0));
+    Assert.equal(selection.currentIndex, 0);
+    Assert.equal(selection.shiftSelectPivot, 0);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  function test_threadBatchUnloadedSelectionFailsBeforeRefreshMutation() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12);
+    const { adapter, liveView, tree, selection } = threadBatchFixture([a, b]);
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.select(1);
+    liveView.countMessages = () =>
+      Assert.ok(false, "No query begins without a physical selection identity");
+    liveView.selectMessages = () => Assert.ok(false, "No query begins");
+    Assert.throws(
+      () => adapter.onMessageAdded(threadBatchDescriptor(adapter, [a, b])),
+      /cannot recover an unloaded selection identity/
+    );
+    Assert.strictEqual(liveView.listener, adapter);
+    Assert.equal(adapter._queryGeneration, 0);
+    Assert.equal(adapter._threadBatchId, null);
+    Assert.ok(selection.isSelected(1));
+    Assert.equal(tree.resets.length, 0);
+  }
+);
+
+add_task(
+  async function test_threadBatchRefreshFailureInvalidatesWithoutReportingRollback() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12);
+    const { adapter, liveView, tree, selection } = threadBatchFixture([a, b]);
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.select(0);
+    liveView.countMessages = async () => 2;
+    liveView.selectMessages = async () => {
+      throw new Error("query failure after commit");
+    };
+    adapter.onMessageAdded(threadBatchDescriptor(adapter, [a, b]));
+    await adapter._batchRefreshPromise;
+    Assert.equal(adapter.rowCount, 0);
+    Assert.equal(selection.count, 0);
+    Assert.equal(selection.currentIndex, -1);
+    Assert.equal(liveView.listener, null);
+    Assert.equal(adapter._liveView, null);
+    Assert.equal(
+      adapter._threadBatchId,
+      1n,
+      "Consumer failure does not undo committed batch identity"
+    );
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  async function test_nativeTextGroupCountsMatchCompleteSelectedMembers() {
+    for (const [sortColumn, field] of [
+      [Ci.nsILiveView.SUBJECT, "subject"],
+      [Ci.nsILiveView.SENDER, "sender"],
+      [Ci.nsILiveView.RECIPIENTS, "recipients"],
+    ]) {
+      const liveView = new LiveView();
+      liveView.initWithFolder(2);
+      liveView.grouping = Ci.nsILiveView.GROUPED_BY_SORT;
+      liveView.sortColumn = sortColumn;
+      const groups = await liveView.selectMessages();
+      Assert.equal(await liveView.countMessages(), groups.length);
+      Assert.equal(
+        await liveView.countUnreadMessages(),
+        groups.filter(group => group.unreadCount > 0).length
+      );
+      const seen = new Set();
+      for (const group of groups) {
+        const members = await liveView.selectMessagesInGroup(group[field]);
+        Assert.equal(members.length, group.messageCount);
+        Assert.equal(
+          members.filter(row => !(row.flags & Ci.nsMsgMessageFlags.Read))
+            .length,
+          group.unreadCount
+        );
+        for (const row of members) {
+          Assert.equal(row.folderId, 2);
+          Assert.ok(
+            !seen.has(row.id),
+            "A physical row belongs to one selected group"
+          );
+          seen.add(row.id);
+        }
+      }
+      const flat = new LiveView();
+      flat.initWithFolder(2);
+      Assert.deepEqual(
+        [...seen].sort((a, b) => a - b),
+        (await flat.selectMessages()).map(row => row.id).sort((a, b) => a - b)
+      );
+    }
+  }
+);
+
+add_task(
+  async function test_threadBatchSparseGroupUsesCapturedMembersAndContributingExpansion() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12),
+      control = threadBatchRow(14);
+    const { adapter, liveView, selection, tree } = threadBatchFixture(
+      [
+        threadBatchSummary([a]),
+        threadBatchSummary([b]),
+        threadBatchSummary([control]),
+      ],
+      LiveViewThreadedDataAdapter
+    );
+    delete adapter._rowMap[2];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(0, 0, false);
+    const selected = adapter.rowAt(0);
+    const batch = groupedThreadBatch(adapter, [a, b]);
+    liveView.countMessages = async () => 2;
+    liveView.selectMessages = async () => [
+      { ...batch.rows[0].after, messageCount: 3, newCount: 0, unreadCount: 3 },
+      threadBatchSummary([control]),
+    ];
+    liveView.selectMessagesInGroup = async key => {
+      Assert.equal(
+        key,
+        14,
+        "Affected historical membership must come from captured facts"
+      );
+      return [control];
+    };
+    adapter.onMessageAdded(batch);
+    await adapter._batchRefreshPromise;
+    Assert.equal(adapter.rowCount, 4);
+    Assert.ok(adapter.rowAt(0).open);
+    Assert.strictEqual(adapter.rowAt(1), selected);
+    Assert.ok(selection.isSelected(1));
+    Assert.equal(selection.currentIndex, 1);
+    Assert.equal(selection.shiftSelectPivot, 1);
+    Assert.equal(adapter.rowAt(0).thread.messageCount, 3);
+    Assert.equal(adapter.rowAt(3).message.id, 14);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  async function test_threadBatchSortRejectsStaleQueryFailureWithoutInvalidatingNewRows() {
+    const a = threadBatchRow(11);
+    const { adapter, liveView, tree } = threadBatchFixture([a]);
+    liveView.countMessages = async () => 1;
+    let rejectQuery, markStarted;
+    const started = new Promise(resolve => {
+      markStarted = resolve;
+    });
+    liveView.selectMessages = () =>
+      new Promise((resolve, reject) => {
+        liveView.listener.onSelectedChunk([a], 0, 0);
+        rejectQuery = reject;
+        markStarted();
+      });
+    const sorting = adapter.sortBy("date", "ascending");
+    await started;
+    adapter.onMessageAdded(threadBatchDescriptor(adapter, [a]));
+    rejectQuery(new DOMException("View query invalidated", "AbortError"));
+    await sorting;
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.equal(adapter.rowAt(0).message.threadId, 13);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  async function test_threadBatchSparseRefreshInvalidatesAffectedChildrenBeforeAwait() {
+    const a = threadBatchRow(11),
+      child = { ...threadBatchRow(15), threadId: 11, threadParent: 11 },
+      control = threadBatchRow(14);
+    const { adapter, liveView, selection } = threadBatchFixture(
+      [threadBatchSummary([a, child]), threadBatchSummary([control])],
+      LiveViewThreadedDataAdapter
+    );
+    const root = adapter.rowAt(0);
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.select(0);
+    let resolveChildren, resolveCount;
+    liveView.selectMessagesInGroup = key =>
+      key == 11
+        ? new Promise(resolve => {
+            resolveChildren = resolve;
+          })
+        : Promise.resolve([control]);
+    const pendingChildren = root.ensureChildren(adapter, 0);
+    const children = root.children;
+    liveView.countMessages = () =>
+      new Promise(resolve => {
+        resolveCount = resolve;
+      });
+    const batch = groupedThreadBatch(adapter, [a, child]);
+    liveView.selectMessages = async () => [
+      { ...batch.rows[0].after, messageCount: 3, newCount: 0, unreadCount: 3 },
+      threadBatchSummary([control]),
+    ];
+    adapter.onMessageAdded(batch);
+    resolveChildren([a, child]);
+    await pendingChildren;
+    Assert.strictEqual(root.children, children);
+    Assert.equal(
+      root.children[0],
+      undefined,
+      "A stale affected child query cannot fill holes during the refresh"
+    );
+    resolveCount(2);
+    await adapter._batchRefreshPromise;
+    Assert.equal(adapter.rowCount, 4);
+    Assert.equal(adapter.rowAt(0).thread.messageCount, 3);
+    Assert.equal(adapter.rowAt(adapter.selection.currentIndex).message.id, 11);
+  }
+);
+
+add_task(
+  async function test_threadBatchReplacementTreeRefreshesCachedAttachmentCapability() {
+    const a = threadBatchRow(11);
+    const { adapter, liveView } = threadBatchFixture([a]);
+    const old = adapter._makeQueryListener(adapter._queryGeneration);
+    liveView.countMessages = async () => 1;
+    liveView.selectMessages = async () => {
+      liveView.listener.onSelectedChunk([a], 0, 0);
+      return [a];
+    };
+    adapter.setTree({
+      reset() {},
+      invalidateRange() {},
+      invalidateRow() {},
+      rowCountChanged() {
+        Assert.ok(false);
+      },
+    });
+    await adapter._batchRefreshPromise;
+    Assert.equal(
+      liveView.listener.panoramaThreadBatchGeneration,
+      adapter._viewGeneration
+    );
+    Assert.ok(adapter._viewGeneration > 0);
+    const fresh = adapter.rowAt(0);
+    old.onSelectedChunk([threadBatchRow(99)], 0, 0);
+    Assert.strictEqual(adapter.rowAt(0), fresh);
+    adapter.onMessageAdded(threadBatchDescriptor(adapter, [a]));
+    Assert.equal(
+      adapter.rowAt(0).message.threadId,
+      13,
+      "The replacement attachment admits current batches"
+    );
+  }
+);
+
+add_task(async function test_threadBatchEmptyQueryClearsRowsAndGroupMaps() {
+  const a = threadBatchRow(11);
+  for (const Adapter of [
+    LiveViewDataAdapter,
+    LiveViewThreadedDataAdapter,
+    LiveViewConversationsDataAdapter,
+    LiveViewGroupedDataAdapter,
+  ]) {
+    const { adapter, liveView } = threadBatchFixture(
+      [Adapter == LiveViewDataAdapter ? a : threadBatchSummary([a])],
+      Adapter
+    );
+    Assert.ok(adapter.rowAt(0));
+    liveView.countMessages = async () => 0;
+    liveView.selectMessages = async () => [];
+    await adapter.sortBy(adapter.sortColumn, "ascending");
+    Assert.equal(adapter.rowCount, 0);
+    Assert.equal(
+      adapter.rowAt(0),
+      null,
+      "No old physical identity survives an empty query"
+    );
+    if (Adapter != LiveViewDataAdapter)
+      Assert.equal(adapter._getBatchGroupMap().size, 0);
+  }
+});
+
+/**
+ * Builds the private old-query mapping from literal pre-insert roots and members.
+ *
+ * @param {LiveViewDataAdapter} adapter - The attached consumer.
+ * @param {object[]} roots - Independent message/group facts in old SQL order.
+ * @returns {object} The native descriptor's pre-insert query mapping.
+ */
+function capturedBeforeView(adapter, roots) {
+  return {
+    grouping: adapter._threadBatchGrouping,
+    sortColumn:
+      adapter instanceof LiveViewGroupedDataAdapter
+        ? Ci.nsILiveView.SUBJECT
+        : Ci.nsILiveView.DATE,
+    sortDescending: false,
+    roots: roots.map(({ message, members = [], group = "" }) => ({
+      message,
+      members,
+      group,
+    })),
+  };
+}
+
+add_task(
+  async function test_threadBatchUnloadedFlatSelectionUsesOldPhysicalMapping() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    b.messageId = a.messageId;
+    const { adapter, liveView, selection, tree } = threadBatchFixture([a, b]);
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(1, 1, false);
+    const batch = threadBatchDescriptor(adapter, [a, b]);
+    batch.beforeView = capturedBeforeView(adapter, [
+      { message: a },
+      { message: b },
+    ]);
+    batch.rows.at(-1).matchesAfter = true;
+    batch.rows.at(-1).after.date = new Date("2025-01-01T00:00:00Z");
+    liveView.countMessages = () =>
+      Assert.ok(false, "Captured old roots avoid a later count");
+    liveView.selectMessages = () =>
+      Assert.ok(
+        false,
+        "Captured roots and changes settle without querying after callbacks"
+      );
+    adapter.onMessageAdded(batch);
+    await adapter._batchRefreshPromise;
+    Assert.deepEqual(
+      adapter._rowMap.map(row => [row.message.folderId, row.message.id]),
+      [
+        [2, 13],
+        [1, 11],
+        [2, 12],
+      ]
+    );
+    Assert.ok(selection.isSelected(2));
+    Assert.ok(!selection.isSelected(1));
+    Assert.equal(selection.currentIndex, 2);
+    Assert.equal(selection.shiftSelectPivot, 2);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  async function test_threadBatchExpandedHoleUsesOldMembersBeforeRootOffsets() {
+    const a = threadBatchRow(11),
+      child = { ...threadBatchRow(15), threadId: 11, threadParent: 11 },
+      control = threadBatchRow(14, 2);
+    const { adapter, liveView, selection, tree } = threadBatchFixture(
+      [threadBatchSummary([a, child]), threadBatchSummary([control])],
+      LiveViewThreadedDataAdapter
+    );
+    adapter.rowAt(0).open = true;
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(1, 2, false);
+    selection.currentIndex = 2;
+    selection._shiftSelectPivot = 1;
+    const batch = groupedThreadBatch(adapter, [a, child]);
+    batch.beforeView = capturedBeforeView(adapter, [
+      { message: a, group: "11", members: [a, child] },
+      { message: control, group: "14", members: [control] },
+    ]);
+    liveView.countMessages = async () => 2;
+    liveView.selectMessages = async () => [
+      {
+        ...batch.rows.at(-1).after,
+        messageCount: 3,
+        newCount: 0,
+        unreadCount: 3,
+      },
+      threadBatchSummary([control]),
+    ];
+    liveView.selectMessagesInGroup = async key => {
+      Assert.equal(
+        key,
+        14,
+        "Changed members come from the descriptor, not later SQL"
+      );
+      return [control];
+    };
+    adapter.onMessageAdded(batch);
+    await adapter._batchRefreshPromise;
+    Assert.deepEqual(
+      Array.from({ length: adapter.rowCount }, (_, i) => [
+        adapter.rowAt(i).message.folderId,
+        adapter.rowAt(i).message.id,
+      ]),
+      [
+        [2, 13],
+        [1, 11],
+        [1, 15],
+        [2, 14],
+      ]
+    );
+    Assert.ok(selection.isSelected(2));
+    Assert.ok(selection.isSelected(3));
+    Assert.equal(selection.currentIndex, 3);
+    Assert.equal(selection.shiftSelectPivot, 2);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(function test_threadBatchUnloadedSortChildUsesCapturedQueryOrder() {
+  const a = threadBatchRow(11),
+    b = threadBatchRow(12, 2);
+  b.date = new Date("2026-01-02T00:00:00Z");
+  const { adapter, selection, tree } = threadBatchFixture(
+    [{ ...a, messageCount: 2, newCount: 0, unreadCount: 2 }],
+    LiveViewGroupedDataAdapter
+  );
+  const dummy = adapter.rowAt(0);
+  dummy.open = true;
+  adapter._clearFlatRowCache();
+  selection.rangedSelect(1, 1, false);
+  const batch = groupedThreadBatch(adapter, [a, b], "subject");
+  batch.beforeView = capturedBeforeView(adapter, [
+    { message: a, group: a.subject, members: [b, a] },
+  ]);
+  adapter.onMessageAdded(batch);
+  Assert.strictEqual(adapter.rowAt(0), dummy);
+  Assert.deepEqual(
+    dummy.children.map(row => [row.message.folderId, row.message.id]),
+    [
+      [2, 12],
+      [1, 11],
+      [2, 13],
+    ]
+  );
+  Assert.equal(selection.currentIndex, 1);
+  Assert.equal(selection.shiftSelectPivot, 1);
+  Assert.ok(selection.isSelected(1));
+  Assert.equal(tree.resets.length, 1);
+});
+
+add_task(
+  async function test_threadBatchUnloadedConversationSelectionMapsToMergedMembership() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    const { adapter, liveView, selection, tree } = threadBatchFixture(
+      [threadBatchSummary([a]), threadBatchSummary([b])],
+      LiveViewConversationsDataAdapter
+    );
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(1, 1, false);
+    const batch = groupedThreadBatch(adapter, [a, b]);
+    batch.rows.at(-1).after.date = new Date("2026-01-02T00:00:00Z");
+    batch.groups.after[0].representative = { folderId: 2, id: 13 };
+    batch.beforeView = capturedBeforeView(adapter, [
+      { message: a, group: "11", members: [a] },
+      { message: b, group: "12", members: [b] },
+    ]);
+    liveView.countMessages = async () => 1;
+    liveView.selectMessages = async () => [
+      {
+        ...batch.rows.at(-1).after,
+        messageCount: 3,
+        newCount: 0,
+        unreadCount: 3,
+      },
+    ];
+    liveView.selectMessagesInGroup = () =>
+      Assert.ok(
+        false,
+        "Complete affected membership was captured before commit"
+      );
+    adapter.onMessageAdded(batch);
+    await adapter._batchRefreshPromise;
+    Assert.equal(adapter.rowCount, 1);
+    Assert.deepEqual(
+      [adapter.rowAt(0).message.folderId, adapter.rowAt(0).message.id],
+      [2, 13]
+    );
+    Assert.equal(adapter.rowAt(0).messageCount, 3);
+    Assert.ok(selection.isSelected(0));
+    Assert.equal(selection.currentIndex, 0);
+    Assert.equal(selection.shiftSelectPivot, 0);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(function test_threadBatchInvalidOldQueryIsRejectedBeforeMutation() {
+  for (const change of [
+    mapping => {
+      mapping.sortDescending = true;
+    },
+    mapping => {
+      mapping.roots.reverse();
+    },
+    mapping => {
+      mapping.roots[1].message.id = 0;
+    },
+    mapping => {
+      mapping.roots[1].message = { ...mapping.roots[0].message };
+    },
+    mapping => {
+      mapping.roots[1].message.flags = Ci.nsMsgMessageFlags.Read;
+    },
+  ]) {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12);
+    const { adapter, selection, tree, liveView } = threadBatchFixture([a, b]);
+    selection.rangedSelect(1, 1, false);
+    const batch = threadBatchDescriptor(adapter, [a, b]);
+    batch.beforeView = capturedBeforeView(adapter, [
+      { message: { ...a } },
+      { message: { ...b } },
+    ]);
+    change(batch.beforeView);
+    const rows = adapter._rowMap,
+      first = adapter.rowAt(0),
+      second = adapter.rowAt(1);
+    Assert.throws(
+      () => adapter.onMessageAdded(batch),
+      /Thread batch|Invalid thread batch|Duplicate thread batch/
+    );
+    Assert.strictEqual(adapter._rowMap, rows);
+    Assert.strictEqual(adapter.rowAt(0), first);
+    Assert.strictEqual(adapter.rowAt(1), second);
+    Assert.strictEqual(liveView.listener, adapter);
+    Assert.deepEqual(
+      [
+        first.message.flags,
+        first.message.threadId,
+        second.message.flags,
+        second.message.threadId,
+      ],
+      [0, 11, 0, 12]
+    );
+    Assert.ok(selection.isSelected(1));
+    Assert.equal(selection.currentIndex, 1);
+    Assert.equal(selection.shiftSelectPivot, 1);
+    Assert.equal(adapter._threadBatchId, null);
+    Assert.equal(adapter._queryGeneration, 0);
+    Assert.equal(adapter._viewGeneration, 0);
+    Assert.equal(tree.resets.length, 0);
+  }
+});
+
+add_task(
+  function test_threadBatchUnloadedDummyKeepsGroupSelectionWithoutSelectingChild() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    const { adapter, selection, tree, liveView } = threadBatchFixture(
+      [{ ...a, messageCount: 2, newCount: 0, unreadCount: 2 }],
+      LiveViewGroupedDataAdapter
+    );
+    delete adapter._rowMap[0];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(0, 0, false);
+    const batch = groupedThreadBatch(adapter, [a, b], "subject");
+    batch.beforeView = capturedBeforeView(adapter, [
+      { message: a, group: a.subject, members: [a, b] },
+    ]);
+    liveView.countMessages = () => Assert.ok(false, "No later count is needed");
+    liveView.selectMessages = () =>
+      Assert.ok(false, "No later query is needed");
+    adapter.onMessageAdded(batch);
+    Assert.equal(adapter.rowCount, 1);
+    Assert.ok(!adapter.rowAt(0).open);
+    Assert.equal(adapter.rowAt(0).group, a.subject);
+    Assert.equal(adapter.rowAt(0).children.length, 3);
+    Assert.equal(selection.currentIndex, 0);
+    Assert.equal(selection.shiftSelectPivot, 0);
+    Assert.ok(selection.isSelected(0));
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  function test_threadBatchUnloadedDepartedMemberDoesNotSelectReplacement() {
+    const a = threadBatchRow(11),
+      b = { ...threadBatchRow(12, 2), threadId: 11 };
+    const { adapter, selection, tree, liveView } = threadBatchFixture([a, b]);
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(1, 1, false);
+    const batch = threadBatchDescriptor(adapter, [a, b]);
+    batch.rows[0].matchesAfter = batch.rows[1].matchesAfter = false;
+    batch.beforeView = capturedBeforeView(adapter, [
+      { message: a },
+      { message: b },
+    ]);
+    liveView.countMessages = () =>
+      Assert.ok(false, "Old filter membership is already captured");
+    liveView.selectMessages = () =>
+      Assert.ok(false, "No later row is used as the selected member");
+    adapter.onMessageAdded(batch);
+    Assert.equal(adapter.rowCount, 0);
+    Assert.equal(selection.count, 0);
+    Assert.equal(selection.currentIndex, -1);
+    Assert.equal(selection.shiftSelectPivot, null);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+/**
+ * Supplies independent current SQL and original displayed query captures.
+ *
+ * @param {LiveViewDataAdapter} adapter - The retained adapter.
+ * @param {object[]} current - Complete pre-insert roots in the requested query.
+ * @param {object[]|null} displayed - Complete roots in the displayed configuration.
+ * @param {object[]} [order=displayed] - Original query root order before cached edits.
+ * @returns {object} A private captured query descriptor.
+ */
+function contextualBeforeView(adapter, current, displayed, order = displayed) {
+  const captured = capturedBeforeView(adapter, current);
+  captured.sortDescending = adapter.sortDirection == "descending";
+  captured.displayView = displayed && capturedBeforeView(adapter, displayed);
+  if (captured.displayView)
+    captured.displayView.order = order.map(entry => ({
+      folderId: entry.message.folderId,
+      id: entry.message.id,
+      group: entry.group ?? "",
+    }));
+  return captured;
+}
+
+add_task(
+  async function test_threadBatchDuringCountPreservesOriginalUnloadedSelection() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    b.date = new Date("2026-01-02T00:00:00Z");
+    const { adapter, liveView, selection, tree } = threadBatchFixture([a, b]);
+    delete adapter._rowMap[0];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(0, 0, false);
+    let resolveCount;
+    liveView.countMessages = () =>
+      new Promise(resolve => {
+        resolveCount = resolve;
+      });
+    liveView.selectMessages = () =>
+      Assert.ok(false, "Superseded count must not install a positional query");
+    const sorting = adapter.sortBy("date", "descending");
+    const batch = threadBatchDescriptor(adapter, [a, b]);
+    batch.rows.at(-1).matchesAfter = true;
+    batch.rows.at(-1).after.date = new Date("2026-01-03T00:00:00Z");
+    batch.beforeView = contextualBeforeView(
+      adapter,
+      [{ message: b }, { message: a }],
+      [{ message: a }, { message: b }]
+    );
+    adapter.onMessageAdded(batch);
+    const rows = adapter._rowMap;
+    resolveCount(2);
+    await sorting;
+    Assert.strictEqual(
+      adapter._rowMap,
+      rows,
+      "The stale count cannot resize the settled map"
+    );
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.deepEqual(
+      rows.map(row => [row.message.folderId, row.message.id]),
+      [
+        [2, 13],
+        [2, 12],
+        [1, 11],
+      ]
+    );
+    Assert.ok(selection.isSelected(2));
+    Assert.equal(selection.currentIndex, 2);
+    Assert.equal(selection.shiftSelectPivot, 2);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  function test_threadBatchCachedTieOrderUsesPhysicalAnchorsAndOriginalQuery() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2),
+      c = threadBatchRow(14),
+      d = threadBatchRow(15, 2);
+    const { adapter, liveView, selection, tree } = threadBatchFixture([
+      c,
+      b,
+      d,
+      a,
+    ]);
+    const first = adapter.rowAt(0),
+      last = adapter.rowAt(3);
+    delete adapter._rowMap[1];
+    delete adapter._rowMap[2];
+    adapter._clearFlatRowCache();
+    selection.select(1);
+    selection.currentIndex = 2;
+    selection._shiftSelectPivot = 0;
+    const batch = threadBatchDescriptor(adapter, [a, b]);
+    batch.rows.at(-1).matchesAfter = true;
+    batch.rows.at(-1).after.date = new Date("2025-01-01T00:00:00Z");
+    const sql = [a, b, c, d].map(message => ({ message }));
+    batch.beforeView = contextualBeforeView(
+      adapter,
+      sql,
+      sql,
+      [b, c, d, a].map(message => ({ message }))
+    );
+    adapter.onMessageAdded(batch);
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.deepEqual(
+      adapter._rowMap.map(row => [row.message.folderId, row.message.id]),
+      [
+        [2, 13],
+        [1, 14],
+        [2, 12],
+        [2, 15],
+        [1, 11],
+      ]
+    );
+    Assert.strictEqual(adapter.rowAt(1), first);
+    Assert.strictEqual(adapter.rowAt(4), last);
+    Assert.ok(selection.isSelected(2));
+    Assert.equal(selection.currentIndex, 3);
+    Assert.equal(selection.shiftSelectPivot, 1);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  function test_threadBatchBeforeInitialCountInstallsAllRetainedAdapters() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    for (const Adapter of [
+      LiveViewDataAdapter,
+      LiveViewThreadedDataAdapter,
+      LiveViewConversationsDataAdapter,
+      LiveViewGroupedDataAdapter,
+    ]) {
+      const { adapter, liveView, selection, tree } = threadBatchFixture(
+        [],
+        Adapter
+      );
+      const flat = Adapter == LiveViewDataAdapter,
+        sort = Adapter == LiveViewGroupedDataAdapter;
+      const batch = flat
+        ? threadBatchDescriptor(adapter, [a, b])
+        : groupedThreadBatch(adapter, [a, b], sort ? "subject" : "threadId");
+      batch.rows.at(-1).matchesAfter = true;
+      if (!flat) batch.groups.after[0].representative = batch.publication;
+      const roots = flat
+        ? [{ message: a }, { message: b }]
+        : sort
+          ? [{ message: a, group: a.subject, members: [a, b] }]
+          : [
+              { message: a, group: "11", members: [a] },
+              { message: b, group: "12", members: [b] },
+            ];
+      batch.beforeView = contextualBeforeView(adapter, roots, null);
+      adapter.onMessageAdded(batch);
+      Assert.strictEqual(adapter._liveView, liveView);
+      Assert.equal(adapter._rowMap.length, flat ? 3 : 1);
+      Assert.equal(selection.count, 0);
+      Assert.equal(selection.currentIndex, -1);
+      Assert.equal(tree.resets.length, 1);
+    }
+  }
+);
+
+add_task(
+  function test_threadBatchUnchangedExpandedGroupRestoresUnloadedChild() {
+    const a = threadBatchRow(11),
+      c = threadBatchRow(14),
+      child = { ...threadBatchRow(15, 2), threadId: 14, threadParent: 14 };
+    c.date = child.date = new Date("2026-01-03T00:00:00Z");
+    const { adapter, liveView, selection, tree } = threadBatchFixture(
+      [threadBatchSummary([a]), threadBatchSummary([c, child])],
+      LiveViewThreadedDataAdapter
+    );
+    const control = adapter.rowAt(1);
+    control.open = true;
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(2, 2, false);
+    adapter.sortDirection = "descending";
+    const batch = groupedThreadBatch(adapter, [a]);
+    batch.rows.at(-1).after.date = new Date("2026-01-02T00:00:00Z");
+    batch.groups.after[0].representative = batch.publication;
+    const old = [
+      { message: a, group: "11", members: [a] },
+      { message: c, group: "14", members: [c, child] },
+    ];
+    batch.beforeView = contextualBeforeView(adapter, old.toReversed(), old);
+    adapter.onMessageAdded(batch);
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.strictEqual(adapter.rowAt(0), control);
+    Assert.deepEqual(
+      Array.from({ length: adapter.rowCount }, (_, i) => [
+        adapter.rowAt(i).message.folderId,
+        adapter.rowAt(i).message.id,
+      ]),
+      [
+        [1, 14],
+        [2, 15],
+        [2, 13],
+      ]
+    );
+    Assert.ok(selection.isSelected(1));
+    Assert.equal(selection.currentIndex, 1);
+    Assert.equal(selection.shiftSelectPivot, 1);
+    Assert.equal(control.thread.messageCount, 2);
+    Assert.equal(tree.resets.length, 1);
+  }
+);
+
+add_task(
+  async function test_threadBatchSortColumnChangePreservesUnloadedPhysicalChild() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    a.sender = b.sender = "z-sender@invalid";
+    const { adapter, liveView, selection, tree } = threadBatchFixture(
+      [{ ...a, messageCount: 2, newCount: 0, unreadCount: 2 }],
+      LiveViewGroupedDataAdapter
+    );
+    const oldDummy = adapter.rowAt(0);
+    oldDummy.open = true;
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(2, 2, false);
+    let resolveCount;
+    liveView.countMessages = () =>
+      new Promise(resolve => {
+        resolveCount = resolve;
+      });
+    liveView.selectMessages = () =>
+      Assert.ok(false, "The superseded query cannot overwrite the batch");
+    const sorting = adapter.sortBy("sender", "ascending");
+    const batch = groupedThreadBatch(adapter, [a, b], "sender");
+    batch.rows.at(-1).after.sender = "a-sender@invalid";
+    batch.groups.after = capturedThreadGroups(
+      batch.rows.map(row => row.after),
+      "sender"
+    );
+    const current = [{ message: a, group: a.sender, members: [a, b] }];
+    const displayed = [{ message: a, group: a.subject, members: [b, a] }];
+    batch.beforeView = contextualBeforeView(adapter, current, displayed);
+    batch.beforeView.sortColumn = Ci.nsILiveView.SENDER;
+    adapter.onMessageAdded(batch);
+    resolveCount(1);
+    await sorting;
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.equal(adapter._rowMap.length, 2);
+    Assert.notStrictEqual(
+      adapter._rowMap[1],
+      oldDummy,
+      "The old subject group is not a sender group"
+    );
+    Assert.equal(adapter._rowMap[0].group, "a-sender@invalid");
+    Assert.equal(adapter._rowMap[1].group, "z-sender@invalid");
+    const selected = adapter.rowAt(selection.currentIndex);
+    Assert.deepEqual([selected.message.folderId, selected.message.id], [1, 11]);
+    Assert.ok(selection.isSelected(selection.currentIndex));
+    Assert.equal(selection.shiftSelectPivot, selection.currentIndex);
+    Assert.equal(
+      adapter._getBatchGroupMap().size,
+      2,
+      "No old subject group remains in the map"
+    );
+    Assert.equal(tree.resets.length, 1);
+
+    const senderGroup = adapter._rowMap[1];
+    const otherGroup = adapter._rowMap[0];
+    Assert.ok(senderGroup.open);
+    selection.select(adapter.indexOf(senderGroup));
+    selection.currentIndex = adapter.indexOf(selected);
+    selection._shiftSelectPivot = adapter.indexOf(otherGroup);
+    const members = batch.rows.map(row => row.after);
+    const publication = {
+      ...threadBatchRow(14),
+      sender: "a-sender@invalid",
+      threadId: 13,
+      threadParent: 13,
+    };
+    const followUp = {
+      ...batch,
+      batchId: "2",
+      publication: { folderId: 1, id: 14 },
+      componentThreadIds: { before: [13], after: [13] },
+      rows: [
+        ...members.map(message => ({
+          before: message,
+          after: { ...message },
+          matchesBefore: true,
+          matchesAfter: true,
+        })),
+        {
+          before: null,
+          after: publication,
+          matchesBefore: false,
+          matchesAfter: true,
+        },
+      ],
+      groups: {
+        before: capturedThreadGroups(members, "sender"),
+        after: capturedThreadGroups([...members, publication], "sender"),
+      },
+    };
+    const installed = [
+      { message: members[2], group: members[2].sender, members: [members[2]] },
+      { message: members[0], group: a.sender, members: members.slice(0, 2) },
+    ];
+    followUp.beforeView = contextualBeforeView(adapter, installed, installed);
+    followUp.beforeView.sortColumn = Ci.nsILiveView.SENDER;
+    followUp.beforeView.displayView.sortColumn = Ci.nsILiveView.SENDER;
+    adapter.onMessageAdded(followUp);
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.strictEqual(adapter._rowMap[0], otherGroup);
+    Assert.strictEqual(adapter._rowMap[1], senderGroup);
+    Assert.ok(senderGroup.open, "A follow-up batch retains expansion");
+    Assert.equal(adapter.rowCount, 4);
+    Assert.equal(otherGroup.children.length, 2);
+    Assert.ok(!otherGroup.open);
+    Assert.ok(selection.isSelected(adapter.indexOf(senderGroup)));
+    Assert.strictEqual(adapter.rowAt(selection.currentIndex), selected);
+    Assert.strictEqual(adapter.rowAt(selection.shiftSelectPivot), otherGroup);
+    Assert.equal(tree.resets.length, 2);
+  }
+);
+
+add_task(
+  function test_threadBatchContextRejectsMissingOriginalEvidenceBeforeMutation() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    const { adapter, liveView, tree, selection } = threadBatchFixture([a, b]);
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(1, 1, false);
+    const batch = threadBatchDescriptor(adapter, [a, b]);
+    batch.beforeView = contextualBeforeView(
+      adapter,
+      [{ message: b }, { message: a }],
+      [{ message: a }, { message: b }],
+      [{ message: a }]
+    );
+    const rows = adapter._rowMap,
+      first = adapter.rowAt(0);
+    Assert.throws(
+      () => adapter.onMessageAdded(batch),
+      /Incomplete original query identity mapping/
+    );
+    Assert.strictEqual(adapter._rowMap, rows);
+    Assert.strictEqual(adapter.rowAt(0), first);
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.equal(adapter._queryGeneration, 0);
+    Assert.equal(adapter._threadBatchId, null);
+    Assert.ok(selection.isSelected(1));
+    Assert.equal(selection.currentIndex, 1);
+    Assert.equal(selection.shiftSelectPivot, 1);
+    Assert.equal(tree.resets.length, 0);
+  }
+);
+
+add_task(
+  async function test_threadBatchRejectsStaleOriginalQueryChunkAndSuccess() {
+    const a = threadBatchRow(11),
+      b = threadBatchRow(12, 2);
+    const { adapter, liveView, selection, tree } = threadBatchFixture([a, b]);
+    let completeQuery, markStarted;
+    const started = new Promise(resolve => {
+      markStarted = resolve;
+    });
+    liveView.countMessages = async () => 2;
+    liveView.selectMessages = () =>
+      new Promise(resolve => {
+        completeQuery = resolve;
+        liveView.listener.onSelectedChunk([a, b], 0, 1);
+        markStarted();
+      });
+    const sorting = adapter.sortBy("date", "ascending");
+    await started;
+    const stale = liveView.listener;
+    delete adapter._rowMap[1];
+    adapter._clearFlatRowCache();
+    selection.rangedSelect(1, 1, false);
+    const batch = threadBatchDescriptor(adapter, [a, b]);
+    batch.beforeView = contextualBeforeView(
+      adapter,
+      [{ message: a }, { message: b }],
+      [{ message: a }, { message: b }]
+    );
+    adapter.onMessageAdded(batch);
+    const rows = adapter._rowMap;
+    stale.onSelectedChunk([threadBatchRow(99), threadBatchRow(100)], 0, 1);
+    completeQuery([a, b]);
+    await sorting;
+    Assert.strictEqual(adapter._rowMap, rows);
+    Assert.strictEqual(adapter._liveView, liveView);
+    Assert.deepEqual(
+      rows.map(row => [
+        row.message.folderId,
+        row.message.id,
+        row.message.threadId,
+      ]),
+      [
+        [1, 11, 13],
+        [2, 12, 13],
+      ]
+    );
+    Assert.ok(selection.isSelected(1));
+    Assert.equal(selection.currentIndex, 1);
+    Assert.equal(selection.shiftSelectPivot, 1);
+    Assert.equal(tree.resets.length, 1);
+  }
+);

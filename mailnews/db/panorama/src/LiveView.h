@@ -5,9 +5,9 @@
 #ifndef COMM_MAILNEWS_DB_PANORAMA_SRC_LIVEVIEW_H_
 #define COMM_MAILNEWS_DB_PANORAMA_SRC_LIVEVIEW_H_
 
-#include "js/Context.h"
 #include "LiveViewFilters.h"
 #include "MessageDatabase.h"
+#include "js/Context.h"
 #include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "nsCOMPtr.h"
@@ -18,16 +18,27 @@ using JS::Rooted;
 
 namespace mozilla::mailnews {
 
+class LiveViewBatchCapability;
+class CapturedLiveView;
+class LiveViewThreadBatchBuilder;
+
 class LiveView : public nsILiveView, public MessageListener {
  public:
-  LiveView()
-      : mSortColumn(nsILiveView::SortColumn::DATE),
-        mSortDescending(true),
-        mGrouping(nsILiveView::Grouping::UNTHREADED) {}
+  LiveView();
 
   NS_DECL_ISUPPORTS
   NS_DECL_NSILIVEVIEW
 
+  // Scoped JS admission is checked by PrepareThreadBatch.
+  bool SupportsThreadChanges() const override { return true; }
+  nsresult CaptureThreadViewBeforeInsert(
+      nsCOMPtr<nsISupports>& output) override;
+  nsresult PrepareThreadBatch(const MessageThreadBatch& batch,
+                              nsISupports* beforeView,
+                              PreparedThreadBatch& prepared) override;
+  nsresult PrepareThreadBatch(const MessageThreadBatch& batch,
+                              PreparedThreadBatch& prepared) override;
+  void DeliverThreadBatch(const PreparedThreadBatch& prepared) override;
   void OnMessageAdded(Message* message) override;
   void OnMessageRemoved(Message* message, uint32_t oldFlags) override;
   void OnMessageFlagsChanged(nsIMsgDBHdr* oldMessage, Message* message,
@@ -36,20 +47,51 @@ class LiveView : public nsILiveView, public MessageListener {
                             const nsACString& oldTags,
                             const nsACString& newTags) override;
 
+  void OnMessagePublishedCaptured(const CapturedMessage& after, Message* live,
+                                  bool notifyLegacy) override;
+  void OnMessageRemovedCaptured(const CapturedMessage& before,
+                                Message* live) override;
+  void OnMessageFlagsChangedCaptured(const CapturedMessage& before,
+                                     const CapturedMessage& after,
+                                     nsIMsgDBHdr* oldHeader,
+                                     Message* live) override;
+  void OnMessageTagsChangedCaptured(const CapturedMessage& before,
+                                    const CapturedMessage& after,
+                                    nsIMsgDBHdr* oldHeader,
+                                    Message* live) override;
+  void OnMessageBodyChangedCaptured(const CapturedMessage& before,
+                                    const CapturedMessage& after,
+                                    nsIMsgDBHdr* oldHeader, Message* live,
+                                    const MessageBodyState& oldBody,
+                                    const MessageBodyState& newBody) override;
+
  private:
-  virtual ~LiveView() {
-    delete mFolderFilter;
-    ResetStatements();
-  }
+  virtual ~LiveView();
 
   friend class SelectMessagesListener;
+  friend class LiveViewThreadBatchBuilder;
 
   MessageDatabase& MessageDB() const {
     return *DatabaseCore::sInstance->mMessageDatabase;
   }
 
+  mozIStorageConnection* Connection() const {
+    return DatabaseCore::sConnection;
+  }
+
+  nsresult CaptureQueryView(const CapturedLiveView* context,
+                            RefPtr<CapturedLiveView>& output);
   void ResetStatements();
   nsCString GetSQLClause();
+  nsCString SelectSQL();
+  nsCString SelectGroupSQL();
+  nsresult MatchesCaptured(const CapturedMessage& message, bool& matches);
+  void InvalidateCapturedConsumer(nsILiveViewListener* listener,
+                                  LiveViewBatchCapability* capability,
+                                  uint64_t attachment);
+  enum class CapturedChange { Added, Removed, Flags, Tags };
+  void NotifyCaptured(const CapturedMessage* before,
+                      const CapturedMessage* after, CapturedChange change);
   void PrepareStatement(mozIStorageStatement* aStatement);
 
   // Are we interested in this message?
@@ -73,6 +115,13 @@ class LiveView : public nsILiveView, public MessageListener {
 
   // The one and only listener for this live view, if set.
   nsCOMPtr<nsILiveViewListener> mListener;
+  RefPtr<LiveViewBatchCapability> mBatchCapability;
+  RefPtr<CapturedLiveView> mCountQuery;
+  RefPtr<CapturedLiveView> mMappedQuery;
+  uint64_t mAttachmentGeneration = 0;
+  uint64_t mQueryGeneration = 0;
+  uint64_t mBatchDeliveryGeneration = 0;
+  uint64_t mConfigurationGeneration = 0;
 };
 
 void CreateJSMessage(uint64_t id, uint64_t folderId, const char* messageId,

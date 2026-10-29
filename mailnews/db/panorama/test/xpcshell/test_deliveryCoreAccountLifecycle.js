@@ -282,7 +282,10 @@ add_task(
     Assert.strictEqual(after.folderFlags, null);
     Assert.equal(after.contentRevision, before.contentRevision);
     Assert.equal(after.locationRevision, before.locationRevision);
-    Assert.greater(BigInt(after.policyRevision), BigInt(before.policyRevision));
+    Assert.ok(
+      BigInt(after.policyRevision) > BigInt(before.policyRevision),
+      "Retirement advances the folder policy revision"
+    );
     Assert.equal(header.messageId, "retained@invalid");
     Assert.equal(header.subject, "retained body");
     Assert.equal(header.storeToken, "0");

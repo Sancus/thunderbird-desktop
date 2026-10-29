@@ -166,7 +166,7 @@ add_task(async function test_replayCopiesDeletionAndPolicyRescan() {
   const first = addStoredMessage(folder, "replayneedle");
   const second = addStoredMessage(otherFolder, "replayneedle");
   await drain(service);
-  let hits = await service.search("replayneedle");
+  const hits = await service.search("replayneedle");
   Assert.deepEqual(
     hits.items.map(hit => hit.id).sort(),
     [String(first.messageKey), String(second.messageKey)].sort()

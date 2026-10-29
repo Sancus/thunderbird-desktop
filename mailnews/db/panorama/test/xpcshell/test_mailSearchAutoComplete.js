@@ -309,15 +309,20 @@ add_task(async function test_peopleHeadersMetadataOnlyAndLiteralTags() {
   }
   const cjk = await completeMailSearch("受");
   Assert.equal(cjk.items[0].label, "受信人");
-  const selected = await completionService.collectResults("Completion fixture", {
-    selection: cjk.items[0].selection,
-  });
+  const selected = await completionService.collectResults(
+    "Completion fixture",
+    {
+      selection: cjk.items[0].selection,
+    }
+  );
   Assert.deepEqual(
     selected.items.find(item => item.id == String(copyA.messageKey)).to,
     [{ name: "受信人", email: "cjk@example.invalid" }]
   );
   Assert.ok(
-    (await completionService.getText(String(copyA.messageKey))).recipients.includes("受信人")
+    (
+      await completionService.getText(String(copyA.messageKey))
+    ).recipients.includes("受信人")
   );
   const literal = await completeMailSearch("ral%");
   Assert.deepEqual(

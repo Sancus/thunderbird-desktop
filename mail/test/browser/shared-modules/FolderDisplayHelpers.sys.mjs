@@ -1798,7 +1798,10 @@ async function _internal_assert_displayed(
 
     const desiredMessage = get_db_view(troller).getMsgHdrAt(desiredIndices[0]);
     const displayedMessage = aboutMessage.gMessage;
-    Assert.ok(desiredMessage, "the view should have the desired message header");
+    Assert.ok(
+      desiredMessage,
+      "the view should have the desired message header"
+    );
     Assert.ok(displayedMessage, "about:message should have a message header");
     Assert.equal(
       displayedMessage.folder.URI,

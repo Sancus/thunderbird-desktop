@@ -318,7 +318,10 @@ add_task(async function test_moveUsesTheActualTransferKeyAndCurrentLocation() {
     },
   };
   const listener = new PromiseTestUtils.PromiseCopyListener();
-  MailServices.mfn.addListener(notification, MailServices.mfn.msgsMoveCopyCompleted);
+  MailServices.mfn.addListener(
+    notification,
+    MailServices.mfn.msgsMoveCopyCompleted
+  );
   try {
     MailServices.copy.copyMessages(
       f.a,
@@ -336,10 +339,12 @@ add_task(async function test_moveUsesTheActualTransferKeyAndCurrentLocation() {
   Assert.equal(transfers.length, 1, "One completed physical transfer");
   const [transfer] = transfers;
   Assert.ok(transfer.isMove);
-  Assert.deepEqual(transfer.sources, [{
-    key: request.location.messageKey,
-    folderURI: f.a.URI,
-  }]);
+  Assert.deepEqual(transfer.sources, [
+    {
+      key: request.location.messageKey,
+      folderURI: f.a.URI,
+    },
+  ]);
   Assert.equal(
     transfer.messageKeys.length,
     1,

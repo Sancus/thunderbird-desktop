@@ -313,7 +313,11 @@ add_task(async function test_streamsEveryPageWithMetadataOnlyRows() {
     .createLocalSubfolder("native-header-pages");
   const file = do_get_profile().clone();
   file.append("native-header-pages.sqlite");
-  const service = await MailSearchService.open(file, database.sourceId, messageDB);
+  const service = await MailSearchService.open(
+    file,
+    database.sourceId,
+    messageDB
+  );
   registerCleanupFunction(() => service.close());
   const expected = [];
   for (let i = 0; i < 105; i++) {

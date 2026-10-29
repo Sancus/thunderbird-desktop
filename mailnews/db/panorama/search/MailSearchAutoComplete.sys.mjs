@@ -143,13 +143,14 @@ class MailSearchAutoCompleteResult {
     if (this.failed) {
       return Ci.nsIAutoCompleteResult.RESULT_FAILURE;
     }
-    return this.matchCount
-      ? this.ongoing
+    if (this.matchCount) {
+      return this.ongoing
         ? Ci.nsIAutoCompleteResult.RESULT_SUCCESS_ONGOING
-        : Ci.nsIAutoCompleteResult.RESULT_SUCCESS
-      : this.ongoing
-        ? Ci.nsIAutoCompleteResult.RESULT_NOMATCH_ONGOING
-        : Ci.nsIAutoCompleteResult.RESULT_NOMATCH;
+        : Ci.nsIAutoCompleteResult.RESULT_SUCCESS;
+    }
+    return this.ongoing
+      ? Ci.nsIAutoCompleteResult.RESULT_NOMATCH_ONGOING
+      : Ci.nsIAutoCompleteResult.RESULT_NOMATCH;
   }
   get matchCount() {
     return this.rows.length;
@@ -256,7 +257,7 @@ export class MailSearchAutoComplete {
       })
       .then(data => {
         if (this.#run !== run || run.controller.signal.aborted) {
-          return;
+          return undefined;
         }
         if (typeof data.sourceId != "string" || !data.sourceId) {
           throw new TypeError("Completion source identity is required");

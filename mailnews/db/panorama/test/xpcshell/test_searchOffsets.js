@@ -83,7 +83,8 @@ add_task(function test_malformedOrSplitCharacterOffsetsReject() {
   ]) {
     Assert.throws(
       () => getSearchHighlightRanges({ ...hit, offsetsUtf8 }, text),
-      error => error.name == "TypeError" && error.message == "Malformed FTS offsets",
+      error =>
+        error.name == "TypeError" && error.message == "Malformed FTS offsets",
       offsetsUtf8
     );
   }
@@ -97,13 +98,17 @@ add_task(function test_malformedOrSplitCharacterOffsetsReject() {
       () => getSearchHighlightRanges({ ...hit, offsetsUtf8 }, text),
       error =>
         error.name == "RangeError" &&
-        ["Invalid UTF-8 range", "FTS range is outside a UTF-8 character boundary"].includes(error.message),
+        [
+          "Invalid UTF-8 range",
+          "FTS range is outside a UTF-8 character boundary",
+        ].includes(error.message),
       offsetsUtf8
     );
   }
   Assert.throws(
     () => getSearchHighlightRanges(hit, text, "unknown"),
-    error => error.name == "TypeError" && error.message == "Unknown search text field"
+    error =>
+      error.name == "TypeError" && error.message == "Unknown search text field"
   );
 });
 

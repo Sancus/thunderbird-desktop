@@ -81,8 +81,15 @@ export function getSearchHighlightRanges(hit, document, field = "body") {
       positions.set(byteOffset, stringOffset);
     }
     const value = point.codePointAt(0);
-    byteOffset +=
-      value < 0x80 ? 1 : value < 0x800 ? 2 : value < 0x10000 ? 3 : 4;
+    if (value < 0x80) {
+      byteOffset += 1;
+    } else if (value < 0x800) {
+      byteOffset += 2;
+    } else if (value < 0x10000) {
+      byteOffset += 3;
+    } else {
+      byteOffset += 4;
+    }
     stringOffset += point.length;
   }
   if (boundaries.has(byteOffset)) {

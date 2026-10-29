@@ -412,7 +412,9 @@ add_task(async function test_cancellationAndCloseDrainQueuedReads() {
   const pending = fixture.provider.refreshLog(fixture.filePath, {
     signal: controller.signal,
   });
-  const rejected = Assert.rejects(pending, error => error === reason);
+  const rejected = (async () => {
+    await Assert.rejects(pending, error => error === reason);
+  })();
   await TestUtils.waitForCondition(
     () => release && gFilePromises.get(fixture.filePath) !== blocker
   );

@@ -91,7 +91,7 @@ export async function getMailSearchService() {
 export async function closeMailSearch() {
   const entry = current;
   if (!entry) {
-    return;
+    return undefined;
   }
   if (!entry.closePromise) {
     entry.closePromise = entry.promise

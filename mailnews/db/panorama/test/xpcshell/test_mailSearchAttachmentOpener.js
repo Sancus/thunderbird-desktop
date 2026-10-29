@@ -199,7 +199,9 @@ add_task(async function test_staleSelectionAndDeletedCopy() {
   Assert.throws(
     () =>
       attachmentService.resolveAttachment({ ...request, id: "0" + request.id }),
-    error => error.name == "TypeError" && error.message == "Invalid physical mail identity"
+    error =>
+      error.name == "TypeError" &&
+      error.message == "Invalid physical mail identity"
   );
   Assert.equal(
     (

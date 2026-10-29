@@ -69,3 +69,51 @@ add_task(function test_headerFieldsNotLiteral() {
   }
   Assert.deepEqual(message.flags, [], "PEEK does not mark the message read");
 });
+
+add_task(function test_numericPartKeepsNestedHeaderSelection() {
+  const raw = [
+    "MIME-Version: 1.0",
+    'Content-Type: multipart/mixed; boundary="nested-message"',
+    "",
+    "--nested-message",
+    "Content-Type: message/rfc822",
+    "",
+    "Subject: Nested message",
+    "X-Trace2: nested header",
+    "",
+    "Nested body.",
+    "--nested-message--",
+    "",
+  ].join("\r\n");
+  const message = new ImapMessage("data:text/plain;base64," + btoa(raw), 3, []);
+  const handler = new IMAP_RFC3501_handler(new ImapDaemon());
+  const expected = "x-trace2: nested header\r\n\r\n";
+  for (const section of [
+    "1.HEADER.FIELDS (X-TRACE2)",
+    "1.HEADER.FIELDS.NOT (SUBJECT)",
+  ]) {
+    Assert.equal(
+      handler._FETCH_BODY(message, `BODY.PEEK[${section}]`),
+      `BODY[${section}] {${expected.length}}\r\n${expected}`,
+      "A leading MIME part number still selects the nested message headers"
+    );
+  }
+});
+
+add_task(function test_headerFieldNamesWithDigits() {
+  const raw =
+    "Subject: Numeric field\r\nX-Trace2: second header\r\n\r\nBody.\r\n";
+  const message = new ImapMessage("data:text/plain;base64," + btoa(raw), 4, []);
+  const handler = new IMAP_RFC3501_handler(new ImapDaemon());
+  for (const [section, expected] of [
+    ["HEADER.FIELDS (X-TRACE2)", "x-trace2: second header\r\n\r\n"],
+    ["HEADER.FIELDS.NOT (X-TRACE2)", "subject: Numeric field\r\n\r\n"],
+  ]) {
+    Assert.equal(
+      handler._FETCH_BODY(message, `BODY.PEEK[${section}]`),
+      `BODY[${section}] {${expected.length}}\r\n${expected}`,
+      "A digit in the field name is not a MIME part number"
+    );
+  }
+  Assert.deepEqual(message.flags, [], "PEEK does not mark the message read");
+});

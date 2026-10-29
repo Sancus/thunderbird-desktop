@@ -1833,7 +1833,7 @@ export class IMAP_RFC3501_handler {
     }
 
     // What's inside the command?
-    var data = /((?:\d+\.)*\d+)(?:\.([^ ]+))?/.exec(parts[1]);
+    var data = /^((?:\d+\.)*\d+)(?:\.([^ ]+))?/.exec(parts[1]);
     var partNum;
     if (data) {
       partNum = data[1];

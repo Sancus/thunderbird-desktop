@@ -20,6 +20,12 @@ import { getMorkThreadRelations } from "resource:///modules/panorama/MigrationMe
 
 import { verifyMigrationBackup } from "resource:///modules/panorama/MigrationBackup.sys.mjs";
 
+import {
+  createMorkFolderCacheRequest,
+  getMorkFolderCacheCells,
+  validateMorkFolderCacheReceipt,
+} from "resource:///modules/panorama/MorkFolderCache.sys.mjs";
+
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   SQLiteDirectory: "resource:///modules/SQLiteDirectory.sys.mjs",
@@ -95,7 +101,11 @@ export async function resumeMorkImports(journal, core, signal) {
       await journal.recordImport(source.id, receipt);
       await checkCancelled();
     }
-    if ((journal.state.books ?? []).every(book => book.state == "imported")) {
+    if (
+      [...(journal.state.books ?? []), ...(journal.state.caches ?? [])].every(
+        unit => unit.state == "imported"
+      )
+    ) {
       await journal.finishStage("import");
     }
   } catch (error) {
@@ -254,7 +264,9 @@ export async function resumeMorkBookImports(journal, profileLock, signal) {
     }
     if (
       journal.state.stage == "import" &&
-      journal.state.sources.every(source => source.state == "imported")
+      [...journal.state.sources, ...(journal.state.caches ?? [])].every(
+        source => source.state == "imported"
+      )
     ) {
       await journal.finishStage("import");
     }
@@ -272,8 +284,8 @@ export async function resumeMorkBookImports(journal, profileLock, signal) {
  * Binds backed-up cache rows to explicit current native folder descriptors.
  * Requires an existing mail-plan database incarnation and the selected held
  * profile lock, with source/target writers quiesced. No setters, SQL writes,
- * checkpoint or activation occur: native cache application/receipt is not yet
- * exposed. Raw source records and exact text remain separate from projections.
+ * checkpoint or activation occur here; resumeMorkCacheImports applies the
+ * separately planned unit. Raw text remains separate from projections.
  *
  * @param {MigrationJournal} journal - Open backed-up import/validation journal.
  * @param {nsIDatabaseCore} core - Actual started target service.
@@ -473,6 +485,116 @@ export async function prepareMorkFolderCacheImport(
       };
     }),
   };
+}
+
+/**
+ * Applies supported cache cells through native SQL receipts, then checkpoints.
+ * The caller retains the selected profile lock and quiesces source/target writers.
+ * Native-authoritative flags/counts/sizes/display remain provenance, not overrides.
+ *
+ * @param {MigrationJournal} journal - Explicit version5 cache plan.
+ * @param {nsIDatabaseCore} core - Actual native cache receiver.
+ * @param {nsIProfileLock} profileLock - Held selected profile lock.
+ * @param {function(string): Map<string, object>} resolveBindings - Exact original-key bindings.
+ * @param {AbortSignal} [signal] - Cancellation at settled commit boundaries.
+ * @returns {Promise<void>} Supported cache units checkpointed; no activation.
+ */
+export async function resumeMorkCacheImports(
+  journal,
+  core,
+  profileLock,
+  resolveBindings,
+  signal
+) {
+  const database = core.QueryInterface(Ci.nsIDatabaseCore);
+  if (
+    AppConstants.platform == "win" ||
+    typeof database.importFolderCacheMetadata != "function" ||
+    typeof database.getFolderCacheImportReceipt != "function"
+  ) {
+    throw new Error("Native Unix cache import/receipt APIs are required");
+  }
+  const checkCancelled = async () => {
+    if (signal?.aborted && !journal.state.cancelled) {
+      await journal.setCancelled(true);
+    }
+    if (journal.state.cancelled) {
+      throw new DOMException("Migration cancelled", "AbortError");
+    }
+  };
+  if (!journal.state.caches?.length) {
+    throw new Error("Migration has no explicit cache plan");
+  }
+  if (!["import", "validate"].includes(journal.state.stage)) {
+    throw new Error("Migration is not at the cache-import stage");
+  }
+  try {
+    for (const cache of journal.state.caches) {
+      await checkCancelled();
+      const snapshot = await prepareMorkFolderCacheImport(
+        journal,
+        database,
+        profileLock,
+        cache.path,
+        await resolveBindings(cache.id)
+      );
+      const current = {
+        ...cache,
+        ...snapshot.source,
+        folders: snapshot.folders,
+        databaseSourceId: snapshot.databaseSourceId,
+      };
+      const request = createMorkFolderCacheRequest(cache);
+      const actual = createMorkFolderCacheRequest(current);
+      const sorted = folders => folders.toSorted((a, b) => a.id - b.id);
+      if (
+        JSON.stringify({ ...request, folders: sorted(request.folders) }) !==
+          JSON.stringify({ ...actual, folders: sorted(actual.folders) }) ||
+        JSON.stringify(getMorkFolderCacheCells(cache.folders)) !==
+          JSON.stringify(getMorkFolderCacheCells(current.folders))
+      ) {
+        throw new Error("Cache snapshot differs from the journal plan");
+      }
+      await checkCancelled();
+      await journal.beginCacheImport(cache.id);
+      const directory = profileLock
+        .QueryInterface(Ci.nsIProfileLock)
+        .directory.clone();
+      directory.normalize();
+      if (
+        !directory.equals(new FileUtils.File(journal.state.profilePath)) ||
+        database.sourceId !== cache.databaseSourceId
+      ) {
+        throw new Error("Cache target changed before native import");
+      }
+      let receipt = database.getFolderCacheImportReceipt(request);
+      if (receipt === null) {
+        if (cache.state == "imported") {
+          throw new Error("Native database lost a committed cache receipt");
+        }
+        receipt = database.importFolderCacheMetadata(request);
+      }
+      receipt = validateMorkFolderCacheReceipt(cache, receipt);
+      // A native commit and this journal write are separate durable operations.
+      await journal.recordCacheImport(cache.id, receipt);
+      await checkCancelled();
+    }
+    if (
+      journal.state.stage == "import" &&
+      [...journal.state.sources, ...(journal.state.books ?? [])].every(
+        unit => unit.state == "imported"
+      )
+    ) {
+      await journal.finishStage("import");
+    }
+  } catch (error) {
+    try {
+      await journal.recordError(error);
+    } catch (journalError) {
+      console.error("Could not checkpoint cache migration error", journalError);
+    }
+    throw error;
+  }
 }
 
 /**

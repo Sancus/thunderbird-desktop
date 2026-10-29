@@ -26,9 +26,15 @@ const { createMigrationBackup, verifyMigrationBackup } =
 const { readMorkMigrationSource } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationSource.sys.mjs"
 );
-const { prepareMorkFolderCacheImport } = ChromeUtils.importESModule(
-  "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
-);
+const { prepareMorkFolderCacheImport, resumeMorkCacheImports } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+  );
+
+const { createMorkFolderCacheRequest, validateMorkFolderCacheReceipt } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MorkFolderCache.sys.mjs"
+  );
 
 const CACHE_FILE = "panacea.dat";
 const OLD_ROOT = "/foo/bar/profile-default/";
@@ -586,5 +592,369 @@ add_task(
     } finally {
       await IOUtils.remove(summary);
     }
+  }
+);
+
+/** @returns {Promise<object>} Explicit backed-up cache plan, not an import. */
+async function plannedCache() {
+  const input = await cacheInput();
+  const snapshot = await prepareMorkFolderCacheImport(
+    input.journal,
+    database,
+    lock,
+    source,
+    bindings
+  );
+  const token = await input.journal.planCacheImport("panacea", snapshot);
+  Assert.equal(input.journal.state.version, 5);
+  Assert.equal(input.journal.state.caches[0].token, token);
+  const revision = input.journal.state.revision;
+  snapshot.folders.reverse();
+  Assert.equal(await input.journal.planCacheImport("panacea", snapshot), token);
+  Assert.equal(
+    input.journal.state.revision,
+    revision,
+    "Matching reordered plan is read-only"
+  );
+  return input;
+}
+
+/** @returns {object} Independently read committed native rows and provenance. */
+function committedCacheState() {
+  const connection = Services.storage.openUnsharedDatabase(
+    new FileUtils.File(PathUtils.join(PathUtils.profileDir, "panorama.sqlite"))
+  );
+  const query = (sql, columns) => {
+    const statement = connection.createStatement(sql);
+    try {
+      const rows = [];
+      while (statement.executeStep()) {
+        rows.push(columns.map(column => statement.row[column]));
+      }
+      return rows;
+    } finally {
+      statement.finalize();
+    }
+  };
+  try {
+    return {
+      folders: query("SELECT id,name,flags FROM folders ORDER BY id", [
+        "id",
+        "name",
+        "flags",
+      ]),
+      properties: query(
+        "SELECT id,name,typeof(value) AS type,value FROM folder_properties ORDER BY id,name",
+        ["id", "name", "type", "value"]
+      ),
+      receipts: query(
+        "SELECT token,identity,receipt FROM folder_cache_imports ORDER BY token",
+        ["token", "identity", "receipt"]
+      ),
+      bindings: query("SELECT COUNT(*) AS count FROM folder_cache_bindings", [
+        "count",
+      ]),
+      messages: query("SELECT id,messageId FROM messages ORDER BY id", [
+        "id",
+        "messageId",
+      ]),
+    };
+  } finally {
+    connection.close();
+  }
+}
+
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_cachePlanRejectsChangedSourceAndMapping() {
+    const input = await plannedCache();
+    const before = committedCacheState();
+    const bytes = await IOUtils.read(source);
+    const wrong = new Map(bindings);
+    const key = OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf";
+    wrong.set(key, {
+      ...wrong.get(key),
+      descriptor: cacheKey(control.summaryFile),
+    });
+    await Assert.rejects(
+      resumeMorkCacheImports(input.journal, database, lock, () => wrong),
+      /canonical descriptor changed/
+    );
+    await IOUtils.write(source, new Uint8Array([...bytes, 10]));
+    try {
+      await Assert.rejects(
+        resumeMorkCacheImports(input.journal, database, lock, () => bindings),
+        /not covered by the verified backup|snapshot differs/
+      );
+    } finally {
+      await IOUtils.write(source, bytes);
+    }
+    Assert.equal(input.journal.state.caches[0].state, "pending");
+    Assert.strictEqual(input.journal.state.caches[0].receipt, null);
+    Assert.deepEqual(committedCacheState(), before);
+    Assert.deepEqual(await IOUtils.read(do_get_file(CACHE_FILE).path), bytes);
+    const invalid = structuredClone(input.journal.state);
+    invalid.version = 1;
+    input.journal.close();
+    await IOUtils.writeJSON(input.path, invalid);
+    await Assert.rejects(
+      MigrationJournal.open(input.path, lock.directory.path),
+      /unsupported migration journal/
+    );
+  }
+);
+
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_cacheNativeRollbackThenCheckpointRecovery() {
+    const input = await plannedCache();
+    const protectedKey = messageDB.addMessage(
+      control.id,
+      "cache-protected@invalid",
+      [],
+      0,
+      "",
+      "",
+      "",
+      "",
+      "Existing native message",
+      0,
+      "",
+      0
+    );
+    const original = await IOUtils.read(source);
+    const inboxFolder = bindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf"
+    ).folder;
+    inboxFolder.msgDatabase.dBFolderInfo.setCharProperty("onlineName", "");
+    const before = committedCacheState();
+    const connection = database.connectionForTests;
+    const faults = [];
+    connection.createFunction("migration_cache_fault", 1, {
+      onFunctionCall(args) {
+        faults.push(args.getUTF8String(0));
+        return 0;
+      },
+    });
+    connection.executeSimpleSQL(`
+    CREATE TEMP TRIGGER migration_cache_fault BEFORE INSERT ON folder_cache_imports
+    BEGIN
+      SELECT migration_cache_fault(NEW.token);
+      SELECT RAISE(ABORT, 'migration cache receipt failure');
+    END;
+  `);
+    try {
+      await Assert.rejects(
+        resumeMorkCacheImports(input.journal, database, lock, () => bindings),
+        /NS_ERROR_STORAGE_CONSTRAINT/
+      );
+      Assert.deepEqual(
+        faults,
+        [input.journal.state.caches[0].token],
+        "Actual receipt insert reached after native work"
+      );
+      Assert.ok(!connection.transactionInProgress);
+      Assert.deepEqual(
+        committedCacheState(),
+        before,
+        "Native failure rolls back rows and provenance"
+      );
+      Assert.strictEqual(input.journal.state.caches[0].receipt, null);
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER migration_cache_fault");
+      connection.removeFunction("migration_cache_fault");
+    }
+    const checkpointError = new Error(
+      "Cache checkpoint interrupted after native commit"
+    );
+    input.journal.recordCacheImport = async () => {
+      throw checkpointError;
+    };
+    await Assert.rejects(
+      resumeMorkCacheImports(input.journal, database, lock, () => bindings),
+      error => error === checkpointError
+    );
+    const cache = input.journal.state.caches[0];
+    Assert.equal(cache.state, "importing");
+    Assert.strictEqual(cache.receipt, null);
+    Assert.equal(
+      input.journal.state.lastError.message,
+      checkpointError.message
+    );
+    const request = createMorkFolderCacheRequest(cache);
+    const receipt = database.getFolderCacheImportReceipt(request);
+    Assert.ok(receipt, "Native commit exists before journal checkpoint");
+    Assert.equal(receipt.identity.policy, "native-authoritative-v1");
+    Assert.equal(receipt.identity.folders.length, 13);
+    const inbox = bindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf"
+    ).folder;
+    const cell = name =>
+      receipt.cells.find(p => p.id == inbox.id && p.name == name);
+    Assert.deepEqual(
+      {
+        text: cell("flags").text,
+        integer: cell("flags").integer,
+        disposition: cell("flags").disposition,
+      },
+      {
+        text: "88083014",
+        integer: 2282237972,
+        disposition: "native-authoritative",
+      }
+    );
+    Assert.equal(cell("MRUTime").text, "1628202593");
+    const rootId = bindings.get(OLD_ROOT + "ImapMail/imap.localhost").folder.id;
+    Assert.equal(
+      receipt.cells.find(p => p.id == rootId && p.name == "onlineName").text,
+      ""
+    );
+    Assert.ok(!receipt.cells.some(p => p.name == "absent"));
+    Assert.equal(
+      cell("onlineName").text,
+      "INBOX",
+      "Receipt retains the original cache text"
+    );
+    Assert.equal(cell("onlineName").disposition, "existing");
+    for (const [mutate, expected] of [
+      [
+        r =>
+          r.cells.splice(
+            r.cells.findIndex(p => p.id == inbox.id && p.name == "MRUTime"),
+            1
+          ),
+        /Native cache receipt cells changed/,
+      ],
+      [
+        r => r.cells.push(structuredClone(r.cells[0])),
+        /Invalid cache property/,
+      ],
+      [
+        r => {
+          r.cells.find(p => p.name == "flags").disposition = "applied";
+        },
+        /Invalid native cache cell disposition/,
+      ],
+      [
+        r => {
+          r.cells.find(p => p.name == "MRUTime").text = "changed";
+        },
+        /Native cache receipt cells changed/,
+      ],
+      [
+        r => {
+          r.identity.folders[0].id = inbox.id;
+        },
+        /Duplicate cache folder binding/,
+      ],
+    ]) {
+      const invalid = structuredClone(receipt);
+      mutate(invalid);
+      Assert.throws(
+        () => validateMorkFolderCacheReceipt(cache, invalid),
+        expected
+      );
+    }
+    const committed = committedCacheState();
+    Assert.deepEqual(
+      committed.folders,
+      before.folders,
+      "Cache cannot override native flags/names"
+    );
+    Assert.deepEqual(
+      committed.messages,
+      before.messages,
+      "Physical mail rows survive"
+    );
+    Assert.ok(
+      committed.messages.some(
+        ([key, id]) => key == protectedKey && id == "cache-protected@invalid"
+      )
+    );
+    Assert.ok(
+      committed.properties.some(
+        ([id, name, type, value]) =>
+          id == inbox.id &&
+          name == "onlineName" &&
+          type == "text" &&
+          value === ""
+      ),
+      "An existing present-empty value is preserved independently of raw cache text"
+    );
+    Assert.equal(committed.receipts.length, 1);
+    Assert.deepEqual(committed.bindings, [[13]]);
+    input.journal.close();
+    input.journal = await MigrationJournal.open(
+      input.path,
+      lock.directory.path
+    );
+    registerCleanupFunction(() => input.journal.close());
+    const count = changes();
+    await resumeMorkCacheImports(input.journal, database, lock, () => bindings);
+    Assert.deepEqual(input.journal.state.caches[0].receipt, receipt);
+    Assert.equal(input.journal.state.caches[0].state, "imported");
+    Assert.equal(
+      input.journal.state.sources[0].state,
+      "pending",
+      "Cache receipt is not a mail key map"
+    );
+    Assert.equal(
+      input.journal.state.stage,
+      "import",
+      "Pending mail still prevents stage completion"
+    );
+    Assert.deepEqual(committedCacheState(), committed);
+    Assert.equal(
+      changes(),
+      count,
+      "Recovery looks up the original native commit without writing"
+    );
+    const revision = input.journal.state.revision;
+    await resumeMorkCacheImports(input.journal, database, lock, () => bindings);
+    Assert.equal(input.journal.state.revision, revision);
+    Assert.equal(changes(), count);
+    const remapped = new Map(bindings);
+    remapped.set(OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf", {
+      folder: control,
+      descriptor: cacheKey(control.summaryFile),
+    });
+    await Assert.rejects(
+      resumeMorkCacheImports(input.journal, database, lock, () => remapped),
+      /Cache snapshot differs from the journal plan/
+    );
+    await IOUtils.write(source, new Uint8Array([...original, 10]));
+    try {
+      await Assert.rejects(
+        resumeMorkCacheImports(input.journal, database, lock, () => bindings),
+        /not covered by the verified backup/
+      );
+    } finally {
+      await IOUtils.write(source, original);
+    }
+    Assert.equal(input.journal.state.caches[0].state, "imported");
+    Assert.deepEqual(committedCacheState(), committed);
+    const controller = new AbortController();
+    controller.abort();
+    await Assert.rejects(
+      resumeMorkCacheImports(
+        input.journal,
+        database,
+        lock,
+        () => bindings,
+        controller.signal
+      ),
+      error => error.name == "AbortError"
+    );
+    Assert.equal(input.journal.state.caches[0].state, "imported");
+    Assert.deepEqual(committedCacheState(), committed);
+    Assert.deepEqual(await IOUtils.read(source), original);
+    Assert.deepEqual(
+      await IOUtils.read(do_get_file(CACHE_FILE).path),
+      original
+    );
+    Assert.deepEqual(
+      await verifyMigrationBackup(PathUtils.parent(backup.path)),
+      backup
+    );
   }
 );

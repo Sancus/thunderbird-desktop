@@ -19,6 +19,13 @@ import {
   isMigrationPhysicalIdentity,
 } from "resource:///modules/panorama/MigrationSource.sys.mjs";
 
+import {
+  createMorkFolderCacheRequest,
+  getMorkFolderCacheCells,
+  validateMorkFolderCacheReceipt,
+} from "resource:///modules/panorama/MorkFolderCache.sys.mjs";
+
+const CACHE_VERSION = 5;
 const PHYSICAL_VERSION = 4;
 const MAIL_VERSION = 1;
 const BOOK_VERSION = 2;
@@ -52,6 +59,9 @@ export class MigrationJournal {
   static async create(path, plan) {
     const journal = new MigrationJournal(path);
     try {
+      if (plan.caches !== undefined) {
+        throw new Error("Cache units require explicit planning after backup");
+      }
       if (plan.books !== undefined && !Array.isArray(plan.books)) {
         throw new Error("Invalid migration book plan");
       }
@@ -106,7 +116,11 @@ export class MigrationJournal {
           new FileUtils.File(journal.#path).parent.path,
           true
         );
-        for (const source of [...state.sources, ...(state.books ?? [])]) {
+        for (const source of [
+          ...state.sources,
+          ...(state.books ?? []),
+          ...(state.caches ?? []),
+        ]) {
           const actual = physicalIdentity(source.path);
           if (
             source.physicalIdentity &&
@@ -395,6 +409,109 @@ export class MigrationJournal {
   }
 
   /**
+   * Explicitly adds a backed-up cache unit, preserving existing mail/book work.
+   * Older journals are upgraded only by this call, never while opening them.
+   *
+   * @param {string} id - Original cache source ID.
+   * @param {object} snapshot - Complete prepareMorkFolderCacheImport result.
+   * @returns {Promise<string>} Durable native operation token.
+   */
+  async planCacheImport(id, snapshot) {
+    let token;
+    const cache = structuredClone({
+      id,
+      databaseSourceId: snapshot.databaseSourceId,
+      ...snapshot.source,
+      folders: snapshot.folders,
+      token: Services.uuid.generateUUID().toString(),
+      state: "pending",
+      receipt: null,
+    });
+    createMorkFolderCacheRequest(cache);
+    getMorkFolderCacheCells(cache.folders);
+    await this.#change(async state => {
+      if (AppConstants.platform == "win") {
+        throw new Error(
+          "Windows cache migration requires native reparse admission"
+        );
+      }
+      const previous = state.caches?.find(item => item.id === id);
+      if (previous) {
+        const planned = createMorkFolderCacheRequest({
+          ...cache,
+          token: previous.token,
+        });
+        const saved = createMorkFolderCacheRequest(previous);
+        const sorted = folders => folders.toSorted((a, b) => a.id - b.id);
+        if (
+          JSON.stringify({ ...planned, folders: sorted(planned.folders) }) !==
+            JSON.stringify({ ...saved, folders: sorted(saved.folders) }) ||
+          JSON.stringify(getMorkFolderCacheCells(cache.folders)) !==
+            JSON.stringify(getMorkFolderCacheCells(previous.folders))
+        ) {
+          throw new Error("Cache import plan changed");
+        }
+        token = previous.token;
+        return false;
+      }
+      this.#requireActive(state, "import");
+      state.version = CACHE_VERSION;
+      (state.caches ??= []).push(cache);
+      await this.#checkSource(cache);
+      await this.#checkBackup(state, state.backup);
+      token = cache.token;
+      return true;
+    });
+    return token;
+  }
+
+  /** @param {string} id - Planned cache ID. @returns {Promise<string>} Retained token. */
+  async beginCacheImport(id) {
+    let token;
+    await this.#change(async state => {
+      const cache = this.#cache(state, id);
+      await this.#checkSource(cache);
+      token = cache.token;
+      if (cache.state == "imported") {
+        return false;
+      }
+      this.#requireActive(state, "import");
+      if (cache.state != "pending") {
+        return false;
+      }
+      cache.state = "importing";
+      return true;
+    });
+    return token;
+  }
+
+  /**
+   * Settles the actual native cache commit before cancellation or later work.
+   *
+   * @param {string} id - Planned cache ID.
+   * @param {object} receipt - Native receipt with complete raw cell dispositions.
+   * @returns {Promise<void>}
+   */
+  async recordCacheImport(id, receipt) {
+    await this.#change(state => {
+      const cache = this.#cache(state, id);
+      const checked = validateMorkFolderCacheReceipt(cache, receipt);
+      if (cache.state == "imported") {
+        if (JSON.stringify(cache.receipt) !== JSON.stringify(checked)) {
+          throw new Error("Committed cache receipt changed");
+        }
+        return false;
+      }
+      if (state.stage != "import" || cache.state != "importing") {
+        throw new Error("Cache import was not started");
+      }
+      cache.receipt = checked;
+      cache.state = "imported";
+      return true;
+    });
+  }
+
+  /**
    * Advances one fixed stage after its owner has completed the work.
    * Activation remains the caller's responsibility, outside any SQL transaction.
    *
@@ -406,15 +523,17 @@ export class MigrationJournal {
       this.#requireActive(state, stage);
       if (
         stage == "import" &&
-        [...state.sources, ...(state.books ?? [])].some(
-          source => source.state != "imported"
-        )
+        [
+          ...state.sources,
+          ...(state.books ?? []),
+          ...(state.caches ?? []),
+        ].some(source => source.state != "imported")
       ) {
         throw new Error("Migration imports are incomplete");
       }
-      if (stage != "import" && state.books?.length) {
+      if (stage != "import" && (state.books?.length || state.caches?.length)) {
         throw new Error(
-          "Staged book publication and activation are not supported"
+          "Book/cache publication and activation are not supported"
         );
       }
       if (!["import", "validate", "activate"].includes(stage)) {
@@ -610,7 +729,11 @@ export class MigrationJournal {
         }
       }
     }
-    for (const source of [...state.sources, ...(state.books ?? [])]) {
+    for (const source of [
+      ...state.sources,
+      ...(state.books ?? []),
+      ...(state.caches ?? []),
+    ]) {
       if (source.inventory) {
         const measured = validateMorkFolderWindowsInventory(source.inventory);
         const stored = filesByPath.get(measured.store.canonicalPath);
@@ -683,6 +806,14 @@ export class MigrationJournal {
       lease.close();
       throw error;
     }
+  }
+
+  #cache(state, id) {
+    const cache = state.caches?.find(item => item.id === id);
+    if (!cache) {
+      throw new Error("Unknown migration cache");
+    }
+    return cache;
   }
 
   #book(state, id) {
@@ -805,7 +936,12 @@ export class MigrationJournal {
   #validate(state) {
     if (
       !state ||
-      ![MAIL_VERSION, BOOK_VERSION, PHYSICAL_VERSION].includes(state.version) ||
+      ![MAIL_VERSION, BOOK_VERSION, PHYSICAL_VERSION, CACHE_VERSION].includes(
+        state.version
+      ) ||
+      (state.version == CACHE_VERSION
+        ? !Array.isArray(state.caches) || !state.caches.length
+        : "caches" in state) ||
       ("books" in state &&
         (!Array.isArray(state.books) || !state.books.length)) ||
       (AppConstants.platform == "win" && state.version != PHYSICAL_VERSION) ||
@@ -833,9 +969,11 @@ export class MigrationJournal {
       state.version != PHYSICAL_VERSION &&
       (state.profilePhysicalIdentity !== undefined ||
         state.workPhysicalIdentity !== undefined ||
-        [...state.sources, ...(state.books ?? [])].some(
-          source => source.physicalIdentity !== undefined
-        ))
+        [
+          ...state.sources,
+          ...(state.books ?? []),
+          ...(state.caches ?? []),
+        ].some(source => source.physicalIdentity !== undefined))
     ) {
       throw new Error("Physical identities require migration journal version4");
     }
@@ -864,9 +1002,11 @@ export class MigrationJournal {
           state.workPhysicalIdentity,
           physicalIdentity(file.parent.path, true)
         ) ||
-        [...state.sources, ...(state.books ?? [])].some(
-          source => !isMigrationPhysicalIdentity(source.physicalIdentity)
-        )
+        [
+          ...state.sources,
+          ...(state.books ?? []),
+          ...(state.caches ?? []),
+        ].some(source => !isMigrationPhysicalIdentity(source.physicalIdentity))
       ) {
         throw new Error("Invalid migration journal physical identity");
       }
@@ -957,6 +1097,50 @@ export class MigrationJournal {
         throw new Error("Uncommitted migration source has a receipt");
       }
     }
+    const cacheFolders = new Set();
+    for (const cache of state.caches ?? []) {
+      createMorkFolderCacheRequest(cache);
+      getMorkFolderCacheCells(cache.folders);
+      const source = new FileUtils.File(normalizedPath(cache.path));
+      if (
+        cache.path !== source.path ||
+        ids.has(cache.id) ||
+        tokens.has(cache.token) ||
+        !roots.some(root => root.contains(source)) ||
+        files.some(other => source.equals(other)) ||
+        source.parent.contains(file) ||
+        !state.sources.length ||
+        state.sources.some(
+          s => s.databaseSourceId !== cache.databaseSourceId
+        ) ||
+        !["pending", "importing", "imported"].includes(cache.state)
+      ) {
+        throw new Error("Invalid cache journal identity");
+      }
+      for (const folder of cache.folders) {
+        if (
+          cacheFolders.has(folder.id) ||
+          [folder.cachePath, folder.storePath].some(path => {
+            const child = new FileUtils.File(normalizedPath(path));
+            return (
+              child.path !== path ||
+              !roots.some(root => root.equals(child) || root.contains(child))
+            );
+          })
+        ) {
+          throw new Error("Invalid cache journal binding");
+        }
+        cacheFolders.add(folder.id);
+      }
+      if (cache.state == "imported") {
+        validateMorkFolderCacheReceipt(cache, cache.receipt);
+      } else if (cache.receipt !== null) {
+        throw new Error("Uncommitted cache has a receipt");
+      }
+      ids.add(cache.id);
+      tokens.add(cache.token);
+      files.push(source);
+    }
     this.#validateBooksAndStage(state, roots, file, ids, tokens, files);
   }
 
@@ -1018,17 +1202,22 @@ export class MigrationJournal {
     ) {
       throw new Error("Windows migration activation remains held");
     }
-    if (state.books?.length && ["activate", "complete"].includes(state.stage)) {
+    if (
+      (state.books?.length || state.caches?.length) &&
+      ["activate", "complete"].includes(state.stage)
+    ) {
       throw new Error(
-        "Staged book publication and activation are not supported"
+        "Book/cache publication and activation are not supported"
       );
     }
     if (
       state.stage == "backup" &&
       (state.backup !== null ||
-        [...state.sources, ...(state.books ?? [])].some(
-          source => source.state != "pending"
-        ))
+        [
+          ...state.sources,
+          ...(state.books ?? []),
+          ...(state.caches ?? []),
+        ].some(source => source.state != "pending"))
     ) {
       throw new Error("Migration work precedes backup completion");
     }
@@ -1042,7 +1231,7 @@ export class MigrationJournal {
     }
     if (
       ["validate", "activate", "complete"].includes(state.stage) &&
-      [...state.sources, ...(state.books ?? [])].some(
+      [...state.sources, ...(state.books ?? []), ...(state.caches ?? [])].some(
         source => source.state != "imported"
       )
     ) {

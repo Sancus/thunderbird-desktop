@@ -214,3 +214,211 @@ function cacheValue(name, value) {
   }
   return converted;
 }
+
+const CACHE_BINDING_FIELDS = [
+  "originalKey",
+  "sourceKey",
+  "id",
+  "isServer",
+  "descriptor",
+  "cachePath",
+  "storePath",
+  "protocol",
+  "storeType",
+];
+const CACHE_AUTHORITY = new Set([
+  "flags",
+  "folderName",
+  "totalMsgs",
+  "totalUnreadMsgs",
+  "pendingMsgs",
+  "pendingUnreadMsgs",
+  "folderSize",
+  "expungedBytes",
+]);
+
+/**
+ * Builds the supported native cache envelope from a retained journal unit.
+ *
+ * @param {object} unit - Exact source identity and complete physical bindings.
+ * @returns {object} Version1 request; source bytes are read by native code.
+ */
+export function createMorkFolderCacheRequest(unit) {
+  for (const value of [unit.id, unit.token, unit.databaseSourceId, unit.path]) {
+    if (typeof value != "string" || !value || value.includes("\0")) {
+      throw new Error("Invalid cache import identity");
+    }
+  }
+  if (
+    !PathUtils.isAbsolute(unit.path) ||
+    !/^[a-f0-9]{64}$/.test(unit.sha256) ||
+    !Number.isSafeInteger(unit.size) ||
+    unit.size <= 0 ||
+    unit.size >= 0xffffffff ||
+    !unit.folders?.length
+  ) {
+    throw new Error("Invalid cache source identity");
+  }
+  const unique = new Map(
+    [
+      "originalKey",
+      "sourceKey",
+      "id",
+      "descriptor",
+      "cachePath",
+      "storePath",
+    ].map(name => [name, new Set()])
+  );
+  const folders = unit.folders.map(folder => {
+    for (const name of CACHE_BINDING_FIELDS) {
+      const value = folder[name];
+      if (name == "id" || name == "sourceKey") {
+        if (
+          !Number.isSafeInteger(value) ||
+          value <= 0 ||
+          (name == "sourceKey" && value > 0xffffffff)
+        ) {
+          throw new Error("Invalid cache folder identity");
+        }
+      } else if (name == "isServer") {
+        if (typeof value != "boolean") {
+          throw new Error("Invalid cache server identity");
+        }
+      } else if (typeof value != "string" || !value || value.includes("\0")) {
+        throw new Error("Invalid cache folder field");
+      }
+      if (unique.has(name)) {
+        if (unique.get(name).has(value)) {
+          throw new Error("Duplicate cache folder binding");
+        }
+        unique.get(name).add(value);
+      }
+    }
+    if (
+      !["none", "imap"].includes(folder.protocol) ||
+      !PathUtils.isAbsolute(folder.cachePath) ||
+      !PathUtils.isAbsolute(folder.storePath)
+    ) {
+      throw new Error("Unsupported cache folder binding");
+    }
+    return Object.fromEntries(
+      CACHE_BINDING_FIELDS.map(name => [name, folder[name]])
+    );
+  });
+  return {
+    version: 1,
+    token: unit.token,
+    sourceId: unit.id,
+    databaseSourceId: unit.databaseSourceId,
+    source: { path: unit.path, size: unit.size, sha256: unit.sha256 },
+    folders,
+  };
+}
+
+/**
+ * Returns exact, presence-sensitive cells in a stable comparison order.
+ *
+ * @param {object[]} folders - Planner bindings with every original property.
+ * @returns {object[]} Cell values; no native disposition is inferred.
+ */
+export function getMorkFolderCacheCells(folders) {
+  return folders
+    .flatMap(folder => {
+      const names = new Set();
+      if (
+        !Array.isArray(folder.properties) ||
+        !folder.properties.some(
+          p => p.name == "key" && p.text === folder.originalKey
+        )
+      ) {
+        throw new Error("Incomplete cache properties");
+      }
+      return folder.properties.map(property => {
+        if (
+          typeof property.name != "string" ||
+          !property.name ||
+          property.name.includes("\0") ||
+          names.has(property.name) ||
+          typeof property.text != "string" ||
+          (Object.hasOwn(property, "integer") &&
+            !Number.isSafeInteger(property.integer))
+        ) {
+          throw new Error("Invalid cache property");
+        }
+        names.add(property.name);
+        return {
+          id: folder.id,
+          name: property.name,
+          text: property.text,
+          ...(Object.hasOwn(property, "integer")
+            ? { integer: property.integer }
+            : {}),
+        };
+      });
+    })
+    .sort(
+      (a, b) => a.id - b.id || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+    );
+}
+
+/**
+ * Checks a native receipt against every retained binding and original cell.
+ *
+ * @param {object} unit - Retained source/binding/cell plan.
+ * @param {object} receipt - Actual native committed receipt.
+ * @returns {object} Owned receipt suitable for a separate journal checkpoint.
+ */
+export function validateMorkFolderCacheReceipt(unit, receipt) {
+  const expected = createMorkFolderCacheRequest(unit);
+  const identity = receipt?.identity;
+  if (
+    identity?.version !== 1 ||
+    identity.policy !== "native-authoritative-v1" ||
+    identity.token !== unit.token ||
+    identity.sourceId !== unit.id ||
+    identity.databaseSourceId !== unit.databaseSourceId ||
+    identity.path !== unit.path ||
+    identity.sha256 !== unit.sha256 ||
+    identity.size !== unit.size ||
+    !Array.isArray(receipt.cells)
+  ) {
+    throw new Error("Invalid native cache receipt identity");
+  }
+  const actual = createMorkFolderCacheRequest({
+    ...unit,
+    folders: identity.folders,
+  });
+  const byId = values => values.toSorted((a, b) => a.id - b.id);
+  if (
+    JSON.stringify(byId(actual.folders)) !==
+    JSON.stringify(byId(expected.folders))
+  ) {
+    throw new Error("Native cache receipt mapping changed");
+  }
+  const folders = unit.folders.map(folder => ({ ...folder, properties: [] }));
+  const byFolder = new Map(folders.map(folder => [folder.id, folder]));
+  for (const cell of receipt.cells) {
+    const folder = byFolder.get(cell.id);
+    const dispositions =
+      cell.name == "key"
+        ? ["binding"]
+        : CACHE_AUTHORITY.has(cell.name)
+          ? ["native-authoritative"]
+          : ["existing", "applied"];
+    if (!folder || !dispositions.includes(cell.disposition)) {
+      throw new Error("Invalid native cache cell disposition");
+    }
+    folder.properties.push({
+      name: cell.name,
+      text: cell.text,
+      ...(Object.hasOwn(cell, "integer") ? { integer: cell.integer } : {}),
+    });
+  }
+  if (
+    JSON.stringify(getMorkFolderCacheCells(folders)) !==
+    JSON.stringify(getMorkFolderCacheCells(unit.folders))
+  ) {
+    throw new Error("Native cache receipt cells changed");
+  }
+  return structuredClone(receipt);
+}

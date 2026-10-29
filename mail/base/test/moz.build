@@ -23,6 +23,11 @@ BROWSER_CHROME_MANIFESTS += [
     "browser/widgets/browser.toml",
 ]
 
+if CONFIG["MOZ_PANORAMA"]:
+    BROWSER_CHROME_MANIFESTS += [
+        "browser/widgets/browser-panorama.toml",
+    ]
+
 XPCSHELL_TESTS_MANIFESTS += [
     "unit/xpcshell.toml",
     "unit/xpcshell_maildir.toml",

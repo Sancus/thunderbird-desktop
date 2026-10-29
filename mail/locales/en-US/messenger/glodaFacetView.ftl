@@ -23,3 +23,7 @@ facet-view-and-others = {
         [one] { $count } other
         *[other] { $count } others
     }
+
+facet-view-search-error = Search could not be completed. Try searching again.
+facet-view-conversation-stale = This conversation changed. Search again to open its current messages.
+facet-view-search-loading = Searching…

@@ -18,18 +18,23 @@ var { MailServices } = ChromeUtils.importESModule(
 var { TagUtils } = ChromeUtils.importESModule(
   "resource:///modules/TagUtils.sys.mjs"
 );
-var { Gloda } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/GlodaPublic.sys.mjs"
-);
-var { GlodaConstants } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/GlodaConstants.sys.mjs"
-);
-var { GlodaSyntheticView } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/GlodaSyntheticView.sys.mjs"
-);
-var { FacetDriver, FacetUtils } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/Facet.sys.mjs"
-);
+ChromeUtils.defineESModuleGetters(this, {
+  Gloda: "resource:///modules/gloda/GlodaPublic.sys.mjs",
+  GlodaConstants: "resource:///modules/gloda/GlodaConstants.sys.mjs",
+  GlodaSyntheticView: "resource:///modules/gloda/GlodaSyntheticView.sys.mjs",
+  FacetDriver: "resource:///modules/gloda/Facet.sys.mjs",
+  findMailSearchResults: "resource:///modules/panorama/MailSearch.sys.mjs",
+  getMailSearchConversation: "resource:///modules/panorama/MailSearch.sys.mjs",
+  getMailSearchService: "resource:///modules/panorama/MailSearch.sys.mjs",
+  openDefaultMailSearchResultsList:
+    "resource:///modules/panorama/MailSearch.sys.mjs",
+  MailSearchView: "resource:///modules/panorama/MailSearchView.sys.mjs",
+  parseSearchTerms: "resource:///modules/panorama/SearchTerms.sys.mjs",
+  getMailSearchFacetData:
+    "resource:///modules/panorama/MailSearchFacets.sys.mjs",
+  refineMailSearchResults:
+    "resource:///modules/panorama/MailSearchFacets.sys.mjs",
+});
 
 var glodaFacetStrings = Services.strings.createBundle(
   "chrome://messenger/locale/glodaFacetView.properties"
@@ -452,17 +457,188 @@ ActiveNonSingularConstraint.prototype = {
     );
   },
   isIncludedGroup(aGroupValue) {
-    const valId = aGroupValue[this.facetDef.groupIdAttr];
+    const valId = aGroupValue?.[this.facetDef.groupIdAttr] ?? aGroupValue;
     return valId in this.includedGroupIds;
   },
   isExcludedGroup(aGroupValue) {
-    const valId = aGroupValue[this.facetDef.groupIdAttr];
+    const valId = aGroupValue?.[this.facetDef.groupIdAttr] ?? aGroupValue;
     return valId in this.excludedGroupIds;
   },
 };
 
+/**
+ * Bind physical snapshot groups to the retained facet widgets.
+ *
+ * @param {MailSearchResultSet} resultSet - Complete native query results.
+ * @returns {object} Faceters with the existing go/makeQuery widget contract.
+ */
+function makeMailSearchFacetDriver(resultSet) {
+  const strings = Services.strings.createBundle(
+    "chrome://messenger/locale/gloda.properties"
+  );
+  const tags = new Map(
+    MailServices.tags.getAllTags().map(tag => [tag.key, tag.tag])
+  );
+  const fullData = getMailSearchFacetData(resultSet);
+  fullData.tags = fullData.tags.filter(group => tags.has(group.value));
+  const definitions = [
+    ["fromMe", "fromMe", "boolean"],
+    ["toMe", "toMe", "boolean"],
+    ["star", "starred", "boolean"],
+    ["attachmentTypes", "attachmentCategories", "boolean-filtered"],
+    ["involves", "participants", "discrete"],
+    ["tag", "tags", "discrete"],
+    ["date", "dates", "date"],
+  ];
+  const faceters = definitions.map(([name, field, type]) => {
+    const values = new Map();
+    const groupValue = value => {
+      if (value === null || type == "boolean") {
+        return value;
+      }
+      if (!values.has(value)) {
+        let label = value;
+        if (field == "tags") {
+          label = tags.get(value);
+        } else if (field == "attachmentCategories") {
+          label = strings.GetStringFromName(
+            `gloda.mimetype.category.${value}.label`
+          );
+        }
+        values.set(value, {
+          id: value,
+          label,
+          category: value,
+          categoryLabel: label,
+        });
+      }
+      return values.get(value);
+    };
+    const compare = (a, b) =>
+      String(a?.label ?? a).localeCompare(String(b?.label ?? b));
+    const facetStrings = {};
+    for (const key of [
+      "facetNameLabel",
+      "includeLabel",
+      "excludeLabel",
+      "remainderLabel",
+      "noneLabel",
+      "mustMatchLabel",
+      "cantMatchLabel",
+      "mustMatchSomeLabel",
+      "mustMatchNoneLabel",
+    ]) {
+      const stringKey = `gloda.message.attr.${name}.${key}`;
+      try {
+        facetStrings[key] = strings.GetStringFromName(stringKey);
+      } catch {}
+    }
+    const faceter = {
+      native: true,
+      type,
+      field,
+      attrDef: {
+        attributeName: name,
+        boundName: name == "date" ? "date" : field,
+        singular: type != "discrete",
+        objectNounDef: {
+          isPrimitive: false,
+          comparator: compare,
+          userVisibleString: value => value.label,
+        },
+      },
+      facetDef: { strings: facetStrings, groupIdAttr: "id" },
+      makeQuery(groupValues, inclusive) {
+        let items;
+        if (type == "date") {
+          items = refineMailSearchResults(resultSet, {
+            dateRanges: groupValues,
+          }).items;
+        } else if (type == "boolean") {
+          items = groupValues.flatMap(
+            value =>
+              refineMailSearchResults(resultSet, { [field]: value }).items
+          );
+        } else if (field == "attachmentCategories") {
+          items = refineMailSearchResults(
+            resultSet,
+            groupValues.length
+              ? { attachmentCategories: groupValues.map(value => value.id) }
+              : { hasAttachments: true }
+          ).items;
+        } else {
+          const ids = new Set(
+            fullData[field]
+              .filter(group =>
+                groupValues.some(value => value?.id === group.value)
+              )
+              .flatMap(group => group.ids)
+          );
+          if (groupValues.includes(null)) {
+            const present = new Set(
+              fullData[field].flatMap(group => group.ids)
+            );
+            for (const item of resultSet.items) {
+              if (!present.has(item.id)) {
+                ids.add(item.id);
+              }
+            }
+          }
+          items = resultSet.items.filter(item => ids.has(item.id));
+        }
+        const ids = new Set(items.map(item => item.id));
+        return [
+          { test: item => ids.has(item.id) },
+          type == "discrete" ? false : !inclusive,
+        ];
+      },
+      facetItems(items, data) {
+        const byId = new Map(items.map(item => [item.id, item]));
+        if (type == "date") {
+          this.validItems = data.dates.validIds.map(id => byId.get(id));
+          this.oldest = data.dates.oldest;
+          this.newest = data.dates.newest;
+          this.groupCount = this.validItems.length ? 1000 : 0;
+          this.orderedGroups = null;
+          return;
+        }
+        if (field == "attachmentCategories") {
+          this.attachmentItems = (
+            data.hasAttachments.find(group => group.value === true)?.ids ?? []
+          ).map(id => byId.get(id));
+        }
+        this.orderedGroups = data[field].map(group => [
+          groupValue(group.value),
+          group.ids.map(id => byId.get(id)),
+        ]);
+        if (type == "discrete") {
+          const present = new Set(data[field].flatMap(group => group.ids));
+          const missing = items.filter(item => !present.has(item.id));
+          if (missing.length) {
+            this.orderedGroups.push([null, missing]);
+          }
+          this.orderedGroups.sort((a, b) => compare(a[0], b[0]));
+        }
+        this.groupCount = this.orderedGroups.length;
+      },
+    };
+    return faceter;
+  });
+  return {
+    faceters,
+    go(items, callback, context) {
+      const data = getMailSearchFacetData({ ...resultSet, items });
+      data.tags = data.tags.filter(group => tags.has(group.value));
+      for (const faceter of faceters) {
+        faceter.facetItems(items, data);
+      }
+      callback.call(context);
+    },
+  };
+}
+
 var FacetContext = {
-  facetDriver: new FacetDriver(Gloda.lookupNounDef("message"), window),
+  facetDriver: null,
 
   /**
    * The root collection which our active set is a subset of.  We hold onto this
@@ -513,6 +689,12 @@ var FacetContext = {
   },
 
   set fullSet(items) {
+    if (this.mailSearchResultSet) {
+      // The service already orders physical hits by relevance across pages.
+      this._relevantSortedItems = items.concat();
+      this._dateSortedItems = items.toSorted((a, b) => b.date - a.date);
+      return;
+    }
     let scoredItems;
     if (this.searcher && this.searcher.scores) {
       const scoreById = new Map();
@@ -536,7 +718,31 @@ var FacetContext = {
   },
 
   initialBuild() {
-    if (this.searcher) {
+    if (this.mailSearchResultSet) {
+      const { text, selection, andTerms } = this.tab.mailSearch;
+      if (selection) {
+        const key =
+          selection.type == "person"
+            ? "glodaFacetView.constraints.query.involves.label"
+            : "glodaFacetView.constraints.query.tagged.label";
+        const label = glodaFacetStrings.GetStringFromName(key);
+        const value =
+          selection.type == "person"
+            ? selection.emails.join(", ")
+            : (MailServices.tags
+                .getAllTags()
+                .find(tag => tag.key == selection.key)?.tag ?? selection.key);
+        QueryExplanation.node.textContent =
+          selection.type == "person"
+            ? label.replace("#1", value)
+            : label + " " + value;
+      } else {
+        QueryExplanation.setFulltext({
+          andTerms,
+          fulltextTerms: parseSearchTerms(text),
+        });
+      }
+    } else if (this.searcher) {
       QueryExplanation.setFulltext(this.searcher);
     } else {
       QueryExplanation.setQuery(this.collection.query);
@@ -550,13 +756,18 @@ var FacetContext = {
 
     this.everFaceted = false;
     this._activeConstraints = {};
-    if (this.searcher) {
+    if (
+      this.searcher ||
+      (this.mailSearchResultSet && !this.tab.mailSearch.selection)
+    ) {
       const sortByPref = Services.prefs.getIntPref("gloda.facetview.sortby");
       this._sortBy = sortByPref == 0 || sortByPref == 2 ? "-dascore" : "-date";
     } else {
       this._sortBy = "-date";
     }
-    this.fullSet = this._removeDupes(this._collection.items.concat());
+    this.fullSet = this.mailSearchResultSet
+      ? this.mailSearchResultSet.items
+      : this._removeDupes(this._collection.items.concat());
     if ("IMCollection" in this) {
       this.fullSet = this.fullSet.concat(this.IMCollection.items);
     }
@@ -999,6 +1210,11 @@ var FacetContext = {
   },
 
   toggleFulltextCriteria() {
+    if (this.tab.mailSearch) {
+      this.tab.mailSearch.andTerms = !this.tab.mailSearch.andTerms;
+      this.tab.searchPromise = this.loadMailSearch();
+      return;
+    }
     this.tab.searcher.andTerms = !this.tab.searcher.andTerms;
     this._resetUI();
     this.collection = this.tab.searcher.getCollection(this);
@@ -1006,9 +1222,14 @@ var FacetContext = {
 
   /**
    * Show the active message set in a 3-pane tab.
+   *
+   * @returns {Promise<?object>|undefined} Native list opening, or synchronous legacy completion.
    */
   showActiveSetInTab() {
     const tabmail = this.rootWin.document.getElementById("tabmail");
+    if (this.tab.mailSearch) {
+      return this.openMailSearchActiveList(tabmail);
+    }
     tabmail.openTab("mail3PaneTab", {
       folderPaneVisible: false,
       syntheticView: new GlodaSyntheticView({
@@ -1022,6 +1243,37 @@ var FacetContext = {
   },
 
   /**
+   * Export the current physical facet members through the existing native list.
+   *
+   * @param {Element} tabmail - Existing mail tab manager.
+   * @returns {Promise<?object>} Native list tab, or null on failure/cancellation.
+   */
+  async openMailSearchActiveList(tabmail) {
+    const signal = AbortSignal.any([
+      this.tab.mailSearchController.signal,
+      this.mailSearchQueryController.signal,
+    ]);
+    try {
+      return await openDefaultMailSearchResultsList(
+        tabmail,
+        {
+          ...this.mailSearchResultSet,
+          items: this.activeSet.map(item => ({
+            ...item,
+            location: { ...item.location },
+          })),
+        },
+        { title: this.tab.title, signal }
+      );
+    } catch (error) {
+      if (!signal.aborted) {
+        this.showMailSearchError("facet-view-search-error", error);
+      }
+      return null;
+    }
+  },
+
+  /**
    * Show the conversation in a new 3-pane tab.
    *
    * @param {MozFacetResultMessage} aResultMessage - The result the user wants
@@ -1031,6 +1283,9 @@ var FacetContext = {
   showConversationInTab(aResultMessage, aBackground) {
     const tabmail = this.rootWin.document.getElementById("tabmail");
     const message = aResultMessage.message;
+    if (this.tab.mailSearch) {
+      return this.openMailSearchConversation(message, aBackground);
+    }
     if (
       "IMCollection" in this &&
       message instanceof Gloda.lookupNounDef("im-conversation").clazz
@@ -1052,6 +1307,292 @@ var FacetContext = {
       title: message.conversation.subject,
       background: aBackground,
     });
+  },
+
+  /**
+   * Fetch a complete physical result set for this retained facet page.
+   *
+   * @returns {Promise<?MailSearchResultSet>} Current physical snapshot, or null on cancellation/error.
+   */
+  async loadMailSearch() {
+    this.mailSearchQueryController?.abort();
+    const controller = (this.mailSearchQueryController = new AbortController());
+    const signal = AbortSignal.any([
+      controller.signal,
+      this.tab.mailSearchController.signal,
+    ]);
+    this.mailSearchResultSet = null;
+    this._activeSet = [];
+    this._relevantSortedItems = [];
+    this._dateSortedItems = [];
+    const results = document.getElementById("results");
+    results.messagesNode.replaceChildren();
+    results.countNode.hidden = true;
+    document.getElementById("gloda-facet-view").inert = true;
+    if (this.faceters) {
+      for (const faceter of this.faceters) {
+        const node = faceter.xblNode;
+        if (node?.explicit) {
+          node.removeAttribute("checked");
+          if (node.checkbox) {
+            node.checkbox.checked = false;
+            node.checkbox.removeAttribute("checked");
+          }
+          if (node.filterNode) {
+            node.selectedValue = "all";
+          }
+          if (node.canvasNode) {
+            node.canvasNode.replaceChildren();
+            node.vis = null;
+          }
+        }
+      }
+      this._resetUI();
+    }
+    for (const id of ["showEmpty", "showMore", "gloda-showall"]) {
+      document.getElementById(id).style.display = "none";
+    }
+    const loading = document.getElementById("showLoading");
+    document.l10n.setAttributes(loading, "facet-view-search-loading");
+    loading.style.display = "block";
+    try {
+      const resultSet = await findMailSearchResults(this.tab.mailSearch.text, {
+        ...this.tab.mailSearch,
+        signal,
+      });
+      signal.throwIfAborted();
+      if (
+        this.tab.mailSearch.sourceId !== null &&
+        this.tab.mailSearch.sourceId !== undefined &&
+        resultSet.sourceId != this.tab.mailSearch.sourceId
+      ) {
+        throw new DOMException(
+          "Native completion source changed",
+          "InvalidStateError"
+        );
+      }
+      this.mailSearchResultSet = resultSet;
+      this.facetDriver = makeMailSearchFacetDriver(resultSet);
+      this.initialBuild();
+      results.countNode.hidden = false;
+      document.getElementById("gloda-facet-view").inert = false;
+      return resultSet;
+    } catch (error) {
+      if (!signal.aborted) {
+        this.showMailSearchError("facet-view-search-error", error);
+      }
+      return null;
+    }
+  },
+
+  /**
+   * Use the retained status area for query or stale-conversation failures.
+   *
+   * @param {string} messageId - Localized error text.
+   * @param {Error} error - Original query or opening failure.
+   */
+  showMailSearchError(messageId, error) {
+    console.error(error);
+    const status = document.getElementById("showLoading");
+    status.replaceChildren();
+    document.l10n.setAttributes(status, messageId);
+    status.style.display = "block";
+    document.getElementById("showEmpty").style.display = "none";
+  },
+
+  /**
+   * Open all current eligible conversation members, selecting the clicked copy.
+   *
+   * @param {MailSearchResult} message - Captured physical hit, never a Message-ID lookup.
+   * @param {boolean} background - Whether to select the new mail tab.
+   * @returns {Promise<?object>} Opened mail tab, or null on cancellation/staleness.
+   */
+  openMailSearchConversation(message, background) {
+    // The facet frame can be destroyed before its pending query settles.
+    const { promise, resolve, reject } = this.rootWin.Promise.withResolvers();
+    this._openMailSearchConversation(message, background, resolve).then(
+      resolve,
+      reject
+    );
+    return promise;
+  },
+
+  /**
+   * Opens captured members while the parent owns cancellation settlement.
+   *
+   * @param {MailSearchResult} message - Exact physical hit.
+   * @param {boolean} background - Whether to retain the facet selection.
+   * @param {function(null): void} cancelled - Settles the parent promise when this frame closes.
+   * @returns {Promise<?object>} Opened list, or null on cancellation/staleness.
+   */
+  async _openMailSearchConversation(message, background, cancelled) {
+    this.mailSearchOpeningController?.abort();
+    const controller = (this.mailSearchOpeningController =
+      new AbortController());
+    const signal = AbortSignal.any([
+      controller.signal,
+      this.tab.mailSearchController.signal,
+      this.mailSearchQueryController.signal,
+    ]);
+    const cancelOpening = () => cancelled(null);
+    signal.addEventListener("abort", cancelOpening, { once: true });
+    const request = {
+      ...message,
+      location: { ...message.location },
+      sourceId: this.mailSearchResultSet.sourceId,
+    };
+    let errorMessageId = "facet-view-search-error";
+    try {
+      const snapshot = await getMailSearchConversation(request, { signal });
+      signal.throwIfAborted();
+      if (snapshot.status != "ready") {
+        if (["deleted", "ineligible", "stale"].includes(snapshot.status)) {
+          errorMessageId = "facet-view-conversation-stale";
+        }
+        throw new Error(`Conversation ${snapshot.status}`);
+      }
+      if (
+        snapshot.selectedId !== request.id ||
+        snapshot.selectedMessage.messageKey !== request.location.messageKey ||
+        snapshot.selectedMessage.folder.id !== request.location.folderId
+      ) {
+        errorMessageId = "facet-view-conversation-stale";
+        throw new Error("Conversation selection changed physical identity");
+      }
+      const selected = {
+        key: snapshot.selectedMessage.messageKey,
+        folderURI: snapshot.selectedMessage.folder.URI,
+      };
+      const service = await getMailSearchService();
+      signal.throwIfAborted();
+      const context = this;
+      const tabmail = this.rootWin.document.getElementById("tabmail");
+      let tab;
+      const view = new (class extends MailSearchView {
+        initialSearch = true;
+        search(listener, completion) {
+          if (!this.initialSearch) {
+            return super.search(listener, completion);
+          }
+          let status;
+          const delivered = new Set();
+          const expected = new Set(
+            snapshot.items.map(
+              item => `${item.location.folderId}/${item.location.messageKey}`
+            )
+          );
+          let unexpected = false;
+          return super.search(
+            {
+              onNewSearch: () => listener.onNewSearch(),
+              onSearchHit: (header, folder) => {
+                const identity = `${folder.id}/${header.messageKey}`;
+                if (!expected.has(identity)) {
+                  unexpected = true;
+                  return;
+                }
+                delivered.add(identity);
+                listener.onSearchHit(header, folder);
+              },
+              onSearchDone: value => {
+                status = value;
+                const nativeView = tab?.chromeBrowser?.contentWindow?.gDBView;
+                let membersCurrent = false;
+                if (Components.isSuccessCode(status)) {
+                  try {
+                    membersCurrent = snapshot.items.every(item => {
+                      const state = service.resolveDocument(item.id, signal);
+                      return (
+                        state?.eligible &&
+                        state.location.folderId == item.location.folderId &&
+                        state.location.messageKey == item.location.messageKey
+                      );
+                    });
+                  } catch (error) {
+                    console.error(error);
+                    status = error?.result || Cr.NS_ERROR_FAILURE;
+                  }
+                }
+                if (
+                  Components.isSuccessCode(status) &&
+                  (!membersCurrent ||
+                    unexpected ||
+                    delivered.size != expected.size ||
+                    nativeView?.numMsgsInView != expected.size)
+                ) {
+                  status = Cr.NS_ERROR_NOT_AVAILABLE;
+                }
+                listener.onSearchDone(status);
+              },
+            },
+            () => {
+              if (status != Cr.NS_BINDING_ABORTED) {
+                this.initialSearch = false;
+                signal.removeEventListener("abort", cancel);
+              }
+              completion?.();
+              const pane = tab?.chromeBrowser?.contentWindow;
+              if (
+                status == Cr.NS_BINDING_ABORTED ||
+                pane?.gViewWrapper?._syntheticView != this ||
+                !tabmail.tabInfo.includes(tab)
+              ) {
+                return;
+              }
+              const index = pane.gDBView.findIndexOfMsgHdr(
+                snapshot.selectedMessage,
+                true
+              );
+              const header =
+                index != 0xffffffff && pane.gDBView.getMsgHdrAt(index);
+              if (
+                !signal.aborted &&
+                Components.isSuccessCode(status) &&
+                pane.gDBView.numMsgsInView == expected.size &&
+                header?.messageKey == selected.key &&
+                header.folder.URI == selected.folderURI
+              ) {
+                this.selectedMessage = snapshot.selectedMessage;
+                pane.threadTree.selectedIndex = index;
+              } else {
+                if (!signal.aborted) {
+                  context.showMailSearchError(
+                    "facet-view-conversation-stale",
+                    new Error(
+                      "Conversation members changed before list completion"
+                    )
+                  );
+                }
+                tabmail.closeTab(tab);
+              }
+            }
+          );
+        }
+      })(service, "", true, snapshot);
+      const cancel = () => {
+        view.abortSearch();
+        if (tab && tabmail.tabInfo.includes(tab)) {
+          tabmail.closeTab(tab);
+        }
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      tab = tabmail.openTab("mail3PaneTab", {
+        folderPaneVisible: false,
+        syntheticView: view,
+        title: message.subject,
+        background,
+      });
+      return tab;
+    } catch (error) {
+      const wasAborted = signal.aborted;
+      controller.abort(error);
+      if (!wasAborted) {
+        this.showMailSearchError(errorMessageId, error);
+      }
+      return null;
+    } finally {
+      signal.removeEventListener("abort", cancelOpening);
+    }
   },
 
   onItemsAdded() {},
@@ -1085,8 +1626,19 @@ function reachOutAndTouchFrame() {
   const aTab = (FacetContext.tab = parentWin.tab);
   parentWin.tab = null;
   window.addEventListener("resize", function () {
-    document.getElementById("facet-date").build(true);
+    const facet = document.getElementById("facet-date");
+    if (facet.faceter?.validItems?.length) {
+      facet.build(true);
+    }
   });
+  if (aTab.mailSearch) {
+    aTab.searchPromise = FacetContext.loadMailSearch();
+    return;
+  }
+  FacetContext.facetDriver = new FacetDriver(
+    Gloda.lookupNounDef("message"),
+    window
+  );
   // we need to hook the context up as a listener in all cases since
   //  removal notifications are required.
   if ("searcher" in aTab) {

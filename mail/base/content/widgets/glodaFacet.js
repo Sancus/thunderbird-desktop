@@ -12,18 +12,16 @@
   const { TagUtils } = ChromeUtils.importESModule(
     "resource:///modules/TagUtils.sys.mjs"
   );
-  const { FacetUtils } = ChromeUtils.importESModule(
-    "resource:///modules/gloda/Facet.sys.mjs"
-  );
-  const { Gloda } = ChromeUtils.importESModule(
-    "resource:///modules/gloda/Gloda.sys.mjs"
-  );
 
   var glodaFacetStrings = Services.strings.createBundle(
     "chrome://messenger/locale/glodaFacetView.properties"
   );
 
   const lazy = {};
+  ChromeUtils.defineESModuleGetters(lazy, {
+    FacetUtils: "resource:///modules/gloda/Facet.sys.mjs",
+    Gloda: "resource:///modules/gloda/Gloda.sys.mjs",
+  });
   ChromeUtils.defineLazyGetter(
     lazy,
     "l10n",
@@ -438,6 +436,13 @@
             count += groupPair[1].length;
           }
         }
+        if (this.faceter.native) {
+          count = new Set(
+            this.orderedGroups
+              .filter(([value]) => value !== null)
+              .flatMap(([, items]) => items.map(item => item.id))
+          ).size;
+        }
         this.countNode.textContent = count.toLocaleString();
         return;
       }
@@ -492,6 +497,9 @@
         this.filterNode.appendChild(selNode);
       });
 
+      if (this.faceter.native) {
+        this.trueValues = this.faceter.attachmentItems;
+      }
       this.disabled = !this.trueValues.length;
 
       this.countNode.textContent = this.trueValues.length.toLocaleString();
@@ -503,6 +511,17 @@
         this.filterNode.selectedIndex = 0;
         this.filterNode.value = "all";
         this.selectedValue = "all";
+        if (this.faceter.native) {
+          const constraint = this.faceter.constraint;
+          if (constraint) {
+            FacetContext.removeFacetConstraint(
+              this.faceter,
+              true,
+              constraint.groupValues.concat()
+            );
+          }
+          return;
+        }
         this.#triggerFacet(this.trueGroups);
       }
     }
@@ -679,11 +698,16 @@
         // top mode must be used
         this.modes.push("top");
         this.mode = "top";
-        this.topGroups = FacetUtils.makeTopGroups(
-          this.attrDef,
-          this.orderedGroups,
-          this.maxDisplayRows
-        );
+        this.topGroups = this.faceter.native
+          ? this.orderedGroups
+              .toSorted((a, b) => b[1].length - a[1].length)
+              .slice(0, this.maxDisplayRows)
+              .sort((a, b) => this.nounDef.comparator(a[0], b[0]))
+          : lazy.FacetUtils.makeTopGroups(
+              this.attrDef,
+              this.orderedGroups,
+              this.maxDisplayRows
+            );
         // setup the more button string
         const groupCount = this.orderedGroups.length;
         document.l10n.setAttributes(
@@ -1529,7 +1553,7 @@
         FacetContext.showConversationInTab(this, event.button == 1);
       };
       subject.onkeypress = event => {
-        if (Event.keyCode == event.DOM_VK_RETURN) {
+        if (event.keyCode == event.DOM_VK_RETURN) {
           FacetContext.showConversationInTab(this, event.shiftKey);
         }
       };
@@ -1543,8 +1567,16 @@
         subject.textContent = message.subject;
       }
       const authorNode = this.author;
-      authorNode.setAttribute("title", message.from.value);
-      authorNode.textContent = message.from.contact.name;
+      const native = Boolean(FacetContext.mailSearchResultSet);
+      authorNode.setAttribute(
+        "title",
+        native
+          ? message.from.map(address => address.email).join(", ")
+          : message.from.value
+      );
+      authorNode.textContent = native
+        ? message.from.map(address => address.name || address.email).join(", ")
+        : message.from.contact.name;
       const toNode = this.to;
       toNode.textContent = glodaFacetStrings.GetStringFromName(
         "glodaFacetView.result.message.toLabel"
@@ -1559,7 +1591,10 @@
       // - Recipients
       try {
         const recipientsNode = this.recipients;
-        if (message.recipients) {
+        const recipients = native
+          ? [...message.to, ...message.cc, ...message.bcc]
+          : message.recipients;
+        if (recipients) {
           const MAX_RECIPIENTS = 3;
 
           const formatter = new Intl.ListFormat(
@@ -1573,11 +1608,15 @@
           // Recipients without one are not shown, but still count towards
           // the "N others" total so that it matches the number of
           // recipients that were left out.
-          const contactNames = message.recipients
-            .map(recipient => recipient.contact?.name)
+          const contactNames = recipients
+            .map(recipient =>
+              native
+                ? recipient.name || recipient.email
+                : recipient.contact?.name
+            )
             .filter(Boolean)
             .slice(0, MAX_RECIPIENTS);
-          const otherCount = message.recipients.length - contactNames.length;
+          const otherCount = recipients.length - contactNames.length;
           if (otherCount > 0) {
             contactNames.push(
               lazy.l10n.formatValueSync("facet-view-and-others", {
@@ -1609,12 +1648,15 @@
       }
 
       // - Attachments
-      if (message.attachmentNames) {
+      const attachmentNames = native
+        ? message.attachmentInfos?.items.map(info => info.name).filter(Boolean)
+        : message.attachmentNames;
+      if (attachmentNames?.length) {
         const attachmentsNode = this.attachments;
         const imgNode = document.createElement("div");
         imgNode.setAttribute("class", "message-attachment-icon");
         attachmentsNode.appendChild(imgNode);
-        for (let attach of message.attachmentNames) {
+        for (let attach of attachmentNames) {
           const attachNode = document.createElement("div");
           attachNode.setAttribute("class", "message-attachment");
           if (attach.length >= 28) {
@@ -1627,8 +1669,16 @@
 
       // - Tags
       const tagsNode = this.tags;
-      if ("tags" in message && message.tags.length) {
-        for (const tag of message.tags) {
+      const tagNames =
+        native &&
+        new Map(MailServices.tags.getAllTags().map(tag => [tag.key, tag.tag]));
+      const tags = native
+        ? message.tagKeys
+            .filter(key => tagNames.has(key))
+            .map(key => ({ key, tag: tagNames.get(key) }))
+        : message.tags;
+      if (tags?.length) {
+        for (const tag of tags) {
           const tagNode = document.createElement("span");
           tagNode.setAttribute("class", "message-tag");
           const color = MailServices.tags.getColorForKey(tag.key);
@@ -1647,7 +1697,22 @@
       }
 
       // - Body
-      if (message.indexedBodyText) {
+      if (native && message.snippet) {
+        const { text, ranges } = message.snippet;
+        let offset = 0;
+        for (const { start, end } of ranges) {
+          this.snippet.append(
+            document.createTextNode(text.slice(offset, start))
+          );
+          const match = document.createElement("span");
+          match.classList.add("message-body-fulltext-match");
+          match.textContent = text.slice(start, end);
+          this.snippet.append(match);
+          offset = end;
+        }
+        this.snippet.append(document.createTextNode(text.slice(offset)));
+        this.firstMatchText = message.snippet.firstMatchText;
+      } else if (message.indexedBodyText) {
         let bodyText = message.indexedBodyText;
 
         const matches = [];
@@ -1655,7 +1720,7 @@
           let collection;
           if (
             "IMCollection" in FacetContext &&
-            message instanceof Gloda.lookupNounDef("im-conversation").clazz
+            message instanceof lazy.Gloda.lookupNounDef("im-conversation").clazz
           ) {
             collection = FacetContext.IMCollection;
           } else {

@@ -3,6 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 ChromeUtils.defineESModuleGetters(this, {
+  copyMailSearchSelection:
+    "resource:///modules/panorama/MailSearchResult.sys.mjs",
   GlodaMsgSearcher: "resource:///modules/gloda/GlodaMsgSearcher.sys.mjs",
 });
 
@@ -40,7 +42,33 @@ var glodaFacetTabType = {
     aTab.panel.appendChild(clone);
     aTab.iframe = aTab.panel.querySelector("iframe");
 
-    if ("query" in aArgs) {
+    if ("mailSearch" in aArgs) {
+      const {
+        text = "",
+        selection = null,
+        andTerms = true,
+        sourceId = null,
+      } = aArgs.mailSearch;
+      if (
+        typeof text != "string" ||
+        typeof andTerms != "boolean" ||
+        (sourceId !== null && (typeof sourceId != "string" || !sourceId))
+      ) {
+        throw new TypeError("Expected mail search text and term mode");
+      }
+      aTab.mailSearch = {
+        text,
+        selection: copyMailSearchSelection(selection),
+        andTerms,
+        sourceId,
+      };
+      aTab.mailSearchController = new AbortController();
+      aTab.searchInputValue = aTab.searchString = text;
+      aTab.title =
+        aArgs.title ||
+        text ||
+        this.strings.GetStringFromName("glodaFacetView.tab.search.label");
+    } else if ("query" in aArgs) {
       aTab.query = aArgs.query;
       aTab.collection = aTab.query.getCollection();
 
@@ -99,7 +127,11 @@ var glodaFacetTabType = {
 
     this.lastTabId++;
   },
-  closeTab() {},
+  closeTab(tab) {
+    tab.mailSearchController?.abort(
+      new DOMException("Search tab closed", "AbortError")
+    );
+  },
   saveTabState() {
     // nothing to do; we are not multiplexed
   },

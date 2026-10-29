@@ -46,6 +46,11 @@ BROWSER_CHROME_MANIFESTS += [
     "utils/browser.toml",
 ]
 
+if CONFIG["MOZ_PANORAMA"]:
+    BROWSER_CHROME_MANIFESTS += [
+        "global-search-bar/browser-panorama.toml",
+    ]
+
 DIRS += [
     "shared-modules",
 ]

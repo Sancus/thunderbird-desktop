@@ -6,11 +6,17 @@ ChromeUtils.defineESModuleGetters(this, {
   Gloda: "resource:///modules/gloda/GlodaPublic.sys.mjs",
   GlodaConstants: "resource:///modules/gloda/GlodaConstants.sys.mjs",
   GlodaSyntheticView: "resource:///modules/gloda/GlodaSyntheticView.sys.mjs",
+  findMailSearchResults: "resource:///modules/panorama/MailSearch.sys.mjs",
+  openDefaultMailSearchList: "resource:///modules/panorama/MailSearch.sys.mjs",
+  openDefaultMailSearchResultsList:
+    "resource:///modules/panorama/MailSearch.sys.mjs",
+  copyMailSearchSelection:
+    "resource:///modules/panorama/MailSearchResult.sys.mjs",
 });
 
 /**
- * Tab type that opens Gloda search results directly as a mail3PaneTab list
- * view, bypassing the faceted search interface.
+ * Opens global search results in the existing mail3PaneTab list view.
+ * Replacement callers pass mailSearch text/selection or an active result set.
  */
 const glodaTableListTabType = {
   name: "glodaTableList",
@@ -27,6 +33,80 @@ const glodaTableListTabType = {
   openTab(aTab, aArgs) {
     aTab.panel.setAttribute("id", "glodaListTab" + this.lastTabId);
     const tabmail = document.getElementById("tabmail");
+
+    if ("mailSearch" in aArgs) {
+      const controller = new AbortController();
+      aTab.mailSearchController = controller;
+      const {
+        text = "",
+        selection = null,
+        andTerms = true,
+        sourceId = null,
+      } = aArgs.mailSearch;
+      const title =
+        aArgs.title ||
+        text ||
+        this.strings.GetStringFromName(
+          selection
+            ? "glodaFacetView.tab.query.label"
+            : "glodaFacetView.tab.search.label"
+        );
+      this.lastTabId++;
+      // Native result delivery still completes through the synthetic view.
+      aTab.searchPromise = (async () => {
+        // Capture typed values and active members before service lookup yields.
+        const copiedSelection = copyMailSearchSelection(selection);
+        if (sourceId !== null && (typeof sourceId != "string" || !sourceId))
+          throw new TypeError("Expected a native completion source");
+        let resultSet = aArgs.mailSearch.resultSet;
+        if (!resultSet && sourceId !== null) {
+          resultSet = await findMailSearchResults(text, {
+            selection: copiedSelection,
+            andTerms,
+            signal: controller.signal,
+          });
+        }
+        controller.signal.throwIfAborted();
+        if (sourceId !== null && resultSet.sourceId != sourceId)
+          throw new DOMException(
+            "Native completion source changed",
+            "InvalidStateError"
+          );
+        if (resultSet) {
+          const captured = {
+            sourceId: resultSet.sourceId,
+            resultSetId: resultSet.resultSetId,
+            items: resultSet.items.map(item => ({ ...item })),
+          };
+          return openDefaultMailSearchResultsList(tabmail, captured, {
+            title,
+            signal: controller.signal,
+          });
+        }
+        return openDefaultMailSearchList(tabmail, text, {
+          selection: copiedSelection,
+          andTerms,
+          title,
+          signal: controller.signal,
+        });
+      })();
+      aTab.searchPromise.then(
+        () => {
+          if (tabmail.tabInfo.includes(aTab)) {
+            tabmail.closeTab(aTab);
+          }
+        },
+        error => {
+          if (!controller.signal.aborted) {
+            console.error(error);
+          }
+          if (tabmail.tabInfo.includes(aTab)) {
+            tabmail.closeTab(aTab);
+          }
+        }
+      );
+      return;
+    }
 
     // Already-resolved items (e.g. from the facet view's active set button).
     if ("items" in aArgs) {
@@ -80,7 +160,11 @@ const glodaTableListTabType = {
       },
     };
   },
-  closeTab() {},
+  closeTab(tab) {
+    tab.mailSearchController?.abort(
+      new DOMException("Search tab closed", "AbortError")
+    );
+  },
   saveTabState() {},
   showTab() {},
   getBrowser() {

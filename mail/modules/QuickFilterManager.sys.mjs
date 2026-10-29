@@ -16,6 +16,15 @@ ChromeUtils.defineESModuleGetters(lazy, {
   XULStoreUtils: "resource:///modules/XULStoreUtils.sys.mjs",
 });
 
+ChromeUtils.defineLazyGetter(
+  lazy,
+  "glodaCompleter",
+  () =>
+    Cc["@mozilla.org/autocomplete/search;1?name=gloda"].getService(
+      Ci.nsIAutoCompleteSearch
+    ).wrappedJSObject
+);
+
 /**
  * Should the filter be visible when there's no previous state to propagate it
  * from? The idea is that when session persistence is working this should only
@@ -1296,11 +1305,16 @@ export var MessageTextFilter = {
       }
       const tabmail =
         aDocument.documentGlobal.top.document.getElementById("tabmail");
+      const showAsList = Services.prefs.getBoolPref(
+        "gloda.show_as_list_by_default",
+        false
+      );
+      const useMailSearch = lazy.glodaCompleter.isNativeMailSearch === true;
       tabmail.openTab(
-        Services.prefs.getBoolPref("gloda.show_as_list_by_default", false)
-          ? "glodaTableList"
-          : "glodaFacet",
-        { searcher: new lazy.GlodaMsgSearcher(null, aState.text) }
+        showAsList ? "glodaTableList" : "glodaFacet",
+        useMailSearch
+          ? { mailSearch: { text: aState.text } }
+          : { searcher: new lazy.GlodaMsgSearcher(null, aState.text) }
       );
       aEvent.preventDefault();
     }
@@ -1373,8 +1387,8 @@ export var MessageTextFilter = {
    * results.
    */
   postFilterProcess(aState, aViewWrapper, aFiltering) {
-    // If we're not filtering, not filtering on text, there are results, or
-    // gloda is not enabled so upselling makes no sense, then bail.
+    // Offer global search only for a text filter with no results and an
+    // enabled search backend.
     // (Currently we always return "nosale" to make sure our panel is closed;
     // this might be overkill but unless it becomes a performance problem, it
     // keeps us safe from weird stuff.)
@@ -1382,7 +1396,12 @@ export var MessageTextFilter = {
       !aFiltering ||
       !aState.text ||
       aViewWrapper.dbView.numMsgsInView ||
-      !lazy.GlodaIndexer.enabled
+      !(lazy.glodaCompleter.isNativeMailSearch === true
+        ? Services.prefs.getBoolPref(
+            "mailnews.database.global.indexer.enabled",
+            true
+          )
+        : lazy.GlodaIndexer.enabled)
     ) {
       return [aState, "nosale", false];
     }

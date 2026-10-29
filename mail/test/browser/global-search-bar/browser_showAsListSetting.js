@@ -108,3 +108,54 @@ registerCleanupFunction(function () {
     tabmail.closeTab(1);
   }
 });
+
+add_task(async function test_mailOnlyListUsesSelectedBackend() {
+  await SpecialPowers.pushPrefEnv({
+    set: [
+      [PREF_SHOW_AS_LIST, true],
+      ["mail.chat.enabled", false],
+    ],
+  });
+  const tabmail = document.getElementById("tabmail");
+  performGlobalSearch("selectedbackendneedle");
+  await TestUtils.waitForCondition(
+    () =>
+      tabmail.tabInfo.length === 2 &&
+      tabmail.tabInfo[1].mode.name === "mail3PaneTab" &&
+      tabmail.tabInfo[1].chromeBrowser?.contentWindow?.gViewWrapper
+        ?.isSynthetic,
+    "Mail-only list search opens using the backend selected at startup"
+  );
+  tabmail.closeTab(1);
+  await SpecialPowers.popPrefEnv();
+});
+
+add_task(async function test_resultInputUsesSelectedBackend() {
+  await SpecialPowers.pushPrefEnv({
+    set: [
+      [PREF_SHOW_AS_LIST, true],
+      ["mail.chat.enabled", false],
+    ],
+  });
+  await customElements.whenDefined("gloda-autocomplete-input");
+  const input = document
+    .getElementById("glodaTab")
+    .querySelector(".remote-gloda-search")
+    .cloneNode(true);
+  registerCleanupFunction(() => input.remove());
+  document.documentElement.appendChild(input);
+  input.value = "selectedresultbackendneedle";
+  input.doSearch();
+  const tabmail = document.getElementById("tabmail");
+  await TestUtils.waitForCondition(
+    () =>
+      tabmail.tabInfo.length === 2 &&
+      tabmail.tabInfo[1].mode.name === "mail3PaneTab" &&
+      tabmail.tabInfo[1].chromeBrowser?.contentWindow?.gViewWrapper
+        ?.isSynthetic,
+    "The existing result input uses the backend selected at startup"
+  );
+  tabmail.closeTab(1);
+  input.remove();
+  await SpecialPowers.popPrefEnv();
+});

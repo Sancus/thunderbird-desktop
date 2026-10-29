@@ -126,6 +126,11 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
   nsresult InitWithFolderId(uint64_t folderId,
                             nsTArray<FolderInitialization>& initializedFolders);
   nsresult GetCachedChild(uint64_t folderId, nsIMsgFolder** child);
+
+  // The canonical local EmptyTrash caller scopes this only while deleting a
+  // child whose native rows have been retired. Ordinary DeleteSelf/move cleanup
+  // must retain their existing nonempty-folder behavior.
+  bool mRequireEmptyNativeStorage = false;
 #endif
 
   virtual nsresult CreateBaseMessageURI(const nsACString& aURI);

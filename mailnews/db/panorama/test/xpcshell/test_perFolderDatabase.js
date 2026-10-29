@@ -1584,3 +1584,432 @@ add_task(function test_expungedBytesRejectsInvalidValuesAndPreservesErrors() {
   Assert.throws(() => (info.expungedBytes = 0), /NS_ERROR_NOT_AVAILABLE/);
   Assert.throws(() => info.changeExpungedBytes(1), /NS_ERROR_NOT_AVAILABLE/);
 });
+
+add_task(async function test_retainedTrashStorageRequiresRetiredRows() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retained-trash-storage");
+  folder.setFlag(Ci.nsMsgFolderFlags.Trash);
+  const id = folder.id;
+  const uri = folder.URI;
+  const path = folder.filePath.path;
+  await IOUtils.writeUTF8(path, "retained storage bytes");
+  const key = addMessage({ folderId: id, messageId: "retained-trash-message" });
+  Assert.throws(
+    () => rootFolder.propagateDelete(folder, true),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.equal(await IOUtils.readUTF8(path), "retained storage bytes");
+  Assert.ok(folder.msgDatabase.containsKey(key));
+  Assert.strictEqual(folder.parent, rootFolder);
+  Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), folder);
+
+  messageDB.removeMessage(key);
+
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    Assert.throws(
+      () => rootFolder.propagateDelete(folder, true),
+      /NS_ERROR_IN_PROGRESS/
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.equal(await IOUtils.readUTF8(path), "retained storage bytes");
+  } finally {
+    connection.rollbackTransaction();
+  }
+  connection.executeSimpleSQL(
+    "ALTER TABLE staged_messages RENAME TO hidden_trash_staged_messages"
+  );
+  try {
+    Assert.throws(
+      () => rootFolder.propagateDelete(folder, true),
+      /NS_ERROR_FAILURE/
+    );
+    Assert.equal(await IOUtils.readUTF8(path), "retained storage bytes");
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE hidden_trash_staged_messages RENAME TO staged_messages"
+    );
+  }
+  rootFolder.propagateDelete(folder, true);
+  Assert.ok(!(await IOUtils.exists(path)));
+  Assert.equal(folderDB.getFolderParent(id), rootFolder.id);
+  // propagateDelete deliberately unlinks the folder on success. EmptyTrash
+  // must instead keep its canonical object and call the native storage API.
+  Assert.strictEqual(folder.parent, null);
+  Assert.equal(folder.id, id);
+  Assert.equal(folder.URI, uri);
+});
+
+add_task(async function test_retainedTrashRechecksAfterAnnouncerCallbacks() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retained-trash-reentrant");
+  folder.setFlag(Ci.nsMsgFolderFlags.Trash);
+  const path = folder.filePath.path;
+  await IOUtils.writeUTF8(path, "announcer must not discard these bytes");
+  const db = folder.msgDatabase;
+  let key;
+  let child;
+  let calls = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway() {
+      calls++;
+      key = addMessage({
+        folderId: folder.id,
+        messageId: "retained-trash-during-close",
+      });
+      folder.createSubfolder("late-child", null);
+      child = folder.getChildNamed("late-child");
+    },
+  };
+  db.addListener(listener);
+  try {
+    Assert.throws(
+      () => rootFolder.propagateDelete(folder, true),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.equal(calls, 1);
+    Assert.ok(folder.msgDatabase.containsKey(key));
+    Assert.strictEqual(child.parent, folder);
+    Assert.equal(folderDB.getFolderParent(child.id), folder.id);
+    Assert.equal(
+      await IOUtils.readUTF8(path),
+      "announcer must not discard these bytes"
+    );
+    Assert.strictEqual(folder.parent, rootFolder);
+    Assert.strictEqual(
+      MailServices.folderLookup.getFolderForURL(folder.URI),
+      folder
+    );
+  } finally {
+    db.removeListener(listener);
+  }
+});
+
+add_task(async function test_accountedDeletionUsesPhysicalRowsAndKeepsBodies() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("accounted-deletion");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("accounted-bystander");
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  const otherDB = other.msgDatabase;
+  const first = messageDB.getMessage(addMessage({ folderId: folder.id }));
+  const second = messageDB.getMessage(addMessage({ folderId: folder.id }));
+  const foreign = messageDB.getMessage(addMessage({ folderId: other.id }));
+  first.messageSize = 0xf0000001;
+  first.offlineMessageSize = 7;
+  second.messageSize = 19;
+  foreign.messageSize = 31;
+  const path = folder.filePath.path;
+  await IOUtils.writeUTF8(path, "metadata removal retains body bytes");
+  const deleted = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrDeleted(header) {
+      deleted.push(header.messageKey);
+      Assert.ok(!db.containsKey(header.messageKey));
+      Assert.equal(
+        info.expungedBytes,
+        deleted.length == 1 ? 0xf0000001 : 0xf0000014
+      );
+      Assert.ok(!database.connectionForTests.transactionInProgress);
+    },
+  };
+  db.addListener(listener);
+  try {
+    Assert.throws(
+      () => db.deleteHeader(foreign, null, true, true),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.ok(otherDB.containsKey(foreign.messageKey));
+    Assert.equal(info.expungedBytes, 0);
+    Assert.equal(otherDB.dBFolderInfo.expungedBytes, 0);
+    Assert.deepEqual(deleted, []);
+    db.deleteHeader(first, null, true, true);
+    db.deleteMessage(second.messageKey, null, false);
+    Assert.deepEqual(deleted, [first.messageKey, second.messageKey]);
+    Assert.equal(info.expungedBytes, 0xf0000014);
+    Assert.ok(otherDB.containsKey(foreign.messageKey));
+    Assert.equal(otherDB.dBFolderInfo.expungedBytes, 0);
+    Assert.equal(
+      await IOUtils.readUTF8(path),
+      "metadata removal retains body bytes"
+    );
+    Assert.strictEqual(first.folder, folder);
+    // Removal deletes storage properties; the retained header keeps its key
+    // and core fields, while the size getter uses the normal absence default.
+    Assert.equal(first.messageSize, 0);
+    const properties = database.connectionForTests.createStatement(
+      "SELECT COUNT(*) AS count FROM message_properties WHERE id = :key"
+    );
+    try {
+      properties.params.key = first.messageKey;
+      Assert.ok(properties.executeStep());
+      Assert.equal(properties.row.count, 0);
+    } finally {
+      properties.finalize();
+    }
+  } finally {
+    db.removeListener(listener);
+  }
+});
+
+add_task(function test_accountedDeletionPreservesErrorsAndCallerOwnership() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("accounted-errors");
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  const key = addMessage({ folderId: folder.id });
+  messageDB.getMessage(key).messageSize = 23;
+  info.expungedBytes = 11;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_accounted_removal BEFORE INSERT ON folder_properties " +
+      `WHEN NEW.id = ${folder.id} AND NEW.name = 'expungedBytes' ` +
+      "BEGIN SELECT RAISE(ABORT, 'accounted removal fault'); END"
+  );
+  try {
+    Assert.throws(
+      () => db.deleteMessages([key], null),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.ok(db.containsKey(key));
+    Assert.equal(info.expungedBytes, 11);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_accounted_removal");
+  }
+  connection.beginTransaction();
+  try {
+    Assert.throws(
+      () => db.deleteMessage(key, null, true),
+      /NS_ERROR_IN_PROGRESS/
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.ok(db.containsKey(key));
+    Assert.equal(info.expungedBytes, 11);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  connection.executeSimpleSQL(
+    "ALTER TABLE body_relocations RENAME TO hidden_accounted_body_relocations"
+  );
+  try {
+    Assert.throws(() => db.deleteMessages([key], null), /NS_ERROR_FAILURE/);
+    Assert.ok(db.containsKey(key));
+    Assert.equal(info.expungedBytes, 11);
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE hidden_accounted_body_relocations RENAME TO body_relocations"
+    );
+  }
+  const source = database.sourceId;
+  connection.executeSimpleSQL(
+    "UPDATE database_identity SET sourceId = '{12345678-1234-1234-1234-123456789abc}'"
+  );
+  try {
+    Assert.throws(
+      () => db.deleteMessages([key], null),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.ok(db.containsKey(key));
+    Assert.equal(info.expungedBytes, 11);
+  } finally {
+    const restore = connection.createStatement(
+      "UPDATE database_identity SET sourceId = :source"
+    );
+    try {
+      restore.params.source = source;
+      restore.execute();
+    } finally {
+      restore.finalize();
+    }
+  }
+  db.deleteMessages([key], null);
+  Assert.ok(!db.containsKey(key));
+  Assert.equal(info.expungedBytes, 34);
+  db.forceClosed();
+  Assert.throws(() => db.deleteMessages([key], null), /NS_ERROR_NOT_AVAILABLE/);
+});
+
+add_task(function test_accountedImapDeletionUsesOnlyOfflineBytes() {
+  const server = MailServices.accounts.createIncomingServer(
+    "accounted-imap",
+    "accounted.invalid",
+    "imap"
+  );
+  const account = MailServices.accounts.createAccount();
+  account.incomingServer = server;
+  try {
+    Assert.equal(server.localDatabaseType, "imap");
+    const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
+    root.createClientSubfolderInfo("accounted", "/", 0, true);
+    const folder = root.getChildNamed("accounted");
+    const db = folder.msgDatabase;
+    Assert.strictEqual(db.folder, folder);
+    const offline = messageDB.getMessage(
+      addMessage({ folderId: folder.id, flags: Ci.nsMsgMessageFlags.Offline })
+    );
+    const online = messageDB.getMessage(addMessage({ folderId: folder.id }));
+    offline.messageSize = 700;
+    offline.offlineMessageSize = 0x80000001;
+    online.messageSize = 900;
+    online.offlineMessageSize = 100;
+    db.deleteMessages([offline.messageKey, online.messageKey], null);
+    Assert.equal(db.dBFolderInfo.expungedBytes, 0x80000001);
+    Assert.ok(!db.containsKey(offline.messageKey));
+    Assert.ok(!db.containsKey(online.messageKey));
+  } finally {
+    MailServices.accounts.removeAccount(account, false);
+  }
+});
+
+add_task(function test_accountedRemovalStopsAtReentrantClose() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("accounted-close");
+  const db = folder.msgDatabase;
+  const first = addMessage({ folderId: folder.id });
+  const second = addMessage({ folderId: folder.id });
+  messageDB.getMessage(first).messageSize = 23;
+  messageDB.getMessage(second).messageSize = 7;
+  let calls = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrDeleted(header) {
+      Assert.equal(header.messageKey, first);
+      calls++;
+      db.forceClosed();
+    },
+  };
+  db.addListener(listener);
+  try {
+    Assert.throws(
+      () => db.deleteMessages([first, second], null),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.equal(calls, 1);
+    const reopened = database.openFolderDB(folder, false);
+    Assert.ok(!reopened.containsKey(first));
+    Assert.ok(reopened.containsKey(second));
+    Assert.equal(reopened.dBFolderInfo.expungedBytes, 23);
+  } finally {
+    db.removeListener(listener);
+  }
+});
+
+add_task(function test_deletionKeepsItsConstructionIncarnation() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("accounted-admission");
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const connection = database.connectionForTests;
+  const originalSource = database.sourceId;
+  const first = addMessage({ folderId: folder.id });
+  messageDB.getMessage(first).messageSize = 43;
+  service.forceFolderDBClosed(folder);
+  let admitted;
+  connection.beginTransaction();
+  try {
+    admitted = service.openFolderDB(folder, false);
+    Assert.ok(connection.transactionInProgress);
+    Assert.throws(
+      () => admitted.deleteMessage(first, null, true),
+      /NS_ERROR_IN_PROGRESS/
+    );
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  admitted.deleteMessage(first, null, true);
+  Assert.equal(admitted.dBFolderInfo.expungedBytes, 43);
+  const second = addMessage({ folderId: folder.id });
+  messageDB.getMessage(second).messageSize = 7;
+  admitted.forceClosed();
+  let transient;
+  connection.beginTransaction();
+  try {
+    connection.executeSimpleSQL(
+      "UPDATE database_identity SET sourceId = '{87654321-4321-4321-4321-cba987654321}'"
+    );
+    transient = service.openFolderDB(folder, false);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(database.sourceId, originalSource);
+  Assert.throws(
+    () => transient.deleteMessage(second, null, true),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.ok(transient.containsKey(second));
+  Assert.equal(transient.dBFolderInfo.expungedBytes, 43);
+  transient.forceClosed();
+  const current = service.openFolderDB(folder, false);
+  current.deleteMessage(second, null, true);
+  Assert.equal(current.dBFolderInfo.expungedBytes, 50);
+});
+
+add_task(function test_deletionPropagatesActualServerPolicyError() {
+  const incoming = MailServices.accounts.createIncomingServer(
+    "accounted-pop",
+    "policy.invalid",
+    "pop3"
+  );
+  const account = MailServices.accounts.createAccount();
+  account.incomingServer = incoming;
+  try {
+    Assert.equal(incoming.localDatabaseType, "mailbox");
+    const folder = incoming.rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("accounted-policy-error");
+    const db = folder.msgDatabase;
+    const key = addMessage({ folderId: folder.id });
+    messageDB.getMessage(key).messageSize = 29;
+    // POP3 uses the real JavaScript incoming-server implementation. The Local
+    // Folders server is native and cannot supply this getter fault witness.
+    const server = incoming.wrappedJSObject;
+    const descriptor = Object.getOwnPropertyDescriptor(
+      server,
+      "localDatabaseType"
+    );
+    Object.defineProperty(server, "localDatabaseType", {
+      configurable: true,
+      get() {
+        throw Components.Exception(
+          "accounting policy fault",
+          Cr.NS_ERROR_ABORT
+        );
+      },
+    });
+    try {
+      Assert.throws(
+        () => db.deleteMessage(key, null, true),
+        error => error.result == Cr.NS_ERROR_ABORT
+      );
+      Assert.ok(db.containsKey(key));
+      Assert.equal(db.dBFolderInfo.expungedBytes, 0);
+      // Empty input preserves its existing no-op behavior, without consulting
+      // the policy or writing an explicit zero counter.
+      db.deleteMessages([], null);
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(server, "localDatabaseType", descriptor);
+      } else {
+        delete server.localDatabaseType;
+      }
+    }
+    db.deleteMessage(key, null, true);
+    Assert.equal(db.dBFolderInfo.expungedBytes, 29);
+  } finally {
+    MailServices.accounts.removeAccount(account, false);
+  }
+});

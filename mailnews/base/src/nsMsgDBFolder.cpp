@@ -3403,7 +3403,50 @@ NS_IMETHODIMP nsMsgDBFolder::GetChildWithURI(const nsACString& uri, bool deep,
 }
 
 NS_IMETHODIMP nsMsgDBFolder::DeleteStorage() {
-  ForceDBClosed();
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::DatabaseCore> core;
+  const uint64_t folderId = mFolderId;
+  const nsCString databaseSourceId(mFolderDatabaseSourceId);
+  const bool guardTrashStorage =
+      StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      ((mFlags & nsMsgFolderFlags::Trash) || mRequireEmptyNativeStorage) &&
+      !(mFlags & nsMsgFolderFlags::Virtual) &&
+      nsCOMPtr<nsIMsgLocalMailFolder>(
+          do_QueryInterface(static_cast<nsIMsgFolder*>(this)));
+  if (guardTrashStorage) {
+    NS_ENSURE_TRUE(folderId && !databaseSourceId.IsEmpty(),
+                   NS_ERROR_NOT_AVAILABLE);
+    core = mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    nsCString sourceId;
+    MOZ_TRY(core->GetSourceId(sourceId));
+    NS_ENSURE_TRUE(sourceId == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  }
+#endif
+  nsresult rv = ForceDBClosed();
+#ifdef MOZ_PANORAMA
+  if (guardTrashStorage) {
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsCString sourceId;
+    MOZ_TRY(core->GetSourceId(sourceId));
+    NS_ENSURE_TRUE(sourceId == databaseSourceId && mFolderId == folderId &&
+                       mFolderDatabaseSourceId == databaseSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(core->FolderDB().GetFolderParent(folderId));
+    MOZ_TRY(core->MessageDB().CheckFolderBodyAccess(folderId));
+    // Retire contents before deleting real local Trash storage or its children,
+    // and recheck after ForceDBClosed's reentrant announcer callbacks.
+    nsCOMPtr<nsIMsgDatabase> folderDB;
+    MOZ_TRY(core->OpenFolderDB(this, false, getter_AddRefs(folderDB)));
+    nsTArray<nsMsgKey> keys;
+    MOZ_TRY(folderDB->ListAllKeys(keys));
+    nsTArray<nsMsgKey> staged;
+    MOZ_TRY(core->MessageDB().ListStagedMessages(folderId, staged));
+    nsTArray<uint64_t> children =
+        MOZ_TRY(core->FolderDB().GetFolderChildren(folderId));
+    NS_ENSURE_TRUE(keys.IsEmpty() && staged.IsEmpty() && children.IsEmpty(),
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+#endif
 
   // Delete the .msf file.
   // NOTE: this doesn't remove .msf files in subfolders, but
@@ -3411,7 +3454,7 @@ NS_IMETHODIMP nsMsgDBFolder::DeleteStorage() {
   // nsMsgMaildirStore::DeleteFolder() will remove those .msf files
   // as a side-effect of deleting the .sbd directory.
   nsCOMPtr<nsIFile> summaryFile;
-  nsresult rv = GetSummaryFile(getter_AddRefs(summaryFile));
+  rv = GetSummaryFile(getter_AddRefs(summaryFile));
   NS_ENSURE_SUCCESS(rv, rv);
   bool exists = false;
   summaryFile->Exists(&exists);

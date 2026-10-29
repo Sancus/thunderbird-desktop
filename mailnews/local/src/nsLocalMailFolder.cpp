@@ -51,6 +51,7 @@
 #include "nsIMsgFolderNotificationService.h"
 #include "nsReadLine.h"
 #include "nsIURIMutator.h"
+#include "mozilla/AutoRestore.h"
 #include "mozilla/Components.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ProfilerMarkers.h"
@@ -689,10 +690,74 @@ NS_IMETHODIMP nsMsgLocalMailFolder::Compact(nsIUrlListener* aListener,
   return AsyncCompactFolders({this}, aListener, aMsgWindow);
 }
 
+#ifdef MOZ_PANORAMA
+// Retire each physical row before its folder's body storage is removed. A late
+// publication must still be refused by the post-close storage admission check.
+nsresult nsMsgLocalMailFolder::RetireLocalTrashContents(nsIMsgFolder* folder) {
+  uint32_t flags;
+  MOZ_TRY(folder->GetFlags(&flags));
+  if (!(flags & nsMsgFolderFlags::Virtual)) {
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+    nsTArray<nsMsgKey> keys;
+    MOZ_TRY(db->ListAllKeys(keys));
+    for (nsMsgKey key : keys) {
+      // Native deletion validates the admitted physical folder/incarnation and
+      // accounts for the retired bytes in the same owned SQL transaction.
+      MOZ_TRY(db->DeleteMessage(key, nullptr, true));
+    }
+  }
+
+  nsTArray<RefPtr<nsIMsgFolder>> children;
+  MOZ_TRY(folder->GetSubFolders(children));
+  for (auto child : children) {
+    MOZ_TRY(RetireLocalTrashContents(child));
+    nsresult rv;
+    nsCOMPtr<nsIMsgLocalMailFolder> localChild = do_QueryInterface(child, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    auto* local = static_cast<nsMsgLocalMailFolder*>(localChild.get());
+    mozilla::AutoRestore<bool> restore(local->mRequireEmptyNativeStorage);
+    local->mRequireEmptyNativeStorage = true;
+    MOZ_TRY(folder->PropagateDelete(child, true));
+  }
+  return NS_OK;
+}
+#endif
+
 NS_IMETHODIMP nsMsgLocalMailFolder::EmptyTrash(nsIUrlListener* aListener) {
   nsresult rv;
   nsCOMPtr<nsIMsgFolder> trashFolder;
   rv = GetTrashFolder(getter_AddRefs(trashFolder));
+#ifdef MOZ_PANORAMA
+  if (NS_SUCCEEDED(rv) && mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_STATE(trashFolder);
+    uint32_t flags;
+    MOZ_TRY(trashFolder->GetFlags(&flags));
+    if (!(flags & nsMsgFolderFlags::Virtual)) {
+      nsCOMPtr<nsIMsgPluggableStore> store;
+      MOZ_TRY(trashFolder->GetMsgStore(getter_AddRefs(store)));
+      MOZ_TRY(RetireLocalTrashContents(trashFolder));
+      // Keep the canonical folder in its parent's children and in the native
+      // cache. DeleteStorage rechecks for rows/stages/children after closing.
+      MOZ_TRY(trashFolder->DeleteStorage());
+      MOZ_TRY(store->EnsureLocalStore(trashFolder));
+
+      nsCOMPtr<nsIDBFolderInfo> info;
+      nsCOMPtr<nsIMsgDatabase> db;
+      MOZ_TRY(trashFolder->GetDBFolderInfoAndDB(getter_AddRefs(info),
+                                                getter_AddRefs(db)));
+      NS_ENSURE_STATE(info && db);
+      // Reset accounting only after the empty destination storage exists.
+      MOZ_TRY(info->SetExpungedBytes(0));
+      MOZ_TRY(db->SetSummaryValid(true));
+      nsCOMPtr<nsIMsgLocalMailFolder> localTrash =
+          do_QueryInterface(trashFolder, &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(localTrash->RefreshSizeOnDisk());
+      return trashFolder->UpdateSummaryTotals(true);
+    }
+  }
+#endif
   if (NS_SUCCEEDED(rv)) {
     uint32_t flags;
     trashFolder->GetFlags(&flags);

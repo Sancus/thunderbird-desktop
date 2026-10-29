@@ -517,6 +517,13 @@ NS_IMETHODIMP nsMsgMaildirStore::SetSummaryFileValid(nsIMsgFolder* aFolder,
 
 NS_IMETHODIMP nsMsgMaildirStore::DeleteFolder(nsIMsgFolder* aFolder) {
   NS_ENSURE_ARG_POINTER(aFolder);
+#ifdef MOZ_PANORAMA
+  // A retained native folder must not lose an issued write or its target.
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      mOngoingWrites.has(aFolder->URI())) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+#endif
   bool exists;
 
   // Delete the Maildir itself.

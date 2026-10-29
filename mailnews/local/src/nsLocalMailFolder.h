@@ -195,6 +195,7 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
 #ifdef MOZ_PANORAMA
   nsresult AddMessageBatch2(const nsTArray<nsCString>& rawMessages,
                             nsTArray<RefPtr<nsIMsgDBHdr>>& addedHdrs);
+  static nsresult RetireLocalTrashContents(nsIMsgFolder* folder);
 #endif
   nsresult UpdateMsgFlagsInStore(nsTArray<RefPtr<nsIMsgDBHdr>> const& msgs);
   nsresult CopyFolderAcrossServer(nsIMsgFolder* srcFolder,

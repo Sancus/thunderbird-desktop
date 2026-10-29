@@ -28,10 +28,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                           public SupportsWeakPtr,
                           public MessageListener {
  public:
-  explicit PerFolderDatabase(uint64_t folderId, bool isNewsFolder)
-      : mFolderId(folderId), mIsNewsFolder(isNewsFolder) {
-    MessageDB().AddMessageListener(this);
-  }
+  explicit PerFolderDatabase(uint64_t folderId, bool isNewsFolder);
 
   NS_DECL_ISUPPORTS
   NS_DECL_NSIDBCHANGEANNOUNCER
@@ -92,6 +89,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
     return *DatabaseCore::sInstance->mMessageDatabase;
   }
   nsresult CheckFolderExists() const;
+  nsresult CaptureDatabaseSourceId();
   nsresult MarkThreadFlag(nsIMsgThread* thread, nsMsgKey key, uint32_t flag,
                           bool set, nsIDBChangeListener* instigator);
   nsresult ReadCount(bool unread, int32_t* count);
@@ -103,6 +101,8 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
 
   uint64_t mFolderId;
   bool mIsNewsFolder;
+  nsCString mDatabaseSourceId;
+  nsresult mDatabaseSourceStatus = NS_ERROR_NOT_AVAILABLE;
   PRTime mLastUseTime = PR_Now();
   bool mForceClosed = false;
   bool mNotifyingGoingAway = false;

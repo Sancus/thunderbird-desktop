@@ -29,7 +29,9 @@
 #include "mozilla/ResultExtensions.h"
 #include "nsComponentManagerUtils.h"
 #include "nsIInputStream.h"
+#include "nsID.h"
 #include "nsIMsgDBView.h"
+#include "nsIMsgIncomingServer.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsIMsgPluggableStore.h"
 #include "nsIMsgSearchSession.h"
@@ -50,6 +52,36 @@ extern LazyLogModule gPanoramaLog;
 
 NS_IMPL_ISUPPORTS(PerFolderDatabase, nsIDBChangeAnnouncer, nsIMsgDatabase,
                   nsIMsgOfflineOpsDatabase)
+
+PerFolderDatabase::PerFolderDatabase(uint64_t folderId, bool isNewsFolder)
+    : mFolderId(folderId), mIsNewsFolder(isNewsFolder) {
+  mDatabaseSourceStatus = CaptureDatabaseSourceId();
+  MessageDB().AddMessageListener(this);
+}
+
+nsresult PerFolderDatabase::CaptureDatabaseSourceId() {
+  // Opening a wrapper may occur inside a caller-owned transaction. Capture its
+  // identity without changing that transaction; removal later checks this
+  // original value against the committed database, never rebinds the wrapper.
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "PerFolderDatabaseSourceId"_ns,
+      "SELECT sourceId FROM database_identity WHERE singleton = 1"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  nsCString source;
+  MOZ_TRY(stmt->GetUTF8String(0, source));
+  nsID parsed;
+  NS_ENSURE_TRUE(source.Length() == NSID_LENGTH - 1 && parsed.Parse(source),
+                 NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  mDatabaseSourceId = source;
+  return NS_OK;
+}
 
 class OfflineOperation final : public nsIMsgOfflineImapOperation {
  public:
@@ -1341,9 +1373,36 @@ NS_IMETHODIMP PerFolderDatabase::DeleteMessages(
   // NOTE: `instigator` ignored. There _will_ be a OnMessageRemoved()
   // callback (because we're a MessageListener), but that will send a null
   // instigator.
+  if (nsMsgKeys.IsEmpty()) {
+    return NS_OK;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  NS_ENSURE_SUCCESS(mDatabaseSourceStatus, mDatabaseSourceStatus);
+  RefPtr<MessageDatabase> messages = &MessageDB();
+  MOZ_TRY(messages->CheckFolderBodyAccess(mFolderId));
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+  nsCOMPtr<nsIMsgIncomingServer> server;
+  MOZ_TRY(folder->GetServer(getter_AddRefs(server)));
+  NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+  nsCString databaseType;
+  MOZ_TRY(server->GetLocalDatabaseType(databaseType));
+  MessageRemovalAccounting accounting;
+  if (databaseType.EqualsLiteral("mailbox")) {
+    accounting = MessageRemovalAccounting::LocalMessageSize;
+  } else if (databaseType.EqualsLiteral("imap") ||
+             databaseType.EqualsLiteral("news")) {
+    accounting = MessageRemovalAccounting::OfflineMessageSize;
+  } else {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
   for (nsMsgKey key : nsMsgKeys) {
-    nsresult rv = MessageDB().RemoveMessage(key);
-    NS_ENSURE_SUCCESS(rv, rv);
+    // A preceding removal callback may have closed this wrapper. Each native
+    // removal also rechecks its captured physical folder and incarnation.
+    MOZ_TRY(CheckFolderExists());
+    MOZ_TRY(messages->RemoveMessageFromFolder(key, mFolderId, mDatabaseSourceId,
+                                              accounting));
   }
 
   return NS_OK;
@@ -1359,6 +1418,8 @@ NS_IMETHODIMP PerFolderDatabase::DeleteMessage(nsMsgKey aKey,
 NS_IMETHODIMP PerFolderDatabase::DeleteHeader(nsIMsgDBHdr* msgHdr,
                                               nsIDBChangeListener* instigator,
                                               bool commit, bool notify) {
+  NS_ENSURE_ARG(msgHdr);
+  RefPtr<PerFolderDatabase> self(this);
   nsMsgKey key;
   nsresult rv = msgHdr->GetMessageKey(&key);
   NS_ENSURE_SUCCESS(rv, rv);

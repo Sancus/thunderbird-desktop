@@ -12,4 +12,10 @@ tags = ["panorama"]
 ["test_mailStoreCompact.js"]
 tags = ["compact"]
 
+["test_maildirFolderReuse.js"]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/maildirstore;1",
+]
+tags = ["maildir"]
+
 ["test_pop3PartialCompletion.js"]

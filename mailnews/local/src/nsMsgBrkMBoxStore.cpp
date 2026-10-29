@@ -416,6 +416,13 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::SetSummaryFileValid(nsIMsgFolder* aFolder,
 
 NS_IMETHODIMP nsMsgBrkMBoxStore::DeleteFolder(nsIMsgFolder* folder) {
   NS_ENSURE_ARG_POINTER(folder);
+#ifdef MOZ_PANORAMA
+  // A retained native folder must not lose an issued write or its target.
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      mOngoingWrites.has(folder->URI())) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+#endif
 
   // Delete mbox file.
   nsCOMPtr<nsIFile> pathFile;

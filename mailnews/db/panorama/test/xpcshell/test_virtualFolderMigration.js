@@ -134,12 +134,21 @@ add_task(async function () {
   }
   stmt.finalize();
 
-  Assert.deepEqual(rows, [
-    [allMessagesId, "searchOnline", 0],
-    [allMessagesId, "searchStr", "ALL"],
-    [testId, "searchOnline", 0],
-    [testId, "searchStr", "AND (subject,contains,test)"],
-  ]);
+  Assert.deepEqual(
+    rows,
+    [
+      [rootFolder.getChildNamed("Trash").id, "mailboxName", "Trash"],
+      [
+        rootFolder.getChildNamed("Unsent Messages").id,
+        "mailboxName",
+        "Unsent Messages",
+      ],
+      [allMessagesId, "searchOnline", 0],
+      [allMessagesId, "searchStr", "ALL"],
+      [testId, "searchOnline", 0],
+      [testId, "searchStr", "AND (subject,contains,test)"],
+    ].toSorted((a, b) => a[0] - b[0])
+  );
 
   const fooId = folderDB.getFolderByPath("server1/foo");
   const barId = folderDB.getFolderByPath("server1/bar");

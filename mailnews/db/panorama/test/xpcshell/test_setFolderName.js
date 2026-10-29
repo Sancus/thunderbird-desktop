@@ -50,6 +50,19 @@ add_task(async function () {
   Assert.equal(folderA.filePath.leafName, "folderA");
   Assert.equal(folderA.name, "folderA");
 
+  stmt = database.connectionForTests.createStatement(
+    "SELECT id, name, value FROM folder_properties ORDER BY id, name"
+  );
+  const originalProperties = [];
+  while (stmt.executeStep()) {
+    originalProperties.push([stmt.row.id, stmt.row.name, stmt.row.value]);
+  }
+  stmt.finalize();
+  Assert.deepEqual(originalProperties, [
+    [5, "mailboxName", "Trash"],
+    [6, "mailboxName", "Unsent Messages"],
+  ]);
+
   folderA.name = "alpha";
   Assert.equal(folderA.filePath.leafName, "folderA");
   Assert.equal(folderA.name, "alpha");
@@ -96,5 +109,5 @@ add_task(async function () {
   }
   stmt.finalize();
 
-  Assert.deepEqual(properties, []);
+  Assert.deepEqual(properties, originalProperties);
 });

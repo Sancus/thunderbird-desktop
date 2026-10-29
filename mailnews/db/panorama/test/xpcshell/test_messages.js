@@ -27,6 +27,14 @@ add_task(function () {
   const generatedMessage = generator.makeMessage({
     cc: generator.makeNamesAndAddresses(1),
   });
+  Assert.equal(
+    generatedMessage.headers["Content-Type"],
+    "text/plain; charset=ISO-8859-1; format=flowed"
+  );
+  Assert.equal(
+    generatedMessage.bodyPart.toMessageString(),
+    `Hello ${generatedMessage.toName}!\r\n`
+  );
   const addedMessage = folder.addMessage(generatedMessage.toMessageString());
   const folderId = folder.id;
 
@@ -99,17 +107,18 @@ add_task(function () {
   stmt.finalize();
 
   stmt = database.connectionForTests.createStatement(
-    "SELECT * FROM message_properties"
+    "SELECT id, name, value FROM message_properties ORDER BY id, name"
   );
-  stmt.executeStep();
-  Assert.equal(stmt.row.id, 1); // This is the first message added.
-  Assert.equal(stmt.row.name, "storeToken");
-  Assert.equal(stmt.row.value, "0");
-  Assert.equal(stmt.executeStep(), true);
-  Assert.equal(stmt.row.id, 1);
-  Assert.equal(stmt.row.name, "messageSize");
-  Assert.equal(stmt.row.value, 303);
-  Assert.equal(stmt.executeStep(), false); // no "keywords".
-
+  const properties = [];
+  while (stmt.executeStep()) {
+    properties.push([stmt.row.id, stmt.row.name, stmt.row.value]);
+  }
   stmt.finalize();
+  Assert.deepEqual(properties, [
+    [1, "lineCount", 1],
+    [1, "messageSize", 303],
+    [1, "msgCharSet", "ISO-8859-1"],
+    [1, "offlineMessageSize", 0],
+    [1, "storeToken", "0"],
+  ]); // No "keywords" property: tags are stored in messages.
 });

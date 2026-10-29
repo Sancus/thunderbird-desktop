@@ -45,6 +45,20 @@ function addSearchMessage(messageId, folderId = searchFolder) {
   );
 }
 
+/**
+ * Asserts that an exact decimal revision string increased.
+ *
+ * Assert.greater accepts numbers and dates, so compare revisions with BigInt.
+ *
+ * @param {string} actual - New revision.
+ * @param {string} previous - Previous revision.
+ * @param {string} message - Assertion description.
+ */
+function assertRevisionIncreased(actual, previous, message) {
+  const increased = BigInt(actual) > BigInt(previous);
+  Assert.ok(increased, message);
+}
+
 add_task(function test_currentStateTracksRevisions() {
   const key = addSearchMessage("state@invalid");
   const header = messageDB.getMessage(key);
@@ -54,12 +68,22 @@ add_task(function test_currentStateTracksRevisions() {
   Assert.equal(before.flags, 0);
   Assert.equal(before.storeToken, "");
   Assert.ok(Number.isSafeInteger(before.generation));
+  for (const revision of [
+    before.metadataRevision,
+    before.contentRevision,
+    before.locationRevision,
+    before.policyRevision,
+  ]) {
+    Assert.strictEqual(typeof revision, "string");
+    Assert.ok(/^(0|[1-9]\d*)$/.test(revision));
+  }
   header.subject = "changed subject";
   const edited = messageDB.getSearchState(key);
   Assert.greater(edited.generation, before.generation);
-  Assert.greater(
-    BigInt(edited.contentRevision),
-    BigInt(before.contentRevision)
+  assertRevisionIncreased(
+    edited.contentRevision,
+    before.contentRevision,
+    "Editing the header advances content revision"
   );
   Assert.equal(edited.locationRevision, before.locationRevision);
   header.flags = Ci.nsMsgMessageFlags.Read;
@@ -70,15 +94,17 @@ add_task(function test_currentStateTracksRevisions() {
   header.setStringProperty("storeToken", "body-token");
   const stored = messageDB.getSearchState(key);
   Assert.equal(stored.storeToken, "body-token");
-  Assert.greater(
-    BigInt(stored.locationRevision),
-    BigInt(flagged.locationRevision)
+  assertRevisionIncreased(
+    stored.locationRevision,
+    flagged.locationRevision,
+    "Storing a body token advances location revision"
   );
   messageDB.noteMessageContentChanged(key);
   const content = messageDB.getSearchState(key);
-  Assert.greater(
-    BigInt(content.contentRevision),
-    BigInt(stored.contentRevision)
+  assertRevisionIncreased(
+    content.contentRevision,
+    stored.contentRevision,
+    "Content notification advances content revision"
   );
   Assert.equal(content.locationRevision, stored.locationRevision);
 });
@@ -148,9 +174,10 @@ add_task(function test_snapshotWatermarkSupportsLaterReplay() {
   }
   Assert.ok(changes.some(change => change.messageKey == late));
   Assert.ok(changes.some(change => change.messageKey == original.messageKey));
-  Assert.greater(
-    BigInt(messageDB.getSearchState(original.messageKey).contentRevision),
-    BigInt(original.contentRevision)
+  assertRevisionIncreased(
+    messageDB.getSearchState(original.messageKey).contentRevision,
+    original.contentRevision,
+    "Replay includes the later content revision"
   );
 });
 
@@ -161,7 +188,11 @@ add_task(function test_policyInvalidationPreservesContentRevision() {
   messageDB.noteSearchPolicyChanged();
   const after = messageDB.getSearchState(key);
   Assert.greater(after.generation, before.generation);
-  Assert.greater(BigInt(after.policyRevision), BigInt(before.policyRevision));
+  assertRevisionIncreased(
+    after.policyRevision,
+    before.policyRevision,
+    "Policy invalidation advances policy revision"
+  );
   Assert.equal(after.contentRevision, before.contentRevision);
   Assert.ok(
     messageDB
@@ -331,7 +362,11 @@ add_task(function test_indexingPriorityChangesInvalidatePolicy() {
     connection.executeSimpleSQL(sql);
     const after = messageDB.getSearchState(key);
     Assert.greater(after.generation, before.generation);
-    Assert.greater(BigInt(after.policyRevision), BigInt(before.policyRevision));
+    assertRevisionIncreased(
+      after.policyRevision,
+      before.policyRevision,
+      "Indexing priority advances policy revision"
+    );
     Assert.equal(after.contentRevision, before.contentRevision);
     const changes = messageDB.getSearchChanges(watermark, 1000).changes;
     Assert.equal(changes.length, 1);

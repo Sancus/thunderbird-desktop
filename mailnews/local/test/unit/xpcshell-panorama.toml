@@ -9,4 +9,7 @@ tags = ["panorama"]
 
 ["include:xpcshell-shared.toml"]
 
+["test_mailStoreCompact.js"]
+tags = ["compact"]
+
 ["test_pop3PartialCompletion.js"]

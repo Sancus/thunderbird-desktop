@@ -1348,6 +1348,23 @@ NS_IMETHODIMP
 nsMsgDBFolder::GetRetentionSettings(nsIMsgRetentionSettings** settings) {
   NS_ENSURE_ARG_POINTER(settings);
   *settings = nullptr;
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(GetDatabase());
+    NS_ENSURE_TRUE(mDatabase, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgRetentionSettings> stored;
+    MOZ_TRY(mDatabase->GetMsgRetentionSettings(getter_AddRefs(stored)));
+    NS_ENSURE_TRUE(stored, NS_ERROR_NOT_AVAILABLE);
+    bool useDefaults;
+    MOZ_TRY(stored->GetUseServerDefaults(&useDefaults));
+    if (useDefaults) {
+      nsCOMPtr<nsIMsgIncomingServer> server;
+      MOZ_TRY(GetServer(getter_AddRefs(server)));
+      NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+      return server->GetRetentionSettings(settings);
+    }
+    stored.forget(settings);
+    return NS_OK;
+  }
   nsresult rv = NS_OK;
   bool useServerDefaults = false;
   if (!m_retentionSettings) {
@@ -1398,6 +1415,13 @@ nsMsgDBFolder::GetRetentionSettings(nsIMsgRetentionSettings** settings) {
 
 NS_IMETHODIMP nsMsgDBFolder::SetRetentionSettings(
     nsIMsgRetentionSettings* settings) {
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(GetDatabase());
+    NS_ENSURE_TRUE(mDatabase, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(mDatabase->SetMsgRetentionSettings(settings));
+    m_retentionSettings = nullptr;
+    return NS_OK;
+  }
   bool useServerDefaults;
   nsCString useServerRetention;
 
@@ -5091,29 +5115,26 @@ NS_IMETHODIMP
 nsMsgDBFolder::ApplyRetentionSettings() { return ApplyRetentionSettings(true); }
 
 nsresult nsMsgDBFolder::ApplyRetentionSettings(bool deleteViaFolder) {
-  if (mFlags & nsMsgFolderFlags::Virtual)  // ignore virtual folders.
+  if (mFlags & nsMsgFolderFlags::Virtual) {
     return NS_OK;
-  bool weOpenedDB = !mDatabase;
-  nsCOMPtr<nsIMsgRetentionSettings> retentionSettings;
-  nsresult rv = GetRetentionSettings(getter_AddRefs(retentionSettings));
-  if (NS_SUCCEEDED(rv)) {
-    nsMsgRetainByPreference retainByPreference =
-        nsIMsgRetentionSettings::nsMsgRetainAll;
-
-    retentionSettings->GetRetainByPreference(&retainByPreference);
-    if (retainByPreference != nsIMsgRetentionSettings::nsMsgRetainAll) {
-      rv = GetDatabase();
-      NS_ENSURE_SUCCESS(rv, rv);
-      if (mDatabase)
-        rv = mDatabase->ApplyRetentionSettings(retentionSettings,
-                                               deleteViaFolder);
-    }
   }
-  // we don't want applying retention settings to keep the db open, because
-  // if we try to purge a bunch of folders, that will leave the dbs all open.
-  // So if we opened the db, close it.
-  if (weOpenedDB) CloseDB();
-  return rv;
+  bool weOpenedDB = !mDatabase;
+  auto closeDB = MakeScopeExit([&] {
+    if (weOpenedDB) {
+      CloseDB();
+    }
+  });
+  nsCOMPtr<nsIMsgRetentionSettings> settings;
+  MOZ_TRY(GetRetentionSettings(getter_AddRefs(settings)));
+  NS_ENSURE_TRUE(settings, NS_ERROR_NOT_AVAILABLE);
+  nsMsgRetainByPreference retainBy;
+  MOZ_TRY(settings->GetRetainByPreference(&retainBy));
+  if (retainBy == nsIMsgRetentionSettings::nsMsgRetainAll) {
+    return NS_OK;
+  }
+  MOZ_TRY(GetDatabase());
+  NS_ENSURE_TRUE(mDatabase, NS_ERROR_NOT_AVAILABLE);
+  return mDatabase->ApplyRetentionSettings(settings, deleteViaFolder);
 }
 
 NS_IMETHODIMP

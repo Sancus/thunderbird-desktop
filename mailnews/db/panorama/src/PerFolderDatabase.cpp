@@ -44,6 +44,7 @@
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
 #include "nsServiceManagerUtils.h"
+#include "prtime.h"
 
 namespace mozilla::mailnews {
 
@@ -55,7 +56,7 @@ NS_IMPL_ISUPPORTS(PerFolderDatabase, nsIDBChangeAnnouncer, nsIMsgDatabase,
 PerFolderDatabase::PerFolderDatabase(uint64_t folderId, bool isNewsFolder)
     : mFolderId(folderId), mIsNewsFolder(isNewsFolder) {
   mDatabaseSourceStatus = CaptureDatabaseSourceId();
-  MessageDB().AddMessageListener(this);
+  MessageDB().AddFolderMessageListener(this);
 }
 
 nsresult PerFolderDatabase::CaptureDatabaseSourceId() {
@@ -667,6 +668,15 @@ NS_IMETHODIMP PerFolderDatabase::GetDatabaseSize(int64_t* databaseSize) {
   *databaseSize = 0;
   return NS_OK;
 }
+nsresult PerFolderDatabase::CheckDatabaseSource() const {
+  MOZ_TRY(mDatabaseSourceStatus);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  nsCString sourceId;
+  MOZ_TRY(core->ReadSourceIdForFolderAdmission(sourceId));
+  return sourceId == mDatabaseSourceId ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+
 nsresult PerFolderDatabase::CheckEnumerationState(uint64_t generation) const {
   NS_ENSURE_TRUE(!mForceClosed && generation == mEnumeratorGeneration,
                  NS_ERROR_FAILURE);
@@ -1498,15 +1508,162 @@ NS_IMETHODIMP PerFolderDatabase::GetFirstNew(nsMsgKey* aFirstNew) {
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgRetentionSettings(
     nsIMsgRetentionSettings** aMsgRetentionSettings) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aMsgRetentionSettings);
+  *aMsgRetentionSettings = nullptr;
+  RememberLastUseTime();
+  MOZ_TRY(CheckDatabaseSource());
+  MOZ_TRY(CheckFolderExists());
+  RefPtr<FolderInfo> info = new FolderInfo(this);
+  uint32_t retainBy, days, count;
+  bool useDefaults, applyToFlagged;
+  MOZ_TRY(info->GetUint32Property(
+      "retainBy", nsIMsgRetentionSettings::nsMsgRetainAll, &retainBy));
+  MOZ_TRY(info->GetUint32Property("daysToKeepHdrs", 0, &days));
+  MOZ_TRY(info->GetUint32Property("numHdrsToKeep", 0, &count));
+  MOZ_TRY(info->GetBooleanProperty("useServerDefaults", true, &useDefaults));
+  MOZ_TRY(info->GetBooleanProperty("applyToFlaggedMessages", false,
+                                   &applyToFlagged));
+  nsresult rv;
+  nsCOMPtr<nsIMsgRetentionSettings> settings =
+      do_CreateInstance("@mozilla.org/msgDatabase/retentionSettings;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  MOZ_TRY(settings->SetRetainByPreference(retainBy));
+  MOZ_TRY(settings->SetDaysToKeepHdrs(days));
+  MOZ_TRY(settings->SetNumHeadersToKeep(count));
+  MOZ_TRY(settings->SetUseServerDefaults(useDefaults));
+  MOZ_TRY(settings->SetApplyToFlaggedMessages(applyToFlagged));
+  settings.forget(aMsgRetentionSettings);
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::SetMsgRetentionSettings(
     nsIMsgRetentionSettings* aMsgRetentionSettings) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  RememberLastUseTime();
+  MOZ_TRY(CheckFolderExists());
+  if (!aMsgRetentionSettings) {
+    return NS_OK;
+  }
+  uint32_t retainBy, days, count;
+  bool useDefaults, applyToFlagged;
+  MOZ_TRY(aMsgRetentionSettings->GetRetainByPreference(&retainBy));
+  MOZ_TRY(aMsgRetentionSettings->GetDaysToKeepHdrs(&days));
+  MOZ_TRY(aMsgRetentionSettings->GetNumHeadersToKeep(&count));
+  MOZ_TRY(aMsgRetentionSettings->GetUseServerDefaults(&useDefaults));
+  MOZ_TRY(aMsgRetentionSettings->GetApplyToFlaggedMessages(&applyToFlagged));
+  MOZ_TRY(CheckDatabaseSource());
+  MOZ_TRY(CheckFolderExists());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool inTransaction;
+  MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
+  NS_ENSURE_FALSE(inTransaction, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  RefPtr<FolderInfo> info = new FolderInfo(this);
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(info->SetUint32Property("retainBy", retainBy));
+    MOZ_TRY(info->SetUint32Property("daysToKeepHdrs", days));
+    MOZ_TRY(info->SetUint32Property("numHdrsToKeep", count));
+    MOZ_TRY(info->SetBooleanProperty("useServerDefaults", useDefaults));
+    MOZ_TRY(info->SetBooleanProperty("applyToFlaggedMessages", applyToFlagged));
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = connection->GetTransactionInProgress(&inTransaction);
+    if (NS_SUCCEEDED(cleanupRv) && inTransaction) {
+      cleanupRv = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanupRv)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Retention settings rollback failed: 0x%08x",
+               static_cast<uint32_t>(cleanupRv)));
+    }
+  }
+  return rv;
 }
 NS_IMETHODIMP PerFolderDatabase::ApplyRetentionSettings(
-    nsIMsgRetentionSettings* aMsgRetentionSettings, bool aDeleteViaFolder) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+    nsIMsgRetentionSettings* settings, bool deleteViaFolder) {
+  NS_ENSURE_ARG(settings);
+  RememberLastUseTime();
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+  bool special;
+  MOZ_TRY(folder->IsSpecialFolder(nsMsgFolderFlags::Drafts |
+                                      nsMsgFolderFlags::Templates |
+                                      nsMsgFolderFlags::Queue,
+                                  true, &special));
+  if (special) {
+    return NS_OK;
+  }
+  uint32_t retainBy, days, count;
+  bool applyToFlagged;
+  MOZ_TRY(settings->GetRetainByPreference(&retainBy));
+  MOZ_TRY(settings->GetApplyToFlaggedMessages(&applyToFlagged));
+  MOZ_TRY(settings->GetDaysToKeepHdrs(&days));
+  MOZ_TRY(settings->GetNumHeadersToKeep(&count));
+  NS_ENSURE_TRUE(
+      retainBy == nsIMsgRetentionSettings::nsMsgRetainAll ||
+          retainBy == nsIMsgRetentionSettings::nsMsgRetainByAge ||
+          retainBy == nsIMsgRetentionSettings::nsMsgRetainByNumHeaders,
+      NS_ERROR_ILLEGAL_VALUE);
+
+  MOZ_TRY(CheckDatabaseSource());
+  MOZ_TRY(CheckFolderExists());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool inTransaction;
+  MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
+  NS_ENSURE_FALSE(inTransaction, NS_ERROR_IN_PROGRESS);
+
+  nsTArray<nsMsgKey> keys;
+  nsTArray<std::pair<PRTime, nsMsgKey>> candidates;
+  if (retainBy != nsIMsgRetentionSettings::nsMsgRetainAll) {
+    MOZ_TRY(ListAllKeys(keys));
+    CheckedInt<PRTime> cutoff(PR_Now());
+    cutoff -= CheckedInt<PRTime>(days) * PR_USEC_PER_DAY;
+    for (nsMsgKey key : keys) {
+      CapturedMessage message;
+      MOZ_TRY(MessageDB().CaptureMessage(key, message));
+      NS_ENSURE_TRUE(message.folderId == mFolderId, NS_ERROR_NOT_AVAILABLE);
+      if (!applyToFlagged && (message.flags & nsMsgMessageFlags::Marked)) {
+        continue;
+      }
+      // An unrepresentably distant cutoff cannot expire any stored date.
+      if (retainBy == nsIMsgRetentionSettings::nsMsgRetainByAge &&
+          (!cutoff.isValid() || message.date >= cutoff.value())) {
+        continue;
+      }
+      candidates.EmplaceBack(message.date, key);
+    }
+    candidates.Sort();
+    if (retainBy == nsIMsgRetentionSettings::nsMsgRetainByNumHeaders) {
+      size_t excess = keys.Length() > count ? keys.Length() - count : 0;
+      candidates.TruncateLength(std::min<size_t>(excess, candidates.Length()));
+    }
+  }
+  nsTArray<RefPtr<nsIMsgDBHdr>> headers;
+  for (const auto& candidate : candidates) {
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(GetMsgHdrForKey(candidate.second, getter_AddRefs(header)));
+    headers.AppendElement(header);
+  }
+  char date[100];
+  PRExplodedTime exploded;
+  PR_ExplodeTime(PR_Now(), PR_LocalTimeParameters, &exploded);
+  PR_FormatTimeUSEnglish(date, sizeof(date), "%a %b %d %H:%M:%S %Y", &exploded);
+  RefPtr<FolderInfo> info = new FolderInfo(this);
+  MOZ_TRY(info->SetCharProperty("LastPurgeTime", nsDependentCString(date)));
+  if (headers.IsEmpty()) {
+    return NS_OK;
+  }
+  if (deleteViaFolder) {
+    return folder->DeleteMessages(headers, nullptr, true, false, nullptr,
+                                  false);
+  }
+  // Each checked removal owns its transaction. A later failure leaves the
+  // already-applied prefix; body storage remains the folder/provider's job.
+  nsTArray<nsMsgKey> selected;
+  selected.SetCapacity(candidates.Length());
+  for (const auto& candidate : candidates) {
+    selected.AppendElement(candidate.second);
+  }
+  return DeleteMessages(selected, nullptr);
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgDownloadSettings(
     nsIMsgDownloadSettings** aMsgDownloadSettings) {

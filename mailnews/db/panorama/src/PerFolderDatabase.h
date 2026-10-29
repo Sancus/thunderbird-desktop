@@ -93,6 +93,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   }
   nsresult CheckFolderExists() const;
   nsresult CaptureDatabaseSourceId();
+  nsresult CheckDatabaseSource() const;
   nsresult CheckEnumerationState(uint64_t generation) const;
   nsresult MarkThreadFlag(nsIMsgThread* thread, nsMsgKey key, uint32_t flag,
                           bool set, nsIDBChangeListener* instigator);

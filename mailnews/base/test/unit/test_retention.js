@@ -35,6 +35,27 @@ add_setup(async function () {
 });
 
 add_task(function test_retention() {
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (native) {
+    Assert.strictEqual(service.QueryInterface(Ci.nsIDatabaseCore), service);
+  } else if ("nsIDatabaseCore" in Ci) {
+    Assert.throws(
+      () => service.QueryInterface(Ci.nsIDatabaseCore),
+      /NS_NOINTERFACE/
+    );
+  }
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID",
+    "@mozilla.org/msgstore/berkeleystore;1"
+  );
+  Assert.equal(gTestFolder.server.getStringValue("storeContractID"), contract);
+  Assert.equal(
+    gTestFolder.msgStore.storeType,
+    contract === "@mozilla.org/msgstore/maildirstore;1" ? "maildir" : "mbox"
+  );
   const numMessages = 10;
   gTestFolder.msgDatabase = null;
   gTestFolder.applyRetentionSettings();

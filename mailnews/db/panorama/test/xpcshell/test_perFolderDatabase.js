@@ -2339,3 +2339,463 @@ add_task(function test_filteredPrefetchCannotOutliveItsMembershipOrOwner() {
     [second]
   );
 });
+
+add_task(function test_retentionSettingsDefaultsAndPersistence() {
+  const db = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-settings").msgDatabase;
+  const settings = db.msgRetentionSettings;
+  Assert.equal(
+    settings.retainByPreference,
+    Ci.nsIMsgRetentionSettings.nsMsgRetainAll
+  );
+  Assert.equal(settings.daysToKeepHdrs, 0);
+  Assert.equal(settings.numHeadersToKeep, 0);
+  Assert.equal(settings.useServerDefaults, true);
+  Assert.equal(settings.applyToFlaggedMessages, false);
+  settings.retainByPreference = Ci.nsIMsgRetentionSettings.nsMsgRetainByAge;
+  settings.daysToKeepHdrs = 0xffffffff;
+  settings.numHeadersToKeep = 42;
+  settings.useServerDefaults = false;
+  settings.applyToFlaggedMessages = true;
+  db.msgRetentionSettings = settings;
+  const info = db.dBFolderInfo;
+  Assert.equal(info.getUint32Property("retainBy", 0), 2);
+  Assert.equal(info.getUint32Property("daysToKeepHdrs", 0), 0xffffffff);
+  Assert.equal(info.getUint32Property("numHdrsToKeep", 0), 42);
+  Assert.equal(info.getBooleanProperty("useServerDefaults", true), false);
+  Assert.equal(info.getBooleanProperty("applyToFlaggedMessages", false), true);
+  db.msgRetentionSettings = null;
+  Assert.equal(db.msgRetentionSettings.daysToKeepHdrs, 0xffffffff);
+  info.setUint32Property("daysToKeepHdrs", 7);
+  Assert.equal(db.msgRetentionSettings.daysToKeepHdrs, 7);
+});
+
+add_task(function test_retentionWriteFailureRollsBack() {
+  const db = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-write-error").msgDatabase;
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference = Ci.nsIMsgRetentionSettings.nsMsgRetainByAge;
+  settings.daysToKeepHdrs = 7;
+  settings.numHeadersToKeep = 9;
+  settings.useServerDefaults = false;
+  settings.applyToFlaggedMessages = true;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_retention BEFORE INSERT ON folder_properties " +
+      "WHEN NEW.id = " +
+      db.folder.id +
+      " AND NEW.name = 'applyToFlaggedMessages' BEGIN " +
+      "SELECT RAISE(ABORT, 'retention write failure'); END"
+  );
+  try {
+    Assert.throws(
+      () => (db.msgRetentionSettings = settings),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    const stored = db.msgRetentionSettings;
+    Assert.equal(stored.retainByPreference, 1);
+    Assert.equal(stored.daysToKeepHdrs, 0);
+    Assert.equal(stored.numHeadersToKeep, 0);
+    Assert.equal(stored.useServerDefaults, true);
+    Assert.equal(stored.applyToFlaggedMessages, false);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_retention");
+  }
+  db.msgRetentionSettings = settings;
+  Assert.equal(db.msgRetentionSettings.daysToKeepHdrs, 7);
+});
+
+add_task(function test_retentionDoesNotCommitForeignTransaction() {
+  const db = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-transaction").msgDatabase;
+  const settings = db.msgRetentionSettings;
+  settings.daysToKeepHdrs = 12;
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    Assert.throws(
+      () => (db.msgRetentionSettings = settings),
+      /NS_ERROR_IN_PROGRESS/
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.equal(db.msgRetentionSettings.daysToKeepHdrs, 0);
+  } finally {
+    connection.rollbackTransaction();
+  }
+});
+
+add_task(function test_folderRetentionUsesCurrentDefaults() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-defaults");
+  const defaults = folder.server.retentionSettings;
+  defaults.numHeadersToKeep = 4;
+  folder.server.retentionSettings = defaults;
+  Assert.equal(folder.retentionSettings.numHeadersToKeep, 4);
+  defaults.numHeadersToKeep = 5;
+  folder.server.retentionSettings = defaults;
+  Assert.equal(folder.retentionSettings.numHeadersToKeep, 5);
+  const settings = folder.msgDatabase.msgRetentionSettings;
+  settings.useServerDefaults = false;
+  settings.numHeadersToKeep = 8;
+  folder.retentionSettings = settings;
+  Assert.equal(folder.retentionSettings.numHeadersToKeep, 8);
+  Assert.equal(folder.msgDatabase.msgRetentionSettings.numHeadersToKeep, 8);
+  folder.retentionSettings = null;
+  Assert.equal(folder.retentionSettings.numHeadersToKeep, 8);
+});
+
+add_task(function test_retentionDoesNotHideStorageErrors() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-read-error");
+  const settings = folder.msgDatabase.msgRetentionSettings;
+  settings.useServerDefaults = false;
+  settings.numHeadersToKeep = 6;
+  folder.retentionSettings = settings;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "ALTER TABLE folder_properties RENAME TO unavailable_folder_properties"
+  );
+  try {
+    Assert.throws(
+      () => folder.retentionSettings,
+      error => error.result == Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => (folder.retentionSettings = settings),
+      error => error.result == Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_folder_properties RENAME TO folder_properties"
+    );
+  }
+  Assert.equal(folder.retentionSettings.numHeadersToKeep, 6);
+});
+
+add_task(function test_deletedFolderCannotReadOrWriteRetention() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-deleted-folder");
+  const db = folder.msgDatabase;
+  const settings = db.msgRetentionSettings;
+  folderDB.deleteFolder(folder.id);
+  Assert.throws(() => db.msgRetentionSettings, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(
+    () => (db.msgRetentionSettings = settings),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+});
+
+add_task(function test_countRetentionUsesDateThenPhysicalKey() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-count");
+  const db = folder.msgDatabase;
+  const newest = addMessage({ folderId: folder.id, date: "2030-01-01" });
+  const oldest = addMessage({ folderId: folder.id, date: "2000-01-01" });
+  const tied = addMessage({ folderId: folder.id, date: "2000-01-01" });
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference =
+    Ci.nsIMsgRetentionSettings.nsMsgRetainByNumHeaders;
+  settings.numHeadersToKeep = 2;
+  db.applyRetentionSettings(settings, false);
+  Assert.deepEqual(db.listAllKeys(), [newest, tied]);
+  Assert.ok(!db.containsKey(oldest));
+  Assert.ok(folder.getStringProperty("LastPurgeTime"));
+});
+
+add_task(function test_countRetentionProtectsFlaggedMessages() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-flagged");
+  const db = folder.msgDatabase;
+  const marked = addMessage({
+    folderId: folder.id,
+    date: "2000-01-01",
+    flags: Ci.nsMsgMessageFlags.Marked,
+  });
+  const oldest = addMessage({ folderId: folder.id, date: "2001-01-01" });
+  const newest = addMessage({ folderId: folder.id, date: "2030-01-01" });
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference =
+    Ci.nsIMsgRetentionSettings.nsMsgRetainByNumHeaders;
+  settings.numHeadersToKeep = 2;
+  db.applyRetentionSettings(settings, false);
+  Assert.deepEqual(db.listAllKeys(), [marked, newest]);
+  Assert.ok(!db.containsKey(oldest));
+  settings.applyToFlaggedMessages = true;
+  settings.numHeadersToKeep = 1;
+  db.applyRetentionSettings(settings, false);
+  Assert.deepEqual(db.listAllKeys(), [newest]);
+});
+
+add_task(function test_ageRetentionAndMaximumAge() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-age");
+  const db = folder.msgDatabase;
+  const old = addMessage({ folderId: folder.id, date: "2000-01-01" });
+  const future = addMessage({ folderId: folder.id, date: "2100-01-01" });
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference = Ci.nsIMsgRetentionSettings.nsMsgRetainByAge;
+  settings.daysToKeepHdrs = 0xffffffff;
+  db.applyRetentionSettings(settings, false);
+  Assert.deepEqual(db.listAllKeys(), [old, future]);
+  settings.daysToKeepHdrs = 1;
+  db.applyRetentionSettings(settings, false);
+  Assert.deepEqual(db.listAllKeys(), [future]);
+});
+
+add_task(function test_retentionProtectsDraftDescendants() {
+  const parent = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-drafts");
+  parent.setFlag(Ci.nsMsgFolderFlags.Drafts);
+  const folder = parent
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("child");
+  const key = addMessage({ folderId: folder.id, date: "2000-01-01" });
+  const settings = folder.msgDatabase.msgRetentionSettings;
+  settings.retainByPreference =
+    Ci.nsIMsgRetentionSettings.nsMsgRetainByNumHeaders;
+  settings.numHeadersToKeep = 0;
+  folder.msgDatabase.applyRetentionSettings(settings, false);
+  Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+});
+
+add_task(function test_invalidRetentionCannotDelete() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-invalid");
+  const db = folder.msgDatabase;
+  const key = addMessage({ folderId: folder.id });
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference = 99;
+  Assert.throws(
+    () => db.applyRetentionSettings(settings, false),
+    /NS_ERROR_ILLEGAL_VALUE/
+  );
+  Assert.deepEqual(db.listAllKeys(), [key]);
+});
+
+add_task(function test_retentionStopsAtFailedRemoval() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-delete-error");
+  const db = folder.msgDatabase;
+  const first = addMessage({ folderId: folder.id, date: "2000-01-01" });
+  const blocked = addMessage({ folderId: folder.id, date: "2001-01-01" });
+  const later = addMessage({ folderId: folder.id, date: "2002-01-01" });
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference =
+    Ci.nsIMsgRetentionSettings.nsMsgRetainByNumHeaders;
+  settings.numHeadersToKeep = 0;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_retention_delete BEFORE DELETE ON messages " +
+      "WHEN OLD.id = " +
+      blocked +
+      " BEGIN " +
+      "SELECT RAISE(ABORT, 'retention removal failure'); END"
+  );
+  try {
+    Assert.throws(
+      () => db.applyRetentionSettings(settings, false),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.ok(!db.containsKey(first));
+    Assert.deepEqual(db.listAllKeys(), [blocked, later]);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_retention_delete");
+  }
+});
+
+add_task(function test_publicRetentionDeletesViaFolder() {
+  const { MessageGenerator } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-public");
+  const header = folder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .addMessage(
+      new MessageGenerator()
+        .makeMessage({ subject: "expired", age: { days: 30 } })
+        .toMessageString()
+    );
+  const settings = folder.msgDatabase.msgRetentionSettings;
+  settings.useServerDefaults = false;
+  settings.retainByPreference =
+    Ci.nsIMsgRetentionSettings.nsMsgRetainByNumHeaders;
+  settings.numHeadersToKeep = 0;
+  folder.retentionSettings = settings;
+  folder.applyRetentionSettings();
+  Assert.ok(!folder.msgDatabase.containsKey(header.messageKey));
+  Assert.equal(folder.getTotalMessages(false), 0);
+});
+
+add_task(function test_purgeTimestampFailurePreventsDeletion() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-timestamp-error");
+  const db = folder.msgDatabase;
+  const key = addMessage({ folderId: folder.id, date: "2000-01-01" });
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference =
+    Ci.nsIMsgRetentionSettings.nsMsgRetainByNumHeaders;
+  settings.numHeadersToKeep = 0;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_purge_time BEFORE INSERT ON folder_properties " +
+      "WHEN NEW.id = " +
+      folder.id +
+      " AND NEW.name = 'LastPurgeTime' BEGIN " +
+      "SELECT RAISE(ABORT, 'purge timestamp failure'); END"
+  );
+  try {
+    Assert.throws(
+      () => db.applyRetentionSettings(settings, false),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.deepEqual(db.listAllKeys(), [key]);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_purge_time");
+  }
+});
+
+add_task(function test_retentionAdmissionAndForeignTransactionStayReadOnly() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retention-admission");
+  const key = addMessage({ folderId: folder.id, date: "2000-01-01" });
+  const db = folder.msgDatabase;
+  const settings = db.msgRetentionSettings;
+  settings.retainByPreference =
+    Ci.nsIMsgRetentionSettings.nsMsgRetainByNumHeaders;
+  settings.numHeadersToKeep = 0;
+  const connection = database.connectionForTests;
+  const source = database.sourceId;
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    for (const operation of [
+      () => db.msgRetentionSettings,
+      () => (db.msgRetentionSettings = settings),
+      () => db.applyRetentionSettings(settings, false),
+    ]) {
+      Assert.throws(operation, /NS_ERROR_NOT_AVAILABLE/);
+    }
+    Assert.ok(db.containsKey(key));
+  } finally {
+    update.params.source = source;
+    update.execute();
+    update.finalize();
+  }
+  const purge = connection.createStatement(
+    "SELECT 1 FROM folder_properties WHERE id = :id AND name = 'LastPurgeTime'"
+  );
+  try {
+    purge.params.id = folder.id;
+    Assert.ok(!purge.executeStep());
+    purge.reset();
+    connection.beginTransaction();
+    try {
+      Assert.throws(
+        () => db.applyRetentionSettings(settings, false),
+        /NS_ERROR_IN_PROGRESS/
+      );
+      Assert.ok(connection.transactionInProgress);
+      Assert.deepEqual(db.listAllKeys(), [key]);
+      purge.params.id = folder.id;
+      Assert.ok(!purge.executeStep());
+      purge.reset();
+    } finally {
+      connection.rollbackTransaction();
+    }
+  } finally {
+    purge.finalize();
+  }
+});
+
+add_task(
+  function test_retentionDefaultReadsAndInputErrorsPreserveRawProperties() {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("retention-raw-presence");
+    const db = folder.msgDatabase;
+    const connection = database.connectionForTests;
+    const read = connection.createStatement(
+      "SELECT name, value, typeof(value) FROM folder_properties WHERE id = :id " +
+        "AND name IN ('retainBy', 'daysToKeepHdrs', 'numHdrsToKeep', " +
+        "'useServerDefaults', 'applyToFlaggedMessages') ORDER BY name"
+    );
+    const snapshot = () => {
+      read.params.id = folder.id;
+      const rows = [];
+      try {
+        while (read.executeStep()) {
+          rows.push([
+            read.getUTF8String(0),
+            read.getInt64(1),
+            read.getUTF8String(2),
+          ]);
+        }
+        return rows;
+      } finally {
+        read.reset();
+      }
+    };
+    try {
+      const original = snapshot();
+      const settings = db.msgRetentionSettings;
+      Assert.equal(settings.daysToKeepHdrs, 0);
+      Assert.deepEqual(
+        snapshot(),
+        original,
+        "Default reads do not store defaults"
+      );
+      const broken = {
+        QueryInterface: ChromeUtils.generateQI(["nsIMsgRetentionSettings"]),
+        retainByPreference: Ci.nsIMsgRetentionSettings.nsMsgRetainByAge,
+        get daysToKeepHdrs() {
+          throw Components.Exception(
+            "retention input fault",
+            Cr.NS_ERROR_ABORT
+          );
+        },
+      };
+      Assert.throws(
+        () => (db.msgRetentionSettings = broken),
+        error => error.result === Cr.NS_ERROR_ABORT
+      );
+      Assert.deepEqual(
+        snapshot(),
+        original,
+        "All settings are read before writes"
+      );
+      settings.daysToKeepHdrs = 0xffffffff;
+      settings.numHeadersToKeep = 0;
+      settings.useServerDefaults = false;
+      settings.applyToFlaggedMessages = false;
+      db.msgRetentionSettings = settings;
+      Assert.deepEqual(snapshot(), [
+        ["applyToFlaggedMessages", 0, "integer"],
+        ["daysToKeepHdrs", 0xffffffff, "integer"],
+        ["numHdrsToKeep", 0, "integer"],
+        ["retainBy", 1, "integer"],
+        ["useServerDefaults", 0, "integer"],
+      ]);
+    } finally {
+      read.finalize();
+    }
+  }
+);

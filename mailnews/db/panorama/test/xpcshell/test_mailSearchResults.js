@@ -117,7 +117,9 @@ add_task(async function test_collectionRefreshesQueuedPhysicalMetadata() {
   // accept the subsequent tag changes itself, not inherit a queued idle batch.
   for (let i = 0; ; i++) {
     Assert.less(i, 100, "The isolated native fixture finishes bounded work");
-    if (!(await isolated.update({ limit: 500 })).moreWork) break;
+    if (!(await isolated.update({ limit: 500 })).moreWork) {
+      break;
+    }
   }
   first.setStringProperty("keywords", "fresh-query-tag");
   selected.setStringProperty("keywords", "fresh-query-tag");
@@ -689,8 +691,9 @@ add_task(async function test_completeExportChecksEveryPhysicalToken() {
       fresh,
       () => {
         calls++;
-        if (calls == 2)
+        if (calls == 2) {
           first.setStringProperty("keywords", "changed-during-delivery");
+        }
       },
       { requireComplete: true }
     ),

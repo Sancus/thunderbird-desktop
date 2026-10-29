@@ -446,7 +446,9 @@ add_task(async function test_capturedListRejectsIncompleteDeliveryAndClosure() {
     selected
   );
   await entered.promise;
-  const rejected = Assert.rejects(pending, error => error.name == "AbortError");
+  const rejected = (async () => {
+    await Assert.rejects(pending, error => error.name == "AbortError");
+  })();
   tabmail.closeTab(tab);
   await rejected;
   release.resolve();
@@ -465,7 +467,9 @@ add_task(async function test_initialDeliveryKeepsOriginalError() {
     },
     "needle"
   );
-  const rejected = Assert.rejects(view.whenReady, actual => actual === error);
+  const rejected = (async () => {
+    await Assert.rejects(view.whenReady, actual => actual === error);
+  })();
   await view.search({
     onNewSearch() {},
     onSearchHit() {},

@@ -285,6 +285,8 @@ export function openMailSearchList(
  * @param {Element} tabmail - Existing mail tab manager.
  * @param {MailSearchView} view - Header producer.
  * @param {object} options - Existing title/background controls.
+ * @param {string} [options.title] - Tab title.
+ * @param {boolean} [options.background] - Open without selecting the tab.
  * @returns {object} The normal mail tab.
  */
 function openView(tabmail, view, { title, background }) {

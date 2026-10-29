@@ -353,10 +353,12 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled")) {
       },
     });
     try {
-      const failure = Assert.rejects(
-        listener.promise,
-        error => error.message == String(Cr.NS_ERROR_STORAGE_CONSTRAINT)
-      );
+      const failure = (async () => {
+        await Assert.rejects(
+          listener.promise,
+          error => error.message == String(Cr.NS_ERROR_STORAGE_CONSTRAINT)
+        );
+      })();
       MailServices.imap.deleteAllMessages(folder, listener);
       await failure;
       Assert.equal(status, Cr.NS_ERROR_STORAGE_CONSTRAINT);
@@ -455,10 +457,12 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled")) {
       },
     });
     try {
-      const failure = Assert.rejects(
-        listener.promise,
-        error => error.message == String(Cr.NS_ERROR_STORAGE_CONSTRAINT)
-      );
+      const failure = (async () => {
+        await Assert.rejects(
+          listener.promise,
+          error => error.message == String(Cr.NS_ERROR_STORAGE_CONSTRAINT)
+        );
+      })();
       folder.updateFolderWithListener(null, listener);
       await failure;
       Assert.equal(status, Cr.NS_ERROR_STORAGE_CONSTRAINT);

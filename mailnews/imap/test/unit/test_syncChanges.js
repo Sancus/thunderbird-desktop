@@ -39,7 +39,9 @@ add_setup(async function () {
   );
   setupIMAPPump();
   registerCleanupFunction(() => {
-    if (IMAPPump.incomingServer) teardownIMAPPump();
+    if (IMAPPump.incomingServer) {
+      teardownIMAPPump();
+    }
   });
   IMAPPump.daemon.createMailbox("secondFolder", { subscribed: true });
   await discoverFolders();
@@ -208,7 +210,9 @@ async function makePendingFolder(name) {
     );
     remote.addMessage(message);
     remote.uidnext = uid + 1;
-    if (panorama) addPublishedFixtureHeader(folder, uid, id, text);
+    if (panorama) {
+      addPublishedFixtureHeader(folder, uid, id, text);
+    }
     messages.push({ message, text, id });
   }
   await selectFolder(folder);
@@ -294,11 +298,15 @@ async function checkLivePendingSource(kind) {
     deleted = [];
   const listener = {
     msgAdded(item) {
-      if (item.folder == folder) added.push(item.messageKey);
+      if (item.folder == folder) {
+        added.push(item.messageKey);
+      }
     },
     msgsDeleted(items) {
       for (const item of items) {
-        if (item.folder == folder) deleted.push(item.messageKey);
+        if (item.folder == folder) {
+          deleted.push(item.messageKey);
+        }
       }
     },
   };
@@ -383,10 +391,12 @@ if (panorama) {
     };
     MailServices.mfn.addListener(notifications, MailServices.mfn.msgsDeleted);
     const listener = new PromiseTestUtils.PromiseUrlListener();
-    const failure = Assert.rejects(
-      listener.promise,
-      error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
-    );
+    const failure = (async () => {
+      await Assert.rejects(
+        listener.promise,
+        error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
+      );
+    })();
     try {
       MailServices.imap.selectFolder(folder, listener, null);
       await failure;
@@ -436,10 +446,12 @@ if (panorama) {
     );
     try {
       const listener = new PromiseTestUtils.PromiseUrlListener();
-      const failure = Assert.rejects(
-        listener.promise,
-        error => error.message == String(Cr.NS_ERROR_FAILURE)
-      );
+      const failure = (async () => {
+        await Assert.rejects(
+          listener.promise,
+          error => error.message == String(Cr.NS_ERROR_FAILURE)
+        );
+      })();
       MailServices.imap.selectFolder(folder, listener, null);
       await failure;
       Assert.deepEqual(deleted, []);

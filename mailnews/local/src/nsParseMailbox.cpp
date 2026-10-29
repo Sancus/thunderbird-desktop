@@ -1128,6 +1128,7 @@ nsresult HardDeleteDetachedMessage(nsIMsgFolder* folder, nsIMsgDatabase* db,
 #ifdef MOZ_PANORAMA
 struct nsParseNewMailState::CompletedFilterState
     : public RefCounted<CompletedFilterState> {
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(CompletedFilterState)
   nsCOMPtr<nsIMsgDBHdr> header;
   nsCOMPtr<nsIMsgOperationListener> completion;
   nsCOMPtr<nsIMsgFilter> filter;

@@ -137,8 +137,9 @@ customElements.whenDefined("autocomplete-input").then(() => {
                   this.nsIAutocompleteInput ||
                 (this.popup.input?.wrappedJSObject ?? this.popup.input) !=
                   this.nsIAutocompleteInput
-              )
+              ) {
                 return;
+              }
               const selection = row.fullText
                 ? null
                 : lazy.copyMailSearchSelection(row.selection);
@@ -170,8 +171,9 @@ customElements.whenDefined("autocomplete-input").then(() => {
                   lazy.glodaCompleter.curResult == curResult &&
                   this.isConnected &&
                   tabmail.currentTabInfo == owner
-                )
+                ) {
                   this._openNativeMailSearch(request, owner);
+                }
               }, 0);
               return;
             }
@@ -193,9 +195,11 @@ customElements.whenDefined("autocomplete-input").then(() => {
                 false
               );
               let query = lazy.Gloda.newQuery(lazy.GlodaConstants.NOUN_MESSAGE);
-              if (row.nounDef.name == "tag") query = query.tags(row.item);
-              else if (row.nounDef.name == "identity")
+              if (row.nounDef.name == "tag") {
+                query = query.tags(row.item);
+              } else if (row.nounDef.name == "identity") {
                 query = query.involves(row.item);
+              }
               query.orderBy("-date");
               const args = { query };
               document
@@ -244,11 +248,14 @@ customElements.whenDefined("autocomplete-input").then(() => {
      */
     _openNativeMailSearch(request, owner) {
       const tabmail = document.getElementById("tabmail");
-      if (tabmail.currentTabInfo != owner) return;
+      if (tabmail.currentTabInfo != owner) {
+        return;
+      }
       lazy.glodaCompleter.stopSearch();
       this.value = "";
-      if (!request.selection && owner.mode.name == "glodaFacet")
+      if (!request.selection && owner.mode.name == "glodaFacet") {
         tabmail.closeTab(owner);
+      }
       tabmail.openTab(
         Services.prefs.getBoolPref("gloda.show_as_list_by_default", false)
           ? "glodaTableList"
@@ -306,8 +313,9 @@ customElements.whenDefined("autocomplete-input").then(() => {
       if (
         lazy.glodaCompleter.isNativeMailSearch &&
         this.controller.input?.wrappedJSObject == this.nsIAutocompleteInput
-      )
+      ) {
         this.controller.stopSearch();
+      }
       this.value = "";
     }
 
@@ -316,8 +324,9 @@ customElements.whenDefined("autocomplete-input").then(() => {
       if (
         lazy.glodaCompleter.isNativeMailSearch &&
         this.controller.input?.wrappedJSObject == this.nsIAutocompleteInput
-      )
+      ) {
         this.controller.stopSearch();
+      }
       Services.obs.removeObserver(
         this.textObserver,
         "autocomplete-did-enter-text"

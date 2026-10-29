@@ -356,9 +356,16 @@ export function getMorkFolderCacheCells(folders) {
         };
       });
     })
-    .sort(
-      (a, b) => a.id - b.id || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
-    );
+    .sort((a, b) => {
+      const difference = a.id - b.id;
+      if (difference) {
+        return difference;
+      }
+      if (a.name < b.name) {
+        return -1;
+      }
+      return a.name > b.name ? 1 : 0;
+    });
 }
 
 /**
@@ -399,12 +406,14 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
   const byFolder = new Map(folders.map(folder => [folder.id, folder]));
   for (const cell of receipt.cells) {
     const folder = byFolder.get(cell.id);
-    const dispositions =
-      cell.name == "key"
-        ? ["binding"]
-        : CACHE_AUTHORITY.has(cell.name)
-          ? ["native-authoritative"]
-          : ["existing", "applied"];
+    let dispositions;
+    if (cell.name == "key") {
+      dispositions = ["binding"];
+    } else if (CACHE_AUTHORITY.has(cell.name)) {
+      dispositions = ["native-authoritative"];
+    } else {
+      dispositions = ["existing", "applied"];
+    }
     if (!folder || !dispositions.includes(cell.disposition)) {
       throw new Error("Invalid native cache cell disposition");
     }

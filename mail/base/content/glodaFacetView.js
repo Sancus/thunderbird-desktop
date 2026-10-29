@@ -1240,6 +1240,7 @@ var FacetContext = {
       }),
       title: this.tab.title,
     });
+    return undefined;
   },
 
   /**
@@ -1296,7 +1297,7 @@ var FacetContext = {
         searchTerm: aResultMessage.firstMatchText,
         background: aBackground,
       });
-      return;
+      return undefined;
     }
     tabmail.openTab("mail3PaneTab", {
       folderPaneVisible: false,
@@ -1307,6 +1308,7 @@ var FacetContext = {
       title: message.conversation.subject,
       background: aBackground,
     });
+    return undefined;
   },
 
   /**
@@ -1467,7 +1469,8 @@ var FacetContext = {
       signal.throwIfAborted();
       const context = this;
       const tabmail = this.rootWin.document.getElementById("tabmail");
-      let tab;
+      // Callbacks may run before openTab returns.
+      const tabState = { tab: undefined };
       const view = new (class extends MailSearchView {
         initialSearch = true;
         search(listener, completion) {
@@ -1496,7 +1499,8 @@ var FacetContext = {
               },
               onSearchDone: value => {
                 status = value;
-                const nativeView = tab?.chromeBrowser?.contentWindow?.gDBView;
+                const nativeView =
+                  tabState.tab?.chromeBrowser?.contentWindow?.gDBView;
                 let membersCurrent = false;
                 if (Components.isSuccessCode(status)) {
                   try {
@@ -1531,11 +1535,11 @@ var FacetContext = {
                 signal.removeEventListener("abort", cancel);
               }
               completion?.();
-              const pane = tab?.chromeBrowser?.contentWindow;
+              const pane = tabState.tab?.chromeBrowser?.contentWindow;
               if (
                 status == Cr.NS_BINDING_ABORTED ||
                 pane?.gViewWrapper?._syntheticView != this ||
-                !tabmail.tabInfo.includes(tab)
+                !tabmail.tabInfo.includes(tabState.tab)
               ) {
                 return;
               }
@@ -1563,7 +1567,7 @@ var FacetContext = {
                     )
                   );
                 }
-                tabmail.closeTab(tab);
+                tabmail.closeTab(tabState.tab);
               }
             }
           );
@@ -1571,18 +1575,18 @@ var FacetContext = {
       })(service, "", true, snapshot);
       const cancel = () => {
         view.abortSearch();
-        if (tab && tabmail.tabInfo.includes(tab)) {
-          tabmail.closeTab(tab);
+        if (tabState.tab && tabmail.tabInfo.includes(tabState.tab)) {
+          tabmail.closeTab(tabState.tab);
         }
       };
       signal.addEventListener("abort", cancel, { once: true });
-      tab = tabmail.openTab("mail3PaneTab", {
+      tabState.tab = tabmail.openTab("mail3PaneTab", {
         folderPaneVisible: false,
         syntheticView: view,
         title: message.subject,
         background,
       });
-      return tab;
+      return tabState.tab;
     } catch (error) {
       const wasAborted = signal.aborted;
       controller.abort(error);

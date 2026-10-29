@@ -48,9 +48,13 @@ add_setup(async function setupNativeCompletionCopies() {
   );
   registerCleanupFunction(async () => {
     provider.stopSearch();
-    while (tabmail.tabInfo.length > 1) tabmail.closeTab(1);
+    while (tabmail.tabInfo.length > 1) {
+      tabmail.closeTab(1);
+    }
     await closeMailSearch();
-    for (const folder of folders) folder.parent.propagateDelete(folder, true);
+    for (const folder of folders) {
+      folder.parent.propagateDelete(folder, true);
+    }
   });
   const generator = new MessageGenerator();
   const raw = generator
@@ -72,8 +76,9 @@ add_setup(async function setupNativeCompletionCopies() {
   for (const [folder, header] of [
     [folders[0], first],
     [folders[1], second],
-  ])
+  ]) {
     folder.addKeywordsToMessages([header], "$label1");
+  }
   const service = await getMailSearchService();
   let progress;
   do {
@@ -168,7 +173,7 @@ add_task(
       const result = await completionResult("completionperson");
       Assert.strictEqual(input.popup.input, input);
       const index = result.rows.findIndex(row => row.type == "person");
-      Assert.ok(index >= 0);
+      Assert.greaterOrEqual(index, 0);
       const row = result.getObjectAt(index);
       Assert.equal(
         row.nounDef,
@@ -214,7 +219,7 @@ add_task(async function test_nativeToolbarTagUsesRetainedFacetUI() {
     const index = result.rows.findIndex(
       row => row.type == "tag" && row.selection.key == "$label1"
     );
-    Assert.ok(index >= 0);
+    Assert.greaterOrEqual(index, 0);
     const row = result.getObjectAt(index);
     input.popup.selectedIndex = index;
     input.dispatchEvent(new CustomEvent("search", { detail: text }));
@@ -255,7 +260,7 @@ add_task(
       const result = await completionResult("completionperson");
       assertCompletionInputOwnership(input);
       const index = result.rows.findIndex(row => row.type == "person");
-      Assert.ok(index >= 0);
+      Assert.greaterOrEqual(index, 0);
       input.popup.selectedIndex = index;
       provider.stopSearch();
       Assert.strictEqual(
@@ -335,7 +340,7 @@ add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
     input.popup.selectedIndex = result.rows.findIndex(
       row => row.type == "person"
     );
-    Assert.ok(input.popup.selectedIndex >= 0);
+    Assert.greaterOrEqual(input.popup.selectedIndex, 0);
     provider.stopSearch();
     const count = tabmail.tabInfo.length;
     input.textObserver.observe(
@@ -395,8 +400,9 @@ add_task(
       pane.commandController.doCommand("cmd_showQuickFilterBar");
       registerCleanupFunction(() => {
         pane.commandController.doCommand("cmd_resetQuickFilterBar");
-        if (pane.quickFilterBar.filterer.visible != visible)
+        if (pane.quickFilterBar.filterer.visible != visible) {
           pane.commandController.doCommand("cmd_toggleQuickFilterBar");
+        }
       });
       await set_filter_text("nativecompletionneedle");
       pane.document.getElementById("qfb-qs-textbox").dispatchEvent(

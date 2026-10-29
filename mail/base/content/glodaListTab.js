@@ -56,8 +56,9 @@ const glodaTableListTabType = {
       aTab.searchPromise = (async () => {
         // Capture typed values and active members before service lookup yields.
         const copiedSelection = copyMailSearchSelection(selection);
-        if (sourceId !== null && (typeof sourceId != "string" || !sourceId))
+        if (sourceId !== null && (typeof sourceId != "string" || !sourceId)) {
           throw new TypeError("Expected a native completion source");
+        }
         let resultSet = aArgs.mailSearch.resultSet;
         if (!resultSet && sourceId !== null) {
           resultSet = await findMailSearchResults(text, {
@@ -67,11 +68,12 @@ const glodaTableListTabType = {
           });
         }
         controller.signal.throwIfAborted();
-        if (sourceId !== null && resultSet.sourceId != sourceId)
+        if (sourceId !== null && resultSet.sourceId != sourceId) {
           throw new DOMException(
             "Native completion source changed",
             "InvalidStateError"
           );
+        }
         if (resultSet) {
           const captured = {
             sourceId: resultSet.sourceId,

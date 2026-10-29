@@ -965,52 +965,7 @@ export class MigrationJournal {
       throw new Error("Invalid or unsupported migration journal");
     }
     const file = new FileUtils.File(this.#path);
-    if (
-      state.version != PHYSICAL_VERSION &&
-      (state.profilePhysicalIdentity !== undefined ||
-        state.workPhysicalIdentity !== undefined ||
-        [
-          ...state.sources,
-          ...(state.books ?? []),
-          ...(state.caches ?? []),
-        ].some(source => source.physicalIdentity !== undefined))
-    ) {
-      throw new Error("Physical identities require migration journal version4");
-    }
-    if (state.version == PHYSICAL_VERSION) {
-      if (
-        !Array.isArray(state.originalRoots) ||
-        !state.originalRoots.length ||
-        JSON.stringify(state.originalRoots) !==
-          JSON.stringify(
-            captureWindowsMigrationRoots(
-              state.originalRoots.map(root => root.originalPath)
-            )
-          ) ||
-        [state.profilePath, ...state.mailPaths].some(
-          path => !state.originalRoots.some(root => root.canonicalPath === path)
-        )
-      ) {
-        throw new Error("Migration original root inventory changed");
-      }
-      if (
-        !samePhysical(
-          state.profilePhysicalIdentity,
-          physicalIdentity(state.profilePath, true)
-        ) ||
-        !samePhysical(
-          state.workPhysicalIdentity,
-          physicalIdentity(file.parent.path, true)
-        ) ||
-        [
-          ...state.sources,
-          ...(state.books ?? []),
-          ...(state.caches ?? []),
-        ].some(source => !isMigrationPhysicalIdentity(source.physicalIdentity))
-      ) {
-        throw new Error("Invalid migration journal physical identity");
-      }
-    }
+    this.#validatePhysicalIdentities(state, file);
     const roots = [state.profilePath, ...state.mailPaths].map(
       path => new FileUtils.File(path)
     );
@@ -1097,6 +1052,60 @@ export class MigrationJournal {
         throw new Error("Uncommitted migration source has a receipt");
       }
     }
+    this.#validateCaches(state, roots, file, ids, tokens, files);
+    this.#validateBooksAndStage(state, roots, file, ids, tokens, files);
+  }
+
+  #validatePhysicalIdentities(state, file) {
+    if (
+      state.version != PHYSICAL_VERSION &&
+      (state.profilePhysicalIdentity !== undefined ||
+        state.workPhysicalIdentity !== undefined ||
+        [
+          ...state.sources,
+          ...(state.books ?? []),
+          ...(state.caches ?? []),
+        ].some(source => source.physicalIdentity !== undefined))
+    ) {
+      throw new Error("Physical identities require migration journal version4");
+    }
+    if (state.version == PHYSICAL_VERSION) {
+      if (
+        !Array.isArray(state.originalRoots) ||
+        !state.originalRoots.length ||
+        JSON.stringify(state.originalRoots) !==
+          JSON.stringify(
+            captureWindowsMigrationRoots(
+              state.originalRoots.map(root => root.originalPath)
+            )
+          ) ||
+        [state.profilePath, ...state.mailPaths].some(
+          path => !state.originalRoots.some(root => root.canonicalPath === path)
+        )
+      ) {
+        throw new Error("Migration original root inventory changed");
+      }
+      if (
+        !samePhysical(
+          state.profilePhysicalIdentity,
+          physicalIdentity(state.profilePath, true)
+        ) ||
+        !samePhysical(
+          state.workPhysicalIdentity,
+          physicalIdentity(file.parent.path, true)
+        ) ||
+        [
+          ...state.sources,
+          ...(state.books ?? []),
+          ...(state.caches ?? []),
+        ].some(source => !isMigrationPhysicalIdentity(source.physicalIdentity))
+      ) {
+        throw new Error("Invalid migration journal physical identity");
+      }
+    }
+  }
+
+  #validateCaches(state, roots, file, ids, tokens, files) {
     const cacheFolders = new Set();
     for (const cache of state.caches ?? []) {
       createMorkFolderCacheRequest(cache);
@@ -1141,7 +1150,6 @@ export class MigrationJournal {
       tokens.add(cache.token);
       files.push(source);
     }
-    this.#validateBooksAndStage(state, roots, file, ids, tokens, files);
   }
 
   #validateBooksAndStage(state, roots, file, ids, tokens, files) {

@@ -789,6 +789,10 @@ class DeliveryCoreReferences : public testing::Test {
     return nullptr;
   }
 
+  nsresult AdmissionSource(DatabaseCore *core, nsACString &output) {
+    return core->ReadSourceIdForFolderAdmission(output);
+  }
+
   nsresult RemovalMetric(uint64_t folder, int64_t &output) {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(mConnection->CreateStatement(
@@ -7956,6 +7960,154 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_EQ(1u, removed);
   ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
   EXPECT_EQ(49, expunged);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderAdmissionReadsCallerTransactionWithoutOwningIt) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString expected;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(expected));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 83));
+  nsCString admitted = "unchanged"_ns;
+  ASSERT_EQ(NS_OK, AdmissionSource(mCore, admitted));
+  EXPECT_EQ(expected, admitted);
+  nsCString publicOutput = "public-unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, mCore->GetSourceId(publicOutput));
+  EXPECT_EQ("public-unchanged"_ns, publicOutput);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t expunged = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(83, expunged);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(0, expunged);
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(publicOutput));
+  EXPECT_EQ(admitted, publicOutput);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderAdmissionRolledBackIdentityCannotRemoveRows) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("admitted-incarnation"_ns, {}, key));
+  nsCString committed;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(committed));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "UPDATE database_identity SET "
+          "sourceId='{12345678-9ABC-4def-8123-0123456789ab}' WHERE singleton=1"_ns));
+  nsCString admitted;
+  ASSERT_EQ(NS_OK, AdmissionSource(mCore, admitted));
+  EXPECT_EQ("{12345678-9ABC-4def-8123-0123456789ab}"_ns, admitted);
+  EXPECT_NE(committed, admitted);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().RemoveMessageFromFolder(
+                key, mFolderId, admitted,
+                MessageRemovalAccounting::LocalMessageSize));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(0, expunged);
+  EXPECT_EQ("{12345678-9ABC-4def-8123-0123456789ab}"_ns, admitted);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageFromFolder(
+                       key, mFolderId, committed,
+                       MessageRemovalAccounting::LocalMessageSize));
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderAdmissionReadErrorsKeepOutputAndTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString expected;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(expected));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("admission_fault"_ns, 1, witness));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 31));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW database_identity AS "
+                       "SELECT singleton,sourceId FROM main.database_identity "
+                       "WHERE CASE WHEN admission_fault(singleton)=0 "
+                       "THEN abs(-9223372036854775808) ELSE 1 END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.database_identity"_ns));
+  });
+  nsCString output = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_FAILURE, AdmissionSource(mCore, output));
+  EXPECT_EQ("unchanged"_ns, output);
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(1, witness->mLastKey);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.database_identity"_ns));
+  ASSERT_EQ(NS_OK, AdmissionSource(mCore, output));
+  EXPECT_EQ(expected, output);
+  ASSERT_EQ(NS_OK, mConnection->CommitTransaction());
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(31, expunged);
+}
+
+TEST_F(DeliveryCoreReferences, FolderAdmissionRejectsCorruptAndRetiredSources) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString expected;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(expected));
+  for (const auto &sql :
+       {"DELETE FROM database_identity"_ns,
+        "UPDATE database_identity SET sourceId='not-a-uuid'"_ns,
+        "UPDATE database_identity SET sourceId=''"_ns}) {
+    ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+    auto rollback = MakeScopeExit([&] {
+      bool active = false;
+      EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+      if (active)
+        EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    });
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    nsCString output = "unchanged"_ns;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, AdmissionSource(mCore, output));
+    EXPECT_EQ("unchanged"_ns, output);
+    ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  }
+  RefPtr<DatabaseCore> retired = mCore;
+  Stop();
+  nsCString output = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, AdmissionSource(retired, output));
+  EXPECT_EQ("unchanged"_ns, output);
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, AdmissionSource(retired, output));
+  EXPECT_EQ("unchanged"_ns, output);
+  ASSERT_EQ(NS_OK, AdmissionSource(mCore, output));
+  EXPECT_EQ(expected, output);
 }
 
 }  // namespace mozilla::mailnews

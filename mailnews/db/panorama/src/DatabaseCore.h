@@ -148,6 +148,12 @@ class DatabaseCore : public nsIDatabaseCore,
   static nsCOMPtr<mozIStorageConnection> sConnection;
   static nsTHashMap<nsCString, nsCOMPtr<mozIStorageStatement>> sStatements;
 
+  // PerFolderDatabase captures this once when admitted. Reads the current
+  // transaction without owning it; a rolled-back source change leaves that
+  // captured identity stale. Never creates/opens a core or rebinds a wrapper.
+  // Failure leaves output unchanged. Public GetSourceId still requires no TX.
+  nsresult ReadSourceIdForFolderAdmission(nsACString &output);
+
   static nsresult EnsureConnection();
   static nsresult CreateNewDatabase();
   static nsresult UpgradeSchema();

@@ -4598,6 +4598,12 @@ NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
 #endif
 }
 
+nsresult DatabaseCore::ReadSourceIdForFolderAdmission(nsACString &output) {
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection && !mShuttingDown,
+                 NS_ERROR_NOT_AVAILABLE);
+  return ReadDatabaseSourceId(sConnection, output);
+}
+
 NS_IMETHODIMP DatabaseCore::GetSourceId(nsACString& sourceId) {
   if (sInstance.get() != this || !sConnection) {
     return NS_ERROR_NOT_AVAILABLE;

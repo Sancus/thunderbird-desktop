@@ -168,6 +168,7 @@ class DatabaseCore : public nsIDatabaseCore,
   static nsresult ReleaseSavepoint(const nsACString& name);
   static nsresult RollbackToSavepoint(const nsACString& name);
 
+  bool mShuttingDown = false;
   RefPtr<FolderDatabase> mFolderDatabase;
   RefPtr<MessageDatabase> mMessageDatabase;
 

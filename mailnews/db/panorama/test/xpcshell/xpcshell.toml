@@ -40,6 +40,10 @@ tags = ["panorama"]
 
 ["test_deliveryCoreAccountLifecycle.js"]
 
+["test_deliveryCoreDBService.js"]
+
+["test_deliveryCoreDBServiceShutdown.js"]
+
 ["test_deliveryCoreSearchState.js"]
 
 ["test_findFolders.js"]

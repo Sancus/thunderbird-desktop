@@ -100,6 +100,7 @@ DatabaseCore::DatabaseCore() {
 
 NS_IMETHODIMP
 DatabaseCore::Startup() {
+  NS_ENSURE_FALSE(mShuttingDown, NS_ERROR_NOT_AVAILABLE);
   if (sConnection) {
     MOZ_LOG(gPanoramaLog, LogLevel::Error, ("DatabaseCore is already started"));
     return NS_ERROR_FAILURE;
@@ -129,7 +130,20 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
     return NS_OK;
   }
 
+  if (mShuttingDown) {
+    return NS_OK;
+  }
+  mShuttingDown = true;
   MOZ_LOG(gPanoramaLog, LogLevel::Info, ("DatabaseCore shutting down"));
+
+  nsTArray<RefPtr<nsIMsgDatabase>> databases;
+  MOZ_ALWAYS_SUCCEEDS(GetOpenDBs(databases));
+  mOpenDatabases.Clear();
+  mOpenDatabasesByFile.Clear();
+  for (const auto& database : databases) {
+    nsresult rv = database->ForceClosed();
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "Failed to close folder database");
+  }
 
   for (auto iter = sStatements.Iter(); !iter.Done(); iter.Next()) {
     iter.UserData()->Finalize();
@@ -3927,34 +3941,40 @@ DatabaseCore::GetConnectionForTests(mozIStorageConnection** aConnection) {
 NS_IMETHODIMP DatabaseCore::OpenFolderDB(nsIMsgFolder* aFolder,
                                          bool aLeaveInvalidDB,
                                          nsIMsgDatabase** _retval) {
+  NS_ENSURE_ARG_POINTER(_retval);
+  *_retval = nullptr;
+  NS_ENSURE_ARG_POINTER(aFolder);
+  NS_ENSURE_TRUE(!mShuttingDown && mFolderDatabase && mMessageDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
   uint64_t folderId;
-  aFolder->GetId(&folderId);
-  WeakPtr<PerFolderDatabase> existingDatabase = mOpenDatabases.Get(folderId);
-  if (existingDatabase) {
-    NS_IF_ADDREF(*_retval = existingDatabase);
+  MOZ_TRY(aFolder->GetId(&folderId));
+  RefPtr<PerFolderDatabase> db = mOpenDatabases.Get(folderId).get();
+  if (db) {
+    db.forget(_retval);
     return NS_OK;
   }
 
   bool isNewsgroup;
-  aFolder->GetFlag(nsMsgFolderFlags::Newsgroup, &isNewsgroup);
-  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(folderId, isNewsgroup);
-  NS_IF_ADDREF(*_retval = db);
-
-  mOpenDatabases.InsertOrUpdate(folderId, db);
-
+  MOZ_TRY(aFolder->GetFlag(nsMsgFolderFlags::Newsgroup, &isNewsgroup));
   nsCOMPtr<nsIFile> filePath;
-  nsresult rv = aFolder->GetFilePath(getter_AddRefs(filePath));
-  NS_ENSURE_SUCCESS(rv, rv);
-
+  MOZ_TRY(aFolder->GetFilePath(getter_AddRefs(filePath)));
+  NS_ENSURE_TRUE(filePath, NS_ERROR_UNEXPECTED);
   nsString path;
-  rv = filePath->GetPath(path);
-  NS_ENSURE_SUCCESS(rv, rv);
-  mOpenDatabasesByFile.InsertOrUpdate(path, db);
+  MOZ_TRY(filePath->GetPath(path));
 
+  db = new PerFolderDatabase(folderId, isNewsgroup);
+  mOpenDatabases.InsertOrUpdate(folderId, db);
+  mOpenDatabasesByFile.InsertOrUpdate(path, db);
+  db.forget(_retval);
   return NS_OK;
 }
 NS_IMETHODIMP DatabaseCore::CreateNewDB(nsIMsgFolder* aFolder,
                                         nsIMsgDatabase** _retval) {
+  NS_ENSURE_ARG_POINTER(_retval);
+  *_retval = nullptr;
+  NS_ENSURE_ARG_POINTER(aFolder);
+  NS_ENSURE_TRUE(!mShuttingDown && mFolderDatabase && mMessageDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
   nsAutoCString name;
   aFolder->GetName(name);
   nsCOMPtr<nsIMsgFolder> msgParent;
@@ -3993,28 +4013,42 @@ NS_IMETHODIMP DatabaseCore::UnregisterPendingListener(
 }
 NS_IMETHODIMP DatabaseCore::CachedDBForFolder(nsIMsgFolder* aFolder,
                                               nsIMsgDatabase** _retval) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(_retval);
+  *_retval = nullptr;
+  NS_ENSURE_ARG_POINTER(aFolder);
+  uint64_t folderId;
+  MOZ_TRY(aFolder->GetId(&folderId));
+  RefPtr<PerFolderDatabase> db = mOpenDatabases.Get(folderId).get();
+  db.forget(_retval);
+  return NS_OK;
 }
 NS_IMETHODIMP DatabaseCore::CachedDBForFilePath(nsIFile* filePath,
                                                 nsIMsgDatabase** _retval) {
+  NS_ENSURE_ARG_POINTER(_retval);
+  *_retval = nullptr;
+  NS_ENSURE_ARG_POINTER(filePath);
   nsString path;
-  nsresult rv = filePath->GetPath(path);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  WeakPtr<PerFolderDatabase> existingDatabase = mOpenDatabasesByFile.Get(path);
-  if (existingDatabase) {
-    NS_IF_ADDREF(*_retval = existingDatabase);
-    return NS_OK;
-  }
-
-  return NS_ERROR_FAILURE;
+  MOZ_TRY(filePath->GetPath(path));
+  RefPtr<PerFolderDatabase> db = mOpenDatabasesByFile.Get(path).get();
+  db.forget(_retval);
+  return NS_OK;
 }
 NS_IMETHODIMP DatabaseCore::ForceFolderDBClosed(nsIMsgFolder* aFolder) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  nsCOMPtr<nsIMsgDatabase> db;
+  MOZ_TRY(CachedDBForFolder(aFolder, getter_AddRefs(db)));
+  return db ? db->ForceClosed() : NS_OK;
 }
 NS_IMETHODIMP DatabaseCore::GetOpenDBs(
     nsTArray<RefPtr<nsIMsgDatabase>>& aOpenDBs) {
   aOpenDBs.Clear();
+  for (auto iter = mOpenDatabases.Iter(); !iter.Done(); iter.Next()) {
+    RefPtr<PerFolderDatabase> db = iter.UserData().get();
+    if (db) {
+      aOpenDBs.AppendElement(db.get());
+    } else {
+      iter.Remove();
+    }
+  }
   return NS_OK;
 }
 

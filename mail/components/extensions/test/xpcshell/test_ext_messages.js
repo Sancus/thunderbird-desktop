@@ -340,7 +340,17 @@ add_task(
       archiveAccount.incomingServer.rootFolder,
       "pendingArchive"
     );
-    await createMessages(source, 1);
+    await createMessages(source, 2);
+    const oldCompleted = Promise.withResolvers();
+    let oldCompletions = 0;
+    const oldArchiver = new MessageArchiver();
+    oldArchiver.oncomplete = () => {
+      oldCompletions++;
+      oldCompleted.resolve();
+    };
+    await oldArchiver.archiveMessages([[...source.messages][0]]);
+    await oldCompleted.promise;
+    Assert.equal(source.getTotalMessages(false), 1);
     const entered = Promise.withResolvers();
     let copyListener;
     const customAction = {
@@ -402,6 +412,12 @@ add_task(
     try {
       await archiver.archiveMessages([...source.messages]);
       await entered.promise;
+      oldArchiver.onStopCopy(Cr.NS_OK);
+      Assert.equal(
+        oldCompletions,
+        1,
+        "A late copy callback does not complete again"
+      );
       await extension.startup();
       await extension.awaitFinish("pending-archive");
     } finally {
@@ -412,6 +428,166 @@ add_task(
       }
       list.removeFilter(filter);
       await extension.unload();
+      cleanUpAccount(archiveAccount);
+    }
+  }
+);
+
+add_task(
+  { skip_if: () => IS_IMAP || IS_NNTP || IS_EWS },
+  async function test_archiveProcessingErrors() {
+    const { sinon } = ChromeUtils.importESModule(
+      "resource://testing-common/Sinon.sys.mjs"
+    );
+    const { MessageArchiver } = ChromeUtils.importESModule(
+      "resource:///modules/MessageArchiver.sys.mjs"
+    );
+    for (const failure of ["preparation", "copy"]) {
+      const archiveAccount = await createAccount();
+      addIdentity(archiveAccount);
+      const source = await createSubfolder(
+        archiveAccount.incomingServer.rootFolder,
+        `archive-${failure}-failure`
+      );
+      await createMessages(source, 1);
+      const [header] = source.messages;
+      const originalKey = header.messageKey;
+      const originalMessageId = header.messageId;
+      const error = new Error("Archive preparation failed");
+      // Inject an error at the existing async preparation/copy callback boundary.
+      // No native copy is attempted before these failures.
+      const step = sinon
+        .stub(MessageArchiver.prototype, "continueBatch")
+        .callsFake(async function () {
+          if (failure == "preparation") {
+            throw error;
+          }
+          this.onStopCopy(Cr.NS_ERROR_FILE_ACCESS_DENIED);
+        });
+      let restored = false;
+      const extension = ExtensionTestUtils.loadExtension({
+        files: {
+          "utils.js": await getUtilsJS(),
+          "background.js": async () => {
+            const [name] = await window.waitForMessage();
+            const [folder] = await browser.folders.query({ name });
+            const [message] = (await browser.messages.list(folder.id)).messages;
+            await browser.test.assertRejects(
+              browser.messages.archive([message.id]),
+              /Error archiving message: Archive (preparation failed|copy failed)/,
+              "A processing failure rejects instead of successful completion"
+            );
+            browser.test.assertEq(
+              folder.id,
+              (await browser.messages.get(message.id)).folder.id,
+              "The failed operation keeps the source physical copy"
+            );
+            browser.test.sendMessage("error-checked");
+            await window.waitForMessage();
+            await browser.messages.archive([message.id]);
+            browser.test.assertEq(
+              0,
+              (await browser.messages.list(folder.id)).messages.length,
+              "A later real archive is not left locked by the failure"
+            );
+            browser.test.notifyPass("archive-processing-error");
+          },
+        },
+        manifest: {
+          permissions: ["accountsRead", "messagesRead", "messagesMove"],
+          background: { scripts: ["utils.js", "background.js"] },
+        },
+      });
+      try {
+        await extension.startup();
+        extension.sendMessage(source.name);
+        await extension.awaitMessage("error-checked");
+        Assert.ok(source.msgDatabase.containsKey(originalKey));
+        Assert.equal(
+          source.GetMessageHeader(originalKey).messageId,
+          originalMessageId
+        );
+        Assert.equal(source.getTotalMessages(false), 1);
+        step.restore();
+        restored = true;
+        extension.sendMessage("retry");
+        await extension.awaitFinish("archive-processing-error");
+        Assert.equal(source.getTotalMessages(false), 0);
+        Assert.ok(!source.msgDatabase.containsKey(originalKey));
+      } finally {
+        if (!restored) {
+          step.restore();
+        }
+        await extension.unload();
+        cleanUpAccount(archiveAccount);
+      }
+    }
+  }
+);
+
+add_task(
+  { skip_if: () => IS_IMAP || IS_NNTP || IS_EWS },
+  async function test_archiveFilterFailureContinues() {
+    const { MessageArchiver } = ChromeUtils.importESModule(
+      "resource:///modules/MessageArchiver.sys.mjs"
+    );
+    const archiveAccount = await createAccount();
+    addIdentity(archiveAccount);
+    const source = await createSubfolder(
+      archiveAccount.incomingServer.rootFolder,
+      "archive-filter-failure"
+    );
+    await createMessages(source, 1);
+    const failedFilter = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgFilterCustomAction"]),
+      id: "archive-error@mochi.test#continue",
+      name: "Report an archive filter error",
+      allowDuplicates: false,
+      isAsync: true,
+      needsBody: false,
+      isValidForType() {
+        return true;
+      },
+      validateActionValue() {
+        return "";
+      },
+      applyAction(headers, value, listener) {
+        listener.onStopCopy(Cr.NS_ERROR_FAILURE);
+      },
+    };
+    MailServices.filters.addCustomAction(failedFilter);
+    const list = source.getFilterList(null);
+    const filter = list.createFilter("Failed archive filter");
+    filter.enabled = true;
+    filter.filterType = Ci.nsMsgFilterType.Archive;
+    const term = filter.createTerm();
+    term.matchAll = true;
+    filter.appendTerm(term);
+    const action = filter.createAction();
+    action.type = Ci.nsMsgFilterAction.Custom;
+    action.customId = failedFilter.id;
+    filter.appendAction(action);
+    list.insertFilterAt(0, filter);
+    const completed = Promise.withResolvers();
+    let completions = 0;
+    const archiver = new MessageArchiver();
+    archiver.oncomplete = (status, error) => {
+      completions++;
+      completed.resolve({ status, error });
+    };
+    try {
+      await archiver.archiveMessages([...source.messages]);
+      const result = await completed.promise;
+      Assert.equal(
+        result.status,
+        Cr.NS_OK,
+        "The existing policy continues normal archiving after a filter error"
+      );
+      Assert.equal(result.error, null);
+      Assert.equal(completions, 1);
+      Assert.equal(source.getTotalMessages(false), 0);
+    } finally {
+      list.removeFilter(filter);
       cleanUpAccount(archiveAccount);
     }
   }

@@ -1997,9 +1997,15 @@ this.messages = class extends ExtensionAPIPersistent {
             if (messages.length) {
               const completed = Promise.withResolvers();
               const archiver = new MessageArchiver();
-              archiver.oncomplete = completed.resolve;
+              archiver.oncomplete = (status, error) =>
+                completed.resolve({ status, error });
               await archiver.archiveMessages(messages);
-              await completed.promise;
+              const { status, error } = await completed.promise;
+              if (!Components.isSuccessCode(status)) {
+                throw (
+                  error || Components.Exception("Archive copy failed", status)
+                );
+              }
             }
           } catch (ex) {
             console.error(ex);

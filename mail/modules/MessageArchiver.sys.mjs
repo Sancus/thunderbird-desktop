@@ -12,8 +12,15 @@ ChromeUtils.defineESModuleGetters(lazy, {
 export function MessageArchiver() {
   this._batches = {};
   this._currentKey = null;
+  this._active = false;
 
   this.msgWindow = null;
+  /**
+   * Called once with the completion nsresult and original processing error.
+   * Startup errors reject archiveMessages without calling this callback.
+   *
+   * @type {?Function}
+   */
   this.oncomplete = null;
 }
 
@@ -88,6 +95,7 @@ MessageArchiver.prototype = {
       throw new Error("Can only have one MessageArchiver running at once");
     }
     gIsArchiving = true;
+    this._active = true;
 
     try {
       for (let i = 0; i < aMsgHdrs.length; i++) {
@@ -173,6 +181,7 @@ MessageArchiver.prototype = {
     } catch (ex) {
       this._batches = {};
       gIsArchiving = false;
+      this._active = false;
       throw ex;
     }
     MailServices.mfn.addListener(this, MailServices.mfn.folderAdded);
@@ -182,6 +191,9 @@ MessageArchiver.prototype = {
   },
 
   processNextBatch() {
+    if (!this._active) {
+      return;
+    }
     // get the first defined key and value
     for (const key in this._batches) {
       this._currentBatch = this._batches[key];
@@ -189,42 +201,87 @@ MessageArchiver.prototype = {
       this.filterBatch();
       return;
     }
-    // All done!
-    this._batches = null;
-    MailServices.mfn.removeListener(this);
+    this._finish();
+  },
 
+  /**
+   * Release the archive operation before notifying its completion callback.
+   *
+   * @param {number} [status=Cr.NS_OK] - Final copy or processing status.
+   * @param {?Error} [error=null] - Original processing failure, when available.
+   */
+  _finish(status = Cr.NS_OK, error = null) {
+    if (!this._active) {
+      return;
+    }
+    this._active = false;
+    this._batches = null;
+    this._currentBatch = null;
+    MailServices.mfn.removeListener(this);
     gIsArchiving = false;
     if (typeof this.oncomplete == "function") {
-      this.oncomplete();
+      this.oncomplete(status, error);
     }
+  },
+
+  /**
+   * Report a batch failure and settle the operation once.
+   *
+   * @param {Error} error - The original processing error.
+   */
+  _fail(error) {
+    console.error(error);
+    this._finish(error?.result || Cr.NS_ERROR_FAILURE, error);
   },
 
   filterBatch() {
     const batch = this._currentBatch;
     // Apply filters to this batch.
-    MailServices.filters.applyFilters(
-      Ci.nsMsgFilterType.Archive,
-      batch.messages,
-      [],
-      batch.srcFolder,
-      this.msgWindow,
-      this
-    );
+    let notified = false;
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgOperationListener"]),
+      onStopOperation: status => {
+        if (!notified) {
+          notified = true;
+          this.onStopOperation(status);
+        }
+      },
+    };
+    try {
+      MailServices.filters.applyFilters(
+        Ci.nsMsgFilterType.Archive,
+        batch.messages,
+        [],
+        batch.srcFolder,
+        this.msgWindow,
+        listener
+      );
+    } catch (error) {
+      if (!notified) {
+        this._fail(error);
+      }
+    }
     // continues with onStopOperation
   },
 
   onStopOperation(aResult) {
+    if (!this._active) {
+      return;
+    }
     if (!Components.isSuccessCode(aResult)) {
       console.error("Archive filter failed: " + aResult);
       // We don't want to effectively disable archiving because a filter
       // failed, so we'll continue after reporting the error.
     }
     // Now do the default archive processing
-    this.continueBatch();
+    this.continueBatch().catch(error => this._fail(error));
   },
 
   // continue processing of default archive operations
   async continueBatch() {
+    if (!this._active) {
+      return;
+    }
     const batch = this._currentBatch;
     const srcFolder = batch.srcFolder;
     const archiveFolder = batch.archiveFolder;
@@ -265,12 +322,18 @@ MessageArchiver.prototype = {
     if (granularity >= Ci.nsIMsgIdentity.perYearArchiveFolders) {
       if (!dstFolder.containsChildNamed(batch.yearFolderName)) {
         await dstFolder.createSubfolderAsync(batch.yearFolderName);
+        if (!this._active) {
+          return;
+        }
       }
       dstFolder = dstFolder.getChildNamed(batch.yearFolderName);
     }
     if (granularity >= Ci.nsIMsgIdentity.perMonthArchiveFolders) {
       if (!dstFolder.containsChildNamed(batch.monthFolderName)) {
         await dstFolder.createSubfolderAsync(batch.monthFolderName);
+        if (!this._active) {
+          return;
+        }
       }
       dstFolder = dstFolder.getChildNamed(batch.monthFolderName);
     }
@@ -299,6 +362,9 @@ MessageArchiver.prototype = {
         const folderName = folderNames[i];
         if (!dstFolder.containsChildNamed(folderName)) {
           await dstFolder.createSubfolderAsync(folderName);
+          if (!this._active) {
+            return;
+          }
         }
         dstFolder = dstFolder.getChildNamed(folderName);
       }
@@ -332,13 +398,15 @@ MessageArchiver.prototype = {
     return null;
   },
   onStopCopy(aStatus) {
+    if (!this._active) {
+      return;
+    }
     if (Components.isSuccessCode(aStatus)) {
       this.processNextBatch();
     } else {
       // stop on error
       console.error("Archive failed to copy: " + aStatus);
-      this._batches = null;
-      this.processNextBatch(); // for cleanup and exit
+      this._finish(aStatus);
     }
   },
 

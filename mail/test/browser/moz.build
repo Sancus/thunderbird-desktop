@@ -49,6 +49,7 @@ BROWSER_CHROME_MANIFESTS += [
 if CONFIG["MOZ_PANORAMA"]:
     BROWSER_CHROME_MANIFESTS += [
         "global-search-bar/browser-panorama.toml",
+        "startup/browser.toml",
     ]
 
 DIRS += [

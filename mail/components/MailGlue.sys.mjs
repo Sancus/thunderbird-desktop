@@ -31,6 +31,7 @@ if (AppConstants.MOZ_SERVICES_SYNC) {
 ChromeUtils.defineESModuleGetters(lazy, {
   ActorManagerParent: "resource://gre/modules/ActorManagerParent.sys.mjs",
   AddonManager: "resource://gre/modules/AddonManager.sys.mjs",
+  AsyncShutdown: "resource://gre/modules/AsyncShutdown.sys.mjs",
   BuiltInThemes: "resource:///modules/BuiltInThemes.sys.mjs",
   cal: "resource:///modules/calendar/calUtils.sys.mjs",
   ChatCore: "resource:///modules/chatHandler.sys.mjs",
@@ -419,6 +420,32 @@ MailGlue.afterStartUp = new Promise(resolve => {
 MailGlue.prototype = {
   _isNewProfile: undefined,
 
+  /**
+   * Coalesced search startup, retaining its original failure.
+   *
+   * @type {?Promise<void>}
+   */
+  _mailSearchStartupPromise: null,
+  /**
+   * Shared factory close, including a pending open.
+   *
+   * @type {?Promise<void>}
+   */
+  _mailSearchShutdownPromise: null,
+  /**
+   * Default factory close callback after selecting the native backend.
+   *
+   * @type {?function(): Promise<void>}
+   */
+  _mailSearchClose: null,
+  /**
+   * Profile barrier for an unfinished factory open.
+   *
+   * @type {?function(): Promise<void>}
+   */
+  _mailSearchShutdownBlocker: null,
+  _mailSearchShuttingDown: false,
+
   // init (called at app startup)
   _init() {
     // Start-up notifications, in order.
@@ -456,6 +483,7 @@ MailGlue.prototype = {
 
   // cleanup (called at shutdown)
   _dispose() {
+    this._shutdownMailSearch().catch(console.error);
     Services.obs.removeObserver(this, "command-line-startup");
     Services.obs.removeObserver(this, "final-ui-startup");
     Services.obs.removeObserver(this, "sessionstore-windows-restored");
@@ -546,6 +574,7 @@ MailGlue.prototype = {
         this._onWindowsRestored();
         break;
       case "quit-application-granted":
+        this._shutdownMailSearch().catch(console.error);
         Services.startup.trackStartupCrashEnd();
         if (AppConstants.MOZ_UPDATER) {
           lazy.UpdateListener.reset();
@@ -890,6 +919,104 @@ MailGlue.prototype = {
   },
 
   /**
+   * Returns the startup-selected database service after account initialization.
+   * A mutable preference does not identify the registered backend.
+   *
+   * @returns {nsIMsgDBService} Active database, without independently creating core.
+   */
+  _getMailSearchBackend() {
+    lazy.MailServices.accounts;
+    return Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+  },
+
+  /**
+   * Loads the default native factory on demand.
+   *
+   * @returns {{getMailSearchService: function(): Promise<MailSearchService>,
+   *   closeMailSearch: function(): Promise<void>}} Shared native factory.
+   */
+  get _mailSearchModule() {
+    return ChromeUtils.importESModule(
+      "resource:///modules/panorama/MailSearch.sys.mjs"
+    );
+  },
+
+  /** Starts the existing indexer only for a non-Panorama backend. */
+  _startLegacyMailSearch() {
+    ChromeUtils.importESModule("resource:///modules/gloda/GlodaPublic.sys.mjs");
+  },
+
+  /**
+   * Starts search once from the retained idle task. Native startup uses the
+   * default factory's source identity, readiness and shared writer. Errors stay
+   * rejected; a failed native start never invokes the legacy indexer.
+   *
+   * @returns {Promise<void>} Startup completion, or no work after shutdown.
+   *   Rejects with the original startup or drain failure.
+   */
+  _initMailSearch() {
+    if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
+      return Promise.resolve();
+    }
+    if (!this._mailSearchStartupPromise) {
+      this._mailSearchStartupPromise = Promise.resolve().then(async () => {
+        if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
+          return;
+        }
+        const backend = this._getMailSearchBackend();
+        if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
+          return;
+        }
+        if (
+          !("nsIDatabaseCore" in Ci) ||
+          !(backend instanceof Ci.nsIDatabaseCore)
+        ) {
+          this._startLegacyMailSearch();
+          return;
+        }
+        const search = this._mailSearchModule;
+        if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
+          return;
+        }
+        this._mailSearchClose = search.closeMailSearch;
+        this._mailSearchShutdownBlocker = () => this._shutdownMailSearch();
+        lazy.AsyncShutdown.profileBeforeChange.addBlocker(
+          "MailGlue mail search",
+          this._mailSearchShutdownBlocker
+        );
+        if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
+          return;
+        }
+        await search.getMailSearchService();
+        // Factory initialization is shared and cannot be cancelled. A close
+        // requested during open drains that same writer before profile shutdown.
+        if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
+          await this._shutdownMailSearch();
+        }
+      });
+    }
+    return this._mailSearchStartupPromise;
+  },
+
+  /**
+   * Prevents late idle startup and closes the selected default factory once.
+   * A never-started or non-native path does not load native search at shutdown.
+   * The profile barrier also waits when quit was requested during an open.
+   *
+   * @returns {Promise<void>} Factory drain, retaining any open/close failure.
+   */
+  _shutdownMailSearch() {
+    this._mailSearchShuttingDown = true;
+    if (!this._mailSearchShutdownPromise) {
+      const close = this._mailSearchClose;
+      this._mailSearchShutdownPromise = Promise.resolve().then(() => close?.());
+    }
+    return this._mailSearchShutdownPromise;
+  },
+
+  /**
    * Use this function as an entry point to schedule tasks that
    * need to run only once after startup, and can be scheduled
    * by using an idle callback.
@@ -924,12 +1051,7 @@ MailGlue.prototype = {
         },
       },
       {
-        task() {
-          // Make sure Gloda's up and running.
-          ChromeUtils.importESModule(
-            "resource:///modules/gloda/GlodaPublic.sys.mjs"
-          );
-        },
+        task: () => this._initMailSearch().catch(console.error),
       },
       {
         task() {

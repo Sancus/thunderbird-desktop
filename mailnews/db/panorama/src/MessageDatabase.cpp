@@ -20,6 +20,7 @@
 #include "mozIStorageStatement.h"
 #include "mozIStorageValueArray.h"
 #include "mozStorageHelper.h"
+#include "mozilla/CheckedInt.h"
 #include "mozilla/Logging.h"
 #include "mozilla/AutoRestore.h"
 #include "mozilla/ResultExtensions.h"
@@ -3077,6 +3078,120 @@ nsresult MessageDatabase::MessageExists(nsMsgKey key, bool& exists) {
 }
 
 NS_IMETHODIMP MessageDatabase::RemoveMessage(nsMsgKey key) {
+  return RemoveMessageInternal(key, 0, nullptr,
+                               MessageRemovalAccounting::LocalMessageSize);
+}
+
+nsresult
+MessageDatabase::RemoveMessageFromFolder(nsMsgKey key, uint64_t folderId,
+                                         const nsACString &databaseSourceId,
+                                         MessageRemovalAccounting accounting) {
+  NS_ENSURE_TRUE(key != nsMsgKey_None && folderId && folderId <= INT64_MAX &&
+                     !databaseSourceId.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(accounting == MessageRemovalAccounting::LocalMessageSize ||
+                     accounting == MessageRemovalAccounting::OfflineMessageSize,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  return RemoveMessageInternal(key, folderId, &databaseSourceId, accounting);
+}
+
+// Called only inside the removal transaction. Read the authoritative row and
+// storage properties, rather than a possibly retained or warmed header.
+nsresult
+MessageDatabase::AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
+                                       const nsACString &databaseSourceId,
+                                       MessageRemovalAccounting accounting) {
+  MOZ_TRY(CheckPendingMessageRelocation(key));
+  uint32_t flags;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(
+        DatabaseCore::GetStatement("RemovalPhysicalIdentity"_ns,
+                                   "SELECT m.flags, d.sourceId FROM messages m "
+                                   "JOIN folders f ON f.id=m.folderId "
+                                   "JOIN database_identity d ON d.singleton=1 "
+                                   "WHERE m.id=:id AND m.folderId=:folder"_ns,
+                                   getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int64_t storedFlags;
+    nsCString source;
+    MOZ_TRY(stmt->GetInt64(0, &storedFlags));
+    MOZ_TRY(stmt->GetUTF8String(1, source));
+    NS_ENSURE_TRUE(source == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(storedFlags >= 0 && uint64_t(storedFlags) <= UINT32_MAX,
+                   NS_ERROR_FILE_CORRUPTED);
+    flags = static_cast<uint32_t>(storedFlags);
+  }
+  if (accounting == MessageRemovalAccounting::OfflineMessageSize &&
+      !(flags & nsMsgMessageFlags::Offline)) {
+    return NS_OK;
+  }
+
+  int64_t size = 0;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "RemovalStorageSize"_ns,
+        "SELECT value FROM message_properties WHERE id=:id AND name=:name"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(stmt->BindUTF8StringByName(
+        "name"_ns, accounting == MessageRemovalAccounting::LocalMessageSize
+                       ? "messageSize"_ns
+                       : "offlineMessageSize"_ns));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (more) {
+      MOZ_TRY(stmt->GetInt64(0, &size));
+    }
+    // The public size view is uint32. Do not wrap corrupt signed/wide values
+    // or narrow legitimate sizes through int32 before accounting.
+    NS_ENSURE_TRUE(size >= 0 && uint64_t(size) <= UINT32_MAX,
+                   NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  }
+  int64_t expunged = 0;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "RemovalExpungedBytes"_ns,
+        "SELECT value FROM folder_properties WHERE id=:folder "
+        "AND name='expungedBytes'"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (more) {
+      MOZ_TRY(stmt->GetInt64(0, &expunged));
+    }
+    NS_ENSURE_TRUE(expunged >= 0, NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  }
+  CheckedInt<int64_t> total(expunged);
+  total += size;
+  NS_ENSURE_TRUE(total.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "AccountRemovedMessage"_ns,
+      "REPLACE INTO folder_properties(id,name,value) "
+      "VALUES(:folder,'expungedBytes',:value)"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("value"_ns, total.value()));
+  return stmt->Execute();
+}
+
+nsresult
+MessageDatabase::RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
+                                       const nsACString *databaseSourceId,
+                                       MessageRemovalAccounting accounting) {
   MOZ_ASSERT(key != nsMsgKey_None);
   MOZ_TRY(DatabaseCore::EnsureConnection());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
@@ -3093,6 +3208,10 @@ NS_IMETHODIMP MessageDatabase::RemoveMessage(nsMsgKey key) {
   notification->kind = QueuedMessageBatch::Kind::Removed;
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
+    if (databaseSourceId) {
+      MOZ_TRY(
+          AccountRemovedMessage(key, folderId, *databaseSourceId, accounting));
+    }
     MOZ_TRY(CaptureMessage(key, notification->before));
     {
       nsCOMPtr<mozIStorageStatement> stmt;

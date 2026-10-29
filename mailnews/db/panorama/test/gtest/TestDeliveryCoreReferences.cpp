@@ -789,6 +789,32 @@ class DeliveryCoreReferences : public testing::Test {
     return nullptr;
   }
 
+  nsresult RemovalMetric(uint64_t folder, int64_t &output) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(mConnection->CreateStatement(
+        "SELECT value FROM folder_properties WHERE id=:folder "
+        "AND name='expungedBytes'"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folder));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    int64_t value = 0;
+    if (more)
+      MOZ_TRY(stmt->GetInt64(0, &value));
+    output = value;
+    return NS_OK;
+  }
+
+  nsresult SetRemovalMetric(uint64_t folder, int64_t value) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(mConnection->CreateStatement(
+        "REPLACE INTO folder_properties VALUES(:folder,'expungedBytes',:value)"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folder));
+    MOZ_TRY(stmt->BindInt64ByName("value"_ns, value));
+    return stmt->Execute();
+  }
+
   nsresult Add(const nsACString& messageId,
                const nsTArray<nsCString>& references, nsMsgKey& key) {
     return mCore->MessageDB().AddMessage(
@@ -7506,6 +7532,430 @@ TEST_F(DeliveryCoreReferences, PartialCompletionRejectsStaleAndNonPartialRows) {
   EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
             db.CompletePartialMessage(expected, parsed, finished, output));
   EXPECT_EQ(123u, output.key);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRemovalAccountsWideLocalBytesBeforeEvent) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RawHdr raw;
+  raw.messageId = "account-local"_ns;
+  raw.subject = "retained deleted header"_ns;
+  raw.references = {"absent-parent"_ns, "ordered-tail"_ns};
+  raw.flags = nsMsgMessageFlags::Offline;
+  raw.messageSize = Some(UINT32_MAX);
+  raw.offlineMessageSize = Some(19u);
+  raw.storeToken = Some(nsCString("finished-owned-by-provider"_ns));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &key));
+  // Warm the existing header; a failed removal must not replace it early.
+  nsCString subject;
+  ASSERT_EQ(NS_OK, db.GetMessageSubject(key, subject));
+  uint32_t removed = 0;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char kind, const CapturedMessage &before,
+                         const CapturedMessage &, Message *live, bool) {
+    EXPECT_EQ('R', kind);
+    ++removed;
+    EXPECT_EQ(key, before.id);
+    EXPECT_EQ(mFolderId, before.folderId);
+    EXPECT_EQ(raw.subject, before.subject);
+    bool active = true, exists = true;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    EXPECT_EQ(NS_OK, db.MessageExists(key, exists));
+    EXPECT_FALSE(exists);
+    int64_t expunged = -1;
+    EXPECT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+    EXPECT_EQ(int64_t(UINT32_MAX), expunged);
+    nsCString retained;
+    EXPECT_EQ(NS_OK, live->GetSubject(retained));
+    EXPECT_EQ(raw.subject, retained);
+  };
+  db.AddMessageListener(observer);
+  auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, db.RemoveMessageFromFolder(
+                       key, mFolderId, source,
+                       MessageRemovalAccounting::LocalMessageSize));
+  EXPECT_EQ(1u, removed);
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, Stored(key, references));
+  EXPECT_TRUE(references.IsEmpty());
+  ASSERT_EQ(NS_OK, db.GetMessageSubject(key, subject));
+  EXPECT_EQ(raw.subject, subject);
+  db.RemoveMessageListener(observer);
+  unwatch.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(int64_t(UINT32_MAX), expunged);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRemovalRemoteAndGenericPoliciesStayDistinct) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RawHdr raw;
+  raw.messageId = "remote-online"_ns;
+  raw.messageSize = Some(97u);
+  raw.offlineMessageSize = Some(UINT32_MAX);
+  nsMsgKey online, offline, generic, absent;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &online));
+  raw.messageId = "remote-offline"_ns;
+  raw.flags = nsMsgMessageFlags::Offline;
+  raw.offlineMessageSize = Some(0x80000000u);
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &offline));
+  raw.messageId = "generic-unaccounted"_ns;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &generic));
+  ASSERT_EQ(NS_OK, Add("absent-size"_ns, {}, absent));
+  ASSERT_EQ(NS_OK, db.RemoveMessageFromFolder(
+                       online, mFolderId, source,
+                       MessageRemovalAccounting::OfflineMessageSize));
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(0, expunged);
+  ASSERT_EQ(NS_OK, db.RemoveMessageFromFolder(
+                       offline, mFolderId, source,
+                       MessageRemovalAccounting::OfflineMessageSize));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(generic));
+  ASSERT_EQ(NS_OK, db.RemoveMessageFromFolder(
+                       absent, mFolderId, source,
+                       MessageRemovalAccounting::LocalMessageSize));
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(int64_t(0x80000000u), expunged);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRemovalRejectsForeignAndUnpublishedIdentity) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  uint64_t other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Other"_ns, &other));
+  nsMsgKey key, staged;
+  ASSERT_EQ(NS_OK, Add("owned-removal"_ns, {}, key));
+  RawHdr raw;
+  raw.messageId = "unpublished-removal"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  auto policy = MessageRemovalAccounting::LocalMessageSize;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RemoveMessageFromFolder(key, other, source, policy));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RemoveMessageFromFolder(key, mFolderId, "other-incarnation"_ns,
+                                       policy));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RemoveMessageFromFolder(staged, mFolderId, source, policy));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RemoveMessageFromFolder(1234567, mFolderId, source, policy));
+  EXPECT_EQ(
+      NS_ERROR_INVALID_ARG,
+      db.RemoveMessageFromFolder(nsMsgKey_None, mFolderId, source, policy));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db.ListStagedMessages(mFolderId, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{staged}), keys);
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(0, expunged);
+  ASSERT_EQ(NS_OK, RemovalMetric(other, expunged));
+  EXPECT_EQ(0, expunged);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRemovalRejectsSizeAndCounterOverflow) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("invalid-accounting"_ns, {}, key));
+  for (const auto &size : {"-1"_ns, "4294967296"_ns}) {
+    nsAutoCString sql("REPLACE INTO message_properties VALUES(");
+    sql.AppendInt(key);
+    sql.AppendLiteral(",'messageSize',");
+    sql.Append(size);
+    sql.Append(')');
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    EXPECT_EQ(
+        NS_ERROR_LOSS_OF_SIGNIFICANT_DATA,
+        db.RemoveMessageFromFolder(key, mFolderId, source,
+                                   MessageRemovalAccounting::LocalMessageSize));
+    bool exists = false;
+    ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+    EXPECT_TRUE(exists);
+  }
+  ASSERT_EQ(NS_OK, db.SetMessageSize(key, 1));
+  for (int64_t metric : {-int64_t(1), INT64_MAX}) {
+    ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, metric));
+    EXPECT_EQ(
+        NS_ERROR_LOSS_OF_SIGNIFICANT_DATA,
+        db.RemoveMessageFromFolder(key, mFolderId, source,
+                                   MessageRemovalAccounting::LocalMessageSize));
+    int64_t retained = 0;
+    ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, retained));
+    EXPECT_EQ(metric, retained);
+    bool exists = false;
+    ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+    EXPECT_TRUE(exists);
+  }
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, INT64_MAX - 1));
+  ASSERT_EQ(NS_OK, db.RemoveMessageFromFolder(
+                       key, mFolderId, source,
+                       MessageRemovalAccounting::LocalMessageSize));
+  int64_t expunged = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(INT64_MAX, expunged);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRemovalWriteFailuresRollBackCounterAndRow) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RawHdr raw;
+  raw.messageId = "removal-fault"_ns;
+  raw.subject = "warm unchanged"_ns;
+  raw.references = {"first"_ns, ""_ns, "last"_ns};
+  raw.messageSize = Some(42u);
+  raw.storeToken = Some(nsCString("provider-body"_ns));
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &key));
+  ASSERT_EQ(NS_OK, Add("removal-control"_ns, {}, control));
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 7));
+  nsCString subject;
+  ASSERT_EQ(NS_OK, db.GetMessageSubject(key, subject));
+  MessageBodyState before;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, before));
+  uint32_t removed = 0;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char kind, const CapturedMessage &,
+                         const CapturedMessage &, Message *, bool) {
+    EXPECT_EQ('R', kind);
+    ++removed;
+  };
+  db.AddMessageListener(observer);
+  auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK, mConnection->CreateFunction("removal_fault"_ns, 1, witness));
+  const nsCString triggers[] = {
+      "CREATE TEMP TRIGGER reject_removal BEFORE INSERT ON folder_properties "
+      "WHEN NEW.name='expungedBytes' BEGIN SELECT removal_fault(NEW.id); "
+      "SELECT RAISE(ABORT,'counter failure'); END"_ns,
+      "CREATE TEMP TRIGGER reject_removal BEFORE DELETE ON messages "
+      "BEGIN SELECT removal_fault(OLD.id); "
+      "SELECT RAISE(ABORT,'delete failure'); END"_ns};
+  for (uint32_t i = 0; i < 2; ++i) {
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(triggers[i]));
+    auto drop = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS reject_removal"_ns));
+    });
+    EXPECT_EQ(
+        NS_ERROR_STORAGE_CONSTRAINT,
+        db.RemoveMessageFromFolder(key, mFolderId, source,
+                                   MessageRemovalAccounting::LocalMessageSize));
+    EXPECT_EQ(i + 1, witness->mCalls);
+    EXPECT_EQ(i == 0 ? int64_t(mFolderId) : int64_t(key), witness->mLastKey);
+    EXPECT_EQ(0u, removed);
+    bool active = true, exists = false;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+    EXPECT_TRUE(exists);
+    ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+    EXPECT_TRUE(exists);
+    int64_t expunged = -1;
+    ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+    EXPECT_EQ(7, expunged);
+    ASSERT_EQ(NS_OK, db.GetMessageSubject(key, subject));
+    EXPECT_EQ(raw.subject, subject);
+    MessageBodyState after;
+    ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, after));
+    EXPECT_EQ(before.storeToken, after.storeToken);
+    EXPECT_EQ(before.contentRevision, after.contentRevision);
+    EXPECT_EQ(before.locationRevision, after.locationRevision);
+    nsTArray<nsCString> references;
+    ASSERT_EQ(NS_OK, Stored(key, references));
+    EXPECT_EQ(raw.references, references);
+  }
+  ASSERT_EQ(NS_OK, db.RemoveMessageFromFolder(
+                       key, mFolderId, source,
+                       MessageRemovalAccounting::LocalMessageSize));
+  EXPECT_EQ(1u, removed);
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(49, expunged);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRemovalReadFailurePreservesCounterAndEvents) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("removal-read-fault"_ns, {}, key));
+  ASSERT_EQ(NS_OK, db.SetMessageSize(key, 23));
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 9));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("removal_read_fault"_ns, 1, witness));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "CREATE TEMP VIEW folder_properties AS SELECT id,name, "
+                "CASE WHEN name='expungedBytes' AND removal_read_fault(id)=0 "
+                "THEN abs(-9223372036854775808) ELSE value END AS value "
+                "FROM main.folder_properties"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.folder_properties"_ns));
+  });
+  uint32_t removed = 0;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char, const CapturedMessage &, const CapturedMessage &,
+                         Message *, bool) { ++removed; };
+  db.AddMessageListener(observer);
+  auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  EXPECT_EQ(NS_ERROR_FAILURE, db.RemoveMessageFromFolder(
+                                  key, mFolderId, source,
+                                  MessageRemovalAccounting::LocalMessageSize));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(int64_t(mFolderId), witness->mLastKey);
+  EXPECT_EQ(0u, removed);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.folder_properties"_ns));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(9, expunged);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRemovalDoesNotTakeCallerTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("removal-foreign-transaction"_ns, {}, key));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 83));
+  EXPECT_EQ(
+      NS_ERROR_IN_PROGRESS,
+      db.RemoveMessageFromFolder(key, mFolderId, source,
+                                 MessageRemovalAccounting::LocalMessageSize));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(83, expunged);
+  ASSERT_EQ(NS_OK, mConnection->CommitTransaction());
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRemovalRespectsPendingBodyRelocation) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  auto &db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.PrepareBodyRelocation(plan));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.RemoveMessageFromFolder(
+                plan.messages[0].before.key, mFolderId, plan.databaseSourceId,
+                MessageRemovalAccounting::LocalMessageSize));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(plan.messages[0].before.key, exists));
+  EXPECT_TRUE(exists);
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(0, expunged);
+  ASSERT_EQ(NS_OK, db.SettleBodyRelocation(mFolderId, plan.token,
+                                           BodyRelocationOutcome::Restored));
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRemovalCommitFailureRollsBackCounterAndRow) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RawHdr raw;
+  raw.messageId = "removal-commit-fault"_ns;
+  raw.messageSize = Some(42u);
+  raw.storeToken = Some(nsCString("retained-body"_ns));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &key));
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 7));
+  MessageBodyState before;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, before));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "PRAGMA foreign_keys=ON; "
+                "CREATE TEMP TABLE removal_parent(id INTEGER PRIMARY KEY); "
+                "CREATE TEMP TABLE removal_child(id INTEGER REFERENCES "
+                "removal_parent(id) "
+                "DEFERRABLE INITIALLY DEFERRED)"_ns));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("removal_commit_fault"_ns, 1, witness));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER reject_removal_commit AFTER DELETE "
+                       "ON main.messages "
+                       "BEGIN SELECT removal_commit_fault(OLD.id); "
+                       "INSERT INTO removal_child VALUES(OLD.id); END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_removal_commit"_ns));
+  });
+  uint32_t removed = 0;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char, const CapturedMessage &, const CapturedMessage &,
+                         Message *, bool) { ++removed; };
+  db.AddMessageListener(observer);
+  auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  EXPECT_EQ(
+      NS_ERROR_STORAGE_CONSTRAINT,
+      db.RemoveMessageFromFolder(key, mFolderId, source,
+                                 MessageRemovalAccounting::LocalMessageSize));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(int64_t(key), witness->mLastKey);
+  EXPECT_EQ(0u, removed);
+  bool active = true, exists = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(7, expunged);
+  MessageBodyState after;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, after));
+  EXPECT_EQ(before.storeToken, after.storeToken);
+  EXPECT_EQ(before.contentRevision, after.contentRevision);
+  EXPECT_EQ(before.locationRevision, after.locationRevision);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_removal_commit"_ns));
+  ASSERT_EQ(NS_OK, db.RemoveMessageFromFolder(
+                       key, mFolderId, source,
+                       MessageRemovalAccounting::LocalMessageSize));
+  EXPECT_EQ(1u, removed);
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, expunged));
+  EXPECT_EQ(49, expunged);
 }
 
 }  // namespace mozilla::mailnews

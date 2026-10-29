@@ -49,6 +49,9 @@ struct FinishedMessageBody {
   bool offline{false};
 };
 
+// Existing local versus IMAP/news expunged-byte accounting on deletion.
+enum class MessageRemovalAccounting { LocalMessageSize, OfflineMessageSize };
+
 enum class BodyRelocationState : uint32_t { Pending, Installed, Restored };
 enum class BodyRelocationOutcome { Installed, Restored };
 
@@ -271,6 +274,14 @@ class MessageDatabase : public nsIMessageDatabase {
                       bool notifyLegacy, nsMsgKey* key,
                       Message** liveHeader = nullptr);
 
+  // Native facade entry: owns its transaction, verifies the physical folder
+  // and database incarnation, and accounts bytes before committing removal.
+  // OfflineMessageSize counts only rows with the Offline flag. Generic
+  // RemoveMessage keeps its existing behavior without folder accounting.
+  nsresult RemoveMessageFromFolder(nsMsgKey key, uint64_t folderId,
+                                   const nsACString &databaseSourceId,
+                                   MessageRemovalAccounting accounting);
+
   // Durable identity/header, excluded from published membership and events.
   nsresult StageMessage(uint64_t folderId, const ::RawHdr& header,
                         nsMsgKey* key, Message** liveHeader = nullptr);
@@ -482,6 +493,13 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult BindMessageToServerUidInTransaction(nsMsgKey key, uint64_t folderId,
                                                uint32_t epoch, uint32_t uid,
                                                bool allowStaged);
+
+  nsresult RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
+                                 const nsACString *databaseSourceId,
+                                 MessageRemovalAccounting accounting);
+  nsresult AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
+                                 const nsACString &databaseSourceId,
+                                 MessageRemovalAccounting accounting);
 
   nsresult SettleMessageBodyInternal(const MessageBodyState& expected,
                                      const FinishedMessageBody& finished,

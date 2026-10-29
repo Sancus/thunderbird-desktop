@@ -5,9 +5,22 @@
 let rootFolder;
 
 add_setup(function () {
+  Services.prefs.setCharPref(
+    "mail.server.default.storeContractID",
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
   const account = MailServices.accounts.createLocalMailAccount();
   rootFolder = account.incomingServer.rootFolder;
   rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  Assert.equal(account.incomingServer.msgStore.storeType, "maildir");
+  Assert.equal(rootFolder.msgStore.storeType, "maildir");
+  const databaseService = Cc[
+    "@mozilla.org/msgDatabase/msgDBService;1"
+  ].getService(Ci.nsIMsgDBService);
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && databaseService instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false)
+  );
 });
 
 add_task(function test_folder_not_reused_after_rename() {

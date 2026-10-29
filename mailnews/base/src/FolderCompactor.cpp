@@ -36,6 +36,13 @@
 #include "mozilla/StaticPtr.h"
 #include "mozilla/glean/CommMailMetrics.h"
 
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#  include "mozilla/StaticPrefs_mail.h"
+#  include "nsIUUIDGenerator.h"
+#  include "nsServiceManagerUtils.h"
+#endif
+
 mozilla::LazyLogModule gCompactLog("compact");
 using mozilla::LogLevel;
 
@@ -64,13 +71,19 @@ static void GUIShowDoneMsg(nsIMsgWindow* window, int64_t totalBytesRecovered);
  * keep, then use that each time asyncCompact() calls our
  * nsIStoreCompactListener.onRetentionQuery() method.
  */
-class FolderCompactor : public nsIStoreCompactListener {
+class FolderCompactor : public nsIStoreCompactListener,
+                        public nsIMboxCompactionCommit {
  public:
   FolderCompactor() = delete;
   explicit FolderCompactor(nsIMsgFolder* folder);
 
   NS_DECL_ISUPPORTS
   NS_DECL_NSISTORECOMPACTLISTENER
+  bool RequiresBodyRelocation() const override;
+  NS_IMETHOD PrepareBodyRelocation(nsIFile* original, nsIFile* compacted,
+                                   nsIFile* backup) override;
+  NS_IMETHOD CompleteBodyRelocation() override;
+  NS_IMETHOD AbandonBodyRelocation() override;
 
   // This kicks off the compaction.
   nsresult BeginCompacting(std::function<void(int)> progressFn,
@@ -111,6 +124,17 @@ class FolderCompactor : public nsIStoreCompactListener {
   // Running total of kept messages (for progress feedback).
   uint32_t mNumKept{0};
 
+#ifdef MOZ_PANORAMA
+  nsresult BuildRelocationPlan(nsIMsgDatabase* db);
+  RefPtr<mozilla::mailnews::DatabaseCore> mCore;
+  mozilla::mailnews::FolderBodyRelocation mRelocation;
+  struct RelocationRow {
+    size_t index;
+    bool retained{false};
+  };
+  mozilla::HashMap<nsMsgKey, RelocationRow> mRelocationRows;
+#endif
+
   // Glean timer.
   uint64_t mTimerId{0};
 
@@ -144,7 +168,8 @@ class FolderCompactor : public nsIStoreCompactListener {
   } mPaths;
 };
 
-NS_IMPL_ISUPPORTS(FolderCompactor, nsIStoreCompactListener)
+NS_IMPL_ISUPPORTS(FolderCompactor, nsIStoreCompactListener,
+                  nsIMboxCompactionCommit)
 
 FolderCompactor::FolderCompactor(nsIMsgFolder* folder) : mFolder(folder) {}
 
@@ -152,7 +177,8 @@ FolderCompactor::~FolderCompactor() {
   // Should have already released folder in OnFinalSummary(), but
   // ReleaseSemaphore() is OK with being called even if we don't hold the
   // lock.
-  mFolder->ReleaseSemaphore(this, "FolderCompactor::~FolderCompactor"_ns);
+  mFolder->ReleaseSemaphore(static_cast<nsIStoreCompactListener*>(this),
+                            "FolderCompactor::~FolderCompactor"_ns);
 }
 
 nsresult FolderCompactor::BeginCompacting(
@@ -172,7 +198,8 @@ nsresult FolderCompactor::BeginCompacting(
   mDBService = do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
   NS_ENSURE_SUCCESS(rv, rv);
 
-  rv = mFolder->AcquireSemaphore(this, "FolderCompactor::BeginCompacting"_ns);
+  rv = mFolder->AcquireSemaphore(static_cast<nsIStoreCompactListener*>(this),
+                                 "FolderCompactor::BeginCompacting"_ns);
   if (rv == NS_MSG_FOLDER_BUSY) {
     return rv;  // Semi-expected, don't want a warning message.
   }
@@ -180,7 +207,8 @@ nsresult FolderCompactor::BeginCompacting(
 
   // Just in case we exit early...
   auto guardSemaphore = mozilla::MakeScopeExit([&] {
-    mFolder->ReleaseSemaphore(this, "FolderCompactor::BeginCompacting"_ns);
+    mFolder->ReleaseSemaphore(static_cast<nsIStoreCompactListener*>(this),
+                              "FolderCompactor::BeginCompacting"_ns);
   });
 
   // If it's a local folder and the DB needs to be rebuilt, this will fail.
@@ -192,97 +220,110 @@ nsresult FolderCompactor::BeginCompacting(
   rv = db->Commit(nsMsgDBCommitType::kLargeCommit);
   NS_ENSURE_SUCCESS(rv, rv);
 
-  // Get file location of the folder db.
-  rv = mFolder->GetSummaryFile(getter_AddRefs(mPaths.Source));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // Check available disk space against estimate of space required.
-  // Return NS_ERROR_FILE_NO_DEVICE_SPACE if we think it'll fail.
-  {
-    int64_t availableSpace;
-    rv = mPaths.Source->GetDiskSpaceAvailable(&availableSpace);
-    // If GetDiskSpaceAvailable() isn't implemented, we'll just plough
-    // on without a space check. Otherwise bail out now.
-    if (NS_FAILED(rv) && rv != NS_ERROR_NOT_IMPLEMENTED) {
-      return rv;
-    }
-    int64_t requiredSpace;
-    rv = SpaceRequiredToCompact(mFolder, &requiredSpace);
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    mCore = mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_STATE(mCore);
+    rv = BuildRelocationPlan(db);
     NS_ENSURE_SUCCESS(rv, rv);
-    if (availableSpace < requiredSpace) {
-      return NS_ERROR_FILE_NO_DEVICE_SPACE;
-    }
-  }
+    mDB = db;
+  } else
+#endif
+  {
+    // Get file location of the folder db.
+    rv = mFolder->GetSummaryFile(getter_AddRefs(mPaths.Source));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // Decide which messages we want to keep. Builds a storeToken => msgKey
-  // hashmap of them.
-  rv = BuildKeepMap(db, mMsgsToKeep);
-  NS_ENSURE_SUCCESS(rv, rv);
+    // Check available disk space against estimate of space required.
+    // Return NS_ERROR_FILE_NO_DEVICE_SPACE if we think it'll fail.
+    {
+      int64_t availableSpace;
+      rv = mPaths.Source->GetDiskSpaceAvailable(&availableSpace);
+      // If GetDiskSpaceAvailable() isn't implemented, we'll just plough
+      // on without a space check. Otherwise bail out now.
+      if (NS_FAILED(rv) && rv != NS_ERROR_NOT_IMPLEMENTED) {
+        return rv;
+      }
+      int64_t requiredSpace;
+      rv = SpaceRequiredToCompact(mFolder, &requiredSpace);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (availableSpace < requiredSpace) {
+        return NS_ERROR_FILE_NO_DEVICE_SPACE;
+      }
+    }
+
+    // Decide which messages we want to keep. Builds a storeToken => msgKey
+    // hashmap of them.
+    rv = BuildKeepMap(db, mMsgsToKeep);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
 
   mFolder->NotifyAboutToCompact();
   // Ensure the active views of the folder are reloaded in any case.
   auto guardNotification =
       mozilla::MakeScopeExit([&] { mFolder->NotifyCompactCompleted(); });
 
-  // We've read what we need from the DB now. Close it. We'll be working on a
-  // copy from now on.
-  mFolder->CloseDatabase();
+  if (!RequiresBodyRelocation()) {
+    // We've read what we need from the DB now. Close it. We'll be working on a
+    // copy from now on.
+    mFolder->CloseDatabase();
 
-  // Set up temp dir and all the paths and filenames we want to track.
-  {
-    rv =
-        GetOrCreateCompactionDir(mPaths.Source, getter_AddRefs(mPaths.TempDir));
-    NS_ENSURE_SUCCESS(rv, rv);
+    // Set up temp dir and all the paths and filenames we want to track.
+    {
+      rv = GetOrCreateCompactionDir(mPaths.Source,
+                                    getter_AddRefs(mPaths.TempDir));
+      NS_ENSURE_SUCCESS(rv, rv);
 
-    // The original folder db file.
-    // "foo/folder.msf"
-    rv = mPaths.Source->GetParent(getter_AddRefs(mPaths.SourceDir));
-    NS_ENSURE_SUCCESS(rv, rv);
-    // "folder.msf"
-    rv = mPaths.Source->GetLeafName(mPaths.SourceName);
-    NS_ENSURE_SUCCESS(rv, rv);
+      // The original folder db file.
+      // "foo/folder.msf"
+      rv = mPaths.Source->GetParent(getter_AddRefs(mPaths.SourceDir));
+      NS_ENSURE_SUCCESS(rv, rv);
+      // "folder.msf"
+      rv = mPaths.Source->GetLeafName(mPaths.SourceName);
+      NS_ENSURE_SUCCESS(rv, rv);
 
-    // The new db file, in temp dir, while it's being built.
-    mPaths.CompactingName = mPaths.SourceName + u".compacting"_ns;
-    rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacting));
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = mPaths.Compacting->Append(mPaths.CompactingName);
-    NS_ENSURE_SUCCESS(rv, rv);
+      // The new db file, in temp dir, while it's being built.
+      mPaths.CompactingName = mPaths.SourceName + u".compacting"_ns;
+      rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacting));
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = mPaths.Compacting->Append(mPaths.CompactingName);
+      NS_ENSURE_SUCCESS(rv, rv);
 
-    // The new db file, in temp dir, once it's been successfully compacted.
-    mPaths.CompactedName = mPaths.SourceName + u".compacted"_ns;
-    rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacted));
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = mPaths.Compacted->Append(mPaths.CompactedName);
-    NS_ENSURE_SUCCESS(rv, rv);
+      // The new db file, in temp dir, once it's been successfully compacted.
+      mPaths.CompactedName = mPaths.SourceName + u".compacted"_ns;
+      rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacted));
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = mPaths.Compacted->Append(mPaths.CompactedName);
+      NS_ENSURE_SUCCESS(rv, rv);
 
-    // The original db file, moved to temp dir just before we install the
-    // compacted one. If we crash at that critical moment, this could be
-    // used for recovery.
-    mPaths.BackupName = mPaths.SourceName + u".original"_ns;
-    rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Backup));
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = mPaths.Backup->Append(mPaths.BackupName);
+      // The original db file, moved to temp dir just before we install the
+      // compacted one. If we crash at that critical moment, this could be
+      // used for recovery.
+      mPaths.BackupName = mPaths.SourceName + u".original"_ns;
+      rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Backup));
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = mPaths.Backup->Append(mPaths.BackupName);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    // Copy the original DB file to work on.
+    // cp "foo/folder.msf" "foo/.compact-temp/folder.msf.compacting"
+    {
+      rv = mPaths.Source->CopyTo(mPaths.TempDir, mPaths.CompactingName);
+      MOZ_LOG(gCompactLog, NS_SUCCEEDED(rv) ? LogLevel::Debug : LogLevel::Error,
+              ("FolderCompactor - copy '%s' to '%s' (rv=0x%x)",
+               mPaths.Source->HumanReadablePath().get(),
+               mPaths.Compacting->HumanReadablePath().get(), (uint32_t)rv));
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    // Open the output ("*.compacting") DB for writing.
+    // This DB will be linked to the folder but no listeners will be attached to
+    // it.
+    rv = mDBService->OpenDBFromFile(mPaths.Compacting, mFolder, false, true,
+                                    getter_AddRefs(mDB));
     NS_ENSURE_SUCCESS(rv, rv);
   }
-
-  // Copy the original DB file to work on.
-  // cp "foo/folder.msf" "foo/.compact-temp/folder.msf.compacting"
-  {
-    rv = mPaths.Source->CopyTo(mPaths.TempDir, mPaths.CompactingName);
-    MOZ_LOG(gCompactLog, NS_SUCCEEDED(rv) ? LogLevel::Debug : LogLevel::Error,
-            ("FolderCompactor - copy '%s' to '%s' (rv=0x%x)",
-             mPaths.Source->HumanReadablePath().get(),
-             mPaths.Compacting->HumanReadablePath().get(), (uint32_t)rv));
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-
-  // Open the output ("*.compacting") DB for writing.
-  // This DB will be linked to the folder but no listeners will be attached to
-  // it.
-  rv = mDBService->OpenDBFromFile(mPaths.Compacting, mFolder, false, true,
-                                  getter_AddRefs(mDB));
-  NS_ENSURE_SUCCESS(rv, rv);
 
   // Local folders maintain X-Mozilla-* headers in the messages and they
   // may need patching up.
@@ -316,6 +357,142 @@ nsresult FolderCompactor::BeginCompacting(
   guardSemaphore.release();
   guardNotification.release();
   return NS_OK;
+}
+
+bool FolderCompactor::RequiresBodyRelocation() const {
+#ifdef MOZ_PANORAMA
+  return mCore != nullptr;
+#else
+  return false;
+#endif
+}
+
+#ifdef MOZ_PANORAMA
+nsresult FolderCompactor::BuildRelocationPlan(nsIMsgDatabase* db) {
+  using namespace mozilla::mailnews;
+  nsresult rv = mFolder->GetId(&mRelocation.folderId);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mCore->GetSourceId(mRelocation.databaseSourceId);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mCore->MessageDB().CheckFolderBodyAccess(mRelocation.folderId);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<nsIFile> body;
+  rv = mFolder->GetFilePath(getter_AddRefs(body));
+  NS_ENSURE_SUCCESS(rv, rv);
+  int64_t available;
+  rv = body->GetDiskSpaceAvailable(&available);
+  if (NS_SUCCEEDED(rv)) {
+    int64_t required;
+    rv = SpaceRequiredToCompact(mFolder, &required);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (available < required) return NS_ERROR_FILE_NO_DEVICE_SPACE;
+  } else if (rv != NS_ERROR_NOT_IMPLEMENTED) {
+    return rv;
+  }
+  nsTArray<nsMsgKey> keys;
+  rv = db->ListAllKeys(keys);
+  NS_ENSURE_SUCCESS(rv, rv);
+  keys.Sort();
+  for (nsMsgKey key : keys) {
+    RelocatedMessageBody row;
+    rv = mCore->MessageDB().GetMessageBodyState(key, row.before);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(row.before.folderId == mRelocation.folderId,
+                   NS_ERROR_NOT_AVAILABLE);
+    row.storeToken = row.before.storeToken;
+    row.messageSize = row.before.messageSize;
+    row.offlineMessageSize = row.before.offlineMessageSize;
+    row.lineCount = row.before.lineCount;
+    row.offline = (row.before.flags & nsMsgMessageFlags::Offline) != 0;
+    if (row.storeToken && !row.storeToken->IsEmpty()) {
+      nsCOMPtr<nsIMsgDBHdr> hdr;
+      rv = db->GetMsgHdrForKey(key, getter_AddRefs(hdr));
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(hdr, NS_ERROR_NOT_AVAILABLE);
+      nsCString pendingRemoval;
+      rv = hdr->GetStringProperty("pendingRemoval", pendingRemoval);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (!pendingRemoval.IsEmpty()) {
+        // Preserve the legacy empty property when settling the removed body.
+        row.storeToken = mozilla::Some(nsCString());
+        row.offline = false;
+      } else {
+        NS_ENSURE_TRUE(!mMsgsToKeep.has(*row.storeToken), NS_ERROR_UNEXPECTED);
+        NS_ENSURE_TRUE(mMsgsToKeep.put(*row.storeToken, key),
+                       NS_ERROR_OUT_OF_MEMORY);
+      }
+    }
+    NS_ENSURE_TRUE(
+        mRelocationRows.put(key, RelocationRow{mRelocation.messages.Length()}),
+        NS_ERROR_OUT_OF_MEMORY);
+    mRelocation.messages.AppendElement(row);
+  }
+  return NS_OK;
+}
+#endif
+
+NS_IMETHODIMP FolderCompactor::PrepareBodyRelocation(nsIFile* original,
+                                                     nsIFile* compacted,
+                                                     nsIFile* backup) {
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_STATE(mCore);
+  if (ShutdownObserver::IsShuttingDown()) return NS_ERROR_ABORT;
+  NS_ENSURE_TRUE(mNumKept == mMsgsToKeep.count(), NS_ERROR_NOT_AVAILABLE);
+  nsresult rv = original->GetPath(mRelocation.originalPath);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = compacted->GetPath(mRelocation.compactedPath);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = backup->GetPath(mRelocation.backupPath);
+  NS_ENSURE_SUCCESS(rv, rv);
+  int64_t originalSize, compactedSize;
+  rv = original->GetFileSize(&originalSize);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = compacted->GetFileSize(&compactedSize);
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(originalSize >= 0 && compactedSize >= 0, NS_ERROR_UNEXPECTED);
+  mRelocation.originalSize = originalSize;
+  mRelocation.compactedSize = compactedSize;
+  nsCOMPtr<nsIUUIDGenerator> generator =
+      do_GetService("@mozilla.org/uuid-generator;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsID token;
+  rv = generator->GenerateUUIDInPlace(&token);
+  NS_ENSURE_SUCCESS(rv, rv);
+  mRelocation.token.Assign(nsIDToCString(token).get());
+  return mCore->MessageDB().PrepareBodyRelocation(mRelocation);
+#else
+  return NS_ERROR_NOT_IMPLEMENTED;
+#endif
+}
+
+NS_IMETHODIMP FolderCompactor::CompleteBodyRelocation() {
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_STATE(mCore);
+  nsresult rv = mCore->MessageDB().SettleBodyRelocation(
+      mRelocation.folderId, mRelocation.token,
+      mozilla::mailnews::BodyRelocationOutcome::Installed);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  rv = mDB->GetDBFolderInfo(getter_AddRefs(info));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
+  rv = info->SetExpungedBytes(0);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return mDB->SetSummaryValid(true);
+#else
+  return NS_ERROR_NOT_IMPLEMENTED;
+#endif
+}
+
+NS_IMETHODIMP FolderCompactor::AbandonBodyRelocation() {
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_STATE(mCore);
+  return mCore->MessageDB().SettleBodyRelocation(
+      mRelocation.folderId, mRelocation.token,
+      mozilla::mailnews::BodyRelocationOutcome::Restored);
+#else
+  return NS_ERROR_NOT_IMPLEMENTED;
+#endif
 }
 
 // Helper to estimate the extra diskspace required to compact a folder.
@@ -425,10 +602,12 @@ static nsresult BuildKeepMap(nsIMsgDatabase* db,
 // nsIStoreCompactListener callback invoked when the compaction starts.
 NS_IMETHODIMP FolderCompactor::OnCompactionBegin() {
   MOZ_ASSERT(mDB);
-  MOZ_ASSERT(mPaths.Source);
-  MOZ_ASSERT(mPaths.Compacting);
-  MOZ_ASSERT(mPaths.Compacted);
-  MOZ_ASSERT(mPaths.Backup);
+  if (!RequiresBodyRelocation()) {
+    MOZ_ASSERT(mPaths.Source);
+    MOZ_ASSERT(mPaths.Compacting);
+    MOZ_ASSERT(mPaths.Compacted);
+    MOZ_ASSERT(mPaths.Backup);
+  }
 
   if (ShutdownObserver::IsShuttingDown()) {
     return NS_ERROR_ABORT;
@@ -516,27 +695,47 @@ NS_IMETHODIMP FolderCompactor::OnMessageRetained(nsACString const& oldToken,
     return NS_ERROR_UNEXPECTED;
   }
   nsMsgKey key = p->value();
-  // Using nsIMsgHdr is pretty heavyweight here - they'll likely all be cached
-  // through murky mechanisms. This'll use up lots of memory on large folders
-  // for no good reason.
-  // Would be much better to just use the msgKey to twiddle the DB directly,
-  // but the API doesn't support it. Sigh.
-  nsCOMPtr<nsIMsgDBHdr> hdr;
-  nsresult rv = mDB->GetMsgHdrForKey(key, getter_AddRefs(hdr));
-  NS_ENSURE_SUCCESS(rv, rv);
-  rv = hdr->SetStoreToken(newToken);
-  NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  if (mCore) {
+    auto found = mRelocationRows.lookup(key);
+    NS_ENSURE_TRUE(found && !found->value().retained && newSize >= 0 &&
+                       newSize < UINT32_MAX,
+                   NS_ERROR_UNEXPECTED);
+    auto& row = mRelocation.messages[found->value().index];
+    NS_ENSURE_TRUE(row.before.storeToken && *row.before.storeToken == oldToken,
+                   NS_ERROR_NOT_AVAILABLE);
+    row.storeToken = mozilla::Some(nsCString(newToken));
+    if (IsLocalFolder(mFolder)) {
+      row.messageSize = uint32_t(newSize);
+    } else {
+      row.offlineMessageSize = uint32_t(newSize);
+    }
+    found->value().retained = true;
+  } else
+#endif
+  {
+    // Using nsIMsgHdr is pretty heavyweight here - they'll likely all be cached
+    // through murky mechanisms. This'll use up lots of memory on large folders
+    // for no good reason.
+    // Would be much better to just use the msgKey to twiddle the DB directly,
+    // but the API doesn't support it. Sigh.
+    nsCOMPtr<nsIMsgDBHdr> hdr;
+    nsresult rv = mDB->GetMsgHdrForKey(key, getter_AddRefs(hdr));
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = hdr->SetStoreToken(newToken);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // For IMAP and news, .offlineMessageSize is the local size.
-  // For local folders, .messageSize is the local size.
-  if (newSize >= UINT32_MAX) {
-    return NS_ERROR_UNEXPECTED;
-  }
-  if (IsLocalFolder(mFolder)) {
-    hdr->SetMessageSize((uint32_t)newSize);
-  } else {
-    hdr->SetOfflineMessageSize((uint32_t)newSize);
-    // Offline flag should already be set.
+    // For IMAP and news, .offlineMessageSize is the local size.
+    // For local folders, .messageSize is the local size.
+    if (newSize >= UINT32_MAX) {
+      return NS_ERROR_UNEXPECTED;
+    }
+    if (IsLocalFolder(mFolder)) {
+      hdr->SetMessageSize((uint32_t)newSize);
+    } else {
+      hdr->SetOfflineMessageSize((uint32_t)newSize);
+      // Offline flag should already be set.
+    }
   }
 
   // Give our caller a progress update.
@@ -571,6 +770,8 @@ NS_IMETHODIMP FolderCompactor::OnMessageRetained(nsACString const& oldToken,
 NS_IMETHODIMP FolderCompactor::OnCompactionComplete(nsresult status) {
   MOZ_LOG(gCompactLog, NS_SUCCEEDED(status) ? LogLevel::Info : LogLevel::Error,
           ("OnCompactionComplete(status=0x%" PRIx32 ")", (uint32_t)status));
+  // Panorama publishes new locations only after the provider installs the body.
+  if (RequiresBodyRelocation()) return status;
   nsresult rv = status;
   if (NS_SUCCEEDED(rv)) {
     // Update the DBs expungedbytes count.
@@ -676,22 +877,25 @@ NS_IMETHODIMP FolderCompactor::OnFinalSummary(nsresult status, int64_t oldSize,
     mozilla::glean::mail::compact_space_recovered.Accumulate(oldSize - newSize);
   }
 
-  // Clean up our working.
-  if (NS_SUCCEEDED(status)) {
-    // If we got this far without an error, we know it's all worked.
-    mKeepRecoveryFiles = false;
+  if (!RequiresBodyRelocation()) {
+    // Clean up our working.
+    if (NS_SUCCEEDED(status)) {
+      // If we got this far without an error, we know it's all worked.
+      mKeepRecoveryFiles = false;
+    }
+    mPaths.Compacting->Remove(false);  // Partial file, no use to anyone.
+    if (!mKeepRecoveryFiles) {
+      mPaths.Compacted->Remove(false);
+      mPaths.Backup->Remove(false);
+    }
+    mPaths.TempDir->Remove(false);  // Only if empty.
   }
-  mPaths.Compacting->Remove(false);  // Partial file, no use to anyone.
-  if (!mKeepRecoveryFiles) {
-    mPaths.Compacted->Remove(false);
-    mPaths.Backup->Remove(false);
-  }
-  mPaths.TempDir->Remove(false);  // Only if empty.
 
   // Release our lock on the folder.
-  mFolder->ReleaseSemaphore(this, "FolderCompactor::OnFinalSummary"_ns);
+  mFolder->ReleaseSemaphore(static_cast<nsIStoreCompactListener*>(this),
+                            "FolderCompactor::OnFinalSummary"_ns);
 
-  if (NS_SUCCEEDED(status)) {
+  if (NS_SUCCEEDED(status) && !RequiresBodyRelocation()) {
     // Need to set nsIMsgDatabase.summaryValid, but can't access DB via
     // nsIMsgFolder.msgDatabase, because summaryValid isn't set! But we can
     // open it with nsIMsgDBService.openFolderDB(). It'll still return

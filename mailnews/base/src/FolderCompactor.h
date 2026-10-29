@@ -6,12 +6,31 @@
 #define COMM_MAILNEWS_BASE_SRC_FOLDERCOMPACTOR_H_
 
 #include "nsTArray.h"
+#include "nsISupports.h"
 #include "mozilla/RefPtr.h"
 
+class nsIFile;
 class nsIMsgFolder;
 class nsIMsgWindow;
 class nsIUrlListener;
 enum class nsresult : uint32_t;
+
+// Private mbox/folder handshake; not a scriptable store callback.
+#define NS_IMBOXCOMPACTIONCOMMIT_IID \
+  {0x9bf4d761, 0xaaf9, 0x4777, {0x8f, 0xbc, 0x6c, 0x19, 0x7a, 0xab, 0xa5, 0x71}}
+
+class nsIMboxCompactionCommit : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IMBOXCOMPACTIONCOMMIT_IID)
+  virtual bool RequiresBodyRelocation() const = 0;
+  // Before the original body is renamed. The completed new body still exists.
+  NS_IMETHOD PrepareBodyRelocation(nsIFile* original, nsIFile* compacted,
+                                   nsIFile* backup) = 0;
+  // After checked installation, before the original backup may be deleted.
+  NS_IMETHOD CompleteBodyRelocation() = 0;
+  // After a known failed first atomic rename, while original bytes are intact.
+  NS_IMETHOD AbandonBodyRelocation() = 0;
+};
 
 /**
  * Perform compaction on the given folders.
@@ -30,8 +49,9 @@ enum class nsresult : uint32_t;
  *   returns.
  * - If AsyncCompactFolders() returns a failure code, no listener callbacks
  *   will be invoked.
- * - If any errors occur, the failing folder will be rolled back to it's
- *   previous state. Successfully compacted folders will stay compacted.
+ * - Failed compaction retains its originals or recovery files. Panorama may
+ *   require checked recovery before new body access resumes. Successfully
+ *   compacted folders stay compacted.
  *
  * This routine DOES NOT perform an expunge for IMAP folders, or attempt to
  * rebuild missing/out-of-date databases for local folders.

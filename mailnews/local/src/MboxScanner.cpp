@@ -32,12 +32,11 @@ nsresult MboxScanner::BeginScan(nsIFile* mboxFile,
     // according to the documentation of nsIMsgPluggableStore.asyncScan,
     // "No listener callbacks will be invoked before asyncScan() returns"
     nsCOMPtr<nsIStoreScanListener> refListener = scanListener;
-    NS_DispatchToMainThread(
+    return NS_DispatchToMainThread(
         NS_NewRunnableFunction("Notify scanListener", [refListener] {
-          refListener->OnStartScan();
-          refListener->OnStopScan(NS_OK);
+          nsresult status = refListener->OnStartScan();
+          refListener->OnStopScan(status);
         }));
-    return NS_OK;
   }
 
   mScanListener = scanListener;

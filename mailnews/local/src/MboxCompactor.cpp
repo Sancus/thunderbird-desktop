@@ -12,6 +12,7 @@
 #include "nsPrintfCString.h"
 #include "HeaderReader.h"
 #include "MboxCompactor.h"
+#include "FolderCompactor.h"
 #include "MboxMsgOutputStream.h"
 #include "MboxScanner.h"
 #include "mozilla/glean/CommMailMetrics.h"
@@ -31,9 +32,9 @@ nsresult MboxCompactor::BeginCompaction(nsIFile* srcMbox,
   MOZ_ASSERT(!mCompactListener);  // Already running?
   mCompactListener = listener;
   mPatchXMozillaHeaders = patchXMozillaHeaders;
-  nsresult rv = SanityCheck(srcMbox);
+  nsresult rv = SetupPaths(srcMbox);
   NS_ENSURE_SUCCESS(rv, rv);
-  rv = SetupPaths(srcMbox);
+  rv = SanityCheck(srcMbox);
   NS_ENSURE_SUCCESS(rv, rv);
 
   MOZ_LOG(gCompactLog, LogLevel::Info,
@@ -43,7 +44,8 @@ nsresult MboxCompactor::BeginCompaction(nsIFile* srcMbox,
 
   // Create output stream for our dest mbox.
   rv = NS_NewLocalFileOutputStream(getter_AddRefs(mDestStream),
-                                   mPaths.Compacting);
+                                   mPaths.Compacting,
+                                   PR_WRONLY | PR_CREATE_FILE | PR_EXCL, 0600);
   NS_ENSURE_SUCCESS(rv, rv);
 
   // Start iterating over the src mbox.
@@ -52,7 +54,16 @@ nsresult MboxCompactor::BeginCompaction(nsIFile* srcMbox,
   // in existence until finished).
   RefPtr<MboxScanner> scanner(new MboxScanner());
   rv = scanner->BeginScan(mPaths.Source, this);
-  NS_ENSURE_SUCCESS(rv, rv);
+  if (NS_FAILED(rv)) {
+    nsresult cleanupRv = mDestStream->Close();
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
+                         "Could not close unused compaction output");
+    mDestStream = nullptr;
+    cleanupRv = mPaths.Compacting->Remove(false);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
+                         "Could not remove unused compaction output");
+    return rv;
+  }
 
   return NS_OK;
 }
@@ -103,11 +114,11 @@ nsresult MboxCompactor::SanityCheck(nsIFile* srcMbox) {
 
 nsresult MboxCompactor::SetupPaths(nsIFile* srcMbox) {
   // Clone to avoid any caching issues on .fileSize etc (Bug 1022704).
-  srcMbox->Clone(getter_AddRefs(mPaths.Source));
+  nsresult rv = srcMbox->Clone(getter_AddRefs(mPaths.Source));
+  NS_ENSURE_SUCCESS(rv, rv);
 
   // Set up temp dir.
-  nsresult rv =
-      GetOrCreateCompactionDir(mPaths.Source, getter_AddRefs(mPaths.TempDir));
+  rv = GetOrCreateCompactionDir(mPaths.Source, getter_AddRefs(mPaths.TempDir));
   NS_ENSURE_SUCCESS(rv, rv);
 
   rv = mPaths.Source->GetParent(getter_AddRefs(mPaths.SourceDir));
@@ -118,20 +129,39 @@ nsresult MboxCompactor::SetupPaths(nsIFile* srcMbox) {
 
   // The new mbox, in temp dir, while it's being built.
   mPaths.CompactingName = mPaths.SourceName + u".compacting"_ns;
-  mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacting));
-  mPaths.Compacting->Append(mPaths.CompactingName);
+  rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacting));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mPaths.Compacting->Append(mPaths.CompactingName);
+  NS_ENSURE_SUCCESS(rv, rv);
 
   // The new mbox, in temp dir, when it's been built.
   mPaths.CompactedName = mPaths.SourceName + u".compacted"_ns;
-  mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacted));
-  mPaths.Compacted->Append(mPaths.CompactedName);
+  rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Compacted));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mPaths.Compacted->Append(mPaths.CompactedName);
+  NS_ENSURE_SUCCESS(rv, rv);
 
   // The original mbox, moved into temp dir after new mbox has been built.
   // Could be used for recovery, if we die during OnCompactionComplete()
   // callback.
   mPaths.BackupName = mPaths.SourceName + u".original"_ns;
-  mPaths.TempDir->Clone(getter_AddRefs(mPaths.Backup));
-  mPaths.Backup->Append(mPaths.BackupName);
+  rv = mPaths.TempDir->Clone(getter_AddRefs(mPaths.Backup));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = mPaths.Backup->Append(mPaths.BackupName);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  // An interrupted compaction may have left the only recoverable body here.
+  // Leave these files intact until recovery has determined which one to keep.
+  nsIFile* recoveryFiles[] = {mPaths.Compacting.get(), mPaths.Compacted.get(),
+                              mPaths.Backup.get()};
+  for (nsIFile* file : recoveryFiles) {
+    bool exists;
+    rv = file->Exists(&exists);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (exists) {
+      return NS_ERROR_FILE_ALREADY_EXISTS;
+    }
+  }
   return NS_OK;
 }
 
@@ -276,7 +306,7 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
   MOZ_LOG(gCompactLog, NS_SUCCEEDED(status) ? LogLevel::Debug : LogLevel::Error,
           ("MboxCompactor - OnStopScan(status=0x%x)", (uint32_t)status));
 
-  if (NS_SUCCEEDED(rv)) {
+  if (NS_FAILED(status)) {
     rv = status;
   }
 
@@ -301,6 +331,20 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
     rv = mPaths.Compacted->GetFileSize(&compactedSize);
   }
 
+  nsCOMPtr<nsIMboxCompactionCommit> commit =
+      do_QueryInterface(mCompactListener);
+  if (commit && !commit->RequiresBodyRelocation()) commit = nullptr;
+  bool keepRecoveryFiles = false;
+  bool relocationPrepared = false;
+  if (NS_SUCCEEDED(rv) && commit) {
+    // A failed preparation may have persisted an intent. Keep the completed
+    // body even when the result is uncertain; never infer a rollback from SQL.
+    keepRecoveryFiles = true;
+    rv = commit->PrepareBodyRelocation(mPaths.Source, mPaths.Compacted,
+                                       mPaths.Backup);
+    relocationPrepared = NS_SUCCEEDED(rv);
+  }
+
   bool movedOriginal = false;
   if (NS_SUCCEEDED(rv)) {
     MOZ_LOG(gCompactLog, LogLevel::Debug,
@@ -316,6 +360,17 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
              mPaths.Backup->HumanReadablePath().get(), (uint32_t)rv));
     if (NS_SUCCEEDED(rv)) {
       movedOriginal = true;
+    } else if (relocationPrepared) {
+      // RenameTo does not fall back to copy/delete on failure. The original is
+      // untouched; core rechecks the complete intent before acknowledging it.
+      nsresult abandonRv = commit->AbandonBodyRelocation();
+      if (NS_SUCCEEDED(abandonRv)) keepRecoveryFiles = false;
+      MOZ_LOG(gCompactLog,
+              NS_SUCCEEDED(abandonRv) ? LogLevel::Debug : LogLevel::Error,
+              ("MboxCompactor - Abandon relocation (rv=0x%x)",
+               (uint32_t)abandonRv));
+      // Preserve the rename error even if acknowledgement failed. Recovery
+      // bytes must remain until that uncertain intent is resolved.
     }
   }
 
@@ -339,6 +394,11 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
              mPaths.Compacted->HumanReadablePath().get(),
              mPaths.Source->HumanReadablePath().get(), (uint32_t)rv, PR_Now()));
 
+    if (NS_SUCCEEDED(rv) && commit) {
+      // A metadata failure leaves the installed body and original backup for
+      // recovery, with the native intent/read gate still pending as needed.
+      rv = commit->CompleteBodyRelocation();
+    }
     if (NS_SUCCEEDED(rv)) {
       nsresult rvTemp = mPaths.Backup->Remove(false);
       MOZ_LOG(gCompactLog,
@@ -347,14 +407,10 @@ NS_IMETHODIMP MboxCompactor::OnStopScan(nsresult status) {
                mPaths.Backup->HumanReadablePath().get(), (uint32_t)rvTemp));
     }
 
-    // If we failed to move the compacted mbox into place, there's not much
-    // we can do, other than leave it where it is for now.
-    // A future (maybe manual) recovery is required to sort things out.
-    // The original mbox is probably no good at this point, as the
-    // listener has already committed it's own changes (i.e. updated
-    // the database) ready for the new, compacted mbox.
-    // But that's OK - we've moved the original mbox out of the way.
-  } else {
+    // Failed installation or settlement retains recovery bodies. The legacy
+    // callback may have installed its DB; Panorama keeps body access gated by
+    // its pending intent until an explicit checked recovery outcome.
+  } else if (!keepRecoveryFiles) {
     // Either the listener requested that we roll back, or we'd already failed.
     // In any case, that means putting things back how they were.
     if (movedOriginal) {

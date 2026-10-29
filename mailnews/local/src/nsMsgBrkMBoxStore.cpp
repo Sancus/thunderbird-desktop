@@ -35,6 +35,10 @@
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ScopeExit.h"
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
 #include <charconv>
 #include <limits>
 #include <cstdlib>  // for std::abs(int/long)
@@ -44,6 +48,23 @@ using mozilla::LogLevel;
 using mozilla::Preferences;
 
 mozilla::LazyLogModule gMboxLog("mbox");
+
+// Check before opening by a cached token or changing physical body bytes.
+static nsresult CheckMboxBodyAccess(nsIMsgFolder* folder) {
+  NS_ENSURE_ARG_POINTER(folder);
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_STATE(core);
+    uint64_t folderId;
+    nsresult rv = folder->GetId(&folderId);
+    NS_ENSURE_SUCCESS(rv, rv);
+    return core->MessageDB().CheckFolderBodyAccess(folderId);
+  }
+#endif
+  return NS_OK;
+}
 
 /****************************************************************************
  * nsMsgBrkMBoxStore implementation.
@@ -700,7 +721,8 @@ nsMsgBrkMBoxStore::GetNewMsgOutputStream(nsIMsgFolder* folder,
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG_POINTER(outStream);
 
-  nsresult rv;
+  nsresult rv = CheckMboxBodyAccess(folder);
+  NS_ENSURE_SUCCESS(rv, rv);
   // First, check the mOngoingWrites set to make sure we're not already
   // writing to this folder. If so, we'll abort and roll back the previous one
   // before issuing a new stream.
@@ -810,9 +832,10 @@ nsMsgBrkMBoxStore::FinishNewMessage(nsIMsgFolder* folder,
   if (NS_FAILED(status) && details->value().quarantined) {
     // A pre-Finish quarantine error has already discarded its temporary file
     // and released the untouched target. It is not an mbox rollback failure.
-    MOZ_LOG(gMboxLog, LogLevel::Error,
-            ("QUARANTINE MSG failed before Finish stream=0x%p folder=%s rv=0x%x",
-             outStream, folder->URI().get(), static_cast<uint32_t>(status)));
+    MOZ_LOG(
+        gMboxLog, LogLevel::Error,
+        ("QUARANTINE MSG failed before Finish stream=0x%p folder=%s rv=0x%x",
+         outStream, folder->URI().get(), static_cast<uint32_t>(status)));
     mOngoingWrites.remove(details);
     return status;
   }
@@ -864,8 +887,8 @@ nsMsgBrkMBoxStore::DiscardNewMessage(nsIMsgFolder* folder,
     if (NS_FAILED(rv)) {
       // Close reports the old temporary-file error; the target was untouched.
       MOZ_LOG(gMboxLog, LogLevel::Error,
-              ("DISCARD QUARANTINE MSG stream=0x%p folder=%s rv=0x%x", outStream,
-               folder->URI().get(), static_cast<uint32_t>(rv)));
+              ("DISCARD QUARANTINE MSG stream=0x%p folder=%s rv=0x%x",
+               outStream, folder->URI().get(), static_cast<uint32_t>(rv)));
     }
     int64_t filePos = details->value().filePos;
     mOngoingWrites.remove(details);
@@ -888,6 +911,8 @@ nsMsgBrkMBoxStore::GetMsgInputStream(nsIMsgFolder* aMsgFolder,
                                      nsIInputStream** aResult) {
   NS_ENSURE_ARG_POINTER(aMsgFolder);
   NS_ENSURE_ARG_POINTER(aResult);
+  nsresult rv = CheckMboxBodyAccess(aMsgFolder);
+  NS_ENSURE_SUCCESS(rv, rv);
   // A corrupt token must not silently select the first message or a prefix
   // offset. Seek() takes a signed offset, even though tokens are unsigned.
   uint64_t offset = 0;
@@ -898,7 +923,7 @@ nsMsgBrkMBoxStore::GetMsgInputStream(nsIMsgFolder* aMsgFolder,
     return NS_ERROR_ILLEGAL_VALUE;
   }
   nsCOMPtr<nsIFile> mboxFile;
-  nsresult rv = aMsgFolder->GetFilePath(getter_AddRefs(mboxFile));
+  rv = aMsgFolder->GetFilePath(getter_AddRefs(mboxFile));
   NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIInputStream> rawMboxStream;
   rv = NS_NewLocalFileInputStream(getter_AddRefs(rawMboxStream), mboxFile);
@@ -942,8 +967,10 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::DeleteStoreMessages(
     return NS_OK;  // Early out, don't need to open file.
   }
 
+  nsresult rv = CheckMboxBodyAccess(folder);
+  NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIFile> mboxFile;
-  nsresult rv = folder->GetFilePath(getter_AddRefs(mboxFile));
+  rv = folder->GetFilePath(getter_AddRefs(mboxFile));
   NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIRandomAccessStream> stream;
   rv = NS_NewLocalFileRandomAccessStream(getter_AddRefs(stream), mboxFile);
@@ -981,8 +1008,10 @@ nsMsgBrkMBoxStore::CopyMessages(bool isMove,
 
 NS_IMETHODIMP nsMsgBrkMBoxStore::AsyncScan(nsIMsgFolder* folder,
                                            nsIStoreScanListener* scanListener) {
+  nsresult rv = CheckMboxBodyAccess(folder);
+  NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIFile> mboxPath;
-  nsresult rv = folder->GetFilePath(getter_AddRefs(mboxPath));
+  rv = folder->GetFilePath(getter_AddRefs(mboxPath));
   NS_ENSURE_SUCCESS(rv, rv);
   // Fire and forget. MboxScanner will hold itself in existence until finished.
   RefPtr<MboxScanner> scanner(new MboxScanner());
@@ -1007,8 +1036,10 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::ChangeFlags(
     return NS_OK;  // Early out, don't need to open file.
   }
 
+  nsresult rv = CheckMboxBodyAccess(folder);
+  NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIFile> mboxFile;
-  nsresult rv = folder->GetFilePath(getter_AddRefs(mboxFile));
+  rv = folder->GetFilePath(getter_AddRefs(mboxFile));
   NS_ENSURE_SUCCESS(rv, rv);
 
   nsCOMPtr<nsIRandomAccessStream> stream;
@@ -1045,6 +1076,8 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::ChangeKeywords(
 
   nsCOMPtr<nsIMsgFolder> folder;
   rv = aHdrArray[0]->GetFolder(getter_AddRefs(folder));
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = CheckMboxBodyAccess(folder);
   NS_ENSURE_SUCCESS(rv, rv);
 
   nsCOMPtr<nsIFile> mboxFile;
@@ -1158,8 +1191,16 @@ nsMsgBrkMBoxStore::GetSupportsCompaction(bool* aSupportsCompaction) {
 NS_IMETHODIMP nsMsgBrkMBoxStore::AsyncCompact(
     nsIMsgFolder* folder, nsIStoreCompactListener* compactListener,
     bool patchXMozillaHeaders) {
+  nsresult rv = CheckMboxBodyAccess(folder);
+  NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      mOngoingWrites.has(folder->URI())) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+#endif
   nsCOMPtr<nsIFile> srcMbox;
-  nsresult rv = folder->GetFilePath(getter_AddRefs(srcMbox));
+  rv = folder->GetFilePath(getter_AddRefs(srcMbox));
   NS_ENSURE_SUCCESS(rv, rv);
 
   // Fire and forget. MboxScanner will hold itself in existence until finished.

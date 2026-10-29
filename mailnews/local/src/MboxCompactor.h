@@ -20,7 +20,7 @@ class nsIFile;
  * want to keep into a new mbox file. It'll also patch X-Mozilla-* headers
  * as it goes, if asked to.
  * If all goes well, the old mbox file is replaced by the
- * new one. If any error occurs, the mbox is left untouched.
+ * new one. Failures during switchover can require recovery from retained files.
  * Doesn't fiddle with folder or database or GUI. Just the mbox file.
  * Any higher level database/folder changes are handled by the caller.
  *
@@ -36,8 +36,11 @@ class nsIFile;
  * 6) rename "foo/.temp-compact/inbox.compacted" to "foo/inbox".
  * 7) all done!
  *
- * If anything goes wrong at any stage, the old mbox will be restored to
- * the state it started in.
+ * Folder-backed Panorama compaction also prepares durable relocation before
+ * step 4 and checks metadata settlement after step 6, before backup deletion.
+ * A failed first atomic rename is acknowledged as Restored before cleanup.
+ * Failed acknowledgement or later installation keeps recovery bodies instead
+ * of restoring bytes behind pending metadata. Legacy rollback is unchanged.
  *
  */
 class MboxCompactor : public nsIStoreScanListener {

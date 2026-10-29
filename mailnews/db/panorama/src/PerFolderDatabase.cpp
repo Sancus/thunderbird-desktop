@@ -644,6 +644,7 @@ NS_IMETHODIMP PerFolderDatabase::ForceClosed() {
   }
   RefPtr<PerFolderDatabase> self(this);
   mForceClosed = true;
+  mCachedHeaders.Clear();
   // Invalidate this wrapper's weak cache entries before a listener reopens it.
   DetachWeakPtr();
   if (DatabaseCore::sInstance && DatabaseCore::sInstance->mMessageDatabase) {
@@ -652,10 +653,16 @@ NS_IMETHODIMP PerFolderDatabase::ForceClosed() {
   return NotifyAnnouncerGoingAway();
 }
 NS_IMETHODIMP PerFolderDatabase::ClearCachedHdrs() {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  // Drop only our strong header references, not external views or core data.
+  mCachedHeaders.Clear();
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::ResetHdrCacheSize(uint32_t size) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  if (mMsgHdrCacheSize > size) {
+    mMsgHdrCacheSize = size;
+    mCachedHeaders.Clear();
+  }
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::GetDBFolderInfo(
     nsIDBFolderInfo** aDBFolderInfo) {
@@ -730,28 +737,43 @@ NS_IMETHODIMP PerFolderDatabase::SetLastUseTime(PRTime aLastUseTime) {
   mLastUseTime = aLastUseTime;
   return NS_OK;
 }
+nsresult PerFolderDatabase::CacheHeader(nsMsgKey key, nsIMsgDBHdr* header) {
+  // Preserve the legacy strict threshold: size zero can retain one header.
+  if (mCachedHeaders.Count() > mMsgHdrCacheSize) {
+    mCachedHeaders.Clear();
+  }
+  return mCachedHeaders.InsertOrUpdate(key, nsCOMPtr<nsIMsgDBHdr>(header),
+                                       mozilla::fallible)
+             ? NS_OK
+             : NS_ERROR_OUT_OF_MEMORY;
+}
+
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForKey(nsMsgKey key,
                                                  nsIMsgDBHdr** msgHdr) {
   NS_ENSURE_ARG_POINTER(msgHdr);
   *msgHdr = nullptr;
+  RememberLastUseTime();
   MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
   bool exists;
   MOZ_TRY(MessageDB().MessageExists(key, exists));
   NS_ENSURE_TRUE(exists, NS_ERROR_ILLEGAL_VALUE);
-
-  RefPtr<Message> message;
-  MOZ_TRY(MessageDB().GetMessage(key, getter_AddRefs(message)));
-  {
-    // Sanity check.
-    CapturedMessage current;
-    MOZ_TRY(MessageDB().CaptureMessage(key, current));
-    if (current.folderId != mFolderId) {
-      NS_WARNING("GetMsgHdrForKey() returned message not in folder");
-      return NS_ERROR_ILLEGAL_VALUE;
-    }
+  CapturedMessage current;
+  MOZ_TRY(MessageDB().CaptureMessage(key, current));
+  if (current.folderId != mFolderId) {
+    NS_WARNING("GetMsgHdrForKey() returned message not in folder");
+    return NS_ERROR_ILLEGAL_VALUE;
   }
 
-  NS_IF_ADDREF(*msgHdr = message);
+  // Membership and incarnation are checked even for a retained object.
+  nsCOMPtr<nsIMsgDBHdr> header = mCachedHeaders.Get(key);
+  if (!header) {
+    RefPtr<Message> message;
+    MOZ_TRY(MessageDB().GetMessage(key, getter_AddRefs(message)));
+    MOZ_TRY(CacheHeader(key, message));
+    header = message;
+  }
+  header.forget(msgHdr);
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForMessageID(const char* messageID,
@@ -760,6 +782,7 @@ NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForMessageID(const char* messageID,
   *msgHdr = nullptr;
   NS_ENSURE_ARG_POINTER(messageID);
   MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
 
   RefPtr<Message> message;
   nsresult rv = MessageDB().GetMessageForMessageID(
@@ -768,8 +791,9 @@ NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForMessageID(const char* messageID,
     return NS_ERROR_ILLEGAL_VALUE;
   }
   NS_ENSURE_SUCCESS(rv, rv);
-  NS_IF_ADDREF(*msgHdr = message);
-  return NS_OK;
+  nsMsgKey key;
+  MOZ_TRY(message->GetMessageKey(&key));
+  return GetMsgHdrForKey(key, msgHdr);
 }
 nsresult PerFolderDatabase::GetMsgHdrForProperty(const nsACString& name,
                                                  const nsACString& value,
@@ -1873,10 +1897,13 @@ NS_IMETHODIMP PerFolderDatabase::GetDefaultSortOrder(
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrCacheSize(
     uint32_t* aMsgHdrCacheSize) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aMsgHdrCacheSize);
+  *aMsgHdrCacheSize = mMsgHdrCacheSize;
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::SetMsgHdrCacheSize(uint32_t aMsgHdrCacheSize) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  mMsgHdrCacheSize = aMsgHdrCacheSize;
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::GetNewList(nsTArray<nsMsgKey>& aNewList) {
   aNewList = mNewList.Clone();
@@ -2029,6 +2056,7 @@ NS_IMETHODIMP MessageEnumerator::GetNext(nsIMsgDBHdr** item) {
   NS_ENSURE_TRUE(current && mHasNext, NS_ERROR_FAILURE);
   nsMsgKey key = static_cast<nsMsgKey>(mStmt->AsInt64(0));
   RefPtr<Message> message = new Message(key);
+  MOZ_TRY(mOwner->CacheHeader(key, message));
   message.forget(item);
   Advance();
   return NS_OK;

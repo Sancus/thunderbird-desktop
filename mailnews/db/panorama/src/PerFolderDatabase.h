@@ -15,8 +15,10 @@
 #include "nsIDBFolderInfo.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgFolder.h"
+#include "nsIMsgHdr.h"
 #include "nsIMsgThread.h"
 #include "nsMsgEnumerator.h"
+#include "nsTHashMap.h"
 #include "prtime.h"
 
 class mozIStorageStatement;
@@ -94,6 +96,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   nsresult CheckFolderExists() const;
   nsresult CaptureDatabaseSourceId();
   nsresult CheckDatabaseSource() const;
+  nsresult CacheHeader(nsMsgKey key, nsIMsgDBHdr* header);
   nsresult CheckEnumerationState(uint64_t generation) const;
   nsresult MarkThreadFlag(nsIMsgThread* thread, nsMsgKey key, uint32_t flag,
                           bool set, nsIDBChangeListener* instigator);
@@ -109,6 +112,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   nsCString mDatabaseSourceId;
   nsresult mDatabaseSourceStatus = NS_ERROR_NOT_AVAILABLE;
   PRTime mLastUseTime = PR_Now();
+  // Retained header-object threshold, matching nsMsgDatabase::AddHdrToCache.
+  uint32_t mMsgHdrCacheSize = 512;
+  nsTHashMap<nsMsgKey, nsCOMPtr<nsIMsgDBHdr>> mCachedHeaders;
   uint64_t mEnumeratorGeneration = 0;
   bool mForceClosed = false;
   bool mNotifyingGoingAway = false;

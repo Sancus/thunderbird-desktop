@@ -2799,3 +2799,149 @@ add_task(
     }
   }
 );
+
+add_task(function test_headerObjectCacheThresholdAndExternalViews() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("header-object-cache");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("header-cache-bystander");
+  const keys = [0, 1, 2].map(index =>
+    addMessage({
+      folderId: folder.id,
+      messageId: `cache-${index}@cache.invalid`,
+    })
+  );
+  const otherKey = addMessage({ folderId: other.id });
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const bystander = otherDB.getMsgHdrForKey(otherKey);
+  Assert.equal(db.msgHdrCacheSize, 512);
+  db.msgHdrCacheSize = 1;
+  const first = db.getMsgHdrForKey(keys[0]);
+  const second = db.getMsgHdrForKey(keys[1]);
+  Assert.strictEqual(db.getMsgHdrForKey(keys[0]), first);
+  Assert.strictEqual(db.getMsgHdrForMessageID(first.messageId), first);
+  const third = db.getMsgHdrForKey(keys[2]);
+  const freshFirst = db.getMsgHdrForKey(keys[0]);
+  Assert.notStrictEqual(freshFirst, first);
+  Assert.strictEqual(db.getMsgHdrForKey(keys[2]), third);
+  db.resetHdrCacheSize(2);
+  Assert.equal(db.msgHdrCacheSize, 1, "Reset never increases the threshold");
+  Assert.strictEqual(db.getMsgHdrForKey(keys[0]), freshFirst);
+  db.resetHdrCacheSize(0);
+  Assert.equal(db.msgHdrCacheSize, 0);
+  const one = db.getMsgHdrForKey(keys[0]);
+  Assert.notStrictEqual(one, freshFirst);
+  Assert.strictEqual(db.getMsgHdrForKey(keys[0]), one);
+  db.getMsgHdrForKey(keys[1]);
+  Assert.notStrictEqual(db.getMsgHdrForKey(keys[0]), one);
+  db.msgHdrCacheSize = 0xffffffff;
+  Assert.equal(db.msgHdrCacheSize, 0xffffffff);
+  const beforeClear = db.getMsgHdrForKey(keys[0]);
+  const enumerator = db.enumerateMessages();
+  Assert.ok(enumerator.hasMoreElements());
+  db.clearCachedHdrs();
+  Assert.notStrictEqual(db.getMsgHdrForKey(keys[0]), beforeClear);
+  Assert.equal(first.messageKey, keys[0]);
+  Assert.equal(first.subject, "subject");
+  first.subject = "External view remains live";
+  Assert.equal(db.getMsgHdrForKey(keys[0]).subject, first.subject);
+  Assert.equal(second.messageKey, keys[1]);
+  Assert.strictEqual(otherDB.getMsgHdrForKey(otherKey), bystander);
+  const enumerated = enumerator.getNext();
+  Assert.strictEqual(db.getMsgHdrForKey(enumerated.messageKey), enumerated);
+  Assert.deepEqual(db.listAllKeys(), keys);
+  db.lastUseTime = 1;
+  db.getMsgHdrForKey(keys[0]);
+  Assert.greater(db.lastUseTime, 1);
+});
+
+add_task(function test_cachedHeadersRequirePhysicalMembershipAndSource() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("header-cache-admission");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("header-cache-foreign");
+  const key = addMessage({ folderId: folder.id });
+  const db = folder.msgDatabase;
+  const header = db.getMsgHdrForKey(key);
+  const otherDB = other.msgDatabase;
+  otherDB.refreshCache(other.URI, [key]);
+  const hit = otherDB.getCachedHits(other.URI).getNext();
+  Assert.strictEqual(hit.folder, folder);
+  Assert.throws(() => otherDB.getMsgHdrForKey(key), /NS_ERROR_ILLEGAL_VALUE/);
+  const connection = database.connectionForTests;
+  const source = database.sourceId;
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    Assert.throws(() => db.getMsgHdrForKey(key), /NS_ERROR_NOT_AVAILABLE/);
+  } finally {
+    update.params.source = source;
+    update.execute();
+    update.finalize();
+  }
+  Assert.strictEqual(db.getMsgHdrForKey(key), header);
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO unavailable_header_cache_messages"
+  );
+  try {
+    Assert.throws(
+      () => db.getMsgHdrForKey(key),
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_header_cache_messages RENAME TO messages"
+    );
+  }
+  Assert.strictEqual(db.getMsgHdrForKey(key), header);
+  Assert.strictEqual(header.folder, folder);
+  db.deleteMessage(key, null, true);
+  Assert.throws(() => db.getMsgHdrForKey(key), /NS_ERROR_ILLEGAL_VALUE/);
+  db.clearCachedHdrs();
+  Assert.strictEqual(header.folder, folder);
+  Assert.ok(!db.containsKey(key));
+});
+
+add_task(function test_headerCacheKeepsCallerTransactionAndCloseScope() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("header-cache-lifetime");
+  const key = addMessage({ folderId: folder.id });
+  const db = folder.msgDatabase;
+  const header = db.getMsgHdrForKey(key);
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    db.clearCachedHdrs();
+    db.msgHdrCacheSize = 4;
+    db.resetHdrCacheSize(2);
+    Assert.equal(db.msgHdrCacheSize, 2);
+    Assert.ok(connection.transactionInProgress);
+    Assert.equal(db.getMsgHdrForKey(key).messageKey, key);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  db.forceClosed();
+  Assert.throws(() => db.getMsgHdrForKey(key), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.strictEqual(header.folder, folder);
+  Assert.equal(header.subject, "subject");
+  db.clearCachedHdrs();
+  db.resetHdrCacheSize(0);
+  Assert.equal(db.msgHdrCacheSize, 0);
+  Assert.ok(!connection.transactionInProgress);
+  const current = database
+    .QueryInterface(Ci.nsIMsgDBService)
+    .openFolderDB(folder, false);
+  Assert.equal(current.msgHdrCacheSize, 512);
+  Assert.notStrictEqual(current.getMsgHdrForKey(key), header);
+  Assert.equal(current.getMsgHdrForKey(key).messageKey, key);
+});

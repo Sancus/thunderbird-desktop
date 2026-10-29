@@ -216,6 +216,96 @@ add_task(async function test_physicalMetadataAndSnippet() {
   Assert.equal(result.snippet.text.substring(range.start, range.end), "café");
 });
 
+add_task(async function test_resultMailboxesUseCurrentAddressBookNames() {
+  const book = MailServices.ab.getDirectory("jsaddrbook://abook.sqlite");
+  const cards = [];
+  try {
+    for (const [email, name] of [
+      ["sender@example.invalid", "Catalog Sender"],
+      ["recipient@example.invalid", "Catalog Recipient"],
+      ["carbon@example.invalid", "Catalog Carbon"],
+      ["blind@example.invalid", "Catalog Blind"],
+    ]) {
+      const card = Cc["@mozilla.org/addressbook/cardproperty;1"].createInstance(
+        Ci.nsIAbCard
+      );
+      card.primaryEmail = email;
+      card.displayName = name;
+      cards.push(book.addCard(card));
+    }
+    const { first, selected, firstHit, selectedHit } = await resultCopies(
+      "namedphysicalresult"
+    );
+    const expectedIds = [
+      String(first.messageKey),
+      String(selected.messageKey),
+    ].sort();
+    const result = await readMailSearchResult(service, selectedHit);
+    for (const [role, email, name] of [
+      ["from", "sender@example.invalid", "Catalog Sender"],
+      ["to", "recipient@example.invalid", "Catalog Recipient"],
+      ["cc", "carbon@example.invalid", "Catalog Carbon"],
+      ["bcc", "blind@example.invalid", "Catalog Blind"],
+    ]) {
+      Assert.deepEqual(result[role], [{ name, email }]);
+    }
+    Assert.equal(result.id, String(selected.messageKey));
+    Assert.deepEqual(result.location, {
+      folderId: selected.folder.id,
+      messageKey: selected.messageKey,
+    });
+    Assert.equal(
+      (await readMailSearchResult(service, firstHit)).id,
+      String(first.messageKey),
+      "A shared contact name does not collapse physical copies"
+    );
+    cards[0].displayName = "Renamed Catalog Sender";
+    book.modifyCard(cards[0]);
+    Assert.equal(
+      await readMailSearchResult(service, selectedHit),
+      null,
+      "A card edit invalidates the old text token"
+    );
+    await drainResultWork();
+    const renamedPage = await service.search("namedphysicalresult cafe");
+    Assert.deepEqual(renamedPage.items.map(hit => hit.id).sort(), expectedIds);
+    const renamedHit = renamedPage.items.find(
+      hit => hit.id == String(selected.messageKey)
+    );
+    Assert.deepEqual(
+      (await readMailSearchResult(service, renamedHit)).from,
+      [{ name: "Renamed Catalog Sender", email: "sender@example.invalid" }],
+      "The current projection uses the edited card"
+    );
+    book.deleteCards(cards);
+    cards.length = 0;
+    Assert.equal(
+      await readMailSearchResult(service, renamedHit),
+      null,
+      "Card deletion also rejects the old text token"
+    );
+    await drainResultWork();
+    const restoredPage = await service.search("namedphysicalresult cafe");
+    Assert.deepEqual(restoredPage.items.map(hit => hit.id).sort(), expectedIds);
+    const restoredHit = restoredPage.items.find(
+      hit => hit.id == String(selected.messageKey)
+    );
+    const restored = await readMailSearchResult(service, restoredHit);
+    for (const [role, email, name] of [
+      ["from", "sender@example.invalid", "Sender"],
+      ["to", "recipient@example.invalid", "Recipient"],
+      ["cc", "carbon@example.invalid", "Carbon"],
+      ["bcc", "blind@example.invalid", "Blind"],
+    ]) {
+      Assert.deepEqual(restored[role], [{ name, email }]);
+    }
+  } finally {
+    if (cards.length) {
+      book.deleteCards(cards);
+    }
+  }
+});
+
 add_task(async function test_nativeChangeBetweenTextAndMetadataRejects() {
   const { first, selected, firstHit, selectedHit } =
     await resultCopies("changedresult");

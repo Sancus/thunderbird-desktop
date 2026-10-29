@@ -10,7 +10,7 @@ import { getSearchBodySnippet } from "resource:///modules/panorama/SearchOffsets
 
 /**
  * @typedef {object} SearchMailbox
- * @property {string} name - Decoded header display name.
+ * @property {string} name - Current address-book name or decoded header name.
  * @property {string} email - Mailbox address with its original case.
  */
 
@@ -43,7 +43,7 @@ import { getSearchBodySnippet } from "resource:///modules/panorama/SearchOffsets
  */
 
 /**
- * Copies decoded mailbox values without changing case or collapsing addresses.
+ * Copies current display names without changing case or collapsing addresses.
  *
  * @param {string} value - Encoded native address header.
  * @returns {SearchMailbox[]} Mailboxes in header order.
@@ -52,7 +52,12 @@ function mailboxes(value) {
   return MailServices.headerParser
     .parseEncodedHeaderW(value)
     .filter(address => address.email)
-    .map(address => ({ name: address.name, email: address.email }));
+    .map(address => ({
+      name:
+        MailServices.ab.cardForEmailAddress(address.email)?.displayName ||
+        address.name,
+      email: address.email,
+    }));
 }
 
 /**

@@ -171,6 +171,7 @@ export async function importMorkFolderSnapshot(core, folder, source) {
   ) {
     throw new Error("Native Panorama migration backend is required");
   }
+  // Read stored flags without opening and closing the live folder database.
   const request = convertMorkFolderSnapshot(
     await readMorkFolderImport(
       folder,
@@ -179,7 +180,7 @@ export async function importMorkFolderSnapshot(core, folder, source) {
     ),
     source,
     database.sourceId,
-    folder.flags
+    database.folderDB.getFolderFlags(folder.id)
   );
   let receipt = database.getFolderImportReceipt(folder, request);
   if (receipt === null) {

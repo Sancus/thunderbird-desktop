@@ -286,7 +286,7 @@ add_task(
     const count = changes();
     const flags = [...bindings.values()].map(({ folder }) => [
       folder.id,
-      folder.flags,
+      folderDB.getFolderFlags(folder.id),
     ]);
     const snapshot = await prepareMorkFolderCacheImport(
       input.journal,
@@ -343,7 +343,10 @@ add_task(
       { name: "folderSize", text: "ffffffffffffffff", integer: -1 }
     );
     Assert.deepEqual(
-      [...bindings.values()].map(({ folder }) => [folder.id, folder.flags]),
+      [...bindings.values()].map(({ folder }) => [
+        folder.id,
+        folderDB.getFolderFlags(folder.id),
+      ]),
       flags
     );
     Assert.equal(

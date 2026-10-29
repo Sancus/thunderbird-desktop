@@ -586,7 +586,7 @@ export function createPanoramaMigrationTarget(
         await readMorkFolderImport(folder, token),
         source,
         databaseSourceId,
-        folder.flags
+        database.folderDB.getFolderFlags(folder.id)
       );
       checkPaths(folder, source, request);
       checkIdentity();

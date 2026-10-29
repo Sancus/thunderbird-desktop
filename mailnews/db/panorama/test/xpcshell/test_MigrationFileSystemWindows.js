@@ -10,7 +10,7 @@ const { AppConstants } = ChromeUtils.importESModule(
 const { FileUtils } = ChromeUtils.importESModule(
   "resource://gre/modules/FileUtils.sys.mjs"
 );
-const windowsOnly = { skip_if: () => AppConstants.platform != "win" };
+const windowsOnly = () => ({ skip_if: () => AppConstants.platform != "win" });
 let fs;
 let work;
 let original;
@@ -50,7 +50,7 @@ function admit(path, kind) {
 }
 
 add_task(
-  windowsOnly,
+  windowsOnly(),
   async function test_nativeAdmissionDoesNotStartOrMutateDatabase() {
     const lease = admit(original, fs.KIND_FILE);
     try {
@@ -94,7 +94,7 @@ add_task(
   }
 );
 
-add_task(windowsOnly, function test_closedLeaseMetadataAndValidationRefuse() {
+add_task(windowsOnly(), function test_closedLeaseMetadataAndValidationRefuse() {
   const lease = admit(original, fs.KIND_FILE);
   lease.close();
   lease.close();
@@ -119,7 +119,7 @@ add_task(windowsOnly, function test_closedLeaseMetadataAndValidationRefuse() {
   );
 });
 
-add_task(windowsOnly, function test_fakeAndForeignLeaseObjectsRefuse() {
+add_task(windowsOnly(), function test_fakeAndForeignLeaseObjectsRefuse() {
   const fake = {
     QueryInterface: ChromeUtils.generateQI(["nsISupports"]),
     canonicalPath: original,
@@ -141,7 +141,7 @@ add_task(windowsOnly, function test_fakeAndForeignLeaseObjectsRefuse() {
   );
 });
 
-add_task(windowsOnly, function test_originalFileObjectsAreCloned() {
+add_task(windowsOnly(), function test_originalFileObjectsAreCloned() {
   const file = new FileUtils.File(original);
   const root = new FileUtils.File(work);
   const lease = fs.admit(file, root, fs.KIND_FILE);
@@ -157,7 +157,7 @@ add_task(windowsOnly, function test_originalFileObjectsAreCloned() {
 });
 
 add_task(
-  windowsOnly,
+  windowsOnly(),
   async function test_absentOutputNeedsExclusiveCreateAndNewLease() {
     const output = PathUtils.join(work, "owned-output.bin");
     const missing = admit(output, fs.KIND_FILE_OR_MISSING);
@@ -193,7 +193,7 @@ add_task(
   }
 );
 
-add_task(windowsOnly, function test_invalidModeAndWrongNativeKindRefuse() {
+add_task(windowsOnly(), function test_invalidModeAndWrongNativeKindRefuse() {
   Assert.throws(
     () => admit(original, 99),
     error => error.result == Cr.NS_ERROR_INVALID_ARG
@@ -298,7 +298,7 @@ async function closedProfileSource() {
 }
 
 add_task(
-  windowsOnly,
+  windowsOnly(),
   async function test_backupVersion3AndJournalVersion4RetainOriginalIDs() {
     const input = await closedProfileSource();
     const manifest = await IOUtils.readJSON(input.backup.path);
@@ -393,7 +393,7 @@ add_task(
 );
 
 add_task(
-  windowsOnly,
+  windowsOnly(),
   async function test_identicalReplacementCannotResumeOriginalUnit() {
     const input = await closedProfileSource();
     const retained = input.summary + ".original";
@@ -424,7 +424,7 @@ add_task(
 );
 
 add_task(
-  windowsOnly,
+  windowsOnly(),
   async function test_windowsRestoreCopiesOnlyIntoFreshOwnedStage() {
     const input = await closedProfileSource();
     const { stageMigrationRestore, verifyMigrationBackup } =

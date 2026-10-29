@@ -227,7 +227,7 @@ async function request(input) {
     await readMorkFolderImport(input.folder, source.token),
     source,
     database.sourceId,
-    input.folder.flags
+    folderDB.getFolderFlags(input.folder.id)
   );
 }
 

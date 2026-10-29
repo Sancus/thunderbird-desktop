@@ -92,6 +92,8 @@ class FolderDatabase : public nsIFolderDatabase {
   nsresult DeleteFolderTree(uint64_t folderId, bool root,
                             const nsACString& serverKey);
 
+  nsresult RequireCommittedOrderMutation();
+
   nsresult SaveOrdinals(nsTArray<uint64_t> const& aFolders);
 
   nsresult InternalAppendDescendants(uint64_t folderId,

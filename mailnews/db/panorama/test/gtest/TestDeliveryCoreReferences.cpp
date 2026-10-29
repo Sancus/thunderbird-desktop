@@ -819,6 +819,55 @@ class DeliveryCoreReferences : public testing::Test {
     return stmt->Execute();
   }
 
+  void CheckSiblingOrder(uint64_t parent, const nsTArray<uint64_t> &expected,
+                         bool assigned = true) {
+    auto actual = mCore->FolderDB().GetFolderChildren(parent);
+    ASSERT_TRUE(actual.isOk());
+    EXPECT_EQ(expected, actual.unwrap());
+    for (uint32_t i = 0; i < expected.Length(); ++i) {
+      auto ordinal = mCore->FolderDB().GetFolderOrdinal(expected[i]);
+      ASSERT_TRUE(ordinal.isOk());
+      if (assigned) {
+        EXPECT_EQ(Some(uint64_t(i + 1)), ordinal.unwrap());
+      } else {
+        EXPECT_FALSE(ordinal.unwrap());
+      }
+    }
+    // The second connection checks persisted rows independently of the cache.
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    auto close = MakeScopeExit([&] {
+      if (stmt)
+        EXPECT_EQ(NS_OK, stmt->Finalize());
+      EXPECT_EQ(NS_OK, reader->Close());
+    });
+    ASSERT_EQ(NS_OK, reader->CreateStatement(
+                         "SELECT id,ordinal FROM folders WHERE parent=:parent "
+                         "ORDER BY ordinal,name"_ns,
+                         getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("parent"_ns, parent));
+    for (uint32_t i = 0; i < expected.Length(); ++i) {
+      bool more;
+      ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+      ASSERT_TRUE(more);
+      int64_t id;
+      ASSERT_EQ(NS_OK, stmt->GetInt64(0, &id));
+      EXPECT_EQ(expected[i], uint64_t(id));
+      bool absent;
+      ASSERT_EQ(NS_OK, stmt->GetIsNull(1, &absent));
+      EXPECT_EQ(!assigned, absent);
+      if (assigned) {
+        int64_t ordinal;
+        ASSERT_EQ(NS_OK, stmt->GetInt64(1, &ordinal));
+        EXPECT_EQ(int64_t(i + 1), ordinal);
+      }
+    }
+    bool more;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    EXPECT_FALSE(more);
+  }
+
   nsresult Add(const nsACString& messageId,
                const nsTArray<nsCString>& references, nsMsgKey& key) {
     return mCore->MessageDB().AddMessage(
@@ -7536,6 +7585,144 @@ TEST_F(DeliveryCoreReferences, PartialCompletionRejectsStaleAndNonPartialRows) {
   EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
             db.CompletePartialMessage(expected, parsed, finished, output));
   EXPECT_EQ(123u, output.key);
+}
+
+TEST_F(DeliveryCoreReferences, SiblingOrderWriteFailureRollsBackSqlAndCache) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  uint64_t a, b, c;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Charlie"_ns, &c));
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(mFolderId, c, a));
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {c, a, b}));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK, mConnection->CreateFunction("ordinal_fault"_ns, 1, witness));
+  nsAutoCString sql(
+      "CREATE TEMP TRIGGER reject_ordinal BEFORE UPDATE OF ordinal "
+      "ON folders WHEN OLD.id=");
+  sql.AppendInt(c);
+  sql.AppendLiteral(" AND NEW.ordinal=2 BEGIN SELECT ordinal_fault(OLD.id); "
+                    "SELECT RAISE(ABORT,'second ordinal failure'); END");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_ordinal"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            folders.MoveFolderWithin(mFolderId, a, c));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(int64_t(c), witness->mLastKey);
+  bool active = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {c, a, b}));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER reject_ordinal"_ns));
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(mFolderId, a, c));
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {a, c, b}));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {a, c, b}));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().ResetChildOrder(mFolderId));
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {a, b, c}, false));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {a, b, c}, false));
+}
+
+TEST_F(DeliveryCoreReferences, SiblingOrderCommitFailureKeepsSqlAndCache) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  uint64_t a, b, c;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Charlie"_ns, &c));
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(mFolderId, c, a));
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {c, a, b}));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "PRAGMA foreign_keys=ON; "
+                "CREATE TEMP TABLE ordinal_parent(id INTEGER PRIMARY KEY); "
+                "CREATE TEMP TABLE ordinal_child(id INTEGER REFERENCES "
+                "ordinal_parent(id) "
+                "DEFERRABLE INITIALLY DEFERRED)"_ns));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("ordinal_commit_fault"_ns, 1, witness));
+  nsAutoCString sql("CREATE TEMP TRIGGER reject_ordinal_commit "
+                    "AFTER UPDATE OF ordinal ON main.folders WHEN OLD.id=");
+  sql.AppendInt(c);
+  sql.AppendLiteral(
+      " AND NEW.ordinal=2 BEGIN SELECT ordinal_commit_fault(OLD.id); "
+      "INSERT INTO ordinal_child VALUES(OLD.id); END");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_ordinal_commit"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            folders.MoveFolderWithin(mFolderId, a, c));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(int64_t(c), witness->mLastKey);
+  bool active = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {c, a, b}));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_ordinal_commit"_ns));
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(mFolderId, a, c));
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {a, c, b}));
+}
+
+TEST_F(DeliveryCoreReferences, SiblingOrderRefusesForeignTransaction) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  uint64_t a, b, c;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Charlie"_ns, &c));
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(mFolderId, c, a));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 73));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.MoveFolderWithin(mFolderId, a, c));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.ResetChildOrder(mFolderId));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t metric = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(73, metric);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {c, a, b}));
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(0, metric);
+}
+
+TEST_F(DeliveryCoreReferences, SiblingOrderRejectsRetiredFolderDatabase) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  uint64_t a, b, c;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Charlie"_ns, &c));
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(mFolderId, c, a));
+  RefPtr<FolderDatabase> retired = &folders;
+  Stop();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->MoveFolderWithin(mFolderId, a, c));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->ResetChildOrder(mFolderId));
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->MoveFolderWithin(mFolderId, a, c));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->ResetChildOrder(mFolderId));
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {c, a, b}));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().MoveFolderWithin(mFolderId, a, c));
+  ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(mFolderId, {a, c, b}));
 }
 
 TEST_F(DeliveryCoreReferences, FolderRemovalAccountsWideLocalBytesBeforeEvent) {

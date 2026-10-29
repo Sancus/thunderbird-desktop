@@ -312,6 +312,7 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
 NS_IMETHODIMP
 FolderDatabase::MoveFolderWithin(uint64_t parentId, uint64_t childId,
                                  uint64_t beforeId) {
+  MOZ_TRY(RequireCommittedOrderMutation());
   nsTArray<uint64_t> children = MOZ_TRY(GetFolderChildren(parentId));
 
   // Remove the folder we're moving around.
@@ -340,29 +341,65 @@ FolderDatabase::MoveFolderWithin(uint64_t parentId, uint64_t childId,
   return NS_OK;
 }
 
+nsresult FolderDatabase::RequireCommittedOrderMutation() {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mFolderDatabase.get() == this,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  return active ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
 // Each folder is assigned an incrementing ordinal value in the order
 // given, starting at 1.
 nsresult FolderDatabase::SaveOrdinals(nsTArray<uint64_t> const& folderIds) {
-  nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "UpdateOrdinals"_ns,
-      "UPDATE folders SET ordinal = :ordinal WHERE id = :id"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "UpdateOrdinals"_ns,
+        "UPDATE folders SET ordinal = :ordinal WHERE id = :id RETURNING id"_ns,
+        getter_AddRefs(stmt)));
+    uint64_t ordinal = 1;
+    for (auto folderId : folderIds) {
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("ordinal"_ns, ordinal++));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+      int64_t storedId;
+      MOZ_TRY(stmt->GetInt64(0, &storedId));
+      NS_ENSURE_TRUE(uint64_t(storedId) == folderId, NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    bool active;
+    nsresult cleanup = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanup) && active) {
+      cleanup = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanup)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Folder ordinal rollback failed: 0x%08x",
+               static_cast<uint32_t>(cleanup)));
+    }
+    return rv;
+  }
 
+  // Install the complete order only after every SQL row and COMMIT succeeds.
+  // Existing entries need no allocation and absent entries stay cold.
   uint64_t ordinal = 1;
   for (auto folderId : folderIds) {
-    stmt->BindInt64ByName("ordinal"_ns, ordinal);
-    stmt->BindInt64ByName("id"_ns, folderId);
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
-
-    // Update cache.
     auto p = mFolderCache.lookup(folderId);
     if (p) {
       p->value().ordinal = Some(ordinal);
     }
-    ordinal++;
+    ++ordinal;
   }
   return NS_OK;
 }
@@ -370,6 +407,7 @@ nsresult FolderDatabase::SaveOrdinals(nsTArray<uint64_t> const& folderIds) {
 // Null out the ordinal field for every child of this parent.
 NS_IMETHODIMP
 FolderDatabase::ResetChildOrder(uint64_t parentId) {
+  MOZ_TRY(RequireCommittedOrderMutation());
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "ResetOrdinals"_ns,
@@ -378,7 +416,7 @@ FolderDatabase::ResetChildOrder(uint64_t parentId) {
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("parent"_ns, parentId);
+  MOZ_TRY(stmt->BindInt64ByName("parent"_ns, parentId));
   rv = stmt->Execute();
   NS_ENSURE_SUCCESS(rv, rv);
 

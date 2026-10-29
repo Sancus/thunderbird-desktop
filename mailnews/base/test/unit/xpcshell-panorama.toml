@@ -7,3 +7,12 @@ prefs = [
 tags = ["panorama"]
 
 ["include:xpcshell-shared.toml"]
+["test_moveCopyFoldersAcrossServers.js"]
+prefs = [
+  "experimental.mail.ews.overrideOAuth.enabled=true",
+  "mail.biff.use_new_count_in_badge=false",
+  "mailnews.oauth.loglevel=Debug",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+tags = ["mbox"]

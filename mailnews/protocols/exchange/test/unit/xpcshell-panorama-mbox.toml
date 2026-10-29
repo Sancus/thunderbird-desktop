@@ -1,0 +1,15 @@
+[DEFAULT]
+head = "head.js"
+support-files = ["data/*"]
+dupe-manifest = true
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+tags = ["panorama", "mbox"]
+
+["test_ewsAttachmentSaves.js"]
+
+["test_item_operations.js"]
+prefs = ["mail.graph.enabled=true"]

@@ -8,6 +8,7 @@ XPCSHELL_TESTS_MANIFESTS += [
 
 if CONFIG["MOZ_PANORAMA"]:
     XPCSHELL_TESTS_MANIFESTS += [
+        "unit/xpcshell-panorama-maildir.toml",
         "unit/xpcshell-panorama.toml"
     ]
 

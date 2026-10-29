@@ -4,6 +4,12 @@
 
 XPCSHELL_TESTS_MANIFESTS += ["unit/xpcshell.toml"]
 
+if CONFIG["MOZ_PANORAMA"]:
+    XPCSHELL_TESTS_MANIFESTS += [
+        "unit/xpcshell-panorama-maildir.toml",
+        "unit/xpcshell-panorama-mbox.toml",
+    ]
+
 BROWSER_CHROME_MANIFESTS += [
     "browser/browser.toml",
 ]

@@ -8,6 +8,7 @@
 #  include "mozilla/Try.h"
 #  include "nsIFile.h"
 #  include "nsReadableUtils.h"
+#  include "nsUnicharUtils.h"
 #  include <utility>
 #  include <windows.h>
 

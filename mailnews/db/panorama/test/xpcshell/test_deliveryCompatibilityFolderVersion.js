@@ -64,14 +64,14 @@ add_task(function test_versionStaysInItsPhysicalFolder() {
   const secondURI = second.URI;
   const firstInfo = first.msgDatabase.dBFolderInfo;
   const secondInfo = second.msgDatabase.dBFolderInfo;
-  firstInfo.highWater = 41;
-  secondInfo.highWater = 73;
+  firstInfo.setCharProperty("isolation-control", "first");
+  secondInfo.setCharProperty("isolation-control", "second");
   firstInfo.version = 12;
   secondInfo.version = 23;
   Assert.equal(first.msgDatabase.dBFolderInfo.version, 12);
   Assert.equal(second.msgDatabase.dBFolderInfo.version, 23);
-  Assert.equal(firstInfo.highWater, 41);
-  Assert.equal(secondInfo.highWater, 73);
+  Assert.equal(firstInfo.getCharProperty("isolation-control"), "first");
+  Assert.equal(secondInfo.getCharProperty("isolation-control"), "second");
   Assert.equal(first.URI, firstURI);
   Assert.equal(second.URI, secondURI);
   Assert.equal(firstInfo.folderName, "version-first");

@@ -7,6 +7,8 @@ prefs = [
   "mail.accountmanager.accounts=account2,account1",
   "mail.accountmanager.defaultaccount=account2",
   "mail.accountmanager.localfoldersserver=server1",
+  # New-mail fixtures do not exercise desktop alerts.
+  "mail.biff.show_alert=false",
   "mail.identity.id1.draft_folder=mailbox://nobody@Local%20Folders/Drafts",
   "mail.identity.id1.fcc_folder=mailbox://nobody@Local%20Folders/Sent",
   "mail.identity.id1.fullName=Tinderbox",

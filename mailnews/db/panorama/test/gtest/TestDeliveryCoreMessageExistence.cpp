@@ -308,7 +308,7 @@ class DeliveryCoreMessageExistence : public testing::Test {
     EXPECT_EQ(PRTime(123456), date);
     uint32_t flags = 0;
     EXPECT_EQ(NS_OK, header->GetFlags(&flags));
-    EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked, flags);
+    EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked), flags);
     nsMsgPriorityValue priority = 0;
     EXPECT_EQ(NS_OK, header->GetPriority(&priority));
     EXPECT_EQ(5, priority);
@@ -666,7 +666,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
       new MessageExistenceRemovedObserver(
           [&](Message* message, uint32_t oldFlags) {
             ++callbacks;
-            EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked,
+            EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked),
                       oldFlags);
             retained = message;
             CheckRemovedState(message, removed, survivor, thread);
@@ -979,7 +979,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
       new MessageExistenceRemovedObserver([&](Message* message,
                                               uint32_t oldFlags) {
         ++callbacks;
-        EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked,
+        EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked),
                   oldFlags);
         bool exists = true;
         EXPECT_EQ(NS_OK, mCore->MessageDB().MessageExists(removed, exists));

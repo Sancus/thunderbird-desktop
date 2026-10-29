@@ -73,8 +73,8 @@ TEST(LocalCopyHeaders, LogicalKeywordsAndStorageExclusions)
   EXPECT_EQ("destination-token"_ns, value);
   uint32_t flags;
   ASSERT_EQ(NS_OK, destination->GetFlags(&flags));
-  EXPECT_EQ(nsMsgMessageFlags::Marked | nsMsgMessageFlags::Read |
-                nsMsgMessageFlags::HasRe,
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::Marked | nsMsgMessageFlags::Read |
+                     nsMsgMessageFlags::HasRe),
             flags);
 }
 

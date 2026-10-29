@@ -1387,7 +1387,8 @@ TEST_F(DISABLED_DeliveryHeaderAncestry, StagedOwnFlagsStayUnpublished) {
   Maybe<CapturedMessage> state;
   ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(key, state));
   ASSERT_TRUE(state);
-  EXPECT_EQ(nsMsgMessageFlags::Ignored | nsMsgMessageFlags::Read, state->flags);
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::Ignored | nsMsgMessageFlags::Read),
+            state->flags);
   EXPECT_EQ(mFolder, state->folderId);
   bool published = true;
   ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, published));

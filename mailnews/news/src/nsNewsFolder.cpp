@@ -270,9 +270,9 @@ nsresult nsMsgNewsFolder::GetDatabase() {
     bool readSetAttempted = false;
     auto cleanup = mozilla::MakeScopeExit([&] {
       if (listenerAdded) {
-        nsresult cleanupRv = database->RemoveListener(this);
-        NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
-                             "Failed to detach news database listener");
+        if (NS_FAILED(database->RemoveListener(this))) {
+          NS_WARNING("Failed to detach news database listener");
+        }
       }
       if (readSetAttempted) {
         nsMsgKeySet* currentSet = nullptr;

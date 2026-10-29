@@ -91,7 +91,7 @@ class VirtualFolderFilter final : public LiveViewFilter {
     Refresh();
   }
 
-  void Refresh();
+  void Refresh() override;
 
   bool Matches(nsIMsgDBHdr*, uint64_t folderId) override {
     if (folderId == 0) {

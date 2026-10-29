@@ -31,6 +31,7 @@
 #include "nsLocalFile.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgDatabase.h"
+#include "nsIMsgOfflineImapOperation.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
 #include "nsComponentManagerUtils.h"
@@ -5990,11 +5991,11 @@ TEST_F(DeliveryCoreReferences,
     }
     if (kind == 'B') {
       EXPECT_EQ(nsMsgMessageFlags::Read, before.flags);
-      EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline,
+      EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline),
                 after.flags);
     }
     if (kind == 'R') {
-      EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline,
+      EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline),
                 before.flags);
     }
   };

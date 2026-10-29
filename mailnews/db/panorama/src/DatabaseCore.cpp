@@ -141,8 +141,9 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
   mOpenDatabases.Clear();
   mOpenDatabasesByFile.Clear();
   for (const auto& database : databases) {
-    nsresult rv = database->ForceClosed();
-    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "Failed to close folder database");
+    if (NS_FAILED(database->ForceClosed())) {
+      NS_WARNING("Failed to close folder database");
+    }
   }
 
   for (auto iter = sStatements.Iter(); !iter.Done(); iter.Next()) {
@@ -209,10 +210,9 @@ nsresult DatabaseCore::EnsureConnection() {
       sConnection = nullptr;
       if (!exists && !schemaCommitted && cleanupSucceeded &&
           NS_SUCCEEDED(closeRv)) {
-        nsresult removeRv = databaseFile->Remove(false);
-        NS_WARNING_ASSERTION(
-            NS_SUCCEEDED(removeRv),
-            "Failed to remove a newly created, rolled-back database");
+        if (NS_FAILED(databaseFile->Remove(false))) {
+          NS_WARNING("Failed to remove a newly created, rolled-back database");
+        }
       }
     }
   });
@@ -3072,7 +3072,9 @@ nsresult CheckImportHeader(const ImportSourceRecord& row, const RawHdr& header,
   }
   auto text = [&](const nsACString& name) {
     nsCString value;
-    row.cells.Get(name, &value);
+    if (!row.cells.Get(name, &value)) {
+      value.Truncate();
+    }
     return value;
   };
   nsCString messageId = text("message-id"_ns);
@@ -3107,7 +3109,7 @@ nsresult CheckImportHeader(const ImportSourceRecord& row, const RawHdr& header,
       header.flags == (flags & ~nsMsgMessageFlags::New) &&
           header.date == PRTime(date) * PR_USEC_PER_SEC &&
           header.dateReceived == PRTime(received) * PR_USEC_PER_SEC &&
-          header.priority == priority,
+          uint32_t(header.priority) == priority,
       NS_ERROR_INVALID_ARG);
   for (auto pair : {std::pair{"size", &header.messageSize},
                     {"offlineMsgSize", &header.offlineMessageSize},
@@ -3410,7 +3412,9 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::HandleObject request,
     auto* subject = find(subjectKey);
     auto* rootRow = find(ImportSourceKey(root, messageScope));
     nsCString rawSubject, threadSubject;
-    rootRow->cells.Get("subject"_ns, &rawSubject);
+    if (!rootRow->cells.Get("subject"_ns, &rawSubject)) {
+      rawSubject.Truncate();
+    }
     NS_ENSURE_TRUE(subject && !subject->accounted &&
                        subject->cells.Count() == 1 &&
                        subject->cells.Get("threadSubject"_ns, &threadSubject) &&

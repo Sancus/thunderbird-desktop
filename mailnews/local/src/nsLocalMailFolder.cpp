@@ -1356,8 +1356,9 @@ nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
       moveCopySucceeded = false;
     }
     if (!moveCopySucceeded) {
-      nsresult discardRv = DiscardCopyMessage();
-      NS_WARNING_ASSERTION(NS_SUCCEEDED(discardRv), "copy discard failed");
+      if (NS_FAILED(DiscardCopyMessage())) {
+        NS_WARNING("copy discard failed");
+      }
     }
   }
 #endif
@@ -2624,8 +2625,9 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
         mCopyState->m_copyError = NS_ERROR_FAILURE;
       }
       mCopyState->m_writeFailed = true;
-      nsresult discardRv = DiscardCopyMessage();
-      NS_WARNING_ASSERTION(NS_SUCCEEDED(discardRv), "copy discard failed");
+      if (NS_FAILED(DiscardCopyMessage())) {
+        NS_WARNING("copy discard failed");
+      }
     } else
 #endif
         if (mCopyState->m_fileStream) {
@@ -3927,9 +3929,9 @@ nsresult nsMsgLocalMailFolder::AddMessageBatch2(
     NS_ENSURE_SUCCESS(rv, rv);
     rv = SyncWriteAll(outStream, raw.BeginReading(), raw.Length());
     if (NS_FAILED(rv)) {
-      nsresult discardRv = msgStore->DiscardNewMessage(this, outStream);
-      NS_WARNING_ASSERTION(NS_SUCCEEDED(discardRv),
-                           "add message discard failed");
+      if (NS_FAILED(msgStore->DiscardNewMessage(this, outStream))) {
+        NS_WARNING("add message discard failed");
+      }
       return rv;
     }
     nsAutoCString storeToken;

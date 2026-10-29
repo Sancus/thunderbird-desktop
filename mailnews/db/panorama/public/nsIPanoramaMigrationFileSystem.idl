@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsISupports.idl"
+
+interface nsIFile;
+
+/** Retained native admission; metadata reads fail after close. Not writable IO. */
+[scriptable, builtinclass, uuid(7abb067d-4629-4d51-80e9-6ba29b238dbc)]
+interface nsIPanoramaMigrationPath : nsISupports {
+  readonly attribute AString canonicalPath;
+  readonly attribute AString canonicalRoot;
+  /** Full volume/file IDs as exact hexadecimal strings; empty for an absent leaf. */
+  readonly attribute AUTF8String identity;
+  readonly attribute AUTF8String parentIdentity;
+  readonly attribute AUTF8String rootIdentity;
+  /** FILE or DIRECTORY when present; FILE_OR_MISSING only for an absent leaf. */
+  readonly attribute unsigned short kind;
+  readonly attribute boolean exists;
+  readonly attribute boolean closed;
+  /** Releases all retained handles. Repeated close succeeds. */
+  void close();
+};
+
+/** Stateless filesystem admission; never opens a database or creates files. */
+[scriptable, builtinclass, uuid(ab93fcac-15a0-4e7b-b7dd-428605db0418)]
+interface nsIPanoramaMigrationFileSystem : nsISupports {
+  const unsigned short KIND_FILE = 0;
+  const unsigned short KIND_DIRECTORY = 1;
+  const unsigned short KIND_FILE_OR_MISSING = 2;
+
+  /**
+   * Admit original Windows paths before lexical normalization. Retain the result
+   * through the operation, then close. Missing leaves still need exclusive create
+   * and a separate admission of the created file. Requires quiesced writers and
+   * caller-owned stages. Unsupported platforms return NOT_IMPLEMENTED.
+   */
+  nsIPanoramaMigrationPath admit(in nsIFile original, in nsIFile root,
+                                in unsigned short kind);
+  /**
+   * Check this implementation's open native lease against its retained original
+   * paths/physical IDs. Rejects fake/foreign/closed leases, replacement, and a
+   * formerly absent leaf which now exists. Does not rebind or change the lease.
+   */
+  void validate(in nsISupports lease);
+};

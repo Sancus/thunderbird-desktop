@@ -775,3 +775,50 @@ add_task(async function test_persistedNoLogRecordCannotReachTheReader() {
   Assert.ok(hit);
   Assert.deepEqual(await provider.resolveLog(hit), { status: "ineligible" });
 });
+
+add_task(async function test_appendBeforeParsingMakesTheOpeningStale() {
+  const fixture = await openChatFixture("open-before-parse");
+  const { provider, filePath } = fixture;
+  await logText(fixture, "beforeparseneedle", { remoteId: "edited" });
+  await provider.refreshLog(filePath);
+  const [hit] = (await provider.search("beforeparseneedle")).items;
+  const original = logs.getLogFromFile;
+  logs.getLogFromFile = async function (...args) {
+    await logText(fixture, "afterappendneedle", { remoteId: "edited" });
+    return original.apply(this, args);
+  };
+  try {
+    Assert.deepEqual(
+      await provider.resolveLog(hit),
+      { status: "stale" },
+      "An append between source validation and the logger read is a stale hit"
+    );
+  } finally {
+    logs.getLogFromFile = original;
+  }
+  await provider.refreshLog(filePath);
+  const [current] = (await provider.search("afterappendneedle")).items;
+  Assert.equal((await provider.resolveLog(current)).status, "ready");
+});
+
+add_task(async function test_loggerFailureSurvivesAConcurrentAppend() {
+  const fixture = await openChatFixture("open-error-append");
+  const { provider, filePath } = fixture;
+  await logText(fixture, "beforeerrorappend", { remoteId: "edited" });
+  await provider.refreshLog(filePath);
+  const [hit] = (await provider.search("beforeerrorappend")).items;
+  const original = logs.getLogFromFile;
+  const failure = new Error("Original read failed while the source changed");
+  logs.getLogFromFile = async () => {
+    await logText(fixture, "aftererrorappend", { remoteId: "edited" });
+    throw failure;
+  };
+  try {
+    await Assert.rejects(provider.resolveLog(hit), error => error === failure);
+  } finally {
+    logs.getLogFromFile = original;
+  }
+  await provider.refreshLog(filePath);
+  const [current] = (await provider.search("aftererrorappend")).items;
+  Assert.equal((await provider.resolveLog(current)).status, "ready");
+});

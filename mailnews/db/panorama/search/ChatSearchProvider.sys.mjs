@@ -181,6 +181,9 @@ function validateSource(bytes, parts) {
   };
 }
 
+/** The logger parse differs from the previously validated source. */
+class IncompleteChatTranscriptError extends Error {}
+
 /**
  * Uses the existing single-file logger parser only after validating its source.
  * The tolerant display parser must not omit an edit or redaction record.
@@ -210,7 +213,7 @@ async function readLogConversation(filePath, source, signal) {
         message.message != expected.messages[i].text
     )
   ) {
-    throw new Error(
+    throw new IncompleteChatTranscriptError(
       "Chat logger did not return the complete source transcript"
     );
   }
@@ -436,7 +439,8 @@ export class ChatSearchProvider {
    * has an absolute current path; it is not a Gloda relative-path result or a
    * grouped-day log. Readers must use the returned conversation, not reparse
    * the log unchecked. Persisted noLog records prevent opening the file.
-   * No reader is opened and no network content is retrieved.
+   * A change between source validation and parsing returns a non-ready status;
+   * unrelated parser failures still reject. No reader or network is opened.
    *
    * @param {SearchHit} hit - Captured transcript identity and exact revisions.
    * @param {object} [options={}] - Opening resolution controls.
@@ -489,11 +493,36 @@ export class ChatSearchProvider {
       if (source.revision !== request.contentRevision) {
         return { status: "stale" };
       }
-      const { log, conversation, hasNoLogRecords } = await readLogConversation(
-        filePath,
-        source,
-        signal
-      );
+      let parsed;
+      try {
+        parsed = await readLogConversation(filePath, source, signal);
+      } catch (error) {
+        if (!(error instanceof IncompleteChatTranscriptError)) {
+          throw error;
+        }
+        let current;
+        try {
+          current = await this.resolveDocument(request.id, { signal });
+        } catch (readError) {
+          signal?.throwIfAborted();
+          throw new AggregateError(
+            [error, readError],
+            "Could not validate the changed transcript"
+          );
+        }
+        signal?.throwIfAborted();
+        if (!current) {
+          return { status: "deleted" };
+        }
+        if (!current.eligible) {
+          return { status: "ineligible" };
+        }
+        if (current.contentRevision !== request.contentRevision) {
+          return { status: "stale" };
+        }
+        throw error;
+      }
+      const { log, conversation, hasNoLogRecords } = parsed;
       if (hasNoLogRecords) {
         return { status: "ineligible" };
       }

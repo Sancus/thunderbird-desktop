@@ -488,7 +488,18 @@ add_task(async function test_backgroundRetriesAfterTransientReplayFailure() {
   });
   const reports = [];
   const progress = [];
-  service.onError = error => reports.push(error);
+  const activitiesAtFailure = [];
+  const manager = Cc["@mozilla.org/activity-manager;1"].getService(
+    Ci.nsIActivityManager
+  );
+  service.onError = error => {
+    reports.push(error);
+    const [activity] = manager.getProcessesByContext(
+      "panorama-search",
+      "background-test-transient"
+    );
+    activitiesAtFailure.push({ activity, state: activity?.state });
+  };
   service.onProgress = state => progress.push(state);
   service.start();
   await TestUtils.waitForCondition(
@@ -499,6 +510,19 @@ add_task(async function test_backgroundRetriesAfterTransientReplayFailure() {
   Assert.equal(progress[0].acceptedThrough, 0);
   Assert.equal(progress[0].sourceWatermark, 0);
   Assert.equal(progress[0].moreWork, false);
+  Assert.equal(activitiesAtFailure.length, 1);
+  const [{ activity, state }] = activitiesAtFailure;
+  Assert.ok(activity, "A replay failure creates a visible activity");
+  Assert.equal(state, Ci.nsIActivityProcess.STATE_WAITINGFORRETRY);
+  Assert.equal(activity.state, Ci.nsIActivityProcess.STATE_COMPLETED);
+  Assert.equal(
+    manager.getProcessesByContext(
+      "panorama-search",
+      "background-test-transient"
+    ).length,
+    0,
+    "A recovered replay removes its completed activity"
+  );
   await service.close();
 });
 
@@ -679,4 +703,52 @@ add_task(async function test_consecutivePolicyMarkersShareOneScan() {
   Assert.equal(scans, 2, "A deletion between policy events cannot be skipped");
   Assert.deepEqual((await again.search("policyburstneedle")).items, []);
   await again.close();
+});
+
+add_task(async function test_unavailableBackgroundWorkHasAnOwnedActivity() {
+  const { folder, service, sourceId } = await fixture("activity-unavailable");
+  const key = messageDB.addMessage(
+    folder.id,
+    "activity-unavailable@example.invalid",
+    [],
+    123456,
+    "Sender <sender@example.invalid>",
+    "",
+    "",
+    "",
+    "activityunavailableneedle",
+    0,
+    "",
+    Ci.nsMsgPriority.notSet
+  );
+  const manager = Cc["@mozilla.org/activity-manager;1"].getService(
+    Ci.nsIActivityManager
+  );
+  const settled = Promise.withResolvers();
+  service.onError = error => settled.reject(error);
+  service.onProgress = progress => {
+    if (!progress.moreWork && progress.unavailable) {
+      settled.resolve(progress);
+    }
+  };
+  service.start();
+  const progress = await settled.promise;
+  Assert.greaterOrEqual(progress.unavailable, 1);
+  Assert.equal((await service.getText(String(key))).bodyIndexed, false);
+  const activities = manager.getProcessesByContext("panorama-search", sourceId);
+  Assert.equal(activities.length, 1, "Only this writer owns its activity");
+  const [activity] = activities;
+  Assert.equal(activity.state, Ci.nsIActivityProcess.STATE_WAITINGFORRETRY);
+  Assert.equal(
+    activity.percentComplete,
+    -1,
+    "A checkpoint is not a message total"
+  );
+  Assert.ok(activity.lastStatusText, "Retained unavailable work has a status");
+  await service.close();
+  Assert.equal(activity.state, Ci.nsIActivityProcess.STATE_CANCELED);
+  Assert.equal(
+    manager.getProcessesByContext("panorama-search", sourceId).length,
+    0
+  );
 });

@@ -32,6 +32,14 @@ const DISPLAY_NAME_PREF = "mail.displayname.version";
 const MAX_BACKGROUND_RETRIES = 3;
 const BACKGROUND_RETRY_DELAY_MS = 1000;
 
+const lazy = {};
+ChromeUtils.defineLazyGetter(lazy, "activityManager", () =>
+  Cc["@mozilla.org/activity-manager;1"].getService(Ci.nsIActivityManager)
+);
+ChromeUtils.defineLazyGetter(lazy, "activityStrings", () =>
+  Services.strings.createBundle("chrome://messenger/locale/activity.properties")
+);
+
 /**
  * Composes native committed replay, current-state resolution and mail indexing.
  * The caller supplies a durable core incarnation identity. A profile path or
@@ -52,6 +60,8 @@ export class MailSearchService {
   #started = false;
   #closed = false;
   #closePromise;
+  /** @type {?nsIActivityProcess} Activity for this physical source incarnation. */
+  #activity = null;
   #shutdown = () => this.close();
 
   /** @type {?function(object): void} Receives durable background progress. */
@@ -397,6 +407,7 @@ export class MailSearchService {
       this.update()
         .then(progress => {
           this.#retryCount = 0;
+          this.#updateActivity(progress);
           try {
             this.onProgress?.(progress);
           } catch (error) {
@@ -410,6 +421,7 @@ export class MailSearchService {
           if (this.#closed) {
             return;
           }
+          this.#updateActivity(null, true);
           this.#reportError(error);
           if (
             this.#closed ||
@@ -426,6 +438,96 @@ export class MailSearchService {
           }, delay);
         });
     });
+  }
+
+  /**
+   * Reports unfinished native work through the existing Activity Manager.
+   * Source checkpoints are not message totals, so progress is indeterminate.
+   * UI failures do not change accepted indexing work or its original errors.
+   *
+   * @param {?object} progress - Durable background counts, or null on failure.
+   * @param {boolean} [failed=false] - Background replay needs a retry.
+   */
+  #updateActivity(progress, failed = false) {
+    if (this.#closed) {
+      return;
+    }
+    if (
+      !failed &&
+      !progress.moreWork &&
+      !progress.pending &&
+      !progress.unavailable
+    ) {
+      this.#clearActivity(false);
+      return;
+    }
+    try {
+      const states = Ci.nsIActivityProcess;
+      if (!this.#activity) {
+        const process =
+          Cc["@mozilla.org/activity-process;1"].createInstance(states);
+        process.init(
+          lazy.activityStrings.GetStringFromName("indexing"),
+          this.#sourceId
+        );
+        process.iconClass = "indexMail";
+        process.contextType = "panorama-search";
+        process.contextObj = this.#sourceId;
+        lazy.activityManager.addActivity(process);
+        if (this.#closed) {
+          process.state = states.STATE_CANCELED;
+          lazy.activityManager.removeActivity(process.id);
+          return;
+        }
+        this.#activity = process;
+      }
+      let state = states.STATE_INPROGRESS;
+      let status = progress?.rebuilding ? "indexingStatusVague" : "indexing";
+      if (!Services.prefs.getBoolPref(INDEXER_PREF, false)) {
+        state = states.STATE_PAUSED;
+        status = "paused2";
+      } else if (failed || (!progress.moreWork && progress.unavailable)) {
+        state = states.STATE_WAITINGFORRETRY;
+        status = "waitingForRetry";
+      }
+      // Waiting processes must resume before moving to another state.
+      if (this.#activity.state == states.STATE_WAITINGFORRETRY) {
+        this.#activity.state = states.STATE_INPROGRESS;
+      }
+      this.#activity.state = state;
+      this.#activity.setProgress(
+        lazy.activityStrings.GetStringFromName(status),
+        0,
+        0
+      );
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  /**
+   * Finishes only this writer's activity after work settles or close drains.
+   *
+   * @param {boolean} cancelled - Whether the writer is closing with work retained.
+   */
+  #clearActivity(cancelled) {
+    const process = this.#activity;
+    this.#activity = null;
+    if (!process) {
+      return;
+    }
+    try {
+      const states = Ci.nsIActivityProcess;
+      if (process.state == states.STATE_WAITINGFORRETRY) {
+        process.state = states.STATE_INPROGRESS;
+      }
+      process.state = cancelled
+        ? states.STATE_CANCELED
+        : states.STATE_COMPLETED;
+      lazy.activityManager.removeActivity(process.id);
+    } catch (error) {
+      console.error(error);
+    }
   }
 
   observe() {
@@ -896,6 +998,7 @@ export class MailSearchService {
       this.#closePromise = Promise.all([this.#updates, this.#preferences])
         .then(() => this.#index.close())
         .finally(() => {
+          this.#clearActivity(true);
           AsyncShutdown.profileBeforeChange.removeBlocker(this.#shutdown);
         });
     }

@@ -491,3 +491,111 @@ add_task(async function test_rotationRequiresCrossFileRedactionSupport() {
     /Cross-file chat refresh requires logger/
   );
 });
+
+add_task(
+  async function test_publicQueryKeepsTranscriptIdentityAndCurrentText() {
+    const first = await openChatFixture("query-first");
+    const second = await openChatFixture("query-second");
+    const { provider } = first;
+    const ids = [first, second].map(
+      (fixture, i) =>
+        "chat:" +
+        JSON.stringify([
+          "search-test",
+          i ? "search-query-second" : "search-query-first",
+          "buddy",
+          PathUtils.filename(fixture.filePath),
+        ])
+    );
+    for (const fixture of [first, second]) {
+      await logText(fixture, "Café orbit shared", { remoteId: "shared" });
+      await provider.refreshLog(fixture.filePath);
+    }
+    const page = await provider.search('"cafe orbit"', { limit: 1 });
+    Assert.equal(page.items.length, 1);
+    Assert.ok(page.cursor);
+    const next = await provider.search('"cafe orbit"', {
+      limit: 1,
+      cursor: page.cursor,
+    });
+    Assert.equal(next.resultSetId, page.resultSetId);
+    Assert.equal(next.cursor, null);
+    Assert.deepEqual(
+      [...page.items, ...next.items].map(hit => hit.id).sort(),
+      [...ids].sort(),
+      "Equal text and remote IDs retain both physical transcript files"
+    );
+    Assert.ok(
+      [...page.items, ...next.items].every(hit => hit.location === null)
+    );
+    Assert.deepEqual((await provider.search("cafe absentneedle")).items, []);
+    Assert.deepEqual(
+      (await provider.search("cafe absentneedle", { andTerms: false })).items
+        .map(hit => hit.id)
+        .sort(),
+      [...ids].sort()
+    );
+    await logText(first, "replacementneedle", { remoteId: "shared" });
+    Assert.deepEqual(
+      (await provider.search("orbit")).items.map(hit => hit.id),
+      [ids[1]],
+      "An unrefreshed edit hides the old transcript before text is replaced"
+    );
+    const refreshing = provider.refreshLog(first.filePath);
+    const current = provider.search("replacementneedle");
+    await refreshing;
+    Assert.deepEqual(
+      (await current).items.map(hit => hit.id),
+      [ids[0]]
+    );
+    Services.prefs.setBoolPref(
+      "mailnews.database.global.indexer.enabled",
+      false
+    );
+    try {
+      Assert.deepEqual((await provider.search("orbit")).items, []);
+    } finally {
+      Services.prefs.setBoolPref(
+        "mailnews.database.global.indexer.enabled",
+        true
+      );
+    }
+    const resolveDocument = provider.resolveDocument;
+    provider.resolveDocument = async function (...args) {
+      const state = await resolveDocument.apply(this, args);
+      Services.prefs.setBoolPref(
+        "mailnews.database.global.indexer.enabled",
+        false
+      );
+      return state;
+    };
+    try {
+      Assert.deepEqual(
+        (await provider.search("orbit")).items,
+        [],
+        "Disabling indexing after resolution still prevents query delivery"
+      );
+    } finally {
+      provider.resolveDocument = resolveDocument;
+      Services.prefs.setBoolPref(
+        "mailnews.database.global.indexer.enabled",
+        true
+      );
+    }
+    const controller = new AbortController();
+    const reason = new Error("Cancel the transcript query");
+    controller.abort(reason);
+    await Assert.rejects(
+      provider.search("orbit", { signal: controller.signal }),
+      error => error === reason
+    );
+    await Assert.rejects(provider.search("orbit", { limit: 0 }), /page size/);
+    Assert.deepEqual(
+      (await provider.search("orbit")).items.map(hit => hit.id),
+      [ids[1]],
+      "A rejected query does not starve later provider operations"
+    );
+    await provider.close();
+    await Assert.rejects(provider.search("orbit"), /provider is closing/);
+  }
+);

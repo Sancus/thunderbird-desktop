@@ -367,6 +367,43 @@ export class ChatSearchProvider {
   }
 
   /**
+   * Searches explicitly indexed transcripts using current logger revisions.
+   * Earlier accepted refreshes drain first; later file edits hide stale hits.
+   * This does not discover logs or activate a chat observer.
+   *
+   * @param {string} text - Search words or quoted phrases.
+   * @param {object} [options={}] - Existing index query, paging and cancellation controls.
+   * @returns {Promise<{items: SearchHit[], cursor: ?object, resultSetId: string}>}
+   *   Eligible physical transcript hits, with opaque paging cursors.
+   * @throws {Error} Original query/cancellation/storage error, or closing provider.
+   */
+  search(text, options = {}) {
+    if (this.#closing) {
+      return Promise.reject(new Error("Chat search provider is closing"));
+    }
+    const controls = { ...options };
+    const result = this.#pending.then(async () => {
+      controls.signal?.throwIfAborted();
+      const page = await this.#index.search(text, controls);
+      controls.signal?.throwIfAborted();
+      if (
+        !Services.prefs.getBoolPref(
+          "mailnews.database.global.indexer.enabled",
+          false
+        )
+      ) {
+        return { ...page, items: [], cursor: null };
+      }
+      return page;
+    });
+    this.#pending = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
+  }
+
+  /**
    * Reads eligible retained text through current source revision checks.
    *
    * @param {string} id - Canonical log identity.

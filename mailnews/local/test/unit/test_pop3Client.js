@@ -249,12 +249,19 @@ async function checkDeferredDownloadFailure(store, failingFirst) {
     store == "mbox"
       ? "@mozilla.org/msgstore/berkeleystore;1"
       : "@mozilla.org/msgstore/maildirstore;1";
-  const previousStore = Services.prefs.getCharPref(
-    "mail.serverDefaultStoreContractID"
-  );
+  const prefs = [
+    "mail.serverDefaultStoreContractID",
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    present: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
   const [badDaemon, badServer, badHandler] = setupServerDaemon();
-  const [goodDaemon, goodServer] = setupServerDaemon();
+  const [goodDaemon, goodServer, goodHandler] = setupServerDaemon();
   const accounts = [];
+  badHandler.kUsername = "deferred-bad";
+  goodHandler.kUsername = "deferred-good";
   badHandler.onStartup = () => "-ERR Delivery unavailable";
   badDaemon.setMessages(["message1.eml"]);
   goodDaemon.setMessages([
@@ -273,7 +280,9 @@ async function checkDeferredDownloadFailure(store, failingFirst) {
     badServer.start();
     goodServer.start();
     localAccountUtils.clearAll();
-    Services.prefs.setCharPref("mail.serverDefaultStoreContractID", storeID);
+    for (const { name } of prefs) {
+      Services.prefs.setCharPref(name, storeID);
+    }
     localAccountUtils.loadLocalMailAccount();
     const inbox = localAccountUtils.inboxFolder;
     Assert.equal(inbox.msgStore.storeType, store);
@@ -287,16 +296,20 @@ async function checkDeferredDownloadFailure(store, failingFirst) {
     );
     Assert.equal(dbService.openFolderDB(inbox, false), inbox.msgDatabase);
 
-    for (const popServer of [badServer, goodServer]) {
+    for (const [popServer, popHandler] of [
+      [badServer, badHandler],
+      [goodServer, goodHandler],
+    ]) {
       const accountAndServer =
         localAccountUtils.create_incoming_server_and_account(
           "pop3",
           popServer.port,
-          "fred",
+          popHandler.kUsername,
           "wilma"
         );
       accounts.push(accountAndServer);
       accountAndServer.server.deferGetNewMail = true;
+      Assert.equal(accountAndServer.server.msgStore.storeType, store);
       Assert.equal(
         accountAndServer.server.deferredToAccount,
         localAccountUtils.msgAccount.key
@@ -304,6 +317,7 @@ async function checkDeferredDownloadFailure(store, failingFirst) {
       Assert.equal(accountAndServer.server.rootMsgFolder, inbox.parent);
     }
     const [badIncoming, goodIncoming] = accounts.map(item => item.server);
+    Assert.notEqual(badIncoming.serverURI, goodIncoming.serverURI);
     const pending = failingFirst
       ? [badIncoming, goodIncoming]
       : [goodIncoming, badIncoming];
@@ -347,10 +361,13 @@ async function checkDeferredDownloadFailure(store, failingFirst) {
       MailServices.accounts.removeAccount(account);
     }
     localAccountUtils.clearAll();
-    Services.prefs.setCharPref(
-      "mail.serverDefaultStoreContractID",
-      previousStore
-    );
+    for (const { name, present, value } of prefs) {
+      if (present) {
+        Services.prefs.setCharPref(name, value);
+      } else {
+        Services.prefs.clearUserPref(name);
+      }
+    }
     goodServer.stop();
     badServer.stop();
   }
@@ -413,4 +430,349 @@ add_task(async function test_deferredDownloadOfflineError() {
     Services.io.manageOfflineStatus = previousManageOffline;
     MailServices.accounts.removeAccount(account);
   }
+});
+
+/**
+ * Exercise both real response handlers with a controlled sink callback.
+ * Native provider/copy behavior is tested in test_pop3PartialCompletion.js.
+ *
+ * @param {string} kind - TOP or RETR response handler.
+ * @param {string} mode - Terminal callback/dispatch timing.
+ */
+async function checkPopCompletionSettlement(kind, mode) {
+  const { Pop3Client } = ChromeUtils.importESModule(
+    "resource:///modules/Pop3Client.sys.mjs"
+  );
+  const { LineReader } = ChromeUtils.importESModule(
+    "resource:///modules/LineReader.sys.mjs"
+  );
+  const incoming = createPop3ServerAndLocalFolders(server.port);
+  incoming.leaveMessagesOnServer = false;
+  const client = new Pop3Client(incoming);
+  client._lineReader = new LineReader();
+  const message = { messageNumber: 1, uidl: "settlement-uidl" };
+  client._currentMessage = message;
+  client._messagesToHandle = [];
+  client._messageSizeMap = new Map([[1, 100]]);
+  client._uidlMap = new Map();
+  client._totalReceivedSize = 0;
+  client._updateProgress = () => {};
+  client._sendNoopIfInactive = () => {};
+  const transitions = [];
+  const errors = [];
+  let completes = 0;
+  let aborts = 0;
+  let listener;
+  client._actionDelete = () => transitions.push("DELE");
+  client._actionHandleMessage = () => transitions.push("next");
+  client._actionError = (_name, _params, _text, status) => errors.push(status);
+  client._sink = {
+    incorporateBegin() {},
+    incorporateWrite() {},
+    incorporateAbort() {
+      aborts++;
+    },
+    incorporateComplete(_window, _size, callback) {
+      completes++;
+      listener = callback;
+      if (mode == "reject") {
+        throw Components.Exception(
+          "dispatch rejected",
+          Cr.NS_ERROR_FILE_ACCESS_DENIED
+        );
+      }
+      if (mode == "reentrant-reject") {
+        callback.onStopOperation(Cr.NS_OK);
+        throw Components.Exception(
+          "dispatch rejected",
+          Cr.NS_ERROR_FILE_ACCESS_DENIED
+        );
+      }
+      if (mode == "first-error") {
+        callback.onStopOperation(Cr.NS_ERROR_STORAGE_CONSTRAINT);
+        throw Components.Exception(
+          "later dispatch error",
+          Cr.NS_ERROR_FILE_ACCESS_DENIED
+        );
+      }
+      if (mode == "sync") {
+        callback.onStopOperation(Cr.NS_OK);
+      }
+    },
+  };
+  try {
+    const response = {
+      status: "+OK",
+      success: true,
+      data: "Subject: settlement\r\n\r\nbody\r\n.\r\n",
+    };
+    if (kind == "TOP") {
+      client._actionTopResponse(response);
+    } else {
+      client._actionRetrResponse(response);
+    }
+    Assert.equal(completes, 1);
+    if (["late", "failure", "cancel", "stale"].includes(mode)) {
+      Assert.deepEqual(transitions, []);
+      Assert.deepEqual(errors, []);
+      Assert.equal(client._nextAction, null);
+      if (mode == "cancel") {
+        client._writeUidlState = async () => {};
+        client.quit = async () => {
+          client._cleanedUp = true;
+        };
+        await client._actionDone(Cr.NS_BINDING_ABORTED);
+        Assert.equal(client._messagesToHandle[0], message);
+      } else if (mode == "stale") {
+        client._currentMessage = { messageNumber: 2, uidl: "other" };
+      }
+      listener.onStopOperation(
+        mode == "failure" ? Cr.NS_ERROR_STORAGE_CONSTRAINT : Cr.NS_OK
+      );
+    }
+    let failure = null;
+    if (mode == "failure" || mode == "first-error") {
+      failure = Cr.NS_ERROR_STORAGE_CONSTRAINT;
+    } else if (["reject", "reentrant-reject"].includes(mode)) {
+      failure = Cr.NS_ERROR_FILE_ACCESS_DENIED;
+    }
+    Assert.deepEqual(errors, failure === null ? [] : [failure]);
+    Assert.deepEqual(
+      transitions,
+      failure !== null || ["cancel", "stale"].includes(mode)
+        ? []
+        : [kind == "TOP" ? "next" : "DELE"]
+    );
+    Assert.equal(aborts, failure !== null || mode == "cancel" ? 1 : 0);
+    listener.onStopOperation(Cr.NS_OK);
+    Assert.equal(completes, 1);
+    Assert.equal(
+      transitions.length,
+      failure !== null || ["cancel", "stale"].includes(mode) ? 0 : 1
+    );
+    Assert.equal(errors.length, failure === null ? 0 : 1);
+  } finally {
+    MailServices.accounts.removeIncomingServer(incoming, false);
+  }
+}
+
+add_task(async function test_topCompletionSync() {
+  await checkPopCompletionSettlement("TOP", "sync");
+});
+
+add_task(async function test_topCompletionLate() {
+  await checkPopCompletionSettlement("TOP", "late");
+});
+
+add_task(async function test_topCompletionReject() {
+  await checkPopCompletionSettlement("TOP", "reject");
+});
+
+add_task(async function test_topCompletionReentrantReject() {
+  await checkPopCompletionSettlement("TOP", "reentrant-reject");
+});
+
+add_task(async function test_topCompletionFirstError() {
+  await checkPopCompletionSettlement("TOP", "first-error");
+});
+
+add_task(async function test_topCompletionFailure() {
+  await checkPopCompletionSettlement("TOP", "failure");
+});
+
+add_task(async function test_topCompletionCancel() {
+  await checkPopCompletionSettlement("TOP", "cancel");
+});
+
+add_task(async function test_topCompletionStale() {
+  await checkPopCompletionSettlement("TOP", "stale");
+});
+
+add_task(async function test_retrCompletionSync() {
+  await checkPopCompletionSettlement("RETR", "sync");
+});
+
+add_task(async function test_retrCompletionLate() {
+  await checkPopCompletionSettlement("RETR", "late");
+});
+
+add_task(async function test_retrCompletionReject() {
+  await checkPopCompletionSettlement("RETR", "reject");
+});
+
+add_task(async function test_retrCompletionReentrantReject() {
+  await checkPopCompletionSettlement("RETR", "reentrant-reject");
+});
+
+add_task(async function test_retrCompletionFirstError() {
+  await checkPopCompletionSettlement("RETR", "first-error");
+});
+
+add_task(async function test_retrCompletionFailure() {
+  await checkPopCompletionSettlement("RETR", "failure");
+});
+
+add_task(async function test_retrCompletionCancel() {
+  await checkPopCompletionSettlement("RETR", "cancel");
+});
+
+add_task(async function test_retrCompletionStale() {
+  await checkPopCompletionSettlement("RETR", "stale");
+});
+
+/**
+ * Exercise real UIDL-file persistence with a controlled sink outcome.
+ * Native completion and copy faults are tested in test_pop3PartialCompletion.
+ *
+ * @param {string} mode - Callback timing, cancellation, correlation or I/O fault.
+ */
+async function checkConfirmedPartialReceipt(mode) {
+  const { Pop3Client } = ChromeUtils.importESModule(
+    "resource:///modules/Pop3Client.sys.mjs"
+  );
+  const incoming = createPop3ServerAndLocalFolders(server.port);
+  const client = new Pop3Client(incoming);
+  const message = {
+    messageNumber: 1,
+    uidl: "confirmed-uidl",
+    status: "f",
+    receivedAt: 100,
+  };
+  const other = { uidl: "other-uidl", status: "f", receivedAt: 200 };
+  client._currentMessage = message;
+  client._messagesToHandle = [{ ...message }, other];
+  client._uidlMap = new Map([[message.uidl, { ...message }]]);
+  client._uidlMapChanged = true;
+  const stateFile = PathUtils.join(incoming.localPath.path, "popstate.dat");
+  const transitions = [];
+  const stopped = Promise.withResolvers();
+  const originalDone = client._actionDone;
+  client._actionDone = async status => {
+    await originalDone(status);
+    stopped.resolve(status);
+  };
+  // Keep the real _actionDone and UIDL writer, without opening a test socket.
+  client.quit = async () => {
+    client._cleanedUp = true;
+  };
+  let listener;
+  let aborts = 0;
+  client._sink = {
+    confirmedPartialCompletion: mode != "unconfirmed",
+    incorporateComplete(_window, _size, callback) {
+      listener = callback;
+      if (mode == "sync") {
+        callback.onStopOperation(Cr.NS_ERROR_STORAGE_CONSTRAINT);
+      }
+      if (mode == "reentrant-reject") {
+        callback.onStopOperation(Cr.NS_OK);
+        throw Components.Exception(
+          "dispatch failed",
+          Cr.NS_ERROR_FILE_ACCESS_DENIED
+        );
+      }
+    },
+    incorporateAbort() {
+      aborts++;
+    },
+  };
+  const before = Math.floor(Date.now() / 1000);
+  try {
+    if (mode == "write-failure") {
+      await IOUtils.makeDirectory(stateFile);
+    }
+    client._completeMessage(0, () => transitions.push("next/DELE"));
+    if (mode == "cancel") {
+      await client._actionDone(Cr.NS_BINDING_ABORTED);
+    } else if (mode == "stale-message") {
+      client._currentMessage = { ...other };
+    } else if (mode == "stale-sink") {
+      client._sink = { confirmedPartialCompletion: true };
+    }
+    if (mode != "sync" && mode != "reentrant-reject") {
+      listener.onStopOperation(Cr.NS_ERROR_STORAGE_CONSTRAINT);
+    }
+    if (mode.startsWith("stale-")) {
+      Assert.equal(client._uidlMap.get(message.uidl).status, "f");
+      Assert.equal(message.status, "f");
+      Assert.ok(!(await IOUtils.exists(stateFile)));
+    } else {
+      let expected;
+      if (mode == "cancel") {
+        expected = Cr.NS_BINDING_ABORTED;
+      } else if (mode == "reentrant-reject") {
+        expected = Cr.NS_ERROR_FILE_ACCESS_DENIED;
+      } else {
+        expected = Cr.NS_ERROR_STORAGE_CONSTRAINT;
+      }
+      Assert.equal(await stopped.promise, expected);
+      if (mode == "write-failure") {
+        Assert.equal((await IOUtils.stat(stateFile)).type, "directory");
+        Assert.ok(
+          client._uidlMapChanged,
+          "Failed persistence is not acknowledged"
+        );
+        Assert.equal(client._uidlMap.get(message.uidl).status, "k");
+      } else {
+        const raw = await IOUtils.readUTF8(stateFile);
+        const entry = raw
+          .split(/\r?\n/)
+          .find(line => line.split(" ")[1] == message.uidl);
+        const [status, uidl, receivedAt] = entry.split(" ");
+        Assert.equal(status, mode == "unconfirmed" ? "f" : "k");
+        Assert.equal(uidl, message.uidl);
+        if (mode == "unconfirmed") {
+          Assert.equal(Number(receivedAt), 100);
+        } else {
+          Assert.greaterOrEqual(Number(receivedAt), before);
+          Assert.lessOrEqual(Number(receivedAt), Math.floor(Date.now() / 1000));
+          Assert.equal(
+            message.status,
+            "k",
+            "Error requeue retains the receipt"
+          );
+        }
+        Assert.ok(raw.split(/\r?\n/).includes("f other-uidl 200"));
+        listener.onStopOperation(Cr.NS_OK);
+        Assert.equal(
+          await IOUtils.readUTF8(stateFile),
+          raw,
+          "Stale callback cannot rewrite state"
+        );
+      }
+      Assert.equal(aborts, mode == "unconfirmed" || mode == "cancel" ? 1 : 0);
+    }
+    Assert.deepEqual(transitions, []);
+  } finally {
+    if (mode == "write-failure") {
+      await IOUtils.remove(stateFile);
+    }
+    MailServices.accounts.removeIncomingServer(incoming, false);
+  }
+}
+
+add_task(async function test_confirmedPartialReceiptSync() {
+  await checkConfirmedPartialReceipt("sync");
+});
+add_task(async function test_confirmedPartialReceiptLate() {
+  await checkConfirmedPartialReceipt("late");
+});
+add_task(async function test_confirmedPartialReceiptCancel() {
+  await checkConfirmedPartialReceipt("cancel");
+});
+add_task(async function test_unconfirmedPartialKeepsFetchState() {
+  await checkConfirmedPartialReceipt("unconfirmed");
+});
+add_task(async function test_confirmedPartialIgnoresDifferentMessage() {
+  await checkConfirmedPartialReceipt("stale-message");
+});
+add_task(async function test_confirmedPartialIgnoresDifferentSink() {
+  await checkConfirmedPartialReceipt("stale-sink");
+});
+add_task(async function test_confirmedPartialReceiptWriteFailure() {
+  await checkConfirmedPartialReceipt("write-failure");
+});
+
+add_task(async function test_confirmedPartialReceiptReentrantDispatchError() {
+  await checkConfirmedPartialReceipt("reentrant-reject");
 });

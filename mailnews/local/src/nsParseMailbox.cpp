@@ -25,6 +25,13 @@
 #include "prprf.h"
 #include "prmem.h"
 #include "nsMsgSearchCore.h"
+#ifdef MOZ_PANORAMA
+#  include "nsMsgSearchScopeTerm.h"
+#  include "nsIMsgOperationListener.h"
+#  include "UrlListener.h"
+#  include "mozilla/AutoRestore.h"
+#  include "mozilla/RefCounted.h"
+#endif
 #include "nsMailHeaders.h"
 #include "nsIMsgMailSession.h"
 #include "nsIMsgComposeService.h"
@@ -1118,6 +1125,23 @@ nsresult HardDeleteDetachedMessage(nsIMsgFolder* folder, nsIMsgDatabase* db,
 
 }  // namespace
 
+#ifdef MOZ_PANORAMA
+struct nsParseNewMailState::CompletedFilterState
+    : public RefCounted<CompletedFilterState> {
+  nsCOMPtr<nsIMsgDBHdr> header;
+  nsCOMPtr<nsIMsgOperationListener> completion;
+  nsCOMPtr<nsIMsgFilter> filter;
+  nsTArray<RefPtr<nsIMsgRuleAction>> actions;
+  uint32_t list = 0, nextFilter = 0, filterCount = 0, nextAction = 0;
+  uint64_t copySerial = 0;
+  bool logging = false, running = false, dispatching = false, waiting = false;
+  nsresult status = NS_OK;
+  void Record(nsresult rv) {
+    if (NS_SUCCEEDED(status) && NS_FAILED(rv)) status = rv;
+  }
+};
+#endif
+
 nsParseNewMailState::nsParseNewMailState()
     : m_numNotNewMessages(0),
       m_msgMovedByFilter(false),
@@ -1348,6 +1372,222 @@ void nsParseNewMailState::ApplyFilters(bool* pMoved, nsIMsgWindow* msgWindow) {
   }
   if (pMoved) *pMoved = m_msgMovedByFilter;
 }
+
+#ifdef MOZ_PANORAMA
+nsresult nsParseNewMailState::ApplyFiltersToCompletedMessage(
+    nsIMsgDBHdr* header, nsIMsgOperationListener* completion) {
+  NS_ENSURE_TRUE(!m_completedFilters, NS_ERROR_IN_PROGRESS);
+  if (m_disableFilters) {
+    if (completion) (void)completion->OnStopOperation(NS_OK);
+    return NS_OK;
+  }
+  NS_ENSURE_ARG_POINTER(header);
+  NS_ENSURE_STATE(m_mailDB && m_downloadFolder);
+  bool live;
+  MOZ_TRY(header->GetIsLive(&live));
+  NS_ENSURE_TRUE(live, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(m_headers.length() <= UINT32_MAX, NS_ERROR_ILLEGAL_VALUE);
+  RefPtr<CompletedFilterState> state = new CompletedFilterState;
+  state->header = header;
+  state->completion = completion;
+  m_completedFilters = state;
+  RunCompletedFilters(state);
+  return completion ? NS_OK : state->status;
+}
+
+static void LogCompletedFilterAction(nsIMsgFilter* filter,
+                                     nsIMsgRuleAction* action,
+                                     nsIMsgDBHdr* header, bool logging,
+                                     nsresult status) {
+  if (!logging) return;
+  if (NS_FAILED(status)) {
+    (void)filter->LogRuleHitFail(action, header, status,
+                                 "filter-failure-action"_ns);
+  } else {
+    (void)filter->LogRuleHit(action, header);
+  }
+}
+
+void nsParseNewMailState::CancelCompletedFilters(nsresult status) {
+  RefPtr<CompletedFilterState> state = m_completedFilters;
+  if (!state) return;
+  state->Record(status);
+  if (!state->waiting) RunCompletedFilters(state);
+}
+
+nsresult nsParseNewMailState::OnCompletedFilterCopy(CompletedFilterState* state,
+                                                    uint64_t serial,
+                                                    nsresult status) {
+  if (m_completedFilters != state || !state->waiting ||
+      state->copySerial != serial)
+    return NS_OK;
+  state->Record(status);
+  state->waiting = false;
+  if (!state->dispatching) {
+    LogCompletedFilterAction(state->filter,
+                             state->actions[state->nextAction - 1],
+                             state->header, state->logging, state->status);
+    RunCompletedFilters(state);
+  }
+  return NS_OK;
+}
+
+void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
+  RefPtr<CompletedFilterState> keepAlive = state;
+  if (m_completedFilters != state || state->running || state->waiting) return;
+  AutoRestore<bool> running(state->running);
+  state->running = true;
+  nsresult rv = [&]() -> nsresult {
+    while (NS_SUCCEEDED(state->status)) {
+      if (!state->filter || state->nextAction == state->actions.Length()) {
+        state->filter = nullptr;
+        state->actions.Clear();
+        state->nextAction = 0;
+        if (state->list == 2) return NS_OK;
+        nsIMsgFilterList* list = state->list == 0
+                                     ? m_filterList.get()
+                                     : m_deferredToServerFilterList.get();
+        if (!list) {
+          ++state->list;
+          continue;
+        }
+        if (!state->nextFilter) {
+          MOZ_TRY(list->GetFilterCount(&state->filterCount));
+          MOZ_TRY(list->GetLoggingEnabled(&state->logging));
+        }
+        if (state->nextFilter == state->filterCount) {
+          ++state->list;
+          state->nextFilter = 0;
+          continue;
+        }
+        nsCOMPtr<nsIMsgFilter> filter;
+        MOZ_TRY(list->GetFilterAt(state->nextFilter++, getter_AddRefs(filter)));
+        NS_ENSURE_TRUE(filter, NS_ERROR_NOT_AVAILABLE);
+        bool enabled;
+        nsMsgFilterTypeType type;
+        MOZ_TRY(filter->GetEnabled(&enabled));
+        MOZ_TRY(filter->GetFilterType(&type));
+        if (!enabled || !(type & nsMsgFilterType::InboxRule)) continue;
+        nsCOMPtr<nsIMsgSearchScopeTerm> previousScope;
+        MOZ_TRY(filter->GetScope(getter_AddRefs(previousScope)));
+        RefPtr<nsMsgSearchScopeTerm> scope = new nsMsgSearchScopeTerm(
+            nullptr, nsMsgSearchScope::offlineMail, m_downloadFolder);
+        MOZ_TRY(filter->SetScope(scope));
+        bool matched = false;
+        nsDependentCSubstring headers(
+            m_headers.begin(), static_cast<uint32_t>(m_headers.length()));
+        nsresult matchRv = filter->MatchHdr(state->header, m_downloadFolder,
+                                            m_mailDB, headers, &matched);
+        nsresult restoreRv = filter->SetScope(previousScope);
+        MOZ_TRY(matchRv);
+        MOZ_TRY(restoreRv);
+        if (!matched) continue;
+        MOZ_TRY(filter->GetSortedActionList(state->actions));
+        // Preflight the whole rule before executing any supported prefix.
+        for (const auto& action : state->actions) {
+          nsMsgRuleActionType actionType;
+          MOZ_TRY(action->GetType(&actionType));
+          switch (actionType) {
+            case nsMsgFilterAction::MarkRead:
+            case nsMsgFilterAction::MarkUnread:
+            case nsMsgFilterAction::MarkFlagged:
+            case nsMsgFilterAction::AddTag:
+            case nsMsgFilterAction::FetchBodyFromPop3Server:
+            case nsMsgFilterAction::StopExecution:
+              break;
+            case nsMsgFilterAction::CopyToFolder:
+              if (state->completion) break;
+              [[fallthrough]];
+            default:
+              LogCompletedFilterAction(filter, action, state->header,
+                                       state->logging,
+                                       NS_ERROR_NOT_IMPLEMENTED);
+              return NS_ERROR_NOT_IMPLEMENTED;
+          }
+        }
+        state->filter = filter;
+        if (state->actions.IsEmpty()) continue;
+      }
+      if (NS_FAILED(state->status)) break;
+      nsMsgKey key;
+      MOZ_TRY(state->header->GetMessageKey(&key));
+      bool contains;
+      MOZ_TRY(m_mailDB->ContainsKey(key, &contains));
+      NS_ENSURE_TRUE(contains, NS_ERROR_NOT_AVAILABLE);
+      auto action = state->actions[state->nextAction++];
+      nsMsgRuleActionType type;
+      MOZ_TRY(action->GetType(&type));
+      nsresult actionRv = [&]() -> nsresult {
+        switch (type) {
+          case nsMsgFilterAction::MarkRead:
+            return m_downloadFolder->MarkMessagesRead({state->header.get()},
+                                                      true);
+          case nsMsgFilterAction::MarkUnread:
+            return m_downloadFolder->MarkMessagesRead({state->header.get()},
+                                                      false);
+          case nsMsgFilterAction::MarkFlagged:
+            return m_downloadFolder->MarkMessagesFlagged({state->header.get()},
+                                                         true);
+          case nsMsgFilterAction::AddTag: {
+            nsCString keyword;
+            MOZ_TRY(action->GetStrValue(keyword));
+            return m_downloadFolder->AddKeywordsToMessages(
+                {state->header.get()}, keyword);
+          }
+          case nsMsgFilterAction::FetchBodyFromPop3Server:
+            return NS_OK;  // Already has its completed body.
+          case nsMsgFilterAction::StopExecution:
+            state->nextAction = state->actions.Length();
+            state->nextFilter = state->filterCount;
+            return NS_OK;
+          case nsMsgFilterAction::CopyToFolder: {
+            nsCString target, source;
+            MOZ_TRY(action->GetTargetFolderUri(target));
+            NS_ENSURE_TRUE(!target.IsEmpty(), NS_ERROR_INVALID_ARG);
+            MOZ_TRY(m_downloadFolder->GetURI(source));
+            if (source.Equals(target)) return NS_OK;
+            nsCOMPtr<nsIMsgFolder> destination;
+            MOZ_TRY(GetOrCreateFolder(target, getter_AddRefs(destination)));
+            NS_ENSURE_TRUE(destination, NS_ERROR_NOT_AVAILABLE);
+            bool canFile;
+            MOZ_TRY(destination->GetCanFileMessages(&canFile));
+            NS_ENSURE_TRUE(canFile, NS_ERROR_INVALID_ARG);
+            nsCOMPtr<nsIMsgCopyService> copy =
+                do_GetService("@mozilla.org/messenger/messagecopyservice;1");
+            NS_ENSURE_TRUE(copy, NS_ERROR_NOT_AVAILABLE);
+            MOZ_TRY(state->status);
+            uint64_t serial = ++state->copySerial;
+            RefPtr<CopyServiceListener> listener = new CopyServiceListener;
+            listener->mStopCopyFn = [self = RefPtr{this}, hold = RefPtr{state},
+                                     serial](nsresult status) {
+              return self->OnCompletedFilterCopy(hold, serial, status);
+            };
+            state->waiting = state->dispatching = true;
+            nsresult copyRv = copy->CopyMessages(
+                m_downloadFolder, {state->header.get()}, destination, false,
+                listener, m_msgWindow, false);
+            state->dispatching = false;
+            return copyRv;
+          }
+          default:
+            return NS_ERROR_NOT_IMPLEMENTED;
+        }
+      }();
+      state->Record(actionRv);
+      if (state->waiting && NS_SUCCEEDED(actionRv)) return NS_OK;
+      state->waiting = false;
+      LogCompletedFilterAction(state->filter, action, state->header,
+                               state->logging, state->status);
+    }
+    return state->status;
+  }();
+  state->Record(rv);
+  if (state->waiting) return;
+  m_completedFilters = nullptr;
+  nsCOMPtr<nsIMsgOperationListener> completion = state->completion.forget();
+  if (completion) (void)completion->OnStopOperation(state->status);
+}
+#endif
 
 NS_IMETHODIMP nsParseNewMailState::ApplyFilterHit(nsIMsgFilter* filter,
                                                   nsIMsgWindow* msgWindow,

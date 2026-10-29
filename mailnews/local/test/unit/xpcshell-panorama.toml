@@ -8,3 +8,5 @@ dupe-manifest = true
 tags = ["panorama"]
 
 ["include:xpcshell-shared.toml"]
+
+["test_pop3PartialCompletion.js"]

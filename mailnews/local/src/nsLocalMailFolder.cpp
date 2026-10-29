@@ -1350,10 +1350,12 @@ NS_IMETHODIMP nsMsgLocalMailFolder::OnAnnouncerGoingAway(
 NS_IMETHODIMP
 nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
                                       bool moveCopySucceeded) {
+  nsresult copyStatus = moveCopySucceeded ? NS_OK : NS_ERROR_FAILURE;
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup() && mCopyState) {
     if (NS_FAILED(mCopyState->m_copyError)) {
       moveCopySucceeded = false;
+      copyStatus = mCopyState->m_copyError;
     }
     if (!moveCopySucceeded) {
       if (NS_FAILED(DiscardCopyMessage())) {
@@ -1393,8 +1395,7 @@ nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
   mCopyState = nullptr;
   nsCOMPtr<nsIMsgCopyService> copyService =
       mozilla::components::Copy::Service();
-  return copyService->NotifyCompletion(
-      srcSupport, this, moveCopySucceeded ? NS_OK : NS_ERROR_FAILURE);
+  return copyService->NotifyCompletion(srcSupport, this, copyStatus);
 }
 
 bool nsMsgLocalMailFolder::CheckIfSpaceForCopy(nsIMsgWindow* msgWindow,
@@ -2413,60 +2414,6 @@ void nsMsgLocalMailFolder::CopyHdrPropertiesWithSkipList(
 }
 
 #ifdef MOZ_PANORAMA
-// Measure the retrievable destination bytes, excluding mbox framing/escaping.
-static nsresult ReadStoredMessageDetails(nsIMsgPluggableStore* store,
-                                         nsIMsgFolder* folder,
-                                         const nsACString& token,
-                                         uint32_t* size, uint32_t* lines) {
-  if (token.IsEmpty()) {
-    return NS_ERROR_UNEXPECTED;
-  }
-  nsCOMPtr<nsIInputStream> stream;
-  MOZ_TRY(store->GetMsgInputStream(folder, token, 0, getter_AddRefs(stream)));
-  uint64_t byteCount = 0;
-  uint64_t bodyLines = 0;
-  uint64_t lineLength = 0;
-  bool inHeaders = true;
-  char previous = 0;
-  nsresult rv;
-  char buffer[COPY_BUFFER_SIZE];
-  while (true) {
-    uint32_t count = 0;
-    rv = stream->Read(buffer, sizeof(buffer), &count);
-    if (NS_FAILED(rv) || !count) {
-      break;
-    }
-    byteCount += count;
-    if (byteCount > UINT32_MAX) {
-      rv = NS_ERROR_ILLEGAL_VALUE;
-      break;
-    }
-    for (uint32_t i = 0; i < count; ++i) {
-      ++lineLength;
-      if (buffer[i] == '\n') {
-        if (inHeaders) {
-          if (lineLength == 1 || (lineLength == 2 && previous == '\r')) {
-            inHeaders = false;
-          }
-        } else {
-          ++bodyLines;
-        }
-        lineLength = 0;
-      }
-      previous = buffer[i];
-    }
-  }
-  nsresult closeRv = stream->Close();
-  MOZ_TRY(rv);
-  MOZ_TRY(closeRv);
-  if (!inHeaders && lineLength) {
-    ++bodyLines;
-  }
-  *size = static_cast<uint32_t>(byteCount);
-  *lines = static_cast<uint32_t>(bodyLines);
-  return NS_OK;
-}
-
 nsresult nsMsgLocalMailFolder::DiscardCopyMessage() {
   if (!mCopyState->m_fileStream || mCopyState->m_finishAttempted ||
       mCopyState->m_discardFailed) {
@@ -3339,6 +3286,39 @@ nsMsgLocalMailFolder::MarkMsgsOnPop3Server(
   return rv;
 }
 
+#ifdef MOZ_PANORAMA
+nsresult nsMsgLocalMailFolder::FindPartialMessageByUidl(
+    const nsACString& account, const nsACString& uidl, nsIMsgDBHdr** header) {
+  NS_ENSURE_ARG_POINTER(header);
+  *header = nullptr;
+  nsCOMPtr<nsIMsgDBHdr> match;
+  uint64_t folderId;
+  MOZ_TRY(GetId(&folderId));
+  for (const auto& candidate : mDownloadPartialMessages) {
+    nsCOMPtr<nsIMsgFolder> sourceFolder;
+    MOZ_TRY(candidate->GetFolder(getter_AddRefs(sourceFolder)));
+    NS_ENSURE_TRUE(sourceFolder, NS_ERROR_NOT_AVAILABLE);
+    uint64_t sourceFolderId;
+    MOZ_TRY(sourceFolder->GetId(&sourceFolderId));
+    NS_ENSURE_TRUE(sourceFolderId == folderId, NS_ERROR_INVALID_ARG);
+    uint32_t flags;
+    MOZ_TRY(candidate->GetFlags(&flags));
+    if (!(flags & nsMsgMessageFlags::Partial)) continue;
+    nsCString storedAccount, storedUidl;
+    MOZ_TRY(
+        ReadPop3MessageIdentity(this, candidate, storedAccount, storedUidl));
+    if (!uidl.IsEmpty() && account.Equals(storedAccount) &&
+        uidl.Equals(storedUidl)) {
+      // Duplicate server identities must not select an arbitrary physical row.
+      NS_ENSURE_FALSE(match, NS_ERROR_UNEXPECTED);
+      match = candidate;
+    }
+  }
+  match.forget(header);
+  return NS_OK;
+}
+#endif
+
 NS_IMETHODIMP nsMsgLocalMailFolder::RetrieveHdrOfPartialMessage(
     nsIMsgDBHdr* newHdr, nsIMsgDBHdr** oldHdr) {
   NS_ENSURE_ARG_POINTER(newHdr);
@@ -3480,7 +3460,8 @@ nsMsgLocalMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   if (mDownloadInProgress) {
     mDownloadInProgress = false;
     mDownloadPartialMessages.Clear();
-    return nsMsgDBFolder::OnStopRunningUrl(aUrl, aExitCode);
+    // Deferred POP accounts report aggregate completion without a URL.
+    return aUrl ? nsMsgDBFolder::OnStopRunningUrl(aUrl, aExitCode) : NS_OK;
   }
 
   if (mFlags & nsMsgFolderFlags::Inbox) {

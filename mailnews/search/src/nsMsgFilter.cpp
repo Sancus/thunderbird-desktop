@@ -573,6 +573,8 @@ NS_IMETHODIMP
 nsMsgFilter::MatchHdr(nsIMsgDBHdr* msgHdr, nsIMsgFolder* folder,
                       nsIMsgDatabase* db, const nsACString& headers,
                       bool* pResult) {
+  NS_ENSURE_ARG_POINTER(pResult);
+  *pResult = false;
   NS_ENSURE_ARG_POINTER(folder);
   NS_ENSURE_ARG_POINTER(msgHdr);
   nsCString folderCharset = "UTF-8"_ns;

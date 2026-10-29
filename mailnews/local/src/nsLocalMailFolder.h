@@ -99,6 +99,13 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
   NS_DECL_NSIJUNKMAILCLASSIFICATIONLISTENER
   NS_DECL_ISUPPORTS_INHERITED
 
+#ifdef MOZ_PANORAMA
+  // Only selected physical Partial messages are eligible for batch completion.
+  nsresult FindPartialMessageByUidl(const nsACString& account,
+                                    const nsACString& uidl,
+                                    nsIMsgDBHdr** header);
+#endif
+
   nsString GetLocalizedNameInternal() override;
 
   // nsIUrlListener methods

@@ -30,6 +30,7 @@ class nsMsgSearchOfflineMail : public nsMsgSearchAdapter,
   NS_IMETHOD Search(bool* aDone) override;
   NS_IMETHOD AddResultElement(nsIMsgDBHdr*) override;
 
+  // Clear the output and propagate the first error from an evaluated term.
   static nsresult MatchTermsForFilter(
       nsIMsgDBHdr* msgToMatch,
       nsTArray<RefPtr<nsIMsgSearchTerm>> const& termList,

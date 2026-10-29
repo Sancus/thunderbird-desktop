@@ -123,6 +123,40 @@ nsMsgSearchBoolExpression* nsMsgSearchBoolExpression::leftToRightAddTerm(
   return this;  // in case we failed to create a new expression, return self
 }
 
+nsresult nsMsgSearchBoolExpression::OfflineEvaluate(
+    nsIMsgDBHdr* msgToMatch, const char* defaultCharset,
+    nsIMsgSearchScopeTerm* scope, nsIMsgDatabase* db, const nsACString& headers,
+    bool Filtering, bool* result) {
+  NS_ENSURE_ARG_POINTER(result);
+  *result = false;
+  bool matched = false;
+  if (m_term) {
+    nsresult rv = nsMsgSearchOfflineMail::ProcessSearchTerm(
+        msgToMatch, m_term, defaultCharset, scope, db, headers, Filtering,
+        &matched);
+    NS_ENSURE_SUCCESS(rv, rv);
+    *result = matched;
+    return NS_OK;
+  }
+  bool isAnd = m_boolOp == nsMsgSearchBooleanOp::BooleanAND;
+  if (m_leftChild) {
+    nsresult rv = m_leftChild->OfflineEvaluate(
+        msgToMatch, defaultCharset, scope, db, headers, Filtering, &matched);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if ((matched && !isAnd) || (!matched && isAnd)) {
+      *result = matched;
+      return NS_OK;
+    }
+  }
+  if (m_rightChild) {
+    nsresult rv = m_rightChild->OfflineEvaluate(
+        msgToMatch, defaultCharset, scope, db, headers, Filtering, &matched);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  *result = matched;
+  return NS_OK;
+}
+
 // returns true or false depending on what the current expression evaluates to.
 bool nsMsgSearchBoolExpression::OfflineEvaluate(nsIMsgDBHdr* msgToMatch,
                                                 const char* defaultCharset,
@@ -586,6 +620,8 @@ nsresult nsMsgSearchOfflineMail::MatchTerms(
     const char* defaultCharset, nsIMsgSearchScopeTerm* scope,
     nsIMsgDatabase* db, const nsACString& headers, bool Filtering,
     nsMsgSearchBoolExpression** aExpressionTree, bool* pResult) {
+  NS_ENSURE_ARG_POINTER(pResult);
+  *pResult = false;
   NS_ENSURE_ARG(aExpressionTree);
   nsresult err;
 
@@ -604,7 +640,12 @@ nsresult nsMsgSearchOfflineMail::MatchTerms(
     if (NS_FAILED(err)) return err;
   }
 
-  // evaluate the expression tree and return the result
+  if (Filtering && *aExpressionTree) {
+    return (*aExpressionTree)
+        ->OfflineEvaluate(msgToMatch, defaultCharset, scope, db, headers, true,
+                          pResult);
+  }
+  // Searches keep their existing best-effort Boolean evaluation.
   *pResult = (*aExpressionTree)
                  ? (*aExpressionTree)
                        ->OfflineEvaluate(msgToMatch, defaultCharset, scope, db,

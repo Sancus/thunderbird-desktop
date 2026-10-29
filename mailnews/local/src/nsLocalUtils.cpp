@@ -14,6 +14,15 @@
 #include "nsNetCID.h"
 #include "nsIURIMutator.h"
 #include "mozilla/Components.h"
+#ifdef MOZ_PANORAMA
+#  include "mozilla/ResultExtensions.h"
+#  include "nsIInputStream.h"
+#  include "nsIMsgHdr.h"
+#  include "nsIMsgFolder.h"
+#  include "nsIMsgPluggableStore.h"
+#  include "nsMailHeaders.h"
+#  include "nsReadLine.h"
+#endif
 
 // it would be really cool to:
 // - cache the last hostname->path match
@@ -195,3 +204,87 @@ nsresult nsCreateLocalBaseMessageURI(const nsACString& baseURI,
 
   return NS_OK;
 }
+
+#ifdef MOZ_PANORAMA
+// Read the physical POP identity, not the message's non-unique Message-ID.
+nsresult ReadPop3MessageIdentity(nsIMsgFolder* folder, nsIMsgDBHdr* header,
+                                 nsACString& account, nsACString& uidl) {
+  account.Truncate();
+  uidl.Truncate();
+  nsCOMPtr<nsIInputStream> stream;
+  MOZ_TRY(folder->GetMsgInputStream(header, getter_AddRefs(stream)));
+  nsLineBuffer<char> buffer;
+  nsCString line;
+  bool more = true;
+  nsresult rv = NS_OK;
+  constexpr auto accountPrefix =
+      nsLiteralCString(HEADER_X_MOZILLA_ACCOUNT_KEY ": ");
+  while (more) {
+    rv = NS_ReadLine(stream.get(), &buffer, line, &more);
+    if (NS_FAILED(rv) || line.IsEmpty()) break;
+    if (StringBeginsWith(line, accountPrefix)) {
+      account = Substring(line, accountPrefix.Length());
+    } else if (StringBeginsWith(line, "X-UIDL: "_ns)) {
+      uidl = Substring(line, sizeof("X-UIDL: ") - 1);
+      break;
+    }
+  }
+  nsresult closeRv = stream->Close();
+  MOZ_TRY(rv);
+  return closeRv;
+}
+
+// Measure the retrievable destination bytes, excluding mbox framing/escaping.
+nsresult ReadStoredMessageDetails(nsIMsgPluggableStore* store,
+                                  nsIMsgFolder* folder, const nsACString& token,
+                                  uint32_t* size, uint32_t* lines) {
+  if (token.IsEmpty()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  nsCOMPtr<nsIInputStream> stream;
+  MOZ_TRY(store->GetMsgInputStream(folder, token, 0, getter_AddRefs(stream)));
+  uint64_t byteCount = 0;
+  uint64_t bodyLines = 0;
+  uint64_t lineLength = 0;
+  bool inHeaders = true;
+  char previous = 0;
+  nsresult rv;
+  char buffer[16384];
+  while (true) {
+    uint32_t count = 0;
+    rv = stream->Read(buffer, sizeof(buffer), &count);
+    if (NS_FAILED(rv) || !count) {
+      break;
+    }
+    byteCount += count;
+    if (byteCount > UINT32_MAX) {
+      rv = NS_ERROR_ILLEGAL_VALUE;
+      break;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      ++lineLength;
+      if (buffer[i] == '\n') {
+        if (inHeaders) {
+          if (lineLength == 1 || (lineLength == 2 && previous == '\r')) {
+            inHeaders = false;
+          }
+        } else {
+          ++bodyLines;
+        }
+        lineLength = 0;
+      }
+      previous = buffer[i];
+    }
+  }
+  nsresult closeRv = stream->Close();
+  MOZ_TRY(rv);
+  MOZ_TRY(closeRv);
+  if (!inHeaders && lineLength) {
+    ++bodyLines;
+  }
+  *size = static_cast<uint32_t>(byteCount);
+  *lines = static_cast<uint32_t>(bodyLines);
+  return NS_OK;
+}
+
+#endif

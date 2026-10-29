@@ -21,6 +21,9 @@
 #include "prmem.h"
 #include "mozilla/Components.h"
 #include "mozilla/Logging.h"
+#ifdef MOZ_PANORAMA
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
 #include "mozilla/intl/AppDateTimeFormat.h"
 #include <ctype.h>
 #include "mozilla/intl/Localization.h"
@@ -274,6 +277,10 @@ nsMsgFilterList::ApplyFiltersToHdr(nsMsgFilterTypeType filterType,
     return NS_ERROR_NULL_POINTER;
   }
 
+  bool propagateMatchErrors = false;
+#ifdef MOZ_PANORAMA
+  propagateMatchErrors = StaticPrefs::mail_panorama_enabled_AtStartup();
+#endif
   nsCOMPtr<nsIMsgFilter> filter;
   uint32_t filterCount = 0;
   nsresult rv = GetFilterCount(&filterCount);
@@ -326,10 +333,17 @@ nsMsgFilterList::ApplyFiltersToHdr(nsMsgFilterTypeType filterType,
         nsresult matchTermStatus = NS_OK;
         bool result = false;
 
-        filter->SetScope(scope);
-        matchTermStatus =
-            filter->MatchHdr(msgHdr, folder, db, headers, &result);
-        filter->SetScope(nullptr);
+        nsCOMPtr<nsIMsgSearchScopeTerm> previousScope;
+        matchTermStatus = filter->GetScope(getter_AddRefs(previousScope));
+        if (NS_SUCCEEDED(matchTermStatus)) {
+          matchTermStatus = filter->SetScope(scope);
+          if (NS_SUCCEEDED(matchTermStatus)) {
+            nsresult matchRv =
+                filter->MatchHdr(msgHdr, folder, db, headers, &result);
+            nsresult restoreRv = filter->SetScope(previousScope);
+            matchTermStatus = NS_FAILED(matchRv) ? matchRv : restoreRv;
+          }
+        }
         if (NS_SUCCEEDED(matchTermStatus) && result && listener) {
           nsCString msgId;
           msgHdr->GetMessageId(msgId);
@@ -360,6 +374,11 @@ nsMsgFilterList::ApplyFiltersToHdr(nsMsgFilterTypeType filterType,
             MOZ_LOG(FILTERLOGMODULE, LogLevel::Error,
                     ("(Auto) Filter evaluation failed"));
             LogFilterMessage(u"Filter evaluation failed"_ns, filter);
+            if (propagateMatchErrors) {
+              rv = matchTermStatus;
+              break;
+            }
+            // Legacy automatic filtering keeps its best-effort continuation.
           }
           if (!result)
             MOZ_LOG(FILTERLOGMODULE, LogLevel::Info,

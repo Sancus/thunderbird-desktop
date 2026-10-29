@@ -7,6 +7,7 @@
 #include "nsIMsgFolder.idl"
 
 interface nsIURI;
+interface nsIMsgOperationListener;
 
 
 /**
@@ -24,6 +25,14 @@ interface nsIPop3Sink : nsISupports {
 
   /// message uri for header-only message version
   attribute AUTF8String origMessageUri;
+
+  /**
+   * True only after the current incorporation confirms a completed same-key
+   * Panorama Partial row. Retained through later filter/copy errors and abort.
+   * Reset by the next successful incorporateBegin, not rejected reentry.
+   * This does not report filter success or atomic body/SQL/UIDL persistence.
+   */
+  readonly attribute boolean confirmedPartialCompletion;
 
   /**
    * Indicate that mail is about to be passed to the sink.
@@ -73,8 +82,13 @@ interface nsIPop3Sink : nsISupports {
    *
    * @param aMsgWindow
    * @param aSize the size of the message, as reported by the server.
+   * @param aCallback optional terminal listener. Before acceptance, failure is
+   *   returned without a callback. After acceptance, success means launched;
+   *   exactly one callback reports the final status, possibly synchronously.
+   *   Omitting the listener keeps synchronous completion.
    */
-  void incorporateComplete(in nsIMsgWindow aMsgWindow, in int32_t aSize);
+  void incorporateComplete(in nsIMsgWindow aMsgWindow, in int32_t aSize,
+                          [optional] in nsIMsgOperationListener aCallback);
 
   /**
    * Called to indicate that passing over the message to the sink has failed.

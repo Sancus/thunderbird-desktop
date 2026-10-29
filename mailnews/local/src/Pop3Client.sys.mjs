@@ -1559,34 +1559,27 @@ export class Pop3Client {
         this._sendNoopIfInactive();
       },
       () => {
-        try {
-          this._sink.incorporateComplete(
-            this._msgWindow,
-            // Set size because it's a partial message.
-            this._messageSizeMap.get(this._currentMessage.messageNumber)
-          );
-        } catch (e) {
-          this._logger.error(`Incorporate complete FAILED! ${e.message}`, e);
-          this._actionMessageWriteError(e);
-          return;
-        }
-
-        const state = this._uidlMap.get(this._currentMessage.uidl);
-        if (state?.status == UIDL_FETCH_BODY) {
-          this._actionRetr();
-          return;
-        }
-        if (state?.status == UIDL_DELETE) {
-          this._actionDelete();
-          return;
-        }
-        this._uidlMap.set(this._currentMessage.uidl, {
-          status: UIDL_TOO_BIG,
-          uidl: this._currentMessage.uidl,
-          receivedAt: Math.floor(Date.now() / 1000),
-        });
-        this._uidlMapChanged = true;
-        this._actionHandleMessage();
+        this._completeMessage(
+          this._messageSizeMap.get(this._currentMessage.messageNumber),
+          () => {
+            const state = this._uidlMap.get(this._currentMessage.uidl);
+            if (state?.status == UIDL_FETCH_BODY) {
+              this._actionRetr();
+              return;
+            }
+            if (state?.status == UIDL_DELETE) {
+              this._actionDelete();
+              return;
+            }
+            this._uidlMap.set(this._currentMessage.uidl, {
+              status: UIDL_TOO_BIG,
+              uidl: this._currentMessage.uidl,
+              receivedAt: Math.floor(Date.now() / 1000),
+            });
+            this._uidlMapChanged = true;
+            this._actionHandleMessage();
+          }
+        );
       }
     );
   };
@@ -1639,38 +1632,176 @@ export class Pop3Client {
       () => {
         // Don't count the ending indicator.
         this._totalReceivedSize -= ".\r\n".length;
-        try {
-          this._sink.incorporateComplete(
-            this._msgWindow,
-            0 // Set size only when it's a partial message.
-          );
-        } catch (e) {
-          this._logger.error(`Incorporate complete FAILED! ${e.message}`, e);
-          this._actionMessageWriteError(e);
-          return;
-        }
-        if (this._server.leaveMessagesOnServer) {
-          const state = this._uidlMap.get(this._currentMessage.uidl);
-          if (state?.status == UIDL_DELETE) {
-            this._actionDelete();
+        this._completeMessage(0, () => {
+          if (this._server.leaveMessagesOnServer) {
+            const state = this._uidlMap.get(this._currentMessage.uidl);
+            if (state?.status == UIDL_DELETE) {
+              this._actionDelete();
+            } else {
+              this._uidlMap.set(this._currentMessage.uidl, {
+                status: UIDL_KEEP,
+                uidl: this._currentMessage.uidl,
+                receivedAt: Math.floor(Date.now() / 1000),
+              });
+              this._uidlMapChanged = true;
+              this._actionHandleMessage();
+            }
           } else {
-            this._uidlMap.set(this._currentMessage.uidl, {
-              status: UIDL_KEEP,
-              uidl: this._currentMessage.uidl,
-              receivedAt: Math.floor(Date.now() / 1000),
-            });
-            this._uidlMapChanged = true;
-            this._actionHandleMessage();
+            this._actionDelete();
           }
-        } else {
-          this._actionDelete();
-        }
+        });
       }
     );
 
     this._totalReceivedSize += res.data.length;
     this._updateProgress();
   };
+
+  /**
+   * Wait for terminal sink/filter completion before advancing this message.
+   *
+   * @param {number} size - Server size for a partial message, or zero.
+   * @param {Function} next - Existing successful protocol continuation.
+   */
+  _completeMessage(size, next) {
+    if (this._pendingIncorporation) {
+      this._actionMessageWriteError(
+        Components.Exception(
+          "Incorporation already pending",
+          Cr.NS_ERROR_IN_PROGRESS
+        )
+      );
+      return;
+    }
+    const pending = {
+      message: this._currentMessage,
+      uidl: this._currentMessage.uidl,
+      sink: this._sink,
+      confirmed: false,
+      receivedAt: 0,
+      dispatching: true,
+      stopped: false,
+      status: Cr.NS_OK,
+    };
+    this._pendingIncorporation = pending;
+    this._nextAction = null;
+    const record = status => {
+      if (
+        Components.isSuccessCode(pending.status) &&
+        !Components.isSuccessCode(status)
+      ) {
+        pending.status = status;
+      }
+    };
+    const settle = () => {
+      if (
+        pending.dispatching ||
+        !pending.stopped ||
+        this._pendingIncorporation != pending
+      ) {
+        return;
+      }
+      if (
+        this._done ||
+        this._cleanedUp ||
+        this._currentMessage != pending.message ||
+        this._currentMessage.uidl != pending.uidl ||
+        this._sink != pending.sink
+      ) {
+        this._pendingIncorporation = null;
+        return;
+      }
+      try {
+        this._recordConfirmedPartial(
+          pending,
+          !Components.isSuccessCode(pending.status)
+        );
+      } catch (error) {
+        record(error.result || Cr.NS_ERROR_FAILURE);
+      }
+      this._pendingIncorporation = null;
+      if (!Components.isSuccessCode(pending.status)) {
+        if (pending.confirmed) {
+          // The parser reports the filter failure; delivery is already saved.
+          this._logger.error("Post-delivery filtering failed", pending.status);
+          this._actionDone(pending.status);
+        } else {
+          this._actionMessageWriteError(
+            Components.Exception("Incorporate complete failed", pending.status)
+          );
+        }
+        return;
+      }
+      next();
+    };
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgOperationListener"]),
+      onStopOperation: status => {
+        if (pending.stopped) {
+          return;
+        }
+        record(status);
+        pending.stopped = true;
+        settle();
+      },
+    };
+    try {
+      pending.sink.incorporateComplete(this._msgWindow, size, listener);
+    } catch (error) {
+      // A reentrant success callback cannot hide a failing dispatch return.
+      record(error.result || Cr.NS_ERROR_FAILURE);
+      pending.stopped = true;
+    } finally {
+      // Capture receipt time when storage confirms, before a late filter copy.
+      try {
+        this._recordConfirmedPartial(pending, false);
+      } catch (error) {
+        record(error.result || Cr.NS_ERROR_FAILURE);
+      }
+      pending.dispatching = false;
+      settle();
+    }
+  }
+
+  /**
+   * Preserve confirmed delivery separately from a later filter/copy failure.
+   *
+   * @param {{message: {uidl: string}, uidl: string, sink: nsIPop3Sink,
+   *   confirmed: boolean, receivedAt: number}} pending - Current incorporation.
+   * @param {boolean} preserve - Keep the received UIDL through error requeue.
+   */
+  _recordConfirmedPartial(pending, preserve) {
+    if (
+      this._pendingIncorporation != pending ||
+      this._currentMessage != pending.message ||
+      this._sink != pending.sink ||
+      !pending.uidl ||
+      this._currentMessage.uidl != pending.uidl
+    ) {
+      return;
+    }
+    if (!pending.confirmed && pending.sink.confirmedPartialCompletion) {
+      pending.confirmed = true;
+      pending.receivedAt = Math.floor(Date.now() / 1000);
+    }
+    if (!pending.confirmed || !preserve) {
+      return;
+    }
+    const receipt = {
+      status: UIDL_KEEP,
+      uidl: pending.uidl,
+      receivedAt: pending.receivedAt,
+    };
+    Object.assign(pending.message, receipt);
+    // Preserve the receipt if an older queued f entry has the same UIDL.
+    for (const message of this._messagesToHandle) {
+      if (message.uidl == pending.uidl) {
+        Object.assign(message, receipt);
+      }
+    }
+    this._uidlMap.set(pending.uidl, receipt);
+    this._uidlMapChanged = true;
+  }
 
   /**
    * Send `DELE` request to the server.
@@ -1779,6 +1910,21 @@ export class Pop3Client {
       return;
     }
     this._done = true;
+    if (this._pendingIncorporation) {
+      if (Components.isSuccessCode(status)) {
+        status = Cr.NS_BINDING_ABORTED;
+      }
+      try {
+        this._recordConfirmedPartial(this._pendingIncorporation, true);
+      } catch (error) {
+        this._logger.error("Reading confirmed Partial outcome failed", error);
+      }
+      try {
+        this._sink.incorporateAbort();
+      } catch (error) {
+        this._logger.error("Abort pending incorporation failed", error);
+      }
+    }
     this._logger.debug(`Done with status=0x${status.toString(16)}`);
     this._authenticating = false;
     if (status == Cr.NS_OK) {

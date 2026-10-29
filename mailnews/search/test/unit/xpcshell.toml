@@ -5,6 +5,7 @@ support-files = [
   "../../../../mail/test/browser/smime/data/*"
 ]
 head = "head_mailbase.js"
+dupe-manifest = true
 
 ["test_base64_decoding.js"]
 
@@ -13,6 +14,8 @@ head = "head_mailbase.js"
 ["test_bug404489.js"]
 
 ["test_copyThenMoveManual.js"]
+
+["test_filterConditionalErrors.js"]
 
 ["test_filterNoTargetFolder.js"]
 

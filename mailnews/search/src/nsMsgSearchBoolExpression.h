@@ -71,6 +71,12 @@ class nsMsgSearchBoolExpression {
                        nsIMsgSearchScopeTerm* scope, nsIMsgDatabase* db,
                        const nsACString& headers, bool Filtering);
 
+  // Filtering reports the first evaluated term error and clears the result.
+  nsresult OfflineEvaluate(nsIMsgDBHdr* msgToMatch, const char* defaultCharset,
+                           nsIMsgSearchScopeTerm* scope, nsIMsgDatabase* db,
+                           const nsACString& headers, bool Filtering,
+                           bool* result);
+
   // assuming the expression is for online
   // searches, determine the length of the
   // resulting IMAP/NNTP encoding string

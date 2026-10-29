@@ -118,6 +118,8 @@ class nsParseMailMessageState : public nsIMsgParseMailMsgState,
   virtual ~nsParseMailMessageState() {};
 };
 
+class nsIMsgOperationListener;
+
 class nsParseNewMailState : public nsParseMailMessageState,
                             public nsMsgLineBuffer,
                             public nsIMsgFilterHitNotify {
@@ -141,6 +143,12 @@ class nsParseNewMailState : public nsParseMailMessageState,
 
   void ApplyFilters(bool* pMoved, nsIMsgWindow* msgWindow);
   nsresult ApplyForwardAndReplyFilter(nsIMsgWindow* msgWindow);
+#ifdef MOZ_PANORAMA
+  // A listener admits CopyToFolder and receives the terminal filter status.
+  nsresult ApplyFiltersToCompletedMessage(
+      nsIMsgDBHdr* header, nsIMsgOperationListener* completion = nullptr);
+  void CancelCompletedFilters(nsresult status);
+#endif
 
   // These three vars are public because they need to be carried between
   // messages.
@@ -169,6 +177,14 @@ class nsParseNewMailState : public nsParseMailMessageState,
                                            nsIMsgWindow* msgWindow);
   virtual void MarkFilteredMessageRead(nsIMsgDBHdr* msgHdr);
   virtual void MarkFilteredMessageUnread(nsIMsgDBHdr* msgHdr);
+
+#ifdef MOZ_PANORAMA
+  struct CompletedFilterState;
+  RefPtr<CompletedFilterState> m_completedFilters;
+  void RunCompletedFilters(CompletedFilterState* state);
+  nsresult OnCompletedFilterCopy(CompletedFilterState* state, uint64_t serial,
+                                 nsresult status);
+#endif
 
   nsCOMPtr<nsIMsgFilterList> m_filterList;
   nsCOMPtr<nsIMsgFilterList> m_deferredToServerFilterList;

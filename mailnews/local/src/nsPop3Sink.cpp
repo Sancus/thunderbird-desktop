@@ -31,6 +31,12 @@
 #include "mozilla/Components.h"
 #include "mozilla/Logging.h"
 #include "mozilla/Services.h"
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#  include "PerFolderDatabase.h"
+#  include "mozilla/ResultExtensions.h"
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
 
 /* for logging to Error Console */
 #include "nsIScriptError.h"
@@ -38,7 +44,7 @@
 mozilla::LazyLogModule POP3LOGMODULE("POP3");
 #define POP3LOG(str) "sink: [this=%p] " str, this
 
-NS_IMPL_ISUPPORTS(nsPop3Sink, nsIPop3Sink)
+NS_IMPL_ISUPPORTS(nsPop3Sink, nsIPop3Sink, nsIMsgOperationListener)
 
 nsPop3Sink::nsPop3Sink() {
   m_biffState = 0;
@@ -145,6 +151,7 @@ nsresult nsPop3Sink::DiscardStalePartialMessages(nsIPop3Protocol* protocol) {
 
 NS_IMETHODIMP nsPop3Sink::BeginMailDelivery(bool uidlDownload,
                                             nsIMsgWindow* aMsgWindow) {
+  if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   if (m_outFileStream) {
     return NS_FAILED(m_incorporateStatus) ? m_incorporateStatus
                                           : NS_ERROR_IN_PROGRESS;
@@ -158,8 +165,18 @@ NS_IMETHODIMP nsPop3Sink::BeginMailDelivery(bool uidlDownload,
   nsCOMPtr<nsIMsgAccountManager> acctMgr =
       mozilla::components::AccountManager::Service();
   nsCOMPtr<nsIMsgAccount> account;
-  acctMgr->FindAccountForServer(server, getter_AddRefs(account));
-  if (account) account->GetKey(m_accountKey);
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    m_accountKey.Truncate();
+    MOZ_TRY(acctMgr->FindAccountForServer(server, getter_AddRefs(account)));
+    NS_ENSURE_TRUE(account, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(account->GetKey(m_accountKey));
+  } else
+#endif
+  {
+    acctMgr->FindAccountForServer(server, getter_AddRefs(account));
+    if (account) account->GetKey(m_accountKey);
+  }
 
   bool isLocked;
   nsCOMPtr<nsISupports> supports =
@@ -192,6 +209,7 @@ NS_IMETHODIMP nsPop3Sink::BeginMailDelivery(bool uidlDownload,
 }
 
 NS_IMETHODIMP nsPop3Sink::EndMailDelivery(nsIPop3Protocol* protocol) {
+  if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   if (m_outFileStream && NS_SUCCEEDED(m_incorporateStatus)) {
     RecordIncorporateResult(NS_ERROR_UNEXPECTED);
   }
@@ -311,10 +329,13 @@ nsresult nsPop3Sink::RecordIncorporateResult(nsresult status) {
 
 NS_IMETHODIMP nsPop3Sink::IncorporateBegin(const char* uidlString,
                                            uint32_t flags) {
+  if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
   if (m_outFileStream) return RecordIncorporateResult(NS_ERROR_IN_PROGRESS);
   m_finishCalled = false;
-  return RecordIncorporateResult(IncorporateBeginInternal(uidlString, flags));
+  nsresult rv = IncorporateBeginInternal(uidlString, flags);
+  if (NS_SUCCEEDED(rv)) m_confirmedPartialCompletion = false;
+  return RecordIncorporateResult(rv);
 }
 
 nsresult nsPop3Sink::IncorporateBeginInternal(const char* uidlString,
@@ -330,6 +351,11 @@ nsresult nsPop3Sink::IncorporateBeginInternal(const char* uidlString,
   rv = m_folder->GetMsgDatabase(getter_AddRefs(db));
   NS_ENSURE_SUCCESS(rv, rv);
 
+#ifdef MOZ_PANORAMA
+  // Resolve the source and capture its guard before opening replacement bytes.
+  rv = PreparePartialMessage(uidlString, flags, db);
+  NS_ENSURE_SUCCESS(rv, rv);
+#endif
   rv = m_folder->GetMsgStore(getter_AddRefs(m_msgStore));
   NS_ENSURE_SUCCESS(rv, rv);
   rv = m_msgStore->GetNewMsgOutputStream(m_folder,
@@ -450,6 +476,7 @@ NS_IMETHODIMP nsPop3Sink::SetMsgsToDownload(uint32_t aNumMessages) {
 }
 
 NS_IMETHODIMP nsPop3Sink::IncorporateWrite(const char* block, int32_t length) {
+  if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   return WriteLineToMailbox(nsDependentCString(block, length));
 }
 
@@ -467,17 +494,194 @@ nsresult nsPop3Sink::WriteLineToMailbox(const nsACString& buffer) {
   return RecordIncorporateResult(rv);
 }
 
-NS_IMETHODIMP nsPop3Sink::IncorporateComplete(nsIMsgWindow* aMsgWindow,
-                                              int32_t aSize) {
+NS_IMETHODIMP nsPop3Sink::IncorporateComplete(
+    nsIMsgWindow* aMsgWindow, int32_t aSize,
+    nsIMsgOperationListener* aCallback) {
+  if (m_completionPending) return NS_ERROR_IN_PROGRESS;
   if (NS_FAILED(m_incorporateStatus)) return m_incorporateStatus;
   if (m_finishCalled) {
     return RecordIncorporateResult(NS_ERROR_ALREADY_INITIALIZED);
   }
   if (!m_outFileStream)
     return RecordIncorporateResult(NS_ERROR_NOT_INITIALIZED);
-  return RecordIncorporateResult(
-      IncorporateCompleteInternal(aMsgWindow, aSize));
+  // From acceptance onward only the callback reports terminal status.
+  if (aCallback) {
+    m_completionListener = aCallback;
+    m_completionPending = true;
+  }
+  nsresult rv;
+#ifdef MOZ_PANORAMA
+  nsCOMPtr<nsIMsgDBHdr> completed;
+  if (m_partialBody) {
+    rv = CompletePartialMessage(aSize, getter_AddRefs(completed));
+  } else
+#endif
+  {
+    rv = IncorporateCompleteInternal(aMsgWindow, aSize);
+  }
+  RecordIncorporateResult(rv);
+#ifdef MOZ_PANORAMA
+  if (completed && NS_SUCCEEDED(m_incorporateStatus)) {
+    rv = m_newMailParser->ApplyFiltersToCompletedMessage(
+        completed, aCallback ? this : nullptr);
+    if (aCallback) {
+      // May already have completed synchronously through OnStopOperation.
+      if (NS_FAILED(rv)) (void)OnStopOperation(rv);
+      return NS_OK;
+    }
+  }
+#endif
+  if (aCallback) {
+    (void)OnStopOperation(rv);
+    return NS_OK;
+  }
+  return FinishIncorporation(rv);
 }
+
+nsresult nsPop3Sink::FinishIncorporation(nsresult status) {
+  if (NS_FAILED(RecordIncorporateResult(status))) return m_incorporateStatus;
+  nsresult rv;
+  nsCOMPtr<nsIPop3Service> pop3Service(
+      do_GetService("@mozilla.org/messenger/popservice;1", &rv));
+  if (NS_FAILED(rv)) return RecordIncorporateResult(rv);
+  pop3Service->NotifyDownloadProgress(m_folder, ++m_numMsgsDownloaded,
+                                      m_numNewMessages);
+  return RecordIncorporateResult(NS_OK);
+}
+
+NS_IMETHODIMP nsPop3Sink::OnStopOperation(nsresult status) {
+  if (!m_completionPending) return NS_OK;
+  status = FinishIncorporation(status);
+  nsCOMPtr<nsIMsgOperationListener> completion = m_completionListener.forget();
+  m_completionPending = false;
+  // Retain failed/uncertain provider state; clear only callback ownership.
+  if (completion) (void)completion->OnStopOperation(status);
+  return NS_OK;
+}
+
+#ifdef MOZ_PANORAMA
+nsresult nsPop3Sink::PreparePartialMessage(const char* uidl, uint32_t flags,
+                                           nsIMsgDatabase* database) {
+  m_partialBody.reset();
+  m_partialUri.Truncate();
+  m_partialFinishedToken.Truncate();
+  if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) return NS_OK;
+  if (flags & nsMsgMessageFlags::Partial) {
+    // A truncated response cannot complete an explicitly requested source.
+    return m_origMessageUri.IsEmpty() ? NS_OK : NS_ERROR_UNEXPECTED;
+  }
+
+  nsCOMPtr<nsIMsgDBHdr> original;
+  if (!m_origMessageUri.IsEmpty()) {
+    MOZ_TRY(GetMsgDBHdrFromURI(m_origMessageUri, getter_AddRefs(original)));
+    NS_ENSURE_TRUE(original, NS_ERROR_NOT_AVAILABLE);
+  } else {
+    nsCOMPtr<nsIMsgLocalMailFolder> local = do_QueryInterface(m_folder);
+    NS_ENSURE_TRUE(local, NS_ERROR_NO_INTERFACE);
+    auto* folder = static_cast<nsMsgLocalMailFolder*>(local.get());
+    MOZ_TRY(folder->FindPartialMessageByUidl(
+        m_accountKey, nsDependentCString(uidl ? uidl : ""),
+        getter_AddRefs(original)));
+    if (!original) return NS_OK;  // Ordinary new mail, not a selected Partial.
+  }
+  NS_ENSURE_TRUE(uidl && *uidl && !m_accountKey.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  nsCOMPtr<nsIMsgFolder> originalFolder;
+  MOZ_TRY(original->GetFolder(getter_AddRefs(originalFolder)));
+  NS_ENSURE_TRUE(originalFolder, NS_ERROR_NOT_AVAILABLE);
+  uint64_t folderId, originalFolderId;
+  MOZ_TRY(m_folder->GetId(&folderId));
+  MOZ_TRY(originalFolder->GetId(&originalFolderId));
+  NS_ENSURE_TRUE(folderId == originalFolderId, NS_ERROR_INVALID_ARG);
+  nsMsgKey key;
+  MOZ_TRY(original->GetMessageKey(&key));
+  RefPtr<mozilla::mailnews::DatabaseCore> core =
+      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_INITIALIZED);
+  mozilla::mailnews::MessageBodyState expected;
+  MOZ_TRY(core->MessageDB().GetMessageBodyState(key, expected));
+  NS_ENSURE_TRUE(expected.folderId == folderId &&
+                     (expected.flags & nsMsgMessageFlags::Partial),
+                 NS_ERROR_INVALID_ARG);
+  // OpenFolderDB selects this native facade when Panorama is enabled.
+  auto* folderDB = static_cast<mozilla::mailnews::PerFolderDatabase*>(database);
+  NS_ENSURE_TRUE(folderDB->FolderId() == folderId, NS_ERROR_INVALID_ARG);
+  nsCString storedAccount, storedUidl;
+  MOZ_TRY(
+      ReadPop3MessageIdentity(m_folder, original, storedAccount, storedUidl));
+  NS_ENSURE_TRUE(m_accountKey.Equals(storedAccount) && storedUidl.Equals(uidl),
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(m_folder->GetUriForMsg(original, m_partialUri));
+  m_partialBody.emplace(std::move(expected));
+  return NS_OK;
+}
+
+nsresult nsPop3Sink::CompletePartialMessage(int32_t size,
+                                            nsIMsgDBHdr** result) {
+  NS_ENSURE_ARG_POINTER(result);
+  *result = nullptr;
+  NS_ENSURE_STATE(m_partialBody && m_newMailParser && m_outFileStream);
+  MOZ_TRY(m_newMailParser->HandleLine("", 0));
+  MOZ_TRY(m_newMailParser->FinishHeader());
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  MOZ_TRY(m_newMailParser->GetNewMsgHdr(getter_AddRefs(parsed)));
+  NS_ENSURE_TRUE(m_newMailParser->m_mailDB, NS_ERROR_NOT_INITIALIZED);
+  auto* database = static_cast<mozilla::mailnews::PerFolderDatabase*>(
+      m_newMailParser->m_mailDB.get());
+  NS_ENSURE_TRUE(database->FolderId() == m_partialBody->folderId,
+                 NS_ERROR_INVALID_ARG);
+  nsCOMPtr<nsIMsgDBHdr> original;
+  MOZ_TRY(
+      database->GetMsgHdrForKey(m_partialBody->key, getter_AddRefs(original)));
+  // Keep the user's priority, as legacy UpdateNewMsgHdr does.
+  nsMsgPriorityValue priority;
+  MOZ_TRY(original->GetPriority(&priority));
+  MOZ_TRY(parsed->SetPriority(priority));
+  // The padded incoming X-Mozilla-Keys header must not replace current tags.
+  nsCString keywords, junkOrigin;
+  MOZ_TRY(original->GetStringProperty("keywords", keywords));
+  MOZ_TRY(parsed->SetStringProperty("keywords", keywords));
+  MOZ_TRY(original->GetStringProperty("junkscoreorigin", junkOrigin));
+  if (junkOrigin.EqualsLiteral("plugin")) {
+    MOZ_TRY(parsed->SetStringProperty("junkscore", ""_ns));
+  }
+  if (size) MOZ_TRY(parsed->SetUint32Property("onlineSize", size));
+
+  nsresult rv;
+  nsCOMPtr<nsISupportsString> originalUri =
+      do_CreateInstance(NS_SUPPORTS_STRING_CONTRACTID, &rv);
+  MOZ_TRY(rv);
+  MOZ_TRY(originalUri->SetData(NS_ConvertUTF8toUTF16(m_partialUri)));
+  MOZ_TRY(m_outFileStream->Flush());
+  // From this point neither failure nor SQL rollback permits Discard or retry.
+  m_finishCalled = true;
+  MOZ_TRY(m_msgStore->FinishNewMessage(m_folder, m_outFileStream,
+                                       m_partialFinishedToken));
+  m_outFileStream = nullptr;
+  mozilla::mailnews::FinishedMessageBody finished;
+  finished.storeToken = m_partialFinishedToken;
+  MOZ_TRY(ReadStoredMessageDetails(m_msgStore, m_folder, finished.storeToken,
+                                   &finished.messageSize, &finished.lineCount));
+  // Local bodies are available without the IMAP offline-storage flag/size.
+  nsCOMPtr<nsIMsgDBHdr> completed;
+  MOZ_TRY(database->CompletePartialHdr(*m_partialBody, parsed, finished,
+                                       getter_AddRefs(completed)));
+  // CompletePartialHdr returns success only after the owned native commit.
+  m_confirmedPartialCompletion = true;
+  // DoneParsing must not publish this consumed draft as a new message.
+  m_newMailParser->SetNewMsgHdr(nullptr);
+  if (m_buildMessageUri) m_messageUri = m_partialUri;
+  nsCOMPtr<nsIObserverService> observers =
+      mozilla::services::GetObserverService();
+  if (observers) {
+    observers->NotifyObservers(originalUri, "message-content-updated",
+                               NS_ConvertUTF8toUTF16(m_partialUri).get());
+  }
+  // Filters operate on this committed physical row without replaying Finish.
+  completed.forget(result);
+  return NS_OK;
+}
+#endif
 
 nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
                                                  int32_t aSize) {
@@ -525,7 +729,13 @@ nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
     // getting a complete message when a partial exists), then update the new
     // header from the old.
     nsCOMPtr<nsIMsgDBHdr> oldMsgHdr;
-    if (localFolder) {
+    bool replaceOldHeader = true;
+#ifdef MOZ_PANORAMA
+    // Panorama completion was resolved physically before opening this write.
+    // A different UIDL must never fall back to matching by Message-ID here.
+    replaceOldHeader = !mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+#endif
+    if (localFolder && replaceOldHeader) {
       rv = !m_origMessageUri.IsEmpty()
                ? GetMsgDBHdrFromURI(m_origMessageUri, getter_AddRefs(oldMsgHdr))
                : localFolder->RetrieveHdrOfPartialMessage(
@@ -592,15 +802,18 @@ nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
 #ifdef DEBUG
   printf("Incorporate message complete.\n");
 #endif
-  nsCOMPtr<nsIPop3Service> pop3Service(
-      do_GetService("@mozilla.org/messenger/popservice;1", &rv));
-  NS_ENSURE_SUCCESS(rv, rv);
-  pop3Service->NotifyDownloadProgress(m_folder, ++m_numMsgsDownloaded,
-                                      m_numNewMessages);
   return NS_OK;
 }
 
 NS_IMETHODIMP nsPop3Sink::IncorporateAbort() {
+  if (m_completionPending) {
+    RecordIncorporateResult(NS_BINDING_ABORTED);
+#ifdef MOZ_PANORAMA
+    if (m_newMailParser) {
+      m_newMailParser->CancelCompletedFilters(m_incorporateStatus);
+    }
+#endif
+  }
   if (m_outFileStream && !m_finishCalled) {
     nsresult rv = m_msgStore->DiscardNewMessage(m_folder, m_outFileStream);
     NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
@@ -639,6 +852,12 @@ NS_IMETHODIMP nsPop3Sink::GetBuildMessageUri(bool* bVal) {
 
 NS_IMETHODIMP nsPop3Sink::SetBuildMessageUri(bool bVal) {
   m_buildMessageUri = bVal;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsPop3Sink::GetConfirmedPartialCompletion(bool* confirmed) {
+  NS_ENSURE_ARG_POINTER(confirmed);
+  *confirmed = m_confirmedPartialCompletion;
   return NS_OK;
 }
 

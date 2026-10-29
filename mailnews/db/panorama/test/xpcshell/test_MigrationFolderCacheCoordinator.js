@@ -44,7 +44,7 @@ const IMAP_NAMES = [
   "blah",
   "foo",
 ];
-const unixOnly = { skip_if: () => AppConstants.platform == "win" };
+const skipOnWindows = () => AppConstants.platform == "win";
 let lock;
 let work;
 let source;
@@ -75,6 +75,30 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
     lock.unlock();
     nativeProfile.remove(false);
   });
+  work = await IOUtils.createUniqueDirectory(
+    PathUtils.parent(profile.path),
+    "migration-cache-native-"
+  );
+  registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
+  const summary = new FileUtils.File(PathUtils.join(work, "source.msf"));
+  const body = new FileUtils.File(PathUtils.join(work, "source"));
+  for (const [file, fixture] of [
+    [summary, "data/migration.msf"],
+    [body, "data/migration"],
+  ]) {
+    await IOUtils.write(
+      file.path,
+      await IOUtils.read(do_get_file(fixture).path),
+      {
+        mode: "create",
+      }
+    );
+  }
+  // Initialize NSS before quiescing the profile for the backup.
+  Assert.equal(
+    await IOUtils.computeHexDigest(summary.path, "sha256"),
+    "7a262023b98fe964d105de06bf1ddca60f90ee19073e38afda8c885be5a47703"
+  );
   const creator = new ProfileCreator(profile);
   const local = creator.addLocalServer();
   for (const name of LOCAL_NAMES) {
@@ -83,8 +107,8 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
   const originalControl = await local.rootFolder.addMailFolder(
     "cache-control",
     {
-      summary: do_get_file("data/migration.msf"),
-      mbox: do_get_file("data/migration"),
+      summary,
+      mbox: body,
     }
   );
   const serverKey = "migrationCacheImap";
@@ -105,14 +129,13 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
     new FileUtils.File(PathUtils.join(profile.path, "prefs.js"))
   );
   source = PathUtils.join(profile.path, "panacea.dat");
-  await IOUtils.copy(do_get_file(CACHE_FILE).path, source, {
-    noOverwrite: true,
-  });
-  work = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
-    "migration-cache-native-"
+  await IOUtils.write(
+    source,
+    await IOUtils.read(do_get_file(CACHE_FILE).path),
+    {
+      mode: "create",
+    }
   );
-  registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
   Assert.ok(
     !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite")))
   );
@@ -127,10 +150,17 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
       profile
     );
   }
+  const backupRoot = await IOUtils.createUniqueDirectory(
+    PathUtils.parent(profile.path),
+    "migration-cache-backup-"
+  );
+  registerCleanupFunction(() =>
+    IOUtils.remove(backupRoot, { recursive: true })
+  );
   backup = await createMigrationBackup(
     profile.path,
     [],
-    PathUtils.join(work, "backup")
+    PathUtils.join(backupRoot, "backup")
   );
   loadExistingDB();
   MailServices.accounts.accounts;
@@ -248,7 +278,7 @@ function changes() {
 }
 
 add_task(
-  unixOnly,
+  { skip_if: skipOnWindows },
   async function test_nativeDescriptorsAndExactTextWithoutApplication() {
     const input = await cacheInput();
     const original = await IOUtils.read(source);
@@ -336,7 +366,7 @@ add_task(
 );
 
 add_task(
-  unixOnly,
+  { skip_if: skipOnWindows },
   async function test_descriptorMismatchRefusesWithoutWrites() {
     const input = await cacheInput();
     const wrong = new Map(bindings);
@@ -361,57 +391,72 @@ add_task(
   }
 );
 
-add_task(unixOnly, async function test_missingBindingRefusesWholeCache() {
-  const input = await cacheInput();
-  const partial = new Map(bindings);
-  partial.delete(OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf");
-  const count = changes();
-  await Assert.rejects(
-    prepareMorkFolderCacheImport(
-      input.journal,
-      database,
-      lock,
-      source,
-      partial
-    ),
-    /Incomplete native folder-cache mapping/
-  );
-  Assert.equal(changes(), count);
-});
-
-add_task(unixOnly, async function test_duplicatePhysicalFolderRefuses() {
-  const input = await cacheInput();
-  const wrong = new Map(bindings);
-  wrong.set(
-    OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf",
-    bindings.get(OLD_ROOT + "ImapMail/imap.localhost/Archives.msf")
-  );
-  const count = changes();
-  await Assert.rejects(
-    prepareMorkFolderCacheImport(input.journal, database, lock, source, wrong),
-    /unique current native identity/
-  );
-  Assert.equal(changes(), count);
-});
-
-add_task(unixOnly, async function test_wrongRetainedIncarnationRefuses() {
-  const input = await cacheInput("another-native-database");
-  const before = await IOUtils.read(input.path);
-  await Assert.rejects(
-    prepareMorkFolderCacheImport(
-      input.journal,
-      database,
-      lock,
-      source,
-      bindings
-    ),
-    /retained migration plan/
-  );
-  Assert.deepEqual(await IOUtils.read(input.path), before);
-});
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_missingBindingRefusesWholeCache() {
+    const input = await cacheInput();
+    const partial = new Map(bindings);
+    partial.delete(OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf");
+    const count = changes();
+    await Assert.rejects(
+      prepareMorkFolderCacheImport(
+        input.journal,
+        database,
+        lock,
+        source,
+        partial
+      ),
+      /Incomplete native folder-cache mapping/
+    );
+    Assert.equal(changes(), count);
+  }
+);
 
 add_task(
-  unixOnly,
+  { skip_if: skipOnWindows },
+  async function test_duplicatePhysicalFolderRefuses() {
+    const input = await cacheInput();
+    const wrong = new Map(bindings);
+    wrong.set(
+      OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf",
+      bindings.get(OLD_ROOT + "ImapMail/imap.localhost/Archives.msf")
+    );
+    const count = changes();
+    await Assert.rejects(
+      prepareMorkFolderCacheImport(
+        input.journal,
+        database,
+        lock,
+        source,
+        wrong
+      ),
+      /unique current native identity/
+    );
+    Assert.equal(changes(), count);
+  }
+);
+
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_wrongRetainedIncarnationRefuses() {
+    const input = await cacheInput("another-native-database");
+    const before = await IOUtils.read(input.path);
+    await Assert.rejects(
+      prepareMorkFolderCacheImport(
+        input.journal,
+        database,
+        lock,
+        source,
+        bindings
+      ),
+      /retained migration plan/
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+  }
+);
+
+add_task(
+  { skip_if: skipOnWindows },
   async function test_identicalUnbackedPathIsNotOriginalSource() {
     const input = await cacheInput();
     const elsewhere = PathUtils.join(lock.directory.path, "unbacked-cache.dat");
@@ -450,7 +495,7 @@ add_task(
 );
 
 add_task(
-  unixOnly,
+  { skip_if: skipOnWindows },
   async function test_otherHeldProfileDoesNotAdmitSelectedTarget() {
     const input = await cacheInput();
     const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
@@ -483,7 +528,7 @@ add_task(
 );
 
 add_task(
-  unixOnly,
+  { skip_if: skipOnWindows },
   async function test_linkedCacheLeafIsNotNormalizedIntoOriginal() {
     const input = await cacheInput();
     const alias = PathUtils.join(lock.directory.path, "cache-alias.dat");
@@ -514,26 +559,29 @@ add_task(
   }
 );
 
-add_task(unixOnly, async function test_summaryDescriptorCannotNameADirectory() {
-  const input = await cacheInput();
-  const summary = bindings.get(OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf")
-    .folder.summaryFile.path;
-  Assert.ok(!(await IOUtils.exists(summary)));
-  await IOUtils.makeDirectory(summary);
-  const count = changes();
-  try {
-    await Assert.rejects(
-      prepareMorkFolderCacheImport(
-        input.journal,
-        database,
-        lock,
-        source,
-        bindings
-      ),
-      /Unsupported native folder-cache path type/
-    );
-    Assert.equal(changes(), count);
-  } finally {
-    await IOUtils.remove(summary);
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_summaryDescriptorCannotNameADirectory() {
+    const input = await cacheInput();
+    const summary = bindings.get(OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf")
+      .folder.summaryFile.path;
+    Assert.ok(!(await IOUtils.exists(summary)));
+    await IOUtils.makeDirectory(summary);
+    const count = changes();
+    try {
+      await Assert.rejects(
+        prepareMorkFolderCacheImport(
+          input.journal,
+          database,
+          lock,
+          source,
+          bindings
+        ),
+        /Unsupported native folder-cache path type/
+      );
+      Assert.equal(changes(), count);
+    } finally {
+      await IOUtils.remove(summary);
+    }
   }
-});
+);

@@ -75,7 +75,7 @@ add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
     nativeProfile.remove(false);
   });
   work = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
+    PathUtils.parent(profileLock.directory.path),
     "migration-native-coordinator-"
   );
   registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
@@ -90,6 +90,12 @@ add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
     body.path,
     await IOUtils.read(do_get_file("data/migration").path),
     { mode: "create" }
+  );
+  // Initialize NSS before quiescing the profile for the backup.
+  Assert.equal(
+    await IOUtils.computeHexDigest(summary.path, "sha256"),
+    "7a262023b98fe964d105de06bf1ddca60f90ee19073e38afda8c885be5a47703",
+    "The copied legacy summary retains its genuine fixture bytes"
   );
   const creator = new ProfileCreator(profile);
   const local = creator.addLocalServer();
@@ -158,10 +164,17 @@ add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
     !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite"))),
     "Closed source backup precedes target startup"
   );
+  const backupRoot = await IOUtils.createUniqueDirectory(
+    PathUtils.parent(profileLock.directory.path),
+    "migration-coordinator-backup-"
+  );
+  registerCleanupFunction(() =>
+    IOUtils.remove(backupRoot, { recursive: true })
+  );
   backup = await createMigrationBackup(
     profileLock.directory.path,
     [],
-    PathUtils.join(work, "backup")
+    PathUtils.join(backupRoot, "backup")
   );
   loadExistingDB();
   MailServices.accounts.accounts;

@@ -618,7 +618,7 @@ function childPath(root, parts) {
         part == "." ||
         part == ".." ||
         PathUtils.isAbsolute(part) ||
-        PathUtils.filename(part) != part
+        PathUtils.filename(PathUtils.join(root, part)) != part
     )
   ) {
     throw new Error("Invalid backup entry path");

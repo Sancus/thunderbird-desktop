@@ -95,6 +95,52 @@ function physicalReceiptModel(journal) {
   };
 }
 
+add_task(async function test_backupVerifiesNestedPathComponents() {
+  const { plan } = await migrationFiles();
+  const nested = PathUtils.join(plan.mailPaths[0], "nested");
+  await IOUtils.makeDirectory(nested);
+  const source = PathUtils.join(nested, "Inbox.msf");
+  await IOUtils.copy(plan.sources[0].path, source);
+  const original = await IOUtils.read(source);
+  const backup = await createMigrationBackup(
+    plan.profilePath,
+    plan.mailPaths,
+    plan.backupPath
+  );
+  Assert.equal(
+    (await verifyMigrationBackup(plan.backupPath)).sha256,
+    backup.sha256
+  );
+  Assert.deepEqual(
+    await IOUtils.read(
+      PathUtils.join(plan.backupPath, "root-1", "nested", "Inbox.msf")
+    ),
+    original
+  );
+  Assert.deepEqual(await IOUtils.read(source), original);
+});
+
+add_task(async function test_backupRejectsParentPathComponents() {
+  const { plan } = await migrationFiles();
+  const source = await IOUtils.read(plan.sources[0].path);
+  const backup = await createMigrationBackup(
+    plan.profilePath,
+    plan.mailPaths,
+    plan.backupPath
+  );
+  const manifest = await IOUtils.readJSON(backup.path);
+  manifest.roots[0].entries[0].parts = ["..", "escaped"];
+  await IOUtils.writeJSON(backup.path, manifest);
+  await Assert.rejects(
+    verifyMigrationBackup(plan.backupPath),
+    /Invalid backup entry path/
+  );
+  Assert.ok(
+    !(await IOUtils.exists(PathUtils.join(plan.backupPath, "escaped")))
+  );
+  Assert.deepEqual(await IOUtils.read(plan.sources[0].path), source);
+});
+
 add_task(async function test_journalResumesCommittedImport() {
   const { plan, path } = await migrationFiles();
   let journal = await MigrationJournal.create(path, plan);

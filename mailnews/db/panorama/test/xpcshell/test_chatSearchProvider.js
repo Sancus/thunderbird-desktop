@@ -599,3 +599,179 @@ add_task(
     await Assert.rejects(provider.search("orbit"), /provider is closing/);
   }
 );
+
+add_task(async function test_resolveLogKeepsTheClickedPhysicalFile() {
+  const fixture = await openChatFixture("open-physical");
+  const { provider, writer, conversation } = fixture;
+  const firstPath = fixture.filePath;
+  await logText(fixture, "physicalopenneedle first", { remoteId: "shared" });
+  await provider.refreshLog(firstPath);
+  writer.startNewFile(conversation.startDate / 1000 + 1000, true);
+  await writer._initialized;
+  const selectedPath = writer.currentPath;
+  await logText(fixture, "physicalopenneedle selected", { remoteId: "shared" });
+  await provider.refreshLog(selectedPath);
+  const ids = [firstPath, selectedPath].map(
+    filePath =>
+      "chat:" +
+      JSON.stringify([
+        "search-test",
+        "search-open-physical",
+        "buddy",
+        PathUtils.filename(filePath),
+      ])
+  );
+  const page = await provider.search("physicalopenneedle");
+  Assert.deepEqual(page.items.map(hit => hit.id).sort(), [...ids].sort());
+  const firstHit = page.items.find(hit => hit.id == ids[0]);
+  const selectedHit = page.items.find(hit => hit.id == ids[1]);
+  const request = { ...selectedHit };
+  const pending = provider.resolveLog(request);
+  Object.assign(request, firstHit);
+  const result = await pending;
+  Assert.equal(result.status, "ready");
+  Assert.equal(result.id, ids[1]);
+  Assert.equal(result.log.path, selectedPath);
+  Assert.equal(result.contentRevision, selectedHit.contentRevision);
+  Assert.equal(result.textRevision, selectedHit.textRevision);
+  Assert.deepEqual(
+    result.conversation
+      .getMessages()
+      .filter(message => !message.noLog)
+      .map(message => message.message),
+    ["physicalopenneedle selected"],
+    "The reader receives only the clicked file, not the grouped day or another version"
+  );
+  await queueFileOperation(selectedPath, () => IOUtils.remove(selectedPath));
+  Assert.deepEqual(await provider.resolveLog(selectedHit), {
+    status: "deleted",
+  });
+  Assert.equal((await provider.resolveLog(firstHit)).status, "ready");
+});
+
+add_task(async function test_resolveLogChecksTokensPolicyAndCancellation() {
+  const fixture = await openChatFixture("open-tokens");
+  const { provider, filePath } = fixture;
+  await logText(fixture, "openrevisionneedle", { remoteId: "edited" });
+  await provider.refreshLog(filePath);
+  const [oldHit] = (await provider.search("openrevisionneedle")).items;
+  await provider.refreshLog(filePath);
+  Assert.deepEqual(await provider.resolveLog(oldHit), { status: "stale" });
+  const [hit] = (await provider.search("openrevisionneedle")).items;
+  Services.prefs.setBoolPref("mailnews.database.global.indexer.enabled", false);
+  try {
+    Assert.deepEqual(await provider.resolveLog(hit), { status: "ineligible" });
+  } finally {
+    Services.prefs.setBoolPref(
+      "mailnews.database.global.indexer.enabled",
+      true
+    );
+  }
+  const controller = new AbortController();
+  const reason = new Error("Cancel the transcript opening");
+  controller.abort(reason);
+  await Assert.rejects(
+    provider.resolveLog(hit, { signal: controller.signal }),
+    error => error === reason
+  );
+  Assert.throws(
+    () => provider.resolveLog({ ...hit, id: "mail-message-id" }),
+    /Invalid chat document identity/
+  );
+  Assert.throws(
+    () => provider.resolveLog({ id: hit.id }),
+    /current chat search hit/
+  );
+  await logText(fixture, "newopeningneedle", { remoteId: "edited" });
+  Assert.deepEqual(await provider.resolveLog(hit), { status: "stale" });
+  await provider.refreshLog(filePath);
+  const [current] = (await provider.search("newopeningneedle")).items;
+  Assert.equal((await provider.resolveLog(current)).status, "ready");
+  await provider.close();
+  await Assert.rejects(provider.resolveLog(current), /provider is closing/);
+});
+
+add_task(async function test_resolveLogPreservesErrorsAndDetectsParseRaces() {
+  const fixture = await openChatFixture("open-race");
+  const { provider, filePath } = fixture;
+  await logText(fixture, "oldopeningrace", { remoteId: "edited" });
+  await provider.refreshLog(filePath);
+  const [hit] = (await provider.search("oldopeningrace")).items;
+  const original = logs.getLogFromFile;
+  const failure = new Error("Original logger read failure");
+  logs.getLogFromFile = async () => {
+    throw failure;
+  };
+  try {
+    await Assert.rejects(provider.resolveLog(hit), error => error === failure);
+  } finally {
+    logs.getLogFromFile = original;
+  }
+  Assert.equal((await provider.resolveLog(hit)).status, "ready");
+  logs.getLogFromFile = async function (...args) {
+    const log = await original.apply(this, args);
+    const getConversation = log.getConversation;
+    log.getConversation = async function () {
+      const parsed = await getConversation.call(this);
+      await logText(fixture, "replacementopeningrace", { remoteId: "edited" });
+      return parsed;
+    };
+    return log;
+  };
+  try {
+    Assert.deepEqual(await provider.resolveLog(hit), { status: "stale" });
+  } finally {
+    logs.getLogFromFile = original;
+  }
+  await provider.refreshLog(filePath);
+  const [current] = (await provider.search("replacementopeningrace")).items;
+  const controller = new AbortController();
+  const reason = new Error("Cancel after parsing the physical transcript");
+  logs.getLogFromFile = async function (...args) {
+    const log = await original.apply(this, args);
+    const getConversation = log.getConversation;
+    log.getConversation = async function () {
+      const parsed = await getConversation.call(this);
+      controller.abort(reason);
+      return parsed;
+    };
+    return log;
+  };
+  try {
+    await Assert.rejects(
+      provider.resolveLog(current, { signal: controller.signal }),
+      error => error === reason
+    );
+  } finally {
+    logs.getLogFromFile = original;
+  }
+  Assert.equal((await provider.resolveLog(current)).status, "ready");
+});
+
+add_task(async function test_persistedNoLogRecordCannotReachTheReader() {
+  const fixture = await openChatFixture("open-no-log");
+  const { provider, filePath } = fixture;
+  await logText(fixture, "publicopeningneedle");
+  // The writer omits noLog messages. Supply a persisted record explicitly to
+  // exercise admission of older or externally changed logs, not writer behavior.
+  const record = {
+    date: "2022-03-04T12:00:02Z",
+    who: "sender",
+    text: "privatenologopeningneedle",
+    flags: ["incoming", "noLog"],
+    remoteId: "private",
+  };
+  await queueFileOperation(filePath, () =>
+    IOUtils.writeUTF8(filePath, JSON.stringify(record) + "\n", {
+      mode: "append",
+    })
+  );
+  await provider.refreshLog(filePath);
+  Assert.deepEqual(
+    (await provider.search("privatenologopeningneedle")).items,
+    []
+  );
+  const [hit] = (await provider.search("publicopeningneedle")).items;
+  Assert.ok(hit);
+  Assert.deepEqual(await provider.resolveLog(hit), { status: "ineligible" });
+});

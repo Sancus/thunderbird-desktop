@@ -116,7 +116,8 @@ async function readSource(filePath, signal) {
  *
  * @param {Uint8Array} bytes - Complete log bytes.
  * @param {string[]} parts - Logger path components.
- * @returns {{title: string, messages: {who: string, text: string}[]}} Source text used to check the parser.
+ * @returns {{title: string, hasNoLogRecords: boolean,
+ *   messages: {who: string, text: string}[]}} Source evidence used to check the parser.
  * @throws {Error} For malformed or mismatched metadata or message records.
  */
 function validateSource(bytes, parts) {
@@ -162,6 +163,7 @@ function validateSource(bytes, parts) {
   }
   return {
     title: header.title,
+    hasNoLogRecords: records.some(record => record.flags.includes("noLog")),
     messages: records
       .filter(
         (record, i) =>
@@ -176,6 +178,47 @@ function validateSource(bytes, parts) {
             ? record.text.slice(4)
             : record.text,
       })),
+  };
+}
+
+/**
+ * Uses the existing single-file logger parser only after validating its source.
+ * The tolerant display parser must not omit an edit or redaction record.
+ *
+ * @param {string} filePath - Current physical log file.
+ * @param {{bytes: Uint8Array}} source - Complete source bytes.
+ * @param {AbortSignal} [signal] - Cancel parsed result delivery.
+ * @returns {Promise<{log: Log, conversation: LogConversation,
+ *   messages: imIMessage[], hasNoLogRecords: boolean}>}
+ *   Real logger objects and their validated visible records.
+ */
+async function readLogConversation(filePath, source, signal) {
+  const expected = validateSource(source.bytes, logComponents(filePath));
+  const log = await IMServices.logs.getLogFromFile(filePath);
+  const conversation = await log.getConversation();
+  signal?.throwIfAborted();
+  const messages = conversation
+    ?.getMessages()
+    .filter(message => !message.noLog);
+  if (
+    !messages ||
+    conversation.title != expected.title ||
+    messages.length != expected.messages.length ||
+    messages.some(
+      (message, i) =>
+        (message.alias || message.who || "") != expected.messages[i].who ||
+        message.message != expected.messages[i].text
+    )
+  ) {
+    throw new Error(
+      "Chat logger did not return the complete source transcript"
+    );
+  }
+  return {
+    log,
+    conversation,
+    messages,
+    hasNoLogRecords: expected.hasNoLogRecords,
   };
 }
 
@@ -296,27 +339,11 @@ export class ChatSearchProvider {
       return { id, indexed: false };
     }
     const source = await readSource(filePath, signal);
-    const expected = validateSource(source.bytes, logComponents(filePath));
-    const log = await IMServices.logs.getLogFromFile(filePath);
-    const conversation = await log.getConversation();
-    signal?.throwIfAborted();
-    const messages = conversation
-      ?.getMessages()
-      .filter(message => !message.noLog);
-    if (
-      !messages ||
-      conversation.title != expected.title ||
-      messages.length != expected.messages.length ||
-      messages.some(
-        (message, i) =>
-          (message.alias || message.who || "") != expected.messages[i].who ||
-          message.message != expected.messages[i].text
-      )
-    ) {
-      throw new Error(
-        "Chat logger did not return the complete source transcript"
-      );
-    }
+    const { conversation, messages } = await readLogConversation(
+      filePath,
+      source,
+      signal
+    );
     const body = messages
       .map(message => {
         const who = message.alias || message.who;
@@ -395,6 +422,102 @@ export class ChatSearchProvider {
         return { ...page, items: [], cursor: null };
       }
       return page;
+    });
+    this.#pending = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
+  }
+
+  /**
+   * Resolves a captured hit to its current single physical log and conversation.
+   * Rechecks source bytes, stored text token and policy before delivery. The log
+   * has an absolute current path; it is not a Gloda relative-path result or a
+   * grouped-day log. Readers must use the returned conversation, not reparse
+   * the log unchecked. Persisted noLog records prevent opening the file.
+   * No reader is opened and no network content is retrieved.
+   *
+   * @param {SearchHit} hit - Captured transcript identity and exact revisions.
+   * @param {object} [options={}] - Opening resolution controls.
+   * @param {AbortSignal} [options.signal] - Cancel after queued logger operations.
+   * @returns {Promise<{status: "ready", id: string, contentRevision: string,
+   *   textRevision: string, log: Log, conversation: LogConversation} |
+   *   {status: "deleted"|"ineligible"|"stale"}>}
+   *   Ready objects, or deleted/ineligible/stale without substitute content.
+   * @throws {TypeError} For an incomplete or noncanonical transcript token.
+   * @throws {Error} Source I/O/parser errors, logger/cancellation failures, or closing provider.
+   */
+  resolveLog(hit, { signal } = {}) {
+    const request = {
+      id: hit?.id,
+      contentRevision: hit?.contentRevision,
+      textRevision: hit?.textRevision,
+    };
+    if (
+      Object.values(request).some(value => typeof value != "string" || !value)
+    ) {
+      throw new TypeError("A current chat search hit is required");
+    }
+    const filePath = logPath(request.id);
+    if (this.#closing) {
+      return Promise.reject(new Error("Chat search provider is closing"));
+    }
+    const result = this.#pending.then(async () => {
+      signal?.throwIfAborted();
+      const state = await this.resolveDocument(request.id, { signal });
+      signal?.throwIfAborted();
+      if (!state) {
+        return { status: "deleted" };
+      }
+      if (!state.eligible) {
+        return { status: "ineligible" };
+      }
+      if (state.contentRevision !== request.contentRevision) {
+        return { status: "stale" };
+      }
+      const text = await this.#index.getText(request.id, { signal });
+      signal?.throwIfAborted();
+      if (
+        !text ||
+        text.textRevision !== request.textRevision ||
+        text.contentRevision !== request.contentRevision
+      ) {
+        return { status: "stale" };
+      }
+      const source = await readSource(filePath, signal);
+      if (source.revision !== request.contentRevision) {
+        return { status: "stale" };
+      }
+      const { log, conversation, hasNoLogRecords } = await readLogConversation(
+        filePath,
+        source,
+        signal
+      );
+      if (hasNoLogRecords) {
+        return { status: "ineligible" };
+      }
+      if (log.path !== filePath) {
+        throw new Error("Chat logger returned a different physical transcript");
+      }
+      const current = await this.resolveDocument(request.id, { signal });
+      signal?.throwIfAborted();
+      if (!current) {
+        return { status: "deleted" };
+      }
+      if (
+        !current.eligible ||
+        !Services.prefs.getBoolPref(
+          "mailnews.database.global.indexer.enabled",
+          false
+        )
+      ) {
+        return { status: "ineligible" };
+      }
+      if (current.contentRevision !== request.contentRevision) {
+        return { status: "stale" };
+      }
+      return { status: "ready", ...request, log, conversation };
     });
     this.#pending = result.then(
       () => {},

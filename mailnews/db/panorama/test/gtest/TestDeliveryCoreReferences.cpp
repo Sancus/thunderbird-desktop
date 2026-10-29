@@ -6882,4 +6882,239 @@ TEST_F(DeliveryCoreReferences, Schema14UpgradeKeepsThreadAndPendingState) {
   EXPECT_FALSE(published);
 }
 
+TEST_F(DeliveryCoreReferences, QueuedSourceReadIsDurableAndReadOnly) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 61));
+  auto& db = mCore->MessageDB();
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("read-queued-source@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, Add("source-control@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 61, 700));
+  OfflineOperationData payload;
+  payload.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  // Mutable compatibility fields are not the captured source identity.
+  payload.sourceKey = control;
+  payload.sourceUid = UINT32_MAX;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_EQ(NS_OK, db.SetOfflineOperationPlayingBack(mFolderId, key, true));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(key));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 62));
+  Maybe<ServerMessageLocation> source;
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(mFolderId, source->folderId);
+  EXPECT_EQ(key, source->key);
+  EXPECT_EQ(61u, source->epoch);
+  EXPECT_EQ(700u, source->uid);
+  ASSERT_NO_FATAL_FAILURE(CheckOfflineSource(key, 61, 700));
+  OfflineOperationData stored;
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, key, stored));
+  EXPECT_EQ(control, stored.sourceKey);
+  EXPECT_EQ(UINT32_MAX, stored.sourceUid);
+  EXPECT_TRUE(stored.playingBack);
+  // Reading neither dispatches nor changes the payload revision.
+  nsCOMPtr<mozIStorageStatement> state;
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateStatement(
+                "SELECT revision, (SELECT COUNT(*) FROM offline_attempts) "
+                "FROM offline_operations WHERE messageKey=:key"_ns,
+                getter_AddRefs(state)));
+  ASSERT_EQ(NS_OK, state->BindInt64ByName("key"_ns, key));
+  bool more;
+  ASSERT_EQ(NS_OK, state->ExecuteStep(&more));
+  ASSERT_TRUE(more);
+  int64_t revision, attempts;
+  ASSERT_EQ(NS_OK, state->GetInt64(0, &revision));
+  ASSERT_EQ(NS_OK, state->GetInt64(1, &attempts));
+  EXPECT_EQ(1, revision);
+  EXPECT_EQ(0, attempts);
+  ASSERT_EQ(NS_OK, state->Finalize());
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperationSource(mFolderId, key, source));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  bool exists = true;
+  ASSERT_EQ(NS_OK, reopened.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, reopened.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, QueuedSourceAbsenceDoesNotCaptureLaterBinding) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("initially-unbound@invalid"_ns, {}, key));
+  OfflineOperationData payload;
+  payload.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 81));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 81, 42));
+  payload.sourceUid = 999;
+  payload.keywordsToAdd = "later edit"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  Maybe<ServerMessageLocation> source =
+      Some(ServerMessageLocation{99, 98, 97, 96});
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
+  EXPECT_FALSE(source);
+  uint64_t attempt = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BeginOfflineAttempt(mFolderId, key,
+                                   nsIMsgOfflineImapOperation::kFlagsChanged,
+                                   Nothing(), attempt));
+  EXPECT_EQ(123u, attempt);
+  source = Some(ServerMessageLocation{99, 98, 97, 96});
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetOfflineOperationSource(mFolderId + 1, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(96u, source->uid);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetOfflineOperationSource(mFolderId, nsMsgKey_None - 1, source));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db.GetOfflineOperationSource(0, key, source));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.GetOfflineOperationSource(mFolderId, nsMsgKey_None, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(99u, source->folderId);
+  EXPECT_EQ(98u, source->key);
+  EXPECT_EQ(97u, source->epoch);
+  EXPECT_EQ(96u, source->uid);
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperationSource(mFolderId, key,
+                                                                source));
+  EXPECT_FALSE(source);
+}
+
+TEST_F(DeliveryCoreReferences, QueuedSourceErrorsPreserveOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 91));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("source-read-fault@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 91, UINT32_MAX));
+  OfflineOperationData payload;
+  payload.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  for (const char* projection :
+       {"id, revision, NULL AS epoch, uid, folderEpoch",
+        "id, revision, -1 AS epoch, uid, folderEpoch",
+        "id, revision, 'invalid' AS epoch, uid, folderEpoch",
+        "id, revision, epoch, 4294967296 AS uid, folderEpoch",
+        "id, 'invalid' AS revision, epoch, uid, folderEpoch"}) {
+    nsCString sql("CREATE TEMP VIEW offline_operations AS SELECT ");
+    sql.Append(projection);
+    sql.AppendLiteral(", folderId, messageKey FROM main.offline_operations");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    Maybe<ServerMessageLocation> source =
+        Some(ServerMessageLocation{99, 98, 97, 96});
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              db.GetOfflineOperationSource(mFolderId, key, source));
+    ASSERT_TRUE(source);
+    EXPECT_EQ(96u, source->uid);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP VIEW temp.offline_operations"_ns));
+  }
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW offline_operations AS SELECT * FROM "
+                       "main.offline_operations "
+                       "UNION ALL SELECT * FROM main.offline_operations"_ns));
+  Maybe<ServerMessageLocation> source =
+      Some(ServerMessageLocation{99, 98, 97, 96});
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(96u, source->uid);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.offline_operations"_ns));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("source_read_fault"_ns, 1, witness));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP VIEW offline_operations AS SELECT id, revision, "
+          "CASE WHEN source_read_fault(messageKey)=0 THEN "
+          "abs(-9223372036854775808) "
+          "ELSE epoch END AS epoch, uid, folderEpoch, folderId, messageKey "
+          "FROM main.offline_operations"_ns));
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            db.GetOfflineOperationSource(mFolderId, key, source));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(key, witness->mLastKey);
+  ASSERT_TRUE(source);
+  EXPECT_EQ(96u, source->uid);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.offline_operations"_ns));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(91u, source->epoch);
+  EXPECT_EQ(UINT32_MAX, source->uid);
+}
+
+TEST_F(DeliveryCoreReferences, QueuedSourceCaptureFailureRollsBackIntent) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 101));
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("source-write-fault@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, Add("source-write-control@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 101, 700));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(control, mFolderId, 101, 701));
+  OfflineOperationData payload;
+  payload.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, control, payload));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("source_write_fault"_ns, 1, witness));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_source_capture BEFORE INSERT ON "
+          "offline_operations "
+          "WHEN NEW.uid=700 BEGIN SELECT source_write_fault(NEW.messageKey); "
+          "SELECT RAISE(ABORT, 'source capture failure'); END"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.StoreOfflineOperation(mFolderId, key, payload));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(key, witness->mLastKey);
+  bool active = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  Maybe<ServerMessageLocation> source =
+      Some(ServerMessageLocation{99, 98, 97, 96});
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(96u, source->uid);
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, control, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(701u, source->uid);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_source_capture"_ns));
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_NO_FATAL_FAILURE(CheckOfflineSource(key, 101, 700));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAttempt(mFolderId, key,
+                                   nsIMsgOfflineImapOperation::kFlagsChanged,
+                                   Nothing(), attemptId));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(700u, source->uid);
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
+  EXPECT_EQ(1u, attempt.revision);
+  ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(attemptId));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  EXPECT_EQ(OfflineAttemptState::Ambiguous, attempt.state);
+  EXPECT_EQ(1u, attempt.revision);
+}
+
 }  // namespace mozilla::mailnews

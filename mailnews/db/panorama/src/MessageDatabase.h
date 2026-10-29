@@ -307,6 +307,11 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult ReserveOfflineOperationKey(uint64_t folderId, nsMsgKey& key);
   nsresult GetOfflineOperation(uint64_t folderId, nsMsgKey key,
                                OfflineOperationData& output);
+  // Reads the immutable queued tuple, even after local message removal.
+  // Nothing means no captured tuple; a missing operation is NOT_AVAILABLE.
+  // Does not check the current server epoch or begin an attempt.
+  nsresult GetOfflineOperationSource(uint64_t folderId, nsMsgKey key,
+                                     Maybe<ServerMessageLocation>& output);
   nsresult StoreOfflineOperation(uint64_t folderId, nsMsgKey key,
                                  const OfflineOperationData& input);
   nsresult SetOfflineOperationPlayingBack(uint64_t folderId, nsMsgKey key,

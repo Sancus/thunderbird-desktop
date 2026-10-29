@@ -1936,6 +1936,12 @@ nsresult MessageDatabase::ReadOfflineOperationIdentity(
   MOZ_TRY(stmt->ExecuteStep(&more));
   NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
   int64_t foundId, foundRevision;
+  for (uint32_t column : {0u, 1u}) {
+    int32_t type;
+    MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+    NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_INTEGER,
+                   NS_ERROR_FILE_CORRUPTED);
+  }
   MOZ_TRY(stmt->GetInt64(0, &foundId));
   MOZ_TRY(stmt->GetInt64(1, &foundRevision));
   NS_ENSURE_TRUE(foundId > 0 && foundRevision > 0, NS_ERROR_FILE_CORRUPTED);
@@ -1957,12 +1963,26 @@ nsresult MessageDatabase::ReadOfflineOperationIdentity(
     MOZ_TRY(OfflineUint32(stmt, 4, epoch));
     scopeEpoch = Some(epoch);
   }
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
   if (folderEpoch) {
     *folderEpoch = scopeEpoch;
   }
   id = foundId;
   revision = foundRevision;
   source = target;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::GetOfflineOperationSource(
+    uint64_t folderId, nsMsgKey key, Maybe<ServerMessageLocation>& output) {
+  NS_ENSURE_TRUE(
+      folderId && folderId <= INT64_MAX && key && key < nsMsgKey_None,
+      NS_ERROR_INVALID_ARG);
+  int64_t id, revision;
+  Maybe<ServerMessageLocation> source;
+  MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source));
+  output = source;
   return NS_OK;
 }
 
@@ -2212,7 +2232,10 @@ nsresult MessageDatabase::StoreOfflineOperation(
                        NS_ERROR_NOT_AVAILABLE);
         nsTArray<nsCString> names;
         MOZ_TRY(GetMessagePropertyNames(key, names));
-        if (!source && names.Contains("uidOnServer"_ns)) {
+        MOZ_TRY(member->ExecuteStep(&exists));
+        NS_ENSURE_FALSE(exists, NS_ERROR_FILE_CORRUPTED);
+        // A missing historical tuple must never acquire a later binding.
+        if (!id && names.Contains("uidOnServer"_ns)) {
           ServerMessageLocation location{folderId, key};
           RefPtr<Message> header = new Message(key);
           MOZ_TRY(header->GetUint32Property("uidOnServer", &location.uid));

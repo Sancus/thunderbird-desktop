@@ -16,6 +16,7 @@ add_setup(async function () {
   await installDBFromFile("db/messages.sql");
   const profile = new ProfileCreator(do_get_profile());
   const server = profile.addLocalServer();
+  server.isMaildirStore = false;
   await server.rootFolder.addMailFolder("folderA");
   await server.rootFolder.addMailFolder("folderB");
   await server.rootFolder.addMailFolder("folderC");
@@ -24,6 +25,17 @@ add_setup(async function () {
   const localServer = MailServices.accounts.localFoldersServer;
   Assert.equal(localServer.key, "server1");
   rootFolder = localServer.rootFolder;
+  Assert.strictEqual(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+      .getService(Ci.nsIMsgDBService)
+      .QueryInterface(Ci.nsIDatabaseCore),
+    database
+  );
+  Assert.equal(rootFolder.msgStore.storeType, "mbox");
+  Assert.equal(
+    localServer.getStringValue("storeContractID"),
+    "@mozilla.org/msgstore/berkeleystore;1"
+  );
 });
 
 add_task(async function testFolderMethods() {
@@ -549,4 +561,261 @@ add_task(async function testListener() {
   );
   // TODO
   //Assert.equal(headerRemoved.getStringProperty("keywords"), "");
+});
+
+add_task(function test_syncCountsUsesPhysicalMembership() {
+  const root = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const folder = root.createLocalSubfolder("physical-counts");
+  const other = root.createLocalSubfolder("other-counts");
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  const unread = addMessage({ folderId: folder.id, messageId: "count-unread" });
+  const removed = addMessage({
+    folderId: folder.id,
+    messageId: "count-remove",
+  });
+  addMessage({
+    folderId: folder.id,
+    messageId: "count-read",
+    flags: Ci.nsMsgMessageFlags.Read,
+  });
+  addMessage({ folderId: other.id, messageId: "count-other" });
+  const unpublished = db.createNewHdr();
+  unpublished.messageId = "count-unpublished";
+  info.setUint32Property("numMsgs", 900);
+  info.setUint32Property("numNewMsgs", 800);
+  info.imapTotalPendingMessages = 10;
+  info.imapUnreadPendingMessages = 9;
+
+  const events = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrAdded: () => events.push("added"),
+    onHdrDeleted: () => events.push("deleted"),
+    onHdrFlagsChanged: () => events.push("flags"),
+    onParentChanged: () => events.push("parent"),
+    onAnnouncerGoingAway: () => events.push("goingAway"),
+    onReadChanged: () => events.push("read"),
+    onJunkScoreChanged: () => events.push("junk"),
+    onHdrPropertyChanged: () => events.push("property"),
+    onEvent: () => events.push("event"),
+  };
+  db.addListener(listener);
+  try {
+    db.syncCounts();
+    Assert.equal(info.numMessages, 3);
+    Assert.equal(info.numUnreadMessages, 2);
+    Assert.equal(info.getUint32Property("numMsgs", 0), 900);
+    Assert.equal(info.getUint32Property("numNewMsgs", 0), 800);
+    Assert.equal(info.imapTotalPendingMessages, 10);
+    Assert.equal(info.imapUnreadPendingMessages, 9);
+    Assert.deepEqual(events, [], "reconciliation emits no fabricated changes");
+  } finally {
+    db.removeListener(listener);
+  }
+
+  db.markRead(unread, true, null);
+  messageDB.removeMessage(removed);
+  db.syncCounts();
+  Assert.equal(info.numMessages, 2);
+  Assert.equal(info.numUnreadMessages, 0);
+  Assert.equal(other.msgDatabase.dBFolderInfo.numMessages, 1);
+  Assert.equal(other.msgDatabase.dBFolderInfo.numUnreadMessages, 1);
+  Assert.throws(() => (info.numMessages = 50), /NS_ERROR_NOT_IMPLEMENTED/);
+  Assert.throws(
+    () => info.changeNumUnreadMessages(1),
+    /NS_ERROR_NOT_IMPLEMENTED/
+  );
+  Assert.equal(info.numMessages, 2);
+  Assert.equal(info.numUnreadMessages, 0);
+});
+
+add_task(function test_virtualCountSummariesAndCheckedDeltas() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("virtual-counts");
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  info.orFlags(Ci.nsMsgFolderFlags.Virtual);
+  Assert.equal(info.numMessages, 0);
+  Assert.equal(info.numUnreadMessages, 0);
+  db.syncCounts();
+  info.numMessages = 7;
+  info.numUnreadMessages = 3;
+  info.changeNumMessages(2);
+  info.changeNumUnreadMessages(-4);
+  Assert.equal(info.numMessages, 9);
+  Assert.equal(info.numUnreadMessages, 0);
+  db.syncCounts();
+  Assert.equal(
+    info.numMessages,
+    9,
+    "sync retains the completed search summary"
+  );
+  Assert.deepEqual(db.listAllKeys(), [], "summary counts create no membership");
+
+  info.numMessages = 0x7fffffff;
+  Assert.throws(
+    () => info.changeNumMessages(1),
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  Assert.equal(info.numMessages, 0x7fffffff);
+  info.setUint32Property("numNewMsgs", 0x80000000);
+  Assert.throws(() => db.syncCounts(), /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/);
+  Assert.equal(info.getUint32Property("numNewMsgs", 0), 0x80000000);
+});
+
+add_task(function test_pendingCountsKeepSignedBitsAndPresence() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("pending-values");
+  const info = folder.msgDatabase.dBFolderInfo;
+  const statement = database.connectionForTests.createStatement(
+    "SELECT name, typeof(value) AS type, value FROM folder_properties " +
+      "WHERE id = :id AND name IN ('totPendingMsgs', 'unreadPendingMsgs') " +
+      "ORDER BY name"
+  );
+  try {
+    Assert.equal(info.imapTotalPendingMessages, 0);
+    Assert.equal(info.imapUnreadPendingMessages, 0);
+    statement.params.id = folder.id;
+    Assert.ok(
+      !statement.executeStep(),
+      "default reads do not create properties"
+    );
+    statement.reset();
+    for (const [attribute, property] of [
+      ["imapTotalPendingMessages", "totPendingMsgs"],
+      ["imapUnreadPendingMessages", "unreadPendingMsgs"],
+    ]) {
+      for (const value of [-2147483648, -1, 2147483647, 0]) {
+        info[attribute] = value;
+        Assert.equal(folder.msgDatabase.dBFolderInfo[attribute], value);
+        Assert.equal(info.getUint32Property(property, 99), value >>> 0);
+      }
+    }
+    statement.params.id = folder.id;
+    const rows = [];
+    while (statement.executeStep()) {
+      rows.push([statement.row.name, statement.row.type, statement.row.value]);
+    }
+    Assert.deepEqual(rows, [
+      ["totPendingMsgs", "integer", 0],
+      ["unreadPendingMsgs", "integer", 0],
+    ]);
+  } finally {
+    statement.finalize();
+  }
+  Assert.equal(info.numMessages, 0);
+  Assert.equal(info.numUnreadMessages, 0);
+  folder.changeNumPendingTotalMessages(3);
+  folder.changeNumPendingUnread(2);
+  Assert.equal(info.imapTotalPendingMessages, 3);
+  Assert.equal(info.imapUnreadPendingMessages, 2);
+  folder.changeNumPendingTotalMessages(-1);
+  folder.changeNumPendingUnread(-1);
+  Assert.equal(info.imapTotalPendingMessages, 2);
+  Assert.equal(info.imapUnreadPendingMessages, 1);
+  Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+});
+
+add_task(function test_pendingCountErrorsPreserveStoredValues() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("pending-errors");
+  const info = folder.msgDatabase.dBFolderInfo;
+  info.imapTotalPendingMessages = 7;
+  info.imapUnreadPendingMessages = 5;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_pending_count BEFORE INSERT ON folder_properties " +
+      `WHEN NEW.id = ${folder.id} AND ` +
+      "NEW.name IN ('totPendingMsgs', 'unreadPendingMsgs') " +
+      "BEGIN SELECT RAISE(ABORT, 'pending count fault'); END"
+  );
+  try {
+    Assert.throws(
+      () => (info.imapTotalPendingMessages = 9),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.throws(
+      () => (info.imapUnreadPendingMessages = 9),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.equal(info.imapTotalPendingMessages, 7);
+    Assert.equal(info.imapUnreadPendingMessages, 5);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_pending_count");
+  }
+  connection.beginTransaction();
+  try {
+    info.imapTotalPendingMessages = -3;
+    info.imapUnreadPendingMessages = -2;
+    Assert.equal(info.imapTotalPendingMessages, -3);
+    Assert.equal(info.imapUnreadPendingMessages, -2);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(info.imapTotalPendingMessages, 7);
+  Assert.equal(info.imapUnreadPendingMessages, 5);
+  for (const [property, value] of [
+    ["totPendingMsgs", "-1"],
+    ["unreadPendingMsgs", "4294967296"],
+  ]) {
+    connection.executeSimpleSQL(
+      `UPDATE folder_properties SET value = ${value} ` +
+        `WHERE id = ${folder.id} AND name = '${property}'`
+    );
+  }
+  Assert.throws(
+    () => info.imapTotalPendingMessages,
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  Assert.throws(
+    () => info.imapUnreadPendingMessages,
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+});
+
+add_task(function test_countReadFailuresAndDeletedFolder() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("count-read-errors");
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO hidden_count_messages"
+  );
+  try {
+    Assert.throws(() => db.syncCounts(), /NS_ERROR_FAILURE/);
+    Assert.throws(() => info.numMessages, /NS_ERROR_FAILURE/);
+    Assert.throws(() => info.numUnreadMessages, /NS_ERROR_FAILURE/);
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE hidden_count_messages RENAME TO messages"
+    );
+  }
+  connection.executeSimpleSQL(
+    "ALTER TABLE folder_properties RENAME TO hidden_count_properties"
+  );
+  try {
+    Assert.throws(() => info.imapTotalPendingMessages, /NS_ERROR_FAILURE/);
+    Assert.throws(() => info.imapUnreadPendingMessages, /NS_ERROR_FAILURE/);
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE hidden_count_properties RENAME TO folder_properties"
+    );
+  }
+  db.syncCounts();
+  Assert.equal(info.numMessages, 0);
+  folderDB.deleteFolder(folder.id);
+  Assert.throws(() => db.syncCounts(), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => info.numMessages, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => info.imapTotalPendingMessages, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(
+    () => (info.imapUnreadPendingMessages = 1),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
 });

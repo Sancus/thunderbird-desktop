@@ -825,8 +825,20 @@ nsresult PerFolderDatabase::WriteCount(bool unread, int32_t count) {
                                 int64_t{count});
 }
 
+nsresult PerFolderDatabase::ChangeCount(bool unread, int32_t delta) {
+  int32_t count;
+  MOZ_TRY(ReadCount(unread, &count));
+  CheckedInt<int32_t> changed(count);
+  changed += delta;
+  NS_ENSURE_TRUE(changed.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  return WriteCount(unread, std::max(0, changed.value()));
+}
+
 NS_IMETHODIMP PerFolderDatabase::SyncCounts() {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  // Physical counts are derived; virtual folders retain their search summary.
+  int32_t total, unread;
+  MOZ_TRY(ReadCount(false, &total));
+  return ReadCount(true, &unread);
 }
 NS_IMETHODIMP PerFolderDatabase::GetThreadContainingMsgHdr(
     nsIMsgDBHdr* msgHdr, nsIMsgThread** thread) {
@@ -1468,10 +1480,10 @@ NS_IMETHODIMP FolderInfo::SetFolderDate(uint32_t aFolderDate) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP FolderInfo::ChangeNumUnreadMessages(int32_t aDelta) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return mPerFolderDatabase->ChangeCount(true, aDelta);
 }
 NS_IMETHODIMP FolderInfo::ChangeNumMessages(int32_t aDelta) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return mPerFolderDatabase->ChangeCount(false, aDelta);
 }
 NS_IMETHODIMP FolderInfo::GetNumUnreadMessages(int32_t* aNumUnreadMessages) {
   return mPerFolderDatabase->ReadCount(true, aNumUnreadMessages);
@@ -1519,19 +1531,33 @@ NS_IMETHODIMP FolderInfo::SetVersion(uint32_t aVersion) {
 }
 NS_IMETHODIMP FolderInfo::GetImapTotalPendingMessages(
     int32_t* aImapTotalPendingMessages) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aImapTotalPendingMessages);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  uint32_t value;
+  MOZ_TRY(GetUint32Property("totPendingMsgs", 0, &value));
+  *aImapTotalPendingMessages = static_cast<int32_t>(value);
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetImapTotalPendingMessages(
     int32_t aImapTotalPendingMessages) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return SetUint32Property("totPendingMsgs",
+                           static_cast<uint32_t>(aImapTotalPendingMessages));
 }
 NS_IMETHODIMP FolderInfo::GetImapUnreadPendingMessages(
     int32_t* aImapUnreadPendingMessages) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aImapUnreadPendingMessages);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  uint32_t value;
+  MOZ_TRY(GetUint32Property("unreadPendingMsgs", 0, &value));
+  *aImapUnreadPendingMessages = static_cast<int32_t>(value);
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetImapUnreadPendingMessages(
     int32_t aImapUnreadPendingMessages) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return SetUint32Property("unreadPendingMsgs",
+                           static_cast<uint32_t>(aImapUnreadPendingMessages));
 }
 NS_IMETHODIMP FolderInfo::GetUserSortOrder(uint32_t* userSortOrder) {
   return NS_ERROR_NOT_IMPLEMENTED;

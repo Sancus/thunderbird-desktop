@@ -86,6 +86,7 @@ class PerFolderDatabase : public nsIMsgDatabase,
   nsresult CheckFolderExists() const;
   nsresult ReadCount(bool unread, int32_t* count);
   nsresult WriteCount(bool unread, int32_t count);
+  nsresult ChangeCount(bool unread, int32_t delta);
   void RememberLastUseTime() { mLastUseTime = PR_Now(); }
   nsresult GetMsgHdrForProperty(const nsACString& name,
                                 const nsACString& value,

@@ -129,7 +129,6 @@ class nsIMAPMailboxInfo {
 #define IMAP_RECEIVED_GREETING        0x00000001  // should we pause for the next read
 #define  IMAP_CONNECTION_IS_OPEN      0x00000004  // is the connection currently open?
 #define IMAP_WAITING_FOR_DATA         0x00000008
-#define IMAP_CLEAN_UP_URL_STATE       0x00000010  // processing clean up url state
 #define IMAP_ISSUED_LANGUAGE_REQUEST  0x00000020  // make sure we only issue the language
                                                   // request once per connection...
 #define IMAP_ISSUED_COMPRESS_REQUEST  0x00000040  // make sure we only request compression once
@@ -378,6 +377,8 @@ class nsImapProtocol : public nsIImapProtocol,
   // It is cleared when we finish processng a url and it is set whenever we call
   // Load on a url
   bool m_urlInProgress;
+  // Protected by mMonitor, including the main-thread interruption check.
+  bool m_urlInCleanup = false;
   bool IsUrlInProgress();
 
   /** The nsIImapURL that is currently running. */
@@ -727,6 +728,8 @@ class nsImapProtocol : public nsIImapProtocol,
 
   bool m_notifySearchHit;
   bool m_needNoop;
+  // Written by the worker and read by the socket callback under this monitor.
+  // Worker-only reads need no lock; writes use m_urlReadyToRunMonitor.
   bool m_idle;
   bool m_useIdle;
   int32_t m_noopCount;

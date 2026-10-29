@@ -227,3 +227,102 @@ add_task(async function test_urlSinkHandoffAfterIdleResponse() {
     [8101]
   );
 });
+
+add_task(async function test_repeatedIdleWakeAndUnrelatedInterrupt() {
+  const [original] = other.msgDatabase.enumerateMessages();
+  const originalKey = original.messageKey;
+  const originalText = server.getMessagesInFolder(other)[0].getText();
+  for (const [uid, messageId, body] of [
+    [8102, "idle-other-first@example.invalid", "First new IDLE body.\r\n"],
+    [8103, "idle-other-second@example.invalid", "Second new IDLE body.\r\n"],
+  ]) {
+    // Streaming may use the cache, so select the folder being tested.
+    const selected = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.selectFolder(other, selected, null);
+    await selected.promise;
+    const mailbox = server.daemon.getMailbox("Other");
+    Assert.equal(other.getTotalMessages(false), uid - 8101);
+    Assert.equal(mailbox._messages.length, uid - 8101);
+    // The fake server retains EXISTS for every command, including IDLE.
+    // Clear only already-delivered notifications; the next wake is explicit.
+    mailbox._updates.length = 0;
+    await TestUtils.waitForCondition(
+      () =>
+        server.daemon.getConnections("Other").some(handler => handler.idling),
+      "The selected folder enters IDLE again"
+    );
+    const idleInterrupt = {};
+    incomingServer.pseudoInterruptMsgLoad(other, null, idleInterrupt);
+    Assert.equal(idleInterrupt.value, false, "IDLE is not a message fetch");
+    const raw =
+      "From: sender@example.invalid\r\n" +
+      `Message-ID: <${messageId}>\r\n` +
+      "Subject: Repeated IDLE wake\r\n\r\n" +
+      body;
+    await server.addMessages("Other", [raw], false);
+    const added = PromiseTestUtils.promiseFolderNotification(other, "msgAdded");
+    const loaded = PromiseTestUtils.promiseFolderEvent(other, "FolderLoaded");
+    Assert.equal(
+      server.daemon.sendUnsolicited("Other", [
+        "* XFOO another response",
+        `* ${uid - 8100} EXISTS`,
+      ]),
+      1
+    );
+    await Promise.all([added, loaded]);
+    Assert.equal(other.getTotalMessages(false), uid - 8100);
+    Assert.equal(other.msgDatabase.dBFolderInfo.imapUidValidity, 7202);
+    Assert.ok(other.msgDatabase.containsKey(originalKey));
+    const header = other.msgDatabase.getMsgHdrForMessageID(messageId);
+    Assert.ok(header);
+    Assert.equal(header.folder, other);
+    if (panorama) {
+      Assert.notEqual(header.messageKey, uid);
+      Assert.equal(header.getUint32Property("uidOnServer"), uid);
+    } else {
+      Assert.equal(header.messageKey, uid);
+    }
+    let starts = 0;
+    let stops = 0;
+    const stream = new PromiseTestUtils.PromiseStreamListener({
+      onStartRequest() {
+        starts++;
+        const interrupted = {};
+        incomingServer.pseudoInterruptMsgLoad(inbox, null, interrupted);
+        Assert.equal(
+          interrupted.value,
+          false,
+          "Another folder cannot interrupt"
+        );
+      },
+      onStopRequest(request, status) {
+        stops++;
+        Assert.equal(status, Cr.NS_OK);
+      },
+    });
+    const uri = other.getUriForMsg(header);
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      stream,
+      null,
+      null,
+      false,
+      "",
+      false
+    );
+    Assert.ok((await stream.promise).endsWith(body));
+    Assert.equal(starts, 1);
+    Assert.equal(stops, 1);
+    const messages = server.getMessagesInFolder(other);
+    Assert.equal(messages[0].getText(), originalText);
+    Assert.equal(messages.at(-1).getText(), raw);
+    Assert.deepEqual(
+      messages.map(message => message.uid),
+      uid == 8102 ? [8101, 8102] : [8101, 8102, 8103]
+    );
+    Assert.deepEqual(
+      server.getMessagesInFolder(inbox).map(message => message.uid),
+      [8101, 8102]
+    );
+  }
+});

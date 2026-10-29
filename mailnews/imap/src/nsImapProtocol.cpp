@@ -1196,9 +1196,13 @@ bool nsImapProtocol::RunImapThreadMainLoop() {
     m_proxyRequest = nullptr;
   }
 
-  if (m_runningUrl) {
-    NS_ReleaseOnMainThread("nsImapProtocol::m_runningUrl",
-                           m_runningUrl.forget());
+  nsCOMPtr<nsIImapUrl> runningUrl;
+  {
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    runningUrl = m_runningUrl.forget();
+  }
+  if (runningUrl) {
+    NS_ReleaseOnMainThread("nsImapProtocol::m_runningUrl", runningUrl.forget());
   }
 
   // close streams via UI thread if it's not already done
@@ -1277,13 +1281,11 @@ NS_IMETHODIMP nsImapProtocol::SetupMainThreadProxies() {
 }
 
 NS_IMETHODIMP nsImapProtocol::OnInputStreamReady(nsIAsyncInputStream* inStr) {
-  // should we check if it's a close vs. data available?
-  if (m_idle) {
-    uint64_t bytesAvailable = 0;
-    (void)inStr->Available(&bytesAvailable);
-    // check if data available - might be a close
-    if (bytesAvailable != 0) {
-      ReentrantMonitorAutoEnter mon(m_urlReadyToRunMonitor);
+  uint64_t bytesAvailable = 0;
+  (void)inStr->Available(&bytesAvailable);
+  if (bytesAvailable != 0) {
+    ReentrantMonitorAutoEnter mon(m_urlReadyToRunMonitor);
+    if (m_idle) {
       m_lastActiveTime = PR_Now();
       m_idleResponseReadyToHandle = true;
       mon.Notify();
@@ -1470,48 +1472,37 @@ nsImapProtocol::PseudoInterruptMsgLoad(nsIMsgFolder* aImapFolder,
                                        nsIMsgWindow* aMsgWindow,
                                        bool* interrupted) {
   NS_ENSURE_ARG(interrupted);
-
   *interrupted = false;
+  nsCOMPtr<nsIMsgMailNewsUrl> urlToDoom;
+  {
+    // ReleaseUrlState and main-thread URL setup use this same monitor.
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    if (!m_runningUrl || m_urlInCleanup) return NS_OK;
 
-  PR_CEnterMonitor(this);
-
-  if (m_runningUrl && !TestFlag(IMAP_CLEAN_UP_URL_STATE)) {
     nsImapAction imapAction;
-    m_runningUrl->GetImapAction(&imapAction);
-
-    if (imapAction == nsIImapUrl::nsImapMsgFetch) {
-      nsresult rv = NS_OK;
-      nsCOMPtr<nsIImapUrl> runningImapURL;
-
-      rv = GetRunningImapURL(getter_AddRefs(runningImapURL));
-      if (NS_SUCCEEDED(rv) && runningImapURL) {
-        nsCOMPtr<nsIMsgFolder> runningImapFolder;
-        nsCOMPtr<nsIMsgWindow> msgWindow;
-        nsCOMPtr<nsIMsgMailNewsUrl> mailnewsUrl =
-            do_QueryInterface(runningImapURL);
-        mailnewsUrl->GetMsgWindow(getter_AddRefs(msgWindow));
-        mailnewsUrl->GetFolder(getter_AddRefs(runningImapFolder));
-        if (aImapFolder == runningImapFolder && msgWindow == aMsgWindow) {
-          MOZ_LOG(IMAPCache, LogLevel::Debug,
-                  ("%s: Set PseudoInterrupt", __func__));
-          PseudoInterrupt(true);
-          *interrupted = true;
-        }
-        // If we're pseudo-interrupted, doom any incomplete cache entry.
-        // But if mock channel indicates fetch is complete so cache write is
-        // done, then don't doom the cache entry.
-        bool cacheWriteInProgress = true;
-        if (m_mockChannel)
-          m_mockChannel->GetWritingToCache(&cacheWriteInProgress);
-        if (cacheWriteInProgress) {
-          MOZ_LOG(IMAPCache, LogLevel::Debug,
-                  ("%s: Call DoomCacheEntry()", __func__));
-          DoomCacheEntry(mailnewsUrl);
-        }
-      }
+    if (NS_FAILED(m_runningUrl->GetImapAction(&imapAction)) ||
+        imapAction != nsIImapUrl::nsImapMsgFetch) {
+      return NS_OK;
     }
+    nsCOMPtr<nsIMsgMailNewsUrl> mailnewsUrl = do_QueryInterface(m_runningUrl);
+    if (!mailnewsUrl) return NS_OK;
+    nsCOMPtr<nsIMsgFolder> runningImapFolder;
+    nsCOMPtr<nsIMsgWindow> msgWindow;
+    mailnewsUrl->GetMsgWindow(getter_AddRefs(msgWindow));
+    mailnewsUrl->GetFolder(getter_AddRefs(runningImapFolder));
+    if (aImapFolder == runningImapFolder && msgWindow == aMsgWindow) {
+      MOZ_LOG(IMAPCache, LogLevel::Debug,
+              ("%s: Set PseudoInterrupt", __func__));
+      PseudoInterrupt(true);
+      *interrupted = true;
+    }
+    // A completed cache write must survive a subsequent interruption.
+    bool cacheWriteInProgress = true;
+    if (m_mockChannel) m_mockChannel->GetWritingToCache(&cacheWriteInProgress);
+    if (cacheWriteInProgress) urlToDoom = mailnewsUrl;
   }
-  PR_CExitMonitor(this);
+  // Cache callbacks and the last URL release stay outside the monitor.
+  if (urlToDoom) DoomCacheEntry(urlToDoom);
   return NS_OK;
 }
 
@@ -1553,8 +1544,19 @@ void nsImapProtocol::ImapThreadMainLoop() {
       }
     }
 
-    urlReadyToRun = m_nextUrlReadyToRun;
-    m_nextUrlReadyToRun = false;
+    bool idleResponseReady;
+    {
+      ReentrantMonitorAutoEnter mon(m_urlReadyToRunMonitor);
+      urlReadyToRun = m_nextUrlReadyToRun;
+      m_nextUrlReadyToRun = false;
+      idleResponseReady = m_idleResponseReadyToHandle;
+      m_idleResponseReadyToHandle = false;
+      if (idleResponseReady && urlReadyToRun) {
+        // An IDLE response takes this pass; preserve the queued URL.
+        m_nextUrlReadyToRun = true;
+        urlReadyToRun = false;
+      }
+    }
 
     // This will happen if the UI thread signals us to die
     if (m_threadShouldDie) {
@@ -1569,14 +1571,8 @@ void nsImapProtocol::ImapThreadMainLoop() {
 
     // If an idle response has occurred, handle only it on this pass through
     // the loop.
-    if (m_idleResponseReadyToHandle && !m_threadShouldDie) {
-      m_idleResponseReadyToHandle = false;
+    if (idleResponseReady && !m_threadShouldDie) {
       HandleIdleResponses();
-      if (urlReadyToRun) {
-        // A URL is also ready. Process it on next loop.
-        m_nextUrlReadyToRun = true;
-        urlReadyToRun = false;
-      }
     }
 
     if (urlReadyToRun && m_runningUrl) {
@@ -1600,7 +1596,10 @@ void nsImapProtocol::ImapThreadMainLoop() {
       //
       if (ProcessCurrentURL()) {
         // Another URL has been setup to run. Process it on next loop.
-        m_nextUrlReadyToRun = true;
+        {
+          ReentrantMonitorAutoEnter mon(m_urlReadyToRunMonitor);
+          m_nextUrlReadyToRun = true;
+        }
         m_imapMailFolderSink = nullptr;
       } else {
         // No more URLs setup to run. Set idle pending if user has configured
@@ -1675,6 +1674,11 @@ bool nsImapProtocol::HandleIdleResponses() {
       nsCOMPtr<nsIAsyncInputStream> asyncInputStream =
           do_QueryInterface(m_inputStream);
       if (asyncInputStream) {
+        {
+          // Publish IDLE before the socket thread can deliver its callback.
+          ReentrantMonitorAutoEnter mon(m_urlReadyToRunMonitor);
+          m_idle = true;
+        }
         RefPtr callback = MakeRefPtr<ImapInputStreamCallback>(this);
         asyncInputStream->AsyncWait(callback, 0, 0, nullptr);
         Log("HandleIdleResponses", nullptr, "idle mode async waiting");
@@ -2139,7 +2143,10 @@ bool nsImapProtocol::ProcessCurrentURL() {
     m_transport->SetTimeout(nsISocketTransport::TIMEOUT_READ_WRITE,
                             PR_UINT32_MAX);
 
-  SetFlag(IMAP_CLEAN_UP_URL_STATE);
+  {
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    m_urlInCleanup = true;
+  }
 
   nsCOMPtr<nsISupports> copyState;
   if (m_runningUrl) m_runningUrl->GetCopyState(getter_AddRefs(copyState));
@@ -2154,7 +2161,10 @@ bool nsImapProtocol::ProcessCurrentURL() {
   ReleaseUrlState(false);
   ResetProgressInfo();
 
-  ClearFlag(IMAP_CLEAN_UP_URL_STATE);
+  {
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    m_urlInCleanup = false;
+  }
 
   if (imapMailFolderSink) {
     if (copyState) {
@@ -8081,7 +8091,9 @@ void nsImapProtocol::Idle() {
     // HandleIdleResponses() will trigger a select URL which will exit idle mode
     // and update the selected folder. Finally, if IDLE responds with tagged BAD
     // or NO, HandleIdleResponses() will return false.
-    m_idle = HandleIdleResponses();
+    bool idle = HandleIdleResponses();
+    ReentrantMonitorAutoEnter mon(m_urlReadyToRunMonitor);
+    m_idle = idle;
   }
 }
 
@@ -8099,7 +8111,11 @@ void nsImapProtocol::EndIdle(bool waitForResponse /* = true */) {
   if (m_transport && !waitForResponse)
     m_transport->SetTimeout(nsISocketTransport::TIMEOUT_READ_WRITE, 5);
   if (NS_SUCCEEDED(rv)) {
-    m_idle = false;
+    {
+      ReentrantMonitorAutoEnter mon(m_urlReadyToRunMonitor);
+      m_idle = false;
+      m_idleResponseReadyToHandle = false;
+    }
     ParseIMAPandCheckForNewMail();
     // If waiting for response (i.e., not shutting down), check for IDLE
     // untagged response(s) occurring after DONE is sent, which can occur and is

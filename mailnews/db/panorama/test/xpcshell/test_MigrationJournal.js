@@ -10,17 +10,24 @@ const { AppConstants } = ChromeUtils.importESModule(
 const { FileUtils } = ChromeUtils.importESModule(
   "resource://gre/modules/FileUtils.sys.mjs"
 );
-const { hashMigrationFile, readMorkMigrationSource } =
-  ChromeUtils.importESModule(
-    "resource:///modules/panorama/MigrationSource.sys.mjs"
-  );
+const {
+  admitWindowsMigrationPath,
+  hashMigrationFile,
+  readMorkMigrationSource,
+} = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationSource.sys.mjs"
+);
 const { MigrationJournal } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationJournal.sys.mjs"
 );
-const { createMigrationBackup, verifyMigrationBackup } =
-  ChromeUtils.importESModule(
-    "resource:///modules/panorama/MigrationBackup.sys.mjs"
-  );
+const {
+  createMigrationBackup,
+  verifyMigrationBackup,
+  stageMigrationRestore,
+  collectMigrationRoots,
+} = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationBackup.sys.mjs"
+);
 
 const { resumeMorkImports } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
@@ -74,6 +81,27 @@ async function migrationFiles() {
     );
   }
   return { root, plan, path: PathUtils.join(root, "journal.json") };
+}
+
+/**
+ * @param {string} path - Existing explicit input directory.
+ * @returns {string} Admitted Windows or normalized Unix spelling for comparisons.
+ */
+function canonicalRoot(path) {
+  const file = new FileUtils.File(path);
+  if (AppConstants.platform == "win") {
+    const lease = admitWindowsMigrationPath(
+      file,
+      Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
+    );
+    try {
+      return lease.canonicalPath;
+    } finally {
+      lease.close();
+    }
+  }
+  file.normalize();
+  return file.path;
 }
 
 /**
@@ -217,6 +245,156 @@ add_task(async function test_backupRejectsParentPathComponents() {
     !(await IOUtils.exists(PathUtils.join(plan.backupPath, "escaped")))
   );
   Assert.deepEqual(await IOUtils.read(plan.sources[0].path), source);
+});
+
+add_task(async function test_inventoryReadsPathsWithoutCreatingStores() {
+  const profile = do_get_profile();
+  const branch = "mail.server.migrationInventory";
+  const missing = PathUtils.join(profile.path, "not-created-absolute-store");
+  const relativeName = "not-created-\u90ae\u4ef6-e\u0301";
+  const relative = PathUtils.join(profile.path, relativeName);
+  const databasePath = PathUtils.join(profile.path, "panorama.sqlite");
+  Assert.ok(!(await IOUtils.exists(databasePath)));
+  try {
+    Services.prefs.setComplexValue(
+      branch + ".directory",
+      Ci.nsIFile,
+      new FileUtils.File(missing)
+    );
+    const descriptor = Services.prefs.getStringPref(branch + ".directory");
+    let roots = collectMigrationRoots();
+    Assert.equal(roots.profilePath, profile.path);
+    Assert.ok(roots.mailPaths.includes(missing));
+    Assert.ok(!Services.prefs.prefHasUserValue(branch + ".directory-rel"));
+    Assert.ok(!(await IOUtils.exists(missing)));
+
+    // The standard ProfileCreator uses this persisted relative-pref format.
+    Services.prefs.setStringPref(
+      branch + ".directory-rel",
+      "[ProfD]" + relativeName
+    );
+    roots = collectMigrationRoots();
+    Assert.ok(roots.mailPaths.includes(relative));
+    Assert.ok(
+      !roots.mailPaths.includes(missing),
+      "Relative paths take precedence"
+    );
+    Assert.equal(
+      Services.prefs.getStringPref(branch + ".directory"),
+      descriptor
+    );
+    Assert.ok(!(await IOUtils.exists(missing)));
+    Assert.ok(!(await IOUtils.exists(relative)));
+    Assert.ok(!(await IOUtils.exists(databasePath)));
+  } finally {
+    Services.prefs.deleteBranch(branch + ".");
+  }
+});
+
+add_task(async function test_inventoryBacksUpNestedExternalRootsOnce() {
+  const { plan } = await migrationFiles();
+  const mail = plan.mailPaths[0];
+  const nested = PathUtils.join(mail, "shared");
+  await IOUtils.makeDirectory(nested);
+  const original = await IOUtils.read(do_get_file("data/migration").path);
+  await IOUtils.write(PathUtils.join(nested, "Archived"), original, {
+    mode: "create",
+  });
+  const receipt = await createMigrationBackup(
+    plan.profilePath,
+    [nested, mail, nested],
+    plan.backupPath
+  );
+  const manifest = await IOUtils.readJSON(receipt.path);
+  Assert.equal(manifest.roots.length, 2);
+  Assert.equal(manifest.roots[1].source, canonicalRoot(mail));
+  const paths = manifest.roots[1].entries.map(entry => entry.parts.join("/"));
+  Assert.equal(
+    new Set(paths).size,
+    paths.length,
+    "Each entry is backed up once"
+  );
+  Assert.deepEqual(paths.toSorted(), [
+    "Inbox",
+    "Inbox.msf",
+    "shared",
+    "shared/Archived",
+  ]);
+  Assert.deepEqual(
+    await IOUtils.read(
+      PathUtils.join(plan.backupPath, "root-1", "shared", "Archived")
+    ),
+    original
+  );
+  Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
+});
+
+add_task(async function test_verifiedBackupRestoresProfileAndExternalMail() {
+  const { root, plan } = await migrationFiles();
+  const prefs = PathUtils.join(plan.profilePath, "prefs.js");
+  const summary = plan.sources[0].path;
+  const body = PathUtils.join(plan.mailPaths[0], "Inbox");
+  const originalPrefs = await IOUtils.read(prefs);
+  const originalSummary = await IOUtils.read(summary);
+  const originalBody = await IOUtils.read(body);
+  const receipt = await createMigrationBackup(
+    plan.profilePath,
+    plan.mailPaths,
+    plan.backupPath
+  );
+  const manifestBytes = await IOUtils.read(receipt.path);
+
+  // Backup has returned and released its source leases before this edit.
+  const changedPrefs = 'user_pref("mail.test", false);';
+  await IOUtils.writeUTF8(prefs, changedPrefs, { flush: true });
+  await Assert.rejects(
+    createMigrationBackup(plan.profilePath, plan.mailPaths, plan.backupPath),
+    /source identity changed/
+  );
+  Assert.deepEqual(await IOUtils.read(receipt.path), manifestBytes);
+  Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
+
+  const expectedRoots = [plan.profilePath, ...plan.mailPaths].map(
+    canonicalRoot
+  );
+  const first = await stageMigrationRestore(plan.backupPath, root);
+  const second = await stageMigrationRestore(plan.backupPath, root);
+  Assert.notEqual(first.path, second.path, "Each restore owns fresh staging");
+  for (const restored of [first, second]) {
+    const mappings = new Map(
+      restored.roots.map(({ original, staged }) => [original, staged])
+    );
+    Assert.equal(mappings.size, expectedRoots.length);
+    Assert.deepEqual([...mappings.keys()], expectedRoots);
+    for (const [original, staged] of mappings) {
+      const stage = new FileUtils.File(staged);
+      Assert.ok(new FileUtils.File(restored.path).contains(stage));
+      Assert.ok(!new FileUtils.File(original).contains(stage));
+    }
+    Assert.deepEqual(
+      await IOUtils.read(
+        PathUtils.join(mappings.get(expectedRoots[0]), "prefs.js")
+      ),
+      originalPrefs
+    );
+    Assert.deepEqual(
+      await IOUtils.read(
+        PathUtils.join(mappings.get(expectedRoots[1]), "Inbox.msf")
+      ),
+      originalSummary
+    );
+    Assert.deepEqual(
+      await IOUtils.read(
+        PathUtils.join(mappings.get(expectedRoots[1]), "Inbox")
+      ),
+      originalBody
+    );
+  }
+  Assert.equal(await IOUtils.readUTF8(prefs), changedPrefs);
+  Assert.deepEqual(await IOUtils.read(summary), originalSummary);
+  Assert.deepEqual(await IOUtils.read(body), originalBody);
+  Assert.deepEqual(await IOUtils.read(receipt.path), manifestBytes);
+  Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
 });
 
 add_task(async function test_journalResumesCommittedImport() {

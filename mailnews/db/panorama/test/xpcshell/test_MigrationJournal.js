@@ -10,6 +10,10 @@ const { AppConstants } = ChromeUtils.importESModule(
 const { FileUtils } = ChromeUtils.importESModule(
   "resource://gre/modules/FileUtils.sys.mjs"
 );
+const { hashMigrationFile, readMorkMigrationSource } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationSource.sys.mjs"
+  );
 const { MigrationJournal } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationJournal.sys.mjs"
 );
@@ -94,6 +98,80 @@ function physicalReceiptModel(journal) {
     windowsAdmission: validateMorkFolderWindowsInventory(source.inventory),
   };
 }
+
+add_task(async function test_hashingAndBackupDoNotOpenProfileNSSStores() {
+  const profile = do_get_profile();
+  const hadUserPref = Services.prefs.prefHasUserValue("security.nocertdb");
+  const noCertDB = Services.prefs.getBoolPref("security.nocertdb", false);
+  Services.prefs.setBoolPref("security.nocertdb", false);
+  const root = await IOUtils.createUniqueDirectory(
+    do_get_tempdir().path,
+    "migration-hash-"
+  );
+  registerCleanupFunction(() => IOUtils.remove(root, { recursive: true }));
+  const source = PathUtils.join(profile.path, "migration-hash.msf");
+  const empty = PathUtils.join(profile.path, "migration-hash-empty");
+  const multi = PathUtils.join(profile.path, "migration-hash-multiple");
+  const assertNoStores = async () => {
+    for (const name of ["cert9.db", "key4.db"]) {
+      Assert.ok(
+        !(await IOUtils.exists(PathUtils.join(profile.path, name))),
+        "Migration hashing must not open profile NSS storage: " + name
+      );
+    }
+  };
+  try {
+    await assertNoStores();
+    await IOUtils.write(
+      source,
+      await IOUtils.read(do_get_file("data/migration.msf").path),
+      { mode: "create" }
+    );
+    await IOUtils.write(empty, new Uint8Array(), { mode: "create" });
+    await IOUtils.write(multi, new Uint8Array(1024 * 1024 + 17).fill(0x61), {
+      mode: "create",
+    });
+    Assert.equal(
+      await hashMigrationFile(empty),
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    await assertNoStores();
+    Assert.equal(
+      await hashMigrationFile(multi),
+      "c26032d5154f96bd29c799447d715ab681d8d0aa308ecc6f321a35d98f0672da"
+    );
+    const { identity } = await readMorkMigrationSource(source);
+    Assert.equal(
+      identity.sha256,
+      "7a262023b98fe964d105de06bf1ddca60f90ee19073e38afda8c885be5a47703"
+    );
+    await assertNoStores();
+    const backupPath = PathUtils.join(root, "backup");
+    const receipt = await createMigrationBackup(profile.path, [], backupPath);
+    Assert.deepEqual(await verifyMigrationBackup(backupPath), receipt);
+    await assertNoStores();
+    Assert.ok((await IOUtils.read(multi)).every(value => value == 0x61));
+    Assert.deepEqual(
+      await IOUtils.read(source),
+      await IOUtils.read(do_get_file("data/migration.msf").path)
+    );
+    await Assert.rejects(hashMigrationFile("relative"), /must be absolute/);
+    await Assert.rejects(hashMigrationFile(root), /Unsupported migration hash/);
+    await Assert.rejects(
+      hashMigrationFile(PathUtils.join(root, "missing")),
+      error => error.name == "NotFoundError"
+    );
+  } finally {
+    for (const path of [source, empty, multi]) {
+      await IOUtils.remove(path, { ignoreAbsent: true });
+    }
+    if (hadUserPref) {
+      Services.prefs.setBoolPref("security.nocertdb", noCertDB);
+    } else {
+      Services.prefs.clearUserPref("security.nocertdb");
+    }
+  }
+});
 
 add_task(async function test_backupVerifiesNestedPathComponents() {
   const { plan } = await migrationFiles();

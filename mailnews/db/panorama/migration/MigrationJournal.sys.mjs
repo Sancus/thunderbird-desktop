@@ -15,6 +15,7 @@ import {
 
 import {
   admitWindowsMigrationPath,
+  hashMigrationFile,
   migrationPhysicalIdentity,
   isMigrationPhysicalIdentity,
 } from "resource:///modules/panorama/MigrationSource.sys.mjs";
@@ -647,7 +648,7 @@ export class MigrationJournal {
       if (before.type != "regular" || before.size != source.size) {
         throw new Error("Migration source changed since backup");
       }
-      const hash = await IOUtils.computeHexDigest(source.path, "sha256");
+      const hash = await hashMigrationFile(source.path);
       const after = await IOUtils.stat(source.path);
       if (
         before.type != "regular" ||
@@ -744,10 +745,8 @@ export class MigrationJournal {
               stored.physicalIdentity.parentId !== measured.store.parentId ||
               (await IOUtils.stat(measured.store.canonicalPath)).size !==
                 stored.size ||
-              (await IOUtils.computeHexDigest(
-                measured.store.canonicalPath,
-                "sha256"
-              )) !== stored.sha256
+              (await hashMigrationFile(measured.store.canonicalPath)) !==
+                stored.sha256
             : !!stored
         ) {
           throw new Error("Migration body store differs from verified backup");
@@ -767,9 +766,7 @@ export class MigrationJournal {
         );
       }
     }
-    if (
-      actual.sha256 != (await IOUtils.computeHexDigest(actual.path, "sha256"))
-    ) {
+    if (actual.sha256 != (await hashMigrationFile(actual.path))) {
       throw new Error(
         "Migration backup changed while binding source identities"
       );

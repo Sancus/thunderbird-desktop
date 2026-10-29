@@ -7,6 +7,7 @@ import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
 
 import {
   admitWindowsMigrationPath,
+  hashMigrationFile,
   migrationPhysicalIdentity,
   isMigrationPhysicalIdentity,
 } from "resource:///modules/panorama/MigrationSource.sys.mjs";
@@ -292,7 +293,7 @@ export async function verifyMigrationBackup(backupPath) {
     if ((await IOUtils.stat(path)).type != "regular") {
       throw new Error("Migration backup manifest is not a regular file");
     }
-    const before = await IOUtils.computeHexDigest(path, "sha256");
+    const before = await hashMigrationFile(path);
     const manifest = await IOUtils.readJSON(path);
     if (
       ![1, 2, 3].includes(manifest.version) ||
@@ -349,7 +350,7 @@ export async function verifyMigrationBackup(backupPath) {
       }
     }
     await verifyCopies(backup.path, manifest);
-    if (before != (await IOUtils.computeHexDigest(path, "sha256"))) {
+    if (before != (await hashMigrationFile(path))) {
       throw new Error("Migration backup manifest changed during verification");
     }
     return { path, sha256: before };
@@ -575,7 +576,7 @@ async function inventory(root, profile, signal) {
             pending.push({ path, parts: entry.parts });
           } else if (info.type == "regular") {
             entry.size = info.size;
-            entry.sha256 = await IOUtils.computeHexDigest(path, "sha256");
+            entry.sha256 = await hashMigrationFile(path);
             const after = await IOUtils.stat(path);
             if (
               after.size != info.size ||
@@ -654,7 +655,7 @@ async function verifyFile(path, entry) {
       info.type != "regular" ||
       info.size != entry.size ||
       !/^[a-f0-9]{64}$/.test(entry.sha256) ||
-      (await IOUtils.computeHexDigest(path, "sha256")) != entry.sha256
+      (await hashMigrationFile(path)) != entry.sha256
     ) {
       throw new Error("Migration backup file differs from its source");
     }

@@ -11,6 +11,54 @@ import { parseMorkFolderCache } from "resource:///modules/panorama/MorkFolderCac
 const MAX_SUMMARY_BYTES = 64 * 1024 * 1024;
 
 /**
+ * Hashes an admitted, quiesced file without initializing profile NSS stores.
+ * Reads at most 1 MiB at once. Callers retain path admission and source leases;
+ * this checks regular-file size and modification time across the hash.
+ *
+ * @param {string} path - Absolute admitted regular-file path.
+ * @returns {Promise<string>} Lowercase SHA-256 of the complete file.
+ * @throws {Error} For unsupported files or changes while hashing. Read errors
+ *   propagate without replacement.
+ */
+export async function hashMigrationFile(path) {
+  if (!PathUtils.isAbsolute(path)) {
+    throw new Error("Migration hash path must be absolute");
+  }
+  const before = await IOUtils.stat(path);
+  if (
+    before.type != "regular" ||
+    !Number.isSafeInteger(before.size) ||
+    before.size < 0
+  ) {
+    throw new Error("Unsupported migration hash file");
+  }
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(Ci.nsICryptoHash.SHA256);
+  for (let offset = 0; offset < before.size; ) {
+    const maxBytes = Math.min(1024 * 1024, before.size - offset);
+    const bytes = await IOUtils.read(path, { offset, maxBytes });
+    if (bytes.length != maxBytes) {
+      throw new Error("Migration file changed while hashing");
+    }
+    hash.update(bytes, bytes.length);
+    offset += bytes.length;
+  }
+  const after = await IOUtils.stat(path);
+  if (
+    after.type != "regular" ||
+    after.size != before.size ||
+    after.lastModified != before.lastModified
+  ) {
+    throw new Error("Migration file changed while hashing");
+  }
+  return Array.from(hash.finish(false), byte =>
+    byte.charCodeAt(0).toString(16).padStart(2, "0")
+  ).join("");
+}
+
+/**
  * Retains Windows no-reparse admission; Unix callers keep their existing guards.
  * The immediate parent is the native admission root. Profile/backup scope still
  * belongs to the coordinator. This does not create a path or start a database.
@@ -154,7 +202,7 @@ async function readMigrationBytes(path) {
       after.type != "regular" ||
       after.size != before.size ||
       after.lastModified != before.lastModified ||
-      (await IOUtils.computeHexDigest(file.path, "sha256")) != sha256
+      (await hashMigrationFile(file.path)) != sha256
     ) {
       throw new Error("Migration source changed while reading");
     }

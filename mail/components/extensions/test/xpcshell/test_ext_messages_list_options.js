@@ -459,3 +459,132 @@ add_task(async function test_messages_list_sort() {
 
   cleanUpAccount(account);
 });
+
+/**
+ * Add a stored physical copy with a literal Message-ID.
+ *
+ * @param {nsIMsgFolder} folder - The physical destination.
+ * @param {string} id - The literal Message-ID.
+ * @returns {nsIMsgDBHdr} The stored header.
+ */
+function addSavedSearchMessage(folder, id) {
+  const header = folder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .addMessage(
+      "From: sender@example.invalid\r\n" +
+        "To: recipient@example.invalid\r\n" +
+        `Message-ID: <${id}>\r\nSubject: scope message\r\n\r\nBody.\r\n`
+    );
+  Assert.equal(header.messageId, id);
+  return header;
+}
+
+/**
+ * Compare the returned physical identities without relying on folder order.
+ *
+ * @param {nsIMsgFolder} folder - The saved search.
+ * @param {nsIMsgDBHdr[]} expected - The expected physical copies.
+ */
+function assertSavedSearchMembers(folder, expected) {
+  const identity = header => [
+    header.folder.URI,
+    header.messageKey,
+    header.messageId,
+  ];
+  const { getMessagesInFolder } = ChromeUtils.importESModule(
+    "resource:///modules/ExtensionMessages.sys.mjs"
+  );
+  const actual = getMessagesInFolder(folder).map(identity);
+  const byIdentity = (left, right) =>
+    JSON.stringify(left).localeCompare(JSON.stringify(right));
+  Assert.equal(actual.length, expected.length, "Exact physical message count");
+  Assert.deepEqual(
+    actual.sort(byIdentity),
+    expected.map(identity).sort(byIdentity)
+  );
+}
+
+add_task(async function test_savedSearchUsesCurrentPhysicalMembership() {
+  const { VirtualFolderHelper } = ChromeUtils.importESModule(
+    "resource:///modules/VirtualFolderWrapper.sys.mjs"
+  );
+  const localAccount = await createAccount("none");
+  const rootFolder = localAccount.incomingServer.rootFolder.QueryInterface(
+    Ci.nsIMsgLocalMailFolder
+  );
+  const first = rootFolder.createLocalSubfolder("enumerateFirst");
+  const second = rootFolder.createLocalSubfolder("enumerateSecond");
+  const outside = rootFolder.createLocalSubfolder("enumerateOutside");
+  const a = addSavedSearchMessage(first, "same-copy@enumeration.invalid");
+  const b = addSavedSearchMessage(second, "same-copy@enumeration.invalid");
+  const pending = addSavedSearchMessage(first, "pending@enumeration.invalid");
+  const excluded = addSavedSearchMessage(
+    outside,
+    "same-copy@enumeration.invalid"
+  );
+  first.addKeywordsToMessages([a], "enumeration-tag");
+  second.addKeywordsToMessages([b], "enumeration-tag");
+  outside.addKeywordsToMessages([excluded], "enumeration-tag");
+  const session = Cc["@mozilla.org/messenger/searchSession;1"].createInstance(
+    Ci.nsIMsgSearchSession
+  );
+  const term = session.createTerm();
+  term.attrib = Ci.nsMsgSearchAttrib.Keywords;
+  term.op = Ci.nsMsgSearchOp.Contains;
+  const value = term.value;
+  value.attrib = Ci.nsMsgSearchAttrib.Keywords;
+  value.str = "enumeration-tag";
+  term.value = value;
+  term.booleanAnd = true;
+  const saved = VirtualFolderHelper.createNewVirtualFolder(
+    "enumeratedSearch",
+    rootFolder,
+    [first, second],
+    [term],
+    false
+  );
+  first.msgDatabase.refreshCache(saved.virtualFolder.URI, [a.messageKey]);
+  second.msgDatabase.refreshCache(saved.virtualFolder.URI, [b.messageKey]);
+  assertSavedSearchMembers(saved.virtualFolder, [a, b]);
+
+  first.removeKeywordsFromMessages([a], "enumeration-tag");
+  first.addKeywordsToMessages([pending], "enumeration-tag");
+  assertSavedSearchMembers(saved.virtualFolder, [pending, b]);
+  saved.searchFolders = [first];
+  assertSavedSearchMembers(saved.virtualFolder, [pending]);
+  saved.searchString = "ALL";
+  assertSavedSearchMembers(saved.virtualFolder, [a, pending]);
+  Assert.equal(first.getTotalMessages(false), 2);
+  Assert.equal(second.getTotalMessages(false), 1);
+  Assert.equal(outside.getTotalMessages(false), 1);
+});
+
+add_task(async function test_savedSearchCachedHitsDoNotHideInvalidTerms() {
+  const { getMessagesInFolder } = ChromeUtils.importESModule(
+    "resource:///modules/ExtensionMessages.sys.mjs"
+  );
+  const { VirtualFolderHelper } = ChromeUtils.importESModule(
+    "resource:///modules/VirtualFolderWrapper.sys.mjs"
+  );
+  const localAccount = await createAccount("none");
+  const rootFolder = localAccount.incomingServer.rootFolder.QueryInterface(
+    Ci.nsIMsgLocalMailFolder
+  );
+  const first = rootFolder.createLocalSubfolder("enumerateInvalid");
+  const message = addSavedSearchMessage(
+    first,
+    "invalid-query@enumeration.invalid"
+  );
+  const saved = VirtualFolderHelper.createNewVirtualFolder(
+    "enumeratedInvalidSearch",
+    rootFolder,
+    [first],
+    "ALL",
+    false
+  );
+  first.msgDatabase.refreshCache(saved.virtualFolder.URI, [message.messageKey]);
+  saved.searchString = "AND (subject,unsupported-operation,scope)";
+  Assert.throws(() => getMessagesInFolder(saved.virtualFolder), /NS_ERROR/);
+  saved.searchString = "ALL";
+  assertSavedSearchMembers(saved.virtualFolder, [message]);
+});

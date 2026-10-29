@@ -879,6 +879,13 @@ export class MsgHdrProcessor {
   }
 }
 
+/**
+ * Return physical headers from a folder or the current saved-search definition.
+ *
+ * @param {nsIMsgFolder} folder - A physical or saved-search folder.
+ * @returns {nsIMsgDBHdr[]} The matching physical message headers.
+ * @throws {Components.Exception} If saved-search parsing or enumeration fails.
+ */
 export function getMessagesInFolder(folder) {
   if (folder.isServer) {
     return [];
@@ -886,33 +893,18 @@ export function getMessagesInFolder(folder) {
 
   if (folder.getFlag(Ci.nsMsgFolderFlags.Virtual)) {
     const messages = [];
-    const searchFolders = [];
     const wrappedVirtualFolder =
       lazy.VirtualFolderHelper.wrapVirtualFolder(folder);
 
-    // Check explicitly listed searchFolders and all folders selected by wildcard,
-    // if any.
+    const searchTerms = wrappedVirtualFolder.searchTerms;
+
+    // Cached hits can outlive the definition or a matching property change.
+    // Evaluate the current terms in each physical source folder instead.
     for (const searchFolder of [
       ...getWildcardVirtualFolders(wrappedVirtualFolder),
       ...wrappedVirtualFolder.searchFolders,
     ]) {
-      // Use cached hits or schedule the folder to be searched manually.
-      // Note: The cached hits are stored in the db of each search folder using
-      // the URI of the virtual folder as identifier.
-      const cachedHits = searchFolder.msgDatabase.getCachedHits(folder.URI);
-      if (!cachedHits) {
-        searchFolders.push(searchFolder);
-        continue;
-      }
-      for (const msg of cachedHits) {
-        messages.push(msg);
-      }
-    }
-
-    for (const searchFolder of searchFolders) {
-      const msgs = searchFolder.msgDatabase.getFilterEnumerator(
-        wrappedVirtualFolder.searchTerms
-      );
+      const msgs = searchFolder.msgDatabase.getFilterEnumerator(searchTerms);
       for (const msg of msgs) {
         messages.push(msg);
       }

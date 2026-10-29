@@ -95,22 +95,27 @@ NS_IMETHODIMP VirtualFolderWrapper::SetSearchString(
 
 NS_IMETHODIMP VirtualFolderWrapper::GetSearchTermsSession(
     nsIMsgFilter** filter) {
+  NS_ENSURE_ARG_POINTER(filter);
+  *filter = nullptr;
   nsCOMPtr<nsIMsgFilterService> filterService = components::Filter::Service();
 
   nsCOMPtr<nsIMsgFilterList> filterList;
-  filterService->GetTempFilterList(mMsgFolder, getter_AddRefs(filterList));
+  MOZ_TRY(
+      filterService->GetTempFilterList(mMsgFolder, getter_AddRefs(filterList)));
 
   nsAutoCString searchString;
-  GetSearchString(searchString);
-  filterList->CreateFilter(u"temp"_ns, filter);
-  filterList->ParseCondition(*filter, searchString);
+  MOZ_TRY(GetSearchString(searchString));
+  nsCOMPtr<nsIMsgFilter> parsedFilter;
+  MOZ_TRY(filterList->CreateFilter(u"temp"_ns, getter_AddRefs(parsedFilter)));
+  MOZ_TRY(filterList->ParseCondition(parsedFilter, searchString));
+  parsedFilter.forget(filter);
   return NS_OK;
 }
 
 NS_IMETHODIMP VirtualFolderWrapper::GetSearchTerms(
     nsTArray<RefPtr<nsIMsgSearchTerm>>& searchTerms) {
   nsCOMPtr<nsIMsgFilter> filter;
-  GetSearchTermsSession(getter_AddRefs(filter));
+  MOZ_TRY(GetSearchTermsSession(getter_AddRefs(filter)));
 
   return filter->GetSearchTerms(searchTerms);
 }

@@ -188,6 +188,105 @@ add_task(async function test_defaultActivationIndexesWithoutAQuery() {
   }
 });
 
+add_task(
+  async function test_nativePagingKeepsPhysicalCopiesAndRejectsChanges() {
+    await closeMailSearch();
+    const pref = "mailnews.database.global.indexer.enabled";
+    const hadPref = Services.prefs.prefHasUserValue(pref);
+    const oldPref = Services.prefs.getBoolPref(pref, false);
+    Services.prefs.setBoolPref(pref, true);
+    try {
+      const folder = MailServices.accounts.localFoldersServer.rootFolder
+        .QueryInterface(Ci.nsIMsgLocalMailFolder)
+        .createLocalSubfolder("native-paging")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const add = subject =>
+        folder.addMessage(
+          "From: sender@example.invalid\r\n" +
+            "Message-ID: <paging-copy@example.invalid>\r\n" +
+            "Subject: " +
+            subject +
+            "\r\n" +
+            "Content-Type: text/plain\r\n\r\nStored body\r\n"
+        );
+      const first = add("pagingneedle");
+      const second = add("pagingneedle");
+      const third = add("pagingneedle");
+      const unrelated = add("unrelatedneedle");
+      const service = await getMailSearchService();
+      let progress;
+      for (let i = 0; i < 200; i++) {
+        progress = await service.update({ limit: 500 });
+        if (!progress.moreWork) {
+          break;
+        }
+      }
+      Assert.equal(progress.moreWork, false, "Native indexing has finished");
+      Assert.equal(first.messageId, second.messageId);
+      Assert.equal(second.messageId, third.messageId);
+      Assert.equal(third.messageId, unrelated.messageId);
+      const expected = [first, second, third];
+      let cursor, resultSetId;
+      const seen = [];
+      for (let i = 0; i < expected.length; i++) {
+        const page = await service.search("pagingneedle", { limit: 1, cursor });
+        Assert.equal(page.items.length, 1);
+        const hit = page.items[0];
+        const header = expected.find(item => String(item.messageKey) == hit.id);
+        Assert.ok(header, "Each page contains a matching physical copy");
+        seen.push(hit.id);
+        Assert.deepEqual(hit.location, {
+          folderId: folder.id,
+          messageKey: header.messageKey,
+        });
+        if (resultSetId) {
+          Assert.equal(page.resultSetId, resultSetId);
+        } else {
+          resultSetId = page.resultSetId;
+        }
+        cursor = page.cursor;
+        Assert.equal(!!cursor, i < expected.length - 1);
+      }
+      Assert.deepEqual(
+        seen.sort(),
+        expected.map(header => String(header.messageKey)).sort(),
+        "Paging delivers every physical copy exactly once"
+      );
+      const oldPage = await service.search("pagingneedle", { limit: 1 });
+      await Assert.rejects(
+        service.search("unrelatedneedle", { cursor: oldPage.cursor }),
+        /Cursor does not belong to this search/
+      );
+      const late = add("pagingneedle");
+      for (let i = 0; i < 200; i++) {
+        progress = await service.update({ limit: 500 });
+        if (!progress.moreWork) {
+          break;
+        }
+      }
+      Assert.equal(progress.moreWork, false);
+      await Assert.rejects(
+        service.search("pagingneedle", { cursor: oldPage.cursor }),
+        /Search index changed; restart the query/
+      );
+      Assert.deepEqual(
+        (await service.search("pagingneedle")).items.map(hit => hit.id).sort(),
+        [first, second, third, late]
+          .map(header => String(header.messageKey))
+          .sort(),
+        "A fresh query keeps each matching physical copy and excludes the control"
+      );
+    } finally {
+      await closeMailSearch();
+      if (hadPref) {
+        Services.prefs.setBoolPref(pref, oldPref);
+      } else {
+        Services.prefs.clearUserPref(pref);
+      }
+    }
+  }
+);
+
 // Advancing shutdown is irreversible, so this must remain the last task.
 add_task(async function test_shutdownPreventsReopening() {
   await closeMailSearch();

@@ -752,3 +752,141 @@ add_task(async function test_unavailableBackgroundWorkHasAnOwnedActivity() {
     0
   );
 });
+
+add_task(async function test_closeCancelsPendingQueryDelivery() {
+  const {
+    folder,
+    service: firstService,
+    file,
+    sourceId,
+  } = await fixture("query-close");
+  const header = addStoredMessage(folder, "querycloseneedle");
+  await drain(firstService);
+  for (const callerSignal of [false, true]) {
+    const service = callerSignal
+      ? await MailSearchService.open(file, sourceId, messageDB)
+      : firstService;
+    const controller = new AbortController();
+    const resolveDocument = service.resolveDocument;
+    let closing, observedSignal;
+    try {
+      if (!callerSignal) {
+        const cancelled = new AbortController();
+        const reason = new Error("Original caller cancellation");
+        cancelled.abort(reason);
+        const failure = new Error("Original native lookup failure");
+        let lookups = 0;
+        service.resolveDocument = () => {
+          lookups++;
+          throw failure;
+        };
+        await Assert.rejects(
+          service.search("querycloseneedle", { signal: cancelled.signal }),
+          error => error === reason
+        );
+        Assert.equal(lookups, 0, "A cancelled query starts no native lookup");
+        await Assert.rejects(
+          service.search("querycloseneedle"),
+          error => error === failure
+        );
+      }
+      service.resolveDocument = function (id, signal) {
+        const state = resolveDocument.call(this, id, signal);
+        if (id == String(header.messageKey) && !closing) {
+          observedSignal = signal;
+          closing = this.close();
+        }
+        return state;
+      };
+      await Assert.rejects(
+        service.search(
+          "querycloseneedle",
+          callerSignal ? { signal: controller.signal } : undefined
+        ),
+        error => observedSignal?.aborted && error === observedSignal.reason,
+        "Closing cancels a page even after its current native state was read"
+      );
+      Assert.ok(closing, "The query reached the physical-state boundary");
+      Assert.ok(
+        !controller.signal.aborted,
+        "Closing does not abort the caller"
+      );
+      await closing;
+    } finally {
+      service.resolveDocument = resolveDocument;
+      await service.close();
+    }
+  }
+});
+
+add_task(async function test_closePreventsPendingReaderDispatch() {
+  const displayMessage = MailUtils.displayMessage;
+  const opened = [];
+  MailUtils.displayMessage = (...args) => opened.push(args);
+  try {
+    for (const callerSignal of [false, true]) {
+      const { folder, service } = await fixture("open-close-" + callerSignal);
+      const header = addStoredMessage(folder, "opencloseneedle");
+      const controller = new AbortController();
+      const resolveDocument = service.resolveDocument;
+      let closing, observedSignal;
+      service.resolveDocument = function (id, signal) {
+        const state = resolveDocument.call(this, id, signal);
+        if (id == String(header.messageKey) && !closing) {
+          observedSignal = signal;
+          closing = this.close();
+        }
+        return state;
+      };
+      try {
+        await Assert.rejects(
+          service.openResult(
+            String(header.messageKey),
+            callerSignal ? { signal: controller.signal } : undefined
+          ),
+          error => observedSignal?.aborted && error === observedSignal.reason,
+          "Closing prevents a reader dispatch after current physical lookup"
+        );
+        Assert.ok(closing, "Opening reached the physical-state boundary");
+        Assert.equal(opened.length, 0, "No message opens after service close");
+        Assert.ok(!controller.signal.aborted);
+        await closing;
+      } finally {
+        service.resolveDocument = resolveDocument;
+        await service.close();
+      }
+    }
+  } finally {
+    MailUtils.displayMessage = displayMessage;
+  }
+});
+
+add_task(async function test_openKeepsOriginalCancellationAndErrors() {
+  const { folder, service } = await fixture("query-original-errors");
+  const header = addStoredMessage(folder, "queryerrorneedle");
+  const controller = new AbortController();
+  const reason = new Error("Original caller cancellation");
+  controller.abort(reason);
+  const options = { signal: controller.signal };
+  const resolveDocument = service.resolveDocument;
+  const failure = new Error("Original native lookup failure");
+  let lookups = 0;
+  service.resolveDocument = () => {
+    lookups++;
+    throw failure;
+  };
+  try {
+    await Assert.rejects(
+      service.openResult(String(header.messageKey), options),
+      error => error === reason
+    );
+    Assert.equal(lookups, 0, "A cancelled caller starts no native lookup");
+    await Assert.rejects(
+      service.openResult(String(header.messageKey)),
+      error => error === failure
+    );
+  } finally {
+    service.resolveDocument = resolveDocument;
+    await service.close();
+  }
+});

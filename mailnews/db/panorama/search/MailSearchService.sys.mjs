@@ -572,15 +572,24 @@ export class MailSearchService {
 
   /**
    * Queries the replacement index and resumes pending background work.
+   * Service closure cancels page delivery, including an in-flight lookup.
    *
    * @param {string} text - Search words/phrases.
    * @param {object} [options] - PanoramaSearchIndex query controls.
+   * @param {AbortSignal} [options.signal] - Cancel query delivery.
    * @returns {Promise<object>} Physical hits, cursor and result-set identity.
    */
-  async search(text, options) {
-    await this.#preparePreferences(options?.signal);
+  async search(text, { signal, ...options } = {}) {
+    if (this.#closed) {
+      throw new Error("Mail search is closed");
+    }
+    signal = signal
+      ? AbortSignal.any([signal, this.#controller.signal])
+      : this.#controller.signal;
+    await this.#preparePreferences(signal);
+    signal.throwIfAborted();
     this.start();
-    return this.#index.search(text, options);
+    return this.#index.search(text, { ...options, signal });
   }
 
   /**
@@ -964,21 +973,31 @@ export class MailSearchService {
 
   /**
    * Opens the current physical copy through the existing mail reader.
+   * Service closure cancels lookup and prevents dispatch to the reader.
    *
    * @param {string} id - Physical global key.
    * @param {object} [options] - Cancellation and normal reader arguments.
+   * @param {AbortSignal} [options.signal] - Cancel lookup and reader dispatch.
+   * @param {DBViewWrapper} [options.viewWrapper] - View to clone for the reader.
+   * @param {Element} [options.tabmail] - Target tabmail, or the reader default.
    * @returns {Promise<object>} Current resolution/opening status.
    */
-  openResult(id, options) {
+  async openResult(id, { signal, viewWrapper, tabmail } = {}) {
+    if (this.#closed) {
+      throw new Error("Mail search is closed");
+    }
+    signal = signal
+      ? AbortSignal.any([signal, this.#controller.signal])
+      : this.#controller.signal;
     return openMailSearchResult(
       id,
-      (key, signal) => this.resolveDocument(key, signal),
-      options
+      (key, lookupSignal) => this.resolveDocument(key, lookupSignal),
+      { signal, viewWrapper, tabmail }
     );
   }
 
   /**
-   * Cancels background delivery and drains the owned connection.
+   * Cancels pending delivery and drains the owned connection.
    *
    * @returns {Promise<void>} Resolves after the sidecar closes.
    */

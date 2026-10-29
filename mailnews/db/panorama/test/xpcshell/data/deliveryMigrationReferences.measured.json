@@ -1,0 +1,62 @@
+{
+  "provenance": {
+    "job": "mi050-references-linux-002",
+    "producerSHA256": "aa0d5a31a3a5c9c7a830ed96a319902853bfd87b4f1574a5677cd698b8e0caf8",
+    "rootAcceptanceSHA256": "66d77bb793e18c06ee67063fdb4713d6d6138307b95446f3d635fe1f99ae74cb",
+    "nativeGetterProvenanceSHA256": "a4f1179d4bfb3d8a5cde0c8e0182878f1d87e4a61a1e5f7ba1a89c66c568710e"
+  },
+  "rows": [
+    {
+      "messageId": "162378@invalid",
+      "physical": {
+        "key": 1,
+        "storeToken": "0",
+        "size": 578
+      },
+      "properties": {
+        "ProtoThreadFlags": "0",
+        "date": "395e7958",
+        "dateReceived": "395e7958",
+        "flags": "1",
+        "gloda-dirty": "1",
+        "growKeywords": "1",
+        "keywords": "$label5",
+        "message-id": "162378@invalid",
+        "msgThreadId": "fffffffe",
+        "numLines": "9",
+        "priority": "1",
+        "recipients": "=?UTF-8?Q?Rene=CC=81e_Alsom?= <renee.alsom@invalid>",
+        "sender": "\"Cicero Kutch\" <cicero.kutch@invalid>",
+        "sender_name": "0|Cicero Kutch <cicero.kutch@invalid>",
+        "size": "242",
+        "storeToken": "0",
+        "subject": "Secured value-added orchestration",
+        "threadParent": "ffffffff"
+      }
+    },
+    {
+      "messageId": "345692@invalid",
+      "physical": {
+        "key": 3,
+        "storeToken": "1143",
+        "size": 375
+      },
+      "properties": {
+        "ProtoThreadFlags": "0",
+        "date": "632017b0",
+        "dateReceived": "632017b0",
+        "flags": "0",
+        "message-id": "345692@invalid",
+        "msgThreadId": "3",
+        "numLines": "4",
+        "priority": "1",
+        "sender": "=?UTF-8?Q?\"Zo=C3=AB_Yundt\"?= <zoe.yundt@invalid>",
+        "sender_name": "0|\"Zoë Yundt\" <zoe.yundt@invalid>",
+        "size": "177",
+        "storeToken": "1143",
+        "subject": "Intuitive full-range analyzer",
+        "threadParent": "ffffffff"
+      }
+    }
+  ]
+}

@@ -166,3 +166,89 @@ add_task(function test_highestStoredOffsetBodyToken() {
   const message = messageWithBodyCells("(msgOffset=fffffffffffffffe)");
   Assert.equal(message.storeToken, "18446744073709551614");
 });
+
+/**
+ * Reads a frozen native-written group/alias update, not generated Mork text.
+ *
+ * @param {string} name - Admitted summary basename.
+ * @param {string} raw - Independent literal folded References text.
+ * @param {string[]} references - Independent literal ordered ancestors.
+ */
+async function assertGenuineReferences(name, raw, references) {
+  const bytes = await IOUtils.read(do_get_file("data/" + name + ".msf").path);
+  const before = bytes.slice();
+  const { messages, source } = parseMorkSummary(bytes);
+  Assert.deepEqual(messages.map(message => message.messageId).sort(), [
+    "162378@invalid",
+    "345692@invalid",
+  ]);
+  const control = messages.find(
+    message => message.messageId == "162378@invalid"
+  );
+  const child = messages.find(message => message.messageId == "345692@invalid");
+  Assert.deepEqual(control.references, []);
+  Assert.ok(control.properties.has("references"));
+  Assert.equal(control.properties.get("references"), "");
+  Assert.deepEqual(child.references, references);
+  Assert.equal(child.properties.get("references"), raw);
+  Assert.equal(
+    child.properties.get("sender_name"),
+    '0|"Zo\u00eb Yundt" <zoe.yundt@invalid>'
+  );
+  Assert.ok(!child.properties.has("growKeywords"));
+  Assert.ok(!child.properties.has("recipients"));
+  const messageScope = "ns:msg:db:row:scope:msgs:all";
+  const threadScope = "ns:msg:db:row:scope:threads:all";
+  const infoScope = "ns:msg:db:row:scope:dbfolderinfo:all";
+  Assert.deepEqual(
+    [...source.rows.keys()].sort(),
+    [
+      "1:m",
+      "2:m",
+      "3:m",
+      "1:" + messageScope,
+      "3:" + messageScope,
+      "4294967294:" + threadScope,
+      "3:" + threadScope,
+      "1:" + infoScope,
+    ].sort(),
+    "All eight real scoped rows survive, including detached metadata"
+  );
+  Assert.deepEqual(
+    [...source.tables.keys()].sort(),
+    [
+      "1:" + messageScope,
+      "4294967294:" + messageScope,
+      "3:" + messageScope,
+      "4294967293:" + threadScope,
+      "1:" + infoScope,
+    ].sort(),
+    "All five real tables survive the References-only update"
+  );
+  Assert.deepEqual(
+    [...source.tables.get("1:" + messageScope).rows],
+    ["1:" + messageScope, "3:" + messageScope]
+  );
+  Assert.deepEqual(bytes, before);
+}
+
+add_task(async function test_genuineFoldedReferencesUpdate() {
+  await assertGenuineReferences(
+    "deliveryMigrationReferences",
+    "<ancestor@invalid>\r\n\t<parent@invalid> <nearest@invalid>",
+    ["ancestor@invalid", "parent@invalid", "nearest@invalid"]
+  );
+});
+
+add_task(async function test_genuineDuplicateReferencesUpdate() {
+  await assertGenuineReferences(
+    "deliveryMigrationDuplicateReferences",
+    "<ancestor@invalid> <parent@invalid>\r\n\t<ancestor@invalid> <nearest@invalid>",
+    [
+      "ancestor@invalid",
+      "parent@invalid",
+      "ancestor@invalid",
+      "nearest@invalid",
+    ]
+  );
+});

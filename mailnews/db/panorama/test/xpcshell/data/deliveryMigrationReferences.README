@@ -1,0 +1,35 @@
+These are frozen, genuine legacy-written mail summaries. Tests do not load the
+legacy Mork engine. Both use the existing data/migration body byte-for-byte.
+The body includes the deleted 300894@invalid record; only 162378@invalid and
+345692@invalid are live summary messages.
+
+Origin: data/migration.msf and data/migration from comm commit
+01833cb07995a3b2796cc64db59f8ff9fc94d5ef. Copies were opened with the real legacy
+nsIMsgDBService.openDBFromFile(summary, null, false, true), under the legacy
+backend selected before service startup. The live 345692@invalid header received
+setReferences(text), followed by forceClosed and a distinct reopened native
+reader. The control 162378@invalid retained a present-empty References cell.
+Other native header properties, keys, store tokens, sizes and body bytes were
+verified unchanged. No summary encoding was handwritten.
+
+Writer source: comm 44606fa9b354dc1d214cd018790cc7c6c647f590,
+Gecko efd2d1e6f77570ae6bc5294731a68101e45c81a3, build 20261028195000.
+Producer SHA256: aa0d5a31a3a5c9c7a830ed96a319902853bfd87b4f1574a5677cd698b8e0caf8.
+
+Ordered text (escaped CR/LF/TAB):
+<ancestor@invalid>\r\n\t<parent@invalid> <nearest@invalid>
+Duplicate text:
+<ancestor@invalid> <parent@invalid>\r\n\t<ancestor@invalid> <nearest@invalid>
+All ancestors are external to this folder; the original two threads remain roots.
+
+SHA256 deliveryMigrationReferences.msf:
+b7a621f2e71c328d1b22393d9760dbc84e0f6d40145eb4745da9881a3f4064c8
+SHA256 deliveryMigrationDuplicateReferences.msf:
+cf2b381c64436b231c1261751db590c7811355f3f4843c8ad0e5e4b1b6003962
+SHA256 shared body data/migration:
+1e31daac2ef488d5aa90515138d44cf64a3490d836ffe73f7a81d8f90306e12e
+
+The measured JSON contains separately observed legacy physical mappings and
+property text. Ordered References, folded text, subjects and message/body
+semantics are specified independently in the tests. No absent References-cell
+coverage is claimed. Fixture generation does not qualify native import.

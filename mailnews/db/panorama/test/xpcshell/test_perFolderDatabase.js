@@ -1324,3 +1324,120 @@ add_task(function test_offlineJournalErrorsAndClosedWrapperAreNotEmptyQueues() {
   const fresh = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
   Assert.deepEqual(fresh.listAllOfflineDeletes(), [key]);
 });
+
+add_task(function test_permanentFolderRemovalRetiresActualNativeLocations() {
+  const local = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const folder = local
+    .createLocalSubfolder("retired-location")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const child = folder
+    .createLocalSubfolder("nested")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const survivor = local
+    .createLocalSubfolder("surviving-location")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const raw =
+    "Message-ID: <same-retirement-message@example.invalid>\r\nSubject: Native retirement control\r\n\r\nbody\r\n";
+  const headers = [
+    folder.addMessage(raw),
+    child.addMessage(raw),
+    survivor.addMessage(raw),
+  ];
+  const ids = [folder.id, child.id, survivor.id];
+  const keys = headers.map(header => header.messageKey);
+  Assert.equal(new Set(keys).size, 3);
+  Assert.deepEqual(
+    keys.map(key => messageDB.getSearchState(key).folderId),
+    ids
+  );
+  Assert.strictEqual(headers[0].folder, folder);
+  Assert.strictEqual(headers[1].folder, child);
+  const body = folder.filePath;
+  Assert.ok(body.exists());
+  rootFolder.propagateDelete(folder, true);
+  Assert.ok(!body.exists());
+  Assert.ok(!rootFolder.subFolders.includes(folder));
+  for (let index = 0; index < 2; index++) {
+    const state = messageDB.getSearchState(keys[index]);
+    Assert.equal(state.folderId, ids[index]);
+    Assert.strictEqual(state.folderFlags, null);
+    Assert.throws(
+      () => folderDB.getFolderParent(ids[index]),
+      /NS_ERROR_UNEXPECTED/
+    );
+    // Retiring a location does not destroy captured physical message facts.
+    Assert.equal(
+      messageDB.getMessage(keys[index]).messageId,
+      "same-retirement-message@example.invalid"
+    );
+  }
+  Assert.equal(messageDB.getSearchState(keys[2]).folderId, ids[2]);
+  Assert.notStrictEqual(messageDB.getSearchState(keys[2]).folderFlags, null);
+  Assert.strictEqual(messageDB.getMessage(keys[2]).folder, survivor);
+  const recreated = local
+    .createLocalSubfolder("retired-location")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  Assert.notEqual(recreated.id, ids[0]);
+  const replacement = recreated.addMessage(raw);
+  Assert.ok(!keys.includes(replacement.messageKey));
+  Assert.strictEqual(replacement.folder, recreated);
+  Assert.strictEqual(messageDB.getSearchState(keys[0]).folderFlags, null);
+});
+
+add_task(
+  function test_folderRemovalRejectsForeignTransactionBeforeBodyDeletion() {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("retirement-foreign-transaction");
+    const id = folder.id;
+    const body = folder.filePath;
+    const connection = database.connectionForTests;
+    connection.beginTransaction();
+    try {
+      Assert.throws(
+        () => rootFolder.propagateDelete(folder, true),
+        /NS_ERROR_IN_PROGRESS/
+      );
+      Assert.ok(connection.transactionInProgress);
+      Assert.strictEqual(folder.parent, rootFolder);
+      Assert.ok(rootFolder.subFolders.includes(folder));
+      Assert.ok(body.exists());
+      Assert.equal(folderDB.getFolderParent(id), rootFolder.id);
+    } finally {
+      connection.rollbackTransaction();
+    }
+    rootFolder.propagateDelete(folder, true);
+    Assert.throws(() => folderDB.getFolderParent(id), /NS_ERROR_UNEXPECTED/);
+  }
+);
+
+add_task(
+  function test_folderRetirementReportsLateMetadataErrorAndAllowsFreshRetry() {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("retirement-write-error");
+    const id = folder.id;
+    const body = folder.filePath;
+    const connection = database.connectionForTests;
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER reject_folder_retirement BEFORE DELETE ON folders " +
+        `WHEN OLD.id = ${id} BEGIN SELECT RAISE(ABORT, 'folder retirement fault'); END`
+    );
+    try {
+      Assert.throws(
+        () => rootFolder.propagateDelete(folder, true),
+        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+      );
+      Assert.strictEqual(folder.parent, rootFolder);
+      Assert.ok(rootFolder.subFolders.includes(folder));
+      Assert.equal(folderDB.getFolderParent(id), rootFolder.id);
+      // Body deletion already succeeded. SQL failure is not a filesystem rollback.
+      Assert.ok(!body.exists());
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER reject_folder_retirement");
+    }
+    rootFolder.propagateDelete(folder, true);
+    Assert.throws(() => folderDB.getFolderParent(id), /NS_ERROR_UNEXPECTED/);
+    Assert.ok(!rootFolder.subFolders.includes(folder));
+  }
+);

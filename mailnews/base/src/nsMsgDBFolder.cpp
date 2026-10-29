@@ -319,6 +319,7 @@ NS_IMETHODIMP nsMsgDBFolder::Shutdown(bool shutdownChildren) {
     mSubFolders.Clear();
 #ifdef MOZ_PANORAMA
     mFolderId = 0;
+    mFolderDatabaseSourceId.Truncate();
 #endif  // MOZ_PANORAMA
   }
   return NS_OK;
@@ -2746,6 +2747,7 @@ NS_IMETHODIMP nsMsgDBFolder::InitWithFolderId(uint64_t folderId) {
       }
       folder->mParent = entry.parent;
       folder->mFolderId = 0;
+      folder->mFolderDatabaseSourceId.Truncate();
       folder->mServer = nullptr;
       folder->mPath = nullptr;
       folder->mName.Truncate();
@@ -2812,6 +2814,7 @@ nsresult nsMsgDBFolder::InitWithFolderId(
   RefPtr<mozilla::mailnews::DatabaseCore> dbCore =
       mozilla::mailnews::DatabaseCore::GetInstanceForService();
   mozilla::mailnews::FolderDatabase& folderDB(dbCore->FolderDB());
+  MOZ_TRY(dbCore->GetSourceId(mFolderDatabaseSourceId));
 
   uint64_t parentId = MOZ_TRY(folderDB.GetFolderParent(folderId));
   mIsServer = (parentId == 0);
@@ -3470,6 +3473,22 @@ NS_IMETHODIMP nsMsgDBFolder::PropagateDelete(nsIMsgFolder* folder,
 }
 
 NS_IMETHODIMP nsMsgDBFolder::RecursiveDelete(bool deleteStorage) {
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::FolderDatabase> folderDatabase;
+  if (deleteStorage && StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(mFolderId && !mFolderDatabaseSourceId.IsEmpty(),
+                   NS_ERROR_NOT_AVAILABLE);
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    nsCString sourceId;
+    MOZ_TRY(core->GetSourceId(sourceId));
+    NS_ENSURE_TRUE(sourceId == mFolderDatabaseSourceId, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(core->MessageDB().CheckFolderBodyAccess(mFolderId));
+    folderDatabase = &core->FolderDB();
+    uint64_t parent = MOZ_TRY(folderDatabase->GetFolderParent(mFolderId));
+    NS_ENSURE_TRUE(parent, NS_ERROR_UNEXPECTED);
+  }
+#endif
   // If deleteStorage is true, recursively deletes disk storage for this folder
   // and all its subfolders.
   // Regardless of deleteStorage, always unlinks them from the children lists
@@ -3527,9 +3546,16 @@ NS_IMETHODIMP nsMsgDBFolder::RecursiveDelete(bool deleteStorage) {
     // EmptyTrash removes and recreates real local Trash using the same object.
     // Unified Trash is also a local folder, but it is virtual and should be
     // evicted so that recreating it produces a fresh object.
-    if (!isTrash || isVirtual ||
-        !nsCOMPtr<nsIMsgLocalMailFolder>(
-            do_QueryInterface(static_cast<nsIMsgFolder*>(this)))) {
+    bool keepLocalTrash = isTrash && !isVirtual &&
+                          nsCOMPtr<nsIMsgLocalMailFolder>(do_QueryInterface(
+                              static_cast<nsIMsgFolder*>(this)));
+#ifdef MOZ_PANORAMA
+    if (folderDatabase && !keepLocalTrash) {
+      // Storage has gone. A later SQL error is not a filesystem rollback.
+      MOZ_TRY(folderDatabase->DeleteFolder(mFolderId));
+    }
+#endif
+    if (!keepLocalTrash) {
       nsCOMPtr<nsIFolderLookupService> folderLookup =
           do_GetService(NS_FOLDERLOOKUPSERVICE_CONTRACTID);
       if (folderLookup) {

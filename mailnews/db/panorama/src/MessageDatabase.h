@@ -11,6 +11,8 @@
 #include "mozilla/Maybe.h"
 #include "mozilla/RefPtr.h"
 #include "mozilla/Result.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCOMPtr.h"
 #include "nsIMessageDatabase.h"
 #include "nsString.h"
 #include "nsTArray.h"
@@ -73,6 +75,12 @@ struct FolderBodyRelocation {
   nsTArray<RelocatedMessageBody> messages;
 };
 
+struct PendingDestination {
+  uint64_t folderId{0};
+  nsMsgKey key{nsMsgKey_None};
+  uint32_t epoch{0};
+};
+
 // Combined legacy operation payload; copy destinations retain their order.
 struct OfflineOperationData {
   uint32_t operation{0};
@@ -87,6 +95,9 @@ struct OfflineOperationData {
   nsCString keywordsToAdd;
   nsCString keywordsToRemove;
   nsTArray<nsCString> copyDestinations;
+  Maybe<PendingDestination> pendingDestination;
+  // Aligned with copyDestinations. Empty input means all bindings absent.
+  nsTArray<Maybe<PendingDestination>> copyDestinationBindings;
 };
 
 struct ServerMessageLocation {
@@ -94,12 +105,6 @@ struct ServerMessageLocation {
   nsMsgKey key{nsMsgKey_None};
   uint32_t epoch{0};
   uint32_t uid{0};
-};
-
-struct PendingDestination {
-  uint64_t folderId{0};
-  nsMsgKey key{nsMsgKey_None};
-  uint32_t epoch{0};
 };
 
 // Destination UIDVALIDITY and UID reported together by APPENDUID/COPYUID.
@@ -167,6 +172,8 @@ struct PreparedThreadBatch {
   MessageThreadBatch captured;
   nsTArray<RefPtr<Message>> changedLive;
   RefPtr<Message> publicationLive;
+  // Only LiveView fills this with owned rooted preparation/attachment data.
+  nsCOMPtr<nsISupports> liveViewData;
 };
 
 class MessageListener : public nsISupports {
@@ -191,8 +198,51 @@ class MessageListener : public nsISupports {
       OnMessageFlagsChanged(oldMessage, message, before.flags, after.flags);
     }
   }
+  // Historical facts stay owned by the queue; borrowed headers remain live.
+  virtual void OnMessageRemovedCaptured(const CapturedMessage& before,
+                                        Message* live) {
+    OnMessageRemoved(live, before.flags);
+  }
+  virtual void OnMessageFlagsChangedCaptured(const CapturedMessage& before,
+                                             const CapturedMessage& after,
+                                             nsIMsgDBHdr* oldHeader,
+                                             Message* live) {
+    OnMessageFlagsChanged(oldHeader, live, before.flags, after.flags);
+  }
+  virtual void OnMessageTagsChangedCaptured(const CapturedMessage& before,
+                                            const CapturedMessage& after,
+                                            nsIMsgDBHdr* oldHeader,
+                                            Message* live) {
+    OnMessageTagsChanged(oldHeader, live, before.tags, after.tags);
+  }
+  virtual void OnMessageBodyChangedCaptured(const CapturedMessage& before,
+                                            const CapturedMessage& after,
+                                            nsIMsgDBHdr* oldHeader,
+                                            Message* live,
+                                            const MessageBodyState& oldBody,
+                                            const MessageBodyState& newBody) {
+    OnMessageBodyChanged(oldHeader, live, oldBody, newBody);
+  }
+  // Known native consumers opt in; LiveView additionally admits its JS
+  // listener.
+  virtual bool SupportsThreadChanges() const { return false; }
+  // Called in the owned transaction, before a published insert/derived writes.
+  // Reads only; native views own exact old query identities.
+  // Failure leaves output intact; no external JS callbacks.
+  virtual nsresult CaptureThreadViewBeforeInsert(
+      nsCOMPtr<nsISupports>& output) {
+    output = nullptr;
+    return NS_OK;
+  }
+  // The opaque snapshot is borrowed; queued records retain its ownership.
+  virtual nsresult PrepareThreadBatch(const MessageThreadBatch& batch,
+                                      nsISupports* beforeView,
+                                      PreparedThreadBatch& prepared) {
+    return PrepareThreadBatch(batch, prepared);
+  }
   // Preparation owns history and live wrappers, without notifying observers.
-  // On failure prepared is unchanged. Production dispatch is not wired yet.
+  // On failure prepared is unchanged. No external JS callbacks during
+  // preparation.
   virtual nsresult PrepareThreadBatch(const MessageThreadBatch& batch,
                                       PreparedThreadBatch& prepared);
   virtual void DeliverThreadBatch(const PreparedThreadBatch& prepared);
@@ -283,6 +333,9 @@ class MessageDatabase : public nsIMessageDatabase {
   // Reads stored facts directly, including uncommitted owned changes.
   // Missing row: NS_ERROR_UNEXPECTED. On failure output is unchanged.
   nsresult CaptureMessage(nsMsgKey key, CapturedMessage& output);
+  // Published or staged current facts. Missing is NS_OK/Nothing; errors leave
+  // output intact. No cache/presence inference or transaction ownership.
+  nsresult CaptureHeaderState(nsMsgKey key, Maybe<CapturedMessage>& output);
 
   // Unwired insertion discovery: direct edges plus whole stored components.
   // Requires known References history for every visible row; otherwise
@@ -335,6 +388,15 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult SetMessageReferences(nsMsgKey key,
                                 const nsTArray<nsCString>& references);
 
+  // Folder-scoped thread metadata, separate from header flags. Missing physical
+  // folder/thread returns NOT_AVAILABLE; failures leave getter output
+  // unchanged.
+  nsresult GetThreadFlags(uint64_t folderId, uint64_t threadId,
+                          uint32_t& flags);
+  // Commits silently before success; an active caller transaction is not
+  // joined.
+  nsresult SetThreadFlags(uint64_t folderId, uint64_t threadId, uint32_t flags);
+
   nsresult GetMessageThreadId(nsMsgKey key, nsMsgKey& threadId);
   nsresult GetMessageThreadParent(nsMsgKey key, nsMsgKey& threadParent);
 
@@ -369,11 +431,17 @@ class MessageDatabase : public nsIMessageDatabase {
   Result<nsMsgKey, nsresult> FindByMessageId(nsACString const& messageId);
 
  protected:
-  virtual ~MessageDatabase() {};
+  virtual ~MessageDatabase();
 
  private:
   friend class DatabaseCore;
   friend class FolderMigrator;
+
+  // Caller owns the insertion transaction and has written the new row/history.
+  // Read-only plan; does not assign a batch ID, write derived fields, warm
+  // caches or notify. Failure leaves output and the caller transaction intact.
+  nsresult PlanConversationInsertion(nsMsgKey key, bool notifyLegacy,
+                                     MessageThreadBatch& output);
 
   // Caller owns the active transaction/savepoint and must roll it back on
   // error.
@@ -396,6 +464,9 @@ class MessageDatabase : public nsIMessageDatabase {
                                         Maybe<ServerMessageLocation>& source,
                                         Maybe<uint32_t>* folderEpoch = nullptr);
   nsresult RequireOfflineOperationMutable(int64_t operationId);
+  nsresult ValidatePendingDestination(const PendingDestination& destination,
+                                      uint64_t folderId, nsMsgKey key,
+                                      bool append, int64_t operationId);
   nsresult BindMessageToServerUidInTransaction(nsMsgKey key, uint64_t folderId,
                                                uint32_t epoch, uint32_t uid,
                                                bool allowStaged);
@@ -409,7 +480,7 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult RequireCommittedSearchRead();
   nsresult GetSearchWatermark(uint64_t& sequence);
 
-  MessageDatabase() {};
+  MessageDatabase();
   void Startup();
   void Shutdown();
 
@@ -419,6 +490,7 @@ class MessageDatabase : public nsIMessageDatabase {
   friend class Thread;
   friend class ThreadMessageEnumerator;
   friend class DeliveryCoreMessageExistence;
+  friend class DeliveryCoreReferences;
 
   // Leaves keys unchanged on failure.
   nsresult ListAllKeys(uint64_t aFolderId, nsTArray<nsMsgKey>& aKeys);
@@ -469,7 +541,35 @@ class MessageDatabase : public nsIMessageDatabase {
   // Check the cache and slim it down if needed.
   void TrimCache();
 
-  nsTObserverArray<RefPtr<MessageListener>> mMessageListeners;
+  struct ListenerRegistration;
+  struct QueuedMessageBatch;
+  nsresult PrepareMessageBatch(UniquePtr<QueuedMessageBatch>& output);
+  nsresult CaptureThreadViewsBeforeInsert(QueuedMessageBatch& batch);
+  nsresult PrepareConversationBatch(nsMsgKey key, bool notifyLegacy,
+                                    QueuedMessageBatch& notification,
+                                    MessageThreadBatch& captured);
+  struct ThreadWordRemap {
+    uint64_t folderId{0};
+    nsMsgKey threadId{0};
+    uint32_t flags{0};
+    bool present{false};
+    nsTArray<nsMsgKey> oldThreads;
+  };
+  nsresult ReadThreadWord(uint64_t folderId, nsMsgKey threadId, uint32_t& flags,
+                          bool& present);
+  nsresult PrepareThreadWordRemap(const MessageThreadBatch& batch,
+                                  nsTArray<ThreadWordRemap>& output);
+  nsresult ApplyThreadWordRemap(const nsTArray<ThreadWordRemap>& remaps);
+  void InstallThreadCache(const MessageThreadBatch& batch);
+  void QueueMessageBatch(UniquePtr<QueuedMessageBatch> batch);
+  void DrainMessageBatches();
+
+  nsTArray<RefPtr<ListenerRegistration>> mMessageListeners;
+  nsTArray<UniquePtr<QueuedMessageBatch>> mMessageBatches;
+  uint64_t mLastMessageBatch{0};
+  bool mDeliveringMessageBatches{false};
+  // Enabled only with the independently accepted producer/consumer aggregate.
+  bool mConversationGroupingEnabled{false};
 
   nsresult SetMessageFlagsInternal(Message* message, uint32_t newFlags);
 };

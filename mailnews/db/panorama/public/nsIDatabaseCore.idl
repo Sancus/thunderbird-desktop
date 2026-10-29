@@ -45,11 +45,15 @@ interface nsIDatabaseCore : nsISupports {
    * Migrate a folder's messages from its message summary into the new database.
    *
    * Returns a Promise that resolves when migration of the folder is complete.
+   * Windows rejects this entrypoint: it has no original admitted-root context.
    */
   [implicit_jscontext] Promise migrateFolderDatabase(in nsIMsgFolder srcFolder);
 
   /**
-   * Import a checked version1 converted folder snapshot. The request carries
+   * Import a checked converted folder snapshot (Unix version1, Windows version2).
+   * Windows adds windowsAdmission.summary/store: originalPath, originalRoot,
+   * id, parentId and rootId. Native admission validates and retains these paths.
+   * The request carries
    * the original folder/store descriptors, source digest and complete records.
    * Unsupported records reject before insertion. A matching receipt is returned
    * unchanged on retry. Source/body files are never written or removed.
@@ -58,7 +62,9 @@ interface nsIDatabaseCore : nsISupports {
                                                    in jsval request);
 
   /**
-   * Look up the committed receipt for the same version1 identity envelope.
+   * Look up the committed receipt for the same versioned identity envelope.
+   * Windows version2 returns measured windowsAdmission and sourcePhysicalIdentity;
+   * missing old Windows physical identity rejects without rebinding the receipt.
    * Returns null only when no receipt exists. Conflicting identities and old
    * hash-only completions throw; callers must retain the database sourceId.
    */

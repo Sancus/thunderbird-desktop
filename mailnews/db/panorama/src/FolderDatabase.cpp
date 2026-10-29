@@ -138,26 +138,41 @@ nsresult FolderDatabase::InternalInsertFolder(uint64_t parentId,
                                               uint64_t* childId) {
   MOZ_ASSERT(MOZ_TRY(DatabaseUtils::Normalize(name)) == name);
   NS_ENSURE_ARG_POINTER(childId);
+  NS_ENSURE_TRUE(parentId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mFolderDatabase.get() == this,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
 
   // DB has uniqueness constraint upon (parent, name).
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "InsertFolder"_ns,
-      "INSERT INTO folders (parent, name) VALUES (:parent, :name) RETURNING id"_ns,
+      "INSERT INTO folders (id, parent, name) SELECT highWater + 1, :parent, "
+      ":name FROM folder_id_allocator WHERE singleton = 1 AND highWater < "
+      "9223372036854775807 RETURNING id"_ns,
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
 
-  stmt->BindInt64ByName("parent"_ns, parentId);  // parentId can be 0 for root.
-  stmt->BindUTF8StringByName("name"_ns, name);
+  MOZ_TRY(stmt->BindInt64ByName("parent"_ns, parentId));  // 0 for root.
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
   bool hasResult;
   rv = stmt->ExecuteStep(&hasResult);
   NS_ENSURE_SUCCESS(rv, rv);
   if (!hasResult) {
-    return NS_ERROR_UNEXPECTED;
+    return NS_ERROR_ILLEGAL_VALUE;
   }
 
-  uint64_t id = stmt->AsInt64(0);
+  int64_t storedId;
+  MOZ_TRY(stmt->GetInt64(0, &storedId));
+  NS_ENSURE_TRUE(storedId > 0, NS_ERROR_FILE_CORRUPTED);
+  uint64_t id = storedId;
+  MOZ_TRY(stmt->ExecuteStep(&hasResult));
+  NS_ENSURE_FALSE(hasResult, NS_ERROR_UNEXPECTED);
 
   // We've already got the data, so may as well enter it in the cache.
   {
@@ -166,7 +181,6 @@ nsresult FolderDatabase::InternalInsertFolder(uint64_t parentId,
     cached.parent = parentId;
     cached.ordinal = Nothing();
     cached.name = name;
-    cached.flags = 0;
     MOZ_ALWAYS_TRUE(mFolderCache.put(id, cached));
   }
 
@@ -178,41 +192,89 @@ nsresult FolderDatabase::InternalInsertFolder(uint64_t parentId,
 }
 
 NS_IMETHODIMP FolderDatabase::DeleteFolder(uint64_t folderId) {
-  uint64_t parentId = MOZ_TRY(GetFolderParent(folderId));
-  if (!parentId) {
-    NS_WARNING("using DeleteFolder on a root folder is forbidden");
-    return NS_ERROR_UNEXPECTED;
+  return DeleteFolderTree(folderId, false, EmptyCString());
+}
+
+nsresult FolderDatabase::RetireRoot(uint64_t folderId,
+                                    const nsACString& serverKey) {
+  NS_ENSURE_TRUE(!serverKey.IsEmpty(), NS_ERROR_INVALID_ARG);
+  return DeleteFolderTree(folderId, true, serverKey);
+}
+
+nsresult FolderDatabase::DeleteFolderTree(uint64_t folderId, bool root,
+                                          const nsACString& serverKey) {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mFolderDatabase.get() == this,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  nsTArray<uint64_t> removed;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "CheckDeletedFolderOwner"_ns,
+          "SELECT parent, name FROM folders WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+      int64_t parent;
+      nsCString name;
+      MOZ_TRY(stmt->GetInt64(0, &parent));
+      MOZ_TRY(stmt->GetUTF8String(1, name));
+      if (!root && !parent) {
+        NS_WARNING("using DeleteFolder on a root folder is forbidden");
+      }
+      NS_ENSURE_TRUE(root ? (!parent && name == serverKey) : parent > 0,
+                     NS_ERROR_UNEXPECTED);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "DeleteFolderTree"_ns,
+          "WITH RECURSIVE doomed(id) AS (SELECT :id UNION SELECT f.id FROM "
+          "folders f JOIN doomed d ON f.parent=d.id) "
+          "DELETE FROM folders WHERE id IN (SELECT id FROM doomed) RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+      while (true) {
+        bool more;
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        if (!more) {
+          break;
+        }
+        int64_t id;
+        MOZ_TRY(stmt->GetInt64(0, &id));
+        NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+        removed.AppendElement(uint64_t(id));
+      }
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    nsresult cleanup = connection->GetTransactionInProgress(&active);
+    if (NS_SUCCEEDED(cleanup) && active) {
+      cleanup = connection->RollbackTransaction();
+    }
+    if (NS_FAILED(cleanup)) {
+      MOZ_LOG(gPanoramaLog, LogLevel::Error,
+              ("Folder deletion cleanup failed: 0x%08x", uint32_t(cleanup)));
+    }
+    return rv;
   }
-
-  // Delete the target folder _AND_ all its descendants.
-  nsTArray<uint64_t> doomed = MOZ_TRY(GetFolderDescendants(folderId));
-  doomed.AppendElement(folderId);
-
-  // TODO: Presumably, we should also be deleting (or unlinking) any
-  // messages in these folders!
-
-  // Awkward uint64_t -> int64_t conversion.
-  nsTArray<int64_t> ids(doomed.Length());
-  for (uint64_t id : doomed) {
-    ids.AppendElement((int64_t)id);
-  }
-  nsCOMPtr<mozIStorageStatement> stmt;
-  DatabaseCore::GetStatement("DeleteFolder"_ns,
-                             "DELETE FROM folders WHERE id IN carray(?1)"_ns,
-                             getter_AddRefs(stmt));
-
-  MOZ_TRY(stmt->BindArrayOfIntegersByIndex(0, ids));
-  nsresult rv = stmt->Execute();
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // Update cache.
-  for (uint64_t id : doomed) {
+  // Physical messages, body metadata and captured revisions remain readable.
+  for (uint64_t id : removed) {
     mFolderCache.remove(id);
   }
-
-  MOZ_LOG(gPanoramaLog, LogLevel::Info,
-          ("DeleteFolder removed folder %" PRIu64, folderId));
-
   return NS_OK;
 }
 
@@ -423,17 +485,11 @@ FolderDatabase::UpdateFlags(uint64_t folderId, uint64_t newFlags) {
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindInt64ByName("flags"_ns, newFlags);
-  stmt->BindInt64ByName("id"_ns, folderId);
+  MOZ_TRY(stmt->BindInt64ByName("flags"_ns, newFlags));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
 
   rv = stmt->Execute();
   NS_ENSURE_SUCCESS(rv, rv);
-
-  // Update cache.
-  auto p = mFolderCache.lookup(folderId);
-  if (p) {
-    p->value().flags = newFlags;
-  }
 
   return NS_OK;
 }
@@ -775,8 +831,25 @@ Result<nsCString, nsresult> FolderDatabase::GetFolderPath(uint64_t folderId) {
 
 Result<uint32_t, nsresult> FolderDatabase::GetFolderFlags(uint64_t folderId) {
   MOZ_ASSERT(folderId);
-  CachedFolder* cached = MOZ_TRY(EnsureFolderCached(folderId));
-  return cached->flags;
+  // Flags can be written in a caller transaction which may later roll back.
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "GetStoredFolderFlags"_ns, "SELECT flags FROM folders WHERE id = :id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (!more) {
+    return Err(NS_ERROR_UNEXPECTED);
+  }
+  int64_t flags;
+  MOZ_TRY(stmt->GetInt64(0, &flags));
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (more) {
+    return Err(NS_ERROR_FILE_CORRUPTED);
+  }
+  return static_cast<uint32_t>(flags);
 }
 
 Result<Maybe<uint64_t>, nsresult> FolderDatabase::GetFolderOrdinal(
@@ -905,11 +978,10 @@ Result<nsTArray<uint64_t>, nsresult> FolderDatabase::GetFolderAncestors(
 nsresult FolderDatabase::FetchFolderData(uint64_t folderId,
                                          CachedFolder& cached) {
   nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv =
-      DatabaseCore::GetStatement("FetchFolder"_ns,
-                                 "SELECT id, parent, ordinal, name, flags "
-                                 " FROM folders WHERE id = :id"_ns,
-                                 getter_AddRefs(stmt));
+  nsresult rv = DatabaseCore::GetStatement("FetchFolder"_ns,
+                                           "SELECT id, parent, ordinal, name "
+                                           " FROM folders WHERE id = :id"_ns,
+                                           getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
   stmt->BindInt64ByName("id"_ns, (uint64_t)folderId);
@@ -927,7 +999,6 @@ nsresult FolderDatabase::FetchFolderData(uint64_t folderId,
       stmt->IsNull(2) ? Nothing() : Some((uint64_t)stmt->AsInt64(2));
   uint32_t len;
   cached.name = stmt->AsSharedUTF8String(3, &len);
-  cached.flags = (uint32_t)stmt->AsInt64(4);
   return NS_OK;
 }
 

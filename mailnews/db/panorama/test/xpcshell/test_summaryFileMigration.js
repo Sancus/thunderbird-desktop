@@ -6,6 +6,9 @@
  * Tests migrating the messages from a summary file into the new database.
  */
 
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
 const { ProfileCreator } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/ProfileCreator.sys.mjs"
 );
@@ -26,6 +29,15 @@ add_task(async function () {
   const testFolder =
     MailServices.accounts.localFoldersServer.rootFolder.getChildNamed("test");
   Assert.equal(testFolder.getTotalMessages(false), 0);
+
+  if (AppConstants.platform == "win") {
+    Assert.throws(
+      () => database.migrateFolderDatabase(testFolder),
+      error => error.result === Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.equal(testFolder.getTotalMessages(false), 0);
+    return;
+  }
 
   await database.migrateFolderDatabase(testFolder);
   const messages = Array.from(testFolder.messages);

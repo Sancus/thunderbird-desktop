@@ -324,6 +324,12 @@ class DeliveryCoreProperties : public testing::Test {
   }
 
   nsresult DropSearchSchema(mozIStorageConnection* connection) {
+    MOZ_TRY(connection->ExecuteSimpleSQL(
+        "DROP TRIGGER thread_flags_message_delete; DROP TRIGGER "
+        "thread_flags_folder_delete;"
+        "DROP TABLE thread_flags;"
+        "DROP TRIGGER guard_folder_id; DROP TRIGGER record_folder_id;"
+        "DROP TRIGGER immutable_folder_id; DROP TABLE folder_id_allocator;"_ns));
     for (const auto* table :
          {"messages", "staged_messages", "folder_properties", "folders",
           "offline_operations", "offline_attempts", "offline_copy_destinations",
@@ -368,7 +374,8 @@ class DeliveryCoreProperties : public testing::Test {
     }
     return connection->ExecuteSimpleSQL(
         "DROP TABLE message_changes; DROP TABLE database_identity; "
-        "DROP TABLE folder_import_keys; DROP TABLE folder_import_receipts"_ns);
+        "DROP TABLE folder_import_windows; DROP TABLE folder_import_keys; "
+        "DROP TABLE folder_import_receipts"_ns);
   }
 
   nsresult MakeVersionTwo() {
@@ -671,7 +678,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UpgradePreservesExistingValues) {
   EXPECT_EQ(before, after);
   int32_t version;
   ASSERT_EQ(NS_OK, Connection()->GetSchemaVersion(&version));
-  EXPECT_EQ(10, version);
+  EXPECT_EQ(14, version);
   ASSERT_NO_FATAL_FAILURE(CheckStored("message_properties"_ns, key,
                                       "native.unsigned"_ns, "4294967295"_ns,
                                       "integer"_ns));
@@ -2076,5 +2083,148 @@ TEST_F(DeliveryCoreProperties,
   EXPECT_EQ(member, output[0]);
   CheckScope(mFolder, {member});
 }
+
+TEST_F(DeliveryCoreProperties, FolderFlagsFollowCallerRollbackAndCommit) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->FolderDB();
+  uint64_t control;
+  ASSERT_EQ(NS_OK, db.InsertFolder(mFolder, "FlagControl"_ns, &control));
+  ASSERT_EQ(NS_OK, db.UpdateFlags(mFolder, 1));
+  ASSERT_EQ(NS_OK, db.UpdateFlags(control, 8));
+  auto name = db.GetFolderName(mFolder);
+  ASSERT_TRUE(name.isOk());
+  EXPECT_EQ("Inbox"_ns, name.unwrap());
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(1u, flags);
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active;
+    if (NS_SUCCEEDED(Connection()->GetTransactionInProgress(&active)) &&
+        active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, db.UpdateFlags(mFolder, 2));
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(2u, flags);
+  bool active;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(1u, flags);
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  ASSERT_EQ(NS_OK, db.UpdateFlags(mFolder, 4));
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(4u, flags);
+  ASSERT_EQ(NS_OK, Connection()->CommitTransaction());
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(4u, flags);
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(control, &flags));
+  EXPECT_EQ(8u, flags);
+
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  auto close = MakeScopeExit([&] {
+    if (stmt) {
+      EXPECT_EQ(NS_OK, stmt->Finalize());
+    }
+    EXPECT_EQ(NS_OK, reader->Close());
+  });
+  ASSERT_EQ(
+      NS_OK,
+      reader->CreateStatement(
+          "SELECT id,flags FROM folders WHERE id=:target OR id=:control"_ns,
+          getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("target"_ns, mFolder));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("control"_ns, control));
+  uint32_t rows = 0;
+  while (true) {
+    bool more;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    int64_t id, storedFlags;
+    ASSERT_EQ(NS_OK, stmt->GetInt64(0, &id));
+    ASSERT_EQ(NS_OK, stmt->GetInt64(1, &storedFlags));
+    ASSERT_TRUE(uint64_t(id) == mFolder || uint64_t(id) == control);
+    EXPECT_EQ(uint64_t(id) == mFolder ? 4 : 8, storedFlags);
+    ++rows;
+  }
+  EXPECT_EQ(2u, rows);
+}
+
+TEST_F(DeliveryCoreProperties, ColdFolderFlagsDoNotCacheUncommittedValues) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder, 8));
+  ASSERT_TRUE(Stop());
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->FolderDB();
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active;
+    if (NS_SUCCEEDED(Connection()->GetTransactionInProgress(&active)) &&
+        active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, db.UpdateFlags(mFolder, 16));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(16u, flags);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(8u, flags);
+}
+
+TEST_F(DeliveryCoreProperties, FolderFlagErrorsPreserveCallerStateAndOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->FolderDB();
+  ASSERT_EQ(NS_OK, db.UpdateFlags(mFolder, 1));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "CREATE TEMP TRIGGER fail_folder_flags BEFORE UPDATE OF flags "
+                "ON folders "
+                "BEGIN SELECT RAISE(ABORT,'folder flags failure'); END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_folder_flags; "
+                         "DROP VIEW IF EXISTS temp.folders"_ns));
+  });
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active;
+    if (NS_SUCCEEDED(Connection()->GetTransactionInProgress(&active)) &&
+        active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, SetFolder("caller-write"_ns, "retained"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, db.UpdateFlags(mFolder, 2));
+  bool active;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(1u, flags);
+  ASSERT_EQ(NS_OK, Connection()->CommitTransaction());
+  ASSERT_NO_FATAL_FAILURE(CheckStored("folder_properties"_ns, mFolder,
+                                      "caller-write"_ns, "retained"_ns));
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "DROP TRIGGER fail_folder_flags; "
+                "CREATE TEMP VIEW folders AS SELECT id, "
+                "abs(-9223372036854775808) AS flags FROM main.folders"_ns));
+  flags = 0xfedcba98;
+  EXPECT_EQ(NS_ERROR_FAILURE, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(0xfedcba98u, flags);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL("DROP VIEW temp.folders"_ns));
+  ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
+  EXPECT_EQ(1u, flags);
+}
+
 
 }  // namespace mozilla::mailnews

@@ -88,7 +88,9 @@ class FolderDatabase : public nsIFolderDatabase {
 
   nsresult InternalInsertFolder(uint64_t aParent, const nsACString& aName,
                                 uint64_t* aChild);
-  nsresult InternalDeleteFolder(uint64_t aFolder);
+  nsresult RetireRoot(uint64_t folderId, const nsACString& serverKey);
+  nsresult DeleteFolderTree(uint64_t folderId, bool root,
+                            const nsACString& serverKey);
 
   nsresult SaveOrdinals(nsTArray<uint64_t> const& aFolders);
 
@@ -101,7 +103,6 @@ class FolderDatabase : public nsIFolderDatabase {
     uint64_t parent{0};
     Maybe<uint64_t> ordinal;
     nsAutoCString name;
-    uint32_t flags{0};
   };
 
   // The cache, indexed by folderId.

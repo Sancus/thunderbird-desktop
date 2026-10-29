@@ -33,6 +33,23 @@ class DeliveryCoreProperties;
 class DeliveryFolderInfoProperties;
 class DeliveryMessageReferences;
 
+// Windows v2 retains original inventory spellings separately from native
+// results.
+struct FolderImportPathIdentity {
+  nsString originalPath;
+  nsString originalRoot;
+  nsString canonicalPath;
+  nsString canonicalRoot;
+  nsCString id;
+  nsCString parentId;
+  nsCString rootId;
+};
+
+struct FolderImportWindowsIdentity {
+  FolderImportPathIdentity summary;
+  FolderImportPathIdentity store;
+};
+
 struct FolderImportIdentity {
   nsCString token;
   nsCString sourceId;
@@ -41,6 +58,7 @@ struct FolderImportIdentity {
   uint64_t folderId{0};
   nsCString folderPath;
   nsString sourcePath;
+  Maybe<FolderImportWindowsIdentity> windows;
 };
 
 struct FolderImportMessage {
@@ -88,6 +106,11 @@ class DatabaseCore : public nsIDatabaseCore,
   NS_DECL_NSIOBSERVER
 
   static already_AddRefed<DatabaseCore> GetInstanceForService();
+
+  // Retires SQL folder identities only; never opens a core or removes files.
+  static nsresult RetireAccountRoot(uint64_t folderId,
+                                    const nsACString& serverKey,
+                                    const nsACString& databaseSourceId);
 
   FolderDatabase& FolderDB() { return *mFolderDatabase; }
   MessageDatabase& MessageDB() { return *mMessageDatabase; }

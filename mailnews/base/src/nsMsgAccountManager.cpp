@@ -533,6 +533,10 @@ nsMsgAccountManager::RemoveIncomingServer(nsIMsgIncomingServer* aServer,
                      nsIScriptError::warningFlag);
   }
 
+#ifdef MOZ_PANORAMA
+  uint64_t rootFolderId = 0;
+  nsCString rootDatabaseSourceId;
+#endif
   nsTArray<RefPtr<nsIMsgFolder>> allDescendants;
   if (rootFolder) {
     rv = rootFolder->GetDescendants(allDescendants);
@@ -588,6 +592,24 @@ nsMsgAccountManager::RemoveIncomingServer(nsIMsgIncomingServer* aServer,
     }
   }
   if (rootFolder && mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+#ifdef MOZ_PANORAMA
+    rv = rootFolder->GetId(&rootFolderId);
+    if (NS_FAILED(rv)) {
+      rootFolderId = 0;
+      NS_WARNING(nsPrintfCString("failed to get removed root identity: %s",
+                                 mozilla::GetStaticErrorName(rv))
+                     .get());
+    }
+    nsCOMPtr<nsIDatabaseCore> core =
+        mozilla::components::DatabaseCore::Service();
+    nsresult identityRv =
+        core ? core->GetSourceId(rootDatabaseSourceId) : NS_ERROR_NOT_AVAILABLE;
+    if (NS_FAILED(identityRv)) {
+      NS_WARNING(nsPrintfCString("failed to capture removed root database: %s",
+                                 mozilla::GetStaticErrorName(identityRv))
+                     .get());
+    }
+#endif
     // Retained folder objects must not be found under a replacement server.
     nsCOMPtr<nsIFolderLookupService> lookup =
         do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
@@ -659,6 +681,24 @@ nsMsgAccountManager::RemoveIncomingServer(nsIMsgIncomingServer* aServer,
   if (rootFolder) {
     rootFolder->Shutdown(true);
   }
+#ifdef MOZ_PANORAMA
+  if (rootFolderId && !rootDatabaseSourceId.IsEmpty() &&
+      mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIMsgIncomingServer> replacement;
+    nsresult retireRv =
+        m_incomingServers.Get(serverKey, getter_AddRefs(replacement))
+            ? NS_ERROR_IN_PROGRESS
+            : mozilla::mailnews::DatabaseCore::RetireAccountRoot(
+                  rootFolderId, serverKey, rootDatabaseSourceId);
+    if (NS_FAILED(retireRv)) {
+      MsgLogToConsole4(
+          NS_ConvertUTF8toUTF16(nsPrintfCString(
+              "failed to retire folders for server %s: %s", serverKey.get(),
+              mozilla::GetStaticErrorName(retireRv))),
+          nsDependentCString(__FILE__), __LINE__, nsIScriptError::warningFlag);
+    }
+  }
+#endif
   return NS_OK;
 }
 

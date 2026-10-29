@@ -112,12 +112,57 @@ add_setup(async function () {
 });
 
 /**
+ * Adds Windows v2 admission from this fixture's original inventory paths.
+ * Closes these caller leases before core must obtain its own native leases.
+ *
+ * @param {object} input - Converted folder request to extend in place.
+ * @returns {object} The same request with v2 admission on Windows.
+ */
+function withWindowsAdmission(input) {
+  if (AppConstants.platform != "win") {
+    return input;
+  }
+  const fileSystem = Cc[
+    "@mozilla.org/mailnews/panorama-migration-file-system;1"
+  ].createInstance(Ci.nsIPanoramaMigrationFileSystem);
+  const root = do_get_profile();
+  input.version = 2;
+  input.windowsAdmission = {};
+  for (const [name, originalPath] of [
+    ["summary", input.folder.summaryPath],
+    ["store", input.folder.storePath],
+  ]) {
+    const kind =
+      name == "store" && !input.folder.storeExists
+        ? Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING
+        : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE;
+    const lease = fileSystem.admit(
+      new FileUtils.File(originalPath),
+      root,
+      kind
+    );
+    try {
+      input.windowsAdmission[name] = {
+        originalPath,
+        originalRoot: root.path,
+        id: lease.identity,
+        parentId: lease.parentIdentity,
+        rootId: lease.rootIdentity,
+      };
+    } finally {
+      lease.close();
+    }
+  }
+  return input;
+}
+
+/**
  * Creates owned converted input over an actual folder's empty summary file.
  * Raw record cells use the migration reader's byte-string representation.
  *
  * @param {string} name - Fixture folder and stable source-unit name.
  * @returns {Promise<Awaited<ReturnType<typeof import("resource:///modules/panorama/MorkFolderImport.sys.mjs").readMorkFolderImport>> & {sourceId: string, databaseSourceId: string}>}
- *   Version1 request with stable journal and database identities.
+ *   Converted request with stable journal and database identities.
  */
 async function importInput(name) {
   const folder = importFolders.get(name);
@@ -161,7 +206,7 @@ async function importInput(name) {
     { sourceKey: 0, rootSourceKey: 0, parentSourceKey: null, header: root },
   ];
   const scope = "ns:msg:db:row:scope:msgs:all";
-  return {
+  return withWindowsAdmission({
     version: 1,
     token: "import-" + name,
     sourceId: name,
@@ -204,7 +249,7 @@ async function importInput(name) {
         },
       ],
     },
-  };
+  });
 }
 
 add_task(async function test_importFolderSnapshotPreservesCompleteFields() {
@@ -443,21 +488,23 @@ add_task(async function test_getFolderImportReceiptPropagatesSqlErrors() {
 async function fullImportInput(name) {
   const folder = importFolders.get(name);
   const input = await readMorkFolderImport(folder, "whole-" + name);
-  return convertMorkFolderSnapshot(
-    input,
-    {
-      id: name,
-      token: input.token,
-      databaseSourceId: database.sourceId,
-      destinationFolderId: folder.id,
-      path: input.source.path,
-      sha256: input.source.sha256,
-      size: input.source.size,
-      messageKeys: [...input.source.messageKeys],
-      state: "importing",
-    },
-    database.sourceId,
-    folder.flags
+  return withWindowsAdmission(
+    convertMorkFolderSnapshot(
+      input,
+      {
+        id: name,
+        token: input.token,
+        databaseSourceId: database.sourceId,
+        destinationFolderId: folder.id,
+        path: input.source.path,
+        sha256: input.source.sha256,
+        size: input.source.size,
+        messageKeys: [...input.source.messageKeys],
+        state: "importing",
+      },
+      database.sourceId,
+      folder.flags
+    )
   );
 }
 
@@ -892,5 +939,64 @@ add_task(
       await IOUtils.move(saved, path, { noOverwrite: true });
     }
     Assert.deepEqual(await IOUtils.read(path), before);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_getFolderImportReceiptBindsNativeWindowsIdentity() {
+    const folder = importFolders.get("fields");
+    const input = await importInput("fields");
+    const receipt = database.getFolderImportReceipt(folder, input);
+    Assert.equal(receipt.version, 2);
+    Assert.deepEqual(receipt.sourcePhysicalIdentity, {
+      version: 1,
+      id: input.windowsAdmission.summary.id,
+      parentId: input.windowsAdmission.summary.parentId,
+    });
+    for (const name of ["summary", "store"]) {
+      for (const key of [
+        "originalPath",
+        "originalRoot",
+        "id",
+        "parentId",
+        "rootId",
+      ]) {
+        Assert.equal(
+          receipt.windowsAdmission[name][key],
+          input.windowsAdmission[name][key]
+        );
+      }
+    }
+    const count = messageDB.totalCount;
+    input.windowsAdmission.summary.id =
+      "0000000000000000:00000000000000000000000000000000";
+    Assert.throws(
+      () => database.importFolderSnapshot(folder, input),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.equal(messageDB.totalCount, count);
+    Assert.ok(messageDB.getSearchState(importControl));
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_importRequiresWindowsOriginalAdmission() {
+    const folder = importFolders.get("fields");
+    const input = await importInput("fields");
+    input.version = 1;
+    delete input.windowsAdmission;
+    const count = messageDB.totalCount;
+    Assert.throws(
+      () => database.importFolderSnapshot(folder, input),
+      error => error.result == Cr.NS_ERROR_INVALID_ARG
+    );
+    Assert.throws(
+      () => database.migrateFolderDatabase(folder),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.equal(messageDB.totalCount, count);
+    Assert.ok(!database.connectionForTests.transactionInProgress);
   }
 );

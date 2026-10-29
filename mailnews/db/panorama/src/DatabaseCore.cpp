@@ -4,6 +4,10 @@
 
 #include "DatabaseCore.h"
 
+#ifdef XP_WIN
+#  include "MigrationFileSystem.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -242,6 +246,20 @@ nsresult DatabaseCore::EnsureConnection() {
 
 namespace {
 
+constexpr auto kFolderIdGuard =
+    "CREATE TRIGGER guard_folder_id BEFORE INSERT ON folders "
+    "WHEN NEW.id <= 0 OR NOT EXISTS(SELECT 1 FROM folder_id_allocator "
+    "WHERE singleton=1) OR NEW.id <= (SELECT highWater FROM "
+    "folder_id_allocator "
+    "WHERE singleton=1) BEGIN SELECT RAISE(ABORT,'invalid folder id'); END"_ns;
+constexpr auto kFolderIdRecord =
+    "CREATE TRIGGER record_folder_id AFTER INSERT ON folders BEGIN "
+    "UPDATE folder_id_allocator SET highWater=NEW.id WHERE singleton=1; END"_ns;
+constexpr auto kFolderIdImmutable =
+    "CREATE TRIGGER immutable_folder_id BEFORE UPDATE OF id ON folders "
+    "WHEN NEW.id IS NOT OLD.id "
+    "BEGIN SELECT RAISE(ABORT,'immutable folder id'); END"_ns;
+
 constexpr auto kReferenceDeleteTrigger =
     "CREATE TRIGGER delete_message_references AFTER DELETE ON messages BEGIN "
     "DELETE FROM message_references WHERE id = OLD.id; "
@@ -464,10 +482,19 @@ nsresult CheckReferenceSchemaTable(mozIStorageConnection* connection,
 
 }  // namespace
 
+static constexpr auto kThreadFlagsMessageDelete =
+    "CREATE TRIGGER thread_flags_message_delete AFTER DELETE ON messages BEGIN "
+    "DELETE FROM thread_flags WHERE folderId=OLD.folderId AND "
+    "threadId=OLD.threadId "
+    "AND NOT EXISTS(SELECT 1 FROM messages WHERE folderId=OLD.folderId AND threadId=OLD.threadId); END"_ns;
+static constexpr auto kThreadFlagsFolderDelete =
+    "CREATE TRIGGER thread_flags_folder_delete AFTER DELETE ON folders BEGIN "
+    "DELETE FROM thread_flags WHERE folderId=OLD.id; END"_ns;
+
 nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version >= 0 && version <= 10, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 14, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -737,20 +764,23 @@ nsresult DatabaseCore::UpgradeSchema() {
         "BEGIN DELETE FROM offline_copy_destinations WHERE operationId = OLD.id; END;"_ns));
     MOZ_TRY(sConnection->SetSchemaVersion(6));
   }
-  MOZ_TRY(CheckReferenceSchemaTable(
-      sConnection, "offline_operations",
-      "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
-      "INTEGER:1:0,"
-      "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
-      "INTEGER:1:0,"
-      "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
-      "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:1:"
-      "0,"
-      "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
-      "TEXT:1:0,folderEpoch:INTEGER:0:0"));
-  MOZ_TRY(CheckReferenceSchemaTable(
-      sConnection, "offline_copy_destinations",
-      "operationId:INTEGER:1:1,ordinal:INTEGER:1:2,uri:TEXT:1:0"));
+  if (version < 11) {
+    MOZ_TRY(CheckReferenceSchemaTable(
+        sConnection, "offline_operations",
+        "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
+        "INTEGER:1:0,"
+        "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
+        "INTEGER:1:0,"
+        "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
+        "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:"
+        "1:"
+        "0,"
+        "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
+        "TEXT:1:0,folderEpoch:INTEGER:0:0"));
+    MOZ_TRY(CheckReferenceSchemaTable(
+        sConnection, "offline_copy_destinations",
+        "operationId:INTEGER:1:1,ordinal:INTEGER:1:2,uri:TEXT:1:0"));
+  }
   MOZ_TRY(CheckReferenceSchemaTable(
       sConnection, "offline_attempts",
       "id:INTEGER:0:1,operationId:INTEGER:1:0,revision:INTEGER:1:0,state:"
@@ -924,10 +954,283 @@ nsresult DatabaseCore::UpgradeSchema() {
       "ON folders BEGIN "
       "DELETE FROM body_relocation_rows WHERE folderId=OLD.id; "
       "DELETE FROM body_relocations WHERE folderId=OLD.id; END"_ns));
+  if (version < 11) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "ALTER TABLE offline_operations ADD COLUMN destinationFolderId INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN destinationKey INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN destinationEpoch INTEGER;"
+        "ALTER TABLE offline_copy_destinations ADD COLUMN destinationFolderId "
+        "INTEGER;"
+        "ALTER TABLE offline_copy_destinations ADD COLUMN destinationKey "
+        "INTEGER;"
+        "ALTER TABLE offline_copy_destinations ADD COLUMN destinationEpoch INTEGER;"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(11));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_operations",
+      "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
+      "INTEGER:1:0,"
+      "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
+      "INTEGER:1:0,"
+      "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
+      "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:1:"
+      "0,"
+      "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
+      "TEXT:1:0,folderEpoch:INTEGER:0:0,destinationFolderId:INTEGER:0:0,"
+      "destinationKey:INTEGER:0:0,destinationEpoch:INTEGER:0:0"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_copy_destinations",
+      "operationId:INTEGER:1:1,ordinal:INTEGER:1:2,uri:TEXT:1:0,"
+      "destinationFolderId:INTEGER:0:0,destinationKey:INTEGER:0:0,"
+      "destinationEpoch:INTEGER:0:0"));
+
+  if (version < 12) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE folder_id_allocator(singleton INTEGER PRIMARY KEY "
+        "CHECK(singleton=1), highWater INTEGER NOT NULL "
+        "CHECK(typeof(highWater)='integer' AND highWater>=0));"
+        "INSERT INTO folder_id_allocator SELECT 1,MAX(id) FROM ("
+        "SELECT 0 AS id UNION ALL SELECT id FROM folders "
+        "UNION ALL SELECT parent FROM folders "
+        "UNION ALL SELECT folderId FROM messages "
+        "UNION ALL SELECT folderId FROM staged_messages "
+        "UNION ALL SELECT id FROM folder_properties "
+        "UNION ALL SELECT folderId FROM offline_operations "
+        "UNION ALL SELECT destinationFolderId FROM offline_operations "
+        "UNION ALL SELECT destinationFolderId FROM offline_copy_destinations "
+        "UNION ALL SELECT sourceFolderId FROM offline_attempts "
+        "UNION ALL SELECT destinationFolderId FROM offline_attempts "
+        "UNION ALL SELECT operationFolderId FROM offline_attempts "
+        "UNION ALL SELECT virtualFolderId FROM virtualFolder_folders "
+        "UNION ALL SELECT searchFolderId FROM virtualFolder_folders "
+        "UNION ALL SELECT folder_id FROM search_folder_hits "
+        "UNION ALL SELECT folderId FROM folder_import_receipts "
+        "UNION ALL SELECT folderId FROM body_relocations "
+        "UNION ALL SELECT folderId FROM body_relocation_rows);"_ns));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kFolderIdGuard));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kFolderIdRecord));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kFolderIdImmutable));
+    MOZ_TRY(sConnection->SetSchemaVersion(12));
+  }
+  MOZ_TRY(
+      CheckReferenceSchemaTable(sConnection, "folder_id_allocator",
+                                "singleton:INTEGER:0:1,highWater:INTEGER:1:0"));
+  for (auto pair : {std::pair{"guard_folder_id", &kFolderIdGuard},
+                    {"record_folder_id", &kFolderIdRecord},
+                    {"immutable_folder_id", &kFolderIdImmutable}}) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(
+        stmt->BindUTF8StringByName("name"_ns, nsDependentCString(pair.first)));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+    nsCString sql;
+    MOZ_TRY(stmt->GetUTF8String(0, sql));
+    NS_ENSURE_TRUE(sql.Equals(*pair.second), NS_ERROR_FILE_CORRUPTED);
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT 1 FROM folder_id_allocator WHERE singleton=1 "
+        "AND typeof(highWater)='integer' AND highWater>=0 "
+        "AND NOT EXISTS(SELECT 1 FROM folders WHERE id<=0 OR id>highWater)"_ns,
+        getter_AddRefs(stmt)));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+
+  if (version < 13) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE thread_flags(folderId INTEGER NOT NULL REFERENCES "
+        "folders(id) CHECK(typeof(folderId)='integer' AND folderId>0),"
+        "threadId INTEGER NOT NULL CHECK(typeof(threadId)='integer' AND "
+        "threadId>0 AND threadId<4294967295),"
+        "flags INTEGER NOT NULL CHECK(typeof(flags)='integer' AND flags>=0 AND "
+        "flags<=4294967295),"
+        "PRIMARY KEY(folderId,threadId))"_ns));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kThreadFlagsMessageDelete));
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(kThreadFlagsFolderDelete));
+    MOZ_TRY(sConnection->SetSchemaVersion(13));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "thread_flags",
+      "folderId:INTEGER:1:1,threadId:INTEGER:1:2,flags:INTEGER:1:0"));
+  for (auto pair :
+       {std::pair{"thread_flags_message_delete", &kThreadFlagsMessageDelete},
+        {"thread_flags_folder_delete", &kThreadFlagsFolderDelete}}) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(sConnection->CreateStatement(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(
+        stmt->BindUTF8StringByName("name"_ns, nsDependentCString(pair.first)));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+    nsCString sql;
+    MOZ_TRY(stmt->GetUTF8String(0, sql));
+    NS_ENSURE_TRUE(sql.Equals(*pair.second), NS_ERROR_FILE_CORRUPTED);
+  }
+
+  if (version < 14) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE folder_import_windows(token TEXT PRIMARY KEY REFERENCES "
+        "folder_import_receipts(token), version INTEGER NOT NULL "
+        "CHECK(version=2), "
+        "sOriginal TEXT NOT NULL, sRootOriginal TEXT NOT NULL, sCanonical TEXT "
+        "NOT NULL, "
+        "sCanonicalRoot TEXT NOT NULL, sId TEXT NOT NULL, sParentId TEXT NOT "
+        "NULL, "
+        "sRootId TEXT NOT NULL, tOriginal TEXT NOT NULL, tRootOriginal TEXT "
+        "NOT NULL, "
+        "tCanonical TEXT NOT NULL, tCanonicalRoot TEXT NOT NULL, tId TEXT NOT "
+        "NULL, "
+        "tParentId TEXT NOT NULL, tRootId TEXT NOT NULL)"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(14));
+  }
+  MOZ_TRY(
+      CheckReferenceSchemaTable(sConnection, "folder_import_windows",
+                                "token:TEXT:0:1,version:INTEGER:1:0,sOriginal:"
+                                "TEXT:1:0,sRootOriginal:TEXT:1:0,"
+                                "sCanonical:TEXT:1:0,sCanonicalRoot:TEXT:1:0,"
+                                "sId:TEXT:1:0,sParentId:TEXT:1:0,"
+                                "sRootId:TEXT:1:0,tOriginal:TEXT:1:0,"
+                                "tRootOriginal:TEXT:1:0,tCanonical:TEXT:1:0,"
+                                "tCanonicalRoot:TEXT:1:0,tId:TEXT:1:0,"
+                                "tParentId:TEXT:1:0,tRootId:TEXT:1:0"));
   return NS_OK;
 }
 
 namespace {
+
+bool SameImportPath(const FolderImportPathIdentity& a,
+                    const FolderImportPathIdentity& b) {
+  return a.originalPath == b.originalPath && a.originalRoot == b.originalRoot &&
+         a.canonicalPath == b.canonicalPath &&
+         a.canonicalRoot == b.canonicalRoot && a.id == b.id &&
+         a.parentId == b.parentId && a.rootId == b.rootId;
+}
+
+bool ValidImportFileId(const nsACString& id) {
+  if (id.Length() != 49 || id[16] != ':') {
+    return false;
+  }
+  for (uint32_t i = 0; i < id.Length(); ++i) {
+    if (i != 16 &&
+        !((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Owns different leases from any caller-visible JS admission.
+class FolderImportAdmission final {
+ public:
+  nsresult Acquire(const FolderImportIdentity& expected,
+                   nsIFile* actualSummary = nullptr,
+                   nsIFile* actualStore = nullptr) {
+    mIdentity = expected;
+#ifdef XP_WIN
+    NS_ENSURE_TRUE(expected.windows, NS_ERROR_NOT_AVAILABLE);
+    mFileSystem = new MigrationFileSystem();
+    FolderImportWindowsIdentity measured;
+    MOZ_TRY(Admit(expected.windows->summary, false, actualSummary,
+                  measured.summary));
+    MOZ_TRY(Admit(expected.windows->store, true, actualStore, measured.store));
+    NS_ENSURE_TRUE(expected.sourcePath.IsEmpty() ||
+                       expected.sourcePath == measured.summary.canonicalPath,
+                   NS_ERROR_NOT_AVAILABLE);
+    mIdentity.sourcePath = measured.summary.canonicalPath;
+    mIdentity.windows = Some(std::move(measured));
+    MOZ_TRY(NS_NewLocalFile(mIdentity.sourcePath, getter_AddRefs(mSummary)));
+#else
+    NS_ENSURE_FALSE(expected.windows, NS_ERROR_NOT_AVAILABLE);
+    mSummary = actualSummary;
+#endif
+    return Validate();
+  }
+
+  nsresult Validate() {
+#ifdef XP_WIN
+    for (const auto& lease : mLeases) {
+      MOZ_TRY(mFileSystem->Validate(lease));
+    }
+#endif
+    return NS_OK;
+  }
+  const FolderImportIdentity& Identity() const { return mIdentity; }
+  nsIFile* Summary() const { return mSummary; }
+
+ private:
+#ifdef XP_WIN
+  static nsresult OriginalFile(const nsAString& path, nsIFile** output) {
+    MOZ_TRY(NS_NewLocalFile(path, output));
+    nsAutoString actual;
+    MOZ_TRY((*output)->GetPath(actual));
+    NS_ENSURE_TRUE(actual == path, NS_ERROR_FILE_INVALID_PATH);
+    return NS_OK;
+  }
+
+  nsresult Admit(const FolderImportPathIdentity& expected, bool allowMissing,
+                 nsIFile* actual, FolderImportPathIdentity& measured) {
+    NS_ENSURE_TRUE(ValidImportFileId(expected.parentId) &&
+                       ValidImportFileId(expected.rootId) &&
+                       (ValidImportFileId(expected.id) ||
+                        (allowMissing && expected.id.IsEmpty())),
+                   NS_ERROR_INVALID_ARG);
+    nsCOMPtr<nsIFile> original, root;
+    MOZ_TRY(OriginalFile(expected.originalPath, getter_AddRefs(original)));
+    MOZ_TRY(OriginalFile(expected.originalRoot, getter_AddRefs(root)));
+    uint16_t kind = expected.id.IsEmpty()
+                        ? nsIPanoramaMigrationFileSystem::KIND_FILE_OR_MISSING
+                        : nsIPanoramaMigrationFileSystem::KIND_FILE;
+    nsCOMPtr<nsIPanoramaMigrationPath> lease;
+    MOZ_TRY(mFileSystem->Admit(original, root, kind, getter_AddRefs(lease)));
+    mLeases.AppendElement(lease);
+    bool exists;
+    MOZ_TRY(lease->GetExists(&exists));
+    NS_ENSURE_TRUE(exists == !expected.id.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    measured.originalPath = expected.originalPath;
+    measured.originalRoot = expected.originalRoot;
+    MOZ_TRY(lease->GetCanonicalPath(measured.canonicalPath));
+    MOZ_TRY(lease->GetCanonicalRoot(measured.canonicalRoot));
+    MOZ_TRY(lease->GetIdentity(measured.id));
+    MOZ_TRY(lease->GetParentIdentity(measured.parentId));
+    MOZ_TRY(lease->GetRootIdentity(measured.rootId));
+    NS_ENSURE_TRUE(measured.id == expected.id &&
+                       measured.parentId == expected.parentId &&
+                       measured.rootId == expected.rootId &&
+                       (expected.canonicalPath.IsEmpty() ||
+                        measured.canonicalPath == expected.canonicalPath) &&
+                       (expected.canonicalRoot.IsEmpty() ||
+                        measured.canonicalRoot == expected.canonicalRoot),
+                   NS_ERROR_NOT_AVAILABLE);
+    if (actual) {
+      nsCOMPtr<nsIPanoramaMigrationPath> bound;
+      MOZ_TRY(mFileSystem->Admit(actual, root, kind, getter_AddRefs(bound)));
+      mLeases.AppendElement(bound);
+      nsAutoString path;
+      nsAutoCString id, parent;
+      MOZ_TRY(bound->GetCanonicalPath(path));
+      MOZ_TRY(bound->GetIdentity(id));
+      MOZ_TRY(bound->GetParentIdentity(parent));
+      NS_ENSURE_TRUE(path == measured.canonicalPath && id == measured.id &&
+                         parent == measured.parentId,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+    return NS_OK;
+  }
+  RefPtr<MigrationFileSystem> mFileSystem;
+  nsTArray<nsCOMPtr<nsIPanoramaMigrationPath>> mLeases;
+#endif
+  FolderImportIdentity mIdentity;
+  nsCOMPtr<nsIFile> mSummary;
+};
 
 // Work on clones: normalizing must not rewrite the folder's stored path.
 nsresult NormalizeImportFile(nsCOMPtr<nsIFile>& file) {
@@ -954,17 +1257,117 @@ nsresult NormalizeImportFile(nsCOMPtr<nsIFile>& file) {
   return NS_OK;
 }
 
-nsresult HashImportSource(nsIFile* file, const FolderImportSnapshot& input,
+nsresult BindImportPath(mozIStorageStatement* stmt, const char* prefix,
+                        const FolderImportPathIdentity& path) {
+  for (auto pair : {std::pair{"Original", &path.originalPath},
+                    {"RootOriginal", &path.originalRoot},
+                    {"Canonical", &path.canonicalPath},
+                    {"CanonicalRoot", &path.canonicalRoot}}) {
+    nsAutoCString name(prefix);
+    name.Append(pair.first);
+    MOZ_TRY(stmt->BindStringByName(name, *pair.second));
+  }
+  for (auto pair : {std::pair{"Id", &path.id},
+                    {"ParentId", &path.parentId},
+                    {"RootId", &path.rootId}}) {
+    nsAutoCString name(prefix);
+    name.Append(pair.first);
+    MOZ_TRY(stmt->BindUTF8StringByName(name, *pair.second));
+  }
+  return NS_OK;
+}
+
+nsresult WriteWindowsImportReceipt(mozIStorageConnection* connection,
+                                   const FolderImportIdentity& identity) {
+  if (!identity.windows) {
+    return NS_OK;
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(connection->CreateStatement(
+      "INSERT INTO folder_import_windows VALUES(:token,2,:sOriginal,"
+      ":sRootOriginal,:sCanonical,:sCanonicalRoot,:sId,:sParentId,:sRootId,"
+      ":tOriginal,:tRootOriginal,:tCanonical,:tCanonicalRoot,:tId,:tParentId,:tRootId)"_ns,
+      getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, identity.token));
+  MOZ_TRY(BindImportPath(stmt, "s", identity.windows->summary));
+  MOZ_TRY(BindImportPath(stmt, "t", identity.windows->store));
+  return stmt->Execute();
+}
+
+nsresult ReadImportPath(mozIStorageStatement* stmt, uint32_t column,
+                        FolderImportPathIdentity& path) {
+  for (auto* text : {&path.originalPath, &path.originalRoot,
+                     &path.canonicalPath, &path.canonicalRoot}) {
+    int32_t type;
+    MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+    NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                   NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(stmt->GetString(column++, *text));
+  }
+  for (auto* text : {&path.id, &path.parentId, &path.rootId}) {
+    int32_t type;
+    MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+    NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                   NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(stmt->GetUTF8String(column++, *text));
+  }
+  NS_ENSURE_TRUE((path.id.IsEmpty() || ValidImportFileId(path.id)) &&
+                     ValidImportFileId(path.parentId) &&
+                     ValidImportFileId(path.rootId),
+                 NS_ERROR_FILE_CORRUPTED);
+  return NS_OK;
+}
+
+nsresult ReadWindowsImportReceipt(mozIStorageConnection* connection,
+                                  const FolderImportIdentity& expected,
+                                  FolderImportIdentity& found) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(connection->CreateStatement(
+      "SELECT version,sOriginal,sRootOriginal,sCanonical,sCanonicalRoot,sId,"
+      "sParentId,sRootId,tOriginal,tRootOriginal,tCanonical,tCanonicalRoot,tId,"
+      "tParentId,tRootId FROM folder_import_windows WHERE token=:token"_ns,
+      getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, expected.token));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (!more) {
+    // Unix v1 stays v1; old Windows receipts cannot acquire new physical pins.
+    NS_ENSURE_FALSE(expected.windows, NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
+  NS_ENSURE_TRUE(expected.windows, NS_ERROR_NOT_AVAILABLE);
+  int32_t type;
+  int64_t version;
+  MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+  MOZ_TRY(stmt->GetInt64(0, &version));
+  NS_ENSURE_TRUE(
+      type == mozIStorageStatement::VALUE_TYPE_INTEGER && version == 2,
+      NS_ERROR_FILE_CORRUPTED);
+  FolderImportWindowsIdentity measured;
+  MOZ_TRY(ReadImportPath(stmt, 1, measured.summary));
+  MOZ_TRY(ReadImportPath(stmt, 8, measured.store));
+  NS_ENSURE_TRUE(!measured.summary.id.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+  NS_ENSURE_TRUE(SameImportPath(measured.summary, expected.windows->summary) &&
+                     SameImportPath(measured.store, expected.windows->store),
+                 NS_ERROR_ALREADY_INITIALIZED);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  found.windows = Some(std::move(measured));
+  return NS_OK;
+}
+
+nsresult HashImportSource(nsIFile* file, const FolderImportIdentity& identity,
+                          uint64_t sourceSize,
                           nsACString* legacyMarker = nullptr) {
   NS_ENSURE_ARG_POINTER(file);
   nsCOMPtr<nsIFile> normalized = file;
   MOZ_TRY(NormalizeImportFile(normalized));
   nsAutoString path;
   MOZ_TRY(normalized->GetPath(path));
-  NS_ENSURE_TRUE(path == input.identity.sourcePath, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(path == identity.sourcePath, NS_ERROR_INVALID_ARG);
   int64_t size;
   MOZ_TRY(normalized->GetFileSize(&size));
-  NS_ENSURE_TRUE(size >= 0 && uint64_t(size) == input.sourceSize,
+  NS_ENSURE_TRUE(size >= 0 && uint64_t(size) == sourceSize,
                  NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_TRUE(uint64_t(size) < UINT32_MAX, NS_ERROR_FILE_TOO_BIG);
   nsCOMPtr<nsIInputStream> stream;
@@ -983,7 +1386,7 @@ nsresult HashImportSource(nsIFile* file, const FolderImportSnapshot& input,
     hex.Append("0123456789abcdef"[byte >> 4]);
     hex.Append("0123456789abcdef"[byte & 15]);
   }
-  NS_ENSURE_TRUE(hex == input.identity.sourceSha256, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(hex == identity.sourceSha256, NS_ERROR_NOT_AVAILABLE);
   if (legacyMarker) {
     nsCString base64;
     MOZ_TRY(Base64Encode(bytes, base64));
@@ -1032,8 +1435,21 @@ nsresult DatabaseCore::GetFolderImportReceipt(
   bool active;
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
-  MOZ_TRY(CheckFolderImportIdentity(identity));
-  return ReadFolderImportReceipt(identity, output);
+  FolderImportAdmission admission;
+  MOZ_TRY(admission.Acquire(identity));
+  const auto& checked = admission.Identity();
+  MOZ_TRY(CheckFolderImportIdentity(checked));
+#ifdef XP_WIN
+  int64_t size;
+  MOZ_TRY(admission.Summary()->GetFileSize(&size));
+  NS_ENSURE_TRUE(size >= 0, NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(HashImportSource(admission.Summary(), checked, size));
+#endif
+  Maybe<FolderImportReceipt> receipt;
+  MOZ_TRY(ReadFolderImportReceipt(checked, receipt));
+  MOZ_TRY(admission.Validate());
+  output = std::move(receipt);
+  return NS_OK;
 }
 
 nsresult DatabaseCore::ReadFolderImportReceipt(
@@ -1094,6 +1510,7 @@ nsresult DatabaseCore::ReadFolderImportReceipt(
     MOZ_TRY(stmt->ExecuteStep(&more));
     NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
   }
+  MOZ_TRY(ReadWindowsImportReceipt(sConnection, identity, receipt.identity));
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(
       GetStatement("ReadFolderImportKeys"_ns,
@@ -1218,7 +1635,16 @@ nsresult DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
       NS_ERROR_INVALID_ARG);
   nsCOMPtr<nsIFile> summary;
   MOZ_TRY(source->GetSummaryFile(getter_AddRefs(summary)));
-  return ImportFolderSnapshotFromFile(summary, input, output);
+  FolderImportAdmission admission;
+#ifdef XP_WIN
+  nsCOMPtr<nsIFile> store;
+  MOZ_TRY(source->GetFilePath(getter_AddRefs(store)));
+  NS_ENSURE_TRUE(store, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(admission.Acquire(input.identity, summary, store));
+#else
+  MOZ_TRY(admission.Acquire(input.identity, summary));
+#endif
+  return ImportFolderSnapshotFromFile(admission.Summary(), input, output);
 }
 
 nsresult DatabaseCore::ImportFolderSnapshotFromFile(
@@ -1231,9 +1657,13 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
   bool active;
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
-  MOZ_TRY(CheckFolderImportIdentity(input.identity));
+  FolderImportAdmission admission;
+  MOZ_TRY(admission.Acquire(input.identity, source));
+  const auto& identity = admission.Identity();
+  source = admission.Summary();
+  MOZ_TRY(CheckFolderImportIdentity(identity));
   nsCString legacyMarker;
-  MOZ_TRY(HashImportSource(source, input, &legacyMarker));
+  MOZ_TRY(HashImportSource(source, identity, input.sourceSize, &legacyMarker));
   RefPtr<DatabaseCore> self(this);
   RefPtr<MessageDatabase> messages = mMessageDatabase;
   nsTHashMap<nsMsgKey, nsMsgKey> keys;
@@ -1242,9 +1672,10 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
   Maybe<FolderImportReceipt> receipt;
   MOZ_TRY(sConnection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
-    MOZ_TRY(CheckFolderImportIdentity(input.identity));
-    MOZ_TRY(ReadFolderImportReceipt(input.identity, receipt));
+    MOZ_TRY(CheckFolderImportIdentity(identity));
+    MOZ_TRY(ReadFolderImportReceipt(identity, receipt));
     if (receipt) {
+      MOZ_TRY(admission.Validate());
       return sConnection->CommitTransaction();
     }
     {
@@ -1256,7 +1687,7 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
           "SELECT 1 FROM offline_operations WHERE folderId = :folder LIMIT 1"_ns,
           getter_AddRefs(stmt)));
       mozStorageStatementScoper scoper(stmt);
-      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, input.identity.folderId));
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, identity.folderId));
       bool occupied;
       MOZ_TRY(stmt->ExecuteStep(&occupied));
       NS_ENSURE_FALSE(occupied, NS_ERROR_ALREADY_INITIALIZED);
@@ -1284,7 +1715,7 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
         NS_ENSURE_TRUE(keys.Get(*row.parentSourceKey, &parent),
                        NS_ERROR_INVALID_ARG);
       }
-      MOZ_TRY(WriteImportedMessage(input.identity.folderId, key, root, parent,
+      MOZ_TRY(WriteImportedMessage(identity.folderId, key, root, parent,
                                    row.header));
       auto cached = MakeUnique<MessageDatabase::CachedMsg>();
       MOZ_TRY(messages->FetchMsg(key, *cached));
@@ -1300,15 +1731,15 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
                        NS_ERROR_INVALID_ARG);
       }
       if (property.integer) {
-        MOZ_TRY(FolderDB().SetFolderProperty(input.identity.folderId,
-                                             property.name, *property.integer));
+        MOZ_TRY(FolderDB().SetFolderProperty(identity.folderId, property.name,
+                                             *property.integer));
       } else {
-        MOZ_TRY(FolderDB().SetFolderProperty(input.identity.folderId,
-                                             property.name, property.text));
+        MOZ_TRY(FolderDB().SetFolderProperty(identity.folderId, property.name,
+                                             property.text));
       }
     }
     MOZ_TRY(FolderDB().SetFolderProperty(
-        input.identity.folderId, "morkMigrationSource"_ns, legacyMarker));
+        identity.folderId, "morkMigrationSource"_ns, legacyMarker));
     {
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(GetStatement(
@@ -1320,16 +1751,14 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
           "(:token, :source, :database, :hash, :folder, :path, :sourcePath, :count)"_ns,
           getter_AddRefs(stmt)));
       mozStorageStatementScoper scoper(stmt);
-      MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.identity.token));
-      MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, input.identity.sourceId));
-      MOZ_TRY(stmt->BindUTF8StringByName("database"_ns,
-                                         input.identity.databaseSourceId));
+      MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, identity.token));
+      MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, identity.sourceId));
       MOZ_TRY(
-          stmt->BindUTF8StringByName("hash"_ns, input.identity.sourceSha256));
-      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, input.identity.folderId));
-      MOZ_TRY(stmt->BindUTF8StringByName("path"_ns, input.identity.folderPath));
-      MOZ_TRY(
-          stmt->BindStringByName("sourcePath"_ns, input.identity.sourcePath));
+          stmt->BindUTF8StringByName("database"_ns, identity.databaseSourceId));
+      MOZ_TRY(stmt->BindUTF8StringByName("hash"_ns, identity.sourceSha256));
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, identity.folderId));
+      MOZ_TRY(stmt->BindUTF8StringByName("path"_ns, identity.folderPath));
+      MOZ_TRY(stmt->BindStringByName("sourcePath"_ns, identity.sourcePath));
       MOZ_TRY(stmt->BindInt64ByName("count"_ns, input.messages.Length()));
       MOZ_TRY(stmt->Execute());
     }
@@ -1344,14 +1773,16 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
         mozStorageStatementScoper scoper(stmt);
         nsMsgKey key;
         NS_ENSURE_TRUE(keys.Get(row.sourceKey, &key), NS_ERROR_UNEXPECTED);
-        MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.identity.token));
+        MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, identity.token));
         MOZ_TRY(stmt->BindInt64ByName("source"_ns, row.sourceKey));
         MOZ_TRY(stmt->BindInt64ByName("destination"_ns, key));
         MOZ_TRY(stmt->Execute());
       }
     }
-    MOZ_TRY(HashImportSource(source, input));
-    MOZ_TRY(ReadFolderImportReceipt(input.identity, receipt));
+    MOZ_TRY(WriteWindowsImportReceipt(sConnection, identity));
+    MOZ_TRY(HashImportSource(source, identity, input.sourceSize));
+    MOZ_TRY(admission.Validate());
+    MOZ_TRY(ReadFolderImportReceipt(identity, receipt));
     NS_ENSURE_TRUE(receipt, NS_ERROR_UNEXPECTED);
     if (!messages->mMsgCache.reserve(messages->mMsgCache.count() +
                                      prepared.Length())) {
@@ -1701,6 +2132,18 @@ nsresult DatabaseCore::ReleaseSavepoint(const nsACString& name) {
 nsresult DatabaseCore::RollbackToSavepoint(const nsACString& name) {
   assertStringIsSafeForSQL(name);
   return sConnection->ExecuteSimpleSQL("ROLLBACK TO "_ns + name);
+}
+
+/* static */
+nsresult DatabaseCore::RetireAccountRoot(uint64_t folderId,
+                                         const nsACString& serverKey,
+                                         const nsACString& databaseSourceId) {
+  NS_ENSURE_TRUE(sInstance && sConnection && sInstance->mFolderDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString currentSourceId;
+  MOZ_TRY(sInstance->GetSourceId(currentSourceId));
+  NS_ENSURE_TRUE(currentSourceId == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  return sInstance->mFolderDatabase->RetireRoot(folderId, serverKey);
 }
 
 NS_IMETHODIMP
@@ -2988,14 +3431,61 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::HandleObject request,
 
 namespace {
 
+#ifdef XP_WIN
+nsresult ImportOriginalPath(JSContext* cx, JS::HandleObject object,
+                            FolderImportPathIdentity& path) {
+  JS::RootedValue field(cx);
+  for (auto pair : {std::pair{"originalPath", &path.originalPath},
+                    {"originalRoot", &path.originalRoot}}) {
+    MOZ_TRY(ImportMember(cx, object, pair.first, &field));
+    nsCString utf8;
+    MOZ_TRY(ImportText(cx, field, utf8));
+    NS_ENSURE_TRUE(!utf8.IsEmpty() && utf8.FindChar(0) < 0,
+                   NS_ERROR_INVALID_ARG);
+    CopyUTF8toUTF16(utf8, *pair.second);
+  }
+  for (auto pair : {std::pair{"id", &path.id},
+                    {"parentId", &path.parentId},
+                    {"rootId", &path.rootId}}) {
+    MOZ_TRY(ImportMember(cx, object, pair.first, &field));
+    MOZ_TRY(ImportText(cx, field, *pair.second));
+  }
+  return NS_OK;
+}
+
+nsresult ImportWindowsAdmission(JSContext* cx, JS::HandleObject request,
+                                FolderImportIdentity& identity) {
+  JS::RootedValue field(cx);
+  MOZ_TRY(ImportMember(cx, request, "windowsAdmission", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::RootedObject admission(cx, &field.toObject());
+  FolderImportWindowsIdentity paths;
+  for (auto pair :
+       {std::pair{"summary", &paths.summary}, {"store", &paths.store}}) {
+    MOZ_TRY(ImportMember(cx, admission, pair.first, &field));
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::RootedObject path(cx, &field.toObject());
+    MOZ_TRY(ImportOriginalPath(cx, path, *pair.second));
+  }
+  identity.windows = Some(std::move(paths));
+  return NS_OK;
+}
+#endif
+
 nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
                         JS::HandleObject request,
-                        FolderImportIdentity& identity) {
+                        FolderImportIdentity& identity,
+                        FolderImportAdmission& admission) {
   NS_ENSURE_ARG_POINTER(source);
   JS::RootedValue field(cx);
   int64_t version;
   MOZ_TRY(ImportMember(cx, request, "version", &field));
+#ifdef XP_WIN
+  MOZ_TRY(ImportNumber(field, 2, 2, version));
+  MOZ_TRY(ImportWindowsAdmission(cx, request, identity));
+#else
   MOZ_TRY(ImportNumber(field, 1, 1, version));
+#endif
   for (auto pair : {std::pair{"token", &identity.token},
                     {"sourceId", &identity.sourceId},
                     {"databaseSourceId", &identity.databaseSourceId}}) {
@@ -3023,11 +3513,20 @@ nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
   MOZ_TRY(source->GetSummaryFile(getter_AddRefs(summary)));
   MOZ_TRY(source->GetFilePath(getter_AddRefs(storeFile)));
   NS_ENSURE_TRUE(summary && storeFile, NS_ERROR_NOT_AVAILABLE);
+  nsAutoString summaryPath, storePath;
+#ifdef XP_WIN
+  // Native leases precede normalization and outlive hash, conversion and
+  // commit.
+  MOZ_TRY(admission.Acquire(identity, summary, storeFile));
+  identity = admission.Identity();
+  summaryPath = identity.windows->summary.canonicalPath;
+  storePath = identity.windows->store.canonicalPath;
+#else
   MOZ_TRY(NormalizeImportFile(summary));
   MOZ_TRY(NormalizeImportFile(storeFile));
-  nsAutoString summaryPath, storePath;
   MOZ_TRY(summary->GetPath(summaryPath));
   MOZ_TRY(storeFile->GetPath(storePath));
+#endif
   nsCString uri, storeType, protocol;
   MOZ_TRY(source->GetURI(uri));
   MOZ_TRY(source->GetIncomingServerType(protocol));
@@ -3049,6 +3548,10 @@ nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
   }
   bool exists;
   MOZ_TRY(storeFile->Exists(&exists));
+#ifdef XP_WIN
+  NS_ENSURE_TRUE(exists == !identity.windows->store.id.IsEmpty(),
+                 NS_ERROR_NOT_AVAILABLE);
+#endif
   MOZ_TRY(ImportMember(cx, folder, "storeExists", &field));
   NS_ENSURE_TRUE(field.isBoolean(), NS_ERROR_INVALID_ARG);
   NS_ENSURE_TRUE(field.toBoolean() == exists, NS_ERROR_NOT_AVAILABLE);
@@ -3172,6 +3675,79 @@ nsresult ImportMessages(JSContext* cx, JS::HandleObject request,
   return NS_OK;
 }
 
+bool ImportPathValue(JSContext* cx, const FolderImportPathIdentity& path,
+                     JS::MutableHandleObject output) {
+  JS::RootedObject object(cx, JS_NewPlainObject(cx));
+  if (!object) {
+    return false;
+  }
+  for (auto pair : {std::pair{"originalPath", &path.originalPath},
+                    {"originalRoot", &path.originalRoot},
+                    {"canonicalPath", &path.canonicalPath},
+                    {"canonicalRoot", &path.canonicalRoot}}) {
+    JS::RootedString text(
+        cx, JS_NewUCStringCopyN(cx, pair.second->get(), pair.second->Length()));
+    if (!text) {
+      return false;
+    }
+    JS::RootedValue value(cx, JS::StringValue(text));
+    if (!JS_DefineProperty(cx, object, pair.first, value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+  for (auto pair : {std::pair{"id", &path.id},
+                    {"parentId", &path.parentId},
+                    {"rootId", &path.rootId}}) {
+    JS::RootedString text(
+        cx, JS_NewStringCopyUTF8N(
+                cx, JS::UTF8Chars(pair.second->get(), pair.second->Length())));
+    if (!text) {
+      return false;
+    }
+    JS::RootedValue value(cx, JS::StringValue(text));
+    if (!JS_DefineProperty(cx, object, pair.first, value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+  output.set(object);
+  return true;
+}
+
+bool ImportWindowsValue(JSContext* cx, const FolderImportWindowsIdentity& paths,
+                        JS::HandleObject receipt) {
+  JS::RootedObject admission(cx, JS_NewPlainObject(cx));
+  JS::RootedObject summary(cx), store(cx);
+  JS::RootedObject physical(cx, JS_NewPlainObject(cx));
+  if (!admission || !physical ||
+      !ImportPathValue(cx, paths.summary, &summary) ||
+      !ImportPathValue(cx, paths.store, &store) ||
+      !JS_DefineProperty(cx, admission, "summary", summary, JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, admission, "store", store, JSPROP_ENUMERATE) ||
+      !JS_DefineProperty(cx, physical, "version", double(1),
+                         JSPROP_ENUMERATE)) {
+    return false;
+  }
+  for (auto pair : {std::pair{"id", &paths.summary.id},
+                    {"parentId", &paths.summary.parentId}}) {
+    JS::RootedString text(
+        cx, JS_NewStringCopyUTF8N(
+                cx, JS::UTF8Chars(pair.second->get(), pair.second->Length())));
+    if (!text) {
+      return false;
+    }
+    JS::RootedValue value(cx, JS::StringValue(text));
+    if (!JS_DefineProperty(cx, physical, pair.first, value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+  return JS_DefineProperty(cx, receipt, "version", double(2),
+                           JSPROP_ENUMERATE) &&
+         JS_DefineProperty(cx, receipt, "windowsAdmission", admission,
+                           JSPROP_ENUMERATE) &&
+         JS_DefineProperty(cx, receipt, "sourcePhysicalIdentity", physical,
+                           JSPROP_ENUMERATE);
+}
+
 bool ImportReceiptValue(JSContext* cx, const FolderImportReceipt& receipt,
                         JS::MutableHandleValue output) {
   JS::RootedObject object(cx, JS_NewPlainObject(cx));
@@ -3210,6 +3786,10 @@ bool ImportReceiptValue(JSContext* cx, const FolderImportReceipt& receipt,
       !JS_DefineProperty(cx, object, "keys", keys, JSPROP_ENUMERATE)) {
     return false;
   }
+  if (receipt.identity.windows &&
+      !ImportWindowsValue(cx, *receipt.identity.windows, object)) {
+    return false;
+  }
   output.setObject(*object);
   return true;
 }
@@ -3223,9 +3803,15 @@ NS_IMETHODIMP DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
   NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
   JS::RootedObject object(cx, &request.toObject());
   FolderImportSnapshot input;
-  // Finish JS conversion before starting the owned SQL transaction.
+  // Finish admission and JS conversion before the owned SQL transaction.
+  FolderImportAdmission admission;
+#ifdef XP_WIN
+  MOZ_TRY(ImportIdentity(this, source, cx, object, input.identity, admission));
+#endif
   MOZ_TRY(ImportMessages(cx, object, source, input));
-  MOZ_TRY(ImportIdentity(this, source, cx, object, input.identity));
+#ifndef XP_WIN
+  MOZ_TRY(ImportIdentity(this, source, cx, object, input.identity, admission));
+#endif
   Maybe<FolderImportReceipt> previous;
   MOZ_TRY(GetFolderImportReceipt(input.identity, previous));
   FolderImportReceipt prepared;
@@ -3278,7 +3864,8 @@ NS_IMETHODIMP DatabaseCore::GetFolderImportReceipt(
   NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
   JS::RootedObject object(cx, &request.toObject());
   FolderImportIdentity identity;
-  MOZ_TRY(ImportIdentity(this, source, cx, object, identity));
+  FolderImportAdmission admission;
+  MOZ_TRY(ImportIdentity(this, source, cx, object, identity, admission));
   Maybe<FolderImportReceipt> receipt;
   MOZ_TRY(GetFolderImportReceipt(identity, receipt));
   if (!receipt) {
@@ -3296,6 +3883,10 @@ NS_IMETHODIMP
 DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,
                                     Promise** aPromise) {
   AUTO_PROFILER_LABEL("DatabaseCore::MigrateFolderDatabase", MAILNEWS);
+#ifdef XP_WIN
+  // This entrypoint has no original inventory paths or admitted-root context.
+  return NS_ERROR_NOT_AVAILABLE;
+#else
 
   ErrorResult err;
   RefPtr<Promise> promise = Promise::Create(xpc::CurrentNativeGlobal(aCx), err);
@@ -3306,6 +3897,7 @@ DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,
 
   promise.forget(aPromise);
   return NS_OK;
+#endif
 }
 
 NS_IMETHODIMP DatabaseCore::GetSourceId(nsACString& sourceId) {

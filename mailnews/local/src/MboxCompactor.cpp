@@ -56,12 +56,14 @@ nsresult MboxCompactor::BeginCompaction(nsIFile* srcMbox,
   rv = scanner->BeginScan(mPaths.Source, this);
   if (NS_FAILED(rv)) {
     nsresult cleanupRv = mDestStream->Close();
-    NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
-                         "Could not close unused compaction output");
+    if (NS_FAILED(cleanupRv)) {
+      NS_WARNING("Could not close unused compaction output");
+    }
     mDestStream = nullptr;
     cleanupRv = mPaths.Compacting->Remove(false);
-    NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
-                         "Could not remove unused compaction output");
+    if (NS_FAILED(cleanupRv)) {
+      NS_WARNING("Could not remove unused compaction output");
+    }
     return rv;
   }
 

@@ -32,10 +32,12 @@ add_setup(async function () {
     type: "ews",
     options: { username: "ewsSrc" },
   });
+  registerCleanupFunction(() => ewsSrcServer.stop());
   ewsDestServer = await ServerTestUtils.createServer({
     type: "ews",
     options: { username: "ewsDest" },
   });
+  registerCleanupFunction(() => ewsDestServer.stop());
 
   const srcRoots = [];
   const destRoots = [];
@@ -107,6 +109,16 @@ async function createServer(username, type, port) {
     incomingServer.password = "password";
   }
   if (type == "ews") {
+    const exchangeServer = incomingServer.QueryInterface(
+      Ci.IExchangeIncomingServer
+    );
+    registerCleanupFunction(async () => {
+      incomingServer.shutdown();
+      await TestUtils.waitForCondition(
+        () => !exchangeServer.protocolClientRunning,
+        "waiting for the EWS client to shut down"
+      );
+    });
     incomingServer.setStringValue(
       "ews_url",
       `http://localhost:${port}/EWS/Exchange.asmx`

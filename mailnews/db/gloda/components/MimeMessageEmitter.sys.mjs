@@ -44,14 +44,11 @@ var MAX_SANE_BODY_PART_SIZE = 20 * 1024;
  */
 export function MimeMessageEmitter() {
   this._mimeMsg = ChromeUtils.importESModule(
-    "resource:///modules/gloda/MimeMessage.sys.mjs"
-  );
-  this._utils = ChromeUtils.importESModule(
-    "resource:///modules/gloda/GlodaUtils.sys.mjs"
+    "resource:///modules/panorama/MimeMessage.sys.mjs"
   );
 
   this._url = null;
-  this._partRE = this._utils.GlodaUtils.PART_RE;
+  this._partRE = this._mimeMsg.MIME_PART_RE;
 
   this._outputListener = null;
 

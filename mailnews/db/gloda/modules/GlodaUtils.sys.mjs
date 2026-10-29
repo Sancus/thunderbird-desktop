@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
+import { MIME_PART_RE } from "resource:///modules/panorama/MimeMessage.sys.mjs";
 
 /**
  * @namespace A holding place for logic that is not gloda-specific and should
@@ -13,9 +14,7 @@ export var GlodaUtils = {
    * This Regexp is super-complicated and used at least in two different parts of
    * the code, so let's expose it from one single location.
    */
-  PART_RE: new RegExp(
-    "^[^?]+\\?(?:/;section=\\d+\\?)?(?:[^&]+&)*part=([^&]+)(?:&[^&]+)*$"
-  ),
+  PART_RE: MIME_PART_RE,
 
   deMime(aString) {
     return MailServices.mimeConverter.decodeMimeHeader(

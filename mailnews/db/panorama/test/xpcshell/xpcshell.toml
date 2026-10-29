@@ -16,6 +16,10 @@ support-files = [
 ]
 tags = ["panorama"]
 
+["test_chatSearchProvider.js"]
+
+["test_chatSearchRedaction.js"]
+
 ["test_delete.js"]
 
 ["test_deliveryCompatibilityCopyHdr.js"]
@@ -74,6 +78,22 @@ tags = ["dataadapter"]
 
 ["test_lookup.js"]
 
+["test_mailSearchAttachmentOpener.js"]
+
+["test_mailSearchAutoComplete.js"]
+
+["test_mailSearchConversation.js"]
+
+["test_mailSearchFacets.js"]
+
+["test_mailSearchFactory.js"]
+
+["test_mailSearchResults.js"]
+
+["test_mailSearchService.js"]
+
+["test_mailSearchView.js"]
+
 ["test_messageIngestion.js"]
 
 ["test_messages.js"]
@@ -106,9 +126,29 @@ support-files = ["../../../../base/test/unit/data/panacea.dat"]
 
 ["test_relations.js"]
 
+["test_searchAttachments.js"]
+
+["test_searchContent.js"]
+
 ["test_searchFolderHitCache.js"]
 
 ["test_searchIndex.js"]
+
+["test_searchIndexing.js"]
+
+["test_searchMimeMessage.js"]
+
+["test_searchMimeRetrieval.js"]
+
+["test_searchMimeTypes.js"]
+
+["test_searchOffsets.js"]
+
+["test_searchPaging.js"]
+
+["test_searchPolicy.js"]
+
+["test_searchResultOpener.js"]
 
 ["test_serverFromPrefs.js"]
 tags = ["foldernames"]

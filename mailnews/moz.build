@@ -30,6 +30,11 @@ DIRS += [
     "search/src",
 ]
 
+EXTRA_JS_MODULES.panorama += [
+    "db/panorama/search/MessageContent.sys.mjs",
+    "db/panorama/search/MimeMessage.sys.mjs",
+]
+
 if CONFIG["MOZ_PANORAMA"]:
     DIRS += ["db/panorama"]
 

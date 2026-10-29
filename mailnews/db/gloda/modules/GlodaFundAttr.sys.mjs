@@ -10,6 +10,7 @@ import { GlodaAttachment } from "resource:///modules/gloda/GlodaDataModel.sys.mj
 import { GlodaConstants } from "resource:///modules/gloda/GlodaConstants.sys.mjs";
 import { MimeTypeNoun } from "resource:///modules/gloda/NounMimetype.sys.mjs";
 import { GlodaContent } from "resource:///modules/gloda/GlodaContent.sys.mjs";
+import { whittleMessageContent } from "resource:///modules/panorama/MessageContent.sys.mjs";
 
 /**
  * @namespace The Gloda Fundamental Attribute provider is a special attribute
@@ -847,87 +848,6 @@ export var GlodaFundAttr = {
    * forwarded messages to actually be the content of the forwarded message.
    */
   contentWhittle(aMeta, aBodyLines, aContent) {
-    if (!aContent.volunteerContent(aContent.kPriorityBase)) {
-      return false;
-    }
-
-    // duplicate the list; we mutate somewhat...
-    const bodyLines = aBodyLines.concat();
-
-    // lastNonBlankLine originally was just for detecting quoting idioms where
-    //  the "wrote" line was separated from the quoted block by a blank line.
-    // Now we also use it for whitespace suppression at the boundaries of
-    //  quoted and un-quoted text.  (We keep blank lines within the same
-    //  'block' of quoted or non-quoted text.)
-    // Because we now have two goals for it, and we still want to suppress blank
-    //  lines when there is a 'wrote' line involved, we introduce...
-    //  prevLastNonBlankLine!  This arguably suggests refactoring should be the
-    //  next step, but things work for now.
-    let rangeStart = 0,
-      lastNonBlankLine = null,
-      prevLastNonBlankLine = null;
-    let inQuoteDepth = 0;
-    for (let [iLine, line] of bodyLines.entries()) {
-      if (!line || line == "\xa0") {
-        /* unicode non breaking space */
-        continue;
-      }
-
-      if (line.startsWith(">")) {
-        if (!inQuoteDepth) {
-          let rangeEnd = iLine - 1;
-          let quoteRangeStart = iLine;
-          // see if the last non-blank-line was a lead-in...
-          if (lastNonBlankLine != null) {
-            // TODO: localize quote range start detection
-            if (aBodyLines[lastNonBlankLine].includes("wrote")) {
-              quoteRangeStart = lastNonBlankLine;
-              rangeEnd = lastNonBlankLine - 1;
-              // we 'used up' lastNonBlankLine, let's promote the prev guy to
-              //  be the new lastNonBlankLine for the next logic block
-              lastNonBlankLine = prevLastNonBlankLine;
-            }
-            // eat the trailing whitespace...
-            if (lastNonBlankLine != null) {
-              rangeEnd = Math.min(rangeEnd, lastNonBlankLine);
-            }
-          }
-          if (rangeEnd >= rangeStart) {
-            aContent.content(aBodyLines.slice(rangeStart, rangeEnd + 1));
-          }
-
-          [inQuoteDepth, line] = this._countQuoteDepthAndNormalize(line);
-          bodyLines[iLine] = line;
-          rangeStart = quoteRangeStart;
-        } else {
-          let curQuoteDepth;
-          [curQuoteDepth, line] = this._countQuoteDepthAndNormalize(line);
-          bodyLines[iLine] = line;
-
-          if (curQuoteDepth != inQuoteDepth) {
-            // we could do some "wrote" compensation here, but it's not really
-            //  as important.  let's wait for a more clever algorithm.
-            aContent.quoted(aBodyLines.slice(rangeStart, iLine), inQuoteDepth);
-            inQuoteDepth = curQuoteDepth;
-            rangeStart = iLine;
-          }
-        }
-      } else if (inQuoteDepth) {
-        aContent.quoted(aBodyLines.slice(rangeStart, iLine), inQuoteDepth);
-        inQuoteDepth = 0;
-        rangeStart = iLine;
-      }
-
-      prevLastNonBlankLine = lastNonBlankLine;
-      lastNonBlankLine = iLine;
-    }
-
-    if (inQuoteDepth) {
-      aContent.quoted(aBodyLines.slice(rangeStart), inQuoteDepth);
-    } else {
-      aContent.content(aBodyLines.slice(rangeStart, lastNonBlankLine + 1));
-    }
-
-    return true;
+    return whittleMessageContent(aMeta, aBodyLines, aContent);
   },
 };

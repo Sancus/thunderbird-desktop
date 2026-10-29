@@ -23,7 +23,7 @@ import {
   GlodaIndexer,
   IndexingJob,
 } from "resource:///modules/gloda/GlodaIndexer.sys.mjs";
-import { MsgHdrToMimeMessage } from "resource:///modules/gloda/MimeMessage.sys.mjs";
+import { MsgHdrToMimeMessage } from "resource:///modules/panorama/MimeMessage.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {

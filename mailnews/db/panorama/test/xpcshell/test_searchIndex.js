@@ -306,3 +306,182 @@ add_task(async function test_embeddedQuoteMatching() {
     Assert.deepEqual(page.items.map(hit => hit.id).sort(), expected, text);
   }
 });
+
+add_task(
+  async function test_attachmentPresenceRoundTripsWithoutInventedAbsence() {
+    const { index, states, file } = await openIndex("attachment-proof");
+    for (const [id, value] of [
+      ["known-yes", true],
+      ["known-no", false],
+      ["unknown", null],
+    ]) {
+      await addDocument(index, states, id, {
+        body: "presenceproofneedle",
+        attachmentPresence: value,
+      });
+    }
+    await index.rebuild();
+    await index.close();
+    const reopened = await PanoramaSearchIndex.open(file, id => states.get(id));
+    registerCleanupFunction(() => reopened.close());
+    for (const [id, value] of [
+      ["known-yes", true],
+      ["known-no", false],
+      ["unknown", null],
+    ]) {
+      Assert.equal((await reopened.getText(id)).attachmentPresence, value, id);
+    }
+  }
+);
+
+add_task(async function test_attachmentUpgradePreservesOldTextAsUnknown() {
+  const file = do_get_profile().clone();
+  file.append("search-v2-attachment-upgrade.sqlite");
+  const db = Services.storage.openDatabase(file);
+  // Exact pre-presence sidecar columns; assertions use the public index API.
+  try {
+    db.executeSimpleSQL(`
+    CREATE TABLE documents (
+      id INTEGER PRIMARY KEY, documentId TEXT UNIQUE NOT NULL,
+      generation INTEGER NOT NULL, contentRevision TEXT NOT NULL, textRevision TEXT NOT NULL,
+      policyRevision INTEGER NOT NULL DEFAULT 0, changeSequence INTEGER NOT NULL DEFAULT 0,
+      bodyIndexed INTEGER NOT NULL DEFAULT 1, subject TEXT NOT NULL, body TEXT NOT NULL,
+      attachmentNames TEXT NOT NULL, author TEXT NOT NULL, recipients TEXT NOT NULL
+    );
+    CREATE TABLE retained_bodies (
+      documentId TEXT PRIMARY KEY, generation INTEGER NOT NULL, policyRevision INTEGER NOT NULL,
+      contentRevision TEXT NOT NULL, body TEXT NOT NULL, attachmentNames TEXT NOT NULL
+    );
+    INSERT INTO documents VALUES
+      (1,'old-copy',1,'source-1','old-projection',0,0,1,'','upgradeproofneedle','','','');
+    INSERT INTO retained_bodies VALUES
+      ('retained-copy',1,0,'source-1','retainedproofneedle','old.pdf');
+`);
+    db.schemaVersion = 2;
+  } finally {
+    db.close();
+  }
+  const index = await PanoramaSearchIndex.open(file, () => ({
+    eligible: true,
+    generation: 1,
+    contentRevision: "source-1",
+    policyRevision: 0,
+    originalContentAvailable: false,
+    location: null,
+  }));
+  registerCleanupFunction(() => index.close());
+  await index.rebuild();
+  const old = await index.getText("old-copy");
+  Assert.equal(old.textRevision, "old-projection");
+  Assert.equal(
+    old.attachmentInfos,
+    null,
+    "Old bodies do not invent attachment attributes"
+  );
+  Assert.equal(
+    old.attachmentTypes,
+    null,
+    "Old semantic text has no invented MIME types"
+  );
+  Assert.equal(
+    old.attachmentPresence,
+    null,
+    "Old filename text cannot prove presence or absence"
+  );
+  Assert.deepEqual(
+    (await index.search("upgradeproofneedle")).items.map(hit => hit.id),
+    ["old-copy"]
+  );
+  Assert.ok(
+    await index.index({
+      id: "retained-copy",
+      generation: 1,
+      contentRevision: "source-1",
+      policyRevision: 0,
+      subject: "",
+      body: "",
+      bodyIndexed: false,
+      attachmentNames: "",
+      author: "",
+      recipients: "",
+    })
+  );
+  Assert.equal(
+    (await index.getText("retained-copy")).body,
+    "retainedproofneedle"
+  );
+  Assert.equal((await index.getText("retained-copy")).attachmentPresence, null);
+  Assert.equal((await index.getText("retained-copy")).attachmentTypes, null);
+  Assert.equal((await index.getText("retained-copy")).attachmentInfos, null);
+});
+
+add_task(async function test_invalidStoredAttachmentProofIsNotUnknown() {
+  const { index, states, file } = await openIndex("invalid-attachment-proof");
+  await addDocument(index, states, "bad-proof", { attachmentPresence: true });
+  await addDocument(index, states, "good-proof", { attachmentPresence: false });
+  await index.close();
+  const db = Services.storage.openDatabase(file);
+  try {
+    db.executeSimpleSQL(
+      "UPDATE documents SET attachmentPresence=2 WHERE documentId='bad-proof'"
+    );
+  } finally {
+    db.close();
+  }
+  const reopened = await PanoramaSearchIndex.open(file, id => states.get(id));
+  registerCleanupFunction(() => reopened.close());
+  await Assert.rejects(
+    reopened.getText("bad-proof"),
+    /Invalid stored attachment presence/
+  );
+  Assert.equal(
+    (await reopened.getText("good-proof")).attachmentPresence,
+    false
+  );
+});
+
+add_task(
+  async function test_invalidStoredAttachmentDetailsRemainStorageErrors() {
+    const { index, states, file } = await openIndex(
+      "invalid-attachment-details"
+    );
+    const details = {
+      complete: true,
+      items: [
+        {
+          name: "zero",
+          contentType: "application/octet-stream",
+          size: 0,
+          part: "1.2",
+          isExternal: false,
+          externalUrl: null,
+        },
+      ],
+    };
+    await addDocument(index, states, "bad-details", {
+      attachmentInfos: details,
+    });
+    await addDocument(index, states, "good-details", {
+      attachmentInfos: details,
+    });
+    await index.close();
+    const db = Services.storage.openUnsharedDatabase(file);
+    try {
+      db.executeSimpleSQL(
+        `UPDATE documents SET attachmentInfos='{"items":[{"size":-1}],"complete":true}' WHERE documentId='bad-details'`
+      );
+    } finally {
+      db.close();
+    }
+    const reopened = await PanoramaSearchIndex.open(file, id => states.get(id));
+    registerCleanupFunction(() => reopened.close());
+    await Assert.rejects(
+      reopened.getText("bad-details"),
+      /Invalid attachment details/
+    );
+    Assert.deepEqual(
+      (await reopened.getText("good-details")).attachmentInfos,
+      details
+    );
+  }
+);

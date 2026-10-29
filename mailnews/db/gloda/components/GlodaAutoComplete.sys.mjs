@@ -10,10 +10,11 @@
  * gloda-single-identity-richlistitem, gloda-single-tag-richlistitem.
  */
 
-import { GlodaConstants } from "resource:///modules/gloda/GlodaConstants.sys.mjs";
+import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
+  GlodaConstants: "resource:///modules/gloda/GlodaConstants.sys.mjs",
   Gloda: "resource:///modules/gloda/GlodaPublic.sys.mjs",
   MultiSuffixTree: "resource:///modules/gloda/SuffixTree.sys.mjs",
   TagNoun: "resource:///modules/gloda/NounTag.sys.mjs",
@@ -183,7 +184,7 @@ var MAX_POPULAR_CONTACTS = 200;
  */
 function ContactIdentityCompleter() {
   // get all the contacts
-  const contactQuery = lazy.Gloda.newQuery(GlodaConstants.NOUN_CONTACT);
+  const contactQuery = lazy.Gloda.newQuery(lazy.GlodaConstants.NOUN_CONTACT);
   contactQuery.orderBy("-popularity").limit(MAX_POPULAR_CONTACTS);
   this.contactCollection = contactQuery.getCollection(this, null);
   this.contactCollection.becomeExplicit();
@@ -221,11 +222,11 @@ ContactIdentityCompleter.prototype = {
     for (let iMatch = 0; iMatch < matches.length; iMatch++) {
       const thing = matches[iMatch];
       if (
-        thing.NOUN_ID == GlodaConstants.NOUN_CONTACT &&
+        thing.NOUN_ID == lazy.GlodaConstants.NOUN_CONTACT &&
         !(thing.id in contactToThing)
       ) {
         contactToThing[thing.id] = thing;
-      } else if (thing.NOUN_ID == GlodaConstants.NOUN_IDENTITY) {
+      } else if (thing.NOUN_ID == lazy.GlodaConstants.NOUN_IDENTITY) {
         contactToThing[thing.contactID] = thing;
       }
     }
@@ -234,7 +235,9 @@ ContactIdentityCompleter.prototype = {
     matches = Object.keys(contactToThing)
       .map(id => contactToThing[id])
       .map(val =>
-        val.NOUN_ID == GlodaConstants.NOUN_IDENTITY ? val : val.identities[0]
+        val.NOUN_ID == lazy.GlodaConstants.NOUN_IDENTITY
+          ? val
+          : val.identities[0]
       );
 
     const rows = matches.map(
@@ -245,7 +248,7 @@ ContactIdentityCompleter.prototype = {
     // - match against database contacts / identities
     const pending = { contactToThing, pendingCount: 2 };
 
-    const contactQuery = lazy.Gloda.newQuery(GlodaConstants.NOUN_CONTACT);
+    const contactQuery = lazy.Gloda.newQuery(lazy.GlodaConstants.NOUN_CONTACT);
     contactQuery.nameLike(
       contactQuery.WILDCARD,
       aString,
@@ -254,7 +257,9 @@ ContactIdentityCompleter.prototype = {
     pending.contactColl = contactQuery.getCollection(this, aResult);
     pending.contactColl.becomeExplicit();
 
-    const identityQuery = lazy.Gloda.newQuery(GlodaConstants.NOUN_IDENTITY);
+    const identityQuery = lazy.Gloda.newQuery(
+      lazy.GlodaConstants.NOUN_IDENTITY
+    );
     identityQuery
       .kind("email")
       .valueLike(identityQuery.WILDCARD, aString, identityQuery.WILDCARD);
@@ -283,7 +288,9 @@ ContactIdentityCompleter.prototype = {
       //  of the contact loading...
       // (but only if we actually have any contacts)
       this.identityCollection =
-        this.contactCollection.subCollections[GlodaConstants.NOUN_IDENTITY];
+        this.contactCollection.subCollections[
+          lazy.GlodaConstants.NOUN_IDENTITY
+        ];
 
       const contactNames = this.contactCollection.items.map(
         c => c.name.replace(" ", "").toLowerCase() || "x"
@@ -400,10 +407,10 @@ ContactTagCompleter.prototype = {
     const tags = this._suffixTree.findMatches(aString.toLowerCase());
     const rows = [];
     for (const tag of tags) {
-      const query = lazy.Gloda.newQuery(GlodaConstants.NOUN_CONTACT);
+      const query = lazy.Gloda.newQuery(lazy.GlodaConstants.NOUN_CONTACT);
       query.freeTags(tag);
       const resRow = new ResultRowMulti(
-        GlodaConstants.NOUN_CONTACT,
+        lazy.GlodaConstants.NOUN_CONTACT,
         "tag",
         tag.name,
         query
@@ -507,7 +514,24 @@ FullTextCompleter.prototype = {
   },
 };
 
+/**
+ * Creates autocomplete for the registered backend without native legacy fallback.
+ *
+ * @returns {MailSearchAutoComplete|undefined} Native instance, or initializes
+ *   the legacy component receiver when that backend is active.
+ */
 export function GlodaAutoComplete() {
+  // Select the registered backend, not a mutable preference or a new core.
+  MailServices.accounts;
+  const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  if ("nsIDatabaseCore" in Ci && backend instanceof Ci.nsIDatabaseCore) {
+    const { MailSearchAutoComplete } = ChromeUtils.importESModule(
+      "resource:///modules/panorama/MailSearchAutoComplete.sys.mjs"
+    );
+    return new MailSearchAutoComplete();
+  }
   this.wrappedJSObject = this;
   try {
     this.completers = [];

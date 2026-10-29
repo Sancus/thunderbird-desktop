@@ -45,7 +45,9 @@ function loadStore(contract, storeType) {
   for (const name of STORE_PREFS) {
     Services.prefs.setCharPref(name, contract);
   }
-  localAccountUtils.loadLocalMailAccount(contract);
+  // Both defaults are already set. Avoid the helper's stale explicit-store
+  // shortcut after clearAll() when two consecutive tasks use the same store.
+  localAccountUtils.loadLocalMailAccount();
   const folder = localAccountUtils.inboxFolder;
   const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIMsgDBService
@@ -185,3 +187,270 @@ add_task(async function test_maildirReadMissingDirectory() {
     localAccountUtils.clearAll();
   }
 });
+
+/**
+ * Run availability checks with the registered reader's real account fixture.
+ *
+ * @param {string} storeType - Expected provider type.
+ * @param {function(nsIMsgLocalMailFolder, nsIMsgFolder): Promise<void>} check -
+ *   Receives the local inbox and account root.
+ * @returns {Promise<void>} Completes the checks and removes the owned account.
+ */
+async function withAvailabilityStore(storeType, check) {
+  localAccountUtils.clearAll();
+  try {
+    const contract =
+      storeType == "mbox"
+        ? "@mozilla.org/msgstore/berkeleystore;1"
+        : "@mozilla.org/msgstore/maildirstore;1";
+    const folder = loadStore(contract, storeType);
+    await check(folder, localAccountUtils.rootFolder);
+  } finally {
+    localAccountUtils.clearAll();
+  }
+}
+
+/**
+ * Local availability depends on Partial, independently of the Offline flag.
+ *
+ * @param {string} storeType - Expected provider type.
+ */
+async function checkLocalAvailability(storeType) {
+  await withAvailabilityStore(storeType, async folder => {
+    const raw = "Subject: Local availability\r\n\r\nExact local body.\r\n";
+    const header = folder.addMessage(raw);
+    const key = header.messageKey;
+    const token = header.storeToken;
+    const size = header.messageSize;
+    const base =
+      (header.flags |
+        Ci.nsMsgMessageFlags.Read |
+        Ci.nsMsgMessageFlags.Marked |
+        Ci.nsMsgMessageFlags.Replied) &
+      ~(Ci.nsMsgMessageFlags.Offline | Ci.nsMsgMessageFlags.Partial);
+    for (const [flags, expected] of [
+      [base, true],
+      [base | Ci.nsMsgMessageFlags.Partial, false],
+      [
+        base | Ci.nsMsgMessageFlags.Partial | Ci.nsMsgMessageFlags.Offline,
+        false,
+      ],
+      [base | Ci.nsMsgMessageFlags.Offline, true],
+    ]) {
+      header.flags = flags;
+      Assert.equal(folder.hasMsgOffline(key), expected);
+      Assert.equal(header.flags, flags);
+      Assert.equal(header.storeToken, token);
+      Assert.equal(header.messageSize, size);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+      Assert.equal(mailTestUtils.loadMessageToString(folder, header), raw);
+    }
+  });
+}
+
+add_task(async function test_localAvailabilityMbox() {
+  await checkLocalAvailability("mbox");
+});
+
+add_task(async function test_localAvailabilityMaildir() {
+  await checkLocalAvailability("maildir");
+});
+
+/**
+ * Preserve native admission errors and the existing message/body state.
+ *
+ * @param {string} storeType - Expected provider type.
+ */
+async function checkLocalAvailabilityAdmissionError(storeType) {
+  await withAvailabilityStore(storeType, async folder => {
+    const raw = "Subject: Availability error\r\n\r\nRetained exact body.\r\n";
+    const header = folder.addMessage(raw);
+    const key = header.messageKey;
+    const token = header.storeToken;
+    const size = header.messageSize;
+    const flags = header.flags;
+    Assert.ok(folder.hasMsgOffline(key));
+    const bodyPath =
+      storeType == "mbox"
+        ? folder.filePath.path
+        : PathUtils.join(folder.filePath.path, "cur", token);
+    const bytes = await IOUtils.read(bodyPath);
+    const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    ).connectionForTests;
+    connection.executeSimpleSQL(
+      "ALTER TABLE body_relocations RENAME TO hidden_local_body_relocations"
+    );
+    try {
+      Assert.throws(
+        () => folder.hasMsgOffline(key),
+        error => error.result === Cr.NS_ERROR_FAILURE
+      );
+      Assert.equal(header.flags, flags);
+      Assert.equal(header.subject, "Availability error");
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE hidden_local_body_relocations RENAME TO body_relocations"
+      );
+    }
+    Assert.ok(folder.hasMsgOffline(key));
+    Assert.equal(header.storeToken, token);
+    Assert.equal(header.messageSize, size);
+    Assert.equal(header.flags, flags);
+    Assert.equal(mailTestUtils.loadMessageToString(folder, header), raw);
+    Assert.deepEqual(await IOUtils.read(bodyPath), bytes);
+  });
+}
+
+/**
+ * A global key in another folder must not become a local availability result.
+ *
+ * @param {string} storeType - Expected provider type.
+ */
+async function checkLocalAvailabilityForeignKey(storeType) {
+  await withAvailabilityStore(storeType, async (folder, root) => {
+    const other = root
+      .createLocalSubfolder("other-body-owner")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    Assert.equal(other.msgStore.storeType, storeType);
+    const raw = "Subject: Foreign body\r\n\r\nOther exact body.\r\n";
+    const header = other.addMessage(raw);
+    const key = header.messageKey;
+    const token = header.storeToken;
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    Assert.throws(
+      () => folder.hasMsgOffline(key),
+      error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE
+    );
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    Assert.deepEqual(other.msgDatabase.listAllKeys(), [key]);
+    Assert.equal(header.storeToken, token);
+    Assert.ok(other.hasMsgOffline(key));
+    Assert.equal(mailTestUtils.loadMessageToString(other, header), raw);
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_localAvailabilityAdmissionErrorMbox() {
+    await checkLocalAvailabilityAdmissionError("mbox");
+  });
+
+  add_task(async function test_localAvailabilityAdmissionErrorMaildir() {
+    await checkLocalAvailabilityAdmissionError("maildir");
+  });
+
+  add_task(async function test_localAvailabilityForeignKeyMbox() {
+    await checkLocalAvailabilityForeignKey("mbox");
+  });
+
+  add_task(async function test_localAvailabilityForeignKeyMaildir() {
+    await checkLocalAvailabilityForeignKey("maildir");
+  });
+}
+
+/**
+ * A real source-admission error must settle copy/move without changing either
+ * the physical source or the destination body storage.
+ *
+ * @param {string} storeType - Expected provider type.
+ * @param {boolean} move - Move instead of copying.
+ */
+async function checkLocalCopyAdmissionError(storeType, move) {
+  await withAvailabilityStore(storeType, async (folder, root) => {
+    const raw =
+      "Subject: Admission before transfer\r\nMessage-ID: <copy-admission@example.invalid>\r\n\r\nRetained source bytes.\r\n";
+    const header = folder.addMessage(raw);
+    const key = header.messageKey;
+    const token = header.storeToken;
+    const flags = header.flags;
+    const size = header.messageSize;
+    const sourcePath =
+      storeType == "mbox"
+        ? folder.filePath.path
+        : PathUtils.join(folder.filePath.path, "cur", token);
+    const sourceBytes = await IOUtils.read(sourcePath);
+    const destination = root
+      .createLocalSubfolder("failed-admission-destination")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    Assert.equal(destination.msgStore.storeType, storeType);
+    const destinationPath =
+      storeType == "mbox"
+        ? destination.filePath.path
+        : PathUtils.join(destination.filePath.path, "cur");
+    const existed = await IOUtils.exists(destinationPath);
+    let before = null;
+    if (existed) {
+      before =
+        storeType == "mbox"
+          ? await IOUtils.read(destinationPath)
+          : await IOUtils.getChildren(destinationPath);
+    }
+    const statuses = [];
+    const listener = new PromiseTestUtils.PromiseCopyListener({
+      onStopCopy(status) {
+        statuses.push(status);
+      },
+    });
+    const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    ).connectionForTests;
+    connection.executeSimpleSQL(
+      "ALTER TABLE body_relocations RENAME TO hidden_local_copy_relocations"
+    );
+    try {
+      MailServices.copy.copyMessages(
+        folder,
+        [header],
+        destination,
+        move,
+        listener,
+        null,
+        false
+      );
+      await Assert.rejects(
+        listener.promise,
+        error => Number(error.message) === Cr.NS_ERROR_FAILURE
+      );
+      Assert.deepEqual(statuses, [Cr.NS_ERROR_FAILURE]);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+      Assert.deepEqual(destination.msgDatabase.listAllKeys(), []);
+      Assert.ok(!folder.locked);
+      Assert.ok(!destination.locked);
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE hidden_local_copy_relocations RENAME TO body_relocations"
+      );
+    }
+    const retained = folder.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(retained.storeToken, token);
+    Assert.equal(retained.messageSize, size);
+    Assert.equal(retained.flags, flags);
+    Assert.equal(mailTestUtils.loadMessageToString(folder, retained), raw);
+    Assert.deepEqual(await IOUtils.read(sourcePath), sourceBytes);
+    Assert.equal(await IOUtils.exists(destinationPath), existed);
+    if (existed) {
+      Assert.deepEqual(
+        storeType == "mbox"
+          ? await IOUtils.read(destinationPath)
+          : await IOUtils.getChildren(destinationPath),
+        before
+      );
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_localCopyAdmissionErrorMbox() {
+    await checkLocalCopyAdmissionError("mbox", false);
+  });
+  add_task(async function test_localCopyAdmissionErrorMaildir() {
+    await checkLocalCopyAdmissionError("maildir", false);
+  });
+  add_task(async function test_localMoveAdmissionErrorMbox() {
+    await checkLocalCopyAdmissionError("mbox", true);
+  });
+  add_task(async function test_localMoveAdmissionErrorMaildir() {
+    await checkLocalCopyAdmissionError("maildir", true);
+  });
+}

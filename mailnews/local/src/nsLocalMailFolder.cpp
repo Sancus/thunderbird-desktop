@@ -61,6 +61,10 @@
 #include "StoreIndexer.h"
 #include "nsIPropertyBag2.h"
 
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#endif
+
 #include <algorithm>
 #include <functional>
 
@@ -1515,18 +1519,35 @@ nsMsgLocalMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
   for (auto message : srcHdrs) {
     nsMsgKey key;
     uint32_t msgSize;
-    message->GetMessageSize(&msgSize);
+    bool hasMsgOffline = false;
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      // Fail admission before opening or publishing any destination body.
+      rv = message->GetMessageSize(&msgSize);
+      if (NS_SUCCEEDED(rv)) rv = message->GetMessageKey(&key);
+      if (NS_SUCCEEDED(rv)) {
+        rv = srcFolder->HasMsgOffline(key, &hasMsgOffline);
+      }
+      if (NS_FAILED(rv)) {
+        if (isMove) srcFolder->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
+        // No copy state or stream exists yet. Settle this queued request with
+        // the original error without disturbing another request's copy state.
+        nsCOMPtr<nsIMsgCopyService> copyService =
+            mozilla::components::Copy::Service();
+        return copyService->NotifyCompletion(srcSupport, this, rv);
+      }
+    } else
+#endif
+    {
+      message->GetMessageSize(&msgSize);
+      message->GetMessageKey(&key);
+      srcFolder->HasMsgOffline(key, &hasMsgOffline);
+    }
 
     /* 200 is a per-message overhead to account for any extra data added
        to the message.
     */
     totalMsgSize += msgSize + 200;
-
-    // Check if each source folder message has offline storage regardless
-    // of whether we're online or offline.
-    message->GetMessageKey(&key);
-    bool hasMsgOffline = false;
-    srcFolder->HasMsgOffline(key, &hasMsgOffline);
     allMsgsHaveOfflineStore = allMsgsHaveOfflineStore && hasMsgOffline;
 
     // If we're offline and not all messages are in offline storage, the copy
@@ -3445,23 +3466,37 @@ NS_IMETHODIMP nsMsgLocalMailFolder::HasMsgOffline(nsMsgKey msgKey,
                                                   bool* result) {
   NS_ENSURE_ARG(result);
   *result = false;
-  GetDatabase();
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(GetDatabase());
+  } else
+#endif
+  {
+    GetDatabase();
+  }
   if (!mDatabase) return NS_ERROR_FAILURE;
 
-  nsresult rv;
   nsCOMPtr<nsIMsgDBHdr> hdr;
-  rv = mDatabase->GetMsgHdrForKey(msgKey, getter_AddRefs(hdr));
-  if (NS_FAILED(rv)) return rv;
+  nsresult rv = mDatabase->GetMsgHdrForKey(msgKey, getter_AddRefs(hdr));
+  NS_ENSURE_SUCCESS(rv, rv);
 
   if (hdr) {
     uint32_t flags = 0;
-    hdr->GetFlags(&flags);
-    // Would be nice to check nsMsgMessageFlags::Offline... but local
-    // folders don't set it.
-    // Don't want partial messages.
-    if (!(flags & nsMsgMessageFlags::Partial)) {
-      *result = true;
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      RefPtr<mozilla::mailnews::DatabaseCore> core =
+          mozilla::mailnews::DatabaseCore::GetInstanceForService();
+      NS_ENSURE_STATE(core);
+      MOZ_TRY(core->MessageDB().CheckMessageBodyAccess(msgKey));
+      MOZ_TRY(hdr->GetFlags(&flags));
+    } else
+#endif
+    {
+      hdr->GetFlags(&flags);
     }
+    // Local folders don't require Offline, but Partial messages have no full
+    // body.
+    *result = !(flags & nsMsgMessageFlags::Partial);
   }
   return NS_OK;
 }

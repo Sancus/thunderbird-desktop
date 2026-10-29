@@ -4,6 +4,8 @@
 
 #include "OfflineStorage.h"
 
+#include <limits>
+
 #include "mozilla/Components.h"
 #include "mozilla/Preferences.h"
 #include "msgCore.h"
@@ -24,6 +26,12 @@
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
+
+#ifdef MOZ_PANORAMA
+#  include "DatabaseCore.h"
+#  include "MessageDatabase.h"
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
 
 using mozilla::Preferences;
 
@@ -409,6 +417,78 @@ nsresult LocalDeleteMessages(
   return NS_OK;
 }
 
+#ifdef MOZ_PANORAMA
+// Native structural fields are separate from the arbitrary property list.
+static nsresult CopyNativeMessageStructure(
+    nsIMsgFolder* sourceFolder, nsIMsgDBHdr* source, nsIMsgDBHdr* destination,
+    mozilla::mailnews::MessageDatabase& messages,
+    const nsTArray<nsCString>& exclusions) {
+  nsMsgKey key;
+  uint64_t folderId, storedFolderId;
+  MOZ_TRY(source->GetMessageKey(&key));
+  MOZ_TRY(sourceFolder->GetId(&folderId));
+  MOZ_TRY(messages.GetMessageFolderId(key, storedFolderId));
+  NS_ENSURE_TRUE(folderId == storedFolderId, NS_ERROR_ILLEGAL_VALUE);
+
+  nsAutoCString value;
+  if (!exclusions.Contains("subject"_ns)) {
+    MOZ_TRY(source->GetSubject(value));
+    MOZ_TRY(destination->SetSubject(value));
+  }
+  if (!exclusions.Contains("sender"_ns)) {
+    MOZ_TRY(source->GetAuthor(value));
+    MOZ_TRY(destination->SetAuthor(value));
+  }
+  if (!exclusions.Contains("recipients"_ns)) {
+    MOZ_TRY(source->GetRecipients(value));
+    MOZ_TRY(destination->SetRecipients(value));
+  }
+  if (!exclusions.Contains("ccList"_ns)) {
+    MOZ_TRY(source->GetCcList(value));
+    MOZ_TRY(destination->SetCcList(value));
+  }
+  if (!exclusions.Contains("bccList"_ns)) {
+    MOZ_TRY(source->GetBccList(value));
+    MOZ_TRY(destination->SetBccList(value));
+  }
+  if (!exclusions.Contains("message-id"_ns)) {
+    MOZ_TRY(source->GetMessageId(value));
+    MOZ_TRY(destination->SetMessageId(value));
+  }
+  if (!exclusions.Contains("date"_ns)) {
+    PRTime date;
+    MOZ_TRY(source->GetDate(&date));
+    MOZ_TRY(destination->SetDate(date));
+  }
+  if (!exclusions.Contains("priority"_ns)) {
+    nsMsgPriorityValue priority;
+    MOZ_TRY(source->GetPriority(&priority));
+    MOZ_TRY(destination->SetPriority(priority));
+  }
+  if (!exclusions.Contains("flags"_ns)) {
+    uint32_t flags;
+    MOZ_TRY(source->GetFlags(&flags));
+    MOZ_TRY(destination->SetFlags(flags & ~nsMsgMessageFlags::Offline));
+  }
+  if (!exclusions.Contains("references"_ns)) {
+    // The public reference getters filter self/empty values and narrow count.
+    nsTArray<nsCString> references;
+    MOZ_TRY(messages.GetMessageReferences(key, references));
+    nsAutoCString serialized;
+    for (const auto& reference : references) {
+      serialized.Append('<');
+      serialized.Append(reference);
+      serialized.AppendLiteral("> ");
+    }
+    // Reject an unrepresentable list before opening a destination body stream.
+    NS_ENSURE_TRUE(ParseIdentificationFields(serialized) == references,
+                   NS_ERROR_ILLEGAL_VALUE);
+    MOZ_TRY(destination->SetReferences(serialized));
+  }
+  return NS_OK;
+}
+#endif
+
 nsresult LocalCopyMessages(nsIMsgFolder* sourceFolder,
                            nsIMsgFolder* destinationFolder,
                            const nsTArray<RefPtr<nsIMsgDBHdr>>& sourceHeaders,
@@ -421,10 +501,32 @@ nsresult LocalCopyMessages(nsIMsgFolder* sourceFolder,
   rv = destinationFolder->GetMsgDatabase(getter_AddRefs(database));
   NS_ENSURE_SUCCESS(rv, rv);
 
+  bool nativeCopy = false;
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::DatabaseCore> nativeCore;
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nativeCore = mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_STATE(nativeCore);
+    nativeCopy = true;
+  }
+#endif
+
   for (auto&& header : sourceHeaders) {
     RefPtr<nsIMsgDBHdr> newHeader;
     rv = LocalCreateHeader(destinationFolder, getter_AddRefs(newHeader));
     NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+    if (nativeCopy) {
+      nsCString dontPreserve;
+      Preferences::GetCString("mailnews.database.summary.dontPreserveOnCopy",
+                              dontPreserve);
+      const nsTArray<nsCString> exclusions = StringFields(dontPreserve);
+      MOZ_TRY(CopyNativeMessageStructure(sourceFolder, header, newHeader,
+                                         nativeCore->MessageDB(), exclusions));
+      // Finish supplies the actual destination storage fields afterwards.
+      MOZ_TRY(LocalCopyHeaders(header, newHeader, exclusions));
+    }
+#endif
     nsAutoCString storeToken;
     rv = header->GetStoreToken(storeToken);
     NS_ENSURE_SUCCESS(rv, rv);
@@ -445,21 +547,24 @@ nsresult LocalCopyMessages(nsIMsgFolder* sourceFolder,
       NS_ENSURE_SUCCESS(rv, rv);
     }
 
-    // This preference exists so that extensions can influence which
-    // properties are preserved in the database when a message is copied.
-    nsCString dontPreserve;
-    Preferences::GetCString("mailnews.database.summary.dontPreserveOnCopy",
-                            dontPreserve);
-    rv = LocalCopyHeaders(header, newHeader, StringFields(dontPreserve));
-    NS_ENSURE_SUCCESS(rv, rv);
+    if (!nativeCopy) {
+      // Keep the legacy per-message preference read after the body copy.
+      nsCString dontPreserve;
+      Preferences::GetCString("mailnews.database.summary.dontPreserveOnCopy",
+                              dontPreserve);
+      rv = LocalCopyHeaders(header, newHeader, StringFields(dontPreserve));
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
 
-    rv = database->AddNewHdrToDB(newHeader, true);
+    nsCOMPtr<nsIMsgDBHdr> liveHeader;
+    rv = database->AttachHdr(newHeader, true, getter_AddRefs(liveHeader));
     NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(liveHeader, NS_ERROR_UNEXPECTED);
 
     rv = database->Commit(nsMsgDBCommitType::kLargeCommit);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    newHeaders.AppendElement(newHeader);
+    newHeaders.AppendElement(liveHeader);
   }
 
   return NS_OK;
@@ -495,17 +600,26 @@ nsresult LocalCopyOfflineMessageContent(nsIMsgFolder* destinationFolder,
                                     getter_AddRefs(outStream));
   NS_ENSURE_SUCCESS(rv, rv);
 
-  auto outGuard = mozilla::MakeScopeExit(
-      [&] { store->DiscardNewMessage(destinationFolder, outStream); });
+  auto outGuard = mozilla::MakeScopeExit([&] {
+    nsresult discardRv = store->DiscardNewMessage(destinationFolder, outStream);
+    if (NS_FAILED(discardRv)) {
+      NS_WARNING("Failed to discard unfinished offline message copy");
+    }
+  });
 
   uint64_t bytesCopied;
   rv = SyncCopyStream(msgInputStream, outStream, bytesCopied);
   NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(bytesCopied <= std::numeric_limits<uint32_t>::max(),
+                 NS_ERROR_FILE_TOO_BIG);
 
+  // Finish may fail after moving the body to its final location. Retain those
+  // bytes and the original error instead of discarding an uncertain write.
+  outGuard.release();
   nsAutoCString storeToken;
   rv = store->FinishNewMessage(destinationFolder, outStream, storeToken);
   NS_ENSURE_SUCCESS(rv, rv);
-  outGuard.release();
+  NS_ENSURE_TRUE(!storeToken.IsEmpty(), NS_ERROR_UNEXPECTED);
 
   rv = messageHeader->SetStoreToken(storeToken);
   NS_ENSURE_SUCCESS(rv, rv);

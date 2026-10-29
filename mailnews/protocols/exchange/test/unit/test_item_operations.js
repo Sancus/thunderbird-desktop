@@ -32,6 +32,12 @@ const ewsIdPropertyName = "ewsId";
 const generator = new MessageGenerator();
 
 add_setup(async function () {
+  // Negative protocol cases check callback errors without opening GUI alerts.
+  Services.prefs.setBoolPref("mail.suppressAlertsForTests", true);
+  registerCleanupFunction(() =>
+    Services.prefs.clearUserPref("mail.suppressAlertsForTests")
+  );
+
   [ewsServer, ewsIncomingServer] = setupBasicEwsTestServer({});
   [graphServer, graphIncomingServer] = setupBasicGraphTestServer({});
 });
@@ -1093,12 +1099,16 @@ async function subtestCrossAccountMoveFailure(
 }
 
 add_task(async function testHardDeleteStoppedClientEws() {
-  const [mockServer, incomingServer] = setupBasicEwsTestServer({});
+  const [mockServer, incomingServer] = setupBasicEwsTestServer({
+    username: "stopped-delete-ews",
+  });
   await testHardDeleteStoppedClient(mockServer, incomingServer);
 });
 
 add_task(async function testHardDeleteStoppedClientGraph() {
-  const [mockServer, incomingServer] = setupBasicGraphTestServer();
+  const [mockServer, incomingServer] = setupBasicGraphTestServer({
+    username: "stopped-delete-graph",
+  });
   await testHardDeleteStoppedClient(mockServer, incomingServer);
 });
 
@@ -1490,7 +1500,8 @@ async function testNextCopyOfflineFailure(
   try {
     MailServices.copy.copyMessages(
       source,
-      headers,
+      // The copy service groups each folder's messages in reverse input order.
+      headers.toReversed(),
       destination,
       false,
       listener,

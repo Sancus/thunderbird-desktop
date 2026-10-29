@@ -32,6 +32,12 @@ var ewsClient;
 var graphClient;
 
 add_setup(async () => {
+  // Negative protocol cases check callback errors without opening GUI alerts.
+  Services.prefs.setBoolPref("mail.suppressAlertsForTests", true);
+  registerCleanupFunction(() =>
+    Services.prefs.clearUserPref("mail.suppressAlertsForTests")
+  );
+
   [ewsServer, incomingEwsServer] = setupBasicEwsTestServer({});
   [graphServer, incomingGraphServer] = setupBasicGraphTestServer();
 
@@ -221,7 +227,7 @@ async function testLocalOnlyMessage(mockServer, incomingServer) {
   const messages = [
     generator.makeMessage({
       subject: "Cached message",
-      body: { body: "The downloaded body remains available offline." },
+      body: { body: "The downloaded body remains available offline.\r\n" },
     }),
     generator.makeMessage({ subject: "Uncached message" }),
   ];

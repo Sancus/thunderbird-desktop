@@ -246,7 +246,7 @@ class CopyMessageStreamListenerTest : public ::testing::Test {
     }
     RefPtr<CopyMessageStreamListener> listener =
         new CopyMessageStreamListener(mDestination, isMove, std::move(endCopy));
-    nsCOMPtr<nsIStreamListener> streamListener = listener;
+    nsCOMPtr<nsIStreamListener> streamListener = listener.get();
     if (sourceFolder) {
       nsCOMPtr<nsIChannel> channel =
           do_CreateInstance("@mozilla.org/network/input-stream-channel;1", &rv);

@@ -29,7 +29,6 @@
 #include "mozilla/ResultExtensions.h"
 #include "nsComponentManagerUtils.h"
 #include "nsIInputStream.h"
-#include "nsID.h"
 #include "nsIMsgDBView.h"
 #include "nsIMsgIncomingServer.h"
 #include "nsIMsgOfflineImapOperation.h"
@@ -60,27 +59,11 @@ PerFolderDatabase::PerFolderDatabase(uint64_t folderId, bool isNewsFolder)
 }
 
 nsresult PerFolderDatabase::CaptureDatabaseSourceId() {
-  // Opening a wrapper may occur inside a caller-owned transaction. Capture its
-  // identity without changing that transaction; removal later checks this
-  // original value against the committed database, never rebinds the wrapper.
-  nsCOMPtr<mozIStorageStatement> stmt;
-  MOZ_TRY(DatabaseCore::GetStatement(
-      "PerFolderDatabaseSourceId"_ns,
-      "SELECT sourceId FROM database_identity WHERE singleton = 1"_ns,
-      getter_AddRefs(stmt)));
-  mozStorageStatementScoper scope(stmt);
-  bool more;
-  MOZ_TRY(stmt->ExecuteStep(&more));
-  NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
-  nsCString source;
-  MOZ_TRY(stmt->GetUTF8String(0, source));
-  nsID parsed;
-  NS_ENSURE_TRUE(source.Length() == NSID_LENGTH - 1 && parsed.Parse(source),
-                 NS_ERROR_FILE_CORRUPTED);
-  MOZ_TRY(stmt->ExecuteStep(&more));
-  NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
-  mDatabaseSourceId = source;
-  return NS_OK;
+  // Capture once without opening a core or changing a caller-owned transaction.
+  // Keep both the original spelling and the first error for later admission.
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  return core->ReadSourceIdForFolderAdmission(mDatabaseSourceId);
 }
 
 class OfflineOperation final : public nsIMsgOfflineImapOperation {

@@ -2013,3 +2013,81 @@ add_task(function test_deletionPropagatesActualServerPolicyError() {
     MailServices.accounts.removeAccount(account, false);
   }
 });
+
+add_task(function test_admissionKeepsItsOriginalSourceReadError() {
+  const service = database.QueryInterface(Ci.nsIMsgDBService);
+  const connection = database.connectionForTests;
+  const source = database.sourceId;
+  for (const fault of ["missing", "corrupt"]) {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder(`admission-source-${fault}`);
+    const key = addMessage({ folderId: folder.id });
+    messageDB.getMessage(key).messageSize = 17;
+    folder.msgDatabase.forceClosed();
+    const readCounter = () => {
+      const row = connection.createStatement(
+        "SELECT value, typeof(value) FROM folder_properties " +
+          "WHERE id = :id AND name = 'expungedBytes'"
+      );
+      try {
+        row.params.id = folder.id;
+        return row.executeStep()
+          ? [row.getInt64(0), row.getUTF8String(1)]
+          : null;
+      } finally {
+        row.finalize();
+      }
+    };
+    const originalCounter = readCounter();
+    let admitted;
+    try {
+      if (fault === "missing") {
+        connection.executeSimpleSQL(
+          "ALTER TABLE database_identity RENAME TO hidden_admission_identity"
+        );
+      } else {
+        connection.executeSimpleSQL(
+          "UPDATE database_identity SET sourceId = 'not-a-uuid'"
+        );
+      }
+      admitted = service.openFolderDB(folder, false);
+    } finally {
+      if (fault === "missing") {
+        connection.executeSimpleSQL(
+          "ALTER TABLE hidden_admission_identity RENAME TO database_identity"
+        );
+      } else {
+        const restore = connection.createStatement(
+          "UPDATE database_identity SET sourceId = :source"
+        );
+        try {
+          restore.params.source = source;
+          restore.execute();
+        } finally {
+          restore.finalize();
+        }
+      }
+    }
+    Assert.equal(database.sourceId, source);
+    const expected =
+      fault === "missing" ? Cr.NS_ERROR_FAILURE : Cr.NS_ERROR_FILE_CORRUPTED;
+    Assert.throws(
+      () => admitted.deleteMessage(key, null, true),
+      error => error.result === expected,
+      "Repairing the source table cannot rebind a failed admission"
+    );
+    Assert.ok(admitted.containsKey(key));
+    Assert.equal(admitted.dBFolderInfo.expungedBytes, 0);
+    Assert.deepEqual(
+      readCounter(),
+      originalCounter,
+      "Failed admission preserves raw counter presence, type and value"
+    );
+    admitted.forceClosed();
+    const current = service.openFolderDB(folder, false);
+    current.deleteMessage(key, null, true);
+    Assert.ok(!current.containsKey(key));
+    Assert.equal(current.dBFolderInfo.expungedBytes, 17);
+  }
+});

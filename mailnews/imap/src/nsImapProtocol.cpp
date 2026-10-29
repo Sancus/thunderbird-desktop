@@ -763,19 +763,23 @@ const char* nsImapProtocol::GetImapServerKey() {
 }
 
 nsresult nsImapProtocol::SetupSinkProxy() {
+  MOZ_ASSERT(NS_IsMainThread());
+  ReentrantMonitorAutoEnter mon(mMonitor);
   if (!m_runningUrl) return NS_OK;
   nsresult res;
   bool newFolderSink = false;
-  if (!m_imapMailFolderSink) {
+  if (!m_pendingMailFolderSink) {
     nsCOMPtr<nsIImapMailFolderSink> aImapMailFolderSink;
     (void)m_runningUrl->GetImapMailFolderSink(
         getter_AddRefs(aImapMailFolderSink));
     if (aImapMailFolderSink) {
-      m_imapMailFolderSink = new ImapMailFolderSinkProxy(aImapMailFolderSink);
+      m_pendingMailFolderSink =
+          new ImapMailFolderSinkProxy(aImapMailFolderSink);
       newFolderSink = true;
     }
   }
-  if (newFolderSink) Log("SetupSinkProxy", nullptr, "got m_imapMailFolderSink");
+  if (newFolderSink)
+    Log("SetupSinkProxy", nullptr, "got m_pendingMailFolderSink");
 
   if (!m_imapMessageSink) {
     nsCOMPtr<nsIImapMessageSink> aImapMessageSink;
@@ -829,7 +833,7 @@ nsresult nsImapProtocol::SetupWithUrl(nsIURI* aURL, nsISupports* aConsumer) {
   NS_ASSERTION(aURL, "null URL passed into Imap Protocol");
   ReentrantMonitorAutoEnter mon(mMonitor);
   m_urlInProgress = true;
-  m_imapMailFolderSink = nullptr;
+  m_pendingMailFolderSink = nullptr;
 
   if (aURL) {
     nsCOMPtr<nsIImapUrl> imapURL = do_QueryInterface(aURL, &rv);
@@ -1133,6 +1137,7 @@ void nsImapProtocol::ReleaseUrlState(bool rerunning) {
       // It is unclear what 'saveFolderSink' is used for, most likely to hold
       // a reference for a little longer. See bug 1324893 and bug 391259.
       saveFolderSink = m_imapMailFolderSink;
+      m_pendingMailFolderSink = nullptr;
 
       m_runningUrl =
           nullptr;  // force us to release our last reference on the url
@@ -1201,6 +1206,10 @@ bool nsImapProtocol::RunImapThreadMainLoop() {
   m_imapMailFolderSink = nullptr;
   m_imapMailFolderSinkSelected = nullptr;
   m_imapMessageSink = nullptr;
+  {
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    m_pendingMailFolderSink = nullptr;
+  }
 
   return true;
 }
@@ -1832,6 +1841,11 @@ bool nsImapProtocol::ProcessCurrentURL() {
   m_mailboxUpdateResult = NS_OK;
   if (m_idle) EndIdle();
 
+  {
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    m_imapMailFolderSink = std::move(m_pendingMailFolderSink);
+  }
+
   if (m_retryUrlOnError) {
     // we clear this flag if we're re-running immediately, because that
     // means we never sent a start running url notification, and later we
@@ -1860,6 +1874,8 @@ bool nsImapProtocol::ProcessCurrentURL() {
     // This occurs when running another URL in the main thread loop
     rv = m_imapProtocolSink->SetupMainThreadProxies();
     NS_ENSURE_SUCCESS(rv, false);
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    m_imapMailFolderSink = std::move(m_pendingMailFolderSink);
   }
 
   // Reinitialize the parser

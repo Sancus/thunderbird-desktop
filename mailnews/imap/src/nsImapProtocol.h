@@ -441,6 +441,10 @@ class nsImapProtocol : public nsIImapProtocol,
   bool m_idleResponseReadyToHandle;
   nsWeakPtr m_server;
 
+  // Main-thread URL setup stages this proxy under mMonitor. The IMAP thread
+  // takes it when starting the URL, without touching the previous URL's sink.
+  RefPtr<ImapMailFolderSinkProxy> m_pendingMailFolderSink;
+  // These folder sinks are accessed only by the IMAP thread until it stops.
   RefPtr<ImapMailFolderSinkProxy> m_imapMailFolderSink;
   RefPtr<ImapMailFolderSinkProxy> m_imapMailFolderSinkSelected;
   RefPtr<ImapMessageSinkProxy> m_imapMessageSink;

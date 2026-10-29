@@ -32,6 +32,7 @@
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgOfflineImapOperation.h"
+#include "nsImapCore.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
 #include "nsComponentManagerUtils.h"
@@ -3097,6 +3098,42 @@ TEST_F(DeliveryCoreReferences, MissingFolderPublicationRetainsStagedHeader) {
   nsCString token;
   ASSERT_EQ(NS_OK, db.GetMessageStoreToken(key, token));
   EXPECT_EQ("retained-body"_ns, token);
+}
+
+TEST_F(DeliveryCoreReferences, OfflineDeletesUseProtocolDeletedFlag) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey deleted, mdnSent, moved, copied;
+  ASSERT_EQ(NS_OK, Add("protocol-deleted@invalid"_ns, {}, deleted));
+  ASSERT_EQ(NS_OK, Add("protocol-mdn@invalid"_ns, {}, mdnSent));
+  ASSERT_EQ(NS_OK, Add("protocol-moved@invalid"_ns, {}, moved));
+  ASSERT_EQ(NS_OK, Add("protocol-copied@invalid"_ns, {}, copied));
+  OfflineOperationData input;
+  input.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  input.newFlags = kImapMsgDeletedFlag;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, deleted, input));
+  input.newFlags = kImapMsgMDNSentFlag;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, mdnSent, input));
+  input.operation = nsIMsgOfflineImapOperation::kMsgMoved;
+  input.newFlags = 0;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, moved, input));
+  // Copy: a flag value alone does not make it a deletion.
+  input.operation = nsIMsgOfflineImapOperation::kMsgCopy;
+  input.newFlags = kImapMsgDeletedFlag;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, copied, input));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(deleted));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().ListOfflineOperations(mFolderId, true, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{deleted, moved}), keys);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().ListOfflineOperations(mFolderId, false, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{deleted, mdnSent, moved, copied}), keys);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(deleted, exists));
+  EXPECT_FALSE(exists);
 }
 
 TEST_F(DeliveryCoreReferences,

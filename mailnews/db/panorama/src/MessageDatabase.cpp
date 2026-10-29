@@ -30,6 +30,7 @@
 #include "nsLocalFile.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgOfflineImapOperation.h"
+#include "nsImapCore.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
@@ -2430,7 +2431,7 @@ nsresult MessageDatabase::ListOfflineOperations(uint64_t folderId,
   MOZ_TRY(stmt->BindInt32ByName("deletesOnly"_ns, deletesOnly));
   MOZ_TRY(stmt->BindInt64ByName("moved"_ns, OfflineOp::kMsgMoved));
   MOZ_TRY(stmt->BindInt64ByName("flagsChanged"_ns, OfflineOp::kFlagsChanged));
-  MOZ_TRY(stmt->BindInt64ByName("deleted"_ns, OfflineOp::kMsgMarkedDeleted));
+  MOZ_TRY(stmt->BindInt64ByName("deleted"_ns, kImapMsgDeletedFlag));
   nsTArray<nsMsgKey> result;
   bool more;
   while (true) {

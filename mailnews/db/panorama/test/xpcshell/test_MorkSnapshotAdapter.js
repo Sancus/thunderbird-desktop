@@ -36,7 +36,7 @@ add_setup(async function setupGenuineLegacySource() {
   const profile = new ProfileCreator(do_get_profile());
   const server = await profile.addLocalServer();
   const work = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
+    do_get_tempdir().path,
     "mork-snapshot-source-"
   );
   registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
@@ -374,14 +374,33 @@ add_task(async function test_rejectsParentMappingThatDiffersFromSource() {
 add_task(async function test_journalPersistsExpectedDatabaseIdentity() {
   const { input, source } = await snapshotInput();
   const directory = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
+    do_get_tempdir().path,
     "mork-snapshot-plan-"
   );
   registerCleanupFunction(() => IOUtils.remove(directory, { recursive: true }));
   const path = PathUtils.join(directory, "journal.json");
+  const profile = do_get_profile();
+  profile.normalize();
+  const work = new FileUtils.File(directory);
+  work.normalize();
+  const backupPath = PathUtils.join(directory, "backup");
+  Assert.ok(
+    !profile.equals(work) && !profile.contains(work),
+    "Journal work is outside the actual selected profile"
+  );
+  const summary = originalFolder.summaryFile.clone();
+  summary.normalize();
+  Assert.ok(
+    profile.contains(summary),
+    "The genuine source remains inside the selected profile"
+  );
+  Assert.ok(
+    !new FileUtils.File(backupPath).contains(new FileUtils.File(path)),
+    "Backup and journal are independent siblings"
+  );
   let journal = await MigrationJournal.create(path, {
     profilePath: do_get_profile().path,
-    backupPath: PathUtils.join(directory, "backup"),
+    backupPath,
     mailPaths: [],
     sources: [
       {

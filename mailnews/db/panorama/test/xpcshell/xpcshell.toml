@@ -117,6 +117,8 @@ skip-if = ["os == 'win'"]
 ["test_MorkFolderCacheImport.js"]
 support-files = ["../../../../base/test/unit/data/panacea.dat"]
 
+["test_MorkSnapshotAdapter.js"]
+
 ["test_MorkSummaryReader.js"]
 
 ["test_move.js"]

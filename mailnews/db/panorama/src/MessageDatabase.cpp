@@ -3186,6 +3186,7 @@ nsresult MessageDatabase::MessageExists(nsMsgKey key, bool& exists) {
 }
 
 NS_IMETHODIMP MessageDatabase::RemoveMessage(nsMsgKey key) {
+  NS_ENSURE_TRUE(key != nsMsgKey_None, NS_ERROR_INVALID_ARG);
   return RemoveMessageInternal(key, 0, nullptr,
                                MessageRemovalAccounting::LocalMessageSize);
 }

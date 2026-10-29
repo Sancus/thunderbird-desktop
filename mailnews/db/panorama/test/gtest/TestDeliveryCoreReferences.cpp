@@ -9129,4 +9129,59 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_TRUE(exists);
 }
 
+TEST_F(DeliveryCoreReferences,
+       GenericRemovalRejectsNoneAndPreservesCallerWork) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("generic-none-control"_ns, {}, key));
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 19));
+  uint32_t removed = 0;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char kind, const CapturedMessage &before,
+                         const CapturedMessage &, Message *, bool) {
+    EXPECT_EQ('R', kind);
+    ++removed;
+    EXPECT_EQ(key, before.id);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    int64_t metric = 0;
+    ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+    EXPECT_EQ(19, metric);
+  };
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db.RemoveMessage(nsMsgKey_None));
+  EXPECT_EQ(0u, removed);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 73));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db.RemoveMessage(nsMsgKey_None));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.RemoveMessage(key));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t metric = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(73, metric);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  EXPECT_EQ(0u, removed);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  // The generic valid-key path still removes without folder-byte accounting.
+  ASSERT_EQ(NS_OK, db.RemoveMessage(key));
+  EXPECT_EQ(1u, removed);
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(19, metric);
+}
+
 }  // namespace mozilla::mailnews

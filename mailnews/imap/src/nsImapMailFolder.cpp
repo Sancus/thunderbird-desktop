@@ -966,7 +966,10 @@ nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
   if (slash > 0) {
     nsAutoCString uri(mURI);
     uri.Append('/');
-    uri.Append(Substring(folderName, 0, slash));
+    nsAutoCString parentPath;
+    MOZ_TRY(MsgEscapeString(Substring(folderName, 0, slash),
+                            nsINetUtil::ESCAPE_URL_PATH, parentPath));
+    uri.Append(parentPath);
     nsCOMPtr<nsIMsgFolder> parent;
     nsresult rv = GetChildWithURI(uri, true, false, getter_AddRefs(parent));
     NS_ENSURE_SUCCESS(rv, rv);

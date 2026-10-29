@@ -444,10 +444,12 @@ class nsImapProtocol : public nsIImapProtocol,
   // Main-thread URL setup stages this proxy under mMonitor. The IMAP thread
   // takes it when starting the URL, without touching the previous URL's sink.
   RefPtr<ImapMailFolderSinkProxy> m_pendingMailFolderSink;
+  RefPtr<ImapServerSinkProxy> m_pendingServerSink;
   // These folder sinks are accessed only by the IMAP thread until it stops.
   RefPtr<ImapMailFolderSinkProxy> m_imapMailFolderSink;
   RefPtr<ImapMailFolderSinkProxy> m_imapMailFolderSinkSelected;
   RefPtr<ImapMessageSinkProxy> m_imapMessageSink;
+  // These server proxies are accessed only by the IMAP thread until it stops.
   RefPtr<ImapServerSinkProxy> m_imapServerSink;
   RefPtr<ImapServerSinkProxy> m_imapServerSinkLatest;
   RefPtr<ImapProtocolSinkProxy> m_imapProtocolSink;

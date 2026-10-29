@@ -43,6 +43,8 @@
 #include "nsIPromptService.h"
 #include "mozilla/Utf8.h"
 #include "mozilla/LoadInfo.h"
+#include "mozilla/ResultExtensions.h"
+#include "nsINetUtil.h"
 #include "nsNSSComponent.h"
 
 #ifdef MOZ_PANORAMA
@@ -1095,7 +1097,14 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
     folderName.Cut(0, leafPos + 1);  // get rid of the parent name
     haveParent = true;
     parentUri.Append('/');
-    parentUri.Append(parentName);
+    nsAutoCString parentPath(parentName);
+#ifdef MOZ_PANORAMA
+    if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      MOZ_TRY(
+          MsgEscapeString(parentName, nsINetUtil::ESCAPE_URL_PATH, parentPath));
+    }
+#endif
+    parentUri.Append(parentPath);
   }
   if (folderPath.LowerCaseEqualsLiteral("inbox") &&
       hierarchyDelimiter == kOnlineHierarchySeparatorNil) {
@@ -1107,10 +1116,17 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
 
   // nsCString possibleName(aSpec->allocatedPathName);
   uri.Append('/');
-  uri.Append(dupFolderPath);
+  nsAutoCString uriPath(dupFolderPath);
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(
+        MsgEscapeString(dupFolderPath, nsINetUtil::ESCAPE_URL_PATH, uriPath));
+  }
+#endif
+  uri.Append(uriPath);
   bool caseInsensitive = dupFolderPath.LowerCaseEqualsLiteral("inbox");
-  rootFolder->GetChildWithURI(uri, true, caseInsensitive,
-                              getter_AddRefs(child));
+  MOZ_TRY(rootFolder->GetChildWithURI(uri, true, caseInsensitive,
+                                      getter_AddRefs(child)));
   // if we couldn't find this folder by URI, tell the imap code it's a new
   // folder to us
   *aNewFolder = !child;
@@ -1121,23 +1137,24 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
       nsCOMPtr<nsIMsgFolder> parent;
       bool parentIsNew;
       caseInsensitive = parentName.LowerCaseEqualsLiteral("inbox");
-      rootFolder->GetChildWithURI(parentUri, true, caseInsensitive,
-                                  getter_AddRefs(parent));
+      MOZ_TRY(rootFolder->GetChildWithURI(parentUri, true, caseInsensitive,
+                                          getter_AddRefs(parent)));
       if (!parent /* || parentFolder->GetFolderNeedsAdded()*/) {
-        PossibleImapMailbox(
+        MOZ_TRY(PossibleImapMailbox(
             parentName, hierarchyDelimiter,
             kNoselect |       // be defensive
                 ((boxFlags &  // only inherit certain flags from the child
                   (kPublicMailbox | kOtherUsersMailbox | kPersonalMailbox))),
-            &parentIsNew);
+            &parentIsNew));
       }
     }
     rv = hostFolder->CreateClientSubfolderInfo(
         dupFolderPath, hierarchyDelimiter, boxFlags, false);
     NS_ENSURE_SUCCESS(rv, rv);
     caseInsensitive = dupFolderPath.LowerCaseEqualsLiteral("inbox");
-    rootFolder->GetChildWithURI(uri, true, caseInsensitive,
-                                getter_AddRefs(child));
+    MOZ_TRY(rootFolder->GetChildWithURI(uri, true, caseInsensitive,
+                                        getter_AddRefs(child)));
+    NS_ENSURE_TRUE(child, NS_ERROR_NOT_AVAILABLE);
   }
   if (child) {
     nsCOMPtr<nsIMsgImapMailFolder> imapFolder = do_QueryInterface(child);

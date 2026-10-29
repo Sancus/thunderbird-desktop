@@ -790,12 +790,11 @@ nsresult nsImapProtocol::SetupSinkProxy() {
       return NS_ERROR_ILLEGAL_VALUE;
     }
   }
-  if (!m_imapServerSink) {
+  if (!m_pendingServerSink) {
     nsCOMPtr<nsIImapServerSink> aImapServerSink;
     res = m_runningUrl->GetImapServerSink(getter_AddRefs(aImapServerSink));
     if (aImapServerSink) {
-      m_imapServerSink = new ImapServerSinkProxy(aImapServerSink);
-      m_imapServerSinkLatest = m_imapServerSink;
+      m_pendingServerSink = new ImapServerSinkProxy(aImapServerSink);
     } else {
       return NS_ERROR_ILLEGAL_VALUE;
     }
@@ -834,6 +833,7 @@ nsresult nsImapProtocol::SetupWithUrl(nsIURI* aURL, nsISupports* aConsumer) {
   ReentrantMonitorAutoEnter mon(mMonitor);
   m_urlInProgress = true;
   m_pendingMailFolderSink = nullptr;
+  m_pendingServerSink = nullptr;
 
   if (aURL) {
     nsCOMPtr<nsIImapUrl> imapURL = do_QueryInterface(aURL, &rv);
@@ -1138,6 +1138,7 @@ void nsImapProtocol::ReleaseUrlState(bool rerunning) {
       // a reference for a little longer. See bug 1324893 and bug 391259.
       saveFolderSink = m_imapMailFolderSink;
       m_pendingMailFolderSink = nullptr;
+      m_pendingServerSink = nullptr;
 
       m_runningUrl =
           nullptr;  // force us to release our last reference on the url
@@ -1209,6 +1210,7 @@ bool nsImapProtocol::RunImapThreadMainLoop() {
   {
     ReentrantMonitorAutoEnter mon(mMonitor);
     m_pendingMailFolderSink = nullptr;
+    m_pendingServerSink = nullptr;
   }
 
   return true;
@@ -1844,6 +1846,8 @@ bool nsImapProtocol::ProcessCurrentURL() {
   {
     ReentrantMonitorAutoEnter mon(mMonitor);
     m_imapMailFolderSink = std::move(m_pendingMailFolderSink);
+    m_imapServerSink = std::move(m_pendingServerSink);
+    m_imapServerSinkLatest = m_imapServerSink;
   }
 
   if (m_retryUrlOnError) {
@@ -1876,6 +1880,8 @@ bool nsImapProtocol::ProcessCurrentURL() {
     NS_ENSURE_SUCCESS(rv, false);
     ReentrantMonitorAutoEnter mon(mMonitor);
     m_imapMailFolderSink = std::move(m_pendingMailFolderSink);
+    m_imapServerSink = std::move(m_pendingServerSink);
+    m_imapServerSinkLatest = m_imapServerSink;
   }
 
   // Reinitialize the parser
@@ -2204,6 +2210,23 @@ bool nsImapProtocol::ProcessCurrentURL() {
 }
 
 bool nsImapProtocol::RetryUrl() {
+  // A dead cached transport can retry before ProcessCurrentURL claims this URL.
+  bool claimedServer = false;
+  {
+    ReentrantMonitorAutoEnter mon(mMonitor);
+    if (m_pendingServerSink) {
+      m_imapServerSink = std::move(m_pendingServerSink);
+      m_imapServerSinkLatest = m_imapServerSink;
+      claimedServer = true;
+    }
+    if (m_pendingMailFolderSink) {
+      m_imapMailFolderSink = std::move(m_pendingMailFolderSink);
+    }
+  }
+  if (claimedServer) {
+    MOZ_LOG(IMAP, LogLevel::Debug,
+            ("RetryUrl: claimed staged server proxy before URL dispatch"));
+  }
   nsCOMPtr<nsIImapUrl> kungFuGripImapUrl = m_runningUrl;
   nsCOMPtr<nsIImapMockChannel> saveMockChannel;
 
@@ -5331,12 +5354,19 @@ void nsImapProtocol::DiscoverMailboxSpec(nsImapMailboxSpec* adoptedBoxSpec) {
           adoptedBoxSpec->mBoxFlags |= kNewlyCreatedFolder;
 
         if (m_imapServerSink) {
-          bool newFolder;
-
-          m_imapServerSink->PossibleImapMailbox(
+          bool newFolder = false;
+          nsresult rv = m_imapServerSink->PossibleImapMailbox(
               adoptedBoxSpec->mAllocatedPathName,
               adoptedBoxSpec->mHierarchySeparator, adoptedBoxSpec->mBoxFlags,
               &newFolder);
+          MOZ_LOG(IMAP, LogLevel::Debug,
+                  ("DiscoverMailboxSpec %s result=0x%" PRIx32 " new=%d",
+                   adoptedBoxSpec->mAllocatedPathName.get(),
+                   static_cast<uint32_t>(rv), newFolder));
+          if (NS_FAILED(rv)) {
+            if (NS_SUCCEEDED(m_mailboxUpdateResult)) m_mailboxUpdateResult = rv;
+            break;
+          }
           // if it's a new folder to the server sink, setting discovery status
           // to eContinueNew will cause us to get the ACL for the new folder.
           if (newFolder) SetMailboxDiscoveryStatus(eContinueNew);

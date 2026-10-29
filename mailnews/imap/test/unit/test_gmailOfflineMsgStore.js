@@ -20,6 +20,10 @@ var { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 
+var { TestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/TestUtils.sys.mjs"
+);
+
 // Messages to load must have CRLF line endings, that is Windows style.
 
 var gMessage1 = "bugmail10"; // message file used as the test message for Inbox and fooFolder.
@@ -54,7 +58,28 @@ add_setup(async function () {
   Services.prefs.setBoolPref("mail.server.server1.offline_download", true);
   Services.prefs.setBoolPref("mail.biff.alert.show_preview", false);
 
+  const storeContract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Services.prefs.setCharPref(
+    "mail.server.default.storeContractID",
+    storeContract
+  );
   setupIMAPPump("GMail");
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false)
+  );
+  Assert.equal(
+    IMAPPump.incomingServer.msgStore.storeType,
+    {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[storeContract]
+  );
 
   IMAPPump.mailbox.specialUseFlag = "\\Inbox";
   IMAPPump.mailbox.subscribed = true;
@@ -81,6 +106,30 @@ add_setup(async function () {
   message.xGmThrid = gXGmThrid1;
   message.xGmLabels = gXGmLabels11; // With labels excluding "//INBOX".
   IMAPPump.mailbox.addMessage(message);
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const gmail = IMAPPump.incomingServer.rootFolder.getChildNamed("[Gmail]");
+  const allMail = gmail
+    .getChildNamed("All Mail")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  Assert.equal(allMail.parent, gmail);
+  Assert.equal(allMail.onlineName, "[Gmail]/All Mail");
+  Assert.equal(
+    allMail.msgDatabase.dBFolderInfo.mailboxName,
+    "[Gmail]/All Mail"
+  );
+  Assert.equal(
+    decodeURIComponent(Services.io.newURI(allMail.URI).pathQueryRef),
+    "/[Gmail]/All Mail"
+  );
+  IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
   const listener = new PromiseTestUtils.PromiseUrlListener();
   IMAPPump.inbox.updateFolderWithListener(null, listener);
   await listener.promise;
@@ -96,6 +145,72 @@ add_task(async function streamMessageInbox() {
   await streamLister.promise;
   // Record initial Size of Inbox.
   gImapInboxOfflineStoreSizeInitial = IMAPPump.inbox.filePath.fileSize;
+});
+
+add_task(async function test_createFolderAfterUrlCompletion() {
+  const root = IMAPPump.incomingServer.rootFolder;
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  root
+    .QueryInterface(Ci.nsIMsgImapMailFolder)
+    .createSubfolderWithListener("AfterStream", listener);
+  await listener.promise;
+  const child = root.getChildNamed("AfterStream");
+  Assert.ok(child, "A successful CREATE/LIST materializes its actual child");
+  Assert.equal(child.parent, root);
+  Assert.equal(
+    child.QueryInterface(Ci.nsIMsgImapMailFolder).onlineName,
+    "AfterStream"
+  );
+  Assert.equal(child.getTotalMessages(false), 0);
+  Assert.deepEqual(IMAPPump.daemon.getMailbox("AfterStream")._messages, []);
+});
+
+add_task(async function test_retryAfterServerClosesCachedConnection() {
+  await TestUtils.waitForCondition(
+    () => IMAPPump.incomingServer.allConnectionsIdle
+  );
+  const readers = IMAPPump.server._readers.filter(reader => reader._isRunning);
+  Assert.equal(readers.length, 1);
+  const connectionCount = IMAPPump.server._readers.length;
+  const header = IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(gMsgId1);
+  const key = header.messageKey;
+  const token = header.storeToken;
+  const epoch = IMAPPump.inbox.msgDatabase.dBFolderInfo.imapUidValidity;
+  const message = IMAPPump.mailbox._messages[0];
+  const raw = message.getText();
+  const uid = message.uid;
+  await readers[0]._realCloseSocket();
+  Assert.equal(readers[0]._transport, null);
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  let starts = 0;
+  let stops = 0;
+  MailServices.imap.selectFolder(
+    IMAPPump.inbox,
+    {
+      OnStartRunningUrl(url) {
+        starts++;
+        listener.OnStartRunningUrl(url);
+      },
+      OnStopRunningUrl(url, status) {
+        stops++;
+        listener.OnStopRunningUrl(url, status);
+      },
+    },
+    null
+  );
+  await listener.promise;
+  Assert.equal(starts, 1);
+  Assert.equal(stops, 1);
+  Assert.equal(IMAPPump.server._readers.length, connectionCount + 1);
+  const after = IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(gMsgId1);
+  Assert.equal(after.messageKey, key);
+  Assert.equal(after.storeToken, token);
+  Assert.equal(IMAPPump.inbox.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+  Assert.equal(IMAPPump.mailbox._messages[0].getText(), raw);
+  Assert.deepEqual(
+    IMAPPump.mailbox._messages.map(item => item.uid),
+    [uid]
+  );
 });
 
 add_task(async function createAndUpdate() {

@@ -259,6 +259,13 @@ add_task(
           accountBefore.folders[2]
         );
         browser.test.assertEq(15, messagesBefore.messages.length);
+        await browser.messages.archive([]);
+        browser.test.assertEq(
+          15,
+          (await browser.messages.list(accountBefore.folders[2])).messages
+            .length,
+          "An empty archive request leaves the source untouched"
+        );
         await browser.messages.archive(messagesBefore.messages.map(m => m.id));
 
         const accountAfter = await browser.accounts.get(accountId);
@@ -316,5 +323,96 @@ add_task(
     extension.sendMessage(account2.key);
     await extension.awaitFinish("finished");
     await extension.unload();
+  }
+);
+
+add_task(
+  {
+    skip_if: () => IS_IMAP || IS_NNTP || IS_EWS,
+  },
+  async function test_archive_while_another_operation_pending() {
+    const { MessageArchiver } = ChromeUtils.importESModule(
+      "resource:///modules/MessageArchiver.sys.mjs"
+    );
+    const archiveAccount = await createAccount();
+    addIdentity(archiveAccount);
+    const source = await createSubfolder(
+      archiveAccount.incomingServer.rootFolder,
+      "pendingArchive"
+    );
+    await createMessages(source, 1);
+    const entered = Promise.withResolvers();
+    let copyListener;
+    const customAction = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgFilterCustomAction"]),
+      id: "pending-archive@mochi.test#wait",
+      name: "Wait for the archive error check",
+      allowDuplicates: false,
+      isAsync: true,
+      needsBody: false,
+      isValidForType() {
+        return true;
+      },
+      validateActionValue() {
+        return "";
+      },
+      applyAction(headers, value, listener) {
+        copyListener = listener;
+        entered.resolve();
+      },
+    };
+    MailServices.filters.addCustomAction(customAction);
+    const list = source.getFilterList(null);
+    const filter = list.createFilter("Pending archive");
+    filter.enabled = true;
+    filter.filterType = Ci.nsMsgFilterType.Archive;
+    const term = filter.createTerm();
+    term.matchAll = true;
+    filter.appendTerm(term);
+    const action = filter.createAction();
+    action.type = Ci.nsMsgFilterAction.Custom;
+    action.customId = customAction.id;
+    filter.appendAction(action);
+    list.insertFilterAt(0, filter);
+    const completed = Promise.withResolvers();
+    const archiver = new MessageArchiver();
+    archiver.oncomplete = completed.resolve;
+    const extension = ExtensionTestUtils.loadExtension({
+      manifest: {
+        permissions: ["accountsRead", "messagesRead", "messagesMove"],
+      },
+      background: async () => {
+        const [folder] = await browser.folders.query({
+          name: "pendingArchive",
+        });
+        const [message] = (await browser.messages.list(folder.id)).messages;
+        await browser.test.assertRejects(
+          browser.messages.archive([message.id]),
+          /Error archiving message: Can only have one MessageArchiver running at once/,
+          "A pending archive rejects a second request instead of leaving it pending"
+        );
+        browser.test.assertEq(
+          folder.id,
+          (await browser.messages.get(message.id)).folder.id,
+          "The rejected operation preserves its source"
+        );
+        browser.test.notifyPass("pending-archive");
+      },
+    });
+    try {
+      await archiver.archiveMessages([...source.messages]);
+      await entered.promise;
+      await extension.startup();
+      await extension.awaitFinish("pending-archive");
+    } finally {
+      if (copyListener) {
+        copyListener.onStopCopy(Cr.NS_OK);
+        copyListener = null;
+        await completed.promise;
+      }
+      list.removeFilter(filter);
+      await extension.unload();
+      cleanUpAccount(archiveAccount);
+    }
   }
 );

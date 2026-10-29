@@ -76,11 +76,11 @@ add_task(async function testImap() {
   account.incomingServer.QueryInterface(Ci.nsIImapIncomingServer);
 
   const rootFolder = account.incomingServer.rootFolder;
-  account.incomingServer.subscribeToFolder("sourceFolder1", true);
-
+  account.incomingServer.performExpand(null);
   const sourceFolder1 = await TestUtils.waitForCondition(() =>
-    rootFolder.getChildNamed("sourceFolder1")
+    rootFolder.subFolders.find(folder => folder.name == "sourceFolder1")
   );
+  account.incomingServer.subscribeToFolder("sourceFolder1", true);
   await imapServer.addMessages(
     sourceFolder1,
     [synMessage1, synMessage2, synMessage3],
@@ -189,3 +189,152 @@ async function subtestInboxStructure(account, imapServer) {
     "the archived inbox folder should contain the archived message"
   );
 }
+
+add_task(async function testFilteredEmptyBatch() {
+  const server = MailServices.accounts.localFoldersServer;
+  const account = MailServices.accounts.findAccountForServer(server);
+  const root = server.rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const source = root
+    .createLocalSubfolder("filteredArchiveBatch")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const skipped = source.addMessage(
+    generator.makeMessage({ date: new Date(2001, 0, 1) }).toMessageString()
+  );
+  const archived = source.addMessage(
+    generator.makeMessage({ date: new Date(2002, 0, 1) }).toMessageString()
+  );
+  const skippedKey = skipped.messageKey;
+  const archivedId = archived.messageId;
+  source.orProcessingFlags(skippedKey, Ci.nsMsgProcessingFlags.FilterToMove);
+  const identity = account.defaultIdentity;
+  const oldGranularity = identity.archiveGranularity;
+  identity.archiveGranularity = Ci.nsIMsgIdentity.perYearArchiveFolders;
+  const completed = Promise.withResolvers();
+  const archiver = new MessageArchiver();
+  archiver.oncomplete = completed.resolve;
+  try {
+    await archiver.archiveMessages([skipped, archived]);
+    await completed.promise;
+    const archives = root.getChildNamed("Archives");
+    Assert.ok(!archives.containsChildNamed("2001"), "Skip the filtered batch");
+    const destination = archives.getChildNamed("2002");
+    Assert.equal(destination.getTotalMessages(false), 1);
+    Assert.equal([...destination.messages][0].messageId, archivedId);
+    Assert.deepEqual(
+      [...source.messages].map(header => header.messageKey),
+      [skippedKey],
+      "The pending filter move is not archived again"
+    );
+  } finally {
+    source.andProcessingFlags(
+      skippedKey,
+      ~Ci.nsMsgProcessingFlags.FilterToMove
+    );
+    identity.archiveGranularity = oldGranularity;
+  }
+});
+
+add_task(async function testCompletionCanStartNextArchive() {
+  const server = MailServices.accounts.localFoldersServer;
+  const account = MailServices.accounts.findAccountForServer(server);
+  const root = server.rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const identity = account.defaultIdentity;
+  const oldGranularity = identity.archiveGranularity;
+  identity.archiveGranularity = Ci.nsIMsgIdentity.perYearArchiveFolders;
+  const source = root
+    .createLocalSubfolder("reentrantArchiveCompletion")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const first = source.addMessage(
+    generator.makeMessage({ date: new Date(2003, 0, 1) }).toMessageString()
+  );
+  const second = source.addMessage(
+    generator.makeMessage({ date: new Date(2004, 0, 1) }).toMessageString()
+  );
+  const firstId = first.messageId;
+  const secondId = second.messageId;
+  const completed = Promise.withResolvers();
+  let completions = 0;
+  const nextArchiver = new MessageArchiver();
+  nextArchiver.oncomplete = () => {
+    completions++;
+    completed.resolve();
+  };
+  const archiver = new MessageArchiver();
+  archiver.oncomplete = () => {
+    completions++;
+    nextArchiver.archiveMessages([second]).catch(completed.reject);
+  };
+  try {
+    await archiver.archiveMessages([first]);
+    await completed.promise;
+    Assert.equal(completions, 2, "Each archive completes once");
+    Assert.equal(source.getTotalMessages(false), 0);
+    const archives = root.getChildNamed("Archives");
+    Assert.equal(
+      [...archives.getChildNamed("2003").messages][0].messageId,
+      firstId
+    );
+    Assert.equal(
+      [...archives.getChildNamed("2004").messages][0].messageId,
+      secondId
+    );
+  } finally {
+    identity.archiveGranularity = oldGranularity;
+  }
+});
+
+add_task(async function testStartupFailureAllowsNextArchive() {
+  const { sinon } = ChromeUtils.importESModule(
+    "resource://testing-common/Sinon.sys.mjs"
+  );
+  const { MailUtils } = ChromeUtils.importESModule(
+    "resource:///modules/MailUtils.sys.mjs"
+  );
+  const root =
+    MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
+      Ci.nsIMsgLocalMailFolder
+    );
+  const source = root
+    .createLocalSubfolder("archiveStartupFailure")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const message = source.addMessage(generator.makeMessage().toMessageString());
+  const messageKey = message.messageKey;
+  const messageId = message.messageId;
+  const identityStub = sinon.stub(MailUtils, "getIdentityForHeader").returns([
+    {
+      archiveEnabled: true,
+      async getOrCreateArchivesFolderAsync() {
+        throw new Error("Archive folder creation failed");
+      },
+    },
+  ]);
+  let completions = 0;
+  const failedArchiver = new MessageArchiver();
+  failedArchiver.oncomplete = () => completions++;
+  try {
+    await Assert.rejects(
+      failedArchiver.archiveMessages([message]),
+      /Archive folder creation failed/
+    );
+    Assert.equal(
+      completions,
+      0,
+      "Startup failure is not successful completion"
+    );
+    Assert.ok(source.msgDatabase.containsKey(messageKey));
+    Assert.equal(source.GetMessageHeader(messageKey).messageId, messageId);
+  } finally {
+    identityStub.restore();
+  }
+
+  const completed = Promise.withResolvers();
+  const archiver = new MessageArchiver();
+  archiver.oncomplete = () => {
+    completions++;
+    completed.resolve();
+  };
+  await archiver.archiveMessages([message]);
+  await completed.promise;
+  Assert.equal(completions, 1);
+  Assert.equal(source.getTotalMessages(false), 0);
+});

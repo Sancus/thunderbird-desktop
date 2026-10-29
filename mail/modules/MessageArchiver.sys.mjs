@@ -89,85 +89,91 @@ MessageArchiver.prototype = {
     }
     gIsArchiving = true;
 
-    for (let i = 0; i < aMsgHdrs.length; i++) {
-      const msgHdr = aMsgHdrs[i];
+    try {
+      for (let i = 0; i < aMsgHdrs.length; i++) {
+        const msgHdr = aMsgHdrs[i];
 
-      // Convert date to JS date object.
-      const msgDate = new Date(msgHdr.date / 1000);
-      const msgYear = msgDate.getFullYear().toString();
-      const monthFolderName =
-        msgYear + "-" + (msgDate.getMonth() + 1).toString().padStart(2, "0");
+        // Convert date to JS date object.
+        const msgDate = new Date(msgHdr.date / 1000);
+        const msgYear = msgDate.getFullYear().toString();
+        const monthFolderName =
+          msgYear + "-" + (msgDate.getMonth() + 1).toString().padStart(2, "0");
 
-      let archiveFolder;
-      let archiveGranularity;
-      let archiveKeepFolderStructure;
-      let archiveRecreateInbox;
+        let archiveFolder;
+        let archiveGranularity;
+        let archiveKeepFolderStructure;
+        let archiveRecreateInbox;
 
-      const [identity] = lazy.MailUtils.getIdentityForHeader(msgHdr);
-      if (!identity || msgHdr.folder.server.type == "rss") {
-        // If no identity, or a server (RSS) which doesn't have an identity
-        // and doesn't want the default unrelated identity value, figure
-        // this out based on the default identity prefs.
-        const enabled = Services.prefs.getBoolPref(
-          "mail.identity.default.archive_enabled"
-        );
-        if (!enabled) {
-          continue;
+        const [identity] = lazy.MailUtils.getIdentityForHeader(msgHdr);
+        if (!identity || msgHdr.folder.server.type == "rss") {
+          // If no identity, or a server (RSS) which doesn't have an identity
+          // and doesn't want the default unrelated identity value, figure
+          // this out based on the default identity prefs.
+          const enabled = Services.prefs.getBoolPref(
+            "mail.identity.default.archive_enabled"
+          );
+          if (!enabled) {
+            continue;
+          }
+
+          archiveFolder = msgHdr.folder.rootFolder.getChildNamed("Archives");
+          if (!archiveFolder) {
+            archiveFolder =
+              await msgHdr.folder.rootFolder.createSubfolderAsync("Archives");
+          }
+          archiveFolder.setFlag(Ci.nsMsgFolderFlags.Archive);
+          archiveGranularity = Services.prefs.getIntPref(
+            "mail.identity.default.archive_granularity"
+          );
+          archiveKeepFolderStructure = Services.prefs.getBoolPref(
+            "mail.identity.default.archive_keep_folder_structure"
+          );
+          archiveRecreateInbox = Services.prefs.getBoolPref(
+            "mail.identity.default.archive_recreate_inbox"
+          );
+        } else {
+          if (!identity.archiveEnabled) {
+            continue;
+          }
+
+          archiveFolder = await identity.getOrCreateArchivesFolderAsync();
+          archiveGranularity = identity.archiveGranularity;
+          archiveKeepFolderStructure = identity.archiveKeepFolderStructure;
+          archiveRecreateInbox = identity.archiveRecreateInbox;
         }
 
-        archiveFolder = msgHdr.folder.rootFolder.getChildNamed("Archives");
-        if (!archiveFolder) {
-          archiveFolder =
-            await msgHdr.folder.rootFolder.createSubfolderAsync("Archives");
-        }
-        archiveFolder.setFlag(Ci.nsMsgFolderFlags.Archive);
-        archiveGranularity = Services.prefs.getIntPref(
-          "mail.identity.default.archive_granularity"
-        );
-        archiveKeepFolderStructure = Services.prefs.getBoolPref(
-          "mail.identity.default.archive_keep_folder_structure"
-        );
-        archiveRecreateInbox = Services.prefs.getBoolPref(
-          "mail.identity.default.archive_recreate_inbox"
-        );
-      } else {
-        if (!identity.archiveEnabled) {
-          continue;
+        let copyBatchKey = msgHdr.folder.URI;
+        if (archiveGranularity >= Ci.nsIMsgIdentity.perYearArchiveFolders) {
+          copyBatchKey += "\0" + msgYear;
         }
 
-        archiveFolder = await identity.getOrCreateArchivesFolderAsync();
-        archiveGranularity = identity.archiveGranularity;
-        archiveKeepFolderStructure = identity.archiveKeepFolderStructure;
-        archiveRecreateInbox = identity.archiveRecreateInbox;
-      }
+        if (archiveGranularity >= Ci.nsIMsgIdentity.perMonthArchiveFolders) {
+          copyBatchKey += "\0" + monthFolderName;
+        }
 
-      let copyBatchKey = msgHdr.folder.URI;
-      if (archiveGranularity >= Ci.nsIMsgIdentity.perYearArchiveFolders) {
-        copyBatchKey += "\0" + msgYear;
-      }
+        if (archiveKeepFolderStructure) {
+          copyBatchKey += msgHdr.folder.URI;
+        }
 
-      if (archiveGranularity >= Ci.nsIMsgIdentity.perMonthArchiveFolders) {
-        copyBatchKey += "\0" + monthFolderName;
+        // Add a key to copyBatchKey
+        if (!(copyBatchKey in this._batches)) {
+          this._batches[copyBatchKey] = {
+            srcFolder: msgHdr.folder,
+            archiveFolder,
+            granularity: archiveGranularity,
+            keepFolderStructure: archiveKeepFolderStructure,
+            recreateInbox: archiveRecreateInbox,
+            yearFolderName: msgYear,
+            monthFolderName,
+            messages: [],
+          };
+        }
+        this._batches[copyBatchKey].messages.push(msgHdr);
       }
-
-      if (archiveKeepFolderStructure) {
-        copyBatchKey += msgHdr.folder.URI;
-      }
-
-      // Add a key to copyBatchKey
-      if (!(copyBatchKey in this._batches)) {
-        this._batches[copyBatchKey] = {
-          srcFolder: msgHdr.folder,
-          archiveFolder,
-          granularity: archiveGranularity,
-          keepFolderStructure: archiveKeepFolderStructure,
-          recreateInbox: archiveRecreateInbox,
-          yearFolderName: msgYear,
-          monthFolderName,
-          messages: [],
-        };
-      }
-      this._batches[copyBatchKey].messages.push(msgHdr);
+    } catch (ex) {
+      this._batches = {};
+      gIsArchiving = false;
+      throw ex;
     }
     MailServices.mfn.addListener(this, MailServices.mfn.folderAdded);
 
@@ -187,10 +193,10 @@ MessageArchiver.prototype = {
     this._batches = null;
     MailServices.mfn.removeListener(this);
 
+    gIsArchiving = false;
     if (typeof this.oncomplete == "function") {
       this.oncomplete();
     }
-    gIsArchiving = false;
   },
 
   filterBatch() {
@@ -241,6 +247,7 @@ MessageArchiver.prototype = {
     if (moveArray.length == 0) {
       // Continue processing.
       this.processNextBatch();
+      return;
     }
 
     let granularity = batch.granularity;

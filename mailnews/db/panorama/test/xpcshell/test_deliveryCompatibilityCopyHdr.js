@@ -262,3 +262,79 @@ add_task(function test_liveHeaderFolderRemainsReadableAfterDeletion() {
   Assert.equal(header.folder.URI, uri);
   Assert.ok(!db.containsKey(key));
 });
+
+add_task(function test_logicalRecipientsSurviveDraftAttachmentAndCopy() {
+  const source = root.createLocalSubfolder("logical-recipients-source");
+  const destination = root.createLocalSubfolder("logical-recipients-copy");
+  const db = source.msgDatabase;
+  const inputs = [
+    "",
+    "ASCII <ascii@mime.invalid>",
+    "Müller <unicode@mime.invalid>, 中文 <other@mime.invalid>",
+    '"=?UTF-8?Q?hello?=" <literal@mime.invalid>',
+  ];
+  for (const [index, recipients] of inputs.entries()) {
+    const draft = makeDraft(db, `recipients-${index}@mime.invalid`);
+    draft.recipients = recipients;
+    // Native header fields already contain logical UTF-8. An unrelated body
+    // charset must not reinterpret them or decode literal encoded words again.
+    draft.charset = "windows-1252";
+    const draftProperties = draft.properties;
+    Assert.equal(draft.mime2DecodedRecipients, recipients);
+    Assert.equal(draft.recipients, recipients);
+    Assert.deepEqual(draft.properties, draftProperties);
+    const header = db.attachHdr(draft, false);
+    Assert.strictEqual(header.folder, source);
+    Assert.equal(header.mime2DecodedRecipients, recipients);
+    Assert.equal(header.recipients, recipients);
+    Assert.equal(header.charset, "windows-1252");
+    const properties = header.properties;
+    Assert.equal(header.mime2DecodedRecipients, recipients);
+    Assert.deepEqual(header.properties, properties);
+    const copy = destination.msgDatabase.copyHdrFromExistingHdr(
+      0xffffffff,
+      header,
+      true
+    );
+    Assert.notEqual(copy.messageKey, header.messageKey);
+    Assert.strictEqual(copy.folder, destination);
+    Assert.equal(copy.recipients, recipients);
+    Assert.equal(copy.mime2DecodedRecipients, recipients);
+    Assert.equal(header.mime2DecodedRecipients, recipients);
+    Assert.strictEqual(header.folder, source);
+  }
+});
+
+add_task(function test_decodedRecipientsPropagateActualHeaderReadErrors() {
+  const connection = database.connectionForTests;
+  const row = connection.createStatement("SELECT 1 FROM messages WHERE id = 0");
+  try {
+    Assert.ok(
+      !row.executeStep(),
+      "The negative key has no physical message row"
+    );
+  } finally {
+    row.finalize();
+  }
+  // Use the actual public factory's missing-key input, not a stand-in header.
+  const missing = messageDB.getMessage(0);
+  Assert.throws(() => missing.recipients, /NS_ERROR_UNEXPECTED/);
+  Assert.throws(() => missing.mime2DecodedRecipients, /NS_ERROR_UNEXPECTED/);
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO unavailable_recipient_messages"
+  );
+  try {
+    Assert.throws(
+      () => missing.recipients,
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => missing.mime2DecodedRecipients,
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_recipient_messages RENAME TO messages"
+    );
+  }
+});

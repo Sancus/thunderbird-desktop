@@ -423,8 +423,8 @@ NS_IMETHODIMP DetachedMsgHdr::GetMime2DecodedSubject(
 
 NS_IMETHODIMP DetachedMsgHdr::GetMime2DecodedRecipients(
     nsAString& mime2DecodedRecipients) {
-  NS_WARNING(__PRETTY_FUNCTION__);
-  return NS_ERROR_NOT_IMPLEMENTED;
+  mime2DecodedRecipients.Assign(NS_ConvertUTF8toUTF16(mRaw.recipients));
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetCharset(nsACString& charset) {

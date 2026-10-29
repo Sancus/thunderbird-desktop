@@ -409,7 +409,10 @@ NS_IMETHODIMP Message::GetMime2DecodedSubject(nsAString& mime2DecodedSubject) {
 
 NS_IMETHODIMP Message::GetMime2DecodedRecipients(
     nsAString& mime2DecodedRecipients) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  nsAutoCString recipients;
+  MOZ_TRY(GetRecipients(recipients));
+  mime2DecodedRecipients.Assign(NS_ConvertUTF8toUTF16(recipients));
+  return NS_OK;
 }
 
 NS_IMETHODIMP Message::GetCharset(nsACString& charset) {

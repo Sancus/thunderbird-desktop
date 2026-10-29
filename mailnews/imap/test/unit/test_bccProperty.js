@@ -368,6 +368,156 @@ add_task(async function test_filterMetadataPrecedesPublication() {
   }
 });
 
+add_task(async function test_copyStreamUsesPhysicalSourceKeys() {
+  const target =
+    localAccountUtils.rootFolder.createLocalSubfolder("UidCopyTarget");
+  const texts = [
+    "From: copy@example.invalid\r\nMessage-ID: <copy-first@example.invalid>\r\n" +
+      "Subject: First copy\r\nX-Priority: 1\r\n\r\nFirst copy body.\r\n",
+    "From: copy@example.invalid\r\nMessage-ID: <copy-second@example.invalid>\r\n" +
+      "Subject: Second copy\r\nX-Priority: 5\r\n\r\nSecond copy body.\r\n",
+  ];
+  const messages = texts.map(
+    (text, i) =>
+      new ImapMessage("data:text/plain;base64," + btoa(text), 6105 + i, [])
+  );
+  messages[0].setFlag("\\Flagged");
+  messages[1].setFlag("\\Seen");
+  for (const message of messages) {
+    IMAPPump.mailbox.addMessage(message);
+  }
+  IMAPPump.mailbox.uidnext = 6107;
+  await updateInbox();
+  const headers = [
+    "copy-first@example.invalid",
+    "copy-second@example.invalid",
+  ].map(id => IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(id));
+  const sourceCount = IMAPPump.inbox.getTotalMessages(false);
+  for (let i = 0; i < headers.length; i++) {
+    Assert.ok(headers[i]);
+    if (panorama) {
+      Assert.notEqual(headers[i].messageKey, 6105 + i);
+      Assert.equal(headers[i].getUint32Property("uidOnServer"), 6105 + i);
+    } else {
+      Assert.equal(headers[i].messageKey, 6105 + i);
+    }
+  }
+  let stops = 0;
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStopCopy(status) {
+      Assert.equal(status, Cr.NS_OK);
+      stops++;
+    },
+  });
+  MailServices.copy.copyMessages(
+    IMAPPump.inbox,
+    headers,
+    target,
+    false,
+    listener,
+    null,
+    false
+  );
+  await listener.promise;
+  Assert.equal(stops, 1);
+  Assert.equal(target.msgStore.storeType, IMAPPump.inbox.msgStore.storeType);
+  Assert.equal(target.getTotalMessages(false), 2);
+  Assert.equal(IMAPPump.inbox.getTotalMessages(false), sourceCount);
+  for (let i = 0; i < headers.length; i++) {
+    const copied = target.msgDatabase.getMsgHdrForMessageID(
+      headers[i].messageId
+    );
+    Assert.ok(copied);
+    Assert.equal(
+      copied.priority,
+      i ? Ci.nsMsgPriority.lowest : Ci.nsMsgPriority.highest
+    );
+    Assert.equal(copied.isFlagged, !i);
+    Assert.equal(copied.isRead, !!i);
+    const body = new PromiseTestUtils.PromiseStreamListener();
+    const uri = target.getUriForMsg(copied);
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      body,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    Assert.ok(
+      (await body.promise).endsWith(
+        i ? "Second copy body.\r\n" : "First copy body.\r\n"
+      )
+    );
+    Assert.ok(IMAPPump.inbox.msgDatabase.containsKey(headers[i].messageKey));
+    Assert.equal(messages[i].getText(), texts[i]);
+    Assert.ok(!messages[i].flags.includes("\\Deleted"));
+  }
+});
+
+add_task(function test_copySinkErrorsAndUnknownIdentityFailClosed() {
+  const sink = IMAPPump.inbox.QueryInterface(Ci.nsIImapMailFolderSink);
+  const url = Services.io
+    .newURI(IMAPPump.incomingServer.rootFolder.URI + "/fetch>UID>/INBOX>6105")
+    .QueryInterface(Ci.nsIImapUrl);
+  let starts = 0,
+    ends = 0;
+  const consumer = {
+    QueryInterface: ChromeUtils.generateQI(["nsICopyMessageListener"]),
+    startMessage() {
+      starts++;
+      throw Components.Exception("Copy start refused", Cr.NS_ERROR_UNEXPECTED);
+    },
+    endMessage(key) {
+      ends++;
+      Assert.equal(key, 6105, "Mork retains its UID-as-key callback");
+      throw Components.Exception("Copy end refused", Cr.NS_ERROR_UNEXPECTED);
+    },
+  };
+  // Main-thread boundary only: raw JS is not a threadsafe transport copy state.
+  url.copyState = consumer;
+  Assert.throws(
+    () => sink.StartMessage(url),
+    error => error.result == Cr.NS_ERROR_UNEXPECTED
+  );
+  Assert.equal(starts, 1);
+  Assert.throws(
+    () => sink.EndMessage(url, 6105),
+    error =>
+      error.result ==
+      (panorama ? Cr.NS_ERROR_NOT_AVAILABLE : Cr.NS_ERROR_UNEXPECTED)
+  );
+  Assert.equal(ends, panorama ? 0 : 1);
+  const header = IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(
+    "copy-first@example.invalid"
+  );
+  Assert.ok(IMAPPump.inbox.msgDatabase.containsKey(header.messageKey));
+  if (panorama) {
+    const target = localAccountUtils.rootFolder.getChildNamed("UidCopyTarget");
+    const foreign = target.msgDatabase.getMsgHdrForMessageID(header.messageId);
+    Assert.notEqual(foreign.messageKey, header.messageKey);
+    const stream = new PromiseTestUtils.PromiseStreamListener();
+    const service = MailServices.messageServiceFromURI(
+      IMAPPump.inbox.getUriForMsg(header)
+    );
+    Assert.throws(
+      () =>
+        service.CopyMessages(
+          [foreign.messageKey],
+          IMAPPump.inbox,
+          stream,
+          false,
+          null,
+          null
+        ),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.ok(target.msgDatabase.containsKey(foreign.messageKey));
+    Assert.ok(IMAPPump.inbox.msgDatabase.containsKey(header.messageKey));
+  }
+});
+
 if (panorama) {
   const deleteText =
     "From: sender@example.invalid\r\nMessage-ID: <delete-target@example.invalid>\r\n" +

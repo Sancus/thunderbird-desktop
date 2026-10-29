@@ -6114,11 +6114,11 @@ nsImapMailFolder::StartMessage(nsIMsgMailNewsUrl* aUrl) {
   nsCOMPtr<nsISupports> copyState;
   NS_ENSURE_TRUE(imapUrl, NS_ERROR_FAILURE);
 
-  imapUrl->GetCopyState(getter_AddRefs(copyState));
+  MOZ_TRY(imapUrl->GetCopyState(getter_AddRefs(copyState)));
   if (copyState) {
     nsCOMPtr<nsICopyMessageListener> listener = do_QueryInterface(copyState);
     if (listener) {
-      listener->StartMessage();
+      return listener->StartMessage();
     }
   }
   return NS_OK;
@@ -6130,11 +6130,47 @@ nsImapMailFolder::EndMessage(nsIMsgMailNewsUrl* aUrl, ImapUid uidOfMessage) {
   nsCOMPtr<nsISupports> copyState;
   NS_ENSURE_TRUE(imapUrl, NS_ERROR_FAILURE);
 
-  imapUrl->GetCopyState(getter_AddRefs(copyState));
+  MOZ_TRY(imapUrl->GetCopyState(getter_AddRefs(copyState)));
   if (copyState) {
     nsCOMPtr<nsICopyMessageListener> listener = do_QueryInterface(copyState);
     if (listener) {
-      listener->EndMessage(uidOfMessage);
+      nsMsgKey key = uidOfMessage;
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup()) {
+        const auto& captured =
+            static_cast<nsImapUrl*>(imapUrl.get())->CapturedCopyTargets();
+        NS_ENSURE_TRUE(captured, NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIMsgFolder> source;
+        MOZ_TRY(aUrl->GetFolder(getter_AddRefs(source)));
+        NS_ENSURE_STATE(source);
+        uint64_t folderId, sourceId;
+        MOZ_TRY(GetId(&folderId));
+        MOZ_TRY(source->GetId(&sourceId));
+        NS_ENSURE_TRUE(folderId == captured->folderId && sourceId == folderId,
+                       NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(GetDatabase());
+        nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+        NS_ENSURE_STATE(db);
+        nsCOMPtr<nsIDBFolderInfo> info;
+        MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+        NS_ENSURE_STATE(info);
+        uint32_t epoch;
+        MOZ_TRY(info->GetImapUidValidity(&epoch));
+        NS_ENSURE_TRUE(epoch == captured->epoch && epoch,
+                       NS_ERROR_NOT_AVAILABLE);
+        const nsImapUrl::CopyTarget* target = nullptr;
+        for (const auto& item : captured->messages) {
+          if (item.uid == uidOfMessage) {
+            target = &item;
+            break;
+          }
+        }
+        NS_ENSURE_TRUE(target, NS_ERROR_NOT_AVAILABLE);
+        key = MOZ_TRY(MsgKeyFromUid(db, uidOfMessage));
+        NS_ENSURE_TRUE(key == target->key, NS_ERROR_NOT_AVAILABLE);
+      }
+#endif
+      return listener->EndMessage(key);
     }
   }
   return NS_OK;

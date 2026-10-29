@@ -925,6 +925,35 @@ uint32_t nsImapUrl::ExpectedUidValidity() {
   return m_expectedUidValidity;
 }
 
+nsresult nsImapUrl::CaptureCopyTargets(nsIMsgFolder* folder,
+                                       const nsTArray<nsMsgKey>& keys,
+                                       const nsTArray<ImapUid>& uids) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG_POINTER(folder);
+  NS_ENSURE_TRUE(!keys.IsEmpty() && keys.Length() == uids.Length(),
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_FALSE(mCopyTargets, NS_ERROR_ALREADY_INITIALIZED);
+  CopyTargets targets;
+  MOZ_TRY(folder->GetId(&targets.folderId));
+  NS_ENSURE_TRUE(targets.folderId, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDatabase> db;
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+  NS_ENSURE_STATE(db);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+  NS_ENSURE_STATE(info);
+  MOZ_TRY(info->GetImapUidValidity(&targets.epoch));
+  NS_ENSURE_TRUE(targets.epoch, NS_ERROR_NOT_AVAILABLE);
+  for (size_t i = 0; i < keys.Length(); ++i) {
+    nsMsgKey key = MOZ_TRY(MsgKeyFromUid(db, uids[i]));
+    NS_ENSURE_TRUE(key == keys[i], NS_ERROR_NOT_AVAILABLE);
+    targets.messages.AppendElement(CopyTarget{key, uids[i]});
+  }
+  MOZ_TRY(SetExpectedUidValidity(targets.epoch));
+  mCopyTargets.emplace(std::move(targets));
+  return NS_OK;
+}
+
 nsresult nsImapUrl::CaptureFlagTargets(nsIMsgFolder* folder,
                                        const nsACString& uidSet) {
   MOZ_ASSERT(NS_IsMainThread());
@@ -1035,6 +1064,11 @@ nsresult nsImapUrl::Clone(nsIURI** _retval) {
   MutexAutoLock lock(mLock);
   clone->m_expectedUidValidity = m_expectedUidValidity;
   clone->mFlagDeleteIsMove = mFlagDeleteIsMove;
+  if (mCopyTargets) {
+    clone->mCopyTargets.emplace(CopyTargets{mCopyTargets->folderId,
+                                            mCopyTargets->epoch,
+                                            mCopyTargets->messages.Clone()});
+  }
   if (mFlagTargets) {
     clone->mFlagTargets.emplace(FlagTargets{mFlagTargets->folderId,
                                             mFlagTargets->epoch,

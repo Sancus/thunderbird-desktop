@@ -578,8 +578,15 @@ NS_IMETHODIMP nsImapService::CopyMessages(
     char hierarchyDelimiter = GetHierarchyDelimiter(folder);
     rv = CreateStartOfImapUrl(uri, getter_AddRefs(imapUrl), folder,
                               aUrlListener, urlSpec, hierarchyDelimiter);
+    NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                  ->CaptureCopyTargets(srcFolder, aKeys, uids));
+    }
+#endif
     nsImapAction action = nsIImapUrl::nsImapOnlineToOfflineCopy;
-    imapUrl->SetCopyState(aMailboxCopy);
+    MOZ_TRY(imapUrl->SetCopyState(aMailboxCopy));
     rv = FetchMessage(imapUrl, action, folder, imapMessageSink, aMsgWindow,
                       aMailboxCopy, messageIds, false, aURL);
 

@@ -2888,7 +2888,9 @@ void nsImapProtocol::ProcessSelectedStateURL() {
         !DeathSignalReceived() &&
         (uidValidityOk || m_imapAction == nsIImapUrl::nsImapDeleteAllMsgs)) {
 #ifdef MOZ_PANORAMA
-      if (expectedEpoch) {
+      if (expectedEpoch &&
+          (m_imapAction == nsIImapUrl::nsImapAddMsgFlags ||
+           m_imapAction == nsIImapUrl::nsImapSubtractMsgFlags)) {
         // Transport retry reuses this URL; status belongs to this attempt.
         m_mailboxUpdateResult =
             m_runningUrl->SetExtraStatus(nsIImapUrl::ImapStatusNone);
@@ -3523,6 +3525,7 @@ void nsImapProtocol::ProcessSelectedStateURL() {
 nsresult nsImapProtocol::BeginMessageDownLoad(
     uint32_t total_message_size,  // for user, headers and body
     const char* content_type) {
+  if (NS_FAILED(m_mailboxUpdateResult)) return m_mailboxUpdateResult;
   nsresult rv = NS_OK;
   char* sizeString = PR_smprintf("OPEN Size: %ld", total_message_size);
   Log("STREAM", sizeString, "Begin Message Download Stream");
@@ -3581,7 +3584,11 @@ nsresult nsImapProtocol::BeginMessageDownLoad(
         if (copyState)  // only need this notification during copy
         {
           nsCOMPtr<nsIMsgMailNewsUrl> mailurl = do_QueryInterface(m_runningUrl);
-          m_imapMailFolderSink->StartMessage(mailurl);
+          rv = m_imapMailFolderSink->StartMessage(mailurl);
+          if (NS_FAILED(rv)) {
+            m_mailboxUpdateResult = rv;
+            return rv;
+          }
         }
       }
     }
@@ -4262,21 +4269,24 @@ void nsImapProtocol::NormalMessageEndDownload() {
         m_mockChannel->SetWritingToCache(false);
         MOZ_LOG(IMAP, LogLevel::Debug, ("%s: End cache write", __func__));
       }
-      m_imapMessageSink->NormalEndMsgWriteStream(
+      nsresult rv = m_imapMessageSink->NormalEndMsgWriteStream(
           m_downloadLineCache->CurrentUID(),
           imapAction == nsIImapUrl::nsImapMsgFetch, m_runningUrl,
           updatedMessageSize);
+      if (NS_SUCCEEDED(m_mailboxUpdateResult) && NS_FAILED(rv))
+        m_mailboxUpdateResult = rv;
     }
 
-    if (m_runningUrl && m_imapMailFolderSink) {
+    if (m_runningUrl && m_imapMailFolderSink &&
+        NS_SUCCEEDED(m_mailboxUpdateResult)) {
       nsCOMPtr<nsISupports> copyState;
-      m_runningUrl->GetCopyState(getter_AddRefs(copyState));
-      if (copyState)  // only need this notification during copy
-      {
+      nsresult rv = m_runningUrl->GetCopyState(getter_AddRefs(copyState));
+      if (NS_SUCCEEDED(rv) && copyState) {
         nsCOMPtr<nsIMsgMailNewsUrl> mailUrl(do_QueryInterface(m_runningUrl));
-        m_imapMailFolderSink->EndMessage(mailUrl,
-                                         m_downloadLineCache->CurrentUID());
+        rv = m_imapMailFolderSink->EndMessage(
+            mailUrl, m_downloadLineCache->CurrentUID());
       }
+      if (NS_FAILED(rv)) m_mailboxUpdateResult = rv;
     }
   }
   m_curHdrInfo = nullptr;

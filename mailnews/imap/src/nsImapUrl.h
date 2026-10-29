@@ -56,6 +56,21 @@ class nsImapUrl : public nsIImapUrl,
     uint32_t epoch;
     nsTArray<FlagTarget> messages;
   };
+  struct CopyTarget {
+    nsMsgKey key;
+    ImapUid uid;
+  };
+  struct CopyTargets {
+    uint64_t folderId;
+    uint32_t epoch;
+    nsTArray<CopyTarget> messages;
+  };
+  nsresult CaptureCopyTargets(nsIMsgFolder* folder,
+                              const nsTArray<nsMsgKey>& keys,
+                              const nsTArray<ImapUid>& uids);
+  const mozilla::Maybe<CopyTargets>& CapturedCopyTargets() const {
+    return mCopyTargets;
+  }
   nsresult CaptureFlagTargets(nsIMsgFolder* folder, const nsACString& uidSet);
   const mozilla::Maybe<FlagTargets>& CapturedFlagTargets() const {
     return mFlagTargets;
@@ -157,6 +172,7 @@ class nsImapUrl : public nsIImapUrl,
 #ifdef MOZ_PANORAMA
   uint32_t m_expectedUidValidity = 0;
   mozilla::Maybe<FlagTargets> mFlagTargets;
+  mozilla::Maybe<CopyTargets> mCopyTargets;
   bool mFlagCompletionStarted = false;
   bool mFlagDeleteIsMove = false;
   nsresult mFlagCompletionResult = NS_ERROR_IN_PROGRESS;

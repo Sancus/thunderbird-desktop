@@ -53,6 +53,7 @@
 #include "nsIScriptError.h"
 #include "nsIURIMutator.h"
 #include "nsIXULAppInfo.h"
+#include "mozilla/CheckedInt.h"
 #include "mozilla/Components.h"
 #include "mozilla/dom/Promise.h"
 #include "mozilla/intl/Localization.h"
@@ -639,8 +640,9 @@ nsresult nsMsgDBFolder::ReadDBFolderInfo(bool force, bool cacheOnly) {
   // the DBs all the time, if we have to open it once, get everything
   // we might need while we're here
   nsresult result = NS_OK;
+  const bool panorama = StaticPrefs::mail_panorama_enabled_AtStartup();
 
-  if (!StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (!panorama) {
     // If we reload the cache we might get stale info, so don't do it.
     if (!mInitializedFromCache) {
       // Path is used as a key into the foldercache.
@@ -663,32 +665,38 @@ nsresult nsMsgDBFolder::ReadDBFolderInfo(bool force, bool cacheOnly) {
     return NS_OK;
   }
 
-  if (force || !mInitializedFromCache) {
+  if (force || !mInitializedFromCache || (panorama && !mIsServer)) {
     nsCOMPtr<nsIDBFolderInfo> folderInfo;
     nsCOMPtr<nsIMsgDatabase> db;
     bool weOpenedDB = !mDatabase;
+    auto closeDatabase = MakeScopeExit([&] {
+      if (panorama && weOpenedDB && db && mDatabase == db) {
+        CloseDB();
+      }
+    });
     result =
         GetDBFolderInfoAndDB(getter_AddRefs(folderInfo), getter_AddRefs(db));
     if (NS_SUCCEEDED(result)) {
       if (folderInfo) {
+        if (panorama) {
+          MOZ_TRY(ReadDBFolderCounts());
+        }
         if (!mInitializedFromCache) {
           folderInfo->GetFlags((int32_t*)&mFlags);
           folderInfo->GetUserSortOrder(&mUserSortOrder);
           mInitializedFromCache = true;
         }
 
-        folderInfo->GetNumMessages(&mNumTotalMessages);
-        folderInfo->GetNumUnreadMessages(&mNumUnreadMessages);
+        if (!panorama) {
+          folderInfo->GetNumMessages(&mNumTotalMessages);
+          folderInfo->GetNumUnreadMessages(&mNumUnreadMessages);
+        }
         folderInfo->GetExpungedBytes(&mExpungedBytes);
         if (!UsesLocalizedName()) {
           nsCString utf8Name;
           folderInfo->GetFolderName(utf8Name);
           if (!utf8Name.IsEmpty()) mName.Assign(utf8Name);
         }
-
-        // These should be put in IMAP folder only.
-        // folderInfo->GetImapTotalPendingMessages(&mNumPendingTotalMessages);
-        // folderInfo->GetImapUnreadPendingMessages(&mNumPendingUnreadMessages);
 
         if (db) {
           // Except for the sort, this is a noop. But this seems to be the only
@@ -701,13 +709,13 @@ nsresult nsMsgDBFolder::ReadDBFolderInfo(bool force, bool cacheOnly) {
           NS_ENSURE_SUCCESS(rv, rv);
           if (hasnew) db->SortNewKeysIfNeeded();
         }
-        if (weOpenedDB) CloseDB();
+        if (weOpenedDB && !panorama) CloseDB();
       }
     } else {
       // we tried to open DB but failed - don't keep trying.
       // If a DB is created, we will call this method with force == TRUE,
       // and read from the db that way.
-      mInitializedFromCache = true;
+      if (!panorama) mInitializedFromCache = true;
     }
   }
   return result;
@@ -4038,17 +4046,96 @@ NS_IMETHODIMP nsMsgDBFolder::GenerateUniqueSubfolderName(
   return NS_OK;
 }
 
+nsresult nsMsgDBFolder::ReadDBFolderCounts() {
+  bool isServer;
+  MOZ_TRY(GetIsServer(&isServer));
+  if (isServer) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsIMsgDatabase> db;
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+  NS_ENSURE_TRUE(info, NS_ERROR_UNEXPECTED);
+  int32_t total, unread, pendingTotal, pendingUnread;
+  MOZ_TRY(info->GetNumMessages(&total));
+  MOZ_TRY(info->GetNumUnreadMessages(&unread));
+  MOZ_TRY(info->GetImapTotalPendingMessages(&pendingTotal));
+  MOZ_TRY(info->GetImapUnreadPendingMessages(&pendingUnread));
+  mNumTotalMessages = total;
+  mNumUnreadMessages = unread;
+  mNumPendingTotalMessages = pendingTotal;
+  mNumPendingUnreadMessages = pendingUnread;
+  return NS_OK;
+}
+
+nsresult nsMsgDBFolder::ChangePendingCount(bool unread, int32_t delta) {
+  if (!delta) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsIMsgDatabase> db;
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+  NS_ENSURE_TRUE(info, NS_ERROR_UNEXPECTED);
+  int32_t count, pending;
+  MOZ_TRY(unread ? info->GetNumUnreadMessages(&count)
+                 : info->GetNumMessages(&count));
+  MOZ_TRY(unread ? info->GetImapUnreadPendingMessages(&pending)
+                 : info->GetImapTotalPendingMessages(&pending));
+  CheckedInt<int32_t> oldCount = CheckedInt<int32_t>(count) + pending;
+  CheckedInt<int32_t> newPending = CheckedInt<int32_t>(pending) + delta;
+  CheckedInt<int32_t> newCount = CheckedInt<int32_t>(count) + newPending;
+  NS_ENSURE_TRUE(
+      oldCount.isValid() && newPending.isValid() && newCount.isValid(),
+      NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  // The unread producer cannot publish a negative displayed count.
+  NS_ENSURE_TRUE(!unread || newCount.value() >= 0,
+                 count < 0 ? NS_ERROR_NOT_AVAILABLE : NS_ERROR_ILLEGAL_VALUE);
+  MOZ_TRY(unread ? info->SetImapUnreadPendingMessages(newPending.value())
+                 : info->SetImapTotalPendingMessages(newPending.value()));
+  if (unread) {
+    mNumUnreadMessages = count;
+    mNumPendingUnreadMessages = newPending.value();
+  } else {
+    mNumTotalMessages = count;
+    mNumPendingTotalMessages = newPending.value();
+  }
+  NotifyIntPropertyChanged(unread ? kTotalUnreadMessages : kTotalMessages,
+                           oldCount.value(), newCount.value());
+  return NS_OK;
+}
+
 NS_IMETHODIMP nsMsgDBFolder::UpdateSummaryTotals(bool force) {
   if (!mNotifyCountChanges) return NS_OK;
 
-  int32_t oldUnreadMessages = mNumUnreadMessages + mNumPendingUnreadMessages;
-  int32_t oldTotalMessages = mNumTotalMessages + mNumPendingTotalMessages;
-  // We need to read this info from the database
+  const bool panorama = StaticPrefs::mail_panorama_enabled_AtStartup();
+  CheckedInt<int32_t> oldUnread =
+      CheckedInt<int32_t>(mNumUnreadMessages) + mNumPendingUnreadMessages;
+  CheckedInt<int32_t> oldTotal =
+      CheckedInt<int32_t>(mNumTotalMessages) + mNumPendingTotalMessages;
+  NS_ENSURE_TRUE(!panorama || (oldUnread.isValid() && oldTotal.isValid()),
+                 NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  int32_t oldUnreadMessages =
+      panorama ? oldUnread.value()
+               : mNumUnreadMessages + mNumPendingUnreadMessages;
+  int32_t oldTotalMessages = panorama
+                                 ? oldTotal.value()
+                                 : mNumTotalMessages + mNumPendingTotalMessages;
+  // We need to read this info from the database.
   nsresult rv = ReadDBFolderInfo(force);
 
   if (NS_SUCCEEDED(rv)) {
-    int32_t newUnreadMessages = mNumUnreadMessages + mNumPendingUnreadMessages;
-    int32_t newTotalMessages = mNumTotalMessages + mNumPendingTotalMessages;
+    CheckedInt<int32_t> newUnread =
+        CheckedInt<int32_t>(mNumUnreadMessages) + mNumPendingUnreadMessages;
+    CheckedInt<int32_t> newTotal =
+        CheckedInt<int32_t>(mNumTotalMessages) + mNumPendingTotalMessages;
+    NS_ENSURE_TRUE(!panorama || (newUnread.isValid() && newTotal.isValid()),
+                   NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+    int32_t newUnreadMessages =
+        panorama ? newUnread.value()
+                 : mNumUnreadMessages + mNumPendingUnreadMessages;
+    int32_t newTotalMessages =
+        panorama ? newTotal.value()
+                 : mNumTotalMessages + mNumPendingTotalMessages;
 
     // Need to notify listeners that total count changed.
     if (oldTotalMessages != newTotalMessages)
@@ -4067,27 +4154,38 @@ NS_IMETHODIMP nsMsgDBFolder::UpdateSummaryTotals(bool force) {
 }
 
 NS_IMETHODIMP nsMsgDBFolder::SummaryChanged() {
-  UpdateSummaryTotals(false);
-  return NS_OK;
+  nsresult rv = UpdateSummaryTotals(false);
+  return StaticPrefs::mail_panorama_enabled_AtStartup() ? rv : NS_OK;
 }
 
 NS_IMETHODIMP nsMsgDBFolder::GetNumUnread(bool deep, int32_t* numUnread) {
   NS_ENSURE_ARG_POINTER(numUnread);
+  const bool panorama = StaticPrefs::mail_panorama_enabled_AtStartup();
+  if (panorama) *numUnread = 0;
 
   bool isServer = false;
   nsresult rv = GetIsServer(&isServer);
   NS_ENSURE_SUCCESS(rv, rv);
-#ifdef MOZ_PANORAMA
-  if (!isServer && StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (!isServer && panorama) {
     nsCOMPtr<nsIMsgDatabase> db;
-    nsCOMPtr<nsIDBFolderInfo> folderInfo;
-    rv = GetDBFolderInfoAndDB(getter_AddRefs(folderInfo), getter_AddRefs(db));
-    if (NS_SUCCEEDED(rv)) {
-      folderInfo->GetNumUnreadMessages(&mNumUnreadMessages);
-    }
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    NS_ENSURE_TRUE(info, NS_ERROR_UNEXPECTED);
+    int32_t count, pending;
+    MOZ_TRY(info->GetNumUnreadMessages(&count));
+    MOZ_TRY(info->GetImapUnreadPendingMessages(&pending));
+    mNumUnreadMessages = count;
+    mNumPendingUnreadMessages = pending;
   }
-#endif  // MOZ_PANORAMA
-  int32_t total = isServer ? 0 : mNumUnreadMessages + mNumPendingUnreadMessages;
+  CheckedInt<int32_t> adjusted =
+      CheckedInt<int32_t>(isServer ? 0 : mNumUnreadMessages) +
+      (isServer ? 0 : mNumPendingUnreadMessages);
+  NS_ENSURE_TRUE(!panorama || adjusted.isValid(),
+                 NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  int32_t total =
+      panorama
+          ? adjusted.value()
+          : (isServer ? 0 : mNumUnreadMessages + mNumPendingUnreadMessages);
 
   if (deep) {
     if (total < 0)  // deep search never returns negative counts
@@ -4097,10 +4195,18 @@ NS_IMETHODIMP nsMsgDBFolder::GetNumUnread(bool deep, int32_t* numUnread) {
       nsCOMPtr<nsIMsgFolder> folder(mSubFolders[i]);
       int32_t num;
       uint32_t folderFlags;
-      folder->GetFlags(&folderFlags);
+      rv = folder->GetFlags(&folderFlags);
+      if (panorama) NS_ENSURE_SUCCESS(rv, rv);
       if (!(folderFlags & nsMsgFolderFlags::Virtual)) {
-        folder->GetNumUnread(deep, &num);
-        total += num;
+        rv = folder->GetNumUnread(deep, &num);
+        if (panorama) {
+          NS_ENSURE_SUCCESS(rv, rv);
+          CheckedInt<int32_t> sum = CheckedInt<int32_t>(total) + num;
+          NS_ENSURE_TRUE(sum.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+          total = sum.value();
+        } else {
+          total += num;
+        }
       }
     }
   }
@@ -4111,21 +4217,31 @@ NS_IMETHODIMP nsMsgDBFolder::GetNumUnread(bool deep, int32_t* numUnread) {
 NS_IMETHODIMP nsMsgDBFolder::GetTotalMessages(bool deep,
                                               int32_t* totalMessages) {
   NS_ENSURE_ARG_POINTER(totalMessages);
+  const bool panorama = StaticPrefs::mail_panorama_enabled_AtStartup();
+  if (panorama) *totalMessages = 0;
 
   bool isServer = false;
   nsresult rv = GetIsServer(&isServer);
   NS_ENSURE_SUCCESS(rv, rv);
-#ifdef MOZ_PANORAMA
-  if (!isServer && StaticPrefs::mail_panorama_enabled_AtStartup()) {
+  if (!isServer && panorama) {
     nsCOMPtr<nsIMsgDatabase> db;
-    nsCOMPtr<nsIDBFolderInfo> folderInfo;
-    rv = GetDBFolderInfoAndDB(getter_AddRefs(folderInfo), getter_AddRefs(db));
-    if (NS_SUCCEEDED(rv)) {
-      folderInfo->GetNumMessages(&mNumTotalMessages);
-    }
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    NS_ENSURE_TRUE(info, NS_ERROR_UNEXPECTED);
+    int32_t count, pending;
+    MOZ_TRY(info->GetNumMessages(&count));
+    MOZ_TRY(info->GetImapTotalPendingMessages(&pending));
+    mNumTotalMessages = count;
+    mNumPendingTotalMessages = pending;
   }
-#endif  // MOZ_PANORAMA
-  int32_t total = isServer ? 0 : mNumTotalMessages + mNumPendingTotalMessages;
+  CheckedInt<int32_t> adjusted =
+      CheckedInt<int32_t>(isServer ? 0 : mNumTotalMessages) +
+      (isServer ? 0 : mNumPendingTotalMessages);
+  NS_ENSURE_TRUE(!panorama || adjusted.isValid(),
+                 NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  int32_t total =
+      panorama ? adjusted.value()
+               : (isServer ? 0 : mNumTotalMessages + mNumPendingTotalMessages);
 
   if (deep) {
     if (total < 0)  // deep search never returns negative counts
@@ -4135,10 +4251,18 @@ NS_IMETHODIMP nsMsgDBFolder::GetTotalMessages(bool deep,
       nsCOMPtr<nsIMsgFolder> folder(mSubFolders[i]);
       int32_t num;
       uint32_t folderFlags;
-      folder->GetFlags(&folderFlags);
+      rv = folder->GetFlags(&folderFlags);
+      if (panorama) NS_ENSURE_SUCCESS(rv, rv);
       if (!(folderFlags & nsMsgFolderFlags::Virtual)) {
-        folder->GetTotalMessages(deep, &num);
-        total += num;
+        rv = folder->GetTotalMessages(deep, &num);
+        if (panorama) {
+          NS_ENSURE_SUCCESS(rv, rv);
+          CheckedInt<int32_t> sum = CheckedInt<int32_t>(total) + num;
+          NS_ENSURE_TRUE(sum.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+          total = sum.value();
+        } else {
+          total += num;
+        }
       }
     }
   }
@@ -4147,17 +4271,44 @@ NS_IMETHODIMP nsMsgDBFolder::GetTotalMessages(bool deep,
 }
 
 NS_IMETHODIMP nsMsgDBFolder::GetNumPendingUnread(int32_t* aPendingUnread) {
+  NS_ENSURE_ARG_POINTER(aPendingUnread);
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    bool isServer;
+    MOZ_TRY(GetIsServer(&isServer));
+    if (!isServer) {
+      nsCOMPtr<nsIMsgDatabase> db;
+      nsCOMPtr<nsIDBFolderInfo> info;
+      MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+      NS_ENSURE_TRUE(info, NS_ERROR_UNEXPECTED);
+      MOZ_TRY(info->GetImapUnreadPendingMessages(&mNumPendingUnreadMessages));
+    }
+  }
   *aPendingUnread = mNumPendingUnreadMessages;
   return NS_OK;
 }
 
 NS_IMETHODIMP nsMsgDBFolder::GetNumPendingTotalMessages(
     int32_t* aPendingTotal) {
+  NS_ENSURE_ARG_POINTER(aPendingTotal);
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    bool isServer;
+    MOZ_TRY(GetIsServer(&isServer));
+    if (!isServer) {
+      nsCOMPtr<nsIMsgDatabase> db;
+      nsCOMPtr<nsIDBFolderInfo> info;
+      MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+      NS_ENSURE_TRUE(info, NS_ERROR_UNEXPECTED);
+      MOZ_TRY(info->GetImapTotalPendingMessages(&mNumPendingTotalMessages));
+    }
+  }
   *aPendingTotal = mNumPendingTotalMessages;
   return NS_OK;
 }
 
 NS_IMETHODIMP nsMsgDBFolder::ChangeNumPendingUnread(int32_t delta) {
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return ChangePendingCount(true, delta);
+  }
   if (delta) {
     int32_t oldUnreadMessages = mNumUnreadMessages + mNumPendingUnreadMessages;
     mNumPendingUnreadMessages += delta;
@@ -4179,6 +4330,9 @@ NS_IMETHODIMP nsMsgDBFolder::ChangeNumPendingUnread(int32_t delta) {
 }
 
 NS_IMETHODIMP nsMsgDBFolder::ChangeNumPendingTotalMessages(int32_t delta) {
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return ChangePendingCount(false, delta);
+  }
   if (delta) {
     int32_t oldTotalMessages = mNumTotalMessages + mNumPendingTotalMessages;
     mNumPendingTotalMessages += delta;

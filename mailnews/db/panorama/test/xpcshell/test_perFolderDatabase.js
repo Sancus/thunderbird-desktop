@@ -819,3 +819,345 @@ add_task(function test_countReadFailuresAndDeletedFolder() {
     /NS_ERROR_NOT_AVAILABLE/
   );
 });
+
+function recordPendingCountChanges(folder) {
+  const changes = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+    onFolderIntPropertyChanged(changed, property, oldValue, newValue) {
+      if (
+        changed == folder &&
+        ["TotalMessages", "TotalUnreadMessages"].includes(property)
+      ) {
+        changes.push([property, oldValue, newValue]);
+      }
+    },
+  };
+  MailServices.mailSession.AddFolderListener(
+    listener,
+    Ci.nsIFolderListener.intPropertyChanged
+  );
+  registerCleanupFunction(() =>
+    MailServices.mailSession.RemoveFolderListener(listener)
+  );
+  return changes;
+}
+
+add_task(function test_pendingProducerWriteFailureDoesNotPublish() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("producer-write-errors");
+  addMessage({ folderId: folder.id, messageId: "producer-one" });
+  addMessage({ folderId: folder.id, messageId: "producer-two" });
+  const info = folder.msgDatabase.dBFolderInfo;
+  info.imapTotalPendingMessages = 3;
+  info.imapUnreadPendingMessages = 1;
+  Assert.equal(folder.numPendingTotalMessages, 3);
+  Assert.equal(folder.numPendingUnread, 1);
+  const changes = recordPendingCountChanges(folder);
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_pending_producer BEFORE INSERT ON folder_properties " +
+      `WHEN NEW.id = ${folder.id} AND NEW.name IN ('totPendingMsgs', 'unreadPendingMsgs') ` +
+      "BEGIN SELECT RAISE(ABORT, 'pending producer fault'); END"
+  );
+  try {
+    Assert.throws(
+      () => folder.changeNumPendingTotalMessages(1),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.throws(
+      () => folder.changeNumPendingUnread(1),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.equal(folder.numPendingTotalMessages, 3);
+    Assert.equal(folder.numPendingUnread, 1);
+    Assert.equal(info.imapTotalPendingMessages, 3);
+    Assert.equal(info.imapUnreadPendingMessages, 1);
+    Assert.equal(folder.getTotalMessages(false), 5);
+    Assert.equal(folder.getNumUnread(false), 3);
+    Assert.deepEqual(changes, []);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_pending_producer");
+  }
+  folder.changeNumPendingTotalMessages(1);
+  folder.changeNumPendingUnread(1);
+  Assert.deepEqual(changes, [
+    ["TotalMessages", 5, 6],
+    ["TotalUnreadMessages", 3, 4],
+  ]);
+});
+
+add_task(function test_pendingProducerChecksDeltaAndDisplayedCountWidth() {
+  const root = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const empty = root.createLocalSubfolder("producer-delta-width");
+  const emptyInfo = empty.msgDatabase.dBFolderInfo;
+  empty.changeNumPendingTotalMessages(0x7fffffff);
+  Assert.throws(
+    () => empty.changeNumPendingTotalMessages(1),
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  Assert.equal(empty.numPendingTotalMessages, 0x7fffffff);
+  emptyInfo.imapTotalPendingMessages = -2147483648;
+  Assert.throws(
+    () => empty.changeNumPendingTotalMessages(-1),
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  Assert.equal(empty.numPendingTotalMessages, -2147483648);
+  emptyInfo.imapTotalPendingMessages = 0;
+
+  const folder = root.createLocalSubfolder("producer-total-width");
+  addMessage({ folderId: folder.id, messageId: "producer-width" });
+  const info = folder.msgDatabase.dBFolderInfo;
+  folder.changeNumPendingTotalMessages(0x7ffffffe);
+  folder.changeNumPendingUnread(0x7ffffffe);
+  const changes = recordPendingCountChanges(folder);
+  Assert.throws(
+    () => folder.changeNumPendingTotalMessages(1),
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  Assert.throws(
+    () => folder.changeNumPendingUnread(1),
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  Assert.equal(folder.numPendingTotalMessages, 0x7ffffffe);
+  Assert.equal(folder.numPendingUnread, 0x7ffffffe);
+  Assert.equal(folder.getTotalMessages(false), 0x7fffffff);
+  Assert.equal(folder.getNumUnread(false), 0x7fffffff);
+  Assert.deepEqual(changes, []);
+  info.imapTotalPendingMessages = 0;
+  info.imapUnreadPendingMessages = 0;
+});
+
+add_task(function test_pendingProducerPreservesSignedAndUnknownUnreadValues() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("producer-signed");
+  addMessage({ folderId: folder.id, messageId: "producer-signed-one" });
+  addMessage({ folderId: folder.id, messageId: "producer-signed-two" });
+  const info = folder.msgDatabase.dBFolderInfo;
+  folder.changeNumPendingUnread(-1);
+  Assert.equal(folder.numPendingUnread, -1);
+  Assert.equal(info.getUint32Property("unreadPendingMsgs", 0), 0xffffffff);
+  Assert.equal(folder.getNumUnread(false), 1);
+  const changes = recordPendingCountChanges(folder);
+  Assert.throws(
+    () => folder.changeNumPendingUnread(-2),
+    /NS_ERROR_ILLEGAL_VALUE/
+  );
+  Assert.equal(folder.numPendingUnread, -1);
+  Assert.equal(info.imapUnreadPendingMessages, -1);
+  Assert.deepEqual(changes, []);
+
+  const virtual = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("producer-unknown");
+  const summary = virtual.msgDatabase.dBFolderInfo;
+  summary.orFlags(Ci.nsMsgFolderFlags.Virtual);
+  summary.numMessages = 7;
+  summary.numUnreadMessages = -1;
+  Assert.equal(virtual.getNumUnread(false), -1);
+  virtual.changeNumPendingUnread(0);
+  Assert.equal(summary.getUint32Property("unreadPendingMsgs", 99), 99);
+  Assert.throws(
+    () => virtual.changeNumPendingUnread(-1),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.equal(summary.getUint32Property("unreadPendingMsgs", 99), 99);
+  virtual.changeNumPendingUnread(2);
+  virtual.changeNumPendingTotalMessages(3);
+  Assert.equal(virtual.getNumUnread(false), 1);
+  Assert.equal(virtual.getTotalMessages(false), 10);
+  Assert.equal(summary.numMessages, 7);
+  Assert.equal(summary.numUnreadMessages, -1);
+  Assert.deepEqual(virtual.msgDatabase.listAllKeys(), []);
+});
+
+add_task(function test_pendingProducerReloadsAcrossForceClose() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("producer-reopen");
+  addMessage({ folderId: folder.id, messageId: "producer-reopen-message" });
+  const oldDB = folder.msgDatabase;
+  oldDB.dBFolderInfo.imapTotalPendingMessages = 8;
+  oldDB.dBFolderInfo.imapUnreadPendingMessages = 4;
+  Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+    .getService(Ci.nsIMsgDBService)
+    .forceFolderDBClosed(folder);
+  const db = folder.msgDatabase;
+  Assert.notStrictEqual(db, oldDB);
+  Assert.equal(folder.numPendingTotalMessages, 8);
+  Assert.equal(folder.numPendingUnread, 4);
+  Assert.equal(folder.getTotalMessages(false), 9);
+  Assert.equal(folder.getNumUnread(false), 5);
+  folder.changeNumPendingTotalMessages(-8);
+  folder.changeNumPendingUnread(-4);
+  Assert.equal(db.dBFolderInfo.imapTotalPendingMessages, 0);
+  Assert.equal(db.dBFolderInfo.imapUnreadPendingMessages, 0);
+  const statement = database.connectionForTests.createStatement(
+    "SELECT name, value, typeof(value) AS type FROM folder_properties " +
+      "WHERE id = :id AND name IN ('totPendingMsgs', 'unreadPendingMsgs') ORDER BY name"
+  );
+  statement.params.id = folder.id;
+  const rows = [];
+  try {
+    while (statement.executeStep()) {
+      rows.push([statement.row.name, statement.row.value, statement.row.type]);
+    }
+  } finally {
+    statement.finalize();
+  }
+  Assert.deepEqual(rows, [
+    ["totPendingMsgs", 0, "integer"],
+    ["unreadPendingMsgs", 0, "integer"],
+  ]);
+  Assert.equal(folder.getTotalMessages(false), 1);
+  Assert.equal(folder.getNumUnread(false), 1);
+});
+
+add_task(function test_pendingProducerKeepsReentrantResult() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("producer-reentrant");
+  const changes = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+    onFolderIntPropertyChanged(changed, property, oldValue, newValue) {
+      if (changed != folder || property != "TotalMessages") return;
+      changes.push([oldValue, newValue]);
+      Assert.equal(folder.numPendingTotalMessages, newValue);
+      Assert.equal(
+        folder.msgDatabase.dBFolderInfo.imapTotalPendingMessages,
+        newValue
+      );
+      if (newValue == 1) folder.changeNumPendingTotalMessages(2);
+    },
+  };
+  MailServices.mailSession.AddFolderListener(
+    listener,
+    Ci.nsIFolderListener.intPropertyChanged
+  );
+  try {
+    folder.changeNumPendingTotalMessages(1);
+    Assert.deepEqual(changes, [
+      [0, 1],
+      [1, 3],
+    ]);
+    Assert.equal(folder.numPendingTotalMessages, 3);
+    Assert.equal(folder.getTotalMessages(false), 3);
+  } finally {
+    MailServices.mailSession.RemoveFolderListener(listener);
+  }
+});
+
+add_task(function test_pendingProducerReadErrorsAndTransactionOwnership() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("producer-read-errors");
+  folder.changeNumPendingTotalMessages(3);
+  folder.changeNumPendingUnread(2);
+  const connection = database.connectionForTests;
+  const changes = recordPendingCountChanges(folder);
+  connection.executeSimpleSQL(
+    "ALTER TABLE folder_properties RENAME TO hidden_producer_properties"
+  );
+  try {
+    Assert.throws(
+      () => folder.changeNumPendingTotalMessages(1),
+      /NS_ERROR_FAILURE/
+    );
+    Assert.throws(() => folder.changeNumPendingUnread(1), /NS_ERROR_FAILURE/);
+    Assert.throws(() => folder.numPendingTotalMessages, /NS_ERROR_FAILURE/);
+    Assert.throws(() => folder.getNumUnread(false), /NS_ERROR_FAILURE/);
+    Assert.throws(() => folder.summaryChanged(), /NS_ERROR_FAILURE/);
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE hidden_producer_properties RENAME TO folder_properties"
+    );
+  }
+  Assert.deepEqual(changes, []);
+  connection.beginTransaction();
+  try {
+    folder.changeNumPendingTotalMessages(1);
+    Assert.ok(connection.transactionInProgress);
+    Assert.equal(folder.numPendingTotalMessages, 4);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(folder.numPendingTotalMessages, 3);
+  Assert.equal(folder.getTotalMessages(false), 3);
+  folderDB.deleteFolder(folder.id);
+  Assert.throws(
+    () => folder.changeNumPendingTotalMessages(1),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.throws(() => folder.numPendingUnread, /NS_ERROR_NOT_AVAILABLE/);
+});
+
+add_task(function test_pendingGettersDoNotReadUnrelatedCountFields() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("producer-independent");
+  addMessage({ folderId: folder.id, messageId: "producer-independent" });
+  const info = folder.msgDatabase.dBFolderInfo;
+  info.imapTotalPendingMessages = 3;
+  info.imapUnreadPendingMessages = 2;
+  info.setInt64Property("unreadPendingMsgs", 4294967296);
+  Assert.equal(folder.numPendingTotalMessages, 3);
+  Assert.equal(folder.getTotalMessages(false), 4);
+  Assert.throws(
+    () => folder.numPendingUnread,
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  info.imapUnreadPendingMessages = 2;
+  info.orFlags(Ci.nsMsgFolderFlags.Virtual);
+  info.numMessages = 7;
+  info.numUnreadMessages = 3;
+  info.setUint32Property("numMsgs", 0x80000000);
+  Assert.equal(folder.numPendingTotalMessages, 3);
+  Assert.equal(folder.numPendingUnread, 2);
+  Assert.equal(folder.getNumUnread(false), 5);
+  Assert.throws(
+    () => folder.getTotalMessages(false),
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  info.numMessages = 7;
+  info.setUint32Property("numNewMsgs", 0x80000000);
+  Assert.equal(folder.getTotalMessages(false), 10);
+  Assert.equal(folder.numPendingUnread, 2);
+  Assert.throws(
+    () => folder.getNumUnread(false),
+    /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+  );
+  info.numUnreadMessages = 3;
+});
+
+add_task(
+  function test_pendingDeepCountsCheckChildrenAndExcludeVirtualSummaries() {
+    const parent = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("producer-deep")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const child = parent.createLocalSubfolder("physical");
+    const virtual = parent.createLocalSubfolder("virtual");
+    addMessage({ folderId: child.id, messageId: "producer-deep-message" });
+    virtual.setFlag(Ci.nsMsgFolderFlags.Virtual);
+    virtual.msgDatabase.dBFolderInfo.numMessages = 99;
+    virtual.msgDatabase.dBFolderInfo.numUnreadMessages = 88;
+    parent.changeNumPendingTotalMessages(2);
+    parent.changeNumPendingUnread(1);
+    child.changeNumPendingTotalMessages(3);
+    child.changeNumPendingUnread(1);
+    Assert.equal(parent.getTotalMessages(false), 2);
+    Assert.equal(parent.getNumUnread(false), 1);
+    Assert.equal(parent.getTotalMessages(true), 6);
+    Assert.equal(parent.getNumUnread(true), 3);
+    child.msgDatabase.dBFolderInfo.imapTotalPendingMessages = 0x7fffffff;
+    Assert.throws(
+      () => parent.getTotalMessages(true),
+      /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+    );
+    child.msgDatabase.dBFolderInfo.imapTotalPendingMessages = 0;
+    Assert.equal(parent.getTotalMessages(true), 3);
+  }
+);

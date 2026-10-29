@@ -170,6 +170,8 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
    *         be opened or read (only possible when cacheOnly is false).
    */
   virtual nsresult ReadDBFolderInfo(bool force, bool cacheOnly = false);
+  nsresult ReadDBFolderCounts();
+  nsresult ChangePendingCount(bool unread, int32_t delta);
   virtual nsresult FlushToFolderCache();
   virtual nsresult GetDatabase() = 0;
   virtual nsresult SendFlagNotifications(nsIMsgDBHdr* item, uint32_t oldFlags,

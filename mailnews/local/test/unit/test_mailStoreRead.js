@@ -6,16 +6,28 @@ const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 
+const STORE_PREFS = [
+  "mail.serverDefaultStoreContractID",
+  "mail.server.default.storeContractID",
+];
+
 add_setup(function setupStoreReads() {
-  const pref = "mail.serverDefaultStoreContractID";
-  const hadPref = Services.prefs.prefHasUserValue(pref);
-  const oldPref = Services.prefs.getCharPref(pref, "");
+  const prefs = STORE_PREFS.map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
   registerCleanupFunction(() => {
-    localAccountUtils.clearAll();
-    if (hadPref) {
-      Services.prefs.setCharPref(pref, oldPref);
-    } else {
-      Services.prefs.clearUserPref(pref);
+    try {
+      localAccountUtils.clearAll();
+    } finally {
+      for (const { name, hadValue, value } of prefs) {
+        if (hadValue) {
+          Services.prefs.setCharPref(name, value);
+        } else {
+          Services.prefs.clearUserPref(name);
+        }
+      }
     }
   });
   localAccountUtils.clearAll();
@@ -29,6 +41,10 @@ add_setup(function setupStoreReads() {
  * @returns {nsIMsgLocalMailFolder} The local inbox.
  */
 function loadStore(contract, storeType) {
+  // Panorama root discovery can cache the provider before server creation ends.
+  for (const name of STORE_PREFS) {
+    Services.prefs.setCharPref(name, contract);
+  }
   localAccountUtils.loadLocalMailAccount(contract);
   const folder = localAccountUtils.inboxFolder;
   const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(

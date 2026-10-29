@@ -12,6 +12,7 @@
 #endif
 #include "Message.h"
 #include "MessageDatabase.h"
+#include "PerFolderDatabase.h"
 #include "gtest/gtest.h"
 #include "mozilla/ScopeExit.h"
 #include "mozilla/ResultExtensions.h"
@@ -275,6 +276,24 @@ class DeliveryCoreReferences : public testing::Test {
   nsresult Open(mozIStorageConnection** connection) {
     return mStorage->OpenUnsharedDatabase(
         mFile, mozIStorageService::CONNECTION_DEFAULT, connection);
+  }
+
+  already_AddRefed<PerFolderDatabase> WeakFolderDatabase(uint64_t folderId) {
+    RefPtr<PerFolderDatabase> facade = new PerFolderDatabase(folderId, false);
+    // The facade owner changes its constructor separately. Enroll through the
+    // real native seam so these controls work with either constructor version.
+    mCore->MessageDB().RemoveMessageListener(facade);
+    mCore->MessageDB().AddFolderMessageListener(facade);
+    return facade.forget();
+  }
+
+  void EnrollWeakFolder(PerFolderDatabase *facade) {
+    mCore->MessageDB().AddFolderMessageListener(facade);
+  }
+
+  void NotifyImported(nsMsgKey key) {
+    RefPtr<Message> message = new Message(key);
+    mCore->MessageDB().NotifyImportedMessage(message);
   }
 
   nsresult Start() {
@@ -9182,6 +9201,157 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_FALSE(exists);
   ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
   EXPECT_EQ(19, metric);
+}
+
+TEST_F(DeliveryCoreReferences, WeakFolderListenerDoesNotOwnUnusedFacade) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  RefPtr<PerFolderDatabase> facade = WeakFolderDatabase(mFolderId);
+  WeakPtr<PerFolderDatabase> weak(facade.get());
+  facade = nullptr;
+  EXPECT_FALSE(weak);
+  uint32_t publications = 0;
+  RefPtr<AddedObserver> ordinary =
+      new AddedObserver([&](Message *) { ++publications; });
+  MessageListener *identity = ordinary;
+  db.AddMessageListener(ordinary);
+  ordinary = nullptr;
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(identity); });
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("unused-weak-folder"_ns, {}, key));
+  EXPECT_EQ(1u, publications);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  EXPECT_FALSE(weak);
+}
+
+TEST_F(DeliveryCoreReferences, WeakFolderListenerKeepsExternalNewListsScoped) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  RefPtr<PerFolderDatabase> facade = WeakFolderDatabase(mFolderId);
+  uint64_t otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, "Bystander"_ns,
+                                                  &otherFolder));
+  RefPtr<PerFolderDatabase> other = WeakFolderDatabase(otherFolder);
+  WeakPtr<PerFolderDatabase> weak(facade.get());
+  ASSERT_EQ(NS_OK, facade->Close(false));
+  ASSERT_TRUE(weak);
+  nsMsgKey key, otherKey;
+  ASSERT_EQ(NS_OK, Add("externally-held-folder"_ns, {}, key));
+  ASSERT_EQ(NS_OK, AddAt(otherFolder, "other-held-folder"_ns, {}, otherKey));
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, facade->GetNewList(keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
+  ASSERT_EQ(NS_OK, other->GetNewList(keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{otherKey}), keys);
+  facade = nullptr;
+  EXPECT_FALSE(weak);
+  ASSERT_EQ(NS_OK, other->GetNewList(keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{otherKey}), keys);
+}
+
+TEST_F(DeliveryCoreReferences, WeakFolderPreflightPinsThroughWholeDelivery) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  RefPtr<PerFolderDatabase> facade;
+  WeakPtr<PerFolderDatabase> weak;
+  uint32_t first = 0, last = 0;
+  RefPtr<AddedObserver> before = new AddedObserver([&](Message *) {
+    ++first;
+    facade = nullptr;
+    EXPECT_TRUE(weak);
+  });
+  db.AddMessageListener(before);
+  facade = WeakFolderDatabase(mFolderId);
+  weak = WeakPtr<PerFolderDatabase>(facade.get());
+  RefPtr<AddedObserver> after = new AddedObserver([&](Message *message) {
+    ++last;
+    ASSERT_TRUE(weak);
+    nsTArray<nsMsgKey> keys;
+    ASSERT_EQ(NS_OK, weak->GetNewList(keys));
+    EXPECT_EQ((nsTArray<nsMsgKey>{message->Key()}), keys);
+  });
+  db.AddMessageListener(after);
+  auto remove = MakeScopeExit([&] {
+    db.RemoveMessageListener(before);
+    db.RemoveMessageListener(after);
+  });
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("preflight-owned-folder"_ns, {}, key));
+  EXPECT_EQ(1u, first);
+  EXPECT_EQ(1u, last);
+  EXPECT_FALSE(weak);
+}
+
+TEST_F(DeliveryCoreReferences, WeakFolderReenrollmentCancelsOldBatchToken) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  RefPtr<PerFolderDatabase> facade;
+  bool reenrolled = false;
+  RefPtr<AddedObserver> before = new AddedObserver([&](Message *) {
+    if (!reenrolled) {
+      reenrolled = true;
+      db.RemoveMessageListener(facade);
+      EnrollWeakFolder(facade);
+    }
+  });
+  db.AddMessageListener(before);
+  facade = WeakFolderDatabase(mFolderId);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(before); });
+  nsMsgKey first, second;
+  ASSERT_EQ(NS_OK, Add("old-registration-token"_ns, {}, first));
+  EXPECT_TRUE(reenrolled);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, facade->GetNewList(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  ASSERT_EQ(NS_OK, Add("new-registration-token"_ns, {}, second));
+  ASSERT_EQ(NS_OK, facade->GetNewList(keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{second}), keys);
+  WeakPtr<PerFolderDatabase> weak(facade.get());
+  ASSERT_EQ(NS_OK, facade->ForceClosed());
+  EXPECT_FALSE(weak);
+  ASSERT_EQ(NS_OK, facade->GetNewList(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  nsMsgKey third;
+  ASSERT_EQ(NS_OK, Add("after-explicit-close"_ns, {}, third));
+  ASSERT_EQ(NS_OK, facade->GetNewList(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  EXPECT_FALSE(weak);
+}
+
+TEST_F(DeliveryCoreReferences, WeakFolderImportPinsBeforeFirstCallback) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("import-recipient-control"_ns, {}, key));
+  RefPtr<PerFolderDatabase> facade;
+  WeakPtr<PerFolderDatabase> weak;
+  uint32_t first = 0, last = 0;
+  RefPtr<AddedObserver> before = new AddedObserver([&](Message *) {
+    ++first;
+    facade = nullptr;
+    EXPECT_TRUE(weak);
+  });
+  db.AddMessageListener(before);
+  facade = WeakFolderDatabase(mFolderId);
+  weak = WeakPtr<PerFolderDatabase>(facade.get());
+  RefPtr<AddedObserver> after = new AddedObserver([&](Message *message) {
+    ++last;
+    ASSERT_TRUE(weak);
+    nsTArray<nsMsgKey> keys;
+    ASSERT_EQ(NS_OK, weak->GetNewList(keys));
+    EXPECT_EQ((nsTArray<nsMsgKey>{message->Key()}), keys);
+  });
+  db.AddMessageListener(after);
+  auto remove = MakeScopeExit([&] {
+    db.RemoveMessageListener(before);
+    db.RemoveMessageListener(after);
+  });
+  NotifyImported(key);
+  EXPECT_EQ(1u, first);
+  EXPECT_EQ(1u, last);
+  EXPECT_FALSE(weak);
 }
 
 }  // namespace mozilla::mailnews

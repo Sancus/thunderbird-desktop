@@ -26,6 +26,7 @@ namespace mozilla::mailnews {
 
 class Folder;
 class Message;
+class PerFolderDatabase;
 
 // Committed physical body location; Nothing distinguishes an absent token.
 struct MessageBodyState {
@@ -612,6 +613,10 @@ class MessageDatabase : public nsIMessageDatabase {
   // Check the cache and slim it down if needed.
   void TrimCache();
 
+  // Only known folder facades are weakly enrolled. A prepared delivery owns
+  // its recipients until completion; ordinary native listeners stay strong.
+  void AddFolderMessageListener(PerFolderDatabase *listener);
+  void PruneExpiredFolderListeners();
   struct ListenerRegistration;
   void NotifyImportedMessage(Message* message);
   struct QueuedMessageBatch;

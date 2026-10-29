@@ -12,6 +12,7 @@
 #include "DatabaseUtils.h"
 #include "DetachedMsgHdr.h"
 #include "Message.h"
+#include "PerFolderDatabase.h"
 #include "js/Array.h"
 #include "js/CharacterEncoding.h"
 #include "js/String.h"
@@ -20,18 +21,18 @@
 #include "mozIStorageStatement.h"
 #include "mozIStorageValueArray.h"
 #include "mozStorageHelper.h"
+#include "mozilla/AutoRestore.h"
 #include "mozilla/CheckedInt.h"
 #include "mozilla/Logging.h"
-#include "mozilla/AutoRestore.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/Try.h"
-#include "mozilla/fallible.h"
 #include "mozilla/UniquePtr.h"
+#include "mozilla/fallible.h"
 #include "nsIFile.h"
-#include "nsLocalFile.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsImapCore.h"
+#include "nsLocalFile.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
@@ -49,17 +50,32 @@ NS_IMPL_ISUPPORTS(MessageDatabase, nsIMessageDatabase)
 struct MessageDatabase::ListenerRegistration {
   NS_INLINE_DECL_REFCOUNTING(ListenerRegistration)
  public:
-  explicit ListenerRegistration(MessageListener* value) : listener(value) {}
-  RefPtr<MessageListener> listener;
+   explicit ListenerRegistration(MessageListener *value)
+       : identity(value), strongListener(value) {}
+   explicit ListenerRegistration(PerFolderDatabase *value)
+       : identity(value), folderListener(value) {}
+   RefPtr<MessageListener> Resolve() const {
+     if (strongListener) {
+       return strongListener;
+     }
+     RefPtr<MessageListener> listener = folderListener.get();
+     return listener;
+   }
+   bool Expired() const { return !strongListener && !folderListener; }
+   // Identity is compared only, including after ForceClosed detaches WeakPtr.
+   MessageListener *const identity;
 
  private:
   ~ListenerRegistration() = default;
+  RefPtr<MessageListener> strongListener;
+  WeakPtr<PerFolderDatabase> folderListener;
 };
 
 struct MessageDatabase::QueuedMessageBatch {
   enum class Kind { Publication, Thread, Removed, Flags, Tags, Body };
   struct Delivery {
     RefPtr<ListenerRegistration> registration;
+    RefPtr<MessageListener> listener;
     nsCOMPtr<nsISupports> beforeViewData;
     PreparedThreadBatch prepared;
   };
@@ -83,11 +99,23 @@ MessageDatabase::MessageDatabase() = default;
 MessageDatabase::~MessageDatabase() = default;
 
 void MessageDatabase::NotifyImportedMessage(Message* message) {
-  // Keep this delivery stable while callbacks add or remove registrations.
-  const auto listeners = mMessageListeners.Clone();
-  for (const auto& registration : listeners) {
-    if (mMessageListeners.Contains(registration)) {
-      registration->listener->OnMessagePublished(message, false);
+  // Preserve this helper's per-message boundary, pinning every live recipient
+  // before any callback can release an externally owned folder wrapper.
+  struct Recipient {
+    RefPtr<ListenerRegistration> registration;
+    RefPtr<MessageListener> listener;
+  };
+  PruneExpiredFolderListeners();
+  nsTArray<Recipient> listeners;
+  listeners.SetCapacity(mMessageListeners.Length());
+  for (const auto &registration : mMessageListeners) {
+    if (auto listener = registration->Resolve()) {
+      listeners.AppendElement(Recipient{registration, std::move(listener)});
+    }
+  }
+  for (const auto &recipient : listeners) {
+    if (mMessageListeners.Contains(recipient.registration)) {
+      recipient.listener->OnMessagePublished(message, false);
     }
   }
 }
@@ -99,12 +127,18 @@ nsresult MessageDatabase::PrepareMessageBatch(
       UniquePtr<QueuedMessageBatch>(new (fallible) QueuedMessageBatch());
   NS_ENSURE_TRUE(batch, NS_ERROR_OUT_OF_MEMORY);
   batch->id = mLastMessageBatch + 1;
-  if (!batch->deliveries.SetLength(mMessageListeners.Length(), fallible) ||
+  PruneExpiredFolderListeners();
+  if (!batch->deliveries.SetCapacity(mMessageListeners.Length(), fallible) ||
       !mMessageBatches.SetCapacity(mMessageBatches.Length() + 1, fallible)) {
     return NS_ERROR_OUT_OF_MEMORY;
   }
-  for (size_t i = 0; i < mMessageListeners.Length(); ++i) {
-    batch->deliveries[i].registration = mMessageListeners[i];
+  for (const auto &registration : mMessageListeners) {
+    if (auto listener = registration->Resolve()) {
+      QueuedMessageBatch::Delivery *delivery =
+          batch->deliveries.AppendElement();
+      delivery->registration = registration;
+      delivery->listener = std::move(listener);
+    }
   }
   output = std::move(batch);
   return NS_OK;
@@ -113,7 +147,7 @@ nsresult MessageDatabase::PrepareMessageBatch(
 nsresult MessageDatabase::CaptureThreadViewsBeforeInsert(
     QueuedMessageBatch& batch) {
   for (auto& delivery : batch.deliveries) {
-    MOZ_TRY(delivery.registration->listener->CaptureThreadViewBeforeInsert(
+    MOZ_TRY(delivery.listener->CaptureThreadViewBeforeInsert(
         delivery.beforeViewData));
   }
   return NS_OK;
@@ -140,7 +174,7 @@ void MessageDatabase::DrainMessageBatches() {
       for (const auto& body : batch->bodies) {
         for (auto& delivery : batch->deliveries) {
           if (mMessageListeners.Contains(delivery.registration)) {
-            delivery.registration->listener->OnMessageBodyChangedCaptured(
+            delivery.listener->OnMessageBodyChangedCaptured(
                 body.before, body.after, body.oldHeader, body.live,
                 body.oldBody, body.newBody);
           }
@@ -152,7 +186,7 @@ void MessageDatabase::DrainMessageBatches() {
       if (!mMessageListeners.Contains(delivery.registration)) {
         continue;
       }
-      auto* listener = delivery.registration->listener.get();
+      auto *listener = delivery.listener.get();
       switch (batch->kind) {
         case QueuedMessageBatch::Kind::Thread:
           listener->DeliverThreadBatch(delivery.prepared);
@@ -4157,14 +4191,30 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
 NS_IMETHODIMP_(void)
 MessageDatabase::AddMessageListener(MessageListener* aListener) {
   if (aListener) {
+    PruneExpiredFolderListeners();
     mMessageListeners.AppendElement(new ListenerRegistration(aListener));
+  }
+}
+
+void MessageDatabase::AddFolderMessageListener(PerFolderDatabase *listener) {
+  if (listener) {
+    PruneExpiredFolderListeners();
+    mMessageListeners.AppendElement(new ListenerRegistration(listener));
+  }
+}
+
+void MessageDatabase::PruneExpiredFolderListeners() {
+  for (size_t i = mMessageListeners.Length(); i; --i) {
+    if (mMessageListeners[i - 1]->Expired()) {
+      mMessageListeners.RemoveElementAt(i - 1);
+    }
   }
 }
 
 NS_IMETHODIMP_(void)
 MessageDatabase::RemoveMessageListener(MessageListener* aListener) {
   for (size_t i = 0; i < mMessageListeners.Length(); ++i) {
-    if (mMessageListeners[i]->listener == aListener) {
+    if (mMessageListeners[i]->identity == aListener) {
       mMessageListeners.RemoveElementAt(i);
       break;
     }
@@ -5357,7 +5407,7 @@ nsresult MessageDatabase::PrepareConversationBatch(
   MOZ_TRY(ApplyThreadWordRemap(remaps));
   notification.kind = QueuedMessageBatch::Kind::Thread;
   for (auto& delivery : notification.deliveries) {
-    auto* listener = delivery.registration->listener.get();
+    auto *listener = delivery.listener.get();
     NS_ENSURE_TRUE(
         captured.changedKeys.IsEmpty() || listener->SupportsThreadChanges(),
         NS_ERROR_NOT_AVAILABLE);

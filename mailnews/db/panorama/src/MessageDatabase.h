@@ -542,6 +542,7 @@ class MessageDatabase : public nsIMessageDatabase {
   void TrimCache();
 
   struct ListenerRegistration;
+  void NotifyImportedMessage(Message* message);
   struct QueuedMessageBatch;
   nsresult PrepareMessageBatch(UniquePtr<QueuedMessageBatch>& output);
   nsresult CaptureThreadViewsBeforeInsert(QueuedMessageBatch& batch);

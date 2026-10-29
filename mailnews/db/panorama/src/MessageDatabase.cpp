@@ -80,6 +80,16 @@ struct MessageDatabase::QueuedMessageBatch {
 MessageDatabase::MessageDatabase() = default;
 MessageDatabase::~MessageDatabase() = default;
 
+void MessageDatabase::NotifyImportedMessage(Message* message) {
+  // Keep this delivery stable while callbacks add or remove registrations.
+  const auto listeners = mMessageListeners.Clone();
+  for (const auto& registration : listeners) {
+    if (mMessageListeners.Contains(registration)) {
+      registration->listener->OnMessagePublished(message, false);
+    }
+  }
+}
+
 nsresult MessageDatabase::PrepareMessageBatch(
     UniquePtr<QueuedMessageBatch>& output) {
   NS_ENSURE_TRUE(mLastMessageBatch < UINT64_MAX, NS_ERROR_ILLEGAL_VALUE);

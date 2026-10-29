@@ -1813,10 +1813,7 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
   }
   output = std::move(*receipt);
   for (const auto& message : live) {
-    for (MessageListener* listener :
-         messages->mMessageListeners.EndLimitedRange()) {
-      listener->OnMessagePublished(message, false);
-    }
+    messages->NotifyImportedMessage(message.get());
   }
   return NS_OK;
 }

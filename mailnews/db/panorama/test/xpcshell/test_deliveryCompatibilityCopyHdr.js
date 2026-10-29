@@ -338,3 +338,132 @@ add_task(function test_decodedRecipientsPropagateActualHeaderReadErrors() {
     );
   }
 });
+
+add_task(function test_effectiveCharsetPreservesRawValuesAndPresence() {
+  const folder = root.createLocalSubfolder("effective-charset");
+  const db = folder.msgDatabase;
+  const draft = db.createNewHdr();
+  draft.messageId = "charset-absent@mime.invalid";
+  const properties = draft.properties;
+  Assert.ok(!properties.includes("msgCharSet"));
+  Assert.equal(draft.charset, "");
+  Assert.equal(draft.effectiveCharset, "UTF-8");
+  Assert.deepEqual(draft.properties, properties);
+  const header = db.attachHdr(draft, false);
+  Assert.strictEqual(header.folder, folder);
+  Assert.equal(header.effectiveCharset, "UTF-8");
+  Assert.ok(!header.properties.includes("msgCharSet"));
+  for (const [index, charset] of [
+    "",
+    "us-ascii",
+    "US-ASCII",
+    "ISO-8859-1",
+    "UTF-8",
+    "X-Exact",
+  ].entries()) {
+    const pending = makeDraft(db, `charset-${index}@mime.invalid`);
+    pending.charset = charset;
+    const expected = !charset || charset === "us-ascii" ? "UTF-8" : charset;
+    const before = pending.properties;
+    Assert.ok(before.includes("msgCharSet"));
+    Assert.equal(pending.charset, charset);
+    Assert.equal(pending.effectiveCharset, expected);
+    Assert.deepEqual(pending.properties, before);
+    const attached = db.attachHdr(pending, false);
+    const attachedProperties = attached.properties;
+    Assert.ok(attachedProperties.includes("msgCharSet"));
+    Assert.equal(attached.charset, charset);
+    Assert.equal(attached.effectiveCharset, expected);
+    Assert.deepEqual(attached.properties, attachedProperties);
+    Assert.strictEqual(attached.folder, folder);
+  }
+});
+
+add_task(function test_effectiveNewsCharsetUsesActualServer() {
+  const server = MailServices.accounts.createIncomingServer(
+    "",
+    "charset.invalid",
+    "nntp"
+  );
+  const account = MailServices.accounts.createAccount();
+  account.incomingServer = server;
+  registerCleanupFunction(() =>
+    MailServices.accounts.removeAccount(account, false)
+  );
+  const news = server.QueryInterface(Ci.nsINntpIncomingServer);
+  news.charset = "windows-1251";
+  const folder = server.rootFolder
+    .QueryInterface(Ci.nsIMsgNewsFolder)
+    .addNewsgroup("charset.group", "");
+  Assert.strictEqual(folder.server, server);
+  const db = database
+    .QueryInterface(Ci.nsIMsgDBService)
+    .openFolderDB(folder, false);
+  for (const [index, charset] of [
+    "",
+    "us-ascii",
+    "US-ASCII",
+    "ISO-8859-1",
+  ].entries()) {
+    const pending = makeDraft(db, `news-charset-${index}@mime.invalid`);
+    pending.charset = charset;
+    const expected =
+      !charset || charset === "us-ascii" ? "windows-1251" : charset;
+    Assert.strictEqual(pending.folder, folder);
+    Assert.equal(pending.effectiveCharset, expected);
+    Assert.equal(pending.charset, charset);
+    const header = db.attachHdr(pending, false);
+    Assert.strictEqual(header.folder, folder);
+    Assert.equal(header.effectiveCharset, expected);
+    Assert.equal(header.charset, charset);
+  }
+});
+
+add_task(function test_effectiveCharsetKeepsOriginalReadErrors() {
+  const connection = database.connectionForTests;
+  const row = connection.createStatement("SELECT 1 FROM messages WHERE id = 0");
+  try {
+    Assert.ok(!row.executeStep());
+  } finally {
+    row.finalize();
+  }
+  const folder = root.createLocalSubfolder("charset-read-error");
+  const db = folder.msgDatabase;
+  const pending = makeDraft(db, "charset-read-error@mime.invalid");
+  const header = db.attachHdr(pending, false);
+  connection.executeSimpleSQL(
+    "ALTER TABLE message_properties RENAME TO unavailable_charset_properties"
+  );
+  try {
+    Assert.throws(
+      () => header.charset,
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => header.effectiveCharset,
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_charset_properties RENAME TO message_properties"
+    );
+  }
+  Assert.equal(header.charset, "ISO-8859-1");
+  Assert.equal(header.effectiveCharset, "ISO-8859-1");
+  const missing = messageDB.getMessage(0);
+  Assert.equal(missing.charset, "");
+  Assert.throws(() => missing.effectiveCharset, /NS_ERROR_UNEXPECTED/);
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO unavailable_charset_messages"
+  );
+  try {
+    Assert.throws(
+      () => missing.effectiveCharset,
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_charset_messages RENAME TO messages"
+    );
+  }
+});

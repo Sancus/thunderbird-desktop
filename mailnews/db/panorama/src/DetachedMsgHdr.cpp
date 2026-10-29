@@ -12,6 +12,8 @@
 #include "mozilla/Try.h"
 #include "nsIDatabaseCore.h"
 #include "nsIFolderDatabase.h"
+#include "nsIMsgFolder.h"
+#include "nsIMsgNewsFolder.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 
@@ -437,7 +439,21 @@ NS_IMETHODIMP DetachedMsgHdr::SetCharset(const nsACString& charset) {
 
 NS_IMETHODIMP DetachedMsgHdr::GetEffectiveCharset(
     nsACString& effectiveCharset) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  nsAutoCString charset;
+  MOZ_TRY(GetCharset(charset));
+  if (charset.IsEmpty() || charset.EqualsLiteral("us-ascii")) {
+    nsCOMPtr<nsIMsgFolder> folder;
+    MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+    NS_ENSURE_TRUE(folder, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgNewsFolder> newsFolder = do_QueryInterface(folder);
+    if (newsFolder) {
+      MOZ_TRY(newsFolder->GetCharset(charset));
+    } else {
+      charset.AssignLiteral("UTF-8");
+    }
+  }
+  effectiveCharset.Assign(charset);
+  return NS_OK;
 }
 
 NS_IMETHODIMP DetachedMsgHdr::GetAccountKey(nsACString& accountKey) {

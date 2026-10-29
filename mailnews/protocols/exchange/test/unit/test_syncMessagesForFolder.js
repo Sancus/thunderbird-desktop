@@ -913,3 +913,90 @@ async function getMessageText(header) {
   );
   return deferred.promise;
 }
+
+add_task(async function testCompleteHeaderOnPublicationEws() {
+  await testCompleteHeaderOnPublication(ewsServer, incomingEwsServer);
+});
+
+add_task(async function testCompleteHeaderOnPublicationGraph() {
+  await testCompleteHeaderOnPublication(graphServer, incomingGraphServer);
+});
+
+/**
+ * Check server metadata in the first database-added callback and after replay.
+ *
+ * @param {MockServer} mockServer - The protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - The configured account server.
+ * @returns {Promise<void>} Resolves after initial sync and replay.
+ */
+async function testCompleteHeaderOnPublication(mockServer, incomingServer) {
+  const folderName = `${incomingServer.type}_complete_publication`;
+  mockServer.appendRemoteFolder(
+    new RemoteFolder(folderName, "root", folderName, folderName)
+  );
+  await syncFolder(incomingServer, incomingServer.rootFolder);
+  const folder = incomingServer.rootFolder.getChildNamed(folderName);
+  const message = generator.makeMessage({
+    bodyPart: new SyntheticPartLeaf("Complete server preview."),
+  });
+  message.metaState.read = true;
+  message.metaState.flagged = true;
+  mockServer.addMessages(folderName, [message]);
+
+  const added = [];
+  const db = folder.msgDatabase;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrAdded(header) {
+      added.push({
+        key: header.messageKey,
+        folderURI: header.folder.URI,
+        ewsId: header.getStringProperty("ewsId"),
+        preview: header.getStringProperty("preview"),
+        size: header.messageSize,
+        read: header.isRead,
+        flagged: header.isFlagged,
+      });
+    },
+    onHdrFlagsChanged() {},
+    onHdrDeleted() {},
+    onParentChanged() {},
+    onAnnouncerGoingAway() {},
+    onReadChanged() {},
+    onJunkScoreChanged() {},
+    onHdrPropertyChanged() {},
+    onEvent() {},
+  };
+  db.addListener(listener);
+  try {
+    await syncFolder(incomingServer, folder);
+    await syncFolder(incomingServer, folder);
+  } finally {
+    db.removeListener(listener);
+  }
+
+  Assert.equal(added.length, 1, "An unchanged resync does not add a duplicate");
+  const hdr = db.getMsgHdrForMessageID(message.messageId);
+  Assert.ok(hdr, "The synced message is stored");
+  Assert.equal(
+    added[0].key,
+    hdr.messageKey,
+    "Publication keeps its global key"
+  );
+  Assert.equal(added[0].folderURI, folder.URI, "Publication has its folder");
+  Assert.equal(added[0].ewsId, message.messageId, "The server ID is published");
+  Assert.equal(
+    added[0].preview,
+    incomingServer.type == "ews"
+      ? message.bodyPart.body.substring(0, 256)
+      : message.bodyPart.toMessageString().slice(0, 10),
+    "The server preview is present in the first callback"
+  );
+  Assert.equal(
+    added[0].size,
+    message.toMessageString().length,
+    "The first callback has the server-provided message size"
+  );
+  Assert.ok(added[0].read, "The server read flag is published");
+  Assert.ok(added[0].flagged, "The server flagged state is published");
+}

@@ -152,8 +152,7 @@ class ExchangeMessageSyncHandler : public IExchangeMessageSyncListener,
     rv = ewsClient->SyncMessagesForFolder(this, ewsFolderId, syncStateToken);
     if (NS_FAILED(rv)) {
       // We called onStart() so must call onStop() too.
-      mOnStop(rv, {}, {});
-      rv = NS_OK;
+      return Finish(rv);
     }
 
     return rv;
@@ -202,20 +201,21 @@ class ExchangeMessageSyncHandler : public IExchangeMessageSyncListener,
       raw.flags |= nsMsgMessageFlags::Marked;
     }
 
-    // Add to database.
-    nsCOMPtr<nsIMsgDBHdr> newHeader;
-    MOZ_TRY(mDB->AddMsgHdr(&raw, true, getter_AddRefs(newHeader)));
-
-    // Link the message to the server EwsId.
-    MOZ_TRY(newHeader->SetStringProperty(kExchangeIdProperty, ewsId));
-
-    // Some non-RFC5322 details to mop up.
-    if (messageSize) {
-      MOZ_TRY(newHeader->SetMessageSize(messageSize));
-    }
+    // Publish the server identity and metadata with the complete header.
+    raw.extras.AppendElement(
+        RawHdr::kv{nsCString(kExchangeIdProperty), nsCString(ewsId)});
     if (!preview.IsEmpty()) {
-      MOZ_TRY(newHeader->SetStringProperty("preview", preview));
+      raw.extras.AppendElement(RawHdr::kv{"preview"_ns, nsCString(preview)});
     }
+
+    nsCOMPtr<nsIMsgDBHdr> draft;
+    MOZ_TRY(mDB->CreateNewHdr(getter_AddRefs(draft)));
+    MOZ_TRY(ApplyRawHdrToDbHdr(raw, draft));
+    if (messageSize) {
+      MOZ_TRY(draft->SetMessageSize(messageSize));
+    }
+    nsCOMPtr<nsIMsgDBHdr> newHeader;
+    MOZ_TRY(mDB->AttachHdr(draft, true, getter_AddRefs(newHeader)));
 
     nsMsgKey newKey;
     MOZ_TRY(newHeader->GetMessageKey(&newKey));
@@ -360,16 +360,7 @@ class ExchangeMessageSyncHandler : public IExchangeMessageSyncListener,
   };
 
   // Called when the operation succeeds.
-  NS_IMETHOD OnSyncComplete() override {
-    // We might have processed unread count updates via `OnMessageUpdated`, in
-    // which case we need to make sure the message counts are up to date.
-    MOZ_TRY(mDB->SyncCounts());
-    MOZ_TRY(mFolder->UpdateSummaryTotals(true));
-
-    MOZ_ASSERT(mNewMessages.Length() == mNewHeaders.Length());
-    mOnStop(NS_OK, mNewMessages, mNewHeaders);
-    return NS_OK;
-  }
+  NS_IMETHOD OnSyncComplete() override { return Finish(NS_OK); }
 
   //
   // IExchangeFallibleOperationListener implementation
@@ -378,21 +369,32 @@ class ExchangeMessageSyncHandler : public IExchangeMessageSyncListener,
   // Called if sync operation fails.
   NS_IMETHOD OnOperationFailure(nsresult status) override {
     MOZ_ASSERT(NS_FAILED(status));
+    return Finish(status);
+  }
 
-    // We might have processed unread count updates via `OnMessageUpdated` (even
-    // if the sync failed), in which case we need to make sure the message
-    // counts are up to date.
-    MOZ_TRY(mDB->SyncCounts());
-    MOZ_TRY(mFolder->UpdateSummaryTotals(true));
+ private:
+  nsresult Finish(nsresult status) {
+    if (mFinished) {
+      return NS_OK;
+    }
+    mFinished = true;
 
-    // Even if the operation fails some messages may have already been added
-    // to the database and the folder should be told about them.
+    // Refresh counts even after a partial failure, without losing the original
+    // error or preventing the caller's completion notification.
+    nsresult refreshStatus = mDB->SyncCounts();
+    if (NS_SUCCEEDED(refreshStatus)) {
+      refreshStatus = mFolder->UpdateSummaryTotals(true);
+    }
+    if (NS_SUCCEEDED(status)) {
+      status = refreshStatus;
+    }
+
     MOZ_ASSERT(mNewMessages.Length() == mNewHeaders.Length());
     mOnStop(status, mNewMessages, mNewHeaders);
     return NS_OK;
   }
 
- private:
+  bool mFinished = false;
   RefPtr<ExchangeFolder> mFolder;
   RefPtr<nsIMsgDatabase> mDB;
 

@@ -508,12 +508,17 @@ nsresult ExchangeIncomingServer::SyncFolders(
   // kind of queue so we can properly batch and sync folders. In the meantime,
   // though, the Exchange client should handle any kind of rate limiting well
   // enough, so this improvement can come later.
+  MOZ_LOG_FMT(gExchangeLog, mozilla::LogLevel::Debug,
+              "Synchronizing {} folders", folders.Length());
   for (const auto& folder : folders) {
     nsresult rv = folder->GetNewMessages(aMsgWindow, urlListener);
     if (NS_FAILED(rv)) {
       // If we encounter an error, just log it rather than fail the whole sync.
       nsCString name;
       folder->GetName(name);
+      MOZ_LOG_FMT(gExchangeLog, mozilla::LogLevel::Error,
+                  "Failed to start synchronization for {}: {}", name,
+                  mozilla::GetStaticErrorName(rv));
       NS_ERROR(nsPrintfCString("failed to get new messages for folder %s: %s",
                                name.get(), mozilla::GetStaticErrorName(rv))
                    .get());

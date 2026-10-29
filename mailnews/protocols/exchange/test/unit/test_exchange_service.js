@@ -45,3 +45,18 @@ add_task(async function test_getUrlForUriGraph() {
     "x-moz-graph -> x-moz-graph"
   );
 });
+
+add_task(function test_unopenedChannelIsNotCanceled() {
+  for (const scheme of ["x-moz-ews", "x-moz-graph"]) {
+    const channel = Services.io.newChannelFromURI(
+      Services.io.newURI(`${scheme}://name@localhost/folder/1`),
+      null,
+      Services.scriptSecurityManager.getSystemPrincipal(),
+      null,
+      Ci.nsILoadInfo.SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+      Ci.nsIContentPolicy.TYPE_OTHER
+    );
+    Assert.ok(!channel.canceled, "An unopened channel is not canceled");
+    Assert.ok(!channel.isPending(), "An unopened channel is not pending");
+  }
+});

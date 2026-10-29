@@ -127,6 +127,12 @@ support-files = ["../../../../base/test/unit/data/panacea.dat"]
 # Native retained Windows import/activation remains a separate held composition.
 skip-if = ["os == 'win'"]
 
+["test_MigrationProfile.js"]
+# Native retained Windows import/activation remains a separate held composition.
+skip-if = ["os == 'win'"]
+
+["test_MigrationRecovery.js"]
+
 ["test_MorkFolderCacheImport.js"]
 support-files = ["../../../../base/test/unit/data/panacea.dat"]
 

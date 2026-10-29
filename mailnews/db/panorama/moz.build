@@ -18,6 +18,8 @@ EXTRA_JS_MODULES.panorama += [
     "migration/MigrationCoordinator.sys.mjs",
     "migration/MigrationJournal.sys.mjs",
     "migration/MigrationMessageMap.sys.mjs",
+    "migration/MigrationProfile.sys.mjs",
+    "migration/MigrationRecovery.sys.mjs",
     "migration/MigrationSource.sys.mjs",
     "migration/MorkAddressBookReader.sys.mjs",
     "migration/MorkFolderCache.sys.mjs",

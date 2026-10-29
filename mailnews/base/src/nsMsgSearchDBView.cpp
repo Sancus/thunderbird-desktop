@@ -4,6 +4,7 @@
 
 #include "nsMsgSearchDBView.h"
 
+#include "mozilla/AutoRestore.h"
 #include "mozilla/Components.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ProfilerMarkers.h"
@@ -152,9 +153,12 @@ NS_IMETHODIMP
 nsMsgSearchDBView::OnHdrDeleted(nsIMsgDBHdr* aHdrDeleted, nsMsgKey aParentKey,
                                 int32_t aFlags,
                                 nsIDBChangeListener* aInstigator) {
-  if (m_viewFlags & nsMsgViewFlagsType::kGroupBySort)
+  if (m_viewFlags & nsMsgViewFlagsType::kGroupBySort) {
+    mozilla::AutoRestore<nsCOMPtr<nsIMsgDBHdr>> restore(mDeletedHdr);
+    mDeletedHdr = aHdrDeleted;
     return nsMsgGroupView::OnHdrDeleted(aHdrDeleted, aParentKey, aFlags,
                                         aInstigator);
+  }
 
   if (m_viewFlags & nsMsgViewFlagsType::kThreadedDisplay) {
     nsMsgViewIndex deletedIndex = FindHdr(aHdrDeleted);
@@ -171,7 +175,8 @@ nsMsgSearchDBView::OnHdrDeleted(nsIMsgDBHdr* aHdrDeleted, nsMsgKey aParentKey,
       }
 
       savedFlags = m_flags[deletedIndex];
-      RemoveByIndex(deletedIndex);
+      nsresult rv = RemoveByIndexWithHdr(deletedIndex, aHdrDeleted);
+      NS_ENSURE_SUCCESS(rv, rv);
 
       if (isMsgSelected) {
         // Now tell the front end that the delete happened.
@@ -756,12 +761,32 @@ NS_IMETHODIMP nsMsgSearchDBView::DoCommand(nsMsgViewCommandTypeValue command) {
 nsresult nsMsgSearchDBView::RemoveByIndex(nsMsgViewIndex index) {
   if (!IsValidIndex(index)) return NS_MSG_INVALID_DBVIEW_INDEX;
 
+  if (mDeletedHdr) {
+    nsMsgKey key;
+    nsCOMPtr<nsIMsgFolder> folder;
+    if (NS_SUCCEEDED(mDeletedHdr->GetMessageKey(&key)) &&
+        m_keys[index] == key &&
+        NS_SUCCEEDED(mDeletedHdr->GetFolder(getter_AddRefs(folder))) &&
+        folder == GetFolderForViewIndex(index)) {
+      return RemoveByIndexWithHdr(index, mDeletedHdr);
+    }
+  }
+
+  nsCOMPtr<nsIMsgDBHdr> msgHdr;
   if (m_viewFlags & nsMsgViewFlagsType::kThreadedDisplay) {
-    nsCOMPtr<nsIMsgDBHdr> msgHdr;
-    nsCOMPtr<nsIMsgThread> thread;
     nsresult rv = GetMsgHdrForViewIndex(index, getter_AddRefs(msgHdr));
     NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return RemoveByIndexWithHdr(index, msgHdr);
+}
 
+nsresult nsMsgSearchDBView::RemoveByIndexWithHdr(nsMsgViewIndex index,
+                                                 nsIMsgDBHdr* msgHdr) {
+  if (!IsValidIndex(index)) return NS_MSG_INVALID_DBVIEW_INDEX;
+
+  if (m_viewFlags & nsMsgViewFlagsType::kThreadedDisplay) {
+    NS_ENSURE_ARG_POINTER(msgHdr);
+    nsCOMPtr<nsIMsgThread> thread;
     GetXFThreadFromMsgHdr(msgHdr, getter_AddRefs(thread));
     if (thread) {
       nsMsgXFViewThread* viewThread =

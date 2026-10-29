@@ -87,6 +87,7 @@ class nsMsgSearchDBView : public nsMsgGroupView,
   virtual nsresult GetDBForViewIndex(nsMsgViewIndex index,
                                      nsIMsgDatabase** db) override;
   virtual nsresult RemoveByIndex(nsMsgViewIndex index) override;
+  nsresult RemoveByIndexWithHdr(nsMsgViewIndex index, nsIMsgDBHdr* msgHdr);
   virtual nsresult CopyMessages(nsIMsgWindow* window,
                                 nsTArray<nsMsgViewIndex> const& selection,
                                 bool isMove, nsIMsgFolder* destFolder) override;
@@ -131,6 +132,8 @@ class nsMsgSearchDBView : public nsMsgGroupView,
   // Augments the existing arrays in nsMsgDBView (m_keys, m_flags and m_levels),
   // and is kept in sync with them.
   nsCOMArray<nsIMsgFolder> m_folders;
+  // The grouped base path may remove the callback's already deleted row.
+  nsCOMPtr<nsIMsgDBHdr> mDeletedHdr;
 
   // Used for copy, move, and delete operations.
   nsTArray<nsTArray<RefPtr<nsIMsgDBHdr>>> m_hdrsForEachFolder;

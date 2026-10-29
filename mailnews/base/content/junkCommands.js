@@ -7,9 +7,6 @@
  */
 
 /*
- * TODO: These functions make the false assumption that a view only contains
- *       a single folder. This is not true for XF saved searches.
- *
  * globals prerequisites used:
  *
  *   top.window.MsgStatusFeedback
@@ -25,59 +22,100 @@ var { AppConstants } = ChromeUtils.importESModule(
 );
 
 /**
- * Performs required operations on a list of newly-classified junk messages.
+ * Apply junk actions through each message's physical folder.
+ * Skip messages moved, deleted or reclassified before their folder action.
  *
- * @param {nsIMsgFolder} aFolder - The folder with messages being marked as
- *   junk.
  * @param {nsIMsgDBHdr[]} aJunkMsgHdrs - New junk messages.
  * @param {nsIMsgDBHdr[]} aGoodMsgHdrs - New good messages.
+ * @returns {Promise<void>} Resolves after all folder actions complete, or
+ *   rejects if a folder action fails.
  */
-async function performActionsOnJunkMsgs(aFolder, aJunkMsgHdrs, aGoodMsgHdrs) {
-  let deferred = Promise.withResolvers();
-  aFolder.performActionsOnJunkMsgs(aJunkMsgHdrs, true, top.msgWindow, {
-    OnStopRunningUrl(url, status) {
-      if (Components.isSuccessCode(status)) {
-        deferred.resolve();
-      } else {
-        deferred.reject(
-          new Error(
-            `performActionsOnJunkMsgs failed with status: ${status.toString(16)}`
-          )
-        );
+async function performActionsOnJunkMsgs(aJunkMsgHdrs, aGoodMsgHdrs) {
+  const batches = [];
+  for (const [messages, isJunk] of [
+    [aJunkMsgHdrs, true],
+    [aGoodMsgHdrs, false],
+  ]) {
+    const folders = new Map();
+    for (const header of messages) {
+      const folder = header.folder;
+      if (!folders.has(folder.URI)) {
+        folders.set(folder.URI, { folder, messages: [], isJunk });
       }
-    },
-  });
-  await deferred.promise;
-  deferred = Promise.withResolvers();
-  aFolder.performActionsOnJunkMsgs(aGoodMsgHdrs, false, top.msgWindow, {
-    OnStopRunningUrl(url, status) {
-      if (Components.isSuccessCode(status)) {
-        deferred.resolve();
-      } else {
-        deferred.reject(
-          new Error(
-            `performActionsOnJunkMsgs failed with status: ${status.toString(16)}`
-          )
-        );
+      folders.get(folder.URI).messages.push({
+        key: header.messageKey,
+        origin: header.getStringProperty("junkscoreorigin"),
+        score: header.getStringProperty("junkscore"),
+      });
+    }
+    batches.push(...folders.values());
+  }
+  for (const { folder, messages, isJunk } of batches) {
+    const db = folder.msgDatabase;
+    const headers = messages.flatMap(({ key, origin, score }) => {
+      if (!db.containsKey(key)) {
+        return [];
       }
-    },
-  });
-  await deferred.promise;
+      const header = db.getMsgHdrForKey(key);
+      return header.getStringProperty("junkscoreorigin") == origin &&
+        header.getStringProperty("junkscore") == score
+        ? [header]
+        : [];
+    });
+    if (!headers.length) {
+      continue;
+    }
+    await new Promise((resolve, reject) => {
+      folder.performActionsOnJunkMsgs(headers, isJunk, top.msgWindow, {
+        OnStopRunningUrl(url, status) {
+          if (Components.isSuccessCode(status)) {
+            resolve();
+          } else {
+            reject(
+              new Error(
+                `performActionsOnJunkMsgs failed with status: ${status.toString(16)}`
+              )
+            );
+          }
+        },
+      });
+    });
+  }
+}
+
+/**
+ * Write classification fields while the original message has no user override.
+ *
+ * @param {{folder: nsIMsgFolder, key: integer}} message - Captured location.
+ * @param {Array<[string, string|number]>} properties - Ordered field writes.
+ * @returns {boolean} Whether the message remains without a user override.
+ */
+function setJunkProperties(message, properties) {
+  const db = message.folder.msgDatabase;
+  const isCurrent = () =>
+    db.containsKey(message.key) &&
+    db.getMsgHdrForKey(message.key).getStringProperty("junkscoreorigin") !=
+      "user";
+  for (const [name, value] of properties) {
+    if (!isCurrent()) {
+      return false;
+    }
+    db.setStringProperty(message.key, name, value);
+  }
+  return isCurrent();
 }
 
 /**
  * Helper object storing the list of pending messages to process,
  * and implementing junk processing callback.
  *
- * @param {nsIMsgFolder} aFolder - The folder with messages to be analyzed for junk.
  * @param {integer} aTotalMessages - Number of messages to process, used for
  *   progress report only.
  */
 
-function MessageClassifier(aFolder, aTotalMessages) {
-  this.mFolder = aFolder;
-  this.mJunkMsgHdrs = [];
-  this.mGoodMsgHdrs = [];
+function MessageClassifier(aTotalMessages) {
+  this.mJunkMessages = [];
+  this.mGoodMessages = [];
   this.mMessages = {};
   this.mMessageQueue = [];
   this.mTotalMessages = aTotalMessages;
@@ -99,28 +137,37 @@ MessageClassifier.prototype = {
    *   whitelists
    */
   analyzeMessage(aMsgHdr, aSpamSettings) {
-    var junkscoreorigin = aMsgHdr.getStringProperty("junkscoreorigin");
-    if (junkscoreorigin == "user") {
-      // don't override user-set junk status
+    const message = { folder: aMsgHdr.folder, key: aMsgHdr.messageKey };
+    if (!message.folder.msgDatabase.containsKey(message.key)) {
+      return;
+    }
+    const origin = aMsgHdr.getStringProperty("junkscoreorigin");
+    if (origin == "user") {
+      // Don't override user-set junk status.
       return;
     }
 
-    // check whitelisting
     if (aSpamSettings.checkWhiteList(aMsgHdr)) {
-      // message is ham from whitelist
-      var db = aMsgHdr.folder.msgDatabase;
-      db.setStringProperty(
-        aMsgHdr.messageKey,
-        "junkscore",
-        Ci.nsIJunkMailPlugin.IS_HAM_SCORE
-      );
-      db.setStringProperty(aMsgHdr.messageKey, "junkscoreorigin", "whitelist");
-      this.mGoodMsgHdrs.push(aMsgHdr);
+      if (
+        setJunkProperties(message, [
+          ["junkscore", Ci.nsIJunkMailPlugin.IS_HAM_SCORE],
+          ["junkscoreorigin", "whitelist"],
+        ])
+      ) {
+        this.mGoodMessages.push({
+          ...message,
+          origin: "whitelist",
+          score: String(Ci.nsIJunkMailPlugin.IS_HAM_SCORE),
+        });
+      }
       return;
     }
 
-    const messageURI = aMsgHdr.folder.generateMessageURI(aMsgHdr.messageKey);
-    this.mMessages[messageURI] = aMsgHdr;
+    const messageURI = message.folder.generateMessageURI(message.key);
+    if (Object.hasOwn(this.mMessages, messageURI)) {
+      return;
+    }
+    this.mMessages[messageURI] = message;
     if (this.firstMessage) {
       this.firstMessage = false;
       MailServices.junk.classifyMessage(messageURI, top.msgWindow, this);
@@ -139,34 +186,43 @@ MessageClassifier.prototype = {
    * @see {nsIJunkMailClassificationListener}
    */
   async onMessageClassified(aClassifiedMsgURI, aClassification, aJunkPercent) {
-    if (!aClassifiedMsgURI) {
-      // Ignore end of batch.
+    if (
+      !aClassifiedMsgURI ||
+      !Object.hasOwn(this.mMessages, aClassifiedMsgURI)
+    ) {
       return;
     }
-    var score =
+    const message = this.mMessages[aClassifiedMsgURI];
+    delete this.mMessages[aClassifiedMsgURI];
+    const score =
       aClassification == Ci.nsIJunkMailPlugin.JUNK
         ? Ci.nsIJunkMailPlugin.IS_SPAM_SCORE
         : Ci.nsIJunkMailPlugin.IS_HAM_SCORE;
     const statusDisplayInterval = 1000; // milliseconds between status updates
 
-    // set these props via the db (instead of the message header
-    // directly) so that the nsMsgDBView knows to update the UI
-    //
-    var msgHdr = this.mMessages[aClassifiedMsgURI];
-    var db = msgHdr.folder.msgDatabase;
-    db.setStringProperty(msgHdr.messageKey, "junkscore", score);
-    db.setStringProperty(msgHdr.messageKey, "junkscoreorigin", "plugin");
-    db.setStringProperty(msgHdr.messageKey, "junkpercent", aJunkPercent);
-
-    if (aClassification == Ci.nsIJunkMailPlugin.JUNK) {
-      this.mJunkMsgHdrs.push(msgHdr);
-    } else if (aClassification == Ci.nsIJunkMailPlugin.GOOD) {
-      this.mGoodMsgHdrs.push(msgHdr);
+    if (
+      setJunkProperties(message, [
+        ["junkscore", score],
+        ["junkscoreorigin", "plugin"],
+        ["junkpercent", aJunkPercent],
+      ])
+    ) {
+      if (aClassification == Ci.nsIJunkMailPlugin.JUNK) {
+        this.mJunkMessages.push({
+          ...message,
+          origin: "plugin",
+          score: String(score),
+        });
+      } else if (aClassification == Ci.nsIJunkMailPlugin.GOOD) {
+        this.mGoodMessages.push({
+          ...message,
+          origin: "plugin",
+          score: String(score),
+        });
+      }
     }
 
-    var nextMsgURI = this.mMessageQueue.shift();
-
-    if (nextMsgURI) {
+    if (this.mMessageQueue.length) {
       ++this.mProcessedMessages;
       if (Date.now() > this.lastStatusTime + statusDisplayInterval) {
         this.lastStatusTime = Date.now();
@@ -181,21 +237,52 @@ MessageClassifier.prototype = {
         );
         MailServices.feedback.reportStatus(status);
       }
+    }
+    let nextMsgURI = this.mMessageQueue.shift();
+    while (nextMsgURI) {
+      const nextMessage = this.mMessages[nextMsgURI];
+      if (nextMessage?.folder.msgDatabase.containsKey(nextMessage.key)) {
+        break;
+      }
+      delete this.mMessages[nextMsgURI];
+      nextMsgURI = this.mMessageQueue.shift();
+    }
+    if (nextMsgURI) {
       MailServices.junk.classifyMessage(nextMsgURI, top.msgWindow, this);
     } else {
       const status = await document.l10n.formatValue("spam-processing-message");
       MailServices.feedback.reportStatus(status);
-      await performActionsOnJunkMsgs(
-        this.mFolder,
-        this.mJunkMsgHdrs,
-        this.mGoodMsgHdrs
-      );
+      await this.performActions();
       // This notification only exists for tests.
       Services.obs.notifyObservers(null, "message-classification-complete");
       setTimeout(() => {
         MailServices.feedback.reportStatus("");
       }, 500);
     }
+  },
+
+  /**
+   * Apply actions to messages with the captured location and classification.
+   *
+   * @returns {Promise<void>} Resolves after the surviving messages' actions.
+   */
+  async performActions() {
+    const currentHeaders = messages =>
+      messages.flatMap(({ folder, key, origin, score }) => {
+        const db = folder.msgDatabase;
+        if (!db.containsKey(key)) {
+          return [];
+        }
+        const header = db.getMsgHdrForKey(key);
+        return header.getStringProperty("junkscoreorigin") == origin &&
+          header.getStringProperty("junkscore") == score
+          ? [header]
+          : [];
+      });
+    await performActionsOnJunkMsgs(
+      currentHeaders(this.mJunkMessages),
+      currentHeaders(this.mGoodMessages)
+    );
   },
 };
 
@@ -239,27 +326,7 @@ async function processFolderForJunk(aAll) {
   }
   const totalMessages = aAll ? count : indices.length;
 
-  // retrieve server and its spam settings via the header of an arbitrary message
-  let tmpMsgURI;
-  for (let i = 0; i < totalMessages; i++) {
-    const index = aAll ? i : indices[i];
-    tmpMsgURI = gDBView.getURIForViewIndex(index);
-    if (tmpMsgURI) {
-      break;
-    }
-    // dummy headers will fail, so look for another
-  }
-  if (!tmpMsgURI) {
-    return;
-  }
-
-  const tmpMsgHdr =
-    MailServices.messageServiceFromURI(tmpMsgURI).messageURIToMsgHdr(tmpMsgURI);
-  const spamSettings = tmpMsgHdr.folder.server.spamSettings;
-
-  // create a classifier instance to classify messages in the folder.
-  const msgClassifier = new MessageClassifier(tmpMsgHdr.folder, totalMessages);
-
+  const messages = [];
   for (let i = 0; i < totalMessages; i++) {
     const index = aAll ? i : indices[i];
     try {
@@ -267,20 +334,26 @@ async function processFolderForJunk(aAll) {
       if (!msgURI) {
         continue;
       }
-      const msgHdr =
+      const header =
         MailServices.messageServiceFromURI(msgURI).messageURIToMsgHdr(msgURI);
-      msgClassifier.analyzeMessage(msgHdr, spamSettings);
+      messages.push({ folder: header.folder, key: header.messageKey });
     } catch (ex) {
-      // blow off errors here - dummy headers will fail
+      // Dummy headers do not identify physical messages.
+    }
+  }
+  const msgClassifier = new MessageClassifier(totalMessages);
+  for (const { folder, key } of messages) {
+    const db = folder.msgDatabase;
+    if (db.containsKey(key)) {
+      msgClassifier.analyzeMessage(
+        db.getMsgHdrForKey(key),
+        folder.server.spamSettings
+      );
     }
   }
   if (msgClassifier.firstMessage) {
-    // the async plugin was not used, maybe all whitelisted?
-    await performActionsOnJunkMsgs(
-      msgClassifier.mFolder,
-      msgClassifier.mJunkMsgHdrs,
-      msgClassifier.mGoodMsgHdrs
-    );
+    // The async plugin was not used, maybe all messages were whitelisted.
+    await msgClassifier.performActions();
   }
 }
 

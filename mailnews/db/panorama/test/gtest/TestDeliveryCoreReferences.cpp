@@ -32,6 +32,7 @@
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgOfflineImapOperation.h"
+#include "nsMsgMessageFlags.h"
 #include "nsImapCore.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
@@ -7290,6 +7291,221 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, db.CaptureMessage(output, child));
   EXPECT_EQ(root, child.threadId);
   EXPECT_EQ(root, child.threadParent);
+}
+
+TEST_F(DeliveryCoreReferences,
+       PartialCompletionPublishesOneCompleteExistingIdentity) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  RawHdr raw;
+  raw.messageId = "partial@invalid"_ns;
+  raw.subject = "old subject"_ns;
+  raw.date = 100;
+  raw.flags = nsMsgMessageFlags::Partial;
+  raw.keywords = "old tags"_ns;
+  raw.storeToken = Some(nsCString("partial-token"_ns));
+  raw.messageSize = Some(uint32_t(12));
+  raw.references = {"old@invalid"_ns};
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &key));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "unrelated"_ns, "1e3"_ns));
+  MessageBodyState expected;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  ASSERT_EQ(NS_OK, db.SetMessageFlag(key, nsMsgMessageFlags::Read, true));
+  ASSERT_EQ(NS_OK, db.SetMessageTags(key, "latest tags"_ns));
+  RawHdr parsed;
+  parsed.messageId = "complete@invalid"_ns;
+  parsed.subject = "complete subject"_ns;
+  parsed.sender = "parsed sender"_ns;
+  parsed.recipients = "parsed recipients"_ns;
+  parsed.ccList = "parsed cc"_ns;
+  parsed.bccList = "parsed bcc"_ns;
+  parsed.date = 300;
+  parsed.priority = nsMsgPriority::highest;
+  parsed.keywords = "stale parsed tags"_ns;
+  parsed.dateReceived = 42000000;
+  parsed.charset = "UTF-8"_ns;
+  parsed.references = {"late@invalid"_ns, ""_ns, "late@invalid"_ns};
+  parsed.extras = {
+      {"Case"_ns, "00042"_ns},        {"Case"_ns, ""_ns},
+      {"case"_ns, "1e3"_ns},          {"café"_ns, "composed"_ns},
+      {"café"_ns, "decomposed"_ns},   {"messageSize"_ns, "00042"_ns},
+      {"dateReceived"_ns, "0002a"_ns}};
+  uint32_t calls = 0;
+  RefPtr<BodyObserver> observer = new BodyObserver(
+      [&](nsIMsgDBHdr* old, Message* live, const MessageBodyState& before,
+          const MessageBodyState& after) {
+        ++calls;
+        EXPECT_EQ(key, after.key);
+        EXPECT_TRUE(before.flags & nsMsgMessageFlags::Partial);
+        EXPECT_FALSE(after.flags & nsMsgMessageFlags::Partial);
+        EXPECT_TRUE(after.flags & nsMsgMessageFlags::Read);
+        bool active;
+        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        EXPECT_FALSE(active);
+        nsCString text;
+        ASSERT_EQ(NS_OK, old->GetSubject(text));
+        EXPECT_EQ("old subject"_ns, text);
+        PRTime date;
+        ASSERT_EQ(NS_OK, old->GetDate(&date));
+        EXPECT_EQ(100, date);
+        ASSERT_EQ(NS_OK, live->GetSubject(text));
+        EXPECT_EQ("complete subject"_ns, text);
+        ASSERT_EQ(NS_OK, live->GetStoreToken(text));
+        EXPECT_EQ("full-token"_ns, text);
+        nsTArray<nsCString> refs;
+        ASSERT_EQ(NS_OK, Stored(key, refs));
+        EXPECT_EQ(
+            (nsTArray<nsCString>{"late@invalid"_ns, ""_ns, "late@invalid"_ns}),
+            refs);
+      });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  FinishedMessageBody finished{"full-token"_ns, 123, 120, 7, true};
+  MessageBodyState output;
+  ASSERT_EQ(NS_OK,
+            db.CompletePartialMessage(expected, parsed, finished, output));
+  EXPECT_EQ(1u, calls);
+  EXPECT_EQ(key, output.key);
+  EXPECT_EQ(123u, output.messageSize);
+  EXPECT_EQ(120u, output.offlineMessageSize);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageTags(key, text));
+  EXPECT_EQ("latest tags"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "unrelated"_ns, text));
+  EXPECT_EQ("1e3"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "Case"_ns, text));
+  EXPECT_TRUE(text.IsEmpty());
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_TRUE(names.Contains("Case"_ns));
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "café"_ns, text));
+  EXPECT_EQ("composed"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "café"_ns, text));
+  EXPECT_EQ("decomposed"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "dateReceived"_ns, text));
+  EXPECT_EQ("0002a"_ns, text);
+  nsMsgPriorityValue priority;
+  ASSERT_EQ(NS_OK, db.GetMessagePriority(key, priority));
+  EXPECT_EQ(nsMsgPriority::highest, priority);
+  db.RemoveMessageListener(observer);
+  cleanup.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  MessageBodyState restored;
+  ASSERT_EQ(NS_OK, reopened.GetMessageBodyState(key, restored));
+  EXPECT_EQ(key, restored.key);
+  EXPECT_EQ(output.storeToken, restored.storeToken);
+  EXPECT_EQ(output.contentRevision, restored.contentRevision);
+  EXPECT_EQ(output.locationRevision, restored.locationRevision);
+  EXPECT_EQ(output.flags, restored.flags);
+  CapturedMessage stored;
+  ASSERT_EQ(NS_OK, reopened.CaptureMessage(key, stored));
+  EXPECT_EQ("complete@invalid"_ns, stored.messageId);
+  EXPECT_EQ("parsed sender"_ns, stored.sender);
+  EXPECT_EQ("parsed recipients"_ns, stored.recipients);
+  EXPECT_EQ("complete subject"_ns, stored.subject);
+  EXPECT_EQ(PRTime(300), stored.date);
+  EXPECT_EQ("latest tags"_ns, stored.tags);
+  EXPECT_EQ(key, stored.threadId);
+  EXPECT_EQ(0u, stored.threadParent);
+  RefPtr<Message> header = new Message(key);
+  ASSERT_EQ(NS_OK, header->GetCcList(text));
+  EXPECT_EQ("parsed cc"_ns, text);
+  ASSERT_EQ(NS_OK, header->GetBccList(text));
+  EXPECT_EQ("parsed bcc"_ns, text);
+  ASSERT_EQ(NS_OK, header->GetPriority(&priority));
+  EXPECT_EQ(nsMsgPriority::highest, priority);
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, Stored(key, references));
+  EXPECT_EQ((nsTArray<nsCString>{"late@invalid"_ns, ""_ns, "late@invalid"_ns}),
+            references);
+  ASSERT_EQ(NS_OK, reopened.GetMessageProperty(key, "unrelated"_ns, text));
+  EXPECT_EQ("1e3"_ns, text);
+}
+
+TEST_F(DeliveryCoreReferences,
+       PartialCompletionFailureRollsBackAllHeaderFacts) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("partial-failure@invalid"_ns, {"old@invalid"_ns}, key));
+  ASSERT_EQ(NS_OK, Add("partial-control@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.SetMessageFlag(key, nsMsgMessageFlags::Partial, true));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "Case"_ns, "old"_ns));
+  MessageBodyState expected;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  RawHdr parsed;
+  parsed.subject = "new subject"_ns;
+  parsed.references = {"new@invalid"_ns};
+  parsed.extras = {{"Case"_ns, "new"_ns}};
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK, mConnection->CreateFunction("partial_fault"_ns, 1, witness));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_partial_metadata BEFORE UPDATE OF subject "
+          "ON messages "
+          "BEGIN SELECT partial_fault(NEW.id); SELECT RAISE(ABORT,'partial metadata'); END"_ns));
+  FinishedMessageBody finished{"finished-retained"_ns, 321, 300, 8, true};
+  MessageBodyState output;
+  output.key = 123;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.CompletePartialMessage(expected, parsed, finished, output));
+  EXPECT_EQ(123u, output.key);
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(key, witness->mLastKey);
+  MessageBodyState current;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, current));
+  EXPECT_EQ(expected.storeToken, current.storeToken);
+  EXPECT_EQ(expected.contentRevision, current.contentRevision);
+  EXPECT_EQ(expected.locationRevision, current.locationRevision);
+  EXPECT_TRUE(current.flags & nsMsgMessageFlags::Partial);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "Case"_ns, text));
+  EXPECT_EQ("old"_ns, text);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, Stored(key, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"old@invalid"_ns}), refs);
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_partial_metadata"_ns));
+  ASSERT_EQ(NS_OK,
+            db.CompletePartialMessage(expected, parsed, finished, output));
+}
+
+TEST_F(DeliveryCoreReferences, PartialCompletionRejectsStaleAndNonPartialRows) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("partial-guard@invalid"_ns, {}, key));
+  MessageBodyState expected, output;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  RawHdr parsed;
+  FinishedMessageBody finished{"finished"_ns, 1, 1, 1, false};
+  output.key = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompletePartialMessage(expected, parsed, finished, output));
+  EXPECT_EQ(123u, output.key);
+  ASSERT_EQ(NS_OK, db.SetMessageFlag(key, nsMsgMessageFlags::Partial, true));
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  ASSERT_EQ(NS_OK, db.SetMessageSize(key, 99));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompletePartialMessage(expected, parsed, finished, output));
+  EXPECT_EQ(123u, output.key);
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.CompletePartialMessage(expected, parsed, finished, output));
+  EXPECT_EQ(123u, output.key);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db.RemoveMessage(key));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompletePartialMessage(expected, parsed, finished, output));
+  EXPECT_EQ(123u, output.key);
 }
 
 }  // namespace mozilla::mailnews

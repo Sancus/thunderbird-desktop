@@ -289,6 +289,14 @@ class MessageDatabase : public nsIMessageDatabase {
                              const FinishedMessageBody& finished,
                              MessageBodyState& output);
 
+  // Completes a Partial row with provider-finished bytes and parsed metadata.
+  // Keeps physical/thread identity and unrelated current properties. Current
+  // user flags/tags survive, except a final explicit keywords extra wins.
+  nsresult CompletePartialMessage(const MessageBodyState& expected,
+                                  const ::RawHdr& parsed,
+                                  const FinishedMessageBody& finished,
+                                  MessageBodyState& output);
+
   // Pending relocation blocks new body resolutions and folder mutation.
   nsresult CheckFolderBodyAccess(uint64_t folderId);
   nsresult CheckMessageBodyAccess(nsMsgKey key);
@@ -475,6 +483,10 @@ class MessageDatabase : public nsIMessageDatabase {
                                                uint32_t epoch, uint32_t uid,
                                                bool allowStaged);
 
+  nsresult SettleMessageBodyInternal(const MessageBodyState& expected,
+                                     const FinishedMessageBody& finished,
+                                     const ::RawHdr* parsed,
+                                     MessageBodyState& output);
   nsresult ReadMessageBodyState(nsMsgKey key, MessageBodyState& output);
   nsresult ReadBodyRelocation(uint64_t folderId,
                               Maybe<FolderBodyRelocation>& output);

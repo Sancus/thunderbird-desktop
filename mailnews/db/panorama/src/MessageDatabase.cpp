@@ -969,6 +969,18 @@ nsresult MessageDatabase::ReadMessageBodyState(nsMsgKey key,
 nsresult MessageDatabase::SettleMessageBody(const MessageBodyState& expected,
                                             const FinishedMessageBody& finished,
                                             MessageBodyState& output) {
+  return SettleMessageBodyInternal(expected, finished, nullptr, output);
+}
+
+nsresult MessageDatabase::CompletePartialMessage(
+    const MessageBodyState& expected, const RawHdr& parsed,
+    const FinishedMessageBody& finished, MessageBodyState& output) {
+  return SettleMessageBodyInternal(expected, finished, &parsed, output);
+}
+
+nsresult MessageDatabase::SettleMessageBodyInternal(
+    const MessageBodyState& expected, const FinishedMessageBody& finished,
+    const RawHdr* parsed, MessageBodyState& output) {
   MOZ_TRY(RequireCommittedSearchRead());
   MOZ_TRY(CheckMessageBodyAccess(expected.key));
   RefPtr<MessageDatabase> self(this);
@@ -1009,11 +1021,16 @@ nsresult MessageDatabase::SettleMessageBody(const MessageBodyState& expected,
       MOZ_TRY(folder->ExecuteStep(&exists));
       NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
     }
+    NS_ENSURE_TRUE(!parsed || (before.flags & nsMsgMessageFlags::Partial),
+                   NS_ERROR_NOT_AVAILABLE);
     MOZ_TRY(FetchMsg(expected.key, cached));
     oldMessage = new DetachedMsgHdr(before.folderId);
     MOZ_TRY(oldMessage->SetMessageId(cached.messageId));
     MOZ_TRY(oldMessage->SetAuthor(cached.sender));
     MOZ_TRY(oldMessage->SetRecipients(cached.recipients));
+    MOZ_TRY(oldMessage->SetCcList(cached.ccList));
+    MOZ_TRY(oldMessage->SetBccList(cached.bccList));
+    MOZ_TRY(oldMessage->SetPriority(cached.priority));
     MOZ_TRY(oldMessage->SetSubject(cached.subject));
     MOZ_TRY(oldMessage->SetDate(cached.date));
     MOZ_TRY(oldMessage->SetThreadId(cached.threadId));
@@ -1025,6 +1042,64 @@ nsresult MessageDatabase::SettleMessageBody(const MessageBodyState& expected,
     MOZ_TRY(oldMessage->SetMessageSize(before.messageSize));
     MOZ_TRY(oldMessage->SetOfflineMessageSize(before.offlineMessageSize));
     MOZ_TRY(oldMessage->SetLineCount(before.lineCount));
+    if (parsed) {
+      cached.messageId = MOZ_TRY(DatabaseUtils::Normalize(parsed->messageId));
+      cached.date = parsed->date;
+      cached.sender = MOZ_TRY(DatabaseUtils::Normalize(parsed->sender));
+      cached.recipients = MOZ_TRY(DatabaseUtils::Normalize(parsed->recipients));
+      cached.ccList = MOZ_TRY(DatabaseUtils::Normalize(parsed->ccList));
+      cached.bccList = MOZ_TRY(DatabaseUtils::Normalize(parsed->bccList));
+      cached.subject = MOZ_TRY(DatabaseUtils::Normalize(parsed->subject));
+      cached.priority = parsed->priority;
+      if (!parsed->replyTo.IsEmpty()) {
+        MOZ_TRY(
+            SetMessageProperty(expected.key, "replyTo"_ns, parsed->replyTo));
+      }
+      if (!parsed->charset.IsEmpty()) {
+        MOZ_TRY(
+            SetMessageProperty(expected.key, "msgCharSet"_ns, parsed->charset));
+      }
+      if (!parsed->accountKey.IsEmpty()) {
+        MOZ_TRY(
+            SetMessageProperty(expected.key, "account"_ns, parsed->accountKey));
+      }
+      if (parsed->dateReceived) {
+        uint32_t seconds;
+        PRTime2Seconds(parsed->dateReceived, &seconds);
+        nsAutoCString text;
+        text.AppendInt(seconds, 16);
+        MOZ_TRY(SetMessageProperty(expected.key, "dateReceived"_ns, text));
+      }
+      for (const auto& extra : parsed->extras) {
+        if (extra.k.EqualsLiteral("keywords")) {
+          cached.tags = extra.v;
+        } else {
+          MOZ_TRY(SetMessageProperty(expected.key, extra.k, extra.v));
+        }
+      }
+      MOZ_TRY(WriteMessageReferencesInTransaction(expected.key,
+                                                  parsed->references));
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "CompletePartialMetadata"_ns,
+          "UPDATE messages SET messageId=:messageId,date=:date,sender=:sender,"
+          "recipients=:recipients,ccList=:ccList,bccList=:bccList,subject=:"
+          "subject,"
+          "priority=:priority,tags=:tags WHERE id=:id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, expected.key));
+      MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, cached.messageId));
+      MOZ_TRY(stmt->BindInt64ByName("date"_ns, cached.date));
+      MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, cached.sender));
+      MOZ_TRY(stmt->BindUTF8StringByName("recipients"_ns, cached.recipients));
+      MOZ_TRY(stmt->BindUTF8StringByName("ccList"_ns, cached.ccList));
+      MOZ_TRY(stmt->BindUTF8StringByName("bccList"_ns, cached.bccList));
+      MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, cached.subject));
+      MOZ_TRY(stmt->BindInt32ByName("priority"_ns, cached.priority));
+      MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, cached.tags));
+      MOZ_TRY(stmt->Execute());
+    }
     {
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(DatabaseCore::GetStatement(
@@ -1044,8 +1119,10 @@ nsresult MessageDatabase::SettleMessageBody(const MessageBodyState& expected,
       MOZ_TRY(stmt->BindInt64ByName("lines"_ns, finished.lineCount));
       MOZ_TRY(stmt->Execute());
     }
-    cached.flags = (before.flags & ~nsMsgMessageFlags::Offline) |
-                   (finished.offline ? nsMsgMessageFlags::Offline : 0);
+    cached.flags =
+        (before.flags & ~(nsMsgMessageFlags::Offline |
+                          (parsed ? nsMsgMessageFlags::Partial : 0))) |
+        (finished.offline ? nsMsgMessageFlags::Offline : 0);
     {
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(DatabaseCore::GetStatement(

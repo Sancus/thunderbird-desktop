@@ -67,7 +67,14 @@ nsresult nsParseImapMessageURI(const nsACString& uri, nsACString& folderURI,
   if (keySeparator != -1) {
     int32_t keyEndSeparator = uriStr.FindCharInSet("/?&", keySeparator);
     nsAutoString folderPath;
-    folderURI = StringHead(uriStr, keySeparator);
+    // A real query precedes the ref; legacy message URIs put it after the key.
+    // Neither spelling makes the query part of the physical folder URI.
+    int32_t querySeparator = uriStr.FindChar('?');
+    int32_t folderLength =
+        querySeparator != kNotFound && querySeparator < keySeparator
+            ? querySeparator
+            : keySeparator;
+    folderURI = StringHead(uriStr, folderLength);
     folderURI.Cut(4, 8);  // cut out the _message part of imap-message:
     // folder uri's don't have fully escaped usernames.
     int32_t atPos = folderURI.FindChar('@');

@@ -151,6 +151,38 @@ add_task(async function checkBccs() {
   }
 });
 
+add_task(async function test_messageUriQueryPreservesIdentity() {
+  const [header] = IMAPPump.inbox.msgDatabase.enumerateMessages();
+  const uri = IMAPPump.inbox.getUriForMsg(header);
+  const service = MailServices.messageServiceFromURI(uri);
+  const [folderUri, key] = uri.split("#");
+  const plainUrl = service.getUrlForUri(uri);
+  for (const messageUri of [
+    uri + "?editasnew=true",
+    folderUri + "?editasnew=true#" + key,
+  ]) {
+    const resolved = service.messageURIToMsgHdr(messageUri);
+    Assert.equal(resolved.folder, IMAPPump.inbox);
+    Assert.equal(resolved.messageKey, header.messageKey);
+    Assert.equal(resolved.messageId, "4849BF7B.2030800@example.com");
+    const url = service.getUrlForUri(messageUri);
+    Assert.equal(url.spec, plainUrl.spec);
+    Assert.equal(url.QueryInterface(Ci.nsIImapUrl).listOfMessageIds, "6101");
+    Assert.equal(url.QueryInterface(Ci.nsIMsgMessageUrl).uri, messageUri);
+    Assert.ok(messageUri.includes("editasnew=true"));
+    const stream = new PromiseTestUtils.PromiseStreamListener();
+    service.streamMessage(messageUri, stream, null, null, false, "", true);
+    Assert.ok(
+      (await stream.promise).includes("Hello, did you receive my bugmail?")
+    );
+  }
+  Assert.equal(IMAPPump.mailbox.uidvalidity, 7101);
+  Assert.deepEqual(
+    IMAPPump.mailbox._messages.map(message => message.uid),
+    [6101]
+  );
+});
+
 async function updateInbox() {
   const listener = new PromiseTestUtils.PromiseUrlListener();
   IMAPPump.inbox.updateFolderWithListener(null, listener);

@@ -72,3 +72,37 @@ TEST(TestMsgImapUtils, UidSetFromUids)
     ASSERT_EQ(t.uidSet, got);
   }
 }
+
+TEST(TestMsgImapUtils, MessageUriQuery)
+{
+  static const struct {
+    nsLiteralCString uri;
+    nsLiteralCString folder;
+    nsLiteralCString part;
+  } tests[] = {
+      {"imap-message://user@host/INBOX#42"_ns, "imap://user@host/INBOX"_ns,
+       ""_ns},
+      {"imap-message://user@host/INBOX#42?editasnew=true"_ns,
+       "imap://user@host/INBOX"_ns, ""_ns},
+      {"imap-message://user@host/INBOX?editasnew=true#42"_ns,
+       "imap://user@host/INBOX"_ns, ""_ns},
+      {"imap-message://user@host/INBOX?editasnew=true&x=1#42"_ns,
+       "imap://user@host/INBOX"_ns, ""_ns},
+      {"imap-message://user%40example@host/Caf%C3%A9%3F%23%25#42?editasnew=true"_ns,
+       "imap://user%40example@host/Caf%C3%A9%3F%23%25"_ns, ""_ns},
+      {"imap-message://user%40example@host/Caf%C3%A9%3F%23%25?editasnew=true#42"_ns,
+       "imap://user%40example@host/Caf%C3%A9%3F%23%25"_ns, ""_ns},
+      {"imap-message://user@host/INBOX#42?part=1.2&filename=imap://host/a#name"_ns,
+       "imap://user@host/INBOX"_ns, "?part=1.2&filename=imap://host/a#name"_ns},
+  };
+  for (const auto& test : tests) {
+    SCOPED_TRACE(test.uri.get());
+    nsCString folder;
+    nsCString part;
+    nsMsgKey key = nsMsgKey_None;
+    ASSERT_EQ(NS_OK, nsParseImapMessageURI(test.uri, folder, &key, part));
+    EXPECT_EQ(test.folder, folder);
+    EXPECT_EQ(42u, key);
+    EXPECT_EQ(test.part, part);
+  }
+}

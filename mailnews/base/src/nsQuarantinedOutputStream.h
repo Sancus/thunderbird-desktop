@@ -5,11 +5,10 @@
 #ifndef COMM_MAILNEWS_BASE_SRC_NSQUARANTINEDOUTPUTSTREAM_H_
 #define COMM_MAILNEWS_BASE_SRC_NSQUARANTINEDOUTPUTSTREAM_H_
 
+#include "nsIFile.h"
 #include "nsIOutputStream.h"
 #include "nsISafeOutputStream.h"
 #include "nsCOMPtr.h"
-
-class nsIFile;
 
 /**
  * nsQuarantinedOutputStream layers on top of an existing target output stream.

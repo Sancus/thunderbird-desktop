@@ -4,6 +4,7 @@
 
 #include "ExchangeMessageChannel.h"
 
+#include "ErrorList.h"
 #include "ExchangeFetchMsgsToOffline.h"
 #include "ExchangeListeners.h"
 #include "IExchangeClient.h"
@@ -25,7 +26,6 @@
 #include "nsIStreamListener.h"
 #include "nsIURIMutator.h"
 #include "nsMimeTypes.h"
-#include "nsMsgError.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
@@ -388,10 +388,13 @@ NS_IMETHODIMP ExchangeMessageChannel::AsyncOpen(nsIStreamListener* aListener) {
 
 NS_IMETHODIMP ExchangeMessageChannel::GetCanceled(bool* aCanceled) {
   NS_ENSURE_ARG_POINTER(aCanceled);
-  if (mReadRequest) {
-    return mReadRequest->GetCanceled(aCanceled);
-  }
   *aCanceled = false;
+  if (mReadRequest) {
+    nsresult status;
+    nsresult rv = mReadRequest->GetStatus(&status);
+    NS_ENSURE_SUCCESS(rv, rv);
+    *aCanceled = NS_FAILED(status);
+  }
   return NS_OK;
 }
 

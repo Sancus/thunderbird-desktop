@@ -2049,7 +2049,8 @@ NS_IMETHODIMP ExchangeFolder::MarkMessagesFlagged(
   }
   RefPtr<ExchangeSimpleListener> listener = new ExchangeSimpleListener(
       [headersToChange = std::move(headersToChange), requestedIds = exchangeIds,
-       markFlagged](const nsTArray<nsCString>& ids, bool useLegacyFallback) {
+       markFlagged](const nsTArray<nsCString>& ids, bool useLegacyFallback)
+          -> nsresult {
         nsTHashSet<nsCString> confirmedIds(ids.Length());
         for (const auto& id : ids) {
           confirmedIds.Insert(id);

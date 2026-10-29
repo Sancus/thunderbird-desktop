@@ -51,7 +51,7 @@ add_task(function test_mailboxNamePreservesNumericText() {
   Assert.notEqual(info, reconstructed);
   Assert.equal(reconstructed.mailboxName, expected);
   const reader = Services.storage.openUnsharedDatabase(file);
-  let statement;
+  let statement = null;
   registerCleanupFunction(() => {
     if (statement) {
       statement.finalize();

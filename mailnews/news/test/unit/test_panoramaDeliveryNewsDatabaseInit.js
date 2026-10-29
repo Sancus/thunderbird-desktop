@@ -14,7 +14,8 @@ add_task(async function test_retriesRejectedNewsDatabase() {
     Ci.nsIDatabaseCore
   );
   const account = MailServices.accounts.createAccount();
-  let incomingServer, seededServerBranch;
+  let incomingServer = null;
+  let seededServerBranch = null;
   registerCleanupFunction(() => {
     try {
       incomingServer?.closeCachedConnections();

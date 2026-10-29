@@ -16,7 +16,7 @@ add_setup(function () {
     Cc["@mozilla.org/msgDatabase/msgDBService;1"]
       .getService(Ci.nsIMsgDBService)
       .QueryInterface(Ci.nsIDatabaseCore),
-    database,
+    database
   );
   const account = MailServices.accounts.createLocalMailAccount();
   registerCleanupFunction(() => {
@@ -25,7 +25,7 @@ add_setup(function () {
     Services.prefs.clearUserPref("mail.server.default.storeContractID");
   });
   root = account.incomingServer.rootFolder.QueryInterface(
-    Ci.nsIMsgLocalMailFolder,
+    Ci.nsIMsgLocalMailFolder
   );
   Assert.equal(root.msgStore.storeType, "mbox");
   Assert.equal(root.server.getStringValue("storeContractID"), contract);
@@ -93,12 +93,12 @@ add_task(function test_versionWriteFailureDoesNotCacheTheAttempt() {
   const connection = database.connectionForTests;
   connection.executeSimpleSQL(
     "CREATE TEMP TRIGGER reject_folder_version BEFORE INSERT ON folder_properties " +
-      "WHEN NEW.name = 'version' BEGIN SELECT RAISE(ABORT, 'version fault'); END",
+      "WHEN NEW.name = 'version' BEGIN SELECT RAISE(ABORT, 'version fault'); END"
   );
   try {
     Assert.throws(
       () => (info.version = 200),
-      (error) => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT,
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
     );
     Assert.equal(info.version, 42);
     Assert.equal(folder.msgDatabase.dBFolderInfo.version, 42);
@@ -113,16 +113,16 @@ add_task(function test_versionReadFailurePropagates() {
   info.version = 42;
   const connection = database.connectionForTests;
   connection.executeSimpleSQL(
-    "ALTER TABLE folder_properties RENAME TO hidden_version_properties",
+    "ALTER TABLE folder_properties RENAME TO hidden_version_properties"
   );
   try {
     Assert.throws(
       () => info.version,
-      (error) => error.result == Cr.NS_ERROR_FAILURE,
+      error => error.result == Cr.NS_ERROR_FAILURE
     );
   } finally {
     connection.executeSimpleSQL(
-      "ALTER TABLE hidden_version_properties RENAME TO folder_properties",
+      "ALTER TABLE hidden_version_properties RENAME TO folder_properties"
     );
   }
   Assert.equal(info.version, 42);
@@ -134,7 +134,7 @@ add_task(function test_negativeStoredVersionIsRejected() {
   info.setInt64Property("version", -1);
   Assert.throws(
     () => info.version,
-    (error) => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA,
+    error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
   );
 });
 
@@ -144,7 +144,7 @@ add_task(function test_tooWideStoredVersionIsRejected() {
   info.setInt64Property("version", 4294967296);
   Assert.throws(
     () => info.version,
-    (error) => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA,
+    error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
   );
 });
 

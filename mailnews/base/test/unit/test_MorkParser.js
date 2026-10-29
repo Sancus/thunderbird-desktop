@@ -528,7 +528,7 @@ add_task(async function test_strictSummaryAndCache() {
 });
 
 add_task(function test_strictExactCellsAndMembership() {
-  const groupStart = "@$$" + "{";
+  const groupStart = "@$${";
   const body = String.raw`// <!-- <mdb:mork:z v="1.4"/> -->
 < <(a=c)> (80=scope)(81=kind)(82=unknown)(83=empty)(84=columnStates)>
 <(80=)(81=  leading and trailing  )(82=slash\\$24$00\))>
@@ -618,10 +618,10 @@ add_task(function test_strictMembershipUpdatesKeepNativeOrder() {
     [
       "{1:r {(k=kind)} " + initial + "}",
       "{1:r {(k=kind)} 10 10 -11 11}",
-      "@$$" + "{A{@",
+      "@$${A{@",
       "{1:r {(k=kind)} -1 1}",
       "@$$}A}@",
-      "@$$" + "{B{@",
+      "@$${B{@",
       "{1:r {(k=kind)} -2}",
       "@$$}~~}@",
       "// Layout after the abort is allowed.",
@@ -646,13 +646,9 @@ add_task(function test_strictMembershipUpdatesKeepNativeOrder() {
 add_task(function test_strictRejectsRowsAfterAbort() {
   const before =
     '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
-    [
-      "[1:r(a=before)]",
-      "@$$" + "{A{@",
-      "[1:r(a=aborted)]",
-      "@$$}~~}@",
-      "",
-    ].join("\n");
+    ["[1:r(a=before)]", "@$${A{@", "[1:r(a=aborted)]", "@$$}~~}@", ""].join(
+      "\n"
+    );
   Assert.throws(
     () => new MorkParser().parseForImport(before + "[2:r(a=later)]"),
     error =>
@@ -666,17 +662,13 @@ add_task(function test_strictRejectsRowsAfterAbort() {
 add_task(function test_strictRejectsGroupsAfterAbort() {
   const before =
     '// <!-- <mdb:mork:z v="1.4"/> -->\n' +
-    [
-      "[1:r(a=before)]",
-      "@$$" + "{A{@",
-      "[1:r(a=aborted)]",
-      "@$$}~~}@",
-      "",
-    ].join("\n");
+    ["[1:r(a=before)]", "@$${A{@", "[1:r(a=aborted)]", "@$$}~~}@", ""].join(
+      "\n"
+    );
   Assert.throws(
     () =>
       new MorkParser().parseForImport(
-        before + "@$$" + "{B{@\n[1:r(a=later)]\n@$$}B}@"
+        before + "@$${B{@\n[1:r(a=later)]\n@$$}B}@"
       ),
     error =>
       error.name == "MorkImportError" &&

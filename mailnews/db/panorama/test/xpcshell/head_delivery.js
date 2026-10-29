@@ -120,13 +120,16 @@ const PanoramaDelivery = {
     );
     const server = folder.server;
     const contractBefore = server.getStringValue("storeContractID");
-    const contractSource = Services.prefs.prefHasUserValue(
-      "mail.server." + server.key + ".storeContractID"
-    )
-      ? "server"
-      : contractBefore
-        ? "inherited-default"
-        : "absent";
+    let contractSource = "absent";
+    if (
+      Services.prefs.prefHasUserValue(
+        "mail.server." + server.key + ".storeContractID"
+      )
+    ) {
+      contractSource = "server";
+    } else if (contractBefore) {
+      contractSource = "inherited-default";
+    }
     info(
       "DELIVERY_STORE_CONTRACT " +
         JSON.stringify({
@@ -229,7 +232,8 @@ const PanoramaDelivery = {
         : null;
     const daemon = new ImapDaemon();
     const server = makeServer(daemon);
-    let account, incomingServer;
+    let account = null;
+    let incomingServer = null;
     registerCleanupFunction(() => {
       try {
         const thread = Services.tm.currentThread;

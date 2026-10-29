@@ -17,7 +17,7 @@ add_task(async function test_keepsEwsItemsWithTheSameMessageId() {
   const service = PanoramaDelivery.assertBackend(lane.backend);
   const server = new EwsServer({ username: "user", password: "password" });
   const account = MailServices.accounts.createAccount();
-  let incomingServer;
+  let incomingServer = null;
   registerCleanupFunction(async () => {
     try {
       if (incomingServer) {

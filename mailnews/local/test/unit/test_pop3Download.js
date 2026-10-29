@@ -139,8 +139,12 @@ add_task(async function testDownloadMessages() {
   // Check the downloaded messages against the expected data.
   for (let i = 0; i < expectRaw.length; ++i) {
     // Parse the message.
-    let [expectHeaders, expectBody] = parseMessage(expectRaw[i]);
-    let [gotHeaders, gotBody] = parseMessage(gotRaw[i]);
+    const expectedMessage = parseMessage(expectRaw[i]);
+    const actualMessage = parseMessage(gotRaw[i]);
+    const [expectHeaders] = expectedMessage;
+    const [gotHeaders] = actualMessage;
+    let expectBody = expectedMessage[1];
+    let gotBody = actualMessage[1];
     // Strip blacklisted headers.
     for (const bad of blacklist) {
       delete gotHeaders[bad];
@@ -190,7 +194,7 @@ async function withPop3Store(store, fn) {
     value: Services.prefs.getCharPref(name, ""),
   }));
   localAccountUtils.clearAll();
-  let account;
+  let account = null;
   try {
     // Panorama root discovery opens the store before account creation applies
     // serverDefaultStoreContractID. Select the same provider at both boundaries.
@@ -348,7 +352,7 @@ add_task(async function testPop3FinishFailureRetainsMaildirWrite() {
       );
       Assert.equal(pending.length, 1);
       const bytes = await IOUtils.read(pending[0]);
-      Assert.ok(bytes.length > 0);
+      Assert.greater(bytes.length, 0);
       for (const finish of [
         () => sink.incorporateComplete(null, 0),
         () => sink.incorporateAbort(),
@@ -369,9 +373,11 @@ add_task(async function testPop3FinishFailureRetainsMaildirWrite() {
       try {
         sink.abortMailDelivery(null);
       } catch (error) {
-        if (error.result !== Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR) {
-          throw error;
-        }
+        Assert.strictEqual(
+          error.result,
+          Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR,
+          "Cleanup retains the original Finish error"
+        );
       }
     }
     Assert.equal(folder.msgDatabase.getMsgHdrForKey(key).storeToken, token);

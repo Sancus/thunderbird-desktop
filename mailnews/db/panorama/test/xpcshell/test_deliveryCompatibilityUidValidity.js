@@ -24,7 +24,7 @@ add_setup(function () {
     Cc["@mozilla.org/msgDatabase/msgDBService;1"]
       .getService(Ci.nsIMsgDBService)
       .QueryInterface(Ci.nsIDatabaseCore),
-    database,
+    database
   );
   const account = MailServices.accounts.createLocalMailAccount();
   registerCleanupFunction(() => {
@@ -33,7 +33,7 @@ add_setup(function () {
     Services.prefs.clearUserPref("mail.server.default.storeContractID");
   });
   root = account.incomingServer.rootFolder.QueryInterface(
-    Ci.nsIMsgLocalMailFolder,
+    Ci.nsIMsgLocalMailFolder
   );
   Assert.equal(root.server.getStringValue("storeContractID"), contract);
   Assert.equal(root.msgStore.storeType, "mbox");
@@ -114,18 +114,18 @@ add_task(function test_epochReadErrorsAreNotReportedAsZero() {
   Assert.equal(info.imapUidValidity, 15);
   const connection = database.connectionForTests;
   connection.executeSimpleSQL(
-    "ALTER TABLE folder_properties RENAME TO unavailable_folder_properties",
+    "ALTER TABLE folder_properties RENAME TO unavailable_folder_properties"
   );
   try {
     Assert.throws(
       () => info.imapUidValidity,
-      (error) =>
+      error =>
         !Components.isSuccessCode(error.result) &&
-        error.result != Cr.NS_ERROR_NOT_AVAILABLE,
+        error.result != Cr.NS_ERROR_NOT_AVAILABLE
     );
   } finally {
     connection.executeSimpleSQL(
-      "ALTER TABLE unavailable_folder_properties RENAME TO folder_properties",
+      "ALTER TABLE unavailable_folder_properties RENAME TO folder_properties"
     );
   }
   Assert.equal(info.imapUidValidity, 15);
@@ -151,12 +151,12 @@ add_task(function test_sqlFailureRollsBackEpochAndBindingRetirement() {
     "CREATE TEMP TRIGGER reject_epoch BEFORE INSERT ON folder_properties " +
       "WHEN NEW.name = 'UIDValidity' AND NEW.id = " +
       folder.id +
-      " BEGIN SELECT RAISE(ABORT, 'epoch write failure'); END",
+      " BEGIN SELECT RAISE(ABORT, 'epoch write failure'); END"
   );
   try {
     Assert.throws(
       () => (info.imapUidValidity = 22),
-      (error) => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT,
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
     );
     Assert.equal(info.imapUidValidity, 21);
     Assert.equal(header.getUint32Property("uidOnServer"), 42);

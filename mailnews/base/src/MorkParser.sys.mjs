@@ -505,12 +505,13 @@ export class MorkParser {
    * @throws {MorkImportError} For malformed, truncated or unsupported input.
    */
   parseForImport(body, maxBytes = 64 * 1024 * 1024) {
-    if (typeof body != "string" || /[^\x00-\xff]/.test(body)) {
+    if (typeof body != "string" || /[\u0100-\uffff]/.test(body)) {
       throw new TypeError("Expected a Mork byte string");
     }
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
       throw new RangeError("Invalid Mork input limit");
     }
+    const whitespace = new Set("\b\t\n\f\r \x7f");
     let pos = 0;
     const fail = (code, message) => {
       throw new MorkImportError(code, pos, message);
@@ -532,7 +533,7 @@ export class MorkParser {
     const cache = new Map();
     const skip = () => {
       while (pos < body.length) {
-        if (/[\x08\t\n\f\r \x7f]/.test(body[pos])) {
+        if (whitespace.has(body[pos])) {
           pos++;
         } else if (body[pos] == "/") {
           pos = this.importCommentEnd(body, pos);
@@ -689,7 +690,7 @@ export class MorkParser {
         take("(");
         const id = hex();
         // Native alias IDs allow whitespace before '=', not comments.
-        while (/[\x08\t\n\f\r \x7f]/.test(body[pos] || "")) {
+        while (whitespace.has(body[pos])) {
           pos++;
         }
         if (body[pos] == "<") {

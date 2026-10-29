@@ -49,7 +49,7 @@ add_task(function test_mailboxNameClearPersistsEmptyText() {
   Assert.notEqual(info, reconstructed);
   Assert.equal(reconstructed.mailboxName, "");
   const reader = Services.storage.openUnsharedDatabase(file);
-  let statement;
+  let statement = null;
   registerCleanupFunction(() => {
     if (statement) {
       statement.finalize();

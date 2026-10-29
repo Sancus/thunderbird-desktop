@@ -1045,11 +1045,6 @@ async function subtestCrossAccountMoveFailure(
   );
   try {
     const copyListener = new PromiseTestUtils.PromiseCopyListener();
-    const failed = Assert.rejects(
-      copyListener.promise,
-      new RegExp(Cr.NS_ERROR_UNEXPECTED),
-      "Missing MIME content fails the move"
-    );
     MailServices.copy.copyMessages(
       source,
       [header],
@@ -1059,7 +1054,11 @@ async function subtestCrossAccountMoveFailure(
       null,
       false
     );
-    await failed;
+    await Assert.rejects(
+      copyListener.promise,
+      new RegExp(Cr.NS_ERROR_UNEXPECTED),
+      "Missing MIME content fails the move"
+    );
     Assert.ok(
       source.msgDatabase.containsKey(key),
       "Failure retains the source"
@@ -1160,13 +1159,12 @@ async function testHardDeleteStoppedClient(mockServer, incomingServer) {
     },
   });
   try {
-    const failed = Assert.rejects(
+    folder.deleteMessages([header], null, true, false, listener, false);
+    await Assert.rejects(
       listener.promise,
       new RegExp(Cr.NS_ERROR_UNEXPECTED),
       "The stopped queue reports its original error"
     );
-    folder.deleteMessages([header], null, true, false, listener, false);
-    await failed;
     Assert.equal(starts, 1, "Deletion starts the listener once");
     Assert.deepEqual(stops, [Cr.NS_ERROR_UNEXPECTED], "Deletion stops once");
     Assert.deepEqual(events, ["DeleteOrMoveMsgFailed"]);
@@ -1369,11 +1367,6 @@ add_task(async function testCrossAccountMoveDeleteFailureEws() {
         stops.push(status);
       },
     });
-    const failed = Assert.rejects(
-      listener.promise,
-      new RegExp(Cr.NS_ERROR_NET_ERROR_RESPONSE),
-      "A failed source deletion fails the move with the original HTTP error"
-    );
     MailServices.copy.copyMessages(
       source,
       [header],
@@ -1383,7 +1376,11 @@ add_task(async function testCrossAccountMoveDeleteFailureEws() {
       null,
       false
     );
-    await failed;
+    await Assert.rejects(
+      listener.promise,
+      new RegExp(Cr.NS_ERROR_NET_ERROR_RESPONSE),
+      "A failed source deletion fails the move with the original HTTP error"
+    );
     Assert.deepEqual(
       deleteAttempts,
       [sourceId],
@@ -1492,11 +1489,6 @@ async function testNextCopyOfflineFailure(
       Services.io.offline = true;
     }
   };
-  const failed = Assert.rejects(
-    listener.promise,
-    new RegExp(0x80550014),
-    "The later uncached message reports NS_MSG_ERROR_OFFLINE"
-  );
   try {
     MailServices.copy.copyMessages(
       source,
@@ -1508,7 +1500,11 @@ async function testNextCopyOfflineFailure(
       null,
       false
     );
-    await failed;
+    await Assert.rejects(
+      listener.promise,
+      new RegExp(0x80550014),
+      "The later uncached message reports NS_MSG_ERROR_OFFLINE"
+    );
   } finally {
     Services.io.offline = wasOffline;
   }
@@ -1596,11 +1592,6 @@ add_task(async function testSynchronousSourceDeleteFailureEws() {
     stops.push(status);
     onStopCopy(status);
   };
-  const failed = Assert.rejects(
-    listener.promise,
-    new RegExp(Cr.NS_ERROR_UNEXPECTED),
-    "The synchronous source deletion failure reaches the copy listener"
-  );
   ewsIncomingServer.setIntValue("delete_model", 2);
   try {
     MailServices.copy.copyMessages(
@@ -1612,7 +1603,11 @@ add_task(async function testSynchronousSourceDeleteFailureEws() {
       null,
       false
     );
-    await failed;
+    await Assert.rejects(
+      listener.promise,
+      new RegExp(Cr.NS_ERROR_UNEXPECTED),
+      "The synchronous source deletion failure reaches the copy listener"
+    );
   } finally {
     ewsIncomingServer.setIntValue("delete_model", model);
   }
@@ -1917,11 +1912,6 @@ async function testMoveDestinationStoreFailure(
       }
       Assert.notEqual(storeError, undefined, "The real store rejects the path");
       Assert.ok(!Components.isSuccessCode(storeError));
-      const failed = Assert.rejects(
-        listener.promise,
-        new RegExp(storeError),
-        "The move reports the original destination-store error"
-      );
       MailServices.copy.copyMessages(
         source,
         [header],
@@ -1931,7 +1921,11 @@ async function testMoveDestinationStoreFailure(
         null,
         false
       );
-      await failed;
+      await Assert.rejects(
+        listener.promise,
+        new RegExp(storeError),
+        "The move reports the original destination-store error"
+      );
       Assert.deepEqual(stops, [storeError], "The failed move completes once");
       Assert.deepEqual(completed, [], "The failed write emits no move success");
       const retained = source.GetMessageHeader(key);
@@ -2430,12 +2424,14 @@ async function testPartialFlaggedIdentity(initiallyFlagged) {
   Assert.equal(remote.syntheticMessage.metaState.flagged, target);
   for (const [index, old] of originals.entries()) {
     const retained = folder.GetMessageHeader(old.key);
-    const expectedFlags =
-      index == 0
-        ? old.flags
-        : target
-          ? old.flags | Ci.nsMsgMessageFlags.Marked
-          : old.flags & ~Ci.nsMsgMessageFlags.Marked;
+    let expectedFlags;
+    if (index == 0) {
+      expectedFlags = old.flags;
+    } else {
+      expectedFlags = target
+        ? old.flags | Ci.nsMsgMessageFlags.Marked
+        : old.flags & ~Ci.nsMsgMessageFlags.Marked;
+    }
     Assert.equal(retained.messageId, old.id);
     Assert.equal(retained.folder.URI, folder.URI);
     Assert.equal(

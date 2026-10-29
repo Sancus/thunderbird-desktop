@@ -22,7 +22,8 @@ add_task(function test_retriesRootAfterStoreInitializationFailure() {
   }[lane.store];
   const missingStore = "@mozilla.org/msgstore/compatibility-missing;1";
   Assert.ok(!(missingStore in Cc), "The configured store is unavailable");
-  let account, incomingServer;
+  let account = null;
+  let incomingServer = null;
   registerCleanupFunction(() => {
     try {
       Services.prefs.setStringPref(

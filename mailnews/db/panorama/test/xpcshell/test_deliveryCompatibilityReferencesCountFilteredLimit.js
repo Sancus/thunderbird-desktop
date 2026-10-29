@@ -26,7 +26,7 @@ add_task(function test_numReferencesLimitsTheFilteredView() {
   const file = do_get_profile().clone();
   file.append("panorama.sqlite");
   const reader = Services.storage.openUnsharedDatabase(file);
-  let statement;
+  let statement = null;
   registerCleanupFunction(() => {
     if (statement) {
       statement.finalize();

@@ -123,7 +123,7 @@ add_task(async function test_publishCommittedMessageOnce() {
   Assert.equal(await view.countMessages(), 1);
   Assert.equal(events.length, 1, "One add callback was published");
   const threadId = events[0].threadId;
-  Assert.ok(threadId > 0, "The published message has a thread identity");
+  Assert.greater(threadId, 0, "The published message has a thread identity");
   Assert.deepEqual(
     events,
     [
@@ -168,7 +168,10 @@ add_task(async function test_folderFilteredEventsUseDatabaseIdentity() {
   const root = folderDB.insertRoot("delivery-filter-events");
   const folderId = folderDB.insertFolder(root, "Inbox");
   const otherFolder = folderDB.insertFolder(root, "Other");
-  const controlId = addMessage({ folderId, messageId: "filter-control@invalid" });
+  const controlId = addMessage({
+    folderId,
+    messageId: "filter-control@invalid",
+  });
   Assert.throws(
     () => messageDB.getMessage(controlId).folder,
     /NS_ERROR_NOT_INITIALIZED/,

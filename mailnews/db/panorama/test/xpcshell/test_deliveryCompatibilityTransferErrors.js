@@ -16,7 +16,7 @@ add_setup(function () {
     Cc["@mozilla.org/msgDatabase/msgDBService;1"]
       .getService(Ci.nsIMsgDBService)
       .QueryInterface(Ci.nsIDatabaseCore),
-    database,
+    database
   );
   const account = MailServices.accounts.createLocalMailAccount();
   registerCleanupFunction(() => {
@@ -25,7 +25,7 @@ add_setup(function () {
     Services.prefs.clearUserPref("mail.server.default.storeContractID");
   });
   root = account.incomingServer.rootFolder.QueryInterface(
-    Ci.nsIMsgLocalMailFolder,
+    Ci.nsIMsgLocalMailFolder
   );
   Assert.equal(root.msgStore.storeType, "mbox");
   Assert.equal(root.server.getStringValue("storeContractID"), contract);
@@ -33,7 +33,7 @@ add_setup(function () {
 
 function transferBag() {
   const bag = Cc["@mozilla.org/hash-property-bag;1"].createInstance(
-    Ci.nsIWritablePropertyBag2,
+    Ci.nsIWritablePropertyBag2
   );
   bag.setPropertyAsACString("transferred", "applied prefix");
   return bag;
@@ -74,16 +74,16 @@ add_task(function test_transferInfoLookupKeepsOriginalError() {
     () => {
       throw new Components.Exception(
         "folder info read",
-        Cr.NS_ERROR_FILE_CORRUPTED,
+        Cr.NS_ERROR_FILE_CORRUPTED
       );
     },
     () => ++summaryCalls,
     () => {
       Assert.throws(
         () => folder.dBTransferInfo,
-        (error) => error.result == Cr.NS_ERROR_FILE_CORRUPTED,
+        error => error.result == Cr.NS_ERROR_FILE_CORRUPTED
       );
-    },
+    }
   );
   Assert.equal(summaryCalls, 0);
   Assert.equal(folder.URI, uri);
@@ -101,7 +101,7 @@ add_task(function test_failedImportCannotClearNativeRepairState() {
       Assert.strictEqual(input, bag);
       throw new Components.Exception(
         "import failed",
-        Cr.NS_ERROR_FILE_ACCESS_DENIED,
+        Cr.NS_ERROR_FILE_ACCESS_DENIED
       );
     },
     setBooleanProperty(name, value) {
@@ -115,9 +115,9 @@ add_task(function test_failedImportCannotClearNativeRepairState() {
     () => {
       Assert.throws(
         () => (folder.dBTransferInfo = bag),
-        (error) => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED,
+        error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED
       );
-    },
+    }
   );
   Assert.ok(info.getBooleanProperty("forceReparse", false));
   Assert.equal(summaryCalls, 0);
@@ -134,7 +134,7 @@ add_task(function test_repairStateWriteFailureKeepsImportedPrefix() {
     initFromTransferInfo(input) {
       info.setCharProperty(
         "transferred",
-        input.getPropertyAsACString("transferred"),
+        input.getPropertyAsACString("transferred")
       );
     },
     setBooleanProperty(name, value) {
@@ -144,7 +144,7 @@ add_task(function test_repairStateWriteFailureKeepsImportedPrefix() {
   const connection = database.connectionForTests;
   connection.executeSimpleSQL(
     "CREATE TEMP TRIGGER reject_transfer_state BEFORE INSERT ON folder_properties " +
-      "WHEN NEW.name = 'forceReparse' BEGIN SELECT RAISE(ABORT, 'transfer state'); END",
+      "WHEN NEW.name = 'forceReparse' BEGIN SELECT RAISE(ABORT, 'transfer state'); END"
   );
   try {
     withTransferDatabase(
@@ -154,9 +154,9 @@ add_task(function test_repairStateWriteFailureKeepsImportedPrefix() {
       () => {
         Assert.throws(
           () => (folder.dBTransferInfo = bag),
-          (error) => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT,
+          error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
         );
-      },
+      }
     );
   } finally {
     connection.executeSimpleSQL("DROP TRIGGER reject_transfer_state");
@@ -177,7 +177,7 @@ add_task(function test_summaryFailurePropagatesAfterMetadataWrites() {
     initFromTransferInfo(input) {
       info.setCharProperty(
         "transferred",
-        input.getPropertyAsACString("transferred"),
+        input.getPropertyAsACString("transferred")
       );
     },
     setBooleanProperty(name, value) {
@@ -188,20 +188,20 @@ add_task(function test_summaryFailurePropagatesAfterMetadataWrites() {
   withTransferDatabase(
     folder,
     () => importingInfo,
-    (value) => {
+    value => {
       ++summaryCalls;
       Assert.ok(value);
       throw new Components.Exception(
         "summary failed",
-        Cr.NS_ERROR_FILE_READ_ONLY,
+        Cr.NS_ERROR_FILE_READ_ONLY
       );
     },
     () => {
       Assert.throws(
         () => (folder.dBTransferInfo = bag),
-        (error) => error.result == Cr.NS_ERROR_FILE_READ_ONLY,
+        error => error.result == Cr.NS_ERROR_FILE_READ_ONLY
       );
-    },
+    }
   );
   Assert.equal(summaryCalls, 1);
   Assert.equal(info.getCharProperty("transferred"), "applied prefix");

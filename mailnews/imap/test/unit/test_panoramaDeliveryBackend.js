@@ -28,8 +28,8 @@ add_task(function test_selectsImapAccountBackend() {
       ? Services.prefs.getCharPref(name)
       : null,
   }));
-  let account;
-  let incomingServer;
+  let account = null;
+  let incomingServer = null;
   registerCleanupFunction(() => {
     try {
       const thread = Services.tm.currentThread;

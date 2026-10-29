@@ -87,7 +87,7 @@ add_setup(async function setupBackedUpLegacyProfileBeforeNativeStartup() {
     nativeProfile.remove(false);
   });
   work = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
+    PathUtils.parent(profile.path),
     "migration-native-import-"
   );
   registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
@@ -129,10 +129,17 @@ add_setup(async function setupBackedUpLegacyProfileBeforeNativeStartup() {
   Assert.ok(
     !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite")))
   );
+  const backupRoot = await IOUtils.createUniqueDirectory(
+    PathUtils.parent(profile.path),
+    "migration-native-backup-"
+  );
+  registerCleanupFunction(() =>
+    IOUtils.remove(backupRoot, { recursive: true })
+  );
   backup = await createMigrationBackup(
     profile.path,
     [],
-    PathUtils.join(work, "backup")
+    PathUtils.join(backupRoot, "backup")
   );
 
   loadExistingDB();
@@ -330,7 +337,7 @@ async function assertCommitted(input) {
       "The genuine base has explicit empty References"
     );
     Assert.equal(header.threadParent, 0);
-    Assert.ok(header.threadId > 0);
+    Assert.greater(header.threadId, 0);
     threadIds.add(header.threadId);
     const thread = input.folder.msgDatabase.getThreadContainingMsgHdr(header);
     Assert.equal(thread.getChildHdrAt(0).messageId, id);
@@ -760,7 +767,7 @@ async function assertReferenceImport(input) {
       );
     }
     Assert.equal(header.threadParent, 0);
-    Assert.ok(header.threadId > 0);
+    Assert.greater(header.threadId, 0);
     threadIds.add(header.threadId);
     Assert.equal(
       input.folder.msgDatabase

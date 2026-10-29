@@ -23,7 +23,7 @@ add_task(function test_selectsEwsAccountBackend() {
     Assert.ok(contract in Cc, `EWS build provides ${contract}`);
   }
   const account = MailServices.accounts.createAccount();
-  let incomingServer;
+  let incomingServer = null;
   registerCleanupFunction(() => {
     incomingServer?.shutdown();
     MailServices.accounts.removeAccount(account, false);

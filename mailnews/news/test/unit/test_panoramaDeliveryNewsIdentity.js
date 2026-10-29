@@ -46,7 +46,7 @@ add_task(async function test_keepsArticlesInTheirGroups() {
     }
   }
   const server = makeServer(NNTP_RFC2980_handler, daemon);
-  let incomingServer;
+  let incomingServer = null;
   registerCleanupFunction(async () => {
     try {
       incomingServer?.closeCachedConnections();

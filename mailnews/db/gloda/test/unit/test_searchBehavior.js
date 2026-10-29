@@ -16,9 +16,6 @@ const { MessageGenerator } = ChromeUtils.importESModule(
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
-  Gloda: "resource:///modules/gloda/GlodaPublic.sys.mjs",
-  GlodaIndexer: "resource:///modules/gloda/GlodaIndexer.sys.mjs",
-  GlodaMsgIndexer: "resource:///modules/gloda/IndexMsg.sys.mjs",
   GlodaMsgSearcher: "resource:///modules/gloda/GlodaMsgSearcher.sys.mjs",
 });
 
@@ -30,14 +27,16 @@ add_setup(async function () {
     "mailnews.database.global.indexer.perform_initial_sweep",
     "mailnews.database.global.search.msg.limit",
   ];
-  const previous = prefs.map(name => ({
-    name,
-    value: Services.prefs.prefHasUserValue(name)
-      ? Services.prefs.getPrefType(name) == Services.prefs.PREF_BOOL
-        ? Services.prefs.getBoolPref(name)
-        : Services.prefs.getIntPref(name)
-      : undefined,
-  }));
+  const previous = prefs.map(name => {
+    let value;
+    if (Services.prefs.prefHasUserValue(name)) {
+      value =
+        Services.prefs.getPrefType(name) == Services.prefs.PREF_BOOL
+          ? Services.prefs.getBoolPref(name)
+          : Services.prefs.getIntPref(name);
+    }
+    return { name, value };
+  });
   registerCleanupFunction(() => {
     for (const { name, value } of previous) {
       if (value === undefined) {

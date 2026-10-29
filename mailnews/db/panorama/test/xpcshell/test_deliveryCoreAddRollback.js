@@ -82,7 +82,7 @@ add_task(async function test_failedAddLeavesNoMessageOrPublication() {
   });
   const control = messageDB.getMessage(controlId);
   const controlThreadId = control.threadId;
-  Assert.ok(controlThreadId > 0, "The control has a thread identity");
+  Assert.greater(controlThreadId, 0, "The control has a thread identity");
   const sql =
     "SELECT id, messageId, sender, subject, threadId, threadParent " +
     "FROM messages ORDER BY id";
@@ -144,7 +144,7 @@ add_task(async function test_failedAddLeavesNoMessageOrPublication() {
     "The fault fixture raises the expected storage constraint"
   );
   Assert.equal(faults, 1, "The operation reached the intended later write");
-  Assert.ok(failedId > 0);
+  Assert.greater(failedId, 0);
   Assert.notEqual(failedId, controlId);
   Assert.throws(
     () => messageDB.getMessage(failedId).messageId,

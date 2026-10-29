@@ -130,7 +130,7 @@ add_task(async function test_currentPolicyAndLocation() {
   });
   const state = states.get("physical");
   state.location = { folderId: 30, messageKey: 40 };
-  let page = await index.search("policyneedle");
+  const page = await index.search("policyneedle");
   Assert.deepEqual(page.items[0].location, { folderId: 30, messageKey: 40 });
   Assert.equal(
     page.items[0].id,

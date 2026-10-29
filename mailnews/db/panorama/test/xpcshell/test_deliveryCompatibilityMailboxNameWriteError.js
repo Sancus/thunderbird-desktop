@@ -44,7 +44,7 @@ add_task(function test_mailboxNamePropagatesWriteError() {
   const info = db.dBFolderInfo;
   info.setCharProperty("mailboxName", "Original/Committed");
   const reader = Services.storage.openUnsharedDatabase(file);
-  let statement;
+  let statement = null;
   registerCleanupFunction(() => {
     if (statement) {
       statement.finalize();

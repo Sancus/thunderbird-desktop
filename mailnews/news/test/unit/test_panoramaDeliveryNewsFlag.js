@@ -31,7 +31,7 @@ add_task(async function test_keepsFlagsInTheirGroups() {
     daemon.addArticleToGroup(new NewsArticle(source), name, 5001);
   }
   const server = makeServer(NNTP_RFC2980_handler, daemon);
-  let incomingServer;
+  let incomingServer = null;
   registerCleanupFunction(async () => {
     try {
       incomingServer?.closeCachedConnections();

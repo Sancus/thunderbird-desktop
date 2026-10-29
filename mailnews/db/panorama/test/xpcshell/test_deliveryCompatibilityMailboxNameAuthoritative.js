@@ -52,7 +52,7 @@ add_task(function test_mailboxNameReadsAuthoritativeProperty() {
   Assert.equal(reconstructed.mailboxName, "Changed/InBoX");
   Assert.equal(info.getCharProperty("onlineName"), "Different/Online");
   const reader = Services.storage.openUnsharedDatabase(file);
-  let statement;
+  let statement = null;
   registerCleanupFunction(() => {
     if (statement) {
       statement.finalize();

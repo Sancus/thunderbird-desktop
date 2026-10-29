@@ -24,7 +24,7 @@ add_setup(function () {
     Cc["@mozilla.org/msgDatabase/msgDBService;1"]
       .getService(Ci.nsIMsgDBService)
       .QueryInterface(Ci.nsIDatabaseCore),
-    database,
+    database
   );
   const account = MailServices.accounts.createLocalMailAccount();
   registerCleanupFunction(() => {
@@ -33,7 +33,7 @@ add_setup(function () {
     Services.prefs.clearUserPref("mail.server.default.storeContractID");
   });
   root = account.incomingServer.rootFolder.QueryInterface(
-    Ci.nsIMsgLocalMailFolder,
+    Ci.nsIMsgLocalMailFolder
   );
   Assert.equal(root.server.getStringValue("storeContractID"), contract);
   Assert.equal(root.msgStore.storeType, "mbox");
@@ -51,22 +51,22 @@ add_task(function test_getFolderAndHeadersStayInTheirPhysicalFolder() {
   Assert.equal(db.getMsgHdrForKey(firstHeader.messageKey).folder, first);
   Assert.equal(
     db.getMsgHdrForMessageID("routing@example.invalid").messageKey,
-    firstHeader.messageKey,
+    firstHeader.messageKey
   );
   Assert.throws(
     () => db.getMsgHdrForKey(secondHeader.messageKey),
-    /NS_ERROR_ILLEGAL_VALUE/,
+    /NS_ERROR_ILLEGAL_VALUE/
   );
   Assert.throws(
     () => db.setStringProperty(secondHeader.messageKey, "custom", "wrong"),
-    /NS_ERROR_ILLEGAL_VALUE/,
+    /NS_ERROR_ILLEGAL_VALUE/
   );
   Assert.equal(secondHeader.getStringProperty("custom"), "");
   messageDB.removeMessage(firstHeader.messageKey);
   Assert.throws(
     () => db.getMsgHdrForKey(firstHeader.messageKey),
     /NS_ERROR_ILLEGAL_VALUE/,
-    "A retained header must not make a deleted row available",
+    "A retained header must not make a deleted row available"
   );
 });
 
@@ -82,7 +82,7 @@ add_task(function test_serverIDsUseExactPropertiesAndFolderMembership() {
   const db = first.msgDatabase;
   Assert.equal(
     db.getMsgHdrForGMMsgID("18446744073709551615").messageKey,
-    header.messageKey,
+    header.messageKey
   );
   Assert.equal(db.getMsgHdrForEwsItemID("AAMk+/=Opaque").folder, first);
   Assert.equal(db.getMsgHdrForEwsItemID("aamk+/=opaque"), null);
@@ -95,7 +95,7 @@ add_task(function test_serverIDsUseExactPropertiesAndFolderMembership() {
   Assert.throws(
     () => db.getMsgHdrForGMMsgID("18446744073709551615"),
     /NS_ERROR_FILE_CORRUPTED/,
-    "Ambiguous physical matches must not pick an arbitrary header",
+    "Ambiguous physical matches must not pick an arbitrary header"
   );
 });
 
@@ -145,7 +145,7 @@ add_task(function test_deletedFolderCannotReturnCachedObjects() {
   Assert.throws(() => db.folder, /NS_ERROR_NOT_AVAILABLE/);
   Assert.throws(
     () => db.getMsgHdrForKey(header.messageKey),
-    /NS_ERROR_NOT_AVAILABLE/,
+    /NS_ERROR_NOT_AVAILABLE/
   );
   Assert.throws(() => db.listAllOfflineMsgs(), /NS_ERROR_NOT_AVAILABLE/);
 });
@@ -157,28 +157,28 @@ add_task(function test_lookupStorageErrorsDoNotBecomeNotFound() {
   const db = folder.msgDatabase;
   Assert.equal(
     db.getMsgHdrForGMMsgID("stored-id").messageKey,
-    header.messageKey,
+    header.messageKey
   );
   const connection = database.connectionForTests;
   connection.executeSimpleSQL(
-    "ALTER TABLE messages RENAME TO unavailable_messages",
+    "ALTER TABLE messages RENAME TO unavailable_messages"
   );
   try {
     Assert.throws(
       () => db.getMsgHdrForGMMsgID("stored-id"),
-      (error) => error.result == Cr.NS_ERROR_FAILURE,
+      error => error.result == Cr.NS_ERROR_FAILURE
     );
     Assert.throws(
       () => db.getMsgHdrForMessageID("routing@example.invalid"),
-      (error) => error.result == Cr.NS_ERROR_FAILURE,
+      error => error.result == Cr.NS_ERROR_FAILURE
     );
   } finally {
     connection.executeSimpleSQL(
-      "ALTER TABLE unavailable_messages RENAME TO messages",
+      "ALTER TABLE unavailable_messages RENAME TO messages"
     );
   }
   Assert.equal(
     db.getMsgHdrForGMMsgID("stored-id").messageKey,
-    header.messageKey,
+    header.messageKey
   );
 });

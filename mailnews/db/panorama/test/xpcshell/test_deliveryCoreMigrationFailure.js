@@ -135,7 +135,7 @@ add_task(
       "A reached late migration failure ends its transaction and preserves the control"
     );
     Assert.equal(nativeError, null, "A subsequent native add succeeds");
-    Assert.ok(nativeId > 0);
+    Assert.greater(nativeId, 0);
     Assert.notEqual(nativeId, controlId);
     Assert.deepEqual(
       {

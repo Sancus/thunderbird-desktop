@@ -406,7 +406,12 @@ add_task(async function testHeaderProperties() {
   stmt.params.id = header.messageKey;
   const properties = [];
   while (stmt.executeStep()) {
-    properties.push([stmt.row.id, stmt.row.name, stmt.row.type, stmt.row.value]);
+    properties.push([
+      stmt.row.id,
+      stmt.row.name,
+      stmt.row.type,
+      stmt.row.value,
+    ]);
   }
   stmt.finalize();
 

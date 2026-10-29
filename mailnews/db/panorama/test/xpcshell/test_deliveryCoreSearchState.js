@@ -56,21 +56,30 @@ add_task(function test_currentStateTracksRevisions() {
   Assert.ok(Number.isSafeInteger(before.generation));
   header.subject = "changed subject";
   const edited = messageDB.getSearchState(key);
-  Assert.ok(edited.generation > before.generation);
-  Assert.ok(BigInt(edited.contentRevision) > BigInt(before.contentRevision));
+  Assert.greater(edited.generation, before.generation);
+  Assert.greater(
+    BigInt(edited.contentRevision),
+    BigInt(before.contentRevision)
+  );
   Assert.equal(edited.locationRevision, before.locationRevision);
   header.flags = Ci.nsMsgMessageFlags.Read;
   const flagged = messageDB.getSearchState(key);
   Assert.equal(flagged.flags, Ci.nsMsgMessageFlags.Read);
-  Assert.ok(flagged.generation > edited.generation);
+  Assert.greater(flagged.generation, edited.generation);
   Assert.equal(flagged.contentRevision, edited.contentRevision);
   header.setStringProperty("storeToken", "body-token");
   const stored = messageDB.getSearchState(key);
   Assert.equal(stored.storeToken, "body-token");
-  Assert.ok(BigInt(stored.locationRevision) > BigInt(flagged.locationRevision));
+  Assert.greater(
+    BigInt(stored.locationRevision),
+    BigInt(flagged.locationRevision)
+  );
   messageDB.noteMessageContentChanged(key);
   const content = messageDB.getSearchState(key);
-  Assert.ok(BigInt(content.contentRevision) > BigInt(stored.contentRevision));
+  Assert.greater(
+    BigInt(content.contentRevision),
+    BigInt(stored.contentRevision)
+  );
   Assert.equal(content.locationRevision, stored.locationRevision);
 });
 
@@ -120,7 +129,7 @@ add_task(function test_snapshotWatermarkSupportsLaterReplay() {
     if (!page.messages.length) {
       break;
     }
-    Assert.ok(page.nextKey > keyCursor);
+    Assert.greater(page.nextKey, keyCursor);
     seen.push(...page.messages.map(state => state.messageKey));
     keyCursor = page.nextKey;
   }
@@ -134,14 +143,14 @@ add_task(function test_snapshotWatermarkSupportsLaterReplay() {
     if (page.nextSequence == page.watermark) {
       break;
     }
-    Assert.ok(page.nextSequence > sequence);
+    Assert.greater(page.nextSequence, sequence);
     sequence = page.nextSequence;
   }
   Assert.ok(changes.some(change => change.messageKey == late));
   Assert.ok(changes.some(change => change.messageKey == original.messageKey));
-  Assert.ok(
-    BigInt(messageDB.getSearchState(original.messageKey).contentRevision) >
-      BigInt(original.contentRevision)
+  Assert.greater(
+    BigInt(messageDB.getSearchState(original.messageKey).contentRevision),
+    BigInt(original.contentRevision)
   );
 });
 
@@ -151,8 +160,8 @@ add_task(function test_policyInvalidationPreservesContentRevision() {
   const watermark = messageDB.getSearchChanges(0, 1).watermark;
   messageDB.noteSearchPolicyChanged();
   const after = messageDB.getSearchState(key);
-  Assert.ok(after.generation > before.generation);
-  Assert.ok(BigInt(after.policyRevision) > BigInt(before.policyRevision));
+  Assert.greater(after.generation, before.generation);
+  Assert.greater(BigInt(after.policyRevision), BigInt(before.policyRevision));
   Assert.equal(after.contentRevision, before.contentRevision);
   Assert.ok(
     messageDB
@@ -163,7 +172,7 @@ add_task(function test_policyInvalidationPreservesContentRevision() {
   try {
     const junk = messageDB.getSearchState(key);
     Assert.equal(junk.folderFlags, Ci.nsMsgFolderFlags.Junk);
-    Assert.ok(junk.generation > after.generation);
+    Assert.greater(junk.generation, after.generation);
   } finally {
     folderDB.updateFlags(searchFolder, 0);
   }
@@ -236,7 +245,7 @@ add_task(function test_deletedFolderRemainsReadableAndPageable() {
   Assert.equal(orphan.folderId, doomed);
   Assert.strictEqual(orphan.folderFlags, null);
   Assert.equal(orphan.contentRevision, before.contentRevision);
-  Assert.ok(orphan.generation > before.generation);
+  Assert.greater(orphan.generation, before.generation);
   Assert.equal(messageDB.getSearchState(survivorKey).folderFlags, 0);
   const replay = messageDB.getSearchChanges(watermark, 1000);
   Assert.equal(replay.changes.length, 1);
@@ -249,7 +258,7 @@ add_task(function test_deletedFolderRemainsReadableAndPageable() {
     if (!page.messages.length) {
       break;
     }
-    Assert.ok(page.nextKey > cursor);
+    Assert.greater(page.nextKey, cursor);
     seen.push(...page.messages);
     cursor = page.nextKey;
   }
@@ -321,8 +330,8 @@ add_task(function test_indexingPriorityChangesInvalidatePolicy() {
     const watermark = messageDB.getSearchChanges(0, 1).watermark;
     connection.executeSimpleSQL(sql);
     const after = messageDB.getSearchState(key);
-    Assert.ok(after.generation > before.generation);
-    Assert.ok(BigInt(after.policyRevision) > BigInt(before.policyRevision));
+    Assert.greater(after.generation, before.generation);
+    Assert.greater(BigInt(after.policyRevision), BigInt(before.policyRevision));
     Assert.equal(after.contentRevision, before.contentRevision);
     const changes = messageDB.getSearchChanges(watermark, 1000).changes;
     Assert.equal(changes.length, 1);

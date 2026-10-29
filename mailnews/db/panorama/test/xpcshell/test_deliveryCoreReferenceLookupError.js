@@ -59,7 +59,7 @@ add_task(function test_referenceLookupErrorDoesNotBecomeAbsence() {
   });
   const control = messageDB.getMessage(controlId);
   const threadId = control.threadId;
-  Assert.ok(threadId > 0);
+  Assert.greater(threadId, 0);
   // Observe raw rows without requiring an account-backed nsIMsgFolder.
   const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView

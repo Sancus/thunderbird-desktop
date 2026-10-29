@@ -128,8 +128,9 @@ add_task(
     let rootCalls = 0;
     const rootCID = MockRegistrar.register(rootContract, () => {
       server = MailServices.accounts.getIncomingServer(key);
-      Assert.ok(
-        ++rootCalls <= 2,
+      Assert.lessOrEqual(
+        ++rootCalls,
+        2,
         "At most the failed root and one fresh retry"
       );
       return rootCalls == 1 ? failed : fresh;

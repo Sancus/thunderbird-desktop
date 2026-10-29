@@ -24,7 +24,8 @@ add_task(function test_selectsNewsAccountBackend() {
       ? Services.prefs.getCharPref(name)
       : null,
   }));
-  let account, incomingServer;
+  let account = null;
+  let incomingServer = null;
   registerCleanupFunction(() => {
     try {
       incomingServer?.closeCachedConnections();

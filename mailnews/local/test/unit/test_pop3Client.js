@@ -317,7 +317,7 @@ async function checkDeferredDownloadFailure(store, failingFirst) {
       },
     });
     await promise;
-    await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+    await new Promise(nextTurn => Services.tm.dispatchToMainThread(nextTurn));
     Assert.deepEqual(completions, [{ url: null, status: Cr.NS_ERROR_FAILURE }]);
     Assert.equal(badDaemon.getTotalMessages(), 1, "Failed source is retained");
     Assert.equal(goodDaemon.getTotalMessages(), 0, "Other account completed");

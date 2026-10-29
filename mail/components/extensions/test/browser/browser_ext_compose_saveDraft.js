@@ -511,23 +511,28 @@ async function checkSaveFailure(failure, mode = "draft") {
   const extension = ExtensionTestUtils.loadExtension({
     files: {
       "background.js": async () => {
-        const [{ subject, mode, folderName }] =
-          await window.sendMessage("getConfig");
+        const [
+          {
+            subject: savedSubject,
+            mode: saveMode,
+            folderName: savedFolderName,
+          },
+        ] = await window.sendMessage("getConfig");
         const [before] = await window.sendMessage("getStoredMessages");
         const tab = await browser.compose.beginNew({
           to: ["save-recovery@example.invalid"],
-          subject,
+          subject: savedSubject,
         });
         await window.sendMessage("failNextSave");
         const failureEvent = window.waitForEvent("compose.onAfterSave");
         await browser.test.assertRejects(
-          browser.compose.saveMessage(tab.id, { mode }),
+          browser.compose.saveMessage(tab.id, { mode: saveMode }),
           /Message operation failed/,
           "The failed save rejects instead of returning an empty success"
         );
         const [failedTab, failureInfo] = await failureEvent;
         browser.test.assertEq(tab.id, failedTab.id);
-        browser.test.assertEq(mode, failureInfo.mode);
+        browser.test.assertEq(saveMode, failureInfo.mode);
         browser.test.assertEq("Message operation failed", failureInfo.error);
         browser.test.assertEq(0, failureInfo.messages.length);
         const [afterFailure] = await window.sendMessage("getStoredMessages");
@@ -538,41 +543,50 @@ async function checkSaveFailure(failure, mode = "draft") {
         );
 
         const successEvent = window.waitForEvent("compose.onAfterSave");
-        const saved = await browser.compose.saveMessage(tab.id, { mode });
+        const saved = await browser.compose.saveMessage(tab.id, {
+          mode: saveMode,
+        });
         const [savedTab, successInfo] = await successEvent;
         browser.test.assertEq(tab.id, savedTab.id);
-        browser.test.assertEq(mode, saved.mode);
+        browser.test.assertEq(saveMode, saved.mode);
         browser.test.assertEq(1, saved.messages.length);
         browser.test.assertEq(undefined, successInfo.error);
         browser.test.assertDeepEq(saved.messages, successInfo.messages);
         const [current] = await window.sendMessage("getStoredMessages");
         browser.test.assertEq(before.length + 1, current.length);
-        const stored = current.filter(message => message.subject == subject);
+        const stored = current.filter(
+          message => message.subject == savedSubject
+        );
         browser.test.assertEq(1, stored.length);
         browser.test.assertEq(
           saved.messages[0].headerMessageId,
           stored[0].messageId,
           "The successful result identifies the actual stored message"
         );
-        browser.test.assertEq(`/${folderName}`, saved.messages[0].folder.path);
+        browser.test.assertEq(
+          `/${savedFolderName}`,
+          saved.messages[0].folder.path
+        );
         browser.test.assertDeepEq(
           before,
-          current.filter(message => message.subject != subject),
+          current.filter(message => message.subject != savedSubject),
           "The retry preserves the original physical drafts"
         );
         const fetched = await browser.messages.get(saved.messages[0].id);
-        browser.test.assertEq(subject, fetched.subject);
+        browser.test.assertEq(savedSubject, fetched.subject);
         browser.test.assertEq(saved.messages[0].folder.id, fetched.folder.id);
 
-        const updatedSubject = subject + " updated";
+        const updatedSubject = savedSubject + " updated";
         await browser.compose.setComposeDetails(tab.id, {
           subject: updatedSubject,
         });
         const replacementEvent = window.waitForEvent("compose.onAfterSave");
-        const replacement = await browser.compose.saveMessage(tab.id, { mode });
+        const replacement = await browser.compose.saveMessage(tab.id, {
+          mode: saveMode,
+        });
         const [replacementTab, replacementInfo] = await replacementEvent;
         browser.test.assertEq(tab.id, replacementTab.id);
-        browser.test.assertEq(mode, replacement.mode);
+        browser.test.assertEq(saveMode, replacement.mode);
         browser.test.assertEq(1, replacement.messages.length);
         browser.test.assertDeepEq(
           replacement.messages,
@@ -599,7 +613,7 @@ async function checkSaveFailure(failure, mode = "draft") {
           updated.messageId
         );
         browser.test.assertEq(
-          `/${folderName}`,
+          `/${savedFolderName}`,
           replacement.messages[0].folder.path
         );
         await browser.test.assertRejects(

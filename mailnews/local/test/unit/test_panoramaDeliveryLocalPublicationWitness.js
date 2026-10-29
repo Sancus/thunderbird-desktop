@@ -387,8 +387,9 @@ add_setup(function setupLocalPublicationWitness() {
     );
     Assert.ok(freshService instanceof Ci.nsIMsgMessageService);
     Assert.equal(freshStore.storeType, lane.store);
-    Assert.ok(
-      witnessStoreInstances > 0,
+    Assert.greater(
+      witnessStoreInstances,
+      0,
       "The fixture used the intercepted factory"
     );
     currentWitness = null;

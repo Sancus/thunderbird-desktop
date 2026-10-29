@@ -28,7 +28,8 @@ add_task(async function test_restoresImapHierarchyWithoutBodyDirectories() {
     hostname: "localhost",
     storeContractID: storeContract,
   };
-  let account, incomingServer;
+  let account = null;
+  let incomingServer = null;
   registerCleanupFunction(() => {
     try {
       if (incomingServer) {

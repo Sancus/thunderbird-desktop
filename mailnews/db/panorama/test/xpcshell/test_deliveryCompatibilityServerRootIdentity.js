@@ -82,7 +82,7 @@ add_task(
         MailServices.folderLookup.getFolderForURL(nativeRoot.URI),
         nativeRoot
       );
-      Assert.ok(childCalls < nativeChildren.length);
+      Assert.less(childCalls, nativeChildren.length);
       return nativeChildren[childCalls++];
     });
     registerCleanupFunction(() => MockRegistrar.unregister(childCID));

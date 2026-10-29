@@ -1,4 +1,12 @@
+#include <utility>
+
 #include "gtest/gtest.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/Preferences.h"
+#include "OfflineStorage.h"
+#include "nsMsgDBFolder.h"
+#include "CopyMessageStreamListener.h"
+#include "nsIInputStreamPump.h"
 #include "nsString.h"
 #include "nsNetUtil.h"
 #include "nsStringStream.h"
@@ -158,4 +166,257 @@ TEST(TestMailStream, RejectLudicrouslyLargeHeader)
   RefPtr<MailStream> wrapped = new MailStream(raw);
 
   ASSERT_TRUE(wrapped->HeaderBlock().isErr());
+}
+
+namespace {
+
+class CopyStreamDestination final : public nsICopyMessageListener {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  NS_IMETHOD BeginCopy() override {
+    ++mBegins;
+    return mBeginResult;
+  }
+  NS_IMETHOD StartMessage() override { return NS_OK; }
+  NS_IMETHOD CopyData(nsIInputStream* stream, int32_t length) override {
+    ++mDataCalls;
+    nsCString data;
+    nsresult rv = NS_ReadInputStreamToString(stream, data, length, nullptr);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    mData.Append(data);
+    if (mCancelOnData) {
+      mCancelResult = mCancelOnData->Cancel(NS_BINDING_ABORTED);
+    }
+    return mDataResult;
+  }
+  NS_IMETHOD EndMessage(nsMsgKey key) override { return NS_OK; }
+  NS_IMETHOD EndCopy(bool succeeded) override {
+    ++mCopies;
+    mCopySucceeded = succeeded;
+    return NS_OK;
+  }
+  NS_IMETHOD EndMove(bool succeeded) override {
+    ++mMoves;
+    mMoveSucceeded = succeeded;
+    return NS_OK;
+  }
+
+  nsCString mData;
+  nsCOMPtr<nsIRequest> mCancelOnData;
+  nsresult mBeginResult = NS_OK;
+  nsresult mDataResult = NS_OK;
+  nsresult mCancelResult = NS_ERROR_NOT_INITIALIZED;
+  uint32_t mBegins = 0;
+  uint32_t mDataCalls = 0;
+  uint32_t mCopies = 0;
+  uint32_t mMoves = 0;
+  bool mCopySucceeded = false;
+  bool mMoveSucceeded = false;
+
+ private:
+  ~CopyStreamDestination() = default;
+};
+
+NS_IMPL_ISUPPORTS(CopyStreamDestination, nsICopyMessageListener)
+
+class CopyMessageStreamListenerTest : public ::testing::Test {
+ protected:
+  nsresult Start(bool statusCallback, bool isMove,
+                 nsIMsgFolder* sourceFolder = nullptr) {
+    nsCOMPtr<nsIInputStream> stream;
+    nsresult rv = NS_NewCStringInputStream(getter_AddRefs(stream),
+                                           "Subject: copy\r\n\r\nbody\r\n"_ns);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    rv = NS_NewInputStreamPump(getter_AddRefs(mPump), stream.forget());
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    std::function<nsresult(nsresult)> endCopy;
+    if (statusCallback) {
+      endCopy = [this](nsresult status) {
+        ++mCompletions;
+        mStatus = status;
+        return NS_OK;
+      };
+    }
+    RefPtr<CopyMessageStreamListener> listener =
+        new CopyMessageStreamListener(mDestination, isMove, std::move(endCopy));
+    nsCOMPtr<nsIStreamListener> streamListener = listener;
+    if (sourceFolder) {
+      nsCOMPtr<nsIChannel> channel =
+          do_CreateInstance("@mozilla.org/network/input-stream-channel;1", &rv);
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+      streamListener =
+          new OfflineMessageReadListener(listener, channel, 42, sourceFolder);
+    }
+    return mPump->AsyncRead(streamListener);
+  }
+
+  bool Wait() {
+    return mozilla::SpinEventLoopUntil(
+        "CopyMessageStreamListenerTest"_ns,
+        [this] { return mCompletions || mDestination->mCopies; });
+  }
+
+  RefPtr<CopyStreamDestination> mDestination = new CopyStreamDestination();
+  nsCOMPtr<nsIInputStreamPump> mPump;
+  uint32_t mCompletions = 0;
+  nsresult mStatus = NS_ERROR_NOT_INITIALIZED;
+};
+
+}  // namespace
+
+TEST_F(CopyMessageStreamListenerTest, LegacyMove) {
+  ASSERT_EQ(NS_OK, Start(false, true));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(1u, mDestination->mBegins);
+  EXPECT_EQ("Subject: copy\r\n\r\nbody\r\n"_ns, mDestination->mData);
+  EXPECT_EQ(1u, mDestination->mCopies);
+  EXPECT_TRUE(mDestination->mCopySucceeded);
+  EXPECT_EQ(1u, mDestination->mMoves);
+  EXPECT_TRUE(mDestination->mMoveSucceeded);
+  EXPECT_EQ(0u, mCompletions);
+}
+
+TEST_F(CopyMessageStreamListenerTest, LegacyFailedMove) {
+  mDestination->mDataResult = NS_ERROR_FILE_NO_DEVICE_SPACE;
+  ASSERT_EQ(NS_OK, Start(false, true));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(1u, mDestination->mDataCalls);
+  EXPECT_EQ(1u, mDestination->mCopies);
+  EXPECT_FALSE(mDestination->mCopySucceeded);
+  EXPECT_EQ(1u, mDestination->mMoves);
+  EXPECT_FALSE(mDestination->mMoveSucceeded);
+}
+
+TEST_F(CopyMessageStreamListenerTest, StatusCallbackSuccess) {
+  ASSERT_EQ(NS_OK, Start(true, false));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(NS_OK, mStatus);
+  EXPECT_EQ(1u, mCompletions);
+  EXPECT_EQ("Subject: copy\r\n\r\nbody\r\n"_ns, mDestination->mData);
+  EXPECT_EQ(0u, mDestination->mCopies);
+  EXPECT_EQ(0u, mDestination->mMoves);
+}
+
+TEST_F(CopyMessageStreamListenerTest, ExactRequestFailure) {
+  ASSERT_EQ(NS_OK, Start(true, true));
+  ASSERT_EQ(NS_OK, mPump->Cancel(NS_ERROR_UNEXPECTED));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, mStatus);
+  EXPECT_EQ(1u, mCompletions);
+  EXPECT_EQ(1u, mDestination->mBegins);
+  EXPECT_TRUE(mDestination->mData.IsEmpty());
+  EXPECT_EQ(0u, mDestination->mCopies);
+  EXPECT_EQ(1u, mDestination->mMoves);
+  EXPECT_FALSE(mDestination->mMoveSucceeded);
+}
+
+TEST_F(CopyMessageStreamListenerTest, BeginFailure) {
+  mDestination->mBeginResult = NS_ERROR_FILE_ACCESS_DENIED;
+  ASSERT_EQ(NS_OK, Start(true, false));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, mStatus);
+  EXPECT_EQ(1u, mCompletions);
+  EXPECT_EQ(1u, mDestination->mBegins);
+  EXPECT_EQ(0u, mDestination->mDataCalls);
+  EXPECT_EQ(0u, mDestination->mCopies);
+  EXPECT_EQ(0u, mDestination->mMoves);
+}
+
+TEST_F(CopyMessageStreamListenerTest, CopyFailurePrecedesCancellation) {
+  mDestination->mDataResult = NS_ERROR_FILE_NO_DEVICE_SPACE;
+  ASSERT_EQ(NS_OK, Start(true, true));
+  mDestination->mCancelOnData = mPump;
+  ASSERT_TRUE(Wait());
+  nsresult requestStatus;
+  ASSERT_EQ(NS_OK, mPump->GetStatus(&requestStatus));
+  EXPECT_EQ(NS_BINDING_ABORTED, requestStatus);
+  EXPECT_EQ(NS_OK, mDestination->mCancelResult);
+  EXPECT_EQ(NS_ERROR_FILE_NO_DEVICE_SPACE, mStatus);
+  EXPECT_EQ("Subject: copy\r\n\r\nbody\r\n"_ns, mDestination->mData);
+  EXPECT_EQ(1u, mDestination->mDataCalls);
+  EXPECT_EQ(1u, mCompletions);
+  EXPECT_EQ(0u, mDestination->mCopies);
+  EXPECT_EQ(1u, mDestination->mMoves);
+  EXPECT_FALSE(mDestination->mMoveSucceeded);
+}
+
+namespace {
+
+// Only records the cache eviction requested by the real read listener.
+class OfflineReadFolder final : public nsMsgDBFolder {
+ public:
+  NS_IMETHOD DiscardOfflineMsg(nsMsgKey key) override {
+    ++mDiscards;
+    mDiscardedKey = key;
+    return NS_OK;
+  }
+
+  uint32_t mDiscards = 0;
+  nsMsgKey mDiscardedKey = nsMsgKey_None;
+
+ private:
+  ~OfflineReadFolder() = default;
+  nsresult GetDatabase() override { return NS_ERROR_NOT_IMPLEMENTED; }
+};
+
+class OfflineMessageReadListenerTest : public CopyMessageStreamListenerTest {
+ protected:
+  void SetUp() override {
+    mHadPref = mozilla::Preferences::HasUserValue(kPref);
+    mOldPref = mozilla::Preferences::GetBool(kPref, true);
+    ASSERT_EQ(NS_OK, mozilla::Preferences::SetBool(kPref, true));
+  }
+
+  void TearDown() override {
+    if (mHadPref) {
+      EXPECT_EQ(NS_OK, mozilla::Preferences::SetBool(kPref, mOldPref));
+    } else {
+      EXPECT_EQ(NS_OK, mozilla::Preferences::ClearUser(kPref));
+    }
+  }
+
+  static constexpr char kPref[] = "mail.discard_offline_msg_on_failure";
+  RefPtr<OfflineReadFolder> mFolder = new OfflineReadFolder();
+  bool mHadPref = false;
+  bool mOldPref = true;
+};
+
+}  // namespace
+
+TEST_F(OfflineMessageReadListenerTest, ConsumerStartFailureKeepsSource) {
+  mDestination->mBeginResult = NS_ERROR_FILE_ACCESS_DENIED;
+  ASSERT_EQ(NS_OK, Start(true, false, mFolder));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, mStatus);
+  EXPECT_EQ(1u, mCompletions);
+  EXPECT_EQ(0u, mFolder->mDiscards);
+}
+
+TEST_F(OfflineMessageReadListenerTest, ConsumerWriteFailureKeepsSource) {
+  mDestination->mDataResult = NS_ERROR_FILE_NO_DEVICE_SPACE;
+  ASSERT_EQ(NS_OK, Start(true, false, mFolder));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(NS_ERROR_FILE_NO_DEVICE_SPACE, mStatus);
+  EXPECT_EQ(1u, mCompletions);
+  EXPECT_EQ("Subject: copy\r\n\r\nbody\r\n"_ns, mDestination->mData);
+  EXPECT_EQ(0u, mFolder->mDiscards);
+}
+
+TEST_F(OfflineMessageReadListenerTest, NonConsumerFailureStillDiscardsSource) {
+  ASSERT_EQ(NS_OK, Start(true, false, mFolder));
+  ASSERT_EQ(NS_OK, mPump->Cancel(NS_ERROR_UNEXPECTED));
+  ASSERT_TRUE(Wait());
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, mStatus);
+  EXPECT_EQ(1u, mCompletions);
+  EXPECT_EQ(1u, mFolder->mDiscards);
+  EXPECT_EQ(42u, mFolder->mDiscardedKey);
 }

@@ -10,12 +10,16 @@
 #include "nsIInputStream.h"
 #include "nsIMsgCopyService.h"
 #include "nsIMsgFolderNotificationService.h"
+#include "nsIMsgLocalMailFolder.h"
 #include "nsIMsgMessageService.h"
+#include "nsIMsgNewsFolder.h"
 #include "nsISeekableStream.h"
 #include "nsIStringStream.h"
+#include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
 #include "OfflineStorage.h"
+#include "UrlListener.h"
 #include "mozilla/Components.h"
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -84,8 +88,13 @@ NS_IMETHODIMP ExchangeMessageCopyHandler::EndCopy(bool aCopySucceeded) {
   // Now we want to create it in the dest folder, both locally and remotely.
   nsCOMPtr<nsIStringInputStream> stream =
       do_CreateInstance("@mozilla.org/io/string-input-stream;1", &rv);
-  NS_ENSURE_SUCCESS(rv, rv);
-  MOZ_TRY(stream->SetByteStringData(mBuffer));
+  if (NS_FAILED(rv)) {
+    return OnCopyCompleted(rv);
+  }
+  rv = stream->SetByteStringData(mBuffer);
+  if (NS_FAILED(rv)) {
+    return OnCopyCompleted(rv);
+  }
 
   // Make sure we apply the correct read flag onto the new message.
   RefPtr<nsIMsgDBHdr> curHeader = mHeaders[mCurIndex];
@@ -99,11 +108,15 @@ NS_IMETHODIMP ExchangeMessageCopyHandler::EndCopy(bool aCopySucceeded) {
         "mailnews.database.summary.dontPreserveOnCopy", dontPreserve);
   }
 
-  return ExchangePerformMessageCreateFromCopy(
+  rv = ExchangePerformMessageCreateFromCopy(
       mDstFolder, stream, curHeader, StringFields(dontPreserve), mIsDraft,
       [self = RefPtr(this)](nsresult status, nsIMsgDBHdr* newHdr) {
         self->OnCreateFinished(status, newHdr);
       });
+  if (NS_FAILED(rv)) {
+    return OnCopyCompleted(rv);
+  }
+  return NS_OK;
 }
 
 NS_IMETHODIMP ExchangeMessageCopyHandler::EndMove(bool aMoveSucceeded) {
@@ -119,6 +132,20 @@ NS_IMETHODIMP ExchangeMessageCopyHandler::EndMove(bool aMoveSucceeded) {
 // Additional public methods on `ExchangeMessageCopyHandler`.
 
 nsresult ExchangeMessageCopyHandler::StartCopyingNextMessage() {
+  if (mIsMove && mSrcFolder) {
+    nsCOMPtr<IExchangeFolder> exchangeSource =
+        do_QueryInterface(mSrcFolder.value());
+    nsCOMPtr<nsIMsgLocalMailFolder> localSource =
+        do_QueryInterface(mSrcFolder.value());
+    nsCOMPtr<nsIMsgNewsFolder> newsSource =
+        do_QueryInterface(mSrcFolder.value());
+    // Exchange reports final deletion through the listener. Local and news
+    // deletion is synchronous. Other sources need a confirmed completion API.
+    if (!exchangeSource && !localSource && !newsSource) {
+      return NS_ERROR_NOT_IMPLEMENTED;
+    }
+  }
+
   if (mCopyServiceListener && mHeaders.Length() > 1) {
     // This is one of multiple messages, so inform the listener which message
     // we're currently on.
@@ -138,7 +165,11 @@ nsresult ExchangeMessageCopyHandler::StartCopyingNextMessage() {
     // `nsIMsgMessageService::CopyMessage()` can use it as an
     // `nsIStreamListener`.
     RefPtr<CopyMessageStreamListener> copyListener =
-        new CopyMessageStreamListener(this, mIsMove);
+        new CopyMessageStreamListener(
+            this, mIsMove, [self = RefPtr(this)](nsresult status) {
+              return NS_FAILED(status) ? self->OnCopyCompleted(status)
+                                       : self->EndCopy(true);
+            });
 
     // We'll buffer up the message in mBuffer before we proceed, see
     // BeginCopy()/CopyData()/EndCopy().
@@ -161,13 +192,11 @@ nsresult ExchangeMessageCopyHandler::StartCopyingNextMessage() {
     nsresult rv = NS_NewLocalFileInputStream(getter_AddRefs(srcRaw), file);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    // When creating a message from a file, we're saving to either the Sent
-    // folder (in which case we mark the message as read) or to the Draft folder
-    // (in which case we mark the message as unread).
-    bool isRead = !mIsDraft;
+    // Honor the caller's read state, including queued Outbox messages.
+    bool isRead = mFileFlags & nsMsgMessageFlags::Read;
 
     return ExchangePerformMessageCreate(
-        mDstFolder, srcRaw, isRead, mIsDraft,
+        mDstFolder, srcRaw, mFileHeader, isRead, mIsDraft, mFileKeywords,
         [self = RefPtr(this)](nsresult status, nsIMsgDBHdr* newHdr) {
           self->OnCreateFinished(status, newHdr);
         });
@@ -180,6 +209,11 @@ nsresult ExchangeMessageCopyHandler::StartCopyingNextMessage() {
 }
 
 nsresult ExchangeMessageCopyHandler::OnCopyCompleted(nsresult status) {
+  if (mCompleted) {
+    return NS_OK;
+  }
+  mCompleted = true;
+
   // TODO: Refresh size on disk once we start keeping track of the size of
   // Exchange folders on disk (via `mFolderSize` and `GetSizeOnDisk()`).
 
@@ -193,7 +227,7 @@ nsresult ExchangeMessageCopyHandler::OnCopyCompleted(nsresult status) {
     }
   }
 
-  if (mSrcFolder) {
+  if (mSrcFolder && NS_SUCCEEDED(status)) {
     nsCOMPtr<nsIMsgFolderNotificationService> notifier =
         mozilla::components::FolderNotification::Service();
     notifier->NotifyMsgsMoveCopyCompleted(mIsMove, mHeaders, mDstFolder,
@@ -223,13 +257,18 @@ nsresult ExchangeMessageCopyHandler::OnCopyCompleted(nsresult status) {
 // For moves, here's where we kick off deletion of the source message.
 nsresult ExchangeMessageCopyHandler::OnCreateFinished(nsresult status,
                                                       nsIMsgDBHdr* newHdr) {
+  if (mCompleted) {
+    return NS_OK;
+  }
   // If we got an error, then there's no guarantee that we have a header.
   if (NS_FAILED(status)) {
     return OnCopyCompleted(status);
   }
 
   // If we got a successful response then the new header should be present.
-  NS_ENSURE_TRUE(newHdr, NS_ERROR_UNEXPECTED);
+  if (!newHdr) {
+    return OnCopyCompleted(NS_ERROR_UNEXPECTED);
+  }
 
   // NOTE: SetMessageKey() needs to die.
   // It's required for old-style IMAP where the UID from the server is used
@@ -240,12 +279,6 @@ nsresult ExchangeMessageCopyHandler::OnCreateFinished(nsresult status,
     nsMsgKey key;
     newHdr->GetMessageKey(&key);
     mCopyServiceListener->SetMessageKey(key);
-  }
-
-  // If the message is a file message and it is not a draft, then it's a sent
-  // message and needs to be marked read.
-  if (mSrcFile && !mIsDraft) {
-    MOZ_TRY(newHdr->MarkRead(true));
   }
 
   // If we're copying from a file, then we're done since this is a single
@@ -267,13 +300,41 @@ nsresult ExchangeMessageCopyHandler::OnCreateFinished(nsresult status,
 
   if (mIsMove) {
     RefPtr<nsIMsgDBHdr> curHdr = mHeaders[mCurIndex];
-    // It's a bit weird that we pass `nullptr` as the `listener` argument
-    // (type `nsIMsgCopyServiceListener`), considering we're in the middle
-    // of a copy. It looks like this argument is almost never set (and never
-    // during a copy), except for `AttachmentDeleter::DeleteOriginalMessage`
-    // which doesn't seem to do anything when the listener is called.
-    MOZ_TRY(mSrcFolder.value()->DeleteMessages({curHdr}, mWindow, true, true,
-                                               nullptr, false));
+    nsCOMPtr<IExchangeFolder> exchangeSource =
+        do_QueryInterface(mSrcFolder.value());
+    if (exchangeSource) {
+      RefPtr<CopyServiceListener> listener = new CopyServiceListener();
+      listener->mStopCopyFn = [self = RefPtr(this),
+                               completed = false](nsresult status) mutable {
+        if (completed || self->mCompleted) {
+          return NS_OK;
+        }
+        completed = true;
+        return self->OnMessageCompleted(status);
+      };
+      nsresult rv = mSrcFolder.value()->DeleteMessages({curHdr}, mWindow, true,
+                                                       true, listener, false);
+      if (NS_FAILED(rv)) {
+        return listener->OnStopCopy(rv);
+      }
+      return NS_OK;
+    }
+
+    // These source implementations finish deletion before returning and do
+    // not supply a reliable move-completion callback.
+    return OnMessageCompleted(mSrcFolder.value()->DeleteMessages(
+        {curHdr}, mWindow, true, true, nullptr, false));
+  }
+
+  return OnMessageCompleted(NS_OK);
+}
+
+nsresult ExchangeMessageCopyHandler::OnMessageCompleted(nsresult status) {
+  if (mCompleted) {
+    return NS_OK;
+  }
+  if (NS_FAILED(status)) {
+    return OnCopyCompleted(status);
   }
 
   mCurIndex++;
@@ -282,5 +343,9 @@ nsresult ExchangeMessageCopyHandler::OnCreateFinished(nsresult status,
     return OnCopyCompleted(NS_OK);
   }
 
-  return StartCopyingNextMessage();
+  nsresult rv = StartCopyingNextMessage();
+  if (NS_FAILED(rv)) {
+    return OnCopyCompleted(rv);
+  }
+  return NS_OK;
 }

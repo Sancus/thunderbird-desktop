@@ -67,6 +67,9 @@ tags = ["compact"]
 
 ["test_encryptedURIsService.js"]
 
+["test_exchangeMissingItems.js"]
+head = ""
+
 ["test_fix_deferred_accounts.js"]
 
 ["test_folderCompact.js"]

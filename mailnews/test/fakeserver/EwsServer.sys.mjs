@@ -1253,6 +1253,21 @@ export class EwsServer extends MockServer {
         .getElementsByTagName("t:ItemId")[0]
         .getAttribute("Id");
       const item = this.getItemInfo(itemId);
+      if (!item) {
+        const responseEl = responsesMessagesEl.appendChild(
+          resDoc.createElement("m:UpdateItemResponseMessage")
+        );
+        responseEl.setAttribute("ResponseClass", "Error");
+        const messageTextEl = responseEl.appendChild(
+          resDoc.createElement("m:MessageText")
+        );
+        messageTextEl.textContent = "Item not found";
+        const responseCodeEl = responseEl.appendChild(
+          resDoc.createElement("m:ResponseCode")
+        );
+        responseCodeEl.textContent = "ErrorItemNotFound";
+        continue;
+      }
 
       const isReadEl = itemChange.getElementsByTagName("t:IsRead")[0];
       if (isReadEl) {
@@ -1339,7 +1354,6 @@ export class EwsServer extends MockServer {
 
     this.#setVersion(resDoc);
 
-    // Assume we are asking for only one item.
     const reqItemIds = [...reqDoc.getElementsByTagName("t:ItemId")].map(id =>
       id.getAttribute("Id")
     );
@@ -1353,17 +1367,27 @@ export class EwsServer extends MockServer {
       const responseMessageEl = resDoc.createElement(
         "m:GetItemResponseMessage"
       );
-      responseMessageEl.setAttribute("ResponseClass", "Success");
+      const item = this.getItemInfo(reqItemId);
+      responseMessageEl.setAttribute(
+        "ResponseClass",
+        item ? "Success" : "Error"
+      );
       responseMessagesEl.appendChild(responseMessageEl);
 
       const responseCodeEl = resDoc.createElement("m:ResponseCode");
-      responseCodeEl.textContent = "NoError";
+      responseCodeEl.textContent = item ? "NoError" : "ErrorItemNotFound";
       responseMessageEl.appendChild(responseCodeEl);
+      if (!item) {
+        const messageTextEl = resDoc.createElement("m:MessageText");
+        messageTextEl.textContent =
+          "The specified object was not found in the store.";
+        responseMessageEl.appendChild(messageTextEl);
+        return;
+      }
 
       const itemsEl = resDoc.createElement("m:Items");
       responseMessageEl.appendChild(itemsEl);
 
-      const item = this.getItemInfo(reqItemId);
       const messageEl = resDoc.createElement("t:Message");
       const itemIdEl = resDoc.createElement("t:ItemId");
       itemIdEl.setAttribute("Id", reqItemId);

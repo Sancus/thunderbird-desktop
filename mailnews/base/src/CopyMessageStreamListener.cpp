@@ -3,6 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "CopyMessageStreamListener.h"
+
+#include <utility>
 #include "nsIMsgImapMailFolder.h"
 #include "nsIChannel.h"
 
@@ -10,26 +12,41 @@ NS_IMPL_ISUPPORTS(CopyMessageStreamListener, nsIStreamListener,
                   nsIRequestObserver, nsICopyMessageListener)
 
 CopyMessageStreamListener::CopyMessageStreamListener(
-    nsICopyMessageListener* destination, bool isMove)
-    : mDestination(destination), mIsMove(isMove) {}
+    nsICopyMessageListener* destination, bool isMove,
+    std::function<nsresult(nsresult)> endCopy)
+    : mDestination(destination),
+      mEndCopy(std::move(endCopy)),
+      mIsMove(isMove) {}
 
 CopyMessageStreamListener::~CopyMessageStreamListener() {}
 
+nsresult CopyMessageStreamListener::RememberResult(nsresult status) {
+  if (NS_SUCCEEDED(mStatus) && NS_FAILED(status)) {
+    mStatus = status;
+  }
+  return status;
+}
+
 NS_IMETHODIMP CopyMessageStreamListener::StartMessage() {
-  return mDestination->StartMessage();
+  return RememberResult(mDestination->StartMessage());
 }
 
 NS_IMETHODIMP CopyMessageStreamListener::BeginCopy() {
-  return mDestination->BeginCopy();
+  return RememberResult(mDestination->BeginCopy());
 }
 
 NS_IMETHODIMP CopyMessageStreamListener::CopyData(nsIInputStream* aIStream,
                                                   int32_t aLength) {
-  return mDestination->CopyData(aIStream, aLength);
+  return RememberResult(mDestination->CopyData(aIStream, aLength));
 }
 
 NS_IMETHODIMP CopyMessageStreamListener::EndCopy(bool copySucceeded) {
-  nsresult rv = mDestination->EndCopy(copySucceeded);
+  if (!copySucceeded) {
+    RememberResult(NS_ERROR_FAILURE);
+  }
+  copySucceeded = NS_SUCCEEDED(mStatus);
+  nsresult rv =
+      mEndCopy ? mEndCopy(mStatus) : mDestination->EndCopy(copySucceeded);
   NS_ENSURE_SUCCESS(rv, rv);
 
   // If this is a move and we finished the copy, delete the old message.
@@ -51,11 +68,11 @@ NS_IMETHODIMP CopyMessageStreamListener::EndCopy(bool copySucceeded) {
 }
 
 NS_IMETHODIMP CopyMessageStreamListener::EndMove(bool moveSucceeded) {
-  return mDestination->EndMove(moveSucceeded);
+  return mDestination->EndMove(moveSucceeded && NS_SUCCEEDED(mStatus));
 }
 
 NS_IMETHODIMP CopyMessageStreamListener::EndMessage(nsMsgKey key) {
-  return mDestination->EndMessage(key);
+  return RememberResult(mDestination->EndMessage(key));
 }
 
 NS_IMETHODIMP CopyMessageStreamListener::OnStartRequest(nsIRequest* aRequest) {
@@ -70,5 +87,6 @@ NS_IMETHODIMP CopyMessageStreamListener::OnDataAvailable(
 
 NS_IMETHODIMP CopyMessageStreamListener::OnStopRequest(nsIRequest* aRequest,
                                                        nsresult aStatus) {
-  return EndCopy(NS_SUCCEEDED(aStatus));
+  RememberResult(aStatus);
+  return EndCopy(NS_SUCCEEDED(mStatus));
 }

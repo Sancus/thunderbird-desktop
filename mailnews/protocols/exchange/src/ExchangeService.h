@@ -22,14 +22,16 @@ class ExchangeService : public nsIMsgMessageService,
  private:
   /**
    * Retrieves the message at the given URI, downloading it first if requested,
-   * then optionally converting it to the desired output format.
+   * then optionally converting it to the desired output format. When localOnly
+   * is true, a missing offline body fails without downloading it.
    *
    * When fetching a part of a message (e.g. to save an attachment), the URI's
    * query is expected to describe which part to isolate and what the output
    * format should be. This query is processed by the stream converter, and thus
    * will be ignored unless `aConvert` is true.
    */
-  nsresult FetchMessage(nsIURI* uri, nsIStreamListener* streamListener);
+  nsresult FetchMessage(nsIURI* uri, nsIStreamListener* streamListener,
+                        bool localOnly = false);
 
   /**
    * Extracts the message key as a string from a message URI. Message URIs

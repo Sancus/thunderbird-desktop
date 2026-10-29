@@ -480,12 +480,11 @@ add_task(async function test_copy_file_message() {
     header.storeToken,
     "copied message should have been stored on disk"
   );
-  // TODO:
-  // Assert.equal(
-  //   header.getStringProperty("keywords"),
-  //   "$label4",
-  //   "keywords should have been set in the database"
-  // );
+  Assert.equal(
+    header.getStringProperty("keywords"),
+    "$label4",
+    "keywords should have been set in the database"
+  );
 
   // Check the message is on the server;
 
@@ -981,3 +980,1479 @@ add_task(async function test_delete_item_from_trash_ews() {
 add_task(async function test_delete_item_from_trash_graph() {
   await runDeleteItemFromTrashTest(graphServer, graphIncomingServer);
 });
+
+add_task(async function testCrossAccountMoveFailureEws() {
+  await subtestCrossAccountMoveFailure(
+    ewsServer,
+    ewsIncomingServer,
+    graphServer,
+    graphIncomingServer
+  );
+});
+
+/**
+ * Keep the source after a failed fetch, then retry into another account.
+ *
+ * @param {MockServer} sourceServer - The source protocol fixture.
+ * @param {nsIMsgIncomingServer} sourceAccount - The source account server.
+ * @param {MockServer} destinationServer - The destination protocol fixture.
+ * @param {nsIMsgIncomingServer} destinationAccount - The destination server.
+ * @returns {Promise<void>} Resolves after failure and retry finish.
+ */
+async function subtestCrossAccountMoveFailure(
+  sourceServer,
+  sourceAccount,
+  destinationServer,
+  destinationAccount
+) {
+  const [source, , messages] = await setup_item_copymove_structure(
+    "failed_cross_account_source",
+    sourceServer,
+    sourceAccount
+  );
+  const [, destination] = await setup_item_copymove_structure(
+    "failed_cross_account_destination",
+    destinationServer,
+    destinationAccount
+  );
+  const sourceId = `${sourceAccount.type}_failed_cross_account_source_a`;
+  const header = [...source.messages].find(
+    item => item.getStringProperty(ewsIdPropertyName) == sourceId
+  );
+  Assert.ok(header, "The source item is stored locally");
+  const key = header.messageKey;
+  Assert.ok(!source.hasMsgOffline(key), "The source must be fetched remotely");
+  const remoteItem = sourceServer.getItemInfo(sourceId);
+  remoteItem.syntheticMessage = null;
+
+  const notifications = [];
+  const listener = {
+    msgsMoveCopyCompleted(isMove, headers, target) {
+      if (target.URI == destination.URI) {
+        notifications.push({ isMove, count: headers.length });
+      }
+    },
+  };
+  MailServices.mfn.addListener(
+    listener,
+    MailServices.mfn.msgsMoveCopyCompleted
+  );
+  try {
+    const copyListener = new PromiseTestUtils.PromiseCopyListener();
+    const failed = Assert.rejects(
+      copyListener.promise,
+      new RegExp(Cr.NS_ERROR_UNEXPECTED),
+      "Missing MIME content fails the move"
+    );
+    MailServices.copy.copyMessages(
+      source,
+      [header],
+      destination,
+      true,
+      copyListener,
+      null,
+      false
+    );
+    await failed;
+    Assert.ok(
+      source.msgDatabase.containsKey(key),
+      "Failure retains the source"
+    );
+    Assert.equal(
+      destination.getTotalMessages(false),
+      0,
+      "No copy is published"
+    );
+    Assert.equal(
+      notifications.length,
+      0,
+      "Failure emits no completed-copy event"
+    );
+
+    remoteItem.syntheticMessage = messages[0];
+    await copyItems(source, destination, [header], true);
+    Assert.deepEqual(notifications, [{ isMove: true, count: 1 }]);
+    Assert.ok(
+      !source.msgDatabase.containsKey(key),
+      "Successful retry moves it"
+    );
+    const copied = [...destination.messages][0];
+    Assert.ok(copied, "The retry creates its destination header");
+    const remoteId = copied.getStringProperty(ewsIdPropertyName);
+    const destinationItem = destinationServer.getItemInfo(remoteId);
+    Assert.ok(destinationItem, "The destination ID resolves on its own server");
+    Assert.equal(
+      destinationItem.parentId,
+      destination.getStringProperty("ewsId"),
+      "The destination binding names the created remote item"
+    );
+  } finally {
+    remoteItem.syntheticMessage = messages[0];
+    MailServices.mfn.removeListener(listener);
+  }
+}
+
+add_task(async function testHardDeleteStoppedClientEws() {
+  const [mockServer, incomingServer] = setupBasicEwsTestServer({});
+  await testHardDeleteStoppedClient(mockServer, incomingServer);
+});
+
+add_task(async function testHardDeleteStoppedClientGraph() {
+  const [mockServer, incomingServer] = setupBasicGraphTestServer();
+  await testHardDeleteStoppedClient(mockServer, incomingServer);
+});
+
+/**
+ * Complete a failed hard deletion without changing the local message.
+ *
+ * @param {MockServer} mockServer - The protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - The account to shut down.
+ * @returns {Promise<void>} Resolves when the failed deletion is reported.
+ */
+async function testHardDeleteStoppedClient(mockServer, incomingServer) {
+  const [folder] = await setup_item_copymove_structure(
+    "stopped_delete",
+    mockServer,
+    incomingServer
+  );
+  const header = [...folder.messages][0];
+  const key = header.messageKey;
+  const serverId = header.getStringProperty(ewsIdPropertyName);
+  const flags = header.flags;
+  const storeToken = header.storeToken;
+
+  incomingServer.shutdown();
+  await TestUtils.waitForCondition(
+    () => !incomingServer.protocolClientRunning,
+    "Waiting for the protocol client to stop"
+  );
+
+  const events = [];
+  const folderListener = {
+    onFolderEvent(eventFolder, event) {
+      if (eventFolder.URI == folder.URI) {
+        events.push(event);
+      }
+    },
+  };
+  MailServices.mailSession.AddFolderListener(
+    folderListener,
+    Ci.nsIFolderListener.event
+  );
+  let starts = 0;
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStartCopy() {
+      starts++;
+    },
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
+  try {
+    const failed = Assert.rejects(
+      listener.promise,
+      new RegExp(Cr.NS_ERROR_UNEXPECTED),
+      "The stopped queue reports its original error"
+    );
+    folder.deleteMessages([header], null, true, false, listener, false);
+    await failed;
+    Assert.equal(starts, 1, "Deletion starts the listener once");
+    Assert.deepEqual(stops, [Cr.NS_ERROR_UNEXPECTED], "Deletion stops once");
+    Assert.deepEqual(events, ["DeleteOrMoveMsgFailed"]);
+    const retained = folder.GetMessageHeader(key);
+    Assert.equal(retained.getStringProperty(ewsIdPropertyName), serverId);
+    Assert.equal(retained.flags, flags, "Failure preserves message state");
+    Assert.equal(retained.storeToken, storeToken);
+    Assert.equal(folder.getTotalMessages(false), 2);
+    Assert.ok(mockServer.getItemInfo(serverId), "The server item remains");
+  } finally {
+    MailServices.mailSession.RemoveFolderListener(folderListener);
+  }
+}
+
+add_task(async function testCrossAccountMoveWaitsForDeleteEws() {
+  await testCrossAccountMoveWaitsForDelete(
+    ewsServer,
+    ewsIncomingServer,
+    graphServer,
+    graphIncomingServer
+  );
+});
+
+add_task(async function testCrossAccountMoveWaitsForDeleteGraph() {
+  await testCrossAccountMoveWaitsForDelete(
+    graphServer,
+    graphIncomingServer,
+    ewsServer,
+    ewsIncomingServer
+  );
+});
+
+/**
+ * Report a move only after remote and local source deletion have completed.
+ *
+ * @param {MockServer} sourceServer - The source protocol fixture.
+ * @param {nsIMsgIncomingServer} sourceAccount - The source account server.
+ * @param {MockServer} destinationServer - The destination protocol fixture.
+ * @param {nsIMsgIncomingServer} destinationAccount - The destination server.
+ * @returns {Promise<void>} Resolves after the two-message move finishes.
+ */
+async function testCrossAccountMoveWaitsForDelete(
+  sourceServer,
+  sourceAccount,
+  destinationServer,
+  destinationAccount
+) {
+  const [source] = await setup_item_copymove_structure(
+    "confirmed_move_source",
+    sourceServer,
+    sourceAccount
+  );
+  const [, destination] = await setup_item_copymove_structure(
+    "confirmed_move_destination",
+    destinationServer,
+    destinationAccount
+  );
+  const headers = [...source.messages];
+  const keys = headers.map(header => header.messageKey);
+  const ids = headers.map(header =>
+    header.getStringProperty(ewsIdPropertyName)
+  );
+  const originals = new Map(
+    headers.map(header => [
+      header.messageId,
+      {
+        isRead: header.isRead,
+        isFlagged: header.isFlagged,
+        body: sourceServer
+          .getItemInfo(header.getStringProperty(ewsIdPropertyName))
+          .syntheticMessage.toMessageString(),
+      },
+    ])
+  );
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStopCopy(status) {
+      stops.push({
+        status,
+        local: keys.map(key => source.msgDatabase.containsKey(key)),
+        remote: ids.map(id => !!sourceServer.getItemInfo(id)),
+      });
+    },
+  });
+  MailServices.copy.copyMessages(
+    source,
+    headers,
+    destination,
+    true,
+    listener,
+    null,
+    false
+  );
+  await listener.promise;
+  Assert.deepEqual(
+    stops,
+    [
+      {
+        status: Cr.NS_OK,
+        local: [false, false],
+        remote: [false, false],
+      },
+    ],
+    "Completion observes confirmed source deletion and occurs once"
+  );
+  const moved = [...destination.messages];
+  Assert.equal(moved.length, headers.length);
+  for (const header of moved) {
+    Assert.equal(header.folder.URI, destination.URI);
+    const original = originals.get(header.messageId);
+    Assert.ok(original, "The destination retains the logical message identity");
+    Assert.equal(header.isRead, original.isRead);
+    Assert.equal(header.isFlagged, original.isFlagged);
+    const remote = destinationServer.getItemInfo(
+      header.getStringProperty(ewsIdPropertyName)
+    );
+    Assert.ok(remote, "The new server identity resolves at the destination");
+    Assert.equal(remote.parentId, destination.getStringProperty("ewsId"));
+    Assert.ok(destination.hasMsgOffline(header.messageKey));
+    const body = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(
+      destination.getUriForMsg(header)
+    ).streamMessage(
+      destination.getUriForMsg(header),
+      body,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    Assert.equal(await body.promise, original.body);
+  }
+}
+
+add_task(async function testCrossAccountMoveDeleteFailureEws() {
+  const { HTTP_404 } = ChromeUtils.importESModule(
+    "resource://testing-common/httpd.sys.mjs"
+  );
+  const [source] = await setup_item_copymove_structure(
+    "delete_failure_source",
+    ewsServer,
+    ewsIncomingServer
+  );
+  const [, destination] = await setup_item_copymove_structure(
+    "delete_failure_destination",
+    graphServer,
+    graphIncomingServer
+  );
+  const sourceId = ewsIncomingServer.type + "_delete_failure_source_a";
+  const header = [...source.messages].find(
+    item => item.getStringProperty(ewsIdPropertyName) == sourceId
+  );
+  Assert.ok(header);
+  const key = header.messageKey;
+  const messageId = header.messageId;
+  const uri = source.getUriForMsg(header);
+  const body = new PromiseTestUtils.PromiseStreamListener();
+  MailServices.messageServiceFromURI(uri).streamMessage(
+    uri,
+    body,
+    null,
+    null,
+    false,
+    "",
+    false
+  );
+  const expectedBody = await body.promise;
+  Assert.ok(
+    source.hasMsgOffline(key),
+    "The source can be copied without a fetch"
+  );
+  const storeToken = header.storeToken;
+  const flags = header.flags;
+  const completed = [];
+  const notificationListener = {
+    msgsMoveCopyCompleted(isMove, headers, target) {
+      if (target.URI == destination.URI) {
+        completed.push(isMove);
+      }
+    },
+  };
+  MailServices.mfn.addListener(
+    notificationListener,
+    MailServices.mfn.msgsMoveCopyCompleted
+  );
+  const originalDelete = ewsServer.deleteItem;
+  const deleteAttempts = [];
+  ewsServer.deleteItem = function (id) {
+    if (id == sourceId) {
+      deleteAttempts.push(id);
+      throw HTTP_404;
+    }
+    return originalDelete.call(this, id);
+  };
+  try {
+    const stops = [];
+    const listener = new PromiseTestUtils.PromiseCopyListener({
+      onStopCopy(status) {
+        stops.push(status);
+      },
+    });
+    const failed = Assert.rejects(
+      listener.promise,
+      new RegExp(Cr.NS_ERROR_NET_ERROR_RESPONSE),
+      "A failed source deletion fails the move with the original HTTP error"
+    );
+    MailServices.copy.copyMessages(
+      source,
+      [header],
+      destination,
+      true,
+      listener,
+      null,
+      false
+    );
+    await failed;
+    Assert.deepEqual(
+      deleteAttempts,
+      [sourceId],
+      "The real source deletion reached the server"
+    );
+    Assert.deepEqual(stops, [Cr.NS_ERROR_NET_ERROR_RESPONSE]);
+    Assert.deepEqual(completed, [], "Failed deletion emits no move success");
+    const retained = source.GetMessageHeader(key);
+    Assert.equal(retained.messageId, messageId);
+    Assert.equal(retained.flags, flags);
+    Assert.equal(retained.storeToken, storeToken);
+    Assert.ok(source.hasMsgOffline(key));
+    Assert.ok(ewsServer.getItemInfo(sourceId), "The remote source remains");
+    const copied = [...destination.messages];
+    Assert.equal(
+      copied.length,
+      1,
+      "The already-created destination is retained"
+    );
+    Assert.equal(copied[0].messageId, messageId);
+    Assert.ok(graphServer.getItemInfo(copied[0].getStringProperty("ewsId")));
+    ewsServer.deleteItem = originalDelete;
+    const reread = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      reread,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    Assert.equal(await reread.promise, expectedBody);
+
+    const other = [...source.messages].find(item => item.messageKey != key);
+    await copyItems(source, destination, [other], false);
+    Assert.deepEqual(completed, [false], "The copy queue remains usable");
+    Assert.ok(
+      source.msgDatabase.containsKey(key),
+      "The failed move stays retained"
+    );
+  } finally {
+    ewsServer.deleteItem = originalDelete;
+    MailServices.mfn.removeListener(notificationListener);
+  }
+});
+
+add_task(async function testNextCopyOfflineFailureEws() {
+  await testNextCopyOfflineFailure(
+    ewsServer,
+    ewsIncomingServer,
+    graphServer,
+    graphIncomingServer
+  );
+});
+
+add_task(async function testNextCopyOfflineFailureGraph() {
+  await testNextCopyOfflineFailure(
+    graphServer,
+    graphIncomingServer,
+    ewsServer,
+    ewsIncomingServer
+  );
+});
+
+/**
+ * Finish once if a later message cannot start streaming.
+ *
+ * @param {MockServer} sourceServer - Source protocol fixture.
+ * @param {nsIMsgIncomingServer} sourceAccount - Source account.
+ * @param {MockServer} destinationServer - Destination protocol fixture.
+ * @param {nsIMsgIncomingServer} destinationAccount - Destination account.
+ * @returns {Promise<void>} Resolves after failure and a queued copy retry.
+ */
+async function testNextCopyOfflineFailure(
+  sourceServer,
+  sourceAccount,
+  destinationServer,
+  destinationAccount
+) {
+  const [source] = await setup_item_copymove_structure(
+    "next_copy_offline_source",
+    sourceServer,
+    sourceAccount
+  );
+  const [, destination] = await setup_item_copymove_structure(
+    "next_copy_offline_destination",
+    destinationServer,
+    destinationAccount
+  );
+  const headers = [...source.messages];
+  Assert.equal(headers.length, 2);
+  Assert.ok(!source.hasMsgOffline(headers[1].messageKey));
+  const listener = new PromiseTestUtils.PromiseCopyListener();
+  const stops = [];
+  const onStopCopy = listener.onStopCopy.bind(listener);
+  listener.onStopCopy = status => {
+    stops.push(status);
+    onStopCopy(status);
+  };
+  const wasOffline = Services.io.offline;
+  let reachedSecond = false;
+  listener.onProgress = current => {
+    if (current == 2) {
+      reachedSecond = true;
+      Services.io.offline = true;
+    }
+  };
+  const failed = Assert.rejects(
+    listener.promise,
+    new RegExp(0x80550014),
+    "The later uncached message reports NS_MSG_ERROR_OFFLINE"
+  );
+  try {
+    MailServices.copy.copyMessages(
+      source,
+      headers,
+      destination,
+      false,
+      listener,
+      null,
+      false
+    );
+    await failed;
+  } finally {
+    Services.io.offline = wasOffline;
+  }
+
+  Assert.ok(reachedSecond, "The first message finished before the failure");
+  Assert.deepEqual(
+    stops,
+    [0x80550014],
+    "The copy completes once with its error"
+  );
+  Assert.equal(destination.getTotalMessages(false), 1);
+  for (const header of headers) {
+    Assert.ok(source.msgDatabase.containsKey(header.messageKey));
+    Assert.ok(sourceServer.getItemInfo(header.getStringProperty("ewsId")));
+  }
+  const copied = [...destination.messages][0];
+  Assert.equal(copied.messageId, headers[0].messageId);
+  Assert.ok(destination.hasMsgOffline(copied.messageKey));
+  Assert.ok(
+    destinationServer.getItemInfo(copied.getStringProperty("ewsId")),
+    "The first destination remains published"
+  );
+  const retry = new PromiseTestUtils.PromiseCopyListener();
+  MailServices.copy.copyMessages(
+    source,
+    [headers[1]],
+    destination,
+    false,
+    retry,
+    null,
+    false
+  );
+  await retry.promise;
+  Assert.equal(
+    destination.getTotalMessages(false),
+    2,
+    "The copy queue is usable"
+  );
+  Assert.deepEqual(
+    stops,
+    [0x80550014],
+    "Retry does not complete the old request"
+  );
+}
+
+add_task(async function testSynchronousSourceDeleteFailureEws() {
+  const [source, , messages] = await setup_item_copymove_structure(
+    "sync_delete_source",
+    ewsServer,
+    ewsIncomingServer
+  );
+  const [, destination] = await setup_item_copymove_structure(
+    "sync_delete_destination",
+    graphServer,
+    graphIncomingServer
+  );
+  const header = [...source.messages][0];
+  const key = header.messageKey;
+  const sourceId = header.getStringProperty("ewsId");
+  const service = MailServices.messageServiceFromURI(
+    source.getUriForMsg(header)
+  );
+  const body = new PromiseTestUtils.PromiseStreamListener();
+  service.streamMessage(
+    source.getUriForMsg(header),
+    body,
+    null,
+    null,
+    false,
+    "",
+    false
+  );
+  const originalBody = await body.promise;
+  const originalMessage = messages.find(
+    message => message.messageId == header.messageId
+  );
+  Assert.ok(originalMessage);
+  Assert.equal(originalBody, originalMessage.toMessageString());
+  const token = header.storeToken;
+  const model = ewsIncomingServer.getIntValue("delete_model");
+  const listener = new PromiseTestUtils.PromiseCopyListener();
+  const stops = [];
+  const onStopCopy = listener.onStopCopy.bind(listener);
+  listener.onStopCopy = status => {
+    stops.push(status);
+    onStopCopy(status);
+  };
+  const failed = Assert.rejects(
+    listener.promise,
+    new RegExp(Cr.NS_ERROR_UNEXPECTED),
+    "The synchronous source deletion failure reaches the copy listener"
+  );
+  ewsIncomingServer.setIntValue("delete_model", 2);
+  try {
+    MailServices.copy.copyMessages(
+      source,
+      [header],
+      destination,
+      true,
+      listener,
+      null,
+      false
+    );
+    await failed;
+  } finally {
+    ewsIncomingServer.setIntValue("delete_model", model);
+  }
+  Assert.deepEqual(stops, [Cr.NS_ERROR_UNEXPECTED]);
+  Assert.ok(
+    source.msgDatabase.containsKey(key),
+    "The failed move retains source"
+  );
+  Assert.ok(
+    ewsServer.getItemInfo(sourceId),
+    "The remote source is not deleted"
+  );
+  Assert.equal(source.GetMessageHeader(key).storeToken, token);
+  Assert.ok(source.hasMsgOffline(key));
+  const retained = new PromiseTestUtils.PromiseStreamListener();
+  service.streamMessage(
+    source.getUriForMsg(header),
+    retained,
+    null,
+    null,
+    false,
+    "",
+    true
+  );
+  Assert.equal(await retained.promise, originalBody);
+  Assert.equal(
+    destination.getTotalMessages(false),
+    1,
+    "The created copy remains"
+  );
+  const retry = new PromiseTestUtils.PromiseCopyListener();
+  MailServices.copy.copyMessages(
+    source,
+    [header],
+    destination,
+    false,
+    retry,
+    null,
+    false
+  );
+  await retry.promise;
+  Assert.equal(
+    destination.getTotalMessages(false),
+    2,
+    "The queue advances again"
+  );
+  Assert.deepEqual(stops, [Cr.NS_ERROR_UNEXPECTED]);
+});
+
+add_task(async function testCopyFileKeywordsEws() {
+  await testCopyFileKeywords(ewsServer, ewsIncomingServer);
+});
+
+add_task(async function testCopyFileKeywordsGraph() {
+  await testCopyFileKeywords(graphServer, graphIncomingServer);
+});
+
+/**
+ * Publish file-copy keywords before notifying database listeners.
+ *
+ * @param {MockServer} mockServer - Destination protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - Destination account.
+ * @returns {Promise<void>} Resolves after the file copies.
+ */
+async function testCopyFileKeywords(mockServer, incomingServer) {
+  const name = incomingServer.type + "_copy_file_keywords";
+  mockServer.appendRemoteFolder(new RemoteFolder(name, "root", name, name));
+  await syncFolder(incomingServer, incomingServer.rootFolder);
+  const folder = incomingServer.rootFolder.getChildNamed(name);
+  const db = folder.msgDatabase;
+  const added = [];
+  const dbListener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrAdded(header) {
+      added.push({
+        key: header.messageKey,
+        folderURI: header.folder.URI,
+        messageId: header.messageId,
+        serverId: header.getStringProperty("ewsId"),
+        keywords: header.getStringProperty("keywords"),
+        offline: folder.hasMsgOffline(header.messageKey),
+        read: header.isRead,
+      });
+    },
+    onHdrFlagsChanged() {},
+    onHdrDeleted() {},
+    onParentChanged() {},
+    onAnnouncerGoingAway() {},
+    onReadChanged() {},
+    onJunkScoreChanged() {},
+    onHdrPropertyChanged() {},
+    onEvent() {},
+  };
+  db.addListener(dbListener);
+  try {
+    for (const [
+      requested,
+      expected,
+      isDraft,
+      flags,
+      parsedKeywords = "existing Existing",
+    ] of [
+      [
+        "added existing added CaseTag",
+        "existing Existing added CaseTag",
+        false,
+        Ci.nsMsgMessageFlags.Read,
+      ],
+      ["", "existing Existing", true, 0],
+      ["", "existing Existing", false, 0],
+      ["$label4", "$label4", false, 0, " ".repeat(80)],
+      [
+        "added existing",
+        "existing Existing existing added",
+        true,
+        0,
+        "  existing \tExisting   existing  ",
+      ],
+    ]) {
+      const message = generator.makeMessage({
+        clobberHeaders: {
+          "X-Mozilla-Keys": parsedKeywords,
+          "X-Mozilla-Status": Ci.nsMsgMessageFlags.Offline.toString(
+            16
+          ).padStart(4, "0"),
+        },
+      });
+      const raw = message.toMessageString();
+      const file = do_get_tempdir();
+      file.append(name + ".eml");
+      file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+      try {
+        await IOUtils.writeUTF8(file.path, raw);
+        const listener = new PromiseTestUtils.PromiseCopyListener();
+        const before = added.length;
+        MailServices.copy.copyFileMessage(
+          file,
+          folder,
+          null,
+          isDraft,
+          flags,
+          requested,
+          listener,
+          null
+        );
+        const copied = await listener.promise;
+        Assert.equal(copied.messageKeys.length, 1);
+        const header = folder.GetMessageHeader(copied.messageKeys[0]);
+        Assert.equal(added.length, before + 1, "One header was published");
+        Assert.deepEqual(added[before], {
+          key: header.messageKey,
+          folderURI: folder.URI,
+          messageId: message.messageId,
+          serverId: header.getStringProperty("ewsId"),
+          keywords: expected,
+          offline: false,
+          read: !!(flags & Ci.nsMsgMessageFlags.Read),
+        });
+        Assert.equal(header.getStringProperty("keywords"), expected);
+        Assert.equal(
+          header.isRead,
+          !!(flags & Ci.nsMsgMessageFlags.Read),
+          "The requested read state is independent of draft mode"
+        );
+        Assert.ok(mockServer.getItemInfo(header.getStringProperty("ewsId")));
+        Assert.ok(folder.hasMsgOffline(header.messageKey));
+        Assert.ok(header.storeToken, "The body has a destination store token");
+        const body = new PromiseTestUtils.PromiseStreamListener();
+        const uri = folder.getUriForMsg(header);
+        MailServices.messageServiceFromURI(uri).streamMessage(
+          uri,
+          body,
+          null,
+          null,
+          false,
+          "",
+          true
+        );
+        Assert.equal(
+          await body.promise,
+          raw,
+          "The stored file body is complete"
+        );
+      } finally {
+        file.remove(false);
+      }
+    }
+  } finally {
+    db.removeListener(dbListener);
+  }
+  Assert.equal(folder.getTotalMessages(false), 5);
+}
+
+add_task(async function testMoveDestinationStoreFailureEws() {
+  await testMoveDestinationStoreFailure(
+    graphServer,
+    graphIncomingServer,
+    ewsServer,
+    ewsIncomingServer
+  );
+});
+
+add_task(async function testMoveDestinationStoreFailureGraph() {
+  await testMoveDestinationStoreFailure(
+    ewsServer,
+    ewsIncomingServer,
+    graphServer,
+    graphIncomingServer
+  );
+});
+
+/**
+ * Retain the source if remote creation succeeds but the local store rejects it.
+ *
+ * @param {MockServer} sourceServer - Source protocol fixture.
+ * @param {nsIMsgIncomingServer} sourceAccount - Source account.
+ * @param {MockServer} destinationServer - Destination protocol fixture.
+ * @param {nsIMsgIncomingServer} destinationAccount - Destination account.
+ * @returns {Promise<void>} Resolves after failure and a successful queued retry.
+ */
+async function testMoveDestinationStoreFailure(
+  sourceServer,
+  sourceAccount,
+  destinationServer,
+  destinationAccount
+) {
+  const [source, , messages] = await setup_item_copymove_structure(
+    "destination_store_failure_source",
+    sourceServer,
+    sourceAccount
+  );
+  const [, destination] = await setup_item_copymove_structure(
+    "destination_store_failure_target",
+    destinationServer,
+    destinationAccount
+  );
+  const header = [...source.messages][0];
+  const key = header.messageKey;
+  const messageId = header.messageId;
+  const sourceId = header.getStringProperty("ewsId");
+  const uri = source.getUriForMsg(header);
+  const service = MailServices.messageServiceFromURI(uri);
+  const body = new PromiseTestUtils.PromiseStreamListener();
+  service.streamMessage(uri, body, null, null, false, "", false);
+  const originalBody = await body.promise;
+  Assert.equal(
+    originalBody,
+    messages.find(message => message.messageId == messageId).toMessageString()
+  );
+  Assert.ok(source.hasMsgOffline(key));
+  const token = header.storeToken;
+  const flags = header.flags;
+  const db = destination.msgDatabase;
+  Assert.equal(destination.getTotalMessages(false), 0);
+  const store = destination.msgStore;
+  Assert.ok(["mbox", "maildir"].includes(store.storeType));
+  const storePath = destination.filePath.clone();
+  const backup = storePath.clone();
+  backup.leafName += ".store-write-backup";
+  Assert.ok(!backup.exists(), "The test owns its unused backup path");
+  const hadStore = storePath.exists();
+  const completed = [];
+  const notificationListener = {
+    msgsMoveCopyCompleted(isMove, headers, target) {
+      if (target.URI == destination.URI) {
+        completed.push(isMove);
+      }
+    },
+  };
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
+  MailServices.mfn.addListener(
+    notificationListener,
+    MailServices.mfn.msgsMoveCopyCompleted
+  );
+  let obstructed = false;
+  let storeError;
+  try {
+    if (hadStore) {
+      storePath.clone().moveTo(backup.parent, backup.leafName);
+    }
+    try {
+      storePath.create(
+        store.storeType == "mbox"
+          ? Ci.nsIFile.DIRECTORY_TYPE
+          : Ci.nsIFile.NORMAL_FILE_TYPE,
+        0o700
+      );
+      obstructed = true;
+      let unexpectedStream;
+      try {
+        unexpectedStream = store.getNewMsgOutputStream(destination);
+      } catch (error) {
+        storeError = error.result;
+      }
+      if (unexpectedStream) {
+        store.discardNewMessage(destination, unexpectedStream);
+      }
+      Assert.notEqual(storeError, undefined, "The real store rejects the path");
+      Assert.ok(!Components.isSuccessCode(storeError));
+      const failed = Assert.rejects(
+        listener.promise,
+        new RegExp(storeError),
+        "The move reports the original destination-store error"
+      );
+      MailServices.copy.copyMessages(
+        source,
+        [header],
+        destination,
+        true,
+        listener,
+        null,
+        false
+      );
+      await failed;
+      Assert.deepEqual(stops, [storeError], "The failed move completes once");
+      Assert.deepEqual(completed, [], "The failed write emits no move success");
+      const retained = source.GetMessageHeader(key);
+      Assert.equal(retained.messageId, messageId);
+      Assert.equal(retained.getStringProperty("ewsId"), sourceId);
+      Assert.equal(retained.flags, flags);
+      Assert.equal(retained.storeToken, token);
+      Assert.ok(source.hasMsgOffline(key));
+      Assert.ok(
+        sourceServer.getItemInfo(sourceId),
+        "The remote source remains"
+      );
+      const partial = [...destination.messages];
+      Assert.equal(partial.length, 1, "The already-published header remains");
+      Assert.equal(partial[0].messageId, messageId);
+      Assert.ok(db.containsKey(partial[0].messageKey));
+      Assert.ok(
+        destinationServer.getItemInfo(partial[0].getStringProperty("ewsId")),
+        "The already-created remote destination remains"
+      );
+      Assert.ok(
+        !destination.hasMsgOffline(partial[0].messageKey),
+        "A failed store write does not advertise an offline body"
+      );
+      Assert.equal(partial[0].storeToken, "");
+    } finally {
+      if (obstructed) {
+        storePath.remove(false);
+      }
+      if (hadStore) {
+        backup.moveTo(storePath.parent, storePath.leafName);
+      }
+    }
+
+    const reread = new PromiseTestUtils.PromiseStreamListener();
+    service.streamMessage(uri, reread, null, null, false, "", true);
+    Assert.equal(
+      await reread.promise,
+      originalBody,
+      "The source body is intact"
+    );
+    await copyItems(source, destination, [header], true);
+    Assert.deepEqual(
+      completed,
+      [true],
+      "A successful retry completes the move"
+    );
+    Assert.deepEqual(
+      stops,
+      [storeError],
+      "The old request is not completed again"
+    );
+    Assert.ok(!source.msgDatabase.containsKey(key));
+    Assert.ok(!sourceServer.getItemInfo(sourceId));
+    const copies = [...destination.messages];
+    Assert.equal(copies.length, 2, "The failed destination is not rolled back");
+    const stored = copies.filter(item =>
+      destination.hasMsgOffline(item.messageKey)
+    );
+    Assert.equal(
+      stored.length,
+      1,
+      "Only the successful retry has an offline body"
+    );
+    Assert.equal(stored[0].messageId, messageId);
+    const copiedBody = new PromiseTestUtils.PromiseStreamListener();
+    const copiedUri = destination.getUriForMsg(stored[0]);
+    MailServices.messageServiceFromURI(copiedUri).streamMessage(
+      copiedUri,
+      copiedBody,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    Assert.equal(await copiedBody.promise, originalBody);
+  } finally {
+    MailServices.mfn.removeListener(notificationListener);
+  }
+}
+
+add_task(async function testCopyFileMetadataEws() {
+  await testCopyFileMetadata(ewsServer, ewsIncomingServer);
+});
+
+add_task(async function testCopyFileMetadataGraph() {
+  await testCopyFileMetadata(graphServer, graphIncomingServer);
+});
+
+/**
+ * Copy local metadata from the supplied header without replacing its identity.
+ *
+ * @param {MockServer} mockServer - Protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - Account holding the source.
+ * @returns {Promise<void>} Resolves after copying and rereading both bodies.
+ */
+async function testCopyFileMetadata(mockServer, incomingServer) {
+  const [folder, , messages] = await setup_item_copymove_structure(
+    "file_metadata",
+    mockServer,
+    incomingServer
+  );
+  const source = [...folder.messages][0];
+  const sourceKey = source.messageKey;
+  const sourceId = source.getStringProperty("ewsId");
+  const message = messages.find(item => item.messageId == source.messageId);
+  Assert.ok(message);
+  const raw = message.toMessageString();
+  source.setStringProperty("fileTemplateNote", "kept locally");
+  source.setStringProperty("fileTemplateEmpty", "");
+  source.setUint32Property("fileTemplateZero", 0);
+  source.setStringProperty("keywords", "source-key");
+  Assert.ok(!source.properties.includes("fileTemplateAbsent"));
+  const sourceUri = folder.getUriForMsg(source);
+  const body = new PromiseTestUtils.PromiseStreamListener();
+  MailServices.messageServiceFromURI(sourceUri).streamMessage(
+    sourceUri,
+    body,
+    null,
+    null,
+    false,
+    "",
+    false
+  );
+  Assert.equal(await body.promise, raw);
+  const sourceToken = source.storeToken;
+  const sourceFlags = source.flags;
+  const file = do_get_tempdir();
+  file.append(incomingServer.type + "-file-metadata.eml");
+  file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+  try {
+    await IOUtils.writeUTF8(file.path, raw);
+    const listener = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.copy.copyFileMessage(
+      file,
+      folder,
+      source,
+      true,
+      0,
+      "file-key source-key",
+      listener,
+      null
+    );
+    const result = await listener.promise;
+    Assert.equal(result.messageKeys.length, 1);
+    const copied = folder.GetMessageHeader(result.messageKeys[0]);
+    Assert.notEqual(
+      copied.messageKey,
+      sourceKey,
+      "The copy has its own identity"
+    );
+    Assert.equal(copied.folder.URI, folder.URI);
+    Assert.equal(copied.messageId, source.messageId);
+    Assert.equal(copied.getStringProperty("fileTemplateNote"), "kept locally");
+    Assert.equal(copied.getStringProperty("fileTemplateEmpty"), "");
+    Assert.equal(copied.getUint32Property("fileTemplateZero"), 0);
+    const properties = copied.properties;
+    Assert.ok(properties.includes("fileTemplateEmpty"));
+    Assert.ok(properties.includes("fileTemplateZero"));
+    Assert.ok(!properties.includes("fileTemplateAbsent"));
+    Assert.equal(copied.getStringProperty("keywords"), "source-key file-key");
+    const copiedId = copied.getStringProperty("ewsId");
+    Assert.notEqual(copiedId, sourceId, "The source server ID is not copied");
+    Assert.ok(mockServer.getItemInfo(copiedId));
+    Assert.ok(folder.hasMsgOffline(copied.messageKey));
+    Assert.ok(copied.storeToken);
+    const retained = folder.GetMessageHeader(sourceKey);
+    Assert.equal(retained.messageId, source.messageId);
+    Assert.equal(retained.getStringProperty("ewsId"), sourceId);
+    Assert.equal(retained.getStringProperty("keywords"), "source-key");
+    Assert.equal(retained.storeToken, sourceToken);
+    Assert.equal(retained.flags, sourceFlags);
+    Assert.ok(
+      mockServer.getItemInfo(sourceId),
+      "The original remote item remains"
+    );
+    Assert.equal(
+      folder.getTotalMessages(false),
+      3,
+      "The original is not deleted"
+    );
+    for (const header of [retained, copied]) {
+      const stream = new PromiseTestUtils.PromiseStreamListener();
+      const uri = folder.getUriForMsg(header);
+      MailServices.messageServiceFromURI(uri).streamMessage(
+        uri,
+        stream,
+        null,
+        null,
+        false,
+        "",
+        true
+      );
+      Assert.equal(await stream.promise, raw);
+    }
+  } finally {
+    file.remove(false);
+  }
+}
+add_task(async function test_flagCompletionEws() {
+  await testFlagCompletion(ewsServer, ewsIncomingServer);
+});
+
+add_task(async function test_flagCompletionGraph() {
+  await testFlagCompletion(graphServer, graphIncomingServer);
+});
+
+/**
+ * Create three real synced messages for flag operations.
+ *
+ * @param {MockServer} mockServer - The protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - The configured account server.
+ * @param {string} suffix - The unique folder suffix.
+ * @param {boolean} flagged - The initial server flag state.
+ * @returns {Promise<{folder: nsIMsgFolder, headers: nsIMsgDBHdr[],
+ *   messages: SyntheticMessage[]}>} The synced messages in generator order.
+ */
+async function createFlagMessages(mockServer, incomingServer, suffix, flagged) {
+  const name = incomingServer.type + "_flag_" + suffix;
+  mockServer.appendRemoteFolder(new RemoteFolder(name, "root"));
+  await syncFolder(incomingServer, incomingServer.rootFolder);
+  const folder = incomingServer.rootFolder.getChildNamed(name);
+  const messages = generator.makeMessages({ count: 3 });
+  for (const [index, message] of messages.entries()) {
+    message.metaState.flagged = flagged;
+    message.metaState.read = index != 1;
+  }
+  mockServer.addMessages(name, messages);
+  await syncFolder(incomingServer, folder);
+  const synced = [...folder.messages];
+  Assert.equal(synced.length, messages.length);
+  const headers = messages.map(message => {
+    const header = synced.find(item => item.messageId == message.messageId);
+    Assert.ok(header, "The real header was synced");
+    Assert.equal(header.isFlagged, flagged);
+    Assert.equal(header.isRead, message.metaState.read);
+    Assert.ok(header.getStringProperty(ewsIdPropertyName));
+    return header;
+  });
+  return { folder, headers, messages };
+}
+
+/**
+ * Report each real flag update once with its acknowledged server identities.
+ *
+ * @param {MockServer} mockServer - The protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - The configured account server.
+ * @returns {Promise<void>} Resolves after flagging and unflagging two items.
+ */
+async function testFlagCompletion(mockServer, incomingServer) {
+  const { folder, headers } = await createFlagMessages(
+    mockServer,
+    incomingServer,
+    "completion",
+    false
+  );
+  const server = incomingServer.QueryInterface(Ci.IExchangeIncomingServer);
+  const client = server.getProtocolClient();
+  const requested = [headers[2], headers[0]].map(header =>
+    header.getStringProperty(ewsIdPropertyName)
+  );
+  const originalFlags = headers.map(header => header.flags);
+  const originalKeys = headers.map(header => header.messageKey);
+  const originalIds = headers.map(header => header.messageId);
+  for (const flagged of [true, false]) {
+    const done = Promise.withResolvers();
+    const successes = [];
+    const failures = [];
+    client.changeFlagStatus(
+      {
+        QueryInterface: ChromeUtils.generateQI([
+          "IExchangeSimpleOperationListener",
+          "IExchangeFallibleOperationListener",
+        ]),
+        onOperationSuccess(ids, useLegacyFallback) {
+          successes.push({ ids: [...ids], useLegacyFallback });
+          done.resolve();
+        },
+        onOperationFailure(status) {
+          failures.push(status);
+          done.reject(Components.Exception("Flag operation failed", status));
+        },
+      },
+      requested,
+      flagged
+    );
+    await done.promise;
+    await TestUtils.waitForCondition(
+      () => server.protocolClientIdle,
+      "Waiting for all native flag callbacks to finish"
+    );
+    Assert.deepEqual(failures, []);
+    Assert.equal(successes.length, 1, "The operation reports success once");
+    Assert.deepEqual(successes[0].ids.toSorted(), requested.toSorted());
+    Assert.ok(!successes[0].useLegacyFallback);
+    for (const [index, header] of headers.entries()) {
+      const serverId = header.getStringProperty(ewsIdPropertyName);
+      const remote = mockServer.getItemInfo(serverId);
+      Assert.ok(remote);
+      Assert.equal(
+        remote.syntheticMessage.metaState.flagged,
+        index == 1 ? false : flagged
+      );
+      Assert.equal(header.messageKey, originalKeys[index]);
+      Assert.equal(header.messageId, originalIds[index]);
+      Assert.equal(header.folder.URI, folder.URI);
+      Assert.equal(
+        header.flags,
+        originalFlags[index],
+        "The protocol operation does not change local headers"
+      );
+    }
+  }
+}
+
+add_task(async function test_flaggedHeaderIdentityEws() {
+  await testFlaggedHeaderIdentity(ewsServer, ewsIncomingServer);
+});
+
+add_task(async function test_flaggedHeaderIdentityGraph() {
+  await testFlaggedHeaderIdentity(graphServer, graphIncomingServer);
+});
+
+/**
+ * Update selected flags without changing cached bodies or unrelated headers.
+ *
+ * @param {MockServer} mockServer - The protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - The configured account server.
+ * @returns {Promise<void>} Resolves after two flag changes and cached reads.
+ */
+async function testFlaggedHeaderIdentity(mockServer, incomingServer) {
+  const { folder, headers, messages } = await createFlagMessages(
+    mockServer,
+    incomingServer,
+    "headers",
+    false
+  );
+  const originals = [];
+  for (const [index, header] of headers.entries()) {
+    const uri = folder.getUriForMsg(header);
+    const stream = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      stream,
+      null,
+      null,
+      false,
+      "",
+      false
+    );
+    const raw = await stream.promise;
+    Assert.equal(raw, messages[index].toMessageString());
+    Assert.ok(folder.hasMsgOffline(header.messageKey));
+    Assert.ok(header.storeToken);
+    originals.push({
+      key: header.messageKey,
+      id: header.messageId,
+      serverId: header.getStringProperty(ewsIdPropertyName),
+      flags: header.flags,
+      token: header.storeToken,
+      size: header.messageSize,
+      offlineSize: header.offlineMessageSize,
+      raw,
+    });
+  }
+  Assert.ok(["mbox", "maildir"].includes(folder.msgStore.storeType));
+  for (const flagged of [true, false]) {
+    folder.markMessagesFlagged([headers[2], headers[0]], flagged);
+    await TestUtils.waitForCondition(
+      () => headers[0].isFlagged == flagged && headers[2].isFlagged == flagged,
+      "Waiting for the acknowledged local flags"
+    );
+    await TestUtils.waitForCondition(
+      () => incomingServer.protocolClientIdle,
+      "Waiting for the flag operation to finish"
+    );
+    Assert.equal(
+      folder.getNumUnread(false),
+      1,
+      "Flag updates keep unread totals"
+    );
+    for (const [index, old] of originals.entries()) {
+      const current = folder.GetMessageHeader(old.key);
+      Assert.equal(current.messageKey, old.key);
+      Assert.equal(current.messageId, old.id);
+      Assert.equal(current.folder.URI, folder.URI);
+      Assert.equal(current.getStringProperty(ewsIdPropertyName), old.serverId);
+      const expectedFlags =
+        flagged && index != 1
+          ? old.flags | Ci.nsMsgMessageFlags.Marked
+          : old.flags;
+      Assert.equal(current.flags, expectedFlags);
+      Assert.equal(current.storeToken, old.token);
+      Assert.equal(current.messageSize, old.size);
+      Assert.equal(current.offlineMessageSize, old.offlineSize);
+      Assert.ok(folder.hasMsgOffline(old.key));
+      const remote = mockServer.getItemInfo(old.serverId);
+      Assert.ok(remote);
+      Assert.equal(
+        remote.syntheticMessage.metaState.flagged,
+        flagged && index != 1
+      );
+      Assert.equal(
+        remote.syntheticMessage.metaState.read,
+        messages[index].metaState.read
+      );
+    }
+  }
+  for (const [index, header] of headers.entries()) {
+    const uri = folder.getUriForMsg(header);
+    const stream = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      stream,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    Assert.equal(await stream.promise, originals[index].raw);
+    Assert.equal(header.storeToken, originals[index].token);
+  }
+}
+
+add_task(async function test_partialFlaggedIdentityEws() {
+  await testPartialFlaggedIdentity(false);
+});
+
+add_task(async function test_partialUnflaggedIdentityEws() {
+  await testPartialFlaggedIdentity(true);
+});
+
+/**
+ * Apply only the confirmed flag change when another server item is missing.
+ *
+ * @param {boolean} initiallyFlagged - The original state of both messages.
+ * @returns {Promise<void>} Resolves after the partial update and cached reads.
+ */
+async function testPartialFlaggedIdentity(initiallyFlagged) {
+  const { folder, headers, messages } = await createFlagMessages(
+    ewsServer,
+    ewsIncomingServer,
+    initiallyFlagged ? "partial_unflag" : "partial_flag",
+    initiallyFlagged
+  );
+  const selected = [headers[1], headers[0]];
+  const originals = [];
+  for (const header of selected) {
+    const uri = folder.getUriForMsg(header);
+    const stream = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      stream,
+      null,
+      null,
+      false,
+      "",
+      false
+    );
+    const raw = await stream.promise;
+    const original = messages.find(
+      message => message.messageId == header.messageId
+    );
+    Assert.ok(original);
+    Assert.equal(raw, original.toMessageString());
+    Assert.ok(folder.hasMsgOffline(header.messageKey));
+    Assert.ok(header.storeToken);
+    originals.push({
+      key: header.messageKey,
+      id: header.messageId,
+      serverId: header.getStringProperty(ewsIdPropertyName),
+      flags: header.flags,
+      token: header.storeToken,
+      size: header.messageSize,
+      offlineSize: header.offlineMessageSize,
+      raw,
+    });
+  }
+  const [missing, live] = originals;
+  ewsServer.deleteItem(missing.serverId);
+  Assert.equal(ewsServer.getItemInfo(missing.serverId), null);
+  const target = !initiallyFlagged;
+  folder.markMessagesFlagged(selected, target);
+  await TestUtils.waitForCondition(
+    () => selected[1].isFlagged == target,
+    "Waiting for the successful item in the partial response"
+  );
+  await TestUtils.waitForCondition(
+    () => ewsIncomingServer.protocolClientIdle,
+    "Waiting for the partial flag operation to finish"
+  );
+  const remote = ewsServer.getItemInfo(live.serverId);
+  Assert.ok(remote);
+  Assert.equal(remote.syntheticMessage.metaState.flagged, target);
+  for (const [index, old] of originals.entries()) {
+    const retained = folder.GetMessageHeader(old.key);
+    const expectedFlags =
+      index == 0
+        ? old.flags
+        : target
+          ? old.flags | Ci.nsMsgMessageFlags.Marked
+          : old.flags & ~Ci.nsMsgMessageFlags.Marked;
+    Assert.equal(retained.messageId, old.id);
+    Assert.equal(retained.folder.URI, folder.URI);
+    Assert.equal(
+      retained.flags,
+      expectedFlags,
+      "An unacknowledged header keeps its original flags"
+    );
+    Assert.equal(retained.getStringProperty(ewsIdPropertyName), old.serverId);
+    Assert.equal(retained.storeToken, old.token);
+    Assert.equal(retained.messageSize, old.size);
+    Assert.equal(retained.offlineMessageSize, old.offlineSize);
+    Assert.ok(folder.hasMsgOffline(old.key));
+    const uri = folder.getUriForMsg(retained);
+    const stream = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      stream,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    Assert.equal(await stream.promise, old.raw);
+  }
+  Assert.equal(
+    headers[2].isFlagged,
+    initiallyFlagged,
+    "The unrequested header is unchanged"
+  );
+}

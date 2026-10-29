@@ -14,7 +14,9 @@ use ews::{
 use nsstring::nsCString;
 use protocol_shared::{
     client::DoOperation,
-    safe_xpcom::{SafeExchangeSimpleOperationListener, SafeListener, UseLegacyFallback},
+    safe_xpcom::{
+        SafeExchangeSimpleOperationListener, SafeListener, UseLegacyFallback, handle_error,
+    },
 };
 use thin_vec::ThinVec;
 
@@ -149,12 +151,11 @@ impl<ServerT: ServerType> DoOperation<XpComEwsClient<ServerT>, XpComEwsError>
             .map(|item_id| item_id.id.into())
             .collect();
 
-        let ret = if !successes.is_empty() {
+        let ret = if !successes.is_empty() || errors.is_empty() {
             self.listener
                 .on_success((successes, UseLegacyFallback::No).into())
         } else {
-            // This branch only happens if no messages were requested,
-            // or we're about to return an aggregated error in the next block.
+            // Every requested update failed.
             Ok(())
         };
 
@@ -181,6 +182,18 @@ impl<ServerT: ServerType> DoOperation<XpComEwsClient<ServerT>, XpComEwsError>
     }
 
     fn into_failure_arg(self) -> <Self::Listener as SafeListener>::OnFailureArg {}
+
+    // do_operation already reports the confirmed IDs, including partial success.
+    async fn handle_operation(
+        mut self,
+        client: &XpComEwsClient<ServerT>,
+        listener: &Self::Listener,
+    ) {
+        if let Err(err) = self.do_operation(client).await {
+            let name = <Self as DoOperation<XpComEwsClient<ServerT>, _>>::NAME;
+            handle_error(listener, name, &err, ());
+        }
+    }
 }
 
 impl<ServerT: ServerType> XpComEwsClient<ServerT> {

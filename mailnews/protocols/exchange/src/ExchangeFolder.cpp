@@ -647,9 +647,9 @@ NS_IMETHODIMP ExchangeFolder::CopyFileMessage(
   rv = GetProtocolClient(getter_AddRefs(client));
   NS_ENSURE_SUCCESS(rv, rv);
 
-  RefPtr<ExchangeMessageCopyHandler> handler =
-      new ExchangeMessageCopyHandler(aFile, this, isDraftOrTemplate, msgWindow,
-                                     exchangeId, client, copyListener);
+  RefPtr<ExchangeMessageCopyHandler> handler = new ExchangeMessageCopyHandler(
+      aFile, this, msgToReplace, isDraftOrTemplate, newMsgFlags,
+      aNewMsgKeywords, msgWindow, exchangeId, client, copyListener);
 
   // Start copying the message. Once it has finished,
   // `ExchangeMessageCopyHandler` will take care of sending the relevant
@@ -1054,6 +1054,7 @@ nsresult ExchangeFolder::HandleDeleteOperation(
 
   DeleteModel deleteModel;
   rv = exchangeServer->GetDeleteModel(&deleteModel);
+  NS_ENSURE_SUCCESS(rv, rv);
 
   if (forceHardDelete || isInTrashFolder ||
       deleteModel == DeleteModel::PERMANENTLY_DELETE) {
@@ -1150,7 +1151,9 @@ NS_IMETHODIMP ExchangeFolder::DeleteMessages(
               return NS_OK;
             },
 
-            [self](nsresult rv) {
+            [self, copyListener](nsresult rv) {
+              auto listenerExitGuard =
+                  GuardCopyServiceListener(copyListener, rv);
               self->NotifyFolderEvent(kDeleteOrMoveMsgFailed);
 
               nsCOMPtr<nsIFeedbackService> feedback =
@@ -2032,7 +2035,7 @@ NS_IMETHODIMP ExchangeFolder::MarkMessagesFlagged(
     const nsTArray<RefPtr<nsIMsgDBHdr>>& messages, bool markFlagged) {
   nsresult rv = NS_OK;
 
-  nsTArray<nsCString> exchangeIds(messages.Length());
+  CopyableTArray<nsCString> exchangeIds(messages.Length());
   for (auto&& message : messages) {
     nsAutoCString exchangeId;
     rv = message->GetStringProperty(kExchangeIdProperty, exchangeId);
@@ -2045,12 +2048,16 @@ NS_IMETHODIMP ExchangeFolder::MarkMessagesFlagged(
     headersToChange.AppendElement(message);
   }
   RefPtr<ExchangeSimpleListener> listener = new ExchangeSimpleListener(
-      [headersToChange = std::move(headersToChange), markFlagged](
-          const nsTArray<nsCString>& exchangeIds, bool useLegacyFallback) {
-        nsresult rv = NS_OK;
-        for (auto&& header : headersToChange) {
-          rv = header->MarkFlagged(markFlagged);
-          NS_ENSURE_SUCCESS(rv, rv);
+      [headersToChange = std::move(headersToChange), requestedIds = exchangeIds,
+       markFlagged](const nsTArray<nsCString>& ids, bool useLegacyFallback) {
+        nsTHashSet<nsCString> confirmedIds(ids.Length());
+        for (const auto& id : ids) {
+          confirmedIds.Insert(id);
+        }
+        for (size_t i = 0; i < headersToChange.Length(); ++i) {
+          if (confirmedIds.Contains(requestedIds[i])) {
+            MOZ_TRY(headersToChange[i]->MarkFlagged(markFlagged));
+          }
         }
         return NS_OK;
       });

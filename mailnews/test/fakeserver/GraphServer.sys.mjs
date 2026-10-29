@@ -708,18 +708,13 @@ export class GraphServer extends MockServer {
   /**
    * Handle GET /me/messages/{id}/$value
    *
-   * @param {string} messageId The ID of the message.
-   * @returns {string?} The message content.
+   * @param {string} messageId - The ID of the message.
+   * @returns {HttpResponseData} The message content, or a 404 response.
    */
   #messageMediaResource(messageId) {
-    const itemInfo = this.getItemInfo(messageId);
-    if (!itemInfo) {
-      return null;
-    }
-
-    const message = itemInfo.syntheticMessage;
+    const message = this.getItemInfo(messageId)?.syntheticMessage;
     if (!message) {
-      return null;
+      return new HttpResponseData(404, "Not Found");
     }
 
     return new HttpResponseData(200, "OK", message.toMessageString());

@@ -18,3 +18,8 @@ UNIFIED_SOURCES += [
     "TestQuarantinedOutputStream.cpp",
     "TestStripSubjectReplyPrefixes.cpp",
 ]
+
+if CONFIG["MOZ_PANORAMA"]:
+    UNIFIED_SOURCES += [
+        "TestLocalCopyHeaders.cpp",
+    ]

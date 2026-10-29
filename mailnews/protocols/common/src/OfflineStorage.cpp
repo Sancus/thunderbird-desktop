@@ -10,6 +10,7 @@
 #include "nsIChannel.h"
 #include "nsIInputStream.h"
 #include "nsIInputStreamPump.h"
+#include "nsILoadGroup.h"
 #include "nsIMsgCopyService.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgFolder.h"
@@ -41,7 +42,9 @@ OfflineMessageReadListener::~OfflineMessageReadListener() = default;
 NS_IMETHODIMP OfflineMessageReadListener::OnStartRequest(nsIRequest* request) {
   if (mShouldStart) {
     mShouldStart = false;
-    return mDestination->OnStartRequest(mChannel);
+    nsresult rv = mDestination->OnStartRequest(mChannel);
+    mConsumerFailed = mConsumerFailed || NS_FAILED(rv);
+    return rv;
   }
 
   return NS_OK;
@@ -50,10 +53,10 @@ NS_IMETHODIMP OfflineMessageReadListener::OnStartRequest(nsIRequest* request) {
 NS_IMETHODIMP OfflineMessageReadListener::OnStopRequest(nsIRequest* request,
                                                         nsresult status) {
   nsresult rv = mDestination->OnStopRequest(mChannel, status);
-  if (NS_FAILED(status) &&
+  if (NS_FAILED(status) && !mConsumerFailed &&
       Preferences::GetBool("mail.discard_offline_msg_on_failure", true)) {
-    // The streaming failed, discard the offline copy of the message so it can
-    // be downloaded again later.
+    // A read failure can require another download. Consumer errors do not
+    // invalidate the source bytes.
     mFolder->DiscardOfflineMsg(mMsgKey);
   }
   // We no longer need the channel. Clean it up so both it and this listener can
@@ -64,8 +67,10 @@ NS_IMETHODIMP OfflineMessageReadListener::OnStopRequest(nsIRequest* request,
 NS_IMETHODIMP OfflineMessageReadListener::OnDataAvailable(
     nsIRequest* request, nsIInputStream* aInStream, uint64_t aSourceOffset,
     uint32_t aCount) {
-  return mDestination->OnDataAvailable(mChannel, aInStream, aSourceOffset,
-                                       aCount);
+  nsresult rv =
+      mDestination->OnDataAvailable(mChannel, aInStream, aSourceOffset, aCount);
+  mConsumerFailed = mConsumerFailed || NS_FAILED(rv);
+  return rv;
 }
 
 // The public-facing helper function.
@@ -73,6 +78,8 @@ nsresult AsyncReadMessageFromStore(nsIMsgDBHdr* message,
                                    nsIStreamListener* streamListener,
                                    bool convertData, nsIChannel* srcChannel,
                                    nsIRequest** readRequest) {
+  NS_ENSURE_ARG_POINTER(readRequest);
+  *readRequest = nullptr;
   NS_ENSURE_ARG_POINTER(message);
   NS_ENSURE_ARG_POINTER(streamListener);
   NS_ENSURE_ARG_POINTER(srcChannel);
@@ -98,11 +105,18 @@ nsresult AsyncReadMessageFromStore(nsIMsgDBHdr* message,
   nsCOMPtr<nsIInputStreamPump> pump;
   MOZ_TRY(NS_NewInputStreamPump(getter_AddRefs(pump), msgStream.forget()));
 
+  // Configure the request before AsyncRead can start callbacks.
+  nsLoadFlags loadFlags;
+  MOZ_TRY(srcChannel->GetLoadFlags(&loadFlags));
+  MOZ_TRY(pump->SetLoadFlags(loadFlags));
+  nsCOMPtr<nsILoadGroup> loadGroup;
+  MOZ_TRY(srcChannel->GetLoadGroup(getter_AddRefs(loadGroup)));
+  MOZ_TRY(pump->SetLoadGroup(loadGroup));
+
   // Wrap the listener to:
   // a) provide srcChannel as the request, instead of the pump.
-  // b) remove the message from the offline store if anything goes
-  //    wrong (the idea being that it'll force a re-download from
-  //    the server so next time it'll work).
+  // b) discard a failed read for re-download, while retaining source bytes
+  //    when the consumer fails.
   nsCOMPtr<nsIStreamListener> listenerWrapper = new OfflineMessageReadListener(
       streamListener, srcChannel, msgKey, folder);
 
@@ -121,8 +135,6 @@ nsresult AsyncReadMessageFromStore(nsIMsgDBHdr* message,
 
   MOZ_TRY(pump->AsyncRead(consumerListener));
 
-  // TODO: should we set the pump LoadFlags() and LoadGroup() here, using
-  // the values on the original request?
   pump.forget(readRequest);
 
   return NS_OK;
@@ -551,6 +563,17 @@ nsresult LocalCopyHeaders(nsIMsgDBHdr* sourceHeader,
         destinationHeader->SetStringProperty(property.get(), propertyValue));
   }
 
+  // Native tags need not appear in the arbitrary property enumeration.
+  if (!exclusions.Contains("keywords"_ns) &&
+      !properties.Contains("keywords"_ns)) {
+    nsCString keywords;
+    MOZ_TRY(sourceHeader->GetStringProperty("keywords", keywords));
+    // An absent empty property must not create a new stored property.
+    if (!keywords.IsEmpty()) {
+      MOZ_TRY(destinationHeader->SetStringProperty("keywords", keywords));
+    }
+  }
+
   uint32_t oldFlags, newFlags;
   MOZ_TRY(sourceHeader->GetFlags(&oldFlags));
   MOZ_TRY(destinationHeader->GetFlags(&newFlags));
@@ -566,9 +589,8 @@ nsresult LocalCopyHeaders(nsIMsgDBHdr* sourceHeader,
   // defined by `carryOver` in the original message, which we want to, well,
   // carry over onto the new header (and overwrite any value the parser has
   // found for them).
-  destinationHeader->SetFlags((newFlags & ~carryOver) | (oldFlags & carryOver));
-
-  return NS_OK;
+  return destinationHeader->SetFlags((newFlags & ~carryOver) |
+                                     (oldFlags & carryOver));
 }
 
 nsresult FoldersOnSameServer(nsIMsgFolder* folder1, nsIMsgFolder* folder2,

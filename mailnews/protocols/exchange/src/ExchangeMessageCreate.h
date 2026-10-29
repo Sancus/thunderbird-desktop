@@ -20,11 +20,13 @@ class nsIInputStream;
  * @param destFolder  The folder in which the message is to be created.
  * @param srcRaw      A stream which will serve up the raw rfc5322 message
  *                    data when read.
+ * @param srcHdr      Optional source of local message properties.
  * @param isRead      If set, the resulting message will be marked read (both
  *                    locally and remotely).
  * @param isDraft     This is a little nebulous and needs to be better defined.
  *                    For EWS it affects the server-side "unchanged" property,
  *                    but it's not quite clear why or what the effect is.
+ * @param keywords    Local keywords to add to those parsed from srcRaw.
  * @param onComplete  Callback to invoked upon completion, with either the
  *                    newly-created nsIMsgDBHdr or a failure code.
  *
@@ -32,8 +34,9 @@ class nsIInputStream;
  *                    successfully started.
  */
 nsresult ExchangePerformMessageCreate(
-    ExchangeFolder* destFolder, nsIInputStream* srcRaw, bool isRead,
-    bool isDraft, std::function<void(nsresult, nsIMsgDBHdr*)> onComplete);
+    ExchangeFolder* destFolder, nsIInputStream* srcRaw, nsIMsgDBHdr* srcHdr,
+    bool isRead, bool isDraft, const nsACString& keywords,
+    std::function<void(nsresult, nsIMsgDBHdr*)> onComplete);
 
 /**
  * Create a message in the given folder, on both the remote server

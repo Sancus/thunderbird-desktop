@@ -12,7 +12,10 @@
 #include "mozilla/Components.h"
 #include "nsAutoSyncState.h"
 #include "nsMsgDatabase.h"  // For ApplyRawHdrToDbHdr().
+#include "nsMsgMessageFlags.h"
+#include "nsMsgUtils.h"
 #include "nsNetUtil.h"
+#include "nsReadableUtils.h"
 #include "nsStreamUtils.h"
 #include "nsIInputStream.h"
 #include "nsIMsgFolderNotificationService.h"
@@ -39,7 +42,7 @@ class MessageCreateHandler : public IExchangeMessageCreateListener {
   MessageCreateHandler(ExchangeFolder* destFolder, nsIInputStream* srcStream,
                        nsIMsgDBHdr* srcHdr,
                        nsTArray<nsCString> const& srcExcludeProperties,
-                       bool isRead, bool isDraft,
+                       bool isRead, bool isDraft, const nsACString& keywords,
                        std::function<void(nsresult, nsIMsgDBHdr*)> onComplete)
       : mFolder(destFolder),
         mOnComplete(std::move(onComplete)),
@@ -47,7 +50,8 @@ class MessageCreateHandler : public IExchangeMessageCreateListener {
         mSrcHdr(srcHdr),
         mSrcExcludeProperties(srcExcludeProperties.Clone()),
         mIsRead(isRead),
-        mIsDraft(isDraft) {}
+        mIsDraft(isDraft),
+        mFileKeywords(keywords) {}
 
   MessageCreateHandler() = delete;
 
@@ -139,13 +143,41 @@ class MessageCreateHandler : public IExchangeMessageCreateListener {
     RawHdr rawHdrData = ParseRawMailHeaders(headerSpan);
     MOZ_TRY(ApplyRawHdrToDbHdr(rawHdrData, tmpHdr));
 
-    // link to EwsId
-    MOZ_TRY(tmpHdr->SetStringProperty(kExchangeIdProperty, serverId));
-
     // (optional) Copy over fields from srcHdr.
     if (mSrcHdr) {
       MOZ_TRY(LocalCopyHeaders(mSrcHdr, tmpHdr, mSrcExcludeProperties));
     }
+
+    // Add requested keywords after copying the source metadata.
+    if (!mFileKeywords.IsEmpty()) {
+      nsCString keywords;
+      MOZ_TRY(tmpHdr->GetStringProperty("keywords", keywords));
+      keywords.CompressWhitespace();
+      nsTArray<nsCString> keywordsToAdd;
+      ParseString(mFileKeywords, ' ', keywordsToAdd);
+      for (const auto& keyword : keywordsToAdd) {
+        int32_t start, length;
+        if (!MsgFindKeyword(keyword, keywords, &start, &length)) {
+          if (!keywords.IsEmpty()) {
+            keywords.Append(' ');
+          }
+          keywords.Append(keyword);
+        }
+      }
+      MOZ_TRY(tmpHdr->SetStringProperty("keywords", keywords));
+    }
+
+    // Match the remote read state; offline availability belongs to this store.
+    uint32_t flags;
+    MOZ_TRY(tmpHdr->GetFlags(&flags));
+    flags &= ~(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline);
+    if (mIsRead) {
+      flags |= nsMsgMessageFlags::Read;
+    }
+    MOZ_TRY(tmpHdr->SetFlags(flags));
+
+    // The destination identity must override copied source properties.
+    MOZ_TRY(tmpHdr->SetStringProperty(kExchangeIdProperty, serverId));
 
     // Add to DB and commit.
     nsCOMPtr<nsIMsgDBHdr> liveHdr;
@@ -153,18 +185,9 @@ class MessageCreateHandler : public IExchangeMessageCreateListener {
     MOZ_TRY(db->Commit(nsMsgDBCommitType::kLargeCommit));
 
     // Now write the full message to local message store.
-    // Ignore failures here - the operation has been successful and the new
-    // message is in the DB. Let the standard offline sync code deal with it.
-    //
     // TODO: check offline-storage policy here! See
     // https://bugzilla.mozilla.org/show_bug.cgi?id=2026215
-    nsresult rv = LocalCopyOfflineMessageContent(mFolder, msgStream, liveHdr);
-    if (NS_FAILED(rv)) {
-      MOZ_LOG_FMT(
-          gExchangeLog, mozilla::LogLevel::Warning,
-          "MessageCreateHandler - failed writing offline copy (serverId={})",
-          serverId);
-    }
+    MOZ_TRY(LocalCopyOfflineMessageContent(mFolder, msgStream, liveHdr));
 
     return liveHdr;
   }
@@ -186,19 +209,21 @@ class MessageCreateHandler : public IExchangeMessageCreateListener {
   nsTArray<nsCString> mSrcExcludeProperties;
   bool mIsRead;   // Should the new message be marked read?
   bool mIsDraft;  // Nobody really understands this.
+  nsCString mFileKeywords;
 };
 
 NS_IMPL_ISUPPORTS(MessageCreateHandler, IExchangeMessageCreateListener)
 
 nsresult ExchangePerformMessageCreate(
-    ExchangeFolder* destFolder, nsIInputStream* srcRaw, bool isRead,
-    bool isDraft, std::function<void(nsresult, nsIMsgDBHdr*)> onComplete) {
+    ExchangeFolder* destFolder, nsIInputStream* srcRaw, nsIMsgDBHdr* srcHdr,
+    bool isRead, bool isDraft, const nsACString& keywords,
+    std::function<void(nsresult, nsIMsgDBHdr*)> onComplete) {
   MOZ_ASSERT(destFolder);
   MOZ_ASSERT(srcRaw);
 
-  // Creation without copying an existing nsIMsgDBHdr.
-  RefPtr<MessageCreateHandler> handler = new MessageCreateHandler(
-      destFolder, srcRaw, nullptr, {}, isRead, isDraft, std::move(onComplete));
+  RefPtr<MessageCreateHandler> handler =
+      new MessageCreateHandler(destFolder, srcRaw, srcHdr, {}, isRead, isDraft,
+                               keywords, std::move(onComplete));
   return handler->Go();
 }
 
@@ -213,8 +238,8 @@ nsresult ExchangePerformMessageCreateFromCopy(
   bool isRead;
   MOZ_TRY(srcHdr->GetIsRead(&isRead));
 
-  RefPtr<MessageCreateHandler> handler =
-      new MessageCreateHandler(destFolder, srcRaw, srcHdr, srcExcludeProperties,
-                               isRead, isDraft, std::move(onComplete));
+  RefPtr<MessageCreateHandler> handler = new MessageCreateHandler(
+      destFolder, srcRaw, srcHdr, srcExcludeProperties, isRead, isDraft,
+      EmptyCString(), std::move(onComplete));
   return handler->Go();
 }

@@ -56,7 +56,7 @@
  * that the new message has been successfully created, both on the Exchange
  * server and locally (`MessageCopyHandler::OnCreateFinished()`).
  * 8. If the operation is a move, the copy handler deletes the source message on
- * the source folder.
+ * the source folder and waits for deletion to finish.
  * 9. The copy handler repeats this process from steps 3 onwards until every
  * message in the original array has been copied or moved.
  * 10. Once the operation has completed, or if there has been a failure during
@@ -104,8 +104,10 @@ class ExchangeMessageCopyHandler : public nsICopyMessageListener {
    * into the destination Exchange folder.
    */
   ExchangeMessageCopyHandler(nsIFile* srcFile, ExchangeFolder* dstFolder,
-                             bool isDraft, nsIMsgWindow* window,
-                             nsCString dstFolderId, IExchangeClient* client,
+                             nsIMsgDBHdr* fileHeader, bool isDraft,
+                             uint32_t fileFlags, const nsACString& keywords,
+                             nsIMsgWindow* window, nsCString dstFolderId,
+                             IExchangeClient* client,
                              nsIMsgCopyServiceListener* copyServiceListener)
       : mDstFolder(dstFolder),
         mHeaders({}),
@@ -114,6 +116,9 @@ class ExchangeMessageCopyHandler : public nsICopyMessageListener {
         mWindow(window),
         mSrcFolder(mozilla::Nothing()),
         mSrcFile(mozilla::Some(srcFile)),
+        mFileHeader(fileHeader),
+        mFileFlags(fileFlags),
+        mFileKeywords(keywords),
         mDstFolderId(std::move(dstFolderId)),
         mClient(client),
         mCopyServiceListener(copyServiceListener),
@@ -147,6 +152,9 @@ class ExchangeMessageCopyHandler : public nsICopyMessageListener {
    */
   nsresult OnCreateFinished(nsresult status, nsIMsgDBHdr* newHdr);
 
+  // Advance after creation and any required source deletion have finished.
+  nsresult OnMessageCompleted(nsresult status);
+
  private:
   // Parameters of the copy/move operation.
   RefPtr<ExchangeFolder> mDstFolder;
@@ -165,6 +173,9 @@ class ExchangeMessageCopyHandler : public nsICopyMessageListener {
   // folder).
   mozilla::Maybe<RefPtr<nsIMsgFolder>> mSrcFolder;
   mozilla::Maybe<RefPtr<nsIFile>> mSrcFile;
+  RefPtr<nsIMsgDBHdr> mFileHeader;
+  uint32_t mFileFlags = 0;
+  nsCString mFileKeywords;
 
   // The Exchange client and folder ID to use when creating the message item on
   // the remote server.
@@ -176,6 +187,7 @@ class ExchangeMessageCopyHandler : public nsICopyMessageListener {
 
   // The index into `mHeaders` of the message currently being copied/move.
   size_t mCurIndex;
+  bool mCompleted = false;
 
   // A buffer containing the full message content.
   //

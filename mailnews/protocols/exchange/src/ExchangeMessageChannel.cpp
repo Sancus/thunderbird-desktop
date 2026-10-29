@@ -10,6 +10,7 @@
 #include "IExchangeFolder.h"
 #include "IExchangeIncomingServer.h"
 #include "nsContentSecurityManager.h"
+#include "nsICachingChannel.h"
 #include "nsIInputStream.h"
 #include "nsIInputStreamPump.h"
 #include "nsIMailChannel.h"
@@ -24,6 +25,7 @@
 #include "nsIStreamListener.h"
 #include "nsIURIMutator.h"
 #include "nsMimeTypes.h"
+#include "nsMsgError.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
@@ -44,7 +46,7 @@ ExchangeMessageChannel::ExchangeMessageChannel(nsIURI* uri, bool convert)
       mContentDisposition(nsIChannel::DISPOSITION_INLINE),
       mContentLength(-1),
       mLoadFlags(nsIRequest::LOAD_NORMAL),
-      mPending(true),
+      mPending(false),
       mStatus(NS_OK) {
   mContentType.AssignLiteral(MESSAGE_RFC822);
 }
@@ -282,15 +284,20 @@ NS_IMETHODIMP ExchangeMessageChannel::Open(nsIInputStream** _retval) {
 }
 
 NS_IMETHODIMP ExchangeMessageChannel::AsyncOpen(nsIStreamListener* aListener) {
+  if (NS_FAILED(mStatus)) {
+    return mStatus;
+  }
+
   mPending = false;
 
   nsCOMPtr<nsIStreamListener> listener = aListener;
   nsresult rv =
       nsContentSecurityManager::doContentSecurityCheck(this, listener);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
 
   nsAutoCString scheme;
-  MOZ_TRY(mURI->GetScheme(scheme));
+  rv = mURI->GetScheme(scheme);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
 
   nsAutoCString serviceId("@mozilla.org/messenger/messageservice;1?type=");
   if (scheme.EqualsLiteral("x-moz-ews")) {
@@ -298,45 +305,58 @@ NS_IMETHODIMP ExchangeMessageChannel::AsyncOpen(nsIStreamListener* aListener) {
   } else if (scheme.EqualsLiteral("x-moz-graph")) {
     serviceId.AppendLiteral("graph");
   } else {
-    return nsresult::NS_ERROR_UNEXPECTED;
+    return mStatus = NS_ERROR_UNEXPECTED;
   }
 
   // Get the header and folder matching the URI.
   nsCOMPtr<nsIMsgMessageService> msgService =
       do_GetService(serviceId.Data(), &rv);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
 
   nsCString spec;
   rv = mURI->GetSpec(spec);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
 
   rv = msgService->MessageURIToMsgHdr(spec, getter_AddRefs(mHdr));
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
 
   nsCOMPtr<nsIMsgFolder> folder;
   rv = mHdr->GetFolder(getter_AddRefs(folder));
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
   nsCOMPtr<IExchangeFolder> ewsFolder{do_QueryInterface(folder, &rv)};
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
 
   nsMsgKey msgKey;
   rv = mHdr->GetMessageKey(&msgKey);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
 
   // Is the message already in the offline store?
   bool hasOffline;
   rv = folder->HasMsgOffline(msgKey, &hasOffline);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, mStatus = rv);
   if (hasOffline) {
     // Yes - start streaming it directly from there.
-    return StartMessageReadFromStore(aListener);
+    rv = StartMessageReadFromStore(aListener);
+    if (NS_FAILED(rv)) {
+      mStatus = rv;
+    }
+    return rv;
+  }
+
+  if (mLoadFlags & (nsICachingChannel::LOAD_ONLY_FROM_CACHE |
+                    nsICachingChannel::LOAD_NO_NETWORK_IO)) {
+    return mStatus = NS_ERROR_DOCUMENT_NOT_CACHED;
+  }
+  if (WeAreOffline()) {
+    return mStatus = NS_MSG_ERROR_OFFLINE;
   }
 
   // No - Fetch it from the server first.
   // TODO: Should use nsIStreamListenerTee to combine this into one operation.
   // TODO: There should be a policy check - do we actually _want_ to keep a
   //       local copy of this message?
-  return ExchangeFetchMsgsToOffline(
+  mPending = true;
+  rv = ExchangeFetchMsgsToOffline(
       folder, {msgKey},
       [self = RefPtr(this), ewsFolder,
        listener = nsCOMPtr(aListener)](nsresult status) {
@@ -352,20 +372,26 @@ NS_IMETHODIMP ExchangeMessageChannel::AsyncOpen(nsIStreamListener* aListener) {
         if (NS_FAILED(status)) {
           // We've already returned from AsyncOpen(), so the listener is
           // expecting callbacks...
+          self->mStatus = status;
           listener->OnStartRequest(self);
+          self->mPending = false;
           listener->OnStopRequest(self, status);
           return;
         }
       });
+  if (NS_FAILED(rv)) {
+    mPending = false;
+    mStatus = rv;
+  }
+  return rv;
 }
 
 NS_IMETHODIMP ExchangeMessageChannel::GetCanceled(bool* aCanceled) {
-  nsCString canceledReason;
-  nsresult rv = mReadRequest->GetCanceledReason(canceledReason);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  *aCanceled = canceledReason.IsEmpty();
-
+  NS_ENSURE_ARG_POINTER(aCanceled);
+  if (mReadRequest) {
+    return mReadRequest->GetCanceled(aCanceled);
+  }
+  *aCanceled = false;
   return NS_OK;
 }
 
@@ -430,14 +456,6 @@ NS_IMETHODIMP ExchangeMessageChannel::SetParentProcessChannelHandle(
 
 nsresult ExchangeMessageChannel::StartMessageReadFromStore(
     nsIStreamListener* streamListener) {
-  nsresult rv = AsyncReadMessageFromStore(mHdr, streamListener, mConvert, this,
-                                          getter_AddRefs(mReadRequest));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // Apply the same load flags and group that were previously set.
-  // TODO: should AsyncReadMessageFromStore() do this automatically?
-  MOZ_TRY(mReadRequest->SetLoadFlags(mLoadFlags));
-  MOZ_TRY(mReadRequest->SetLoadGroup(mLoadGroup));
-
-  return NS_OK;
+  return AsyncReadMessageFromStore(mHdr, streamListener, mConvert, this,
+                                   getter_AddRefs(mReadRequest));
 }

@@ -66,6 +66,9 @@ class OfflineMessageReadListener : public nsIStreamListener {
   // avoid calling it more than once.
   bool mShouldStart;
 
+  // Destination failures must not discard a valid cached source body.
+  bool mConsumerFailed = false;
+
   // The listener to which to forward any method call.
   nsCOMPtr<nsIStreamListener> mDestination;
 

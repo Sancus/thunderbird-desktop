@@ -6,6 +6,7 @@
 
 #include "IExchangeClient.h"
 #include "mozilla/Components.h"
+#include "nsICachingChannel.h"
 #include "nsIChannel.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgFolder.h"
@@ -223,7 +224,7 @@ NS_IMETHODIMP ExchangeService::StreamMessage(
 
   NS_IF_ADDREF(*_retval = channelURI);
 
-  return FetchMessage(channelURI, aStreamListener);
+  return FetchMessage(channelURI, aStreamListener, aLocalOnly);
 }
 
 NS_IMETHODIMP ExchangeService::StreamHeaders(const nsACString& aMessageURI,
@@ -363,7 +364,8 @@ nsresult ExchangeService::MsgHdrFromUri(nsIURI* uri, nsIMsgDBHdr** _retval) {
 }
 
 nsresult ExchangeService::FetchMessage(nsIURI* aURI,
-                                       nsIStreamListener* aStreamListener) {
+                                       nsIStreamListener* aStreamListener,
+                                       bool localOnly) {
   nsCOMPtr<nsIIOService> netService = mozilla::components::IO::Service();
   NS_ENSURE_TRUE(netService, NS_ERROR_UNEXPECTED);
 
@@ -372,6 +374,13 @@ nsresult ExchangeService::FetchMessage(nsIURI* aURI,
       aURI, nullptr, nsContentUtils::GetSystemPrincipal(), nullptr,
       nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
       nsIContentPolicy::TYPE_OTHER, getter_AddRefs(messageChannel)));
+
+  if (localOnly) {
+    nsLoadFlags flags;
+    MOZ_TRY(messageChannel->GetLoadFlags(&flags));
+    MOZ_TRY(messageChannel->SetLoadFlags(
+        flags | nsICachingChannel::LOAD_ONLY_FROM_CACHE));
+  }
 
   return messageChannel->AsyncOpen(aStreamListener);
 }

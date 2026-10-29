@@ -905,3 +905,226 @@ add_task(
     await AddonTestUtils.promiseShutdownManager();
   }
 );
+
+add_task(
+  {
+    skip_if: () => IS_IMAP || IS_NNTP || IS_EWS,
+  },
+  async function test_duplicate_local_message_ids() {
+    await AddonTestUtils.promiseStartupManager();
+    const account = await createAccount();
+    addIdentity(account);
+    const root = account.incomingServer.rootFolder;
+    const first = await createSubfolder(root, "duplicateFirst");
+    const second = await createSubfolder(root, "duplicateSecond");
+    const copied = await createSubfolder(root, "duplicateCopied");
+    const moved = await createSubfolder(root, "duplicateMoved");
+    const archived = await createSubfolder(root, "duplicateArchived");
+    const outside = await createSubfolder(root, "duplicateOutside");
+    archived.setFlag(Ci.nsMsgFolderFlags.Archive);
+    account.defaultIdentity.archivesFolderURI = archived.URI;
+    account.defaultIdentity.archiveGranularity =
+      Ci.nsIMsgIdentity.singleArchiveFolder;
+    account.defaultIdentity.archiveKeepFolderStructure = false;
+    const rawMessage = [
+      "From: sender@example.invalid",
+      "To: recipient@example.invalid",
+      "Subject: Distinct physical messages",
+      "Message-ID: <duplicate-operation@example.invalid>",
+      "Date: Tue, 27 Oct 2026 12:00:00 +0000",
+      "",
+      "Body",
+      "",
+    ].join("\r\n");
+    await createMessageFromString(first, rawMessage);
+    await createMessageFromString(second, rawMessage);
+    await createMessageFromString(outside, rawMessage);
+
+    const extension = ExtensionTestUtils.loadExtension({
+      manifest: {
+        permissions: [
+          "accountsRead",
+          "messagesRead",
+          "messagesMove",
+          "messagesDelete",
+        ],
+      },
+      background: async () => {
+        function nextEvent(name, expectedEvents = 1) {
+          return new Promise(resolve => {
+            const events = [];
+            const listener = (...args) => {
+              events.push(args);
+              if (events.length != expectedEvents) {
+                return;
+              }
+              browser.messages[name].removeListener(listener);
+              resolve(
+                args.map((page, index) => ({
+                  ...page,
+                  messages: events.flatMap(event => event[index].messages),
+                }))
+              );
+            };
+            browser.messages[name].addListener(listener);
+          });
+        }
+
+        const folders = {};
+        for (const name of [
+          "duplicateFirst",
+          "duplicateSecond",
+          "duplicateCopied",
+          "duplicateMoved",
+          "duplicateArchived",
+          "duplicateOutside",
+        ]) {
+          [folders[name]] = await browser.folders.query({ name });
+        }
+        const [firstMessage] = (
+          await browser.messages.list(folders.duplicateFirst.id)
+        ).messages;
+        const [secondMessage] = (
+          await browser.messages.list(folders.duplicateSecond.id)
+        ).messages;
+        browser.test.assertEq(
+          firstMessage.headerMessageId,
+          secondMessage.headerMessageId,
+          "The two physical messages have the same Message-ID"
+        );
+        browser.test.assertTrue(firstMessage.id != secondMessage.id);
+
+        const copyEvent = nextEvent("onCopied", 2);
+        await browser.messages.copy(
+          [
+            firstMessage.id,
+            firstMessage.id,
+            secondMessage.id,
+            secondMessage.id,
+          ],
+          folders.duplicateCopied.id
+        );
+        const [copySource, copyDestination] = await copyEvent;
+        browser.test.assertEq(2, copySource.messages.length);
+        browser.test.assertEq(2, copyDestination.messages.length);
+        for (const message of [firstMessage, secondMessage]) {
+          browser.test.assertEq(
+            1,
+            copySource.messages.filter(m => m.id == message.id).length,
+            "Each physical source occurs once"
+          );
+          browser.test.assertEq(
+            message.folder.id,
+            (await browser.messages.get(message.id)).folder.id,
+            "Copy preserves the original physical location"
+          );
+        }
+        const copies = (await browser.messages.list(folders.duplicateCopied.id))
+          .messages;
+        browser.test.assertEq(2, copies.length);
+        browser.test.assertTrue(copies[0].id != copies[1].id);
+        browser.test.assertTrue(
+          copies.every(m => m.id != firstMessage.id && m.id != secondMessage.id)
+        );
+
+        const moveEvent = nextEvent("onMoved");
+        await browser.messages.move(
+          copies.flatMap(m => [m.id, m.id]),
+          folders.duplicateMoved.id
+        );
+        const [moveSource, moveDestination] = await moveEvent;
+        browser.test.assertEq(2, moveSource.messages.length);
+        browser.test.assertEq(2, moveDestination.messages.length);
+        browser.test.assertEq(
+          0,
+          (await browser.messages.list(folders.duplicateCopied.id)).messages
+            .length
+        );
+        const movedMessages = (
+          await browser.messages.list(folders.duplicateMoved.id)
+        ).messages;
+        browser.test.assertEq(2, movedMessages.length);
+        for (const message of copies) {
+          browser.test.assertEq(
+            1,
+            moveSource.messages.filter(m => m.id == message.id).length
+          );
+          await browser.test.assertRejects(
+            browser.messages.get(message.id),
+            /Message not found:/,
+            "Move invalidates the old physical location"
+          );
+        }
+
+        const deleteEvent = nextEvent("onDeleted");
+        await browser.messages.delete(
+          movedMessages.flatMap(m => [m.id, m.id]),
+          { deletePermanently: true }
+        );
+        const [deleted] = await deleteEvent;
+        browser.test.assertEq(2, deleted.messages.length);
+        for (const message of movedMessages) {
+          browser.test.assertEq(
+            1,
+            deleted.messages.filter(m => m.id == message.id).length
+          );
+        }
+        browser.test.assertEq(
+          0,
+          (await browser.messages.list(folders.duplicateMoved.id)).messages
+            .length
+        );
+        const archiveEvent = nextEvent("onMoved", 2);
+        await browser.messages.archive([
+          firstMessage.id,
+          firstMessage.id,
+          secondMessage.id,
+          secondMessage.id,
+        ]);
+        const [archiveSource, archiveDestination] = await archiveEvent;
+        browser.test.assertEq(2, archiveSource.messages.length);
+        browser.test.assertEq(2, archiveDestination.messages.length);
+        const archivedMessages = (
+          await browser.messages.list(folders.duplicateArchived.id)
+        ).messages;
+        browser.test.assertEq(2, archivedMessages.length);
+        browser.test.assertTrue(
+          archivedMessages[0].id != archivedMessages[1].id
+        );
+        browser.test.assertTrue(
+          archivedMessages.every(
+            message => message.headerMessageId == firstMessage.headerMessageId
+          )
+        );
+        for (const source of ["duplicateFirst", "duplicateSecond"]) {
+          browser.test.assertEq(
+            0,
+            (await browser.messages.list(folders[source].id)).messages.length
+          );
+        }
+        browser.test.assertEq(
+          1,
+          (await browser.messages.list(folders.duplicateOutside.id)).messages
+            .length,
+          "An unselected physical copy with the same Message-ID stays in place"
+        );
+        browser.test.notifyPass("duplicate-ids");
+      },
+    });
+
+    try {
+      await extension.startup();
+      await extension.awaitFinish("duplicate-ids");
+      Assert.equal(first.getTotalMessages(false), 0);
+      Assert.equal(second.getTotalMessages(false), 0);
+      Assert.equal(copied.getTotalMessages(false), 0);
+      Assert.equal(moved.getTotalMessages(false), 0);
+      Assert.equal(archived.getTotalMessages(false), 2);
+      Assert.equal(outside.getTotalMessages(false), 1);
+    } finally {
+      await extension.unload();
+      cleanUpAccount(account);
+      await AddonTestUtils.promiseShutdownManager();
+    }
+  }
+);

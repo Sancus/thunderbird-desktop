@@ -1004,7 +1004,7 @@ this.messages = class extends ExtensionAPIPersistent {
     function collectMessagesInFolders(messageIds) {
       const folderMap = new DefaultMap(() => new Set());
 
-      for (const messageId of messageIds) {
+      for (const messageId of new Set(messageIds)) {
         const msgHdr = messageManager.get(messageId);
         if (!msgHdr) {
           throw new ExtensionError(`Message not found: ${messageId}.`);

@@ -174,7 +174,7 @@ nsresult nsMsgAccountManager::Init() {
         do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    databaseCore->Startup();
+    rv = databaseCore->Startup();
     NS_ENSURE_SUCCESS(rv, rv);
 
     componentRegistrar->RegisterFactory(

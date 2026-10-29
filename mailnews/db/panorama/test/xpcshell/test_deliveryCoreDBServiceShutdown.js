@@ -6,6 +6,39 @@
 
 /* import-globals-from head.js */
 
+add_task(function test_startupErrorStopsAccountInitialization() {
+  const file = do_get_profile().clone();
+  file.append("panorama.sqlite");
+  const connection = Services.storage.openDatabase(file);
+  connection.schemaVersion = 0x7fffffff;
+  connection.close();
+
+  Assert.throws(
+    () =>
+      Cc["@mozilla.org/messenger/account-manager;1"].getService(
+        Ci.nsIMsgAccountManager
+      ),
+    error => error.result === Cr.NS_ERROR_XPC_GS_RETURNED_FAILURE,
+    "The service factory must fail when database startup fails"
+  );
+  const refused = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.throws(() => refused.startup(), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.ok(file.exists(), "A refused database remains in the profile");
+  const retained = Services.storage.openDatabase(file);
+  try {
+    Assert.equal(retained.schemaVersion, 0x7fffffff);
+    Assert.ok(!retained.transactionInProgress);
+    // Only the test repairs its unsupported version before normal startup.
+    retained.schemaVersion = 0;
+  } finally {
+    retained.close();
+  }
+  installDB();
+  Assert.ok(database.sourceId, "The repaired profile can initialize normally");
+});
+
 add_task(function test_shutdownClosesOwnedWrappersBeforeNativeState() {
   do_get_profile();
   loadExistingDB();

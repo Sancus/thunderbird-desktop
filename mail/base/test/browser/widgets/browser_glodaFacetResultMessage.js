@@ -298,3 +298,97 @@ add_task(function test_snippetSubjectOnlyMatch() {
   );
   element.remove();
 });
+
+/**
+ * Renders a copied native snippet through the retained result card.
+ *
+ * @param {?object} snippet - Text, UTF-16 ranges and firstMatchText from the service.
+ * @returns {HTMLElement} Result card owned by this fixture.
+ */
+function renderNativeSnippet(snippet) {
+  const element = doc.createElement("facet-result-message");
+  element.message = {
+    subject: "Native result",
+    from: [{ name: "Native Author", email: "native@example.invalid" }],
+    to: [],
+    cc: [],
+    bcc: [],
+    date: new Date(),
+    read: true,
+    starred: false,
+    tagKeys: [],
+    attachmentInfos: null,
+    snippet,
+  };
+  registerCleanupFunction(() => element.remove());
+  const previous = win.FacetContext.mailSearchResultSet;
+  try {
+    win.FacetContext.mailSearchResultSet = {};
+    doc.body.appendChild(element);
+  } finally {
+    win.FacetContext.mailSearchResultSet = previous;
+  }
+  return element;
+}
+
+add_task(function test_nativeSnippetUsesUtf16Ranges() {
+  const element = renderNativeSnippet({
+    text: "é 😀 café 自動 end",
+    ranges: [
+      { start: 5, end: 9 },
+      { start: 10, end: 12 },
+    ],
+    firstMatchText: "café",
+  });
+  const snippet = element.querySelector(".message-body");
+  Assert.ok(snippet, "The native result card has a snippet");
+  Assert.equal(snippet.textContent, "é 😀 café 自動 end");
+  Assert.deepEqual(
+    [...snippet.querySelectorAll(".message-body-fulltext-match")].map(
+      node => node.textContent
+    ),
+    ["café", "自動"],
+    "Native ranges are UTF-16 positions, not legacy FTS byte offsets"
+  );
+  Assert.equal(element.firstMatchText, "café");
+  Assert.equal(
+    element.querySelector(".message-author").textContent,
+    "Native Author",
+    "The card uses the native mailbox shape"
+  );
+  element.remove();
+});
+
+add_task(function test_nativeSnippetKeepsContextAndLiteralText() {
+  const element = renderNativeSnippet({
+    text: "…\ntwo\nthree\n<needle>\nfive\nsix…",
+    ranges: [{ start: 13, end: 19 }],
+    firstMatchText: "needle",
+  });
+  const snippet = element.querySelector(".message-body");
+  Assert.ok(snippet, "The native result card has context");
+  Assert.equal(snippet.textContent, "…\ntwo\nthree\n<needle>\nfive\nsix…");
+  const match = snippet.querySelector(".message-body-fulltext-match");
+  Assert.ok(match, "The copied match has a highlight");
+  Assert.equal(match.textContent, "needle");
+  Assert.equal(element.firstMatchText, "needle");
+  Assert.equal(snippet.querySelectorAll("needle").length, 0);
+  element.remove();
+});
+
+add_task(function test_nativeUnavailableSnippetDoesNotInventBodyText() {
+  for (const snippet of [
+    null,
+    { text: "", ranges: [], firstMatchText: null },
+  ]) {
+    const element = renderNativeSnippet(snippet);
+    const body = element.querySelector(".message-body");
+    Assert.ok(body, "The native card retains its body container");
+    Assert.equal(body.textContent, "");
+    Assert.equal(
+      body.querySelectorAll(".message-body-fulltext-match").length,
+      0
+    );
+    element.remove();
+  }
+});

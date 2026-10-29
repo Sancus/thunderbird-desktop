@@ -992,6 +992,8 @@ NS_IMETHODIMP nsMsgMaildirStore::DeleteMessages(
   }
   nsCOMPtr<nsIMsgFolder> folder;
   nsresult rv = aHdrArray[0]->GetFolder(getter_AddRefs(folder));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_ARG(folder);
   nsTArray<nsCString> storeTokens;
   for (nsIMsgDBHdr* msg : aHdrArray) {
     nsAutoCString tok;
@@ -1017,19 +1019,23 @@ NS_IMETHODIMP nsMsgMaildirStore::DeleteStoreMessages(
     nsCOMPtr<nsIFile> path;
     nsresult rv = folder->GetFilePath(getter_AddRefs(path));
     NS_ENSURE_SUCCESS(rv, rv);
-    path->Append(u"cur"_ns);
-    path->Append(NS_ConvertUTF8toUTF16(storeToken));
+    rv = path->Append(u"cur"_ns);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = path->Append(NS_ConvertUTF8toUTF16(storeToken));
+    NS_ENSURE_SUCCESS(rv, rv);
 
     // Let's check if the message exists.
     bool exists;
-    path->Exists(&exists);
+    rv = path->Exists(&exists);
+    NS_ENSURE_SUCCESS(rv, rv);
     if (!exists) {
       MOZ_LOG(MailDirLog, mozilla::LogLevel::Info,
               ("DeleteStoreMessages - file does not exist !!"));
       // Perhaps an offline store has not downloaded this particular message.
       continue;
     }
-    path->Remove(false);
+    rv = path->Remove(false);
+    NS_ENSURE_SUCCESS(rv, rv);
   }
   return NS_OK;
 }

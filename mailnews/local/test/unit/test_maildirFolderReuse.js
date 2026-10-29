@@ -2,6 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+const { PromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+
 let rootFolder;
 
 add_setup(function () {
@@ -575,4 +579,139 @@ add_task(async function test_deleteNonemptyTrashChildMbox() {
 });
 add_task(async function test_deleteNonemptyTrashChildMaildir() {
   await checkPermanentTrashChildDeletion("maildir");
+});
+
+/**
+ * A failed provider removal returns its first error and keeps later bodies.
+ * This tests the store-only API, not SQL/body deletion settlement.
+ */
+add_task(async function test_maildirDeleteFailureKeepsRemainingBodies() {
+  await withTrashStore("maildir", async root => {
+    const folder = root.createLocalSubfolder("provider-removal");
+    const store = folder.msgStore;
+    Assert.equal(store.storeType, "maildir");
+    const messages = [
+      "Subject: Obstructed removal\r\n\r\nFirst exact body.\r\n",
+      "Subject: Later removal\r\n\r\nLater exact body.\r\n",
+    ];
+    const tokens = [];
+    for (const message of messages) {
+      const stream = store.getNewMsgOutputStream(folder);
+      stream.write(message, message.length);
+      tokens.push(store.finishNewMessage(folder, stream));
+    }
+    const first = PathUtils.join(folder.filePath.path, "cur", tokens[0]);
+    const later = PathUtils.join(folder.filePath.path, "cur", tokens[1]);
+    const saved = PathUtils.join(folder.filePath.path, "retained-body");
+    await IOUtils.move(first, saved, { noOverwrite: true });
+    await IOUtils.makeDirectory(first);
+    const blocker = PathUtils.join(first, "owned-blocker");
+    await IOUtils.writeUTF8(blocker, "Keep this obstruction.");
+    try {
+      Assert.throws(
+        () =>
+          store.deleteStoreMessages(folder, [
+            "",
+            "absent-body",
+            tokens[0],
+            tokens[1],
+          ]),
+        error => error.result === Cr.NS_ERROR_FILE_DIR_NOT_EMPTY
+      );
+      Assert.equal(await IOUtils.readUTF8(saved), messages[0]);
+      Assert.equal(await IOUtils.readUTF8(later), messages[1]);
+      Assert.equal(await IOUtils.readUTF8(blocker), "Keep this obstruction.");
+    } finally {
+      await IOUtils.remove(blocker);
+      await IOUtils.remove(first);
+      await IOUtils.move(saved, first, { noOverwrite: true });
+    }
+    // Empty and missing tokens retain their existing successful no-op meaning.
+    store.deleteStoreMessages(folder, ["", "absent-body"]);
+    Assert.equal(await IOUtils.readUTF8(first), messages[0]);
+    Assert.equal(await IOUtils.readUTF8(later), messages[1]);
+    store.deleteStoreMessages(folder, tokens);
+    Assert.ok(!(await IOUtils.exists(first)));
+    Assert.ok(!(await IOUtils.exists(later)));
+  });
+});
+
+/**
+ * A first provider failure keeps rows and reports the actual deletion result.
+ * This does not promise rollback after successful removal or a later SQL error.
+ */
+add_task(async function test_maildirFolderDeleteFailureKeepsRows() {
+  await withTrashStore("maildir", async root => {
+    const folder = root
+      .createLocalSubfolder("checked-folder-removal")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const raw = [
+      "Subject: First retained row\r\n\r\nFirst exact row body.\r\n",
+      "Subject: Later retained row\r\n\r\nLater exact row body.\r\n",
+    ];
+    const headers = raw.map(message => folder.addMessage(message));
+    const keys = headers.map(header => header.messageKey);
+    const tokens = headers.map(header => header.storeToken);
+    const sizes = headers.map(header => header.messageSize);
+    const flags = headers.map(header => header.flags);
+    const first = PathUtils.join(folder.filePath.path, "cur", tokens[0]);
+    const later = PathUtils.join(folder.filePath.path, "cur", tokens[1]);
+    const saved = PathUtils.join(folder.filePath.path, "retained-row-body");
+    await IOUtils.move(first, saved, { noOverwrite: true });
+    await IOUtils.makeDirectory(first);
+    const blocker = PathUtils.join(first, "owned-blocker");
+    await IOUtils.writeUTF8(blocker, "Retain this child.");
+    let starts = 0;
+    const stops = [];
+    const listener = new PromiseTestUtils.PromiseCopyListener({
+      onStartCopy() {
+        starts++;
+      },
+      onStopCopy(status) {
+        stops.push(status);
+      },
+    });
+    try {
+      Assert.throws(
+        () =>
+          folder.deleteMessages(headers, null, true, false, listener, false),
+        error => error.result === Cr.NS_ERROR_FILE_DIR_NOT_EMPTY
+      );
+      await Assert.rejects(
+        listener.promise,
+        error => Number(error.message) === Cr.NS_ERROR_FILE_DIR_NOT_EMPTY
+      );
+      Assert.equal(starts, 1);
+      Assert.deepEqual(stops, [Cr.NS_ERROR_FILE_DIR_NOT_EMPTY]);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), keys);
+      Assert.equal(await IOUtils.readUTF8(saved), raw[0]);
+      Assert.equal(await IOUtils.readUTF8(later), raw[1]);
+      Assert.equal(await IOUtils.readUTF8(blocker), "Retain this child.");
+    } finally {
+      await IOUtils.remove(blocker);
+      await IOUtils.remove(first);
+      await IOUtils.move(saved, first, { noOverwrite: true });
+    }
+    for (let i = 0; i < keys.length; i++) {
+      const retained = folder.msgDatabase.getMsgHdrForKey(keys[i]);
+      Assert.equal(retained.storeToken, tokens[i]);
+      Assert.equal(retained.messageSize, sizes[i]);
+      Assert.equal(retained.flags, flags[i]);
+      Assert.equal(mailTestUtils.loadMessageToString(folder, retained), raw[i]);
+    }
+    Assert.equal(folder.getTotalMessages(false), 2);
+    const retryStops = [];
+    const retried = new PromiseTestUtils.PromiseCopyListener({
+      onStopCopy(status) {
+        retryStops.push(status);
+      },
+    });
+    folder.deleteMessages(headers, null, true, false, retried, false);
+    await retried.promise;
+    Assert.deepEqual(retryStops, [Cr.NS_OK]);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    Assert.equal(folder.getTotalMessages(false), 0);
+    Assert.ok(!(await IOUtils.exists(first)));
+    Assert.ok(!(await IOUtils.exists(later)));
+  });
 });

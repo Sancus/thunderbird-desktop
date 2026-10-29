@@ -1200,14 +1200,17 @@ nsMsgLocalMailFolder::DeleteMessages(
 
   bool isTrashFolder = mFlags & nsMsgFolderFlags::Trash;
 
+  const bool notifyDeletion = !isMove && (deleteStorage || isTrashFolder);
+  auto complete = [&](nsresult status) {
+    if (notifyDeletion && listener) listener->OnStopCopy(status);
+    return status;
+  };
+
   // notify on delete from trash and shift-delete
-  if (!isMove && (deleteStorage || isTrashFolder)) {
+  if (notifyDeletion) {
     nsCOMPtr<nsIMsgFolderNotificationService> notifier =
         mozilla::components::FolderNotification::Service();
-    if (listener) {
-      listener->OnStartCopy();
-      listener->OnStopCopy(NS_OK);
-    }
+    if (listener) listener->OnStartCopy();
     notifier->NotifyMsgsDeleted(msgHeaders);
   }
 
@@ -1244,8 +1247,11 @@ nsMsgLocalMailFolder::DeleteMessages(
         if (NS_SUCCEEDED(rv)) {
           // Second, remove the message entries from the DB.
           rv = msgStore->DeleteMessages(msgHeaders);
-          for (auto hdr : msgHeaders) {
-            rv = msgDB->DeleteHeader(hdr, nullptr, false, true);
+          if (NS_SUCCEEDED(rv)) {
+            for (auto hdr : msgHeaders) {
+              rv = msgDB->DeleteHeader(hdr, nullptr, false, true);
+              if (NS_FAILED(rv)) break;
+            }
           }
         }
       } else if (rv == NS_MSG_FOLDER_BUSY) {
@@ -1268,13 +1274,15 @@ nsMsgLocalMailFolder::DeleteMessages(
     nsCOMPtr<nsITransactionManager> txnMgr;
     nsCOMPtr<nsIMsgTransactionService> txns =
         mozilla::components::Txns::Service();
-    NS_ENSURE_STATE(txns);
+    if (!txns) {
+      return complete(NS_FAILED(rv) ? rv : NS_ERROR_UNEXPECTED);
+    }
     txns->GetTransactionManager(getter_AddRefs(txnMgr));
     if (txnMgr) {
       txnMgr->Clear();
     }
   }
-  return rv;
+  return complete(rv);
 }
 
 // Go through the given messages and tell the msgStore about their flags.
@@ -3014,6 +3022,14 @@ nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
     rv = srcFolder->DeleteMessages(mCopyState->m_messages,
                                    mCopyState->m_msgWindow, true, true, nullptr,
                                    mCopyState->m_allowUndo);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv)) {
+      if (NS_SUCCEEDED(mCopyState->m_copyError)) {
+        mCopyState->m_copyError = rv;
+      }
+      mCopyState->m_writeFailed = true;
+    }
+#endif
     AutoCompact(mCopyState->m_msgWindow);
 
     // enable the dest folder
@@ -3818,6 +3834,8 @@ nsMsgLocalMailFolder::GetUidlFromFolder(nsLocalFolderScanState* aState,
   while (len > 0) {
     rv = NS_ReadLine(aState->m_inputStream.get(), lineBuffer.get(),
                      aState->m_header, &more);
+    // A failed read cannot advance len. Stop and close the stream below.
+    if (NS_FAILED(rv)) break;
     if (NS_SUCCEEDED(rv)) {
       size = aState->m_header.Length();
       if (!size) break;

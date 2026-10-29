@@ -112,6 +112,233 @@ function assertMovedAndTagged(source, destination) {
   );
 }
 
+/**
+ * Check the active database service and the account's physical message store.
+ *
+ * @param {nsIMsgFolder} folder - A real folder created by the RSS account.
+ */
+function assertBackendAndStore(folder) {
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const isPanorama =
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore;
+  Assert.equal(
+    isPanorama,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    "The database service matches the configured backend after account setup"
+  );
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  const expectedStore = {
+    "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+    "@mozilla.org/msgstore/maildirstore;1": "maildir",
+  }[contract];
+  Assert.ok(expectedStore, "The account uses a supported physical store");
+  Assert.equal(folder.server.getStringValue("storeContractID"), contract);
+  Assert.equal(folder.msgStore.storeType, expectedStore);
+}
+
+add_task(async function test_storeFailureCompletesAndCanRetry() {
+  const account = FeedUtils.createRssAccount("store failure account");
+  const rootFolder = account.incomingServer.rootMsgFolder.QueryInterface(
+    Ci.nsIMsgLocalMailFolder
+  );
+  const folder = rootFolder.createLocalSubfolder("store failure folder");
+  assertBackendAndStore(folder);
+  Assert.ok(
+    folder.msgDatabase,
+    "The folder database is available before locking"
+  );
+  const feed = new Feed("https://example.invalid/store-failure", folder);
+  feed.parseItems = true;
+  const results = [];
+  const retryComplete = Promise.withResolvers();
+  let progress = 0;
+  feed.downloadCallback = {
+    downloaded(completedFeed, code) {
+      Assert.equal(completedFeed.url, feed.url);
+      results.push(code);
+      if (code == FeedUtils.kNewsBlogSuccess) {
+        retryComplete.resolve();
+      }
+    },
+    onFeedItemStored() {
+      progress++;
+    },
+  };
+  const makeItem = () => {
+    const item = new FeedItem();
+    item.feed = feed;
+    item.id = "store-failure-item";
+    item.title = "Store failure item";
+    item.author = ["author@example.invalid"];
+    item.content = "<p>The retried feed content.</p>";
+    item.url = "https://example.invalid/store-failure-item";
+    return item;
+  };
+  const storedItem = makeItem();
+  storedItem.id = "stored-after-failure";
+  storedItem.title = "Already stored item";
+  storedItem.url = "https://example.invalid/stored-after-failure";
+  storedItem.content = "<p>Existing physical feed message.</p>";
+  Assert.ok(storedItem.store(), "The later item is already published");
+  const storedHeader = [...folder.messages][0];
+  const storedKey = storedHeader.messageKey;
+  const storedMessageId = storedHeader.messageId;
+  const storedToken = storedHeader.storeToken;
+  const storedBody = mailTestUtils.loadMessageToString(folder, storedHeader);
+  const ds = FeedUtils.getItemsDS(account.incomingServer);
+  ds.data[storedItem.id].lastSeenTime =
+    Date.now() - FeedUtils.INVALID_ITEM_PURGE_DELAY - 1;
+  const storedResource = structuredClone(ds.data[storedItem.id]);
+  feed.invalidateItems();
+  storedResource.valid = false;
+  const failedItem = makeItem();
+  feed.itemsToStore = [failedItem, storedItem];
+  feed.itemsToStoreIndex = 0;
+  feed.itemsStored = 0;
+  const holder = Cc["@mozilla.org/supports-cstring;1"].createInstance(
+    Ci.nsISupportsCString
+  );
+  folder.acquireSemaphore(holder, "test feed storage failure");
+  try {
+    feed.storeNextItem();
+    Assert.deepEqual(results, [FeedUtils.kNewsBlogFileError]);
+    Assert.equal(progress, 0, "The failed item must not report progress");
+    Assert.equal(feed.itemsStored, 0);
+    Assert.deepEqual(feed.itemsToStore, [], "Failure clears the pending items");
+    Assert.equal(feed.storeItemsTimer, null, "No further write is scheduled");
+    Assert.equal(
+      folder.getTotalMessages(false),
+      1,
+      "The failed item does not publish a message"
+    );
+    Assert.deepEqual(
+      ds.data[storedItem.id],
+      storedResource,
+      "Failure retains the aged stored resource and its feed identity"
+    );
+    const retained = folder.GetMessageHeader(storedKey);
+    Assert.equal(retained.messageId, storedMessageId);
+    Assert.equal(retained.storeToken, storedToken);
+    Assert.equal(
+      mailTestUtils.loadMessageToString(folder, retained),
+      storedBody
+    );
+    Assert.ok(
+      !FeedUtils.getItemsDS(account.incomingServer).data[failedItem.id]?.stored,
+      "The failed item must not be marked stored"
+    );
+    Assert.ok(folder.testSemaphore(holder), "The foreign lock remains owned");
+    Assert.ok(
+      !folder.gettingNewMessages,
+      "The ingestion flag has been cleared"
+    );
+  } finally {
+    folder.releaseSemaphore(holder, "test feed storage failure");
+  }
+
+  feed.itemsToStore = [makeItem(), storedItem];
+  feed.storeNextItem();
+  await retryComplete.promise;
+  Assert.deepEqual(results, [
+    FeedUtils.kNewsBlogFileError,
+    FeedUtils.kNewsBlogSuccess,
+  ]);
+  Assert.equal(
+    progress,
+    2,
+    "Only the two successful retry items report progress"
+  );
+  Assert.equal(feed.itemsStored, 1);
+  const messages = [...folder.messages];
+  Assert.equal(
+    messages.length,
+    2,
+    "The retry publishes one additional message"
+  );
+  const retried = messages.find(header => header.messageKey != storedKey);
+  Assert.ok(retried, "The failed item receives a new physical message");
+  Assert.ok(
+    FeedUtils.getItemsDS(account.incomingServer).data[failedItem.id].stored,
+    "The successful retry records the stored item"
+  );
+  Assert.stringContains(
+    mailTestUtils.loadMessageToString(folder, retried),
+    "<p>The retried feed content.</p>"
+  );
+  Assert.ok(!storedItem.store(), "The remaining stored item is not duplicated");
+  Assert.equal(folder.getTotalMessages(false), 2);
+  Assert.equal(folder.GetMessageHeader(storedKey).storeToken, storedToken);
+  Assert.equal(
+    mailTestUtils.loadMessageToString(
+      folder,
+      folder.GetMessageHeader(storedKey)
+    ),
+    storedBody
+  );
+});
+
+add_task(function test_folderCreationFailurePreservesExistingMessages() {
+  const account = FeedUtils.createRssAccount("folder collision account");
+  const rootFolder = account.incomingServer.rootMsgFolder.QueryInterface(
+    Ci.nsIMsgLocalMailFolder
+  );
+  const feed = new Feed("https://example.invalid/folder-collision", rootFolder);
+  feed.title = "Folder collision";
+  // Another operation creates this name after the feed has chosen it.
+  const name = feed.folderName;
+  const existing = rootFolder.createLocalSubfolder(name);
+  assertBackendAndStore(existing);
+  const item = new FeedItem();
+  item.feed = new Feed("https://example.invalid/existing", existing);
+  item.id = "folder-collision-item";
+  item.title = "Existing feed item";
+  item.author = ["author@example.invalid"];
+  item.content = "<p>Existing physical feed message.</p>";
+  item.url = "https://example.invalid/folder-collision-item";
+  Assert.ok(item.store(), "The existing item is published");
+  const header = [...existing.messages][0];
+  Assert.ok(header, "The existing folder contains a stored message");
+  const uri = existing.URI;
+  const parentURI = existing.parent.URI;
+  const key = header.messageKey;
+  const messageId = header.messageId;
+  const storeToken = header.storeToken;
+  const flags = existing.flags;
+  const body = mailTestUtils.loadMessageToString(existing, header);
+
+  feed.createFolder();
+  Assert.equal(
+    feed.folder,
+    null,
+    "The failed attempt does not adopt the folder"
+  );
+  const results = [];
+  feed.itemsToStore = [];
+  feed.downloadCallback = {
+    downloaded(completedFeed, code) {
+      results.push(code);
+    },
+  };
+  feed.storeNextItem();
+  Assert.deepEqual(results, [FeedUtils.kNewsBlogFileError]);
+
+  const retained = rootFolder.getChildNamed(name);
+  Assert.equal(retained.URI, uri, "The original logical folder remains");
+  Assert.equal(retained.parent.URI, parentURI);
+  Assert.equal(retained.name, name);
+  Assert.equal(retained.flags, flags, "The folder metadata remains unchanged");
+  const messages = [...retained.messages];
+  Assert.equal(messages.length, 1, "The stored message remains");
+  Assert.equal(messages[0].messageKey, key);
+  Assert.equal(messages[0].messageId, messageId);
+  Assert.equal(messages[0].storeToken, storeToken);
+  Assert.equal(mailTestUtils.loadMessageToString(retained, messages[0]), body);
+});
+
 add_task(function test_feed_category_tag_available_to_incoming_filter() {
   const account = FeedUtils.createRssAccount("tag filter account");
   const rootFolder = account.incomingServer.rootMsgFolder.QueryInterface(

@@ -604,9 +604,6 @@ Feed.prototype = {
           " -- " +
           ex
       );
-      // But its remnants are still there, clean up.
-      const xfolder = this.server.rootMsgFolder.getChildNamed(this.folderName);
-      this.server.rootMsgFolder.propagateDelete(xfolder, true);
     }
   },
 
@@ -633,8 +630,16 @@ Feed.prototype = {
 
     const item = this.itemsToStore[this.itemsToStoreIndex];
 
-    if (item.store()) {
-      this.itemsStored++;
+    try {
+      if (item.store()) {
+        this.itemsStored++;
+      }
+    } catch (ex) {
+      lazy.FeedUtils.log.error(
+        "Feed.storeNextItem: error storing item - " + ex
+      );
+      this.cleanupParsingState(this, lazy.FeedUtils.kNewsBlogFileError);
+      return;
     }
 
     if (!this.folder) {
@@ -691,7 +696,9 @@ Feed.prototype = {
 
     if (aFeed.parseItems) {
       // Do this only if we're in parse/store mode.
-      aFeed.removeInvalidItems(false);
+      if (aCode != lazy.FeedUtils.kNewsBlogFileError) {
+        aFeed.removeInvalidItems(false);
+      }
 
       if (aCode == lazy.FeedUtils.kNewsBlogSuccess && aFeed.mLastModified) {
         aFeed.lastModified = aFeed.mLastModified;

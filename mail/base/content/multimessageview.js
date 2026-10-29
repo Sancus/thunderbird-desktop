@@ -11,16 +11,15 @@ var { MailServices } = ChromeUtils.importESModule(
 
 ChromeUtils.defineESModuleGetters(this, {
   DisplayNameUtils: "resource:///modules/DisplayNameUtils.sys.mjs",
-  Gloda: "resource:///modules/gloda/Gloda.sys.mjs",
   MailUtils: "resource:///modules/MailUtils.sys.mjs",
   MessageArchiver: "resource:///modules/MessageArchiver.sys.mjs",
-  MsgHdrToMimeMessage: "resource:///modules/gloda/MimeMessage.sys.mjs",
+  MsgHdrToMimeMessage: "resource:///modules/panorama/MimeMessage.sys.mjs",
   TagUtils: "resource:///modules/TagUtils.sys.mjs",
   UIDensity: "resource:///modules/UIDensity.sys.mjs",
   UIFontSize: "resource:///modules/UIFontSize.sys.mjs",
   makeFriendlyDateAgo: "resource:///modules/TemplateUtils.sys.mjs",
   mimeMsgToContentSnippetAndMeta:
-    "resource:///modules/gloda/GlodaContent.sys.mjs",
+    "resource:///modules/panorama/MessageContent.sys.mjs",
 });
 
 ChromeUtils.defineLazyGetter(
@@ -95,6 +94,11 @@ class LimitIterator {
 class MultiMessageSummary {
   constructor() {
     this._summarizers = {};
+    this._folderStates = new Map();
+    this._summaryNodes = new Set();
+    this._generation = 0;
+    this._nextMemberOrder = 0;
+    window.addEventListener("unload", () => this.clear(), { once: true });
   }
   /**
    * The maximum number of messages to examine in any way.
@@ -132,15 +136,24 @@ class MultiMessageSummary {
   }
 
   /**
-   * Store a mapping from a message header to the summary node in the DOM. We
-   * use this to update things when Gloda tells us to.
+   * Store the physical message identity and metadata for a summary node.
    *
    * @param {nsIMsgDBHdr} aMsgHdr - The nsIMsgDBHdr.
    * @param {Node} aNode - The related DOM node.
    */
   mapMsgToNode(aMsgHdr, aNode) {
-    const key = aMsgHdr.messageKey + aMsgHdr.folder.URI;
-    this._msgNodes[key] = aNode;
+    const folder = aMsgHdr.folder;
+    let state = this._folderStates.get(folder.URI);
+    if (!state) {
+      state = { folder, members: new Map(), database: null, listener: null };
+      this._folderStates.set(folder.URI, state);
+    }
+    state.members.set(aMsgHdr.messageKey, {
+      node: aNode,
+      order: this._nextMemberOrder++,
+      ...this._readMetadata(aMsgHdr),
+    });
+    this._summaryNodes.add(aNode);
   }
 
   /**
@@ -149,8 +162,14 @@ class MultiMessageSummary {
   clear() {
     this._selectCallback = null;
     this._listener = null;
-    this._glodaQuery = null;
-    this._msgNodes = {};
+    this._generation++;
+    this._refreshPending = false;
+    for (const state of this._folderStates.values()) {
+      this._stopListening(state);
+    }
+    this._folderStates.clear();
+    this._summaryNodes.clear();
+    this._nextMemberOrder = 0;
 
     // Clear the messages list.
     const messageList = document.getElementById("messageList");
@@ -264,14 +283,26 @@ class MultiMessageSummary {
     }
 
     const messages = new LimitIterator(aMessages, this.kMaxMessages);
-    const summarizedMessages = summarizer.summarize(messages, aDBView);
+    summarizer.summarize(messages, aDBView);
 
-    // Stash somewhere so it doesn't get GC'ed.
-    this._glodaQuery = Gloda.getMessageCollectionForHeaders(
-      summarizedMessages,
-      this
-    );
-    this._computeSize(messages);
+    try {
+      for (const state of this._folderStates.values()) {
+        this._startListening(state);
+      }
+      this._computeSize(messages);
+    } catch (error) {
+      this.clear();
+      throw error;
+    }
+
+    const generation = this._generation;
+    queueMicrotask(() => {
+      if (generation == this._generation && this._listener) {
+        const listener = this._listener;
+        this._listener = null;
+        listener.onLoadCompleted();
+      }
+    });
   }
 
   /**
@@ -305,10 +336,10 @@ class MultiMessageSummary {
     const isStarred = messages.some(message => message.isFlagged);
 
     const unreadCount = messages.filter(message => !message.isRead).length;
-    const tags = new Set();
+    const tags = new Map();
     for (const message of messages) {
       for (const tag of this._getTagsForMsg(message)) {
-        tags.add(tag);
+        tags.set(tag.key, tag);
       }
     }
 
@@ -332,7 +363,7 @@ class MultiMessageSummary {
       subjectNode.textContent =
         firstMessage.mime2DecodedSubject || l10n.formatValueSync("no-subject");
       subjectNode.addEventListener("click", () =>
-        this._selectCallback(messages)
+        this._selectSummaryItem(listItem)
       );
 
       if (messages?.length > 1) {
@@ -351,25 +382,27 @@ class MultiMessageSummary {
         new Date(firstMessage.date / 1000)
       );
       author.addEventListener("click", () => {
-        this._selectCallback(messages);
+        this._selectSummaryItem(listItem);
       });
     }
 
-    this._addTagNodes(tags, listItem.querySelector(".tags"));
+    this._addTagNodes(tags.values(), listItem.querySelector(".tags"));
 
     const snippetNode = listItem.querySelector(".snippet");
+    const generation = this._generation;
+    const folder = firstMessage.folder;
     try {
       MsgHdrToMimeMessage(
         firstMessage,
         null,
-        function (messageHeader, mimeMessage) {
-          if (mimeMessage == null) {
+        (messageHeader, mimeMessage) => {
+          if (generation != this._generation || mimeMessage == null) {
             // Shouldn't happen, but sometimes does?
             return;
           }
           const [text, meta] = mimeMsgToContentSnippetAndMeta(
             mimeMessage,
-            messageHeader.folder,
+            folder,
             options.snippetLength
           );
           snippetNode.textContent = text;
@@ -488,77 +521,174 @@ class MultiMessageSummary {
     flagButton.setAttribute("aria-pressed", allFlagged);
   }
 
-  // These are listeners for the gloda collections.
-  onItemsAdded() {}
-  onItemsModified(aItems) {
-    this._processItems(aItems);
+  /**
+   * Select surviving members using their original physical folder and key.
+   *
+   * @param {HTMLLIElement} node - The clicked summary row.
+   */
+  _selectSummaryItem(node) {
+    const messages = [];
+    for (const state of this._folderStates.values()) {
+      let database;
+      for (const [key, member] of state.members) {
+        if (member.node != node) {
+          continue;
+        }
+        database ??= state.folder.msgDatabase;
+        if (database.containsKey(key)) {
+          messages.push({
+            order: member.order,
+            header: database.getMsgHdrForKey(key),
+          });
+        }
+      }
+    }
+    if (messages.length) {
+      messages.sort((left, right) => left.order - right.order);
+      this._selectCallback?.(messages.map(member => member.header));
+    }
   }
-  onItemsRemoved() {}
 
   /**
-   * Given a set of items from a gloda collection, process them and update
-   * the display accordingly.
+   * Read current metadata for one selected physical message.
    *
-   * @param {GlodaMessage[]} aItems - Contents of a gloda collection.
+   * @param {nsIMsgDBHdr} header - The current stored header.
+   * @returns {object} Read, flagged and tag state.
    */
-  _processItems(aItems) {
-    const knownMessageNodes = new Map();
-
-    for (const glodaMsg of aItems) {
-      // Unread and starred will get set if any of the messages in a collapsed
-      // thread qualify.  The trick here is that we may get multiple items
-      // corresponding to the same thread (and hence DOM node), so we need to
-      // detect when we get the first item for a particular DOM node, stash the
-      // preexisting status of that DOM node, an only do transitions if the
-      // items warrant it.
-      const key = glodaMsg.messageKey + glodaMsg.folder.uri;
-      const headerNode = this._msgNodes[key];
-      if (!headerNode) {
-        continue;
-      }
-      if (!knownMessageNodes.has(headerNode)) {
-        knownMessageNodes.set(headerNode, {
-          read: true,
-          starred: false,
-          tags: new Set(),
-        });
-      }
-
-      const flags = knownMessageNodes.get(headerNode);
-
-      // Count as read if *all* the messages are read.
-      flags.read &= glodaMsg.read;
-      // Count as starred if *any* of the messages are starred.
-      flags.starred |= glodaMsg.starred;
-      // Count as tagged with a tag if *any* of the messages have that tag.
-      for (const tag of this._getTagsForMsg(glodaMsg.folderMessage)) {
-        flags.tags.add(tag);
-      }
-    }
-
-    for (const [headerNode, flags] of knownMessageNodes) {
-      headerNode.classList.toggle("unread", !flags.read);
-      headerNode.classList.toggle("starred", flags.starred);
-
-      // Clear out all the tags and start fresh, just to make sure we don't get
-      // out of sync.
-      const tagsNode = headerNode.querySelector(".tags");
-      tagsNode.replaceChildren();
-
-      this._addTagNodes(flags.tags, tagsNode);
-    }
-
-    this.toggleFlaggedButton(
-      Array.from(knownMessageNodes.values()).every(value => value.starred)
-    );
+  _readMetadata(header) {
+    return {
+      read: header.isRead,
+      flagged: header.isFlagged,
+      tags: this._getTagsForMsg(header),
+    };
   }
 
-  onQueryCompleted() {
-    // If we need something that's just available from GlodaMessages, this is
-    // where we'll get it initially.
-    if (this._listener) {
-      this._listener.onLoadCompleted();
+  /**
+   * Subscribe to metadata changes in one selected physical folder.
+   *
+   * @param {object} state - The folder and its selected members.
+   */
+  _startListening(state) {
+    const generation = this._generation;
+    const contains = header =>
+      generation == this._generation &&
+      header.folder.URI == state.folder.URI &&
+      state.members.has(header.messageKey);
+    state.listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged: header => {
+        if (contains(header)) {
+          this._queueRefresh();
+        }
+      },
+      onHdrPropertyChanged: (header, property, preChange) => {
+        if (!preChange && property == "keywords" && contains(header)) {
+          this._queueRefresh();
+        }
+      },
+      onHdrDeleted: header => {
+        if (contains(header)) {
+          state.members.delete(header.messageKey);
+          this._queueRefresh();
+        }
+      },
+      onAnnouncerGoingAway: () => this._stopListening(state),
+      onHdrAdded() {},
+      onParentChanged() {},
+      onReadChanged() {},
+      onJunkScoreChanged() {},
+      onEvent() {},
+    };
+    state.database = state.folder.msgDatabase;
+    state.database.addListener(state.listener);
+  }
+
+  /**
+   * Release a database subscription without reopening the folder.
+   *
+   * @param {object} state - The subscribed folder state.
+   */
+  _stopListening(state) {
+    if (state.database) {
+      state.database.removeListener(state.listener);
+      state.database = null;
+      state.listener = null;
     }
+  }
+
+  /**
+   * Refresh current metadata after the database finishes notifying listeners.
+   */
+  _queueRefresh() {
+    if (this._refreshPending) {
+      return;
+    }
+    this._refreshPending = true;
+    const generation = this._generation;
+    queueMicrotask(() => {
+      if (generation == this._generation) {
+        this._refreshPending = false;
+        this._refreshMetadata();
+      }
+    });
+  }
+
+  /**
+   * Recompute each row from all surviving members, including unchanged ones.
+   * Keep the existing rows, snippets and selection callbacks.
+   */
+  _refreshMetadata() {
+    const nodes = new Map(
+      [...this._summaryNodes].map(node => [
+        node,
+        { unread: 0, starred: false, tags: new Map(), count: 0 },
+      ])
+    );
+    let allFlagged = true;
+    let count = 0;
+    for (const state of this._folderStates.values()) {
+      for (const [key, member] of state.members) {
+        if (state.database) {
+          if (!state.database.containsKey(key)) {
+            state.members.delete(key);
+            continue;
+          }
+          Object.assign(
+            member,
+            this._readMetadata(state.database.getMsgHdrForKey(key))
+          );
+        }
+        const flags = nodes.get(member.node);
+        flags.count++;
+        flags.unread += !member.read;
+        flags.starred ||= member.flagged;
+        for (const tag of member.tags) {
+          flags.tags.set(tag.key, tag);
+        }
+        allFlagged &&= member.flagged;
+        count++;
+      }
+    }
+
+    for (const [node, flags] of nodes) {
+      node.classList.toggle("unread", flags.unread > 0);
+      node.classList.toggle("starred", flags.starred);
+      const tagsNode = node.querySelector(".tags");
+      tagsNode.replaceChildren();
+      this._addTagNodes(flags.tags.values(), tagsNode);
+      const countNode = node.querySelector(".count");
+      if (countNode) {
+        let text = "";
+        if (flags.count > 1) {
+          text = l10n.formatValueSync("num-messages", { count: flags.count });
+          if (flags.unread) {
+            text += l10n.formatValueSync("num-unread", { count: flags.unread });
+          }
+        }
+        countNode.textContent = text;
+      }
+    }
+    this.toggleFlaggedButton(count > 0 && allFlagged);
   }
 }
 
@@ -572,7 +702,7 @@ class ThreadSummarizer {
   kMaxSummarizedMessages = 100;
 
   /**
-   * The length of message snippets to fetch from Gloda.
+   * The length of message snippets.
    */
   kSnippetLength = 300;
 
@@ -676,7 +806,7 @@ class MultipleSelectionSummarizer {
   kMaxSummarizedThreads = 100;
 
   /**
-   * The length of message snippets to fetch from Gloda.
+   * The length of message snippets.
    */
   kSnippetLength = 300;
 

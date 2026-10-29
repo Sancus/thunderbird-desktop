@@ -102,6 +102,14 @@ tags = [
 
 ["test_nsLDAPURL.js"]
 
+["test_panoramaMigrationImport.js"]
+run-if = ["nightly_build"]
+# Windows migration path admission remains held.
+skip-if = ["os == 'win'"]
+support-files = [
+  "../../../../mail/components/addrbook/test/browser/data/import.mab",
+]
+
 ["test_photoURL.js"]
 
 ["test_preferDisplayName.js"]

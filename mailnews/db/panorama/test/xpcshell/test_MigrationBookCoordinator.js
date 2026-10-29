@@ -27,7 +27,7 @@ const { resumeMorkBookImports } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
 );
 const MAB_FILE = "import.mab";
-const unixOnly = { skip_if: () => AppConstants.platform == "win" };
+const unixOnly = () => ({ skip_if: () => AppConstants.platform == "win" });
 let home;
 let profiles;
 let serial = 0;
@@ -153,7 +153,7 @@ async function assertOriginals(input) {
   Assert.deepEqual(await verifyMigrationBackup(input.backupPath), input.backup);
 }
 
-add_task(unixOnly, async function test_bookCheckpointAndExactSourceMaps() {
+add_task(unixOnly(), async function test_bookCheckpointAndExactSourceMaps() {
   const input = await bookInput();
   Assert.equal(input.journal.state.version, 2);
   await resumeMorkBookImports(input.journal, input.lock);
@@ -232,7 +232,7 @@ add_task(unixOnly, async function test_bookCheckpointAndExactSourceMaps() {
 });
 
 add_task(
-  unixOnly,
+  unixOnly(),
   async function test_reconcileStorageCommitBeforeJournalCheckpoint() {
     const input = await bookInput();
     const token = await input.journal.beginBookImport("original-book");
@@ -262,7 +262,7 @@ add_task(
 );
 
 add_task(
-  unixOnly,
+  unixOnly(),
   async function test_failedCheckpointRetainsCommittedBookForRetry() {
     const input = await bookInput();
     const record = input.journal.recordBookImport.bind(input.journal);
@@ -318,31 +318,34 @@ add_task(
   }
 );
 
-add_task(unixOnly, async function test_cancellationSettlesCommittedBookFirst() {
-  const input = await bookInput();
-  const controller = new AbortController();
-  const record = input.journal.recordBookImport.bind(input.journal);
-  input.journal.recordBookImport = (id, receipt) => {
-    controller.abort();
-    return record(id, receipt);
-  };
-  await Assert.rejects(
-    resumeMorkBookImports(input.journal, input.lock, controller.signal),
-    error => error.name == "AbortError"
-  );
-  Assert.equal(input.journal.state.cancelled, true);
-  Assert.equal(input.journal.state.stage, "import");
-  Assert.equal(input.journal.state.books[0].state, "imported");
-  const receipt = input.journal.state.books[0].receipt;
-  input.journal.recordBookImport = record;
-  await input.journal.setCancelled(false);
-  await resumeMorkBookImports(input.journal, input.lock);
-  Assert.deepEqual(input.journal.state.books[0].receipt, receipt);
-  Assert.equal(input.journal.state.stage, "validate");
-  await assertOriginals(input);
-});
+add_task(
+  unixOnly(),
+  async function test_cancellationSettlesCommittedBookFirst() {
+    const input = await bookInput();
+    const controller = new AbortController();
+    const record = input.journal.recordBookImport.bind(input.journal);
+    input.journal.recordBookImport = (id, receipt) => {
+      controller.abort();
+      return record(id, receipt);
+    };
+    await Assert.rejects(
+      resumeMorkBookImports(input.journal, input.lock, controller.signal),
+      error => error.name == "AbortError"
+    );
+    Assert.equal(input.journal.state.cancelled, true);
+    Assert.equal(input.journal.state.stage, "import");
+    Assert.equal(input.journal.state.books[0].state, "imported");
+    const receipt = input.journal.state.books[0].receipt;
+    input.journal.recordBookImport = record;
+    await input.journal.setCancelled(false);
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.deepEqual(input.journal.state.books[0].receipt, receipt);
+    Assert.equal(input.journal.state.stage, "validate");
+    await assertOriginals(input);
+  }
+);
 
-add_task(unixOnly, async function test_changedBookRejectsBeforeStaging() {
+add_task(unixOnly(), async function test_changedBookRejectsBeforeStaging() {
   const input = await bookInput();
   await IOUtils.write(input.source, new Uint8Array([...input.bytes, 10]));
   await Assert.rejects(
@@ -356,7 +359,7 @@ add_task(unixOnly, async function test_changedBookRejectsBeforeStaging() {
   await assertOriginals(input);
 });
 
-add_task(unixOnly, async function test_lostCommittedStageIsNotRecreated() {
+add_task(unixOnly(), async function test_lostCommittedStageIsNotRecreated() {
   const input = await bookInput();
   await resumeMorkBookImports(input.journal, input.lock);
   const receipt = input.journal.state.books[0].receipt;
@@ -372,7 +375,7 @@ add_task(unixOnly, async function test_lostCommittedStageIsNotRecreated() {
   await assertOriginals(input);
 });
 
-add_task(unixOnly, async function test_wrongHeldProfileRejectsBeforeIntent() {
+add_task(unixOnly(), async function test_wrongHeldProfileRejectsBeforeIntent() {
   const input = await bookInput();
   const other = await bookInput();
   const before = await IOUtils.read(input.path);
@@ -398,29 +401,32 @@ add_task(
   }
 );
 
-add_task(unixOnly, async function test_bookCompletionDoesNotSkipPendingMail() {
-  const input = await bookInput(true);
-  const mail = input.journal.state.sources[0];
-  await resumeMorkBookImports(input.journal, input.lock);
-  Assert.equal(input.journal.state.books[0].state, "imported");
-  Assert.equal(input.journal.state.stage, "import");
-  Assert.deepEqual(input.journal.state.sources[0], mail);
-  await Assert.rejects(
-    input.journal.finishStage("import"),
-    /imports are incomplete/
-  );
-  input.journal.close();
-  input.journal = await MigrationJournal.open(input.path, input.profilePath);
-  Assert.deepEqual(
-    input.journal.state.sources[0],
-    mail,
-    "Version1 mail fields survive a version2 restart"
-  );
-  await assertOriginals(input);
-});
+add_task(
+  unixOnly(),
+  async function test_bookCompletionDoesNotSkipPendingMail() {
+    const input = await bookInput(true);
+    const mail = input.journal.state.sources[0];
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.equal(input.journal.state.books[0].state, "imported");
+    Assert.equal(input.journal.state.stage, "import");
+    Assert.deepEqual(input.journal.state.sources[0], mail);
+    await Assert.rejects(
+      input.journal.finishStage("import"),
+      /imports are incomplete/
+    );
+    input.journal.close();
+    input.journal = await MigrationJournal.open(input.path, input.profilePath);
+    Assert.deepEqual(
+      input.journal.state.sources[0],
+      mail,
+      "Version1 mail fields survive a version2 restart"
+    );
+    await assertOriginals(input);
+  }
+);
 
 add_task(
-  unixOnly,
+  unixOnly(),
   async function test_bookReceiptCannotSwapSourceOrScopedMaps() {
     const input = await bookInput();
     await resumeMorkBookImports(input.journal, input.lock);
@@ -453,7 +459,7 @@ add_task(
 );
 
 add_task(
-  unixOnly,
+  unixOnly(),
   async function test_lostCommittedReceiptDoesNotReimportEmptyStage() {
     const input = await bookInput();
     await resumeMorkBookImports(input.journal, input.lock);

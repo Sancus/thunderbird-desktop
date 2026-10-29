@@ -3,12 +3,21 @@
  * file, you can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { AddrBookDirectory } from "resource:///modules/AddrBookDirectory.sys.mjs";
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
 import { AsyncShutdown } from "resource://gre/modules/AsyncShutdown.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
+  admitWindowsMigrationPath:
+    "resource:///modules/panorama/MigrationSource.sys.mjs",
+  migrationPhysicalIdentity:
+    "resource:///modules/panorama/MigrationSource.sys.mjs",
+  AddrBookCard: "resource:///modules/AddrBookCard.sys.mjs",
   FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
   newUID: "resource:///modules/AddrBookUtils.sys.mjs",
+  parseMorkAddressBook:
+    "resource:///modules/panorama/MorkAddressBookReader.sys.mjs",
 });
 
 var log = console.createInstance({
@@ -25,65 +34,91 @@ var directories = new Map();
 var connections = new Map();
 
 /**
+ * Bind text for a matching CAST(:parameter AS TEXT) without SQLite consuming a
+ * leading BOM through its UTF-16 binding. Empty text uses the ordinary binder
+ * because an empty blob binds as NULL. Other value types keep their binding.
+ *
+ * @param {mozIStorageBindingParams} params - Statement or parameter set.
+ * @param {string} name - Declared parameter name.
+ * @param {unknown} value - Value to bind.
+ */
+function bindValue(params, name, value) {
+  if (typeof value == "string" && value.length) {
+    params.bindUTF8StringAsBlobByName(name, value);
+  } else {
+    params.bindByName(name, value);
+  }
+}
+
+/**
  * Opens an SQLite connection to `file`, caches the connection, and upgrades
  * the database schema if necessary.
  */
 function openConnectionTo(file) {
-  const CURRENT_VERSION = 4;
-
   let connection = connections.get(file.path);
   if (!connection) {
     connection = Services.storage.openDatabase(file);
-    const fileVersion = connection.schemaVersion;
-
-    // If we're upgrading the version, first create a backup.
-    if (fileVersion > 0 && fileVersion < CURRENT_VERSION) {
-      const backupFile = file.clone();
-      backupFile.leafName = backupFile.leafName.replace(
-        /\.sqlite$/,
-        `.v${fileVersion}.sqlite`
-      );
-      backupFile.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
-
-      log.warn(`Backing up ${file.leafName} to ${backupFile.leafName}`);
-      file.copyTo(null, backupFile.leafName);
-    }
-
-    switch (fileVersion) {
-      case 0:
-        connection.executeSimpleSQL("PRAGMA journal_mode=WAL");
-        connection.executeSimpleSQL(
-          "CREATE TABLE properties (card TEXT, name TEXT, value TEXT)"
-        );
-        connection.executeSimpleSQL(
-          "CREATE TABLE lists (uid TEXT PRIMARY KEY, name TEXT, nickName TEXT, description TEXT)"
-        );
-        connection.executeSimpleSQL(
-          "CREATE TABLE list_cards (list TEXT, card TEXT, PRIMARY KEY(list, card))"
-        );
-      // Falls through.
-      case 1:
-        connection.executeSimpleSQL(
-          "CREATE INDEX properties_card ON properties(card)"
-        );
-        connection.executeSimpleSQL(
-          "CREATE INDEX properties_name ON properties(name)"
-        );
-      // Falls through.
-      case 2:
-        connection.executeSimpleSQL("DROP TABLE IF EXISTS cards");
-      // The lists table may have a localId column we no longer use, but
-      // since SQLite can't drop columns it's not worth effort to remove it.
-      // Falls through.
-      case 3:
-        // This version exists only to create an automatic backup before cards
-        // are transitioned to vCard.
-        connection.schemaVersion = CURRENT_VERSION;
-        break;
-    }
+    initializeConnection(connection, file);
     connections.set(file.path, connection);
   }
   return connection;
+}
+
+/**
+ * Initializes the normal address-book schema without registering a directory.
+ *
+ * @param {mozIStorageConnection} connection - Open database.
+ * @param {nsIFile} file - File used for existing upgrade backups.
+ */
+function initializeConnection(connection, file) {
+  const CURRENT_VERSION = 4;
+  const fileVersion = connection.schemaVersion;
+
+  // If we're upgrading the version, first create a backup.
+  if (fileVersion > 0 && fileVersion < CURRENT_VERSION) {
+    const backupFile = file.clone();
+    backupFile.leafName = backupFile.leafName.replace(
+      /\.sqlite$/,
+      `.v${fileVersion}.sqlite`
+    );
+    backupFile.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
+
+    log.warn(`Backing up ${file.leafName} to ${backupFile.leafName}`);
+    file.copyTo(null, backupFile.leafName);
+  }
+
+  switch (fileVersion) {
+    case 0:
+      connection.executeSimpleSQL("PRAGMA journal_mode=WAL");
+      connection.executeSimpleSQL(
+        "CREATE TABLE properties (card TEXT, name TEXT, value TEXT)"
+      );
+      connection.executeSimpleSQL(
+        "CREATE TABLE lists (uid TEXT PRIMARY KEY, name TEXT, nickName TEXT, description TEXT)"
+      );
+      connection.executeSimpleSQL(
+        "CREATE TABLE list_cards (list TEXT, card TEXT, PRIMARY KEY(list, card))"
+      );
+    // Falls through.
+    case 1:
+      connection.executeSimpleSQL(
+        "CREATE INDEX properties_card ON properties(card)"
+      );
+      connection.executeSimpleSQL(
+        "CREATE INDEX properties_name ON properties(name)"
+      );
+    // Falls through.
+    case 2:
+      connection.executeSimpleSQL("DROP TABLE IF EXISTS cards");
+    // The lists table may have a localId column we no longer use, but
+    // since SQLite can't drop columns it's not worth effort to remove it.
+    // Falls through.
+    case 3:
+      // This version exists only to create an automatic backup before cards
+      // are transitioned to vCard.
+      connection.schemaVersion = CURRENT_VERSION;
+      break;
+  }
 }
 
 /**
@@ -262,9 +297,9 @@ export class SQLiteDirectory extends AddrBookDirectory {
     }
     const properties = new Map();
     const propertyStatement = this._dbConnection.createStatement(
-      "SELECT name, value FROM properties WHERE card = :card"
+      "SELECT name, value FROM properties WHERE card = CAST(:card AS TEXT)"
     );
-    propertyStatement.params.card = uid;
+    bindValue(propertyStatement, "card", uid);
     while (propertyStatement.executeStep()) {
       properties.set(propertyStatement.row.name, propertyStatement.row.value);
     }
@@ -275,19 +310,19 @@ export class SQLiteDirectory extends AddrBookDirectory {
     try {
       this._dbConnection.beginTransaction();
       const deleteStatement = this._dbConnection.createStatement(
-        "DELETE FROM properties WHERE card = :card"
+        "DELETE FROM properties WHERE card = CAST(:card AS TEXT)"
       );
-      deleteStatement.params.card = uid;
+      bindValue(deleteStatement, "card", uid);
       deleteStatement.execute();
       const insertStatement = this._dbConnection.createStatement(
-        "INSERT INTO properties VALUES (:card, :name, :value)"
+        "INSERT INTO properties VALUES (CAST(:card AS TEXT), CAST(:name AS TEXT), CAST(:value AS TEXT))"
       );
 
       for (const [name, value] of properties) {
         if (value !== null && value !== undefined && value !== "") {
-          insertStatement.params.card = uid;
-          insertStatement.params.name = name;
-          insertStatement.params.value = value;
+          bindValue(insertStatement, "card", uid);
+          bindValue(insertStatement, "name", name);
+          bindValue(insertStatement, "value", value);
           insertStatement.execute();
           insertStatement.reset();
         }
@@ -303,9 +338,9 @@ export class SQLiteDirectory extends AddrBookDirectory {
   }
   deleteCard(uid) {
     const deleteStatement = this._dbConnection.createStatement(
-      "DELETE FROM properties WHERE card = :cardUID"
+      "DELETE FROM properties WHERE card = CAST(:cardUID AS TEXT)"
     );
-    deleteStatement.params.cardUID = uid;
+    bindValue(deleteStatement, "cardUID", uid);
     deleteStatement.execute();
     deleteStatement.finalize();
   }
@@ -315,12 +350,12 @@ export class SQLiteDirectory extends AddrBookDirectory {
 
     const replaceStatement = this._dbConnection.createStatement(
       "REPLACE INTO lists (uid, name, nickName, description) " +
-        "VALUES (:uid, :name, :nickName, :description)"
+        "VALUES (CAST(:uid AS TEXT), CAST(:name AS TEXT), CAST(:nickName AS TEXT), CAST(:description AS TEXT))"
     );
-    replaceStatement.params.uid = list._uid;
-    replaceStatement.params.name = list._name;
-    replaceStatement.params.nickName = list._nickName;
-    replaceStatement.params.description = list._description;
+    bindValue(replaceStatement, "uid", list._uid);
+    bindValue(replaceStatement, "name", list._name);
+    bindValue(replaceStatement, "nickName", list._nickName);
+    bindValue(replaceStatement, "description", list._description);
     replaceStatement.execute();
     replaceStatement.finalize();
 
@@ -333,9 +368,9 @@ export class SQLiteDirectory extends AddrBookDirectory {
   }
   deleteList(uid) {
     const deleteListStatement = this._dbConnection.createStatement(
-      "DELETE FROM lists WHERE uid = :uid"
+      "DELETE FROM lists WHERE uid = CAST(:uid AS TEXT)"
     );
-    deleteListStatement.params.uid = uid;
+    bindValue(deleteListStatement, "uid", uid);
     deleteListStatement.execute();
     deleteListStatement.finalize();
 
@@ -376,7 +411,7 @@ export class SQLiteDirectory extends AddrBookDirectory {
 
     const usedUIDs = new Set(this.cards.keys());
     const propertiesStatement = this._dbConnection.createStatement(
-      "INSERT INTO properties VALUES (:card, :name, :value)"
+      "INSERT INTO properties VALUES (CAST(:card AS TEXT), CAST(:name AS TEXT), CAST(:value AS TEXT))"
     );
     const propertiesArray = propertiesStatement.newBindingParamsArray();
     for (const card of cards) {
@@ -396,9 +431,9 @@ export class SQLiteDirectory extends AddrBookDirectory {
 
       for (const [name, value] of this.prepareToSaveCard(card)) {
         const propertiesParams = propertiesArray.newBindingParams();
-        propertiesParams.bindByName("card", uid);
-        propertiesParams.bindByName("name", name);
-        propertiesParams.bindByName("value", value);
+        bindValue(propertiesParams, "card", uid);
+        bindValue(propertiesParams, "name", name);
+        bindValue(propertiesParams, "value", value);
         propertiesArray.addParams(propertiesParams);
 
         if (cachedCard) {
@@ -450,11 +485,11 @@ export class SQLiteDirectory extends AddrBookDirectory {
   }
   getCardFromProperty(property, value, caseSensitive) {
     const sql = caseSensitive
-      ? "SELECT card FROM properties WHERE name = :name AND value = :value LIMIT 1"
-      : "SELECT card FROM properties WHERE name = :name AND LOWER(value) = LOWER(:value) LIMIT 1";
+      ? "SELECT card FROM properties WHERE name = CAST(:name AS TEXT) AND value = CAST(:value AS TEXT) LIMIT 1"
+      : "SELECT card FROM properties WHERE name = CAST(:name AS TEXT) AND LOWER(value) = LOWER(CAST(:value AS TEXT)) LIMIT 1";
     const selectStatement = this._dbConnection.createStatement(sql);
-    selectStatement.params.name = property;
-    selectStatement.params.value = value;
+    bindValue(selectStatement, "name", property);
+    bindValue(selectStatement, "value", value);
     let result = null;
     if (selectStatement.executeStep()) {
       result = this.getCard(selectStatement.row.card);
@@ -464,17 +499,372 @@ export class SQLiteDirectory extends AddrBookDirectory {
   }
   getCardsFromProperty(property, value, caseSensitive) {
     const sql = caseSensitive
-      ? "SELECT card FROM properties WHERE name = :name AND value = :value"
-      : "SELECT card FROM properties WHERE name = :name AND LOWER(value) = LOWER(:value)";
+      ? "SELECT card FROM properties WHERE name = CAST(:name AS TEXT) AND value = CAST(:value AS TEXT)"
+      : "SELECT card FROM properties WHERE name = CAST(:name AS TEXT) AND LOWER(value) = LOWER(CAST(:value AS TEXT))";
     const selectStatement = this._dbConnection.createStatement(sql);
-    selectStatement.params.name = property;
-    selectStatement.params.value = value;
+    bindValue(selectStatement, "name", property);
+    bindValue(selectStatement, "value", value);
     const results = [];
     while (selectStatement.executeStep()) {
       results.push(this.getCard(selectStatement.row.card));
     }
     selectStatement.finalize();
     return results;
+  }
+
+  /**
+   * Creates a fresh, unregistered normal-schema file without address-book prefs.
+   * Requires a caller-owned staging parent. Never overwrites an existing file;
+   * retains failed initialization artifacts. The caller must close the returned
+   * connection. This is storage preparation, not profile path admission/startup.
+   *
+   * @param {nsIFile} file - Fresh staging file beneath an existing private parent.
+   * @returns {mozIStorageConnection} Uncached, caller-owned schema-4 connection.
+   * @throws {Error} On an existing/unsafe path, missing parent or storage failure.
+   */
+  static createMigrationStage(file) {
+    const target = file.clone();
+    const future =
+      AppConstants.platform == "win"
+        ? lazy.admitWindowsMigrationPath(
+            target,
+            Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING
+          )
+        : null;
+    let lease;
+    let db;
+    try {
+      if (future?.exists) {
+        throw Components.Exception(
+          "Book stage already exists",
+          Cr.NS_ERROR_FILE_ALREADY_EXISTS
+        );
+      }
+      target.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600, true);
+      lease =
+        AppConstants.platform == "win"
+          ? lazy.admitWindowsMigrationPath(
+              target,
+              Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING
+            )
+          : null;
+      db = Services.storage.openUnsharedDatabase(target);
+      initializeConnection(db, target);
+      if (lease) {
+        lazy.migrationPhysicalIdentity(lease);
+      }
+      return db;
+    } catch (error) {
+      try {
+        db?.close();
+      } catch (closeError) {
+        console.error("Could not close failed book stage", closeError);
+      }
+      throw error;
+    } finally {
+      lease?.close();
+      future?.close();
+    }
+  }
+
+  /**
+   * Imports one complete legacy book into an unregistered, empty schema-4 stage.
+   * The caller owns the connection, backup, profile lock and writer quiescence.
+   * Keeps original bytes and exact active card/list/data cells separately from
+   * normal vCard/list projections. Commits those rows, UID maps and the receipt
+   * together. Attempts rollback on failure; retains the stage for receipt-based
+   * retry. An identical completed repeat returns its original maps without
+   * writes or notifications.
+   * Never publishes a book or authorizes activation. Live-book notification and
+   * platform path admission remain caller prerequisites, not completion evidence.
+   *
+   * @param {mozIStorageConnection} connection - Dedicated createMigrationStage
+   *   connection, or its reopened normal schema-4 file. No SQLiteDirectory may
+   *   have this file open. The caller retains ownership.
+   * @param {Uint8Array} bytes - Complete read-only legacy snapshot.
+   * @param {string} sourceId - Stable source-unit identity retained on retries.
+   * @returns {{sourceId: string, sourceSha256: string, sourceSize: number,
+   *   cards: [number, string][], lists: [number, string][]}} Committed source and
+   *   scoped original-key/UID maps. On Windows, also includes versioned
+   *   stagePhysicalIdentity (id and parentId), checked on every reopen.
+   * @throws {Error} For incompatible/nonempty targets, changed repeats, unsupported
+   *   data, foreign transactions or storage failure. No source files are touched.
+   */
+  static importMorkSnapshot(connection, bytes, sourceId) {
+    const db = connection.QueryInterface(Ci.mozIStorageConnection);
+    if (db.transactionInProgress) {
+      throw Components.Exception(
+        "Book import requires its own transaction",
+        Cr.NS_ERROR_IN_PROGRESS
+      );
+    }
+    if (
+      !db.databaseFile ||
+      db.schemaVersion != 4 ||
+      typeof sourceId != "string" ||
+      !sourceId
+    ) {
+      throw new Error(
+        "Expected a dedicated schema-4 stage and source identity"
+      );
+    }
+    const file = db.databaseFile.clone();
+    const lease =
+      AppConstants.platform == "win"
+        ? lazy.admitWindowsMigrationPath(
+            file,
+            Ci.nsIPanoramaMigrationFileSystem.KIND_FILE_OR_MISSING
+          )
+        : null;
+    try {
+      const physical = lease ? lazy.migrationPhysicalIdentity(lease) : null;
+      if (file.isSymlink()) {
+        throw new Error("Book import stage is a linked file");
+      }
+      if (lease) {
+        file.initWithPath(lease.canonicalPath);
+      } else {
+        file.normalize();
+      }
+      for (const path of connections.keys()) {
+        const active = new lazy.FileUtils.File(path);
+        active.normalize();
+        if (active.equals(file)) {
+          throw new Error("Book import stage is open in SQLiteDirectory");
+        }
+      }
+      if (
+        !ArrayBuffer.isView(bytes) ||
+        Object.prototype.toString.call(bytes) != "[object Uint8Array]" ||
+        bytes.length > 64 * 1024 * 1024
+      ) {
+        throw new TypeError("Expected a bounded Uint8Array book snapshot");
+      }
+      const original = Uint8Array.from(bytes);
+      const book = lazy.parseMorkAddressBook(original);
+      const sha256 = migrationHash(original);
+      if (!physical && db.tableExists("migration_file_identity")) {
+        throw new Error(
+          "Book stage requires its original Windows physical identity"
+        );
+      }
+      const tables = [
+        ...(physical ? ["migration_file_identity"] : []),
+        "migration_source",
+        "migration_records",
+        "migration_properties",
+      ];
+      if (tables.some(name => db.tableExists(name))) {
+        if (!tables.every(name => db.tableExists(name))) {
+          throw new Error("Incomplete book import provenance");
+        }
+        return migrationReceipt(db, sourceId, sha256, original, book, physical);
+      }
+      const count = db.createStatement(
+        "SELECT (SELECT COUNT(*) FROM properties) + (SELECT COUNT(*) FROM lists) + (SELECT COUNT(*) FROM list_cards) AS total"
+      );
+      try {
+        count.executeStep();
+        if (count.row.total) {
+          throw new Error("Book import stage is not empty");
+        }
+      } finally {
+        count.finalize();
+      }
+      const records = [];
+      const cardUIDs = new Map();
+      const uids = new Set();
+      const allocate = properties => {
+        const uid = properties.get("UID") || lazy.newUID();
+        if (uid.includes("\0") || uid.includes("/") || uids.has(uid)) {
+          throw new Error("Unsupported or duplicate legacy book UID");
+        }
+        uids.add(uid);
+        return uid;
+      };
+      const projector = new SQLiteDirectory();
+      for (const card of book.cards) {
+        const uid = allocate(card.properties);
+        const projected = new lazy.AddrBookCard();
+        projected._uid = uid;
+        projected._properties = new Map(card.properties);
+        // The old book's unknown _vCard cell is provenance, not a modern vCard.
+        projected._properties.delete("_vCard");
+        // InitCardFromRow projects this structural field as uint32, not text.
+        if (card.properties.has("RecordKey")) {
+          const key = card.properties.get("RecordKey");
+          if (!/^[0-9a-f]{0,8}$/iu.test(key)) {
+            throw new Error("Unrepresentable legacy card RecordKey");
+          }
+          projected._properties.set("RecordKey", parseInt(key || "0", 16));
+        }
+        const properties = projector.prepareToSaveCard(projected, uid);
+        properties.delete("LastModifiedDate");
+        if (card.properties.has("LastModifiedDate")) {
+          properties.set(
+            "LastModifiedDate",
+            card.properties.get("LastModifiedDate")
+          );
+        }
+        records.push({ ...card, kind: "card", uid, projected: properties });
+        cardUIDs.set(card.sourceKey, uid);
+      }
+      for (const list of book.lists) {
+        const name = list.properties.get("ListName");
+        if (
+          !name ||
+          name.includes("  ") ||
+          /[,;"<>]/u.test(name) ||
+          new Set(list.members).size != list.members.length
+        ) {
+          throw new Error("Unrepresentable legacy mailing list");
+        }
+        records.push({ ...list, kind: "list", uid: allocate(list.properties) });
+      }
+      for (const [sourceKey, properties] of book.metadata) {
+        records.push({ sourceKey, properties, kind: "data", uid: null });
+      }
+      db.beginTransaction();
+      try {
+        if (physical) {
+          db.executeSimpleSQL(
+            "CREATE TABLE migration_file_identity(version INTEGER PRIMARY KEY CHECK(version=1), id TEXT NOT NULL, parentId TEXT NOT NULL)"
+          );
+          writeMigrationRow(
+            db,
+            "INSERT INTO migration_file_identity(version,id,parentId) VALUES(1,CAST(:id AS TEXT),CAST(:parentId AS TEXT))",
+            { id: physical.id, parentId: physical.parentId }
+          );
+        }
+        db.executeSimpleSQL(
+          "CREATE TABLE migration_source (version INTEGER PRIMARY KEY CHECK(version=1), sourceId TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, bytes BLOB NOT NULL)"
+        );
+        db.executeSimpleSQL(
+          "CREATE TABLE migration_records (kind TEXT NOT NULL, sourceKey TEXT NOT NULL, uid TEXT UNIQUE, PRIMARY KEY(kind,sourceKey))"
+        );
+        db.executeSimpleSQL(
+          "CREATE TABLE migration_properties (kind TEXT NOT NULL, sourceKey TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,sourceKey,name))"
+        );
+        for (const record of records) {
+          const { kind, sourceKey, uid } = record;
+          writeMigrationRow(
+            db,
+            "INSERT INTO migration_records VALUES(CAST(:kind AS TEXT),CAST(:sourceKey AS TEXT),CAST(:uid AS TEXT))",
+            { kind, sourceKey: String(sourceKey), uid }
+          );
+          for (const [name, value] of record.properties) {
+            writeMigrationRow(
+              db,
+              "INSERT INTO migration_properties VALUES(CAST(:kind AS TEXT),CAST(:sourceKey AS TEXT),CAST(:name AS TEXT),CAST(:value AS TEXT))",
+              { kind, sourceKey: String(sourceKey), name, value }
+            );
+          }
+          if (kind == "card") {
+            for (const [name, value] of record.projected) {
+              writeMigrationRow(
+                db,
+                "INSERT INTO properties VALUES(CAST(:card AS TEXT),CAST(:name AS TEXT),CAST(:value AS TEXT))",
+                { card: uid, name, value }
+              );
+            }
+          } else if (kind == "list") {
+            writeMigrationRow(
+              db,
+              "INSERT INTO lists(uid,name,nickName,description) VALUES(CAST(:uid AS TEXT),CAST(:name AS TEXT),CAST(:nickName AS TEXT),CAST(:description AS TEXT))",
+              {
+                uid,
+                name: record.properties.get("ListName"),
+                nickName: record.properties.get("ListNickName") ?? "",
+                description: record.properties.get("ListDescription") ?? "",
+              }
+            );
+            for (const member of record.members) {
+              writeMigrationRow(
+                db,
+                "INSERT INTO list_cards VALUES(CAST(:list AS TEXT),CAST(:card AS TEXT))",
+                { list: uid, card: cardUIDs.get(member) }
+              );
+            }
+          }
+        }
+        const receipt = db.createStatement(
+          "INSERT INTO migration_source VALUES(1,CAST(:sourceId AS TEXT),CAST(:sha256 AS TEXT),:size,:bytes)"
+        );
+        try {
+          bindValue(receipt, "sourceId", sourceId);
+          bindValue(receipt, "sha256", sha256);
+          bindValue(receipt, "size", original.length);
+          receipt.bindBlobByName("bytes", original);
+          receipt.execute();
+        } finally {
+          receipt.finalize();
+        }
+        const result = migrationReceipt(
+          db,
+          sourceId,
+          sha256,
+          original,
+          book,
+          physical
+        );
+        db.commitTransaction();
+        return result;
+      } catch (error) {
+        try {
+          db.rollbackTransaction();
+        } catch (rollbackError) {
+          console.error(
+            "Could not roll back staged book import",
+            rollbackError
+          );
+        }
+        throw error;
+      }
+    } finally {
+      lease?.close();
+    }
+  }
+
+  /**
+   * Reads immutable original cells for an imported card/list UID.
+   * Missing properties stay absent; present empty values remain empty strings.
+   * Normal edits use existing projections and do not rewrite this provenance.
+   *
+   * @param {string} uid - Destination UID returned in the import receipt.
+   * @returns {Map<string, string>|null} Original cells, or null for a non-imported UID.
+   */
+  loadMigrationProperties(uid) {
+    const db = this._dbConnection;
+    if (!db.tableExists("migration_records")) {
+      return null;
+    }
+    const record = db.createStatement(
+      "SELECT kind,sourceKey FROM migration_records WHERE uid=CAST(:uid AS TEXT)"
+    );
+    let kind, sourceKey;
+    try {
+      bindValue(record, "uid", uid);
+      if (!record.executeStep()) {
+        return null;
+      }
+      ({ kind, sourceKey } = record.row);
+    } finally {
+      record.finalize();
+    }
+    const properties = new Map();
+    const statement = db.createStatement(
+      "SELECT name,value FROM migration_properties WHERE kind=CAST(:kind AS TEXT) AND sourceKey=CAST(:sourceKey AS TEXT)"
+    );
+    try {
+      bindValue(statement, "kind", kind);
+      bindValue(statement, "sourceKey", sourceKey);
+      while (statement.executeStep()) {
+        properties.set(statement.row.name, statement.row.value);
+      }
+    } finally {
+      statement.finalize();
+    }
+    return properties;
   }
 
   static forFile(fileName) {
@@ -485,3 +875,117 @@ export class SQLiteDirectory extends AddrBookDirectory {
 SQLiteDirectory.prototype.classID = Components.ID(
   "{e96ee804-0bd3-472f-81a6-8a9d65277ad3}"
 );
+
+/** @param {Uint8Array} bytes - Original bytes. @returns {string} Exact SHA-256. */
+function migrationHash(bytes) {
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(Ci.nsICryptoHash.SHA256);
+  hash.update(bytes, bytes.length);
+  return Array.from(hash.finish(false), byte =>
+    byte.charCodeAt(0).toString(16).padStart(2, "0")
+  ).join("");
+}
+
+/** @param {mozIStorageConnection} db - Owned transaction. @param {string} sql - Fixed import SQL. @param {Record<string, string|number|null>} values - Bound values. */
+function writeMigrationRow(db, sql, values) {
+  const statement = db.createStatement(sql);
+  try {
+    for (const [name, value] of Object.entries(values)) {
+      bindValue(statement, name, value);
+    }
+    statement.execute();
+  } finally {
+    statement.finalize();
+  }
+}
+
+/**
+ * Reads a completed scoped UID map and verifies its complete original bytes.
+ *
+ * @param {mozIStorageConnection} db - Dedicated stage connection.
+ * @param {string} sourceId - Retained source identity.
+ * @param {string} sha256 - Current input hash.
+ * @param {Uint8Array} bytes - Current immutable input copy.
+ * @param {{cards: {sourceKey: number}[], lists: {sourceKey: number}[]}} book -
+ *   Validated original scoped keys.
+ * @param {?object} physical - Native stage identity, required on Windows.
+ * @returns {{sourceId: string, sourceSha256: string, sourceSize: number,
+ *   cards: [number, string][], lists: [number, string][],
+ *   stagePhysicalIdentity?: {version: number, id: string, parentId: string}}}
+ *   Complete map and retained Windows identity when applicable.
+ * @throws {Error} On changed or incomplete source/maps.
+ */
+function migrationReceipt(db, sourceId, sha256, bytes, book, physical) {
+  if (physical) {
+    const pin = db.createStatement(
+      "SELECT version,id,parentId FROM migration_file_identity"
+    );
+    try {
+      if (
+        !pin.executeStep() ||
+        pin.row.version != 1 ||
+        pin.row.id !== physical.id ||
+        pin.row.parentId !== physical.parentId ||
+        pin.executeStep()
+      ) {
+        throw new Error("Book stage physical identity changed");
+      }
+    } finally {
+      pin.finalize();
+    }
+  }
+  const source = db.createStatement(
+    "SELECT sourceId,sha256,size,bytes FROM migration_source WHERE version=1"
+  );
+  try {
+    if (
+      !source.executeStep() ||
+      source.row.sourceId !== sourceId ||
+      source.row.sha256 !== sha256 ||
+      source.row.size != bytes.length
+    ) {
+      throw new Error("Book import source identity changed");
+    }
+    const original = {};
+    source.getBlob(3, {}, original);
+    if (
+      original.value.length != bytes.length ||
+      bytes.some((value, index) => value != original.value[index])
+    ) {
+      throw new Error("Book import original bytes changed");
+    }
+  } finally {
+    source.finalize();
+  }
+  const result = {
+    ...(physical ? { stagePhysicalIdentity: { ...physical } } : {}),
+    sourceId,
+    sourceSha256: sha256,
+    sourceSize: bytes.length,
+    cards: [],
+    lists: [],
+  };
+  const statement = db.createStatement(
+    "SELECT kind,sourceKey,uid FROM migration_records WHERE kind IN ('card','list') ORDER BY CAST(sourceKey AS INTEGER)"
+  );
+  try {
+    while (statement.executeStep()) {
+      const { kind, sourceKey, uid } = statement.row;
+      result[kind == "card" ? "cards" : "lists"].push([Number(sourceKey), uid]);
+    }
+  } finally {
+    statement.finalize();
+  }
+  for (const kind of ["cards", "lists"]) {
+    const expected = new Set(book[kind].map(record => record.sourceKey));
+    if (
+      result[kind].length != expected.size ||
+      result[kind].some(([key, uid]) => !expected.delete(key) || !uid)
+    ) {
+      throw new Error("Incomplete book import UID mapping");
+    }
+  }
+  return result;
+}

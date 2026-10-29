@@ -111,6 +111,9 @@ tags = ["dataadapter"]
 
 ["test_messages.js"]
 
+["test_MigrationBookCoordinator.js"]
+support-files = ["../../../../../mail/components/addrbook/test/browser/data/import.mab"]
+
 ["test_MigrationCoordinator.js"]
 
 ["test_MigrationFileSystemWindows.js"]

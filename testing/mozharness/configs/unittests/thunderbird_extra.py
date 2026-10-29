@@ -17,7 +17,14 @@ config = {
         "tools/*",
     ],
     "all_gtest_suites": {
-        "gtest": {"env": {"GTEST_FILTER": "TestMail*:TestMsg*:*XREAppDir*"}},
+        "gtest": {
+            "env": {
+                "GTEST_FILTER": (
+                    "TestMail*:TestMsg*:*XREAppDir*:"
+                    "DeliveryCore*:LocalCopyHeaders.*:MigrationWindowsPath.*"
+                ),
+            },
+        },
     },
     "all_mochitest_suites": {
         "mochitest-browser-chrome-thunderbird": [

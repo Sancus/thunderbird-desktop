@@ -521,25 +521,27 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     const saved = beforeView?.contextual
       ? this._captureBatchSelection(beforeView)
       : null;
-    const oldRows = beforeView?.contextual
-      ? beforeView.roots
-          .map(
-            entry =>
-              cachedRows.get(threadBatchKey(entry.message)) ??
-              this._setUpRow(entry.message)
-          )
-          .sort((a, b) => {
-            const ai = beforeView.oldOrder.indexOf(threadBatchKey(a.message));
-            const bi = beforeView.oldOrder.indexOf(threadBatchKey(b.message));
-            return (ai < 0 ? Infinity : ai) - (bi < 0 ? Infinity : bi);
-          })
-      : beforeView
-        ? Array.from(
-            this._rowMap,
-            (row, index) =>
-              row ?? this._setUpRow(beforeView.roots[index].message)
-          )
-        : this._rowMap;
+    let oldRows;
+    if (beforeView?.contextual) {
+      oldRows = beforeView.roots
+        .map(
+          entry =>
+            cachedRows.get(threadBatchKey(entry.message)) ??
+            this._setUpRow(entry.message)
+        )
+        .sort((a, b) => {
+          const ai = beforeView.oldOrder.indexOf(threadBatchKey(a.message));
+          const bi = beforeView.oldOrder.indexOf(threadBatchKey(b.message));
+          return (ai < 0 ? Infinity : ai) - (bi < 0 ? Infinity : bi);
+        });
+    } else if (beforeView) {
+      oldRows = Array.from(
+        this._rowMap,
+        (row, index) => row ?? this._setUpRow(beforeView.roots[index].message)
+      );
+    } else {
+      oldRows = this._rowMap;
+    }
     if (Array.from(oldRows).some(row => !row)) {
       if (
         typeof this._liveView.countMessages != "function" ||
@@ -613,13 +615,12 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
         next.push({ row: this._setUpRow(change.after), message: change.after });
       }
     }
-    next.sort((a, b) =>
-      this._compareMessages(a.message, b.message)
-        ? -1
-        : this._compareMessages(b.message, a.message)
-          ? 1
-          : 0
-    );
+    next.sort((a, b) => {
+      if (this._compareMessages(a.message, b.message)) {
+        return -1;
+      }
+      return this._compareMessages(b.message, a.message) ? 1 : 0;
+    });
     return {
       rows: next.map(item => item.row),
       updates,
@@ -996,20 +997,22 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
     );
     const oldOrder = mappedRoots.flatMap((entry, i) => {
       const row = this._rowMap[i];
-      if (!grouped)
-        return row?.message
-          ? [threadBatchKey(row.message)]
-          : entry
-            ? [threadBatchKey(entry.message)]
-            : [];
+      if (!grouped) {
+        if (row?.message) {
+          return [threadBatchKey(row.message)];
+        }
+        return entry ? [threadBatchKey(entry.message)] : [];
+      }
       if (row && !(this instanceof LiveViewConversationsDataAdapter)) {
-        const members = entry
-          ? this instanceof LiveViewGroupedDataAdapter
-            ? entry.members
-            : LiveViewThreadedDataAdapter.sortThread(
-                entry.members.map(message => ({ ...message }))
-              ).slice(1)
-          : [];
+        let members = [];
+        if (entry) {
+          members =
+            this instanceof LiveViewGroupedDataAdapter
+              ? entry.members
+              : LiveViewThreadedDataAdapter.sortThread(
+                  entry.members.map(message => ({ ...message }))
+                ).slice(1);
+        }
         return [
           row.message && threadBatchKey(row.message),
           ...Array.from(row.children, (child, j) =>
@@ -1262,17 +1265,17 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
             [...saved.selected, saved.current, saved.pivot].some(identity =>
               keys.has(identity)
             ));
-        const sorted = conversations
-          ? []
-          : sortGroups
-            ? members.sort((a, b) =>
-                this._compareMessages(a, b)
-                  ? -1
-                  : this._compareMessages(b, a)
-                    ? 1
-                    : 0
-              )
+        let sorted = [];
+        if (!conversations) {
+          sorted = sortGroups
+            ? members.sort((a, b) => {
+                if (this._compareMessages(a, b)) {
+                  return -1;
+                }
+                return this._compareMessages(b, a) ? 1 : 0;
+              })
             : LiveViewThreadedDataAdapter.sortThread(members);
+        }
         const first = !conversations && !sortGroups ? sorted.shift() : summary;
         const displayed = shouldOpen() && !sortGroups ? first : summary;
         const root = sortGroups
@@ -1495,62 +1498,63 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       !(this instanceof LiveViewGroupedDataAdapter) ||
       !beforeView?.contextual ||
       beforeView.display?.sortColumn === columns[this.sortColumn];
-    const roots = beforeView?.contextual
-      ? beforeView.roots.map(entry => {
-          const keys = new Set(
-            entry.members.map(message => threadBatchKey(message))
+    let roots;
+    if (beforeView?.contextual) {
+      roots = beforeView.roots.map(entry => {
+        const keys = new Set(
+          entry.members.map(message => threadBatchKey(message))
+        );
+        const old =
+          sameSortGroup &&
+          this._rowMap.find(
+            row =>
+              row &&
+              (this instanceof LiveViewGroupedDataAdapter
+                ? String(row.group) === entry.group ||
+                  beforeView.mappedRoots[
+                    this._rowMap.indexOf(row)
+                  ]?.members.some(message => keys.has(threadBatchKey(message)))
+                : (row.thread ?? row.message).threadId ===
+                  entry.message.threadId)
           );
-          const old =
-            sameSortGroup &&
-            this._rowMap.find(
-              row =>
-                row &&
-                (this instanceof LiveViewGroupedDataAdapter
-                  ? String(row.group) === entry.group ||
-                    beforeView.mappedRoots[
-                      this._rowMap.indexOf(row)
-                    ]?.members.some(message =>
-                      keys.has(threadBatchKey(message))
-                    )
-                  : (row.thread ?? row.message).threadId ===
-                    entry.message.threadId)
-            );
-          if (old) {
-            rootEntries.set(old, entry);
-            if (
-              Array.from(old.children).some(child => !child) &&
-              !(this instanceof LiveViewConversationsDataAdapter)
-            )
-              baseInstalls.push({
-                ...this._stateFromBatchBefore(entry, cached, old),
-                root: old,
-                sortGroups: this instanceof LiveViewGroupedDataAdapter,
-                conversations: false,
-              });
-            return old;
-          }
-          const root = this._rootFromBatchBefore(entry, cached);
-          rootEntries.set(root, entry);
+        if (old) {
+          rootEntries.set(old, entry);
           if (
-            !(this instanceof LiveViewConversationsDataAdapter) &&
-            this._rowMap.some(
-              (row, i) =>
-                row?.open &&
-                beforeView.mappedRoots[i]?.members.some(message =>
-                  keys.has(threadBatchKey(message))
-                )
-            )
+            Array.from(old.children).some(child => !child) &&
+            !(this instanceof LiveViewConversationsDataAdapter)
           )
-            root.open = true;
-          return root;
-        })
-      : beforeView
-        ? Array.from(
-            this._rowMap,
-            (row, index) =>
-              row ?? this._rootFromBatchBefore(beforeView.roots[index])
+            baseInstalls.push({
+              ...this._stateFromBatchBefore(entry, cached, old),
+              root: old,
+              sortGroups: this instanceof LiveViewGroupedDataAdapter,
+              conversations: false,
+            });
+          return old;
+        }
+        const root = this._rootFromBatchBefore(entry, cached);
+        rootEntries.set(root, entry);
+        if (
+          !(this instanceof LiveViewConversationsDataAdapter) &&
+          this._rowMap.some(
+            (row, i) =>
+              row?.open &&
+              beforeView.mappedRoots[i]?.members.some(message =>
+                keys.has(threadBatchKey(message))
+              )
           )
-        : this._rowMap;
+        )
+          root.open = true;
+        return root;
+      });
+    } else if (beforeView) {
+      roots = Array.from(
+        this._rowMap,
+        (row, index) =>
+          row ?? this._rootFromBatchBefore(beforeView.roots[index])
+      );
+    } else {
+      roots = this._rowMap;
+    }
     if (Array.from(roots).some(row => !row)) {
       return {
         refresh: true,
@@ -1586,13 +1590,16 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
         collect(row.children);
       });
     collect(roots);
-    const oldOrder = beforeView?.contextual
-      ? beforeView.oldOrder
-      : beforeView
-        ? beforeView.roots.flatMap(entry =>
-            entry.members.map(message => threadBatchKey(message))
-          )
-        : [...cached.keys()];
+    let oldOrder;
+    if (beforeView?.contextual) {
+      oldOrder = beforeView.oldOrder;
+    } else if (beforeView) {
+      oldOrder = beforeView.roots.flatMap(entry =>
+        entry.members.map(message => threadBatchKey(message))
+      );
+    } else {
+      oldOrder = [...cached.keys()];
+    }
     const sortGroups = this instanceof LiveViewGroupedDataAdapter;
     const conversations = this instanceof LiveViewConversationsDataAdapter;
     const matchesGroup = (row, group, side) => {
@@ -1684,17 +1691,17 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
         const bi = oldOrder.indexOf(threadBatchKey(b));
         return (ai < 0 ? Infinity : ai) - (bi < 0 ? Infinity : bi);
       });
-      const sorted = conversations
-        ? []
-        : sortGroups
-          ? ordered.sort((a, b) =>
-              this._compareMessages(a, b)
-                ? -1
-                : this._compareMessages(b, a)
-                  ? 1
-                  : 0
-            )
+      let sorted = [];
+      if (!conversations) {
+        sorted = sortGroups
+          ? ordered.sort((a, b) => {
+              if (this._compareMessages(a, b)) {
+                return -1;
+              }
+              return this._compareMessages(b, a) ? 1 : 0;
+            })
           : LiveViewThreadedDataAdapter.sortThread(ordered);
+      }
       const first =
         !conversations && !sortGroups ? sorted.shift() : representative;
       const displayed = open && !sortGroups ? first : representative;
@@ -1754,11 +1761,12 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
           a.order - b.order
         );
       }
-      return this._compareMessages(a.message, b.message)
-        ? -1
-        : this._compareMessages(b.message, a.message)
-          ? 1
-          : a.order - b.order;
+      if (this._compareMessages(a.message, b.message)) {
+        return -1;
+      }
+      return this._compareMessages(b.message, a.message)
+        ? 1
+        : a.order - b.order;
     });
     return {
       grouped: true,

@@ -1888,10 +1888,18 @@ NS_IMETHODIMP FolderInfo::SetNumMessages(int32_t aNumMessages) {
   return mPerFolderDatabase->WriteCount(false, aNumMessages);
 }
 NS_IMETHODIMP FolderInfo::GetExpungedBytes(int64_t* aExpungedBytes) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aExpungedBytes);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  int64_t value;
+  MOZ_TRY(GetInt64Property("expungedBytes", 0, &value));
+  NS_ENSURE_TRUE(value >= 0, NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  *aExpungedBytes = value;
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetExpungedBytes(int64_t aExpungedBytes) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  NS_ENSURE_TRUE(aExpungedBytes >= 0, NS_ERROR_ILLEGAL_VALUE);
+  return SetInt64Property("expungedBytes", aExpungedBytes);
 }
 NS_IMETHODIMP FolderInfo::GetImapUidValidity(ImapUid* aImapUidValidity) {
   NS_ENSURE_ARG_POINTER(aImapUidValidity);
@@ -1997,7 +2005,12 @@ NS_IMETHODIMP FolderInfo::SetSortOrder(nsMsgViewSortOrderValue sortOrder) {
   return SetUint32Property("sortOrder", sortOrder);
 }
 NS_IMETHODIMP FolderInfo::ChangeExpungedBytes(int32_t aDelta) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  int64_t value;
+  MOZ_TRY(GetExpungedBytes(&value));
+  CheckedInt<int64_t> changed(value);
+  changed += aDelta;
+  NS_ENSURE_TRUE(changed.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  return SetExpungedBytes(changed.value());
 }
 NS_IMETHODIMP FolderInfo::GetCharProperty(const char* propertyName,
                                           nsACString& propertyValue) {

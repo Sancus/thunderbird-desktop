@@ -1445,3 +1445,142 @@ add_task(
     Assert.ok(!rootFolder.subFolders.includes(folder));
   }
 );
+
+add_task(function test_expungedBytesPersistenceAndPhysicalFolder() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("expunged-bytes");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("other-expunged-bytes");
+  let info = folder.msgDatabase.dBFolderInfo;
+  const otherInfo = other.msgDatabase.dBFolderInfo;
+  const connection = database.connectionForTests;
+  const readStoredValue = () => {
+    const statement = connection.createStatement(
+      "SELECT CAST(value AS TEXT) AS value, typeof(value) AS type " +
+        "FROM folder_properties WHERE id = :id AND name = 'expungedBytes'"
+    );
+    statement.params.id = folder.id;
+    try {
+      return statement.executeStep()
+        ? [statement.row.value, statement.row.type]
+        : null;
+    } finally {
+      statement.finalize();
+    }
+  };
+
+  Assert.equal(info.expungedBytes, 0);
+  Assert.equal(folder.expungedBytes, 0);
+  Assert.equal(readStoredValue(), null, "reading absence does not store zero");
+  otherInfo.expungedBytes = 29;
+  const largeValue = 2 ** 40 + 19;
+  info.expungedBytes = largeValue;
+  info.changeExpungedBytes(7);
+  info.changeExpungedBytes(-3);
+  Assert.equal(info.expungedBytes, largeValue + 4);
+  Assert.equal(folder.expungedBytes, largeValue + 4);
+  Assert.deepEqual(readStoredValue(), [String(largeValue + 4), "integer"]);
+  Assert.equal(otherInfo.expungedBytes, 29);
+
+  connection.beginTransaction();
+  try {
+    info.expungedBytes = 10;
+    info.changeExpungedBytes(2);
+    Assert.equal(info.expungedBytes, 12);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(info.expungedBytes, largeValue + 4);
+  Assert.equal(folder.expungedBytes, largeValue + 4);
+
+  Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+    .getService(Ci.nsIMsgDBService)
+    .forceFolderDBClosed(folder);
+  info = folder.msgDatabase.dBFolderInfo;
+  Assert.equal(info.expungedBytes, largeValue + 4);
+  Assert.equal(folder.expungedBytes, largeValue + 4);
+  info.expungedBytes = 0;
+  Assert.deepEqual(readStoredValue(), ["0", "integer"]);
+  Assert.equal(folder.expungedBytes, 0);
+  Assert.equal(otherInfo.expungedBytes, 29);
+});
+
+add_task(function test_expungedBytesRejectsInvalidValuesAndPreservesErrors() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("expunged-errors");
+  const info = folder.msgDatabase.dBFolderInfo;
+  const connection = database.connectionForTests;
+  info.expungedBytes = 20;
+  Assert.throws(
+    () => (info.expungedBytes = -1),
+    error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE
+  );
+  Assert.throws(
+    () => info.changeExpungedBytes(-21),
+    error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE
+  );
+  Assert.equal(info.expungedBytes, 20);
+
+  // Use SQL for INT64_MAX: JavaScript Numbers cannot represent it exactly.
+  connection.executeSimpleSQL(
+    "UPDATE folder_properties SET value = 9223372036854775807 " +
+      `WHERE id = ${folder.id} AND name = 'expungedBytes'`
+  );
+  Assert.throws(
+    () => info.changeExpungedBytes(1),
+    error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
+  );
+  Assert.equal(info.getCharProperty("expungedBytes"), "9223372036854775807");
+  info.changeExpungedBytes(-1);
+  Assert.equal(info.getCharProperty("expungedBytes"), "9223372036854775806");
+  info.setInt64Property("expungedBytes", -1);
+  Assert.throws(
+    () => info.expungedBytes,
+    error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
+  );
+  Assert.equal(info.getInt64Property("expungedBytes", 0), -1);
+  info.expungedBytes = 20;
+
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_expunged_write BEFORE INSERT ON folder_properties " +
+      `WHEN NEW.id = ${folder.id} AND NEW.name = 'expungedBytes' ` +
+      "BEGIN SELECT RAISE(ABORT, 'expunged bytes fault'); END"
+  );
+  try {
+    Assert.throws(
+      () => (info.expungedBytes = 30),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.throws(
+      () => info.changeExpungedBytes(1),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.equal(info.expungedBytes, 20);
+    Assert.equal(folder.expungedBytes, 20);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_expunged_write");
+  }
+
+  connection.executeSimpleSQL(
+    "ALTER TABLE folder_properties RENAME TO hidden_expunged_properties"
+  );
+  try {
+    Assert.throws(() => info.expungedBytes, /NS_ERROR_FAILURE/);
+    Assert.throws(() => folder.expungedBytes, /NS_ERROR_FAILURE/);
+    Assert.throws(() => info.changeExpungedBytes(1), /NS_ERROR_FAILURE/);
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE hidden_expunged_properties RENAME TO folder_properties"
+    );
+  }
+  Assert.equal(info.expungedBytes, 20);
+  Assert.equal(folder.expungedBytes, 20);
+  folderDB.deleteFolder(folder.id);
+  Assert.throws(() => info.expungedBytes, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => (info.expungedBytes = 0), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => info.changeExpungedBytes(1), /NS_ERROR_NOT_AVAILABLE/);
+});

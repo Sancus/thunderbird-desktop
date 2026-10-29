@@ -9,6 +9,9 @@ do_get_profile();
 const { ChatSearchProvider, chatSearchDocumentId } = ChromeUtils.importESModule(
   "resource:///modules/panorama/ChatSearchProvider.sys.mjs"
 );
+const { getSearchBodySnippet } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/SearchOffsets.sys.mjs"
+);
 const { PanoramaSearchIndex } = ChromeUtils.importESModule(
   "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs"
 );
@@ -821,4 +824,60 @@ add_task(async function test_loggerFailureSurvivesAConcurrentAppend() {
   await provider.refreshLog(filePath);
   const [current] = (await provider.search("aftererrorappend")).items;
   Assert.equal((await provider.resolveLog(current)).status, "ready");
+});
+
+add_task(async function test_firstMatchUsesCurrentTranscriptProjection() {
+  const fixture = await openChatFixture("first-match");
+  const { provider, filePath } = fixture;
+  await logText(fixture, "<i>é 😀 Café</i> &amp; orbit 自動", {
+    remoteId: "edited",
+    alias: "Friend",
+  });
+  await provider.refreshLog(filePath);
+  const [hit] = (await provider.search("cafe")).items;
+  Assert.ok(hit, "The normalized logged body matches the ordinary query");
+  const text = await provider.getText(hit.id);
+  Assert.equal(text.body, "Friend: é 😀 Café & orbit 自動");
+  const snippet = getSearchBodySnippet(hit, text);
+  Assert.deepEqual(snippet, {
+    text: "Friend: é 😀 Café & orbit 自動",
+    ranges: [{ start: 13, end: 17 }],
+    firstMatchText: "Café",
+  });
+  const opened = await provider.resolveLog(hit);
+  Assert.equal(opened.status, "ready");
+  Assert.equal(opened.log.path, filePath);
+  Assert.equal(opened.textRevision, text.textRevision);
+  Assert.deepEqual(
+    opened.conversation
+      .getMessages()
+      .filter(message => !message.noLog)
+      .map(message => message.message),
+    ["<i>é 😀 Café</i> &amp; orbit 自動"],
+    "The checked log contains the exact first-match text for the existing reader"
+  );
+  const [titleHit] = (await provider.search("Retained")).items;
+  Assert.deepEqual(getSearchBodySnippet(titleHit, text), {
+    text: "Friend: é 😀 Café & orbit 自動",
+    ranges: [],
+    firstMatchText: null,
+  });
+  await logText(fixture, "<b>Replacement</b> text", {
+    remoteId: "edited",
+    alias: "Friend",
+  });
+  Assert.equal(
+    await provider.getText(hit.id),
+    null,
+    "A changed source cannot supply the old snippet while awaiting refresh"
+  );
+  await provider.refreshLog(filePath);
+  const current = await provider.getText(hit.id);
+  Assert.equal(current.body, "Friend: Replacement text");
+  Assert.equal(
+    getSearchBodySnippet(hit, current),
+    null,
+    "Old FTS offsets cannot highlight the new transcript projection"
+  );
+  Assert.deepEqual(await provider.resolveLog(hit), { status: "stale" });
 });

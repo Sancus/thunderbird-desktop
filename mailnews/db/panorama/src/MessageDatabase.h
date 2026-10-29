@@ -579,6 +579,9 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult GetMessageForMessageID(uint64_t aFolderId,
                                   const nsACString& aMessageId,
                                   Message** aMessage);
+  // Uses an owned transaction; errors leave marked keys and hot flags
+  // unchanged. Refuses a caller transaction, matching published per-message
+  // flag writes.
   nsresult MarkAllRead(uint64_t aFolderId, nsTArray<nsMsgKey>& aMarkedKeys);
   // Count read errors leave the output unchanged.
   nsresult GetNumMessages(uint64_t folderId, uint64_t* numMessages);

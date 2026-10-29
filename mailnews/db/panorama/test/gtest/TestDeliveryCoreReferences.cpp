@@ -304,6 +304,14 @@ class DeliveryCoreReferences : public testing::Test {
     return bool(mCore->MessageDB().mMsgCache.lookup(key));
   }
 
+  nsresult MarkFolderRead(uint64_t folder, nsTArray<nsMsgKey>& marked) {
+    return mCore->MessageDB().MarkAllRead(folder, marked);
+  }
+
+  nsresult FolderUnreadCount(uint64_t folder, uint64_t& count) {
+    return mCore->MessageDB().GetNumUnread(folder, &count);
+  }
+
   nsresult Start() {
     // This native fixture selects the concrete Panorama implementation
     // directly.
@@ -9409,6 +9417,129 @@ TEST_F(DeliveryCoreReferences, HeaderCacheMissAcrossTrimKeepsPhysicalFields) {
     }
   }
   EXPECT_TRUE(reloaded);
+}
+
+TEST_F(DeliveryCoreReferences, MarkAllReadWriteFailureKeepsSqlCacheAndOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  RawHdr raw;
+  raw.messageId = "bulk-first@invalid"_ns;
+  raw.flags = nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New;
+  nsMsgKey first, second, read, foreign;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &first));
+  raw.messageId = "bulk-second@invalid"_ns;
+  raw.flags = 0;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &second));
+  raw.messageId = "bulk-read@invalid"_ns;
+  raw.flags = nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &read));
+  uint64_t other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Other"_ns, &other));
+  raw.messageId = "bulk-foreign@invalid"_ns;
+  raw.flags = 0;
+  ASSERT_EQ(NS_OK, db.AddMessage(other, raw, true, &foreign));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New, flags);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
+  EXPECT_EQ(0u, flags);
+
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("mark_all_fault"_ns, 1, witness));
+  nsAutoCString trigger(
+      "CREATE TEMP TRIGGER fail_mark_all BEFORE UPDATE OF flags ON messages "
+      "BEGIN SELECT mark_all_fault(OLD.id); SELECT CASE WHEN OLD.id="_ns);
+  trigger.AppendInt(second);
+  trigger.AppendLiteral(" THEN RAISE(FAIL,'bulk read fault') END; END");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(trigger));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_mark_all"_ns));
+    EXPECT_EQ(NS_OK, mConnection->RemoveFunction("mark_all_fault"_ns));
+  });
+  nsTArray<nsMsgKey> marked{nsMsgKey_None - 1};
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, MarkFolderRead(mFolderId, marked));
+  EXPECT_EQ((nsTArray<nsMsgKey>{nsMsgKey_None - 1}), marked);
+  EXPECT_EQ(2u, witness->mCalls);
+  EXPECT_EQ(second, witness->mLastKey);
+  bool active = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New, flags);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
+  EXPECT_EQ(0u, flags);
+  uint64_t unread;
+  ASSERT_EQ(NS_OK, FolderUnreadCount(mFolderId, unread));
+  EXPECT_EQ(2u, unread);
+
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER fail_mark_all"_ns));
+  ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
+  EXPECT_EQ((nsTArray<nsMsgKey>{first, second}), marked);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New |
+                nsMsgMessageFlags::Read,
+            flags);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(read, flags));
+  EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked, flags);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(foreign, flags));
+  EXPECT_EQ(0u, flags);
+  ASSERT_EQ(NS_OK, FolderUnreadCount(mFolderId, unread));
+  EXPECT_EQ(0u, unread);
+  ASSERT_EQ(NS_OK, FolderUnreadCount(other, unread));
+  EXPECT_EQ(1u, unread);
+  ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
+  EXPECT_TRUE(marked.IsEmpty());
+  ASSERT_EQ(NS_OK, mConnection->RemoveFunction("mark_all_fault"_ns));
+  cleanup.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(first, flags));
+  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New |
+                nsMsgMessageFlags::Read,
+            flags);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(foreign, flags));
+  EXPECT_EQ(0u, flags);
+}
+
+TEST_F(DeliveryCoreReferences,
+       MarkAllReadRefusesCallerTransactionWithoutOwningIt) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("caller-bulk@invalid"_ns, {}, key));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(key, flags));
+  EXPECT_EQ(0u, flags);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active) {
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK,
+            db.SetMessageProperty(key, "caller-control"_ns, "pending"_ns));
+  nsTArray<nsMsgKey> marked{nsMsgKey_None - 1};
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, MarkFolderRead(mFolderId, marked));
+  EXPECT_EQ((nsTArray<nsMsgKey>{nsMsgKey_None - 1}), marked);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString control;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "caller-control"_ns, control));
+  EXPECT_EQ("pending"_ns, control);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(key, flags));
+  EXPECT_EQ(0u, flags);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "caller-control"_ns, control));
+  EXPECT_TRUE(control.IsEmpty());
+  ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), marked);
 }
 
 }  // namespace mozilla::mailnews

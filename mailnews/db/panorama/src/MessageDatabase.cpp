@@ -3986,34 +3986,58 @@ Result<nsMsgKey, nsresult> MessageDatabase::FindByMessageId(
   return key;
 }
 
+namespace {
+nsresult RollbackMessageChange(mozIStorageConnection* connection,
+                               nsresult original);
+}  // namespace
+
 nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
                                       nsTArray<nsMsgKey>& aMarkedKeys) {
-  aMarkedKeys.Clear();
-
-  nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "MarkAllRead"_ns,
-      "UPDATE messages SET flags = flags | :flag WHERE folderId = :folderId AND flags & :flag = 0 RETURNING id"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
-  mozStorageStatementScoper scoper(stmt);
-
-  stmt->BindInt64ByName("flag"_ns, nsMsgMessageFlags::Read);
-  stmt->BindInt64ByName("folderId"_ns, aFolderId);
-
-  bool hasResult;
-  while (NS_SUCCEEDED(stmt->ExecuteStep(&hasResult)) && hasResult) {
-    aMarkedKeys.AppendElement((nsMsgKey)(stmt->AsInt64(0)));
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  nsTArray<nsMsgKey> marked;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(
+          DatabaseCore::GetStatement("MarkAllRead"_ns,
+                                     "UPDATE messages SET flags = flags | "
+                                     ":flag WHERE folderId = :folderId "
+                                     "AND flags & :flag = 0 RETURNING id"_ns,
+                                     getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("flag"_ns, nsMsgMessageFlags::Read));
+      MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, aFolderId));
+      while (true) {
+        bool more;
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        if (!more) {
+          break;
+        }
+        int64_t key;
+        MOZ_TRY(stmt->GetInt64(0, &key));
+        NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+        if (!marked.AppendElement(static_cast<nsMsgKey>(key), fallible)) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+      }
+    }
+    marked.Sort();
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
-
-  // Update affected cache entries.
-  for (nsMsgKey key : aMarkedKeys) {
-    auto p = mMsgCache.lookup(key);
-    if (p) {
-      p->value().flags |= nsMsgMessageFlags::Read;
+  // SQL, including every returned key, is settled before cache or caller
+  // output.
+  for (nsMsgKey key : marked) {
+    auto entry = mMsgCache.lookup(key);
+    if (entry) {
+      entry->value().flags |= nsMsgMessageFlags::Read;
     }
   }
-
+  aMarkedKeys = std::move(marked);
   return NS_OK;
 }
 

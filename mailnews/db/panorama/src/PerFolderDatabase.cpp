@@ -21,6 +21,7 @@
 #include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
 #include "mozStorageHelper.h"
+#include "mozilla/AutoRestore.h"
 #include "mozilla/CheckedInt.h"
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
@@ -55,6 +56,10 @@ void PerFolderDatabase::OnMessageAdded(Message* message) {
 
 void PerFolderDatabase::OnMessagePublished(Message* message,
                                            bool notifyLegacy) {
+  if (mForceClosed) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
   uint64_t msgFolderId;
   nsresult rv = MessageDB().GetMessageFolderId(message->Key(), msgFolderId);
   NS_ENSURE_SUCCESS_VOID(rv);
@@ -79,7 +84,31 @@ void PerFolderDatabase::OnMessagePublished(Message* message,
   }
 }
 
+void PerFolderDatabase::OnMessageThreadChanged(const CapturedMessage& before,
+                                               const CapturedMessage& after,
+                                               Message*) {
+  if (mForceClosed) {
+    return;
+  }
+  if (before.folderId != mFolderId || after.folderId != mFolderId) {
+    return;
+  }
+  nsMsgKey oldParent =
+      before.threadParent ? before.threadParent : nsMsgKey_None;
+  nsMsgKey newParent = after.threadParent ? after.threadParent : nsMsgKey_None;
+  if (oldParent == newParent) {
+    return;
+  }
+  // Earlier callbacks may have changed or removed the live header.
+  RefPtr<PerFolderDatabase> self(this);
+  NotifyParentChangedAll(after.id, oldParent, newParent, nullptr);
+}
+
 void PerFolderDatabase::OnMessageRemoved(Message* message, uint32_t oldFlags) {
+  if (mForceClosed) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
   uint64_t msgFolderId;
   nsresult rv = MessageDB().GetMessageFolderId(message->Key(), msgFolderId);
   NS_ENSURE_SUCCESS_VOID(rv);
@@ -92,6 +121,10 @@ void PerFolderDatabase::OnMessageFlagsChanged(nsIMsgDBHdr* oldMessage,
                                               Message* message,
                                               uint32_t oldFlags,
                                               uint32_t newFlags) {
+  if (mForceClosed) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
   uint64_t msgFolderId;
   nsresult rv = MessageDB().GetMessageFolderId(message->Key(), msgFolderId);
   NS_ENSURE_SUCCESS_VOID(rv);
@@ -104,6 +137,10 @@ void PerFolderDatabase::OnMessageTagsChanged(nsIMsgDBHdr* oldMessage,
                                              Message* message,
                                              const nsACString& oldTags,
                                              const nsACString& newTags) {
+  if (mForceClosed) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
   uint64_t msgFolderId;
   nsresult rv = MessageDB().GetMessageFolderId(message->Key(), msgFolderId);
   NS_ENSURE_SUCCESS_VOID(rv);
@@ -119,10 +156,94 @@ void PerFolderDatabase::OnMessageTagsChanged(nsIMsgDBHdr* oldMessage,
   }
 }
 
+void PerFolderDatabase::OnMessagePublishedCaptured(const CapturedMessage& after,
+                                                   Message* message,
+                                                   bool notifyLegacy) {
+  if (mForceClosed) {
+    return;
+  }
+  if (after.folderId != mFolderId) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  if (!(after.flags & nsMsgMessageFlags::Read)) {
+    nsresult rv = AddToNewList(after.id);
+    NS_ENSURE_SUCCESS_VOID(rv);
+  }
+  if (notifyLegacy) {
+    nsMsgKey parent = after.threadParent ? after.threadParent : nsMsgKey_None;
+    NotifyHdrAddedAll(message, parent, after.flags, nullptr);
+  }
+}
+
+void PerFolderDatabase::OnMessageRemovedCaptured(const CapturedMessage& before,
+                                                 Message* message) {
+  if (mForceClosed) {
+    return;
+  }
+  if (before.folderId != mFolderId) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  mNewList.RemoveElement(before.id);
+  nsMsgKey parent = before.threadParent ? before.threadParent : nsMsgKey_None;
+  NotifyHdrDeletedAll(message, parent, before.flags, nullptr);
+}
+
+void PerFolderDatabase::OnMessageFlagsChangedCaptured(
+    const CapturedMessage& before, const CapturedMessage& after, nsIMsgDBHdr*,
+    Message* message) {
+  if (mForceClosed) {
+    return;
+  }
+  if (before.folderId != mFolderId || after.folderId != mFolderId ||
+      before.flags == after.flags) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  if (((before.flags ^ after.flags) & nsMsgMessageFlags::Read) ||
+      ((before.flags & nsMsgMessageFlags::New) &&
+       !(after.flags & nsMsgMessageFlags::New))) {
+    mNewList.RemoveElement(after.id);
+  }
+  NotifyHdrChangeAll(message, before.flags, after.flags, nullptr);
+}
+
+void PerFolderDatabase::OnMessageTagsChangedCaptured(
+    const CapturedMessage& before, const CapturedMessage& after, nsIMsgDBHdr*,
+    Message* message) {
+  if (mForceClosed) {
+    return;
+  }
+  if (before.folderId != mFolderId || after.folderId != mFolderId ||
+      before.tags.Equals(after.tags)) {
+    return;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  for (RefPtr<nsIDBChangeListener> listener : mListeners.EndLimitedRange()) {
+    uint32_t status = 0;
+    listener->OnHdrPropertyChanged(message, "keywords"_ns, false, &status,
+                                   nullptr);
+  }
+}
+
+void PerFolderDatabase::OnMessageBodyChangedCaptured(
+    const CapturedMessage& before, const CapturedMessage& after,
+    nsIMsgDBHdr* oldHeader, Message* message, const MessageBodyState&,
+    const MessageBodyState&) {
+  if (mForceClosed) {
+    return;
+  }
+  if (before.flags != after.flags) {
+    OnMessageFlagsChangedCaptured(before, after, oldHeader, message);
+  }
+}
+
 // nsIDBChangeAnnouncer:
 
 NS_IMETHODIMP PerFolderDatabase::AddListener(nsIDBChangeListener* listener) {
   NS_ENSURE_ARG(listener);
+  NS_ENSURE_FALSE(mForceClosed, NS_ERROR_NOT_AVAILABLE);
   mListeners.AppendElementUnlessExists(listener);
   return NS_OK;
 }
@@ -161,7 +282,10 @@ NS_IMETHODIMP PerFolderDatabase::NotifyHdrDeletedAll(
 NS_IMETHODIMP PerFolderDatabase::NotifyParentChangedAll(
     nsMsgKey keyReparented, nsMsgKey oldParent, nsMsgKey newParent,
     nsIDBChangeListener* instigator) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  for (RefPtr<nsIDBChangeListener> listener : mListeners.EndLimitedRange()) {
+    listener->OnParentChanged(keyReparented, oldParent, newParent, instigator);
+  }
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::NotifyReadChanged(
     nsIDBChangeListener* instigator) {
@@ -172,7 +296,20 @@ NS_IMETHODIMP PerFolderDatabase::NotifyJunkScoreChanged(
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP PerFolderDatabase::NotifyAnnouncerGoingAway(void) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  if (mNotifyingGoingAway) {
+    return NS_OK;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  AutoRestore<bool> notifying(mNotifyingGoingAway);
+  mNotifyingGoingAway = true;
+  for (RefPtr<nsIDBChangeListener> listener : mListeners.EndLimitedRange()) {
+    listener->OnAnnouncerGoingAway(this);
+  }
+  if (mForceClosed) {
+    mListeners.Clear();
+    mNewList.Clear();
+  }
+  return NS_OK;
 }
 
 // nsIMsgDatabase:
@@ -180,11 +317,26 @@ NS_IMETHODIMP PerFolderDatabase::NotifyAnnouncerGoingAway(void) {
 NS_IMETHODIMP PerFolderDatabase::OpenFromFile(nsIFile* aFolderName) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
-NS_IMETHODIMP PerFolderDatabase::Close(bool aForceCommit) { return NS_OK; }
+NS_IMETHODIMP PerFolderDatabase::Close(bool forceCommit) {
+  // Each native write is already committed. Never settle another caller's SQL.
+  return forceCommit ? Commit(nsMsgDBCommitType::kSessionCommit) : NS_OK;
+}
 NS_IMETHODIMP PerFolderDatabase::Commit(nsMsgDBCommit aCommitType) {
   return NS_OK;
 }
-NS_IMETHODIMP PerFolderDatabase::ForceClosed() { return NS_OK; }
+NS_IMETHODIMP PerFolderDatabase::ForceClosed() {
+  if (mForceClosed) {
+    return NS_OK;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  mForceClosed = true;
+  // Invalidate this wrapper's weak cache entries before a listener reopens it.
+  DetachWeakPtr();
+  if (DatabaseCore::sInstance && DatabaseCore::sInstance->mMessageDatabase) {
+    MessageDB().RemoveMessageListener(this);
+  }
+  return NotifyAnnouncerGoingAway();
+}
 NS_IMETHODIMP PerFolderDatabase::ClearCachedHdrs() {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
@@ -205,6 +357,9 @@ NS_IMETHODIMP PerFolderDatabase::GetDatabaseSize(int64_t* databaseSize) {
 nsresult
 PerFolderDatabase::CheckFolderExists() const
 {
+  NS_ENSURE_TRUE(!mForceClosed && DatabaseCore::sInstance &&
+                     DatabaseCore::sInstance->mFolderDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
   CheckedInt<int64_t> id(mFolderId);
   NS_ENSURE_TRUE(mFolderId && id.isValid(), NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<mozIStorageStatement> stmt;

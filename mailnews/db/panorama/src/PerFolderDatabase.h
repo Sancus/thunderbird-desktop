@@ -40,12 +40,34 @@ class PerFolderDatabase : public nsIMsgDatabase,
   // MessageListener functions.
   void OnMessageAdded(Message* message) override;
   void OnMessagePublished(Message* message, bool notifyLegacy) override;
+  void OnMessageThreadChanged(const CapturedMessage& before,
+                              const CapturedMessage& after,
+                              Message* borrowedLive) override;
   void OnMessageRemoved(Message* message, uint32_t oldFlags) override;
   void OnMessageFlagsChanged(nsIMsgDBHdr* oldMessage, Message* message,
                              uint32_t oldFlags, uint32_t newFlags) override;
   void OnMessageTagsChanged(nsIMsgDBHdr* oldMessage, Message* message,
                             const nsACString& oldTags,
                             const nsACString& newTags) override;
+
+  bool SupportsThreadChanges() const override { return true; }
+  void OnMessagePublishedCaptured(const CapturedMessage& after,
+                                  Message* message, bool notifyLegacy) override;
+  void OnMessageRemovedCaptured(const CapturedMessage& before,
+                                Message* message) override;
+  void OnMessageFlagsChangedCaptured(const CapturedMessage& before,
+                                     const CapturedMessage& after,
+                                     nsIMsgDBHdr* oldHeader,
+                                     Message* message) override;
+  void OnMessageTagsChangedCaptured(const CapturedMessage& before,
+                                    const CapturedMessage& after,
+                                    nsIMsgDBHdr* oldHeader,
+                                    Message* message) override;
+  void OnMessageBodyChangedCaptured(const CapturedMessage& before,
+                                    const CapturedMessage& after,
+                                    nsIMsgDBHdr* oldHeader, Message* message,
+                                    const MessageBodyState& oldBody,
+                                    const MessageBodyState& newBody) override;
 
   uint64_t FolderId() { return mFolderId; }
 
@@ -72,6 +94,8 @@ class PerFolderDatabase : public nsIMsgDatabase,
   uint64_t mFolderId;
   bool mIsNewsFolder;
   PRTime mLastUseTime = PR_Now();
+  bool mForceClosed = false;
+  bool mNotifyingGoingAway = false;
   nsTArray<nsMsgKey> mNewList;
   nsTObserverArray<RefPtr<nsIDBChangeListener>> mListeners;
 };

@@ -7,13 +7,18 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <utility>
 
+#include "MessageDatabase.h"
 #include "mozilla/Components.h"
+#include "mozilla/Maybe.h"
 #include "mozilla/Try.h"
+#include "nsHashKeys.h"
 #include "nsIMsgAccountManager.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsString.h"
+#include "nsTHashSet.h"
 #include "prtime.h"
 
 namespace mozilla::mailnews {
@@ -108,10 +113,31 @@ NS_IMETHODIMP Message::GetIsFlagged(bool* isFlagged) {
 
 NS_IMETHODIMP Message::GetIsKilled(bool* isKilled) {
   NS_ENSURE_ARG_POINTER(isKilled);
-  uint32_t flags;
-  MOZ_TRY(MessageDB().GetMessageFlags(mKey, flags));
-  *isKilled = flags & nsMsgMessageFlags::Ignored;
-  return NS_OK;
+  *isKilled = false;
+  Maybe<CapturedMessage> current;
+  MOZ_TRY(MessageDB().CaptureHeaderState(mKey, current));
+  NS_ENSURE_TRUE(current, NS_ERROR_UNEXPECTED);
+  const uint64_t folderId = current->folderId;
+  const nsMsgKey threadId = current->threadId;
+  nsTHashSet<nsUint32HashKey> ancestors;
+  while (true) {
+    NS_ENSURE_TRUE(!ancestors.Contains(current->id), NS_ERROR_FILE_CORRUPTED);
+    ancestors.Insert(current->id);
+    if (current->flags & nsMsgMessageFlags::Ignored) {
+      *isKilled = true;
+      return NS_OK;
+    }
+    if (!current->threadParent || current->threadParent == nsMsgKey_None) {
+      return NS_OK;
+    }
+    Maybe<CapturedMessage> parent;
+    MOZ_TRY(MessageDB().CaptureHeaderState(current->threadParent, parent));
+    if (!parent || parent->folderId != folderId ||
+        parent->threadId != threadId) {
+      return NS_OK;
+    }
+    current = std::move(parent);
+  }
 }
 
 NS_IMETHODIMP Message::MarkRead(bool read) {

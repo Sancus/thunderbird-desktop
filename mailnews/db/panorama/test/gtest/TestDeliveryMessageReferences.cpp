@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <type_traits>
 
 #include "DatabaseCore.h"
@@ -26,11 +27,13 @@
 #include "nsDirectoryServiceDefs.h"
 #include "nsDirectoryServiceUtils.h"
 #include "nsIEventTarget.h"
+#include "nsIDBChangeListener.h"
 #include "nsIFile.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgHdr.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
+#include "nsMsgMessageFlags.h"
 #include "nsServiceManagerUtils.h"
 #include "nsString.h"
 #include "nsThreadUtils.h"
@@ -243,6 +246,61 @@ class DeliveryMessageReferences : public testing::Test {
     ASSERT_TRUE(mHeader);
   }
 
+  nsresult StoreParentForBridge(nsMsgKey key, nsMsgKey thread,
+                                nsMsgKey parent) {
+    nsCOMPtr<mozIStorageStatement> statement;
+    MOZ_TRY(Connection()->CreateStatement(
+        "UPDATE messages SET threadId=:thread, threadParent=:parent WHERE id=:id"_ns,
+        getter_AddRefs(statement)));
+    MOZ_TRY(statement->BindInt64ByName("id"_ns, key));
+    MOZ_TRY(statement->BindInt64ByName("thread"_ns, thread));
+    MOZ_TRY(statement->BindInt64ByName("parent"_ns, parent));
+    return statement->Execute();
+  }
+
+  void PrepareParentChange(MessageThreadBatch& batch) {
+    ASSERT_NO_FATAL_FAILURE(Create({"future-parent@invalid"_ns}));
+    CapturedMessage before;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(mKey, before));
+    ASSERT_EQ(0u, before.threadParent);
+    ASSERT_EQ(mKey, before.threadId);
+    nsMsgKey parent;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().AddMessage(
+                  mFolder, "future-parent@invalid"_ns, {}, 123457, "sender"_ns,
+                  "recipient"_ns, EmptyCString(), EmptyCString(), "parent"_ns,
+                  0, EmptyCString(), 0, &parent));
+    // Model the producer's committed derived fields, not arrival grouping.
+    ASSERT_EQ(NS_OK, StoreParentForBridge(mKey, parent, parent));
+    CapturedMessage after, publication;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(mKey, after));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(parent, publication));
+    ASSERT_EQ(parent, after.threadParent);
+    ASSERT_EQ(parent, after.threadId);
+    batch.batchId = 1;
+    batch.publicationKey = parent;
+    batch.notifyLegacy = false;
+    batch.before.AppendElement(before);
+    batch.after.AppendElement(after);
+    batch.after.AppendElement(publication);
+    batch.changedKeys.AppendElement(mKey);
+  }
+
+  void CheckParentBridgeCount(int64_t expected) {
+    nsCOMPtr<mozIStorageStatement> statement;
+    ASSERT_EQ(NS_OK,
+              Connection()->CreateStatement(
+                  "SELECT COUNT(*) FROM messages WHERE folderId=:folder"_ns,
+                  getter_AddRefs(statement)));
+    ASSERT_EQ(NS_OK, statement->BindInt64ByName("folder"_ns, mFolder));
+    bool more;
+    ASSERT_EQ(NS_OK, statement->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    int64_t count;
+    ASSERT_EQ(NS_OK, statement->GetInt64(0, &count));
+    EXPECT_EQ(expected, count);
+  }
+
   void CreateOversized() {
     nsTArray<nsCString> tokens;
     for (uint32_t i = 0; i < 65535; ++i) {
@@ -391,6 +449,188 @@ class DeliveryMessageReferences : public testing::Test {
   nsMsgKey mKey = nsMsgKey_None;
   static inline bool sCloseCompleted = false;
 };
+
+class DeliveryParentChangeListener final : public nsIDBChangeListener {
+ public:
+  NS_DECL_ISUPPORTS
+  struct Change {
+    nsMsgKey key, oldParent, newParent;
+  };
+  nsTArray<Change> changes;
+  nsTArray<nsMsgKey> added;
+  nsTArray<nsMsgKey> order;
+  uint32_t otherChanges = 0;
+  PerFolderDatabase* detachFrom = nullptr;
+
+  NS_IMETHOD OnParentChanged(nsMsgKey key, nsMsgKey oldParent,
+                             nsMsgKey newParent,
+                             nsIDBChangeListener* instigator) override {
+    EXPECT_EQ(nullptr, instigator);
+    changes.AppendElement(Change{key, oldParent, newParent});
+    order.AppendElement(key);
+    if (detachFrom) {
+      PerFolderDatabase* db = detachFrom;
+      detachFrom = nullptr;
+      EXPECT_EQ(NS_OK, db->RemoveListener(this));
+    }
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrAdded(nsIMsgDBHdr* header, nsMsgKey parent, int32_t,
+                        nsIDBChangeListener* instigator) override {
+    EXPECT_EQ(nullptr, instigator);
+    EXPECT_EQ(nsMsgKey_None, parent);
+    nsMsgKey key = nsMsgKey_None;
+    EXPECT_EQ(NS_OK, header->GetMessageKey(&key));
+    added.AppendElement(key);
+    order.AppendElement(key);
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrDeleted(nsIMsgDBHdr*, nsMsgKey, int32_t,
+                          nsIDBChangeListener*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrFlagsChanged(nsIMsgDBHdr*, uint32_t, uint32_t,
+                               nsIDBChangeListener*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnAnnouncerGoingAway(nsIDBChangeAnnouncer*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnReadChanged(nsIDBChangeListener*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnJunkScoreChanged(nsIDBChangeListener*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrPropertyChanged(nsIMsgDBHdr*, const nsACString&, bool,
+                                  uint32_t*, nsIDBChangeListener*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnEvent(nsIMsgDatabase*, const char*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+
+ private:
+  ~DeliveryParentChangeListener() = default;
+};
+NS_IMPL_ISUPPORTS(DeliveryParentChangeListener, nsIDBChangeListener)
+
+class DeliveryEarlyMutationListener final : public MessageListener {
+ public:
+  NS_DECL_ISUPPORTS
+  std::function<void(const CapturedMessage&, Message*)> publication;
+  std::function<void(const MessageBodyState&)> body;
+  void OnMessageAdded(Message*) override {}
+  void OnMessageRemoved(Message*, uint32_t) override {}
+  void OnMessageFlagsChanged(nsIMsgDBHdr*, Message*, uint32_t,
+                             uint32_t) override {}
+  void OnMessageTagsChanged(nsIMsgDBHdr*, Message*, const nsACString&,
+                            const nsACString&) override {}
+  void OnMessagePublishedCaptured(const CapturedMessage& after, Message* live,
+                                  bool) override {
+    if (publication) {
+      publication(after, live);
+    }
+  }
+  void OnMessageBodyChangedCaptured(const CapturedMessage&,
+                                    const CapturedMessage&, nsIMsgDBHdr*,
+                                    Message*, const MessageBodyState&,
+                                    const MessageBodyState& after) override {
+    if (body) {
+      body(after);
+    }
+  }
+
+ private:
+  ~DeliveryEarlyMutationListener() = default;
+};
+NS_IMPL_ISUPPORTS(DeliveryEarlyMutationListener, nsISupports)
+
+class DeliveryCapturedLegacyListener final : public nsIDBChangeListener {
+ public:
+  NS_DECL_ISUPPORTS
+  explicit DeliveryCapturedLegacyListener(PerFolderDatabase* db) : mDB(db) {}
+  struct Event {
+    char kind;
+    nsMsgKey key, parent;
+    uint32_t oldFlags, flags, liveFlags;
+    nsCString tags;
+    nsTArray<nsMsgKey> newKeys;
+  };
+  nsTArray<Event> events;
+  uint32_t otherChanges = 0;
+  bool closeOnParent = false;
+  nsresult Record(char kind, nsIMsgDBHdr* header, nsMsgKey parent,
+                  uint32_t oldFlags, uint32_t flags) {
+    Event event{kind, nsMsgKey_None, parent, oldFlags, flags, 0, {}, {}};
+    MOZ_TRY(header->GetMessageKey(&event.key));
+    MOZ_TRY(header->GetFlags(&event.liveFlags));
+    MOZ_TRY(mDB->GetNewList(event.newKeys));
+    if (kind == 'T') {
+      MOZ_TRY(header->GetStringProperty("keywords", event.tags));
+    }
+    events.AppendElement(std::move(event));
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrAdded(nsIMsgDBHdr* header, nsMsgKey parent, int32_t flags,
+                        nsIDBChangeListener* instigator) override {
+    EXPECT_EQ(nullptr, instigator);
+    return Record('A', header, parent, 0, flags);
+  }
+  NS_IMETHOD OnHdrDeleted(nsIMsgDBHdr* header, nsMsgKey parent, int32_t flags,
+                          nsIDBChangeListener* instigator) override {
+    EXPECT_EQ(nullptr, instigator);
+    return Record('D', header, parent, flags, flags);
+  }
+  NS_IMETHOD OnHdrFlagsChanged(nsIMsgDBHdr* header, uint32_t oldFlags,
+                               uint32_t flags,
+                               nsIDBChangeListener* instigator) override {
+    EXPECT_EQ(nullptr, instigator);
+    return Record('F', header, nsMsgKey_None, oldFlags, flags);
+  }
+  NS_IMETHOD OnHdrPropertyChanged(nsIMsgDBHdr* header,
+                                  const nsACString& property, bool preChange,
+                                  uint32_t*,
+                                  nsIDBChangeListener* instigator) override {
+    EXPECT_EQ("keywords"_ns, property);
+    EXPECT_FALSE(preChange);
+    EXPECT_EQ(nullptr, instigator);
+    return Record('T', header, nsMsgKey_None, 0, 0);
+  }
+  NS_IMETHOD OnParentChanged(nsMsgKey, nsMsgKey, nsMsgKey,
+                             nsIDBChangeListener*) override {
+    ++otherChanges;
+    return closeOnParent ? mDB->ForceClosed() : NS_OK;
+  }
+  NS_IMETHOD OnAnnouncerGoingAway(nsIDBChangeAnnouncer*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnReadChanged(nsIDBChangeListener*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnJunkScoreChanged(nsIDBChangeListener*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+  NS_IMETHOD OnEvent(nsIMsgDatabase*, const char*) override {
+    ++otherChanges;
+    return NS_OK;
+  }
+
+ private:
+  ~DeliveryCapturedLegacyListener() = default;
+  PerFolderDatabase* mDB;
+};
+NS_IMPL_ISUPPORTS(DeliveryCapturedLegacyListener, nsIDBChangeListener)
 
 namespace {
 
@@ -955,6 +1195,637 @@ TEST_F(DISABLED_DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {
   EXPECT_FALSE(live);
   EXPECT_EQ(1u, mWitness->mCalls);
   EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, draft->SetSubject("retry"_ns));
+}
+
+using DISABLED_DeliveryParentChanges = DeliveryMessageReferences;
+
+TEST_F(DISABLED_DeliveryParentChanges,
+       ParentBridgeUsesCapturedParentsWhenLegacyAddIsSuppressed) {
+  MessageThreadBatch batch;
+  ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryParentChangeListener> listener =
+      new DeliveryParentChangeListener;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  PreparedThreadBatch prepared;
+  ASSERT_EQ(NS_OK, db->PrepareThreadBatch(batch, prepared));
+  db->DeliverThreadBatch(prepared);
+  ASSERT_EQ(1u, listener->changes.Length());
+  EXPECT_EQ(mKey, listener->changes[0].key);
+  EXPECT_EQ(nsMsgKey_None, listener->changes[0].oldParent);
+  EXPECT_EQ(batch.publicationKey, listener->changes[0].newParent);
+  EXPECT_TRUE(listener->added.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+  CapturedMessage stored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(mKey, stored));
+  EXPECT_EQ(batch.publicationKey, stored.threadParent);
+  EXPECT_EQ(batch.publicationKey, stored.threadId);
+  EXPECT_EQ(0u, stored.flags);
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(mKey, references));
+  ASSERT_EQ(1u, references.Length());
+  EXPECT_EQ("future-parent@invalid"_ns, references[0]);
+}
+
+TEST_F(DISABLED_DeliveryParentChanges,
+       ParentBridgePrecedesOnlyTheActualPublication) {
+  MessageThreadBatch batch;
+  ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
+  batch.notifyLegacy = true;
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryParentChangeListener> listener =
+      new DeliveryParentChangeListener;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  PreparedThreadBatch prepared;
+  ASSERT_EQ(NS_OK, db->PrepareThreadBatch(batch, prepared));
+  db->DeliverThreadBatch(prepared);
+  ASSERT_EQ(1u, listener->changes.Length());
+  ASSERT_EQ(1u, listener->added.Length());
+  EXPECT_EQ(batch.publicationKey, listener->added[0]);
+  ASSERT_EQ(2u, listener->order.Length());
+  EXPECT_EQ(mKey, listener->order[0]);
+  EXPECT_EQ(batch.publicationKey, listener->order[1]);
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+}
+
+TEST_F(DISABLED_DeliveryParentChanges,
+       ParentBridgeKeepsHistoryAfterAnEarlierRemoval) {
+  MessageThreadBatch batch;
+  ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  PreparedThreadBatch prepared;
+  ASSERT_EQ(NS_OK, db->PrepareThreadBatch(batch, prepared));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(mKey));
+  ASSERT_NO_FATAL_FAILURE(CheckMessageRow(false));
+  RefPtr<DeliveryParentChangeListener> listener =
+      new DeliveryParentChangeListener;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  db->DeliverThreadBatch(prepared);
+  ASSERT_EQ(1u, listener->changes.Length());
+  EXPECT_EQ(mKey, listener->changes[0].key);
+  EXPECT_EQ(nsMsgKey_None, listener->changes[0].oldParent);
+  EXPECT_EQ(batch.publicationKey, listener->changes[0].newParent);
+  EXPECT_TRUE(listener->added.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckMessageRow(false));
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryParentChanges, ParentBridgeMapsAnAbsentDestination) {
+  MessageThreadBatch batch;
+  ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
+  CapturedMessage before = batch.after[0], after;
+  ASSERT_EQ(NS_OK, StoreParentForBridge(mKey, mKey, 0));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(mKey, after));
+  RefPtr<Message> live = new Message(mKey);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryParentChangeListener> listener =
+      new DeliveryParentChangeListener;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  db->OnMessageThreadChanged(before, after, live);
+  ASSERT_EQ(1u, listener->changes.Length());
+  EXPECT_EQ(mKey, listener->changes[0].key);
+  EXPECT_EQ(batch.publicationKey, listener->changes[0].oldParent);
+  EXPECT_EQ(nsMsgKey_None, listener->changes[0].newParent);
+  EXPECT_TRUE(listener->added.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+}
+
+TEST_F(DISABLED_DeliveryParentChanges,
+       ParentBridgeIgnoresForeignScopeAndUnchangedParents) {
+  MessageThreadBatch batch;
+  ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
+  CapturedMessage before = batch.before[0], after;
+  RefPtr<Message> live = new Message(mKey);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryParentChangeListener> listener =
+      new DeliveryParentChangeListener;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  after = before;
+  after.threadId = batch.publicationKey;
+  db->OnMessageThreadChanged(before, after, live);
+  after.threadParent = nsMsgKey_None;
+  db->OnMessageThreadChanged(before, after, live);
+  uint64_t otherRoot, other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertRoot("parent-bridge-other"_ns, &otherRoot));
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(otherRoot, "Inbox"_ns, &other));
+  after = before;
+  after.folderId = other;
+  after.threadParent = mKey;
+  db->OnMessageThreadChanged(before, after, live);
+  db->OnMessageThreadChanged(after, before, live);
+  before = after;
+  after.threadParent = 0;
+  db->OnMessageThreadChanged(before, after, live);
+  EXPECT_TRUE(listener->changes.IsEmpty());
+  EXPECT_TRUE(listener->added.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+}
+
+TEST_F(DISABLED_DeliveryParentChanges, ParentBridgeAllowsListenerRemoval) {
+  MessageThreadBatch batch;
+  ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
+  RefPtr<Message> live = new Message(mKey);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryParentChangeListener> listener =
+      new DeliveryParentChangeListener;
+  listener->detachFrom = db;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  db->OnMessageThreadChanged(batch.before[0], batch.after[0], live);
+  ASSERT_EQ(1u, listener->changes.Length());
+  ASSERT_EQ(NS_OK, StoreParentForBridge(mKey, mKey, 0));
+  CapturedMessage restored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(mKey, restored));
+  db->OnMessageThreadChanged(batch.after[0], restored, live);
+  EXPECT_EQ(1u, listener->changes.Length());
+  EXPECT_TRUE(listener->added.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+}
+
+using DISABLED_DeliveryHeaderAncestry = DeliveryMessageReferences;
+
+TEST_F(DISABLED_DeliveryHeaderAncestry, StagedOwnFlagsStayUnpublished) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryParentChangeListener> listener =
+      new DeliveryParentChangeListener;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  RawHdr raw{};
+  raw.messageId = "staged-own-killed@invalid"_ns;
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolder, raw, &key,
+                                                   getter_AddRefs(header)));
+  bool killed = true;
+  EXPECT_EQ(NS_OK, header->GetIsKilled(&killed));
+  EXPECT_FALSE(killed);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageFlag(
+                       key, nsMsgMessageFlags::Ignored, true));
+  EXPECT_EQ(NS_OK, header->GetIsKilled(&killed));
+  EXPECT_TRUE(killed);
+  ASSERT_EQ(NS_OK, header->MarkRead(true));
+  Maybe<CapturedMessage> state;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(key, state));
+  ASSERT_TRUE(state);
+  EXPECT_EQ(nsMsgMessageFlags::Ignored | nsMsgMessageFlags::Read, state->flags);
+  EXPECT_EQ(mFolder, state->folderId);
+  bool published = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, published));
+  EXPECT_FALSE(published);
+  EXPECT_EQ(NS_ERROR_NULL_POINTER, header->GetIsKilled(nullptr));
+  EXPECT_TRUE(listener->changes.IsEmpty());
+  EXPECT_TRUE(listener->added.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+}
+
+TEST_F(DISABLED_DeliveryHeaderAncestry,
+       StagedAncestryRemainsPhysicalFolderScoped) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageFlag(
+                       mKey, nsMsgMessageFlags::Ignored, true));
+  RawHdr raw{};
+  raw.messageId = "staged-descendant@invalid"_ns;
+  raw.references = {"child@invalid"_ns};
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolder, raw, &key,
+                                                   getter_AddRefs(header)));
+  Maybe<CapturedMessage> state;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(key, state));
+  ASSERT_TRUE(state);
+  ASSERT_EQ(mKey, state->threadParent);
+  ASSERT_EQ(mKey, state->threadId);
+  bool killed = false;
+  EXPECT_EQ(NS_OK, header->GetIsKilled(&killed));
+  EXPECT_TRUE(killed);
+  EXPECT_EQ(0u, state->flags);
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  raw.messageId = "foreign-staged-descendant@invalid"_ns;
+  RefPtr<Message> foreign;
+  nsMsgKey foreignKey;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(other, raw, &foreignKey,
+                                                   getter_AddRefs(foreign)));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(foreignKey, state));
+  ASSERT_TRUE(state);
+  ASSERT_EQ(mKey, state->threadParent);
+  ASSERT_EQ(other, state->folderId);
+  killed = true;
+  EXPECT_EQ(NS_OK, foreign->GetIsKilled(&killed));
+  EXPECT_FALSE(killed);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryHeaderAncestry,
+       RemovedAncestorCannotSupplyCachedKilledState) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageFlag(
+                       mKey, nsMsgMessageFlags::Ignored, true));
+  RawHdr raw{};
+  raw.messageId = "staged-survivor@invalid"_ns;
+  raw.references = {"child@invalid"_ns};
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolder, raw, &key,
+                                                   getter_AddRefs(header)));
+  bool killed = false;
+  ASSERT_EQ(NS_OK, header->GetIsKilled(&killed));
+  ASSERT_TRUE(killed);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(mKey));
+  ASSERT_NO_FATAL_FAILURE(CheckMessageRow(false));
+  uint32_t retainedFlags = 0;
+  ASSERT_EQ(NS_OK, mHeader->GetFlags(&retainedFlags));
+  EXPECT_TRUE(retainedFlags & nsMsgMessageFlags::Ignored);
+  EXPECT_EQ(NS_OK, header->GetIsKilled(&killed));
+  EXPECT_FALSE(killed);
+  Maybe<CapturedMessage> state;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(key, state));
+  ASSERT_TRUE(state);
+  EXPECT_EQ(mKey, state->threadParent);
+  EXPECT_EQ(0u, state->flags);
+}
+
+TEST_F(DISABLED_DeliveryHeaderAncestry,
+       AbortedOwnHeaderFailsWithClearedOutput) {
+  RawHdr raw{};
+  raw.messageId = "aborted-killed@invalid"_ns;
+  raw.flags = nsMsgMessageFlags::Ignored;
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolder, raw, &key,
+                                                   getter_AddRefs(header)));
+  bool killed = false;
+  ASSERT_EQ(NS_OK, header->GetIsKilled(&killed));
+  ASSERT_TRUE(killed);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AbortMessage(key));
+  Maybe<CapturedMessage> state;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(key, state));
+  ASSERT_FALSE(state);
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, header->GetIsKilled(&killed));
+  EXPECT_FALSE(killed);
+}
+
+TEST_F(DISABLED_DeliveryHeaderAncestry,
+       StagedAncestorCycleFailsWithClearedOutput) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RawHdr raw{};
+  raw.messageId = "staged-cycle@invalid"_ns;
+  raw.references = {"child@invalid"_ns};
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolder, raw, &key,
+                                                   getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, StoreParentForBridge(mKey, mKey, key));
+  bool killed = true;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, header->GetIsKilled(&killed));
+  EXPECT_FALSE(killed);
+  Maybe<CapturedMessage> state;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(key, state));
+  ASSERT_TRUE(state);
+  EXPECT_EQ(mKey, state->threadParent);
+  EXPECT_EQ(0u, state->flags);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryHeaderAncestry, StagedReadFailureIsNotMissingAncestry) {
+  RawHdr raw{};
+  raw.messageId = "staged-read-error@invalid"_ns;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolder, raw, &mKey,
+                                                   getter_AddRefs(header)));
+  ASSERT_NO_FATAL_FAILURE(InstallWitness(true));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW staged_messages AS SELECT "
+                       "id,folderId,messageId,date,sender,"
+                       "recipients,subject,delivery_references_fault(id) AS "
+                       "flags,tags,threadId,"
+                       "threadParent FROM main.staged_messages"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP VIEW temp.staged_messages"_ns));
+  });
+  bool killed = true;
+  EXPECT_EQ(NS_ERROR_FAILURE, header->GetIsKilled(&killed));
+  EXPECT_FALSE(killed);
+  ASSERT_TRUE(mWitness);
+  EXPECT_GT(mWitness->mCalls, 0u);
+  EXPECT_EQ(int64_t(mKey), mWitness->mLastKey);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+}
+
+using DISABLED_DeliveryCapturedNotifications = DeliveryMessageReferences;
+
+TEST_F(DISABLED_DeliveryCapturedNotifications,
+       PublicationPrecedesReentrantReadDelta) {
+  auto& native = mCore->MessageDB();
+  RefPtr<DeliveryEarlyMutationListener> early =
+      new DeliveryEarlyMutationListener;
+  native.AddMessageListener(early);
+  auto unwatch = MakeScopeExit([&] { native.RemoveMessageListener(early); });
+  bool changed = false;
+  early->publication = [&](const CapturedMessage& after, Message* live) {
+    changed = true;
+    EXPECT_EQ(mFolder, after.folderId);
+    EXPECT_EQ(NS_OK, live->MarkRead(true));
+  };
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  RawHdr raw{};
+  raw.messageId = "captured-read@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, native.AddMessage(mFolder, raw, true, &key));
+  ASSERT_TRUE(changed);
+  ASSERT_EQ(2u, listener->events.Length());
+  const auto& added = listener->events[0];
+  EXPECT_EQ('A', added.kind);
+  EXPECT_EQ(key, added.key);
+  EXPECT_EQ(0u, added.flags);
+  EXPECT_EQ(nsMsgKey_None, added.parent);
+  EXPECT_EQ(nsMsgMessageFlags::Read, added.liveFlags);
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), added.newKeys);
+  const auto& read = listener->events[1];
+  EXPECT_EQ('F', read.kind);
+  EXPECT_EQ(0u, read.oldFlags);
+  EXPECT_EQ(nsMsgMessageFlags::Read, read.flags);
+  EXPECT_TRUE(read.newKeys.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  Maybe<CapturedMessage> stored;
+  ASSERT_EQ(NS_OK, native.CaptureHeaderState(key, stored));
+  ASSERT_TRUE(stored);
+  EXPECT_EQ(nsMsgMessageFlags::Read, stored->flags);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryCapturedNotifications,
+       PublicationAndDeletionKeepHistoricalParent) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  auto& native = mCore->MessageDB();
+  RefPtr<DeliveryEarlyMutationListener> early =
+      new DeliveryEarlyMutationListener;
+  native.AddMessageListener(early);
+  auto unwatch = MakeScopeExit([&] { native.RemoveMessageListener(early); });
+  bool removed = false;
+  early->publication = [&](const CapturedMessage& after, Message*) {
+    removed = true;
+    EXPECT_EQ(NS_OK, native.RemoveMessage(after.id));
+  };
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  RawHdr raw{};
+  raw.messageId = "captured-deletion@invalid"_ns;
+  raw.references = {"child@invalid"_ns};
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, native.AddMessage(mFolder, raw, true, &key));
+  ASSERT_TRUE(removed);
+  ASSERT_EQ(2u, listener->events.Length());
+  EXPECT_EQ('A', listener->events[0].kind);
+  EXPECT_EQ(mKey, listener->events[0].parent);
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), listener->events[0].newKeys);
+  EXPECT_EQ('D', listener->events[1].kind);
+  EXPECT_EQ(key, listener->events[1].key);
+  EXPECT_EQ(mKey, listener->events[1].parent);
+  EXPECT_EQ(0u, listener->events[1].flags);
+  EXPECT_TRUE(listener->events[1].newKeys.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  Maybe<CapturedMessage> stored;
+  ASSERT_EQ(NS_OK, native.CaptureHeaderState(key, stored));
+  EXPECT_FALSE(stored);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryCapturedNotifications,
+       ReentrantTagsUseExistingPostChangeCallbacks) {
+  auto& native = mCore->MessageDB();
+  RefPtr<DeliveryEarlyMutationListener> early =
+      new DeliveryEarlyMutationListener;
+  native.AddMessageListener(early);
+  auto unwatch = MakeScopeExit([&] { native.RemoveMessageListener(early); });
+  bool changed = false;
+  early->publication = [&](const CapturedMessage& after, Message*) {
+    changed = true;
+    EXPECT_EQ(NS_OK, native.SetMessageTags(after.id, "first"_ns));
+    EXPECT_EQ(NS_OK, native.SetMessageTags(after.id, "second"_ns));
+  };
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  RawHdr raw{};
+  raw.messageId = "captured-tags@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, native.AddMessage(mFolder, raw, true, &key));
+  ASSERT_TRUE(changed);
+  ASSERT_EQ(3u, listener->events.Length());
+  EXPECT_EQ('A', listener->events[0].kind);
+  for (size_t i = 1; i < 3; ++i) {
+    EXPECT_EQ('T', listener->events[i].kind);
+    EXPECT_EQ(key, listener->events[i].key);
+    EXPECT_EQ("second"_ns, listener->events[i].tags);
+  }
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryCapturedNotifications,
+       BodyOnlyChangesDoNotInventEvents) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  auto& native = mCore->MessageDB();
+  RefPtr<DeliveryEarlyMutationListener> early =
+      new DeliveryEarlyMutationListener;
+  native.AddMessageListener(early);
+  auto unwatch = MakeScopeExit([&] { native.RemoveMessageListener(early); });
+  bool changed = false;
+  early->body = [&](const MessageBodyState& after) {
+    if (changed || !(after.flags & nsMsgMessageFlags::Offline)) {
+      return;
+    }
+    changed = true;
+    FinishedMessageBody latest;
+    latest.storeToken = "latest"_ns;
+    latest.messageSize = 20;
+    latest.offlineMessageSize = 21;
+    latest.lineCount = 4;
+    MessageBodyState output;
+    EXPECT_EQ(NS_OK, native.SettleMessageBody(after, latest, output));
+  };
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  ASSERT_EQ(NS_OK, db->AddToNewList(mKey));
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  MessageBodyState before, after;
+  ASSERT_EQ(NS_OK, native.GetMessageBodyState(mKey, before));
+  FinishedMessageBody finished;
+  finished.storeToken = "token-only"_ns;
+  finished.messageSize = 10;
+  finished.offlineMessageSize = 11;
+  finished.lineCount = 2;
+  ASSERT_EQ(NS_OK, native.SettleMessageBody(before, finished, after));
+  EXPECT_TRUE(listener->events.IsEmpty());
+  EXPECT_FALSE(changed);
+  finished.storeToken = "offline"_ns;
+  finished.offline = true;
+  ASSERT_EQ(NS_OK, native.SettleMessageBody(after, finished, before));
+  ASSERT_TRUE(changed);
+  ASSERT_EQ(2u, listener->events.Length());
+  EXPECT_EQ('F', listener->events[0].kind);
+  EXPECT_EQ(0u, listener->events[0].oldFlags);
+  EXPECT_EQ(nsMsgMessageFlags::Offline, listener->events[0].flags);
+  EXPECT_EQ(0u, listener->events[0].liveFlags);
+  EXPECT_EQ('F', listener->events[1].kind);
+  EXPECT_EQ(nsMsgMessageFlags::Offline, listener->events[1].oldFlags);
+  EXPECT_EQ(0u, listener->events[1].flags);
+  EXPECT_EQ((nsTArray<nsMsgKey>{mKey}), listener->events[1].newKeys);
+  ASSERT_EQ(NS_OK, native.GetMessageBodyState(mKey, after));
+  ASSERT_TRUE(after.storeToken);
+  EXPECT_EQ("latest"_ns, *after.storeToken);
+  EXPECT_EQ(20u, after.messageSize);
+  EXPECT_EQ(21u, after.offlineMessageSize);
+  EXPECT_EQ(4u, after.lineCount);
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryCapturedNotifications,
+       SuppressedAddStillTracksUnreadMembership) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  RawHdr raw{};
+  raw.messageId = "captured-suppressed@invalid"_ns;
+  nsMsgKey key;
+  RefPtr<Message> live;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolder, raw, false, &key,
+                                                 getter_AddRefs(live)));
+  EXPECT_TRUE(listener->events.IsEmpty());
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->GetNewList(keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
+  ASSERT_EQ(NS_OK, live->MarkRead(true));
+  ASSERT_EQ(1u, listener->events.Length());
+  EXPECT_EQ('F', listener->events[0].kind);
+  EXPECT_EQ(nsMsgMessageFlags::Read, listener->events[0].flags);
+  EXPECT_TRUE(listener->events[0].newKeys.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+}
+
+TEST_F(DISABLED_DeliveryCapturedNotifications,
+       ForeignFolderFactsDoNotChangeThisWrapper) {
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  RawHdr raw{};
+  raw.messageId = "captured-foreign@invalid"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(other, raw, true, &key));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageFlag(
+                       key, nsMsgMessageFlags::Read, true));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageTags(key, "foreign"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(key));
+  EXPECT_TRUE(listener->events.IsEmpty());
+  EXPECT_EQ(0u, listener->otherChanges);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->GetNewList(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+}
+
+using DISABLED_DeliveryCapturedLifetime = DeliveryMessageReferences;
+
+TEST_F(DISABLED_DeliveryCapturedLifetime,
+       ClosedDuringParentDoesNotConsumePublication) {
+  MessageThreadBatch batch;
+  ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  listener->closeOnParent = true;
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  PreparedThreadBatch prepared;
+  ASSERT_EQ(NS_OK, db->PrepareThreadBatch(batch, prepared));
+  db->DeliverThreadBatch(prepared);
+  EXPECT_TRUE(listener->events.IsEmpty());
+  EXPECT_EQ(2u, listener->otherChanges);
+  nsTArray<nsMsgKey> newKeys;
+  ASSERT_EQ(NS_OK, db->GetNewList(newKeys));
+  EXPECT_TRUE(newKeys.IsEmpty());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->AddListener(listener));
+  Maybe<CapturedMessage> stored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(batch.publicationKey,
+                                                         stored));
+  ASSERT_TRUE(stored);
+  EXPECT_EQ(mFolder, stored->folderId);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+}
+
+TEST_F(DISABLED_DeliveryHeaderAncestry,
+       SingleReferenceUsesTheParentsActualThread) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  nsMsgKey branch;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(
+                mFolder, "staged-branch@invalid"_ns, {"child@invalid"_ns},
+                123457, "sender"_ns, "recipient"_ns, EmptyCString(),
+                EmptyCString(), "branch"_ns, 0, EmptyCString(), 0, &branch));
+  ASSERT_NE(mKey, branch);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageFlag(
+                       branch, nsMsgMessageFlags::Ignored, true));
+  RawHdr raw{};
+  raw.messageId = "staged-single-reference@invalid"_ns;
+  raw.references = {"staged-branch@invalid"_ns};
+  nsMsgKey key;
+  RefPtr<Message> header;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolder, raw, &key,
+                                                   getter_AddRefs(header)));
+  Maybe<CapturedMessage> state;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureHeaderState(key, state));
+  ASSERT_TRUE(state);
+  EXPECT_EQ(branch, state->threadParent);
+  EXPECT_EQ(mKey, state->threadId);
+  bool killed = false;
+  EXPECT_EQ(NS_OK, header->GetIsKilled(&killed));
+  EXPECT_TRUE(killed);
+  bool published = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, published));
+  EXPECT_FALSE(published);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
 }
 
 }  // namespace

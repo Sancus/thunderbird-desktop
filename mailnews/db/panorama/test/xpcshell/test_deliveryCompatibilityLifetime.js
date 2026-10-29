@@ -1,0 +1,230 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+let root;
+
+add_setup(function () {
+  do_get_profile();
+  const contract = "@mozilla.org/msgstore/berkeleystore;1";
+  Services.prefs.setCharPref("mail.serverDefaultStoreContractID", contract);
+  Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
+  loadExistingDB();
+  Assert.equal(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+      .getService(Ci.nsIMsgDBService)
+      .QueryInterface(Ci.nsIDatabaseCore),
+    database
+  );
+  const account = MailServices.accounts.createLocalMailAccount();
+  registerCleanupFunction(() => {
+    MailServices.accounts.removeAccount(account, false);
+    Services.prefs.clearUserPref("mail.serverDefaultStoreContractID");
+    Services.prefs.clearUserPref("mail.server.default.storeContractID");
+  });
+  root = account.incomingServer.rootFolder.QueryInterface(
+    Ci.nsIMsgLocalMailFolder
+  );
+  Assert.equal(root.msgStore.storeType, "mbox");
+  Assert.equal(root.server.getStringValue("storeContractID"), contract);
+});
+
+add_task(function test_explicitGoingAwayKeepsScopeAndAllowsSelfRemoval() {
+  const first = root.createLocalSubfolder("going-away-first").msgDatabase;
+  const second = root.createLocalSubfolder("going-away-second").msgDatabase;
+  const calls = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway(source) {
+      calls.push(source);
+      source.removeListener(listener);
+    },
+  };
+  first.addListener(listener);
+  second.addListener(listener);
+  try {
+    first.notifyAnnouncerGoingAway();
+    first.notifyAnnouncerGoingAway();
+    Assert.equal(calls.length, 1);
+    Assert.strictEqual(calls[0], first);
+    second.notifyAnnouncerGoingAway();
+    Assert.equal(calls.length, 2);
+    Assert.strictEqual(calls[1], second);
+  } finally {
+    first.removeListener(listener);
+    second.removeListener(listener);
+  }
+});
+
+add_task(function test_closeKeepsSubscriptionWithoutCommittingForeignWork() {
+  const folder = root.createLocalSubfolder("ordinary-close");
+  const db = folder.msgDatabase;
+  const calls = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrAdded(header) {
+      calls.push(header.messageKey);
+    },
+    onAnnouncerGoingAway() {
+      Assert.ok(false, "Ordinary close does not force listeners away");
+    },
+  };
+  db.addListener(listener);
+  try {
+    const connection = database.connectionForTests;
+    connection.beginTransaction();
+    try {
+      db.close(false);
+      Assert.ok(connection.transactionInProgress);
+      db.close(true);
+      Assert.ok(connection.transactionInProgress);
+    } finally {
+      connection.rollbackTransaction();
+    }
+    Assert.strictEqual(folder.msgDatabase, db);
+    const key = addMessage({ folderId: folder.id });
+    Assert.deepEqual(calls, [key]);
+    Assert.deepEqual(db.listAllKeys(), [key]);
+  } finally {
+    db.removeListener(listener);
+  }
+});
+
+add_task(function test_forceCloseReopensOnlyItsWrapperAndPreservesRows() {
+  const folder = root.createLocalSubfolder("forced-close");
+  const other = root.createLocalSubfolder("still-open");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const key = addMessage({ folderId: folder.id });
+  db.dBFolderInfo.setCharProperty("close-preserved", "exact value");
+  let gone = 0;
+  let oldAdds = 0;
+  let otherAdds = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway(source) {
+      Assert.strictEqual(source, db);
+      ++gone;
+      source.removeListener(listener);
+    },
+    onHdrAdded() {
+      ++oldAdds;
+    },
+  };
+  const otherListener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway() {
+      Assert.ok(false, "The other folder remains open");
+    },
+    onHdrAdded() {
+      ++otherAdds;
+    },
+  };
+  db.addListener(listener);
+  otherDB.addListener(otherListener);
+  try {
+    db.forceClosed();
+    db.forceClosed();
+    Assert.equal(gone, 1);
+    Assert.throws(() => db.addListener(listener), /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => db.folder, /NS_ERROR_NOT_AVAILABLE/);
+    const reopened = folder.msgDatabase;
+    Assert.notStrictEqual(reopened, db);
+    Assert.strictEqual(reopened.folder, folder);
+    Assert.strictEqual(folder.msgDatabase, reopened);
+    Assert.equal(
+      reopened.dBFolderInfo.getCharProperty("close-preserved"),
+      "exact value"
+    );
+    Assert.deepEqual(reopened.listAllKeys(), [key]);
+    const next = addMessage({ folderId: folder.id });
+    Assert.deepEqual(reopened.listAllKeys(), [key, next]);
+    Assert.equal(oldAdds, 0);
+    const otherKey = addMessage({ folderId: other.id });
+    Assert.strictEqual(other.msgDatabase, otherDB);
+    Assert.deepEqual(otherDB.listAllKeys(), [otherKey]);
+    Assert.equal(otherAdds, 1);
+  } finally {
+    db.removeListener(listener);
+    otherDB.removeListener(otherListener);
+  }
+});
+
+add_task(function test_goingAwayCanReenterForceCloseAndReopen() {
+  const folder = root.createLocalSubfolder("reentrant-close");
+  const db = folder.msgDatabase;
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  let firstCalls = 0;
+  let secondCalls = 0;
+  let reopened;
+  const first = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway(source) {
+      ++firstCalls;
+      Assert.strictEqual(source, db);
+      source.forceClosed();
+      source.notifyAnnouncerGoingAway();
+      reopened = service.openFolderDB(folder, false);
+      Assert.notStrictEqual(reopened, db);
+    },
+  };
+  const second = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway(source) {
+      ++secondCalls;
+      Assert.strictEqual(source, db);
+    },
+  };
+  db.addListener(first);
+  db.addListener(second);
+  try {
+    db.notifyAnnouncerGoingAway();
+    Assert.equal(firstCalls, 1);
+    Assert.equal(secondCalls, 1);
+    Assert.strictEqual(folder.msgDatabase, reopened);
+    Assert.strictEqual(service.openFolderDB(folder, false), reopened);
+    db.forceClosed();
+    Assert.equal(firstCalls, 1);
+    Assert.equal(secondCalls, 1);
+  } finally {
+    db.removeListener(first);
+    db.removeListener(second);
+  }
+});
+
+add_task(function test_forceCloseDuringPublicationKeepsHeaderAndOneEvent() {
+  const folder = root.createLocalSubfolder("close-on-add");
+  const db = folder.msgDatabase;
+  const calls = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrAdded(header) {
+      calls.push(["add", header.messageKey]);
+      db.forceClosed();
+    },
+    onAnnouncerGoingAway(source) {
+      Assert.strictEqual(source, db);
+      calls.push(["away"]);
+    },
+  };
+  db.addListener(listener);
+  try {
+    const draft = db.createNewHdr();
+    draft.messageId = "close-on-add@lifetime.invalid";
+    const live = db.attachHdr(draft, true);
+    Assert.deepEqual(calls, [["add", live.messageKey], ["away"]]);
+    const reopened = folder.msgDatabase;
+    Assert.notStrictEqual(reopened, db);
+    Assert.equal(live.folder, folder);
+    Assert.equal(live.messageId, "close-on-add@lifetime.invalid");
+    Assert.deepEqual(reopened.listAllKeys(), [live.messageKey]);
+    addMessage({ folderId: folder.id });
+    Assert.equal(calls.length, 2);
+  } finally {
+    db.removeListener(listener);
+  }
+});

@@ -247,6 +247,133 @@ add_task(async function test_backupRejectsParentPathComponents() {
   Assert.deepEqual(await IOUtils.read(plan.sources[0].path), source);
 });
 
+add_task(async function test_cancelledBackupRetainsWorkAndResumes() {
+  const { sinon } = ChromeUtils.importESModule(
+    "resource://testing-common/Sinon.sys.mjs"
+  );
+  const { plan } = await migrationFiles();
+  const originals = new Map();
+  for (const path of [
+    PathUtils.join(plan.profilePath, "prefs.js"),
+    plan.sources[0].path,
+    PathUtils.join(plan.mailPaths[0], "Inbox"),
+  ]) {
+    const file = new FileUtils.File(path);
+    const lease =
+      AppConstants.platform == "win"
+        ? admitWindowsMigrationPath(
+            file,
+            Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+          )
+        : null;
+    try {
+      if (!lease) {
+        file.normalize();
+      }
+      originals.set(
+        lease?.canonicalPath ?? file.path,
+        await IOUtils.read(path)
+      );
+    } finally {
+      lease?.close();
+    }
+  }
+
+  const controller = new AbortController();
+  const copied = [];
+  const backupIO = Cu.getGlobalForObject(createMigrationBackup).IOUtils;
+  const realCopy = backupIO.copy.bind(backupIO);
+  const copy = sinon.stub(backupIO, "copy").callsFake(async (...args) => {
+    const result = await realCopy(...args);
+    copied.push({ source: args[0], destination: args[1] });
+    controller.abort();
+    return result;
+  });
+  try {
+    await Assert.rejects(
+      createMigrationBackup(
+        plan.profilePath,
+        plan.mailPaths,
+        plan.backupPath,
+        controller.signal
+      ),
+      error =>
+        error.name == "AbortError" &&
+        error.message == "Migration backup cancelled"
+    );
+  } finally {
+    copy.restore();
+  }
+  Assert.equal(copied.length, 1, "One real copy completed before cancellation");
+  const retained = copied[0];
+  Assert.ok(
+    originals.has(retained.source),
+    "The copied file is an original input"
+  );
+  Assert.ok(
+    new FileUtils.File(canonicalRoot(plan.backupPath)).contains(
+      new FileUtils.File(retained.destination)
+    ),
+    "Incomplete work belongs to the backup"
+  );
+  Assert.deepEqual(
+    await IOUtils.read(retained.destination),
+    originals.get(retained.source),
+    "Cancellation retains the completed scratch copy"
+  );
+  const manifestPath = PathUtils.join(plan.backupPath, "manifest.json");
+  const incomplete = await IOUtils.readJSON(manifestPath);
+  Assert.equal(incomplete.complete, false);
+  await Assert.rejects(
+    verifyMigrationBackup(plan.backupPath),
+    /Migration backup is incomplete or unsupported/
+  );
+  for (const [path, bytes] of originals) {
+    Assert.deepEqual(await IOUtils.read(path), bytes);
+  }
+
+  const receipt = await createMigrationBackup(
+    plan.profilePath,
+    plan.mailPaths,
+    plan.backupPath
+  );
+  Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
+  const complete = await IOUtils.readJSON(manifestPath);
+  Assert.equal(complete.complete, true);
+  Assert.deepEqual(
+    complete.roots,
+    incomplete.roots,
+    "Retry keeps source identities"
+  );
+  const [prefs, summary, body] = originals.values();
+  for (const [root, leaf, bytes] of [
+    [0, "prefs.js", prefs],
+    [1, "Inbox.msf", summary],
+    [1, "Inbox", body],
+  ]) {
+    Assert.deepEqual(
+      await IOUtils.read(
+        PathUtils.join(plan.backupPath, complete.roots[root].directory, leaf)
+      ),
+      bytes
+    );
+  }
+
+  const manifestBytes = await IOUtils.read(manifestPath);
+  Assert.deepEqual(
+    await createMigrationBackup(
+      plan.profilePath,
+      plan.mailPaths,
+      plan.backupPath
+    ),
+    receipt
+  );
+  Assert.deepEqual(await IOUtils.read(manifestPath), manifestBytes);
+  for (const [path, bytes] of originals) {
+    Assert.deepEqual(await IOUtils.read(path), bytes);
+  }
+});
+
 add_task(async function test_inventoryReadsPathsWithoutCreatingStores() {
   const profile = do_get_profile();
   const branch = "mail.server.migrationInventory";

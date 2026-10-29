@@ -1062,7 +1062,8 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
   EXPECT_EQ(8u, epoch);
   int32_t flags = 0;
   ASSERT_EQ(NS_OK, mInfo->GetFlags(&flags));
-  EXPECT_EQ(nsMsgFolderFlags::Mail, static_cast<uint32_t>(flags));
+  EXPECT_EQ(static_cast<uint32_t>(nsMsgFolderFlags::Mail),
+            static_cast<uint32_t>(flags));
   nsMsgKey found = nsMsgKey_None;
   EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
             sCore->MessageDB().GetMessageKeyForServerUid(mDatabase->FolderId(),

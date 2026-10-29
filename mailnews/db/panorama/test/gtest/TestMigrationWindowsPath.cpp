@@ -89,9 +89,10 @@ class MigrationWindowsPath : public ::testing::Test {
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     mJunctions.AppendElement(linkPath);
     DWORD returned = 0;
-    if (!handle || !::DeviceIoControl(handle.get(), FSCTL_SET_REPARSE_POINT,
-                                      bytes.Elements(), bytes.Length(), nullptr,
-                                      0, &returned, nullptr)) {
+    if (!FileHandleIsValid(handle.get()) ||
+        !::DeviceIoControl(handle.get(), FSCTL_SET_REPARSE_POINT,
+                           bytes.Elements(), bytes.Length(), nullptr, 0,
+                           &returned, nullptr)) {
       return false;
     }
     return true;
@@ -177,6 +178,19 @@ TEST_F(MigrationWindowsPath, OutsideRootAndDotComponentsAreRefused) {
   EXPECT_EQ(NS_ERROR_FILE_INVALID_PATH, dot.inspectErr());
 }
 
+TEST_F(MigrationWindowsPath, MissingFileIsNotASourceLease) {
+  nsCOMPtr<nsIFile> file;
+  ASSERT_EQ(NS_OK, mRoot->Clone(getter_AddRefs(file)));
+  ASSERT_EQ(NS_OK, file->Append(u"absent-source.msf"_ns));
+  auto result = WindowsMigrationPath::Admit(
+      file, mRoot, WindowsMigrationPath::Kind::File);
+  ASSERT_TRUE(result.isErr());
+  EXPECT_EQ(NS_ERROR_FILE_NOT_FOUND, result.inspectErr());
+  bool exists = true;
+  ASSERT_EQ(NS_OK, file->Exists(&exists));
+  EXPECT_FALSE(exists);
+}
+
 TEST_F(MigrationWindowsPath, MissingParentIsNotAnAbsentLeaf) {
   nsCOMPtr<nsIFile> file;
   ASSERT_EQ(NS_OK, mRoot->Clone(getter_AddRefs(file)));
@@ -216,7 +230,7 @@ TEST_F(MigrationWindowsPath, ExistingWriterPreventsSourceAdmission) {
       ::CreateFileW(path.get(), FILE_WRITE_DATA,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, 0, nullptr));
-  ASSERT_TRUE(writer);
+  ASSERT_TRUE(FileHandleIsValid(writer.get()));
   auto blocked = WindowsMigrationPath::Admit(file, mRoot,
                                              WindowsMigrationPath::Kind::File);
   ASSERT_TRUE(blocked.isErr());
@@ -240,14 +254,14 @@ TEST_F(MigrationWindowsPath, SourceLeaseBlocksWriteUntilReleased) {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, 0, nullptr));
   DWORD error = ::GetLastError();
-  EXPECT_FALSE(writer);
+  EXPECT_FALSE(FileHandleIsValid(writer.get()));
   EXPECT_EQ(DWORD(ERROR_SHARING_VIOLATION), error);
   lease.reset();
   writer.reset(
       ::CreateFileW(path.get(), FILE_WRITE_DATA,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, 0, nullptr));
-  EXPECT_TRUE(writer);
+  EXPECT_TRUE(FileHandleIsValid(writer.get()));
 }
 
 TEST_F(MigrationWindowsPath,
@@ -264,7 +278,7 @@ TEST_F(MigrationWindowsPath,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
   DWORD error = ::GetLastError();
-  EXPECT_FALSE(deleter);
+  EXPECT_FALSE(FileHandleIsValid(deleter.get()));
   EXPECT_EQ(DWORD(ERROR_SHARING_VIOLATION), error);
   nsCOMPtr<nsIFile> child;
   ASSERT_EQ(NS_OK, directory->Clone(getter_AddRefs(child)));
@@ -280,7 +294,7 @@ TEST_F(MigrationWindowsPath,
       path.get(), DELETE,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-  EXPECT_TRUE(deleter);
+  EXPECT_TRUE(FileHandleIsValid(deleter.get()));
 }
 
 TEST_F(MigrationWindowsPath, ExistingDirectoryDeleteAccessPreventsAdmission) {
@@ -291,7 +305,7 @@ TEST_F(MigrationWindowsPath, ExistingDirectoryDeleteAccessPreventsAdmission) {
       path.get(), DELETE,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-  ASSERT_TRUE(deleter);
+  ASSERT_TRUE(FileHandleIsValid(deleter.get()));
   auto blocked = WindowsMigrationPath::Admit(
       directory, mRoot, WindowsMigrationPath::Kind::Directory);
   ASSERT_TRUE(blocked.isErr());
@@ -314,20 +328,20 @@ TEST_F(MigrationWindowsPath, StageLeaseAllowsWriteButDeniesDeleteAccess) {
       ::CreateFileW(path.get(), FILE_WRITE_DATA,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, 0, nullptr));
-  ASSERT_TRUE(writer);
+  ASSERT_TRUE(FileHandleIsValid(writer.get()));
   UniqueFileHandle deleter(
       ::CreateFileW(path.get(), DELETE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, 0, nullptr));
   DWORD error = ::GetLastError();
-  EXPECT_FALSE(deleter);
+  EXPECT_FALSE(FileHandleIsValid(deleter.get()));
   EXPECT_EQ(DWORD(ERROR_SHARING_VIOLATION), error);
   lease.reset();
   deleter.reset(
       ::CreateFileW(path.get(), DELETE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, 0, nullptr));
-  EXPECT_TRUE(deleter);
+  EXPECT_TRUE(FileHandleIsValid(deleter.get()));
 }
 
 TEST_F(MigrationWindowsPath, ReservedDevicesAreNotMissingFiles) {

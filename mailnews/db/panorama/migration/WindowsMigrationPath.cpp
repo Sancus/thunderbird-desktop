@@ -151,8 +151,9 @@ Result<WalkedPath, nsresult> Walk(nsIFile* file,
     UniqueFileHandle handle(::CreateFileW(
         prefix.get(), access, sharing, nullptr, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-    if (!handle) {
-      DWORD error = ::GetLastError();
+    DWORD error = ::GetLastError();
+    // CreateFileW fails with INVALID_HANDLE_VALUE, not just nullptr.
+    if (!FileHandleIsValid(handle.get())) {
       if (leaf && kind == WindowsMigrationPath::Kind::FileOrMissing &&
           error == ERROR_FILE_NOT_FOUND && !result.handles.IsEmpty()) {
         result.parentIdentity = result.identity;

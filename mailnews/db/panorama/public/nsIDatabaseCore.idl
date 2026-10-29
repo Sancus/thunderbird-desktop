@@ -72,6 +72,21 @@ interface nsIDatabaseCore : nsISupports {
                                                     in jsval request);
 
   /**
+   * Apply an explicitly mapped, complete legacy folder cache (Unix version1).
+   * Native flags, counts, sizes and names remain authoritative. Other metadata
+   * fills absent properties only. The receipt retains every original cell and
+   * source byte. No file, profile or startup activation is performed.
+   */
+  [implicit_jscontext] jsval importFolderCacheMetadata(in jsval request);
+
+  /**
+   * Read the cache-only receipt for the same source/database/mapping identity.
+   * Returns null only if absent; conflicting identities throw. No metadata is
+   * reapplied on a matching retry. Windows cache admission is not supported.
+   */
+  [implicit_jscontext] jsval getFolderCacheImportReceipt(in jsval request);
+
+  /**
    * Access to the database for testing purposes only. If you are not a test,
    * you'll get NS_ERROR_NOT_AVAILABLE instead.
    */

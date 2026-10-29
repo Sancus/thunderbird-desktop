@@ -44,6 +44,9 @@ tags = ["panorama"]
 
 ["test_deliveryCoreAccountLifecycle.js"]
 
+["test_deliveryCoreCacheImport.js"]
+support-files = ["../../../../base/test/unit/data/panacea.dat"]
+
 ["test_deliveryCoreDBService.js"]
 
 ["test_deliveryCoreDBServiceShutdown.js"]

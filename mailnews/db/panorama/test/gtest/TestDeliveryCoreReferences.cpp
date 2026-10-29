@@ -1348,7 +1348,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   EXPECT_TRUE(got.IsEmpty());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(14, version);
+  EXPECT_EQ(15, version);
   Stop();
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(7, got));
@@ -4949,12 +4949,13 @@ TEST_F(DeliveryCoreReferences,
           "destinationFolderId;"
           "ALTER TABLE offline_copy_destinations DROP COLUMN destinationKey;"
           "ALTER TABLE offline_copy_destinations DROP COLUMN destinationEpoch;"_ns));
+  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(10));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(14, version);
+  EXPECT_EQ(15, version);
   OfflineOperationData got;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperation(mFolderId, key, got));
   EXPECT_EQ(input.operation, got.operation);
@@ -5228,6 +5229,7 @@ TEST_F(DeliveryCoreReferences, FolderIdsSurviveReopenAndOldOrphanUpgrade) {
           "DROP TABLE thread_flags;"
           "DROP TRIGGER guard_folder_id; DROP TRIGGER record_folder_id;"
           "DROP TRIGGER immutable_folder_id; DROP TABLE folder_id_allocator;"_ns));
+  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(11));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -5616,6 +5618,7 @@ TEST_F(DeliveryCoreReferences, ThreadFlagsUpgradeDoesNotInferHeaderIgnored) {
                                   "DROP TRIGGER thread_flags_message_delete; "
                                   "DROP TRIGGER thread_flags_folder_delete;"
                                   "DROP TABLE thread_flags"_ns));
+  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(12));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -6837,12 +6840,13 @@ TEST_F(DeliveryCoreReferences, Schema14UpgradeKeepsThreadAndPendingState) {
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
   ASSERT_EQ(NS_OK,
             old->ExecuteSimpleSQL("DROP TABLE folder_import_windows"_ns));
+  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(13));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(14, version);
+  EXPECT_EQ(15, version);
   nsCString reopenedId;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(reopenedId));
   EXPECT_EQ(sourceId, reopenedId);

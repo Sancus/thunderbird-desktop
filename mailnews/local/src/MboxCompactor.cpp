@@ -511,8 +511,12 @@ nsresult MboxCompactor::FlushBuffer() {
 
   // The X-Mozilla-Keys header is dynamically modified as users tag/untag
   // messages, so aim to leave some space for in-place edits.
+  // Stored keywords can include padding from the original header. It is a
+  // separator, not part of a tag; keep the stored value unchanged.
+  nsAutoCString keywords(mMsgKeywords);
+  keywords.Trim(" ");
   out = nsPrintfCString(HEADER_X_MOZILLA_KEYWORDS ": %-*s",
-                        X_MOZILLA_KEYWORDS_BLANK_LEN, mMsgKeywords.get());
+                        X_MOZILLA_KEYWORDS_BLANK_LEN, keywords.get());
   out.Append(eolSeq);
   rv = writeSpan(mMsgOut, out);
   NS_ENSURE_SUCCESS(rv, rv);

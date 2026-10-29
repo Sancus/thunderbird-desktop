@@ -289,6 +289,9 @@ add_task(async function testBigXMozillaKeys() {
 
   const msgs = Array.from(inbox.messages);
   inbox.addKeywordsToMessages([msgs[0]], bigKeyword);
+  const key = msgs[0].messageKey;
+  const keywords = msgs[0].getStringProperty("keywords");
+  Assert.deepEqual(keywords.split(" ").filter(Boolean), [bigKeyword]);
 
   await deleteMsgs(inbox, doomed);
 
@@ -297,6 +300,11 @@ add_task(async function testBigXMozillaKeys() {
   await l.promise;
 
   await checkMbox(inbox, outMsgs);
+  Assert.equal(
+    inbox.msgDatabase.getMsgHdrForKey(key).getStringProperty("keywords"),
+    keywords,
+    "Compaction preserves the exact stored keywords and physical message key"
+  );
 });
 
 // Check that local folder compact copes with a malformed (but

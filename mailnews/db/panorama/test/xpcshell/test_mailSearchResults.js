@@ -103,6 +103,77 @@ async function resultCopies(name) {
   };
 }
 
+add_task(async function test_collectionRefreshesQueuedPhysicalMetadata() {
+  const { first, selected } = await resultCopies("freshphysicalmetadata");
+  const file = do_get_profile().clone();
+  file.append("isolated-fresh-metadata.sqlite");
+  const isolated = await MailSearchService.open(
+    file,
+    "isolated-fresh-metadata",
+    messageDB
+  );
+  registerCleanupFunction(() => isolated.close());
+  // Populate this writer without starting its idle observer. The query must
+  // accept the subsequent tag changes itself, not inherit a queued idle batch.
+  for (let i = 0; ; i++) {
+    Assert.less(i, 100, "The isolated native fixture finishes bounded work");
+    if (!(await isolated.update({ limit: 500 })).moreWork) break;
+  }
+  first.setStringProperty("keywords", "fresh-query-tag");
+  selected.setStringProperty("keywords", "fresh-query-tag");
+  const result = await isolated.collectResults("", {
+    selection: { type: "tag", key: "fresh-query-tag" },
+  });
+  Assert.deepEqual(
+    result.items.map(item => item.id).sort(),
+    [String(first.messageKey), String(selected.messageKey)].sort(),
+    "A query refreshes both existing physical copies after native tag changes"
+  );
+  await isolated.close();
+});
+
+add_task(
+  async function test_refreshFailureReportsOriginalAndKeepsCurrentResults() {
+    const { first, selected } = await resultCopies("failedrefreshcurrent");
+    const update = service.update;
+    const onError = service.onError;
+    const failure = new Error("Unrelated background replay failed");
+    const errors = [];
+    service.update = async () => {
+      throw failure;
+    };
+    service.onError = error => errors.push(error);
+    try {
+      const result = await service.collectResults("failedrefreshcurrent");
+      Assert.deepEqual(
+        result.items.map(item => item.id).sort(),
+        [String(first.messageKey), String(selected.messageKey)].sort(),
+        "An unrelated refresh error does not hide current physical results"
+      );
+      Assert.ok(
+        errors.includes(failure),
+        "The original background failure is reported"
+      );
+      Assert.ok(errors.every(error => error === failure));
+      const controller = new AbortController();
+      const reason = new Error("Cancel the pre-query refresh");
+      service.update = async () => {
+        controller.abort(reason);
+        throw reason;
+      };
+      await Assert.rejects(
+        service.collectResults("failedrefreshcurrent", {
+          signal: controller.signal,
+        }),
+        error => error === reason
+      );
+    } finally {
+      service.update = update;
+      service.onError = onError;
+    }
+  }
+);
+
 add_task(async function test_physicalMetadataAndSnippet() {
   const { first, selected, selectedHit } = await resultCopies("previewresult");
   const result = await readMailSearchResult(service, selectedHit);
@@ -586,3 +657,48 @@ add_task(
     );
   }
 );
+
+add_task(async function test_completeExportChecksEveryPhysicalToken() {
+  const { first, selected } = await resultCopies("strictphysicalexport");
+  const results = await service.collectResults("strictphysicalexport");
+  const exported = [];
+  const receipt = await service.streamResultHeaders(
+    results,
+    header => exported.push(header.messageKey),
+    { requireComplete: true }
+  );
+  Assert.equal(receipt.count, 2);
+  Assert.deepEqual(
+    exported.sort((a, b) => a - b),
+    [first.messageKey, selected.messageKey].sort((a, b) => a - b)
+  );
+  selected.setStringProperty("keywords", "changed-after-capture");
+  await Assert.rejects(
+    service.streamResultHeaders(
+      results,
+      () => Assert.ok(false, "All tokens are checked before delivery"),
+      { requireComplete: true }
+    ),
+    error => error.result == Cr.NS_ERROR_IN_PROGRESS
+  );
+  await drainResultWork();
+  const fresh = await service.collectResults("strictphysicalexport");
+  let calls = 0;
+  await Assert.rejects(
+    service.streamResultHeaders(
+      fresh,
+      () => {
+        calls++;
+        if (calls == 2)
+          first.setStringProperty("keywords", "changed-during-delivery");
+      },
+      { requireComplete: true }
+    ),
+    error => error.result == Cr.NS_ERROR_IN_PROGRESS
+  );
+  Assert.equal(
+    calls,
+    2,
+    "Mutation by a delivery callback cannot certify the older set"
+  );
+});

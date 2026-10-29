@@ -574,7 +574,8 @@ export class MailSearchService {
 
   /**
    * Collects all query pages for facets or an exact person/tag selection.
-   * Updates wait until collection completes. Native state is checked for each
+   * Accepts one bounded update before collection. Updates then wait until
+   * collection completes. Native state is checked for each
    * projection and again before return; this is not a live subscription or an
    * atomic snapshot of the native database. Unindexed messages are not included.
    *
@@ -598,6 +599,16 @@ export class MailSearchService {
       : this.#controller.signal;
     signal.throwIfAborted();
     this.start();
+    // Accept one current change page before collecting indexed physical copies.
+    // In particular, flag/tag changes must refresh their existing projection.
+    try {
+      await this.update({ limit: 500, signal });
+    } catch (error) {
+      if (signal.aborted) {
+        throw error;
+      }
+      this.#reportError(error);
+    }
     const operation = this.#updates.then(async () => {
       await this.#preparePreferences(signal);
       const items = [];
@@ -657,10 +668,16 @@ export class MailSearchService {
    * @param {function(nsIMsgDBHdr): void} onHeader - Current selected copy.
    * @param {object} [options] - Delivery controls.
    * @param {AbortSignal} [options.signal] - Stop lookup/delivery.
+   * @param {boolean} [options.requireComplete=false] - Reject if any selected copy changed.
    * @returns {Promise<{resultSetId: string, count: number}>} Delivered membership.
    * @throws {TypeError} If the result set belongs to another native incarnation.
+   * @throws {nsIException} For stale membership when requireComplete is true.
    */
-  streamResultHeaders(resultSet, onHeader, { signal } = {}) {
+  streamResultHeaders(
+    resultSet,
+    onHeader,
+    { signal, requireComplete = false } = {}
+  ) {
     if (this.#closed) {
       return Promise.reject(new Error("Mail search is closed"));
     }
@@ -687,15 +704,31 @@ export class MailSearchService {
     const operation = this.#updates.then(async () => {
       await this.#preparePreferences(signal);
       const seen = new Set();
+      const resolve = hit => {
+        signal.throwIfAborted();
+        const header = this.#currentHeader(hit, signal);
+        if (!header && requireComplete) {
+          throw Components.Exception(
+            `Search result changed (physical key ${hit.id})`,
+            Cr.NS_ERROR_IN_PROGRESS
+          );
+        }
+        return header;
+      };
+      if (requireComplete) {
+        selected.forEach(resolve);
+      }
       let count = 0;
       for (const hit of selected) {
-        signal.throwIfAborted();
-        const header = !seen.has(hit.id) && this.#currentHeader(hit, signal);
+        const header = !seen.has(hit.id) && resolve(hit);
         if (header) {
           seen.add(hit.id);
           onHeader(header);
           count++;
         }
+      }
+      if (requireComplete) {
+        selected.forEach(resolve);
       }
       return { resultSetId, count };
     });

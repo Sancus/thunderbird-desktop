@@ -8,6 +8,8 @@ const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   MailSearchService: "resource:///modules/panorama/MailSearchService.sys.mjs",
   openMailSearchList: "resource:///modules/panorama/MailSearchView.sys.mjs",
+  openMailSearchResultsList:
+    "resource:///modules/panorama/MailSearchView.sys.mjs",
 });
 
 /** @type {?{sourceId: string, promise: Promise<MailSearchService>, closePromise: ?Promise<void>}} */
@@ -116,7 +118,7 @@ export async function closeMailSearch() {
  * @param {string} [options.title=text] - Tab title.
  * @param {boolean} [options.background=false] - Open without selecting the tab.
  * @param {AbortSignal} [options.signal] - Prevent opening after cancellation.
- * @returns {Promise<object>} Existing mail3PaneTab.
+ * @returns {Promise<object>} Existing mail3PaneTab; captured members finish delivery before return.
  */
 export async function openDefaultMailSearchList(
   tabmail,
@@ -129,10 +131,12 @@ export async function openDefaultMailSearchList(
     ? await service.collectResults(text, { ...options, selection, signal })
     : null;
   signal?.throwIfAborted();
-  return lazy.openMailSearchList(tabmail, service, text, {
-    ...options,
-    resultSet,
-  });
+  return resultSet
+    ? lazy.openMailSearchResultsList(tabmail, service, resultSet, {
+        ...options,
+        signal,
+      })
+    : lazy.openMailSearchList(tabmail, service, text, options);
 }
 
 /**
@@ -159,8 +163,9 @@ export async function findMailSearchResults(text, options) {
  * @param {object} [options] - Existing list controls.
  * @param {string} [options.title=""] - Tab title.
  * @param {boolean} [options.background=false] - Open without selecting the tab.
- * @param {AbortSignal} [options.signal] - Prevent tab creation after cancellation.
- * @returns {Promise<object>} Existing mail3PaneTab.
+ * @param {AbortSignal} [options.signal] - Cancel initialization and initial delivery.
+ * @returns {Promise<object>} Existing mail3PaneTab after complete initial delivery.
+ * @throws {Error} If captured membership changed or delivery failed.
  */
 export async function openDefaultMailSearchResultsList(
   tabmail,
@@ -170,9 +175,9 @@ export async function openDefaultMailSearchResultsList(
   signal?.throwIfAborted();
   const service = await getMailSearchService();
   signal?.throwIfAborted();
-  return lazy.openMailSearchList(tabmail, service, "", {
+  return lazy.openMailSearchResultsList(tabmail, service, resultSet, {
     ...options,
-    resultSet,
+    signal,
   });
 }
 

@@ -87,10 +87,23 @@ add_task(async function test_typedFactoryAndFacetSubsetUseNativeSource() {
   Assert.ok(snapshot.resultSetId);
   Assert.deepEqual(snapshot.items, []);
   const opened = [];
+  const statuses = [];
   const tabmail = {
+    tabInfo: opened,
+    registerTabMonitor() {},
+    unregisterTabMonitor() {},
     openTab(name, options) {
       Assert.equal(name, "mail3PaneTab");
       opened.push(options);
+      options.syntheticView.search({
+        onNewSearch() {},
+        onSearchHit() {
+          Assert.ok(false, "These literal selections have no native member");
+        },
+        onSearchDone(status) {
+          statuses.push(status);
+        },
+      });
       return options;
     },
   };
@@ -107,19 +120,11 @@ add_task(async function test_typedFactoryAndFacetSubsetUseNativeSource() {
   Assert.equal(opened.length, 2);
   Assert.equal(opened[0].title, "Selected person");
   Assert.equal(opened[1].title, "Active facets");
-  for (const tab of opened) {
-    const done = [];
-    await tab.syntheticView.search({
-      onNewSearch() {},
-      onSearchHit() {
-        Assert.ok(false, "These literal selections have no native member");
-      },
-      onSearchDone(status) {
-        done.push(status);
-      },
-    });
-    Assert.deepEqual(done, [Cr.NS_OK]);
-  }
+  Assert.deepEqual(
+    statuses,
+    [Cr.NS_OK, Cr.NS_OK],
+    "Captured lists finish before the factory returns"
+  );
 });
 
 add_task(async function test_defaultUnavailableRetryAndCancellation() {

@@ -252,13 +252,13 @@ nsresult DatabaseCore::EnsureConnection() {
   rv = sConnection->ExecuteSimpleSQL("PRAGMA cache_size=-200000;"_ns);
   NS_ENSURE_SUCCESS(rv, rv);
   RefPtr<TagsMatchFunction> tagsInclude = new TagsMatchFunction(true);
-  sConnection->CreateFunction("tags_include"_ns, 2, tagsInclude);
+  MOZ_TRY(sConnection->CreateFunction("tags_include"_ns, 2, tagsInclude));
   RefPtr<TagsMatchFunction> tagsExclude = new TagsMatchFunction(false);
-  sConnection->CreateFunction("tags_exclude"_ns, 2, tagsExclude);
+  MOZ_TRY(sConnection->CreateFunction("tags_exclude"_ns, 2, tagsExclude));
   RefPtr<AddressFormatFunction> addressFormat = new AddressFormatFunction();
-  sConnection->CreateFunction("address_format"_ns, 1, addressFormat);
+  MOZ_TRY(sConnection->CreateFunction("address_format"_ns, 1, addressFormat));
   RefPtr<GroupedByDateFunction> dateGroup = new GroupedByDateFunction();
-  sConnection->CreateFunction("date_group"_ns, 1, dateGroup);
+  MOZ_TRY(sConnection->CreateFunction("date_group"_ns, 1, dateGroup));
 
   connectionGuard.release();
   return NS_OK;

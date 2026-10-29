@@ -5,6 +5,7 @@
 #ifndef COMM_MAILNEWS_IMAP_SRC_NSIMAPURL_H_
 #define COMM_MAILNEWS_IMAP_SRC_NSIMAPURL_H_
 
+#include "ImapTypes.h"
 #include "nsIImapUrl.h"
 #include "nsCOMPtr.h"
 #include "nsMsgMailNewsUrl.h"

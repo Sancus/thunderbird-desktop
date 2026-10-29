@@ -6,6 +6,7 @@
 #define COMM_MAILNEWS_DB_PANORAMA_SRC_DETACHEDMSGHDR_H_
 
 #include "MailNewsTypes.h"
+#include "Message.h"
 #include "nsCOMPtr.h"
 #include "nsIMsgDatabase.h"  // For struct RawHdr
 #include "nsIMsgHdr.h"
@@ -24,7 +25,7 @@ class PerFolderDatabase;
  * the 'live' implementation (class Message).
  * See nsIMsgDatabase.addDetachedMsgHdrToDB().
  */
-class DetachedMsgHdr : public nsIMsgDBHdr {
+class DetachedMsgHdr : public DecodedSubjectHdr {
  public:
   friend class PerFolderDatabase;
   DetachedMsgHdr() = delete;

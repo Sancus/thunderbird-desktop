@@ -190,3 +190,37 @@ add_task(
     Assert.ok(!(group._msgHdr.flags & Ci.nsMsgMessageFlags.HasRe));
   }
 );
+
+add_task(function test_subjectSettersDoNotDecodeLogicalText() {
+  const db = localAccountUtils.inboxFolder.msgDatabase;
+  const decodedStorage = Services.prefs.getBoolPref(
+    "mail.panorama.enabled",
+    false
+  );
+  const flags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.HasRe;
+  for (const [subject, legacyDecoded] of [
+    ["=?UTF-8?Q?hello?=", "hello"],
+    ["Re: =?UTF-8?Q?hello?=", "Re: hello"],
+    ["=?UTF-8?B?PT9VVEYtOD9RP2hlbGxvPz0=?=", "=?UTF-8?Q?hello?="],
+    ["日本語", "日本語"],
+    ["", ""],
+  ]) {
+    const draft = db.createNewHdr();
+    draft.flags = flags;
+    draft.subject = subject;
+    Assert.equal(draft.subject, subject);
+    Assert.equal(
+      draft.mime2DecodedSubject,
+      decodedStorage ? subject : legacyDecoded
+    );
+    Assert.equal(draft.flags, flags);
+    const live = db.attachHdr(draft, false);
+    live.subject = subject;
+    Assert.equal(live.subject, subject);
+    Assert.equal(
+      live.mime2DecodedSubject,
+      decodedStorage ? subject : legacyDecoded
+    );
+    Assert.equal(live.flags, flags);
+  }
+});

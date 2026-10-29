@@ -17,7 +17,7 @@
 
 namespace mozilla::mailnews {
 
-NS_IMPL_ISUPPORTS(DetachedMsgHdr, nsIMsgDBHdr)
+NS_IMPL_ISUPPORTS(DetachedMsgHdr, nsIMsgDBHdr, DecodedSubjectHdr)
 
 nsresult DetachedMsgHdr::CheckMutable() const {
   if (mAttachState == AttachState::Attaching) {

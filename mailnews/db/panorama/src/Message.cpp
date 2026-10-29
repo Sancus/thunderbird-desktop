@@ -35,7 +35,7 @@ bool UsesNativeUint32Property(const nsACString& name) {
 
 }  // namespace
 
-NS_IMPL_ISUPPORTS(Message, nsIMsgDBHdr)
+NS_IMPL_ISUPPORTS(Message, nsIMsgDBHdr, DecodedSubjectHdr)
 
 // LiveViewFilter::Match() currently needs this because it doesn't access DB.
 // But we should ditch this.

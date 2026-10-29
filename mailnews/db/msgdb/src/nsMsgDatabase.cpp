@@ -41,6 +41,9 @@
 #include "mozilla/ScopeExit.h"
 #include "mozilla/StaticPrefs_mail.h"
 #include "mozilla/mailnews/MsgSubjectUtils.h"
+#ifdef MOZ_PANORAMA
+#  include "Message.h"
+#endif
 
 using namespace mozilla::mailnews;
 using namespace mozilla;
@@ -2776,10 +2779,14 @@ nsresult ApplyRawHdrToDbHdr(RawHdr const& raw, nsIMsgDBHdr* hdr) {
     NS_ENSURE_SUCCESS(rv, rv);
   }
   if (!raw.subject.IsEmpty()) {
-    // Legacy databases MIME-decode subjects when reading them back. Protect
-    // decoded text that happens to look like an encoded word.
+    // Legacy headers MIME-decode on read; native headers store logical UTF-8.
+    bool decodedStorage = false;
+#ifdef MOZ_PANORAMA
+    nsCOMPtr<DecodedSubjectHdr> decodedHeader = do_QueryInterface(hdr);
+    decodedStorage = !!decodedHeader;
+#endif
     nsAutoCString subject;
-    if (raw.subject.Find("=?") != kNotFound) {
+    if (!decodedStorage && raw.subject.Find("=?") != kNotFound) {
       rv = EncodeSubjectForLegacyStorage(raw.subject, subject);
       NS_ENSURE_SUCCESS(rv, rv);
     } else {

@@ -11,7 +11,20 @@
 
 namespace mozilla::mailnews {
 
-class Message : public nsIMsgDBHdr {
+#define NS_DECODED_SUBJECT_HDR_IID                   \
+  {                                                  \
+    0xb28c6a7b, 0x952f, 0x4ad5, {                    \
+      0x91, 0xd9, 0x51, 0x83, 0x80, 0x4a, 0x39, 0x65 \
+    }                                                \
+  }
+
+// Internal capability: subject storage contains decoded UTF-8, not MIME words.
+class DecodedSubjectHdr : public nsIMsgDBHdr {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_DECODED_SUBJECT_HDR_IID)
+};
+
+class Message : public DecodedSubjectHdr {
  public:
   Message() = delete;
   explicit Message(nsMsgKey key) : mKey(key) {};

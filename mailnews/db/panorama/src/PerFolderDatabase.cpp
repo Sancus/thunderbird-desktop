@@ -5,6 +5,8 @@
 #include "PerFolderDatabase.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 #include "DatabaseCore.h"
@@ -28,7 +30,12 @@
 #include "nsIMsgDBView.h"
 #include "nsIMsgPluggableStore.h"
 #include "nsIMsgSearchSession.h"
+#include "nsIProperty.h"
+#include "nsISimpleEnumerator.h"
+#include "nsIVariant.h"
+#include "nsIWritablePropertyBag2.h"
 #include "nsMsgMessageFlags.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgSearchCore.h"
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
@@ -225,10 +232,13 @@ NS_IMETHODIMP PerFolderDatabase::GetFolder(nsIMsgFolder** aFolder) {
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::GetLastUseTime(PRTime* aLastUseTime) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aLastUseTime);
+  *aLastUseTime = mLastUseTime;
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::SetLastUseTime(PRTime aLastUseTime) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  mLastUseTime = aLastUseTime;
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::GetMsgHdrForKey(nsMsgKey key,
                                                  nsIMsgDBHdr** msgHdr) {
@@ -625,6 +635,41 @@ NS_IMETHODIMP PerFolderDatabase::GetFilterEnumerator(
   enumerator.forget(aRetVal);
   return NS_OK;
 }
+nsresult PerFolderDatabase::ReadCount(bool unread, int32_t* count) {
+  NS_ENSURE_ARG_POINTER(count);
+  *count = 0;
+  RememberLastUseTime();
+  MOZ_TRY(CheckFolderExists());
+  uint32_t flags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
+  if (flags & nsMsgFolderFlags::Virtual) {
+    int64_t value = 0;
+    RefPtr<FolderInfo> info = new FolderInfo(this);
+    MOZ_TRY(
+        info->GetInt64Property(unread ? "numNewMsgs" : "numMsgs", 0, &value));
+    CheckedInt<int32_t> checked(value);
+    NS_ENSURE_TRUE(checked.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+    *count = checked.value();
+    return NS_OK;
+  }
+  uint64_t value;
+  MOZ_TRY(unread ? MessageDB().GetNumUnread(mFolderId, &value)
+                 : MessageDB().GetNumMessages(mFolderId, &value));
+  CheckedInt<int32_t> checked(value);
+  NS_ENSURE_TRUE(checked.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  *count = checked.value();
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::WriteCount(bool unread, int32_t count) {
+  RememberLastUseTime();
+  MOZ_TRY(CheckFolderExists());
+  uint32_t flags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
+  NS_ENSURE_TRUE(flags & nsMsgFolderFlags::Virtual, NS_ERROR_NOT_IMPLEMENTED);
+  RefPtr<FolderInfo> info = new FolderInfo(this);
+  return info->SetInt64Property(unread ? "numNewMsgs" : "numMsgs",
+                                int64_t{count});
+}
+
 NS_IMETHODIMP PerFolderDatabase::SyncCounts() {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
@@ -1247,10 +1292,13 @@ NS_IMETHODIMP FolderInfo::OnKeyAdded(nsMsgKey aNewKey) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP FolderInfo::GetHighWater(nsMsgKey* aHighWater) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aHighWater);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return GetUint32Property("highWaterKey", 0, aHighWater);
 }
 NS_IMETHODIMP FolderInfo::SetHighWater(nsMsgKey aHighWater) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return SetUint32Property("highWaterKey", aHighWater);
 }
 NS_IMETHODIMP FolderInfo::GetFolderSize(int64_t* aFolderSize) {
   return NS_ERROR_NOT_IMPLEMENTED;
@@ -1271,24 +1319,16 @@ NS_IMETHODIMP FolderInfo::ChangeNumMessages(int32_t aDelta) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP FolderInfo::GetNumUnreadMessages(int32_t* aNumUnreadMessages) {
-  NS_ENSURE_ARG_POINTER(aNumUnreadMessages);
-  uint64_t out;
-  nsresult rv = MessageDB().GetNumUnread(mFolderId, &out);
-  *aNumUnreadMessages = (int32_t)out;
-  return rv;
+  return mPerFolderDatabase->ReadCount(true, aNumUnreadMessages);
 }
 NS_IMETHODIMP FolderInfo::SetNumUnreadMessages(int32_t aNumUnreadMessages) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return mPerFolderDatabase->WriteCount(true, aNumUnreadMessages);
 }
 NS_IMETHODIMP FolderInfo::GetNumMessages(int32_t* aNumMessages) {
-  NS_ENSURE_ARG_POINTER(aNumMessages);
-  uint64_t out;
-  nsresult rv = MessageDB().GetNumMessages(mFolderId, &out);
-  *aNumMessages = (int32_t)out;
-  return rv;
+  return mPerFolderDatabase->ReadCount(false, aNumMessages);
 }
 NS_IMETHODIMP FolderInfo::SetNumMessages(int32_t aNumMessages) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  return mPerFolderDatabase->WriteCount(false, aNumMessages);
 }
 NS_IMETHODIMP FolderInfo::GetExpungedBytes(int64_t* aExpungedBytes) {
   return NS_ERROR_NOT_IMPLEMENTED;
@@ -1462,11 +1502,258 @@ NS_IMETHODIMP FolderInfo::SetProperty(const char* propertyName,
                                       nsDependentCString(propertyName),
                                       NS_ConvertUTF16toUTF8(propertyValue));
 }
-NS_IMETHODIMP FolderInfo::GetTransferInfo(nsIPropertyBag2** _retval) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+nsresult FolderInfo::ReadTransferProperties(
+    nsTArray<FolderImportProperty>& properties) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  return FolderDB().GetFolderProperties(mFolderId, properties);
+}
+
+nsresult FolderInfo::EncodeTransferInfo(
+    const nsTArray<FolderImportProperty>& properties,
+    nsIPropertyBag2** transferInfo) {
+  NS_ENSURE_ARG_POINTER(transferInfo);
+  *transferInfo = nullptr;
+  nsresult rv;
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsTArray<nsCString> names;
+  for (const auto& property : properties) {
+    NS_ConvertUTF8toUTF16 name(property.name);
+    NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(name).Equals(property.name),
+                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_FALSE(names.Contains(property.name), NS_ERROR_FILE_CORRUPTED);
+    names.AppendElement(property.name);
+    if (property.integer) {
+      MOZ_TRY(bag->SetPropertyAsInt64(name, *property.integer));
+    } else {
+      MOZ_TRY(bag->SetPropertyAsACString(name, property.text));
+    }
+  }
+  nsCOMPtr<nsIPropertyBag2> result = bag;
+  result.forget(transferInfo);
+  return NS_OK;
+}
+
+nsresult FolderInfo::DecodeTransferInfo(
+    nsIPropertyBag2* transferInfo, nsTArray<FolderImportProperty>& properties) {
+  NS_ENSURE_ARG(transferInfo);
+  nsCOMPtr<nsISimpleEnumerator> enumerator;
+  MOZ_TRY(transferInfo->GetEnumerator(getter_AddRefs(enumerator)));
+  NS_ENSURE_STATE(enumerator);
+  nsTArray<FolderImportProperty> decoded;
+  bool more;
+  while (true) {
+    MOZ_TRY(enumerator->HasMoreElements(&more));
+    if (!more) {
+      break;
+    }
+    nsCOMPtr<nsISupports> item;
+    MOZ_TRY(enumerator->GetNext(getter_AddRefs(item)));
+    nsresult rv;
+    nsCOMPtr<nsIProperty> entry = do_QueryInterface(item, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsAutoString name;
+    MOZ_TRY(entry->GetName(name));
+    FolderImportProperty property;
+    CopyUTF16toUTF8(name, property.name);
+    NS_ENSURE_TRUE(NS_ConvertUTF8toUTF16(property.name).Equals(name),
+                   NS_ERROR_INVALID_ARG);
+    for (const auto& previous : decoded) {
+      NS_ENSURE_FALSE(previous.name == property.name, NS_ERROR_INVALID_ARG);
+    }
+    nsCOMPtr<nsIVariant> value;
+    MOZ_TRY(entry->GetValue(getter_AddRefs(value)));
+    NS_ENSURE_TRUE(value, NS_ERROR_INVALID_ARG);
+    switch (value->GetDataType()) {
+      case nsIDataType::VTYPE_INT8:
+      case nsIDataType::VTYPE_INT16:
+      case nsIDataType::VTYPE_INT32:
+      case nsIDataType::VTYPE_INT64:
+      case nsIDataType::VTYPE_UINT8:
+      case nsIDataType::VTYPE_UINT16:
+      case nsIDataType::VTYPE_UINT32: {
+        int64_t integer;
+        MOZ_TRY(value->GetAsInt64(&integer));
+        property.integer = Some(integer);
+        break;
+      }
+      case nsIDataType::VTYPE_UINT64: {
+        uint64_t integer;
+        MOZ_TRY(value->GetAsUint64(&integer));
+        CheckedInt<int64_t> checked(integer);
+        NS_ENSURE_TRUE(checked.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+        property.integer = Some(checked.value());
+        break;
+      }
+      case nsIDataType::VTYPE_CSTRING:
+        MOZ_TRY(value->GetAsACString(property.text));
+        break;
+      case nsIDataType::VTYPE_CHAR_STR:
+      case nsIDataType::VTYPE_STRING_SIZE_IS: {
+        uint32_t length;
+        char* bytes = nullptr;
+        MOZ_TRY(value->GetAsStringWithSize(&length, &bytes));
+        property.text.Assign(bytes, length);
+        std::free(bytes);
+        break;
+      }
+      case nsIDataType::VTYPE_UTF8STRING:
+        MOZ_TRY(value->GetAsAUTF8String(property.text));
+        break;
+      case nsIDataType::VTYPE_ASTRING:
+      case nsIDataType::VTYPE_WCHAR_STR:
+      case nsIDataType::VTYPE_WSTRING_SIZE_IS: {
+        nsAutoString text;
+        MOZ_TRY(value->GetAsAString(text));
+        CopyUTF16toUTF8(text, property.text);
+        NS_ENSURE_TRUE(NS_ConvertUTF8toUTF16(property.text).Equals(text),
+                       NS_ERROR_INVALID_ARG);
+        break;
+      }
+      default:
+        return NS_ERROR_INVALID_ARG;
+    }
+    decoded.AppendElement(std::move(property));
+  }
+  properties = std::move(decoded);
+  return NS_OK;
+}
+
+nsresult FolderInfo::ValidateTransferProperties(
+    const nsTArray<FolderImportProperty>& properties) {
+  for (const auto& property : properties) {
+    const auto& name = property.name;
+    // Widths of the retained FolderInfo fields, not unknown property names.
+    bool unsigned32 =
+        name.EqualsLiteral("highWaterKey") ||
+        name.EqualsLiteral("folderDate") || name.EqualsLiteral("UIDValidity") ||
+        name.EqualsLiteral("version") || name.EqualsLiteral("userSortOrder") ||
+        name.EqualsLiteral("viewType") || name.EqualsLiteral("viewFlags") ||
+        name.EqualsLiteral("sortType") || name.EqualsLiteral("sortOrder") ||
+        name.EqualsLiteral("totPendingMsgs") ||
+        name.EqualsLiteral("unreadPendingMsgs");
+    bool count =
+        name.EqualsLiteral("numMsgs") || name.EqualsLiteral("numNewMsgs");
+    bool flags = name.EqualsLiteral("flags");
+    bool signed64 =
+        name.EqualsLiteral("folderSize") || name.EqualsLiteral("expungedBytes");
+    if (!unsigned32 && !count && !flags && !signed64) {
+      continue;
+    }
+    NS_ENSURE_TRUE(property.integer, NS_ERROR_INVALID_ARG);
+    int64_t value = *property.integer;
+    if (unsigned32) {
+      NS_ENSURE_TRUE(CheckedInt<uint32_t>(value).isValid(),
+                     NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+    } else if (count) {
+      NS_ENSURE_TRUE(value >= 0 && CheckedInt<int32_t>(value).isValid(),
+                     NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+    } else if (flags) {
+      // The IDL setter also accepts signed32 flag bit patterns.
+      NS_ENSURE_TRUE(value >= INT32_MIN && value <= UINT32_MAX,
+                     NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP FolderInfo::GetTransferInfo(nsIPropertyBag2** transferInfo) {
+  NS_ENSURE_ARG_POINTER(transferInfo);
+  *transferInfo = nullptr;
+  nsTArray<FolderImportProperty> properties;
+  MOZ_TRY(ReadTransferProperties(properties));
+  auto setInteger = [&](const nsACString& name, int64_t value) {
+    for (auto& property : properties) {
+      if (property.name == name) {
+        property.text.Truncate();
+        property.integer = Some(value);
+        return;
+      }
+    }
+    properties.AppendElement(
+        FolderImportProperty{nsCString(name), ""_ns, Some(value)});
+  };
+  uint32_t flags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
+  setInteger("flags"_ns, flags);
+  if (!(flags & nsMsgFolderFlags::Virtual)) {
+    int32_t total, unread;
+    MOZ_TRY(GetNumMessages(&total));
+    MOZ_TRY(GetNumUnreadMessages(&unread));
+    setInteger("numMsgs"_ns, total);
+    setInteger("numNewMsgs"_ns, unread);
+  }
+  nsresult rv = ValidateTransferProperties(properties);
+  NS_ENSURE_TRUE(rv != NS_ERROR_INVALID_ARG, NS_ERROR_FILE_CORRUPTED);
+  NS_ENSURE_SUCCESS(rv, rv);
+  // Native bags keep TEXT as ACString and INTEGER as Int64, not hex strings.
+  return EncodeTransferInfo(properties, transferInfo);
 }
 NS_IMETHODIMP FolderInfo::InitFromTransferInfo(nsIPropertyBag2* transferInfo) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG(transferInfo);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  nsTArray<FolderImportProperty> properties;
+  MOZ_TRY(DecodeTransferInfo(transferInfo, properties));
+  for (auto& property : properties) {
+    if (property.integer) {
+      continue;
+    }
+    // Exact edits made by rebuildFolderSummary in FolderCommands.mjs.
+    if (((property.name.EqualsLiteral("numMsgs") ||
+          property.name.EqualsLiteral("numNewMsgs")) &&
+         property.text.EqualsLiteral("0")) ||
+        (property.name.EqualsLiteral("UIDValidity") &&
+         property.text.EqualsLiteral("-1"))) {
+      property.integer = Some(int64_t{0});
+      property.text.Truncate();
+    }
+  }
+  MOZ_TRY(ValidateTransferProperties(properties));
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  uint32_t previousFlags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
+  uint32_t flags = previousFlags;
+  Maybe<uint32_t> transferredFlags, epoch;
+  for (const auto& property : properties) {
+    if (property.name.EqualsLiteral("flags")) {
+      transferredFlags = Some(static_cast<uint32_t>(*property.integer));
+      flags = *transferredFlags;
+    } else if (property.name.EqualsLiteral("UIDValidity")) {
+      epoch = Some(static_cast<uint32_t>(*property.integer));
+    }
+  }
+  if (transferredFlags && *transferredFlags != previousFlags) {
+    // Core flag caching cannot roll back a caller's transaction.
+    bool active;
+    MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+    NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  }
+  // Replace the epoch through the binding-retirement operation.
+  if (epoch) {
+    MOZ_TRY(FolderDB().SetFolderUidValidity(mFolderId, *epoch));
+  }
+  if (transferredFlags) {
+    MOZ_TRY(FolderDB().UpdateFlags(mFolderId, *transferredFlags));
+  }
+  // Earlier writes can persist when a later write fails.
+  for (const auto& property : properties) {
+    if (property.name.EqualsLiteral("flags") ||
+        property.name.EqualsLiteral("UIDValidity")) {
+      continue;
+    }
+    if (!(flags & nsMsgFolderFlags::Virtual) &&
+        (property.name.EqualsLiteral("numMsgs") ||
+         property.name.EqualsLiteral("numNewMsgs"))) {
+      continue;
+    }
+    if (property.integer) {
+      MOZ_TRY(FolderDB().SetFolderProperty(mFolderId, property.name,
+                                           *property.integer));
+    } else {
+      MOZ_TRY(FolderDB().SetFolderProperty(mFolderId, property.name,
+                                           property.text));
+    }
+  }
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::GetLocale(nsAString& aLocale) {
   return NS_ERROR_NOT_IMPLEMENTED;

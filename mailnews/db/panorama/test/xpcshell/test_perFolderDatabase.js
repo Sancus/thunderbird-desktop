@@ -214,6 +214,12 @@ add_task(async function testFolderInfo() {
   );
   Assert.equal(folderInfo.flags, Ci.nsMsgFolderFlags.Mail);
 
+  // Physical folders count rows; virtual folders use search summaries.
+  Assert.equal(folderInfo.numMessages, 4);
+  Assert.equal(folderA.getTotalMessages(false), 4);
+  Assert.equal(folderInfo.numUnreadMessages, 2);
+  Assert.equal(folderA.getNumUnread(false), 2);
+
   Assert.equal(
     folderInfo.orFlags(Ci.nsMsgFolderFlags.Virtual),
     Ci.nsMsgFolderFlags.Mail | Ci.nsMsgFolderFlags.Virtual
@@ -222,11 +228,6 @@ add_task(async function testFolderInfo() {
     folderInfo.flags,
     Ci.nsMsgFolderFlags.Mail | Ci.nsMsgFolderFlags.Virtual
   );
-
-  Assert.equal(folderInfo.numMessages, 4);
-  Assert.equal(folderA.getTotalMessages(false), 4);
-  Assert.equal(folderInfo.numUnreadMessages, 2);
-  Assert.equal(folderA.getNumUnread(false), 2);
 });
 
 add_task(async function testFolderProperties() {
@@ -466,6 +467,7 @@ add_task(async function testListener() {
   );
   const folderDatabaseB = database.openFolderDB(folderB, false);
   folderDatabaseB.addListener(listenerB);
+  registerCleanupFunction(() => folderDatabaseB.removeListener(listenerB));
 
   const listenerC = new FolderListener();
   const folderC = MailServices.folderLookup.getFolderForURL(
@@ -473,6 +475,7 @@ add_task(async function testListener() {
   );
   const folderDatabaseC = database.openFolderDB(folderC, false);
   folderDatabaseC.addListener(listenerC);
+  registerCleanupFunction(() => folderDatabaseC.removeListener(listenerC));
 
   const addedId = addMessage({ folderId: folderC.id });
   Assert.ok(!listenerB._headerAdded);

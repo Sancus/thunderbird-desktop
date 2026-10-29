@@ -17,6 +17,7 @@
 #include "nsIMsgFolder.h"
 #include "nsIMsgThread.h"
 #include "nsMsgEnumerator.h"
+#include "prtime.h"
 
 class mozIStorageStatement;
 class nsIDBChangeListener;
@@ -61,12 +62,16 @@ class PerFolderDatabase : public nsIMsgDatabase,
     return *DatabaseCore::sInstance->mMessageDatabase;
   }
   nsresult CheckFolderExists() const;
+  nsresult ReadCount(bool unread, int32_t* count);
+  nsresult WriteCount(bool unread, int32_t count);
+  void RememberLastUseTime() { mLastUseTime = PR_Now(); }
   nsresult GetMsgHdrForProperty(const nsACString& name,
                                 const nsACString& value,
                                 nsIMsgDBHdr** result);
 
   uint64_t mFolderId;
   bool mIsNewsFolder;
+  PRTime mLastUseTime = PR_Now();
   nsTArray<nsMsgKey> mNewList;
   nsTObserverArray<RefPtr<nsIDBChangeListener>> mListeners;
 };
@@ -112,6 +117,18 @@ class FolderInfo : public nsIDBFolderInfo {
   NS_DECL_NSIDBFOLDERINFO
 
  private:
+  friend class DeliveryFolderInfoProperties;
+
+  nsresult ReadTransferProperties(nsTArray<FolderImportProperty>& properties);
+  static nsresult ValidateTransferProperties(
+      const nsTArray<FolderImportProperty>& properties);
+  static nsresult EncodeTransferInfo(
+      const nsTArray<FolderImportProperty>& properties,
+      nsIPropertyBag2** transferInfo);
+  static nsresult DecodeTransferInfo(
+      nsIPropertyBag2* transferInfo,
+      nsTArray<FolderImportProperty>& properties);
+
   virtual ~FolderInfo() {}
 
   FolderDatabase& FolderDB() const {

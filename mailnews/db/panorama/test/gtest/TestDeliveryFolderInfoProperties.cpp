@@ -25,8 +25,13 @@
 #include "nsIFile.h"
 #include "nsIFolderDatabase.h"
 #include "nsIInterfaceRequestorUtils.h"
+#include "nsIMsgHdr.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
+#include "nsIWritablePropertyBag.h"
+#include "nsIWritablePropertyBag2.h"
+#include "nsMsgFolderFlags.h"
+#include "nsMsgMessageFlags.h"
 #include "nsServiceManagerUtils.h"
 #include "nsString.h"
 #include "nsThreadUtils.h"
@@ -157,6 +162,38 @@ class DeliveryFolderInfoProperties : public ::testing::Test {
     if (mDatabase) {
       sCore->MessageDB().RemoveMessageListener(mDatabase);
       mDatabase = nullptr;
+    }
+  }
+
+  static nsresult Encode(const nsTArray<FolderImportProperty>& properties,
+                         nsIPropertyBag2** info) {
+    return FolderInfo::EncodeTransferInfo(properties, info);
+  }
+
+  static nsresult Decode(nsIPropertyBag2* info,
+                         nsTArray<FolderImportProperty>& properties) {
+    return FolderInfo::DecodeTransferInfo(info, properties);
+  }
+
+  nsresult ReadTransfer(nsTArray<FolderImportProperty>& properties) {
+    RefPtr<FolderInfo> info = new FolderInfo(mDatabase);
+    return info->ReadTransferProperties(properties);
+  }
+
+  static void ExpectProperties(const nsTArray<FolderImportProperty>& expected,
+                               const nsTArray<FolderImportProperty>& actual) {
+    ASSERT_EQ(expected.Length(), actual.Length());
+    for (const auto& wanted : expected) {
+      const FolderImportProperty* found = nullptr;
+      for (const auto& property : actual) {
+        if (wanted.name == property.name) {
+          EXPECT_FALSE(found);
+          found = &property;
+        }
+      }
+      ASSERT_TRUE(found);
+      EXPECT_EQ(wanted.integer, found->integer);
+      EXPECT_EQ(wanted.text, found->text);
     }
   }
 
@@ -612,6 +649,484 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
     ASSERT_TRUE(row);
     EXPECT_EQ(1, statement->AsInt32(0));
   }
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferConversionRoundTripsExactTypes) {
+  const nsTArray<FolderImportProperty> expected{
+      {""_ns, "empty name"_ns, Nothing()},
+      {"Case"_ns, "upper"_ns, Nothing()},
+      {"case"_ns, "lower"_ns, Nothing()},
+      {"Caf\xC3\xA9"_ns, "composed"_ns, Nothing()},
+      {"Cafe\xCC\x81"_ns, "decomposed"_ns, Nothing()},
+      {"empty"_ns, ""_ns, Nothing()},
+      {"zeros"_ns, "00042"_ns, Nothing()},
+      {"exponent"_ns, "1e3"_ns, Nothing()},
+      {"bytes"_ns, nsCString("a\0b", 3), Nothing()},
+      {nsCString("n\0m", 3), "name with NUL"_ns, Nothing()},
+      {"minimum"_ns, ""_ns, Some(std::numeric_limits<int64_t>::min())},
+      {"maximum"_ns, ""_ns, Some(std::numeric_limits<int64_t>::max())},
+      {"zero"_ns, ""_ns, Some(int64_t{0})}};
+  nsCOMPtr<nsIPropertyBag2> bag;
+  ASSERT_EQ(NS_OK, Encode(expected, getter_AddRefs(bag)));
+  bool present = true;
+  ASSERT_EQ(NS_OK, bag->HasKey(u"absent"_ns, &present));
+  EXPECT_FALSE(present);
+  ASSERT_EQ(NS_OK, bag->HasKey(u"empty"_ns, &present));
+  EXPECT_TRUE(present);
+  nsCOMPtr<nsIVariant> value;
+  ASSERT_EQ(NS_OK, bag->GetProperty(u"zeros"_ns, getter_AddRefs(value)));
+  EXPECT_EQ(nsIDataType::VTYPE_CSTRING, value->GetDataType());
+  ASSERT_EQ(NS_OK, bag->GetProperty(u"maximum"_ns, getter_AddRefs(value)));
+  EXPECT_EQ(nsIDataType::VTYPE_INT64, value->GetDataType());
+  nsAutoCString decimal;
+  ASSERT_EQ(NS_OK, bag->GetPropertyAsACString(u"maximum"_ns, decimal));
+  EXPECT_EQ("9223372036854775807"_ns, decimal);
+  ASSERT_EQ(NS_OK, bag->GetPropertyAsACString(u"minimum"_ns, decimal));
+  EXPECT_EQ("-9223372036854775808"_ns, decimal);
+  nsTArray<FolderImportProperty> actual;
+  ASSERT_EQ(NS_OK, Decode(bag, actual));
+  ExpectProperties(expected, actual);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferConversionPreservesUnicodeVariants) {
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  ASSERT_EQ(NS_OK,
+            bag->SetPropertyAsAString(u"wide"_ns, u"\u03b1\U0001f600"_ns));
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsAUTF8String(
+                       u"utf8"_ns, "\xCE\xB1\xF0\x9F\x98\x80"_ns));
+  nsTArray<FolderImportProperty> actual;
+  ASSERT_EQ(NS_OK, Decode(bag, actual));
+  const nsTArray<FolderImportProperty> expected{
+      {"wide"_ns, "\xCE\xB1\xF0\x9F\x98\x80"_ns, Nothing()},
+      {"utf8"_ns, "\xCE\xB1\xF0\x9F\x98\x80"_ns, Nothing()}};
+  ExpectProperties(expected, actual);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferConversionPreservesSizedBytes) {
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  nsCOMPtr<nsIWritablePropertyBag> generic = do_QueryInterface(bag);
+  ASSERT_TRUE(generic);
+  nsCOMPtr<nsIWritableVariant> value =
+      do_CreateInstance("@mozilla.org/variant;1");
+  ASSERT_TRUE(value);
+  ASSERT_EQ(NS_OK, value->SetAsStringWithSize(3, "a\0b"));
+  ASSERT_EQ(NS_OK, generic->SetProperty(u"bytes"_ns, value));
+  nsTArray<FolderImportProperty> properties;
+  ASSERT_EQ(NS_OK, Decode(bag, properties));
+  ExpectProperties({{"bytes"_ns, nsCString("a\0b", 3), Nothing()}}, properties);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferConversionUnsignedOverflowKeepsOutput) {
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsUint64(
+                       u"wide"_ns, static_cast<uint64_t>(
+                                       std::numeric_limits<int64_t>::max())));
+  nsTArray<FolderImportProperty> actual;
+  ASSERT_EQ(NS_OK, Decode(bag, actual));
+  ExpectProperties(
+      {{"wide"_ns, ""_ns, Some(std::numeric_limits<int64_t>::max())}}, actual);
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsUint64(
+                       u"wide"_ns, std::numeric_limits<uint64_t>::max()));
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "unchanged"_ns, Nothing()}};
+  actual = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_LOSS_OF_SIGNIFICANT_DATA, Decode(bag, actual));
+  ExpectProperties(sentinel, actual);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferConversionRejectsUnsupportedBeforeOutput) {
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsACString(u"valid"_ns, "keep text"_ns));
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsDouble(u"unsupported"_ns, 1.5));
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "unchanged"_ns, Nothing()}};
+  nsTArray<FolderImportProperty> actual = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, Decode(bag, actual));
+  ExpectProperties(sentinel, actual);
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsBool(u"unsupported"_ns, true));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, Decode(bag, actual));
+  ExpectProperties(sentinel, actual);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, Decode(nullptr, actual));
+  ExpectProperties(sentinel, actual);
+  EXPECT_EQ(NS_ERROR_INVALID_POINTER, Encode(sentinel, nullptr));
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferConversionRejectsInvalidNamesAndDuplicates) {
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  nsAutoString name;
+  name.Append(char16_t{0xd800});
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsACString(name, "text"_ns));
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "unchanged"_ns, Nothing()}};
+  nsTArray<FolderImportProperty> actual = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, Decode(bag, actual));
+  ExpectProperties(sentinel, actual);
+  nsCOMPtr<nsIPropertyBag2> output;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            Encode({{"duplicate"_ns, "first"_ns, Nothing()},
+                    {"duplicate"_ns, "second"_ns, Nothing()}},
+                   getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, Encode({{"\xFF"_ns, "text"_ns, Nothing()}},
+                                            getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferConversionRejectsInvalidUnicodeText) {
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  nsAutoString text;
+  text.Append(char16_t{0xd800});
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsAString(u"invalid"_ns, text));
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "unchanged"_ns, Nothing()}};
+  nsTArray<FolderImportProperty> properties = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, Decode(bag, properties));
+  ExpectProperties(sentinel, properties);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferSnapshotPreservesPhysicalOwnership) {
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("id", "metadata id"_ns));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("parent", "metadata parent"_ns));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("path", "metadata path"_ns));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("folderName", "metadata display"_ns));
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("number", "00042"_ns));
+  uint64_t id = mDatabase->FolderId(), parent;
+  nsAutoCString name;
+  ASSERT_EQ(NS_OK, sFolders->GetFolderParent(id, &parent));
+  ASSERT_EQ(NS_OK, sFolders->GetFolderName(id, name));
+  uint64_t foreign;
+  ASSERT_EQ(NS_OK, sFolders->InsertFolder(id, "foreign"_ns, &foreign));
+  RefPtr<PerFolderDatabase> other = new PerFolderDatabase(foreign, false);
+  auto cleanup =
+      MakeScopeExit([&] { sCore->MessageDB().RemoveMessageListener(other); });
+  nsCOMPtr<nsIDBFolderInfo> otherInfo;
+  ASSERT_EQ(NS_OK, other->GetDBFolderInfo(getter_AddRefs(otherInfo)));
+  ASSERT_EQ(NS_OK, otherInfo->SetCharProperty("foreign", "excluded"_ns));
+  nsTArray<FolderImportProperty> properties;
+  ASSERT_EQ(NS_OK, ReadTransfer(properties));
+  ExpectProperties({{"id"_ns, "metadata id"_ns, Nothing()},
+                    {"parent"_ns, "metadata parent"_ns, Nothing()},
+                    {"path"_ns, "metadata path"_ns, Nothing()},
+                    {"folderName"_ns, "metadata display"_ns, Nothing()},
+                    {"number"_ns, "00042"_ns, Nothing()}},
+                   properties);
+  EXPECT_EQ(id, mDatabase->FolderId());
+  uint64_t afterParent;
+  nsAutoCString afterName;
+  ASSERT_EQ(NS_OK, sFolders->GetFolderParent(id, &afterParent));
+  ASSERT_EQ(NS_OK, sFolders->GetFolderName(id, afterName));
+  EXPECT_EQ(parent, afterParent);
+  EXPECT_EQ(name, afterName);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferSnapshotDistinguishesEmptyAndMissing) {
+  nsTArray<FolderImportProperty> properties{
+      {"sentinel"_ns, "unchanged"_ns, Nothing()}};
+  ASSERT_EQ(NS_OK, ReadTransfer(properties));
+  EXPECT_TRUE(properties.IsEmpty());
+  ASSERT_EQ(NS_OK, sFolders->DeleteFolder(mDatabase->FolderId()));
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "unchanged"_ns, Nothing()}};
+  properties = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ReadTransfer(properties));
+  ExpectProperties(sentinel, properties);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       TransferSnapshotStorageErrorKeepsOutput) {
+  ASSERT_EQ(NS_OK, mInfo->SetCharProperty("stored", "value"_ns));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "ALTER TABLE folder_properties RENAME TO "
+                       "hidden_transfer_properties"_ns));
+  auto restore = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "ALTER TABLE hidden_transfer_properties "
+                         "RENAME TO folder_properties"_ns));
+  });
+  const nsTArray<FolderImportProperty> sentinel{
+      {"sentinel"_ns, "unchanged"_ns, Nothing()}};
+  nsTArray<FolderImportProperty> properties = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_FAILURE, ReadTransfer(properties));
+  ExpectProperties(sentinel, properties);
+}
+
+nsresult AddBodyHeader(nsIMsgDatabase* db, nsIMsgDBHdr** result) {
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  MOZ_TRY(db->CreateNewHdr(getter_AddRefs(draft)));
+  MOZ_TRY(draft->SetMessageId("body-settlement@invalid"_ns));
+  MOZ_TRY(draft->SetFlags(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked));
+  MOZ_TRY(draft->SetStoreToken("before"_ns));
+  MOZ_TRY(draft->SetMessageSize(10));
+  MOZ_TRY(draft->SetOfflineMessageSize(11));
+  MOZ_TRY(draft->SetLineCount(2));
+  return db->AttachHdr(draft, false, result);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       PublicTransferEpochRetiresOnlyOwnedBindings) {
+  ASSERT_EQ(NS_OK, mInfo->SetImapUidValidity(7));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddBodyHeader(mDatabase, getter_AddRefs(header)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  ASSERT_EQ(NS_OK, sCore->MessageDB().BindMessageToServerUid(
+                       key, mDatabase->FolderId(), 7, 91));
+  RawHdr raw;
+  raw.messageId = "staged-transfer@invalid"_ns;
+  nsMsgKey staged;
+  ASSERT_EQ(NS_OK, sCore->MessageDB().StageMessage(mDatabase->FolderId(), raw,
+                                                   &staged));
+  nsAutoCString sql(
+      "INSERT INTO staged_message_properties (id,name,value) VALUES (");
+  sql.AppendInt(staged);
+  sql.Append(", 'uidOnServer', 91)");
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(sql));
+  uint64_t otherId;
+  ASSERT_EQ(NS_OK,
+            sFolders->InsertFolder(sRoot, "transfer-control"_ns, &otherId));
+  RefPtr<PerFolderDatabase> other = new PerFolderDatabase(otherId, false);
+  auto cleanup =
+      MakeScopeExit([&] { sCore->MessageDB().RemoveMessageListener(other); });
+  nsCOMPtr<nsIDBFolderInfo> otherInfo;
+  ASSERT_EQ(NS_OK, other->GetDBFolderInfo(getter_AddRefs(otherInfo)));
+  ASSERT_EQ(NS_OK, otherInfo->SetImapUidValidity(7));
+  nsCOMPtr<nsIMsgDBHdr> otherHeader;
+  ASSERT_EQ(NS_OK, AddBodyHeader(other, getter_AddRefs(otherHeader)));
+  nsMsgKey otherKey;
+  ASSERT_EQ(NS_OK, otherHeader->GetMessageKey(&otherKey));
+  ASSERT_EQ(NS_OK, sCore->MessageDB().BindMessageToServerUid(otherKey, otherId,
+                                                             7, 91));
+  nsCOMPtr<nsIPropertyBag2> transfer;
+  ASSERT_EQ(NS_OK, mInfo->GetTransferInfo(getter_AddRefs(transfer)));
+  nsCOMPtr<nsIWritablePropertyBag2> edit = do_QueryInterface(transfer);
+  ASSERT_TRUE(edit);
+  ASSERT_EQ(NS_OK, edit->SetPropertyAsInt64(u"UIDValidity"_ns, UINT32_MAX));
+  ASSERT_EQ(NS_OK, mInfo->InitFromTransferInfo(transfer));
+  uint32_t epoch = 0;
+  ASSERT_EQ(NS_OK, mInfo->GetImapUidValidity(&epoch));
+  EXPECT_EQ(UINT32_MAX, epoch);
+  nsMsgKey found = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            sCore->MessageDB().GetMessageKeyForServerUid(
+                mDatabase->FolderId(), UINT32_MAX, 91, found));
+  EXPECT_EQ(nsMsgKey_None, found);
+  ASSERT_EQ(NS_OK, sCore->MessageDB().GetMessageKeyForServerUid(otherId, 7, 91,
+                                                                found));
+  EXPECT_EQ(otherKey, found);
+  nsCOMPtr<mozIStorageStatement> statement;
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->CreateStatement(
+          "SELECT (SELECT COUNT(*) FROM messages WHERE id=:live), "
+          "(SELECT COUNT(*) FROM staged_messages WHERE id=:staged), "
+          "(SELECT COUNT(*) FROM message_properties WHERE id=:live AND "
+          "name='uidOnServer'), "
+          "(SELECT COUNT(*) FROM staged_message_properties WHERE id=:staged AND name='uidOnServer')"_ns,
+          getter_AddRefs(statement)));
+  ASSERT_EQ(NS_OK, statement->BindInt64ByName("live"_ns, key));
+  ASSERT_EQ(NS_OK, statement->BindInt64ByName("staged"_ns, staged));
+  bool row = false;
+  ASSERT_EQ(NS_OK, statement->ExecuteStep(&row));
+  ASSERT_TRUE(row);
+  EXPECT_EQ(1, statement->AsInt32(0));
+  EXPECT_EQ(1, statement->AsInt32(1));
+  EXPECT_EQ(0, statement->AsInt32(2));
+  EXPECT_EQ(0, statement->AsInt32(3));
+  ASSERT_EQ(NS_OK, statement->Finalize());
+  nsAutoCString token;
+  ASSERT_EQ(NS_OK, header->GetStoreToken(token));
+  EXPECT_EQ("before"_ns, token);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       PublicTransferValidationPrecedesEpochAndFlagWrites) {
+  ASSERT_EQ(NS_OK, mInfo->SetImapUidValidity(7));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddBodyHeader(mDatabase, getter_AddRefs(header)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  ASSERT_EQ(NS_OK, sCore->MessageDB().BindMessageToServerUid(
+                       key, mDatabase->FolderId(), 7, 91));
+  nsCOMPtr<nsIPropertyBag2> transfer;
+  ASSERT_EQ(NS_OK, mInfo->GetTransferInfo(getter_AddRefs(transfer)));
+  nsCOMPtr<nsIWritablePropertyBag2> edit = do_QueryInterface(transfer);
+  ASSERT_TRUE(edit);
+  ASSERT_EQ(NS_OK, edit->SetPropertyAsInt64(u"UIDValidity"_ns, 8));
+  ASSERT_EQ(NS_OK,
+            edit->SetPropertyAsInt64(u"flags"_ns, nsMsgFolderFlags::Mail));
+  ASSERT_EQ(NS_OK,
+            edit->SetPropertyAsInt64(u"version"_ns, int64_t{UINT32_MAX} + 1));
+  EXPECT_EQ(NS_ERROR_LOSS_OF_SIGNIFICANT_DATA,
+            mInfo->InitFromTransferInfo(transfer));
+  uint32_t epoch = 0;
+  ASSERT_EQ(NS_OK, mInfo->GetImapUidValidity(&epoch));
+  EXPECT_EQ(7u, epoch);
+  int32_t flags = -1;
+  ASSERT_EQ(NS_OK, mInfo->GetFlags(&flags));
+  EXPECT_EQ(0, flags);
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, sCore->MessageDB().GetMessageKeyForServerUid(
+                       mDatabase->FolderId(), 7, 91, found));
+  EXPECT_EQ(key, found);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       PublicTransferEpochFailureKeepsBindingsAndPrimaryError) {
+  ASSERT_EQ(NS_OK, mInfo->SetImapUidValidity(7));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddBodyHeader(mDatabase, getter_AddRefs(header)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  ASSERT_EQ(NS_OK, sCore->MessageDB().BindMessageToServerUid(
+                       key, mDatabase->FolderId(), 7, 91));
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsInt64(u"UIDValidity"_ns, 8));
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsACString(u"later"_ns, "not applied"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_transfer_epoch BEFORE INSERT ON "
+          "folder_properties "
+          "WHEN NEW.name='UIDValidity' BEGIN SELECT RAISE(ABORT,'epoch fault'); END"_ns));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_transfer_epoch"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, mInfo->InitFromTransferInfo(bag));
+  uint32_t epoch = 0;
+  ASSERT_EQ(NS_OK, mInfo->GetImapUidValidity(&epoch));
+  EXPECT_EQ(7u, epoch);
+  nsMsgKey found = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, sCore->MessageDB().GetMessageKeyForServerUid(
+                       mDatabase->FolderId(), 7, 91, found));
+  EXPECT_EQ(key, found);
+  nsCOMPtr<nsIPropertyBag2> after;
+  ASSERT_EQ(NS_OK, mInfo->GetTransferInfo(getter_AddRefs(after)));
+  bool present = true;
+  ASSERT_EQ(NS_OK, after->HasKey(u"later"_ns, &present));
+  EXPECT_FALSE(present);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       PublicTransferLateFailureKeepsAppliedPrefix) {
+  ASSERT_EQ(NS_OK, mInfo->SetImapUidValidity(7));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddBodyHeader(mDatabase, getter_AddRefs(header)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  ASSERT_EQ(NS_OK, sCore->MessageDB().BindMessageToServerUid(
+                       key, mDatabase->FolderId(), 7, 91));
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsInt64(u"UIDValidity"_ns, 8));
+  ASSERT_EQ(NS_OK,
+            bag->SetPropertyAsInt64(u"flags"_ns, nsMsgFolderFlags::Mail));
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsACString(u"late"_ns, "rejected"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_transfer_late BEFORE INSERT ON "
+          "folder_properties "
+          "WHEN NEW.name='late' BEGIN SELECT RAISE(ABORT,'late fault'); END"_ns));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_transfer_late"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, mInfo->InitFromTransferInfo(bag));
+  uint32_t epoch = 0;
+  ASSERT_EQ(NS_OK, mInfo->GetImapUidValidity(&epoch));
+  EXPECT_EQ(8u, epoch);
+  int32_t flags = 0;
+  ASSERT_EQ(NS_OK, mInfo->GetFlags(&flags));
+  EXPECT_EQ(nsMsgFolderFlags::Mail, static_cast<uint32_t>(flags));
+  nsMsgKey found = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            sCore->MessageDB().GetMessageKeyForServerUid(mDatabase->FolderId(),
+                                                         8, 91, found));
+  nsAutoCString token;
+  ASSERT_EQ(NS_OK, header->GetStoreToken(token));
+  EXPECT_EQ("before"_ns, token);
+  nsCOMPtr<nsIPropertyBag2> after;
+  ASSERT_EQ(NS_OK, mInfo->GetTransferInfo(getter_AddRefs(after)));
+  bool present = true;
+  ASSERT_EQ(NS_OK, after->HasKey(u"late"_ns, &present));
+  EXPECT_FALSE(present);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       PublicTransferEpochDoesNotSettleForeignTransaction) {
+  ASSERT_EQ(NS_OK, mInfo->SetImapUidValidity(7));
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  ASSERT_EQ(NS_OK, bag->SetPropertyAsInt64(u"UIDValidity"_ns, 8));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto cleanup = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, mInfo->InitFromTransferInfo(bag));
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  uint32_t epoch = 0;
+  ASSERT_EQ(NS_OK, mInfo->GetImapUidValidity(&epoch));
+  EXPECT_EQ(7u, epoch);
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       PublicTransferMissingAndNullOutputs) {
+  EXPECT_EQ(NS_ERROR_INVALID_POINTER, mInfo->GetTransferInfo(nullptr));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, mInfo->InitFromTransferInfo(nullptr));
+  nsCOMPtr<nsIPropertyBag2> bag;
+  ASSERT_EQ(NS_OK, mInfo->GetTransferInfo(getter_AddRefs(bag)));
+  ASSERT_EQ(NS_OK, sFolders->DeleteFolder(mDatabase->FolderId()));
+  nsCOMPtr<nsIPropertyBag2> missing;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mInfo->GetTransferInfo(getter_AddRefs(missing)));
+  EXPECT_FALSE(missing);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mInfo->InitFromTransferInfo(bag));
+}
+
+TEST_F(DISABLED_DeliveryFolderInfoProperties,
+       PublicTransferFlagChangeDoesNotSettleForeignTransaction) {
+  nsCOMPtr<nsIWritablePropertyBag2> bag =
+      do_CreateInstance("@mozilla.org/hash-property-bag;1");
+  ASSERT_TRUE(bag);
+  ASSERT_EQ(NS_OK,
+            bag->SetPropertyAsInt64(u"flags"_ns, nsMsgFolderFlags::Mail));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto cleanup = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, mInfo->InitFromTransferInfo(bag));
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int32_t flags = -1;
+  ASSERT_EQ(NS_OK, mInfo->GetFlags(&flags));
+  EXPECT_EQ(0, flags);
 }
 
 }  // namespace

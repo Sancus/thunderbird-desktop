@@ -205,10 +205,14 @@ export class GraphServer extends MockServer {
 
   /**
    * Stop listening for requests.
+   *
+   * @returns {Promise<void>} Resolves when the HTTP server has stopped.
+   * @throws {nsIException} If the HTTP server is not running.
    */
   stop() {
-    this.#httpServer.stop();
+    const stopped = this.#httpServer.stop();
     this.#httpsProxy?.destroy();
+    return stopped;
   }
 
   /**

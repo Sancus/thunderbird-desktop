@@ -101,7 +101,7 @@ add_task(async function test_ewsReportsEachMissingItem() {
       0
     );
   } finally {
-    server.stop();
+    await server.stop();
   }
 });
 
@@ -115,7 +115,7 @@ add_task(async function test_graphReturns404ForMissingItem() {
     Assert.equal(response.status, 404);
     Assert.equal(await response.text(), "");
   } finally {
-    server.stop();
+    await server.stop();
   }
 });
 
@@ -130,7 +130,7 @@ add_task(async function test_graphReturns404ForMissingMime() {
     Assert.equal(response.status, 404);
     Assert.equal(await response.text(), "");
   } finally {
-    server.stop();
+    await server.stop();
   }
 });
 
@@ -147,7 +147,7 @@ add_task(async function test_graphReturnsExistingMime() {
     Assert.equal(response.status, 200);
     Assert.equal(await response.text(), raw);
   } finally {
-    server.stop();
+    await server.stop();
   }
 });
 
@@ -288,6 +288,29 @@ add_task(async function test_ewsUpdateItemPreservesMixedOutcomes() {
       "unselected",
     ]);
   } finally {
-    server.stop();
+    await server.stop();
+  }
+});
+
+add_task(async function test_mockStopCompletionAndOriginalError() {
+  for (const Server of [EwsServer, GraphServer]) {
+    const server = new Server();
+    server.start();
+    const stopped = server.stop();
+    try {
+      Assert.equal(
+        typeof stopped?.then,
+        "function",
+        "Mock shutdown returns an observable completion promise"
+      );
+      await stopped;
+      Assert.throws(
+        () => server.stop(),
+        error => error.result === Cr.NS_ERROR_UNEXPECTED,
+        "A second stop preserves the HTTP server's original synchronous error"
+      );
+    } finally {
+      await stopped;
+    }
   }
 });

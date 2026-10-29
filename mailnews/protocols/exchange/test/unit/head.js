@@ -80,7 +80,7 @@ function setupBasicEwsTestServer({
       "waiting for the EWS client to shut down"
     );
 
-    ewsServer.stop();
+    await ewsServer.stop();
   });
 
   return [ewsServer, incomingServer];
@@ -120,7 +120,7 @@ function setupBasicGraphTestServer({ username = "user" } = {}) {
       "waiting for the Graph client to shut down"
     );
 
-    graphServer.stop();
+    await graphServer.stop();
   });
 
   return [graphServer, incomingServer];

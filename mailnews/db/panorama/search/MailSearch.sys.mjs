@@ -23,9 +23,15 @@ let current = null;
  * backend can activate this service; this does not supply a legacy fallback.
  *
  * @returns {Promise<MailSearchService>} Shared service; close through closeMailSearch.
- * @throws {Error} If opening or native identity lookup fails.
+ * @throws {Error} If opening or native identity lookup fails, or shutdown has started.
  */
 export async function getMailSearchService() {
+  if (Services.startup.shuttingDown) {
+    throw Components.Exception(
+      "Mail search is shutting down",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
+  }
   // Account manager initialization registers and starts the native backend.
   MailServices.accounts;
   const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(

@@ -187,3 +187,21 @@ add_task(async function test_defaultActivationIndexesWithoutAQuery() {
     await closeMailSearch();
   }
 });
+
+// Advancing shutdown is irreversible, so this must remain the last task.
+add_task(async function test_shutdownPreventsReopening() {
+  await closeMailSearch();
+  Services.startup.advanceShutdownPhase(
+    Ci.nsIAppStartup.SHUTDOWN_PHASE_APPSHUTDOWNCONFIRMED
+  );
+  Assert.ok(Services.startup.shuttingDown, "Shutdown has been confirmed");
+  try {
+    await Assert.rejects(
+      getMailSearchService(),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+      "A caller cannot open a new search writer during shutdown"
+    );
+  } finally {
+    await closeMailSearch();
+  }
+});

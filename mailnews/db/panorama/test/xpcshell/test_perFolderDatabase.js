@@ -2091,3 +2091,251 @@ add_task(function test_admissionKeepsItsOriginalSourceReadError() {
     Assert.equal(current.dBFolderInfo.expungedBytes, 17);
   }
 });
+
+add_task(function test_enumeratorsBelongToTheirWrapperLifetime() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("enumerator-owner");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("enumerator-bystander");
+  const key = addMessage({ folderId: folder.id });
+  const otherKey = addMessage({ folderId: other.id });
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const header = db.getMsgHdrForKey(key);
+  db.refreshCache(folder.URI, [otherKey]);
+  Assert.strictEqual(db.getCachedHits(folder.URI).getNext().folder, other);
+  const factories = [
+    () => db.enumerateMessages(),
+    () => db.reverseEnumerateMessages(),
+    () => db.getFilterEnumerator([]),
+    () => db.getCachedHits(folder.URI),
+  ];
+  const retained = factories.map(create => create());
+  const threads = db.enumerateThreads();
+  for (const enumerator of [...retained, threads]) {
+    Assert.ok(enumerator.hasMoreElements());
+  }
+  const otherEnumerator = otherDB.enumerateMessages();
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    db.close(true);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  for (const enumerator of retained) {
+    Assert.throws(() => enumerator.hasMoreElements(), /NS_ERROR_FAILURE/);
+    Assert.throws(() => enumerator.getNext(), /NS_ERROR_FAILURE/);
+  }
+  // Retained thread cursors report exhaustion on close; fetching still fails.
+  Assert.ok(!threads.hasMoreElements());
+  Assert.throws(() => threads.getNext(), /NS_ERROR_FAILURE/);
+  Assert.strictEqual(header.folder, folder);
+  header.subject = "Header remains usable after cursor invalidation";
+  Assert.equal(db.getMsgHdrForKey(key).subject, header.subject);
+  Assert.deepEqual(
+    [...db.enumerateMessages()].map(item => item.messageKey),
+    [key],
+    "Close invalidates old cursors without closing the shared connection"
+  );
+  Assert.equal(otherEnumerator.getNext().messageKey, otherKey);
+  Assert.ok(!otherEnumerator.hasMoreElements());
+  Assert.deepEqual(
+    [...db.getCachedHits(folder.URI)].map(item => item.messageKey),
+    [otherKey],
+    "Cached hits retain their own physical folder identity"
+  );
+  const beforeForceClose = factories.map(create => create());
+  const threadsBeforeForceClose = db.enumerateThreads();
+  let callbacks = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway(source) {
+      callbacks++;
+      Assert.strictEqual(source, db);
+      for (const enumerator of beforeForceClose) {
+        Assert.throws(() => enumerator.hasMoreElements(), /NS_ERROR_FAILURE/);
+        Assert.throws(() => enumerator.getNext(), /NS_ERROR_FAILURE/);
+      }
+      Assert.ok(!threadsBeforeForceClose.hasMoreElements());
+      Assert.throws(
+        () => threadsBeforeForceClose.getNext(),
+        /NS_ERROR_FAILURE/
+      );
+      source.forceClosed();
+      Assert.ok(otherDB.containsKey(otherKey));
+    },
+  };
+  db.addListener(listener);
+  try {
+    db.forceClosed();
+    Assert.equal(callbacks, 1);
+    db.forceClosed();
+    Assert.equal(callbacks, 1);
+    const reopened = database
+      .QueryInterface(Ci.nsIMsgDBService)
+      .openFolderDB(folder, false);
+    Assert.notStrictEqual(reopened, db);
+    Assert.deepEqual(
+      [...reopened.enumerateMessages()].map(item => item.messageKey),
+      [key]
+    );
+    Assert.ok(otherDB.containsKey(otherKey));
+  } finally {
+    db.removeListener(listener);
+  }
+});
+
+add_task(function test_enumeratorsPreserveTheirOriginalSourceIdentity() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("enumerator-incarnation");
+  const key = addMessage({ folderId: folder.id });
+  const db = folder.msgDatabase;
+  const connection = database.connectionForTests;
+  const source = database.sourceId;
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    for (const [value, expected] of [
+      [Services.uuid.generateUUID().toString(), Cr.NS_ERROR_NOT_AVAILABLE],
+      ["not-a-uuid", Cr.NS_ERROR_FILE_CORRUPTED],
+    ]) {
+      const enumerators = [
+        db.enumerateMessages(),
+        db.reverseEnumerateMessages(),
+        db.enumerateThreads(),
+        db.getFilterEnumerator([]),
+      ];
+      for (const enumerator of enumerators) {
+        Assert.ok(enumerator.hasMoreElements());
+      }
+      update.params.source = value;
+      update.execute();
+      try {
+        for (const enumerator of enumerators) {
+          Assert.throws(
+            () => enumerator.hasMoreElements(),
+            error => error.result === expected
+          );
+          Assert.throws(
+            () => enumerator.getNext(),
+            error => error.result === expected
+          );
+        }
+      } finally {
+        update.params.source = source;
+        update.execute();
+      }
+      for (const enumerator of enumerators) {
+        Assert.throws(
+          () => enumerator.getNext(),
+          error => error.result === expected,
+          "Restoring the table cannot revive a refused cursor"
+        );
+      }
+      Assert.deepEqual(
+        [...db.enumerateMessages()].map(header => header.messageKey),
+        [key]
+      );
+    }
+  } finally {
+    update.params.source = source;
+    update.execute();
+    update.finalize();
+  }
+});
+
+add_task(function test_enumeratorFactoriesPropagateFirstStepErrors() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("enumerator-step-error");
+  const key = addMessage({ folderId: folder.id });
+  const db = folder.msgDatabase;
+  const connection = database.connectionForTests;
+  // A normal read of the temporary view fails when SQLite evaluates date.
+  // The production table and its message are unchanged.
+  connection.executeSimpleSQL(
+    "CREATE TEMP VIEW messages AS SELECT id, folderId, threadId, " +
+      "threadParent, messageId, abs(-9223372036854775808) AS date, sender, " +
+      "recipients, ccList, bccList, subject, flags, tags, priority FROM main.messages"
+  );
+  try {
+    for (const create of [
+      () => db.enumerateMessages(),
+      () => db.reverseEnumerateMessages(),
+      () => db.enumerateThreads(),
+    ]) {
+      Assert.throws(
+        create,
+        error => error.result === Cr.NS_ERROR_FAILURE,
+        "An ExecuteStep error cannot become a successful empty enumeration"
+      );
+    }
+  } finally {
+    connection.executeSimpleSQL("DROP VIEW temp.messages");
+  }
+  Assert.deepEqual(
+    [...db.enumerateMessages()].map(header => header.messageKey),
+    [key]
+  );
+});
+
+add_task(function test_filteredPrefetchCannotOutliveItsMembershipOrOwner() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("enumerator-filtered-membership");
+  const first = addMessage({ folderId: folder.id });
+  const second = addMessage({ folderId: folder.id });
+  const db = folder.msgDatabase;
+  const enumerator = db.getFilterEnumerator([]);
+  Assert.ok(enumerator.hasMoreElements());
+  db.deleteMessage(first, null, true);
+  Assert.equal(enumerator.getNext().messageKey, second);
+  Assert.ok(!enumerator.hasMoreElements());
+  let calls = 0;
+  const custom = {
+    id: "enumerator-reentrant-close@test.invalid",
+    name: "Close the wrapper during matching",
+    getEnabled() {
+      return true;
+    },
+    getAvailable() {
+      return true;
+    },
+    getAvailableOperators() {
+      return [Ci.nsMsgSearchOp.Is];
+    },
+    match() {
+      calls++;
+      db.close(false);
+      return true;
+    },
+  };
+  MailServices.filters.addCustomTerm(custom);
+  const session = Cc["@mozilla.org/messenger/searchSession;1"].createInstance(
+    Ci.nsIMsgSearchSession
+  );
+  const term = session.createTerm();
+  term.attrib = Ci.nsMsgSearchAttrib.Custom;
+  term.customId = custom.id;
+  term.op = Ci.nsMsgSearchOp.Is;
+  term.booleanAnd = true;
+  const value = term.value;
+  value.attrib = term.attrib;
+  value.str = "close";
+  term.value = value;
+  const reentrant = db.getFilterEnumerator([term]);
+  Assert.throws(() => reentrant.hasMoreElements(), /NS_ERROR_FAILURE/);
+  Assert.equal(calls, 1);
+  Assert.throws(() => reentrant.getNext(), /NS_ERROR_FAILURE/);
+  Assert.equal(calls, 1);
+  Assert.deepEqual(
+    [...db.getFilterEnumerator([])].map(header => header.messageKey),
+    [second]
+  );
+});

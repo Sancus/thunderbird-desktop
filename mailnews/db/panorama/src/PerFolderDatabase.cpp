@@ -630,6 +630,7 @@ NS_IMETHODIMP PerFolderDatabase::OpenFromFile(nsIFile* aFolderName) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
 NS_IMETHODIMP PerFolderDatabase::Close(bool forceCommit) {
+  ++mEnumeratorGeneration;
   // Each native write is already committed. Never settle another caller's SQL.
   return forceCommit ? Commit(nsMsgDBCommitType::kSessionCommit) : NS_OK;
 }
@@ -666,6 +667,20 @@ NS_IMETHODIMP PerFolderDatabase::GetDatabaseSize(int64_t* databaseSize) {
   *databaseSize = 0;
   return NS_OK;
 }
+nsresult PerFolderDatabase::CheckEnumerationState(uint64_t generation) const {
+  NS_ENSURE_TRUE(!mForceClosed && generation == mEnumeratorGeneration,
+                 NS_ERROR_FAILURE);
+  MOZ_TRY(mDatabaseSourceStatus);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core && core->mFolderDatabase && core->mMessageDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
+  // This reader neither opens a connection nor settles a caller's transaction.
+  nsCString sourceId;
+  MOZ_TRY(core->ReadSourceIdForFolderAdmission(sourceId));
+  NS_ENSURE_TRUE(sourceId == mDatabaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  return CheckFolderExists();
+}
+
 nsresult PerFolderDatabase::CheckFolderExists() const {
   NS_ENSURE_TRUE(!mForceClosed && DatabaseCore::sInstance &&
                      DatabaseCore::sInstance->mFolderDatabase,
@@ -995,6 +1010,8 @@ NS_IMETHODIMP PerFolderDatabase::ListAllKeys(nsTArray<nsMsgKey>& aKeys) {
 NS_IMETHODIMP PerFolderDatabase::EnumerateMessages(
     nsIMsgEnumerator** aEnumerator) {
   NS_ENSURE_ARG_POINTER(aEnumerator);
+  *aEnumerator = nullptr;
+  MOZ_TRY(CheckEnumerationState(mEnumeratorGeneration));
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv =
       DatabaseCore::GetStatement("GetAllMessages"_ns,
@@ -1007,15 +1024,19 @@ NS_IMETHODIMP PerFolderDatabase::EnumerateMessages(
   rv = stmt->Clone(getter_AddRefs(stmtClone));
   NS_ENSURE_SUCCESS(rv, rv);
 
-  stmtClone->BindInt64ByName("folderId"_ns, mFolderId);
+  MOZ_TRY(stmtClone->BindInt64ByName("folderId"_ns, mFolderId));
 
-  RefPtr<MessageEnumerator> enumerator = new MessageEnumerator(stmtClone);
+  RefPtr<MessageEnumerator> enumerator = new MessageEnumerator(this, stmtClone);
+  bool hasNext;
+  MOZ_TRY(enumerator->HasMoreElements(&hasNext));
   enumerator.forget(aEnumerator);
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::ReverseEnumerateMessages(
     nsIMsgEnumerator** aEnumerator) {
   NS_ENSURE_ARG_POINTER(aEnumerator);
+  *aEnumerator = nullptr;
+  MOZ_TRY(CheckEnumerationState(mEnumeratorGeneration));
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "GetAllMessagesReverse"_ns,
@@ -1028,15 +1049,19 @@ NS_IMETHODIMP PerFolderDatabase::ReverseEnumerateMessages(
   rv = stmt->Clone(getter_AddRefs(stmtClone));
   NS_ENSURE_SUCCESS(rv, rv);
 
-  stmtClone->BindInt64ByName("folderId"_ns, mFolderId);
+  MOZ_TRY(stmtClone->BindInt64ByName("folderId"_ns, mFolderId));
 
-  RefPtr<MessageEnumerator> enumerator = new MessageEnumerator(stmtClone);
+  RefPtr<MessageEnumerator> enumerator = new MessageEnumerator(this, stmtClone);
+  bool hasNext;
+  MOZ_TRY(enumerator->HasMoreElements(&hasNext));
   enumerator.forget(aEnumerator);
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::EnumerateThreads(
     nsIMsgThreadEnumerator** aEnumerator) {
   NS_ENSURE_ARG_POINTER(aEnumerator);
+  *aEnumerator = nullptr;
+  MOZ_TRY(CheckEnumerationState(mEnumeratorGeneration));
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "GetMessageThreads"_ns,
@@ -1048,25 +1073,37 @@ NS_IMETHODIMP PerFolderDatabase::EnumerateThreads(
   rv = stmt->Clone(getter_AddRefs(stmtClone));
   NS_ENSURE_SUCCESS(rv, rv);
 
-  stmtClone->BindInt64ByName("folderId"_ns, mFolderId);
+  MOZ_TRY(stmtClone->BindInt64ByName("folderId"_ns, mFolderId));
 
-  RefPtr<ThreadEnumerator> enumerator =
-      new ThreadEnumerator(stmtClone, mFolderId);
+  RefPtr<ThreadEnumerator> enumerator = new ThreadEnumerator(this, stmtClone);
+  bool hasNext;
+  MOZ_TRY(enumerator->HasMoreElements(&hasNext));
   enumerator.forget(aEnumerator);
   return NS_OK;
 }
 
-namespace {
-
 class FilterEnumerator final : public nsBaseMsgEnumerator {
  public:
-  FilterEnumerator(nsIMsgDatabase* db, nsIMsgSearchSession* session,
+  FilterEnumerator(PerFolderDatabase* db, nsIMsgSearchSession* session,
                    nsTArray<nsMsgKey>&& keys)
-      : mDatabase(db), mSession(session), mKeys(std::move(keys)) {}
+      : mDatabase(db),
+        mGeneration(db->mEnumeratorGeneration),
+        mSession(session),
+        mKeys(std::move(keys)) {}
 
   NS_IMETHOD HasMoreElements(bool* result) override {
     NS_ENSURE_ARG_POINTER(result);
     *result = false;
+    MOZ_TRY(CheckOwner());
+    if (mNext) {
+      nsMsgKey key;
+      MOZ_TRY(mNext->GetMessageKey(&key));
+      bool contains;
+      MOZ_TRY(mDatabase->ContainsKey(key, &contains));
+      if (!contains) {
+        mNext = nullptr;
+      }
+    }
     while (!mNext && mIndex < mKeys.Length()) {
       bool contains;
       MOZ_TRY(mDatabase->ContainsKey(mKeys[mIndex], &contains));
@@ -1078,7 +1115,11 @@ class FilterEnumerator final : public nsBaseMsgEnumerator {
       MOZ_TRY(
           mDatabase->GetMsgHdrForKey(mKeys[mIndex], getter_AddRefs(header)));
       bool matches = false;
-      MOZ_TRY(mSession->MatchHdr(header, mDatabase, &matches));
+      // Matching can synchronously close the owner and release our members.
+      RefPtr<PerFolderDatabase> database = mDatabase;
+      nsCOMPtr<nsIMsgSearchSession> session = mSession;
+      MOZ_TRY(session->MatchHdr(header, database, &matches));
+      MOZ_TRY(CheckOwner());
       ++mIndex;
       if (matches) {
         mNext = header;
@@ -1100,20 +1141,34 @@ class FilterEnumerator final : public nsBaseMsgEnumerator {
 
  private:
   ~FilterEnumerator() = default;
-  nsCOMPtr<nsIMsgDatabase> mDatabase;
+
+  nsresult CheckOwner() {
+    MOZ_TRY(mStatus);
+    mStatus = mDatabase->CheckEnumerationState(mGeneration);
+    if (NS_FAILED(mStatus)) {
+      mNext = nullptr;
+      mKeys.Clear();
+      mSession = nullptr;
+      mDatabase = nullptr;
+    }
+    return mStatus;
+  }
+
+  RefPtr<PerFolderDatabase> mDatabase;
+  uint64_t mGeneration;
+  nsresult mStatus = NS_OK;
   nsCOMPtr<nsIMsgSearchSession> mSession;
   nsTArray<nsMsgKey> mKeys;
   size_t mIndex = 0;
   nsCOMPtr<nsIMsgDBHdr> mNext;
 };
 
-}  // namespace
-
 NS_IMETHODIMP PerFolderDatabase::GetFilterEnumerator(
     const nsTArray<RefPtr<nsIMsgSearchTerm>>& searchTerms, bool reverse,
     nsIMsgEnumerator** aRetVal) {
   NS_ENSURE_ARG_POINTER(aRetVal);
   *aRetVal = nullptr;
+  MOZ_TRY(CheckEnumerationState(mEnumeratorGeneration));
   nsCOMPtr<nsIMsgFolder> folder;
   MOZ_TRY(GetFolder(getter_AddRefs(folder)));
   nsresult rv;
@@ -1672,18 +1727,23 @@ NS_IMETHODIMP PerFolderDatabase::GetNewList(nsTArray<nsMsgKey>& aNewList) {
 }
 NS_IMETHODIMP PerFolderDatabase::GetCachedHits(
     const nsACString& aSearchFolderUri, nsIMsgEnumerator** aRetVal) {
+  NS_ENSURE_ARG_POINTER(aRetVal);
+  *aRetVal = nullptr;
+  MOZ_TRY(CheckEnumerationState(mEnumeratorGeneration));
   uint64_t folderId = MOZ_TRY(FolderURIToId(aSearchFolderUri));
 
-  // We don't need a `mozStorageStatementScoper` (in fact we can't use one here)
-  // because we'll hand the statement over to the `MessageEnumerator`, which
-  // takes care of resetting it when relevant.
-  nsCOMPtr<mozIStorageStatement> stmt =
+  // The cache owns the original statement. Each cursor needs an independent
+  // clone, including when an older cursor is retained across Close.
+  nsCOMPtr<mozIStorageStatement> cached =
       MOZ_TRY(SearchFolderHitsCache::SelectAllForFolderStmt(folderId));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(cached->Clone(getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, folderId));
 
   // `MessageEnumerator` works as long as the statement provides IDs that map to
   // the `messages` table, so although we're not reading directly from that
   // table it still works here.
-  RefPtr<MessageEnumerator> enumerator = new MessageEnumerator(stmt);
+  RefPtr<MessageEnumerator> enumerator = new MessageEnumerator(this, stmt);
 
   // Consumers expect us to return a null pointer rather than an empty
   // enumerator if we don't have any hits, because in a Mork world the lack of
@@ -1691,7 +1751,7 @@ NS_IMETHODIMP PerFolderDatabase::GetCachedHits(
   // This is not really a thing in the Panorama world but we need to preserve
   // this behaviour for compatibility.
   bool hasMessages;
-  enumerator->HasMoreElements(&hasMessages);
+  MOZ_TRY(enumerator->HasMoreElements(&hasMessages));
   if (hasMessages) {
     enumerator.forget(aRetVal);
   } else {
@@ -1770,92 +1830,123 @@ NS_IMETHODIMP PerFolderDatabase::HdrIsInCache(
   return NS_OK;
 }
 
-MessageEnumerator::MessageEnumerator(mozIStorageStatement* aStmt)
-    : mStmt(aStmt) {
-  mStmt->ExecuteStep(&mHasNext);
+MessageEnumerator::MessageEnumerator(PerFolderDatabase* owner,
+                                     mozIStorageStatement* stmt)
+    : mOwner(owner), mGeneration(owner->mEnumeratorGeneration), mStmt(stmt) {
+  Advance();
+}
 
+bool MessageEnumerator::CheckOwner() {
+  if (mOwner && !mOwner->mForceClosed &&
+      mGeneration == mOwner->mEnumeratorGeneration) {
+    if (NS_SUCCEEDED(mStatus)) {
+      mStatus = mOwner->CheckEnumerationState(mGeneration);
+    }
+    if (NS_SUCCEEDED(mStatus)) {
+      return true;
+    }
+  }
+  mHasNext = false;
+  mStmt = nullptr;
+  mOwner = nullptr;
+  return false;
+}
+
+void MessageEnumerator::Advance() {
+  mHasNext = false;
+  mStatus = mStmt->ExecuteStep(&mHasNext);
   if (!mHasNext) {
-    // The statement didn't yield any result, so let's reset it right away.
-    // Ideally we'd reset in the destructor, but this enumerator might be used
-    // in JS in which case we can't always ensure the destructor is called at
-    // the right time.
-    mStmt->Reset();
+    // Reset promptly for JS consumers, preserving the original step error.
+    nsresult rv = mStmt->Reset();
+    if (NS_SUCCEEDED(mStatus)) {
+      mStatus = rv;
+    }
   }
 }
 
-NS_IMETHODIMP MessageEnumerator::GetNext(nsIMsgDBHdr** aItem) {
-  NS_ENSURE_ARG_POINTER(aItem);
-  *aItem = nullptr;
-
-  if (!mHasNext) {
-    return NS_ERROR_FAILURE;
-  }
-
-  nsMsgKey key = (nsMsgKey)mStmt->AsInt64(0);
+NS_IMETHODIMP MessageEnumerator::GetNext(nsIMsgDBHdr** item) {
+  NS_ENSURE_ARG_POINTER(item);
+  *item = nullptr;
+  bool current = CheckOwner();
+  MOZ_TRY(mStatus);
+  NS_ENSURE_TRUE(current && mHasNext, NS_ERROR_FAILURE);
+  nsMsgKey key = static_cast<nsMsgKey>(mStmt->AsInt64(0));
   RefPtr<Message> message = new Message(key);
-  message.forget(aItem);
-  mStmt->ExecuteStep(&mHasNext);
+  message.forget(item);
+  Advance();
+  return NS_OK;
+}
 
-  if (!mHasNext) {
-    // We won't be using the statement anymore, so let's reset it. Ideally we'd
-    // reset in the destructor, but this enumerator might be used in JS in which
-    // case we can't always ensure the destructor is called at the right time.
-    mStmt->Reset();
+NS_IMETHODIMP MessageEnumerator::HasMoreElements(bool* hasNext) {
+  NS_ENSURE_ARG_POINTER(hasNext);
+  *hasNext = false;
+  bool current = CheckOwner();
+  MOZ_TRY(mStatus);
+  NS_ENSURE_TRUE(current, NS_ERROR_FAILURE);
+  *hasNext = mHasNext;
+  return NS_OK;
+}
+
+ThreadEnumerator::ThreadEnumerator(PerFolderDatabase* owner,
+                                   mozIStorageStatement* stmt)
+    : mOwner(owner),
+      mGeneration(owner->mEnumeratorGeneration),
+      mStmt(stmt),
+      mFolderId(owner->FolderId()) {
+  Advance();
+}
+
+bool ThreadEnumerator::CheckOwner() {
+  if (mOwner && !mOwner->mForceClosed &&
+      mGeneration == mOwner->mEnumeratorGeneration) {
+    if (NS_SUCCEEDED(mStatus)) {
+      mStatus = mOwner->CheckEnumerationState(mGeneration);
+    }
+    if (NS_SUCCEEDED(mStatus)) {
+      return true;
+    }
   }
-
-  return NS_OK;
+  mHasNext = false;
+  mStmt = nullptr;
+  mOwner = nullptr;
+  return false;
 }
 
-NS_IMETHODIMP MessageEnumerator::HasMoreElements(bool* aHasNext) {
-  NS_ENSURE_ARG_POINTER(aHasNext);
-
-  *aHasNext = mHasNext;
-  return NS_OK;
-}
-
-ThreadEnumerator::ThreadEnumerator(mozIStorageStatement* stmt,
-                                   uint64_t folderId)
-    : mStmt(stmt), mFolderId(folderId) {
-  mStmt->ExecuteStep(&mHasNext);
-
+void ThreadEnumerator::Advance() {
+  mHasNext = false;
+  mStatus = mStmt->ExecuteStep(&mHasNext);
   if (!mHasNext) {
-    // The statement didn't yield any result, so let's reset it right away.
-    // Ideally we'd reset in the destructor, but this enumerator might be used
-    // in JS in which case we can't always ensure the destructor is called at
-    // the right time.
-    mStmt->Reset();
+    // Reset promptly for JS consumers, preserving the original step error.
+    nsresult rv = mStmt->Reset();
+    if (NS_SUCCEEDED(mStatus)) {
+      mStatus = rv;
+    }
   }
 }
 
 NS_IMETHODIMP ThreadEnumerator::GetNext(nsIMsgThread** item) {
   NS_ENSURE_ARG_POINTER(item);
   *item = nullptr;
-
-  if (!mHasNext) {
-    return NS_ERROR_FAILURE;
-  }
-
+  bool current = CheckOwner();
+  MOZ_TRY(mStatus);
+  NS_ENSURE_TRUE(current && mHasNext, NS_ERROR_FAILURE);
   uint64_t threadId = mStmt->AsInt64(0);
   uint64_t maxDate = mStmt->AsDouble(1);
-
   RefPtr<Thread> thread = new Thread(mFolderId, threadId, maxDate);
   thread.forget(item);
-  mStmt->ExecuteStep(&mHasNext);
-
-  if (!mHasNext) {
-    // We won't be using the statement anymore, so let's reset it. Ideally we'd
-    // reset in the destructor, but this enumerator might be used in JS in which
-    // case we can't always ensure the destructor is called at the right time.
-    mStmt->Reset();
-  }
-
+  Advance();
   return NS_OK;
 }
 
 NS_IMETHODIMP ThreadEnumerator::HasMoreElements(bool* hasNext) {
   NS_ENSURE_ARG_POINTER(hasNext);
-
-  *hasNext = mHasNext;
+  *hasNext = false;
+  bool current = CheckOwner();
+  MOZ_TRY(mStatus);
+  // A closed thread cursor is exhausted, as in the retained legacy adapter.
+  if (current) {
+    *hasNext = mHasNext;
+  }
   return NS_OK;
 }
 

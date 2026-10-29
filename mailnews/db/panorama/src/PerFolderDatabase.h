@@ -79,6 +79,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
  private:
   friend class FolderInfo;
   friend class OfflineOperation;
+  friend class MessageEnumerator;
+  friend class ThreadEnumerator;
+  friend class FilterEnumerator;
 
   virtual ~PerFolderDatabase() {};
 
@@ -90,6 +93,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   }
   nsresult CheckFolderExists() const;
   nsresult CaptureDatabaseSourceId();
+  nsresult CheckEnumerationState(uint64_t generation) const;
   nsresult MarkThreadFlag(nsIMsgThread* thread, nsMsgKey key, uint32_t flag,
                           bool set, nsIDBChangeListener* instigator);
   nsresult ReadCount(bool unread, int32_t* count);
@@ -104,6 +108,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   nsCString mDatabaseSourceId;
   nsresult mDatabaseSourceStatus = NS_ERROR_NOT_AVAILABLE;
   PRTime mLastUseTime = PR_Now();
+  uint64_t mEnumeratorGeneration = 0;
   bool mForceClosed = false;
   bool mNotifyingGoingAway = false;
   nsTArray<nsMsgKey> mNewList;
@@ -112,7 +117,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
 
 class MessageEnumerator : public nsBaseMsgEnumerator {
  public:
-  explicit MessageEnumerator(mozIStorageStatement* aStmt);
+  MessageEnumerator(PerFolderDatabase* owner, mozIStorageStatement* stmt);
 
   // nsIMsgEnumerator support.
   NS_IMETHOD GetNext(nsIMsgDBHdr** aItem) override;
@@ -120,14 +125,19 @@ class MessageEnumerator : public nsBaseMsgEnumerator {
 
  private:
   ~MessageEnumerator() = default;
+  bool CheckOwner();
+  void Advance();
 
+  WeakPtr<PerFolderDatabase> mOwner;
+  uint64_t mGeneration;
+  nsresult mStatus = NS_OK;
   nsCOMPtr<mozIStorageStatement> mStmt;
   bool mHasNext = false;
 };
 
 class ThreadEnumerator : public nsBaseMsgThreadEnumerator {
  public:
-  ThreadEnumerator(mozIStorageStatement* stmt, uint64_t folderId);
+  ThreadEnumerator(PerFolderDatabase* owner, mozIStorageStatement* stmt);
 
   // nsIMsgEnumerator support.
   NS_IMETHOD GetNext(nsIMsgThread** item) override;
@@ -135,7 +145,12 @@ class ThreadEnumerator : public nsBaseMsgThreadEnumerator {
 
  private:
   ~ThreadEnumerator() = default;
+  bool CheckOwner();
+  void Advance();
 
+  WeakPtr<PerFolderDatabase> mOwner;
+  uint64_t mGeneration;
+  nsresult mStatus = NS_OK;
   nsCOMPtr<mozIStorageStatement> mStmt;
   uint64_t mFolderId;
   bool mHasNext = false;

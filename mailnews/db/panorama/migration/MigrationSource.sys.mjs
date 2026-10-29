@@ -1,0 +1,175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
+import { parseMorkSummary } from "resource:///modules/panorama/MorkSummaryReader.sys.mjs";
+import { parseMorkAddressBook } from "resource:///modules/panorama/MorkAddressBookReader.sys.mjs";
+import { parseMorkFolderCache } from "resource:///modules/panorama/MorkFolderCache.sys.mjs";
+
+const MAX_SUMMARY_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Retains Windows no-reparse admission; Unix callers keep their existing guards.
+ * The immediate parent is the native admission root. Profile/backup scope still
+ * belongs to the coordinator. This does not create a path or start a database.
+ *
+ * @param {nsIFile} file - Original path before normalization.
+ * @param {number} kind - nsIPanoramaMigrationFileSystem kind.
+ * @returns {?nsIPanoramaMigrationPath} Caller-owned native lease on Windows.
+ */
+export function admitWindowsMigrationPath(file, kind) {
+  if (AppConstants.platform != "win") {
+    return null;
+  }
+  return Cc["@mozilla.org/mailnews/panorama-migration-file-system;1"]
+    .getService(Ci.nsIPanoramaMigrationFileSystem)
+    .admit(file, file.parent ?? file, kind);
+}
+
+/**
+ * @param {nsIPanoramaMigrationPath} lease - Open native existing-path lease.
+ * @returns {object} Version1 exact physical identity for manifests/journals.
+ */
+export function migrationPhysicalIdentity(lease) {
+  Cc["@mozilla.org/mailnews/panorama-migration-file-system;1"]
+    .getService(Ci.nsIPanoramaMigrationFileSystem)
+    .validate(lease);
+  if (!lease.exists) {
+    throw new Error("Migration physical identity requires an existing path");
+  }
+  return { version: 1, id: lease.identity, parentId: lease.parentIdentity };
+}
+
+/** @param {unknown} value - Persisted identity. @returns {boolean} Exact supported format. */
+export function isMigrationPhysicalIdentity(value) {
+  return (
+    value?.version === 1 &&
+    [value.id, value.parentId].every(
+      id => typeof id == "string" && /^[0-9a-f]{16}:[0-9a-f]{32}$/.test(id)
+    )
+  );
+}
+
+/**
+ * Reads owned summary bytes and binds the parsed data to their SHA-256.
+ * Requires quiesced profile/store writers. Detects changes across read/hash;
+ * retains a native read lease on Windows for this read, not for later imports.
+ *
+ * @param {string} path - Absolute original summary path.
+ * @returns {Promise<{summary: object, identity: object}>} Parsed snapshot and
+ *   normalized path, exact byte size, SHA-256 and original message keys.
+ */
+export async function readMorkMigrationSource(path) {
+  const { bytes, identity } = await readMigrationBytes(path);
+  const summary = parseMorkSummary(bytes);
+  return {
+    summary,
+    identity: {
+      ...identity,
+      messageKeys: summary.messages.map(message => message.sourceKey),
+    },
+  };
+}
+
+/**
+ * Reads and validates a complete legacy book without writing its original file.
+ * Requires the same caller-held profile lock and writer quiescence as mail.
+ *
+ * @param {string} path - Absolute original .mab path.
+ * @returns {Promise<{book: object, bytes: Uint8Array, identity: object}>}
+ *   Owned bytes, parsed book, hash/size/path and separate card/list source keys.
+ */
+export async function readMorkAddressBookSource(path) {
+  const { bytes, identity } = await readMigrationBytes(path);
+  const book = parseMorkAddressBook(bytes);
+  return {
+    book,
+    bytes,
+    identity: {
+      ...identity,
+      cardKeys: book.cards.map(card => card.sourceKey),
+      listKeys: book.lists.map(list => list.sourceKey),
+    },
+  };
+}
+
+/**
+ * Reads a strict folder-cache snapshot with its unchanged original bytes.
+ * This does not apply metadata or produce a native import receipt.
+ *
+ * @param {string} path - Absolute original panacea.dat path.
+ * @returns {Promise<{cache: object, bytes: Uint8Array, identity: object}>}
+ *   Owned parsed records, bytes and canonical path/SHA-256/size.
+ */
+export async function readMorkFolderCacheSource(path) {
+  const { bytes, identity } = await readMigrationBytes(path);
+  return { cache: parseMorkFolderCache(bytes), bytes, identity };
+}
+
+/**
+ * @param {string} path - Absolute quiesced source file.
+ * @returns {Promise<{bytes: Uint8Array, identity: object}>} Fingerprinted bytes.
+ */
+async function readMigrationBytes(path) {
+  if (!PathUtils.isAbsolute(path)) {
+    throw new Error("Migration source path must be absolute");
+  }
+  const file = new FileUtils.File(path);
+  const lease =
+    AppConstants.platform == "win"
+      ? admitWindowsMigrationPath(
+          file,
+          Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+        )
+      : null;
+  try {
+    if (file.isSymlink()) {
+      throw new Error("Migration source contains a link");
+    }
+    if (lease) {
+      file.initWithPath(lease.canonicalPath);
+    } else {
+      file.normalize();
+    }
+    const before = await IOUtils.stat(file.path);
+    if (before.type != "regular" || before.size > MAX_SUMMARY_BYTES) {
+      throw new Error("Unsupported migration source type or size");
+    }
+    const bytes = await IOUtils.read(file.path, {
+      maxBytes: MAX_SUMMARY_BYTES + 1,
+    });
+    const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+      Ci.nsICryptoHash
+    );
+    hash.init(Ci.nsICryptoHash.SHA256);
+    hash.update(bytes, bytes.length);
+    const sha256 = Array.from(hash.finish(false), byte =>
+      byte.charCodeAt(0).toString(16).padStart(2, "0")
+    ).join("");
+    const after = await IOUtils.stat(file.path);
+    if (
+      bytes.length != before.size ||
+      after.type != "regular" ||
+      after.size != before.size ||
+      after.lastModified != before.lastModified ||
+      (await IOUtils.computeHexDigest(file.path, "sha256")) != sha256
+    ) {
+      throw new Error("Migration source changed while reading");
+    }
+    return {
+      bytes,
+      identity: {
+        path: file.path,
+        size: bytes.length,
+        sha256,
+        ...(lease
+          ? { physicalIdentity: migrationPhysicalIdentity(lease) }
+          : {}),
+      },
+    };
+  } finally {
+    lease?.close();
+  }
+}

@@ -219,3 +219,216 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkUnsupportedImapMoveUndo("maildir");
   });
 }
+
+/**
+ * Copy or move one local message between different real store implementations.
+ *
+ * @param {string} sourceStore - Source provider contract ID.
+ * @param {string} destinationStore - Destination provider contract ID.
+ * @param {boolean} isMove - Whether to retire the source after destination success.
+ */
+async function checkCrossStoreTransfer(sourceStore, destinationStore, isMove) {
+  const accounts = [];
+  const prefs = [
+    "mail.serverDefaultStoreContractID",
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
+  const makeFolder = (name, contract) => {
+    // Native account adoption can cache the store during server creation.
+    for (const { name: pref } of prefs) {
+      Services.prefs.setCharPref(pref, contract);
+    }
+    const server = MailServices.accounts.createIncomingServer(
+      name,
+      `${name}.invalid`,
+      "none"
+    );
+    // The store must be selected before rootMsgFolder or msgStore is cached.
+    server.setStringValue("storeContractID", contract);
+    const account = MailServices.accounts.createAccount();
+    accounts.push(account);
+    account.incomingServer = server;
+    const folder = server.rootMsgFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder(name)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const type = contract.includes("maildirstore") ? "maildir" : "mbox";
+    Assert.equal(folder.msgStore.storeType, type);
+    Assert.equal(server.msgStore.storeType, type);
+    return folder;
+  };
+  const snapshot = (folder, header) => ({
+    key: header.messageKey,
+    id: header.messageId,
+    token: header.storeToken,
+    size: header.messageSize,
+    flags: header.flags,
+    body: mailTestUtils.loadMessageToString(folder, header),
+  });
+  try {
+    const source = makeFolder("cross-store-source", sourceStore);
+    const destination = makeFolder("cross-store-destination", destinationStore);
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    const database = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && database instanceof Ci.nsIDatabaseCore,
+      native
+    );
+    Assert.notEqual(source.server.key, destination.server.key);
+    const raw = id =>
+      "From: sender@example.invalid\r\n" +
+      "To: recipient@example.invalid\r\n" +
+      "Date: Tue, 01 Jan 2019 00:00:00 +0000\r\n" +
+      `Message-ID: <${id}@cross-store.invalid>\r\n` +
+      "References: <first@example.invalid> <second@example.invalid>\r\n" +
+      `Subject: ${id}\r\n\r\nExact ${id} body.\r\n`;
+    const selected = source.addMessage(raw("selected"));
+    source.markMessagesRead([selected], true);
+    source.markMessagesFlagged([selected], true);
+    selected.setStringProperty("keywords", "first-tag second-tag");
+    selected.setStringProperty("crossStoreValue", "Exact cafÃ© æ—¥æœ¬èªž");
+    selected.setStringProperty("crossStoreEmpty", "");
+    // These are arbitrary text rows in Panorama, but storage columns in Mork.
+    if (native) {
+      selected.setStringProperty("size", "0007 text");
+      selected.setStringProperty("numLines", "0011 text");
+      selected.setStringProperty("offlineMsgSize", "0013 text");
+    }
+    const kept = source.addMessage(raw("unselected"));
+    const prior = destination.addMessage(raw("preexisting"));
+    const before = snapshot(source, selected);
+    const bystander = snapshot(source, kept);
+    const existing = snapshot(destination, prior);
+    const stops = [];
+    const listener = new PromiseTestUtils.PromiseCopyListener({
+      onStopCopy(status) {
+        stops.push(status);
+      },
+    });
+    MailServices.copy.copyMessages(
+      source,
+      [selected],
+      destination,
+      isMove,
+      listener,
+      null,
+      false
+    );
+    await listener.promise;
+    Assert.deepEqual(stops, [Cr.NS_OK]);
+    // CopyMessages does not promise the CopyFileMessage-only SetMessageKey hook.
+    const copied = [...destination.messages].find(
+      header => header.messageId == before.id
+    );
+    Assert.ok(copied);
+    Assert.equal(copied.folder, destination);
+    Assert.equal(copied.messageId, before.id);
+    if (native) {
+      Assert.notEqual(copied.messageKey, before.key);
+    }
+    Assert.notEqual(copied.storeToken, ""); // Token "0" remains valid.
+    Assert.equal(copied.messageSize, before.size);
+    Assert.equal(
+      mailTestUtils.loadMessageToString(destination, copied),
+      before.body
+    );
+    const storedFlags = ~(
+      Ci.nsMsgMessageFlags.New | Ci.nsMsgMessageFlags.Offline
+    );
+    Assert.equal(copied.flags & storedFlags, before.flags & storedFlags);
+    Assert.equal(copied.flags & Ci.nsMsgMessageFlags.Offline, 0);
+    Assert.equal(copied.getStringProperty("keywords"), "first-tag second-tag");
+    Assert.equal(
+      copied.getStringProperty("crossStoreValue"),
+      "Exact cafÃ© æ—¥æœ¬èªž"
+    );
+    Assert.equal(copied.getStringProperty("crossStoreEmpty"), "");
+    Assert.ok([...copied.properties].includes("crossStoreEmpty"));
+    if (native) {
+      Assert.equal(copied.getStringProperty("size"), "0007 text");
+      Assert.equal(copied.getStringProperty("numLines"), "0011 text");
+      Assert.equal(copied.getStringProperty("offlineMsgSize"), "0013 text");
+    }
+    Assert.equal(copied.numReferences, 2);
+    Assert.equal(copied.getStringReference(0), "first@example.invalid");
+    Assert.equal(copied.getStringReference(1), "second@example.invalid");
+    Assert.deepEqual(
+      snapshot(destination, destination.GetMessageHeader(existing.key)),
+      existing
+    );
+    Assert.deepEqual(
+      [...destination.messages].map(header => header.messageId).sort(),
+      [before.id, existing.id].sort()
+    );
+    Assert.deepEqual(
+      source.msgDatabase.listAllKeys().sort((a, b) => a - b),
+      (isMove ? [bystander.key] : [before.key, bystander.key]).sort(
+        (a, b) => a - b
+      )
+    );
+    Assert.deepEqual(
+      snapshot(source, source.GetMessageHeader(bystander.key)),
+      bystander
+    );
+    if (!isMove) {
+      Assert.deepEqual(
+        snapshot(source, source.GetMessageHeader(before.key)),
+        before
+      );
+    }
+    Assert.ok(!source.locked);
+    Assert.ok(!destination.locked);
+  } finally {
+    try {
+      for (const account of accounts.reverse()) {
+        MailServices.accounts.removeAccount(account, false);
+      }
+    } finally {
+      for (const { name, hadValue, value } of prefs) {
+        if (hadValue) {
+          Services.prefs.setCharPref(name, value);
+        } else {
+          Services.prefs.clearUserPref(name);
+        }
+      }
+    }
+  }
+}
+
+add_task(async function test_copyMboxToMaildir() {
+  await checkCrossStoreTransfer(
+    "@mozilla.org/msgstore/berkeleystore;1",
+    "@mozilla.org/msgstore/maildirstore;1",
+    false
+  );
+});
+
+add_task(async function test_moveMboxToMaildir() {
+  await checkCrossStoreTransfer(
+    "@mozilla.org/msgstore/berkeleystore;1",
+    "@mozilla.org/msgstore/maildirstore;1",
+    true
+  );
+});
+
+add_task(async function test_copyMaildirToMbox() {
+  await checkCrossStoreTransfer(
+    "@mozilla.org/msgstore/maildirstore;1",
+    "@mozilla.org/msgstore/berkeleystore;1",
+    false
+  );
+});
+
+add_task(async function test_moveMaildirToMbox() {
+  await checkCrossStoreTransfer(
+    "@mozilla.org/msgstore/maildirstore;1",
+    "@mozilla.org/msgstore/berkeleystore;1",
+    true
+  );
+});

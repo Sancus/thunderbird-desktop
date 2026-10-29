@@ -715,3 +715,88 @@ add_task(async function test_maildirFolderDeleteFailureKeepsRows() {
     Assert.ok(!(await IOUtils.exists(later)));
   });
 });
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_nativeMaildirFastCopyDeclinesWithoutMutation() {
+    await withTrashStore("maildir", async root => {
+      const source = root
+        .createLocalSubfolder("fast-copy-source")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const destination = root
+        .createLocalSubfolder("fast-copy-destination")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      Assert.equal(source.msgStore.storeType, "maildir");
+      Assert.equal(destination.msgStore.storeType, "maildir");
+      const raw =
+        "From: sender@example.invalid\r\n" +
+        "Subject: Fast copy refusal\r\n" +
+        "Message-ID: <fast-copy-source@example.invalid>\r\n\r\n" +
+        "Exact source bytes stay owned.\r\n";
+      const header = source.addMessage(raw);
+      header.setStringProperty("fastCopyProperty", "unchanged source value");
+      const existing = destination.addMessage(
+        raw.replace("fast-copy-source@", "fast-copy-destination@")
+      );
+      const sourceKey = header.messageKey;
+      const sourceToken = header.storeToken;
+      const destinationKey = existing.messageKey;
+      const destinationToken = existing.storeToken;
+      const sourceFlags = header.flags;
+      const destinationFlags = existing.flags;
+      const sourceSize = header.messageSize;
+      const destinationSize = existing.messageSize;
+      const sourceFiles = await trashBodyFiles(source);
+      const destinationFiles = await trashBodyFiles(destination);
+      const sourceTemp = PathUtils.join(source.filePath.path, "tmp");
+      const destinationTemp = PathUtils.join(destination.filePath.path, "tmp");
+      Assert.deepEqual(await IOUtils.getChildren(sourceTemp), []);
+      Assert.deepEqual(await IOUtils.getChildren(destinationTemp), []);
+      for (const isMove of [false, true]) {
+        const copiedHeaders = {};
+        const undoAction = {};
+        Assert.equal(
+          destination.msgStore.copyMessages(
+            isMove,
+            [header],
+            destination,
+            copiedHeaders,
+            undoAction
+          ),
+          false,
+          "The native store leaves the real copy to the folder fallback"
+        );
+        Assert.deepEqual(copiedHeaders.value, []);
+        Assert.equal(undoAction.value, null);
+        Assert.deepEqual(source.msgDatabase.listAllKeys(), [sourceKey]);
+        Assert.deepEqual(destination.msgDatabase.listAllKeys(), [
+          destinationKey,
+        ]);
+        const retained = source.GetMessageHeader(sourceKey);
+        Assert.equal(retained.folder, source);
+        Assert.equal(retained.storeToken, sourceToken);
+        Assert.equal(retained.messageSize, sourceSize);
+        Assert.equal(retained.flags, sourceFlags);
+        Assert.equal(
+          retained.getStringProperty("fastCopyProperty"),
+          "unchanged source value"
+        );
+        Assert.equal(mailTestUtils.loadMessageToString(source, retained), raw);
+        const untouched = destination.GetMessageHeader(destinationKey);
+        Assert.equal(untouched.folder, destination);
+        Assert.equal(untouched.storeToken, destinationToken);
+        Assert.equal(untouched.messageSize, destinationSize);
+        Assert.equal(untouched.flags, destinationFlags);
+        Assert.equal(
+          mailTestUtils.loadMessageToString(destination, untouched),
+          raw.replace("fast-copy-source@", "fast-copy-destination@")
+        );
+        Assert.deepEqual(await trashBodyFiles(source), sourceFiles);
+        Assert.deepEqual(await trashBodyFiles(destination), destinationFiles);
+        Assert.deepEqual(await IOUtils.getChildren(sourceTemp), []);
+        Assert.deepEqual(await IOUtils.getChildren(destinationTemp), []);
+        Assert.ok(!source.locked);
+        Assert.ok(!destination.locked);
+      }
+    });
+  });
+}

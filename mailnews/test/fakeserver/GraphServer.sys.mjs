@@ -211,7 +211,7 @@ export class GraphServer extends MockServer {
    */
   stop() {
     const stopped = this.#httpServer.stop();
-    this.#httpsProxy?.destroy();
+    this.#httpsProxy?.close();
     return stopped;
   }
 

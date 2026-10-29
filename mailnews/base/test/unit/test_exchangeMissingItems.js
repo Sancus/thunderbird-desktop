@@ -14,6 +14,10 @@ const { MessageGenerator } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
 );
 
+const { ServerTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/ServerTestUtils.sys.mjs"
+);
+
 const MESSAGES_NS =
   "http://schemas.microsoft.com/exchange/services/2006/messages";
 const TYPES_NS = "http://schemas.microsoft.com/exchange/services/2006/types";
@@ -308,6 +312,30 @@ add_task(async function test_mockStopCompletionAndOriginalError() {
         () => server.stop(),
         error => error.result === Cr.NS_ERROR_UNEXPECTED,
         "A second stop preserves the HTTP server's original synchronous error"
+      );
+    } finally {
+      await stopped;
+    }
+  }
+});
+
+add_task(async function test_mockTlsStopCompletionAndOriginalError() {
+  const tlsCert = await ServerTestUtils.getCertificate("valid");
+  for (const Server of [EwsServer, GraphServer]) {
+    const server = new Server({ tlsCert });
+    server.start();
+    const stopped = server.stop();
+    try {
+      Assert.equal(
+        typeof stopped?.then,
+        "function",
+        "TLS mock shutdown returns an observable completion promise"
+      );
+      await stopped;
+      Assert.throws(
+        () => server.stop(),
+        error => error.result === Cr.NS_ERROR_UNEXPECTED,
+        "A second TLS stop preserves the original synchronous error"
       );
     } finally {
       await stopped;

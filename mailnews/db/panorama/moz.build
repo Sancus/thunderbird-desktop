@@ -14,6 +14,15 @@ TEST_DIRS += [
 JAR_MANIFESTS += ["jar.mn"]
 
 EXTRA_JS_MODULES.panorama += [
+    "migration/MigrationBackup.sys.mjs",
+    "migration/MigrationCoordinator.sys.mjs",
+    "migration/MigrationJournal.sys.mjs",
+    "migration/MigrationMessageMap.sys.mjs",
+    "migration/MigrationSource.sys.mjs",
+    "migration/MorkAddressBookReader.sys.mjs",
+    "migration/MorkFolderCache.sys.mjs",
+    "migration/MorkFolderImport.sys.mjs",
+    "migration/MorkSnapshotAdapter.sys.mjs",
     "migration/MorkSummaryReader.sys.mjs",
     "migration/StrictMorkReader.sys.mjs",
     "search/PanoramaSearchIndex.sys.mjs",

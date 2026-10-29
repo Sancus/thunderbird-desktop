@@ -16,8 +16,6 @@ support-files = [
 ]
 tags = ["panorama"]
 
-["test_MorkSummaryReader.js"]
-
 ["test_delete.js"]
 
 ["test_deliveryCompatibilityCopyHdr.js"]
@@ -30,11 +28,13 @@ tags = ["panorama"]
 
 ["test_deliveryCompatibilityFolderVersion.js"]
 
+["test_deliveryCompatibilityLifetime.js"]
+
 ["test_deliveryCompatibilityTransferErrors.js"]
 
-["test_deliveryCompatibilityUidValidity.js"]
-
 ["test_deliveryCompatibilityTransferInfo.js"]
+
+["test_deliveryCompatibilityUidValidity.js"]
 
 ["test_deliveryCompatibilityViewType.js"]
 
@@ -49,6 +49,8 @@ tags = ["panorama"]
 ["test_insert.js"]
 
 ["test_liveView.js"]
+
+["test_liveView_conversations.js"]
 
 ["test_liveViewConversationsDataAdapter.js"]
 tags = ["dataadapter"]
@@ -66,13 +68,29 @@ tags = ["dataadapter"]
 ["test_liveViewThreadedDataAdapter.js"]
 tags = ["dataadapter"]
 
-["test_liveView_conversations.js"]
-
 ["test_lookup.js"]
 
 ["test_messageIngestion.js"]
 
 ["test_messages.js"]
+
+["test_MigrationCoordinator.js"]
+
+["test_MigrationFileSystemWindows.js"]
+
+["test_MigrationFolderCacheCoordinator.js"]
+support-files = ["../../../../base/test/unit/data/panacea.dat"]
+
+["test_MigrationJournal.js"]
+
+["test_MigrationNativeImport.js"]
+# Native retained Windows import/activation remains a separate held composition.
+skip-if = ["os == 'win'"]
+
+["test_MorkFolderCacheImport.js"]
+support-files = ["../../../../base/test/unit/data/panacea.dat"]
+
+["test_MorkSummaryReader.js"]
 
 ["test_move.js"]
 
@@ -80,13 +98,13 @@ tags = ["dataadapter"]
 
 ["test_perFolderDatabase.js"]
 
-["test_searchIndex.js"]
-
 ["test_reconcile.js"]
 
 ["test_relations.js"]
 
 ["test_searchFolderHitCache.js"]
+
+["test_searchIndex.js"]
 
 ["test_serverFromPrefs.js"]
 tags = ["foldernames"]
@@ -102,3 +120,4 @@ tags = ["foldernames"]
 ["test_threads.js"]
 
 ["test_virtualFolderMigration.js"]
+

@@ -39,3 +39,11 @@ FINAL_LIBRARY = "mail"
 XPCOM_MANIFESTS += [
     "components.conf",
 ]
+
+EXPORTS += [
+    "../migration/MigrationFileSystem.h",
+    "../migration/WindowsMigrationPath.h",
+]
+SOURCES += ["../migration/MigrationFileSystem.cpp"]
+if CONFIG["OS_ARCH"] == "WINNT":
+    SOURCES += ["../migration/WindowsMigrationPath.cpp"]

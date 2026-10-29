@@ -11,3 +11,6 @@ UNIFIED_SOURCES += [
     "TestDeliveryFolderInfoProperties.cpp",
     "TestDeliveryMessageReferences.cpp",
 ]
+
+if CONFIG["OS_ARCH"] == "WINNT":
+    UNIFIED_SOURCES += ["TestMigrationWindowsPath.cpp"]

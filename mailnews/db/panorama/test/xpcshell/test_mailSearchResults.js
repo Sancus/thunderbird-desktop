@@ -10,6 +10,10 @@ const { readMailSearchResult, getMailSearchFacets, copyMailSearchSelection } =
     "resource:///modules/panorama/MailSearchResult.sys.mjs"
   );
 
+const { getSearchHighlightRanges } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/SearchOffsets.sys.mjs"
+);
+
 const { MailStringUtils } = ChromeUtils.importESModule(
   "resource:///modules/MailStringUtils.sys.mjs"
 );
@@ -793,5 +797,54 @@ add_task(async function test_completeExportChecksEveryPhysicalToken() {
     calls,
     2,
     "Mutation by a delivery callback cannot certify the older set"
+  );
+});
+
+add_task(async function test_nativeTextRevisionRejectsOldOffsetsAfterRefresh() {
+  const { first, selected, firstHit, selectedHit } = await resultCopies(
+    "revisionrefreshresult"
+  );
+  const before = await service.getText(String(selected.messageKey));
+  Assert.equal(before.body, "é 😀 café 自動 end");
+  Assert.deepEqual(getSearchHighlightRanges(selectedHit, before), [
+    { start: 5, end: 9 },
+  ]);
+
+  selected.subject = "refreshedrevisionresult";
+  await drainResultWork();
+  const current = await service.getText(String(selected.messageKey));
+  Assert.equal(current.body, "é 😀 café 自動 end");
+  Assert.notEqual(current.textRevision, before.textRevision);
+  Assert.equal(
+    getSearchHighlightRanges(selectedHit, current),
+    null,
+    "Unchanged body bytes do not make an old projection's offsets current"
+  );
+  Assert.equal(await readMailSearchResult(service, selectedHit), null);
+  const page = await service.search("refreshedrevisionresult cafe");
+  Assert.deepEqual(
+    page.items.map(hit => hit.id),
+    [String(selected.messageKey)]
+  );
+  const result = await readMailSearchResult(service, page.items[0]);
+  Assert.equal(result.textRevision, current.textRevision);
+  Assert.deepEqual(result.location, {
+    folderId: selected.folder.id,
+    messageKey: selected.messageKey,
+  });
+  Assert.equal(result.snippet.text, "é 😀 café 自動 end");
+  Assert.deepEqual(result.snippet.ranges, [{ start: 5, end: 9 }]);
+  Assert.equal(result.snippet.firstMatchText, "café");
+
+  const unchanged = await readMailSearchResult(service, firstHit);
+  Assert.equal(unchanged.id, String(first.messageKey));
+  Assert.equal(unchanged.textRevision, firstHit.textRevision);
+  Assert.deepEqual(unchanged.snippet.ranges, [{ start: 5, end: 9 }]);
+  Assert.deepEqual(
+    (await service.search("revisionrefreshresult cafe")).items.map(
+      hit => hit.id
+    ),
+    [String(first.messageKey)],
+    "Only the changed physical copy leaves the old subject query"
   );
 });

@@ -89,6 +89,26 @@ class FaultWitness final : public mozIStorageFunction {
 };
 NS_IMPL_ISUPPORTS(FaultWitness, mozIStorageFunction)
 
+class UndoRemovalObserver final : public MessageListener {
+public:
+  NS_DECL_ISUPPORTS
+  explicit UndoRemovalObserver(std::function<void(Message *)> removed)
+      : mRemoved(std::move(removed)) {}
+  void OnMessageAdded(Message *) override {}
+  void OnMessageRemoved(Message *message, uint32_t) override {
+    mRemoved(message);
+  }
+  void OnMessageFlagsChanged(nsIMsgDBHdr *, Message *, uint32_t,
+                             uint32_t) override {}
+  void OnMessageTagsChanged(nsIMsgDBHdr *, Message *, const nsACString &,
+                            const nsACString &) override {}
+
+private:
+  ~UndoRemovalObserver() = default;
+  std::function<void(Message *)> mRemoved;
+};
+NS_IMPL_ISUPPORTS(UndoRemovalObserver, nsISupports)
+
 class AddedObserver final : public MessageListener {
  public:
   NS_DECL_ISUPPORTS
@@ -8537,6 +8557,457 @@ TEST_F(DeliveryCoreReferences, FolderAdmissionRejectsCorruptAndRetiredSources) {
   EXPECT_EQ("unchanged"_ns, output);
   ASSERT_EQ(NS_OK, AdmissionSource(mCore, output));
   EXPECT_EQ(expected, output);
+}
+
+TEST_F(DeliveryCoreReferences,
+       UndoCaptureRestoresCompleteMetadataWithFreshIdentity) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  RawHdr raw;
+  raw.messageId = "undo@invalid"_ns;
+  raw.subject = "saved subject"_ns;
+  raw.sender = "saved author"_ns;
+  raw.recipients = "saved recipients"_ns;
+  raw.ccList = "saved cc"_ns;
+  raw.bccList = "saved bcc"_ns;
+  raw.date = 123456789;
+  raw.priority = nsMsgPriority::highest;
+  raw.flags = nsMsgMessageFlags::Expunged | nsMsgMessageFlags::Read;
+  raw.keywords = "saved tags"_ns;
+  raw.references = {"missing@invalid"_ns, "missing@invalid"_ns, ""_ns};
+  raw.storeToken = Some(nsCString("old-body"_ns));
+  raw.messageSize = Some(uint32_t(21));
+  raw.extras = {{"Case"_ns, "00042"_ns},
+                {"case"_ns, "1e3"_ns},
+                {"empty"_ns, ""_ns},
+                {"msgCharSet"_ns, "UTF-8"_ns},
+                {"replyTo"_ns, "reply@invalid"_ns},
+                {"account"_ns, "old-account"_ns}};
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &key));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "native"_ns, UINT32_MAX));
+  ASSERT_EQ(NS_OK, db.SetMessageUidOnServer(key, 42));
+  RemovedMessage snapshot;
+  uint32_t removed = 0;
+  RefPtr<UndoRemovalObserver> removal =
+      new UndoRemovalObserver([&](Message *old) {
+        ++removed;
+        ASSERT_TRUE(snapshot.Body());
+        EXPECT_EQ(key, snapshot.Body()->key);
+        EXPECT_EQ(Some(nsCString("old-body"_ns)), snapshot.Body()->storeToken);
+        bool exists = true;
+        ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+        EXPECT_FALSE(exists);
+        nsCString subject;
+        ASSERT_EQ(NS_OK, old->GetSubject(subject));
+        EXPECT_EQ("saved subject"_ns, subject);
+      });
+  db.AddMessageListener(removal);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(removal); });
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(key, snapshot));
+  EXPECT_EQ(1u, removed);
+  db.RemoveMessageListener(removal);
+  remove.release();
+  uint32_t published = 0;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message *restored) {
+    ++published;
+    EXPECT_FALSE(snapshot.Body());
+    bool active;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    nsMsgKey actual;
+    ASSERT_EQ(NS_OK, restored->GetMessageKey(&actual));
+    EXPECT_NE(key, actual);
+    nsCString text;
+    ASSERT_EQ(NS_OK, restored->GetSubject(text));
+    EXPECT_EQ("saved subject"_ns, text);
+    ASSERT_EQ(NS_OK, restored->GetStoreToken(text));
+    EXPECT_EQ("finished-body"_ns, text);
+    ASSERT_EQ(NS_OK, restored->GetMessageId(text));
+    EXPECT_EQ("undo@invalid"_ns, text);
+    ASSERT_EQ(NS_OK, restored->GetAuthor(text));
+    EXPECT_EQ("saved author"_ns, text);
+    ASSERT_EQ(NS_OK, restored->GetRecipients(text));
+    EXPECT_EQ("saved recipients"_ns, text);
+    ASSERT_EQ(NS_OK, restored->GetCcList(text));
+    EXPECT_EQ("saved cc"_ns, text);
+    ASSERT_EQ(NS_OK, restored->GetBccList(text));
+    EXPECT_EQ("saved bcc"_ns, text);
+    PRTime date;
+    ASSERT_EQ(NS_OK, restored->GetDate(&date));
+    EXPECT_EQ(123456789, date);
+    nsMsgPriorityValue priority;
+    ASSERT_EQ(NS_OK, restored->GetPriority(&priority));
+    EXPECT_EQ(nsMsgPriority::highest, priority);
+    ASSERT_EQ(NS_OK, db.GetMessageTags(actual, text));
+    EXPECT_EQ("saved tags"_ns, text);
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(actual, "replyTo"_ns, text));
+    EXPECT_EQ("reply@invalid"_ns, text);
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(actual, "msgCharSet"_ns, text));
+    EXPECT_EQ("UTF-8"_ns, text);
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(actual, "account"_ns, text));
+    EXPECT_EQ("old-account"_ns, text);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+    ASSERT_EQ(NS_OK, PublicationCell(
+                         reader, actual,
+                         "SELECT subject FROM messages WHERE id=:id"_ns, text));
+    EXPECT_EQ("saved subject"_ns, text);
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, actual,
+            "SELECT typeof(value) FROM message_properties WHERE id=:id AND name='native'"_ns,
+            text));
+    EXPECT_EQ("integer"_ns, text);
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(actual, "Case"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
+    nsTArray<nsCString> refs;
+    ASSERT_EQ(NS_OK, Stored(actual, refs));
+    EXPECT_EQ((nsTArray<nsCString>{"missing@invalid"_ns, "missing@invalid"_ns,
+                                   ""_ns}),
+              refs);
+  });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  FinishedMessageBody finished{"finished-body"_ns, 101, 99, 8, true};
+  nsMsgKey restored = nsMsgKey_None;
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, snapshot, finished, &restored));
+  EXPECT_EQ(1u, published);
+  EXPECT_NE(key, restored);
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(restored, flags));
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline),
+            flags);
+  uint32_t value = 0;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(restored, "native"_ns, value));
+  EXPECT_EQ(UINT32_MAX, value);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(restored, "case"_ns, text));
+  EXPECT_EQ("1e3"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(restored, "empty"_ns, text));
+  EXPECT_TRUE(text.IsEmpty());
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(restored, names));
+  EXPECT_TRUE(names.Contains("empty"_ns));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  nsMsgKey untouched = 123;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db.RestoreMessageForUndo(mFolderId, snapshot, finished, &untouched));
+  EXPECT_EQ(123u, untouched);
+}
+
+TEST_F(DeliveryCoreReferences,
+       UndoCaptureFailureRetainsRowsAndPreviousSnapshot) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsMsgKey saved, target, control;
+  ASSERT_EQ(NS_OK, Add("saved-undo@invalid"_ns, {}, saved));
+  ASSERT_EQ(NS_OK, Add("target-undo@invalid"_ns, {"raw@invalid"_ns}, target));
+  ASSERT_EQ(NS_OK, Add("control-undo@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(target, "Case"_ns, "00042"_ns));
+  RemovedMessage snapshot;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(saved, snapshot));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK, mConnection->CreateFunction("undo_fault"_ns, 1, witness));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_undo_delete BEFORE DELETE ON messages "
+          "BEGIN "
+          "SELECT undo_fault(OLD.id); SELECT RAISE(ABORT,'undo delete'); END"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.RemoveMessageForUndo(target, snapshot));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(target, witness->mLastKey);
+  ASSERT_TRUE(snapshot.Body());
+  EXPECT_EQ(saved, snapshot.Body()->key);
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(target, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, Stored(target, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"raw@invalid"_ns}), refs);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(target, "Case"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER fail_undo_delete"_ns));
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(target, snapshot));
+  EXPECT_EQ(target, snapshot.Body()->key);
+}
+
+TEST_F(DeliveryCoreReferences, UndoRestoreFailureRetainsCaptureAndOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, Add("restore-undo@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, Add("restore-control@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "Case"_ns, "1e3"_ns));
+  RemovedMessage snapshot;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(key, snapshot));
+  FinishedMessageBody finished{"provider-finished"_ns, 12, 12, 1, true};
+  nsMsgKey result = 123;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.RestoreMessageForUndo(UINT64_MAX, snapshot, finished, &result));
+  EXPECT_EQ(123u, result);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.RestoreMessageForUndo(mFolderId, snapshot, finished, &result));
+  EXPECT_EQ(123u, result);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK, mConnection->CreateFunction("undo_fault"_ns, 1, witness));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER fail_undo_restore BEFORE INSERT ON "
+                       "message_properties "
+                       "WHEN NEW.name='Case' BEGIN SELECT undo_fault(NEW.id); "
+                       "SELECT RAISE(ABORT,'undo restore'); END"_ns));
+  RefPtr<Message> held = new Message(control);
+  Message *live = held.get();
+  EXPECT_EQ(
+      NS_ERROR_STORAGE_CONSTRAINT,
+      db.RestoreMessageForUndo(mFolderId, snapshot, finished, &result, &live));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(123u, result);
+  EXPECT_EQ(held.get(), live);
+  ASSERT_TRUE(snapshot.Body());
+  EXPECT_EQ(key, snapshot.Body()->key);
+  bool active;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  {
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+    nsCString count;
+    nsMsgKey attempted = static_cast<nsMsgKey>(witness->mLastKey);
+    ASSERT_EQ(NS_OK,
+              PublicationCell(reader, attempted,
+                              "SELECT COUNT(*) FROM messages WHERE id=:id"_ns,
+                              count));
+    EXPECT_EQ("0"_ns, count);
+    ASSERT_EQ(NS_OK,
+              PublicationCell(
+                  reader, attempted,
+                  "SELECT COUNT(*) FROM message_properties WHERE id=:id"_ns,
+                  count));
+    EXPECT_EQ("0"_ns, count);
+  }
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER fail_undo_restore"_ns));
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, snapshot, finished, &result));
+  EXPECT_NE(key, result);
+}
+
+TEST_F(DeliveryCoreReferences,
+       UndoRetainsUnavailableReferenceHistoryAcrossReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("unknown-undo@invalid"_ns, {}, key));
+  // Remove only the availability marker on a real core-created row.
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DELETE FROM message_reference_sets"_ns));
+  nsTArray<nsCString> refs;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().GetMessageReferences(key, refs));
+  RemovedMessage snapshot;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageForUndo(key, snapshot));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  FinishedMessageBody finished{"finished-after-reopen"_ns, 12, 12, 1, true};
+  nsMsgKey restored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RestoreMessageForUndo(
+                       mFolderId, snapshot, finished, &restored));
+  refs = {"untouched"_ns};
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().GetMessageReferences(restored, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"untouched"_ns}), refs);
+}
+
+TEST_F(DeliveryCoreReferences, UndoRetainsKnownEmptyReferences) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("empty-undo@invalid"_ns, {}, key));
+  RemovedMessage snapshot;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageForUndo(key, snapshot));
+  FinishedMessageBody finished{"finished-empty"_ns, 12, 12, 1, true};
+  nsMsgKey restored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RestoreMessageForUndo(
+                       mFolderId, snapshot, finished, &restored));
+  nsTArray<nsCString> refs = {"not empty"_ns};
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(restored, refs));
+  EXPECT_TRUE(refs.IsEmpty());
+}
+
+TEST_F(DeliveryCoreReferences,
+       UndoCaptureRejectsUnsupportedStoredPropertyWithoutDeletion) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("unsupported-undo@invalid"_ns, {}, key));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->CreateStatement(
+          "INSERT INTO message_properties VALUES(:id,'unsupported',1.25)"_ns,
+          getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, key));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  RemovedMessage snapshot;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.RemoveMessageForUndo(key, snapshot));
+  EXPECT_FALSE(snapshot.Body());
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, UndoCaptureRejectsNoneKeyWithoutDeletingRows) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("undo-sentinel-control@invalid"_ns, {}, control));
+  RemovedMessage output;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.RemoveMessageForUndo(nsMsgKey_None, output));
+  EXPECT_FALSE(output.Body());
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, UndoFolderCaptureAccountsAndRollsBackTogether) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RawHdr raw;
+  raw.messageId = "accounted-undo@invalid"_ns;
+  raw.messageSize = Some(UINT32_MAX);
+  raw.storeToken = Some(nsCString("removed-physical-body"_ns));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &key));
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 17));
+  RemovedMessage snapshot;
+  uint32_t removed = 0;
+  RefPtr<UndoRemovalObserver> observer =
+      new UndoRemovalObserver([&](Message *) {
+        ++removed;
+        ASSERT_TRUE(snapshot.Body());
+        EXPECT_EQ(key, snapshot.Body()->key);
+        bool active = true;
+        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        EXPECT_FALSE(active);
+        int64_t metric = 0;
+        ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+        EXPECT_EQ(int64_t(UINT32_MAX) + 17, metric);
+      });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("undo_count_fault"_ns, 1, witness));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_accounted_undo BEFORE DELETE ON messages "
+          "BEGIN SELECT undo_count_fault(OLD.id); "
+          "SELECT RAISE(ABORT,'accounted undo'); END"_ns));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_accounted_undo"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.RemoveMessageForUndo(key, mFolderId, source,
+                                    MessageRemovalAccounting::LocalMessageSize,
+                                    snapshot));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(0u, removed);
+  EXPECT_FALSE(snapshot.Body());
+  int64_t metric = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(17, metric);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  nsCString token;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "storeToken"_ns, token));
+  EXPECT_EQ("removed-physical-body"_ns, token);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_accounted_undo"_ns));
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(
+                       key, mFolderId, source,
+                       MessageRemovalAccounting::LocalMessageSize, snapshot));
+  EXPECT_EQ(1u, removed);
+  FinishedMessageBody finished{"fresh-provider-copy"_ns, 25, 0, 2, false};
+  nsMsgKey restored;
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, snapshot, finished, &restored));
+  EXPECT_NE(key, restored);
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  // Restore writes a fresh body. The old removed body is still expunged.
+  EXPECT_EQ(int64_t(UINT32_MAX) + 17, metric);
+}
+
+TEST_F(DeliveryCoreReferences,
+       UndoFolderCaptureRejectsForeignAndCallerOwnedWork) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("guarded-undo@invalid"_ns, {}, key));
+  uint64_t other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Other"_ns, &other));
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 31));
+  RemovedMessage snapshot;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RemoveMessageForUndo(key, other, source,
+                                    MessageRemovalAccounting::LocalMessageSize,
+                                    snapshot));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RemoveMessageForUndo(
+                key, mFolderId, "foreign"_ns,
+                MessageRemovalAccounting::OfflineMessageSize, snapshot));
+  EXPECT_FALSE(snapshot.Body());
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 79));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.RemoveMessageForUndo(key, mFolderId, source,
+                                    MessageRemovalAccounting::LocalMessageSize,
+                                    snapshot));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t metric = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(79, metric);
+  EXPECT_FALSE(snapshot.Body());
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(31, metric);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
 }
 
 }  // namespace mozilla::mailnews

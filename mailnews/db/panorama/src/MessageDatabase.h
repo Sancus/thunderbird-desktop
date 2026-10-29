@@ -52,6 +52,24 @@ struct FinishedMessageBody {
 // Existing local versus IMAP/news expunged-byte accounting on deletion.
 enum class MessageRemovalAccounting { LocalMessageSize, OfflineMessageSize };
 
+// Owned complete deletion snapshot. Consumed by a successful fresh-key restore.
+// Not a durable undo journal; callers retain recovery bytes until settled.
+class RemovedMessage final {
+public:
+  RemovedMessage();
+  ~RemovedMessage();
+  RemovedMessage(RemovedMessage &&);
+  RemovedMessage &operator=(RemovedMessage &&);
+  RemovedMessage(const RemovedMessage &) = delete;
+  RemovedMessage &operator=(const RemovedMessage &) = delete;
+  const MessageBodyState *Body() const;
+
+private:
+  friend class MessageDatabase;
+  struct Data;
+  UniquePtr<Data> mData;
+};
+
 enum class BodyRelocationState : uint32_t { Pending, Installed, Restored };
 enum class BodyRelocationOutcome { Installed, Restored };
 
@@ -308,6 +326,22 @@ class MessageDatabase : public nsIMessageDatabase {
                                   const FinishedMessageBody& finished,
                                   MessageBodyState& output);
 
+  // Captures complete SQL metadata before deletion, never from a cached header.
+  // Output is unchanged on error and available before removal callbacks.
+  // Successful capture replaces any prior unconsumed snapshot in output.
+  nsresult RemoveMessageForUndo(nsMsgKey key, RemovedMessage &output);
+  // Per-folder capture accounts expunged bytes in the same removal transaction.
+  nsresult RemoveMessageForUndo(nsMsgKey key, uint64_t folderId,
+                                const nsACString &databaseSourceId,
+                                MessageRemovalAccounting accounting,
+                                RemovedMessage &output);
+  // Requires a fresh provider-finished target write, not old-token reuse.
+  // Old removed bytes remain expunged; no UID binding is copied.
+  // Allocates a fresh key; consumes captured only after successful commit.
+  nsresult RestoreMessageForUndo(uint64_t folderId, RemovedMessage &captured,
+                                 const FinishedMessageBody &finished,
+                                 nsMsgKey *key, Message **liveHeader = nullptr);
+
   // Pending relocation blocks new body resolutions and folder mutation.
   nsresult CheckFolderBodyAccess(uint64_t folderId);
   nsresult CheckMessageBodyAccess(nsMsgKey key);
@@ -478,9 +512,10 @@ class MessageDatabase : public nsIMessageDatabase {
                               const nsACString& suffix,
                               mozIStorageStatement** statement,
                               bool* staged = nullptr);
-  nsresult InsertMessage(uint64_t folderId, const ::RawHdr& header, bool staged,
-                         bool notifyLegacy, nsMsgKey* key,
-                         Message** liveHeader);
+  nsresult InsertMessage(uint64_t folderId, const ::RawHdr &header, bool staged,
+                         bool notifyLegacy, nsMsgKey *key, Message **liveHeader,
+                         RemovedMessage *restoring = nullptr,
+                         const FinishedMessageBody *finished = nullptr);
 
   nsresult ReadOfflineOperationIdentity(uint64_t folderId, nsMsgKey key,
                                         int64_t& id, int64_t& revision,
@@ -496,7 +531,9 @@ class MessageDatabase : public nsIMessageDatabase {
 
   nsresult RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
                                  const nsACString *databaseSourceId,
-                                 MessageRemovalAccounting accounting);
+                                 MessageRemovalAccounting accounting,
+                                 RemovedMessage *output = nullptr);
+  nsresult ReadRemovedMessage(nsMsgKey key, RemovedMessage &output);
   nsresult AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
                                  const nsACString &databaseSourceId,
                                  MessageRemovalAccounting accounting);

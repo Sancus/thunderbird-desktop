@@ -179,6 +179,29 @@ void MessageDatabase::DrainMessageBatches() {
   }
 }
 
+struct RemovedMessage::Data {
+  struct Property {
+    nsCString name;
+    nsCString text;
+    Maybe<int64_t> integer;
+  };
+  RawHdr header;
+  MessageBodyState body;
+  nsTArray<Property> properties;
+  nsMsgKey threadId{0};
+  nsMsgKey threadParent{0};
+  bool referencesKnown{false};
+  int64_t deletionSequence{0};
+};
+
+RemovedMessage::RemovedMessage() = default;
+RemovedMessage::~RemovedMessage() = default;
+RemovedMessage::RemovedMessage(RemovedMessage &&) = default;
+RemovedMessage &RemovedMessage::operator=(RemovedMessage &&) = default;
+const MessageBodyState *RemovedMessage::Body() const {
+  return mData ? &mData->body : nullptr;
+}
+
 void MessageDatabase::Startup() {
   MOZ_LOG(gPanoramaLog, LogLevel::Info, ("MessageDatabase starting up"));
   MOZ_LOG(gPanoramaLog, LogLevel::Info, ("MessageDatabase startup complete"));
@@ -1385,9 +1408,11 @@ nsresult MessageDatabase::StageMessage(uint64_t folderId,
 }
 
 nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
-                                        const ::RawHdr& header, bool staged,
-                                        bool notifyLegacy, nsMsgKey* aKey,
-                                        Message** liveHeader) {
+                                        const ::RawHdr &header, bool staged,
+                                        bool notifyLegacy, nsMsgKey *aKey,
+                                        Message **liveHeader,
+                                        RemovedMessage *restoring,
+                                        const FinishedMessageBody *finished) {
   NS_ENSURE_ARG_POINTER(aKey);
   if (staged) {
     NS_ENSURE_TRUE(aFolderId && aFolderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
@@ -1423,7 +1448,7 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
     if (!staged && mConversationGroupingEnabled) {
       MOZ_TRY(CaptureThreadViewsBeforeInsert(*notification));
     }
-    if (staged) {
+    if (staged || restoring) {
       nsCOMPtr<mozIStorageStatement> folder;
       MOZ_TRY(DatabaseCore::GetStatement(
           "RequireHeaderFolder"_ns, "SELECT 1 FROM folders WHERE id = :id"_ns,
@@ -1433,6 +1458,29 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       bool exists;
       MOZ_TRY(folder->ExecuteStep(&exists));
       NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+    }
+    if (restoring) {
+      const auto &body = restoring->mData->body;
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RequireUndoTombstone"_ns,
+          "SELECT sequence,deleted FROM message_changes "
+          "WHERE messageId=:id ORDER BY sequence DESC LIMIT 1"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, body.key));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+      int64_t sequence, deleted;
+      MOZ_TRY(stmt->GetInt64(0, &sequence));
+      MOZ_TRY(stmt->GetInt64(1, &deleted));
+      NS_ENSURE_TRUE(deleted == 1 &&
+                         sequence == restoring->mData->deletionSequence,
+                     NS_ERROR_NOT_AVAILABLE);
+      bool exists;
+      MOZ_TRY(MessageExists(body.key, exists));
+      NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
     }
     nsMsgKey allocated;
     MOZ_TRY(DatabaseCore::GetNextMessageKey(allocated));
@@ -1470,14 +1518,27 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       }
     }
     {
-      nsCString messageId = MOZ_TRY(DatabaseUtils::Normalize(header.messageId));
-      nsCString sender = MOZ_TRY(DatabaseUtils::Normalize(header.sender));
+      nsCString messageId =
+          restoring ? header.messageId
+                    : MOZ_TRY(DatabaseUtils::Normalize(header.messageId));
+      nsCString sender = restoring
+                             ? header.sender
+                             : MOZ_TRY(DatabaseUtils::Normalize(header.sender));
       nsCString recipients =
-          MOZ_TRY(DatabaseUtils::Normalize(header.recipients));
-      nsCString ccList = MOZ_TRY(DatabaseUtils::Normalize(header.ccList));
-      nsCString bccList = MOZ_TRY(DatabaseUtils::Normalize(header.bccList));
-      nsCString subject = MOZ_TRY(DatabaseUtils::Normalize(header.subject));
-      nsCString tags = MOZ_TRY(DatabaseUtils::Normalize(header.keywords));
+          restoring ? header.recipients
+                    : MOZ_TRY(DatabaseUtils::Normalize(header.recipients));
+      nsCString ccList = restoring
+                             ? header.ccList
+                             : MOZ_TRY(DatabaseUtils::Normalize(header.ccList));
+      nsCString bccList =
+          restoring ? header.bccList
+                    : MOZ_TRY(DatabaseUtils::Normalize(header.bccList));
+      nsCString subject =
+          restoring ? header.subject
+                    : MOZ_TRY(DatabaseUtils::Normalize(header.subject));
+      nsCString tags = restoring
+                           ? header.keywords
+                           : MOZ_TRY(DatabaseUtils::Normalize(header.keywords));
       for (const auto& extra : header.extras) {
         if (extra.k.EqualsLiteral("keywords")) {
           tags = extra.v;
@@ -1507,7 +1568,12 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       MOZ_TRY(stmt->BindUTF8StringByName("ccList"_ns, ccList));
       MOZ_TRY(stmt->BindUTF8StringByName("bccList"_ns, bccList));
       MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, subject));
-      MOZ_TRY(stmt->BindInt32ByName("flags"_ns, header.flags));
+      uint32_t flags =
+          restoring ? (header.flags & ~(nsMsgMessageFlags::Expunged |
+                                        nsMsgMessageFlags::Offline)) |
+                          (finished->offline ? nsMsgMessageFlags::Offline : 0)
+                    : header.flags;
+      MOZ_TRY(stmt->BindInt32ByName("flags"_ns, flags));
       MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
       MOZ_TRY(stmt->BindInt32ByName("priority"_ns, header.priority));
 
@@ -1563,45 +1629,84 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       cached.threadId = cached.key;
     }
 
-    MOZ_TRY(WriteMessageReferencesInTransaction(cached.key, header.references));
-
-    if (!header.replyTo.IsEmpty()) {
-      MOZ_TRY(SetMessageProperty(cached.key, "replyTo"_ns, header.replyTo));
-    }
-    if (!header.charset.IsEmpty()) {
-      MOZ_TRY(SetMessageProperty(cached.key, "msgCharSet"_ns, header.charset));
-    }
-    if (!header.accountKey.IsEmpty()) {
-      MOZ_TRY(SetMessageProperty(cached.key, "account"_ns, header.accountKey));
-    }
-    if (header.dateReceived != 0) {
-      uint32_t seconds;
-      PRTime2Seconds(header.dateReceived, &seconds);
-      nsAutoCString text;
-      text.AppendInt(seconds, 16);
-      MOZ_TRY(SetMessageProperty(cached.key, "dateReceived"_ns, text));
-    }
-    for (const auto& extra : header.extras) {
-      if (!extra.k.EqualsLiteral("keywords")) {
-        MOZ_TRY(SetMessageProperty(cached.key, extra.k, extra.v));
+    if (restoring) {
+      if (restoring->mData->referencesKnown) {
+        MOZ_TRY(
+            WriteMessageReferencesInTransaction(cached.key, header.references));
       }
-    }
-    // Only the new native storage inputs override matching extras.
-    if (header.messageSize) {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RestoreMessageProperties"_ns,
+          "INSERT INTO message_properties(id,name,value) VALUES(:id,:name,:value)"_ns,
+          getter_AddRefs(stmt)));
+      for (const auto &property : restoring->mData->properties) {
+        // A server binding belongs to the old physical row, not its restored
+        // copy.
+        if (property.name.EqualsLiteral("uidOnServer")) {
+          continue;
+        }
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("id"_ns, cached.key));
+        MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, property.name));
+        if (property.integer) {
+          MOZ_TRY(stmt->BindInt64ByName("value"_ns, *property.integer));
+        } else {
+          MOZ_TRY(stmt->BindUTF8StringByName("value"_ns, property.text));
+        }
+        MOZ_TRY(stmt->Execute());
+      }
+      MOZ_TRY(SetMessageProperty(cached.key, "storeToken"_ns,
+                                 finished->storeToken));
       MOZ_TRY(SetMessageProperty(cached.key, "messageSize"_ns,
-                                 *header.messageSize));
-    }
-    if (header.storeToken) {
-      MOZ_TRY(
-          SetMessageProperty(cached.key, "storeToken"_ns, *header.storeToken));
-    }
-    if (header.offlineMessageSize) {
+                                 finished->messageSize));
       MOZ_TRY(SetMessageProperty(cached.key, "offlineMessageSize"_ns,
-                                 *header.offlineMessageSize));
-    }
-    if (header.lineCount) {
+                                 finished->offlineMessageSize));
       MOZ_TRY(
-          SetMessageProperty(cached.key, "lineCount"_ns, *header.lineCount));
+          SetMessageProperty(cached.key, "lineCount"_ns, finished->lineCount));
+    } else {
+      MOZ_TRY(
+          WriteMessageReferencesInTransaction(cached.key, header.references));
+
+      if (!header.replyTo.IsEmpty()) {
+        MOZ_TRY(SetMessageProperty(cached.key, "replyTo"_ns, header.replyTo));
+      }
+      if (!header.charset.IsEmpty()) {
+        MOZ_TRY(
+            SetMessageProperty(cached.key, "msgCharSet"_ns, header.charset));
+      }
+      if (!header.accountKey.IsEmpty()) {
+        MOZ_TRY(
+            SetMessageProperty(cached.key, "account"_ns, header.accountKey));
+      }
+      if (header.dateReceived != 0) {
+        uint32_t seconds;
+        PRTime2Seconds(header.dateReceived, &seconds);
+        nsAutoCString text;
+        text.AppendInt(seconds, 16);
+        MOZ_TRY(SetMessageProperty(cached.key, "dateReceived"_ns, text));
+      }
+      for (const auto &extra : header.extras) {
+        if (!extra.k.EqualsLiteral("keywords")) {
+          MOZ_TRY(SetMessageProperty(cached.key, extra.k, extra.v));
+        }
+      }
+      // Only the new native storage inputs override matching extras.
+      if (header.messageSize) {
+        MOZ_TRY(SetMessageProperty(cached.key, "messageSize"_ns,
+                                   *header.messageSize));
+      }
+      if (header.storeToken) {
+        MOZ_TRY(SetMessageProperty(cached.key, "storeToken"_ns,
+                                   *header.storeToken));
+      }
+      if (header.offlineMessageSize) {
+        MOZ_TRY(SetMessageProperty(cached.key, "offlineMessageSize"_ns,
+                                   *header.offlineMessageSize));
+      }
+      if (header.lineCount) {
+        MOZ_TRY(
+            SetMessageProperty(cached.key, "lineCount"_ns, *header.lineCount));
+      }
     }
 
     if (!staged) {
@@ -1662,6 +1767,9 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
   if (liveHeader) {
     RefPtr<Message> result = message;
     result.forget(liveHeader);
+  }
+  if (restoring) {
+    restoring->mData.reset();
   }
   if (notification) {
     QueueMessageBatch(std::move(notification));
@@ -3096,6 +3204,106 @@ MessageDatabase::RemoveMessageFromFolder(nsMsgKey key, uint64_t folderId,
   return RemoveMessageInternal(key, folderId, &databaseSourceId, accounting);
 }
 
+nsresult MessageDatabase::RemoveMessageForUndo(nsMsgKey key,
+                                               RemovedMessage &output) {
+  NS_ENSURE_TRUE(key != nsMsgKey_None, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(CheckMessageBodyAccess(key));
+  RefPtr<MessageDatabase> self(this);
+  return RemoveMessageInternal(
+      key, 0, nullptr, MessageRemovalAccounting::LocalMessageSize, &output);
+}
+
+nsresult MessageDatabase::RemoveMessageForUndo(
+    nsMsgKey key, uint64_t folderId, const nsACString &databaseSourceId,
+    MessageRemovalAccounting accounting, RemovedMessage &output) {
+  NS_ENSURE_TRUE(key != nsMsgKey_None && folderId && folderId <= INT64_MAX &&
+                     !databaseSourceId.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(accounting == MessageRemovalAccounting::LocalMessageSize ||
+                     accounting == MessageRemovalAccounting::OfflineMessageSize,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  RefPtr<MessageDatabase> self(this);
+  return RemoveMessageInternal(key, folderId, &databaseSourceId, accounting,
+                               &output);
+}
+
+nsresult MessageDatabase::RestoreMessageForUndo(
+    uint64_t folderId, RemovedMessage &captured,
+    const FinishedMessageBody &finished, nsMsgKey *key, Message **liveHeader) {
+  NS_ENSURE_ARG_POINTER(key);
+  NS_ENSURE_TRUE(captured.mData, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(folderId && folderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString source;
+  MOZ_TRY(DatabaseCore::sInstance->GetSourceId(source));
+  NS_ENSURE_TRUE(source == captured.mData->body.databaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  RefPtr<MessageDatabase> self(this);
+  return InsertMessage(folderId, captured.mData->header, false, true, key,
+                       liveHeader, &captured, &finished);
+}
+
+nsresult MessageDatabase::ReadRemovedMessage(nsMsgKey key,
+                                             RemovedMessage &output) {
+  auto saved = MakeUnique<RemovedMessage::Data>();
+  MOZ_TRY(ReadMessageBodyState(key, saved->body));
+  CachedMsg row;
+  MOZ_TRY(FetchMsg(key, row));
+  saved->header.key = key;
+  saved->header.messageId = row.messageId;
+  saved->header.date = row.date;
+  saved->header.sender = row.sender;
+  saved->header.recipients = row.recipients;
+  saved->header.ccList = row.ccList;
+  saved->header.bccList = row.bccList;
+  saved->header.subject = row.subject;
+  saved->header.flags = row.flags;
+  saved->header.keywords = row.tags;
+  saved->header.priority = row.priority;
+  saved->threadId = row.threadId;
+  saved->threadParent = row.threadParent;
+  nsresult refs = GetMessageReferences(key, saved->header.references);
+  if (NS_FAILED(refs) && refs != NS_ERROR_NOT_AVAILABLE) {
+    return refs;
+  }
+  saved->referencesKnown = NS_SUCCEEDED(refs);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CaptureRemovedProperties"_ns,
+      "SELECT name,value FROM message_properties WHERE id=:id ORDER BY name COLLATE BINARY"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      break;
+    }
+    RemovedMessage::Data::Property *property =
+        saved->properties.AppendElement();
+    int32_t type;
+    MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+    NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                   NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(stmt->GetUTF8String(0, property->name));
+    MOZ_TRY(stmt->GetTypeOfIndex(1, &type));
+    if (type == mozIStorageValueArray::VALUE_TYPE_INTEGER) {
+      int64_t value;
+      MOZ_TRY(stmt->GetInt64(1, &value));
+      property->integer = Some(value);
+    } else {
+      NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                     NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(stmt->GetUTF8String(1, property->text));
+    }
+  }
+  output.mData = std::move(saved);
+  return NS_OK;
+}
+
 // Called only inside the removal transaction. Read the authoritative row and
 // storage properties, rather than a possibly retained or warmed header.
 nsresult
@@ -3188,10 +3396,9 @@ MessageDatabase::AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
   return stmt->Execute();
 }
 
-nsresult
-MessageDatabase::RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
-                                       const nsACString *databaseSourceId,
-                                       MessageRemovalAccounting accounting) {
+nsresult MessageDatabase::RemoveMessageInternal(
+    nsMsgKey key, uint64_t folderId, const nsACString *databaseSourceId,
+    MessageRemovalAccounting accounting, RemovedMessage *output) {
   MOZ_ASSERT(key != nsMsgKey_None);
   MOZ_TRY(DatabaseCore::EnsureConnection());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
@@ -3201,6 +3408,7 @@ MessageDatabase::RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
     return NS_ERROR_IN_PROGRESS;
   }
 
+  RemovedMessage captured;
   CachedMsg cached;
   RefPtr<Message> message;
   UniquePtr<QueuedMessageBatch> notification;
@@ -3211,6 +3419,9 @@ MessageDatabase::RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
     if (databaseSourceId) {
       MOZ_TRY(
           AccountRemovedMessage(key, folderId, *databaseSourceId, accounting));
+    }
+    if (output) {
+      MOZ_TRY(ReadRemovedMessage(key, captured));
     }
     MOZ_TRY(CaptureMessage(key, notification->before));
     {
@@ -3264,6 +3475,25 @@ MessageDatabase::RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
         return NS_ERROR_UNEXPECTED;
       }
     }
+    if (output) {
+      // Property deletion may itself advance revisions before the row delete.
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "CaptureUndoTombstone"_ns,
+          "SELECT sequence,deleted FROM message_changes WHERE messageId=:id "
+          "ORDER BY sequence DESC LIMIT 1"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+      int64_t deleted;
+      MOZ_TRY(stmt->GetInt64(0, &captured.mData->deletionSequence));
+      MOZ_TRY(stmt->GetInt64(1, &deleted));
+      NS_ENSURE_TRUE(deleted == 1 && captured.mData->deletionSequence > 0,
+                     NS_ERROR_FILE_CORRUPTED);
+    }
     if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
       return NS_ERROR_OUT_OF_MEMORY;
     }
@@ -3292,6 +3522,9 @@ MessageDatabase::RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
     entry->value() = std::move(cached);
   } else {
     mMsgCache.putNewInfallible(key, std::move(cached));
+  }
+  if (output) {
+    *output = std::move(captured);
   }
   QueueMessageBatch(std::move(notification));
   return NS_OK;

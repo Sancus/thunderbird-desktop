@@ -50,20 +50,20 @@ NS_IMPL_ISUPPORTS(MessageDatabase, nsIMessageDatabase)
 struct MessageDatabase::ListenerRegistration {
   NS_INLINE_DECL_REFCOUNTING(ListenerRegistration)
  public:
-   explicit ListenerRegistration(MessageListener *value)
-       : identity(value), strongListener(value) {}
-   explicit ListenerRegistration(PerFolderDatabase *value)
-       : identity(value), folderListener(value) {}
-   RefPtr<MessageListener> Resolve() const {
-     if (strongListener) {
-       return strongListener;
-     }
-     RefPtr<MessageListener> listener = folderListener.get();
-     return listener;
-   }
-   bool Expired() const { return !strongListener && !folderListener; }
-   // Identity is compared only, including after ForceClosed detaches WeakPtr.
-   MessageListener *const identity;
+  explicit ListenerRegistration(MessageListener* value)
+      : identity(value), strongListener(value) {}
+  explicit ListenerRegistration(PerFolderDatabase* value)
+      : identity(value), folderListener(value) {}
+  RefPtr<MessageListener> Resolve() const {
+    if (strongListener) {
+      return strongListener;
+    }
+    RefPtr<MessageListener> listener = folderListener.get();
+    return listener;
+  }
+  bool Expired() const { return !strongListener && !folderListener; }
+  // Identity is compared only, including after ForceClosed detaches WeakPtr.
+  MessageListener* const identity;
 
  private:
   ~ListenerRegistration() = default;
@@ -108,12 +108,12 @@ void MessageDatabase::NotifyImportedMessage(Message* message) {
   PruneExpiredFolderListeners();
   nsTArray<Recipient> listeners;
   listeners.SetCapacity(mMessageListeners.Length());
-  for (const auto &registration : mMessageListeners) {
+  for (const auto& registration : mMessageListeners) {
     if (auto listener = registration->Resolve()) {
       listeners.AppendElement(Recipient{registration, std::move(listener)});
     }
   }
-  for (const auto &recipient : listeners) {
+  for (const auto& recipient : listeners) {
     if (mMessageListeners.Contains(recipient.registration)) {
       recipient.listener->OnMessagePublished(message, false);
     }
@@ -132,9 +132,9 @@ nsresult MessageDatabase::PrepareMessageBatch(
       !mMessageBatches.SetCapacity(mMessageBatches.Length() + 1, fallible)) {
     return NS_ERROR_OUT_OF_MEMORY;
   }
-  for (const auto &registration : mMessageListeners) {
+  for (const auto& registration : mMessageListeners) {
     if (auto listener = registration->Resolve()) {
-      QueuedMessageBatch::Delivery *delivery =
+      QueuedMessageBatch::Delivery* delivery =
           batch->deliveries.AppendElement();
       delivery->registration = registration;
       delivery->listener = std::move(listener);
@@ -186,7 +186,7 @@ void MessageDatabase::DrainMessageBatches() {
       if (!mMessageListeners.Contains(delivery.registration)) {
         continue;
       }
-      auto *listener = delivery.listener.get();
+      auto* listener = delivery.listener.get();
       switch (batch->kind) {
         case QueuedMessageBatch::Kind::Thread:
           listener->DeliverThreadBatch(delivery.prepared);
@@ -230,9 +230,9 @@ struct RemovedMessage::Data {
 
 RemovedMessage::RemovedMessage() = default;
 RemovedMessage::~RemovedMessage() = default;
-RemovedMessage::RemovedMessage(RemovedMessage &&) = default;
-RemovedMessage &RemovedMessage::operator=(RemovedMessage &&) = default;
-const MessageBodyState *RemovedMessage::Body() const {
+RemovedMessage::RemovedMessage(RemovedMessage&&) = default;
+RemovedMessage& RemovedMessage::operator=(RemovedMessage&&) = default;
+const MessageBodyState* RemovedMessage::Body() const {
   return mData ? &mData->body : nullptr;
 }
 
@@ -1442,11 +1442,11 @@ nsresult MessageDatabase::StageMessage(uint64_t folderId,
 }
 
 nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
-                                        const ::RawHdr &header, bool staged,
-                                        bool notifyLegacy, nsMsgKey *aKey,
-                                        Message **liveHeader,
-                                        RemovedMessage *restoring,
-                                        const FinishedMessageBody *finished) {
+                                        const ::RawHdr& header, bool staged,
+                                        bool notifyLegacy, nsMsgKey* aKey,
+                                        Message** liveHeader,
+                                        RemovedMessage* restoring,
+                                        const FinishedMessageBody* finished) {
   NS_ENSURE_ARG_POINTER(aKey);
   if (staged) {
     NS_ENSURE_TRUE(aFolderId && aFolderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
@@ -1494,7 +1494,7 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
     }
     if (restoring) {
-      const auto &body = restoring->mData->body;
+      const auto& body = restoring->mData->body;
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(DatabaseCore::GetStatement(
           "RequireUndoTombstone"_ns,
@@ -1509,9 +1509,9 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       int64_t sequence, deleted;
       MOZ_TRY(stmt->GetInt64(0, &sequence));
       MOZ_TRY(stmt->GetInt64(1, &deleted));
-      NS_ENSURE_TRUE(deleted == 1 &&
-                         sequence == restoring->mData->deletionSequence,
-                     NS_ERROR_NOT_AVAILABLE);
+      NS_ENSURE_TRUE(
+          deleted == 1 && sequence == restoring->mData->deletionSequence,
+          NS_ERROR_NOT_AVAILABLE);
       bool exists;
       MOZ_TRY(MessageExists(body.key, exists));
       NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
@@ -1673,7 +1673,7 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
           "RestoreMessageProperties"_ns,
           "INSERT INTO message_properties(id,name,value) VALUES(:id,:name,:value)"_ns,
           getter_AddRefs(stmt)));
-      for (const auto &property : restoring->mData->properties) {
+      for (const auto& property : restoring->mData->properties) {
         // A server binding belongs to the old physical row, not its restored
         // copy.
         if (property.name.EqualsLiteral("uidOnServer")) {
@@ -1719,7 +1719,7 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
         text.AppendInt(seconds, 16);
         MOZ_TRY(SetMessageProperty(cached.key, "dateReceived"_ns, text));
       }
-      for (const auto &extra : header.extras) {
+      for (const auto& extra : header.extras) {
         if (!extra.k.EqualsLiteral("keywords")) {
           MOZ_TRY(SetMessageProperty(cached.key, extra.k, extra.v));
         }
@@ -3225,10 +3225,9 @@ NS_IMETHODIMP MessageDatabase::RemoveMessage(nsMsgKey key) {
                                MessageRemovalAccounting::LocalMessageSize);
 }
 
-nsresult
-MessageDatabase::RemoveMessageFromFolder(nsMsgKey key, uint64_t folderId,
-                                         const nsACString &databaseSourceId,
-                                         MessageRemovalAccounting accounting) {
+nsresult MessageDatabase::RemoveMessageFromFolder(
+    nsMsgKey key, uint64_t folderId, const nsACString& databaseSourceId,
+    MessageRemovalAccounting accounting) {
   NS_ENSURE_TRUE(key != nsMsgKey_None && folderId && folderId <= INT64_MAX &&
                      !databaseSourceId.IsEmpty(),
                  NS_ERROR_INVALID_ARG);
@@ -3240,7 +3239,7 @@ MessageDatabase::RemoveMessageFromFolder(nsMsgKey key, uint64_t folderId,
 }
 
 nsresult MessageDatabase::RemoveMessageForUndo(nsMsgKey key,
-                                               RemovedMessage &output) {
+                                               RemovedMessage& output) {
   NS_ENSURE_TRUE(key != nsMsgKey_None, NS_ERROR_INVALID_ARG);
   MOZ_TRY(RequireCommittedSearchRead());
   MOZ_TRY(CheckMessageBodyAccess(key));
@@ -3250,8 +3249,8 @@ nsresult MessageDatabase::RemoveMessageForUndo(nsMsgKey key,
 }
 
 nsresult MessageDatabase::RemoveMessageForUndo(
-    nsMsgKey key, uint64_t folderId, const nsACString &databaseSourceId,
-    MessageRemovalAccounting accounting, RemovedMessage &output) {
+    nsMsgKey key, uint64_t folderId, const nsACString& databaseSourceId,
+    MessageRemovalAccounting accounting, RemovedMessage& output) {
   NS_ENSURE_TRUE(key != nsMsgKey_None && folderId && folderId <= INT64_MAX &&
                      !databaseSourceId.IsEmpty(),
                  NS_ERROR_INVALID_ARG);
@@ -3265,8 +3264,8 @@ nsresult MessageDatabase::RemoveMessageForUndo(
 }
 
 nsresult MessageDatabase::RestoreMessageForUndo(
-    uint64_t folderId, RemovedMessage &captured,
-    const FinishedMessageBody &finished, nsMsgKey *key, Message **liveHeader) {
+    uint64_t folderId, RemovedMessage& captured,
+    const FinishedMessageBody& finished, nsMsgKey* key, Message** liveHeader) {
   NS_ENSURE_ARG_POINTER(key);
   NS_ENSURE_TRUE(captured.mData, NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_TRUE(folderId && folderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
@@ -3281,7 +3280,7 @@ nsresult MessageDatabase::RestoreMessageForUndo(
 }
 
 nsresult MessageDatabase::ReadRemovedMessage(nsMsgKey key,
-                                             RemovedMessage &output) {
+                                             RemovedMessage& output) {
   auto saved = MakeUnique<RemovedMessage::Data>();
   MOZ_TRY(ReadMessageBodyState(key, saved->body));
   CachedMsg row;
@@ -3317,7 +3316,7 @@ nsresult MessageDatabase::ReadRemovedMessage(nsMsgKey key,
     if (!more) {
       break;
     }
-    RemovedMessage::Data::Property *property =
+    RemovedMessage::Data::Property* property =
         saved->properties.AppendElement();
     int32_t type;
     MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
@@ -3341,10 +3340,9 @@ nsresult MessageDatabase::ReadRemovedMessage(nsMsgKey key,
 
 // Called only inside the removal transaction. Read the authoritative row and
 // storage properties, rather than a possibly retained or warmed header.
-nsresult
-MessageDatabase::AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
-                                       const nsACString &databaseSourceId,
-                                       MessageRemovalAccounting accounting) {
+nsresult MessageDatabase::AccountRemovedMessage(
+    nsMsgKey key, uint64_t folderId, const nsACString& databaseSourceId,
+    MessageRemovalAccounting accounting) {
   MOZ_TRY(CheckPendingMessageRelocation(key));
   uint32_t flags;
   {
@@ -3432,8 +3430,8 @@ MessageDatabase::AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
 }
 
 nsresult MessageDatabase::RemoveMessageInternal(
-    nsMsgKey key, uint64_t folderId, const nsACString *databaseSourceId,
-    MessageRemovalAccounting accounting, RemovedMessage *output) {
+    nsMsgKey key, uint64_t folderId, const nsACString* databaseSourceId,
+    MessageRemovalAccounting accounting, RemovedMessage* output) {
   MOZ_ASSERT(key != nsMsgKey_None);
   MOZ_TRY(DatabaseCore::EnsureConnection());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
@@ -4197,7 +4195,7 @@ MessageDatabase::AddMessageListener(MessageListener* aListener) {
   }
 }
 
-void MessageDatabase::AddFolderMessageListener(PerFolderDatabase *listener) {
+void MessageDatabase::AddFolderMessageListener(PerFolderDatabase* listener) {
   if (listener) {
     PruneExpiredFolderListeners();
     mMessageListeners.AppendElement(new ListenerRegistration(listener));
@@ -5408,7 +5406,7 @@ nsresult MessageDatabase::PrepareConversationBatch(
   MOZ_TRY(ApplyThreadWordRemap(remaps));
   notification.kind = QueuedMessageBatch::Kind::Thread;
   for (auto& delivery : notification.deliveries) {
-    auto *listener = delivery.listener.get();
+    auto* listener = delivery.listener.get();
     NS_ENSURE_TRUE(
         captured.changedKeys.IsEmpty() || listener->SupportsThreadChanges(),
         NS_ERROR_NOT_AVAILABLE);

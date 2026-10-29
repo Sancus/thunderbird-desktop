@@ -91,22 +91,22 @@ class FaultWitness final : public mozIStorageFunction {
 NS_IMPL_ISUPPORTS(FaultWitness, mozIStorageFunction)
 
 class UndoRemovalObserver final : public MessageListener {
-public:
+ public:
   NS_DECL_ISUPPORTS
-  explicit UndoRemovalObserver(std::function<void(Message *)> removed)
+  explicit UndoRemovalObserver(std::function<void(Message*)> removed)
       : mRemoved(std::move(removed)) {}
-  void OnMessageAdded(Message *) override {}
-  void OnMessageRemoved(Message *message, uint32_t) override {
+  void OnMessageAdded(Message*) override {}
+  void OnMessageRemoved(Message* message, uint32_t) override {
     mRemoved(message);
   }
-  void OnMessageFlagsChanged(nsIMsgDBHdr *, Message *, uint32_t,
+  void OnMessageFlagsChanged(nsIMsgDBHdr*, Message*, uint32_t,
                              uint32_t) override {}
-  void OnMessageTagsChanged(nsIMsgDBHdr *, Message *, const nsACString &,
-                            const nsACString &) override {}
+  void OnMessageTagsChanged(nsIMsgDBHdr*, Message*, const nsACString&,
+                            const nsACString&) override {}
 
-private:
+ private:
   ~UndoRemovalObserver() = default;
-  std::function<void(Message *)> mRemoved;
+  std::function<void(Message*)> mRemoved;
 };
 NS_IMPL_ISUPPORTS(UndoRemovalObserver, nsISupports)
 
@@ -287,7 +287,7 @@ class DeliveryCoreReferences : public testing::Test {
     return facade.forget();
   }
 
-  void EnrollWeakFolder(PerFolderDatabase *facade) {
+  void EnrollWeakFolder(PerFolderDatabase* facade) {
     mCore->MessageDB().AddFolderMessageListener(facade);
   }
 
@@ -837,15 +837,15 @@ class DeliveryCoreReferences : public testing::Test {
     return nullptr;
   }
 
-  nsresult PhysicalFolderKeys(uint64_t folderId, nsTArray<nsMsgKey> &keys) {
+  nsresult PhysicalFolderKeys(uint64_t folderId, nsTArray<nsMsgKey>& keys) {
     return mCore->MessageDB().ListAllKeys(folderId, keys);
   }
 
-  nsresult AdmissionSource(DatabaseCore *core, nsACString &output) {
+  nsresult AdmissionSource(DatabaseCore* core, nsACString& output) {
     return core->ReadSourceIdForFolderAdmission(output);
   }
 
-  nsresult RemovalMetric(uint64_t folder, int64_t &output) {
+  nsresult RemovalMetric(uint64_t folder, int64_t& output) {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(mConnection->CreateStatement(
         "SELECT value FROM folder_properties WHERE id=:folder "
@@ -855,14 +855,13 @@ class DeliveryCoreReferences : public testing::Test {
     bool more;
     MOZ_TRY(stmt->ExecuteStep(&more));
     int64_t value = 0;
-    if (more)
-      MOZ_TRY(stmt->GetInt64(0, &value));
+    if (more) MOZ_TRY(stmt->GetInt64(0, &value));
     output = value;
     return NS_OK;
   }
 
   void CheckFolderIdentity(uint64_t id, uint64_t parent,
-                           const nsACString &name) {
+                           const nsACString& name) {
     auto cachedParent = mCore->FolderDB().GetFolderParent(id);
     ASSERT_TRUE(cachedParent.isOk());
     EXPECT_EQ(parent, cachedParent.unwrap());
@@ -873,8 +872,7 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
     nsCOMPtr<mozIStorageStatement> stmt;
     auto close = MakeScopeExit([&] {
-      if (stmt)
-        EXPECT_EQ(NS_OK, stmt->Finalize());
+      if (stmt) EXPECT_EQ(NS_OK, stmt->Finalize());
       EXPECT_EQ(NS_OK, reader->Close());
     });
     ASSERT_EQ(NS_OK, reader->CreateStatement(
@@ -904,7 +902,7 @@ class DeliveryCoreReferences : public testing::Test {
     return stmt->Execute();
   }
 
-  void CheckSiblingOrder(uint64_t parent, const nsTArray<uint64_t> &expected,
+  void CheckSiblingOrder(uint64_t parent, const nsTArray<uint64_t>& expected,
                          bool assigned = true) {
     auto actual = mCore->FolderDB().GetFolderChildren(parent);
     ASSERT_TRUE(actual.isOk());
@@ -923,8 +921,7 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
     nsCOMPtr<mozIStorageStatement> stmt;
     auto close = MakeScopeExit([&] {
-      if (stmt)
-        EXPECT_EQ(NS_OK, stmt->Finalize());
+      if (stmt) EXPECT_EQ(NS_OK, stmt->Finalize());
       EXPECT_EQ(NS_OK, reader->Close());
     });
     ASSERT_EQ(NS_OK, reader->CreateStatement(
@@ -4782,7 +4779,6 @@ TEST_F(DeliveryCoreReferences, RelocationReadErrorsPreserveOutputAndGate) {
   EXPECT_EQ(NS_OK, db.CheckMessageBodyAccess(plan.messages[0].before.key));
 }
 
-
 TEST_F(DeliveryCoreReferences, PendingAppendDestinationSurvivesReopen) {
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK,
@@ -5223,7 +5219,10 @@ TEST_F(DeliveryCoreReferences,
           "destinationFolderId;"
           "ALTER TABLE offline_copy_destinations DROP COLUMN destinationKey;"
           "ALTER TABLE offline_copy_destinations DROP COLUMN destinationEpoch;"_ns));
-  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      old->ExecuteSimpleSQL(
+          "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(10));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -5503,7 +5502,10 @@ TEST_F(DeliveryCoreReferences, FolderIdsSurviveReopenAndOldOrphanUpgrade) {
           "DROP TABLE thread_flags;"
           "DROP TRIGGER guard_folder_id; DROP TRIGGER record_folder_id;"
           "DROP TRIGGER immutable_folder_id; DROP TABLE folder_id_allocator;"_ns));
-  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      old->ExecuteSimpleSQL(
+          "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(11));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -5892,7 +5894,10 @@ TEST_F(DeliveryCoreReferences, ThreadFlagsUpgradeDoesNotInferHeaderIgnored) {
                                   "DROP TRIGGER thread_flags_message_delete; "
                                   "DROP TRIGGER thread_flags_folder_delete;"
                                   "DROP TABLE thread_flags"_ns));
-  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      old->ExecuteSimpleSQL(
+          "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(12));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -7114,7 +7119,10 @@ TEST_F(DeliveryCoreReferences, Schema14UpgradeKeepsThreadAndPendingState) {
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
   ASSERT_EQ(NS_OK,
             old->ExecuteSimpleSQL("DROP TABLE folder_import_windows"_ns));
-  ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL("DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      old->ExecuteSimpleSQL(
+          "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(13));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -7674,7 +7682,7 @@ TEST_F(DeliveryCoreReferences, PartialCompletionRejectsStaleAndNonPartialRows) {
 
 TEST_F(DeliveryCoreReferences, SiblingOrderWriteFailureRollsBackSqlAndCache) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   uint64_t a, b, c;
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
@@ -7687,8 +7695,9 @@ TEST_F(DeliveryCoreReferences, SiblingOrderWriteFailureRollsBackSqlAndCache) {
       "CREATE TEMP TRIGGER reject_ordinal BEFORE UPDATE OF ordinal "
       "ON folders WHEN OLD.id=");
   sql.AppendInt(c);
-  sql.AppendLiteral(" AND NEW.ordinal=2 BEGIN SELECT ordinal_fault(OLD.id); "
-                    "SELECT RAISE(ABORT,'second ordinal failure'); END");
+  sql.AppendLiteral(
+      " AND NEW.ordinal=2 BEGIN SELECT ordinal_fault(OLD.id); "
+      "SELECT RAISE(ABORT,'second ordinal failure'); END");
   ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
   auto drop = MakeScopeExit([&] {
     EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
@@ -7718,7 +7727,7 @@ TEST_F(DeliveryCoreReferences, SiblingOrderWriteFailureRollsBackSqlAndCache) {
 
 TEST_F(DeliveryCoreReferences, SiblingOrderCommitFailureKeepsSqlAndCache) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   uint64_t a, b, c;
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
@@ -7735,8 +7744,9 @@ TEST_F(DeliveryCoreReferences, SiblingOrderCommitFailureKeepsSqlAndCache) {
   RefPtr<FaultWitness> witness = new FaultWitness();
   ASSERT_EQ(NS_OK,
             mConnection->CreateFunction("ordinal_commit_fault"_ns, 1, witness));
-  nsAutoCString sql("CREATE TEMP TRIGGER reject_ordinal_commit "
-                    "AFTER UPDATE OF ordinal ON main.folders WHEN OLD.id=");
+  nsAutoCString sql(
+      "CREATE TEMP TRIGGER reject_ordinal_commit "
+      "AFTER UPDATE OF ordinal ON main.folders WHEN OLD.id=");
   sql.AppendInt(c);
   sql.AppendLiteral(
       " AND NEW.ordinal=2 BEGIN SELECT ordinal_commit_fault(OLD.id); "
@@ -7762,7 +7772,7 @@ TEST_F(DeliveryCoreReferences, SiblingOrderCommitFailureKeepsSqlAndCache) {
 
 TEST_F(DeliveryCoreReferences, SiblingOrderRefusesForeignTransaction) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   uint64_t a, b, c;
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
@@ -7772,8 +7782,7 @@ TEST_F(DeliveryCoreReferences, SiblingOrderRefusesForeignTransaction) {
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 73));
   EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.MoveFolderWithin(mFolderId, a, c));
@@ -7792,7 +7801,7 @@ TEST_F(DeliveryCoreReferences, SiblingOrderRefusesForeignTransaction) {
 
 TEST_F(DeliveryCoreReferences, SiblingOrderRejectsRetiredFolderDatabase) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   uint64_t a, b, c;
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &a));
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Bravo"_ns, &b));
@@ -7812,7 +7821,7 @@ TEST_F(DeliveryCoreReferences, SiblingOrderRejectsRetiredFolderDatabase) {
 
 TEST_F(DeliveryCoreReferences, FolderRemovalAccountsWideLocalBytesBeforeEvent) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   RawHdr raw;
@@ -7830,8 +7839,8 @@ TEST_F(DeliveryCoreReferences, FolderRemovalAccountsWideLocalBytesBeforeEvent) {
   ASSERT_EQ(NS_OK, db.GetMessageSubject(key, subject));
   uint32_t removed = 0;
   RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
-  observer->action = [&](char kind, const CapturedMessage &before,
-                         const CapturedMessage &, Message *live, bool) {
+  observer->action = [&](char kind, const CapturedMessage& before,
+                         const CapturedMessage&, Message* live, bool) {
     EXPECT_EQ('R', kind);
     ++removed;
     EXPECT_EQ(key, before.id);
@@ -7874,7 +7883,7 @@ TEST_F(DeliveryCoreReferences, FolderRemovalAccountsWideLocalBytesBeforeEvent) {
 
 TEST_F(DeliveryCoreReferences, ReconcileCanonicalNamesRetainPhysicalMembers) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   const nsCString nfc = "Caf\xC3\xA9"_ns;
   const nsCString nfd = "Cafe\xCC\x81"_ns;
   uint64_t child, nested;
@@ -7884,7 +7893,7 @@ TEST_F(DeliveryCoreReferences, ReconcileCanonicalNamesRetainPhysicalMembers) {
   const nsTArray<nsCString> references = {"missing-root"_ns, ""_ns, "tail"_ns,
                                           "missing-root"_ns};
   ASSERT_EQ(NS_OK, AddAt(nested, "canonical-child"_ns, references, key));
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   const nsCString property = "Exact\xCC\x81"_ns;
   ASSERT_EQ(NS_OK, db.SetMessageProperty(key, property, ""_ns));
   // Warm the original paths/identities before reconciliation.
@@ -7892,7 +7901,7 @@ TEST_F(DeliveryCoreReferences, ReconcileCanonicalNamesRetainPhysicalMembers) {
   ASSERT_TRUE(path.isOk());
   nsCString originalPath = path.unwrap();
   ASSERT_EQ(NS_OK, folders.Reconcile(mFolderId, {nfd}));
-  for (const auto &name : {nfc, nfd}) {
+  for (const auto& name : {nfc, nfd}) {
     auto found = folders.GetFolderChildNamed(mFolderId, name);
     ASSERT_TRUE(found.isOk());
     EXPECT_EQ(child, found.unwrap());
@@ -7928,7 +7937,7 @@ TEST_F(DeliveryCoreReferences, ReconcileCanonicalNamesRetainPhysicalMembers) {
 
 TEST_F(DeliveryCoreReferences, ReconcileCanonicalDuplicatesKeepVirtualControl) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   const nsCString nfc = "Caf\xC3\xA9"_ns;
   const nsCString nfd = "Cafe\xCC\x81"_ns;
   uint64_t child, obsolete, control;
@@ -7951,12 +7960,12 @@ TEST_F(DeliveryCoreReferences, ReconcileCanonicalDuplicatesKeepVirtualControl) {
   EXPECT_TRUE(ids.Contains(control));
   auto flags = folders.GetFolderFlags(control);
   ASSERT_TRUE(flags.isOk());
-  EXPECT_EQ(nsMsgFolderFlags::Virtual, flags.unwrap());
+  EXPECT_EQ(uint32_t(nsMsgFolderFlags::Virtual), flags.unwrap());
 }
 
 TEST_F(DeliveryCoreReferences, HierarchyRenameRefusesCallerTxAndRetiredOwner) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   uint64_t child;
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &child));
   ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, mFolderId, "Alpha"_ns));
@@ -7964,8 +7973,7 @@ TEST_F(DeliveryCoreReferences, HierarchyRenameRefusesCallerTxAndRetiredOwner) {
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 73));
   EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.UpdateName(child, "Transient"_ns));
@@ -7995,7 +8003,7 @@ TEST_F(DeliveryCoreReferences, HierarchyRenameRefusesCallerTxAndRetiredOwner) {
 TEST_F(DeliveryCoreReferences,
        HierarchyReparentRefusesCallerTxAndRetiredOwner) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   uint64_t left, right, child, nested;
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Left"_ns, &left));
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Right"_ns, &right));
@@ -8008,8 +8016,7 @@ TEST_F(DeliveryCoreReferences,
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 81));
   EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.MoveFolderTo(right, child));
@@ -8038,7 +8045,7 @@ TEST_F(DeliveryCoreReferences,
 
 TEST_F(DeliveryCoreReferences, HierarchyWriteFailureKeepsCachedPathAndRows) {
   ASSERT_EQ(NS_OK, Start());
-  auto &folders = mCore->FolderDB();
+  auto& folders = mCore->FolderDB();
   uint64_t left, right, child;
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Left"_ns, &left));
   ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Right"_ns, &right));
@@ -8047,11 +8054,13 @@ TEST_F(DeliveryCoreReferences, HierarchyWriteFailureKeepsCachedPathAndRows) {
   RefPtr<FaultWitness> witness = new FaultWitness();
   ASSERT_EQ(NS_OK,
             mConnection->CreateFunction("hierarchy_fault"_ns, 1, witness));
-  nsAutoCString sql("CREATE TEMP TRIGGER reject_hierarchy "
-                    "BEFORE UPDATE OF name,parent ON folders WHEN OLD.id=");
+  nsAutoCString sql(
+      "CREATE TEMP TRIGGER reject_hierarchy "
+      "BEFORE UPDATE OF name,parent ON folders WHEN OLD.id=");
   sql.AppendInt(child);
-  sql.AppendLiteral(" BEGIN SELECT hierarchy_fault(OLD.id); "
-                    "SELECT RAISE(ABORT,'hierarchy write failure'); END");
+  sql.AppendLiteral(
+      " BEGIN SELECT hierarchy_fault(OLD.id); "
+      "SELECT RAISE(ABORT,'hierarchy write failure'); END");
   ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
   auto drop = MakeScopeExit([&] {
     EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
@@ -8079,7 +8088,7 @@ TEST_F(DeliveryCoreReferences, HierarchyWriteFailureKeepsCachedPathAndRows) {
 TEST_F(DeliveryCoreReferences,
        FolderRemovalRemoteAndGenericPoliciesStayDistinct) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   RawHdr raw;
@@ -8115,7 +8124,7 @@ TEST_F(DeliveryCoreReferences,
 TEST_F(DeliveryCoreReferences,
        FolderRemovalRejectsForeignAndUnpublishedIdentity) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   uint64_t other;
@@ -8154,12 +8163,12 @@ TEST_F(DeliveryCoreReferences,
 
 TEST_F(DeliveryCoreReferences, FolderRemovalRejectsSizeAndCounterOverflow) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("invalid-accounting"_ns, {}, key));
-  for (const auto &size : {"-1"_ns, "4294967296"_ns}) {
+  for (const auto& size : {"-1"_ns, "4294967296"_ns}) {
     nsAutoCString sql("REPLACE INTO message_properties VALUES(");
     sql.AppendInt(key);
     sql.AppendLiteral(",'messageSize',");
@@ -8200,7 +8209,7 @@ TEST_F(DeliveryCoreReferences, FolderRemovalRejectsSizeAndCounterOverflow) {
 TEST_F(DeliveryCoreReferences,
        FolderRemovalWriteFailuresRollBackCounterAndRow) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   RawHdr raw;
@@ -8219,8 +8228,8 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, before));
   uint32_t removed = 0;
   RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
-  observer->action = [&](char kind, const CapturedMessage &,
-                         const CapturedMessage &, Message *, bool) {
+  observer->action = [&](char kind, const CapturedMessage&,
+                         const CapturedMessage&, Message*, bool) {
     EXPECT_EQ('R', kind);
     ++removed;
   };
@@ -8281,7 +8290,7 @@ TEST_F(DeliveryCoreReferences,
 TEST_F(DeliveryCoreReferences,
        FolderRemovalReadFailurePreservesCounterAndEvents) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   nsMsgKey key;
@@ -8303,8 +8312,8 @@ TEST_F(DeliveryCoreReferences,
   });
   uint32_t removed = 0;
   RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
-  observer->action = [&](char, const CapturedMessage &, const CapturedMessage &,
-                         Message *, bool) { ++removed; };
+  observer->action = [&](char, const CapturedMessage&, const CapturedMessage&,
+                         Message*, bool) { ++removed; };
   db.AddMessageListener(observer);
   auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
   EXPECT_EQ(NS_ERROR_FAILURE, db.RemoveMessageFromFolder(
@@ -8325,7 +8334,7 @@ TEST_F(DeliveryCoreReferences,
 
 TEST_F(DeliveryCoreReferences, FolderRemovalDoesNotTakeCallerTransaction) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   nsMsgKey key;
@@ -8352,7 +8361,7 @@ TEST_F(DeliveryCoreReferences, FolderRemovalRespectsPendingBodyRelocation) {
   ASSERT_EQ(NS_OK, Start());
   FolderBodyRelocation plan;
   ASSERT_EQ(NS_OK, PrepareRelocation(plan));
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   ASSERT_EQ(NS_OK, db.PrepareBodyRelocation(plan));
   EXPECT_EQ(NS_ERROR_IN_PROGRESS,
             db.RemoveMessageFromFolder(
@@ -8371,7 +8380,7 @@ TEST_F(DeliveryCoreReferences, FolderRemovalRespectsPendingBodyRelocation) {
 TEST_F(DeliveryCoreReferences,
        FolderRemovalCommitFailureRollsBackCounterAndRow) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   RawHdr raw;
@@ -8404,8 +8413,8 @@ TEST_F(DeliveryCoreReferences,
   });
   uint32_t removed = 0;
   RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
-  observer->action = [&](char, const CapturedMessage &, const CapturedMessage &,
-                         Message *, bool) { ++removed; };
+  observer->action = [&](char, const CapturedMessage&, const CapturedMessage&,
+                         Message*, bool) { ++removed; };
   db.AddMessageListener(observer);
   auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
   EXPECT_EQ(
@@ -8447,8 +8456,7 @@ TEST_F(DeliveryCoreReferences,
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 83));
   nsCString admitted = "unchanged"_ns;
@@ -8481,8 +8489,7 @@ TEST_F(DeliveryCoreReferences,
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(
       NS_OK,
@@ -8522,8 +8529,7 @@ TEST_F(DeliveryCoreReferences,
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 31));
   ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
@@ -8557,7 +8563,7 @@ TEST_F(DeliveryCoreReferences, FolderAdmissionRejectsCorruptAndRetiredSources) {
   ASSERT_EQ(NS_OK, Start());
   nsCString expected;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(expected));
-  for (const auto &sql :
+  for (const auto& sql :
        {"DELETE FROM database_identity"_ns,
         "UPDATE database_identity SET sourceId='not-a-uuid'"_ns,
         "UPDATE database_identity SET sourceId=''"_ns}) {
@@ -8565,8 +8571,7 @@ TEST_F(DeliveryCoreReferences, FolderAdmissionRejectsCorruptAndRetiredSources) {
     auto rollback = MakeScopeExit([&] {
       bool active = false;
       EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-      if (active)
-        EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+      if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
     });
     ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
     nsCString output = "unchanged"_ns;
@@ -8589,7 +8594,7 @@ TEST_F(DeliveryCoreReferences, FolderAdmissionRejectsCorruptAndRetiredSources) {
 TEST_F(DeliveryCoreReferences,
        UndoCaptureRestoresCompleteMetadataWithFreshIdentity) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   RawHdr raw;
   raw.messageId = "undo@invalid"_ns;
   raw.subject = "saved subject"_ns;
@@ -8617,7 +8622,7 @@ TEST_F(DeliveryCoreReferences,
   RemovedMessage snapshot;
   uint32_t removed = 0;
   RefPtr<UndoRemovalObserver> removal =
-      new UndoRemovalObserver([&](Message *old) {
+      new UndoRemovalObserver([&](Message* old) {
         ++removed;
         ASSERT_TRUE(snapshot.Body());
         EXPECT_EQ(key, snapshot.Body()->key);
@@ -8636,7 +8641,7 @@ TEST_F(DeliveryCoreReferences,
   db.RemoveMessageListener(removal);
   remove.release();
   uint32_t published = 0;
-  RefPtr<AddedObserver> observer = new AddedObserver([&](Message *restored) {
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message* restored) {
     ++published;
     EXPECT_FALSE(snapshot.Body());
     bool active;
@@ -8730,7 +8735,7 @@ TEST_F(DeliveryCoreReferences,
 TEST_F(DeliveryCoreReferences,
        UndoCaptureFailureRetainsRowsAndPreviousSnapshot) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsMsgKey saved, target, control;
   ASSERT_EQ(NS_OK, Add("saved-undo@invalid"_ns, {}, saved));
   ASSERT_EQ(NS_OK, Add("target-undo@invalid"_ns, {"raw@invalid"_ns}, target));
@@ -8771,7 +8776,7 @@ TEST_F(DeliveryCoreReferences,
 
 TEST_F(DeliveryCoreReferences, UndoRestoreFailureRetainsCaptureAndOutput) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsMsgKey key, control;
   ASSERT_EQ(NS_OK, Add("restore-undo@invalid"_ns, {}, key));
   ASSERT_EQ(NS_OK, Add("restore-control@invalid"_ns, {}, control));
@@ -8796,7 +8801,7 @@ TEST_F(DeliveryCoreReferences, UndoRestoreFailureRetainsCaptureAndOutput) {
                        "WHEN NEW.name='Case' BEGIN SELECT undo_fault(NEW.id); "
                        "SELECT RAISE(ABORT,'undo restore'); END"_ns));
   RefPtr<Message> held = new Message(control);
-  Message *live = held.get();
+  Message* live = held.get();
   EXPECT_EQ(
       NS_ERROR_STORAGE_CONSTRAINT,
       db.RestoreMessageForUndo(mFolderId, snapshot, finished, &result, &live));
@@ -8824,11 +8829,11 @@ TEST_F(DeliveryCoreReferences, UndoRestoreFailureRetainsCaptureAndOutput) {
                               "SELECT COUNT(*) FROM messages WHERE id=:id"_ns,
                               count));
     EXPECT_EQ("0"_ns, count);
-    ASSERT_EQ(NS_OK,
-              PublicationCell(
-                  reader, attempted,
-                  "SELECT COUNT(*) FROM message_properties WHERE id=:id"_ns,
-                  count));
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, attempted,
+            "SELECT COUNT(*) FROM message_properties WHERE id=:id"_ns, count));
     EXPECT_EQ("0"_ns, count);
   }
   ASSERT_EQ(NS_OK,
@@ -8881,7 +8886,7 @@ TEST_F(DeliveryCoreReferences, UndoRetainsKnownEmptyReferences) {
 TEST_F(DeliveryCoreReferences,
        UndoCaptureRejectsUnsupportedStoredPropertyWithoutDeletion) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("unsupported-undo@invalid"_ns, {}, key));
   nsCOMPtr<mozIStorageStatement> stmt;
@@ -8903,7 +8908,7 @@ TEST_F(DeliveryCoreReferences,
 
 TEST_F(DeliveryCoreReferences, UndoCaptureRejectsNoneKeyWithoutDeletingRows) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsMsgKey control;
   ASSERT_EQ(NS_OK, Add("undo-sentinel-control@invalid"_ns, {}, control));
   RemovedMessage output;
@@ -8917,7 +8922,7 @@ TEST_F(DeliveryCoreReferences, UndoCaptureRejectsNoneKeyWithoutDeletingRows) {
 
 TEST_F(DeliveryCoreReferences, UndoFolderCaptureAccountsAndRollsBackTogether) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   RawHdr raw;
@@ -8929,18 +8934,17 @@ TEST_F(DeliveryCoreReferences, UndoFolderCaptureAccountsAndRollsBackTogether) {
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 17));
   RemovedMessage snapshot;
   uint32_t removed = 0;
-  RefPtr<UndoRemovalObserver> observer =
-      new UndoRemovalObserver([&](Message *) {
-        ++removed;
-        ASSERT_TRUE(snapshot.Body());
-        EXPECT_EQ(key, snapshot.Body()->key);
-        bool active = true;
-        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-        EXPECT_FALSE(active);
-        int64_t metric = 0;
-        ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
-        EXPECT_EQ(int64_t(UINT32_MAX) + 17, metric);
-      });
+  RefPtr<UndoRemovalObserver> observer = new UndoRemovalObserver([&](Message*) {
+    ++removed;
+    ASSERT_TRUE(snapshot.Body());
+    EXPECT_EQ(key, snapshot.Body()->key);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    int64_t metric = 0;
+    ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+    EXPECT_EQ(int64_t(UINT32_MAX) + 17, metric);
+  });
   db.AddMessageListener(observer);
   auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
   RefPtr<FaultWitness> witness = new FaultWitness();
@@ -8991,7 +8995,7 @@ TEST_F(DeliveryCoreReferences, UndoFolderCaptureAccountsAndRollsBackTogether) {
 TEST_F(DeliveryCoreReferences,
        UndoFolderCaptureRejectsForeignAndCallerOwnedWork) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsCString source;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
   nsMsgKey key;
@@ -9014,8 +9018,7 @@ TEST_F(DeliveryCoreReferences,
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 79));
   EXPECT_EQ(NS_ERROR_IN_PROGRESS,
@@ -9061,8 +9064,7 @@ TEST_F(DeliveryCoreReferences, StartupRefusesFutureSchemaWithoutLosingRows) {
   EXPECT_TRUE(exists);
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
   auto close = MakeScopeExit([&] {
-    if (reader)
-      EXPECT_EQ(NS_OK, reader->Close());
+    if (reader) EXPECT_EQ(NS_OK, reader->Close());
   });
   int32_t retained;
   ASSERT_EQ(NS_OK, reader->GetSchemaVersion(&retained));
@@ -9123,8 +9125,7 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_TRUE(exists);
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
   auto close = MakeScopeExit([&] {
-    if (reader)
-      EXPECT_EQ(NS_OK, reader->Close());
+    if (reader) EXPECT_EQ(NS_OK, reader->Close());
   });
   int32_t retained;
   ASSERT_EQ(NS_OK, reader->GetSchemaVersion(&retained));
@@ -9159,14 +9160,14 @@ TEST_F(DeliveryCoreReferences,
 TEST_F(DeliveryCoreReferences,
        GenericRemovalRejectsNoneAndPreservesCallerWork) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("generic-none-control"_ns, {}, key));
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 19));
   uint32_t removed = 0;
   RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
-  observer->action = [&](char kind, const CapturedMessage &before,
-                         const CapturedMessage &, Message *, bool) {
+  observer->action = [&](char kind, const CapturedMessage& before,
+                         const CapturedMessage&, Message*, bool) {
     EXPECT_EQ('R', kind);
     ++removed;
     EXPECT_EQ(key, before.id);
@@ -9185,8 +9186,7 @@ TEST_F(DeliveryCoreReferences,
   auto rollback = MakeScopeExit([&] {
     bool active = false;
     EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
-    if (active)
-      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
   });
   ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 73));
   EXPECT_EQ(NS_ERROR_INVALID_ARG, db.RemoveMessage(nsMsgKey_None));
@@ -9213,15 +9213,15 @@ TEST_F(DeliveryCoreReferences,
 
 TEST_F(DeliveryCoreReferences, WeakFolderListenerDoesNotOwnUnusedFacade) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   RefPtr<PerFolderDatabase> facade = WeakFolderDatabase(mFolderId);
   WeakPtr<PerFolderDatabase> weak(facade.get());
   facade = nullptr;
   EXPECT_FALSE(weak);
   uint32_t publications = 0;
   RefPtr<AddedObserver> ordinary =
-      new AddedObserver([&](Message *) { ++publications; });
-  MessageListener *identity = ordinary;
+      new AddedObserver([&](Message*) { ++publications; });
+  MessageListener* identity = ordinary;
   db.AddMessageListener(ordinary);
   ordinary = nullptr;
   auto remove = MakeScopeExit([&] { db.RemoveMessageListener(identity); });
@@ -9236,7 +9236,7 @@ TEST_F(DeliveryCoreReferences, WeakFolderListenerDoesNotOwnUnusedFacade) {
 
 TEST_F(DeliveryCoreReferences, WeakFolderListenerKeepsExternalNewListsScoped) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   RefPtr<PerFolderDatabase> facade = WeakFolderDatabase(mFolderId);
   uint64_t otherFolder;
   ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, "Bystander"_ns,
@@ -9261,11 +9261,11 @@ TEST_F(DeliveryCoreReferences, WeakFolderListenerKeepsExternalNewListsScoped) {
 
 TEST_F(DeliveryCoreReferences, WeakFolderPreflightPinsThroughWholeDelivery) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   RefPtr<PerFolderDatabase> facade;
   WeakPtr<PerFolderDatabase> weak;
   uint32_t first = 0, last = 0;
-  RefPtr<AddedObserver> before = new AddedObserver([&](Message *) {
+  RefPtr<AddedObserver> before = new AddedObserver([&](Message*) {
     ++first;
     facade = nullptr;
     EXPECT_TRUE(weak);
@@ -9273,7 +9273,7 @@ TEST_F(DeliveryCoreReferences, WeakFolderPreflightPinsThroughWholeDelivery) {
   db.AddMessageListener(before);
   facade = WeakFolderDatabase(mFolderId);
   weak = WeakPtr<PerFolderDatabase>(facade.get());
-  RefPtr<AddedObserver> after = new AddedObserver([&](Message *message) {
+  RefPtr<AddedObserver> after = new AddedObserver([&](Message* message) {
     ++last;
     ASSERT_TRUE(weak);
     nsTArray<nsMsgKey> keys;
@@ -9294,10 +9294,10 @@ TEST_F(DeliveryCoreReferences, WeakFolderPreflightPinsThroughWholeDelivery) {
 
 TEST_F(DeliveryCoreReferences, WeakFolderReenrollmentCancelsOldBatchToken) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   RefPtr<PerFolderDatabase> facade;
   bool reenrolled = false;
-  RefPtr<AddedObserver> before = new AddedObserver([&](Message *) {
+  RefPtr<AddedObserver> before = new AddedObserver([&](Message*) {
     if (!reenrolled) {
       reenrolled = true;
       db.RemoveMessageListener(facade);
@@ -9330,13 +9330,13 @@ TEST_F(DeliveryCoreReferences, WeakFolderReenrollmentCancelsOldBatchToken) {
 
 TEST_F(DeliveryCoreReferences, WeakFolderImportPinsBeforeFirstCallback) {
   ASSERT_EQ(NS_OK, Start());
-  auto &db = mCore->MessageDB();
+  auto& db = mCore->MessageDB();
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("import-recipient-control"_ns, {}, key));
   RefPtr<PerFolderDatabase> facade;
   WeakPtr<PerFolderDatabase> weak;
   uint32_t first = 0, last = 0;
-  RefPtr<AddedObserver> before = new AddedObserver([&](Message *) {
+  RefPtr<AddedObserver> before = new AddedObserver([&](Message*) {
     ++first;
     facade = nullptr;
     EXPECT_TRUE(weak);
@@ -9344,7 +9344,7 @@ TEST_F(DeliveryCoreReferences, WeakFolderImportPinsBeforeFirstCallback) {
   db.AddMessageListener(before);
   facade = WeakFolderDatabase(mFolderId);
   weak = WeakPtr<PerFolderDatabase>(facade.get());
-  RefPtr<AddedObserver> after = new AddedObserver([&](Message *message) {
+  RefPtr<AddedObserver> after = new AddedObserver([&](Message* message) {
     ++last;
     ASSERT_TRUE(weak);
     nsTArray<nsMsgKey> keys;

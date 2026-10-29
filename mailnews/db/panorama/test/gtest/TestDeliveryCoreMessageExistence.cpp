@@ -1152,7 +1152,6 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   ASSERT_NO_FATAL_FAILURE(CheckStoredKeys({key, other}));
 }
 
-
 TEST_F(DeliveryCoreMessageExistence, FolderKeysReturnStoredMembership) {
   nsMsgKey first, second;
   ASSERT_EQ(NS_OK, Add("folder-first@invalid"_ns, first));
@@ -1197,7 +1196,6 @@ TEST_F(DeliveryCoreMessageExistence, FolderKeysStepErrorsPreserveOutput) {
   ASSERT_EQ(NS_OK, FolderKeys(mFolder, keys));
   EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
 }
-
 
 TEST_F(DeliveryCoreMessageExistence,
        CountsUseStoredFolderMembershipAndReadFlag) {
@@ -1255,7 +1253,6 @@ TEST_F(DeliveryCoreMessageExistence, CountStepErrorsPreserveOutputs) {
   ASSERT_EQ(NS_OK, FolderCount(mFolder, true, unread));
   EXPECT_EQ(1u, unread);
 }
-
 
 }  // namespace
 }  // namespace mozilla::mailnews

@@ -3140,71 +3140,73 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxStatus(
 NS_IMETHODIMP nsImapMailFolder::ParseMsgHdrs(
     nsIImapProtocol* aProtocol, nsIImapHeaderXferInfo* aHdrXferInfo) {
   NS_ENSURE_ARG_POINTER(aHdrXferInfo);
-  int32_t numHdrs;
-  nsCOMPtr<nsIImapHeaderInfo> headerInfo;
-  nsCOMPtr<nsIImapUrl> aImapUrl;
-  nsImapAction imapAction = nsIImapUrl::nsImapTest;  // unused value.
-  if (!mDatabase) GetDatabase();
+  MOZ_TRY(GetDatabase());
   NS_ENSURE_STATE(mDatabase);
-
-  nsresult rv = aHdrXferInfo->GetNumHeaders(&numHdrs);
-  if (aProtocol) {
-    (void)aProtocol->GetRunningImapURL(getter_AddRefs(aImapUrl));
-    if (aImapUrl) aImapUrl->GetImapAction(&imapAction);
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(info)));
+    NS_ENSURE_STATE(info);
+    uint32_t epoch;
+    MOZ_TRY(info->GetImapUidValidity(&epoch));
+    NS_ENSURE_TRUE(epoch && epoch == m_uidValidity, NS_ERROR_NOT_AVAILABLE);
   }
-  for (uint32_t i = 0; NS_SUCCEEDED(rv) && (int32_t)i < numHdrs; i++) {
-    rv = aHdrXferInfo->GetHeader(i, getter_AddRefs(headerInfo));
-    NS_ENSURE_SUCCESS(rv, rv);
-    if (!headerInfo) break;
+#endif
+  int32_t numHdrs;
+  MOZ_TRY(aHdrXferInfo->GetNumHeaders(&numHdrs));
+  nsCOMPtr<nsIImapUrl> imapUrl;
+  nsImapAction imapAction = nsIImapUrl::nsImapTest;
+  if (aProtocol) {
+    MOZ_TRY(aProtocol->GetRunningImapURL(getter_AddRefs(imapUrl)));
+    if (imapUrl) MOZ_TRY(imapUrl->GetImapAction(&imapAction));
+  }
+  for (int32_t i = 0; i < numHdrs; i++) {
+    nsCOMPtr<nsIImapHeaderInfo> headerInfo;
+    MOZ_TRY(aHdrXferInfo->GetHeader(i, getter_AddRefs(headerInfo)));
+    NS_ENSURE_STATE(headerInfo);
     int32_t msgSize;
-    nsCString msgHdrs;
-    headerInfo->GetMsgSize(&msgSize);
-
+    MOZ_TRY(headerInfo->GetMsgSize(&msgSize));
     ImapUid uid;
-    headerInfo->GetMsgUid(&uid);
-    if (uid == 0) {
-      continue;
-    }
+    MOZ_TRY(headerInfo->GetMsgUid(&uid));
+    NS_ENSURE_TRUE(uid, NS_ERROR_INVALID_ARG);
     auto keyLookup = MsgKeyFromUid(mDatabase, uid);
-    if (keyLookup.isErr()) {
-      continue;
-    }
-    nsMsgKey msgKey = keyLookup.unwrap();
+    nsCString msgHdrs;
+    MOZ_TRY(headerInfo->GetMsgHdrs(msgHdrs));
     if (imapAction == nsIImapUrl::nsImapMsgPreview) {
+      nsMsgKey key = MOZ_TRY(std::move(keyLookup));
       nsCOMPtr<nsIMsgDBHdr> msgHdr;
-      headerInfo->GetMsgHdrs(msgHdrs);
-      // create an input stream based on the hdr string.
+      MOZ_TRY(GetMessageHeader(key, getter_AddRefs(msgHdr)));
+      NS_ENSURE_STATE(msgHdr);
+      nsresult rv;
       nsCOMPtr<nsIStringInputStream> inputStream =
           do_CreateInstance("@mozilla.org/io/string-input-stream;1", &rv);
-      NS_ENSURE_SUCCESS(rv, rv);
-      inputStream->ShareData(msgHdrs.get(), msgHdrs.Length());
-      GetMessageHeader(msgKey, getter_AddRefs(msgHdr));
-      if (msgHdr) {
-        GetMsgPreviewTextFromStream(msgHdr, inputStream);
+      MOZ_TRY(rv);
+      MOZ_TRY(inputStream->ShareData(msgHdrs.get(), msgHdrs.Length()));
+      MOZ_TRY(GetMsgPreviewTextFromStream(msgHdr, inputStream));
+      continue;
+    }
+    if (keyLookup.isOk()) {
+      bool containsKey;
+      MOZ_TRY(mDatabase->ContainsKey(keyLookup.unwrap(), &containsKey));
+      if (containsKey) {
+        NS_ERROR("downloading hdrs for hdr we already have");
+        continue;
       }
-      continue;
+    } else if (keyLookup.unwrapErr() != NS_ERROR_NOT_AVAILABLE) {
+      return keyLookup.unwrapErr();
     }
-    bool containsKey;
-    if (mDatabase &&
-        NS_SUCCEEDED(mDatabase->ContainsKey(msgKey, &containsKey)) &&
-        containsKey) {
-      NS_ERROR("downloading hdrs for hdr we already have");
-      continue;
-    }
-    nsresult rv = SetupHeaderParseStream(msgSize, EmptyCString(), nullptr);
-    NS_ENSURE_SUCCESS(rv, rv);
-    headerInfo->GetMsgHdrs(msgHdrs);  // The raw header block.
-    rv = ParseAdoptedHeaderLine(msgHdrs.get(), uid);
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = NormalEndHeaderParseStream(aProtocol, aImapUrl);
+    // A new server UID has no local key until its complete header is published.
+    MOZ_TRY(SetupHeaderParseStream(msgSize, EmptyCString(), nullptr));
+    MOZ_TRY(ParseAdoptedHeaderLine(msgHdrs.get(), uid));
+    MOZ_TRY(NormalEndHeaderParseStream(aProtocol, imapUrl));
   }
-  return rv;
+  return NS_OK;
 }
 
 // Helper for ParseMsgHdrs().
 nsresult nsImapMailFolder::SetupHeaderParseStream(
     uint32_t aSize, const nsACString& content_type, nsIMailboxSpec* boxSpec) {
-  if (!mDatabase) GetDatabase();
+  MOZ_TRY(GetDatabase());
   m_nextMessageByteLength = aSize;
   if (!m_msgParser) {
     nsresult rv;
@@ -3214,8 +3216,8 @@ nsresult nsImapMailFolder::SetupHeaderParseStream(
   } else
     m_msgParser->Clear();
 
-  m_msgParser->SetMailDB(mDatabase);
-  if (mBackupDatabase) m_msgParser->SetBackupMailDB(mBackupDatabase);
+  MOZ_TRY(m_msgParser->SetMailDB(mDatabase));
+  if (mBackupDatabase) MOZ_TRY(m_msgParser->SetBackupMailDB(mBackupDatabase));
   return m_msgParser->SetState(nsIMsgParseMailMsgState::ParseHeadersState);
 }
 
@@ -3226,21 +3228,24 @@ nsresult nsImapMailFolder::ParseAdoptedHeaderLine(const char* aMessageLine,
   // but they never contain partial lines
   const char* str = aMessageLine;
   m_curMsgUid = uid;
-  m_msgParser->SetMsgUid(uid);
-  // m_envelope_pos, for local folders,
-  // is the msg key. Setting this will set the msg key for the new header.
+  ImapUid parserKey = uid;
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) parserKey = 0;
+#endif
+  MOZ_TRY(m_msgParser->SetMsgUid(parserKey));
 
   int32_t len = strlen(str);
   char* currentEOL = PL_strstr(str, MSG_LINEBREAK);
   const char* currentLine = str;
   while (currentLine < (str + len)) {
     if (currentEOL) {
-      m_msgParser->ParseAFolderLine(
-          currentLine, (currentEOL + MSG_LINEBREAK_LEN) - currentLine);
+      MOZ_TRY(m_msgParser->ParseAFolderLine(
+          currentLine, (currentEOL + MSG_LINEBREAK_LEN) - currentLine));
       currentLine = currentEOL + MSG_LINEBREAK_LEN;
       currentEOL = PL_strstr(currentLine, MSG_LINEBREAK);
     } else {
-      m_msgParser->ParseAFolderLine(currentLine, PL_strlen(currentLine));
+      MOZ_TRY(
+          m_msgParser->ParseAFolderLine(currentLine, PL_strlen(currentLine)));
       currentLine = str + len + 1;
     }
   }
@@ -3250,35 +3255,60 @@ nsresult nsImapMailFolder::ParseAdoptedHeaderLine(const char* aMessageLine,
 // Adds an IMAP header to the database and notifies listeners. We call this
 // both for newly parsed headers and when restoring a header whose destructive
 // filter action was dropped. It does nothing if the header is already present.
-nsresult nsImapMailFolder::AddNewImapHeaderToDB(nsIMsgDBHdr* aHeader) {
-  nsresult rv = GetDatabase();
-  NS_ENSURE_SUCCESS(rv, rv);
+nsresult nsImapMailFolder::AddNewImapHeaderToDB(nsIMsgDBHdr* header) {
+  nsCOMPtr<nsIMsgDBHdr> live = header;
+  return AddNewImapHeaderToDB(live, m_uidValidity, m_curMsgUid);
+}
 
+nsresult nsImapMailFolder::AddNewImapHeaderToDB(nsCOMPtr<nsIMsgDBHdr>& header,
+                                                uint32_t expectedEpoch,
+                                                ImapUid expectedUid) {
+  MOZ_TRY(GetDatabase());
+  NS_ENSURE_STATE(header);
   nsMsgKey key;
-  rv = aHeader->GetMessageKey(&key);
-  NS_ENSURE_SUCCESS(rv, rv);
-  bool containsKey = false;
-  if (NS_SUCCEEDED(mDatabase->ContainsKey(key, &containsKey)) && containsKey) {
-    return NS_OK;
+  MOZ_TRY(header->GetMessageKey(&key));
+  if (key != nsMsgKey_None) {
+    bool contains;
+    MOZ_TRY(mDatabase->ContainsKey(key, &contains));
+    if (contains) return NS_OK;
   }
-
+  nsCString messageId;
+  MOZ_TRY(header->GetMessageId(messageId));
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    uint32_t uid, epoch;
+    MOZ_TRY(header->GetUint32Property("uidOnServer", &uid));
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(info)));
+    NS_ENSURE_STATE(info);
+    MOZ_TRY(info->GetImapUidValidity(&epoch));
+    NS_ENSURE_TRUE(uid && uid == expectedUid && epoch && epoch == expectedEpoch,
+                   NS_ERROR_NOT_AVAILABLE);
+    // Pending destinations need their saved physical association, not
+    // Message-ID.
+    NS_ENSURE_FALSE(m_pseudoHdrs.Contains(messageId), NS_ERROR_NOT_AVAILABLE);
+    auto existing = MsgKeyFromUid(mDatabase, uid);
+    if (existing.isOk()) return NS_ERROR_ALREADY_INITIALIZED;
+    if (existing.unwrapErr() != NS_ERROR_NOT_AVAILABLE)
+      return existing.unwrapErr();
+    nsCOMPtr<nsIMsgDBHdr> draft = header;
+    MOZ_TRY(mDatabase->AttachHdr(draft, true, getter_AddRefs(header)));
+  } else
+#endif
+  {
+    MOZ_TRY(mDatabase->AddNewHdrToDB(header, true));
+  }
+  MOZ_TRY(header->GetMessageKey(&key));
+  NS_ENSURE_TRUE(key != nsMsgKey_None, NS_ERROR_UNEXPECTED);
   nsCOMPtr<nsIMsgFolderNotificationService> notifier =
       mozilla::components::FolderNotification::Service();
-  // Check if this header corresponds to a pseudo header from a
-  // pseudo-offline move. If so, notify listeners that its key changed.
-  nsCString messageId;
-  aHeader->GetMessageId(messageId);
   nsMsgKey pseudoKey = m_pseudoHdrs.MaybeGet(messageId).valueOr(nsMsgKey_None);
   if (pseudoKey != nsMsgKey_None) {
-    notifier->NotifyMsgKeyChanged(pseudoKey, aHeader);
+    notifier->NotifyMsgKeyChanged(pseudoKey, header);
     m_pseudoHdrs.Remove(messageId);
   }
-
-  rv = mDatabase->AddNewHdrToDB(aHeader, true);
-  NS_ENSURE_SUCCESS(rv, rv);
-  notifier->NotifyMsgAdded(aHeader);
-  // Mark the header as not yet reported classified.
   OrProcessingFlags(key, nsMsgProcessingFlags::NotReportedClassified);
+  notifier->NotifyMsgAdded(header);
   return NS_OK;
 }
 
@@ -3289,12 +3319,18 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
   nsresult rv;
   NS_ENSURE_TRUE(m_msgParser, NS_ERROR_NULL_POINTER);
 
-  auto uidClear = mozilla::MakeScopeExit([&] { m_curMsgUid = 0; });
+  const ImapUid uid = m_curMsgUid;
+  const uint32_t expectedEpoch = m_uidValidity;
+  auto parseCleanup = mozilla::MakeScopeExit([&] {
+    m_curMsgUid = 0;
+    m_msgParser->Clear();
+    m_msgParser->SetMailDB(nullptr);
+  });
 
   nsMailboxParseState parseState;
-  m_msgParser->GetState(&parseState);
+  MOZ_TRY(m_msgParser->GetState(&parseState));
   if (parseState == nsIMsgParseMailMsgState::ParseHeadersState)
-    m_msgParser->ParseAFolderLine(CRLF, 2);
+    MOZ_TRY(m_msgParser->ParseAFolderLine(CRLF, 2));
   rv = m_msgParser->GetNewMsgHdr(getter_AddRefs(newMsgHdr));
   NS_ENSURE_SUCCESS(rv, rv);
 
@@ -3317,24 +3353,55 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
   rv = imapServer->GetIsGMailServer(&m_isGmailServer);
   NS_ENSURE_SUCCESS(rv, rv);
 
-  newMsgHdr->SetMessageKey(m_curMsgUid);
-  TweakHeaderFlags(aProtocol, newMsgHdr);
+  NS_ENSURE_STATE(newMsgHdr);
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(newMsgHdr->SetUint32Property("uidOnServer", uid));
+    // Body-filter staging is separate from complete header-only publication.
+    NS_ENSURE_FALSE(m_filterListRequiresBody, NS_ERROR_NOT_IMPLEMENTED);
+  } else
+#endif
+  {
+    MOZ_TRY(newMsgHdr->SetMessageKey(uid));
+  }
+  MOZ_TRY(TweakHeaderFlags(aProtocol, newMsgHdr));
+  if (m_isGmailServer) {
+    nsCOMPtr<nsIImapFlagAndUidState> flagState;
+    MOZ_TRY(aProtocol->GetFlagAndUidState(getter_AddRefs(flagState)));
+    NS_ENSURE_STATE(flagState);
+    nsCString msgIDValue;
+    nsCString threadIDValue;
+    nsCString labelsValue;
+    MOZ_TRY(flagState->GetCustomAttribute(m_curMsgUid, "X-GM-MSGID"_ns,
+                                          msgIDValue));
+    MOZ_TRY(flagState->GetCustomAttribute(m_curMsgUid, "X-GM-THRID"_ns,
+                                          threadIDValue));
+    MOZ_TRY(flagState->GetCustomAttribute(m_curMsgUid, "X-GM-LABELS"_ns,
+                                          labelsValue));
+    MOZ_TRY(newMsgHdr->SetStringProperty("X-GM-MSGID", msgIDValue));
+    MOZ_TRY(newMsgHdr->SetStringProperty("X-GM-THRID", threadIDValue));
+    MOZ_TRY(newMsgHdr->SetStringProperty("X-GM-LABELS", labelsValue));
+  }
+
   uint32_t messageSize;
-  if (NS_SUCCEEDED(newMsgHdr->GetMessageSize(&messageSize)))
-    mFolderSize += messageSize;
+  MOZ_TRY(newMsgHdr->GetMessageSize(&messageSize));
   m_msgMovedByFilter = false;
+  m_filterIdentityRefused = false;
 
   ImapUid highestUid = 0;
+  bool raisesHighWater = false;
   nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
-  if (mDatabase) mDatabase->GetDBFolderInfo(getter_AddRefs(dbFolderInfo));
+  if (mDatabase)
+    MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(dbFolderInfo)));
   if (dbFolderInfo) {
-    dbFolderInfo->GetUint32Property(kHighestRecordedUIDPropertyName, 0,
-                                    &highestUid);
+    MOZ_TRY(dbFolderInfo->GetUint32Property(kHighestRecordedUIDPropertyName, 0,
+                                            &highestUid));
     MOZ_LOG(IMAP_CS, mozilla::LogLevel::Debug,
             ("NormalEndHeaderParseStream(): got stored highest UID=%" PRIu32
              " for folder=%s",
              highestUid, m_onlineFolderName.get()));
-    if (m_curMsgUid > highestUid) {
+    if (uid > highestUid) {
+      raisesHighWater = true;
       // Most imap servers fetch UIDs in increasing/ascending order so only
       // this "if" branch will occur. Servers that fetch in descending order
       // (e.g., Yahoo) will take this branch the on the first header fetch and
@@ -3345,8 +3412,7 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
               ("NormalEndHeaderParseStream(): store new highest UID=%" PRIu32
                " for folder=%s",
                m_curMsgUid, m_onlineFolderName.get()));
-      dbFolderInfo->SetUint32Property(kHighestRecordedUIDPropertyName,
-                                      m_curMsgUid);
+
     } else {
       // Some imap servers fetch UIDs in descending order, e.g., Yahoo.
       // This only occurs if more than one header for new messages are fetched
@@ -3394,6 +3460,11 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
         bool isDup;
         server->IsNewHdrDuplicate(newMsgHdr, &isDup);
         if (isDup) {
+#ifdef MOZ_PANORAMA
+          // These actions need a published physical source and epoch guard.
+          NS_ENSURE_FALSE(mail_panorama_enabled_AtStartup(),
+                          NS_ERROR_NOT_AVAILABLE);
+#endif
           // we want to do something similar to applying filter hits.
           // if a dup is marked read, it shouldn't trigger biff.
           // Same for deleting it or moving it to trash.
@@ -3438,9 +3509,20 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
           MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
                   ("(Imap) ApplyFilterToHdr from "
                    "nsImapMailFolder::NormalEndHeaderParseStream()"));
-          m_filterList->ApplyFiltersToHdr(
+          nsresult filterRv = m_filterList->ApplyFiltersToHdr(
               nsMsgFilterType::InboxRule, newMsgHdr, this, mDatabase,
               nsDependentCSubstring(headers, headersSize), this, msgWindow);
+          NS_ENSURE_TRUE(!m_filterIdentityRefused, NS_ERROR_NOT_AVAILABLE);
+#ifdef MOZ_PANORAMA
+          if (mail_panorama_enabled_AtStartup()) {
+            NS_ENSURE_SUCCESS(filterRv, filterRv);
+          }
+#endif
+          if (NS_FAILED(filterRv)) {
+            MOZ_LOG(FILTERLOGMODULE, LogLevel::Error,
+                    ("(Imap) Header filter action failed: %" PRIx32,
+                     static_cast<uint32_t>(filterRv)));
+          }
           NotifyFolderEvent(kFiltersApplied);
         }
       }
@@ -3448,25 +3530,30 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
   }
   // here we need to tweak flags from uid state..
   if (mDatabase && (!m_msgMovedByFilter || ShowDeletedMessages())) {
-    (void)AddNewImapHeaderToDB(newMsgHdr);
+    MOZ_TRY(AddNewImapHeaderToDB(newMsgHdr, expectedEpoch, uid));
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      nsCString origin, score;
+      MOZ_TRY(newMsgHdr->GetStringProperty("junkscoreorigin", origin));
+      MOZ_TRY(newMsgHdr->GetStringProperty("junkscore", score));
+      if (origin.EqualsLiteral("filter") &&
+          (score.EqualsLiteral("0") || score.EqualsLiteral("100"))) {
+        nsMsgKey key;
+        MOZ_TRY(newMsgHdr->GetMessageKey(&key));
+        MOZ_TRY(GetMoveCoalescer());
+        auto* bucket = m_moveCoalescer->GetKeyBucket(
+            score.EqualsLiteral("100") ? 0 : 1);
+        if (!bucket->Contains(key)) bucket->AppendElement(key);
+      }
+    }
+#endif
   }
 
-  if (m_isGmailServer) {
-    nsCOMPtr<nsIImapFlagAndUidState> flagState;
-    aProtocol->GetFlagAndUidState(getter_AddRefs(flagState));
-    nsCString msgIDValue;
-    nsCString threadIDValue;
-    nsCString labelsValue;
-    flagState->GetCustomAttribute(m_curMsgUid, "X-GM-MSGID"_ns, msgIDValue);
-    flagState->GetCustomAttribute(m_curMsgUid, "X-GM-THRID"_ns, threadIDValue);
-    flagState->GetCustomAttribute(m_curMsgUid, "X-GM-LABELS"_ns, labelsValue);
-    newMsgHdr->SetStringProperty("X-GM-MSGID", msgIDValue);
-    newMsgHdr->SetStringProperty("X-GM-THRID", threadIDValue);
-    newMsgHdr->SetStringProperty("X-GM-LABELS", labelsValue);
+  mFolderSize += messageSize;
+  if (dbFolderInfo && raisesHighWater) {
+    MOZ_TRY(
+        dbFolderInfo->SetUint32Property(kHighestRecordedUIDPropertyName, uid));
   }
-
-  m_msgParser->Clear();  // clear out parser, because it holds onto a msg hdr.
-  m_msgParser->SetMailDB(nullptr);  // tell it to let go of the db too.
   // I don't think we want to do this - it does bad things like set the size
   // incorrectly.
   //    m_msgParser->FinishHeader();
@@ -3717,6 +3804,17 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
                ", action type = %i",
                actionIndex, actionType));
       if (loggingEnabled) (void)filter->LogRuleHit(filterAction, msgHdr);
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup() && msgKey == nsMsgKey_None &&
+          actionType != nsMsgFilterAction::ChangePriority &&
+          actionType != nsMsgFilterAction::JunkScore &&
+          actionType != nsMsgFilterAction::StopExecution &&
+          actionType != nsMsgFilterAction::Custom) {
+        m_filterIdentityRefused = true;
+        *applyMore = false;
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+#endif
 
       nsCString actionTargetFolderUri;
       if (actionType == nsMsgFilterAction::MoveToFolder ||
@@ -3904,8 +4002,7 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
         case nsMsgFilterAction::ChangePriority: {
           nsMsgPriorityValue filterPriority;  // a int32_t
           filterAction->GetPriority(&filterPriority);
-          rv = mDatabase->SetUint32PropertyByHdr(
-              msgHdr, "priority", static_cast<uint32_t>(filterPriority));
+          rv = msgHdr->SetPriority(filterPriority);
         } break;
         case nsMsgFilterAction::AddTag: {
           nsCString keyword;
@@ -3916,7 +4013,18 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
           nsAutoCString junkScoreStr;
           int32_t junkScore;
           filterAction->GetJunkScore(&junkScore);
-          SetJunkScoreForMessage(msgHdr, junkScore, "filter"_ns, -1);
+#ifdef MOZ_PANORAMA
+          if (mail_panorama_enabled_AtStartup() && msgKey == nsMsgKey_None) {
+            junkScoreStr.AppendInt(junkScore);
+            rv = msgHdr->SetStringProperty("junkscore", junkScoreStr);
+            if (NS_SUCCEEDED(rv))
+              rv = msgHdr->SetStringProperty("junkscoreorigin", "filter"_ns);
+          } else
+#endif
+          {
+            rv = SetJunkScoreForMessage(msgHdr, junkScore, "filter"_ns, -1);
+          }
+          if (NS_FAILED(rv)) break;
 
           // If score is available, set up to store junk status on server.
           if (junkScore == nsIJunkMailPlugin::IS_SPAM_SCORE ||
@@ -3924,10 +4032,15 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
             nsTArray<nsMsgKey>* keysToClassify = m_moveCoalescer->GetKeyBucket(
                 (junkScore == nsIJunkMailPlugin::IS_SPAM_SCORE) ? 0 : 1);
             NS_ASSERTION(keysToClassify, "error getting key bucket");
-            if (keysToClassify) keysToClassify->AppendElement(msgKey);
+            if (keysToClassify && msgKey != nsMsgKey_None)
+              keysToClassify->AppendElement(msgKey);
             if (msgIsNew && junkScore == nsIJunkMailPlugin::IS_SPAM_SCORE) {
               msgIsNew = false;
-              mDatabase->MarkNotNew(msgKey, nullptr);
+              if (msgKey == nsMsgKey_None) {
+                rv = msgHdr->AndFlags(~nsMsgMessageFlags::New, &msgFlags);
+              } else {
+                rv = mDatabase->MarkNotNew(msgKey, nullptr);
+              }
               // nsMsgDBFolder::SendFlagNotifications by the call to
               // SetBiffState(nsMsgBiffState_NoMail) will reset numNewMessages
               // only if the message is also read and database notifications
@@ -4590,87 +4703,47 @@ void nsImapMailFolder::PrepareToAddHeadersToMailDB(nsIImapProtocol* aProtocol) {
   aProtocol->NotifyBodysToDownload({});
 }
 
-void nsImapMailFolder::TweakHeaderFlags(nsIImapProtocol* aProtocol,
-                                        nsIMsgDBHdr* tweakMe) {
-  if (mDatabase && aProtocol && tweakMe) {
-    ImapUid uid = m_curMsgUid;
-
-    tweakMe->SetMessageSize(m_nextMessageByteLength);
-
-    bool foundIt = false;
-
-    nsCOMPtr<nsIImapFlagAndUidState> flagState;
-    nsresult rv = aProtocol->GetFlagAndUidState(getter_AddRefs(flagState));
-    NS_ENSURE_SUCCESS_VOID(rv);
-    rv = flagState->HasMessage(uid, &foundIt);
-
-    if (NS_SUCCEEDED(rv) && foundIt) {
-      imapMessageFlagsType imap_flags;
-      nsCString customFlags;
-      flagState->GetMessageFlagsByUid(uid, &imap_flags);
-      if (imap_flags & kImapMsgCustomKeywordFlag) {
-        flagState->GetCustomFlags(uid, getter_Copies(customFlags));
-      }
-
-      // make a mask and clear these message flags
-      uint32_t mask = nsMsgMessageFlags::Read | nsMsgMessageFlags::Replied |
-                      nsMsgMessageFlags::Marked |
-                      nsMsgMessageFlags::IMAPDeleted |
-                      nsMsgMessageFlags::Labels;
-      uint32_t dbHdrFlags;
-
-      tweakMe->GetFlags(&dbHdrFlags);
-      tweakMe->AndFlags(~mask, &dbHdrFlags);
-
-      // set the new value for these flags
-      uint32_t newFlags = 0;
-      if (imap_flags & kImapMsgSeenFlag)
-        newFlags |= nsMsgMessageFlags::Read;
-      else  // if (imap_flags & kImapMsgRecentFlag)
-        newFlags |= nsMsgMessageFlags::New;
-
-      // Okay here is the MDN needed logic (if DNT header seen):
-      /* if server support user defined flag:
-         XXX TODO: Fix badly formatted comment which doesn't reflect the code.
-                    MDNSent flag set => clear kMDNNeeded flag
-                    MDNSent flag not set => do nothing, leave kMDNNeeded on
-                    else if
-                    not nsMsgMessageFlags::New => clear kMDNNeeded flag
-                   nsMsgMessageFlags::New => do nothing, leave kMDNNeeded on
-               */
-      uint16_t userFlags;
-      rv = aProtocol->GetSupportedUserFlags(&userFlags);
-      if (NS_SUCCEEDED(rv) && (userFlags & (kImapMsgSupportUserFlag |
-                                            kImapMsgSupportMDNSentFlag))) {
-        if (imap_flags & kImapMsgMDNSentFlag) {
-          newFlags |= nsMsgMessageFlags::MDNReportSent;
-          if (dbHdrFlags & nsMsgMessageFlags::MDNReportNeeded)
-            tweakMe->AndFlags(~nsMsgMessageFlags::MDNReportNeeded, &dbHdrFlags);
-        }
-      }
-
-      if (imap_flags & kImapMsgAnsweredFlag) {
-        newFlags |= nsMsgMessageFlags::Replied;
-      }
-      if (imap_flags & kImapMsgFlaggedFlag) {
-        newFlags |= nsMsgMessageFlags::Marked;
-      }
-      if (imap_flags & kImapMsgDeletedFlag) {
-        newFlags |= nsMsgMessageFlags::IMAPDeleted;
-      }
-      if (imap_flags & kImapMsgForwardedFlag) {
-        newFlags |= nsMsgMessageFlags::Forwarded;
-      }
-      if (newFlags) {
-        tweakMe->OrFlags(newFlags, &dbHdrFlags);
-      }
-      if (!customFlags.IsEmpty()) {
-        nsMsgKey msgKey;
-        tweakMe->GetMessageKey(&msgKey);
-        (void)HandleCustomFlags(msgKey, tweakMe, userFlags, customFlags);
-      }
-    }
+nsresult nsImapMailFolder::TweakHeaderFlags(nsIImapProtocol* protocol,
+                                            nsIMsgDBHdr* header) {
+  MOZ_TRY(header->SetMessageSize(m_nextMessageByteLength));
+  if (!protocol) return NS_OK;
+  nsCOMPtr<nsIImapFlagAndUidState> state;
+  MOZ_TRY(protocol->GetFlagAndUidState(getter_AddRefs(state)));
+  NS_ENSURE_STATE(state);
+  bool found;
+  MOZ_TRY(state->HasMessage(m_curMsgUid, &found));
+  if (!found) return NS_ERROR_NOT_AVAILABLE;
+  imapMessageFlagsType serverFlags;
+  MOZ_TRY(state->GetMessageFlagsByUid(m_curMsgUid, &serverFlags));
+  uint32_t flags;
+  MOZ_TRY(header->GetFlags(&flags));
+  flags &= ~(nsMsgMessageFlags::Read | nsMsgMessageFlags::Replied |
+             nsMsgMessageFlags::Marked | nsMsgMessageFlags::IMAPDeleted |
+             nsMsgMessageFlags::Labels);
+  flags |= (serverFlags & kImapMsgSeenFlag) ? nsMsgMessageFlags::Read
+                                            : nsMsgMessageFlags::New;
+  uint16_t userFlags;
+  MOZ_TRY(protocol->GetSupportedUserFlags(&userFlags));
+  if ((userFlags & (kImapMsgSupportUserFlag | kImapMsgSupportMDNSentFlag)) &&
+      (serverFlags & kImapMsgMDNSentFlag)) {
+    flags |= nsMsgMessageFlags::MDNReportSent;
+    flags &= ~nsMsgMessageFlags::MDNReportNeeded;
   }
+  if (serverFlags & kImapMsgAnsweredFlag) flags |= nsMsgMessageFlags::Replied;
+  if (serverFlags & kImapMsgFlaggedFlag) flags |= nsMsgMessageFlags::Marked;
+  if (serverFlags & kImapMsgDeletedFlag)
+    flags |= nsMsgMessageFlags::IMAPDeleted;
+  if (serverFlags & kImapMsgForwardedFlag)
+    flags |= nsMsgMessageFlags::Forwarded;
+  MOZ_TRY(header->SetFlags(flags));
+  if (serverFlags & kImapMsgCustomKeywordFlag) {
+    nsCString keywords;
+    MOZ_TRY(state->GetCustomFlags(m_curMsgUid, getter_Copies(keywords)));
+    nsMsgKey key;
+    MOZ_TRY(header->GetMessageKey(&key));
+    MOZ_TRY(HandleCustomFlags(key, header, userFlags, keywords));
+  }
+  return NS_OK;
 }
 
 // nsIImapMessageSink.setupMsgWriteStream() implementation.
@@ -4968,28 +5041,31 @@ nsresult nsImapMailFolder::HandleCustomFlags(nsMsgKey msgKey,
       CaseInsensitiveFindInReadable("NotJunk"_ns, keywords)) {
     nsAutoCString msgJunkScore;
     msgJunkScore.AppendInt(nsIJunkMailPlugin::IS_HAM_SCORE);
-    mDatabase->SetStringProperty(msgKey, "junkscore", msgJunkScore);
+    MOZ_TRY(
+        mDatabase->SetStringPropertyByHdr(dbHdr, "junkscore", msgJunkScore));
   } else if (CaseInsensitiveFindInReadable("Junk"_ns, keywords)) {
     uint32_t newFlags;
-    dbHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags);
+    MOZ_TRY(dbHdr->AndFlags(~nsMsgMessageFlags::New, &newFlags));
     nsAutoCString msgJunkScore;
     msgJunkScore.AppendInt(nsIJunkMailPlugin::IS_SPAM_SCORE);
-    mDatabase->SetStringProperty(msgKey, "junkscore", msgJunkScore);
+    MOZ_TRY(
+        mDatabase->SetStringPropertyByHdr(dbHdr, "junkscore", msgJunkScore));
   } else
     messageClassified = false;
   if (messageClassified) {
     // only set the junkscore origin if it wasn't set before.
     nsCString existingProperty;
-    dbHdr->GetStringProperty("junkscoreorigin", existingProperty);
+    MOZ_TRY(dbHdr->GetStringProperty("junkscoreorigin", existingProperty));
     if (existingProperty.IsEmpty())
-      dbHdr->SetStringProperty("junkscoreorigin", "imapflag"_ns);
+      MOZ_TRY(mDatabase->SetStringPropertyByHdr(dbHdr, "junkscoreorigin",
+                                                "imapflag"_ns));
   }
 
   if (!(userFlags & kImapMsgSupportUserFlag)) {
     nsCString localKeywords;
     nsCString prevKeywords;
-    dbHdr->GetStringProperty("keywords", localKeywords);
-    dbHdr->GetStringProperty("prevkeywords", prevKeywords);
+    MOZ_TRY(dbHdr->GetStringProperty("keywords", localKeywords));
+    MOZ_TRY(dbHdr->GetStringProperty("prevkeywords", prevKeywords));
     // localKeywords: tags currently stored in database for the message.
     // keywords: tags stored in server and obtained when flags for the message
     //           were last fetched. (Parameter of this function.)
@@ -5001,7 +5077,7 @@ nsresult nsImapMailFolder::HandleCustomFlags(nsMsgKey msgKey,
     // clang-format on
 
     // Store keywords to detect changes on next call of this function.
-    dbHdr->SetStringProperty("prevkeywords", keywords);
+    MOZ_TRY(mDatabase->SetStringPropertyByHdr(dbHdr, "prevkeywords", keywords));
 
     // Parse the space separated strings into arrays.
     nsTArray<nsCString> localKeywordArray;

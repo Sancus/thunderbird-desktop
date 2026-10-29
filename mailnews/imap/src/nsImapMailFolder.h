@@ -387,7 +387,7 @@ class nsImapMailFolder : public nsMsgDBFolder,
                         nsIImapFlagAndUidState* flagState, uint32_t boxFlags);
   nsresult HandleUidInvalidation(ImapUid newUidValidity);
   void PrepareToAddHeadersToMailDB(nsIImapProtocol* aProtocol);
-  void TweakHeaderFlags(nsIImapProtocol* aProtocol, nsIMsgDBHdr* tweakMe);
+  nsresult TweakHeaderFlags(nsIImapProtocol* aProtocol, nsIMsgDBHdr* tweakMe);
 
   nsresult SyncFlags(nsIImapFlagAndUidState* flagState,
                      const nsTHashSet<ImapUid>& removedSourceUids);
@@ -457,6 +457,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
   nsresult GetMoveCoalescer();
   nsresult PlaybackCoalescedOperations();
   nsresult AddNewImapHeaderToDB(nsIMsgDBHdr* aHeader);
+  nsresult AddNewImapHeaderToDB(nsCOMPtr<nsIMsgDBHdr>& header,
+                                uint32_t expectedEpoch, ImapUid expectedUid);
   void FilterCopyStarted(nsIMsgDBHdr* aHeader);
   void FilterCopyCompleted(nsMsgKey aKey, nsresult aStatus);
   bool HasFilterCopy(nsMsgKey aKey) const;
@@ -494,6 +496,7 @@ class nsImapMailFolder : public nsMsgDBFolder,
   // used with filter plugins to know when we've finished classifying and can
   // playback moves
   bool m_msgMovedByFilter;
+  bool m_filterIdentityRefused = false;
   RefPtr<nsImapMoveCoalescer>
       m_moveCoalescer;  // strictly owned by the nsImapMailFolder
   // Filter copies may stream source bodies asynchronously. We keep destructive

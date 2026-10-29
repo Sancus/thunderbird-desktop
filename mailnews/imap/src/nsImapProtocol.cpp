@@ -4164,7 +4164,11 @@ void nsImapProtocol::NormalMessageEndDownload() {
     int32_t numHdrsCached;
     m_hdrDownloadCache->GetNumHeaders(&numHdrsCached);
     if (numHdrsCached == kNumHdrsToXfer) {
-      m_imapMailFolderSink->ParseMsgHdrs(this, m_hdrDownloadCache);
+      if (NS_SUCCEEDED(m_mailboxUpdateResult)) {
+        nsresult rv =
+            m_imapMailFolderSink->ParseMsgHdrs(this, m_hdrDownloadCache);
+        if (NS_FAILED(rv)) m_mailboxUpdateResult = rv;
+      }
       m_hdrDownloadCache->ResetAll();
     }
   }
@@ -4508,6 +4512,7 @@ void nsImapProtocol::ProcessMailboxUpdate(bool handlePossibleUndo) {
       FolderHeaderDump(msgIdList);
     }
     HeaderFetchCompleted();
+    if (NS_FAILED(m_mailboxUpdateResult)) return;
     // this might be bogus, how are we going to do pane notification and stuff
     // when we fetch bodies without headers!
   }
@@ -4624,15 +4629,21 @@ void nsImapProtocol::FolderMsgDumpLoop(mozilla::Span<const ImapUid> msgUids,
     FetchMessage(idString, fields);
     msgsDownloaded += msgsToDownload;
     msgCountLeft -= msgsToDownload;
-  } while (msgCountLeft > 0 && !DeathSignalReceived());
+  } while (msgCountLeft > 0 && !DeathSignalReceived() &&
+           NS_SUCCEEDED(m_mailboxUpdateResult));
 }
 
 void nsImapProtocol::HeaderFetchCompleted() {
-  if (m_imapMailFolderSink)
-    m_imapMailFolderSink->ParseMsgHdrs(this, m_hdrDownloadCache);
+  if (m_imapMailFolderSink && NS_SUCCEEDED(m_mailboxUpdateResult)) {
+    nsresult rv = m_imapMailFolderSink->ParseMsgHdrs(this, m_hdrDownloadCache);
+    if (NS_FAILED(rv)) m_mailboxUpdateResult = rv;
+  }
   m_hdrDownloadCache->ReleaseAll();
 
-  if (m_imapMailFolderSink) m_imapMailFolderSink->HeaderFetchCompleted(this);
+  if (m_imapMailFolderSink && NS_SUCCEEDED(m_mailboxUpdateResult)) {
+    nsresult rv = m_imapMailFolderSink->HeaderFetchCompleted(this);
+    if (NS_FAILED(rv)) m_mailboxUpdateResult = rv;
+  }
 }
 
 // Use the noop to tell the server we are still here, and therefore we are

@@ -26,9 +26,11 @@
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/RefPtr.h"
+#include "mozilla/ResultExtensions.h"
 #include "nsComponentManagerUtils.h"
 #include "nsIInputStream.h"
 #include "nsIMsgDBView.h"
+#include "nsIMsgOfflineImapOperation.h"
 #include "nsIMsgPluggableStore.h"
 #include "nsIMsgSearchSession.h"
 #include "nsIProperty.h"
@@ -46,7 +48,302 @@ namespace mozilla::mailnews {
 
 extern LazyLogModule gPanoramaLog;
 
-NS_IMPL_ISUPPORTS(PerFolderDatabase, nsIDBChangeAnnouncer, nsIMsgDatabase)
+NS_IMPL_ISUPPORTS(PerFolderDatabase, nsIDBChangeAnnouncer, nsIMsgDatabase,
+                  nsIMsgOfflineOpsDatabase)
+
+class OfflineOperation final : public nsIMsgOfflineImapOperation {
+ public:
+  NS_DECL_ISUPPORTS
+  OfflineOperation(PerFolderDatabase* database, nsMsgKey key)
+      : mDatabase(database), mKey(key) {}
+
+  NS_IMETHOD GetMessageKey(nsMsgKey* value) override {
+    NS_ENSURE_ARG_POINTER(value);
+    *value = mKey;
+    return NS_OK;
+  }
+  NS_IMETHOD SetMessageKey(nsMsgKey value) override {
+    // The factory supplies the immutable physical identity.
+    return value == mKey ? NS_OK : NS_ERROR_INVALID_ARG;
+  }
+  NS_IMETHOD GetOperation(nsOfflineImapOperationType* value) override {
+    NS_ENSURE_ARG_POINTER(value);
+    OfflineOperationData data;
+    MOZ_TRY(Read(data));
+    *value = static_cast<nsOfflineImapOperationType>(data.operation);
+    return NS_OK;
+  }
+  NS_IMETHOD SetOperation(nsOfflineImapOperationType value) override {
+    return Update([&](auto& data) {
+      data.operation |= static_cast<uint32_t>(value);
+      return NS_OK;
+    });
+  }
+  NS_IMETHOD ClearOperation(nsOfflineImapOperationType value) override {
+    return Update([&](auto& data) -> nsresult {
+      data.operation &= ~static_cast<uint32_t>(value);
+      if (!(data.operation & (kMsgMoved | kAppendDraft | kAppendTemplate))) {
+        data.pendingDestination.reset();
+      }
+      switch (value) {
+        case kMsgMoved:
+        case kAppendDraft:
+        case kAppendTemplate:
+          data.destinationFolderURI.Truncate();
+          break;
+        case kMsgCopy:
+          NS_ENSURE_FALSE(data.copyDestinations.IsEmpty(), NS_ERROR_UNEXPECTED);
+          data.copyDestinations.RemoveElementAt(0);
+          if (!data.copyDestinationBindings.IsEmpty()) {
+            data.copyDestinationBindings.RemoveElementAt(0);
+          }
+          break;
+      }
+      return NS_OK;
+    });
+  }
+  NS_IMETHOD GetSrcMessageKey(nsMsgKey* value) override {
+    return ReadNumber(&OfflineOperationData::sourceKey, value);
+  }
+  NS_IMETHOD SetSrcMessageKey(nsMsgKey value) override {
+    return WriteField(&OfflineOperationData::sourceKey, value);
+  }
+  NS_IMETHOD GetSrcUid(ImapUid* value) override {
+    return ReadNumber(&OfflineOperationData::sourceUid, value);
+  }
+  NS_IMETHOD SetSrcUid(ImapUid value) override {
+    return WriteField(&OfflineOperationData::sourceUid, value);
+  }
+  NS_IMETHOD GetFlagOperation(imapMessageFlagsType* value) override {
+    return ReadNumber(&OfflineOperationData::flagOperation, value);
+  }
+  NS_IMETHOD SetFlagOperation(imapMessageFlagsType value) override {
+    return Update([&](auto& data) {
+      data.operation |= kFlagsChanged;
+      data.newFlags = value;
+      data.flagOperation |= value;
+      return NS_OK;
+    });
+  }
+  NS_IMETHOD GetNewFlags(imapMessageFlagsType* value) override {
+    return ReadNumber(&OfflineOperationData::newFlags, value);
+  }
+  NS_IMETHOD SetNewFlags(imapMessageFlagsType value) override {
+    return WriteField(&OfflineOperationData::newFlags, value);
+  }
+  NS_IMETHOD GetDestinationFolderURI(nsACString& value) override {
+    return ReadString(&OfflineOperationData::destinationFolderURI, value);
+  }
+  NS_IMETHOD SetDestinationFolderURI(const nsACString& value) override {
+    return WriteField(&OfflineOperationData::destinationFolderURI, value);
+  }
+  NS_IMETHOD GetSourceFolderURI(nsACString& value) override {
+    return ReadString(&OfflineOperationData::sourceFolderURI, value);
+  }
+  NS_IMETHOD SetSourceFolderURI(const nsACString& value) override {
+    return Update([&](auto& data) {
+      data.operation |= kMoveResult;
+      data.sourceFolderURI = value;
+      return NS_OK;
+    });
+  }
+  NS_IMETHOD GetKeywordsToAdd(char** value) override {
+    return ReadCString(&OfflineOperationData::keywordsToAdd, value);
+  }
+  NS_IMETHOD GetKeywordsToRemove(char** value) override {
+    return ReadCString(&OfflineOperationData::keywordsToRemove, value);
+  }
+  NS_IMETHOD AddKeywordToAdd(const char* value) override {
+    NS_ENSURE_ARG_POINTER(value);
+    return Update([&](auto& data) {
+      data.operation |= kAddKeywords;
+      AddKeyword(value, data.keywordsToAdd, data.keywordsToRemove);
+      return NS_OK;
+    });
+  }
+  NS_IMETHOD AddKeywordToRemove(const char* value) override {
+    NS_ENSURE_ARG_POINTER(value);
+    return Update([&](auto& data) {
+      data.operation |= kRemoveKeywords;
+      AddKeyword(value, data.keywordsToRemove, data.keywordsToAdd);
+      return NS_OK;
+    });
+  }
+  NS_IMETHOD AddMessageCopyOperation(const nsACString& value) override {
+    return Update([&](auto& data) {
+      data.operation |= kMsgCopy;
+      data.copyDestinations.AppendElement(value);
+      data.copyDestinationBindings.AppendElement(Nothing());
+      return NS_OK;
+    });
+  }
+  NS_IMETHOD GetCopyDestination(int32_t index, char** value) override {
+    NS_ENSURE_ARG_POINTER(value);
+    *value = nullptr;
+    OfflineOperationData data;
+    MOZ_TRY(Read(data));
+    NS_ENSURE_TRUE(
+        index >= 0 && uint32_t(index) < data.copyDestinations.Length(),
+        NS_ERROR_ILLEGAL_VALUE);
+    *value = ToNewCString(data.copyDestinations[index]);
+    return *value ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+  }
+  NS_IMETHOD GetMsgSize(uint32_t* value) override {
+    return ReadNumber(&OfflineOperationData::messageSize, value);
+  }
+  NS_IMETHOD SetMsgSize(uint32_t value) override {
+    return WriteField(&OfflineOperationData::messageSize, value);
+  }
+  NS_IMETHOD GetPlayingBack(bool* value) override {
+    NS_ENSURE_ARG_POINTER(value);
+    OfflineOperationData data;
+    MOZ_TRY(Read(data));
+    *value = data.playingBack;
+    return NS_OK;
+  }
+  NS_IMETHOD SetPlayingBack(bool value) override {
+    MOZ_TRY(mDatabase->CheckFolderExists());
+    return mDatabase->MessageDB().SetOfflineOperationPlayingBack(
+        mDatabase->FolderId(), mKey, value);
+  }
+
+ private:
+  ~OfflineOperation() = default;
+  nsresult Read(OfflineOperationData& data) {
+    MOZ_TRY(mDatabase->CheckFolderExists());
+    return mDatabase->MessageDB().GetOfflineOperation(mDatabase->FolderId(),
+                                                      mKey, data);
+  }
+  template <typename Change>
+  nsresult Update(Change&& change) {
+    OfflineOperationData data;
+    MOZ_TRY(Read(data));
+    MOZ_TRY(change(data));
+    return mDatabase->MessageDB().StoreOfflineOperation(mDatabase->FolderId(),
+                                                        mKey, data);
+  }
+  template <typename T>
+  nsresult ReadNumber(uint32_t OfflineOperationData::*member, T* value) {
+    NS_ENSURE_ARG_POINTER(value);
+    OfflineOperationData data;
+    MOZ_TRY(Read(data));
+    CheckedInt<T> checked(data.*member);
+    NS_ENSURE_TRUE(checked.isValid(), NS_ERROR_FILE_CORRUPTED);
+    *value = checked.value();
+    return NS_OK;
+  }
+  template <typename T, typename U>
+  nsresult WriteField(T OfflineOperationData::*member, const U& value) {
+    return Update([&](auto& data) {
+      data.*member = value;
+      return NS_OK;
+    });
+  }
+  nsresult ReadString(nsCString OfflineOperationData::*member,
+                      nsACString& value) {
+    OfflineOperationData data;
+    MOZ_TRY(Read(data));
+    value = data.*member;
+    return NS_OK;
+  }
+  nsresult ReadCString(nsCString OfflineOperationData::*member, char** value) {
+    NS_ENSURE_ARG_POINTER(value);
+    *value = nullptr;
+    OfflineOperationData data;
+    MOZ_TRY(Read(data));
+    *value = ToNewCString(data.*member);
+    return *value ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+  }
+  static void AddKeyword(const char* keyword, nsCString& add,
+                         nsCString& remove) {
+    nsDependentCString value(keyword);
+    int32_t start, length;
+    if (!MsgFindKeyword(value, add, &start, &length)) {
+      if (!add.IsEmpty()) {
+        add.Append(' ');
+      }
+      add.Append(value);
+    }
+    if (MsgFindKeyword(value, remove, &start, &length)) {
+      remove.Cut(start, length);
+    }
+  }
+
+  RefPtr<PerFolderDatabase> mDatabase;
+  const nsMsgKey mKey;
+};
+NS_IMPL_ISUPPORTS(OfflineOperation, nsIMsgOfflineImapOperation)
+
+NS_IMETHODIMP PerFolderDatabase::GetOfflineOpForKey(
+    nsMsgKey key, bool create, nsIMsgOfflineImapOperation** result) {
+  NS_ENSURE_ARG_POINTER(result);
+  *result = nullptr;
+  MOZ_TRY(CheckFolderExists());
+  OfflineOperationData data;
+  nsresult rv = MessageDB().GetOfflineOperation(mFolderId, key, data);
+  if (rv == NS_ERROR_NOT_AVAILABLE) {
+    if (!create) {
+      return NS_OK;
+    }
+    Maybe<CapturedMessage> captured;
+    MOZ_TRY(MessageDB().CaptureHeaderState(key, captured));
+    NS_ENSURE_TRUE(captured && captured->folderId == mFolderId,
+                   NS_ERROR_NOT_AVAILABLE);
+    data.newFlags = static_cast<imapMessageFlagsType>(captured->flags);
+    MOZ_TRY(MessageDB().StoreOfflineOperation(mFolderId, key, data));
+  } else {
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  if (create) {
+    // If this later step fails, retain the durable operation and report
+    // failure.
+    RefPtr<FolderInfo> info = new FolderInfo(this);
+    int32_t flags;
+    MOZ_TRY(info->OrFlags(nsMsgFolderFlags::OfflineEvents, &flags));
+    nsCOMPtr<nsIMsgFolder> folder;
+    MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+    MOZ_TRY(folder->SetFlag(nsMsgFolderFlags::OfflineEvents));
+  }
+  RefPtr<OfflineOperation> operation = new OfflineOperation(this, key);
+  operation.forget(result);
+  return NS_OK;
+}
+
+NS_IMETHODIMP PerFolderDatabase::RemoveOfflineOp(
+    nsIMsgOfflineImapOperation* op) {
+  NS_ENSURE_ARG(op);
+  MOZ_TRY(CheckFolderExists());
+  nsMsgKey key;
+  MOZ_TRY(op->GetMessageKey(&key));
+  return MessageDB().RemoveOfflineOperation(mFolderId, key);
+}
+
+NS_IMETHODIMP PerFolderDatabase::ListAllOfflineOpIds(nsTArray<nsMsgKey>& keys) {
+  MOZ_TRY(CheckFolderExists());
+  nsTArray<nsMsgKey> pending;
+  MOZ_TRY(MessageDB().ListOfflineOperations(mFolderId, false, pending));
+  keys.AppendElements(pending);
+  return NS_OK;
+}
+
+NS_IMETHODIMP PerFolderDatabase::ListAllOfflineDeletes(
+    nsTArray<nsMsgKey>& keys) {
+  MOZ_TRY(CheckFolderExists());
+  nsTArray<nsMsgKey> pending;
+  MOZ_TRY(MessageDB().ListOfflineOperations(mFolderId, true, pending));
+  // SELECT appends these to its already collected published keys.
+  keys.AppendElements(pending);
+  return NS_OK;
+}
+
+NS_IMETHODIMP PerFolderDatabase::HasOfflineActivity(bool* hasOffline) {
+  NS_ENSURE_ARG_POINTER(hasOffline);
+  *hasOffline = false;
+  nsTArray<nsMsgKey> keys;
+  MOZ_TRY(ListAllOfflineOpIds(keys));
+  *hasOffline = !keys.IsEmpty();
+  return NS_OK;
+}
 
 // MessageListener:
 
@@ -1179,9 +1476,11 @@ NS_IMETHODIMP PerFolderDatabase::SetNextPseudoMsgKey(
     nsMsgKey aNextPseudoMsgKey) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
-NS_IMETHODIMP PerFolderDatabase::GetNextFakeOfflineMsgKey(
-    nsMsgKey* aNextFakeOfflineMsgKey) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+NS_IMETHODIMP PerFolderDatabase::GetNextFakeOfflineMsgKey(nsMsgKey* key) {
+  NS_ENSURE_ARG_POINTER(key);
+  *key = nsMsgKey_None;
+  MOZ_TRY(CheckFolderExists());
+  return MessageDB().ReserveOfflineOperationKey(mFolderId, *key);
 }
 NS_IMETHODIMP PerFolderDatabase::GetDefaultViewFlags(
     nsMsgViewFlagsTypeValue* viewFlags) {

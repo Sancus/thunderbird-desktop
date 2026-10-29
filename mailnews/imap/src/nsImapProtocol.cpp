@@ -1828,6 +1828,7 @@ static void DoomCacheEntry(nsIMsgMailNewsUrl* url) {
  */
 bool nsImapProtocol::ProcessCurrentURL() {
   nsresult rv = NS_OK;
+  m_mailboxUpdateResult = NS_OK;
   if (m_idle) EndIdle();
 
   if (m_retryUrlOnError) {
@@ -2048,7 +2049,8 @@ bool nsImapProtocol::ProcessCurrentURL() {
     if (m_retryUrlOnError) return RetryUrl();
 
     // The URL has now been processed
-    if ((!logonFailed && NS_FAILED(GetConnectionStatus())) ||
+    if ((!logonFailed && (NS_FAILED(GetConnectionStatus()) ||
+                          NS_FAILED(m_mailboxUpdateResult))) ||
         DeathSignalReceived())
       HandleCurrentUrlError();
 
@@ -2063,6 +2065,7 @@ bool nsImapProtocol::ProcessCurrentURL() {
     if (m_mockChannel) {
       nsresult status;
       m_mockChannel->GetStatus(&status);
+      if (NS_SUCCEEDED(status)) status = m_mailboxUpdateResult;
       if (!GetServerStateParser().LastCommandSuccessful() &&
           NS_SUCCEEDED(status))
         status = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
@@ -2073,6 +2076,7 @@ bool nsImapProtocol::ProcessCurrentURL() {
   m_runningUrl->GetMoreHeadersToDownload(&suspendUrl);
   if (mailnewsurl && m_imapMailFolderSink) {
     rv = GetConnectionStatus();
+    if (NS_SUCCEEDED(rv)) rv = m_mailboxUpdateResult;
     // There are error conditions to check even if the connection is OK.
     if (NS_SUCCEEDED(rv)) {
       if (logonFailed) {
@@ -2133,7 +2137,8 @@ bool nsImapProtocol::ProcessCurrentURL() {
     if (copyState) {
       rv = imapMailFolderSink->CopyNextStreamMessage(
           GetServerStateParser().LastCommandSuccessful() &&
-              NS_SUCCEEDED(GetConnectionStatus()),
+              NS_SUCCEEDED(GetConnectionStatus()) &&
+              NS_SUCCEEDED(m_mailboxUpdateResult),
           copyState);
       if (NS_FAILED(rv))
         MOZ_LOG(IMAP, LogLevel::Info,
@@ -2843,6 +2848,7 @@ void nsImapProtocol::ProcessSelectedStateURL() {
       selectIssued = GetServerStateParser().LastCommandSuccessful();
     }
 
+    if (NS_FAILED(m_mailboxUpdateResult)) return;
     if (selectIssued) RefreshACLForFolderIfNecessary(mailboxName.get());
 
     bool uidValidityOk = true;
@@ -4481,7 +4487,12 @@ void nsImapProtocol::ProcessMailboxUpdate(bool handlePossibleUndo) {
       new_spec->mBoxFlags |= kJustExpunged;
 
     if (m_imapMailFolderSink) {
-      m_imapMailFolderSink->UpdateImapMailboxInfo(this, new_spec);
+      nsresult rv = m_imapMailFolderSink->UpdateImapMailboxInfo(this, new_spec);
+      if (NS_FAILED(rv)) {
+        m_mailboxUpdateResult = rv;
+        m_runningUrl->SetMoreHeadersToDownload(false);
+        return;
+      }
       m_imapMailFolderSink->GetMsgHdrsToDownload(msgIdList);
       m_progressExpectedNumber = msgIdList.Length();
       // Assert that either it's empty string OR it must be header string.

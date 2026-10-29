@@ -119,6 +119,8 @@ tags = ["foldernames"]
 
 ["test_imapPasswordFailure.js"]
 
+["test_imapPendingCounts.js"]
+
 ["test_imapPreAuthUntaggedIgnored.js"]
 
 ["test_imapProtocols.js"]

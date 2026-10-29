@@ -433,6 +433,8 @@ class nsImapProtocol : public nsIImapProtocol,
   bool m_imapThreadIsRunning;
   void ImapThreadMainLoop(void);
   nsresult m_connectionStatus;
+  // A local mailbox update failure must not poison a healthy connection.
+  nsresult m_mailboxUpdateResult = NS_OK;
   nsCString m_connectionType;
 
   bool m_nextUrlReadyToRun;

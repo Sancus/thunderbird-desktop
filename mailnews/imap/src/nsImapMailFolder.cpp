@@ -74,12 +74,14 @@
 #include "nsIMsgFilterCustomAction.h"
 #include "nsIMsgThread.h"
 #include "nsMsgLineBuffer.h"
+#include "mozilla/CheckedInt.h"
 #include "mozilla/Components.h"
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ScopeExit.h"
 #include "mozilla/StaticPrefs_mail.h"
 #include "nsReadableUtils.h"
+#include "nsTHashSet.h"
 #include "UrlListener.h"
 #include "nsIObserverService.h"
 #include "nsIPropertyBag2.h"
@@ -2738,8 +2740,7 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
   NS_ENSURE_ARG_POINTER(aSpec);
 
   nsresult rv;
-  ChangeNumPendingTotalMessages(-mNumPendingTotalMessages);
-  ChangeNumPendingUnread(-mNumPendingUnreadMessages);
+  MOZ_TRY(ResetPendingCounts());
   m_numServerRecentMessages = 0;  // clear this since we selected the folder.
 
   if (!mDatabase) GetDatabase();
@@ -2772,14 +2773,18 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
     nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
         do_QueryInterface(mDatabase, &rv);
     NS_ENSURE_SUCCESS(rv, rv);
-    // Include any messages which have been deleted locally but still exist
-    // on the server.
-    // TODO: For Bug 1806770 we'll need the UID for these too, but the local
-    // message entry is gone. So either we need to store offline ops by UID
-    // rather than key, or have some provision for including the UID in the
-    // pending offline op...
-    // See  https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-    opsDb->ListAllOfflineDeletes(existingKeys);
+    nsTArray<nsMsgKey> offlineDeletes;
+    MOZ_TRY(opsDb->ListAllOfflineDeletes(offlineDeletes));
+    nsTHashSet<nsMsgKey> liveKeys;
+    for (nsMsgKey key : existingKeys) liveKeys.Insert(key);
+    for (nsMsgKey key : offlineDeletes) {
+      if (!liveKeys.EnsureInserted(key)) continue;
+      // A removed Panorama source needs its saved epoch/UID, not its key.
+      // The current facade cannot supply that immutable tuple.
+      NS_ENSURE_TRUE(!mail_panorama_enabled_AtStartup(),
+                     NS_ERROR_NOT_AVAILABLE);
+      existingKeys.AppendElement(key);
+    }
   }
   ImapUid folderValidity;
   aSpec->GetFolder_UIDVALIDITY(&folderValidity);
@@ -2984,12 +2989,12 @@ nsresult nsImapMailFolder::HandleUidInvalidation(ImapUid newUidValidity) {
 NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxStatus(
     nsIImapProtocol* aProtocol, nsIMailboxSpec* aSpec) {
   NS_ENSURE_ARG_POINTER(aSpec);
-  int32_t numUnread, numTotal;
-  aSpec->GetNumUnseenMessages(&numUnread);
-  aSpec->GetNumMessages(&numTotal);
-  aSpec->GetNumRecentMessages(&m_numServerRecentMessages);
-  ImapUid prevNextUID = m_nextUID;
-  aSpec->GetNextUID(&m_nextUID);
+  int32_t numUnread, numTotal, numRecent;
+  MOZ_TRY(aSpec->GetNumUnseenMessages(&numUnread));
+  MOZ_TRY(aSpec->GetNumMessages(&numTotal));
+  MOZ_TRY(aSpec->GetNumRecentMessages(&numRecent));
+  ImapUid nextUID;
+  MOZ_TRY(aSpec->GetNextUID(&nextUID));
   bool summaryChanged = false;
   // If a noop occurred, we don't know the server's UNSEEN number because NOOP
   // does not return it. The next STATUS call response will provide numUnread.
@@ -3005,10 +3010,15 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxStatus(
   // about as unread messages. We may want to do similar things with total
   // messages, but the total messages include deleted messages if the folder
   // hasn't been expunged.
+  if (mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(ReadDBFolderInfo(false));
+  }
+  auto displayed = mozilla::CheckedInt<int32_t>(mNumUnreadMessages) +
+                   mNumPendingUnreadMessages;
+  NS_ENSURE_TRUE(displayed.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  int32_t displayedUnread = displayed.value();
   int32_t previousUnreadMessages =
-      (m_numServerUnseenMessages)
-          ? m_numServerUnseenMessages
-          : mNumPendingUnreadMessages + mNumUnreadMessages;
+      m_numServerUnseenMessages ? m_numServerUnseenMessages : displayedUnread;
   if (!haveServerUnseenCount) {
     // Keep using the previously known unread count.
     MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
@@ -3016,15 +3026,16 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxStatus(
              __func__, m_onlineFolderName.get(), previousUnreadMessages));
     numUnread = previousUnreadMessages;
   }
-  if (numUnread != previousUnreadMessages || m_nextUID != prevNextUID) {
+  if (numUnread != previousUnreadMessages || nextUID != m_nextUID) {
     // Without a fresh server UNSEEN count, the pending-unread delta is
     // meaningless.
     if (haveServerUnseenCount) {
-      int32_t unreadDelta =
-          numUnread - (mNumPendingUnreadMessages + mNumUnreadMessages);
-      if (numUnread - previousUnreadMessages != unreadDelta)
+      auto delta = mozilla::CheckedInt<int32_t>(numUnread) - displayedUnread;
+      NS_ENSURE_TRUE(delta.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+      int32_t unreadDelta = delta.value();
+      if (int64_t(numUnread) - previousUnreadMessages != unreadDelta)
         NS_WARNING("unread count should match server count");
-      ChangeNumPendingUnread(unreadDelta);
+      MOZ_TRY(ChangeNumPendingUnread(unreadDelta));
       if (unreadDelta > 0 &&
           !(mFlags & (nsMsgFolderFlags::Trash | nsMsgFolderFlags::Junk))) {
         SetHasNewMessages(true);
@@ -3049,6 +3060,8 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxStatus(
     }
     summaryChanged = true;
   }
+  m_nextUID = nextUID;
+  m_numServerRecentMessages = numRecent;
   if (!deferredNewMailBiff) SetPerformingBiff(false);
   if (m_numServerUnseenMessages != numUnread ||
       m_numServerTotalMessages != numTotal) {
@@ -3060,7 +3073,7 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxStatus(
     m_numServerTotalMessages = numTotal;
   }
   if (summaryChanged) {
-    SummaryChanged();
+    MOZ_TRY(SummaryChanged());
     // Do UpdateFolder() below if folder not selected.
     // folderSelected false means folderstatus URL caused imap STATUS to be
     // sent by an imap connection not imap SELECTed on the URL target folder.
@@ -3071,7 +3084,7 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxStatus(
       MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
               ("%s: folder=%s, do UpdateFolder(), summary change after STATUS",
                __func__, m_onlineFolderName.get()));
-      UpdateFolder(nullptr);
+      MOZ_TRY(UpdateFolder(nullptr));
     } else {
       MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
               ("%s: folder=%s, do NOTHING, summary change after SELECT",
@@ -5308,6 +5321,7 @@ nsImapMailFolder::OnStartRunningUrl(nsIURI* aUrl) {
 NS_IMETHODIMP
 nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   nsresult rv = NS_OK;
+  nsresult pendingCountsRv = NS_OK;
   bool endedOfflineDownload = false;
   nsImapAction imapAction = nsIImapUrl::nsImapTest;
   m_urlRunning = false;
@@ -5362,7 +5376,8 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
         case nsIImapUrl::nsImapOnlineMove:
         case nsIImapUrl::nsImapOnlineCopy:
           if (NS_SUCCEEDED(aExitCode)) {
-            UpdatePendingCounts();
+            pendingCountsRv = UpdatePendingCounts();
+            if (NS_FAILED(pendingCountsRv)) aExitCode = pendingCountsRv;
           }
 
           if (m_copyState) {
@@ -5528,8 +5543,10 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
         case nsIImapUrl::nsImapAppendDraftFromFile:
           if (m_copyState) {
             if (NS_SUCCEEDED(aExitCode)) {
-              UpdatePendingCounts();
-
+              pendingCountsRv = UpdatePendingCounts();
+              if (NS_FAILED(pendingCountsRv)) aExitCode = pendingCountsRv;
+            }
+            if (NS_SUCCEEDED(aExitCode)) {
               m_copyState->m_curIndex++;
               if (m_copyState->m_curIndex >= m_copyState->m_messages.Length()) {
                 if (m_copyState->m_msgWindow && m_copyState->m_undoMsgTxn) {
@@ -5580,13 +5597,6 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
         case nsIImapUrl::nsImapRenameFolder:
           if (NS_FAILED(aExitCode)) {
             NotifyFolderEvent(kRenameCompleted);
-          }
-          break;
-        case nsIImapUrl::nsImapDeleteAllMsgs:
-          if (NS_SUCCEEDED(aExitCode)) {
-            ChangeNumPendingTotalMessages(-mNumPendingTotalMessages);
-            ChangeNumPendingUnread(-mNumPendingUnreadMessages);
-            m_numServerUnseenMessages = 0;
           }
           break;
         case nsIImapUrl::nsImapListFolder:
@@ -5678,30 +5688,49 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
     m_urlListener = nullptr;
     saveListener->OnStopRunningUrl(aUrl, aExitCode);
   }
-  return rv;
+  return NS_FAILED(pendingCountsRv) ? pendingCountsRv : rv;
 }
 
-void nsImapMailFolder::UpdatePendingCounts() {
-  if (m_copyState) {
-    int32_t delta =
-        m_copyState->m_isCrossServerOp ? 1 : m_copyState->m_messages.Length();
-    if (!m_copyState->m_selectedState && m_copyState->m_messages.IsEmpty()) {
-      // special case from CopyFileMessage():
-      // - copied a single message in from a file
-      // - no previously-existing messages are involved
-      delta = 1;
-    }
-    ChangePendingTotal(delta);
-
-    // count the moves that were unread
-    int numUnread = m_copyState->m_unreadCount;
-    if (numUnread) {
-      m_numServerUnseenMessages +=
-          numUnread;  // adjust last status count by this delta.
-      ChangeNumPendingUnread(numUnread);
-    }
-    SummaryChanged();
+nsresult nsImapMailFolder::ResetPendingCounts() {
+  if (mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(GetDatabase());
+    NS_ENSURE_STATE(mDatabase);
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(info)));
+    NS_ENSURE_STATE(info);
+    int32_t total, unread;
+    MOZ_TRY(info->GetImapTotalPendingMessages(&total));
+    MOZ_TRY(info->GetImapUnreadPendingMessages(&unread));
+    // Reset persisted deltas without negating INT32_MIN. Keep the displayed
+    // cache until the summary reload below notifies the change.
+    if (total) MOZ_TRY(info->SetImapTotalPendingMessages(0));
+    if (unread) MOZ_TRY(info->SetImapUnreadPendingMessages(0));
+    return UpdateSummaryTotals(false);
   }
+  MOZ_TRY(ChangeNumPendingTotalMessages(-mNumPendingTotalMessages));
+  return ChangeNumPendingUnread(-mNumPendingUnreadMessages);
+}
+
+nsresult nsImapMailFolder::UpdatePendingCounts() {
+  if (!m_copyState) return NS_OK;
+
+  mozilla::CheckedInt<int32_t> delta(
+      m_copyState->m_isCrossServerOp ? 1 : m_copyState->m_messages.Length());
+  if (!m_copyState->m_selectedState && m_copyState->m_messages.IsEmpty()) {
+    // CopyFileMessage copied one message without a pre-existing source header.
+    delta = 1;
+  }
+  int32_t numUnread = m_copyState->m_unreadCount;
+  auto unseen =
+      mozilla::CheckedInt<int32_t>(m_numServerUnseenMessages) + numUnread;
+  NS_ENSURE_TRUE(delta.isValid() && unseen.isValid(),
+                 NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+  MOZ_TRY(ChangePendingTotal(delta.value()));
+  if (numUnread) {
+    MOZ_TRY(ChangeNumPendingUnread(numUnread));
+    m_numServerUnseenMessages = unseen.value();
+  }
+  return SummaryChanged();
 }
 
 NS_IMETHODIMP
@@ -6800,6 +6829,13 @@ nsImapMailFolder::SetUrlState(nsIImapProtocol* aProtocol,
     if (imapUrl) {
       nsImapAction imapAction;
       imapUrl->GetImapAction(&imapAction);
+      // The folder need not be a URL listener (for example, EmptyTrash can
+      // supply its own listener). Settle counts before notifying that listener.
+      if (!aSuspend && imapAction == nsIImapUrl::nsImapDeleteAllMsgs &&
+          NS_SUCCEEDED(statusCode)) {
+        statusCode = ResetPendingCounts();
+        if (NS_SUCCEEDED(statusCode)) m_numServerUnseenMessages = 0;
+      }
       // if the server doesn't support copyUID, then SetCopyResponseUid won't
       // get called, so we need to clear m_pendingOfflineMoves when the online
       // move operation has finished.
@@ -9144,7 +9180,7 @@ NS_IMETHODIMP nsImapMailFolder::GetCustomIdentity(nsIMsgIdentity** aIdentity) {
 }
 
 NS_IMETHODIMP nsImapMailFolder::ChangePendingTotal(int32_t aDelta) {
-  ChangeNumPendingTotalMessages(aDelta);
+  MOZ_TRY(ChangeNumPendingTotalMessages(aDelta));
   if (aDelta > 0) NotifyHasPendingMsgs();
   return NS_OK;
 }
@@ -9159,8 +9195,7 @@ void nsImapMailFolder::NotifyHasPendingMsgs() {
 
 /* void changePendingUnread (in long aDelta); */
 NS_IMETHODIMP nsImapMailFolder::ChangePendingUnread(int32_t aDelta) {
-  ChangeNumPendingUnread(aDelta);
-  return NS_OK;
+  return ChangeNumPendingUnread(aDelta);
 }
 
 NS_IMETHODIMP nsImapMailFolder::GetServerRecent(int32_t* aServerRecent) {

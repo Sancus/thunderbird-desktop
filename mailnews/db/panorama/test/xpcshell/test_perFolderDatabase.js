@@ -1161,3 +1161,163 @@ add_task(
     Assert.equal(parent.getTotalMessages(true), 3);
   }
 );
+
+
+add_task(function test_offlineInterfaceReadsAndPersistsRealFolderOperations() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("offline-interface");
+  let db = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
+  const key = addMessage({
+    folderId: folder.id,
+    flags: Ci.nsMsgMessageFlags.Read,
+  });
+  Assert.deepEqual(db.listAllKeys(), [key]);
+  Assert.deepEqual(db.listAllOfflineOpIds(), []);
+  Assert.deepEqual(db.listAllOfflineDeletes(), []);
+  Assert.equal(db.hasOfflineActivity(), false);
+  Assert.strictEqual(db.getOfflineOpForKey(key, false), null);
+  const op = db.getOfflineOpForKey(key, true);
+  Assert.equal(op.messageKey, key);
+  Assert.equal(op.newFlags, 1);
+  Assert.equal(op.operation, 0);
+  op.flagOperation = 0x08;
+  op.addKeywordToAdd("exact-keyword");
+  Assert.equal(
+    op.operation,
+    Ci.nsIMsgOfflineImapOperation.kFlagsChanged |
+      Ci.nsIMsgOfflineImapOperation.kAddKeywords,
+  );
+  Assert.equal(op.keywordsToAdd, "exact-keyword");
+  Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
+  Assert.deepEqual(db.listAllOfflineDeletes(), [key]);
+  Assert.equal(db.hasOfflineActivity(), true);
+  Assert.ok(folder.getFlag(Ci.nsMsgFolderFlags.OfflineEvents));
+  Assert.ok(db.dBFolderInfo.flags & Ci.nsMsgFolderFlags.OfflineEvents);
+  db.forceClosed();
+  Assert.throws(() => op.operation, /NS_ERROR_NOT_AVAILABLE/);
+  db = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
+  Assert.equal(
+    db.getOfflineOpForKey(key, false).keywordsToAdd,
+    "exact-keyword",
+  );
+  Assert.deepEqual(db.listAllOfflineDeletes(), [key]);
+  db.removeOfflineOp(db.getOfflineOpForKey(key, false));
+  Assert.strictEqual(db.getOfflineOpForKey(key, false), null);
+  Assert.equal(db.hasOfflineActivity(), false);
+  Assert.deepEqual(db.listAllKeys(), [key]);
+});
+
+add_task(
+  function test_offlineDeleteEnumerationKeepsRemovedSourcesAndFolderScope() {
+    const local = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const folder = local.createLocalSubfolder("offline-delete-scope");
+    const other = local.createLocalSubfolder("offline-delete-other");
+    const db = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
+    const otherDb = other.msgDatabase.QueryInterface(
+      Ci.nsIMsgOfflineOpsDatabase,
+    );
+    const deleted = addMessage({ folderId: folder.id });
+    const mdnSent = addMessage({ folderId: folder.id });
+    const moved = addMessage({ folderId: folder.id });
+    const copied = addMessage({ folderId: folder.id });
+    const foreign = addMessage({ folderId: other.id });
+    db.getOfflineOpForKey(deleted, true).flagOperation = 0x08;
+    db.getOfflineOpForKey(mdnSent, true).flagOperation = 0x80;
+    db.getOfflineOpForKey(moved, true).operation =
+      Ci.nsIMsgOfflineImapOperation.kMsgMoved;
+    const copy = db.getOfflineOpForKey(copied, true);
+    copy.operation = Ci.nsIMsgOfflineImapOperation.kMsgCopy;
+    copy.newFlags = 0x08;
+    otherDb.getOfflineOpForKey(foreign, true).flagOperation = 0x08;
+    Assert.strictEqual(db.getOfflineOpForKey(foreign, false), null);
+    Assert.throws(
+      () => db.getOfflineOpForKey(foreign, true),
+      /NS_ERROR_NOT_AVAILABLE/,
+    );
+    messageDB.removeMessage(deleted);
+    Assert.deepEqual(db.listAllKeys(), [mdnSent, moved, copied]);
+    Assert.deepEqual(db.listAllOfflineDeletes(), [deleted, moved]);
+    Assert.deepEqual(db.listAllOfflineOpIds(), [
+      deleted,
+      mdnSent,
+      moved,
+      copied,
+    ]);
+    Assert.deepEqual(otherDb.listAllOfflineDeletes(), [foreign]);
+    Assert.equal(db.getOfflineOpForKey(deleted, false).newFlags, 0x08);
+    const connection = database.connectionForTests;
+    const statement = connection.createStatement(
+      "SELECT messageKey, newFlags FROM offline_operations WHERE folderId = :folder ORDER BY messageKey",
+    );
+    try {
+      statement.params.folder = folder.id;
+      const stored = [];
+      while (statement.executeStep()) {
+        stored.push([statement.row.messageKey, statement.row.newFlags]);
+      }
+      Assert.deepEqual(stored, [
+        [deleted, 0x08],
+        [mdnSent, 0x80],
+        [moved, 0],
+        [copied, 0x08],
+      ]);
+    } finally {
+      statement.finalize();
+    }
+  },
+);
+
+add_task(function test_offlineJournalErrorsAndClosedWrapperAreNotEmptyQueues() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("offline-interface-errors");
+  const db = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
+  const key = addMessage({ folderId: folder.id });
+  const op = db.getOfflineOpForKey(key, true);
+  op.flagOperation = 0x08;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_offline_update BEFORE UPDATE ON offline_operations " +
+      "BEGIN SELECT RAISE(ABORT, 'offline update fault'); END",
+  );
+  try {
+    Assert.throws(
+      () => (op.newFlags = 0x80),
+      (error) => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT,
+    );
+    Assert.equal(op.newFlags, 0x08);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_offline_update");
+  }
+  connection.beginTransaction();
+  try {
+    Assert.throws(
+      () => (op.operation = Ci.nsIMsgOfflineImapOperation.kMsgMoved),
+      /NS_ERROR_IN_PROGRESS/,
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.equal(op.operation, Ci.nsIMsgOfflineImapOperation.kFlagsChanged);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  connection.executeSimpleSQL(
+    "ALTER TABLE offline_operations RENAME TO hidden_offline_operations",
+  );
+  try {
+    Assert.throws(() => db.listAllOfflineOpIds(), /NS_ERROR_FAILURE/);
+    Assert.throws(() => db.listAllOfflineDeletes(), /NS_ERROR_FAILURE/);
+    Assert.throws(() => db.hasOfflineActivity(), /NS_ERROR_FAILURE/);
+    Assert.throws(() => db.getOfflineOpForKey(key, false), /NS_ERROR_FAILURE/);
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE hidden_offline_operations RENAME TO offline_operations",
+    );
+  }
+  Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
+  db.forceClosed();
+  Assert.throws(() => db.listAllOfflineDeletes(), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => op.newFlags, /NS_ERROR_NOT_AVAILABLE/);
+  const fresh = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
+  Assert.deepEqual(fresh.listAllOfflineDeletes(), [key]);
+});

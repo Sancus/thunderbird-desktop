@@ -414,7 +414,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
   // Notifies imap autosync that it should update this folder when it
   // gets a chance.
   void NotifyHasPendingMsgs();
-  void UpdatePendingCounts();
+  nsresult ResetPendingCounts();
+  nsresult UpdatePendingCounts();
   virtual bool ShowDeletedMessages();
   virtual bool DeleteIsMoveToTrash();
   nsresult GetFolder(const nsACString& name, nsIMsgFolder** pFolder);

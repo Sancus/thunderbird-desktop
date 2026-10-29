@@ -24,7 +24,7 @@ class nsIDBChangeListener;
 
 namespace mozilla::mailnews {
 
-class PerFolderDatabase : public nsIMsgDatabase,
+class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                           public SupportsWeakPtr,
                           public MessageListener {
  public:
@@ -36,6 +36,7 @@ class PerFolderDatabase : public nsIMsgDatabase,
   NS_DECL_ISUPPORTS
   NS_DECL_NSIDBCHANGEANNOUNCER
   NS_DECL_NSIMSGDATABASE
+  NS_DECL_NSIMSGOFFLINEOPSDATABASE
 
   // MessageListener functions.
   void OnMessageAdded(Message* message) override;
@@ -72,14 +73,14 @@ class PerFolderDatabase : public nsIMsgDatabase,
   uint64_t FolderId() { return mFolderId; }
 
  private:
-   friend class FolderInfo;
+  friend class FolderInfo;
+  friend class OfflineOperation;
 
-   virtual ~PerFolderDatabase(){};
+  virtual ~PerFolderDatabase(){};
 
-   FolderDatabase& FolderDB() const
-   {
+  FolderDatabase& FolderDB() const {
     return *DatabaseCore::sInstance->mFolderDatabase;
-   }
+  }
   MessageDatabase& MessageDB() const {
     return *DatabaseCore::sInstance->mMessageDatabase;
   }

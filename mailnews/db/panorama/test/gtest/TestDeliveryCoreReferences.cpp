@@ -9010,4 +9010,123 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_TRUE(exists);
 }
 
+TEST_F(DeliveryCoreReferences, StartupRefusesFutureSchemaWithoutLosingRows) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK,
+            Add("future-version-control"_ns, {"raw"_ns, ""_ns, "raw"_ns}, key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageProperty(key, "Case"_ns, "00042"_ns));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  int32_t supported;
+  ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&supported));
+  ASSERT_LT(supported, INT32_MAX);
+  Stop();
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  ASSERT_EQ(NS_OK, reader->SetSchemaVersion(supported + 1));
+  ASSERT_EQ(NS_OK, reader->Close());
+  reader = nullptr;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, Start());
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] {
+    if (reader)
+      EXPECT_EQ(NS_OK, reader->Close());
+  });
+  int32_t retained;
+  ASSERT_EQ(NS_OK, reader->GetSchemaVersion(&retained));
+  EXPECT_EQ(supported + 1, retained);
+  bool active = true;
+  ASSERT_EQ(NS_OK, reader->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  nsCString stored;
+  ASSERT_EQ(NS_OK,
+            PublicationCell(reader, key,
+                            "SELECT messageId FROM messages WHERE id=:id"_ns,
+                            stored));
+  EXPECT_EQ("future-version-control"_ns, stored);
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          reader, key,
+          "SELECT value FROM message_properties WHERE id=:id AND name='Case'"_ns,
+          stored));
+  EXPECT_EQ("00042"_ns, stored);
+  // Only the test restores the supported version; startup never rewrites it.
+  ASSERT_EQ(NS_OK, reader->SetSchemaVersion(supported));
+  ASSERT_EQ(NS_OK, reader->Close());
+  reader = nullptr;
+  ASSERT_EQ(NS_OK, Start());
+  nsCString reopened;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(reopened));
+  EXPECT_EQ(source, reopened);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"raw"_ns, ""_ns, "raw"_ns}), refs);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupRejectsIncompatibleLayoutWithoutRebuilding) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("damaged-schema-control"_ns, {}, key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageProperty(key, "empty"_ns, ""_ns));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  int32_t supported;
+  ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&supported));
+  Stop();
+  nsCOMPtr<mozIStorageConnection> reader;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  ASSERT_EQ(NS_OK,
+            reader->ExecuteSimpleSQL(
+                "ALTER TABLE messages ADD COLUMN unsupported_layout TEXT"_ns));
+  ASSERT_EQ(NS_OK, reader->Close());
+  reader = nullptr;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, Start());
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+  auto close = MakeScopeExit([&] {
+    if (reader)
+      EXPECT_EQ(NS_OK, reader->Close());
+  });
+  int32_t retained;
+  ASSERT_EQ(NS_OK, reader->GetSchemaVersion(&retained));
+  EXPECT_EQ(supported, retained);
+  nsCString stored;
+  ASSERT_EQ(NS_OK,
+            PublicationCell(reader, key,
+                            "SELECT messageId FROM messages WHERE id=:id"_ns,
+                            stored));
+  EXPECT_EQ("damaged-schema-control"_ns, stored);
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          reader, key,
+          "SELECT COUNT(*) FROM message_properties WHERE id=:id AND name='empty' AND value=''"_ns,
+          stored));
+  EXPECT_EQ("1"_ns, stored);
+  // Explicit test repair, not product recovery or a replacement database.
+  ASSERT_EQ(NS_OK,
+            reader->ExecuteSimpleSQL(
+                "ALTER TABLE messages DROP COLUMN unsupported_layout"_ns));
+  ASSERT_EQ(NS_OK, reader->Close());
+  reader = nullptr;
+  ASSERT_EQ(NS_OK, Start());
+  nsCString reopened;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(reopened));
+  EXPECT_EQ(source, reopened);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+}
+
 }  // namespace mozilla::mailnews

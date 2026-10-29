@@ -5237,11 +5237,26 @@ void nsImapProtocol::NotifyMessageFlags(imapMessageFlagsType flags,
 }
 
 void nsImapProtocol::NotifySearchHit(const char* hitLine) {
+  if (!m_runningUrl || !m_notifySearchHit || NS_FAILED(m_mailboxUpdateResult)) {
+    return;
+  }
+#ifdef MOZ_PANORAMA
+  uint32_t expected =
+      static_cast<nsImapUrl*>(m_runningUrl.get())->ExpectedUidValidity();
+  if (expected && expected != GetServerStateParser().FolderUIDValidity()) {
+    m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+    return;
+  }
+#endif
   nsresult rv;
   nsCOMPtr<nsIMsgMailNewsUrl> mailnewsUrl =
       do_QueryInterface(m_runningUrl, &rv);
-  if (m_imapMailFolderSink)
-    m_imapMailFolderSink->NotifySearchHit(mailnewsUrl, hitLine);
+  if (NS_SUCCEEDED(rv)) {
+    rv = m_imapMailFolderSink
+             ? m_imapMailFolderSink->NotifySearchHit(mailnewsUrl, hitLine)
+             : NS_ERROR_NOT_AVAILABLE;
+  }
+  if (NS_FAILED(rv)) m_mailboxUpdateResult = rv;
 }
 
 void nsImapProtocol::SetMailboxDiscoveryStatus(EMailboxDiscoverStatus status) {

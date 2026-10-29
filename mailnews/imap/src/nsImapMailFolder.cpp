@@ -4953,27 +4953,73 @@ nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
   NS_WARNING_ASSERTION((uidOfMessage == m_curMsgUid), "Interleaved messages?");
   auto uidClear = mozilla::MakeScopeExit([&] { m_curMsgUid = 0; });
 
+  nsresult sizeResult = NS_OK;
   if (updatedMessageSize != -1) {
-    // retrieve the message header to update size, if we don't already have it
+    // Retrieve the physical header if this download isn't writing offline.
     nsCOMPtr<nsIMsgDBHdr> msgHeader = m_offlineHeader;
-    if (!msgHeader) GetMessageHeader(uidOfMessage, getter_AddRefs(msgHeader));
+    if (!msgHeader) {
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup()) {
+        NS_ENSURE_ARG_POINTER(imapUrl);
+        MOZ_TRY(GetDatabase());
+        nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+        NS_ENSURE_STATE(db);
+        nsMsgKey key = MOZ_TRY(MsgKeyFromUid(db, uidOfMessage));
+        const auto& captured =
+            static_cast<nsImapUrl*>(imapUrl)->CapturedCopyTargets();
+        if (captured) {
+          uint64_t folderId;
+          MOZ_TRY(GetId(&folderId));
+          NS_ENSURE_TRUE(folderId == captured->folderId,
+                         NS_ERROR_NOT_AVAILABLE);
+          nsCOMPtr<nsIDBFolderInfo> info;
+          MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+          NS_ENSURE_STATE(info);
+          uint32_t epoch;
+          MOZ_TRY(info->GetImapUidValidity(&epoch));
+          NS_ENSURE_TRUE(epoch && epoch == captured->epoch,
+                         NS_ERROR_NOT_AVAILABLE);
+          bool found = false;
+          for (const auto& target : captured->messages) {
+            if (target.uid == uidOfMessage) {
+              NS_ENSURE_TRUE(key == target.key, NS_ERROR_NOT_AVAILABLE);
+              found = true;
+              break;
+            }
+          }
+          NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
+        }
+        MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(msgHeader)));
+        NS_ENSURE_STATE(msgHeader);
+      } else
+#endif
+      {
+        GetMessageHeader(uidOfMessage, getter_AddRefs(msgHeader));
+      }
+    }
     if (msgHeader) {
       uint32_t msgSize;
-      msgHeader->GetMessageSize(&msgSize);
-      MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
-              ("Updating stored message size from %u, new size %d", msgSize,
-               updatedMessageSize));
-      msgHeader->SetMessageSize(updatedMessageSize);
-      // only commit here if this isn't an offline message
-      // offline header gets committed in EndNewOfflineMessage() called below
-      if (mDatabase && !m_offlineHeader)
-        mDatabase->Commit(nsMsgDBCommitType::kLargeCommit);
-    } else
+      sizeResult = msgHeader->GetMessageSize(&msgSize);
+      if (NS_SUCCEEDED(sizeResult)) {
+        MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
+                ("Updating stored message size from %u, new size %d", msgSize,
+                 updatedMessageSize));
+        sizeResult = msgHeader->SetMessageSize(updatedMessageSize);
+      }
+      // Offline headers are settled by EndNewOfflineMessage below.
+      if (NS_SUCCEEDED(sizeResult) && mDatabase && !m_offlineHeader)
+        sizeResult = mDatabase->Commit(nsMsgDBCommitType::kLargeCommit);
+    } else {
       NS_WARNING(
           "Failed to get message header when trying to update message size");
+    }
   }
 
-  if (m_offlineHeader) EndNewOfflineMessage(NS_OK);
+  if (m_offlineHeader) {
+    nsresult rv = EndNewOfflineMessage(sizeResult);
+    if (NS_SUCCEEDED(sizeResult)) sizeResult = rv;
+  }
+  NS_ENSURE_SUCCESS(sizeResult, sizeResult);
 
   m_curMsgUid = uidOfMessage;
 
@@ -6181,42 +6227,68 @@ nsImapMailFolder::EndMessage(nsIMsgMailNewsUrl* aUrl, ImapUid uidOfMessage) {
 
 #define WHITESPACE " \015\012"  // token delimiter
 
-NS_IMETHODIMP
-nsImapMailFolder::NotifySearchHit(nsIMsgMailNewsUrl* aUrl,
-                                  const char* searchHitLine) {
+NS_IMETHODIMP nsImapMailFolder::NotifySearchHit(nsIMsgMailNewsUrl* aUrl,
+                                                const char* searchHitLine) {
   NS_ENSURE_ARG_POINTER(aUrl);
-  nsresult rv = GetDatabase();
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  // expect search results in the form of "* SEARCH <hit> <hit> ..."
-  // expect search results in the form of "* SEARCH <hit> <hit> ..."
+  NS_ENSURE_ARG_POINTER(searchHitLine);
+  nsCOMPtr<nsIMsgSearchSession> searchSession;
+  MOZ_TRY(aUrl->GetSearchSession(getter_AddRefs(searchSession)));
+  // Internal protocol searches have no result consumer.
+  if (!searchSession) return NS_OK;
+  nsCOMPtr<nsIMsgSearchAdapter> searchAdapter;
+  MOZ_TRY(searchSession->GetRunningAdapter(getter_AddRefs(searchAdapter)));
+  NS_ENSURE_TRUE(searchAdapter, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(aUrl->GetFolder(getter_AddRefs(folder)));
+  NS_ENSURE_TRUE(folder == this, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(GetDatabase());
+  nsCOMPtr<nsIMsgDatabase> database = mDatabase;
+#ifdef MOZ_PANORAMA
+  nsCOMPtr<nsIDBFolderInfo> folderInfo;
+  uint32_t expectedEpoch = 0;
+  if (mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(aUrl);
+    NS_ENSURE_TRUE(imapUrl, NS_ERROR_NOT_AVAILABLE);
+    expectedEpoch =
+        static_cast<nsImapUrl*>(imapUrl.get())->ExpectedUidValidity();
+    MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(folderInfo)));
+    NS_ENSURE_TRUE(folderInfo, NS_ERROR_NOT_AVAILABLE);
+  }
+#endif
+  // Search hits are server UIDs, not physical message keys.
   nsCString tokenString(searchHitLine);
   char* currentPosition = PL_strcasestr(tokenString.get(), "SEARCH");
-  if (currentPosition) {
-    currentPosition += strlen("SEARCH");
-    bool shownUpdateAlert = false;
-    char* hitUidToken = NS_strtok(WHITESPACE, &currentPosition);
-    while (hitUidToken) {
-      long naturalLong;  // %l is 64 bits on OSF1
-      sscanf(hitUidToken, "%ld", &naturalLong);
-      ImapUid hitUid = (ImapUid)naturalLong;
-      nsMsgKey hitKey = MOZ_TRY(MsgKeyFromUid(mDatabase, hitUid));
-
-      nsCOMPtr<nsIMsgDBHdr> hitHeader;
-      rv = mDatabase->GetMsgHdrForKey(hitKey, getter_AddRefs(hitHeader));
-      if (NS_SUCCEEDED(rv) && hitHeader) {
-        nsCOMPtr<nsIMsgSearchSession> searchSession;
-        nsCOMPtr<nsIMsgSearchAdapter> searchAdapter;
-        aUrl->GetSearchSession(getter_AddRefs(searchSession));
-        if (searchSession) {
-          searchSession->GetRunningAdapter(getter_AddRefs(searchAdapter));
-          if (searchAdapter) searchAdapter->AddResultElement(hitHeader);
-        }
-      } else if (!shownUpdateAlert) {
-      }
-
-      hitUidToken = NS_strtok(WHITESPACE, &currentPosition);
+  if (!currentPosition) return NS_ERROR_ILLEGAL_VALUE;
+  currentPosition += strlen("SEARCH");
+  char* hitUidToken = NS_strtok(WHITESPACE, &currentPosition);
+  while (hitUidToken) {
+    mozilla::CheckedInt<ImapUid> uid(0);
+    for (const char* digit = hitUidToken; *digit; ++digit) {
+      NS_ENSURE_TRUE(*digit >= '0' && *digit <= '9', NS_ERROR_ILLEGAL_VALUE);
+      uid = uid * 10 + (*digit - '0');
     }
+    NS_ENSURE_TRUE(uid.isValid() && uid.value(), NS_ERROR_ILLEGAL_VALUE);
+#ifdef MOZ_PANORAMA
+    if (folderInfo) {
+      uint32_t epoch;
+      MOZ_TRY(folderInfo->GetImapUidValidity(&epoch));
+      NS_ENSURE_TRUE(epoch == expectedEpoch, NS_ERROR_NOT_AVAILABLE);
+    }
+#endif
+    nsMsgKey key = MOZ_TRY(MsgKeyFromUid(database, uid.value()));
+    nsCOMPtr<nsIMsgDBHdr> header;
+    nsresult rv = database->GetMsgHdrForKey(key, getter_AddRefs(header));
+#ifdef MOZ_PANORAMA
+    if (folderInfo) {
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+    }
+#endif
+    // Legacy searches ignore hits not present in their folder summary.
+    if (NS_SUCCEEDED(rv) && header) {
+      MOZ_TRY(searchAdapter->AddResultElement(header));
+    }
+    hitUidToken = NS_strtok(WHITESPACE, &currentPosition);
   }
   return NS_OK;
 }

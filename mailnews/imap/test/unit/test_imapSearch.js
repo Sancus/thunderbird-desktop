@@ -287,8 +287,39 @@ var searchTests = [
   },
 ];
 
+let panorama;
+
 add_setup(async function () {
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
   setupIMAPPump();
+  panorama = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    panorama
+  );
+  Assert.equal(
+    IMAPPump.incomingServer.msgStore.storeType,
+    {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[contract]
+  );
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
 
   // don't use offline store
   IMAPPump.inbox.clearFlag(Ci.nsMsgFolderFlags.Offline);
@@ -330,6 +361,404 @@ add_task(async function testSearch() {
     }
   }
 });
+
+add_task(async function test_onlineSearchUsesPhysicalFolderKeys() {
+  const first = await createSearchFolder(
+    "SearchFirst",
+    "search-first@example.invalid",
+    7301
+  );
+  const second = await createSearchFolder(
+    "SearchSecond",
+    "search-second@example.invalid",
+    7401
+  );
+  if (panorama) {
+    Assert.notEqual(first.header.messageKey, 8101);
+    Assert.notEqual(second.header.messageKey, 8101);
+    Assert.notEqual(first.header.messageKey, second.header.messageKey);
+  }
+  for (const state of [first, second]) {
+    const result = await onlineSearch(state.folder);
+    Assert.equal(result.status, Cr.NS_OK);
+    Assert.equal(result.starts, 1);
+    Assert.equal(result.stops, 1);
+    Assert.deepEqual(
+      result.hits.map(header => [
+        header.folder,
+        header.messageKey,
+        header.messageId,
+      ]),
+      [[state.folder, state.header.messageKey, state.id]]
+    );
+    Assert.deepEqual(
+      state.mailbox._messages.map(message => message.uid),
+      [8101]
+    );
+  }
+});
+
+add_task(async function test_onlineSearchReportsMalformedUidsAndCanRetry() {
+  const state = await createSearchFolder(
+    "SearchMalformed",
+    "search-malformed@example.invalid",
+    7501
+  );
+  const deleted = [];
+  const listener = {
+    msgsDeleted(headers) {
+      deleted.push(...headers);
+    },
+  };
+  MailServices.mfn.addListener(
+    listener,
+    Ci.nsIMsgFolderNotificationService.msgsDeleted
+  );
+  try {
+    for (const badUid of ["invalid", 0, 4294967296]) {
+      // Keep the connection selected so this isolates SEARCH response parsing.
+      Assert.equal((await onlineSearch(state.folder)).status, Cr.NS_OK);
+      const before = searchCommands().length;
+      state.message.uid = badUid;
+      let result;
+      try {
+        result = await onlineSearch(state.folder);
+      } finally {
+        state.message.uid = 8101;
+      }
+      Assert.equal(
+        searchCommands().length,
+        before + 1,
+        "The real UID SEARCH reached the fake server"
+      );
+      Assert.equal(result.status, Cr.NS_ERROR_ILLEGAL_VALUE);
+      Assert.equal(result.starts, 1);
+      Assert.equal(result.stops, 1);
+      Assert.deepEqual(result.hits, []);
+      Assert.deepEqual(
+        Array.from(state.folder.messages, header => header.messageKey),
+        [state.header.messageKey]
+      );
+      Assert.equal(state.header.messageId, state.id);
+      Assert.equal(state.message.getText(), state.raw);
+      Assert.deepEqual(deleted, []);
+      const retry = await onlineSearch(state.folder);
+      Assert.equal(retry.status, Cr.NS_OK);
+      Assert.deepEqual(
+        retry.hits.map(header => header.messageKey),
+        [state.header.messageKey]
+      );
+    }
+  } finally {
+    MailServices.mfn.removeListener(listener);
+  }
+});
+
+add_task(
+  async function test_onlineSearchReportsAnUnsynchronizedUidAndCanRetry() {
+    const state = await createSearchFolder(
+      "SearchArrival",
+      "search-known@example.invalid",
+      7601
+    );
+    Assert.equal((await onlineSearch(state.folder)).status, Cr.NS_OK);
+    const flags = state.header.flags;
+    const token = state.header.storeToken;
+    const raw = state.raw.replaceAll(
+      state.id,
+      "search-arriving@example.invalid"
+    );
+    const arriving = new ImapMessage(
+      "data:text/plain;base64," + btoa(raw),
+      8103,
+      []
+    );
+    state.mailbox.addMessage(arriving);
+    const before = searchCommands().length;
+    const result = await onlineSearch(state.folder);
+    Assert.equal(searchCommands().length, before + 1);
+    Assert.equal(
+      result.status,
+      panorama ? Cr.NS_ERROR_NOT_AVAILABLE : Cr.NS_OK
+    );
+    Assert.equal(result.starts, 1);
+    Assert.equal(result.stops, 1);
+    Assert.deepEqual(
+      result.hits.map(header => header.messageKey),
+      [state.header.messageKey]
+    );
+    Assert.deepEqual(
+      Array.from(state.folder.messages, header => header.messageKey),
+      [state.header.messageKey]
+    );
+    Assert.equal(state.header.flags, flags);
+    Assert.equal(state.header.storeToken, token);
+    Assert.equal(state.message.getText(), state.raw);
+    Assert.equal(arriving.getText(), raw);
+    Assert.deepEqual(
+      state.mailbox._messages.map(message => message.uid),
+      [8101, 8103]
+    );
+
+    // A real folder synchronization supplies the missing binding before retry.
+    const selected = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.selectFolder(state.folder, selected, null);
+    await selected.promise;
+    const header = state.folder.msgDatabase.getMsgHdrForMessageID(
+      "search-arriving@example.invalid"
+    );
+    Assert.ok(header);
+    Assert.equal(header.folder, state.folder);
+    if (panorama) {
+      Assert.notEqual(header.messageKey, 8103);
+      Assert.equal(header.getUint32Property("uidOnServer"), 8103);
+    }
+    const retry = await onlineSearch(state.folder);
+    Assert.equal(retry.status, Cr.NS_OK);
+    Assert.deepEqual(
+      retry.hits.map(hit => hit.messageId),
+      [state.id, "search-arriving@example.invalid"]
+    );
+    Assert.deepEqual(
+      retry.hits.map(hit => hit.messageKey),
+      [state.header.messageKey, header.messageKey]
+    );
+    Assert.equal(state.message.getText(), state.raw);
+    Assert.equal(arriving.getText(), raw);
+  }
+);
+
+add_task(async function test_onlineSearchInUnselectedEmptyFolder() {
+  const { folder, mailbox } = await createUnselectedSearchFolder(
+    "SearchUnselectedEmpty",
+    7501
+  );
+  const before = searchCommands().length;
+  const result = await onlineSearch(folder);
+  Assert.equal(result.status, Cr.NS_OK);
+  Assert.equal(result.starts, 1);
+  Assert.equal(result.stops, 1);
+  Assert.deepEqual(result.hits, []);
+  Assert.equal(searchCommands().length, before + 1);
+  Assert.deepEqual(Array.from(folder.messages), []);
+  Assert.deepEqual(mailbox._messages, []);
+});
+
+add_task(async function test_onlineSearchInUnselectedPopulatedFolder() {
+  const { folder, mailbox } = await createUnselectedSearchFolder(
+    "SearchUnselectedPopulated",
+    7601
+  );
+  const raw =
+    "From: sender@example.invalid\r\n" +
+    "Message-ID: <unselected-search@example.invalid>\r\n" +
+    "Subject: Search identity\r\n\r\nUnselected bytes stay intact.\r\n";
+  const message = new ImapMessage(
+    "data:text/plain;base64," + btoa(raw),
+    8105,
+    []
+  );
+  mailbox.addMessage(message);
+  const before = searchCommands().length;
+  const result = await onlineSearch(folder);
+  Assert.equal(result.status, panorama ? Cr.NS_ERROR_NOT_AVAILABLE : Cr.NS_OK);
+  Assert.equal(result.starts, 1);
+  Assert.equal(result.stops, 1);
+  if (panorama) {
+    Assert.deepEqual(result.hits, []);
+  } else {
+    Assert.deepEqual(
+      result.hits.map(hit => hit.messageId),
+      ["unselected-search@example.invalid"]
+    );
+    Assert.deepEqual(
+      result.hits.map(hit => hit.messageKey),
+      [8105]
+    );
+    Assert.equal(result.hits[0].folder, folder);
+  }
+  Assert.equal(searchCommands().length, before + 1);
+  Assert.deepEqual(
+    mailbox._messages.map(item => item.uid),
+    [8105]
+  );
+  Assert.equal(message.getText(), raw);
+
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.selectFolder(folder, selected, null);
+  await selected.promise;
+  const [header] = folder.messages;
+  Assert.equal(header.messageId, "unselected-search@example.invalid");
+  Assert.equal(header.folder, folder);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7601);
+  if (panorama) {
+    Assert.notEqual(header.messageKey, 8105);
+    Assert.equal(header.getUint32Property("uidOnServer"), 8105);
+  } else {
+    Assert.equal(header.messageKey, 8105);
+  }
+  const retry = await onlineSearch(folder);
+  Assert.equal(retry.status, Cr.NS_OK);
+  Assert.equal(retry.starts, 1);
+  Assert.equal(retry.stops, 1);
+  Assert.deepEqual(
+    retry.hits.map(hit => hit.messageKey),
+    [header.messageKey]
+  );
+  Assert.deepEqual(
+    retry.hits.map(hit => hit.messageId),
+    ["unselected-search@example.invalid"]
+  );
+  Assert.deepEqual(
+    mailbox._messages.map(item => item.uid),
+    [8105]
+  );
+  Assert.equal(message.getText(), raw);
+});
+
+/**
+ * Creates an actual remote folder without a SELECT or a seeded client header.
+ *
+ * @param {string} name - The server mailbox name.
+ * @param {number} epoch - The server UIDVALIDITY.
+ * @returns {Promise<{folder: nsIMsgImapMailFolder, mailbox: ImapMailbox}>}
+ *   The unsynchronized client folder and its real server mailbox.
+ */
+async function createUnselectedSearchFolder(name, epoch) {
+  const root = IMAPPump.incomingServer.rootFolder;
+  const created = new PromiseTestUtils.PromiseUrlListener();
+  root
+    .QueryInterface(Ci.nsIMsgImapMailFolder)
+    .createSubfolderWithListener(name, created);
+  await created.promise;
+  const folder = root
+    .getChildNamed(name)
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+  Assert.equal(
+    folder.msgStore.storeType,
+    IMAPPump.incomingServer.msgStore.storeType
+  );
+  Assert.deepEqual(Array.from(folder.messages), []);
+  if (panorama) {
+    Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 0);
+  }
+  const mailbox = IMAPPump.daemon.getMailbox(name);
+  mailbox.uidvalidity = epoch;
+  return { folder, mailbox };
+}
+
+/**
+ * Creates and synchronizes one actual server message in an independent folder.
+ *
+ * @param {string} name - The remote folder name.
+ * @param {string} id - The literal Message-ID.
+ * @param {number} epoch - The server UIDVALIDITY.
+ * @returns {Promise<{folder: nsIMsgImapMailFolder, header: nsIMsgDBHdr,
+ *   mailbox: ImapMailbox, message: ImapMessage, raw: string, id: string}>}
+ *   The retained client and server state.
+ */
+async function createSearchFolder(name, id, epoch) {
+  const root = IMAPPump.incomingServer.rootFolder;
+  const created = new PromiseTestUtils.PromiseUrlListener();
+  root
+    .QueryInterface(Ci.nsIMsgImapMailFolder)
+    .createSubfolderWithListener(name, created);
+  await created.promise;
+  const folder = root
+    .getChildNamed(name)
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+  const mailbox = IMAPPump.daemon.getMailbox(name);
+  mailbox.uidvalidity = epoch;
+  const raw = [
+    "From: sender@example.invalid",
+    "To: recipient@example.invalid",
+    "Message-ID: <" + id + ">",
+    "Subject: Search identity",
+    "",
+    "Retained bytes for " + id,
+    "",
+  ].join("\r\n");
+  const message = new ImapMessage(
+    "data:text/plain;base64," + btoa(raw),
+    8101,
+    []
+  );
+  mailbox.addMessage(message);
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.selectFolder(folder, selected, null);
+  await selected.promise;
+  const headers = Array.from(folder.messages);
+  Assert.equal(headers.length, 1);
+  const header = headers[0];
+  Assert.equal(header.messageId, id);
+  Assert.equal(header.folder, folder);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+  if (panorama) {
+    Assert.equal(header.getUint32Property("uidOnServer"), 8101);
+  }
+  return { folder, header, mailbox, message, raw, id };
+}
+
+/**
+ * Runs an online subject search through the actual search session and IMAP URL.
+ *
+ * @param {nsIMsgFolder} folder - The physical folder to search.
+ * @returns {Promise<{status: number, starts: number, stops: number,
+ *   hits: nsIMsgDBHdr[]}>} Actual completion and delivered headers.
+ */
+async function onlineSearch(folder) {
+  const session = Cc["@mozilla.org/messenger/searchSession;1"].createInstance(
+    Ci.nsIMsgSearchSession
+  );
+  session.addScopeTerm(Ci.nsMsgSearchScope.onlineMail, folder);
+  const term = session.createTerm();
+  term.attrib = Ci.nsMsgSearchAttrib.Subject;
+  const value = term.value;
+  value.attrib = term.attrib;
+  value.str = "Search identity";
+  term.value = value;
+  term.op = Ci.nsMsgSearchOp.Contains;
+  session.appendTerm(term);
+  const result = { status: Cr.NS_OK, starts: 0, stops: 0, hits: [] };
+  let resolve;
+  const done = new Promise(finish => {
+    resolve = finish;
+  });
+  const listener = {
+    onNewSearch() {
+      result.starts++;
+    },
+    onSearchHit(header) {
+      result.hits.push(header);
+    },
+    onSearchDone(status) {
+      result.status = status;
+      result.stops++;
+      resolve(result);
+    },
+  };
+  session.registerListener(listener);
+  try {
+    session.search(null);
+    return await done;
+  } finally {
+    session.unregisterListener(listener);
+  }
+}
+
+/**
+ * Returns the real server's received UID SEARCH commands.
+ *
+ * @returns {string[]} Received commands from all actual connections.
+ */
+function searchCommands() {
+  const transactions = IMAPPump.server.playTransaction();
+  return (Array.isArray(transactions) ? transactions : [transactions])
+    .flatMap(transaction => transaction.them)
+    .filter(command => / UID SEARCH /i.test(command));
+}
 
 // Cleanup at end
 add_task(function endTest() {

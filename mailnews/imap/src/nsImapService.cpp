@@ -5,6 +5,8 @@
 #include "nsImapService.h"
 
 #include "msgCore.h"  // precompiled header...
+#include "nsIDBFolderInfo.h"
+#include "nsIMsgDatabase.h"
 #include "nsImapCore.h"
 #include "netCore.h"
 #include "nsImapUrl.h"
@@ -635,8 +637,25 @@ NS_IMETHODIMP nsImapService::Search(nsIMsgSearchSession* aSearchSession,
     MsgEscapeString(aSearchUri, nsINetUtil::ESCAPE_XALPHAS, escapedSearchUri);
     urlSpec.Append(escapedSearchUri);
     rv = mailNewsUrl->SetSpecInternal(urlSpec);
-    if (NS_SUCCEEDED(rv))
+    if (NS_SUCCEEDED(rv)) {
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        nsCOMPtr<nsIMsgDatabase> database;
+        MOZ_TRY(aMsgFolder->GetMsgDatabase(getter_AddRefs(database)));
+        NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIDBFolderInfo> folderInfo;
+        MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(folderInfo)));
+        NS_ENSURE_TRUE(folderInfo, NS_ERROR_NOT_AVAILABLE);
+        uint32_t epoch;
+        MOZ_TRY(folderInfo->GetImapUidValidity(&epoch));
+        if (epoch) {
+          MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                      ->SetExpectedUidValidity(epoch));
+        }
+      }
+#endif
       rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, nullptr);
+    }
   }
   return rv;
 }
@@ -700,6 +719,12 @@ NS_IMETHODIMP nsImapService::SaveMessageToDisk(const nsACString& aMessageURI,
     rv = folder->GetMsgDatabase(getter_AddRefs(db));
     NS_ENSURE_SUCCESS(rv, rv);
     ImapUid uid = MOZ_TRY(UidFromMsgKey(db, msgKey));
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                  ->CaptureCopyTargets(folder, {msgKey}, {uid}));
+    }
+#endif
     nsAutoCString msgIds(UidSetFromUids({uid}));
 
     nsCOMPtr<nsIURI> dummyNull;

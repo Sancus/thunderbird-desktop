@@ -13,6 +13,7 @@
 #include "js/Array.h"
 #include "js/CallAndConstruct.h"
 #include "js/Date.h"
+#include "js/Exception.h"
 #include "js/GlobalObject.h"
 #include "js/PropertyDescriptor.h"
 #include "js/Proxy.h"
@@ -486,13 +487,14 @@ class LiveViewThreadBatchBuilder {
         sql.Append(" AND DATE_GROUP(date) = :batchGroup");
         break;
       case nsILiveView::SUBJECT:
-        sql.Append(" AND subject = :batchGroup COLLATE locale");
+        sql.Append(" AND COALESCE(subject, '') = :batchGroup COLLATE locale");
         break;
       case nsILiveView::SENDER:
-        sql.Append(" AND sender = :batchGroup COLLATE locale");
+        sql.Append(" AND COALESCE(sender, '') = :batchGroup COLLATE locale");
         break;
       case nsILiveView::RECIPIENTS:
-        sql.Append(" AND recipients = :batchGroup COLLATE locale");
+        sql.Append(
+            " AND COALESCE(recipients, '') = :batchGroup COLLATE locale");
         break;
       default:
         return NS_ERROR_NOT_AVAILABLE;
@@ -1222,13 +1224,13 @@ NS_IMETHODIMP LiveView::CountMessages(JSContext* cx, Promise** promise) {
           sql.Append("DISTINCT DATE_GROUP(date)");
           break;
         case nsILiveView::SortColumn::SUBJECT:
-          sql.Append("DISTINCT subject COLLATE locale");
+          sql.Append("DISTINCT COALESCE(subject, '') COLLATE locale");
           break;
         case nsILiveView::SortColumn::SENDER:
-          sql.Append("DISTINCT sender COLLATE locale");
+          sql.Append("DISTINCT COALESCE(sender, '') COLLATE locale");
           break;
         case nsILiveView::SortColumn::RECIPIENTS:
-          sql.Append("DISTINCT recipients COLLATE locale");
+          sql.Append("DISTINCT COALESCE(recipients, '') COLLATE locale");
           break;
         default:
           MOZ_CRASH("Unexpected sort column for GROUPED_BY_SORT");
@@ -1266,13 +1268,13 @@ NS_IMETHODIMP LiveView::CountUnreadMessages(JSContext* cx, Promise** promise) {
           sql.Append("DISTINCT DATE_GROUP(date)");
           break;
         case nsILiveView::SortColumn::SUBJECT:
-          sql.Append("DISTINCT subject COLLATE locale");
+          sql.Append("DISTINCT COALESCE(subject, '') COLLATE locale");
           break;
         case nsILiveView::SortColumn::SENDER:
-          sql.Append("DISTINCT sender COLLATE locale");
+          sql.Append("DISTINCT COALESCE(sender, '') COLLATE locale");
           break;
         case nsILiveView::SortColumn::RECIPIENTS:
-          sql.Append("DISTINCT recipients COLLATE locale");
+          sql.Append("DISTINCT COALESCE(recipients, '') COLLATE locale");
           break;
         default:
           MOZ_CRASH("Unexpected sort column for GROUPED_BY_SORT");
@@ -1606,13 +1608,13 @@ nsCString LiveView::SelectSQL() {
         sql.Append("dateGroup ");
         break;
       case nsILiveView::SortColumn::SUBJECT:
-        sql.Append("subject COLLATE locale ");
+        sql.Append("COALESCE(subject, '') COLLATE locale ");
         break;
       case nsILiveView::SortColumn::SENDER:
-        sql.Append("formattedSender COLLATE locale ");
+        sql.Append("COALESCE(formattedSender, '') COLLATE locale ");
         break;
       case nsILiveView::SortColumn::RECIPIENTS:
-        sql.Append("formattedRecipients COLLATE locale ");
+        sql.Append("COALESCE(formattedRecipients, '') COLLATE locale ");
         break;
       default:
         MOZ_CRASH("Unexpected sort column for GROUPED_BY_SORT");
@@ -1704,17 +1706,19 @@ nsCString LiveView::SelectGroupSQL() {
         sql.Append(mSortDescending ? " DESC" : " ASC");
         break;
       case nsILiveView::SortColumn::SUBJECT:
-        sql.Append(" AND subject = :group COLLATE locale");
+        sql.Append(" AND COALESCE(subject, '') = :group COLLATE locale");
         // TODO: Does this ordering make sense?
         sql.Append(" ORDER BY date DESC");
         break;
       case nsILiveView::SortColumn::SENDER:
-        sql.Append(" AND formattedSender = :group COLLATE locale");
+        sql.Append(
+            " AND COALESCE(formattedSender, '') = :group COLLATE locale");
         // TODO: Does this ordering make sense?
         sql.Append(" ORDER BY date DESC");
         break;
       case nsILiveView::SortColumn::RECIPIENTS:
-        sql.Append(" AND formattedRecipients = :group COLLATE locale");
+        sql.Append(
+            " AND COALESCE(formattedRecipients, '') = :group COLLATE locale");
         // TODO: Does this ordering make sense?
         sql.Append(" ORDER BY date DESC");
         break;
@@ -1797,7 +1801,14 @@ void LiveView::NotifyCaptured(const CapturedMessage* before,
   }
   JSContext* cx = jsapi.cx();
   Rooted<JSObject*> object(cx);
-  if (!BatchMessage(cx, now ? *after : *before, &object)) {
+  const auto& row = now ? *after : *before;
+  // Ordinary metadata views also expose unassigned folders. Serialize the
+  // captured scalars using their existing row contract, without a live header.
+  CreateJSMessage(row.id, row.folderId, row.messageId.get(), row.date,
+                  row.sender.get(), row.recipients.get(), row.subject.get(),
+                  row.flags, row.tags.get(), row.threadId, row.threadParent, cx,
+                  object);
+  if (!object || JS_IsExceptionPending(cx)) {
     if (capability)
       InvalidateCapturedConsumer(listener, capability, attachment);
     return;

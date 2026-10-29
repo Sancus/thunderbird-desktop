@@ -1695,10 +1695,12 @@ export class LiveViewDataAdapter extends TreeDataAdapter {
       if (!conversations) {
         sorted = sortGroups
           ? ordered.sort((a, b) => {
-              if (this._compareMessages(a, b)) {
-                return -1;
-              }
-              return this._compareMessages(b, a) ? 1 : 0;
+              // Match SelectGroupSQL: text groups use newest first; date
+              // groups follow the requested date direction.
+              return this.sortColumn == "date" &&
+                this.sortDirection == "ascending"
+                ? a.date - b.date
+                : b.date - a.date;
             })
           : LiveViewThreadedDataAdapter.sortThread(ordered);
       }

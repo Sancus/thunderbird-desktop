@@ -1711,7 +1711,8 @@ add_task(
     Assert.equal(adapter.rowCount, 0);
     Assert.equal(selection.count, 0);
     Assert.equal(selection.currentIndex, -1);
-    Assert.equal(selection.shiftSelectPivot, null);
+    Assert.equal(selection.shiftSelectPivot, -1);
+    Assert.strictEqual(selection._shiftSelectPivot, null);
     Assert.equal(tree.resets.length, 1);
   }
 );

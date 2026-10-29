@@ -814,6 +814,39 @@ class DeliveryCoreReferences : public testing::Test {
     return NS_OK;
   }
 
+  void CheckFolderIdentity(uint64_t id, uint64_t parent,
+                           const nsACString &name) {
+    auto cachedParent = mCore->FolderDB().GetFolderParent(id);
+    ASSERT_TRUE(cachedParent.isOk());
+    EXPECT_EQ(parent, cachedParent.unwrap());
+    auto cachedName = mCore->FolderDB().GetFolderName(id);
+    ASSERT_TRUE(cachedName.isOk());
+    EXPECT_EQ(name, cachedName.unwrap());
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    auto close = MakeScopeExit([&] {
+      if (stmt)
+        EXPECT_EQ(NS_OK, stmt->Finalize());
+      EXPECT_EQ(NS_OK, reader->Close());
+    });
+    ASSERT_EQ(NS_OK, reader->CreateStatement(
+                         "SELECT parent,name FROM folders WHERE id=:id"_ns,
+                         getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, id));
+    bool more;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    int64_t actualParent;
+    nsCString actualName;
+    ASSERT_EQ(NS_OK, stmt->GetInt64(0, &actualParent));
+    ASSERT_EQ(NS_OK, stmt->GetUTF8String(1, actualName));
+    EXPECT_EQ(parent, uint64_t(actualParent));
+    EXPECT_EQ(name, actualName);
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    EXPECT_FALSE(more);
+  }
+
   nsresult SetRemovalMetric(uint64_t folder, int64_t value) {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(mConnection->CreateStatement(
@@ -7872,6 +7905,128 @@ TEST_F(DeliveryCoreReferences, ReconcileCanonicalDuplicatesKeepVirtualControl) {
   auto flags = folders.GetFolderFlags(control);
   ASSERT_TRUE(flags.isOk());
   EXPECT_EQ(nsMsgFolderFlags::Virtual, flags.unwrap());
+}
+
+TEST_F(DeliveryCoreReferences, HierarchyRenameRefusesCallerTxAndRetiredOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  uint64_t child;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Alpha"_ns, &child));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, mFolderId, "Alpha"_ns));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 73));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.UpdateName(child, "Transient"_ns));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t metric = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, metric));
+  EXPECT_EQ(73, metric);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, mFolderId, "Alpha"_ns));
+  RefPtr<FolderDatabase> retired = &folders;
+  Stop();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->UpdateName(child, "Stale"_ns));
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->UpdateName(child, "Stale"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, mFolderId, "Alpha"_ns));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateName(child, "Cafe\xCC\x81"_ns));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckFolderIdentity(child, mFolderId, "Caf\xC3\xA9"_ns));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_NO_FATAL_FAILURE(
+      CheckFolderIdentity(child, mFolderId, "Caf\xC3\xA9"_ns));
+}
+
+TEST_F(DeliveryCoreReferences,
+       HierarchyReparentRefusesCallerTxAndRetiredOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  uint64_t left, right, child, nested;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Left"_ns, &left));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Right"_ns, &right));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Child"_ns, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(child, "Nested"_ns, &nested));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, AddAt(nested, "hierarchy-member"_ns, {}, key));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Child"_ns));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active)
+      EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(mFolderId, 81));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.MoveFolderTo(right, child));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Child"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(nested, child, "Nested"_ns));
+  RefPtr<FolderDatabase> retired = &folders;
+  Stop();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->MoveFolderTo(right, child));
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->MoveFolderTo(right, child));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Child"_ns));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().MoveFolderTo(right, child));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, right, "Child"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(nested, child, "Nested"_ns));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  uint64_t actualFolder;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFolderId(key, actualFolder));
+  EXPECT_EQ(nested, actualFolder);
+}
+
+TEST_F(DeliveryCoreReferences, HierarchyWriteFailureKeepsCachedPathAndRows) {
+  ASSERT_EQ(NS_OK, Start());
+  auto &folders = mCore->FolderDB();
+  uint64_t left, right, child;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Left"_ns, &left));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Right"_ns, &right));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Child"_ns, &child));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Child"_ns));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("hierarchy_fault"_ns, 1, witness));
+  nsAutoCString sql("CREATE TEMP TRIGGER reject_hierarchy "
+                    "BEFORE UPDATE OF name,parent ON folders WHEN OLD.id=");
+  sql.AppendInt(child);
+  sql.AppendLiteral(" BEGIN SELECT hierarchy_fault(OLD.id); "
+                    "SELECT RAISE(ABORT,'hierarchy write failure'); END");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  auto drop = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_hierarchy"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            folders.UpdateName(child, "Renamed"_ns));
+  EXPECT_EQ(1u, witness->mCalls);
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Child"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, folders.MoveFolderTo(right, child));
+  EXPECT_EQ(2u, witness->mCalls);
+  EXPECT_EQ(int64_t(child), witness->mLastKey);
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Child"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(right, mFolderId, "Right"_ns));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER reject_hierarchy"_ns));
+  ASSERT_EQ(NS_OK, folders.UpdateName(child, "Renamed"_ns));
+  ASSERT_EQ(NS_OK, folders.MoveFolderTo(right, child));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, right, "Renamed"_ns));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, right, "Renamed"_ns));
 }
 
 TEST_F(DeliveryCoreReferences,

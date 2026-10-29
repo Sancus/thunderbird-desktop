@@ -323,7 +323,7 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
 NS_IMETHODIMP
 FolderDatabase::MoveFolderWithin(uint64_t parentId, uint64_t childId,
                                  uint64_t beforeId) {
-  MOZ_TRY(RequireCommittedOrderMutation());
+  MOZ_TRY(RequireCommittedHierarchyMutation());
   nsTArray<uint64_t> children = MOZ_TRY(GetFolderChildren(parentId));
 
   // Remove the folder we're moving around.
@@ -352,7 +352,7 @@ FolderDatabase::MoveFolderWithin(uint64_t parentId, uint64_t childId,
   return NS_OK;
 }
 
-nsresult FolderDatabase::RequireCommittedOrderMutation() {
+nsresult FolderDatabase::RequireCommittedHierarchyMutation() {
   NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
                      DatabaseCore::sInstance->mFolderDatabase.get() == this,
                  NS_ERROR_NOT_AVAILABLE);
@@ -418,7 +418,7 @@ nsresult FolderDatabase::SaveOrdinals(nsTArray<uint64_t> const& folderIds) {
 // Null out the ordinal field for every child of this parent.
 NS_IMETHODIMP
 FolderDatabase::ResetChildOrder(uint64_t parentId) {
-  MOZ_TRY(RequireCommittedOrderMutation());
+  MOZ_TRY(RequireCommittedHierarchyMutation());
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "ResetOrdinals"_ns,
@@ -443,6 +443,7 @@ FolderDatabase::ResetChildOrder(uint64_t parentId) {
 NS_IMETHODIMP
 FolderDatabase::MoveFolderTo(uint64_t newParentId, uint64_t childId) {
   NS_ENSURE_ARG(childId);
+  MOZ_TRY(RequireCommittedHierarchyMutation());
 
   // Sanity checks.
   uint64_t oldParentId = MOZ_TRY(GetFolderParent(childId));
@@ -483,8 +484,8 @@ FolderDatabase::MoveFolderTo(uint64_t newParentId, uint64_t childId) {
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindInt64ByName("parent"_ns, newParentId);
-  stmt->BindInt64ByName("id"_ns, childId);
+  MOZ_TRY(stmt->BindInt64ByName("parent"_ns, newParentId));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, childId));
   rv = stmt->Execute();
   NS_ENSURE_SUCCESS(rv, rv);
 
@@ -501,6 +502,7 @@ FolderDatabase::MoveFolderTo(uint64_t newParentId, uint64_t childId) {
 NS_IMETHODIMP
 FolderDatabase::UpdateName(uint64_t folderId, const nsACString& newName) {
   NS_ENSURE_ARG(folderId);
+  MOZ_TRY(RequireCommittedHierarchyMutation());
   nsCString nfcNewName = MOZ_TRY(DatabaseUtils::Normalize(newName));
 
   nsCOMPtr<mozIStorageStatement> stmt;
@@ -509,8 +511,8 @@ FolderDatabase::UpdateName(uint64_t folderId, const nsACString& newName) {
       getter_AddRefs(stmt));
   NS_ENSURE_SUCCESS(rv, rv);
   mozStorageStatementScoper scoper(stmt);
-  stmt->BindUTF8StringByName("name"_ns, nfcNewName);
-  stmt->BindInt64ByName("id"_ns, folderId);
+  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, nfcNewName));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
 
   rv = stmt->Execute();
   NS_ENSURE_SUCCESS(rv, rv);

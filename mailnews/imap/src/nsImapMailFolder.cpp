@@ -2380,6 +2380,13 @@ NS_IMETHODIMP nsImapMailFolder::DeleteMessages(
 
   if ((NS_SUCCEEDED(rv) && deleteImmediatelyNoTrash) ||
       deleteModel == nsMsgImapDeleteModels::IMAPDelete) {
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      NS_ENSURE_FALSE(WeAreOffline(), NS_MSG_ERROR_OFFLINE);
+      // Legacy undo keeps only UID text and cannot restore native identity.
+      NS_ENSURE_FALSE(allowUndo, NS_ERROR_NOT_IMPLEMENTED);
+    }
+#endif
     if (allowUndo) {
       nsTArray<ImapUid> uids = MOZ_TRY(UidsFromHdrs(msgHeaders));
       nsAutoCString messageIds(UidSetFromUids(uids));
@@ -2417,9 +2424,46 @@ NS_IMETHODIMP nsImapMailFolder::DeleteMessages(
     // if copy service listener is also a url listener, pass that
     // url listener into StoreImapFlags.
     nsCOMPtr<nsIUrlListener> urlListener = do_QueryInterface(listener);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      // Preserve the caller's URL chain. Direct copy listeners are adapted
+      // with the existing helper and complete only after checked settlement.
+      // URL-capable callers must forward completion to this folder listener.
+      nsCOMPtr<nsIUrlListener> delegate =
+          urlListener ? urlListener.get() : this;
+      nsCOMPtr<nsIMsgCopyServiceListener> directCopy =
+          urlListener ? nullptr : listener;
+      RefPtr<UrlListener> completion = new UrlListener;
+      completion->mStartFn = [delegate, directCopy, isMove, started = false](
+                                 nsIURI* url) mutable -> nsresult {
+        nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(url);
+        NS_ENSURE_STATE(imapUrl);
+        static_cast<nsImapUrl*>(imapUrl.get())->SetFlagDeleteIsMove(isMove);
+        if (started) return NS_OK;
+        started = true;
+        MOZ_TRY(delegate->OnStartRunningUrl(url));
+        return directCopy ? directCopy->OnStartCopy() : NS_OK;
+      };
+      completion->mStopFn = [delegate, directCopy, completed = false](
+                                nsIURI* url,
+                                nsresult status) mutable -> nsresult {
+        if (completed) return NS_OK;
+        completed = true;
+        nsresult rv = delegate->OnStopRunningUrl(url, status);
+        return directCopy
+                   ? directCopy->OnStopCopy(NS_FAILED(status) ? status : rv)
+                   : rv;
+      };
+      urlListener = completion;
+    }
+#endif
     imapMessageFlagsType messageFlags = kImapMsgDeletedFlag;
     if (deleteMsgs) messageFlags |= kImapMsgSeenFlag;
     rv = StoreImapFlags(messageFlags, deleteMsgs, srcKeyArray, urlListener);
+#ifdef MOZ_PANORAMA
+    // Keep native membership and bodies until the saved command is confirmed.
+    if (mail_panorama_enabled_AtStartup()) return rv;
+#endif
 
     if (NS_SUCCEEDED(rv)) {
       if (mDatabase) {
@@ -5438,10 +5482,107 @@ nsImapMailFolder::OnStartRunningUrl(nsIURI* aUrl) {
 // nsImapMailFolder passes itself as a listener when it kicks off operations
 // on the nsIImapService. So, when the operation completes, this gets called
 // to handle all the different operations, using a big switch statement.
+#ifdef MOZ_PANORAMA
+nsresult nsImapMailFolder::CompleteFlagTargets(nsIImapUrl* url, bool addFlags) {
+  const auto& captured = static_cast<nsImapUrl*>(url)->CapturedFlagTargets();
+  NS_ENSURE_TRUE(captured, NS_ERROR_NOT_AVAILABLE);
+  uint64_t folderId;
+  MOZ_TRY(GetId(&folderId));
+  NS_ENSURE_TRUE(folderId == captured->folderId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(GetDatabase());
+  nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+  NS_ENSURE_STATE(db);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+  NS_ENSURE_STATE(info);
+  uint32_t epoch;
+  MOZ_TRY(info->GetImapUidValidity(&epoch));
+  NS_ENSURE_TRUE(epoch && epoch == captured->epoch, NS_ERROR_NOT_AVAILABLE);
+
+  nsTArray<RefPtr<nsIMsgDBHdr>> headers;
+  nsTArray<nsMsgKey> keys;
+  nsTArray<ImapUid> uids;
+  nsTArray<nsCString> tokens;
+  for (const auto& target : captured->messages) {
+    bool exists;
+    MOZ_TRY(db->ContainsKey(target.key, &exists));
+    auto binding = MsgKeyFromUid(db, target.uid);
+    if (binding.isErr()) {
+      if (binding.unwrapErr() == NS_ERROR_NOT_AVAILABLE && !exists) continue;
+      return binding.unwrapErr();
+    }
+    NS_ENSURE_TRUE(exists && binding.unwrap() == target.key,
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(db->GetMsgHdrForKey(target.key, getter_AddRefs(header)));
+    NS_ENSURE_STATE(header);
+    nsCString token;
+    MOZ_TRY(header->GetStoreToken(token));
+    headers.AppendElement(header);
+    keys.AppendElement(target.key);
+    uids.AppendElement(target.uid);
+    tokens.AppendElement(std::move(token));
+  }
+
+  if (!addFlags || ShowDeletedMessages()) {
+    for (size_t i = 0; i < keys.Length(); ++i) {
+      NS_ENSURE_TRUE(mDatabase == db, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(info->GetImapUidValidity(&epoch));
+      NS_ENSURE_TRUE(epoch == captured->epoch, NS_ERROR_NOT_AVAILABLE);
+      nsMsgKey currentKey = MOZ_TRY(MsgKeyFromUid(db, uids[i]));
+      NS_ENSURE_TRUE(currentKey == keys[i], NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(db->MarkImapDeleted(keys[i], addFlags, nullptr));
+    }
+    return NS_OK;
+  }
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(GetMsgStore(getter_AddRefs(store)));
+  NS_ENSURE_STATE(store);
+  bool supportsCompaction;
+  MOZ_TRY(store->GetSupportsCompaction(&supportsCompaction));
+  nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+      mozilla::components::FolderNotification::Service();
+  for (size_t i = 0; i < keys.Length(); ++i) {
+    NS_ENSURE_TRUE(mDatabase == db, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(info->GetImapUidValidity(&epoch));
+    NS_ENSURE_TRUE(epoch == captured->epoch, NS_ERROR_NOT_AVAILABLE);
+    nsMsgKey currentKey = MOZ_TRY(MsgKeyFromUid(db, uids[i]));
+    NS_ENSURE_TRUE(currentKey == keys[i], NS_ERROR_NOT_AVAILABLE);
+    // The public notification is before removal and excludes move cleanup.
+    // Observers must still see complete properties on the original header.
+    if (!static_cast<nsImapUrl*>(url)->FlagDeleteIsMove()) {
+      MOZ_TRY(notifier->NotifyMsgsDeleted({headers[i]}));
+      NS_ENSURE_TRUE(mDatabase == db, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(info->GetImapUidValidity(&epoch));
+      NS_ENSURE_TRUE(epoch == captured->epoch, NS_ERROR_NOT_AVAILABLE);
+      currentKey = MOZ_TRY(MsgKeyFromUid(db, uids[i]));
+      NS_ENSURE_TRUE(currentKey == keys[i], NS_ERROR_NOT_AVAILABLE);
+      nsCString currentToken;
+      MOZ_TRY(headers[i]->GetStoreToken(currentToken));
+      NS_ENSURE_TRUE(currentToken == tokens[i], NS_ERROR_NOT_AVAILABLE);
+    }
+    // Database failure leaves the body intact. A later store failure retains
+    // recoverable bytes and reports partial settlement, not atomic success.
+    MOZ_TRY(db->DeleteMessages({keys[i]}, nullptr));
+    if (!supportsCompaction && !tokens[i].IsEmpty()) {
+      MOZ_TRY(store->DeleteStoreMessages(this, {tokens[i]}));
+    }
+  }
+  MOZ_TRY(db->SetSummaryValid(true));
+  MOZ_TRY(db->Commit(nsMsgDBCommitType::kLargeCommit));
+  NotifyFolderEvent(kDeleteOrMoveMsgCompleted);
+  return NS_OK;
+}
+#endif
+
 NS_IMETHODIMP
 nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
   nsresult rv = NS_OK;
   nsresult pendingCountsRv = NS_OK;
+  nsresult flagCompletionRv = NS_OK;
+#ifdef MOZ_PANORAMA
+  nsImapUrl* completingFlags = nullptr;
+#endif
   bool endedOfflineDownload = false;
   nsImapAction imapAction = nsIImapUrl::nsImapTest;
   m_urlRunning = false;
@@ -5468,6 +5609,19 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
     if (imapUrl) {
       DisplayStatusMsg(imapUrl, EmptyString());
       imapUrl->GetImapAction(&imapAction);
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup() &&
+          (imapAction == nsIImapUrl::nsImapAddMsgFlags ||
+           imapAction == nsIImapUrl::nsImapSubtractMsgFlags)) {
+        imapMessageFlagsType flags;
+        MOZ_ALWAYS_SUCCEEDS(imapUrl->GetMsgFlags(&flags));
+        if (flags & kImapMsgDeletedFlag) {
+          completingFlags = static_cast<nsImapUrl*>(imapUrl.get());
+          if (!completingFlags->BeginFlagCompletion())
+            return completingFlags->FlagCompletionResult();
+        }
+      }
+#endif
       if (imapAction == nsIImapUrl::nsImapMsgFetch ||
           imapAction == nsIImapUrl::nsImapMsgDownloadForOffline) {
         ReleaseSemaphore(static_cast<nsIMsgFolder*>(this),
@@ -5586,6 +5740,19 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
           }
           break;
         case nsIImapUrl::nsImapSubtractMsgFlags: {
+#ifdef MOZ_PANORAMA
+          if (mail_panorama_enabled_AtStartup()) {
+            imapMessageFlagsType flags;
+            flagCompletionRv = imapUrl->GetMsgFlags(&flags);
+            if (NS_SUCCEEDED(flagCompletionRv) &&
+                (flags & kImapMsgDeletedFlag) && NS_SUCCEEDED(aExitCode)) {
+              flagCompletionRv = CompleteFlagTargets(imapUrl, false);
+            }
+            if (NS_SUCCEEDED(aExitCode) && NS_FAILED(flagCompletionRv))
+              aExitCode = flagCompletionRv;
+            break;
+          }
+#endif
           // this isn't really right - we'd like to know we were
           // deleting a message to start with, but it probably
           // won't do any harm.
@@ -5601,7 +5768,14 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
               imapUrl->GetListOfMessageIds(uidSet);
               nsTArray<ImapUid> uids;
               ParseUidString(uidSet.get(), uids);
-              nsTArray<nsMsgKey> keyArray = MOZ_TRY(MsgKeysFromUids(db, uids));
+              auto keys = MsgKeysFromUids(db, uids);
+              if (keys.isErr()) {
+                flagCompletionRv =
+                    NS_FAILED(aExitCode) ? aExitCode : keys.unwrapErr();
+                aExitCode = flagCompletionRv;
+                break;
+              }
+              nsTArray<nsMsgKey> keyArray = std::move(keys).unwrap();
               for (nsMsgKey key : keyArray) {
                 db->MarkImapDeleted(key, false, nullptr);
               }
@@ -5610,6 +5784,19 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
           }
         } break;
         case nsIImapUrl::nsImapAddMsgFlags: {
+#ifdef MOZ_PANORAMA
+          if (mail_panorama_enabled_AtStartup()) {
+            imapMessageFlagsType flags;
+            flagCompletionRv = imapUrl->GetMsgFlags(&flags);
+            if (NS_SUCCEEDED(flagCompletionRv) &&
+                (flags & kImapMsgDeletedFlag) && NS_SUCCEEDED(aExitCode)) {
+              flagCompletionRv = CompleteFlagTargets(imapUrl, true);
+            }
+            if (NS_SUCCEEDED(aExitCode) && NS_FAILED(flagCompletionRv))
+              aExitCode = flagCompletionRv;
+            break;
+          }
+#endif
           imapMessageFlagsType flags = 0;
           imapUrl->GetMsgFlags(&flags);
           if (flags & kImapMsgDeletedFlag) {
@@ -5623,8 +5810,14 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
                 imapUrl->GetListOfMessageIds(uidSet);
                 nsTArray<ImapUid> uids;
                 ParseUidString(uidSet.get(), uids);
-                nsTArray<nsMsgKey> keyArray =
-                    MOZ_TRY(MsgKeysFromUids(db, uids));
+                auto keys = MsgKeysFromUids(db, uids);
+                if (keys.isErr()) {
+                  flagCompletionRv =
+                      NS_FAILED(aExitCode) ? aExitCode : keys.unwrapErr();
+                  aExitCode = flagCompletionRv;
+                  break;
+                }
+                nsTArray<nsMsgKey> keyArray = std::move(keys).unwrap();
                 // For pluggable stores that do not support compaction, we need
                 // to delete the messages now.
                 bool supportsCompaction = false;
@@ -5808,6 +6001,14 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
     m_urlListener = nullptr;
     saveListener->OnStopRunningUrl(aUrl, aExitCode);
   }
+#ifdef MOZ_PANORAMA
+  if (completingFlags) {
+    nsresult result = NS_FAILED(aExitCode) ? aExitCode : rv;
+    completingFlags->SetFlagCompletionResult(result);
+    return result;
+  }
+#endif
+  if (NS_FAILED(flagCompletionRv)) return flagCompletionRv;
   return NS_FAILED(pendingCountsRv) ? pendingCountsRv : rv;
 }
 

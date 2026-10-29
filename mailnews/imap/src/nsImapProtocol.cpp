@@ -17,6 +17,7 @@
 #include "nsIMsgMailNewsUrl.h"
 #include "../public/nsIImapHostSessionList.h"
 #include "nsImapMailFolder.h"
+#include "nsImapUrl.h"
 #include "nsIMsgAccountManager.h"
 #include "nsImapServerResponseParser.h"
 #include "nspr.h"
@@ -2849,6 +2850,15 @@ void nsImapProtocol::ProcessSelectedStateURL() {
     }
 
     if (NS_FAILED(m_mailboxUpdateResult)) return;
+#ifdef MOZ_PANORAMA
+    uint32_t expectedEpoch =
+        static_cast<nsImapUrl*>(m_runningUrl.get())->ExpectedUidValidity();
+    if (expectedEpoch && GetServerStateParser().LastCommandSuccessful() &&
+        expectedEpoch != GetServerStateParser().FolderUIDValidity()) {
+      m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+      return;
+    }
+#endif
     if (selectIssued) RefreshACLForFolderIfNecessary(mailboxName.get());
 
     bool uidValidityOk = true;
@@ -2865,11 +2875,42 @@ void nsImapProtocol::ProcessSelectedStateURL() {
             m_uidValidity == GetServerStateParser().FolderUIDValidity();
     }
 
-    if (!uidValidityOk)
+    if (!uidValidityOk) {
       Log("ProcessSelectedStateURL", nullptr, "uid validity not ok");
+#ifdef MOZ_PANORAMA
+      if (expectedEpoch) {
+        m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+        return;
+      }
+#endif
+    }
     if (GetServerStateParser().LastCommandSuccessful() &&
         !DeathSignalReceived() &&
         (uidValidityOk || m_imapAction == nsIImapUrl::nsImapDeleteAllMsgs)) {
+#ifdef MOZ_PANORAMA
+      if (expectedEpoch) {
+        // Transport retry reuses this URL; status belongs to this attempt.
+        m_mailboxUpdateResult =
+            m_runningUrl->SetExtraStatus(nsIImapUrl::ImapStatusNone);
+        if (NS_FAILED(m_mailboxUpdateResult)) return;
+        // A skipped or partially writable STORE is not delete confirmation.
+        if (GetServerStateParser().CurrentFolderReadOnly()) {
+          m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+          return;
+        }
+        uint16_t writable = GetServerStateParser().SettablePermanentFlags();
+        uint16_t supported = GetServerStateParser().SupportsUserFlags();
+        if (supported & kImapMsgSupportForwardedFlag)
+          writable |= kImapMsgForwardedFlag;
+        if (supported & kImapMsgSupportMDNSentFlag)
+          writable |= kImapMsgMDNSentFlag;
+        if (msgFlags & ~writable) {
+          m_runningUrl->SetExtraStatus(nsIImapUrl::ImapStatusFlagsNotSettable);
+          m_mailboxUpdateResult = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+          return;
+        }
+      }
+#endif
       if (GetServerStateParser().CurrentFolderReadOnly()) {
         Log("ProcessSelectedStateURL", nullptr, "current folder read only");
         if (m_imapAction == nsIImapUrl::nsImapAddMsgFlags ||
@@ -3269,7 +3310,19 @@ void nsImapProtocol::ProcessSelectedStateURL() {
           // may be expunged below if \deleted flag is set.
           ProcessStoreFlags(messageIdString, bMessageIdsAreUids, msgFlags,
                             true);
+#ifdef MOZ_PANORAMA
+          if (expectedEpoch && NS_SUCCEEDED(m_mailboxUpdateResult)) {
+            int32_t extra;
+            nsresult rv = m_runningUrl->GetExtraStatus(&extra);
+            if (NS_FAILED(rv))
+              m_mailboxUpdateResult = rv;
+            else if (extra != nsIImapUrl::ImapStatusNone)
+              m_mailboxUpdateResult = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+            if (NS_FAILED(m_mailboxUpdateResult)) break;
+          }
+#endif
 
+          if (!GetServerStateParser().LastCommandSuccessful()) break;
           // Nothing more to do if \deleted flag was not set.
           if (!(msgFlags & kImapMsgDeletedFlag)) break;
 
@@ -3320,6 +3373,17 @@ void nsImapProtocol::ProcessSelectedStateURL() {
 
           ProcessStoreFlags(messageIdString, bMessageIdsAreUids, msgFlags,
                             false);
+#ifdef MOZ_PANORAMA
+          if (expectedEpoch && NS_SUCCEEDED(m_mailboxUpdateResult)) {
+            int32_t extra;
+            nsresult rv = m_runningUrl->GetExtraStatus(&extra);
+            if (NS_FAILED(rv))
+              m_mailboxUpdateResult = rv;
+            else if (extra != nsIImapUrl::ImapStatusNone)
+              m_mailboxUpdateResult = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+            if (NS_FAILED(m_mailboxUpdateResult)) break;
+          }
+#endif
         } break;
         case nsIImapUrl::nsImapSetMsgFlags: {
           // This changes the flags to the value in msgFlags. Any flags that

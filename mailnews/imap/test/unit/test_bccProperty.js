@@ -368,6 +368,577 @@ add_task(async function test_filterMetadataPrecedesPublication() {
   }
 });
 
+if (panorama) {
+  const deleteText =
+    "From: sender@example.invalid\r\nMessage-ID: <delete-target@example.invalid>\r\n" +
+    "Subject: Delete target\r\n" +
+    "References: <delete-r1@example.invalid> <delete-r2@example.invalid> <delete-r1@example.invalid>\r\n" +
+    "X-Publication: 18446744073709551615\r\nX-Priority: 2\r\n\r\n" +
+    "Retain the original delete source.\r\n";
+  const protectedText =
+    "From: sender@example.invalid\r\nMessage-ID: <delete-protected@example.invalid>\r\n" +
+    "Subject: Unrelated source\r\n\r\nKeep unrelated source bytes.\r\n";
+  let deleteHeader, protectedHeader, deleteMessage, protectedMessage;
+  const deleted = [];
+  let initialCount;
+
+  async function localBody(header) {
+    const uri = IMAPPump.inbox.getUriForMsg(header);
+    const listener = new PromiseTestUtils.PromiseStreamListener();
+    MailServices.messageServiceFromURI(uri).streamMessage(
+      uri,
+      listener,
+      null,
+      null,
+      false,
+      "",
+      true
+    );
+    return listener.promise;
+  }
+
+  async function deleteWithStatus(
+    status,
+    header = deleteHeader,
+    isMove = false
+  ) {
+    let starts = 0;
+    const stops = [];
+    const listener = new PromiseTestUtils.PromiseCopyListener({
+      onStartCopy() {
+        starts++;
+      },
+      onStopCopy(result) {
+        stops.push(result);
+      },
+    });
+    const completion = (async () => {
+      if (status == Cr.NS_OK) {
+        await listener.promise;
+      } else {
+        await Assert.rejects(
+          listener.promise,
+          error => error.message == String(status)
+        );
+      }
+    })();
+    IMAPPump.inbox.deleteMessages(
+      [header],
+      null,
+      true,
+      isMove,
+      listener,
+      false
+    );
+    Assert.deepEqual(stops, [], "Dispatch is not confirmed deletion");
+    await completion;
+    Assert.equal(starts, 1);
+    Assert.deepEqual(stops, [status]);
+    Assert.ok(!IMAPPump.inbox.gettingNewMessages);
+  }
+
+  add_task(async function test_deleteSetupUsesRealIngestion() {
+    IMAPPump.incomingServer.deleteModel = Ci.nsMsgImapDeleteModels.MoveToTrash;
+    initialCount = IMAPPump.inbox.getTotalMessages(false);
+    deleteMessage = new ImapMessage(
+      "data:text/plain;base64," + btoa(deleteText),
+      6201,
+      []
+    );
+    protectedMessage = new ImapMessage(
+      "data:text/plain;base64," + btoa(protectedText),
+      6202,
+      []
+    );
+    IMAPPump.mailbox.addMessage(deleteMessage);
+    IMAPPump.mailbox.addMessage(protectedMessage);
+    IMAPPump.mailbox.uidnext = 6203;
+    const listener = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.downloadAllForOffline(listener, null);
+    await listener.promise;
+    deleteHeader = IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(
+      "delete-target@example.invalid"
+    );
+    protectedHeader = IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(
+      "delete-protected@example.invalid"
+    );
+    Assert.ok(deleteHeader);
+    Assert.ok(protectedHeader);
+    Assert.notEqual(deleteHeader.messageKey, 6201);
+    Assert.notEqual(protectedHeader.messageKey, 6202);
+    Assert.equal(IMAPPump.inbox.getTotalMessages(false), initialCount + 2);
+    Assert.ok(
+      (await localBody(deleteHeader)).endsWith(
+        "Retain the original delete source.\r\n"
+      )
+    );
+    Assert.ok(
+      (await localBody(protectedHeader)).endsWith(
+        "Keep unrelated source bytes.\r\n"
+      )
+    );
+    const observer = {
+      msgsDeleted(headers) {
+        for (const header of headers) {
+          Assert.ok(
+            IMAPPump.inbox.msgDatabase.containsKey(header.messageKey),
+            "Deletion notification precedes removal"
+          );
+          Assert.equal(header.messageId, "delete-target@example.invalid");
+          Assert.equal(header.getUint32Property("uidOnServer"), 6201);
+          Assert.ok(header.storeToken);
+          Assert.equal(header.priority, Ci.nsMsgPriority.high);
+          Assert.equal(
+            header.getStringProperty("x-publication"),
+            "18446744073709551615"
+          );
+          Assert.ok(header.properties.includes("x-publication"));
+          Assert.deepEqual(
+            Array.from({ length: header.numReferences }, (_, i) =>
+              header.getStringReference(i)
+            ),
+            [
+              "delete-r1@example.invalid",
+              "delete-r2@example.invalid",
+              "delete-r1@example.invalid",
+            ]
+          );
+          deleted.push(header.messageKey);
+        }
+      },
+    };
+    MailServices.mfn.addListener(observer, MailServices.mfn.msgsDeleted);
+    registerCleanupFunction(() => MailServices.mfn.removeListener(observer));
+  });
+
+  add_task(async function test_failedDeleteKeepsSourceAndBody() {
+    const token = deleteHeader.storeToken;
+    IMAPPump.daemon.commandToFail = "UID";
+    try {
+      await deleteWithStatus(Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED);
+    } finally {
+      IMAPPump.daemon.commandToFail = "";
+    }
+    Assert.ok(IMAPPump.inbox.msgDatabase.containsKey(deleteHeader.messageKey));
+    Assert.equal(deleteHeader.storeToken, token);
+    Assert.deepEqual(deleted, []);
+    Assert.equal(IMAPPump.inbox.getTotalMessages(false), initialCount + 2);
+    Assert.ok(
+      (await localBody(deleteHeader)).endsWith(
+        "Retain the original delete source.\r\n"
+      )
+    );
+    Assert.ok(!deleteMessage.flags.includes("\\Deleted"));
+    Assert.equal(deleteMessage.getText(), deleteText);
+    Assert.equal(protectedMessage.getText(), protectedText);
+  });
+
+  add_task(async function test_databaseFailureKeepsBodyAndReportsError() {
+    const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const token = deleteHeader.storeToken;
+    core.connectionForTests.executeSimpleSQL(
+      "CREATE TEMP TRIGGER reject_confirmed_delete BEFORE DELETE ON messages " +
+        `WHEN OLD.id=${deleteHeader.messageKey} BEGIN SELECT RAISE(ABORT,'delete'); END`
+    );
+    try {
+      await deleteWithStatus(Cr.NS_ERROR_STORAGE_CONSTRAINT);
+    } finally {
+      core.connectionForTests.executeSimpleSQL(
+        "DROP TRIGGER reject_confirmed_delete"
+      );
+    }
+    Assert.ok(deleteMessage.flags.includes("\\Deleted"));
+    Assert.ok(IMAPPump.inbox.msgDatabase.containsKey(deleteHeader.messageKey));
+    Assert.equal(deleteHeader.storeToken, token);
+    Assert.deepEqual(
+      deleted,
+      [deleteHeader.messageKey],
+      "The confirmed delete command announces intent before the failed local removal"
+    );
+    Assert.ok(
+      (await localBody(deleteHeader)).endsWith(
+        "Retain the original delete source.\r\n"
+      )
+    );
+  });
+
+  add_task(async function test_confirmedDeleteSettlesOriginalKeyOnce() {
+    const protectedKey = protectedHeader.messageKey;
+    await deleteWithStatus(Cr.NS_OK);
+    Assert.ok(!IMAPPump.inbox.msgDatabase.containsKey(deleteHeader.messageKey));
+    Assert.deepEqual(deleted, [
+      deleteHeader.messageKey,
+      deleteHeader.messageKey,
+    ]);
+    Assert.equal(IMAPPump.inbox.getTotalMessages(false), initialCount + 1);
+    Assert.equal(protectedHeader.messageKey, protectedKey);
+    Assert.ok(IMAPPump.inbox.msgDatabase.containsKey(protectedKey));
+    Assert.ok(!protectedMessage.flags.includes("\\Deleted"));
+    Assert.equal(protectedMessage.getText(), protectedText);
+    Assert.ok(
+      (await localBody(protectedHeader)).endsWith(
+        "Keep unrelated source bytes.\r\n"
+      )
+    );
+    const commands = IMAPPump.server.playTransaction();
+    Assert.ok(
+      (Array.isArray(commands) ? commands : [commands])
+        .flatMap(item => item.them)
+        .some(command => /UID STORE 6201 .*\\Deleted/i.test(command))
+    );
+  });
+
+  add_task(
+    async function test_missingCaptureFailsClosedAndDuplicateCompletesOnce() {
+      let url;
+      const folderListener = IMAPPump.inbox.QueryInterface(Ci.nsIUrlListener);
+      let stops = 0;
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStartRunningUrl(value) {
+          folderListener.OnStartRunningUrl(value);
+        },
+        OnStopRunningUrl(value, status) {
+          url = value;
+          folderListener.OnStopRunningUrl(value, status);
+          stops++;
+        },
+      });
+      IMAPPump.inbox.storeImapFlags(
+        8,
+        false,
+        [protectedHeader.messageKey],
+        listener
+      );
+      await listener.promise;
+      Assert.equal(stops, 1);
+      folderListener.OnStopRunningUrl(url, Cr.NS_OK);
+      Assert.equal(stops, 1);
+      const uncaptured = Services.io.newURI(url.spec);
+      Assert.throws(
+        () => folderListener.OnStopRunningUrl(uncaptured, Cr.NS_OK),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+      Assert.ok(
+        IMAPPump.inbox.msgDatabase.containsKey(protectedHeader.messageKey)
+      );
+      Assert.ok(
+        (await localBody(protectedHeader)).endsWith(
+          "Keep unrelated source bytes.\r\n"
+        )
+      );
+    }
+  );
+
+  add_task(async function test_capturedAlreadyRemovedSourceCompletes() {
+    const text =
+      "From: sender@example.invalid\r\nMessage-ID: <already-removed@example.invalid>\r\n" +
+      "Subject: Known source retirement\r\n\r\nKeep the known source bytes.\r\n";
+    const message = new ImapMessage(
+      "data:text/plain;base64," + btoa(text),
+      6301,
+      []
+    );
+    IMAPPump.mailbox.addMessage(message);
+    IMAPPump.mailbox.uidnext = 6302;
+    await updateInbox();
+    const db = IMAPPump.inbox.msgDatabase;
+    const header = db.getMsgHdrForMessageID("already-removed@example.invalid");
+    Assert.ok(header);
+    Assert.notEqual(header.messageKey, 6301);
+    const originalStore = IMAP_RFC3501_handler.prototype.STORE;
+    let reached = false;
+    IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
+      if (uid && String(args[0]) == "6301") {
+        Assert.ok(db.containsKey(header.messageKey));
+        db.deleteMessages([header.messageKey], null);
+        reached = true;
+      }
+      return originalStore.call(this, args, uid);
+    };
+    try {
+      await deleteWithStatus(Cr.NS_OK, header, true);
+    } finally {
+      IMAP_RFC3501_handler.prototype.STORE = originalStore;
+    }
+    Assert.ok(reached, "The actual command ran after identity capture");
+    Assert.ok(!db.containsKey(header.messageKey));
+    Assert.ok(message.flags.includes("\\Deleted"));
+    Assert.equal(message.getText(), text);
+    Assert.deepEqual(
+      deleted,
+      [deleteHeader.messageKey, deleteHeader.messageKey],
+      "Do not emit another removal for an absent captured key"
+    );
+    Assert.ok(db.containsKey(protectedHeader.messageKey));
+  });
+
+  add_task(async function test_moveCleanupSuppressesDeleteNotification() {
+    const text =
+      "From: sender@example.invalid\r\nMessage-ID: <move-cleanup@example.invalid>\r\n" +
+      "Subject: Confirmed move cleanup\r\n\r\nOriginal move source.\r\n";
+    const message = new ImapMessage(
+      "data:text/plain;base64," + btoa(text),
+      6401,
+      []
+    );
+    IMAPPump.mailbox.addMessage(message);
+    IMAPPump.mailbox.uidnext = 6402;
+    await updateInbox();
+    const db = IMAPPump.inbox.msgDatabase;
+    const header = db.getMsgHdrForMessageID("move-cleanup@example.invalid");
+    Assert.ok(header);
+    Assert.notEqual(header.messageKey, 6401);
+    await deleteWithStatus(Cr.NS_OK, header, true);
+    Assert.ok(!db.containsKey(header.messageKey));
+    Assert.ok(message.flags.includes("\\Deleted"));
+    Assert.equal(message.getText(), text);
+    Assert.deepEqual(deleted, [
+      deleteHeader.messageKey,
+      deleteHeader.messageKey,
+    ]);
+    Assert.ok(db.containsKey(protectedHeader.messageKey));
+  });
+
+  add_task(async function test_droppedDeleteStoreRetriesAndSettlesOnce() {
+    const text =
+      "From: sender@example.invalid\r\nMessage-ID: <delete-retry@example.invalid>\r\n" +
+      "Subject: Retried delete\r\n\r\nRetain retry source bytes.\r\n";
+    const message = new ImapMessage(
+      "data:text/plain;base64," + btoa(text),
+      6501,
+      []
+    );
+    IMAPPump.mailbox.addMessage(message);
+    IMAPPump.mailbox.uidnext = 6502;
+    const download = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.downloadAllForOffline(download, null);
+    await download.promise;
+    const db = IMAPPump.inbox.msgDatabase;
+    const header = db.getMsgHdrForMessageID("delete-retry@example.invalid");
+    Assert.ok(header);
+    Assert.notEqual(header.messageKey, 6501);
+    Assert.ok(
+      (await localBody(header)).endsWith("Retain retry source bytes.\r\n")
+    );
+    const originalStore = IMAP_RFC3501_handler.prototype.STORE;
+    let attempts = 0;
+    IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
+      if (uid && String(args[0]) == "6501" && ++attempts == 1) {
+        Assert.ok(db.containsKey(header.messageKey));
+        Assert.ok(!message.flags.includes("\\Deleted"));
+        this.closing = true;
+        return "";
+      }
+      return originalStore.call(this, args, uid);
+    };
+    try {
+      await deleteWithStatus(Cr.NS_OK, header, true);
+    } finally {
+      IMAP_RFC3501_handler.prototype.STORE = originalStore;
+    }
+    Assert.equal(attempts, 2, "The dropped STORE receives one transport retry");
+    Assert.ok(!db.containsKey(header.messageKey));
+    Assert.ok(IMAPPump.mailbox._messages.includes(message));
+    Assert.ok(message.flags.includes("\\Deleted"));
+    Assert.equal(message.getText(), text);
+    Assert.ok(db.containsKey(protectedHeader.messageKey));
+    Assert.ok(!protectedMessage.flags.includes("\\Deleted"));
+    Assert.equal(protectedMessage.getText(), protectedText);
+    Assert.ok(
+      (await localBody(protectedHeader)).endsWith(
+        "Keep unrelated source bytes.\r\n"
+      )
+    );
+    const transactions = IMAPPump.server.playTransaction();
+    const commands = (
+      Array.isArray(transactions) ? transactions : [transactions]
+    ).flatMap(item => item.them);
+    Assert.equal(
+      commands.filter(command => /UID STORE 6501 .*\\Deleted/i.test(command))
+        .length,
+      2
+    );
+    Assert.equal(
+      commands.filter(command => /UID EXPUNGE 6501\b/i.test(command)).length,
+      0
+    );
+  });
+
+  add_task(async function test_unknownSourceRefusesBeforeDispatch() {
+    const keys = IMAPPump.inbox.msgDatabase.listAllKeys();
+    Assert.throws(
+      () =>
+        IMAPPump.inbox.deleteMessages(
+          [protectedHeader],
+          null,
+          true,
+          false,
+          null,
+          true
+        ),
+      error => error.result == Cr.NS_ERROR_NOT_IMPLEMENTED
+    );
+    Assert.throws(
+      () =>
+        MailServices.imap.addMessageFlags(
+          IMAPPump.inbox,
+          null,
+          "9999",
+          8,
+          true
+        ),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.throws(
+      () =>
+        MailServices.imap.addMessageFlags(IMAPPump.inbox, null, "1:*", 8, true),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.deepEqual(IMAPPump.inbox.msgDatabase.listAllKeys(), keys);
+    Assert.ok(!protectedMessage.flags.includes("\\Deleted"));
+    Assert.ok(
+      (await localBody(protectedHeader)).endsWith(
+        "Keep unrelated source bytes.\r\n"
+      )
+    );
+  });
+
+  add_task(async function test_unwritableCommandsDoNotSettleSource() {
+    const proto = IMAP_RFC3501_handler.prototype;
+    const originalSelect = proto.SELECT;
+    const originalFlags = IMAPPump.mailbox.permflags;
+    for (const readOnly of [true, false]) {
+      IMAPPump.incomingServer.closeCachedConnections();
+      await TestUtils.waitForCondition(
+        () => !IMAPPump.daemon.getConnections().length,
+        "The command must consume current SELECT permissions"
+      );
+      if (readOnly) {
+        proto.SELECT = function (args) {
+          const response = originalSelect.call(this, args);
+          this._readOnly = true;
+          return response.replace("OK [READ-WRITE]", "OK [READ-ONLY]");
+        };
+      } else {
+        IMAPPump.mailbox.permflags = originalFlags.filter(
+          flag => flag != "\\Deleted"
+        );
+      }
+      try {
+        await deleteWithStatus(
+          readOnly
+            ? Cr.NS_ERROR_NOT_AVAILABLE
+            : Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED,
+          protectedHeader
+        );
+      } finally {
+        proto.SELECT = originalSelect;
+        IMAPPump.mailbox.permflags = originalFlags;
+      }
+      Assert.ok(
+        IMAPPump.inbox.msgDatabase.containsKey(protectedHeader.messageKey)
+      );
+      Assert.ok(!protectedMessage.flags.includes("\\Deleted"));
+      Assert.deepEqual(deleted, [
+        deleteHeader.messageKey,
+        deleteHeader.messageKey,
+      ]);
+      Assert.ok(
+        (await localBody(protectedHeader)).endsWith(
+          "Keep unrelated source bytes.\r\n"
+        )
+      );
+    }
+  });
+
+  add_task(async function test_changedServerEpochRefusesOldCommand() {
+    const token = protectedHeader.storeToken;
+    IMAPPump.incomingServer.closeCachedConnections();
+    await TestUtils.waitForCondition(
+      () => !IMAPPump.daemon.getConnections().length,
+      "The flag command must select the actual server epoch"
+    );
+    IMAPPump.mailbox.uidvalidity = 7202;
+    const listener = new PromiseTestUtils.PromiseUrlListener();
+    const failure = (async () => {
+      await Assert.rejects(
+        listener.promise,
+        error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
+      );
+    })();
+    IMAPPump.inbox.storeImapFlags(
+      8,
+      true,
+      [protectedHeader.messageKey],
+      listener
+    );
+    await failure;
+    Assert.ok(
+      IMAPPump.inbox.msgDatabase.containsKey(protectedHeader.messageKey)
+    );
+    Assert.ok(!protectedMessage.flags.includes("\\Deleted"));
+    Assert.equal(protectedMessage.getText(), protectedText);
+    Assert.equal(protectedHeader.storeToken, token);
+    // Protocol identity is stale; verify retained bytes at their actual store.
+    const uri = IMAPPump.inbox.getUriForMsg(protectedHeader);
+    Assert.throws(
+      () =>
+        MailServices.messageServiceFromURI(uri).streamMessage(
+          uri,
+          null,
+          null,
+          null,
+          false,
+          "",
+          true
+        ),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    const stream = IMAPPump.inbox.msgStore.getMsgInputStream(
+      IMAPPump.inbox,
+      token,
+      0
+    );
+    const reader = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+      Ci.nsIScriptableInputStream
+    );
+    reader.init(stream);
+    let bytes = "";
+    try {
+      for (let chunk = reader.read(4096); chunk; chunk = reader.read(4096)) {
+        bytes += chunk;
+      }
+    } finally {
+      reader.close();
+    }
+    Assert.ok(bytes.endsWith("Keep unrelated source bytes.\r\n"));
+  });
+}
+
+add_task(function test_flagLookupErrorsReachCommonCleanup() {
+  const keys = IMAPPump.inbox.msgDatabase.listAllKeys();
+  const spec =
+    IMAPPump.incomingServer.rootFolder.URI + "/addmsgflags>UID>/INBOX>0>8";
+  const folderListener = IMAPPump.inbox.QueryInterface(Ci.nsIUrlListener);
+  for (const status of [Cr.NS_OK, Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED]) {
+    const expected =
+      status ||
+      (panorama ? Cr.NS_ERROR_NOT_AVAILABLE : Cr.NS_ERROR_INVALID_ARG);
+    IMAPPump.inbox.gettingNewMessages = true;
+    Assert.throws(
+      () => folderListener.OnStopRunningUrl(Services.io.newURI(spec), status),
+      error => error.result == expected
+    );
+    Assert.ok(
+      !IMAPPump.inbox.gettingNewMessages,
+      "A lookup error still runs common URL cleanup"
+    );
+    Assert.deepEqual(IMAPPump.inbox.msgDatabase.listAllKeys(), keys);
+  }
+});
+
 add_task(function endTest() {
   teardownIMAPPump();
 });

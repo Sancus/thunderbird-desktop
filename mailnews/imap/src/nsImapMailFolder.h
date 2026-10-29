@@ -454,6 +454,9 @@ class nsImapMailFolder : public nsMsgDBFolder,
                          uint32_t newMsgFlags, const nsACString& newMsgKeywords,
                          nsIMsgCopyServiceListener* listener,
                          nsIMsgWindow* msgWindow, bool allowUndo);
+#ifdef MOZ_PANORAMA
+  nsresult CompleteFlagTargets(nsIImapUrl* url, bool addFlags);
+#endif
   nsresult GetMoveCoalescer();
   nsresult PlaybackCoalescedOperations();
   nsresult AddNewImapHeaderToDB(nsIMsgDBHdr* aHeader);

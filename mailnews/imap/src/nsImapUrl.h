@@ -11,6 +11,7 @@
 #include "nsIWeakReferenceUtils.h"
 #include "nsIFile.h"
 #include "mozilla/Mutex.h"
+#include "mozilla/Maybe.h"
 
 class nsImapUrl : public nsIImapUrl,
                   public nsMsgMailNewsUrl,
@@ -45,6 +46,41 @@ class nsImapUrl : public nsIImapUrl,
   static nsresult EscapeSlashes(const char* sourcePath, char** resultPath);
   static nsresult UnescapeSlashes(nsACString& path);
   static nsresult UnescapeSlashes(char* path);
+#ifdef MOZ_PANORAMA
+  struct FlagTarget {
+    nsMsgKey key;
+    ImapUid uid;
+  };
+  struct FlagTargets {
+    uint64_t folderId;
+    uint32_t epoch;
+    nsTArray<FlagTarget> messages;
+  };
+  nsresult CaptureFlagTargets(nsIMsgFolder* folder, const nsACString& uidSet);
+  const mozilla::Maybe<FlagTargets>& CapturedFlagTargets() const {
+    return mFlagTargets;
+  }
+  nsresult SetExpectedUidValidity(uint32_t epoch);
+  uint32_t ExpectedUidValidity();
+  // Completion bookkeeping is confined to the main-thread URL listener.
+  bool BeginFlagCompletion() {
+    if (mFlagCompletionStarted) return false;
+    mFlagCompletionStarted = true;
+    return true;
+  }
+  void SetFlagDeleteIsMove(bool value) {
+    mozilla::MutexAutoLock lock(mLock);
+    mFlagDeleteIsMove = value;
+  }
+  bool FlagDeleteIsMove() {
+    mozilla::MutexAutoLock lock(mLock);
+    return mFlagDeleteIsMove;
+  }
+  nsresult FlagCompletionResult() const { return mFlagCompletionResult; }
+  void SetFlagCompletionResult(nsresult result) {
+    mFlagCompletionResult = result;
+  }
+#endif
 
  protected:
   virtual ~nsImapUrl();
@@ -118,6 +154,13 @@ class nsImapUrl : public nsIImapUrl,
   nsCString mURI;           // the RDF URI associated with this url.
   bool mAutodetectCharset;  // used by nsIMsgI18NUrl...
   mozilla::Mutex mLock;
+#ifdef MOZ_PANORAMA
+  uint32_t m_expectedUidValidity = 0;
+  mozilla::Maybe<FlagTargets> mFlagTargets;
+  bool mFlagCompletionStarted = false;
+  bool mFlagDeleteIsMove = false;
+  nsresult mFlagCompletionResult = NS_ERROR_IN_PROGRESS;
+#endif
 };
 
 #endif  // COMM_MAILNEWS_IMAP_SRC_NSIMAPURL_H_

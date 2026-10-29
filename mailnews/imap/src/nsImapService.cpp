@@ -59,6 +59,8 @@
 #include "mozilla/Components.h"
 #include "mozilla/LoadInfo.h"
 #include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_mail.h"
+#include "mozilla/ResultExtensions.h"
 #include "nsWhitespaceTokenizer.h"
 
 using mozilla::Preferences;
@@ -1470,6 +1472,16 @@ nsresult nsImapService::DiddleFlags(nsIMsgFolder* aImapMailFolder,
       urlSpec.Append('>');
       urlSpec.AppendInt(flags);
       rv = mailnewsurl->SetSpecInternal(urlSpec);
+#ifdef MOZ_PANORAMA
+      if (NS_SUCCEEDED(rv) &&
+          mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+          (flags & kImapMsgDeletedFlag) && strcmp(howToDiddle, "setmsgflags")) {
+        NS_ENSURE_TRUE(messageIdsAreUID, NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(
+            static_cast<nsImapUrl*>(imapUrl.get())
+                ->CaptureFlagTargets(aImapMailFolder, messageIdentifierList));
+      }
+#endif
       if (NS_SUCCEEDED(rv))
         rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, aURL);
     }

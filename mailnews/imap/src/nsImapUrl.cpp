@@ -24,6 +24,9 @@
 #include "nsServiceManagerUtils.h"
 #include "nsURLHelper.h"
 #include "mozilla/Logging.h"
+#include "mozilla/ResultExtensions.h"
+#include "nsIMsgDatabase.h"
+#include "nsIDBFolderInfo.h"
 
 using namespace mozilla;
 extern LazyLogModule IMAPCache;  // defined in nsImapProtocol.cpp
@@ -907,6 +910,65 @@ NS_IMETHODIMP nsImapUrl::GetMimePartSelectorDetected(
   return NS_OK;
 }
 
+#ifdef MOZ_PANORAMA
+nsresult nsImapUrl::SetExpectedUidValidity(uint32_t epoch) {
+  NS_ENSURE_TRUE(epoch, NS_ERROR_INVALID_ARG);
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(!m_expectedUidValidity || m_expectedUidValidity == epoch,
+                 NS_ERROR_NOT_AVAILABLE);
+  m_expectedUidValidity = epoch;
+  return NS_OK;
+}
+
+uint32_t nsImapUrl::ExpectedUidValidity() {
+  MutexAutoLock lock(mLock);
+  return m_expectedUidValidity;
+}
+
+nsresult nsImapUrl::CaptureFlagTargets(nsIMsgFolder* folder,
+                                       const nsACString& uidSet) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG_POINTER(folder);
+  NS_ENSURE_TRUE(uidSet.FindChar('*') == kNotFound, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_FALSE(mFlagTargets, NS_ERROR_ALREADY_INITIALIZED);
+  FlagTargets targets;
+  MOZ_TRY(folder->GetId(&targets.folderId));
+  NS_ENSURE_TRUE(targets.folderId, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDatabase> db;
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+  NS_ENSURE_STATE(db);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+  NS_ENSURE_STATE(info);
+  MOZ_TRY(info->GetImapUidValidity(&targets.epoch));
+  NS_ENSURE_TRUE(targets.epoch, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<ImapUid> uids;
+  ParseUidString(PromiseFlatCString(uidSet).get(), uids);
+  NS_ENSURE_FALSE(uids.IsEmpty(), NS_ERROR_INVALID_ARG);
+  uids.Sort();
+  ImapUid previous = 0;
+  for (ImapUid uid : uids) {
+    NS_ENSURE_TRUE(uid, NS_ERROR_INVALID_ARG);
+    if (uid == previous) continue;
+    previous = uid;
+    nsMsgKey key = MOZ_TRY(MsgKeyFromUid(db, uid));
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(header)));
+    NS_ENSURE_STATE(header);
+    nsCOMPtr<nsIMsgFolder> owner;
+    MOZ_TRY(header->GetFolder(getter_AddRefs(owner)));
+    NS_ENSURE_STATE(owner);
+    uint64_t ownerId;
+    MOZ_TRY(owner->GetId(&ownerId));
+    NS_ENSURE_TRUE(ownerId == targets.folderId, NS_ERROR_NOT_AVAILABLE);
+    targets.messages.AppendElement(FlagTarget{key, uid});
+  }
+  MOZ_TRY(SetExpectedUidValidity(targets.epoch));
+  mFlagTargets.emplace(std::move(targets));
+  return NS_OK;
+}
+#endif
+
 // this method is only called from the UI thread.
 NS_IMETHODIMP nsImapUrl::SetCopyState(nsISupports* copyState) {
   MutexAutoLock mon(mLock);
@@ -966,6 +1028,19 @@ nsresult nsImapUrl::Clone(nsIURI** _retval) {
   // mURI isn't set due to escaping issues.
   nsCOMPtr<nsIMsgMessageUrl> clonedUrl = do_QueryInterface(*_retval);
   if (clonedUrl) clonedUrl->SetUri(mURI);
+#ifdef MOZ_PANORAMA
+  nsCOMPtr<nsIImapUrl> clonedImap = do_QueryInterface(*_retval);
+  NS_ENSURE_STATE(clonedImap);
+  auto* clone = static_cast<nsImapUrl*>(clonedImap.get());
+  MutexAutoLock lock(mLock);
+  clone->m_expectedUidValidity = m_expectedUidValidity;
+  clone->mFlagDeleteIsMove = mFlagDeleteIsMove;
+  if (mFlagTargets) {
+    clone->mFlagTargets.emplace(FlagTargets{mFlagTargets->folderId,
+                                            mFlagTargets->epoch,
+                                            mFlagTargets->messages.Clone()});
+  }
+#endif
   return rv;
 }
 

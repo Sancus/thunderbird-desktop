@@ -85,6 +85,8 @@ tags = ["foldernames"]
 
 ["test_imapHdrStreaming.js"]
 
+["test_imapHeaderFields.js"]
+
 ["test_imapHighWater.js"]
 
 ["test_imapHugeFetchIndex.js"]

@@ -1893,14 +1893,18 @@ export class IMAP_RFC3501_handler {
             );
           }
         }
-        data += joinList.join("\r\n") + "\r\n";
+        data += joinList.join("\r\n") + (joinList.length ? "\r\n\r\n" : "\r\n");
         break;
       }
       case "HEADER.FIELDS.NOT": {
         const joinList = [];
         const headers = message.getPartHeaders(partNum);
-        for (const header of headers) {
-          if (!(header in queryArgs)) {
+        const excludedHeaders = new Set(
+          queryArgs.map(header => header.toLowerCase())
+        );
+        for (let header of headers.keys()) {
+          header = header.toLowerCase();
+          if (!excludedHeaders.has(header)) {
             joinList.push(
               headers
                 .getRawHeader(header)
@@ -1909,7 +1913,7 @@ export class IMAP_RFC3501_handler {
             );
           }
         }
-        data += joinList.join("\r\n") + "\r\n";
+        data += joinList.join("\r\n") + (joinList.length ? "\r\n\r\n" : "\r\n");
         break;
       }
       default:

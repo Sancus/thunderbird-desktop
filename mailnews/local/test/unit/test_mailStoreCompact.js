@@ -7,6 +7,10 @@
  * Tests _only_ the mailstore side - no folder/db involvement!
  */
 
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
 const { MessageGenerator } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
 );
@@ -873,7 +877,7 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     }
   });
 
-  if (Services.appinfo.OS == "WINNT") {
+  if (AppConstants.platform == "win") {
     add_task(async function test_folderRelocationRenameFailure() {
       const {
         folder,

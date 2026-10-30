@@ -11910,4 +11910,99 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_TRUE(text.IsEmpty());
 }
 
+TEST_F(DeliveryCoreReferences, FolderMissingParentKeepsPhysicalRowsAndOutputs) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& initial = mCore->FolderDB();
+  uint64_t orphan, leaf, control, root;
+  ASSERT_EQ(NS_OK, initial.GetFolderRoot(mFolderId, &root));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(mFolderId, "Orphan"_ns, &orphan));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(orphan, "Leaf"_ns, &leaf));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(mFolderId, "Control"_ns, &control));
+  nsMsgKey key;
+  const nsTArray<nsCString> references{"one"_ns, "two"_ns, "one"_ns};
+  ASSERT_EQ(NS_OK, AddAt(leaf, "retained-orphan-row"_ns, references, key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageProperty(key, "Exact"_ns, "00042"_ns));
+  Stop();
+  const uint64_t missingParent = INT64_MAX;
+  {
+    // Keep genuine native rows, but make one stored ancestor unavailable.
+    nsCOMPtr<mozIStorageConnection> writer;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(writer)));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    auto close = MakeScopeExit([&] {
+      if (stmt) EXPECT_EQ(NS_OK, stmt->Finalize());
+      EXPECT_EQ(NS_OK, writer->Close());
+    });
+    ASSERT_EQ(NS_OK, writer->CreateStatement(
+                         "UPDATE folders SET parent=:parent WHERE id=:id"_ns,
+                         getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, orphan));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("parent"_ns, missingParent));
+    ASSERT_EQ(NS_OK, stmt->Execute());
+  }
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t watermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+  for (uint64_t id : {orphan, leaf}) {
+    uint64_t value = UINT64_MAX;
+    EXPECT_EQ(NS_ERROR_UNEXPECTED, folders.GetFolderRoot(id, &value));
+    EXPECT_EQ(UINT64_MAX, value);
+    nsCString path("unchanged path");
+    EXPECT_EQ(NS_ERROR_UNEXPECTED, folders.GetFolderPath(id, path));
+    EXPECT_EQ("unchanged path"_ns, path);
+    nsTArray<uint64_t> ancestors{UINT64_MAX};
+    EXPECT_EQ(NS_ERROR_UNEXPECTED, folders.GetFolderAncestors(id, ancestors));
+    EXPECT_EQ((nsTArray<uint64_t>{UINT64_MAX}), ancestors);
+    bool descendant = true;
+    EXPECT_EQ(NS_ERROR_UNEXPECTED,
+              folders.GetFolderIsDescendantOf(id, mFolderId, &descendant));
+    EXPECT_TRUE(descendant);
+    nsCOMPtr<nsIMsgFolder> facade;
+    EXPECT_EQ(NS_ERROR_UNEXPECTED,
+              folders.GetMsgFolderForFolder(id, getter_AddRefs(facade)));
+    EXPECT_FALSE(facade);
+  }
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, folders.MoveFolderTo(leaf, control));
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, folders.MoveFolderTo(control, leaf));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckFolderIdentity(orphan, missingParent, "Orphan"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(leaf, orphan, "Leaf"_ns));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckFolderIdentity(control, mFolderId, "Control"_ns));
+  uint64_t value = 0;
+  ASSERT_EQ(NS_OK, folders.GetFolderRoot(control, &value));
+  EXPECT_EQ(root, value);
+  nsTArray<uint64_t> descendants;
+  ASSERT_EQ(NS_OK, folders.GetFolderDescendants(mFolderId, descendants));
+  EXPECT_EQ((nsTArray<uint64_t>{control}), descendants);
+  bool exists = false;
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.GetMessageFolderId(key, value));
+  EXPECT_EQ(leaf, value);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "Exact"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, db.GetMessageReferences(key, stored));
+  EXPECT_EQ(references, stored);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "caller"_ns, "pending"_ns));
+  nsTArray<uint64_t> ancestors{UINT64_MAX};
+  EXPECT_EQ(NS_ERROR_UNEXPECTED, folders.GetFolderAncestors(leaf, ancestors));
+  EXPECT_EQ((nsTArray<uint64_t>{UINT64_MAX}), ancestors);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "caller"_ns, text));
+  EXPECT_EQ("pending"_ns, text);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  uint64_t after;
+  ASSERT_EQ(NS_OK, SearchWatermark(after));
+  EXPECT_EQ(watermark, after);
+}
+
 }  // namespace mozilla::mailnews

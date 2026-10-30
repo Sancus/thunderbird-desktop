@@ -12,6 +12,22 @@ ChromeUtils.defineESModuleGetters(lazy, {
   VCardService: "resource:///modules/VCardUtils.sys.mjs",
 });
 
+/**
+ * Bind a UID for a matching CAST(:parameter AS TEXT) without consuming a BOM.
+ * Empty text uses the ordinary binder because an empty blob binds as NULL.
+ *
+ * @param {mozIStorageStatement} statement - Statement containing the parameter.
+ * @param {string} name - Parameter name.
+ * @param {string} uid - Exact list or card UID.
+ */
+function bindUID(statement, name, uid) {
+  if (uid.length) {
+    statement.bindUTF8StringAsBlobByName(name, uid);
+  } else {
+    statement.bindByName(name, uid);
+  }
+}
+
 export function AddrBookMailingList(uid, parent, name, nickName, description) {
   this._uid = uid;
   this._parent = parent;
@@ -71,9 +87,9 @@ AddrBookMailingList.prototype = {
       },
       get childCards() {
         const selectStatement = self._parent._dbConnection.createStatement(
-          "SELECT card FROM list_cards WHERE list = :list ORDER BY oid"
+          "SELECT card FROM list_cards WHERE list = CAST(:list AS TEXT) ORDER BY oid"
         );
-        selectStatement.params.list = self._uid;
+        bindUID(selectStatement, "list", self._uid);
         const results = [];
         while (selectStatement.executeStep()) {
           results.push(self._parent.getCard(selectStatement.row.card));
@@ -213,10 +229,10 @@ AddrBookMailingList.prototype = {
           card = self._parent.addCard(card);
         }
         const insertStatement = self._parent._dbConnection.createStatement(
-          "REPLACE INTO list_cards (list, card) VALUES (:list, :card)"
+          "REPLACE INTO list_cards (list, card) VALUES (CAST(:list AS TEXT), CAST(:card AS TEXT))"
         );
-        insertStatement.params.list = self._uid;
-        insertStatement.params.card = card.UID;
+        bindUID(insertStatement, "list", self._uid);
+        bindUID(insertStatement, "card", card.UID);
         insertStatement.execute();
         Services.obs.notifyObservers(
           card,
@@ -235,11 +251,11 @@ AddrBookMailingList.prototype = {
         }
 
         const deleteCardStatement = self._parent._dbConnection.createStatement(
-          "DELETE FROM list_cards WHERE list = :list AND card = :card"
+          "DELETE FROM list_cards WHERE list = CAST(:list AS TEXT) AND card = CAST(:card AS TEXT)"
         );
         for (const card of cards) {
-          deleteCardStatement.params.list = self._uid;
-          deleteCardStatement.params.card = card.UID;
+          bindUID(deleteCardStatement, "list", self._uid);
+          bindUID(deleteCardStatement, "card", card.UID);
           deleteCardStatement.execute();
           if (self._parent._dbConnection.affectedRows) {
             Services.obs.notifyObservers(

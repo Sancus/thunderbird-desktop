@@ -424,3 +424,117 @@ add_task(async function cleanUp() {
   observer.checkEvents();
   observer.cleanUp();
 });
+
+add_task(async function test_exactMailingListMemberUIDs() {
+  const { SQLiteDirectory } = ChromeUtils.importESModule(
+    "resource:///modules/SQLiteDirectory.sys.mjs"
+  );
+  const { AddrBookMailingList } = ChromeUtils.importESModule(
+    "resource:///modules/AddrBookMailingList.sys.mjs"
+  );
+  const prefId = MailServices.ab.newAddressBook(
+    "Exact member UIDs",
+    "",
+    Ci.nsIAbManager.JS_DIRECTORY_TYPE
+  );
+  const directory = MailServices.ab.getDirectoryFromId(prefId);
+  const uri = directory.URI;
+  registerCleanupFunction(async () => {
+    if (MailServices.ab.directories.some(item => item.URI == uri)) {
+      await promiseDirectoryRemoved(uri);
+    }
+  });
+  const parent = SQLiteDirectory.forFile(directory.fileName);
+  Assert.equal(parent.URI, uri);
+  const cards = ["\uFEFFmember-id", "member-id", "member-\uFEFF\u00E9"].map(
+    (uid, index) => {
+      const card = Cc["@mozilla.org/addressbook/cardproperty;1"].createInstance(
+        Ci.nsIAbCard
+      );
+      card.UID = uid;
+      card.primaryEmail = `member${index}@example.invalid`;
+      const added = directory.addCard(card);
+      Assert.equal(added.UID, uid);
+      Assert.equal(added.primaryEmail, card.primaryEmail);
+      return added;
+    }
+  );
+  const rawLists = ["\uFEFFlist-id", "list-id"].map(
+    (uid, index) =>
+      new AddrBookMailingList(uid, parent, `Exact list ${index}`, "", "")
+  );
+  for (const mailingList of rawLists) {
+    parent.saveList(mailingList);
+  }
+  const [exact, plain] = rawLists.map(mailingList => mailingList.asDirectory);
+  const events = [];
+  const observe = (subject, topic, data) => {
+    events.push([topic, subject.QueryInterface(Ci.nsIAbCard).UID, data]);
+  };
+  const topics = ["addrbook-list-member-added", "addrbook-list-member-removed"];
+  for (const topic of topics) {
+    Services.obs.addObserver(observe, topic);
+  }
+  registerCleanupFunction(() => {
+    for (const topic of topics) {
+      Services.obs.removeObserver(observe, topic);
+    }
+  });
+  for (const card of cards) {
+    exact.addCard(card);
+  }
+  plain.addCard(cards[1]);
+  Assert.deepEqual(
+    exact.childCards.map(card => [card.UID, card.primaryEmail]),
+    cards.map(card => [card.UID, card.primaryEmail]),
+    "Exact member identities and insertion order survive enumeration"
+  );
+  Assert.deepEqual(
+    plain.childCards.map(card => card.UID),
+    [cards[1].UID]
+  );
+  Assert.deepEqual(events, [
+    ...cards.map(card => ["addrbook-list-member-added", card.UID, exact.UID]),
+    ["addrbook-list-member-added", cards[1].UID, plain.UID],
+  ]);
+  events.length = 0;
+  exact.deleteCards([cards[0]]);
+  Assert.deepEqual(
+    exact.childCards.map(card => card.UID),
+    [cards[1].UID, cards[2].UID]
+  );
+  Assert.deepEqual(
+    plain.childCards.map(card => card.UID),
+    [cards[1].UID]
+  );
+  Assert.deepEqual(events, [
+    ["addrbook-list-member-removed", cards[0].UID, exact.UID],
+  ]);
+  events.length = 0;
+  exact.deleteCards([cards[0]]);
+  Assert.deepEqual(events, [], "A missing membership emits no removal event");
+  const connection = parent._dbConnection;
+  connection.executeSimpleSQL(
+    "ALTER TABLE list_cards RENAME TO unavailable_members"
+  );
+  try {
+    Assert.throws(() => exact.childCards, /NS_ERROR_FAILURE/);
+    Assert.throws(() => exact.addCard(cards[0]), /NS_ERROR_FAILURE/);
+    Assert.throws(() => exact.deleteCards([cards[1]]), /NS_ERROR_FAILURE/);
+    Assert.deepEqual(events, [], "Failed storage does not announce membership");
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_members RENAME TO list_cards"
+    );
+  }
+  Assert.deepEqual(
+    exact.childCards.map(card => card.UID),
+    [cards[1].UID, cards[2].UID]
+  );
+  Assert.deepEqual(
+    plain.childCards.map(card => card.UID),
+    [cards[1].UID]
+  );
+  Assert.equal(directory.childNodes.length, 2);
+  Assert.equal(directory.childCards.filter(card => !card.isMailList).length, 3);
+});

@@ -78,7 +78,14 @@ async function privacyFixture(name) {
         throw error;
       }
     } finally {
-      await provider.close();
+      if (fixture.expectedFailure) {
+        await Assert.rejects(
+          provider.close(),
+          error => error === fixture.expectedFailure
+        );
+      } else {
+        await provider.close();
+      }
       conversation.removeObserver(ui._convObservers.get(conversation));
       closeLogWriter(conversation);
       for (const path of writer.paths) {
@@ -174,12 +181,12 @@ add_task(async function test_closeCapturesWriterPathsAndDrainsTheRefresh() {
   await f.provider.refreshLog(path);
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
-  const original = f.provider.refreshLog.bind(f.provider);
+  const original = f.provider.redactMessage.bind(f.provider);
   let completed = false;
-  f.provider.refreshLog = async (...args) => {
+  f.provider.redactMessage = async (...args) => {
+    const result = await original(...args);
     entered.resolve();
     await release.promise;
-    const result = await original(...args);
     completed = true;
     return result;
   };
@@ -207,6 +214,9 @@ add_task(async function test_firstPrivacyFailureHoldsFlushAndClose() {
   await writePrivacyMessage(f, "private-id", "sourceuntouchedneedle");
   const path = f.writer.currentPath;
   const before = await IOUtils.readUTF8(path);
+  await f.provider.refreshLog(path);
+  const hit = (await f.provider.search("sourceuntouchedneedle")).items[0];
+  Assert.equal(hit.id, chatSearchDocumentId(path));
   const failure = new Error("Original queued privacy source failure");
   f.expectedFailure = failure;
   queueFileOperation(path, () => Promise.reject(failure));
@@ -217,7 +227,19 @@ add_task(async function test_firstPrivacyFailureHoldsFlushAndClose() {
   await Assert.rejects(f.observer.flush(), error => error === failure);
   Assert.deepEqual(f.errors, [failure]);
   Assert.equal(await IOUtils.readUTF8(path), before);
+  await Assert.rejects(
+    f.provider.search("sourceuntouchedneedle"),
+    error => error === failure
+  );
+  await Assert.rejects(f.provider.getText(hit.id), error => error === failure);
+  await Assert.rejects(f.provider.resolveLog(hit), error => error === failure);
+  await f.provider.refreshLog(path);
+  await Assert.rejects(
+    f.provider.search("sourceuntouchedneedle"),
+    error => error === failure
+  );
   await Assert.rejects(f.observer.close(), error => error === failure);
+  await Assert.rejects(f.provider.close(), error => error === failure);
 });
 
 add_task(
@@ -325,3 +347,89 @@ add_task(async function test_noLogErasesStoredTextWhileIndexingIsDisabled() {
   }
   Assert.deepEqual(f.errors, []);
 });
+
+add_task(
+  async function test_pendingRedactionWithholdsLookupsAndDrainsProviderClose() {
+    const f = await privacyFixture("pending");
+    await writePrivacyMessage(f, "private-id", "pendingprivateneedle");
+    await writePrivacyMessage(f, "keep-id", "pendingkeptneedle");
+    const path = f.writer.currentPath;
+    const id = chatSearchDocumentId(path);
+    await f.provider.refreshLog(path);
+    const hit = (await f.provider.search("pendingprivateneedle")).items[0];
+    Assert.equal(hit.id, id);
+    const entered = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    registerCleanupFunction(() => release.resolve());
+    const held = queueFileOperation(path, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    f.conversation.updateMessage("sender", "neverpersistpendingneedle", {
+      noLog: true,
+      remoteId: "private-id",
+    });
+    let delivered = false;
+    const search = (async () => {
+      await Assert.rejects(
+        f.provider.search("pendingprivateneedle"),
+        /Chat privacy changed during search/
+      );
+      delivered = true;
+    })();
+    const text = f.provider.getText(id);
+    const resolved = f.provider.resolveLog(hit);
+    const controller = new AbortController();
+    const reason = new Error("Cancel an overlapping chat privacy read");
+    const cancelled = (async () => {
+      await Assert.rejects(
+        f.provider.getText(id, { signal: controller.signal }),
+        error => error === reason
+      );
+    })();
+    controller.abort(reason);
+    let closed = false;
+    const closing = f.provider.close();
+    Assert.equal(f.provider.close(), closing);
+    const observedClose = closing.then(() => {
+      closed = true;
+    });
+    await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+    Assert.ok(
+      !delivered,
+      "No search result escapes the pending privacy operation"
+    );
+    Assert.ok(!closed, "Provider close waits for admitted privacy writes");
+    release.resolve();
+    await held;
+    await search;
+    Assert.equal(await text, null);
+    Assert.equal((await resolved).status, "stale");
+    await cancelled;
+    await observedClose;
+    await f.observer.flush();
+    Assert.deepEqual(f.errors, []);
+    await f.observer.close();
+    const reopened = await ChatSearchProvider.open(f.file);
+    try {
+      Assert.deepEqual(
+        (await reopened.search("pendingprivateneedle")).items,
+        []
+      );
+      Assert.equal(
+        (await reopened.getText(id)).body,
+        "sender: pendingkeptneedle"
+      );
+      Assert.deepEqual(
+        (await reopened.search("pendingkeptneedle")).items.map(item => item.id),
+        [id]
+      );
+      const raw = await IOUtils.readUTF8(path);
+      Assert.ok(!raw.includes("pendingprivateneedle"));
+      Assert.ok(!raw.includes("neverpersistpendingneedle"));
+    } finally {
+      await reopened.close();
+    }
+  }
+);

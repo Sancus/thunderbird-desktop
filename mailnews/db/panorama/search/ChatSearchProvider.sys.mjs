@@ -8,6 +8,7 @@ import {
   queueFileOperation,
 } from "resource:///modules/logger.sys.mjs";
 import { PanoramaSearchIndex } from "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs";
+import { persistChatSearchRedaction } from "resource:///modules/panorama/ChatSearchRedaction.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineLazyGetter(lazy, "plainText", () =>
@@ -232,14 +233,21 @@ async function readLogConversation(filePath, source, signal) {
  *
  * Callers supply changed files, or an active conversation whose writer has one
  * file. This class does not subscribe to observers or discover historical logs.
- * Cross-file edits and persistent noLog invalidation need logger support before
- * activation. Recovered text without verified log policy is not accepted here.
+ * Explicit privacy updates use the existing logger redaction helper. Activation
+ * still needs durable missed-event delivery and verified historical mapping.
+ * Recovered text without verified log policy is not accepted here.
  */
 export class ChatSearchProvider {
   /** @type {PanoramaSearchIndex} */
   #index;
   /** @type {Promise<void>} */
   #pending = Promise.resolve();
+  /** @type {Set<Promise<string[]>>} */
+  #redactions = new Set();
+  #privacyRevision = 0;
+  #privacyFailed = false;
+  /** @type {unknown} */
+  #privacyFailure;
   /** @type {?Promise<void>} */
   #closing = null;
 
@@ -321,6 +329,19 @@ export class ChatSearchProvider {
     if (this.#closing) {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
+    return this.#queueRefresh(id, filePath, signal, eraseStoredText);
+  }
+
+  /**
+   * Queues an admitted refresh, including privacy work accepted before close.
+   *
+   * @param {string} id - Validated physical log identity.
+   * @param {string} filePath - Validated current path.
+   * @param {AbortSignal} [signal] - Cancels delivery after queued I/O.
+   * @param {boolean} [eraseStoredText=false] - Erase old semantic text first.
+   * @returns {Promise<{id: string, indexed: boolean}>} Publication result.
+   */
+  #queueRefresh(id, filePath, signal, eraseStoredText = false) {
     const result = this.#pending.then(async () => {
       signal?.throwIfAborted();
       if (eraseStoredText) {
@@ -334,6 +355,65 @@ export class ChatSearchProvider {
       () => {}
     );
     return result;
+  }
+
+  /**
+   * Persists an explicit noLog/deleted update and erases affected stored text.
+   * Captures active logger paths before returning. Lookups withhold delivery
+   * until observed redactions finish, and reject the first privacy failure.
+   * This does not recover missed events or historical closed-writer paths.
+   *
+   * @param {prplIMessage} message - Existing notification with a real remoteId.
+   * @returns {Promise<string[]>} Changed paths after source and sidecar writes.
+   * @throws {Error} Original source/storage error, or closing provider.
+   */
+  redactMessage(message) {
+    if (this.#closing) {
+      return Promise.reject(new Error("Chat search provider is closing"));
+    }
+    const redaction = persistChatSearchRedaction(message);
+    this.#privacyRevision++;
+    const result = redaction.then(async paths => {
+      for (const path of paths) {
+        await this.#queueRefresh(
+          chatSearchDocumentId(path),
+          path,
+          undefined,
+          true
+        );
+      }
+      return paths;
+    });
+    this.#redactions.add(result);
+    result.then(
+      () => this.#redactions.delete(result),
+      error => {
+        this.#redactions.delete(result);
+        if (!this.#privacyFailed) {
+          this.#privacyFailed = true;
+          this.#privacyFailure = error;
+        }
+      }
+    );
+    return result;
+  }
+
+  /**
+   * Drains observed redactions and preserves the first failure.
+   *
+   * @param {AbortSignal} [signal] - Cancels delivery after pending I/O.
+   * @returns {Promise<void>} Resolves after source and sidecar writes.
+   * @throws {Error} Cancellation reason or the original privacy failure.
+   */
+  async #waitForRedactions(signal) {
+    signal?.throwIfAborted();
+    while (this.#redactions.size) {
+      await Promise.allSettled([...this.#redactions]);
+      signal?.throwIfAborted();
+    }
+    if (this.#privacyFailed) {
+      throw this.#privacyFailure;
+    }
   }
 
   /**
@@ -412,6 +492,8 @@ export class ChatSearchProvider {
   /**
    * Searches explicitly indexed transcripts using current logger revisions.
    * Earlier accepted refreshes drain first; later file edits hide stale hits.
+   * Observed privacy changes invalidate an overlapping result. A caller may
+   * retry after redaction completes. Privacy failures retain their original error.
    * This does not discover logs or activate a chat observer.
    *
    * @param {string} text - Search words or quoted phrases.
@@ -425,10 +507,22 @@ export class ChatSearchProvider {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
     const controls = { ...options };
+    const revision = this.#redactions.size ? null : this.#privacyRevision;
     const result = this.#pending.then(async () => {
       controls.signal?.throwIfAborted();
       const page = await this.#index.search(text, controls);
       controls.signal?.throwIfAborted();
+      return page;
+    });
+    this.#pending = result.then(
+      () => {},
+      () => {}
+    );
+    return result.then(async page => {
+      await this.#waitForRedactions(controls.signal);
+      if (revision !== this.#privacyRevision) {
+        throw new Error("Chat privacy changed during search");
+      }
       if (
         !Services.prefs.getBoolPref(
           "mailnews.database.global.indexer.enabled",
@@ -439,11 +533,6 @@ export class ChatSearchProvider {
       }
       return page;
     });
-    this.#pending = result.then(
-      () => {},
-      () => {}
-    );
-    return result;
   }
 
   /**
@@ -453,7 +542,9 @@ export class ChatSearchProvider {
    * grouped-day log. Readers must use the returned conversation, not reparse
    * the log unchecked. Persisted noLog records prevent opening the file.
    * A change between source validation and parsing returns a non-ready status;
-   * unrelated parser failures still reject. No reader or network is opened.
+   * unrelated parser failures still reject. An overlapping privacy update returns
+   * stale; a failed redaction rejects with its original error.
+   * No reader or network is opened.
    *
    * @param {SearchHit} hit - Captured transcript identity and exact revisions.
    * @param {object} [options={}] - Opening resolution controls.
@@ -477,6 +568,7 @@ export class ChatSearchProvider {
       throw new TypeError("A current chat search hit is required");
     }
     const filePath = logPath(request.id);
+    const revision = this.#redactions.size ? null : this.#privacyRevision;
     if (this.#closing) {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
@@ -565,11 +657,18 @@ export class ChatSearchProvider {
       () => {},
       () => {}
     );
-    return result;
+    return result.then(async resolved => {
+      await this.#waitForRedactions(signal);
+      return revision === this.#privacyRevision
+        ? resolved
+        : { status: "stale" };
+    });
   }
 
   /**
    * Reads eligible retained text through current source revision checks.
+   * Returns null if observed redaction overlaps the read. Privacy failures reject
+   * with their original error, including when source bytes did not change.
    *
    * @param {string} id - Canonical log identity.
    * @param {object} [options={}] - Existing index cancellation options.
@@ -577,16 +676,43 @@ export class ChatSearchProvider {
    */
   getText(id, options = {}) {
     logPath(id);
-    return this.#index.getText(id, options);
+    if (this.#closing) {
+      return Promise.reject(new Error("Chat search provider is closing"));
+    }
+    const revision = this.#redactions.size ? null : this.#privacyRevision;
+    return this.#index.getText(id, options).then(async text => {
+      await this.#waitForRedactions(options.signal);
+      return revision === this.#privacyRevision ? text : null;
+    });
   }
 
   /**
-   * Closes the dedicated writer after queued work drains.
+   * Closes the dedicated writer after queued work and redactions drain.
+   * Detach the observer first. A privacy failure still closes storage and rejects
+   * with the original error, or both errors if storage close also fails.
    *
    * @returns {Promise<void>} Resolves after storage closes.
+   * @throws {Error} Original privacy/storage failure, or both in AggregateError.
    */
   close() {
-    this.#closing ??= this.#pending.then(() => this.#index.close());
+    this.#closing ??= (async () => {
+      try {
+        await this.#waitForRedactions();
+      } catch (error) {
+        try {
+          await this.#pending;
+          await this.#index.close();
+        } catch (closeError) {
+          throw new AggregateError(
+            [error, closeError],
+            "Chat privacy and storage close failed"
+          );
+        }
+        throw error;
+      }
+      await this.#pending;
+      await this.#index.close();
+    })();
     return this.#closing;
   }
 }

@@ -3,7 +3,6 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { AsyncShutdown } from "resource://gre/modules/AsyncShutdown.sys.mjs";
-import { persistChatSearchRedaction } from "resource:///modules/panorama/ChatSearchRedaction.sys.mjs";
 
 /**
  * Persists explicit chat privacy updates from the existing new-text notification,
@@ -11,9 +10,9 @@ import { persistChatSearchRedaction } from "resource:///modules/panorama/ChatSea
  * UIConversation forwards edited/deleted messages through that same topic.
  * Display-only remove-text and ordinary messages do not trigger a redaction.
  *
- * Startup is explicit and is not wired into MailGlue. flush drains observed work,
- * not an atomic query gate. Full activation remains held for durable delivery,
- * historical mapping and privacy eligibility; a failed flush preserves that hold.
+ * Startup is explicit and is not wired into MailGlue. The provider withholds
+ * lookups during observed redactions. Full activation remains held for durable
+ * missed-event delivery and historical mapping; a failed flush preserves that hold.
  * Ordinary change indexing is separate.
  */
 export class ChatSearchRedactionObserver {
@@ -22,7 +21,7 @@ export class ChatSearchRedactionObserver {
   #provider;
   /** @type {function(unknown): void} */
   #onError;
-  /** @type {Set<Promise<void>>} */
+  /** @type {Set<Promise<string[]>>} */
   #pending = new Set();
   /** @type {unknown} */
   #failure;
@@ -39,7 +38,7 @@ export class ChatSearchRedactionObserver {
    */
   constructor(provider, { onError = console.error } = {}) {
     if (
-      typeof provider?.refreshLog != "function" ||
+      typeof provider?.redactMessage != "function" ||
       typeof onError != "function"
     ) {
       throw new TypeError("A chat provider and error reporter are required");
@@ -90,7 +89,7 @@ export class ChatSearchRedactionObserver {
       ) {
         return;
       }
-      redaction = persistChatSearchRedaction({
+      redaction = this.#provider.redactMessage({
         noLog: subject.noLog,
         deleted: subject.deleted,
         remoteId: subject.remoteId,
@@ -99,11 +98,7 @@ export class ChatSearchRedactionObserver {
     } catch (error) {
       redaction = Promise.reject(error);
     }
-    const work = redaction.then(async paths => {
-      for (const path of paths) {
-        await this.#provider.refreshLog(path, { eraseStoredText: true });
-      }
-    });
+    const work = redaction;
     this.#pending.add(work);
     work.then(
       () => this.#pending.delete(work),

@@ -484,3 +484,65 @@ add_task(
     await assertOriginals(input);
   }
 );
+
+add_task(
+  unixOnly(),
+  async function test_changedCommittedBookCannotCheckpointBeforeRepair() {
+    const input = await bookInput();
+    const token = await input.journal.beginBookImport("original-book");
+    let db = SQLiteDirectory.createMigrationStage(
+      new FileUtils.File(input.stagingPath)
+    );
+    let committed;
+    try {
+      committed = SQLiteDirectory.importMorkSnapshot(db, input.bytes, token);
+      db.executeSimpleSQL(
+        "DELETE FROM migration_properties WHERE kind='card' AND name='Notes'"
+      );
+    } finally {
+      db.close();
+    }
+    input.journal.close();
+    input.journal = await MigrationJournal.open(input.path, input.profilePath);
+    await Assert.rejects(
+      resumeMorkBookImports(input.journal, input.lock),
+      /Staged book differs: raw properties/
+    );
+    Assert.equal(input.journal.state.stage, "import");
+    Assert.equal(input.journal.state.books[0].state, "importing");
+    Assert.equal(input.journal.state.books[0].receipt, null);
+    db = openStage(input);
+    try {
+      Assert.deepEqual(
+        rows(db, "SELECT uid FROM migration_records WHERE kind='card'"),
+        [[committed.cards[0][1]]],
+        "The original committed identity is retained, not called rolled back"
+      );
+      Assert.deepEqual(
+        rows(
+          db,
+          "SELECT COUNT(*) FROM migration_properties WHERE kind='card' AND name='Notes'"
+        ),
+        [["0"]],
+        "Reconciliation does not silently repair missing source data"
+      );
+      db.executeSimpleSQL(
+        "INSERT INTO migration_properties VALUES('card','1','Notes','')"
+      );
+    } finally {
+      db.close();
+    }
+    await assertOriginals(input);
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.equal(input.journal.state.stage, "validate");
+    Assert.deepEqual(
+      input.journal.state.books[0].receipt.cards,
+      committed.cards
+    );
+    Assert.deepEqual(
+      input.journal.state.books[0].receipt.lists,
+      committed.lists
+    );
+    await assertOriginals(input);
+  }
+);

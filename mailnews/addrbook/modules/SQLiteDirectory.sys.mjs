@@ -685,27 +685,7 @@ export class SQLiteDirectory extends AddrBookDirectory {
       const projector = new SQLiteDirectory();
       for (const card of book.cards) {
         const uid = allocate(card.properties);
-        const projected = new lazy.AddrBookCard();
-        projected._uid = uid;
-        projected._properties = new Map(card.properties);
-        // The old book's unknown _vCard cell is provenance, not a modern vCard.
-        projected._properties.delete("_vCard");
-        // InitCardFromRow projects this structural field as uint32, not text.
-        if (card.properties.has("RecordKey")) {
-          const key = card.properties.get("RecordKey");
-          if (!/^[0-9a-f]{0,8}$/iu.test(key)) {
-            throw new Error("Unrepresentable legacy card RecordKey");
-          }
-          projected._properties.set("RecordKey", parseInt(key || "0", 16));
-        }
-        const properties = projector.prepareToSaveCard(projected, uid);
-        properties.delete("LastModifiedDate");
-        if (card.properties.has("LastModifiedDate")) {
-          properties.set(
-            "LastModifiedDate",
-            card.properties.get("LastModifiedDate")
-          );
-        }
+        const properties = projectMigrationCard(projector, card, uid);
         records.push({ ...card, kind: "card", uid, projected: properties });
         cardUIDs.set(card.sourceKey, uid);
       }
@@ -987,5 +967,160 @@ function migrationReceipt(db, sourceId, sha256, bytes, book, physical) {
       throw new Error("Incomplete book import UID mapping");
     }
   }
+  verifyMigrationBookStage(db, book, result);
   return result;
+}
+
+/**
+ * Uses the normal card projection while retaining the legacy modification date.
+ * Never allocates an identity or treats an old _vCard cell as a modern vCard.
+ *
+ * @param {SQLiteDirectory} projector - Normal card serializer.
+ * @param {object} card - Validated original card and exact text properties.
+ * @param {string} uid - Retained scoped UID, never regenerated on readback.
+ * @returns {Map<string, string|number>} Normal projected properties.
+ */
+function projectMigrationCard(projector, card, uid) {
+  const projected = new lazy.AddrBookCard();
+  projected._uid = uid;
+  projected._properties = new Map(card.properties);
+  projected._properties.delete("_vCard");
+  if (card.properties.has("RecordKey")) {
+    const key = card.properties.get("RecordKey");
+    if (!/^[0-9a-f]{0,8}$/iu.test(key)) {
+      throw new Error("Unrepresentable legacy card RecordKey");
+    }
+    projected._properties.set("RecordKey", parseInt(key || "0", 16));
+  }
+  const properties = projector.prepareToSaveCard(projected, uid);
+  properties.delete("LastModifiedDate");
+  if (card.properties.has("LastModifiedDate")) {
+    properties.set("LastModifiedDate", card.properties.get("LastModifiedDate"));
+  }
+  return properties;
+}
+
+/**
+ * Checks a private, unpublished book stage before returning its receipt. Original
+ * cells, normal projections and membership must still match the source snapshot.
+ * Reconciliation is read-only; changed stages are retained for explicit repair.
+ * This does not validate a live book after publication or permit activation.
+ *
+ * @param {mozIStorageConnection} db - Dedicated private stage connection.
+ * @param {object} book - Actual parsed original snapshot.
+ * @param {object} receipt - Complete persisted source-scoped UID maps.
+ * @returns {void}
+ * @throws {Error} For any changed, missing or extra stage row. Storage failures
+ *   propagate unchanged; an existing commit is not rolled back or rewritten.
+ */
+function verifyMigrationBookStage(db, book, receipt) {
+  const records = [];
+  const raw = [];
+  const properties = [];
+  const lists = [];
+  const members = new Map();
+  const cardUIDs = new Map(receipt.cards);
+  const listUIDs = new Map(receipt.lists);
+  const projector = new SQLiteDirectory();
+  const original = (kind, key, uid, cells) => {
+    const sourceKey = String(key);
+    if (
+      uid !== null &&
+      (uid.includes("\0") ||
+        uid.includes("/") ||
+        (cells.get("UID") && cells.get("UID") !== uid))
+    ) {
+      throw new Error("Staged book source UID differs");
+    }
+    records.push([kind, sourceKey, uid]);
+    for (const [name, value] of cells) {
+      raw.push([kind, sourceKey, name, value]);
+    }
+  };
+  for (const card of book.cards) {
+    const uid = cardUIDs.get(card.sourceKey);
+    original("card", card.sourceKey, uid, card.properties);
+    for (const [name, value] of projectMigrationCard(projector, card, uid)) {
+      properties.push([uid, name, String(value)]);
+    }
+  }
+  for (const list of book.lists) {
+    const uid = listUIDs.get(list.sourceKey);
+    original("list", list.sourceKey, uid, list.properties);
+    lists.push([
+      uid,
+      list.properties.get("ListName"),
+      list.properties.get("ListNickName") ?? "",
+      list.properties.get("ListDescription") ?? "",
+    ]);
+    members.set(
+      uid,
+      list.members.map(key => cardUIDs.get(key))
+    );
+  }
+  for (const [key, cells] of book.metadata) {
+    original("data", key, null, cells);
+  }
+  const check = (sql, columns, expected, name) => {
+    const missing = new Set(expected.map(row => JSON.stringify(row)));
+    const statement = db.createStatement(sql);
+    try {
+      while (statement.executeStep()) {
+        const row = columns.map(column => statement.row[column]);
+        if (!missing.delete(JSON.stringify(row))) {
+          throw new Error("Staged book differs: " + name);
+        }
+      }
+      if (missing.size) {
+        throw new Error("Staged book differs: " + name);
+      }
+    } finally {
+      statement.finalize();
+    }
+  };
+  check(
+    "SELECT kind,sourceKey,uid FROM migration_records",
+    ["kind", "sourceKey", "uid"],
+    records,
+    "records"
+  );
+  check(
+    "SELECT kind,sourceKey,name,value FROM migration_properties",
+    ["kind", "sourceKey", "name", "value"],
+    raw,
+    "raw properties"
+  );
+  check(
+    "SELECT card,name,value FROM properties",
+    ["card", "name", "value"],
+    properties,
+    "card projection"
+  );
+  check(
+    "SELECT uid,name,nickName,description FROM lists",
+    ["uid", "name", "nickName", "description"],
+    lists,
+    "list projection"
+  );
+  const positions = new Map();
+  const statement = db.createStatement(
+    "SELECT list,card FROM list_cards ORDER BY rowid"
+  );
+  try {
+    while (statement.executeStep()) {
+      const { list, card } = statement.row;
+      const index = positions.get(list) ?? 0;
+      if (!members.has(list) || members.get(list)[index] !== card) {
+        throw new Error("Staged book differs: list membership");
+      }
+      positions.set(list, index + 1);
+    }
+    for (const [list, cards] of members) {
+      if ((positions.get(list) ?? 0) !== cards.length) {
+        throw new Error("Staged book differs: list membership");
+      }
+    }
+  } finally {
+    statement.finalize();
+  }
 }

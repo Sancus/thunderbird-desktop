@@ -600,3 +600,128 @@ add_task(
     await assertSourceUnchanged(input);
   }
 );
+
+/**
+ * Exposes a changed real committed stage, then repairs only the injected damage.
+ * The original .mab and its returned UIDs are never changed or regenerated.
+ *
+ * @param {Function} damage - Change one persisted destination fact.
+ * @param {Function} repair - Restore that fact from the independent fixture oracle.
+ * @param {string} field - Expected mismatch boundary.
+ * @returns {Promise<void>}
+ */
+async function assertDamagedPrivateBookRefused(damage, repair, field) {
+  const input = await emptyStage();
+  const db = input.connection;
+  const receipt = SQLiteDirectory.importMorkSnapshot(
+    db,
+    input.bytes,
+    SOURCE_ID
+  );
+  damage(db, receipt);
+  const changes = scalar(db, "SELECT total_changes()");
+  try {
+    Assert.throws(
+      () => SQLiteDirectory.importMorkSnapshot(db, input.bytes, SOURCE_ID),
+      new RegExp("Staged book differs: " + field)
+    );
+    Assert.equal(scalar(db, "SELECT total_changes()"), changes);
+    Assert.ok(!db.transactionInProgress);
+    Assert.deepEqual(seen, [], "Invalid private stages publish nothing");
+    await assertSourceUnchanged(input);
+  } finally {
+    repair(db, receipt);
+  }
+  const repairedChanges = scalar(db, "SELECT total_changes()");
+  Assert.deepEqual(
+    SQLiteDirectory.importMorkSnapshot(db, input.bytes, SOURCE_ID),
+    receipt,
+    "The original source-scoped UIDs survive repair and read-only retry"
+  );
+  Assert.equal(scalar(db, "SELECT total_changes()"), repairedChanges);
+  Assert.deepEqual(seen, []);
+  await assertSourceUnchanged(input);
+}
+
+add_task(async function test_repeatRejectsChangedRawPresentEmptyText() {
+  await assertDamagedPrivateBookRefused(
+    db =>
+      db.executeSimpleSQL(
+        "UPDATE migration_properties SET value=char(65279)||'changed'||char(0)||'e'||char(769) WHERE kind='card' AND name='Notes'"
+      ),
+    db =>
+      db.executeSimpleSQL(
+        "UPDATE migration_properties SET value='' WHERE kind='card' AND name='Notes'"
+      ),
+    "raw properties"
+  );
+});
+
+add_task(async function test_repeatRejectsMissingRawPresentEmptyCell() {
+  await assertDamagedPrivateBookRefused(
+    db =>
+      db.executeSimpleSQL(
+        "DELETE FROM migration_properties WHERE kind='card' AND name='Notes'"
+      ),
+    db =>
+      db.executeSimpleSQL(
+        "INSERT INTO migration_properties VALUES('card','1','Notes','')"
+      ),
+    "raw properties"
+  );
+});
+
+add_task(async function test_repeatRejectsUnmappedRawRecord() {
+  await assertDamagedPrivateBookRefused(
+    db =>
+      db.executeSimpleSQL(
+        "INSERT INTO migration_records VALUES('unmapped','foreign',NULL)"
+      ),
+    db =>
+      db.executeSimpleSQL(
+        "DELETE FROM migration_records WHERE kind='unmapped' AND sourceKey='foreign'"
+      ),
+    "records"
+  );
+});
+
+add_task(async function test_repeatRejectsChangedNormalCardProjection() {
+  await assertDamagedPrivateBookRefused(
+    db =>
+      db.executeSimpleSQL(
+        "UPDATE properties SET value='changed destination' WHERE name='DisplayName'"
+      ),
+    db =>
+      db.executeSimpleSQL(
+        "UPDATE properties SET value='contact number one' WHERE name='DisplayName'"
+      ),
+    "card projection"
+  );
+});
+
+add_task(async function test_repeatRejectsChangedNormalListProjection() {
+  await assertDamagedPrivateBookRefused(
+    db => db.executeSimpleSQL("UPDATE lists SET name='changed destination'"),
+    db => db.executeSimpleSQL("UPDATE lists SET name='list'"),
+    "list projection"
+  );
+});
+
+add_task(async function test_repeatRejectsMissingListMembership() {
+  await assertDamagedPrivateBookRefused(
+    db => db.executeSimpleSQL("DELETE FROM list_cards"),
+    (db, receipt) => {
+      const statement = db.createStatement(
+        "INSERT INTO list_cards VALUES(:list,:card)"
+      );
+      try {
+        statement.params.list = receipt.lists[0][1];
+        statement.params.card = receipt.cards[0][1];
+        statement.execute();
+      } finally {
+        statement.finalize();
+      }
+    },
+    "list membership"
+  );
+});

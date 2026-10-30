@@ -183,6 +183,30 @@ add_task(async function test_tabWithinTermMatchesAdjacentWords() {
   await assertSyntaxSearch(syntaxFirst + "\t" + syntaxSecond, ["adjacent"]);
 });
 
+add_task(async function test_nbspWithinTermMatchesAdjacentWords() {
+  await assertSyntaxSearch(syntaxFirst + "\u00a0" + syntaxSecond, ["adjacent"]);
+});
+
+add_task(async function test_colonWithinTermMatchesAdjacentWords() {
+  await assertSyntaxSearch(syntaxFirst + ":" + syntaxSecond, ["adjacent"]);
+});
+
+add_task(async function test_literalOrDoesNotEnableDisjunction() {
+  await assertSyntaxSearch(syntaxFirst + " OR " + syntaxSecond, [
+    "adjacent",
+    "reversed",
+    "separated",
+  ]);
+});
+
+add_task(async function test_literalNotDoesNotExcludeSecondTerm() {
+  await assertSyntaxSearch(syntaxFirst + " NOT " + syntaxSecond, []);
+});
+
+add_task(async function test_malformedNearIsLiteralText() {
+  await assertSyntaxSearch(syntaxFirst + " NEAR/no " + syntaxSecond, []);
+});
+
 /**
  * Checks the physical membership returned by the public syntax search.
  *

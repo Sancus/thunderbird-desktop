@@ -26,6 +26,177 @@ add_setup(async function () {
   );
 });
 
+add_task(async function test_public_factory_preserves_imap_identity() {
+  const { VirtualFolderHelper } = ChromeUtils.importESModule(
+    "resource:///modules/VirtualFolderWrapper.sys.mjs"
+  );
+  const root = IMAPPump.incomingServer.rootFolder;
+  const added = PromiseTestUtils.promiseFolderAdded("FactoryParent");
+  root.createSubfolder("FactoryParent", null);
+  const parent = await added;
+  const panorama = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const expectedStore = Services.prefs
+    .getCharPref(
+      "mail.serverDefaultStoreContractID",
+      "@mozilla.org/msgstore/berkeleystore;1"
+    )
+    .includes("maildir")
+    ? "maildir"
+    : "mbox";
+  Assert.equal(parent.msgStore.storeType, expectedStore);
+  const name = "Saved ☃";
+  const uri = parent.URI + "/" + encodeURIComponent(name);
+  const children = parent.subFolders;
+  const originalOffline = IMAPPump.incomingServer.offlineDownload;
+  let wrapped;
+  IMAPPump.incomingServer.offlineDownload = true;
+  try {
+    wrapped = VirtualFolderHelper.createNewVirtualFolder(
+      name,
+      parent,
+      [parent],
+      "ALL",
+      false
+    );
+  } finally {
+    IMAPPump.incomingServer.offlineDownload = originalOffline;
+  }
+  const folder = wrapped.virtualFolder;
+  Assert.ok(folder instanceof Ci.nsIMsgImapMailFolder);
+  Assert.equal(folder.parent, parent);
+  Assert.equal(folder.server, IMAPPump.incomingServer);
+  Assert.equal(folder.name, name);
+  Assert.equal(folder.URI, uri);
+  Assert.equal(
+    folder.generateMessageURI(7),
+    uri.replace("imap:", "imap-message:") + "#7"
+  );
+  Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), folder);
+  Assert.deepEqual(parent.subFolders, [...children, folder]);
+  const expectedPath = parent.filePath.clone();
+  expectedPath.leafName += ".sbd";
+  expectedPath.append(name);
+  Assert.ok(folder.filePath.equals(expectedPath));
+  Assert.equal(folder.msgStore.storeType, expectedStore);
+  Assert.ok(folder.getFlag(Ci.nsMsgFolderFlags.Virtual));
+  Assert.ok(folder.getFlag(Ci.nsMsgFolderFlags.Mail));
+  Assert.ok(folder.getFlag(Ci.nsMsgFolderFlags.Offline));
+  Assert.equal(wrapped.searchString, "ALL");
+  Assert.equal(wrapped.onlineSearch, false);
+  Assert.deepEqual(wrapped.searchFolders, [parent]);
+  let core;
+  let id;
+  if (panorama) {
+    core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    id = folder.id;
+    Assert.greater(id, 0);
+    Assert.equal(core.folderDB.getFolderChildNamed(parent.id, name), id);
+    Assert.strictEqual(core.folderDB.getMsgFolderForFolder(id), folder);
+  }
+  for (const duplicateName of [name, name.toLowerCase()]) {
+    Assert.throws(
+      () =>
+        VirtualFolderHelper.createNewVirtualFolder(
+          duplicateName,
+          parent,
+          [],
+          "NONE",
+          true
+        ),
+      error => error.result == Cr.NS_MSG_FOLDER_EXISTS
+    );
+    Assert.strictEqual(parent.getChildNamed(name), folder);
+    Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), folder);
+    Assert.deepEqual(parent.subFolders, [...children, folder]);
+    Assert.equal(folder.parent, parent);
+    Assert.equal(folder.server, IMAPPump.incomingServer);
+    Assert.equal(wrapped.searchString, "ALL");
+    Assert.equal(wrapped.onlineSearch, false);
+    Assert.deepEqual(wrapped.searchFolders, [parent]);
+    if (panorama) {
+      Assert.equal(folder.id, id);
+      Assert.equal(core.folderDB.getFolderChildNamed(parent.id, name), id);
+      Assert.deepEqual(core.folderDB.getFolderChildren(parent.id), [id]);
+    }
+  }
+  if (panorama) {
+    const originalPath = parent.filePath;
+    const overriddenPath = originalPath.clone();
+    overriddenPath.leafName += "-override";
+    const refusedName = "RefusedFactory";
+    const refusedURI = parent.URI + "/" + refusedName;
+    let retainedId;
+    parent.filePath = overriddenPath;
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        Assert.throws(
+          () =>
+            VirtualFolderHelper.createNewVirtualFolder(
+              refusedName,
+              parent,
+              [parent],
+              "ALL",
+              false
+            ),
+          error => error.result == Cr.NS_ERROR_NOT_IMPLEMENTED
+        );
+        const pending = core.folderDB.getFolderChildNamed(
+          parent.id,
+          refusedName
+        );
+        Assert.greater(
+          pending,
+          0,
+          "The failed attempt retains its physical row"
+        );
+        if (retainedId !== undefined) {
+          Assert.equal(pending, retainedId);
+        }
+        retainedId = pending;
+        Assert.equal(parent.getChildNamed(refusedName), null);
+        Assert.equal(
+          MailServices.folderLookup.getFolderForURL(refusedURI),
+          null
+        );
+        Assert.deepEqual(parent.subFolders, [...children, folder]);
+        Assert.strictEqual(parent.getChildNamed(name), folder);
+        Assert.strictEqual(core.folderDB.getMsgFolderForFolder(id), folder);
+        Assert.equal(folder.parent, parent);
+        Assert.equal(wrapped.searchString, "ALL");
+        Assert.deepEqual(wrapped.searchFolders, [parent]);
+        Assert.ok(folder.filePath.equals(expectedPath));
+      }
+    } finally {
+      parent.filePath = originalPath;
+    }
+    const repaired = VirtualFolderHelper.createNewVirtualFolder(
+      refusedName,
+      parent,
+      [parent],
+      "ALL",
+      false
+    ).virtualFolder;
+    Assert.equal(
+      repaired.id,
+      retainedId,
+      "Repair reuses the original physical row"
+    );
+    Assert.strictEqual(
+      core.folderDB.getMsgFolderForFolder(retainedId),
+      repaired
+    );
+    Assert.equal(repaired.parent, parent);
+    Assert.equal(repaired.server, IMAPPump.incomingServer);
+    Assert.equal(repaired.URI, refusedURI);
+    Assert.deepEqual(
+      core.folderDB.getFolderChildren(parent.id).sort(),
+      [id, retainedId].sort()
+    );
+  }
+});
+
 add_task(async function test_virtual_folder_not_reused_after_delete() {
   const rootFolder = IMAPPump.incomingServer.rootFolder;
 

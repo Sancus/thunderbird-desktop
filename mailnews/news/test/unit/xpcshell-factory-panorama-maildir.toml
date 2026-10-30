@@ -1,0 +1,12 @@
+[DEFAULT]
+head = "head_server_setup.js ../../../db/panorama/test/xpcshell/head_delivery.js"
+dupe-manifest = true
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:maildir"]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/maildirstore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/maildirstore;1",
+]
+tags = ["panorama-delivery"]
+
+["test_panoramaDeliveryNewsFolderInit.js"]

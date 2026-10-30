@@ -606,6 +606,14 @@ nsresult nsImapMailFolder::AddDirectorySeparator(nsIFile* path) {
 NS_IMETHODIMP nsImapMailFolder::AddSubfolder(const nsACString& aName,
                                              nsIMsgFolder** aChild) {
   NS_ENSURE_ARG_POINTER(aChild);
+#ifdef MOZ_PANORAMA
+  bool native = mail_panorama_enabled_AtStartup();
+  if (native) {
+    *aChild = nullptr;
+    MOZ_TRY(CheckFolderPathAccess());
+    NS_ENSURE_ARG(!aName.IsEmpty());
+  }
+#endif
 
   int32_t flags = 0;
   nsresult rv;
@@ -622,7 +630,65 @@ NS_IMETHODIMP nsImapMailFolder::AddSubfolder(const nsACString& aName,
   nsCOMPtr<nsIMsgFolder> msgFolder;
   rv = GetChildWithURI(uri, false /*deep*/, true /*case Insensitive*/,
                        getter_AddRefs(msgFolder));
+#ifdef MOZ_PANORAMA
+  if (native) NS_ENSURE_SUCCESS(rv, rv);
+#endif
   if (NS_SUCCEEDED(rv) && msgFolder) return NS_MSG_FOLDER_EXISTS;
+
+#ifdef MOZ_PANORAMA
+  if (native) {
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    auto& folderDB = core->FolderDB();
+    uint64_t id = MOZ_TRY(folderDB.GetFolderChildNamed(mFolderId, aName));
+    if (!id) MOZ_TRY(folderDB.InsertFolder(mFolderId, aName, &id));
+    nsCOMPtr<nsIMsgFolder> existing;
+    MOZ_TRY(GetCachedChild(id, getter_AddRefs(existing)));
+    NS_ENSURE_FALSE(existing, NS_MSG_FOLDER_EXISTS);
+
+    nsCOMPtr<nsIFolderLookupService> fls =
+        do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsCOMPtr<nsIMsgFolder> folder =
+        do_CreateInstance("@mozilla.org/mail/folder-factory;1?name=imap", &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    MOZ_TRY(folder->InitWithFolderId(id));
+    auto* child = static_cast<nsImapMailFolder*>(folder.get());
+    auto discard =
+        mozilla::MakeScopeExit([&] { child->DiscardPanoramaDiscovery(fls); });
+
+    // Native paths are derived from physical names. Refuse an effective parent
+    // override that cannot be represented by that same persisted hierarchy.
+    nsCOMPtr<nsIFile> expectedPath;
+    MOZ_TRY(GetFilePath(getter_AddRefs(expectedPath)));
+    if (!mIsServer) MOZ_TRY(AddDirectorySeparator(expectedPath));
+    nsCString storedName = MOZ_TRY(folderDB.GetFolderName(id));
+    MOZ_TRY(expectedPath->Append(EncodeFilename(storedName)));
+    nsCOMPtr<nsIFile> actualPath;
+    MOZ_TRY(folder->GetFilePath(getter_AddRefs(actualPath)));
+    bool samePath;
+    MOZ_TRY(actualPath->Equals(expectedPath, &samePath));
+    NS_ENSURE_TRUE(samePath, NS_ERROR_NOT_IMPLEMENTED);
+
+    uint32_t childFlags;
+    MOZ_TRY(folder->GetFlags(&childFlags));
+    childFlags |= nsMsgFolderFlags::Mail;
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    MOZ_TRY(GetServer(getter_AddRefs(server)));
+    NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+    bool offline;
+    MOZ_TRY(server->GetOfflineDownload(&offline));
+    if (offline) childFlags |= nsMsgFolderFlags::Offline;
+    MOZ_TRY(folder->SetFlags(childFlags));
+    MOZ_TRY(child->SetHierarchyDelimiter(m_hierarchyDelimiter));
+    MOZ_TRY(folder->SetParent(this));
+    mSubFolders.AppendObject(folder);
+    discard.release();
+    folder.forget(aChild);
+    return NS_OK;
+  }
+#endif
 
   nsCOMPtr<nsIMsgFolder> folder;
   rv = GetOrCreateFolder(uri, getter_AddRefs(folder));

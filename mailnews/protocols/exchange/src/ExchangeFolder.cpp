@@ -35,6 +35,7 @@
 #include "nsIMsgWindow.h"
 #include "nsString.h"
 #include "nsMsgFolderFlags.h"
+#include "nsMsgLocalStoreUtils.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
 #include "nsPrintfCString.h"
@@ -171,6 +172,133 @@ ExchangeFolder::ExchangeFolder()
     : mHasLoadedSubfolders(false), mExchangeProtocol("") {}
 
 ExchangeFolder::~ExchangeFolder() = default;
+
+#ifdef MOZ_PANORAMA
+namespace {
+// Recovery may outlive every folder wrapper. Retain only physical move/error
+// state here, never the native operation, core, token or live folders.
+class ExchangeFolderRelocationStorage final : public nsISupports {
+ public:
+  NS_DECL_ISUPPORTS
+  mozilla::mailnews::FolderStorageMove plan;
+  nsresult primary = NS_OK;
+  nsresult rollback = NS_OK;
+
+ private:
+  ~ExchangeFolderRelocationStorage() = default;
+};
+NS_IMPL_ISUPPORTS(ExchangeFolderRelocationStorage, nsISupports)
+}  // namespace
+#endif
+
+nsresult ExchangeFolder::ApplyFolderUpdate(nsIMsgFolder* sourceFolder,
+                                           nsIMsgFolder* targetParent,
+                                           const nsACString& name,
+                                           nsIMsgWindow* window) {
+  NS_ENSURE_ARG(sourceFolder);
+  NS_ENSURE_ARG(targetParent);
+  if (!mail_panorama_enabled_AtStartup()) {
+    return LocalRenameOrReparentFolder(sourceFolder, targetParent, name,
+                                       window);
+  }
+#ifdef MOZ_PANORAMA
+  using namespace mozilla::mailnews;
+  nsCOMPtr<IExchangeFolder> exchange = do_QueryInterface(sourceFolder);
+  NS_ENSURE_TRUE(exchange, NS_NOINTERFACE);
+  auto* source = static_cast<ExchangeFolder*>(exchange.get());
+  MOZ_TRY(source->CheckFolderPathAccess());
+  nsCOMPtr<nsIMsgFolder> oldParent;
+  MOZ_TRY(source->GetParent(getter_AddRefs(oldParent)));
+  NS_ENSURE_TRUE(oldParent, NS_ERROR_NOT_AVAILABLE);
+  nsAutoCString oldName;
+  MOZ_TRY(source->GetName(oldName));
+  if (oldParent == targetParent && oldName == name) {
+    return NS_OK;
+  }
+  bool conflict;
+  MOZ_TRY(targetParent->ContainsChildNamed(name, &conflict));
+  NS_ENSURE_FALSE(conflict, NS_MSG_FOLDER_EXISTS);
+
+  nsTArray<RefPtr<nsIMsgFolder>> originals;
+  MOZ_TRY(source->GetDescendants(originals));
+  originals.InsertElementAt(0, source);
+  for (const auto& folder : originals) {
+    nsCOMPtr<IExchangeFolder> child = do_QueryInterface(folder);
+    NS_ENSURE_TRUE(child, NS_NOINTERFACE);
+    MOZ_TRY(CheckFolderStorageMove(folder));
+  }
+  RefPtr<ExchangeFolderRelocationStorage> storage =
+      new ExchangeFolderRelocationStorage();
+  RefPtr<NativeFolderRelocation> operation;
+  MOZ_TRY(source->PrepareNativeFolderRelocation(targetParent, name, storage,
+                                                operation));
+  nsTArray<uint64_t> ids;
+  nsCOMPtr<nsIMsgFolder> replacement;
+  nsresult rv = [&]() -> nsresult {
+    NS_ENSURE_TRUE(originals.Length() == operation->FolderIds().Length(),
+                   NS_ERROR_NOT_AVAILABLE);
+    for (const auto& folder : originals) {
+      uint64_t id;
+      MOZ_TRY(folder->GetId(&id));
+      NS_ENSURE_TRUE(operation->FolderIds().Contains(id) && !ids.Contains(id),
+                     NS_ERROR_NOT_AVAILABLE);
+      ids.AppendElement(id);
+      // Restore protocol-only cached policy on the prepared real wrappers.
+      auto* original = static_cast<ExchangeFolder*>(folder.get());
+      auto* prepared =
+          static_cast<ExchangeFolder*>(operation->ReplacementFor(id));
+      NS_ENSURE_TRUE(prepared, NS_ERROR_NOT_AVAILABLE);
+      prepared->mLockedFlags = original->mLockedFlags;
+    }
+    nsCOMPtr<nsIFile> directory;
+    MOZ_TRY(static_cast<nsMsgDBFolder*>(targetParent)
+                ->CreateDirectoryForFolder(getter_AddRefs(directory)));
+    // Remote folders may have no cached body, summary or child storage.
+    MOZ_TRY(storage->plan.Prepare(operation->SourcePath(),
+                                  operation->TargetPath()));
+    MOZ_TRY(source->ForceDBClosed());
+    // Closing can reenter. Recheck the actual stores and full captured tuple
+    // before the synchronous physical/native publication tail.
+    for (const auto& folder : originals) {
+      MOZ_TRY(CheckFolderStorageMove(folder));
+    }
+    MOZ_TRY(source->ValidateNativeFolderRelocation(operation));
+    nsresult status = storage->plan.Apply();
+    storage->rollback = storage->plan.RollbackStatus();
+    if (NS_FAILED(status)) return status;
+    status = source->CommitNativeFolderRelocation(operation, nullptr,
+                                                  getter_AddRefs(replacement));
+    if (NS_FAILED(status)) storage->rollback = storage->plan.Rollback();
+    return status;
+  }();
+  if (NS_FAILED(rv)) {
+    storage->primary = rv;
+    source->FinishNativeFolderRelocationFailure(operation, rv,
+                                                storage->rollback);
+    return rv;
+  }
+
+  // Publication is known. Best-effort filter updates/notifications cannot
+  // convert the committed relocation into a reported rollback failure.
+  for (size_t i = 0; i < originals.Length(); i++) {
+    bool changed = false;
+    (void)originals[i]->MatchOrChangeFilterDestination(
+        operation->ReplacementFor(ids[i]), true, &changed);
+    if (changed) (void)originals[i]->AlertFilterChanged(window);
+  }
+  nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+      mozilla::components::FolderNotification::Service();
+  if (oldName != operation->NewName()) {
+    notifier->NotifyFolderRenamed(source, replacement);
+  }
+  if (oldParent != targetParent) {
+    notifier->NotifyFolderMoveCopyCompleted(true, source, targetParent);
+  }
+  return NS_OK;
+#else
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
+}
 
 NS_IMETHODIMP
 ExchangeFolder::SetStringProperty(const char* propertyName,
@@ -392,6 +520,11 @@ NS_IMETHODIMP ExchangeFolder::GetSubFolders(
     nsTArray<RefPtr<nsIMsgFolder>>& aSubFolders) {
   // Lazy discovery of child folders. Should do this up front when root folder
   // is created!
+  if (mail_panorama_enabled_AtStartup()) {
+    // The native initializer already restored the recorded remote hierarchy.
+    // Local body files are not evidence of additional server folders.
+    return nsMsgDBFolder::GetSubFolders(aSubFolders);
+  }
   if (!mHasLoadedSubfolders) {
     nsresult rv = CreateChildrenFromStore();
     NS_ENSURE_SUCCESS(rv, rv);

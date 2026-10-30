@@ -69,7 +69,8 @@ class ExchangeIncomingServer : public nsMsgIncomingServer,
    * callback function.
    */
   nsresult SyncFolderList(nsIMsgWindow* aMsgWindow,
-                          std::function<nsresult()> postSyncCallback);
+                          std::function<nsresult()> postSyncCallback,
+                          std::function<nsresult(nsresult)> errorCallback = {});
 
   /**
    * Synchronize the message list for the given list of folders.

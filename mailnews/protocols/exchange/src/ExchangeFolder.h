@@ -44,6 +44,13 @@ class ExchangeFolder : public nsMsgDBFolder, public IExchangeFolder {
    */
   nsresult GetExchangeId(nsACString& exchangeId);
 
+  // Settle a confirmed server folder delta locally. Native folders retain their
+  // physical IDs and properties; Mork keeps its existing store operation.
+  static nsresult ApplyFolderUpdate(nsIMsgFolder* source,
+                                    nsIMsgFolder* targetParent,
+                                    const nsACString& name,
+                                    nsIMsgWindow* window);
+
  public:
   // The XPCOM interface(s).
   NS_IMETHOD SetStringProperty(const char* propertyName,

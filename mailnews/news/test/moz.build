@@ -6,6 +6,10 @@ XPCSHELL_TESTS_MANIFESTS += ["unit/xpcshell.toml"]
 
 if CONFIG["MOZ_PANORAMA"]:
     XPCSHELL_TESTS_MANIFESTS += [
+        "unit/xpcshell-factory-mork-maildir.toml",
+        "unit/xpcshell-factory-mork-mbox.toml",
+        "unit/xpcshell-factory-panorama-maildir.toml",
+        "unit/xpcshell-factory-panorama-mbox.toml",
         "unit/xpcshell-panorama-maildir.toml",
         "unit/xpcshell-panorama.toml",
     ]

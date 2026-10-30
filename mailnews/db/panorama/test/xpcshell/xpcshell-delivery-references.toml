@@ -1,0 +1,67 @@
+[DEFAULT]
+head = "head.js head_delivery.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]
+prefs = ["mail.panorama.enabled=true"]
+tags = ["panorama-delivery"]
+
+["test_deliveryCompatibilityReferencesBounds.js"]
+
+["test_deliveryCompatibilityReferencesClear.js"]
+support-files = ["db/messages.sql"]
+
+["test_deliveryCompatibilityReferencesCount.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
+["test_deliveryCompatibilityReferencesCountFilteredLimit.js"]
+
+["test_deliveryCompatibilityReferencesCountLimit.js"]
+
+["test_deliveryCompatibilityReferencesCountOverflow.js"]
+
+["test_deliveryCompatibilityReferencesCountOverflow65536Storage.js"]
+
+["test_deliveryCompatibilityReferencesCountOverflow65537.js"]
+
+["test_deliveryCompatibilityReferencesMissingMessage.js"]
+
+["test_deliveryCompatibilityReferencesMutation.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
+["test_deliveryCompatibilityReferencesOrder.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
+["test_deliveryCompatibilityReferencesParsingBare.js"]
+
+["test_deliveryCompatibilityReferencesParsingDelimited.js"]
+
+["test_deliveryCompatibilityReferencesParsingUnterminated.js"]
+
+["test_deliveryCompatibilityReferencesSelfExclusion.js"]
+
+["test_deliveryCompatibilityReferencesUnavailable.js"]
+support-files = ["db/messages.sql"]
+
+["test_deliveryCompatibilityReferencesWriteError.js"]
+
+["test_deliveryCoreReferenceLookupError.js"]

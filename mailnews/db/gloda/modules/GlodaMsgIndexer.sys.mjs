@@ -56,25 +56,30 @@ export var GlodaABIndexer = {
   *_worker_index_card(aJob, aCallbackHandle) {
     const card = aJob.id;
 
-    if (card.primaryEmail) {
-      // load the identity
+    const emails = [
+      ...new Set(card.emailAddresses.map(email => email.toLowerCase())),
+    ];
+    if (emails.length) {
       const query = Gloda.newQuery(GlodaConstants.NOUN_IDENTITY);
       query.kind("email");
-      // we currently normalize all e-mail addresses to be lowercase
-      query.value(card.primaryEmail.toLowerCase());
+      query.value(...emails);
       const identityCollection = query.getCollection(aCallbackHandle);
       yield GlodaConstants.kWorkAsync;
 
-      if (identityCollection.items.length) {
-        const identity = identityCollection.items[0];
-        // force the identity to know it has an associated ab card.
-        identity._hasAddressBookCard = true;
-
+      const processedContacts = new Set();
+      for (const identity of identityCollection.items) {
+        // Re-read the live card after the asynchronous query. A queued update
+        // must not restore an association to a card that has since been deleted.
+        const currentCard = identity.abCard;
+        if (!currentCard || processedContacts.has(identity.contactID)) {
+          continue;
+        }
+        processedContacts.add(identity.contactID);
         this._log.debug("Found identity, processing card.");
         yield aCallbackHandle.pushAndGo(
           Gloda.grokNounItem(
             identity.contact,
-            { card },
+            { card: currentCard },
             false,
             false,
             aCallbackHandle
@@ -92,42 +97,29 @@ export var GlodaABIndexer = {
   observe(subject, topic) {
     subject.QueryInterface(Ci.nsIAbCard);
 
-    switch (topic) {
-      case "addrbook-contact-created": {
-        // When an address book card is added, update the cached GlodaIdentity
-        // object's cached idea of whether the identity has an ab card.
-        this._log.debug("Received Card Add Notification");
-
-        const identity = GlodaCollectionManager.cacheLookupOneByUniqueValue(
-          GlodaConstants.NOUN_IDENTITY,
-          "email@" + subject.primaryEmail.toLowerCase()
-        );
-        if (identity) {
-          identity._hasAddressBookCard = true;
-        }
-        break;
+    for (const email of subject.emailAddresses) {
+      const identity = GlodaCollectionManager.cacheLookupOneByUniqueValue(
+        GlodaConstants.NOUN_IDENTITY,
+        "email@" + email.toLowerCase()
+      );
+      if (identity) {
+        // The observer runs after the address-book change. Preserve an
+        // association if another card still supplies this email address.
+        identity._hasAddressBookCard = !!identity.abCard;
       }
-      case "addrbook-contact-updated": {
-        this._log.debug("Received Card Change Notification");
+    }
 
+    switch (topic) {
+      case "addrbook-contact-created":
+      case "addrbook-contact-updated": {
+        this._log.debug("Received Card Add/Change Notification");
         const job = new IndexingJob("ab-card", subject);
         GlodaIndexer.indexJob(job);
         break;
       }
-      case "addrbook-contact-deleted": {
-        // When an address book card is added, update the cached GlodaIdentity
-        // object's cached idea of whether the identity has an ab card.
+      case "addrbook-contact-deleted":
         this._log.debug("Received Card Removal Notification");
-
-        const identity = GlodaCollectionManager.cacheLookupOneByUniqueValue(
-          GlodaConstants.NOUN_IDENTITY,
-          "email@" + subject.primaryEmail.toLowerCase()
-        );
-        if (identity) {
-          identity._hasAddressBookCard = false;
-        }
         break;
-      }
     }
   },
 };

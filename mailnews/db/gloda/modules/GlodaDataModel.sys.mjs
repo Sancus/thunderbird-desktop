@@ -850,6 +850,16 @@ GlodaContact.prototype = {
       this._frecency
     );
   },
+
+  /**
+   * Copy the indexed name back to the contact retained by live collections.
+   * Other indexed attributes are copied by Gloda.grokNounItem.
+   *
+   * @param {GlodaContact} aOther - The updated indexing clone.
+   */
+  _declone(aOther) {
+    this._name = aOther._name;
+  },
 };
 MixIn(GlodaContact, GlodaHasAttributesMixIn);
 

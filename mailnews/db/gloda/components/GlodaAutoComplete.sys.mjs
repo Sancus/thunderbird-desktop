@@ -193,6 +193,34 @@ ContactIdentityCompleter.prototype = {
   _popularitySorter(a, b) {
     return b.popularity - a.popularity;
   },
+  /** Rebuilds cached completion strings after indexed contacts change. */
+  _buildSuffixTree() {
+    const contactNames = this.contactCollection.items.map(
+      c => c.name.replace(" ", "").toLowerCase() || "x"
+    );
+    // if we had no contacts, we will have no identity collection!
+    let identityMails;
+    if (this.identityCollection) {
+      identityMails = this.identityCollection.items.map(i =>
+        i.value.toLowerCase()
+      );
+    }
+
+    // The suffix tree takes two parallel lists; the first contains strings
+    //  while the second contains objects that correspond to those strings.
+    // In the degenerate case where identityCollection does not exist, it will
+    //  be undefined.  Calling concat with an argument of undefined simply
+    //  duplicates the list we called concat on, and is thus harmless.  Our
+    //  use of && on identityCollection allows its undefined value to be
+    //  passed through to concat.  identityMails will likewise be undefined.
+    this.suffixTree = new lazy.MultiSuffixTree(
+      contactNames.concat(identityMails),
+      this.contactCollection.items.concat(
+        this.identityCollection && this.identityCollection.items
+      )
+    );
+    this._suffixTreeDirty = false;
+  },
   complete(aResult, aString) {
     if (aString.length < 3) {
       // In CJK, first name or last name is sometime used as 1 character only.
@@ -205,6 +233,10 @@ ContactIdentityCompleter.prototype = {
       if (!aString.match(/[\u3041-\u9fff\uac00-\ud7ff\uf900-\uffdc]/)) {
         return false;
       }
+    }
+
+    if (this._suffixTreeDirty && this.suffixTree) {
+      this._buildSuffixTree();
     }
 
     let matches;
@@ -270,9 +302,17 @@ ContactIdentityCompleter.prototype = {
 
     return true;
   },
-  onItemsAdded() {},
-  onItemsModified() {},
-  onItemsRemoved() {},
+  onItemsAdded(_items, collection) {
+    if (collection == this.contactCollection) {
+      this._suffixTreeDirty = true;
+    }
+  },
+  onItemsModified(items, collection) {
+    this.onItemsAdded(items, collection);
+  },
+  onItemsRemoved(items, collection) {
+    this.onItemsAdded(items, collection);
+  },
   onQueryCompleted(aCollection) {
     // handle the initial setup case...
     if (aCollection.data == null) {
@@ -292,30 +332,7 @@ ContactIdentityCompleter.prototype = {
           lazy.GlodaConstants.NOUN_IDENTITY
         ];
 
-      const contactNames = this.contactCollection.items.map(
-        c => c.name.replace(" ", "").toLowerCase() || "x"
-      );
-      // if we had no contacts, we will have no identity collection!
-      let identityMails;
-      if (this.identityCollection) {
-        identityMails = this.identityCollection.items.map(i =>
-          i.value.toLowerCase()
-        );
-      }
-
-      // The suffix tree takes two parallel lists; the first contains strings
-      //  while the second contains objects that correspond to those strings.
-      // In the degenerate case where identityCollection does not exist, it will
-      //  be undefined.  Calling concat with an argument of undefined simply
-      //  duplicates the list we called concat on, and is thus harmless.  Our
-      //  use of && on identityCollection allows its undefined value to be
-      //  passed through to concat.  identityMails will likewise be undefined.
-      this.suffixTree = new lazy.MultiSuffixTree(
-        contactNames.concat(identityMails),
-        this.contactCollection.items.concat(
-          this.identityCollection && this.identityCollection.items
-        )
-      );
+      this._buildSuffixTree();
 
       return;
     }
@@ -551,6 +568,7 @@ GlodaAutoComplete.prototype = {
 
   startSearch(aString, aParam, aResult, aListener) {
     try {
+      this.stopSearch();
       const result = new nsAutoCompleteGlodaResult(aListener, this, aString);
       // save this for hacky access to the search.  I somewhat suspect we simply
       //  should not be using the formal autocomplete mechanism at all.
@@ -580,6 +598,8 @@ GlodaAutoComplete.prototype = {
   },
 
   stopSearch() {
-    this.curResult.active = false;
+    if (this.curResult) {
+      this.curResult.active = false;
+    }
   },
 };

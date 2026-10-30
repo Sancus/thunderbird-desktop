@@ -15,6 +15,7 @@ var {
   be_in_folder,
   create_folder,
   get_about_3pane,
+  wait_for_all_messages_to_load,
 } = ChromeUtils.importESModule(
   "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
 );
@@ -590,3 +591,332 @@ add_task(async function test_results_label() {
 function teardownTest() {
   clear_constraints();
 }
+
+const legacyQuickFilter = {};
+const legacyGlobalText = "qflegacyoutside café";
+const legacyLocalText = "qflegacylocalneedle";
+
+add_setup(async function setupLegacyQuickFilterReference() {
+  Assert.equal(
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    false
+  );
+  Assert.equal(
+    Components.manager
+      .QueryInterface(Ci.nsIComponentRegistrar)
+      .contractIDToCID("@mozilla.org/msgDatabase/msgDBService;1")
+      .toString(),
+    "{03223c50-1e88-45e8-ba1a-7ce792dc3fc3}",
+    "The Quick Filter reference uses the actual legacy backend"
+  );
+  const previousFolder = get_about_3pane().gFolder;
+  const tabmail = document.getElementById("tabmail");
+  const originalTabs = new Set(tabmail.tabInfo);
+  const storeURL = "chrome://messenger/content/messenger.xhtml";
+  const hadStickySetting = Services.xulStore.hasValue(
+    storeURL,
+    "quickFilterBarSticky",
+    "enabled"
+  );
+  const previousStickySetting = Services.xulStore.getValue(
+    storeURL,
+    "quickFilterBarSticky",
+    "enabled"
+  );
+  const { GlodaIndexer } = ChromeUtils.importESModule(
+    "resource:///modules/gloda/GlodaIndexer.sys.mjs"
+  );
+  const previousIndexerEnabled = GlodaIndexer.enabled;
+  await SpecialPowers.pushPrefEnv({
+    set: [["mailnews.database.global.indexer.enabled", true]],
+  });
+  registerCleanupFunction(async () => {
+    for (const tab of [...tabmail.tabInfo]) {
+      if (!originalTabs.has(tab)) {
+        tabmail.closeTab(tab);
+      }
+    }
+    const panel = get_about_3pane().document.getElementById(
+      "qfb-text-search-upsell"
+    );
+    if (panel.state != "closed") {
+      const hidden = BrowserTestUtils.waitForPopupEvent(panel, "hidden");
+      panel.hidePopup();
+      await hidden;
+    }
+    const origin = get_about_3pane();
+    const bar = origin.document.getElementById("quick-filter-bar");
+    const wasVisible = BrowserTestUtils.isVisible(bar);
+    clear_constraints();
+    await be_in_folder(previousFolder);
+    if (BrowserTestUtils.isVisible(bar) != wasVisible) {
+      await toggle_quick_filter_bar();
+    }
+    for (const folder of [
+      legacyQuickFilter.origin,
+      legacyQuickFilter.outside,
+    ]) {
+      if (folder) {
+        folder.parent.propagateDelete(folder, true);
+      }
+    }
+    if (hadStickySetting) {
+      Services.xulStore.setValue(
+        storeURL,
+        "quickFilterBarSticky",
+        "enabled",
+        previousStickySetting
+      );
+    } else {
+      Services.xulStore.removeValue(
+        storeURL,
+        "quickFilterBarSticky",
+        "enabled"
+      );
+    }
+    // The preference is read at startup; restore the real runtime state too.
+    GlodaIndexer.enabled = previousIndexerEnabled;
+    await SpecialPowers.popPrefEnv();
+  });
+
+  const { Gloda } = ChromeUtils.importESModule(
+    "resource:///modules/gloda/GlodaPublic.sys.mjs"
+  );
+  const { GlodaMsgIndexer } = ChromeUtils.importESModule(
+    "resource:///modules/gloda/IndexMsg.sys.mjs"
+  );
+  legacyQuickFilter.indexer = GlodaIndexer;
+  legacyQuickFilter.origin = await create_folder("LegacyQFOrigin");
+  legacyQuickFilter.outside = await create_folder("LegacyQFOutside");
+  const [local] = await make_message_sets_in_folders(
+    [legacyQuickFilter.origin],
+    [{ count: 1, subject: legacyLocalText }]
+  );
+  const [outside] = await make_message_sets_in_folders(
+    [legacyQuickFilter.outside],
+    [{ count: 1, subject: legacyGlobalText }]
+  );
+  outside.setRead(true);
+  legacyQuickFilter.local = local.getMsgHdr(0);
+  legacyQuickFilter.target = outside.getMsgHdr(0);
+  Assert.ok(legacyQuickFilter.local);
+  Assert.ok(legacyQuickFilter.target);
+  Assert.notEqual(
+    legacyQuickFilter.local.folder.URI,
+    legacyQuickFilter.target.folder.URI,
+    "The only global hit is physically outside the local filter scope"
+  );
+  for (const folder of [legacyQuickFilter.origin, legacyQuickFilter.outside]) {
+    const indexed = await new Promise(resolve => {
+      Assert.ok(
+        GlodaMsgIndexer.indexFolder(folder, { force: true, callback: resolve })
+      );
+    });
+    Assert.ok(indexed, "The production Gloda indexer indexed the real folder");
+  }
+  await TestUtils.waitForCondition(
+    () => Gloda.isMessageIndexed(legacyQuickFilter.target),
+    "The outside physical message is indexed before typing the local filter"
+  );
+});
+
+/**
+ * Returns the physical location of a real message header.
+ *
+ * @param {nsIMsgDBHdr} header - The message header.
+ * @returns {[string, number]} Its folder URI and local message key.
+ */
+function legacyQuickFilterLocation(header) {
+  return [header.folder.URI, header.messageKey];
+}
+
+/**
+ * Escalates the real local filter and checks its global result and origin state.
+ *
+ * @param {boolean} showAsList - Whether the existing list preference is enabled.
+ * @returns {Promise<void>} Resolves after the results tab closes and state checks.
+ */
+async function checkLegacyQuickFilterEscalation(showAsList) {
+  await be_in_folder(legacyQuickFilter.origin);
+  clear_constraints();
+  await wait_for_all_messages_to_load();
+  await toggle_boolean_constraints("sticky", "unread");
+  const origin = get_about_3pane();
+  const input = origin.document.getElementById("qfb-qs-textbox");
+  const panel = origin.document.getElementById("qfb-text-search-upsell");
+  input.focus();
+  const shown = BrowserTestUtils.waitForPopupEvent(panel, "shown");
+  await set_filter_text(legacyGlobalText);
+  await shown;
+  Assert.equal(origin.gDBView.numMsgsInView, 0, "No local message matches");
+  assert_results_label_count(0);
+  Assert.deepEqual(
+    origin.document.l10n.getAttributes(
+      origin.document.getElementById("qfb-upsell-line-two")
+    ),
+    {
+      id: "quick-filter-bar-gloda-upsell-line2",
+      args: { text: legacyGlobalText },
+    }
+  );
+  const state = structuredClone(origin.quickFilterBar.filterer.filterValues);
+  Assert.equal(state.sticky, true);
+  Assert.equal(state.unread, true);
+  Assert.equal(state.text.text, legacyGlobalText);
+  const tabmail = document.getElementById("tabmail");
+  const originTab = tabmail.currentTabInfo;
+  const tabCount = tabmail.tabInfo.length;
+  const mode = showAsList ? "mail3PaneTab" : "glodaFacet";
+  await SpecialPowers.pushPrefEnv({
+    set: [["gloda.show_as_list_by_default", showAsList]],
+  });
+  let results;
+  try {
+    const opened = BrowserTestUtils.waitForEvent(
+      tabmail.tabContainer,
+      "TabOpen",
+      false,
+      event => event.detail.tabInfo.mode.name == mode
+    );
+    const hidden = BrowserTestUtils.waitForPopupEvent(panel, "hidden");
+    EventUtils.synthesizeKey("KEY_Enter", {}, origin);
+    results = (await opened).detail.tabInfo;
+    await hidden;
+    const expected = legacyQuickFilterLocation(legacyQuickFilter.target);
+    if (showAsList) {
+      await TestUtils.waitForCondition(
+        () =>
+          results.chromeBrowser.contentWindow.gViewWrapper?.isSynthetic &&
+          results.chromeBrowser.contentWindow.gDBView?.numMsgsInView == 1,
+        "The real global query loads its one-message synthetic result view"
+      );
+      const view = results.chromeBrowser.contentWindow.gDBView;
+      Assert.equal(view.rowCount, 1);
+      Assert.deepEqual(
+        legacyQuickFilterLocation(view.getMsgHdrAt(0)),
+        expected
+      );
+      await BrowserTestUtils.waitForMutationCondition(
+        results.tabNode,
+        { attributes: true, childList: true, subtree: true },
+        () => results.title == legacyGlobalText
+      );
+      Assert.equal(
+        results.title,
+        legacyGlobalText,
+        "The list keeps the exact query"
+      );
+    } else {
+      await TestUtils.waitForCondition(
+        () => results.browser?.contentWindow.FacetContext?.everFaceted,
+        "The production facet query has completed"
+      );
+      const context = results.browser.contentWindow.FacetContext;
+      Assert.equal(context.fullSet.length, 1);
+      Assert.deepEqual(
+        context.fullSet.map(item =>
+          legacyQuickFilterLocation(item.folderMessage)
+        ),
+        [expected]
+      );
+      const cards = results.browser.contentDocument.querySelectorAll(
+        "facet-result-message"
+      );
+      Assert.equal(cards.length, 1);
+      Assert.deepEqual(
+        legacyQuickFilterLocation(cards[0].message.folderMessage),
+        expected
+      );
+      Assert.equal(results.searchString, legacyGlobalText);
+      Assert.equal(results.searcher.searchString, legacyGlobalText);
+    }
+    Assert.equal(
+      tabmail.tabInfo.length,
+      tabCount + 1,
+      "One final results tab opens"
+    );
+    Assert.equal(tabmail.currentTabInfo, results);
+    tabmail.closeTab(results);
+    Assert.equal(tabmail.currentTabInfo, originTab);
+    Assert.equal(origin.gFolder.URI, legacyQuickFilter.origin.URI);
+    Assert.equal(
+      input.value,
+      legacyGlobalText,
+      "Closing search keeps the filter text"
+    );
+    Assert.deepEqual(origin.quickFilterBar.filterer.filterValues, state);
+    Assert.equal(origin.document.getElementById("qfb-sticky").pressed, true);
+    Assert.equal(origin.document.getElementById("qfb-unread").pressed, true);
+    Assert.equal(origin.gDBView.numMsgsInView, 0);
+    Assert.equal(panel.state, "closed");
+  } finally {
+    if (results && tabmail.tabInfo.includes(results)) {
+      tabmail.closeTab(results);
+    }
+    clear_constraints();
+    await wait_for_all_messages_to_load();
+    await SpecialPowers.popPrefEnv();
+  }
+}
+
+add_task(async function test_legacyQuickFilterFacetEscalation() {
+  await checkLegacyQuickFilterEscalation(false);
+});
+
+add_task(async function test_legacyQuickFilterListEscalation() {
+  await checkLegacyQuickFilterEscalation(true);
+});
+
+add_task(async function test_legacyQuickFilterUpsellSuppression() {
+  await be_in_folder(legacyQuickFilter.origin);
+  clear_constraints();
+  await wait_for_all_messages_to_load();
+  const origin = get_about_3pane();
+  const input = origin.document.getElementById("qfb-qs-textbox");
+  const panel = origin.document.getElementById("qfb-text-search-upsell");
+  input.focus();
+  const shown = BrowserTestUtils.waitForPopupEvent(panel, "shown");
+  await set_filter_text(legacyGlobalText);
+  await shown;
+  await SpecialPowers.pushPrefEnv({
+    set: [["mailnews.database.global.indexer.enabled", false]],
+  });
+  // Legacy Gloda reads the preference at startup. Disable its actual indexer
+  // through the production API as well; changing the preference alone is not
+  // evidence that indexing has stopped.
+  const wasEnabled = legacyQuickFilter.indexer.enabled;
+  legacyQuickFilter.indexer.enabled = false;
+  try {
+    Assert.equal(legacyQuickFilter.indexer.enabled, false);
+    const hidden = BrowserTestUtils.waitForPopupEvent(panel, "hidden");
+    await set_filter_text(legacyGlobalText + " absent");
+    await hidden;
+    Assert.equal(origin.gDBView.numMsgsInView, 0);
+    Assert.equal(
+      panel.state,
+      "closed",
+      "Disabled indexer suppresses the upsell"
+    );
+  } finally {
+    legacyQuickFilter.indexer.enabled = wasEnabled;
+    await SpecialPowers.popPrefEnv();
+  }
+  Assert.equal(legacyQuickFilter.indexer.enabled, true);
+  await set_filter_text("");
+  Assert.equal(input.value, "");
+  Assert.equal(origin.gDBView.numMsgsInView, 1);
+  Assert.equal(panel.state, "closed", "Empty text suppresses the upsell");
+  await set_filter_text(legacyLocalText);
+  Assert.equal(origin.gDBView.numMsgsInView, 1);
+  Assert.deepEqual(
+    legacyQuickFilterLocation(origin.gDBView.getMsgHdrAt(0)),
+    legacyQuickFilterLocation(legacyQuickFilter.local)
+  );
+  Assert.equal(
+    panel.state,
+    "closed",
+    "An actual local hit suppresses the upsell"
+  );
+  clear_constraints();
+  await wait_for_all_messages_to_load();
+});

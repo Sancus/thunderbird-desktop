@@ -83,6 +83,8 @@ tags = ["foldernames"]
 
 ["test_imapFolderCopy.js"]
 
+["test_imapFolderCopyFailures.js"]
+
 ["test_imapHdrStreaming.js"]
 
 ["test_imapHeaderFields.js"]

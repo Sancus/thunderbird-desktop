@@ -65,12 +65,25 @@ class nsImapMailCopyState : public nsISupports {
       m_msgService;        // source folder message service; can
                            // be Nntp, Mailbox, or Imap
   bool m_isMove;           // is a move
+  bool m_isFolder;         // private message phase of a folder copy
   bool m_selectedState;    // needs to be in selected state; append msg
   bool m_isCrossServerOp;  // are we copying between imap servers?
   uint32_t m_curIndex;     // message index to the message array which we are
                            // copying
   uint32_t m_unreadCount;  // num unread messages we're moving
   bool m_streamCopy;
+  bool m_waitingForSourceDelete;
+#ifdef MOZ_PANORAMA
+  struct StreamSource {
+    struct Message {
+      nsMsgKey key;
+      ImapUid uid;
+    };
+    uint64_t folderId = 0;
+    uint32_t epoch = 0;
+    nsTArray<Message> messages;
+  } m_streamSource;
+#endif
   char* m_dataBuffer;  // temporary buffer for this copy operation
   nsCOMPtr<nsIOutputStream> m_msgFileStream;  // temporary file (processed mail)
   uint32_t m_dataBufferSize;
@@ -456,7 +469,12 @@ class nsImapMailFolder : public nsMsgDBFolder,
                                   bool isMove, bool isCrossServerOp,
                                   nsIMsgWindow* msgWindow,
                                   nsIMsgCopyServiceListener* listener,
-                                  bool allowUndo);
+                                  bool allowUndo, bool isFolder);
+#ifdef MOZ_PANORAMA
+  nsresult ValidateStreamSource(nsImapMailCopyState* state,
+                                nsIMsgFolder* source, uint32_t index);
+#endif
+  nsresult ContinueStreamCopy(nsImapMailCopyState* state, nsresult status);
   nsresult CopyStreamMessage(nsIMsgDBHdr* message, nsIMsgFolder* dstFolder,
                              nsIMsgWindow* msgWindow, bool isMove);
   nsresult InitCopyState(nsISupports* srcSupport,

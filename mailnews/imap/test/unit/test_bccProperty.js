@@ -1050,13 +1050,42 @@ if (panorama) {
         error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
       );
     })();
-    IMAPPump.inbox.storeImapFlags(
-      8,
-      true,
-      [protectedHeader.messageKey],
-      listener
+    const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
     );
-    await failure;
+    const oldEpoch = IMAPPump.inbox.msgDatabase.dBFolderInfo.imapUidValidity;
+    const oldUid = protectedHeader.getUint32Property("uidOnServer");
+    Assert.equal(oldEpoch, 7101);
+    Assert.equal(
+      oldUid,
+      6202,
+      "The real source binding exists before fault injection"
+    );
+    // Fault injection only: retain the real ingested binding if retiring it
+    // fails, so the cached observed-epoch guard is exercised independently.
+    core.connectionForTests.executeSimpleSQL(
+      "CREATE TEMP TRIGGER reject_epoch_retirement BEFORE DELETE ON message_properties " +
+        `WHEN OLD.id=${protectedHeader.messageKey} AND OLD.name='uidOnServer' ` +
+        "BEGIN SELECT RAISE(ABORT,'epoch retirement'); END"
+    );
+    try {
+      IMAPPump.inbox.storeImapFlags(
+        8,
+        true,
+        [protectedHeader.messageKey],
+        listener
+      );
+      await failure;
+    } finally {
+      core.connectionForTests.executeSimpleSQL(
+        "DROP TRIGGER reject_epoch_retirement"
+      );
+    }
+    Assert.equal(
+      IMAPPump.inbox.msgDatabase.dBFolderInfo.imapUidValidity,
+      oldEpoch
+    );
+    Assert.equal(protectedHeader.getUint32Property("uidOnServer"), oldUid);
     Assert.ok(
       IMAPPump.inbox.msgDatabase.containsKey(protectedHeader.messageKey)
     );
@@ -1065,37 +1094,96 @@ if (panorama) {
     Assert.equal(protectedHeader.storeToken, token);
     // Protocol identity is stale; verify retained bytes at their actual store.
     const uri = IMAPPump.inbox.getUriForMsg(protectedHeader);
-    Assert.throws(
-      () =>
+    const originalKeys = IMAPPump.inbox.msgDatabase.listAllKeys();
+    const originalFlags = protectedHeader.flags;
+    const originalCount = IMAPPump.inbox.getTotalMessages(false);
+    const wireBefore = IMAPPump.server.playTransaction();
+    const commandCount = (
+      Array.isArray(wireBefore) ? wireBefore : [wireBefore]
+    ).flatMap(item => item.them).length;
+    for (const persistObservedEpoch of [false, true]) {
+      if (persistObservedEpoch) {
+        IMAPPump.inbox.QueryInterface(Ci.nsIImapMailFolderSink).uidValidity =
+          IMAPPump.mailbox.uidvalidity;
+        Assert.equal(
+          IMAPPump.inbox.msgDatabase.dBFolderInfo.imapUidValidity,
+          7202
+        );
+        Assert.equal(protectedHeader.getUint32Property("uidOnServer"), 0);
+      }
+      let receivedBytes = 0;
+      let stoppedWith;
+      const consumer = new PromiseTestUtils.PromiseStreamListener({
+        onDataAvailable(request, stream, offset, count) {
+          receivedBytes += count;
+        },
+        onStopRequest(request, status) {
+          stoppedWith = status;
+        },
+      });
+      const terminal = consumer.promise.then(
+        () => Cr.NS_OK,
+        error => Number(error.message)
+      );
+      let result;
+      try {
         MailServices.messageServiceFromURI(uri).streamMessage(
           uri,
-          null,
+          consumer,
           null,
           null,
           false,
           "",
           true
-        ),
-      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
-    );
-    const stream = IMAPPump.inbox.msgStore.getMsgInputStream(
-      IMAPPump.inbox,
-      token,
-      0
-    );
-    const reader = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
-      Ci.nsIScriptableInputStream
-    );
-    reader.init(stream);
-    let bytes = "";
-    try {
-      for (let chunk = reader.read(4096); chunk; chunk = reader.read(4096)) {
-        bytes += chunk;
+        );
+        result = await terminal;
+      } catch (error) {
+        result = error.result;
       }
-    } finally {
-      reader.close();
+      Assert.equal(
+        result,
+        Cr.NS_ERROR_NOT_AVAILABLE,
+        `A stale-epoch consumer must fail; received ${receivedBytes} bytes`
+      );
+      Assert.equal(
+        receivedBytes,
+        0,
+        "No old-identity bytes reach the consumer"
+      );
+      if (stoppedWith !== undefined) {
+        Assert.equal(stoppedWith, Cr.NS_ERROR_NOT_AVAILABLE);
+      }
+      const wireAfter = IMAPPump.server.playTransaction();
+      Assert.deepEqual(
+        (Array.isArray(wireAfter) ? wireAfter : [wireAfter])
+          .flatMap(item => item.them)
+          .slice(commandCount),
+        [],
+        "A local-only stale stream must not fall back to the protocol"
+      );
+      Assert.deepEqual(IMAPPump.inbox.msgDatabase.listAllKeys(), originalKeys);
+      Assert.equal(protectedHeader.flags, originalFlags);
+      Assert.equal(IMAPPump.inbox.getTotalMessages(false), originalCount);
+      Assert.equal(protectedHeader.storeToken, token);
+      const stream = IMAPPump.inbox.msgStore.getMsgInputStream(
+        IMAPPump.inbox,
+        token,
+        0
+      );
+      const reader = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+        Ci.nsIScriptableInputStream
+      );
+      reader.init(stream);
+      let bytes = "";
+      try {
+        for (let chunk = reader.read(4096); chunk; chunk = reader.read(4096)) {
+          bytes += chunk;
+        }
+      } finally {
+        reader.close();
+      }
+      Assert.ok(bytes.endsWith("Keep unrelated source bytes.\r\n"));
     }
-    Assert.ok(bytes.endsWith("Keep unrelated source bytes.\r\n"));
   });
 }
 

@@ -20,6 +20,8 @@
 #include "nsIMsgHdr.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgFolder.h"
+#include "nsIDBFolderInfo.h"
+#include "nsIImapMailFolderSink.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/StaticPrefs_mail.h"
 
@@ -409,6 +411,21 @@ static mozilla::Result<uint64_t, nsresult> FolderIdFromDatabase(
   MOZ_TRY(folder->GetId(&folderId));
   if (!folderId) {
     return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+  }
+  nsCOMPtr<nsIImapMailFolderSink> imapFolder = do_QueryInterface(folder);
+  if (imapFolder) {
+    ImapUid observedEpoch;
+    MOZ_TRY(imapFolder->GetUidValidity(&observedEpoch));
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+    if (!info) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
+    ImapUid storedEpoch;
+    MOZ_TRY(info->GetImapUidValidity(&storedEpoch));
+    if (observedEpoch && observedEpoch != storedEpoch) {
+      return mozilla::Err(NS_ERROR_NOT_AVAILABLE);
+    }
   }
   return folderId;
 }

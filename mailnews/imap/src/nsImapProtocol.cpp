@@ -2900,16 +2900,31 @@ void nsImapProtocol::ProcessSelectedStateURL() {
       selectIssued = GetServerStateParser().LastCommandSuccessful();
     }
 
-    if (NS_FAILED(m_mailboxUpdateResult)) return;
 #ifdef MOZ_PANORAMA
     uint32_t expectedEpoch =
         static_cast<nsImapUrl*>(m_runningUrl.get())->ExpectedUidValidity();
-    if (expectedEpoch && GetServerStateParser().LastCommandSuccessful() &&
-        expectedEpoch != GetServerStateParser().FolderUIDValidity()) {
-      m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+    ImapUid observedEpoch = GetServerStateParser().FolderUIDValidity();
+    if (expectedEpoch && observedEpoch &&
+        GetServerStateParser().LastCommandSuccessful() &&
+        expectedEpoch != observedEpoch) {
+      // ProcessMailboxUpdate may already have rejected this old-epoch URL.
+      // Still publish the observed epoch through the main-thread sink, so
+      // later cached reads cannot resolve the old physical key to a live UID.
+      if (NS_SUCCEEDED(m_mailboxUpdateResult)) {
+        m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+      }
+      nsresult rv = m_imapMailFolderSink
+                        ? m_imapMailFolderSink->SetUidValidity(observedEpoch)
+                        : NS_ERROR_NOT_AVAILABLE;
+      if (NS_FAILED(rv)) {
+        MOZ_LOG(IMAP, LogLevel::Warning,
+                ("Failed to record observed UIDVALIDITY: 0x%08" PRIx32,
+                 static_cast<uint32_t>(rv)));
+      }
       return;
     }
 #endif
+    if (NS_FAILED(m_mailboxUpdateResult)) return;
     if (selectIssued) RefreshACLForFolderIfNecessary(mailboxName.get());
 
     bool uidValidityOk = true;

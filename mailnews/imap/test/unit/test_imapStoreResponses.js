@@ -93,3 +93,120 @@ add_task(function test_missingUidAndBadOperationPreserveMessages() {
     [["\\Seen"], ["\\Seen"], ["\\Seen"]]
   );
 });
+
+/**
+ * Adds a UIDPLUS destination with a different UIDVALIDITY and UID range.
+ *
+ * @returns {{handler: IMAP_RFC3501_handler, messages: ImapMessage[],
+ *   destination: ImapMailbox}} The selected source and distinct destination.
+ */
+function makeUidplusTransferFixture() {
+  const { IMAP_MOVE_extension } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/Imapd.sys.mjs"
+  );
+  const { handler, messages } = makeStoreFixture();
+  mixinExtension(handler, IMAP_MOVE_extension);
+  mixinExtension(handler, IMAP_RFC4315_extension);
+  handler._selectedMailbox.uidvalidity = 111;
+  messages.forEach((message, index) => {
+    message._URI =
+      "data:text/plain," +
+      encodeURIComponent(
+        `Subject: source ${index}\r\n\r\nExact body ${index}.\r\n`
+      );
+  });
+  Assert.ok(
+    handler._daemon.createMailbox("destination", {
+      uidvalidity: 9001,
+      uidnext: 501,
+    })
+  );
+  const destination = handler._daemon.getMailbox("destination");
+  Assert.equal(destination.uidvalidity, 9001);
+  Assert.equal(destination.uidnext, 501);
+  return { handler, messages, destination };
+}
+
+add_task(function test_uidplusCopyUsesDestinationAndActualSourceUids() {
+  for (const uid of [false, true]) {
+    const { handler, messages, destination } = makeUidplusTransferFixture();
+    const source = [...messages];
+    const response = uid
+      ? handler.UID(["COPY", "41,999,105", "destination"])
+      : handler.COPY(["1,3,99", "destination"]);
+    Assert.equal(response, "OK [COPYUID 9001 41,105 501:502] COPY completed");
+    Assert.deepEqual(
+      destination._messages.map(message => message.uid),
+      [501, 502]
+    );
+    Assert.deepEqual(
+      destination._messages.map(message => message.getText()),
+      [source[0].getText(), source[2].getText()]
+    );
+    Assert.deepEqual(
+      destination._messages.map(message => message.flags),
+      [["\\Seen"], ["\\Seen"]]
+    );
+    Assert.deepEqual(handler._selectedMailbox._messages, source);
+    Assert.notEqual(destination._messages[0].flags, source[0].flags);
+    Assert.equal(destination.uidnext, 503);
+  }
+});
+
+add_task(function test_uidplusMoveMapsUidsBeforeExpunge() {
+  for (const uid of [false, true]) {
+    const { handler, messages, destination } = makeUidplusTransferFixture();
+    const source = [...messages];
+    const response = uid
+      ? handler.UID(["MOVE", "41,999,105", "destination"])
+      : handler.MOVE(["1,3,99", "destination"]);
+    Assert.equal(
+      response,
+      "* 3 EXPUNGE\0* 1 EXPUNGE\0OK [COPYUID 9001 41,105 501:502] completed"
+    );
+    Assert.deepEqual(
+      destination._messages.map(message => message.uid),
+      [501, 502]
+    );
+    Assert.deepEqual(
+      destination._messages.map(message => message.getText()),
+      [source[0].getText(), source[2].getText()]
+    );
+    Assert.deepEqual(
+      destination._messages.map(message => message.flags),
+      [["\\Seen"], ["\\Seen"]]
+    );
+    Assert.deepEqual(handler._selectedMailbox._messages, [source[1]]);
+    Assert.notEqual(destination._messages[0].flags, source[0].flags);
+    Assert.equal(destination.uidnext, 503);
+  }
+});
+
+add_task(function test_uidplusEmptyAndRejectedTransfersPreserveMessages() {
+  for (const command of ["COPY", "MOVE"]) {
+    const { handler, messages, destination } = makeUidplusTransferFixture();
+    const source = [...messages];
+    Assert.equal(
+      handler.UID([command, "999", "destination"]),
+      `OK ${command} completed`,
+      "An empty match has no invented COPYUID mapping"
+    );
+    Assert.equal(
+      handler.UID([command, "73", "missing"]),
+      "NO [TRYCREATE] what mailbox?",
+      "A missing destination keeps the original refusal"
+    );
+    Assert.throws(
+      () => handler.UID([command, "invalid", "destination"]),
+      /BAD invalid UID/,
+      "An invalid source set keeps the original error"
+    );
+    Assert.deepEqual(handler._selectedMailbox._messages, source);
+    Assert.deepEqual(destination._messages, []);
+    Assert.equal(destination.uidnext, 501);
+    Assert.deepEqual(
+      source.map(message => message.flags),
+      [["\\Seen"], ["\\Seen"], ["\\Seen"]]
+    );
+  }
+});

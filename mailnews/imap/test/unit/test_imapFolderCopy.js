@@ -19,8 +19,12 @@ var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
 
-add_setup(function () {
-  setupIMAPPump();
+add_setup(async function () {
+  Services.prefs.setCharPref(
+    "mail.server.default.storeContractID",
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
+  setupIMAPPump("RFC2195,RFC4315");
 
   gEmptyLocal1 = localAccountUtils.rootFolder.createLocalSubfolder("empty 1");
   gEmptyLocal2 = localAccountUtils.rootFolder.createLocalSubfolder("empty 2");
@@ -28,7 +32,7 @@ add_setup(function () {
   gNotEmptyLocal4 =
     localAccountUtils.rootFolder.createLocalSubfolder("not empty 4");
   gNotEmptyLocal5 =
-    localAccountUtils.rootFolder.createLocalSubfolder("not empty 5");
+    localAccountUtils.rootFolder.createLocalSubfolder("not empty 5 ☃");
 
   const messageGenerator = new MessageGenerator();
   const message = messageGenerator.makeMessage();
@@ -37,12 +41,18 @@ add_setup(function () {
   gNotEmptyLocal5.QueryInterface(Ci.nsIMsgLocalMailFolder);
   gNotEmptyLocal5.addMessage(messageGenerator.makeMessage().toMessageString());
 
-  // these hacks are required because we've created the inbox before
-  // running initial folder discovery, and adding the folder bails
-  // out before we set it as verified online, so we bail out, and
-  // then remove the INBOX folder since it's not verified.
-  IMAPPump.inbox.hierarchyDelimiter = "/";
-  IMAPPump.inbox.verifiedAsOnlineFolder = true;
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    listener,
+    null
+  );
+  await listener.promise;
+  IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  Assert.equal(IMAPPump.inbox.parent, IMAPPump.incomingServer.rootFolder);
+  Assert.equal(IMAPPump.inbox.server, IMAPPump.incomingServer);
 });
 
 add_task(async function copyFolder1() {
@@ -129,7 +139,7 @@ add_task(async function copyImapFolderWithinAccount() {
   await copyListener.promise;
 
   const source = IMAPPump.inbox
-    .getChildNamed("not empty 5")
+    .getChildNamed("not empty 5 ☃")
     .QueryInterface(Ci.nsIMsgImapMailFolder);
   const destination = IMAPPump.inbox.getChildNamed("empty 1");
 
@@ -144,7 +154,7 @@ add_task(async function copyImapFolderWithinAccount() {
   await copyListener.promise;
 
   const copied = destination
-    .getChildNamed("not empty 5")
+    .getChildNamed("not empty 5 ☃")
     .QueryInterface(Ci.nsIMsgImapMailFolder);
   listener = new PromiseTestUtils.PromiseUrlListener();
   copied.updateFolderWithListener(null, listener);

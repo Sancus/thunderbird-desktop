@@ -1623,11 +1623,8 @@ export class IMAP_RFC3501_handler {
     }
 
     for (var message of messages) {
-      const newMessage = new ImapMessage(
-        message._URI,
-        dest.uidnext++,
-        message.flags
-      );
+      const newMessage = new ImapMessage(message._URI, dest.uidnext++, []);
+      newMessage.flags = [...message.flags];
       newMessage.recent = false;
       dest.addMessage(newMessage);
     }
@@ -2214,11 +2211,8 @@ export var IMAP_MOVE_extension = {
     }
 
     for (var message of messages) {
-      const newMessage = new ImapMessage(
-        message._URI,
-        dest.uidnext++,
-        message.flags
-      );
+      const newMessage = new ImapMessage(message._URI, dest.uidnext++, []);
+      newMessage.flags = [...message.flags];
       newMessage.recent = false;
       dest.addMessage(newMessage);
     }
@@ -2458,19 +2452,27 @@ export var IMAP_RFC4315_extension = {
     }
     return response;
   },
-  COPY(args) {
-    const mailbox = this._daemon.getMailbox(args[0]);
-    if (mailbox) {
-      var first = mailbox.uidnext;
-    }
-    let response = this._preRFC4315COPY(args, true);
-    if (response.indexOf("OK") == 0) {
+  /**
+   * Adds the destination UIDVALIDITY and actual source UIDs to a successful COPY.
+   *
+   * @param {[number|string, string]} args - Source set and destination mailbox.
+   * @param {boolean} [uid] - Whether the source set contains UIDs.
+   * @returns {string} The delegate response with COPYUID for a nonempty copy.
+   */
+  COPY(args, uid) {
+    const mailbox = this._daemon.getMailbox(args[1]);
+    const first = mailbox?.uidnext;
+    const sourceUids = this._parseSequenceSet(args[0], uid)
+      .map(message => message.uid)
+      .join(",");
+    let response = this._preRFC4315COPY(args, uid);
+    if (response.indexOf("OK") == 0 && sourceUids) {
       const last = mailbox.uidnext - 1;
       response =
         "OK [COPYUID " +
-        this._selectedMailbox.uidvalidity +
+        mailbox.uidvalidity +
         " " +
-        args[0] +
+        sourceUids +
         " " +
         first +
         ":" +
@@ -2480,20 +2482,28 @@ export var IMAP_RFC4315_extension = {
     }
     return response;
   },
-  MOVE(args) {
+  /**
+   * Captures source UIDs before MOVE expunges and adds the destination mapping.
+   *
+   * @param {[number|string, string]} args - Source set and destination mailbox.
+   * @param {boolean} [uid] - Whether the source set contains UIDs.
+   * @returns {string} The delegate response with COPYUID for a nonempty move.
+   */
+  MOVE(args, uid) {
     const mailbox = this._daemon.getMailbox(args[1]);
-    if (mailbox) {
-      var first = mailbox.uidnext;
-    }
-    let response = this._preRFC4315MOVE(args, true);
-    if (response.includes("OK MOVE")) {
+    const first = mailbox?.uidnext;
+    const sourceUids = this._parseSequenceSet(args[0], uid)
+      .map(message => message.uid)
+      .join(",");
+    let response = this._preRFC4315MOVE(args, uid);
+    if (response.includes("OK MOVE") && sourceUids) {
       const last = mailbox.uidnext - 1;
       response = response.replace(
         "OK MOVE",
         "OK [COPYUID " +
-          this._selectedMailbox.uidvalidity +
+          mailbox.uidvalidity +
           " " +
-          args[0] +
+          sourceUids +
           " " +
           first +
           ":" +

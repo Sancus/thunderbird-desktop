@@ -26,7 +26,7 @@ var gEmptyLocal1, gEmptyLocal2;
 var gLastKey;
 var gMessages = [];
 
-add_setup(function () {
+add_setup(async function () {
   // Turn off autosync_offline_stores because
   // fetching messages is invoked after copying the messages.
   // (i.e. The fetching process will be invoked after OnStopCopy)
@@ -37,17 +37,27 @@ add_setup(function () {
     false
   );
 
-  setupIMAPPump();
+  Services.prefs.setCharPref(
+    "mail.server.default.storeContractID",
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
+  setupIMAPPump("RFC2195,RFC4315");
 
   gEmptyLocal1 = localAccountUtils.rootFolder.createLocalSubfolder("empty 1");
   gEmptyLocal2 = localAccountUtils.rootFolder.createLocalSubfolder("empty 2");
 
-  // these hacks are required because we've created the inbox before
-  // running initial folder discovery, and adding the folder bails
-  // out before we set it as verified online, so we bail out, and
-  // then remove the INBOX folder since it's not verified.
-  IMAPPump.inbox.hierarchyDelimiter = "/";
-  IMAPPump.inbox.verifiedAsOnlineFolder = true;
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    listener,
+    null
+  );
+  await listener.promise;
+  IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  Assert.equal(IMAPPump.inbox.parent, IMAPPump.incomingServer.rootFolder);
+  Assert.equal(IMAPPump.inbox.server, IMAPPump.incomingServer);
 });
 
 add_task(async function copyFolder1() {

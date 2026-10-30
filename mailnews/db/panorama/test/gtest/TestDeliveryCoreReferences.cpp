@@ -2963,6 +2963,20 @@ void ExpectDiscovery(MessageDatabase& db, nsMsgKey seed,
   }
 }
 
+void ExpectConversationRead(MessageDatabase& db, nsMsgKey seed,
+                            const nsTArray<ConversationMember>& expected) {
+  nsTArray<nsMsgKey> keys, output{nsMsgKey_None - 1};
+  for (const auto& member : expected) keys.AppendElement(member.id);
+  keys.Sort();
+  ASSERT_EQ(NS_OK, db.GetConversationMessageKeys(seed, output));
+  EXPECT_EQ(keys, output);
+  for (const auto& member : expected) {
+    CapturedMessage physical;
+    ASSERT_EQ(NS_OK, db.CaptureMessage(member.id, physical));
+    EXPECT_EQ(member.folderId, physical.folderId);
+  }
+}
+
 TEST_F(DISABLED_DeliveryCoreReferences, DiscoverOrderedCrossFolder) {
   ASSERT_EQ(NS_OK, Start());
   uint64_t a, b;
@@ -10519,6 +10533,314 @@ TEST_F(DeliveryCoreReferences,
         CheckStructuralFieldWrites(staged, StructuralFailure::Commit));
     Stop();
   }
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadOrderedCrossFolder) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Ordered conversation");
+  nsMsgKey root, reply, tail, unrelated;
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, a, "ordered-root@conversation.invalid"_ns,
+                                {}, root, subject));
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, b, "ordered-reply@conversation.invalid"_ns,
+                                {"ordered-root@conversation.invalid"_ns}, reply,
+                                subject));
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, a, "ordered-tail@conversation.invalid"_ns,
+                                {"ordered-root@conversation.invalid"_ns,
+                                 "ordered-reply@conversation.invalid"_ns},
+                                tail, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "ordered-unrelated@conversation.invalid"_ns, {},
+                       unrelated, subject));
+  for (nsMsgKey seed : {root, reply, tail}) {
+    ExpectConversationRead(db, seed, {{root, a}, {reply, b}, {tail, a}});
+  }
+  ExpectConversationRead(db, unrelated, {{unrelated, b}});
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, Stored(tail, stored));
+  EXPECT_EQ((nsTArray<nsCString>{"ordered-root@conversation.invalid"_ns,
+                                 "ordered-reply@conversation.invalid"_ns}),
+            stored);
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadReplyBeforeParent) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Reply before parent");
+  nsMsgKey unrelated, reply, parent;
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "reply-first-unrelated@conversation.invalid"_ns,
+                       {}, unrelated, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "reply-first-child@conversation.invalid"_ns,
+                       {"reply-first-parent@conversation.invalid"_ns}, reply,
+                       subject));
+  ExpectConversationRead(db, reply, {{reply, b}});
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "reply-first-parent@conversation.invalid"_ns, {},
+                       parent, subject));
+  for (nsMsgKey seed : {reply, parent}) {
+    ExpectConversationRead(db, seed, {{reply, b}, {parent, a}});
+  }
+  ExpectConversationRead(db, unrelated, {{unrelated, a}});
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadSiblingsWithoutParent) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Siblings without parent");
+  nsMsgKey unrelated, first, second;
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(
+                db, a, "siblings-missing-unrelated@conversation.invalid"_ns, {},
+                unrelated, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "siblings-missing-first@conversation.invalid"_ns,
+                       {"siblings-missing-parent@conversation.invalid"_ns},
+                       first, subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "siblings-missing-second@conversation.invalid"_ns,
+                       {"siblings-missing-parent@conversation.invalid"_ns},
+                       second, subject));
+  for (nsMsgKey seed : {first, second}) {
+    ExpectConversationRead(db, seed, {{first, a}, {second, b}});
+  }
+  ExpectConversationRead(db, unrelated, {{unrelated, a}});
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadSiblingsThenParent) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t a, b;
+  ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
+  auto& db = mCore->MessageDB();
+  const nsCString subject("Siblings then parent");
+  nsMsgKey first, second, unrelated, parent;
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "siblings-late-first@conversation.invalid"_ns,
+                       {"siblings-late-parent@conversation.invalid"_ns}, first,
+                       subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "siblings-late-second@conversation.invalid"_ns,
+                       {"siblings-late-parent@conversation.invalid"_ns}, second,
+                       subject));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, b, "siblings-late-unrelated@conversation.invalid"_ns,
+                       {}, unrelated, subject));
+  // Exercise the late arrival independently of the missing-parent assertion.
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(
+                       db, a, "siblings-late-parent@conversation.invalid"_ns,
+                       {}, parent, subject));
+  for (nsMsgKey seed : {first, second, parent}) {
+    ExpectConversationRead(db, seed, {{first, a}, {second, b}, {parent, a}});
+  }
+  ExpectConversationRead(db, unrelated, {{unrelated, b}});
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadWholeStoredComponent) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey root, child, incoming;
+  ASSERT_EQ(NS_OK,
+            AddDiscoveryMessage(db, mFolderId, "root@invalid"_ns, {}, root));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(db, mFolderId, "child@invalid"_ns,
+                                       {"root@invalid"_ns}, child));
+  CapturedMessage rootRow, childRow;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(root, rootRow));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(child, childRow));
+  ASSERT_NE(0u, rootRow.threadId);
+  ASSERT_EQ(rootRow.threadId, childRow.threadId);
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(child, {}));
+  ASSERT_EQ(NS_OK, AddDiscoveryMessage(db, mFolderId, "incoming@invalid"_ns,
+                                       {"child@invalid"_ns}, incoming));
+  ExpectConversationRead(
+      db, incoming,
+      {{root, mFolderId}, {child, mFolderId}, {incoming, mFolderId}});
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadKeepsEveryReferencedCopy) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  uint64_t other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Other"_ns, &other));
+  nsMsgKey first, reply, selected, unrelated;
+  ASSERT_EQ(NS_OK, AddAt(mFolderId, "physical-root"_ns, {}, first));
+  ASSERT_EQ(NS_OK,
+            AddAt(mFolderId, "physical-reply"_ns, {"physical-root"_ns}, reply));
+  ASSERT_EQ(NS_OK, AddAt(other, "physical-root"_ns, {}, selected));
+  ASSERT_EQ(NS_OK, AddAt(other, "unrelated"_ns, {}, unrelated));
+  CapturedMessage firstBefore, selectedBefore;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(first, firstBefore));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(selected, selectedBefore));
+  ASSERT_NE(firstBefore.threadId, selectedBefore.threadId);
+  uint64_t before, after;
+  ASSERT_EQ(NS_OK, SearchWatermark(before));
+  const size_t cached = CachedHeaderCount();
+  for (nsMsgKey seed : {first, reply, selected}) {
+    nsTArray<nsMsgKey> output;
+    ASSERT_EQ(NS_OK, db.GetConversationMessageKeys(seed, output));
+    EXPECT_EQ((nsTArray<nsMsgKey>{first, reply, selected}), output);
+  }
+  EXPECT_EQ(cached, CachedHeaderCount());
+  ASSERT_EQ(NS_OK, SearchWatermark(after));
+  EXPECT_EQ(before, after);
+  CapturedMessage firstAfter, selectedAfter;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(first, firstAfter));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(selected, selectedAfter));
+  EXPECT_EQ(firstBefore.threadId, firstAfter.threadId);
+  EXPECT_EQ(selectedBefore.threadId, selectedAfter.threadId);
+  EXPECT_EQ(mFolderId, firstAfter.folderId);
+  EXPECT_EQ(other, selectedAfter.folderId);
+  ExpectConversationRead(db, unrelated, {{unrelated, other}});
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadTraversesLateAncestorChain) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey leaf, middle, root;
+  ASSERT_EQ(NS_OK, Add("late-leaf"_ns, {"late-middle"_ns}, leaf));
+  ASSERT_EQ(NS_OK, Add("late-middle"_ns, {"late-root"_ns}, middle));
+  ASSERT_EQ(NS_OK, Add("late-root"_ns, {}, root));
+  CapturedMessage leafRow, middleRow, rootRow;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(leaf, leafRow));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(middle, middleRow));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(root, rootRow));
+  ASSERT_NE(leafRow.threadId, middleRow.threadId);
+  ASSERT_NE(middleRow.threadId, rootRow.threadId);
+  for (nsMsgKey seed : {leaf, middle, root}) {
+    ExpectConversationRead(
+        db, seed, {{leaf, mFolderId}, {middle, mFolderId}, {root, mFolderId}});
+  }
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ExpectConversationRead(
+      mCore->MessageDB(), root,
+      {{leaf, mFolderId}, {middle, mFolderId}, {root, mFolderId}});
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadKeepsExactTokenEdges) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey first, copy, lower, child, emptyFirst, emptySecond;
+  ASSERT_EQ(NS_OK, Add("Case"_ns, {}, first));
+  ASSERT_EQ(NS_OK, Add("Case"_ns, {}, copy));
+  ASSERT_EQ(NS_OK, Add("case"_ns, {}, lower));
+  ExpectConversationRead(db, first, {{first, mFolderId}});
+  ExpectConversationRead(db, copy, {{copy, mFolderId}});
+  ASSERT_EQ(NS_OK, Add("exact-child"_ns, {"Case"_ns, "Case"_ns}, child));
+  ExpectConversationRead(
+      db, copy, {{first, mFolderId}, {copy, mFolderId}, {child, mFolderId}});
+  ExpectConversationRead(db, lower, {{lower, mFolderId}});
+  ASSERT_EQ(NS_OK, Add(""_ns, {}, emptyFirst));
+  ASSERT_EQ(NS_OK, Add(""_ns, {}, emptySecond));
+  CapturedMessage emptyA, emptyB;
+  ASSERT_EQ(NS_OK, db.CaptureMessage(emptyFirst, emptyA));
+  ASSERT_EQ(NS_OK, db.CaptureMessage(emptySecond, emptyB));
+  ASSERT_NE(emptyA.threadId, emptyB.threadId);
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(emptyFirst, {""_ns}));
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(emptySecond, {""_ns}));
+  ExpectConversationRead(db, emptyFirst, {{emptyFirst, mFolderId}});
+  ExpectConversationRead(db, emptySecond, {{emptySecond, mFolderId}});
+  nsTArray<nsCString> raw;
+  ASSERT_EQ(NS_OK, Stored(emptyFirst, raw));
+  EXPECT_EQ((nsTArray<nsCString>{""_ns}), raw);
+  raw.Clear();
+  ASSERT_EQ(NS_OK, Stored(child, raw));
+  EXPECT_EQ((nsTArray<nsCString>{"Case"_ns, "Case"_ns}), raw);
+  nsMsgKey spaced, trimmed, shared;
+  ASSERT_EQ(NS_OK, Add("spaced"_ns, {" absent "_ns}, spaced));
+  ASSERT_EQ(NS_OK, Add("trimmed"_ns, {"absent"_ns}, trimmed));
+  ASSERT_EQ(NS_OK, Add("shared"_ns, {" absent "_ns}, shared));
+  ExpectConversationRead(db, spaced,
+                         {{spaced, mFolderId}, {shared, mFolderId}});
+  ExpectConversationRead(db, trimmed, {{trimmed, mFolderId}});
+}
+
+TEST_F(DeliveryCoreReferences, ConversationReadRejectsIncompleteAndOwnedState) {
+  ASSERT_EQ(NS_OK, Start());
+  RefPtr<MessageDatabase> held = &mCore->MessageDB();
+  auto& db = *held;
+  nsMsgKey seed, control, staged;
+  ASSERT_EQ(NS_OK, Add("reader-seed"_ns, {}, seed));
+  ASSERT_EQ(NS_OK, Add("reader-control"_ns, {}, control));
+  RawHdr raw;
+  raw.messageId = "unpublished"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  const nsTArray<nsMsgKey> sentinel{nsMsgKey_None - 2, nsMsgKey_None - 1};
+  nsTArray<nsMsgKey> output = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db.GetConversationMessageKeys(0, output));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.GetConversationMessageKeys(nsMsgKey_None, output));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetConversationMessageKeys(nsMsgKey_None - 3, output));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetConversationMessageKeys(staged, output));
+  EXPECT_EQ(sentinel, output);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(control, "caller"_ns, "pending"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.GetConversationMessageKeys(seed, output));
+  EXPECT_EQ(sentinel, output);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString pending;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(control, "caller"_ns, pending));
+  EXPECT_EQ("pending"_ns, pending);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  // A removed known-history marker models unavailable native history, not a
+  // fabricated legacy fixture or an empty References list.
+  nsCOMPtr<mozIStorageStatement> remove;
+  ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                       "DELETE FROM message_reference_sets WHERE id=:id"_ns,
+                       getter_AddRefs(remove)));
+  ASSERT_EQ(NS_OK, remove->BindInt64ByName("id"_ns, control));
+  ASSERT_EQ(NS_OK, remove->Execute());
+  remove = nullptr;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetConversationMessageKeys(seed, output));
+  EXPECT_EQ(sentinel, output);
+  ASSERT_EQ(NS_OK, db.SetMessageReferences(control, {}));
+  RefPtr<CaptureReadAbort> fault = new CaptureReadAbort();
+  nsCOMPtr<mozIStorageProgressHandler> previous;
+  ASSERT_EQ(NS_OK, mConnection->SetProgressHandler(1, fault,
+                                                   getter_AddRefs(previous)));
+  EXPECT_FALSE(previous);
+  EXPECT_EQ(NS_ERROR_ABORT, db.GetConversationMessageKeys(seed, output));
+  EXPECT_GT(fault->mCalls, 0u);
+  EXPECT_EQ(1u, fault->mAborts);
+  EXPECT_EQ(sentinel, output);
+  nsCOMPtr<mozIStorageProgressHandler> removed;
+  ASSERT_EQ(NS_OK, mConnection->RemoveProgressHandler(getter_AddRefs(removed)));
+  EXPECT_EQ(fault.get(), removed.get());
+  ASSERT_EQ(NS_OK, db.GetConversationMessageKeys(seed, output));
+  EXPECT_EQ((nsTArray<nsMsgKey>{seed}), output);
+  uint64_t other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Retired"_ns, &other));
+  nsMsgKey child;
+  ASSERT_EQ(NS_OK, AddAt(other, "retired-child"_ns, {"reader-seed"_ns}, child));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().DeleteFolder(other));
+  output = sentinel.Clone();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetConversationMessageKeys(seed, output));
+  EXPECT_EQ(sentinel, output);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, db.MessageExists(child, exists));
+  EXPECT_TRUE(exists);
+  Stop();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            held->GetConversationMessageKeys(seed, output));
+  EXPECT_EQ(sentinel, output);
+  EXPECT_FALSE(Connection());
 }
 
 }  // namespace mozilla::mailnews

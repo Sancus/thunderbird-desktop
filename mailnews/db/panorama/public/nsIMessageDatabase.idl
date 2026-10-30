@@ -63,6 +63,17 @@ interface nsIMessageDatabase : nsISupports {
   [implicit_jscontext] jsval getSearchState(in nsMsgKey id);
 
   /**
+   * Complete current physical membership under the stored References policy,
+   * including whole existing components, in ascending unique global-key order.
+   * Does not change grouping, thread IDs or any stored facts. Equal own IDs
+   * alone are not an edge. The caller checks each current location/policy.
+   * Missing seed, unavailable raw history anywhere, or a missing member folder
+   * returns NOT_AVAILABLE rather than a partial result. Foreign transactions
+   * return IN_PROGRESS. Closed/replaced instances do not open a database.
+   */
+  Array<nsMsgKey> getConversationMessageKeys(in nsMsgKey id);
+
+  /**
    * Bounded current-state page. Replay changes after the FIRST page's watermark
    * after paging; pages are not an indefinitely retained historical snapshot.
    */

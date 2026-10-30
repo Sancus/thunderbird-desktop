@@ -5753,6 +5753,77 @@ void MessageListener::DeliverThreadBatch(const PreparedThreadBatch& prepared) {
                              batch.notifyLegacy);
 }
 
+NS_IMETHODIMP MessageDatabase::GetConversationMessageKeys(
+    nsMsgKey key, nsTArray<nsMsgKey>& output) {
+  NS_ENSURE_ARG(key && key != nsMsgKey_None);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReadConversationMessageKeys"_ns,
+      "WITH RECURSIVE availability(seedExists,unknownHistory) AS ("
+      "SELECT EXISTS(SELECT 1 FROM messages WHERE id=:id), "
+      "EXISTS(SELECT 1 FROM messages m LEFT JOIN message_reference_sets s "
+      "ON s.id=m.id WHERE s.id IS NULL)), "
+      // Physical rows, raw tokens and stored components are distinct vertices.
+      // An own-ID token is reachable only when a real row references it, so
+      // equal own IDs alone do not connect otherwise independent copies.
+      "walk(kind,id,token) AS ("
+      "SELECT 0,id,'' FROM messages WHERE id=:id "
+      "UNION SELECT 1,0,r.token FROM walk w "
+      "JOIN message_references r ON w.kind=0 AND r.id=w.id "
+      "WHERE r.token<>'' "
+      "UNION SELECT 1,0,m.messageId FROM walk w "
+      "JOIN messages m ON w.kind=0 AND m.id=w.id "
+      "WHERE m.messageId<>'' AND EXISTS(SELECT 1 FROM message_references r "
+      "JOIN messages owner ON owner.id=r.id "
+      "WHERE r.token=m.messageId COLLATE BINARY AND r.token<>'') "
+      "UNION SELECT 0,m.id,'' FROM walk w "
+      "JOIN messages m ON w.kind=1 AND m.messageId=w.token COLLATE BINARY "
+      "UNION SELECT 0,m.id,'' FROM walk w "
+      "JOIN message_references r ON w.kind=1 AND r.token=w.token COLLATE "
+      "BINARY "
+      "JOIN messages m ON m.id=r.id "
+      "UNION SELECT 2,m.threadId,'' FROM walk w "
+      "JOIN messages m ON w.kind=0 AND m.id=w.id WHERE m.threadId<>0 "
+      "UNION SELECT 0,m.id,'' FROM walk w "
+      "JOIN messages m ON w.kind=2 AND m.threadId=w.id) "
+      "SELECT a.seedExists,a.unknownHistory,m.id,m.folderId,f.id,m.threadId "
+      "FROM availability a LEFT JOIN walk w "
+      "ON a.seedExists AND NOT a.unknownHistory AND w.kind=0 "
+      "LEFT JOIN messages m ON m.id=w.id "
+      "LEFT JOIN folders f ON f.id=m.folderId ORDER BY m.id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+  int32_t exists, unavailable;
+  MOZ_TRY(stmt->GetInt32(0, &exists));
+  MOZ_TRY(stmt->GetInt32(1, &unavailable));
+  NS_ENSURE_TRUE(exists && !unavailable, NS_ERROR_NOT_AVAILABLE);
+  nsTArray<nsMsgKey> found;
+  do {
+    int64_t id, folderId, threadId;
+    MOZ_TRY(stmt->GetInt64(2, &id));
+    MOZ_TRY(stmt->GetInt64(3, &folderId));
+    MOZ_TRY(stmt->GetInt64(5, &threadId));
+    NS_ENSURE_TRUE(id > 0 && id < int64_t(nsMsgKey_None) && folderId > 0 &&
+                       threadId >= 0 && threadId < int64_t(nsMsgKey_None),
+                   NS_ERROR_FILE_CORRUPTED);
+    bool missingFolder;
+    MOZ_TRY(stmt->GetIsNull(4, &missingFolder));
+    // Do not advertise a partial component by silently dropping retired rows.
+    NS_ENSURE_FALSE(missingFolder, NS_ERROR_NOT_AVAILABLE);
+    if (!found.AppendElement(static_cast<nsMsgKey>(id), fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    MOZ_TRY(stmt->ExecuteStep(&more));
+  } while (more);
+  output.SwapElements(found);
+  return NS_OK;
+}
+
 nsresult MessageDatabase::DiscoverConversationComponent(
     nsMsgKey key, nsTArray<ConversationMember>& output) {
   nsCOMPtr<mozIStorageStatement> stmt;

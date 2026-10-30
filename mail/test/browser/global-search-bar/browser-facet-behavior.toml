@@ -1,0 +1,7 @@
+[DEFAULT]
+prefs = [
+  "mail.identity.id1.fullName=Facet Own",
+  "mail.identity.id1.useremail=facet-own@example.invalid",
+]
+
+["browser_facetBehavior.js"]

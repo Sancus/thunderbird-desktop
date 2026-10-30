@@ -20,7 +20,7 @@ subsuite = "thunderbird"
 
 ["browser_clickResultItem.js"]
 
-["browser_facetBehavior.js"]
+["include:browser-facet-behavior.toml"]
 
 ["browser_globalSearchBar.js"]
 

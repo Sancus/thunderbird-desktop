@@ -63,6 +63,8 @@ support-files = ["../../../../base/test/unit/data/panacea.dat"]
 
 ["test_deliveryCoreSearchState.js"]
 
+["test_filterAsyncCompletion.js"]
+
 ["test_findFolders.js"]
 
 ["test_flags.js"]

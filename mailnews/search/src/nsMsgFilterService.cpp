@@ -37,8 +37,10 @@
 #include "nsIMsgThread.h"
 #include "nsIMsgFilter.h"
 #include "nsIMsgOperationListener.h"
+#include "mozilla/AutoRestore.h"
 #include "mozilla/Components.h"
 #include "mozilla/Logging.h"
+#include "mozilla/RefPtr.h"
 #include "mozilla/intl/Localization.h"
 
 using namespace mozilla;
@@ -335,6 +337,8 @@ class nsMsgFilterAfterTheFact : public nsIUrlListener,
   uint32_t m_nextAction;  // next filter action to perform
   nsresult mFinalResult;  // report of overall success or failure
   bool mNeedsRelease;     // Did we need to release ourself?
+  // Stack-local flag for the current CopyMessages/ApplyAction dispatch.
+  bool* m_copyListenerFired = nullptr;
 };
 
 NS_IMPL_ISUPPORTS(nsMsgFilterAfterTheFact, nsIUrlListener, nsIMsgSearchNotify,
@@ -366,24 +370,26 @@ nsMsgFilterAfterTheFact::~nsMsgFilterAfterTheFact() {
 
 // do what we have to do to cleanup.
 nsresult nsMsgFilterAfterTheFact::OnEndExecution() {
-  if (m_searchSession) m_searchSession->UnregisterListener(this);
+  nsresult rv = mFinalResult;
+  if (!mNeedsRelease) return rv;
+  // Mark completion before calling external code, which may reenter us.
+  mNeedsRelease = false;
 
+  if (m_searchSession) m_searchSession->UnregisterListener(this);
   if (m_filters) (void)m_filters->FlushLogIfNecessary();
 
-  if (m_callback) (void)m_callback->OnStopOperation(mFinalResult);
+  nsCOMPtr<nsIMsgOperationListener> callback;
+  callback.swap(m_callback);
+  if (callback) (void)callback->OnStopOperation(rv);
 
-  nsresult rv = mFinalResult;
-  // OnEndExecution() can be called a second time when a rule execution fails
-  // and the user is prompted whether he wants to continue.
-  if (mNeedsRelease) {
-    NS_RELEASE_THIS();  // release ourselves.
-    mNeedsRelease = false;
-  }
   MOZ_LOG(FILTERLOGMODULE, LogLevel::Info, ("(Post) End executing filters"));
+  NS_RELEASE_THIS();
   return rv;
 }
 
 nsresult nsMsgFilterAfterTheFact::RunNextFilter() {
+  if (!mNeedsRelease) return NS_OK;
+  RefPtr<nsMsgFilterAfterTheFact> self = this;
   MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
           ("(Post) nsMsgFilterAfterTheFact::RunNextFilter"));
   nsresult rv = NS_OK;
@@ -429,6 +435,7 @@ nsresult nsMsgFilterAfterTheFact::RunNextFilter() {
     CONTINUE_IF_FAILURE(rv, "Failed to add scope term");
     m_nextAction = 0;
     rv = m_searchSession->Search(m_msgWindow);
+    if (!mNeedsRelease) return mFinalResult;
     CONTINUE_IF_FAILURE(rv, "Search failed");
     return NS_OK;  // OnSearchDone will continue
   }
@@ -445,6 +452,8 @@ nsresult nsMsgFilterAfterTheFact::RunNextFilter() {
 }
 
 nsresult nsMsgFilterAfterTheFact::AdvanceToNextFolder() {
+  if (!mNeedsRelease) return NS_OK;
+  RefPtr<nsMsgFilterAfterTheFact> self = this;
   MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
           ("(Post) nsMsgFilterAfterTheFact::AdvanceToNextFolder"));
   nsresult rv = NS_OK;
@@ -493,6 +502,7 @@ nsresult nsMsgFilterAfterTheFact::AdvanceToNextFolder() {
     CONTINUE_IF_FAILURE(rv, "Could not get folder db");
 
     rv = RunNextFilter();
+    if (!mNeedsRelease) return mFinalResult;
     // RunNextFilter returns success when either filters are done, or an async
     // process has started. It will call AdvanceToNextFolder itself if possible,
     // so no need to call here.
@@ -509,12 +519,13 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnStartRunningUrl(nsIURI* aUrl) {
 // This is the return from a folder parse
 NS_IMETHODIMP nsMsgFilterAfterTheFact::OnStopRunningUrl(nsIURI* aUrl,
                                                         nsresult aExitCode) {
+  if (!mNeedsRelease) return NS_OK;
   if (NS_SUCCEEDED(aExitCode)) return RunNextFilter();
 
   mFinalResult = aExitCode;
   // If m_msgWindow then we are in a context where the user can deal with
   //  errors. Put up a prompt, and exit if user wants.
-  if (!ContinueExecutionPrompt()) return OnEndExecution();
+  if (m_msgWindow && !ContinueExecutionPrompt()) return OnEndExecution();
 
   // folder parse failed, so stop processing this folder.
   return AdvanceToNextFolder();
@@ -522,6 +533,7 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnStopRunningUrl(nsIURI* aUrl,
 
 NS_IMETHODIMP nsMsgFilterAfterTheFact::OnSearchHit(nsIMsgDBHdr* header,
                                                    nsIMsgFolder* folder) {
+  if (!mNeedsRelease) return NS_OK;
   NS_ENSURE_ARG_POINTER(header);
 
   nsMsgKey msgKey;
@@ -552,6 +564,7 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnSearchHit(nsIMsgDBHdr* header,
 
 // Continue after an async operation.
 NS_IMETHODIMP nsMsgFilterAfterTheFact::OnSearchDone(nsresult status) {
+  if (!mNeedsRelease) return NS_OK;
   MOZ_LOG(FILTERLOGMODULE, LogLevel::Info,
           ("(Post) Done matching current filter"));
   if (NS_SUCCEEDED(status))
@@ -566,6 +579,7 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnSearchDone(nsresult status) {
 }
 
 NS_IMETHODIMP nsMsgFilterAfterTheFact::OnNewSearch() {
+  if (!mNeedsRelease) return NS_OK;
   m_searchHits.Clear();
   m_searchHitHdrs.Clear();
   return NS_OK;
@@ -577,6 +591,8 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnNewSearch() {
 //   an error if it is impossible to continue after attempting to continue the
 //   next filter action, filter, or folder.
 nsresult nsMsgFilterAfterTheFact::ApplyFilter() {
+  if (!mNeedsRelease) return NS_OK;
+  RefPtr<nsMsgFilterAfterTheFact> self = this;
   MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
           ("(Post) nsMsgFilterAfterTheFact::ApplyFilter"));
   nsresult rv;
@@ -728,10 +744,17 @@ nsresult nsMsgFilterAfterTheFact::ApplyFilter() {
                                            nsMsgProcessingFlags::FilterToMove);
           }
 
-          rv = copyService->CopyMessages(
-              curFolder, m_searchHitHdrs, destIFolder,
-              actionType == nsMsgFilterAction::MoveToFolder, this, m_msgWindow,
-              false);
+          bool listenerFired = false;
+          {
+            AutoRestore<bool*> restore(m_copyListenerFired);
+            m_copyListenerFired = &listenerFired;
+            rv = copyService->CopyMessages(
+                curFolder, m_searchHitHdrs, destIFolder,
+                actionType == nsMsgFilterAction::MoveToFolder, this,
+                m_msgWindow, false);
+          }
+          if (!mNeedsRelease) return mFinalResult;
+          if (listenerFired) return NS_OK;
           BREAK_ACTION_IF_FAILURE(rv, "CopyMessages failed");
           MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
                   ("(Post) Action execution continues async"));
@@ -916,8 +939,15 @@ nsresult nsMsgFilterAfterTheFact::ApplyFilter() {
           BREAK_ACTION_IF_FAILURE(rv, "Could not get custom action value");
           bool isAsync = false;
           customAction->GetIsAsync(&isAsync);
-          rv = customAction->ApplyAction(m_searchHitHdrs, value, this,
-                                         filterType, m_msgWindow);
+          bool listenerFired = false;
+          {
+            AutoRestore<bool*> restore(m_copyListenerFired);
+            m_copyListenerFired = &listenerFired;
+            rv = customAction->ApplyAction(m_searchHitHdrs, value, this,
+                                           filterType, m_msgWindow);
+          }
+          if (!mNeedsRelease) return mFinalResult;
+          if (listenerFired) return NS_OK;
           BREAK_ACTION_IF_FAILURE(rv, "custom action failed to apply");
           if (isAsync) {
             MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
@@ -1130,6 +1160,8 @@ nsMsgApplyFiltersToMessages::nsMsgApplyFiltersToMessages(
 }
 
 nsresult nsMsgApplyFiltersToMessages::RunNextFilter() {
+  if (!mNeedsRelease) return NS_OK;
+  RefPtr<nsMsgFilterAfterTheFact> self = this;
   MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
           ("(Post) nsMsgApplyFiltersToMessages::RunNextFilter"));
   nsresult rv = NS_OK;
@@ -1165,7 +1197,8 @@ nsresult nsMsgApplyFiltersToMessages::RunNextFilter() {
     nsCOMPtr<nsIMsgSearchScopeTerm> scope(new nsMsgSearchScopeTerm(
         nullptr, nsMsgSearchScope::offlineMail, m_curFolder));
     BREAK_IF_FALSE(scope, "Could not create scope, OOM?");
-    m_curFilter->SetScope(scope);
+    nsCOMPtr<nsIMsgFilter> curFilter = m_curFilter;
+    curFilter->SetScope(scope);
     OnNewSearch();
 
     for (size_t i = 0; i < m_msgHdrList.Length(); ++i) {
@@ -1198,8 +1231,12 @@ nsresult nsMsgApplyFiltersToMessages::RunNextFilter() {
         }
       }
       bool matched;
-      rv = m_curFilter->MatchHdr(msgHdr, m_curFolder, m_curFolderDB,
-                                 nulSeparatedHeaders, &matched);
+      rv = curFilter->MatchHdr(msgHdr, m_curFolder, m_curFolderDB,
+                               nulSeparatedHeaders, &matched);
+      if (!mNeedsRelease) {
+        curFilter->SetScope(nullptr);
+        return mFinalResult;
+      }
       if (NS_SUCCEEDED(rv) && matched) {
         // In order to work with nsMsgFilterAfterTheFact::ApplyFilter we
         // initialize nsMsgFilterAfterTheFact's information with a search hit
@@ -1207,11 +1244,12 @@ nsresult nsMsgApplyFiltersToMessages::RunNextFilter() {
         OnSearchHit(msgHdr, m_curFolder);
       }
     }
-    m_curFilter->SetScope(nullptr);
+    curFilter->SetScope(nullptr);
 
     if (m_searchHits.Length() > 0) {
       m_nextAction = 0;
       rv = ApplyFilter();
+      if (!mNeedsRelease) return mFinalResult;
       if (NS_SUCCEEDED(rv))
         return NS_OK;  // async callback will continue, or we are done.
     }
@@ -1303,6 +1341,8 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::GetMessageId(nsACString& messageId) {
 
 /* void OnStopCopy (in nsresult aStatus); */
 NS_IMETHODIMP nsMsgFilterAfterTheFact::OnStopCopy(nsresult aStatus) {
+  if (m_copyListenerFired) *m_copyListenerFired = true;
+  if (!mNeedsRelease) return NS_OK;
   if (NS_SUCCEEDED(aStatus)) {
     // clang-format off
     MOZ_LOG(FILTERLOGMODULE, LogLevel::Info,
@@ -1315,7 +1355,7 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnStopCopy(nsresult aStatus) {
            static_cast<uint32_t>(aStatus)));
 
   mFinalResult = aStatus;
-  if (!ContinueExecutionPrompt()) return OnEndExecution();
+  if (m_msgWindow && !ContinueExecutionPrompt()) return OnEndExecution();
 
   // Copy failed, so run the next filter
   return RunNextFilter();

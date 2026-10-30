@@ -1,0 +1,598 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+/* import-globals-from head.js */
+
+do_get_profile();
+
+let rootFolder;
+
+add_setup(function () {
+  const account = MailServices.accounts.createLocalMailAccount();
+  rootFolder = account.incomingServer.rootFolder.QueryInterface(
+    Ci.nsIMsgLocalMailFolder
+  );
+  Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+    .getService(Ci.nsIMsgDBService)
+    .QueryInterface(Ci.nsIDatabaseCore);
+  Assert.equal(rootFolder.msgStore.storeType, "mbox");
+});
+
+/**
+ * Create a real message in the filter source folder.
+ *
+ * @param {nsIMsgLocalMailFolder} folder - The source folder.
+ * @param {string} id - The Message-ID.
+ * @param {string} subject - The subject.
+ * @returns {nsIMsgDBHdr} The stored header.
+ */
+function addMessage(folder, id, subject) {
+  const header = folder.addMessage(
+    "From: sender@example.invalid\r\n" +
+      "To: recipient@example.invalid\r\n" +
+      `Message-ID: <${id}>\r\nSubject: ${subject}\r\n\r\nBody.\r\n`
+  );
+  Assert.equal(header.messageId, id);
+  return header;
+}
+
+/**
+ * Create an enabled manual filter matching the literal subject token.
+ *
+ * @param {nsIMsgFilterList} list - The temporary filter list.
+ * @param {string} name - The rule name.
+ * @returns {nsIMsgFilter} The rule inserted at the end of the list.
+ */
+function makeFilter(list, name) {
+  const filter = list.createFilter(name);
+  filter.enabled = true;
+  filter.filterType = Ci.nsMsgFilterType.Manual;
+  const term = filter.createTerm();
+  term.attrib = Ci.nsMsgSearchAttrib.Subject;
+  term.op = Ci.nsMsgSearchOp.Contains;
+  const value = term.value;
+  value.attrib = Ci.nsMsgSearchAttrib.Subject;
+  value.str = "match";
+  term.value = value;
+  term.booleanAnd = true;
+  filter.appendTerm(term);
+  list.insertFilterAt(list.filterCount, filter);
+  return filter;
+}
+
+/**
+ * Run the real manual-filter pipeline with an existing async custom action.
+ *
+ * @param {string} name - Unique fixture and action name.
+ * @param {nsresult} status - The custom action's completion status.
+ * @param {boolean} synchronous - Complete inside applyAction.
+ * @param {boolean} [reenter=false] - Call back from operation completion.
+ * @returns {Promise<object>} The listener and captured completion records.
+ */
+async function runFilters(name, status, synchronous, reenter = false) {
+  const folder = rootFolder
+    .createLocalSubfolder(name)
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const target = addMessage(
+    folder,
+    `${name}-target@filter.invalid`,
+    "match this"
+  );
+  const excluded = addMessage(
+    folder,
+    `${name}-excluded@filter.invalid`,
+    "leave alone"
+  );
+  let copyListener;
+  const actions = [];
+  const action = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgFilterCustomAction"]),
+    id: `${name}@filter.invalid#completion`,
+    name,
+    allowDuplicates: false,
+    isAsync: true,
+    needsBody: false,
+    isValidForType() {
+      return true;
+    },
+    validateActionValue() {
+      return "";
+    },
+    applyAction(headers, value, listener) {
+      actions.push(
+        headers.map(header => [
+          header.folder.URI,
+          header.messageKey,
+          header.messageId,
+        ])
+      );
+      copyListener = listener;
+      if (synchronous) {
+        listener.onStopCopy(status);
+      } else {
+        Services.tm.dispatchToMainThread(() => listener.onStopCopy(status));
+      }
+    },
+  };
+  MailServices.filters.addCustomAction(action);
+  registerCleanupFunction(() => {
+    copyListener = null;
+  });
+  const list = MailServices.filters.getTempFilterList(folder);
+  const first = makeFilter(list, "custom completion");
+  const custom = first.createAction();
+  custom.type = Ci.nsMsgFilterAction.Custom;
+  custom.customId = action.id;
+  first.appendAction(custom);
+  const second = makeFilter(list, "later rule");
+  const flag = second.createAction();
+  flag.type = Ci.nsMsgFilterAction.MarkFlagged;
+  second.appendAction(flag);
+
+  const stopped = Promise.withResolvers();
+  const completions = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgOperationListener"]),
+    onStopOperation(result) {
+      completions.push(result);
+      if (reenter && completions.length == 1) {
+        copyListener.onStopCopy(Cr.NS_OK);
+      }
+      stopped.resolve();
+    },
+  };
+  MailServices.filters.applyFiltersToFolders(list, [folder], null, listener);
+  await stopped.promise;
+  Assert.deepEqual(
+    completions,
+    [status],
+    "One operation completion preserves the result"
+  );
+  Assert.deepEqual(actions, [
+    [[folder.URI, target.messageKey, `${name}-target@filter.invalid`]],
+  ]);
+  Assert.ok(
+    folder.msgDatabase.getMsgHdrForKey(target.messageKey).isFlagged,
+    "The later rule ran"
+  );
+  Assert.ok(
+    !folder.msgDatabase.getMsgHdrForKey(excluded.messageKey).isFlagged,
+    "The excluded message was untouched"
+  );
+  Assert.deepEqual(
+    Array.from(folder.messages, header => header.messageId).sort(),
+    [`${name}-excluded@filter.invalid`, `${name}-target@filter.invalid`],
+    "Both physical source messages remain"
+  );
+  return { copyListener, completions, actions };
+}
+
+add_task(async function test_late_custom_completion_notifies_once() {
+  const { copyListener, completions, actions } = await runFilters(
+    "asyncSuccess",
+    Cr.NS_OK,
+    false
+  );
+  copyListener.onStopCopy(Cr.NS_OK);
+  copyListener.onStopCopy(Cr.NS_ERROR_FAILURE);
+  Assert.deepEqual(completions, [Cr.NS_OK]);
+  Assert.equal(actions.length, 1, "Late completion does not restart actions");
+});
+
+add_task(async function test_headless_custom_failure_preserves_error() {
+  const { copyListener, completions } = await runFilters(
+    "asyncFailure",
+    Cr.NS_ERROR_FILE_ACCESS_DENIED,
+    false
+  );
+  copyListener.onStopCopy(Cr.NS_OK);
+  Assert.deepEqual(completions, [Cr.NS_ERROR_FILE_ACCESS_DENIED]);
+});
+
+add_task(async function test_synchronous_custom_completion_finishes_once() {
+  const { copyListener, completions, actions } = await runFilters(
+    "syncSuccess",
+    Cr.NS_OK,
+    true
+  );
+  copyListener.onStopCopy(Cr.NS_OK);
+  Assert.deepEqual(completions, [Cr.NS_OK]);
+  Assert.equal(actions.length, 1);
+});
+
+add_task(async function test_reentrant_operation_completion_notifies_once() {
+  const { completions, actions } = await runFilters(
+    "reentrantSuccess",
+    Cr.NS_OK,
+    false,
+    true
+  );
+  Assert.deepEqual(completions, [Cr.NS_OK]);
+  Assert.equal(actions.length, 1);
+});
+
+/**
+ * Keep a later action pending after a synchronous callback followed by failure.
+ *
+ * @param {boolean} messageList - Use applyFilters instead of folder search.
+ */
+async function checkSynchronousCallbackThenFailure(messageList) {
+  const prefix = messageList ? "syncFailureMessages" : "syncFailureFolder";
+  const folder = rootFolder
+    .createLocalSubfolder(prefix)
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const target = addMessage(
+    folder,
+    prefix + "-target@filter.invalid",
+    "match this"
+  );
+  const excluded = addMessage(
+    folder,
+    prefix + "-excluded@filter.invalid",
+    "leave alone"
+  );
+  const list = messageList
+    ? folder.getFilterList(null)
+    : MailServices.filters.getTempFilterList(folder);
+  const events = [];
+  const waiting = Promise.withResolvers();
+  const stopped = Promise.withResolvers();
+  const completions = [];
+  let pendingListener;
+  const filters = [];
+  for (const [name, isAsync, apply] of [
+    [
+      "first",
+      true,
+      (headers, listener) => {
+        listener.onStopCopy(Cr.NS_ERROR_FILE_ACCESS_DENIED);
+        throw new Components.Exception(
+          "Failed after callback",
+          Cr.NS_ERROR_FILE_ACCESS_DENIED
+        );
+      },
+    ],
+    [
+      "waiting",
+      true,
+      (headers, listener) => {
+        pendingListener = listener;
+        waiting.resolve();
+      },
+    ],
+    ["last", false, headers => folder.markMessagesFlagged(headers, true)],
+  ]) {
+    const custom = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgFilterCustomAction"]),
+      id: `${prefix}@filter.invalid#${name}`,
+      name,
+      allowDuplicates: false,
+      isAsync,
+      needsBody: false,
+      isValidForType() {
+        return true;
+      },
+      validateActionValue() {
+        return "";
+      },
+      applyAction(headers, value, listener) {
+        events.push(name);
+        apply(headers, listener);
+      },
+    };
+    MailServices.filters.addCustomAction(custom);
+    const filter = makeFilter(list, name);
+    filters.push(filter);
+    const action = filter.createAction();
+    action.type = Ci.nsMsgFilterAction.Custom;
+    action.customId = custom.id;
+    filter.appendAction(action);
+  }
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgOperationListener"]),
+    onStopOperation(status) {
+      completions.push(status);
+      stopped.resolve();
+    },
+  };
+  try {
+    if (messageList) {
+      MailServices.filters.applyFilters(
+        Ci.nsMsgFilterType.Manual,
+        [target, excluded],
+        [],
+        folder,
+        null,
+        listener
+      );
+    } else {
+      MailServices.filters.applyFiltersToFolders(
+        list,
+        [folder],
+        null,
+        listener
+      );
+    }
+    await Promise.race([waiting.promise, stopped.promise]);
+    Assert.deepEqual(events, ["first", "waiting"]);
+    Assert.deepEqual(completions, [], "The later action is still pending");
+    Assert.ok(!folder.msgDatabase.getMsgHdrForKey(target.messageKey).isFlagged);
+    if (messageList) {
+      Assert.throws(
+        () => pendingListener.onStopCopy(Cr.NS_OK),
+        error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED,
+        "Synchronous terminal continuation returns the original failure"
+      );
+    } else {
+      pendingListener.onStopCopy(Cr.NS_OK);
+    }
+    await stopped.promise;
+    Assert.deepEqual(events, ["first", "waiting", "last"]);
+    Assert.deepEqual(completions, [Cr.NS_ERROR_FILE_ACCESS_DENIED]);
+    Assert.ok(folder.msgDatabase.getMsgHdrForKey(target.messageKey).isFlagged);
+    Assert.ok(
+      !folder.msgDatabase.getMsgHdrForKey(excluded.messageKey).isFlagged
+    );
+    Assert.deepEqual(
+      Array.from(folder.messages, header => header.messageId).sort(),
+      [prefix + "-excluded@filter.invalid", prefix + "-target@filter.invalid"],
+      "No physical source message was removed"
+    );
+    pendingListener.onStopCopy(Cr.NS_ERROR_FAILURE);
+    Assert.deepEqual(events, ["first", "waiting", "last"]);
+    Assert.deepEqual(completions, [Cr.NS_ERROR_FILE_ACCESS_DENIED]);
+  } finally {
+    for (const filter of filters) {
+      list.removeFilter(filter);
+    }
+    pendingListener = null;
+  }
+}
+
+add_task(async function test_folder_filter_sync_callback_then_failure() {
+  await checkSynchronousCallbackThenFailure(false);
+});
+
+add_task(async function test_message_filter_sync_callback_then_failure() {
+  await checkSynchronousCallbackThenFailure(true);
+});
+
+add_task(async function test_terminal_message_filter_stops_matching() {
+  const folder = rootFolder
+    .createLocalSubfolder("terminalMessageFilter")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const target = addMessage(
+    folder,
+    "terminal-target@filter.invalid",
+    "match this"
+  );
+  const excluded = addMessage(
+    folder,
+    "terminal-excluded@filter.invalid",
+    "leave alone"
+  );
+  const list = folder.getFilterList(null);
+  const filters = [];
+  let copyListener;
+  const capture = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgFilterCustomAction"]),
+    id: "terminal@filter.invalid#capture",
+    name: "Capture existing listener",
+    allowDuplicates: false,
+    isAsync: false,
+    needsBody: false,
+    isValidForType() {
+      return true;
+    },
+    validateActionValue() {
+      return "";
+    },
+    applyAction(headers, value, listener) {
+      copyListener = listener;
+    },
+  };
+  MailServices.filters.addCustomAction(capture);
+  const first = makeFilter(list, "capture listener");
+  filters.push(first);
+  const captureAction = first.createAction();
+  captureAction.type = Ci.nsMsgFilterAction.Custom;
+  captureAction.customId = capture.id;
+  first.appendAction(captureAction);
+  const matches = [];
+  const customTerm = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgSearchCustomTerm"]),
+    id: "terminal@filter.invalid#match",
+    name: "Stop while matching",
+    needsBody: false,
+    getEnabled() {
+      return true;
+    },
+    getAvailable() {
+      return true;
+    },
+    getAvailableOperators() {
+      return [Ci.nsMsgSearchOp.Is];
+    },
+    match(header, value) {
+      matches.push([
+        value,
+        header.folder.URI,
+        header.messageKey,
+        header.messageId,
+      ]);
+      if (value == "stop") {
+        Assert.throws(
+          () =>
+            copyListener
+              .QueryInterface(Ci.nsIUrlListener)
+              .OnStopRunningUrl(null, Cr.NS_ERROR_ABORT),
+          error => error.result == Cr.NS_ERROR_ABORT
+        );
+      }
+      return true;
+    },
+  };
+  MailServices.filters.addCustomTerm(customTerm);
+  for (const name of ["stop", "after"]) {
+    const filter = list.createFilter(name);
+    filters.push(filter);
+    filter.enabled = true;
+    filter.filterType = Ci.nsMsgFilterType.Manual;
+    const term = filter.createTerm();
+    term.attrib = Ci.nsMsgSearchAttrib.Custom;
+    term.customId = customTerm.id;
+    term.op = Ci.nsMsgSearchOp.Is;
+    term.booleanAnd = true;
+    const value = term.value;
+    value.attrib = Ci.nsMsgSearchAttrib.Custom;
+    value.str = name;
+    term.value = value;
+    filter.appendTerm(term);
+    const action = filter.createAction();
+    action.type = Ci.nsMsgFilterAction.MarkFlagged;
+    filter.appendAction(action);
+    list.insertFilterAt(list.filterCount, filter);
+  }
+  const completions = [];
+  const stopped = Promise.withResolvers();
+  try {
+    Assert.throws(
+      () =>
+        MailServices.filters.applyFilters(
+          Ci.nsMsgFilterType.Manual,
+          [target, excluded],
+          [],
+          folder,
+          null,
+          {
+            QueryInterface: ChromeUtils.generateQI(["nsIMsgOperationListener"]),
+            onStopOperation(status) {
+              completions.push(status);
+              stopped.resolve();
+            },
+          }
+        ),
+      error => error.result == Cr.NS_ERROR_ABORT,
+      "Synchronous terminal failure also reaches the caller"
+    );
+    await stopped.promise;
+    Assert.deepEqual(completions, [Cr.NS_ERROR_ABORT]);
+    Assert.deepEqual(matches, [
+      ["stop", folder.URI, target.messageKey, "terminal-target@filter.invalid"],
+    ]);
+    Assert.ok(!folder.msgDatabase.getMsgHdrForKey(target.messageKey).isFlagged);
+    Assert.ok(
+      !folder.msgDatabase.getMsgHdrForKey(excluded.messageKey).isFlagged
+    );
+  } finally {
+    for (const filter of filters) {
+      list.removeFilter(filter);
+    }
+    copyListener = null;
+  }
+});
+
+/**
+ * Check a failure that finishes inside the initial public service call.
+ *
+ * @param {boolean} withListener - Also observe the optional operation callback.
+ */
+function checkSynchronousFailureResult(withListener) {
+  const name = withListener
+    ? "syncErrorWithListener"
+    : "syncErrorWithoutListener";
+  const folder = rootFolder
+    .createLocalSubfolder(name)
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const target = addMessage(
+    folder,
+    name + "-target@filter.invalid",
+    "match this"
+  );
+  const excluded = addMessage(
+    folder,
+    name + "-excluded@filter.invalid",
+    "leave alone"
+  );
+  const list = folder.getFilterList(null);
+  const completions = [];
+  let calls = 0;
+  const custom = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgFilterCustomAction"]),
+    id: name + "@filter.invalid#failure",
+    name,
+    allowDuplicates: false,
+    isAsync: true,
+    needsBody: false,
+    isValidForType() {
+      return true;
+    },
+    validateActionValue() {
+      return "";
+    },
+    applyAction(headers, value, listener) {
+      calls++;
+      Assert.deepEqual(
+        headers.map(header => [header.folder.URI, header.messageKey]),
+        [[folder.URI, target.messageKey]]
+      );
+      listener.onStopCopy(Cr.NS_ERROR_FILE_ACCESS_DENIED);
+    },
+  };
+  MailServices.filters.addCustomAction(custom);
+  const filter = makeFilter(list, name);
+  const action = filter.createAction();
+  action.type = Ci.nsMsgFilterAction.Custom;
+  action.customId = custom.id;
+  filter.appendAction(action);
+  const listener = withListener
+    ? {
+        QueryInterface: ChromeUtils.generateQI(["nsIMsgOperationListener"]),
+        onStopOperation(status) {
+          completions.push(status);
+        },
+      }
+    : null;
+  try {
+    Assert.throws(
+      () =>
+        MailServices.filters.applyFilters(
+          Ci.nsMsgFilterType.Manual,
+          [target, excluded],
+          [],
+          folder,
+          null,
+          listener
+        ),
+      error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED,
+      "The public call preserves its synchronous terminal error"
+    );
+    Assert.equal(calls, 1);
+    Assert.deepEqual(
+      completions,
+      withListener ? [Cr.NS_ERROR_FILE_ACCESS_DENIED] : []
+    );
+    Assert.deepEqual(
+      Array.from(folder.messages, header => [
+        header.messageKey,
+        header.messageId,
+      ]),
+      [
+        [target.messageKey, name + "-target@filter.invalid"],
+        [excluded.messageKey, name + "-excluded@filter.invalid"],
+      ],
+      "The matched and excluded physical messages remain"
+    );
+  } finally {
+    list.removeFilter(filter);
+  }
+}
+
+add_task(function test_synchronous_failure_reaches_caller_and_listener() {
+  checkSynchronousFailureResult(true);
+});
+
+add_task(function test_synchronous_failure_reaches_caller_without_listener() {
+  checkSynchronousFailureResult(false);
+});

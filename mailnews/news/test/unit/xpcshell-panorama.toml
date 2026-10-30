@@ -1,0 +1,12 @@
+[DEFAULT]
+head = "head_server_setup.js"
+support-files = ["postings/*"]
+dupe-manifest = true
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+tags = ["panorama", "mbox"]
+
+["test_newsReadChanged.js"]

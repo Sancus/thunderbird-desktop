@@ -3202,3 +3202,154 @@ add_task(function test_epochAccessPreservesSourceReaderErrors() {
   Assert.equal(info.imapUidValidity, 19);
   Assert.ok(!connection.transactionInProgress);
 });
+
+add_task(function test_readChangedUsesItsCurrentListeners() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("read-change-listeners");
+  const db = folder.msgDatabase;
+  const events = [];
+  const late = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onReadChanged(instigator) {
+      Assert.strictEqual(instigator.QueryInterface(Ci.nsIMsgFolder), folder);
+      events.push("late");
+    },
+  };
+  const removed = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onReadChanged() {
+      Assert.ok(false, "A removed listener must not be notified");
+    },
+  };
+  const first = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onReadChanged(instigator) {
+      Assert.strictEqual(instigator.QueryInterface(Ci.nsIMsgFolder), folder);
+      events.push("first");
+      db.removeListener(removed);
+      db.addListener(late);
+    },
+  };
+  db.addListener(first);
+  db.addListener(removed);
+  try {
+    db.notifyReadChanged(folder.QueryInterface(Ci.nsIDBChangeListener));
+    Assert.deepEqual(events, ["first"]);
+    db.notifyReadChanged(folder.QueryInterface(Ci.nsIDBChangeListener));
+    Assert.deepEqual(events, ["first", "first", "late"]);
+    Assert.deepEqual(
+      db.listAllKeys(),
+      [],
+      "Notification does not publish data"
+    );
+  } finally {
+    db.removeListener(first);
+    db.removeListener(removed);
+    db.removeListener(late);
+  }
+});
+
+add_task(function test_readChangedStopsAtReentrantForceClose() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("read-change-close");
+  const db = folder.msgDatabase;
+  const events = [];
+  const first = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onReadChanged(instigator) {
+      Assert.strictEqual(instigator, null);
+      events.push("first");
+      db.forceClosed();
+    },
+    onAnnouncerGoingAway(source) {
+      Assert.strictEqual(source, db);
+      events.push("first-away");
+    },
+  };
+  const second = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onReadChanged() {
+      Assert.ok(false, "A force-closed wrapper must stop notifying");
+    },
+    onAnnouncerGoingAway(source) {
+      Assert.strictEqual(source, db);
+      events.push("second-away");
+    },
+  };
+  db.addListener(first);
+  db.addListener(second);
+  try {
+    db.notifyReadChanged(null);
+    Assert.deepEqual(events, ["first", "first-away", "second-away"]);
+    Assert.throws(() => db.notifyReadChanged(null), /NS_ERROR_NOT_AVAILABLE/);
+    Assert.deepEqual(events, ["first", "first-away", "second-away"]);
+  } finally {
+    db.removeListener(first);
+    db.removeListener(second);
+  }
+});
+
+add_task(function test_readChangedRequiresItsFolderAndSource() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("read-change-admission");
+  const db = folder.msgDatabase;
+  const connection = database.connectionForTests;
+  let calls = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onReadChanged() {
+      calls++;
+    },
+  };
+  db.addListener(listener);
+  try {
+    connection.beginTransaction();
+    const update = connection.createStatement(
+      "UPDATE database_identity SET sourceId = :source"
+    );
+    try {
+      update.params.source = Services.uuid.generateUUID().toString();
+      update.execute();
+      Assert.throws(() => db.notifyReadChanged(null), /NS_ERROR_NOT_AVAILABLE/);
+      Assert.ok(connection.transactionInProgress);
+      Assert.equal(calls, 0);
+    } finally {
+      update.finalize();
+      connection.rollbackTransaction();
+    }
+    for (const table of ["folders", "database_identity"]) {
+      const temporary = `unavailable_read_change_${table}`;
+      connection.executeSimpleSQL(
+        `ALTER TABLE ${table} RENAME TO ${temporary}`
+      );
+      try {
+        Assert.throws(
+          () => db.notifyReadChanged(null),
+          error => error.result === Cr.NS_ERROR_FAILURE
+        );
+        Assert.equal(calls, 0);
+      } finally {
+        connection.executeSimpleSQL(
+          `ALTER TABLE ${temporary} RENAME TO ${table}`
+        );
+      }
+    }
+    connection.beginTransaction();
+    try {
+      db.notifyReadChanged(null);
+      Assert.ok(connection.transactionInProgress);
+      Assert.equal(calls, 1);
+    } finally {
+      connection.rollbackTransaction();
+    }
+  } finally {
+    db.removeListener(listener);
+  }
+  rootFolder.propagateDelete(folder, true);
+  Assert.throws(() => db.notifyReadChanged(null), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.equal(calls, 1);
+  Assert.ok(!connection.transactionInProgress);
+});

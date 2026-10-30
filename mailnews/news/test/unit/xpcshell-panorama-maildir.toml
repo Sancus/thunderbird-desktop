@@ -1,0 +1,12 @@
+[DEFAULT]
+head = "head_server_setup.js"
+support-files = ["postings/*"]
+dupe-manifest = true
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/maildirstore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/maildirstore;1",
+]
+tags = ["panorama", "maildir"]
+
+["test_newsReadChanged.js"]

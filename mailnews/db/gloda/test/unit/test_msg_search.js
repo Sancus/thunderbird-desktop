@@ -46,11 +46,50 @@ var { MessageInjection } = ChromeUtils.importESModule(
 
 var uniqueCounter = 0;
 var messageInjection;
+let syntaxFirst = "";
+let syntaxSecond = "";
+/** @type {Map<string, nsIMsgDBHdr>} */
+const syntaxHeaders = new Map();
 
 add_setup(async function () {
   const msgGen = new MessageGenerator();
   messageInjection = new MessageInjection({ mode: "local" }, msgGen);
   glodaTestHelperInitialize(messageInjection);
+  Assert.equal(
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    false
+  );
+  Assert.equal(
+    Components.manager
+      .QueryInterface(Ci.nsIComponentRegistrar)
+      .contractIDToCID("@mozilla.org/msgDatabase/msgDBService;1")
+      .toString(),
+    "{03223c50-1e88-45e8-ba1a-7ce792dc3fc3}",
+    "Syntax behavior is captured on the legacy backend"
+  );
+  syntaxFirst = unique_string();
+  syntaxSecond = unique_string();
+  const bodies = {
+    adjacent: syntaxFirst + " " + syntaxSecond,
+    reversed: syntaxSecond + " " + syntaxFirst,
+    separated: syntaxFirst + " between " + syntaxSecond,
+    firstOnly: syntaxFirst,
+    secondOnly: syntaxSecond,
+  };
+  const names = Object.keys(bodies);
+  const [, ...sets] = await messageInjection.makeFoldersWithSets(
+    1,
+    names.map(name => ({
+      count: 1,
+      subject: "Syntax fixture " + name,
+      body: { body: bodies[name] },
+    }))
+  );
+  await waitForGlodaIndexer();
+  Assert.ok(...assertExpectedMessagesIndexed(sets));
+  for (const [index, name] of names.entries()) {
+    syntaxHeaders.set(name, sets[index].getMsgHdr(0));
+  }
 });
 
 /**
@@ -123,6 +162,72 @@ add_task(async function test_joins_do_not_return_everybody() {
   Assert.ok(...assertExpectedMessagesIndexed([subjSet]));
   await asyncMsgSearcherExpect(ustr, subjSet, 2);
 });
+
+add_task(async function test_unmatchedQuoteKeepsBothTerms() {
+  await assertSyntaxSearch('"' + syntaxFirst + " " + syntaxSecond, [
+    "adjacent",
+    "reversed",
+    "separated",
+  ]);
+});
+
+add_task(async function test_emptyQuoteKeepsFollowingTerms() {
+  await assertSyntaxSearch('"" ' + syntaxFirst + " " + syntaxSecond, [
+    "adjacent",
+    "reversed",
+    "separated",
+  ]);
+});
+
+add_task(async function test_tabWithinTermMatchesAdjacentWords() {
+  await assertSyntaxSearch(syntaxFirst + "\t" + syntaxSecond, ["adjacent"]);
+});
+
+/**
+ * Checks the physical membership returned by the public syntax search.
+ *
+ * @param {string} text - The literal search input.
+ * @param {string[]} expected - Names in the independent syntax fixture.
+ * @returns {Promise<void>} Resolves after checking the completed collection.
+ */
+async function assertSyntaxSearch(text, expected) {
+  const pref = "mailnews.database.global.search.msg.limit";
+  const hadValue = Services.prefs.prefHasUserValue(pref);
+  const previous = Services.prefs.getIntPref(pref);
+  Services.prefs.setIntPref(pref, 100);
+  try {
+    const searcher = new GlodaMsgSearcher(null, text);
+    const collection = await new Promise(resolve => {
+      searcher.getCollection({
+        onItemsAdded() {},
+        onItemsModified() {},
+        onItemsRemoved() {},
+        onQueryCompleted: resolve,
+      });
+    });
+    collection.becomeExplicit();
+    collection.listener = null;
+    searcher.listener = null;
+    const location = header =>
+      JSON.stringify([header.folder.URI, header.messageKey]);
+    const actual = collection.items.map(item => {
+      const header = item.folderMessage;
+      Assert.ok(header, "The result resolves to its current physical header");
+      return location(header);
+    });
+    Assert.deepEqual(
+      actual.toSorted(),
+      expected.map(name => location(syntaxHeaders.get(name))).toSorted(),
+      "Exact physical results for " + JSON.stringify(text)
+    );
+  } finally {
+    if (hadValue) {
+      Services.prefs.setIntPref(pref, previous);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+}
 
 /**
  * Generate strings like "aaaaa", "aabaa", "aacaa", etc.  The idea with the

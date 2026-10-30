@@ -2,6 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
 const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
@@ -170,7 +174,7 @@ async function checkUnsupportedImapMoveUndo(storeType) {
     const body = mailTestUtils.loadMessageToString(destination, finished);
     // WriteStartOfNewMessage uses MSG_LINEBREAK and the exact 80-space blank
     // from nsMsgLocalFolderHdrs.h; the IMAP body itself uses canonical CRLF.
-    const eol = Services.appinfo.OS == "WINNT" ? "\r\n" : "\n";
+    const eol = AppConstants.platform == "win" ? "\r\n" : "\n";
     const storedFlags = (flags & ~Ci.nsMsgMessageFlags.RuntimeOnly & 0xffff)
       .toString(16)
       .padStart(4, "0");

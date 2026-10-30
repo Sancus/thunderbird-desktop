@@ -76,9 +76,12 @@ static nsresult copyStream(nsIInputStream* in, nsIOutputStream* out) {
     // Write buf to output stream.
     uint32_t pos = 0;
     while (pos < bufCnt) {
-      uint32_t writeCnt;
+      uint32_t writeCnt = 0;
       rv = out->Write(buf.get() + pos, bufCnt - pos, &writeCnt);
       NS_ENSURE_SUCCESS(rv, rv);
+      if (writeCnt == 0) {
+        return NS_ERROR_UNEXPECTED;
+      }
       pos += writeCnt;
     }
   }
@@ -96,15 +99,21 @@ static nsresult copyStreamSafely(nsIInputStream* in, nsIOutputStream* out) {
   int64_t initialOffset;
   nsresult rv = outSeekable->Tell(&initialOffset);
   NS_ENSURE_SUCCESS(rv, rv);
-  rv = copyStream(in, out);
-  if (NS_FAILED(rv)) {
-    // Uhoh... the copy failed! Try to remove the partially-written data.
-    rv = outSeekable->Seek(nsISeekableStream::NS_SEEK_SET, initialOffset);
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = outSeekable->SetEOF();
-    NS_ENSURE_SUCCESS(rv, rv);
+  const nsresult copyResult = copyStream(in, out);
+  if (NS_FAILED(copyResult)) {
+    // Rollback is best effort. Neither its success nor a later cleanup error
+    // changes the original append failure or permits finishing the target.
+    nsresult rollbackResult =
+        outSeekable->Seek(nsISeekableStream::NS_SEEK_SET, initialOffset);
+    if (NS_SUCCEEDED(rollbackResult)) {
+      rollbackResult = outSeekable->SetEOF();
+    }
+    if (NS_FAILED(rollbackResult)) {
+      NS_WARNING(
+          "Could not roll back quarantined append; partial bytes may remain");
+    }
   }
-  return NS_OK;
+  return copyResult;
 }
 
 NS_IMETHODIMP nsQuarantinedOutputStream::Close() {

@@ -16,6 +16,23 @@ var gExpectedFiles;
 
 function run_test() {
   Services.prefs.setBoolPref("mailnews.downloadToTempFile", true);
+  const database = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && database instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false)
+  );
+  const expectedStore = Services.prefs
+    .getCharPref("mail.serverDefaultStoreContractID")
+    .includes("maildirstore")
+    ? "maildir"
+    : "mbox";
+  Assert.equal(localAccountUtils.inboxFolder.msgStore.storeType, expectedStore);
+  Assert.equal(
+    localAccountUtils.incomingServer.msgStore.storeType,
+    expectedStore
+  );
   gExpectedFiles = createExpectedTemporaryFiles(2);
   // add 2 messages
   gPOP3Pump.files = ["../../../data/bugmail1", "../../../data/draft1"];

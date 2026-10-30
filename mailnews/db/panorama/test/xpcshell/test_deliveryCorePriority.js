@@ -69,3 +69,78 @@ add_task(function test_addMessageWithPriority() {
     "The immediate header and committed row retain the supplied priority"
   );
 });
+
+add_task(function test_priorityUpdatesAndFailureKeepCommittedValue() {
+  const root = folderDB.insertRoot("delivery-priority-updates");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const id = addMessage({
+    folderId,
+    messageId: "priority-updates@example.invalid",
+    priority: Ci.nsMsgPriority.lowest,
+  });
+  const header = messageDB.getMessage(id);
+  Assert.equal(
+    header.priority,
+    Ci.nsMsgPriority.lowest,
+    "Prime the cached row"
+  );
+  for (const priority of [
+    Ci.nsMsgPriority.highest,
+    Ci.nsMsgPriority.normal,
+    Ci.nsMsgPriority.lowest,
+    Ci.nsMsgPriority.notSet,
+  ]) {
+    header.priority = priority;
+    Assert.equal(header.priority, priority, "The retained header is updated");
+    Assert.equal(messageDB.getMessage(id).priority, priority);
+    Assert.deepEqual(
+      readStoredRows("SELECT priority FROM messages WHERE id = " + id, [
+        "priority",
+      ]),
+      [[priority]],
+      "The independent committed row agrees with the public getter"
+    );
+  }
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_priority_write BEFORE UPDATE OF priority " +
+      "ON messages WHEN OLD.id = " +
+      id +
+      " BEGIN " +
+      "SELECT RAISE(ABORT, 'priority write rejected'); END"
+  );
+  try {
+    Assert.throws(
+      () => {
+        header.priority = Ci.nsMsgPriority.high;
+      },
+      error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT,
+      "The priority setter propagates the actual SQL constraint error"
+    );
+    Assert.ok(
+      !connection.transactionInProgress,
+      "The failed setter rolled back"
+    );
+    Assert.equal(header.priority, Ci.nsMsgPriority.notSet);
+    Assert.equal(messageDB.getMessage(id).priority, Ci.nsMsgPriority.notSet);
+    Assert.deepEqual(
+      readStoredRows("SELECT priority FROM messages WHERE id = " + id, [
+        "priority",
+      ]),
+      [[Ci.nsMsgPriority.notSet]],
+      "The failure preserves the previous committed priority"
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_priority_write");
+  }
+  header.priority = Ci.nsMsgPriority.normal;
+  Assert.equal(header.priority, Ci.nsMsgPriority.normal);
+  Assert.equal(messageDB.getMessage(id).priority, Ci.nsMsgPriority.normal);
+  Assert.deepEqual(
+    readStoredRows("SELECT priority FROM messages WHERE id = " + id, [
+      "priority",
+    ]),
+    [[Ci.nsMsgPriority.normal]],
+    "The same live header can retry and commit after rollback"
+  );
+});

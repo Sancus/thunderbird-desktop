@@ -6,7 +6,11 @@ tags = ["panorama-delivery"]
 
 ["test_deliveryCoreFolderProperties.js"]
 
+["test_deliveryCoreHeaderFields.js"]
+
 ["test_deliveryCoreMessageProperties.js"]
+
+["test_deliveryCorePriority.js"]
 
 ["test_deliveryMigrationNumericProperties.js"]
 environment = [

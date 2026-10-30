@@ -52,8 +52,18 @@ function readStoredRows(sql, columns) {
 add_task(function test_persistHeaderUpdates() {
   const root = folderDB.insertRoot("delivery-headers");
   const folderId = folderDB.insertFolder(root, "Inbox");
-  const id = addMessage({ folderId, messageId: "before@example.invalid" });
+  const id = addMessage({
+    folderId,
+    messageId: "before@example.invalid",
+    sender: "Before <before@example.invalid>",
+    subject: "Before subject",
+    priority: Ci.nsMsgPriority.highest,
+  });
   const header = messageDB.getMessage(id);
+  Assert.equal(header.messageId, "before@example.invalid");
+  Assert.equal(header.author, "Before <before@example.invalid>");
+  Assert.equal(header.subject, "Before subject");
+  Assert.equal(header.priority, Ci.nsMsgPriority.highest);
   const expected = {
     messageId: "after@example.invalid",
     date: 1736947200123456,
@@ -128,5 +138,181 @@ add_task(function test_persistHeaderUpdates() {
       ["storeToken", "maildir-token:001"],
     ],
     "Storage metadata persists under its public property names"
+  );
+});
+
+add_task(function test_repeatedHeaderWritesUpdateExistingHeaders() {
+  const root = folderDB.insertRoot("delivery-repeated-headers");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const id = addMessage({
+    folderId,
+    messageId: "repeated-before@example.invalid",
+    subject: "Before",
+  });
+  const header = messageDB.getMessage(id);
+  Assert.equal(header.subject, "Before", "Prime the real cached row");
+  const fetched = messageDB.getMessage(id);
+  const first = {
+    messageId: "repeated-first@example.invalid",
+    date: 1736947200123456,
+    author: "Zoë <first@example.invalid>",
+    recipients: "René <to@example.invalid>",
+    ccList: "Chloë <cc@example.invalid>",
+    bccList: "Hidden <bcc@example.invalid>",
+    subject: "  First café subject  ",
+    flags: Ci.nsMsgMessageFlags.Read,
+  };
+  const second = {
+    messageId: "repeated-second@example.invalid",
+    date: 1736947200654321,
+    author: "Second <second@example.invalid>",
+    recipients: "",
+    ccList: "",
+    bccList: "Zoë <hidden@example.invalid>",
+    subject: "",
+    flags: Ci.nsMsgMessageFlags.Marked,
+  };
+  for (const values of [first, second]) {
+    for (const [name, value] of Object.entries(values)) {
+      fetched[name] = value;
+    }
+    for (const [name, value] of Object.entries(values)) {
+      Assert.equal(header[name], value, name + " updates the retained header");
+      Assert.equal(
+        messageDB.getMessage(id)[name],
+        value,
+        name + " updates a fetched header"
+      );
+    }
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT messageId, date, sender, recipients, ccList, bccList, " +
+          "subject, flags FROM messages WHERE id = " +
+          id,
+        [
+          "messageId",
+          "date",
+          "sender",
+          "recipients",
+          "ccList",
+          "bccList",
+          "subject",
+          "flags",
+        ]
+      ),
+      [Object.values(values)],
+      "An independent reader observes the complete committed values"
+    );
+  }
+});
+
+add_task(function test_failedHeaderWritePreservesLiveFields() {
+  const root = folderDB.insertRoot("delivery-header-write-error");
+  const folderId = folderDB.insertFolder(root, "Inbox");
+  const id = addMessage({
+    folderId,
+    messageId: "failed-before@example.invalid",
+    date: 1736947200123,
+    sender: "Before <before@example.invalid>",
+    recipients: "Before recipients",
+    ccList: "Before cc",
+    bccList: "Before bcc",
+    subject: "Before subject",
+    flags: Ci.nsMsgMessageFlags.Read,
+  });
+  const header = messageDB.getMessage(id);
+  const before = {
+    messageId: "failed-before@example.invalid",
+    date: 1736947200123000,
+    author: "Before <before@example.invalid>",
+    recipients: "Before recipients",
+    ccList: "Before cc",
+    bccList: "Before bcc",
+    subject: "Before subject",
+    flags: Ci.nsMsgMessageFlags.Read,
+  };
+  const after = {
+    messageId: "failed-after@example.invalid",
+    date: 1736947200654321,
+    author: "After <after@example.invalid>",
+    recipients: "After recipients",
+    ccList: "After cc",
+    bccList: "",
+    subject: "After café subject",
+    flags: Ci.nsMsgMessageFlags.Marked,
+  };
+  for (const [name, value] of Object.entries(before)) {
+    Assert.equal(header[name], value, name + " primes the committed field");
+  }
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_header_write BEFORE UPDATE ON messages " +
+      "WHEN OLD.id = " +
+      id +
+      " BEGIN " +
+      "SELECT RAISE(ABORT, 'header write rejected'); END"
+  );
+  try {
+    for (const [name, value] of Object.entries(after)) {
+      Assert.throws(
+        () => {
+          header[name] = value;
+        },
+        error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT,
+        name + " propagates the actual SQL constraint error"
+      );
+      Assert.ok(
+        !connection.transactionInProgress,
+        "The failed write rolled back"
+      );
+      for (const [field, oldValue] of Object.entries(before)) {
+        Assert.equal(header[field], oldValue, field + " retains the hot value");
+        Assert.equal(messageDB.getMessage(id)[field], oldValue);
+      }
+    }
+    Assert.deepEqual(
+      readStoredRows(
+        "SELECT messageId, date, sender, recipients, ccList, bccList, " +
+          "subject, flags FROM messages WHERE id = " +
+          id,
+        [
+          "messageId",
+          "date",
+          "sender",
+          "recipients",
+          "ccList",
+          "bccList",
+          "subject",
+          "flags",
+        ]
+      ),
+      [Object.values(before)],
+      "Failed writes leave all committed fields intact"
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_header_write");
+  }
+  for (const [name, value] of Object.entries(after)) {
+    header[name] = value;
+    Assert.equal(header[name], value, name + " retries after the constraint");
+  }
+  Assert.deepEqual(
+    readStoredRows(
+      "SELECT messageId, date, sender, recipients, ccList, bccList, " +
+        "subject, flags FROM messages WHERE id = " +
+        id,
+      [
+        "messageId",
+        "date",
+        "sender",
+        "recipients",
+        "ccList",
+        "bccList",
+        "subject",
+        "flags",
+      ]
+    ),
+    [Object.values(after)],
+    "All retries commit after removing only the failing trigger"
   );
 });

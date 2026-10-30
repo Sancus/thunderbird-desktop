@@ -124,6 +124,19 @@ var intlPhrases = [
     },
     searchPhrases: [{ body: "paris", match: true }],
   },
+  // Standalone combining marks remain part of a mozporter token.
+  {
+    name: "Decomposed Latin acute",
+    actual: "Cafe\u0301",
+    encodings: {
+      "utf-8": ["=?UTF-8?B?Q2FmZcyB?=", "Cafe\xcc\x81"],
+    },
+    searchPhrases: [
+      { body: "Cafe\u0301", match: true },
+      { body: "cafe", match: false },
+      { body: "Café", match: false },
+    ],
+  },
   // Case insensitive case for non-ASCII characters.
   {
     name: "Russian: new",
@@ -221,6 +234,18 @@ var msgGen;
 var messageInjection;
 
 add_setup(function () {
+  Assert.equal(
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    false
+  );
+  Assert.equal(
+    Components.manager
+      .QueryInterface(Ci.nsIComponentRegistrar)
+      .contractIDToCID("@mozilla.org/msgDatabase/msgDBService;1")
+      .toString(),
+    "{03223c50-1e88-45e8-ba1a-7ce792dc3fc3}",
+    "International reference uses the legacy backend"
+  );
   msgGen = new MessageGenerator();
   // Use mbox injection because the fake server chokes sometimes right now.
   messageInjection = new MessageInjection({ mode: "local" }, msgGen);

@@ -156,6 +156,8 @@ prefs = [
   "mailnews.database.global.indexer.enabled=false",
 ]
 
+["test_mailSearchQueries.js"]
+
 ["test_mailSearchResults.js"]
 
 ["test_mailSearchService.js"]

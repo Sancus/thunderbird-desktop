@@ -531,6 +531,187 @@ class DeliveryCoreReferences : public testing::Test {
     EXPECT_EQ(!staged, published);
   }
 
+  void CheckStagedChangeFailure(bool tags, bool commitFailure) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& db = mCore->MessageDB();
+    RawHdr raw;
+    raw.messageId = "staged-change-fault"_ns;
+    raw.flags = nsMsgMessageFlags::Marked;
+    raw.keywords = "before"_ns;
+    raw.references = {"first"_ns, "second"_ns, "first"_ns};
+    nsMsgKey key, control;
+    ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+    ASSERT_EQ(NS_OK, Add("staged-unrelated"_ns, {}, control));
+    ASSERT_EQ(NS_OK, db.SetMessageProperty(control, "Exact"_ns, "00042"_ns));
+    uint32_t flags;
+    nsCString text;
+    ASSERT_EQ(NS_OK, db.GetMessageFlags(key, flags));
+    ASSERT_EQ(NS_OK, db.GetMessageTags(key, text));
+    EXPECT_EQ(raw.flags, flags);
+    EXPECT_EQ(raw.keywords, text);
+    RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+    uint32_t callbacks = 0;
+    observer->action = [&](char, const CapturedMessage&, const CapturedMessage&,
+                           Message*, bool) { ++callbacks; };
+    db.AddMessageListener(observer);
+    auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK, mConnection->CreateFunction("staged_change_fault"_ns, 1,
+                                                 witness));
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "staged_parent(id INTEGER PRIMARY KEY); "
+                           "CREATE TEMP TABLE staged_child(id INTEGER "
+                           "REFERENCES staged_parent(id) DEFERRABLE "
+                           "INITIALLY DEFERRED)"_ns));
+    }
+    nsAutoCString sql("CREATE TEMP TRIGGER fail_staged_change ");
+    sql.Append(commitFailure ? "AFTER" : "BEFORE");
+    sql.AppendLiteral(" UPDATE OF ");
+    sql.Append(tags ? "tags" : "flags");
+    sql.AppendLiteral(" ON main.staged_messages WHEN OLD.id=");
+    sql.AppendInt(key);
+    sql.AppendLiteral(" BEGIN SELECT staged_change_fault(OLD.id); ");
+    sql.Append(commitFailure ? "INSERT INTO staged_child VALUES(OLD.id); END"
+                             : "SELECT RAISE(ABORT,'staged change'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_staged_change"_ns));
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("staged_change_fault"_ns));
+    });
+    auto write = [&]() -> nsresult {
+      return tags ? db.SetMessageTags(key, "  Exact TAG 00042  "_ns)
+                  : db.SetMessageFlags(key, UINT32_MAX);
+    };
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, write());
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(int64_t(key), witness->mLastKey);
+    bool active = true, exists = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(NS_OK, db.GetMessageFlags(key, flags));
+    ASSERT_EQ(NS_OK, db.GetMessageTags(key, text));
+    EXPECT_EQ(raw.flags, flags);
+    EXPECT_EQ(raw.keywords, text);
+    ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+    EXPECT_FALSE(exists);
+    if (commitFailure) {
+      nsCOMPtr<mozIStorageStatement> leftovers;
+      ASSERT_EQ(NS_OK,
+                mConnection->CreateStatement("SELECT id FROM staged_child"_ns,
+                                             getter_AddRefs(leftovers)));
+      bool more = true;
+      ASSERT_EQ(NS_OK, leftovers->ExecuteStep(&more));
+      EXPECT_FALSE(more);
+    }
+    EXPECT_EQ(0u, callbacks);
+    EXPECT_EQ(0u, observer->ordinary);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_staged_change"_ns));
+    ASSERT_EQ(NS_OK, write());
+    ASSERT_EQ(NS_OK, write());  // A no-op remains silent.
+    ASSERT_EQ(NS_OK, db.GetMessageFlags(key, flags));
+    ASSERT_EQ(NS_OK, db.GetMessageTags(key, text));
+    EXPECT_EQ(tags ? raw.flags : UINT32_MAX, flags);
+    EXPECT_EQ(tags ? nsCString("  Exact TAG 00042  ") : raw.keywords, text);
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(control, "Exact"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
+    nsTArray<nsCString> refs;
+    ASSERT_EQ(NS_OK, db.GetMessageReferences(key, refs));
+    EXPECT_EQ(raw.references, refs);
+    EXPECT_EQ(0u, callbacks);
+    EXPECT_EQ(0u, observer->ordinary);
+  }
+
+  void CheckBulkReadNotificationFailure(bool commitFailure) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& db = mCore->MessageDB();
+    RefPtr<PerFolderDatabase> facade = WeakFolderDatabase(mFolderId);
+    RawHdr raw;
+    raw.messageId = "bulk-notify-first"_ns;
+    raw.flags = nsMsgMessageFlags::Marked;
+    nsMsgKey first, second;
+    ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &first));
+    ASSERT_EQ(NS_OK, Add("bulk-notify-second"_ns, {}, second));
+    uint32_t flags;
+    ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+    ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
+    nsTArray<nsMsgKey> originalNew;
+    ASSERT_EQ(NS_OK, facade->GetNewList(originalNew));
+    ASSERT_EQ((nsTArray<nsMsgKey>{first, second}), originalNew);
+    uint64_t watermark;
+    ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+    uint32_t callbacks = 0;
+    RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+    observer->action = [&](char, const CapturedMessage&, const CapturedMessage&,
+                           Message*, bool) { ++callbacks; };
+    db.AddMessageListener(observer);
+    auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK,
+              mConnection->CreateFunction("bulk_notify_fault"_ns, 1, witness));
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "bulk_parent(id INTEGER PRIMARY KEY); "
+                           "CREATE TEMP TABLE bulk_child(id INTEGER "
+                           "REFERENCES bulk_parent(id) DEFERRABLE "
+                           "INITIALLY DEFERRED)"_ns));
+    }
+    nsAutoCString trigger("CREATE TEMP TRIGGER fail_bulk_notify ");
+    trigger.Append(commitFailure ? "AFTER" : "BEFORE");
+    trigger.AppendLiteral(
+        " UPDATE OF flags ON main.messages BEGIN "
+        "SELECT bulk_notify_fault(OLD.id); ");
+    if (commitFailure) {
+      trigger.AppendLiteral("INSERT INTO bulk_child VALUES(OLD.id); END");
+    } else {
+      trigger.AppendLiteral("SELECT CASE WHEN OLD.id=");
+      trigger.AppendInt(second);
+      trigger.AppendLiteral(" THEN RAISE(FAIL,'bulk flags') END; END");
+    }
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(trigger));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_bulk_notify"_ns));
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("bulk_notify_fault"_ns));
+    });
+    nsTArray<nsMsgKey> marked{nsMsgKey_None - 1};
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, MarkFolderRead(mFolderId, marked));
+    EXPECT_EQ((nsTArray<nsMsgKey>{nsMsgKey_None - 1}), marked);
+    EXPECT_EQ(2u, witness->mCalls);
+    EXPECT_EQ(int64_t(second), witness->mLastKey);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+    EXPECT_EQ(nsMsgMessageFlags::Marked, flags);
+    ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
+    EXPECT_EQ(0u, flags);
+    uint64_t unread, afterWatermark;
+    ASSERT_EQ(NS_OK, FolderUnreadCount(mFolderId, unread));
+    EXPECT_EQ(2u, unread);
+    ASSERT_EQ(NS_OK, SearchWatermark(afterWatermark));
+    EXPECT_EQ(watermark, afterWatermark);
+    nsTArray<nsMsgKey> currentNew;
+    ASSERT_EQ(NS_OK, facade->GetNewList(currentNew));
+    EXPECT_EQ(originalNew, currentNew);
+    EXPECT_EQ(0u, callbacks);
+    EXPECT_EQ(0u, observer->ordinary);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_bulk_notify"_ns));
+    ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
+    EXPECT_EQ((nsTArray<nsMsgKey>{first, second}), marked);
+    EXPECT_EQ(2u, callbacks);
+    ASSERT_EQ(NS_OK, facade->GetNewList(currentNew));
+    EXPECT_TRUE(currentNew.IsEmpty());
+    ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
+    EXPECT_TRUE(marked.IsEmpty());
+    EXPECT_EQ(2u, callbacks);
+  }
+
   nsresult Start() {
     // This native fixture selects the concrete Panorama implementation
     // directly.
@@ -10841,6 +11022,247 @@ TEST_F(DeliveryCoreReferences, ConversationReadRejectsIncompleteAndOwnedState) {
             held->GetConversationMessageKeys(seed, output));
   EXPECT_EQ(sentinel, output);
   EXPECT_FALSE(Connection());
+}
+
+TEST_F(DeliveryCoreReferences, StagedChangesPreserveCallerTransactionAndCache) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr raw;
+  raw.messageId = "staged-caller"_ns;
+  raw.flags = nsMsgMessageFlags::Marked;
+  raw.keywords = "before"_ns;
+  nsMsgKey key, control;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().StageMessage(mFolderId, raw, &key));
+  ASSERT_EQ(NS_OK, Add("staged-caller-control"_ns, {}, control));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_FALSE(HeaderIsCached(key));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto cleanup = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(control, "caller"_ns, "pending"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.SetMessageFlags(key, nsMsgMessageFlags::Read));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.SetMessageFlag(key, nsMsgMessageFlags::Read, true));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.SetMessageTags(key, "changed"_ns));
+  EXPECT_FALSE(HeaderIsCached(key));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(control, "caller"_ns, text));
+  EXPECT_EQ("pending"_ns, text);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  uint32_t flags = 0;
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(key, flags));
+  ASSERT_EQ(NS_OK, db.GetMessageTags(key, text));
+  EXPECT_EQ(raw.flags, flags);
+  EXPECT_EQ(raw.keywords, text);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.SetMessageFlags(key, UINT32_MAX));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.SetMessageTags(key, "changed"_ns));
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(key, flags));
+  ASSERT_EQ(NS_OK, db.GetMessageTags(key, text));
+  EXPECT_EQ(raw.flags, flags);
+  EXPECT_EQ(raw.keywords, text);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db.SetMessageFlags(key, UINT32_MAX));
+  ASSERT_EQ(NS_OK, db.SetMessageTags(key, "  Exact TAG 00042  "_ns));
+  bool published = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, published));
+  EXPECT_FALSE(published);
+  cleanup.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(key, flags));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageTags(key, text));
+  EXPECT_EQ(UINT32_MAX, flags);
+  EXPECT_EQ("  Exact TAG 00042  "_ns, text);
+  uint64_t folder = 0;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFolderId(key, folder));
+  EXPECT_EQ(mFolderId, folder);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(control, "caller"_ns, text));
+  EXPECT_TRUE(text.IsEmpty());
+}
+
+TEST_F(DeliveryCoreReferences, StagedChangeFailuresKeepSqlAndHotFacts) {
+  for (bool tags : {false, true}) {
+    for (bool commitFailure : {false, true}) {
+      ASSERT_NO_FATAL_FAILURE(CheckStagedChangeFailure(tags, commitFailure));
+      Stop();
+    }
+  }
+}
+
+TEST_F(DeliveryCoreReferences, FlagAndTagChangesDoNotOpenStoppedOrOldOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  RefPtr<MessageDatabase> held = &mCore->MessageDB();
+  RawHdr raw;
+  raw.messageId = "staged-owner"_ns;
+  raw.flags = nsMsgMessageFlags::Marked;
+  raw.keywords = "retained"_ns;
+  nsMsgKey staged, published;
+  ASSERT_EQ(NS_OK, held->StageMessage(mFolderId, raw, &staged));
+  ASSERT_EQ(NS_OK, Add("published-owner"_ns, {}, published));
+  Stop();
+  for (nsMsgKey key : {staged, published}) {
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, held->SetMessageFlags(key, UINT32_MAX));
+    EXPECT_FALSE(Connection());
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              held->SetMessageFlag(key, nsMsgMessageFlags::Read, true));
+    EXPECT_FALSE(Connection());
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, held->SetMessageTags(key, "rejected"_ns));
+    EXPECT_FALSE(Connection());
+  }
+  ASSERT_EQ(NS_OK, Start());
+  for (nsMsgKey key : {staged, published}) {
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, held->SetMessageFlags(key, UINT32_MAX));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              held->SetMessageFlag(key, nsMsgMessageFlags::Read, true));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, held->SetMessageTags(key, "rejected"_ns));
+  }
+  uint32_t flags = 0;
+  nsCString text;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(staged, flags));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageTags(staged, text));
+  EXPECT_EQ(raw.flags, flags);
+  EXPECT_EQ(raw.keywords, text);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(published, flags));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageTags(published, text));
+  EXPECT_EQ(0u, flags);
+  EXPECT_TRUE(text.IsEmpty());
+}
+
+TEST_F(DeliveryCoreReferences, MarkAllReadPublishesCommittedFlagsInQueueOrder) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  uint64_t otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, "Bystander"_ns,
+                                                  &otherFolder));
+  RefPtr<PerFolderDatabase> facade = WeakFolderDatabase(mFolderId);
+  RefPtr<PerFolderDatabase> other = WeakFolderDatabase(otherFolder);
+  RawHdr raw;
+  raw.messageId = "bulk-captured-first"_ns;
+  raw.flags = 0x80000000u | nsMsgMessageFlags::New | nsMsgMessageFlags::Marked;
+  raw.references = {"raw-first"_ns, "raw-second"_ns, "raw-first"_ns};
+  nsMsgKey first, second, read, staged, foreign;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &first));
+  ASSERT_EQ(NS_OK, Add("bulk-captured-second"_ns, {}, second));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(first, "Exact"_ns, "00042"_ns));
+  RawHdr readRaw;
+  readRaw.messageId = "bulk-already-read"_ns;
+  readRaw.flags = nsMsgMessageFlags::Read;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, readRaw, true, &read));
+  RawHdr stagedRaw;
+  stagedRaw.messageId = "bulk-staged"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, stagedRaw, &staged));
+  ASSERT_EQ(NS_OK, AddAt(otherFolder, "bulk-foreign"_ns, {}, foreign));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
+  nsTArray<nsMsgKey> marked{nsMsgKey_None - 1};
+  nsTArray<nsCString> events;
+  RefPtr<ThreadQueueObserver> before = new ThreadQueueObserver();
+  RefPtr<ThreadQueueObserver> after = new ThreadQueueObserver();
+  auto observe = [&](char recipient, char kind, const CapturedMessage& old,
+                     const CapturedMessage& now, Message* live, bool) {
+    nsAutoCString event;
+    event.Append(recipient);
+    event.Append(kind);
+    event.AppendInt(now.id);
+    events.AppendElement(event);
+    EXPECT_EQ(now.id, live->Key());
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    EXPECT_EQ((nsTArray<nsMsgKey>{first, second}), marked);
+    for (nsMsgKey key : {first, second}) {
+      uint32_t current;
+      ASSERT_EQ(NS_OK, db.GetMessageFlags(key, current));
+      EXPECT_TRUE(current & nsMsgMessageFlags::Read);
+    }
+    uint64_t unread;
+    ASSERT_EQ(NS_OK, FolderUnreadCount(mFolderId, unread));
+    EXPECT_EQ(0u, unread);
+    if (kind == 'F') {
+      EXPECT_EQ(mFolderId, old.folderId);
+      EXPECT_EQ(old.id, now.id);
+      EXPECT_FALSE(old.flags & nsMsgMessageFlags::Read);
+      EXPECT_EQ(old.flags | nsMsgMessageFlags::Read, now.flags);
+      EXPECT_TRUE(old.tags.IsEmpty());
+      EXPECT_TRUE(now.tags.IsEmpty());  // Captured before reentrant tag edit.
+      if (recipient == 'A' && now.id == first) {
+        ASSERT_EQ(NS_OK, db.SetMessageTags(second, "nested exact tags"_ns));
+      }
+    } else {
+      EXPECT_EQ('G', kind);
+      EXPECT_EQ(second, now.id);
+      EXPECT_TRUE(old.tags.IsEmpty());
+      EXPECT_EQ("nested exact tags"_ns, now.tags);
+    }
+  };
+  before->action = [&](char kind, const CapturedMessage& old,
+                       const CapturedMessage& now, Message* live, bool notify) {
+    observe('A', kind, old, now, live, notify);
+  };
+  after->action = [&](char kind, const CapturedMessage& old,
+                      const CapturedMessage& now, Message* live, bool notify) {
+    observe('B', kind, old, now, live, notify);
+  };
+  db.AddMessageListener(before);
+  db.AddMessageListener(after);
+  auto unwatch = MakeScopeExit([&] {
+    db.RemoveMessageListener(before);
+    db.RemoveMessageListener(after);
+  });
+  ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
+  nsTArray<nsCString> expected;
+  auto expectEvent = [&](const nsACString& prefix, nsMsgKey key) {
+    nsAutoCString event(prefix);
+    event.AppendInt(key);
+    expected.AppendElement(event);
+  };
+  expectEvent("AF"_ns, first);
+  expectEvent("BF"_ns, first);
+  expectEvent("AF"_ns, second);
+  expectEvent("BF"_ns, second);
+  expectEvent("AG"_ns, second);
+  expectEvent("BG"_ns, second);
+  EXPECT_EQ(expected, events);
+  EXPECT_EQ(0u, before->ordinary);
+  EXPECT_EQ(0u, after->ordinary);
+  nsTArray<nsMsgKey> newKeys;
+  ASSERT_EQ(NS_OK, facade->GetNewList(newKeys));
+  EXPECT_TRUE(newKeys.IsEmpty());
+  ASSERT_EQ(NS_OK, other->GetNewList(newKeys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{foreign}), newKeys);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+  EXPECT_EQ(raw.flags | nsMsgMessageFlags::Read, flags);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(staged, flags));
+  EXPECT_EQ(0u, flags);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(foreign, flags));
+  EXPECT_EQ(0u, flags);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, db.GetMessageReferences(first, refs));
+  EXPECT_EQ(raw.references, refs);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "Exact"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
+  EXPECT_TRUE(marked.IsEmpty());
+  EXPECT_EQ(expected, events);
+}
+
+TEST_F(DeliveryCoreReferences, MarkAllReadFailuresDoNotPublishOrClearNewLists) {
+  for (bool commitFailure : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(CheckBulkReadNotificationFailure(commitFailure));
+    Stop();
+  }
 }
 
 }  // namespace mozilla::mailnews

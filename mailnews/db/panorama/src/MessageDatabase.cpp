@@ -79,6 +79,11 @@ struct MessageDatabase::QueuedMessageBatch {
     nsCOMPtr<nsISupports> beforeViewData;
     PreparedThreadBatch prepared;
   };
+  struct Flags {
+    CapturedMessage before, after;
+    RefPtr<nsIMsgDBHdr> oldHeader;
+    RefPtr<Message> live;
+  };
   struct Body {
     CapturedMessage before, after;
     MessageBodyState oldBody, newBody;
@@ -93,6 +98,7 @@ struct MessageDatabase::QueuedMessageBatch {
   RefPtr<Message> live;
   nsTArray<Delivery> deliveries;
   nsTArray<Body> bodies;
+  nsTArray<Flags> flagChanges;
 };
 
 MessageDatabase::MessageDatabase() = default;
@@ -170,6 +176,18 @@ void MessageDatabase::DrainMessageBatches() {
   while (!mMessageBatches.IsEmpty()) {
     auto batch = std::move(mMessageBatches[0]);
     mMessageBatches.RemoveElementAt(0);
+    if (batch->kind == QueuedMessageBatch::Kind::Flags &&
+        !batch->flagChanges.IsEmpty()) {
+      for (const auto& change : batch->flagChanges) {
+        for (auto& delivery : batch->deliveries) {
+          if (mMessageListeners.Contains(delivery.registration)) {
+            delivery.listener->OnMessageFlagsChangedCaptured(
+                change.before, change.after, change.oldHeader, change.live);
+          }
+        }
+      }
+      continue;
+    }
     if (batch->kind == QueuedMessageBatch::Kind::Body) {
       for (const auto& body : batch->bodies) {
         for (auto& delivery : batch->deliveries) {
@@ -4154,6 +4172,8 @@ Result<nsMsgKey, nsresult> MessageDatabase::FindByMessageId(
 namespace {
 nsresult RollbackMessageChange(mozIStorageConnection* connection,
                                nsresult original);
+nsresult ChangeHeader(const CapturedMessage& row,
+                      RefPtr<DetachedMsgHdr>& output);
 }  // namespace
 
 nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
@@ -4161,8 +4181,45 @@ nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
   MOZ_TRY(RequireCommittedSearchRead());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   nsTArray<nsMsgKey> marked;
+  UniquePtr<QueuedMessageBatch> notification;
+  MOZ_TRY(PrepareMessageBatch(notification));
+  notification->kind = QueuedMessageBatch::Kind::Flags;
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
+    // Capture every affected physical row before changing any flags. Existing
+    // per-message listeners receive one commit-ordered batch after settlement.
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "MarkAllReadBefore"_ns,
+          "SELECT id FROM messages WHERE folderId=:folderId "
+          "AND flags & :flag = 0 ORDER BY id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folderId"_ns, aFolderId));
+      MOZ_TRY(stmt->BindInt64ByName("flag"_ns, nsMsgMessageFlags::Read));
+      while (true) {
+        bool more;
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        if (!more) {
+          break;
+        }
+        int64_t key;
+        MOZ_TRY(stmt->GetInt64(0, &key));
+        NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+        QueuedMessageBatch::Flags change;
+        MOZ_TRY(CaptureMessage(static_cast<nsMsgKey>(key), change.before));
+        RefPtr<DetachedMsgHdr> old;
+        MOZ_TRY(ChangeHeader(change.before, old));
+        change.oldHeader = old;
+        change.live = new (fallible) Message(static_cast<nsMsgKey>(key));
+        NS_ENSURE_TRUE(change.live, NS_ERROR_OUT_OF_MEMORY);
+        if (!notification->flagChanges.AppendElement(std::move(change),
+                                                     fallible)) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+      }
+    }
     {
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(
@@ -4189,6 +4246,13 @@ nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
       }
     }
     marked.Sort();
+    NS_ENSURE_TRUE(marked.Length() == notification->flagChanges.Length(),
+                   NS_ERROR_FILE_CORRUPTED);
+    for (size_t i = 0; i < marked.Length(); ++i) {
+      auto& change = notification->flagChanges[i];
+      NS_ENSURE_TRUE(marked[i] == change.before.id, NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(CaptureMessage(marked[i], change.after));
+    }
     return connection->CommitTransaction();
   }();
   if (NS_FAILED(rv)) {
@@ -4203,6 +4267,9 @@ nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
     }
   }
   aMarkedKeys = std::move(marked);
+  if (!notification->flagChanges.IsEmpty()) {
+    QueueMessageBatch(std::move(notification));
+  }
   return NS_OK;
 }
 
@@ -4740,29 +4807,39 @@ nsresult RollbackMessageChange(mozIStorageConnection* connection,
 }  // namespace
 
 nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
+  MOZ_TRY(RequireCommittedSearchRead());
   bool staged;
   MOZ_TRY(IsMessageStaged(key, staged));
   if (staged) {
-    uint32_t previous;
-    MOZ_TRY(GetMessageFlags(key, previous));
-    if (previous == newFlags) {
-      return NS_OK;
+    nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+    MOZ_TRY(connection->BeginTransaction());
+    nsresult rv = [&]() -> nsresult {
+      CachedMsg previous;
+      MOZ_TRY(FetchMsg(key, previous));
+      if (previous.flags == newFlags) {
+        return connection->CommitTransaction();
+      }
+      {
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(GetHeaderStatement(
+            key, "SetMessageFlags"_ns, HeaderTable::Messages, "UPDATE "_ns,
+            " SET flags=:flags WHERE id=:id"_ns, getter_AddRefs(stmt)));
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+        MOZ_TRY(stmt->BindInt64ByName("flags"_ns, newFlags));
+        MOZ_TRY(stmt->Execute());
+      }
+      return connection->CommitTransaction();
+    }();
+    if (NS_FAILED(rv)) {
+      return RollbackMessageChange(connection, rv);
     }
-    nsCOMPtr<mozIStorageStatement> stmt;
-    MOZ_TRY(GetHeaderStatement(
-        key, "SetMessageFlags"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET flags=:flags WHERE id=:id"_ns, getter_AddRefs(stmt)));
-    mozStorageStatementScoper scope(stmt);
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindInt64ByName("flags"_ns, newFlags));
-    MOZ_TRY(stmt->Execute());
     auto entry = mMsgCache.lookup(key);
     if (entry) {
       entry->value().flags = newFlags;
     }
     return NS_OK;
   }
-  MOZ_TRY(RequireCommittedSearchRead());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   UniquePtr<QueuedMessageBatch> notification;
   MOZ_TRY(PrepareMessageBatch(notification));
@@ -4809,6 +4886,7 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
 
 nsresult MessageDatabase::SetMessageFlag(nsMsgKey key, uint32_t flag,
                                          bool value) {
+  MOZ_TRY(RequireCommittedSearchRead());
   uint32_t flags;
   MOZ_TRY(GetMessageFlags(key, flags));
   if (value) {
@@ -5146,6 +5224,7 @@ nsresult MessageDatabase::SetMessageRecipients(nsMsgKey key,
 }
 
 nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
+  MOZ_TRY(RequireCommittedSearchRead());
   bool staged;
   MOZ_TRY(IsMessageStaged(key, staged));
   nsAutoCString cachedTags;
@@ -5153,26 +5232,35 @@ nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
     return NS_ERROR_OUT_OF_MEMORY;
   }
   if (staged) {
-    nsAutoCString previous;
-    MOZ_TRY(GetMessageTags(key, previous));
-    if (previous == tags) {
-      return NS_OK;
+    nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+    MOZ_TRY(connection->BeginTransaction());
+    nsresult rv = [&]() -> nsresult {
+      CachedMsg previous;
+      MOZ_TRY(FetchMsg(key, previous));
+      if (previous.tags == tags) {
+        return connection->CommitTransaction();
+      }
+      {
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(GetHeaderStatement(
+            key, "SetMessageTags"_ns, HeaderTable::Messages, "UPDATE "_ns,
+            " SET tags=:tags WHERE id=:id"_ns, getter_AddRefs(stmt)));
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+        MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
+        MOZ_TRY(stmt->Execute());
+      }
+      return connection->CommitTransaction();
+    }();
+    if (NS_FAILED(rv)) {
+      return RollbackMessageChange(connection, rv);
     }
-    nsCOMPtr<mozIStorageStatement> stmt;
-    MOZ_TRY(GetHeaderStatement(key, "SetMessageTags"_ns, HeaderTable::Messages,
-                               "UPDATE "_ns, " SET tags=:tags WHERE id=:id"_ns,
-                               getter_AddRefs(stmt)));
-    mozStorageStatementScoper scope(stmt);
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
-    MOZ_TRY(stmt->Execute());
     auto entry = mMsgCache.lookup(key);
     if (entry) {
       entry->value().tags = std::move(cachedTags);
     }
     return NS_OK;
   }
-  MOZ_TRY(RequireCommittedSearchRead());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   UniquePtr<QueuedMessageBatch> notification;
   MOZ_TRY(PrepareMessageBatch(notification));

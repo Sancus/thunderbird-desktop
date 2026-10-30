@@ -2129,6 +2129,15 @@ this.messages = class extends ExtensionAPIPersistent {
             if (!tag) {
               throw new ExtensionError(`Specified key does not exist: ${key}`);
             }
+            if (
+              updateProperties.tag &&
+              tag.tag != updateProperties.tag &&
+              tags.find(t => t.tag == updateProperties.tag)
+            ) {
+              throw new ExtensionError(
+                `Specified tag already exists: ${updateProperties.tag}`
+              );
+            }
             if (updateProperties.color) {
               const newColor = updateProperties.color.toUpperCase();
               if (newColor != tag.color.toUpperCase()) {
@@ -2139,12 +2148,6 @@ this.messages = class extends ExtensionAPIPersistent {
               MailServices.tags.setOrdinalForKey(key, updateProperties.ordinal);
             }
             if (updateProperties.tag && tag.tag != updateProperties.tag) {
-              // Don't let the user edit a tag to the name of another existing tag.
-              if (tags.find(t => t.tag == updateProperties.tag)) {
-                throw new ExtensionError(
-                  `Specified tag already exists: ${updateProperties.tag}`
-                );
-              }
               MailServices.tags.setTagForKey(key, updateProperties.tag);
             }
           },

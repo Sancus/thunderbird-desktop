@@ -20,6 +20,19 @@ add_setup(
     const rootFolder = account.incomingServer.rootFolder;
     const testFolder = await createSubfolder(rootFolder, "test");
     await createMessages(testFolder, 1);
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+      Services.prefs.getBoolPref("mail.panorama.enabled", false),
+      "The installed backend matches the requested startup configuration"
+    );
+    Assert.equal(
+      testFolder.server.msgStore.storeType,
+      "mbox",
+      "The ordinary local fixture uses the actual mbox store"
+    );
 
     // There are a couple of deprecated properties in MV3, which we still want to
     // test in MV2 but also report to the user. By default, tests throw when
@@ -422,6 +435,22 @@ add_task(
           browser.messages.updateTag("$label5", { tag: "Important" }),
           `Specified tag already exists: Important`,
           "Should reject updating a key using a tag which exists already"
+        );
+
+        const unchangedTag = await browser.messages.tags.get("$label5");
+        await browser.test.assertRejects(
+          browser.messages.tags.update("$label5", {
+            tag: "Important",
+            color: "#123456",
+            ordinal: "rejected-update",
+          }),
+          "Specified tag already exists: Important",
+          "A duplicate name should reject the whole update"
+        );
+        window.assertDeepEqual(
+          unchangedTag,
+          await browser.messages.tags.get("$label5"),
+          "A rejected rename must preserve the tag color and ordinal"
         );
 
         // Test rejects for deleteTag();

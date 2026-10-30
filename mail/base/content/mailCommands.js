@@ -72,19 +72,43 @@ async function ComposeMessage(
     document.getElementById("tabmail")?.currentAboutMessage ||
     document.getElementById("messageBrowser")?.contentWindow;
   const currentHeaderData = aboutMessage?.currentHeaderData;
+  const displayedMessage = aboutMessage?.gMessage;
+  const displayedFolderURI = displayedMessage?.folder?.URI;
+  const displayedMessageKey = displayedMessage?.messageKey;
+  const displayedMessageURI = aboutMessage?.gMessageURI;
 
-  function isCurrentlyDisplayed(hdr) {
-    return (
-      currentHeaderData && // ignoring enclosing brackets:
-      currentHeaderData["message-id"]?.headerValue.includes(hdr.messageId)
-    );
+  /**
+   * Check whether the captured display headers belong to this physical message.
+   *
+   * @param {nsIMsgDBHdr} hdr - Header being composed from.
+   * @param {string} messageURI - URI used to open that message.
+   * @returns {boolean} Whether the captured display headers can be used.
+   */
+  function isCurrentlyDisplayed(hdr, messageURI) {
+    if (!currentHeaderData || !displayedMessage) {
+      return false;
+    }
+    if (hdr.folder) {
+      return (
+        displayedFolderURI == hdr.folder.URI &&
+        displayedMessageKey == hdr.messageKey
+      );
+    }
+    return !displayedFolderURI && messageURI == displayedMessageURI;
   }
 
-  function findDeliveredToIdentityEmail(hdr) {
+  /**
+   * Find an own identity in this message's captured Delivered-To headers.
+   *
+   * @param {nsIMsgDBHdr} hdr - Header being composed from.
+   * @param {string} messageURI - URI used to open that message.
+   * @returns {string} Matching identity email, or an empty string.
+   */
+  function findDeliveredToIdentityEmail(hdr, messageURI) {
     // This function reads from currentHeaderData, which is only useful if we're
     // looking at the currently-displayed message. Otherwise, just return
     // immediately so we don't waste time.
-    if (!isCurrentlyDisplayed(hdr)) {
+    if (!isCurrentlyDisplayed(hdr, messageURI)) {
       return "";
     }
 
@@ -125,6 +149,7 @@ async function ComposeMessage(
 
   // Check if the draft is already open in another window. If it is, just focus the window.
   if (type == Ci.nsIMsgCompType.Draft && messageArray.length == 1) {
+    const draftFolderURI = messageArray[0].split("#", 1)[0];
     // We'll search this uri in the opened windows.
     for (const win of Services.wm.getEnumerator("")) {
       // Check if it is a compose window.
@@ -132,10 +157,14 @@ async function ComposeMessage(
         win.document.defaultView.gMsgCompose &&
         win.document.defaultView.gMsgCompose.compFields.draftId
       ) {
-        const wKey = GetMsgKeyFromURI(
-          win.document.defaultView.gMsgCompose.compFields.draftId
-        );
-        if (wKey == msgKey) {
+        const draftURI =
+          win.document.defaultView.gMsgCompose.compFields.draftId;
+        const wKey = GetMsgKeyFromURI(draftURI);
+        if (
+          wKey !== null &&
+          wKey == msgKey &&
+          draftURI.split("#", 1)[0] == draftFolderURI
+        ) {
           // Found ! just focus it...
           win.focus();
           // ...and nothing to do anymore.
@@ -264,7 +293,7 @@ async function ComposeMessage(
           let email = fromAddrs[0]?.email;
           if (
             type == Ci.nsIMsgCompType.ReplyToList &&
-            isCurrentlyDisplayed(hdr)
+            isCurrentlyDisplayed(hdr, messageUri)
           ) {
             // ReplyToList is only enabled for current message (if at all), so
             // using currentHeaderData is ok.
@@ -437,7 +466,7 @@ async function ComposeMessage(
               [bestIdentity] = MailUtils.getIdentityForHeader(
                 hdr,
                 type,
-                findDeliveredToIdentityEmail(hdr)
+                findDeliveredToIdentityEmail(hdr, messageUri)
               );
             }
             MailServices.compose.OpenComposeWindow(

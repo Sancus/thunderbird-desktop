@@ -501,3 +501,74 @@ add_task(async function test_news_uris() {
   // Clean up the created draft.
   await press_delete(window);
 });
+
+add_task(async function test_openDraftCopiesInDifferentFolders() {
+  const { MessageGenerator } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const copies = ["FirstDraftCopy", "SecondDraftCopy"].map(name => {
+    const copy = draftsFolder.parent
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder(name);
+    copy.setFlag(Ci.nsMsgFolderFlags.Drafts);
+    return copy.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  });
+  const windows = [];
+  registerCleanupFunction(async () => {
+    for (const win of windows) {
+      if (!win.closed) {
+        await close_compose_window(win);
+      }
+    }
+    for (const copy of copies) {
+      copy.clearFlag(Ci.nsMsgFolderFlags.Drafts);
+      copy.deleteSelf(null);
+    }
+  });
+  const source = new MessageGenerator()
+    .makeMessage({
+      subject: "Independent physical drafts",
+    })
+    .toMessageString();
+  const headers = copies.map(copy => copy.addMessage(source));
+  Assert.equal(headers[0].messageId, headers[1].messageId);
+  Assert.notEqual(headers[0].folder.URI, headers[1].folder.URI);
+  const uris = headers.map(header => header.folder.getUriForMsg(header));
+  for (let i = 0; i < copies.length; i++) {
+    const opened = promise_new_window("msgcompose");
+    await window.ComposeMessage(
+      Ci.nsIMsgCompType.Draft,
+      Ci.nsIMsgCompFormat.Default,
+      copies[i],
+      [uris[i]]
+    );
+    const win = await compose_window_ready(opened);
+    windows.push(win);
+    Assert.equal(win.gMsgCompose.compFields.draftId.split("?")[0], uris[i]);
+  }
+  Assert.notEqual(
+    windows[0],
+    windows[1],
+    "Each physical draft has its own window"
+  );
+  await window.ComposeMessage(
+    Ci.nsIMsgCompType.Draft,
+    Ci.nsIMsgCompFormat.Default,
+    copies[0],
+    [uris[0]]
+  );
+  await TestUtils.waitForCondition(
+    () => Services.ww.activeWindow == windows[0],
+    "Reopening the first physical draft focuses its existing window"
+  );
+  Assert.equal(
+    [...Services.wm.getEnumerator("msgcompose")].length,
+    2,
+    "Reopening the same physical draft focuses its existing window"
+  );
+  Assert.equal(copies[0].getTotalMessages(false), 1);
+  Assert.equal(copies[1].getTotalMessages(false), 1);
+  for (const win of windows) {
+    await close_compose_window(win);
+  }
+});

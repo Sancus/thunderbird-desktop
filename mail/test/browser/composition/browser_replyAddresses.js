@@ -1204,3 +1204,83 @@ add_task(async function testToFromWithReplyTo() {
     { addr_to: ["Flanders <flanders@example.com>"] }
   );
 });
+
+add_task(
+  async function test_replyIdentityDoesNotBorrowDuplicateMessageHeaders() {
+    const { compose_window_ready } = ChromeUtils.importESModule(
+      "resource://testing-common/mail/ComposeHelpers.sys.mjs"
+    );
+    const { promise_new_window } = ChromeUtils.importESModule(
+      "resource://testing-common/mail/WindowHelpers.sys.mjs"
+    );
+    const displayedFolder = folder.parent
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("DisplayedReplyCopy");
+    const targetFolder = folder.parent
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("OtherReplyCopy");
+    // The existing account cleanup removes both physical fixture folders.
+    for (const [target, deliveredTo] of [
+      [displayedFolder, myEmail2],
+      [targetFolder, myEmail],
+    ]) {
+      const message = create_message({
+        from: "Sender <sender@example.invalid>",
+        to: "Other Recipient <recipient@example.invalid>",
+        subject: "Physical reply identity",
+        clobberHeaders: {
+          "Delivered-To": deliveredTo,
+        },
+      });
+      message.messageId = "physical-reply-copy@example.invalid";
+      await add_message_to_folder([target], message);
+    }
+    const [displayedHeader] = displayedFolder.messages;
+    const [targetHeader] = targetFolder.messages;
+    Assert.equal(displayedHeader.messageId, targetHeader.messageId);
+    Assert.notEqual(displayedHeader.folder.URI, targetHeader.folder.URI);
+    await be_in_folder(displayedFolder);
+    await select_click_row(0);
+    const aboutMessage =
+      get_about_3pane().document.getElementById("messageBrowser").contentWindow;
+    Assert.equal(aboutMessage.gMessage.folder.URI, displayedFolder.URI);
+    Assert.equal(aboutMessage.gMessage.messageKey, displayedHeader.messageKey);
+    Assert.equal(
+      aboutMessage.currentHeaderData["delivered-to"].headerValue,
+      myEmail2,
+      "The displayed copy supplies a real identity hint"
+    );
+    const currentReply = await open_compose_with_reply();
+    registerCleanupFunction(async () => {
+      if (!currentReply.closed) {
+        await close_compose_window(currentReply);
+      }
+    });
+    Assert.equal(currentReply.getCurrentIdentityKey(), identity2.key);
+    await close_compose_window(currentReply);
+
+    const opened = promise_new_window("msgcompose");
+    await window.ComposeMessage(
+      Ci.nsIMsgCompType.Reply,
+      Ci.nsIMsgCompFormat.Default,
+      targetFolder,
+      [targetFolder.getUriForMsg(targetHeader)]
+    );
+    const otherReply = await compose_window_ready(opened);
+    registerCleanupFunction(async () => {
+      if (!otherReply.closed) {
+        await close_compose_window(otherReply);
+      }
+    });
+    Assert.equal(
+      otherReply.getCurrentIdentityKey(),
+      identity.key,
+      "A different physical copy cannot borrow the displayed Delivered-To hint"
+    );
+    Assert.equal(aboutMessage.gMessage.folder.URI, displayedFolder.URI);
+    Assert.equal(aboutMessage.gMessage.messageKey, displayedHeader.messageKey);
+    Assert.equal(displayedFolder.getTotalMessages(false), 1);
+    Assert.equal(targetFolder.getTotalMessages(false), 1);
+    await close_compose_window(otherReply);
+  }
+);

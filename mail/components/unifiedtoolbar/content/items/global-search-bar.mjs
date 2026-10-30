@@ -52,13 +52,10 @@ class GlobalSearchBar extends SearchBar {
 
   #completionResult = null;
 
-  /** Stops delivery only for this input's native result. */
+  /** Stops delivery only for the result owned by this input. */
   #stopCompletion() {
     const provider = lazy.glodaCompleter;
-    if (
-      !provider.isNativeMailSearch ||
-      provider.curResult == this.#completionResult
-    ) {
+    if (provider.curResult && provider.curResult == this.#completionResult) {
       provider.stopSearch();
     }
   }
@@ -67,16 +64,13 @@ class GlobalSearchBar extends SearchBar {
     onSearchResult: (result, search) => {
       const provider = lazy.glodaCompleter;
       if (
-        provider.isNativeMailSearch &&
-        ((result.wrappedJSObject ?? result) != provider ||
-          (search.wrappedJSObject ?? search) != provider.curResult ||
-          search.searchString != this.controller.searchString)
+        (result.wrappedJSObject ?? result) != provider ||
+        (search.wrappedJSObject ?? search) != provider.curResult ||
+        search.searchString != this.controller.searchString
       ) {
         return;
       }
-      if (provider.isNativeMailSearch) {
-        this.#completionResult = search.wrappedJSObject ?? search;
-      }
+      this.#completionResult = search.wrappedJSObject ?? search;
       this.controller.matchCount = search.matchCount;
       if (this.controller.matchCount < 1) {
         this.popup.closePopup();
@@ -133,6 +127,12 @@ class GlobalSearchBar extends SearchBar {
       case "keydown":
         this.#handleKeydown(event);
         this.#popupWasOpenAtDown = this.popup.mPopupOpen;
+        if (
+          !lazy.glodaCompleter.isNativeMailSearch &&
+          !event.defaultPrevented
+        ) {
+          super.handleEvent(event);
+        }
         break;
       case "focus":
         this.#handleFocus(event);
@@ -146,9 +146,7 @@ class GlobalSearchBar extends SearchBar {
         }
         break;
       case "blur":
-        if (lazy.glodaCompleter.isNativeMailSearch) {
-          this.#stopCompletion();
-        }
+        this.#stopCompletion();
         if (this.popup.mPopupOpen) {
           this.popup.closePopup();
         }
@@ -188,13 +186,11 @@ class GlobalSearchBar extends SearchBar {
       ) {
         throw new TypeError("Expected a source-bound native completion");
       }
-      let text;
+      let text = event.detail;
       if (selection) {
         text = "";
       } else if (row?.fullText) {
         text = row.item;
-      } else {
-        text = event.detail;
       }
       const title = selection ? row.label : text;
       // Copy typed values before stopSearch/popup/reset can change the selection.
@@ -254,9 +250,7 @@ class GlobalSearchBar extends SearchBar {
   #handleAutocomplete = event => {
     this.controller.searchString = event.detail;
     if (!event.detail) {
-      if (lazy.glodaCompleter.isNativeMailSearch) {
-        this.#stopCompletion();
-      }
+      this.#stopCompletion();
       this.#completionResult = null;
       this.popup.closePopup();
       this.controller.matchCount = 0;

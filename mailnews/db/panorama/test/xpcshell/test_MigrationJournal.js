@@ -247,6 +247,153 @@ add_task(async function test_backupRejectsParentPathComponents() {
   Assert.deepEqual(await IOUtils.read(plan.sources[0].path), source);
 });
 
+/**
+ * Models only the free-space query on the destination parent. Every source,
+ * admission and copy still receives real native file objects. This does not
+ * model a physically full disk.
+ *
+ * @param {object} sinon - Existing Sinon helper.
+ * @param {string} parentPath - Actual canonical destination parent path.
+ * @param {Function} readSpace - Modeled result or thrown query error.
+ * @returns {object} Stub to restore in finally.
+ */
+function stubBackupVolumeSpace(sinon, parentPath, readSpace) {
+  const File = FileUtils.File;
+  const parent = new File(parentPath);
+  return sinon.stub(FileUtils, "File").callsFake(function (path) {
+    const file = new File(path);
+    if (file.equals(parent)) {
+      return {
+        get diskSpaceAvailable() {
+          return readSpace(file);
+        },
+      };
+    }
+    return file;
+  });
+}
+
+add_task(
+  async function test_freshBackupRefusesInsufficientFileBytesBeforeCreatingOutput() {
+    const { sinon } = ChromeUtils.importESModule(
+      "resource://testing-common/Sinon.sys.mjs"
+    );
+    const { root, plan } = await migrationFiles();
+    const paths = [
+      PathUtils.join(plan.profilePath, "prefs.js"),
+      plan.sources[0].path,
+      PathUtils.join(plan.mailPaths[0], "Inbox"),
+    ];
+    const originals = await Promise.all(paths.map(path => IOUtils.read(path)));
+    const required = originals.reduce((sum, bytes) => sum + bytes.length, 0);
+    let queries = 0;
+    const parent = new FileUtils.File(canonicalRoot(root));
+    const space = stubBackupVolumeSpace(sinon, parent.path, file => {
+      Assert.ok(file.equals(parent));
+      queries++;
+      return required - 1;
+    });
+    const copy = sinon.spy(
+      Cu.getGlobalForObject(createMigrationBackup).IOUtils,
+      "copy"
+    );
+    try {
+      await Assert.rejects(
+        createMigrationBackup(
+          plan.profilePath,
+          [...plan.mailPaths, ...plan.mailPaths],
+          plan.backupPath
+        ),
+        error =>
+          error.result == Cr.NS_ERROR_FILE_NO_DEVICE_SPACE &&
+          error.message.includes(`at least ${required} bytes`)
+      );
+      Assert.equal(queries, 1);
+      Assert.equal(copy.callCount, 0);
+      Assert.ok(!(await IOUtils.exists(plan.backupPath)));
+    } finally {
+      copy.restore();
+      space.restore();
+    }
+    for (const [index, path] of paths.entries()) {
+      Assert.deepEqual(await IOUtils.read(path), originals[index]);
+    }
+    const receipt = await createMigrationBackup(
+      plan.profilePath,
+      plan.mailPaths,
+      plan.backupPath
+    );
+    Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
+  }
+);
+
+add_task(
+  async function test_freshBackupPreservesVolumeQueryErrorBeforeCreatingOutput() {
+    const { sinon } = ChromeUtils.importESModule(
+      "resource://testing-common/Sinon.sys.mjs"
+    );
+    const { root, plan } = await migrationFiles();
+    const original = await IOUtils.read(plan.sources[0].path);
+    const failure = new Error("Backup volume query failed");
+    const space = stubBackupVolumeSpace(sinon, canonicalRoot(root), () => {
+      throw failure;
+    });
+    const copy = sinon.spy(
+      Cu.getGlobalForObject(createMigrationBackup).IOUtils,
+      "copy"
+    );
+    try {
+      await Assert.rejects(
+        createMigrationBackup(
+          plan.profilePath,
+          plan.mailPaths,
+          plan.backupPath
+        ),
+        error => error === failure
+      );
+      Assert.equal(copy.callCount, 0);
+      Assert.ok(!(await IOUtils.exists(plan.backupPath)));
+    } finally {
+      copy.restore();
+      space.restore();
+    }
+    Assert.deepEqual(await IOUtils.read(plan.sources[0].path), original);
+  }
+);
+
+add_task(async function test_freshBackupAllowsExactFileByteLowerBound() {
+  const { sinon } = ChromeUtils.importESModule(
+    "resource://testing-common/Sinon.sys.mjs"
+  );
+  const { root, plan } = await migrationFiles();
+  const paths = [
+    PathUtils.join(plan.profilePath, "prefs.js"),
+    plan.sources[0].path,
+    PathUtils.join(plan.mailPaths[0], "Inbox"),
+  ];
+  const originals = await Promise.all(paths.map(path => IOUtils.read(path)));
+  const required = originals.reduce((sum, bytes) => sum + bytes.length, 0);
+  let queries = 0;
+  const space = stubBackupVolumeSpace(sinon, canonicalRoot(root), () => {
+    queries++;
+    return required;
+  });
+  try {
+    const receipt = await createMigrationBackup(
+      plan.profilePath,
+      plan.mailPaths,
+      plan.backupPath
+    );
+    Assert.equal(queries, 1);
+    Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
+  } finally {
+    space.restore();
+  }
+  for (const [index, path] of paths.entries()) {
+    Assert.deepEqual(await IOUtils.read(path), originals[index]);
+  }
+});
+
 add_task(async function test_cancelledBackupRetainsWorkAndResumes() {
   const { sinon } = ChromeUtils.importESModule(
     "resource://testing-common/Sinon.sys.mjs"

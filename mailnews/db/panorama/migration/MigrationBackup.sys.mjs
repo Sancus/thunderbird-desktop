@@ -78,6 +78,8 @@ export function captureWindowsMigrationRoots(paths) {
 /**
  * Copies a quiesced profile and external mail stores to a private backup.
  * Resumes an incomplete copy only when its recorded source inventory matches.
+ * A fresh copy requires at least the inventoried file bytes available on disk.
+ * This does not reserve space or include filesystem/manifest overhead.
  * Never changes or removes source data. Failed scratch copies are retained.
  * Profile lock files are recorded as exclusions; other links/special files fail.
  *
@@ -171,6 +173,34 @@ export async function createMigrationBackup(
       throw new Error("Invalid incomplete migration backup");
     }
   } else {
+    // This is only a lower bound: directory/manifest overhead and concurrent
+    // allocations can still make a later copy fail. Incomplete backups retain
+    // their existing retry path; already copied bytes need no second allocation.
+    let requiredBytes = 0;
+    for (const root of roots) {
+      for (const entry of root.entries) {
+        if (entry.type == "regular") {
+          requiredBytes += entry.size;
+          if (!Number.isSafeInteger(requiredBytes)) {
+            throw new Error(
+              "Migration backup byte count exceeds the supported range"
+            );
+          }
+        }
+      }
+    }
+    const availableBytes = new FileUtils.File(backup.parent.path)
+      .diskSpaceAvailable;
+    if (!Number.isSafeInteger(availableBytes) || availableBytes < 0) {
+      throw new Error("Migration backup free space is unavailable");
+    }
+    if (availableBytes < requiredBytes) {
+      throw Components.Exception(
+        `Migration backup needs at least ${requiredBytes} bytes; ${availableBytes} available`,
+        Cr.NS_ERROR_FILE_NO_DEVICE_SPACE
+      );
+    }
+    checkCancellation(signal);
     await IOUtils.makeDirectory(backup.path, {
       createAncestors: false,
       ignoreExisting: false,

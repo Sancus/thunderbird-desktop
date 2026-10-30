@@ -1310,8 +1310,18 @@ NS_IMETHODIMP PerFolderDatabase::GetThreadContainingMsgHdr(
 }
 NS_IMETHODIMP PerFolderDatabase::MarkNotNew(nsMsgKey aKey,
                                             nsIDBChangeListener* aInstigator) {
-  mNewList.RemoveElement(aKey);
-  return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::New, false);
+  RefPtr<PerFolderDatabase> self(this);
+  nsCOMPtr<nsIMsgDBHdr> header;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(header)));
+  uint32_t flags;
+  MOZ_TRY(MessageDB().GetMessageFlags(aKey, flags));
+  MOZ_TRY(MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::New, false));
+  // A changed raw flag clears NewList before notifying listeners. Do not erase
+  // an entry that a listener added again while handling that notification.
+  if (!(flags & nsMsgMessageFlags::New)) {
+    mNewList.RemoveElement(aKey);
+  }
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::MarkMDNNeeded(
     nsMsgKey aKey, bool aNeeded, nsIDBChangeListener* aInstigator) {

@@ -3606,3 +3606,139 @@ add_task(function test_bulkReadFailureAndReentrantCapturedOrder() {
     db.removeListener(listener);
   }
 });
+
+add_task(function test_notNewErrorsPreservePhysicalMembershipAndNewList() {
+  const local = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const folder = local.createLocalSubfolder("not-new-admission");
+  const other = local.createLocalSubfolder("not-new-admission-other");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const draft = db.createNewHdr();
+  draft.messageId = "not-new-owned@read.invalid";
+  draft.flags = Ci.nsMsgMessageFlags.New | 0x40000004;
+  const header = db.attachHdr(draft, false);
+  const foreignDraft = otherDB.createNewHdr();
+  foreignDraft.messageId = "not-new-foreign@read.invalid";
+  foreignDraft.flags = Ci.nsMsgMessageFlags.New;
+  const foreign = otherDB.attachHdr(foreignDraft, false);
+  const before = db.getNewList();
+  const flags = header.flags;
+  const foreignFlags = foreign.flags;
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    Assert.throws(
+      () => db.markNotNew(header.messageKey, null),
+      error => error.result === Cr.NS_ERROR_IN_PROGRESS
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.deepEqual(db.getNewList(), before);
+    Assert.equal(header.flags, flags);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  connection.beginTransaction();
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    Assert.throws(
+      () => db.markNotNew(header.messageKey, null),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.deepEqual(db.getNewList(), before);
+  } finally {
+    update.finalize();
+    connection.rollbackTransaction();
+  }
+  connection.executeSimpleSQL(
+    `CREATE TEMP TRIGGER reject_not_new_104 BEFORE UPDATE OF flags ON messages
+     WHEN OLD.id = ${header.messageKey}
+     BEGIN SELECT RAISE(ABORT, 'not new fault'); END`
+  );
+  try {
+    Assert.throws(
+      () => db.markNotNew(header.messageKey, null),
+      error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.deepEqual(db.getNewList(), before);
+    Assert.equal(header.flags, flags);
+    Assert.ok(!connection.transactionInProgress);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_not_new_104");
+  }
+  Assert.throws(
+    () => db.markNotNew(foreign.messageKey, null),
+    /NS_ERROR_ILLEGAL_VALUE/
+  );
+  Assert.deepEqual(db.getNewList(), before);
+  Assert.equal(foreign.flags, foreignFlags);
+  Assert.deepEqual(otherDB.getNewList(), [foreign.messageKey]);
+  db.forceClosed();
+  Assert.throws(
+    () => db.markNotNew(header.messageKey, null),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.equal(header.flags, flags);
+  Assert.strictEqual(header.folder, folder);
+  Assert.ok(!connection.transactionInProgress);
+});
+
+add_task(function test_notNewNoOpAndReentrantNewListMutation() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("not-new-reentrant");
+  const db = folder.msgDatabase;
+  const plain = db.createNewHdr();
+  plain.messageId = "not-new-no-raw-bit@read.invalid";
+  const withoutBit = db.attachHdr(plain, false);
+  Assert.deepEqual(db.getNewList(), [withoutBit.messageKey]);
+  db.markNotNew(withoutBit.messageKey, null);
+  Assert.deepEqual(
+    db.getNewList(),
+    [],
+    "A raw flag no-op still clears NewList"
+  );
+  const draft = db.createNewHdr();
+  draft.messageId = "not-new-reentrant@read.invalid";
+  draft.flags = Ci.nsMsgMessageFlags.New | 0x40000004;
+  const header = db.attachHdr(draft, false);
+  let calls = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(changed, before, after) {
+      Assert.equal(changed.messageKey, header.messageKey);
+      Assert.equal(before, Ci.nsMsgMessageFlags.New | 0x40000004);
+      Assert.equal(after, 0x40000004);
+      Assert.deepEqual(db.getNewList(), []);
+      calls++;
+      db.addToNewList(header.messageKey);
+    },
+  };
+  db.addListener(listener);
+  try {
+    db.markNotNew(header.messageKey, null);
+    Assert.equal(calls, 1);
+    Assert.deepEqual(
+      db.getNewList(),
+      [header.messageKey],
+      "The completed caller must preserve a listener's later re-addition"
+    );
+    const statement = database.connectionForTests.createStatement(
+      "SELECT flags FROM messages WHERE id = :key"
+    );
+    try {
+      statement.params.key = header.messageKey;
+      Assert.ok(statement.executeStep());
+      Assert.equal(statement.getInt64(0), 0x40000004);
+      Assert.ok(!statement.executeStep());
+    } finally {
+      statement.finalize();
+    }
+  } finally {
+    db.removeListener(listener);
+  }
+});

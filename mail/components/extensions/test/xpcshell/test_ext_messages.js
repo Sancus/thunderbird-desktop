@@ -592,3 +592,201 @@ add_task(
     }
   }
 );
+
+add_task(
+  { skip_if: () => IS_IMAP || IS_NNTP || IS_EWS },
+  async function test_archiveKeepsOriginalPhysicalSources() {
+    const { sinon } = ChromeUtils.importESModule(
+      "resource://testing-common/Sinon.sys.mjs"
+    );
+    const { MailUtils } = ChromeUtils.importESModule(
+      "resource:///modules/MailUtils.sys.mjs"
+    );
+    const { MessageArchiver } = ChromeUtils.importESModule(
+      "resource:///modules/MessageArchiver.sys.mjs"
+    );
+    const physical = header => [
+      header.folder.URI,
+      header.messageKey,
+      header.messageId,
+    ];
+    for (const stage of ["preparation", "filter"]) {
+      for (const operation of ["move", "delete"]) {
+        const archiveAccount = await createAccount();
+        const identity = addIdentity(archiveAccount);
+        const root = archiveAccount.incomingServer.rootFolder;
+        const source = await createSubfolder(
+          root,
+          `source-${stage}-${operation}`
+        );
+        const target = await createSubfolder(
+          root,
+          `target-${stage}-${operation}`
+        );
+        const outside = await createSubfolder(
+          root,
+          `outside-${stage}-${operation}`
+        );
+        const archives = await createSubfolder(
+          root,
+          `archives-${stage}-${operation}`
+        );
+        identity.archivesFolderURI = archives.URI;
+        archives.setFlag(Ci.nsMsgFolderFlags.Archive);
+        const synthetic = new MessageGenerator().makeMessage();
+        synthetic.messageId = `archive-${stage}-${operation}@example.invalid`;
+        await addGeneratedMessages(source, [synthetic]);
+        await addGeneratedMessages(outside, [synthetic]);
+        const [header] = source.messages;
+        const service = Cc[
+          "@mozilla.org/msgDatabase/msgDBService;1"
+        ].getService(Ci.nsIMsgDBService);
+        Assert.equal(
+          "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+          Services.prefs.getBoolPref("mail.panorama.enabled", false),
+          "The installed backend matches the requested startup configuration"
+        );
+        Assert.equal(
+          source.server.msgStore.storeType,
+          "mbox",
+          "The ordinary local fixture uses the actual mbox store"
+        );
+        const key = header.messageKey;
+        const excludedIdentity = physical([...outside.messages][0]);
+        const entered = Promise.withResolvers();
+        const resume = Promise.withResolvers();
+        const completed = Promise.withResolvers();
+        let completions = 0;
+        let identityStub;
+        let filter;
+        let list;
+        let filterContinuation;
+        let released = false;
+        if (stage == "preparation") {
+          identityStub = sinon.stub(MailUtils, "getIdentityForHeader").returns([
+            {
+              archiveEnabled: true,
+              archiveGranularity: identity.archiveGranularity,
+              archiveKeepFolderStructure: identity.archiveKeepFolderStructure,
+              archiveRecreateInbox: identity.archiveRecreateInbox,
+              async getOrCreateArchivesFolderAsync() {
+                entered.resolve();
+                await resume.promise;
+                return archives;
+              },
+            },
+          ]);
+        } else {
+          const waitAction = {
+            QueryInterface: ChromeUtils.generateQI([
+              "nsIMsgFilterCustomAction",
+            ]),
+            id: `archive-identity-${operation}@mochi.test#wait`,
+            name: "Pause archive filtering for a physical source change",
+            allowDuplicates: false,
+            isAsync: true,
+            needsBody: false,
+            isValidForType() {
+              return true;
+            },
+            validateActionValue() {
+              return "";
+            },
+            applyAction(headers, value, listener) {
+              filterContinuation = listener;
+              entered.resolve();
+            },
+          };
+          MailServices.filters.addCustomAction(waitAction);
+          list = source.getFilterList(null);
+          filter = list.createFilter("Wait for the original physical source");
+          filter.enabled = true;
+          filter.filterType = Ci.nsMsgFilterType.Archive;
+          const term = filter.createTerm();
+          term.matchAll = true;
+          filter.appendTerm(term);
+          const action = filter.createAction();
+          action.type = Ci.nsMsgFilterAction.Custom;
+          action.customId = waitAction.id;
+          filter.appendAction(action);
+          list.insertFilterAt(0, filter);
+        }
+        const archiver = new MessageArchiver();
+        archiver.oncomplete = (status, error) => {
+          completions++;
+          completed.resolve({ status, error });
+        };
+        const starting = archiver.archiveMessages([header]);
+        starting.catch(entered.reject);
+        const release = () => {
+          if (released) {
+            return;
+          }
+          released = true;
+          resume.resolve();
+          filterContinuation?.onStopCopy(Cr.NS_OK);
+        };
+        try {
+          await entered.promise;
+          const changed = new MailPromiseTestUtils.PromiseCopyListener();
+          const current = source.GetMessageHeader(key);
+          if (operation == "move") {
+            MailServices.copy.copyMessages(
+              source,
+              [current],
+              target,
+              true,
+              changed,
+              null,
+              false
+            );
+          } else {
+            source.deleteMessages([current], null, true, false, changed, false);
+          }
+          await changed.promise;
+          Assert.ok(!source.msgDatabase.containsKey(key));
+          const targetIdentities = [...target.messages].map(physical);
+          Assert.equal(targetIdentities.length, operation == "move" ? 1 : 0);
+          release();
+          await starting;
+          const result = await completed.promise;
+          Assert.equal(
+            result.status,
+            Cr.NS_OK,
+            "There is no remaining original physical source to archive"
+          );
+          Assert.equal(result.error, null);
+          Assert.equal(completions, 1);
+          Assert.equal(source.getTotalMessages(false), 0);
+          Assert.equal(
+            archives.getTotalMessages(true),
+            0,
+            "The archive never follows a moved wrapper or another logical copy"
+          );
+          Assert.deepEqual(
+            [...target.messages].map(physical),
+            targetIdentities
+          );
+          Assert.deepEqual([...outside.messages].map(physical), [
+            excludedIdentity,
+          ]);
+        } finally {
+          release();
+          const started = await starting.then(
+            () => true,
+            () => false
+          );
+          if (started) {
+            await completed.promise;
+          }
+          identityStub?.restore();
+          if (filter) {
+            list.removeFilter(filter);
+          }
+          archives.clearFlag(Ci.nsMsgFolderFlags.Archive);
+          cleanUpAccount(archiveAccount);
+        }
+      }
+    }
+  }
+);

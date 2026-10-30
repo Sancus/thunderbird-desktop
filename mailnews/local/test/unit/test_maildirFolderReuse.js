@@ -800,3 +800,164 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     });
   });
 }
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_maildirFinishFailureKeepsOwnedIdentity() {
+    await withTrashStore("maildir", async root => {
+      const folder = root
+        .createLocalSubfolder("failed-finish")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const other = root
+        .createLocalSubfolder("independent-finish")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const store = folder.msgStore;
+      const raw =
+        "Subject: Existing body\r\n\r\nRetain the original bytes.\r\n";
+      const resident = folder.addMessage(raw);
+      const key = resident.messageKey;
+      const token = resident.storeToken;
+      const flags = resident.flags;
+      const size = resident.messageSize;
+      const originalFiles = await trashBodyFiles(folder);
+      const pending =
+        "Subject: Failed rename\r\n\r\nRetain the unfinished bytes.\r\n";
+      const stream = store.getNewMsgOutputStream(folder);
+      const independent = store.getNewMsgOutputStream(other);
+      try {
+        stream.write(pending, pending.length);
+        stream.flush();
+        const tmp = PathUtils.join(folder.filePath.path, "tmp");
+        const ownedFiles = await IOUtils.getChildren(tmp);
+        Assert.equal(ownedFiles.length, 1);
+        const cur = PathUtils.join(folder.filePath.path, "cur");
+        const saved = PathUtils.join(
+          folder.filePath.path,
+          "cur-before-failure"
+        );
+        await IOUtils.move(cur, saved, { noOverwrite: true });
+        const obstruction = "This is not a destination directory.";
+        try {
+          // MoveTo requires a directory parent on both Unix and Windows.
+          await IOUtils.writeUTF8(cur, obstruction);
+          Assert.throws(
+            () => store.finishNewMessage(folder, stream),
+            error => error.result == Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR
+          );
+        } finally {
+          if (await IOUtils.exists(cur)) {
+            Assert.equal(
+              await IOUtils.readUTF8(cur),
+              obstruction,
+              "Only the fixture's known obstruction may be removed"
+            );
+            await IOUtils.remove(cur);
+          }
+          await IOUtils.move(saved, cur, { noOverwrite: true });
+        }
+        // Restoring the directory must not retry an uncertain failed rename.
+        Assert.throws(
+          () => store.finishNewMessage(folder, stream),
+          error => error.result == Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR
+        );
+        Assert.throws(
+          () => store.getNewMsgOutputStream(folder),
+          error => error.result == Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR
+        );
+        Assert.throws(
+          () => store.discardNewMessage(folder, stream),
+          error => error.result == Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR,
+          "Discard must not delete possibly settled cur content"
+        );
+        Assert.throws(
+          () => store.finishNewMessage(folder, independent),
+          error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE
+        );
+        Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+        const retained = folder.GetMessageHeader(key);
+        Assert.equal(retained.storeToken, token);
+        Assert.equal(retained.flags, flags);
+        Assert.equal(retained.messageSize, size);
+        Assert.equal(mailTestUtils.loadMessageToString(folder, retained), raw);
+        Assert.deepEqual(await trashBodyFiles(folder), originalFiles);
+        Assert.deepEqual(await IOUtils.getChildren(tmp), ownedFiles);
+        Assert.equal(await IOUtils.readUTF8(ownedFiles[0]), pending);
+        // The error belongs to this folder/write, not every provider write.
+        const independentRaw =
+          "Subject: Independent\r\n\r\nA complete body.\r\n";
+        independent.write(independentRaw, independentRaw.length);
+        const independentToken = store.finishNewMessage(other, independent);
+        Assert.notEqual(independentToken, "");
+        Assert.equal(
+          await IOUtils.readUTF8(
+            PathUtils.join(other.filePath.path, "cur", independentToken)
+          ),
+          independentRaw
+        );
+        Assert.deepEqual(await trashBodyFiles(folder), originalFiles);
+        Assert.equal(await IOUtils.readUTF8(ownedFiles[0]), pending);
+      } finally {
+        stream.close();
+        independent.close();
+      }
+    });
+  });
+
+  add_task(async function test_maildirFinishAlreadyCurReturnsOwnedToken() {
+    await withTrashStore("maildir", async root => {
+      const folder = root
+        .createLocalSubfolder("already-cur-finish")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const other = root
+        .createLocalSubfolder("foreign-finish")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const store = folder.msgStore;
+      const stream = store.getNewMsgOutputStream(folder);
+      const foreign = store.getNewMsgOutputStream(other);
+      try {
+        const raw =
+          "Subject: Filter-settled body\r\n\r\nExact finished body.\r\n";
+        stream.write(raw, raw.length);
+        stream.close();
+        const tmp = PathUtils.join(folder.filePath.path, "tmp");
+        const pending = await IOUtils.getChildren(tmp);
+        Assert.equal(pending.length, 1);
+        const filename = PathUtils.filename(pending[0]);
+        const cur = PathUtils.join(folder.filePath.path, "cur", filename);
+        // A real filter may settle this owned file before Finish runs.
+        await IOUtils.move(pending[0], cur, { noOverwrite: true });
+        Assert.throws(
+          () => store.finishNewMessage(folder, foreign),
+          error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE
+        );
+        Assert.throws(
+          () => store.discardNewMessage(folder, foreign),
+          error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE
+        );
+        Assert.equal(await IOUtils.readUTF8(cur), raw);
+        const token = store.finishNewMessage(folder, stream);
+        Assert.equal(token, filename);
+        Assert.notEqual(token, "");
+        Assert.equal(await IOUtils.readUTF8(cur), raw);
+        Assert.deepEqual(await IOUtils.getChildren(tmp), []);
+        const foreignRaw =
+          "Subject: Other folder\r\n\r\nIndependent bytes.\r\n";
+        foreign.write(foreignRaw, foreignRaw.length);
+        const foreignToken = store.finishNewMessage(other, foreign);
+        Assert.notEqual(foreignToken, "");
+        Assert.equal(
+          await IOUtils.readUTF8(
+            PathUtils.join(other.filePath.path, "cur", foreignToken)
+          ),
+          foreignRaw
+        );
+        Assert.equal(await IOUtils.readUTF8(cur), raw);
+        // This is provider settlement, not implicit header publication.
+        Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+        Assert.deepEqual(other.msgDatabase.listAllKeys(), []);
+      } finally {
+        stream.close();
+        foreign.close();
+      }
+    });
+  });
+}

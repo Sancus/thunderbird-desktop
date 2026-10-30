@@ -15,6 +15,22 @@ async function commitBook() {
   const { FileUtils } = ChromeUtils.importESModule(
     "resource://gre/modules/FileUtils.sys.mjs"
   );
+  if (migrationBookChildInput.pauseAfterIntent) {
+    const { MigrationJournal } = ChromeUtils.importESModule(
+      "resource:///modules/panorama/MigrationJournal.sys.mjs"
+    );
+    globalThis.migrationBookJournal = await MigrationJournal.open(
+      migrationBookChildInput.journalPath,
+      migrationBookChildInput.profilePath
+    );
+    const token =
+      await globalThis.migrationBookJournal.beginBookImport("original-book");
+    print("BOOK-INTENT " + JSON.stringify({ token }));
+    Services.tm.spinEventLoopUntil(
+      "TestMigrationBook:KillAfterIntent",
+      () => false
+    );
+  }
   globalThis.migrationBookStage = SQLiteDirectory.createMigrationStage(
     new FileUtils.File(migrationBookChildInput.stagingPath)
   );
@@ -72,7 +88,12 @@ async function commitBook() {
       cards: receipt.cards,
       lists: receipt.lists,
     });
-    print("BOOK-CHECKPOINTED " + JSON.stringify(receipt));
+    if (migrationBookChildInput.finishImportStage) {
+      await globalThis.migrationBookJournal.finishStage("import");
+      print("BOOK-IMPORT-SETTLED " + JSON.stringify(receipt));
+    } else {
+      print("BOOK-CHECKPOINTED " + JSON.stringify(receipt));
+    }
   } else {
     print("BOOK-COMMITTED " + JSON.stringify(receipt));
   }

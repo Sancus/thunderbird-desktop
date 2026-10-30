@@ -919,3 +919,132 @@ add_task(
     await assertOriginals(input);
   }
 );
+
+/**
+ * Stops the sole real journal writer after intent or import-stage settlement.
+ * The returned state is read independently from disk, not supplied by the child.
+ *
+ * @param {object} input - Genuine book, actual held profile lock and journal.
+ * @param {boolean} intentOnly - Stop before stage creation, otherwise after import settlement.
+ * @returns {Promise<{persisted: object, reported: object}>} Observed durable state.
+ */
+async function killBookAtJournalBoundary(input, intentOnly) {
+  const token = input.journal.state.books[0].token;
+  input.journal.close();
+  const { Subprocess } = ChromeUtils.importESModule(
+    "resource://gre/modules/Subprocess.sys.mjs"
+  );
+  const { TestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/TestUtils.sys.mjs"
+  );
+  const prefix = intentOnly ? "BOOK-INTENT " : "BOOK-IMPORT-SETTLED ";
+  const child = await Subprocess.call({
+    command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+    arguments: bookCommitChildArguments({
+      source: input.source,
+      stagingPath: input.stagingPath,
+      token,
+      journalPath: input.path,
+      profilePath: input.profilePath,
+      pauseAfterIntent: intentOnly,
+      checkpointJournal: !intentOnly,
+      finishImportStage: !intentOnly,
+    }),
+    stderr: "stdout",
+  });
+  let output = "";
+  let reported;
+  let readError;
+  const readBoundary = (async () => {
+    try {
+      for (let chunk; (chunk = await child.stdout.readString()); ) {
+        output += chunk;
+        const complete = output.split("\n");
+        complete.pop();
+        const line = complete.find(value => value.startsWith(prefix));
+        if (line) {
+          reported = JSON.parse(line.slice(prefix.length));
+          return;
+        }
+      }
+      await child.wait();
+      throw new Error("Child exited before its journal boundary: " + output);
+    } catch (error) {
+      readError = error;
+    }
+  })();
+  let persisted;
+  try {
+    await TestUtils.waitForCondition(
+      () => reported || readError,
+      "Waiting for the actual durable book journal write",
+      100,
+      300
+    );
+    if (readError) {
+      throw readError;
+    }
+    persisted = await IOUtils.readJSON(input.path);
+    if (intentOnly) {
+      Assert.ok(!(await IOUtils.exists(input.stagingPath)));
+    }
+    Assert.equal(child.exitCode, null);
+    Assert.equal((await child.kill(0)).exitCode, -9);
+  } finally {
+    await child.kill(0);
+    await readBoundary;
+  }
+  input.journal = await MigrationJournal.open(input.path, input.profilePath);
+  Assert.deepEqual(input.journal.state, persisted);
+  return { persisted, reported };
+}
+
+add_task(unixOnly(), async function test_killedBookIntentRetriesFromNoStage() {
+  const input = await bookInput();
+  const before = input.journal.state;
+  Assert.equal(before.books[0].state, "pending");
+  const { persisted, reported } = await killBookAtJournalBoundary(input, true);
+  Assert.equal(persisted.revision, before.revision + 1);
+  Assert.equal(persisted.stage, "import");
+  Assert.equal(persisted.books[0].state, "importing");
+  Assert.equal(persisted.books[0].receipt, null);
+  Assert.equal(reported.token, before.books[0].token);
+  Assert.equal(persisted.books[0].token, reported.token);
+  Assert.ok(!(await IOUtils.exists(input.stagingPath)));
+  await assertOriginals(input);
+  await resumeMorkBookImports(input.journal, input.lock);
+  Assert.equal(input.journal.state.stage, "validate");
+  Assert.equal(
+    input.journal.state.books[0].receipt.storageSourceId,
+    reported.token
+  );
+  await assertOriginals(input);
+});
+
+add_task(unixOnly(), async function test_killedSettledImportReopensReadOnly() {
+  const input = await bookInput();
+  await input.journal.beginBookImport("original-book");
+  const revision = input.journal.state.revision;
+  const { persisted, reported } = await killBookAtJournalBoundary(input, false);
+  Assert.equal(persisted.revision, revision + 2);
+  Assert.equal(persisted.stage, "validate");
+  Assert.equal(persisted.books[0].state, "imported");
+  Assert.deepEqual(persisted.books[0].receipt.cards, reported.cards);
+  Assert.deepEqual(persisted.books[0].receipt.lists, reported.lists);
+  await assertOriginals(input);
+  const before = await IOUtils.read(input.path);
+  await resumeMorkBookImports(input.journal, input.lock);
+  Assert.deepEqual(await IOUtils.read(input.path), before);
+  Assert.deepEqual(input.journal.state, persisted);
+  await Assert.rejects(
+    input.journal.finishStage("validate"),
+    /publication and activation are not supported/
+  );
+  Assert.deepEqual(await IOUtils.read(input.path), before);
+  Assert.ok(
+    !(await IOUtils.exists(
+      PathUtils.join(input.profilePath, "panorama-profile.json")
+    ))
+  );
+  await assertOriginals(input);
+});

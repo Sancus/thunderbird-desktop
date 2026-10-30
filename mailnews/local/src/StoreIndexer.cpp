@@ -241,9 +241,7 @@ NS_IMETHODIMP StoreIndexer::OnStopRequest(nsIRequest* req, nsresult status) {
     {
       nsCOMPtr<nsIMsgDBHdr> liveHdr;
       rv = mParser->m_mailDB->AttachHdr(hdr, false, getter_AddRefs(liveHdr));
-      if (NS_FAILED(rv)) {
-        NS_WARNING("AttachHdr() failed in StoreIndexer");
-      }
+      NS_ENSURE_SUCCESS(rv, rv);
     }
   } else {
     // The parser chose not to include the message.

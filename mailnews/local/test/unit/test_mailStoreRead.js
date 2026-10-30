@@ -708,3 +708,107 @@ add_task(async function test_scanStopError() {
 add_task(async function test_scanDataKeepsFirstError() {
   await checkScanListenerError("data-stop");
 });
+
+/**
+ * A real failed import must retain finished store bytes and report its error.
+ *
+ * @param {string} storeType - Expected provider type.
+ */
+async function checkRepairAttachError(storeType) {
+  await withAvailabilityStore(storeType, async folder => {
+    const id = folder.id;
+    const uri = folder.URI;
+    const store = folder.msgStore;
+    const raw =
+      "From: repair@example.invalid\r\n" +
+      "Subject: Repair attachment error\r\n" +
+      "Message-ID: <repair-attachment@example.invalid>\r\n" +
+      "References: <first@example.invalid> <second@example.invalid>\r\n" +
+      "\r\nExact retained repair body.\r\n";
+    const stream = store.getNewMsgOutputStream(folder);
+    Assert.equal(stream.write(raw, raw.length), raw.length);
+    const token = store.finishNewMessage(folder, stream);
+    Assert.notEqual(token, ""); // The first mbox token may be zero.
+    const path =
+      storeType == "mbox"
+        ? folder.filePath.path
+        : PathUtils.join(folder.filePath.path, "cur", token);
+    const bytes = await IOUtils.read(path);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    ).connectionForTests;
+    let faults = 0;
+    connection.createFunction("repair_attach_fault", 0, {
+      onFunctionCall() {
+        faults++;
+        return 0;
+      },
+    });
+    let installed = false;
+    try {
+      connection.executeSimpleSQL(
+        "CREATE TEMP TRIGGER repair_attach_fault BEFORE INSERT ON main.messages " +
+          `WHEN NEW.folderId=${id} BEGIN SELECT repair_attach_fault(); ` +
+          "SELECT RAISE(ABORT, 'repair attachment failure'); END"
+      );
+      installed = true;
+      const statuses = [];
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(url, status) {
+          statuses.push(status);
+        },
+      });
+      folder.parseFolder(null, listener);
+      const result = await listener.promise.then(
+        () => Cr.NS_OK,
+        error => Number(error.message)
+      );
+      Assert.equal(faults, 1, "The real attachment reached the failing write");
+      Assert.equal(result, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+      Assert.deepEqual(statuses, [Cr.NS_ERROR_STORAGE_CONSTRAINT]);
+      Assert.equal(folder.id, id);
+      Assert.equal(folder.URI, uri);
+      Assert.ok(!folder.locked);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+      Assert.deepEqual(await IOUtils.read(path), bytes);
+      Assert.equal(readAll(store.getMsgInputStream(folder, token, 0)), raw);
+
+      connection.executeSimpleSQL("DROP TRIGGER temp.repair_attach_fault");
+      installed = false;
+      const retry = new PromiseTestUtils.PromiseUrlListener();
+      folder.parseFolder(null, retry);
+      await retry.promise;
+      const keys = folder.msgDatabase.listAllKeys();
+      Assert.equal(keys.length, 1);
+      const header = folder.msgDatabase.getMsgHdrForKey(keys[0]);
+      Assert.equal(header.messageId, "repair-attachment@example.invalid");
+      Assert.equal(header.subject, "Repair attachment error");
+      Assert.equal(header.storeToken, token);
+      Assert.equal(header.messageSize, raw.length);
+      Assert.equal(header.lineCount, 1);
+      Assert.equal(header.numReferences, 2);
+      Assert.equal(header.getStringReference(0), "first@example.invalid");
+      Assert.equal(header.getStringReference(1), "second@example.invalid");
+      Assert.equal(mailTestUtils.loadMessageToString(folder, header), raw);
+      Assert.deepEqual(await IOUtils.read(path), bytes);
+      Assert.equal(folder.id, id);
+      Assert.equal(folder.URI, uri);
+      Assert.ok(!folder.locked);
+    } finally {
+      if (installed) {
+        connection.executeSimpleSQL("DROP TRIGGER temp.repair_attach_fault");
+      }
+      connection.removeFunction("repair_attach_fault");
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_repairAttachErrorMbox() {
+    await checkRepairAttachError("mbox");
+  });
+  add_task(async function test_repairAttachErrorMaildir() {
+    await checkRepairAttachError("maildir");
+  });
+}

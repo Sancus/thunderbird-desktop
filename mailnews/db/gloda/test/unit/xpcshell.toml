@@ -8,6 +8,15 @@ prefs = ["gloda.loglevel=Debug"]
 
 ["test_corrupt_database.js"]
 
+["test_deliveryConversationBehavior.js"]
+prefs = [
+  "mail.panorama.enabled=false",
+  "mailnews.database.global.indexer.enabled=true",
+  "mailnews.database.global.indexer.perform_initial_sweep=false",
+  "security.storage.encryption.sqlite.enabled=false",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
 ["test_folder_logic.js"]
 
 ["test_fts3_tokenizer.js"]
@@ -74,6 +83,15 @@ requesttimeoutfactor = 2
 ["test_query_messages_imap_online_to_offline.js"]
 
 ["test_query_messages_local.js"]
+
+["test_searchBehavior.js"]
+prefs = [
+  "mail.panorama.enabled=false",
+  "mailnews.database.global.indexer.enabled=true",
+  "mailnews.database.global.indexer.perform_initial_sweep=false",
+  "security.storage.encryption.sqlite.enabled=false",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
 
 ["test_smime_mimemsg_representation.js"]
 

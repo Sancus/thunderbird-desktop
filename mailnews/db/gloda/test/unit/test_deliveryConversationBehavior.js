@@ -104,6 +104,22 @@ async function createConversation() {
 }
 
 /**
+ * Creates a singleton bound to its actual folder. slice retains empty source
+ * folders, but the per-folder tag/move/delete helpers pass every folder to native.
+ *
+ * @param {SyntheticMessageSet} thread - Existing injected fixture.
+ * @param {number} index - Message to select.
+ * @returns {SyntheticMessageSet} One message without empty folder groups.
+ */
+function singleMessage(thread, index) {
+  return new SyntheticMessageSet(
+    [thread.synMessages[index]],
+    thread.getMsgHdr(index).folder,
+    [0]
+  );
+}
+
+/**
  * Records collection callbacks and resolves when the initial query completes.
  * Callback records copy locations and metadata before later mutations.
  *
@@ -350,7 +366,7 @@ add_task(async function test_liveTagUpdate() {
   ];
   const observed = await observeConversation(headers[0]);
   assertMembers(observed.collection, headers);
-  const reply = thread.slice(1, 2);
+  const reply = singleMessage(thread, 1);
   reply.addTag("$label1");
   await waitForGlodaIndexer();
   Assert.ok(...assertExpectedMessagesIndexed([reply]));
@@ -376,7 +392,7 @@ add_task(async function test_liveMoveResolvesCurrentHeader() {
   const observed = await observeConversation(rootHeader);
   assertMembers(observed.collection, [rootHeader, oldReply, tailHeader]);
   const destination = await injection.makeEmptyFolder();
-  const reply = thread.slice(1, 2);
+  const reply = singleMessage(thread, 1);
   await injection.moveMessages(reply, destination, true);
   await waitForGlodaIndexer();
   Assert.ok(...assertExpectedMessagesIndexed([reply], { fullyIndexed: 0 }));
@@ -403,7 +419,7 @@ add_task(async function test_liveAncestorDeletion() {
   const removedLocation = location(rootHeader);
   const observed = await observeConversation(tailHeader);
   assertMembers(observed.collection, [rootHeader, replyHeader, tailHeader]);
-  const rootSet = thread.slice(0, 1);
+  const rootSet = singleMessage(thread, 0);
   await MessageInjection.deleteMessages(rootSet);
   await waitForGlodaIndexer();
   Assert.ok(...assertExpectedMessagesIndexed([], { deleted: [rootSet] }));

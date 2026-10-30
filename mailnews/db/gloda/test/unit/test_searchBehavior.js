@@ -10,18 +10,34 @@ const { MailServices } = ChromeUtils.importESModule(
 const { TestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/TestUtils.sys.mjs"
 );
-const { MessageGenerator } = ChromeUtils.importESModule(
+const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+);
+
+const { MessageInjection } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/MessageInjection.sys.mjs"
 );
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
+  Gloda: "resource:///modules/gloda/GlodaPublic.sys.mjs",
+  GlodaIndexer: "resource:///modules/gloda/GlodaIndexer.sys.mjs",
+  GlodaMsgIndexer: "resource:///modules/gloda/IndexMsg.sys.mjs",
   GlodaMsgSearcher: "resource:///modules/gloda/GlodaMsgSearcher.sys.mjs",
 });
 
 const messages = {};
 
 add_setup(async function () {
+  Assert.equal(Services.prefs.getBoolPref("mail.panorama.enabled"), false);
+  Assert.equal(
+    Components.manager
+      .QueryInterface(Ci.nsIComponentRegistrar)
+      .contractIDToCID("@mozilla.org/msgDatabase/msgDBService;1")
+      .toString(),
+    "{03223c50-1e88-45e8-ba1a-7ce792dc3fc3}",
+    "The behavior reference uses the legacy backend"
+  );
   const prefs = [
     "mailnews.database.global.indexer.enabled",
     "mailnews.database.global.indexer.perform_initial_sweep",
@@ -82,8 +98,15 @@ add_setup(async function () {
     Assert.equal(found.displayName, displayName);
   }
 
-  const { Gloda, GlodaIndexer, GlodaMsgIndexer } = lazy;
+  const Gloda = lazy.Gloda;
+  const GlodaIndexer = lazy.GlodaIndexer;
+  const GlodaMsgIndexer = lazy.GlodaMsgIndexer;
   const generator = new MessageGenerator();
+  const injection = new MessageInjection({ mode: "local" }, generator);
+  const { glodaTestHelperInitialize } = ChromeUtils.importESModule(
+    "resource://testing-common/gloda/GlodaTestHelper.sys.mjs"
+  );
+  glodaTestHelperInitialize(injection);
   const definitions = {
     subject: { subject: "subjectneedle" },
     body: { body: { body: "bodyneedle" } },
@@ -130,8 +153,9 @@ add_setup(async function () {
       ...options,
     }),
   ]);
-  folder.addMessageBatch(
-    synthetic.map(([, message]) => message.toMessageString())
+  await injection.addSetsToFolders(
+    [folder],
+    [new SyntheticMessageSet(synthetic.map(([, message]) => message))]
   );
   // Each Message-ID occurs once per folder; result identities include the folder.
   for (const [name, message] of synthetic) {
@@ -141,7 +165,10 @@ add_setup(async function () {
     Assert.ok(messages[name], "Created fixture " + name);
   }
   const duplicate = synthetic.find(([name]) => name == "duplicate")[1];
-  copyFolder.addMessage(duplicate.toMessageString());
+  await injection.addSetsToFolders(
+    [copyFolder],
+    [new SyntheticMessageSet([duplicate])]
+  );
   messages.duplicateCopy = [...copyFolder.messages][0];
   Assert.ok(messages.duplicateCopy, "Created the second physical copy");
   Assert.equal(messages.duplicate.messageId, messages.duplicateCopy.messageId);

@@ -13,9 +13,10 @@ const { FileUtils } = ChromeUtils.importESModule(
 const { MigrationJournal } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationJournal.sys.mjs"
 );
-const { createMigrationBackup } = ChromeUtils.importESModule(
-  "resource:///modules/panorama/MigrationBackup.sys.mjs"
-);
+const { createMigrationBackup, verifyMigrationBackup, stageMigrationRestore } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationBackup.sys.mjs"
+  );
 const { inspectMigrationRecovery, stageInterruptedMigrationRestore } =
   ChromeUtils.importESModule(
     "resource:///modules/panorama/MigrationRecovery.sys.mjs"
@@ -744,5 +745,258 @@ add_task(
     Assert.deepEqual((await IOUtils.getChildren(directory)).sort(), children);
     Assert.deepEqual(await IOUtils.read(markerPath), marker);
     Assert.deepEqual(await IOUtils.read(journalPath), journal);
+  }
+);
+
+/**
+ * Copies genuine legacy files into an otherwise idle locked profile and store.
+ *
+ * @returns {Promise<object>} Held profile, selected roots and original bytes.
+ */
+async function backupBoundaryInput() {
+  const input = await lockedProfile();
+  const mail = PathUtils.join(input.root, "external-mail");
+  await IOUtils.makeDirectory(mail);
+  const originals = new Map();
+  // createProfile writes this native metadata file before backup inventory.
+  const created = new FileUtils.File(
+    PathUtils.join(input.lock.directory.path, "times.json")
+  );
+  created.normalize();
+  originals.set(created.path, await IOUtils.read(created.path));
+  for (const root of [input.lock.directory.path, mail]) {
+    await IOUtils.makeDirectory(PathUtils.join(root, "empty"));
+    for (const [fixture, leaf] of [
+      ["data/migration.msf", "Inbox.msf"],
+      ["data/migration", "Inbox"],
+    ]) {
+      const path = PathUtils.join(root, leaf);
+      await IOUtils.copy(do_get_file(fixture).path, path);
+      const canonical = new FileUtils.File(path);
+      canonical.normalize();
+      originals.set(canonical.path, await IOUtils.read(path));
+    }
+  }
+  // Use a real harmless ancestor alias for the not-yet-created backup leaf.
+  const alias = input.root + "-alias";
+  const ln = Cc["@mozilla.org/process/util;1"].createInstance(Ci.nsIProcess);
+  ln.init(new FileUtils.File("/bin/ln"));
+  ln.run(true, ["-s", input.root, alias], 3);
+  Assert.equal(ln.exitValue, 0);
+  registerCleanupFunction(() => IOUtils.remove(alias));
+  return {
+    ...input,
+    profilePath: input.lock.directory.path,
+    mailPaths: [mail],
+    backupPath: PathUtils.join(alias, "backup"),
+    originals,
+  };
+}
+
+/**
+ * Kills the actual backup child after a completed file move or manifest flush.
+ * Reads the persisted manifest independently while the parent retains its lock.
+ *
+ * @param {object} input - Locked fresh profile and external-store input.
+ * @param {boolean} complete - Wait for the complete manifest instead of first move.
+ * @returns {Promise<object>} Persisted manifest and first installed file metadata.
+ */
+async function killBackupAfterWrite(input, complete) {
+  const { Subprocess } = ChromeUtils.importESModule(
+    "resource://gre/modules/Subprocess.sys.mjs"
+  );
+  const { TestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/TestUtils.sys.mjs"
+  );
+  const child = await Subprocess.call({
+    command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+    arguments: [
+      "-g",
+      Services.dirsvc.get("GreD", Ci.nsIFile).path,
+      "-a",
+      Services.dirsvc.get("XCurProcD", Ci.nsIFile).path,
+      "-e",
+      `const migrationBackupChildInput = ${JSON.stringify({
+        profilePath: input.profilePath,
+        mailPaths: input.mailPaths,
+        backupPath: input.backupPath,
+        complete,
+      })};`,
+      "-f",
+      do_get_file("data/migration-backup-child.js").path,
+    ],
+    stderr: "stdout",
+  });
+  let output = "";
+  let paused;
+  let readError;
+  const reader = (async () => {
+    try {
+      for (let chunk; (chunk = await child.stdout.readString()); ) {
+        output += chunk;
+        const lines = output.split("\n");
+        lines.pop();
+        const line = lines.find(value => value.startsWith("BACKUP-PAUSED "));
+        if (line) {
+          paused = JSON.parse(line.slice("BACKUP-PAUSED ".length));
+          return;
+        }
+      }
+      await child.wait();
+      throw new Error("Child exited before the backup boundary: " + output);
+    } catch (error) {
+      readError = error;
+    }
+  })();
+  try {
+    await TestUtils.waitForCondition(
+      () => paused || readError,
+      "Waiting for the real backup write before forced termination",
+      100,
+      300
+    );
+    if (readError) {
+      throw readError;
+    }
+    Assert.equal(child.exitCode, null, "The actual backup operation is paused");
+    const backup = new FileUtils.File(input.backupPath);
+    backup.normalize();
+    const manifestPath = PathUtils.join(backup.path, "manifest.json");
+    const manifest = await IOUtils.readJSON(manifestPath);
+    Assert.equal(manifest.complete, complete);
+    Assert.equal(manifest.roots.length, 2);
+    const root = manifest.roots[0];
+    const entry = root.entries.find(item => item.type == "regular");
+    const firstPath = PathUtils.join(
+      backup.path,
+      root.directory,
+      ...entry.parts
+    );
+    Assert.equal(paused.path, complete ? manifestPath : firstPath);
+    const bytes = await IOUtils.read(firstPath);
+    Assert.deepEqual(
+      bytes,
+      await IOUtils.read(PathUtils.join(root.source, ...entry.parts))
+    );
+    const info = await IOUtils.stat(firstPath);
+    Assert.ok(input.lock.directory.equals(input.profile.rootDir));
+    const { exitCode } = await child.kill(0);
+    Assert.equal(exitCode, -9, "Real SIGKILL at the persisted backup boundary");
+    return { manifest, manifestPath, firstPath, bytes, info };
+  } finally {
+    await child.kill(0);
+    await reader;
+  }
+}
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_killedIncompleteBackupResumesWithoutReplacingCopiedFile() {
+    const input = await backupBoundaryInput();
+    const saved = await killBackupAfterWrite(input, false);
+    await Assert.rejects(
+      verifyMigrationBackup(input.backupPath),
+      /Migration backup is incomplete or unsupported/
+    );
+    const { sinon } = ChromeUtils.importESModule(
+      "resource://testing-common/Sinon.sys.mjs"
+    );
+    const backupIO = Cu.getGlobalForObject(createMigrationBackup).IOUtils;
+    const move = sinon.spy(backupIO, "move");
+    let receipt;
+    try {
+      receipt = await createMigrationBackup(
+        input.profilePath,
+        input.mailPaths,
+        input.backupPath
+      );
+      const remaining = saved.manifest.roots.flatMap(root =>
+        root.entries
+          .filter(entry => entry.type == "regular")
+          .map(entry =>
+            PathUtils.join(
+              PathUtils.parent(saved.manifestPath),
+              root.directory,
+              ...entry.parts
+            )
+          )
+          .filter(path => path != saved.firstPath)
+      );
+      Assert.deepEqual(
+        move
+          .getCalls()
+          .map(call => call.args[1])
+          .sort(),
+        remaining.sort(),
+        "Retry moves every remaining file, never the completed first copy"
+      );
+    } finally {
+      move.restore();
+    }
+    Assert.deepEqual(await verifyMigrationBackup(input.backupPath), receipt);
+    const manifest = await IOUtils.readJSON(saved.manifestPath);
+    Assert.equal(manifest.complete, true);
+    Assert.deepEqual(manifest.roots, saved.manifest.roots);
+    Assert.deepEqual(await IOUtils.read(saved.firstPath), saved.bytes);
+    Assert.equal(
+      (await IOUtils.stat(saved.firstPath)).lastModified,
+      saved.info.lastModified,
+      "Retry verifies the installed file without replacing it"
+    );
+    for (const [path, bytes] of input.originals) {
+      Assert.deepEqual(await IOUtils.read(path), bytes);
+    }
+    Assert.ok(input.lock.directory.equals(input.profile.rootDir));
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_killedCompleteBackupReopensAndRestoresBothRoots() {
+    const input = await backupBoundaryInput();
+    const saved = await killBackupAfterWrite(input, true);
+    const manifestBytes = await IOUtils.read(saved.manifestPath);
+    const receipt = await verifyMigrationBackup(input.backupPath);
+    Assert.deepEqual(
+      await createMigrationBackup(
+        input.profilePath,
+        input.mailPaths,
+        input.backupPath
+      ),
+      receipt,
+      "A complete backup is verified, not replaced after restart"
+    );
+    const parent = PathUtils.join(input.root, "restore-staging");
+    await IOUtils.makeDirectory(parent);
+    const restored = await stageMigrationRestore(input.backupPath, parent);
+    Assert.equal(restored.roots.length, 2);
+    for (const root of restored.roots) {
+      for (const [original, bytes] of input.originals) {
+        if (PathUtils.parent(original) == root.original) {
+          Assert.deepEqual(
+            await IOUtils.read(
+              PathUtils.join(root.staged, PathUtils.filename(original))
+            ),
+            bytes
+          );
+        }
+      }
+      Assert.equal(
+        (await IOUtils.stat(PathUtils.join(root.staged, "empty"))).type,
+        "directory"
+      );
+      Assert.notEqual(root.staged, root.original);
+    }
+    Assert.deepEqual(await IOUtils.read(saved.manifestPath), manifestBytes);
+    for (const [path, bytes] of input.originals) {
+      Assert.deepEqual(await IOUtils.read(path), bytes);
+    }
+    Assert.ok(input.lock.directory.equals(input.profile.rootDir));
+    Assert.ok(
+      !(await IOUtils.exists(
+        PathUtils.join(input.profilePath, "panorama-profile.json")
+      )),
+      "Backup and fresh restore staging do not publish a migration selector"
+    );
   }
 );

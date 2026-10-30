@@ -207,6 +207,25 @@ add_task(async function test_malformedNearIsLiteralText() {
   await assertSyntaxSearch(syntaxFirst + " NEAR/no " + syntaxSecond, []);
 });
 
+add_task(async function test_embeddedQuotesKeepBothTerms() {
+  await assertSyntaxSearch(syntaxFirst + '""' + syntaxSecond, [
+    "adjacent",
+    "reversed",
+    "separated",
+  ]);
+  await assertSyntaxSearch('"' + syntaxFirst + '""' + syntaxSecond + '"', [
+    "adjacent",
+    "reversed",
+    "separated",
+  ]);
+});
+
+add_task(async function test_emptyAndShortOnlyQueries() {
+  for (const text of ["", " \t\u00a0 ", '""', "aa", "aa bb"]) {
+    await assertSyntaxSearch(text, []);
+  }
+});
+
 /**
  * Checks the physical membership returned by the public syntax search.
  *

@@ -3005,3 +3005,113 @@ add_task(function test_bulkReadPropagatesSourceReadFailure() {
   Assert.ok(db.containsKey(key));
   Assert.ok(!connection.transactionInProgress);
 });
+
+add_task(function test_fileMetadataKeepsPresenceWidthAndPhysicalIdentity() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("file-metadata");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("file-metadata-bystander");
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  const otherInfo = other.msgDatabase.dBFolderInfo;
+  const uri = folder.URI;
+  const before = info.GetTransferInfo();
+  Assert.ok(!before.hasKey("folderSize"));
+  Assert.ok(!before.hasKey("folderDate"));
+  Assert.equal(info.folderSize, 0);
+  Assert.equal(info.folderDate, 0);
+  Assert.ok(!info.GetTransferInfo().hasKey("folderSize"));
+  Assert.ok(!info.GetTransferInfo().hasKey("folderDate"));
+  otherInfo.folderSize = 27;
+  otherInfo.folderDate = 31;
+  for (const size of [
+    0,
+    -1,
+    0x100000005,
+    -0x100000005,
+    Number.MAX_SAFE_INTEGER,
+    -Number.MAX_SAFE_INTEGER,
+  ]) {
+    info.folderSize = size;
+    Assert.equal(info.folderSize, size);
+    Assert.equal(info.GetTransferInfo().getPropertyAsInt64("folderSize"), size);
+    Assert.equal(otherInfo.folderSize, 27);
+  }
+  for (const date of [0, 0x80000000, 0xffffffff, 1]) {
+    info.folderDate = date;
+    Assert.equal(info.folderDate, date);
+    Assert.equal(
+      info.GetTransferInfo().getPropertyAsUint32("folderDate"),
+      date
+    );
+    Assert.equal(otherInfo.folderDate, 31);
+  }
+  Assert.strictEqual(folder.parent, rootFolder);
+  Assert.equal(folder.URI, uri);
+  Assert.equal(info.numMessages, 0);
+  Assert.equal(info.numUnreadMessages, 0);
+  Assert.ok(info.GetTransferInfo().hasKey("folderSize"));
+  Assert.ok(info.GetTransferInfo().hasKey("folderDate"));
+  db.forceClosed();
+  const reopened = folder.msgDatabase;
+  Assert.notStrictEqual(reopened, db);
+  Assert.equal(reopened.dBFolderInfo.folderSize, -Number.MAX_SAFE_INTEGER);
+  Assert.equal(reopened.dBFolderInfo.folderDate, 1);
+});
+
+add_task(
+  function test_fileMetadataPreservesStorageErrorsAndCallerTransaction() {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("file-metadata-errors");
+    const db = folder.msgDatabase;
+    const info = db.dBFolderInfo;
+    const connection = database.connectionForTests;
+    info.folderSize = 123;
+    info.folderDate = 456;
+    connection.beginTransaction();
+    try {
+      info.folderSize = -789;
+      info.folderDate = 0xffffffff;
+      Assert.equal(info.folderSize, -789);
+      Assert.equal(info.folderDate, 0xffffffff);
+      Assert.ok(connection.transactionInProgress);
+    } finally {
+      connection.rollbackTransaction();
+    }
+    Assert.equal(info.folderSize, 123);
+    Assert.equal(info.folderDate, 456);
+    info.folderSize = 987;
+    connection.executeSimpleSQL(
+      "ALTER TABLE folder_properties RENAME TO unavailable_file_properties"
+    );
+    try {
+      for (const property of ["folderSize", "folderDate"]) {
+        Assert.throws(
+          () => info[property],
+          error => error.result === Cr.NS_ERROR_FAILURE
+        );
+        Assert.throws(
+          () => {
+            info[property] = 555;
+          },
+          error => error.result === Cr.NS_ERROR_FAILURE
+        );
+      }
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE unavailable_file_properties RENAME TO folder_properties"
+      );
+    }
+    Assert.equal(info.folderSize, 987);
+    Assert.equal(info.folderDate, 456);
+    Assert.ok(!connection.transactionInProgress);
+    db.forceClosed();
+    Assert.throws(() => info.folderSize, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => {
+      info.folderDate = 2;
+    }, /NS_ERROR_NOT_AVAILABLE/);
+  }
+);

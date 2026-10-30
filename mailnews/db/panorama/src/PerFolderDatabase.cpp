@@ -2180,16 +2180,32 @@ NS_IMETHODIMP FolderInfo::SetHighWater(nsMsgKey aHighWater) {
   return SetUint32Property("highWaterKey", aHighWater);
 }
 NS_IMETHODIMP FolderInfo::GetFolderSize(int64_t* aFolderSize) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aFolderSize);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  int64_t value = 0;
+  MOZ_TRY(GetInt64Property("folderSize", 0, &value));
+  *aFolderSize = value;
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetFolderSize(int64_t aFolderSize) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  return SetInt64Property("folderSize", aFolderSize);
 }
 NS_IMETHODIMP FolderInfo::GetFolderDate(uint32_t* aFolderDate) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(aFolderDate);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  uint32_t value = 0;
+  MOZ_TRY(GetUint32Property("folderDate", 0, &value));
+  *aFolderDate = value;
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetFolderDate(uint32_t aFolderDate) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  return SetUint32Property("folderDate", aFolderDate);
 }
 NS_IMETHODIMP FolderInfo::ChangeNumUnreadMessages(int32_t aDelta) {
   return mPerFolderDatabase->ChangeCount(true, aDelta);

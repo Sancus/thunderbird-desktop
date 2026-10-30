@@ -14,6 +14,7 @@ TEST_DIRS += [
 JAR_MANIFESTS += ["jar.mn"]
 
 EXTRA_JS_MODULES.panorama += [
+    "migration/LegacyGlodaChatReader.sys.mjs",
     "migration/LegacyGlodaMailReader.sys.mjs",
     "migration/MigrationBackup.sys.mjs",
     "migration/MigrationCoordinator.sys.mjs",

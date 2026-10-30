@@ -16,6 +16,8 @@ support-files = [
 ]
 tags = ["panorama"]
 
+["test_LegacyGlodaChatReader.js"]
+
 ["test_LegacyGlodaMailReader.js"]
 
 ["test_MigrationBookCoordinator.js"]

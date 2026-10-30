@@ -9,6 +9,8 @@ tags = ["panorama"]
 
 ["include:xpcshell-shared.toml"]
 
+["test_folderCopyCompletion.js"]
+
 ["test_localRetention.js"]
 
 ["test_mailStoreCompact.js"]

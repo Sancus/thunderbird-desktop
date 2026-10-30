@@ -60,6 +60,8 @@ class nsCopyRequest {
   bool m_isMoveOrDraftOrTemplate;
   bool m_allowUndo;
   bool m_processed;
+  // Queued sources may be premarked processed without starting this request.
+  bool m_started;
   uint32_t m_newMsgFlags;
   nsCString m_newMsgKeywords;
   nsCString m_dstFolderName;                  // used for copy folder.

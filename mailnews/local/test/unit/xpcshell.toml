@@ -24,6 +24,8 @@ tags = ["compact"]
 
 ["test_fileName.js"]
 
+["test_folderCopyCompletion.js"]
+
 ["test_folderLoaded.js"]
 
 ["test_folderParse.js"]

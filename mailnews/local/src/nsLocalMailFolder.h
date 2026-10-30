@@ -29,6 +29,8 @@
 #define COPY_BUFFER_SIZE 16384
 
 class nsParseMailMessageState;
+class LocalFolderCopy;
+class LocalMoveSourceListener;
 
 struct nsLocalMailCopyState {
   nsLocalMailCopyState();
@@ -66,6 +68,8 @@ struct nsLocalMailCopyState {
   bool m_allowUndo;
   bool m_writeFailed;
   nsresult m_copyError = NS_OK;
+  // Borrowed identity; the protocol URL owns the listener until settlement.
+  LocalMoveSourceListener* m_sourceDeleteListener = nullptr;
 #ifdef MOZ_PANORAMA
   bool m_finishAttempted = false;
   bool m_discardFailed = false;
@@ -189,6 +193,12 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
   NS_IMETHOD GetIncomingServerType(nsACString& serverType) override;
 
  protected:
+  friend class LocalFolderCopy;
+  friend class LocalMoveSourceListener;
+  nsresult CompleteMoveSource(LocalMoveSourceListener* listener,
+                              nsresult status);
+  nsresult CompleteCopy(nsISupports* source, nsresult status);
+
   virtual ~nsMsgLocalMailFolder();
   nsresult RenameSubFolders(nsIMsgWindow* msgWindow,
                             nsIMsgFolder* oldFolder) override;
@@ -266,6 +276,7 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
   nsresult DiscardCopyMessage();
 #endif
 
+  RefPtr<LocalFolderCopy> mFolderCopy;
   nsLocalMailCopyState* mCopyState;  // We only allow one of these at a time
   nsCString mType;
   bool mHaveReadNameFromDB;

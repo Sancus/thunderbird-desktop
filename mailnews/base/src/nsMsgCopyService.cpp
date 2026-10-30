@@ -40,6 +40,7 @@ nsCopyRequest::nsCopyRequest()
       m_isMoveOrDraftOrTemplate(false),
       m_allowUndo(false),
       m_processed(false),
+      m_started(false),
       m_newMsgFlags(0),
       mPendingRemoval(false) {
   MOZ_COUNT_CTOR(nsCopyRequest);
@@ -267,6 +268,7 @@ nsresult nsMsgCopyService::DoNextCopy() {
     }
   found:
     if (copyRequest && !copyRequest->m_processed) {
+      copyRequest->m_started = true;
       if (copyRequest->m_listener) copyRequest->m_listener->OnStartCopy();
       if (copyRequest->m_requestType == nsCopyMessagesType && copySource) {
         copySource->m_processed = true;
@@ -342,7 +344,7 @@ nsCopyRequest* nsMsgCopyService::FindRequest(nsISupports* aSupport,
                                              nsIMsgFolder* dstFolder) {
   nsCopyRequest* matchingRequest = nullptr;
   for (auto copyRequest : m_copyRequests) {
-    if (copyRequest->mPendingRemoval ||
+    if (!copyRequest->m_started || copyRequest->mPendingRemoval ||
         !SameCOMIdentity(copyRequest->m_srcSupport, aSupport)) {
       continue;
     }

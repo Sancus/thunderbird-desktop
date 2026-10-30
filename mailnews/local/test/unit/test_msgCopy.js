@@ -835,3 +835,548 @@ add_task(async function test_laterCopyFinishFailure() {
 add_task(async function test_laterMoveFinishFailure() {
   await checkCopyFinishFailure(true, 3);
 });
+
+/**
+ * Preserve a real IMAP source when the local EndMessage cannot finish its body.
+ *
+ * @param {boolean} isMove - Request a move instead of a copy.
+ * @returns {Promise<void>} Completes the request and restores owned paths.
+ */
+async function checkImapFinishFailure(isMove) {
+  const { IMAPPump, setupIMAPPump, teardownIMAPPump } =
+    ChromeUtils.importESModule(
+      "resource://testing-common/mailnews/IMAPpump.sys.mjs"
+    );
+  const { ImapMessage } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/Imapd.sys.mjs"
+  );
+  const accountKeys = new Set(
+    MailServices.accounts.accounts.map(account => account.key)
+  );
+  const prefs = [
+    "mail.serverDefaultStoreContractID",
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
+  const label = `imap-finish-${isMove ? "move" : "copy"}`;
+  let started = false;
+  try {
+    for (const { name } of prefs) {
+      Services.prefs.setCharPref(name, "@mozilla.org/msgstore/maildirstore;1");
+    }
+    localAccountUtils.loadLocalMailAccount();
+    const destination =
+      localAccountUtils.rootFolder.createLocalSubfolder(label);
+    Assert.equal(destination.msgStore.storeType, "maildir");
+    Assert.equal(destination.server.msgStore.storeType, "maildir");
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+      native
+    );
+    setupIMAPPump();
+    started = true;
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const inbox = root.getChildNamed("INBOX");
+    Assert.ok(inbox);
+    Assert.equal(inbox.parent, root);
+    Assert.equal(inbox.server, IMAPPump.incomingServer);
+    IMAPPump.inbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+    IMAPPump.incomingServer.setBoolValue("autosync_offline_stores", false);
+    const raw =
+      "From: sender@example.invalid\r\n" +
+      `Message-ID: <${label}@example.invalid>\r\n` +
+      `Subject: ${label}\r\n` +
+      "References: <first@example.invalid> <second@example.invalid>\r\n\r\n" +
+      "Exact retained IMAP Finish failure body.\r\n";
+    const file = do_get_profile();
+    file.append(`${label}.eml`);
+    await IOUtils.writeUTF8(file.path, raw);
+    const serverMessage = new ImapMessage(
+      Services.io.newFileURI(file).spec,
+      IMAPPump.mailbox.uidnext++,
+      ["\\Seen", "\\Flagged"]
+    );
+    IMAPPump.mailbox.addMessage(serverMessage);
+    const update = new PromiseTestUtils.PromiseUrlListener();
+    inbox.updateFolderWithListener(null, update);
+    await update.promise;
+    const source = inbox.msgDatabase.getMsgHdrForMessageID(
+      `${label}@example.invalid`
+    );
+    Assert.ok(source);
+    const original = {
+      key: source.messageKey,
+      flags: source.flags,
+      token: source.storeToken,
+      size: source.messageSize,
+      serverFlags: [...serverMessage.flags],
+    };
+    const uid = native
+      ? source.getUint32Property("uidOnServer")
+      : source.messageKey;
+    Assert.equal(uid, serverMessage.uid);
+    if (native) {
+      Assert.notEqual(source.messageKey, uid);
+    }
+    source.setStringProperty("finishFailureNote", "Retain this IMAP identity");
+    const cur = destination.filePath.clone();
+    cur.append("cur");
+    const held = destination.filePath.clone();
+    held.append("cur-before-failed-finish");
+    Assert.ok(cur.isDirectory());
+    Assert.ok(!held.exists());
+    let starts = 0;
+    let stops = 0;
+    let progress = 0;
+    let injected = false;
+    let injectionError;
+    let resolve;
+    const done = new Promise(callback => {
+      resolve = callback;
+    });
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+      onStartCopy() {
+        starts++;
+      },
+      onProgress() {
+        if (++progress != 1) {
+          return;
+        }
+        try {
+          // The single-message BeginCopy has opened its actual output stream.
+          cur.clone().moveTo(held.parent, held.leafName);
+          cur.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+          injected = true;
+        } catch (error) {
+          injectionError = error;
+        }
+      },
+      setMessageKey() {},
+      getMessageId() {
+        return "";
+      },
+      onStopCopy(status) {
+        stops++;
+        resolve(status);
+      },
+    };
+    let status;
+    try {
+      MailServices.copy.copyMessages(
+        inbox,
+        [source],
+        destination,
+        isMove,
+        listener,
+        null,
+        false
+      );
+      status = await done;
+    } finally {
+      if (held.exists()) {
+        Assert.ok(cur.isFile());
+        Assert.equal(cur.fileSize, 0);
+        cur.remove(false);
+        held.moveTo(destination.filePath, "cur");
+      }
+    }
+    Assert.equal(injectionError, undefined);
+    Assert.ok(injected, "The real IMAP destination Finish fault was reached");
+    Assert.equal(starts, 1);
+    Assert.equal(stops, 1);
+    Assert.equal(progress, 1);
+    Assert.equal(status, Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR);
+    Assert.deepEqual(inbox.msgDatabase.listAllKeys(), [original.key]);
+    const retained = inbox.msgDatabase.getMsgHdrForKey(original.key);
+    Assert.equal(retained.folder, inbox);
+    Assert.equal(retained.messageId, `${label}@example.invalid`);
+    Assert.equal(retained.storeToken, original.token);
+    Assert.equal(retained.messageSize, original.size);
+    Assert.equal(retained.flags, original.flags);
+    Assert.ok(retained.properties.includes("finishFailureNote"));
+    Assert.equal(
+      retained.getStringProperty("finishFailureNote"),
+      "Retain this IMAP identity"
+    );
+    Assert.equal(retained.numReferences, 2);
+    Assert.equal(retained.getStringReference(0), "first@example.invalid");
+    Assert.equal(retained.getStringReference(1), "second@example.invalid");
+    Assert.equal(
+      native ? retained.getUint32Property("uidOnServer") : retained.messageKey,
+      uid
+    );
+    Assert.ok(IMAPPump.mailbox._messages.includes(serverMessage));
+    Assert.deepEqual(serverMessage.flags, original.serverFlags);
+    Assert.ok(!serverMessage.flags.includes("\\Deleted"));
+    Assert.equal(await IOUtils.readUTF8(file.path), raw);
+    Assert.deepEqual(destination.msgDatabase.listAllKeys(), []);
+    const pending = await IOUtils.getChildren(
+      PathUtils.join(destination.filePath.path, "tmp")
+    );
+    Assert.equal(pending.length, 1);
+    const eol = AppConstants.platform == "win" ? "\r\n" : "\n";
+    const flags = (original.flags & ~Ci.nsMsgMessageFlags.RuntimeOnly & 0xffff)
+      .toString(16)
+      .padStart(4, "0");
+    const prefix =
+      `X-Mozilla-Status: ${flags}${eol}` +
+      `X-Mozilla-Status2: 00000000${eol}` +
+      `X-Mozilla-Keys: ${" ".repeat(80)}${eol}`;
+    Assert.equal(await IOUtils.readUTF8(pending[0]), prefix + raw);
+    Assert.ok(!destination.locked);
+    Assert.ok(!inbox.locked);
+  } finally {
+    try {
+      if (started) {
+        teardownIMAPPump();
+      }
+    } finally {
+      localAccountUtils.clearAll();
+      for (const account of MailServices.accounts.accounts) {
+        if (!accountKeys.has(account.key)) {
+          MailServices.accounts.removeAccount(account);
+        }
+      }
+      for (const { name, hadValue, value } of prefs) {
+        if (hadValue) {
+          Services.prefs.setCharPref(name, value);
+        } else {
+          Services.prefs.clearUserPref(name);
+        }
+      }
+    }
+  }
+}
+
+add_task(async function test_imapCopyFinishFailure() {
+  await checkImapFinishFailure(false);
+});
+add_task(async function test_imapMoveFinishFailure() {
+  await checkImapFinishFailure(true);
+});
+
+/**
+ * Wait for a real native IMAP source-delete reply after a finished local body.
+ *
+ * @param {string} storeType - Local mbox or maildir provider.
+ * @param {boolean} refuseStore - Whether the real server rejects its STORE.
+ * @param {boolean} [excludeMetadata=false] - Exclude priority, tags and junk score.
+ * @returns {Promise<void>} Resolves after terminal source/body identity checks.
+ */
+async function checkImapMoveSettlement(
+  storeType,
+  refuseStore,
+  excludeMetadata = false
+) {
+  const { IMAPPump, setupIMAPPump, teardownIMAPPump } =
+    ChromeUtils.importESModule(
+      "resource://testing-common/mailnews/IMAPpump.sys.mjs"
+    );
+  const { ImapMessage } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/Imapd.sys.mjs"
+  );
+  const accountKeys = new Set(
+    MailServices.accounts.accounts.map(account => account.key)
+  );
+  const prefs = [
+    "mail.serverDefaultStoreContractID",
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
+  const contract =
+    storeType == "mbox"
+      ? "@mozilla.org/msgstore/berkeleystore;1"
+      : "@mozilla.org/msgstore/maildirstore;1";
+  let started = false;
+  let restoreStore;
+  const propertyPref = "mailnews.database.summary.dontPreserveOnMove";
+  const oldProperties = {
+    hadValue: Services.prefs.prefHasUserValue(propertyPref),
+    value: Services.prefs.getCharPref(propertyPref, ""),
+  };
+  try {
+    if (excludeMetadata) {
+      Services.prefs.setCharPref(
+        propertyPref,
+        oldProperties.value + " priority keywords junkscore"
+      );
+    }
+    for (const { name } of prefs) {
+      Services.prefs.setCharPref(name, contract);
+    }
+    localAccountUtils.loadLocalMailAccount();
+    const database = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.ok(database instanceof Ci.nsIDatabaseCore);
+    const destination = localAccountUtils.rootFolder.createLocalSubfolder(
+      "native-move-settlement"
+    );
+    Assert.equal(destination.msgStore.storeType, storeType);
+    Assert.equal(destination.server.msgStore.storeType, storeType);
+    setupIMAPPump();
+    started = true;
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const inbox = root.getChildNamed("INBOX");
+    Assert.ok(inbox);
+    Assert.equal(inbox.parent, root);
+    Assert.equal(inbox.server, IMAPPump.incomingServer);
+    IMAPPump.inbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+    IMAPPump.incomingServer.setBoolValue("autosync_offline_stores", false);
+    const raw =
+      "From: sender@example.invalid\r\n" +
+      "Subject: Native IMAP move settlement\r\n" +
+      "Message-ID: <native-move-settlement@example.invalid>\r\n" +
+      "References: <first@example.invalid> <second@example.invalid>\r\n\r\n" +
+      "Exact retained IMAP move settlement body.\r\n";
+    const file = do_get_profile();
+    file.append(`native-move-settlement-${storeType}.eml`);
+    await IOUtils.writeUTF8(file.path, raw);
+    const serverMessage = new ImapMessage(
+      Services.io.newFileURI(file).spec,
+      IMAPPump.mailbox.uidnext++,
+      ["\\Seen", "\\Flagged"]
+    );
+    IMAPPump.mailbox.addMessage(serverMessage);
+    const update = new PromiseTestUtils.PromiseUrlListener();
+    inbox.updateFolderWithListener(null, update);
+    await update.promise;
+    const source = inbox.msgDatabase.getMsgHdrForMessageID(
+      "native-move-settlement@example.invalid"
+    );
+    const messageId = source.messageId;
+    source.priority = Ci.nsMsgPriority.high;
+    source.setStringProperty("keywords", "first-tag second-tag");
+    source.setStringProperty("junkscore", "73");
+    const key = source.messageKey;
+    const flags = source.flags;
+    const token = source.storeToken;
+    const size = source.messageSize;
+    const uid = source.getUint32Property("uidOnServer");
+    Assert.equal(uid, serverMessage.uid);
+    Assert.notEqual(key, uid);
+    source.setStringProperty("copyErrorProperty", "exact retained value");
+    const stops = [];
+    let sourceKeysAtStop;
+    let wire;
+    let deleteCommands = 0;
+    let resolveDeleteCommand;
+    const deleteCommand = new Promise(resolve => {
+      resolveDeleteCommand = resolve;
+    });
+    const copied = new PromiseTestUtils.PromiseCopyListener({
+      onStopCopy(status) {
+        stops.push(status);
+        sourceKeysAtStop = inbox.msgDatabase.listAllKeys();
+      },
+    });
+    const connections = IMAPPump.daemon.getConnections("INBOX");
+    Assert.equal(connections.length, 1);
+    const connection = connections[0];
+    const hadStore = Object.hasOwn(connection, "STORE");
+    const originalStore = connection.STORE;
+    restoreStore = () => {
+      if (hadStore) {
+        connection.STORE = originalStore;
+      } else {
+        delete connection.STORE;
+      }
+    };
+    connection.STORE = function (args, isUid) {
+      const commandFlags = Array.isArray(args[2]) ? args[2] : [args[2]];
+      if (commandFlags.includes("\\Deleted")) {
+        deleteCommands++;
+        wire = {
+          isUid,
+          uid: args[0],
+          stops: stops.length,
+          destinationKeys: destination.msgDatabase.listAllKeys(),
+        };
+        resolveDeleteCommand();
+        if (refuseStore) {
+          return "NO Source deletion refused by ordinary fixture";
+        }
+      }
+      return originalStore.call(this, args, isUid);
+    };
+    MailServices.copy.copyMessages(
+      inbox,
+      [source],
+      destination,
+      true,
+      copied,
+      null,
+      false
+    );
+    if (refuseStore) {
+      await Assert.rejects(
+        copied.promise,
+        error => Number(error.message) === Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED
+      );
+    } else {
+      await copied.promise;
+    }
+    await deleteCommand;
+    Assert.equal(deleteCommands, 1);
+    Assert.equal(wire.isUid, true);
+    Assert.equal(String(wire.uid), String(uid));
+    Assert.equal(
+      wire.stops,
+      0,
+      "Copy completion waits for the actual source STORE reply"
+    );
+    Assert.equal(
+      wire.destinationKeys.length,
+      1,
+      "The destination is published before source retirement"
+    );
+    const expectedStatus = refuseStore
+      ? Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED
+      : Cr.NS_OK;
+    Assert.deepEqual(stops, [expectedStatus]);
+    Assert.deepEqual(sourceKeysAtStop, refuseStore ? [key] : []);
+    if (refuseStore) {
+      Assert.deepEqual(inbox.msgDatabase.listAllKeys(), [key]);
+      const retained = inbox.msgDatabase.getMsgHdrForKey(key);
+      Assert.equal(retained.storeToken, token);
+      Assert.equal(retained.priority, Ci.nsMsgPriority.high);
+      Assert.equal(
+        retained.getStringProperty("keywords"),
+        "first-tag second-tag"
+      );
+      Assert.equal(retained.getStringProperty("junkscore"), "73");
+      Assert.equal(retained.flags, flags);
+      Assert.equal(retained.messageSize, size);
+      Assert.equal(retained.getUint32Property("uidOnServer"), uid);
+      Assert.equal(
+        retained.getStringProperty("copyErrorProperty"),
+        "exact retained value"
+      );
+      Assert.ok(!serverMessage.flags.includes("\\Deleted"));
+      Assert.equal(await IOUtils.readUTF8(file.path), raw);
+    } else {
+      Assert.deepEqual(inbox.msgDatabase.listAllKeys(), []);
+      Assert.ok(serverMessage.flags.includes("\\Deleted"));
+      Assert.equal(await IOUtils.readUTF8(file.path), raw);
+    }
+    const keys = destination.msgDatabase.listAllKeys();
+    Assert.equal(keys.length, 1);
+    const finished = destination.msgDatabase.getMsgHdrForKey(keys[0]);
+    Assert.notEqual(finished.messageKey, key);
+    Assert.equal(finished.messageId, messageId);
+    Assert.equal(
+      finished.priority,
+      excludeMetadata ? Ci.nsMsgPriority.none : Ci.nsMsgPriority.high
+    );
+    Assert.equal(
+      finished.getStringProperty("keywords"),
+      excludeMetadata ? "" : "first-tag second-tag"
+    );
+    Assert.equal(
+      finished.getStringProperty("junkscore"),
+      excludeMetadata ? "" : "73"
+    );
+    if (excludeMetadata) {
+      Assert.ok(!finished.properties.includes("keywords"));
+      Assert.ok(!finished.properties.includes("junkscore"));
+    }
+    Assert.deepEqual(keys, wire.destinationKeys);
+    Assert.equal(finished.flags, flags & ~Ci.nsMsgMessageFlags.Offline);
+    Assert.equal(
+      finished.getStringProperty("copyErrorProperty"),
+      "exact retained value"
+    );
+    Assert.equal(finished.numReferences, 2);
+    Assert.equal(finished.getStringReference(0), "first@example.invalid");
+    Assert.equal(finished.getStringReference(1), "second@example.invalid");
+    Assert.notEqual(finished.storeToken, ""); // A zero mbox token is valid.
+    const body = mailTestUtils.loadMessageToString(destination, finished);
+    // WriteStartOfNewMessage uses MSG_LINEBREAK and the exact 80-space blank
+    // from nsMsgLocalFolderHdrs.h; the IMAP body itself uses canonical CRLF.
+    const eol = AppConstants.platform == "win" ? "\r\n" : "\n";
+    const storedFlags = (flags & ~Ci.nsMsgMessageFlags.RuntimeOnly & 0xffff)
+      .toString(16)
+      .padStart(4, "0");
+    const prefix =
+      `X-Mozilla-Status: ${storedFlags}${eol}` +
+      `X-Mozilla-Status2: 00000000${eol}` +
+      `X-Mozilla-Keys: ${" ".repeat(80)}${eol}`;
+    Assert.equal(body, prefix + raw);
+    Assert.equal(finished.messageSize, body.length);
+    const path =
+      storeType == "mbox"
+        ? destination.filePath.path
+        : PathUtils.join(destination.filePath.path, "cur", finished.storeToken);
+    const bytes = await IOUtils.read(path);
+    Assert.greater(bytes.length, 0);
+    Assert.ok(!destination.locked);
+    Assert.ok(!inbox.locked);
+  } finally {
+    restoreStore?.();
+    try {
+      if (started) {
+        teardownIMAPPump();
+      }
+    } finally {
+      localAccountUtils.clearAll();
+      for (const account of MailServices.accounts.accounts) {
+        if (!accountKeys.has(account.key)) {
+          MailServices.accounts.removeAccount(account);
+        }
+      }
+      if (oldProperties.hadValue) {
+        Services.prefs.setCharPref(propertyPref, oldProperties.value);
+      } else {
+        Services.prefs.clearUserPref(propertyPref);
+      }
+      for (const { name, hadValue, value } of prefs) {
+        if (hadValue) {
+          Services.prefs.setCharPref(name, value);
+        } else {
+          Services.prefs.clearUserPref(name);
+        }
+      }
+    }
+  }
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_imapMoveWaitsForSourceMbox() {
+    await checkImapMoveSettlement("mbox", false);
+  });
+  add_task(async function test_imapMoveWaitsForSourceMaildir() {
+    await checkImapMoveSettlement("maildir", false);
+  });
+  add_task(async function test_imapMoveSourceErrorMbox() {
+    await checkImapMoveSettlement("mbox", true);
+  });
+  add_task(async function test_imapMoveSourceErrorMaildir() {
+    await checkImapMoveSettlement("maildir", true);
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_imapMoveExcludesMetadataMbox() {
+    await checkImapMoveSettlement("mbox", false, true);
+  });
+  add_task(async function test_imapMoveExcludesMetadataMaildir() {
+    await checkImapMoveSettlement("maildir", false, true);
+  });
+}

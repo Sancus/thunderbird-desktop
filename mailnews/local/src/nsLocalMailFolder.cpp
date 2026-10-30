@@ -35,6 +35,7 @@
 #include "nsIPop3IncomingServer.h"
 #include "nsILocalMailIncomingServer.h"
 #include "nsIMsgIncomingServer.h"
+#include "nsIMsgImapMailFolder.h"
 #include "nsIFeedbackService.h"
 #include "nsString.h"
 #include "nsIMsgFolderCacheElement.h"
@@ -60,6 +61,7 @@
 #include "mozilla/UniquePtr.h"
 #include "StoreIndexer.h"
 #include "nsIPropertyBag2.h"
+#include "nsThreadUtils.h"
 
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
@@ -90,6 +92,191 @@ constexpr std::array<std::pair<nsLiteralCString, unsigned>, 8> kDefaultFolders{
     std::make_pair("Junk"_ns, nsMsgFolderFlags::Junk),
     std::make_pair("Archives"_ns, nsMsgFolderFlags::Archive),
 };
+
+// A folder request completes after its messages and each child request settle.
+// Child requests use the existing copy service/listener; no launch is success.
+class LocalFolderCopy final : public nsIMsgCopyServiceListener {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMSGCOPYSERVICELISTENER
+
+  LocalFolderCopy(nsIMsgFolder* source, nsMsgLocalMailFolder* destination,
+                  nsIMsgFolder* destinationParent,
+                  nsTArray<RefPtr<nsIMsgFolder>>&& children,
+                  nsIMsgWindow* window, nsIMsgCopyServiceListener* listener,
+                  bool isMove)
+      : mSource(source),
+        mDestination(destination),
+        mParent(destinationParent),
+        mChildren(std::move(children)),
+        mWindow(window),
+        mListener(listener),
+        mIsMove(isMove) {}
+
+  void AdoptSemaphore() { mHoldingSemaphore = true; }
+
+  nsresult MessagesCopied(nsresult status) {
+    RefPtr<LocalFolderCopy> self(this);
+    if (mDone) {
+      return NS_OK;
+    }
+    if (NS_FAILED(status)) {
+      return Finish(status);
+    }
+    if (!mHoldingSemaphore) {
+      nsresult rv = mDestination->AcquireSemaphore(
+          static_cast<nsIMsgLocalMailFolder*>(mDestination.get()),
+          "LocalFolderCopy::MessagesCopied"_ns);
+      if (NS_FAILED(rv)) {
+        return Finish(rv);
+      }
+      mHoldingSemaphore = true;
+    }
+    return CopyNextChild();
+  }
+
+ private:
+  ~LocalFolderCopy() = default;
+
+  nsresult Finish(nsresult status) {
+    if (mDone) {
+      return NS_OK;
+    }
+    mDone = true;
+    mChildren.Clear();
+    nsCOMPtr<nsIMsgFolder> parent;
+    nsresult parentStatus = mDestination->GetParent(getter_AddRefs(parent));
+    bool arrived = NS_SUCCEEDED(parentStatus) && parent == mParent;
+    if (NS_SUCCEEDED(status) && !arrived) {
+      status = NS_FAILED(parentStatus) ? parentStatus : NS_ERROR_NOT_AVAILABLE;
+    }
+    if (mHoldingSemaphore) {
+      nsresult rv = mDestination->ReleaseSemaphore(
+          static_cast<nsIMsgLocalMailFolder*>(mDestination.get()),
+          "LocalFolderCopy::Finish"_ns);
+      mHoldingSemaphore = false;
+      if (NS_SUCCEEDED(status) && NS_FAILED(rv)) {
+        status = rv;
+      }
+    }
+    nsCOMPtr<nsIMsgCopyService> service = mozilla::components::Copy::Service();
+    // An error must still clear the original request if an observer detached
+    // the arrived wrapper. Do not resolve it through that wrapper's parent.
+    nsIMsgFolder* completionFolder =
+        arrived ? mDestination.get() : mParent.get();
+    return service->NotifyCompletion(mSource, completionFolder, status);
+  }
+
+  nsresult CopyNextChild() {
+    RefPtr<LocalFolderCopy> self(this);
+    if (mDone || mWaitingForChild) {
+      return NS_OK;
+    }
+    if (NS_FAILED(mChildStatus)) {
+      return Finish(mChildStatus);
+    }
+    nsCOMPtr<nsIMsgCopyService> service = mozilla::components::Copy::Service();
+    while (mNextChild < mChildren.Length()) {
+      RefPtr<nsIMsgFolder> child = mChildren[mNextChild++];
+      mWaitingForChild = true;
+      mStartingChild = true;
+      nsresult rv =
+          service->CopyFolder(child, mDestination, mIsMove, this, mWindow);
+      mStartingChild = false;
+      if (NS_FAILED(rv) && NS_SUCCEEDED(mChildStatus)) {
+        mChildStatus = rv;
+      }
+      if (NS_FAILED(mChildStatus)) {
+        return Finish(mChildStatus);
+      }
+      if (mWaitingForChild) {
+        return NS_OK;
+      }
+    }
+    return Finish(NS_OK);
+  }
+
+  nsCOMPtr<nsIMsgFolder> mSource;
+  RefPtr<nsMsgLocalMailFolder> mDestination;
+  nsCOMPtr<nsIMsgFolder> mParent;
+  nsTArray<RefPtr<nsIMsgFolder>> mChildren;
+  nsCOMPtr<nsIMsgWindow> mWindow;
+  nsCOMPtr<nsIMsgCopyServiceListener> mListener;
+  uint32_t mNextChild = 0;
+  nsresult mChildStatus = NS_OK;
+  bool mIsMove;
+  bool mWaitingForChild = false;
+  bool mStartingChild = false;
+  bool mDone = false;
+  bool mHoldingSemaphore = false;
+};
+
+NS_IMPL_ISUPPORTS(LocalFolderCopy, nsIMsgCopyServiceListener)
+
+NS_IMETHODIMP LocalFolderCopy::OnStartCopy() { return NS_OK; }
+NS_IMETHODIMP LocalFolderCopy::OnProgress(uint32_t progress, uint32_t maximum) {
+  return mListener ? mListener->OnProgress(progress, maximum) : NS_OK;
+}
+NS_IMETHODIMP LocalFolderCopy::SetMessageKey(nsMsgKey key) { return NS_OK; }
+NS_IMETHODIMP LocalFolderCopy::GetMessageId(nsACString& messageId) {
+  messageId.Truncate();
+  return NS_OK;
+}
+NS_IMETHODIMP LocalFolderCopy::OnStopCopy(nsresult status) {
+  RefPtr<LocalFolderCopy> self(this);
+  if (mDone || !mWaitingForChild) {
+    return NS_OK;
+  }
+  mWaitingForChild = false;
+  if (NS_FAILED(status) && NS_SUCCEEDED(mChildStatus)) {
+    mChildStatus = status;
+  }
+  if (mStartingChild) {
+    return NS_OK;
+  }
+  // Let the copy service remove the completed child request before the next
+  // child (or the parent completion) re-enters that service.
+  nsresult rv = NS_DispatchToCurrentThread(NS_NewRunnableFunction(
+      "LocalFolderCopy::CopyNextChild", [self] { self->CopyNextChild(); }));
+  return NS_FAILED(rv) ? Finish(rv) : NS_OK;
+}
+
+// Native IMAP deletion reports its checked URL/SQL outcome through this
+// existing listener only after the destination messages have finished.
+class LocalMoveSourceListener final : public nsIMsgCopyServiceListener {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMSGCOPYSERVICELISTENER
+
+  explicit LocalMoveSourceListener(nsMsgLocalMailFolder* destination)
+      : mDestination(destination) {}
+
+ private:
+  ~LocalMoveSourceListener() = default;
+  RefPtr<nsMsgLocalMailFolder> mDestination;
+  bool mCompleted = false;
+};
+
+NS_IMPL_ISUPPORTS(LocalMoveSourceListener, nsIMsgCopyServiceListener)
+NS_IMETHODIMP LocalMoveSourceListener::OnStartCopy() { return NS_OK; }
+NS_IMETHODIMP LocalMoveSourceListener::OnProgress(uint32_t progress,
+                                                  uint32_t maximum) {
+  return NS_OK;
+}
+NS_IMETHODIMP LocalMoveSourceListener::SetMessageKey(nsMsgKey key) {
+  return NS_OK;
+}
+NS_IMETHODIMP LocalMoveSourceListener::GetMessageId(nsACString& messageId) {
+  messageId.Truncate();
+  return NS_OK;
+}
+NS_IMETHODIMP LocalMoveSourceListener::OnStopCopy(nsresult status) {
+  if (mCompleted) {
+    return NS_OK;
+  }
+  mCompleted = true;
+  return mDestination->CompleteMoveSource(this, status);
+}
 
 nsLocalMailCopyState::nsLocalMailCopyState()
     : m_flags(0),
@@ -1580,7 +1767,12 @@ NS_IMETHODIMP nsMsgLocalMailFolder::OnAnnouncerGoingAway(
 NS_IMETHODIMP
 nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
                                       bool moveCopySucceeded) {
-  nsresult copyStatus = moveCopySucceeded ? NS_OK : NS_ERROR_FAILURE;
+  return CompleteCopy(srcSupport, moveCopySucceeded ? NS_OK : NS_ERROR_FAILURE);
+}
+
+nsresult nsMsgLocalMailFolder::CompleteCopy(nsISupports* srcSupport,
+                                            nsresult copyStatus) {
+  bool moveCopySucceeded = NS_SUCCEEDED(copyStatus);
   if (mCopyState && NS_FAILED(mCopyState->m_copyError)) {
     moveCopySucceeded = false;
     copyStatus = mCopyState->m_copyError;
@@ -1602,9 +1794,15 @@ nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
   bool haveSemaphore;
   nsresult rv =
       TestSemaphore(static_cast<nsIMsgLocalMailFolder*>(this), &haveSemaphore);
-  if (NS_SUCCEEDED(rv) && haveSemaphore)
-    ReleaseSemaphore(static_cast<nsIMsgLocalMailFolder*>(this),
-                     "nsMsgLocalMailFolder::OnCopyCompleted"_ns);
+  if (NS_SUCCEEDED(rv) && haveSemaphore) {
+    if (mFolderCopy) {
+      // Keep the arrived root stable until all child requests settle.
+      mFolderCopy->AdoptSemaphore();
+    } else {
+      ReleaseSemaphore(static_cast<nsIMsgLocalMailFolder*>(this),
+                       "nsMsgLocalMailFolder::OnCopyCompleted"_ns);
+    }
+  }
 
   if (mCopyState && !mCopyState->m_newMsgKeywords.IsEmpty() &&
       mCopyState->m_newHdr
@@ -1623,6 +1821,10 @@ nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
 
   delete mCopyState;
   mCopyState = nullptr;
+  RefPtr<LocalFolderCopy> folderCopy = std::move(mFolderCopy);
+  if (folderCopy) {
+    return folderCopy->MessagesCopied(copyStatus);
+  }
   nsCOMPtr<nsIMsgCopyService> copyService =
       mozilla::components::Copy::Service();
   return copyService->NotifyCompletion(srcSupport, this, copyStatus);
@@ -1695,6 +1897,9 @@ nsMsgLocalMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
         // the original error without disturbing another request's copy state.
         nsCOMPtr<nsIMsgCopyService> copyService =
             mozilla::components::Copy::Service();
+        if (mFolderCopy) {
+          return CompleteCopy(srcSupport, rv);
+        }
         return copyService->NotifyCompletion(srcSupport, this, rv);
       }
     } else
@@ -1876,50 +2081,61 @@ nsresult nsMsgLocalMailFolder::CopyFolderAcrossServer(
   mInitialized = true;
 
   nsAutoCString folderName;
-  srcFolder->GetName(folderName);
-
-  nsCOMPtr<nsIMsgFolder> newMsgFolder;
-  nsresult rv = CreateSubfolderInternal(folderName, msgWindow,
-                                        getter_AddRefs(newMsgFolder));
+  nsresult rv = srcFolder->GetName(folderName);
   NS_ENSURE_SUCCESS(rv, rv);
 
+  nsCOMPtr<nsIMsgFolder> destination;
+  rv = CreateSubfolderInternal(folderName, msgWindow,
+                               getter_AddRefs(destination));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsTArray<RefPtr<nsIMsgFolder>> children;
+  rv = srcFolder->GetSubFolders(children);
+  NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIMsgEnumerator> messages;
   rv = srcFolder->GetMessages(getter_AddRefs(messages));
   NS_ENSURE_SUCCESS(rv, rv);
-
-  nsTArray<RefPtr<nsIMsgDBHdr>> msgArray;
-  bool hasMoreElements = false;
-
-  if (messages) rv = messages->HasMoreElements(&hasMoreElements);
-
-  while (NS_SUCCEEDED(rv) && hasMoreElements) {
-    nsCOMPtr<nsIMsgDBHdr> msg;
-    rv = messages->GetNext(getter_AddRefs(msg));
+  nsTArray<RefPtr<nsIMsgDBHdr>> headers;
+  bool more = false;
+  if (messages) {
+    rv = messages->HasMoreElements(&more);
     NS_ENSURE_SUCCESS(rv, rv);
-
-    msgArray.AppendElement(msg);
-    rv = messages->HasMoreElements(&hasMoreElements);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-
-  if (msgArray.Length() > 0)  // if only srcFolder has messages..
-    // Allow move of copied messages but keep source folder in place.
-    newMsgFolder->CopyMessages(srcFolder, msgArray, moveMsgs, msgWindow,
-                               listener, true /* is folder*/,
-                               false /* allowUndo */);
-  else {
-    nsCOMPtr<nsIMsgLocalMailFolder> localFolder =
-        do_QueryInterface(newMsgFolder);
-    if (localFolder) {
-      // normally these would get called from ::EndCopy when the last message
-      // was finished copying. But since there are no messages, we have to call
-      // them explicitly.
-      nsCOMPtr<nsISupports> srcSupports = do_QueryInterface(srcFolder);
-      localFolder->CopyAllSubFolders(srcFolder, msgWindow, listener, moveMsgs);
-      return localFolder->OnCopyCompleted(srcSupports, true);
+    while (more) {
+      nsCOMPtr<nsIMsgDBHdr> header;
+      rv = messages->GetNext(getter_AddRefs(header));
+      NS_ENSURE_SUCCESS(rv, rv);
+      headers.AppendElement(header);
+      rv = messages->HasMoreElements(&more);
+      NS_ENSURE_SUCCESS(rv, rv);
     }
   }
-  return NS_OK;  // otherwise the front-end will say Exception::CopyFolder
+
+  RefPtr<nsMsgLocalMailFolder> localDestination =
+      static_cast<nsMsgLocalMailFolder*>(destination.get());
+  // Folder-added observers can re-enter and start a write into the new folder.
+  // Do not attach this operation to, or clear, that other copy's state.
+  bool locked = false;
+  rv = localDestination->GetLocked(&locked);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (locked || localDestination->mCopyState || localDestination->mFolderCopy) {
+    return NS_MSG_FOLDER_BUSY;
+  }
+  RefPtr<LocalFolderCopy> operation =
+      new LocalFolderCopy(srcFolder, localDestination, this,
+                          std::move(children), msgWindow, listener, moveMsgs);
+  if (headers.IsEmpty()) {
+    return operation->MessagesCopied(NS_OK);
+  }
+  localDestination->mFolderCopy = operation;
+  // Keep the existing folder-message path, including per-message Finish and
+  // source retirement. Its completion advances the subtree instead of
+  // completing the root request while child copies are still outstanding.
+  rv = localDestination->CopyMessages(srcFolder, headers, moveMsgs, msgWindow,
+                                      listener, true, false);
+  if (NS_FAILED(rv) && localDestination->mFolderCopy == operation) {
+    (void)localDestination->CompleteCopy(srcFolder, rv);
+  }
+  return rv;
 }
 
 nsresult  // copy the sub folders
@@ -2735,6 +2951,26 @@ nsresult nsMsgLocalMailFolder::CompleteCopyMessage(nsIMsgDBHdr** liveHdr) {
                                : "mailnews.database.summary.dontPreserveOnCopy",
           excluded);
       MOZ_TRY(CopyLocalHdrProperties(draft, mCopyState->m_message, excluded));
+      // Priority and logical tags are not arbitrary native properties. Keep
+      // current user metadata on the detached parser header before Finish.
+      nsCString exclusions(" "_ns);
+      exclusions.Append(excluded);
+      exclusions.Append(' ');
+      if (exclusions.Find(" priority ") == kNotFound) {
+        nsMsgPriorityValue priority;
+        MOZ_TRY(mCopyState->m_message->GetPriority(&priority));
+        MOZ_TRY(draft->SetPriority(priority));
+      }
+      nsTArray<nsCString> properties;
+      MOZ_TRY(mCopyState->m_message->GetProperties(properties));
+      if (exclusions.Find(" keywords ") == kNotFound &&
+          !properties.Contains("keywords"_ns)) {
+        nsAutoCString keywords;
+        MOZ_TRY(mCopyState->m_message->GetStringProperty("keywords", keywords));
+        if (!keywords.IsEmpty()) {
+          MOZ_TRY(draft->SetStringProperty("keywords", keywords));
+        }
+      }
     } else {
       carryOver |= nsMsgMessageFlags::Marked;
     }
@@ -3139,7 +3375,7 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
     if (multipleCopiesFinished) {
       nsCOMPtr<nsIMsgFolder> srcFolder;
       srcFolder = do_QueryInterface(mCopyState->m_srcSupport);
-      if (mCopyState->m_isFolder) {
+      if (mCopyState->m_isFolder && !mFolderCopy) {
         // Copy or move all subfolders then notify completion
         CopyAllSubFolders(srcFolder, nullptr, nullptr, mCopyState->m_isMove);
       }
@@ -3187,6 +3423,10 @@ MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
 nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
   nsresult rv;
   if (!mCopyState) return NS_OK;
+  if (mCopyState->m_sourceDeleteListener && moveSucceeded &&
+      !mCopyState->m_writeFailed) {
+    return NS_OK;
+  }
 
   if (!moveSucceeded || mCopyState->m_writeFailed) {
     // Notify that a completion finished.
@@ -3226,48 +3466,77 @@ nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
         }
       }
     }
+#ifdef MOZ_PANORAMA
+    nsCOMPtr<nsIMsgImapMailFolder> imapSource = do_QueryInterface(srcFolder);
+    if (mail_panorama_enabled_AtStartup() && imapSource) {
+      RefPtr<LocalMoveSourceListener> completion =
+          new LocalMoveSourceListener(this);
+      mCopyState->m_sourceDeleteListener = completion.get();
+      rv = srcFolder->DeleteMessages(mCopyState->m_messages,
+                                     mCopyState->m_msgWindow, true, true,
+                                     completion, mCopyState->m_allowUndo);
+      // The native implementation may reject before launching its URL, or
+      // complete reentrantly. The same listener settles either case once.
+      if (NS_FAILED(rv)) {
+        (void)completion->OnStopCopy(rv);
+      }
+      return NS_OK;
+    }
+#endif
     // lets delete these all at once - much faster that way
     rv = srcFolder->DeleteMessages(mCopyState->m_messages,
                                    mCopyState->m_msgWindow, true, true, nullptr,
                                    mCopyState->m_allowUndo);
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv)) {
-      if (NS_SUCCEEDED(mCopyState->m_copyError)) {
-        mCopyState->m_copyError = rv;
-      }
-      mCopyState->m_writeFailed = true;
-    }
-#endif
-    AutoCompact(mCopyState->m_msgWindow);
-
-    // enable the dest folder
-    EnableNotifications(allMessageCountNotifications, true);
-    // I'm not too sure of the proper location of this event. It seems to need
-    // to be after the EnableNotifications, or the folder counts can be
-    // incorrect during the kDeleteOrMoveMsgCompleted call.
-    srcFolder->NotifyFolderEvent(NS_SUCCEEDED(rv) ? kDeleteOrMoveMsgCompleted
-                                                  : kDeleteOrMoveMsgFailed);
-
-    if (NS_SUCCEEDED(rv) && mCopyState->m_msgWindow &&
-        mCopyState->m_undoMsgTxn) {
-      nsCOMPtr<nsITransactionManager> txnMgr;
-      nsCOMPtr<nsIMsgTransactionService> txns =
-          mozilla::components::Txns::Service();
-      NS_ENSURE_STATE(txns);
-      txns->GetTransactionManager(getter_AddRefs(txnMgr));
-      if (txnMgr) {
-        RefPtr<nsLocalMoveCopyMsgTxn> txn = mCopyState->m_undoMsgTxn;
-        txnMgr->DoTransaction(txn);
-      }
-    }
-    (void)OnCopyCompleted(
-        mCopyState->m_srcSupport,
-        NS_SUCCEEDED(rv)
-            ? true
-            : false);  // clear the copy state so that the next message from a
-                       // different folder can be move
+    return CompleteMoveSource(nullptr, rv);
   }
 
+  return NS_OK;
+}
+
+nsresult nsMsgLocalMailFolder::CompleteMoveSource(
+    LocalMoveSourceListener* listener, nsresult rv) {
+  if (!mCopyState ||
+      (listener && mCopyState->m_sourceDeleteListener != listener)) {
+    return NS_OK;
+  }
+  mCopyState->m_sourceDeleteListener = nullptr;
+  nsCOMPtr<nsIMsgFolder> srcFolder =
+      do_QueryInterface(mCopyState->m_srcSupport);
+  NS_ENSURE_STATE(srcFolder);
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv)) {
+    if (NS_SUCCEEDED(mCopyState->m_copyError)) {
+      mCopyState->m_copyError = rv;
+    }
+    mCopyState->m_writeFailed = true;
+  }
+#endif
+  AutoCompact(mCopyState->m_msgWindow);
+
+  // enable the dest folder
+  EnableNotifications(allMessageCountNotifications, true);
+  // I'm not too sure of the proper location of this event. It seems to need
+  // to be after the EnableNotifications, or the folder counts can be
+  // incorrect during the kDeleteOrMoveMsgCompleted call.
+  srcFolder->NotifyFolderEvent(NS_SUCCEEDED(rv) ? kDeleteOrMoveMsgCompleted
+                                                : kDeleteOrMoveMsgFailed);
+
+  if (NS_SUCCEEDED(rv) && mCopyState->m_msgWindow && mCopyState->m_undoMsgTxn) {
+    nsCOMPtr<nsITransactionManager> txnMgr;
+    nsCOMPtr<nsIMsgTransactionService> txns =
+        mozilla::components::Txns::Service();
+    NS_ENSURE_STATE(txns);
+    txns->GetTransactionManager(getter_AddRefs(txnMgr));
+    if (txnMgr) {
+      RefPtr<nsLocalMoveCopyMsgTxn> txn = mCopyState->m_undoMsgTxn;
+      txnMgr->DoTransaction(txn);
+    }
+  }
+  if (listener) {
+    (void)CompleteCopy(mCopyState->m_srcSupport, rv);
+  } else {
+    (void)OnCopyCompleted(mCopyState->m_srcSupport, NS_SUCCEEDED(rv));
+  }
   return NS_OK;
 }
 

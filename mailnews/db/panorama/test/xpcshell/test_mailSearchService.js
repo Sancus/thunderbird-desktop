@@ -20,6 +20,8 @@ const { MailUtils } = ChromeUtils.importESModule(
 
 let rootFolder;
 let fixtureCount = 0;
+let previousService;
+const fixtureFolders = [];
 const INDEXER_PREF = "mailnews.database.global.indexer.enabled";
 
 add_setup(function setupNativeSearch() {
@@ -45,19 +47,27 @@ add_setup(function setupNativeSearch() {
 });
 
 /**
- * Creates a real local folder and a sidecar bound to this test's core instance.
+ * Retires the previous case's folders and opens a real native search fixture.
+ * Keeps the same core and journal while removing finished cases' stored messages.
  *
  * @param {string} name - Unique fixture name.
  * @returns {Promise<object>} Native folder, service and file.
  */
 async function fixture(name) {
+  await previousService?.close();
+  while (fixtureFolders.length) {
+    rootFolder.propagateDelete(fixtureFolders[0], true);
+    fixtureFolders.shift();
+  }
   const folder = rootFolder
     .createLocalSubfolder(name)
     .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  fixtureFolders.push(folder);
   const file = do_get_profile().clone();
   file.append("native-search-" + name + ".sqlite");
   const sourceId = "isolated-test-core-" + ++fixtureCount;
   const service = await MailSearchService.open(file, sourceId, messageDB);
+  previousService = service;
   registerCleanupFunction(() => service.close());
   return { folder, service, file, sourceId };
 }
@@ -163,6 +173,7 @@ add_task(async function test_replayCopiesDeletionAndPolicyRescan() {
   const otherFolder = rootFolder
     .createLocalSubfolder("replay-other")
     .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  fixtureFolders.push(otherFolder);
   const first = addStoredMessage(folder, "replayneedle");
   const second = addStoredMessage(otherFolder, "replayneedle");
   await drain(service);
@@ -318,6 +329,7 @@ add_task(async function test_nativeSelectedCopyOpening() {
   const other = rootFolder
     .createLocalSubfolder("opening-other")
     .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  fixtureFolders.push(other);
   const first = addStoredMessage(folder, "openingneedle");
   const selected = addStoredMessage(other, "openingneedle");
   Assert.equal(first.messageId, selected.messageId);

@@ -837,6 +837,169 @@ class DeliveryCoreReferences : public testing::Test {
     EXPECT_EQ("00042"_ns, text);
   }
 
+  // 0: delete failure; 1/3: insert failure; 2/4: deferred commit failure.
+  // 0..2 exercise whole-set Reconcile, 3..4 the shared public insertion path.
+  void CheckReconcileSettlement(uint32_t mode) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& folders = mCore->FolderDB();
+    nsAutoCString parentName("Reconcile settlement ");
+    parentName.AppendInt(mode);
+    uint64_t parent, victim, descendant, retained, virtualChild;
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, parentName, &parent));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(parent, "Old"_ns, &victim));
+    ASSERT_EQ(NS_OK,
+              folders.InsertFolder(victim, "Descendant"_ns, &descendant));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(parent, "Retained"_ns, &retained));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(parent, "Virtual"_ns, &virtualChild));
+    ASSERT_EQ(NS_OK,
+              folders.UpdateFlags(virtualChild, nsMsgFolderFlags::Virtual));
+    nsMsgKey key;
+    const nsTArray<nsCString> references{"one"_ns, "two"_ns, "one"_ns};
+    // The deferred-commit seam enables real foreign keys. Keep its message in
+    // a retained child so deletion itself does not hit an immediate message
+    // foreign key before the insert trigger. Other modes cover retained
+    // physical messages whose old owning folder is actually retired.
+    const uint64_t messageFolder = mode == 2 ? retained : descendant;
+    ASSERT_EQ(NS_OK,
+              AddAt(messageFolder, "reconcile-control"_ns, references, key));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(key, "Exact"_ns,
+                                                           "00042"_ns));
+    // Prime all pre-existing entries before any mutation can fail.
+    nsTArray<uint64_t> original;
+    ASSERT_EQ(NS_OK, folders.GetFolderChildren(parent, original));
+    nsCString originalPath;
+    ASSERT_EQ(NS_OK, folders.GetFolderPath(descendant, originalPath));
+    auto highWater = [&](int64_t& value) -> nsresult {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(mConnection->CreateStatement(
+          "SELECT highWater FROM folder_id_allocator WHERE singleton=1"_ns,
+          getter_AddRefs(stmt)));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+      return stmt->GetInt64(0, &value);
+    };
+    int64_t high;
+    ASSERT_EQ(NS_OK, highWater(high));
+    uint64_t watermark;
+    ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK,
+              mConnection->CreateFunction("reconcile_fault"_ns, 1, witness));
+    bool commitFailure = mode == 2 || mode == 4;
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "reconcile_parent(id INTEGER PRIMARY KEY); "
+                           "CREATE TEMP TABLE reconcile_child(id INTEGER "
+                           "REFERENCES reconcile_parent(id) DEFERRABLE "
+                           "INITIALLY DEFERRED)"_ns));
+    }
+    nsAutoCString sql("CREATE TEMP TRIGGER fail_reconcile AFTER ");
+    if (mode == 0) {
+      sql.AppendLiteral("DELETE ON main.folders WHEN OLD.id=");
+      sql.AppendInt(victim);
+      sql.AppendLiteral(" BEGIN SELECT reconcile_fault(OLD.id); ");
+    } else {
+      sql.AppendLiteral(
+          "INSERT ON main.folders WHEN NEW.name='Inserted' "
+          "BEGIN SELECT reconcile_fault(NEW.id); ");
+    }
+    sql.Append(commitFailure
+                   ? "INSERT INTO reconcile_child VALUES(NEW.id); END"
+                   : "SELECT RAISE(FAIL,'reconcile after write'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_reconcile"_ns));
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("reconcile_fault"_ns));
+    });
+    uint64_t inserted = UINT64_MAX;
+    auto write = [&]() -> nsresult {
+      return mode < 3
+                 ? folders.Reconcile(parent, {"Retained"_ns, "Inserted"_ns})
+                 : folders.InsertFolder(parent, "Inserted"_ns, &inserted);
+    };
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, write());
+    EXPECT_EQ(UINT64_MAX, inserted);
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(mode == 0 ? int64_t(victim) : high + 1, witness->mLastKey);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(victim, parent, "Old"_ns));
+    ASSERT_NO_FATAL_FAILURE(
+        CheckFolderIdentity(descendant, victim, "Descendant"_ns));
+    nsTArray<uint64_t> children;
+    ASSERT_EQ(NS_OK, folders.GetFolderChildren(parent, children));
+    EXPECT_EQ(original, children);
+    nsCString path;
+    ASSERT_EQ(NS_OK, folders.GetFolderPath(descendant, path));
+    EXPECT_EQ(originalPath, path);
+    int64_t afterHigh;
+    ASSERT_EQ(NS_OK, highWater(afterHigh));
+    EXPECT_EQ(high, afterHigh);
+    uint64_t after;
+    ASSERT_EQ(NS_OK, SearchWatermark(after));
+    EXPECT_EQ(watermark, after);
+    ASSERT_EQ(NS_OK,
+              mConnection->ExecuteSimpleSQL("DROP TRIGGER fail_reconcile"_ns));
+    ASSERT_EQ(NS_OK, mConnection->RemoveFunction("reconcile_fault"_ns));
+    cleanup.release();
+    ASSERT_EQ(NS_OK, write());
+    uint64_t actual;
+    ASSERT_EQ(NS_OK,
+              folders.GetFolderChildNamed(parent, "Inserted"_ns, &actual));
+    ASSERT_GT(actual, uint64_t(high));
+    if (mode >= 3) EXPECT_EQ(actual, inserted);
+    auto checkSettled = [&] {
+      ASSERT_NO_FATAL_FAILURE(
+          CheckFolderIdentity(actual, parent, "Inserted"_ns));
+      ASSERT_NO_FATAL_FAILURE(
+          CheckFolderIdentity(retained, parent, "Retained"_ns));
+      ASSERT_NO_FATAL_FAILURE(
+          CheckFolderIdentity(virtualChild, parent, "Virtual"_ns));
+      uint64_t physicalFolder;
+      ASSERT_EQ(NS_OK,
+                mCore->MessageDB().GetMessageFolderId(key, physicalFolder));
+      EXPECT_EQ(messageFolder, physicalFolder);
+      nsTArray<nsCString> refs;
+      ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, refs));
+      EXPECT_EQ(references, refs);
+      nsCString text;
+      ASSERT_EQ(NS_OK,
+                mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+      EXPECT_EQ("00042"_ns, text);
+      uint64_t value = UINT64_MAX;
+      if (mode < 3) {
+        EXPECT_EQ(NS_ERROR_UNEXPECTED, folders.GetFolderParent(victim, &value));
+        EXPECT_EQ(UINT64_MAX, value);
+        EXPECT_EQ(NS_ERROR_UNEXPECTED,
+                  folders.GetFolderParent(descendant, &value));
+        EXPECT_EQ(UINT64_MAX, value);
+      } else {
+        ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(victim, parent, "Old"_ns));
+        ASSERT_NO_FATAL_FAILURE(
+            CheckFolderIdentity(descendant, victim, "Descendant"_ns));
+      }
+    };
+    ASSERT_NO_FATAL_FAILURE(checkSettled());
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    // Reacquire the database after a real core reopen, not a fresh header.
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(actual, parent, "Inserted"_ns));
+    uint64_t value;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFolderId(key, value));
+    EXPECT_EQ(messageFolder, value);
+    nsTArray<nsCString> refs;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, refs));
+    EXPECT_EQ(references, refs);
+    nsCString text;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
+  }
+
   nsresult Start() {
     // This native fixture selects the concrete Panorama implementation
     // directly.
@@ -11686,6 +11849,64 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_EQ((nsTArray<nsCString>{"one"_ns, "one"_ns}), refs);
   ASSERT_EQ(NS_OK,
             mCore->MessageDB().GetMessageProperty(control, "caller"_ns, text));
+  EXPECT_TRUE(text.IsEmpty());
+}
+
+TEST_F(DeliveryCoreReferences, ReconcileWriteAndCommitFailuresRestoreWholeSet) {
+  for (uint32_t mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    ASSERT_NO_FATAL_FAILURE(CheckReconcileSettlement(mode));
+    Stop();
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderInsertFailuresKeepOutputCacheAndAllocator) {
+  for (uint32_t mode = 3; mode < 5; ++mode) {
+    SCOPED_TRACE(mode);
+    ASSERT_NO_FATAL_FAILURE(CheckReconcileSettlement(mode));
+    Stop();
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       ReconcileRefusesCallerTransactionAndRetiredOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  RefPtr<FolderDatabase> original = &mCore->FolderDB();
+  uint64_t child;
+  ASSERT_EQ(NS_OK,
+            original->InsertFolder(mFolderId, "Caller child"_ns, &child));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("caller-reconcile"_ns, {}, key));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(key, "caller"_ns,
+                                                         "pending"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, original->Reconcile(mFolderId, {}));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString text;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "caller"_ns, text));
+  EXPECT_EQ("pending"_ns, text);
+  ASSERT_NO_FATAL_FAILURE(
+      CheckFolderIdentity(child, mFolderId, "Caller child"_ns));
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  rollback.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, original->Reconcile(mFolderId, {}));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            original->Reconcile(mFolderId, {"Inserted"_ns}));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckFolderIdentity(child, mFolderId, "Caller child"_ns));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "caller"_ns, text));
   EXPECT_TRUE(text.IsEmpty());
 }
 

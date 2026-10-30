@@ -88,6 +88,13 @@ class FolderDatabase : public nsIFolderDatabase {
 
   nsresult InternalInsertFolder(uint64_t aParent, const nsACString& aName,
                                 uint64_t* aChild);
+  // SQL-only helpers. Callers own the transaction and settle cache after
+  // commit.
+  nsresult InsertFolderRow(uint64_t parent, const nsACString& name,
+                           uint64_t* child);
+  nsresult DeleteFolderRows(uint64_t folder, bool root,
+                            const nsACString& serverKey,
+                            nsTArray<uint64_t>& removed);
   nsresult RetireRoot(uint64_t folderId, const nsACString& serverKey);
   nsresult DeleteFolderTree(uint64_t folderId, bool root,
                             const nsACString& serverKey);

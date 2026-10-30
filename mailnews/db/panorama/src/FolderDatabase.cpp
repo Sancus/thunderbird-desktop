@@ -159,14 +159,35 @@ nsresult FolderDatabase::InternalInsertFolder(uint64_t parentId,
   MOZ_ASSERT(MOZ_TRY(DatabaseUtils::Normalize(name)) == name);
   NS_ENSURE_ARG_POINTER(childId);
   NS_ENSURE_TRUE(parentId <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedHierarchyMutation());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  CachedFolder cached;
+  cached.parent = parentId;
+  cached.ordinal = Nothing();
+  cached.name = name;
+  MOZ_TRY(connection->BeginTransaction());
+  uint64_t id;
+  nsresult rv = InsertFolderRow(parentId, name, &id);
+  if (NS_SUCCEEDED(rv)) {
+    rv = connection->CommitTransaction();
+  }
+  if (NS_FAILED(rv)) {
+    return RollbackFolderUpdate(connection, rv);
+  }
+  cached.id = id;
+  MOZ_ALWAYS_TRUE(mFolderCache.put(id, cached));
+  MOZ_LOG(gPanoramaLog, LogLevel::Info,
+          ("InternalInsertFolder created new folder '%s' (id=%" PRIu64 ")\n",
+           GetFolderPath(id).unwrapOr(""_ns).get(), id));
+  *childId = id;
+  return NS_OK;
+}
 
-  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
-                     DatabaseCore::sInstance->mFolderDatabase.get() == this,
-                 NS_ERROR_NOT_AVAILABLE);
-  bool active;
-  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
-  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
-
+// The caller owns the transaction and defers cache/output changes until commit.
+nsresult FolderDatabase::InsertFolderRow(uint64_t parentId,
+                                         const nsACString& name,
+                                         uint64_t* childId) {
+  NS_ENSURE_TRUE(parentId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   // DB has uniqueness constraint upon (parent, name).
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
@@ -190,24 +211,10 @@ nsresult FolderDatabase::InternalInsertFolder(uint64_t parentId,
   int64_t storedId;
   MOZ_TRY(stmt->GetInt64(0, &storedId));
   NS_ENSURE_TRUE(storedId > 0, NS_ERROR_FILE_CORRUPTED);
-  uint64_t id = storedId;
   MOZ_TRY(stmt->ExecuteStep(&hasResult));
   NS_ENSURE_FALSE(hasResult, NS_ERROR_UNEXPECTED);
 
-  // We've already got the data, so may as well enter it in the cache.
-  {
-    CachedFolder cached;
-    cached.id = id;
-    cached.parent = parentId;
-    cached.ordinal = Nothing();
-    cached.name = name;
-    MOZ_ALWAYS_TRUE(mFolderCache.put(id, cached));
-  }
-
-  MOZ_LOG(gPanoramaLog, LogLevel::Info,
-          ("InternalInsertFolder created new folder '%s' (id=%" PRIu64 ")\n",
-           GetFolderPath(id).unwrapOr(""_ns).get(), id));
-  *childId = id;
+  *childId = uint64_t(storedId);
   return NS_OK;
 }
 
@@ -232,68 +239,70 @@ nsresult FolderDatabase::DeleteFolderTree(uint64_t folderId, bool root,
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
   nsTArray<uint64_t> removed;
   MOZ_TRY(connection->BeginTransaction());
-  nsresult rv = [&]() -> nsresult {
-    {
-      nsCOMPtr<mozIStorageStatement> stmt;
-      MOZ_TRY(DatabaseCore::GetStatement(
-          "CheckDeletedFolderOwner"_ns,
-          "SELECT parent, name FROM folders WHERE id = :id"_ns,
-          getter_AddRefs(stmt)));
-      mozStorageStatementScoper scope(stmt);
-      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
-      bool more;
-      MOZ_TRY(stmt->ExecuteStep(&more));
-      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
-      int64_t parent;
-      nsCString name;
-      MOZ_TRY(stmt->GetInt64(0, &parent));
-      MOZ_TRY(stmt->GetUTF8String(1, name));
-      if (!root && !parent) {
-        NS_WARNING("using DeleteFolder on a root folder is forbidden");
-      }
-      NS_ENSURE_TRUE(root ? (!parent && name == serverKey) : parent > 0,
-                     NS_ERROR_UNEXPECTED);
-      MOZ_TRY(stmt->ExecuteStep(&more));
-      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
-    }
-    {
-      nsCOMPtr<mozIStorageStatement> stmt;
-      MOZ_TRY(DatabaseCore::GetStatement(
-          "DeleteFolderTree"_ns,
-          "WITH RECURSIVE doomed(id) AS (SELECT :id UNION SELECT f.id FROM "
-          "folders f JOIN doomed d ON f.parent=d.id) "
-          "DELETE FROM folders WHERE id IN (SELECT id FROM doomed) RETURNING id"_ns,
-          getter_AddRefs(stmt)));
-      mozStorageStatementScoper scope(stmt);
-      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
-      while (true) {
-        bool more;
-        MOZ_TRY(stmt->ExecuteStep(&more));
-        if (!more) {
-          break;
-        }
-        int64_t id;
-        MOZ_TRY(stmt->GetInt64(0, &id));
-        NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
-        removed.AppendElement(uint64_t(id));
-      }
-    }
-    return connection->CommitTransaction();
-  }();
+  nsresult rv = DeleteFolderRows(folderId, root, serverKey, removed);
+  if (NS_SUCCEEDED(rv)) {
+    rv = connection->CommitTransaction();
+  }
   if (NS_FAILED(rv)) {
-    nsresult cleanup = connection->GetTransactionInProgress(&active);
-    if (NS_SUCCEEDED(cleanup) && active) {
-      cleanup = connection->RollbackTransaction();
-    }
-    if (NS_FAILED(cleanup)) {
-      MOZ_LOG(gPanoramaLog, LogLevel::Error,
-              ("Folder deletion cleanup failed: 0x%08x", uint32_t(cleanup)));
-    }
-    return rv;
+    return RollbackFolderUpdate(connection, rv);
   }
   // Physical messages, body metadata and captured revisions remain readable.
   for (uint64_t id : removed) {
     mFolderCache.remove(id);
+  }
+  return NS_OK;
+}
+
+// Shared only by owned folder mutations; no commit or cache invalidation here.
+nsresult FolderDatabase::DeleteFolderRows(uint64_t folderId, bool root,
+                                          const nsACString& serverKey,
+                                          nsTArray<uint64_t>& removed) {
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "CheckDeletedFolderOwner"_ns,
+        "SELECT parent, name FROM folders WHERE id = :id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+    int64_t parent;
+    nsCString name;
+    MOZ_TRY(stmt->GetInt64(0, &parent));
+    MOZ_TRY(stmt->GetUTF8String(1, name));
+    if (!root && !parent) {
+      NS_WARNING("using DeleteFolder on a root folder is forbidden");
+    }
+    NS_ENSURE_TRUE(root ? (!parent && name == serverKey) : parent > 0,
+                   NS_ERROR_UNEXPECTED);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "DeleteFolderTree"_ns,
+        "WITH RECURSIVE doomed(id) AS (SELECT :id UNION SELECT f.id FROM "
+        "folders f JOIN doomed d ON f.parent=d.id) "
+        "DELETE FROM folders WHERE id IN (SELECT id FROM doomed) RETURNING id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+    while (true) {
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (!more) {
+        break;
+      }
+      int64_t id;
+      MOZ_TRY(stmt->GetInt64(0, &id));
+      NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+      if (!removed.AppendElement(uint64_t(id), fallible)) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+    }
   }
   return NS_OK;
 }
@@ -311,31 +320,39 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
     names.AppendElement(MOZ_TRY(DatabaseUtils::Normalize(name)));
   }
 
-  // Step One: delete any folders in the db that aren't in the list (but
-  // not virtual folders).
-  // TODO: (BenC) - I don't think we should do this step. Even for local
-  // folders, I think the database should be the source of truth for folder
-  // existence.
-  nsTArray<uint64_t> childIds = MOZ_TRY(GetFolderChildrenUnsorted(parentId));
-  for (auto childId : childIds) {
-    nsCString childName = MOZ_TRY(GetFolderName(childId));
-    uint32_t childFlags = MOZ_TRY(GetFolderFlags(childId));
-    if (!names.Contains(childName) &&
-        !(childFlags & nsMsgFolderFlags::Virtual)) {
-      MOZ_TRY(DeleteFolder(childId));
+  MOZ_TRY(RequireCommittedHierarchyMutation());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  nsTArray<uint64_t> removed;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    // Keep virtual folders even when the server listing does not name them.
+    nsTArray<uint64_t> childIds = MOZ_TRY(GetFolderChildrenUnsorted(parentId));
+    for (uint64_t childId : childIds) {
+      nsCString childName = MOZ_TRY(GetFolderName(childId));
+      uint32_t childFlags = MOZ_TRY(GetFolderFlags(childId));
+      if (!names.Contains(childName) &&
+          !(childFlags & nsMsgFolderFlags::Virtual)) {
+        MOZ_TRY(DeleteFolderRows(childId, false, EmptyCString(), removed));
+      }
     }
-  }
-
-  // Step Two: create any folders which are in `childNames`, but not in DB.
-  for (auto const& childName : names) {
-    uint64_t childId = MOZ_TRY(GetFolderChildNamed(parentId, childName));
-    if (childId == 0) {
-      // It's not in the DB!
-      uint64_t newChildId;
-      MOZ_TRY(InsertFolder(parentId, childName, &newChildId));
+    for (const auto& name : names) {
+      uint64_t id = MOZ_TRY(GetFolderChildNamed(parentId, name));
+      if (!id) {
+        // As with InsertFolder, this operation cannot create root folders.
+        NS_ENSURE_ARG(parentId);
+        MOZ_TRY(InsertFolderRow(parentId, name, &id));
+      }
     }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackFolderUpdate(connection, rv);
   }
-
+  // Removed entries stay visible in the cache until commit is confirmed.
+  // New rows are loaded on demand, after this owned transaction has settled.
+  for (uint64_t id : removed) {
+    mFolderCache.remove(id);
+  }
   return NS_OK;
 }
 

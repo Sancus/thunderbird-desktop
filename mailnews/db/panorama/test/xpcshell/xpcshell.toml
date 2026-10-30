@@ -53,6 +53,8 @@ support-files = ["../../../../base/test/unit/data/panacea.dat"]
 
 ["test_chatSearchRedaction.js"]
 
+["test_chatSearchRedactionObserver.js"]
+
 ["test_delete.js"]
 
 ["test_deliveryCompatibilityCopyHdr.js"]

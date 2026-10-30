@@ -300,22 +300,35 @@ export class ChatSearchProvider {
   /**
    * Replaces one log's semantic text only if its exact bytes are still current.
    * Missing files erase their text. Failures leave existing text stored, with
-   * source-revision checks hiding stale rows. Cancellation does not undo a commit.
+   * source-revision checks hiding stale rows. Explicit privacy erasure removes
+   * stored text before reading source or checking indexing policy. Cancellation
+   * does not undo an erasure or other commit already started.
    *
    * @param {string} filePath - Current logger path.
    * @param {object} [options={}] - Refresh options.
    * @param {AbortSignal} [options.signal] - Cancels delivery after queued reads.
+   * @param {boolean} [options.eraseStoredText=false] - Erase the old semantic/FTS
+   *   copy before refreshing a durably redacted source.
    * @returns {Promise<{id: string, indexed: boolean}>} Identity and publication result.
    * @throws {Error} Original I/O/cancellation/storage errors, or invalid source.
+   * @throws {TypeError} For a non-boolean erasure option.
    */
-  refreshLog(filePath, { signal } = {}) {
+  refreshLog(filePath, { signal, eraseStoredText = false } = {}) {
     const id = chatSearchDocumentId(filePath);
+    if (typeof eraseStoredText != "boolean") {
+      throw new TypeError("Chat stored-text erasure must be boolean");
+    }
     if (this.#closing) {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
-    const result = this.#pending.then(() =>
-      this.#refreshLog(id, filePath, signal)
-    );
+    const result = this.#pending.then(async () => {
+      signal?.throwIfAborted();
+      if (eraseStoredText) {
+        await this.#index.remove(id);
+      }
+      signal?.throwIfAborted();
+      return this.#refreshLog(id, filePath, signal);
+    });
     this.#pending = result.then(
       () => {},
       () => {}

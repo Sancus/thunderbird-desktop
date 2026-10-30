@@ -612,8 +612,14 @@ NS_IMETHODIMP PerFolderDatabase::NotifyReadChanged(
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::NotifyJunkScoreChanged(
-    nsIDBChangeListener* aInstigator) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+    nsIDBChangeListener* instigator) {
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<PerFolderDatabase> self(this);
+  for (RefPtr<nsIDBChangeListener> listener : mListeners.EndLimitedRange()) {
+    listener->OnJunkScoreChanged(instigator);
+  }
+  return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::NotifyAnnouncerGoingAway(void) {
   if (mNotifyingGoingAway) {

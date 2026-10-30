@@ -3353,3 +3353,114 @@ add_task(function test_readChangedRequiresItsFolderAndSource() {
   Assert.equal(calls, 1);
   Assert.ok(!connection.transactionInProgress);
 });
+
+add_task(function test_junkScoreAnnouncementUsesOwningFolderAndAdmission() {
+  const local = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const folder = local.createLocalSubfolder("junk-announcer");
+  const other = local.createLocalSubfolder("junk-announcer-other");
+  const db = database.openFolderDB(folder, false);
+  const otherDB = database.openFolderDB(other, false);
+  const events = [];
+  let calls = 0;
+  let away = 0;
+  let closeOnNotify = false;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onJunkScoreChanged(instigator) {
+      Assert.strictEqual(instigator.QueryInterface(Ci.nsIMsgFolder), folder);
+      calls++;
+      if (closeOnNotify) {
+        db.forceClosed();
+      }
+    },
+    onAnnouncerGoingAway(source) {
+      Assert.strictEqual(source, db);
+      away++;
+    },
+  };
+  const folderListener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+    onFolderEvent(changed, event) {
+      if (changed == folder || changed == other) {
+        events.push([changed.URI, event]);
+      }
+    },
+  };
+  const target = folder.QueryInterface(Ci.nsIDBChangeListener);
+  const bystander = other.QueryInterface(Ci.nsIDBChangeListener);
+  // Folder initialization already registered target; put the closing listener first.
+  db.removeListener(target);
+  db.addListener(listener);
+  db.addListener(target);
+  otherDB.addListener(bystander);
+  MailServices.mailSession.AddFolderListener(
+    folderListener,
+    Ci.nsIFolderListener.event
+  );
+  try {
+    const connection = database.connectionForTests;
+    connection.beginTransaction();
+    const update = connection.createStatement(
+      "UPDATE database_identity SET sourceId = :source"
+    );
+    try {
+      update.params.source = Services.uuid.generateUUID().toString();
+      update.execute();
+      Assert.throws(
+        () => db.notifyJunkScoreChanged(target),
+        /NS_ERROR_NOT_AVAILABLE/
+      );
+      Assert.ok(connection.transactionInProgress);
+      Assert.equal(calls, 0);
+      Assert.deepEqual(events, []);
+    } finally {
+      update.finalize();
+      connection.rollbackTransaction();
+    }
+    connection.executeSimpleSQL(
+      "ALTER TABLE database_identity RENAME TO unavailable_junk_identity"
+    );
+    try {
+      Assert.throws(
+        () => db.notifyJunkScoreChanged(target),
+        error => error.result === Cr.NS_ERROR_FAILURE
+      );
+      Assert.equal(calls, 0);
+      Assert.deepEqual(events, []);
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE unavailable_junk_identity RENAME TO database_identity"
+      );
+    }
+    db.notifyJunkScoreChanged(target);
+    Assert.equal(calls, 1);
+    Assert.deepEqual(events, [[folder.URI, "JunkStatusChanged"]]);
+    Assert.deepEqual(db.listAllKeys(), []);
+    Assert.deepEqual(otherDB.listAllKeys(), []);
+    Assert.equal(db.dBFolderInfo.numMessages, 0);
+    Assert.equal(db.dBFolderInfo.numUnreadMessages, 0);
+    Assert.strictEqual(folder.parent, rootFolder);
+    closeOnNotify = true;
+    db.notifyJunkScoreChanged(target);
+    Assert.equal(calls, 2);
+    Assert.equal(away, 1);
+    Assert.deepEqual(events, [[folder.URI, "JunkStatusChanged"]]);
+    Assert.throws(
+      () => db.notifyJunkScoreChanged(target),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.equal(calls, 2);
+    otherDB.notifyJunkScoreChanged(null);
+    Assert.deepEqual(events, [
+      [folder.URI, "JunkStatusChanged"],
+      [other.URI, "JunkStatusChanged"],
+    ]);
+    Assert.deepEqual(otherDB.listAllKeys(), []);
+    Assert.ok(!connection.transactionInProgress);
+  } finally {
+    MailServices.mailSession.RemoveFolderListener(folderListener);
+    db.removeListener(listener);
+    db.removeListener(target);
+    otherDB.removeListener(bystander);
+  }
+});

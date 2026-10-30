@@ -18,6 +18,30 @@
 
 namespace mozilla::mailnews {
 
+namespace {
+
+// Preserve physical parents while exposing each root of this folder's forest.
+nsresult IsScopedRoot(MessageDatabase& messages, const CapturedMessage& current,
+                      bool& isRoot) {
+  if (!current.threadParent || current.threadParent == nsMsgKey_None) {
+    isRoot = true;
+    return NS_OK;
+  }
+  bool exists;
+  MOZ_TRY(messages.MessageExists(current.threadParent, exists));
+  if (!exists) {
+    isRoot = true;
+    return NS_OK;
+  }
+  CapturedMessage parent;
+  MOZ_TRY(messages.CaptureMessage(current.threadParent, parent));
+  isRoot = parent.folderId != current.folderId ||
+           parent.threadId != current.threadId;
+  return NS_OK;
+}
+
+}  // namespace
+
 NS_IMPL_ISUPPORTS(Thread, nsIMsgThread)
 
 NS_IMETHODIMP Thread::GetThreadKey(nsMsgKey* threadKey) {
@@ -213,10 +237,21 @@ NS_IMETHODIMP Thread::EnumerateMessages(nsMsgKey parent,
   nsCOMPtr<nsIMsgDBHdr> header;
   nsTArray<nsMsgKey> keys;
   if (parent == nsMsgKey_None) {
-    MOZ_TRY(GetRootHdr(getter_AddRefs(header)));
-    nsMsgKey rootKey;
-    MOZ_TRY(header->GetMessageKey(&rootKey));
-    keys.AppendElement(rootKey);
+    nsTArray<nsMsgKey> members;
+    MOZ_TRY(GetKeys(members));
+    NS_ENSURE_TRUE(!members.IsEmpty(), NS_ERROR_UNEXPECTED);
+    for (nsMsgKey key : members) {
+      CapturedMessage current;
+      MOZ_TRY(MessageDB().CaptureMessage(key, current));
+      NS_ENSURE_TRUE(
+          current.folderId == mFolderId && current.threadId == mThreadId,
+          NS_ERROR_UNEXPECTED);
+      bool isRoot;
+      MOZ_TRY(IsScopedRoot(MessageDB(), current, isRoot));
+      if (isRoot) {
+        keys.AppendElement(key);
+      }
+    }
   } else {
     MOZ_TRY(GetChild(parent, getter_AddRefs(header)));
     MOZ_TRY(MessageDB().ListThreadChildKeys(mFolderId, parent, keys));
@@ -245,7 +280,13 @@ nsresult ThreadMessageEnumerator::Advance(bool* hasNext) {
     if (current.folderId != mFolderId || current.threadId != mThreadId) {
       continue;
     }
-    if (mParent != nsMsgKey_None && current.threadParent != mParent) {
+    if (mParent == nsMsgKey_None) {
+      bool isRoot;
+      MOZ_TRY(IsScopedRoot(MessageDB(), current, isRoot));
+      if (!isRoot) {
+        continue;
+      }
+    } else if (current.threadParent != mParent) {
       continue;
     }
     *hasNext = true;

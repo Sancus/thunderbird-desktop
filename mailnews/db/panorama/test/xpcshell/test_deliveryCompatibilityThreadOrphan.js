@@ -59,6 +59,10 @@ add_task(function test_missingParentDoesNotHideSurvivingUnreadMembership() {
   Assert.equal(thread.numUnreadChildren, 1);
   Assert.equal(thread.numNewChildren, 1);
   Assert.equal(thread.getFirstUnreadChild().messageKey, leaf.messageKey);
+  Assert.deepEqual(
+    [...thread.enumerateMessages(0xffffffff)].map(header => header.messageKey),
+    [head.messageKey, leaf.messageKey]
+  );
 });
 
 add_task(function test_foreignConnectorDoesNotHideLocalUnreadMembers() {
@@ -81,6 +85,10 @@ add_task(function test_foreignConnectorDoesNotHideLocalUnreadMembers() {
   Assert.equal(thread.getChildKeyAt(1), leaf.messageKey);
   Assert.equal(thread.getChildHdrAt(1).messageKey, leaf.messageKey);
   Assert.equal(thread.getFirstUnreadChild().messageKey, leaf.messageKey);
+  Assert.deepEqual(
+    [...thread.enumerateMessages(0xffffffff)].map(header => header.messageKey),
+    [head.messageKey, leaf.messageKey]
+  );
   Assert.equal(
     thread.enumerateMessages(head.messageKey).hasMoreElements(),
     false
@@ -91,4 +99,115 @@ add_task(function test_foreignConnectorDoesNotHideLocalUnreadMembers() {
   );
   Assert.equal(foreign.isRead, false);
   Assert.equal(leaf.threadParent, foreign.messageKey);
+});
+
+add_task(function test_scopedRootsKeepForeignParentsAndReachEveryLocalMember() {
+  const folder = root.createLocalSubfolder("frontier-local");
+  const other = root.createLocalSubfolder("frontier-foreign");
+  const head = insert(other, "frontier-root@thread.invalid", [], true);
+  const foreign = insert(other, "frontier-foreign@thread.invalid", [
+    head.messageId,
+  ]);
+  const first = insert(folder, "frontier-first@thread.invalid", [
+    head.messageId,
+  ]);
+  const second = insert(folder, "frontier-second@thread.invalid", [
+    head.messageId,
+    foreign.messageId,
+  ]);
+  const child = insert(folder, "frontier-child@thread.invalid", [
+    head.messageId,
+    first.messageId,
+  ]);
+  const unrelated = insert(folder, "frontier-other-thread@thread.invalid");
+  const db = folder.msgDatabase;
+  const thread = db.getThreadContainingMsgHdr(first);
+  Assert.equal(first.threadParent, head.messageKey);
+  Assert.equal(second.threadParent, foreign.messageKey);
+  Assert.equal(child.threadParent, first.messageKey);
+  Assert.equal(thread.threadKey, head.messageKey);
+  Assert.equal(thread.numChildren, 3);
+  Assert.deepEqual(
+    [...thread.enumerateMessages(0xffffffff)].map(header => header.messageKey),
+    [second.messageKey, first.messageKey],
+    "Every local frontier root follows the native thread preorder"
+  );
+  Assert.deepEqual(
+    [...thread.enumerateMessages(first.messageKey)].map(
+      header => header.messageKey
+    ),
+    [child.messageKey],
+    "A non-sentinel parent still enumerates immediate children only"
+  );
+  Assert.deepEqual([...thread.enumerateMessages(second.messageKey)], []);
+  const pending = [0xffffffff];
+  const visited = [];
+  while (pending.length) {
+    for (const header of thread.enumerateMessages(pending.pop())) {
+      Assert.strictEqual(header.folder, folder);
+      visited.push(header.messageKey);
+      pending.push(header.messageKey);
+    }
+  }
+  Assert.equal(visited.length, thread.numChildren);
+  Assert.equal(new Set(visited).size, visited.length);
+  Assert.deepEqual(
+    visited.toSorted((a, b) => a - b),
+    [first.messageKey, second.messageKey, child.messageKey].toSorted(
+      (a, b) => a - b
+    )
+  );
+  Assert.ok(!visited.includes(unrelated.messageKey));
+  Assert.throws(
+    () => thread.enumerateMessages(foreign.messageKey),
+    /NS_ERROR_UNEXPECTED/
+  );
+  Assert.equal(first.threadParent, head.messageKey);
+  Assert.equal(second.threadParent, foreign.messageKey);
+  Assert.equal(child.threadParent, first.messageKey);
+});
+
+add_task(function test_rootCursorSkipsRetiredMembersAndPreservesQueryErrors() {
+  const folder = root.createLocalSubfolder("frontier-cursor-local");
+  const other = root.createLocalSubfolder("frontier-cursor-foreign");
+  const head = insert(other, "cursor-root@thread.invalid", [], true);
+  const first = insert(folder, "cursor-first@thread.invalid", [head.messageId]);
+  const second = insert(folder, "cursor-second@thread.invalid", [
+    head.messageId,
+  ]);
+  const thread = folder.msgDatabase.getThreadContainingMsgHdr(first);
+  const roots = thread.enumerateMessages(0xffffffff);
+  Assert.ok(roots.hasMoreElements());
+  messageDB.removeMessage(first.messageKey);
+  Assert.equal(roots.getNext().messageKey, second.messageKey);
+  Assert.ok(!roots.hasMoreElements());
+  Assert.throws(() => roots.getNext(), /NS_ERROR_FAILURE/);
+  const retained = thread.enumerateMessages(0xffffffff);
+  Assert.ok(retained.hasMoreElements());
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO unavailable_frontier_messages"
+  );
+  try {
+    Assert.throws(
+      () => retained.hasMoreElements(),
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => retained.getNext(),
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => thread.enumerateMessages(0xffffffff),
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_frontier_messages RENAME TO messages"
+    );
+  }
+  Assert.equal(retained.getNext().messageKey, second.messageKey);
+  Assert.ok(!retained.hasMoreElements());
+  Assert.equal(second.threadParent, head.messageKey);
+  Assert.strictEqual(head.folder, other);
 });

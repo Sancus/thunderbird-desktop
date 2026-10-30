@@ -145,3 +145,75 @@ add_task(async function testGetThreadContainingMsgHdr() {
   Assert.equal(thread.getRootHdr().messageId, "message1@invalid");
   Assert.equal(thread.newestMsgDate, new Date("2025-06-02").valueOf() / 1000);
 });
+
+add_task(function test_retainedThreadDateTracksPublishedMembersAndReadErrors() {
+  const folder = MailServices.accounts.localFoldersServer.rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("retained-thread-date");
+  const db = folder.msgDatabase;
+  const oldest = Date.UTC(2025, 1, 1) / 1000;
+  const newer = Date.UTC(2025, 1, 2) / 1000;
+  const newest = Date.UTC(2025, 1, 3) / 1000;
+  const draft = db.createNewHdr();
+  draft.messageId = "retained-date-root@thread.invalid";
+  draft.date = oldest * 1000000;
+  const head = db.attachHdr(draft, false);
+  const thread = db.getThreadContainingMsgHdr(head);
+  const preloaded = [...db.enumerateThreads()].find(
+    item => item.threadKey == head.messageKey
+  );
+  Assert.ok(preloaded);
+  Assert.equal(thread.newestMsgDate, oldest);
+  Assert.equal(preloaded.newestMsgDate, oldest);
+  const reply = db.createNewHdr();
+  reply.messageId = "retained-date-reply@thread.invalid";
+  reply.setReferences(`<${head.messageId}>`);
+  reply.date = newer * 1000000;
+  const child = db.attachHdr(reply, false);
+  Assert.equal(child.threadId, head.messageKey);
+  Assert.equal(child.threadParent, head.messageKey);
+  Assert.equal(thread.numChildren, 2);
+  Assert.equal(thread.newestMsgDate, newer);
+  Assert.equal(preloaded.newestMsgDate, newer);
+  child.date = newest * 1000000;
+  Assert.equal(thread.newestMsgDate, newest);
+  Assert.equal(preloaded.newestMsgDate, newest);
+  db.deleteMessage(child.messageKey, null, true);
+  Assert.equal(thread.newestMsgDate, oldest);
+  Assert.equal(preloaded.newestMsgDate, oldest);
+  Assert.equal(head.date, oldest * 1000000);
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    Assert.equal(thread.newestMsgDate, oldest);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO unavailable_thread_dates"
+  );
+  try {
+    for (const retained of [thread, preloaded]) {
+      Assert.throws(
+        () => retained.newestMsgDate,
+        error => error.result === Cr.NS_ERROR_FAILURE
+      );
+    }
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_thread_dates RENAME TO messages"
+    );
+  }
+  Assert.equal(thread.newestMsgDate, oldest);
+  Assert.equal(preloaded.newestMsgDate, oldest);
+  db.deleteMessage(head.messageKey, null, true);
+  Assert.equal(thread.numChildren, 0);
+  Assert.equal(
+    thread.newestMsgDate,
+    0,
+    "The checked native empty-thread default is zero"
+  );
+  Assert.equal(preloaded.newestMsgDate, 0);
+  Assert.deepEqual(db.listAllKeys(), []);
+});

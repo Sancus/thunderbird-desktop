@@ -61,11 +61,10 @@ NS_IMETHODIMP Thread::SetFlags(uint32_t aFlags) {
   return MessageDB().SetThreadFlags(mFolderId, mThreadId, aFlags);
 }
 NS_IMETHODIMP Thread::GetNewestMsgDate(uint32_t* aNewestMsgDate) {
-  if (mMaxDate == 0) {
-    // We didn't get the max date when constructing this Thread. Do it now.
-    nsresult rv = MessageDB().GetThreadMaxDate(mFolderId, mThreadId, &mMaxDate);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
+  NS_ENSURE_ARG_POINTER(aNewestMsgDate);
+  uint64_t maxDate;
+  MOZ_TRY(MessageDB().GetThreadMaxDate(mFolderId, mThreadId, &maxDate));
+  mMaxDate = maxDate;
   *aNewestMsgDate = mMaxDate / PR_USEC_PER_SEC;
   return NS_OK;
 }

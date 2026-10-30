@@ -18,12 +18,20 @@ add_task(async function test_folderParse() {
   for (const storeKind of localAccountUtils.pluggableStores) {
     info(`Running test with ${storeKind}`);
     Services.prefs.setCharPref("mail.serverDefaultStoreContractID", storeKind);
-    await doTestFolderParse();
+    Services.prefs.setCharPref(
+      "mail.server.default.storeContractID",
+      storeKind
+    );
+    await doTestFolderParse(storeKind);
   }
 });
 
-// Core test for test_FolderParse().
-async function doTestFolderParse() {
+/**
+ * Rebuild a real store and retain every original message byte.
+ *
+ * @param {string} storeKind - Expected store contract.
+ */
+async function doTestFolderParse(storeKind) {
   const msgs = [
     // 0
     "To: bob@invalid\r\n" +
@@ -44,6 +52,10 @@ async function doTestFolderParse() {
   localAccountUtils.loadLocalMailAccount();
 
   const inbox = localAccountUtils.inboxFolder;
+  const storeType =
+    storeKind == "@mozilla.org/msgstore/berkeleystore;1" ? "mbox" : "maildir";
+  Assert.equal(inbox.msgStore.storeType, storeType);
+  Assert.equal(inbox.server.msgStore.storeType, storeType);
 
   // Load messages into the msgStore (this will perform whatever escaping is
   // required).
@@ -71,7 +83,108 @@ async function doTestFolderParse() {
   const expectedSizes = msgs.map(m => m.length).sort();
   const gotSizes = Array.from(inbox.messages, m => m.messageSize).sort();
   Assert.deepEqual(expectedSizes, gotSizes);
+  Assert.deepEqual(
+    Array.from(inbox.messages, header =>
+      mailTestUtils.loadMessageToString(inbox, header)
+    ).sort(),
+    msgs.toSorted(),
+    "Repair preserves every original header and body byte"
+  );
 
   // Clear up so we can run again on different store type.
   localAccountUtils.clearAll();
 }
+
+/**
+ * A failed final summary write must reach the repair completion listener.
+ */
+add_task(async function test_folderParseSummaryFailure() {
+  const { FeedbackService } = ChromeUtils.importESModule(
+    "resource:///modules/FeedbackService.sys.mjs"
+  );
+  const preference = "mail.serverDefaultStoreContractID";
+  const defaultPreference = "mail.server.default.storeContractID";
+  const preferences = [preference, defaultPreference].map(name => ({
+    name,
+    present: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
+  const reportStatus = FeedbackService.prototype.reportStatus;
+  let retained;
+  let original;
+  try {
+    localAccountUtils.clearAll();
+    for (const name of [preference, defaultPreference]) {
+      Services.prefs.setCharPref(name, "@mozilla.org/msgstore/berkeleystore;1");
+    }
+    localAccountUtils.loadLocalMailAccount();
+    const folder = localAccountUtils.inboxFolder;
+    Assert.equal(folder.msgStore.storeType, "mbox");
+    Assert.equal(folder.server.msgStore.storeType, "mbox");
+    Assert.ok(!Services.prefs.getBoolPref("mail.panorama.enabled", false));
+    original = folder.filePath.clone();
+    const bytes = await IOUtils.read(original.path);
+    Assert.equal(bytes.length, 0);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    await IOUtils.remove(folder.summaryFile.path);
+
+    let faults = 0;
+    FeedbackService.prototype.reportStatus = function (message, meteors) {
+      reportStatus.call(this, message, meteors);
+      if (meteors == "start-meteors" && !faults) {
+        // The empty scan is queued but has no open input handle. Preserve its
+        // actual body file elsewhere before the real final summary setter.
+        retained = original.clone();
+        retained.moveTo(null, original.leafName + ".retained");
+        faults++;
+      }
+    };
+    const statuses = [];
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl(url, status) {
+        statuses.push(status);
+      },
+    });
+    folder.parseFolder(null, listener);
+    await Assert.rejects(
+      listener.promise,
+      error => Number(error.message) === Cr.NS_MSG_ERROR_FOLDER_MISSING
+    );
+    Assert.equal(faults, 1);
+    Assert.deepEqual(statuses, [Cr.NS_MSG_ERROR_FOLDER_MISSING]);
+    Assert.ok(!folder.locked);
+    Assert.ok(!original.exists());
+    Assert.ok(retained.exists());
+    Assert.deepEqual(await IOUtils.read(retained.path), bytes);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+
+    FeedbackService.prototype.reportStatus = reportStatus;
+    retained.moveTo(null, original.leafName);
+    retained = null;
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    await IOUtils.remove(folder.summaryFile.path);
+    const retry = new PromiseTestUtils.PromiseUrlListener();
+    folder.parseFolder(null, retry);
+    await retry.promise;
+    Assert.ok(!folder.locked);
+    Assert.ok(folder.msgDatabase.summaryValid);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    Assert.deepEqual(await IOUtils.read(original.path), bytes);
+  } finally {
+    FeedbackService.prototype.reportStatus = reportStatus;
+    if (retained?.exists() && !original.exists()) {
+      retained.moveTo(null, original.leafName);
+    }
+    localAccountUtils.clearAll();
+    for (const { name, present, value } of preferences) {
+      if (present) {
+        Services.prefs.setCharPref(name, value);
+      } else {
+        Services.prefs.clearUserPref(name);
+      }
+    }
+  }
+});

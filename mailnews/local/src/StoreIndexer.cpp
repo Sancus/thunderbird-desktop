@@ -267,7 +267,7 @@ NS_IMETHODIMP StoreIndexer::OnStopRequest(nsIRequest* req, nsresult status) {
 // Called when the scan completes.
 NS_IMETHODIMP StoreIndexer::OnStopScan(nsresult status) {
   if (NS_SUCCEEDED(status)) {
-    mDB->SetSummaryValid(true);
+    status = mDB->SetSummaryValid(true);
   }
   ReleaseFolder();
 

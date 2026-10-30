@@ -9,6 +9,8 @@ tags = ["panorama"]
 
 ["include:xpcshell-shared.toml"]
 
+["test_localRetention.js"]
+
 ["test_mailStoreCompact.js"]
 tags = ["compact"]
 
@@ -21,5 +23,3 @@ tags = ["maildir"]
 ["test_msgCopy.js"]
 
 ["test_pop3PartialCompletion.js"]
-
-["test_localRetention.js"]

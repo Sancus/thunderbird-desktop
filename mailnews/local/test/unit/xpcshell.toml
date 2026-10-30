@@ -30,6 +30,9 @@ tags = ["compact"]
 
 ["test_localFolder.js"]
 
+["test_localRetention.js"]
+tags = ["mork"]
+
 ["test_mailStoreCompact.js"]
 tags = ["compact"]
 
@@ -142,6 +145,3 @@ requesttimeoutfactor = 12
 ["test_verifyLogon.js"]
 
 ["test_viewSortBySize.js"]
-
-["test_localRetention.js"]
-tags = ["mork"]

@@ -7,6 +7,7 @@
 
 #include "FolderDatabase.h"
 #include "MessageDatabase.h"
+#include "mozilla/RefCounted.h"
 #include "mozilla/RefPtr.h"
 #include "mozilla/StaticPtr.h"
 #include "mozilla/WeakPtr.h"
@@ -95,6 +96,37 @@ struct FolderImportReceipt {
   nsTArray<FolderImportKey> keys;
 };
 
+// One prepared folder operation. The protocol/local owner retains its exact
+// storage plan and path/error snapshots through the strong nsISupports owner.
+// No storage I/O or retry occurs on destruction. Main-thread use only.
+class FolderRelocationRecovery final
+    : public RefCounted<FolderRelocationRecovery> {
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(FolderRelocationRecovery)
+
+  // Allocation-free, before releasing active wrapper references on failure.
+  // First failure wins. A blocked holder has no unchecked release operation.
+  void BlockAfterFailedRestore(nsresult primaryError, nsresult rollbackError);
+  nsresult PrimaryError() const { return mPrimaryError; }
+  nsresult RollbackError() const { return mRollbackError; }
+
+ private:
+  friend class DatabaseCore;
+  friend class mozilla::detail::RefCounted<FolderRelocationRecovery,
+                                           mozilla::detail::NonAtomicRefCount>;
+  FolderRelocationRecovery(nsCString&& sourceId, uint64_t root,
+                           nsTArray<uint64_t>&& folders, nsISupports* owner);
+  ~FolderRelocationRecovery() = default;
+
+  nsCString mSourceId;
+  uint64_t mRoot;
+  nsTArray<uint64_t> mFolders;
+  nsCOMPtr<nsISupports> mOwner;
+  bool mBlocked{false};
+  nsresult mPrimaryError{NS_OK};
+  nsresult mRollbackError{NS_OK};
+};
+
 class DatabaseCore : public nsIDatabaseCore,
                      public nsIMsgDBService,
                      public nsIObserver {
@@ -112,6 +144,19 @@ class DatabaseCore : public nsIDatabaseCore,
   static nsresult RetireAccountRoot(uint64_t folderId,
                                     const nsACString& serverKey,
                                     const nsACString& databaseSourceId);
+
+  // Private native folder-operation boundary, not an XPCOM API. Prepare before
+  // I/O, revalidate before Apply, and discard only an unblocked completed plan.
+  // The owner must not strongly retain this core, this token, or a wrapper/PFD
+  // ancestry that retains this core. Failure leaves output unchanged.
+  nsresult PrepareFolderRelocationRecovery(
+      const nsACString& expectedSourceId, uint64_t root,
+      const nsTArray<uint64_t>& capturedFolders, nsISupports* recoveryOwner,
+      RefPtr<FolderRelocationRecovery>& output);
+  nsresult ValidateFolderRelocationRecovery(FolderRelocationRecovery* recovery);
+  void DiscardFolderRelocationRecovery(FolderRelocationRecovery* recovery);
+  // Does not open a core, own SQL, or erase numeric diagnostic identities.
+  nsresult CheckFolderRelocationRecovery(uint64_t folderId);
 
   FolderDatabase& FolderDB() { return *mFolderDatabase; }
   MessageDatabase& MessageDB() { return *mMessageDatabase; }
@@ -176,6 +221,12 @@ class DatabaseCore : public nsIDatabaseCore,
   static nsresult CreateSavepoint(const nsACString& name);
   static nsresult ReleaseSavepoint(const nsACString& name);
   static nsresult RollbackToSavepoint(const nsACString& name);
+
+  nsresult CheckFolderRelocationRecoverySnapshot(
+      const nsACString& sourceId, uint64_t root,
+      const nsTArray<uint64_t>& capturedFolders);
+  bool HasFailedFolderRelocationRecovery() const;
+  nsTArray<RefPtr<FolderRelocationRecovery>> mFolderRelocationRecoveries;
 
   bool mShuttingDown = false;
   RefPtr<FolderDatabase> mFolderDatabase;

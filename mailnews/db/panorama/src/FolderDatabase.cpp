@@ -178,6 +178,7 @@ nsresult FolderDatabase::InternalInsertFolder(uint64_t parentId,
   NS_ENSURE_ARG_POINTER(childId);
   NS_ENSURE_TRUE(parentId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   MOZ_TRY(RequireCommittedHierarchyMutation());
+  if (parentId) MOZ_TRY(CheckFolderRelocationRecovery(parentId, false));
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   CachedFolder cached;
   cached.parent = parentId;
@@ -255,6 +256,7 @@ nsresult FolderDatabase::DeleteFolderTree(uint64_t folderId, bool root,
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(CheckFolderRelocationRecovery(folderId, true));
   nsTArray<uint64_t> removed;
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = DeleteFolderRows(folderId, root, serverKey, removed);
@@ -339,6 +341,7 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
   }
 
   MOZ_TRY(RequireCommittedHierarchyMutation());
+  MOZ_TRY(CheckFolderRelocationRecovery(parentId, true));
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   nsTArray<uint64_t> removed;
   MOZ_TRY(connection->BeginTransaction());
@@ -415,6 +418,18 @@ nsresult FolderDatabase::RequireCommittedHierarchyMutation() {
   return active ? NS_ERROR_IN_PROGRESS : NS_OK;
 }
 
+nsresult FolderDatabase::CheckFolderRelocationRecovery(uint64_t folderId,
+                                                       bool subtree) {
+  MOZ_TRY(DatabaseCore::sInstance->CheckFolderRelocationRecovery(folderId));
+  if (subtree && DatabaseCore::sInstance->HasFailedFolderRelocationRecovery()) {
+    nsTArray<uint64_t> descendants = MOZ_TRY(GetFolderDescendants(folderId));
+    for (uint64_t child : descendants) {
+      MOZ_TRY(DatabaseCore::sInstance->CheckFolderRelocationRecovery(child));
+    }
+  }
+  return NS_OK;
+}
+
 nsresult FolderDatabase::ValidateFolderRelocation(
     const nsACString& expectedSourceId, uint64_t folderId,
     uint64_t expectedParent, const nsACString& expectedName,
@@ -422,6 +437,7 @@ nsresult FolderDatabase::ValidateFolderRelocation(
   nsCString sourceId;
   MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
   NS_ENSURE_TRUE(sourceId == expectedSourceId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckFolderRelocationRecovery(newParent, false));
   {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(DatabaseCore::GetStatement(
@@ -740,6 +756,8 @@ NS_IMETHODIMP
 FolderDatabase::MoveFolderTo(uint64_t newParentId, uint64_t childId) {
   NS_ENSURE_ARG(childId);
   MOZ_TRY(RequireCommittedHierarchyMutation());
+  MOZ_TRY(CheckFolderRelocationRecovery(childId, true));
+  MOZ_TRY(CheckFolderRelocationRecovery(newParentId, false));
 
   // Sanity checks.
   uint64_t oldParentId = MOZ_TRY(GetFolderParent(childId));
@@ -809,6 +827,7 @@ NS_IMETHODIMP
 FolderDatabase::UpdateName(uint64_t folderId, const nsACString& newName) {
   NS_ENSURE_ARG(folderId);
   MOZ_TRY(RequireCommittedHierarchyMutation());
+  MOZ_TRY(CheckFolderRelocationRecovery(folderId, true));
   nsCString nfcNewName = MOZ_TRY(DatabaseUtils::Normalize(newName));
 
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;

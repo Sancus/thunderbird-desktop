@@ -478,6 +478,7 @@ nsresult MessageDatabase::CheckPendingFolderRelocation(uint64_t folderId) {
   NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
                      DatabaseCore::sInstance->mMessageDatabase.get() == this,
                  NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(DatabaseCore::sInstance->CheckFolderRelocationRecovery(folderId));
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
       "CheckFolderBodyAccess"_ns,
@@ -499,6 +500,30 @@ nsresult MessageDatabase::CheckPendingMessageRelocation(nsMsgKey key) {
   NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
                      DatabaseCore::sInstance->mMessageDatabase.get() == this,
                  NS_ERROR_NOT_AVAILABLE);
+  if (DatabaseCore::sInstance->HasFailedFolderRelocationRecovery()) {
+    nsCOMPtr<mozIStorageStatement> folders;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReadMessageRecoveryFolder"_ns,
+        "SELECT folderId FROM messages WHERE id=:id UNION SELECT folderId "
+        "FROM staged_messages WHERE id=:id"_ns,
+        getter_AddRefs(folders)));
+    mozStorageStatementScoper reset(folders);
+    MOZ_TRY(folders->BindInt64ByName("id"_ns, key));
+    bool more;
+    MOZ_TRY(folders->ExecuteStep(&more));
+    if (more) {
+      int32_t type;
+      int64_t folder;
+      MOZ_TRY(folders->GetTypeOfIndex(0, &type));
+      MOZ_TRY(folders->GetInt64(0, &folder));
+      NS_ENSURE_TRUE(
+          type == mozIStorageStatement::VALUE_TYPE_INTEGER && folder > 0,
+          NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(folders->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(DatabaseCore::sInstance->CheckFolderRelocationRecovery(folder));
+    }
+  }
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
       "CheckMessageBodyAccess"_ns,
@@ -3547,9 +3572,9 @@ nsresult MessageDatabase::AccountRemovedMessage(
     MOZ_TRY(stmt->GetInt64(0, &storedFlags));
     MOZ_TRY(stmt->GetUTF8String(1, source));
     NS_ENSURE_TRUE(source == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
-    NS_ENSURE_TRUE(storedFlags >= INT32_MIN &&
-                       storedFlags <= int64_t(UINT32_MAX),
-                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(
+        storedFlags >= INT32_MIN && storedFlags <= int64_t(UINT32_MAX),
+        NS_ERROR_FILE_CORRUPTED);
     flags = static_cast<uint32_t>(storedFlags);
   }
   if (accounting == MessageRemovalAccounting::OfflineMessageSize &&

@@ -37,6 +37,7 @@
 #include "mozilla/ProfilerMarkers.h"
 #include "mozilla/Services.h"
 #include "mozilla/UniquePtr.h"
+#include "mozilla/fallible.h"
 #include "mozilla/ScopeExit.h"
 #include "mozIStorageBindingParams.h"
 #include "mozIStorageBindingParamsArray.h"
@@ -65,6 +66,7 @@
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
 #include "nsNetUtil.h"
+#include "nsThreadUtils.h"
 #include "PerFolderDatabase.h"
 #include "xpcpublic.h"
 
@@ -157,6 +159,7 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
   }
   sStatements.Clear();
 
+  mFolderRelocationRecoveries.Clear();
   mFolderDatabase = nullptr;
 
   if (mMessageDatabase) {
@@ -4618,6 +4621,155 @@ NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
   output.set(prepared);
   return NS_OK;
 #endif
+}
+
+FolderRelocationRecovery::FolderRelocationRecovery(nsCString&& sourceId,
+                                                   uint64_t root,
+                                                   nsTArray<uint64_t>&& folders,
+                                                   nsISupports* owner)
+    : mSourceId(std::move(sourceId)),
+      mRoot(root),
+      mFolders(std::move(folders)),
+      mOwner(owner) {}
+
+void FolderRelocationRecovery::BlockAfterFailedRestore(nsresult primaryError,
+                                                       nsresult rollbackError) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(NS_FAILED(primaryError) && NS_FAILED(rollbackError));
+  if (!mBlocked) {
+    mPrimaryError = primaryError;
+    mRollbackError = rollbackError;
+    mBlocked = true;
+  }
+}
+
+nsresult DatabaseCore::CheckFolderRelocationRecoverySnapshot(
+    const nsACString& sourceId, uint64_t root,
+    const nsTArray<uint64_t>& capturedFolders) {
+  nsCString current;
+  MOZ_TRY(ReadSourceIdForFolderAdmission(current));
+  NS_ENSURE_TRUE(current == sourceId, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(GetStatement("CheckRecoveryRoot"_ns,
+                       "SELECT parent FROM folders WHERE id=:id"_ns,
+                       getter_AddRefs(stmt)));
+  {
+    mozStorageStatementScoper reset(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, root));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int32_t type;
+    int64_t parent;
+    MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+    MOZ_TRY(stmt->GetInt64(0, &parent));
+    NS_ENSURE_TRUE(
+        type == mozIStorageStatement::VALUE_TYPE_INTEGER && parent >= 0,
+        NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(parent, NS_ERROR_UNEXPECTED);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  nsTArray<uint64_t> remaining = MOZ_TRY(FolderDB().GetFolderDescendants(root));
+  remaining.AppendElement(root);
+  NS_ENSURE_TRUE(remaining.Length() == capturedFolders.Length(),
+                 NS_ERROR_NOT_AVAILABLE);
+  for (uint64_t id : capturedFolders) {
+    NS_ENSURE_TRUE(remaining.RemoveElement(id), NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(MessageDB().CheckPendingFolderRelocation(id));
+  }
+  return NS_OK;
+}
+
+nsresult DatabaseCore::PrepareFolderRelocationRecovery(
+    const nsACString& expectedSourceId, uint64_t root,
+    const nsTArray<uint64_t>& capturedFolders, nsISupports* recoveryOwner,
+    RefPtr<FolderRelocationRecovery>& output) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection && mFolderDatabase &&
+                     mMessageDatabase && !mShuttingDown,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(recoveryOwner && !expectedSourceId.IsEmpty() && root &&
+                     root <= INT64_MAX && !capturedFolders.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  for (uint64_t id : capturedFolders) {
+    NS_ENSURE_TRUE(id && id <= INT64_MAX, NS_ERROR_INVALID_ARG);
+  }
+  bool active;
+  MOZ_TRY(sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(CheckFolderRelocationRecoverySnapshot(expectedSourceId, root,
+                                                capturedFolders));
+  for (const auto& existing : mFolderRelocationRecoveries) {
+    for (uint64_t id : capturedFolders) {
+      if (existing->mFolders.Contains(id)) {
+        NS_ENSURE_TRUE(existing->mSourceId == expectedSourceId,
+                       NS_ERROR_NOT_AVAILABLE);
+        return NS_ERROR_IN_PROGRESS;
+      }
+    }
+  }
+  nsTArray<uint64_t> retained;
+  if (!retained.AppendElements(capturedFolders, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  RefPtr<FolderRelocationRecovery> recovery = new FolderRelocationRecovery(
+      nsCString(expectedSourceId), root, std::move(retained), recoveryOwner);
+  if (!mFolderRelocationRecoveries.AppendElement(recovery, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  output = std::move(recovery);
+  return NS_OK;
+}
+
+nsresult DatabaseCore::ValidateFolderRelocationRecovery(
+    FolderRelocationRecovery* recovery) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection && mFolderDatabase &&
+                     mMessageDatabase && !mShuttingDown,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_ARG_POINTER(recovery);
+  NS_ENSURE_TRUE(mFolderRelocationRecoveries.Contains(recovery),
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_FALSE(recovery->mBlocked, NS_ERROR_IN_PROGRESS);
+  bool active;
+  MOZ_TRY(sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  return CheckFolderRelocationRecoverySnapshot(
+      recovery->mSourceId, recovery->mRoot, recovery->mFolders);
+}
+
+void DatabaseCore::DiscardFolderRelocationRecovery(
+    FolderRelocationRecovery* recovery) {
+  MOZ_ASSERT(NS_IsMainThread());
+  // Success/complete rollback can discard its prepared inactive holder. A
+  // failed restore cannot be dismissed by a caller Boolean or object
+  // destruction.
+  if (recovery && !recovery->mBlocked) {
+    mFolderRelocationRecoveries.RemoveElement(recovery);
+  }
+}
+
+bool DatabaseCore::HasFailedFolderRelocationRecovery() const {
+  for (const auto& recovery : mFolderRelocationRecoveries) {
+    if (recovery->mBlocked) return true;
+  }
+  return false;
+}
+
+nsresult DatabaseCore::CheckFolderRelocationRecovery(uint64_t folderId) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection && !mShuttingDown,
+                 NS_ERROR_NOT_AVAILABLE);
+  for (const auto& recovery : mFolderRelocationRecoveries) {
+    if (recovery->mBlocked && recovery->mFolders.Contains(folderId)) {
+      nsCString current;
+      MOZ_TRY(ReadSourceIdForFolderAdmission(current));
+      NS_ENSURE_TRUE(current == recovery->mSourceId, NS_ERROR_NOT_AVAILABLE);
+      return NS_ERROR_IN_PROGRESS;
+    }
+  }
+  return NS_OK;
 }
 
 nsresult DatabaseCore::ReadSourceIdForFolderAdmission(nsACString& output) {

@@ -262,6 +262,15 @@ NS_IMPL_ISUPPORTS(ThreadQueueObserver, nsISupports)
 
 }  // namespace
 
+class RecoveryPlanOwner final : public nsISupports, public SupportsWeakPtr {
+ public:
+  NS_DECL_ISUPPORTS
+
+ private:
+  ~RecoveryPlanOwner() = default;
+};
+NS_IMPL_ISUPPORTS(RecoveryPlanOwner, nsISupports)
+
 class DeliveryCoreReferences : public testing::Test {
  protected:
   void SetUp() override {
@@ -12765,6 +12774,259 @@ TEST_F(DeliveryCoreReferences, ImapFolderRelocationMetadataFailuresRollback) {
     EXPECT_EQ("Trash/New/Child"_ns, *text);
     Stop();
   }
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRelocationRecoveryRetainsFailedOwnerAndBlocksSubtree) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  auto& messages = mCore->MessageDB();
+  uint64_t root, child, sibling;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Recovery"_ns, &root));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Child"_ns, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Sibling"_ns, &sibling));
+  nsMsgKey key, siblingKey;
+  ASSERT_EQ(NS_OK,
+            AddAt(child, "recovery@invalid"_ns, {"one"_ns, "one"_ns}, key));
+  ASSERT_EQ(NS_OK, AddAt(sibling, "outside@invalid"_ns, {}, siblingKey));
+  ASSERT_EQ(NS_OK, messages.SetMessageStoreToken(key, "retained-body"_ns));
+  ASSERT_EQ(NS_OK, messages.SetMessageProperty(key, "Exact"_ns, "00042"_ns));
+  RawHdr stagedHeader;
+  stagedHeader.messageId = "staged-recovery@invalid"_ns;
+  nsMsgKey stagedKey;
+  ASSERT_EQ(NS_OK, messages.StageMessage(child, stagedHeader, &stagedKey));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  uint64_t watermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+  RefPtr<RecoveryPlanOwner> owner = new RecoveryPlanOwner();
+  WeakPtr<RecoveryPlanOwner> alive(owner.get());
+  RefPtr<FolderRelocationRecovery> recovery;
+  ASSERT_EQ(NS_OK, mCore->PrepareFolderRelocationRecovery(
+                       source, root, {root, child}, owner, recovery));
+  ASSERT_EQ(NS_OK, mCore->ValidateFolderRelocationRecovery(recovery));
+  ASSERT_EQ(NS_OK, messages.CheckFolderBodyAccess(child));
+  ASSERT_EQ(NS_OK, messages.CheckMessageBodyAccess(key));
+  ASSERT_EQ(NS_OK, messages.CheckMessageBodyAccess(stagedKey));
+  owner = nullptr;
+  ASSERT_TRUE(alive);
+  recovery->BlockAfterFailedRestore(NS_ERROR_STORAGE_CONSTRAINT,
+                                    NS_ERROR_FILE_ACCESS_DENIED);
+  recovery->BlockAfterFailedRestore(NS_ERROR_UNEXPECTED, NS_ERROR_FAILURE);
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, recovery->PrimaryError());
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, recovery->RollbackError());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            mCore->ValidateFolderRelocationRecovery(recovery));
+  mCore->DiscardFolderRelocationRecovery(recovery);
+  recovery = nullptr;
+  ASSERT_TRUE(alive);  // Core retains the recovery owner after stack eviction.
+  for (uint64_t id : {root, child}) {
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, mCore->CheckFolderRelocationRecovery(id));
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, messages.CheckFolderBodyAccess(id));
+  }
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, messages.CheckMessageBodyAccess(key));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, messages.CheckMessageBodyAccess(stagedKey));
+  MessageBodyState output;
+  output.key = nsMsgKey_None;
+  output.storeToken = Some(nsCString("unchanged"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, messages.GetMessageBodyState(key, output));
+  EXPECT_EQ(nsMsgKey_None, output.key);
+  ASSERT_TRUE(output.storeToken);
+  EXPECT_EQ("unchanged"_ns, *output.storeToken);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.UpdateName(root, "Unsafe"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.UpdateName(mFolderId, "Unsafe"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.MoveFolderTo(sibling, root));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.MoveFolderTo(child, sibling));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.DeleteFolder(mFolderId));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, folders.Reconcile(mFolderId, {}));
+  uint64_t notInserted = UINT64_MAX;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            folders.InsertFolder(child, "Unsafe"_ns, &notInserted));
+  EXPECT_EQ(UINT64_MAX, notInserted);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            folders.RelocateFolder(source, root, mFolderId, "Recovery"_ns,
+                                   sibling, "Moved"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(root, mFolderId, "Recovery"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, root, "Child"_ns));
+  uint64_t after;
+  ASSERT_EQ(NS_OK, SearchWatermark(after));
+  EXPECT_EQ(watermark, after);
+  nsCString text;
+  ASSERT_EQ(NS_OK, messages.GetMessageProperty(key, "Exact"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, messages.GetMessageReferences(key, references));
+  EXPECT_EQ((nsTArray<nsCString>{"one"_ns, "one"_ns}), references);
+  ASSERT_EQ(NS_OK, messages.CheckFolderBodyAccess(sibling));
+  ASSERT_EQ(NS_OK, messages.CheckMessageBodyAccess(siblingKey));
+  ASSERT_EQ(NS_OK, mCore->CheckFolderRelocationRecovery(mFolderId));
+  ASSERT_EQ(NS_OK, folders.UpdateName(sibling, "Still usable"_ns));
+  Stop();  // No recovery I/O; releasing the core's last holder releases owner.
+  EXPECT_FALSE(alive);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRelocationRecoveryPreparationKeepsOutputAndCallerState) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t root, child, outside;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Recovery"_ns, &root));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Child"_ns, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Outside"_ns, &outside));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RefPtr<RecoveryPlanOwner> owner = new RecoveryPlanOwner();
+  RefPtr<FolderRelocationRecovery> sentinel;
+  ASSERT_EQ(NS_OK, mCore->PrepareFolderRelocationRecovery(
+                       source, outside, {outside}, owner, sentinel));
+  RefPtr<FolderRelocationRecovery> output = sentinel;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->PrepareFolderRelocationRecovery(
+                "different-source"_ns, root, {root, child}, owner, output));
+  EXPECT_EQ(sentinel, output);
+  for (const auto& ids :
+       {nsTArray<uint64_t>{root}, nsTArray<uint64_t>{root, root},
+        nsTArray<uint64_t>{root, outside}}) {
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mCore->PrepareFolderRelocationRecovery(
+                                          source, root, ids, owner, output));
+    EXPECT_EQ(sentinel, output);
+  }
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, mCore->PrepareFolderRelocationRecovery(
+                                      source, root, {root, 0}, owner, output));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            mCore->PrepareFolderRelocationRecovery(source, root, {root, child},
+                                                   nullptr, output));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->PrepareFolderRelocationRecovery(
+                source, INT64_MAX, {uint64_t(INT64_MAX)}, owner, output));
+  EXPECT_EQ(sentinel, output);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            mCore->PrepareFolderRelocationRecovery(source, outside, {outside},
+                                                   owner, output));
+  EXPECT_EQ(sentinel, output);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(root, 47));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            mCore->PrepareFolderRelocationRecovery(source, root, {root, child},
+                                                   owner, output));
+  EXPECT_EQ(sentinel, output);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t metric;
+  ASSERT_EQ(NS_OK, RemovalMetric(root, metric));
+  EXPECT_EQ(47, metric);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, RemovalMetric(root, metric));
+  EXPECT_EQ(0, metric);
+  mCore->DiscardFolderRelocationRecovery(sentinel);
+  ASSERT_EQ(NS_OK, mCore->PrepareFolderRelocationRecovery(
+                       source, root, {root, child}, owner, output));
+  ASSERT_EQ(NS_OK, mCore->ValidateFolderRelocationRecovery(output));
+  mCore->DiscardFolderRelocationRecovery(output);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->ValidateFolderRelocationRecovery(output));
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRelocationRecoveryRevalidatesSubtreeAndRetiredOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t root, child;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Recovery"_ns, &root));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Child"_ns, &child));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RefPtr<RecoveryPlanOwner> owner = new RecoveryPlanOwner();
+  RefPtr<FolderRelocationRecovery> recovery;
+  ASSERT_EQ(NS_OK, mCore->PrepareFolderRelocationRecovery(
+                       source, root, {child, root}, owner, recovery));
+  uint64_t late;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Late"_ns, &late));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->ValidateFolderRelocationRecovery(recovery));
+  ASSERT_EQ(NS_OK, folders.DeleteFolder(late));
+  ASSERT_EQ(NS_OK, mCore->ValidateFolderRelocationRecovery(recovery));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW database_identity AS SELECT "
+                       "singleton,'{12345678-9ABC-4def-8123-0123456789ab}' AS "
+                       "sourceId FROM main.database_identity"_ns));
+  auto drop = MakeScopeExit([&] {
+    if (mConnection)
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP VIEW IF EXISTS temp.database_identity"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->ValidateFolderRelocationRecovery(recovery));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.database_identity"_ns));
+  ASSERT_EQ(NS_OK, mCore->ValidateFolderRelocationRecovery(recovery));
+  RefPtr<DatabaseCore> oldCore = mCore;
+  Stop();
+  EXPECT_FALSE(Connection());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            oldCore->ValidateFolderRelocationRecovery(recovery));
+  EXPECT_FALSE(Connection());
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->ValidateFolderRelocationRecovery(recovery));
+  recovery->BlockAfterFailedRestore(NS_ERROR_FAILURE,
+                                    NS_ERROR_FILE_ACCESS_DENIED);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CheckFolderBodyAccess(root));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().CheckFolderBodyAccess(child));
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRelocationRecoveryReadFailuresPreserveOutputAndPrimaryError) {
+  ASSERT_EQ(NS_OK, Start());
+  uint64_t root;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Recovery"_ns, &root));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  RefPtr<RecoveryPlanOwner> owner = new RecoveryPlanOwner();
+  RefPtr<FolderRelocationRecovery> output;
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("recovery_read_fault"_ns, 1, witness));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW database_identity AS "
+                       "SELECT singleton,sourceId FROM main.database_identity "
+                       "WHERE CASE WHEN recovery_read_fault(singleton)=0 "
+                       "THEN abs(-9223372036854775808) ELSE 1 END"_ns));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.database_identity"_ns));
+    EXPECT_EQ(NS_OK, mConnection->RemoveFunction("recovery_read_fault"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->PrepareFolderRelocationRecovery(
+                                  source, root, {root}, owner, output));
+  EXPECT_FALSE(output);
+  EXPECT_EQ(1u, witness->mCalls);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.database_identity"_ns));
+  ASSERT_EQ(NS_OK, mCore->PrepareFolderRelocationRecovery(source, root, {root},
+                                                          owner, output));
+  output->BlockAfterFailedRestore(NS_ERROR_STORAGE_CONSTRAINT,
+                                  NS_ERROR_FILE_ACCESS_DENIED);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW database_identity AS SELECT "
+                       "singleton,sourceId FROM main.database_identity WHERE "
+                       "CASE WHEN recovery_read_fault(singleton)=0 "
+                       "THEN abs(-9223372036854775808) ELSE 1 END"_ns));
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->MessageDB().CheckFolderBodyAccess(root));
+  EXPECT_EQ(2u, witness->mCalls);
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, output->PrimaryError());
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, output->RollbackError());
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.database_identity"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            mCore->MessageDB().CheckFolderBodyAccess(root));
 }
 
 }  // namespace mozilla::mailnews

@@ -151,6 +151,7 @@ class FolderDatabase : public nsIFolderDatabase {
                             const nsACString& serverKey);
 
   nsresult RequireCommittedHierarchyMutation();
+  nsresult CheckFolderRelocationRecovery(uint64_t folderId, bool subtree);
 
   nsresult SaveOrdinals(nsTArray<uint64_t> const& aFolders);
 

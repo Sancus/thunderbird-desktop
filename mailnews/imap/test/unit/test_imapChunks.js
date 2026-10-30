@@ -11,6 +11,10 @@ const { ServerTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/ServerTestUtils.sys.mjs"
 );
 
+let gChunkServer;
+let gChunkIncomingServer;
+let gCopyChunkSource;
+
 add_task(async function testSaveMessageToDisk() {
   const store = Services.prefs.getCharPref("mail.serverDefaultStoreContractID");
   Services.prefs.setCharPref("mail.server.default.storeContractID", store);
@@ -29,6 +33,8 @@ add_task(async function testSaveMessageToDisk() {
   incomingServer.port = imapServer.port;
   incomingServer.password = "password";
   account.incomingServer = incomingServer;
+  gChunkServer = imapServer;
+  gChunkIncomingServer = incomingServer;
   const panorama = Services.prefs.getBoolPref("mail.panorama.enabled", false);
   const databaseService = Cc[
     "@mozilla.org/msgDatabase/msgDBService;1"
@@ -291,3 +297,295 @@ add_task(async function testSaveMessageToDisk() {
     [8101]
   );
 });
+
+add_task(async function test_copyNoStopsBeforeMoveDeletion() {
+  await checkCopyChunkError("no-first-move", "NO", 1, true);
+});
+
+add_task(async function test_copyBadStopsLaterChunks() {
+  await checkCopyChunkError("bad-first-copy", "BAD", 1, false);
+});
+
+add_task(async function test_copyLateNoReportsPartialDestination() {
+  await checkCopyChunkError("no-second-copy", "NO", 2, false);
+});
+
+/**
+ * Checks a real chunked COPY failure without deleting the source or hiding it.
+ *
+ * @param {string} name - Unique folder/message identity suffix.
+ * @param {string} response - Tagged server rejection, NO or BAD.
+ * @param {number} rejectedChunk - One-based chunk to reject.
+ * @param {boolean} isMove - Requests the COPY/delete fallback for its error case.
+ * @returns {Promise<void>}
+ */
+async function checkCopyChunkError(name, response, rejectedChunk, isMove) {
+  const sourceName = "copy-chunk-source";
+  const destinationName = `copy-${name}-destination`;
+  const daemon = gChunkServer.daemon;
+  let remote;
+  let uids;
+  let text;
+  if (gCopyChunkSource) {
+    ({ remote, uids, text } = gCopyChunkSource);
+  } else {
+    remote = daemon.createMailbox(sourceName, {
+      subscribed: true,
+      uidvalidity: 9301,
+    });
+    text = uid =>
+      [
+        "From: copy@example.invalid",
+        "To: user@example.invalid",
+        `Message-ID: <${sourceName}-${uid}@example.invalid>`,
+        `Subject: Retain COPY source ${uid}`,
+        "",
+        `Exact ${sourceName} source body for UID ${uid}.`,
+        "",
+      ].join("\r\n");
+    // 400 sparse five-digit UIDs require three bounded commands. Reuse this
+    // real source unchanged across cases; each destination is independent.
+    uids = Array.from({ length: 400 }, (value, i) => 10001 + 2 * i);
+    const serverUids = [...uids, 10002].sort((a, b) => a - b);
+    for (const uid of serverUids) {
+      const message = new ImapMessage(
+        "data:text/plain;base64," + btoa(text(uid)),
+        uid,
+        []
+      );
+      if (uid == 10002) {
+        message.setFlag("Keepcopy");
+      }
+      remote.addMessage(message);
+    }
+    remote.uidnext = serverUids.at(-1) + 1;
+  }
+  const destination = daemon.createMailbox(destinationName, {
+    subscribed: true,
+    uidvalidity: 9302,
+  });
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    gChunkIncomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const panorama = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (!gCopyChunkSource) {
+    const source = gChunkIncomingServer.rootFolder
+      .getChildNamed(sourceName)
+      .QueryInterface(Ci.nsIMsgImapMailFolder);
+    const selected = new PromiseTestUtils.PromiseUrlListener();
+    source.updateFolderWithListener(null, selected);
+    await selected.promise;
+    const db = source.msgDatabase;
+    const keys = db.listAllKeys();
+    Assert.equal(keys.length, 401);
+    Assert.equal(db.dBFolderInfo.imapUidValidity, 9301);
+    const downloaded = new PromiseTestUtils.PromiseUrlListener();
+    source.downloadAllForOffline(downloaded, null);
+    await downloaded.promise;
+    const readBody = header => {
+      const stream = source.getMsgInputStream(header);
+      try {
+        let bytes = "";
+        while (stream.available()) {
+          bytes += NetUtil.readInputStreamToString(stream, stream.available());
+        }
+        return bytes;
+      } finally {
+        stream.close();
+      }
+    };
+    const originals = remote._messages.map(message => {
+      const uid = message.uid;
+      const header = db.getMsgHdrForMessageID(
+        `${sourceName}-${uid}@example.invalid`
+      );
+      Assert.ok(header);
+      if (panorama) {
+        Assert.notEqual(header.messageKey, uid);
+        Assert.equal(header.getUint32Property("uidOnServer"), uid);
+      } else {
+        Assert.equal(header.messageKey, uid);
+      }
+      Assert.ok(header.storeToken);
+      const bytes = readBody(header);
+      Assert.ok(
+        bytes.includes(`Exact ${sourceName} source body for UID ${uid}.`)
+      );
+      return {
+        uid,
+        header,
+        key: header.messageKey,
+        token: header.storeToken,
+        bytes,
+      };
+    });
+    const flags = remote._messages.map(message => [...message.flags]);
+    gCopyChunkSource = Object.freeze({
+      source,
+      remote,
+      db,
+      keys,
+      originals,
+      flags,
+      uids,
+      text,
+      readBody,
+    });
+  }
+  const { source, db, keys, originals, flags, readBody } = gCopyChunkSource;
+  const target = gChunkIncomingServer.rootFolder.getChildNamed(destinationName);
+  Assert.equal(
+    source.msgStore.storeType,
+    gChunkIncomingServer.msgStore.storeType
+  );
+  Assert.equal(target.msgStore.storeType, source.msgStore.storeType);
+  Assert.equal(uids.length, 400);
+  const beforeDestinationUid = destination.uidnext;
+  const commands = [];
+  const destructive = [];
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalCopy = proto.COPY;
+  const originalStore = proto.STORE;
+  const originalExpunge = proto.EXPUNGE;
+  let reject = true;
+  proto.COPY = function (args, isUid) {
+    Assert.equal(this._selectedMailbox, remote);
+    Assert.ok(isUid);
+    Assert.equal(args[1], destinationName);
+    const chunk = String(args[0]).split(",").map(Number);
+    commands.push(chunk);
+    if (reject && commands.length == rejectedChunk) {
+      return `${response} copy chunk rejected`;
+    }
+    return originalCopy.call(this, args, isUid);
+  };
+  proto.STORE = function (args, isUid) {
+    if (this._selectedMailbox == remote) {
+      destructive.push("STORE");
+    }
+    return originalStore.call(this, args, isUid);
+  };
+  proto.EXPUNGE = function (...args) {
+    if (this._selectedMailbox == remote) {
+      destructive.push("EXPUNGE");
+    }
+    return originalExpunge.apply(this, args);
+  };
+  const deleted = [];
+  const notifier = {
+    msgsDeleted(items) {
+      deleted.push(...items.filter(item => item.folder == source));
+    },
+  };
+  MailServices.mfn.addListener(
+    notifier,
+    Ci.nsIMsgFolderNotificationService.msgsDeleted
+  );
+  const runCopy = async move => {
+    const calls = { starts: 0, stops: 0 };
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStartRunningUrl() {
+        calls.starts++;
+      },
+      OnStopRunningUrl() {
+        calls.stops++;
+      },
+    });
+    const out = {};
+    // This public raw UID API reports protocol completion, not native staged
+    // destination publication. No copyState or destination key is invented.
+    MailServices.imap.onlineMessageCopy(
+      source,
+      uids.join(","),
+      target,
+      true,
+      move,
+      listener,
+      out,
+      null,
+      null
+    );
+    const result = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    Assert.ok(out.value);
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    return result;
+  };
+  const checkSource = () => {
+    Assert.deepEqual(db.listAllKeys(), keys);
+    Assert.equal(db.dBFolderInfo.imapUidValidity, 9301);
+    Assert.equal(remote.uidvalidity, 9301);
+    Assert.deepEqual(
+      remote._messages.map(message => message.flags),
+      flags
+    );
+    for (const message of remote._messages) {
+      Assert.equal(message.getText(), text(message.uid));
+    }
+    for (const saved of originals) {
+      Assert.equal(saved.header.messageKey, saved.key);
+      Assert.equal(saved.header.storeToken, saved.token);
+      if (panorama) {
+        Assert.equal(saved.header.getUint32Property("uidOnServer"), saved.uid);
+      }
+      Assert.equal(readBody(saved.header), saved.bytes);
+    }
+    Assert.deepEqual(deleted, []);
+    Assert.deepEqual(destructive, []);
+  };
+  try {
+    const result = await runCopy(isMove);
+    Assert.equal(
+      result,
+      Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED,
+      `COPY chunk sizes=${commands.map(chunk => chunk.length)}; following=${destructive}`
+    );
+    Assert.equal(commands.length, rejectedChunk);
+    const sent = commands.flat();
+    Assert.deepEqual(sent, uids.slice(0, sent.length));
+    Assert.less(
+      sent.length,
+      uids.length,
+      "The rejected chunk leaves later input unsent"
+    );
+    const copied = commands.slice(0, rejectedChunk - 1).flat();
+    Assert.equal(destination._messages.length, copied.length);
+    Assert.equal(destination.uidnext, beforeDestinationUid + copied.length);
+    Assert.deepEqual(
+      destination._messages.map(message => message.getText()),
+      copied.map(uid => text(uid))
+    );
+    checkSource();
+    if (rejectedChunk == 1) {
+      // The observed fixture destination is empty. An explicit COPY retry is
+      // safe here; do not retry the whole selection after a partial COPY.
+      reject = false;
+      commands.length = 0;
+      const retryDestinationUid = destination.uidnext;
+      Assert.equal(await runCopy(false), Cr.NS_OK);
+      Assert.greater(commands.length, 2);
+      Assert.deepEqual(commands.flat(), uids);
+      Assert.equal(destination._messages.length, uids.length);
+      Assert.deepEqual(
+        destination._messages.map(message => message.uid),
+        uids.map((uid, i) => retryDestinationUid + i)
+      );
+      Assert.deepEqual(
+        destination._messages.map(message => message.getText()),
+        uids.map(uid => text(uid))
+      );
+      checkSource();
+    }
+  } finally {
+    proto.COPY = originalCopy;
+    proto.STORE = originalStore;
+    proto.EXPUNGE = originalExpunge;
+    MailServices.mfn.removeListener(notifier);
+  }
+}

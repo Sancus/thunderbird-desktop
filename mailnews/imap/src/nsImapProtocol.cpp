@@ -3514,7 +3514,8 @@ void nsImapProtocol::ProcessSelectedStateURL() {
             copyState = ImapOnlineCopyStateType::kInterruptedState;
           else
             copyState =
-                GetServerStateParser().LastCommandSuccessful()
+                NS_SUCCEEDED(m_mailboxUpdateResult) &&
+                        GetServerStateParser().LastCommandSuccessful()
                     ? (ImapOnlineCopyState)
                           ImapOnlineCopyStateType::kSuccessfulCopy
                     : (ImapOnlineCopyState)ImapOnlineCopyStateType::kFailedCopy;
@@ -3522,7 +3523,8 @@ void nsImapProtocol::ProcessSelectedStateURL() {
             m_imapMailFolderSink->OnlineCopyCompleted(this, copyState);
           // Don't mark message 'Deleted' for servers that support the MOVE
           // extension, since we already issued a 'move' command.
-          if (GetServerStateParser().LastCommandSuccessful() &&
+          if (!DeathSignalReceived() && NS_SUCCEEDED(m_mailboxUpdateResult) &&
+              GetServerStateParser().LastCommandSuccessful() &&
               (m_imapAction == nsIImapUrl::nsImapOnlineMove) &&
               !(GetServerStateParser().GetCapabilityFlag() &
                 kHasMoveCapability)) {
@@ -3531,6 +3533,7 @@ void nsImapProtocol::ProcessSelectedStateURL() {
             Store(messageIdString, "+FLAGS (\\Deleted \\Seen)",
                   bMessageIdsAreUids);
             bool storeSuccessful =
+                !DeathSignalReceived() && NS_SUCCEEDED(m_mailboxUpdateResult) &&
                 GetServerStateParser().LastCommandSuccessful();
             if (storeSuccessful) {
               // We are simulating a imap MOVE (on the same server). The
@@ -8315,6 +8318,7 @@ void nsImapProtocol::Search(const char* searchCriteria, bool useUID,
 
 void nsImapProtocol::Copy(const char* messageList,
                           const char* destinationMailbox, bool idsAreUid) {
+  if (NS_FAILED(m_mailboxUpdateResult)) return;
   IncrementCommandTagNumber();
 
   nsCString escapedDestination;
@@ -8358,6 +8362,16 @@ void nsImapProtocol::Copy(const char* messageList,
 
     nsresult rv = SendData(protocolString.get());
     if (NS_SUCCEEDED(rv)) ParseIMAPandCheckForNewMail(protocolString.get());
+    if (NS_SUCCEEDED(rv)) rv = GetConnectionStatus();
+    if (NS_SUCCEEDED(rv) && !GetServerStateParser().LastCommandSuccessful()) {
+      rv = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+    }
+    if (NS_SUCCEEDED(rv) && DeathSignalReceived()) rv = NS_BINDING_ABORTED;
+    if (NS_FAILED(rv) || NS_FAILED(m_mailboxUpdateResult)) {
+      // No later chunk or delete fallback may hide the first COPY failure.
+      if (NS_SUCCEEDED(m_mailboxUpdateResult)) m_mailboxUpdateResult = rv;
+      return;
+    }
   } while (msgCountLeft > 0 && !DeathSignalReceived());
 }
 

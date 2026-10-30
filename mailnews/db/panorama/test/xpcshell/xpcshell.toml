@@ -13,6 +13,7 @@ support-files = [
   "db/move.sql",
   "db/relations.sql",
   "db/sortGroups.sql",
+  "head_delivery.js",
 ]
 tags = ["panorama"]
 

@@ -1,0 +1,34 @@
+[DEFAULT]
+head = "head.js head_delivery.js"
+prefs = ["mail.panorama.enabled=true"]
+support-files = [
+  "data/migration",
+  "data/migration.msf",
+]
+tags = ["panorama-delivery"]
+
+["test_deliveryCoreAddOwnership.js"]
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]
+
+["test_deliveryCoreAddRollback.js"]
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]
+
+["test_deliveryCoreMigrationFailure.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
+["test_deliveryCoreNativeAfterMigration.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]

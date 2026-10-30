@@ -31,15 +31,6 @@ if CONFIG["MOZ_PANORAMA"]:
         "unit/xpcshell-panorama-discovery-repeat-panorama-mbox.toml",
     ]
 
-    if "comm" in CONFIG["MOZ_BUILD_APP"]:
-        test_harness_base = TEST_HARNESS_FILES.xpcshell.comm
-    else:
-        test_harness_base = TEST_HARNESS_FILES.xpcshell
-
-    test_harness_base.mailnews.db.panorama.test.xpcshell += [
-        "/comm/mailnews/db/panorama/test/xpcshell/head_delivery.js",
-    ]
-
 LOCAL_INCLUDES += [
     "../../base/src",
     "../src",

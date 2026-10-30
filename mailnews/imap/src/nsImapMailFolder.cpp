@@ -4425,23 +4425,39 @@ NS_IMETHODIMP nsImapMailFolder::StoreImapFlags(int32_t flags, bool addFlags,
       rv = imapService->SubtractMessageFlags(
           this, aUrlListener ? aUrlListener : this, msgIds, flags, true);
   } else {
-    rv = GetDatabase();
-    if (NS_SUCCEEDED(rv) && mDatabase) {
-      nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
-          do_QueryInterface(mDatabase, &rv);
-      NS_ENSURE_SUCCESS(rv, rv);
-      for (auto key : keys) {
-        nsCOMPtr<nsIMsgOfflineImapOperation> op;
-        rv = opsDb->GetOfflineOpForKey(key, true, getter_AddRefs(op));
-        SetFlag(nsMsgFolderFlags::OfflineEvents);
-        if (NS_SUCCEEDED(rv) && op) {
-          imapMessageFlagsType newFlags;
-          op->GetNewFlags(&newFlags);
-          op->SetFlagOperation(addFlags ? newFlags | flags : newFlags & ~flags);
-        }
+    MOZ_TRY(GetDatabase());
+    NS_ENSURE_STATE(mDatabase);
+    nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
+        do_QueryInterface(mDatabase, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    for (auto key : keys) {
+      nsCOMPtr<nsIMsgOfflineImapOperation> op;
+      rv = opsDb->GetOfflineOpForKey(key, true, getter_AddRefs(op));
+      if (NS_FAILED(rv)) break;
+      if (!op) {
+        rv = NS_ERROR_NOT_AVAILABLE;
+        break;
       }
-      opsDb->Commit(nsMsgDBCommitType::kLargeCommit);  // flush offline flags
+      rv = SetFlag(nsMsgFolderFlags::OfflineEvents);
+      if (NS_FAILED(rv)) break;
+      imapMessageFlagsType newFlags;
+      rv = op->GetNewFlags(&newFlags);
+      if (NS_FAILED(rv)) break;
+      rv =
+          op->SetFlagOperation(addFlags ? newFlags | flags : newFlags & ~flags);
+      if (NS_FAILED(rv)) break;
     }
+    // Keep earlier queued keys discoverable if a later key failed.
+    nsresult commitRv = opsDb->Commit(nsMsgDBCommitType::kLargeCommit);
+    if (NS_FAILED(rv)) {
+      if (NS_FAILED(commitRv)) {
+        MOZ_LOG(IMAP, mozilla::LogLevel::Error,
+                ("Committing earlier offline flag changes failed: 0x%08x",
+                 static_cast<uint32_t>(commitRv)));
+      }
+      return rv;
+    }
+    return commitRv;
   }
   return rv;
 }
@@ -9084,25 +9100,43 @@ nsImapMailFolder::StoreCustomKeywords(nsIMsgWindow* aMsgWindow,
   if (aKeysToStore.IsEmpty()) return NS_OK;
   nsresult rv = NS_OK;
   if (WeAreOffline()) {
-    GetDatabase();
-    if (!mDatabase) return NS_ERROR_UNEXPECTED;
+    MOZ_TRY(GetDatabase());
+    NS_ENSURE_STATE(mDatabase);
     nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
         do_QueryInterface(mDatabase, &rv);
     NS_ENSURE_SUCCESS(rv, rv);
     for (auto key : aKeysToStore) {
       nsCOMPtr<nsIMsgOfflineImapOperation> op;
-      nsresult rv2 = opsDb->GetOfflineOpForKey(key, true, getter_AddRefs(op));
-      if (NS_FAILED(rv2)) rv = rv2;
-      SetFlag(nsMsgFolderFlags::OfflineEvents);
-      if (NS_SUCCEEDED(rv2) && op) {
-        if (!aFlagsToAdd.IsEmpty())
-          op->AddKeywordToAdd(PromiseFlatCString(aFlagsToAdd).get());
-        if (!aFlagsToSubtract.IsEmpty())
-          op->AddKeywordToRemove(PromiseFlatCString(aFlagsToSubtract).get());
+      rv = opsDb->GetOfflineOpForKey(key, true, getter_AddRefs(op));
+      if (NS_FAILED(rv)) break;
+      if (!op) {
+        rv = NS_ERROR_NOT_AVAILABLE;
+        break;
+      }
+      rv = SetFlag(nsMsgFolderFlags::OfflineEvents);
+      if (NS_FAILED(rv)) break;
+      if (!aFlagsToAdd.IsEmpty()) {
+        rv = op->AddKeywordToAdd(PromiseFlatCString(aFlagsToAdd).get());
+        if (NS_FAILED(rv)) break;
+      }
+      if (!aFlagsToSubtract.IsEmpty()) {
+        rv = op->AddKeywordToRemove(PromiseFlatCString(aFlagsToSubtract).get());
+        if (NS_FAILED(rv)) break;
       }
     }
-    mDatabase->Commit(nsMsgDBCommitType::kLargeCommit);  // flush offline ops
-    return rv;
+    // Earlier keys or keyword additions may already be queued.
+    nsresult commitRv = opsDb->Commit(nsMsgDBCommitType::kLargeCommit);
+    if (NS_FAILED(rv)) {
+      if (NS_FAILED(commitRv)) {
+        MOZ_LOG(IMAP, mozilla::LogLevel::Error,
+                ("Committing earlier offline keywords failed: 0x%08x",
+                 static_cast<uint32_t>(commitRv)));
+      }
+      return rv;
+    }
+    NS_ENSURE_SUCCESS(commitRv, commitRv);
+    if (_retval) *_retval = nullptr;
+    return NS_OK;
   }
 
   MOZ_TRY(GetDatabase());

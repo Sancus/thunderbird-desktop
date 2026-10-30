@@ -993,6 +993,209 @@ if (panorama) {
   });
 }
 
+add_task(async function test_offlineFlagMasksPreserveSourceState() {
+  const { folder, remote, db, headers } =
+    await makePendingFolder("offline-mask-queue");
+  const header = headers[0];
+  const key = header.messageKey;
+  const markedRead = new PromiseTestUtils.PromiseUrlListener();
+  folder.storeImapFlags(0x01, true, [key], markedRead);
+  await markedRead.promise;
+  Assert.ok(header.flags & Ci.nsMsgMessageFlags.Read);
+  const originalFlags = header.flags;
+  const bytes = storedBody(folder, header);
+  const seed = originalFlags & 0xffff; // imapMessageFlagsType is uint16.
+  Services.io.offline = true;
+  try {
+    folder.storeImapFlags(0x04, true, [key], null);
+    let op = db.getOfflineOpForKey(key, false);
+    Assert.equal(op.operation, Ci.nsIMsgOfflineImapOperation.kFlagsChanged);
+    Assert.equal(op.newFlags, seed | 0x04);
+    folder.storeImapFlags(0x04, false, [key], null);
+    op = db.getOfflineOpForKey(key, false);
+    Assert.equal(op.newFlags, seed & ~0x04);
+    folder.storeCustomKeywords(null, "keep-tag", "drop-tag", [key]);
+    op = db.getOfflineOpForKey(key, false);
+    Assert.equal(
+      op.operation,
+      Ci.nsIMsgOfflineImapOperation.kFlagsChanged |
+        Ci.nsIMsgOfflineImapOperation.kAddKeywords |
+        Ci.nsIMsgOfflineImapOperation.kRemoveKeywords
+    );
+    Assert.equal(op.newFlags, seed & ~0x04);
+    Assert.equal(op.keywordsToAdd, "keep-tag");
+    Assert.equal(op.keywordsToRemove, "drop-tag");
+    Assert.ok(folder.flags & Ci.nsMsgFolderFlags.OfflineEvents);
+    Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
+    Assert.equal(header.messageKey, key);
+    Assert.equal(header.flags, originalFlags);
+    Assert.equal(storedBody(folder, header), bytes);
+    Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7101);
+    Assert.deepEqual(
+      remote._messages.map(message => message.uid),
+      [6101, 6102]
+    );
+    Assert.deepEqual(remote._messages[0].flags, ["\\Seen"]);
+  } finally {
+    Services.io.offline = false;
+  }
+});
+
+/**
+ * Checks a real persisted queue failure without queueing later keys.
+ *
+ * @param {number} failedIndex - Physical key whose INSERT is rejected.
+ * @param {"flags"|"keywords"} [kind="flags"] - The queued operation.
+ * @param {"create"|"update"|"remove"} [mutation="create"] - The rejected write.
+ * @returns {Promise<void>} Resolves after checking retained state.
+ */
+async function checkOfflineQueueFailure(
+  failedIndex,
+  kind = "flags",
+  mutation = "create"
+) {
+  const keywords = kind == "keywords";
+  const updating = mutation != "create";
+  const { folder, remote, db, headers } = await makePendingFolder(
+    `offline-queue-${kind}-${failedIndex}-${mutation}`
+  );
+  const keys = headers.map(header => header.messageKey);
+  const bytes = storedBody(folder, headers[0]);
+  const token = headers[0].storeToken;
+  const seed = headers[0].flags & 0xffff;
+  Assert.deepEqual(db.listAllOfflineOpIds(), []);
+  const connection = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  ).connectionForTests;
+  let condition = " ";
+  if (mutation == "remove") {
+    condition = ` AND (NEW.operation & ${Ci.nsIMsgOfflineImapOperation.kRemoveKeywords})!=0 `;
+  } else if (updating) {
+    condition = " AND NEW.operation!=0 ";
+  }
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_offline_flag BEFORE INSERT ON offline_operations " +
+      `WHEN NEW.folderId=${folder.id} AND NEW.messageKey=${keys[failedIndex]}` +
+      condition +
+      "BEGIN SELECT RAISE(ABORT,'offline flag'); END"
+  );
+  const deleted = [];
+  const listener = {
+    msgsDeleted(items) {
+      deleted.push(...items.filter(header => header.folder == folder));
+    },
+  };
+  MailServices.mfn.addListener(
+    listener,
+    Ci.nsIMsgFolderNotificationService.msgsDeleted
+  );
+  Services.io.offline = true;
+  try {
+    Assert.throws(
+      () =>
+        keywords
+          ? folder.storeCustomKeywords(null, "keep-tag", "drop-tag", keys)
+          : folder.storeImapFlags(0x04, true, keys, null),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    const retained = failedIndex || updating ? [keys[0]] : [];
+    Assert.deepEqual(db.listAllOfflineOpIds(), retained);
+    if (retained.length) {
+      const op = db.getOfflineOpForKey(keys[0], false);
+      if (keywords) {
+        let expectedOperation = 0;
+        if (mutation == "create") {
+          expectedOperation =
+            Ci.nsIMsgOfflineImapOperation.kAddKeywords |
+            Ci.nsIMsgOfflineImapOperation.kRemoveKeywords;
+        } else if (mutation == "remove") {
+          expectedOperation = Ci.nsIMsgOfflineImapOperation.kAddKeywords;
+        }
+        Assert.equal(op.operation, expectedOperation);
+        Assert.equal(op.newFlags, seed);
+        Assert.equal(op.keywordsToAdd, mutation == "update" ? "" : "keep-tag");
+        Assert.equal(
+          op.keywordsToRemove,
+          mutation == "create" ? "drop-tag" : ""
+        );
+      } else {
+        Assert.equal(
+          op.operation,
+          updating ? 0 : Ci.nsIMsgOfflineImapOperation.kFlagsChanged
+        );
+        Assert.equal(op.newFlags, updating ? seed : seed | 0x04);
+      }
+      Assert.ok(folder.flags & Ci.nsMsgFolderFlags.OfflineEvents);
+      const statement = connection.createStatement(
+        "SELECT folderId, messageKey, epoch, uid, folderEpoch " +
+          "FROM offline_operations WHERE folderId=:folder AND messageKey=:key"
+      );
+      try {
+        statement.params.folder = folder.id;
+        statement.params.key = keys[0];
+        Assert.ok(statement.executeStep());
+        Assert.deepEqual(
+          [
+            statement.row.folderId,
+            statement.row.messageKey,
+            statement.row.epoch,
+            statement.row.uid,
+            statement.row.folderEpoch,
+          ],
+          [folder.id, keys[0], 7101, 6101, null]
+        );
+        Assert.ok(!statement.executeStep());
+      } finally {
+        statement.finalize();
+      }
+    } else {
+      Assert.equal(folder.flags & Ci.nsMsgFolderFlags.OfflineEvents, 0);
+    }
+    Assert.deepEqual(db.listAllKeys(), keys);
+    Assert.deepEqual(deleted, []);
+    Assert.equal(headers[0].storeToken, token);
+    Assert.equal(storedBody(folder, headers[0]), bytes);
+    Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7101);
+    Assert.deepEqual(
+      remote._messages.map(message => message.uid),
+      [6101, 6102]
+    );
+    Assert.deepEqual(
+      remote._messages.map(message => message.flags),
+      [[], []]
+    );
+  } finally {
+    Services.io.offline = false;
+    MailServices.mfn.removeListener(listener);
+    connection.executeSimpleSQL("DROP TRIGGER reject_offline_flag");
+  }
+}
+
+if (panorama) {
+  add_task(async function test_offlineFlagCreationFailureStopsAtFirstKey() {
+    await checkOfflineQueueFailure(0);
+  });
+  add_task(
+    async function test_offlineFlagCreationFailureRetainsEarlierIntent() {
+      await checkOfflineQueueFailure(1);
+    }
+  );
+  add_task(async function test_offlineFlagUpdateFailureRetainsCapturedSource() {
+    await checkOfflineQueueFailure(0, "flags", "update");
+  });
+  add_task(async function test_offlineKeywordCreationFailureStopsAtFirstKey() {
+    await checkOfflineQueueFailure(0, "keywords");
+  });
+  add_task(
+    async function test_offlineKeywordWriteFailureRetainsCapturedSource() {
+      await checkOfflineQueueFailure(0, "keywords", "update");
+    }
+  );
+  add_task(async function test_offlineKeywordRemoveFailureRetainsEarlierAdd() {
+    await checkOfflineQueueFailure(0, "keywords", "remove");
+  });
+}
+
 add_task(function endTest() {
   teardownIMAPPump();
 });

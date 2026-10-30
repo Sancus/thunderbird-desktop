@@ -477,6 +477,8 @@ class MessageDatabase : public nsIMessageDatabase {
 
   nsresult SetMessageFlags(nsMsgKey key, uint32_t flags);
   nsresult SetMessageFlag(nsMsgKey key, uint32_t flag, bool value);
+  // Cached structural fields own their transaction; an active caller
+  // transaction is rejected before writing or changing hot state.
   nsresult SetMessagePriority(nsMsgKey key, nsMsgPriorityValue priority);
   nsresult SetMessageDate(nsMsgKey key, PRTime date);
   // Size setters retain the public/stored uint32 width; overflow is rejected.
@@ -484,6 +486,7 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult SetMessageLineCount(nsMsgKey key, uint32_t size);
   nsresult SetMessageOfflineMessageSize(nsMsgKey key, uint64_t size);
   nsresult SetMessageStoreToken(nsMsgKey key, const nsACString& token);
+  // Same owned-transaction boundary as priority/date above.
   nsresult SetMessageMessageId(nsMsgKey key, const nsACString& messageId);
   nsresult SetMessageCcList(nsMsgKey key, const nsACString& ccList);
   nsresult SetMessageBccList(nsMsgKey key, const nsACString& bccList);

@@ -350,6 +350,187 @@ class DeliveryCoreReferences : public testing::Test {
     return mCore->MessageDB().GetSearchWatermark(sequence);
   }
 
+  enum class StructuralFailure { None, CallerTransaction, Write, Commit };
+
+  void CheckStructuralFieldWrites(bool staged, StructuralFailure failure) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& db = mCore->MessageDB();
+    RawHdr raw;
+    raw.messageId = "structural-before"_ns;
+    raw.sender = "before sender"_ns;
+    raw.recipients = "before recipients"_ns;
+    raw.ccList = "before cc"_ns;
+    raw.bccList = "before bcc"_ns;
+    raw.subject = "before subject"_ns;
+    raw.date = 1234567890123;
+    raw.priority = nsMsgPriority::lowest;
+    raw.references = {"first"_ns, "second"_ns, "first"_ns};
+    raw.extras.AppendElement(RawHdr::kv{"Exact"_ns, "00042"_ns});
+    nsMsgKey key, control;
+    ASSERT_EQ(NS_OK, staged ? db.StageMessage(mFolderId, raw, &key)
+                            : db.AddMessage(mFolderId, raw, false, &key));
+    ASSERT_EQ(NS_OK, Add("unrelated-control"_ns, {}, control));
+    // These inputs are deliberately exact, including whitespace and UTF-8.
+    const nsCString changed = "  Case Caf\xC3\xA9 00042  "_ns;
+    const PRTime changedDate = 9876543210123;
+    auto check = [&](bool updated) {
+      nsMsgPriorityValue priority = nsMsgPriority::none;
+      EXPECT_EQ(NS_OK, db.GetMessagePriority(key, priority));
+      EXPECT_EQ(updated ? nsMsgPriority::highest : raw.priority, priority);
+      PRTime date = -1;
+      EXPECT_EQ(NS_OK, db.GetMessageDate(key, date));
+      EXPECT_EQ(updated ? changedDate : raw.date, date);
+      nsCString value;
+      EXPECT_EQ(NS_OK, db.GetMessageMessageId(key, value));
+      EXPECT_EQ(updated ? changed : raw.messageId, value);
+      EXPECT_EQ(NS_OK, db.GetMessageSender(key, value));
+      EXPECT_EQ(updated ? changed : raw.sender, value);
+      EXPECT_EQ(NS_OK, db.GetMessageRecipients(key, value));
+      EXPECT_EQ(updated ? changed : raw.recipients, value);
+      EXPECT_EQ(NS_OK, db.GetMessageCcList(key, value));
+      EXPECT_EQ(updated ? changed : raw.ccList, value);
+      EXPECT_EQ(NS_OK, db.GetMessageBccList(key, value));
+      EXPECT_EQ(updated ? nsCString() : raw.bccList, value);
+      EXPECT_EQ(NS_OK, db.GetMessageSubject(key, value));
+      EXPECT_EQ(updated ? changed : raw.subject, value);
+    };
+    check(false);  // Prime the real hot row before either SQL failure.
+    const std::function<nsresult()> writes[] = {
+        [&] { return db.SetMessagePriority(key, nsMsgPriority::highest); },
+        [&] { return db.SetMessageDate(key, changedDate); },
+        [&] { return db.SetMessageMessageId(key, changed); },
+        [&] { return db.SetMessageSender(key, changed); },
+        [&] { return db.SetMessageRecipients(key, changed); },
+        [&] { return db.SetMessageCcList(key, changed); },
+        [&] { return db.SetMessageBccList(key, EmptyCString()); },
+        [&] { return db.SetMessageSubject(key, changed); }};
+    {
+      RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+      uint32_t callbacks = 0;
+      observer->action = [&](char, const CapturedMessage&,
+                             const CapturedMessage&, Message*,
+                             bool) { ++callbacks; };
+      db.AddMessageListener(observer);
+      auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+      RefPtr<FaultWitness> witness = new FaultWitness();
+      const bool fault = failure == StructuralFailure::Write ||
+                         failure == StructuralFailure::Commit;
+      if (fault) {
+        ASSERT_EQ(NS_OK, mConnection->CreateFunction("structural_witness"_ns, 1,
+                                                     witness));
+        if (failure == StructuralFailure::Commit) {
+          ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                               "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                               "structural_parent(id INTEGER PRIMARY KEY); "
+                               "CREATE TEMP TABLE structural_child(id INTEGER "
+                               "REFERENCES structural_parent(id) DEFERRABLE "
+                               "INITIALLY DEFERRED)"_ns));
+        }
+        nsAutoCString sql("CREATE TEMP TRIGGER structural_fault ");
+        sql.Append(failure == StructuralFailure::Commit ? "AFTER" : "BEFORE");
+        sql.AppendLiteral(" UPDATE ON main.");
+        sql.Append(staged ? "staged_messages" : "messages");
+        sql.AppendLiteral(" WHEN OLD.id=");
+        sql.AppendInt(key);
+        sql.AppendLiteral(" BEGIN SELECT structural_witness(OLD.id); ");
+        sql.Append(failure == StructuralFailure::Commit
+                       ? "INSERT INTO structural_child VALUES(OLD.id); END"
+                       : "SELECT RAISE(ABORT,'structural write'); END");
+        ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+      }
+      auto cleanup = MakeScopeExit([&] {
+        if (fault) {
+          EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                               "DROP TRIGGER IF EXISTS structural_fault"_ns));
+          EXPECT_EQ(NS_OK,
+                    mConnection->RemoveFunction("structural_witness"_ns));
+        }
+        bool active = false;
+        EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+      });
+      if (failure == StructuralFailure::CallerTransaction) {
+        ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+        ASSERT_EQ(NS_OK,
+                  db.SetMessageProperty(control, "caller"_ns, "pending"_ns));
+      }
+      if (failure != StructuralFailure::None) {
+        for (const auto& write : writes) {
+          EXPECT_EQ(fault ? NS_ERROR_STORAGE_CONSTRAINT : NS_ERROR_IN_PROGRESS,
+                    write());
+          check(false);
+        }
+        bool active = false;
+        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        EXPECT_EQ(failure == StructuralFailure::CallerTransaction, active);
+        if (fault) {
+          EXPECT_EQ(8u, witness->mCalls);
+          EXPECT_EQ(int64_t(key), witness->mLastKey);
+          ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                               "DROP TRIGGER structural_fault"_ns));
+          if (failure == StructuralFailure::Commit) {
+            nsCOMPtr<mozIStorageStatement> leftovers;
+            ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                                 "SELECT id FROM structural_child"_ns,
+                                 getter_AddRefs(leftovers)));
+            bool more = true;
+            ASSERT_EQ(NS_OK, leftovers->ExecuteStep(&more));
+            EXPECT_FALSE(more);
+          }
+        } else {
+          nsCString value;
+          ASSERT_EQ(NS_OK, db.GetMessageProperty(control, "caller"_ns, value));
+          EXPECT_EQ("pending"_ns, value);
+          ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+          check(false);
+          ASSERT_EQ(NS_OK, db.GetMessageProperty(control, "caller"_ns, value));
+          EXPECT_TRUE(value.IsEmpty());
+        }
+        EXPECT_EQ(0u, callbacks);
+        EXPECT_EQ(0u, observer->ordinary);
+      }
+      // All eight operations retry normally after rejection/rollback.
+      for (const auto& write : writes) ASSERT_EQ(NS_OK, write());
+      check(true);
+      EXPECT_EQ(0u, callbacks);
+      EXPECT_EQ(0u, observer->ordinary);
+      nsCString controlId;
+      ASSERT_EQ(NS_OK, db.GetMessageMessageId(control, controlId));
+      EXPECT_EQ("unrelated-control"_ns, controlId);
+    }
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    // Use the reopened core rather than the destroyed db reference.
+    auto& reopened = mCore->MessageDB();
+    nsCString value;
+    ASSERT_EQ(NS_OK, reopened.GetMessageMessageId(key, value));
+    EXPECT_EQ(changed, value);
+    ASSERT_EQ(NS_OK, reopened.GetMessageSender(key, value));
+    EXPECT_EQ(changed, value);
+    ASSERT_EQ(NS_OK, reopened.GetMessageRecipients(key, value));
+    EXPECT_EQ(changed, value);
+    ASSERT_EQ(NS_OK, reopened.GetMessageCcList(key, value));
+    EXPECT_EQ(changed, value);
+    ASSERT_EQ(NS_OK, reopened.GetMessageBccList(key, value));
+    EXPECT_TRUE(value.IsEmpty());
+    ASSERT_EQ(NS_OK, reopened.GetMessageSubject(key, value));
+    EXPECT_EQ(changed, value);
+    nsMsgPriorityValue priority = nsMsgPriority::none;
+    ASSERT_EQ(NS_OK, reopened.GetMessagePriority(key, priority));
+    EXPECT_EQ(nsMsgPriority::highest, priority);
+    PRTime date = -1;
+    ASSERT_EQ(NS_OK, reopened.GetMessageDate(key, date));
+    EXPECT_EQ(changedDate, date);
+    nsTArray<nsCString> refs;
+    ASSERT_EQ(NS_OK, reopened.GetMessageReferences(key, refs));
+    EXPECT_EQ(raw.references, refs);
+    ASSERT_EQ(NS_OK, reopened.GetMessageProperty(key, "Exact"_ns, value));
+    EXPECT_EQ("00042"_ns, value);
+    bool published = false;
+    ASSERT_EQ(NS_OK, reopened.MessageExists(key, published));
+    EXPECT_EQ(!staged, published);
+  }
+
   nsresult Start() {
     // This native fixture selects the concrete Panorama implementation
     // directly.
@@ -10302,6 +10483,41 @@ TEST_F(DeliveryCoreReferences, FolderRemovalAcceptsNativeSignedFlagWords) {
       ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, actualBytes));
       EXPECT_EQ(expectedBytes, actualBytes);
     }
+  }
+}
+
+TEST_F(DeliveryCoreReferences, StructuralFieldsCommitBeforeHotStateAndReopen) {
+  for (bool staged : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(
+        CheckStructuralFieldWrites(staged, StructuralFailure::None));
+    Stop();
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       StructuralFieldsKeepCallerTransactionAndHotState) {
+  for (bool staged : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(CheckStructuralFieldWrites(
+        staged, StructuralFailure::CallerTransaction));
+    Stop();
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       StructuralFieldWriteFailuresKeepStoredAndHotFacts) {
+  for (bool staged : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(
+        CheckStructuralFieldWrites(staged, StructuralFailure::Write));
+    Stop();
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       StructuralFieldCommitFailuresKeepStoredAndHotFacts) {
+  for (bool staged : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(
+        CheckStructuralFieldWrites(staged, StructuralFailure::Commit));
+    Stop();
   }
 }
 

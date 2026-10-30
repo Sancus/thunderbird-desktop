@@ -4821,22 +4821,30 @@ nsresult MessageDatabase::SetMessageFlag(nsMsgKey key, uint32_t flag,
 
 nsresult MessageDatabase::SetMessagePriority(nsMsgKey key,
                                              nsMsgPriorityValue priority) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessagePriority"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET priority = :priority WHERE id = :id"_ns, getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessagePriority"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET priority = :priority WHERE id = :id"_ns, getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindInt32ByName("priority"_ns, priority));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindInt32ByName("priority"_ns, priority));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
     p->value().priority = priority;
@@ -4854,26 +4862,35 @@ nsresult MessageDatabase::SetMessageOfflineMessageSize(nsMsgKey key,
 }
 
 nsresult MessageDatabase::SetMessageDate(nsMsgKey key, PRTime date) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessageDate"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET date = :date WHERE id = :id"_ns, getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessageDate"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET date = :date WHERE id = :id"_ns, getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindInt64ByName("date"_ns, (int64_t)date));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindInt64ByName("date"_ns, (int64_t)date));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
     p->value().date = date;
   }
+
   // TODO: notifications.
   return NS_OK;
 }
@@ -4894,25 +4911,38 @@ nsresult MessageDatabase::SetMessageStoreToken(nsMsgKey key,
 
 nsresult MessageDatabase::SetMessageMessageId(nsMsgKey key,
                                               const nsACString& messageId) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessageMessageId"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET messageId = :messageId WHERE id = :id"_ns, getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString cachedValue;
+  if (!cachedValue.Assign(messageId, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessageMessageId"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET messageId = :messageId WHERE id = :id"_ns,
+          getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, messageId));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
-    p->value().messageId = messageId;
+    p->value().messageId = std::move(cachedValue);
   }
 
   // TODO: notifications.
@@ -4921,25 +4951,37 @@ nsresult MessageDatabase::SetMessageMessageId(nsMsgKey key,
 
 nsresult MessageDatabase::SetMessageCcList(nsMsgKey key,
                                            const nsACString& ccList) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessageCcList"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET ccList = :ccList WHERE id = :id"_ns, getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString cachedValue;
+  if (!cachedValue.Assign(ccList, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessageCcList"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET ccList = :ccList WHERE id = :id"_ns, getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindUTF8StringByName("ccList"_ns, ccList));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindUTF8StringByName("ccList"_ns, ccList));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
-    p->value().ccList = ccList;
+    p->value().ccList = std::move(cachedValue);
   }
 
   // TODO: notifications.
@@ -4948,25 +4990,37 @@ nsresult MessageDatabase::SetMessageCcList(nsMsgKey key,
 
 nsresult MessageDatabase::SetMessageBccList(nsMsgKey key,
                                             const nsACString& bccList) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessageBccList"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET bccList = :bccList WHERE id = :id"_ns, getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString cachedValue;
+  if (!cachedValue.Assign(bccList, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessageBccList"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET bccList = :bccList WHERE id = :id"_ns, getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindUTF8StringByName("bccList"_ns, bccList));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindUTF8StringByName("bccList"_ns, bccList));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
-    p->value().bccList = bccList;
+    p->value().bccList = std::move(cachedValue);
   }
 
   // TODO: notifications.
@@ -4975,25 +5029,37 @@ nsresult MessageDatabase::SetMessageBccList(nsMsgKey key,
 
 nsresult MessageDatabase::SetMessageSender(nsMsgKey key,
                                            const nsACString& sender) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessageSender"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET sender = :sender WHERE id = :id"_ns, getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString cachedValue;
+  if (!cachedValue.Assign(sender, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessageSender"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET sender = :sender WHERE id = :id"_ns, getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, sender));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, sender));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
-    p->value().sender = sender;
+    p->value().sender = std::move(cachedValue);
   }
 
   // TODO: notifications.
@@ -5002,25 +5068,37 @@ nsresult MessageDatabase::SetMessageSender(nsMsgKey key,
 
 nsresult MessageDatabase::SetMessageSubject(nsMsgKey key,
                                             const nsACString& subject) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessageSubject"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET subject = :subject WHERE id = :id"_ns, getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString cachedValue;
+  if (!cachedValue.Assign(subject, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessageSubject"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET subject = :subject WHERE id = :id"_ns, getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, subject));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, subject));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
-    p->value().subject = subject;
+    p->value().subject = std::move(cachedValue);
   }
 
   // TODO: notifications.
@@ -5029,26 +5107,38 @@ nsresult MessageDatabase::SetMessageSubject(nsMsgKey key,
 
 nsresult MessageDatabase::SetMessageRecipients(nsMsgKey key,
                                                const nsACString& recipients) {
-  // Update DB.
-  {
-    nsCOMPtr<mozIStorageStatement> stmt;
-    nsresult rv = GetHeaderStatement(
-        key, "SetMessageRecipients"_ns, HeaderTable::Messages, "UPDATE "_ns,
-        " SET recipients = :recipients WHERE id = :id"_ns,
-        getter_AddRefs(stmt));
-    NS_ENSURE_SUCCESS(rv, rv);
-    mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString cachedValue;
+  if (!cachedValue.Assign(recipients, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = GetHeaderStatement(
+          key, "SetMessageRecipients"_ns, HeaderTable::Messages, "UPDATE "_ns,
+          " SET recipients = :recipients WHERE id = :id"_ns,
+          getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
-    MOZ_TRY(stmt->BindUTF8StringByName("recipients"_ns, recipients));
-    rv = stmt->Execute();
-    NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindUTF8StringByName("recipients"_ns, recipients));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackMessageChange(connection, rv);
   }
 
-  // Update cache.
+  // Install hot state only after the owned transaction commits.
   auto p = mMsgCache.lookup(key);
   if (p) {
-    p->value().recipients = recipients;
+    p->value().recipients = std::move(cachedValue);
   }
 
   // TODO: notifications.

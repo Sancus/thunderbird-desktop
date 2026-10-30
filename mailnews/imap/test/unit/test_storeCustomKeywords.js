@@ -11,6 +11,10 @@ var { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 
+var { NetUtil } = ChromeUtils.importESModule(
+  "resource://gre/modules/NetUtil.sys.mjs"
+);
+
 const VALID_TAG_KEY = "validtag";
 const MALFORMED_TAG_KEY = "invalid)";
 // Thunderbird formerly derived non-ASCII tag keys using modified UTF-7 and
@@ -33,9 +37,14 @@ add_setup(async function () {
     false
   );
 
+  Services.prefs.setCharPref(
+    "mail.server.default.storeContractID",
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
   setupIMAPPump();
   registerCleanupFunction(teardownIMAPPump);
   IMAPPump.mailbox.uidnext = 5001;
+  IMAPPump.mailbox.uidvalidity = 7801;
   const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIMsgDBService
   );
@@ -57,7 +66,9 @@ add_setup(async function () {
 
   const messageGenerator = new MessageGenerator();
   gSynthMessageForMixedKeywords = messageGenerator.makeMessage();
-  gSynthMessageForKeywordAdd = messageGenerator.makeMessage();
+  gSynthMessageForKeywordAdd = messageGenerator.makeMessage({
+    body: { body: "Retain these exact keyword source bytes." },
+  });
   gSynthMessageForKeywordRemove = messageGenerator.makeMessage();
 
   gServerMessageForMixedKeywords = addMessageToServer(
@@ -73,6 +84,17 @@ add_setup(async function () {
     []
   );
 
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  Assert.equal(IMAPPump.inbox.msgStore.storeType, expectedStoreType);
   const listener = new PromiseTestUtils.PromiseUrlListener();
   IMAPPump.inbox.updateFolderWithListener(null, listener);
   await listener.promise;
@@ -237,6 +259,345 @@ add_task(async function test_rejectsMissingAndAmbiguousBindings() {
       flagsBefore,
       "Rejected translations leave every server message unchanged"
     );
+  }
+});
+
+add_task(async function test_rejectedKeywordAddStopsBeforeRemove() {
+  await checkRejectedKeywordStore("+FLAGS", "NO");
+});
+
+add_task(async function test_badKeywordAddStopsBeforeRemove() {
+  await checkRejectedKeywordStore("+FLAGS", "BAD");
+});
+
+add_task(async function test_rejectedKeywordRemoveReportsPartialSuccess() {
+  await checkRejectedKeywordStore("-FLAGS", "NO");
+});
+
+/**
+ * Rejects one real keyword STORE and checks the error, retained bytes and retry.
+ *
+ * @param {string} rejectedAction - STORE action rejected by the server.
+ * @param {string} response - Tagged failure response, NO or BAD.
+ * @returns {Promise<void>} Resolves after checking retained bytes and retry.
+ */
+async function checkRejectedKeywordStore(rejectedAction, response) {
+  const folder = IMAPPump.inbox;
+  const header = folder.msgDatabase.getMsgHdrForMessageID(
+    gSynthMessageForKeywordAdd.messageId
+  );
+  const key = header.messageKey;
+  const uid = Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ? header.getUint32Property("uidOnServer")
+    : key;
+  Assert.equal(uid, 5002);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
+  await storeCustomKeywords(header, "removeme", "addedlater");
+  const downloaded = new PromiseTestUtils.PromiseUrlListener();
+  folder.downloadAllForOffline(downloaded, null);
+  await downloaded.promise;
+  Assert.ok(header.flags & Ci.nsMsgMessageFlags.Offline);
+  const token = header.storeToken;
+  Assert.ok(token);
+  const readBody = () => {
+    const stream = folder.getMsgInputStream(header);
+    try {
+      let body = "";
+      while (stream.available()) {
+        body += NetUtil.readInputStreamToString(stream, stream.available());
+      }
+      return body;
+    } finally {
+      stream.close();
+    }
+  };
+  const bytes = readBody();
+  Assert.ok(bytes.includes("Retain these exact keyword source bytes."), bytes);
+  const keys = folder.msgDatabase.listAllKeys();
+  const texts = IMAPPump.mailbox._messages.map(message => message.getText());
+  const flags = IMAPPump.mailbox._messages.map(message => [...message.flags]);
+  const commands = [];
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalStore = proto.STORE;
+  proto.STORE = function (args, isUid) {
+    commands.push([String(args[0]), args[1]]);
+    if (args[1] == rejectedAction) {
+      return `${response} keyword rejected`;
+    }
+    return originalStore.call(this, args, isUid);
+  };
+  const deleted = [];
+  const listener = {
+    msgsDeleted(items) {
+      deleted.push(...items.filter(item => item.folder == folder));
+    },
+  };
+  MailServices.mfn.addListener(
+    listener,
+    Ci.nsIMsgFolderNotificationService.msgsDeleted
+  );
+  try {
+    const calls = { starts: 0, stops: 0 };
+    const completion = new PromiseTestUtils.PromiseUrlListener({
+      OnStartRunningUrl() {
+        calls.starts++;
+      },
+      OnStopRunningUrl() {
+        calls.stops++;
+      },
+    });
+    const uri = folder.storeCustomKeywords(null, "addedlater", "removeme", [
+      key,
+    ]);
+    uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(completion);
+    const result = await completion.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    Assert.equal(result, Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED);
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    const expectedCommands = [["5002", "+FLAGS"]];
+    const expectedFlags = [...flags[1]];
+    if (rejectedAction == "-FLAGS") {
+      expectedCommands.push(["5002", "-FLAGS"]);
+      expectedFlags.push("Addedlater");
+    }
+    Assert.deepEqual(commands, expectedCommands);
+    Assert.deepEqual(gServerMessageForKeywordAdd.flags, expectedFlags);
+    Assert.deepEqual(IMAPPump.mailbox._messages[0].flags, flags[0]);
+    Assert.deepEqual(IMAPPump.mailbox._messages[2].flags, flags[2]);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), keys);
+    Assert.equal(header.messageKey, key);
+    Assert.equal(header.storeToken, token);
+    Assert.equal(readBody(), bytes);
+    Assert.deepEqual(
+      IMAPPump.mailbox._messages.map(message => message.uid),
+      [5001, 5002, 5003]
+    );
+    Assert.deepEqual(
+      IMAPPump.mailbox._messages.map(message => message.getText()),
+      texts
+    );
+    Assert.deepEqual(deleted, []);
+  } finally {
+    proto.STORE = originalStore;
+    MailServices.mfn.removeListener(listener);
+  }
+  // Retry the requested pair; the previously applied addition is idempotent.
+  await storeCustomKeywords(header, "addedlater", "removeme");
+  Assert.ok(gServerMessageForKeywordAdd.flags.includes("Addedlater"));
+  Assert.ok(!gServerMessageForKeywordAdd.flags.includes("Removeme"));
+  Assert.equal(header.messageKey, key);
+  Assert.equal(header.storeToken, token);
+  Assert.equal(readBody(), bytes);
+}
+
+add_task(async function test_rejectedFullMaskDoesNotSendComplement() {
+  const folder = IMAPPump.inbox;
+  const header = folder.msgDatabase.getMsgHdrForMessageID(
+    gSynthMessageForKeywordAdd.messageId
+  );
+  const key = header.messageKey;
+  const marked = new PromiseTestUtils.PromiseUrlListener();
+  folder.storeImapFlags(0x06, true, [key], marked); // Answered and Flagged.
+  await marked.promise;
+  Assert.ok(gServerMessageForKeywordAdd.flags.includes("\\Answered"));
+  Assert.ok(gServerMessageForKeywordAdd.flags.includes("\\Flagged"));
+  const flags = IMAPPump.mailbox._messages.map(message => [...message.flags]);
+  const keys = folder.msgDatabase.listAllKeys();
+  const localFlags = header.flags;
+  const token = header.storeToken;
+  const readBody = () => {
+    const stream = folder.getMsgInputStream(header);
+    try {
+      let body = "";
+      while (stream.available()) {
+        body += NetUtil.readInputStreamToString(stream, stream.available());
+      }
+      return body;
+    } finally {
+      stream.close();
+    }
+  };
+  const bytes = readBody();
+  Assert.ok(bytes.includes("Retain these exact keyword source bytes."));
+  const texts = IMAPPump.mailbox._messages.map(message => message.getText());
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalStore = proto.STORE;
+  const commands = [];
+  let reject = true;
+  proto.STORE = function (args, isUid) {
+    const action = args[1].toUpperCase();
+    commands.push([String(args[0]), action]);
+    if (reject && action == "+FLAGS") {
+      return "NO full mask addition rejected";
+    }
+    return originalStore.call(this, args, isUid);
+  };
+  const setFlags = async () => {
+    const calls = { starts: 0, stops: 0 };
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStartRunningUrl() {
+        calls.starts++;
+      },
+      OnStopRunningUrl() {
+        calls.stops++;
+      },
+    });
+    const uri = folder.setImapFlags([key], 0x05); // Seen and Flagged.
+    uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(listener);
+    const result = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    return result;
+  };
+  try {
+    Assert.equal(await setFlags(), Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED);
+    Assert.deepEqual(commands, [["5002", "+FLAGS"]]);
+    Assert.deepEqual(
+      IMAPPump.mailbox._messages.map(message => message.flags),
+      flags
+    );
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), keys);
+    Assert.equal(header.messageKey, key);
+    Assert.equal(header.flags, localFlags);
+    Assert.equal(header.storeToken, token);
+    Assert.equal(readBody(), bytes);
+    reject = false;
+    commands.length = 0;
+    Assert.equal(await setFlags(), Cr.NS_OK);
+    Assert.deepEqual(commands, [
+      ["5002", "+FLAGS"],
+      ["5002", "-FLAGS"],
+    ]);
+    Assert.ok(gServerMessageForKeywordAdd.flags.includes("\\Seen"));
+    Assert.ok(gServerMessageForKeywordAdd.flags.includes("\\Flagged"));
+    Assert.ok(!gServerMessageForKeywordAdd.flags.includes("\\Answered"));
+    Assert.deepEqual(IMAPPump.mailbox._messages[0].flags, flags[0]);
+    Assert.deepEqual(IMAPPump.mailbox._messages[2].flags, flags[2]);
+    Assert.deepEqual(
+      IMAPPump.mailbox._messages.map(message => message.getText()),
+      texts
+    );
+    Assert.equal(readBody(), bytes);
+  } finally {
+    proto.STORE = originalStore;
+  }
+});
+
+add_task(async function test_sparseKeywordChunksStopAtFirstFailureAndRetry() {
+  const folder = IMAPPump.inbox;
+  const selectedUids = [];
+  const expectedTexts = [];
+  for (let uid = 10001; uid <= 10400; uid++) {
+    const text = [
+      "From: chunk@example.invalid",
+      "To: user@example.invalid",
+      `Message-ID: <keyword-chunk-${uid}@example.invalid>`,
+      `Subject: Sparse keyword chunk ${uid}`,
+      "",
+      `Keep exact chunk body ${uid}.`,
+      "",
+    ].join("\r\n");
+    const uri = "data:text/plain;base64," + btoa(text);
+    const message = new ImapMessage(uri, uid, []);
+    message.setFlag("Keepchunk");
+    IMAPPump.mailbox.addMessage(message);
+    expectedTexts.push(text);
+    if (uid % 2) {
+      selectedUids.push(uid);
+    }
+  }
+  IMAPPump.mailbox.uidnext = 10401;
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  folder.updateFolderWithListener(null, selected);
+  await selected.promise;
+  const keys = selectedUids.map(uid => {
+    const header = folder.msgDatabase.getMsgHdrForMessageID(
+      `keyword-chunk-${uid}@example.invalid`
+    );
+    Assert.ok(header);
+    Assert.equal(header.folder, folder);
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      Assert.notEqual(header.messageKey, uid);
+      Assert.equal(header.getUint32Property("uidOnServer"), uid);
+    } else {
+      Assert.equal(header.messageKey, uid);
+    }
+    return header.messageKey;
+  });
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
+  const liveKeys = folder.msgDatabase.listAllKeys();
+  Assert.equal(liveKeys.length, 403);
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalStore = proto.STORE;
+  const commands = [];
+  const dispatchedUids = [];
+  let reject = true;
+  proto.STORE = function (args, isUid) {
+    commands.push(String(args[0]));
+    Assert.ok(isUid);
+    Assert.equal(args[1], "+FLAGS");
+    Assert.deepEqual(args[2], ["Chunkadded"]);
+    if (reject) {
+      return "NO first keyword chunk rejected";
+    }
+    dispatchedUids.push(
+      ...this._parseSequenceSet(args[0], isUid, []).map(message => message.uid)
+    );
+    return originalStore.call(this, args, isUid);
+  };
+  const runStore = async () => {
+    const calls = { starts: 0, stops: 0 };
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStartRunningUrl() {
+        calls.starts++;
+      },
+      OnStopRunningUrl() {
+        calls.stops++;
+      },
+    });
+    const uri = folder.storeCustomKeywords(null, "chunkadded", "", keys);
+    uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(listener);
+    const result = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    return result;
+  };
+  try {
+    Assert.equal(await runStore(), Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED);
+    Assert.equal(commands.length, 1, "A rejection stops later UID chunks");
+    const messages = IMAPPump.mailbox._messages.slice(3);
+    Assert.equal(messages.length, 400);
+    for (const message of messages) {
+      Assert.deepEqual(message.flags, ["Keepchunk"]);
+    }
+    reject = false;
+    commands.length = 0;
+    Assert.equal(await runStore(), Cr.NS_OK);
+    Assert.greater(commands.length, 1, "The real UID set requires chunking");
+    Assert.deepEqual(
+      dispatchedUids,
+      selectedUids,
+      "Each requested UID occurs once"
+    );
+    for (const message of messages) {
+      Assert.deepEqual(
+        message.flags,
+        message.uid % 2 ? ["Keepchunk", "Chunkadded"] : ["Keepchunk"]
+      );
+    }
+    Assert.deepEqual(
+      messages.map(message => message.getText()),
+      expectedTexts
+    );
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), liveKeys);
+  } finally {
+    proto.STORE = originalStore;
   }
 });
 

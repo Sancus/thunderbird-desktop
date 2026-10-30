@@ -3191,6 +3191,7 @@ void nsImapProtocol::ProcessSelectedStateURL() {
             storeString.Append(addFlags);
             storeString.Append(')');
             Store(messageIdString, storeString.get(), true);
+            if (NS_FAILED(m_mailboxUpdateResult)) break;
           }
           if (!subtractFlags.IsEmpty()) {
             if (!userDefinedSettable) {
@@ -5595,6 +5596,7 @@ void nsImapProtocol::PercentProgressUpdateEvent(nsACString const& fmtStringName,
 // imap commands issued by the parser
 void nsImapProtocol::Store(const nsCString& messageList,
                            const char* messageData, bool idsAreUid) {
+  if (NS_FAILED(m_mailboxUpdateResult)) return;
   // turn messageList back into key array and then back into a message id list,
   // but use the flag state to handle ranges correctly.
   nsCString messageIdList;
@@ -5647,8 +5649,23 @@ void nsImapProtocol::Store(const nsCString& messageList,
           Check();
       }
       PR_Free(protocolString);
-    } else
+      if (NS_SUCCEEDED(rv)) rv = GetConnectionStatus();
+      if (NS_SUCCEEDED(rv) && !GetServerStateParser().LastCommandSuccessful()) {
+        rv = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+      }
+      if (NS_FAILED(rv) || NS_FAILED(m_mailboxUpdateResult)) {
+        // A later chunk or keyword action must not hide this failure. The
+        // existing URL retry still runs first for retryable transport errors.
+        if (NS_SUCCEEDED(m_mailboxUpdateResult)) m_mailboxUpdateResult = rv;
+        return;
+      }
+    } else {
+      if (NS_SUCCEEDED(m_mailboxUpdateResult)) {
+        m_mailboxUpdateResult = NS_ERROR_OUT_OF_MEMORY;
+      }
       HandleMemoryFailure();
+      return;
+    }
   } while (msgCountLeft > 0 && !DeathSignalReceived());
 }
 

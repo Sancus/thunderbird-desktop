@@ -316,7 +316,7 @@ void AllocateImapUidString(const ImapUid* msgUids, uint32_t& msgCount,
     // it means we just need to go ahead and generate a too long string
     // because the calling code won't handle breaking up the strings.
     if (flagState && returnString.Length() > 950) {
-      msgCount = keyIndex;
+      msgCount = keyIndex + 1;
       break;
     }
     // If we are not the last item then we need to add the comma

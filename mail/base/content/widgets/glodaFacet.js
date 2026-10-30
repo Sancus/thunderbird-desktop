@@ -522,7 +522,14 @@
           }
           return;
         }
-        this.#triggerFacet(this.trueGroups);
+        const constraint = this.faceter.constraint;
+        if (constraint) {
+          FacetContext.removeFacetConstraint(
+            this.faceter,
+            true,
+            constraint.includedGroupValues.concat()
+          );
+        }
       }
     }
 

@@ -20,6 +20,9 @@ const { MailStringUtils } = ChromeUtils.importESModule(
 
 let service, rootFolder;
 
+/** @type {{folder: nsIMsgLocalMailFolder, id: number, name: string}[]} */
+const resultFolders = [];
+
 add_setup(async function setupNativeResults() {
   do_get_profile();
   loadExistingDB();
@@ -64,12 +67,30 @@ async function drainResultWork() {
 }
 
 /**
+ * Retires only the previous helper fixture after its consuming task finishes.
+ * The next fixture's drain accepts the removals together with its new messages.
+ */
+function retireResultFixtures() {
+  for (const { folder, id, name } of resultFolders.splice(0)) {
+    // The orphan-folder task deliberately removes the folder database row.
+    if (folderDB.getFolderChildNamed(rootFolder.id, name) != id) {
+      continue;
+    }
+    for (const header of [...folder.messages]) {
+      messageDB.removeMessage(header.messageKey);
+    }
+    rootFolder.propagateDelete(folder, true);
+  }
+}
+
+/**
  * Adds two real copies and queries their independently supplied subject/body.
  *
  * @param {string} name - Literal unique query word and folder prefix.
  * @returns {Promise<object>} Native copies and their physical hits.
  */
 async function resultCopies(name) {
+  retireResultFixtures();
   const raw = [
     "From: Sender <sender@example.invalid>",
     "To: Recipient <recipient@example.invalid>",
@@ -83,14 +104,20 @@ async function resultCopies(name) {
     "é 😀 café 自動 end",
     "",
   ].join("\r\n");
-  const first = rootFolder
+  const firstFolder = rootFolder
     .createLocalSubfolder(name + "-first")
-    .QueryInterface(Ci.nsIMsgLocalMailFolder)
-    .addMessage(MailStringUtils.stringToByteString(raw));
-  const selected = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const selectedFolder = rootFolder
     .createLocalSubfolder(name + "-selected")
-    .QueryInterface(Ci.nsIMsgLocalMailFolder)
-    .addMessage(MailStringUtils.stringToByteString(raw));
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  resultFolders.push(
+    { folder: firstFolder, id: firstFolder.id, name: name + "-first" },
+    { folder: selectedFolder, id: selectedFolder.id, name: name + "-selected" }
+  );
+  const first = firstFolder.addMessage(MailStringUtils.stringToByteString(raw));
+  const selected = selectedFolder.addMessage(
+    MailStringUtils.stringToByteString(raw)
+  );
   selected.flags |= Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
   selected.setStringProperty("keywords", "tag-alpha tag-beta");
   await drainResultWork();
@@ -386,12 +413,17 @@ add_task(async function test_deletedFolderRetainsExcludedPhysicalIdentity() {
  * @returns {Promise<object>} Named native headers and the second copy's folder.
  */
 async function typedResultFixture(name) {
+  retireResultFixtures();
   const folder = rootFolder
     .createLocalSubfolder(name)
     .QueryInterface(Ci.nsIMsgLocalMailFolder);
   const otherFolder = rootFolder
     .createLocalSubfolder(name + "-copy")
     .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  resultFolders.push(
+    { folder, id: folder.id, name },
+    { folder: otherFolder, id: otherFolder.id, name: name + "-copy" }
+  );
   const definitions = [
     {
       from: "person@example.invalid",

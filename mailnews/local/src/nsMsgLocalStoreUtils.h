@@ -5,6 +5,7 @@
 #ifndef COMM_MAILNEWS_LOCAL_SRC_NSMSGLOCALSTOREUTILS_H_
 #define COMM_MAILNEWS_LOCAL_SRC_NSMSGLOCALSTOREUTILS_H_
 
+#include "nsCOMPtr.h"
 #include "nsIDirectoryEnumerator.h"
 #include "nsIFile.h"
 #include "nsString.h"
@@ -77,5 +78,50 @@ class nsMsgLocalStoreUtils {
                                              StatusDetails const& details,
                                              uint32_t newFlags);
 };
+
+#ifdef MOZ_PANORAMA
+namespace mozilla::mailnews {
+
+/**
+ * Move existing body, summary and child storage without changing folder rows.
+ * Callers exclude concurrent store use and close their handles before Apply().
+ * Missing parts are allowed for folders without an offline cache. Local folder
+ * callers must separately require their body store to exist.
+ *
+ * Prepare() checks all paths without changing files. Apply() uses same-volume
+ * RenameTo(), never a copy/delete fallback. On failure it restores earlier
+ * moves and returns the original error; RollbackStatus() exposes a restoration
+ * error. After a known metadata failure the caller explicitly calls Rollback().
+ * Neither destruction nor a metadata error deletes files or retries Finish.
+ * This does not make filesystem changes and database commits atomic.
+ */
+class FolderStorageMove final {
+ public:
+  FolderStorageMove() = default;
+  FolderStorageMove(const FolderStorageMove&) = delete;
+  FolderStorageMove& operator=(const FolderStorageMove&) = delete;
+
+  nsresult Prepare(nsIFile* source, nsIFile* destination);
+  nsresult Apply();
+  nsresult Rollback();
+  nsresult RollbackStatus() const { return mRollbackStatus; }
+  bool HasPendingMoves() const;
+
+ private:
+  struct Move {
+    nsCOMPtr<nsIFile> source;
+    nsCOMPtr<nsIFile> destination;
+    bool moved{false};
+  };
+
+  static nsresult Rename(nsIFile* source, nsIFile* destination);
+  nsTArray<Move> mMoves;
+  bool mPrepared{false};
+  bool mAttempted{false};
+  nsresult mRollbackStatus{NS_OK};
+};
+
+}  // namespace mozilla::mailnews
+#endif
 
 #endif  // COMM_MAILNEWS_LOCAL_SRC_NSMSGLOCALSTOREUTILS_H_

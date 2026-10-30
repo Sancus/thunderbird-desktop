@@ -22,4 +22,5 @@ UNIFIED_SOURCES += [
 if CONFIG["MOZ_PANORAMA"]:
     UNIFIED_SOURCES += [
         "TestLocalCopyHeaders.cpp",
+        "TestLocalFolderStorageMove.cpp",
     ]

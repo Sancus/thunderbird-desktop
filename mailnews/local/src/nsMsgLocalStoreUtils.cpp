@@ -15,6 +15,7 @@
 #include "nsPrintfCString.h"
 #include "nsReadableUtils.h"
 #include "mozilla/Buffer.h"
+#include "mozilla/Try.h"
 #include "nsIInputStream.h"
 #include "prprf.h"
 
@@ -364,3 +365,105 @@ nsresult nsMsgLocalStoreUtils::ChangeKeywordsHelper(
 
   return NS_OK;
 }
+
+#ifdef MOZ_PANORAMA
+namespace mozilla::mailnews {
+
+nsresult FolderStorageMove::Prepare(nsIFile* source, nsIFile* destination) {
+  NS_ENSURE_ARG(source);
+  NS_ENSURE_ARG(destination);
+  NS_ENSURE_FALSE(mPrepared || mAttempted, NS_ERROR_ALREADY_INITIALIZED);
+
+  nsTArray<Move> moves;
+  nsAutoString sourceName, destinationName;
+  MOZ_TRY(source->GetLeafName(sourceName));
+  MOZ_TRY(destination->GetLeafName(destinationName));
+  nsCOMPtr<nsIFile> parent;
+  MOZ_TRY(destination->GetParent(getter_AddRefs(parent)));
+  NS_ENSURE_TRUE(parent, NS_ERROR_FILE_DESTINATION_NOT_DIR);
+  bool directory;
+  MOZ_TRY(parent->IsDirectory(&directory));
+  NS_ENSURE_TRUE(directory, NS_ERROR_FILE_DESTINATION_NOT_DIR);
+
+  const nsLiteralString suffixes[] = {u""_ns, u".msf"_ns, u".sbd"_ns};
+  for (const auto& suffix : suffixes) {
+    Move move;
+    MOZ_TRY(source->Clone(getter_AddRefs(move.source)));
+    MOZ_TRY(move.source->SetLeafName(sourceName + suffix));
+    MOZ_TRY(destination->Clone(getter_AddRefs(move.destination)));
+    MOZ_TRY(move.destination->SetLeafName(destinationName + suffix));
+    bool same;
+    MOZ_TRY(move.source->Equals(move.destination, &same));
+    if (same) {
+      continue;
+    }
+    bool exists;
+    MOZ_TRY(move.destination->Exists(&exists));
+    NS_ENSURE_FALSE(exists, NS_ERROR_FILE_ALREADY_EXISTS);
+    MOZ_TRY(move.source->Exists(&exists));
+    if (exists) {
+      moves.AppendElement(std::move(move));
+    }
+  }
+  mMoves = std::move(moves);
+  mPrepared = true;
+  return NS_OK;
+}
+
+nsresult FolderStorageMove::Rename(nsIFile* source, nsIFile* destination) {
+  // RenameTo can replace a file. Refuse a known destination before every
+  // forward or reverse move, so an obstruction never becomes cleanup data.
+  bool exists;
+  MOZ_TRY(destination->Exists(&exists));
+  NS_ENSURE_FALSE(exists, NS_ERROR_FILE_ALREADY_EXISTS);
+  nsCOMPtr<nsIFile> parent;
+  nsAutoString name;
+  MOZ_TRY(destination->GetParent(getter_AddRefs(parent)));
+  MOZ_TRY(destination->GetLeafName(name));
+  return source->RenameTo(parent, name);
+}
+
+nsresult FolderStorageMove::Apply() {
+  NS_ENSURE_TRUE(mPrepared && !mAttempted, NS_ERROR_ALREADY_INITIALIZED);
+  mAttempted = true;
+  for (auto& move : mMoves) {
+    nsresult rv = Rename(move.source, move.destination);
+    if (NS_FAILED(rv)) {
+      mRollbackStatus = Rollback();
+      return rv;
+    }
+    move.moved = true;
+  }
+  return NS_OK;
+}
+
+nsresult FolderStorageMove::Rollback() {
+  NS_ENSURE_TRUE(mPrepared, NS_ERROR_NOT_INITIALIZED);
+  nsresult firstError = NS_OK;
+  for (size_t i = mMoves.Length(); i > 0; --i) {
+    auto& move = mMoves[i - 1];
+    if (!move.moved) {
+      continue;
+    }
+    nsresult rv = Rename(move.destination, move.source);
+    if (NS_SUCCEEDED(rv)) {
+      move.moved = false;
+    } else if (NS_SUCCEEDED(firstError)) {
+      firstError = rv;
+    }
+  }
+  mRollbackStatus = firstError;
+  return firstError;
+}
+
+bool FolderStorageMove::HasPendingMoves() const {
+  for (const auto& move : mMoves) {
+    if (move.moved) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace mozilla::mailnews
+#endif

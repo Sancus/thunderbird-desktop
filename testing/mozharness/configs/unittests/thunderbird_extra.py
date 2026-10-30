@@ -21,7 +21,8 @@ config = {
             "env": {
                 "GTEST_FILTER": (
                     "TestMail*:TestMsg*:*XREAppDir*:"
-                    "DeliveryCore*:LocalCopyHeaders.*:MigrationWindowsPath.*"
+                    "DeliveryCore*:FolderStorageMoveTest.*:"
+                    "LocalCopyHeaders.*:MigrationWindowsPath.*"
                 ),
             },
         },

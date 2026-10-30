@@ -103,6 +103,14 @@ struct PendingDestination {
   uint32_t epoch{0};
 };
 
+// Explicit pending destination metadata, not an inferred source-header match.
+// Generic integers use the existing public legacy unsigned text view.
+struct PendingHeaderAttribute {
+  nsCString name;
+  nsCString text;  // Used only when integer is Nothing.
+  Maybe<uint64_t> integer;
+};
+
 // Combined legacy operation payload; copy destinations retain their order.
 struct OfflineOperationData {
   uint32_t operation{0};
@@ -310,6 +318,14 @@ class MessageDatabase : public nsIMessageDatabase {
   // Removes staged metadata only; never deletes stored body bytes.
   nsresult AbortMessage(nsMsgKey key);
   nsresult ListStagedMessages(uint64_t folderId, nsTArray<nsMsgKey>& keys);
+
+  // Updates only the explicit unbound staged target, without publication.
+  // Attributes are ordered and atomic; PublishMessage consumes the staged row.
+  // Storage aliases require matching provider-finished destination state.
+  nsresult SetStagedHeaderAttributes(
+      const nsACString& databaseSourceId, const PendingDestination& target,
+      const nsTArray<PendingHeaderAttribute>& attributes,
+      const Maybe<FinishedMessageBody>& finished = Nothing());
 
   // Published rows only. Missing: NOT_AVAILABLE; failure leaves output intact.
   nsresult GetMessageBodyState(nsMsgKey key, MessageBodyState& output);

@@ -1811,6 +1811,160 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
   return NS_OK;
 }
 
+nsresult MessageDatabase::SetStagedHeaderAttributes(
+    const nsACString& databaseSourceId, const PendingDestination& target,
+    const nsTArray<PendingHeaderAttribute>& attributes,
+    const Maybe<FinishedMessageBody>& finished) {
+  NS_ENSURE_TRUE(target.folderId && target.folderId <= INT64_MAX &&
+                     target.key && target.key < nsMsgKey_None,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(CheckPendingFolderRelocation(target.folderId));
+  RefPtr<MessageDatabase> self(this);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  nsCString currentSourceId;
+  MOZ_TRY(DatabaseCore::sInstance->GetSourceId(currentSourceId));
+  NS_ENSURE_TRUE(currentSourceId == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  CachedMsg cached;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    uint32_t epoch;
+    MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+        target.folderId, epoch));
+    NS_ENSURE_TRUE(epoch == target.epoch, NS_ERROR_NOT_AVAILABLE);
+    bool staged, published;
+    MOZ_TRY(IsMessageStaged(target.key, staged));
+    NS_ENSURE_TRUE(staged, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(MessageExists(target.key, published));
+    NS_ENSURE_FALSE(published, NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(FetchMsg(target.key, cached));
+    NS_ENSURE_TRUE(cached.folderId == target.folderId, NS_ERROR_NOT_AVAILABLE);
+    uint32_t originalFlags = cached.flags;
+    Maybe<uint32_t> queuedFlags;
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "PendingHeaderInFlight"_ns,
+          "SELECT 1 FROM offline_attempts WHERE destinationKey=:id "
+          "AND state IN(1,2,3) UNION ALL SELECT 1 FROM "
+          "staged_message_properties "
+          "WHERE id=:id AND name='uidOnServer' LIMIT 1"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, target.key));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_IN_PROGRESS);
+    }
+    for (const auto& attribute : attributes) {
+      NS_ENSURE_TRUE(!attribute.integer || attribute.text.IsEmpty(),
+                     NS_ERROR_INVALID_ARG);
+      if (attribute.name.EqualsLiteral("uidOnServer")) {
+        // Only checked server confirmation may establish this binding.
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+      if (attribute.name.EqualsLiteral("storeToken")) {
+        NS_ENSURE_TRUE(finished, NS_ERROR_NOT_AVAILABLE);
+        NS_ENSURE_TRUE(
+            !attribute.integer && attribute.text == finished->storeToken,
+            NS_ERROR_INVALID_ARG);
+        continue;
+      }
+      const uint32_t* size = nullptr;
+      if (attribute.name.EqualsLiteral("messageSize")) {
+        if (finished) size = &finished->messageSize;
+      } else if (attribute.name.EqualsLiteral("offlineMsgSize") ||
+                 attribute.name.EqualsLiteral("offlineMessageSize")) {
+        if (finished) size = &finished->offlineMessageSize;
+      } else if (attribute.name.EqualsLiteral("lineCount")) {
+        if (finished) size = &finished->lineCount;
+      } else if (attribute.name.EqualsLiteral("flags")) {
+        NS_ENSURE_TRUE(attribute.integer && *attribute.integer <= UINT32_MAX,
+                       NS_ERROR_ILLEGAL_VALUE);
+        queuedFlags = Some(static_cast<uint32_t>(*attribute.integer));
+        continue;
+      } else if (attribute.name.EqualsLiteral("priority")) {
+        uint64_t priority;
+        if (attribute.integer) {
+          priority = *attribute.integer;
+        } else {
+          // The existing IMAP producer supplies one decimal priority digit.
+          NS_ENSURE_TRUE(attribute.text.Length() == 1 &&
+                             attribute.text[0] >= '0' &&
+                             attribute.text[0] <= '6',
+                         NS_ERROR_INVALID_ARG);
+          priority = attribute.text[0] - '0';
+        }
+        NS_ENSURE_TRUE(priority <= nsMsgPriority::highest,
+                       NS_ERROR_ILLEGAL_VALUE);
+        cached.priority = static_cast<nsMsgPriorityValue>(priority);
+        continue;
+      } else {
+        nsAutoCString text;
+        if (attribute.integer) {
+          text.AppendInt(*attribute.integer, 16);
+        } else {
+          text = attribute.text;
+        }
+        if (attribute.name.EqualsLiteral("keywords")) {
+          cached.tags = text;
+        } else {
+          MOZ_TRY(SetMessageProperty(target.key, attribute.name, text));
+        }
+        continue;
+      }
+      NS_ENSURE_TRUE(finished, NS_ERROR_NOT_AVAILABLE);
+      NS_ENSURE_TRUE(size && attribute.integer && *attribute.integer == *size,
+                     NS_ERROR_INVALID_ARG);
+    }
+    if (queuedFlags) {
+      cached.flags |= *queuedFlags;
+    }
+    if (finished) {
+      // A queued source flag cannot contradict the finished destination body.
+      NS_ENSURE_TRUE(
+          !(cached.flags & nsMsgMessageFlags::Offline) || finished->offline,
+          NS_ERROR_INVALID_ARG);
+      MOZ_TRY(SetMessageProperty(target.key, "storeToken"_ns,
+                                 finished->storeToken));
+      MOZ_TRY(SetMessageProperty(target.key, "messageSize"_ns,
+                                 finished->messageSize));
+      MOZ_TRY(SetMessageProperty(target.key, "offlineMessageSize"_ns,
+                                 finished->offlineMessageSize));
+      MOZ_TRY(
+          SetMessageProperty(target.key, "lineCount"_ns, finished->lineCount));
+      if (finished->offline) cached.flags |= nsMsgMessageFlags::Offline;
+    } else {
+      NS_ENSURE_TRUE(
+          !((cached.flags & ~originalFlags) & nsMsgMessageFlags::Offline),
+          NS_ERROR_NOT_AVAILABLE);
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "SetPendingHeaderFields"_ns,
+          "UPDATE staged_messages SET flags=:flags,tags=:tags,priority=:priority WHERE id=:id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, target.key));
+      MOZ_TRY(stmt->BindInt64ByName("flags"_ns, cached.flags));
+      MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, cached.tags));
+      MOZ_TRY(stmt->BindInt32ByName("priority"_ns, cached.priority));
+      MOZ_TRY(stmt->Execute());
+    }
+    if (!mMsgCache.reserve(mMsgCache.count() + 1))
+      return NS_ERROR_OUT_OF_MEMORY;
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) return RollbackBody(connection, rv);
+  auto entry = mMsgCache.lookup(target.key);
+  if (entry)
+    entry->value() = std::move(cached);
+  else
+    mMsgCache.putNewInfallible(target.key, std::move(cached));
+  return NS_OK;
+}
+
 nsresult MessageDatabase::IsMessageStaged(nsMsgKey key, bool& staged) {
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(

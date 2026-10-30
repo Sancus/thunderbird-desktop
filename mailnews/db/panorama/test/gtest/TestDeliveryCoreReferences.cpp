@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "DatabaseCore.h"
+#include "js/JSON.h"
 #include "FolderDatabase.h"
 #ifdef XP_WIN
 #  include "MigrationFileSystem.h"
@@ -17,6 +18,7 @@
 #include "mozilla/ScopeExit.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/Try.h"
+#include "mozilla/dom/ScriptSettings.h"
 #include "mozilla/SpinEventLoopUntil.h"
 #include "mozIStorageConnection.h"
 #include "mozIStorageFunction.h"
@@ -41,6 +43,7 @@
 #include "nsComponentManagerUtils.h"
 #include "nsServiceManagerUtils.h"
 #include "nsThreadUtils.h"
+#include "xpcpublic.h"
 
 namespace mozilla::mailnews {
 namespace {
@@ -109,6 +112,37 @@ class UndoRemovalObserver final : public MessageListener {
   std::function<void(Message*)> mRemoved;
 };
 NS_IMPL_ISUPPORTS(UndoRemovalObserver, nsISupports)
+
+class PendingHeaderObserver final : public MessageListener {
+ public:
+  NS_DECL_ISUPPORTS
+  explicit PendingHeaderObserver(std::function<void(Message*)> added)
+      : mCallback(std::move(added)) {}
+  uint32_t mAdded = 0;
+  uint32_t mChanged = 0;
+  void OnMessageAdded(Message* message) override {
+    ++mAdded;
+    mCallback(message);
+  }
+  void OnMessageRemoved(Message*, uint32_t) override { ++mChanged; }
+  void OnMessageFlagsChanged(nsIMsgDBHdr*, Message*, uint32_t,
+                             uint32_t) override {
+    ++mChanged;
+  }
+  void OnMessageTagsChanged(nsIMsgDBHdr*, Message*, const nsACString&,
+                            const nsACString&) override {
+    ++mChanged;
+  }
+  void OnMessageBodyChanged(nsIMsgDBHdr*, Message*, const MessageBodyState&,
+                            const MessageBodyState&) override {
+    ++mChanged;
+  }
+
+ private:
+  ~PendingHeaderObserver() = default;
+  std::function<void(Message*)> mCallback;
+};
+NS_IMPL_ISUPPORTS(PendingHeaderObserver, nsISupports)
 
 class AddedObserver final : public MessageListener {
  public:
@@ -310,6 +344,10 @@ class DeliveryCoreReferences : public testing::Test {
 
   nsresult FolderUnreadCount(uint64_t folder, uint64_t& count) {
     return mCore->MessageDB().GetNumUnread(folder, &count);
+  }
+
+  nsresult SearchWatermark(uint64_t& sequence) {
+    return mCore->MessageDB().GetSearchWatermark(sequence);
   }
 
   nsresult Start() {
@@ -9540,6 +9578,353 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_TRUE(control.IsEmpty());
   ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
   EXPECT_EQ((nsTArray<nsMsgKey>{key}), marked);
+}
+
+TEST_F(DeliveryCoreReferences, DurableSearchReplaySurvivesCoreReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  uint64_t start;
+  ASSERT_EQ(NS_OK, SearchWatermark(start));
+  nsMsgKey retained, removed;
+  ASSERT_EQ(NS_OK, Add("physical-copy@invalid"_ns, {}, retained));
+  ASSERT_EQ(NS_OK, Add("physical-copy@invalid"_ns, {}, removed));
+  ASSERT_NE(retained, removed);
+  RefPtr<Message> header = new Message(retained);
+  ASSERT_EQ(NS_OK, header->SetSubject("edited before reopen"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(
+                       retained, "storeToken"_ns, "persisted-token"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().NoteSearchPolicyChanged());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessage(removed));
+  uint64_t watermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+  ASSERT_GT(watermark, start);
+
+  mozilla::dom::AutoJSAPI jsapi;
+  ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+  JSContext* cx = jsapi.cx();
+  auto stringify = [cx](JS::MutableHandle<JS::Value> value, nsString& text) {
+    text.Truncate();
+    return JS_Stringify(
+        cx, value, nullptr, JS::NullHandleValue,
+        [](const char16_t* data, uint32_t length, void* output) {
+          static_cast<nsString*>(output)->Append(data, length);
+          return true;
+        },
+        &text);
+  };
+  JS::Rooted<JS::Value> replay(cx), state(cx);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetSearchChanges(start, 1000, cx, &replay));
+  nsString beforeReplay, beforeState;
+  ASSERT_TRUE(stringify(&replay, beforeReplay));
+  EXPECT_NE(kNotFound, beforeReplay.Find(u"\"messageKey\":null"_ns));
+  EXPECT_NE(kNotFound, beforeReplay.Find(u"\"deleted\":true"_ns));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetSearchState(retained, cx, &state));
+  ASSERT_TRUE(state.isObject());
+  ASSERT_TRUE(stringify(&state, beforeState));
+  EXPECT_NE(kNotFound, beforeState.Find(u"persisted-token"_ns));
+  header = nullptr;
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  nsCString reopenedSource;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(reopenedSource));
+  EXPECT_EQ(source, reopenedSource);
+  uint64_t reopenedWatermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(reopenedWatermark));
+  EXPECT_EQ(watermark, reopenedWatermark);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetSearchChanges(start, 1000, cx, &replay));
+  nsString after;
+  ASSERT_TRUE(stringify(&replay, after));
+  EXPECT_EQ(beforeReplay, after);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetSearchState(retained, cx, &state));
+  ASSERT_TRUE(stringify(&state, after));
+  EXPECT_EQ(beforeState, after);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetSearchState(removed, cx, &state));
+  EXPECT_TRUE(state.isNull());
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetSearchChanges(watermark, 1000, cx, &replay));
+  ASSERT_TRUE(stringify(&replay, after));
+  EXPECT_NE(kNotFound, after.Find(u"\"changes\":[]"_ns));
+
+  nsMsgKey later;
+  ASSERT_EQ(NS_OK, Add("after-reopen@invalid"_ns, {}, later));
+  EXPECT_NE(later, retained);
+  EXPECT_NE(later, removed);
+  ASSERT_EQ(NS_OK, SearchWatermark(reopenedWatermark));
+  EXPECT_GT(reopenedWatermark, watermark);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetSearchChanges(watermark, 1000, cx, &replay));
+  ASSERT_TRUE(stringify(&replay, after));
+  nsAutoString expected(u"\"messageKey\":"_ns);
+  expected.AppendInt(later);
+  expected.Append(u',');
+  EXPECT_NE(kNotFound, after.Find(expected));
+}
+
+TEST_F(DeliveryCoreReferences,
+       StagedAttributesKeepCopiesDistinctAndPublishComplete) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 51));
+  RawHdr raw;
+  raw.messageId = "duplicate@invalid"_ns;
+  raw.flags = nsMsgMessageFlags::Read;
+  nsMsgKey first, second;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &first));
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &second));
+  uint32_t completeCalls = 0;
+  RefPtr<PendingHeaderObserver> observer =
+      new PendingHeaderObserver([&](Message* message) {
+        ++completeCalls;
+        bool active = true;
+        ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+        EXPECT_FALSE(active);
+        nsMsgKey key = nsMsgKey_None;
+        ASSERT_EQ(NS_OK, message->GetMessageKey(&key));
+        EXPECT_EQ(first, key);
+        nsCString text;
+        ASSERT_EQ(NS_OK, message->GetStoreToken(text));
+        EXPECT_EQ("finished-target"_ns, text);
+        ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageTags(key, text));
+        EXPECT_EQ("final tags"_ns, text);
+        nsMsgPriorityValue priority = nsMsgPriority::notSet;
+        ASSERT_EQ(NS_OK, message->GetPriority(&priority));
+        EXPECT_EQ(nsMsgPriority::highest, priority);
+        ASSERT_EQ(NS_OK,
+                  mCore->MessageDB().GetMessageProperty(key, "wide"_ns, text));
+        EXPECT_EQ("ffffffffffffffff"_ns, text);
+      });
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  nsTArray<PendingHeaderAttribute> attributes = {
+      {"flags"_ns, ""_ns, Some(uint64_t(nsMsgMessageFlags::HasRe))},
+      {"flags"_ns, ""_ns, Some(uint64_t(nsMsgMessageFlags::Marked))},
+      {"keywords"_ns, "first tags"_ns, Nothing()},
+      {"keywords"_ns, "final tags"_ns, Nothing()},
+      {"priority"_ns, "6"_ns, Nothing()},
+      {"Case"_ns, "00042"_ns, Nothing()},
+      {"case"_ns, "1e3"_ns, Nothing()},
+      {"empty"_ns, ""_ns, Nothing()},
+      {"café"_ns, "composed"_ns, Nothing()},
+      {"café"_ns, "decomposed"_ns, Nothing()},
+      {"max32"_ns, ""_ns, Some(uint64_t(UINT32_MAX))},
+      {"wide"_ns, ""_ns, Some(uint64_t(UINT64_MAX))},
+      {"zero"_ns, ""_ns, Some(uint64_t(0))},
+      {"storeToken"_ns, "finished-target"_ns, Nothing()},
+      {"offlineMsgSize"_ns, ""_ns, Some(uint64_t(23))}};
+  Maybe<FinishedMessageBody> finished =
+      Some(FinishedMessageBody{"finished-target"_ns, 24, 23, 2, true});
+  ASSERT_EQ(NS_OK, db.SetStagedHeaderAttributes(
+                       sourceId, {mFolderId, first, 51}, attributes, finished));
+  EXPECT_EQ(0u, observer->mAdded);
+  EXPECT_EQ(0u, observer->mChanged);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(first, exists));
+  EXPECT_FALSE(exists);
+  uint32_t flags = 0;
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked |
+                     nsMsgMessageFlags::Offline),
+            flags);
+  ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read), flags);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "max32"_ns, text));
+  EXPECT_EQ("ffffffff"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "zero"_ns, text));
+  EXPECT_EQ("0"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "Case"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "case"_ns, text));
+  EXPECT_EQ("1e3"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "café"_ns, text));
+  EXPECT_EQ("composed"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "café"_ns, text));
+  EXPECT_EQ("decomposed"_ns, text);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(first, names));
+  EXPECT_TRUE(names.Contains("empty"_ns));
+  EXPECT_FALSE(names.Contains("offlineMsgSize"_ns));
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(second, names));
+  EXPECT_FALSE(names.Contains("Case"_ns));
+  db.RemoveMessageListener(observer);
+  remove.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  nsTArray<PendingHeaderAttribute> afterReopen{
+      {"after-reopen"_ns, ""_ns, Some(uint64_t(0))}};
+  ASSERT_EQ(NS_OK, reopened.SetStagedHeaderAttributes(
+                       sourceId, {mFolderId, first, 51}, afterReopen));
+  reopened.AddMessageListener(observer);
+  auto cleanup =
+      MakeScopeExit([&] { reopened.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, reopened.PublishMessage(first, true));
+  EXPECT_EQ(1u, observer->mAdded);
+  EXPECT_EQ(1u, completeCalls);
+  EXPECT_EQ(0u, observer->mChanged);
+  ASSERT_EQ(NS_OK, reopened.MessageExists(second, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, StagedAttributeFailureRollsBackWithoutEvents) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 53));
+  RawHdr raw;
+  raw.keywords = "original"_ns;
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &key));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "good"_ns, "old"_ns));
+  RefPtr<PendingHeaderObserver> observer =
+      new PendingHeaderObserver([](Message*) {});
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateFunction("pending_fault"_ns, 1, witness));
+  auto unregister = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->RemoveFunction("pending_fault"_ns));
+  });
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL(
+                "CREATE TEMP TRIGGER fail_pending_attr BEFORE INSERT ON "
+                "staged_message_properties "
+                "WHEN NEW.name='fail' BEGIN SELECT pending_fault(NEW.id); "
+                "SELECT RAISE(ABORT,'pending attribute'); END"_ns));
+  nsTArray<PendingHeaderAttribute> attributes = {
+      {"good"_ns, "new"_ns, Nothing()},
+      {"keywords"_ns, "changed"_ns, Nothing()},
+      {"fail"_ns, ""_ns, Nothing()}};
+  EXPECT_EQ(
+      NS_ERROR_STORAGE_CONSTRAINT,
+      db.SetStagedHeaderAttributes(sourceId, {mFolderId, key, 53}, attributes));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(key, witness->mLastKey);
+  EXPECT_EQ(0u, observer->mAdded);
+  EXPECT_EQ(0u, observer->mChanged);
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "good"_ns, text));
+  EXPECT_EQ("old"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageTags(key, text));
+  EXPECT_EQ("original"_ns, text);
+  bool active = true;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_pending_attr"_ns));
+  ASSERT_EQ(NS_OK, db.SetStagedHeaderAttributes(sourceId, {mFolderId, key, 53},
+                                                attributes));
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "good"_ns, text));
+  EXPECT_EQ("new"_ns, text);
+  EXPECT_EQ(0u, observer->mAdded);
+  EXPECT_EQ(0u, observer->mChanged);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StagedAttributesRejectWrongIdentityAndUnfinishedStorage) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 55));
+  RawHdr raw;
+  nsMsgKey staged, published;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, true, &published));
+  nsTArray<PendingHeaderAttribute> attributes{{"keep"_ns, ""_ns, Nothing()}};
+  uint64_t other;
+  ASSERT_EQ(NS_OK,
+            mCore->FolderDB().InsertFolder(mFolderId, "Other"_ns, &other));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(other, 55));
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db.SetStagedHeaderAttributes(sourceId, {other, staged, 55}, attributes));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SetStagedHeaderAttributes("replaced-database"_ns,
+                                         {mFolderId, staged, 55}, attributes));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SetStagedHeaderAttributes(sourceId, {mFolderId, staged, 56},
+                                         attributes));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SetStagedHeaderAttributes(sourceId, {mFolderId, published, 55},
+                                         attributes));
+  attributes = {{"flags"_ns, ""_ns, Some(uint64_t(UINT64_MAX))}};
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+            db.SetStagedHeaderAttributes(sourceId, {mFolderId, staged, 55},
+                                         attributes));
+  attributes = {{"storeToken"_ns, "source-token"_ns, Nothing()}};
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SetStagedHeaderAttributes(sourceId, {mFolderId, staged, 55},
+                                         attributes));
+  attributes = {{"uidOnServer"_ns, "2a"_ns, Nothing()}};
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.SetStagedHeaderAttributes(sourceId, {mFolderId, staged, 55},
+                                         attributes));
+  attributes = {{"offlineMsgSize"_ns, ""_ns, Some(uint64_t(UINT64_MAX))}};
+  Maybe<FinishedMessageBody> finished =
+      Some(FinishedMessageBody{"target"_ns, 10, 10, 1, true});
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.SetStagedHeaderAttributes(sourceId, {mFolderId, staged, 55},
+                                         attributes, finished));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  ASSERT_EQ(NS_OK,
+            db.SetMessageProperty(staged, "caller-control"_ns, "pending"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.SetStagedHeaderAttributes(sourceId, {mFolderId, staged, 55},
+                                         attributes, finished));
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString control;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(staged, "caller-control"_ns, control));
+  EXPECT_EQ("pending"_ns, control);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(staged, names));
+  EXPECT_FALSE(names.Contains("keep"_ns));
+  EXPECT_FALSE(names.Contains("storeToken"_ns));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+}
+
+TEST_F(DeliveryCoreReferences,
+       StagedAttributesCannotChangeSentOrAmbiguousDestination) {
+  ASSERT_EQ(NS_OK, Start());
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 57));
+  nsMsgKey source, destination;
+  ASSERT_EQ(NS_OK, Add("pending-source@invalid"_ns, {}, source));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(source, mFolderId, 57, 907));
+  RawHdr raw;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &destination));
+  OfflineOperationData op;
+  op.operation = nsIMsgOfflineImapOperation::kMsgCopy;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, source, op));
+  PendingDestination target{mFolderId, destination, 57};
+  nsTArray<PendingHeaderAttribute> attributes{
+      {"value"_ns, "before"_ns, Nothing()}};
+  ASSERT_EQ(NS_OK, db.SetStagedHeaderAttributes(sourceId, target, attributes));
+  uint64_t attempt = 0;
+  ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(mFolderId, source,
+                                          nsIMsgOfflineImapOperation::kMsgCopy,
+                                          Some(target), attempt));
+  attributes[0].text = "after"_ns;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.SetStagedHeaderAttributes(sourceId, target, attributes));
+  ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(attempt));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.SetStagedHeaderAttributes(sourceId, target, attributes));
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(destination, "value"_ns, text));
+  EXPECT_EQ("before"_ns, text);
 }
 
 }  // namespace mozilla::mailnews

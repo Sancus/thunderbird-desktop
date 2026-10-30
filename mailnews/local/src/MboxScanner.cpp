@@ -100,6 +100,7 @@ NS_IMETHODIMP MboxScanner::OnStartRequest(nsIRequest* req) {
 
   nsAutoCString token;
   token.AppendInt(msgOffset);
+  mMessageStarted = true;
   rv = mScanListener->OnStartMessage(token, mMboxStream->EnvAddr(),
                                      mMboxStream->EnvDate());
   if (NS_FAILED(rv)) {
@@ -122,9 +123,12 @@ NS_IMETHODIMP MboxScanner::OnDataAvailable(nsIRequest* req,
 NS_IMETHODIMP MboxScanner::OnStopRequest(nsIRequest* req, nsresult status) {
   AUTO_PROFILER_LABEL("MboxScanner::OnStopRequest", MAILNEWS);
   if (mMboxStream) {
-    nsresult rv = mScanListener->OnStopRequest(req, status);
-    if (NS_SUCCEEDED(status) && NS_FAILED(rv)) {
-      status = rv;  // Listener requested abort.
+    if (mMessageStarted) {
+      mMessageStarted = false;
+      nsresult rv = mScanListener->OnStopRequest(req, status);
+      if (NS_SUCCEEDED(status) && NS_FAILED(rv)) {
+        status = rv;  // Listener requested abort.
+      }
     }
 
     bool more = false;
@@ -133,8 +137,7 @@ NS_IMETHODIMP MboxScanner::OnStopRequest(nsIRequest* req, nsresult status) {
       nsresult rv = mMboxStream->Continue(more);
       if (NS_SUCCEEDED(rv) && more) {
         RefPtr<MboxMsgInputStream> stream = mMboxStream;
-        nsresult rv =
-            NS_NewInputStreamPump(getter_AddRefs(mPump), stream.forget());
+        rv = NS_NewInputStreamPump(getter_AddRefs(mPump), stream.forget());
         if (NS_SUCCEEDED(rv)) {
           rv = mPump->AsyncRead(this);
         }

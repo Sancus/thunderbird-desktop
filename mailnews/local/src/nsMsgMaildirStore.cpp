@@ -86,7 +86,8 @@ nsresult MaildirScanner::BeginScan(nsIFile* maildirPath,
   nsCOMPtr<nsIFile> cur;
   nsresult rv = maildirPath->Clone(getter_AddRefs(cur));
   NS_ENSURE_SUCCESS(rv, rv);
-  cur->Append(u"cur"_ns);
+  rv = cur->Append(u"cur"_ns);
+  NS_ENSURE_SUCCESS(rv, rv);
 
   rv = cur->GetDirectoryEntries(getter_AddRefs(mDirEnumerator));
   NS_ENSURE_SUCCESS(rv, rv);
@@ -98,12 +99,15 @@ nsresult MaildirScanner::BeginScan(nsIFile* maildirPath,
   // (otherwise the first callbacks will be called before BeginScan() finishes,
   // which should be fine, but just seems a bit inconsistent).
   RefPtr<MaildirScanner> self = this;
-  NS_DispatchToMainThread(
+  rv = NS_DispatchToMainThread(
       NS_NewRunnableFunction("Maildir BeginScan kickoff", [self] {
-        self->mScanListener->OnStartScan();
+        self->mStatus = self->mScanListener->OnStartScan();
         self->NextFile();
       }));
-  return NS_OK;
+  if (NS_FAILED(rv)) {
+    mKungFuDeathGrip = nullptr;
+  }
+  return rv;
 }
 
 // The main driver. Returns no error code. If an error occurs, the mStatus
@@ -133,9 +137,10 @@ void MaildirScanner::NextFile() {
     nsresult rv = NS_NewLocalFileInputStream(getter_AddRefs(stream), f);
     if (NS_FAILED(rv)) {
       MOZ_LOG_FMT(MailDirLog, mozilla::LogLevel::Error,
-                  "Folder scan failed opening file '{}' ({}). Skipping.",
+                  "Folder scan failed opening file '{}' ({}).",
                   f->HumanReadablePath(), rv);
-      continue;
+      mStatus = rv;
+      break;
     }
     // We now have a guaranteed valid stream. Proceed with parsing.
 
@@ -145,7 +150,10 @@ void MaildirScanner::NextFile() {
     }
 
     nsAutoString storeToken;
-    f->GetLeafName(storeToken);
+    mStatus = f->GetLeafName(storeToken);
+    if (NS_FAILED(mStatus)) {
+      break;
+    }
 
     // Notify the listener that a valid message is starting.
     mStatus = mScanListener->OnStartMessage(NS_ConvertUTF16toUTF8(storeToken),
@@ -186,8 +194,10 @@ NS_IMETHODIMP MaildirScanner::OnDataAvailable(nsIRequest* req,
 }
 
 NS_IMETHODIMP MaildirScanner::OnStopRequest(nsIRequest* req, nsresult status) {
-  mScanListener->OnStopRequest(req, status);
-  mStatus = status;
+  nsresult rv = mScanListener->OnStopRequest(req, status);
+  if (NS_SUCCEEDED(mStatus)) {
+    mStatus = NS_FAILED(status) ? status : rv;
+  }
   NextFile();
   return NS_OK;
 }

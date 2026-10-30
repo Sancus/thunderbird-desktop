@@ -559,3 +559,152 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     });
   });
 }
+
+/**
+ * Stop a read-only scan on the first actual listener error, without losing data.
+ *
+ * @param {string} mode - Empty start, populated start, stop, or data plus stop.
+ * @returns {Promise<void>} Checks both real providers and a successful rescan.
+ */
+async function checkScanListenerError(mode) {
+  for (const type of ["mbox", "maildir"]) {
+    await withAvailabilityStore(type, async folder => {
+      const raws =
+        mode == "empty-start"
+          ? []
+          : [0, 1].map(
+              index =>
+                "From: sender@example.invalid\r\n" +
+                `Message-ID: <scan-error-${index}@example.invalid>\r\n` +
+                `Subject: Scan retained message ${index}\r\n\r\n` +
+                `Exact retained scanner body ${index}.\r\n`
+            );
+      const headers = raws.map(raw => folder.addMessage(raw));
+      const originals = headers.map(header => ({
+        key: header.messageKey,
+        id: header.messageId,
+        token: header.storeToken,
+        size: header.messageSize,
+        flags: header.flags,
+      }));
+      const physicalFiles = async () => {
+        const paths =
+          type == "mbox"
+            ? [folder.filePath.path]
+            : await IOUtils.getChildren(
+                PathUtils.join(folder.filePath.path, "cur")
+              );
+        return Promise.all(
+          paths.sort().map(async path => [path, await IOUtils.read(path)])
+        );
+      };
+      const before = await physicalFiles();
+      const listener = new PromiseTestUtils.PromiseStoreScanListener();
+      let starts = 0;
+      let stops = 0;
+      const requestStops = [];
+      listener.onStartScan = () => {
+        starts++;
+        if (mode.endsWith("start")) {
+          throw Components.Exception(
+            "Stop scan before reading",
+            Cr.NS_ERROR_ABORT
+          );
+        }
+      };
+      const read = listener.onDataAvailable;
+      listener.onDataAvailable = function (...args) {
+        read.apply(this, args);
+        if (mode == "data-stop") {
+          throw Components.Exception(
+            "Original scan data error",
+            Cr.NS_ERROR_ABORT
+          );
+        }
+      };
+      listener.onStopRequest = (request, status) => {
+        requestStops.push(status);
+        throw Components.Exception(
+          "Later scan stop error",
+          Cr.NS_ERROR_FILE_ACCESS_DENIED
+        );
+      };
+      const stop = listener.onStopScan;
+      listener.onStopScan = function (status) {
+        stops++;
+        stop.call(this, status);
+      };
+      const expected =
+        mode == "stop" ? Cr.NS_ERROR_FILE_ACCESS_DENIED : Cr.NS_ERROR_ABORT;
+      // asyncScan guarantees that no callback runs before this call returns.
+      folder.msgStore.asyncScan(folder, listener);
+      await Assert.rejects(
+        listener.promise,
+        error => Number(error.message) == expected
+      );
+      Assert.equal(starts, 1);
+      Assert.equal(stops, 1);
+      if (mode.endsWith("start")) {
+        Assert.deepEqual(listener.tokens, []);
+        Assert.deepEqual(listener.messages, []);
+        Assert.deepEqual(requestStops, []);
+      } else {
+        Assert.equal(listener.tokens.length, 1);
+        const index = originals.findIndex(
+          original => original.token == listener.tokens[0]
+        );
+        Assert.notEqual(index, -1);
+        if (mode == "stop") {
+          Assert.equal(listener.messages[0], raws[index]);
+          Assert.deepEqual(requestStops, [Cr.NS_OK]);
+        } else {
+          // A deliberate data error can stop before all bytes are delivered.
+          // The independent full body and physical-file checks below stay exact.
+          Assert.greater(listener.messages[0].length, 0);
+          Assert.ok(raws[index].startsWith(listener.messages[0]));
+          Assert.deepEqual(requestStops, [Cr.NS_ERROR_ABORT]);
+        }
+      }
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys().sort((a, b) => a - b),
+        originals.map(original => original.key).sort((a, b) => a - b)
+      );
+      for (let i = 0; i < originals.length; i++) {
+        const original = originals[i];
+        const header = folder.msgDatabase.getMsgHdrForKey(original.key);
+        Assert.equal(header.folder, folder);
+        Assert.equal(header.messageId, original.id);
+        Assert.equal(header.storeToken, original.token);
+        Assert.equal(header.messageSize, original.size);
+        Assert.equal(header.flags, original.flags);
+        Assert.equal(
+          mailTestUtils.loadMessageToString(folder, header),
+          raws[i]
+        );
+      }
+      Assert.deepEqual(await physicalFiles(), before);
+      const retry = new PromiseTestUtils.PromiseStoreScanListener();
+      folder.msgStore.asyncScan(folder, retry);
+      await retry.promise;
+      Assert.deepEqual(retry.messages.toSorted(), raws.toSorted());
+      Assert.deepEqual(
+        retry.tokens.toSorted(),
+        originals.map(original => original.token).toSorted()
+      );
+      Assert.deepEqual(await physicalFiles(), before);
+    });
+  }
+}
+
+add_task(async function test_scanEmptyStartError() {
+  await checkScanListenerError("empty-start");
+});
+add_task(async function test_scanStartError() {
+  await checkScanListenerError("start");
+});
+add_task(async function test_scanStopError() {
+  await checkScanListenerError("stop");
+});
+add_task(async function test_scanDataKeepsFirstError() {
+  await checkScanListenerError("data-stop");
+});

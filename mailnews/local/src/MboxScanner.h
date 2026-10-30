@@ -41,6 +41,8 @@ class MboxScanner : public nsIStreamListener {
   RefPtr<MboxMsgInputStream> mMboxStream;
   // Pump to use a sync stream as async.
   nsCOMPtr<nsIInputStreamPump> mPump;
+  // Balance message callbacks only after OnStartMessage has been announced.
+  bool mMessageStarted{false};
 };
 
 #endif  // COMM_MAILNEWS_LOCAL_SRC_MBOXSCANNER_H_

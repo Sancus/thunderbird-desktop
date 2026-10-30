@@ -1325,11 +1325,15 @@ NS_IMETHODIMP PerFolderDatabase::MarkNotNew(nsMsgKey aKey,
 }
 NS_IMETHODIMP PerFolderDatabase::MarkMDNNeeded(
     nsMsgKey aKey, bool aNeeded, nsIDBChangeListener* aInstigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::MDNReportNeeded,
                                     aNeeded);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkMDNSent(nsMsgKey aKey, bool aSent,
                                              nsIDBChangeListener* aInstigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::MDNReportSent,
                                     aSent);
 }
@@ -1341,33 +1345,47 @@ NS_IMETHODIMP PerFolderDatabase::MarkRead(nsMsgKey aKey, bool aRead,
 }
 NS_IMETHODIMP PerFolderDatabase::MarkMarked(nsMsgKey aKey, bool aMarked,
                                             nsIDBChangeListener* instigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Marked, aMarked);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkReplied(nsMsgKey aKey, bool aReplied,
                                              nsIDBChangeListener* aInstigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Replied, aReplied);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkForwarded(
     nsMsgKey aKey, bool aForwarded, nsIDBChangeListener* aInstigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Forwarded,
                                     aForwarded);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkRedirected(
     nsMsgKey aKey, bool aRedirected, nsIDBChangeListener* aInstigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Redirected,
                                     aRedirected);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkHasAttachments(
     nsMsgKey aKey, bool aHasAttachments, nsIDBChangeListener* aInstigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Attachment,
                                     aHasAttachments);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkOffline(nsMsgKey aKey, bool aOffline,
                                              nsIDBChangeListener* instigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::Offline, aOffline);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkImapDeleted(
     nsMsgKey aKey, bool aDeleted, nsIDBChangeListener* instigator) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::IMAPDeleted,
                                     aDeleted);
 }
@@ -1451,14 +1469,23 @@ NS_IMETHODIMP PerFolderDatabase::IsWatched(nsMsgKey key, bool* watched) {
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::IsMarked(nsMsgKey aKey, bool* aMarked) {
+  NS_ENSURE_ARG_POINTER(aMarked);
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().GetMessageFlag(aKey, nsMsgMessageFlags::Marked, *aMarked);
 }
 NS_IMETHODIMP PerFolderDatabase::HasAttachments(nsMsgKey aKey,
                                                 bool* aAttachments) {
+  NS_ENSURE_ARG_POINTER(aAttachments);
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().GetMessageFlag(aKey, nsMsgMessageFlags::Attachment,
                                     *aAttachments);
 }
 NS_IMETHODIMP PerFolderDatabase::IsMDNSent(nsMsgKey aKey, bool* aMDNSent) {
+  NS_ENSURE_ARG_POINTER(aMDNSent);
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   return MessageDB().GetMessageFlag(aKey, nsMsgMessageFlags::MDNReportSent,
                                     *aMDNSent);
 }

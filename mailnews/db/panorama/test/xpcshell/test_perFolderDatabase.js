@@ -3742,3 +3742,236 @@ add_task(function test_notNewNoOpAndReentrantNewListMutation() {
     db.removeListener(listener);
   }
 });
+
+add_task(function test_keyFlagSettersRequireCurrentPhysicalFolder() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("key-flag-admission");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("key-flag-bystander");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const draft = db.createNewHdr();
+  draft.messageId = "key-flag-owned@read.invalid";
+  draft.flags = 0x40000000;
+  const header = db.attachHdr(draft, false);
+  const foreignDraft = otherDB.createNewHdr();
+  foreignDraft.messageId = "key-flag-foreign@read.invalid";
+  foreignDraft.flags = 0x40000000;
+  const foreign = otherDB.attachHdr(foreignDraft, false);
+  const setters = [
+    ["markMDNNeeded", Ci.nsMsgMessageFlags.MDNReportNeeded],
+    ["markMDNSent", Ci.nsMsgMessageFlags.MDNReportSent],
+    ["markMarked", Ci.nsMsgMessageFlags.Marked],
+    ["markReplied", Ci.nsMsgMessageFlags.Replied],
+    ["markForwarded", Ci.nsMsgMessageFlags.Forwarded],
+    ["markRedirected", Ci.nsMsgMessageFlags.Redirected],
+    ["markHasAttachments", Ci.nsMsgMessageFlags.Attachment],
+    ["markOffline", Ci.nsMsgMessageFlags.Offline],
+    ["markImapDeleted", Ci.nsMsgMessageFlags.IMAPDeleted],
+  ];
+  const calls = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(changed, before, after) {
+      Assert.equal(changed.messageKey, header.messageKey);
+      Assert.strictEqual(changed.folder, folder);
+      calls.push([before, after]);
+    },
+  };
+  db.addListener(listener);
+  const connection = database.connectionForTests;
+  try {
+    for (const [method, flag] of setters) {
+      db[method](header.messageKey, true, null);
+      Assert.equal(
+        header.flags,
+        0x40000000 | flag,
+        `${method} sets only its bit`
+      );
+      db[method](header.messageKey, false, null);
+      Assert.equal(header.flags, 0x40000000, `${method} clears only its bit`);
+      Assert.deepEqual(calls.splice(0), [
+        [0x40000000, 0x40000000 | flag],
+        [0x40000000 | flag, 0x40000000],
+      ]);
+    }
+    for (const [method] of setters) {
+      Assert.throws(
+        () => db[method](foreign.messageKey, true, null),
+        /NS_ERROR_ILLEGAL_VALUE/,
+        `${method} cannot mutate another physical folder`
+      );
+      Assert.equal(foreign.flags, 0x40000000);
+      Assert.deepEqual(otherDB.getNewList(), [foreign.messageKey]);
+    }
+    connection.beginTransaction();
+    try {
+      for (const [method] of setters) {
+        Assert.throws(
+          () => db[method](header.messageKey, true, null),
+          error => error.result === Cr.NS_ERROR_IN_PROGRESS,
+          `${method} preserves the caller transaction`
+        );
+        Assert.ok(connection.transactionInProgress);
+        Assert.equal(header.flags, 0x40000000);
+      }
+    } finally {
+      connection.rollbackTransaction();
+    }
+    connection.executeSimpleSQL(
+      `CREATE TEMP TRIGGER reject_key_flags_105 BEFORE UPDATE OF flags ON messages
+       WHEN OLD.id = ${header.messageKey}
+       BEGIN SELECT RAISE(ABORT, 'key flags fault'); END`
+    );
+    try {
+      for (const [method] of setters) {
+        Assert.throws(
+          () => db[method](header.messageKey, true, null),
+          error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT,
+          `${method} propagates the original write error`
+        );
+        Assert.equal(header.flags, 0x40000000);
+        Assert.ok(!connection.transactionInProgress);
+      }
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER reject_key_flags_105");
+    }
+    connection.beginTransaction();
+    const update = connection.createStatement(
+      "UPDATE database_identity SET sourceId = :source"
+    );
+    try {
+      update.params.source = Services.uuid.generateUUID().toString();
+      update.execute();
+      for (const [method] of setters) {
+        Assert.throws(
+          () => db[method](header.messageKey, true, null),
+          /NS_ERROR_NOT_AVAILABLE/,
+          `${method} refuses another database incarnation`
+        );
+        Assert.ok(connection.transactionInProgress);
+      }
+    } finally {
+      update.finalize();
+      connection.rollbackTransaction();
+    }
+    for (const [method] of setters) {
+      Assert.throws(
+        () => db[method](0xffffffff, true, null),
+        /NS_ERROR_ILLEGAL_VALUE/,
+        `${method} refuses a missing published key`
+      );
+    }
+    Assert.equal(header.flags, 0x40000000);
+    Assert.deepEqual(db.getNewList(), [header.messageKey]);
+    Assert.deepEqual(calls, []);
+    db.forceClosed();
+    for (const [method] of setters) {
+      Assert.throws(
+        () => db[method](header.messageKey, true, null),
+        /NS_ERROR_NOT_AVAILABLE/,
+        `${method} refuses a force-closed wrapper`
+      );
+    }
+    Assert.equal(header.flags, 0x40000000);
+    Assert.equal(foreign.flags, 0x40000000);
+    Assert.ok(!connection.transactionInProgress);
+  } finally {
+    db.removeListener(listener);
+  }
+});
+
+add_task(function test_keyFlagQueriesRequireCurrentPhysicalFolder() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("key-flag-query-admission");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("key-flag-query-bystander");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const draft = db.createNewHdr();
+  draft.messageId = "key-flag-query-owned@read.invalid";
+  const header = db.attachHdr(draft, false);
+  const foreignDraft = otherDB.createNewHdr();
+  foreignDraft.messageId = "key-flag-query-foreign@read.invalid";
+  foreignDraft.flags =
+    Ci.nsMsgMessageFlags.Marked |
+    Ci.nsMsgMessageFlags.Attachment |
+    Ci.nsMsgMessageFlags.MDNReportSent;
+  const foreign = otherDB.attachHdr(foreignDraft, false);
+  const queries = [
+    ["isMarked", "markMarked"],
+    ["hasAttachments", "markHasAttachments"],
+    ["isMDNSent", "markMDNSent"],
+  ];
+  for (const [query, setter] of queries) {
+    Assert.strictEqual(db[query](header.messageKey), false);
+    db[setter](header.messageKey, true, null);
+    Assert.strictEqual(db[query](header.messageKey), true);
+  }
+  for (const [query] of queries) {
+    Assert.throws(
+      () => db[query](foreign.messageKey),
+      /NS_ERROR_ILLEGAL_VALUE/,
+      `${query} cannot read another physical folder through this wrapper`
+    );
+  }
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    for (const [query] of queries) {
+      Assert.strictEqual(db[query](header.messageKey), true);
+      Assert.ok(connection.transactionInProgress);
+    }
+  } finally {
+    connection.rollbackTransaction();
+  }
+  connection.beginTransaction();
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    for (const [query] of queries) {
+      Assert.throws(
+        () => db[query](header.messageKey),
+        /NS_ERROR_NOT_AVAILABLE/,
+        `${query} refuses another database incarnation`
+      );
+      Assert.ok(connection.transactionInProgress);
+    }
+  } finally {
+    update.finalize();
+    connection.rollbackTransaction();
+  }
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO held_messages_105"
+  );
+  try {
+    for (const [query] of queries) {
+      Assert.throws(
+        () => db[query](header.messageKey),
+        error => error.result === Cr.NS_ERROR_FAILURE,
+        `${query} propagates the original lookup failure`
+      );
+    }
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE held_messages_105 RENAME TO messages"
+    );
+  }
+  for (const [query] of queries) {
+    Assert.strictEqual(db[query](header.messageKey), true);
+    Assert.throws(() => db[query](0xffffffff), /NS_ERROR_ILLEGAL_VALUE/);
+  }
+  db.forceClosed();
+  for (const [query] of queries) {
+    Assert.throws(() => db[query](header.messageKey), /NS_ERROR_NOT_AVAILABLE/);
+    Assert.strictEqual(otherDB[query](foreign.messageKey), true);
+  }
+  Assert.ok(!connection.transactionInProgress);
+});

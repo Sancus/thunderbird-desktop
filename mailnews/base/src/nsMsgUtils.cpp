@@ -324,6 +324,16 @@ nsString NS_MsgHashIfNecessary(const nsAString& unsafeName) {
     name.Append(NS_ConvertASCIItoUTF16(hashedname));
   }
 
+#ifdef XP_WIN
+  // Preserve an already-safe shortened name, but Windows device names remain
+  // reserved even with extensions. Use the same hash without an unsafe prefix.
+  if (nsLocalFile::CheckForReservedFileName(name)) {
+    PR_snprintf(hashedname, 9, "%08lx",
+                (unsigned long)StringHash(nsString(unsafeName)));
+    name.AssignASCII(hashedname);
+  }
+#endif
+
   return name;
 }
 

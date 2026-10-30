@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
  * You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
 const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
@@ -226,7 +229,12 @@ async function test_createFolder() {
     easypeasy: "easypeasy",
     ".nameWithLeadingDot": "8e57891d",
     "Input/Output": "Input6359d759",
-    COM1: "COM1",
+    COM1: AppConstants.platform == "win" ? msgHash("COM1") : "COM1",
+    cOm2: AppConstants.platform == "win" ? msgHash("cOm2") : "cOm2",
+    "COM1.txt":
+      AppConstants.platform == "win" ? msgHash("COM1.txt") : "COM1.txt",
+    COM10: "COM10",
+    "COM1.": "COM1" + msgHash("COM1."),
     グレープフルーツ: "グレープフルーツ",
     "/\\wibble/\\": "9d042cb8",
     "ZA̡͊͠͝LGΌ ISͮ̂҉̯͈͕̹̘̱ TO͇̹̺ͅƝ̴ȳ̳ TH̘Ë͖́̉ ͠P̯͍̭O̚​N̐Y̡ H̸̡̪̯ͨ͊̽̅̾̎Ȩ̬̩̾͛ͪ̈́̀́͘ ̶̧̨̱̹̭̯ͧ̾ͬC̷̙̲̝͖ͭ̏ͥͮ͟Oͮ͏̮̪̝͍M̲̖͊̒ͪͩͬ̚̚͜Ȇ̴̟̟͙̞ͩ͌͝S̨̥̫͎̭ͯ̿̔̀ͅ": "ZA̡͊͠͝LGΌ ISͮ̂҉̯͈͕̹̘̱ TO͇̹̺ͅƝ̴ȳ̳ TH̘Ë͖́̉ ͠P̯͍̭O656c4d10",
@@ -244,6 +252,47 @@ async function test_createFolder() {
       folderNames[folderName],
       `Folder "${folderName} should have path "${folderNames[folderName]}""`
     );
+    if (folderName == "COM1") {
+      const originalPath = newFolder.filePath.path;
+      const originalURI = newFolder.URI;
+      const raw =
+        "From: writer@example.invalid\r\n" +
+        "Message-ID: <reserved-folder@example.invalid>\r\n" +
+        "Subject: Retain the reserved display name\r\n\r\n" +
+        "Exact reserved-folder body.\r\n";
+      const header = newFolder
+        .QueryInterface(Ci.nsIMsgLocalMailFolder)
+        .addMessage(raw);
+      const key = header.messageKey;
+      const token = header.storeToken;
+      const size = header.messageSize;
+      Assert.equal(header.messageId, "reserved-folder@example.invalid");
+      Assert.equal(
+        readAll(store.getMsgInputStream(newFolder, token, size)),
+        raw
+      );
+      newFolder.ForceDBClosed();
+      const db = newFolder.msgDatabase;
+      Assert.equal(
+        db.dBFolderInfo.folderName,
+        folderNames[folderName] == folderName ? "" : folderName,
+        "Only a hashed storage name needs a persisted display-name override"
+      );
+      const reopened = db.getMsgHdrForKey(key);
+      Assert.equal(reopened.messageKey, key);
+      Assert.equal(reopened.storeToken, token);
+      Assert.equal(reopened.messageSize, size);
+      Assert.equal(reopened.messageId, "reserved-folder@example.invalid");
+      Assert.equal(newFolder.name, folderName);
+      Assert.equal(newFolder.filePath.path, originalPath);
+      Assert.equal(newFolder.URI, originalURI);
+      Assert.strictEqual(rootFolder.getChildNamed(folderName), newFolder);
+      Assert.equal(
+        readAll(store.getMsgInputStream(newFolder, token, size)),
+        raw,
+        "Reopening the summary retains the same storage token and exact body"
+      );
+    }
   }
 }
 

@@ -1841,6 +1841,9 @@ async function checkNativeLocalIssuedError(storeType) {
         Ci.nsIFile
       );
       issuedFile.initWithPath(files[0]);
+      // Release the Windows file handle without finishing the provider's write.
+      // Buffered Close is idempotent, so Finish still reaches the missing file.
+      stream.close();
       const cur = child.filePath.clone();
       cur.append("cur");
       issuedFile.moveTo(cur, "retained-issued-error.eml");

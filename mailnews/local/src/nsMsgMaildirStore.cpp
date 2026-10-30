@@ -787,14 +787,9 @@ nsresult nsMsgMaildirStore::InternalGetNewMsgOutputStream(
       return existing->value().finishStatus;
     }
 
-    // Close stream, delete partly-written file, remove from ongoing set.
-    existing->value().stream->Close();
-    nsCOMPtr<nsIFile> partial;
-    rv = EnsureSubDir(folder, u"tmp"_ns, getter_AddRefs(partial));
+    nsCOMPtr<nsIOutputStream> stream = existing->value().stream;
+    rv = DiscardNewMessage(folder, stream);
     NS_ENSURE_SUCCESS(rv, rv);
-    partial->Append(NS_ConvertUTF8toUTF16(existing->value().filename));
-    partial->Remove(false);
-    mOngoingWrites.remove(existing);
   }
 
   // Time to open a new stream for writing.

@@ -47,6 +47,7 @@ NS_IMETHODIMP CopyMessageStreamListener::EndCopy(bool copySucceeded) {
   copySucceeded = NS_SUCCEEDED(mStatus);
   nsresult rv =
       mEndCopy ? mEndCopy(mStatus) : mDestination->EndCopy(copySucceeded);
+  RememberResult(rv);
   NS_ENSURE_SUCCESS(rv, rv);
 
   // If this is a move and we finished the copy, delete the old message.

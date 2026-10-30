@@ -65,8 +65,8 @@ struct nsLocalMailCopyState {
   bool m_copyingMultipleMessages;
   bool m_allowUndo;
   bool m_writeFailed;
-#ifdef MOZ_PANORAMA
   nsresult m_copyError = NS_OK;
+#ifdef MOZ_PANORAMA
   bool m_finishAttempted = false;
   bool m_discardFailed = false;
   nsCString m_storeToken;

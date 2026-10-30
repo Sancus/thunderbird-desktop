@@ -615,3 +615,219 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkDeleteAdmission("maildir", true);
   });
 }
+
+/**
+ * Fail a real maildir Finish after its destination stream has opened.
+ *
+ * @param {boolean} isMove - Request a move instead of a copy.
+ * @param {number} count - One message, or three with the second Finish failing.
+ * @returns {Promise<void>} Completes the real request and restores owned paths.
+ */
+async function checkCopyFinishFailure(isMove, count) {
+  const accounts = [];
+  const prefs = [
+    "mail.serverDefaultStoreContractID",
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
+  const label = `finish-${isMove ? "move" : "copy"}-${count}`;
+  const makeFolder = (name, contract) => {
+    for (const { name: pref } of prefs) {
+      Services.prefs.setCharPref(pref, contract);
+    }
+    const server = MailServices.accounts.createIncomingServer(
+      name,
+      `${name}.invalid`,
+      "none"
+    );
+    server.setStringValue("storeContractID", contract);
+    const account = MailServices.accounts.createAccount();
+    accounts.push(account);
+    account.incomingServer = server;
+    const folder = server.rootMsgFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder(name)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const type = contract.includes("maildirstore") ? "maildir" : "mbox";
+    Assert.equal(folder.msgStore.storeType, type);
+    Assert.equal(server.msgStore.storeType, type);
+    return folder;
+  };
+  try {
+    // Different providers force the real streaming path on both backends.
+    const source = makeFolder(
+      `${label}-source`,
+      "@mozilla.org/msgstore/berkeleystore;1"
+    );
+    const destination = makeFolder(
+      `${label}-destination`,
+      "@mozilla.org/msgstore/maildirstore;1"
+    );
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+      native
+    );
+    const raws = Array.from(
+      { length: count },
+      (_, index) =>
+        "From: sender@example.invalid\r\n" +
+        "To: recipient@example.invalid\r\n" +
+        `Message-ID: <${label}-${index}@example.invalid>\r\n` +
+        `Subject: ${label} ${index}\r\n\r\n` +
+        `Exact retained body ${index}.\r\n`
+    );
+    const headers = raws.map(raw => source.addMessage(raw));
+    source.markMessagesRead(headers, true);
+    for (const header of headers) {
+      header.setStringProperty("finishFailureNote", "Keep this exact value");
+    }
+    const originals = headers.map(header => ({
+      key: header.messageKey,
+      id: header.messageId,
+      token: header.storeToken,
+      size: header.messageSize,
+      flags: header.flags,
+    }));
+    const sourceBytes = await IOUtils.read(source.filePath.path);
+    const failAt = count == 1 ? 1 : 2;
+    const cur = destination.filePath.clone();
+    cur.append("cur");
+    const held = destination.filePath.clone();
+    held.append("cur-before-failed-finish");
+    Assert.ok(cur.isDirectory());
+    Assert.ok(!held.exists());
+    let starts = 0;
+    let stops = 0;
+    let progress = 0;
+    let injected = false;
+    let injectionError;
+    let resolve;
+    const done = new Promise(callback => {
+      resolve = callback;
+    });
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+      onStartCopy() {
+        starts++;
+      },
+      onProgress() {
+        if (++progress != failAt) {
+          return;
+        }
+        try {
+          // BeginCopy calls progress only after GetNewMsgOutputStream.
+          // Keep any successful prefix, and block the actual final MoveTo.
+          cur.clone().moveTo(held.parent, held.leafName);
+          cur.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+          injected = true;
+        } catch (error) {
+          injectionError = error;
+        }
+      },
+      setMessageKey() {},
+      getMessageId() {
+        return "";
+      },
+      onStopCopy(status) {
+        stops++;
+        resolve(status);
+      },
+    };
+    let status;
+    try {
+      MailServices.copy.copyMessages(
+        source,
+        headers,
+        destination,
+        isMove,
+        listener,
+        null,
+        false
+      );
+      status = await done;
+    } finally {
+      if (held.exists()) {
+        // Never remove unexpected or possibly settled destination content.
+        Assert.ok(cur.isFile());
+        Assert.equal(cur.fileSize, 0);
+        cur.remove(false);
+        held.moveTo(destination.filePath, "cur");
+      }
+    }
+    Assert.equal(injectionError, undefined);
+    Assert.ok(injected, "The real opened-write finalization fault was reached");
+    Assert.equal(starts, 1);
+    Assert.equal(stops, 1);
+    Assert.equal(status, Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR);
+    Assert.equal(progress, failAt);
+    Assert.deepEqual(
+      source.msgDatabase.listAllKeys().sort((a, b) => a - b),
+      originals.map(original => original.key).sort((a, b) => a - b)
+    );
+    for (let i = 0; i < originals.length; i++) {
+      const original = originals[i];
+      const header = source.msgDatabase.getMsgHdrForKey(original.key);
+      Assert.equal(header.messageId, original.id);
+      Assert.equal(header.storeToken, original.token);
+      Assert.equal(header.messageSize, original.size);
+      Assert.equal(header.flags, original.flags);
+      Assert.ok(header.properties.includes("finishFailureNote"));
+      Assert.equal(
+        header.getStringProperty("finishFailureNote"),
+        "Keep this exact value"
+      );
+      Assert.equal(mailTestUtils.loadMessageToString(source, header), raws[i]);
+    }
+    Assert.deepEqual(await IOUtils.read(source.filePath.path), sourceBytes);
+    const destinationKeys = destination.msgDatabase
+      .listAllKeys()
+      .sort((a, b) => a - b);
+    Assert.equal(destinationKeys.length, failAt - 1);
+    for (let i = 0; i < destinationKeys.length; i++) {
+      const header = destination.msgDatabase.getMsgHdrForKey(
+        destinationKeys[i]
+      );
+      Assert.equal(header.messageId, originals[i].id);
+      Assert.equal(
+        mailTestUtils.loadMessageToString(destination, header),
+        raws[i]
+      );
+    }
+    const pending = await IOUtils.getChildren(
+      PathUtils.join(destination.filePath.path, "tmp")
+    );
+    Assert.equal(pending.length, 1);
+    Assert.equal(await IOUtils.readUTF8(pending[0]), raws[failAt - 1]);
+  } finally {
+    for (const account of accounts.reverse()) {
+      MailServices.accounts.removeAccount(account);
+    }
+    for (const { name, hadValue, value } of prefs) {
+      if (hadValue) {
+        Services.prefs.setCharPref(name, value);
+      } else {
+        Services.prefs.clearUserPref(name);
+      }
+    }
+  }
+}
+
+add_task(async function test_copyFinishFailure() {
+  await checkCopyFinishFailure(false, 1);
+});
+add_task(async function test_moveFinishFailure() {
+  await checkCopyFinishFailure(true, 1);
+});
+add_task(async function test_laterCopyFinishFailure() {
+  await checkCopyFinishFailure(false, 3);
+});
+add_task(async function test_laterMoveFinishFailure() {
+  await checkCopyFinishFailure(true, 3);
+});

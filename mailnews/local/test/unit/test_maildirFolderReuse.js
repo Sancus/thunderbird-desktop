@@ -961,3 +961,430 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     });
   });
 }
+
+/**
+ * Keep a preempted copy's write error and the provider's newer owned stream.
+ *
+ * @param {boolean} isMove - Request a move instead of a copy.
+ * @returns {Promise<void>} Completes the request and discards only our new write.
+ */
+async function checkPreemptedCopy(isMove) {
+  await withTrashStore("maildir", async root => {
+    const destination = root.createLocalSubfolder(
+      `preempted-${isMove ? "move" : "copy"}`
+    );
+    const contract = "@mozilla.org/msgstore/berkeleystore;1";
+    Services.prefs.setCharPref("mail.serverDefaultStoreContractID", contract);
+    Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
+    const server = MailServices.accounts.createIncomingServer(
+      "preempted-source",
+      "preempted-source.invalid",
+      "none"
+    );
+    server.setStringValue("storeContractID", contract);
+    const account = MailServices.accounts.createAccount();
+    account.incomingServer = server;
+    let replacement;
+    try {
+      const source = server.rootMsgFolder
+        .QueryInterface(Ci.nsIMsgLocalMailFolder)
+        .createLocalSubfolder("source")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      Assert.equal(server.msgStore.storeType, "mbox");
+      Assert.equal(source.msgStore.storeType, "mbox");
+      Assert.equal(destination.msgStore.storeType, "maildir");
+      const raw =
+        "From: sender@example.invalid\r\n" +
+        "Message-ID: <preempted-copy@example.invalid>\r\n" +
+        "Subject: Retain source on preempted copy\r\n\r\n" +
+        "Exact retained source body.\r\n";
+      const header = source.addMessage(raw);
+      source.markMessagesRead([header], true);
+      header.setStringProperty("preemptionNote", "Keep this exact value");
+      const original = {
+        key: header.messageKey,
+        token: header.storeToken,
+        size: header.messageSize,
+        flags: header.flags,
+        bytes: await IOUtils.read(source.filePath.path),
+      };
+      const replacementBody = "Exact independent provider write.\r\n";
+      let starts = 0;
+      let stops = 0;
+      let progress = 0;
+      let written;
+      let injectionError;
+      let resolve;
+      const done = new Promise(callback => {
+        resolve = callback;
+      });
+      const listener = {
+        QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+        onStartCopy() {
+          starts++;
+        },
+        onProgress() {
+          if (++progress != 1) {
+            return;
+          }
+          try {
+            // The provider's existing per-folder contract closes the old
+            // stream before issuing this new one. The copy must not discard it.
+            replacement =
+              destination.msgStore.getNewMsgOutputStream(destination);
+            written = replacement.write(
+              replacementBody,
+              replacementBody.length
+            );
+            replacement.flush();
+          } catch (error) {
+            injectionError = error;
+          }
+        },
+        setMessageKey() {},
+        getMessageId() {
+          return "";
+        },
+        onStopCopy(status) {
+          stops++;
+          resolve(status);
+        },
+      };
+      MailServices.copy.copyMessages(
+        source,
+        [header],
+        destination,
+        isMove,
+        listener,
+        null,
+        false
+      );
+      const status = await done;
+      Assert.equal(injectionError, undefined);
+      Assert.ok(replacement);
+      Assert.equal(written, replacementBody.length);
+      Assert.equal(starts, 1);
+      Assert.equal(stops, 1);
+      Assert.equal(progress, 1);
+      Assert.equal(status, Cr.NS_BASE_STREAM_CLOSED);
+      Assert.deepEqual(source.msgDatabase.listAllKeys(), [original.key]);
+      const retained = source.msgDatabase.getMsgHdrForKey(original.key);
+      Assert.equal(retained.messageId, "preempted-copy@example.invalid");
+      Assert.equal(retained.storeToken, original.token);
+      Assert.equal(retained.messageSize, original.size);
+      Assert.equal(retained.flags, original.flags);
+      Assert.ok(retained.properties.includes("preemptionNote"));
+      Assert.equal(
+        retained.getStringProperty("preemptionNote"),
+        "Keep this exact value"
+      );
+      Assert.equal(mailTestUtils.loadMessageToString(source, retained), raw);
+      Assert.deepEqual(
+        await IOUtils.read(source.filePath.path),
+        original.bytes
+      );
+      Assert.deepEqual(destination.msgDatabase.listAllKeys(), []);
+      Assert.deepEqual(
+        await IOUtils.getChildren(
+          PathUtils.join(destination.filePath.path, "cur")
+        ),
+        []
+      );
+      const pending = await IOUtils.getChildren(
+        PathUtils.join(destination.filePath.path, "tmp")
+      );
+      Assert.equal(pending.length, 1);
+      Assert.equal(await IOUtils.readUTF8(pending[0]), replacementBody);
+      replacement.streamStatus();
+      Assert.ok(!destination.locked);
+      Assert.ok(!source.locked);
+    } finally {
+      if (replacement) {
+        destination.msgStore.discardNewMessage(destination, replacement);
+      }
+      MailServices.accounts.removeAccount(account);
+    }
+  });
+}
+
+add_task(async function test_copyPreemptedWrite() {
+  await checkPreemptedCopy(false);
+});
+add_task(async function test_movePreemptedWrite() {
+  await checkPreemptedCopy(true);
+});
+
+/**
+ * Keep a failed synchronous file copy from settling a later real request.
+ *
+ * @param {boolean} queuedMove - Move the next source instead of copying it.
+ * @returns {Promise<void>} Waits for the blocked and independent requests.
+ */
+async function checkFileFinishContinuation(queuedMove) {
+  await withTrashStore("maildir", async root => {
+    const label = `file-finish-${queuedMove ? "move" : "copy"}`;
+    const destination = root.createLocalSubfolder(label);
+    const independent = root.createLocalSubfolder(`${label}-independent`);
+    const contract = "@mozilla.org/msgstore/berkeleystore;1";
+    Services.prefs.setCharPref("mail.serverDefaultStoreContractID", contract);
+    Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
+    const server = MailServices.accounts.createIncomingServer(
+      label,
+      `${label}.invalid`,
+      "none"
+    );
+    server.setStringValue("storeContractID", contract);
+    const account = MailServices.accounts.createAccount();
+    account.incomingServer = server;
+    const cur = destination.filePath.clone();
+    cur.append("cur");
+    const held = destination.filePath.clone();
+    held.append("cur-before-file-finish");
+    let heldCur = false;
+    const restore = () => {
+      if (heldCur) {
+        if (!cur.isFile() || cur.fileSize != 0) {
+          throw new Error("Refusing to remove unexpected destination content");
+        }
+        cur.remove(false);
+        held.moveTo(destination.filePath, "cur");
+        heldCur = false;
+      }
+    };
+    try {
+      const source = server.rootMsgFolder
+        .QueryInterface(Ci.nsIMsgLocalMailFolder)
+        .createLocalSubfolder("source")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      Assert.equal(source.msgStore.storeType, "mbox");
+      Assert.equal(server.msgStore.storeType, "mbox");
+      Assert.equal(destination.msgStore.storeType, "maildir");
+      Assert.equal(independent.msgStore.storeType, "maildir");
+      const raw =
+        "From: sender@example.invalid\r\n" +
+        `Message-ID: <${label}-source@example.invalid>\r\n` +
+        "Subject: Retain queued source\r\n\r\nExact queued source body.\r\n";
+      const header = source.addMessage(raw);
+      header.setStringProperty("fileFinishNote", "Exact queued property");
+      const original = {
+        key: header.messageKey,
+        token: header.storeToken,
+        size: header.messageSize,
+        flags: header.flags,
+        bytes: await IOUtils.read(source.filePath.path),
+      };
+      const fileRaw =
+        "X-Mozilla-Status: 0001\r\n" +
+        "X-Mozilla-Status2: 00000000\r\n" +
+        "X-Mozilla-Keys: \r\n" +
+        "From: file@example.invalid\r\n" +
+        `Message-ID: <${label}-file@example.invalid>\r\n` +
+        "Subject: Failed file Finish\r\n\r\nExact failed file body.\r\n";
+      const file = do_get_profile();
+      file.append(`${label}.eml`);
+      await IOUtils.writeUTF8(file.path, fileRaw);
+      Assert.ok(cur.isDirectory());
+      Assert.ok(!held.exists());
+      const starts = [0, 0, 0];
+      const progress = [0, 0, 0];
+      const statuses = [[], [], []];
+      let injected = false;
+      let resolve;
+      let reject;
+      const done = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      const listeners = starts.map((unused, index) => ({
+        QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+        onStartCopy() {
+          starts[index]++;
+        },
+        onProgress() {
+          progress[index]++;
+          if (index == 0 && !injected) {
+            try {
+              cur.clone().moveTo(held.parent, held.leafName);
+              heldCur = true;
+              cur.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+              injected = true;
+            } catch (error) {
+              reject(error);
+            }
+          }
+        },
+        setMessageKey() {},
+        getMessageId() {
+          return "";
+        },
+        onStopCopy(status) {
+          statuses[index].push(status);
+          try {
+            if (index == 0) {
+              restore();
+              // The provider still retains the failed Finish. This next
+              // same-folder request must fail once with that actual error.
+              MailServices.copy.copyMessages(
+                source,
+                [header],
+                destination,
+                queuedMove,
+                listeners[1],
+                null,
+                false
+              );
+            } else if (index == 1) {
+              // A blocked folder must not strand an independent valid copy.
+              MailServices.copy.copyMessages(
+                source,
+                [header],
+                independent,
+                false,
+                listeners[2],
+                null,
+                false
+              );
+            } else {
+              resolve();
+            }
+          } catch (error) {
+            reject(error);
+          }
+        },
+      }));
+      let fileResult = Cr.NS_OK;
+      try {
+        MailServices.copy.copyFileMessage(
+          file,
+          destination,
+          null,
+          false,
+          0,
+          "",
+          listeners[0],
+          null
+        );
+      } catch (error) {
+        fileResult = error.result;
+      }
+      await done;
+      Assert.ok(injected);
+      Assert.equal(fileResult, Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR);
+      Assert.deepEqual(starts, [1, 1, 1]);
+      Assert.deepEqual(progress, [1, 0, 1]);
+      Assert.deepEqual(statuses, [
+        [Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR],
+        [Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR],
+        [Cr.NS_OK],
+      ]);
+      Assert.equal(await IOUtils.readUTF8(file.path), fileRaw);
+      Assert.deepEqual(source.msgDatabase.listAllKeys(), [original.key]);
+      const retained = source.msgDatabase.getMsgHdrForKey(original.key);
+      Assert.equal(retained.messageId, `${label}-source@example.invalid`);
+      Assert.equal(retained.storeToken, original.token);
+      Assert.equal(retained.messageSize, original.size);
+      Assert.equal(retained.flags, original.flags);
+      Assert.equal(
+        retained.getStringProperty("fileFinishNote"),
+        "Exact queued property"
+      );
+      Assert.equal(mailTestUtils.loadMessageToString(source, retained), raw);
+      Assert.deepEqual(
+        await IOUtils.read(source.filePath.path),
+        original.bytes
+      );
+      Assert.deepEqual(destination.msgDatabase.listAllKeys(), []);
+      Assert.deepEqual(await IOUtils.getChildren(cur.path), []);
+      const pending = await IOUtils.getChildren(
+        PathUtils.join(destination.filePath.path, "tmp")
+      );
+      Assert.equal(pending.length, 1);
+      Assert.equal(await IOUtils.readUTF8(pending[0]), fileRaw);
+      const completed = [...independent.messages];
+      Assert.equal(completed.length, 1);
+      Assert.equal(completed[0].messageId, retained.messageId);
+      Assert.equal(completed[0].folder, independent);
+      Assert.notEqual(completed[0].storeToken, "");
+      Assert.equal(
+        completed[0].getStringProperty("fileFinishNote"),
+        "Exact queued property"
+      );
+      Assert.equal(
+        mailTestUtils.loadMessageToString(independent, completed[0]),
+        raw
+      );
+      Assert.ok(!destination.locked);
+      Assert.ok(!independent.locked);
+      Assert.ok(!source.locked);
+    } finally {
+      restore();
+      MailServices.accounts.removeAccount(account);
+    }
+  });
+}
+
+add_task(async function test_fileFinishQueuedCopy() {
+  await checkFileFinishContinuation(false);
+});
+add_task(async function test_fileFinishQueuedMove() {
+  await checkFileFinishContinuation(true);
+});
+
+/** Preserve a possibly settled body and its issued identity during preemption. */
+add_task(async function test_preemptionRetainsUncertainWrite() {
+  await withTrashStore("maildir", async root => {
+    const folder = root.createLocalSubfolder("uncertain-preemption");
+    const store = folder.msgStore;
+    const raw =
+      "From: sender@example.invalid\r\n" +
+      "Message-ID: <uncertain-preemption@example.invalid>\r\n" +
+      "Subject: Retain possibly settled bytes\r\n\r\nExact retained body.\r\n";
+    const issued = store.getNewMsgOutputStream(folder);
+    Assert.equal(issued.write(raw, raw.length), raw.length);
+    issued.close();
+    const tmp = PathUtils.join(folder.filePath.path, "tmp");
+    const pending = await IOUtils.getChildren(tmp);
+    Assert.equal(pending.length, 1);
+    const oldFile = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+    oldFile.initWithPath(pending[0]);
+    const token = oldFile.leafName;
+    const cur = folder.filePath.clone();
+    cur.append("cur");
+    // This is a real file move, not provider Finish. A preempting writer may
+    // neither forget the issued write nor delete a possibly settled cur body.
+    oldFile.moveTo(cur, token);
+    Assert.equal(await IOUtils.readUTF8(oldFile.path), raw);
+    let replacement;
+    try {
+      Assert.throws(
+        () => {
+          replacement = store.getNewMsgOutputStream(folder);
+        },
+        error => error.result == Cr.NS_ERROR_FILE_NOT_FOUND
+      );
+      Assert.throws(
+        () => store.getNewMsgOutputStream(folder),
+        error => error.result == Cr.NS_ERROR_FILE_NOT_FOUND
+      );
+      Assert.throws(
+        () => store.finishNewMessage(folder, issued),
+        error => error.result == Cr.NS_ERROR_FILE_NOT_FOUND
+      );
+      Assert.throws(
+        () => store.discardNewMessage(folder, issued),
+        error => error.result == Cr.NS_ERROR_FILE_NOT_FOUND
+      );
+      Assert.equal(replacement, undefined);
+      Assert.deepEqual(await IOUtils.getChildren(tmp), []);
+      Assert.deepEqual(await IOUtils.getChildren(cur.path), [oldFile.path]);
+      Assert.equal(await IOUtils.readUTF8(oldFile.path), raw);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    } finally {
+      // Needed only for the old-source negative: dispose the actually returned
+      // new stream without touching the original file now under cur.
+      if (replacement) {
+        store.discardNewMessage(folder, replacement);
+      }
+    }
+  });
+});

@@ -1465,12 +1465,12 @@ NS_IMETHODIMP
 nsMsgLocalMailFolder::OnCopyCompleted(nsISupports* srcSupport,
                                       bool moveCopySucceeded) {
   nsresult copyStatus = moveCopySucceeded ? NS_OK : NS_ERROR_FAILURE;
+  if (mCopyState && NS_FAILED(mCopyState->m_copyError)) {
+    moveCopySucceeded = false;
+    copyStatus = mCopyState->m_copyError;
+  }
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup() && mCopyState) {
-    if (NS_FAILED(mCopyState->m_copyError)) {
-      moveCopySucceeded = false;
-      copyStatus = mCopyState->m_copyError;
-    }
     if (!moveCopySucceeded) {
       if (NS_FAILED(DiscardCopyMessage())) {
         NS_WARNING("copy discard failed");
@@ -2307,12 +2307,12 @@ static nsresult CopyHdrStructure(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr) {
 
 nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
   auto checked = [&](nsresult status) {
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup() && NS_FAILED(status)) {
-      mCopyState->m_copyError = status;
+    if (NS_FAILED(status)) {
+      if (NS_SUCCEEDED(mCopyState->m_copyError)) {
+        mCopyState->m_copyError = status;
+      }
       mCopyState->m_writeFailed = true;
     }
-#endif
     return status;
   };
   nsresult rv = GetMsgStore(getter_AddRefs(mCopyState->m_msgStore));
@@ -2440,14 +2440,12 @@ NS_IMETHODIMP nsMsgLocalMailFolder::CopyData(nsIInputStream* aIStream,
     if (NS_SUCCEEDED(rv) && readCount == 0) {
       rv = NS_ERROR_UNEXPECTED;  // unexpected EOF.
     }
-#ifdef MOZ_PANORAMA
-    if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv)) {
+    if (NS_FAILED(rv)) {
       if (NS_SUCCEEDED(mCopyState->m_copyError)) {
         mCopyState->m_copyError = rv;
       }
       mCopyState->m_writeFailed = true;
     }
-#endif
     NS_ENSURE_SUCCESS(rv, rv);
     aLength -= readCount;
     auto data =
@@ -2458,7 +2456,8 @@ NS_IMETHODIMP nsMsgLocalMailFolder::CopyData(nsIInputStream* aIStream,
   }
 
   if (mCopyState->m_writeFailed) {
-    return NS_ERROR_UNEXPECTED;
+    return NS_FAILED(mCopyState->m_copyError) ? mCopyState->m_copyError
+                                              : NS_ERROR_UNEXPECTED;
   }
   return NS_OK;
 }
@@ -2472,26 +2471,23 @@ bool nsMsgLocalMailFolder::CopyLine(mozilla::Span<const char> line) {
   if (!mCopyState->m_fileStream) {
     ThrowAlertMsg("copyMsgWriteFailed", mCopyState->m_msgWindow);
     mCopyState->m_writeFailed = true;
-#ifdef MOZ_PANORAMA
-    mCopyState->m_copyError = NS_ERROR_FAILURE;
-#endif
+    if (NS_SUCCEEDED(mCopyState->m_copyError)) {
+      mCopyState->m_copyError = NS_ERROR_FAILURE;
+    }
     return false;  // Stop processing!
   }
 
   // Feed it to the messagestore.
-  uint32_t bytesWritten;
+  uint32_t bytesWritten = 0;
   nsresult rv = mCopyState->m_fileStream->Write(line.data(), line.Length(),
                                                 &bytesWritten);
-#ifdef MOZ_PANORAMA
-  if (mail_panorama_enabled_AtStartup() && NS_SUCCEEDED(rv) &&
-      bytesWritten != line.Length()) {
+  if (NS_SUCCEEDED(rv) && bytesWritten != line.Length()) {
     rv = NS_ERROR_UNEXPECTED;
   }
-  if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv)) {
-    mCopyState->m_copyError = rv;
-  }
-#endif
   if (NS_FAILED(rv)) {
+    if (NS_SUCCEEDED(mCopyState->m_copyError)) {
+      mCopyState->m_copyError = rv;
+    }
     ThrowAlertMsg("copyMsgWriteFailed", mCopyState->m_msgWindow);
     mCopyState->m_writeFailed = true;
     return false;  // Stop processing!
@@ -2745,6 +2741,13 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
         mCopyState->m_copyError = rv;
       }
       mCopyState->m_writeFailed = true;
+      nsCOMPtr<nsIFile> sourceFile =
+          do_QueryInterface(mCopyState->m_srcSupport);
+      if (sourceFile) {
+        // CopyFileMessage closes its input and settles this failure once.
+        // Notifying here could start a new request before its error cleanup.
+        return rv;
+      }
       if (mCopyState->m_copyingMultipleMessages && !multipleCopiesFinished) {
         // Keep this request until the continuing mailbox stream stops.
         return rv;
@@ -2792,7 +2795,32 @@ nsMsgLocalMailFolder::EndCopy(bool aCopySucceeded) {
       mCopyState->m_newHdr->SetStoreToken(storeToken);
       mCopyState->m_newHdr->GetMessageKey(&mCopyState->m_curDstKey);
     }
+    // Finish has been attempted. The provider retains an uncertain write;
+    // neither failure cleanup nor the destructor may close or discard it.
     mCopyState->m_fileStream = nullptr;
+    if (NS_FAILED(rv)) {
+      if (NS_SUCCEEDED(mCopyState->m_copyError)) {
+        mCopyState->m_copyError = rv;
+      }
+      mCopyState->m_writeFailed = true;
+      nsCOMPtr<nsIFile> sourceFile =
+          do_QueryInterface(mCopyState->m_srcSupport);
+      if (sourceFile) {
+        // CopyFileMessage closes its input and settles this failure once.
+        // Notifying here could start a new request before its error cleanup.
+        return rv;
+      }
+      if (mCopyState->m_copyingMultipleMessages && !multipleCopiesFinished) {
+        // The mailbox stream is still active. Settle at its final stop.
+        return rv;
+      }
+      bool isMove = mCopyState->m_isMove;
+      (void)EndCopy(false);
+      if (isMove && mCopyState) {
+        (void)EndMove(false);
+      }
+      return rv;
+    }
   }
   // Copy the header to the new database
   if (!completeHeader && mCopyState->m_message) {
@@ -3192,6 +3220,13 @@ NS_IMETHODIMP nsMsgLocalMailFolder::EndMessage(nsMsgKey key) {
       mCopyState->m_newHdr->SetStoreToken(storeToken);
     }
     mCopyState->m_fileStream = nullptr;
+    if (NS_FAILED(rv)) {
+      if (NS_SUCCEEDED(mCopyState->m_copyError)) {
+        mCopyState->m_copyError = rv;
+      }
+      mCopyState->m_writeFailed = true;
+      return rv;
+    }
   }
 
   // CopyFileMessage() and CopyMessages() from servers other than mailbox

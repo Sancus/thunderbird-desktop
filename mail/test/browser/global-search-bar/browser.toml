@@ -20,6 +20,8 @@ subsuite = "thunderbird"
 
 ["browser_clickResultItem.js"]
 
+["browser_facetBehavior.js"]
+
 ["browser_globalSearchBar.js"]
 
 ["browser_showAsListSetting.js"]

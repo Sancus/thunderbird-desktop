@@ -7,11 +7,17 @@
 const { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
-const { MessageGenerator } = ChromeUtils.importESModule(
+const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+);
+const { add_message_sets_to_folders } = ChromeUtils.importESModule(
+  "resource://testing-common/mail/MessageInjectionHelpers.sys.mjs"
 );
 const { Gloda } = ChromeUtils.importESModule(
   "resource:///modules/gloda/GlodaPublic.sys.mjs"
+);
+const { TagNoun } = ChromeUtils.importESModule(
+  "resource:///modules/gloda/NounTag.sys.mjs"
 );
 const { GlodaMsgIndexer } = ChromeUtils.importESModule(
   "resource:///modules/gloda/IndexMsg.sys.mjs"
@@ -35,6 +41,18 @@ let facetWindow;
 let facetDocument;
 
 add_setup(async function () {
+  Assert.equal(
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    false
+  );
+  Assert.equal(
+    Components.manager
+      .QueryInterface(Ci.nsIComponentRegistrar)
+      .contractIDToCID("@mozilla.org/msgDatabase/msgDBService;1")
+      .toString(),
+    "{03223c50-1e88-45e8-ba1a-7ce792dc3fc3}",
+    "The facet behavior reference uses the legacy backend"
+  );
   await SpecialPowers.pushPrefEnv({
     set: [
       ["mailnews.database.global.indexer.enabled", true],
@@ -59,6 +77,8 @@ add_setup(async function () {
   });
   MailServices.tags.addTagForKey(redKey, redLabel, "#FF0000", "");
   MailServices.tags.addTagForKey(blueKey, blueLabel, "#0000FF", "");
+  Assert.equal(TagNoun.getTag(redKey).tag, redLabel);
+  Assert.equal(TagNoun.getTag(blueKey).tag, blueLabel);
 
   const rootFolder = MailServices.accounts.localFoldersServer.rootFolder;
   const generator = new MessageGenerator();
@@ -71,15 +91,15 @@ add_setup(async function () {
       .createLocalSubfolder("Facet " + names[0])
       .QueryInterface(Ci.nsIMsgLocalMailFolder);
     folders.push(folder);
-    folder.addMessageBatch(
-      names.map(name =>
-        generator
-          .makeMessage({
-            subject: "Facet message " + name,
-            body: { body: term },
-          })
-          .toMessageString()
-      )
+    const synthetic = names.map(name =>
+      generator.makeMessage({
+        subject: "Facet message " + name,
+        body: { body: term },
+      })
+    );
+    await add_message_sets_to_folders(
+      [folder],
+      [new SyntheticMessageSet(synthetic)]
     );
     for (const header of folder.messages) {
       const name = header.subject.slice(-1);
@@ -259,12 +279,17 @@ add_task(async function test_refineFacets() {
   await chooseFacet("tag", blueLabel, "bottom", ["A", "E"]);
   const starred = facetDocument.querySelector("#facet-star input");
   Assert.ok(starred, "Starred facet has a checkbox");
+  const starBubble = facetDocument.querySelector(
+    "#facet-star .facet-checkbox-bubble"
+  );
+  Assert.ok(BrowserTestUtils.isVisible(starBubble));
+  starBubble.scrollIntoView({ block: "center" });
   let updated = waitForResults(["A"]);
-  EventUtils.synthesizeMouseAtCenter(starred, {}, facetWindow);
+  EventUtils.synthesizeMouseAtCenter(starBubble, {}, facetWindow);
   await updated;
   assertResults(["A"]);
   updated = waitForResults(["A", "E"]);
-  EventUtils.synthesizeMouseAtCenter(starred, {}, facetWindow);
+  EventUtils.synthesizeMouseAtCenter(starBubble, {}, facetWindow);
   await updated;
   assertResults(["A", "E"]);
 

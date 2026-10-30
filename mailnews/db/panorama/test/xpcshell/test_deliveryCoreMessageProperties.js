@@ -6,6 +6,10 @@
 
 /* import-globals-from head_delivery.js */
 
+const { MailStringUtils } = ChromeUtils.importESModule(
+  "resource:///modules/MailStringUtils.sys.mjs"
+);
+
 let dbFile;
 
 add_setup(function () {
@@ -57,9 +61,18 @@ add_task(function test_persistPropertyNamesAndViews() {
 
   Assert.equal(header.getStringProperty("delivery.missing"), "");
   Assert.equal(header.getUint32Property("delivery.missing"), 0);
-  header.setStringProperty("delivery.café", "old value");
-  header.setStringProperty("delivery.cafe\u0301", "previous value");
-  header.setStringProperty("delivery.cafe\u0301", "raw cafe\u0301 value");
+  header.setStringProperty(
+    MailStringUtils.stringToByteString("delivery.café"),
+    "old value"
+  );
+  header.setStringProperty(
+    MailStringUtils.stringToByteString("delivery.cafe\u0301"),
+    "previous value"
+  );
+  header.setStringProperty(
+    MailStringUtils.stringToByteString("delivery.cafe\u0301"),
+    "raw cafe\u0301 value"
+  );
   header.setStringProperty("delivery.case", "previous value");
   header.setStringProperty("delivery.Case", "upper value");
   header.setStringProperty("delivery.case", "lower value");
@@ -96,8 +109,8 @@ add_task(function test_persistPropertyNamesAndViews() {
     {
       views: expectedProperties.map(([name]) => [
         name,
-        fetched.getStringProperty(name),
-        fetched.getUint32Property(name),
+        fetched.getStringProperty(MailStringUtils.stringToByteString(name)),
+        fetched.getUint32Property(MailStringUtils.stringToByteString(name)),
       ]),
       names: fetched.properties.toSorted(),
       nativeText: stringProperties.map(([name]) => [

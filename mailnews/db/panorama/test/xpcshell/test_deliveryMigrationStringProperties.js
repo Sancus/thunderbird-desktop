@@ -79,8 +79,64 @@ add_task(async function test_preservesStringProperties() {
   const folder = rootFolder.getChildNamed("strings");
   PanoramaDelivery.assertFolder(folder, lane);
   Assert.equal(folder.getTotalMessages(false), 0);
+  const controlFolder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("string-property-controls");
+  const controlId = addMessage({
+    folderId: controlFolder.id,
+    messageId: "property-control@invalid",
+    subject: "Committed property control",
+  });
+  const control = messageDB.getMessage(controlId);
+  control.setStringProperty("delivery.control", "00042");
+  const sourceSummary = await IOUtils.read(files.summaryFilePath);
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER delivery_fail_property_import " +
+      "BEFORE INSERT ON message_properties " +
+      "WHEN NEW.name = 'deliveryMigrationPaddedText' " +
+      "BEGIN SELECT RAISE(ABORT, 'delivery property import failure'); END"
+  );
+  registerCleanupFunction(() =>
+    connection.executeSimpleSQL(
+      "DROP TRIGGER IF EXISTS delivery_fail_property_import"
+    )
+  );
+  await Assert.rejects(
+    database.migrateFolderDatabase(folder),
+    error =>
+      error.name === "UnknownError" &&
+      error.message ===
+        "Folder migration SQL failed: delivery property import failure",
+    "The actual late arbitrary-property write failure rejects the import"
+  );
+  Assert.ok(!connection.transactionInProgress);
+  Assert.equal(messageDB.totalCount, 1);
+  Assert.deepEqual([...folder.messages], []);
+  Assert.equal(control.subject, "Committed property control");
+  Assert.equal(control.getStringProperty("delivery.control"), "00042");
+  Assert.equal(control.getUint32Property("delivery.control"), 66);
+  const failedRows = connection.createStatement(
+    "SELECT id, name, value FROM message_properties ORDER BY id, name"
+  );
+  try {
+    const rows = [];
+    while (failedRows.executeStep()) {
+      rows.push([failedRows.row.id, failedRows.row.name, failedRows.row.value]);
+    }
+    Assert.deepEqual(rows, [[controlId, "delivery.control", "00042"]]);
+  } finally {
+    failedRows.finalize();
+  }
+  Assert.equal(folder.getStringProperty("morkMigrationSource"), "");
+  Assert.deepEqual(await IOUtils.read(files.summaryFilePath), sourceSummary);
+  Assert.deepEqual(await IOUtils.read(files.mailFilePath), originalMbox);
+  connection.executeSimpleSQL("DROP TRIGGER delivery_fail_property_import");
   await database.migrateFolderDatabase(folder);
 
+  Assert.ok(!connection.transactionInProgress);
+  Assert.equal(messageDB.totalCount, 3);
+  Assert.equal(control.getStringProperty("delivery.control"), "00042");
   const messages = [...folder.messages];
   Assert.equal(messages.length, 2, "Only the two live source messages migrate");
   const migrated = folder.msgDatabase.getMsgHdrForMessageID("162378@invalid");

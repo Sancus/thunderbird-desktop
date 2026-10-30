@@ -1,0 +1,57 @@
+[DEFAULT]
+head = "head.js head_delivery.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]
+prefs = ["mail.panorama.enabled=true"]
+tags = ["panorama-delivery"]
+
+["test_deliveryCoreFolderProperties.js"]
+
+["test_deliveryCoreMessageProperties.js"]
+
+["test_deliveryMigrationNumericProperties.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+# Raw migrateFolderDatabase throws NS_ERROR_NOT_AVAILABLE before a Promise on Windows.
+skip-if = ["os == 'win'"]
+support-files = [
+  "data/migration",
+  "data/migration.msf",
+]
+
+["test_deliveryMigrationPropertyPresence.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+# Raw migrateFolderDatabase throws NS_ERROR_NOT_AVAILABLE before a Promise on Windows.
+skip-if = ["os == 'win'"]
+support-files = [
+  "data/migration",
+  "data/migration.msf",
+]
+
+["test_deliveryMigrationStringProperties.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+# Raw migrateFolderDatabase throws NS_ERROR_NOT_AVAILABLE before a Promise on Windows.
+skip-if = ["os == 'win'"]
+support-files = [
+  "data/migration",
+  "data/migration.msf",
+]

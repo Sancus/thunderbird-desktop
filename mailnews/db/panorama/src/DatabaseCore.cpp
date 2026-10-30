@@ -2237,8 +2237,14 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
   bool mAlreadyMigrated = false;
   nsMainThreadPtrHandle<Promise> mPromiseHolder;
 
+  struct Property {
+    nsCString name;
+    nsCString value;
+    Maybe<uint32_t> integer;
+  };
   struct MessageData {
     nsTArray<nsCString> references;
+    nsTArray<Property> properties;
     nsMsgKey oldMessageKey;
     nsCString storeToken;
     uint32_t messageSize;
@@ -2469,6 +2475,27 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       }
       MOZ_TRY(message->GetStoreToken(data.storeToken));
       MOZ_TRY(message->GetMessageSize(&data.messageSize));
+      nsTArray<nsCString> names;
+      MOZ_TRY(message->GetProperties(names));
+      for (const auto& name : names) {
+        // These two structural values are bound separately below.
+        if (name.EqualsLiteral("storeToken") ||
+            name.EqualsLiteral("messageSize")) {
+          continue;
+        }
+        auto& property = *data.properties.AppendElement();
+        property.name = name;
+        if (name.EqualsLiteral("lineCount") ||
+            name.EqualsLiteral("offlineMessageSize")) {
+          uint32_t value;
+          MOZ_TRY(message->GetUint32Property(name.get(), &value));
+          property.integer = Some(value);
+        } else {
+          // The legacy getter returns exact text for every unknown name,
+          // including present-empty cells and hex text from uint32 writers.
+          MOZ_TRY(message->GetStringProperty(name.get(), property.value));
+        }
+      }
       mMessageData.AppendElement(std::move(data));
 
       MOZ_TRY(mParamsArray->AddParams(params));
@@ -2591,6 +2618,18 @@ class FolderMigrator final : public nsIRunnable, mozIStorageStatementCallback {
       MOZ_TRY(mStmt->NewBindingParamsArray(getter_AddRefs(mParamsArray)));
 
       for (size_t i = 0; i < mMessageData.Length(); i++) {
+        for (const auto& property : mMessageData[i].properties) {
+          nsCOMPtr<mozIStorageBindingParams> params;
+          MOZ_TRY(mParamsArray->NewBindingParams(getter_AddRefs(params)));
+          MOZ_TRY(params->BindInt64ByName("id"_ns, mNewMessageKeys[i]));
+          MOZ_TRY(params->BindUTF8StringByName("name"_ns, property.name));
+          if (property.integer) {
+            MOZ_TRY(params->BindInt64ByName("value"_ns, *property.integer));
+          } else {
+            MOZ_TRY(params->BindUTF8StringByName("value"_ns, property.value));
+          }
+          MOZ_TRY(mParamsArray->AddParams(params));
+        }
         if (!mMessageData[i].storeToken.IsEmpty()) {
           nsCOMPtr<mozIStorageBindingParams> params;
           MOZ_TRY(mParamsArray->NewBindingParams(getter_AddRefs(params)));

@@ -49,10 +49,33 @@ add_task(
     Assert.ok(!dbFile.exists(), "DatabaseCore must create the schema");
     const profile = new ProfileCreator(do_get_profile());
     const server = profile.addLocalServer();
-    await server.rootFolder.addMailFolder("migration-failure", {
+    const files = await server.rootFolder.addMailFolder("migration-failure", {
       summary: do_get_file("data/migration.msf"),
       mbox: do_get_file("data/migration"),
     });
+    // Capture every source cell through a distinct genuine legacy reader.
+    const summary = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+    summary.initWithPath(files.summaryFilePath);
+    const reader = Cc[
+      "@mozilla.org/nsMsgDatabase/msgDB-mailbox"
+    ].createInstance(Ci.nsIMsgDatabase);
+    reader.openFromFile(summary);
+    const sourceProperties = [];
+    try {
+      for (const header of reader.enumerateMessages()) {
+        for (const name of header.properties) {
+          if (name != "storeToken" && name != "messageSize") {
+            sourceProperties.push([
+              header.messageId,
+              name,
+              header.getStringProperty(name),
+            ]);
+          }
+        }
+      }
+    } finally {
+      reader.forceClosed();
+    }
     loadExistingDB();
     MailServices.accounts.accounts;
     const lane = PanoramaDelivery.expectedLane();
@@ -203,11 +226,15 @@ add_task(
       folder.id +
       " ORDER BY m.messageId, p.name";
     const properties = [
+      ...sourceProperties,
       ["162378@invalid", "messageSize", "578"],
       ["162378@invalid", "storeToken", "0"],
       ["345692@invalid", "messageSize", "375"],
       ["345692@invalid", "storeToken", "1143"],
-    ];
+    ].sort((left, right) => {
+      const column = left[0] == right[0] ? 1 : 0;
+      return left[column] < right[column] ? -1 : 1;
+    });
     Assert.deepEqual(
       readStoredRows(propertySQL, ["messageId", "name", "value"]),
       properties,

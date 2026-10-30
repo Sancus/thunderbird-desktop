@@ -374,7 +374,8 @@ class DeliveryCoreProperties : public testing::Test {
     }
     return connection->ExecuteSimpleSQL(
         "DROP TABLE message_changes; DROP TABLE database_identity; "
-        "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports; DROP TABLE folder_import_windows; "
+        "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports; "
+        "DROP TABLE folder_import_windows; "
         "DROP TABLE folder_import_keys; "
         "DROP TABLE folder_import_receipts"_ns);
   }
@@ -435,7 +436,7 @@ namespace {
 
 using DISABLED_DeliveryCoreProperties = DeliveryCoreProperties;
 
-TEST_F(DISABLED_DeliveryCoreProperties, MessageNamesAndTextAreExact) {
+TEST_F(DeliveryCoreProperties, MessageNamesAndTextAreExact) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -480,7 +481,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, MessageNamesAndTextAreExact) {
   EXPECT_TRUE(absent.IsEmpty());
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, FolderNamesAndTextAreExact) {
+TEST_F(DeliveryCoreProperties, FolderNamesAndTextAreExact) {
   ASSERT_EQ(NS_OK, Start());
   const struct {
     nsCString name;
@@ -509,8 +510,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, FolderNamesAndTextAreExact) {
   }
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties,
-       NativeIntegersAndStructuralValuesRemainTyped) {
+TEST_F(DeliveryCoreProperties, NativeIntegersAndStructuralValuesRemainTyped) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -533,7 +533,7 @@ TEST_F(DISABLED_DeliveryCoreProperties,
   EXPECT_EQ("00042"_ns, token);
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, CoreReopenKeepsExactTextAndPresence) {
+TEST_F(DeliveryCoreProperties, CoreReopenKeepsExactTextAndPresence) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -558,7 +558,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, CoreReopenKeepsExactTextAndPresence) {
       CheckStored("message_properties"_ns, key, "native.empty"_ns, ""_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, FailedMessageOverwritePreservesRows) {
+TEST_F(DeliveryCoreProperties, FailedMessageOverwritePreservesRows) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -579,7 +579,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, FailedMessageOverwritePreservesRows) {
       CheckStored("message_properties"_ns, key, "control"_ns, "1e3"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, FailedFolderOverwritePreservesRows) {
+TEST_F(DeliveryCoreProperties, FailedFolderOverwritePreservesRows) {
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, SetFolder("native.write"_ns, "00042"_ns));
   ASSERT_EQ(NS_OK, SetFolder("control"_ns, "1e3"_ns));
@@ -595,7 +595,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, FailedFolderOverwritePreservesRows) {
       CheckStored("folder_properties"_ns, mFolder, "control"_ns, "1e3"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, ReadErrorsAreNotAbsentProperties) {
+TEST_F(DeliveryCoreProperties, ReadErrorsAreNotAbsentProperties) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -619,7 +619,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, ReadErrorsAreNotAbsentProperties) {
   EXPECT_EQ("sentinel"_ns, text);
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, StepErrorsPreserveOutputSentinels) {
+TEST_F(DeliveryCoreProperties, StepErrorsPreserveOutputSentinels) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -654,7 +654,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, StepErrorsPreserveOutputSentinels) {
   EXPECT_EQ("sentinel"_ns, text);
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UpgradePreservesExistingValues) {
+TEST_F(DeliveryCoreProperties, UpgradePreservesExistingValues) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -696,7 +696,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UpgradePreservesExistingValues) {
                                       "after.upgrade"_ns, "00042"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UpgradeDoesNotDropUnknownIndex) {
+TEST_F(DeliveryCoreProperties, UpgradeDoesNotDropUnknownIndex) {
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, SetFolder("control"_ns, "kept"_ns));
   ASSERT_EQ(NS_OK, MakeVersionOne());
@@ -722,7 +722,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UpgradeDoesNotDropUnknownIndex) {
       CheckStored("folder_properties"_ns, mFolder, "control"_ns, "kept"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, FailedUpgradeRollsBackAndRetries) {
+TEST_F(DeliveryCoreProperties, FailedUpgradeRollsBackAndRetries) {
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, SetFolder("control"_ns, "exact"_ns));
   ASSERT_EQ(NS_OK, MakeVersionOne());
@@ -1448,7 +1448,6 @@ TEST_F(DeliveryCoreProperties, ServerUidWritesDoNotCommitAnotherTransaction) {
   EXPECT_TRUE(text.IsEmpty());
 }
 
-
 TEST_F(DeliveryCoreProperties, AllocatorNeverReusesCommittedDeletedKeys) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey first, removed, next;
@@ -1548,7 +1547,6 @@ TEST_F(DeliveryCoreProperties, AllocatorUpgradeFailurePreservesVersionAndRows) {
   ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
   EXPECT_TRUE(exists);
 }
-
 
 TEST_F(DeliveryCoreProperties, AllocatorRejectsChangingPhysicalKey) {
   ASSERT_EQ(NS_OK, Start());
@@ -2226,6 +2224,5 @@ TEST_F(DeliveryCoreProperties, FolderFlagErrorsPreserveCallerStateAndOutput) {
   ASSERT_EQ(NS_OK, db.GetFolderFlags(mFolder, &flags));
   EXPECT_EQ(1u, flags);
 }
-
 
 }  // namespace mozilla::mailnews

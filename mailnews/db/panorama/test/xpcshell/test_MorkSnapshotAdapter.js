@@ -27,10 +27,134 @@ const {
 const { MigrationJournal } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationJournal.sys.mjs"
 );
+const { MailStringUtils } = ChromeUtils.importESModule(
+  "resource:///modules/MailStringUtils.sys.mjs"
+);
+const TEXT_PROPERTIES = [
+  ["Case", "UPPER", 0],
+  ["case", "lower", 0],
+  ["n\u00e1me", "Name NFC", 0],
+  ["na\u0301me", "Name NFD", 0],
+  ["escaped", "line 1\n(a=b) $ \\end", 0],
+  ["unicode", "text Caf\u00e9 / Cafe\u0301 \ud83d\ude42", 0],
+  ["leadingBom", "\ufeffraw text", 0],
+  ["empty", "", 0],
+  ["decimalText", "42", 66],
+  ["paddedText", "00042", 66],
+  ["hexText", "2a", 42],
+  ["suffixText", "2ag", 42],
+  ["wideText", "100000000", 268435456],
+  ["maxText", "ffffffff", 0xffffffff],
+];
+const NUMERIC_PROPERTIES = [
+  ["numericZero", 0, "0"],
+  ["numericValue", 42, "2a"],
+  ["numericMax", 0xffffffff, "ffffffff"],
+];
+const PROPERTY_VIEWS = [
+  ...TEXT_PROPERTIES,
+  ...NUMERIC_PROPERTIES.map(([name, value, text]) => [name, text, value]),
+];
+const FOLDER_TEXT_PROPERTIES = [
+  ["FolderCase", "42"],
+  ["foldercase", "00042"],
+  ["n\u00e1me", "text Caf\u00e9"],
+  ["na\u0301me", "text Cafe\u0301"],
+  ["folderEmpty", ""],
+];
+const WIDE_FOLDER_SIZE = 2 ** 40 + 42;
 const MESSAGE_SCOPE = "ns:msg:db:row:scope:msgs:all";
 const INFO_SCOPE = "ns:msg:db:row:scope:dbfolderinfo:all";
 let originalFolder;
 let originalInventory;
+let propertyFolder;
+let propertyInventory;
+
+/**
+ * Checks literal property text, numeric views and presence through nsIMsgDBHdr.
+ *
+ * @param {nsIMsgDBHdr} header - A genuine legacy or imported native header.
+ */
+function assertPropertyViews(header) {
+  const names = header.properties;
+  for (const [name, text, number] of PROPERTY_VIEWS) {
+    const bytes = MailStringUtils.stringToByteString(name);
+    Assert.ok(
+      names.includes(name),
+      name + " remains present with exact spelling"
+    );
+    Assert.equal(header.getStringProperty(bytes), text, name);
+    Assert.equal(header.getUint32Property(bytes), number, name);
+  }
+  Assert.ok(!names.includes("absentProperty"));
+  Assert.equal(header.getStringProperty("absentProperty"), "");
+  Assert.equal(header.getUint32Property("absentProperty"), 0);
+}
+
+/**
+ * Serializes properties with the real legacy writer, then reads a fresh legacy
+ * database before the source is copied into the closed import profile.
+ *
+ * @param {nsIFile} summary - Owned regular copy of the genuine summary fixture.
+ */
+function preparePropertySource(summary) {
+  const writer = Cc["@mozilla.org/nsMsgDatabase/msgDB-mailbox"].createInstance(
+    Ci.nsIMsgDatabase
+  );
+  writer.openFromFile(summary);
+  try {
+    const header = writer.getMsgHdrForMessageID("162378@invalid");
+    Assert.equal(header.messageKey, 1);
+    Assert.equal(header.messageId, "162378@invalid");
+    for (const [name, text] of TEXT_PROPERTIES) {
+      header.setStringProperty(MailStringUtils.stringToByteString(name), text);
+    }
+    for (const [name, value] of NUMERIC_PROPERTIES) {
+      header.setUint32Property(name, value);
+    }
+    const info = writer.dBFolderInfo;
+    for (const [name, text] of FOLDER_TEXT_PROPERTIES) {
+      info.setCharProperty(MailStringUtils.stringToByteString(name), text);
+    }
+    info.setUint32Property("numHdrsToKeep", 0xffffffff);
+    info.setInt64Property("folderSize", WIDE_FOLDER_SIZE);
+  } finally {
+    writer.forceClosed();
+  }
+  const reader = Cc["@mozilla.org/nsMsgDatabase/msgDB-mailbox"].createInstance(
+    Ci.nsIMsgDatabase
+  );
+  reader.openFromFile(summary);
+  try {
+    const saved = reader.getMsgHdrForMessageID("162378@invalid");
+    Assert.equal(saved.messageKey, 1);
+    assertPropertyViews(saved);
+    const other = reader.getMsgHdrForMessageID("345692@invalid");
+    Assert.equal(other.messageKey, 3);
+    Assert.equal(other.messageId, "345692@invalid");
+    for (const [name] of PROPERTY_VIEWS) {
+      Assert.ok(!other.properties.includes(name));
+    }
+    for (const [name, text] of FOLDER_TEXT_PROPERTIES) {
+      Assert.equal(
+        reader.dBFolderInfo.getCharProperty(
+          MailStringUtils.stringToByteString(name)
+        ),
+        text
+      );
+    }
+    Assert.equal(
+      reader.dBFolderInfo.getUint32Property("numHdrsToKeep", 0),
+      0xffffffff
+    );
+    Assert.equal(
+      reader.dBFolderInfo.getInt64Property("folderSize", 0),
+      WIDE_FOLDER_SIZE
+    );
+  } finally {
+    reader.forceClosed();
+  }
+}
 
 add_setup(async function setupGenuineLegacySource() {
   const profile = new ProfileCreator(do_get_profile());
@@ -64,6 +188,30 @@ add_setup(async function setupGenuineLegacySource() {
       do_get_profile()
     );
   }
+  const propertySummary = new FileUtils.File(
+    PathUtils.join(work, "properties.msf")
+  );
+  await IOUtils.write(
+    propertySummary.path,
+    await IOUtils.read(do_get_file("data/migration.msf").path),
+    { mode: "create" }
+  );
+  preparePropertySource(propertySummary);
+  const propertyFiles = await server.rootFolder.addMailFolder(
+    "property-source",
+    {
+      summary: propertySummary,
+      mbox: body,
+    }
+  );
+  if (AppConstants.platform == "win") {
+    propertyInventory = captureMorkFolderWindowsInventory(
+      new FileUtils.File(propertyFiles.summaryFilePath),
+      do_get_profile(),
+      new FileUtils.File(propertyFiles.mailFilePath),
+      do_get_profile()
+    );
+  }
   loadExistingDB();
   MailServices.accounts.accounts;
   originalFolder =
@@ -76,12 +224,20 @@ add_setup(async function setupGenuineLegacySource() {
     ),
     database
   );
+  propertyFolder =
+    MailServices.accounts.localFoldersServer.rootFolder.getChildNamed(
+      "property-source"
+    );
+  Assert.ok(propertyFolder instanceof Ci.nsIMsgFolder);
+  Assert.equal(propertyFolder.msgStore.storeType, "mbox");
+  Assert.equal(propertyFolder.incomingServerType, "none");
   Assert.equal(originalFolder.msgStore.storeType, "mbox");
   Assert.equal(originalFolder.incomingServerType, "none");
   Assert.ok(!originalFolder.summaryFile.isSymlink());
   Assert.ok(!originalFolder.filePath.isSymlink());
   registerCleanupFunction(() => {
     originalFolder = null;
+    propertyFolder = null;
   });
 });
 
@@ -559,4 +715,186 @@ add_task(async function test_sourcePhysicalIdentityCannotBeSilentlyDropped() {
     /Unsupported native Mork receipt version\/physical admission/
   );
   Assert.ok(Object.hasOwn(receipt, "sourcePhysicalIdentity"));
+});
+
+add_task(async function test_genuinePropertyImportFailureRetryAndCopy() {
+  const input = await readMorkFolderImport(
+    propertyFolder,
+    "property-import-operation",
+    propertyInventory
+  );
+  const source = {
+    id: "property-source-unit",
+    token: input.token,
+    databaseSourceId: database.sourceId,
+    destinationFolderId: propertyFolder.id,
+    path: input.source.path,
+    sha256: input.source.sha256,
+    size: input.source.size,
+    messageKeys: [...input.source.messageKeys],
+    state: "importing",
+    receipt: null,
+    ...(propertyInventory ? { inventory: propertyInventory } : {}),
+  };
+  const request = convertMorkFolderSnapshot(
+    input,
+    source,
+    database.sourceId,
+    propertyFolder.flags
+  );
+  const summary = await IOUtils.read(propertyFolder.summaryFile.path);
+  const body = await IOUtils.read(propertyFolder.filePath.path);
+  const count = messageDB.totalCount;
+  const connection = database.connectionForTests;
+  const trigger =
+    "CREATE TEMP TRIGGER fail_imported_property BEFORE INSERT ON message_properties " +
+    "WHEN NEW.name = 'Case' AND EXISTS (SELECT 1 FROM messages " +
+    "WHERE id = NEW.id AND folderId = " +
+    propertyFolder.id +
+    ") " +
+    "BEGIN SELECT RAISE(ABORT, 'S3-02 property write failure'); END";
+  connection.executeSimpleSQL(trigger);
+  try {
+    await Assert.rejects(
+      importMorkFolderSnapshot(database, propertyFolder, source),
+      /NS_ERROR_STORAGE_CONSTRAINT/
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER fail_imported_property");
+  }
+  Assert.ok(!connection.transactionInProgress);
+  Assert.equal(messageDB.totalCount, count);
+  Assert.equal(database.getFolderImportReceipt(propertyFolder, request), null);
+  Assert.equal(propertyFolder.getTotalMessages(false), 0);
+  Assert.deepEqual(
+    await IOUtils.read(propertyFolder.summaryFile.path),
+    summary
+  );
+  Assert.deepEqual(await IOUtils.read(propertyFolder.filePath.path), body);
+
+  const receipt = await importMorkFolderSnapshot(
+    database,
+    propertyFolder,
+    source
+  );
+  Assert.deepEqual(
+    receipt.keys.map(pair => pair[0]),
+    [1, 3]
+  );
+  Assert.equal(messageDB.totalCount, count + 2);
+  Assert.ok(!connection.transactionInProgress);
+  const keys = new Map(receipt.keys);
+  const header = propertyFolder.msgDatabase.getMsgHdrForKey(keys.get(1));
+  const other = propertyFolder.msgDatabase.getMsgHdrForKey(keys.get(3));
+  assertPropertyViews(header);
+  for (const [name] of PROPERTY_VIEWS) {
+    Assert.ok(
+      !other.properties.includes(name),
+      name + " is not invented on the other row"
+    );
+  }
+  const info = propertyFolder.msgDatabase.dBFolderInfo;
+  for (const [name, text] of FOLDER_TEXT_PROPERTIES) {
+    Assert.equal(
+      info.getCharProperty(MailStringUtils.stringToByteString(name)),
+      text
+    );
+  }
+  Assert.equal(info.getUint32Property("numHdrsToKeep", 0), 0xffffffff);
+  Assert.equal(info.getInt64Property("folderSize", 0), WIDE_FOLDER_SIZE);
+  Assert.equal(info.getCharProperty("absentFolderProperty"), "");
+
+  connection.executeSimpleSQL(trigger);
+  try {
+    Assert.throws(
+      () => header.setStringProperty("Case", "must not commit"),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER fail_imported_property");
+  }
+  assertPropertyViews(header);
+  header.setStringProperty("Case", "overwrite Cafe\u0301");
+  Assert.equal(header.getStringProperty("Case"), "overwrite Cafe\u0301");
+  Assert.equal(header.getStringProperty("case"), "lower");
+  header.setStringProperty("Case", "UPPER");
+  assertPropertyViews(header);
+  const copy = propertyFolder.msgDatabase.copyHdrFromExistingHdr(
+    0xffffffff,
+    header,
+    false
+  );
+  Assert.equal(
+    copy.isLive,
+    false,
+    "This checks the detached metadata-copy boundary"
+  );
+  assertPropertyViews(copy);
+  copy.setStringProperty("Case", "changed copy");
+  Assert.equal(header.getStringProperty("Case"), "UPPER");
+  Assert.equal(copy.getStringProperty("Case"), "changed copy");
+
+  // A separate reopened storage connection checks durable text/presence without
+  // claiming a backend/process restart or a body-copy transaction.
+  const stored = Services.storage.openUnsharedDatabase(connection.databaseFile);
+  try {
+    const statement = stored.createStatement(
+      "SELECT name, value, typeof(value) AS storageType FROM message_properties WHERE id = :id"
+    );
+    try {
+      statement.params.id = header.messageKey;
+      const properties = new Map();
+      while (statement.executeStep()) {
+        properties.set(statement.row.name, [
+          statement.row.value,
+          statement.row.storageType,
+        ]);
+      }
+      for (const [name, text] of PROPERTY_VIEWS) {
+        Assert.deepEqual(properties.get(name), [text, "text"], name);
+      }
+      Assert.ok(!properties.has("absentProperty"));
+    } finally {
+      statement.finalize();
+    }
+    const folderStatement = stored.createStatement(
+      "SELECT name, value, typeof(value) AS storageType FROM folder_properties WHERE id = :id"
+    );
+    try {
+      folderStatement.params.id = propertyFolder.id;
+      const folderProperties = new Map();
+      while (folderStatement.executeStep()) {
+        folderProperties.set(folderStatement.row.name, [
+          folderStatement.row.value,
+          folderStatement.row.storageType,
+        ]);
+      }
+      for (const [name, text] of FOLDER_TEXT_PROPERTIES) {
+        Assert.deepEqual(folderProperties.get(name), [text, "text"], name);
+      }
+      Assert.ok(!folderProperties.has("absentFolderProperty"));
+      Assert.deepEqual(folderProperties.get("numHdrsToKeep"), [
+        0xffffffff,
+        "integer",
+      ]);
+      Assert.deepEqual(folderProperties.get("folderSize"), [
+        WIDE_FOLDER_SIZE,
+        "integer",
+      ]);
+    } finally {
+      folderStatement.finalize();
+    }
+  } finally {
+    stored.close();
+  }
+  Assert.deepEqual(
+    await importMorkFolderSnapshot(database, propertyFolder, source),
+    receipt
+  );
+  Assert.equal(messageDB.totalCount, count + 2);
+  Assert.deepEqual(
+    await IOUtils.read(propertyFolder.summaryFile.path),
+    summary
+  );
+  Assert.deepEqual(await IOUtils.read(propertyFolder.filePath.path), body);
 });

@@ -7330,7 +7330,7 @@ bool nsImapProtocol::RenameHierarchyByHand(const char* oldParentMailboxName,
   NS_ENSURE_TRUE(oldParentMailboxName, false);
   NS_ENSURE_TRUE(newParentMailboxName, false);
 
-  bool renameSucceeded = true;
+  bool renameSucceeded = false;
   char onlineDirSeparator = kOnlineHierarchySeparatorUnknown;
   m_deletableChildren = new nsTArray<nsCString>();
 
@@ -7539,6 +7539,7 @@ void nsImapProtocol::FolderNotCreated(const char* folderName) {
 }
 
 void nsImapProtocol::FolderRenamed(const char* oldName, const char* newName) {
+  if (NS_FAILED(m_mailboxUpdateResult)) return;
   char onlineDelimiter = kOnlineHierarchySeparatorUnknown;
 
   if ((m_hierarchyNameState == kNoOperationInProgress) ||
@@ -7546,14 +7547,20 @@ void nsImapProtocol::FolderRenamed(const char* oldName, const char* newName) {
 
   {
     nsCString canonicalOldName, canonicalNewName;
-    m_runningUrl->AllocateCanonicalPath(nsDependentCString(oldName),
-                                        onlineDelimiter, canonicalOldName);
-    m_runningUrl->AllocateCanonicalPath(nsDependentCString(newName),
-                                        onlineDelimiter, canonicalNewName);
-    AutoProxyReleaseMsgWindow msgWindow;
-    GetMsgWindow(getter_AddRefs(msgWindow));
-    m_imapServerSink->OnlineFolderRename(msgWindow, canonicalOldName,
-                                         canonicalNewName);
+    nsresult rv = m_runningUrl->AllocateCanonicalPath(
+        nsDependentCString(oldName), onlineDelimiter, canonicalOldName);
+    if (NS_SUCCEEDED(rv)) {
+      rv = m_runningUrl->AllocateCanonicalPath(
+          nsDependentCString(newName), onlineDelimiter, canonicalNewName);
+    }
+    if (NS_SUCCEEDED(rv)) {
+      AutoProxyReleaseMsgWindow msgWindow;
+      GetMsgWindow(getter_AddRefs(msgWindow));
+      rv = m_imapServerSink ? m_imapServerSink->OnlineFolderRename(
+                                  msgWindow, canonicalOldName, canonicalNewName)
+                            : NS_ERROR_NOT_AVAILABLE;
+    }
+    if (NS_FAILED(rv)) m_mailboxUpdateResult = rv;
   }
 }
 
@@ -7590,7 +7597,11 @@ void nsImapProtocol::OnRenameFolder(const char* sourceMailbox) {
   nsCString destinationMailbox = OnCreateServerDestinationFolderPathString();
 
   bool renamed = RenameHierarchyByHand(sourceMailbox, destinationMailbox.get());
-  if (renamed) FolderRenamed(sourceMailbox, destinationMailbox.get());
+  if (!renamed) return;
+  FolderRenamed(sourceMailbox, destinationMailbox.get());
+  // A successful LIST must not overwrite a failed server rename or local
+  // settlement. Common URL completion still delivers the original error.
+  if (NS_FAILED(m_mailboxUpdateResult)) return;
 
   // Cause a LIST and re-discovery when slash and/or ^ are escaped. Also
   // needed when folder renamed to non-ASCII UTF-8 when UTF8=ACCEPT in

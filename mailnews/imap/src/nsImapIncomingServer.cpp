@@ -1346,7 +1346,8 @@ NS_IMETHODIMP nsImapIncomingServer::OnlineFolderRename(
         nsCOMPtr<nsIMsgRetentionSettings> retentionSettings;
         me->GetRetentionSettings(getter_AddRefs(retentionSettings));
 
-        folder->RenameLocal(tmpNewName, parent);
+        rv = folder->RenameLocal(tmpNewName, parent);
+        NS_ENSURE_SUCCESS(rv, rv);
         nsCOMPtr<nsIMsgImapMailFolder> parentImapFolder =
             do_QueryInterface(parent);
 

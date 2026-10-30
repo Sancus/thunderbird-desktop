@@ -19,14 +19,50 @@ const settingFlags = {
   Favorite: Ci.nsMsgFolderFlags.Favorite,
 };
 
+const panorama = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+
 add_setup(async function () {
-  setupIMAPPump();
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
   Services.prefs.setBoolPref(
     "mail.server.default.autosync_offline_stores",
     false
   );
+  setupIMAPPump();
+  registerCleanupFunction(() => {
+    if (IMAPPump.incomingServer) {
+      teardownIMAPPump();
+    }
+  });
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    panorama,
+    "the requested database backend is active"
+  );
+  const store = {
+    "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+    "@mozilla.org/msgstore/maildirstore;1": "maildir",
+  }[contract];
+  Assert.ok(store, "the requested store is supported");
+  Assert.equal(IMAPPump.incomingServer.msgStore.storeType, store);
+  const discovery = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    discovery,
+    null
+  );
+  await discovery.promise;
+  IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  const added = PromiseTestUtils.promiseFolderAdded("folder 1");
   IMAPPump.incomingServer.rootFolder.createSubfolder("folder 1", null);
-  await PromiseTestUtils.promiseFolderAdded("folder 1");
+  await added;
 
   const listener = new PromiseTestUtils.PromiseUrlListener();
   IMAPPump.inbox.updateFolderWithListener(null, listener);

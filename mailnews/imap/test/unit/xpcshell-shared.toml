@@ -139,6 +139,8 @@ prefs = ["mail.panorama.enabled=true"]
 
 ["test_imapRename.js"]
 
+["test_imapRenameErrors.js"]
+
 ["test_imapSearch.js"]
 
 ["test_imapSelectFailedMyRights.js"]

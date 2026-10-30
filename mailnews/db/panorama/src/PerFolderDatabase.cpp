@@ -1437,6 +1437,8 @@ NS_IMETHODIMP PerFolderDatabase::IsMDNSent(nsMsgKey aKey, bool* aMDNSent) {
                                     *aMDNSent);
 }
 NS_IMETHODIMP PerFolderDatabase::MarkAllRead(nsTArray<nsMsgKey>& aMarkedKeys) {
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
   return MessageDB().MarkAllRead(mFolderId, aMarkedKeys);
 }
 

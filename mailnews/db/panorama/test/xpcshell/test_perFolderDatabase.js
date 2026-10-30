@@ -2945,3 +2945,63 @@ add_task(function test_headerCacheKeepsCallerTransactionAndCloseScope() {
   Assert.notStrictEqual(current.getMsgHdrForKey(key), header);
   Assert.equal(current.getMsgHdrForKey(key).messageKey, key);
 });
+
+add_task(function test_bulkReadRequiresCurrentFolderAndSource() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("bulk-read-admission");
+  const key = addMessage({ folderId: folder.id, flags: 0x40000004 });
+  const db = folder.msgDatabase;
+  const header = db.getMsgHdrForKey(key);
+  const originalFlags = header.flags;
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    Assert.throws(() => db.markAllRead(), /NS_ERROR_NOT_AVAILABLE/);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    update.finalize();
+    connection.rollbackTransaction();
+  }
+  Assert.equal(header.flags, originalFlags);
+  Assert.ok(!header.isRead);
+  Assert.ok(!connection.transactionInProgress);
+  Assert.ok(db.containsKey(key));
+  db.forceClosed();
+  Assert.throws(() => db.markAllRead(), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.equal(header.flags, originalFlags);
+  Assert.ok(!header.isRead);
+});
+
+add_task(function test_bulkReadPropagatesSourceReadFailure() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("bulk-read-source-error");
+  const key = addMessage({ folderId: folder.id, flags: 0x40000004 });
+  const db = folder.msgDatabase;
+  const header = db.getMsgHdrForKey(key);
+  const originalFlags = header.flags;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "ALTER TABLE database_identity RENAME TO unavailable_bulk_identity"
+  );
+  try {
+    Assert.throws(
+      () => db.markAllRead(),
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_bulk_identity RENAME TO database_identity"
+    );
+  }
+  Assert.equal(header.flags, originalFlags);
+  Assert.ok(!header.isRead);
+  Assert.ok(db.containsKey(key));
+  Assert.ok(!connection.transactionInProgress);
+});

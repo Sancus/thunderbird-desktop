@@ -40,7 +40,7 @@ function seedMailboxes(nested) {
 }
 
 /**
- * Runs production discovery and requires successful URL completion.
+ * Runs production discovery and verifies actual mailbox listing commands.
  */
 async function discover() {
   info('DELIVERY_PHASE {"phase":"imap-discovery-started"}');
@@ -57,12 +57,15 @@ async function discover() {
   const previousListings = listingCount();
   const listener = new PromiseTestUtils.PromiseUrlListener();
   MailServices.imap.discoverAllFolders(fixture.rootFolder, listener, null);
-  await listener.promise;
-  Assert.greater(
-    listingCount(),
-    previousListings,
-    "Discovery reached the fake server's mailbox listing commands"
-  );
+  try {
+    await listener.promise;
+  } finally {
+    Assert.greater(
+      listingCount(),
+      previousListings,
+      "Discovery reached the fake server's mailbox listing commands"
+    );
+  }
   info('DELIVERY_PHASE {"phase":"imap-discovery-url-complete"}');
 }
 
@@ -204,9 +207,14 @@ async function test_repeatedDiscoveryPreservesIdentity() {
           "DeliveryParent/DeliveryChild",
           "DeliveryParent/DeliveryRetry",
           "INBOX",
+          "Trash",
         ]
       );
-      await discover();
+      await Assert.rejects(
+        discover(),
+        error => error.message == String(Cr.NS_ERROR_NOT_IMPLEMENTED),
+        "The unsupported effective parent path reports its original error"
+      );
       Assert.equal(
         parent.getChildNamed("DeliveryRetry"),
         null,

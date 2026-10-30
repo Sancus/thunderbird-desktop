@@ -136,6 +136,16 @@ tags = ["dataadapter"]
 
 ["test_mailSearchFactory.js"]
 
+["test_mailSearchLegacyRecovery.js"]
+head = "../../../gloda/test/unit/head_gloda.js"
+prefs = [
+  "mail.panorama.enabled=false",
+  "mailnews.database.global.indexer.enabled=true",
+  "mailnews.database.global.indexer.perform_initial_sweep=false",
+  "security.storage.encryption.sqlite.enabled=false",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
 ["test_mailSearchLegacyStartup.js"]
 prefs = [
   "mail.panorama.enabled=false",

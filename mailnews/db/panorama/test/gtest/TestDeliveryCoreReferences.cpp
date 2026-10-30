@@ -2132,8 +2132,7 @@ namespace {
 
 using DISABLED_DeliveryCoreReferences = DeliveryCoreReferences;
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       AddNotificationSeesCommittedReferences) {
+TEST_F(DeliveryCoreReferences, AddNotificationSeesCommittedReferences) {
   ASSERT_EQ(NS_OK, Start());
   uint32_t notifications = 0;
   nsMsgKey notified = 0;
@@ -2160,7 +2159,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ(key, notified);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, ExactTokensSurviveReopen) {
+TEST_F(DeliveryCoreReferences, ExactTokensSurviveReopen) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("child@invalid"_ns,
@@ -2188,7 +2187,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, ExactTokensSurviveReopen) {
       got);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, ReplaceAndClearDoNotRethread) {
+TEST_F(DeliveryCoreReferences, ReplaceAndClearDoNotRethread) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey parent, child;
   ASSERT_EQ(NS_OK, Add("parent@invalid"_ns, {}, parent));
@@ -2228,8 +2227,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, ReplaceAndClearDoNotRethread) {
   EXPECT_EQ(2u, count);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       FailedReplacementPreservesCommittedSequence) {
+TEST_F(DeliveryCoreReferences, FailedReplacementPreservesCommittedSequence) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("child@invalid"_ns, {"original@invalid"_ns}, key));
@@ -2257,7 +2255,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_FALSE(inTransaction);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, FailedClearPreservesCommittedSequence) {
+TEST_F(DeliveryCoreReferences, FailedClearPreservesCommittedSequence) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("child@invalid"_ns, {"original@invalid"_ns}, key));
@@ -2281,8 +2279,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, FailedClearPreservesCommittedSequence) {
   EXPECT_EQ((nsTArray<nsCString>{"original@invalid"_ns}), stored);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       FailedAddRollsBackMessageAndReferences) {
+TEST_F(DeliveryCoreReferences, FailedAddRollsBackMessageAndReferences) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey control, failed = 0;
   ASSERT_EQ(NS_OK, Add("control@invalid"_ns, {"kept@invalid"_ns}, control));
@@ -2322,8 +2319,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ((nsTArray<nsCString>{"one@invalid"_ns}), got);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       MissingRowsAndStorageErrorsAreFailures) {
+TEST_F(DeliveryCoreReferences, MissingRowsAndStorageErrorsAreFailures) {
   ASSERT_EQ(NS_OK, Start());
   nsTArray<nsCString> got{"unchanged"_ns};
   EXPECT_EQ(NS_ERROR_UNEXPECTED,
@@ -2342,7 +2338,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ((nsTArray<nsCString>{"unchanged"_ns}), got);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
+TEST_F(DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   nsCOMPtr<mozIStorageConnection> old;
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
   ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(kOldSchema));
@@ -2369,7 +2365,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   EXPECT_TRUE(got.IsEmpty());
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, UnsupportedSchemaCanRetryAfterRepair) {
+TEST_F(DeliveryCoreReferences, UnsupportedSchemaCanRetryAfterRepair) {
   nsCOMPtr<mozIStorageConnection> old;
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
   ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(kOldSchema));
@@ -2384,7 +2380,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, UnsupportedSchemaCanRetryAfterRepair) {
   ASSERT_EQ(NS_OK, Start());
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DeleteRemovesSequenceAndKnownMarker) {
+TEST_F(DeliveryCoreReferences, DeleteRemovesSequenceAndKnownMarker) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("deleted@invalid"_ns, {"old@invalid"_ns}, key));
@@ -2405,7 +2401,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DeleteRemovesSequenceAndKnownMarker) {
   EXPECT_TRUE(got.IsEmpty());
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, SetterDoesNotAdoptForeignTransaction) {
+TEST_F(DeliveryCoreReferences, SetterDoesNotAdoptForeignTransaction) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("child@invalid"_ns, {"original@invalid"_ns}, key));
@@ -2422,7 +2418,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, SetterDoesNotAdoptForeignTransaction) {
   EXPECT_EQ((nsTArray<nsCString>{"original@invalid"_ns}), stored);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, FailedUpgradeRollsBackAndCanRetry) {
+TEST_F(DeliveryCoreReferences, FailedUpgradeRollsBackAndCanRetry) {
   nsCOMPtr<mozIStorageConnection> old;
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
   ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(kOldSchema));
@@ -2442,7 +2438,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, FailedUpgradeRollsBackAndCanRetry) {
   ASSERT_EQ(NS_OK, Start());
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, FutureSchemaIsNotSilentlyAccepted) {
+TEST_F(DeliveryCoreReferences, FutureSchemaIsNotSilentlyAccepted) {
   nsCOMPtr<mozIStorageConnection> old;
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
   ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(kOldSchema));
@@ -2458,7 +2454,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, FutureSchemaIsNotSilentlyAccepted) {
   ASSERT_EQ(NS_OK, Start());
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, ChangedDeleteTriggerIsUnsupported) {
+TEST_F(DeliveryCoreReferences, ChangedDeleteTriggerIsUnsupported) {
   ASSERT_EQ(NS_OK, Start());
   Stop();
   nsCOMPtr<mozIStorageConnection> old;

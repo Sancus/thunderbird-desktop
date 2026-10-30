@@ -405,6 +405,45 @@ add_task(
         }
       });
       await set_filter_text("nativecompletionneedle");
+      // Earlier list selections can change metadata after fixture indexing.
+      let progress;
+      do {
+        progress = await fixture.service.update({ limit: 500 });
+      } while (progress.moreWork);
+      const snapshot = await fixture.service.collectResults(
+        "nativecompletionneedle"
+      );
+      const current = fixture.expected.map(([, key]) =>
+        fixture.service.resolveDocument(String(key))
+      );
+      const { getMailSearchHeader } = ChromeUtils.importESModule(
+        "resource:///modules/panorama/MailSearchPolicy.sys.mjs"
+      );
+      const indexed = snapshot.items.map(item => {
+        const state = fixture.service.resolveDocument(item.id);
+        Assert.equal(item.generation, state.generation);
+        Assert.equal(item.contentRevision, state.contentRevision);
+        Assert.equal(item.policyRevision, state.policyRevision);
+        Assert.deepEqual(item.location, state.location);
+        const header = getMailSearchHeader(state);
+        return [header.folder.URI, header.messageKey, item.messageId];
+      });
+      const revisions = states =>
+        states.map(state => ({
+          id: state?.id,
+          generation: state?.generation,
+          contentRevision: state?.contentRevision,
+          policyRevision: state?.policyRevision,
+          location: state?.location,
+        }));
+      Assert.deepEqual(
+        indexed.toSorted(),
+        fixture.expected.toSorted(),
+        `Both physical copies are current before escalation: ${JSON.stringify({
+          indexed: revisions(snapshot.items),
+          current: revisions(current),
+        })}`
+      );
       pane.document.getElementById("qfb-qs-textbox").dispatchEvent(
         new pane.CustomEvent("search", {
           detail: "nativecompletionneedle",
@@ -471,3 +510,185 @@ add_task(
     }
   }
 );
+
+let queryFixture;
+
+add_setup(async function setupNativeQueryInput() {
+  const root =
+    MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
+      Ci.nsIMsgLocalMailFolder
+    );
+  const folders = ["First", "Second"].map(name =>
+    root
+      .createLocalSubfolder("NativeQueryInput" + name)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+  );
+  registerCleanupFunction(async () => {
+    await closeMailSearch();
+    for (const folder of folders) {
+      folder.parent.propagateDelete(folder, true);
+    }
+  });
+  const generator = new MessageGenerator();
+  let headersCopy;
+  const headers = [
+    "s410amber s410violet café 東京検索",
+    "s410amber separated s410violet café",
+    "s410violet s410amber unrelated",
+    "s410amber alone",
+    "s410violet alone",
+  ].map((subject, index) => {
+    const message = generator.makeMessage();
+    message.messageId = `native-query-input-${index}@example.invalid`;
+    message.subject = MailServices.mimeConverter.encodeMimePartIIStr_UTF8(
+      subject,
+      false,
+      "Subject".length,
+      72
+    );
+    const raw = message.toMessageString();
+    const header = folders[0].addMessage(raw);
+    Assert.equal(header.mime2DecodedSubject, subject);
+    if (index == 0) {
+      headersCopy = folders[1].addMessage(raw);
+    }
+    return header;
+  });
+  Assert.equal(headers[0].messageId, headersCopy.messageId);
+  Assert.notEqual(headers[0].folder.URI, headersCopy.folder.URI);
+  let progress;
+  do {
+    progress = await fixture.service.update({ limit: 500 });
+  } while (progress.moreWork);
+  queryFixture = {
+    phrase: [headers[0], headersCopy],
+    terms: [headers[0], headersCopy, headers[1], headers[2]],
+    accent: [headers[0], headersCopy, headers[1]],
+  };
+});
+
+/**
+ * Submit literal text through the toolbar's input, completion and Enter handlers.
+ *
+ * @param {string} text - User text, including quotes and Unicode characters.
+ * @param {nsIMsgDBHdr[]} expected - Independent physical result headers.
+ * @param {boolean} showAsList - Existing result presentation preference.
+ * @returns {Promise<void>} Resolves after checking and closing the result tab.
+ */
+async function searchToolbarQuery(text, expected, showAsList) {
+  await SpecialPowers.pushPrefEnv({
+    set: [["gloda.show_as_list_by_default", showAsList]],
+  });
+  const origin = tabmail.currentTabInfo;
+  const input = document.querySelector(
+    "#unifiedToolbarContent global-search-bar"
+  );
+  try {
+    input.reset();
+    input.focus();
+    Assert.strictEqual(
+      input.shadowRoot.activeElement,
+      input.shadowRoot.querySelector("input")
+    );
+    if (Array.from(text).some(character => character.charCodeAt(0) > 127)) {
+      EventUtils.synthesizeCompositionChange(
+        {
+          composition: {
+            string: text,
+            clauses: [
+              {
+                length: text.length,
+                attr: EventUtils.COMPOSITION_ATTR_RAW_CLAUSE,
+              },
+            ],
+          },
+          caret: { start: text.length, length: 0 },
+        },
+        window
+      );
+      EventUtils.synthesizeComposition(
+        { type: "compositioncommitasis" },
+        window
+      );
+    } else {
+      EventUtils.sendString(text, window);
+    }
+    Assert.equal(input.value, text, "Preserve the exact user input");
+    const result = await completionResult(text);
+    Assert.equal(input.controller.searchString, text);
+    Assert.strictEqual(input.popup.input, input);
+    const index = result.rows.findIndex(row => row.fullText);
+    Assert.greaterOrEqual(
+      index,
+      0,
+      "The actual provider offers a full-text choice"
+    );
+    Assert.equal(result.getObjectAt(index).item, text);
+    input.popup.selectedIndex = -1;
+    for (let i = 0; i <= index; i++) {
+      EventUtils.synthesizeKey("KEY_ArrowDown", {}, window);
+    }
+    Assert.equal(input.popup.selectedIndex, index);
+    EventUtils.synthesizeKey("KEY_Enter", {}, window);
+    const pending = tabmail.currentTabInfo;
+    Assert.notEqual(pending, origin, "Enter opens the retained result UI");
+    Assert.equal(
+      pending.mode.name,
+      showAsList ? "glodaTableList" : "glodaFacet"
+    );
+    if (!showAsList) {
+      Assert.equal(pending.mailSearch.text, text);
+      Assert.equal(pending.mailSearch.selection, null);
+    }
+    let actual;
+    if (showAsList) {
+      const list = await pending.searchPromise;
+      actual = await completionListRows(list);
+      Assert.equal(list.chromeBrowser.contentDocument.title, text);
+    } else {
+      await TestUtils.waitForCondition(() => pending.searchPromise);
+      await pending.searchPromise;
+      const { getMailSearchHeader } = ChromeUtils.importESModule(
+        "resource:///modules/panorama/MailSearchPolicy.sys.mjs"
+      );
+      actual = pending.browser.contentWindow.FacetContext.fullSet.map(item => {
+        const state = fixture.service.resolveDocument(item.id);
+        Assert.deepEqual(item.location, state.location);
+        const header = getMailSearchHeader(state);
+        Assert.equal(item.messageId, header.messageId);
+        return [header.folder.URI, header.messageKey, item.messageId];
+      });
+    }
+    const identities = expected.map(header => [
+      header.folder.URI,
+      header.messageKey,
+      header.messageId,
+    ]);
+    Assert.deepEqual(
+      actual.toSorted(),
+      identities.toSorted(),
+      `Exact physical results for ${text}`
+    );
+  } finally {
+    while (tabmail.currentTabInfo != origin) {
+      tabmail.closeTab(tabmail.currentTabInfo);
+    }
+    input.reset();
+    await SpecialPowers.popPrefEnv();
+  }
+}
+
+add_task(async function test_nativeToolbarQuotedPhraseAndTermOrder() {
+  await searchToolbarQuery('"s410amber s410violet"', queryFixture.phrase, true);
+  await searchToolbarQuery("s410amber s410violet", queryFixture.terms, true);
+});
+
+add_task(async function test_nativeToolbarUnmatchedQuoteKeepsBothTerms() {
+  await searchToolbarQuery('"s410amber s410violet', queryFixture.terms, false);
+});
+
+add_task(async function test_nativeToolbarAccentAndCjkInput() {
+  await searchToolbarQuery("CAFÉ", queryFixture.accent, true);
+  await searchToolbarQuery("cafe", queryFixture.accent, false);
+  await searchToolbarQuery("東京検索", queryFixture.phrase, false);
+});

@@ -454,3 +454,108 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkLocalCopyAdmissionError("maildir", true);
   });
 }
+
+/**
+ * Validate real mbox summary metadata without changing the body file.
+ */
+add_task(async function test_mboxSummaryValidation() {
+  await withAvailabilityStore("mbox", async folder => {
+    const database = folder.msgDatabase;
+    const info = database.dBFolderInfo;
+    const bytes = await IOUtils.read(folder.filePath.path);
+    folder.msgStore.setSummaryFileValid(folder, database, true);
+    Assert.ok(folder.msgStore.isSummaryFileValid(folder, database));
+    Assert.equal(info.folderSize, folder.filePath.fileSize);
+    Assert.deepEqual(await IOUtils.read(folder.filePath.path), bytes);
+  });
+});
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  /**
+   * Preserve a real metadata getter error instead of accepting an empty mbox.
+   */
+  add_task(async function test_mboxSummaryGetterError() {
+    await withAvailabilityStore("mbox", async folder => {
+      const database = folder.msgDatabase;
+      const info = database.dBFolderInfo;
+      const store = folder.msgStore;
+      const bytes = await IOUtils.read(folder.filePath.path);
+      store.setSummaryFileValid(folder, database, true);
+      Assert.equal(info.folderSize, 0);
+      const originalDate = info.folderDate;
+      info.setInt64Property("folderDate", -1);
+      try {
+        Assert.throws(
+          () => info.folderDate,
+          error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
+        );
+        Assert.throws(
+          () => store.isSummaryFileValid(folder, database),
+          error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
+        );
+        Assert.equal(info.getInt64Property("folderDate", 0), -1);
+        Assert.deepEqual(database.listAllKeys(), []);
+        Assert.deepEqual(await IOUtils.read(folder.filePath.path), bytes);
+      } finally {
+        info.folderDate = originalDate;
+      }
+      Assert.ok(store.isSummaryFileValid(folder, database));
+    });
+  });
+
+  /**
+   * Report the first real summary-property write error and keep the body file.
+   */
+  add_task(async function test_mboxSummarySetterErrors() {
+    await withAvailabilityStore("mbox", async folder => {
+      const database = folder.msgDatabase;
+      const info = database.dBFolderInfo;
+      const store = folder.msgStore;
+      const bytes = await IOUtils.read(folder.filePath.path);
+      const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+        Ci.nsIDatabaseCore
+      ).connectionForTests;
+      for (const [property, valid] of [
+        ["folderSize", true],
+        ["folderDate", true],
+        ["version", false],
+      ]) {
+        let faults = 0;
+        connection.createFunction("mbox_summary_fault", 0, {
+          onFunctionCall() {
+            faults++;
+            return 0;
+          },
+        });
+        try {
+          connection.executeSimpleSQL(
+            "CREATE TEMP TRIGGER mbox_summary_fault BEFORE INSERT ON main.folder_properties " +
+              `WHEN NEW.id = ${folder.id} AND NEW.name = '${property}' BEGIN ` +
+              "SELECT mbox_summary_fault(); " +
+              "SELECT RAISE(ABORT, 'Mbox summary metadata failed'); END"
+          );
+          Assert.throws(
+            () => store.setSummaryFileValid(folder, database, valid),
+            error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+          );
+          Assert.equal(faults, 1);
+          Assert.deepEqual(database.listAllKeys(), []);
+          Assert.deepEqual(await IOUtils.read(folder.filePath.path), bytes);
+        } finally {
+          try {
+            connection.executeSimpleSQL(
+              "DROP TRIGGER IF EXISTS temp.mbox_summary_fault"
+            );
+          } finally {
+            connection.removeFunction("mbox_summary_fault");
+          }
+        }
+        // An earlier successful property write may remain after a later error.
+        // This is not an atomic group of metadata setters.
+        store.setSummaryFileValid(folder, database, true);
+        Assert.equal(info.folderSize, folder.filePath.fileSize);
+        Assert.ok(store.isSummaryFileValid(folder, database));
+      }
+    });
+  });
+}

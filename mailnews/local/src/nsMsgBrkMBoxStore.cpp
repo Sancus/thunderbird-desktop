@@ -352,15 +352,18 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::IsSummaryFileValid(nsIMsgFolder* aFolder,
   nsCOMPtr<nsIDBFolderInfo> folderInfo;
   rv = aDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
   NS_ENSURE_SUCCESS(rv, rv);
-  int64_t folderSize;
-  uint32_t folderDate;
-  int32_t numUnreadMessages;
+  int64_t folderSize = 0;
+  uint32_t folderDate = 0;
+  int32_t numUnreadMessages = 0;
 
   *aResult = false;
 
-  folderInfo->GetNumUnreadMessages(&numUnreadMessages);
-  folderInfo->GetFolderSize(&folderSize);
-  folderInfo->GetFolderDate(&folderDate);
+  rv = folderInfo->GetNumUnreadMessages(&numUnreadMessages);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = folderInfo->GetFolderSize(&folderSize);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = folderInfo->GetFolderDate(&folderDate);
+  NS_ENSURE_SUCCESS(rv, rv);
 
   int64_t fileSize = 0;
   uint32_t actualFolderTimeStamp = 0;
@@ -397,21 +400,24 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::SetSummaryFileValid(nsIMsgFolder* aFolder,
   nsCOMPtr<nsIDBFolderInfo> folderInfo;
   rv = aDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
   NS_ENSURE_SUCCESS(rv, rv);
-  bool exists;
-  pathFile->Exists(&exists);
+  bool exists = false;
+  rv = pathFile->Exists(&exists);
+  NS_ENSURE_SUCCESS(rv, rv);
   if (!exists) return NS_MSG_ERROR_FOLDER_MISSING;
 
   if (aValid) {
     uint32_t actualFolderTimeStamp;
     int64_t fileSize;
     GetMailboxModProperties(aFolder, &fileSize, &actualFolderTimeStamp);
-    folderInfo->SetFolderSize(fileSize);
-    folderInfo->SetFolderDate(actualFolderTimeStamp);
+    rv = folderInfo->SetFolderSize(fileSize);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = folderInfo->SetFolderDate(actualFolderTimeStamp);
+    NS_ENSURE_SUCCESS(rv, rv);
   } else {
-    folderInfo->SetVersion(0);  // that ought to do the trick.
+    rv = folderInfo->SetVersion(0);  // that ought to do the trick.
+    NS_ENSURE_SUCCESS(rv, rv);
   }
-  aDB->Commit(nsMsgDBCommitType::kLargeCommit);
-  return rv;
+  return aDB->Commit(nsMsgDBCommitType::kLargeCommit);
 }
 
 NS_IMETHODIMP nsMsgBrkMBoxStore::DeleteFolder(nsIMsgFolder* folder) {

@@ -82,40 +82,6 @@ function inspectSelection(service, request, signal) {
 }
 
 /**
- * Cancels delivery while still observing the native query's eventual settlement.
- * LiveView has no scriptable cancellation method; no listener is installed.
- *
- * @param {Promise<object[]>} pending - Native selection already started.
- * @param {AbortSignal} [signal] - Cancel result delivery.
- * @returns {Promise<object[]>} Selected rows, or the original rejection/reason.
- */
-function selectWithCancellation(pending, signal) {
-  if (!signal) {
-    return pending;
-  }
-  return new Promise((resolve, reject) => {
-    const abort = () => {
-      signal.removeEventListener("abort", abort);
-      reject(signal.reason);
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    pending.then(
-      rows => {
-        signal.removeEventListener("abort", abort);
-        resolve(rows);
-      },
-      error => {
-        signal.removeEventListener("abort", abort);
-        reject(error);
-      }
-    );
-    if (signal.aborted) {
-      abort();
-    }
-  });
-}
-
-/**
  * @typedef {object} MailSearchConversationMember
  * @property {string} id - Global physical message key.
  * @property {number} generation - Current native generation.
@@ -175,31 +141,25 @@ export async function readMailSearchConversation(
   }
   const conversationId = seed.header.threadId;
   mailSearchKey(String(conversationId));
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
-    Ci.nsILiveView
+  // Keep cancellation and mutation checks across delivery from the synchronous
+  // native selection.
+  const keys = await messageDB.getConversationMessageKeys(
+    mailSearchKey(request.id)
   );
-  view.initWithConversation(conversationId);
-  view.grouping = Ci.nsILiveView.UNTHREADED;
-  const rows = await selectWithCancellation(view.selectMessages(), signal);
   signal?.throwIfAborted();
   const items = [];
   const seen = new Set();
   let excludedCount = 0;
-  for (const row of rows) {
+  for (const key of keys) {
     signal?.throwIfAborted();
-    const id = String(row.id);
+    const id = String(key);
     mailSearchKey(id);
     if (seen.has(id)) {
       throw new Error("Duplicate physical conversation row");
     }
     seen.add(id);
     const state = service.resolveDocument(id, signal);
-    if (
-      !state ||
-      state.location?.folderId !== row.folderId ||
-      state.location.messageKey !== row.id ||
-      row.threadId !== conversationId
-    ) {
+    if (!state || !state.location || state.location.messageKey !== key) {
       return { status: "stale" };
     }
     if (!state.eligible) {
@@ -207,7 +167,7 @@ export async function readMailSearchConversation(
       continue;
     }
     const header = getMailSearchHeader(state);
-    if (!header || header.threadId !== conversationId) {
+    if (!header) {
       return { status: "stale" };
     }
     items.push({

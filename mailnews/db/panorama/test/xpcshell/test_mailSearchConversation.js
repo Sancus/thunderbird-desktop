@@ -175,7 +175,7 @@ add_task(async function test_completeUnindexedConversationAndClickedCopy() {
   Assert.equal(
     snapshot.conversationId,
     f.clicked.threadId,
-    "Only the current native thread is used"
+    "Conversation metadata names the selected copy’s current native thread"
   );
   Assert.ok(snapshot.resultSetId);
   Assert.equal(
@@ -497,4 +497,85 @@ add_task(async function test_headerEntryPreservesCancellationAndErrors() {
   const closing = f.service.close();
   await Assert.rejects(closingLookup, /Mail search closed/);
   await closing;
+});
+
+add_task(async function test_completeConversationIncludesDuplicateRootCopies() {
+  const a = conversationRoot
+    .createLocalSubfolder("duplicate-root-a")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const b = conversationRoot
+    .createLocalSubfolder("duplicate-root-b")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const c = conversationRoot
+    .createLocalSubfolder("duplicate-root-control")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const rootId = "duplicate-root@conversation.invalid";
+  const root = addConversationMail(a, rootId, []);
+  const reply = addConversationMail(
+    a,
+    "duplicate-root-reply@conversation.invalid",
+    [rootId]
+  );
+  const clicked = addConversationMail(b, rootId, []);
+  const unrelated = addConversationMail(
+    c,
+    "duplicate-root-unrelated@conversation.invalid",
+    []
+  );
+  const file = do_get_profile().clone();
+  file.append("conversation-duplicate-root.sqlite");
+  const service = await MailSearchService.open(
+    file,
+    database.sourceId,
+    messageDB
+  );
+  registerCleanupFunction(() => service.close());
+  Assert.equal(root.messageId, clicked.messageId);
+  Assert.notEqual(root.messageKey, clicked.messageKey);
+  Assert.equal(await service.getText(String(clicked.messageKey)), null);
+  const snapshot = await service.getConversationForHeader(clicked);
+  assertConversationMembers(snapshot, [root, reply, clicked]);
+  Assert.equal(snapshot.selectedId, String(clicked.messageKey));
+  Assert.equal(snapshot.selectedMessage.messageKey, clicked.messageKey);
+  Assert.equal(snapshot.selectedMessage.folder.id, b.id);
+  Assert.equal(snapshot.excludedCount, 0);
+  const exported = [];
+  await service.streamResultHeaders(snapshot, header => exported.push(header));
+  Assert.deepEqual(
+    exported
+      .map(header => [header.folder.id, header.messageKey])
+      .toSorted((x, y) => x[1] - y[1]),
+    [root, reply, clicked]
+      .map(header => [header.folder.id, header.messageKey])
+      .toSorted((x, y) => x[1] - y[1])
+  );
+  assertConversationMembers(await service.getConversationForHeader(unrelated), [
+    unrelated,
+  ]);
+});
+
+add_task(async function test_sameMessageIdWithoutReferencesIsNotAnEdge() {
+  const a = conversationRoot
+    .createLocalSubfolder("same-id-no-references-a")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const b = conversationRoot
+    .createLocalSubfolder("same-id-no-references-b")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const id = "same-id-no-references@conversation.invalid";
+  const first = addConversationMail(a, id, []);
+  const clicked = addConversationMail(b, id, []);
+  const file = do_get_profile().clone();
+  file.append("conversation-same-id-no-references.sqlite");
+  const service = await MailSearchService.open(
+    file,
+    database.sourceId,
+    messageDB
+  );
+  registerCleanupFunction(() => service.close());
+  Assert.equal(first.messageId, clicked.messageId);
+  Assert.notEqual(first.messageKey, clicked.messageKey);
+  const snapshot = await service.getConversationForHeader(clicked);
+  assertConversationMembers(snapshot, [clicked]);
+  Assert.equal(snapshot.selectedId, String(clicked.messageKey));
+  Assert.equal(snapshot.selectedMessage.folder.id, b.id);
 });

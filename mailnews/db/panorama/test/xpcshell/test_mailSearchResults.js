@@ -589,20 +589,23 @@ add_task(function test_selectionCopiesDoNotRetainAutocompleteObjects() {
 
 add_task(async function test_typedSelectionReachesLaterMetadataPage() {
   const folder = rootFolder.createLocalSubfolder("later-typed-page");
+  const controls = [];
   for (let i = 0; i < 100; i++) {
-    messageDB.addMessage(
-      folder.id,
-      "same-page@example.invalid",
-      [],
-      123456,
-      "Control <control@example.invalid>",
-      "",
-      "",
-      "",
-      "typedpagingneedle",
-      0,
-      "",
-      Ci.nsMsgPriority.notSet
+    controls.push(
+      messageDB.addMessage(
+        folder.id,
+        "same-page@example.invalid",
+        [],
+        123456,
+        "Control <control@example.invalid>",
+        "",
+        "",
+        "",
+        "typedpagingneedle",
+        0,
+        "",
+        Ci.nsMsgPriority.notSet
+      )
     );
   }
   const expected = messageDB.addMessage(
@@ -633,6 +636,13 @@ add_task(async function test_typedSelectionReachesLaterMetadataPage() {
     ranges: [],
     firstMatchText: null,
   });
+
+  // Later cases must not reindex this fixture's unavailable paging controls.
+  for (const key of [...controls, expected]) {
+    messageDB.removeMessage(key);
+  }
+  rootFolder.propagateDelete(folder, true);
+  await drainResultWork();
 });
 
 add_task(async function test_cancelledCollectionDeliversNoSnapshot() {

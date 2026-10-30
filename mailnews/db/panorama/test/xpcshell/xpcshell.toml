@@ -140,6 +140,8 @@ tags = ["dataadapter"]
 
 ["test_mailSearchFactory.js"]
 
+["test_mailSearchImapContent.js"]
+
 ["test_mailSearchLegacyRecovery.js"]
 head = "../../../gloda/test/unit/head_gloda.js"
 prefs = [

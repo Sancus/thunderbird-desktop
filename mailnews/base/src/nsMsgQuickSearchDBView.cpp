@@ -12,6 +12,10 @@
 #include "nsImapCore.h"
 #include "nsIMsgHdr.h"
 #include "nsIDBFolderInfo.h"
+#ifdef MOZ_PANORAMA
+#  include "nsIDatabaseCore.h"
+#  include "nsServiceManagerUtils.h"
+#endif  // MOZ_PANORAMA
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 
@@ -684,6 +688,19 @@ nsresult nsMsgQuickSearchDBView::ListIdsInThreadOrder(nsIMsgThread* threadHdr,
                                                       uint32_t* pNumListed) {
   nsresult rv = ListIdsInThreadOrder(threadHdr, parentKey, level, level,
                                      nsMsgKey_None, viewIndex, pNumListed);
+#ifdef MOZ_PANORAMA
+  if (level == 1) {
+    nsCOMPtr<nsIDatabaseCore> core =
+        do_GetService("@mozilla.org/msgDatabase/msgDBService;1");
+    if (core) {
+      NS_ENSURE_SUCCESS(rv, rv);
+      // A native folder can contain several roots of the same global thread.
+      // The displayed root's descendants have already been listed above.
+      return ListIdsInThreadOrder(threadHdr, nsMsgKey_None, level, level,
+                                  parentKey, viewIndex, pNumListed);
+    }
+  }
+#endif  // MOZ_PANORAMA
   // Because a quick search view might not have the actual thread root
   // as its root, and thus might have a message that potentially has siblings
   // as its root, and the enumerator will miss the siblings, we might need to

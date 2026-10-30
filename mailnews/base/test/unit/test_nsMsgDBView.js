@@ -34,7 +34,6 @@ var messageInjection = new MessageInjection({ mode: "local" });
 
 var gTestFolder;
 var gSiblingsMissingParentsSubject;
-var gMessages;
 
 function setup_messages() {
   // build up a diverse list of messages
@@ -77,11 +76,12 @@ function setup_messages() {
 }
 
 /**
- * Sets gTestFolder with msgSet. Ensure that gTestFolder is clean for each test.
+ * Set gTestFolder to a new folder and store the supplied messages.
  *
- * @param {SyntheticMessageSet} msgSet
+ * @param {SyntheticMessageSet} [msgSet] - Defaults to a fresh message scenario.
+ * @returns {Promise<void>}
  */
-async function set_gTestFolder(msgSet) {
+async function set_gTestFolder(msgSet = setup_messages()) {
   gTestFolder = await messageInjection.makeEmptyFolder();
   await messageInjection.addSetsToFolders([gTestFolder], [msgSet]);
 }
@@ -102,7 +102,7 @@ async function make_and_add_message(aMessageArgs) {
 }
 
 function view_throw(why) {
-  dump_view_contents();
+  dump_view_contents({ dbView: gDBView });
   do_throw(why);
 }
 
@@ -174,6 +174,16 @@ function assert_view_level_is(index, level) {
 }
 
 /**
+ * Returns a header's physical location and Message-ID.
+ *
+ * @param {nsIMsgDBHdr} header - The stored header.
+ * @returns {[string, number, string]} Folder URI, key and Message-ID.
+ */
+function physicalIdentity(header) {
+  return [header.folder.URI, header.messageKey, header.messageId];
+}
+
+/**
  * Given a message, assert that it is present at the given indices.
  *
  * Usage:
@@ -186,7 +196,11 @@ function assert_view_message_at_indices(...aArgs) {
   for (const thing of aArgs) {
     if (typeof thing == "number") {
       const hdrAt = gDBView.getMsgHdrAt(thing);
-      if (curHdr != hdrAt) {
+      if (
+        curHdr.folder.URI != hdrAt.folder.URI ||
+        curHdr.messageKey != hdrAt.messageKey ||
+        curHdr.messageId != hdrAt.messageId
+      ) {
         view_throw(
           "Expected hdr at " +
             thing +
@@ -589,6 +603,17 @@ function test_number_of_messages() {
     }
   }
   if (gDBView.numMsgsInView != numMsgInTree) {
+    info(
+      "Stored physical thread membership: " +
+        JSON.stringify(
+          Array.from(gTestFolder.messages, header => ({
+            key: header.messageKey,
+            messageId: header.messageId,
+            threadId: header.threadId,
+            parent: header.threadParent,
+          }))
+        )
+    );
     view_throw(
       "message in tree is " +
         numMsgInTree +
@@ -615,15 +640,12 @@ function test_selected_messages() {
   }
 
   const firstSelectedMsg = gDBView.hdrForFirstSelectedMessage;
-  if (selectedMessages[0] != firstSelectedMsg) {
-    do_throw(
-      "getSelectedMsgHdrs[0] is " +
-        selectedMessages[0].messageKey +
-        " but should be " +
-        firstSelectedMsg.messageKey +
-        "\n"
-    );
-  }
+  Assert.ok(firstSelectedMsg, "The view returns its first selected header");
+  Assert.deepEqual(
+    physicalIdentity(selectedMessages[0]),
+    physicalIdentity(firstSelectedMsg),
+    "Both selection APIs return the same physical message"
+  );
 
   // Select all messages
   gTreeView.selection.selectAll();
@@ -648,18 +670,19 @@ function test_selected_messages() {
     );
   }
 
-  for (let i = 0; i < selectedMessages.length; i++) {
-    const expectedHdr = gDBView.getMsgHdrAt(i);
-    if (!selectedMessages.includes(expectedHdr)) {
-      view_throw(
-        "Expected " +
-          expectedHdr.messageKey +
-          ":" +
-          expectedHdr.mime2DecodedSubject.substr(0, 30) +
-          " to be selected, but it wasn't\n"
-      );
+  const expectedIdentities = [];
+  for (let index = 0; index < gTreeView.rowCount; index++) {
+    if (!(gDBView.getFlagsAt(index) & MSG_VIEW_FLAG_DUMMY)) {
+      expectedIdentities.push(physicalIdentity(gDBView.getMsgHdrAt(index)));
     }
   }
+  const compareIdentity = (left, right) =>
+    left[0].localeCompare(right[0]) || left[1] - right[1];
+  Assert.deepEqual(
+    selectedMessages.map(physicalIdentity).sort(compareIdentity),
+    expectedIdentities.sort(compareIdentity),
+    "Every physical message is selected, without dummy rows or duplicates"
+  );
 
   gTreeView.selection.clearSelection();
 }
@@ -1119,12 +1142,8 @@ function tests_for_all_views() {
   test_selected_messages();
 }
 
-add_setup(function () {
-  gMessages = setup_messages();
-});
-
 add_task(async function test_threaded() {
-  await set_gTestFolder(gMessages);
+  await set_gTestFolder();
   const [view_type, view_flag] = VIEW_TYPES[0];
   setup_view(view_type, view_flag);
 
@@ -1135,8 +1154,66 @@ add_task(async function test_threaded() {
   await test_thread_sorting();
 });
 
+add_task(async function test_quicksearchCopiedThreadMembers() {
+  const messages = setup_messages();
+  await set_gTestFolder(messages);
+  const sourceFolder = gTestFolder;
+  const sourceKeys = new Set(
+    [...sourceFolder.messages].map(hdr => hdr.messageKey)
+  );
+  await set_gTestFolder(messages);
+  const headers = [...gTestFolder.messages];
+  const expected = headers.map(physicalIdentity);
+  const parents = headers.map(hdr => [
+    hdr.messageKey,
+    hdr.threadId,
+    hdr.threadParent,
+  ]);
+  Assert.equal(
+    expected.length,
+    39,
+    "The copied folder contains all physical messages"
+  );
+  Assert.notEqual(sourceFolder.URI, gTestFolder.URI);
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const isNative =
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore;
+  if (isNative) {
+    Assert.ok(
+      headers.some(hdr => sourceKeys.has(hdr.threadParent)),
+      "Native copies retain physical parents in the original folder"
+    );
+  }
+
+  setup_view("quicksearch", Ci.nsMsgViewFlagsType.kThreadedDisplay);
+  test_number_of_messages();
+  const actual = Array.from({ length: gTreeView.rowCount }, (_, index) =>
+    physicalIdentity(gDBView.getMsgHdrAt(index))
+  );
+  const compare = (left, right) => left[1] - right[1];
+  Assert.deepEqual(
+    actual.sort(compare),
+    expected.sort(compare),
+    "The view includes each copied physical message once and excludes the source folder"
+  );
+  test_selected_messages();
+  if (isNative) {
+    Assert.deepEqual(
+      [...gTestFolder.messages].map(hdr => [
+        hdr.messageKey,
+        hdr.threadId,
+        hdr.threadParent,
+      ]),
+      parents,
+      "Displaying copied threads does not rewrite native parents or thread IDs"
+    );
+  }
+});
+
 add_task(async function test_quicksearch_threaded() {
-  await set_gTestFolder(gMessages);
+  await set_gTestFolder();
   const [view_type, view_flag] = VIEW_TYPES[1];
   setup_view(view_type, view_flag);
 
@@ -1147,7 +1224,7 @@ add_task(async function test_quicksearch_threaded() {
 });
 
 add_task(async function test_search_threaded() {
-  await set_gTestFolder(gMessages);
+  await set_gTestFolder();
   const [view_type, view_flag] = VIEW_TYPES[2];
   setup_view(view_type, view_flag);
 
@@ -1158,7 +1235,7 @@ add_task(async function test_search_threaded() {
 });
 
 add_task(async function test_search_group_by_sort() {
-  await set_gTestFolder(gMessages);
+  await set_gTestFolder();
   const [view_type, view_flag] = VIEW_TYPES[3];
   setup_view(view_type, view_flag);
 
@@ -1169,7 +1246,7 @@ add_task(async function test_search_group_by_sort() {
 });
 
 add_task(async function test_xfvf() {
-  await set_gTestFolder(gMessages);
+  await set_gTestFolder();
   const [view_type, view_flag] = VIEW_TYPES[4];
   setup_view(view_type, view_flag);
 
@@ -1180,7 +1257,7 @@ add_task(async function test_xfvf() {
 });
 
 add_task(async function test_group() {
-  await set_gTestFolder(gMessages);
+  await set_gTestFolder();
   const [view_type, view_flag] = VIEW_TYPES[5];
   setup_view(view_type, view_flag);
 

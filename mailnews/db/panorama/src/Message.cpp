@@ -489,9 +489,12 @@ NS_IMETHODIMP Message::GetFolder(nsIMsgFolder** aFolder) {
 }
 
 NS_IMETHODIMP Message::GetIsLive(bool* isLive) {
-  // By definition, Message is always live and in the database.
-  *isLive = true;
-  return NS_OK;
+  NS_ENSURE_ARG_POINTER(isLive);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core && DatabaseCore::sConnection, NS_ERROR_NOT_AVAILABLE);
+  RefPtr<MessageDatabase> messages = core->mMessageDatabase;
+  NS_ENSURE_TRUE(messages, NS_ERROR_NOT_AVAILABLE);
+  return messages->MessageExists(mKey, *isLive);
 }
 
 }  // namespace mozilla::mailnews

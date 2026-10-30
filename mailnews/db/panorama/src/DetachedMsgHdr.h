@@ -15,6 +15,9 @@ namespace mozilla::mailnews {
 
 class PerFolderDatabase;
 
+#define NS_DETACHED_MSG_HDR_IID \
+  {0x5fb65d55, 0x5737, 0x46b0, {0x9c, 0xe3, 0x48, 0xd3, 0xce, 0x59, 0x78, 0x9a}}
+
 /**
  * An nsIMsgDBHdr which carries around its own data and is 'detached'
  * from the database.
@@ -27,6 +30,7 @@ class PerFolderDatabase;
  */
 class DetachedMsgHdr : public DecodedSubjectHdr {
  public:
+  NS_INLINE_DECL_STATIC_IID(NS_DETACHED_MSG_HDR_IID)
   friend class PerFolderDatabase;
   DetachedMsgHdr() = delete;
   explicit DetachedMsgHdr(uint64_t folderId) : mFolderId(folderId) {}

@@ -467,3 +467,75 @@ add_task(function test_effectiveCharsetKeepsOriginalReadErrors() {
     );
   }
 });
+
+add_task(function test_publicHeaderLivenessTracksPublishedMembership() {
+  const folder = root.createLocalSubfolder("header-liveness");
+  const db = folder.msgDatabase;
+  const pending = makeDraft(db, "live@header.invalid");
+  Assert.ok(!pending.isLive);
+  const header = db.attachHdr(pending, false);
+  const key = header.messageKey;
+  Assert.ok(header.isLive);
+  Assert.ok(db.containsKey(key));
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    Assert.ok(header.isLive);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.ok(!connection.transactionInProgress);
+  Assert.equal(header.subject, "Exact subject");
+  db.deleteMessages([key], null);
+  Assert.ok(!db.containsKey(key));
+  Assert.ok(!header.isLive, "A retained removed header is not published");
+  Assert.equal(header.subject, "Exact subject");
+  const remaining = db.listAllKeys();
+  const count = db.dBFolderInfo.numMessages;
+  Assert.throws(
+    () => db.attachHdr(header, false),
+    error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE
+  );
+  Assert.throws(
+    () => db.copyHdrFromExistingHdr(0xffffffff, header, true),
+    error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE
+  );
+  Assert.deepEqual(db.listAllKeys(), remaining);
+  Assert.equal(db.dBFolderInfo.numMessages, count);
+  const missing = messageDB.getMessage(0);
+  Assert.ok(!missing.isLive, "A factory key view does not imply membership");
+  Assert.throws(
+    () => db.attachHdr(missing, false),
+    error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE
+  );
+  Assert.throws(
+    () => db.copyHdrFromExistingHdr(0xffffffff, missing, true),
+    error => error.result === Cr.NS_ERROR_UNEXPECTED
+  );
+  Assert.deepEqual(db.listAllKeys(), remaining);
+  Assert.equal(db.dBFolderInfo.numMessages, count);
+});
+
+add_task(function test_headerLivenessPreservesStorageErrors() {
+  const folder = root.createLocalSubfolder("header-liveness-error");
+  const db = folder.msgDatabase;
+  const pending = makeDraft(db, "live-error@header.invalid");
+  const header = db.attachHdr(pending, false);
+  Assert.ok(header.isLive);
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "ALTER TABLE messages RENAME TO unavailable_live_messages"
+  );
+  try {
+    Assert.throws(
+      () => header.isLive,
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_live_messages RENAME TO messages"
+    );
+  }
+  Assert.ok(header.isLive);
+});

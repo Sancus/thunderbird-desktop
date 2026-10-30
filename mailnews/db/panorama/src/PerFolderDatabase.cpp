@@ -42,6 +42,7 @@
 #include "nsMsgFolderFlags.h"
 #include "nsMsgSearchCore.h"
 #include "nsMsgUtils.h"
+#include "nsQueryObject.h"
 #include "nsReadableUtils.h"
 #include "nsServiceManagerUtils.h"
 #include "prtime.h"
@@ -884,8 +885,9 @@ nsresult PerFolderDatabase::CompletePartialHdr(
   bool isLive;
   MOZ_TRY(parsed->GetIsLive(&isLive));
   NS_ENSURE_FALSE(isLive, NS_ERROR_INVALID_ARG);
-  // The parser uses the native CreateNewHdr implementation, as in AttachHdr.
-  RefPtr<DetachedMsgHdr> draft = static_cast<DetachedMsgHdr*>(parsed);
+  // Only native parser drafts carry the raw header and attachment state.
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(parsed);
+  NS_ENSURE_TRUE(draft, NS_ERROR_INVALID_ARG);
   NS_ENSURE_TRUE(draft->mFolderId == mFolderId, NS_ERROR_INVALID_ARG);
   MOZ_TRY(draft->CheckMutable());
   RefPtr<PerFolderDatabase> self(this);
@@ -923,8 +925,9 @@ NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,
     return NS_ERROR_INVALID_ARG;
   }
 
-  // CreateNewHdr supplies the native detached implementation.
-  RefPtr<DetachedMsgHdr> draft = static_cast<DetachedMsgHdr*>(detachedHdr);
+  // Publication state alone does not identify a native parser draft.
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(detachedHdr);
+  NS_ENSURE_TRUE(draft, NS_ERROR_INVALID_ARG);
   if (draft->mFolderId != mFolderId) {
     return NS_ERROR_INVALID_ARG;
   }
@@ -987,8 +990,9 @@ NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
     // The public getter filters self/empty tokens and has a uint16 limit.
     MOZ_TRY(MessageDB().GetMessageReferences(sourceKey, raw.references));
   } else {
-    // Like AttachHdr, this accepts the native CreateNewHdr implementation.
-    auto* source = static_cast<DetachedMsgHdr*>(existingHdr);
+    // Only native drafts carry the complete unfiltered references.
+    RefPtr<DetachedMsgHdr> source = do_QueryObject(existingHdr);
+    NS_ENSURE_TRUE(source, NS_ERROR_ILLEGAL_VALUE);
     MOZ_TRY(source->CheckMutable());
     raw.references = source->mRaw.references.Clone();
   }

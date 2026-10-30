@@ -4,6 +4,7 @@
 
 #include "gtest/gtest.h"
 #include "nsImapUtils.h"
+#include "nsImapFlagAndUidState.h"
 #include "nsImapMailFolder.h"
 
 // Invocation:
@@ -105,4 +106,92 @@ TEST(TestMsgImapUtils, MessageUriQuery)
     EXPECT_EQ(42u, key);
     EXPECT_EQ(test.part, part);
   }
+}
+
+TEST(TestMsgImapUtils, ImapUidSetsDoNotInferCachedMembers)
+{
+  RefPtr<nsImapFlagAndUidState> state = new nsImapFlagAndUidState(0);
+  ASSERT_EQ(NS_OK, state->AddUidFlagPair(5, 0, 0));
+  ASSERT_EQ(NS_OK, state->AddUidFlagPair(7, 0, 1));
+  state->SetPartialUIDFetch(false);
+  const ImapUid uids[] = {5, 7};
+  uint32_t count = 2;
+  nsCString got;
+  AllocateImapUidString(uids, count, state, got);
+  EXPECT_EQ("5,7"_ns, got);
+  EXPECT_EQ(2u, count);
+}
+
+TEST(TestMsgImapUtils, ImapUidSetsKeepUncachedInputs)
+{
+  RefPtr<nsImapFlagAndUidState> state = new nsImapFlagAndUidState(0);
+  ASSERT_EQ(NS_OK, state->AddUidFlagPair(1001, 0, 0));
+  state->SetPartialUIDFetch(false);
+  const ImapUid uids[] = {1003, 1005};
+  uint32_t count = 2;
+  nsCString got;
+  AllocateImapUidString(uids, count, state, got);
+  EXPECT_EQ("1003,1005"_ns, got);
+  EXPECT_EQ(2u, count);
+}
+
+TEST(TestMsgImapUtils, ImapUidSetsKeepLargestUid)
+{
+  const ImapUid uids[] = {4294967293, 4294967294, 4294967295};
+  uint32_t count = 3;
+  nsCString got;
+  AllocateImapUidString(uids, count, nullptr, got);
+  EXPECT_EQ("4294967293:4294967295"_ns, got);
+  EXPECT_EQ(3u, count);
+}
+
+TEST(TestMsgImapUtils, ImapUidChunksPreserveEveryInput)
+{
+  nsTArray<ImapUid> uids;
+  for (ImapUid uid = 10001; uid < 10801; uid += 2) uids.AppendElement(uid);
+  for (bool partial : {false, true}) {
+    RefPtr<nsImapFlagAndUidState> state = new nsImapFlagAndUidState(0);
+    state->SetPartialUIDFetch(partial);
+    nsTArray<ImapUid> actual;
+    uint32_t chunks = 0;
+    while (actual.Length() < uids.Length()) {
+      uint32_t start = actual.Length();
+      uint32_t count = uids.Length() - start;
+      nsCString chunk;
+      AllocateImapUidString(uids.Elements() + start, count, state, chunk);
+      ASSERT_GT(count, 0u);
+      ASSERT_LE(count, uids.Length() - start);
+      // The 950-byte threshold can be crossed by the last UID and punctuation.
+      EXPECT_LE(chunk.Length(), 962u);
+      nsTArray<ImapUid> expanded;
+      ParseUidString(chunk.get(), expanded);
+      ASSERT_EQ(count, expanded.Length());
+      for (uint32_t i = 0; i < count; ++i)
+        EXPECT_EQ(uids[start + i], expanded[i]);
+      actual.AppendElements(expanded);
+      ++chunks;
+    }
+    EXPECT_GT(chunks, 1u);
+    EXPECT_EQ(uids, actual);
+  }
+}
+
+TEST(TestMsgImapUtils, ImapUidRangesKeepLargestEndpoint)
+{
+  nsTArray<ImapUid> parsed;
+  ParseUidString("4294967293:4294967295", parsed);
+  EXPECT_EQ((nsTArray<ImapUid>{4294967293, 4294967294, 4294967295}), parsed);
+  parsed.Clear();
+  // Keep the existing repeated-endpoint behavior without uint32 overflow.
+  ParseUidString("4294967295:4294967295", parsed);
+  EXPECT_EQ((nsTArray<ImapUid>{4294967295, 4294967295}), parsed);
+  parsed.Clear();
+  ParseUidString("42:42", parsed);
+  EXPECT_EQ((nsTArray<ImapUid>{42, 42}), parsed);
+  parsed.Clear();
+  ParseUidString("4294967295:4294967293", parsed);
+  EXPECT_EQ((nsTArray<ImapUid>{4294967295, 4294967294, 4294967293}), parsed);
+  parsed.Clear();
+  ParseUidString("1005:1003", parsed);
+  EXPECT_EQ((nsTArray<ImapUid>{1005, 1004, 1003}), parsed);
 }

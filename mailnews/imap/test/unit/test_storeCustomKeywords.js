@@ -1123,6 +1123,152 @@ async function checkKeywordChangedEpoch() {
   }
 }
 
+add_task(async function test_rawKeywordStoreKeepsUncachedUids() {
+  const name = "raw-uncached-keywords";
+  const remote = IMAPPump.daemon.createMailbox(name, {
+    subscribed: true,
+    uidvalidity: 8201,
+  });
+  const text = uid =>
+    [
+      "From: uncached@example.invalid",
+      "To: user@example.invalid",
+      `Message-ID: <uncached-keyword-${uid}@example.invalid>`,
+      "Subject: Retain every requested UID",
+      "",
+      `Literal uncached UID ${uid} body.`,
+      "",
+    ].join("\r\n");
+  const known = new ImapMessage(
+    "data:text/plain;base64," + btoa(text(1001)),
+    1001,
+    []
+  );
+  remote.addMessage(known);
+  remote.uidnext = 1002;
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const folder = IMAPPump.incomingServer.rootFolder
+    .getChildNamed(name)
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  Assert.equal(
+    folder.msgStore.storeType,
+    IMAPPump.incomingServer.msgStore.storeType
+  );
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  folder.updateFolderWithListener(null, selected);
+  await selected.promise;
+  const header = folder.msgDatabase.getMsgHdrForMessageID(
+    "uncached-keyword-1001@example.invalid"
+  );
+  Assert.ok(header);
+  const key = header.messageKey;
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    Assert.notEqual(key, 1001);
+  }
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 8201);
+  const downloaded = new PromiseTestUtils.PromiseUrlListener();
+  folder.downloadAllForOffline(downloaded, null);
+  await downloaded.promise;
+  const token = header.storeToken;
+  Assert.ok(token);
+  const readBody = () => {
+    const stream = folder.getMsgInputStream(header);
+    try {
+      let bytes = "";
+      while (stream.available()) {
+        bytes += NetUtil.readInputStreamToString(stream, stream.available());
+      }
+      return bytes;
+    } finally {
+      stream.close();
+    }
+  };
+  const bytes = readBody();
+  Assert.ok(bytes.includes("Literal uncached UID 1001 body."));
+  const flags = [...known.flags];
+  // Real arrivals after SELECT. Do not reset or manufacture the client cache.
+  for (const uid of [1003, 1004, 1005]) {
+    remote.addMessage(
+      new ImapMessage("data:text/plain;base64," + btoa(text(uid)), uid, [])
+    );
+  }
+  remote.uidnext = 1006;
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalStore = proto.STORE;
+  const commands = [];
+  proto.STORE = function (args, isUid) {
+    Assert.equal(this._selectedMailbox, remote);
+    Assert.ok(isUid);
+    commands.push([String(args[0]), args[1]]);
+    return originalStore.call(this, args, isUid);
+  };
+  try {
+    for (const [uids, keyword] of [
+      ["1003,1005", "uncached"],
+      ["1005:1003", "reverserange"],
+    ]) {
+      const calls = { starts: 0, stops: 0 };
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStartRunningUrl() {
+          calls.starts++;
+        },
+        OnStopRunningUrl() {
+          calls.stops++;
+        },
+      });
+      const uri = MailServices.imap.storeCustomKeywords(
+        folder,
+        null,
+        keyword,
+        "",
+        uids
+      );
+      uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(listener);
+      await listener.promise;
+      Assert.deepEqual(calls, { starts: 1, stops: 1 });
+      if (keyword == "uncached") {
+        Assert.deepEqual(commands, [["1003,1005", "+FLAGS"]]);
+        Assert.deepEqual(
+          remote._messages[2].flags,
+          [],
+          "UID1004 was not requested"
+        );
+      }
+    }
+    Assert.deepEqual(commands, [
+      ["1003,1005", "+FLAGS"],
+      ["1005,1004,1003", "+FLAGS"],
+    ]);
+    Assert.deepEqual(
+      remote._messages.map(message => message.uid),
+      [1001, 1003, 1004, 1005]
+    );
+    Assert.deepEqual(known.flags, flags);
+    for (const message of remote._messages) {
+      Assert.equal(message.getText(), text(message.uid));
+      if (message.uid != 1001) {
+        Assert.deepEqual(
+          message.flags,
+          message.uid == 1004 ? ["Reverserange"] : ["Uncached", "Reverserange"]
+        );
+      }
+    }
+    Assert.equal(header.messageKey, key);
+    Assert.ok(folder.msgDatabase.containsKey(key));
+    Assert.equal(header.storeToken, token);
+    Assert.equal(readBody(), bytes);
+    Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 8201);
+  } finally {
+    proto.STORE = originalStore;
+  }
+});
+
 add_task(function test_rejectsRetiredBindings() {
   const folder = IMAPPump.inbox;
   const header = folder.msgDatabase.getMsgHdrForMessageID(

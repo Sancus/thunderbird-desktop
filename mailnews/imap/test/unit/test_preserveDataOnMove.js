@@ -16,7 +16,27 @@ var gMessage = "bugmail10"; // message file used as the test message
 var gSubfolder;
 
 add_setup(function () {
+  Services.prefs.setCharPref(
+    "mail.server.default.storeContractID",
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
   setupIMAPPump();
+  const databaseService = Cc[
+    "@mozilla.org/msgDatabase/msgDBService;1"
+  ].getService(Ci.nsIMsgDBService);
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && databaseService instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    "The active backend matches the startup configuration"
+  );
+  Assert.equal(
+    IMAPPump.incomingServer.msgStore.storeType,
+    {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[Services.prefs.getCharPref("mail.serverDefaultStoreContractID")],
+    "The copy control uses the configured body store"
+  );
   Services.prefs.setBoolPref(
     "mail.server.default.autosync_offline_stores",
     false

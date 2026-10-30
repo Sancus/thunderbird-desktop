@@ -256,47 +256,23 @@ void AllocateImapUidString(const ImapUid* msgUids, uint32_t& msgCount,
   ImapUid startSequence = (msgCount > 0) ? msgUids[0] : 0xFFFFFFFF;
   ImapUid curSequenceEnd = startSequence;
   uint32_t total = msgCount;
-  int32_t curFlagStateIndex = -1;
-
-  // a partial fetch flag state doesn't help us, so don't use it.
-  if (flagState && flagState->GetPartialUIDFetch()) flagState = nullptr;
+  // Cached sequence adjacency is not membership in this request. Never add
+  // intermediate UIDs to a range, or omit an input absent from the cache.
+  // Retain the existing non-null flagState convention for bounded chunks;
+  // partial and empty caches need the same bound without consulting their data.
 
   for (uint32_t keyIndex = 0; keyIndex < total; keyIndex++) {
     ImapUid curUid = msgUids[keyIndex];
     ImapUid nextUid =
         (keyIndex + 1 < total) ? msgUids[keyIndex + 1] : 0xFFFFFFFF;
-    bool lastKey = (nextUid == 0xFFFFFFFF);
+    bool lastKey = (keyIndex + 1 == total);
 
     if (lastKey) curSequenceEnd = curUid;
 
     if (!lastKey) {
       if (nextUid == curSequenceEnd + 1) {
         curSequenceEnd = nextUid;
-        curFlagStateIndex++;
         continue;
-      }
-      if (flagState) {
-        if (curFlagStateIndex == -1) {
-          bool foundIt;
-          flagState->GetMessageFlagsFromUID(curSequenceEnd, &foundIt,
-                                            &curFlagStateIndex);
-          if (!foundIt) {
-            NS_WARNING("flag state missing key");
-            // The start of this sequence is missing from flag state, so move
-            // on to the next key.
-            curFlagStateIndex = -1;
-            curSequenceEnd = startSequence = nextUid;
-            continue;
-          }
-        }
-        curFlagStateIndex++;
-        ImapUid nextUidInFlagState;
-        nsresult rv =
-            flagState->GetUidOfMessage(curFlagStateIndex, &nextUidInFlagState);
-        if (NS_SUCCEEDED(rv) && nextUidInFlagState == nextUid) {
-          curSequenceEnd = nextUid;
-          continue;
-        }
       }
     }
     if (curSequenceEnd > startSequence) {
@@ -305,12 +281,10 @@ void AllocateImapUidString(const ImapUid* msgUids, uint32_t& msgCount,
       returnString.AppendInt((int64_t)curSequenceEnd);
       startSequence = nextUid;
       curSequenceEnd = startSequence;
-      curFlagStateIndex = -1;
     } else {
       startSequence = nextUid;
       curSequenceEnd = startSequence;
       returnString.AppendInt((int64_t)msgUids[keyIndex]);
-      curFlagStateIndex = -1;
     }
     // check if we've generated too long a string - if there's no flag state,
     // it means we just need to go ahead and generate a too long string
@@ -347,12 +321,23 @@ void ParseUidString(const char* uidString, nsTArray<ImapUid>& uids) {
     // stops at non-numeric chars.
     curToken = strtoul(currentKeyToken, nullptr, 10);
     if (isRange) {
-      while (saveStartToken < curToken) uids.AppendElement(saveStartToken++);
+      // Increment only below the endpoint. MAX:MAX must not wrap its start
+      // to zero and attempt to expand the entire UID space.
+      while (saveStartToken < curToken) {
+        ++saveStartToken;
+        if (saveStartToken < curToken) uids.AppendElement(saveStartToken);
+      }
+      // IMAP ranges are inclusive in either direction. Keep invalid UID zero
+      // out of reverse expansion rather than treating it as a range endpoint.
+      while (curToken && saveStartToken > curToken) {
+        --saveStartToken;
+        if (saveStartToken > curToken) uids.AppendElement(saveStartToken);
+      }
     }
     uids.AppendElement(curToken);
     isRange = (curChar == ':');
     if (isRange) {
-      saveStartToken = curToken + 1;
+      saveStartToken = curToken;
     }
   }
 }

@@ -5685,8 +5685,8 @@ void nsImapProtocol::PercentProgressUpdateEvent(nsACString const& fmtStringName,
 void nsImapProtocol::Store(const nsCString& messageList,
                            const char* messageData, bool idsAreUid) {
   if (NS_FAILED(m_mailboxUpdateResult)) return;
-  // turn messageList back into key array and then back into a message id list,
-  // but use the flag state to handle ranges correctly.
+  // Split the requested UIDs into bounded chunks using only numeric adjacency.
+  // The cached flag state must not add or drop members of this request.
   nsCString messageIdList;
   nsTArray<ImapUid> msgUids;
   if (idsAreUid) ParseUidString(messageList.get(), msgUids);
@@ -8320,8 +8320,8 @@ void nsImapProtocol::Copy(const char* messageList,
   nsCString escapedDestination;
   CreateEscapedMailboxName(destinationMailbox, escapedDestination);
 
-  // turn messageList back into key array and then back into a message id list,
-  // but use the flag state to handle ranges correctly.
+  // Split the requested UIDs into bounded chunks using only numeric adjacency.
+  // The cached flag state must not add or drop members of this request.
   nsCString messageIdList;
   nsTArray<ImapUid> msgUids;
   if (idsAreUid) ParseUidString(messageList, msgUids);

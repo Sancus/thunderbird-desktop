@@ -4840,7 +4840,9 @@ nsresult MessageDatabase::SetMessagePriority(nsMsgKey key,
 
 nsresult MessageDatabase::SetMessageOfflineMessageSize(nsMsgKey key,
                                                        uint64_t size) {
-  return SetMessageProperty(key, "offlineMessageSize"_ns, (uint32_t)size);
+  NS_ENSURE_TRUE(size <= UINT32_MAX, NS_ERROR_ILLEGAL_VALUE);
+  return SetMessageProperty(key, "offlineMessageSize"_ns,
+                            static_cast<uint32_t>(size));
 }
 
 nsresult MessageDatabase::SetMessageDate(nsMsgKey key, PRTime date) {
@@ -4869,7 +4871,8 @@ nsresult MessageDatabase::SetMessageDate(nsMsgKey key, PRTime date) {
 }
 
 nsresult MessageDatabase::SetMessageSize(nsMsgKey key, uint64_t size) {
-  return SetMessageProperty(key, "messageSize"_ns, (uint32_t)size);
+  NS_ENSURE_TRUE(size <= UINT32_MAX, NS_ERROR_ILLEGAL_VALUE);
+  return SetMessageProperty(key, "messageSize"_ns, static_cast<uint32_t>(size));
 }
 
 nsresult MessageDatabase::SetMessageLineCount(nsMsgKey key, uint32_t count) {

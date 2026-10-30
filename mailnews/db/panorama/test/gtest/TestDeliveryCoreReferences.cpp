@@ -9927,4 +9927,170 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_EQ("before"_ns, text);
 }
 
+TEST_F(DeliveryCoreReferences, NativeSizeSettersKeepUint32Boundaries) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey published, staged;
+  ASSERT_EQ(NS_OK, Add("size-published@invalid"_ns, {}, published));
+  RawHdr raw;
+  raw.messageId = "size-staged@invalid"_ns;
+  raw.references = {"first@invalid"_ns, "second@invalid"_ns,
+                    "first@invalid"_ns};
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  for (nsMsgKey key : {published, staged}) {
+    SCOPED_TRACE(key);
+    for (uint64_t value : {uint64_t(0), uint64_t(1), uint64_t(0x80000000),
+                           uint64_t(UINT32_MAX)}) {
+      ASSERT_EQ(NS_OK, db.SetMessageSize(key, value));
+      ASSERT_EQ(NS_OK, db.SetMessageOfflineMessageSize(key, value));
+      uint64_t actual = 17;
+      ASSERT_EQ(NS_OK, db.GetMessageSize(key, actual));
+      EXPECT_EQ(value, actual);
+      actual = 23;
+      ASSERT_EQ(NS_OK, db.GetMessageOfflineMessageSize(key, actual));
+      EXPECT_EQ(value, actual);
+    }
+    for (uint64_t overflow : {uint64_t(UINT32_MAX) + 1, UINT64_MAX}) {
+      EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE, db.SetMessageSize(key, overflow));
+      uint64_t actual = 17;
+      ASSERT_EQ(NS_OK, db.GetMessageSize(key, actual));
+      EXPECT_EQ(uint64_t(UINT32_MAX), actual);
+      EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+                db.SetMessageOfflineMessageSize(key, overflow));
+      actual = 23;
+      ASSERT_EQ(NS_OK, db.GetMessageOfflineMessageSize(key, actual));
+      EXPECT_EQ(uint64_t(UINT32_MAX), actual);
+    }
+  }
+  ASSERT_EQ(NS_OK, db.PublishMessage(staged, false));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  for (nsMsgKey key : {published, staged}) {
+    uint64_t actual = 17;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageSize(key, actual));
+    EXPECT_EQ(uint64_t(UINT32_MAX), actual);
+    actual = 23;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageOfflineMessageSize(key, actual));
+    EXPECT_EQ(uint64_t(UINT32_MAX), actual);
+  }
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, Stored(staged, references));
+  EXPECT_EQ((nsTArray<nsCString>{"first@invalid"_ns, "second@invalid"_ns,
+                                 "first@invalid"_ns}),
+            references);
+}
+
+TEST_F(DeliveryCoreReferences,
+       NativeSizeOverflowKeepsCallerTransactionAndStoredValues) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("size-transaction@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, db.SetMessageSize(key, 23));
+  ASSERT_EQ(NS_OK, db.SetMessageOfflineMessageSize(key, 17));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+  ASSERT_EQ(NS_OK, db.SetMessageSize(key, 42));
+  ASSERT_EQ(NS_OK, db.SetMessageOfflineMessageSize(key, 0x80000000));
+  ASSERT_EQ(NS_OK,
+            db.SetMessageProperty(key, "caller-control"_ns, "pending"_ns));
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE, db.SetMessageSize(key, UINT64_MAX));
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+            db.SetMessageOfflineMessageSize(key, uint64_t(UINT32_MAX) + 1));
+  // Body getters require committed state; inspect the caller's SQL directly.
+  {
+    nsCOMPtr<mozIStorageStatement> pending;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                         "SELECT value FROM message_properties WHERE id=:id "
+                         "AND name IN('messageSize','offlineMessageSize') "
+                         "ORDER BY name"_ns,
+                         getter_AddRefs(pending)));
+    ASSERT_EQ(NS_OK, pending->BindInt64ByName("id"_ns, key));
+    bool more = false;
+    ASSERT_EQ(NS_OK, pending->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    int64_t value = 0;
+    ASSERT_EQ(NS_OK, pending->GetInt64(0, &value));
+    EXPECT_EQ(int64_t(42), value);
+    ASSERT_EQ(NS_OK, pending->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    ASSERT_EQ(NS_OK, pending->GetInt64(0, &value));
+    EXPECT_EQ(int64_t(0x80000000), value);
+    ASSERT_EQ(NS_OK, pending->ExecuteStep(&more));
+    EXPECT_FALSE(more);
+  }
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString control;
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(key, "caller-control"_ns, control));
+  EXPECT_EQ("pending"_ns, control);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  rollback.release();
+  uint64_t actual = 0;
+  ASSERT_EQ(NS_OK, db.GetMessageSize(key, actual));
+  EXPECT_EQ(23u, actual);
+  ASSERT_EQ(NS_OK, db.GetMessageOfflineMessageSize(key, actual));
+  EXPECT_EQ(17u, actual);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(key, names));
+  EXPECT_FALSE(names.Contains("caller-control"_ns));
+}
+
+TEST_F(DeliveryCoreReferences, NativeSizeSettersPropagateReachedWriteErrors) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey published, staged;
+  ASSERT_EQ(NS_OK, Add("size-fault-published@invalid"_ns, {}, published));
+  RawHdr raw;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  for (nsMsgKey key : {published, staged}) {
+    ASSERT_EQ(NS_OK, db.SetMessageSize(key, 23));
+    ASSERT_EQ(NS_OK, db.SetMessageOfflineMessageSize(key, 17));
+  }
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK, Connection()->CreateFunction("size_fault"_ns, 1, witness));
+  auto remove = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RemoveFunction("size_fault"_ns)); });
+  for (const auto& table :
+       {"message_properties", "staged_message_properties"}) {
+    nsAutoCString sql("CREATE TEMP TRIGGER fail_size_");
+    sql.Append(table);
+    sql.AppendLiteral(" BEFORE INSERT ON ");
+    sql.Append(table);
+    sql.AppendLiteral(
+        " WHEN NEW.name IN('messageSize','offlineMessageSize') "
+        "BEGIN SELECT size_fault(NEW.id); "
+        "SELECT RAISE(ABORT,'size write'); END");
+    ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(sql));
+  }
+  for (nsMsgKey key : {published, staged}) {
+    uint32_t before = witness->mCalls;
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, db.SetMessageSize(key, UINT32_MAX));
+    EXPECT_EQ(before + 1, witness->mCalls);
+    EXPECT_EQ(int64_t(key), witness->mLastKey);
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              db.SetMessageOfflineMessageSize(key, UINT32_MAX));
+    EXPECT_EQ(before + 2, witness->mCalls);
+    EXPECT_EQ(int64_t(key), witness->mLastKey);
+    uint64_t actual = 0;
+    ASSERT_EQ(NS_OK, db.GetMessageSize(key, actual));
+    EXPECT_EQ(23u, actual);
+    actual = 0;
+    ASSERT_EQ(NS_OK, db.GetMessageOfflineMessageSize(key, actual));
+    EXPECT_EQ(17u, actual);
+    bool active = true;
+    ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+  }
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_size_message_properties"_ns));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_size_staged_message_properties"_ns));
+  ASSERT_EQ(NS_OK, db.SetMessageSize(published, UINT32_MAX));
+  ASSERT_EQ(NS_OK, db.SetMessageOfflineMessageSize(staged, UINT32_MAX));
+}
+
 }  // namespace mozilla::mailnews

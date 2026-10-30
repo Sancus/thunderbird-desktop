@@ -479,6 +479,7 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult SetMessageFlag(nsMsgKey key, uint32_t flag, bool value);
   nsresult SetMessagePriority(nsMsgKey key, nsMsgPriorityValue priority);
   nsresult SetMessageDate(nsMsgKey key, PRTime date);
+  // Size setters retain the public/stored uint32 width; overflow is rejected.
   nsresult SetMessageSize(nsMsgKey key, uint64_t size);
   nsresult SetMessageLineCount(nsMsgKey key, uint32_t size);
   nsresult SetMessageOfflineMessageSize(nsMsgKey key, uint64_t size);

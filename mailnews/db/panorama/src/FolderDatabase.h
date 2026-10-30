@@ -19,6 +19,20 @@ namespace mozilla::mailnews {
 
 struct FolderImportProperty;
 
+// Captured physical targets for one server-confirmed IMAP relocation. Wire
+// paths are supplied by the protocol owner, never derived from logical paths.
+struct ImapFolderRelocationEntry {
+  uint64_t id{0};
+  uint64_t expectedParent{0};
+  nsCString expectedName;
+  nsCString onlineName;
+};
+
+struct ImapFolderRelocationMetadata {
+  nsTArray<ImapFolderRelocationEntry> folders;  // Root and every descendant.
+  Maybe<nsCString> displayName;  // Root only; Nothing preserves presence/text.
+};
+
 class FolderDatabase : public nsIFolderDatabase {
  public:
   NS_DECL_THREADSAFE_ISUPPORTS
@@ -35,6 +49,15 @@ class FolderDatabase : public nsIFolderDatabase {
                           uint64_t expectedParent,
                           const nsACString& expectedName, uint64_t newParent,
                           const nsACString& newName);
+
+  // Same guards/transaction as RelocateFolder, with complete physical subtree
+  // metadata. Writes onlineName/mailboxName, optional root displayName, and
+  // clears only Favorite|CheckNew when reparenting beneath actual Trash.
+  nsresult RelocateImapFolder(const nsACString& expectedSourceId,
+                              uint64_t folderId, uint64_t expectedParent,
+                              const nsACString& expectedName,
+                              uint64_t newParent, const nsACString& newName,
+                              const ImapFolderRelocationMetadata& metadata);
 
   Result<uint64_t, nsresult> GetFolderParent(uint64_t folderId);
   // Returns children sorted. Can pass folderId=0 to get root folders.
@@ -100,6 +123,17 @@ class FolderDatabase : public nsIFolderDatabase {
                                     uint64_t folderId, uint64_t expectedParent,
                                     const nsACString& expectedName,
                                     uint64_t newParent);
+
+  nsresult RelocateFolderInternal(const nsACString& expectedSourceId,
+                                  uint64_t folderId, uint64_t expectedParent,
+                                  const nsACString& expectedName,
+                                  uint64_t newParent, const nsACString& newName,
+                                  const ImapFolderRelocationMetadata* metadata);
+  nsresult ValidateImapFolderRelocation(
+      uint64_t folderId, const ImapFolderRelocationMetadata& metadata);
+  nsresult WriteImapFolderRelocation(
+      uint64_t folderId, uint64_t expectedParent, uint64_t newParent,
+      const ImapFolderRelocationMetadata& metadata);
 
   nsresult InternalLoadFolders();
 

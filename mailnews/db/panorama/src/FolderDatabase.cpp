@@ -472,6 +472,108 @@ nsresult FolderDatabase::RelocateFolder(const nsACString& expectedSourceId,
                                         const nsACString& expectedName,
                                         uint64_t newParent,
                                         const nsACString& newName) {
+  return RelocateFolderInternal(expectedSourceId, folderId, expectedParent,
+                                expectedName, newParent, newName, nullptr);
+}
+
+nsresult FolderDatabase::RelocateImapFolder(
+    const nsACString& expectedSourceId, uint64_t folderId,
+    uint64_t expectedParent, const nsACString& expectedName, uint64_t newParent,
+    const nsACString& newName, const ImapFolderRelocationMetadata& metadata) {
+  return RelocateFolderInternal(expectedSourceId, folderId, expectedParent,
+                                expectedName, newParent, newName, &metadata);
+}
+
+nsresult FolderDatabase::ValidateImapFolderRelocation(
+    uint64_t folderId, const ImapFolderRelocationMetadata& metadata) {
+  nsTArray<uint64_t> remaining = MOZ_TRY(GetFolderDescendants(folderId));
+  remaining.AppendElement(folderId);
+  NS_ENSURE_TRUE(remaining.Length() == metadata.folders.Length(),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CheckImapRelocationTarget"_ns,
+      "SELECT parent,name FROM folders WHERE id=:id"_ns, getter_AddRefs(stmt)));
+  for (const auto& entry : metadata.folders) {
+    NS_ENSURE_TRUE(entry.id && entry.id <= INT64_MAX && entry.expectedParent &&
+                       entry.expectedParent <= INT64_MAX &&
+                       !entry.onlineName.IsEmpty(),
+                   NS_ERROR_INVALID_ARG);
+    NS_ENSURE_TRUE(remaining.RemoveElement(entry.id), NS_ERROR_NOT_AVAILABLE);
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, entry.id));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int32_t parentType, nameType;
+    int64_t parent;
+    nsCString name;
+    MOZ_TRY(stmt->GetTypeOfIndex(0, &parentType));
+    MOZ_TRY(stmt->GetTypeOfIndex(1, &nameType));
+    MOZ_TRY(stmt->GetInt64(0, &parent));
+    MOZ_TRY(stmt->GetUTF8String(1, name));
+    NS_ENSURE_TRUE(parentType == mozIStorageStatement::VALUE_TYPE_INTEGER &&
+                       nameType == mozIStorageStatement::VALUE_TYPE_TEXT &&
+                       parent > 0,
+                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(
+        uint64_t(parent) == entry.expectedParent && name == entry.expectedName,
+        NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  return NS_OK;
+}
+
+nsresult FolderDatabase::WriteImapFolderRelocation(
+    uint64_t folderId, uint64_t expectedParent, uint64_t newParent,
+    const ImapFolderRelocationMetadata& metadata) {
+  for (const auto& entry : metadata.folders) {
+    MOZ_TRY(SetFolderProperty(entry.id, "onlineName"_ns, entry.onlineName));
+    MOZ_TRY(SetFolderProperty(entry.id, "mailboxName"_ns, entry.onlineName));
+  }
+  if (metadata.displayName) {
+    MOZ_TRY(SetFolderProperty(folderId, "imapDisplayName"_ns,
+                              *metadata.displayName));
+  }
+  if (expectedParent != newParent) {
+    nsTArray<uint64_t> ancestors = MOZ_TRY(GetFolderAncestors(newParent));
+    ancestors.AppendElement(newParent);
+    bool trash = false;
+    for (uint64_t ancestor : ancestors) {
+      uint32_t flags = MOZ_TRY(GetFolderFlags(ancestor));
+      trash |= bool(flags & nsMsgFolderFlags::Trash);
+    }
+    if (trash) {
+      // Generic UpdateFlags publishes immediately and can join caller SQL. This
+      // operation owns SQL, so keep this write private until confirmed commit.
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ClearImapRelocationTrashFlags"_ns,
+          "UPDATE folders SET flags=flags & ~:clear WHERE id=:id RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName(
+          "clear"_ns, nsMsgFolderFlags::Favorite | nsMsgFolderFlags::CheckNew));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+      int64_t storedId;
+      MOZ_TRY(stmt->GetInt64(0, &storedId));
+      NS_ENSURE_TRUE(storedId > 0 && uint64_t(storedId) == folderId,
+                     NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+  return NS_OK;
+}
+
+nsresult FolderDatabase::RelocateFolderInternal(
+    const nsACString& expectedSourceId, uint64_t folderId,
+    uint64_t expectedParent, const nsACString& expectedName, uint64_t newParent,
+    const nsACString& newName, const ImapFolderRelocationMetadata* metadata) {
   MOZ_TRY(RequireCommittedHierarchyMutation());
   NS_ENSURE_TRUE(!expectedSourceId.IsEmpty() && folderId &&
                      folderId <= INT64_MAX && expectedParent <= INT64_MAX &&
@@ -480,7 +582,15 @@ nsresult FolderDatabase::RelocateFolder(const nsACString& expectedSourceId,
   nsCString normalized = MOZ_TRY(DatabaseUtils::Normalize(newName));
   MOZ_TRY(ValidateFolderRelocation(expectedSourceId, folderId, expectedParent,
                                    expectedName, newParent));
-  if (newParent == expectedParent && normalized == expectedName) {
+  if (metadata) {
+    NS_ENSURE_TRUE(normalized == expectedName || metadata->displayName,
+                   NS_ERROR_INVALID_ARG);
+    NS_ENSURE_TRUE(newParent == expectedParent || normalized != expectedName ||
+                       !metadata->displayName,
+                   NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ValidateImapFolderRelocation(folderId, *metadata));
+  }
+  if (!metadata && newParent == expectedParent && normalized == expectedName) {
     return NS_OK;
   }
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
@@ -490,6 +600,7 @@ nsresult FolderDatabase::RelocateFolder(const nsACString& expectedSourceId,
     // committing a caller's transaction or relying on a stale wrapper/cache.
     MOZ_TRY(ValidateFolderRelocation(expectedSourceId, folderId, expectedParent,
                                      expectedName, newParent));
+    if (metadata) MOZ_TRY(ValidateImapFolderRelocation(folderId, *metadata));
     {
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(DatabaseCore::GetStatement(
@@ -513,6 +624,10 @@ nsresult FolderDatabase::RelocateFolder(const nsACString& expectedSourceId,
                      NS_ERROR_FILE_CORRUPTED);
       MOZ_TRY(stmt->ExecuteStep(&more));
       NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+    if (metadata) {
+      MOZ_TRY(WriteImapFolderRelocation(folderId, expectedParent, newParent,
+                                        *metadata));
     }
     return connection->CommitTransaction();
   }();

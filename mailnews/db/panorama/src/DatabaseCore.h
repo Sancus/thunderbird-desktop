@@ -23,6 +23,7 @@
 class mozIStorageConnection;
 class mozIStorageStatement;
 class nsIFile;
+class nsMsgDBFolder;
 
 namespace mozilla::mailnews {
 
@@ -126,6 +127,7 @@ class DatabaseCore : public nsIDatabaseCore,
   virtual ~DatabaseCore() {};
 
  private:
+  friend class ::nsMsgDBFolder;
   friend class DeliveryCoreMessageExistence;
   friend class DeliveryCoreReferences;
   friend class DeliveryCoreProperties;
@@ -152,12 +154,13 @@ class DatabaseCore : public nsIDatabaseCore,
   // transaction without owning it; a rolled-back source change leaves that
   // captured identity stale. Never creates/opens a core or rebinds a wrapper.
   // Failure leaves output unchanged. Public GetSourceId still requires no TX.
-  nsresult ReadSourceIdForFolderAdmission(nsACString &output);
+  nsresult ReadSourceIdForFolderAdmission(nsACString& output);
 
   static nsresult EnsureConnection();
   static nsresult CreateNewDatabase();
   static nsresult UpgradeSchema();
-  // Caller owns the insert transaction; the insert advances the high-water mark.
+  // Caller owns the insert transaction; the insert advances the high-water
+  // mark.
   static nsresult GetNextMessageKey(nsMsgKey& key);
   nsresult ImportFolderSnapshotFromFile(nsIFile* source,
                                         const FolderImportSnapshot& input,

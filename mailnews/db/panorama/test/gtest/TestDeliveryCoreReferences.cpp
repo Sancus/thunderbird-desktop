@@ -1541,6 +1541,44 @@ class DeliveryCoreReferences : public testing::Test {
     return core->ReadSourceIdForFolderAdmission(output);
   }
 
+  nsresult ImapRelocationProperty(uint64_t folder, const nsACString& name,
+                                  Maybe<nsCString>& output) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(mConnection->CreateStatement(
+        "SELECT value FROM folder_properties WHERE id=:id AND name=:name"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, folder));
+    MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    Maybe<nsCString> found;
+    if (more) {
+      int32_t type;
+      nsCString text;
+      MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+      NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                     NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(stmt->GetUTF8String(0, text));
+      found = Some(std::move(text));
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+    output = std::move(found);
+    return NS_OK;
+  }
+
+  nsresult SeedImapRelocationProperty(uint64_t folder, const nsACString& name,
+                                      const nsACString& text) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(mConnection->CreateStatement(
+        "REPLACE INTO folder_properties(id,name,value) VALUES(:id,:name,:value)"_ns,
+        getter_AddRefs(stmt)));
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, folder));
+    MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, name));
+    MOZ_TRY(stmt->BindUTF8StringByName("value"_ns, text));
+    return stmt->Execute();
+  }
+
   nsresult RemovalMetric(uint64_t folder, int64_t& output) {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(mConnection->CreateStatement(
@@ -12471,6 +12509,262 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_FALSE(folder);
   after = Connection();
   EXPECT_EQ(before, after);
+}
+
+TEST_F(DeliveryCoreReferences, ImapFolderRelocationSettlesCompleteMetadata) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t left, trash, target, root, child, leaf;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Left"_ns, &left));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Trash"_ns, &trash));
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(trash, nsMsgFolderFlags::Trash));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(trash, "Nested"_ns, &target));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Old"_ns, &root));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Child"_ns, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(child, "Leaf"_ns, &leaf));
+  const uint32_t flags = nsMsgFolderFlags::Favorite |
+                         nsMsgFolderFlags::CheckNew | nsMsgFolderFlags::Offline;
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(root, flags));
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(child, flags));
+  ASSERT_EQ(NS_OK, SeedImapRelocationProperty(root, "imapDisplayName"_ns,
+                                              "Old display"_ns));
+  ASSERT_EQ(NS_OK,
+            SeedImapRelocationProperty(child, "imapDisplayName"_ns, ""_ns));
+  ASSERT_EQ(NS_OK, SeedImapRelocationProperty(root, "Exact"_ns, "00042"_ns));
+  ASSERT_EQ(NS_OK, SeedImapRelocationProperty(leaf, "empty"_ns, ""_ns));
+  nsMsgKey key;
+  const nsTArray<nsCString> references{"first"_ns, "last"_ns, "first"_ns};
+  ASSERT_EQ(NS_OK, AddAt(leaf, "imap-relocation@invalid"_ns, references, key));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageStoreToken(key, "body"_ns));
+  ASSERT_EQ(NS_OK, folders.SetFolderUidValidity(leaf, 57));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().BindMessageToServerUid(key, leaf, 57, 91));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  ImapFolderRelocationMetadata metadata;
+  metadata.folders = {
+      {root, left, "Old"_ns, "Left/wire-&AOE-"_ns},
+      {child, root, "Child"_ns, "Left/wire-&AOE-/Child"_ns},
+      {leaf, child, "Leaf"_ns, "Left/wire-&AOE-/Child/Leaf"_ns}};
+  metadata.displayName = Some(nsCString("folder \xC3\xA1"_ns));
+  ASSERT_EQ(NS_OK, folders.RelocateImapFolder(source, root, left, "Old"_ns,
+                                              left, "wire-&AOE-"_ns, metadata));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(root, left, "wire-&AOE-"_ns));
+  auto storedFlags = folders.GetFolderFlags(root);
+  ASSERT_TRUE(storedFlags.isOk());
+  EXPECT_EQ(flags, storedFlags.unwrap());
+  metadata.folders[0].expectedName = "wire-&AOE-"_ns;
+  metadata.folders[0].onlineName = "Trash/Nested/wire-&AOE-"_ns;
+  metadata.folders[1].onlineName = "Trash/Nested/wire-&AOE-/Child"_ns;
+  metadata.folders[2].onlineName = "Trash/Nested/wire-&AOE-/Child/Leaf"_ns;
+  metadata.displayName.reset();
+  ASSERT_EQ(NS_OK,
+            folders.RelocateImapFolder(source, root, left, "wire-&AOE-"_ns,
+                                       target, "wire-&AOE-"_ns, metadata));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(root, target, "wire-&AOE-"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, root, "Child"_ns));
+  for (const auto& entry : metadata.folders) {
+    for (const auto& name : {"onlineName"_ns, "mailboxName"_ns}) {
+      Maybe<nsCString> text;
+      ASSERT_EQ(NS_OK, ImapRelocationProperty(entry.id, name, text));
+      ASSERT_TRUE(text);
+      EXPECT_EQ(entry.onlineName, *text);
+    }
+  }
+  Maybe<nsCString> text;
+  ASSERT_EQ(NS_OK, ImapRelocationProperty(root, "imapDisplayName"_ns, text));
+  ASSERT_TRUE(text);
+  EXPECT_EQ("folder \xC3\xA1"_ns, *text);
+  ASSERT_EQ(NS_OK, ImapRelocationProperty(child, "imapDisplayName"_ns, text));
+  ASSERT_TRUE(text);
+  EXPECT_TRUE(text->IsEmpty());
+  ASSERT_EQ(NS_OK, ImapRelocationProperty(leaf, "imapDisplayName"_ns, text));
+  EXPECT_TRUE(text.isNothing());
+  ASSERT_EQ(NS_OK, ImapRelocationProperty(root, "Exact"_ns, text));
+  ASSERT_TRUE(text);
+  EXPECT_EQ("00042"_ns, *text);
+  ASSERT_EQ(NS_OK, ImapRelocationProperty(leaf, "empty"_ns, text));
+  ASSERT_TRUE(text);
+  EXPECT_TRUE(text->IsEmpty());
+  auto rootFlags = mCore->FolderDB().GetFolderFlags(root);
+  auto childFlags = mCore->FolderDB().GetFolderFlags(child);
+  ASSERT_TRUE(rootFlags.isOk());
+  ASSERT_TRUE(childFlags.isOk());
+  EXPECT_EQ(nsMsgFolderFlags::Offline, rootFlags.unwrap());
+  EXPECT_EQ(flags, childFlags.unwrap());
+  nsMsgKey resolved = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(leaf, 57, 91,
+                                                                resolved));
+  EXPECT_EQ(key, resolved);
+  nsCString token;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageStoreToken(key, token));
+  EXPECT_EQ("body"_ns, token);
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, stored));
+  EXPECT_EQ(references, stored);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ImapFolderRelocationRejectsIncompleteAndStaleTargets) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t root, child, target;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Old"_ns, &root));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Child"_ns, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Target"_ns, &target));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  ImapFolderRelocationMetadata valid;
+  valid.folders = {{root, mFolderId, "Old"_ns, "New"_ns},
+                   {child, root, "Child"_ns, "New/Child"_ns}};
+  valid.displayName = Some(nsCString("New display"_ns));
+  uint64_t watermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+  for (uint32_t fault = 0; fault < 7; ++fault) {
+    SCOPED_TRACE(fault);
+    ImapFolderRelocationMetadata metadata;
+    metadata.folders = valid.folders.Clone();
+    metadata.displayName = valid.displayName;
+    if (fault == 0) metadata.folders.RemoveLastElement();
+    if (fault == 1) metadata.folders[1] = metadata.folders[0];
+    if (fault == 2) metadata.folders[1].id = target;
+    if (fault == 3) metadata.folders[1].expectedParent = target;
+    if (fault == 4) metadata.folders[1].expectedName = "stale"_ns;
+    if (fault == 5) metadata.folders[1].onlineName.Truncate();
+    if (fault == 6) metadata.displayName.reset();
+    EXPECT_EQ(fault >= 5 ? NS_ERROR_INVALID_ARG : NS_ERROR_NOT_AVAILABLE,
+              folders.RelocateImapFolder(source, root, mFolderId, "Old"_ns,
+                                         mFolderId, "New"_ns, metadata));
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(root, mFolderId, "Old"_ns));
+    Maybe<nsCString> text;
+    ASSERT_EQ(NS_OK, ImapRelocationProperty(root, "onlineName"_ns, text));
+    EXPECT_TRUE(text.isNothing());
+    uint64_t after;
+    ASSERT_EQ(NS_OK, SearchWatermark(after));
+    EXPECT_EQ(watermark, after);
+  }
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            folders.RelocateImapFolder(source, root, mFolderId, "Old"_ns,
+                                       target, "Old"_ns, valid));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, SetRemovalMetric(root, 17));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            folders.RelocateImapFolder(source, root, mFolderId, "Old"_ns,
+                                       mFolderId, "New"_ns, valid));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  int64_t metric = 0;
+  ASSERT_EQ(NS_OK, RemovalMetric(root, metric));
+  EXPECT_EQ(17, metric);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, RemovalMetric(root, metric));
+  EXPECT_EQ(0, metric);
+}
+
+TEST_F(DeliveryCoreReferences, ImapFolderRelocationMetadataFailuresRollback) {
+  for (bool commitFailure : {false, true}) {
+    SCOPED_TRACE(commitFailure);
+    ASSERT_EQ(NS_OK, Start());
+    auto& folders = mCore->FolderDB();
+    uint64_t parent, root, child, trash;
+    ASSERT_EQ(NS_OK, folders.InsertFolder(
+                         mFolderId, commitFailure ? "Commit"_ns : "Write"_ns,
+                         &parent));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(parent, "Old"_ns, &root));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Child"_ns, &child));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(parent, "Trash"_ns, &trash));
+    ASSERT_EQ(NS_OK, folders.UpdateFlags(trash, nsMsgFolderFlags::Trash));
+    const uint32_t flags =
+        nsMsgFolderFlags::CheckNew | nsMsgFolderFlags::Favorite;
+    ASSERT_EQ(NS_OK, folders.UpdateFlags(root, flags));
+    ASSERT_EQ(NS_OK,
+              SeedImapRelocationProperty(root, "onlineName"_ns, "Old"_ns));
+    ASSERT_EQ(NS_OK,
+              SeedImapRelocationProperty(root, "mailboxName"_ns, "Old"_ns));
+    ASSERT_EQ(NS_OK, SeedImapRelocationProperty(child, "onlineName"_ns,
+                                                "Old/Child"_ns));
+    ASSERT_EQ(NS_OK, SeedImapRelocationProperty(child, "mailboxName"_ns,
+                                                "Old/Child"_ns));
+    nsCString source;
+    ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+    ImapFolderRelocationMetadata metadata;
+    metadata.folders = {{root, parent, "Old"_ns, "Trash/New"_ns},
+                        {child, root, "Child"_ns, "Trash/New/Child"_ns}};
+    metadata.displayName = Some(nsCString("New display"_ns));
+    uint64_t watermark;
+    ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK, mConnection->CreateFunction("imap_metadata_fault"_ns, 1,
+                                                 witness));
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "imap_relocate_parent(id INTEGER PRIMARY KEY); "
+                           "CREATE TEMP TABLE imap_relocate_child(id INTEGER "
+                           "REFERENCES imap_relocate_parent(id) DEFERRABLE "
+                           "INITIALLY DEFERRED)"_ns));
+    }
+    nsAutoCString sql(
+        "CREATE TEMP TRIGGER fail_imap_metadata AFTER INSERT ON "
+        "main.folder_properties WHEN NEW.name='mailboxName' AND NEW.id=");
+    sql.AppendInt(child);
+    sql.AppendLiteral(" BEGIN SELECT imap_metadata_fault(NEW.id); ");
+    sql.Append(commitFailure
+                   ? "INSERT INTO imap_relocate_child VALUES(NEW.id); END"
+                   : "SELECT RAISE(FAIL,'IMAP metadata write'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_imap_metadata"_ns));
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("imap_metadata_fault"_ns));
+    });
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              folders.RelocateImapFolder(source, root, parent, "Old"_ns, trash,
+                                         "New"_ns, metadata));
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(int64_t(child), witness->mLastKey);
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(root, parent, "Old"_ns));
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, root, "Child"_ns));
+    Maybe<nsCString> text;
+    ASSERT_EQ(NS_OK, ImapRelocationProperty(root, "onlineName"_ns, text));
+    ASSERT_TRUE(text);
+    EXPECT_EQ("Old"_ns, *text);
+    ASSERT_EQ(NS_OK, ImapRelocationProperty(child, "mailboxName"_ns, text));
+    ASSERT_TRUE(text);
+    EXPECT_EQ("Old/Child"_ns, *text);
+    ASSERT_EQ(NS_OK, ImapRelocationProperty(root, "imapDisplayName"_ns, text));
+    EXPECT_TRUE(text.isNothing());
+    auto afterFlags = folders.GetFolderFlags(root);
+    ASSERT_TRUE(afterFlags.isOk());
+    EXPECT_EQ(flags, afterFlags.unwrap());
+    uint64_t after;
+    ASSERT_EQ(NS_OK, SearchWatermark(after));
+    EXPECT_EQ(watermark, after);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_imap_metadata"_ns));
+    ASSERT_EQ(NS_OK, folders.RelocateImapFolder(source, root, parent, "Old"_ns,
+                                                trash, "New"_ns, metadata));
+    ASSERT_EQ(NS_OK, mConnection->RemoveFunction("imap_metadata_fault"_ns));
+    cleanup.release();
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(root, trash, "New"_ns));
+    ASSERT_EQ(NS_OK, ImapRelocationProperty(child, "mailboxName"_ns, text));
+    ASSERT_TRUE(text);
+    EXPECT_EQ("Trash/New/Child"_ns, *text);
+    Stop();
+  }
 }
 
 }  // namespace mozilla::mailnews

@@ -3464,3 +3464,145 @@ add_task(function test_junkScoreAnnouncementUsesOwningFolderAndAdmission() {
     otherDB.removeListener(bystander);
   }
 });
+
+add_task(function test_bulkReadCommitsAllRowsBeforeScopedFlagCallbacks() {
+  const local = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const folder = local.createLocalSubfolder("bulk-read-captured");
+  const other = local.createLocalSubfolder("bulk-read-captured-other");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const initial = [0x40000004, 0, Ci.nsMsgMessageFlags.Read];
+  const headers = initial.map((flags, index) => {
+    const draft = db.createNewHdr();
+    draft.messageId = `bulk-captured-${index}@read.invalid`;
+    draft.flags = flags;
+    return db.attachHdr(draft, false);
+  });
+  const foreignDraft = otherDB.createNewHdr();
+  foreignDraft.messageId = "bulk-captured-foreign@read.invalid";
+  const foreign = otherDB.attachHdr(foreignDraft, false);
+  const keys = headers.slice(0, 2).map(header => header.messageKey);
+  Assert.deepEqual(db.getNewList(), keys);
+  const changes = [];
+  const connection = database.connectionForTests;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(header, before, after, instigator) {
+      Assert.strictEqual(instigator, null);
+      Assert.ok(!connection.transactionInProgress);
+      Assert.ok(headers.every(candidate => candidate.isRead));
+      changes.push([header.messageKey, before, after]);
+    },
+  };
+  const bystander = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged() {
+      Assert.ok(false, "Bulk read must not notify another physical folder");
+    },
+  };
+  db.addListener(listener);
+  otherDB.addListener(bystander);
+  try {
+    Assert.deepEqual(
+      db.markAllRead(),
+      keys.toSorted((a, b) => a - b)
+    );
+    Assert.deepEqual(changes, [
+      [keys[0], initial[0], initial[0] | Ci.nsMsgMessageFlags.Read],
+      [keys[1], initial[1], Ci.nsMsgMessageFlags.Read],
+    ]);
+    Assert.deepEqual(db.getNewList(), []);
+    Assert.ok(!db.hasNew());
+    Assert.equal(db.dBFolderInfo.numMessages, 3);
+    Assert.equal(db.dBFolderInfo.numUnreadMessages, 0);
+    Assert.equal(headers[0].flags, initial[0] | Ci.nsMsgMessageFlags.Read);
+    Assert.ok(!foreign.isRead);
+    Assert.deepEqual(otherDB.getNewList(), [foreign.messageKey]);
+    Assert.equal(otherDB.dBFolderInfo.numUnreadMessages, 1);
+    const beforeNoOp = changes.slice();
+    Assert.deepEqual(db.markAllRead(), []);
+    Assert.deepEqual(changes, beforeNoOp, "A no-op has no flag callbacks");
+  } finally {
+    db.removeListener(listener);
+    otherDB.removeListener(bystander);
+  }
+});
+
+add_task(function test_bulkReadFailureAndReentrantCapturedOrder() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("bulk-read-rollback");
+  const db = folder.msgDatabase;
+  const headers = [0, 1].map(index => {
+    const draft = db.createNewHdr();
+    draft.messageId = `bulk-rollback-${index}@read.invalid`;
+    return db.attachHdr(draft, false);
+  });
+  const keys = headers.map(header => header.messageKey);
+  Assert.ok(headers.every(header => !header.isRead));
+  Assert.deepEqual(db.getNewList(), keys);
+  const connection = database.connectionForTests;
+  const changes = [];
+  let reenter = false;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(header, before, after) {
+      changes.push([header.messageKey, before, after]);
+      Assert.ok(!connection.transactionInProgress);
+      if (reenter && changes.length == 1) {
+        Assert.ok(headers.every(candidate => candidate.isRead));
+        db.markRead(keys[1], false, null);
+      }
+    },
+  };
+  db.addListener(listener);
+  try {
+    connection.beginTransaction();
+    try {
+      Assert.throws(
+        () => db.markAllRead(),
+        error => error.result === Cr.NS_ERROR_IN_PROGRESS
+      );
+      Assert.ok(connection.transactionInProgress);
+      Assert.deepEqual(db.getNewList(), keys);
+      Assert.deepEqual(changes, []);
+    } finally {
+      connection.rollbackTransaction();
+    }
+    connection.executeSimpleSQL(
+      `CREATE TEMP TRIGGER reject_bulk_read_103 BEFORE UPDATE OF flags ON messages
+       WHEN OLD.id = ${keys[1]}
+       BEGIN SELECT RAISE(ABORT, 'bulk read fault'); END`
+    );
+    try {
+      Assert.throws(
+        () => db.markAllRead(),
+        error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT
+      );
+      Assert.ok(!connection.transactionInProgress);
+      Assert.ok(headers.every(header => !header.isRead));
+      Assert.deepEqual(db.getNewList(), keys);
+      Assert.deepEqual(changes, [], "Failed bulk writes have no callbacks");
+      Assert.equal(db.dBFolderInfo.numUnreadMessages, 2);
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER reject_bulk_read_103");
+    }
+    reenter = true;
+    Assert.deepEqual(
+      db.markAllRead(),
+      keys.toSorted((a, b) => a - b)
+    );
+    Assert.deepEqual(changes, [
+      [keys[0], 0, Ci.nsMsgMessageFlags.Read],
+      [keys[1], 0, Ci.nsMsgMessageFlags.Read],
+      [keys[1], Ci.nsMsgMessageFlags.Read, 0],
+    ]);
+    Assert.deepEqual(db.getNewList(), []);
+    Assert.ok(headers[0].isRead);
+    Assert.ok(!headers[1].isRead);
+    Assert.equal(db.dBFolderInfo.numUnreadMessages, 1);
+    Assert.equal(db.dBFolderInfo.numMessages, 2);
+  } finally {
+    db.removeListener(listener);
+  }
+});

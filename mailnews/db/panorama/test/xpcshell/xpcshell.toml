@@ -124,6 +124,8 @@ tags = ["dataadapter"]
 
 ["test_lookup.js"]
 
+["test_mailSearchAddressBook.js"]
+
 ["test_mailSearchAttachmentOpener.js"]
 
 ["test_mailSearchAutoComplete.js"]

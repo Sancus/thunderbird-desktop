@@ -809,3 +809,113 @@ add_task(
     await assertOriginals(input);
   }
 );
+
+add_task(
+  unixOnly(),
+  async function test_killedCheckpointedBookOnlyFinishesStage() {
+    const input = await bookInput();
+    const token = await input.journal.beginBookImport("original-book");
+    const plannedStage = input.journal.state.books[0].stagingPath;
+    const alias = PathUtils.join(home, "checkpoint-alias-" + serial);
+    // Existing xpcom/path-test route: only a harmless work-directory ancestor
+    // is linked. The selected profile and actual source leaf remain unchanged.
+    const process = Cc["@mozilla.org/process/util;1"].createInstance(
+      Ci.nsIProcess
+    );
+    process.init(new FileUtils.File("/bin/ln"));
+    const args = ["-s", input.root, alias];
+    process.run(true, args, args.length);
+    Assert.equal(process.exitValue, 0);
+    Assert.ok(new FileUtils.File(alias).isSymlink());
+    const originalStage = PathUtils.join(alias, "abook.sqlite");
+    Assert.notEqual(originalStage, plannedStage);
+    // One journal writer: the child owns the actual reopen/write until it exits.
+    input.journal.close();
+    const { Subprocess } = ChromeUtils.importESModule(
+      "resource://gre/modules/Subprocess.sys.mjs"
+    );
+    const { TestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/TestUtils.sys.mjs"
+    );
+    const child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: bookCommitChildArguments({
+        source: input.source,
+        stagingPath: originalStage,
+        token,
+        checkpointJournal: true,
+        journalPath: input.path,
+        profilePath: input.profilePath,
+      }),
+      stderr: "stdout",
+    });
+    let output = "";
+    let committed;
+    let readError;
+    const readCheckpoint = (async () => {
+      try {
+        for (let chunk; (chunk = await child.stdout.readString()); ) {
+          output += chunk;
+          const complete = output.split("\n");
+          complete.pop();
+          const line = complete.find(value =>
+            value.startsWith("BOOK-CHECKPOINTED ")
+          );
+          if (line) {
+            committed = JSON.parse(line.slice("BOOK-CHECKPOINTED ".length));
+            return;
+          }
+        }
+        await child.wait();
+        throw new Error(
+          "Child exited before its durable book checkpoint: " + output
+        );
+      } catch (error) {
+        readError = error;
+      }
+    })();
+    let persisted;
+    try {
+      await TestUtils.waitForCondition(
+        () => committed || readError,
+        "Waiting for the actual durable book journal checkpoint",
+        100,
+        300
+      );
+      if (readError) {
+        throw readError;
+      }
+      persisted = await IOUtils.readJSON(input.path);
+      Assert.equal(persisted.stage, "import");
+      Assert.equal(persisted.books[0].state, "imported");
+      Assert.equal(persisted.books[0].receipt.storageSourceId, token);
+      Assert.equal(persisted.books[0].receipt.stagingPath, plannedStage);
+      Assert.notEqual(persisted.books[0].receipt.stagingPath, originalStage);
+      Assert.deepEqual(persisted.books[0].receipt.cards, committed.cards);
+      Assert.deepEqual(persisted.books[0].receipt.lists, committed.lists);
+      Assert.equal(child.exitCode, null);
+      Assert.equal((await child.kill(0)).exitCode, -9);
+    } finally {
+      await child.kill(0);
+      await readCheckpoint;
+    }
+    input.journal = await MigrationJournal.open(input.path, input.profilePath);
+    Assert.deepEqual(input.journal.state, persisted);
+    await assertOriginals(input);
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.equal(input.journal.state.stage, "validate");
+    Assert.equal(
+      input.journal.state.revision,
+      persisted.revision + 1,
+      "Only finishStage writes; the committed unit is not checkpointed again"
+    );
+    Assert.deepEqual(
+      input.journal.state.books[0].receipt,
+      persisted.books[0].receipt
+    );
+    const before = await IOUtils.read(input.path);
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+    await assertOriginals(input);
+  }
+);

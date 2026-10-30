@@ -42,12 +42,50 @@ async function commitBook() {
     await IOUtils.read(migrationBookChildInput.source),
     migrationBookChildInput.token
   );
-  print("BOOK-COMMITTED " + JSON.stringify(receipt));
+  if (migrationBookChildInput.checkpointJournal) {
+    const { MigrationJournal } = ChromeUtils.importESModule(
+      "resource:///modules/panorama/MigrationJournal.sys.mjs"
+    );
+    globalThis.migrationBookJournal = await MigrationJournal.open(
+      migrationBookChildInput.journalPath,
+      migrationBookChildInput.profilePath
+    );
+    const book = globalThis.migrationBookJournal.state.books.find(
+      item => item.id == "original-book"
+    );
+    const actualStage = globalThis.migrationBookStage.databaseFile.clone();
+    actualStage.normalize();
+    if (
+      !book ||
+      book.token !== migrationBookChildInput.token ||
+      !actualStage.equals(new FileUtils.File(book.stagingPath))
+    ) {
+      throw new Error("Actual child stage differs from the retained book plan");
+    }
+    await globalThis.migrationBookJournal.recordBookImport("original-book", {
+      token: migrationBookChildInput.token,
+      sourceId: "original-book",
+      storageSourceId: receipt.sourceId,
+      sourceSha256: receipt.sourceSha256,
+      sourceSize: receipt.sourceSize,
+      stagingPath: book.stagingPath,
+      cards: receipt.cards,
+      lists: receipt.lists,
+    });
+    print("BOOK-CHECKPOINTED " + JSON.stringify(receipt));
+  } else {
+    print("BOOK-COMMITTED " + JSON.stringify(receipt));
+  }
 }
 
 let failed = false;
 commitBook().catch(error => {
   console.error(error);
+  try {
+    globalThis.migrationBookJournal?.close();
+  } catch (closeError) {
+    console.error("Could not close failed child book journal", closeError);
+  }
   try {
     globalThis.migrationBookStage?.close();
   } catch (closeError) {

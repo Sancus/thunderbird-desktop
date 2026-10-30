@@ -29,6 +29,10 @@ import {
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   SQLiteDirectory: "resource:///modules/SQLiteDirectory.sys.mjs",
+  readLegacyGlodaMail:
+    "resource:///modules/panorama/LegacyGlodaMailReader.sys.mjs",
+  mapLegacyGlodaMail:
+    "resource:///modules/panorama/LegacyGlodaMailReader.sys.mjs",
 });
 
 /**
@@ -595,6 +599,169 @@ export async function resumeMorkCacheImports(
     }
     throw error;
   }
+}
+
+/**
+ * Reads backed-up Gloda mail text and joins it to committed native imports.
+ * Retains every raw record, excluded row and attribute definition. Resolves
+ * physical folder/key locations before corroborating the original Message-ID.
+ * Requires the held selected-profile lock and quiesced source/backup writers.
+ * Never imports, checkpoints, indexes text or authorizes profile activation.
+ * Unknown eligibility remains a decision for the current search-policy owner.
+ *
+ * @param {MigrationJournal} journal - Open journal with imported mail sources.
+ * @param {nsIDatabaseCore} core - Actual started Panorama database.
+ * @param {function(string): (nsIMsgFolder|Promise<nsIMsgFolder>)} resolveFolder -
+ *   Resolves each journal source ID to its original native folder.
+ * @param {nsIProfileLock} profileLock - Caller-held selected-profile lock.
+ * @param {string} path - Gloda database file inside the verified complete backup.
+ * @returns {Promise<object>} Schema30 snapshot, mapped and excluded records,
+ *   complete native receipts, database identity and original backup location.
+ * @throws {Error} For unsupported paths/schema, missing or conflicting receipts,
+ *   changed source/journal/database identity, or a released/unrelated lock.
+ */
+export async function readLegacyGlodaMailRecovery(
+  journal,
+  core,
+  resolveFolder,
+  profileLock,
+  path
+) {
+  if (AppConstants.platform == "win") {
+    throw new Error("Windows Gloda recovery requires native reparse admission");
+  }
+  const database = core.QueryInterface(Ci.nsIDatabaseCore);
+  if (
+    database !==
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(Ci.nsIDatabaseCore)
+  ) {
+    throw new Error("Native Panorama recovery backend is required");
+  }
+  const state = journal.state;
+  if (
+    !["import", "validate", "activate", "complete"].includes(state.stage) ||
+    state.sources.some(source => source.state != "imported") ||
+    !state.backup
+  ) {
+    throw new Error("Gloda recovery requires backed-up committed mail imports");
+  }
+  const lock = profileLock.QueryInterface(Ci.nsIProfileLock);
+  const databaseSourceId = database.sourceId;
+  const before = JSON.stringify(state);
+  const check = () => {
+    const selected = new FileUtils.File(PathUtils.profileDir);
+    const directory = lock.directory.clone();
+    if (selected.isSymlink() || directory.isSymlink()) {
+      throw new Error("Gloda recovery profile contains a link");
+    }
+    selected.normalize();
+    directory.normalize();
+    if (selected.path !== state.profilePath || !selected.equals(directory)) {
+      throw new Error("Gloda recovery requires the held selected profile");
+    }
+    if (
+      database.sourceId !== databaseSourceId ||
+      JSON.stringify(journal.state) !== before
+    ) {
+      throw new Error("Gloda recovery journal/database identity changed");
+    }
+  };
+  check();
+  const backupPath = PathUtils.parent(state.backup.path);
+  const backup = await verifyMigrationBackup(backupPath);
+  if (
+    backup.path !== state.backup.path ||
+    backup.sha256 !== state.backup.sha256
+  ) {
+    throw new Error("Gloda recovery backup identity changed");
+  }
+  const sourcePath = admittedFolderPath(new FileUtils.File(path), [
+    new FileUtils.File(PathUtils.parent(backup.path)),
+  ]);
+  const manifest = await IOUtils.readJSON(backup.path);
+  const entries = [];
+  for (const root of manifest.roots) {
+    for (const entry of root.entries) {
+      if (
+        entry.type == "regular" &&
+        PathUtils.join(backupPath, root.directory, ...entry.parts) ===
+          sourcePath
+      ) {
+        entries.push({ root, entry });
+      }
+    }
+  }
+  if (entries.length != 1) {
+    throw new Error("Gloda recovery file is not a unique backed-up input");
+  }
+  const { root, entry } = entries[0];
+  const snapshot = await lazy.readLegacyGlodaMail(sourcePath);
+  if (
+    snapshot.source.size !== entry.size ||
+    snapshot.source.sha256 !== entry.sha256
+  ) {
+    throw new Error("Gloda recovery snapshot differs from the complete backup");
+  }
+  const folders = new Map();
+  for (const source of state.sources) {
+    folders.set(
+      source.id,
+      (await resolveFolder(source.id)).QueryInterface(Ci.nsIMsgFolder)
+    );
+  }
+  const target = createPanoramaMigrationTarget(
+    journal,
+    database,
+    id => folders.get(id),
+    lock
+  );
+  const bindings = [];
+  const receipts = new Map();
+  for (const source of state.sources) {
+    const receipt = await target.findReceipt(source.token, {
+      sourceId: source.id,
+      sourceSha256: source.sha256,
+      destinationFolderId: source.destinationFolderId,
+    });
+    if (receipt === null) {
+      throw new Error("Native database lost a committed Gloda mail binding");
+    }
+    if (
+      receipt.databaseSourceId !== databaseSourceId ||
+      receipt.token !== source.receipt?.token ||
+      receipt.sourceSha256 !== source.receipt?.sourceSha256 ||
+      receipt.folderId !== source.receipt?.folderId ||
+      JSON.stringify(receipt.keys) !== JSON.stringify(source.receipt?.keys)
+    ) {
+      throw new Error("Native Gloda mail receipt differs from its checkpoint");
+    }
+    receipts.set(source.id, receipt);
+    bindings.push({
+      folderURI: folders.get(source.id).URI,
+      source,
+      originalSummary: await readMorkMigrationSource(source.path),
+    });
+  }
+  const result = lazy.mapLegacyGlodaMail(snapshot, bindings);
+  check();
+  return {
+    snapshot,
+    backup,
+    originalDatabasePath: PathUtils.join(root.source, ...entry.parts),
+    mapped: result.mapped.map(row => ({
+      ...row,
+      sourceId: databaseSourceId,
+      provenance: {
+        ...row.provenance,
+        originalDatabasePath: PathUtils.join(root.source, ...entry.parts),
+        backup: structuredClone(backup),
+        importReceipt: structuredClone(
+          receipts.get(row.provenance.sourceFolderId)
+        ),
+      },
+    })),
+    excluded: result.excluded,
+  };
 }
 
 /**

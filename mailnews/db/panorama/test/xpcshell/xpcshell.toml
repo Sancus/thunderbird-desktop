@@ -16,6 +16,37 @@ support-files = [
 ]
 tags = ["panorama"]
 
+["test_LegacyGlodaMailReader.js"]
+
+["test_MigrationBookCoordinator.js"]
+support-files = ["../../../../../mail/components/addrbook/test/browser/data/import.mab"]
+
+["test_MigrationCoordinator.js"]
+
+["test_MigrationFileSystemWindows.js"]
+
+["test_MigrationFolderCacheCoordinator.js"]
+support-files = ["../../../../base/test/unit/data/panacea.dat"]
+
+["test_MigrationJournal.js"]
+
+["test_MigrationNativeImport.js"]
+# Native retained Windows import/activation remains a separate held composition.
+skip-if = ["os == 'win'"]
+
+["test_MigrationProfile.js"]
+# Native retained Windows import/activation remains a separate held composition.
+skip-if = ["os == 'win'"]
+
+["test_MigrationRecovery.js"]
+
+["test_MorkFolderCacheImport.js"]
+support-files = ["../../../../base/test/unit/data/panacea.dat"]
+
+["test_MorkSnapshotAdapter.js"]
+
+["test_MorkSummaryReader.js"]
+
 ["test_chatSearchProvider.js"]
 
 ["test_chatSearchRedaction.js"]
@@ -73,8 +104,6 @@ support-files = ["../../../../base/test/unit/data/panacea.dat"]
 
 ["test_liveView.js"]
 
-["test_liveView_conversations.js"]
-
 ["test_liveViewConversationsDataAdapter.js"]
 tags = ["dataadapter"]
 
@@ -91,6 +120,8 @@ tags = ["dataadapter"]
 ["test_liveViewThreadedDataAdapter.js"]
 tags = ["dataadapter"]
 
+["test_liveView_conversations.js"]
+
 ["test_lookup.js"]
 
 ["test_mailSearchAttachmentOpener.js"]
@@ -103,6 +134,12 @@ tags = ["dataadapter"]
 
 ["test_mailSearchFactory.js"]
 
+["test_mailSearchLegacyStartup.js"]
+prefs = [
+  "mail.panorama.enabled=false",
+  "mailnews.database.global.indexer.enabled=false",
+]
+
 ["test_mailSearchResults.js"]
 
 ["test_mailSearchService.js"]
@@ -112,35 +149,6 @@ tags = ["dataadapter"]
 ["test_messageIngestion.js"]
 
 ["test_messages.js"]
-
-["test_MigrationBookCoordinator.js"]
-support-files = ["../../../../../mail/components/addrbook/test/browser/data/import.mab"]
-
-["test_MigrationCoordinator.js"]
-
-["test_MigrationFileSystemWindows.js"]
-
-["test_MigrationFolderCacheCoordinator.js"]
-support-files = ["../../../../base/test/unit/data/panacea.dat"]
-
-["test_MigrationJournal.js"]
-
-["test_MigrationNativeImport.js"]
-# Native retained Windows import/activation remains a separate held composition.
-skip-if = ["os == 'win'"]
-
-["test_MigrationProfile.js"]
-# Native retained Windows import/activation remains a separate held composition.
-skip-if = ["os == 'win'"]
-
-["test_MigrationRecovery.js"]
-
-["test_MorkFolderCacheImport.js"]
-support-files = ["../../../../base/test/unit/data/panacea.dat"]
-
-["test_MorkSnapshotAdapter.js"]
-
-["test_MorkSummaryReader.js"]
 
 ["test_move.js"]
 

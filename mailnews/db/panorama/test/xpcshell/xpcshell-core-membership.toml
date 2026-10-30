@@ -1,0 +1,14 @@
+[DEFAULT]
+head = "head.js head_delivery.js"
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+tags = ["panorama-delivery"]
+
+["test_deliveryCompatibilityEnumeration.js"]

@@ -308,7 +308,8 @@ class DeliveryCoreMessageExistence : public testing::Test {
     EXPECT_EQ(PRTime(123456), date);
     uint32_t flags = 0;
     EXPECT_EQ(NS_OK, header->GetFlags(&flags));
-    EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked), flags);
+    EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked),
+              flags);
     nsMsgPriorityValue priority = 0;
     EXPECT_EQ(NS_OK, header->GetPriority(&priority));
     EXPECT_EQ(5, priority);
@@ -663,14 +664,14 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   uint32_t callbacks = 0;
   RefPtr<Message> retained;
   RefPtr<MessageExistenceRemovedObserver> observer =
-      new MessageExistenceRemovedObserver(
-          [&](Message* message, uint32_t oldFlags) {
-            ++callbacks;
-            EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked),
-                      oldFlags);
-            retained = message;
-            CheckRemovedState(message, removed, survivor, thread);
-          });
+      new MessageExistenceRemovedObserver([&](Message* message,
+                                              uint32_t oldFlags) {
+        ++callbacks;
+        EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked),
+                  oldFlags);
+        retained = message;
+        CheckRemovedState(message, removed, survivor, thread);
+      });
   mCore->MessageDB().AddMessageListener(observer);
   auto cleanup = MakeScopeExit(
       [&] { mCore->MessageDB().RemoveMessageListener(observer); });
@@ -913,8 +914,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   CheckRemovalProperty(removed, false);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
-       WarmHeaderDeletionUsesStoredMembership) {
+TEST_F(DeliveryCoreMessageExistence, WarmHeaderDeletionUsesStoredMembership) {
   nsMsgKey survivor, removed;
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
   ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
@@ -939,8 +939,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   CheckHeader(header, removed, thread);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
-       ColdRowDeletionUsesStoredMembership) {
+TEST_F(DeliveryCoreMessageExistence, ColdRowDeletionUsesStoredMembership) {
   nsMsgKey survivor, removed;
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
   ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
@@ -961,7 +960,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   EXPECT_TRUE(exists);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
+TEST_F(DeliveryCoreMessageExistence,
        RemovalCallbackSeesAbsentRowAndReadableHeader) {
   nsMsgKey survivor, removed;
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
@@ -998,8 +997,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   CheckStoredKeys({survivor});
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
-       WarmHeaderPrepareFailurePropagates) {
+TEST_F(DeliveryCoreMessageExistence, WarmHeaderPrepareFailurePropagates) {
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("warm@invalid"_ns, key));
   nsAutoCString subject;
@@ -1008,7 +1006,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   CheckPrepareFailure(key);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence, ColdRowPrepareFailurePropagates) {
+TEST_F(DeliveryCoreMessageExistence, ColdRowPrepareFailurePropagates) {
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("cold@invalid"_ns, key));
   ASSERT_TRUE(Stop());
@@ -1016,7 +1014,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence, ColdRowPrepareFailurePropagates) {
   CheckPrepareFailure(key);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence, WarmHeaderStepFailurePropagates) {
+TEST_F(DeliveryCoreMessageExistence, WarmHeaderStepFailurePropagates) {
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("warm@invalid"_ns, key));
   nsAutoCString subject;
@@ -1025,7 +1023,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence, WarmHeaderStepFailurePropagates) {
   CheckStepFailure(key);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence, ColdRowStepFailurePropagates) {
+TEST_F(DeliveryCoreMessageExistence, ColdRowStepFailurePropagates) {
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("cold@invalid"_ns, key));
   ASSERT_TRUE(Stop());

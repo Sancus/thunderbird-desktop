@@ -33,14 +33,25 @@ const REFERENCE_VARIANTS = [
   {
     file: "deliveryMigrationReferences",
     sha256: "b7a621f2e71c328d1b22393d9760dbc84e0f6d40145eb4745da9881a3f4064c8",
-    folders: ["references", "references-invalid"],
+    folders: [
+      "references",
+      "references-invalid",
+      "projection-subject",
+      "projection-raw",
+      "projection-present",
+      "projection-after",
+    ],
     raw: "<ancestor@invalid>\r\n\t<parent@invalid> <nearest@invalid>",
     references: ["ancestor@invalid", "parent@invalid", "nearest@invalid"],
   },
   {
     file: "deliveryMigrationDuplicateReferences",
     sha256: "cf2b381c64436b231c1261751db590c7811355f3f4843c8ad0e5e4b1b6003962",
-    folders: ["duplicate-references", "references-rollback"],
+    folders: [
+      "duplicate-references",
+      "references-rollback",
+      "projection-duplicates",
+    ],
     raw: "<ancestor@invalid> <parent@invalid>\r\n\t<ancestor@invalid> <nearest@invalid>",
     references: [
       "ancestor@invalid",
@@ -958,5 +969,201 @@ add_task(
     Assert.deepEqual(destination(input), committed);
     Assert.deepEqual(events.added, []);
     events.close();
+  }
+);
+
+/**
+ * Commits through the real native receiver, leaving the journal before its
+ * receipt checkpoint. All identities/keys come from the actual receipt.
+ *
+ * @param {string} name - Genuine fixture-backed unit.
+ * @returns {Promise<object>} Original input, actual request and native receipt.
+ */
+async function nativeCommitBeforeCheckpoint(name) {
+  const input = await planned(name);
+  await input.journal.beginImport(name);
+  const snapshot = await request(input);
+  const receipt = await database.importFolderSnapshot(input.folder, snapshot);
+  Assert.equal(input.journal.state.sources[0].state, "importing");
+  Assert.equal(input.journal.state.sources[0].receipt, null);
+  return { input, snapshot, receipt };
+}
+
+/** @param {object} input - Genuine unit. @returns {Promise<void>} Source bytes unchanged. */
+async function assertProjectionSourcesUnchanged(input) {
+  Assert.deepEqual(
+    await IOUtils.read(input.folder.summaryFile.path),
+    input.reference.bytes
+  );
+  Assert.deepEqual(await IOUtils.read(input.folder.filePath.path), bodyBytes);
+}
+
+add_task(
+  async function test_projectionReadbackFailureKeepsActualCommitForRetry() {
+    const { input, snapshot, receipt } =
+      await nativeCommitBeforeCheckpoint("projection-subject");
+    const [sourceKey, key] = receipt.keys[0];
+    const expected = snapshot.messages.find(
+      message => message.sourceKey == sourceKey
+    ).header.subject;
+    const header = messageDB.getMessage(key);
+    const count = messageDB.totalCount;
+    header.subject = "Changed after native commit";
+    const changes = rows("SELECT total_changes() AS value", ["value"]);
+    try {
+      await Assert.rejects(
+        resumeMorkImports(input.journal, target(input)),
+        /message projection differs: subject/
+      );
+      Assert.equal(
+        messageDB.totalCount,
+        count,
+        "The native commit is not called rolled back"
+      );
+      Assert.deepEqual(
+        rows("SELECT total_changes() AS value", ["value"]),
+        changes
+      );
+      Assert.equal(input.journal.state.sources[0].state, "importing");
+      Assert.equal(input.journal.state.sources[0].receipt, null);
+      Assert.deepEqual(
+        database.getFolderImportReceipt(input.folder, snapshot),
+        receipt
+      );
+      await assertProjectionSourcesUnchanged(input);
+    } finally {
+      header.subject = expected;
+    }
+    await resumeMorkImports(input.journal, target(input));
+    Assert.equal(messageDB.totalCount, count);
+    Assert.deepEqual(input.journal.state.sources[0].receipt.keys, receipt.keys);
+    await assertReferenceImport(input);
+  }
+);
+
+add_task(
+  async function test_projectionReadbackRejectsReorderedDuplicateReferences() {
+    const { input, snapshot, receipt } = await nativeCommitBeforeCheckpoint(
+      "projection-duplicates"
+    );
+    const row = snapshot.messages.find(
+      message => message.header.references.length == 4
+    );
+    Assert.ok(row, "Genuine duplicate-four References row was read");
+    const key = new Map(receipt.keys).get(row.sourceKey);
+    const header = messageDB.getMessage(key);
+    header.setReferences(
+      [...input.reference.spec.references]
+        .reverse()
+        .map(value => `<${value}>`)
+        .join(" ")
+    );
+    const changes = rows("SELECT total_changes() AS value", ["value"]);
+    try {
+      await Assert.rejects(
+        resumeMorkImports(input.journal, target(input)),
+        /References ordinal/
+      );
+      Assert.deepEqual(
+        rows("SELECT total_changes() AS value", ["value"]),
+        changes
+      );
+      Assert.equal(input.journal.state.sources[0].receipt, null);
+      Assert.deepEqual(
+        database.getFolderImportReceipt(input.folder, snapshot),
+        receipt
+      );
+      await assertProjectionSourcesUnchanged(input);
+    } finally {
+      header.setReferences(input.reference.spec.raw);
+    }
+    await resumeMorkImports(input.journal, target(input));
+    Assert.deepEqual(input.journal.state.sources[0].receipt.keys, receipt.keys);
+    await assertReferenceImport(input);
+  }
+);
+
+add_task(
+  async function test_projectionReadbackRejectsChangedPresentEmptyText() {
+    const { input, snapshot, receipt } =
+      await nativeCommitBeforeCheckpoint("projection-raw");
+    const row = snapshot.messages.find(
+      message => !message.header.references.length
+    );
+    Assert.ok(
+      row.header.extras.some(({ k, v }) => k == "references" && v === "")
+    );
+    const header = messageDB.getMessage(
+      new Map(receipt.keys).get(row.sourceKey)
+    );
+    header.setStringProperty("references", "\ufeffchanged\0e\u0301");
+    const changes = rows("SELECT total_changes() AS value", ["value"]);
+    try {
+      await Assert.rejects(
+        resumeMorkImports(input.journal, target(input)),
+        /property references/
+      );
+      Assert.deepEqual(
+        rows("SELECT total_changes() AS value", ["value"]),
+        changes
+      );
+      Assert.equal(input.journal.state.sources[0].receipt, null);
+      await assertProjectionSourcesUnchanged(input);
+    } finally {
+      header.setStringProperty("references", "");
+    }
+    await resumeMorkImports(input.journal, target(input));
+    await assertReferenceImport(input);
+  }
+);
+
+add_task(async function test_projectionReadbackRejectsInventedEmptyProperty() {
+  const { input, snapshot, receipt } =
+    await nativeCommitBeforeCheckpoint("projection-present");
+  const header = messageDB.getMessage(receipt.keys[0][1]);
+  Assert.ok(!header.properties.includes("validation-present-empty"));
+  header.setStringProperty("validation-present-empty", "");
+  Assert.ok(header.properties.includes("validation-present-empty"));
+  const changes = rows("SELECT total_changes() AS value", ["value"]);
+  await Assert.rejects(
+    resumeMorkImports(input.journal, target(input)),
+    /property presence differs/
+  );
+  Assert.deepEqual(rows("SELECT total_changes() AS value", ["value"]), changes);
+  Assert.equal(input.journal.state.sources[0].receipt, null);
+  Assert.deepEqual(
+    database.getFolderImportReceipt(input.folder, snapshot),
+    receipt
+  );
+  await assertProjectionSourcesUnchanged(input);
+});
+
+add_task(
+  async function test_receiptLookupAfterCheckpointAllowsCurrentHeaderEdits() {
+    const input = await planned("projection-after");
+    await resumeMorkImports(input.journal, target(input));
+    Assert.equal(input.journal.state.stage, "validate");
+    const source = input.journal.state.sources[0];
+    const header = messageDB.getMessage(source.receipt.keys[0][1]);
+    const subject = header.subject;
+    try {
+      header.subject = "Legitimate current metadata after import stage";
+      const changes = rows("SELECT total_changes() AS value", ["value"]);
+      const journal = await IOUtils.read(input.path);
+      const receipt = await target(input).findReceipt(source.token, {
+        sourceId: source.id,
+        sourceSha256: source.sha256,
+        destinationFolderId: source.destinationFolderId,
+      });
+      Assert.deepEqual(receipt.keys, source.receipt.keys);
+      Assert.deepEqual(
+        rows("SELECT total_changes() AS value", ["value"]),
+        changes
+      );
+      Assert.deepEqual(await IOUtils.read(input.path), journal);
+      await assertProjectionSourcesUnchanged(input);
+    } finally {
+      header.subject = subject;
+    }
   }
 );

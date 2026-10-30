@@ -33,6 +33,7 @@ import {
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
+  MailServices: "resource:///modules/MailServices.sys.mjs",
   SQLiteDirectory: "resource:///modules/SQLiteDirectory.sys.mjs",
   readLegacyGlodaMail:
     "resource:///modules/panorama/LegacyGlodaMailReader.sys.mjs",
@@ -1016,6 +1017,15 @@ function bindPanoramaMigrationTarget(
       throw new Error("Mork snapshot conflicts with journal/database identity");
     }
   };
+  const checkedReceipt = (folder, request, receipt) => {
+    const result = validateMorkFolderReceipt(request, receipt);
+    if (journal.state.stage == "import") {
+      verifyNativeMessageProjection(database, folder, request, result);
+    }
+    checkIdentity();
+    checkLock();
+    return result;
+  };
   checkIdentity();
   checkLock();
   let prepared = null;
@@ -1045,7 +1055,7 @@ function bindPanoramaMigrationTarget(
       const receipt = database.getFolderImportReceipt(folder, request);
       checkIdentity();
       if (receipt !== null) {
-        return validateMorkFolderReceipt(request, receipt);
+        return checkedReceipt(folder, request, receipt);
       }
       prepared = { folder, request };
       return null;
@@ -1080,9 +1090,126 @@ function bindPanoramaMigrationTarget(
         pending.request
       );
       checkIdentity();
-      return validateMorkFolderReceipt(pending.request, receipt);
+      return checkedReceipt(pending.folder, pending.request, receipt);
     },
   };
+}
+
+/**
+ * Reads the supported native message projection before an import checkpoint.
+ * Uses only the complete committed physical-key map and actual folder. Every
+ * public property name/value is checked, including derived body-field aliases.
+ * Does not write, reimport, validate opaque structural storage or prove that a
+ * body is available. Caller retains its profile lock and writer quiescence.
+ *
+ * @param {nsIDatabaseCore} database - Actual started native receiver.
+ * @param {nsIMsgFolder} folder - Actual physically bound destination.
+ * @param {object} request - Complete converted source snapshot.
+ * @param {object} receipt - Validated complete native key map.
+ * @returns {void}
+ * @throws {Error} For any changed/missing/extra message, field or property.
+ *   Native getter failures propagate unchanged after the already committed import.
+ */
+function verifyNativeMessageProjection(database, folder, request, receipt) {
+  const keys = new Map(receipt.keys);
+  const remaining = new Set(keys.values());
+  const headers = new Map();
+  for (const header of folder.messages) {
+    if (!remaining.delete(header.messageKey)) {
+      throw new Error("Native migration message set differs from its receipt");
+    }
+    headers.set(header.messageKey, header);
+  }
+  if (remaining.size) {
+    throw new Error("Native migration message set differs from its receipt");
+  }
+  const equal = (actual, expected, name) => {
+    if (actual !== expected) {
+      throw new Error("Native migration message projection differs: " + name);
+    }
+  };
+  for (const message of request.messages) {
+    const key = keys.get(message.sourceKey);
+    const actual = headers.get(key);
+    const expected = message.header;
+    equal(actual.messageKey, key, "messageKey");
+    equal(actual.folder.id, request.folder.id, "folder");
+    for (const [name, value] of [
+      ["messageId", expected.messageId],
+      ["date", expected.date],
+      ["author", expected.sender],
+      ["recipients", expected.recipients],
+      ["ccList", expected.ccList],
+      ["bccList", expected.bccList],
+      ["subject", expected.subject],
+      ["flags", expected.flags],
+      ["priority", expected.priority],
+      ["charset", expected.charset],
+      ["threadId", keys.get(message.rootSourceKey)],
+      [
+        "threadParent",
+        message.parentSourceKey === null
+          ? 0
+          : keys.get(message.parentSourceKey),
+      ],
+    ]) {
+      equal(actual[name], value, name);
+    }
+    equal(actual.numReferences, expected.references.length, "References count");
+    expected.references.forEach((reference, ordinal) => {
+      equal(
+        actual.getStringReference(ordinal),
+        reference,
+        "References ordinal " + ordinal
+      );
+    });
+    equal(
+      actual.getUint32Property("dateReceived"),
+      expected.dateReceived / 1000000,
+      "dateReceived"
+    );
+    const properties = new Map(expected.extras.map(({ k, v }) => [k, v]));
+    equal(
+      actual.getStringProperty("keywords"),
+      properties.get("keywords") ?? expected.keywords,
+      "keywords"
+    );
+    properties.delete("keywords"); // Native tags are a field, not a property row.
+    equal(
+      actual.accountKey,
+      properties.has("account")
+        ? expected.accountKey
+        : lazy.MailServices.accounts.findAccountForServer(folder.server).key,
+      "accountKey"
+    );
+    for (const name of [
+      "storeToken",
+      "messageSize",
+      "offlineMessageSize",
+      "lineCount",
+    ]) {
+      if (Object.hasOwn(expected, name)) {
+        equal(actual[name], expected[name], name);
+        // These canonical getters are projections of the legacy body fields.
+        // Original size/offlineMsgSize/numLines cells remain separate properties.
+        properties.set(name, String(expected[name]));
+      }
+    }
+    const present = new Set(actual.properties);
+    if (
+      present.size !== properties.size ||
+      [...present].some(name => !properties.has(name))
+    ) {
+      throw new Error("Native migration message property presence differs");
+    }
+    for (const [name, value] of properties) {
+      equal(
+        database.messageDB.getMessageProperty(key, name),
+        value,
+        "property " + name
+      );
+    }
+  }
 }
 
 /**

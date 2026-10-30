@@ -748,6 +748,8 @@ class nsImapProtocol : public nsIImapProtocol,
   bool m_autoSubscribe, m_autoUnsubscribe, m_autoSubscribeOnOpen;
   bool m_closeNeededBeforeSelect;
   bool m_retryUrlOnError;
+  // Worker-only: COPY/MOVE may have executed, so this URL cannot be replayed.
+  bool m_copyCommandIssued = false;
   bool m_preferPlainText;
   bool m_forceSelect;
 

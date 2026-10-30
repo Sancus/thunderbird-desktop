@@ -310,11 +310,46 @@ add_task(async function test_copyLateNoReportsPartialDestination() {
   await checkCopyChunkError("no-second-copy", "NO", 2, false);
 });
 
+add_task(async function test_copyLostReplyDoesNotReplayPriorChunks() {
+  await checkCopyChunkError("drop-second-copy", "DROP", 2, false);
+});
+
+add_task(async function test_copyLostFirstReplyDoesNotDeleteSource() {
+  await checkCopyChunkError("drop-first-move", "DROP", 1, true);
+});
+
+add_task(async function test_copyCanRetrySelectBeforeDispatch() {
+  // Select a different real mailbox so COPY must select its source. Dropping
+  // this SELECT has not issued COPY and still permits the normal one retry.
+  const inbox = gChunkIncomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  inbox.updateFolderWithListener(null, selected);
+  await selected.promise;
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalSelect = proto.SELECT;
+  let selects = 0;
+  proto.SELECT = function (args) {
+    if (args[0] == "copy-chunk-source" && ++selects == 1) {
+      this.closing = true;
+      return "";
+    }
+    return originalSelect.call(this, args);
+  };
+  try {
+    await checkCopyChunkError("select-retry", "NO", 1, false);
+    Assert.equal(selects, 2, "The pre-COPY SELECT gets one transport retry");
+  } finally {
+    proto.SELECT = originalSelect;
+  }
+});
+
 /**
  * Checks a real chunked COPY failure without deleting the source or hiding it.
  *
  * @param {string} name - Unique folder/message identity suffix.
- * @param {string} response - Tagged server rejection, NO or BAD.
+ * @param {string} response - NO/BAD rejection, or DROP after applying the chunk.
  * @param {number} rejectedChunk - One-based chunk to reject.
  * @param {boolean} isMove - Requests the COPY/delete fallback for its error case.
  * @returns {Promise<void>}
@@ -459,6 +494,11 @@ async function checkCopyChunkError(name, response, rejectedChunk, isMove) {
     const chunk = String(args[0]).split(",").map(Number);
     commands.push(chunk);
     if (reject && commands.length == rejectedChunk) {
+      if (response == "DROP") {
+        originalCopy.call(this, args, isUid);
+        this.closing = true;
+        return "";
+      }
       return `${response} copy chunk rejected`;
     }
     return originalCopy.call(this, args, isUid);
@@ -543,7 +583,9 @@ async function checkCopyChunkError(name, response, rejectedChunk, isMove) {
     const result = await runCopy(isMove);
     Assert.equal(
       result,
-      Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED,
+      response == "DROP"
+        ? Cr.NS_BASE_STREAM_CLOSED
+        : Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED,
       `COPY chunk sizes=${commands.map(chunk => chunk.length)}; following=${destructive}`
     );
     Assert.equal(commands.length, rejectedChunk);
@@ -554,7 +596,11 @@ async function checkCopyChunkError(name, response, rejectedChunk, isMove) {
       uids.length,
       "The rejected chunk leaves later input unsent"
     );
-    const copied = commands.slice(0, rejectedChunk - 1).flat();
+    // DROP deliberately executes the chunk on the real server, then loses
+    // its reply. Its effects remain ambiguous to the client, not safe to retry.
+    const copied = commands
+      .slice(0, rejectedChunk - (response == "DROP" ? 0 : 1))
+      .flat();
     Assert.equal(destination._messages.length, copied.length);
     Assert.equal(destination.uidnext, beforeDestinationUid + copied.length);
     Assert.deepEqual(
@@ -562,7 +608,7 @@ async function checkCopyChunkError(name, response, rejectedChunk, isMove) {
       copied.map(uid => text(uid))
     );
     checkSource();
-    if (rejectedChunk == 1) {
+    if (rejectedChunk == 1 && response != "DROP") {
       // The observed fixture destination is empty. An explicit COPY retry is
       // safe here; do not retry the whole selection after a partial COPY.
       reject = false;

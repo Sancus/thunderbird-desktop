@@ -1846,6 +1846,7 @@ static void DoomCacheEntry(nsIMsgMailNewsUrl* url) {
 bool nsImapProtocol::ProcessCurrentURL() {
   nsresult rv = NS_OK;
   m_mailboxUpdateResult = NS_OK;
+  m_copyCommandIssued = false;
   if (m_idle) EndIdle();
 
   {
@@ -2349,7 +2350,7 @@ nsresult nsImapProtocol::SendData(const char* dataBuffer,
       ClearFlag(IMAP_CONNECTION_IS_OPEN);
       TellThreadToDie();
       SetConnectionStatus(rv);
-      if (m_runningUrl && !m_retryUrlOnError) {
+      if (m_runningUrl && !m_retryUrlOnError && !m_copyCommandIssued) {
         bool alreadyRerunningUrl;
         m_runningUrl->GetRerunningUrl(&alreadyRerunningUrl);
         if (!alreadyRerunningUrl) {
@@ -5184,7 +5185,7 @@ char* nsImapProtocol::CreateNewLineFromSocket() {
       case NS_ERROR_NET_INTERRUPT:
         // we should retry on RESET, especially for SSL...
         if ((TestFlag(IMAP_RECEIVED_GREETING) || rv == NS_ERROR_NET_RESET) &&
-            m_runningUrl && !m_retryUrlOnError) {
+            m_runningUrl && !m_retryUrlOnError && !m_copyCommandIssued) {
           bool rerunningUrl;
           nsImapAction imapAction;
           m_runningUrl->GetRerunningUrl(&rerunningUrl);
@@ -8360,6 +8361,9 @@ void nsImapProtocol::Copy(const char* messageList,
     protocolString.Append(escapedDestination);
     protocolString.AppendLiteral("\"" CRLF);
 
+    // A failed write or lost reply does not establish that COPY had no effect.
+    // Replaying this URL could duplicate this chunk or earlier successful ones.
+    m_copyCommandIssued = true;
     nsresult rv = SendData(protocolString.get());
     if (NS_SUCCEEDED(rv)) ParseIMAPandCheckForNewMail(protocolString.get());
     if (NS_SUCCEEDED(rv)) rv = GetConnectionStatus();

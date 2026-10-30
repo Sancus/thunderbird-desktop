@@ -6120,7 +6120,16 @@ NS_IMETHODIMP nsMsgDBFolder::SetUserSortOrder(uint32_t order) {
     MOZ_TRY(CheckFolderDatabaseSource());
     nsCOMPtr<nsIMsgDatabase> db;
     nsCOMPtr<nsIDBFolderInfo> info;
-    MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    if (mIsServer) {
+      // Server roots have native metadata, but no protocol message database.
+      RefPtr<mozilla::mailnews::DatabaseCore> core =
+          mozilla::mailnews::DatabaseCore::sInstance;
+      NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(core->OpenFolderDB(this, false, getter_AddRefs(db)));
+      MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+    } else {
+      MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    }
     NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
     MOZ_TRY(info->SetUserSortOrder(order));
     // The property write either autocommits or remains in the caller's TX.
@@ -6150,7 +6159,16 @@ NS_IMETHODIMP nsMsgDBFolder::GetUserSortOrder(uint32_t* order) {
     MOZ_TRY(CheckFolderDatabaseSource());
     nsCOMPtr<nsIMsgDatabase> db;
     nsCOMPtr<nsIDBFolderInfo> info;
-    MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    if (mIsServer) {
+      // Server roots have native metadata, but no protocol message database.
+      RefPtr<mozilla::mailnews::DatabaseCore> core =
+          mozilla::mailnews::DatabaseCore::sInstance;
+      NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(core->OpenFolderDB(this, false, getter_AddRefs(db)));
+      MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+    } else {
+      MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    }
     NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
     uint32_t stored;
     MOZ_TRY(info->GetUserSortOrder(&stored));

@@ -220,7 +220,8 @@ add_task(function test_changedDirectParentIsSkipped() {
 });
 
 add_task(function test_retiredRootHandleCannotReturnAnotherThreadsChild() {
-  const { folder, db, head, branch, thread } = tree("retired-root");
+  const { folder, db, head, branch, leaf, sibling, thread } =
+    tree("retired-root");
   const draft = db.createNewHdr();
   draft.messageId = "replacement@retired-root.invalid";
   const replacement = db.attachHdr(draft, false);
@@ -242,6 +243,10 @@ add_task(function test_retiredRootHandleCannotReturnAnotherThreadsChild() {
     Assert.strictEqual(currentRoot.folder, folder);
     Assert.deepEqual(keys(thread.enumerateMessages(0xffffffff)), [
       branch.messageKey,
+      sibling.messageKey,
+    ]);
+    Assert.deepEqual(keys(thread.enumerateMessages(branch.messageKey)), [
+      leaf.messageKey,
     ]);
     Assert.equal(
       thread.getChild(branch.messageKey).messageKey,
@@ -259,6 +264,12 @@ add_task(function test_retiredRootHandleCannotReturnAnotherThreadsChild() {
       head.messageKey,
       head.messageKey,
     ]);
+    Assert.deepEqual(storedMembership(sibling.messageKey), [
+      sibling.messageKey,
+      folder.id,
+      head.messageKey,
+      head.messageKey,
+    ]);
   } finally {
     database.connectionForTests.executeSimpleSQL(
       "UPDATE messages SET threadId = " +
@@ -268,10 +279,13 @@ add_task(function test_retiredRootHandleCannotReturnAnotherThreadsChild() {
     );
   }
   Assert.equal(thread.getRootHdr().messageKey, head.messageKey);
+  Assert.deepEqual(keys(thread.enumerateMessages(0xffffffff)), [
+    head.messageKey,
+  ]);
 });
 
 add_task(function test_removedRootCannotBeReturnedFromRetainedHeaders() {
-  const { folder, head, branch, thread } = tree("removed-root");
+  const { folder, head, branch, leaf, sibling, thread } = tree("removed-root");
   Assert.equal(thread.getRootHdr().messageKey, head.messageKey);
   messageDB.removeMessage(head.messageKey);
   Assert.equal(storedMembership(head.messageKey), null);
@@ -281,6 +295,10 @@ add_task(function test_removedRootCannotBeReturnedFromRetainedHeaders() {
   Assert.strictEqual(currentRoot.folder, folder);
   Assert.deepEqual(keys(thread.enumerateMessages(0xffffffff)), [
     branch.messageKey,
+    sibling.messageKey,
+  ]);
+  Assert.deepEqual(keys(thread.enumerateMessages(branch.messageKey)), [
+    leaf.messageKey,
   ]);
   Assert.equal(
     thread.getChild(branch.messageKey).messageKey,
@@ -288,6 +306,12 @@ add_task(function test_removedRootCannotBeReturnedFromRetainedHeaders() {
   );
   Assert.deepEqual(storedMembership(branch.messageKey), [
     branch.messageKey,
+    folder.id,
+    head.messageKey,
+    head.messageKey,
+  ]);
+  Assert.deepEqual(storedMembership(sibling.messageKey), [
+    sibling.messageKey,
     folder.id,
     head.messageKey,
     head.messageKey,

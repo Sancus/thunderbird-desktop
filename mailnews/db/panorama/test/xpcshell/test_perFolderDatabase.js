@@ -4116,3 +4116,115 @@ add_task(function test_userSortOrderPersistsWithoutChangingPhysicalOrder() {
   Assert.strictEqual(folder.parent, rootFolder);
   Assert.deepEqual(readStored(), [7, "integer"]);
 });
+
+add_task(function test_serverRootSortOrderUsesNativeMetadata() {
+  const folder = rootFolder;
+  Assert.ok(folder.isServer);
+  const id = folder.id;
+  const connection = database.connectionForTests;
+  const readStored = () => {
+    const row = connection.createStatement(
+      "SELECT value, typeof(value) FROM folder_properties " +
+        "WHERE id=:id AND name='userSortOrder'"
+    );
+    try {
+      row.params.id = id;
+      return row.executeStep() ? [row.getInt64(0), row.getUTF8String(1)] : null;
+    } finally {
+      row.finalize();
+    }
+  };
+  Assert.equal(folder.userSortOrder, Ci.nsIMsgFolder.NO_SORT_VALUE);
+  Assert.equal(
+    readStored(),
+    null,
+    "Reading root metadata does not create a row"
+  );
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const info = service.openFolderDB(folder, false).dBFolderInfo;
+  for (const value of [0, 0x80000001, 0xffffffff]) {
+    folder.userSortOrder = value;
+    Assert.equal(folder.userSortOrder, value);
+    Assert.equal(info.userSortOrder, value);
+    Assert.deepEqual(readStored(), [value, "integer"]);
+  }
+  for (const invalid of [-1, 0x100000000]) {
+    info.setInt64Property("userSortOrder", invalid);
+    Assert.throws(
+      () => folder.userSortOrder,
+      error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
+    );
+    Assert.deepEqual(readStored(), [invalid, "integer"]);
+  }
+  info.userSortOrder = 7;
+  Assert.equal(folder.userSortOrder, 7, "Direct metadata writes are visible");
+  connection.beginTransaction();
+  try {
+    folder.userSortOrder = 11;
+    Assert.ok(connection.transactionInProgress);
+    Assert.equal(folder.userSortOrder, 11);
+    Assert.equal(info.userSortOrder, 11);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(
+    folder.userSortOrder,
+    7,
+    "Caller rollback remains authoritative"
+  );
+  connection.executeSimpleSQL(
+    `CREATE TEMP TRIGGER reject_root_user_sort BEFORE INSERT ON folder_properties
+     WHEN NEW.id=${id} AND NEW.name='userSortOrder' AND NEW.value=13
+     BEGIN SELECT RAISE(ABORT, 'root user sort fault'); END`
+  );
+  try {
+    Assert.throws(
+      () => (folder.userSortOrder = 13),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.equal(folder.userSortOrder, 7);
+    Assert.deepEqual(readStored(), [7, "integer"]);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_root_user_sort");
+  }
+  connection.executeSimpleSQL(
+    "ALTER TABLE folder_properties RENAME TO held_root_sort_properties"
+  );
+  try {
+    Assert.throws(
+      () => folder.userSortOrder,
+      error => error.result == Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => (folder.userSortOrder = 17),
+      error => error.result == Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE held_root_sort_properties RENAME TO folder_properties"
+    );
+  }
+  connection.beginTransaction();
+  try {
+    connection.executeSimpleSQL(
+      "UPDATE database_identity SET sourceId = '{87654321-4321-4321-4321-cba987654321}'"
+    );
+    for (const call of [
+      () => folder.userSortOrder,
+      () => (folder.userSortOrder = 19),
+    ]) {
+      Assert.throws(call, error => error.result == Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  service.forceFolderDBClosed(folder);
+  Assert.equal(folder.userSortOrder, 7, "Root metadata survives facade reopen");
+  Assert.equal(folder.id, id);
+  Assert.ok(folder.isServer);
+  Assert.deepEqual(readStored(), [7, "integer"]);
+});

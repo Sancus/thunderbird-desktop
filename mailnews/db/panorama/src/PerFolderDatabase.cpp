@@ -2241,6 +2241,8 @@ NS_IMETHODIMP FolderInfo::SetExpungedBytes(int64_t aExpungedBytes) {
 }
 NS_IMETHODIMP FolderInfo::GetImapUidValidity(ImapUid* aImapUidValidity) {
   NS_ENSURE_ARG_POINTER(aImapUidValidity);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   uint32_t epoch;
   nsresult rv = FolderDB().GetFolderUidValidity(mFolderId, epoch);
   if (rv == NS_ERROR_NOT_AVAILABLE) {
@@ -2253,6 +2255,8 @@ NS_IMETHODIMP FolderInfo::GetImapUidValidity(ImapUid* aImapUidValidity) {
   return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetImapUidValidity(ImapUid aImapUidValidity) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().SetFolderUidValidity(mFolderId, aImapUidValidity);
 }
 NS_IMETHODIMP FolderInfo::GetVersion(uint32_t* aVersion) {

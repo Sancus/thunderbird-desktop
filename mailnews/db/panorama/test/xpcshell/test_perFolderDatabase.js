@@ -3115,3 +3115,90 @@ add_task(
     }, /NS_ERROR_NOT_AVAILABLE/);
   }
 );
+
+add_task(function test_epochAccessRequiresTheCapturedSource() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("epoch-source-admission");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("epoch-source-bystander");
+  const key = addMessage({ folderId: folder.id });
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  const header = db.getMsgHdrForKey(key);
+  const otherInfo = other.msgDatabase.dBFolderInfo;
+  info.imapUidValidity = 0xffffffff;
+  otherInfo.imapUidValidity = 17;
+  header.setUint32Property("uidOnServer", 42);
+  const connection = database.connectionForTests;
+  const source = database.sourceId;
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    Assert.throws(() => info.imapUidValidity, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => {
+      info.imapUidValidity = 0;
+    }, /NS_ERROR_NOT_AVAILABLE/);
+  } finally {
+    update.params.source = source;
+    update.execute();
+    update.finalize();
+  }
+  Assert.equal(info.imapUidValidity, 0xffffffff);
+  Assert.equal(otherInfo.imapUidValidity, 17);
+  Assert.equal(header.getUint32Property("uidOnServer"), 42);
+  Assert.ok(header.properties.includes("uidOnServer"));
+  Assert.deepEqual(db.listAllKeys(), [key]);
+  connection.beginTransaction();
+  try {
+    Assert.equal(info.imapUidValidity, 0xffffffff);
+    Assert.throws(() => {
+      info.imapUidValidity = 0;
+    }, /NS_ERROR_IN_PROGRESS/);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(info.imapUidValidity, 0xffffffff);
+  Assert.equal(header.getUint32Property("uidOnServer"), 42);
+  db.forceClosed();
+  Assert.throws(() => info.imapUidValidity, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => {
+    info.imapUidValidity = 0;
+  }, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.equal(otherInfo.imapUidValidity, 17);
+});
+
+add_task(function test_epochAccessPreservesSourceReaderErrors() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("epoch-source-error");
+  const info = folder.msgDatabase.dBFolderInfo;
+  info.imapUidValidity = 19;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "ALTER TABLE database_identity RENAME TO unavailable_epoch_identity"
+  );
+  try {
+    Assert.throws(
+      () => info.imapUidValidity,
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => {
+        info.imapUidValidity = 20;
+      },
+      error => error.result === Cr.NS_ERROR_FAILURE
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE unavailable_epoch_identity RENAME TO database_identity"
+    );
+  }
+  Assert.equal(info.imapUidValidity, 19);
+  Assert.ok(!connection.transactionInProgress);
+});

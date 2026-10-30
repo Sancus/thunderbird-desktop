@@ -76,10 +76,12 @@ class FaultWitness final : public mozIStorageFunction {
   NS_DECL_ISUPPORTS
   uint32_t mCalls = 0;
   int64_t mLastKey = 0;
+  nsresult mFailure = NS_OK;
   NS_IMETHOD OnFunctionCall(mozIStorageValueArray* args,
                             nsIVariant** result) override {
     ++mCalls;
     MOZ_TRY(args->GetInt64(0, &mLastKey));
+    NS_ENSURE_SUCCESS(mFailure, mFailure);
     nsCOMPtr<nsIWritableVariant> value =
         do_CreateInstance("@mozilla.org/variant;1");
     NS_ENSURE_STATE(value);
@@ -11568,6 +11570,123 @@ TEST_F(DeliveryCoreReferences,
   uint64_t after;
   ASSERT_EQ(NS_OK, SearchWatermark(after));
   EXPECT_EQ(watermark, after);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderSortReadErrorsPreserveOutputAndCallerState) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t parent, a, b, singleParent, single;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Sort parent"_ns, &parent));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(parent, "Alpha"_ns, &a));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(parent, "Beta"_ns, &b));
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(a, nsMsgFolderFlags::Trash));
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(b, nsMsgFolderFlags::Inbox));
+  ASSERT_EQ(NS_OK,
+            folders.InsertFolder(mFolderId, "One child"_ns, &singleParent));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(singleParent, "Only"_ns, &single));
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("sort-control"_ns, {"one"_ns, "one"_ns}, control));
+  uint64_t watermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  witness->mFailure = NS_ERROR_ABORT;
+  ASSERT_EQ(NS_OK, mConnection->CreateFunction("unreadable_folder_flag"_ns, 1,
+                                               witness));
+  // The real id/parent/name/ordinal columns remain readable. Only evaluating
+  // the flags column invokes the failing mozStorage function. No main row is
+  // changed, so this reaches the actual sorting-key read, not a prior failure.
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP VIEW folders AS SELECT id,parent,ordinal,"
+          "name,unreadable_folder_flag(id) AS flags FROM main.folders"_ns));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP VIEW IF EXISTS temp.folders"_ns));
+    EXPECT_EQ(NS_OK, mConnection->RemoveFunction("unreadable_folder_flag"_ns));
+  });
+  auto flags = folders.GetFolderFlags(a);
+  ASSERT_TRUE(flags.isErr());
+  nsresult original = flags.unwrapErr();
+  EXPECT_TRUE(NS_FAILED(original));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(int64_t(a), witness->mLastKey);
+  witness->mCalls = 0;
+  nsTArray<uint64_t> children{UINT64_MAX};
+  EXPECT_EQ(original, folders.GetFolderChildren(parent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{UINT64_MAX}), children);
+  EXPECT_GT(witness->mCalls, 0u);
+  EXPECT_TRUE(witness->mLastKey == int64_t(a) ||
+              witness->mLastKey == int64_t(b));
+  witness->mCalls = 0;
+  EXPECT_EQ(original, folders.MoveFolderWithin(parent, a, 0));
+  EXPECT_GT(witness->mCalls, 0u);
+  auto ordinalA = folders.GetFolderOrdinal(a);
+  auto ordinalB = folders.GetFolderOrdinal(b);
+  ASSERT_TRUE(ordinalA.isOk());
+  ASSERT_TRUE(ordinalB.isOk());
+  EXPECT_FALSE(ordinalA.unwrap());
+  EXPECT_FALSE(ordinalB.unwrap());
+  // Preserve the existing no-comparison behavior for empty and single lists.
+  witness->mCalls = 0;
+  ASSERT_EQ(NS_OK, folders.GetFolderChildren(single, children));
+  EXPECT_TRUE(children.IsEmpty());
+  ASSERT_EQ(NS_OK, folders.GetFolderChildren(singleParent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{single}), children);
+  EXPECT_EQ(0u, witness->mCalls);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(control, "caller"_ns,
+                                                         "pending"_ns));
+  children = {UINT64_MAX};
+  EXPECT_EQ(original, folders.GetFolderChildren(parent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{UINT64_MAX}), children);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString text;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(control, "caller"_ns, text));
+  EXPECT_EQ("pending"_ns, text);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL("DROP VIEW temp.folders"_ns));
+  ASSERT_EQ(NS_OK, mConnection->RemoveFunction("unreadable_folder_flag"_ns));
+  cleanup.release();
+  ASSERT_EQ(NS_OK, folders.GetFolderChildren(parent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{b, a}), children);
+  uint64_t after;
+  ASSERT_EQ(NS_OK, SearchWatermark(after));
+  EXPECT_EQ(watermark, after);
+  // Every call must read current flags even when folder metadata is hot.
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(a, nsMsgFolderFlags::Inbox));
+  ASSERT_EQ(NS_OK, folders.UpdateFlags(b, nsMsgFolderFlags::Trash));
+  ASSERT_EQ(NS_OK, folders.GetFolderChildren(parent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{a, b}), children);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  ASSERT_EQ(NS_OK, folders.GetFolderChildren(parent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{b, a}), children);
+  ASSERT_EQ(NS_OK, SearchWatermark(after));
+  EXPECT_EQ(watermark, after);
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(parent, a, b));
+  ASSERT_EQ(NS_OK, folders.GetFolderChildren(parent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{a, b}), children);
+  ASSERT_EQ(NS_OK, folders.ResetChildOrder(parent));
+  ASSERT_EQ(NS_OK, folders.GetFolderChildren(parent, children));
+  EXPECT_EQ((nsTArray<uint64_t>{b, a}), children);
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(a, parent, "Alpha"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(b, parent, "Beta"_ns));
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(control, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"one"_ns, "one"_ns}), refs);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(control, "caller"_ns, text));
+  EXPECT_TRUE(text.IsEmpty());
 }
 
 }  // namespace mozilla::mailnews

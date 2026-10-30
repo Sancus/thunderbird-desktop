@@ -1003,7 +1003,29 @@ Result<nsTArray<uint64_t>, nsresult> FolderDatabase::GetFolderChildren(
   // folderId can be 0, to return root folders.
   nsTArray<uint64_t> children = MOZ_TRY(GetFolderChildrenUnsorted(folderId));
 
-  children.Sort(mComparator);
+  if (children.Length() < 2) {
+    return children;
+  }
+  // Fetch fallible metadata before sorting. A comparator cannot propagate a
+  // storage error, and must not replace unreadable keys with default values.
+  nsTArray<FolderComparator::Key> keys;
+  if (!keys.SetCapacity(children.Length(), fallible)) {
+    return Err(NS_ERROR_OUT_OF_MEMORY);
+  }
+  for (uint64_t id : children) {
+    FolderComparator::Key key;
+    key.id = id;
+    key.ordinal = MOZ_TRY(GetFolderOrdinal(id));
+    key.flags = MOZ_TRY(GetFolderFlags(id));
+    key.name = MOZ_TRY(GetFolderName(id));
+    if (!keys.AppendElement(std::move(key), fallible)) {
+      return Err(NS_ERROR_OUT_OF_MEMORY);
+    }
+  }
+  keys.Sort(mComparator);
+  for (size_t i = 0; i < children.Length(); ++i) {
+    children[i] = keys[i].id;
+  }
   return children;
 };
 

@@ -51,7 +51,7 @@ class FolderDatabase : public nsIFolderDatabase {
  private:
   friend class DatabaseCore;
 
-  FolderDatabase() : mComparator(*this) {};
+  FolderDatabase() = default;
 
  private:
   friend class DatabaseCore;

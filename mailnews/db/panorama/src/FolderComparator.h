@@ -7,31 +7,36 @@
 
 #include <cstdint>
 
+#include "mozilla/Maybe.h"
+#include "nsString.h"
+
 namespace mozilla::intl {
 class Collator;
 }
 namespace mozilla::mailnews {
-
-class FolderDatabase;
 
 /**
  * Compares folders for display in the right order. Folders with an ordinal in
  * the database are sorted ahead of those without. Folders without an ordinal
  * are sorted in alphabetical order.
  *
- * A future version of this class will handle special folder types (e.g.
- * Inbox, which goes ahead of ordinary folders).
+ * FolderDatabase prepares checked sort keys before invoking this comparator,
+ * so comparison itself performs no database reads.
  */
 class FolderComparator {
  public:
-  FolderComparator() = delete;
-  explicit FolderComparator(FolderDatabase& folderDB) : mFolderDB(folderDB) {}
-  bool Equals(uint64_t a, uint64_t b) const;
-  bool LessThan(uint64_t a, uint64_t b) const;
+  struct Key {
+    uint64_t id{0};
+    Maybe<uint64_t> ordinal;
+    uint32_t flags{0};
+    nsCString name;
+  };
+  FolderComparator() = default;
+  bool Equals(const Key& a, const Key& b) const;
+  bool LessThan(const Key& a, const Key& b) const;
 
  private:
   uint8_t SpecialFlagsOrder(const uint32_t flags) const;
-  FolderDatabase& mFolderDB;
 };
 
 }  // namespace mozilla::mailnews

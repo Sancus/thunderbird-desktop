@@ -4,7 +4,6 @@
 
 #include "FolderComparator.h"
 
-#include "FolderDatabase.h"
 #include "mozilla/intl/AppCollator.h"
 #include "mozilla/intl/LocaleService.h"
 #include "nsMsgFolderFlags.h"
@@ -14,16 +13,14 @@ using mozilla::intl::LocaleService;
 
 namespace mozilla::mailnews {
 
-bool FolderComparator::Equals(uint64_t a, uint64_t b) const {
-  Maybe<uint64_t> ordA = mFolderDB.GetFolderOrdinal(a).unwrapOr(Nothing());
-  Maybe<uint64_t> ordB = mFolderDB.GetFolderOrdinal(b).unwrapOr(Nothing());
+bool FolderComparator::Equals(const Key& a, const Key& b) const {
+  const auto& ordA = a.ordinal;
+  const auto& ordB = b.ordinal;
 
   if (ordA.isNothing()) {
     if (ordB.isNothing()) {
-      nsCString nameA = mFolderDB.GetFolderName(a).unwrapOr(""_ns);
-      nsCString nameB = mFolderDB.GetFolderName(b).unwrapOr(""_ns);
       // FIXME: This doesn't do a numeric comparison, but it should.
-      return mozilla::intl::AppCollator::CompareBase(nameA, nameB) == 0;
+      return mozilla::intl::AppCollator::CompareBase(a.name, b.name) == 0;
     }
     return false;
   }
@@ -36,14 +33,12 @@ bool FolderComparator::Equals(uint64_t a, uint64_t b) const {
     return false;
   }
 
-  uint32_t flagsA = mFolderDB.GetFolderFlags(a).unwrapOr(0);
-  uint32_t flagsB = mFolderDB.GetFolderFlags(b).unwrapOr(0);
-  return SpecialFlagsOrder(flagsA) == SpecialFlagsOrder(flagsB);
+  return SpecialFlagsOrder(a.flags) == SpecialFlagsOrder(b.flags);
 }
 
-bool FolderComparator::LessThan(uint64_t a, uint64_t b) const {
-  Maybe<uint64_t> ordA = mFolderDB.GetFolderOrdinal(a).unwrapOr(Nothing());
-  Maybe<uint64_t> ordB = mFolderDB.GetFolderOrdinal(b).unwrapOr(Nothing());
+bool FolderComparator::LessThan(const Key& a, const Key& b) const {
+  const auto& ordA = a.ordinal;
+  const auto& ordB = b.ordinal;
   if (ordA.isSome()) {
     if (ordB.isSome()) {
       return ordA < ordB;
@@ -55,10 +50,8 @@ bool FolderComparator::LessThan(uint64_t a, uint64_t b) const {
     return false;
   }
 
-  uint32_t flagsA = mFolderDB.GetFolderFlags(a).unwrapOr(0);
-  uint32_t flagsB = mFolderDB.GetFolderFlags(b).unwrapOr(0);
-  uint8_t aFlagsOrder = SpecialFlagsOrder(flagsA);
-  uint8_t bFlagsOrder = SpecialFlagsOrder(flagsB);
+  uint8_t aFlagsOrder = SpecialFlagsOrder(a.flags);
+  uint8_t bFlagsOrder = SpecialFlagsOrder(b.flags);
   if (aFlagsOrder < bFlagsOrder) {
     return true;
   }
@@ -66,10 +59,8 @@ bool FolderComparator::LessThan(uint64_t a, uint64_t b) const {
     return false;
   }
 
-  nsCString nameA = mFolderDB.GetFolderName(a).unwrapOr(""_ns);
-  nsCString nameB = mFolderDB.GetFolderName(b).unwrapOr(""_ns);
   // FIXME: This doesn't do a numeric comparison, but it should.
-  return mozilla::intl::AppCollator::CompareBase(nameA, nameB) < 0;
+  return mozilla::intl::AppCollator::CompareBase(a.name, b.name) < 0;
 }
 
 uint8_t FolderComparator::SpecialFlagsOrder(const uint32_t flags) const {

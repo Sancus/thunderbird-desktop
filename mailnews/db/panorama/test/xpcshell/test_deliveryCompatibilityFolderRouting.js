@@ -282,3 +282,179 @@ add_task(function test_logicalCodecPreservesPhysicalCachedWrappers() {
   Assert.equal(conflicting.id, id);
   Assert.equal(conflicting.parent, null);
 });
+
+add_task(function test_folderWrapperRetainsItsDatabaseSource() {
+  const folder = createFolder("wrapper-source");
+  const child = folder.createLocalSubfolder("kept");
+  const id = folder.id;
+  const path = folder.path;
+  const filePath = folder.filePath;
+  const uri = folder.URI;
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  const update = connection.createStatement(
+    "UPDATE database_identity SET sourceId = :source"
+  );
+  try {
+    Assert.equal(
+      folder.id,
+      id,
+      "Current-source ID reads allow caller transactions"
+    );
+    Assert.equal(folder.path, path);
+    Assert.ok(folder.filePath.equals(filePath));
+    Assert.deepEqual(folder.subFolders, [child]);
+    Assert.deepEqual(folder.descendants, [child]);
+    Assert.strictEqual(folder.getChildNamed("kept"), child);
+    update.params.source = Services.uuid.generateUUID().toString();
+    update.execute();
+    Assert.throws(() => folder.id, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => folder.path, /NS_ERROR_NOT_AVAILABLE/);
+    for (const get of [
+      () => folder.filePath,
+      () => folder.descendants,
+      () => folder.subFolders,
+      () => folder.hasSubFolders,
+      () => folder.numSubFolders,
+      () => folder.getChildNamed("kept"),
+      () => folder.getChildWithURI(child.URI, false, false),
+      () => folder.addSubfolder("blocked"),
+      () => MailServices.folderLookup.getFolderForURL(uri),
+      () => MailServices.folderLookup.getOrCreateFolderForURL(uri),
+      () => MailServices.folderLookup.createFolderAndCache(folder, "kept"),
+      () => MailServices.folderLookup.cache(uri, folder),
+    ]) {
+      Assert.throws(get, /NS_ERROR_NOT_AVAILABLE/);
+    }
+
+    Assert.equal(
+      folder.URI,
+      uri,
+      "A stale wrapper is not rebound to another URI"
+    );
+  } finally {
+    update.finalize();
+    connection.rollbackTransaction();
+  }
+  Assert.equal(folder.id, id);
+  Assert.equal(folder.path, path);
+  Assert.ok(folder.filePath.equals(filePath));
+  Assert.deepEqual(folder.subFolders, [child]);
+  Assert.equal(folderDB.getFolderChildNamed(id, "blocked"), 0);
+  Assert.strictEqual(folder.parent, root);
+  Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), folder);
+
+  connection.executeSimpleSQL(
+    "ALTER TABLE database_identity RENAME TO held_wrapper_identity"
+  );
+  try {
+    Assert.throws(
+      () => folder.id,
+      error => error.result == Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => folder.path,
+      error => error.result == Cr.NS_ERROR_FAILURE
+    );
+    for (const get of [
+      () => folder.filePath,
+      () => folder.descendants,
+      () => folder.subFolders,
+      () => folder.getChildNamed("kept"),
+      () => folder.addSubfolder("blocked-error"),
+      () => MailServices.folderLookup.getFolderForURL(uri),
+      () => MailServices.folderLookup.getOrCreateFolderForURL(uri),
+    ]) {
+      Assert.throws(get, error => error.result == Cr.NS_ERROR_FAILURE);
+    }
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE held_wrapper_identity RENAME TO database_identity"
+    );
+  }
+  Assert.equal(
+    folder.id,
+    id,
+    "The original storage error does not rebind the ID"
+  );
+  Assert.equal(folder.path, path);
+  Assert.ok(folder.filePath.equals(filePath));
+  Assert.strictEqual(folderDB.getMsgFolderForFolder(id), folder);
+});
+add_task(async function test_shutdownWrapperCannotReparseNativeStorage() {
+  const folder = createFolder("shutdown-native-wrapper");
+  const child = folder
+    .createLocalSubfolder("retained-child")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const sibling = createFolder("shutdown-native-control");
+  const header = folder.addMessage(raw);
+  const childHeader = child.addMessage(raw);
+  const siblingHeader = sibling.addMessage(raw);
+  const id = folder.id;
+  const childId = child.id;
+  const path = folder.filePath;
+  const childPath = child.filePath;
+  const bytes = await IOUtils.read(path.path);
+  const childBytes = await IOUtils.read(childPath.path);
+  const store = folder.msgStore;
+  for (const [owner, message] of [
+    [folder, header],
+    [child, childHeader],
+  ]) {
+    const stream = store.getMsgInputStream(
+      owner,
+      message.storeToken,
+      message.messageSize
+    );
+    Assert.greater(stream.available(), 0, "The real source body is readable");
+    stream.close();
+  }
+  folder.Shutdown(true);
+  Assert.equal(folder.id, 0, "Shutdown clears the wrapper's admitted ID");
+  Assert.equal(child.id, 0);
+  for (const [owner, message] of [
+    [folder, header],
+    [child, childHeader],
+  ]) {
+    let unexpected;
+    try {
+      Assert.throws(
+        () => {
+          unexpected = store.getMsgInputStream(
+            owner,
+            message.storeToken,
+            message.messageSize
+          );
+        },
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+        "Cleared wrappers cannot resolve old URI bytes without native identity"
+      );
+    } finally {
+      unexpected?.close();
+    }
+    for (const call of [
+      () => owner.filePath,
+      () => owner.subFolders,
+      () => owner.descendants,
+      () => owner.userSortOrder,
+      () => (owner.userSortOrder = 19),
+    ]) {
+      Assert.throws(call, error => error.result == Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  Assert.deepEqual(await IOUtils.read(path.path), bytes);
+  Assert.deepEqual(await IOUtils.read(childPath.path), childBytes);
+  Assert.equal(folderDB.getFolderName(id), "shutdown-native-wrapper");
+  Assert.equal(folderDB.getFolderName(childId), "retained-child");
+  const stream = store.getMsgInputStream(
+    sibling,
+    siblingHeader.storeToken,
+    siblingHeader.messageSize
+  );
+  Assert.greater(
+    stream.available(),
+    0,
+    "Unrelated native bodies remain readable"
+  );
+  stream.close();
+});

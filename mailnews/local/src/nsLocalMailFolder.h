@@ -196,6 +196,10 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
   nsresult AddMessageBatch2(const nsTArray<nsCString>& rawMessages,
                             nsTArray<RefPtr<nsIMsgDBHdr>>& addedHdrs);
   static nsresult RetireLocalTrashContents(nsIMsgFolder* folder);
+  nsresult RelocateNativeLocalFolder(nsIMsgFolder* targetParent,
+                                     const nsACString& name,
+                                     nsIMsgWindow* msgWindow,
+                                     nsIMsgFolder** replacement);
 #endif
   nsresult UpdateMsgFlagsInStore(nsTArray<RefPtr<nsIMsgDBHdr>> const& msgs);
   nsresult CopyFolderAcrossServer(nsIMsgFolder* srcFolder,

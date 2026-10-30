@@ -5,10 +5,13 @@
 #include "gtest/gtest.h"
 #include "Helpers.h"
 #include "mozilla/Try.h"
+#include "nsComponentManagerUtils.h"
 #include "nsDirectoryServiceDefs.h"
 #include "nsDirectoryServiceUtils.h"
 #include "nsIFile.h"
 #include "nsIInputStream.h"
+#include "nsIMsgPluggableStore.h"
+#include "nsMsgDBFolder.h"
 #include "nsMsgLocalStoreUtils.h"
 #include "nsNetUtil.h"
 
@@ -37,6 +40,29 @@ nsresult ReadStorageFile(const nsCOMPtr<nsIFile>& file, nsACString& bytes) {
   nsresult closed = stream->Close();
   return NS_FAILED(rv) ? rv : closed;
 }
+
+// The provider receives a real path and a typed admission failure through its
+// ordinary folder boundary. No database identity or message header is invented.
+class StorageAdmissionFolder final : public nsMsgDBFolder {
+ public:
+  explicit StorageAdmissionFolder(nsIFile* path) : mStorage(path) {
+    mURI = "mailbox://storage-admission/source"_ns;
+  }
+
+  NS_IMETHOD GetFilePath(nsIFile** path) override {
+    NS_ENSURE_SUCCESS(admissionStatus, admissionStatus);
+    return mStorage->Clone(path);
+  }
+
+  nsresult admissionStatus = NS_OK;
+
+ protected:
+  nsresult GetDatabase() override { return NS_ERROR_NOT_AVAILABLE; }
+
+ private:
+  ~StorageAdmissionFolder() override = default;
+  nsCOMPtr<nsIFile> mStorage;
+};
 
 class FolderStorageMoveTest : public testing::Test {
  protected:
@@ -156,6 +182,50 @@ class FolderStorageMoveTest : public testing::Test {
     EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED, move.Apply());
   }
 
+  void CheckMaildirAdmission(nsresult error) {
+    ASSERT_EQ(NS_OK, CreateTree(true));
+    auto source = Path(u"source"_ns);
+    RefPtr<StorageAdmissionFolder> folder = new StorageAdmissionFolder(source);
+    nsresult rv;
+    nsCOMPtr<nsIMsgPluggableStore> store =
+        do_CreateInstance("@mozilla.org/msgstore/maildirstore;1", &rv);
+    ASSERT_EQ(NS_OK, rv);
+    ASSERT_TRUE(store);
+    nsCOMPtr<nsIOutputStream> issued;
+    ASSERT_EQ(NS_OK,
+              store->GetNewMsgOutputStream(folder, getter_AddRefs(issued)));
+    const nsLiteralCString first =
+        "From: sender@example.invalid\r\n\r\nIssued bytes."_ns;
+    uint32_t written;
+    ASSERT_EQ(NS_OK,
+              issued->Write(first.BeginReading(), first.Length(), &written));
+    ASSERT_EQ(first.Length(), written);
+
+    folder->admissionStatus = error;
+    nsCOMPtr<nsIOutputStream> rejected;
+    EXPECT_EQ(error,
+              store->GetNewMsgOutputStream(folder, getter_AddRefs(rejected)));
+    EXPECT_FALSE(rejected);
+    EXPECT_EQ(NS_OK, issued->StreamStatus());
+
+    // Restoring path admission is a test input, not a native recovery release.
+    // The already-issued write must still own its stream and original bytes.
+    folder->admissionStatus = NS_OK;
+    const nsLiteralCString tail = " Retain this write.\r\n"_ns;
+    ASSERT_EQ(NS_OK,
+              issued->Write(tail.BeginReading(), tail.Length(), &written));
+    ASSERT_EQ(tail.Length(), written);
+    nsCString token;
+    ASSERT_EQ(NS_OK, store->FinishNewMessage(folder, issued, token));
+    ASSERT_FALSE(token.IsEmpty());
+    auto cur = Child(source, u"cur"_ns);
+    ExpectBytes(Child(cur, NS_ConvertUTF8toUTF16(token)), first + tail);
+    EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+              store->FinishNewMessage(folder, issued, token));
+    ExpectBytes(Child(cur, NS_ConvertUTF8toUTF16(token)), first + tail);
+    ExpectTree(u"source"_ns, true);
+  }
+
   nsCOMPtr<nsIFile> mRoot;
   bool mOwnsRoot{false};
 };
@@ -254,6 +324,14 @@ TEST_F(FolderStorageMoveTest, SamePathLeavesStorageUntouched) {
   ExpectTree(u"source"_ns, true);
   ASSERT_EQ(NS_OK, move.Rollback());
   ExpectTree(u"source"_ns, true);
+}
+
+TEST_F(FolderStorageMoveTest, MaildirRecoveryAdmissionKeepsIssuedWrite) {
+  CheckMaildirAdmission(NS_ERROR_IN_PROGRESS);
+}
+
+TEST_F(FolderStorageMoveTest, MaildirPathErrorKeepsIssuedWrite) {
+  CheckMaildirAdmission(NS_ERROR_FILE_ACCESS_DENIED);
 }
 
 }  // namespace

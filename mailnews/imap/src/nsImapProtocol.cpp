@@ -7540,6 +7540,17 @@ void nsImapProtocol::FolderNotCreated(const char* folderName) {
 
 void nsImapProtocol::FolderRenamed(const char* oldName, const char* newName) {
   if (NS_FAILED(m_mailboxUpdateResult)) return;
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Native physical/wrapper settlement belongs to the prepared main-thread
+    // URL continuation. Never reconstruct its source from a mutable name.
+    m_mailboxUpdateResult =
+        static_cast<nsImapUrl*>(m_runningUrl.get())
+            ->ConfirmNativeHierarchy(nsDependentCString(oldName),
+                                     nsDependentCString(newName));
+    return;
+  }
+#endif
   char onlineDelimiter = kOnlineHierarchySeparatorUnknown;
 
   if ((m_hierarchyNameState == kNoOperationInProgress) ||
@@ -7602,6 +7613,11 @@ void nsImapProtocol::OnRenameFolder(const char* sourceMailbox) {
   // A successful LIST must not overwrite a failed server rename or local
   // settlement. Common URL completion still delivers the original error.
   if (NS_FAILED(m_mailboxUpdateResult)) return;
+#ifdef MOZ_PANORAMA
+  // The new native name is published only during checked local settlement at
+  // URL completion. LIST here could create a competing physical row first.
+  if (static_cast<nsImapUrl*>(m_runningUrl.get())->HasNativeHierarchy()) return;
+#endif
 
   // Cause a LIST and re-discovery when slash and/or ^ are escaped. Also
   // needed when folder renamed to non-ASCII UTF-8 when UTF8=ACCEPT in

@@ -5,6 +5,8 @@
 #include "msgCore.h"  // precompiled header...
 #include "nsMsgLocalStoreUtils.h"
 #include "nsIMsgDatabase.h"
+#include "nsIMsgFolder.h"
+#include "nsIMsgPluggableStore.h"
 #include "nsIRandomAccessStream.h"
 #include "HeaderReader.h"
 #include "nsCharSeparatedTokenizer.h"
@@ -368,6 +370,15 @@ nsresult nsMsgLocalStoreUtils::ChangeKeywordsHelper(
 
 #ifdef MOZ_PANORAMA
 namespace mozilla::mailnews {
+
+nsresult CheckFolderStorageMove(nsIMsgFolder* folder) {
+  NS_ENSURE_ARG(folder);
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+  nsCOMPtr<nsIFolderStorageMoveAdmission> admission = do_QueryInterface(store);
+  NS_ENSURE_TRUE(admission, NS_ERROR_NOT_IMPLEMENTED);
+  return admission->CheckFolderStorageMove(folder);
+}
 
 nsresult FolderStorageMove::Prepare(nsIFile* source, nsIFile* destination) {
   NS_ENSURE_ARG(source);

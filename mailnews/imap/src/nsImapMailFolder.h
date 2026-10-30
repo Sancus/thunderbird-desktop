@@ -33,6 +33,8 @@ class nsIFolderLookupService;
 class nsIMsgIdentity;
 class nsIMsgOfflineImapOperation;
 class nsIMsgThread;
+class nsImapUrl;
+class nsImapFolderRelocation;
 
 #define COPY_BUFFER_SIZE 16384
 
@@ -216,6 +218,15 @@ class nsImapMailFolder : public nsMsgDBFolder,
 
  public:
   nsImapMailFolder();
+#ifdef MOZ_PANORAMA
+  friend class nsImapFolderRelocation;
+  nsresult PrepareNativeImapFolderRelocation(nsImapUrl* url,
+                                             nsIMsgFolder* targetParent,
+                                             const nsACString& onlineLeaf,
+                                             const nsACString* displayName);
+  static nsresult CompleteNativeImapFolderRelocation(
+      nsIImapUrl* url, nsresult status, nsIMsgFolder** replacement = nullptr);
+#endif
 
   NS_DECL_ISUPPORTS_INHERITED
 

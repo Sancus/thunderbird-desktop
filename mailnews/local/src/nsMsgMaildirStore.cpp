@@ -240,7 +240,22 @@ nsMsgMaildirStore::nsMsgMaildirStore() {
 
 nsMsgMaildirStore::~nsMsgMaildirStore() {}
 
+#ifdef MOZ_PANORAMA
+NS_IMPL_ISUPPORTS(nsMsgMaildirStore, nsIMsgPluggableStore,
+                  nsIFolderStorageMoveAdmission)
+
+NS_IMETHODIMP nsMsgMaildirStore::CheckFolderStorageMove(nsIMsgFolder* folder) {
+  NS_ENSURE_ARG(folder);
+  auto entry = mOngoingWrites.lookup(folder->URI());
+  if (!entry) return NS_OK;
+  if (NS_FAILED(entry->value().finishStatus))
+    return entry->value().finishStatus;
+  nsresult status = entry->value().stream->StreamStatus();
+  return NS_FAILED(status) ? status : NS_MSG_FOLDER_BUSY;
+}
+#else
 NS_IMPL_ISUPPORTS(nsMsgMaildirStore, nsIMsgPluggableStore)
+#endif
 
 nsCString nsMsgMaildirStore::UniqueName() {
   // Generate a unique filename.
@@ -774,7 +789,11 @@ NS_IMETHODIMP nsMsgMaildirStore::CopyFolder(
 
 nsresult nsMsgMaildirStore::InternalGetNewMsgOutputStream(
     nsIMsgFolder* folder, nsACString& storeToken, nsIOutputStream** outStream) {
-  nsresult rv;
+  // Check path admission before preempting an issued stream. A failed native
+  // relocation can deny this path while the previous stream still owns bytes.
+  nsCOMPtr<nsIFile> admittedPath;
+  nsresult rv = folder->GetFilePath(getter_AddRefs(admittedPath));
+  NS_ENSURE_SUCCESS(rv, rv);
   // To set up to write a new message:
   // 1. Discard any ongoing write already active in the folder.
   // 2. Generate a unique filename.

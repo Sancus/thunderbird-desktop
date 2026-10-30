@@ -76,6 +76,12 @@ nsImapUrl::~nsImapUrl() {
   // principal/URI deserialization, on other threads). The weak references
   // hold a non-threadsafe nsWeakReference proxy that belongs to the main
   // thread, so it must be released there too.
+#ifdef MOZ_PANORAMA
+  NS_ReleaseOnMainThread("nsImapUrl::mNativeHierarchyContinuation",
+                         mNativeHierarchyContinuation.forget());
+  NS_ReleaseOnMainThread("nsImapUrl::mNativeHierarchyCopyState",
+                         mNativeHierarchyCopyState.forget());
+#endif
   NS_ReleaseOnMainThread("nsImapUrl::m_imapFolder", m_imapFolder.forget());
   NS_ReleaseOnMainThread("nsImapUrl::m_imapMailFolderSink",
                          m_imapMailFolderSink.forget());
@@ -911,6 +917,66 @@ NS_IMETHODIMP nsImapUrl::GetMimePartSelectorDetected(
 }
 
 #ifdef MOZ_PANORAMA
+nsresult nsImapUrl::PrepareNativeHierarchy(const nsACString& source,
+                                           const nsACString& destination,
+                                           nsISupports* continuation,
+                                           nsISupports* copyState) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG(continuation);
+  NS_ENSURE_FALSE(source.IsEmpty() || destination.IsEmpty(),
+                  NS_ERROR_INVALID_ARG);
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_FALSE(mNativeHierarchy, NS_ERROR_ALREADY_INITIALIZED);
+  mNativeHierarchy.emplace(
+      NativeHierarchyEvidence{nsCString(source), nsCString(destination)});
+  mNativeHierarchyContinuation = continuation;
+  mNativeHierarchyCopyState = copyState;
+  return NS_OK;
+}
+
+bool nsImapUrl::HasNativeHierarchy() {
+  MutexAutoLock lock(mLock);
+  return mNativeHierarchy.isSome();
+}
+
+nsresult nsImapUrl::ConfirmNativeHierarchy(const nsACString& source,
+                                           const nsACString& destination) {
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(mNativeHierarchy && mNativeHierarchy->source == source &&
+                     mNativeHierarchy->destination == destination &&
+                     !mNativeHierarchy->confirmed,
+                 NS_ERROR_NOT_AVAILABLE);
+  mNativeHierarchy->confirmed = true;
+  return NS_OK;
+}
+
+bool nsImapUrl::NativeHierarchyConfirmed() {
+  MutexAutoLock lock(mLock);
+  return mNativeHierarchy && mNativeHierarchy->confirmed;
+}
+
+nsISupports* nsImapUrl::NativeHierarchyContinuation() {
+  MOZ_ASSERT(NS_IsMainThread());
+  return mNativeHierarchyContinuation;
+}
+
+nsISupports* nsImapUrl::NativeHierarchyCopyState() {
+  MOZ_ASSERT(NS_IsMainThread());
+  return mNativeHierarchyCopyState;
+}
+
+void nsImapUrl::ClearNativeHierarchyContinuation() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mNativeHierarchyContinuation = nullptr;
+}
+
+bool nsImapUrl::BeginNativeHierarchyCompletion() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mNativeHierarchyCompletionStarted) return false;
+  mNativeHierarchyCompletionStarted = true;
+  return true;
+}
+
 nsresult nsImapUrl::SetExpectedUidValidity(uint32_t epoch) {
   NS_ENSURE_TRUE(epoch, NS_ERROR_INVALID_ARG);
   MutexAutoLock lock(mLock);
@@ -1081,6 +1147,9 @@ nsresult nsImapUrl::Clone(nsIURI** _retval) {
   NS_ENSURE_STATE(clonedImap);
   auto* clone = static_cast<nsImapUrl*>(clonedImap.get());
   MutexAutoLock lock(mLock);
+  // A URI clone carries refusal/identity evidence, never the unique prepared
+  // main-thread operation. It cannot complete local settlement on its own.
+  if (mNativeHierarchy) clone->mNativeHierarchy = mNativeHierarchy;
   clone->m_expectedUidValidity = m_expectedUidValidity;
   clone->mFlagDeleteIsMove = mFlagDeleteIsMove;
   if (mCopyTargets) {

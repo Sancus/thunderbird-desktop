@@ -3,6 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "FolderPopulation.h"
+#include "FolderLookupService.h"
+#include "nsQueryObject.h"
 #include "IHeaderBlock.h"
 #include "MailNewsTypes.h"
 #include "msgCore.h"
@@ -73,6 +75,8 @@
 #ifdef MOZ_PANORAMA
 #  include "FolderDatabase.h"
 #  include "DatabaseCore.h"
+#  include "DatabaseUtils.h"
+#  include "nsMsgLocalStoreUtils.h"
 #endif  // MOZ_PANORAMA
 
 using namespace mozilla;
@@ -2642,6 +2646,7 @@ nsCString nsIMsgFolder::URI() {
 
 NS_IMETHODIMP
 nsMsgDBFolder::GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) {
+  MOZ_TRY(CheckFolderPathAccess());
   folders.ClearAndRetainStorage();
   folders.SetCapacity(mSubFolders.Length());
   for (nsIMsgFolder* f : mSubFolders) {
@@ -2665,6 +2670,7 @@ nsMsgDBFolder::FindSubFolder(const nsACString& aEscapedSubFolderName,
 NS_IMETHODIMP
 nsMsgDBFolder::GetHasSubFolders(bool* _retval) {
   NS_ENSURE_ARG_POINTER(_retval);
+  MOZ_TRY(CheckFolderPathAccess());
   *_retval = mSubFolders.Count() > 0;
   return NS_OK;
 }
@@ -2672,6 +2678,7 @@ nsMsgDBFolder::GetHasSubFolders(bool* _retval) {
 NS_IMETHODIMP
 nsMsgDBFolder::GetNumSubFolders(uint32_t* aResult) {
   NS_ENSURE_ARG_POINTER(aResult);
+  MOZ_TRY(CheckFolderPathAccess());
   *aResult = mSubFolders.Count();
   return NS_OK;
 }
@@ -2825,6 +2832,7 @@ nsresult nsMsgDBFolder::GetCachedChild(uint64_t folderId,
                                        nsIMsgFolder** child) {
   NS_ENSURE_ARG_POINTER(child);
   *child = nullptr;
+  MOZ_TRY(CheckFolderPathAccess());
   RefPtr<mozilla::mailnews::DatabaseCore> dbCore =
       mozilla::mailnews::DatabaseCore::GetInstanceForService();
   nsCString path = MOZ_TRY(dbCore->FolderDB().GetFolderPath(folderId));
@@ -2967,9 +2975,475 @@ nsresult nsMsgDBFolder::InitWithFolderId(
 
   return NS_OK;
 }
+// Root storage is the caller's actual effective path. Moving its .sbd carries
+// descendants only if each child remains beneath its captured actual parent.
+static nsresult CheckRelocationChildPath(nsIFile* parent, nsIFile* child,
+                                         const nsACString& wireName) {
+  nsCOMPtr<nsIFile> expected;
+  MOZ_TRY(parent->Clone(getter_AddRefs(expected)));
+  nsAutoString leaf;
+  MOZ_TRY(expected->GetLeafName(leaf));
+  MOZ_TRY(expected->SetLeafName(leaf + u".sbd"_ns));
+  MOZ_TRY(expected->Append(EncodeFilename(wireName)));
+  bool equal = false;
+  MOZ_TRY(child->Equals(expected, &equal));
+  NS_ENSURE_TRUE(equal, NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+namespace mozilla::mailnews {
+NativeFolderRelocation::~NativeFolderRelocation() = default;
+
+nsIMsgFolder* NativeFolderRelocation::ReplacementFor(uint64_t id) const {
+  for (const auto& entry : mEntries) {
+    if (entry.id == id) return entry.replacement;
+  }
+  return nullptr;
+}
+}  // namespace mozilla::mailnews
+
+nsresult nsMsgDBFolder::PrepareNativeFolderRelocation(
+    nsIMsgFolder* targetParent, const nsACString& storedName,
+    nsISupports* recoveryOwner,
+    RefPtr<mozilla::mailnews::NativeFolderRelocation>& output) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(StaticPrefs::mail_panorama_enabled_AtStartup(),
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_ARG(targetParent);
+  NS_ENSURE_ARG(recoveryOwner);
+  MOZ_TRY(CheckFolderPathAccess());
+  NS_ENSURE_TRUE(mFolderId && !mIsServer, NS_ERROR_UNEXPECTED);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  nsCString name = MOZ_TRY(DatabaseUtils::Normalize(storedName));
+  NS_ENSURE_FALSE(name.IsEmpty(), NS_ERROR_INVALID_ARG);
+  uint64_t targetId;
+  MOZ_TRY(targetParent->GetId(&targetId));
+  NS_ENSURE_TRUE(targetId, NS_ERROR_NOT_AVAILABLE);
+  auto* target = static_cast<nsMsgDBFolder*>(targetParent);
+  MOZ_TRY(target->CheckFolderPathAccess());
+  NS_ENSURE_TRUE(target->mFolderDatabaseSourceId == mFolderDatabaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  auto& folders = core->FolderDB();
+  uint64_t root = MOZ_TRY(folders.GetFolderRoot(mFolderId));
+  uint64_t targetRoot = MOZ_TRY(folders.GetFolderRoot(targetId));
+  NS_ENSURE_TRUE(root == targetRoot, NS_ERROR_INVALID_ARG);
+  uint64_t parentId = MOZ_TRY(folders.GetFolderParent(mFolderId));
+  nsCString oldName = MOZ_TRY(folders.GetFolderName(mFolderId));
+  NS_ENSURE_TRUE(parentId, NS_ERROR_UNEXPECTED);
+  NS_ENSURE_FALSE(parentId == targetId && oldName == name,
+                  NS_ERROR_INVALID_ARG);
+  nsCOMPtr<nsIMsgFolder> parent;
+  MOZ_TRY(GetParent(getter_AddRefs(parent)));
+  NS_ENSURE_TRUE(parent, NS_ERROR_NOT_AVAILABLE);
+  uint64_t wrapperParentId;
+  MOZ_TRY(parent->GetId(&wrapperParentId));
+  NS_ENSURE_TRUE(parentId == wrapperParentId, NS_ERROR_UNEXPECTED);
+
+  RefPtr<NativeFolderRelocation> operation = new NativeFolderRelocation();
+  operation->mSourceId = mFolderDatabaseSourceId;
+  operation->mSource = this;
+  operation->mOriginalParent = static_cast<nsMsgDBFolder*>(parent.get());
+  operation->mTargetParent = target;
+  operation->mTargetParentId = targetId;
+  operation->mNewName = name;
+  operation->mSourceLogicalPath = MOZ_TRY(folders.GetFolderPath(mFolderId));
+  operation->mTargetLogicalPath = MOZ_TRY(folders.GetFolderPath(targetId));
+  operation->mFolderIds = MOZ_TRY(folders.GetFolderDescendants(mFolderId));
+  NS_ENSURE_FALSE(
+      operation->mFolderIds.Contains(targetId) || targetId == mFolderId,
+      NS_ERROR_INVALID_ARG);
+  operation->mFolderIds.InsertElementAt(0, mFolderId);
+  nsCOMPtr<nsIMsgIncomingServer> server;
+  MOZ_TRY(GetServer(getter_AddRefs(server)));
+  nsAutoCString key, serverURI;
+  MOZ_TRY(server->GetKey(key));
+  nsCString rootName = MOZ_TRY(folders.GetFolderName(root));
+  NS_ENSURE_TRUE(key == rootName, NS_ERROR_UNEXPECTED);
+  MOZ_TRY(server->GetServerURI(serverURI));
+  // Validate the actual physical wrapper's URI/path, not an alias supplied by
+  // a mutable cached path or an unrelated folder with the same leaf name.
+  auto checkLocation = [&](nsMsgDBFolder* wrapper, uint64_t id) -> nsresult {
+    nsCString logicalPath = MOZ_TRY(folders.GetFolderPath(id));
+    nsAutoCString escapedPath;
+    MOZ_TRY(EscapeLogicalFolderPath(logicalPath, escapedPath));
+    nsAutoCString uri(serverURI);
+    int32_t slash = escapedPath.FindChar('/');
+    if (slash != kNotFound) {
+      uri.Append(Substring(escapedPath, slash));
+    }
+    NS_ENSURE_TRUE(wrapper->mURI == uri, NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  };
+  MOZ_TRY(checkLocation(target, targetId));
+  operation->mTargetParentURI = target->mURI;
+  MOZ_TRY(target->GetFilePath(getter_AddRefs(operation->mTargetParentPath)));
+  nsAutoCString storeType;
+  MOZ_TRY(server->GetLocalStoreType(storeType));
+  NS_ENSURE_TRUE(
+      storeType.EqualsLiteral("mailbox") || storeType.EqualsLiteral("imap"),
+      NS_ERROR_NOT_IMPLEMENTED);
+  operation->mIsImap = storeType.EqualsLiteral("imap");
+  nsAutoCString contract("@mozilla.org/mail/folder-factory;1?name=");
+  contract.Append(storeType);
+  nsresult rv;
+  nsCOMPtr<nsIFolderLookupService> lookup =
+      do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  operation->mLookup = do_QueryObject(lookup);
+  NS_ENSURE_TRUE(operation->mLookup, NS_NOINTERFACE);
+
+  nsTArray<RefPtr<nsIMsgFolder>> originals{this};
+  for (size_t i = 0; i < originals.Length(); ++i) {
+    auto* original = static_cast<nsMsgDBFolder*>(originals[i].get());
+    MOZ_TRY(original->CheckFolderPathAccess());
+    uint64_t id = original->mFolderId;
+    MOZ_TRY(checkLocation(original, id));
+    NS_ENSURE_TRUE(operation->mFolderIds.Contains(id), NS_ERROR_UNEXPECTED);
+    for (const auto& entry : operation->mEntries) {
+      NS_ENSURE_TRUE(entry.id != id, NS_ERROR_UNEXPECTED);
+    }
+    NativeFolderRelocation::Entry entry;
+    entry.id = id;
+    entry.parent = MOZ_TRY(folders.GetFolderParent(id));
+    entry.name = MOZ_TRY(folders.GetFolderName(id));
+    entry.oldURI = original->mURI;
+    entry.original = original;
+    MOZ_TRY(original->GetFilePath(getter_AddRefs(entry.sourcePath)));
+    if (i) {
+      const NativeFolderRelocation::Entry* parentEntry = nullptr;
+      for (const auto& preceding : operation->mEntries) {
+        if (preceding.id == entry.parent) {
+          parentEntry = &preceding;
+          break;
+        }
+      }
+      NS_ENSURE_TRUE(parentEntry, NS_ERROR_UNEXPECTED);
+      MOZ_TRY(CheckRelocationChildPath(parentEntry->sourcePath,
+                                       entry.sourcePath, entry.name));
+    }
+    nsCOMPtr<nsIMsgFolder> fresh = do_CreateInstance(contract.get(), &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(fresh, NS_ERROR_NOT_AVAILABLE);
+    entry.replacement = static_cast<nsMsgDBFolder*>(fresh.get());
+    auto* replacement = entry.replacement.get();
+    replacement->mFolderInitAttempted = true;
+    replacement->mFolderRelocationPrepared = true;
+    replacement->mFolderId = id;
+    replacement->mFolderDatabaseSourceId = operation->mSourceId;
+    replacement->mServer = do_GetWeakReference(server);
+    replacement->mName = i ? entry.name : name;
+    replacement->mFlags = MOZ_TRY(folders.GetFolderFlags(id));
+    replacement->mIsServer = false;
+    replacement->mIsServerIsValid = true;
+    replacement->mHaveParsedURI = true;
+    replacement->mInitializedFromCache = true;
+    replacement->mUserSortOrder = original->mUserSortOrder;
+    nsMsgDBFolder* newParent = target;
+    if (i) {
+      newParent = nullptr;
+      for (const auto& preceding : operation->mEntries) {
+        if (preceding.id == entry.parent) {
+          newParent = preceding.replacement;
+          break;
+        }
+      }
+      NS_ENSURE_TRUE(newParent, NS_ERROR_UNEXPECTED);
+    }
+    replacement->mParent = do_GetWeakReference(newParent);
+    nsAutoCString escaped, intermediate;
+    MOZ_TRY(MsgEscapeString(replacement->mName, nsINetUtil::ESCAPE_URL_PATH,
+                            intermediate));
+    MOZ_TRY(MsgEscapeURL(intermediate,
+                         nsINetUtil::ESCAPE_URL_FILE_BASENAME |
+                             nsINetUtil::ESCAPE_URL_FILE_EXTENSION,
+                         escaped));
+    replacement->mURI = newParent->mURI + "/"_ns + escaped;
+    MOZ_TRY(replacement->CreateBaseMessageURI(replacement->mURI));
+    nsCOMPtr<nsIFile> parentPath;
+    if (i) {
+      MOZ_TRY(newParent->mPath->Clone(getter_AddRefs(parentPath)));
+    } else {
+      MOZ_TRY(target->GetFilePath(getter_AddRefs(parentPath)));
+    }
+    uint64_t nativeParent = i ? 1 : MOZ_TRY(folders.GetFolderParent(targetId));
+    if (nativeParent) {
+      nsAutoString leaf;
+      MOZ_TRY(parentPath->GetLeafName(leaf));
+      MOZ_TRY(parentPath->SetLeafName(leaf + u".sbd"_ns));
+    }
+    MOZ_TRY(parentPath->Append(EncodeFilename(replacement->mName)));
+    replacement->mPath = parentPath;
+    if (i) {
+      NS_ENSURE_TRUE(newParent->mSubFolders.AppendObject(replacement),
+                     NS_ERROR_OUT_OF_MEMORY);
+    }
+    nsTArray<RefPtr<nsIMsgFolder>> children;
+    MOZ_TRY(original->GetSubFolders(children));
+    for (const auto& child : children) {
+      uint64_t childId;
+      MOZ_TRY(child->GetId(&childId));
+      uint64_t actualParent = MOZ_TRY(folders.GetFolderParent(childId));
+      NS_ENSURE_TRUE(actualParent == id, NS_ERROR_UNEXPECTED);
+      originals.AppendElement(child);
+    }
+    operation->mEntries.AppendElement(std::move(entry));
+  }
+  NS_ENSURE_TRUE(operation->mEntries.Length() == operation->mFolderIds.Length(),
+                 NS_ERROR_NOT_AVAILABLE);
+  operation->mTargetPath = operation->mEntries[0].replacement->mPath;
+  MOZ_TRY(core->PrepareFolderRelocationRecovery(
+      operation->mSourceId, mFolderId, operation->mFolderIds, recoveryOwner,
+      operation->mRecovery));
+  output = std::move(operation);
+  return NS_OK;
+}
+
+nsresult nsMsgDBFolder::ValidateNativeFolderRelocation(
+    mozilla::mailnews::NativeFolderRelocation* operation) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG(operation);
+  NS_ENSURE_TRUE(operation->mSource == this && !operation->mEnded,
+                 NS_ERROR_NOT_AVAILABLE);
+  operation->mValidated = false;
+  MOZ_TRY(CheckFolderPathAccess());
+  MOZ_TRY(operation->mTargetParent->CheckFolderPathAccess());
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(core->ValidateFolderRelocationRecovery(operation->mRecovery));
+  nsCOMPtr<nsIFolderLookupService> current =
+      do_GetService("@mozilla.org/mail/folder-lookup;1");
+  NS_ENSURE_TRUE(current.get() == operation->mLookup.get(),
+                 NS_ERROR_NOT_AVAILABLE);
+  auto& folders = core->FolderDB();
+  uint64_t targetId;
+  MOZ_TRY(operation->mTargetParent->GetId(&targetId));
+  NS_ENSURE_TRUE(targetId == operation->mTargetParentId,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(operation->mTargetParent->mURI == operation->mTargetParentURI,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> targetFile;
+  MOZ_TRY(operation->mTargetParent->GetFilePath(getter_AddRefs(targetFile)));
+  bool sameTarget = false;
+  MOZ_TRY(targetFile->Equals(operation->mTargetParentPath, &sameTarget));
+  NS_ENSURE_TRUE(sameTarget, NS_ERROR_NOT_AVAILABLE);
+  nsCString sourcePath = MOZ_TRY(folders.GetFolderPath(mFolderId));
+  nsCString targetPath = MOZ_TRY(folders.GetFolderPath(targetId));
+  NS_ENSURE_TRUE(sourcePath == operation->mSourceLogicalPath &&
+                     targetPath == operation->mTargetLogicalPath,
+                 NS_ERROR_NOT_AVAILABLE);
+  for (const auto& entry : operation->mEntries) {
+    auto* original = entry.original.get();
+    MOZ_TRY(original->CheckFolderPathAccess());
+    NS_ENSURE_TRUE(
+        original->mFolderId == entry.id && original->mURI == entry.oldURI,
+        NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(CheckFolderStorageMove(original));
+    NS_ENSURE_FALSE(original->mSemaphoreHolder ||
+                        original->m_tempMessageStream ||
+                        original->m_offlineHeader || original->mDatabase ||
+                        original->mBackupDatabase,
+                    NS_ERROR_IN_PROGRESS);
+    uint64_t parent = MOZ_TRY(folders.GetFolderParent(entry.id));
+    nsCString name = MOZ_TRY(folders.GetFolderName(entry.id));
+    entry.replacement->mFlags = MOZ_TRY(folders.GetFolderFlags(entry.id));
+    entry.replacement->mUserSortOrder = original->mUserSortOrder;
+    NS_ENSURE_TRUE(parent == entry.parent && name == entry.name,
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgFolder> wrapperParent;
+    MOZ_TRY(original->GetParent(getter_AddRefs(wrapperParent)));
+    nsIMsgFolder* expectedParent = operation->mOriginalParent;
+    if (entry.id != mFolderId) {
+      expectedParent = nullptr;
+      for (const auto& preceding : operation->mEntries) {
+        if (preceding.id == parent) {
+          expectedParent = preceding.original;
+          break;
+        }
+      }
+    }
+    NS_ENSURE_TRUE(wrapperParent == expectedParent, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIFile> path;
+    MOZ_TRY(original->GetFilePath(getter_AddRefs(path)));
+    bool equal = false;
+    MOZ_TRY(path->Equals(entry.sourcePath, &equal));
+    NS_ENSURE_TRUE(equal, NS_ERROR_NOT_AVAILABLE);
+    if (entry.id != mFolderId) {
+      const NativeFolderRelocation::Entry* parentEntry = nullptr;
+      for (const auto& preceding : operation->mEntries) {
+        if (preceding.id == entry.parent) {
+          parentEntry = &preceding;
+          break;
+        }
+      }
+      NS_ENSURE_TRUE(parentEntry, NS_ERROR_UNEXPECTED);
+      MOZ_TRY(
+          CheckRelocationChildPath(parentEntry->sourcePath, path, entry.name));
+    }
+    nsCOMPtr<nsIMsgFolder> existing;
+    MOZ_TRY(current->GetFolderForURL(entry.replacement->mURI,
+                                     getter_AddRefs(existing)));
+    NS_ENSURE_FALSE(existing, NS_ERROR_ALREADY_INITIALIZED);
+  }
+  NS_ENSURE_TRUE(operation->mOriginalParent->mSubFolders.Contains(this),
+                 NS_ERROR_NOT_AVAILABLE);
+  operation->mTargetParent->mSubFolders.SetCapacity(
+      operation->mTargetParent->mSubFolders.Count() + 1);
+  operation->mCache.Clear();
+  for (auto iter = operation->mLookup->mFolderCache.ConstIter(); !iter.Done();
+       iter.Next()) {
+    nsCOMPtr<nsIMsgFolder> cached = do_QueryReferent(iter.Data());
+    bool replaced = false;
+    for (const auto& entry : operation->mEntries) {
+      if (cached.get() == entry.original.get()) {
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced && !operation->mCache.InsertOrUpdate(iter.Key(), iter.Data(),
+                                                       mozilla::fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  for (const auto& entry : operation->mEntries) {
+    nsWeakPtr weak = do_GetWeakReference(entry.replacement);
+    NS_ENSURE_TRUE(weak, NS_ERROR_NOT_AVAILABLE);
+    if (!operation->mCache.InsertOrUpdate(entry.replacement->mURI, weak,
+                                          mozilla::fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  operation->mCacheGeneration = operation->mLookup->mCacheGeneration;
+  operation->mValidated = true;
+  return NS_OK;
+}
+
+nsresult nsMsgDBFolder::CommitNativeFolderRelocation(
+    mozilla::mailnews::NativeFolderRelocation* operation,
+    const mozilla::mailnews::ImapFolderRelocationMetadata* metadata,
+    nsIMsgFolder** replacement) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG_POINTER(replacement);
+  *replacement = nullptr;
+  NS_ENSURE_ARG(operation);
+  NS_ENSURE_TRUE(
+      operation->mSource == this && !operation->mEnded && operation->mValidated,
+      NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(operation->mIsImap == bool(metadata), NS_ERROR_INVALID_ARG);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckFolderPathAccess());
+  MOZ_TRY(core->ValidateFolderRelocationRecovery(operation->mRecovery));
+  NS_ENSURE_TRUE(
+      operation->mCacheGeneration == operation->mLookup->mCacheGeneration,
+      NS_ERROR_NOT_AVAILABLE);
+  const auto& root = operation->mEntries[0];
+  uint32_t flags = MOZ_TRY(core->FolderDB().GetFolderFlags(root.id));
+  if (metadata && root.parent != operation->mTargetParentId) {
+    nsTArray<uint64_t> ancestors = MOZ_TRY(
+        core->FolderDB().GetFolderAncestors(operation->mTargetParentId));
+    ancestors.AppendElement(operation->mTargetParentId);
+    for (uint64_t id : ancestors) {
+      uint32_t ancestorFlags = MOZ_TRY(core->FolderDB().GetFolderFlags(id));
+      if (ancestorFlags & nsMsgFolderFlags::Trash) {
+        flags &= ~(nsMsgFolderFlags::Favorite | nsMsgFolderFlags::CheckNew);
+        break;
+      }
+    }
+  }
+  int32_t originalIndex = operation->mOriginalParent->mSubFolders.IndexOf(this);
+  NS_ENSURE_TRUE(originalIndex >= 0, NS_ERROR_NOT_AVAILABLE);
+  if (metadata) {
+    MOZ_TRY(core->FolderDB().RelocateImapFolder(
+        operation->mSourceId, root.id, root.parent, root.name,
+        operation->mTargetParentId, operation->mNewName, *metadata));
+  } else {
+    MOZ_TRY(core->FolderDB().RelocateFolder(
+        operation->mSourceId, root.id, root.parent, root.name,
+        operation->mTargetParentId, operation->mNewName));
+  }
+  // No SQL, file calls, virtual setters, callbacks or fallible output work
+  // follows the native commit. Caller notifications run only after return.
+  for (const auto& entry : operation->mEntries) {
+    entry.replacement->mFolderRelocationPrepared = false;
+  }
+  operation->mLookup->mFolderCache.SwapElements(operation->mCache);
+  ++operation->mLookup->mCacheGeneration;
+  root.replacement->mFlags = flags;
+  if (operation->mOriginalParent == operation->mTargetParent) {
+    operation->mOriginalParent->mSubFolders.ReplaceObjectAt(root.replacement,
+                                                            originalIndex);
+  } else {
+    operation->mOriginalParent->mSubFolders.RemoveObject(this);
+    MOZ_RELEASE_ASSERT(
+        operation->mTargetParent->mSubFolders.AppendObject(root.replacement));
+  }
+  for (const auto& entry : operation->mEntries) {
+    entry.original->mParent = nullptr;
+    entry.original->mPath = nullptr;
+    entry.original->mSubFolders.Clear();
+    entry.original->mFolderRelocated = true;
+  }
+  NS_ADDREF(*replacement = root.replacement);
+  operation->mCommitted = true;
+  operation->mEnded = true;
+  core->DiscardFolderRelocationRecovery(operation->mRecovery);
+  return NS_OK;
+}
+
+void nsMsgDBFolder::FinishNativeFolderRelocationFailure(
+    mozilla::mailnews::NativeFolderRelocation* operation, nsresult primaryError,
+    nsresult rollbackError) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_RELEASE_ASSERT(operation && operation->mSource == this &&
+                     !operation->mEnded && NS_FAILED(primaryError));
+  if (NS_FAILED(rollbackError)) {
+    operation->mRecovery->BlockAfterFailedRestore(primaryError, rollbackError);
+  } else if (RefPtr<DatabaseCore> core = DatabaseCore::sInstance) {
+    core->DiscardFolderRelocationRecovery(operation->mRecovery);
+  }
+  operation->mEnded = true;
+}
+
 #endif  // MOZ_PANORAMA
 
+nsresult nsMsgDBFolder::CheckFolderDatabaseSource() {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup() && mFolderId) {
+    NS_ENSURE_FALSE(mFolderRelocationPrepared, NS_ERROR_IN_PROGRESS);
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::sInstance;
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    nsCString source;
+    MOZ_TRY(core->ReadSourceIdForFolderAdmission(source));
+    NS_ENSURE_TRUE(source == mFolderDatabaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  }
+#endif
+  return NS_OK;
+}
+
+nsresult nsMsgDBFolder::CheckFolderPathAccess() {
+  MOZ_TRY(CheckFolderDatabaseSource());
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(mFolderId, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_FALSE(mFolderRelocated, NS_ERROR_NOT_AVAILABLE);
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::sInstance;
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(core->CheckFolderRelocationRecovery(mFolderId));
+  }
+#endif
+  return NS_OK;
+}
+
 NS_IMETHODIMP nsMsgDBFolder::GetId(uint64_t* id) {
+  NS_ENSURE_ARG_POINTER(id);
+  MOZ_TRY(CheckFolderDatabaseSource());
 #ifdef MOZ_PANORAMA
   MOZ_ASSERT(StaticPrefs::mail_panorama_enabled_AtStartup());
   *id = mFolderId;
@@ -2984,8 +3458,10 @@ NS_IMETHODIMP nsMsgDBFolder::GetPath(nsACString& path) {
 #ifdef MOZ_PANORAMA
   MOZ_ASSERT(StaticPrefs::mail_panorama_enabled_AtStartup());
 
+  MOZ_TRY(CheckFolderPathAccess());
+  NS_ENSURE_TRUE(mFolderId, NS_ERROR_NOT_AVAILABLE);
   RefPtr<mozilla::mailnews::DatabaseCore> dbCore =
-      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+      mozilla::mailnews::DatabaseCore::sInstance;
   mozilla::mailnews::FolderDatabase& folderDB(dbCore->FolderDB());
   path = MOZ_TRY(folderDB.GetFolderPath(mFolderId));
 
@@ -3405,8 +3881,8 @@ nsMsgDBFolder::GetChildNamed(const nsACString& aName, nsIMsgFolder** aChild) {
   NS_ENSURE_STATE(!aName.IsEmpty());
   NS_ENSURE_ARG_POINTER(aChild);
   nsTArray<RefPtr<nsIMsgFolder>> dummy;
-  GetSubFolders(dummy);  // initialize mSubFolders
   *aChild = nullptr;
+  MOZ_TRY(GetSubFolders(dummy));  // initialize mSubFolders
 
   for (nsIMsgFolder* child : mSubFolders) {
     nsCString folderName;
@@ -3711,6 +4187,8 @@ NS_IMETHODIMP nsMsgDBFolder::CreateSubfolderAsync(
 NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
                                           nsIMsgFolder** child) {
   NS_ENSURE_ARG_POINTER(child);
+  *child = nullptr;
+  MOZ_TRY(CheckFolderPathAccess());
 
   // Ensure the containing (.sbd) dir exists.
   nsCOMPtr<nsIFile> path;
@@ -4848,6 +5326,8 @@ nsMsgDBFolder::SetFilePath(nsIFile* aFile) {
 NS_IMETHODIMP
 nsMsgDBFolder::GetFilePath(nsIFile** aFile) {
   NS_ENSURE_ARG_POINTER(aFile);
+  *aFile = nullptr;
+  MOZ_TRY(CheckFolderPathAccess());
   nsresult rv;
   // make a new nsIFile object in case the caller
   // alters the underlying file object.
@@ -5395,6 +5875,20 @@ NS_IMETHODIMP nsMsgDBFolder::GetMessageHeader(nsMsgKey msgKey,
 
 NS_IMETHODIMP nsMsgDBFolder::GetDescendants(
     nsTArray<RefPtr<nsIMsgFolder>>& aDescendants) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(CheckFolderPathAccess());
+    nsTArray<RefPtr<nsIMsgFolder>> descendants;
+    for (nsIMsgFolder* child : mSubFolders) {
+      nsTArray<RefPtr<nsIMsgFolder>> grandchildren;
+      MOZ_TRY(child->GetDescendants(grandchildren));
+      descendants.AppendElement(child);
+      descendants.AppendElements(grandchildren);
+    }
+    aDescendants = std::move(descendants);
+    return NS_OK;
+  }
+#endif
   aDescendants.Clear();
   for (nsIMsgFolder* child : mSubFolders) {
     aDescendants.AppendElement(child);
@@ -5620,6 +6114,21 @@ nsresult nsMsgDBFolder::CloseDB() {
 }
 
 NS_IMETHODIMP nsMsgDBFolder::SetUserSortOrder(uint32_t order) {
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(mFolderId, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(CheckFolderDatabaseSource());
+    nsCOMPtr<nsIMsgDatabase> db;
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(info->SetUserSortOrder(order));
+    // The property write either autocommits or remains in the caller's TX.
+    // Never settle that TX or publish a cache value after a failed write.
+    mUserSortOrder = order;
+    return NS_OK;
+  }
+#endif
   if (order != mUserSortOrder) {
     nsCOMPtr<nsIMsgDatabase> db;
     nsCOMPtr<nsIDBFolderInfo> folderInfo;
@@ -5635,6 +6144,21 @@ NS_IMETHODIMP nsMsgDBFolder::SetUserSortOrder(uint32_t order) {
 
 NS_IMETHODIMP nsMsgDBFolder::GetUserSortOrder(uint32_t* order) {
   NS_ENSURE_ARG_POINTER(order);
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(mFolderId, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(CheckFolderDatabaseSource());
+    nsCOMPtr<nsIMsgDatabase> db;
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(GetDBFolderInfoAndDB(getter_AddRefs(info), getter_AddRefs(db)));
+    NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
+    uint32_t stored;
+    MOZ_TRY(info->GetUserSortOrder(&stored));
+    mUserSortOrder = stored;
+    *order = stored;
+    return NS_OK;
+  }
+#endif
   ReadDBFolderInfo(false);
   *order = mUserSortOrder;
   return NS_OK;
@@ -5649,7 +6173,7 @@ NS_IMETHODIMP nsMsgDBFolder::GetSortOrder(int32_t* order) {
   NS_ENSURE_ARG_POINTER(order);
 
   uint32_t userSortOrder;
-  GetUserSortOrder(&userSortOrder);
+  MOZ_TRY(GetUserSortOrder(&userSortOrder));
   /*
     NO_SORT_VALUE is defined in interface nsIMsgFolder as unsigned long.
     But XPIDL-generated enum is interpreted as signed.

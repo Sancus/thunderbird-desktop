@@ -883,6 +883,157 @@ nsresult AddBodyHeader(nsIMsgDatabase* db, nsIMsgDBHdr** result) {
   return db->AttachHdr(draft, false, result);
 }
 
+TEST_F(DeliveryFolderInfoProperties, DeletionKeepsItsConstructionIncarnation) {
+  nsAutoCString originalSource;
+  ASSERT_EQ(NS_OK, sCore->GetSourceId(originalSource));
+  ASSERT_EQ(NS_OK, mInfo->SetExpungedBytes(43));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddBodyHeader(mDatabase, getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, header->SetMessageSize(7));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  bool active = true;
+  auto rollback = MakeScopeExit([&] {
+    if (active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId = "
+                       "'{87654321-4321-4321-4321-cba987654321}'"_ns));
+  RefPtr<PerFolderDatabase> transient =
+      new PerFolderDatabase(mDatabase->FolderId(), false);
+  auto cleanup = MakeScopeExit(
+      [&] { sCore->MessageDB().RemoveMessageListener(transient); });
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  active = false;
+  nsAutoCString restoredSource;
+  ASSERT_EQ(NS_OK, sCore->GetSourceId(restoredSource));
+  EXPECT_EQ(originalSource, restoredSource);
+
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            transient->DeleteMessage(key, nullptr, true));
+  bool present = false;
+  ASSERT_EQ(NS_OK, transient->ContainsKey(key, &present));
+  EXPECT_TRUE(present);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  ASSERT_EQ(NS_OK, transient->GetDBFolderInfo(getter_AddRefs(info)));
+  int64_t expunged = -1;
+  ASSERT_EQ(NS_OK, info->GetExpungedBytes(&expunged));
+  EXPECT_EQ(43, expunged);
+  uint32_t size = 0;
+  ASSERT_EQ(NS_OK, header->GetMessageSize(&size));
+  EXPECT_EQ(7u, size);
+  EXPECT_EQ(NS_OK, transient->ForceClosed());
+  // The public service retry and successful 43 + 7 accounting stay in
+  // test_perFolderDatabase.js with the real local-account policy.
+}
+
+TEST_F(DeliveryFolderInfoProperties, AdmissionKeepsItsOriginalSourceReadError) {
+  nsAutoCString originalSource;
+  ASSERT_EQ(NS_OK, sCore->GetSourceId(originalSource));
+  for (bool missing : {true, false}) {
+    uint64_t folderId;
+    ASSERT_EQ(NS_OK, sFolders->InsertFolder(
+                         mDatabase->FolderId(),
+                         missing ? "missing"_ns : "corrupt"_ns, &folderId));
+    RefPtr<PerFolderDatabase> original = new PerFolderDatabase(folderId, false);
+    RefPtr<PerFolderDatabase> admitted;
+    auto cleanup = MakeScopeExit([&] {
+      sCore->MessageDB().RemoveMessageListener(original);
+      if (admitted) {
+        sCore->MessageDB().RemoveMessageListener(admitted);
+      }
+    });
+    nsCOMPtr<nsIMsgDBHdr> header;
+    ASSERT_EQ(NS_OK, AddBodyHeader(original, getter_AddRefs(header)));
+    ASSERT_EQ(NS_OK, header->SetMessageSize(17));
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+    ASSERT_EQ(NS_OK, original->ForceClosed());
+
+    auto readCounter = [&](bool& present, int64_t& value,
+                           nsACString& type) -> nsresult {
+      nsCOMPtr<mozIStorageStatement> row;
+      MOZ_TRY(Connection()->CreateStatement(
+          "SELECT value, typeof(value) FROM folder_properties "
+          "WHERE id=:id AND name='expungedBytes'"_ns,
+          getter_AddRefs(row)));
+      MOZ_TRY(row->BindInt64ByName("id"_ns, folderId));
+      MOZ_TRY(row->ExecuteStep(&present));
+      if (present) {
+        MOZ_TRY(row->GetInt64(0, &value));
+        MOZ_TRY(row->GetUTF8String(1, type));
+      }
+      return row->Finalize();
+    };
+    bool originalPresent = false;
+    int64_t originalValue = 0;
+    nsAutoCString originalType;
+    ASSERT_EQ(NS_OK, readCounter(originalPresent, originalValue, originalType));
+    bool faultInstalled = false;
+    auto repair = [&]() -> nsresult {
+      if (!faultInstalled) {
+        return NS_OK;
+      }
+      nsresult rv;
+      if (missing) {
+        rv = Connection()->ExecuteSimpleSQL(
+            "ALTER TABLE hidden_admission_identity "
+            "RENAME TO database_identity"_ns);
+      } else {
+        nsCOMPtr<mozIStorageStatement> statement;
+        MOZ_TRY(Connection()->CreateStatement(
+            "UPDATE database_identity SET sourceId=:source"_ns,
+            getter_AddRefs(statement)));
+        MOZ_TRY(statement->BindUTF8StringByName("source"_ns, originalSource));
+        rv = statement->Execute();
+      }
+      if (NS_SUCCEEDED(rv)) {
+        faultInstalled = false;
+      }
+      return rv;
+    };
+    auto restore = MakeScopeExit([&] { EXPECT_EQ(NS_OK, repair()); });
+    ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         missing ? "ALTER TABLE database_identity RENAME TO "
+                                   "hidden_admission_identity"_ns
+                                 : "UPDATE database_identity SET sourceId = "
+                                   "'not-a-uuid'"_ns));
+    faultInstalled = true;
+    admitted = new PerFolderDatabase(folderId, false);
+    ASSERT_EQ(NS_OK, repair());
+    nsAutoCString restoredSource;
+    ASSERT_EQ(NS_OK, sCore->GetSourceId(restoredSource));
+    EXPECT_EQ(originalSource, restoredSource);
+    EXPECT_EQ(missing ? NS_ERROR_FAILURE : NS_ERROR_FILE_CORRUPTED,
+              admitted->DeleteMessage(key, nullptr, true));
+    bool present = false;
+    ASSERT_EQ(NS_OK, admitted->ContainsKey(key, &present));
+    EXPECT_TRUE(present);
+    nsCOMPtr<nsIDBFolderInfo> info;
+    ASSERT_EQ(NS_OK, admitted->GetDBFolderInfo(getter_AddRefs(info)));
+    int64_t expunged = -1;
+    ASSERT_EQ(NS_OK, info->GetExpungedBytes(&expunged));
+    EXPECT_EQ(0, expunged);
+    int64_t value = 0;
+    nsAutoCString type;
+    ASSERT_EQ(NS_OK, readCounter(present, value, type));
+    EXPECT_EQ(originalPresent, present);
+    EXPECT_EQ(originalValue, value);
+    EXPECT_EQ(originalType, type);
+    uint32_t size = 0;
+    ASSERT_EQ(NS_OK, header->GetMessageSize(&size));
+    EXPECT_EQ(17u, size);
+    EXPECT_EQ(NS_OK, admitted->ForceClosed());
+    // Actual account/server retry deletion remains an ordinary public JS case.
+  }
+}
+
 TEST_F(DISABLED_DeliveryFolderInfoProperties,
        PublicTransferEpochRetiresOnlyOwnedBindings) {
   ASSERT_EQ(NS_OK, mInfo->SetImapUidValidity(7));
@@ -1128,6 +1279,108 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
   int32_t flags = -1;
   ASSERT_EQ(NS_OK, mInfo->GetFlags(&flags));
   EXPECT_EQ(0, flags);
+}
+
+TEST_F(DeliveryFolderInfoProperties, UserSortOrderWidthPresenceAndErrors) {
+  EXPECT_EQ(NS_ERROR_INVALID_POINTER, mInfo->GetUserSortOrder(nullptr));
+  GuardedOutput output{0x33445566, kCanary};
+  ASSERT_EQ(NS_OK, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(static_cast<uint32_t>(nsIMsgFolder::NO_SORT_VALUE), output.value);
+  EXPECT_EQ(kCanary, static_cast<uint32_t>(output.canary));
+  nsCOMPtr<mozIStorageStatement> row;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "SELECT COUNT(*) FROM folder_properties "
+                       "WHERE id=:id AND name='userSortOrder'"_ns,
+                       getter_AddRefs(row)));
+  ASSERT_EQ(NS_OK, row->BindInt64ByName("id"_ns, mDatabase->FolderId()));
+  bool found = false;
+  ASSERT_EQ(NS_OK, row->ExecuteStep(&found));
+  ASSERT_TRUE(found);
+  EXPECT_EQ(0, row->AsInt32(0));
+  ASSERT_EQ(NS_OK, row->Finalize());
+  for (uint32_t value : {0u, 7u, UINT32_MAX}) {
+    ASSERT_EQ(NS_OK, mInfo->SetUserSortOrder(value));
+    output = {0x33445566, kCanary};
+    ASSERT_EQ(NS_OK, mInfo->GetUserSortOrder(&output.value));
+    EXPECT_EQ(value, output.value);
+    EXPECT_EQ(kCanary, static_cast<uint32_t>(output.canary));
+  }
+  for (int64_t value : {int64_t{-1}, int64_t{1} << 32}) {
+    ASSERT_EQ(NS_OK, mInfo->SetInt64Property("userSortOrder", value));
+    output = {0x33445566, kCanary};
+    EXPECT_EQ(NS_ERROR_LOSS_OF_SIGNIFICANT_DATA,
+              mInfo->GetUserSortOrder(&output.value));
+    EXPECT_EQ(0x33445566u, output.value);
+    EXPECT_EQ(kCanary, static_cast<uint32_t>(output.canary));
+  }
+  ASSERT_EQ(NS_OK, mInfo->SetUserSortOrder(7));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  bool active = true;
+  auto rollback = MakeScopeExit([&] {
+    if (active) EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, mInfo->SetUserSortOrder(11));
+  ASSERT_EQ(NS_OK, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(11u, output.value);
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  active = false;
+  ASSERT_EQ(NS_OK, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(7u, output.value);
+  EXPECT_EQ(kCanary, static_cast<uint32_t>(output.canary));
+}
+
+TEST_F(DeliveryFolderInfoProperties, UserSortOrderAdmissionAndReadFailure) {
+  ASSERT_EQ(NS_OK, mInfo->SetUserSortOrder(7));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "ALTER TABLE folder_properties RENAME TO "
+                       "hidden_user_sort_properties"_ns));
+  bool hidden = true;
+  auto restore = MakeScopeExit([&] {
+    if (hidden) {
+      EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                           "ALTER TABLE hidden_user_sort_properties "
+                           "RENAME TO folder_properties"_ns));
+    }
+  });
+  GuardedOutput output{0x33445566, kCanary};
+  EXPECT_EQ(NS_ERROR_FAILURE, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(0x33445566u, output.value);
+  EXPECT_EQ(kCanary, static_cast<uint32_t>(output.canary));
+  EXPECT_EQ(NS_ERROR_FAILURE, mInfo->SetUserSortOrder(13));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "ALTER TABLE hidden_user_sort_properties "
+                       "RENAME TO folder_properties"_ns));
+  hidden = false;
+  ASSERT_EQ(NS_OK, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(7u, output.value);
+
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  bool active = true;
+  auto rollback = MakeScopeExit([&] {
+    if (active) EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId = "
+                       "'{87654321-4321-4321-4321-cba987654321}'"_ns));
+  output = {0x33445566, kCanary};
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mInfo->SetUserSortOrder(17));
+  EXPECT_EQ(0x33445566u, output.value);
+  EXPECT_EQ(kCanary, static_cast<uint32_t>(output.canary));
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  active = false;
+  ASSERT_EQ(NS_OK, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(7u, output.value);
+  ASSERT_EQ(NS_OK, sFolders->DeleteFolder(mDatabase->FolderId()));
+  output = {0x33445566, kCanary};
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mInfo->GetUserSortOrder(&output.value));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mInfo->SetUserSortOrder(19));
+  EXPECT_EQ(0x33445566u, output.value);
+  EXPECT_EQ(kCanary, static_cast<uint32_t>(output.canary));
 }
 
 }  // namespace

@@ -1388,3 +1388,709 @@ add_task(async function test_preemptionRetainsUncertainWrite() {
     }
   });
 });
+
+/**
+ * Read a complete local message and close the provider input stream.
+ *
+ * @param {nsIMsgFolder} folder - The physical message folder.
+ * @param {nsIMsgDBHdr} header - The retained message header.
+ * @returns {string} Exact message bytes.
+ */
+function hierarchyMessageBytes(folder, header) {
+  return hierarchyInputBytes(folder.getMsgInputStream(header));
+}
+
+/**
+ * Read and close an actual provider stream.
+ *
+ * @param {nsIInputStream} input - The opened body stream.
+ * @returns {string} Exact message bytes.
+ */
+function hierarchyInputBytes(input) {
+  const stream = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+    Ci.nsIScriptableInputStream
+  );
+  stream.init(input);
+  try {
+    let bytes = "";
+    let chunk;
+    while ((chunk = stream.read(4096))) {
+      bytes += chunk;
+    }
+    return bytes;
+  } finally {
+    stream.close();
+  }
+}
+
+/**
+ * Keep native folder and message rows when renaming or reparenting a subtree.
+ *
+ * @param {string} storeType - The mbox or maildir provider.
+ * @param {boolean} move - Move to another parent instead of renaming.
+ * @param {string|null} [failure=null] - Refuse a write, external child, or SQL.
+ * @param {boolean} [throughCopyService=false] - Use the existing move completion.
+ */
+async function checkNativeLocalHierarchy(
+  storeType,
+  move,
+  failure = null,
+  throughCopyService = false
+) {
+  await withTrashStore(storeType, async (root, _trash, core) => {
+    const sourceParent = root.createLocalSubfolder("hierarchy-source");
+    const destinationParent = root.createLocalSubfolder(
+      "hierarchy-destination"
+    );
+    const folder = sourceParent
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("original");
+    const child = folder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("child");
+    const raw =
+      "From: sender@example.invalid\r\n" +
+      "Message-ID: <hierarchy@example.invalid>\r\n" +
+      "References: <first@example.invalid> <second@example.invalid>\r\n" +
+      "Subject: Retain folder identity\r\n\r\nExact hierarchy body.\r\n";
+    const records = [folder, child].map(item => {
+      item.userSortOrder = item === folder ? 0x80000001 : 19;
+      const header = item
+        .QueryInterface(Ci.nsIMsgLocalMailFolder)
+        .addMessage(raw);
+      header.setStringProperty("hierarchy-user", "retain this value");
+      Assert.equal(hierarchyMessageBytes(item, header), raw);
+      return {
+        folderId: item.id,
+        key: header.messageKey,
+        token: header.storeToken,
+        size: header.messageSize,
+        order: item.userSortOrder,
+        bytes: hierarchyMessageBytes(item, header),
+      };
+    });
+    const oldURI = folder.URI;
+    const childURI = child.URI;
+    const expectedName = move ? "original" : "renamed";
+    const expectedParent = move ? destinationParent : sourceParent;
+    const relocate = () => {
+      if (move) {
+        destinationParent
+          .QueryInterface(Ci.nsIMsgLocalMailFolder)
+          .copyFolderLocal(folder, true, null, null);
+      } else {
+        folder.rename(expectedName, null);
+      }
+    };
+    const sourcePath = folder.filePath.path;
+    const childPath = child.filePath.path;
+    let finished;
+    let external;
+    if (failure) {
+      const checkUnchanged = () => {
+        Assert.equal(folder.id, records[0].folderId);
+        Assert.equal(child.id, records[1].folderId);
+        Assert.equal(folder.parent, sourceParent);
+        Assert.equal(child.parent, folder);
+        Assert.equal(folder.URI, oldURI);
+        Assert.equal(child.URI, childURI);
+        Assert.equal(folder.filePath.path, sourcePath);
+        Assert.equal(child.filePath.path, childPath);
+        Assert.equal(expectedParent.getChildNamed(expectedName), null);
+        Assert.equal(MailServices.folderLookup.getFolderForURL(oldURI), folder);
+        Assert.equal(
+          MailServices.folderLookup.getFolderForURL(childURI),
+          child
+        );
+        for (const [index, item] of [folder, child].entries()) {
+          const headers = [...item.messages];
+          Assert.equal(headers.length, 1);
+          Assert.equal(headers[0].messageKey, records[index].key);
+          Assert.equal(headers[0].storeToken, records[index].token);
+          Assert.equal(item.userSortOrder, records[index].order);
+          Assert.equal(hierarchyMessageBytes(item, headers[0]), raw);
+        }
+      };
+      if (failure === "external-child") {
+        const original = child.filePath;
+        const parent = root.filePath;
+        const name = "external-child-store";
+        original.copyTo(parent, name);
+        external = parent.clone();
+        external.append(name);
+        const externalBody =
+          storeType === "mbox"
+            ? external.path
+            : PathUtils.join(external.path, "cur", records[1].token);
+        const text = await IOUtils.readUTF8(externalBody);
+        await IOUtils.writeUTF8(
+          externalBody,
+          text.replace("Exact hierarchy body.", "Other hierarchy body.")
+        );
+        const bytes = await IOUtils.read(externalBody);
+        const rootBytes = await trashBodyFiles(folder);
+        const childBytes = await trashBodyFiles(child);
+        child.filePath = external;
+        try {
+          Assert.equal(
+            hierarchyMessageBytes(child, [...child.messages][0]),
+            raw.replace("Exact hierarchy body.", "Other hierarchy body.")
+          );
+          Assert.throws(
+            relocate,
+            error => error.result === Cr.NS_ERROR_NOT_AVAILABLE
+          );
+          Assert.equal(folder.id, records[0].folderId);
+          Assert.equal(child.id, records[1].folderId);
+          Assert.equal(folder.parent, sourceParent);
+          Assert.equal(child.parent, folder);
+          Assert.equal(folder.filePath.path, sourcePath);
+          Assert.equal(child.filePath.path, external.path);
+          Assert.equal(expectedParent.getChildNamed(expectedName), null);
+          Assert.deepEqual(await trashBodyFiles(folder), rootBytes);
+          Assert.deepEqual(await IOUtils.read(externalBody), bytes);
+        } finally {
+          child.filePath = original;
+        }
+        checkUnchanged();
+        Assert.deepEqual(await trashBodyFiles(child), childBytes);
+        external = { path: externalBody, bytes };
+      } else if (failure === "sql") {
+        const rootBytes = await trashBodyFiles(folder);
+        const childBytes = await trashBodyFiles(child);
+        const connection = core.connectionForTests;
+        connection.executeSimpleSQL(
+          `CREATE TEMP TRIGGER fail_local_relocation BEFORE UPDATE OF name,parent ON main.folders WHEN OLD.id=${folder.id} BEGIN SELECT RAISE(ABORT, 'Local relocation failure'); END`
+        );
+        try {
+          Assert.throws(
+            relocate,
+            error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT
+          );
+          checkUnchanged();
+          Assert.deepEqual(await trashBodyFiles(folder), rootBytes);
+          Assert.deepEqual(await trashBodyFiles(child), childBytes);
+        } finally {
+          connection.executeSimpleSQL(
+            "DROP TRIGGER temp.fail_local_relocation"
+          );
+        }
+      } else {
+        const pendingChild = failure === "busy-child";
+        const pendingFolder = pendingChild ? child : folder;
+        const store = pendingFolder.msgStore;
+        const stream = store.getNewMsgOutputStream(pendingFolder);
+        const pendingRaw =
+          "From: pending@example.invalid\r\nSubject: Still issued\r\n\r\nExact pending body.\r\n";
+        let finishAttempted = false;
+        try {
+          Assert.equal(
+            stream.write(pendingRaw, pendingRaw.length),
+            pendingRaw.length
+          );
+          stream.flush();
+          const rootBytes = await trashBodyFiles(folder);
+          const childBytes = await trashBodyFiles(child);
+          let pending;
+          if (storeType === "maildir") {
+            const files = await IOUtils.getChildren(
+              PathUtils.join(pendingFolder.filePath.path, "tmp")
+            );
+            Assert.equal(files.length, 1);
+            pending = [files[0], await IOUtils.read(files[0])];
+          }
+          Assert.throws(
+            relocate,
+            error => error.result === Cr.NS_MSG_FOLDER_BUSY
+          );
+          checkUnchanged();
+          Assert.deepEqual(await trashBodyFiles(folder), rootBytes);
+          Assert.deepEqual(await trashBodyFiles(child), childBytes);
+          if (pending) {
+            Assert.deepEqual(await IOUtils.read(pending[0]), pending[1]);
+          }
+          const tail = "Still owned after refusal.\r\n";
+          Assert.equal(stream.write(tail, tail.length), tail.length);
+          finishAttempted = true;
+          const token = store.finishNewMessage(pendingFolder, stream);
+          Assert.notEqual(token, "");
+          Assert.throws(
+            () => store.finishNewMessage(pendingFolder, stream),
+            error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE
+          );
+          Assert.equal(
+            hierarchyInputBytes(
+              store.getMsgInputStream(pendingFolder, token, 0)
+            ),
+            pendingRaw + tail
+          );
+          finished = { pendingChild, token, bytes: pendingRaw + tail };
+        } finally {
+          if (!finishAttempted) {
+            store.discardNewMessage(pendingFolder, stream);
+          }
+        }
+      }
+    }
+    if (throughCopyService) {
+      let started = 0;
+      let stopped = 0;
+      let arrived;
+      const listener = new PromiseTestUtils.PromiseCopyListener({
+        onStartCopy() {
+          started++;
+        },
+        onStopCopy(status) {
+          stopped++;
+          Assert.equal(status, Cr.NS_OK);
+          arrived = MailServices.copy.getArrivedFolder(folder);
+          Assert.ok(arrived, "Completion identifies the actual arrived folder");
+          Assert.equal(arrived.id, records[0].folderId);
+        },
+      });
+      MailServices.copy.copyFolder(
+        folder,
+        expectedParent,
+        true,
+        listener,
+        null
+      );
+      await listener.promise;
+      Assert.equal(started, 1);
+      Assert.equal(stopped, 1);
+      Assert.equal(arrived, expectedParent.getChildNamed(expectedName));
+    } else {
+      relocate();
+    }
+    if (external) {
+      Assert.deepEqual(await IOUtils.read(external.path), external.bytes);
+    }
+    const result = expectedParent.getChildNamed(expectedName);
+    Assert.ok(result, "The committed folder exists under its new logical path");
+    const resultChild = result.getChildNamed("child");
+    Assert.ok(resultChild);
+    Assert.equal(
+      result.id,
+      records[0].folderId,
+      "Retain the physical folder row"
+    );
+    Assert.equal(
+      resultChild.id,
+      records[1].folderId,
+      "Retain the child folder row"
+    );
+    Assert.equal(result.parent, expectedParent);
+    Assert.equal(resultChild.parent, result);
+    Assert.notEqual(result, folder);
+    Assert.notEqual(resultChild, child);
+    Assert.equal(folder.parent, null);
+    Assert.equal(child.parent, null);
+    for (const old of [folder, child]) {
+      Assert.throws(
+        () => old.filePath,
+        error => error.result === Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+    if (finished) {
+      const item = finished.pendingChild ? resultChild : result;
+      Assert.equal(
+        hierarchyInputBytes(
+          item.msgStore.getMsgInputStream(item, finished.token, 0)
+        ),
+        finished.bytes
+      );
+    }
+    Assert.equal(sourceParent.getChildNamed("original"), null);
+    Assert.equal(MailServices.folderLookup.getFolderForURL(oldURI), null);
+    Assert.equal(MailServices.folderLookup.getFolderForURL(childURI), null);
+    Assert.equal(MailServices.folderLookup.getFolderForURL(result.URI), result);
+    Assert.equal(
+      MailServices.folderLookup.getFolderForURL(resultChild.URI),
+      resultChild
+    );
+    for (const [index, item] of [result, resultChild].entries()) {
+      const original = records[index];
+      const headers = [...item.messages];
+      Assert.equal(headers.length, 1);
+      const header = headers[0];
+      Assert.equal(header.messageKey, original.key);
+      Assert.equal(header.folder.id, original.folderId);
+      Assert.equal(header.storeToken, original.token);
+      Assert.equal(header.messageSize, original.size);
+      Assert.equal(item.userSortOrder, original.order);
+      Assert.ok(
+        item.hasMsgOffline(header.messageKey),
+        "A live complete local body is available"
+      );
+      Assert.equal(
+        header.getStringProperty("hierarchy-user"),
+        "retain this value"
+      );
+      Assert.equal(header.numReferences, 2);
+      Assert.equal(header.getStringReference(0), "first@example.invalid");
+      Assert.equal(header.getStringReference(1), "second@example.invalid");
+      Assert.equal(hierarchyMessageBytes(item, header), original.bytes);
+      Assert.equal(core.folderDB.getFolderParent(item.id), item.parent.id);
+    }
+    // New wrappers have warmed the same physical metadata receivers. A retired
+    // wrapper still cannot advertise body access through that warm receiver.
+    for (const [index, old] of [folder, child].entries()) {
+      Assert.throws(
+        () => old.hasMsgOffline(records[index].key),
+        error => error.result === Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_nativeLocalRenameMbox() {
+    await checkNativeLocalHierarchy("mbox", false);
+  });
+  add_task(async function test_nativeLocalRenameMaildir() {
+    await checkNativeLocalHierarchy("maildir", false);
+  });
+  add_task(async function test_nativeLocalMoveMbox() {
+    await checkNativeLocalHierarchy("mbox", true);
+  });
+  add_task(async function test_nativeLocalMoveMaildir() {
+    await checkNativeLocalHierarchy("maildir", true);
+  });
+  add_task(async function test_nativeLocalCopyServiceMoveMbox() {
+    await checkNativeLocalHierarchy("mbox", true, null, true);
+  });
+  add_task(async function test_nativeLocalCopyServiceMoveMaildir() {
+    await checkNativeLocalHierarchy("maildir", true, null, true);
+  });
+  add_task(async function test_nativeLocalExternalChildMbox() {
+    for (const move of [false, true]) {
+      await checkNativeLocalHierarchy("mbox", move, "external-child");
+    }
+  });
+  add_task(async function test_nativeLocalExternalChildMaildir() {
+    for (const move of [false, true]) {
+      await checkNativeLocalHierarchy("maildir", move, "external-child");
+    }
+  });
+  add_task(async function test_nativeLocalIssuedWriteMbox() {
+    for (const move of [false, true]) {
+      for (const failure of ["busy-root", "busy-child"]) {
+        await checkNativeLocalHierarchy("mbox", move, failure);
+      }
+    }
+  });
+  add_task(async function test_nativeLocalIssuedWriteMaildir() {
+    for (const move of [false, true]) {
+      for (const failure of ["busy-root", "busy-child"]) {
+        await checkNativeLocalHierarchy("maildir", move, failure);
+      }
+    }
+  });
+  add_task(async function test_nativeLocalSqlRollbackMbox() {
+    for (const move of [false, true]) {
+      await checkNativeLocalHierarchy("mbox", move, "sql");
+    }
+  });
+  add_task(async function test_nativeLocalSqlRollbackMaildir() {
+    for (const move of [false, true]) {
+      await checkNativeLocalHierarchy("maildir", move, "sql");
+    }
+  });
+}
+
+/**
+ * Keep an existing provider failure when refusing a parent's relocation.
+ *
+ * @param {string} storeType - The selected real provider.
+ */
+async function checkNativeLocalIssuedError(storeType) {
+  await withTrashStore(storeType, async root => {
+    const folder = root.createLocalSubfolder("issued-error");
+    const child = folder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("child");
+    const target = root.createLocalSubfolder("issued-error-target");
+    const raw =
+      "From: sender@example.invalid\r\nSubject: Keep issued error\r\n\r\nExisting exact body.\r\n";
+    const header = child
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .addMessage(raw);
+    const id = folder.id;
+    const childId = child.id;
+    const key = header.messageKey;
+    const path = folder.filePath.path;
+    const childPath = child.filePath.path;
+    const store = child.msgStore;
+    const stream = store.getNewMsgOutputStream(child);
+    const pendingRaw =
+      "From: pending@example.invalid\r\n\r\nRetained pending bytes.\r\n";
+    Assert.equal(
+      stream.write(pendingRaw, pendingRaw.length),
+      pendingRaw.length
+    );
+    stream.flush();
+    let expected;
+    let retained;
+    if (storeType === "mbox") {
+      stream.close();
+      expected = Cr.NS_BASE_STREAM_CLOSED;
+    } else {
+      const files = await IOUtils.getChildren(PathUtils.join(childPath, "tmp"));
+      Assert.equal(files.length, 1);
+      const issuedFile = Cc["@mozilla.org/file/local;1"].createInstance(
+        Ci.nsIFile
+      );
+      issuedFile.initWithPath(files[0]);
+      const cur = child.filePath.clone();
+      cur.append("cur");
+      issuedFile.moveTo(cur, "retained-issued-error.eml");
+      retained = issuedFile.path;
+      expected = Cr.NS_ERROR_FILE_NOT_FOUND;
+    }
+    Assert.throws(
+      () => store.finishNewMessage(child, stream),
+      error => error.result === expected
+    );
+    const bytes = await trashBodyFiles(child);
+    Assert.throws(
+      () => folder.rename("after-error", null),
+      error => error.result === expected
+    );
+    Assert.throws(
+      () =>
+        target
+          .QueryInterface(Ci.nsIMsgLocalMailFolder)
+          .copyFolderLocal(folder, true, null, null),
+      error => error.result === expected
+    );
+    Assert.equal(folder.id, id);
+    Assert.equal(child.id, childId);
+    Assert.equal(folder.filePath.path, path);
+    Assert.equal(child.filePath.path, childPath);
+    Assert.equal(child.parent, folder);
+    Assert.equal(root.getChildNamed("after-error"), null);
+    Assert.equal(target.getChildNamed("issued-error"), null);
+    Assert.equal(header.messageKey, key);
+    Assert.equal(hierarchyMessageBytes(child, header), raw);
+    Assert.deepEqual(await trashBodyFiles(child), bytes);
+    Assert.throws(
+      () => store.finishNewMessage(child, stream),
+      error => error.result === expected
+    );
+    Assert.deepEqual(await trashBodyFiles(child), bytes);
+    if (retained) {
+      Assert.equal(await IOUtils.readUTF8(retained), pendingRaw);
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_nativeLocalIssuedErrorMbox() {
+    await checkNativeLocalIssuedError("mbox");
+  });
+  add_task(async function test_nativeLocalIssuedErrorMaildir() {
+    await checkNativeLocalIssuedError("maildir");
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_nativeLocalFailedRestoreRetainsAndDenies() {
+    const prefNames = [
+      "mail.serverDefaultStoreContractID",
+      "mail.server.default.storeContractID",
+    ];
+    const prefs = prefNames.map(name => ({
+      name,
+      hadValue: Services.prefs.prefHasUserValue(name),
+      value: Services.prefs.getCharPref(name),
+    }));
+    const configurations = [];
+    try {
+      // Both genuine accounts are prepared before either subtree is fenced.
+      for (const storeType of ["mbox", "maildir"]) {
+        const contract =
+          storeType === "mbox"
+            ? "@mozilla.org/msgstore/berkeleystore;1"
+            : "@mozilla.org/msgstore/maildirstore;1";
+        for (const name of prefNames) {
+          Services.prefs.setCharPref(name, contract);
+        }
+        const server = MailServices.accounts.createIncomingServer(
+          "hierarchy-recovery",
+          `${storeType}.hierarchy.invalid`,
+          "none"
+        );
+        const account = MailServices.accounts.createAccount();
+        account.incomingServer = server;
+        const root = server.rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+        Assert.equal(server.msgStore.storeType, storeType);
+        Assert.equal(root.msgStore.storeType, storeType);
+        const folder = root
+          .createLocalSubfolder(`recovery-${storeType}`)
+          .QueryInterface(Ci.nsIMsgLocalMailFolder);
+        const child = folder
+          .createLocalSubfolder("child")
+          .QueryInterface(Ci.nsIMsgLocalMailFolder);
+        const sibling = root
+          .createLocalSubfolder(`unaffected-${storeType}`)
+          .QueryInterface(Ci.nsIMsgLocalMailFolder);
+        const raw =
+          `From: sender@example.invalid\r\nMessage-ID: <${storeType}-recovery@example.invalid>\r\n` +
+          "Subject: Retain recovery bytes\r\n\r\nExact original body.\r\n";
+        const records = [folder, child, sibling].map(item => {
+          const header = item.addMessage(raw);
+          return {
+            folder: item,
+            id: item.id,
+            key: header.messageKey,
+            token: header.storeToken,
+            path: item.filePath.path,
+            URI: item.URI,
+            header,
+          };
+        });
+        for (const record of records) {
+          record.bodyPath =
+            storeType === "mbox"
+              ? record.path
+              : PathUtils.join(record.path, "cur", record.token);
+          record.bytes = await IOUtils.read(record.bodyPath);
+        }
+        const newName = `failed-relocation-${storeType}`;
+        const target = root.filePath.clone();
+        target.append(newName);
+        configurations.push({
+          account,
+          root,
+          records,
+          raw,
+          newName,
+          target,
+          storeType,
+        });
+      }
+    } finally {
+      for (const { name, hadValue, value } of prefs) {
+        if (hadValue) {
+          Services.prefs.setCharPref(name, value);
+        } else {
+          Services.prefs.clearUserPref(name);
+        }
+      }
+    }
+    const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const connection = core.connectionForTests;
+    for (const {
+      root,
+      records,
+      raw,
+      newName,
+      target,
+      storeType,
+    } of configurations) {
+      const [source, child, sibling] = records;
+      const parentId = root.id;
+      let calls = 0;
+      connection.createFunction("obstruct_local_restore", 0, {
+        onFunctionCall() {
+          calls++;
+          const obstruction = Cc["@mozilla.org/file/local;1"].createInstance(
+            Ci.nsIFile
+          );
+          obstruction.initWithPath(source.path);
+          obstruction.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+          const stream = Cc[
+            "@mozilla.org/network/file-output-stream;1"
+          ].createInstance(Ci.nsIFileOutputStream);
+          stream.init(obstruction, 0x02, 0o600, 0);
+          const bytes = "Retain this obstruction exactly.";
+          Assert.equal(stream.write(bytes, bytes.length), bytes.length);
+          stream.close();
+          return 0;
+        },
+      });
+      connection.executeSimpleSQL(
+        `CREATE TEMP TRIGGER fail_local_restore BEFORE UPDATE OF name,parent ON main.folders WHEN OLD.id=${source.id} BEGIN SELECT obstruct_local_restore(); SELECT RAISE(ABORT, 'Native settlement failed'); END`
+      );
+      try {
+        Assert.throws(
+          () => source.folder.rename(newName, null),
+          error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT
+        );
+      } finally {
+        connection.executeSimpleSQL("DROP TRIGGER temp.fail_local_restore");
+        connection.removeFunction("obstruct_local_restore");
+      }
+      Assert.equal(
+        calls,
+        1,
+        "Reach the actual native update after physical Apply"
+      );
+      Assert.equal(
+        await IOUtils.readUTF8(source.path),
+        "Retain this obstruction exactly."
+      );
+      const retainedPath =
+        storeType === "mbox"
+          ? target.path
+          : PathUtils.join(target.path, "cur", source.token);
+      Assert.deepEqual(await IOUtils.read(retainedPath), source.bytes);
+      Assert.deepEqual(await IOUtils.read(child.bodyPath), child.bytes);
+      Assert.equal(core.folderDB.getFolderParent(source.id), parentId);
+      Assert.equal(core.folderDB.getFolderParent(child.id), source.id);
+      for (const record of [source, child]) {
+        Assert.equal(
+          record.folder.id,
+          record.id,
+          "Keep diagnostic physical identity"
+        );
+        Assert.throws(
+          () => record.folder.filePath,
+          error => error.result === Cr.NS_ERROR_IN_PROGRESS
+        );
+        Assert.throws(
+          () => MailServices.folderLookup.getFolderForURL(record.URI),
+          error => error.result === Cr.NS_ERROR_IN_PROGRESS
+        );
+        Assert.throws(
+          () => record.folder.hasMsgOffline(record.key),
+          error => error.result === Cr.NS_ERROR_IN_PROGRESS
+        );
+        const store = record.folder.msgStore;
+        Assert.throws(
+          () => store.getMsgInputStream(record.folder, record.token, 0),
+          error => error.result === Cr.NS_ERROR_IN_PROGRESS
+        );
+        Assert.throws(
+          () => store.getNewMsgOutputStream(record.folder),
+          error => error.result === Cr.NS_ERROR_IN_PROGRESS
+        );
+        Assert.throws(
+          () => store.deleteStoreMessages(record.folder, [record.token]),
+          error => error.result === Cr.NS_ERROR_IN_PROGRESS
+        );
+      }
+      Assert.throws(
+        () => source.folder.rename(newName, null),
+        error => error.result === Cr.NS_ERROR_IN_PROGRESS
+      );
+      Assert.equal(
+        MailServices.folderLookup.getFolderForURL(root.URI + "/" + newName),
+        null,
+        "A failed relocation never publishes a replacement alias"
+      );
+      Assert.equal(root.filePath.path, PathUtils.parent(source.path));
+      Assert.equal(hierarchyMessageBytes(sibling.folder, sibling.header), raw);
+      Assert.deepEqual(await IOUtils.read(retainedPath), source.bytes);
+      Assert.equal(
+        await IOUtils.readUTF8(source.path),
+        "Retain this obstruction exactly."
+      );
+    }
+    // A checked recovery-release API deliberately does not exist. Keep these
+    // actual blocked accounts/bytes through normal test shutdown; do not close
+    // the shared core, delete a row, or fabricate successful restoration.
+  });
+}

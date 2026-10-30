@@ -6,6 +6,8 @@
 #define COMM_MAILNEWS_BASE_SRC_NSMSGDBFOLDER_H_
 
 #include "mozilla/Attributes.h"
+#include "mozilla/RefPtr.h"
+#include "nsTHashMap.h"
 #include "msgCore.h"
 #include "nsIMsgFolder.h"
 #include "nsIMsgDatabase.h"
@@ -67,6 +69,16 @@ extern const nsLiteralCString kRenameCompleted;
 
 using mozilla::intl::Collator;
 
+#ifdef MOZ_PANORAMA
+namespace mozilla::mailnews {
+class NativeFolderRelocation;
+class FolderRelocationRecovery;
+struct ImapFolderRelocationMetadata;
+}  // namespace mozilla::mailnews
+#endif
+
+class FolderLookupService;
+class nsIFolderLookupService;
 class nsIMsgFolderCacheElement;
 class nsMsgKeySetU;
 
@@ -114,8 +126,42 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
                                        nsIInputStream* stream);
   MOZ_CAN_RUN_SCRIPT nsresult HandleAutoCompactEvent(nsIMsgWindow* aMsgWindow);
 
+#ifdef MOZ_PANORAMA
+  // Prepare before protocol/storage dispatch. No row, path or cache
+  // publication. The opaque recovery owner holds only its storage
+  // plan/path/error facts. It MUST NOT retain the returned operation, token,
+  // core or live wrappers. The caller roots the returned operation on main,
+  // outside that owner.
+  nsresult PrepareNativeFolderRelocation(
+      nsIMsgFolder* targetParent, const nsACString& storedName,
+      nsISupports* recoveryOwner,
+      RefPtr<mozilla::mailnews::NativeFolderRelocation>& output);
+  // Immediately before synchronous physical Apply. No event-loop yield may
+  // intervene between validation, physical Apply, native commit and
+  // publication.
+  nsresult ValidateNativeFolderRelocation(
+      mozilla::mailnews::NativeFolderRelocation* operation);
+  // Call after physical Apply. Failure requires the caller's physical Rollback;
+  // preserve that primary error and BlockAfterFailedRestore if rollback fails.
+  // Success installs the prepared tree/cache and returns its real root; there
+  // is no fallible result construction after the native commit.
+  nsresult CommitNativeFolderRelocation(
+      mozilla::mailnews::NativeFolderRelocation* operation,
+      const mozilla::mailnews::ImapFolderRelocationMetadata* metadata,
+      nsIMsgFolder** replacement);
+  // Only after failed Apply/commit and the actual Rollback result. Does not
+  // restore files, overwrite the primary error, or release a blocked recovery.
+  void FinishNativeFolderRelocationFailure(
+      mozilla::mailnews::NativeFolderRelocation* operation,
+      nsresult primaryError, nsresult rollbackError);
+#endif
+
  protected:
   virtual ~nsMsgDBFolder();
+
+  // Validates captured native source without opening or owning a transaction.
+  nsresult CheckFolderDatabaseSource();
+  nsresult CheckFolderPathAccess();
 
 #ifdef MOZ_PANORAMA
   struct FolderInitialization {
@@ -243,6 +289,8 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
   nsCString mFolderDatabaseSourceId;
   // Failed initialization requires a fresh object.
   bool mFolderInitAttempted{false};
+  bool mFolderRelocated{false};
+  bool mFolderRelocationPrepared{false};
 #endif  // MOZ_PANORAMA
 
   nsCOMPtr<nsIMsgDatabase> mDatabase;
@@ -409,5 +457,66 @@ class nsMsgKeySetU {
   RefPtr<nsMsgKeySet> loKeySet;
   RefPtr<nsMsgKeySet> hiKeySet;
 };
+
+#ifdef MOZ_PANORAMA
+namespace mozilla::mailnews {
+
+// One same-account rename/move's preallocated replacement tree. The recovery
+// owner MUST NOT retain this object. The main-thread caller roots it separately
+// from that owner, keeping old/target wrappers and the recovery token alive.
+class NativeFolderRelocation final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(NativeFolderRelocation)
+  const nsCString& SourceId() const { return mSourceId; }
+  uint64_t FolderId() const { return mEntries[0].id; }
+  uint64_t ParentId() const { return mEntries[0].parent; }
+  uint64_t TargetParentId() const { return mTargetParentId; }
+  const nsCString& StoredName() const { return mEntries[0].name; }
+  const nsCString& NewName() const { return mNewName; }
+  const nsTArray<uint64_t>& FolderIds() const { return mFolderIds; }
+  nsIFile* SourcePath() const { return mEntries[0].sourcePath; }
+  nsIFile* TargetPath() const { return mTargetPath; }
+  nsIMsgFolder* Replacement() const { return mEntries[0].replacement; }
+  nsIMsgFolder* ReplacementFor(uint64_t id) const;
+  FolderRelocationRecovery* Recovery() const { return mRecovery; }
+
+ private:
+  friend class ::nsMsgDBFolder;
+  NativeFolderRelocation() = default;
+  ~NativeFolderRelocation();
+  struct Entry {
+    uint64_t id{0};
+    uint64_t parent{0};
+    nsCString name;
+    nsCString oldURI;
+    nsCOMPtr<nsIFile> sourcePath;
+    RefPtr<nsMsgDBFolder> original;
+    RefPtr<nsMsgDBFolder> replacement;
+  };
+  nsCString mSourceId;
+  nsCString mNewName;
+  nsCString mSourceLogicalPath;
+  nsCString mTargetLogicalPath;
+  nsCString mTargetParentURI;
+  nsCOMPtr<nsIFile> mTargetParentPath;
+  uint64_t mTargetParentId{0};
+  RefPtr<nsMsgDBFolder> mSource;
+  RefPtr<nsMsgDBFolder> mOriginalParent;
+  RefPtr<nsMsgDBFolder> mTargetParent;
+  RefPtr<FolderRelocationRecovery> mRecovery;
+  nsCOMPtr<nsIFile> mTargetPath;
+  nsTArray<uint64_t> mFolderIds;
+  nsTArray<Entry> mEntries;
+  RefPtr<FolderLookupService> mLookup;
+  nsTHashMap<nsCString, nsWeakPtr> mCache;
+  uint64_t mCacheGeneration{0};
+  bool mIsImap{false};
+  bool mValidated{false};
+  bool mCommitted{false};
+  bool mEnded{false};
+};
+
+}  // namespace mozilla::mailnews
+#endif
 
 #endif  // COMM_MAILNEWS_BASE_SRC_NSMSGDBFOLDER_H_

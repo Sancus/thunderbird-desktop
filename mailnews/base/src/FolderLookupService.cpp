@@ -8,6 +8,7 @@
 
 #include "mozilla/Components.h"
 #include "mozilla/Preferences.h"
+#include "mozilla/ResultExtensions.h"
 #include "mozilla/StaticPrefs_mail.h"
 #include "msgCore.h"
 #include "nsINetUtil.h"
@@ -23,9 +24,34 @@
  * an exception if we attempted to create a server that doesn't exist, so we
  * need to guard for that error.
  */
+static nsresult CheckNativeFolderSource(nsIMsgFolder* folder) {
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    uint64_t id;
+    nsresult rv = folder->GetId(&id);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(id, NS_ERROR_NOT_AVAILABLE);
+    nsAutoCString path;
+    MOZ_TRY(folder->GetPath(path));
+  }
+  return NS_OK;
+}
+
 static nsresult IsValidFolder(nsIMsgFolder* folder, bool& isValid) {
   NS_ENSURE_ARG_POINTER(folder);
 
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    uint64_t id;
+    nsresult rv = folder->GetId(&id);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (!id) {
+      // Cleared/uninitialized wrappers are misses; a source read error above
+      // must retain its error instead of becoming an apparently absent folder.
+      isValid = false;
+      return NS_OK;
+    }
+    nsAutoCString path;
+    MOZ_TRY(folder->GetPath(path));
+  }
   nsCOMPtr<nsIMsgFolder> parent;
   nsresult rv = folder->GetParent(getter_AddRefs(parent));
   NS_ENSURE_SUCCESS(rv, rv);
@@ -42,7 +68,8 @@ static nsresult IsValidFolder(nsIMsgFolder* folder, bool& isValid) {
   return NS_OK;
 }
 
-NS_IMPL_ISUPPORTS(FolderLookupService, nsIFolderLookupService)
+NS_IMPL_ISUPPORTS(FolderLookupService, nsIFolderLookupService,
+                  FolderLookupService)
 
 NS_IMETHODIMP FolderLookupService::GetFolderForURL(const nsACString& url,
                                                    nsIMsgFolder** folder) {
@@ -75,6 +102,9 @@ NS_IMETHODIMP FolderLookupService::CreateFolderAndCache(
   NS_ENSURE_ARG_POINTER(folder);
 
   *folder = nullptr;
+
+  nsresult sourceRv = CheckNativeFolderSource(parentFolder);
+  NS_ENSURE_SUCCESS(sourceRv, sourceRv);
 
   // Make sure the parent folder is already cached.
   nsCOMPtr<nsIMsgFolder> cachedParent = GetExisting(parentFolder->URI());
@@ -126,6 +156,9 @@ NS_IMETHODIMP FolderLookupService::CreateFolderAndCache(
     return NS_ERROR_FAILURE;
   }
 
+  rv = CheckNativeFolderSource(folderToReturn);
+  NS_ENSURE_SUCCESS(rv, rv);
+
   // If the existing folder object has a parent, make sure it's the same parent.
   nsCOMPtr<nsIMsgFolder> obtainedParent;
   rv = folderToReturn->GetParent(getter_AddRefs(obtainedParent));
@@ -154,6 +187,7 @@ NS_IMETHODIMP FolderLookupService::CreateRootFolderAndCache(
       const auto& key = iter.Key();
       if (StringHead(key, urlEncodedName.Length()).Equals(urlEncodedName)) {
         iter.Remove();
+        ++mCacheGeneration;
       }
     }
   }
@@ -170,6 +204,8 @@ NS_IMETHODIMP FolderLookupService::GetOrCreateFolderForURL(
   nsresult rv;
   nsCOMPtr<nsIMsgFolder> existingFolder = GetExisting(url);
   if (existingFolder) {
+    rv = CheckNativeFolderSource(existingFolder);
+    NS_ENSURE_SUCCESS(rv, rv);
     // The folder object exists and it has a server with a type,
     // indicating that the server hasn't been removed.
     nsCOMPtr<nsIMsgIncomingServer> server;
@@ -204,6 +240,8 @@ NS_IMETHODIMP FolderLookupService::Cache(const nsACString& url,
         "enabled.");
     return NS_ERROR_UNEXPECTED;
   }
+  nsresult sourceRv = CheckNativeFolderSource(folder);
+  NS_ENSURE_SUCCESS(sourceRv, sourceRv);
   nsCOMPtr<nsIMsgFolder> existing = GetExisting(url);
   if (existing && existing != folder) {
     bool isValid;
@@ -212,6 +250,7 @@ NS_IMETHODIMP FolderLookupService::Cache(const nsACString& url,
     NS_ENSURE_TRUE(!isValid, NS_ERROR_ALREADY_INITIALIZED);
   }
   mFolderCache.InsertOrUpdate(url, do_GetWeakReference(folder));
+  ++mCacheGeneration;
   return NS_OK;
 }
 
@@ -225,12 +264,14 @@ NS_IMETHODIMP FolderLookupService::EvictFolder(nsIMsgFolder* folder) {
   nsCOMPtr<nsIMsgFolder> cachedFolder = GetExisting(url);
   if (cachedFolder == folder) {
     mFolderCache.Remove(url);
+    ++mCacheGeneration;
   }
   return NS_OK;
 }
 
 NS_IMETHODIMP FolderLookupService::InvalidateCache() {
   mFolderCache.Clear();
+  ++mCacheGeneration;
   return NS_OK;
 }
 
@@ -245,6 +286,7 @@ nsCOMPtr<nsIMsgFolder> FolderLookupService::GetExisting(const nsACString& url) {
   if (NS_FAILED(rv)) {
     // The weak reference has expired, so remove its stale cache entry.
     mFolderCache.Remove(url);
+    ++mCacheGeneration;
     return nullptr;
   }
 
@@ -288,6 +330,7 @@ nsresult FolderLookupService::CreateDangling(const nsACString& url,
     rv = newFolder->Init(url);
     NS_ENSURE_SUCCESS(rv, rv);
     mFolderCache.InsertOrUpdate(url, do_GetWeakReference(newFolder));
+    ++mCacheGeneration;
     newFolder.forget(folder);
   }
 

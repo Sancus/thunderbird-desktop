@@ -7,6 +7,39 @@ XPCSHELL_TESTS_MANIFESTS += [
     "unit/xpcshell-mbox.toml",
 ]
 
+if CONFIG["MOZ_PANORAMA"]:
+    XPCSHELL_TESTS_MANIFESTS += [
+        "unit/xpcshell-panorama-discovery-child-mork-maildir.toml",
+        "unit/xpcshell-panorama-discovery-child-mork-mbox.toml",
+        "unit/xpcshell-panorama-discovery-child-panorama-maildir.toml",
+        "unit/xpcshell-panorama-discovery-child-panorama-mbox.toml",
+        "unit/xpcshell-panorama-discovery-delimiter-mork-maildir.toml",
+        "unit/xpcshell-panorama-discovery-delimiter-mork-mbox.toml",
+        "unit/xpcshell-panorama-discovery-delimiter-panorama-maildir.toml",
+        "unit/xpcshell-panorama-discovery-delimiter-panorama-mbox.toml",
+        "unit/xpcshell-panorama-discovery-nested-mork-maildir.toml",
+        "unit/xpcshell-panorama-discovery-nested-mork-mbox.toml",
+        "unit/xpcshell-panorama-discovery-nested-panorama-maildir.toml",
+        "unit/xpcshell-panorama-discovery-nested-panorama-mbox.toml",
+        "unit/xpcshell-panorama-discovery-online-name-mork-maildir.toml",
+        "unit/xpcshell-panorama-discovery-online-name-mork-mbox.toml",
+        "unit/xpcshell-panorama-discovery-online-name-panorama-maildir.toml",
+        "unit/xpcshell-panorama-discovery-online-name-panorama-mbox.toml",
+        "unit/xpcshell-panorama-discovery-repeat-mork-maildir.toml",
+        "unit/xpcshell-panorama-discovery-repeat-mork-mbox.toml",
+        "unit/xpcshell-panorama-discovery-repeat-panorama-maildir.toml",
+        "unit/xpcshell-panorama-discovery-repeat-panorama-mbox.toml",
+    ]
+
+    if "comm" in CONFIG["MOZ_BUILD_APP"]:
+        test_harness_base = TEST_HARNESS_FILES.xpcshell.comm
+    else:
+        test_harness_base = TEST_HARNESS_FILES.xpcshell
+
+    test_harness_base.mailnews.db.panorama.test.xpcshell += [
+        "/comm/mailnews/db/panorama/test/xpcshell/head_delivery.js",
+    ]
+
 LOCAL_INCLUDES += [
     "../../base/src",
     "../src",

@@ -18,10 +18,18 @@ class nsIFile;
 class nsIOutputStream;
 
 class nsMsgBrkMBoxStore final : public nsMsgLocalStoreUtils,
-                                nsIMsgPluggableStore {
+                                nsIMsgPluggableStore
+#ifdef MOZ_PANORAMA
+    ,
+                                public nsIFolderStorageMoveAdmission
+#endif
+{
  public:
   NS_DECL_ISUPPORTS
   NS_DECL_NSIMSGPLUGGABLESTORE
+#ifdef MOZ_PANORAMA
+  NS_IMETHOD CheckFolderStorageMove(nsIMsgFolder* folder) override;
+#endif
 
   nsMsgBrkMBoxStore();
 

@@ -63,6 +63,8 @@
 
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
+#  include "nsMsgLocalStoreUtils.h"
+#  include "mozilla/UniquePtr.h"
 #endif
 
 #include <algorithm>
@@ -936,6 +938,104 @@ nsresult nsMsgLocalMailFolder::ConfirmFolderDeletion(nsIMsgWindow* aMsgWindow,
   return NS_OK;
 }
 
+#ifdef MOZ_PANORAMA
+namespace {
+
+// Core may retain this physical recovery state after every wrapper is evicted.
+// It deliberately has no operation, token, core, folder or PFD reference.
+class LocalFolderRelocationStorage final : public nsISupports {
+ public:
+  NS_DECL_ISUPPORTS
+  mozilla::UniquePtr<mozilla::mailnews::FolderStorageMove> plan =
+      mozilla::MakeUnique<mozilla::mailnews::FolderStorageMove>();
+  nsCOMPtr<nsIFile> source;
+  nsCOMPtr<nsIFile> destination;
+  nsresult primary = NS_OK;
+  nsresult rollback = NS_OK;
+
+ private:
+  ~LocalFolderRelocationStorage() = default;
+};
+
+NS_IMPL_ISUPPORTS(LocalFolderRelocationStorage, nsISupports)
+
+}  // namespace
+
+nsresult nsMsgLocalMailFolder::RelocateNativeLocalFolder(
+    nsIMsgFolder* targetParent, const nsACString& name, nsIMsgWindow* msgWindow,
+    nsIMsgFolder** replacement) {
+  using namespace mozilla::mailnews;
+  NS_ENSURE_ARG_POINTER(replacement);
+  *replacement = nullptr;
+  MOZ_TRY(CheckFolderPathAccess());
+  nsTArray<RefPtr<nsIMsgFolder>> originals;
+  MOZ_TRY(GetDescendants(originals));
+  originals.InsertElementAt(0, this);
+  for (const auto& folder : originals) {
+    MOZ_TRY(CheckFolderStorageMove(folder));
+  }
+
+  RefPtr<LocalFolderRelocationStorage> storage =
+      new LocalFolderRelocationStorage();
+  RefPtr<NativeFolderRelocation> operation;
+  MOZ_TRY(
+      PrepareNativeFolderRelocation(targetParent, name, storage, operation));
+  nsTArray<uint64_t> ids;
+  nsresult rv = [&]() -> nsresult {
+    NS_ENSURE_TRUE(originals.Length() == operation->FolderIds().Length(),
+                   NS_ERROR_NOT_AVAILABLE);
+    for (const auto& folder : originals) {
+      uint64_t id;
+      MOZ_TRY(folder->GetId(&id));
+      NS_ENSURE_TRUE(operation->FolderIds().Contains(id) && !ids.Contains(id),
+                     NS_ERROR_NOT_AVAILABLE);
+      ids.AppendElement(id);
+    }
+    MOZ_TRY(operation->SourcePath()->Clone(getter_AddRefs(storage->source)));
+    MOZ_TRY(
+        operation->TargetPath()->Clone(getter_AddRefs(storage->destination)));
+    bool exists;
+    MOZ_TRY(storage->source->Exists(&exists));
+    NS_ENSURE_TRUE(exists || (mFlags & nsMsgFolderFlags::Virtual),
+                   NS_ERROR_FILE_NOT_FOUND);
+    nsCOMPtr<nsIFile> directory;
+    MOZ_TRY(static_cast<nsMsgDBFolder*>(targetParent)
+                ->CreateDirectoryForFolder(getter_AddRefs(directory)));
+    MOZ_TRY(storage->plan->Prepare(storage->source, storage->destination));
+    MOZ_TRY(ForceDBClosed());
+    // Closing databases can reenter. Recheck each actual selected provider and
+    // the complete captured tuple before the synchronous physical/native tail.
+    for (const auto& folder : originals) {
+      MOZ_TRY(CheckFolderStorageMove(folder));
+    }
+    MOZ_TRY(ValidateNativeFolderRelocation(operation));
+    nsresult status = storage->plan->Apply();
+    storage->rollback = storage->plan->RollbackStatus();
+    if (NS_FAILED(status)) return status;
+    status = CommitNativeFolderRelocation(operation, nullptr, replacement);
+    if (NS_FAILED(status)) storage->rollback = storage->plan->Rollback();
+    return status;
+  }();
+  if (NS_FAILED(rv)) {
+    storage->primary = rv;
+    // This roots the physical holder before releasing any operation/wrappers
+    // when restoration failed. It never substitutes the cleanup error.
+    FinishNativeFolderRelocationFailure(operation, rv, storage->rollback);
+    return rv;
+  }
+
+  // Existing local filter retargeting is best effort after known publication.
+  // It cannot convert a committed relocation into a reported rollback failure.
+  for (size_t i = 0; i < originals.Length(); ++i) {
+    bool changed = false;
+    (void)originals[i]->MatchOrChangeFilterDestination(
+        operation->ReplacementFor(ids[i]), true, &changed);
+    if (changed) (void)originals[i]->AlertFilterChanged(msgWindow);
+  }
+  return NS_OK;
+}
+#endif
+
 NS_IMETHODIMP nsMsgLocalMailFolder::Rename(const nsACString& aNewName,
                                            nsIMsgWindow* msgWindow) {
   // Renaming to the same name is easy
@@ -947,6 +1047,22 @@ NS_IMETHODIMP nsMsgLocalMailFolder::Rename(const nsACString& aNewName,
 
   rv = CheckIfFolderExists(aNewName, parentFolder, msgWindow);
   if (NS_FAILED(rv)) return rv;
+
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+        mozilla::components::FolderNotification::Service();
+    NS_ENSURE_STATE(notifier);
+    nsCOMPtr<nsIMsgFolder> replacement;
+    rv = RelocateNativeLocalFolder(parentFolder, aNewName, msgWindow,
+                                   getter_AddRefs(replacement));
+    if (NS_FAILED(rv)) return rv;
+    (void)parentFolder->NotifyFolderAdded(replacement);
+    (void)replacement->NotifyFolderEvent(kRenameCompleted);
+    notifier->NotifyFolderRenamed(this, replacement);
+    return NS_OK;
+  }
+#endif
 
   nsCOMPtr<nsIMsgPluggableStore> msgStore;
   nsCOMPtr<nsIMsgFolder> newFolder;
@@ -1869,7 +1985,10 @@ nsMsgLocalMailFolder::CopyFolderLocal(nsIMsgFolder* srcFolder,
       }
       // if we are moving a favorite folder to trash, we should clear the
       // favorites flag so it gets removed from the view.
-      srcFolder->ClearFlag(nsMsgFolderFlags::Favorite);
+#ifdef MOZ_PANORAMA
+      if (!mail_panorama_enabled_AtStartup())
+#endif
+        srcFolder->ClearFlag(nsMsgFolderFlags::Favorite);
     }
 
     bool match = false;
@@ -1927,6 +2046,27 @@ nsMsgLocalMailFolder::CopyFolderLocal(nsIMsgFolder* srcFolder,
   if (NS_WARN_IF(NS_FAILED(rv))) {
     return rv;
   }
+
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup() && isMoveFolder) {
+    nsCOMPtr<nsIMsgLocalMailFolder> local = do_QueryInterface(srcFolder);
+    NS_ENSURE_TRUE(local, NS_ERROR_INVALID_ARG);
+    nsCOMPtr<nsIMsgFolder> replacement;
+    rv = static_cast<nsMsgLocalMailFolder*>(srcFolder)
+             ->RelocateNativeLocalFolder(this, newFolderName, msgWindow,
+                                         getter_AddRefs(replacement));
+    if (NS_FAILED(rv)) return rv;
+    // Preserve the existing best-effort local Trash flag policy only after
+    // success; a failed move must not clear the source's Favorite flag.
+    if (isChildOfTrash)
+      (void)replacement->ClearFlag(nsMsgFolderFlags::Favorite);
+    nsCOMPtr<nsISupports> support = do_QueryInterface(srcFolder);
+    (void)static_cast<nsMsgLocalMailFolder*>(replacement.get())
+        ->OnCopyCompleted(support, true);
+    (void)NotifyFolderAdded(replacement);
+    return NS_OK;
+  }
+#endif
 
   return msgStore->CopyFolder(srcFolder, this, isMoveFolder, msgWindow,
                               aListener, newFolderName);
@@ -3559,6 +3699,7 @@ NS_IMETHODIMP nsMsgLocalMailFolder::HasMsgOffline(nsMsgKey msgKey,
   *result = false;
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(CheckFolderPathAccess());
     MOZ_TRY(GetDatabase());
   } else
 #endif

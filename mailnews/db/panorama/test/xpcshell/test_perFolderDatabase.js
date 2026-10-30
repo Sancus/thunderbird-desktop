@@ -1934,26 +1934,26 @@ add_task(function test_deletionKeepsItsConstructionIncarnation() {
   const second = addMessage({ folderId: folder.id });
   messageDB.getMessage(second).messageSize = 7;
   admitted.forceClosed();
-  let transient;
   connection.beginTransaction();
   try {
     connection.executeSimpleSQL(
       "UPDATE database_identity SET sourceId = '{87654321-4321-4321-4321-cba987654321}'"
     );
-    transient = service.openFolderDB(folder, false);
+    Assert.throws(
+      () => service.openFolderDB(folder, false),
+      /NS_ERROR_NOT_AVAILABLE/,
+      "Public admission rejects the original wrapper in another incarnation"
+    );
     Assert.ok(connection.transactionInProgress);
   } finally {
     connection.rollbackTransaction();
   }
   Assert.equal(database.sourceId, originalSource);
-  Assert.throws(
-    () => transient.deleteMessage(second, null, true),
-    /NS_ERROR_NOT_AVAILABLE/
-  );
-  Assert.ok(transient.containsKey(second));
-  Assert.equal(transient.dBFolderInfo.expungedBytes, 43);
-  transient.forceClosed();
+  // Direct receiver construction in a temporary incarnation is covered by
+  // DeliveryFolderInfoProperties.DeletionKeepsItsConstructionIncarnation.
   const current = service.openFolderDB(folder, false);
+  Assert.ok(current.containsKey(second));
+  Assert.equal(current.dBFolderInfo.expungedBytes, 43);
   current.deleteMessage(second, null, true);
   Assert.equal(current.dBFolderInfo.expungedBytes, 50);
 });
@@ -2022,7 +2022,8 @@ add_task(function test_admissionKeepsItsOriginalSourceReadError() {
     const folder = rootFolder
       .QueryInterface(Ci.nsIMsgLocalMailFolder)
       .createLocalSubfolder(`admission-source-${fault}`);
-    const key = addMessage({ folderId: folder.id });
+    const folderId = folder.id;
+    const key = addMessage({ folderId });
     messageDB.getMessage(key).messageSize = 17;
     folder.msgDatabase.forceClosed();
     const readCounter = () => {
@@ -2031,7 +2032,7 @@ add_task(function test_admissionKeepsItsOriginalSourceReadError() {
           "WHERE id = :id AND name = 'expungedBytes'"
       );
       try {
-        row.params.id = folder.id;
+        row.params.id = folderId;
         return row.executeStep()
           ? [row.getInt64(0), row.getUTF8String(1)]
           : null;
@@ -2040,7 +2041,8 @@ add_task(function test_admissionKeepsItsOriginalSourceReadError() {
       }
     };
     const originalCounter = readCounter();
-    let admitted;
+    const expected =
+      fault === "missing" ? Cr.NS_ERROR_FAILURE : Cr.NS_ERROR_FILE_CORRUPTED;
     try {
       if (fault === "missing") {
         connection.executeSimpleSQL(
@@ -2051,7 +2053,11 @@ add_task(function test_admissionKeepsItsOriginalSourceReadError() {
           "UPDATE database_identity SET sourceId = 'not-a-uuid'"
         );
       }
-      admitted = service.openFolderDB(folder, false);
+      Assert.throws(
+        () => service.openFolderDB(folder, false),
+        error => error.result === expected,
+        "Public admission preserves the original source reader error"
+      );
     } finally {
       if (fault === "missing") {
         connection.executeSimpleSQL(
@@ -2070,22 +2076,16 @@ add_task(function test_admissionKeepsItsOriginalSourceReadError() {
       }
     }
     Assert.equal(database.sourceId, source);
-    const expected =
-      fault === "missing" ? Cr.NS_ERROR_FAILURE : Cr.NS_ERROR_FILE_CORRUPTED;
-    Assert.throws(
-      () => admitted.deleteMessage(key, null, true),
-      error => error.result === expected,
-      "Repairing the source table cannot rebind a failed admission"
-    );
-    Assert.ok(admitted.containsKey(key));
-    Assert.equal(admitted.dBFolderInfo.expungedBytes, 0);
+    // The constructor's latched original error is covered directly by
+    // DeliveryFolderInfoProperties.AdmissionKeepsItsOriginalSourceReadError.
+    const current = service.openFolderDB(folder, false);
+    Assert.ok(current.containsKey(key));
+    Assert.equal(current.dBFolderInfo.expungedBytes, 0);
     Assert.deepEqual(
       readCounter(),
       originalCounter,
       "Failed admission preserves raw counter presence, type and value"
     );
-    admitted.forceClosed();
-    const current = service.openFolderDB(folder, false);
     current.deleteMessage(key, null, true);
     Assert.ok(!current.containsKey(key));
     Assert.equal(current.dBFolderInfo.expungedBytes, 17);
@@ -3974,4 +3974,145 @@ add_task(function test_keyFlagQueriesRequireCurrentPhysicalFolder() {
     Assert.strictEqual(otherDB[query](foreign.messageKey), true);
   }
   Assert.ok(!connection.transactionInProgress);
+});
+add_task(function test_userSortOrderPersistsWithoutChangingPhysicalOrder() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("stored-user-sort");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("stored-user-sort-control");
+  const id = folder.id;
+  const info = folder.msgDatabase.dBFolderInfo;
+  const otherInfo = other.msgDatabase.dBFolderInfo;
+  const connection = database.connectionForTests;
+  const readStored = () => {
+    const row = connection.createStatement(
+      "SELECT value, typeof(value) FROM folder_properties " +
+        "WHERE id=:id AND name='userSortOrder'"
+    );
+    try {
+      row.params.id = id;
+      return row.executeStep() ? [row.getInt64(0), row.getUTF8String(1)] : null;
+    } finally {
+      row.finalize();
+    }
+  };
+  const readOrdinal = () => {
+    const row = connection.createStatement(
+      "SELECT ordinal FROM folders WHERE id=:id"
+    );
+    try {
+      row.params.id = id;
+      Assert.ok(row.executeStep());
+      return row.getIsNull(0) ? null : row.getInt64(0);
+    } finally {
+      row.finalize();
+    }
+  };
+  const ordinal = readOrdinal();
+  Assert.equal(info.userSortOrder, Ci.nsIMsgFolder.NO_SORT_VALUE);
+  Assert.equal(folder.userSortOrder, Ci.nsIMsgFolder.NO_SORT_VALUE);
+  Assert.equal(readStored(), null, "Reading a default does not create a row");
+  otherInfo.userSortOrder = 29;
+  for (const value of [0, 7, 0xffffffff]) {
+    info.userSortOrder = value;
+    Assert.equal(info.userSortOrder, value);
+    Assert.equal(folder.userSortOrder, value);
+    Assert.deepEqual(readStored(), [value, "integer"]);
+  }
+  for (const invalid of [-1, 0x100000000]) {
+    info.setInt64Property("userSortOrder", invalid);
+    for (const read of [
+      () => info.userSortOrder,
+      () => folder.userSortOrder,
+      () => folder.sortOrder,
+    ]) {
+      Assert.throws(
+        read,
+        error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
+      );
+    }
+    Assert.deepEqual(readStored(), [invalid, "integer"]);
+  }
+  info.userSortOrder = 7;
+  connection.executeSimpleSQL(
+    `CREATE TEMP TRIGGER reject_user_sort BEFORE INSERT ON folder_properties
+     WHEN NEW.id=${id} AND NEW.name='userSortOrder' AND NEW.value=9
+     BEGIN SELECT RAISE(ABORT, 'user sort fault'); END`
+  );
+  try {
+    Assert.throws(
+      () => (folder.userSortOrder = 9),
+      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.equal(info.userSortOrder, 7);
+    Assert.equal(
+      folder.userSortOrder,
+      7,
+      "Failed writes do not replace the cache"
+    );
+    Assert.deepEqual(readStored(), [7, "integer"]);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_user_sort");
+  }
+  connection.beginTransaction();
+  try {
+    folder.userSortOrder = 11;
+    Assert.ok(connection.transactionInProgress);
+    Assert.equal(info.userSortOrder, 11);
+    Assert.equal(folder.userSortOrder, 11);
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(folder.userSortOrder, 7, "Rollback is read from storage");
+  connection.executeSimpleSQL(
+    "ALTER TABLE folder_properties RENAME TO held_user_sort_properties"
+  );
+  try {
+    for (const call of [
+      () => info.userSortOrder,
+      () => folder.userSortOrder,
+      () => folder.sortOrder,
+      () => (info.userSortOrder = 13),
+      () => (folder.userSortOrder = 13),
+    ]) {
+      Assert.throws(call, error => error.result == Cr.NS_ERROR_FAILURE);
+    }
+  } finally {
+    connection.executeSimpleSQL(
+      "ALTER TABLE held_user_sort_properties RENAME TO folder_properties"
+    );
+  }
+  Assert.equal(folder.userSortOrder, 7);
+  connection.beginTransaction();
+  try {
+    connection.executeSimpleSQL(
+      "UPDATE database_identity SET sourceId = '{87654321-4321-4321-4321-cba987654321}'"
+    );
+    for (const call of [
+      () => info.userSortOrder,
+      () => folder.userSortOrder,
+      () => (info.userSortOrder = 17),
+      () => (folder.userSortOrder = 17),
+    ]) {
+      Assert.throws(call, error => error.result == Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  folder.msgDatabase.forceClosed();
+  Assert.equal(folder.msgDatabase.dBFolderInfo.userSortOrder, 7);
+  Assert.equal(folder.userSortOrder, 7);
+  Assert.equal(otherInfo.userSortOrder, 29);
+  Assert.equal(
+    readOrdinal(),
+    ordinal,
+    "The native ordinal is a different field"
+  );
+  Assert.equal(folder.id, id);
+  Assert.strictEqual(folder.parent, rootFolder);
+  Assert.deepEqual(readStored(), [7, "integer"]);
 });

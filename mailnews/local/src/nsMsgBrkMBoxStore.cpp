@@ -35,6 +35,7 @@
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ScopeExit.h"
+#include "mozilla/Try.h"
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
 #  include "mozilla/StaticPrefs_mail.h"
@@ -54,6 +55,10 @@ static nsresult CheckMboxBodyAccess(nsIMsgFolder* folder) {
   NS_ENSURE_ARG_POINTER(folder);
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Admission must precede requesting a service: a retired/closed wrapper
+    // must not open a core merely to check whether its old path is readable.
+    nsCOMPtr<nsIFile> admittedPath;
+    MOZ_TRY(folder->GetFilePath(getter_AddRefs(admittedPath)));
     RefPtr<mozilla::mailnews::DatabaseCore> core =
         mozilla::mailnews::DatabaseCore::GetInstanceForService();
     NS_ENSURE_STATE(core);
@@ -73,7 +78,21 @@ nsMsgBrkMBoxStore::nsMsgBrkMBoxStore() {}
 
 nsMsgBrkMBoxStore::~nsMsgBrkMBoxStore() {}
 
+#ifdef MOZ_PANORAMA
+NS_IMPL_ISUPPORTS(nsMsgBrkMBoxStore, nsIMsgPluggableStore,
+                  nsIFolderStorageMoveAdmission)
+
+NS_IMETHODIMP nsMsgBrkMBoxStore::CheckFolderStorageMove(nsIMsgFolder* folder) {
+  NS_ENSURE_ARG(folder);
+  auto entry = mOngoingWrites.lookup(folder->URI());
+  if (!entry) return NS_OK;
+  if (NS_FAILED(entry->value().status)) return entry->value().status;
+  nsresult status = entry->value().stream->StreamStatus();
+  return NS_FAILED(status) ? status : NS_MSG_FOLDER_BUSY;
+}
+#else
 NS_IMPL_ISUPPORTS(nsMsgBrkMBoxStore, nsIMsgPluggableStore)
+#endif
 
 NS_IMETHODIMP nsMsgBrkMBoxStore::DiscoverSubFolders(nsIMsgFolder* aParentFolder,
                                                     bool aDeep) {

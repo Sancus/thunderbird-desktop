@@ -64,6 +64,9 @@
 #include "mozilla/StaticPrefs_mail.h"
 #include "mozilla/ResultExtensions.h"
 #include "nsWhitespaceTokenizer.h"
+#ifdef MOZ_PANORAMA
+#  include "nsImapMailFolder.h"
+#endif
 
 using mozilla::Preferences;
 using mozilla::net::LoadInfo;
@@ -1956,19 +1959,41 @@ NS_IMETHODIMP nsImapService::MoveFolder(nsIMsgFolder* srcFolder,
       nsCString folderName;
 
       nsCOMPtr<nsIMsgMailNewsUrl> mailnewsurl = do_QueryInterface(imapUrl);
-      GetFolderName(srcFolder, folderName);
+      MOZ_TRY(GetFolderName(srcFolder, folderName));
       urlSpec.AppendLiteral("/movefolderhierarchy>");
       urlSpec.Append(hierarchyDelimiter);
       urlSpec.Append(folderName);
       urlSpec.Append('>');
-      GetFolderName(dstFolder, folderName);
+      MOZ_TRY(GetFolderName(dstFolder, folderName));
       if (!folderName.IsEmpty()) {
         urlSpec.Append(hierarchyDelimiter);
         urlSpec.Append(folderName);
       }
       rv = mailnewsurl->SetSpecInternal(urlSpec);
+#ifdef MOZ_PANORAMA
+      if (NS_SUCCEEDED(rv) &&
+          mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        nsCOMPtr<nsIMsgImapMailFolder> source = do_QueryInterface(srcFolder);
+        NS_ENSURE_TRUE(source, NS_NOINTERFACE);
+        nsAutoCString online;
+        MOZ_TRY(source->GetOnlineName(online));
+        char delimiter;
+        MOZ_TRY(source->GetHierarchyDelimiter(&delimiter));
+        nsCString leaf(Substring(online, online.RFindChar(delimiter) + 1));
+        rv = static_cast<nsImapMailFolder*>(srcFolder)
+                 ->PrepareNativeImapFolderRelocation(
+                     static_cast<nsImapUrl*>(imapUrl.get()), dstFolder, leaf,
+                     nullptr);
+      }
+#endif
       if (NS_SUCCEEDED(rv)) {
         rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, nullptr);
+#ifdef MOZ_PANORAMA
+        if (NS_FAILED(rv) &&
+            static_cast<nsImapUrl*>(imapUrl.get())->HasNativeHierarchy()) {
+          nsImapMailFolder::CompleteNativeImapFolderRelocation(imapUrl, rv);
+        }
+#endif
       }
     }
   }
@@ -1994,7 +2019,7 @@ NS_IMETHODIMP nsImapService::RenameLeaf(nsIMsgFolder* srcFolder,
       nsCOMPtr<nsIMsgMailNewsUrl> mailNewsUrl = do_QueryInterface(imapUrl);
       mailNewsUrl->SetMsgWindow(msgWindow);
       nsCString folderName;
-      GetFolderName(srcFolder, folderName);
+      MOZ_TRY(GetFolderName(srcFolder, folderName));
       urlSpec.AppendLiteral("/rename>");
       urlSpec.Append(hierarchyDelimiter);
       urlSpec.Append(folderName);
@@ -2028,8 +2053,27 @@ NS_IMETHODIMP nsImapService::RenameLeaf(nsIMsgFolder* srcFolder,
       urlSpec.Append(escapedSlashName);
 
       rv = mailNewsUrl->SetSpecInternal(urlSpec);
-      if (NS_SUCCEEDED(rv))
+#ifdef MOZ_PANORAMA
+      if (NS_SUCCEEDED(rv) &&
+          mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        nsCOMPtr<nsIMsgFolder> parent;
+        MOZ_TRY(srcFolder->GetParent(getter_AddRefs(parent)));
+        NS_ENSURE_TRUE(parent, NS_ERROR_NOT_AVAILABLE);
+        rv = static_cast<nsImapMailFolder*>(srcFolder)
+                 ->PrepareNativeImapFolderRelocation(
+                     static_cast<nsImapUrl*>(imapUrl.get()), parent, utfNewName,
+                     &newLeafName);
+      }
+#endif
+      if (NS_SUCCEEDED(rv)) {
         rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, nullptr);
+#ifdef MOZ_PANORAMA
+        if (NS_FAILED(rv) &&
+            static_cast<nsImapUrl*>(imapUrl.get())->HasNativeHierarchy()) {
+          nsImapMailFolder::CompleteNativeImapFolderRelocation(imapUrl, rv);
+        }
+#endif
+      }
     }
   }
   return rv;

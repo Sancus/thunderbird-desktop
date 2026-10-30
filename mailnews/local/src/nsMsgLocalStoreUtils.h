@@ -8,6 +8,7 @@
 #include "nsCOMPtr.h"
 #include "nsIDirectoryEnumerator.h"
 #include "nsIFile.h"
+#include "nsISupports.h"
 #include "nsString.h"
 #include "nsTArray.h"
 
@@ -80,7 +81,25 @@ class nsMsgLocalStoreUtils {
 };
 
 #ifdef MOZ_PANORAMA
+class nsIMsgFolder;
+
+// Private native relocation admission; querying never preempts an issued write.
+#  define NS_IFOLDERSTORAGEMOVEADMISSION_IID \
+    {0x1bf67541,                             \
+     0x1509,                                 \
+     0x4bdb,                                 \
+     {0x9d, 0xba, 0x45, 0x7c, 0x34, 0xb0, 0x98, 0xd1}}
+
+class nsIFolderStorageMoveAdmission : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IFOLDERSTORAGEMOVEADMISSION_IID)
+  NS_IMETHOD CheckFolderStorageMove(nsIMsgFolder* folder) = 0;
+};
+
 namespace mozilla::mailnews {
+
+// Use the actual selected store. Unknown providers refuse before physical I/O.
+nsresult CheckFolderStorageMove(nsIMsgFolder* folder);
 
 /**
  * Move existing body, summary and child storage without changing folder rows.

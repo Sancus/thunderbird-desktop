@@ -17,10 +17,18 @@
 #include "mozilla/HashTable.h"
 
 class nsMsgMaildirStore final : public nsMsgLocalStoreUtils,
-                                nsIMsgPluggableStore {
+                                nsIMsgPluggableStore
+#ifdef MOZ_PANORAMA
+    ,
+                                public nsIFolderStorageMoveAdmission
+#endif
+{
  public:
   NS_DECL_ISUPPORTS
   NS_DECL_NSIMSGPLUGGABLESTORE
+#ifdef MOZ_PANORAMA
+  NS_IMETHOD CheckFolderStorageMove(nsIMsgFolder* folder) override;
+#endif
 
   nsMsgMaildirStore();
 

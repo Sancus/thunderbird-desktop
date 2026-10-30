@@ -1505,7 +1505,7 @@ NS_IMETHODIMP PerFolderDatabase::DeleteMessages(
   }
   RefPtr<PerFolderDatabase> self(this);
   MOZ_TRY(CheckFolderExists());
-  NS_ENSURE_SUCCESS(mDatabaseSourceStatus, mDatabaseSourceStatus);
+  MOZ_TRY(CheckDatabaseSource());
   RefPtr<MessageDatabase> messages = &MessageDB();
   MOZ_TRY(messages->CheckFolderBodyAccess(mFolderId));
   nsCOMPtr<nsIMsgFolder> folder;
@@ -2353,10 +2353,19 @@ NS_IMETHODIMP FolderInfo::SetImapUnreadPendingMessages(
                            static_cast<uint32_t>(aImapUnreadPendingMessages));
 }
 NS_IMETHODIMP FolderInfo::GetUserSortOrder(uint32_t* userSortOrder) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(userSortOrder);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  uint32_t value;
+  MOZ_TRY(
+      GetUint32Property("userSortOrder", nsIMsgFolder::NO_SORT_VALUE, &value));
+  *userSortOrder = value;
+  return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetUserSortOrder(uint32_t userSortOrder) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  return SetUint32Property("userSortOrder", userSortOrder);
 }
 NS_IMETHODIMP FolderInfo::GetViewType(nsMsgViewTypeValue* viewType) {
   NS_ENSURE_ARG_POINTER(viewType);

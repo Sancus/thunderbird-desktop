@@ -90,6 +90,7 @@
 #  include "DatabaseCore.h"
 #  include "nsIFolderLookupService.h"
 #  include "nsImapUrl.h"
+#  include "nsMsgLocalStoreUtils.h"
 #endif
 
 using mozilla::LazyLogModule;
@@ -216,6 +217,320 @@ struct nsImapMailFolder::FilterCopyState {
   uint32_t mPendingCopies = 0;
   bool mPlaybackRequested = false;
 };
+
+#ifdef MOZ_PANORAMA
+// Core retains this object after a failed physical restore. It has no edge to
+// the URL, prepared wrappers, native token or core, and its destructor does no
+// I/O.
+class nsImapFolderStorageMove final : public nsISupports {
+ public:
+  NS_DECL_ISUPPORTS
+  mozilla::mailnews::FolderStorageMove plan;
+  nsresult primary = NS_OK;
+  nsresult rollback = NS_OK;
+
+ private:
+  ~nsImapFolderStorageMove() = default;
+};
+NS_IMPL_ISUPPORTS(nsImapFolderStorageMove, nsISupports)
+
+#  define NS_IMAPFOLDERRELOCATION_IID \
+    {0x29bb2c35,                      \
+     0xa932,                          \
+     0x4217,                          \
+     {0x88, 0x2e, 0x19, 0x86, 0x40, 0x27, 0xab, 0x50}}
+
+class nsImapFolderRelocation final : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IMAPFOLDERRELOCATION_IID)
+  NS_DECL_ISUPPORTS
+
+  nsresult Prepare(nsImapMailFolder* source, nsIMsgFolder* parent,
+                   const nsACString& leaf, const nsACString* display,
+                   nsImapUrl* url);
+  nsresult Complete(nsImapUrl* url, nsresult status,
+                    nsIMsgFolder** replacement);
+  void Abort(nsresult status) {
+    if (mOperation && !mDone) Fail(status, NS_OK);
+  }
+  const char* PreparationStage() const { return mPreparationStage; }
+
+ private:
+  ~nsImapFolderRelocation() {
+    MOZ_ASSERT(NS_IsMainThread());
+    if (!mDone && mOperation) Fail(NS_BINDING_ABORTED, NS_OK);
+  }
+  struct Folder {
+    RefPtr<nsImapMailFolder> original;
+    mozilla::Maybe<uint32_t> epoch;
+    nsCString onlineName;
+  };
+  nsresult CheckEpochs();
+  nsresult CheckStorageReady();
+  nsresult Fail(nsresult primary, nsresult rollback) {
+    mStorage->primary = primary;
+    mStorage->rollback = rollback;
+    mSource->FinishNativeFolderRelocationFailure(mOperation, primary, rollback);
+    mDone = true;
+    return primary;
+  }
+  RefPtr<nsImapMailFolder> mSource;
+  nsCOMPtr<nsIMsgFolder> mParent;
+  nsCOMPtr<nsIMsgWindow> mWindow;
+  RefPtr<mozilla::mailnews::NativeFolderRelocation> mOperation;
+  RefPtr<nsImapFolderStorageMove> mStorage;
+  mozilla::mailnews::ImapFolderRelocationMetadata mMetadata;
+  nsTArray<Folder> mFolders;
+  bool mDone = false;
+  const char* mPreparationStage = "parameters";
+};
+NS_IMPL_ISUPPORTS(nsImapFolderRelocation, nsImapFolderRelocation)
+
+nsresult nsImapFolderRelocation::CheckStorageReady() {
+  for (const auto& folder : mFolders) {
+    MOZ_TRY(mozilla::mailnews::CheckFolderStorageMove(folder.original));
+  }
+  return NS_OK;
+}
+
+nsresult nsImapFolderRelocation::Prepare(nsImapMailFolder* source,
+                                         nsIMsgFolder* parent,
+                                         const nsACString& leaf,
+                                         const nsACString* display,
+                                         nsImapUrl* url) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG(source && parent && url);
+  NS_ENSURE_FALSE(leaf.IsEmpty(), NS_ERROR_INVALID_ARG);
+  mSource = source;
+  mParent = parent;
+  mStorage = new nsImapFolderStorageMove();
+  char delimiter;
+  MOZ_TRY(source->GetHierarchyDelimiter(&delimiter));
+  NS_ENSURE_TRUE(delimiter && delimiter != kOnlineHierarchySeparatorUnknown,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(leaf.FindChar(delimiter) == kNotFound, NS_ERROR_INVALID_ARG);
+  nsCString storedLeaf = nsImapUrl::ConvertToCanonicalFormat(leaf, delimiter);
+  mPreparationStage = "replacement preparation";
+  MOZ_TRY(source->PrepareNativeFolderRelocation(parent, storedLeaf, mStorage,
+                                                mOperation));
+  NS_ENSURE_TRUE(mOperation->NewName() == storedLeaf, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgMailNewsUrl> mailUrl =
+      do_QueryInterface(static_cast<nsIImapUrl*>(url));
+  mPreparationStage = "optional message window";
+  nsresult windowRv = mailUrl->GetMsgWindow(getter_AddRefs(mWindow));
+  // This existing getter reports NULL_POINTER for an absent weak UI window.
+  // Headless/service callers explicitly support that optional input.
+  if (NS_FAILED(windowRv) && windowRv != NS_ERROR_NULL_POINTER) return windowRv;
+  mPreparationStage = "protocol metadata";
+  nsAutoCString sourceOnline, parentOnline;
+  MOZ_TRY(source->GetOnlineName(sourceOnline));
+  NS_ENSURE_FALSE(sourceOnline.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgImapMailFolder> imapParent = do_QueryInterface(parent);
+  NS_ENSURE_TRUE(imapParent, NS_NOINTERFACE);
+  MOZ_TRY(imapParent->GetOnlineName(parentOnline));
+  bool root;
+  MOZ_TRY(parent->GetIsServer(&root));
+  NS_ENSURE_TRUE(root || !parentOnline.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+  nsCString destination(parentOnline);
+  if (!destination.IsEmpty()) destination.Append(delimiter);
+  destination.Append(leaf);
+  if (display) mMetadata.displayName.emplace(*display);
+
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  nsCString sourceId;
+  MOZ_TRY(core->GetSourceId(sourceId));
+  NS_ENSURE_TRUE(sourceId == mOperation->SourceId(), NS_ERROR_NOT_AVAILABLE);
+  nsTArray<RefPtr<nsIMsgFolder>> originals{source};
+  for (size_t i = 0; i < originals.Length(); ++i) {
+    nsCOMPtr<nsIMsgImapMailFolder> imap = do_QueryInterface(originals[i]);
+    NS_ENSURE_TRUE(imap, NS_NOINTERFACE);
+    auto* original = static_cast<nsImapMailFolder*>(originals[i].get());
+    uint64_t id;
+    MOZ_TRY(original->GetId(&id));
+    NS_ENSURE_TRUE(mOperation->FolderIds().Contains(id),
+                   NS_ERROR_NOT_AVAILABLE);
+    for (const auto& entry : mMetadata.folders) {
+      NS_ENSURE_TRUE(entry.id != id, NS_ERROR_NOT_AVAILABLE);
+    }
+    Folder captured;
+    captured.original = original;
+    MOZ_TRY(original->GetOnlineName(captured.onlineName));
+    nsCString desired(destination);
+    if (i) {
+      NS_ENSURE_TRUE(
+          captured.onlineName.Length() > sourceOnline.Length() &&
+              StringBeginsWith(captured.onlineName, sourceOnline) &&
+              captured.onlineName.CharAt(sourceOnline.Length()) == delimiter,
+          NS_ERROR_NOT_AVAILABLE);
+      desired.Append(Substring(captured.onlineName, sourceOnline.Length()));
+    } else {
+      NS_ENSURE_TRUE(captured.onlineName == sourceOnline,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+    uint32_t epoch;
+    nsresult rv = core->FolderDB().GetFolderUidValidity(id, epoch);
+    if (NS_SUCCEEDED(rv)) {
+      captured.epoch.emplace(epoch);
+    } else if (rv != NS_ERROR_NOT_AVAILABLE) {
+      return rv;
+    }
+    mMetadata.folders.AppendElement(ImapFolderRelocationEntry{
+        id, MOZ_TRY(core->FolderDB().GetFolderParent(id)),
+        MOZ_TRY(core->FolderDB().GetFolderName(id)), std::move(desired)});
+    mFolders.AppendElement(std::move(captured));
+    nsTArray<RefPtr<nsIMsgFolder>> children;
+    MOZ_TRY(original->GetSubFolders(children));
+    originals.AppendElements(children);
+  }
+  NS_ENSURE_TRUE(mFolders.Length() == mOperation->FolderIds().Length(),
+                 NS_ERROR_NOT_AVAILABLE);
+  mPreparationStage = "provider admission";
+  MOZ_TRY(CheckStorageReady());
+  mPreparationStage = "physical path preparation";
+  // The helper needs a real destination directory. This creates no folder row,
+  // replacement publication or body and is checked before protocol dispatch.
+  nsCOMPtr<nsIFile> directory;
+  MOZ_TRY(static_cast<nsMsgDBFolder*>(parent)->CreateDirectoryForFolder(
+      getter_AddRefs(directory)));
+  MOZ_TRY(mStorage->plan.Prepare(mOperation->SourcePath(),
+                                 mOperation->TargetPath()));
+  mPreparationStage = "URL evidence capture";
+  nsImapMailCopyState* copyState =
+      display ? nullptr
+              : static_cast<nsImapMailFolder*>(parent)->m_copyState.get();
+  return url->PrepareNativeHierarchy(sourceOnline, destination, this,
+                                     copyState);
+}
+
+nsresult nsImapFolderRelocation::CheckEpochs() {
+  using namespace mozilla::mailnews;
+  // Refuse a retired/closed source through the checked existing wrapper before
+  // acquiring a service; validation must not manufacture a replacement core.
+  MOZ_TRY(mSource->CheckFolderPathAccess());
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  nsCString sourceId;
+  MOZ_TRY(core->GetSourceId(sourceId));
+  NS_ENSURE_TRUE(sourceId == mOperation->SourceId(), NS_ERROR_NOT_AVAILABLE);
+  for (size_t i = 0; i < mFolders.Length(); ++i) {
+    nsAutoCString online;
+    MOZ_TRY(mFolders[i].original->GetOnlineName(online));
+    NS_ENSURE_TRUE(online == mFolders[i].onlineName, NS_ERROR_NOT_AVAILABLE);
+    uint32_t epoch;
+    nsresult rv =
+        core->FolderDB().GetFolderUidValidity(mMetadata.folders[i].id, epoch);
+    if (mFolders[i].epoch) {
+      MOZ_TRY(rv);
+      NS_ENSURE_TRUE(epoch == *mFolders[i].epoch, NS_ERROR_NOT_AVAILABLE);
+    } else {
+      if (NS_FAILED(rv) && rv != NS_ERROR_NOT_AVAILABLE) return rv;
+      NS_ENSURE_TRUE(rv == NS_ERROR_NOT_AVAILABLE, NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  return NS_OK;
+}
+
+nsresult nsImapFolderRelocation::Complete(nsImapUrl* url, nsresult status,
+                                          nsIMsgFolder** replacement) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_FALSE(mDone, NS_ERROR_NOT_AVAILABLE);
+  if (NS_FAILED(status)) return Fail(status, NS_OK);
+  if (!url->NativeHierarchyConfirmed())
+    return Fail(NS_ERROR_NOT_AVAILABLE, NS_OK);
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(CheckStorageReady());
+    MOZ_TRY(CheckEpochs());
+    nsCOMPtr<nsIMsgDBService> service =
+        do_GetService("@mozilla.org/msgDatabase/msgDBService;1");
+    NS_ENSURE_TRUE(service, NS_ERROR_NOT_AVAILABLE);
+    for (const auto& folder : mFolders) {
+      auto* original = folder.original.get();
+      NS_ENSURE_FALSE(original->mBackupDatabase, NS_ERROR_IN_PROGRESS);
+      // Use checked native closure, not the legacy ForceDBClosed/SetMsgDatabase
+      // wrappers that ignore receiver errors or commit while clearing a
+      // pointer.
+      MOZ_TRY(service->ForceFolderDBClosed(original));
+      if (original->mDatabase) MOZ_TRY(original->mDatabase->ForceClosed());
+      original->mDatabase = nullptr;
+    }
+    // ForceClosed announcers may reenter and change protocol metadata. Recheck
+    // the captured epoch/online tuple after those callbacks, before any bytes.
+    MOZ_TRY(CheckEpochs());
+    MOZ_TRY(CheckStorageReady());
+    MOZ_TRY(mSource->ValidateNativeFolderRelocation(mOperation));
+    return NS_OK;
+  }();
+  if (NS_FAILED(rv)) return Fail(rv, NS_OK);
+  // No yielding from the final provider/tuple check through Apply and commit.
+  rv = mStorage->plan.Apply();
+  if (NS_FAILED(rv)) return Fail(rv, mStorage->plan.RollbackStatus());
+  nsCOMPtr<nsIMsgFolder> arrived;
+  rv = mSource->CommitNativeFolderRelocation(mOperation, &mMetadata,
+                                             getter_AddRefs(arrived));
+  if (NS_FAILED(rv)) {
+    nsresult rollback = mStorage->plan.Rollback();
+    return Fail(rv, rollback);
+  }
+  mDone = true;
+  for (size_t i = 0; i < mFolders.Length(); ++i) {
+    auto* old = mFolders[i].original.get();
+    auto* fresh = static_cast<nsImapMailFolder*>(
+        mOperation->ReplacementFor(mMetadata.folders[i].id));
+    fresh->m_onlineFolderName = mMetadata.folders[i].onlineName;
+    fresh->m_hierarchyDelimiter = old->m_hierarchyDelimiter;
+    fresh->m_boxFlags = old->m_boxFlags;
+    fresh->m_uidValidity = old->m_uidValidity;
+    fresh->m_initialized = true;
+    fresh->m_verifiedAsOnlineFolder = true;
+    old->m_verifiedAsOnlineFolder = false;
+    // Preserve existing best-effort filter behavior after known settlement.
+    bool changed = false;
+    old->MatchOrChangeFilterDestination(fresh, false, &changed);
+    if (changed) old->AlertFilterChanged(mWindow);
+  }
+  nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+      mozilla::components::FolderNotification::Service();
+  if (notifier) notifier->NotifyFolderRenamed(mSource, arrived);
+  mParent->NotifyFolderAdded(arrived);
+  arrived->NotifyFolderEvent(kRenameCompleted);
+  if (replacement) arrived.forget(replacement);
+  return NS_OK;
+}
+
+nsresult nsImapMailFolder::PrepareNativeImapFolderRelocation(
+    nsImapUrl* url, nsIMsgFolder* targetParent, const nsACString& onlineLeaf,
+    const nsACString* displayName) {
+  RefPtr<nsImapFolderRelocation> operation = new nsImapFolderRelocation();
+  nsresult rv =
+      operation->Prepare(this, targetParent, onlineLeaf, displayName, url);
+  if (NS_FAILED(rv)) {
+    MOZ_LOG(IMAP_DC, mozilla::LogLevel::Error,
+            ("Native hierarchy %s failed: 0x%08" PRIx32,
+             operation->PreparationStage(), static_cast<uint32_t>(rv)));
+    operation->Abort(rv);
+  }
+  return rv;
+}
+
+nsresult nsImapMailFolder::CompleteNativeImapFolderRelocation(
+    nsIImapUrl* url, nsresult status, nsIMsgFolder** replacement) {
+  auto* native = static_cast<nsImapUrl*>(url);
+  if (replacement) *replacement = nullptr;
+  if (!native->BeginNativeHierarchyCompletion()) {
+    return native->NativeHierarchyResult();
+  }
+  nsCOMPtr<nsImapFolderRelocation> operation =
+      do_QueryInterface(native->NativeHierarchyContinuation());
+  nsresult rv = operation ? operation->Complete(native, status, replacement)
+                : NS_FAILED(status) ? status
+                                    : NS_ERROR_NOT_AVAILABLE;
+  native->SetNativeHierarchyResult(rv);
+  native->ClearNativeHierarchyContinuation();
+  return rv;
+}
+#endif
 
 //
 //  nsImapMailFolder
@@ -2051,7 +2366,7 @@ nsImapMailFolder::GetImapIncomingServer(
   nsCOMPtr<nsIMsgIncomingServer> server;
   if (NS_SUCCEEDED(GetServer(getter_AddRefs(server))) && server) {
     nsCOMPtr<nsIImapIncomingServer> incomingServer = do_QueryInterface(server);
-    NS_ENSURE_TRUE(incomingServer, NS_ERROR_NO_INTERFACE);
+    NS_ENSURE_TRUE(incomingServer, NS_NOINTERFACE);
     incomingServer.forget(aImapIncomingServer);
     return NS_OK;
   }
@@ -3589,8 +3904,8 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
         nsMsgKey key;
         MOZ_TRY(newMsgHdr->GetMessageKey(&key));
         MOZ_TRY(GetMoveCoalescer());
-        auto* bucket = m_moveCoalescer->GetKeyBucket(
-            score.EqualsLiteral("100") ? 0 : 1);
+        auto* bucket =
+            m_moveCoalescer->GetKeyBucket(score.EqualsLiteral("100") ? 0 : 1);
         if (!bucket->Contains(key)) bucket->AppendElement(key);
       }
     }
@@ -6004,6 +6319,16 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
           }
           break;
         case nsIImapUrl::nsImapMoveFolderHierarchy:
+#ifdef MOZ_PANORAMA
+          if (mail_panorama_enabled_AtStartup() &&
+              (!static_cast<nsImapUrl*>(imapUrl.get())->HasNativeHierarchy() ||
+               static_cast<nsImapUrl*>(imapUrl.get())
+                       ->NativeHierarchyCopyState() != m_copyState.get())) {
+            // A previous request may already have failed synchronously. Its
+            // late URL must not complete or clear the next queued request.
+            break;
+          }
+#endif
           if (m_copyState)  // delete folder gets here, but w/o an m_copyState
           {
             nsCOMPtr<nsIMsgCopyService> copyService =
@@ -7314,9 +7639,27 @@ NS_IMETHODIMP
 nsImapMailFolder::SetUrlState(nsIImapProtocol* aProtocol,
                               nsIMsgMailNewsUrl* aUrl, bool isRunning,
                               bool aSuspend, nsresult statusCode) {
-  // If we have no path, then the folder has been shutdown, and there's
-  // no point in doing anything...
-  if (!mPath) return NS_OK;
+  bool nativeHierarchy = false;
+#ifdef MOZ_PANORAMA
+  if (!isRunning && !aSuspend && aUrl) {
+    nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(aUrl);
+    if (imapUrl &&
+        static_cast<nsImapUrl*>(imapUrl.get())->HasNativeHierarchy()) {
+      nativeHierarchy = true;
+      nsCOMPtr<nsIMsgFolder> arrived;
+      statusCode = CompleteNativeImapFolderRelocation(imapUrl, statusCode,
+                                                      getter_AddRefs(arrived));
+      if (arrived && m_copyState &&
+          static_cast<nsImapUrl*>(imapUrl.get())->NativeHierarchyCopyState() ==
+              m_copyState.get()) {
+        m_copyState->m_arrFolder = arrived;
+      }
+    }
+  }
+#endif
+  // A committed native rename deliberately detached this old wrapper. Its URL
+  // must still run common cleanup and notify the registered listeners once.
+  if (!mPath && !nativeHierarchy) return NS_OK;
   if (!isRunning) {
     ProgressStatusString(aProtocol, "imapDone"_ns, ""_ns);
     m_urlRunning = false;
@@ -8306,7 +8649,18 @@ nsImapMailFolder::CopyFolder(nsIMsgFolder* srcFolder, bool isMoveFolder,
                        listener, msgWindow, false);
     if (NS_FAILED(rv)) return OnCopyCompleted(srcSupport, rv);
 
-    return imapService->MoveFolder(srcFolder, this, this, msgWindow);
+    RefPtr<nsImapMailCopyState> dispatchedState = m_copyState;
+    rv = imapService->MoveFolder(srcFolder, this, this, msgWindow);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup() && NS_FAILED(rv) &&
+        m_copyState == dispatchedState) {
+      // The real copy service clears its still-pending request and reports the
+      // original error. Release only our matching destination state first, so
+      // a later retry is not refused by stale InitCopyState bookkeeping.
+      m_copyState = nullptr;
+    }
+#endif
+    return rv;
   }
 
   // !sameServer OR it's a copy. folderCopier, set below, handles the folder

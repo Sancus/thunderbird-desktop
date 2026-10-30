@@ -74,6 +74,24 @@ class nsImapUrl : public nsIImapUrl,
     uint32_t epoch;
     nsTArray<CopyTarget> messages;
   };
+  // The worker sees only immutable mailbox strings and records matching ACKs.
+  // The storage/wrapper continuation is main-thread-only and released there.
+  nsresult PrepareNativeHierarchy(const nsACString& source,
+                                  const nsACString& destination,
+                                  nsISupports* continuation,
+                                  nsISupports* copyState);
+  bool HasNativeHierarchy();
+  nsresult ConfirmNativeHierarchy(const nsACString& source,
+                                  const nsACString& destination);
+  bool NativeHierarchyConfirmed();
+  nsISupports* NativeHierarchyContinuation();
+  nsISupports* NativeHierarchyCopyState();
+  void ClearNativeHierarchyContinuation();
+  bool BeginNativeHierarchyCompletion();
+  nsresult NativeHierarchyResult() const { return mNativeHierarchyResult; }
+  void SetNativeHierarchyResult(nsresult result) {
+    mNativeHierarchyResult = result;
+  }
   nsresult CaptureCopyTargets(nsIMsgFolder* folder,
                               const nsTArray<nsMsgKey>& keys,
                               const nsTArray<ImapUid>& uids);
@@ -179,6 +197,17 @@ class nsImapUrl : public nsIImapUrl,
   bool mAutodetectCharset;  // used by nsIMsgI18NUrl...
   mozilla::Mutex mLock;
 #ifdef MOZ_PANORAMA
+  struct NativeHierarchyEvidence {
+    nsCString source;
+    nsCString destination;
+    bool confirmed = false;
+  };
+  mozilla::Maybe<NativeHierarchyEvidence> mNativeHierarchy
+      MOZ_GUARDED_BY(mLock);
+  nsCOMPtr<nsISupports> mNativeHierarchyContinuation;  // Main thread only.
+  nsCOMPtr<nsISupports> mNativeHierarchyCopyState;     // Main thread only.
+  bool mNativeHierarchyCompletionStarted = false;
+  nsresult mNativeHierarchyResult = NS_ERROR_IN_PROGRESS;
   uint32_t m_expectedUidValidity = 0;
   mozilla::Maybe<FlagTargets> mFlagTargets;
   nsTArray<KeywordResponse> mKeywordResponses MOZ_GUARDED_BY(mLock);

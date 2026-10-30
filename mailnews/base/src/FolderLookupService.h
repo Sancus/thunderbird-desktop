@@ -9,8 +9,12 @@
 #include "nsIWeakReferenceUtils.h"
 #include "nsTHashMap.h"
 
+#define NATIVE_FOLDER_LOOKUP_IID \
+  {0x205b4186, 0x5a21, 0x4f49, {0xb9, 0x81, 0x52, 0xb1, 0x76, 0x78, 0x6e, 0x02}}
+
 class FolderLookupService final : public nsIFolderLookupService {
  public:
+  NS_INLINE_DECL_STATIC_IID(NATIVE_FOLDER_LOOKUP_IID)
   NS_DECL_THREADSAFE_ISUPPORTS
   NS_DECL_NSIFOLDERLOOKUPSERVICE
 
@@ -22,6 +26,8 @@ class FolderLookupService final : public nsIFolderLookupService {
   virtual ~FolderLookupService() = default;
 
  private:
+  friend class nsMsgDBFolder;
+  uint64_t mCacheGeneration{0};
   /**
    * Internal helper to find a folder (which may or may not be dangling).
    * Will return `nullptr` if the folder does not exist, and will only

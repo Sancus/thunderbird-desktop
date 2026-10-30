@@ -404,3 +404,475 @@ add_task(async function test_resultSearchInputUsesPhysicalGlobalList() {
   input.remove();
   await SpecialPowers.popPrefEnv();
 });
+
+/**
+ * Create independently identified native conversation members using mail ingest.
+ *
+ * @param {string} name - Unique physical fixture prefix.
+ * @returns {object} Stored headers, literal expected members and cleanup.
+ */
+function makeConversationCommandFixture(name) {
+  const { MailServices } = ChromeUtils.importESModule(
+    "resource:///modules/MailServices.sys.mjs"
+  );
+  const { MessageGenerator } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const root =
+    MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
+      Ci.nsIMsgLocalMailFolder
+    );
+  const folders = ["First", "Second", "Outside"].map(suffix =>
+    root
+      .createLocalSubfolder(name + suffix)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+  );
+  const generator = new MessageGenerator();
+  const parent = generator.makeMessage({ subject: name });
+  parent.messageId = `${name}-parent@example.invalid`;
+  const reply = generator.makeMessage({ inReplyTo: parent });
+  reply.messageId = `${name}-reply@example.invalid`;
+  const unrelated = generator.makeMessage({ subject: name });
+  unrelated.messageId = `${name}-unrelated@example.invalid`;
+  const a = folders[0].addMessage(parent.toMessageString());
+  const b = folders[0].addMessage(reply.toMessageString());
+  const selected = folders[1].addMessage(parent.toMessageString());
+  const excluded = folders[2].addMessage(unrelated.toMessageString());
+  const physical = header => ({
+    folderURI: header.folder.URI,
+    key: header.messageKey,
+    messageId: header.messageId,
+  });
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.ok(core, "The real installed native backend supplies this command");
+  info(
+    "Native conversation ingress " +
+      JSON.stringify(
+        [a, b, selected, excluded].map(header => ({
+          key: header.messageKey,
+          folderId: header.folder.id,
+          messageId: header.messageId,
+          threadId: header.threadId,
+          threadParent: header.threadParent,
+          references: Array.from({ length: header.numReferences }, (_, index) =>
+            header.getStringReference(index)
+          ),
+        }))
+      )
+  );
+  Assert.equal(
+    b.numReferences,
+    1,
+    "The stored reply retains its real parent reference"
+  );
+  Assert.equal(
+    b.getStringReference(0),
+    a.messageId,
+    "The ordinary native ingress preserved the generated parent Message-ID"
+  );
+  return {
+    selected,
+    excluded,
+    folders,
+    expected: [a, b, selected].map(physical),
+    physical,
+    async close() {
+      const tabmail = document.getElementById("tabmail");
+      while (tabmail.tabInfo.length > 1) {
+        tabmail.closeTab(1);
+      }
+      const { closeMailSearch } = ChromeUtils.importESModule(
+        "resource:///modules/panorama/MailSearch.sys.mjs"
+      );
+      await closeMailSearch();
+      for (const folder of folders) {
+        folder.parent.propagateDelete(folder, true);
+      }
+    },
+  };
+}
+
+add_task(async function test_openConversationKeepsWholePhysicalMembership() {
+  const { ConversationOpener } = ChromeUtils.importESModule(
+    "resource:///modules/ConversationOpener.sys.mjs"
+  );
+  const { MailSearchView } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MailSearchView.sys.mjs"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [
+      ["mailnews.database.global.indexer.enabled", true],
+      ["mailnews.default_view_flags", 0],
+      ["mailnews.default_sort_order", Ci.nsMsgViewSortOrder.ascending],
+    ],
+  });
+  const fixture = makeConversationCommandFixture("nativeconversationopen");
+  try {
+    Assert.ok(
+      ConversationOpener.isMessageIndexed(fixture.selected),
+      "An eligible native header needs no Gloda or FTS result token"
+    );
+    const tabmail = document.getElementById("tabmail");
+    const origin = tabmail.currentTabInfo;
+    const tab = await new ConversationOpener(
+      origin.chromeBrowser.contentWindow
+    ).openConversationForMessages([fixture.selected]);
+    Assert.equal(tab.mode.name, "mail3PaneTab");
+    const actual = await readMailSearchList(tab);
+    const order = (left, right) => left.key - right.key;
+    Assert.deepEqual(
+      actual.toSorted(order),
+      fixture.expected.toSorted(order),
+      "Every literal root/reply/physical-copy member is present, not the unrelated subject match"
+    );
+    const pane = tab.chromeBrowser.contentWindow;
+    Assert.ok(
+      pane.gViewWrapper._syntheticView instanceof MailSearchView,
+      "The native path never opens the legacy synthetic view"
+    );
+    await TestUtils.waitForCondition(
+      () => pane.gDBView.numSelected == 1,
+      "The requested physical member is selected"
+    );
+    Assert.deepEqual(
+      fixture.physical(pane.gDBView.hdrForFirstSelectedMessage),
+      fixture.physical(fixture.selected)
+    );
+    Assert.equal(
+      pane.gViewWrapper._sort[0][1],
+      Ci.nsMsgViewSortOrder.ascending,
+      "The existing mail-list sort preference remains in use"
+    );
+    tabmail.closeTab(tab);
+    Assert.equal(tabmail.currentTabInfo, origin);
+  } finally {
+    await fixture.close();
+    await SpecialPowers.popPrefEnv();
+  }
+});
+
+add_task(async function test_openConversationPolicyAndErrors() {
+  const { ConversationOpener } = ChromeUtils.importESModule(
+    "resource:///modules/ConversationOpener.sys.mjs"
+  );
+  const { MailSearchService } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MailSearchService.sys.mjs"
+  );
+  const { sinon } = ChromeUtils.importESModule(
+    "resource://testing-common/Sinon.sys.mjs"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [["mailnews.database.global.indexer.enabled", true]],
+  });
+  const fixture = makeConversationCommandFixture("nativeconversationpolicy");
+  const tabmail = document.getElementById("tabmail");
+  const origin = tabmail.currentTabInfo;
+  let stub;
+  try {
+    fixture.selected.setStringProperty("junkscore", "100");
+    Assert.ok(!ConversationOpener.isMessageIndexed(fixture.selected));
+    fixture.selected.setStringProperty("junkscore", "0");
+    await SpecialPowers.pushPrefEnv({
+      set: [["mailnews.database.global.indexer.enabled", false]],
+    });
+    try {
+      Assert.ok(!ConversationOpener.isMessageIndexed(fixture.selected));
+      Assert.equal(
+        await new ConversationOpener(
+          origin.chromeBrowser.contentWindow
+        ).openConversationForMessages([fixture.selected]),
+        null
+      );
+      Assert.equal(tabmail.tabInfo.length, 1, "Disabled search opens no tab");
+    } finally {
+      await SpecialPowers.popPrefEnv();
+    }
+    const error = new Error("Native conversation lookup failed");
+    stub = sinon
+      .stub(MailSearchService.prototype, "getConversationForHeader")
+      .rejects(error);
+    await Assert.rejects(
+      new ConversationOpener(
+        origin.chromeBrowser.contentWindow
+      ).openConversationForMessages([fixture.selected]),
+      value => value === error,
+      "The original native error is preserved without a legacy fallback"
+    );
+    Assert.equal(tabmail.tabInfo.length, 1);
+  } finally {
+    stub?.restore();
+    await fixture.close();
+    await SpecialPowers.popPrefEnv();
+  }
+});
+
+add_task(async function test_openConversationCancelsClosedOrigin() {
+  const { ConversationOpener } = ChromeUtils.importESModule(
+    "resource:///modules/ConversationOpener.sys.mjs"
+  );
+  const { MailSearchService } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MailSearchService.sys.mjs"
+  );
+  const { sinon } = ChromeUtils.importESModule(
+    "resource://testing-common/Sinon.sys.mjs"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [["mailnews.database.global.indexer.enabled", true]],
+  });
+  const fixture = makeConversationCommandFixture("nativeconversationcancel");
+  const tabmail = document.getElementById("tabmail");
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const original = MailSearchService.prototype.getConversationForHeader;
+  const stub = sinon
+    .stub(MailSearchService.prototype, "getConversationForHeader")
+    .callsFake(async function (header, options) {
+      const result = await original.call(this, header, options);
+      entered.resolve();
+      await release.promise;
+      return result;
+    });
+  let opening;
+  try {
+    const origin = tabmail.openTab("mail3PaneTab", {
+      folderURI: fixture.folders[0].URI,
+    });
+    await TestUtils.waitForCondition(
+      () => origin.chromeBrowser.contentWindow?.gDBView,
+      "The real origin mail pane is initialized"
+    );
+    opening = new ConversationOpener(
+      origin.chromeBrowser.contentWindow
+    ).openConversationForMessages([fixture.selected]);
+    opening.catch(entered.reject);
+    await entered.promise;
+    tabmail.closeTab(origin);
+    Assert.equal(
+      await opening,
+      null,
+      "Closing the origin settles before delayed delivery"
+    );
+    release.resolve();
+    await TestUtils.waitForTick();
+    Assert.equal(
+      tabmail.tabInfo.length,
+      1,
+      "Delayed native completion creates no late tab"
+    );
+  } finally {
+    release.resolve();
+    stub.restore();
+    if (opening) {
+      await opening.catch(() => {});
+    }
+    await fixture.close();
+    await SpecialPowers.popPrefEnv();
+  }
+});
+
+/**
+ * Change the selected physical member after a real conversation snapshot.
+ *
+ * @param {"move"|"delete"} action - The operation on the captured copy.
+ */
+async function checkStaleConversationSelection(action) {
+  const { ConversationOpener } = ChromeUtils.importESModule(
+    "resource:///modules/ConversationOpener.sys.mjs"
+  );
+  const { MailSearchService } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MailSearchService.sys.mjs"
+  );
+  const { MailServices } = ChromeUtils.importESModule(
+    "resource:///modules/MailServices.sys.mjs"
+  );
+  const { PromiseTestUtils: MailPromiseTestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
+  const { sinon } = ChromeUtils.importESModule(
+    "resource://testing-common/Sinon.sys.mjs"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [
+      ["mailnews.database.global.indexer.enabled", true],
+      ["mailnews.default_view_flags", 0],
+    ],
+  });
+  const fixture = makeConversationCommandFixture(`nativeconversation${action}`);
+  const tabmail = document.getElementById("tabmail");
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const original = MailSearchService.prototype.getConversationForHeader;
+  const stub = sinon
+    .stub(MailSearchService.prototype, "getConversationForHeader")
+    .callsFake(async function (header, options) {
+      const snapshot = await original.call(this, header, options);
+      Assert.equal(snapshot.status, "ready");
+      Assert.equal(snapshot.items.length, 3);
+      entered.resolve();
+      await release.promise;
+      return snapshot;
+    });
+  let opening;
+  try {
+    const origin = tabmail.openTab("mail3PaneTab", {
+      folderURI: fixture.folders[0].URI,
+    });
+    await TestUtils.waitForCondition(
+      () => origin.chromeBrowser.contentWindow?.gDBView?.rowCount == 2,
+      "The independent origin folder has both stored messages"
+    );
+    const pane = origin.chromeBrowser.contentWindow;
+    pane.selectMessage(
+      fixture.folders[0].msgDatabase.getMsgHdrForKey(fixture.expected[0].key)
+    );
+    await TestUtils.waitForCondition(
+      () => pane.gDBView.numSelected == 1,
+      "The original physical selection is installed"
+    );
+    const view = pane.gDBView;
+    const capture = () => ({
+      folderURI: pane.gViewWrapper.displayedFolder.URI,
+      selected: view.getSelectedMsgHdrs().map(fixture.physical),
+      current: view.selection.currentIndex,
+      pivot: view.selection.shiftSelectPivot,
+    });
+    const before = capture();
+    const tabsBefore = [...tabmail.tabInfo];
+    const selectedKey = fixture.selected.messageKey;
+    opening = new ConversationOpener(pane).openConversationForMessages([
+      fixture.selected,
+    ]);
+    opening.catch(entered.reject);
+    await entered.promise;
+    if (action == "move") {
+      const listener = new MailPromiseTestUtils.PromiseCopyListener();
+      MailServices.copy.copyMessages(
+        fixture.folders[1],
+        [fixture.selected],
+        fixture.folders[2],
+        true,
+        listener,
+        null,
+        false
+      );
+      await listener.promise;
+    } else {
+      fixture.folders[1].deleteMessages(
+        [fixture.selected],
+        null,
+        true,
+        false,
+        null,
+        false
+      );
+    }
+    Assert.ok(
+      !fixture.folders[1].msgDatabase.containsKey(selectedKey),
+      "The captured physical member actually left its original folder"
+    );
+    Assert.equal(fixture.folders[0].getTotalMessages(false), 2);
+    Assert.equal(fixture.folders[1].getTotalMessages(false), 0);
+    Assert.equal(
+      fixture.folders[2].getTotalMessages(false),
+      action == "move" ? 2 : 1
+    );
+    release.resolve();
+    await Assert.rejects(
+      opening,
+      error =>
+        [Cr.NS_ERROR_NOT_AVAILABLE, Cr.NS_ERROR_IN_PROGRESS].includes(
+          error.result
+        ),
+      "Stale membership fails instead of opening a subset or the equal-ID copy"
+    );
+    Assert.deepEqual(
+      tabmail.tabInfo,
+      tabsBefore,
+      "No stale result tab remains"
+    );
+    Assert.equal(tabmail.currentTabInfo, origin);
+    Assert.deepEqual(
+      capture(),
+      before,
+      "The origin selection/current/pivot remain intact"
+    );
+  } finally {
+    release.resolve();
+    stub.restore();
+    if (opening) {
+      await opening.catch(() => {});
+    }
+    await fixture.close();
+    await SpecialPowers.popPrefEnv();
+  }
+}
+
+add_task(async function test_openConversationRejectsMovedSelection() {
+  await checkStaleConversationSelection("move");
+});
+
+add_task(async function test_openConversationRejectsDeletedSelection() {
+  await checkStaleConversationSelection("delete");
+});
+
+add_task(async function test_openConversationFromStandaloneWindow() {
+  const { ConversationOpener } = ChromeUtils.importESModule(
+    "resource:///modules/ConversationOpener.sys.mjs"
+  );
+  const { MailUtils } = ChromeUtils.importESModule(
+    "resource:///modules/MailUtils.sys.mjs"
+  );
+  const { promise_new_window } = ChromeUtils.importESModule(
+    "resource://testing-common/mail/WindowHelpers.sys.mjs"
+  );
+  const { wait_for_message_display_completion } = ChromeUtils.importESModule(
+    "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [
+      ["mailnews.database.global.indexer.enabled", true],
+      ["mailnews.default_view_flags", 0],
+    ],
+  });
+  const fixture = makeConversationCommandFixture("nativeconversationwindow");
+  let origin;
+  try {
+    const opened = promise_new_window("mail:messageWindow");
+    MailUtils.openMessageInNewWindow(fixture.selected);
+    origin = await opened;
+    await wait_for_message_display_completion(origin, true);
+    Assert.equal(origin.document.getElementById("tabmail"), null);
+    const tabmail = document.getElementById("tabmail");
+    const tab = await new ConversationOpener(
+      origin
+    ).openConversationForMessages([fixture.selected]);
+    const actual = await readMailSearchList(tab);
+    const order = (left, right) => left.key - right.key;
+    Assert.deepEqual(actual.toSorted(order), fixture.expected.toSorted(order));
+    const pane = tab.chromeBrowser.contentWindow;
+    Assert.deepEqual(
+      fixture.physical(pane.gDBView.hdrForFirstSelectedMessage),
+      fixture.expected[2],
+      "The standalone origin opens the selected physical copy in the existing mail window"
+    );
+    await BrowserTestUtils.closeWindow(origin);
+    origin = null;
+    Assert.ok(
+      tabmail.tabInfo.includes(tab),
+      "Closing the completed origin keeps its result tab"
+    );
+    Assert.deepEqual(
+      fixture.physical(pane.gDBView.hdrForFirstSelectedMessage),
+      fixture.expected[2]
+    );
+    tabmail.closeTab(tab);
+  } finally {
+    if (origin && !origin.closed) {
+      await BrowserTestUtils.closeWindow(origin);
+    }
+    await fixture.close();
+    await SpecialPowers.popPrefEnv();
+  }
+});

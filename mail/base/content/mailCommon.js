@@ -88,9 +88,9 @@ var commandController = {
         .cancelMessage(gDBView.hdrForFirstSelectedMessage, null, top.msgWindow);
     },
     cmd_openConversation() {
-      new ConversationOpener(window).openConversationForMessages(
-        gDBView.getSelectedMsgHdrs()
-      );
+      new ConversationOpener(window)
+        .openConversationForMessages(gDBView.getSelectedMsgHdrs())
+        ?.catch(console.error);
     },
     cmd_reply(event) {
       if (

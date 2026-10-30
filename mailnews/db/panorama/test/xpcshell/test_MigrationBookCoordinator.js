@@ -4,8 +4,6 @@
 
 "use strict";
 
-/* globals print */
-
 const { AppConstants } = ChromeUtils.importESModule(
   "resource://gre/modules/AppConstants.sys.mjs"
 );
@@ -550,30 +548,23 @@ add_task(
 );
 
 /**
- * Runs only in the child xpcshell. Keep the real committed connection alive so
- * the parent can terminate the process without a normal storage close.
+ * Uses -f because the native -e handler ignores evaluation failure status.
+ * The bootstrap only supplies exact input; the ordinary child script runs it.
  *
- * @param {object} input - Original source, owned stage and retained operation token.
- * @returns {Promise<void>}
+ * @param {object} input - Actual source/stage/token for the child.
+ * @returns {string[]} Native xpcshell arguments.
  */
-async function commitBookBeforeProcessTermination(input) {
-  Services.prefs.setBoolPref("security.nocertdb", true);
-  const { SQLiteDirectory: directory } = ChromeUtils.importESModule(
-    "resource:///modules/SQLiteDirectory.sys.mjs"
-  );
-  const { FileUtils: files } = ChromeUtils.importESModule(
-    "resource://gre/modules/FileUtils.sys.mjs"
-  );
-  globalThis.migrationBookStage = directory.createMigrationStage(
-    new files.File(input.stagingPath)
-  );
-  const receipt = directory.importMorkSnapshot(
-    globalThis.migrationBookStage,
-    await IOUtils.read(input.source),
-    input.token
-  );
-  // This is the actual native receipt after commit, never a predicted UID map.
-  print("BOOK-COMMITTED " + JSON.stringify(receipt));
+function bookCommitChildArguments(input) {
+  return [
+    "-g",
+    Services.dirsvc.get("GreD", Ci.nsIFile).path,
+    "-a",
+    Services.dirsvc.get("XCurProcD", Ci.nsIFile).path,
+    "-e",
+    `const migrationBookChildInput = ${JSON.stringify(input)};`,
+    "-f",
+    do_get_file("data/migration-book-child.js").path,
+  ];
 }
 
 add_task(
@@ -587,23 +578,13 @@ add_task(
     const { TestUtils } = ChromeUtils.importESModule(
       "resource://testing-common/TestUtils.sys.mjs"
     );
-    const command =
-      `(${commitBookBeforeProcessTermination})(${JSON.stringify({
+    const child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: bookCommitChildArguments({
         source: input.source,
         stagingPath: input.stagingPath,
         token,
-      })}).catch(error => { console.error(error); quit(2); });` +
-      'Services.tm.spinEventLoopUntil("TestMigrationBook:AwaitKill", () => false);';
-    const child = await Subprocess.call({
-      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
-      arguments: [
-        "-g",
-        Services.dirsvc.get("GreD", Ci.nsIFile).path,
-        "-a",
-        Services.dirsvc.get("XCurProcD", Ci.nsIFile).path,
-        "-e",
-        command,
-      ],
+      }),
       stderr: "stdout",
     });
     let output = "";
@@ -623,6 +604,7 @@ add_task(
             return;
           }
         }
+        await child.wait(); // Observe exit before failure cleanup can request a kill.
         throw new Error("Child exited before its native commit: " + output);
       } catch (error) {
         readError = error;
@@ -663,6 +645,75 @@ add_task(
     const before = await IOUtils.read(input.path);
     await resumeMorkBookImports(input.journal, input.lock);
     Assert.deepEqual(await IOUtils.read(input.path), before);
+    await assertOriginals(input);
+  }
+);
+
+add_task(
+  unixOnly(),
+  async function test_childSourceErrorExitsBeforeCommitAndRetryImports() {
+    const input = await bookInput();
+    const token = await input.journal.beginBookImport("original-book");
+    const { Subprocess } = ChromeUtils.importESModule(
+      "resource://gre/modules/Subprocess.sys.mjs"
+    );
+    const { TestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/TestUtils.sys.mjs"
+    );
+    const missing = input.source + ".missing";
+    Assert.ok(!(await IOUtils.exists(missing)));
+    const child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: bookCommitChildArguments({
+        source: missing,
+        stagingPath: input.stagingPath,
+        token,
+      }),
+      stderr: "stdout",
+    });
+    let output = "";
+    const readOutput = (async () => {
+      for (let chunk; (chunk = await child.stdout.readString()); ) {
+        output += chunk;
+      }
+    })();
+    let exit;
+    child.wait().then(result => {
+      exit = result;
+    });
+    try {
+      await TestUtils.waitForCondition(
+        () => exit,
+        "The actual child source failure must exit, not hang in its spin loop",
+        100,
+        300
+      );
+      await readOutput;
+      Assert.equal(exit.exitCode, 2);
+      Assert.ok(output.includes("NotFoundError"), output);
+      Assert.ok(
+        output.includes(missing),
+        "The original failing path is reported"
+      );
+      Assert.ok(!output.includes("BOOK-COMMITTED"));
+    } finally {
+      await child.kill(0);
+      await readOutput;
+    }
+    Assert.equal(input.journal.state.books[0].state, "importing");
+    Assert.equal(input.journal.state.books[0].receipt, null);
+    const db = openStage(input);
+    try {
+      Assert.ok(!db.tableExists("migration_source"));
+      Assert.deepEqual(rows(db, "SELECT COUNT(*) FROM properties"), [["0"]]);
+      Assert.deepEqual(rows(db, "SELECT COUNT(*) FROM lists"), [["0"]]);
+    } finally {
+      db.close();
+    }
+    await assertOriginals(input);
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.equal(input.journal.state.stage, "validate");
+    Assert.equal(input.journal.state.books[0].receipt.storageSourceId, token);
     await assertOriginals(input);
   }
 );

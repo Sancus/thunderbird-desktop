@@ -10093,4 +10093,216 @@ TEST_F(DeliveryCoreReferences, NativeSizeSettersPropagateReachedWriteErrors) {
   ASSERT_EQ(NS_OK, db.SetMessageOfflineMessageSize(staged, UINT32_MAX));
 }
 
+TEST_F(DeliveryCoreReferences, BodyStateRejectsOutOfRangeNativeQuantities) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  RawHdr raw;
+  raw.messageId = "body-bounds@invalid"_ns;
+  raw.storeToken = Some(nsCString("original-token"_ns));
+  raw.messageSize = Some(0u);
+  raw.offlineMessageSize = Some(0u);
+  raw.lineCount = Some(0u);
+  raw.references = {"first@invalid"_ns, "second@invalid"_ns,
+                    "first@invalid"_ns};
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, false, &key));
+  MessageBodyState sentinel;
+  sentinel.databaseSourceId = "untouched-source"_ns;
+  sentinel.key = 77;
+  sentinel.folderId = 88;
+  sentinel.storeToken = Some(nsCString("untouched-token"_ns));
+  sentinel.contentRevision = 91;
+  sentinel.locationRevision = 92;
+  sentinel.messageSize = 93;
+  sentinel.offlineMessageSize = 94;
+  sentinel.lineCount = 95;
+  sentinel.flags = 96;
+  auto checkUnchanged = [&](const MessageBodyState& output) {
+    EXPECT_EQ(sentinel.databaseSourceId, output.databaseSourceId);
+    EXPECT_EQ(sentinel.key, output.key);
+    EXPECT_EQ(sentinel.folderId, output.folderId);
+    EXPECT_EQ(sentinel.storeToken, output.storeToken);
+    EXPECT_EQ(sentinel.contentRevision, output.contentRevision);
+    EXPECT_EQ(sentinel.locationRevision, output.locationRevision);
+    EXPECT_EQ(sentinel.messageSize, output.messageSize);
+    EXPECT_EQ(sentinel.offlineMessageSize, output.offlineMessageSize);
+    EXPECT_EQ(sentinel.lineCount, output.lineCount);
+    EXPECT_EQ(sentinel.flags, output.flags);
+  };
+  MessageBodyState expected;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, expected));
+  uint32_t callbacks = 0;
+  RefPtr<BodyObserver> observer =
+      new BodyObserver([&](nsIMsgDBHdr*, Message*, const MessageBodyState&,
+                           const MessageBodyState&) { ++callbacks; });
+  db.AddMessageListener(observer);
+  auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  FinishedMessageBody finished{"must-not-install"_ns, 3, 2, 1, false};
+  for (const char* field :
+       {"flags", "messageSize", "offlineMessageSize", "lineCount"}) {
+    SCOPED_TRACE(field);
+    bool flags = nsDependentCString(field).EqualsLiteral("flags");
+    auto write = [&](int64_t value) -> nsresult {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(Connection()->CreateStatement(
+          flags
+              ? "UPDATE messages SET flags=:value WHERE id=:id"_ns
+              : "UPDATE message_properties SET value=:value WHERE id=:id AND name=:name"_ns,
+          getter_AddRefs(stmt)));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+      MOZ_TRY(stmt->BindInt64ByName("value"_ns, value));
+      if (!flags) {
+        MOZ_TRY(
+            stmt->BindUTF8StringByName("name"_ns, nsDependentCString(field)));
+      }
+      return stmt->Execute();
+    };
+    for (int64_t invalid : {flags ? int64_t(INT32_MIN) - 1 : int64_t(-1),
+                            int64_t(UINT32_MAX) + 1, INT64_MAX}) {
+      SCOPED_TRACE(invalid);
+      ASSERT_EQ(NS_OK, write(invalid));
+      MessageBodyState output = sentinel;
+      EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.GetMessageBodyState(key, output));
+      checkUnchanged(output);
+      output = sentinel;
+      EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+                db.SettleMessageBody(expected, finished, output));
+      checkUnchanged(output);
+      if (flags) {
+        EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+                  db.RemoveMessageFromFolder(
+                      key, mFolderId, expected.databaseSourceId,
+                      MessageRemovalAccounting::LocalMessageSize));
+      }
+      EXPECT_EQ(0u, callbacks);
+      bool active = true;
+      ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+      EXPECT_FALSE(active);
+      // The read must retain the corrupt physical row; it is not a repair.
+      nsCOMPtr<mozIStorageStatement> retained;
+      ASSERT_EQ(
+          NS_OK,
+          Connection()->CreateStatement(
+              flags
+                  ? "SELECT flags FROM messages WHERE id=:id"_ns
+                  : "SELECT value FROM message_properties WHERE id=:id AND name=:name"_ns,
+              getter_AddRefs(retained)));
+      ASSERT_EQ(NS_OK, retained->BindInt64ByName("id"_ns, key));
+      if (!flags) {
+        ASSERT_EQ(NS_OK, retained->BindUTF8StringByName(
+                             "name"_ns, nsDependentCString(field)));
+      }
+      bool more = false;
+      ASSERT_EQ(NS_OK, retained->ExecuteStep(&more));
+      ASSERT_TRUE(more);
+      int64_t value = 0;
+      ASSERT_EQ(NS_OK, retained->GetInt64(0, &value));
+      EXPECT_EQ(invalid, value);
+      ASSERT_EQ(NS_OK, retained->ExecuteStep(&more));
+      EXPECT_FALSE(more);
+      ASSERT_EQ(NS_OK, write(0));
+      ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, output));
+      EXPECT_EQ(key, output.key);
+      EXPECT_EQ(0u, output.messageSize);
+      EXPECT_EQ(0u, output.offlineMessageSize);
+      EXPECT_EQ(0u, output.lineCount);
+      EXPECT_EQ(0u, output.flags);
+      EXPECT_EQ(raw.storeToken, output.storeToken);
+    }
+  }
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, Stored(key, references));
+  EXPECT_EQ(raw.references, references);
+}
+
+TEST_F(DeliveryCoreReferences, BodyStateUint32BoundsAndAbsenceSurviveReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  RawHdr maximum;
+  maximum.messageId = "maximum-body-bounds@invalid"_ns;
+  maximum.flags = UINT32_MAX;
+  maximum.storeToken = Some(nsCString(""_ns));
+  maximum.messageSize = Some(uint32_t(UINT32_MAX));
+  maximum.offlineMessageSize = Some(uint32_t(UINT32_MAX));
+  maximum.lineCount = Some(uint32_t(UINT32_MAX));
+  RawHdr absent;
+  absent.messageId = "absent-body-bounds@invalid"_ns;
+  nsMsgKey high, signedHighBit, positiveHigh, missing;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolderId, maximum, false, &high));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolderId, absent, false, &missing));
+  maximum.flags = 0x80000000u;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, maximum, false,
+                                                 &signedHighBit));
+  maximum.flags = 0;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolderId, maximum, false,
+                                                 &positiveHigh));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageFlags(positiveHigh, UINT32_MAX));
+  for (bool reopened : {false, true}) {
+    SCOPED_TRACE(reopened);
+    if (reopened) {
+      Stop();
+      ASSERT_EQ(NS_OK, Start());
+    }
+    MessageBodyState state;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(high, state));
+    EXPECT_EQ(UINT32_MAX, state.flags);
+    EXPECT_EQ(UINT32_MAX, state.messageSize);
+    EXPECT_EQ(UINT32_MAX, state.offlineMessageSize);
+    EXPECT_EQ(UINT32_MAX, state.lineCount);
+    ASSERT_TRUE(state.storeToken);
+    EXPECT_TRUE(state.storeToken->IsEmpty());
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageBodyState(signedHighBit, state));
+    EXPECT_EQ(0x80000000u, state.flags);
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageBodyState(positiveHigh, state));
+    EXPECT_EQ(UINT32_MAX, state.flags);
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(missing, state));
+    EXPECT_EQ(0u, state.flags);
+    EXPECT_EQ(0u, state.messageSize);
+    EXPECT_EQ(0u, state.offlineMessageSize);
+    EXPECT_EQ(0u, state.lineCount);
+    EXPECT_FALSE(state.storeToken);
+  }
+}
+
+TEST_F(DeliveryCoreReferences, FolderRemovalAcceptsNativeSignedFlagWords) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  int64_t expectedBytes = 0;
+  for (auto policy : {MessageRemovalAccounting::LocalMessageSize,
+                      MessageRemovalAccounting::OfflineMessageSize}) {
+    for (uint32_t flags : {0x80000000u, UINT32_MAX}) {
+      SCOPED_TRACE(flags);
+      RawHdr raw;
+      raw.flags = flags;
+      raw.messageSize = Some(17u);
+      raw.offlineMessageSize = Some(13u);
+      raw.storeToken = Some(nsCString("retained-body"_ns));
+      nsMsgKey key;
+      ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, raw, false, &key));
+      MessageBodyState captured;
+      ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, captured));
+      EXPECT_EQ(flags, captured.flags);
+      ASSERT_EQ(NS_OK,
+                db.RemoveMessageFromFolder(key, mFolderId, source, policy));
+      bool exists = true;
+      ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+      EXPECT_FALSE(exists);
+      if (policy == MessageRemovalAccounting::LocalMessageSize) {
+        expectedBytes += 17;
+      } else if (flags & nsMsgMessageFlags::Offline) {
+        expectedBytes += 13;
+      }
+      int64_t actualBytes = -1;
+      ASSERT_EQ(NS_OK, RemovalMetric(mFolderId, actualBytes));
+      EXPECT_EQ(expectedBytes, actualBytes);
+    }
+  }
+}
+
 }  // namespace mozilla::mailnews

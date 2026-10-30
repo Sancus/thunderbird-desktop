@@ -1007,6 +1007,13 @@ nsresult MessageDatabase::ReadMessageBodyState(nsMsgKey key,
   MOZ_TRY(stmt->GetInt64(6, &size));
   MOZ_TRY(stmt->GetInt64(7, &offlineSize));
   MOZ_TRY(stmt->GetInt64(8, &lines));
+  // InsertMessage uses signed32 flags; later flag writes use unsigned32.
+  NS_ENSURE_TRUE(flags >= INT32_MIN && flags <= int64_t(UINT32_MAX),
+                 NS_ERROR_FILE_CORRUPTED);
+  for (int64_t quantity : {size, offlineSize, lines}) {
+    NS_ENSURE_TRUE(quantity >= 0 && uint64_t(quantity) <= UINT32_MAX,
+                   NS_ERROR_FILE_CORRUPTED);
+  }
   state.flags = static_cast<uint32_t>(flags);
   state.messageSize = static_cast<uint32_t>(size);
   state.offlineMessageSize = static_cast<uint32_t>(offlineSize);
@@ -3522,7 +3529,8 @@ nsresult MessageDatabase::AccountRemovedMessage(
     MOZ_TRY(stmt->GetInt64(0, &storedFlags));
     MOZ_TRY(stmt->GetUTF8String(1, source));
     NS_ENSURE_TRUE(source == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
-    NS_ENSURE_TRUE(storedFlags >= 0 && uint64_t(storedFlags) <= UINT32_MAX,
+    NS_ENSURE_TRUE(storedFlags >= INT32_MIN &&
+                       storedFlags <= int64_t(UINT32_MAX),
                    NS_ERROR_FILE_CORRUPTED);
     flags = static_cast<uint32_t>(storedFlags);
   }

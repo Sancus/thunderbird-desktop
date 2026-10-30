@@ -2794,6 +2794,33 @@ NS_IMETHODIMP nsMsgDBFolder::InitWithFolderId(uint64_t folderId) {
 }
 
 #ifdef MOZ_PANORAMA
+static nsresult EscapeLogicalFolderPath(const nsACString& path,
+                                        nsACString& uriPath) {
+  // Logical paths already escape percent and slash within each physical name.
+  // Decode each component once before URI escaping so an embedded slash cannot
+  // become a hierarchy separator, and a literal percent is not escaped twice.
+  nsAutoCString result;
+  bool first = true;
+  for (const auto& component : path.Split('/')) {
+    nsAutoCString name;
+    MOZ_TRY(MsgUnescapeString(component, 0, name));
+    nsAutoCString escaped;
+    nsAutoCString pathEscaped;
+    MOZ_TRY(MsgEscapeString(name, nsINetUtil::ESCAPE_URL_PATH, pathEscaped));
+    MOZ_TRY(MsgEscapeURL(pathEscaped,
+                         nsINetUtil::ESCAPE_URL_FILE_BASENAME |
+                             nsINetUtil::ESCAPE_URL_FILE_EXTENSION,
+                         escaped));
+    if (!first) {
+      result.Append('/');
+    }
+    result.Append(escaped);
+    first = false;
+  }
+  uriPath = result;
+  return NS_OK;
+}
+
 nsresult nsMsgDBFolder::GetCachedChild(uint64_t folderId,
                                        nsIMsgFolder** child) {
   NS_ENSURE_ARG_POINTER(child);
@@ -2801,7 +2828,7 @@ nsresult nsMsgDBFolder::GetCachedChild(uint64_t folderId,
   RefPtr<mozilla::mailnews::DatabaseCore> dbCore =
       mozilla::mailnews::DatabaseCore::GetInstanceForService();
   nsCString path = MOZ_TRY(dbCore->FolderDB().GetFolderPath(folderId));
-  MOZ_TRY(MsgEscapeString(path, nsINetUtil::ESCAPE_URL_PATH, path));
+  MOZ_TRY(EscapeLogicalFolderPath(path, path));
   nsCOMPtr<nsIMsgIncomingServer> server;
   MOZ_TRY(GetServer(getter_AddRefs(server)));
   nsCString uri;
@@ -2878,7 +2905,7 @@ nsresult nsMsgDBFolder::InitWithFolderId(
   rv = server->GetServerURI(mURI);
   NS_ENSURE_SUCCESS(rv, rv);
   nsCString path = MOZ_TRY(folderDB.GetFolderPath(folderId));
-  rv = MsgEscapeString(path, nsINetUtil::ESCAPE_URL_PATH, path);
+  rv = EscapeLogicalFolderPath(path, path);
   NS_ENSURE_SUCCESS(rv, rv);
   int32_t pathStart = path.FindChar('/');
   if (pathStart != kNotFound) {

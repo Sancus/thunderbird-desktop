@@ -75,6 +75,12 @@ const names = [
   "insertion",
   "control",
 ];
+// ProfileCreator takes physical leaves. Native EncodeFilename escapes '%' and
+// '/', and nsMsgBrkMBoxStore discovers these names through DecodeFilename once.
+const CODEC_FOLDER_INPUTS = [
+  { name: "codec/literal", filename: "codec%2Fliteral" },
+  { name: "codec%2Fliteral", filename: "codec%252Fliteral" },
+];
 
 add_setup(async function setupBackedUpLegacyProfileBeforeNativeStartup() {
   const profile = do_get_profile();
@@ -113,6 +119,9 @@ add_setup(async function setupBackedUpLegacyProfileBeforeNativeStartup() {
   const server = creator.addLocalServer();
   for (const name of names) {
     await server.rootFolder.addMailFolder(name, { summary, mbox: body });
+  }
+  for (const { filename } of CODEC_FOLDER_INPUTS) {
+    await server.rootFolder.addMailFolder(filename, { summary, mbox: body });
   }
   legacyMeasurements = await IOUtils.readJSON(
     do_get_file("data/deliveryMigrationReferences.measured.json").path
@@ -164,7 +173,11 @@ add_setup(async function setupBackedUpLegacyProfileBeforeNativeStartup() {
   Assert.ok(database.sourceId);
   MailServices.accounts.accounts;
   const root = MailServices.accounts.localFoldersServer.rootFolder;
-  for (const name of [...names, ...referenceInputs.keys()]) {
+  for (const name of [
+    ...names,
+    ...referenceInputs.keys(),
+    ...CODEC_FOLDER_INPUTS.map(input => input.name),
+  ]) {
     const folder = root.getChildNamed(name);
     Assert.ok(folder instanceof Ci.nsIMsgFolder);
     Assert.equal(folder.incomingServerType, "none");
@@ -1164,6 +1177,143 @@ add_task(
       await assertProjectionSourcesUnchanged(input);
     } finally {
       header.subject = subject;
+    }
+  }
+);
+
+add_task(
+  async function test_literalPercentReceiptRetryPreservesPhysicalIdentity() {
+    const input = await planned("codec%2Fliteral");
+    const sibling = folders.get("codec/literal");
+    Assert.notEqual(input.folder.id, sibling.id);
+    const path = folderDB.getFolderPath(input.folder.id);
+    const siblingPath = folderDB.getFolderPath(sibling.id);
+    Assert.ok(path.endsWith("/codec%252Fliteral"));
+    Assert.ok(siblingPath.endsWith("/codec%2Fliteral"));
+    Assert.notEqual(path, siblingPath);
+    Assert.equal(folderDB.getFolderByPath(path), input.folder.id);
+    Assert.equal(folderDB.getFolderByPath(siblingPath), sibling.id);
+
+    await input.journal.beginImport(input.name);
+    const snapshot = await request(input);
+    const beforeCommit = await IOUtils.read(input.path);
+    const first = await database.importFolderSnapshot(input.folder, snapshot);
+    Assert.equal(first.folderId, input.folder.id);
+    Assert.equal(first.sourceId, input.name);
+    Assert.equal(first.databaseSourceId, database.sourceId);
+    Assert.deepEqual(
+      first.keys.map(pair => pair[0]),
+      [1, 3]
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), beforeCommit);
+    Assert.equal(input.journal.state.sources[0].receipt, null);
+
+    const events = observe(input);
+    const page = messageDB.getSearchChanges(0, 1);
+    Assert.ok(Number.isSafeInteger(page.watermark));
+    try {
+      Assert.deepEqual(
+        database.getFolderImportReceipt(input.folder, snapshot),
+        first
+      );
+      Assert.deepEqual(
+        await database.importFolderSnapshot(input.folder, snapshot),
+        first,
+        "An unchanged public producer request returns the original mapping"
+      );
+      Assert.deepEqual(events.added, []);
+      Assert.equal(messageDB.getSearchChanges(0, 1).watermark, page.watermark);
+
+      const conflicts = [
+        [
+          { ...snapshot, sourceId: snapshot.sourceId + "-changed" },
+          Cr.NS_ERROR_ALREADY_INITIALIZED,
+        ],
+        [
+          {
+            ...snapshot,
+            databaseSourceId: snapshot.databaseSourceId + "-changed",
+          },
+          Cr.NS_ERROR_NOT_AVAILABLE,
+        ],
+        [
+          {
+            ...snapshot,
+            source: { ...snapshot.source, sha256: "0".repeat(64) },
+          },
+          // Unix receipt lookup compares the recorded hash tuple; this is the
+          // same conflict result asserted by the native historical-retry test.
+          Cr.NS_ERROR_ALREADY_INITIALIZED,
+        ],
+        [
+          {
+            ...snapshot,
+            source: { ...snapshot.source, path: sibling.summaryFile.path },
+          },
+          Cr.NS_ERROR_NOT_AVAILABLE,
+        ],
+      ];
+      for (const [conflict, result] of conflicts) {
+        Assert.throws(
+          () => database.getFolderImportReceipt(input.folder, conflict),
+          error => error.result == result
+        );
+      }
+      Assert.throws(
+        () => database.getFolderImportReceipt(sibling, snapshot),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+        "A percent-looking sibling cannot supply another physical folder"
+      );
+      Assert.deepEqual(
+        database.getFolderImportReceipt(input.folder, snapshot),
+        first
+      );
+      Assert.deepEqual(await IOUtils.read(input.path), beforeCommit);
+      Assert.equal(messageDB.getSearchChanges(0, 1).watermark, page.watermark);
+      Assert.deepEqual(events.added, []);
+
+      await resumeMorkImports(input.journal, target(input));
+      await assertCommitted(input);
+      Assert.deepEqual(input.journal.state.sources[0].receipt.keys, first.keys);
+      const recorded = input.journal.state.sources[0].receipt;
+      const changed = structuredClone(recorded);
+      changed.keys[0][1] = control;
+      const settled = await IOUtils.read(input.path);
+      await Assert.rejects(
+        input.journal.recordImport(input.name, changed),
+        /Committed migration receipt changed/
+      );
+      Assert.deepEqual(await IOUtils.read(input.path), settled);
+      input.journal.close();
+      input.journal = await MigrationJournal.open(
+        input.path,
+        lock.directory.path
+      );
+      const reopened = input.journal;
+      registerCleanupFunction(() => reopened.close());
+      Assert.deepEqual(
+        await target(input).findReceipt(recorded.token, {
+          sourceId: input.name,
+          sourceSha256: snapshot.source.sha256,
+          destinationFolderId: input.folder.id,
+        }),
+        first,
+        "The reopened journal validates the same actual native receipt"
+      );
+      await resumeMorkImports(input.journal, target(input));
+      Assert.deepEqual(await IOUtils.read(input.path), settled);
+      Assert.deepEqual(input.journal.state.sources[0].receipt, recorded);
+      Assert.deepEqual(events.added, []);
+      Assert.deepEqual(
+        await IOUtils.read(input.folder.summaryFile.path),
+        summaryBytes
+      );
+      Assert.deepEqual(
+        await IOUtils.read(input.folder.filePath.path),
+        bodyBytes
+      );
+    } finally {
+      events.close();
     }
   }
 );

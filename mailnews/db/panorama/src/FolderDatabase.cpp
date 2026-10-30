@@ -89,36 +89,54 @@ NS_IMETHODIMP FolderDatabase::GetMsgFolderForFolder(uint64_t folderId,
                                                     nsIMsgFolder** msgFolder) {
   NS_ENSURE_ARG(folderId);  // Folder 0 disallowed.
   NS_ENSURE_ARG_POINTER(msgFolder);
+  auto currentOwner = [this] {
+    return DatabaseCore::sInstance && DatabaseCore::sConnection &&
+           DatabaseCore::sInstance->mFolderDatabase.get() == this;
+  };
+  NS_ENSURE_TRUE(currentOwner(), NS_ERROR_NOT_AVAILABLE);
   // Validate the stored ancestry before entering the recursive facade lookup.
   (void)MOZ_TRY(GetFolderRoot(folderId));
-  nsresult rv;
-
   nsCString name = MOZ_TRY(GetFolderName(folderId));
   uint64_t parentId = MOZ_TRY(GetFolderParent(folderId));
+  nsCOMPtr<nsIMsgFolder> resolved;
   if (!parentId) {
-    // If we're at the root, get the corresponding nsIMsgFolder from the
-    // account manager.
     nsCOMPtr<nsIMsgAccountManager> accountManager =
         components::AccountManager::Service();
     nsCOMPtr<nsIMsgIncomingServer> server;
-    rv = accountManager->GetIncomingServer(name, getter_AddRefs(server));
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = server->GetRootFolder(msgFolder);
-    NS_ENSURE_SUCCESS(rv, rv);
-    return NS_OK;
+    MOZ_TRY(accountManager->GetIncomingServer(name, getter_AddRefs(server)));
+    MOZ_TRY(server->GetRootFolder(getter_AddRefs(resolved)));
+    NS_ENSURE_TRUE(resolved, NS_ERROR_NOT_AVAILABLE);
+    uint64_t rootId;
+    MOZ_TRY(resolved->GetId(&rootId));
+    NS_ENSURE_TRUE(rootId == folderId, NS_ERROR_NOT_AVAILABLE);
+  } else {
+    nsCOMPtr<nsIMsgFolder> parent;
+    MOZ_TRY(GetMsgFolderForFolder(parentId, getter_AddRefs(parent)));
+    NS_ENSURE_TRUE(parent, NS_ERROR_NOT_AVAILABLE);
+    nsTArray<RefPtr<nsIMsgFolder>> children;
+    MOZ_TRY(parent->GetSubFolders(children));
+    // Stored wire names and pretty names differ (notably for IMAP). A display
+    // name or URI alias cannot choose the physical row requested by the caller.
+    for (const auto& child : children) {
+      NS_ENSURE_TRUE(child, NS_ERROR_FILE_CORRUPTED);
+      uint64_t childId;
+      MOZ_TRY(child->GetId(&childId));
+      if (childId != folderId) {
+        continue;
+      }
+      NS_ENSURE_FALSE(resolved, NS_ERROR_FILE_CORRUPTED);
+      nsCOMPtr<nsIMsgFolder> actualParent;
+      MOZ_TRY(child->GetParent(getter_AddRefs(actualParent)));
+      NS_ENSURE_TRUE(actualParent == parent, NS_ERROR_NOT_AVAILABLE);
+      resolved = child;
+    }
+    NS_ENSURE_TRUE(resolved, NS_ERROR_NOT_AVAILABLE);
   }
-
-  // Traverse up the ancestors until we get to the root.
-  nsCOMPtr<nsIMsgFolder> msgParent;
-  rv = GetMsgFolderForFolder(parentId, getter_AddRefs(msgParent));
-  NS_ENSURE_SUCCESS(rv, rv);
-  if (!msgParent) {
-    return NS_ERROR_FAILURE;
-  }
-
-  // Get the subfolder with the name we're looking for.
-  rv = msgParent->GetChildNamed(name, msgFolder);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(currentOwner(), NS_ERROR_NOT_AVAILABLE);
+  uint64_t currentParent = MOZ_TRY(GetFolderParent(folderId));
+  NS_ENSURE_TRUE(currentParent == parentId, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(currentOwner(), NS_ERROR_NOT_AVAILABLE);
+  resolved.forget(msgFolder);
   return NS_OK;
 }
 
@@ -395,6 +413,123 @@ nsresult FolderDatabase::RequireCommittedHierarchyMutation() {
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   return active ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
+nsresult FolderDatabase::ValidateFolderRelocation(
+    const nsACString& expectedSourceId, uint64_t folderId,
+    uint64_t expectedParent, const nsACString& expectedName,
+    uint64_t newParent) {
+  nsCString sourceId;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+  NS_ENSURE_TRUE(sourceId == expectedSourceId, NS_ERROR_NOT_AVAILABLE);
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReadFolderRelocationLocation"_ns,
+        "SELECT parent, name FROM folders WHERE id=:id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int32_t parentType, nameType;
+    int64_t parent;
+    nsCString name;
+    MOZ_TRY(stmt->GetTypeOfIndex(0, &parentType));
+    MOZ_TRY(stmt->GetTypeOfIndex(1, &nameType));
+    MOZ_TRY(stmt->GetInt64(0, &parent));
+    MOZ_TRY(stmt->GetUTF8String(1, name));
+    NS_ENSURE_TRUE(parentType == mozIStorageStatement::VALUE_TYPE_INTEGER &&
+                       nameType == mozIStorageStatement::VALUE_TYPE_TEXT &&
+                       parent >= 0,
+                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(uint64_t(parent) == expectedParent && name == expectedName,
+                   NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(parent, NS_ERROR_UNEXPECTED);  // Account roots stay roots.
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  NS_ENSURE_TRUE(folderId != newParent, NS_ERROR_UNEXPECTED);
+  nsTArray<uint64_t> descendants = MOZ_TRY(GetFolderDescendants(folderId));
+  NS_ENSURE_FALSE(descendants.Contains(newParent), NS_ERROR_UNEXPECTED);
+  uint64_t sourceRoot = MOZ_TRY(GetFolderRoot(folderId));
+  uint64_t targetRoot = MOZ_TRY(GetFolderRoot(newParent));
+  NS_ENSURE_TRUE(sourceRoot == targetRoot, NS_ERROR_UNEXPECTED);
+  // Every path in the moved subtree changes. An unfinished body relocation
+  // still owns its old physical paths, including after a restart.
+  auto& messages = DatabaseCore::sInstance->MessageDB();
+  MOZ_TRY(messages.CheckPendingFolderRelocation(folderId));
+  for (uint64_t child : descendants) {
+    MOZ_TRY(messages.CheckPendingFolderRelocation(child));
+  }
+  return NS_OK;
+}
+
+nsresult FolderDatabase::RelocateFolder(const nsACString& expectedSourceId,
+                                        uint64_t folderId,
+                                        uint64_t expectedParent,
+                                        const nsACString& expectedName,
+                                        uint64_t newParent,
+                                        const nsACString& newName) {
+  MOZ_TRY(RequireCommittedHierarchyMutation());
+  NS_ENSURE_TRUE(!expectedSourceId.IsEmpty() && folderId &&
+                     folderId <= INT64_MAX && expectedParent <= INT64_MAX &&
+                     newParent && newParent <= INT64_MAX,
+                 NS_ERROR_INVALID_ARG);
+  nsCString normalized = MOZ_TRY(DatabaseUtils::Normalize(newName));
+  MOZ_TRY(ValidateFolderRelocation(expectedSourceId, folderId, expectedParent,
+                                   expectedName, newParent));
+  if (newParent == expectedParent && normalized == expectedName) {
+    return NS_OK;
+  }
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    // Recheck the captured facts in our own transaction, without borrowing or
+    // committing a caller's transaction or relying on a stale wrapper/cache.
+    MOZ_TRY(ValidateFolderRelocation(expectedSourceId, folderId, expectedParent,
+                                     expectedName, newParent));
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RelocateFolder"_ns,
+          "UPDATE folders SET name=:name, parent=:parent, "
+          "ordinal=CASE WHEN parent=:parent THEN ordinal ELSE NULL END "
+          "WHERE id=:id AND parent=:oldParent AND name=:oldName RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, normalized));
+      MOZ_TRY(stmt->BindInt64ByName("parent"_ns, newParent));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+      MOZ_TRY(stmt->BindInt64ByName("oldParent"_ns, expectedParent));
+      MOZ_TRY(stmt->BindUTF8StringByName("oldName"_ns, expectedName));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+      int64_t storedId;
+      MOZ_TRY(stmt->GetInt64(0, &storedId));
+      NS_ENSURE_TRUE(storedId > 0 && uint64_t(storedId) == folderId,
+                     NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackFolderUpdate(connection, rv);
+  }
+  // No fallible lookup/allocation/publication after a confirmed commit. Cold
+  // entries load the committed values normally on the next read.
+  auto cached = mFolderCache.lookup(folderId);
+  if (cached) {
+    cached->value().name = std::move(normalized);
+    cached->value().parent = newParent;
+    if (newParent != expectedParent) {
+      cached->value().ordinal.reset();
+    }
+  }
+  return NS_OK;
 }
 
 // Each folder is assigned an incrementing ordinal value in the order
@@ -929,6 +1064,11 @@ Result<nsCString, nsresult> FolderDatabase::GetFolderName(uint64_t folderId) {
 }
 
 Result<nsCString, nsresult> FolderDatabase::GetFolderPath(uint64_t folderId) {
+  return GetFolderPath(folderId, true);
+}
+
+Result<nsCString, nsresult> FolderDatabase::GetFolderPath(uint64_t folderId,
+                                                          bool escapePercent) {
   MOZ_ASSERT(folderId);
 
   nsTArray<nsCString> encodedParts;
@@ -942,7 +1082,9 @@ Result<nsCString, nsresult> FolderDatabase::GetFolderPath(uint64_t folderId) {
     }
     CachedFolder* cached = MOZ_TRY(EnsureFolderCached(folderId));
     nsCString encodedName =
-        PercentEncode(cached->name, [](char c) -> bool { return c == '/'; });
+        PercentEncode(cached->name, [escapePercent](char c) {
+          return c == '/' || (escapePercent && c == '%');
+        });
     encodedParts.AppendElement(encodedName);
     folderId = cached->parent;
     if (cached->parent == 0) {

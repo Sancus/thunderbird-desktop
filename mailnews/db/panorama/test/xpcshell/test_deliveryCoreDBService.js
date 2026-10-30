@@ -266,3 +266,82 @@ add_task(function test_lookupAndOpenErrorsDoNotPublishPartialCacheEntries() {
   Assert.strictEqual(service.cachedDBForFolder(folder), db);
   Assert.deepEqual(db.listAllKeys(), []);
 });
+
+add_task(function test_nativeFolderResolutionUsesPhysicalId() {
+  const server = MailServices.accounts.createIncomingServer(
+    "native-resolver",
+    "resolver.invalid",
+    "imap"
+  );
+  const account = MailServices.accounts.createAccount();
+  account.incomingServer = server;
+  registerCleanupFunction(() =>
+    MailServices.accounts.removeAccount(account, false)
+  );
+  const imapRoot = server.rootFolder;
+  const imapFolder = imapRoot.QueryInterface(Ci.nsIMsgImapMailFolder);
+  // Use the actual native LIST-completion producer, not legacy AddSubfolder.
+  imapFolder.createClientSubfolderInfo("wire-&AOE-", "/", 0, true);
+  imapFolder.createClientSubfolderInfo("unrelated-wire-name", "/", 0, true);
+  const requestedId = folderDB.getFolderChildNamed(imapRoot.id, "wire-&AOE-");
+  const aliasId = folderDB.getFolderChildNamed(
+    imapRoot.id,
+    "unrelated-wire-name"
+  );
+  Assert.greater(requestedId, 0);
+  Assert.greater(aliasId, 0);
+  const requested = imapRoot.subFolders.find(child => child.id == requestedId);
+  const alias = imapRoot.subFolders.find(child => child.id == aliasId);
+  Assert.ok(requested);
+  Assert.ok(alias);
+  Assert.notEqual(requestedId, aliasId);
+  const requestedURI = requested.URI;
+  const aliasURI = alias.URI;
+  requested.name = "folder \u00e1";
+  alias.name = "wire-&AOE-";
+  Assert.equal(requested.name, "folder \u00e1");
+  Assert.equal(alias.name, "wire-&AOE-");
+  Assert.equal(folderDB.getFolderName(requestedId), "wire-&AOE-");
+  Assert.equal(folderDB.getFolderName(aliasId), "unrelated-wire-name");
+  const sourceId = database.sourceId;
+  const children = folderDB.getFolderChildren(imapRoot.id);
+  Assert.strictEqual(
+    folderDB.getMsgFolderForFolder(requestedId),
+    requested,
+    "A pretty-name alias must not select another physical folder"
+  );
+  Assert.strictEqual(folderDB.getMsgFolderForFolder(aliasId), alias);
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    Assert.strictEqual(folderDB.getMsgFolderForFolder(requestedId), requested);
+    Assert.ok(
+      connection.transactionInProgress,
+      "The reader keeps the caller TX"
+    );
+  } finally {
+    connection.rollbackTransaction();
+  }
+  const key = addMessage({
+    folderId: requestedId,
+    subject: "physical folder resolver",
+  });
+  Assert.strictEqual(
+    requested.msgDatabase.getMsgHdrForKey(key).folder,
+    requested
+  );
+  Assert.equal(requested.parent, imapRoot);
+  Assert.equal(alias.parent, imapRoot);
+  Assert.equal(requested.URI, requestedURI);
+  Assert.equal(alias.URI, aliasURI);
+  Assert.strictEqual(
+    MailServices.folderLookup.getFolderForURL(requestedURI),
+    requested
+  );
+  Assert.strictEqual(
+    MailServices.folderLookup.getFolderForURL(aliasURI),
+    alias
+  );
+  Assert.deepEqual(folderDB.getFolderChildren(imapRoot.id), children);
+  Assert.equal(database.sourceId, sourceId);
+});

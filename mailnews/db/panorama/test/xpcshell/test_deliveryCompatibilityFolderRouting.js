@@ -182,3 +182,103 @@ add_task(function test_lookupStorageErrorsDoNotBecomeNotFound() {
     header.messageKey
   );
 });
+
+add_task(function test_logicalCodecPreservesPhysicalCachedWrappers() {
+  const parent = createFolder("codec-parent");
+  const other = createFolder("codec-other");
+  const cases = [
+    ["I/O stuff", "I%2FO stuff", "I%2FO%20stuff"],
+    ["I%2FO stuff", "I%252FO stuff", "I%252FO%20stuff"],
+    ["comp.lang.c++", "comp.lang.c++", "comp.lang.c++"],
+    ["R&D (a=b);x,$+", "R&D (a=b);x,$+", "R%26D%20%28a%3Db%29%3Bx%2C%24+"],
+    ["100% +?#süb", "100%25 +?#süb", "100%25%20+%3F%23s%C3%BCb"],
+  ];
+  const children = [];
+  for (const [name, logicalName, uriName] of cases) {
+    const id = folderDB.insertFolder(parent.id, name);
+    const child = Cc[
+      "@mozilla.org/mail/folder-factory;1?name=mailbox"
+    ].createInstance(Ci.nsIMsgFolder);
+    child.initWithFolderId(id);
+    child.parent = parent;
+    const uri = parent.URI + "/" + uriName;
+    Assert.equal(child.path, parent.path + "/" + logicalName);
+    Assert.equal(folderDB.getFolderByPath(child.path), id);
+    Assert.equal(child.name, name);
+    Assert.equal(child.URI, uri, "The logical codec is not escaped twice");
+    Assert.equal(
+      child.generateMessageURI(7),
+      uri.replace("mailbox:", "mailbox-message:") + "#7"
+    );
+    Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), child);
+    Assert.strictEqual(
+      MailServices.folderLookup.createFolderAndCache(parent, name),
+      child,
+      "The existing legacy URI encoder finds the identical native wrapper"
+    );
+    Assert.strictEqual(parent.addSubfolder(name), child);
+    Assert.strictEqual(parent.addSubfolder(name), child);
+    Assert.strictEqual(folderDB.getMsgFolderForFolder(id), child);
+    Assert.equal(child.id, id);
+    Assert.strictEqual(child.parent, parent);
+    Assert.throws(
+      () => child.initWithFolderId(id),
+      /NS_ERROR_ALREADY_INITIALIZED/,
+      "A cached wrapper cannot be rebound"
+    );
+    children.push(child);
+  }
+  Assert.deepEqual(parent.subFolders, children);
+  Assert.equal(new Set(children.map(child => child.URI)).size, cases.length);
+  Assert.equal(
+    new Set(children.map(child => child.filePath.path)).size,
+    cases.length,
+    "Logical encoding does not change physical filename authority"
+  );
+  Assert.equal(
+    MailServices.folderLookup.getFolderForURL(
+      parent.URI + "/I%25252FO%20stuff"
+    ),
+    null,
+    "There is no extra-escaped URI alias"
+  );
+
+  const id = folderDB.insertFolder(parent.id, "conflicting%2Fchild");
+  const conflicting = Cc[
+    "@mozilla.org/mail/folder-factory;1?name=mailbox"
+  ].createInstance(Ci.nsIMsgFolder);
+  conflicting.initWithFolderId(id);
+  conflicting.parent = other;
+  const uri = parent.URI + "/conflicting%252Fchild";
+  try {
+    Assert.throws(
+      () => parent.addSubfolder("conflicting%2Fchild"),
+      /NS_ERROR_UNEXPECTED/,
+      "A URI hit must retain its exact physical parent guard"
+    );
+    Assert.equal(conflicting.id, id);
+    Assert.strictEqual(conflicting.parent, other);
+    Assert.strictEqual(
+      MailServices.folderLookup.getFolderForURL(uri),
+      conflicting
+    );
+    Assert.deepEqual(parent.subFolders, children);
+    Assert.equal(folderDB.getFolderParent(id), parent.id);
+  } finally {
+    conflicting.parent = null;
+    MailServices.folderLookup.evictFolder(conflicting);
+  }
+  Assert.equal(MailServices.folderLookup.getFolderForURL(uri), null);
+  const replacement = parent.addSubfolder("conflicting%2Fchild");
+  Assert.notEqual(replacement, conflicting);
+  Assert.equal(replacement.id, id);
+  Assert.strictEqual(replacement.parent, parent);
+  Assert.equal(replacement.URI, uri);
+  MailServices.folderLookup.evictFolder(conflicting);
+  Assert.strictEqual(
+    MailServices.folderLookup.getFolderForURL(uri),
+    replacement
+  );
+  Assert.equal(conflicting.id, id);
+  Assert.equal(conflicting.parent, null);
+});

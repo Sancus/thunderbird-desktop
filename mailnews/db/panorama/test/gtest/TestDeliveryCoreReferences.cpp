@@ -4992,6 +4992,153 @@ TEST_F(DeliveryCoreReferences, NativeImportReceiptMapsForwardRootsAndReopens) {
             recovered->identity.databaseSourceId);
 }
 
+TEST_F(DeliveryCoreReferences,
+       NativeImportHistoricalPathRetryPreservesReceipt) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  auto& folders = mCore->FolderDB();
+  uint64_t literal = input.identity.folderId, slash;
+  ASSERT_EQ(NS_OK, folders.UpdateName(literal, "I%2FO stuff"_ns));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "I/O stuff"_ns, &slash));
+  nsCString prefix, slashPath;
+  ASSERT_EQ(NS_OK, folders.GetFolderPath(mFolderId, prefix));
+  ASSERT_EQ(NS_OK, folders.GetFolderPath(literal, input.identity.folderPath));
+  ASSERT_EQ(NS_OK, folders.GetFolderPath(slash, slashPath));
+  EXPECT_EQ(nsCString(prefix + "/I%252FO stuff"_ns), input.identity.folderPath);
+  EXPECT_EQ(nsCString(prefix + "/I%2FO stuff"_ns), slashPath);
+  for (uint64_t id : {literal, slash}) {
+    nsCString path;
+    ASSERT_EQ(NS_OK, folders.GetFolderPath(id, path));
+    uint64_t found = 0;
+    ASSERT_EQ(NS_OK, folders.GetFolderByPath(path, &found));
+    EXPECT_EQ(id, found);
+  }
+
+  FolderImportReceipt first;
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, first));
+  ASSERT_EQ(2u, first.keys.Length());
+  EXPECT_EQ(input.identity.folderPath, first.identity.folderPath);
+  const nsCString historical = slashPath;
+  // Simulate exactly the persisted spelling written before the codec change.
+  // The source, physical folder, complete imported rows and key map are real.
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                       "UPDATE folder_import_receipts SET folderPath = :path "
+                       "WHERE token = :token"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindUTF8StringByName("path"_ns, historical));
+  ASSERT_EQ(NS_OK,
+            stmt->BindUTF8StringByName("token"_ns, input.identity.token));
+  ASSERT_EQ(NS_OK, stmt->Execute());
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  stmt = nullptr;
+
+  uint64_t watermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+  {
+    ASSERT_EQ(NS_OK,
+              mConnection->ExecuteSimpleSQL("PRAGMA query_only = ON"_ns));
+    auto writable = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK,
+                mConnection->ExecuteSimpleSQL("PRAGMA query_only = OFF"_ns));
+    });
+    uint32_t callbacks = 0;
+    RefPtr<PublicationObserver> observer =
+        new PublicationObserver([&](Message*, bool) { ++callbacks; });
+    auto& db = mCore->MessageDB();
+    db.AddMessageListener(observer);
+    auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    Maybe<FolderImportReceipt> recovered;
+    ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, recovered));
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(historical, recovered->identity.folderPath);
+    EXPECT_EQ(first.identity.token, recovered->identity.token);
+    EXPECT_EQ(first.identity.databaseSourceId,
+              recovered->identity.databaseSourceId);
+    EXPECT_EQ(literal, recovered->identity.folderId);
+    ASSERT_EQ(first.keys.Length(), recovered->keys.Length());
+    for (uint32_t i = 0; i < first.keys.Length(); ++i) {
+      EXPECT_EQ(first.keys[i].source, recovered->keys[i].source);
+      EXPECT_EQ(first.keys[i].destination, recovered->keys[i].destination);
+    }
+    FolderImportReceipt repeated;
+    ASSERT_EQ(NS_OK, ImportNativeFile(source, input, repeated));
+    EXPECT_EQ(historical, repeated.identity.folderPath);
+    ASSERT_EQ(first.keys.Length(), repeated.keys.Length());
+    for (uint32_t i = 0; i < first.keys.Length(); ++i) {
+      EXPECT_EQ(first.keys[i].source, repeated.keys[i].source);
+      EXPECT_EQ(first.keys[i].destination, repeated.keys[i].destination);
+    }
+    EXPECT_EQ(0u, callbacks);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    uint64_t after;
+    ASSERT_EQ(NS_OK, SearchWatermark(after));
+    EXPECT_EQ(watermark, after);
+    nsCString text;
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(first.keys[1].destination, "Case"_ns,
+                                           text));
+    EXPECT_EQ("00042"_ns, text);
+    nsTArray<nsCString> references;
+    ASSERT_EQ(NS_OK, Stored(first.keys[1].destination, references));
+    EXPECT_EQ(
+        (nsTArray<nsCString>{"root-import@invalid"_ns, "missing@invalid"_ns,
+                             "root-import@invalid"_ns}),
+        references);
+
+    for (uint32_t change = 0; change < 5; ++change) {
+      SCOPED_TRACE(change);
+      auto conflict = input.identity;
+      nsresult expected = NS_ERROR_ALREADY_INITIALIZED;
+      switch (change) {
+        case 0:
+          conflict.token = "different-token"_ns;
+          break;
+        case 1:
+          conflict.sourceId = "different-source"_ns;
+          break;
+        case 2:
+          conflict.folderId = slash;
+          conflict.folderPath = slashPath;
+          break;
+        case 3:
+          conflict.databaseSourceId = "different-database"_ns;
+          expected = NS_ERROR_NOT_AVAILABLE;
+          break;
+        case 4:
+          conflict.sourceSha256.AssignLiteral(
+              "000000000000000000000000000000000000000000000000000000000000000"
+              "0");
+#ifdef XP_WIN
+          expected = NS_ERROR_NOT_AVAILABLE;
+#endif
+          break;
+      }
+      recovered->identity.token = "unchanged"_ns;
+      EXPECT_EQ(expected, mCore->GetFolderImportReceipt(conflict, recovered));
+      ASSERT_TRUE(recovered);
+      EXPECT_EQ("unchanged"_ns, recovered->identity.token);
+    }
+    // The old spelling is not a second request-path or folder lookup alias.
+    auto conflict = input.identity;
+    conflict.folderPath = historical;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              mCore->GetFolderImportReceipt(conflict, recovered));
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ("unchanged"_ns, recovered->identity.token);
+  }
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  Maybe<FolderImportReceipt> recovered;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, recovered));
+  ASSERT_TRUE(recovered);
+  EXPECT_EQ(historical, recovered->identity.folderPath);
+  EXPECT_EQ(first.keys[1].destination, recovered->keys[1].destination);
+}
+
 TEST_F(DeliveryCoreReferences, NativeImportReceiptFailureRollsBackWholeUnit) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey control;
@@ -12003,6 +12150,327 @@ TEST_F(DeliveryCoreReferences, FolderMissingParentKeepsPhysicalRowsAndOutputs) {
   uint64_t after;
   ASSERT_EQ(NS_OK, SearchWatermark(after));
   EXPECT_EQ(watermark, after);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRelocationPreservesSubtreeAndBindings) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t left, right, child, sibling, leaf;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Left"_ns, &left));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Right"_ns, &right));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Original"_ns, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Sibling"_ns, &sibling));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(child, "Leaf"_ns, &leaf));
+  ASSERT_EQ(NS_OK, folders.MoveFolderWithin(left, child, 0));
+  auto ordinalResult = folders.GetFolderOrdinal(child);
+  ASSERT_TRUE(ordinalResult.isOk());
+  auto ordinal = ordinalResult.unwrap();
+  ASSERT_TRUE(ordinal);
+  nsMsgKey key;
+  const nsTArray<nsCString> references{"one"_ns, "two"_ns, "one"_ns};
+  ASSERT_EQ(NS_OK,
+            AddAt(leaf, "relocate-retained@invalid"_ns, references, key));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "retained-token"_ns));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(key, "Exact"_ns, "00042"_ns));
+  ASSERT_EQ(NS_OK, folders.SetFolderUidValidity(leaf, 71));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, leaf, 71, 83));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  ASSERT_EQ(NS_OK, folders.RelocateFolder(source, child, left, "Original"_ns,
+                                          left, "Cafe\xCC\x81"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Caf\xC3\xA9"_ns));
+  auto renamedOrdinal = folders.GetFolderOrdinal(child);
+  ASSERT_TRUE(renamedOrdinal.isOk());
+  EXPECT_EQ(ordinal, renamedOrdinal.unwrap());
+  ASSERT_EQ(NS_OK, folders.RelocateFolder(source, child, left, "Caf\xC3\xA9"_ns,
+                                          right, "Moved %/leaf"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, right, "Moved %/leaf"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(leaf, child, "Leaf"_ns));
+  auto movedOrdinal = folders.GetFolderOrdinal(child);
+  ASSERT_TRUE(movedOrdinal.isOk());
+  EXPECT_TRUE(movedOrdinal.unwrap().isNothing());
+  uint64_t current;
+  nsCString parentPath, path;
+  ASSERT_EQ(NS_OK, folders.GetFolderPath(right, parentPath));
+  ASSERT_EQ(NS_OK, folders.GetFolderPath(leaf, path));
+  EXPECT_EQ(nsCString(parentPath + "/Moved %25%2Fleaf/Leaf"_ns), path);
+  current = 0;
+  ASSERT_EQ(NS_OK, folders.GetFolderByPath(path, &current));
+  EXPECT_EQ(leaf, current);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            folders.RelocateFolder(source, child, left, "Caf\xC3\xA9"_ns, right,
+                                   "Moved %/leaf"_ns));
+  ASSERT_EQ(NS_OK,
+            folders.RelocateFolder(source, child, right, "Moved %/leaf"_ns,
+                                   right, "Moved %/leaf"_ns));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, right, "Moved %/leaf"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(leaf, child, "Leaf"_ns));
+  auto& reopened = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, reopened.GetMessageFolderId(key, current));
+  EXPECT_EQ(leaf, current);
+  nsMsgKey resolved = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, reopened.GetMessageKeyForServerUid(leaf, 71, 83, resolved));
+  EXPECT_EQ(key, resolved);
+  nsCString text;
+  ASSERT_EQ(NS_OK, reopened.GetMessageStoreToken(key, text));
+  EXPECT_EQ("retained-token"_ns, text);
+  ASSERT_EQ(NS_OK, reopened.GetMessageProperty(key, "Exact"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  nsTArray<nsCString> stored;
+  ASSERT_EQ(NS_OK, reopened.GetMessageReferences(key, stored));
+  EXPECT_EQ(references, stored);
+  // The same checked primitive also accepts a parent-only move.
+  ASSERT_EQ(NS_OK, mCore->FolderDB().RelocateFolder(source, child, right,
+                                                    "Moved %/leaf"_ns, left,
+                                                    "Moved %/leaf"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Moved %/leaf"_ns));
+}
+
+TEST_F(DeliveryCoreReferences, FolderRelocationWriteAndCommitFailuresRollback) {
+  for (bool commitFailure : {false, true}) {
+    SCOPED_TRACE(commitFailure);
+    ASSERT_EQ(NS_OK, Start());
+    auto& folders = mCore->FolderDB();
+    uint64_t left, right, child, sibling;
+    nsAutoCString leftName("Left ");
+    nsAutoCString rightName("Right ");
+    leftName.Append(commitFailure ? "commit" : "write");
+    rightName.Append(commitFailure ? "commit" : "write");
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, leftName, &left));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, rightName, &right));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Original"_ns, &child));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Sibling"_ns, &sibling));
+    ASSERT_EQ(NS_OK, folders.MoveFolderWithin(left, child, 0));
+    ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(left, {sibling, child}));
+    nsCString source, oldPath;
+    ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+    ASSERT_EQ(NS_OK, folders.GetFolderPath(child, oldPath));
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, AddAt(child, "rollback-retained@invalid"_ns,
+                           {"one"_ns, "one"_ns}, key));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(key, "Exact"_ns,
+                                                           "00042"_ns));
+    uint64_t watermark;
+    ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK, mConnection->CreateFunction("folder_relocate_fault"_ns, 1,
+                                                 witness));
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "relocate_parent(id INTEGER PRIMARY KEY); "
+                           "CREATE TEMP TABLE relocate_child(id INTEGER "
+                           "REFERENCES relocate_parent(id) DEFERRABLE "
+                           "INITIALLY DEFERRED)"_ns));
+    }
+    nsAutoCString sql(
+        "CREATE TEMP TRIGGER fail_folder_relocation "
+        "AFTER UPDATE OF name,parent ON main.folders WHEN OLD.id=");
+    sql.AppendInt(child);
+    sql.AppendLiteral(" BEGIN SELECT folder_relocate_fault(OLD.id); ");
+    sql.Append(commitFailure
+                   ? "INSERT INTO relocate_child VALUES(OLD.id); END"
+                   : "SELECT RAISE(FAIL,'folder relocation write'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_folder_relocation"_ns));
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("folder_relocate_fault"_ns));
+    });
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              folders.RelocateFolder(source, child, left, "Original"_ns, right,
+                                     "Renamed"_ns));
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(int64_t(child), witness->mLastKey);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, left, "Original"_ns));
+    ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(left, {sibling, child}));
+    ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(right, {}, false));
+    nsCString path, text;
+    ASSERT_EQ(NS_OK, folders.GetFolderPath(child, path));
+    EXPECT_EQ(oldPath, path);
+    uint64_t current, after;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFolderId(key, current));
+    EXPECT_EQ(child, current);
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
+    ASSERT_EQ(NS_OK, SearchWatermark(after));
+    EXPECT_EQ(watermark, after);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_folder_relocation"_ns));
+    ASSERT_EQ(NS_OK, folders.RelocateFolder(source, child, left, "Original"_ns,
+                                            right, "Renamed"_ns));
+    ASSERT_EQ(NS_OK, mConnection->RemoveFunction("folder_relocate_fault"_ns));
+    cleanup.release();
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, right, "Renamed"_ns));
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, right, "Renamed"_ns));
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
+    Stop();
+  }
+}
+
+TEST_F(DeliveryCoreReferences, FolderRelocationRefusesStaleAndCallerState) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t child, leaf, target, collision, otherRoot;
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Original"_ns, &child));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(child, "Leaf"_ns, &leaf));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, "Target"_ns, &target));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(target, "Collision"_ns, &collision));
+  ASSERT_EQ(NS_OK, folders.InsertRoot("different-account"_ns, &otherRoot));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            folders.RelocateFolder("old-incarnation"_ns, child, mFolderId,
+                                   "Original"_ns, target, "New"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            folders.RelocateFolder(source, child, target, "Original"_ns, target,
+                                   "New"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            folders.RelocateFolder(source, child, mFolderId, "original"_ns,
+                                   target, "New"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            folders.RelocateFolder(source, target, mFolderId, "Original"_ns,
+                                   mFolderId, "New"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            folders.RelocateFolder(source, INT64_MAX, mFolderId, "Original"_ns,
+                                   target, "New"_ns));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            folders.RelocateFolder(source, 0, mFolderId, "Original"_ns, target,
+                                   "New"_ns));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            folders.RelocateFolder(source, child, mFolderId, "Original"_ns, 0,
+                                   "New"_ns));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            folders.RelocateFolder(source, child, mFolderId, "Original"_ns,
+                                   UINT64_MAX, "New"_ns));
+  for (uint64_t badParent : {child, leaf, otherRoot}) {
+    EXPECT_EQ(NS_ERROR_UNEXPECTED,
+              folders.RelocateFolder(source, child, mFolderId, "Original"_ns,
+                                     badParent, "New"_ns));
+  }
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            folders.RelocateFolder(source, child, mFolderId, "Original"_ns,
+                                   target, "Collision"_ns));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, AddAt(child, "caller-state@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(key, "caller"_ns,
+                                                         "pending"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            folders.RelocateFolder(source, child, mFolderId, "Original"_ns,
+                                   target, "New"_ns));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString text;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "caller"_ns, text));
+  EXPECT_EQ("pending"_ns, text);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  nsAutoCString sql("CREATE TEMP VIEW folders AS SELECT id,parent,ordinal,");
+  sql.AppendLiteral("CASE WHEN id=");
+  sql.AppendInt(child);
+  sql.AppendLiteral(
+      " THEN abs(-9223372036854775808) ELSE name END AS name,flags "
+      "FROM main.folders");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            folders.RelocateFolder(source, child, mFolderId, "Original"_ns,
+                                   target, "New"_ns));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL("DROP VIEW temp.folders"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, mFolderId, "Original"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(leaf, child, "Leaf"_ns));
+  RefPtr<FolderDatabase> retired = &folders;
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            retired->RelocateFolder(source, child, mFolderId, "Original"_ns,
+                                    target, "New"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(child, mFolderId, "Original"_ns));
+}
+
+TEST_F(DeliveryCoreReferences, FolderRelocationRefusesPendingSubtreeBodyWork) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t root, container;
+  ASSERT_EQ(NS_OK, folders.GetFolderRoot(mFolderId, &root));
+  ASSERT_EQ(NS_OK, folders.InsertFolder(root, "Container"_ns, &container));
+  ASSERT_EQ(NS_OK, folders.MoveFolderTo(container, mFolderId));
+  nsCString source, inboxName;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  ASSERT_EQ(NS_OK, folders.GetFolderName(mFolderId, inboxName));
+  FolderBodyRelocation plan;
+  ASSERT_EQ(NS_OK, PrepareRelocation(plan));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().PrepareBodyRelocation(plan));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->FolderDB();
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            reopened.RelocateFolder(source, container, root, "Container"_ns,
+                                    root, "Renamed"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            reopened.RelocateFolder(source, mFolderId, container, inboxName,
+                                    container, "Renamed"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP VIEW body_relocations AS SELECT folderId, "
+          "abs(-9223372036854775808) AS state FROM main.body_relocations"_ns));
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            reopened.RelocateFolder(source, container, root, "Container"_ns,
+                                    root, "Renamed"_ns));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.body_relocations"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(container, root, "Container"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(mFolderId, container, inboxName));
+  Maybe<FolderBodyRelocation> pending;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetBodyRelocation(mFolderId, pending));
+  ASSERT_TRUE(pending);
+  EXPECT_EQ(BodyRelocationState::Pending, pending->state);
+  EXPECT_EQ(plan.token, pending->token);
+  EXPECT_EQ(plan.messages.Length(), pending->messages.Length());
+  for (const auto& path : {plan.originalPath, plan.compactedPath}) {
+    nsCOMPtr<nsIFile> file;
+    ASSERT_EQ(NS_OK, NS_NewLocalFile(path, getter_AddRefs(file)));
+    bool exists = false;
+    ASSERT_EQ(NS_OK, file->Exists(&exists));
+    EXPECT_TRUE(exists);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderResolverRefusesRetiredOwnerWithoutReopening) {
+  ASSERT_EQ(NS_OK, Start());
+  RefPtr<FolderDatabase> original = &mCore->FolderDB();
+  nsCString path;
+  ASSERT_EQ(NS_OK, original->GetFolderPath(mFolderId, path));
+  Stop();
+  nsCOMPtr<mozIStorageConnection> before = Connection();
+  ASSERT_FALSE(before);
+  nsCOMPtr<nsIMsgFolder> folder;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            original->GetMsgFolderForFolder(mFolderId, getter_AddRefs(folder)));
+  EXPECT_FALSE(folder);
+  nsCOMPtr<mozIStorageConnection> after = Connection();
+  EXPECT_FALSE(after);
+  ASSERT_EQ(NS_OK, Start());
+  before = Connection();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            original->GetMsgFolderForFolder(mFolderId, getter_AddRefs(folder)));
+  EXPECT_FALSE(folder);
+  after = Connection();
+  EXPECT_EQ(before, after);
 }
 
 }  // namespace mozilla::mailnews

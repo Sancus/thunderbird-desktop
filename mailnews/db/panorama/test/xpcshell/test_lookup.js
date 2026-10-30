@@ -83,20 +83,19 @@ add_task(function testLookup() {
     "server2/folder/süb1/sub2/I%2FO stuff"
   );
 
-  // Check that getFolderByPath() works with names that contain things that
-  // look like percent-encoding.
-  // TODO: we haven't yet nailed down the exact rules for our path encoding.
-  // Once that's done, enable and expand these.
-  /*
-  Assert.equal(folderDB.getFolderChildNamed(sub2, iostuff2), "I%2FO stuff");
+  // Decode once so a literal percent sequence remains a distinct sibling.
+  Assert.equal(folderDB.getFolderChildNamed(sub2, "I%2FO stuff"), iostuff2);
   Assert.equal(
     folderDB.getFolderByPath("server2/folder/süb1/sub2/I%252FO stuff"),
     iostuff2
   );
   Assert.equal(
-    folderDB.getFolderPath(iostuff2, "server2/folder/süb1/sub2/I%252FO stuff"));
+    folderDB.getFolderPath(iostuff2),
+    "server2/folder/süb1/sub2/I%252FO stuff"
   );
-  */
+  for (const id of [iostuff, iostuff2]) {
+    Assert.equal(folderDB.getFolderByPath(folderDB.getFolderPath(id)), id);
+  }
 });
 
 /**
@@ -109,6 +108,9 @@ add_task(function testLookupAfterMove() {
   Assert.equal(folderDB.getFolderByPath("server2/folder/s\u00FCb1/sub2"), sub2);
 
   folderDB.moveFolderTo(folder, sub2);
+  for (const id of [iostuff, iostuff2]) {
+    Assert.equal(folderDB.getFolderByPath(folderDB.getFolderPath(id)), id);
+  }
   Assert.equal(folderDB.getFolderPath(sub2), "server2/folder/sub2");
   Assert.equal(folderDB.getFolderByPath("server2/folder/sub2"), sub2);
   Assert.equal(folderDB.getFolderByPath("server2/folder/s\u00FCb1/sub2"), 0);

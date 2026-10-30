@@ -28,6 +28,14 @@ class FolderDatabase : public nsIFolderDatabase {
   Result<nsCString, nsresult> GetFolderPath(uint64_t folderId);
   Result<uint32_t, nsresult> GetFolderFlags(uint64_t folderId);
 
+  // Native same-row settlement, not a filesystem or wrapper operation. Guards
+  // the exact captured location/incarnation; owns SQL and refuses caller TXs.
+  // Failure preserves metadata/cache; success has no fallible postcommit work.
+  nsresult RelocateFolder(const nsACString& expectedSourceId, uint64_t folderId,
+                          uint64_t expectedParent,
+                          const nsACString& expectedName, uint64_t newParent,
+                          const nsACString& newName);
+
   Result<uint64_t, nsresult> GetFolderParent(uint64_t folderId);
   // Returns children sorted. Can pass folderId=0 to get root folders.
   Result<nsTArray<uint64_t>, nsresult> GetFolderChildren(uint64_t folderId);
@@ -52,6 +60,10 @@ class FolderDatabase : public nsIFolderDatabase {
   friend class DatabaseCore;
 
   FolderDatabase() = default;
+
+  // Historical spelling is only for checking an already identified receipt.
+  Result<nsCString, nsresult> GetFolderPath(uint64_t folderId,
+                                            bool escapePercent);
 
  private:
   friend class DatabaseCore;
@@ -83,6 +95,11 @@ class FolderDatabase : public nsIFolderDatabase {
 
  private:
   FolderComparator mComparator;
+
+  nsresult ValidateFolderRelocation(const nsACString& expectedSourceId,
+                                    uint64_t folderId, uint64_t expectedParent,
+                                    const nsACString& expectedName,
+                                    uint64_t newParent);
 
   nsresult InternalLoadFolders();
 

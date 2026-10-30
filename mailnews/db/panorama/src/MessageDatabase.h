@@ -501,7 +501,8 @@ class MessageDatabase : public nsIMessageDatabase {
                               uint32_t value);
 
   // Stored published membership; never opens a stopped/replaced core.
-  // Reads a caller transaction without owning it; errors leave exists unchanged.
+  // Reads a caller transaction without owning it; errors leave exists
+  // unchanged.
   nsresult MessageExists(nsMsgKey key, bool& exists);
 
   // Lowest physical key with this exact Message-ID in an existing folder.
@@ -513,6 +514,7 @@ class MessageDatabase : public nsIMessageDatabase {
 
  private:
   friend class DatabaseCore;
+  friend class FolderDatabase;
   friend class FolderMigrator;
 
   // Caller owns the insertion transaction and has written the new row/history.

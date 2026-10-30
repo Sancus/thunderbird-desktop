@@ -26,10 +26,13 @@ const { readMorkFolderImport, captureMorkFolderWindowsInventory } =
 const { importMorkFolderSnapshot } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs"
 );
-const { resumeMorkImports, createPanoramaMigrationTarget } =
-  ChromeUtils.importESModule(
-    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
-  );
+const {
+  resumeMorkImports,
+  createPanoramaMigrationTarget,
+  createWindowsPanoramaMigrationTarget,
+} = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+);
 
 let profileLock;
 let work;
@@ -51,6 +54,14 @@ const names = [
   "native-store-link",
   "native-outside",
   "native-no-store",
+  ...(AppConstants.platform == "win"
+    ? [
+        "native-win-success",
+        "native-win-reconcile",
+        "native-win-wrong-folder",
+        "native-win-backup",
+      ]
+    : []),
 ];
 
 add_setup(async function setupClosedLegacyProfileThenNativeTarget() {
@@ -359,6 +370,174 @@ add_task(
     Assert.throws(() => targetFor(input), /requires native reparse admission/);
     Assert.deepEqual(await IOUtils.read(input.path), before);
     Assert.equal(database.messageDB.totalCount, 0);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  function test_windowsExplicitTargetRefusesOtherPlatformsBeforeIO() {
+    Assert.throws(
+      () => createWindowsPanoramaMigrationTarget(null, null, null, null),
+      /version2 migration requires Windows/
+    );
+  }
+);
+
+/** @param {object} input - Real journal/native folder. @returns {object} Explicit v2 target. */
+function windowsTargetFor(input) {
+  return createWindowsPanoramaMigrationTarget(
+    input.journal,
+    database,
+    id => {
+      Assert.equal(id, input.name);
+      return input.folder;
+    },
+    profileLock
+  );
+}
+
+/** @param {object} input - Committed real import. */
+function assertWindowsReceipt(input) {
+  const source = input.journal.state.sources[0];
+  const receipt = source.receipt;
+  Assert.equal(input.journal.state.version, 4);
+  Assert.equal(receipt.version, 2);
+  Assert.equal(receipt.databaseSourceId, database.sourceId);
+  Assert.equal(receipt.sourceId, source.id);
+  Assert.deepEqual(receipt.sourcePhysicalIdentity, source.physicalIdentity);
+  for (const kind of ["summary", "store"]) {
+    for (const [name, value] of Object.entries(
+      source.inventory.windowsAdmission[kind]
+    )) {
+      Assert.equal(receipt.windowsAdmission[kind][name], value);
+    }
+    Assert.equal(
+      receipt.windowsAdmission[kind].canonicalRoot,
+      input.journal.state.profilePath
+    );
+  }
+  Assert.equal(receipt.windowsAdmission.summary.canonicalPath, source.path);
+}
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_explicitWindowsTargetCommitsMeasuredReceipt() {
+    const input = await plannedImport("native-win-success");
+    await resumeMorkImports(input.journal, windowsTargetFor(input));
+    Assert.equal(input.journal.state.stage, "validate");
+    await assertCommitted(input);
+    assertWindowsReceipt(input);
+    input.journal.close();
+    input.journal = await MigrationJournal.open(
+      input.path,
+      profileLock.directory.path
+    );
+    registerCleanupFunction(() => input.journal.close());
+    const source = input.journal.state.sources[0];
+    const before = await IOUtils.read(input.path);
+    const count = database.messageDB.totalCount;
+    const receipt = await windowsTargetFor(input).findReceipt(source.token, {
+      sourceId: source.id,
+      sourceSha256: source.sha256,
+      destinationFolderId: source.destinationFolderId,
+    });
+    Assert.deepEqual(receipt.windowsAdmission, source.receipt.windowsAdmission);
+    Assert.deepEqual(receipt.keys, source.receipt.keys);
+    Assert.equal(database.messageDB.totalCount, count);
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_windowsReconcilesNativeCommitBeforeCheckpoint() {
+    const input = await plannedImport("native-win-reconcile");
+    await input.journal.beginImport(input.name);
+    const committed = await importMorkFolderSnapshot(
+      database,
+      input.folder,
+      input.journal.state.sources[0]
+    );
+    Assert.equal(input.journal.state.sources[0].receipt, null);
+    input.journal.close();
+    input.journal = await MigrationJournal.open(
+      input.path,
+      profileLock.directory.path
+    );
+    registerCleanupFunction(() => input.journal.close());
+    const target = windowsTargetFor(input);
+    target.importFolder = async () => {
+      throw new Error("Must reconcile, never reimport");
+    };
+    const count = database.messageDB.totalCount;
+    await resumeMorkImports(input.journal, target);
+    Assert.equal(database.messageDB.totalCount, count);
+    Assert.deepEqual(
+      input.journal.state.sources[0].receipt.windowsAdmission,
+      committed.windowsAdmission
+    );
+    await assertCommitted(input);
+    assertWindowsReceipt(input);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_windowsRejectsAnotherPhysicalFolderBeforeNativeWrites() {
+    const input = await plannedImport("native-win-wrong-folder");
+    const count = database.messageDB.totalCount;
+    const target = createWindowsPanoramaMigrationTarget(
+      input.journal,
+      database,
+      () => originals.get("native-pin"),
+      profileLock
+    );
+    await Assert.rejects(
+      resumeMorkImports(input.journal, target),
+      /Original Windows inventory differs from native folder/
+    );
+    Assert.equal(database.messageDB.totalCount, count);
+    Assert.equal(input.journal.state.sources[0].receipt, null);
+    Assert.deepEqual(
+      await IOUtils.read(input.folder.summaryFile.path),
+      input.summary
+    );
+    Assert.deepEqual(
+      await IOUtils.read(input.folder.filePath.path),
+      input.body
+    );
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_windowsRejectsChangedBackupBeforeNativeWrites() {
+    const input = await plannedImport("native-win-backup");
+    const target = windowsTargetFor(input);
+    const manifest = await IOUtils.read(backup.path);
+    const count = database.messageDB.totalCount;
+    try {
+      await IOUtils.write(backup.path, new Uint8Array([...manifest, 0x20]));
+      await Assert.rejects(
+        resumeMorkImports(input.journal, target),
+        /backup identity changed/
+      );
+      Assert.equal(database.messageDB.totalCount, count);
+      Assert.equal(input.journal.state.sources[0].receipt, null);
+      Assert.deepEqual(
+        await IOUtils.read(input.folder.summaryFile.path),
+        input.summary
+      );
+      Assert.deepEqual(
+        await IOUtils.read(input.folder.filePath.path),
+        input.body
+      );
+    } finally {
+      await IOUtils.write(backup.path, manifest);
+    }
+    await resumeMorkImports(input.journal, windowsTargetFor(input));
+    await assertCommitted(input);
+    assertWindowsReceipt(input);
   }
 );
 

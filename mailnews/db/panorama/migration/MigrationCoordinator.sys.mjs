@@ -5,7 +5,11 @@
 import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { FileUtils } from "resource://gre/modules/FileUtils.sys.mjs";
 import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
-import { readMorkFolderImport } from "resource:///modules/panorama/MorkFolderImport.sys.mjs";
+import {
+  readMorkFolderImport,
+  validateMorkFolderWindowsInventory,
+} from "resource:///modules/panorama/MorkFolderImport.sys.mjs";
+import { MigrationJournal } from "resource:///modules/panorama/MigrationJournal.sys.mjs";
 import {
   convertMorkFolderSnapshot,
   validateMorkFolderReceipt,
@@ -14,6 +18,7 @@ import {
   readMorkMigrationSource,
   readMorkAddressBookSource,
   readMorkFolderCacheSource,
+  hashMigrationFile,
 } from "resource:///modules/panorama/MigrationSource.sys.mjs";
 
 import { getMorkThreadRelations } from "resource:///modules/panorama/MigrationMessageMap.sys.mjs";
@@ -656,7 +661,10 @@ export async function readLegacyGlodaMailRecovery(
     }
     selected.normalize();
     directory.normalize();
-    if (selected.path !== state.profilePath || !selected.equals(directory)) {
+    if (
+      !selected.equals(new FileUtils.File(state.profilePath)) ||
+      !selected.equals(directory)
+    ) {
       throw new Error("Gloda recovery requires the held selected profile");
     }
     if (
@@ -743,6 +751,9 @@ export async function readLegacyGlodaMailRecovery(
     });
   }
   const result = lazy.mapLegacyGlodaMail(snapshot, bindings);
+  if ((await hashMigrationFile(backup.path)) !== backup.sha256) {
+    throw new Error("Gloda recovery backup identity changed");
+  }
   check();
   return {
     snapshot,
@@ -787,6 +798,73 @@ export function createPanoramaMigrationTarget(
   resolveFolder,
   profileLock
 ) {
+  return bindPanoramaMigrationTarget(
+    journal,
+    core,
+    resolveFolder,
+    profileLock,
+    false
+  );
+}
+
+/**
+ * Binds explicit Windows version2 imports to retained journal4/backup3 inputs.
+ * Keeps the Unix/default factory's Windows refusal. Requires the caller's actual
+ * selected-profile lock and quiesced source, backup and target writers. The native
+ * receiver acquires separate leases and returns its measured durable receipt.
+ * Does not authorize startup, profile activation, books or cache import.
+ *
+ * @param {MigrationJournal} journal - Actual open journal with original roots.
+ * @param {nsIDatabaseCore} core - Actual started Panorama database.
+ * @param {function(string): (nsIMsgFolder|Promise<nsIMsgFolder>)} resolveFolder -
+ *   Resolves a retained source ID to its actual native folder.
+ * @param {nsIProfileLock} profileLock - Caller-held lock through checkpointing.
+ * @returns {object} Receipt lookup and import boundary for resumeMorkImports.
+ * @throws {Error} For non-Windows, old progress or incomplete admission.
+ */
+export function createWindowsPanoramaMigrationTarget(
+  journal,
+  core,
+  resolveFolder,
+  profileLock
+) {
+  if (AppConstants.platform != "win") {
+    throw new Error("Windows version2 migration requires Windows");
+  }
+  if (
+    !(journal instanceof MigrationJournal) ||
+    journal.state.version !== 4 ||
+    !["import", "validate", "activate", "complete"].includes(
+      journal.state.stage
+    ) ||
+    !journal.state.backup
+  ) {
+    throw new Error("Windows migration requires a backed-up version4 journal");
+  }
+  return bindPanoramaMigrationTarget(
+    journal,
+    core,
+    resolveFolder,
+    profileLock,
+    true
+  );
+}
+
+/**
+ * @param {MigrationJournal} journal - Open retained plan.
+ * @param {nsIDatabaseCore} core - Native backend.
+ * @param {Function} resolveFolder - Actual original-folder resolver.
+ * @param {nsIProfileLock} profileLock - Held selected-profile lock.
+ * @param {boolean} windows - Explicit version2 admission, never a startup gate.
+ * @returns {object} Checked native receipt/import methods.
+ */
+function bindPanoramaMigrationTarget(
+  journal,
+  core,
+  resolveFolder,
+  profileLock,
+  windows
+) {
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
   if (
     typeof database.importFolderSnapshot != "function" ||
@@ -797,7 +875,7 @@ export function createPanoramaMigrationTarget(
       "Native version1 migration APIs and folder resolver are required"
     );
   }
-  if (AppConstants.platform == "win") {
+  if (AppConstants.platform == "win" && !windows) {
     throw new Error(
       "Windows migration import requires native reparse admission"
     );
@@ -819,6 +897,37 @@ export function createPanoramaMigrationTarget(
   };
   const checkLock = () => {
     const directory = lock.directory.clone();
+    if (windows) {
+      const state = journal.state;
+      const root = state.originalRoots.find(
+        item => item.canonicalPath === state.profilePath
+      );
+      if (!root) {
+        throw new Error("Migration profile has no original admitted root");
+      }
+      const fs = Cc[
+        "@mozilla.org/mailnews/panorama-migration-file-system;1"
+      ].getService(Ci.nsIPanoramaMigrationFileSystem);
+      const lease = fs.admit(
+        directory,
+        new FileUtils.File(root.originalPath),
+        fs.KIND_DIRECTORY
+      );
+      try {
+        fs.validate(lease);
+        if (
+          lease.canonicalPath !== state.profilePath ||
+          lease.identity !== state.profilePhysicalIdentity.id ||
+          lease.parentIdentity !== state.profilePhysicalIdentity.parentId ||
+          lease.rootIdentity !== root.physicalIdentity.id
+        ) {
+          throw new Error("Migration profile lock selects another profile");
+        }
+      } finally {
+        lease.close();
+      }
+      return;
+    }
     if (directory.isSymlink()) {
       throw new Error("Migration profile lock directory is a link");
     }
@@ -844,7 +953,55 @@ export function createPanoramaMigrationTarget(
     }
     return source;
   };
+  const checkBackup = async () => {
+    if (!windows) {
+      return;
+    }
+    const state = journal.state;
+    const actual = await verifyMigrationBackup(state.backupPath);
+    const manifest = await IOUtils.readJSON(actual.path);
+    if (
+      actual.path !== state.backup.path ||
+      actual.sha256 !== state.backup.sha256 ||
+      manifest.version !== 3 ||
+      JSON.stringify(manifest.originalRoots) !==
+        JSON.stringify(state.originalRoots) ||
+      (await hashMigrationFile(actual.path)) !== actual.sha256
+    ) {
+      throw new Error("Windows migration backup identity changed");
+    }
+  };
   const checkPaths = (folder, source, request) => {
+    if (windows) {
+      const measured = validateMorkFolderWindowsInventory(
+        source.inventory,
+        folder
+      );
+      if (
+        source.path !== measured.summary.canonicalPath ||
+        source.physicalIdentity?.version !== 1 ||
+        source.physicalIdentity.id !== measured.summary.id ||
+        source.physicalIdentity.parentId !== measured.summary.parentId ||
+        Object.values(measured).some(
+          record =>
+            !journal.state.originalRoots.some(
+              root =>
+                root.originalPath === record.originalRoot &&
+                root.canonicalPath === record.canonicalRoot &&
+                root.physicalIdentity.id === record.rootId
+            )
+        ) ||
+        (request &&
+          (request.version !== 2 ||
+            request.folder.summaryPath !== measured.summary.canonicalPath ||
+            request.folder.storePath !== measured.store.canonicalPath))
+      ) {
+        throw new Error(
+          "Mork snapshot conflicts with journal/database identity"
+        );
+      }
+      return;
+    }
     const roots = [journal.state.profilePath, ...journal.state.mailPaths].map(
       path => new FileUtils.File(path)
     );
@@ -867,12 +1024,17 @@ export function createPanoramaMigrationTarget(
       prepared = null;
       const source = plannedSource(token, identity);
       checkLock();
+      await checkBackup();
       const folder = (await resolveFolder(source.id)).QueryInterface(
         Ci.nsIMsgFolder
       );
       checkPaths(folder, source);
       const request = convertMorkFolderSnapshot(
-        await readMorkFolderImport(folder, token),
+        await readMorkFolderImport(
+          folder,
+          token,
+          windows ? source.inventory : undefined
+        ),
         source,
         databaseSourceId,
         database.folderDB.getFolderFlags(folder.id)
@@ -911,6 +1073,7 @@ export function createPanoramaMigrationTarget(
         );
       }
       checkLock();
+      await checkBackup();
       checkPaths(pending.folder, source, pending.request);
       const receipt = await database.importFolderSnapshot(
         pending.folder,

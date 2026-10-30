@@ -179,10 +179,12 @@ export function captureMorkFolderWindowsInventory(
  * Returns current measurements for comparison, never import/commit proof.
  *
  * @param {MorkWindowsInventory} inventory - Persisted original-path intent.
+ * @param {nsIMsgFolder} [folder] - Actual native folder to bind independently.
  * @returns {object} Summary/store identities with canonical path/root strings.
  */
-export function validateMorkFolderWindowsInventory(inventory) {
-  const paths = admitWindowsInventory(null, inventory);
+export function validateMorkFolderWindowsInventory(inventory, folder) {
+  folder?.QueryInterface(Ci.nsIMsgFolder);
+  const paths = admitWindowsInventory(folder ?? null, inventory);
   try {
     paths.validate();
     return structuredClone(paths.measured);

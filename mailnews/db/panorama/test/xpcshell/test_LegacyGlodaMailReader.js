@@ -832,6 +832,49 @@ add_task(
       otherLock.unlock();
       other.remove(false);
     }
+    const manifestBytes = await IOUtils.read(backup.path);
+    let changedManifest = false;
+    const changeAfterVerifiedRead = async id => {
+      if (!changedManifest) {
+        const changed = new Uint8Array(manifestBytes.length + 1);
+        changed.set(manifestBytes);
+        changed[manifestBytes.length] = 10;
+        await IOUtils.write(backup.path, changed);
+        changedManifest = true;
+      }
+      return resolve(id);
+    };
+    try {
+      await Assert.rejects(
+        readLegacyGlodaMailRecovery(
+          journal,
+          database,
+          changeAfterVerifiedRead,
+          lock,
+          backedUp
+        ),
+        /backup identity changed/
+      );
+      Assert.ok(
+        changedManifest,
+        "The manifest changed after its verified read, at native folder resolution"
+      );
+      Assert.equal(changes(), writes);
+      Assert.deepEqual(await IOUtils.read(journalPath), recorded);
+    } finally {
+      await IOUtils.write(backup.path, manifestBytes);
+    }
+    Assert.deepEqual(
+      await readLegacyGlodaMailRecovery(
+        journal,
+        database,
+        resolve,
+        lock,
+        backedUp
+      ),
+      result,
+      "The original verified backup remains usable after exact restoration"
+    );
     Assert.deepEqual(await IOUtils.read(journalPath), recorded);
     Assert.deepEqual(journal.state, state);
     for (const [path, bytes] of originals) {

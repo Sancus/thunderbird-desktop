@@ -292,7 +292,7 @@ async function checkCrossStoreTransfer(sourceStore, destinationStore, isMove) {
     source.markMessagesRead([selected], true);
     source.markMessagesFlagged([selected], true);
     selected.setStringProperty("keywords", "first-tag second-tag");
-    selected.setStringProperty("crossStoreValue", "Exact cafÃ© æ—¥æœ¬èªž");
+    selected.setStringProperty("crossStoreValue", "Exact café 日本語");
     selected.setStringProperty("crossStoreEmpty", "");
     // These are arbitrary text rows in Panorama, but storage columns in Mork.
     if (native) {
@@ -346,7 +346,7 @@ async function checkCrossStoreTransfer(sourceStore, destinationStore, isMove) {
     Assert.equal(copied.getStringProperty("keywords"), "first-tag second-tag");
     Assert.equal(
       copied.getStringProperty("crossStoreValue"),
-      "Exact cafÃ© æ—¥æœ¬èªž"
+      "Exact café 日本語"
     );
     Assert.equal(copied.getStringProperty("crossStoreEmpty"), "");
     Assert.ok([...copied.properties].includes("crossStoreEmpty"));
@@ -432,3 +432,186 @@ add_task(async function test_moveMaildirToMbox() {
     true
   );
 });
+
+/**
+ * Reject an invalid delete batch before any member's body or row is removed.
+ *
+ * @param {string} storeType - Local mbox or maildir provider.
+ * @param {boolean} [foreignTransaction=false] - Hold a real native transaction.
+ */
+async function checkDeleteAdmission(storeType, foreignTransaction = false) {
+  const prefs = [
+    "mail.serverDefaultStoreContractID",
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
+  const contract = `@mozilla.org/msgstore/${storeType == "mbox" ? "berkeleystore" : "maildirstore"};1`;
+  localAccountUtils.clearAll();
+  try {
+    for (const { name } of prefs) {
+      Services.prefs.setCharPref(name, contract);
+    }
+    localAccountUtils.loadLocalMailAccount();
+    const root = localAccountUtils.rootFolder;
+    const folder = root
+      .createLocalSubfolder("delete-owner")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const other = root
+      .createLocalSubfolder("delete-other")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+      native
+    );
+    for (const f of [folder, other]) {
+      Assert.equal(f.msgStore.storeType, storeType);
+      Assert.equal(f.server.msgStore.storeType, storeType);
+    }
+    const populate = (f, prefix) =>
+      [0, 1].map(i => {
+        const raw =
+          "From: sender@example.invalid\r\n" +
+          "Date: Tue, 01 Jan 2019 00:00:00 +0000\r\n" +
+          `Message-ID: <${prefix}-${i}@delete.invalid>\r\n` +
+          `Subject: ${prefix}-${i}\r\n\r\nExact ${prefix}-${i} bytes.\r\n`;
+        const header = f.addMessage(raw);
+        header.setStringProperty("delete-note", "Keep café 日本語");
+        return {
+          header,
+          key: header.messageKey,
+          token: header.storeToken,
+          flags: header.flags,
+          size: header.messageSize,
+          raw,
+        };
+      });
+    const own = populate(folder, "owner");
+    const foreign = populate(other, "foreign");
+    const files = async (f, originals) =>
+      storeType == "mbox"
+        ? [await IOUtils.read(f.filePath.path)]
+        : Promise.all(
+            originals.map(original =>
+              IOUtils.read(
+                PathUtils.join(f.filePath.path, "cur", original.token)
+              )
+            )
+          );
+    const ownBytes = await files(folder, own);
+    const foreignBytes = await files(other, foreign);
+    const check = (f, originals) => {
+      Assert.deepEqual(
+        f.msgDatabase.listAllKeys().sort((a, b) => a - b),
+        originals.map(original => original.key).sort((a, b) => a - b)
+      );
+      for (const original of originals) {
+        const h = f.GetMessageHeader(original.key);
+        Assert.equal(h.folder, f);
+        Assert.equal(h.storeToken, original.token);
+        Assert.equal(h.flags, original.flags);
+        Assert.equal(h.messageSize, original.size);
+        Assert.equal(h.getStringProperty("delete-note"), "Keep café 日本語");
+        Assert.equal(mailTestUtils.loadMessageToString(f, h), original.raw);
+      }
+    };
+    let deleted = 0;
+    const observer = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgFolderListener"]),
+      msgsDeleted() {
+        ++deleted;
+      },
+    };
+    MailServices.mfn.addListener(observer, MailServices.mfn.msgsDeleted);
+    try {
+      let connection;
+      if (foreignTransaction) {
+        Assert.ok(native);
+        connection = service.QueryInterface(
+          Ci.nsIDatabaseCore
+        ).connectionForTests;
+        connection.beginTransaction();
+      }
+      try {
+        Assert.throws(
+          () =>
+            folder.deleteMessages(
+              foreignTransaction
+                ? own.map(original => original.header)
+                : [own[0].header, foreign[0].header],
+              null,
+              true,
+              false,
+              null,
+              false
+            ),
+          error =>
+            error.result ==
+            (foreignTransaction
+              ? Cr.NS_ERROR_IN_PROGRESS
+              : Cr.NS_ERROR_ILLEGAL_VALUE)
+        );
+        if (connection) {
+          Assert.ok(connection.transactionInProgress);
+        }
+      } finally {
+        if (connection) {
+          connection.rollbackTransaction();
+        }
+      }
+      Assert.equal(deleted, 0);
+      check(folder, own);
+      check(other, foreign);
+      Assert.deepEqual(await files(folder, own), ownBytes);
+      Assert.deepEqual(await files(other, foreign), foreignBytes);
+      // The validation failure has not poisoned a later valid request.
+      folder.deleteMessages([own[0].header], null, true, false, null, false);
+      Assert.equal(deleted, 1);
+      check(folder, own.slice(1));
+      check(other, foreign);
+      if (storeType == "maildir") {
+        Assert.ok(
+          !(await IOUtils.exists(
+            PathUtils.join(folder.filePath.path, "cur", own[0].token)
+          ))
+        );
+      }
+      Assert.deepEqual(await files(other, foreign), foreignBytes);
+    } finally {
+      MailServices.mfn.removeListener(observer);
+    }
+  } finally {
+    try {
+      localAccountUtils.clearAll();
+    } finally {
+      for (const { name, hadValue, value } of prefs) {
+        if (hadValue) {
+          Services.prefs.setCharPref(name, value);
+        } else {
+          Services.prefs.clearUserPref(name);
+        }
+      }
+    }
+  }
+}
+
+add_task(async function test_deleteRejectsForeignFolderMbox() {
+  await checkDeleteAdmission("mbox");
+});
+add_task(async function test_deleteRejectsForeignFolderMaildir() {
+  await checkDeleteAdmission("maildir");
+});
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_deleteRejectsForeignTransactionMbox() {
+    await checkDeleteAdmission("mbox", true);
+  });
+  add_task(async function test_deleteRejectsForeignTransactionMaildir() {
+    await checkDeleteAdmission("maildir", true);
+  });
+}

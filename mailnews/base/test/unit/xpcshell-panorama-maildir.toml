@@ -11,4 +11,6 @@ prefs = [
 ]
 tags = ["panorama", "maildir"]
 
+["test_copyChaining.js"]
+
 ["test_moveCopyFoldersAcrossServers.js"]

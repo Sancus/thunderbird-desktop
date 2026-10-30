@@ -547,16 +547,19 @@ nsMsgLocalMailFolder::UpdateFolder(nsIMsgWindow* aWindow) {
                                 // to load it if not parsing
       NotifyFolderEvent(kFolderLoaded);
   }
+  const bool databaseLoading = rv == NS_ERROR_NOT_INITIALIZED;
   bool filtersRun;
   bool hasNewMessages;
   GetHasNewMessages(&hasNewMessages);
-  if (mDatabase) ApplyRetentionSettings();
+  if (NS_SUCCEEDED(rv) && mDatabase) {
+    rv = ApplyRetentionSettings();
+  }
   // if we have new messages, try the filter plugins.
   if (NS_SUCCEEDED(rv) && hasNewMessages)
     (void)CallFilterPlugins(aWindow, &filtersRun);
   // Callers should rely on folder loaded event to ensure completion of loading.
   // So we'll return NS_OK even if parsing is still in progress
-  if (rv == NS_ERROR_NOT_INITIALIZED) rv = NS_OK;
+  if (databaseLoading) rv = NS_OK;
   return rv;
 }
 
@@ -1183,6 +1186,42 @@ nsMsgLocalMailFolder::DeleteMessages(
     bool deleteStorage, bool isMove, nsIMsgCopyServiceListener* listener,
     bool allowUndo) {
   nsresult rv;
+  // Validate the whole input before POP3 marking, deletion notifications or
+  // provider mutations. A later foreign member must not retire a valid prefix.
+  for (const auto& header : msgHeaders) {
+    NS_ENSURE_ARG(header);
+    nsCOMPtr<nsIMsgFolder> owner;
+    rv = header->GetFolder(getter_AddRefs(owner));
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(owner == this, NS_ERROR_ILLEGAL_VALUE);
+  }
+
+  bool isTrashFolder = mFlags & nsMsgFolderFlags::Trash;
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup() && (deleteStorage || isTrashFolder)) {
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_STATE(core);
+    uint64_t folderId;
+    rv = GetId(&folderId);
+    NS_ENSURE_SUCCESS(rv, rv);
+    for (const auto& header : msgHeaders) {
+      nsMsgKey key;
+      rv = header->GetMessageKey(&key);
+      NS_ENSURE_SUCCESS(rv, rv);
+      mozilla::mailnews::MessageBodyState body;
+      rv = core->MessageDB().GetMessageBodyState(key, body);
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(body.folderId == folderId, NS_ERROR_ILLEGAL_VALUE);
+      nsAutoCString token;
+      rv = header->GetStoreToken(token);
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(
+          body.storeToken ? token.Equals(*body.storeToken) : token.IsEmpty(),
+          NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+#endif
 
   // shift delete case - (delete to trash is handled in EndMove)
   // this is also the case when applying retention settings.
@@ -1197,8 +1236,6 @@ nsMsgLocalMailFolder::DeleteMessages(
     }
     MarkMsgsOnPop3Server(hdrsToDelete, POP3_DELETE);
   }
-
-  bool isTrashFolder = mFlags & nsMsgFolderFlags::Trash;
 
   const bool notifyDeletion = !isMove && (deleteStorage || isTrashFolder);
   auto complete = [&](nsresult status) {
@@ -1579,9 +1616,12 @@ nsMsgLocalMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
   NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsITransaction> undoTxn;
   nsTArray<RefPtr<nsIMsgDBHdr>> dstHdrs;
-  // Store might have a shortcut, but mbox one doesn't.
-  rv = msgStore->CopyMessages(isMove, srcHdrs, this, dstHdrs,
-                              getter_AddRefs(undoTxn), &storeDidCopy);
+  // Store shortcuts finish only the messages. Folder transfers need the
+  // streamed completion path below to copy or move their subfolders too.
+  if (!isFolder) {
+    rv = msgStore->CopyMessages(isMove, srcHdrs, this, dstHdrs,
+                                getter_AddRefs(undoTxn), &storeDidCopy);
+  }
   if (storeDidCopy) {
     NS_ASSERTION(undoTxn, "if store does copy, it needs to add undo action");
     if (msgWindow && undoTxn) {

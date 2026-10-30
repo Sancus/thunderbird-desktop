@@ -7,6 +7,14 @@ prefs = [
 tags = ["panorama"]
 
 ["include:xpcshell-shared.toml"]
+["test_copyChaining.js"]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
+tags = ["mbox"]
+
 ["test_moveCopyFoldersAcrossServers.js"]
 prefs = [
   "experimental.mail.ews.overrideOAuth.enabled=true",

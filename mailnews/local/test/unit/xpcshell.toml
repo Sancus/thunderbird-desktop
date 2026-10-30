@@ -142,3 +142,6 @@ requesttimeoutfactor = 12
 ["test_verifyLogon.js"]
 
 ["test_viewSortBySize.js"]
+
+["test_localRetention.js"]
+tags = ["mork"]

@@ -18,4 +18,8 @@ prefs = [
 ]
 tags = ["maildir"]
 
+["test_msgCopy.js"]
+
 ["test_pop3PartialCompletion.js"]
+
+["test_localRetention.js"]

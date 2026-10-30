@@ -4,6 +4,8 @@
 
 "use strict";
 
+/* globals print */
+
 const { AppConstants } = ChromeUtils.importESModule(
   "resource://gre/modules/AppConstants.sys.mjs"
 );
@@ -543,6 +545,124 @@ add_task(
       input.journal.state.books[0].receipt.lists,
       committed.lists
     );
+    await assertOriginals(input);
+  }
+);
+
+/**
+ * Runs only in the child xpcshell. Keep the real committed connection alive so
+ * the parent can terminate the process without a normal storage close.
+ *
+ * @param {object} input - Original source, owned stage and retained operation token.
+ * @returns {Promise<void>}
+ */
+async function commitBookBeforeProcessTermination(input) {
+  Services.prefs.setBoolPref("security.nocertdb", true);
+  const { SQLiteDirectory: directory } = ChromeUtils.importESModule(
+    "resource:///modules/SQLiteDirectory.sys.mjs"
+  );
+  const { FileUtils: files } = ChromeUtils.importESModule(
+    "resource://gre/modules/FileUtils.sys.mjs"
+  );
+  globalThis.migrationBookStage = directory.createMigrationStage(
+    new files.File(input.stagingPath)
+  );
+  const receipt = directory.importMorkSnapshot(
+    globalThis.migrationBookStage,
+    await IOUtils.read(input.source),
+    input.token
+  );
+  // This is the actual native receipt after commit, never a predicted UID map.
+  print("BOOK-COMMITTED " + JSON.stringify(receipt));
+}
+
+add_task(
+  unixOnly(),
+  async function test_killedBookCommitReconcilesWithoutRegeneratingUIDs() {
+    const input = await bookInput();
+    const token = await input.journal.beginBookImport("original-book");
+    const { Subprocess } = ChromeUtils.importESModule(
+      "resource://gre/modules/Subprocess.sys.mjs"
+    );
+    const { TestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/TestUtils.sys.mjs"
+    );
+    const command =
+      `(${commitBookBeforeProcessTermination})(${JSON.stringify({
+        source: input.source,
+        stagingPath: input.stagingPath,
+        token,
+      })}).catch(error => { console.error(error); quit(2); });` +
+      'Services.tm.spinEventLoopUntil("TestMigrationBook:AwaitKill", () => false);';
+    const child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: [
+        "-g",
+        Services.dirsvc.get("GreD", Ci.nsIFile).path,
+        "-a",
+        Services.dirsvc.get("XCurProcD", Ci.nsIFile).path,
+        "-e",
+        command,
+      ],
+      stderr: "stdout",
+    });
+    let output = "";
+    let committed;
+    let readError;
+    const readCommit = (async () => {
+      try {
+        for (let chunk; (chunk = await child.stdout.readString()); ) {
+          output += chunk;
+          const complete = output.split("\n");
+          complete.pop(); // The last chunk can end in a partial line.
+          const line = complete.find(value =>
+            value.startsWith("BOOK-COMMITTED ")
+          );
+          if (line) {
+            committed = JSON.parse(line.slice("BOOK-COMMITTED ".length));
+            return;
+          }
+        }
+        throw new Error("Child exited before its native commit: " + output);
+      } catch (error) {
+        readError = error;
+      }
+    })();
+    try {
+      await TestUtils.waitForCondition(
+        () => committed || readError,
+        "Waiting for the actual native book commit before forced termination",
+        100,
+        300
+      );
+      if (readError) {
+        throw readError;
+      }
+      Assert.equal(input.journal.state.books[0].state, "importing");
+      Assert.equal(input.journal.state.books[0].receipt, null);
+      Assert.equal(child.exitCode, null, "The child still owns its open stage");
+      const { exitCode } = await child.kill(0);
+      Assert.equal(exitCode, -9, "Real SIGKILL, not orderly connection close");
+    } finally {
+      await child.kill(0);
+      await readCommit;
+    }
+    input.journal.close();
+    input.journal = await MigrationJournal.open(input.path, input.profilePath);
+    await assertOriginals(input);
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.equal(input.journal.state.stage, "validate");
+    Assert.deepEqual(
+      input.journal.state.books[0].receipt.cards,
+      committed.cards
+    );
+    Assert.deepEqual(
+      input.journal.state.books[0].receipt.lists,
+      committed.lists
+    );
+    const before = await IOUtils.read(input.path);
+    await resumeMorkBookImports(input.journal, input.lock);
+    Assert.deepEqual(await IOUtils.read(input.path), before);
     await assertOriginals(input);
   }
 );

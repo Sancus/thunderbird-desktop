@@ -1603,7 +1603,11 @@ export class IMAP_RFC3501_handler {
       }
       response += "* " + ids[i] + " FETCH (FLAGS (";
       response += message.flags.join(" ");
-      response += "))\0";
+      response += ")";
+      if (uid) {
+        response += " UID " + message.uid;
+      }
+      response += ")\0";
     }
     if (silent) {
       response = "";

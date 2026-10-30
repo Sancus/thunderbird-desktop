@@ -7,6 +7,7 @@
 #include "msgCore.h"  // for pre-compiled headers
 #include "nsMsgDBFolder.h"
 #include "nsMsgUtils.h"
+#include "nsWhitespaceTokenizer.h"
 #include "nsIFeedbackService.h"
 
 #include "nsImapStringBundle.h"
@@ -3167,6 +3168,15 @@ void nsImapProtocol::ProcessSelectedStateURL() {
           GetSupportedUserFlags(&userFlags);
           bool userDefinedSettable = userFlags & kImapMsgSupportUserFlag;
           bool stdJunkOk = GetServerStateParser().IsStdJunkNotJunkUseOk();
+#ifdef MOZ_PANORAMA
+          bool scoped = static_cast<nsImapUrl*>(m_runningUrl.get())
+                            ->CapturedFlagTargets()
+                            .isSome();
+          if (scoped) {
+            // Discard observations from an earlier transport attempt.
+            static_cast<nsImapUrl*>(m_runningUrl.get())->TakeKeywordResponses();
+          }
+#endif
 
           nsCString messageIdString;
           nsCString addFlags;
@@ -3182,14 +3192,26 @@ void nsImapProtocol::ProcessSelectedStateURL() {
                   addFlags = "$Junk";
                 else if (addFlags.EqualsIgnoreCase("nonjunk"))
                   addFlags = "$NotJunk";
-                else
+                else {
+#ifdef MOZ_PANORAMA
+                  if (scoped) m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+#endif
                   break;
-              } else
+                }
+              } else {
+#ifdef MOZ_PANORAMA
+                if (scoped) m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+#endif
                 break;
+              }
             }
             nsAutoCString storeString("+FLAGS (");
             storeString.Append(addFlags);
             storeString.Append(')');
+#ifdef MOZ_PANORAMA
+            mKeywordExpected = addFlags;
+            mKeywordRemoving = false;
+#endif
             Store(messageIdString, storeString.get(), true);
             if (NS_FAILED(m_mailboxUpdateResult)) break;
           }
@@ -3200,14 +3222,26 @@ void nsImapProtocol::ProcessSelectedStateURL() {
                   subtractFlags = "$Junk";
                 else if (subtractFlags.EqualsIgnoreCase("nonjunk"))
                   subtractFlags = "$NotJunk";
-                else
+                else {
+#ifdef MOZ_PANORAMA
+                  if (scoped) m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+#endif
                   break;
-              } else
+                }
+              } else {
+#ifdef MOZ_PANORAMA
+                if (scoped) m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+#endif
                 break;
+              }
             }
             nsAutoCString storeString("-FLAGS (");
             storeString.Append(subtractFlags);
             storeString.Append(')');
+#ifdef MOZ_PANORAMA
+            mKeywordExpected = subtractFlags;
+            mKeywordRemoving = true;
+#endif
             Store(messageIdString, storeString.get(), true);
           }
         } break;
@@ -5249,6 +5283,48 @@ void nsImapProtocol::NotifyMessageFlags(imapMessageFlagsType flags,
   }
 }
 
+bool nsImapProtocol::HandleKeywordResponse(imapMessageFlagsType flags,
+                                           const nsACString& keywords,
+                                           ImapUid uid, bool explicitUid) {
+#ifdef MOZ_PANORAMA
+  if (mCollectKeywordResponses) {
+    // A FLAGS-only response may have borrowed its UID from the sequence cache.
+    // It cannot confirm this command or select a physical row to update.
+    if (!explicitUid) return true;
+    if (!mKeywordChunkUids.Contains(uid)) return false;
+    auto* url = static_cast<nsImapUrl*>(m_runningUrl.get());
+    url->RecordKeywordResponse(uid, flags, keywords);
+    bool matches = true;
+    nsCWhitespaceTokenizer requested(mKeywordExpected);
+    while (requested.hasMoreTokens()) {
+      const auto& keyword = requested.nextToken();
+      if (keyword.IsEmpty()) continue;
+      bool present = false;
+      nsCWhitespaceTokenizer observed(keywords);
+      while (observed.hasMoreTokens()) {
+        if (keyword.Equals(observed.nextToken(),
+                           nsCaseInsensitiveCStringComparator)) {
+          present = true;
+          break;
+        }
+      }
+      if (keyword.EqualsIgnoreCase("$Forwarded"))
+        present = flags & kImapMsgForwardedFlag;
+      if (keyword.EqualsIgnoreCase("$MDNSent"))
+        present = flags & kImapMsgMDNSentFlag;
+      if (present == mKeywordRemoving) matches = false;
+    }
+    if (matches) {
+      mKeywordPendingUids.RemoveElement(uid);
+    } else if (!mKeywordPendingUids.Contains(uid)) {
+      mKeywordPendingUids.AppendElement(uid);
+    }
+    return true;
+  }
+#endif
+  return false;
+}
+
 void nsImapProtocol::NotifySearchHit(const char* hitLine) {
   if (!m_runningUrl || !m_notifySearchHit || NS_FAILED(m_mailboxUpdateResult)) {
     return;
@@ -5653,12 +5729,38 @@ void nsImapProtocol::Store(const nsCString& messageList,
                   commandTag,          // command tag
                   idString.get(), messageData);
 
+#ifdef MOZ_PANORAMA
+      bool scopedKeywords =
+          idsAreUid &&
+          m_imapAction == nsIImapUrl::nsImapMsgStoreCustomKeywords &&
+          static_cast<nsImapUrl*>(m_runningUrl.get())->CapturedFlagTargets();
+      mKeywordPendingUids.Clear();
+      if (scopedKeywords) {
+        // Use the real input slice, not a re-expanded gap-compressed wire
+        // range.
+        mKeywordPendingUids.AppendElements(
+            msgUids.Elements() + msgsHandled - msgsToHandle, msgsToHandle);
+      }
+      mKeywordChunkUids = mKeywordPendingUids.Clone();
+      mCollectKeywordResponses = scopedKeywords;
+#endif
       nsresult rv = SendData(protocolString);
       if (NS_SUCCEEDED(rv)) {
         m_flagChangeCount++;
         ParseIMAPandCheckForNewMail(protocolString);
-        if (GetServerStateParser().LastCommandSuccessful() && CheckNeeded())
-          Check();
+      }
+#ifdef MOZ_PANORAMA
+      mCollectKeywordResponses = false;
+      if (NS_SUCCEEDED(rv) && GetServerStateParser().LastCommandSuccessful() &&
+          scopedKeywords && !mKeywordPendingUids.IsEmpty()) {
+        rv = NS_ERROR_NOT_AVAILABLE;
+      }
+      mKeywordPendingUids.Clear();
+      mKeywordChunkUids.Clear();
+#endif
+      if (NS_SUCCEEDED(rv) && GetServerStateParser().LastCommandSuccessful() &&
+          CheckNeeded()) {
+        Check();
       }
       PR_Free(protocolString);
       if (NS_SUCCEEDED(rv)) rv = GetConnectionStatus();

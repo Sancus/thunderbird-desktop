@@ -199,6 +199,8 @@ class nsImapServerResponseParser : public nsImapGenericParser {
 
   bool fCurrentFolderReadOnly;
   bool fCurrentLineContainedFlagInfo;
+  bool fCurrentLineHasExplicitUid = false;
+  nsCString fCurrentResponseKeywords;
   bool fFetchingAllFlags;
   bool fWaitingForMoreClientInput;
   // Is the server a Netscape 3.x Messaging Server?

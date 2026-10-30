@@ -2669,6 +2669,26 @@ NS_IMETHODIMP nsImapService::StoreCustomKeywords(
     nsIMsgFolder* anImapFolder, nsIMsgWindow* aMsgWindow,
     const nsACString& flagsToAdd, const nsACString& flagsToSubtract,
     const nsACString& uids, nsIURI** aURL) {
+  return StoreCustomKeywordsInternal(anImapFolder, aMsgWindow, flagsToAdd,
+                                     flagsToSubtract, uids, false, aURL);
+}
+
+nsresult nsImapService::StoreCustomKeywordsForKeys(
+    nsIMsgFolder* folder, nsIMsgWindow* window, const nsACString& add,
+    const nsACString& subtract, const nsTArray<nsMsgKey>& keys, nsIURI** url) {
+  NS_ENSURE_ARG_POINTER(folder);
+  nsCOMPtr<nsIMsgDatabase> db;
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+  NS_ENSURE_STATE(db);
+  nsTArray<ImapUid> uids = MOZ_TRY(UidsFromMsgKeys(db, keys));
+  return StoreCustomKeywordsInternal(folder, window, add, subtract,
+                                     UidSetFromUids(uids), true, url);
+}
+
+nsresult nsImapService::StoreCustomKeywordsInternal(
+    nsIMsgFolder* anImapFolder, nsIMsgWindow* aMsgWindow,
+    const nsACString& flagsToAdd, const nsACString& flagsToSubtract,
+    const nsACString& uids, bool captureTargets, nsIURI** aURL) {
   NS_ENSURE_ARG_POINTER(anImapFolder);
 
   // Ensure bad tags from RSS feeds or legacy databases cannot crash the IMAP
@@ -2710,6 +2730,10 @@ NS_IMETHODIMP nsImapService::StoreCustomKeywords(
       if (NS_SUCCEEDED(rv)) {
 #ifdef MOZ_PANORAMA
         if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+          if (captureTargets) {
+            MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                        ->CaptureFlagTargets(anImapFolder, uids));
+          }
           nsCOMPtr<nsIMsgDatabase> database;
           MOZ_TRY(anImapFolder->GetMsgDatabase(getter_AddRefs(database)));
           NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);

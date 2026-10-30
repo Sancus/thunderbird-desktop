@@ -287,6 +287,10 @@ class nsImapProtocol : public nsIImapProtocol,
   void NotifyMessageFlags(imapMessageFlagsType flags,
                           const nsACString& keywords, ImapUid uid,
                           uint64_t highestModSeq);
+  // Returns true when a scoped keyword STORE consumes this FETCH response.
+  bool HandleKeywordResponse(imapMessageFlagsType flags,
+                             const nsACString& keywords, ImapUid uid,
+                             bool explicitUid);
   void NotifySearchHit(const char* hitLine);
 
   // Event handlers for the imap parser.
@@ -662,6 +666,14 @@ class nsImapProtocol : public nsIImapProtocol,
 
   // CondStore support - true if server supports it, and the user hasn't
   // disabled it.
+#ifdef MOZ_PANORAMA
+  // Worker-only, reset for each actual STORE chunk, never a cached flag lookup.
+  bool mCollectKeywordResponses = false;
+  nsTArray<ImapUid> mKeywordPendingUids;
+  nsTArray<ImapUid> mKeywordChunkUids;
+  nsCString mKeywordExpected;
+  bool mKeywordRemoving = false;
+#endif
   bool UseCondStore();
   // false if pref "mail.server.serverxxx.use_condstore" is false;
   bool m_useCondStore;

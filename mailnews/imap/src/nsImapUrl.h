@@ -52,6 +52,14 @@ class nsImapUrl : public nsIImapUrl,
     nsMsgKey key;
     ImapUid uid;
   };
+  struct KeywordResponse {
+    ImapUid uid;
+    imapMessageFlagsType flags;
+    nsCString keywords;
+  };
+  void RecordKeywordResponse(ImapUid uid, imapMessageFlagsType flags,
+                             const nsACString& keywords);
+  nsTArray<KeywordResponse> TakeKeywordResponses();
   struct FlagTargets {
     uint64_t folderId;
     uint32_t epoch;
@@ -173,6 +181,7 @@ class nsImapUrl : public nsIImapUrl,
 #ifdef MOZ_PANORAMA
   uint32_t m_expectedUidValidity = 0;
   mozilla::Maybe<FlagTargets> mFlagTargets;
+  nsTArray<KeywordResponse> mKeywordResponses MOZ_GUARDED_BY(mLock);
   mozilla::Maybe<CopyTargets> mCopyTargets;
   bool mFlagCompletionStarted = false;
   bool mFlagDeleteIsMove = false;

@@ -47,7 +47,18 @@ class nsImapService : public nsIImapService,
   NS_DECL_NSIMSGMESSAGEFETCHPARTSERVICE
   NS_DECL_NSICONTENTHANDLER
 
+  // Physical-key callers require fresh evidence and checked local settlement.
+  nsresult StoreCustomKeywordsForKeys(
+      nsIMsgFolder* folder, nsIMsgWindow* window, const nsACString& add,
+      const nsACString& subtract, const nsTArray<nsMsgKey>& keys, nsIURI** url);
+
  protected:
+  nsresult StoreCustomKeywordsInternal(nsIMsgFolder* folder,
+                                       nsIMsgWindow* window,
+                                       const nsACString& add,
+                                       const nsACString& subtract,
+                                       const nsACString& uids,
+                                       bool captureTargets, nsIURI** url);
   virtual ~nsImapService();
   char GetHierarchyDelimiter(nsIMsgFolder* aMsgFolder);
 

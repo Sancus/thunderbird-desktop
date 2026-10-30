@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "nsImapMailFolder.h"
+#include "nsImapService.h"
 
 #include <algorithm>
 
@@ -5548,6 +5549,58 @@ nsImapMailFolder::OnStartRunningUrl(nsIURI* aUrl) {
 // on the nsIImapService. So, when the operation completes, this gets called
 // to handle all the different operations, using a big switch statement.
 #ifdef MOZ_PANORAMA
+nsresult nsImapMailFolder::CompleteKeywordTargets(nsIImapUrl* url) {
+  auto* concrete = static_cast<nsImapUrl*>(url);
+  const auto& captured = concrete->CapturedFlagTargets();
+  if (!captured)
+    return NS_OK;  // The public raw UID API has no physical targets.
+  auto responses = concrete->TakeKeywordResponses();
+  uint64_t folderId;
+  MOZ_TRY(GetId(&folderId));
+  NS_ENSURE_TRUE(folderId == captured->folderId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(GetDatabase());
+  nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+  NS_ENSURE_STATE(db);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+  NS_ENSURE_STATE(info);
+  auto checkTarget = [&](const auto& target) -> nsresult {
+    NS_ENSURE_TRUE(mDatabase == db, NS_ERROR_NOT_AVAILABLE);
+    uint32_t epoch;
+    MOZ_TRY(info->GetImapUidValidity(&epoch));
+    NS_ENSURE_TRUE(epoch == captured->epoch, NS_ERROR_NOT_AVAILABLE);
+    nsMsgKey key = MOZ_TRY(MsgKeyFromUid(db, target.uid));
+    NS_ENSURE_TRUE(key == target.key, NS_ERROR_NOT_AVAILABLE);
+    ImapUid uid = MOZ_TRY(UidFromMsgKey(db, target.key));
+    NS_ENSURE_TRUE(uid == target.uid, NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  };
+  // Validate every captured identity before changing any physical message.
+  for (const auto& target : captured->messages) MOZ_TRY(checkTarget(target));
+  uint32_t supported;
+  MOZ_TRY(GetSupportedUserFlags(&supported));
+  for (auto& response : responses) {
+    const nsImapUrl::FlagTarget* target = nullptr;
+    for (const auto& candidate : captured->messages) {
+      if (candidate.uid == response.uid) {
+        target = &candidate;
+        break;
+      }
+    }
+    NS_ENSURE_TRUE(target, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(checkTarget(*target));
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(db->GetMsgHdrForKey(target->key, getter_AddRefs(header)));
+    NS_ENSURE_STATE(header);
+    MOZ_TRY(NotifyMessageFlagsFromHdr(header, target->key, response.flags));
+    // Observers may have changed the binding during the flag notifications.
+    MOZ_TRY(checkTarget(*target));
+    MOZ_TRY(
+        HandleCustomFlags(target->key, header, supported, response.keywords));
+  }
+  return db->Commit(nsMsgDBCommitType::kLargeCommit);
+}
+
 nsresult nsImapMailFolder::CompleteFlagTargets(nsIImapUrl* url, bool addFlags) {
   const auto& captured = static_cast<nsImapUrl*>(url)->CapturedFlagTargets();
   NS_ENSURE_TRUE(captured, NS_ERROR_NOT_AVAILABLE);
@@ -7277,6 +7330,13 @@ nsImapMailFolder::SetUrlState(nsIImapProtocol* aProtocol,
     if (imapUrl) {
       nsImapAction imapAction;
       imapUrl->GetImapAction(&imapAction);
+#ifdef MOZ_PANORAMA
+      if (!aSuspend && imapAction == nsIImapUrl::nsImapMsgStoreCustomKeywords &&
+          mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        nsresult settleRv = CompleteKeywordTargets(imapUrl);
+        if (NS_SUCCEEDED(statusCode)) statusCode = settleRv;
+      }
+#endif
       // The folder need not be a URL listener (for example, EmptyTrash can
       // supply its own listener). Settle counts before notifying that listener.
       if (!aSuspend && imapAction == nsIImapUrl::nsImapDeleteAllMsgs &&
@@ -9140,9 +9200,16 @@ nsImapMailFolder::StoreCustomKeywords(nsIMsgWindow* aMsgWindow,
   }
 
   MOZ_TRY(GetDatabase());
-  nsTArray<ImapUid> uids = MOZ_TRY(UidsFromMsgKeys(mDatabase, aKeysToStore));
   nsCOMPtr<nsIURI> retUri;
   nsCOMPtr<nsIImapService> imapService = mozilla::components::Imap::Service();
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return static_cast<nsImapService*>(imapService.get())
+        ->StoreCustomKeywordsForKeys(this, aMsgWindow, aFlagsToAdd,
+                                     aFlagsToSubtract, aKeysToStore, _retval);
+  }
+#endif
+  nsTArray<ImapUid> uids = MOZ_TRY(UidsFromMsgKeys(mDatabase, aKeysToStore));
   rv = imapService->StoreCustomKeywords(this, aMsgWindow, aFlagsToAdd,
                                         aFlagsToSubtract, UidSetFromUids(uids),
                                         getter_AddRefs(retUri));

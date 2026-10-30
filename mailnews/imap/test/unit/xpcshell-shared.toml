@@ -149,6 +149,8 @@ prefs = ["mail.panorama.enabled=true"]
 
 ["test_imapStoreMsgOffline.js"]
 
+["test_imapStoreResponses.js"]
+
 ["test_imapTruncatedOfflineBody.js"]
 
 ["test_imapUndo.js"]

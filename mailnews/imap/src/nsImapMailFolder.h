@@ -456,6 +456,7 @@ class nsImapMailFolder : public nsMsgDBFolder,
                          nsIMsgWindow* msgWindow, bool allowUndo);
 #ifdef MOZ_PANORAMA
   nsresult CompleteFlagTargets(nsIImapUrl* url, bool addFlags);
+  nsresult CompleteKeywordTargets(nsIImapUrl* url);
 #endif
   nsresult GetMoveCoalescer();
   nsresult PlaybackCoalescedOperations();

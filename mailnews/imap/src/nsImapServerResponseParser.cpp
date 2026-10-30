@@ -692,8 +692,12 @@ void nsImapServerResponseParser::PostProcessEndOfLine() {
     nsCString customFlags;
     fFlagState->GetCustomFlags(CurrentResponseUID(),
                                getter_Copies(customFlags));
-    fServerConnection.NotifyMessageFlags(fSavedFlagInfo, customFlags,
-                                         CurrentResponseUID(), fHighestModSeq);
+    if (!fServerConnection.HandleKeywordResponse(
+            fSavedFlagInfo, fCurrentResponseKeywords, CurrentResponseUID(),
+            fCurrentLineHasExplicitUid)) {
+      fServerConnection.NotifyMessageFlags(
+          fSavedFlagInfo, customFlags, CurrentResponseUID(), fHighestModSeq);
+    }
   }
 }
 
@@ -937,6 +941,8 @@ void nsImapServerResponseParser::msg_fetch() {
 
   // we have not seen a uid response or flags for this fetch, yet
   fCurrentResponseUID = 0;
+  fCurrentLineHasExplicitUid = false;
+  fCurrentResponseKeywords.Truncate();
   fCurrentLineContainedFlagInfo = false;
   fSizeOfMostRecentMessage = 0;
   // show any incremental progress, for instance, for header downloading
@@ -964,6 +970,12 @@ void nsImapServerResponseParser::msg_fetch() {
       AdvanceToNextToken();
       if (ContinueParse()) {
         fCurrentResponseUID = strtoul(fNextToken, nullptr, 10);
+        char* end;
+        uint64_t explicitUid = strtoull(fNextToken, &end, 10);
+        fCurrentLineHasExplicitUid =
+            *fNextToken >= '0' && *fNextToken <= '9' && explicitUid &&
+            explicitUid <= UINT32_MAX &&
+            (*end == '\0' || *end == ')' || !strcmp(end, "MODSEQ"));
         if (fCurrentResponseUID > fHighestRecordedUID)
           fHighestRecordedUID = fCurrentResponseUID;
         // size came before UID
@@ -1394,6 +1406,7 @@ void nsImapServerResponseParser::internal_date() {
 void nsImapServerResponseParser::flags() {
   imapMessageFlagsType messageFlags = kNoImapMsgFlag;
   fCustomFlags.Clear();
+  fCurrentResponseKeywords.Truncate();
 
   // clear the custom flags for this message
   // otherwise the old custom flags will stay around
@@ -1471,6 +1484,9 @@ void nsImapServerResponseParser::flags() {
       int32_t parenIndex = flag.FindChar(')');
       if (parenIndex > 0) flag.SetLength(parenIndex);
       messageFlags |= kImapMsgCustomKeywordFlag;
+      if (!fCurrentResponseKeywords.IsEmpty())
+        fCurrentResponseKeywords.Append(' ');
+      fCurrentResponseKeywords.Append(flag);
       if (CurrentResponseUID() != 0) {
         fFlagState->AddUidCustomFlagPair(CurrentResponseUID(), flag.get());
       } else {

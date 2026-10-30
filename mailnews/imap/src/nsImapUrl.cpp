@@ -954,6 +954,25 @@ nsresult nsImapUrl::CaptureCopyTargets(nsIMsgFolder* folder,
   return NS_OK;
 }
 
+void nsImapUrl::RecordKeywordResponse(ImapUid uid, imapMessageFlagsType flags,
+                                      const nsACString& keywords) {
+  MutexAutoLock lock(mLock);
+  for (auto& response : mKeywordResponses) {
+    if (response.uid == uid) {
+      response.flags = flags;
+      response.keywords = keywords;
+      return;
+    }
+  }
+  mKeywordResponses.AppendElement(
+      KeywordResponse{uid, flags, nsCString(keywords)});
+}
+
+nsTArray<nsImapUrl::KeywordResponse> nsImapUrl::TakeKeywordResponses() {
+  MutexAutoLock lock(mLock);
+  return std::move(mKeywordResponses);
+}
+
 nsresult nsImapUrl::CaptureFlagTargets(nsIMsgFolder* folder,
                                        const nsACString& uidSet) {
   MOZ_ASSERT(NS_IsMainThread());

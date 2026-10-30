@@ -770,6 +770,359 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
   });
 }
 
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_missingKeywordUidHasNoConfirmation() {
+    await checkKeywordCommandEvidence("missing");
+  });
+  add_task(async function test_cachedKeywordNeedsFreshResponse() {
+    await checkKeywordCommandEvidence("cached");
+  });
+  add_task(async function test_keywordFlagsWithoutUidAreNotEvidence() {
+    await checkKeywordCommandEvidence("flags-only");
+  });
+  add_task(async function test_unappliedKeywordIsNotConfirmed() {
+    await checkKeywordCommandEvidence("unapplied");
+  });
+  add_task(async function test_unappliedKeywordRemovalIsNotConfirmed() {
+    await checkKeywordCommandEvidence("remove-unapplied");
+  });
+  add_task(async function test_keywordCompletionRejectsBindingCollision() {
+    await checkKeywordCommandEvidence("collision");
+  });
+  add_task(async function test_keywordCompletionRejectsChangedEpoch() {
+    await checkKeywordChangedEpoch();
+  });
+  add_task(async function test_keywordCommandFailurePrecedesStorageFailure() {
+    await checkKeywordCommandEvidence("storage-no");
+  });
+  add_task(async function test_keywordStorageFailureReachesListener() {
+    await checkKeywordCommandEvidence("storage");
+  });
+}
+
+/**
+ * Checks fresh UID/keyword evidence, native settlement errors and retry.
+ *
+ * @param {string} mode - Missing response, cached state, FLAGS-only response,
+ *   unapplied addition/removal, changed identity or a native metadata error.
+ */
+async function checkKeywordCommandEvidence(mode) {
+  const folder = IMAPPump.inbox;
+  const db = folder.msgDatabase;
+  const header = db.getMsgHdrForMessageID(gSynthMessageForKeywordAdd.messageId);
+  const key = header.messageKey;
+  Assert.notEqual(key, 5002);
+  const keyword = `evidence-${mode}`;
+  const removing = mode == "remove-unapplied";
+  const other = db.getMsgHdrForMessageID(
+    gSynthMessageForKeywordRemove.messageId
+  );
+  const otherUid = other.getUint32Property("uidOnServer");
+  const otherKeywords = other.getStringProperty("keywords");
+  if (mode == "cached" || removing) {
+    await storeCustomKeywords(header, keyword, "");
+    Assert.ok(
+      header.getStringProperty("keywords").toLowerCase().includes(keyword)
+    );
+  }
+  const downloaded = new PromiseTestUtils.PromiseUrlListener();
+  folder.downloadAllForOffline(downloaded, null);
+  await downloaded.promise;
+  const token = header.storeToken;
+  Assert.ok(token);
+  const readBody = () => {
+    const stream = folder.getMsgInputStream(header);
+    try {
+      let bytes = "";
+      while (stream.available()) {
+        bytes += NetUtil.readInputStreamToString(stream, stream.available());
+      }
+      return bytes;
+    } finally {
+      stream.close();
+    }
+  };
+  const bytes = readBody();
+  Assert.ok(bytes.includes("Retain these exact keyword source bytes."));
+  const keys = db.listAllKeys();
+  const serverMessages = [...IMAPPump.mailbox._messages];
+  const texts = serverMessages.map(message => message.getText());
+  const otherFlags = serverMessages
+    .filter(message => message.uid != 5002)
+    .map(message => [...message.flags]);
+  const keywords = header.getStringProperty("keywords");
+  const connection = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  ).connectionForTests;
+  if (mode.startsWith("storage")) {
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER reject_keyword_settlement BEFORE UPDATE OF tags ON messages " +
+        `WHEN OLD.id=${key} BEGIN SELECT RAISE(ABORT,'keyword settlement'); END`
+    );
+  }
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalStore = proto.STORE;
+  const commands = [];
+  proto.STORE = function (args, isUid) {
+    commands.push([String(args[0]), args[1]]);
+    Assert.ok(isUid);
+    if (mode == "missing") {
+      IMAPPump.mailbox._messages = serverMessages.filter(
+        message => message.uid != 5002
+      );
+    } else if (mode == "cached") {
+      return "OK STORE completed";
+    } else if (mode == "unapplied" || removing) {
+      return `* 2 FETCH (FLAGS (${gServerMessageForKeywordAdd.flags.join(" ")}) UID 5002)\0OK STORE completed`;
+    }
+    const response = originalStore.call(this, args, isUid);
+    if (mode == "collision") {
+      other.setUint32Property("uidOnServer", 5002);
+    }
+    if (mode == "storage-no") {
+      return response.replace(
+        /OK STORE completed$/,
+        "NO partial STORE rejected"
+      );
+    }
+    return mode == "flags-only" ? response.replace(/ UID \d+/g, "") : response;
+  };
+  const deleted = [];
+  const notifier = {
+    msgsDeleted(items) {
+      deleted.push(...items.filter(item => item.folder == folder));
+    },
+  };
+  MailServices.mfn.addListener(
+    notifier,
+    Ci.nsIMsgFolderNotificationService.msgsDeleted
+  );
+  try {
+    const calls = { starts: 0, stops: 0 };
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStartRunningUrl() {
+        calls.starts++;
+      },
+      OnStopRunningUrl() {
+        calls.stops++;
+      },
+    });
+    const uri = folder.storeCustomKeywords(
+      null,
+      removing ? "" : keyword,
+      removing ? keyword : "",
+      [key]
+    );
+    uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(listener);
+    const result = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    let expectedResult = Cr.NS_ERROR_NOT_AVAILABLE;
+    if (mode == "storage-no") {
+      expectedResult = Cr.NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+    } else if (mode == "storage") {
+      expectedResult = Cr.NS_ERROR_STORAGE_CONSTRAINT;
+    } else if (mode == "collision") {
+      expectedResult = Cr.NS_ERROR_FILE_CORRUPTED;
+    }
+    Assert.equal(result, expectedResult, mode);
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    Assert.deepEqual(commands, [["5002", removing ? "-FLAGS" : "+FLAGS"]]);
+    // Check rejected identity changes before restoring only the injected fixture.
+    Assert.equal(header.getStringProperty("keywords"), keywords);
+    Assert.equal(other.getStringProperty("keywords"), otherKeywords);
+    if (mode == "collision") {
+      Assert.equal(other.getUint32Property("uidOnServer"), 5002);
+      other.setUint32Property("uidOnServer", otherUid);
+    }
+    Assert.deepEqual(db.listAllKeys(), keys);
+    Assert.equal(header.messageKey, key);
+    Assert.equal(header.getUint32Property("uidOnServer"), 5002);
+    Assert.equal(db.dBFolderInfo.imapUidValidity, 7801);
+    Assert.equal(header.storeToken, token);
+    Assert.equal(readBody(), bytes);
+    Assert.deepEqual(
+      serverMessages.map(message => message.getText()),
+      texts
+    );
+    Assert.deepEqual(
+      serverMessages
+        .filter(message => message.uid != 5002)
+        .map(message => [...message.flags]),
+      otherFlags
+    );
+    Assert.deepEqual(deleted, []);
+  } finally {
+    proto.STORE = originalStore;
+    IMAPPump.mailbox._messages = serverMessages;
+    if (mode == "collision") {
+      other.setUint32Property("uidOnServer", otherUid);
+    }
+    MailServices.mfn.removeListener(notifier);
+    if (mode.startsWith("storage")) {
+      connection.executeSimpleSQL("DROP TRIGGER reject_keyword_settlement");
+    }
+  }
+  await storeCustomKeywords(
+    header,
+    removing ? "" : keyword,
+    removing ? keyword : ""
+  );
+  Assert.equal(
+    gServerMessageForKeywordAdd.flags.some(
+      flag => flag.toLowerCase() == keyword
+    ),
+    !removing
+  );
+  Assert.equal(
+    header
+      .getStringProperty("keywords")
+      .toLowerCase()
+      .split(" ")
+      .includes(keyword),
+    !removing
+  );
+  Assert.equal(header.storeToken, token);
+  Assert.equal(readBody(), bytes);
+}
+
+/** Checks completion after native epoch retirement without reactivating it. */
+async function checkKeywordChangedEpoch() {
+  const name = "keyword-completion-epoch";
+  const remote = IMAPPump.daemon.createMailbox(name, {
+    subscribed: true,
+    uidvalidity: 8101,
+  });
+  const text = [
+    "From: epoch@example.invalid",
+    "To: user@example.invalid",
+    "Message-ID: <keyword-completion-epoch@example.invalid>",
+    "Subject: Retain physical source after epoch change",
+    "",
+    "Retain these independent epoch source bytes.",
+    "",
+  ].join("\r\n");
+  const message = new ImapMessage(
+    "data:text/plain;base64," + btoa(text),
+    9101,
+    []
+  );
+  remote.addMessage(message);
+  remote.uidnext = 9102;
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const folder = IMAPPump.incomingServer.rootFolder
+    .getChildNamed(name)
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  folder.updateFolderWithListener(null, selected);
+  await selected.promise;
+  const db = folder.msgDatabase;
+  const header = db.getMsgHdrForMessageID(
+    "keyword-completion-epoch@example.invalid"
+  );
+  Assert.ok(header);
+  const key = header.messageKey;
+  Assert.notEqual(key, 9101);
+  Assert.equal(header.getUint32Property("uidOnServer"), 9101);
+  Assert.equal(db.dBFolderInfo.imapUidValidity, 8101);
+  const downloaded = new PromiseTestUtils.PromiseUrlListener();
+  folder.downloadAllForOffline(downloaded, null);
+  await downloaded.promise;
+  const token = header.storeToken;
+  Assert.ok(token);
+  const readBody = () => {
+    const stream = folder.getMsgInputStream(header);
+    try {
+      let bytes = "";
+      while (stream.available()) {
+        bytes += NetUtil.readInputStreamToString(stream, stream.available());
+      }
+      return bytes;
+    } finally {
+      stream.close();
+    }
+  };
+  const bytes = readBody();
+  Assert.ok(bytes.includes("Retain these independent epoch source bytes."));
+  const keywords = header.getStringProperty("keywords");
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalStore = proto.STORE;
+  let stores = 0;
+  proto.STORE = function (args, isUid) {
+    Assert.equal(this._selectedMailbox, remote);
+    Assert.ok(isUid);
+    Assert.deepEqual(
+      [String(args[0]), args[1], args[2].map(flag => flag.toLowerCase())],
+      ["9101", "+FLAGS", ["epochguard"]]
+    );
+    stores++;
+    const response = originalStore.call(this, args, isUid);
+    // Epoch changes retire bindings. The test never resets or guesses one.
+    db.dBFolderInfo.imapUidValidity = 8102;
+    return response;
+  };
+  const deleted = [];
+  const notifier = {
+    msgsDeleted(items) {
+      deleted.push(...items.filter(item => item.folder == folder));
+    },
+  };
+  MailServices.mfn.addListener(
+    notifier,
+    Ci.nsIMsgFolderNotificationService.msgsDeleted
+  );
+  try {
+    const calls = { starts: 0, stops: 0 };
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStartRunningUrl() {
+        calls.starts++;
+      },
+      OnStopRunningUrl() {
+        calls.stops++;
+      },
+    });
+    const uri = folder.storeCustomKeywords(null, "epochguard", "", [key]);
+    uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(listener);
+    const result = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    Assert.equal(result, Cr.NS_ERROR_NOT_AVAILABLE);
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    Assert.equal(stores, 1);
+    Assert.equal(db.dBFolderInfo.imapUidValidity, 8102);
+    Assert.equal(header.getUint32Property("uidOnServer"), 0);
+    Assert.deepEqual(db.listAllKeys(), [key]);
+    Assert.equal(header.getStringProperty("keywords"), keywords);
+    Assert.equal(header.storeToken, token);
+    Assert.equal(readBody(), bytes);
+    Assert.deepEqual(message.flags, ["Epochguard"]);
+    Assert.equal(message.getText(), text);
+    Assert.equal(remote.uidvalidity, 8101);
+    Assert.deepEqual(
+      remote._messages.map(item => item.uid),
+      [9101]
+    );
+    Assert.deepEqual(deleted, []);
+    Assert.throws(
+      () => folder.storeCustomKeywords(null, "blocked", "", [key]),
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+      "A retired binding cannot be guessed for retry"
+    );
+    Assert.equal(stores, 1);
+  } finally {
+    proto.STORE = originalStore;
+    MailServices.mfn.removeListener(notifier);
+  }
+}
+
 add_task(function test_rejectsRetiredBindings() {
   const folder = IMAPPump.inbox;
   const header = folder.msgDatabase.getMsgHdrForMessageID(
@@ -828,5 +1181,12 @@ async function storeCustomKeywords(header, flagsToAdd, flagsToRemove) {
   uri.QueryInterface(Ci.nsIMsgMailNewsUrl);
   const listener = new PromiseTestUtils.PromiseUrlListener();
   uri.RegisterListener(listener);
-  await listener.promise;
+  try {
+    await listener.promise;
+  } catch (error) {
+    info(
+      `Keyword key=${header.messageKey} add=${flagsToAdd} remove=${flagsToRemove}; local=${header.getStringProperty("keywords")}`
+    );
+    throw error;
+  }
 }

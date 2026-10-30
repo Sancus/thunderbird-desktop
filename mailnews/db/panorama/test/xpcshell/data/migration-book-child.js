@@ -18,6 +18,25 @@ async function commitBook() {
   globalThis.migrationBookStage = SQLiteDirectory.createMigrationStage(
     new FileUtils.File(migrationBookChildInput.stagingPath)
   );
+  if (migrationBookChildInput.pauseDuringWrite) {
+    globalThis.migrationBookStage.createFunction("book_write_boundary", 0, {
+      onFunctionCall() {
+        if (!globalThis.migrationBookStage.transactionInProgress) {
+          throw new Error("Expected the native book import transaction");
+        }
+        print("BOOK-WRITING");
+        Services.tm.spinEventLoopUntil(
+          "TestMigrationBook:KillDuringWrite",
+          () => false
+        );
+        return 0;
+      },
+    });
+    globalThis.migrationBookStage.executeSimpleSQL(`
+      CREATE TEMP TRIGGER book_write_boundary BEFORE INSERT ON properties
+      BEGIN SELECT book_write_boundary(); END;
+    `);
+  }
   const receipt = SQLiteDirectory.importMorkSnapshot(
     globalThis.migrationBookStage,
     await IOUtils.read(migrationBookChildInput.source),
@@ -29,6 +48,11 @@ async function commitBook() {
 let failed = false;
 commitBook().catch(error => {
   console.error(error);
+  try {
+    globalThis.migrationBookStage?.close();
+  } catch (closeError) {
+    console.error("Could not close failed child book stage", closeError);
+  }
   failed = true;
 });
 // Success stays open until the parent's actual SIGKILL. On failure, leave the

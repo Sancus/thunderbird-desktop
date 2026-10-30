@@ -717,3 +717,95 @@ add_task(
     await assertOriginals(input);
   }
 );
+
+add_task(
+  unixOnly(),
+  async function test_killedUncommittedBookRollsBackThenRetries() {
+    const input = await bookInput();
+    const token = await input.journal.beginBookImport("original-book");
+    const { Subprocess } = ChromeUtils.importESModule(
+      "resource://gre/modules/Subprocess.sys.mjs"
+    );
+    const { TestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/TestUtils.sys.mjs"
+    );
+    const child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: bookCommitChildArguments({
+        source: input.source,
+        stagingPath: input.stagingPath,
+        token,
+        pauseDuringWrite: true,
+      }),
+      stderr: "stdout",
+    });
+    let output = "";
+    let writing = false;
+    let readError;
+    const readBoundary = (async () => {
+      try {
+        for (let chunk; (chunk = await child.stdout.readString()); ) {
+          output += chunk;
+          const complete = output.split("\n");
+          complete.pop();
+          if (complete.includes("BOOK-WRITING")) {
+            writing = true;
+            return;
+          }
+        }
+        await child.wait();
+        throw new Error("Child exited before its native SQL write: " + output);
+      } catch (error) {
+        readError = error;
+      }
+    })();
+    try {
+      await TestUtils.waitForCondition(
+        () => writing || readError,
+        "Waiting for the actual native transaction before forced termination",
+        100,
+        300
+      );
+      if (readError) {
+        throw readError;
+      }
+      Assert.ok(!output.includes("BOOK-COMMITTED"));
+      Assert.equal(child.exitCode, null);
+      Assert.equal(input.journal.state.books[0].state, "importing");
+      Assert.equal(input.journal.state.books[0].receipt, null);
+      Assert.equal((await child.kill(0)).exitCode, -9);
+    } finally {
+      await child.kill(0);
+      await readBoundary;
+    }
+    const db = openStage(input);
+    try {
+      Assert.equal(db.schemaVersion, 4);
+      Assert.ok(!db.tableExists("migration_source"));
+      Assert.ok(!db.tableExists("migration_records"));
+      Assert.ok(!db.tableExists("migration_properties"));
+      Assert.deepEqual(rows(db, "SELECT COUNT(*) FROM properties"), [["0"]]);
+      Assert.deepEqual(rows(db, "SELECT COUNT(*) FROM lists"), [["0"]]);
+      Assert.deepEqual(rows(db, "SELECT COUNT(*) FROM list_cards"), [["0"]]);
+    } finally {
+      db.close();
+    }
+    input.journal.close();
+    input.journal = await MigrationJournal.open(input.path, input.profilePath);
+    Assert.equal(input.journal.state.books[0].receipt, null);
+    await assertOriginals(input);
+    await resumeMorkBookImports(input.journal, input.lock);
+    const receipt = input.journal.state.books[0].receipt;
+    Assert.equal(input.journal.state.stage, "validate");
+    Assert.equal(receipt.storageSourceId, token);
+    Assert.deepEqual(
+      receipt.cards.map(([key]) => key),
+      [1]
+    );
+    Assert.deepEqual(
+      receipt.lists.map(([key]) => key),
+      [1]
+    );
+    await assertOriginals(input);
+  }
+);

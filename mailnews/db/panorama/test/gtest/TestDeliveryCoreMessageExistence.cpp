@@ -1254,5 +1254,94 @@ TEST_F(DeliveryCoreMessageExistence, CountStepErrorsPreserveOutputs) {
   EXPECT_EQ(1u, unread);
 }
 
+TEST_F(DeliveryCoreMessageExistence,
+       PublishedMembershipDoesNotReopenRetiredCore) {
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("membership@invalid"_ns, key));
+  RefPtr<MessageDatabase> retired = &mCore->MessageDB();
+  bool exists = false;
+  ASSERT_EQ(NS_OK, retired->MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_TRUE(Stop());
+  EXPECT_FALSE(Connection());
+  exists = false;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  EXPECT_FALSE(Connection());
+  ASSERT_NO_FATAL_FAILURE(Start());
+  exists = true;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, retired->MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreMessageExistence,
+       PublishedMembershipReadsCallerTransaction) {
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("membership@invalid"_ns, key));
+  auto& db = mCore->MessageDB();
+  RawHdr raw;
+  nsMsgKey staged;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolder, raw, &staged));
+  bool exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(staged, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(nsMsgKey_None, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(0, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+  nsAutoCString sql("DELETE FROM messages WHERE id = ");
+  sql.AppendInt(key);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(sql));
+  exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  rollback.release();
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.RemoveMessage(key));
+  ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreMessageExistence,
+       PublishedMembershipReadFailureKeepsOutputAndCallerTransaction) {
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("membership-fault@invalid"_ns, key));
+  ASSERT_NO_FATAL_FAILURE(InstallStepFault());
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+  bool exists = false;
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  EXPECT_EQ(1u, mFault->mCalls);
+  EXPECT_EQ(int64_t(key), mFault->mLastKey);
+  exists = true;
+  EXPECT_EQ(NS_ERROR_FAILURE, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  EXPECT_EQ(2u, mFault->mCalls);
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  rollback.release();
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP VIEW temp.messages"_ns));
+  ASSERT_EQ(NS_OK, Connection()->RemoveFunction("delivery_existence_fault"_ns));
+  exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+}
+
 }  // namespace
 }  // namespace mozilla::mailnews

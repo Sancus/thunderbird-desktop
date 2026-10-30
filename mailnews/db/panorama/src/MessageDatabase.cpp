@@ -3359,6 +3359,9 @@ nsresult MessageDatabase::SetMessageReferences(
 }
 
 nsresult MessageDatabase::MessageExists(nsMsgKey key, bool& exists) {
+  NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
+                     DatabaseCore::sInstance->mMessageDatabase.get() == this,
+                 NS_ERROR_NOT_AVAILABLE);
   // Removed headers stay cached for listeners; membership comes from storage.
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement("MessageExists"_ns,

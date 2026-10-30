@@ -496,8 +496,8 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult SetMessageProperty(nsMsgKey key, const nsACString& name,
                               uint32_t value);
 
-  // Stored membership, independent of cached notification headers.
-  // On storage error, exists is unchanged.
+  // Stored published membership; never opens a stopped/replaced core.
+  // Reads a caller transaction without owning it; errors leave exists unchanged.
   nsresult MessageExists(nsMsgKey key, bool& exists);
 
   // Lowest physical key with this exact Message-ID in an existing folder.

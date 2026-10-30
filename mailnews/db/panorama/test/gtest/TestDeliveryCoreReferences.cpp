@@ -26,6 +26,7 @@
 #include "mozIStorageService.h"
 #include "mozIStorageStatement.h"
 #include "mozIStorageValueArray.h"
+#include "mozStorageHelper.h"
 #include "nsAppDirectoryServiceDefs.h"
 #include "nsDirectoryServiceDefs.h"
 #include "nsDirectoryServiceUtils.h"
@@ -34,6 +35,7 @@
 #include "nsLocalFile.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgDatabase.h"
+#include "nsIMsgFolder.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
@@ -710,6 +712,127 @@ class DeliveryCoreReferences : public testing::Test {
     ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
     EXPECT_TRUE(marked.IsEmpty());
     EXPECT_EQ(2u, callbacks);
+  }
+
+  void CheckHierarchyUpdateSettlement(uint32_t operation, bool commitFailure) {
+    ASSERT_EQ(NS_OK, Start());
+    auto& folders = mCore->FolderDB();
+    nsAutoCString suffix;
+    suffix.AppendInt(operation);
+    suffix.Append(commitFailure ? " commit" : " write");
+    nsAutoCString leftName("Settlement left ");
+    leftName.Append(suffix);
+    nsAutoCString rightName("Settlement right ");
+    rightName.Append(suffix);
+    uint64_t left, right, first, second;
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, leftName, &left));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(mFolderId, rightName, &right));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Alpha"_ns, &first));
+    ASSERT_EQ(NS_OK, folders.InsertFolder(left, "Beta"_ns, &second));
+    ASSERT_EQ(NS_OK, folders.MoveFolderWithin(left, first, 0));
+    ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(left, {second, first}));
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(first, left, "Alpha"_ns));
+    nsCString originalPath;
+    ASSERT_EQ(NS_OK, folders.GetFolderPath(first, originalPath));
+    nsMsgKey key;
+    const nsTArray<nsCString> references{"first"_ns, "second"_ns, "first"_ns};
+    ASSERT_EQ(NS_OK, AddAt(first, "settlement-message"_ns, references, key));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(key, "Exact"_ns,
+                                                           "00042"_ns));
+    uint64_t watermark;
+    ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK, mConnection->CreateFunction("hierarchy_settle_fault"_ns, 1,
+                                                 witness));
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "hierarchy_parent(id INTEGER PRIMARY KEY); "
+                           "CREATE TEMP TABLE hierarchy_child(id INTEGER "
+                           "REFERENCES hierarchy_parent(id) DEFERRABLE "
+                           "INITIALLY DEFERRED)"_ns));
+    }
+    nsAutoCString sql(
+        "CREATE TEMP TRIGGER fail_hierarchy_settlement "
+        "AFTER UPDATE OF ");
+    sql.Append(operation == 0 ? "name" : operation == 1 ? "parent" : "ordinal");
+    sql.AppendLiteral(" ON main.folders WHEN OLD.id=");
+    sql.AppendInt(first);
+    sql.AppendLiteral(" BEGIN SELECT hierarchy_settle_fault(OLD.id); ");
+    sql.Append(commitFailure
+                   ? "INSERT INTO hierarchy_child VALUES(OLD.id); END"
+                   : "SELECT RAISE(FAIL,'hierarchy after update'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK,
+                mConnection->ExecuteSimpleSQL(
+                    "DROP TRIGGER IF EXISTS fail_hierarchy_settlement"_ns));
+      EXPECT_EQ(NS_OK,
+                mConnection->RemoveFunction("hierarchy_settle_fault"_ns));
+    });
+    auto write = [&]() -> nsresult {
+      if (operation == 0) {
+        return folders.UpdateName(first, "Cafe\xCC\x81"_ns);
+      }
+      return operation == 1 ? folders.MoveFolderTo(right, first)
+                            : folders.ResetChildOrder(left);
+    };
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, write());
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(int64_t(first), witness->mLastKey);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(first, left, "Alpha"_ns));
+    ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(second, left, "Beta"_ns));
+    ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(left, {second, first}));
+    ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(right, {}, false));
+    nsCString path;
+    ASSERT_EQ(NS_OK, folders.GetFolderPath(first, path));
+    EXPECT_EQ(originalPath, path);
+    uint64_t after;
+    ASSERT_EQ(NS_OK, SearchWatermark(after));
+    EXPECT_EQ(watermark, after);
+    uint64_t physicalFolder;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageFolderId(key, physicalFolder));
+    EXPECT_EQ(first, physicalFolder);
+    nsTArray<nsCString> refs;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, refs));
+    EXPECT_EQ(references, refs);
+    nsCString text;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_hierarchy_settlement"_ns));
+    ASSERT_EQ(NS_OK, write());
+    ASSERT_EQ(NS_OK, mConnection->RemoveFunction("hierarchy_settle_fault"_ns));
+    cleanup.release();
+    auto checkSettled = [&] {
+      ASSERT_NO_FATAL_FAILURE(
+          CheckFolderIdentity(first, operation == 1 ? right : left,
+                              operation == 0 ? "Caf\xC3\xA9"_ns : "Alpha"_ns));
+      if (operation == 1) {
+        ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(left, {second}));
+        ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(right, {first}, false));
+      } else if (operation == 2) {
+        ASSERT_NO_FATAL_FAILURE(
+            CheckSiblingOrder(left, {first, second}, false));
+      } else {
+        ASSERT_NO_FATAL_FAILURE(CheckSiblingOrder(left, {second, first}));
+      }
+    };
+    ASSERT_NO_FATAL_FAILURE(checkSettled());
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    ASSERT_NO_FATAL_FAILURE(checkSettled());
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageFolderId(key, physicalFolder));
+    EXPECT_EQ(first, physicalFolder);
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+    EXPECT_EQ("00042"_ns, text);
   }
 
   nsresult Start() {
@@ -11311,6 +11434,140 @@ TEST_F(DeliveryCoreReferences, FolderCacheMissAcrossTrimKeepsPhysicalIdentity) {
       EXPECT_EQ(ids[i], resolved);
     }
   }
+}
+
+TEST_F(DeliveryCoreReferences,
+       HierarchyUpdatesRollbackAfterWriteAndCommitFaults) {
+  for (uint32_t operation : {0u, 1u, 2u}) {
+    for (bool commitFailure : {false, true}) {
+      ASSERT_NO_FATAL_FAILURE(
+          CheckHierarchyUpdateSettlement(operation, commitFailure));
+      Stop();
+    }
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderHierarchyCyclesKeepOutputsAndPhysicalRows) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& initial = mCore->FolderDB();
+  uint64_t a, b, leaf, self, control, root;
+  ASSERT_EQ(NS_OK, initial.GetFolderRoot(mFolderId, &root));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(mFolderId, "Alpha"_ns, &a));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(a, "Beta"_ns, &b));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(b, "Leaf"_ns, &leaf));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(mFolderId, "Self"_ns, &self));
+  ASSERT_EQ(NS_OK, initial.InsertFolder(mFolderId, "Control"_ns, &control));
+  nsMsgKey key;
+  const nsTArray<nsCString> references{"one"_ns, "two"_ns, "one"_ns};
+  ASSERT_EQ(NS_OK, AddAt(b, "retained-cycle-row"_ns, references, key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageProperty(key, "Exact"_ns, "00042"_ns));
+  Stop();
+  {
+    // Corrupt only parent links in a genuine native database after shutdown.
+    // This is a storage-fault control, not a fabricated legacy artifact.
+    nsCOMPtr<mozIStorageConnection> writer;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(writer)));
+    nsCOMPtr<mozIStorageStatement> stmt;
+    auto close = MakeScopeExit([&] {
+      if (stmt) EXPECT_EQ(NS_OK, stmt->Finalize());
+      EXPECT_EQ(NS_OK, writer->Close());
+    });
+    ASSERT_EQ(NS_OK, writer->CreateStatement(
+                         "UPDATE folders SET parent=:parent WHERE id=:id"_ns,
+                         getter_AddRefs(stmt)));
+    for (const auto& change : {std::pair{a, b}, std::pair{self, self}}) {
+      mozStorageStatementScoper scope(stmt);
+      ASSERT_EQ(NS_OK, stmt->BindInt64ByName("id"_ns, change.first));
+      ASSERT_EQ(NS_OK, stmt->BindInt64ByName("parent"_ns, change.second));
+      ASSERT_EQ(NS_OK, stmt->Execute());
+    }
+  }
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  uint64_t watermark;
+  ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+  for (uint64_t id : {a, b, leaf, self}) {
+    uint64_t value = UINT64_MAX;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, folders.GetFolderRoot(id, &value));
+    EXPECT_EQ(UINT64_MAX, value);
+    nsCString path("unchanged path");
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, folders.GetFolderPath(id, path));
+    EXPECT_EQ("unchanged path"_ns, path);
+    nsTArray<uint64_t> ancestors{UINT64_MAX};
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              folders.GetFolderAncestors(id, ancestors));
+    EXPECT_EQ((nsTArray<uint64_t>{UINT64_MAX}), ancestors);
+    bool descendant = true;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              folders.GetFolderIsDescendantOf(id, mFolderId, &descendant));
+    EXPECT_TRUE(descendant);
+    bool ancestor = true;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              folders.GetFolderIsAncestorOf(mFolderId, id, &ancestor));
+    EXPECT_TRUE(ancestor);
+    nsCOMPtr<nsIMsgFolder> facade;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              folders.GetMsgFolderForFolder(id, getter_AddRefs(facade)));
+    EXPECT_FALSE(facade);
+  }
+  for (uint64_t id : {a, b, self}) {
+    nsTArray<uint64_t> descendants{UINT64_MAX};
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              folders.GetFolderDescendants(id, descendants));
+    EXPECT_EQ((nsTArray<uint64_t>{UINT64_MAX}), descendants);
+  }
+  // The leaf has no descendants even though its ancestry is corrupt.
+  nsTArray<uint64_t> descendants{UINT64_MAX};
+  ASSERT_EQ(NS_OK, folders.GetFolderDescendants(leaf, descendants));
+  EXPECT_TRUE(descendants.IsEmpty());
+  uint64_t value = 0;
+  ASSERT_EQ(NS_OK, folders.GetFolderRoot(control, &value));
+  EXPECT_EQ(root, value);
+  nsCString path;
+  ASSERT_EQ(NS_OK, folders.GetFolderPath(control, path));
+  EXPECT_EQ("delivery-references/Inbox/Control"_ns, path);
+  ASSERT_EQ(NS_OK, folders.GetFolderDescendants(mFolderId, descendants));
+  EXPECT_EQ((nsTArray<uint64_t>{control}), descendants);
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, folders.MoveFolderTo(control, leaf));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(a, b, "Alpha"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(b, a, "Beta"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(leaf, b, "Leaf"_ns));
+  ASSERT_NO_FATAL_FAILURE(CheckFolderIdentity(self, self, "Self"_ns));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFolderId(key, value));
+  EXPECT_EQ(b, value);
+  nsCString text;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, refs));
+  EXPECT_EQ(references, refs);
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    if (active) EXPECT_EQ(NS_OK, mConnection->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(key, "caller"_ns,
+                                                         "pending"_ns));
+  nsTArray<uint64_t> ancestors{UINT64_MAX};
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, folders.GetFolderAncestors(b, ancestors));
+  EXPECT_EQ((nsTArray<uint64_t>{UINT64_MAX}), ancestors);
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "caller"_ns, text));
+  EXPECT_EQ("pending"_ns, text);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  uint64_t after;
+  ASSERT_EQ(NS_OK, SearchWatermark(after));
+  EXPECT_EQ(watermark, after);
 }
 
 }  // namespace mozilla::mailnews

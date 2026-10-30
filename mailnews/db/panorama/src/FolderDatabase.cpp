@@ -36,6 +36,23 @@ namespace mozilla::mailnews {
 
 extern LazyLogModule gPanoramaLog;  // Defined by DatabaseCore.
 
+namespace {
+nsresult RollbackFolderUpdate(mozIStorageConnection* connection,
+                              nsresult original) {
+  bool active;
+  nsresult cleanup = connection->GetTransactionInProgress(&active);
+  if (NS_SUCCEEDED(cleanup) && active) {
+    cleanup = connection->RollbackTransaction();
+  }
+  if (NS_FAILED(cleanup)) {
+    MOZ_LOG(gPanoramaLog, LogLevel::Error,
+            ("Folder update rollback failed: 0x%08x",
+             static_cast<uint32_t>(cleanup)));
+  }
+  return original;
+}
+}  // namespace
+
 NS_IMPL_ISUPPORTS(FolderDatabase, nsIFolderDatabase)
 
 /**
@@ -72,6 +89,8 @@ NS_IMETHODIMP FolderDatabase::GetMsgFolderForFolder(uint64_t folderId,
                                                     nsIMsgFolder** msgFolder) {
   NS_ENSURE_ARG(folderId);  // Folder 0 disallowed.
   NS_ENSURE_ARG_POINTER(msgFolder);
+  // Validate the stored ancestry before entering the recursive facade lookup.
+  (void)MOZ_TRY(GetFolderRoot(folderId));
   nsresult rv;
 
   nsCString name = MOZ_TRY(GetFolderName(folderId));
@@ -419,17 +438,27 @@ nsresult FolderDatabase::SaveOrdinals(nsTArray<uint64_t> const& folderIds) {
 NS_IMETHODIMP
 FolderDatabase::ResetChildOrder(uint64_t parentId) {
   MOZ_TRY(RequireCommittedHierarchyMutation());
-  nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "ResetOrdinals"_ns,
-      "UPDATE folders SET ordinal = NULL WHERE parent = :parent"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
-  mozStorageStatementScoper scoper(stmt);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = DatabaseCore::GetStatement(
+          "ResetOrdinals"_ns,
+          "UPDATE folders SET ordinal = NULL WHERE parent = :parent"_ns,
+          getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
 
-  MOZ_TRY(stmt->BindInt64ByName("parent"_ns, parentId));
-  rv = stmt->Execute();
-  NS_ENSURE_SUCCESS(rv, rv);
+      MOZ_TRY(stmt->BindInt64ByName("parent"_ns, parentId));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackFolderUpdate(connection, rv);
+  }
 
   // Update cache.
   for (auto it = mFolderCache.iter(); !it.done(); it.next()) {
@@ -477,17 +506,27 @@ FolderDatabase::MoveFolderTo(uint64_t newParentId, uint64_t childId) {
     return NS_ERROR_UNEXPECTED;
   }
 
-  nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "Reparent"_ns,
-      "UPDATE folders SET parent = :parent, ordinal = NULL WHERE id = :id"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
-  mozStorageStatementScoper scoper(stmt);
-  MOZ_TRY(stmt->BindInt64ByName("parent"_ns, newParentId));
-  MOZ_TRY(stmt->BindInt64ByName("id"_ns, childId));
-  rv = stmt->Execute();
-  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = DatabaseCore::GetStatement(
+          "Reparent"_ns,
+          "UPDATE folders SET parent = :parent, ordinal = NULL WHERE id = :id"_ns,
+          getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("parent"_ns, newParentId));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, childId));
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackFolderUpdate(connection, rv);
+  }
 
   // Update cache.
   auto p = mFolderCache.lookup(childId);
@@ -505,17 +544,27 @@ FolderDatabase::UpdateName(uint64_t folderId, const nsACString& newName) {
   MOZ_TRY(RequireCommittedHierarchyMutation());
   nsCString nfcNewName = MOZ_TRY(DatabaseUtils::Normalize(newName));
 
-  nsCOMPtr<mozIStorageStatement> stmt;
-  nsresult rv = DatabaseCore::GetStatement(
-      "UpdateName"_ns, "UPDATE folders SET name = :name WHERE id = :id"_ns,
-      getter_AddRefs(stmt));
-  NS_ENSURE_SUCCESS(rv, rv);
-  mozStorageStatementScoper scoper(stmt);
-  MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, nfcNewName));
-  MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      nsresult statementRv = DatabaseCore::GetStatement(
+          "UpdateName"_ns, "UPDATE folders SET name = :name WHERE id = :id"_ns,
+          getter_AddRefs(stmt));
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindUTF8StringByName("name"_ns, nfcNewName));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
 
-  rv = stmt->Execute();
-  NS_ENSURE_SUCCESS(rv, rv);
+      statementRv = stmt->Execute();
+      NS_ENSURE_SUCCESS(statementRv, statementRv);
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return RollbackFolderUpdate(connection, rv);
+  }
 
   // Update cache.
   auto p = mFolderCache.lookup(folderId);
@@ -866,7 +915,14 @@ Result<nsCString, nsresult> FolderDatabase::GetFolderPath(uint64_t folderId) {
   MOZ_ASSERT(folderId);
 
   nsTArray<nsCString> encodedParts;
+  nsTArray<uint64_t> visited;
   while (true) {
+    if (visited.Contains(folderId)) {
+      return Err(NS_ERROR_FILE_CORRUPTED);
+    }
+    if (!visited.AppendElement(folderId, fallible)) {
+      return Err(NS_ERROR_OUT_OF_MEMORY);
+    }
     CachedFolder* cached = MOZ_TRY(EnsureFolderCached(folderId));
     nsCString encodedName =
         PercentEncode(cached->name, [](char c) -> bool { return c == '/'; });
@@ -984,7 +1040,14 @@ Result<uint64_t, nsresult> FolderDatabase::GetFolderChildNamed(
 
 Result<uint64_t, nsresult> FolderDatabase::GetFolderRoot(uint64_t folderId) {
   MOZ_ASSERT(folderId);
+  nsTArray<uint64_t> visited;
   while (true) {
+    if (visited.Contains(folderId)) {
+      return Err(NS_ERROR_FILE_CORRUPTED);
+    }
+    if (!visited.AppendElement(folderId, fallible)) {
+      return Err(NS_ERROR_OUT_OF_MEMORY);
+    }
     uint64_t parent = MOZ_TRY(GetFolderParent(folderId));
     if (parent == 0) {
       break;
@@ -998,7 +1061,10 @@ nsresult FolderDatabase::InternalAppendDescendants(
     uint64_t folderId, nsTArray<uint64_t>& descendants) {
   nsTArray<uint64_t> children = MOZ_TRY(GetFolderChildren(folderId));
   for (uint64_t child : children) {
-    descendants.AppendElement(child);
+    NS_ENSURE_FALSE(descendants.Contains(child), NS_ERROR_FILE_CORRUPTED);
+    if (!descendants.AppendElement(child, fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
     MOZ_TRY(InternalAppendDescendants(child, descendants));
   }
   return NS_OK;
@@ -1018,8 +1084,12 @@ Result<nsTArray<uint64_t>, nsresult> FolderDatabase::GetFolderAncestors(
   // Don't include self.
   folderId = MOZ_TRY(GetFolderParent(folderId));
   while (folderId) {
-    MOZ_ASSERT(!ancestors.Contains(folderId));  // Cycle detected!
-    ancestors.AppendElement(folderId);
+    if (ancestors.Contains(folderId)) {
+      return Err(NS_ERROR_FILE_CORRUPTED);
+    }
+    if (!ancestors.AppendElement(folderId, fallible)) {
+      return Err(NS_ERROR_OUT_OF_MEMORY);
+    }
     folderId = MOZ_TRY(GetFolderParent(folderId));
   }
   return ancestors;

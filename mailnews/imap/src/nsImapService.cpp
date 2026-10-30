@@ -2708,6 +2708,23 @@ NS_IMETHODIMP nsImapService::StoreCustomKeywords(
       urlSpec.Append(safeFlagsToSubtract);
       rv = mailNewsUrl->SetSpecInternal(urlSpec);
       if (NS_SUCCEEDED(rv)) {
+#ifdef MOZ_PANORAMA
+        if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+          nsCOMPtr<nsIMsgDatabase> database;
+          MOZ_TRY(anImapFolder->GetMsgDatabase(getter_AddRefs(database)));
+          NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+          nsCOMPtr<nsIDBFolderInfo> info;
+          MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(info)));
+          NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
+          uint32_t epoch;
+          MOZ_TRY(info->GetImapUidValidity(&epoch));
+          // A reconnect must not apply these UIDs to a replacement epoch.
+          if (epoch) {
+            MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                        ->SetExpectedUidValidity(epoch));
+          }
+        }
+#endif
         rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, aURL);
       }
     }

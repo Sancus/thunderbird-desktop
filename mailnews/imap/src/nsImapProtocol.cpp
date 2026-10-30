@@ -4357,7 +4357,19 @@ void nsImapProtocol::AbortMessageDownLoad() {
 }
 
 void nsImapProtocol::ProcessMailboxUpdate(bool handlePossibleUndo) {
-  if (DeathSignalReceived()) return;
+  if (DeathSignalReceived() || NS_FAILED(m_mailboxUpdateResult)) return;
+#ifdef MOZ_PANORAMA
+  if (m_runningUrl) {
+    uint32_t expectedEpoch =
+        static_cast<nsImapUrl*>(m_runningUrl.get())->ExpectedUidValidity();
+    if (expectedEpoch &&
+        expectedEpoch != GetServerStateParser().FolderUIDValidity()) {
+      // SELECT can request this update before its caller checks the epoch.
+      m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+      return;
+    }
+  }
+#endif
 
   // Update quota information
   char* boxName = nullptr;

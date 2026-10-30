@@ -11,6 +11,9 @@ var { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 
+var { TestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/TestUtils.sys.mjs"
+);
 var { NetUtil } = ChromeUtils.importESModule(
   "resource://gre/modules/NetUtil.sys.mjs"
 );
@@ -600,6 +603,172 @@ add_task(async function test_sparseKeywordChunksStopAtFirstFailureAndRetry() {
     proto.STORE = originalStore;
   }
 });
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_rejectsReusedUidAfterReconnect() {
+    const folder = IMAPPump.inbox;
+    const header = folder.msgDatabase.getMsgHdrForMessageID(
+      gSynthMessageForKeywordAdd.messageId
+    );
+    const key = header.messageKey;
+    Assert.notEqual(key, 5002);
+    Assert.equal(header.getUint32Property("uidOnServer"), 5002);
+    Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
+    const token = header.storeToken;
+    const readBody = () => {
+      const stream = folder.getMsgInputStream(header);
+      try {
+        let text = "";
+        while (stream.available()) {
+          text += NetUtil.readInputStreamToString(stream, stream.available());
+        }
+        return text;
+      } finally {
+        stream.close();
+      }
+    };
+    const bytes = readBody();
+    Assert.ok(bytes.includes("Retain these exact keyword source bytes."));
+    const keys = folder.msgDatabase.listAllKeys();
+    IMAPPump.incomingServer.closeCachedConnections();
+    await TestUtils.waitForCondition(
+      () => !IMAPPump.daemon.getConnections().length
+    );
+    const replacementText = [
+      "From: replacement@example.invalid",
+      "To: user@example.invalid",
+      "Message-ID: <replacement-epoch-7802@example.invalid>",
+      "Subject: A different physical server message",
+      "",
+      "The reused UID must not receive the old epoch's keyword.",
+      "",
+    ].join("\r\n");
+    const replacement = new ImapMessage(
+      "data:text/plain;base64," + btoa(replacementText),
+      5002,
+      []
+    );
+    const mailbox = IMAPPump.mailbox;
+    const index = mailbox._messages.indexOf(gServerMessageForKeywordAdd);
+    Assert.greaterOrEqual(index, 0);
+    mailbox._messages.splice(index, 1, replacement);
+    mailbox.uidvalidity = 7802;
+    const proto = IMAP_RFC3501_handler.prototype;
+    const originalSelect = proto.SELECT;
+    const originalStore = proto.STORE;
+    const selectedEpochs = [];
+    const stores = [];
+    proto.SELECT = function (args) {
+      const result = originalSelect.call(this, args);
+      if (args[0] == "INBOX") {
+        selectedEpochs.push(this._selectedMailbox.uidvalidity);
+        Assert.ok(result.includes("[UIDVALIDITY 7802]"));
+      }
+      return result;
+    };
+    proto.STORE = function (args, uid) {
+      stores.push(String(args[0]));
+      return originalStore.call(this, args, uid);
+    };
+    try {
+      const calls = { starts: 0, stops: 0 };
+      const completion = new PromiseTestUtils.PromiseUrlListener({
+        OnStartRunningUrl() {
+          calls.starts++;
+        },
+        OnStopRunningUrl() {
+          calls.stops++;
+        },
+      });
+      const uri = folder.storeCustomKeywords(null, "wrong-epoch", "", [key]);
+      Assert.equal(uri.QueryInterface(Ci.nsIImapUrl).listOfMessageIds, "5002");
+      uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(completion);
+      const result = await completion.promise.then(
+        () => Cr.NS_OK,
+        error => Number(error.message)
+      );
+      Assert.deepEqual(calls, { starts: 1, stops: 1 });
+      Assert.deepEqual(selectedEpochs, [7802]);
+      Assert.deepEqual(stores, []);
+      Assert.deepEqual(replacement.flags, []);
+      Assert.equal(replacement.getText(), replacementText);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), keys);
+      Assert.equal(header.messageKey, key);
+      Assert.equal(header.storeToken, token);
+      Assert.equal(readBody(), bytes);
+      Assert.equal(header.getUint32Property("uidOnServer"), 5002);
+      Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
+      Assert.equal(result, Cr.NS_ERROR_NOT_AVAILABLE);
+    } finally {
+      proto.SELECT = originalSelect;
+      proto.STORE = originalStore;
+      IMAPPump.incomingServer.closeCachedConnections();
+      await TestUtils.waitForCondition(
+        () => !IMAPPump.daemon.getConnections().length
+      );
+      mailbox._messages.splice(index, 1, gServerMessageForKeywordAdd);
+      mailbox.uidvalidity = 7801;
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_rawUidKeywordsWithoutStoredEpoch() {
+    const name = "raw-keywords";
+    IMAPPump.daemon.createMailbox(name, {
+      subscribed: true,
+      uidvalidity: 7901,
+    });
+    const remote = IMAPPump.daemon.getMailbox(name);
+    const text = [
+      "From: raw@example.invalid",
+      "To: user@example.invalid",
+      "Message-ID: <raw-keyword-uid-6101@example.invalid>",
+      "Subject: Raw protocol UID",
+      "",
+      "Keep these independent raw UID bytes.",
+      "",
+    ].join("\r\n");
+    const message = new ImapMessage(
+      "data:text/plain;base64," + btoa(text),
+      6101,
+      []
+    );
+    remote.addMessage(message);
+    remote.uidnext = 6102;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(
+      IMAPPump.incomingServer.rootFolder,
+      discovered,
+      null
+    );
+    await discovered.promise;
+    const folder = IMAPPump.incomingServer.rootFolder.getChildNamed(name);
+    Assert.ok(folder.id);
+    Assert.equal(
+      folder.msgStore.storeType,
+      IMAPPump.incomingServer.msgStore.storeType
+    );
+    Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 0);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+    const listener = new PromiseTestUtils.PromiseUrlListener();
+    const uri = MailServices.imap.storeCustomKeywords(
+      folder,
+      null,
+      "rawcold",
+      "",
+      "6101"
+    );
+    Assert.equal(uri.QueryInterface(Ci.nsIImapUrl).listOfMessageIds, "6101");
+    uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(listener);
+    await listener.promise;
+    Assert.deepEqual(message.flags, ["Rawcold"]);
+    Assert.equal(message.uid, 6101);
+    Assert.equal(message.getText(), text);
+    Assert.equal(remote.uidvalidity, 7901);
+    Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7901);
+  });
+}
 
 add_task(function test_rejectsRetiredBindings() {
   const folder = IMAPPump.inbox;

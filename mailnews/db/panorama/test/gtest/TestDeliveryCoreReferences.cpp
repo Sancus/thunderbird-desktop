@@ -11265,4 +11265,52 @@ TEST_F(DeliveryCoreReferences, MarkAllReadFailuresDoNotPublishOrClearNewLists) {
   }
 }
 
+TEST_F(DeliveryCoreReferences, FolderCacheMissAcrossTrimKeepsPhysicalIdentity) {
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<uint64_t> ids;
+  nsTArray<nsCString> names;
+  constexpr uint32_t boundary = 512;
+  for (uint32_t i = 0; i <= boundary; ++i) {
+    nsAutoCString name("Folder % / ");
+    name.AppendInt(i);
+    name.AppendLiteral(" \xC3\xA9");
+    uint64_t id;
+    ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, name, &id));
+    ids.AppendElement(id);
+    names.AppendElement(name);
+  }
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& folders = mCore->FolderDB();
+  // No hierarchy read has warmed the new core. Warm exactly 512 names, then
+  // load the next physical row through the real trim-and-insert boundary.
+  for (uint32_t i = 0; i < boundary; ++i) {
+    nsCString name;
+    ASSERT_EQ(NS_OK, folders.GetFolderName(ids[i], name));
+    EXPECT_EQ(names[i], name);
+  }
+  nsCString name;
+  ASSERT_EQ(NS_OK, folders.GetFolderName(ids.LastElement(), name));
+  EXPECT_EQ(names.LastElement(), name);
+  // Reloading all rows also reaches the arbitrarily evicted entries. Names,
+  // parent identity, ordinal absence and reversible paths must remain exact.
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    for (uint32_t i = 0; i <= boundary; ++i) {
+      ASSERT_EQ(NS_OK, folders.GetFolderName(ids[i], name));
+      EXPECT_EQ(names[i], name);
+      auto parent = folders.GetFolderParent(ids[i]);
+      ASSERT_TRUE(parent.isOk());
+      EXPECT_EQ(mFolderId, parent.unwrap());
+      auto ordinal = folders.GetFolderOrdinal(ids[i]);
+      ASSERT_TRUE(ordinal.isOk());
+      EXPECT_TRUE(ordinal.unwrap().isNothing());
+      nsCString path;
+      ASSERT_EQ(NS_OK, folders.GetFolderPath(ids[i], path));
+      uint64_t resolved = 0;
+      ASSERT_EQ(NS_OK, folders.GetFolderByPath(path, &resolved));
+      EXPECT_EQ(ids[i], resolved);
+    }
+  }
+}
+
 }  // namespace mozilla::mailnews

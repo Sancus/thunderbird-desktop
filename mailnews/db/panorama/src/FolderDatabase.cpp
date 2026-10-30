@@ -288,7 +288,7 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
   if (!names.SetCapacity(childNames.Length(), fallible)) {
     return NS_ERROR_OUT_OF_MEMORY;
   }
-  for (const auto &name : childNames) {
+  for (const auto& name : childNames) {
     names.AppendElement(MOZ_TRY(DatabaseUtils::Normalize(name)));
   }
 
@@ -308,7 +308,7 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
   }
 
   // Step Two: create any folders which are in `childNames`, but not in DB.
-  for (auto const &childName : names) {
+  for (auto const& childName : names) {
     uint64_t childId = MOZ_TRY(GetFolderChildNamed(parentId, childName));
     if (childId == 0) {
       // It's not in the DB!
@@ -1064,7 +1064,8 @@ FolderDatabase::EnsureFolderCached(uint64_t folderId) {
     if (NS_FAILED(rv)) {
       return Err(rv);
     }
-    if (!mFolderCache.add(p, folderId, cached)) {
+    // Trimming can invalidate the insertion slot captured by lookupForAdd.
+    if (!mFolderCache.relookupOrAdd(p, folderId, cached)) {
       return Err(NS_ERROR_FAILURE);
     }
   }

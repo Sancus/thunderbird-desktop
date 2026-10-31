@@ -842,3 +842,111 @@ add_task(
     await assertCurrentConversation(rebuilt, control, [control]);
   }
 );
+
+add_task(async function test_inboxSentArchiveRolesKeepCurrentMovedSelection() {
+  const inbox = conversationRoot
+    .createLocalSubfolder("conversation-roles-inbox")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const sent = conversationRoot
+    .createLocalSubfolder("conversation-roles-sent")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const archive = conversationRoot
+    .createLocalSubfolder("conversation-roles-archive")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  for (const [folder, flag] of [
+    [inbox, Ci.nsMsgFolderFlags.Inbox],
+    [sent, Ci.nsMsgFolderFlags.SentMail],
+    [archive, Ci.nsMsgFolderFlags.Archive],
+  ]) {
+    folder.setFlag(flag);
+    Assert.equal(folder.flags & flag, flag);
+  }
+  const rootId = "roles-root@conversation.invalid";
+  const replyId = "roles-reply@conversation.invalid";
+  const root = addConversationMail(inbox, rootId, []);
+  const reply = addConversationMail(sent, replyId, [rootId]);
+  const tail = addConversationMail(archive, "roles-tail@conversation.invalid", [
+    rootId,
+    replyId,
+  ]);
+  const control = addConversationMail(
+    sent,
+    "roles-unrelated@conversation.invalid",
+    []
+  );
+  Assert.equal(root.folder.id, inbox.id);
+  Assert.equal(reply.folder.id, sent.id);
+  Assert.equal(tail.folder.id, archive.id);
+  const file = do_get_profile().clone();
+  file.append("conversation-folder-roles.sqlite");
+  const service = await MailSearchService.open(
+    file,
+    database.sourceId,
+    messageDB
+  );
+  registerCleanupFunction(() => service.close());
+  Assert.equal(await service.getText(String(reply.messageKey)), null);
+  for (const selected of [root, reply, tail]) {
+    await assertCurrentConversation(service, selected, [root, reply, tail]);
+  }
+  const token = conversationSelection(service, reply);
+  const before = { key: reply.messageKey, folderURI: sent.URI };
+  const transfers = [];
+  const notification = {
+    msgsMoveCopyCompleted(isMove, sources, target, messages) {
+      if (target.URI == archive.URI) {
+        transfers.push({
+          isMove,
+          sources: sources.map(header => ({
+            key: header.messageKey,
+            folderURI: header.folder.URI,
+          })),
+          keys: messages.map(header => header.messageKey),
+        });
+      }
+    },
+  };
+  const copyListener = new PromiseTestUtils.PromiseCopyListener();
+  MailServices.mfn.addListener(
+    notification,
+    MailServices.mfn.msgsMoveCopyCompleted
+  );
+  try {
+    MailServices.copy.copyMessages(
+      sent,
+      [reply],
+      archive,
+      true,
+      copyListener,
+      null,
+      false
+    );
+    await copyListener.promise;
+  } finally {
+    MailServices.mfn.removeListener(notification);
+  }
+  Assert.equal(
+    transfers.length,
+    1,
+    "One completed native Sent-to-Archive move"
+  );
+  Assert.equal(transfers[0].isMove, true);
+  Assert.deepEqual(transfers[0].sources, [before]);
+  Assert.equal(transfers[0].keys.length, 1);
+  const moved = messageDB.getMessage(transfers[0].keys[0]);
+  Assert.equal(moved.folder.id, archive.id);
+  Assert.equal(
+    moved.folder.flags & Ci.nsMsgFolderFlags.Archive,
+    Ci.nsMsgFolderFlags.Archive
+  );
+  Assert.equal(moved.messageId, replyId);
+  Assert.ok(moved.messageKey != before.key || moved.folder.id != sent.id);
+  Assert.equal(
+    (await service.getConversation(token)).status,
+    moved.messageKey == before.key ? "stale" : "deleted"
+  );
+  for (const selected of [root, moved, tail]) {
+    await assertCurrentConversation(service, selected, [root, moved, tail]);
+  }
+  await assertCurrentConversation(service, control, [control]);
+});

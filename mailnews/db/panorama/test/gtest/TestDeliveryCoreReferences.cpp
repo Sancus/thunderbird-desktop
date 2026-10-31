@@ -3163,7 +3163,7 @@ class CapturedBatchObserver final : public MessageListener {
 };
 NS_IMPL_ISUPPORTS(CapturedBatchObserver, nsISupports)
 
-TEST_F(DISABLED_DeliveryCoreReferences, CaptureOwnsHistoricalRowFacts) {
+TEST_F(DeliveryCoreReferences, CaptureOwnsHistoricalRowFacts) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey parent;
   ASSERT_EQ(NS_OK, Add("capture-parent@invalid"_ns, {}, parent));
@@ -3224,14 +3224,14 @@ TEST_F(DISABLED_DeliveryCoreReferences, CaptureOwnsHistoricalRowFacts) {
   EXPECT_EQ("capture-parent@invalid"_ns, text);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, CaptureMissingRowPreservesOutput) {
+TEST_F(DeliveryCoreReferences, CaptureMissingRowPreservesOutput) {
   ASSERT_EQ(NS_OK, Start());
   CapturedMessage output = CaptureSentinel();
   EXPECT_EQ(NS_ERROR_UNEXPECTED, mCore->MessageDB().CaptureMessage(0, output));
   ExpectCapture(CaptureSentinel(), output);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, CaptureReadErrorPreservesOutput) {
+TEST_F(DeliveryCoreReferences, CaptureReadErrorPreservesOutput) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey control;
   ASSERT_EQ(NS_OK, Add("capture-control@invalid"_ns, {}, control));
@@ -3266,7 +3266,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, CaptureReadErrorPreservesOutput) {
   EXPECT_FALSE(inTransaction);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, PreparedBatchOwnsPendingPublication) {
+TEST_F(DeliveryCoreReferences, PreparedBatchOwnsPendingPublication) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey first, second, publication, control;
   ASSERT_EQ(NS_OK, Add("batch-first@invalid"_ns, {}, first));
@@ -3353,8 +3353,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, PreparedBatchOwnsPendingPublication) {
   ExpectCapture(unchanged, kept);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       BatchPreparationFailurePreservesOutput) {
+TEST_F(DeliveryCoreReferences, BatchPreparationFailurePreservesOutput) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey publication;
   ASSERT_EQ(NS_OK, Add("prepare-publication@invalid"_ns, {}, publication));
@@ -3385,8 +3384,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ(1u, calls);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       CaptureReadsStagedSqlWithoutCacheMutation) {
+TEST_F(DeliveryCoreReferences, CaptureReadsStagedSqlWithoutCacheMutation) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("capture-staged@invalid"_ns, {}, key));
@@ -3483,7 +3481,7 @@ void ExpectConversationRead(MessageDatabase& db, nsMsgKey seed,
   }
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverOrderedCrossFolder) {
+TEST_F(DeliveryCoreReferences, DiscoverOrderedCrossFolder) {
   ASSERT_EQ(NS_OK, Start());
   uint64_t a, b;
   ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
@@ -3516,7 +3514,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverOrderedCrossFolder) {
             stored);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReplyBeforeParent) {
+TEST_F(DeliveryCoreReferences, DiscoverReplyBeforeParent) {
   ASSERT_EQ(NS_OK, Start());
   uint64_t a, b;
   ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
@@ -3540,7 +3538,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReplyBeforeParent) {
   ExpectDiscovery(db, unrelated, {{unrelated, a}});
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverSiblingsWithoutParent) {
+TEST_F(DeliveryCoreReferences, DiscoverSiblingsWithoutParent) {
   ASSERT_EQ(NS_OK, Start());
   uint64_t a, b;
   ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
@@ -3565,7 +3563,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverSiblingsWithoutParent) {
   ExpectDiscovery(db, unrelated, {{unrelated, a}});
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverSiblingsThenParent) {
+TEST_F(DeliveryCoreReferences, DiscoverSiblingsThenParent) {
   ASSERT_EQ(NS_OK, Start());
   uint64_t a, b;
   ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
@@ -3593,7 +3591,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverSiblingsThenParent) {
   ExpectDiscovery(db, unrelated, {{unrelated, b}});
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverDuplicatePhysicalCopies) {
+TEST_F(DeliveryCoreReferences, DiscoverDuplicatePhysicalCopies) {
   ASSERT_EQ(NS_OK, Start());
   uint64_t a, b;
   ASSERT_EQ(NS_OK, MakeDiscoveryFolders(*mCore, a, b));
@@ -3622,7 +3620,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverDuplicatePhysicalCopies) {
             stored);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverWholeStoredComponent) {
+TEST_F(DeliveryCoreReferences, DiscoverWholeStoredComponent) {
   ASSERT_EQ(NS_OK, Start());
   auto& db = mCore->MessageDB();
   nsMsgKey root, child, incoming;
@@ -3643,7 +3641,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverWholeStoredComponent) {
       {{root, mFolderId}, {child, mFolderId}, {incoming, mFolderId}});
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverExactReferenceTokens) {
+TEST_F(DeliveryCoreReferences, DiscoverExactReferenceTokens) {
   ASSERT_EQ(NS_OK, Start());
   auto& db = mCore->MessageDB();
   nsMsgKey first, same, lower, spaced, composed, decomposed, emptyA, emptyB;
@@ -3680,7 +3678,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverExactReferenceTokens) {
   EXPECT_EQ((nsTArray<nsCString>{"cafe\xcc\x81@invalid"_ns}), stored);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverMissingRowPreservesOutput) {
+TEST_F(DeliveryCoreReferences, DiscoverMissingRowPreservesOutput) {
   ASSERT_EQ(NS_OK, Start());
   nsTArray<ConversationMember> output{{0xfffffff0, 0x123456789ULL}};
   EXPECT_EQ(NS_ERROR_UNEXPECTED,
@@ -3690,8 +3688,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverMissingRowPreservesOutput) {
   EXPECT_EQ(0x123456789ULL, output[0].folderId);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       DiscoverUnavailableHistoryPreservesOutput) {
+TEST_F(DeliveryCoreReferences, DiscoverUnavailableHistoryPreservesOutput) {
   ASSERT_EQ(NS_OK, Start());
   auto& db = mCore->MessageDB();
   nsMsgKey known, unknown;
@@ -3718,7 +3715,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   ExpectDiscovery(db, unknown, {{unknown, mFolderId}});
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReadErrorPreservesOutput) {
+TEST_F(DeliveryCoreReferences, DiscoverReadErrorPreservesOutput) {
   ASSERT_EQ(NS_OK, Start());
   auto& db = mCore->MessageDB();
   nsMsgKey control;
@@ -3751,7 +3748,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReadErrorPreservesOutput) {
   EXPECT_FALSE(inTransaction);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, DiscoverReadsStagedReferences) {
+TEST_F(DeliveryCoreReferences, DiscoverReadsStagedReferences) {
   ASSERT_EQ(NS_OK, Start());
   auto& db = mCore->MessageDB();
   nsMsgKey child, parent;

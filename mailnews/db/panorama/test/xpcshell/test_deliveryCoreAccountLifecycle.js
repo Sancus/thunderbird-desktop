@@ -342,3 +342,174 @@ add_task(function test_reentrantServerLookupKeepsSqlTree() {
   Assert.equal(folderDB.getFolderChildNamed(0, key), rootId);
   Assert.equal(folderDB.getFolderChildNamed(rootId, "Retained"), childId);
 });
+
+add_task(async function test_folderRetirementKeepsFreshSearchIdentity() {
+  const { MailSearchService } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MailSearchService.sys.mjs"
+  );
+  const { readMailSearchResult } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MailSearchResult.sys.mjs"
+  );
+  const pref = "mailnews.database.global.indexer.enabled";
+  const hadUserValue = Services.prefs.prefHasUserValue(pref);
+  const oldValue = Services.prefs.getBoolPref(pref, false);
+  Services.prefs.setBoolPref(pref, true);
+  registerCleanupFunction(() => {
+    if (hadUserValue) {
+      Services.prefs.setBoolPref(pref, oldValue);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  });
+  const { root } = makeRemovalAccount("physical-search-retirement");
+  const retired = root
+    .createLocalSubfolder("Retired")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const nested = retired
+    .createLocalSubfolder("Nested")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const survivor = root
+    .createLocalSubfolder("Survivor")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  Assert.equal(retired.msgStore.storeType, "mbox");
+  const raw = [
+    "From: Sender <sender@example.invalid>",
+    "To: Recipient <recipient@example.invalid>",
+    "Date: Tue, 01 Jan 2019 00:00:00 +0000",
+    "Message-ID: <physical-retirement-copy@example.invalid>",
+    "Subject: retirementsearchneedle",
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    "retirementbodyneedle original incarnation",
+    "",
+  ].join("\r\n");
+  const headers = [
+    retired.addMessage(raw),
+    nested.addMessage(raw),
+    survivor.addMessage(raw),
+  ];
+  const keys = headers.map(header => header.messageKey);
+  const ids = [retired.id, nested.id, survivor.id];
+  const oldURI = retired.URI;
+  const oldBody = retired.filePath.clone();
+  const nestedBody = nested.filePath.clone();
+  Assert.equal(new Set(keys).size, 3);
+  Assert.ok(oldBody.exists());
+  Assert.ok(nestedBody.exists());
+  const file = do_get_profile().clone();
+  file.append("physical-folder-retirement-search.sqlite");
+  const service = await MailSearchService.open(
+    file,
+    database.sourceId,
+    messageDB
+  );
+  registerCleanupFunction(() => service.close());
+  for (let updates = 0; ; updates++) {
+    Assert.less(updates, 100, "Initial physical fixture finishes indexing");
+    if (!(await service.update({ limit: 50 })).moreWork) {
+      break;
+    }
+  }
+  const query = "retirementsearchneedle retirementbodyneedle";
+  let page = await service.search(query);
+  Assert.deepEqual(
+    page.items.map(hit => hit.id).sort(),
+    keys.map(String).sort()
+  );
+  const oldHit = page.items.find(hit => hit.id == String(keys[0]));
+  Assert.ok(oldHit, "The actual physical copy is indexed before retirement");
+  Assert.equal(
+    (await readMailSearchResult(service, oldHit)).id,
+    String(keys[0])
+  );
+
+  root.propagateDelete(retired, true);
+  Assert.ok(!oldBody.exists(), "Permanent retirement deleted the actual body");
+  Assert.ok(!nestedBody.exists(), "Permanent retirement deleted child storage");
+  Assert.ok(!root.subFolders.includes(retired));
+  for (let index = 0; index < 2; index++) {
+    Assert.throws(
+      () => folderDB.getFolderParent(ids[index]),
+      /NS_ERROR_UNEXPECTED/
+    );
+    const state = messageDB.getSearchState(keys[index]);
+    Assert.equal(
+      state.folderId,
+      ids[index],
+      "Historical physical ID is retained"
+    );
+    Assert.strictEqual(state.folderFlags, null);
+    Assert.equal(
+      messageDB.getMessage(keys[index]).messageId,
+      "physical-retirement-copy@example.invalid"
+    );
+    const resolved = service.resolveDocument(String(keys[index]));
+    Assert.strictEqual(resolved.eligible, false);
+    Assert.strictEqual(resolved.folder, null);
+    Assert.strictEqual(resolved.originalContentAvailable, false);
+    Assert.strictEqual(resolved.canOpen, false);
+  }
+  Assert.strictEqual(await readMailSearchResult(service, oldHit), null);
+  Assert.ok(service.resolveDocument(String(keys[2])).eligible);
+  for (let updates = 0; ; updates++) {
+    Assert.less(updates, 100, "Physical retirement journal finishes indexing");
+    if (!(await service.update({ limit: 50 })).moreWork) {
+      break;
+    }
+  }
+  page = await service.search(query);
+  Assert.deepEqual(
+    page.items.map(hit => hit.id),
+    [String(keys[2])]
+  );
+  Assert.equal(
+    (await readMailSearchResult(service, page.items[0])).id,
+    String(keys[2]),
+    "The surviving same-Message-ID copy remains readable"
+  );
+
+  const fresh = root
+    .createLocalSubfolder("Retired")
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  Assert.equal(fresh.URI, oldURI);
+  Assert.notEqual(fresh.id, ids[0]);
+  Assert.notEqual(fresh.id, ids[1]);
+  const replacement = fresh.addMessage(
+    raw.replace("original incarnation", "fresh incarnation")
+  );
+  Assert.ok(!keys.includes(replacement.messageKey));
+  Assert.strictEqual(replacement.folder, fresh);
+  Assert.ok(
+    oldBody.exists(),
+    "The recreated folder reuses the actual body path"
+  );
+  for (let updates = 0; ; updates++) {
+    Assert.less(updates, 100, "Fresh physical incarnation finishes indexing");
+    if (!(await service.update({ limit: 50 })).moreWork) {
+      break;
+    }
+  }
+  page = await service.search(query);
+  Assert.deepEqual(
+    page.items.map(hit => hit.id).sort(),
+    [String(keys[2]), String(replacement.messageKey)].sort(),
+    "Only the surviving and fresh physical copies are public search results"
+  );
+  const freshHit = page.items.find(
+    hit => hit.id == String(replacement.messageKey)
+  );
+  Assert.ok(
+    freshHit,
+    "Search admits the fresh global key at the same folder name"
+  );
+  const result = await readMailSearchResult(service, freshHit);
+  Assert.ok(result);
+  Assert.equal(result.id, String(replacement.messageKey));
+  Assert.equal(result.messageId, "physical-retirement-copy@example.invalid");
+  Assert.strictEqual(result.originalContentAvailable, true);
+  Assert.strictEqual(result.canOpen, true);
+  Assert.equal(messageDB.getSearchState(keys[0]).folderId, ids[0]);
+  Assert.strictEqual(messageDB.getSearchState(keys[0]).folderFlags, null);
+  Assert.strictEqual(service.resolveDocument(String(keys[0])).eligible, false);
+  Assert.strictEqual(await readMailSearchResult(service, oldHit), null);
+});

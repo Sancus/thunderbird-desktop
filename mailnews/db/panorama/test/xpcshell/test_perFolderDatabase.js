@@ -5086,3 +5086,135 @@ add_task(function test_publicStatusFanoutPreservesLaterMembershipAndClose() {
     db.removeListener(observer);
   }
 });
+
+add_task(
+  function test_announcerForwardsExactArgumentsAndCurrentRegistrations() {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("announcer-arguments");
+    const other = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("announcer-arguments-bystander");
+    const db = folder.msgDatabase;
+    const otherDB = other.msgDatabase;
+    const key = addMessage({ folderId: folder.id, flags: 0x40000000 });
+    const header = db.getMsgHdrForKey(key);
+    const oldFlags = 0x80000004;
+    const newFlags = 0x40000001;
+    const parent = 0xf1234567;
+    const nextParent = 0xe2345678;
+    const instigator = other.QueryInterface(Ci.nsIDBChangeListener);
+    const events = [];
+    const removed = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged() {
+        Assert.ok(false, "Removal before the listener's turn stops delivery");
+      },
+    };
+    const late = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged(...args) {
+        events.push(["late-flags", ...args]);
+      },
+      onHdrAdded(...args) {
+        events.push(["late-added", ...args]);
+      },
+      onHdrDeleted(...args) {
+        events.push(["late-deleted", ...args]);
+      },
+      onParentChanged(...args) {
+        events.push(["late-parent", ...args]);
+      },
+    };
+    const first = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged(...args) {
+        events.push(["first-flags", ...args]);
+        db.removeListener(removed);
+        db.addListener(late);
+      },
+      onHdrAdded(...args) {
+        events.push(["first-added", ...args]);
+      },
+      onHdrDeleted(...args) {
+        events.push(["first-deleted", ...args]);
+      },
+      onParentChanged(...args) {
+        events.push(["first-parent", ...args]);
+      },
+    };
+    const bystander = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged() {
+        Assert.ok(false, "Another folder's announcer is not notified");
+      },
+      onHdrAdded() {
+        Assert.ok(false, "Another folder's announcer is not notified");
+      },
+      onHdrDeleted() {
+        Assert.ok(false, "Another folder's announcer is not notified");
+      },
+      onParentChanged() {
+        Assert.ok(false, "Another folder's announcer is not notified");
+      },
+    };
+    // Exercise the announcer without synthesizing folder or view mutations.
+    const folderListener = folder.QueryInterface(Ci.nsIDBChangeListener);
+    db.removeListener(folderListener);
+    registerCleanupFunction(() => {
+      db.removeListener(first);
+      db.removeListener(removed);
+      db.removeListener(late);
+      otherDB.removeListener(bystander);
+      db.addListener(folderListener);
+    });
+    const keys = db.listAllKeys();
+    const newKeys = db.getNewList();
+    const storedFlags = header.flags;
+    db.addListener(first);
+    db.addListener(first);
+    db.addListener(removed);
+    otherDB.addListener(bystander);
+
+    db.notifyHdrChangeAll(header, oldFlags, newFlags, instigator);
+    db.notifyHdrAddedAll(header, parent, -2147483647, instigator);
+    db.notifyHdrDeletedAll(header, nextParent, -1073741823, null);
+    db.notifyParentChangedAll(key, parent, nextParent, instigator);
+    Assert.deepEqual(events, [
+      ["first-flags", header, oldFlags, newFlags, instigator],
+      ["first-added", header, parent, -2147483647, instigator],
+      ["late-added", header, parent, -2147483647, instigator],
+      ["first-deleted", header, nextParent, -1073741823, null],
+      ["late-deleted", header, nextParent, -1073741823, null],
+      ["first-parent", key, parent, nextParent, instigator],
+      ["late-parent", key, parent, nextParent, instigator],
+    ]);
+    Assert.strictEqual(events[0][1], header);
+    Assert.strictEqual(events[0][4], instigator);
+    Assert.strictEqual(events[1][1], header);
+    Assert.strictEqual(events[1][4], instigator);
+
+    db.removeListener(first);
+    db.removeListener(first);
+    events.length = 0;
+    db.notifyHdrChangeAll(header, oldFlags, oldFlags, null);
+    Assert.deepEqual(events, [
+      ["late-flags", header, oldFlags, oldFlags, null],
+    ]);
+    for (const notify of [
+      () => db.notifyHdrChangeAll(null, oldFlags, newFlags, instigator),
+      () => db.notifyHdrAddedAll(null, parent, 0, instigator),
+      () => db.notifyHdrDeletedAll(null, parent, 0, instigator),
+    ]) {
+      Assert.throws(notify, /NS_ERROR_ILLEGAL_VALUE/);
+    }
+    Assert.equal(events.length, 1, "Rejected inputs deliver no event");
+    Assert.deepEqual(db.listAllKeys(), keys);
+    Assert.deepEqual(db.getNewList(), newKeys);
+    Assert.equal(header.flags, storedFlags, "Forwarding does not mutate flags");
+    db.removeListener(late);
+    events.length = 0;
+    db.notifyParentChangedAll(key, nextParent, parent, null);
+    Assert.deepEqual(events, [], "Removed ordinary listeners stay removed");
+  }
+);

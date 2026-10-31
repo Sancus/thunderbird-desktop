@@ -2031,4 +2031,109 @@ TEST_F(DISABLED_DeliveryPartialHeader,
 }
 
 }  // namespace
+using DeliveryDatabaseClose = DeliveryMessageReferences;
+
+TEST_F(DeliveryDatabaseClose, MessageInvalidationClearsOutputs) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgEnumerator> iterator;
+  ASSERT_EQ(NS_OK, db->EnumerateMessages(getter_AddRefs(iterator)));
+  bool more = false;
+  ASSERT_EQ(NS_OK, iterator->HasMoreElements(&more));
+  ASSERT_TRUE(more);
+  ASSERT_EQ(NS_OK, db->Close(false));
+  more = true;
+  EXPECT_EQ(NS_ERROR_FAILURE, iterator->HasMoreElements(&more));
+  EXPECT_FALSE(more);
+  nsIMsgDBHdr* output = mHeader;
+  EXPECT_EQ(NS_ERROR_FAILURE, iterator->GetNext(&output));
+  EXPECT_EQ(nullptr, output);
+  nsCString subject;
+  ASSERT_EQ(NS_OK, mHeader->GetSubject(subject));
+  EXPECT_EQ("subject"_ns, subject);
+}
+
+TEST_F(DeliveryDatabaseClose, ThreadInvalidationClearsOutputs) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgThreadEnumerator> iterator;
+  ASSERT_EQ(NS_OK, db->EnumerateThreads(getter_AddRefs(iterator)));
+  bool more = false;
+  ASSERT_EQ(NS_OK, iterator->HasMoreElements(&more));
+  ASSERT_TRUE(more);
+  nsCOMPtr<nsIMsgThread> thread;
+  ASSERT_EQ(NS_OK,
+            db->GetThreadContainingMsgHdr(mHeader, getter_AddRefs(thread)));
+  ASSERT_TRUE(thread);
+  ASSERT_EQ(NS_OK, db->Close(false));
+  more = true;
+  EXPECT_EQ(NS_OK, iterator->HasMoreElements(&more));
+  EXPECT_FALSE(more);
+  nsIMsgThread* output = thread;
+  EXPECT_EQ(NS_ERROR_FAILURE, iterator->GetNext(&output));
+  EXPECT_EQ(nullptr, output);
+  uint32_t count = 0;
+  ASSERT_EQ(NS_OK, thread->GetNumChildren(&count));
+  EXPECT_EQ(1u, count);
+}
+
+TEST_F(DeliveryDatabaseClose, MessageStepFailureIsNotEmptyIteration) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<DeliveryMessageReferencesFaultWitness> witness =
+      new DeliveryMessageReferencesFaultWitness(true);
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateFunction("close_enum_fault"_ns, 1, witness));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->RemoveFunction("close_enum_fault"_ns));
+  });
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "SELECT id FROM messages WHERE id=:key AND "
+                       "close_enum_fault(id)=0"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<MessageEnumerator> iterator = new MessageEnumerator(db, stmt);
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(mKey, witness->mLastKey);
+  bool more = true;
+  EXPECT_EQ(NS_ERROR_FAILURE, iterator->HasMoreElements(&more));
+  EXPECT_FALSE(more);
+  nsIMsgDBHdr* output = mHeader;
+  EXPECT_EQ(NS_ERROR_FAILURE, iterator->GetNext(&output));
+  EXPECT_EQ(nullptr, output);
+}
+
+TEST_F(DeliveryDatabaseClose, ThreadStepFailureIsNotEmptyIteration) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgThread> thread;
+  ASSERT_EQ(NS_OK,
+            db->GetThreadContainingMsgHdr(mHeader, getter_AddRefs(thread)));
+  ASSERT_TRUE(thread);
+  RefPtr<DeliveryMessageReferencesFaultWitness> witness =
+      new DeliveryMessageReferencesFaultWitness(true);
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateFunction("close_thread_fault"_ns, 1, witness));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->RemoveFunction("close_thread_fault"_ns));
+  });
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateStatement(
+                "SELECT threadId, MAX(date) FROM messages WHERE id=:key AND "
+                "close_thread_fault(id)=0 GROUP BY threadId"_ns,
+                getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
+  RefPtr<ThreadEnumerator> iterator = new ThreadEnumerator(db, stmt);
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(mKey, witness->mLastKey);
+  bool more = true;
+  EXPECT_EQ(NS_ERROR_FAILURE, iterator->HasMoreElements(&more));
+  EXPECT_FALSE(more);
+  nsIMsgThread* output = thread;
+  EXPECT_EQ(NS_ERROR_FAILURE, iterator->GetNext(&output));
+  EXPECT_EQ(nullptr, output);
+}
+
 }  // namespace mozilla::mailnews

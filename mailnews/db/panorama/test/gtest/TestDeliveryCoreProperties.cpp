@@ -748,7 +748,7 @@ TEST_F(DeliveryCoreProperties, FailedUpgradeRollsBackAndRetries) {
       CheckStored("folder_properties"_ns, mFolder, "control"_ns, "exact"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UidValuesAndViewsSurviveCoreReopen) {
+TEST_F(DeliveryCoreProperties, UidValuesAndViewsSurviveCoreReopen) {
   ASSERT_EQ(NS_OK, Start());
   const struct {
     uint32_t uid;
@@ -798,7 +798,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidValuesAndViewsSurviveCoreReopen) {
   }
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UidTextPresenceAndNamesStayExact) {
+TEST_F(DeliveryCoreProperties, UidTextPresenceAndNamesStayExact) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add(key));
@@ -864,7 +864,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidTextPresenceAndNamesStayExact) {
       CheckStored("message_properties"_ns, key, "uidonserver"_ns, "b2"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UidIsIndependentOfGlobalAndFolderKeys) {
+TEST_F(DeliveryCoreProperties, UidIsIndependentOfGlobalAndFolderKeys) {
   ASSERT_EQ(NS_OK, Start());
   uint64_t root, otherFolder;
   ASSERT_EQ(NS_OK, mCore->FolderDB().InsertRoot("uid-other-root"_ns, &root));
@@ -931,7 +931,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidIsIndependentOfGlobalAndFolderKeys) {
   EXPECT_FALSE(more);
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UidMissingKeyPreservesOutputAndRows) {
+TEST_F(DeliveryCoreProperties, UidMissingKeyPreservesOutputAndRows) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey control;
   ASSERT_EQ(NS_OK, Add(control));
@@ -956,7 +956,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidMissingKeyPreservesOutputAndRows) {
       CheckStored("message_properties"_ns, control, "uidOnServer"_ns, "1"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UidDeletedWarmHeaderIsNotMembership) {
+TEST_F(DeliveryCoreProperties, UidDeletedWarmHeaderIsNotMembership) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key, control;
   ASSERT_EQ(NS_OK, Add(key));
@@ -995,7 +995,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidDeletedWarmHeaderIsNotMembership) {
       CheckStored("message_properties"_ns, control, "uidOnServer"_ns, "1"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UidReadStepFailurePreservesOutput) {
+TEST_F(DeliveryCoreProperties, UidReadStepFailurePreservesOutput) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key, control;
   ASSERT_EQ(NS_OK, Add(key));
@@ -1050,7 +1050,7 @@ TEST_F(DISABLED_DeliveryCoreProperties, UidReadStepFailurePreservesOutput) {
   EXPECT_EQ(42u, uid);
 }
 
-TEST_F(DISABLED_DeliveryCoreProperties, UidWriteFailurePreservesOldRows) {
+TEST_F(DeliveryCoreProperties, UidWriteFailurePreservesOldRows) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey key, control;
   ASSERT_EQ(NS_OK, Add(key));

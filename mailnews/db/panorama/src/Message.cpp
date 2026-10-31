@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "MessageDatabase.h"
+#include "PerFolderDatabase.h"
 #include "mozilla/Components.h"
 #include "mozilla/Maybe.h"
 #include "mozilla/Try.h"
@@ -166,7 +167,22 @@ NS_IMETHODIMP Message::SetPriority(nsMsgPriorityValue priority) {
 
 NS_IMETHODIMP Message::GetFlags(uint32_t* flags) {
   NS_ENSURE_ARG_POINTER(flags);
-  return MessageDB().GetMessageFlags(mKey, *flags);
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core && DatabaseCore::sConnection && core->mMessageDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
+  RefPtr<MessageDatabase> messages = core->mMessageDatabase;
+  uint32_t status;
+  MOZ_TRY(messages->GetMessageFlags(mKey, status));
+  uint64_t folderId;
+  MOZ_TRY(messages->GetMessageFolderId(mKey, folderId));
+  // Consult only the existing physical-folder facade. A status read must not
+  // open a wrapper, retain it on the header, or revive a closed database.
+  RefPtr<PerFolderDatabase> db = core->mOpenDatabases.Get(folderId).get();
+  if (db) {
+    MOZ_TRY(db->GetStatusFlags(mKey, status, status));
+  }
+  *flags = status;
+  return NS_OK;
 }
 
 NS_IMETHODIMP Message::SetFlags(uint32_t flags) {

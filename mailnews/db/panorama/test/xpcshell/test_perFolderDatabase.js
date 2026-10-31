@@ -12,6 +12,28 @@ const { ProfileCreator } = ChromeUtils.importESModule(
 
 let rootFolder;
 
+/**
+ * Checks the stored word separately from the public header status.
+ *
+ * @param {nsIMsgDBHdr} header - The published header to check.
+ * @param {number} rawFlags - Exact stored flags, including unknown bits.
+ * @param {number} publicFlags - Exact flags exposed by the current facade.
+ */
+function assertRawAndPublicFlags(header, rawFlags, publicFlags) {
+  const statement = database.connectionForTests.createStatement(
+    "SELECT flags FROM messages WHERE id = :key"
+  );
+  try {
+    statement.params.key = header.messageKey;
+    Assert.ok(statement.executeStep());
+    Assert.equal(statement.getInt64(0) >>> 0, rawFlags >>> 0, "raw SQL flags");
+    Assert.ok(!statement.executeStep());
+  } finally {
+    statement.finalize();
+  }
+  Assert.equal(header.flags, publicFlags >>> 0, "public status flags");
+}
+
 add_setup(async function () {
   // The independent fixture messages are standalone native thread roots.
   installDB(
@@ -2958,6 +2980,11 @@ add_task(function test_bulkReadRequiresCurrentFolderAndSource() {
   const db = folder.msgDatabase;
   const header = db.getMsgHdrForKey(key);
   const originalFlags = header.flags;
+  assertRawAndPublicFlags(
+    header,
+    0x40000004,
+    0x40000004 | Ci.nsMsgMessageFlags.New
+  );
   const connection = database.connectionForTests;
   connection.beginTransaction();
   const update = connection.createStatement(
@@ -2978,7 +3005,7 @@ add_task(function test_bulkReadRequiresCurrentFolderAndSource() {
   Assert.ok(db.containsKey(key));
   db.forceClosed();
   Assert.throws(() => db.markAllRead(), /NS_ERROR_NOT_AVAILABLE/);
-  Assert.equal(header.flags, originalFlags);
+  assertRawAndPublicFlags(header, 0x40000004, 0x40000004);
   Assert.ok(!header.isRead);
 });
 
@@ -3512,14 +3539,25 @@ add_task(function test_bulkReadCommitsAllRowsBeforeScopedFlagCallbacks() {
       keys.toSorted((a, b) => a - b)
     );
     Assert.deepEqual(changes, [
-      [keys[0], initial[0], initial[0] | Ci.nsMsgMessageFlags.Read],
-      [keys[1], initial[1], Ci.nsMsgMessageFlags.Read],
+      [
+        keys[0],
+        initial[0] | Ci.nsMsgMessageFlags.New,
+        initial[0] | Ci.nsMsgMessageFlags.Read,
+      ],
+      [
+        keys[1],
+        initial[1] | Ci.nsMsgMessageFlags.New,
+        Ci.nsMsgMessageFlags.Read,
+      ],
     ]);
     Assert.deepEqual(db.getNewList(), []);
     Assert.ok(!db.hasNew());
     Assert.equal(db.dBFolderInfo.numMessages, 3);
     Assert.equal(db.dBFolderInfo.numUnreadMessages, 0);
-    Assert.equal(headers[0].flags, initial[0] | Ci.nsMsgMessageFlags.Read);
+    for (const [index, header] of headers.entries()) {
+      const raw = initial[index] | Ci.nsMsgMessageFlags.Read;
+      assertRawAndPublicFlags(header, raw, raw);
+    }
     Assert.ok(!foreign.isRead);
     Assert.deepEqual(otherDB.getNewList(), [foreign.messageKey]);
     Assert.equal(otherDB.dBFolderInfo.numUnreadMessages, 1);
@@ -3597,11 +3635,17 @@ add_task(function test_bulkReadFailureAndReentrantCapturedOrder() {
       keys.toSorted((a, b) => a - b)
     );
     Assert.deepEqual(changes, [
-      [keys[0], 0, Ci.nsMsgMessageFlags.Read],
-      [keys[1], 0, Ci.nsMsgMessageFlags.Read],
+      [keys[0], Ci.nsMsgMessageFlags.New, Ci.nsMsgMessageFlags.Read],
+      [keys[1], Ci.nsMsgMessageFlags.New, Ci.nsMsgMessageFlags.Read],
       [keys[1], Ci.nsMsgMessageFlags.Read, 0],
     ]);
     Assert.deepEqual(db.getNewList(), []);
+    assertRawAndPublicFlags(
+      headers[0],
+      Ci.nsMsgMessageFlags.Read,
+      Ci.nsMsgMessageFlags.Read
+    );
+    assertRawAndPublicFlags(headers[1], 0, 0);
     Assert.ok(headers[0].isRead);
     Assert.ok(!headers[1].isRead);
     Assert.equal(db.dBFolderInfo.numUnreadMessages, 1);
@@ -3789,16 +3833,26 @@ add_task(function test_keyFlagSettersRequireCurrentPhysicalFolder() {
   try {
     for (const [method, flag] of setters) {
       db[method](header.messageKey, true, null);
-      Assert.equal(
-        header.flags,
+      assertRawAndPublicFlags(
+        header,
         0x40000000 | flag,
-        `${method} sets only its bit`
+        0x40000000 | flag | Ci.nsMsgMessageFlags.New
       );
       db[method](header.messageKey, false, null);
-      Assert.equal(header.flags, 0x40000000, `${method} clears only its bit`);
+      assertRawAndPublicFlags(
+        header,
+        0x40000000,
+        0x40000000 | Ci.nsMsgMessageFlags.New
+      );
       Assert.deepEqual(calls.splice(0), [
-        [0x40000000, 0x40000000 | flag],
-        [0x40000000 | flag, 0x40000000],
+        [
+          0x40000000 | Ci.nsMsgMessageFlags.New,
+          0x40000000 | flag | Ci.nsMsgMessageFlags.New,
+        ],
+        [
+          0x40000000 | flag | Ci.nsMsgMessageFlags.New,
+          0x40000000 | Ci.nsMsgMessageFlags.New,
+        ],
       ]);
     }
     for (const [method] of setters) {
@@ -3807,7 +3861,11 @@ add_task(function test_keyFlagSettersRequireCurrentPhysicalFolder() {
         /NS_ERROR_ILLEGAL_VALUE/,
         `${method} cannot mutate another physical folder`
       );
-      Assert.equal(foreign.flags, 0x40000000);
+      assertRawAndPublicFlags(
+        foreign,
+        0x40000000,
+        0x40000000 | Ci.nsMsgMessageFlags.New
+      );
       Assert.deepEqual(otherDB.getNewList(), [foreign.messageKey]);
     }
     connection.beginTransaction();
@@ -3819,7 +3877,11 @@ add_task(function test_keyFlagSettersRequireCurrentPhysicalFolder() {
           `${method} preserves the caller transaction`
         );
         Assert.ok(connection.transactionInProgress);
-        Assert.equal(header.flags, 0x40000000);
+        assertRawAndPublicFlags(
+          header,
+          0x40000000,
+          0x40000000 | Ci.nsMsgMessageFlags.New
+        );
       }
     } finally {
       connection.rollbackTransaction();
@@ -3836,7 +3898,11 @@ add_task(function test_keyFlagSettersRequireCurrentPhysicalFolder() {
           error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT,
           `${method} propagates the original write error`
         );
-        Assert.equal(header.flags, 0x40000000);
+        assertRawAndPublicFlags(
+          header,
+          0x40000000,
+          0x40000000 | Ci.nsMsgMessageFlags.New
+        );
         Assert.ok(!connection.transactionInProgress);
       }
     } finally {
@@ -3868,7 +3934,11 @@ add_task(function test_keyFlagSettersRequireCurrentPhysicalFolder() {
         `${method} refuses a missing published key`
       );
     }
-    Assert.equal(header.flags, 0x40000000);
+    assertRawAndPublicFlags(
+      header,
+      0x40000000,
+      0x40000000 | Ci.nsMsgMessageFlags.New
+    );
     Assert.deepEqual(db.getNewList(), [header.messageKey]);
     Assert.deepEqual(calls, []);
     db.forceClosed();
@@ -3880,7 +3950,11 @@ add_task(function test_keyFlagSettersRequireCurrentPhysicalFolder() {
       );
     }
     Assert.equal(header.flags, 0x40000000);
-    Assert.equal(foreign.flags, 0x40000000);
+    assertRawAndPublicFlags(
+      foreign,
+      0x40000000,
+      0x40000000 | Ci.nsMsgMessageFlags.New
+    );
     Assert.ok(!connection.transactionInProgress);
   } finally {
     db.removeListener(listener);
@@ -4668,3 +4742,347 @@ add_task(
     Assert.deepEqual(storedFolderInfoState(other.id), unrelated);
   }
 );
+
+add_task(function test_publicFlagsFollowCanonicalNewList() {
+  const local = rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const folder = local.createLocalSubfolder("public-status-canonical");
+  const other = local.createLocalSubfolder("public-status-foreign");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const { New, Read } = Ci.nsMsgMessageFlags;
+  const rawWords = [0, 0x80000004, New, Read | New, Read];
+  const headers = rawWords.map((flags, index) => {
+    const draft = db.createNewHdr();
+    draft.messageId = `status-canonical-${index}@invalid`;
+    draft.flags = flags;
+    return db.attachHdr(draft, false);
+  });
+  const keys = headers.map(header => header.messageKey);
+  const cachedHeaders = keys.map(key => db.getMsgHdrForKey(key));
+  Assert.deepEqual(db.getNewList(), keys.slice(0, 3));
+  for (const [index, header] of headers.entries()) {
+    assertRawAndPublicFlags(
+      header,
+      rawWords[index],
+      rawWords[index] | (index < 3 ? New : 0)
+    );
+    Assert.strictEqual(
+      db.getMsgHdrForKey(header.messageKey),
+      cachedHeaders[index]
+    );
+    Assert.equal(cachedHeaders[index].messageKey, header.messageKey);
+    Assert.strictEqual(cachedHeaders[index].folder, folder);
+  }
+  const events = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(header, before, after) {
+      events.push([header.messageKey, before, after]);
+    },
+  };
+  db.addListener(listener);
+  try {
+    db.clearNewList(false);
+    Assert.deepEqual(db.getNewList(), []);
+    Assert.deepEqual(events, [], "Silent clear sends no ordinary flag events");
+    for (const [index, header] of headers.entries()) {
+      assertRawAndPublicFlags(header, rawWords[index], rawWords[index]);
+    }
+    db.addToNewList(keys[0]);
+    db.addToNewList(keys[0]);
+    Assert.deepEqual(db.getNewList(), [keys[0]]);
+    assertRawAndPublicFlags(headers[0], 0, New);
+    const foreign = otherDB.attachHdr(otherDB.createNewHdr(), false);
+    Assert.throws(
+      () => db.addToNewList(foreign.messageKey),
+      /NS_ERROR_ILLEGAL_VALUE/
+    );
+    Assert.throws(() => db.addToNewList(0xffffffff), /NS_ERROR_ILLEGAL_VALUE/);
+    const staged = db.createNewHdr();
+    Assert.throws(
+      () => db.addToNewList(staged.messageKey),
+      /NS_ERROR_ILLEGAL_VALUE/
+    );
+    Assert.deepEqual(db.getNewList(), [keys[0]]);
+    Assert.deepEqual(otherDB.getNewList(), [foreign.messageKey]);
+    const copyDraft = otherDB.copyHdrFromExistingHdr(
+      0xffffffff,
+      headers[0],
+      false
+    );
+    Assert.equal(
+      copyDraft.flags,
+      0,
+      "A structural copy retains the raw source word"
+    );
+    const copy = otherDB.attachHdr(copyDraft, false);
+    assertRawAndPublicFlags(copy, 0, New);
+    assertRawAndPublicFlags(headers[0], 0, New);
+
+    const connection = database.connectionForTests;
+    connection.beginTransaction();
+    const update = connection.createStatement(
+      "UPDATE database_identity SET sourceId = :source"
+    );
+    try {
+      update.params.source = Services.uuid.generateUUID().toString();
+      update.execute();
+      Assert.throws(() => headers[0].flags, /NS_ERROR_NOT_AVAILABLE/);
+      Assert.throws(() => db.clearNewList(true), /NS_ERROR_NOT_AVAILABLE/);
+      Assert.throws(() => db.clearNewList(false), /NS_ERROR_NOT_AVAILABLE/);
+      Assert.throws(() => db.addToNewList(keys[1]), /NS_ERROR_NOT_AVAILABLE/);
+      Assert.deepEqual(db.getNewList(), [keys[0]]);
+      Assert.ok(connection.transactionInProgress);
+      Assert.deepEqual(events, []);
+    } finally {
+      update.finalize();
+      connection.rollbackTransaction();
+    }
+    assertRawAndPublicFlags(headers[0], 0, New);
+  } finally {
+    db.removeListener(listener);
+  }
+  db.forceClosed();
+  Assert.strictEqual(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+      .getService(Ci.nsIMsgDBService)
+      .cachedDBForFolder(folder),
+    null
+  );
+  assertRawAndPublicFlags(headers[0], 0, 0);
+  Assert.strictEqual(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+      .getService(Ci.nsIMsgDBService)
+      .cachedDBForFolder(folder),
+    null,
+    "Reading status did not open a replacement facade"
+  );
+  const replacement = folder.msgDatabase;
+  Assert.notStrictEqual(replacement, db);
+  const current = replacement.getMsgHdrForKey(keys[0]);
+  Assert.notStrictEqual(current, cachedHeaders[0]);
+  Assert.strictEqual(replacement.getMsgHdrForKey(keys[0]), current);
+  Assert.equal(current.messageKey, headers[0].messageKey);
+  Assert.strictEqual(current.folder, folder);
+  Assert.deepEqual(replacement.getNewList(), []);
+  replacement.addToNewList(keys[1]);
+  assertRawAndPublicFlags(headers[0], 0, 0);
+  assertRawAndPublicFlags(headers[1], rawWords[1], rawWords[1] | New);
+  Assert.throws(() => db.clearNewList(true), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.deepEqual(replacement.getNewList(), [keys[1]]);
+});
+
+add_task(function test_publicFlagCallbacksKeepRealViewNewStatus() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("public-status-real-view");
+  const db = folder.msgDatabase;
+  const { New, Read, Marked, Offline } = Ci.nsMsgMessageFlags;
+  // nsMsgDBView.h: standalone roots retain MSG_VIEW_FLAG_ISTHREAD in the row.
+  const viewThread = 0x08000000;
+  const events = [];
+  const added = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrAdded(header, parent, flags) {
+      added.push([header.messageKey, parent, flags]);
+      assertRawAndPublicFlags(header, 0, New);
+    },
+    onHdrFlagsChanged(header, before, after) {
+      events.push([header.messageKey, before, after]);
+    },
+  };
+  db.addListener(listener);
+  const view = Cc[
+    "@mozilla.org/messenger/msgdbview;1?type=threaded"
+  ].createInstance(Ci.nsIMsgDBView);
+  view.init(null, null);
+  try {
+    const draft = db.createNewHdr();
+    draft.messageId = "status-real-view@invalid";
+    const header = db.attachHdr(draft, true);
+    const key = header.messageKey;
+    Assert.deepEqual(added, [[key, 0xffffffff, New]]);
+    view.open(
+      folder,
+      Ci.nsMsgViewSortType.byDate,
+      Ci.nsMsgViewSortOrder.ascending,
+      0
+    );
+    Assert.equal(view.QueryInterface(Ci.nsITreeView).rowCount, 1);
+    Assert.equal(view.getMsgHdrAt(0).messageKey, header.messageKey);
+    Assert.strictEqual(view.getMsgHdrAt(0).folder, folder);
+    Assert.equal(view.getFlagsAt(0), viewThread | New);
+    header.markFlagged(true);
+    assertRawAndPublicFlags(header, Marked, New | Marked);
+    Assert.equal(view.getFlagsAt(0), viewThread | New | Marked);
+    header.setStringProperty("keywords", "status-tag");
+    header.messageSize = 27;
+    Assert.equal(header.getStringProperty("keywords"), "status-tag");
+    Assert.equal(header.messageSize, 27);
+    Assert.equal(view.getFlagsAt(0), viewThread | New | Marked);
+    db.markOffline(key, true, null);
+    assertRawAndPublicFlags(header, Marked | Offline, New | Marked | Offline);
+    Assert.equal(view.getFlagsAt(0), viewThread | New | Marked | Offline);
+    db.markOffline(key, false, null);
+    header.markRead(true);
+    Assert.deepEqual(db.getNewList(), []);
+    assertRawAndPublicFlags(header, Marked | Read, Marked | Read);
+    Assert.equal(view.getFlagsAt(0), viewThread | Marked | Read);
+    Assert.deepEqual(events, [
+      [key, New, New | Marked],
+      [key, New | Marked, New | Marked | Offline],
+      [key, New | Marked | Offline, New | Marked],
+      [key, New | Marked, Read | Marked],
+    ]);
+    header.markRead(true);
+    Assert.equal(events.length, 4, "A raw/status no-op is silent");
+    header.markRead(false);
+    assertRawAndPublicFlags(header, Marked, Marked);
+    Assert.equal(view.getFlagsAt(0), viewThread | Marked);
+    db.addToNewList(key);
+    db.markMarked(key, false, null);
+    Assert.equal(view.getFlagsAt(0), viewThread | New);
+    db.markNotNew(key, null);
+    assertRawAndPublicFlags(header, 0, 0);
+    Assert.equal(
+      view.getFlagsAt(0),
+      viewThread,
+      "Membership-only MarkNotNew reaches the view"
+    );
+    const count = events.length;
+    db.markNotNew(key, null);
+    Assert.equal(events.length, count);
+    db.addToNewList(key);
+    header.markFlagged(true);
+    Assert.equal(view.getFlagsAt(0), viewThread | New | Marked);
+    db.clearNewList(true);
+    assertRawAndPublicFlags(header, Marked, Marked);
+    Assert.equal(
+      view.getFlagsAt(0),
+      viewThread | Marked,
+      "Notifying clear updates the real row"
+    );
+  } finally {
+    view.close();
+    db.removeListener(listener);
+  }
+});
+
+add_task(function test_clearNewListPinsPublicCallbacks() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("public-status-clear-reentrant");
+  const db = folder.msgDatabase;
+  const { New, Attachment } = Ci.nsMsgMessageFlags;
+  const initial = [0, 0x40000004, New];
+  const headers = initial.map((flags, index) => {
+    const draft = db.createNewHdr();
+    draft.messageId = `status-clear-${index}@invalid`;
+    draft.flags = flags;
+    return db.attachHdr(draft, false);
+  });
+  const keys = headers.map(header => header.messageKey);
+  const first = [];
+  const later = [];
+  let reenter = true;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(header, before, after) {
+      first.push([header.messageKey, before, after]);
+      if (reenter) {
+        reenter = false;
+        Assert.deepEqual(db.getNewList(), []);
+        db.addToNewList(keys[0]);
+        headers[1].markHasAttachments(true);
+        db.addToNewList(keys[1]);
+      }
+    },
+  };
+  const observer = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(header, before, after) {
+      later.push([header.messageKey, before, after, header.flags]);
+    },
+  };
+  db.addListener(listener);
+  db.addListener(observer);
+  try {
+    db.clearNewList(true);
+    Assert.deepEqual(first, [
+      [keys[0], New, 0],
+      [keys[1], initial[1], initial[1] | Attachment],
+      [keys[1], initial[1] | New, initial[1]],
+    ]);
+    Assert.deepEqual(later, [
+      [keys[1], initial[1], initial[1] | Attachment, initial[1] | Attachment],
+      [keys[0], New, 0, New],
+      [keys[1], initial[1] | New, initial[1], initial[1] | Attachment | New],
+    ]);
+    Assert.deepEqual(db.getNewList(), keys.slice(0, 2));
+    assertRawAndPublicFlags(headers[0], 0, New);
+    assertRawAndPublicFlags(
+      headers[1],
+      initial[1] | Attachment,
+      initial[1] | Attachment | New
+    );
+    assertRawAndPublicFlags(headers[2], New, New);
+    Assert.ok(
+      !first.some(event => event[0] == keys[2]),
+      "Stored New is preserved without a synthetic flag event"
+    );
+  } finally {
+    db.removeListener(listener);
+    db.removeListener(observer);
+  }
+});
+
+add_task(function test_publicStatusFanoutPreservesLaterMembershipAndClose() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("public-status-close-reentrant");
+  const db = folder.msgDatabase;
+  const { New, Read } = Ci.nsMsgMessageFlags;
+  const draft = db.createNewHdr();
+  draft.messageId = "status-close-reentrant@invalid";
+  const header = db.attachHdr(draft, false);
+  const key = header.messageKey;
+  const events = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(changed, before, after) {
+      Assert.equal(changed.messageKey, header.messageKey);
+      Assert.strictEqual(changed.folder, folder);
+      Assert.equal(before, New);
+      Assert.equal(after, Read);
+      Assert.deepEqual(db.getNewList(), []);
+      db.addToNewList(key);
+    },
+  };
+  const observer = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onHdrFlagsChanged(changed, before, after) {
+      events.push([before, after, changed.flags]);
+      db.forceClosed();
+    },
+    onAnnouncerGoingAway() {},
+  };
+  db.addListener(listener);
+  db.addListener(observer);
+  try {
+    header.markRead(true);
+    Assert.deepEqual(events, [[New, Read, New | Read]]);
+    assertRawAndPublicFlags(header, Read, Read);
+    Assert.throws(() => db.addToNewList(key), /NS_ERROR_NOT_AVAILABLE/);
+    Assert.deepEqual(db.getNewList(), []);
+    Assert.strictEqual(
+      Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+        .getService(Ci.nsIMsgDBService)
+        .cachedDBForFolder(folder),
+      null
+    );
+  } finally {
+    db.removeListener(listener);
+    db.removeListener(observer);
+  }
+});

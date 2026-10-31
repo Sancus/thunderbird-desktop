@@ -1530,10 +1530,9 @@ TEST_F(DISABLED_DeliveryHeaderAncestry, StagedReadFailureIsNotMissingAncestry) {
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
 }
 
-using DISABLED_DeliveryCapturedNotifications = DeliveryMessageReferences;
+using DeliveryCapturedNotifications = DeliveryMessageReferences;
 
-TEST_F(DISABLED_DeliveryCapturedNotifications,
-       PublicationPrecedesReentrantReadDelta) {
+TEST_F(DeliveryCapturedNotifications, PublicationPrecedesReentrantReadDelta) {
   auto& native = mCore->MessageDB();
   RefPtr<DeliveryEarlyMutationListener> early =
       new DeliveryEarlyMutationListener;
@@ -1543,6 +1542,7 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   early->publication = [&](const CapturedMessage& after, Message* live) {
     changed = true;
     EXPECT_EQ(mFolder, after.folderId);
+    EXPECT_EQ(0u, after.flags);
     EXPECT_EQ(NS_OK, live->MarkRead(true));
   };
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
@@ -1559,13 +1559,13 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   const auto& added = listener->events[0];
   EXPECT_EQ('A', added.kind);
   EXPECT_EQ(key, added.key);
-  EXPECT_EQ(0u, added.flags);
+  EXPECT_EQ(nsMsgMessageFlags::New, added.flags);
   EXPECT_EQ(nsMsgKey_None, added.parent);
   EXPECT_EQ(nsMsgMessageFlags::Read, added.liveFlags);
   EXPECT_EQ((nsTArray<nsMsgKey>{key}), added.newKeys);
   const auto& read = listener->events[1];
   EXPECT_EQ('F', read.kind);
-  EXPECT_EQ(0u, read.oldFlags);
+  EXPECT_EQ(nsMsgMessageFlags::New, read.oldFlags);
   EXPECT_EQ(nsMsgMessageFlags::Read, read.flags);
   EXPECT_TRUE(read.newKeys.IsEmpty());
   EXPECT_EQ(0u, listener->otherChanges);
@@ -1576,7 +1576,7 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
 }
 
-TEST_F(DISABLED_DeliveryCapturedNotifications,
+TEST_F(DeliveryCapturedNotifications,
        PublicationAndDeletionKeepHistoricalParent) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   auto& native = mCore->MessageDB();
@@ -1587,6 +1587,7 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   bool removed = false;
   early->publication = [&](const CapturedMessage& after, Message*) {
     removed = true;
+    EXPECT_EQ(0u, after.flags);
     EXPECT_EQ(NS_OK, native.RemoveMessage(after.id));
   };
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
@@ -1602,12 +1603,14 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   ASSERT_TRUE(removed);
   ASSERT_EQ(2u, listener->events.Length());
   EXPECT_EQ('A', listener->events[0].kind);
+  EXPECT_EQ(nsMsgMessageFlags::New, listener->events[0].flags);
+  EXPECT_EQ(0u, listener->events[0].liveFlags);
   EXPECT_EQ(mKey, listener->events[0].parent);
   EXPECT_EQ((nsTArray<nsMsgKey>{key}), listener->events[0].newKeys);
   EXPECT_EQ('D', listener->events[1].kind);
   EXPECT_EQ(key, listener->events[1].key);
   EXPECT_EQ(mKey, listener->events[1].parent);
-  EXPECT_EQ(0u, listener->events[1].flags);
+  EXPECT_EQ(nsMsgMessageFlags::New, listener->events[1].flags);
   EXPECT_TRUE(listener->events[1].newKeys.IsEmpty());
   EXPECT_EQ(0u, listener->otherChanges);
   Maybe<CapturedMessage> stored;
@@ -1616,7 +1619,7 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
 }
 
-TEST_F(DISABLED_DeliveryCapturedNotifications,
+TEST_F(DeliveryCapturedNotifications,
        ReentrantTagsUseExistingPostChangeCallbacks) {
   auto& native = mCore->MessageDB();
   RefPtr<DeliveryEarlyMutationListener> early =
@@ -1650,8 +1653,7 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
 }
 
-TEST_F(DISABLED_DeliveryCapturedNotifications,
-       BodyOnlyChangesDoNotInventEvents) {
+TEST_F(DeliveryCapturedNotifications, BodyOnlyChangesDoNotInventEvents) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   auto& native = mCore->MessageDB();
   RefPtr<DeliveryEarlyMutationListener> early =
@@ -1686,22 +1688,30 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   finished.offlineMessageSize = 11;
   finished.lineCount = 2;
   ASSERT_EQ(NS_OK, native.SettleMessageBody(before, finished, after));
+  EXPECT_EQ(0u, after.flags);
   EXPECT_TRUE(listener->events.IsEmpty());
   EXPECT_FALSE(changed);
   finished.storeToken = "offline"_ns;
   finished.offline = true;
   ASSERT_EQ(NS_OK, native.SettleMessageBody(after, finished, before));
   ASSERT_TRUE(changed);
+  EXPECT_EQ(nsMsgMessageFlags::Offline, before.flags);
   ASSERT_EQ(2u, listener->events.Length());
   EXPECT_EQ('F', listener->events[0].kind);
-  EXPECT_EQ(0u, listener->events[0].oldFlags);
-  EXPECT_EQ(nsMsgMessageFlags::Offline, listener->events[0].flags);
+  EXPECT_EQ(nsMsgMessageFlags::New, listener->events[0].oldFlags);
+  EXPECT_EQ(nsMsgMessageFlags::New | nsMsgMessageFlags::Offline,
+            listener->events[0].flags);
   EXPECT_EQ(0u, listener->events[0].liveFlags);
   EXPECT_EQ('F', listener->events[1].kind);
-  EXPECT_EQ(nsMsgMessageFlags::Offline, listener->events[1].oldFlags);
-  EXPECT_EQ(0u, listener->events[1].flags);
+  EXPECT_EQ(nsMsgMessageFlags::New | nsMsgMessageFlags::Offline,
+            listener->events[1].oldFlags);
+  EXPECT_EQ(nsMsgMessageFlags::New, listener->events[1].flags);
   EXPECT_EQ((nsTArray<nsMsgKey>{mKey}), listener->events[1].newKeys);
   ASSERT_EQ(NS_OK, native.GetMessageBodyState(mKey, after));
+  EXPECT_EQ(0u, after.flags);
+  uint32_t rawFlags = UINT32_MAX;
+  ASSERT_EQ(NS_OK, native.GetMessageFlags(mKey, rawFlags));
+  EXPECT_EQ(0u, rawFlags);
   ASSERT_TRUE(after.storeToken);
   EXPECT_EQ("latest"_ns, *after.storeToken);
   EXPECT_EQ(20u, after.messageSize);
@@ -1711,7 +1721,7 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
 }
 
-TEST_F(DISABLED_DeliveryCapturedNotifications,
+TEST_F(DeliveryCapturedNotifications,
        SuppressedAddStillTracksUnreadMembership) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   RefPtr<DeliveryCapturedLegacyListener> listener =
@@ -1728,16 +1738,22 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   nsTArray<nsMsgKey> keys;
   ASSERT_EQ(NS_OK, db->GetNewList(keys));
   EXPECT_EQ((nsTArray<nsMsgKey>{key}), keys);
+  uint32_t rawFlags = UINT32_MAX;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(key, rawFlags));
+  EXPECT_EQ(0u, rawFlags);
   ASSERT_EQ(NS_OK, live->MarkRead(true));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(key, rawFlags));
+  EXPECT_EQ(nsMsgMessageFlags::Read, rawFlags);
   ASSERT_EQ(1u, listener->events.Length());
   EXPECT_EQ('F', listener->events[0].kind);
+  EXPECT_EQ(nsMsgMessageFlags::New, listener->events[0].oldFlags);
   EXPECT_EQ(nsMsgMessageFlags::Read, listener->events[0].flags);
   EXPECT_TRUE(listener->events[0].newKeys.IsEmpty());
   EXPECT_EQ(0u, listener->otherChanges);
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
 }
 
-TEST_F(DISABLED_DeliveryCapturedNotifications,
+TEST_F(DeliveryCapturedNotifications,
        ForeignFolderFactsDoNotChangeThisWrapper) {
   uint64_t other;
   ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
@@ -1762,10 +1778,9 @@ TEST_F(DISABLED_DeliveryCapturedNotifications,
   ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
 }
 
-using DISABLED_DeliveryCapturedLifetime = DeliveryMessageReferences;
+using DeliveryCapturedLifetime = DeliveryMessageReferences;
 
-TEST_F(DISABLED_DeliveryCapturedLifetime,
-       ClosedDuringParentDoesNotConsumePublication) {
+TEST_F(DeliveryCapturedLifetime, ClosedDuringParentDoesNotConsumePublication) {
   MessageThreadBatch batch;
   ASSERT_NO_FATAL_FAILURE(PrepareParentChange(batch));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);

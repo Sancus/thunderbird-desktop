@@ -1084,3 +1084,148 @@ add_task(async function test_nativeTextRevisionRejectsOldOffsetsAfterRefresh() {
     "Only the changed physical copy leaves the old subject query"
   );
 });
+
+add_task(async function test_physicalFolderRetirementKeepsCopyAndNewIdentity() {
+  const name = "physicalfolderretire098";
+  const { first, selected, selectedHit } = await resultCopies(name);
+  const folder = selected.folder;
+  const folderId = folder.id;
+  const folderURI = folder.URI;
+  const folderName = folder.name;
+  const key = selected.messageKey;
+  const file = folder.filePath.clone();
+  Assert.ok(file.exists(), "The retiring copy has real body storage");
+  Assert.equal(first.messageId, selected.messageId);
+  Assert.notEqual(first.messageKey, key);
+  const makeRaw = subject =>
+    MailStringUtils.stringToByteString(
+      [
+        "From: Sender <sender@example.invalid>",
+        "To: Recipient <recipient@example.invalid>",
+        "Date: Tue, 01 Jan 2019 00:00:00 +0000",
+        "Message-ID: <shared-result@example.invalid>",
+        "Subject: " + subject,
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        "café current body",
+        "",
+      ].join("\r\n")
+    );
+  const control = first.folder.addMessage(makeRaw("retirementcontrol098"));
+  await drainResultWork();
+  const currentPage = await service.search(name + " cafe");
+  Assert.deepEqual(
+    currentPage.items.map(hit => hit.id).toSorted(),
+    [String(first.messageKey), String(key)].toSorted()
+  );
+  const currentHit = currentPage.items.find(hit => hit.id === String(key));
+  Assert.ok(
+    currentHit,
+    "The selected physical hit is current before retirement"
+  );
+  const pause = pauseResultProjection(String(key));
+  const pending = readMailSearchResult(service, currentHit);
+  let completed = false;
+  const settled = pending.finally(() => {
+    completed = true;
+  });
+  const deleted = [];
+  const listener = {
+    folderDeleted(target) {
+      if (target.URI === folderURI) {
+        Assert.ok(
+          !completed,
+          "Actual folder deletion precedes projection delivery"
+        );
+        deleted.push(target.URI);
+      }
+    },
+  };
+  MailServices.mfn.addListener(listener, MailServices.mfn.folderDeleted);
+  try {
+    await Promise.race([pause.entered, settled]);
+    Assert.ok(!completed, "The selected copy's real projection is pending");
+    rootFolder.propagateDelete(folder, true);
+    Assert.deepEqual(deleted, [folderURI]);
+    Assert.ok(!file.exists(), "The actual source body file was deleted");
+    const raw = messageDB.getSearchState(key);
+    Assert.ok(raw, "Physical history remains after actual folder retirement");
+    Assert.equal(raw.folderId, folderId);
+    Assert.equal(raw.folderFlags, null);
+    const state = service.resolveDocument(String(key));
+    Assert.equal(state.eligible, false);
+    Assert.equal(state.folder, null);
+    Assert.equal(state.originalContentAvailable, false);
+    Assert.equal(state.canOpen, false);
+    pause.release();
+    Assert.equal(
+      await settled,
+      null,
+      "The old physical hit cannot become its equal-ID peer"
+    );
+    pause.restore();
+    await drainResultWork();
+    const surviving = await service.search(name + " cafe");
+    Assert.deepEqual(
+      surviving.items.map(hit => hit.id),
+      [String(first.messageKey)]
+    );
+    Assert.equal(
+      (await readMailSearchResult(service, surviving.items[0])).id,
+      String(first.messageKey)
+    );
+    const replacement = rootFolder
+      .createLocalSubfolder(folderName)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    Assert.equal(replacement.URI, folderURI);
+    Assert.notEqual(
+      replacement.id,
+      folderId,
+      "A same-name folder has a new native identity"
+    );
+    resultFolders.push({
+      folder: replacement,
+      id: replacement.id,
+      name: folderName,
+    });
+    const fresh = replacement.addMessage(makeRaw("retirementreplacement098"));
+    Assert.equal(fresh.messageId, first.messageId);
+    Assert.notEqual(fresh.messageKey, key);
+    Assert.notEqual(fresh.messageKey, first.messageKey);
+    await drainResultWork();
+    const current = await service.search("retirementreplacement098 cafe");
+    Assert.deepEqual(
+      current.items.map(hit => hit.id),
+      [String(fresh.messageKey)]
+    );
+    const result = await readMailSearchResult(service, current.items[0]);
+    Assert.deepEqual(result.location, {
+      folderId: replacement.id,
+      messageKey: fresh.messageKey,
+    });
+    Assert.ok(result.canOpen);
+    Assert.equal(await readMailSearchResult(service, selectedHit), null);
+    Assert.equal(messageDB.getSearchState(key).folderId, folderId);
+    Assert.equal(messageDB.getSearchState(key).folderFlags, null);
+    Assert.deepEqual(
+      (await service.search(name + " cafe")).items.map(hit => hit.id),
+      [String(first.messageKey)]
+    );
+    Assert.deepEqual(
+      (await service.search("retirementcontrol098 cafe")).items.map(
+        hit => hit.id
+      ),
+      [String(control.messageKey)]
+    );
+    Assert.deepEqual(
+      deleted,
+      [folderURI],
+      "Same-name creation publishes no second deletion"
+    );
+  } finally {
+    MailServices.mfn.removeListener(listener);
+    pause.release();
+    pause.restore();
+    await settled.catch(() => {});
+  }
+});

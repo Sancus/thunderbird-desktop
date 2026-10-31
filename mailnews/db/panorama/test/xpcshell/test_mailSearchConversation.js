@@ -13,6 +13,7 @@ const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 let conversationRoot;
+let conversationInitialFolderURIs;
 
 add_setup(function setupConversationLookup() {
   do_get_profile();
@@ -29,6 +30,9 @@ add_setup(function setupConversationLookup() {
   conversationRoot = MailServices.accounts
     .createLocalMailAccount()
     .incomingServer.rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  conversationInitialFolderURIs = new Set(
+    [...conversationRoot.subFolders].map(folder => folder.URI)
+  );
 });
 
 /**
@@ -643,5 +647,198 @@ add_task(
         "Every reference-connected physical member streams from every seed"
       );
     }
+  }
+);
+
+/**
+ * Checks current physical selection and complete streamed conversation members.
+ *
+ * @param {MailSearchService} service - Current native conversation consumer.
+ * @param {nsIMsgDBHdr} selected - Independently selected physical header.
+ * @param {nsIMsgDBHdr[]} expected - Complete independent physical member set.
+ * @returns {Promise<void>} Resolves after the real header stream finishes.
+ */
+async function assertCurrentConversation(service, selected, expected) {
+  const snapshot = await service.getConversationForHeader(selected);
+  assertConversationMembers(snapshot, expected);
+  Assert.equal(snapshot.selectedId, String(selected.messageKey));
+  Assert.equal(snapshot.selectedMessage.messageKey, selected.messageKey);
+  Assert.equal(snapshot.selectedMessage.folder.id, selected.folder.id);
+  const headers = [];
+  await service.streamResultHeaders(snapshot, header => headers.push(header));
+  Assert.deepEqual(
+    headers
+      .map(header => [header.folder.id, header.messageKey])
+      .toSorted((a, b) => a[1] - b[1]),
+    expected
+      .map(header => [header.folder.id, header.messageKey])
+      .toSorted((a, b) => a[1] - b[1]),
+    "The full current conversation streams each physical copy exactly once"
+  );
+}
+
+/**
+ * Drains the small fixture through ordinary bounded sidecar indexing updates.
+ *
+ * @param {MailSearchService} service - Native service owning the derived index.
+ * @returns {Promise<object>} Completed durable progress and source watermark.
+ */
+async function drainConversationIndex(service) {
+  for (let i = 0; i < 200; i++) {
+    const progress = await service.update({ limit: 500 });
+    if (!progress.moreWork) {
+      Assert.equal(progress.rebuilding, false);
+      Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
+      return progress;
+    }
+  }
+  throw new Error("Conversation fixture indexing did not finish bounded work");
+}
+
+add_task(
+  async function test_physicalCopyReindexAndLastDeletionKeepCurrentMembership() {
+    // Finished snapshot cases retain stored messages in this shared core. Retire
+    // only their fixture folders before rebuilding this case's derived index.
+    for (const folder of [...conversationRoot.subFolders]) {
+      if (!conversationInitialFolderURIs.has(folder.URI)) {
+        conversationRoot.propagateDelete(folder, true);
+      }
+    }
+    const a = conversationRoot
+      .createLocalSubfolder("conversation-copy-reindex-a")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const b = conversationRoot
+      .createLocalSubfolder("conversation-copy-reindex-b")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const c = conversationRoot
+      .createLocalSubfolder("conversation-copy-reindex-c")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const rootId = "copy-reindex-root@conversation.invalid";
+    const root = addConversationMail(a, rootId, []);
+    const reply = addConversationMail(
+      b,
+      "copy-reindex-reply@conversation.invalid",
+      [rootId]
+    );
+    const control = addConversationMail(
+      a,
+      "copy-reindex-control@conversation.invalid",
+      []
+    );
+    const file = do_get_profile().clone();
+    file.append("conversation-before-copy-reindex.sqlite");
+    const service = await MailSearchService.open(
+      file,
+      database.sourceId,
+      messageDB
+    );
+    registerCleanupFunction(() => service.close());
+    await assertCurrentConversation(service, reply, [root, reply]);
+    const transfers = [];
+    const notification = {
+      msgsMoveCopyCompleted(isMove, sources, target, messages) {
+        if (target.URI == c.URI) {
+          transfers.push({
+            isMove,
+            sources: sources.map(header => ({
+              key: header.messageKey,
+              folderURI: header.folder.URI,
+            })),
+            keys: messages.map(header => header.messageKey),
+          });
+        }
+      },
+    };
+    const copyListener = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.mfn.addListener(
+      notification,
+      MailServices.mfn.msgsMoveCopyCompleted
+    );
+    try {
+      MailServices.copy.copyMessages(
+        a,
+        [root],
+        c,
+        false,
+        copyListener,
+        null,
+        false
+      );
+      await copyListener.promise;
+    } finally {
+      MailServices.mfn.removeListener(notification);
+    }
+    Assert.equal(transfers.length, 1, "One actual completed native copy");
+    Assert.equal(transfers[0].isMove, false);
+    Assert.deepEqual(transfers[0].sources, [
+      { key: root.messageKey, folderURI: a.URI },
+    ]);
+    Assert.equal(transfers[0].keys.length, 1);
+    const copied = messageDB.getMessage(transfers[0].keys[0]);
+    Assert.equal(copied.folder.id, c.id);
+    Assert.equal(copied.messageId, root.messageId);
+    Assert.notEqual(copied.messageKey, root.messageKey);
+    Assert.equal(messageDB.getMessage(root.messageKey).folder.id, a.id);
+    Assert.equal(await service.getText(String(copied.messageKey)), null);
+    for (const selected of [root, reply, copied]) {
+      await assertCurrentConversation(service, selected, [root, reply, copied]);
+    }
+    await service.close();
+
+    // Rebuild a fresh derived sidecar from the same committed native messages.
+    // Neither physical identity nor complete membership depends on FTS state.
+    const rebuiltFile = do_get_profile().clone();
+    rebuiltFile.append("conversation-after-copy-reindex.sqlite");
+    const rebuilt = await MailSearchService.open(
+      rebuiltFile,
+      database.sourceId,
+      messageDB
+    );
+    registerCleanupFunction(() => rebuilt.close());
+    await assertCurrentConversation(rebuilt, copied, [root, reply, copied]);
+    await drainConversationIndex(rebuilt);
+    Assert.ok(
+      await rebuilt.getText(String(copied.messageKey)),
+      "The copied stored bytes were actually indexed"
+    );
+    for (const selected of [root, reply, copied]) {
+      await assertCurrentConversation(rebuilt, selected, [root, reply, copied]);
+    }
+
+    const removedTokens = [];
+    for (const [removed, after] of [
+      [root, [reply, copied]],
+      [copied, [reply]],
+      [reply, []],
+    ]) {
+      const token = conversationSelection(rebuilt, removed);
+      removedTokens.push(token);
+      const deleteListener = new PromiseTestUtils.PromiseCopyListener();
+      removed.folder.deleteMessages(
+        [removed],
+        null,
+        true,
+        false,
+        deleteListener,
+        false
+      );
+      await deleteListener.promise;
+      const deleted = await rebuilt.getConversation(token);
+      Assert.equal(deleted.status, "deleted");
+      Assert.equal(Object.hasOwn(deleted, "items"), false);
+      if (after.length) {
+        await assertCurrentConversation(rebuilt, after.at(-1), after);
+      }
+      await drainConversationIndex(rebuilt);
+      for (const old of removedTokens) {
+        const result = await rebuilt.getConversation(old);
+        Assert.equal(result.status, "deleted");
+        Assert.equal(Object.hasOwn(result, "items"), false);
+      }
+      if (after.length) {
+        await assertCurrentConversation(rebuilt, after.at(-1), after);
+      }
+    }
+    await assertCurrentConversation(rebuilt, control, [control]);
   }
 );

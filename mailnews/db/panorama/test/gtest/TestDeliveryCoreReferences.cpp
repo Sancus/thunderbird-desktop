@@ -2560,8 +2560,7 @@ nsresult PublicationCell(mozIStorageConnection* reader, nsMsgKey key,
   return stmt->GetUTF8String(0, value);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       NativePublicationIsCompleteAtFirstCallback) {
+TEST_F(DeliveryCoreReferences, NativePublicationIsCompleteAtFirstCallback) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey parent;
   ASSERT_EQ(NS_OK, Add("parent@invalid"_ns, {}, parent));
@@ -2692,7 +2691,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ(0u, observer->mChanges);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
+TEST_F(DeliveryCoreReferences,
        NativeQuietPublicationStillReachesInternalObservers) {
   ASSERT_EQ(NS_OK, Start());
   uint32_t publications = 0, oldCallbacks = 0;
@@ -2721,8 +2720,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ(1u, count);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       NativeExtrasKeepExactNamesTextAndOrder) {
+TEST_F(DeliveryCoreReferences, NativeExtrasKeepExactNamesTextAndOrder) {
   ASSERT_EQ(NS_OK, Start());
   RawHdr raw;
   raw.replyTo = "default reply"_ns;
@@ -2794,8 +2792,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_FALSE(names.Contains("keywords"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       NativeEmptyKeywordsOverrideNamedDefault) {
+TEST_F(DeliveryCoreReferences, NativeEmptyKeywordsOverrideNamedDefault) {
   ASSERT_EQ(NS_OK, Start());
   RawHdr raw;
   raw.keywords = "named default"_ns;
@@ -2814,7 +2811,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_TRUE(tags.IsEmpty());
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences, NativeAbsentStorageRetainsExactExtras) {
+TEST_F(DeliveryCoreReferences, NativeAbsentStorageRetainsExactExtras) {
   ASSERT_EQ(NS_OK, Start());
   RawHdr raw;
   raw.extras = {{"messageSize"_ns, "00041"_ns},
@@ -2849,8 +2846,7 @@ TEST_F(DISABLED_DeliveryCoreReferences, NativeAbsentStorageRetainsExactExtras) {
   EXPECT_EQ("00041"_ns, text);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       NativePresentStorageOverridesExactExtras) {
+TEST_F(DeliveryCoreReferences, NativePresentStorageOverridesExactExtras) {
   ASSERT_EQ(NS_OK, Start());
   RawHdr raw;
   raw.extras = {{"messageSize"_ns, "41"_ns},
@@ -2887,8 +2883,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ("4"_ns, text);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       NativeReceivedDateUsesLegacySecondsText) {
+TEST_F(DeliveryCoreReferences, NativeReceivedDateUsesLegacySecondsText) {
   ASSERT_EQ(NS_OK, Start());
   const struct {
     PRTime received;
@@ -2926,7 +2921,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   }
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
+TEST_F(DeliveryCoreReferences,
        NativePropertyFailureLeavesOutputsAndControlIntact) {
   ASSERT_EQ(NS_OK, Start());
   nsMsgKey control;
@@ -3005,7 +3000,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ("subject"_ns, text);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
+TEST_F(DeliveryCoreReferences,
        NativePublicationRejectsForeignTransactionAndNullKey) {
   ASSERT_EQ(NS_OK, Start());
   RawHdr raw;
@@ -3040,8 +3035,7 @@ TEST_F(DISABLED_DeliveryCoreReferences,
   EXPECT_EQ("kept"_ns, value);
 }
 
-TEST_F(DISABLED_DeliveryCoreReferences,
-       NativeBorrowedInputSupportsReentrantReuse) {
+TEST_F(DeliveryCoreReferences, NativeBorrowedInputSupportsReentrantReuse) {
   ASSERT_EQ(NS_OK, Start());
   RawHdr raw;
   raw.messageId = "reused@invalid"_ns;

@@ -184,6 +184,9 @@ prefs = [
 ["test_searchAttachments.js"]
 
 ["test_searchContent.js"]
+support-files = [
+  "../../../../../mail/test/browser/openpgp/data/eml/unsigned-encrypted-to-0xf231550c4f47e38e-from-0xfbfcc82a015e7330.eml",
+]
 
 ["test_searchFolderHitCache.js"]
 

@@ -3194,6 +3194,23 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
     MOZ_TRY(dbFolderInfo->GetImapUidValidity(&imapUIDValidity));
     rv = mDatabase->ListAllKeys(existingKeys);
     NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      // Reconciliation concerns confirmed server rows. Local-only and staged
+      // transfer records retain their physical identity across ordinary sync.
+      nsTArray<nsMsgKey> serverKeys;
+      for (nsMsgKey key : existingKeys) {
+        nsCOMPtr<nsIMsgDBHdr> header;
+        MOZ_TRY(mDatabase->GetMsgHdrForKey(key, getter_AddRefs(header)));
+        NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+        uint32_t uid, pseudo;
+        MOZ_TRY(header->GetUint32Property("uidOnServer", &uid));
+        MOZ_TRY(header->GetUint32Property("pseudoHdr", &pseudo));
+        if (uid && !pseudo) serverKeys.AppendElement(key);
+      }
+      existingKeys = std::move(serverKeys);
+    }
+#endif
     nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
         do_QueryInterface(mDatabase, &rv);
     NS_ENSURE_SUCCESS(rv, rv);
@@ -3363,6 +3380,12 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
   NS_ENSURE_STATE(dbFolderInfo);
   nsAutoCString modseq;
   modseq.AppendInt(mailboxHighestModSeq);
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup() && !mailboxHighestModSeq) {
+    // No usable server checkpoint is different from the text value "0".
+    modseq.Truncate();
+  }
+#endif
   MOZ_TRY(dbFolderInfo->SetCharProperty(kModSeqPropertyName, modseq));
   return NS_OK;
 }
@@ -3373,6 +3396,69 @@ NS_IMETHODIMP nsImapMailFolder::UpdateImapMailboxInfo(
 // We deal with it by throwing away the old database and any downloaded
 // messages and starting from scratch.
 nsresult nsImapMailFolder::HandleUidInvalidation(ImapUid newUidValidity) {
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(newUidValidity, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(GetDatabase());
+    nsCOMPtr<nsIMsgDatabase> database = mDatabase;
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(info)));
+    NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
+    ImapUid oldUidValidity;
+    MOZ_TRY(info->GetImapUidValidity(&oldUidValidity));
+    if (oldUidValidity == newUidValidity) {
+      return NS_OK;
+    }
+
+    // Pending operations can outlive their source rows and still name old UIDs.
+    NS_ENSURE_TRUE(!(mFlags & nsMsgFolderFlags::OfflineEvents),
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgOfflineOpsDatabase> operations = do_QueryInterface(database);
+    NS_ENSURE_TRUE(operations, NS_ERROR_NOT_AVAILABLE);
+    nsTArray<nsMsgKey> operationKeys;
+    MOZ_TRY(operations->ListAllOfflineOpIds(operationKeys));
+    NS_ENSURE_TRUE(operationKeys.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    uint64_t folderId;
+    MOZ_TRY(GetId(&folderId));
+    NS_ENSURE_TRUE(folderId, NS_ERROR_NOT_AVAILABLE);
+    nsTArray<nsMsgKey> keys;
+    nsTArray<nsMsgKey> staleKeys;
+    nsTHashSet<uint32_t> seenUids;
+    MOZ_TRY(database->ListAllKeys(keys));
+    // Validate the complete snapshot before deleting any physical records.
+    for (nsMsgKey key : keys) {
+      NS_ENSURE_TRUE(key && key != nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+      nsCOMPtr<nsIMsgDBHdr> header;
+      MOZ_TRY(database->GetMsgHdrForKey(key, getter_AddRefs(header)));
+      NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+      nsMsgKey headerKey;
+      MOZ_TRY(header->GetMessageKey(&headerKey));
+      NS_ENSURE_TRUE(headerKey == key, NS_ERROR_FILE_CORRUPTED);
+      nsCOMPtr<nsIMsgFolder> folder;
+      MOZ_TRY(header->GetFolder(getter_AddRefs(folder)));
+      NS_ENSURE_TRUE(folder, NS_ERROR_NOT_AVAILABLE);
+      uint64_t headerFolderId;
+      MOZ_TRY(folder->GetId(&headerFolderId));
+      NS_ENSURE_TRUE(headerFolderId == folderId, NS_ERROR_FILE_CORRUPTED);
+
+      uint32_t uid, pseudo;
+      MOZ_TRY(header->GetUint32Property("uidOnServer", &uid));
+      MOZ_TRY(header->GetUint32Property("pseudoHdr", &pseudo));
+      if (!uid || pseudo) {
+        continue;
+      }
+      NS_ENSURE_TRUE(oldUidValidity, NS_ERROR_NOT_AVAILABLE);
+      NS_ENSURE_TRUE(seenUids.EnsureInserted(uid), NS_ERROR_FILE_CORRUPTED);
+      staleKeys.AppendElement(key);
+    }
+    MOZ_TRY(database->DeleteMessages(staleKeys, nullptr));
+    MOZ_TRY(info->SetCharProperty(kModSeqPropertyName, EmptyCString()));
+    MOZ_TRY(info->SetUint32Property(kHighestRecordedUIDPropertyName, 0));
+    // Advance last so failed deletes or metadata writes remain retryable.
+    MOZ_TRY(info->SetImapUidValidity(newUidValidity));
+    return SummaryChanged();
+  }
+#endif
   NS_WARNING("uid validity seems to have changed, blowing away db");
   nsCOMPtr<nsIFile> pathFile;
   nsresult rv = GetFilePath(getter_AddRefs(pathFile));
@@ -6964,8 +7050,22 @@ nsImapMailFolder::SetUidValidity(ImapUid uidValidity) {
     nsCOMPtr<nsIDBFolderInfo> info;
     MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(info)));
     NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
-    // The native setter retires UID bindings, not rows, bodies or queued
-    // source identities. This does not recover messages into the new epoch.
+    ImapUid oldUidValidity;
+    MOZ_TRY(info->GetImapUidValidity(&oldUidValidity));
+    if (oldUidValidity != uidValidity) {
+      // Observing a new epoch fences cached commands immediately, but cannot
+      // rebind a pending operation's captured source to that epoch.
+      NS_ENSURE_TRUE(!(mFlags & nsMsgFolderFlags::OfflineEvents),
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<nsIMsgOfflineOpsDatabase> operations =
+          do_QueryInterface(mDatabase);
+      NS_ENSURE_TRUE(operations, NS_ERROR_NOT_AVAILABLE);
+      nsTArray<nsMsgKey> keys;
+      MOZ_TRY(operations->ListAllOfflineOpIds(keys));
+      NS_ENSURE_TRUE(keys.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+    }
+    // The native setter retires UID bindings, not rows or bodies. This does
+    // not recover messages into the new epoch.
     return info->SetImapUidValidity(uidValidity);
   }
 #endif

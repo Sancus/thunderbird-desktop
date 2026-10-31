@@ -3006,8 +3006,14 @@ void nsImapProtocol::ProcessSelectedStateURL() {
         case nsIImapUrl::nsImapLiteSelectFolder:
           if (GetServerStateParser().LastCommandSuccessful() &&
               m_imapMailFolderSink && !moreHeadersToDownload) {
-            m_imapMailFolderSink->SetUidValidity(
-                GetServerStateParser().FolderUIDValidity());
+            // Native synchronization validates retained sources before the
+            // epoch setter retires their bindings. The legacy path sets it
+            // here.
+#ifdef MOZ_PANORAMA
+            if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+#endif
+              m_imapMailFolderSink->SetUidValidity(
+                  GetServerStateParser().FolderUIDValidity());
             ProcessMailboxUpdate(false);  // handle uidvalidity change
           }
           break;

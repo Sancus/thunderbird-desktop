@@ -7,6 +7,9 @@
 #include "nsNetUtil.h"
 #include "nsIAppStartup.h"
 #include "nsImapOfflineSync.h"
+#ifdef MOZ_PANORAMA
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
 #include "nsImapMailFolder.h"
 #include "nsIMsgDatabase.h"
 #include "nsMsgFolderFlags.h"
@@ -102,6 +105,13 @@ nsImapOfflineSync::OnStopRunningUrl(nsIURI* url, nsresult exitCode) {
     nsImapProtocol::LogImapUrl(NS_SUCCEEDED(rv) ? "offline imap url succeeded "
                                                 : "offline imap url failed ",
                                imapUrl);
+
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      NS_FAILED(exitCode)) {
+    return FinishPlayback(url, exitCode);
+  }
+#endif
 
   // If we succeeded, or it was an imap move/copy that timed out, clear the
   // operation.
@@ -218,7 +228,8 @@ void nsImapOfflineSync::AdvanceToFirstIMAPFolder() {
   }
 }
 
-void nsImapOfflineSync::ProcessFlagOperation(nsIMsgOfflineImapOperation* op) {
+nsresult nsImapOfflineSync::ProcessFlagOperation(
+    nsIMsgOfflineImapOperation* op) {
   nsCOMPtr<nsIMsgOfflineImapOperation> currentOp = op;
   nsTArray<nsMsgKey> matchingFlagKeys;
   uint32_t currentKeyIndex = m_KeyIndex;
@@ -262,15 +273,39 @@ void nsImapOfflineSync::ProcessFlagOperation(nsIMsgOfflineImapOperation* op) {
         if (NS_SUCCEEDED(rv) && uriToSetFlags) {
           nsCOMPtr<nsIMsgMailNewsUrl> mailnewsUrl =
               do_QueryInterface(uriToSetFlags);
-          if (mailnewsUrl) mailnewsUrl->RegisterListener(this);
+          if (mailnewsUrl) {
+            rv = mailnewsUrl->RegisterListener(this);
+#ifdef MOZ_PANORAMA
+            if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+              return rv;
+#endif
+          }
         }
+#ifdef MOZ_PANORAMA
+        if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+          return NS_FAILED(rv) ? rv : NS_ERROR_NOT_AVAILABLE;
+#endif
       }
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+        return NS_ERROR_NOT_AVAILABLE;
+#endif
     }
-  } else
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+      return NS_ERROR_NOT_AVAILABLE;
+#endif
+  } else {
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+      return ProcessNextOperation();
+#endif
     ProcessNextOperation();
+  }
+  return NS_OK;
 }
 
-void nsImapOfflineSync::ProcessKeywordOperation(
+nsresult nsImapOfflineSync::ProcessKeywordOperation(
     nsIMsgOfflineImapOperation* op) {
   nsCOMPtr<nsIMsgOfflineImapOperation> currentOp = op;
   nsTArray<nsMsgKey> matchingKeywordKeys;
@@ -330,12 +365,36 @@ void nsImapOfflineSync::ProcessKeywordOperation(
         if (NS_SUCCEEDED(rv) && uriToStoreCustomKeywords) {
           nsCOMPtr<nsIMsgMailNewsUrl> mailnewsUrl =
               do_QueryInterface(uriToStoreCustomKeywords);
-          if (mailnewsUrl) mailnewsUrl->RegisterListener(this);
+          if (mailnewsUrl) {
+            rv = mailnewsUrl->RegisterListener(this);
+#ifdef MOZ_PANORAMA
+            if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+              return rv;
+#endif
+          }
         }
+#ifdef MOZ_PANORAMA
+        if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+          return NS_FAILED(rv) ? rv : NS_ERROR_NOT_AVAILABLE;
+#endif
       }
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+        return NS_ERROR_NOT_AVAILABLE;
+#endif
     }
-  } else
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+      return NS_ERROR_NOT_AVAILABLE;
+#endif
+  } else {
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+      return ProcessNextOperation();
+#endif
     ProcessNextOperation();
+  }
+  return NS_OK;
 }
 
 // XXX This should not be void but return an error to indicate which low
@@ -764,11 +823,20 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
     if (folderInfo && (m_KeyIndex < m_CurrentKeys.Length()) &&
         (m_pseudoOffline || (GetCurrentUIDValidity() != 0) ||
          !(folderFlags & nsMsgFolderFlags::ImapBox))) {
-      ImapUid curFolderUidValidity;
-      folderInfo->GetImapUidValidity(&curFolderUidValidity);
+      ImapUid curFolderUidValidity = 0;
+      nsresult validityRv =
+          folderInfo->GetImapUidValidity(&curFolderUidValidity);
       bool uidvalidityChanged =
           (!m_pseudoOffline && folderFlags & nsMsgFolderFlags::ImapBox) &&
           (GetCurrentUIDValidity() != curFolderUidValidity);
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+          (NS_FAILED(validityRv) || uidvalidityChanged)) {
+        return FinishPlayback(nullptr, NS_FAILED(validityRv)
+                                           ? validityRv
+                                           : NS_ERROR_NOT_AVAILABLE);
+      }
+#endif
       nsCOMPtr<nsIMsgOfflineImapOperation> currentOp;
       if (uidvalidityChanged)
         DeleteAllOfflineOpsForCurrentDB();
@@ -823,12 +891,33 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
           if (nextOp) {
             mCurrentPlaybackOpType = nextOp;
             m_KeyIndex = 0;
+#ifdef MOZ_PANORAMA
+            if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+              return ProcessNextOperation();
+#endif
             ProcessNextOperation();
           } else {
             DeleteAllOfflineOpsForCurrentDB();
             currentFolderFinished = true;
           }
         } else {
+#ifdef MOZ_PANORAMA
+          if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+              (mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kFlagsChanged ||
+               mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kAddKeywords ||
+               mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kRemoveKeywords)) {
+            // These operations finish through their URL listener. Do not
+            // report global completion while a later folder is still sending.
+            rv = mCurrentPlaybackOpType ==
+                         nsIMsgOfflineImapOperation::kFlagsChanged
+                     ? ProcessFlagOperation(currentOp)
+                     : ProcessKeywordOperation(currentOp);
+            return NS_FAILED(rv) ? FinishPlayback(nullptr, rv) : rv;
+          }
+#endif
           switch (mCurrentPlaybackOpType) {
             case nsIMsgOfflineImapOperation::kFlagsChanged:
               ProcessFlagOperation(currentOp);
@@ -891,6 +980,7 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
       m_singleFolderToUpdate->UpdateFolder(m_window);
     }
   }
+  if (NS_SUCCEEDED(rv)) rv = m_firstPlaybackError;
   // if we get here, then I *think* we're done. Not sure, though.
   nsCOMPtr<nsIUrlListener> saveListener = m_listener;
   m_listener = nullptr;
@@ -898,6 +988,32 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
   if (saveListener)
     saveListener->OnStopRunningUrl(nullptr /* don't know url */, rv);
   return rv;
+}
+
+// A failed native SELECT or playback never authorizes deleting its intent.
+nsresult nsImapOfflineSync::FinishPlayback(nsIURI* url, nsresult status) {
+  if (NS_FAILED(status) && NS_SUCCEEDED(m_firstPlaybackError)) {
+    m_firstPlaybackError = status;
+  }
+  // A refused idempotent flag command retains its payload for a later retry.
+  if (NS_FAILED(status) &&
+      (mCurrentPlaybackOpType == nsIMsgOfflineImapOperation::kFlagsChanged ||
+       mCurrentPlaybackOpType == nsIMsgOfflineImapOperation::kAddKeywords ||
+       mCurrentPlaybackOpType == nsIMsgOfflineImapOperation::kRemoveKeywords)) {
+    for (int32_t i = 0; i < m_currentOpsToClear.Count(); ++i) {
+      m_currentOpsToClear[i]->SetPlayingBack(false);
+    }
+  }
+  ClearDB();
+  if (status != NS_BINDING_ABORTED && m_listener && !m_singleFolderToUpdate &&
+      AdvanceToNextFolder()) {
+    return ProcessNextOperation();
+  }
+  nsCOMPtr<nsIUrlListener> listener = m_listener.forget();
+  nsresult result =
+      NS_FAILED(m_firstPlaybackError) ? m_firstPlaybackError : status;
+  if (listener) listener->OnStopRunningUrl(url, result);
+  return result;
 }
 
 void nsImapOfflineSync::DeleteAllOfflineOpsForCurrentDB() {

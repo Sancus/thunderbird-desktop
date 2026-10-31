@@ -988,9 +988,9 @@ TEST_F(DeliveryHeaderProperties, Uint32ReadStepErrorPreservesSentinel) {
   CheckWitness();
 }
 
-using DISABLED_DeliveryCompleteHeader = DeliveryMessageReferences;
+using DeliveryCompleteHeader = DeliveryMessageReferences;
 
-TEST_F(DISABLED_DeliveryCompleteHeader, DetachedAliasesPreserveExplicitEmpty) {
+TEST_F(DeliveryCompleteHeader, DetachedAliasesPreserveExplicitEmpty) {
   RefPtr<nsIMsgDBHdr> draft = new DetachedMsgHdr(mFolder);
   ASSERT_EQ(NS_OK, draft->SetCharset("UTF-8"_ns));
   ASSERT_EQ(NS_OK, draft->SetAccountKey("received-account"_ns));
@@ -1025,7 +1025,7 @@ TEST_F(DISABLED_DeliveryCompleteHeader, DetachedAliasesPreserveExplicitEmpty) {
   EXPECT_EQ(5u, names.Length());
 }
 
-TEST_F(DISABLED_DeliveryCompleteHeader, RawExtrasKeepOrderCaseAndUtf8) {
+TEST_F(DeliveryCompleteHeader, RawExtrasKeepOrderCaseAndUtf8) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   RawHdr raw;
   raw.messageId = "exact-extras@invalid"_ns;
@@ -1074,7 +1074,7 @@ TEST_F(DISABLED_DeliveryCompleteHeader, RawExtrasKeepOrderCaseAndUtf8) {
   EXPECT_TRUE(names.Contains("replyTo"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCompleteHeader, UnspecifiedStorageRemainsAbsent) {
+TEST_F(DeliveryCompleteHeader, UnspecifiedStorageRemainsAbsent) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   RawHdr raw;
   raw.messageId = "unspecified-storage@invalid"_ns;
@@ -1091,7 +1091,7 @@ TEST_F(DISABLED_DeliveryCompleteHeader, UnspecifiedStorageRemainsAbsent) {
   EXPECT_FALSE(names.Contains("lineCount"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCompleteHeader, AbsentStorageOptionalsPreserveExtras) {
+TEST_F(DeliveryCompleteHeader, AbsentStorageOptionalsPreserveExtras) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   RawHdr raw;
   raw.messageId = "storage-none@invalid"_ns;
@@ -1113,8 +1113,7 @@ TEST_F(DISABLED_DeliveryCompleteHeader, AbsentStorageOptionalsPreserveExtras) {
   EXPECT_EQ("original"_ns, token);
 }
 
-TEST_F(DISABLED_DeliveryCompleteHeader,
-       ExplicitStorageZeroAndEmptyOverrideExtras) {
+TEST_F(DeliveryCompleteHeader, ExplicitStorageZeroAndEmptyOverrideExtras) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   RawHdr raw;
   raw.extras = {{"messageSize"_ns, "31"_ns},
@@ -1164,7 +1163,7 @@ TEST_F(DeliveryHeaderProperties, DetachedUint32RetainsTypedStorage) {
             draft->GetUint32Property("delivery.number", nullptr));
 }
 
-TEST_F(DISABLED_DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {
+TEST_F(DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   nsCOMPtr<nsIMsgDBHdr> draft;
   ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(draft)));

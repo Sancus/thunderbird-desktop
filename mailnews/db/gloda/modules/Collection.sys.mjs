@@ -425,6 +425,11 @@ export var GlodaCollectionManager = {
 
     // collections
     for (const collection of this.getCollectionsForNounID(aNounID)) {
+      if (collection._pendingIdMap) {
+        for (const itemId of aItemIds) {
+          collection._pendingIdMap[itemId] = null;
+        }
+      }
       const removeItems = aItemIds
         .filter(itemId => itemId in collection._idMap)
         .map(itemId => collection._idMap[itemId]);
@@ -464,6 +469,14 @@ export var GlodaCollectionManager = {
 
     // collections
     for (const collection of this.getCollectionsForNounID(aNounID)) {
+      if (collection._pendingIdMap) {
+        (collection._pendingDeletionFilters ??= []).push(aFilter);
+        for (const item of collection.pendingItems) {
+          if (aFilter(item)) {
+            collection._pendingIdMap[item.id] = null;
+          }
+        }
+      }
       const removeItems = collection.items.filter(aFilter);
       if (removeItems.length) {
         collection._onItemsRemoved(removeItems);
@@ -500,6 +513,7 @@ export function GlodaCollection(
   }
 
   this.pendingItems = [];
+  // Null entries reject late initial-query rows deleted during the query.
   this._pendingIdMap = {};
   this.items = [];
   this._idMap = {};

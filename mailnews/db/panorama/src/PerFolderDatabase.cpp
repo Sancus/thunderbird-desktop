@@ -2194,16 +2194,22 @@ NS_IMPL_ISUPPORTS(FolderInfo, nsIDBFolderInfo)
 
 NS_IMETHODIMP FolderInfo::GetFlags(int32_t* aFlags) {
   NS_ENSURE_ARG_POINTER(aFlags);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   *aFlags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
   return NS_OK;
 }
 
 NS_IMETHODIMP FolderInfo::SetFlags(int32_t aFlags) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().UpdateFlags(mFolderId, aFlags);
 }
 
 NS_IMETHODIMP FolderInfo::OrFlags(int32_t aFlags, int32_t* aOutFlags) {
   NS_ENSURE_ARG_POINTER(aOutFlags);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   uint32_t flags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
   flags |= aFlags;
   MOZ_TRY(FolderDB().UpdateFlags(mFolderId, flags));
@@ -2213,6 +2219,8 @@ NS_IMETHODIMP FolderInfo::OrFlags(int32_t aFlags, int32_t* aOutFlags) {
 
 NS_IMETHODIMP FolderInfo::AndFlags(int32_t aFlags, int32_t* aOutFlags) {
   NS_ENSURE_ARG_POINTER(aOutFlags);
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   uint32_t flags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
   flags &= aFlags;
   MOZ_TRY(FolderDB().UpdateFlags(mFolderId, flags));
@@ -2418,11 +2426,15 @@ NS_IMETHODIMP FolderInfo::ChangeExpungedBytes(int32_t aDelta) {
 }
 NS_IMETHODIMP FolderInfo::GetCharProperty(const char* propertyName,
                                           nsACString& propertyValue) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().GetFolderProperty(
       mFolderId, nsDependentCString(propertyName), propertyValue);
 }
 NS_IMETHODIMP FolderInfo::SetCharProperty(const char* propertyName,
                                           const nsACString& propertyValue) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().SetFolderProperty(
       mFolderId, nsDependentCString(propertyName), propertyValue);
 }
@@ -2431,6 +2443,8 @@ NS_IMETHODIMP FolderInfo::GetUint32Property(const char* propertyName,
                                             uint32_t* propertyValue) {
   NS_ENSURE_ARG_POINTER(propertyValue);
   *propertyValue = defaultValue;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   int64_t value = defaultValue;
   MOZ_TRY(FolderDB().GetFolderProperty(
       mFolderId, nsDependentCString(propertyName), &value));
@@ -2443,6 +2457,8 @@ NS_IMETHODIMP FolderInfo::GetUint32Property(const char* propertyName,
 }
 NS_IMETHODIMP FolderInfo::SetUint32Property(const char* propertyName,
                                             uint32_t propertyValue) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().SetFolderProperty(
       mFolderId, nsDependentCString(propertyName), (int64_t)propertyValue);
 }
@@ -2451,11 +2467,15 @@ NS_IMETHODIMP FolderInfo::GetInt64Property(const char* propertyName,
                                            int64_t* propertyValue) {
   NS_ENSURE_ARG_POINTER(propertyValue);
   *propertyValue = defaultValue;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().GetFolderProperty(
       mFolderId, nsDependentCString(propertyName), propertyValue);
 }
 NS_IMETHODIMP FolderInfo::SetInt64Property(const char* propertyName,
                                            int64_t propertyValue) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().SetFolderProperty(
       mFolderId, nsDependentCString(propertyName), propertyValue);
 }
@@ -2464,6 +2484,8 @@ NS_IMETHODIMP FolderInfo::GetBooleanProperty(const char* propertyName,
                                              bool* propertyValue) {
   NS_ENSURE_ARG_POINTER(propertyValue);
   *propertyValue = defaultValue;
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   int64_t value = defaultValue;
   MOZ_TRY(FolderDB().GetFolderProperty(
       mFolderId, nsDependentCString(propertyName), &value));
@@ -2472,11 +2494,15 @@ NS_IMETHODIMP FolderInfo::GetBooleanProperty(const char* propertyName,
 }
 NS_IMETHODIMP FolderInfo::SetBooleanProperty(const char* propertyName,
                                              bool propertyValue) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().SetFolderProperty(
       mFolderId, nsDependentCString(propertyName), (int64_t)propertyValue);
 }
 NS_IMETHODIMP FolderInfo::GetProperty(const char* propertyName,
                                       nsAString& propertyValue) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   nsAutoCString value;
   nsresult rv = FolderDB().GetFolderProperty(
       mFolderId, nsDependentCString(propertyName), value);
@@ -2486,6 +2512,8 @@ NS_IMETHODIMP FolderInfo::GetProperty(const char* propertyName,
 }
 NS_IMETHODIMP FolderInfo::SetProperty(const char* propertyName,
                                       const nsAString& propertyValue) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().SetFolderProperty(mFolderId,
                                       nsDependentCString(propertyName),
                                       NS_ConvertUTF16toUTF8(propertyValue));
@@ -2493,6 +2521,7 @@ NS_IMETHODIMP FolderInfo::SetProperty(const char* propertyName,
 nsresult FolderInfo::ReadTransferProperties(
     nsTArray<FolderImportProperty>& properties) {
   MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().GetFolderProperties(mFolderId, properties);
 }
 
@@ -2680,6 +2709,7 @@ NS_IMETHODIMP FolderInfo::GetTransferInfo(nsIPropertyBag2** transferInfo) {
 NS_IMETHODIMP FolderInfo::InitFromTransferInfo(nsIPropertyBag2* transferInfo) {
   NS_ENSURE_ARG(transferInfo);
   MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   nsTArray<FolderImportProperty> properties;
   MOZ_TRY(DecodeTransferInfo(transferInfo, properties));
   for (auto& property : properties) {
@@ -2698,6 +2728,7 @@ NS_IMETHODIMP FolderInfo::InitFromTransferInfo(nsIPropertyBag2* transferInfo) {
   }
   MOZ_TRY(ValidateTransferProperties(properties));
   MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   uint32_t previousFlags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
   uint32_t flags = previousFlags;
   Maybe<uint32_t> transferredFlags, epoch;
@@ -2771,10 +2802,14 @@ NS_IMETHODIMP FolderInfo::SetKnownArtsSet(const char* aKnownArtsSet) {
       "knownArts", nsDependentCString(aKnownArtsSet ? aKnownArtsSet : ""));
 }
 NS_IMETHODIMP FolderInfo::GetFolderName(nsACString& aFolderName) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   aFolderName = MOZ_TRY(FolderDB().GetFolderName(mFolderId));
   return NS_OK;
 }
 NS_IMETHODIMP FolderInfo::SetFolderName(const nsACString& aFolderName) {
+  MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
+  MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
   return FolderDB().UpdateName(mFolderId, aFolderName);
 }
 

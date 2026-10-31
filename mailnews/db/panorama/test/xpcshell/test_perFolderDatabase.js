@@ -5218,3 +5218,126 @@ add_task(
     Assert.deepEqual(events, [], "Removed ordinary listeners stay removed");
   }
 );
+
+add_task(function test_folderRoutingKeepsPhysicalSourceAndWrapperIdentity() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("routing-source-owner");
+  const other = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("routing-source-bystander");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const key = addMessage({ folderId: folder.id });
+  const header = db.getMsgHdrForKey(key);
+  const draft = db.createNewHdr();
+  const info = db.dBFolderInfo;
+  const originalName = info.folderName;
+  const source = database.sourceId;
+  const connection = database.connectionForTests;
+  const originalKeys = db.listAllKeys();
+
+  Assert.strictEqual(db.folder, folder);
+  Assert.strictEqual(header.folder, folder);
+  Assert.strictEqual(draft.folder, folder);
+  Assert.equal(db.folder.id, folder.id);
+  Assert.strictEqual(db.folder.server, folder.server);
+  Assert.equal(db.folder.URI, folder.URI);
+  Assert.strictEqual(otherDB.folder, other);
+  Assert.equal(
+    info.getUint32Property("routing.absent", 0xfedcba98),
+    0xfedcba98
+  );
+
+  /**
+   * Replaces this fixture's source marker without changing folder rows.
+   *
+   * @param {string} value - Exact marker to store.
+   */
+  function setSource(value) {
+    const statement = connection.createStatement(
+      "UPDATE database_identity SET sourceId = :source"
+    );
+    try {
+      statement.params.source = value;
+      statement.execute();
+    } finally {
+      statement.finalize();
+    }
+  }
+
+  for (const fault of [
+    {
+      name: "replacement",
+      value: Services.uuid.generateUUID().toString(),
+      error: Cr.NS_ERROR_NOT_AVAILABLE,
+    },
+    {
+      name: "corrupt",
+      value: "invalid-routing-source",
+      error: Cr.NS_ERROR_FILE_CORRUPTED,
+    },
+    { name: "missing", error: Cr.NS_ERROR_FAILURE },
+  ]) {
+    try {
+      if (fault.name === "missing") {
+        connection.executeSimpleSQL(
+          "ALTER TABLE database_identity RENAME TO hidden_routing_identity"
+        );
+      } else {
+        setSource(fault.value);
+      }
+      Assert.throws(
+        () => db.folder,
+        error => error.result === fault.error,
+        `${fault.name} source cannot route the retained wrapper`
+      );
+      Assert.throws(
+        () => info.folderName,
+        error => error.result === fault.error,
+        `${fault.name} source cannot route its folder-info transport`
+      );
+      Assert.ok(!connection.transactionInProgress);
+    } finally {
+      if (fault.name === "missing") {
+        connection.executeSimpleSQL(
+          "ALTER TABLE hidden_routing_identity RENAME TO database_identity"
+        );
+      } else {
+        setSource(source);
+      }
+    }
+    Assert.strictEqual(db.folder, folder);
+    Assert.equal(info.folderName, originalName);
+    Assert.strictEqual(otherDB.folder, other);
+  }
+
+  connection.beginTransaction();
+  try {
+    Assert.strictEqual(db.folder, folder);
+    Assert.equal(info.folderName, originalName);
+    setSource(Services.uuid.generateUUID().toString());
+    Assert.throws(() => db.folder, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.ok(connection.transactionInProgress, "The caller still owns SQL");
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.equal(database.sourceId, source);
+  Assert.strictEqual(db.folder, folder);
+  Assert.deepEqual(db.listAllKeys(), originalKeys);
+
+  db.forceClosed();
+  Assert.throws(() => db.folder, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => info.folderName, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.strictEqual(
+    header.folder,
+    folder,
+    "The live physical header remains usable"
+  );
+  const reopened = folder.msgDatabase;
+  Assert.notStrictEqual(reopened, db);
+  Assert.strictEqual(reopened.folder, folder);
+  Assert.equal(reopened.dBFolderInfo.folderName, originalName);
+  Assert.deepEqual(reopened.listAllKeys(), originalKeys);
+  Assert.strictEqual(otherDB.folder, other);
+});

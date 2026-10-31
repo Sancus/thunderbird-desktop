@@ -1810,6 +1810,8 @@ add_task(function test_accountedDeletionPreservesErrorsAndCallerOwnership() {
     );
   }
   const source = database.sourceId;
+  const id = folder.id;
+  const stored = storedFolderInfoState(id);
   connection.executeSimpleSQL(
     "UPDATE database_identity SET sourceId = '{12345678-1234-1234-1234-123456789abc}'"
   );
@@ -1819,7 +1821,8 @@ add_task(function test_accountedDeletionPreservesErrorsAndCallerOwnership() {
       /NS_ERROR_NOT_AVAILABLE/
     );
     Assert.ok(db.containsKey(key));
-    Assert.equal(info.expungedBytes, 11);
+    Assert.throws(() => info.expungedBytes, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.deepEqual(storedFolderInfoState(id), stored);
   } finally {
     const restore = connection.createStatement(
       "UPDATE database_identity SET sourceId = :source"
@@ -1831,6 +1834,7 @@ add_task(function test_accountedDeletionPreservesErrorsAndCallerOwnership() {
       restore.finalize();
     }
   }
+  Assert.equal(info.expungedBytes, 11);
   db.deleteMessages([key], null);
   Assert.ok(!db.containsKey(key));
   Assert.equal(info.expungedBytes, 34);
@@ -4228,3 +4232,439 @@ add_task(function test_serverRootSortOrderUsesNativeMetadata() {
   Assert.ok(folder.isServer);
   Assert.deepEqual(readStored(), [7, "integer"]);
 });
+
+/**
+ * Read physical folder metadata and exact stored property types and values.
+ *
+ * @param {number} id - Physical folder ID, including a retired folder ID.
+ * @returns {Array<Array>} The folder row and stored property rows.
+ */
+function storedFolderInfoState(id) {
+  const connection = database.connectionForTests;
+  const folder = connection.createStatement(
+    "SELECT parent, name, flags FROM folders WHERE id = :id"
+  );
+  let row = null;
+  try {
+    folder.params.id = id;
+    if (folder.executeStep()) {
+      row = [folder.row.parent, folder.row.name, folder.row.flags];
+    }
+  } finally {
+    folder.finalize();
+  }
+  const properties = connection.createStatement(
+    "SELECT name, typeof(value) AS type, CAST(value AS TEXT) AS text " +
+      "FROM folder_properties WHERE id = :id ORDER BY name"
+  );
+  const rows = [];
+  try {
+    properties.params.id = id;
+    while (properties.executeStep()) {
+      rows.push([
+        properties.row.name,
+        properties.row.type,
+        properties.row.text,
+      ]);
+    }
+  } finally {
+    properties.finalize();
+  }
+  return [row, rows];
+}
+
+/**
+ * Enumerate persisted property access through the public folder-info facade.
+ *
+ * @param {nsIDBFolderInfo} info - The retained facade to exercise.
+ * @param {nsIPropertyBag2} transfer - A valid native transfer bag.
+ * @returns {Array<Array>} Named operations and their callbacks.
+ */
+function folderInfoPropertyOperations(info, transfer) {
+  return [
+    ["generic char read", () => info.getCharProperty("guardedMetadata.char")],
+    [
+      "generic char write",
+      () => info.setCharProperty("guardedMetadata.char", "changed"),
+    ],
+    ["generic text read", () => info.getProperty("guardedMetadata.text")],
+    [
+      "generic text write",
+      () => info.setProperty("guardedMetadata.text", "changed"),
+    ],
+    [
+      "generic uint32 read",
+      () => info.getUint32Property("guardedMetadata.uint", 19),
+    ],
+    [
+      "generic uint32 write",
+      () => info.setUint32Property("guardedMetadata.uint", 20),
+    ],
+    [
+      "generic int64 read",
+      () => info.getInt64Property("guardedMetadata.int", -19),
+    ],
+    [
+      "generic int64 write",
+      () => info.setInt64Property("guardedMetadata.int", -20),
+    ],
+    [
+      "generic boolean read",
+      () => info.getBooleanProperty("guardedMetadata.bool", false),
+    ],
+    [
+      "generic boolean write",
+      () => info.setBooleanProperty("guardedMetadata.bool", true),
+    ],
+    ["flags read", () => info.flags],
+    [
+      "flags write",
+      () => {
+        info.flags = Ci.nsMsgFolderFlags.Mail;
+      },
+    ],
+    ["or flags", () => info.orFlags(Ci.nsMsgFolderFlags.Favorite)],
+    ["and flags", () => info.andFlags(Ci.nsMsgFolderFlags.Mail)],
+    ["folder name read", () => info.folderName],
+    [
+      "folder name write",
+      () => {
+        info.folderName = "changed";
+      },
+    ],
+    ["mailbox name read", () => info.mailboxName],
+    [
+      "mailbox name write",
+      () => {
+        info.mailboxName = "changed";
+      },
+    ],
+    ["known articles read", () => info.knownArtsSet],
+    [
+      "known articles write",
+      () => {
+        info.knownArtsSet = "1-7";
+      },
+    ],
+    ["view flags read", () => info.viewFlags],
+    [
+      "view flags write",
+      () => {
+        info.viewFlags = Ci.nsMsgViewFlagsType.kThreadedDisplay;
+      },
+    ],
+    ["sort type read", () => info.sortType],
+    [
+      "sort type write",
+      () => {
+        info.sortType = Ci.nsMsgViewSortType.byDate;
+      },
+    ],
+    ["sort order read", () => info.sortOrder],
+    [
+      "sort order write",
+      () => {
+        info.sortOrder = Ci.nsMsgViewSortOrder.ascending;
+      },
+    ],
+    ["view type read", () => info.viewType],
+    [
+      "view type write",
+      () => {
+        info.viewType = Ci.nsMsgViewType.eShowAllThreads;
+      },
+    ],
+    ["high water read", () => info.highWater],
+    [
+      "high water write",
+      () => {
+        info.highWater = 17;
+      },
+    ],
+    ["version read", () => info.version],
+    [
+      "version write",
+      () => {
+        info.version = 17;
+      },
+    ],
+    ["expunged bytes read", () => info.expungedBytes],
+    [
+      "expunged bytes write",
+      () => {
+        info.expungedBytes = 17;
+      },
+    ],
+    ["folder size read", () => info.folderSize],
+    [
+      "folder size write",
+      () => {
+        info.folderSize = 17;
+      },
+    ],
+    ["folder date read", () => info.folderDate],
+    [
+      "folder date write",
+      () => {
+        info.folderDate = 17;
+      },
+    ],
+    ["sort position read", () => info.userSortOrder],
+    [
+      "sort position write",
+      () => {
+        info.userSortOrder = 17;
+      },
+    ],
+    ["total pending read", () => info.imapTotalPendingMessages],
+    [
+      "total pending write",
+      () => {
+        info.imapTotalPendingMessages = 17;
+      },
+    ],
+    ["unread pending read", () => info.imapUnreadPendingMessages],
+    [
+      "unread pending write",
+      () => {
+        info.imapUnreadPendingMessages = 17;
+      },
+    ],
+    ["transfer read", () => info.GetTransferInfo()],
+    ["transfer write", () => info.initFromTransferInfo(transfer)],
+  ];
+}
+
+add_task(
+  function test_folderInfoPropertiesKeepTypedPersistenceAndCallerTransaction() {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("guarded-property-types");
+    const other = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("guarded-property-types-other");
+    const id = folder.id;
+    const info = folder.msgDatabase.dBFolderInfo;
+    const connection = database.connectionForTests;
+    const unrelated = storedFolderInfoState(other.id);
+    const before = storedFolderInfoState(id);
+    Assert.equal(info.getCharProperty("guardedMetadata.char"), "");
+    Assert.equal(info.getProperty("guardedMetadata.text"), "");
+    Assert.equal(info.getUint32Property("guardedMetadata.uint", 19), 19);
+    Assert.equal(info.getInt64Property("guardedMetadata.int", -19), -19);
+    Assert.equal(info.getBooleanProperty("guardedMetadata.bool", true), true);
+    Assert.deepEqual(storedFolderInfoState(id), before);
+    info.setCharProperty("guardedMetadata.char", "");
+    info.setProperty("guardedMetadata.text", "café 日本語 📧");
+    info.setUint32Property("guardedMetadata.uint", 0xffffffff);
+    info.setInt64Property("guardedMetadata.int", -0x100000001);
+    info.setBooleanProperty("guardedMetadata.bool", false);
+    const stored = storedFolderInfoState(id);
+    Assert.deepEqual(
+      stored[1].filter(([name]) => name.startsWith("guardedMetadata.")),
+      [
+        ["guardedMetadata.bool", "integer", "0"],
+        ["guardedMetadata.char", "text", ""],
+        ["guardedMetadata.int", "integer", "-4294967297"],
+        ["guardedMetadata.text", "text", "café 日本語 📧"],
+        ["guardedMetadata.uint", "integer", "4294967295"],
+      ]
+    );
+    connection.beginTransaction();
+    try {
+      info.setCharProperty("guardedMetadata.char", "line\nπ");
+      info.setProperty("guardedMetadata.text", "");
+      info.setUint32Property("guardedMetadata.uint", 0);
+      info.setInt64Property("guardedMetadata.int", 0x100000002);
+      info.setBooleanProperty("guardedMetadata.bool", true);
+      Assert.equal(info.getCharProperty("guardedMetadata.char"), "line\nπ");
+      Assert.equal(info.getProperty("guardedMetadata.text"), "");
+      Assert.equal(info.getUint32Property("guardedMetadata.uint", 19), 0);
+      Assert.equal(
+        info.getInt64Property("guardedMetadata.int", -19),
+        0x100000002
+      );
+      Assert.equal(
+        info.getBooleanProperty("guardedMetadata.bool", false),
+        true
+      );
+      Assert.ok(connection.transactionInProgress);
+    } finally {
+      connection.rollbackTransaction();
+    }
+    Assert.deepEqual(storedFolderInfoState(id), stored);
+    for (const invalid of [-1, 0x100000000]) {
+      info.setInt64Property("guardedMetadata.uint", invalid);
+      Assert.throws(
+        () => info.getUint32Property("guardedMetadata.uint", 19),
+        error => error.result == Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA
+      );
+      Assert.equal(info.getInt64Property("guardedMetadata.uint", 0), invalid);
+    }
+    info.setUint32Property("guardedMetadata.uint", 0xffffffff);
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+      .getService(Ci.nsIMsgDBService)
+      .forceFolderDBClosed(folder);
+    const reopened = folder.msgDatabase.dBFolderInfo;
+    Assert.equal(reopened.getCharProperty("guardedMetadata.char"), "");
+    Assert.equal(
+      reopened.getProperty("guardedMetadata.text"),
+      "café 日本語 📧"
+    );
+    Assert.equal(
+      reopened.getUint32Property("guardedMetadata.uint", 19),
+      0xffffffff
+    );
+    Assert.equal(
+      reopened.getInt64Property("guardedMetadata.int", -19),
+      -0x100000001
+    );
+    Assert.equal(
+      reopened.getBooleanProperty("guardedMetadata.bool", true),
+      false
+    );
+    Assert.equal(folder.id, id);
+    Assert.deepEqual(storedFolderInfoState(id), stored);
+    Assert.deepEqual(storedFolderInfoState(other.id), unrelated);
+  }
+);
+
+add_task(function test_folderInfoPropertiesRejectClosedAndDeletedOwners() {
+  for (const state of ["closed", "deleted"]) {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder(`guarded-property-${state}`);
+    const id = folder.id;
+    const db = folder.msgDatabase;
+    const info = db.dBFolderInfo;
+    info.setCharProperty("guardedMetadata.char", "retained");
+    const transfer = info.GetTransferInfo();
+    const file = folder.filePath;
+    const existed = file.exists();
+    if (state == "closed") {
+      db.forceClosed();
+    } else {
+      folderDB.deleteFolder(id);
+    }
+    const afterRetirement = storedFolderInfoState(id);
+    for (const [name, operation] of folderInfoPropertyOperations(
+      info,
+      transfer
+    )) {
+      Assert.throws(
+        operation,
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+        `${state}: ${name} cannot use a retired folder-info facade`
+      );
+      Assert.deepEqual(storedFolderInfoState(id), afterRetirement);
+    }
+    Assert.equal(
+      file.exists(),
+      existed,
+      "Rejected properties do not alter the body path"
+    );
+  }
+});
+
+add_task(
+  function test_folderInfoPropertiesRequireCapturedSourceAndKeepFirstErrors() {
+    const folder = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("guarded-property-source");
+    const other = rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("guarded-property-source-other");
+    const id = folder.id;
+    const info = folder.msgDatabase.dBFolderInfo;
+    info.setCharProperty("guardedMetadata.char", "retained");
+    const transfer = info.GetTransferInfo();
+    const operations = folderInfoPropertyOperations(info, transfer);
+    const before = storedFolderInfoState(id);
+    const unrelated = storedFolderInfoState(other.id);
+    const connection = database.connectionForTests;
+    connection.beginTransaction();
+    try {
+      const update = connection.createStatement(
+        "UPDATE database_identity SET sourceId = :source"
+      );
+      try {
+        update.params.source = Services.uuid.generateUUID().toString();
+        update.execute();
+      } finally {
+        update.finalize();
+      }
+      for (const [name, operation] of operations) {
+        Assert.throws(
+          operation,
+          error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+          `${name} requires the facade's captured source`
+        );
+        Assert.deepEqual(storedFolderInfoState(id), before);
+        Assert.ok(connection.transactionInProgress);
+      }
+    } finally {
+      connection.rollbackTransaction();
+    }
+    connection.executeSimpleSQL(
+      "ALTER TABLE database_identity RENAME TO held_property_identity"
+    );
+    try {
+      for (const [name, operation] of operations) {
+        Assert.throws(
+          operation,
+          error => error.result == Cr.NS_ERROR_FAILURE,
+          `${name} preserves the source-reader failure`
+        );
+        Assert.deepEqual(storedFolderInfoState(id), before);
+      }
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE held_property_identity RENAME TO database_identity"
+      );
+    }
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER reject_guarded_property BEFORE INSERT ON folder_properties " +
+        `WHEN NEW.id = ${id} AND NEW.name GLOB 'guardedMetadata.*' ` +
+        "BEGIN SELECT RAISE(ABORT, 'property write fault'); END"
+    );
+    connection.beginTransaction();
+    try {
+      for (const [name, operation] of operations.filter(
+        ([label]) => label.startsWith("generic ") && label.endsWith(" write")
+      )) {
+        Assert.throws(
+          operation,
+          error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT,
+          `${name} preserves the actual write error`
+        );
+        Assert.ok(connection.transactionInProgress);
+        Assert.deepEqual(storedFolderInfoState(id), before);
+      }
+    } finally {
+      connection.rollbackTransaction();
+      connection.executeSimpleSQL("DROP TRIGGER reject_guarded_property");
+    }
+    connection.executeSimpleSQL(
+      "ALTER TABLE folder_properties RENAME TO held_guarded_properties"
+    );
+    try {
+      for (const [name, operation] of operations.filter(([label]) =>
+        label.startsWith("generic ")
+      )) {
+        Assert.throws(
+          operation,
+          error => error.result == Cr.NS_ERROR_FAILURE,
+          `${name} does not treat a property-table error as absence`
+        );
+      }
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE held_guarded_properties RENAME TO folder_properties"
+      );
+    }
+    Assert.ok(!connection.transactionInProgress);
+    Assert.equal(info.getCharProperty("guardedMetadata.char"), "retained");
+    Assert.deepEqual(storedFolderInfoState(id), before);
+    Assert.deepEqual(storedFolderInfoState(other.id), unrelated);
+  }
+);

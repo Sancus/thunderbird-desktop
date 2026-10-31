@@ -651,7 +651,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   EXPECT_FALSE(filter.Matches(missing, missing->FolderId()));
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
+TEST_F(DeliveryCoreMessageExistence,
        ColdRemovalCallbackSeesCommittedRowAndReadableHeader) {
   nsMsgKey survivor, removed, thread;
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
@@ -681,8 +681,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   CheckRemovedState(retained, removed, survivor, thread);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
-       WarmRemovalUsesReturnedStoredFields) {
+TEST_F(DeliveryCoreMessageExistence, WarmRemovalUsesReturnedStoredFields) {
   nsMsgKey removed;
   ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));
   RefPtr<Message> header = new Message(removed);
@@ -716,7 +715,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   EXPECT_FALSE(exists);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
+TEST_F(DeliveryCoreMessageExistence,
        RemovalStepFailureRollsBackWithoutNotification) {
   nsMsgKey survivor, removed, thread;
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
@@ -773,7 +772,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   CheckRemovalProperty(removed, false);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
+TEST_F(DeliveryCoreMessageExistence,
        RemovalCommitFailureRollsBackWithoutNotification) {
   nsMsgKey survivor, removed, thread;
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
@@ -838,8 +837,7 @@ TEST_F(DISABLED_DeliveryCoreMessageExistence,
   CheckRemovalProperty(removed, false);
 }
 
-TEST_F(DISABLED_DeliveryCoreMessageExistence,
-       RemovalRejectsForeignTransaction) {
+TEST_F(DeliveryCoreMessageExistence, RemovalRejectsForeignTransaction) {
   nsMsgKey survivor, removed;
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, survivor));
   ASSERT_EQ(NS_OK, Add("removed@invalid"_ns, removed));

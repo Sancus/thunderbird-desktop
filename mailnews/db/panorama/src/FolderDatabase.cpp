@@ -409,10 +409,15 @@ FolderDatabase::MoveFolderWithin(uint64_t parentId, uint64_t childId,
   return NS_OK;
 }
 
-nsresult FolderDatabase::RequireCommittedHierarchyMutation() {
+nsresult FolderDatabase::RequireCurrentOwner() const {
   NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
                      DatabaseCore::sInstance->mFolderDatabase.get() == this,
                  NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult FolderDatabase::RequireCommittedHierarchyMutation() {
+  MOZ_TRY(RequireCurrentOwner());
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   return active ? NS_ERROR_IN_PROGRESS : NS_OK;
@@ -922,7 +927,7 @@ nsresult FolderDatabase::SetFolderUidValidity(uint64_t folderId,
   if (!folderId || folderId > INT64_MAX) {
     return NS_ERROR_NOT_AVAILABLE;
   }
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -1041,6 +1046,7 @@ nsresult FolderDatabase::GetFolderProperties(
 
 nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
                                            nsACString& value) {
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "GetFolderProperty"_ns,
@@ -1063,6 +1069,7 @@ nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
 
 nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
                                            int64_t* value) {
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "GetFolderProperty"_ns,
@@ -1085,6 +1092,7 @@ nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
 
 nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
                                            const nsACString& value) {
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "SetFolderProperty"_ns,
@@ -1101,6 +1109,7 @@ nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
 
 nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
                                            int64_t value) {
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "SetFolderProperty"_ns,
@@ -1117,6 +1126,7 @@ nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
 
 nsresult FolderDatabase::GetVirtualFolderFolders(
     uint64_t virtualFolderId, nsTArray<uint64_t>& searchFolderIds) {
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "GetVirtualFolderFolders"_ns,
@@ -1144,7 +1154,7 @@ nsresult FolderDatabase::GetVirtualFolderFolders(
 
 nsresult FolderDatabase::SetVirtualFolderFolders(
     uint64_t virtualFolderId, nsTArray<uint64_t>& searchFolderIds) {
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));

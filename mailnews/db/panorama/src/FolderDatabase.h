@@ -92,6 +92,7 @@ class FolderDatabase : public nsIFolderDatabase {
   friend class DatabaseCore;
   friend class FolderInfo;
   friend class DeliveryCoreProperties;
+  friend class DeliveryCoreReferences;
   friend class VirtualFolderFilter;
   friend class VirtualFolderWrapper;
 
@@ -150,6 +151,7 @@ class FolderDatabase : public nsIFolderDatabase {
   nsresult DeleteFolderTree(uint64_t folderId, bool root,
                             const nsACString& serverKey);
 
+  nsresult RequireCurrentOwner() const;
   nsresult RequireCommittedHierarchyMutation();
   nsresult CheckFolderRelocationRecovery(uint64_t folderId, bool subtree);
 

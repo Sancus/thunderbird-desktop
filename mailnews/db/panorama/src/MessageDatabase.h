@@ -571,6 +571,7 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult VerifyBodyRelocationRows(const FolderBodyRelocation& plan);
   nsresult CheckPendingFolderRelocation(uint64_t folderId);
   nsresult CheckPendingMessageRelocation(nsMsgKey key);
+  nsresult RequireCurrentOwner() const;
   nsresult RequireCommittedSearchRead();
   nsresult GetSearchWatermark(uint64_t& sequence);
 

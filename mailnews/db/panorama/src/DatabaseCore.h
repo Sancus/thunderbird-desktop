@@ -201,7 +201,7 @@ class DatabaseCore : public nsIDatabaseCore,
   // Failure leaves output unchanged. Public GetSourceId still requires no TX.
   nsresult ReadSourceIdForFolderAdmission(nsACString& output);
 
-  static nsresult EnsureConnection();
+  static nsresult EnsureConnection(bool aAllowNewConnection = false);
   static nsresult CreateNewDatabase();
   static nsresult UpgradeSchema();
   // Caller owns the insert transaction; the insert advances the high-water

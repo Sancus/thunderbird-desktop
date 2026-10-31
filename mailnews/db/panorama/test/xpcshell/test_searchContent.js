@@ -15,9 +15,10 @@ const {
 const { processSearchIndexBatch } = ChromeUtils.importESModule(
   "resource:///modules/panorama/SearchIndexer.sys.mjs"
 );
-const { getMailBodyText } = ChromeUtils.importESModule(
-  "resource:///modules/panorama/MessageContent.sys.mjs"
-);
+const { getMailBodyText, mimeMsgToContentSnippetAndMeta } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MessageContent.sys.mjs"
+  );
 
 add_task(function test_unquotedContentAndInputPreservation() {
   const lines = [
@@ -301,3 +302,105 @@ add_task(async function test_forwardedAttachmentKeepsItsOwnMessageType() {
   Assert.equal(details.items[0].name, "forwarded.eml");
   Assert.equal(details.items[0].part, "1.2");
 });
+
+add_task(
+  async function test_streamedSummaryContentKeepsLiteralMimeBoundaries() {
+    const { MailStringUtils } = ChromeUtils.importESModule(
+      "resource:///modules/MailStringUtils.sys.mjs"
+    );
+    const folder = MailServices.accounts.localFoldersServer.rootFolder
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("native-summary-content099")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    registerCleanupFunction(() => folder.parent.propagateDelete(folder, true));
+    const cases = [
+      {
+        name: "plain-signature",
+        type: "text/plain; charset=utf-8",
+        body: "Authored café\r\n\r\nPat wrote:\r\n> quotedneedle\r\n\r\n-- \r\nSignature Ω\r\n",
+        expected: "Authored café\n-- \nSignature Ω",
+      },
+      {
+        name: "html",
+        type: "text/html; charset=utf-8",
+        body: "<html><body><p>HTML authored &amp; final</p></body></html>",
+        expected: "HTML authored & final",
+      },
+      {
+        name: "alternative",
+        type: 'multipart/alternative; boundary="summary-alternative099"',
+        body: [
+          "--summary-alternative099",
+          "Content-Type: text/plain; charset=utf-8",
+          "",
+          "Preferred plain",
+          "-- ",
+          "Plain signature",
+          "--summary-alternative099",
+          "Content-Type: text/html; charset=utf-8",
+          "",
+          "<p>Nonpreferred HTML alternative</p>",
+          "--summary-alternative099--",
+          "",
+        ].join("\r\n"),
+        expected: "Preferred plain\n-- \nPlain signature",
+      },
+      {
+        name: "empty",
+        type: "text/plain; charset=utf-8",
+        body: "",
+        expected: "",
+      },
+      {
+        name: "encrypted",
+        fixture:
+          "unsigned-encrypted-to-0xf231550c4f47e38e-from-0xfbfcc82a015e7330.eml",
+        subject: "...",
+        expected: "",
+      },
+    ];
+    for (const item of cases) {
+      const subject = item.subject ?? "summary099-" + item.name;
+      const raw = item.fixture
+        ? await IOUtils.readUTF8(do_get_file(item.fixture).path)
+        : [
+            "From: sender@example.invalid",
+            "To: recipient@example.invalid",
+            "Message-ID: <native-" + subject + "@example.invalid>",
+            "Subject: " + subject,
+            "MIME-Version: 1.0",
+            "Content-Type: " + item.type,
+            "",
+            item.body,
+            "",
+          ].join("\r\n");
+      const header = folder.addMessage(MailStringUtils.stringToByteString(raw));
+      const mime = await readMailSearchMime(header);
+      if (item.name == "encrypted") {
+        Assert.ok(
+          mime
+            .get("content-type")
+            .toLowerCase()
+            .startsWith("multipart/encrypted"),
+          "The actual stored fixture is an encrypted OpenPGP MIME message"
+        );
+        Assert.equal(
+          mime.coerceBodyToPlaintext(folder),
+          "",
+          "The encrypted fixture supplies no plaintext summary body"
+        );
+      }
+      Assert.deepEqual(
+        mimeMsgToContentSnippetAndMeta(mime, folder, 300),
+        [item.expected, { subject }],
+        item.name + " keeps the literal summary and subject"
+      );
+      if (item.name == "plain-signature") {
+        Assert.deepEqual(mimeMsgToContentSnippetAndMeta(mime, folder, 10), [
+          "Authored …",
+          { subject },
+        ]);
+      }
+    }
+  }
+);

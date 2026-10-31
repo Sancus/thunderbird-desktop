@@ -579,3 +579,69 @@ add_task(async function test_sameMessageIdWithoutReferencesIsNotAnEdge() {
   Assert.equal(snapshot.selectedId, String(clicked.messageKey));
   Assert.equal(snapshot.selectedMessage.folder.id, b.id);
 });
+
+add_task(
+  async function test_multipleStoredReferenceRootsKeepEveryPhysicalMember() {
+    const a = conversationRoot
+      .createLocalSubfolder("conversation-stored-roots-a")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const b = conversationRoot
+      .createLocalSubfolder("conversation-stored-roots-b")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const firstId = "stored-first@conversation.invalid";
+    const secondId = "stored-second@conversation.invalid";
+    const first = addConversationMail(a, firstId, []);
+    const second = addConversationMail(b, secondId, []);
+    addConversationMail(b, "stored-unrelated@conversation.invalid", []);
+    Assert.notEqual(first.threadId, second.threadId);
+    const file = do_get_profile().clone();
+    file.append("conversation-stored-roots.sqlite");
+    const service = await MailSearchService.open(
+      file,
+      database.sourceId,
+      messageDB
+    );
+    registerCleanupFunction(() => service.close());
+    Assert.equal(await service.getText(String(first.messageKey)), null);
+    for (const header of [first, second]) {
+      assertConversationMembers(
+        await service.getConversation(conversationSelection(service, header)),
+        [header]
+      );
+    }
+
+    // Capture the legacy omission input: both referenced roots already exist in
+    // distinct native components when the message connecting them is ingested.
+    const bridge = addConversationMail(
+      a,
+      "stored-bridge@conversation.invalid",
+      [firstId, secondId]
+    );
+    Assert.equal(bridge.numReferences, 2);
+    Assert.equal(bridge.getStringReference(0), firstId);
+    Assert.equal(bridge.getStringReference(1), secondId);
+    const expected = [first, second, bridge];
+    for (const selected of expected) {
+      const snapshot = await service.getConversation(
+        conversationSelection(service, selected)
+      );
+      assertConversationMembers(snapshot, expected);
+      Assert.equal(snapshot.selectedId, String(selected.messageKey));
+      Assert.equal(snapshot.selectedMessage.messageKey, selected.messageKey);
+      Assert.equal(snapshot.selectedMessage.folder.id, selected.folder.id);
+      const streamed = [];
+      await service.streamResultHeaders(snapshot, header =>
+        streamed.push(header)
+      );
+      Assert.deepEqual(
+        streamed
+          .map(header => [header.folder.id, header.messageKey])
+          .toSorted((left, right) => left[1] - right[1]),
+        expected
+          .map(header => [header.folder.id, header.messageKey])
+          .toSorted((left, right) => left[1] - right[1]),
+        "Every reference-connected physical member streams from every seed"
+      );
+    }
+  }
+);

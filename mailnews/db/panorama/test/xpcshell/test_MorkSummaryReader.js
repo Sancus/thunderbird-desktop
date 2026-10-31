@@ -4,6 +4,13 @@
 
 "use strict";
 
+const { MorkParser } = ChromeUtils.importESModule(
+  "resource:///modules/MorkParser.sys.mjs"
+);
+const { MailStringUtils } = ChromeUtils.importESModule(
+  "resource:///modules/MailStringUtils.sys.mjs"
+);
+
 const { parseMorkSummary } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MorkSummaryReader.sys.mjs"
 );
@@ -250,5 +257,53 @@ add_task(async function test_genuineDuplicateReferencesUpdate() {
       "ancestor@invalid",
       "nearest@invalid",
     ]
+  );
+});
+
+add_task(async function test_genuineNativeRowPositionRefusal() {
+  // A real MDB MoveRow/commit produced this input; native frozen reopen checks
+  // full order [2,3,1,4] and every original cell. This is not positive import.
+  const path = do_get_file("data/migration-row-position.mork").path;
+  const bytes = await IOUtils.read(path);
+  const original = bytes.slice();
+  const body = MailStringUtils.uint8ArrayToByteString(bytes);
+  const offset = body.indexOf("!2 ");
+  Assert.greater(offset, 0, "The genuine input includes the native move delta");
+  const sentinel = {};
+  let snapshot = sentinel;
+  Assert.throws(
+    () => {
+      snapshot = new MorkParser().parseForImport(body);
+    },
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == offset &&
+      error.message == "Row position hints are not supported at byte " + offset,
+    "A valid native move cannot return stale pre-move membership"
+  );
+  Assert.equal(
+    snapshot,
+    sentinel,
+    "No partial structural snapshot was returned"
+  );
+  let summary = sentinel;
+  Assert.throws(
+    () => {
+      summary = parseMorkSummary(bytes);
+    },
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == offset &&
+      error.message == "Row position hints are not supported at byte " + offset,
+    "The summary caller propagates the move refusal before projection"
+  );
+  Assert.equal(summary, sentinel, "No partial summary was returned");
+  Assert.deepEqual(bytes, original, "Neither caller mutates the input buffer");
+  Assert.deepEqual(
+    await IOUtils.read(path),
+    original,
+    "Source file is unchanged"
   );
 });

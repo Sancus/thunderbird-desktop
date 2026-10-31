@@ -2,6 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+"use strict";
+
+const { PromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+
 const { MailSearchService } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MailSearchService.sys.mjs"
 );
@@ -163,6 +169,194 @@ add_task(async function test_collectionRefreshesQueuedPhysicalMetadata() {
     "A query refreshes both existing physical copies after native tag changes"
   );
   await isolated.close();
+});
+
+/**
+ * Pauses a real selected-copy text read before the native metadata check.
+ * Query selection and text retrieval still run through the real service/index.
+ *
+ * @param {string} id - Selected native physical ID.
+ * @returns {{entered: Promise<void>, release: function(): void,
+ *   restore: function(): void}} Projection boundary and method restoration.
+ */
+function pauseResultProjection(id) {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const getText = service.getText;
+  service.getText = async function (key, options) {
+    const text = await getText.call(this, key, options);
+    if (key === id) {
+      entered.resolve();
+      await release.promise;
+    }
+    return text;
+  };
+  return {
+    entered: entered.promise,
+    release: () => release.resolve(),
+    restore: () => {
+      service.getText = getText;
+    },
+  };
+}
+
+add_task(async function test_pendingCollectionRejectsDeletedPhysicalCopy() {
+  const { first, selected } = await resultCopies("pendingdeletedcopy");
+  const selectedId = String(selected.messageKey);
+  const pause = pauseResultProjection(selectedId);
+  let completed = false;
+  const pending = service.collectResults("pendingdeletedcopy cafe");
+  const settled = pending.finally(() => {
+    completed = true;
+  });
+  try {
+    await Promise.race([pause.entered, settled]);
+    Assert.ok(
+      !completed,
+      "The real collection is still projecting its selected copy"
+    );
+    messageDB.removeMessage(selected.messageKey);
+    Assert.equal(messageDB.getSearchState(selected.messageKey), null);
+    pause.release();
+    const result = await settled;
+    Assert.deepEqual(
+      result.items.map(item => item.id),
+      [String(first.messageKey)],
+      "A deleted pending hit is omitted without replacing it by its Message-ID peer"
+    );
+    Assert.deepEqual(result.items[0].location, {
+      folderId: first.folder.id,
+      messageKey: first.messageKey,
+    });
+    await drainResultWork();
+    Assert.deepEqual(
+      (await service.search("pendingdeletedcopy cafe")).items.map(
+        hit => hit.id
+      ),
+      [String(first.messageKey)],
+      "A fresh query cannot resurrect the removed physical copy"
+    );
+  } finally {
+    pause.release();
+    pause.restore();
+    await settled.catch(() => {});
+  }
+});
+
+add_task(async function test_pendingCollectionRejectsMovedPhysicalLocation() {
+  const { first, selected, selectedHit } =
+    await resultCopies("pendingmovedcopy");
+  const source = selected.folder;
+  const sourceKey = selected.messageKey;
+  const destinationName = "pendingmovedcopy-destination";
+  const destination = rootFolder
+    .createLocalSubfolder(destinationName)
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  resultFolders.push({
+    folder: destination,
+    id: destination.id,
+    name: destinationName,
+  });
+  const pause = pauseResultProjection(String(sourceKey));
+  let completed = false;
+  const transfers = [];
+  const notification = {
+    msgsMoveCopyCompleted(isMove, sources, target, messages) {
+      if (target.URI === destination.URI) {
+        Assert.ok(
+          !completed,
+          "The actual native move finishes while collection is pending"
+        );
+        transfers.push({
+          isMove,
+          sources: sources.map(header => ({
+            key: header.messageKey,
+            folderURI: header.folder.URI,
+          })),
+          keys: messages.map(header => header.messageKey),
+        });
+      }
+    },
+  };
+  const pending = service.collectResults("pendingmovedcopy cafe");
+  const settled = pending.finally(() => {
+    completed = true;
+  });
+  MailServices.mfn.addListener(
+    notification,
+    MailServices.mfn.msgsMoveCopyCompleted
+  );
+  try {
+    await Promise.race([pause.entered, settled]);
+    Assert.ok(
+      !completed,
+      "The selected copy's real text was read before moving it"
+    );
+    const listener = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.copy.copyMessages(
+      source,
+      [selected],
+      destination,
+      true,
+      listener,
+      null,
+      false
+    );
+    await listener.promise;
+    Assert.equal(
+      transfers.length,
+      1,
+      "One completed native transfer is observed"
+    );
+    Assert.ok(transfers[0].isMove);
+    Assert.deepEqual(transfers[0].sources, [
+      { key: sourceKey, folderURI: source.URI },
+    ]);
+    Assert.equal(transfers[0].keys.length, 1);
+    const moved = messageDB.getMessage(transfers[0].keys[0]);
+    Assert.equal(moved.folder.id, destination.id);
+    Assert.equal(moved.messageId, first.messageId);
+    Assert.notEqual(moved.messageKey, first.messageKey);
+    const oldState = messageDB.getSearchState(sourceKey);
+    Assert.ok(
+      oldState === null || oldState.generation !== selectedHit.generation,
+      "The completed move invalidates the selected query token"
+    );
+    pause.release();
+    const result = await settled;
+    Assert.deepEqual(
+      result.items.map(item => item.id),
+      [String(first.messageKey)],
+      "The pending snapshot omits a moved stale token rather than publishing its old location"
+    );
+    Assert.deepEqual(result.items[0].location, {
+      folderId: first.folder.id,
+      messageKey: first.messageKey,
+    });
+    pause.restore();
+    await drainResultWork();
+    const fresh = await service.collectResults("pendingmovedcopy cafe");
+    Assert.deepEqual(
+      fresh.items
+        .map(item => [
+          item.id,
+          item.location.folderId,
+          item.location.messageKey,
+        ])
+        .sort(),
+      [
+        [String(first.messageKey), first.folder.id, first.messageKey],
+        [String(moved.messageKey), destination.id, moved.messageKey],
+      ].sort(),
+      "A fresh result contains both distinct physical copies at their current native locations"
+    );
+    Assert.ok(fresh.items.every(item => item.location.folderId !== source.id));
+  } finally {
+    pause.release();
+    pause.restore();
+    MailServices.mfn.removeListener(notification);
+    await settled.catch(() => {});
+  }
 });
 
 add_task(

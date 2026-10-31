@@ -4,6 +4,26 @@ environment = ["PANORAMA_DELIVERY_EXPECT=panorama:none"]
 prefs = ["mail.panorama.enabled=true"]
 tags = ["panorama-delivery"]
 
+["test_deliveryCompatibilityProperties.js"]
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
+["test_deliveryCompatibilityPropertiesUint32Read.js"]
+
+["test_deliveryCompatibilityPropertiesUint32ReadError.js"]
+
+["test_deliveryCompatibilityPropertiesUint32Structural.js"]
+
+["test_deliveryCompatibilityPropertiesUint32Write.js"]
+
+["test_deliveryCompatibilityPropertiesUint32WriteError.js"]
+
 ["test_deliveryCoreFolderProperties.js"]
 
 ["test_deliveryCoreHeaderFields.js"]

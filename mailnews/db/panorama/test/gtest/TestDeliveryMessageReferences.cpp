@@ -636,7 +636,7 @@ namespace {
 
 using DISABLED_DeliveryMessageReferences = DeliveryMessageReferences;
 
-using DISABLED_DeliveryDetachedThreadIdentity = DeliveryMessageReferences;
+using DeliveryDetachedThreadIdentity = DeliveryMessageReferences;
 
 constexpr uint32_t kThreadIdCanary = 0xa53c7e19;
 struct alignas(uint64_t) GuardedThreadId {
@@ -656,7 +656,7 @@ void CheckDetachedThreadId(nsIMsgDBHdr* header, nsMsgKey expected) {
   EXPECT_EQ(kThreadIdCanary, static_cast<uint32_t>(output.canary));
 }
 
-TEST_F(DISABLED_DeliveryDetachedThreadIdentity, DefaultIsUnknown) {
+TEST_F(DeliveryDetachedThreadIdentity, DefaultIsUnknown) {
   RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
   CheckDetachedThreadId(header, nsMsgKey_None);
   nsMsgKey key = 123;
@@ -667,7 +667,7 @@ TEST_F(DISABLED_DeliveryDetachedThreadIdentity, DefaultIsUnknown) {
   EXPECT_FALSE(live);
 }
 
-TEST_F(DISABLED_DeliveryDetachedThreadIdentity, PositiveIdRoundTrips) {
+TEST_F(DeliveryDetachedThreadIdentity, PositiveIdRoundTrips) {
   RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
   ASSERT_EQ(NS_OK, header->SetThreadId(17));
   CheckDetachedThreadId(header, 17);
@@ -676,7 +676,7 @@ TEST_F(DISABLED_DeliveryDetachedThreadIdentity, PositiveIdRoundTrips) {
   EXPECT_EQ(nsMsgKey_None, key);
 }
 
-TEST_F(DISABLED_DeliveryDetachedThreadIdentity, FullWidthRepeatedReads) {
+TEST_F(DeliveryDetachedThreadIdentity, FullWidthRepeatedReads) {
   RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
   ASSERT_EQ(NS_OK, header->SetThreadId(0xf1234567));
   for (uint32_t i = 0; i < 3; ++i) {
@@ -686,7 +686,7 @@ TEST_F(DISABLED_DeliveryDetachedThreadIdentity, FullWidthRepeatedReads) {
   CheckDetachedThreadId(header, 0xfffffffe);
 }
 
-TEST_F(DISABLED_DeliveryDetachedThreadIdentity, ZeroAndSentinelRoundTrip) {
+TEST_F(DeliveryDetachedThreadIdentity, ZeroAndSentinelRoundTrip) {
   RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
   ASSERT_EQ(NS_OK, header->SetThreadId(17));
   ASSERT_EQ(NS_OK, header->SetThreadId(0));
@@ -695,7 +695,7 @@ TEST_F(DISABLED_DeliveryDetachedThreadIdentity, ZeroAndSentinelRoundTrip) {
   CheckDetachedThreadId(header, nsMsgKey_None);
 }
 
-TEST_F(DISABLED_DeliveryDetachedThreadIdentity, NullOutputIsRejected) {
+TEST_F(DeliveryDetachedThreadIdentity, NullOutputIsRejected) {
   RefPtr<nsIMsgDBHdr> header = new DetachedMsgHdr(mFolder);
   EXPECT_EQ(NS_ERROR_NULL_POINTER, header->GetThreadId(nullptr));
   ASSERT_EQ(NS_OK, header->SetThreadId(0x80000042));
@@ -703,8 +703,7 @@ TEST_F(DISABLED_DeliveryDetachedThreadIdentity, NullOutputIsRejected) {
   CheckDetachedThreadId(header, 0x80000042);
 }
 
-TEST_F(DISABLED_DeliveryDetachedThreadIdentity,
-       IdentityIsIndependentOfMetadata) {
+TEST_F(DeliveryDetachedThreadIdentity, IdentityIsIndependentOfMetadata) {
   RefPtr<nsIMsgDBHdr> first = new DetachedMsgHdr(mFolder);
   RefPtr<nsIMsgDBHdr> second = new DetachedMsgHdr(mFolder);
   ASSERT_EQ(NS_OK, first->SetFlags(0x11));
@@ -904,15 +903,15 @@ TEST_F(DISABLED_DeliveryMessageReferences,
   CheckStored({"original@invalid"_ns});
 }
 
-using DISABLED_DeliveryHeaderProperties = DeliveryMessageReferences;
+using DeliveryHeaderProperties = DeliveryMessageReferences;
 
-TEST_F(DISABLED_DeliveryHeaderProperties, Uint32SuccessAssignsOnlyUint32) {
+TEST_F(DeliveryHeaderProperties, Uint32SuccessAssignsOnlyUint32) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   ASSERT_EQ(NS_OK, mHeader->SetStringProperty("delivery.uint32", "2a"_ns));
   CheckHeaderUint32Output(mHeader, NS_OK, 42);
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties, Uint32MaximumAssignsOnlyUint32) {
+TEST_F(DeliveryHeaderProperties, Uint32MaximumAssignsOnlyUint32) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   ASSERT_EQ(NS_OK, mHeader->SetUint32Property("delivery.uint32", 0xffffffff));
   CheckHeaderUint32Output(mHeader, NS_OK, 0xffffffff);
@@ -921,8 +920,7 @@ TEST_F(DISABLED_DeliveryHeaderProperties, Uint32MaximumAssignsOnlyUint32) {
   EXPECT_EQ("ffffffff"_ns, text);
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties,
-       Uint32MissingReplacesSentinelWithZero) {
+TEST_F(DeliveryHeaderProperties, Uint32MissingReplacesSentinelWithZero) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   CheckHeaderUint32Output(mHeader, NS_OK, 0);
   nsTArray<nsCString> names;
@@ -930,7 +928,7 @@ TEST_F(DISABLED_DeliveryHeaderProperties,
   EXPECT_FALSE(names.Contains("delivery.uint32"_ns));
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties, Uint32EmptyReplacesSentinelWithZero) {
+TEST_F(DeliveryHeaderProperties, Uint32EmptyReplacesSentinelWithZero) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   ASSERT_EQ(NS_OK,
             mHeader->SetStringProperty("delivery.uint32", EmptyCString()));
@@ -940,21 +938,20 @@ TEST_F(DISABLED_DeliveryHeaderProperties, Uint32EmptyReplacesSentinelWithZero) {
   EXPECT_TRUE(names.Contains("delivery.uint32"_ns));
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties,
-       Uint32InvalidPrefixReplacesSentinelWithZero) {
+TEST_F(DeliveryHeaderProperties, Uint32InvalidPrefixReplacesSentinelWithZero) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   ASSERT_EQ(NS_OK, mHeader->SetStringProperty("delivery.uint32", "g2a"_ns));
   CheckHeaderUint32Output(mHeader, NS_OK, 0);
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NineDigitsUseFirstEight) {
+TEST_F(DeliveryHeaderProperties, Uint32NineDigitsUseFirstEight) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   ASSERT_EQ(NS_OK,
             mHeader->SetStringProperty("delivery.uint32", "100000000"_ns));
   CheckHeaderUint32Output(mHeader, NS_OK, 0x10000000);
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NullKnownOutputIsRejected) {
+TEST_F(DeliveryHeaderProperties, Uint32NullKnownOutputIsRejected) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   ASSERT_EQ(NS_OK, mHeader->SetStringProperty("delivery.uint32", "2a"_ns));
   EXPECT_EQ(NS_ERROR_NULL_POINTER,
@@ -962,7 +959,7 @@ TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NullKnownOutputIsRejected) {
   CheckHeaderUint32Output(mHeader, NS_OK, 42);
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NullOutputDoesNotEvaluateSQL) {
+TEST_F(DeliveryHeaderProperties, Uint32NullOutputDoesNotEvaluateSQL) {
   ASSERT_NO_FATAL_FAILURE(MakePropertyReadFault());
   EXPECT_EQ(NS_ERROR_NULL_POINTER,
             mHeader->GetUint32Property("delivery.uint32", nullptr));
@@ -971,7 +968,7 @@ TEST_F(DISABLED_DeliveryHeaderProperties, Uint32NullOutputDoesNotEvaluateSQL) {
   CheckWitness();
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties, Uint32PrepareErrorPreservesSentinel) {
+TEST_F(DeliveryHeaderProperties, Uint32PrepareErrorPreservesSentinel) {
   ASSERT_NO_FATAL_FAILURE(Create({}));
   // Keep the getter's statement cold so the missing table fails preparation.
   ASSERT_EQ(NS_OK,
@@ -985,8 +982,7 @@ TEST_F(DISABLED_DeliveryHeaderProperties, Uint32PrepareErrorPreservesSentinel) {
   CheckHeaderUint32Output(mHeader, NS_ERROR_FAILURE, kHeaderUint32Sentinel);
 }
 
-TEST_F(DISABLED_DeliveryHeaderProperties,
-       Uint32ReadStepErrorPreservesSentinel) {
+TEST_F(DeliveryHeaderProperties, Uint32ReadStepErrorPreservesSentinel) {
   ASSERT_NO_FATAL_FAILURE(MakePropertyReadFault());
   CheckHeaderUint32Output(mHeader, NS_ERROR_FAILURE, kHeaderUint32Sentinel);
   CheckWitness();
@@ -1148,7 +1144,7 @@ TEST_F(DISABLED_DeliveryCompleteHeader,
   EXPECT_TRUE(names.Contains("messageSize"_ns));
 }
 
-TEST_F(DISABLED_DeliveryCompleteHeader, DetachedUint32RetainsTypedStorage) {
+TEST_F(DeliveryHeaderProperties, DetachedUint32RetainsTypedStorage) {
   RefPtr<nsIMsgDBHdr> draft = new DetachedMsgHdr(mFolder);
   ASSERT_EQ(NS_OK, draft->SetUint32Property("delivery.number", 42));
   nsAutoCString text;

@@ -126,7 +126,11 @@ add_task(async function test_recursiveConflictPreservesCachedSubtree() {
   Assert.equal(failed.id, 0);
   Assert.equal(failed.parent, null);
   Assert.equal(failed.URI, "");
-  Assert.equal(failed.numSubFolders, 0);
+  Assert.throws(
+    () => failed.numSubFolders,
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "A failed initializer cannot enumerate a partial subtree"
+  );
   Assert.equal(parent.id, parentId);
   Assert.equal(parent.parent, null);
   Assert.equal(parent.URI, parentURI);

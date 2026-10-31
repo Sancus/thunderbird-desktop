@@ -136,7 +136,11 @@ add_task(async function test_failedDescendantKeepsRowsBodiesAndExistingChild() {
   for (const item of created) {
     Assert.equal(item.id, 0, "Failed objects do not retain initialized IDs");
     Assert.equal(item.parent, null);
-    Assert.equal(item.numSubFolders, 0);
+    Assert.throws(
+      () => item.numSubFolders,
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+      "A failed initializer cannot enumerate a partial subtree"
+    );
   }
   for (const uri of [pendingURI, pendingURI + "/AReady", branchURI]) {
     Assert.equal(MailServices.folderLookup.getFolderForURL(uri), null);

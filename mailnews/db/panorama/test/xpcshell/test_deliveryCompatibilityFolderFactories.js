@@ -114,7 +114,9 @@ add_task(async function test_restoresImapHierarchyWithoutBodyDirectories() {
   const grandchild = child.getChildNamed("Nested");
   Assert.ok(grandchild instanceof Ci.nsIMsgImapMailFolder);
   Assert.equal(grandchild.id, grandchildId);
+  Assert.equal(folderDB.getMsgFolderForFolder(grandchildId), grandchild);
   Assert.equal(grandchild.parent, child);
+  Assert.equal(grandchild.server, incomingServer);
   Assert.equal(grandchild.URI, "imap://factory@localhost/Server%20Only/Nested");
   Assert.equal(
     grandchild.generateMessageURI(7),

@@ -26,7 +26,8 @@ add_task(function test_rejectsConflictingLiveIdentity() {
   Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), child);
   Assert.throws(
     () => MailServices.folderLookup.cache(uri, replacement),
-    /NS_ERROR_ALREADY_INITIALIZED/
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "A failed initializer cannot be admitted to the URI cache"
   );
   MailServices.folderLookup.evictFolder(replacement);
   Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), child);

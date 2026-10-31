@@ -1913,6 +1913,24 @@ NS_IMETHODIMP
 nsMsgDBFolder::GetStringProperty(const char* propertyName,
                                  nsACString& propertyValue) {
   NS_ENSURE_ARG_POINTER(propertyName);
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(mFolderId, NS_ERROR_NOT_INITIALIZED);
+    MOZ_TRY(CheckFolderPathAccess());
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::sInstance;
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(core->FolderDB().GetFolderParent(mFolderId));
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(core->OpenFolderDB(this, false, getter_AddRefs(db)));
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+    nsAutoCString value;
+    MOZ_TRY(info->GetCharProperty(propertyName, value));
+    propertyValue = value;
+    return NS_OK;
+  }
+#endif
   nsresult rv;
   nsCOMPtr<nsIMsgFolderCacheElement> cacheElement;
   if (!StaticPrefs::mail_panorama_enabled_AtStartup()) {
@@ -1969,6 +1987,21 @@ NS_IMETHODIMP
 nsMsgDBFolder::SetStringProperty(const char* propertyName,
                                  const nsACString& propertyValue) {
   NS_ENSURE_ARG_POINTER(propertyName);
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(mFolderId, NS_ERROR_NOT_INITIALIZED);
+    MOZ_TRY(CheckFolderPathAccess());
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::sInstance;
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(core->FolderDB().GetFolderParent(mFolderId));
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(core->OpenFolderDB(this, false, getter_AddRefs(db)));
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+    return info->SetCharProperty(propertyName, propertyValue);
+  }
+#endif
 
   if (!StaticPrefs::mail_panorama_enabled_AtStartup()) {
     nsCOMPtr<nsIFile> dbPath;
@@ -3081,9 +3114,10 @@ nsresult nsMsgDBFolder::PrepareNativeFolderRelocation(
   MOZ_TRY(target->GetFilePath(getter_AddRefs(operation->mTargetParentPath)));
   nsAutoCString storeType;
   MOZ_TRY(server->GetLocalStoreType(storeType));
-  NS_ENSURE_TRUE(
-      storeType.EqualsLiteral("mailbox") || storeType.EqualsLiteral("imap"),
-      NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE(storeType.EqualsLiteral("mailbox") ||
+                     storeType.EqualsLiteral("imap") ||
+                     storeType.EqualsLiteral("ews"),
+                 NS_ERROR_NOT_IMPLEMENTED);
   operation->mIsImap = storeType.EqualsLiteral("imap");
   nsAutoCString contract("@mozilla.org/mail/folder-factory;1?name=");
   contract.Append(storeType);

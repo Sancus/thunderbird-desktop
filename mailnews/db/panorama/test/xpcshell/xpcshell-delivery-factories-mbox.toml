@@ -1,0 +1,27 @@
+[DEFAULT]
+head = "head.js head_delivery.js"
+dupe-manifest = true
+environment = [
+  "MOZ_LOG=mozStorage:4,panorama:4",
+  "PANORAMA_DELIVERY_EXPECT=panorama:mbox",
+]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+tags = ["panorama-delivery"]
+
+["test_deliveryCompatibilityFolderFactories.js"]
+
+["test_deliveryCompatibilityFolderFactoryChildren.js"]
+
+["test_deliveryCompatibilityFolderFactoryRetry.js"]
+
+["test_deliveryCompatibilityFolderInitConflict.js"]
+
+["test_deliveryCompatibilityFolderInitFailure.js"]
+
+["test_deliveryCompatibilityFolderInitIdentity.js"]
+
+["test_deliveryCompatibilityFolderInitParentConflict.js"]

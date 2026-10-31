@@ -7,6 +7,8 @@ XPCSHELL_TESTS_MANIFESTS += [
     "xpcshell/xpcshell-core-insertion.toml",
     "xpcshell/xpcshell-core-membership.toml",
     "xpcshell/xpcshell-core-properties.toml",
+    "xpcshell/xpcshell-delivery-factories-maildir.toml",
+    "xpcshell/xpcshell-delivery-factories-mbox.toml",
     "xpcshell/xpcshell-delivery-migration-lexer.toml",
     "xpcshell/xpcshell-delivery-references.toml",
     "xpcshell/xpcshell.toml",

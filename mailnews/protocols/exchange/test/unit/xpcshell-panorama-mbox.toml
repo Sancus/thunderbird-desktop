@@ -11,5 +11,8 @@ tags = ["panorama", "mbox"]
 
 ["test_ewsAttachmentSaves.js"]
 
+["test_folder_sync.js"]
+prefs = ["mail.graph.enabled=false"]
+
 ["test_item_operations.js"]
 prefs = ["mail.graph.enabled=true"]

@@ -20,6 +20,7 @@
 #include "nsNetUtil.h"
 #include "nsPrintfCString.h"
 #include "OfflineStorage.h"
+#include "UrlListener.h"
 #include "mozilla/Components.h"
 #include "mozilla/intl/Localization.h"
 #include "mozilla/StaticPrefs_mail.h"
@@ -236,7 +237,8 @@ nsresult ExchangeIncomingServer::UpdateFolderWithDetails(
   rv = FindFolderWithId(parentId, getter_AddRefs(newParentFolder));
   NS_ENSURE_SUCCESS(rv, rv);
 
-  return LocalRenameOrReparentFolder(folder, newParentFolder, name, msgWindow);
+  return ExchangeFolder::ApplyFolderUpdate(folder, newParentFolder, name,
+                                           msgWindow);
 }
 
 /**
@@ -386,7 +388,8 @@ NS_IMETHODIMP ExchangeIncomingServer::SyncFolderHierarchy(
 }
 
 nsresult ExchangeIncomingServer::SyncFolderList(
-    nsIMsgWindow* aMsgWindow, std::function<nsresult()> postSyncCallback) {
+    nsIMsgWindow* aMsgWindow, std::function<nsresult()> postSyncCallback,
+    std::function<nsresult(nsresult)> errorCallback) {
   // Exchange provides us an opaque value which specifies the last version of
   // upstream folders we received. Provide that to simplify sync.
   nsCString syncStateToken;
@@ -474,7 +477,7 @@ nsresult ExchangeIncomingServer::SyncFolderList(
     return postSyncCallback();
   };
 
-  auto onError = [postSyncCallback](nsresult _status) {
+  auto onError = [postSyncCallback, errorCallback](nsresult status) {
     // Reset the status bar since the remote operation has finished.
     nsCOMPtr<nsIFeedbackService> feedback =
         mozilla::components::Feedback::Service();
@@ -487,7 +490,7 @@ nsresult ExchangeIncomingServer::SyncFolderList(
     // example, during Biff, even if the folder list sync fails, we still need
     // to continue with the follow-on folder item synchronization for the
     // existing folders.
-    return postSyncCallback();
+    return errorCallback ? errorCallback(status) : postSyncCallback();
   };
 
   RefPtr<ExchangeFolderSyncListener> listener = new ExchangeFolderSyncListener(
@@ -601,35 +604,57 @@ NS_IMETHODIMP ExchangeIncomingServer::GetNewMessages(
 
   // Sync the folder list for the account, then sync the message list for the
   // specific folder.
+  auto afterHierarchy = [self = RefPtr(this), folder, window,
+                         urlListener](nsresult hierarchyStatus) {
+    nsCOMPtr<nsIUrlListener> completionListener = urlListener;
+    if (NS_FAILED(hierarchyStatus) && urlListener) {
+      // Follow-on item sync still runs, but cannot replace the earlier
+      // hierarchy error with its success or a later failure.
+      RefPtr<UrlListener> listener = new UrlListener();
+      listener->mStartFn = [urlListener](nsIURI* uri) {
+        return urlListener->OnStartRunningUrl(uri);
+      };
+      listener->mStopFn = [urlListener, hierarchyStatus](nsIURI* uri,
+                                                         nsresult) {
+        return urlListener->OnStopRunningUrl(uri, hierarchyStatus);
+      };
+      completionListener = listener;
+    }
+    // Check if we're getting messages for the whole
+    // folder here. If so, the intent is likely that the
+    // user wants to synchronize all the folders on the
+    // account.
+    bool isServer;
+    nsresult rv = folder->GetIsServer(&isServer);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (isServer) {
+      return self->SyncAllFolders(window, completionListener);
+    }
+
+    // Synchronizing the folder list may have invalidated the folder that
+    // sync was selected for by moving the folder to a new location. If that
+    // is the case, then the Exchange ID will be invalidated and we can no
+    // longer sync that folder.
+    nsAutoCString originalExchangeId;
+    rv = folder->GetStringProperty(kExchangeIdProperty, originalExchangeId);
+    if (NS_FAILED(rv)) {
+      // An earlier successful hierarchy update may have retired the selected
+      // wrapper. Complete the request without losing a prior hierarchy error.
+      nsresult status = NS_FAILED(hierarchyStatus) ? hierarchyStatus : rv;
+      if (completionListener) {
+        completionListener->OnStopRunningUrl(nullptr, status);
+      }
+      return status;
+    }
+
+    // If this is not the root folder, synchronize its
+    // message list normally.
+    return folder->GetNewMessages(window, completionListener);
+  };
   return SyncFolderList(
-      aMsgWindow, [self = RefPtr(this), folder, window, urlListener]() {
-        // Check if we're getting messages for the whole
-        // folder here. If so, the intent is likely that the
-        // user wants to synchronize all the folders on the
-        // account.
-        bool isServer;
-        nsresult rv = folder->GetIsServer(&isServer);
-        NS_ENSURE_SUCCESS(rv, rv);
-
-        if (isServer) {
-          return self->SyncAllFolders(window, urlListener);
-        }
-
-        // Synchronizing the folder list may have invalidated the folder that
-        // sync was selected for by moving the folder to a new location. If that
-        // is the case, then the Exchange ID will be invalidated and we can no
-        // longer sync that folder.
-        nsAutoCString originalExchangeId;
-        rv = folder->GetStringProperty(kExchangeIdProperty, originalExchangeId);
-        if (NS_FAILED(rv)) {
-          // Assume the original folder moved and return success.
-          return NS_OK;
-        }
-
-        // If this is not the root folder, synchronize its
-        // message list normally.
-        return folder->GetNewMessages(window, urlListener);
-      });
+      aMsgWindow, [afterHierarchy]() { return afterHierarchy(NS_OK); },
+      afterHierarchy);
 }
 
 NS_IMETHODIMP ExchangeIncomingServer::PerformBiff(nsIMsgWindow* aMsgWindow) {

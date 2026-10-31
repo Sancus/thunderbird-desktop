@@ -44,6 +44,32 @@ add_setup(async function () {
     `http://127.0.0.1:${ewsServer.port}/EWS/Exchange.asmx`
   );
 
+  const expectedContract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Assert.equal(
+    incomingServer.getStringValue("storeContractID"),
+    expectedContract,
+    "The actual protocol consumer uses the configured store contract"
+  );
+  Assert.equal(
+    incomingServer.msgStore.storeType,
+    {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[expectedContract],
+    "The actual consumer uses the configured body store"
+  );
+  const databaseService = Cc[
+    "@mozilla.org/msgDatabase/msgDBService;1"
+  ].getService(Ci.nsIMsgDBService);
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && databaseService instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    "The configured backend is active for this real incoming server"
+  );
+  Assert.ok(incomingServer.rootFolder instanceof Ci.IExchangeFolder);
+
   const exchangeServer = incomingServer.QueryInterface(
     Ci.IExchangeIncomingServer
   );
@@ -55,6 +81,370 @@ add_setup(async function () {
     );
   });
 });
+
+// Persisted folder IDs are a Panorama-only input. The existing tasks below
+// exercise the Mork store-discovery and protocol-sync path too.
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(
+    async function test_restoresPersistedHierarchyWithoutBodyDirectories() {
+      const key = "factoryEws";
+      const prefix = `mail.server.${key}.`;
+      Assert.equal(Services.prefs.getChildList(prefix).length, 0);
+      const account = MailServices.accounts.createAccount();
+      const cleanup = { server: null };
+      registerCleanupFunction(() => {
+        try {
+          cleanup.server?.shutdown();
+          MailServices.accounts.removeAccount(account, false);
+        } finally {
+          Services.prefs.deleteBranch(prefix);
+        }
+      });
+      const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+        Ci.nsIMsgDBService
+      );
+      Assert.ok(service instanceof Ci.nsIDatabaseCore);
+      const folders = service.QueryInterface(Ci.nsIDatabaseCore).folderDB;
+      const contract = Services.prefs.getCharPref(
+        "mail.serverDefaultStoreContractID"
+      );
+      const store = {
+        "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+        "@mozilla.org/msgstore/maildirstore;1": "maildir",
+      }[contract];
+      Assert.ok(store, "The configured store is supported");
+      for (const [name, value] of Object.entries({
+        type: "ews",
+        userName: "factory",
+        hostname: "ews-folder-init.invalid",
+        storeContractID: contract,
+      })) {
+        Services.prefs.setCharPref(prefix + name, value);
+      }
+      Services.prefs.setBoolPref(prefix + "valid", false);
+      const directory = do_get_profile();
+      directory.append("factory-ews");
+      await IOUtils.makeDirectory(directory.path);
+      Services.prefs.setComplexValue(
+        prefix + "directory",
+        Ci.nsIFile,
+        directory
+      );
+
+      const rootId = folders.insertRoot(key);
+      const childId = folders.insertFolder(rootId, "Server Only");
+      const grandchildId = folders.insertFolder(childId, "Nested");
+      const flags =
+        (Ci.nsMsgFolderFlags.Mail |
+          Ci.nsMsgFolderFlags.Offline |
+          Ci.nsMsgFolderFlags.Favorite) >>>
+        0;
+      folders.updateFlags(childId, flags);
+      folders.updateFlags(grandchildId, flags);
+      Assert.deepEqual(await IOUtils.getChildren(directory.path), []);
+
+      const server = MailServices.accounts.getIncomingServer(key);
+      cleanup.server = server;
+      account.incomingServer = server;
+      Assert.ok(server instanceof Ci.IExchangeIncomingServer);
+      Assert.equal(server.localStoreType, "ews");
+      const root = server.rootFolder;
+      Assert.ok(root instanceof Ci.IExchangeFolder);
+      Assert.equal(root.id, rootId);
+      Assert.equal(root.parent, null);
+      Assert.equal(root.server.key, key);
+      Assert.equal(root.filePath.path, directory.path);
+      Assert.equal(server.getStringValue("storeContractID"), contract);
+      Assert.equal(root.msgStore.storeType, store);
+      Assert.equal(root.URI, "ews://factory@ews-folder-init.invalid");
+      Assert.equal(
+        root.generateMessageURI(7),
+        "ews-message://factory@ews-folder-init.invalid#7"
+      );
+
+      const children = root.subFolders;
+      Assert.deepEqual(
+        children.map(folder => folder.id),
+        [childId]
+      );
+      const child = children[0];
+      Assert.ok(child instanceof Ci.IExchangeFolder);
+      Assert.equal(child.parent.id, rootId);
+      Assert.equal(child.server.key, key);
+      Assert.equal(child.name, "Server Only");
+      Assert.equal(child.URI, root.URI + "/Server%20Only");
+      Assert.equal(
+        child.generateMessageURI(7),
+        "ews-message://factory@ews-folder-init.invalid/Server%20Only#7"
+      );
+      Assert.equal(child.flags, flags);
+      const descendants = child.subFolders;
+      Assert.deepEqual(
+        descendants.map(folder => folder.id),
+        [grandchildId]
+      );
+      const grandchild = descendants[0];
+      Assert.ok(grandchild instanceof Ci.IExchangeFolder);
+      Assert.equal(grandchild.parent.id, childId);
+      Assert.equal(grandchild.server.key, key);
+      Assert.equal(grandchild.URI, child.URI + "/Nested");
+      Assert.equal(
+        grandchild.generateMessageURI(7),
+        "ews-message://factory@ews-folder-init.invalid/Server%20Only/Nested#7"
+      );
+      Assert.equal(grandchild.flags, flags);
+      Assert.deepEqual(grandchild.subFolders, []);
+      Assert.ok(!child.filePath.exists(), "The child requires no body file");
+      Assert.ok(
+        !grandchild.filePath.exists(),
+        "The grandchild requires no body file"
+      );
+      Assert.deepEqual(
+        await IOUtils.getChildren(directory.path),
+        [],
+        "Enumeration creates no body directories or summaries"
+      );
+      for (let repeat = 0; repeat < 2; repeat++) {
+        Assert.deepEqual(
+          root.subFolders.map(folder => folder.id),
+          [childId]
+        );
+        Assert.deepEqual(
+          child.subFolders.map(folder => folder.id),
+          [grandchildId]
+        );
+        Assert.deepEqual(folders.getFolderChildren(rootId), [childId]);
+        Assert.deepEqual(folders.getFolderChildren(childId), [grandchildId]);
+        Assert.equal(folders.getMsgFolderForFolder(childId).URI, child.URI);
+        Assert.equal(
+          folders.getMsgFolderForFolder(grandchildId).URI,
+          grandchild.URI
+        );
+      }
+    }
+  );
+
+  add_task(async function test_ignoresUnregisteredBodyStoreFolders() {
+    const key = "factoryEwsBodyInventory";
+    const prefix = `mail.server.${key}.`;
+    Assert.equal(Services.prefs.getChildList(prefix).length, 0);
+    const account = MailServices.accounts.createAccount();
+    const cleanup = { server: null };
+    registerCleanupFunction(() => {
+      try {
+        cleanup.server?.shutdown();
+        MailServices.accounts.removeAccount(account, false);
+      } finally {
+        Services.prefs.deleteBranch(prefix);
+      }
+    });
+    const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.ok(service instanceof Ci.nsIDatabaseCore);
+    const folders = service.QueryInterface(Ci.nsIDatabaseCore).folderDB;
+    const contract = Services.prefs.getCharPref(
+      "mail.serverDefaultStoreContractID"
+    );
+    const store = {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[contract];
+    Assert.ok(store, "The configured store is supported");
+    for (const [name, value] of Object.entries({
+      type: "ews",
+      userName: "inventory",
+      hostname: "ews-body-inventory.invalid",
+      storeContractID: contract,
+    })) {
+      Services.prefs.setCharPref(prefix + name, value);
+    }
+    Services.prefs.setBoolPref(prefix + "valid", false);
+    const directory = do_get_profile();
+    directory.append("factory-ews-inventory");
+    await IOUtils.makeDirectory(directory.path);
+    Services.prefs.setComplexValue(prefix + "directory", Ci.nsIFile, directory);
+    const rootId = folders.insertRoot(key);
+    const childId = folders.insertFolder(rootId, "Recorded Remote Child");
+
+    // A retained local artifact is not a server-discovered folder or DB member.
+    const artifact = PathUtils.join(directory.path, "body-only");
+    let retainedBody = artifact;
+    if (store == "maildir") {
+      await IOUtils.makeDirectory(PathUtils.join(artifact, "cur"));
+      await IOUtils.makeDirectory(PathUtils.join(artifact, "tmp"));
+      retainedBody = PathUtils.join(artifact, "cur", "retained");
+    }
+    await IOUtils.writeUTF8(retainedBody, "Retained local bytes\n");
+    const server = MailServices.accounts.getIncomingServer(key);
+    cleanup.server = server;
+    account.incomingServer = server;
+    const root = server.rootFolder;
+    Assert.ok(root instanceof Ci.IExchangeFolder);
+    Assert.equal(root.id, rootId);
+    Assert.equal(root.server.key, key);
+    Assert.equal(server.getStringValue("storeContractID"), contract);
+    Assert.equal(root.msgStore.storeType, store);
+    for (let repeat = 0; repeat < 2; repeat++) {
+      Assert.deepEqual(
+        root.subFolders.map(folder => folder.id),
+        [childId],
+        "Only the recorded remote child is enumerated"
+      );
+      Assert.deepEqual(
+        folders.getFolderChildren(rootId),
+        [childId],
+        "Store inventory must not add a remote DB folder by leaf name"
+      );
+      Assert.equal(
+        await IOUtils.readUTF8(retainedBody),
+        "Retained local bytes\n"
+      );
+    }
+  });
+
+  add_task(async function test_renamesUncachedFolder() {
+    const oldName = "uncached_original";
+    const newName = "uncached_renamed";
+    ewsServer.appendRemoteFolder(
+      new RemoteFolder(oldName, "root", oldName, oldName)
+    );
+    const root = incomingServer.rootFolder;
+    await syncFolder(incomingServer, root);
+    const original = root.getChildNamed(oldName);
+    const id = original.id;
+    Assert.equal(original.getTotalMessages(false), 0);
+    const oldPath = original.filePath.path;
+    // Evict this empty folder's cache before the server reports a rename.
+    await IOUtils.remove(oldPath, { recursive: true });
+    Assert.ok(!(await IOUtils.exists(oldPath)));
+    Assert.ok(!(await IOUtils.exists(oldPath + ".msf")));
+    ewsServer.renameFolderById(oldName, newName);
+    await syncFolder(incomingServer, root);
+    const renamed = root.getChildNamed(newName);
+    Assert.ok(renamed instanceof Ci.IExchangeFolder);
+    Assert.equal(renamed.id, id, "An uncached folder keeps its physical ID");
+    Assert.equal(renamed.getStringProperty(ewsIdPropertyName), oldName);
+    Assert.equal(renamed.parent.id, root.id);
+    Assert.equal(renamed.server.key, incomingServer.key);
+    Assert.equal(renamed.URI, root.URI + "/" + newName);
+    Assert.equal(root.getChildNamed(oldName), null);
+    Assert.ok(
+      !renamed.filePath.exists(),
+      "A rename need not create cached bytes"
+    );
+  });
+
+  add_task(async function test_failedRenameRetainsSource() {
+    const oldName = "blocked_rename_original";
+    const newName = "blocked_rename_target";
+    const selectedName = "a_completed_before_failure";
+    const selectedNewName = "a_completed_after_update";
+    ewsServer.appendRemoteFolder(
+      new RemoteFolder(selectedName, "root", selectedName, selectedName)
+    );
+    ewsServer.appendRemoteFolder(
+      new RemoteFolder(oldName, "root", oldName, oldName)
+    );
+    const root = incomingServer.rootFolder;
+    await syncFolder(incomingServer, root);
+    const original = root.getChildNamed(oldName);
+    const selected = root.getChildNamed(selectedName);
+    const selectedId = selected.id;
+    const id = original.id;
+    const uri = original.URI;
+    original.setFlag(Ci.nsMsgFolderFlags.Favorite);
+    const flags = original.flags;
+    original.setStringProperty("ewsIdentityMarker", "Caf\u00e9");
+    const members = root.subFolders.map(folder => folder.id);
+    const store = root.msgStore.storeType;
+    const sourcePath = original.filePath.path;
+    const sourceBody =
+      store == "maildir"
+        ? PathUtils.join(sourcePath, "cur", "retained")
+        : sourcePath;
+    const retained = "Retained cache marker\n";
+    await IOUtils.writeUTF8(sourceBody, retained);
+    const obstruction = original.filePath.clone();
+    obstruction.leafName = newName;
+    Assert.ok(!obstruction.exists());
+    await IOUtils.writeUTF8(obstruction.path, "Fixture-owned obstruction\n");
+    // Use one change per page: updates within a page are deduplicated in a
+    // HashSet and have no defined order. The first page retires the selected
+    // wrapper; the next page must report the original obstruction error.
+    ewsServer.renameFolderById(selectedName, selectedNewName);
+    ewsServer.renameFolderById(oldName, newName);
+    const stops = [];
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl(_url, status) {
+        stops.push(status);
+      },
+    });
+    const maxSyncItems = ewsServer.maxSyncItems;
+    ewsServer.maxSyncItems = 1;
+    try {
+      incomingServer.getNewMessages(selected, null, listener);
+      await Assert.rejects(
+        listener.promise,
+        error => error.message == String(Cr.NS_ERROR_FILE_ALREADY_EXISTS),
+        "The original destination obstruction error reaches completion"
+      );
+    } finally {
+      ewsServer.maxSyncItems = maxSyncItems;
+    }
+    await TestUtils.waitForCondition(
+      () => root.getChildNamed(selectedNewName),
+      "The earlier unblocked hierarchy update is published"
+    );
+    Assert.equal(root.getChildNamed(selectedNewName).id, selectedId);
+    Assert.equal(root.getChildNamed(selectedName), null);
+    Assert.throws(
+      () => selected.getStringProperty(ewsIdPropertyName),
+      /NS_ERROR_NOT_AVAILABLE/,
+      "The selected original wrapper is retired by the confirmed update"
+    );
+    Assert.deepEqual(stops, [Cr.NS_ERROR_FILE_ALREADY_EXISTS]);
+    Assert.equal(root.getChildNamed(oldName), original);
+    Assert.equal(root.getChildNamed(newName), null);
+    Assert.equal(original.id, id);
+    Assert.equal(original.URI, uri);
+    Assert.equal(original.parent.id, root.id);
+    Assert.equal(original.flags, flags);
+    Assert.equal(original.getStringProperty(ewsIdPropertyName), oldName);
+    Assert.equal(original.getStringProperty("ewsIdentityMarker"), "Caf\u00e9");
+    Assert.deepEqual(
+      root.subFolders.map(folder => folder.id),
+      members
+    );
+    Assert.equal(await IOUtils.readUTF8(sourceBody), retained);
+    Assert.equal(
+      await IOUtils.readUTF8(obstruction.path),
+      "Fixture-owned obstruction\n"
+    );
+
+    // Only remove our checked obstruction, then issue a new explicit request.
+    await IOUtils.remove(obstruction.path);
+    await syncFolder(incomingServer, root);
+    const renamed = root.getChildNamed(newName);
+    Assert.equal(renamed.id, id);
+    Assert.equal(renamed.parent.id, root.id);
+    Assert.equal(renamed.getStringProperty(ewsIdPropertyName), oldName);
+    Assert.equal(renamed.getStringProperty("ewsIdentityMarker"), "Caf\u00e9");
+    Assert.equal(renamed.flags, flags);
+    Assert.equal(root.getChildNamed(oldName), null);
+    const destinationBody =
+      store == "maildir"
+        ? PathUtils.join(renamed.filePath.path, "cur", "retained")
+        : renamed.filePath.path;
+    Assert.equal(await IOUtils.readUTF8(destinationBody), retained);
+    Assert.ok(!(await IOUtils.exists(sourcePath)));
+    Assert.deepEqual(
+      stops,
+      [Cr.NS_ERROR_FILE_ALREADY_EXISTS],
+      "The failed request completed once"
+    );
+  });
+}
 
 /**
  * Tests that triggering a folder hierarchy sync via
@@ -149,12 +539,25 @@ add_task(async function test_rename_folder() {
   const child = rootFolder.getChildNamed(initialFolderName);
   Assert.ok(!!child, `${initialFolderName} should exist.`);
   const initialEwsId = child.getStringProperty(ewsIdPropertyName);
+  const initialPhysicalId = Services.prefs.getBoolPref(
+    "mail.panorama.enabled",
+    false
+  )
+    ? child.id
+    : null;
 
   ewsServer.renameFolderById(initialFolderName, finalFolderName);
   await syncFolder(incomingServer, rootFolder);
   const renamedChild = rootFolder.getChildNamed(finalFolderName);
   Assert.ok(!!renamedChild, `${finalFolderName} should exist.`);
   const finalEwsId = renamedChild.getStringProperty(ewsIdPropertyName);
+  if (initialPhysicalId !== null) {
+    Assert.equal(
+      renamedChild.id,
+      initialPhysicalId,
+      "The physical folder ID is retained"
+    );
+  }
   Assert.equal(
     finalEwsId,
     initialEwsId,
@@ -192,6 +595,12 @@ add_task(async function test_reparent_folder() {
     `${childName} should not exist in ${parent2Name}`
   );
   const initialEwsId = child.getStringProperty(ewsIdPropertyName);
+  const initialPhysicalId = Services.prefs.getBoolPref(
+    "mail.panorama.enabled",
+    false
+  )
+    ? child.id
+    : null;
 
   ewsServer.reparentFolderById(childName, parent2Name);
 
@@ -204,6 +613,13 @@ add_task(async function test_reparent_folder() {
     `${childName} should not exist in ${parent1Name}`
   );
   const finalEwsId = renamedChild.getStringProperty(ewsIdPropertyName);
+  if (initialPhysicalId !== null) {
+    Assert.equal(
+      renamedChild.id,
+      initialPhysicalId,
+      "The physical folder ID is retained"
+    );
+  }
   Assert.equal(
     finalEwsId,
     initialEwsId,
@@ -254,6 +670,9 @@ add_task(async function test_reparent_folder_tree() {
   const child1FolderEwsId = child1Folder.getStringProperty(ewsIdPropertyName);
   const child2FolderEwsId = child2Folder.getStringProperty(ewsIdPropertyName);
   const child3FolderEwsId = child3Folder.getStringProperty(ewsIdPropertyName);
+  const physicalIds = Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ? [child1Folder.id, child2Folder.id, child3Folder.id]
+    : null;
 
   const assertHierarchy = parentName => {
     const parent = rootFolder.getChildNamed(parentName);
@@ -279,6 +698,13 @@ add_task(async function test_reparent_folder_tree() {
   const child1Reparented = parentFolders[1].getChildNamed(child1Name);
   const child2Reparented = child1Reparented.getChildNamed(child2Name);
   const child3Reparented = child2Reparented.getChildNamed(child3Name);
+  if (physicalIds) {
+    Assert.deepEqual(
+      [child1Reparented.id, child2Reparented.id, child3Reparented.id],
+      physicalIds,
+      "Every descendant retains its physical ID"
+    );
+  }
 
   Assert.equal(
     child1Reparented.getStringProperty(ewsIdPropertyName),

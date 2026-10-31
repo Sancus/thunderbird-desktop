@@ -607,3 +607,316 @@ add_task(async function test_supersededMimeCallbackDoesNotUpdateRows() {
     fixture.close();
   }
 });
+
+/**
+ * Open a real folder tab and hold only its completed prior-selection MIME calls.
+ *
+ * @returns {Promise<object>} Stored headers, live pane, pending calls and cleanup.
+ */
+async function createLiveSnippetFixture() {
+  const suffix = ++summaryFixtureCount;
+  const folders = ["prior", "current", "outside"].map(name =>
+    rootFolder
+      .createLocalSubfolder(`snippet-${suffix}-${name}`)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+  );
+  const [prior, current, outside] = folders;
+  const generator = new MessageGenerator();
+  const sharedId = `snippet-shared-${suffix}@example.invalid`;
+  const aRoot = generator.makeMessage({
+    subject: "Prior physical selection",
+    body: { body: "Prior physical A snippet." },
+  });
+  aRoot.messageId = sharedId;
+  const aReply = generator.makeMessage({
+    inReplyTo: aRoot,
+    body: { body: "Prior A reply snippet." },
+  });
+  aReply.messageId = `snippet-prior-reply-${suffix}@example.invalid`;
+  const bRoot = generator.makeMessage({
+    subject: "Current physical selection",
+    body: { body: "Current physical B snippet." },
+  });
+  bRoot.messageId = sharedId;
+  const bReply = generator.makeMessage({
+    subject: "Additional current physical selection",
+    body: { body: "Current B additional snippet." },
+  });
+  bReply.messageId = `snippet-current-reply-${suffix}@example.invalid`;
+  const control = generator.makeMessage({
+    subject: "Independent control selection",
+    body: { body: "Independent control snippet." },
+  });
+  control.messageId = `snippet-control-${suffix}@example.invalid`;
+  const priorHeaders = [aRoot, aReply].map(message =>
+    prior.addMessage(message.toMessageString())
+  );
+  const currentHeaders = [bRoot, bReply, control].map(message =>
+    current.addMessage(message.toMessageString())
+  );
+  const excluded = outside.addMessage(bRoot.toMessageString());
+  const originalTab = tabmail.currentTabInfo;
+  const originalList =
+    multiMessageBrowser.contentDocument.getElementById("messageList").outerHTML;
+  const tab = tabmail.openTab("mail3PaneTab", { folderURI: prior.URI });
+  let win = null;
+  let originalMime = null;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) {
+      return;
+    }
+    cleaned = true;
+    if (win && !win.closed && originalMime) {
+      win.MsgHdrToMimeMessage = originalMime;
+    }
+    if (tabmail.tabInfo.includes(tab)) {
+      tabmail.closeTab(tab);
+    }
+    for (const folder of folders) {
+      if (rootFolder.containsChildNamed(folder.name)) {
+        folder.deleteSelf(null);
+      }
+    }
+  };
+  registerCleanupFunction(cleanup);
+  await BrowserTestUtils.browserLoaded(tab.chromeBrowser);
+  const pane = tab.chromeBrowser.contentWindow;
+  await pane.hasDOMContentLoaded.promise;
+  await TestUtils.waitForCondition(
+    () =>
+      pane.gDBView?.rowCount && pane.dbViewWrapperListener.allMessagesLoaded,
+    "The real prior folder view has loaded"
+  );
+  pane.gViewWrapper.showThreaded = false;
+  pane.threadTree.selectedIndices = [];
+  await TestUtils.waitForCondition(
+    () => pane.multiMessageBrowser.contentWindow.gMessageSummary,
+    "The real summary document is ready"
+  );
+  win = pane.multiMessageBrowser.contentWindow;
+  originalMime = win.MsgHdrToMimeMessage;
+  const pending = [];
+  win.MsgHdrToMimeMessage = (header, context, callback, ...args) =>
+    originalMime(
+      header,
+      context,
+      function (...values) {
+        if (header.folder.URI != prior.URI) {
+          callback.apply(this, values);
+          return;
+        }
+        Assert.deepEqual(
+          physicalSummaryIdentity(values[0]),
+          physicalSummaryIdentity(header),
+          "The completed real stream belongs to the requested physical header"
+        );
+        Assert.ok(values[1], "The real MIME stream supplied a message tree");
+        pending.push(() => callback.apply(this, values));
+      },
+      ...args
+    );
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const factory = Cc["@mozilla.org/msgDatabase/msgDBService;1"];
+  if (native) {
+    Assert.ok(factory.getService(Ci.nsIDatabaseCore));
+  }
+  info(`Snippet099 actual startup native=${native}`);
+  const loaded = BrowserTestUtils.waitForEvent(pane, "MsgsLoaded");
+  pane.threadTree.focus();
+  EventUtils.synthesizeKey("a", { accelKey: true }, pane);
+  await loaded;
+  Assert.ok(BrowserTestUtils.isVisible(pane.multiMessageBrowser));
+  Assert.deepEqual(
+    pane.gDBView.getSelectedMsgHdrs().map(physicalSummaryIdentity),
+    priorHeaders.map(physicalSummaryIdentity),
+    "The real summary selection contains exactly both stored prior headers"
+  );
+  await TestUtils.waitForCondition(
+    () => pending.length == 2,
+    "Both real prior MIME completions are held at the consumer boundary"
+  );
+  const oldSnippets = [...win.document.querySelectorAll(".snippet")];
+  Assert.equal(oldSnippets.length, 2);
+  Assert.deepEqual(
+    oldSnippets.map(node => node.textContent),
+    ["", ""]
+  );
+  return {
+    prior,
+    current,
+    outside,
+    priorHeaders,
+    currentHeaders,
+    excluded,
+    originalTab,
+    originalList,
+    tab,
+    pane,
+    win,
+    pending,
+    oldSnippets,
+    cleanup,
+  };
+}
+
+add_task(async function test_selectionChangeRejectsLateMimeSnippet() {
+  const fixture = await createLiveSnippetFixture();
+  const { pane, win, current, currentHeaders, priorHeaders } = fixture;
+  try {
+    pane.displayFolder(current.URI);
+    await TestUtils.waitForCondition(
+      () =>
+        pane.gDBView?.rowCount &&
+        pane.gDBView.getMsgHdrAt(0).folder.URI == current.URI &&
+        pane.dbViewWrapperListener.allMessagesLoaded,
+      "The actual folder switch has installed the current physical rows"
+    );
+    pane.gViewWrapper.showThreaded = false;
+    const loaded = BrowserTestUtils.waitForEvent(pane, "MsgsLoaded");
+    pane.threadTree.focus();
+    EventUtils.synthesizeKey("a", { accelKey: true }, pane);
+    await loaded;
+    const selected = currentHeaders.map(physicalSummaryIdentity);
+    Assert.deepEqual(
+      pane.gDBView.getSelectedMsgHdrs().map(physicalSummaryIdentity),
+      selected
+    );
+    Assert.equal(priorHeaders[0].messageId, currentHeaders[0].messageId);
+    Assert.notEqual(priorHeaders[0].folder.URI, currentHeaders[0].folder.URI);
+    const list = win.document.getElementById("messageList");
+    try {
+      await BrowserTestUtils.waitForMutationCondition(
+        list,
+        { subtree: true, childList: true, characterData: true },
+        () =>
+          list.children.length == 3 &&
+          [...list.querySelectorAll(".snippet")].every(node => node.textContent)
+      );
+    } catch (error) {
+      info(
+        "Snippet099 current summary " +
+          JSON.stringify({
+            rows: [...list.children].map(node => ({
+              id: node.dataset.messageId,
+              snippet: node.querySelector(".snippet").textContent,
+            })),
+            threads: currentHeaders.map(header => {
+              const thread = pane.gDBView.getThreadContainingMsgHdr(header);
+              return {
+                physical: physicalSummaryIdentity(header),
+                threadKey: thread.threadKey,
+                root: physicalSummaryIdentity(thread.getRootHdr()),
+              };
+            }),
+          })
+      );
+      throw error;
+    }
+    const rows = [...list.children];
+    const row = rows.find(
+      node => node.dataset.messageId == currentHeaders[0].messageId
+    );
+    const control = rows.find(
+      node => node.dataset.messageId == currentHeaders[2].messageId
+    );
+    Assert.ok(row, "The current physical thread has a real summary row");
+    Assert.ok(control, "The unrelated control has its own summary row");
+    const additional = rows.find(
+      node => node.dataset.messageId == currentHeaders[1].messageId
+    );
+    Assert.ok(additional, "The additional current header has its own row");
+    Assert.equal(
+      additional.querySelector(".snippet").textContent,
+      "Current B additional snippet."
+    );
+    Assert.deepEqual(
+      rows.map(node => node.dataset.messageId),
+      currentHeaders.map(header => header.messageId),
+      "Exactly all three independently selected current rows are displayed"
+    );
+    Assert.equal(
+      row.querySelector(".snippet").textContent,
+      "Current physical B snippet."
+    );
+    Assert.equal(
+      control.querySelector(".snippet").textContent,
+      "Independent control snippet."
+    );
+    const html = rows.map(node => node.outerHTML);
+    for (const callback of fixture.pending.splice(0)) {
+      callback();
+    }
+    Assert.deepEqual(
+      fixture.oldSnippets.map(node => node.textContent),
+      ["", ""],
+      "The superseded real MIME callbacks cannot publish to their old rows"
+    );
+    Assert.ok(fixture.oldSnippets.every(node => !node.isConnected));
+    Assert.deepEqual(
+      [...list.children],
+      rows,
+      "Current summary rows are retained"
+    );
+    Assert.deepEqual(
+      rows.map(node => node.outerHTML),
+      html,
+      "Current B and the unrelated control are unchanged after actual A callbacks"
+    );
+    Assert.deepEqual(
+      pane.gDBView.getSelectedMsgHdrs().map(physicalSummaryIdentity),
+      selected,
+      "Late callbacks preserve the exact selected physical headers"
+    );
+    Assert.ok(
+      fixture.outside.msgDatabase.containsKey(fixture.excluded.messageKey),
+      "The unselected equal-ID copy remains outside the actual selection"
+    );
+    info("Snippet099 real selection A-to-B stale callbacks complete");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+add_task(async function test_closedSummaryRejectsLateMimeSnippet() {
+  const fixture = await createLiveSnippetFixture();
+  const { win, tab } = fixture;
+  const summary = win.gMessageSummary;
+  try {
+    const unloaded = BrowserTestUtils.waitForEvent(win, "unload");
+    tabmail.closeTab(tab);
+    await unloaded;
+    Assert.ok(
+      !tabmail.tabInfo.includes(tab),
+      "The actual summary tab is closed"
+    );
+    Assert.equal(
+      summary._folderStates.size,
+      0,
+      "Unload released summary subscriptions"
+    );
+    for (const callback of fixture.pending.splice(0)) {
+      callback();
+    }
+    Assert.deepEqual(
+      fixture.oldSnippets.map(node => node.textContent),
+      ["", ""],
+      "Real MIME completions cannot publish after the summary consumer closes"
+    );
+    Assert.ok(fixture.oldSnippets.every(node => !node.isConnected));
+    Assert.strictEqual(
+      tabmail.currentTabInfo,
+      fixture.originalTab,
+      "Closing the consumer returns to the original real tab"
+    );
+    Assert.equal(
+      multiMessageBrowser.contentDocument.getElementById("messageList")
+        .outerHTML,
+      fixture.originalList,
+      "The surviving consumer is unchanged by the old callbacks"
+    );
+    info("Snippet099 real summary-tab close stale callbacks complete");
+  } finally {
+    fixture.cleanup();
+  }
+});

@@ -363,6 +363,37 @@ class DeliveryCoreReferences : public testing::Test {
     return mCore->MessageDB().GetSearchWatermark(sequence);
   }
 
+  nsresult ReadFolderProperty(FolderDatabase* db, uint64_t folder,
+                              const nsACString& name, nsACString& value) {
+    return db->GetFolderProperty(folder, name, value);
+  }
+
+  nsresult ReadFolderProperty(FolderDatabase* db, uint64_t folder,
+                              const nsACString& name, int64_t& value) {
+    return db->GetFolderProperty(folder, name, &value);
+  }
+
+  nsresult WriteFolderProperty(FolderDatabase* db, uint64_t folder,
+                               const nsACString& name,
+                               const nsACString& value) {
+    return db->SetFolderProperty(folder, name, value);
+  }
+
+  nsresult WriteFolderProperty(FolderDatabase* db, uint64_t folder,
+                               const nsACString& name, int64_t value) {
+    return db->SetFolderProperty(folder, name, value);
+  }
+
+  nsresult ReadVirtualFolders(FolderDatabase* db, uint64_t folder,
+                              nsTArray<uint64_t>& members) {
+    return db->GetVirtualFolderFolders(folder, members);
+  }
+
+  nsresult WriteVirtualFolders(FolderDatabase* db, uint64_t folder,
+                               nsTArray<uint64_t>& members) {
+    return db->SetVirtualFolderFolders(folder, members);
+  }
+
   enum class StructuralFailure { None, CallerTransaction, Write, Commit };
 
   void CheckStructuralFieldWrites(bool staged, StructuralFailure failure) {
@@ -11605,6 +11636,109 @@ TEST_F(DeliveryCoreReferences, FlagAndTagChangesDoNotOpenStoppedOrOldOwner) {
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageTags(published, text));
   EXPECT_EQ(0u, flags);
   EXPECT_TRUE(text.IsEmpty());
+}
+
+TEST_F(DeliveryCoreReferences,
+       StoppedNativeWritersCannotReopenOrJoinReplacementCore) {
+  ASSERT_EQ(NS_OK, Start());
+  RefPtr<MessageDatabase> heldMessages = &mCore->MessageDB();
+  RefPtr<FolderDatabase> heldFolders = &mCore->FolderDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK,
+            Add("lifetime-control"_ns, {"raw"_ns, ""_ns, "raw"_ns}, key));
+  ASSERT_EQ(NS_OK,
+            heldMessages->SetMessageProperty(key, "Exact"_ns, "00042"_ns));
+  RawHdr raw;
+  raw.messageId = "retained-staged"_ns;
+  nsMsgKey staged;
+  ASSERT_EQ(NS_OK, heldMessages->StageMessage(mFolderId, raw, &staged));
+  ASSERT_EQ(NS_OK, WriteFolderProperty(heldFolders, mFolderId, "Exact"_ns,
+                                       "00042"_ns));
+  ASSERT_EQ(NS_OK, WriteFolderProperty(heldFolders, mFolderId, "number"_ns,
+                                       INT64_MAX));
+  ASSERT_EQ(NS_OK, heldFolders->SetFolderUidValidity(mFolderId, 42));
+  nsTArray<uint64_t> members{mFolderId};
+  ASSERT_EQ(NS_OK, WriteVirtualFolders(heldFolders, mFolderId, members));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  Stop();
+
+  auto rejectRetired = [&] {
+    nsCString text = "unchanged"_ns;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              heldMessages->GetMessageProperty(key, "Exact"_ns, text));
+    EXPECT_EQ("unchanged"_ns, text);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              ReadFolderProperty(heldFolders, mFolderId, "Exact"_ns, text));
+    EXPECT_EQ("unchanged"_ns, text);
+    nsMsgKey output = nsMsgKey_None;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              heldMessages->AddMessage(mFolderId, raw, false, &output));
+    EXPECT_EQ(nsMsgKey_None, output);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              heldMessages->SetMessageProperty(key, "Exact"_ns, "rejected"_ns));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              heldMessages->SetMessageProperty(key, "Exact"_ns, uint32_t(99)));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, heldMessages->AbortMessage(staged));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              heldMessages->PublishMessage(staged, false));
+    EXPECT_EQ(
+        NS_ERROR_NOT_AVAILABLE,
+        WriteFolderProperty(heldFolders, mFolderId, "Exact"_ns, "bad"_ns));
+    EXPECT_EQ(
+        NS_ERROR_NOT_AVAILABLE,
+        WriteFolderProperty(heldFolders, mFolderId, "number"_ns, int64_t(99)));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              heldFolders->SetFolderUidValidity(mFolderId, 99));
+    nsTArray<uint64_t> empty;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              WriteVirtualFolders(heldFolders, mFolderId, empty));
+  };
+  ASSERT_NO_FATAL_FAILURE(rejectRetired());
+  EXPECT_FALSE(Connection());
+  ASSERT_EQ(NS_OK, Start());
+  auto* current = Connection();
+  ASSERT_NO_FATAL_FAILURE(rejectRetired());
+  EXPECT_EQ(current, Connection());
+
+  // Current raw property calls still participate in a caller-owned transaction.
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageProperty(key, "Exact"_ns,
+                                                         "caller"_ns));
+  ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                       "Exact"_ns, "caller"_ns));
+  ASSERT_NO_FATAL_FAILURE(rejectRetired());
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+
+  nsCString text;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(text));
+  EXPECT_EQ(source, text);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId, "Exact"_ns,
+                                      text));
+  EXPECT_EQ("00042"_ns, text);
+  int64_t number = 0;
+  ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                      "number"_ns, number));
+  EXPECT_EQ(INT64_MAX, number);
+  uint32_t epoch = 0;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderUidValidity(mFolderId, epoch));
+  EXPECT_EQ(42U, epoch);
+  nsTArray<uint64_t> actualMembers;
+  ASSERT_EQ(NS_OK,
+            ReadVirtualFolders(&mCore->FolderDB(), mFolderId, actualMembers));
+  EXPECT_EQ(members, actualMembers);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolderId, keys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{staged}), keys);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"raw"_ns, ""_ns, "raw"_ns}), refs);
 }
 
 TEST_F(DeliveryCoreReferences, MarkAllReadPublishesCommittedFlagsInQueueOrder) {

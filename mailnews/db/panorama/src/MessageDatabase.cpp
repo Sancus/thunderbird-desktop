@@ -293,10 +293,15 @@ bool SearchRevision(JSContext* cx, JS::Handle<JSObject*> object,
 
 }  // namespace
 
-nsresult MessageDatabase::RequireCommittedSearchRead() {
+nsresult MessageDatabase::RequireCurrentOwner() const {
   NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection &&
                      DatabaseCore::sInstance->mMessageDatabase.get() == this,
                  NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::RequireCommittedSearchRead() {
+  MOZ_TRY(RequireCurrentOwner());
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   return active ? NS_ERROR_IN_PROGRESS : NS_OK;
@@ -1501,7 +1506,7 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
   if (staged) {
     NS_ENSURE_TRUE(aFolderId && aFolderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   }
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool inTransaction;
   MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
@@ -2032,6 +2037,7 @@ nsresult MessageDatabase::GetHeaderStatement(
     nsMsgKey key, const nsACString& label, HeaderTable table,
     const nsACString& prefix, const nsACString& suffix,
     mozIStorageStatement** statement, bool* staged) {
+  MOZ_TRY(RequireCurrentOwner());
   bool pending;
   MOZ_TRY(IsMessageStaged(key, pending));
   if (!StringBeginsWith(prefix, "SELECT"_ns)) {
@@ -2094,7 +2100,7 @@ nsresult MessageDatabase::ListStagedMessages(uint64_t folderId,
 }
 
 nsresult MessageDatabase::AbortMessage(nsMsgKey key) {
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   {
     nsCOMPtr<mozIStorageStatement> attempt;
     MOZ_TRY(DatabaseCore::GetStatement(
@@ -2130,7 +2136,7 @@ nsresult MessageDatabase::AbortMessage(nsMsgKey key) {
 
 nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
                                          Message** liveHeader) {
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -2560,7 +2566,7 @@ nsresult MessageDatabase::GetOfflineOperation(uint64_t folderId, nsMsgKey key,
 
 nsresult MessageDatabase::ReserveOfflineOperationKey(uint64_t folderId,
                                                      nsMsgKey& key) {
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -2617,7 +2623,7 @@ nsresult MessageDatabase::StoreOfflineOperation(
                      input.copyDestinationBindings.Length() ==
                          input.copyDestinations.Length(),
                  NS_ERROR_INVALID_ARG);
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -2815,7 +2821,7 @@ nsresult MessageDatabase::StoreOfflineOperation(
 nsresult MessageDatabase::SetOfflineOperationPlayingBack(uint64_t folderId,
                                                          nsMsgKey key,
                                                          bool playingBack) {
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
@@ -2838,7 +2844,7 @@ nsresult MessageDatabase::SetOfflineOperationPlayingBack(uint64_t folderId,
 
 nsresult MessageDatabase::RemoveOfflineOperation(uint64_t folderId,
                                                  nsMsgKey key) {
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -2900,7 +2906,7 @@ nsresult MessageDatabase::BeginOfflineAttempt(
     uint64_t folderId, nsMsgKey key, uint32_t operation,
     const Maybe<PendingDestination>& destination, uint64_t& attemptId) {
   NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -3172,7 +3178,7 @@ nsresult MessageDatabase::GetCurrentOfflineAttempt(uint64_t folderId,
 
 nsresult MessageDatabase::ResolveOfflineAttemptNotApplied(uint64_t attemptId) {
   NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
@@ -3193,7 +3199,7 @@ nsresult MessageDatabase::ResolveOfflineAttemptNotApplied(uint64_t attemptId) {
 
 nsresult MessageDatabase::MarkOfflineAttemptAmbiguous(uint64_t attemptId) {
   NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
@@ -3216,7 +3222,7 @@ nsresult MessageDatabase::ConfirmOfflineAttempt(
     uint64_t attemptId, const Maybe<ServerUidConfirmation>& destinationUid) {
   NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));
@@ -3384,7 +3390,7 @@ nsresult MessageDatabase::WriteMessageReferencesInTransaction(
 
 nsresult MessageDatabase::SetMessageReferences(
     nsMsgKey key, const nsTArray<nsCString>& references) {
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool inTransaction;
   MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
@@ -3641,7 +3647,7 @@ nsresult MessageDatabase::RemoveMessageInternal(
     nsMsgKey key, uint64_t folderId, const nsACString* databaseSourceId,
     MessageRemovalAccounting accounting, RemovedMessage* output) {
   MOZ_ASSERT(key != nsMsgKey_None);
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool inTransaction;
   MOZ_TRY(connection->GetTransactionInProgress(&inTransaction));
@@ -4669,7 +4675,7 @@ nsresult MessageDatabase::BindMessageToServerUid(nsMsgKey key,
     return NS_ERROR_NOT_AVAILABLE;
   }
   NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
-  MOZ_TRY(DatabaseCore::EnsureConnection());
+  MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
   MOZ_TRY(connection->GetTransactionInProgress(&active));

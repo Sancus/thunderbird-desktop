@@ -116,7 +116,7 @@ DatabaseCore::Startup() {
 
   MOZ_LOG(gPanoramaLog, LogLevel::Info, ("DatabaseCore starting up"));
 
-  nsresult rv = EnsureConnection();
+  nsresult rv = EnsureConnection(true);
   NS_ENSURE_SUCCESS(rv, rv);
 
   mFolderDatabase = new FolderDatabase();
@@ -185,10 +185,13 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
 /**
  * Ensures a mozIStorageConnection to panorama.sqlite in the profile folder.
  */
-nsresult DatabaseCore::EnsureConnection() {
+nsresult DatabaseCore::EnsureConnection(bool aAllowNewConnection) {
   if (sConnection) {
     return NS_OK;
   }
+  // Only explicit startup may open a connection after native teardown.
+  NS_ENSURE_TRUE(aAllowNewConnection && sInstance && !sInstance->mShuttingDown,
+                 NS_ERROR_NOT_AVAILABLE);
 
   MOZ_ASSERT(NS_IsMainThread(),
              "connection must be established on the main thread");

@@ -228,3 +228,81 @@ add_task(function test_forceCloseDuringPublicationKeepsHeaderAndOneEvent() {
     db.removeListener(listener);
   }
 });
+
+/**
+ * Keep a replacement opened during a real folder close callback.
+ *
+ * @param {string} method - Existing nsIMsgFolder close method.
+ * @param {string} name - Unique child folder name.
+ */
+function checkFolderCloseReplacement(method, name) {
+  const folder = root.createLocalSubfolder(name);
+  const other = root.createLocalSubfolder(name + "-other");
+  const db = folder.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const key = addMessage({ folderId: folder.id });
+  const otherKey = addMessage({ folderId: other.id });
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const connection = database.connectionForTests;
+  let calls = 0;
+  let replacement;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onAnnouncerGoingAway(source) {
+      Assert.strictEqual(source, db);
+      ++calls;
+      source.removeListener(listener);
+      replacement = folder.msgDatabase;
+      Assert.notStrictEqual(replacement, db);
+      Assert.strictEqual(replacement.folder, folder);
+    },
+  };
+  db.addListener(listener);
+  try {
+    folder[method]();
+    Assert.equal(calls, 1);
+    Assert.ok(folder.databaseOpen, "the reentrant replacement stays attached");
+    Assert.strictEqual(service.cachedDBForFolder(folder), replacement);
+    Assert.strictEqual(
+      service.cachedDBForFilePath(folder.filePath),
+      replacement
+    );
+    Assert.strictEqual(folder.msgDatabase, replacement);
+    Assert.deepEqual(replacement.listAllKeys(), [key]);
+    Assert.strictEqual(other.msgDatabase, otherDB);
+    Assert.deepEqual(otherDB.listAllKeys(), [otherKey]);
+    Assert.strictEqual(database.connectionForTests, connection);
+    db.forceClosed();
+    Assert.equal(calls, 1);
+  } finally {
+    db.removeListener(listener);
+  }
+}
+
+add_task(function test_folderClosePreservesReentrantReplacement() {
+  checkFolderCloseReplacement("CloseDatabase", "folder-close-replacement");
+});
+
+add_task(function test_folderForceClosePreservesReentrantReplacement() {
+  checkFolderCloseReplacement("ForceDBClosed", "folder-force-replacement");
+});
+
+add_task(function test_oldAnnouncerCannotDetachTheCurrentWrapper() {
+  const folder = root.createLocalSubfolder("old-announcer");
+  const oldDB = folder.msgDatabase;
+  const key = addMessage({ folderId: folder.id });
+  oldDB.forceClosed();
+  const current = folder.msgDatabase;
+  Assert.notStrictEqual(current, oldDB);
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  folder.QueryInterface(Ci.nsIDBChangeListener).onAnnouncerGoingAway(oldDB);
+  Assert.ok(folder.databaseOpen, "a different announcer cannot detach it");
+  Assert.strictEqual(folder.msgDatabase, current);
+  Assert.strictEqual(service.cachedDBForFolder(folder), current);
+  Assert.strictEqual(current.folder, folder);
+  Assert.deepEqual(current.listAllKeys(), [key]);
+});

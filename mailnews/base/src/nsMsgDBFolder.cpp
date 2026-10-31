@@ -331,8 +331,11 @@ NS_IMETHODIMP nsMsgDBFolder::Shutdown(bool shutdownChildren) {
 
 NS_IMETHODIMP nsMsgDBFolder::CloseDatabase() {
   if (mDatabase) {
-    mDatabase->ForceClosed();
-    mDatabase = nullptr;
+    nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+    db->ForceClosed();
+    if (mDatabase == db) {
+      mDatabase = nullptr;
+    }
   } else {
     nsCOMPtr<nsIMsgDBService> mailDBFactory(
         do_GetService("@mozilla.org/msgDatabase/msgDBService;1"));
@@ -346,8 +349,11 @@ NS_IMETHODIMP nsMsgDBFolder::ForceDBClosed() {
   for (int32_t i = 0; i < count; i++) mSubFolders[i]->ForceDBClosed();
 
   if (mDatabase) {
-    mDatabase->ForceClosed();
-    mDatabase = nullptr;
+    nsCOMPtr<nsIMsgDatabase> db = mDatabase;
+    db->ForceClosed();
+    if (mDatabase == db) {
+      mDatabase = nullptr;
+    }
   } else {
     nsCOMPtr<nsIMsgDBService> mailDBFactory(
         do_GetService("@mozilla.org/msgDatabase/msgDBService;1"));
@@ -1001,7 +1007,7 @@ NS_IMETHODIMP nsMsgDBFolder::OnAnnouncerGoingAway(
   if (mBackupDatabase && instigator == mBackupDatabase) {
     mBackupDatabase->RemoveListener(this);
     mBackupDatabase = nullptr;
-  } else if (mDatabase) {
+  } else if (mDatabase && instigator == mDatabase) {
     mDatabase->RemoveListener(this);
     mDatabase = nullptr;
   }

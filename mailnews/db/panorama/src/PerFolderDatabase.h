@@ -79,6 +79,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                               nsIMsgDBHdr** realHdr);
 
  private:
+  friend class Message;
   friend class FolderInfo;
   friend class OfflineOperation;
   friend class MessageEnumerator;
@@ -93,6 +94,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   MessageDatabase& MessageDB() const {
     return *DatabaseCore::sInstance->mMessageDatabase;
   }
+  uint32_t StatusFlags(nsMsgKey key, uint32_t rawFlags) const;
+  nsresult GetStatusFlags(nsMsgKey key, uint32_t rawFlags,
+                          uint32_t& status) const;
   nsresult CheckFolderExists() const;
   nsresult CaptureDatabaseSourceId();
   nsresult CheckDatabaseSource() const;

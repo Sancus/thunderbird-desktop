@@ -379,13 +379,14 @@ void PerFolderDatabase::OnMessagePublished(Message* message,
   NS_ENSURE_SUCCESS_VOID(rv);
   if (msgFolderId == mFolderId) {
     uint32_t flags;
-    rv = message->GetFlags(&flags);
+    rv = MessageDB().GetMessageFlags(message->Key(), flags);
     NS_ENSURE_SUCCESS_VOID(rv);
     // Unread messages join NewList even when legacy notifications are
     // suppressed.
     if (!(flags & nsMsgMessageFlags::Read)) {
-      rv = AddToNewList(message->Key());
-      NS_ENSURE_SUCCESS_VOID(rv);
+      if (!mNewList.Contains(message->Key())) {
+        mNewList.AppendElement(message->Key());
+      }
     }
     if (!notifyLegacy) {
       return;
@@ -394,7 +395,8 @@ void PerFolderDatabase::OnMessagePublished(Message* message,
     rv = message->GetThreadParent(&parent);
     NS_ENSURE_SUCCESS_VOID(rv);
     // Panorama stores an absent parent as zero.
-    NotifyHdrAddedAll(message, parent ? parent : nsMsgKey_None, flags, nullptr);
+    NotifyHdrAddedAll(message, parent ? parent : nsMsgKey_None,
+                      StatusFlags(message->Key(), flags), nullptr);
   }
 }
 
@@ -427,7 +429,9 @@ void PerFolderDatabase::OnMessageRemoved(Message* message, uint32_t oldFlags) {
   nsresult rv = MessageDB().GetMessageFolderId(message->Key(), msgFolderId);
   NS_ENSURE_SUCCESS_VOID(rv);
   if (msgFolderId == mFolderId) {
-    NotifyHdrDeletedAll(message, nsMsgKey_None, oldFlags, nullptr);
+    uint32_t status = StatusFlags(message->Key(), oldFlags);
+    mNewList.RemoveElement(message->Key());
+    NotifyHdrDeletedAll(message, nsMsgKey_None, status, nullptr);
   }
 }
 
@@ -443,7 +447,12 @@ void PerFolderDatabase::OnMessageFlagsChanged(nsIMsgDBHdr* oldMessage,
   nsresult rv = MessageDB().GetMessageFolderId(message->Key(), msgFolderId);
   NS_ENSURE_SUCCESS_VOID(rv);
   if (msgFolderId == mFolderId) {
-    NotifyHdrChangeAll(message, oldFlags, newFlags, nullptr);
+    CapturedMessage before, after;
+    before.id = after.id = message->Key();
+    before.folderId = after.folderId = mFolderId;
+    before.flags = oldFlags;
+    after.flags = newFlags;
+    OnMessageFlagsChangedCaptured(before, after, oldMessage, message);
   }
 }
 
@@ -481,12 +490,16 @@ void PerFolderDatabase::OnMessagePublishedCaptured(const CapturedMessage& after,
   }
   RefPtr<PerFolderDatabase> self(this);
   if (!(after.flags & nsMsgMessageFlags::Read)) {
-    nsresult rv = AddToNewList(after.id);
-    NS_ENSURE_SUCCESS_VOID(rv);
+    // Earlier native listeners may already have changed the live row. These
+    // membership and notification facts belong to this captured publication.
+    if (!mNewList.Contains(after.id)) {
+      mNewList.AppendElement(after.id);
+    }
   }
   if (notifyLegacy) {
     nsMsgKey parent = after.threadParent ? after.threadParent : nsMsgKey_None;
-    NotifyHdrAddedAll(message, parent, after.flags, nullptr);
+    NotifyHdrAddedAll(message, parent, StatusFlags(after.id, after.flags),
+                      nullptr);
   }
 }
 
@@ -499,9 +512,10 @@ void PerFolderDatabase::OnMessageRemovedCaptured(const CapturedMessage& before,
     return;
   }
   RefPtr<PerFolderDatabase> self(this);
+  uint32_t status = StatusFlags(before.id, before.flags);
   mNewList.RemoveElement(before.id);
   nsMsgKey parent = before.threadParent ? before.threadParent : nsMsgKey_None;
-  NotifyHdrDeletedAll(message, parent, before.flags, nullptr);
+  NotifyHdrDeletedAll(message, parent, status, nullptr);
 }
 
 void PerFolderDatabase::OnMessageFlagsChangedCaptured(
@@ -515,12 +529,16 @@ void PerFolderDatabase::OnMessageFlagsChangedCaptured(
     return;
   }
   RefPtr<PerFolderDatabase> self(this);
+  uint32_t oldStatus = StatusFlags(before.id, before.flags);
   if (((before.flags ^ after.flags) & nsMsgMessageFlags::Read) ||
       ((before.flags & nsMsgMessageFlags::New) &&
        !(after.flags & nsMsgMessageFlags::New))) {
     mNewList.RemoveElement(after.id);
   }
-  NotifyHdrChangeAll(message, before.flags, after.flags, nullptr);
+  uint32_t newStatus = StatusFlags(after.id, after.flags);
+  // Freeze both outgoing words before ordinary listeners can remove/re-add the
+  // key, change flags again, or close this facade.
+  NotifyHdrChangeAll(message, oldStatus, newStatus, nullptr);
 }
 
 void PerFolderDatabase::OnMessageTagsChangedCaptured(
@@ -688,6 +706,18 @@ NS_IMETHODIMP PerFolderDatabase::GetDatabaseSize(int64_t* databaseSize) {
   *databaseSize = 0;
   return NS_OK;
 }
+uint32_t PerFolderDatabase::StatusFlags(nsMsgKey key, uint32_t rawFlags) const {
+  return mNewList.Contains(key) ? rawFlags | nsMsgMessageFlags::New : rawFlags;
+}
+
+nsresult PerFolderDatabase::GetStatusFlags(nsMsgKey key, uint32_t rawFlags,
+                                           uint32_t& status) const {
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  status = StatusFlags(key, rawFlags);
+  return NS_OK;
+}
+
 nsresult PerFolderDatabase::CheckDatabaseSource() const {
   MOZ_TRY(mDatabaseSourceStatus);
   RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
@@ -999,6 +1029,8 @@ NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
     MOZ_TRY(folder->GetId(&folderId));
     MOZ_TRY(MessageDB().GetMessageFolderId(sourceKey, storedFolderId));
     NS_ENSURE_TRUE(folderId == storedFolderId, NS_ERROR_ILLEGAL_VALUE);
+    // Copy the admitted native word, not the facade's transient NewList bit.
+    MOZ_TRY(MessageDB().GetMessageFlags(sourceKey, raw.flags));
     // The public getter filters self/empty tokens and has a uint16 limit.
     MOZ_TRY(MessageDB().GetMessageReferences(sourceKey, raw.references));
   } else {
@@ -1318,8 +1350,11 @@ NS_IMETHODIMP PerFolderDatabase::MarkNotNew(nsMsgKey aKey,
   MOZ_TRY(MessageDB().SetMessageFlag(aKey, nsMsgMessageFlags::New, false));
   // A changed raw flag clears NewList before notifying listeners. Do not erase
   // an entry that a listener added again while handling that notification.
-  if (!(flags & nsMsgMessageFlags::New)) {
-    mNewList.RemoveElement(aKey);
+  if (!(flags & nsMsgMessageFlags::New) && mNewList.RemoveElement(aKey)) {
+    // The raw setter was a no-op, but removing the list contribution changes
+    // the public status. Do not manufacture a native flag write or event.
+    return NotifyHdrChangeAll(header, flags | nsMsgMessageFlags::New, flags,
+                              aInstigator);
   }
   return NS_OK;
 }
@@ -1415,8 +1450,9 @@ nsresult PerFolderDatabase::MarkThreadFlag(nsIMsgThread* thread, nsMsgKey key,
     flags &= ~flag;
   }
   MOZ_TRY(thread->SetFlags(flags));
-  return NotifyHdrChangeAll(header, oldFlags | current.flags,
-                            flags | current.flags, instigator);
+  uint32_t status = StatusFlags(key, current.flags);
+  return NotifyHdrChangeAll(header, oldFlags | status, flags | status,
+                            instigator);
 }
 
 NS_IMETHODIMP PerFolderDatabase::MarkThreadIgnored(
@@ -1816,10 +1852,43 @@ NS_IMETHODIMP PerFolderDatabase::SortNewKeysIfNeeded() {
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::ClearNewList(bool aNotify) {
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  struct Change {
+    nsCOMPtr<nsIMsgDBHdr> header;
+    uint32_t rawFlags;
+  };
+  nsTArray<Change> changes;
+  if (aNotify) {
+    // Finish all fallible reads before changing membership or notifying anyone.
+    // These raw words remain historical even if an earlier listener mutates a
+    // later header during fanout.
+    for (nsMsgKey key : mNewList) {
+      nsCOMPtr<nsIMsgDBHdr> header;
+      MOZ_TRY(GetMsgHdrForKey(key, getter_AddRefs(header)));
+      uint32_t flags;
+      MOZ_TRY(MessageDB().GetMessageFlags(key, flags));
+      if (!(flags & nsMsgMessageFlags::New)) {
+        changes.AppendElement(Change{header, flags});
+      }
+    }
+  }
   mNewList.Clear();
+  for (const Change& change : changes) {
+    if (mForceClosed) {
+      break;
+    }
+    NotifyHdrChangeAll(change.header, change.rawFlags | nsMsgMessageFlags::New,
+                       change.rawFlags, nullptr);
+  }
+  // Preserve entries added by a listener after the clear, and preserve stored
+  // New bits: this operation removes only the facade's list contribution.
   return NS_OK;
 }
 NS_IMETHODIMP PerFolderDatabase::AddToNewList(nsMsgKey aKey) {
+  nsCOMPtr<nsIMsgDBHdr> member;
+  MOZ_TRY(GetMsgHdrForKey(aKey, getter_AddRefs(member)));
   if (!mNewList.Contains(aKey)) {
     mNewList.AppendElement(aKey);
   }

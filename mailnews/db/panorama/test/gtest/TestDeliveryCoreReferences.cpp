@@ -32,7 +32,9 @@
 #include "nsDirectoryServiceUtils.h"
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
+#include "nsIInputStream.h"
 #include "nsLocalFile.h"
+#include "nsNetUtil.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgFolder.h"
@@ -9960,6 +9962,70 @@ TEST_F(DeliveryCoreReferences,
   bool exists = false;
   ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
   EXPECT_TRUE(exists);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StartupPreservesMalformedFileForExplicitRestore) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK,
+            Add("corrupt-file-control"_ns, {"raw"_ns, ""_ns, "raw"_ns}, key));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().SetMessageProperty(key, "Exact"_ns, "00042"_ns));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  Stop();
+
+  // Preserve the closed, valid database before damaging only this test's copy.
+  ASSERT_EQ(NS_OK, mFile->CopyToNative(mProfile, "lifecycle-backup.sqlite"_ns));
+  nsCOMPtr<nsIFile> backup;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(backup)));
+  ASSERT_EQ(NS_OK, backup->Append(u"lifecycle-backup.sqlite"_ns));
+  int64_t size = 0;
+  ASSERT_EQ(NS_OK, backup->GetFileSize(&size));
+  ASSERT_GT(size, 31);
+  ASSERT_EQ(NS_OK, mFile->SetFileSize(31));
+  auto readBytes = [](nsIFile* file, nsACString& bytes) -> nsresult {
+    nsCOMPtr<nsIInputStream> stream;
+    MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), file));
+    auto close = MakeScopeExit([&] { stream->Close(); });
+    return NS_ReadInputStreamToString(stream, bytes, -1);
+  };
+  nsCString damaged;
+  ASSERT_EQ(NS_OK, readBytes(mFile, damaged));
+  ASSERT_EQ(31U, damaged.Length());
+
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, Start());
+  EXPECT_FALSE(Connection());
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mFile->Exists(&exists));
+  ASSERT_TRUE(exists);
+  nsCString retained;
+  ASSERT_EQ(NS_OK, readBytes(mFile, retained));
+  EXPECT_EQ(damaged, retained);
+  ASSERT_EQ(NS_OK, backup->GetFileSize(&size));
+  EXPECT_GT(size, 31);
+
+  // Only explicit test recovery restores the backup. Keep the rejected input.
+  nsCOMPtr<nsIFile> rejected;
+  ASSERT_EQ(NS_OK, mFile->Clone(getter_AddRefs(rejected)));
+  ASSERT_EQ(NS_OK,
+            rejected->MoveToNative(mProfile, "lifecycle-rejected.sqlite"_ns));
+  ASSERT_EQ(NS_OK, backup->CopyToNative(mProfile, "panorama.sqlite"_ns));
+  ASSERT_EQ(NS_OK, Start());
+  nsCString reopened;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(reopened));
+  EXPECT_EQ(source, reopened);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageProperty(key, "Exact"_ns, retained));
+  EXPECT_EQ("00042"_ns, retained);
+  nsTArray<nsCString> refs;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"raw"_ns, ""_ns, "raw"_ns}), refs);
+  ASSERT_EQ(NS_OK, readBytes(rejected, retained));
+  EXPECT_EQ(damaged, retained);
 }
 
 TEST_F(DeliveryCoreReferences, StartupRefusesFutureSchemaWithoutLosingRows) {

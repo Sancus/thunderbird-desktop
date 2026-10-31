@@ -1,0 +1,28 @@
+{
+  "scope": "migration:fixture:rows",
+  "tableKind": "migration:fixture:table",
+  "tableId": 1,
+  "initialIds": [1, 2, 3, 4],
+  "finalIds": [2, 3, 1, 4],
+  "move": {
+    "id": 1,
+    "from": 0,
+    "to": 2
+  },
+  "cells": {
+    "1": {
+      "Payload": "row-1"
+    },
+    "2": {
+      "Payload": "row-2"
+    },
+    "3": {
+      "Payload": "row-3"
+    },
+    "4": {
+      "Payload": "row-4"
+    }
+  },
+  "requiredSerializedSyntax": "native row1 !2 delta",
+  "control": "Fourth member is unchanged: native rowCount/4 change budget requires at least four members to avoid a full table rewrite."
+}

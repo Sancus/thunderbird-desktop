@@ -278,18 +278,23 @@ export class ConversationOpener {
       const cleanup = () => {
         Services.obs.removeObserver(observer, "mail-startup-done");
         signal.removeEventListener("abort", abort);
-        win.removeEventListener("unload", closed);
+        Services.ww.unregisterNotification(closed);
       };
       const abort = () => {
         cleanup();
         win.close();
         reject(signal.reason);
       };
-      const closed = () => {
-        cleanup();
-        reject(
-          new DOMException("Mail window closed before startup", "AbortError")
-        );
+      const closed = {
+        observe(subject, topic) {
+          if (topic != "domwindowclosed" || subject != win) {
+            return;
+          }
+          cleanup();
+          reject(
+            new DOMException("Mail window closed before startup", "AbortError")
+          );
+        },
       };
       const observer = {
         observe(subject) {
@@ -301,9 +306,11 @@ export class ConversationOpener {
       };
       Services.obs.addObserver(observer, "mail-startup-done");
       signal.addEventListener("abort", abort, { once: true });
-      win.addEventListener("unload", closed, { once: true });
+      Services.ww.registerNotification(closed);
       if (signal.aborted) {
         abort();
+      } else if (win.closed) {
+        closed.observe(win, "domwindowclosed");
       }
     });
   }

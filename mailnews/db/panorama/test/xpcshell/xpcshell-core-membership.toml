@@ -11,4 +11,6 @@ prefs = [
 ]
 tags = ["panorama-delivery"]
 
+["test_deliveryCompatibilityColdDeletion.js"]
+
 ["test_deliveryCompatibilityEnumeration.js"]

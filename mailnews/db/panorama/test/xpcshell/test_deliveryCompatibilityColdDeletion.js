@@ -35,27 +35,38 @@ add_task(function test_deleteMessageNotifiesWithoutCachedHeader() {
   // Copy a valid standalone row without warming MessageDatabase's message cache.
   // Use the stored no-parent value instead of a legacy nsMsgKey_None sentinel.
   const insert = connection.createStatement(
-    "INSERT INTO messages (folderId, threadId, threadParent, messageId, date, " +
+    "INSERT INTO messages (id, folderId, threadId, threadParent, messageId, date, " +
       "sender, recipients, ccList, bccList, subject, flags, tags, priority) " +
-      "SELECT folderId, threadId, threadParent, 'delivery-cold@invalid', date, " +
+      "SELECT (SELECT highWater + 1 FROM message_key_allocator WHERE singleton = 1), " +
+      "folderId, threadId, threadParent, 'delivery-cold@invalid', date, " +
       "sender, recipients, ccList, bccList, subject, flags, tags, priority " +
       "FROM messages WHERE id = :id RETURNING id"
   );
   registerCleanupFunction(() => insert.finalize());
-  insert.params.id = source.messageKey;
-  Assert.ok(
-    insert.executeStep(),
-    "The cold fixture copies an existing message"
-  );
-  const key = insert.row.id;
-  Assert.ok(!insert.executeStep());
-  insert.reset();
   const update = connection.createStatement(
     "UPDATE messages SET threadId = id WHERE id = :id"
   );
   registerCleanupFunction(() => update.finalize());
-  update.params.id = key;
-  update.execute();
+  let key;
+  connection.beginTransaction();
+  try {
+    insert.params.id = source.messageKey;
+    Assert.ok(
+      insert.executeStep(),
+      "The cold fixture copies an existing message"
+    );
+    key = insert.row.id;
+    Assert.ok(!insert.executeStep());
+    insert.reset();
+    update.params.id = key;
+    update.execute();
+    connection.commitTransaction();
+  } finally {
+    insert.reset();
+    if (connection.transactionInProgress) {
+      connection.rollbackTransaction();
+    }
+  }
 
   const deleted = [];
   const listener = {

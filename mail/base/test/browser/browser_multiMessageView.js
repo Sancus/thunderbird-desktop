@@ -920,3 +920,425 @@ add_task(async function test_closedSummaryRejectsLateMimeSnippet() {
     fixture.cleanup();
   }
 });
+
+/**
+ * Create stored summary members and independent location-collision controls.
+ *
+ * @returns {object} Real folders, headers, summary and task cleanup.
+ */
+function createSummaryLocationFixture() {
+  const fixture = createSummaryFixture();
+  const { first, second, outside, a, b, c, d, view } = fixture;
+  const names = [first.name, second.name, outside.name];
+  const destination = rootFolder
+    .createLocalSubfolder(`summary-location-${summaryFixtureCount}`)
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  names.push(destination.name);
+  const generator = new MessageGenerator();
+  const decoy = generator.makeMessage({
+    subject: "Unselected destination copy",
+    body: { body: "Destination collision must stay outside the summary." },
+  });
+  decoy.messageId = a.messageId;
+  const collision = destination.addMessage(decoy.toMessageString());
+  const tagA = `summary-location-a-${summaryFixtureCount}`;
+  const tagB = `summary-location-b-${summaryFixtureCount}`;
+  const tagC = `summary-location-c-${summaryFixtureCount}`;
+  const listeners = [];
+  const win = multiMessageBrowser.contentWindow;
+  const summary = win.gMessageSummary;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) {
+      return;
+    }
+    cleaned = true;
+    for (const listener of listeners) {
+      MailServices.mfn.removeListener(listener);
+    }
+    summary.clear();
+    view.close();
+    for (const tag of [tagA, tagB, tagC]) {
+      MailServices.tags.deleteKey(tag);
+    }
+    for (const name of names) {
+      if (rootFolder.containsChildNamed(name)) {
+        rootFolder.getChildNamed(name).deleteSelf(null);
+      }
+    }
+  };
+  registerCleanupFunction(cleanup);
+  MailServices.tags.addTagForKey(tagA, "Location A", "#ff0000", "");
+  MailServices.tags.addTagForKey(tagB, "Location B", "#0000ff", "");
+  MailServices.tags.addTagForKey(tagC, "Location C", "#00ff00", "");
+  first.markMessagesRead([a, b], true);
+  second.markMessagesRead([c, d], true);
+  first.markMessagesFlagged([a, b], true);
+  second.markMessagesFlagged([c, d], true);
+  first.addKeywordsToMessages([a], tagA);
+  second.addKeywordsToMessages([c], tagA);
+  first.addKeywordsToMessages([b], tagB);
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const factory = Cc["@mozilla.org/msgDatabase/msgDBService;1"];
+  if (native) {
+    Assert.ok(factory.getService(Ci.nsIDatabaseCore));
+  }
+  Assert.equal(
+    first.server.msgStore.storeType,
+    "mbox",
+    "The location fixture uses the actual local mbox store"
+  );
+  info(`Summary100 actual startup native=${native}`);
+  return {
+    ...fixture,
+    destination,
+    collision,
+    names,
+    listeners,
+    win,
+    summary,
+    tagA,
+    tagB,
+    tagC,
+    cleanup,
+  };
+}
+
+/**
+ * Display known stored members through the ordinary search view and summary.
+ *
+ * @param {object} fixture - The physical location fixture.
+ * @param {nsIMsgDBHdr[]} headers - Independently known current stored headers.
+ * @param {Function} onSelect - Receives the real clicked row's physical members.
+ * @returns {Promise<HTMLLIElement>} The displayed row for the known root ID.
+ */
+async function showSummaryLocationMembers(fixture, headers, onSelect) {
+  const { view, summary, win, a } = fixture;
+  const notify = view.QueryInterface(Ci.nsIMsgSearchNotify);
+  notify.onNewSearch();
+  for (const header of headers) {
+    notify.onSearchHit(header, header.folder);
+  }
+  notify.onSearchDone(Cr.NS_OK);
+  summary.summarize("multipleselection", headers, view, onSelect);
+  const list = win.document.getElementById("messageList");
+  await TestUtils.waitForCondition(
+    () =>
+      [...list.querySelectorAll(".snippet")].every(node => node.textContent),
+    "The real stored MIME summaries have loaded"
+  );
+  const row = [...list.children].find(
+    node => node.dataset.messageId == a.messageId
+  );
+  Assert.ok(row, "The known selected root has a summary row");
+  Assert.equal(
+    row.querySelector(".snippet").textContent,
+    "The retained summary body."
+  );
+  return row;
+}
+
+add_task(async function test_summaryMoveKeepsCurrentPhysicalMembers() {
+  await SpecialPowers.pushPrefEnv({
+    set: [["mailnews.database.global.indexer.enabled", false]],
+  });
+  const fixture = createSummaryLocationFixture();
+  const { first, outside, a, b, c, d, destination, collision, win } = fixture;
+  const { tagC } = fixture;
+  let selected;
+  const row = await showSummaryLocationMembers(
+    fixture,
+    [a, c, b, d],
+    headers => (selected = headers)
+  );
+  const control = [...win.document.querySelectorAll("#messageList > li")].find(
+    node => node.dataset.messageId == d.messageId
+  );
+  Assert.ok(control);
+  const controlHTML = control.outerHTML;
+  const oldSource = physicalSummaryIdentity(a);
+  let completed;
+  const notification = new Promise(resolve => {
+    const listener = {
+      msgsMoveCopyCompleted(isMove, sources, target, targets) {
+        if (target.URI != destination.URI) {
+          return;
+        }
+        completed = {
+          isMove,
+          source: sources.map(physicalSummaryIdentity),
+          destination: targets.map(physicalSummaryIdentity),
+          headers: [...targets],
+        };
+        MailServices.mfn.removeListener(listener);
+        resolve();
+      },
+    };
+    fixture.listeners.push(listener);
+    MailServices.mfn.addListener(
+      listener,
+      MailServices.mfn.msgsMoveCopyCompleted
+    );
+  });
+  const copy = new PromiseTestUtils.PromiseCopyListener();
+  MailServices.copy.copyMessages(
+    first,
+    [a],
+    destination,
+    true,
+    copy,
+    null,
+    false
+  );
+  await Promise.all([notification, copy.promise]);
+  Assert.ok(completed.isMove);
+  Assert.deepEqual(
+    completed.source,
+    [oldSource],
+    "Mfn snapshots the actual source before deletion"
+  );
+  Assert.equal(completed.headers.length, 1);
+  const moved = destination.msgDatabase.getMsgHdrForKey(
+    completed.headers[0].messageKey
+  );
+  Assert.deepEqual(completed.destination, [physicalSummaryIdentity(moved)]);
+  Assert.equal(moved.messageId, oldSource[2]);
+  Assert.equal(moved.folder.URI, destination.URI);
+  Assert.ok(
+    !first.msgDatabase.containsKey(oldSource[1]),
+    "The completed move removed the exact old source pair"
+  );
+  Assert.ok(first.msgDatabase.containsKey(b.messageKey));
+  Assert.ok(destination.msgDatabase.containsKey(collision.messageKey));
+  await new Promise(resolve => win.queueMicrotask(resolve));
+  EventUtils.synthesizeMouseAtCenter(row.querySelector(".subject"), {}, win);
+  Assert.deepEqual(
+    selected.map(physicalSummaryIdentity),
+    [c, b].map(physicalSummaryIdentity),
+    "The original summary selects only surviving members in original order"
+  );
+  Assert.equal(
+    control.outerHTML,
+    controlHTML,
+    "Moving a selected member preserves the independent row"
+  );
+
+  const currentRow = await showSummaryLocationMembers(
+    fixture,
+    [moved, c, b, d],
+    headers => (selected = headers)
+  );
+  EventUtils.synthesizeMouseAtCenter(
+    currentRow.querySelector(".subject"),
+    {},
+    win
+  );
+  const current = [moved, c, b].map(physicalSummaryIdentity);
+  Assert.deepEqual(
+    selected.map(physicalSummaryIdentity),
+    current,
+    "Fresh selection uses the actual moved header, unchanged copy and reply in order"
+  );
+  const currentControl = [
+    ...win.document.querySelectorAll("#messageList > li"),
+  ].find(node => node.dataset.messageId == d.messageId);
+  Assert.ok(currentControl);
+  const currentControlHTML = currentControl.outerHTML;
+  destination.markMessagesRead([moved], false);
+  destination.markMessagesFlagged([moved], false);
+  destination.addKeywordsToMessages([moved], tagC);
+  outside.markMessagesRead([fixture.excluded], false);
+  outside.markMessagesFlagged([fixture.excluded], false);
+  destination.markMessagesRead([collision], false);
+  destination.markMessagesFlagged([collision], false);
+  destination.addKeywordsToMessages([collision], tagC);
+  await new Promise(resolve => win.queueMicrotask(resolve));
+  Assert.ok(currentRow.classList.contains("unread"));
+  Assert.ok(
+    currentRow.classList.contains("starred"),
+    "Unchanged members retain any-star aggregation"
+  );
+  Assert.equal(
+    win.document
+      .getElementById("starMessageButton")
+      .getAttribute("aria-pressed"),
+    "false"
+  );
+  Assert.deepEqual(
+    [...currentRow.querySelectorAll(".tag")].map(node => node.textContent),
+    ["Location A", "Location B", "Location C"]
+  );
+  destination.markMessagesRead([moved], true);
+  destination.markMessagesFlagged([moved], true);
+  await new Promise(resolve => win.queueMicrotask(resolve));
+  Assert.ok(
+    !currentRow.classList.contains("unread"),
+    "Only the selected current physical members contribute read state"
+  );
+  Assert.equal(
+    win.document
+      .getElementById("starMessageButton")
+      .getAttribute("aria-pressed"),
+    "true",
+    "Unselected unflagged equal-ID copies cannot change the all-selected aggregate"
+  );
+  EventUtils.synthesizeMouseAtCenter(
+    currentRow.querySelector(".subject"),
+    {},
+    win
+  );
+  Assert.deepEqual(selected.map(physicalSummaryIdentity), current);
+  Assert.equal(currentControl.outerHTML, currentControlHTML);
+  Assert.equal(
+    currentRow.querySelector(".snippet").textContent,
+    "The retained summary body."
+  );
+  Assert.ok(
+    !selected.some(
+      header =>
+        header.folder.URI == outside.URI ||
+        (header.folder.URI == destination.URI &&
+          header.messageKey == collision.messageKey)
+    )
+  );
+  fixture.cleanup();
+  info("Summary100 actual completed move/current physical selection complete");
+});
+
+add_task(async function test_summaryFolderRenameKeepsCurrentPhysicalMembers() {
+  await SpecialPowers.pushPrefEnv({
+    set: [["mailnews.database.global.indexer.enabled", false]],
+  });
+  const fixture = createSummaryLocationFixture();
+  const { first, outside, a, b, c, d, win, tagC } = fixture;
+  let selected;
+  const row = await showSummaryLocationMembers(
+    fixture,
+    [a, c, b, d],
+    headers => (selected = headers)
+  );
+  const control = [...win.document.querySelectorAll("#messageList > li")].find(
+    node => node.dataset.messageId == d.messageId
+  );
+  Assert.ok(control);
+  const controlHTML = control.outerHTML;
+  const oldURI = first.URI;
+  const oldName = first.name;
+  const knownIds = [a.messageId, b.messageId];
+  const newName = `${oldName}-renamed`;
+  fixture.names.push(newName);
+  const renamed = PromiseTestUtils.promiseFolderNotification(
+    null,
+    "folderRenamed"
+  );
+  first.rename(newName, null);
+  const [original, replacement] = await renamed;
+  Assert.equal(original.URI, oldURI);
+  Assert.notEqual(replacement.URI, oldURI);
+  Assert.equal(replacement.name, newName);
+  Assert.ok(
+    !rootFolder.containsChildNamed(oldName),
+    "The actual rename removed the obsolete folder location"
+  );
+  const stored = [...replacement.messages];
+  const currentHeaders = knownIds.map(id => {
+    const matches = stored.filter(header => header.messageId == id);
+    Assert.equal(
+      matches.length,
+      1,
+      "The independently known message has one actual renamed-folder header"
+    );
+    return matches[0];
+  });
+  const expected = [currentHeaders[0], c, currentHeaders[1]].map(
+    physicalSummaryIdentity
+  );
+  Assert.ok(
+    currentHeaders.every(header => header.folder.URI == replacement.URI)
+  );
+
+  // Reoccupy the obsolete path with real, unselected equal-ID messages.
+  const obsolete = rootFolder
+    .createLocalSubfolder(oldName)
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  const generator = new MessageGenerator();
+  const decoys = knownIds.map((id, index) => {
+    const message = generator.makeMessage({
+      subject: `Unselected obsolete location ${index}`,
+      body: { body: "Obsolete folder collision must not become current." },
+    });
+    message.messageId = id;
+    return obsolete.addMessage(message.toMessageString());
+  });
+  info(
+    "Summary100 actual rename locations " +
+      JSON.stringify({
+        prior: [oldURI, a.messageKey, b.messageKey],
+        current: currentHeaders.map(physicalSummaryIdentity),
+        obsolete: decoys.map(physicalSummaryIdentity),
+      })
+  );
+  await new Promise(resolve => win.queueMicrotask(resolve));
+  EventUtils.synthesizeMouseAtCenter(row.querySelector(".subject"), {}, win);
+  Assert.deepEqual(
+    selected.map(physicalSummaryIdentity),
+    expected,
+    "The retained summary resolves renamed current headers in original member order, never old-path decoys"
+  );
+  replacement.markMessagesRead([currentHeaders[0]], false);
+  replacement.markMessagesFlagged([currentHeaders[0]], false);
+  replacement.addKeywordsToMessages([currentHeaders[0]], tagC);
+  obsolete.markMessagesRead(decoys, false);
+  obsolete.markMessagesFlagged(decoys, false);
+  outside.markMessagesRead([fixture.excluded], false);
+  await new Promise(resolve => win.queueMicrotask(resolve));
+  Assert.ok(
+    row.classList.contains("unread"),
+    "Actual new-folder metadata reaches the retained summary"
+  );
+  Assert.ok(
+    row.classList.contains("starred"),
+    "Unchanged current members retain any-star aggregation"
+  );
+  Assert.deepEqual(
+    [...row.querySelectorAll(".tag")].map(node => node.textContent),
+    ["Location A", "Location B", "Location C"]
+  );
+  Assert.equal(
+    win.document
+      .getElementById("starMessageButton")
+      .getAttribute("aria-pressed"),
+    "false"
+  );
+  replacement.markMessagesRead(currentHeaders, true);
+  replacement.markMessagesFlagged(currentHeaders, true);
+  await new Promise(resolve => win.queueMicrotask(resolve));
+  Assert.ok(
+    !row.classList.contains("unread"),
+    "Obsolete and outside copies cannot affect current read aggregation"
+  );
+  Assert.equal(
+    win.document
+      .getElementById("starMessageButton")
+      .getAttribute("aria-pressed"),
+    "true"
+  );
+  EventUtils.synthesizeMouseAtCenter(row.querySelector(".subject"), {}, win);
+  Assert.deepEqual(selected.map(physicalSummaryIdentity), expected);
+  Assert.equal(
+    row.querySelector(".snippet").textContent,
+    "The retained summary body."
+  );
+  Assert.equal(
+    control.outerHTML,
+    controlHTML,
+    "The independent physical control row stays unchanged"
+  );
+  Assert.ok(
+    selected.every(
+      header => header.folder.URI != oldURI && header.folder.URI != outside.URI
+    )
+  );
+  fixture.cleanup();
+  info("Summary100 actual folder rename/current physical selection complete");
+});

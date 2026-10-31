@@ -4882,9 +4882,10 @@ NS_IMETHODIMP DatabaseCore::CreateNewDB(nsIMsgFolder* aFolder,
   NS_ENSURE_TRUE(!mShuttingDown && mFolderDatabase && mMessageDatabase,
                  NS_ERROR_NOT_AVAILABLE);
   nsAutoCString name;
-  aFolder->GetName(name);
+  MOZ_TRY(aFolder->GetName(name));
   nsCOMPtr<nsIMsgFolder> msgParent;
-  aFolder->GetParent(getter_AddRefs(msgParent));
+  MOZ_TRY(aFolder->GetParent(getter_AddRefs(msgParent)));
+  NS_ENSURE_ARG(msgParent);
   uint64_t parentId;
   MOZ_TRY(msgParent->GetId(&parentId));
 

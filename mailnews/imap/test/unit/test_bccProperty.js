@@ -1061,8 +1061,8 @@ if (panorama) {
       6202,
       "The real source binding exists before fault injection"
     );
-    // Fault injection only: retain the real ingested binding if retiring it
-    // fails, so the cached observed-epoch guard is exercised independently.
+    // Fault injection only: forbid retiring the real ingested binding during
+    // observation, so cached consumers must use the observed-epoch fence.
     core.connectionForTests.executeSimpleSQL(
       "CREATE TEMP TRIGGER reject_epoch_retirement BEFORE DELETE ON message_properties " +
         `WHEN OLD.id=${protectedHeader.messageKey} AND OLD.name='uidOnServer' ` +
@@ -1101,15 +1101,15 @@ if (panorama) {
     const commandCount = (
       Array.isArray(wireBefore) ? wireBefore : [wireBefore]
     ).flatMap(item => item.them).length;
-    for (const persistObservedEpoch of [false, true]) {
-      if (persistObservedEpoch) {
+    for (const observeAgain of [false, true]) {
+      if (observeAgain) {
         IMAPPump.inbox.QueryInterface(Ci.nsIImapMailFolderSink).uidValidity =
           IMAPPump.mailbox.uidvalidity;
         Assert.equal(
           IMAPPump.inbox.msgDatabase.dBFolderInfo.imapUidValidity,
-          7202
+          oldEpoch
         );
-        Assert.equal(protectedHeader.getUint32Property("uidOnServer"), 0);
+        Assert.equal(protectedHeader.getUint32Property("uidOnServer"), oldUid);
       }
       let receivedBytes = 0;
       let stoppedWith;

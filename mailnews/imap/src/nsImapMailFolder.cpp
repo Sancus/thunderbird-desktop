@@ -7041,34 +7041,10 @@ nsImapMailFolder::GetUidValidity(ImapUid* uidValidity) {
 
 NS_IMETHODIMP
 nsImapMailFolder::SetUidValidity(ImapUid uidValidity) {
-  // Retain the observed epoch even if persisting it fails. UID resolution
-  // must reject the old binding in that case as well.
+  // Fence cached commands immediately. Native reconciliation advances the
+  // durable epoch only after validating and removing confirmed old-epoch rows;
+  // observing a new epoch must retain the bindings needed for that reset.
   m_uidValidity = uidValidity;
-#ifdef MOZ_PANORAMA
-  if (mail_panorama_enabled_AtStartup() && uidValidity) {
-    MOZ_TRY(GetDatabase());
-    nsCOMPtr<nsIDBFolderInfo> info;
-    MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(info)));
-    NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
-    ImapUid oldUidValidity;
-    MOZ_TRY(info->GetImapUidValidity(&oldUidValidity));
-    if (oldUidValidity != uidValidity) {
-      // Observing a new epoch fences cached commands immediately, but cannot
-      // rebind a pending operation's captured source to that epoch.
-      NS_ENSURE_TRUE(!(mFlags & nsMsgFolderFlags::OfflineEvents),
-                     NS_ERROR_NOT_AVAILABLE);
-      nsCOMPtr<nsIMsgOfflineOpsDatabase> operations =
-          do_QueryInterface(mDatabase);
-      NS_ENSURE_TRUE(operations, NS_ERROR_NOT_AVAILABLE);
-      nsTArray<nsMsgKey> keys;
-      MOZ_TRY(operations->ListAllOfflineOpIds(keys));
-      NS_ENSURE_TRUE(keys.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
-    }
-    // The native setter retires UID bindings, not rows or bodies. This does
-    // not recover messages into the new epoch.
-    return info->SetImapUidValidity(uidValidity);
-  }
-#endif
   return NS_OK;
 }
 

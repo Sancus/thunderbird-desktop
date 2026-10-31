@@ -632,8 +632,7 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     Assert.equal(header.getUint32Property("uidOnServer"), 5002);
     Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
     const token = header.storeToken;
-    const readBody = () => {
-      const stream = folder.getMsgInputStream(header);
+    const readBody = (stream = folder.getMsgInputStream(header)) => {
       try {
         let text = "";
         while (stream.available()) {
@@ -714,11 +713,44 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
       Assert.equal(readBody(), bytes);
       Assert.equal(
         header.getUint32Property("uidOnServer"),
-        0,
-        "The observed replacement epoch retires the old wire binding"
+        5002,
+        "Observation retains the old binding for checked reconciliation"
       );
-      Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7802);
+      Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
       Assert.equal(result, Cr.NS_ERROR_NOT_AVAILABLE);
+
+      const resynchronized = new PromiseTestUtils.PromiseUrlListener();
+      folder.updateFolderWithListener(null, resynchronized);
+      await resynchronized.promise;
+      const database = folder.msgDatabase;
+      const replacementHeader = database.getMsgHdrForMessageID(
+        "replacement-epoch-7802@example.invalid"
+      );
+      Assert.equal(database.dBFolderInfo.imapUidValidity, 7802);
+      Assert.ok(!database.containsKey(key), "The old physical row is removed");
+      Assert.equal(replacementHeader.folder, folder);
+      Assert.notEqual(replacementHeader.messageKey, key);
+      Assert.equal(replacementHeader.getUint32Property("uidOnServer"), 5002);
+      Assert.deepEqual(database.listAllKeys(), [replacementHeader.messageKey]);
+      Assert.equal(database.dBFolderInfo.numMessages, 1);
+      Assert.equal(folder.getTotalMessages(false), 1);
+      Assert.equal(
+        readBody(folder.msgStore.getMsgInputStream(folder, token, 0)),
+        bytes,
+        "Epoch reconciliation retains the original physical body bytes"
+      );
+
+      const repeated = new PromiseTestUtils.PromiseUrlListener();
+      folder.updateFolderWithListener(null, repeated);
+      await repeated.promise;
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys(),
+        [replacementHeader.messageKey],
+        "Repeated synchronization creates no duplicate or orphan rows"
+      );
+      Assert.equal(replacementHeader.getUint32Property("uidOnServer"), 5002);
+      Assert.deepEqual(replacement.flags, []);
+      Assert.equal(replacement.getText(), replacementText);
     } finally {
       proto.SELECT = originalSelect;
       proto.STORE = originalStore;

@@ -98,6 +98,7 @@ class MultiMessageSummary {
     this._summaryNodes = new Set();
     this._generation = 0;
     this._nextMemberOrder = 0;
+    this._listeningForRenames = false;
     window.addEventListener("unload", () => this.clear(), { once: true });
   }
   /**
@@ -164,6 +165,10 @@ class MultiMessageSummary {
     this._listener = null;
     this._generation++;
     this._refreshPending = false;
+    if (this._listeningForRenames) {
+      MailServices.mfn.removeListener(this);
+      this._listeningForRenames = false;
+    }
     for (const state of this._folderStates.values()) {
       this._stopListening(state);
     }
@@ -288,6 +293,10 @@ class MultiMessageSummary {
     try {
       for (const state of this._folderStates.values()) {
         this._startListening(state);
+      }
+      if (this._folderStates.size) {
+        MailServices.mfn.addListener(this, MailServices.mfn.folderRenamed);
+        this._listeningForRenames = true;
       }
       this._computeSize(messages);
     } catch (error) {
@@ -601,6 +610,25 @@ class MultiMessageSummary {
     };
     state.database = state.folder.msgDatabase;
     state.database.addListener(state.listener);
+  }
+
+  /**
+   * Reconnect selected members to the actual renamed folder's database.
+   *
+   * @param {nsIMsgFolder} original - The folder at the obsolete location.
+   * @param {nsIMsgFolder} replacement - The renamed folder with the same keys.
+   */
+  folderRenamed(original, replacement) {
+    const state = this._folderStates.get(original.URI);
+    if (!state) {
+      return;
+    }
+    this._stopListening(state);
+    this._folderStates.delete(original.URI);
+    state.folder = replacement;
+    this._folderStates.set(replacement.URI, state);
+    this._startListening(state);
+    this._queueRefresh();
   }
 
   /**

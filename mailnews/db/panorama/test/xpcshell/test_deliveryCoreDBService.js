@@ -267,6 +267,73 @@ add_task(function test_lookupAndOpenErrorsDoNotPublishPartialCacheEntries() {
   Assert.deepEqual(db.listAllKeys(), []);
 });
 
+add_task(function test_createNewDBStopsOnUnreadableOrAbsentParent() {
+  const folder = root.createLocalSubfolder("checked-create");
+  const db = folder.msgDatabase;
+  const key = addMessage({ folderId: folder.id, subject: "retained" });
+  db.getMsgHdrForKey(key).setStringProperty("Exact", "00042");
+  const children = folderDB.getFolderChildren(root.id);
+  const open = service.openDBs;
+  const connection = database.connectionForTests;
+  const sourceId = database.sourceId;
+  let names = 0;
+  let parents = 0;
+  const failingName = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgFolder"]),
+    id: folder.id,
+    get name() {
+      ++names;
+      throw Components.Exception(
+        "name read failed",
+        Cr.NS_ERROR_FILE_ACCESS_DENIED
+      );
+    },
+    get parent() {
+      ++parents;
+      return root;
+    },
+  };
+  Assert.throws(
+    () => service.createNewDB(failingName),
+    /NS_ERROR_FILE_ACCESS_DENIED/,
+    "A name error must propagate before any folder lookup or cache change"
+  );
+  Assert.equal(names, 1);
+  Assert.equal(parents, 0, "A later getter must not run after the first error");
+  const failingParent = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgFolder"]),
+    id: folder.id,
+    name: "unreadable-parent",
+    get parent() {
+      ++parents;
+      throw Components.Exception(
+        "parent read failed",
+        Cr.NS_ERROR_FILE_NOT_FOUND
+      );
+    },
+  };
+  Assert.throws(
+    () => service.createNewDB(failingParent),
+    /NS_ERROR_FILE_NOT_FOUND/
+  );
+  Assert.equal(parents, 1);
+  Assert.strictEqual(root.parent, null);
+  Assert.throws(
+    () => service.createNewDB(root),
+    error => error.result === Cr.NS_ERROR_INVALID_ARG,
+    "Creating a child projection requires an actual parent"
+  );
+  Assert.deepEqual(folderDB.getFolderChildren(root.id), children);
+  Assert.deepEqual(service.openDBs, open);
+  Assert.strictEqual(service.cachedDBForFolder(folder), db);
+  Assert.strictEqual(service.cachedDBForFilePath(folder.filePath), db);
+  Assert.strictEqual(database.connectionForTests, connection);
+  Assert.equal(database.sourceId, sourceId);
+  Assert.strictEqual(service.createNewDB(folder), db);
+  Assert.deepEqual(db.listAllKeys(), [key]);
+  Assert.equal(messageDB.getMessageProperty(key, "Exact"), "00042");
+});
+
 add_task(function test_nativeFolderResolutionUsesPhysicalId() {
   const server = MailServices.accounts.createIncomingServer(
     "native-resolver",

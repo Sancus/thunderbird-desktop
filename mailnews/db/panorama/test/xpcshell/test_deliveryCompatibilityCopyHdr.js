@@ -45,6 +45,12 @@ function makeDraft(db, id) {
   header.setStringProperty("custom", "00042");
   header.setStringProperty("Custom", "different");
   header.setStringProperty("empty", "");
+  header.setUint32Property("delivery.uint32", 42);
+  header.setUint32Property("delivery.zero", 0);
+  header.setUint32Property("delivery.maximum", 0xffffffff);
+  header.setStringProperty("delivery.empty", "");
+  header.setStringProperty("delivery.prefix", "2ag");
+  header.setStringProperty("delivery.ninth", "100000000");
   header.accountKey = "";
   header.charset = "ISO-8859-1";
   header.setStringProperty("keywords", "tag1 tag2");
@@ -53,9 +59,16 @@ function makeDraft(db, id) {
   return header;
 }
 
-function checkCopy(header, folder) {
+/**
+ * Check the effective metadata and property views of a copied header.
+ *
+ * @param {nsIMsgDBHdr} header - Live or detached header to check.
+ * @param {nsIMsgFolder} folder - Expected destination folder.
+ * @param {string} [subject="Exact subject"] - Expected current subject.
+ */
+function checkCopy(header, folder, subject = "Exact subject") {
   Assert.equal(header.folder, folder);
-  Assert.equal(header.subject, "Exact subject");
+  Assert.equal(header.subject, subject);
   Assert.equal(header.author, "Author <author@example.invalid>");
   Assert.equal(header.recipients, "To <to@example.invalid>");
   Assert.equal(header.ccList, "cc@example.invalid");
@@ -75,6 +88,23 @@ function checkCopy(header, folder) {
   }
   Assert.ok(!names.includes("offlineMessageSize"));
   Assert.ok(!names.includes("lineCount"));
+  for (const [name, text, value] of [
+    ["custom", "00042", 66],
+    ["Custom", "different", 13],
+    ["delivery.uint32", "2a", 42],
+    ["delivery.zero", "0", 0],
+    ["delivery.maximum", "ffffffff", 0xffffffff],
+    ["delivery.empty", "", 0],
+    ["delivery.prefix", "2ag", 42],
+    ["delivery.ninth", "100000000", 0x10000000],
+  ]) {
+    Assert.equal(header.getStringProperty(name), text, name + " text");
+    Assert.equal(header.getUint32Property(name), value, name + " uint32 view");
+    Assert.ok(names.includes(name), name + " is present");
+  }
+  Assert.equal(header.getStringProperty("delivery.absent"), "");
+  Assert.equal(header.getUint32Property("delivery.absent"), 0);
+  Assert.ok(!names.includes("delivery.absent"));
   Assert.equal(header.messageSize, 0);
   Assert.equal(header.storeToken, "");
 }
@@ -100,6 +130,7 @@ add_task(function test_copyDetachedHeaderWithoutPublishing() {
   const destination = root.createLocalSubfolder("copy-draft-destination");
   const original = makeDraft(source.msgDatabase, "draft@copy.invalid");
   original.setReferences("<first@copy.invalid> <last@copy.invalid>");
+  checkCopy(original, source);
   const db = destination.msgDatabase;
   const copy = db.copyHdrFromExistingHdr(0xffffffff, original, false);
   Assert.equal(copy.isLive, false);
@@ -110,6 +141,7 @@ add_task(function test_copyDetachedHeaderWithoutPublishing() {
   Assert.equal(original.subject, "Exact subject");
   const live = db.attachHdr(copy, false);
   Assert.equal(live.subject, "Changed copy");
+  checkCopy(live, destination, "Changed copy");
   Assert.equal(live.numReferences, 2);
   Assert.equal(live.getStringReference(1), "last@copy.invalid");
   Assert.deepEqual(storedReferences(live.messageKey), [

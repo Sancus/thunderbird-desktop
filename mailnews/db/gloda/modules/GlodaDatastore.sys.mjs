@@ -124,7 +124,10 @@ var QueryFromQueryResolver = {
       originColl.masterCollection.inverseReferencesByNounID;
 
     if (originColl.pendingItems) {
-      for (const item of originColl.pendingItems) {
+      const pendingItems = originColl.pendingItems.filter(
+        item => originColl._pendingIdMap[item.id] !== null
+      );
+      for (const item of pendingItems) {
         // QFQ_LOG.debug("QFQR: loading deferred " + item.NOUN_ID + ":" + item.id);
         GlodaDatastore.loadNounDeferredDeps(
           item,
@@ -138,7 +141,7 @@ var QueryFromQueryResolver = {
       //  unification as our last step.
       GlodaCollectionManager.cacheLoadUnify(
         originColl._nounDef.id,
-        originColl.pendingItems,
+        pendingItems,
         false
       );
 
@@ -147,9 +150,10 @@ var QueryFromQueryResolver = {
       //  in SQL.)
       // QFQ_LOG.debug(" QFQR: about to trigger listener: " + originColl._listener +
       //    "with collection: " + originColl._nounDef.name);
-      originColl._onItemsAdded(originColl.pendingItems);
+      originColl._onItemsAdded(pendingItems);
       delete originColl.pendingItems;
       delete originColl._pendingIdMap;
+      delete originColl._pendingDeletionFilters;
     }
   },
   onItemsModified() {},
@@ -248,6 +252,16 @@ QueryFromQueryCallback.prototype = {
 
         // if we already have a copy in the pending id map, skip it
         if (item.id in pendingIdMap) {
+          continue;
+        }
+
+        const currentItem = cachedItem ?? this.selfReferences[item.id] ?? item;
+        if (
+          this.collection._pendingDeletionFilters?.some(filter =>
+            filter(currentItem)
+          )
+        ) {
+          pendingIdMap[item.id] = null;
           continue;
         }
 

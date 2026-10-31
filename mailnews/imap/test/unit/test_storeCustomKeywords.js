@@ -606,17 +606,33 @@ add_task(async function test_sparseKeywordChunksStopAtFirstFailureAndRetry() {
 
 if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
   add_task(async function test_rejectsReusedUidAfterReconnect() {
-    const folder = IMAPPump.inbox;
+    const folder = await createImapSubfolder("KeywordReusedEpoch");
+    folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+    const mailbox = IMAPPump.daemon.getMailbox("KeywordReusedEpoch");
+    mailbox.uidvalidity = 7801;
+    const originalMessage = new ImapMessage(
+      "data:text/plain;base64," + btoa(gServerMessageForKeywordAdd.getText()),
+      5002,
+      []
+    );
+    mailbox.addMessage(originalMessage);
+    mailbox.uidnext = 5003;
+    const synchronized = new PromiseTestUtils.PromiseUrlListener();
+    folder.updateFolderWithListener(null, synchronized);
+    await synchronized.promise;
     const header = folder.msgDatabase.getMsgHdrForMessageID(
       gSynthMessageForKeywordAdd.messageId
     );
+    const downloaded = new PromiseTestUtils.PromiseUrlListener();
+    folder.downloadAllForOffline(downloaded, null);
+    await downloaded.promise;
+    Assert.ok(header.flags & Ci.nsMsgMessageFlags.Offline);
     const key = header.messageKey;
     Assert.notEqual(key, 5002);
     Assert.equal(header.getUint32Property("uidOnServer"), 5002);
     Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
     const token = header.storeToken;
-    const readBody = () => {
-      const stream = folder.getMsgInputStream(header);
+    const readBody = (stream = folder.getMsgInputStream(header)) => {
       try {
         let text = "";
         while (stream.available()) {
@@ -648,8 +664,7 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
       5002,
       []
     );
-    const mailbox = IMAPPump.mailbox;
-    const index = mailbox._messages.indexOf(gServerMessageForKeywordAdd);
+    const index = mailbox._messages.indexOf(originalMessage);
     Assert.greaterOrEqual(index, 0);
     mailbox._messages.splice(index, 1, replacement);
     mailbox.uidvalidity = 7802;
@@ -660,7 +675,7 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     const stores = [];
     proto.SELECT = function (args) {
       const result = originalSelect.call(this, args);
-      if (args[0] == "INBOX") {
+      if (args[0] == "KeywordReusedEpoch") {
         selectedEpochs.push(this._selectedMailbox.uidvalidity);
         Assert.ok(result.includes("[UIDVALIDITY 7802]"));
       }
@@ -696,9 +711,46 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
       Assert.equal(header.messageKey, key);
       Assert.equal(header.storeToken, token);
       Assert.equal(readBody(), bytes);
-      Assert.equal(header.getUint32Property("uidOnServer"), 5002);
+      Assert.equal(
+        header.getUint32Property("uidOnServer"),
+        5002,
+        "Observation retains the old binding for checked reconciliation"
+      );
       Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7801);
       Assert.equal(result, Cr.NS_ERROR_NOT_AVAILABLE);
+
+      const resynchronized = new PromiseTestUtils.PromiseUrlListener();
+      folder.updateFolderWithListener(null, resynchronized);
+      await resynchronized.promise;
+      const database = folder.msgDatabase;
+      const replacementHeader = database.getMsgHdrForMessageID(
+        "replacement-epoch-7802@example.invalid"
+      );
+      Assert.equal(database.dBFolderInfo.imapUidValidity, 7802);
+      Assert.ok(!database.containsKey(key), "The old physical row is removed");
+      Assert.equal(replacementHeader.folder, folder);
+      Assert.notEqual(replacementHeader.messageKey, key);
+      Assert.equal(replacementHeader.getUint32Property("uidOnServer"), 5002);
+      Assert.deepEqual(database.listAllKeys(), [replacementHeader.messageKey]);
+      Assert.equal(database.dBFolderInfo.numMessages, 1);
+      Assert.equal(folder.getTotalMessages(false), 1);
+      Assert.equal(
+        readBody(folder.msgStore.getMsgInputStream(folder, token, 0)),
+        bytes,
+        "Epoch reconciliation retains the original physical body bytes"
+      );
+
+      const repeated = new PromiseTestUtils.PromiseUrlListener();
+      folder.updateFolderWithListener(null, repeated);
+      await repeated.promise;
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys(),
+        [replacementHeader.messageKey],
+        "Repeated synchronization creates no duplicate or orphan rows"
+      );
+      Assert.equal(replacementHeader.getUint32Property("uidOnServer"), 5002);
+      Assert.deepEqual(replacement.flags, []);
+      Assert.equal(replacement.getText(), replacementText);
     } finally {
       proto.SELECT = originalSelect;
       proto.STORE = originalStore;
@@ -706,7 +758,7 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
       await TestUtils.waitForCondition(
         () => !IMAPPump.daemon.getConnections().length
       );
-      mailbox._messages.splice(index, 1, gServerMessageForKeywordAdd);
+      mailbox._messages.splice(index, 1, originalMessage);
       mailbox.uidvalidity = 7801;
     }
   });

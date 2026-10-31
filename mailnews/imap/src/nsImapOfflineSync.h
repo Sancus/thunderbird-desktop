@@ -58,8 +58,10 @@ class nsImapOfflineSync : public nsIUrlListener,
   void ClearCurrentOps();
   // Clears m_currentDB, and unregister listener.
   void ClearDB();
-  void ProcessFlagOperation(nsIMsgOfflineImapOperation* currentOp);
-  void ProcessKeywordOperation(nsIMsgOfflineImapOperation* op);
+  nsresult FinishPlayback(nsIURI* url, nsresult status);
+  nsresult m_firstPlaybackError = NS_OK;
+  nsresult ProcessFlagOperation(nsIMsgOfflineImapOperation* currentOp);
+  nsresult ProcessKeywordOperation(nsIMsgOfflineImapOperation* op);
   void ProcessMoveOperation(nsIMsgOfflineImapOperation* currentOp);
   void ProcessCopyOperation(nsIMsgOfflineImapOperation* currentOp);
   void ProcessEmptyTrash();

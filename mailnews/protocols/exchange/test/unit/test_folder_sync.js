@@ -369,8 +369,9 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     obstruction.leafName = newName;
     Assert.ok(!obstruction.exists());
     await IOUtils.writeUTF8(obstruction.path, "Fixture-owned obstruction\n");
-    // Publish one real update before the obstructed update retires its selected
-    // wrapper. The later hierarchy error must still complete that request.
+    // Use one change per page: updates within a page are deduplicated in a
+    // HashSet and have no defined order. The first page retires the selected
+    // wrapper; the next page must report the original obstruction error.
     ewsServer.renameFolderById(selectedName, selectedNewName);
     ewsServer.renameFolderById(oldName, newName);
     const stops = [];
@@ -379,12 +380,18 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
         stops.push(status);
       },
     });
-    incomingServer.getNewMessages(selected, null, listener);
-    await Assert.rejects(
-      listener.promise,
-      error => error.message == String(Cr.NS_ERROR_FILE_ALREADY_EXISTS),
-      "The original destination obstruction error reaches completion"
-    );
+    const maxSyncItems = ewsServer.maxSyncItems;
+    ewsServer.maxSyncItems = 1;
+    try {
+      incomingServer.getNewMessages(selected, null, listener);
+      await Assert.rejects(
+        listener.promise,
+        error => error.message == String(Cr.NS_ERROR_FILE_ALREADY_EXISTS),
+        "The original destination obstruction error reaches completion"
+      );
+    } finally {
+      ewsServer.maxSyncItems = maxSyncItems;
+    }
     await TestUtils.waitForCondition(
       () => root.getChildNamed(selectedNewName),
       "The earlier unblocked hierarchy update is published"

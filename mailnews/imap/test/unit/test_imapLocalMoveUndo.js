@@ -234,35 +234,68 @@ add_task(async function test_restoreFailureRetainsSnapshotAndCanRetry() {
   }
   const state = await prepareMove("RestoreFailure");
   await move(state);
-  core.connectionForTests.executeSimpleSQL(
-    "CREATE TEMP TRIGGER fail_imap_restore BEFORE INSERT ON messages " +
-      "WHEN NEW.messageId = 'RestoreFailure@example.invalid' " +
-      "BEGIN SELECT RAISE(ABORT, 'IMAP undo restore failure'); END"
-  );
+  const published = [];
+  const observer = {
+    msgAdded(header) {
+      if (header.folder == state.source) {
+        assertRestored(state, header);
+        published.push(header.messageKey);
+      }
+    },
+  };
+  MailServices.mfn.addListener(observer, MailServices.mfn.msgAdded);
   try {
-    Assert.throws(
-      () => manager.undoTransaction(),
-      error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+    core.connectionForTests.executeSimpleSQL(
+      "CREATE TEMP TRIGGER fail_imap_restore BEFORE INSERT ON messages " +
+        "WHEN NEW.messageId = 'RestoreFailure@example.invalid' " +
+        "BEGIN SELECT RAISE(ABORT, 'IMAP undo restore failure'); END"
     );
-    Assert.deepEqual(Array.from(state.source.messages), []);
-    Assert.equal(manager.numberOfUndoItems, 1);
-    Assert.equal(readBody(state.source, state.oldToken), state.storedBytes);
-    Assert.equal(state.mailbox._messages.length, 1);
-    Assert.equal(state.mailbox._messages[0].flags.includes("\\Deleted"), false);
+    try {
+      Assert.throws(
+        () => manager.undoTransaction(),
+        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+      );
+      Assert.deepEqual(Array.from(state.source.messages), []);
+      Assert.deepEqual(
+        published,
+        [],
+        "Failed public restore publishes nothing"
+      );
+      Assert.equal(state.source.msgDatabase.containsKey(state.oldKey), false);
+      Assert.equal(manager.numberOfUndoItems, 1);
+      Assert.equal(manager.numberOfRedoItems, 0);
+      Assert.equal(readBody(state.source, state.oldToken), state.storedBytes);
+      Assert.equal(state.mailbox._messages.length, 1);
+      Assert.equal(
+        state.mailbox._messages[0].flags.includes("\\Deleted"),
+        false
+      );
+    } finally {
+      core.connectionForTests.executeSimpleSQL(
+        "DROP TRIGGER fail_imap_restore"
+      );
+    }
+    manager.undoTransaction();
+    Assert.equal(manager.numberOfUndoItems, 0);
+    Assert.equal(manager.numberOfRedoItems, 1);
+    await select(state.destination);
+    const restored = Array.from(state.source.messages);
+    Assert.equal(restored.length, 1);
+    assertRestored(state, restored[0]);
+    Assert.deepEqual(
+      published,
+      [restored[0].messageKey],
+      "Retry publishes the one complete fresh destination"
+    );
+    Assert.equal(
+      state.mailbox._messages.length,
+      1,
+      "Undo never issues another APPEND"
+    );
+    Assert.ok(state.mailbox._messages[0].flags.includes("\\Deleted"));
   } finally {
-    core.connectionForTests.executeSimpleSQL("DROP TRIGGER fail_imap_restore");
+    MailServices.mfn.removeListener(observer);
   }
-  manager.undoTransaction();
-  await select(state.destination);
-  const restored = Array.from(state.source.messages);
-  Assert.equal(restored.length, 1);
-  assertRestored(state, restored[0]);
-  Assert.equal(
-    state.mailbox._messages.length,
-    1,
-    "Undo never issues another APPEND"
-  );
-  Assert.ok(state.mailbox._messages[0].flags.includes("\\Deleted"));
 });
 
 add_task(async function test_undoRejectsReusedDestinationUidInAnotherEpoch() {
@@ -614,6 +647,11 @@ add_task(async function test_nativeLocalMoveUndoUsesFreshFinishedBody() {
         Assert.ok(!(header.flags & Ci.nsMsgMessageFlags.Offline));
         Assert.ok(!header.properties.includes("uidOnServer"));
         Assert.throws(
+          () => local.msgDatabase.undoDelete(header),
+          /NS_ERROR_NOT_AVAILABLE/,
+          "A published header cannot borrow the active restore context"
+        );
+        Assert.throws(
           () => transaction.undoTransaction(),
           /NS_ERROR_IN_PROGRESS/
         );
@@ -651,6 +689,12 @@ add_task(async function test_nativeLocalMoveUndoUsesFreshFinishedBody() {
       Array.from(bytes)
     );
     const firstRestoredKey = restored[0].messageKey;
+    Assert.throws(
+      () => local.msgDatabase.undoDelete(restored[0]),
+      /NS_ERROR_NOT_AVAILABLE/,
+      "The public facade has no capture after the owning call returns"
+    );
+    Assert.deepEqual(published, [firstRestoredKey]);
     transactionManager.redoTransaction();
     refreshed = new PromiseTestUtils.PromiseUrlListener();
     IMAPPump.inbox.updateFolderWithListener(null, refreshed);

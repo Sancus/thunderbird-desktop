@@ -103,6 +103,15 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                              const PendingDestination* cancelMove = nullptr,
                              OfflineOperationUndo* redo = nullptr);
 
+  // Borrow the caller-owned capture/finished state only for this synchronous
+  // public UndoDelete call. Persistent outputs are filled before callbacks.
+  nsresult UndoDeleteHdrForUndo(RemovedMessage& captured,
+                                const FinishedMessageBody& finished,
+                                nsMsgKey* key, Message** liveHeader = nullptr,
+                                OfflineOperationUndo* offline = nullptr,
+                                const PendingDestination* cancelMove = nullptr,
+                                OfflineOperationUndo* redo = nullptr);
+
   // Same-key completion from the actual parsed CreateNewHdr draft.
   // Once claimed, a failure seals the draft; caller retains finished bytes.
   nsresult CompletePartialHdr(const MessageBodyState& expected,
@@ -117,6 +126,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   friend class MessageEnumerator;
   friend class ThreadEnumerator;
   friend class FilterEnumerator;
+
+  struct UndoDeleteContext;
+  UndoDeleteContext* mUndoDeleteContext = nullptr;
 
   virtual ~PerFolderDatabase() {};
 

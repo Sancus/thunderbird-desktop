@@ -1440,6 +1440,139 @@ TEST_F(DeliveryCompleteHeader, UndoBridgeLeavesCallerTransactionAndOutputs) {
   CheckNoTransaction();
 }
 
+TEST_F(DeliveryCompleteHeader, UndoDeleteRejectsHeadersWithoutOwnedContext) {
+  ASSERT_NO_FATAL_FAILURE(Create({"parent@undo.invalid"_ns}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DetachedMsgHdr> detached = new DetachedMsgHdr(mFolder);
+  EXPECT_EQ(NS_ERROR_NULL_POINTER, db->UndoDelete(nullptr));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->UndoDelete(mHeader));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->UndoDelete(detached));
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       UndoDeleteRetainsFailureThenPublishesFreshOutputs) {
+  nsTArray<nsCString> references{"parent@undo.invalid"_ns, EmptyCString(),
+                                 "parent@undo.invalid"_ns};
+  ASSERT_NO_FATAL_FAILURE(Create(references));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("Case", "Résumé — 雪"_ns));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("case", "distinct"_ns));
+  ASSERT_EQ(NS_OK, mHeader->SetStringProperty("presentEmpty", EmptyCString()));
+  ASSERT_EQ(NS_OK, mHeader->SetUint32Property("uidOnServer", 900001));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RemovedMessage captured;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageForUndo(mKey, captured));
+  // Native receiver fixture input; real provider Finish is exercised by the
+  // retained ordinary IM caller on both stores, not manufactured by the facade.
+  FinishedMessageBody finished{"new-finished"_ns, 23, 0, 2, false};
+  nsMsgKey key = 42;
+  RefPtr<Message> live;
+  uint32_t publications = 0;
+  RefPtr<DeliveryEarlyMutationListener> listener =
+      new DeliveryEarlyMutationListener;
+  listener->publication = [&](const CapturedMessage& after, Message* header) {
+    ++publications;
+    EXPECT_EQ(key, after.id);
+    EXPECT_EQ(live.get(), header);
+    EXPECT_NE(mKey, key);
+    EXPECT_NE(900001u, key);
+    EXPECT_FALSE(captured.Body());
+    nsMsgKey reentrantKey = 43;
+    RefPtr<Message> reentrantLive;
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db->UndoDeleteHdrForUndo(captured, finished, &reentrantKey,
+                                       getter_AddRefs(reentrantLive)));
+    EXPECT_EQ(43u, reentrantKey);
+    EXPECT_FALSE(reentrantLive);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->UndoDelete(header));
+  };
+  mCore->MessageDB().AddMessageListener(listener);
+  auto remove = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(listener); });
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(
+      NS_ERROR_IN_PROGRESS,
+      db->UndoDeleteHdrForUndo(captured, finished, &key, getter_AddRefs(live)));
+  EXPECT_EQ(42u, key);
+  EXPECT_FALSE(live);
+  ASSERT_TRUE(captured.Body());
+  EXPECT_EQ(mKey, captured.Body()->key);
+  EXPECT_EQ(0u, publications);
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->UndoDeleteHdrForUndo(captured, finished, &key,
+                                            getter_AddRefs(live)));
+  ASSERT_TRUE(live);
+  EXPECT_EQ(1u, publications);
+  EXPECT_FALSE(captured.Body());
+  nsCString value;
+  ASSERT_EQ(NS_OK, live->GetStringProperty("Case", value));
+  EXPECT_EQ("Résumé — 雪"_ns, value);
+  ASSERT_EQ(NS_OK, live->GetStringProperty("case", value));
+  EXPECT_EQ("distinct"_ns, value);
+  nsTArray<nsCString> properties;
+  ASSERT_EQ(NS_OK, live->GetProperties(properties));
+  EXPECT_TRUE(properties.Contains("presentEmpty"_ns));
+  EXPECT_FALSE(properties.Contains("uidOnServer"_ns));
+  ASSERT_EQ(NS_OK, live->GetStringProperty("presentEmpty", value));
+  EXPECT_TRUE(value.IsEmpty());
+  ASSERT_EQ(NS_OK, live->GetStoreToken(value));
+  EXPECT_EQ(finished.storeToken, value);
+  nsTArray<nsCString> restoredReferences;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageReferences(key, restoredReferences));
+  EXPECT_EQ(references, restoredReferences);
+  nsMsgKey duplicateKey = 44;
+  RefPtr<Message> duplicate;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->UndoDeleteHdrForUndo(captured, finished, &duplicateKey,
+                                     getter_AddRefs(duplicate)));
+  EXPECT_EQ(44u, duplicateKey);
+  EXPECT_FALSE(duplicate);
+  EXPECT_EQ(1u, publications);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       UndoDeleteRejectsForeignClosedAndOccupiedInputs) {
+  ASSERT_NO_FATAL_FAILURE(Create({"parent@undo.invalid"_ns}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<Message> occupied = new Message(mKey);
+  RemovedMessage captured;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageForUndo(mKey, captured));
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  RefPtr<PerFolderDatabase> foreign = new PerFolderDatabase(other, false);
+  FinishedMessageBody finished{"new-finished"_ns, 23, 0, 2, false};
+  nsMsgKey key = 42;
+  RefPtr<Message> live;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            foreign->UndoDeleteHdrForUndo(captured, finished, &key,
+                                          getter_AddRefs(live)));
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            db->UndoDeleteHdrForUndo(captured, finished, nullptr));
+  Message* occupiedSlot = occupied;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->UndoDeleteHdrForUndo(captured, finished, &key, &occupiedSlot));
+  EXPECT_EQ(occupied.get(), occupiedSlot);
+  EXPECT_EQ(42u, key);
+  EXPECT_FALSE(live);
+  ASSERT_TRUE(captured.Body());
+  EXPECT_EQ(mKey, captured.Body()->key);
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db->UndoDeleteHdrForUndo(captured, finished, &key, getter_AddRefs(live)));
+  EXPECT_EQ(42u, key);
+  EXPECT_FALSE(live);
+  ASSERT_TRUE(captured.Body());
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  CheckNoTransaction();
+}
+
 TEST_F(DeliveryCompleteHeader,
        OfflineCopyStagesOpaqueMetadataBeforePublication) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);

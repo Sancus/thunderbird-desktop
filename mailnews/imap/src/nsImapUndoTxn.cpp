@@ -692,7 +692,7 @@ nsresult nsImapMoveCopyMsgTxn::RestoreNativeSources(nsIMsgFolder* folder) {
       entry.finishedMeasured = true;
     }
     NS_ENSURE_TRUE(!entry.live, NS_ERROR_IN_PROGRESS);
-    MOZ_TRY(native->RestoreHdrForUndo(
+    MOZ_TRY(native->UndoDeleteHdrForUndo(
         entry.removed, *entry.finished, &m_srcKeyArray[i],
         getter_AddRefs(entry.live),
         entry.offline.Operation() ? &entry.offline : nullptr,

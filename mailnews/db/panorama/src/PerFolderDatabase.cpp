@@ -1773,8 +1773,56 @@ nsresult PerFolderDatabase::RestoreHdrForUndo(
                                          liveHeader, offline, cancelMove, redo);
 }
 
+// This header is never published or returned. Its exact interface pointer is
+// valid only while the owning wrapper's synchronous context is installed.
+// No header getter supplies capture, provider completion or physical identity.
+struct PerFolderDatabase::UndoDeleteContext {
+  RemovedMessage& captured;
+  const FinishedMessageBody& finished;
+  nsMsgKey* key;
+  Message** liveHeader;
+  OfflineOperationUndo* offline;
+  const PendingDestination* cancelMove;
+  OfflineOperationUndo* redo;
+  RefPtr<DetachedMsgHdr> header;
+  bool entered = false;
+};
+
+nsresult PerFolderDatabase::UndoDeleteHdrForUndo(
+    RemovedMessage& captured, const FinishedMessageBody& finished,
+    nsMsgKey* key, Message** liveHeader, OfflineOperationUndo* offline,
+    const PendingDestination* cancelMove, OfflineOperationUndo* redo) {
+  NS_ENSURE_ARG_POINTER(key);
+  NS_ENSURE_TRUE(!liveHeader || !*liveHeader, NS_ERROR_INVALID_ARG);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_FALSE(mUndoDeleteContext, NS_ERROR_IN_PROGRESS);
+  UndoDeleteContext context{
+      captured, finished,   key,  liveHeader,
+      offline,  cancelMove, redo, new DetachedMsgHdr(mFolderId)};
+  // Restore the active pointer before context/header or self can be destroyed.
+  // A failed call retains the real inputs for a fresh call by the owning entry.
+  AutoRestore<UndoDeleteContext*> active(mUndoDeleteContext);
+  mUndoDeleteContext = &context;
+  return UndoDelete(context.header);
+}
+
 NS_IMETHODIMP PerFolderDatabase::UndoDelete(nsIMsgDBHdr* msgHdr) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG_POINTER(msgHdr);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  UndoDeleteContext* context = mUndoDeleteContext;
+  // Compare the private interface pointer directly: accepting a foreign QI or
+  // an ordinary/live header would not establish ownership of the opaque input.
+  NS_ENSURE_TRUE(context && msgHdr == context->header.get(),
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_FALSE(context->entered, NS_ERROR_IN_PROGRESS);
+  context->entered = true;
+  return RestoreHdrForUndo(context->captured, context->finished, context->key,
+                           context->liveHeader, context->offline,
+                           context->cancelMove, context->redo);
 }
 NS_IMETHODIMP PerFolderDatabase::SetStringProperty(
     nsMsgKey key, const char* propertyName, const nsACString& propertyValue) {

@@ -30,6 +30,8 @@ export var gFilePromises = new Map();
  * @type {Set<string>}
  */
 export var gPendingCleanup = new Set();
+// Privacy capture joins this existing cleanup before recording line versions.
+const gLogCleanupPromises = new Map();
 
 const kPendingLogCleanupPref = "chat.logging.cleanup.pending";
 
@@ -292,9 +294,16 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
   ) {
     return Promise.resolve(null);
   }
+  const prepareNotice = () => {
+    try {
+      return appendNotice ? appendNotice() : null;
+    } catch (error) {
+      return () => Promise.reject(error);
+    }
+  };
   const existing = gChatPrivacySubjects.get(message);
   if (existing && (!appendNotice || !existing.started)) {
-    existing.appendNotice ||= appendNotice;
+    existing.appendNotice ||= prepareNotice();
     return existing.promise;
   }
   const scope = chatPrivacyScope(message);
@@ -315,11 +324,12 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
   ];
   const capture = {
     started: false,
-    appendNotice,
+    appendNotice: null,
     durable: false,
     promise: null,
   };
   ++gChatPrivacyEpoch;
+  capture.appendNotice = prepareNotice();
   const run = async () => {
     capture.started = true;
     let firstError;
@@ -737,11 +747,24 @@ export function getNewLogFileName(aStartTime) {
  * from messages that were marked as deleted. This can be disabled by a pref.
  *
  * @param {string} path - Path to the logfile to clean.
+ * @returns {Promise<void>} The actual queued cleanup, including its original error.
  */
 function queueLogFileCleanup(path) {
-  if (gPendingCleanup.has(path) || !lazy.SHOULD_CLEANUP_LOGS) {
-    return;
+  if (gPendingCleanup.has(path)) {
+    return gLogCleanupPromises.get(path);
   }
+  if (!lazy.SHOULD_CLEANUP_LOGS) {
+    return Promise.resolve();
+  }
+  let resolveCleanup, rejectCleanup;
+  const completion = new Promise((resolve, reject) => {
+    resolveCleanup = resolve;
+    rejectCleanup = reject;
+  });
+  // Existing fire-and-forget callers retain their behavior. The privacy caller
+  // explicitly awaits this same operation and receives its original failure.
+  completion.catch(() => {});
+  gLogCleanupPromises.set(path, completion);
   const idleCallback = () => {
     if (gFilePromises.has(path)) {
       gFilePromises.get(path).finally(() => {
@@ -803,14 +826,16 @@ function queueLogFileCleanup(path) {
         console.error(
           "Error cleaning up log file contents for " + path + ": " + error
         );
+        throw error;
       } finally {
         gPendingCleanup.delete(path);
         Services.prefs.setStringPref(
           kPendingLogCleanupPref,
           JSON.stringify(Array.from(gPendingCleanup.values()))
         );
+        gLogCleanupPromises.delete(path);
       }
-    });
+    }).then(resolveCleanup, rejectCleanup);
   };
   ChromeUtils.idleDispatch(idleCallback);
   gPendingCleanup.add(path);
@@ -818,6 +843,7 @@ function queueLogFileCleanup(path) {
     kPendingLogCleanupPref,
     JSON.stringify(Array.from(gPendingCleanup.values()))
   );
+  return completion;
 }
 
 /**
@@ -941,7 +967,16 @@ class LogWriter {
    * @type {number}
    */
   static kMessageCountLimit = 1000;
-  async logMessage(aMessage) {
+  /**
+   * Appends one ordinary message snapshot and schedules existing deletion cleanup.
+   *
+   * @param {prplIMessage} aMessage - Ordinary logged record, never a noLog payload.
+   * @param {boolean} [awaitCleanup=false] - Privacy capture joins cleanup before
+   *   recording hashes so a later idle rewrite cannot invalidate its own receipt.
+   * @returns {Promise<void>} After append, or the joined cleanup when requested.
+   * @throws {Error} Original initialization or explicitly joined cleanup failure.
+   */
+  async logMessage(aMessage, awaitCleanup = false) {
     // aMessage.time is in seconds, we need it in milliseconds.
     const messageTime = aMessage.time * 1000;
     const messageMidnight = new Date(messageTime).setHours(0, 0, 0, 0);
@@ -1002,7 +1037,10 @@ class LogWriter {
       console.error("Failed to log message:\n" + error);
     }
     if (aMessage.deleted) {
-      queueLogFileCleanup(this.currentPath);
+      const cleanup = queueLogFileCleanup(this.currentPath);
+      if (awaitCleanup) {
+        await cleanup;
+      }
     }
   }
 }
@@ -1684,19 +1722,49 @@ export class Logger {
         if (aSubject.noLog === true || aSubject.deleted === true) {
           // Register the privacy barrier before yielding, even with no consumer.
           // Keep ordinary deletion notices inside the captured source versions.
-          const appendNotice =
+          const writer =
             !aSubject.noLog && !excludeBecauseEncrypted
-              ? async () => {
-                  const writer = getLogWriter(aSubject.conversation);
-                  const work = writer.logMessage(aSubject);
+              ? getLogWriter(aSubject.conversation)
+              : null;
+          const appendNotice = writer
+            ? () => {
+                // LogWriter used to snapshot these fields before its first await.
+                // Preserve that notification even if the original object changes.
+                const notice = Object.fromEntries(
+                  [
+                    "time",
+                    "who",
+                    "displayMessage",
+                    "remoteId",
+                    "alias",
+                    "delayed",
+                    "outgoing",
+                    "incoming",
+                    "system",
+                    "autoResponse",
+                    "containsNick",
+                    "error",
+                    "noFormat",
+                    "containsImages",
+                    "notification",
+                    "noLinkification",
+                    "isEncrypted",
+                    "action",
+                    "deleted",
+                  ].map(field => [field, aSubject[field]])
+                );
+                return async () => {
+                  const work = writer.logMessage(notice, true);
+                  work.catch(() => {});
                   await writer._initialized;
                   const queued = gFilePromises.get(writer.currentPath);
                   if (queued) {
                     await queued;
                   }
                   await work;
-                }
-              : null;
+                };
+              }
+            : null;
           beginChatPrivacyCapture(aSubject, appendNotice).catch(error =>
             console.error("Failed to capture chat privacy:\n" + error)
           );

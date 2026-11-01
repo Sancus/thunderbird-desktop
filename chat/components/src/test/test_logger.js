@@ -1034,6 +1034,56 @@ add_task(async function test_explicitPrivacyIntentSurvivesLoggerRestart() {
 });
 
 add_task(async function test_closedConversationPrivacyUsesVerifiedHistory() {
+  const closing = await makePrivacyLog("closing-notice", { rotated: true });
+  const logger = new Logger();
+  const deletion = {
+    conversation: closing.conversation,
+    remoteId: closing.remoteId,
+    deleted: true,
+    time: closing.conversation.startDate / 1000000 + 2 * 86400 + 20,
+    who: "known-sender",
+    displayMessage: "ordinary deletion notice",
+  };
+  logger.observe(deletion, "new-text");
+  deletion.displayMessage = "later unlogged payload";
+  deletion.remoteId = "later-unlogged-id";
+  deletion.noLog = true;
+  closeLogWriter(closing.conversation);
+  const closingReceipt = await captureChatPrivacyIntent(deletion);
+  Assert.ok(
+    closing.paths.every(path => !gPendingCleanup.has(path)),
+    "Version capture joins the actual legacy cleanup rather than racing its rewrite"
+  );
+  Assert.strictEqual(
+    await logger.getLogPathsForConversation(closing.conversation),
+    null,
+    "Pending deletion retains its original writer without reopening a closed one"
+  );
+  Assert.deepEqual(
+    closingReceipt.targets.map(target =>
+      PathUtils.join(logDirPath, ...target.relativePath)
+    ),
+    closing.paths,
+    "The original rotated writer source identities are retained"
+  );
+  Assert.equal(
+    closingReceipt.targets.reduce(
+      (count, target) => count + target.records.length,
+      0
+    ),
+    3,
+    "The ordinary deletion notice is captured before privacy settlement"
+  );
+  Assert.ok(
+    !(await IOUtils.readUTF8(closing.paths[1])).includes(
+      "later unlogged payload"
+    ),
+    "A later mutation cannot replace the captured ordinary deletion notice"
+  );
+  await acknowledgeChatPrivacyIntent(closingReceipt.id, async current => {
+    await erasePrivacyVersions(current);
+    return getChatPrivacySourceProof(current.id);
+  });
   const source = await makePrivacyLog("closed", { rotated: true });
   const control = await makePrivacyLog("foreign-control");
   const controlBytes = await IOUtils.read(control.paths[0]);

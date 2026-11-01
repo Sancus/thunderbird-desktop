@@ -304,8 +304,17 @@ add_task(async function test_appliesMetadataAndRetainsNativeAuthority() {
     return;
   }
   const inbox = imapRoot.getChildNamed("INBOX");
+  const trash = localRoot.getChildNamed("Trash");
+  Assert.strictEqual(
+    scalar(
+      `SELECT value FROM folder_properties WHERE id=${trash.id} AND name='MRUTime'`
+    ),
+    null,
+    "The cache-only MRUTime starts without a native value"
+  );
   // A pre-existing empty value is authoritative, independently of cache text.
   inbox.msgDatabase.dBFolderInfo.setCharProperty("onlineName", "");
+  inbox.msgDatabase.dBFolderInfo.setCharProperty("MRUTime", "1700000000");
   Assert.strictEqual(
     scalar(
       `SELECT value FROM folder_properties WHERE id=${inbox.id} AND name='onlineName'`
@@ -362,8 +371,28 @@ add_task(async function test_appliesMetadataAndRetainsNativeAuthority() {
     scalar(
       `SELECT value FROM folder_properties WHERE id=${inbox.id} AND name='MRUTime'`
     ),
-    "1628202593"
+    "1700000000",
+    "The native MRUTime remains authoritative over the cache"
   );
+  const nativeMRU = receipt.cells.find(
+    cell => cell.id == inbox.id && cell.name == "MRUTime"
+  );
+  Assert.ok(nativeMRU, "The receipt includes the native MRUTime cell");
+  Assert.equal(nativeMRU.text, "1628202593");
+  Assert.equal(nativeMRU.disposition, "existing");
+  Assert.strictEqual(
+    scalar(
+      `SELECT value FROM folder_properties WHERE id=${trash.id} AND name='MRUTime'`
+    ),
+    "1628202569",
+    "The cache fills an absent native MRUTime"
+  );
+  const appliedMRU = receipt.cells.find(
+    cell => cell.id == trash.id && cell.name == "MRUTime"
+  );
+  Assert.ok(appliedMRU, "The receipt includes the applied MRUTime cell");
+  Assert.equal(appliedMRU.text, "1628202569");
+  Assert.equal(appliedMRU.disposition, "applied");
   Assert.strictEqual(
     scalar(
       `SELECT typeof(value) FROM folder_properties WHERE id=${inbox.id} AND name='MRUTime'`

@@ -99,11 +99,6 @@ already_AddRefed<DatabaseCore> DatabaseCore::GetInstanceForService() {
 
 DatabaseCore::DatabaseCore() {
   MOZ_ASSERT(!sConnection, "creating a second DatabaseCore");
-
-  // Bump up the refcount so it doesn't get freed too early. This is needed
-  // because of the unusual dynamic component registration done in
-  // `nsMsgAccountManager::Init`.
-  NS_ADDREF_THIS();
 }
 
 NS_IMETHODIMP
@@ -4966,13 +4961,13 @@ NS_IMPL_ISUPPORTS(DatabaseCoreFactory, nsIFactory)
 
 NS_IMETHODIMP DatabaseCoreFactory::CreateInstance(const nsIID& aIID,
                                                   void** aResult) {
+  *aResult = nullptr;
   nsresult rv;
   nsCOMPtr<nsIDatabaseCore> core =
       do_GetService("@mozilla.org/mailnews/database-core;1", &rv);
   NS_ENSURE_SUCCESS(rv, rv);
 
-  *aResult = (void*)(core);
-  return NS_OK;
+  return core->QueryInterface(aIID, aResult);
 }
 
 }  // namespace mozilla::mailnews

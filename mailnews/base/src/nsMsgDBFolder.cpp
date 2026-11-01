@@ -77,6 +77,7 @@
 #  include "DatabaseCore.h"
 #  include "DatabaseUtils.h"
 #  include "nsMsgLocalStoreUtils.h"
+#  include "nsCharSeparatedTokenizer.h"
 #endif  // MOZ_PANORAMA
 
 using namespace mozilla;

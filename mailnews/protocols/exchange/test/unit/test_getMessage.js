@@ -1231,3 +1231,116 @@ async function testEarlyPolicyStatus(mockServer, incomingServer, offline) {
   );
   Assert.deepEqual(callbacks, [], "The failed request never starts");
 }
+
+add_task(async function test_singleUriPhysicalReadEws() {
+  await checkSingleUriPhysicalRead(ewsServer, incomingEwsServer);
+});
+
+add_task(async function test_singleUriPhysicalReadGraph() {
+  await checkSingleUriPhysicalRead(graphServer, incomingGraphServer);
+});
+
+/**
+ * Resolve and stream separate physical messages with the same Message-ID.
+ *
+ * @param {MockServer} mockServer - The existing protocol fixture.
+ * @param {nsIMsgIncomingServer} incomingServer - Its configured account.
+ * @returns {Promise<void>} Resolves after remote and cached reads of both URIs.
+ */
+async function checkSingleUriPhysicalRead(mockServer, incomingServer) {
+  const databaseService = Cc[
+    "@mozilla.org/msgDatabase/msgDBService;1"
+  ].getService(Ci.nsIMsgDBService);
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && databaseService instanceof Ci.nsIDatabaseCore,
+    native
+  );
+  Assert.equal(
+    incomingServer.getStringValue("storeContractID"),
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
+  const prefix = `${incomingServer.type}_physical_uri`;
+  const generator = new MessageGenerator();
+  const messages = generator.makeMessages({ count: 2 });
+  const commonId = `${prefix}@made.up.invalid`;
+  const folders = [];
+  for (let i = 0; i < 2; i++) {
+    messages[i].messageId = commonId;
+    const name = `${prefix}_${i}`;
+    mockServer.appendRemoteFolder(new RemoteFolder(name, "root", name, name));
+    mockServer.addItemToFolder(
+      `${prefix}_item_${i ? "11" : "1"}`,
+      name,
+      messages[i]
+    );
+  }
+  await syncFolder(incomingServer, incomingServer.rootFolder);
+  for (let i = 0; i < 2; i++) {
+    const folder = incomingServer.rootFolder.getChildNamed(`${prefix}_${i}`);
+    await syncFolder(incomingServer, folder);
+    folders.push(folder);
+  }
+  const headers = folders.map(folder => [...folder.messages][0]);
+  const keys = headers.map(header => header.messageKey);
+  const ids = headers.map(header => header.getStringProperty("ewsId"));
+  const uris = headers.map((header, i) => folders[i].getUriForMsg(header));
+  Assert.notEqual(
+    uris[0],
+    uris[1],
+    "Each physical instance has its own message URI"
+  );
+  Assert.notEqual(
+    ids[0],
+    ids[1],
+    "Opaque IDs with overlapping text stay distinct"
+  );
+  if (native) {
+    Assert.notEqual(
+      keys[0],
+      keys[1],
+      "Native physical keys are global across folders"
+    );
+  }
+  for (const localOnly of [false, true]) {
+    for (let i = 0; i < 2; i++) {
+      const service = MailServices.messageServiceFromURI(uris[i]);
+      const resolved = service.messageURIToMsgHdr(uris[i]);
+      Assert.equal(resolved.messageKey, keys[i]);
+      Assert.equal(resolved.folder.URI, folders[i].URI);
+      Assert.equal(resolved.messageId, commonId);
+      Assert.equal(resolved.getStringProperty("ewsId"), ids[i]);
+      const channelURI = service.getUrlForUri(uris[i]);
+      Assert.equal(channelURI.scheme, `x-moz-${incomingServer.type}`);
+      const statuses = [];
+      let starts = 0;
+      const stream = new PromiseTestUtils.PromiseStreamListener({
+        onStartRequest() {
+          starts++;
+        },
+        onStopRequest(request, status) {
+          statuses.push(status);
+        },
+      });
+      service.streamMessage(uris[i], stream, null, null, false, "", localOnly);
+      Assert.equal(await stream.promise, messages[i].toMessageString());
+      Assert.equal(starts, 1, "Each individual URI starts once");
+      Assert.deepEqual(
+        statuses,
+        [Cr.NS_OK],
+        "Each individual URI stops successfully once"
+      );
+      Assert.ok(folders[i].hasMsgOffline(keys[i]));
+      Assert.ok(headers[i].storeToken);
+      Assert.equal(service.messageURIToMsgHdr(uris[i]).messageKey, keys[i]);
+      Assert.equal(
+        mockServer.getItemInfo(ids[i]).parentId,
+        folders[i].getStringProperty("ewsId")
+      );
+      Assert.equal(
+        folders[1 - i].GetMessageHeader(keys[1 - i]).messageId,
+        commonId
+      );
+    }
+  }
+}

@@ -46,16 +46,12 @@ class ExchangeCopyMoveTransaction : public nsMsgTxn {
   NS_IMETHOD UndoTransaction() override;
   NS_IMETHOD RedoTransaction() override;
 
-  /**
-   * Replace the collection of headers so that the next undo/redo operates on
-   * the given `headers`.
-   */
-  void UpdateHeaderSet(const nsTArray<RefPtr<nsIMsgDBHdr>>& headers);
-
  protected:
   virtual ~ExchangeCopyMoveTransaction();
 
  private:
+  class OperationListener;
+
   /**
    * Construct an Undo/Redo transaction for a copy or move operation.
    *
@@ -73,7 +69,7 @@ class ExchangeCopyMoveTransaction : public nsMsgTxn {
    * and to `toFolder`.
    */
   nsresult PerformOperation(IExchangeFolder* fromFolder,
-                            IExchangeFolder* toFolder);
+                            IExchangeFolder* toFolder, bool undo);
 
   const nsCOMPtr<IExchangeFolder> mOriginalSourceFolder;
   const nsCOMPtr<IExchangeFolder> mOriginalDestinationFolder;
@@ -81,6 +77,8 @@ class ExchangeCopyMoveTransaction : public nsMsgTxn {
   const bool mIsMove;
   const nsTArray<RefPtr<nsIMsgDBHdr>> mOriginalHeaderSet;
   nsTArray<RefPtr<nsIMsgDBHdr>> mCurrentHeaderSet;
+  bool mOperationPending = false;
+  bool mUndone = false;
 };
 
 #endif  // COMM_MAILNEWS_PROTOCOLS_EXCHANGE_SRC_EXCHANGECOPYMOVETRANSACTION_H_

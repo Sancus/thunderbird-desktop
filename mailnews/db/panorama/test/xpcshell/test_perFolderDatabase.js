@@ -1124,6 +1124,130 @@ add_task(function test_pendingProducerReadErrorsAndTransactionOwnership() {
   Assert.throws(() => folder.numPendingUnread, /NS_ERROR_NOT_AVAILABLE/);
 });
 
+add_task(function test_summaryOverflowPreservesCountsAndRecovers() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("summary-overflow-recovery");
+  addMessage({ folderId: folder.id, messageId: "summary-overflow-message" });
+  const oldDB = folder.msgDatabase;
+  const info = oldDB.dBFolderInfo;
+  Assert.equal(folder.getTotalMessages(false), 1);
+  Assert.equal(folder.getNumUnread(false), 1);
+  const changes = recordPendingCountChanges(folder);
+  const connection = database.connectionForTests;
+
+  connection.beginTransaction();
+  try {
+    for (const [property, getter] of [
+      ["imapTotalPendingMessages", "getTotalMessages"],
+      ["imapUnreadPendingMessages", "getNumUnread"],
+    ]) {
+      info[property] = 0x7fffffff;
+      Assert.throws(
+        () => folder[getter](false),
+        /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+      );
+      Assert.deepEqual(changes, []);
+      info[property] = 0;
+      folder.summaryChanged();
+      Assert.deepEqual(changes, [], "a failed getter keeps cached counts");
+    }
+    Assert.ok(connection.transactionInProgress);
+  } finally {
+    connection.rollbackTransaction();
+  }
+
+  connection.beginTransaction();
+  try {
+    info.imapTotalPendingMessages = 1;
+    info.imapUnreadPendingMessages = 0x7fffffff;
+    Assert.throws(
+      () => folder.summaryChanged(),
+      /NS_ERROR_LOSS_OF_SIGNIFICANT_DATA/
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.deepEqual(changes, [], "a failed pair publishes neither count");
+
+    info.imapUnreadPendingMessages = 1;
+    folder.summaryChanged();
+    Assert.ok(connection.transactionInProgress);
+    Assert.deepEqual(changes, [
+      ["TotalMessages", 1, 2],
+      ["TotalUnreadMessages", 1, 2],
+    ]);
+  } finally {
+    connection.rollbackTransaction();
+  }
+
+  // Refresh directly after rollback, before getters can repair cached fields.
+  changes.length = 0;
+  folder.summaryChanged();
+  Assert.deepEqual(changes, [
+    ["TotalMessages", 2, 1],
+    ["TotalUnreadMessages", 2, 1],
+  ]);
+  Assert.equal(info.getUint32Property("totPendingMsgs", 99), 99);
+  Assert.equal(info.getUint32Property("unreadPendingMsgs", 99), 99);
+
+  Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+    .getService(Ci.nsIMsgDBService)
+    .forceFolderDBClosed(folder);
+  const reopened = folder.msgDatabase;
+  Assert.notStrictEqual(reopened, oldDB);
+  Assert.equal(folder.getTotalMessages(false), 1);
+  Assert.equal(folder.getNumUnread(false), 1);
+  Assert.equal(folder.numPendingTotalMessages, 0);
+  Assert.equal(folder.numPendingUnread, 0);
+  Assert.equal(
+    reopened.dBFolderInfo.getUint32Property("totPendingMsgs", 99),
+    99
+  );
+  Assert.equal(
+    reopened.dBFolderInfo.getUint32Property("unreadPendingMsgs", 99),
+    99
+  );
+});
+
+add_task(function test_summaryRefreshesAfterInvalidCachedPending() {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("summary-cached-pending");
+  addMessage({ folderId: folder.id, messageId: "summary-cached-message" });
+  const info = folder.msgDatabase.dBFolderInfo;
+  Assert.equal(folder.getTotalMessages(false), 1);
+  Assert.equal(folder.getNumUnread(false), 1);
+  const changes = recordPendingCountChanges(folder);
+  const connection = database.connectionForTests;
+
+  for (const [property, getter, notification] of [
+    ["imapTotalPendingMessages", "numPendingTotalMessages", "TotalMessages"],
+    ["imapUnreadPendingMessages", "numPendingUnread", "TotalUnreadMessages"],
+  ]) {
+    info[property] = 0x7fffffff;
+    Assert.equal(folder[getter], 0x7fffffff);
+    connection.executeSimpleSQL(
+      "ALTER TABLE folder_properties RENAME TO hidden_summary_properties"
+    );
+    try {
+      Assert.throws(() => folder.summaryChanged(), /NS_ERROR_FAILURE/);
+      Assert.deepEqual(
+        changes,
+        [],
+        "the original read error publishes nothing"
+      );
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE hidden_summary_properties RENAME TO folder_properties"
+      );
+    }
+
+    info[property] = 0;
+    folder.summaryChanged();
+    Assert.deepEqual(changes, [[notification, 0x80000000, 1]]);
+    changes.length = 0;
+  }
+});
+
 add_task(function test_pendingGettersDoNotReadUnrelatedCountFields() {
   const folder = rootFolder
     .QueryInterface(Ci.nsIMsgLocalMailFolder)

@@ -94,7 +94,10 @@ add_setup(async function () {
       teardownIMAPPump();
     }
   });
-  IMAPPump.daemon.createMailbox("secondFolder", { subscribed: true });
+  IMAPPump.daemon.createMailbox("secondFolder", {
+    subscribed: true,
+    uidvalidity: IMAPPump.daemon.uidvalidity++,
+  });
   await discoverFolders();
   IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
     .getChildNamed("INBOX")
@@ -797,8 +800,23 @@ if (panorama) {
       let restore;
       let expected = Cr.NS_ERROR_NOT_AVAILABLE;
       if (fault == "legacy-null" || fault == "corrupt") {
+        const source = connection.createStatement(
+          "SELECT sourcePhysicalKey FROM offline_operations " +
+            "WHERE folderId=:folderId AND messageKey=:key"
+        );
+        source.params.folderId = folder.id;
+        source.params.key = key;
+        let sourcePhysicalKey;
+        try {
+          Assert.ok(source.executeStep());
+          Assert.ok(!source.getIsNull(0));
+          sourcePhysicalKey = source.getInt64(0);
+          Assert.ok(!source.executeStep());
+        } finally {
+          source.finalize();
+        }
         connection.executeSimpleSQL(
-          `UPDATE offline_operations SET epoch=NULL${fault == "legacy-null" ? ",uid=NULL" : ""} ` +
+          `UPDATE offline_operations SET epoch=NULL${fault == "legacy-null" ? ",uid=NULL,sourcePhysicalKey=NULL" : ""} ` +
             `WHERE folderId=${folder.id} AND messageKey=${key}`
         );
         if (fault == "corrupt") {
@@ -806,7 +824,7 @@ if (panorama) {
         }
         restore = () =>
           connection.executeSimpleSQL(
-            `UPDATE offline_operations SET epoch=7101,uid=6101 ` +
+            `UPDATE offline_operations SET epoch=7101,uid=6101,sourcePhysicalKey=${sourcePhysicalKey} ` +
               `WHERE folderId=${folder.id} AND messageKey=${key}`
           );
       } else if (fault == "stale-epoch") {

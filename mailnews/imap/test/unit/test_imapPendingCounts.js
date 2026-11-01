@@ -92,7 +92,10 @@ function makeMailboxSpec(values) {
 }
 
 async function makeCountFolder(name) {
-  server.daemon.createMailbox(name, { subscribed: true });
+  server.daemon.createMailbox(name, {
+    subscribed: true,
+    uidvalidity: server.daemon.uidvalidity++,
+  });
   const listener = new PromiseTestUtils.PromiseUrlListener();
   MailServices.imap.discoverAllFolders(
     incomingServer.rootFolder,
@@ -150,6 +153,84 @@ add_task(async function testImapPendingWrappers() {
 });
 
 if (Services.prefs.getBoolPref("mail.panorama.enabled")) {
+  add_task(async function test_syncCountsPreservesNewBiffAndPendingState() {
+    const folder = await makeCountFolder("sync-new-biff-counts");
+    const generator = new MessageGenerator();
+    await server.addMessages(
+      "sync-new-biff-counts",
+      generator.makeMessages({ count: 3 }),
+      false
+    );
+    const messages = server.getMessagesInFolder(folder);
+    messages[0].setFlag("\\Seen");
+    folder.performingBiff = true;
+    try {
+      await updateFolder(folder);
+      const database = folder.msgDatabase;
+      const headers = [...folder.messages];
+      const unreadKeys = headers
+        .filter(header => !header.isRead)
+        .map(header => header.messageKey)
+        .sort((a, b) => a - b);
+      Assert.equal(headers.length, 3, "real protocol headers were published");
+      Assert.equal(unreadKeys.length, 2);
+      Assert.equal(folder.getTotalMessages(false), 3);
+      Assert.equal(folder.getNumUnread(false), 2);
+      Assert.equal(folder.getNumNewMessages(false), 2);
+      Assert.deepEqual(
+        database.getNewList().sort((a, b) => a - b),
+        unreadKeys
+      );
+      Assert.equal(folder.biffState, Ci.nsIMsgFolder.nsMsgBiffState_NewMail);
+
+      folder.changePendingTotal(2);
+      folder.changePendingUnread(1);
+      database.syncCounts();
+      folder.updateSummaryTotals(true);
+      Assert.equal(folder.getTotalMessages(false), 5);
+      Assert.equal(folder.getNumUnread(false), 3);
+      Assert.equal(folder.getNumNewMessages(false), 2);
+      Assert.deepEqual(
+        database.getNewList().sort((a, b) => a - b),
+        unreadKeys
+      );
+      Assert.equal(database.dBFolderInfo.imapTotalPendingMessages, 2);
+      Assert.equal(database.dBFolderInfo.imapUnreadPendingMessages, 1);
+
+      folder.clearNewMessages();
+      Assert.equal(folder.getNumNewMessages(false), 0);
+      Assert.deepEqual(database.getNewList(), []);
+      Assert.equal(
+        folder.getNumUnread(false),
+        3,
+        "clearing new is not marking read"
+      );
+      incomingServer.biffState = Ci.nsIMsgFolder.nsMsgBiffState_NoMail;
+      Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+        .getService(Ci.nsIMsgDBService)
+        .forceFolderDBClosed(folder);
+      const reopened = folder.msgDatabase;
+      Assert.notStrictEqual(reopened, database);
+      reopened.syncCounts();
+      folder.updateSummaryTotals(true);
+      Assert.equal(reopened.dBFolderInfo.numMessages, 3);
+      Assert.equal(reopened.dBFolderInfo.numUnreadMessages, 2);
+      Assert.equal(folder.numPendingTotalMessages, 2);
+      Assert.equal(folder.numPendingUnread, 1);
+      Assert.equal(folder.getTotalMessages(false), 5);
+      Assert.equal(folder.getNumUnread(false), 3);
+      Assert.equal(folder.getNumNewMessages(false), 0);
+      Assert.deepEqual(reopened.getNewList(), []);
+      Assert.equal(folder.biffState, Ci.nsIMsgFolder.nsMsgBiffState_NoMail);
+    } finally {
+      folder.performingBiff = false;
+      incomingServer.performingBiff = false;
+      incomingServer.biffState = Ci.nsIMsgFolder.nsMsgBiffState_NoMail;
+      incomingServer.closeCachedConnections();
+      await waitForConnectionsToClose();
+    }
+  });
+
   add_task(async function testSelectKeepsAbsentAndZeroPendingCounts() {
     const folder = await makeCountFolder("select-zero-pending");
     const info = folder.msgDatabase.dBFolderInfo;

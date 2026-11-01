@@ -4710,6 +4710,12 @@ nsresult nsMsgDBFolder::ReadDBFolderCounts() {
   MOZ_TRY(info->GetNumUnreadMessages(&unread));
   MOZ_TRY(info->GetImapTotalPendingMessages(&pendingTotal));
   MOZ_TRY(info->GetImapUnreadPendingMessages(&pendingUnread));
+  CheckedInt<int32_t> displayedTotal =
+      CheckedInt<int32_t>(total) + pendingTotal;
+  CheckedInt<int32_t> displayedUnread =
+      CheckedInt<int32_t>(unread) + pendingUnread;
+  NS_ENSURE_TRUE(displayedTotal.isValid() && displayedUnread.isValid(),
+                 NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
   mNumTotalMessages = total;
   mNumUnreadMessages = unread;
   mNumPendingTotalMessages = pendingTotal;
@@ -4757,18 +4763,14 @@ NS_IMETHODIMP nsMsgDBFolder::UpdateSummaryTotals(bool force) {
   if (!mNotifyCountChanges) return NS_OK;
 
   const bool panorama = StaticPrefs::mail_panorama_enabled_AtStartup();
-  CheckedInt<int32_t> oldUnread =
-      CheckedInt<int32_t>(mNumUnreadMessages) + mNumPendingUnreadMessages;
-  CheckedInt<int32_t> oldTotal =
-      CheckedInt<int32_t>(mNumTotalMessages) + mNumPendingTotalMessages;
-  NS_ENSURE_TRUE(!panorama || (oldUnread.isValid() && oldTotal.isValid()),
-                 NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
-  int32_t oldUnreadMessages =
-      panorama ? oldUnread.value()
+  // Pending getters can cache a valid value whose displayed sum is too wide.
+  // Keep the old sum for the int64 notification, but validate refreshed inputs.
+  int64_t oldUnreadMessages =
+      panorama ? int64_t(mNumUnreadMessages) + mNumPendingUnreadMessages
                : mNumUnreadMessages + mNumPendingUnreadMessages;
-  int32_t oldTotalMessages = panorama
-                                 ? oldTotal.value()
-                                 : mNumTotalMessages + mNumPendingTotalMessages;
+  int64_t oldTotalMessages =
+      panorama ? int64_t(mNumTotalMessages) + mNumPendingTotalMessages
+               : mNumTotalMessages + mNumPendingTotalMessages;
   // We need to read this info from the database.
   nsresult rv = ReadDBFolderInfo(force);
 
@@ -4823,6 +4825,8 @@ NS_IMETHODIMP nsMsgDBFolder::GetNumUnread(bool deep, int32_t* numUnread) {
     int32_t count, pending;
     MOZ_TRY(info->GetNumUnreadMessages(&count));
     MOZ_TRY(info->GetImapUnreadPendingMessages(&pending));
+    CheckedInt<int32_t> displayed = CheckedInt<int32_t>(count) + pending;
+    NS_ENSURE_TRUE(displayed.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
     mNumUnreadMessages = count;
     mNumPendingUnreadMessages = pending;
   }
@@ -4880,6 +4884,8 @@ NS_IMETHODIMP nsMsgDBFolder::GetTotalMessages(bool deep,
     int32_t count, pending;
     MOZ_TRY(info->GetNumMessages(&count));
     MOZ_TRY(info->GetImapTotalPendingMessages(&pending));
+    CheckedInt<int32_t> displayed = CheckedInt<int32_t>(count) + pending;
+    NS_ENSURE_TRUE(displayed.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
     mNumTotalMessages = count;
     mNumPendingTotalMessages = pending;
   }

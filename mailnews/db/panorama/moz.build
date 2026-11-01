@@ -32,6 +32,7 @@ EXTRA_JS_MODULES.panorama += [
     "search/ChatSearchProvider.sys.mjs",
     "search/ChatSearchRedaction.sys.mjs",
     "search/ChatSearchRedactionObserver.sys.mjs",
+    "search/ChatSearchService.sys.mjs",
     "search/MailSearch.sys.mjs",
     "search/MailSearchAttachmentOpener.sys.mjs",
     "search/MailSearchAttachments.sys.mjs",

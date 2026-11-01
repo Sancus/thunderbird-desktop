@@ -122,6 +122,9 @@ tags = ["dataadapter"]
 
 ["test_liveViewSQL.js"]
 
+["test_liveViewThreadBatch.js"]
+tags = ["dataadapter"]
+
 ["test_liveViewThreadedDataAdapter.js"]
 tags = ["dataadapter"]
 

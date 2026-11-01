@@ -1846,10 +1846,16 @@ async function _internal_assert_displayed(
     const dbView = get_db_view(troller);
     const desiredMessages = desiredIndices.map(i => dbView.getMsgHdrAt(i));
     const summary = multiMessageBrowser.contentWindow.gMessageSummary;
+    const summarizedMessages = [];
+    for (const { folder, members } of summary._folderStates.values()) {
+      for (const key of members.keys()) {
+        summarizedMessages.push(`${key}${folder.URI}`);
+      }
+    }
 
     Assert.deepEqual(
       desiredMessages.map(m => `${m.messageKey}${m.folder.URI}`).toSorted(),
-      Object.keys(summary._msgNodes).toSorted(),
+      summarizedMessages.toSorted(),
       "the selected messages should be summarised"
     );
   }

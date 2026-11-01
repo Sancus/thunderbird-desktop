@@ -4,6 +4,8 @@
 
 "use strict";
 
+/* global arguments */
+
 const [action, fixture, rejectDelivery] = arguments;
 const done = arguments[arguments.length - 1];
 const { MailServices } = ChromeUtils.importESModule(

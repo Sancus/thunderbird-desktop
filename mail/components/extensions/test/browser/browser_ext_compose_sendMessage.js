@@ -851,9 +851,38 @@ async function checkImapFcc(retry) {
     ),
     "The installed native database serves this compose consumer"
   );
-  const account = createAccount("imap", { extensions: ["RFC4315"] });
-  const imap = gIMAPServers.get(account.incomingServer.key);
-  const root = account.incomingServer.rootFolder;
+  const account = MailServices.accounts.createAccount();
+  let accountRemoved = false;
+  registerCleanupFunction(() => {
+    if (!accountRemoved) {
+      accountRemoved = true;
+      cleanUpAccount(account);
+    }
+  });
+  const imap = new IMAPServer({ extensions: ["RFC4315"] });
+  imap.open();
+  account.incomingServer = MailServices.accounts.createIncomingServer(
+    "user",
+    "localhost",
+    "imap"
+  );
+  const incoming = account.incomingServer.QueryInterface(
+    Ci.nsIImapIncomingServer
+  );
+  incoming.port = imap.port;
+  incoming.password = "password";
+  incoming.maximumConnectionsNumber = 1;
+  incoming.useIdle = false;
+  incoming.downloadOnBiff = false;
+  incoming.setBoolValue("autosync_offline_stores", false);
+  const root = incoming.rootFolder;
+  const discovery = new MailPromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(root, discovery, null);
+  await discovery.promise;
+  Assert.ok(
+    root.getChildNamed("INBOX"),
+    "Real LIST discovers the native INBOX"
+  );
   const sent = await createSubfolder(root, "ConfiguredSent");
   const outside = await createSubfolder(root, "OtherIdentitySent");
   const controlBody = [
@@ -883,7 +912,6 @@ async function checkImapFcc(retry) {
   const sentCount = gSentMessages.length;
   let prompts = 0;
   const originalPrompt = Services.prompt;
-  let extension;
   let loaded = false;
   let cleaned = false;
   const cleanup = async () => {
@@ -904,7 +932,10 @@ async function checkImapFcc(retry) {
       loaded = false;
       await extension.unload();
     }
-    cleanUpAccount(account);
+    if (!accountRemoved) {
+      accountRemoved = true;
+      cleanUpAccount(account);
+    }
   };
   registerCleanupFunction(cleanup);
   if (retry) {
@@ -933,7 +964,7 @@ async function checkImapFcc(retry) {
       },
     };
   }
-  extension = ExtensionTestUtils.loadExtension({
+  const extension = ExtensionTestUtils.loadExtension({
     files: {
       "background.js": async () => {
         const [config] = await window.sendMessage("getImapFccConfig");

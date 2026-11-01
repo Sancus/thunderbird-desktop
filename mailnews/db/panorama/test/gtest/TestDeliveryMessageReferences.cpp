@@ -1238,7 +1238,8 @@ TEST_F(DeliveryCompleteHeader, LocalStoreCopyExcludesStoragePresence) {
   EXPECT_TRUE(names.Contains("storeToken"_ns));
   EXPECT_TRUE(names.Contains("messageSize"_ns));
   ASSERT_EQ(NS_OK, source->GetFlags(&flags));
-  EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline, flags);
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline),
+            flags);
 }
 
 TEST_F(DeliveryCompleteHeader, UncachedStoreCopyKeepsLogicalMessageSize) {
@@ -1873,11 +1874,11 @@ TEST_F(DeliveryCapturedNotifications, BodyOnlyChangesDoNotInventEvents) {
   ASSERT_EQ(2u, listener->events.Length());
   EXPECT_EQ('F', listener->events[0].kind);
   EXPECT_EQ(nsMsgMessageFlags::New, listener->events[0].oldFlags);
-  EXPECT_EQ(nsMsgMessageFlags::New | nsMsgMessageFlags::Offline,
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::New | nsMsgMessageFlags::Offline),
             listener->events[0].flags);
   EXPECT_EQ(0u, listener->events[0].liveFlags);
   EXPECT_EQ('F', listener->events[1].kind);
-  EXPECT_EQ(nsMsgMessageFlags::New | nsMsgMessageFlags::Offline,
+  EXPECT_EQ(uint32_t(nsMsgMessageFlags::New | nsMsgMessageFlags::Offline),
             listener->events[1].oldFlags);
   EXPECT_EQ(nsMsgMessageFlags::New, listener->events[1].flags);
   EXPECT_EQ((nsTArray<nsMsgKey>{mKey}), listener->events[1].newKeys);

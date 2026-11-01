@@ -182,7 +182,11 @@ export class nsMailServer {
           // is still connecting, in which case take the oldest such relay.
           const ports = this._startTLSReaders.map(reader => {
             try {
-              return reader._relayTransport.getScriptableSelfAddr().port;
+              const relay = reader._relayTransport;
+              if (!relay.isAlive()) {
+                return null;
+              }
+              return relay.getScriptableSelfAddr().port;
             } catch (e) {
               return null;
             }

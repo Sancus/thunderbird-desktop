@@ -32,7 +32,8 @@ add_setup(function () {
 });
 
 add_task(function test_downloadSettingsDefaultsAndPersistence() {
-  const db = root.createLocalSubfolder("settings").msgDatabase;
+  const folder = root.createLocalSubfolder("settings");
+  const db = folder.msgDatabase;
   const settings = db.msgDownloadSettings;
   Assert.equal(settings.useServerDefaults, true);
   Assert.equal(settings.downloadByDate, false);
@@ -57,6 +58,12 @@ add_task(function test_downloadSettingsDefaultsAndPersistence() {
   Assert.equal(db.msgDownloadSettings.ageLimitOfMsgsToDownload, 0xffffffff);
   info.setUint32Property("ageLimit", 3);
   Assert.equal(db.msgDownloadSettings.ageLimitOfMsgsToDownload, 3);
+  db.forceClosed();
+  const reopened = folder.msgDatabase.msgDownloadSettings;
+  Assert.equal(reopened.useServerDefaults, false);
+  Assert.equal(reopened.downloadByDate, true);
+  Assert.equal(reopened.downloadUnreadOnly, true);
+  Assert.equal(reopened.ageLimitOfMsgsToDownload, 3);
 });
 
 add_task(function test_failedWriteRollsBackAllSettings() {

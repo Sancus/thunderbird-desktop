@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+"use strict";
+
 let root;
 const raw =
   "From: sender@example.invalid\r\n" +
@@ -124,6 +126,42 @@ add_task(function test_listOfflineMessagesRequiresStoredCompleteContent() {
   Assert.ok(noToken.flags & Ci.nsMsgMessageFlags.Offline);
 });
 
+add_task(async function test_offlineEnumerationRejectsLateStoreReadFailure() {
+  const folder = createFolder("offline-read-error");
+  for (let i = 0; i < 2; i++) {
+    folder.addMessage(raw).orFlags(Ci.nsMsgMessageFlags.Offline);
+  }
+  const db = folder.msgDatabase;
+  const keys = db.listAllKeys();
+  Assert.equal(keys.length, 2);
+  Assert.deepEqual(db.listAllOfflineMsgs(), keys);
+  // Damage the last enumerated message, leaving a readable prefix.
+  const damaged = db.getMsgHdrForKey(keys.at(-1));
+  const token = damaged.storeToken;
+  const flags = damaged.flags;
+  const bytes = await IOUtils.read(folder.filePath.path);
+  const badToken = String(Number(token) + 3);
+  damaged.storeToken = badToken;
+  try {
+    let result;
+    Assert.throws(
+      () => {
+        result = db.listAllOfflineMsgs();
+      },
+      error => error.result == 0x80550024, // NS_MSG_ERROR_MBOX_MALFORMED.
+      "A late store Read failure must not return an empty or partial list"
+    );
+    Assert.equal(result, undefined);
+    Assert.equal(damaged.storeToken, badToken);
+    Assert.equal(damaged.flags, flags);
+    Assert.deepEqual(db.listAllKeys(), keys);
+    Assert.deepEqual(await IOUtils.read(folder.filePath.path), bytes);
+  } finally {
+    damaged.storeToken = token;
+  }
+  Assert.deepEqual(db.listAllOfflineMsgs(), keys);
+});
+
 add_task(async function test_missingStoreDoesNotReportOfflineMessages() {
   const folder = createFolder("missing-store");
   const header = folder.addMessage(raw);
@@ -171,6 +209,11 @@ add_task(function test_lookupStorageErrorsDoNotBecomeNotFound() {
     Assert.throws(
       () => db.getMsgHdrForMessageID("routing@example.invalid"),
       error => error.result == Cr.NS_ERROR_FAILURE
+    );
+    Assert.throws(
+      () => db.listAllOfflineMsgs(),
+      error => error.result == Cr.NS_ERROR_FAILURE,
+      "A physical key query error must not become an empty offline list"
     );
   } finally {
     connection.executeSimpleSQL(

@@ -133,3 +133,120 @@ add_task(async function test_nativeMimeResultRendersUnicodeSnippet() {
     element.remove();
   }
 });
+
+add_task(async function test_nativeSnippetRefreshUsesCurrentRevision() {
+  const literalBody = "é 😀 café 自動 end";
+  const headers = folders.map(folder =>
+    folder.addMessage(
+      MailStringUtils.stringToByteString(
+        [
+          "From: Native Author <native@example.invalid>",
+          "To: Recipient <recipient@example.invalid>",
+          "Date: Tue, 01 Jan 2019 00:00:00 +0000",
+          "Message-ID: <snippet-revision116@example.invalid>",
+          "Subject: snippetoldsubject116",
+          "Content-Type: text/plain; charset=utf-8",
+          "",
+          literalBody,
+          "",
+        ].join("\r\n")
+      )
+    )
+  );
+  Assert.equal(headers[0].messageId, headers[1].messageId);
+  Assert.notEqual(headers[0].messageKey, headers[1].messageKey);
+  for (let i = 0; ; i++) {
+    Assert.less(i, 100, "The initial native projections finish bounded indexing");
+    if (!(await service.update({ limit: 50 })).moreWork) {
+      break;
+    }
+  }
+  const before = await service.collectResults("snippetoldsubject116 cafe");
+  Assert.deepEqual(
+    before.items.map(item => item.id).sort(),
+    headers.map(header => String(header.messageKey)).sort()
+  );
+  const selected = before.items.find(
+    item => item.id == String(headers[1].messageKey)
+  );
+  const control = before.items.find(
+    item => item.id == String(headers[0].messageKey)
+  );
+  Assert.ok(selected, "The selected physical copy has an initial result");
+  Assert.ok(control, "The unrelated physical copy has its own result");
+  win.FacetContext = {
+    collection: {},
+    mailSearchResultSet: before,
+    hoverFacet() {},
+    unhoverFacet() {},
+  };
+  const originalCard = doc.createElement("facet-result-message");
+  originalCard.message = selected;
+  registerCleanupFunction(() => originalCard.remove());
+  doc.body.appendChild(originalCard);
+  const originalBody = originalCard.querySelector(".message-body");
+  Assert.ok(originalBody, "The initial card has a real body snippet");
+  Assert.equal(originalBody.textContent, literalBody);
+  Assert.deepEqual(
+    [...originalBody.querySelectorAll(".message-body-fulltext-match")].map(
+      node => node.textContent
+    ),
+    ["café"]
+  );
+  Assert.equal(originalCard.firstMatchText, "café");
+
+  headers[1].subject = "snippetcurrentsubject116";
+  for (let i = 0; ; i++) {
+    Assert.less(i, 100, "The real header revision finishes bounded indexing");
+    if (!(await service.update({ limit: 50 })).moreWork) {
+      break;
+    }
+  }
+  const after = await service.collectResults("snippetcurrentsubject116 自動");
+  Assert.deepEqual(
+    after.items.map(item => item.id),
+    [String(headers[1].messageKey)],
+    "The refreshed query retains the exact selected physical copy"
+  );
+  const current = after.items[0];
+  Assert.equal(current.id, selected.id);
+  Assert.deepEqual(current.location, {
+    folderId: folders[1].id,
+    messageKey: headers[1].messageKey,
+  });
+  Assert.notEqual(current.textRevision, selected.textRevision);
+  const text = await service.getText(current.id);
+  Assert.equal(text.textRevision, current.textRevision);
+  Assert.equal(text.body, literalBody);
+  Assert.deepEqual(current.snippet, {
+    text: literalBody,
+    ranges: [{ start: 10, end: 12 }],
+    firstMatchText: "自動",
+  });
+
+  win.FacetContext.mailSearchResultSet = after;
+  const currentCard = doc.createElement("facet-result-message");
+  currentCard.message = current;
+  registerCleanupFunction(() => currentCard.remove());
+  originalCard.replaceWith(currentCard);
+  Assert.ok(!originalCard.isConnected, "The old result card is replaced");
+  const currentBody = currentCard.querySelector(".message-body");
+  Assert.ok(currentBody, "The refreshed card has the current native snippet");
+  Assert.equal(currentBody.textContent, literalBody);
+  Assert.deepEqual(
+    [...currentBody.querySelectorAll(".message-body-fulltext-match")].map(
+      node => node.textContent
+    ),
+    ["自動"],
+    "The displayed card uses fresh UTF-16 ranges instead of the old café match"
+  );
+  Assert.equal(currentCard.firstMatchText, "自動");
+  Assert.equal(selected.snippet.firstMatchText, "café");
+  const unchanged = await service.collectResults("snippetoldsubject116 cafe");
+  Assert.deepEqual(
+    unchanged.items.map(item => item.id),
+    [String(headers[0].messageKey)]
+  );
+  Assert.equal(unchanged.items[0].textRevision, control.textRevision);
+  currentCard.remove();
+});

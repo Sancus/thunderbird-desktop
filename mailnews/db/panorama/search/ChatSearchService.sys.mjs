@@ -133,7 +133,7 @@ export class ChatSearchService {
             throw error;
           }
           try {
-            await this.#provider.refreshLog(path);
+            await this.#refreshLog(path);
           } catch (error) {
             // Logger.forEach tolerates DOMExceptions from directory traversal.
             // A provider/source failure must instead reject with its own error.
@@ -145,6 +145,43 @@ export class ChatSearchService {
       });
     } catch (error) {
       throw failed ? failure : error;
+    }
+  }
+
+  /**
+   * Reports a rejected source file without withholding unrelated transcripts.
+   * Provider-wide privacy, closing and index/storage errors remain fatal.
+   *
+   * @param {string} path - Actual physical logger file.
+   * @returns {Promise<void>} Refresh completion or per-file rejection report.
+   * @throws {Error} Original provider-wide failure.
+   */
+  async #refreshLog(path) {
+    try {
+      await this.#provider.refreshLog(path);
+    } catch (error) {
+      if (!this.#provider.isSourceError(error)) {
+        throw error;
+      }
+      this.#reportError(error);
+    }
+  }
+
+  /**
+   * Sends the original error to the caller without replacing it if reporting fails.
+   *
+   * @param {unknown} error - Original source or provider failure.
+   */
+  #reportError(error) {
+    try {
+      this.#onError(error);
+    } catch (reportError) {
+      console.error(
+        new AggregateError(
+          [error, reportError],
+          "Chat search error reporting failed"
+        )
+      );
     }
   }
 
@@ -196,12 +233,19 @@ export class ChatSearchService {
         folder,
         ...Array.from(files, path => PathUtils.parent(path)),
       ]);
+      const failedPaths = new Set();
       const pending = Array.from(gFilePromises.entries()).filter(([path]) =>
         folders.has(PathUtils.parent(path))
       );
       for (const [path, promise] of pending) {
         files.add(path);
-        await promise;
+        try {
+          await promise;
+        } catch (error) {
+          files.delete(path);
+          failedPaths.add(path);
+          this.#reportError(error);
+        }
       }
       let children;
       try {
@@ -215,7 +259,9 @@ export class ChatSearchService {
       for (const path of children) {
         try {
           chatSearchDocumentId(path);
-          files.add(path);
+          if (!failedPaths.has(path)) {
+            files.add(path);
+          }
         } catch (error) {
           if (!(error instanceof TypeError)) {
             throw error;
@@ -223,7 +269,7 @@ export class ChatSearchService {
         }
       }
       for (const path of files) {
-        await this.#provider.refreshLog(path);
+        await this.#refreshLog(path);
       }
     });
   }
@@ -243,16 +289,7 @@ export class ChatSearchService {
           this.#failed = true;
           this.#failure = error;
         }
-        try {
-          this.#onError(error);
-        } catch (reportError) {
-          console.error(
-            new AggregateError(
-              [error, reportError],
-              "Chat search error reporting failed"
-            )
-          );
-        }
+        this.#reportError(error);
       }
     );
     return result;

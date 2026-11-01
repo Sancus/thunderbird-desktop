@@ -8,8 +8,11 @@ do_get_profile();
 const { ChatSearchService } = ChromeUtils.importESModule(
   "resource:///modules/panorama/ChatSearchService.sys.mjs"
 );
-const { ChatSearchProvider, chatSearchDocumentId } = ChromeUtils.importESModule(
+const { chatSearchDocumentId } = ChromeUtils.importESModule(
   "resource:///modules/panorama/ChatSearchProvider.sys.mjs"
+);
+const { PanoramaSearchIndex } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs"
 );
 const { GenericConvIMPrototype } = ChromeUtils.importESModule(
   "resource:///modules/jsProtoHelper.sys.mjs"
@@ -59,9 +62,24 @@ async function serviceFixture(name) {
   const service = await ChatSearchService.open(file, {
     onError: error => errors.push(error),
   });
-  const fixture = { conversation, ui, file, service, errors, writer: null };
+  const fixture = {
+    conversation,
+    ui,
+    file,
+    service,
+    errors,
+    writer: null,
+    expectedFailure: null,
+  };
   registerCleanupFunction(async () => {
-    await fixture.service.close();
+    if (fixture.expectedFailure) {
+      await Assert.rejects(
+        fixture.service.close(),
+        error => error === fixture.expectedFailure
+      );
+    } else {
+      await fixture.service.close();
+    }
     conversation.removeObserver(ui._convObservers.get(conversation));
     closeLogWriter(conversation);
     for (const path of fixture.writer?.paths || []) {
@@ -147,6 +165,7 @@ add_task(async function test_realAdditionsPersistPhysicalIdentity() {
   );
   Assert.deepEqual(f.errors, []);
   Assert.ok(!Cu.isESModuleLoaded("resource:///modules/index_im.sys.mjs"));
+  await f.service.close();
 });
 
 add_task(async function test_firstMessageSurvivesImmediateWriterClose() {
@@ -167,6 +186,7 @@ add_task(async function test_firstMessageSurvivesImmediateWriterClose() {
   );
   Assert.ok((await IOUtils.readUTF8(path)).includes("immediatecloseneedle"));
   Assert.deepEqual(f.errors, []);
+  await f.service.close();
 });
 
 add_task(async function test_rotatedAndEqualIdLogsStayDistinct() {
@@ -196,6 +216,7 @@ add_task(async function test_rotatedAndEqualIdLogsStayDistinct() {
   Assert.equal((await f.service.getText(ids[0])).id, ids[0]);
   Assert.equal((await f.service.getText(ids[1])).id, ids[1]);
   Assert.deepEqual(f.errors, []);
+  await Promise.all([f.service.close(), control.service.close()]);
 });
 
 add_task(async function test_observedPrivacyNeverIndexesNotificationPayload() {
@@ -223,6 +244,7 @@ add_task(async function test_observedPrivacyNeverIndexesNotificationPayload() {
   Assert.ok(!bytes.includes("neverpersistservicepayload"));
   Assert.ok(bytes.includes("servicekeptneedle"));
   Assert.deepEqual(f.errors, []);
+  await f.service.close();
 });
 
 add_task(async function test_policyAndDisabledLoggingKeepSourceEligibility() {
@@ -263,9 +285,11 @@ add_task(async function test_policyAndDisabledLoggingKeepSourceEligibility() {
       0
     );
     Assert.deepEqual(disabled.errors, []);
+    await disabled.service.close();
   } finally {
     Services.prefs.setBoolPref("purple.logging.log_ims", true);
   }
+  await f.service.close();
 });
 
 add_task(async function test_closeDrainsActualLoggerWorkAndRestartResumes() {
@@ -323,36 +347,115 @@ add_task(async function test_closeDrainsActualLoggerWorkAndRestartResumes() {
   Assert.ok((await f.service.getText(id)).body.includes("missedrestartneedle"));
   Assert.deepEqual(f.errors, []);
   Assert.ok(!Cu.isESModuleLoaded("resource:///modules/index_im.sys.mjs"));
+  await f.service.close();
 });
 
-add_task(async function test_failedStartupPreservesSourceAndClosesTheWriter() {
-  const f = await serviceFixture("failure");
-  await writeServiceMessage(f, "first-id", "preservedserviceneedle");
-  await f.service.close();
+add_task(async function test_indexFailureIsNotARejectedSourceFile() {
+  const f = await serviceFixture("storage-failure");
+  await writeServiceMessage(f, "first-id", "beforestoragefailureneedle");
   const path = f.writer.currentPath;
-  const bytes = (await IOUtils.readUTF8(path)) + "{invalid-tail\n";
-  await IOUtils.writeUTF8(path, bytes);
-  const errors = [];
-  await Assert.rejects(
-    ChatSearchService.open(f.file, { onError: error => errors.push(error) }),
-    error => error === errors[0] && error.name === "SyntaxError"
-  );
-  Assert.equal(errors.length, 1);
-  Assert.equal(
-    await IOUtils.readUTF8(path),
-    bytes,
-    "Failed destination work never deletes source"
-  );
-  const provider = await ChatSearchProvider.open(f.file);
+  const id = chatSearchDocumentId(path);
+  const failure = new Error("Controlled original index write failure");
+  const index = PanoramaSearchIndex.prototype.index;
+  PanoramaSearchIndex.prototype.index = function (document, ...args) {
+    return document.id === id
+      ? Promise.reject(failure)
+      : index.call(this, document, ...args);
+  };
+  f.expectedFailure = failure;
   try {
-    Assert.equal(
-      await provider.getText(chatSearchDocumentId(path)),
-      null,
-      "Changed source hides the old text"
+    await Assert.rejects(
+      writeServiceMessage(f, "second-id", "retainedstoragesourceneedle"),
+      error => error === failure
     );
+    await Assert.rejects(
+      f.service.search("beforestoragefailureneedle"),
+      error => error === failure
+    );
+    await Assert.rejects(f.service.getText(id), error => error === failure);
+    Assert.deepEqual(f.errors, [failure]);
+    Assert.ok(
+      (await IOUtils.readUTF8(path)).includes("retainedstoragesourceneedle")
+    );
+    const closing = f.service.close();
+    Assert.equal(closing, f.service.close());
+    await Assert.rejects(closing, error => error === failure);
   } finally {
-    await provider.close();
+    PanoramaSearchIndex.prototype.index = index;
   }
-  // Keep this malformed source isolated from later startup sweeps.
-  await IOUtils.remove(path);
+});
+
+add_task(async function test_malformedLogsDoNotBlockHealthySourceOrStartup() {
+  const f = await serviceFixture("malformed");
+  const rejected = [];
+  for (let i = 0; i < 4; i++) {
+    await writeServiceMessage(f, "bad-" + i, "malformedhistoricalneedle" + i);
+    rejected.push(f.writer.currentPath);
+    f.writer.startNewFile(
+      f.conversation.startDate / 1000 + 1000 * (i + 1),
+      true
+    );
+  }
+  await writeServiceMessage(f, "healthy-id", "healthyhistoricalneedle");
+  const healthyPath = f.writer.currentPath;
+  await f.service.close();
+  await IOUtils.writeUTF8(
+    rejected[0],
+    (await IOUtils.readUTF8(rejected[0])) + "{invalid-tail\n"
+  );
+  await IOUtils.writeUTF8(rejected[1], "");
+  await IOUtils.write(rejected[2], new Uint8Array([255, 254, 255]));
+  const lines = (await IOUtils.readUTF8(rejected[3])).split("\n");
+  const header = JSON.parse(lines[0]);
+  delete header.normalizedName;
+  lines[0] = JSON.stringify(header);
+  await IOUtils.writeUTF8(rejected[3], lines.join("\n"));
+  const source = new Map();
+  for (const path of rejected) {
+    source.set(path, Array.from(await IOUtils.read(path)));
+  }
+  const errors = [];
+  f.service = await ChatSearchService.open(f.file, {
+    onError: error => errors.push(error),
+  });
+  Assert.deepEqual(errors.map(error => error.name).sort(), [
+    "Error",
+    "SyntaxError",
+    "SyntaxError",
+    "TypeError",
+  ]);
+  Assert.deepEqual(
+    (await f.service.search("healthyhistoricalneedle")).items.map(
+      hit => hit.id
+    ),
+    [chatSearchDocumentId(healthyPath)]
+  );
+  for (const path of rejected) {
+    Assert.equal(await f.service.getText(chatSearchDocumentId(path)), null);
+    Assert.deepEqual(
+      Array.from(await IOUtils.read(path)),
+      source.get(path),
+      "Rejected source remains byte-exact"
+    );
+  }
+  await writeServiceMessage(f, "later-id", "healthyliveadditionneedle");
+  Assert.deepEqual(
+    (await f.service.search("healthyliveadditionneedle")).items.map(
+      hit => hit.id
+    ),
+    [chatSearchDocumentId(healthyPath)]
+  );
+  Assert.equal(
+    (await f.service.search("malformedhistoricalneedle0")).items.length,
+    0
+  );
+  Assert.equal(
+    errors.length,
+    8,
+    "Each actual historical rejection is reported, not a sticky global hold"
+  );
+  for (const path of rejected) {
+    Assert.deepEqual(Array.from(await IOUtils.read(path)), source.get(path));
+  }
+  await f.service.close();
 });

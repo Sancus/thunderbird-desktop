@@ -1133,6 +1133,62 @@ add_task(async function test_closedConversationPrivacyUsesVerifiedHistory() {
     [...original],
     "Actual historical source versions were erased"
   );
+  await IOUtils.remove(source.paths[0]);
+  const absent = await readChatPrivacyTarget(
+    receipt.id,
+    receipt.targets[0].relativePath
+  );
+  Assert.strictEqual(
+    absent.missing,
+    true,
+    "Only the exact known absent source is missing"
+  );
+  Assert.strictEqual(
+    absent.bytes,
+    null,
+    "Absence is never invented empty bytes"
+  );
+  Assert.strictEqual(
+    absent.revision,
+    null,
+    "Absence has no fabricated content revision"
+  );
+  await Assert.rejects(
+    readChatPrivacyTarget(receipt.id, [
+      ...receipt.targets[0].relativePath.slice(0, 3),
+      "2099-01-01.000000+0000.json",
+    ]),
+    /Unknown chat privacy target/,
+    "A missing unrecorded path is not a valid target"
+  );
+  const proof = await getChatPrivacySourceProof(receipt.id);
+  Assert.deepEqual(
+    proof.targets[0],
+    {
+      relativePath: receipt.targets[0].relativePath,
+      missing: true,
+      revision: null,
+    },
+    "Proof records actual scoped source absence"
+  );
+  Assert.strictEqual(
+    proof.targets[1].missing,
+    false,
+    "Existing erased targets keep their actual digest rather than absence"
+  );
+  await acknowledgeChatPrivacyIntent(receipt.id, () =>
+    getChatPrivacySourceProof(receipt.id)
+  );
+  await IOUtils.write(source.paths[0], original);
+  await Assert.rejects(
+    getChatPrivacySourceProof(receipt.id),
+    /not erased/,
+    "A completed absent target still excludes restored captured bytes"
+  );
+  await acknowledgeChatPrivacyIntent(receipt.id, async current => {
+    await erasePrivacyVersions(current);
+    return getChatPrivacySourceProof(current.id);
+  });
 });
 
 add_task(async function test_failedPrivacyCompletionRetainsPendingIntent() {

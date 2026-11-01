@@ -511,8 +511,9 @@ async function findChatPrivacyReceipt(receiptId) {
  * @param {string[]} relativePath - Exact stored four-component target.
  * @param {object} [options={}] - Cancellation controls.
  * @param {AbortSignal} [options.signal] - Cancels delivery, not started logger I/O.
- * @returns {Promise<{path: string, bytes: Uint8Array, revision: string,
- *   target: ChatPrivacyTarget}>} Current source bytes and captured line descriptors.
+ * @returns {Promise<{path: string, bytes: Uint8Array|null, revision: string|null,
+ *   target: ChatPrivacyTarget, missing: boolean}>} Current source or explicit
+ *   absence of this validated target. Missing never means invented empty text.
  * @throws {Error} Original error, foreign/replaced header or changed target version.
  */
 export async function readChatPrivacyTarget(
@@ -537,7 +538,16 @@ export async function readChatPrivacyTarget(
   if (previous) {
     await previous;
   }
-  const bytes = await queueFileOperation(path, () => IOUtils.read(path));
+  let bytes;
+  try {
+    bytes = await queueFileOperation(path, () => IOUtils.read(path));
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (error.name === "NotFoundError") {
+      return { path, target, missing: true, bytes: null, revision: null };
+    }
+    throw error;
+  }
   signal?.throwIfAborted();
   const { lines } = parseChatPrivacySource(bytes, receipt.scope);
   if (
@@ -549,7 +559,13 @@ export async function readChatPrivacyTarget(
   ) {
     throw new Error("Chat privacy target version changed");
   }
-  return { path, bytes, revision: chatPrivacyHash(bytes), target };
+  return {
+    path,
+    target,
+    missing: false,
+    bytes,
+    revision: chatPrivacyHash(bytes),
+  };
 }
 
 /**
@@ -559,7 +575,8 @@ export async function readChatPrivacyTarget(
  * @param {object} [options={}] - Cancellation controls.
  * @param {AbortSignal} [options.signal] - Cancels between source reads.
  * @returns {Promise<{receiptId: string, targets: {relativePath: string[],
- *   revision: string}[]}>} Actual current source proof; no semantic success claim.
+ *   revision: string|null, missing: boolean}[]}>} Exact erasure/absence proof;
+ *   no semantic success claim. Other I/O failures remain original failures.
  * @throws {Error} Original failure or a captured source version remains unerased.
  */
 export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
@@ -569,6 +586,14 @@ export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
     const source = await readChatPrivacyTarget(receiptId, target.relativePath, {
       signal,
     });
+    if (source.missing) {
+      targets.push({
+        relativePath: target.relativePath,
+        missing: true,
+        revision: null,
+      });
+      continue;
+    }
     const { lines } = parseChatPrivacySource(source.bytes, receipt.scope);
     if (
       target.records.some(
@@ -579,6 +604,7 @@ export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
     }
     targets.push({
       relativePath: target.relativePath,
+      missing: false,
       revision: source.revision,
     });
   }

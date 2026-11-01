@@ -4,36 +4,58 @@
 
 #include "ExchangeCopyMoveTransaction.h"
 
+#include "UrlListener.h"
 #include "nsIMsgTransactionService.h"
 #include "nsIMsgFolder.h"
 
-namespace {
-
-class UpdateHeaderSetListener : public IExchangeFolderOperationListener {
+// Both folder callbacks belong to one operation. Keep its headers until the
+// copy listener confirms the outcome, including asynchronous deletion failures.
+class ExchangeCopyMoveTransaction::OperationListener final
+    : public CopyServiceListener,
+      public IExchangeFolderOperationListener {
  public:
-  NS_DECL_IEXCHANGEFOLDEROPERATIONLISTENER
-  NS_DECL_ISUPPORTS
+  NS_DECL_ISUPPORTS_INHERITED
 
-  explicit UpdateHeaderSetListener(
-      RefPtr<ExchangeCopyMoveTransaction> transaction)
-      : mTransaction(std::move(transaction)) {}
+  OperationListener(ExchangeCopyMoveTransaction* transaction, bool undo,
+                    bool deleting)
+      : mTransaction(transaction), mUndo(undo), mDeleting(deleting) {}
 
- protected:
-  virtual ~UpdateHeaderSetListener() = default;
+  NS_IMETHOD OnComplete(const nsTArray<RefPtr<nsIMsgDBHdr>>& headers) override {
+    if (!mFinished) {
+      mHeaders = headers.Clone();
+      mHaveHeaders = true;
+    }
+    return NS_OK;
+  }
+
+  NS_IMETHOD OnStopCopy(nsresult status) override {
+    if (mFinished) {
+      return NS_OK;
+    }
+    mFinished = true;
+    RefPtr<ExchangeCopyMoveTransaction> transaction = std::move(mTransaction);
+    if (NS_SUCCEEDED(status) && (mDeleting || mHaveHeaders)) {
+      transaction->mCurrentHeaderSet = std::move(mHeaders);
+      transaction->mUndone = mUndo;
+    }
+    transaction->mOperationPending = false;
+    return NS_OK;
+  }
 
  private:
+  ~OperationListener() override = default;
+
   RefPtr<ExchangeCopyMoveTransaction> mTransaction;
+  nsTArray<RefPtr<nsIMsgDBHdr>> mHeaders;
+  const bool mUndo;
+  const bool mDeleting;
+  bool mHaveHeaders = false;
+  bool mFinished = false;
 };
 
-NS_IMPL_ISUPPORTS(UpdateHeaderSetListener, IExchangeFolderOperationListener);
-
-NS_IMETHODIMP UpdateHeaderSetListener::OnComplete(
-    const nsTArray<RefPtr<nsIMsgDBHdr>>& headers) {
-  mTransaction->UpdateHeaderSet(headers);
-  return NS_OK;
-}
-
-}  // namespace
+NS_IMPL_ISUPPORTS_INHERITED(ExchangeCopyMoveTransaction::OperationListener,
+                            CopyServiceListener,
+                            IExchangeFolderOperationListener)
 
 RefPtr<ExchangeCopyMoveTransaction> ExchangeCopyMoveTransaction::ForCopy(
     nsCOMPtr<IExchangeFolder> originalSourceFolder,
@@ -75,45 +97,55 @@ ExchangeCopyMoveTransaction::ExchangeCopyMoveTransaction(
 ExchangeCopyMoveTransaction::~ExchangeCopyMoveTransaction() = default;
 
 NS_IMETHODIMP ExchangeCopyMoveTransaction::UndoTransaction() {
+  if (mOperationPending) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  if (mUndone) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
   if (mIsMove) {
-    return PerformOperation(mOriginalDestinationFolder, mOriginalSourceFolder);
+    return PerformOperation(mOriginalDestinationFolder, mOriginalSourceFolder,
+                            true);
   }
 
   nsresult rv;
   nsCOMPtr<nsIMsgFolder> msgFolder =
       do_QueryInterface(mOriginalDestinationFolder, &rv);
   NS_ENSURE_SUCCESS(rv, rv);
+  RefPtr<OperationListener> listener = new OperationListener(this, true, true);
+  mOperationPending = true;
   rv = msgFolder->DeleteMessages(mCurrentHeaderSet, mWindow, true, false,
-                                 nullptr, false);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  mCurrentHeaderSet.ClearAndRetainStorage();
-  return NS_OK;
+                                 listener, false);
+  if (NS_FAILED(rv)) {
+    listener->OnStopCopy(rv);
+  }
+  return rv;
 }
 
 NS_IMETHODIMP ExchangeCopyMoveTransaction::RedoTransaction() {
-  return PerformOperation(mOriginalSourceFolder, mOriginalDestinationFolder);
-}
-
-void ExchangeCopyMoveTransaction::UpdateHeaderSet(
-    const nsTArray<RefPtr<nsIMsgDBHdr>>& headers) {
-  mCurrentHeaderSet.ClearAndRetainStorage();
-  for (auto&& header : headers) {
-    mCurrentHeaderSet.AppendElement(header);
+  if (mOperationPending) {
+    return NS_ERROR_IN_PROGRESS;
   }
+  if (!mUndone) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  return PerformOperation(mOriginalSourceFolder, mOriginalDestinationFolder,
+                          false);
 }
 
 nsresult ExchangeCopyMoveTransaction::PerformOperation(
-    IExchangeFolder* fromFolder, IExchangeFolder* toFolder) {
-  RefPtr<UpdateHeaderSetListener> listener = new UpdateHeaderSetListener(this);
+    IExchangeFolder* fromFolder, IExchangeFolder* toFolder, bool undo) {
+  RefPtr<OperationListener> listener = new OperationListener(this, undo, false);
   const auto& transactionHeaders =
       mIsMove ? mCurrentHeaderSet : mOriginalHeaderSet;
   // We can pass `eUnknown` as the undo operation type because we're passing
   // another argument to disallow undo for this operation.
+  mOperationPending = true;
   nsresult rv = toFolder->CopyItemsOnSameServer(
-      fromFolder, transactionHeaders, mIsMove, mWindow, nullptr, false,
+      fromFolder, transactionHeaders, mIsMove, mWindow, listener, false,
       nsIMsgTransactionService::eUnknown, listener);
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  return NS_OK;
+  if (NS_FAILED(rv)) {
+    listener->OnStopCopy(rv);
+  }
+  return rv;
 }

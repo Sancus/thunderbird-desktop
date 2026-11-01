@@ -458,3 +458,190 @@ add_task(async function test_shutdownWrapperCannotReparseNativeStorage() {
   );
   stream.close();
 });
+
+add_task(function test_messageIdLookupPreservesPhysicalHeaderIdentity() {
+  const first = createFolder("lookup-physical-identity");
+  const other = createFolder("lookup-physical-bystander");
+  const header = first.addMessage(raw);
+  const foreign = other.addMessage(raw);
+  const db = first.msgDatabase;
+  const otherDB = other.msgDatabase;
+  const key = header.messageKey;
+  const messageId = header.messageId;
+  const cached = db.getMsgHdrForKey(key);
+  Assert.strictEqual(db.getMsgHdrForMessageID(messageId), cached);
+  Assert.strictEqual(
+    otherDB.getMsgHdrForMessageID(messageId),
+    otherDB.getMsgHdrForKey(foreign.messageKey)
+  );
+  Assert.notStrictEqual(cached, otherDB.getMsgHdrForMessageID(messageId));
+  Assert.strictEqual(cached.folder, first);
+  Assert.throws(
+    () => db.getMsgHdrForKey(foreign.messageKey),
+    /NS_ERROR_ILLEGAL_VALUE/
+  );
+  Assert.throws(
+    () => db.getMsgHdrForMessageID("missing-physical@routing.invalid"),
+    /NS_ERROR_ILLEGAL_VALUE/
+  );
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    Assert.strictEqual(db.getMsgHdrForMessageID(messageId), cached);
+    Assert.strictEqual(db.getMsgHdrForKey(key), cached);
+    Assert.ok(
+      connection.transactionInProgress,
+      "Read-only lookups keep the caller's transaction"
+    );
+  } finally {
+    connection.rollbackTransaction();
+  }
+  db.forceClosed();
+  Assert.throws(() => db.getMsgHdrForKey(key), /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(
+    () => db.getMsgHdrForMessageID(messageId),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  const reopened = first.msgDatabase;
+  Assert.notStrictEqual(reopened, db);
+  const current = reopened.getMsgHdrForMessageID(messageId);
+  Assert.notStrictEqual(current, cached);
+  Assert.strictEqual(current, reopened.getMsgHdrForKey(key));
+  Assert.strictEqual(current.folder, first);
+  messageDB.removeMessage(key);
+  Assert.throws(() => reopened.getMsgHdrForKey(key), /NS_ERROR_ILLEGAL_VALUE/);
+  Assert.throws(
+    () => reopened.getMsgHdrForMessageID(messageId),
+    /NS_ERROR_ILLEGAL_VALUE/
+  );
+  Assert.strictEqual(otherDB.getMsgHdrForMessageID(messageId).folder, other);
+  Assert.ok(!connection.transactionInProgress);
+});
+
+add_task(
+  function test_opaqueIdLookupRequiresSourceForEmptyAndPopulatedFolders() {
+    const empty = createFolder("lookup-empty-source");
+    const populated = createFolder("lookup-populated-source");
+    const header = populated.addMessage(raw);
+    const messageId = header.messageId;
+    const gmail = "18446744073709551615";
+    const ews = "AAMk+/=Ω";
+    header.setStringProperty("X-GM-MSGID", gmail);
+    header.setStringProperty("ewsId", ews);
+    const emptyDB = empty.msgDatabase;
+    const populatedDB = populated.msgDatabase;
+    const cached = populatedDB.getMsgHdrForKey(header.messageKey);
+    Assert.equal(emptyDB.getMsgHdrForGMMsgID(gmail), null);
+    Assert.equal(emptyDB.getMsgHdrForEwsItemID(ews), null);
+    Assert.strictEqual(populatedDB.getMsgHdrForGMMsgID(gmail), cached);
+    Assert.strictEqual(populatedDB.getMsgHdrForEwsItemID(ews), cached);
+    const connection = database.connectionForTests;
+    const source = database.sourceId;
+
+    /**
+     * Changes the fixture's database identity without changing message rows.
+     *
+     * @param {string} value - Exact source identity to store.
+     */
+    function setSource(value) {
+      const statement = connection.createStatement(
+        "UPDATE database_identity SET sourceId = :source"
+      );
+      try {
+        statement.params.source = value;
+        statement.execute();
+      } finally {
+        statement.finalize();
+      }
+    }
+
+    for (const fault of [
+      {
+        name: "replacement",
+        value: Services.uuid.generateUUID().toString(),
+        error: Cr.NS_ERROR_NOT_AVAILABLE,
+      },
+      {
+        name: "corrupt",
+        value: "invalid-lookup-source",
+        error: Cr.NS_ERROR_FILE_CORRUPTED,
+      },
+      { name: "missing", error: Cr.NS_ERROR_FAILURE },
+    ]) {
+      try {
+        if (fault.name === "missing") {
+          connection.executeSimpleSQL(
+            "ALTER TABLE database_identity RENAME TO unavailable_lookup_identity"
+          );
+        } else {
+          setSource(fault.value);
+        }
+        for (const db of [emptyDB, populatedDB]) {
+          Assert.throws(
+            () => db.getMsgHdrForGMMsgID(gmail),
+            error => error.result === fault.error,
+            `${fault.name} source must not become an empty Gmail match`
+          );
+          Assert.throws(
+            () => db.getMsgHdrForEwsItemID(ews),
+            error => error.result === fault.error,
+            `${fault.name} source must not become an empty EWS match`
+          );
+          Assert.throws(
+            () => db.getMsgHdrForMessageID(messageId),
+            error => error.result === fault.error,
+            `${fault.name} source errors precede Message-ID not-found`
+          );
+        }
+        Assert.ok(!connection.transactionInProgress);
+      } finally {
+        if (fault.name === "missing") {
+          connection.executeSimpleSQL(
+            "ALTER TABLE unavailable_lookup_identity RENAME TO database_identity"
+          );
+        } else {
+          setSource(source);
+        }
+      }
+      Assert.equal(emptyDB.getMsgHdrForGMMsgID(gmail), null);
+      Assert.equal(emptyDB.getMsgHdrForEwsItemID(ews), null);
+      Assert.strictEqual(populatedDB.getMsgHdrForGMMsgID(gmail), cached);
+      Assert.strictEqual(populatedDB.getMsgHdrForEwsItemID(ews), cached);
+    }
+
+    connection.beginTransaction();
+    try {
+      Assert.equal(emptyDB.getMsgHdrForGMMsgID(gmail), null);
+      Assert.equal(emptyDB.getMsgHdrForEwsItemID(ews), null);
+      setSource(Services.uuid.generateUUID().toString());
+      Assert.throws(
+        () => emptyDB.getMsgHdrForGMMsgID(gmail),
+        /NS_ERROR_NOT_AVAILABLE/
+      );
+      Assert.throws(
+        () => emptyDB.getMsgHdrForEwsItemID(ews),
+        /NS_ERROR_NOT_AVAILABLE/
+      );
+      Assert.ok(
+        connection.transactionInProgress,
+        "Source refusal leaves SQL with its caller"
+      );
+    } finally {
+      connection.rollbackTransaction();
+    }
+    Assert.equal(database.sourceId, source);
+    Assert.equal(emptyDB.getMsgHdrForGMMsgID(gmail), null);
+    Assert.equal(emptyDB.getMsgHdrForEwsItemID(ews), null);
+    Assert.strictEqual(populatedDB.getMsgHdrForEwsItemID(ews), cached);
+    emptyDB.forceClosed();
+    Assert.throws(
+      () => emptyDB.getMsgHdrForGMMsgID(gmail),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.throws(
+      () => emptyDB.getMsgHdrForEwsItemID(ews),
+      /NS_ERROR_NOT_AVAILABLE/
+    );
+    Assert.strictEqual(populatedDB.getMsgHdrForGMMsgID(gmail), cached);
+  }
+);

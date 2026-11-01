@@ -1485,7 +1485,8 @@ TEST_F(DeliveryCompleteHeader,
     ++publications;
     EXPECT_EQ(key, after.id);
     EXPECT_EQ(output.get(), live);
-    EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked, after.flags);
+    EXPECT_EQ(uint32_t(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked),
+              after.flags);
     OfflineOperationData saved;
     EXPECT_EQ(NS_OK,
               mCore->MessageDB().GetOfflineOperation(mFolder, key, saved));

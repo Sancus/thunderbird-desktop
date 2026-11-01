@@ -8016,7 +8016,7 @@ nsImapMailFolder::PercentProgress(nsIImapProtocol* aProtocol,
   return NS_OK;
 }
 
-NS_IMETHODIMP
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
 nsImapMailFolder::CopyNextStreamMessage(bool copySucceeded,
                                         nsISupports* copyState) {
   if (!copySucceeded) return NS_OK;
@@ -8078,8 +8078,10 @@ nsImapMailFolder::CopyNextStreamMessage(bool copySucceeded,
         nsCOMPtr<nsITransactionManager> manager;
         rv = txns ? txns->GetTransactionManager(getter_AddRefs(manager))
                   : NS_ERROR_NOT_AVAILABLE;
-        if (NS_SUCCEEDED(rv) && manager)
-          rv = manager->DoTransaction(state->m_undoMsgTxn);
+        if (NS_SUCCEEDED(rv) && manager) {
+          RefPtr<nsImapMoveCopyMsgTxn> txn = state->m_undoMsgTxn;
+          rv = manager->DoTransaction(txn);
+        }
       }
       return ContinueStreamCopy(state, rv);
     }
@@ -8493,7 +8495,7 @@ nsresult nsImapMailFolder::CopyMessagesOfflineNative(
   nsTArray<RefPtr<nsIMsgDBHdr>> copiedSources, destinations;
   const char* step = "folder validation";
   nsMsgKey copyingKey = nsMsgKey_None;
-  nsresult result = [&]() -> nsresult {
+  nsresult result = [&]() MOZ_CAN_RUN_SCRIPT -> nsresult {
     NS_ENSURE_TRUE(source && source != this, NS_ERROR_INVALID_ARG);
     RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
     NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
@@ -8761,7 +8763,10 @@ nsresult nsImapMailFolder::CopyMessagesOfflineNative(
         NS_ENSURE_STATE(transactions);
         nsCOMPtr<nsITransactionManager> manager;
         MOZ_TRY(transactions->GetTransactionManager(getter_AddRefs(manager)));
-        if (manager) MOZ_TRY(manager->DoTransaction(entry->sourceUndo));
+        if (manager) {
+          RefPtr<nsImapOfflineTxn> txn = entry->sourceUndo;
+          MOZ_TRY(manager->DoTransaction(txn));
+        }
       }
       step = "copy listener";
       if (listener) MOZ_TRY(listener->SetMessageKey(entry->key));

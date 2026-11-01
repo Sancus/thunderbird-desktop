@@ -1,0 +1,26 @@
+// <!-- <mdb:mork:z v="1.4"/> -->
+< <(a=c)> // (f=iso-8859-1)
+  (80=migration:fixture:rows)(81=migration:fixture:table)
+  (82=presentEmpty)(83=Payload)(84=absentValue)(85=UTF-8)>
+
+<(80=)>
+{1:^80 {(k^81:c)(s=9)} 
+  [1(^82=)
+[(f^85)]
+    (^83
+    =row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-r\
+ow-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-for\
+m-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-\
+form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-r\
+ow-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-for\
+m-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-\
+form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-r\
+ow-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-for\
+m-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-\
+form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-r\
+ow-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-for\
+m-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-\
+form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-r\
+ow-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-for\
+m-row-form-row-form-row-form-row-form-row-form-row-form-row-form-$C3$AB$0D$0A(\
+raw\)\\\$)]}

@@ -307,3 +307,147 @@ add_task(async function test_genuineNativeRowPositionRefusal() {
     "Source file is unchanged"
   );
 });
+
+add_task(async function test_genuineNativeRowFormRefusal() {
+  // The unchanged MDB writer committed this nondefault inline UTF-8 form.
+  // A distinct frozen native reader checks exact bytes, form and presence.
+  const path = do_get_file("data/migration-row-form.mork").path;
+  const bytes = await IOUtils.read(path);
+  const original = bytes.slice();
+  const body = MailStringUtils.uint8ArrayToByteString(bytes);
+  const offset = body.indexOf("[(f^");
+  Assert.greater(offset, 0, "The genuine input contains native row metadata");
+  const sentinel = {};
+  let snapshot = sentinel;
+  Assert.throws(
+    () => {
+      snapshot = new MorkParser().parseForImport(body);
+    },
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == offset &&
+      error.message == "Row metadata block at byte " + offset,
+    "A valid unsupported native form must not be decoded as default text"
+  );
+  Assert.equal(
+    snapshot,
+    sentinel,
+    "No partial structural snapshot was returned"
+  );
+  let summary = sentinel;
+  Assert.throws(
+    () => {
+      summary = parseMorkSummary(bytes);
+    },
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == offset &&
+      error.message == "Row metadata block at byte " + offset,
+    "The summary caller propagates the native row form refusal before projection"
+  );
+  Assert.equal(summary, sentinel, "No partial summary was returned");
+  Assert.deepEqual(bytes, original, "Neither caller mutates the input buffer");
+  Assert.deepEqual(
+    await IOUtils.read(path),
+    original,
+    "Source file is unchanged"
+  );
+});
+
+add_task(async function test_genuineNativeDictionaryFormRefusal() {
+  // Native003 committed these bytes. Its discarded reader loses the alias form;
+  // the migration reader must refuse the saved form rather than lose its meaning.
+  const path = do_get_file("data/migration-dictionary-form.mork").path;
+  const bytes = await IOUtils.read(path);
+  const original = bytes.slice();
+  const body = MailStringUtils.uint8ArrayToByteString(bytes);
+  const expected = await IOUtils.readJSON(
+    do_get_file("data/migration-forms.json").path
+  );
+  // Physical tokens were measured separately from the pre-production oracle.
+  const tokens = {
+    scope: "80",
+    kind: "81",
+    empty: "82",
+    payload: "83",
+    absent: "84",
+    form: "85",
+    value: "81",
+  };
+  Assert.ok(body.includes(`(${tokens.scope}=${expected.scope})`));
+  Assert.ok(body.includes(`(${tokens.kind}=${expected.tableKind})`));
+  Assert.ok(
+    body.includes(`(${tokens.form}=${expected.dictionaryForm.formName})`)
+  );
+  Assert.ok(body.includes(`(${tokens.empty}=presentEmpty)`));
+  Assert.ok(body.includes(`(${tokens.payload}=Payload)`));
+  Assert.ok(
+    body.includes(`(${tokens.absent}=${expected.dictionaryForm.absentCell})`)
+  );
+  // Independently spelled wire representation of the literal UTF-8 payload:
+  // dictionary é (raw)\$; the IDs are measurements, never the semantic oracle.
+  const encodedPayload = "dictionary $C3$A9 (raw\\)\\\\\\$";
+  Assert.ok(
+    body.includes(`(${tokens.value}\n<(f^${tokens.form})>=${encodedPayload})`),
+    "The genuine dictionary retains the exact escaped UTF-8 value and form"
+  );
+  Assert.ok(
+    body.includes(
+      `{${expected.tableId}:^${tokens.scope} {(k^${tokens.kind}:c)(s=9)}`
+    ),
+    "The original table kind and scope remain linked"
+  );
+  Assert.ok(
+    body.includes(
+      `[${expected.dictionaryForm.rowId}(^${tokens.empty}=)\n` +
+        `[(f^${tokens.form})](^${tokens.payload}^${tokens.value})]`
+    ),
+    "The scoped row keeps the empty default-form cell and nondefault payload alias"
+  );
+  Assert.ok(
+    !body.includes(`(^${tokens.absent}`),
+    "The absent cell stays absent"
+  );
+
+  const offset = body.indexOf("<(f^");
+  Assert.greater(offset, 0);
+  const sentinel = {};
+  let snapshot = sentinel;
+  Assert.throws(
+    () => {
+      snapshot = new MorkParser().parseForImport(body);
+    },
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == offset &&
+      error.message == "Per-alias form override at byte " + offset,
+    "The structural reader refuses the unsupported alias form before decoding"
+  );
+  Assert.equal(
+    snapshot,
+    sentinel,
+    "No partial structural snapshot was returned"
+  );
+  let summary = sentinel;
+  Assert.throws(
+    () => {
+      summary = parseMorkSummary(bytes);
+    },
+    error =>
+      error.name == "MorkImportError" &&
+      error.code == "UNSUPPORTED_MORK" &&
+      error.offset == offset &&
+      error.message == "Per-alias form override at byte " + offset,
+    "The summary caller propagates the exact alias-form refusal"
+  );
+  Assert.equal(summary, sentinel, "No partial summary was returned");
+  Assert.deepEqual(bytes, original, "Neither caller mutates the input buffer");
+  Assert.deepEqual(
+    await IOUtils.read(path),
+    original,
+    "Source file is unchanged"
+  );
+});

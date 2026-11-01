@@ -536,7 +536,8 @@ add_task(async function test_queryWithoutGlobalIndex() {
     },
   });
   await extension.startup();
-  const manager = extension.extension.messageManager;
+  const manager = WebExtensionPolicy.getByID(extension.id).extension
+    .messageManager;
   extension.sendMessage({
     a: manager.convert(a).id,
     b: manager.convert(b).id,

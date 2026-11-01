@@ -298,7 +298,9 @@ async function checkGlobalResults(manifestVersion) {
   pane.threadTree.selectedIndices = [];
   extension.sendMessage(
     "watch-selection",
-    extension.extension.messageManager.convert(selected).id
+    WebExtensionPolicy.getByID(extension.id).extension.messageManager.convert(
+      selected
+    ).id
   );
   await extension.awaitMessage("watching");
   pane.threadTree.selectedIndex = index;
@@ -306,7 +308,11 @@ async function checkGlobalResults(manifestVersion) {
   Assert.equal(selectedTab.id ?? selectedTab.tabId, listAPI.id);
   const resolvePhysical = apiMessages =>
     apiMessages.map(apiMessage =>
-      physical(extension.extension.messageManager.get(apiMessage.id))
+      physical(
+        WebExtensionPolicy.getByID(extension.id).extension.messageManager.get(
+          apiMessage.id
+        )
+      )
     );
   Assert.deepEqual(resolvePhysical(selectedList.messages), [
     physical(selected),

@@ -931,3 +931,210 @@ add_task(async function test_virtual_folder_threading_persistence() {
     "View group-by-sort bit should be set."
   );
 });
+
+/**
+ * Stores a literal physical-identity fixture in a real local folder.
+ *
+ * @param {nsIMsgFolder} folder - Destination folder.
+ * @param {string} id - Message-ID without brackets.
+ * @param {string} subject - Subject used for filtering and ordering.
+ * @returns {nsIMsgDBHdr} The stored header.
+ */
+function storePhysicalMessage(folder, id, subject) {
+  return folder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .addMessage(
+      "From: sender@membership.invalid\r\n" +
+        "To: recipient@membership.invalid\r\n" +
+        "Date: Thu, 1 Jan 2026 12:00:00 +0000\r\n" +
+        `Message-ID: <${id}>\r\nSubject: ${subject}\r\n\r\n${subject}\r\n`
+    );
+}
+
+/**
+ * Checks actual backend/store selection and ordered physical rows.
+ *
+ * @param {DBViewWrapper} wrapper - The loaded real view.
+ * @param {Array<[string, number, string]>} expected - Independent fixture rows.
+ * @param {nsIMsgDBHdr} outside - The excluded equal-ID copy.
+ */
+function assertPhysicalView(wrapper, expected, outside) {
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    "The actual database service matches the requested backend"
+  );
+  const contract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Assert.equal(
+    outside.folder.server.msgStore.storeType,
+    contract.includes("maildirstore") ? "maildir" : "mbox",
+    "The real fixture uses the requested body store"
+  );
+  const view = wrapper.dbView;
+  Assert.equal(view.rowCount, expected.length, "Exact physical row count");
+  Assert.deepEqual(
+    Array.from({ length: view.rowCount }, (_, i) => {
+      const h = view.getMsgHdrAt(i);
+      return [h.folder.URI, h.messageKey, h.messageId];
+    }),
+    expected,
+    "Every ordered row has the expected physical folder, key and literal ID"
+  );
+  for (const [i, [uri, key]] of expected.entries()) {
+    const folder = wrapper._underlyingFolders.find(f => f.URI == uri);
+    const header = folder.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(wrapper.getViewIndexForMsgHdr(header, false), i);
+    Assert.equal(view.findIndexOfMsgHdr(header, false), i);
+  }
+  Assert.equal(wrapper.getViewIndexForMsgHdr(outside, false), 0xffffffff);
+  Assert.equal(wrapper.getViewIndexForMsgHdr(outside, true), 0xffffffff);
+}
+
+add_task(async function test_single_folder_physical_identity_lookup() {
+  const folder = await messageInjection.makeEmptyFolder();
+  const outside = await messageInjection.makeEmptyFolder();
+  const a = storePhysicalMessage(
+    folder,
+    "single-a@membership.invalid",
+    "Alpha"
+  );
+  const b = storePhysicalMessage(folder, "single-b@membership.invalid", "Zulu");
+  const excluded = storePhysicalMessage(
+    outside,
+    "single-a@membership.invalid",
+    "Alpha"
+  );
+  const expected = [
+    [folder.URI, a.messageKey, "single-a@membership.invalid"],
+    [folder.URI, b.messageKey, "single-b@membership.invalid"],
+  ];
+  const outsideExpected = [
+    [outside.URI, excluded.messageKey, "single-a@membership.invalid"],
+  ];
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, folder);
+  wrapper.showUnthreaded = true;
+  wrapper.sort("subjectCol", Ci.nsMsgViewSortOrder.ascending);
+  assertPhysicalView(wrapper, expected, excluded);
+  folder.msgDatabase.clearCachedHdrs();
+  assertPhysicalView(wrapper, expected, excluded);
+  wrapper.sort("subjectCol", Ci.nsMsgViewSortOrder.descending);
+  assertPhysicalView(wrapper, expected.toReversed(), excluded);
+  const { PromiseCopyListener } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
+  const deleted = new PromiseCopyListener();
+  folder.deleteMessages([a], null, true, false, deleted, false);
+  await deleted.promise;
+  assertPhysicalView(wrapper, [expected[1]], excluded);
+  Assert.equal(wrapper.getViewIndexForMsgHdr(a, false), 0xffffffff);
+  Assert.deepEqual(
+    Array.from(folder.messages, h => [h.folder.URI, h.messageKey, h.messageId]),
+    [expected[1]],
+    "Only the selected physical target was deleted"
+  );
+  Assert.deepEqual(
+    Array.from(outside.messages, h => [
+      h.folder.URI,
+      h.messageKey,
+      h.messageId,
+    ]),
+    outsideExpected,
+    "The outside equal-ID copy is unchanged"
+  );
+  wrapper.close();
+});
+
+add_task(async function test_saved_search_physical_identity_lookup() {
+  const first = await messageInjection.makeEmptyFolder();
+  const second = await messageInjection.makeEmptyFolder();
+  const outside = await messageInjection.makeEmptyFolder();
+  const a = storePhysicalMessage(
+    first,
+    "shared-search@membership.invalid",
+    "member Alpha"
+  );
+  const b = storePhysicalMessage(
+    second,
+    "shared-search@membership.invalid",
+    "member Zulu"
+  );
+  const excluded = storePhysicalMessage(
+    outside,
+    "shared-search@membership.invalid",
+    "member Alpha"
+  );
+  const control = storePhysicalMessage(
+    first,
+    "control-search@membership.invalid",
+    "Unrelated"
+  );
+  const expected = [
+    [first.URI, a.messageKey, "shared-search@membership.invalid"],
+    [second.URI, b.messageKey, "shared-search@membership.invalid"],
+  ];
+  const saved = messageInjection.makeVirtualFolder([first, second], {
+    subject: "member",
+  });
+  const wrapper = make_view_wrapper();
+  registerCleanupFunction(() => {
+    wrapper.close();
+    saved.parent?.propagateDelete(saved, true);
+  });
+  await view_open(wrapper, saved);
+  wrapper.beginViewUpdate();
+  wrapper.showUnthreaded = true;
+  wrapper.sort("subjectCol", Ci.nsMsgViewSortOrder.ascending);
+  wrapper.listener.pendingLoad = true;
+  wrapper.endViewUpdate();
+  await gMockViewWrapperListener.promise;
+  gMockViewWrapperListener.resetPromise();
+  assertPhysicalView(wrapper, expected, excluded);
+  first.msgDatabase.clearCachedHdrs();
+  second.msgDatabase.clearCachedHdrs();
+  assertPhysicalView(wrapper, expected, excluded);
+  wrapper.sort("subjectCol", Ci.nsMsgViewSortOrder.descending);
+  assertPhysicalView(wrapper, expected.toReversed(), excluded);
+  const added = storePhysicalMessage(
+    second,
+    "arrival-search@membership.invalid",
+    "member Middle"
+  );
+  const addedIdentity = [
+    second.URI,
+    added.messageKey,
+    "arrival-search@membership.invalid",
+  ];
+  assertPhysicalView(
+    wrapper,
+    [expected[1], addedIdentity, expected[0]],
+    excluded
+  );
+  const { PromiseCopyListener } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
+  const deleted = new PromiseCopyListener();
+  first.deleteMessages([a], null, true, false, deleted, false);
+  await deleted.promise;
+  assertPhysicalView(wrapper, [expected[1], addedIdentity], excluded);
+  Assert.equal(wrapper.getViewIndexForMsgHdr(a, false), 0xffffffff);
+  Assert.deepEqual(
+    Array.from(first.messages, h => [h.messageKey, h.messageId]),
+    [[control.messageKey, "control-search@membership.invalid"]],
+    "The nonmatching source control survives"
+  );
+  wrapper.close();
+  await view_open(wrapper, saved);
+  assertPhysicalView(wrapper, [expected[1], addedIdentity], excluded);
+  Assert.deepEqual(
+    Array.from(outside.messages, h => [h.messageKey, h.messageId]),
+    [[excluded.messageKey, "shared-search@membership.invalid"]],
+    "The unsearched equal-ID copy survives arrival, deletion and reopen"
+  );
+  wrapper.close();
+});

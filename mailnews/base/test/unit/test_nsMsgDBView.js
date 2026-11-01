@@ -1272,3 +1272,160 @@ add_task(function test_teardown() {
   // Delete view reference to avoid a cycle leak.
   gFakeSelection.view = null;
 });
+
+add_task(async function test_physical_lookup_null_getter_errors_and_key_miss() {
+  const folder = await messageInjection.makeEmptyFolder();
+  const [set] = await messageInjection.makeNewSetsInFolders(
+    [folder],
+    [{ count: 2 }]
+  );
+  const headers = [...set.msgHdrs()];
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore,
+    Services.prefs.getBoolPref("mail.panorama.enabled", false),
+    "Lookup runs against the requested real database service"
+  );
+  Assert.equal(
+    folder.server.msgStore.storeType,
+    Services.prefs
+      .getCharPref("mail.serverDefaultStoreContractID")
+      .includes("maildirstore")
+      ? "maildir"
+      : "mbox"
+  );
+  for (const type of ["threaded", "search"]) {
+    const view = Cc[
+      "@mozilla.org/messenger/msgdbview;1?type=" + type
+    ].createInstance(Ci.nsIMsgDBView);
+    registerCleanupFunction(() => view.close());
+    view.init(null, null);
+    view.open(
+      type == "search" ? null : folder,
+      Ci.nsMsgViewSortType.byDate,
+      Ci.nsMsgViewSortOrder.ascending,
+      Ci.nsMsgViewFlagsType.kNone
+    );
+    if (type == "search") {
+      const notify = view.QueryInterface(Ci.nsIMsgSearchNotify);
+      notify.onNewSearch();
+      for (const header of headers) {
+        notify.onSearchHit(header, folder);
+      }
+      notify.onSearchDone(Cr.NS_OK);
+    }
+    Assert.throws(
+      () => view.findIndexOfMsgHdr(null, false),
+      e => e.result == Cr.NS_ERROR_INVALID_ARG,
+      "Public null input throws synchronously"
+    );
+    const key = headers[0].messageKey;
+    let folderCalls = 0;
+    const keyFailure = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]),
+      get messageKey() {
+        throw Components.Exception("key failure", Cr.NS_ERROR_FAILURE);
+      },
+      get folder() {
+        folderCalls++;
+        return folder;
+      },
+    };
+    Assert.equal(view.findIndexOfMsgHdr(keyFailure, false), 0xffffffff);
+    Assert.equal(
+      folderCalls,
+      0,
+      "A failed key getter stops before the folder getter"
+    );
+    const folderFailure = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]),
+      messageKey: key,
+      get folder() {
+        throw Components.Exception("folder failure", Cr.NS_ERROR_FAILURE);
+      },
+    };
+    Assert.equal(view.findIndexOfMsgHdr(folderFailure, false), 0xffffffff);
+    Assert.equal(
+      view.findIndexOfMsgHdr(
+        {
+          QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]),
+          messageKey: key,
+          folder: null,
+        },
+        false
+      ),
+      0xffffffff
+    );
+    let absentKey = 0;
+    while (headers.some(h => h.messageKey == absentKey)) {
+      absentKey++;
+    }
+    const missing = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]),
+      messageKey: absentKey,
+      get folder() {
+        folderCalls++;
+        return folder;
+      },
+    };
+    Assert.equal(view.findIndexOfMsgHdr(missing, false), 0xffffffff);
+    Assert.equal(
+      folderCalls,
+      type == "threaded" ? 0 : 1,
+      "Base key misses stop before folder lookup; search validates both getters"
+    );
+    for (const header of headers) {
+      const fresh = folder.msgDatabase.getMsgHdrForKey(header.messageKey);
+      const index = view.findIndexOfMsgHdr(fresh, false);
+      Assert.notEqual(index, 0xffffffff);
+      Assert.deepEqual(
+        physicalIdentity(view.getMsgHdrAt(index)),
+        physicalIdentity(header)
+      );
+    }
+    view.close();
+  }
+  for (const [type, flags] of [
+    [
+      "threaded",
+      Ci.nsMsgViewFlagsType.kThreadedDisplay | Ci.nsMsgViewFlagsType.kExpandAll,
+    ],
+    [
+      "group",
+      Ci.nsMsgViewFlagsType.kGroupBySort |
+        Ci.nsMsgViewFlagsType.kThreadedDisplay |
+        Ci.nsMsgViewFlagsType.kExpandAll,
+    ],
+  ]) {
+    const view = Cc[
+      "@mozilla.org/messenger/msgdbview;1?type=" + type
+    ].createInstance(Ci.nsIMsgDBView);
+    registerCleanupFunction(() => view.close());
+    view.init(null, null);
+    view.open(
+      folder,
+      Ci.nsMsgViewSortType.byDate,
+      Ci.nsMsgViewSortOrder.ascending,
+      flags
+    );
+    for (const header of headers) {
+      const index = view.findIndexOfMsgHdr(
+        folder.msgDatabase.getMsgHdrForKey(header.messageKey),
+        true
+      );
+      Assert.notEqual(index, 0xffffffff);
+      Assert.equal(
+        view.getFlagsAt(index) & MSG_VIEW_FLAG_DUMMY,
+        0,
+        "Public lookup returns the physical row, not a group dummy"
+      );
+      Assert.deepEqual(
+        physicalIdentity(view.getMsgHdrAt(index)),
+        physicalIdentity(header)
+      );
+    }
+    view.close();
+  }
+});

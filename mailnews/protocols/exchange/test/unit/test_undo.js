@@ -452,6 +452,21 @@ async function createUndoFixture(type, name, isMove) {
       : Ci.nsIMsgTransactionService.eCopyMsg
   );
   Assert.equal(fixture.publications, 1, "The initial operation publishes once");
+  // Retention starts with the actual acknowledged destination state. Legacy
+  // Mork copy caches do not carry Marked; that reference behavior is separate
+  // from the native preservation requirement and from undo/redo retention.
+  fixture.retainedFlags = fixture.latestHeaders.map(header => {
+    Assert.ok(header.isRead, "The acknowledged copy retains Read");
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      Assert.ok(
+        header.isRead && header.isFlagged,
+        "Native copies preserve the configured Read and Marked input"
+      );
+    }
+    return (
+      header.flags & (Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked)
+    );
+  });
   fixture.transaction = transaction;
   return fixture;
 }
@@ -483,7 +498,11 @@ async function checkTransactionMessages(fixture, folder) {
     const header = headers[i];
     Assert.equal(header.folder.URI, folder.URI);
     Assert.ok(folder.msgDatabase.containsKey(header.messageKey));
-    Assert.ok(header.isRead && header.isFlagged);
+    Assert.equal(
+      header.flags & (Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked),
+      fixture.retainedFlags[i],
+      "Undo/redo retains the acknowledged Read and Marked state"
+    );
     Assert.equal(header.getStringProperty("keywords"), "$label2 transaction");
     Assert.deepEqual(
       Array.from({ length: header.numReferences }, (_, j) =>

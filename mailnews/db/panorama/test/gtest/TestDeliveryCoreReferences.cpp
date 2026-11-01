@@ -10224,7 +10224,6 @@ TEST_F(DeliveryCoreReferences, WeakFolderListenerDoesNotOwnUnusedFacade) {
 
 TEST_F(DeliveryCoreReferences, WeakFolderListenerKeepsExternalNewListsScoped) {
   ASSERT_EQ(NS_OK, Start());
-  auto& db = mCore->MessageDB();
   RefPtr<PerFolderDatabase> facade = WeakFolderDatabase(mFolderId);
   uint64_t otherFolder;
   ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, "Bystander"_ns,
@@ -10421,7 +10420,8 @@ TEST_F(DeliveryCoreReferences, MarkAllReadWriteFailureKeepsSqlCacheAndOutput) {
   ASSERT_EQ(NS_OK, db.AddMessage(other, raw, true, &foreign));
   uint32_t flags;
   ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
-  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New, flags);
+  EXPECT_EQ(uint32_t{nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New},
+            flags);
   ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
   EXPECT_EQ(0u, flags);
 
@@ -10448,7 +10448,8 @@ TEST_F(DeliveryCoreReferences, MarkAllReadWriteFailureKeepsSqlCacheAndOutput) {
   ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
   EXPECT_FALSE(active);
   ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
-  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New, flags);
+  EXPECT_EQ(uint32_t{nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New},
+            flags);
   ASSERT_EQ(NS_OK, db.GetMessageFlags(second, flags));
   EXPECT_EQ(0u, flags);
   uint64_t unread;
@@ -10460,11 +10461,12 @@ TEST_F(DeliveryCoreReferences, MarkAllReadWriteFailureKeepsSqlCacheAndOutput) {
   ASSERT_EQ(NS_OK, MarkFolderRead(mFolderId, marked));
   EXPECT_EQ((nsTArray<nsMsgKey>{first, second}), marked);
   ASSERT_EQ(NS_OK, db.GetMessageFlags(first, flags));
-  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New |
-                nsMsgMessageFlags::Read,
+  EXPECT_EQ(uint32_t{nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New |
+                     nsMsgMessageFlags::Read},
             flags);
   ASSERT_EQ(NS_OK, db.GetMessageFlags(read, flags));
-  EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked, flags);
+  EXPECT_EQ(uint32_t{nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked},
+            flags);
   ASSERT_EQ(NS_OK, db.GetMessageFlags(foreign, flags));
   EXPECT_EQ(0u, flags);
   ASSERT_EQ(NS_OK, FolderUnreadCount(mFolderId, unread));
@@ -10478,8 +10480,8 @@ TEST_F(DeliveryCoreReferences, MarkAllReadWriteFailureKeepsSqlCacheAndOutput) {
   Stop();
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(first, flags));
-  EXPECT_EQ(nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New |
-                nsMsgMessageFlags::Read,
+  EXPECT_EQ(uint32_t{nsMsgMessageFlags::Forwarded | nsMsgMessageFlags::New |
+                     nsMsgMessageFlags::Read},
             flags);
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageFlags(foreign, flags));
   EXPECT_EQ(0u, flags);
@@ -12788,7 +12790,7 @@ TEST_F(DeliveryCoreReferences, ImapFolderRelocationSettlesCompleteMetadata) {
   auto childFlags = mCore->FolderDB().GetFolderFlags(child);
   ASSERT_TRUE(rootFlags.isOk());
   ASSERT_TRUE(childFlags.isOk());
-  EXPECT_EQ(nsMsgFolderFlags::Offline, rootFlags.unwrap());
+  EXPECT_EQ(uint32_t{nsMsgFolderFlags::Offline}, rootFlags.unwrap());
   EXPECT_EQ(flags, childFlags.unwrap());
   nsMsgKey resolved = nsMsgKey_None;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(leaf, 57, 91,

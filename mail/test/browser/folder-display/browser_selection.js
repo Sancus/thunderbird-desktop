@@ -21,12 +21,12 @@ var {
   press_delete,
   right_click_on_row,
   select_click_row,
-  select_column_click_row,
   select_control_click_row,
   select_none,
   select_shift_click_row,
   switch_tab,
   wait_for_blank_content_pane,
+  wait_for_message_display_completion,
 } = ChromeUtils.importESModule(
   "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
 );
@@ -43,6 +43,52 @@ add_setup(async function () {
   folder2 = await create_folder("SelectionB");
   await make_message_sets_in_folders([folder, folder2], [{ count: 50 }]);
 });
+
+/**
+ * Toggle the retained table view's selection column through its column picker.
+ */
+async function toggleSelectionColumn() {
+  const about3Pane = get_about_3pane();
+  const picker = about3Pane.document.querySelector(
+    "#threadTree .last-column .button-column-picker"
+  );
+  const popup = about3Pane.document.querySelector(
+    "#threadTree .menupopup-column-picker"
+  );
+  const shown = BrowserTestUtils.waitForPopupEvent(popup, "shown");
+  EventUtils.synthesizeMouseAtCenter(picker, {}, about3Pane);
+  await shown;
+  const changed = BrowserTestUtils.waitForEvent(
+    about3Pane.document,
+    "columns-changed"
+  );
+  popup.activateItem(popup.querySelector('[value="selectCol"]'));
+  await changed;
+  const hidden = BrowserTestUtils.waitForPopupEvent(popup, "hidden");
+  EventUtils.synthesizeKey("KEY_Escape", {}, about3Pane);
+  await hidden;
+  await new Promise(about3Pane.requestAnimationFrame);
+}
+
+/**
+ * Click a physical row's selection checkbox in the current table view.
+ *
+ * @param {number} index - The current DB-view row index.
+ */
+async function clickSelectionColumn(index) {
+  const about3Pane = get_about_3pane();
+  const tree = about3Pane.threadTree;
+  tree.scrollToIndex(index, true);
+  await TestUtils.waitForCondition(() => tree.getRowAtIndex(index));
+  const checkbox = tree
+    .getRowAtIndex(index)
+    .querySelector(".tree-view-row-select-checkbox");
+  Assert.ok(checkbox, "The physical row exposes its selection checkbox");
+  const selected = BrowserTestUtils.waitForEvent(tree, "select");
+  EventUtils.synthesizeMouseAtCenter(checkbox, {}, about3Pane);
+  await selected;
+  await wait_for_message_display_completion();
+}
 
 // https://bugzilla.mozilla.org/show_bug.cgi?id=474701#c80
 add_task(async function test_selection_on_entry() {
@@ -71,36 +117,40 @@ add_task(async function test_selection_extension() {
 
 add_task(async function test_selection_select_column() {
   await be_in_folder(folder);
-  document.getElementById("selectCol").removeAttribute("hidden");
+  await SpecialPowers.pushPrefEnv({
+    set: [["mail.threadpane.listview", 1]],
+  });
+  await toggleSelectionColumn();
   await select_none();
-  await select_column_click_row(0);
+  await clickSelectionColumn(0);
   await assert_selected_and_displayed(0);
-  await select_column_click_row(0);
+  await clickSelectionColumn(0);
   await assert_nothing_selected();
-  await select_column_click_row(2);
-  await select_column_click_row(3);
-  await select_column_click_row(4);
+  await clickSelectionColumn(2);
+  await clickSelectionColumn(3);
+  await clickSelectionColumn(4);
   // This only takes a range.
   await assert_selected_and_displayed([2, 4]); // ensures multi-message summary
-  await select_column_click_row(2);
+  await clickSelectionColumn(2);
   await assert_selected_and_displayed([3, 4]); // ensures multi-message summary
-  await select_column_click_row(3);
+  await clickSelectionColumn(3);
   await assert_selected_and_displayed(4);
-  await select_column_click_row(4);
+  await clickSelectionColumn(4);
   await assert_nothing_selected();
-}).skip();
+});
 
 add_task(async function test_selection_select_column_deselection() {
   await be_in_folder(folder);
   await select_none();
-  await select_column_click_row(3);
-  await select_column_click_row(3);
+  await clickSelectionColumn(3);
+  await clickSelectionColumn(3);
   await assert_nothing_selected();
   await right_click_on_row(7);
   await delete_via_popup();
   await assert_nothing_selected();
-  document.getElementById("selectCol").toggleAttribute("hidden", true);
-}).skip();
+  await toggleSelectionColumn();
+  await SpecialPowers.popPrefEnv();
+});
 
 add_task(async function test_selection_last_message_deleted() {
   await be_in_folder(folder);

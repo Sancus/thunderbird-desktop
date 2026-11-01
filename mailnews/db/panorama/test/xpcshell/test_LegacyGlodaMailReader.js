@@ -6,6 +6,8 @@
 
 /* import-globals-from head.js */
 
+Services.prefs.setBoolPref("security.nocertdb", true);
+
 const { AppConstants } = ChromeUtils.importESModule(
   "resource://gre/modules/AppConstants.sys.mjs"
 );
@@ -119,6 +121,580 @@ function committedBindings() {
     };
   });
 }
+
+// Back up the real selected profile before the format-only cases use storage.
+let nativeRecovery;
+
+add_task(async function test_recoversBackedUpTextWithActualNativeReceipts() {
+  const { ProfileCreator } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/ProfileCreator.sys.mjs"
+  );
+  const { MigrationJournal } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationJournal.sys.mjs"
+  );
+  const { createMigrationBackup } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationBackup.sys.mjs"
+  );
+  const { readMorkFolderImport, captureMorkFolderWindowsInventory } =
+    ChromeUtils.importESModule(
+      "resource:///modules/panorama/MorkFolderImport.sys.mjs"
+    );
+  const {
+    createPanoramaMigrationTarget,
+    createWindowsPanoramaMigrationTarget,
+    resumeMorkImports,
+    readLegacyGlodaMailRecovery,
+  } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+  );
+  const profile = do_get_profile();
+  const provider = Cc["@mozilla.org/xre/directory-provider;1"]
+    .getService(Ci.nsIDirectoryServiceProvider)
+    .QueryInterface(Ci.nsIXREDirProvider);
+  for (const key of ["DefProfRt", "DefProfLRt", "UAppData"]) {
+    const file = provider.getFile(key, {}).clone();
+    if (Services.dirsvc.has(key)) {
+      Services.dirsvc.undefine(key);
+    }
+    Services.dirsvc.set(key, file);
+  }
+  const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
+    Ci.nsIToolkitProfileService
+  );
+  const nativeProfile = service.createProfile(
+    profile,
+    "legacy-mail-recovery",
+    "tests"
+  );
+  let lock = nativeProfile.lock({});
+  registerCleanupFunction(() => {
+    lock.unlock();
+    nativeProfile.remove(false);
+  });
+  const work = await IOUtils.createUniqueDirectory(
+    PathUtils.parent(profile.path),
+    "legacy-mail-recovery-"
+  );
+  registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
+  const summaryBytes = await IOUtils.read(
+    do_get_file("data/migration.msf").path
+  );
+  const bodyBytes = await IOUtils.read(do_get_file("data/migration").path);
+  const summary = new FileUtils.File(PathUtils.join(work, "source.msf"));
+  const body = new FileUtils.File(PathUtils.join(work, "source"));
+  await IOUtils.write(summary.path, summaryBytes, { mode: "create" });
+  await IOUtils.write(body.path, bodyBytes, { mode: "create" });
+  const names = ["RecoveredInbox", "RecoveredCopy"];
+  // Literal unit-data locations for ProfileCreator's nobody/Local Folders server.
+  // The native URI assertions below must hold before any mapping is used.
+  const uris = [
+    "mailbox://nobody@Local%20Folders/RecoveredInbox",
+    "mailbox://nobody@Local%20Folders/RecoveredCopy",
+  ];
+  const windows = AppConstants.platform == "win";
+  const inventories = new Map();
+  const creator = new ProfileCreator(profile);
+  const server = creator.addLocalServer();
+  for (const name of names) {
+    const original = await server.rootFolder.addMailFolder(name, {
+      summary,
+      mbox: body,
+    });
+    if (windows) {
+      inventories.set(
+        name,
+        captureMorkFolderWindowsInventory(
+          new FileUtils.File(original.summaryFilePath),
+          profile,
+          new FileUtils.File(original.mailFilePath),
+          profile
+        )
+      );
+    }
+  }
+  const glodaPath = createMailInput(
+    "native-recovery",
+    `
+      UPDATE folderLocations SET folderURI='${uris[0]}' WHERE id=7;
+      UPDATE folderLocations SET folderURI='${uris[1]}' WHERE id=8;
+      UPDATE messages SET messageKey=1,headerMessageID='162378@invalid' WHERE id IN (32,33);
+    `
+  );
+  const glodaBytes = await IOUtils.read(glodaPath);
+  Assert.ok(
+    !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite")))
+  );
+  const backup = await createMigrationBackup(
+    profile.path,
+    [],
+    PathUtils.join(work, "backup")
+  );
+  loadExistingDB();
+  Assert.equal(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
+    ),
+    database
+  );
+  const folders = new Map();
+  const sources = [];
+  const originals = new Map([[glodaPath, glodaBytes]]);
+  Assert.equal(MailServices.accounts.accounts.length, 1);
+  const root = MailServices.accounts.localFoldersServer.rootFolder;
+  for (const [index, name] of names.entries()) {
+    const folder = root.getChildNamed(name);
+    Assert.ok(folder instanceof Ci.nsIMsgFolder);
+    Assert.equal(folder.URI, uris[index]);
+    Assert.equal(folder.msgStore.storeType, "mbox");
+    const inventory = inventories.get(name);
+    const input = await readMorkFolderImport(
+      folder,
+      "planning-only",
+      inventory
+    );
+    Assert.deepEqual(input.source.messageKeys.toSorted(), [1, 3]);
+    folders.set(name, folder);
+    sources.push({
+      id: name,
+      databaseSourceId: database.sourceId,
+      ...input.source,
+      ...(windows ? { inventory } : {}),
+      destinationFolderId: folder.id,
+    });
+    originals.set(
+      folder.summaryFile.path,
+      await IOUtils.read(folder.summaryFile.path)
+    );
+    originals.set(
+      folder.filePath.path,
+      await IOUtils.read(folder.filePath.path)
+    );
+  }
+  const journalPath = PathUtils.join(work, "journal.json");
+  const journal = await MigrationJournal.create(journalPath, {
+    profilePath: lock.directory.path,
+    mailPaths: [],
+    backupPath: PathUtils.parent(backup.path),
+    sources,
+  });
+  registerCleanupFunction(() => journal.close());
+  await journal.recordBackup(backup);
+  const resolve = id => folders.get(id);
+  await resumeMorkImports(
+    journal,
+    (windows
+      ? createWindowsPanoramaMigrationTarget
+      : createPanoramaMigrationTarget)(journal, database, resolve, lock)
+  );
+  Assert.equal(journal.state.version, windows ? 4 : 1);
+  if (windows) {
+    Assert.equal((await IOUtils.readJSON(backup.path)).version, 3);
+  }
+  const recorded = await IOUtils.read(journalPath);
+  const state = journal.state;
+  const changes = () => {
+    const stmt = database.connectionForTests.createStatement(
+      "SELECT total_changes() AS count"
+    );
+    try {
+      Assert.ok(stmt.executeStep());
+      return stmt.row.count;
+    } finally {
+      stmt.finalize();
+    }
+  };
+  const writes = changes();
+  const backedUp = PathUtils.join(
+    PathUtils.parent(backup.path),
+    "root-0",
+    PathUtils.filename(glodaPath)
+  );
+  const result = await readLegacyGlodaMailRecovery(
+    journal,
+    database,
+    resolve,
+    lock,
+    backedUp
+  );
+  Assert.equal(
+    changes(),
+    writes,
+    "Recovery does not write the native database"
+  );
+  Assert.deepEqual(result.backup, backup);
+  const originalDatabase = new FileUtils.File(glodaPath);
+  originalDatabase.normalize();
+  Assert.equal(result.originalDatabasePath, originalDatabase.path);
+  Assert.deepEqual(
+    result.mapped.map(row => row.sourceId),
+    [database.sourceId, database.sourceId]
+  );
+  const expected = state.sources.map(source => [
+    source.destinationFolderId,
+    new Map(source.receipt.keys).get(1),
+  ]);
+  Assert.deepEqual(
+    result.mapped.map(row => [row.folderId, row.key]),
+    expected
+  );
+  Assert.notEqual(
+    result.mapped[0].key,
+    result.mapped[1].key,
+    "Physical copies remain separate despite equal Message-IDs"
+  );
+  Assert.deepEqual(
+    result.mapped.map(row => row.message.headerMessageId),
+    ["162378@invalid", "162378@invalid"]
+  );
+  Assert.equal(
+    result.mapped[0].message.text.body,
+    "\uFEFFrecovered é 😀 body\0tail"
+  );
+  Assert.equal(result.mapped[1].message.text.body, null);
+  Assert.equal(result.mapped[1].message.text.subject, "");
+  Assert.deepEqual(
+    result.snapshot.attributeDefinitions.map(row => row.name.value),
+    ["é", "é"]
+  );
+  Assert.deepEqual(
+    result.excluded.map(row => row.reason),
+    ["ghost", "deleted"]
+  );
+  for (const [index, row] of result.mapped.entries()) {
+    Assert.equal(
+      row.provenance.importReceipt.sourceId,
+      state.sources[index].id
+    );
+    Assert.equal(
+      row.provenance.importReceipt.databaseSourceId,
+      database.sourceId
+    );
+    Assert.deepEqual(
+      row.provenance.importReceipt.keys,
+      state.sources[index].receipt.keys
+    );
+    Assert.deepEqual(row.provenance.backup, backup);
+    Assert.ok(
+      !Object.hasOwn(row, "eligible"),
+      "Recovery never invents search eligibility"
+    );
+  }
+  const repeated = await readLegacyGlodaMailRecovery(
+    journal,
+    database,
+    resolve,
+    lock,
+    backedUp
+  );
+  Assert.deepEqual(repeated, result);
+  Assert.equal(changes(), writes);
+  await Assert.rejects(
+    readLegacyGlodaMailRecovery(journal, database, resolve, lock, glodaPath),
+    windows
+      ? error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED
+      : /outside backed-up roots/
+  );
+  const other = service.createProfile(
+    new FileUtils.File(PathUtils.join(work, "other-profile")),
+    "legacy-mail-other",
+    "tests"
+  );
+  const otherLock = other.lock({});
+  try {
+    await Assert.rejects(
+      readLegacyGlodaMailRecovery(
+        journal,
+        database,
+        resolve,
+        otherLock,
+        backedUp
+      ),
+      /held selected profile/
+    );
+  } finally {
+    otherLock.unlock();
+    other.remove(false);
+  }
+  if (!windows) {
+    const manifestBytes = await IOUtils.read(backup.path);
+    let changedManifest = false;
+    const changeAfterVerifiedRead = async id => {
+      if (!changedManifest) {
+        const changed = new Uint8Array(manifestBytes.length + 1);
+        changed.set(manifestBytes);
+        changed[manifestBytes.length] = 10;
+        await IOUtils.write(backup.path, changed);
+        changedManifest = true;
+      }
+      return resolve(id);
+    };
+    try {
+      await Assert.rejects(
+        readLegacyGlodaMailRecovery(
+          journal,
+          database,
+          changeAfterVerifiedRead,
+          lock,
+          backedUp
+        ),
+        /backup identity changed/
+      );
+      Assert.ok(
+        changedManifest,
+        "The manifest changed after its verified read, at native folder resolution"
+      );
+      Assert.equal(changes(), writes);
+      Assert.deepEqual(await IOUtils.read(journalPath), recorded);
+    } finally {
+      await IOUtils.write(backup.path, manifestBytes);
+    }
+    Assert.deepEqual(
+      await readLegacyGlodaMailRecovery(
+        journal,
+        database,
+        resolve,
+        lock,
+        backedUp
+      ),
+      result,
+      "The original verified backup remains usable after exact restoration"
+    );
+  }
+  Assert.deepEqual(await IOUtils.read(journalPath), recorded);
+  Assert.deepEqual(journal.state, state);
+  for (const [path, bytes] of originals) {
+    Assert.deepEqual(await IOUtils.read(path), bytes);
+  }
+  Assert.deepEqual(await IOUtils.read(backedUp), glodaBytes);
+  nativeRecovery = {
+    journal,
+    lock,
+    backup,
+    work,
+    state,
+    recorded,
+    journalPath,
+    originals,
+    result,
+    changes,
+    writes,
+    backedUp,
+    glodaPath,
+    resolve,
+    unlock: () => lock.unlock(),
+    relock: () => {
+      lock = nativeProfile.lock({});
+    },
+    read: callback =>
+      readLegacyGlodaMailRecovery(
+        journal,
+        database,
+        callback ?? resolve,
+        lock,
+        backedUp
+      ),
+  };
+});
+
+add_task(
+  async function test_recoveryRejectsJournalChangeDuringFolderResolution() {
+    const c = nativeRecovery;
+    let changed = false;
+    try {
+      await Assert.rejects(
+        c.read(async id => {
+          await c.journal.setCancelled(true);
+          changed = true;
+          return c.resolve(id);
+        }),
+        error =>
+          error.message === "Gloda recovery journal/database identity changed"
+      );
+      Assert.ok(changed);
+      Assert.equal(c.changes(), c.writes);
+    } finally {
+      if (changed) {
+        // This is a new genuine checkpoint, not a rollback of journal bytes/revision.
+        await c.journal.setCancelled(false);
+        c.state = c.journal.state;
+        c.recorded = await IOUtils.read(c.journalPath);
+      }
+    }
+    Assert.deepEqual(await c.read(), c.result);
+  }
+);
+
+add_task(async function test_recoveryRejectsReleasedSelectedLock() {
+  const c = nativeRecovery;
+  let calls = 0;
+  try {
+    await Assert.rejects(
+      c.read(id => {
+        c.unlock();
+        calls++;
+        return c.resolve(id);
+      }),
+      error => error.result == Cr.NS_ERROR_NOT_INITIALIZED
+    );
+    Assert.equal(calls, 1);
+    Assert.equal(c.changes(), c.writes);
+    Assert.deepEqual(await IOUtils.read(c.journalPath), c.recorded);
+  } finally {
+    if (calls) {
+      c.relock();
+    }
+  }
+  Assert.deepEqual(await c.read(), c.result);
+});
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_windowsRecoveryRejectsChangedBackupBeforeRetry() {
+    const c = nativeRecovery;
+    const bytes = await IOUtils.read(c.backup.path);
+    const changed = new Uint8Array(bytes.length + 1);
+    changed.set(bytes);
+    changed[bytes.length] = 10;
+    await IOUtils.write(c.backup.path, changed);
+    try {
+      await Assert.rejects(
+        c.read(),
+        error => error.message === "Gloda recovery backup identity changed"
+      );
+      Assert.equal(c.changes(), c.writes);
+      Assert.deepEqual(await IOUtils.read(c.journalPath), c.recorded);
+    } finally {
+      await IOUtils.write(c.backup.path, bytes);
+    }
+    Assert.deepEqual(await c.read(), c.result);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_windowsRecoveryRejectsChangedSourcePhysicalIdentity() {
+    const c = nativeRecovery;
+    const source = c.state.sources[0];
+    const retained = PathUtils.join(c.work, "original-summary.msf");
+    // Retain the original file/ID. Only the disposable identical copy replaces it.
+    await IOUtils.move(source.path, retained, { noOverwrite: true });
+    try {
+      await IOUtils.copy(retained, source.path, { noOverwrite: true });
+      Assert.deepEqual(
+        await IOUtils.read(source.path),
+        c.originals.get(source.path)
+      );
+      await Assert.rejects(
+        c.read(),
+        error =>
+          error.message ===
+          "Retained Windows migration physical identity changed"
+      );
+      Assert.equal(c.changes(), c.writes);
+      Assert.deepEqual(await IOUtils.read(c.journalPath), c.recorded);
+    } finally {
+      await IOUtils.move(retained, source.path, { noOverwrite: false });
+    }
+    Assert.deepEqual(await c.read(), c.result);
+  }
+);
+
+add_task(
+  { skip_if: () => AppConstants.platform != "win" },
+  async function test_windowsRecoveryRetainsAdmissionThroughResolverFailure() {
+    const c = nativeRecovery;
+    const protectedPaths = [
+      c.backup.path,
+      c.backedUp,
+      ...c.originals.keys(),
+    ].filter(path => path !== c.glodaPath);
+    let firstError;
+    let calls = 0;
+    const fail = async () => {
+      calls++;
+      for (const path of protectedPaths) {
+        Assert.throws(
+          () =>
+            new FileUtils.File(path).moveTo(
+              null,
+              PathUtils.filename(path) + ".blocked"
+            ),
+          error => {
+            firstError ??= error;
+            return error.result == Cr.NS_ERROR_FILE_IS_LOCKED;
+          }
+        );
+        Assert.ok(await IOUtils.exists(path));
+        Assert.ok(!(await IOUtils.exists(path + ".blocked")));
+      }
+      throw firstError;
+    };
+    await Assert.rejects(c.read(fail), error => error === firstError);
+    Assert.equal(calls, 1);
+    Assert.ok(firstError);
+    Assert.equal(c.changes(), c.writes);
+    Assert.deepEqual(await IOUtils.read(c.journalPath), c.recorded);
+    // The failed operation has finished. Renames now prove owned leases closed.
+    for (const path of protectedPaths) {
+      const moved = path + ".closed";
+      await IOUtils.move(path, moved, { noOverwrite: true });
+      await IOUtils.move(moved, path, { noOverwrite: true });
+    }
+    Assert.deepEqual(await c.read(), c.result);
+    Assert.deepEqual(c.journal.state, c.state);
+  }
+);
+
+add_task(async function test_recoveryDoesNotReimportMissingCommittedReceipt() {
+  const { state, changes, writes, recorded, journalPath, originals } =
+    nativeRecovery;
+  Assert.equal(changes(), writes);
+  // Delete only this receipt/map. Retain the native completion marker so the
+  // actual getter must reject the inconsistent committed import, never retry it.
+  const removeKeys = database.connectionForTests.createStatement(
+    "DELETE FROM folder_import_keys WHERE token=:token"
+  );
+  try {
+    removeKeys.params.token = state.sources[0].token;
+    removeKeys.execute();
+  } finally {
+    removeKeys.finalize();
+  }
+  Assert.equal(
+    database.connectionForTests.affectedRows,
+    state.sources[0].receipt.keys.length,
+    "The fault removes only the selected source's complete native key map"
+  );
+  const remove = database.connectionForTests.createStatement(
+    "DELETE FROM folder_import_receipts WHERE token=:token"
+  );
+  try {
+    remove.params.token = state.sources[0].token;
+    remove.execute();
+  } finally {
+    remove.finalize();
+  }
+  Assert.equal(
+    database.connectionForTests.affectedRows,
+    1,
+    "The scoped native receipt-loss fault reached its real row"
+  );
+  const afterFault = changes();
+  await Assert.rejects(
+    nativeRecovery.read(),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "The native getter refuses the retained completion marker without its receipt"
+  );
+  Assert.equal(
+    changes(),
+    afterFault,
+    "A missing receipt never reimports messages"
+  );
+  Assert.deepEqual(await IOUtils.read(journalPath), recorded);
+  for (const [path, bytes] of originals) {
+    Assert.deepEqual(await IOUtils.read(path), bytes);
+  }
+});
 
 add_task(async function test_readsStoredTextAndExactUnknownAttributes() {
   const path = createMailInput("text");
@@ -568,363 +1144,3 @@ add_task(async function test_rejectsCoercedReceiptFolderIdentity() {
     /Invalid.*binding/
   );
 });
-
-add_task(
-  { skip_if: () => AppConstants.platform == "win" },
-  async function test_recoversBackedUpTextWithActualNativeReceipts() {
-    const { ProfileCreator } = ChromeUtils.importESModule(
-      "resource://testing-common/mailnews/ProfileCreator.sys.mjs"
-    );
-    const { MigrationJournal } = ChromeUtils.importESModule(
-      "resource:///modules/panorama/MigrationJournal.sys.mjs"
-    );
-    const { createMigrationBackup } = ChromeUtils.importESModule(
-      "resource:///modules/panorama/MigrationBackup.sys.mjs"
-    );
-    const { readMorkFolderImport } = ChromeUtils.importESModule(
-      "resource:///modules/panorama/MorkFolderImport.sys.mjs"
-    );
-    const {
-      createPanoramaMigrationTarget,
-      resumeMorkImports,
-      readLegacyGlodaMailRecovery,
-    } = ChromeUtils.importESModule(
-      "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
-    );
-    Services.prefs.setBoolPref("security.nocertdb", true);
-    const profile = do_get_profile();
-    const provider = Cc["@mozilla.org/xre/directory-provider;1"]
-      .getService(Ci.nsIDirectoryServiceProvider)
-      .QueryInterface(Ci.nsIXREDirProvider);
-    for (const key of ["DefProfRt", "DefProfLRt", "UAppData"]) {
-      const file = provider.getFile(key, {}).clone();
-      if (Services.dirsvc.has(key)) {
-        Services.dirsvc.undefine(key);
-      }
-      Services.dirsvc.set(key, file);
-    }
-    const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
-      Ci.nsIToolkitProfileService
-    );
-    const nativeProfile = service.createProfile(
-      profile,
-      "legacy-mail-recovery",
-      "tests"
-    );
-    const lock = nativeProfile.lock({});
-    registerCleanupFunction(() => {
-      lock.unlock();
-      nativeProfile.remove(false);
-    });
-    const work = await IOUtils.createUniqueDirectory(
-      PathUtils.parent(profile.path),
-      "legacy-mail-recovery-"
-    );
-    registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
-    const summaryBytes = await IOUtils.read(
-      do_get_file("data/migration.msf").path
-    );
-    const bodyBytes = await IOUtils.read(do_get_file("data/migration").path);
-    const summary = new FileUtils.File(PathUtils.join(work, "source.msf"));
-    const body = new FileUtils.File(PathUtils.join(work, "source"));
-    await IOUtils.write(summary.path, summaryBytes, { mode: "create" });
-    await IOUtils.write(body.path, bodyBytes, { mode: "create" });
-    const names = ["RecoveredInbox", "RecoveredCopy"];
-    // Literal unit-data locations for ProfileCreator's nobody/Local Folders server.
-    // The native URI assertions below must hold before any mapping is used.
-    const uris = [
-      "mailbox://nobody@Local%20Folders/RecoveredInbox",
-      "mailbox://nobody@Local%20Folders/RecoveredCopy",
-    ];
-    const creator = new ProfileCreator(profile);
-    const server = creator.addLocalServer();
-    for (const name of names) {
-      await server.rootFolder.addMailFolder(name, { summary, mbox: body });
-    }
-    const glodaPath = createMailInput(
-      "native-recovery",
-      `
-      UPDATE folderLocations SET folderURI='${uris[0]}' WHERE id=7;
-      UPDATE folderLocations SET folderURI='${uris[1]}' WHERE id=8;
-      UPDATE messages SET messageKey=1,headerMessageID='162378@invalid' WHERE id IN (32,33);
-    `
-    );
-    const glodaBytes = await IOUtils.read(glodaPath);
-    Assert.ok(
-      !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite")))
-    );
-    const backup = await createMigrationBackup(
-      profile.path,
-      [],
-      PathUtils.join(work, "backup")
-    );
-    loadExistingDB();
-    Assert.equal(
-      Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
-        Ci.nsIDatabaseCore
-      ),
-      database
-    );
-    const folders = new Map();
-    const sources = [];
-    const originals = new Map([[glodaPath, glodaBytes]]);
-    Assert.equal(MailServices.accounts.accounts.length, 1);
-    const root = MailServices.accounts.localFoldersServer.rootFolder;
-    for (const [index, name] of names.entries()) {
-      const folder = root.getChildNamed(name);
-      Assert.ok(folder instanceof Ci.nsIMsgFolder);
-      Assert.equal(folder.URI, uris[index]);
-      const input = await readMorkFolderImport(folder, "planning-only");
-      Assert.deepEqual(input.source.messageKeys.toSorted(), [1, 3]);
-      folders.set(name, folder);
-      sources.push({
-        id: name,
-        databaseSourceId: database.sourceId,
-        path: input.source.path,
-        sha256: input.source.sha256,
-        size: input.source.size,
-        messageKeys: input.source.messageKeys,
-        destinationFolderId: folder.id,
-      });
-      originals.set(
-        folder.summaryFile.path,
-        await IOUtils.read(folder.summaryFile.path)
-      );
-      originals.set(
-        folder.filePath.path,
-        await IOUtils.read(folder.filePath.path)
-      );
-    }
-    const journalPath = PathUtils.join(work, "journal.json");
-    const journal = await MigrationJournal.create(journalPath, {
-      profilePath: lock.directory.path,
-      mailPaths: [],
-      backupPath: PathUtils.parent(backup.path),
-      sources,
-    });
-    registerCleanupFunction(() => journal.close());
-    await journal.recordBackup(backup);
-    const resolve = id => folders.get(id);
-    await resumeMorkImports(
-      journal,
-      createPanoramaMigrationTarget(journal, database, resolve, lock)
-    );
-    const recorded = await IOUtils.read(journalPath);
-    const state = journal.state;
-    const changes = () => {
-      const stmt = database.connectionForTests.createStatement(
-        "SELECT total_changes() AS count"
-      );
-      try {
-        Assert.ok(stmt.executeStep());
-        return stmt.row.count;
-      } finally {
-        stmt.finalize();
-      }
-    };
-    const writes = changes();
-    const backedUp = PathUtils.join(
-      PathUtils.parent(backup.path),
-      "root-0",
-      PathUtils.filename(glodaPath)
-    );
-    const result = await readLegacyGlodaMailRecovery(
-      journal,
-      database,
-      resolve,
-      lock,
-      backedUp
-    );
-    Assert.equal(
-      changes(),
-      writes,
-      "Recovery does not write the native database"
-    );
-    Assert.deepEqual(result.backup, backup);
-    const originalDatabase = new FileUtils.File(glodaPath);
-    originalDatabase.normalize();
-    Assert.equal(result.originalDatabasePath, originalDatabase.path);
-    Assert.deepEqual(
-      result.mapped.map(row => row.sourceId),
-      [database.sourceId, database.sourceId]
-    );
-    const expected = state.sources.map(source => [
-      source.destinationFolderId,
-      new Map(source.receipt.keys).get(1),
-    ]);
-    Assert.deepEqual(
-      result.mapped.map(row => [row.folderId, row.key]),
-      expected
-    );
-    Assert.notEqual(
-      result.mapped[0].key,
-      result.mapped[1].key,
-      "Physical copies remain separate despite equal Message-IDs"
-    );
-    Assert.deepEqual(
-      result.mapped.map(row => row.message.headerMessageId),
-      ["162378@invalid", "162378@invalid"]
-    );
-    Assert.equal(
-      result.mapped[0].message.text.body,
-      "\uFEFFrecovered é 😀 body\0tail"
-    );
-    Assert.equal(result.mapped[1].message.text.body, null);
-    Assert.equal(result.mapped[1].message.text.subject, "");
-    Assert.deepEqual(
-      result.snapshot.attributeDefinitions.map(row => row.name.value),
-      ["é", "é"]
-    );
-    Assert.deepEqual(
-      result.excluded.map(row => row.reason),
-      ["ghost", "deleted"]
-    );
-    for (const [index, row] of result.mapped.entries()) {
-      Assert.equal(
-        row.provenance.importReceipt.sourceId,
-        state.sources[index].id
-      );
-      Assert.equal(
-        row.provenance.importReceipt.databaseSourceId,
-        database.sourceId
-      );
-      Assert.deepEqual(
-        row.provenance.importReceipt.keys,
-        state.sources[index].receipt.keys
-      );
-      Assert.deepEqual(row.provenance.backup, backup);
-      Assert.ok(
-        !Object.hasOwn(row, "eligible"),
-        "Recovery never invents search eligibility"
-      );
-    }
-    const repeated = await readLegacyGlodaMailRecovery(
-      journal,
-      database,
-      resolve,
-      lock,
-      backedUp
-    );
-    Assert.deepEqual(repeated, result);
-    Assert.equal(changes(), writes);
-    await Assert.rejects(
-      readLegacyGlodaMailRecovery(journal, database, resolve, lock, glodaPath),
-      /outside backed-up roots/
-    );
-    const other = service.createProfile(
-      new FileUtils.File(PathUtils.join(work, "other-profile")),
-      "legacy-mail-other",
-      "tests"
-    );
-    const otherLock = other.lock({});
-    try {
-      await Assert.rejects(
-        readLegacyGlodaMailRecovery(
-          journal,
-          database,
-          resolve,
-          otherLock,
-          backedUp
-        ),
-        /held selected profile/
-      );
-    } finally {
-      otherLock.unlock();
-      other.remove(false);
-    }
-    const manifestBytes = await IOUtils.read(backup.path);
-    let changedManifest = false;
-    const changeAfterVerifiedRead = async id => {
-      if (!changedManifest) {
-        const changed = new Uint8Array(manifestBytes.length + 1);
-        changed.set(manifestBytes);
-        changed[manifestBytes.length] = 10;
-        await IOUtils.write(backup.path, changed);
-        changedManifest = true;
-      }
-      return resolve(id);
-    };
-    try {
-      await Assert.rejects(
-        readLegacyGlodaMailRecovery(
-          journal,
-          database,
-          changeAfterVerifiedRead,
-          lock,
-          backedUp
-        ),
-        /backup identity changed/
-      );
-      Assert.ok(
-        changedManifest,
-        "The manifest changed after its verified read, at native folder resolution"
-      );
-      Assert.equal(changes(), writes);
-      Assert.deepEqual(await IOUtils.read(journalPath), recorded);
-    } finally {
-      await IOUtils.write(backup.path, manifestBytes);
-    }
-    Assert.deepEqual(
-      await readLegacyGlodaMailRecovery(
-        journal,
-        database,
-        resolve,
-        lock,
-        backedUp
-      ),
-      result,
-      "The original verified backup remains usable after exact restoration"
-    );
-    Assert.deepEqual(await IOUtils.read(journalPath), recorded);
-    Assert.deepEqual(journal.state, state);
-    for (const [path, bytes] of originals) {
-      Assert.deepEqual(await IOUtils.read(path), bytes);
-    }
-    Assert.deepEqual(await IOUtils.read(backedUp), glodaBytes);
-    // Delete only this receipt/map. Retain the native completion marker so the
-    // actual getter must reject the inconsistent committed import, never retry it.
-    const removeKeys = database.connectionForTests.createStatement(
-      "DELETE FROM folder_import_keys WHERE token=:token"
-    );
-    try {
-      removeKeys.params.token = state.sources[0].token;
-      removeKeys.execute();
-    } finally {
-      removeKeys.finalize();
-    }
-    Assert.equal(
-      database.connectionForTests.affectedRows,
-      state.sources[0].receipt.keys.length,
-      "The fault removes only the selected source's complete native key map"
-    );
-    const remove = database.connectionForTests.createStatement(
-      "DELETE FROM folder_import_receipts WHERE token=:token"
-    );
-    try {
-      remove.params.token = state.sources[0].token;
-      remove.execute();
-    } finally {
-      remove.finalize();
-    }
-    Assert.equal(
-      database.connectionForTests.affectedRows,
-      1,
-      "The scoped native receipt-loss fault reached its real row"
-    );
-    const afterFault = changes();
-    await Assert.rejects(
-      readLegacyGlodaMailRecovery(journal, database, resolve, lock, backedUp),
-      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
-      "The native getter refuses the retained completion marker without its receipt"
-    );
-    Assert.equal(
-      changes(),
-      afterFault,
-      "A missing receipt never reimports messages"
-    );
-    Assert.deepEqual(await IOUtils.read(journalPath), recorded);
-    for (const [path, bytes] of originals) {
-      Assert.deepEqual(await IOUtils.read(path), bytes);
-    }
-  }
-);

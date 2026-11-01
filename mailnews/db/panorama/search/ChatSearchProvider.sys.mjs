@@ -11,6 +11,14 @@ import { PanoramaSearchIndex } from "resource:///modules/panorama/PanoramaSearch
 import { persistChatSearchRedaction } from "resource:///modules/panorama/ChatSearchRedaction.sys.mjs";
 
 const lazy = {};
+ChromeUtils.defineESModuleGetters(lazy, {
+  readLegacyGlodaChat:
+    "resource:///modules/panorama/LegacyGlodaChatReader.sys.mjs",
+  readLegacyChatLog:
+    "resource:///modules/panorama/LegacyGlodaChatReader.sys.mjs",
+  bindLegacyChatLogs:
+    "resource:///modules/panorama/LegacyGlodaChatReader.sys.mjs",
+});
 ChromeUtils.defineLazyGetter(lazy, "plainText", () =>
   Cc["@mozilla.org/mail/folder-factory;1?name=mailbox"].createInstance(
     Ci.nsIMsgFolder
@@ -263,6 +271,90 @@ export class ChatSearchProvider {
       provider.resolveDocument(id, { signal })
     );
     return provider;
+  }
+
+  /**
+   * Persists validated old chat records without authorizing their unknown policy.
+   * Only explicitly supplied physical log paths are read; no history is discovered.
+   *
+   * @param {string} indexPath - Closed schema30 Gloda backup.
+   * @param {string} logsRoot - Original backed-up logger root.
+   * @param {string[]} relativePaths - Exact physical log paths from that snapshot.
+   * @returns {Promise<number>} Number of committed quarantined records.
+   * @throws {Error} Original source/validation/storage error or closing provider.
+   */
+  recoverLegacy(indexPath, logsRoot, relativePaths) {
+    if (this.#closing) {
+      return Promise.reject(new Error("Chat search provider is closing"));
+    }
+    const result = this.#pending.then(async () => {
+      const snapshot = await lazy.readLegacyGlodaChat(indexPath);
+      const logs = [];
+      for (const path of relativePaths) {
+        logs.push(await lazy.readLegacyChatLog(logsRoot, path));
+      }
+      const bound = lazy.bindLegacyChatLogs(snapshot, logs);
+      const records = bound.records.map(record => ({
+        recordId: "chat:" + JSON.stringify([snapshot.source.path, record.id]),
+        documentId: chatSearchDocumentId(
+          PathUtils.join(
+            PathUtils.profileDir,
+            "logs",
+            ...record.relativePath.split("/")
+          )
+        ),
+        kind: "chat",
+        sourceRevision: snapshot.source.sha256,
+        payload: record,
+        document: null,
+      }));
+      await this.#index.retainRecovery(records);
+      return records.length;
+    });
+    this.#pending = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
+  }
+
+  /**
+   * Reads stored quarantine/provenance without granting search eligibility.
+   *
+   * @param {?string} [id=null] - Exact chat document ID, or all records.
+   * @returns {Promise<object[]>} Stored records; erased payloads are null. An
+   *   overlapping privacy operation withholds this read, as for getText.
+   * @throws {Error} Original privacy/storage failure or closing provider.
+   */
+  async getRecoveryRecords(id = null) {
+    if (this.#closing) {
+      throw new Error("Chat search provider is closing");
+    }
+    const revision = this.#redactions.size ? null : this.#privacyRevision;
+    const records = await this.#index.getRecoveryRecords(id);
+    await this.#waitForRedactions();
+    return revision === this.#privacyRevision ? records : [];
+  }
+
+  /**
+   * Rebuilds disposable transcript rows after earlier refreshes and erasures.
+   * Stored recovery aggregates remain quarantined and supply no index rows.
+   *
+   * @returns {Promise<void>} Resolves after observed privacy work and FTS rebuild.
+   * @throws {Error} Original privacy/storage failure or closing provider.
+   */
+  async rebuild() {
+    if (this.#closing) {
+      throw new Error("Chat search provider is closing");
+    }
+    await this.#waitForRedactions();
+    const result = this.#pending.then(() => this.#index.rebuild());
+    this.#pending = result.then(
+      () => {},
+      () => {}
+    );
+    await result;
+    await this.#waitForRedactions();
   }
 
   /**

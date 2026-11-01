@@ -612,6 +612,9 @@ export async function resumeMorkCacheImports(
  * Retains every raw record, excluded row and attribute definition. Resolves
  * physical folder/key locations before corroborating the original Message-ID.
  * Requires the held selected-profile lock and quiesced source/backup writers.
+ * Windows retains native path leases through the read and requires journal4,
+ * backup3 and complete version2 import receipts. Releases its own leases on exit;
+ * the caller retains the profile lock.
  * Never imports, checkpoints, indexes text or authorizes profile activation.
  * Unknown eligibility remains a decision for the current search-policy owner.
  *
@@ -633,9 +636,7 @@ export async function readLegacyGlodaMailRecovery(
   profileLock,
   path
 ) {
-  if (AppConstants.platform == "win") {
-    throw new Error("Windows Gloda recovery requires native reparse admission");
-  }
+  const windows = AppConstants.platform == "win";
   const database = core.QueryInterface(Ci.nsIDatabaseCore);
   if (
     database !==
@@ -651,129 +652,261 @@ export async function readLegacyGlodaMailRecovery(
   ) {
     throw new Error("Gloda recovery requires backed-up committed mail imports");
   }
+  if (
+    windows &&
+    (!(journal instanceof MigrationJournal) || state.version !== 4)
+  ) {
+    throw new Error("Windows migration requires a backed-up version4 journal");
+  }
   const lock = profileLock.QueryInterface(Ci.nsIProfileLock);
   const databaseSourceId = database.sourceId;
   const before = JSON.stringify(state);
-  const check = () => {
-    const selected = new FileUtils.File(PathUtils.profileDir);
-    const directory = lock.directory.clone();
-    if (selected.isSymlink() || directory.isSymlink()) {
-      throw new Error("Gloda recovery profile contains a link");
-    }
-    selected.normalize();
-    directory.normalize();
+  const fs = windows
+    ? Cc["@mozilla.org/mailnews/panorama-migration-file-system;1"].getService(
+        Ci.nsIPanoramaMigrationFileSystem
+      )
+    : null;
+  const leases = [];
+  const retain = (file, root, kind, expected) => {
+    const lease = fs.admit(file, root, kind);
+    leases.push(lease);
+    fs.validate(lease);
     if (
-      !selected.equals(new FileUtils.File(state.profilePath)) ||
-      !selected.equals(directory)
+      expected &&
+      (lease.identity !== expected.id ||
+        lease.parentIdentity !== expected.parentId ||
+        lease.rootIdentity !== expected.rootId)
     ) {
-      throw new Error("Gloda recovery requires the held selected profile");
+      throw new Error("Gloda recovery source physical identity changed");
     }
-    if (
-      database.sourceId !== databaseSourceId ||
-      JSON.stringify(journal.state) !== before
-    ) {
-      throw new Error("Gloda recovery journal/database identity changed");
-    }
+    return lease;
   };
-  check();
-  const backupPath = PathUtils.parent(state.backup.path);
-  const backup = await verifyMigrationBackup(backupPath);
-  if (
-    backup.path !== state.backup.path ||
-    backup.sha256 !== state.backup.sha256
-  ) {
-    throw new Error("Gloda recovery backup identity changed");
-  }
-  const sourcePath = admittedFolderPath(new FileUtils.File(path), [
-    new FileUtils.File(PathUtils.parent(backup.path)),
-  ]);
-  const manifest = await IOUtils.readJSON(backup.path);
-  const entries = [];
-  for (const root of manifest.roots) {
-    for (const entry of root.entries) {
+  try {
+    let selectedLease;
+    if (windows) {
+      const root = state.originalRoots.find(
+        item => item.canonicalPath === state.profilePath
+      );
+      if (!root) {
+        throw new Error("Migration profile has no original admitted root");
+      }
+      selectedLease = retain(
+        new FileUtils.File(PathUtils.profileDir),
+        new FileUtils.File(root.originalPath),
+        fs.KIND_DIRECTORY
+      );
       if (
-        entry.type == "regular" &&
-        PathUtils.join(backupPath, root.directory, ...entry.parts) ===
-          sourcePath
+        selectedLease.canonicalPath !== state.profilePath ||
+        selectedLease.identity !== state.profilePhysicalIdentity.id ||
+        selectedLease.parentIdentity !==
+          state.profilePhysicalIdentity.parentId ||
+        selectedLease.rootIdentity !== root.physicalIdentity.id
       ) {
-        entries.push({ root, entry });
+        throw new Error("Gloda recovery requires the held selected profile");
       }
     }
-  }
-  if (entries.length != 1) {
-    throw new Error("Gloda recovery file is not a unique backed-up input");
-  }
-  const { root, entry } = entries[0];
-  const snapshot = await lazy.readLegacyGlodaMail(sourcePath);
-  if (
-    snapshot.source.size !== entry.size ||
-    snapshot.source.sha256 !== entry.sha256
-  ) {
-    throw new Error("Gloda recovery snapshot differs from the complete backup");
-  }
-  const folders = new Map();
-  for (const source of state.sources) {
-    folders.set(
-      source.id,
-      (await resolveFolder(source.id)).QueryInterface(Ci.nsIMsgFolder)
-    );
-  }
-  const target = createPanoramaMigrationTarget(
-    journal,
-    database,
-    id => folders.get(id),
-    lock
-  );
-  const bindings = [];
-  const receipts = new Map();
-  for (const source of state.sources) {
-    const receipt = await target.findReceipt(source.token, {
-      sourceId: source.id,
-      sourceSha256: source.sha256,
-      destinationFolderId: source.destinationFolderId,
-    });
-    if (receipt === null) {
-      throw new Error("Native database lost a committed Gloda mail binding");
+    const check = () => {
+      const directory = lock.directory.clone();
+      if (windows) {
+        // Admit the lock's actual directory before comparing canonical paths.
+        const current = fs.admit(directory, directory, fs.KIND_DIRECTORY);
+        try {
+          fs.validate(current);
+          if (
+            current.canonicalPath !== selectedLease.canonicalPath ||
+            current.identity !== selectedLease.identity ||
+            current.parentIdentity !== selectedLease.parentIdentity
+          ) {
+            throw new Error(
+              "Gloda recovery requires the held selected profile"
+            );
+          }
+          for (const lease of leases) {
+            fs.validate(lease);
+          }
+        } finally {
+          current.close();
+        }
+      } else {
+        const selected = new FileUtils.File(PathUtils.profileDir);
+        if (selected.isSymlink() || directory.isSymlink()) {
+          throw new Error("Gloda recovery profile contains a link");
+        }
+        selected.normalize();
+        directory.normalize();
+        if (
+          !selected.equals(new FileUtils.File(state.profilePath)) ||
+          !selected.equals(directory)
+        ) {
+          throw new Error("Gloda recovery requires the held selected profile");
+        }
+      }
+      if (
+        database.sourceId !== databaseSourceId ||
+        JSON.stringify(journal.state) !== before
+      ) {
+        throw new Error("Gloda recovery journal/database identity changed");
+      }
+    };
+    check();
+    const backupPath = PathUtils.parent(state.backup.path);
+    let sourcePath;
+    if (windows) {
+      const root = retain(
+        new FileUtils.File(state.backupPath),
+        new FileUtils.File(state.backupPath),
+        fs.KIND_DIRECTORY
+      );
+      if (root.canonicalPath !== backupPath) {
+        throw new Error("Gloda recovery backup identity changed");
+      }
+      retain(
+        new FileUtils.File(state.backup.path),
+        new FileUtils.File(state.backupPath),
+        fs.KIND_FILE
+      );
+      const source = retain(
+        new FileUtils.File(path),
+        new FileUtils.File(state.backupPath),
+        fs.KIND_FILE
+      );
+      sourcePath = source.canonicalPath;
+      for (const item of state.sources) {
+        validateMorkFolderWindowsInventory(item.inventory);
+        for (const [name, original] of Object.entries(
+          item.inventory.windowsAdmission
+        )) {
+          const lease = retain(
+            new FileUtils.File(original.originalPath),
+            new FileUtils.File(original.originalRoot),
+            original.id ? fs.KIND_FILE : fs.KIND_FILE_OR_MISSING,
+            original
+          );
+          if (name == "summary" && lease.canonicalPath !== item.path) {
+            throw new Error("Gloda recovery source physical identity changed");
+          }
+        }
+      }
     }
+    const backup = await verifyMigrationBackup(backupPath);
+    check();
     if (
-      receipt.databaseSourceId !== databaseSourceId ||
-      receipt.token !== source.receipt?.token ||
-      receipt.sourceSha256 !== source.receipt?.sourceSha256 ||
-      receipt.folderId !== source.receipt?.folderId ||
-      JSON.stringify(receipt.keys) !== JSON.stringify(source.receipt?.keys)
+      backup.path !== state.backup.path ||
+      backup.sha256 !== state.backup.sha256
     ) {
-      throw new Error("Native Gloda mail receipt differs from its checkpoint");
+      throw new Error("Gloda recovery backup identity changed");
     }
-    receipts.set(source.id, receipt);
-    bindings.push({
-      folderURI: folders.get(source.id).URI,
-      source,
-      originalSummary: await readMorkMigrationSource(source.path),
-    });
+    sourcePath ??= admittedFolderPath(new FileUtils.File(path), [
+      new FileUtils.File(PathUtils.parent(backup.path)),
+    ]);
+    const manifest = await IOUtils.readJSON(backup.path);
+    check();
+    if (
+      windows &&
+      (manifest.version !== 3 ||
+        JSON.stringify(manifest.originalRoots) !==
+          JSON.stringify(state.originalRoots))
+    ) {
+      throw new Error("Windows migration backup identity changed");
+    }
+    const entries = [];
+    for (const root of manifest.roots) {
+      for (const entry of root.entries) {
+        if (
+          entry.type == "regular" &&
+          PathUtils.join(backupPath, root.directory, ...entry.parts) ===
+            sourcePath
+        ) {
+          entries.push({ root, entry });
+        }
+      }
+    }
+    if (entries.length != 1) {
+      throw new Error("Gloda recovery file is not a unique backed-up input");
+    }
+    const { root, entry } = entries[0];
+    const snapshot = await lazy.readLegacyGlodaMail(sourcePath);
+    check();
+    if (
+      snapshot.source.size !== entry.size ||
+      snapshot.source.sha256 !== entry.sha256
+    ) {
+      throw new Error(
+        "Gloda recovery snapshot differs from the complete backup"
+      );
+    }
+    const folders = new Map();
+    for (const source of state.sources) {
+      folders.set(
+        source.id,
+        (await resolveFolder(source.id)).QueryInterface(Ci.nsIMsgFolder)
+      );
+      check();
+    }
+    const target = (
+      windows
+        ? createWindowsPanoramaMigrationTarget
+        : createPanoramaMigrationTarget
+    )(journal, database, id => folders.get(id), lock);
+    const bindings = [];
+    const receipts = new Map();
+    for (const source of state.sources) {
+      const receipt = await target.findReceipt(source.token, {
+        sourceId: source.id,
+        sourceSha256: source.sha256,
+        destinationFolderId: source.destinationFolderId,
+      });
+      check();
+      if (receipt === null) {
+        throw new Error("Native database lost a committed Gloda mail binding");
+      }
+      if (
+        receipt.databaseSourceId !== databaseSourceId ||
+        receipt.token !== source.receipt?.token ||
+        receipt.sourceSha256 !== source.receipt?.sourceSha256 ||
+        receipt.folderId !== source.receipt?.folderId ||
+        JSON.stringify(receipt.keys) !== JSON.stringify(source.receipt?.keys)
+      ) {
+        throw new Error(
+          "Native Gloda mail receipt differs from its checkpoint"
+        );
+      }
+      receipts.set(source.id, receipt);
+      bindings.push({
+        folderURI: folders.get(source.id).URI,
+        source,
+        originalSummary: await readMorkMigrationSource(source.path),
+      });
+      check();
+    }
+    const result = lazy.mapLegacyGlodaMail(snapshot, bindings);
+    if ((await hashMigrationFile(backup.path)) !== backup.sha256) {
+      throw new Error("Gloda recovery backup identity changed");
+    }
+    check();
+    return {
+      snapshot,
+      backup,
+      originalDatabasePath: PathUtils.join(root.source, ...entry.parts),
+      mapped: result.mapped.map(row => ({
+        ...row,
+        sourceId: databaseSourceId,
+        provenance: {
+          ...row.provenance,
+          originalDatabasePath: PathUtils.join(root.source, ...entry.parts),
+          backup: structuredClone(backup),
+          importReceipt: structuredClone(
+            receipts.get(row.provenance.sourceFolderId)
+          ),
+        },
+      })),
+      excluded: result.excluded,
+    };
+  } finally {
+    for (const lease of leases.reverse()) {
+      lease.close();
+    }
   }
-  const result = lazy.mapLegacyGlodaMail(snapshot, bindings);
-  if ((await hashMigrationFile(backup.path)) !== backup.sha256) {
-    throw new Error("Gloda recovery backup identity changed");
-  }
-  check();
-  return {
-    snapshot,
-    backup,
-    originalDatabasePath: PathUtils.join(root.source, ...entry.parts),
-    mapped: result.mapped.map(row => ({
-      ...row,
-      sourceId: databaseSourceId,
-      provenance: {
-        ...row.provenance,
-        originalDatabasePath: PathUtils.join(root.source, ...entry.parts),
-        backup: structuredClone(backup),
-        importReceipt: structuredClone(
-          receipts.get(row.provenance.sourceFolderId)
-        ),
-      },
-    })),
-    excluded: result.excluded,
-  };
 }
 
 /**

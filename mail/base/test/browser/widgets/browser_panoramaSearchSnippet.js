@@ -156,7 +156,7 @@ add_task(async function test_nativeSnippetRefreshUsesCurrentRevision() {
   Assert.equal(headers[0].messageId, headers[1].messageId);
   Assert.notEqual(headers[0].messageKey, headers[1].messageKey);
   for (let i = 0; ; i++) {
-    Assert.less(i, 100, "The initial native projections finish bounded indexing");
+    Assert.less(i, 100, "The native projections finish bounded indexing");
     if (!(await service.update({ limit: 50 })).moreWork) {
       break;
     }

@@ -271,12 +271,16 @@ NS_IMETHODIMP LocalMoveSourceListener::GetMessageId(nsACString& messageId) {
   messageId.Truncate();
   return NS_OK;
 }
-NS_IMETHODIMP LocalMoveSourceListener::OnStopCopy(nsresult status) {
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP
+LocalMoveSourceListener::OnStopCopy(nsresult status) {
   if (mCompleted) {
     return NS_OK;
   }
+  // Completion can enter the transaction manager and release the copy request.
+  RefPtr<LocalMoveSourceListener> self(this);
+  RefPtr<nsMsgLocalMailFolder> destination = mDestination;
   mCompleted = true;
-  return mDestination->CompleteMoveSource(this, status);
+  return destination->CompleteMoveSource(self, status);
 }
 
 nsLocalMailCopyState::nsLocalMailCopyState()

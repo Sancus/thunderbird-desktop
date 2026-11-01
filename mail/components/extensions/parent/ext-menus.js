@@ -1215,7 +1215,14 @@ const menuTracker = {
         const triggerTab = trigger.closest("tab");
         const tab = triggerTab || tabTracker.activeTab;
         const pageUrl = tab.linkedBrowser?.currentURI?.spec;
-        gMenuBuilder.build({ menu, tab, pageUrl, onTab: true });
+        // Tab IDs belong to tabInfo, not its XUL tab element. Use the same
+        // native object as tabs events and queries when building menu events.
+        const tabInfo = triggerTab
+          ? win.document
+              .getElementById("tabmail")
+              ._getTabContextForTabbyThing(triggerTab)[1]
+          : tab;
+        gMenuBuilder.build({ menu, tab: tabInfo, pageUrl, onTab: true });
         break;
       }
       case "folderPaneContext": {

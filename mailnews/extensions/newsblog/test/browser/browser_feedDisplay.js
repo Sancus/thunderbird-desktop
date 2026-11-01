@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, you can obtain one at http://mozilla.org/MPL/2.0/. */
 
+"use strict";
+
 var { MockExternalProtocolService } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MockExternalProtocolService.sys.mjs"
 );
@@ -158,6 +160,23 @@ async function unsubscribeCurrentRow() {
 }
 
 add_setup(async () => {
+  const databaseService = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && databaseService instanceof Ci.nsIDatabaseCore,
+    native,
+    "The actual database service matches the startup backend"
+  );
+  Assert.equal(rootFolder.id > 0, native, "The RSS root has native identity");
+  const store = Services.prefs.getCharPref("mail.server.server1.storeContractID");
+  Assert.equal(rootFolder.server.getStringValue("storeContractID"), store);
+  Assert.equal(
+    rootFolder.msgStore.storeType,
+    store == "@mozilla.org/msgstore/maildirstore;1" ? "maildir" : "mbox",
+    "The RSS account uses the startup physical store"
+  );
   MockExternalProtocolService.init();
   registerCleanupFunction(() => {
     MockExternalProtocolService.cleanup();
@@ -393,4 +412,200 @@ add_task(async function testSubscribeFromAccountSettings() {
 
   await unsubscribeCurrentRow();
   folderTree.selectedIndex = 0;
+});
+
+/**
+ * Stores a real feed article and deletes its folder at test cleanup.
+ *
+ * @param {string} name - Unique folder name.
+ * @returns {nsIMsgDBHdr} The stored physical header.
+ */
+function storeArticle(name) {
+  const folder = rootFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder(name)
+    .QueryInterface(Ci.nsIMsgLocalMailFolder);
+  registerCleanupFunction(() => {
+    about3Pane.displayFolder(rootFolder.URI);
+    rootFolder.propagateDelete(folder, true);
+  });
+  return folder.addMessage(
+    "From: feed@example.invalid\r\n" +
+      "Subject: " + name + "\r\n" +
+      "Message-ID: <" + name + "@example.invalid>\r\n" +
+      "Content-Base: https://example.org/browser/comm/mailnews/extensions/" +
+      "newsblog/test/browser/data/article.html\r\n" +
+      "Content-Type: text/plain; charset=UTF-8\r\n\r\n" +
+      "Stored article body.\r\n"
+  );
+}
+
+/**
+ * Intercepts only a real article's message service to deliver terminal errors.
+ * Restores the provider and finishes any pending stream before returning.
+ *
+ * @param {nsIMsgDBHdr} header - Stored article header.
+ * @param {function(object): Promise<void>} exercise - Receives stream controls.
+ * @returns {Promise<void>} Resolves after restoring the provider.
+ */
+async function withArticleService(header, exercise) {
+  const uri = header.folder.getUriForMsg(header);
+  const original = MailServices.messageServiceFromURI;
+  const control = { lookupError: null, startError: null, streams: [] };
+  MailServices.messageServiceFromURI = function (candidate) {
+    if (candidate != uri) {
+      return original.call(this, candidate);
+    }
+    if (control.lookupError) {
+      throw control.lookupError;
+    }
+    return {
+      streamMessage(messageURI, consumer, msgWindow, listener) {
+        Assert.equal(messageURI, uri, "The real physical URI reaches the service");
+        if (control.startError) {
+          throw control.startError;
+        }
+        control.streams.push({ listener, consumer });
+      },
+    };
+  };
+  try {
+    await exercise(control);
+  } finally {
+    MailServices.messageServiceFromURI = original;
+    for (const stream of control.streams) {
+      stream.listener.OnStopRunningUrl(null, Cr.NS_BINDING_ABORTED);
+    }
+  }
+}
+
+add_task(async function test_loadWebPageReturnsLookupAndStartErrors() {
+  const header = storeArticle("lookup-start-errors");
+  await withArticleService(header, async control => {
+    const lookupError = Components.Exception(
+      "Article lookup failed",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    control.lookupError = lookupError;
+    await Assert.rejects(
+      window.FeedMessageHandler.loadWebPage(header, { browser: true }),
+      error => error === lookupError,
+      "The caller receives the original lookup exception"
+    );
+    control.lookupError = null;
+    const startError = Components.Exception(
+      "Article stream failed",
+      Cr.NS_ERROR_FILE_ACCESS_DENIED
+    );
+    control.startError = startError;
+    await Assert.rejects(
+      window.FeedMessageHandler.loadWebPage(header, { browser: true }),
+      error => error === startError,
+      "The caller receives the original stream-start exception"
+    );
+    Assert.equal(control.streams.length, 0);
+  });
+  const uri = await window.FeedMessageHandler.loadWebPage(header, {
+    browser: true,
+  });
+  MockExternalProtocolService.assertHasLoadedURL(uri.spec);
+  Assert.equal(
+    header.folder.GetMessageHeader(header.messageKey).storeToken,
+    header.storeToken
+  );
+  Assert.ok(
+    mailTestUtils
+      .loadMessageToString(header.folder, header)
+      .includes("Stored article body.")
+  );
+});
+
+add_task(async function test_loadWebPageReturnsCompletionErrorsAndMissingContent() {
+  const header = storeArticle("completion-errors");
+  await withArticleService(header, async control => {
+    const pending = window.FeedMessageHandler.loadWebPage(header, {
+    browser: true,
+  });
+    const rejected = Assert.rejects(
+      pending,
+      error => error.result == Cr.NS_ERROR_FILE_NOT_FOUND,
+      "The original asynchronous completion error reaches the caller"
+    );
+    Assert.equal(control.streams.length, 1);
+    control.streams[0].listener.OnStopRunningUrl(null, Cr.NS_ERROR_FILE_NOT_FOUND);
+    control.streams[0].listener.OnStopRunningUrl(null, Cr.NS_OK);
+    await rejected;
+
+    const missing = window.FeedMessageHandler.loadWebPage(header, {
+    browser: true,
+  });
+    const unavailable = Assert.rejects(
+      missing,
+      error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+      "A successful stop without content is unavailable, not a successful display"
+    );
+    Assert.equal(
+      control.streams.length,
+      2,
+      "Failure releases the first retrieval for retry"
+    );
+    control.streams[1].listener.OnStopRunningUrl(null, Cr.NS_OK);
+    await unavailable;
+  });
+  const uri = await window.FeedMessageHandler.loadWebPage(header, {
+    browser: true,
+  });
+  MockExternalProtocolService.assertHasLoadedURL(uri.spec);
+});
+
+add_task(async function test_setContentRestoresBodyAfterFailure() {
+  const header = storeArticle("display-error");
+  about3Pane.displayFolder(header.folder.URI);
+  await TestUtils.waitForCondition(
+    () => threadTree.table.body.childElementCount == 1,
+    "The real stored article appears in the thread pane"
+  );
+  const loaded = BrowserTestUtils.browserLoaded(messagePane);
+  await threadTreeClick(0);
+  await loaded;
+  const body = messagePane.contentDocument.body;
+  Assert.ok(body, "The stored summary is displayed before the failed page load");
+  Assert.ok(!body.hidden);
+  await withArticleService(header, async control => {
+    const pending = aboutMessage.FeedMessageHandler.setContent(
+      aboutMessage.gMessage,
+      false
+    );
+    const rejected = Assert.rejects(
+      pending,
+      error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED,
+      "setContent returns the actual content failure"
+    );
+    Assert.ok(body.hidden, "The page load temporarily hides the summary");
+    Assert.equal(control.streams.length, 1);
+    control.streams[0].listener.OnStopRunningUrl(
+      null,
+      Cr.NS_ERROR_FILE_ACCESS_DENIED
+    );
+    await rejected;
+    Assert.ok(!body.hidden, "The failed current page load restores the summary");
+    Assert.equal(messagePane.contentDocument.body, body);
+    // Existing UI callers ignore this result; the callee must still report and
+    // settle it without an unhandled rejection or a callback throw.
+    aboutMessage.FeedMessageHandler.setContent(aboutMessage.gMessage, false);
+    Assert.equal(control.streams.length, 2);
+    control.streams[1].listener.OnStopRunningUrl(
+      null,
+      Cr.NS_ERROR_FILE_ACCESS_DENIED
+    );
+    await TestUtils.waitForCondition(
+      () => !body.hidden,
+      "Ignored failure also restores the summary"
+    );
+  });
+  Assert.ok(
+    mailTestUtils
+      .loadMessageToString(header.folder, header)
+      .includes("Stored article body.")
+  );
 });

@@ -24,6 +24,23 @@ const server = MailServices.accounts.getAccount("account1").incomingServer;
 const rootFolder = server.rootFolder;
 
 add_setup(() => {
+  const databaseService = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && databaseService instanceof Ci.nsIDatabaseCore,
+    native,
+    "The actual database service matches the startup backend"
+  );
+  Assert.equal(rootFolder.id > 0, native, "The RSS root has native identity");
+  const store = Services.prefs.getCharPref("mail.server.server1.storeContractID");
+  Assert.equal(rootFolder.server.getStringValue("storeContractID"), store);
+  Assert.equal(
+    rootFolder.msgStore.storeType,
+    store == "@mozilla.org/msgstore/maildirstore;1" ? "maildir" : "mbox",
+    "The RSS account uses the startup physical store"
+  );
   MockFilePicker.init(window.browsingContext);
   registerCleanupFunction(() => {
     MockFilePicker.cleanup();

@@ -1061,9 +1061,9 @@ export var FeedUtils = {
         "\nfolder changed - " +
         aAction +
         "\nnew folder  - " +
-        aFolder.filePath.path +
+        aFolder.URI +
         "\norig folder - " +
-        aOrigFolder.filePath.path
+        aOrigFolder.URI
     );
 
     this.log.debug(

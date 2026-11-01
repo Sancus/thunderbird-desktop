@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+"use strict";
+
 /*
  * Test to ensure that downloadAllForOffline works correctly with imap folders
  * and returns success.
@@ -12,7 +14,56 @@ var { MessageGenerator } = ChromeUtils.importESModule(
 );
 
 add_task(async function setup() {
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (native) {
+    const storePref = "mail.server.default.storeContractID";
+    const autosyncPref = "mail.server.default.autosync_offline_stores";
+    const hadStore = Services.prefs.prefHasUserValue(storePref);
+    const oldStore = Services.prefs.getCharPref(storePref, "");
+    const hadAutosync = Services.prefs.prefHasUserValue(autosyncPref);
+    const oldAutosync = Services.prefs.getBoolPref(autosyncPref, true);
+    registerCleanupFunction(() => {
+      if (hadStore) {
+        Services.prefs.setCharPref(storePref, oldStore);
+      } else {
+        Services.prefs.clearUserPref(storePref);
+      }
+      if (hadAutosync) {
+        Services.prefs.setBoolPref(autosyncPref, oldAutosync);
+      } else {
+        Services.prefs.clearUserPref(autosyncPref);
+      }
+    });
+    Services.prefs.setCharPref(
+      storePref,
+      Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+    );
+    Services.prefs.setBoolPref(autosyncPref, false);
+  }
   setupIMAPPump();
+  registerCleanupFunction(() => {
+    if (IMAPPump.incomingServer) {
+      teardownIMAPPump();
+    }
+  });
+  if (native) {
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    const root = IMAPPump.incomingServer.rootFolder;
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+    Assert.ok(inbox, "Native discovery supplied the real INBOX");
+    IMAPPump.inbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+    Assert.strictEqual(IMAPPump.inbox.parent, root);
+    Assert.strictEqual(IMAPPump.inbox.server, IMAPPump.incomingServer);
+    const expectedStore = {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[Services.prefs.getCharPref("mail.serverDefaultStoreContractID")];
+    Assert.ok(expectedStore);
+    Assert.equal(IMAPPump.incomingServer.msgStore.storeType, expectedStore);
+    Assert.equal(IMAPPump.inbox.msgStore.storeType, expectedStore);
+  }
   const msgFile = do_get_file("../../../data/bug460636");
 
   /*
@@ -46,6 +97,15 @@ add_task(async function downloadAllForOffline() {
 
 add_task(async function verifyDownloaded() {
   const inbox = IMAPPump.inbox;
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    const keys = Array.from(inbox.messages, msg => msg.messageKey);
+    Assert.equal(keys.length, 2, "Both real server messages were downloaded");
+    Assert.deepEqual(
+      inbox.msgDatabase.listAllOfflineMsgs().sort((a, b) => a - b),
+      keys.sort((a, b) => a - b),
+      "Offline enumeration returns the downloaded physical message keys"
+    );
+  }
   for (const msg of inbox.messages) {
     Assert.ok(
       msg.flags & Ci.nsMsgMessageFlags.Offline,
@@ -57,6 +117,61 @@ add_task(async function verifyDownloaded() {
     const service = MailServices.messageServiceFromURI(uri);
     service.streamMessage(uri, streamListener, null, null, false, "", true);
     await streamListener.promise;
+  }
+});
+
+add_task(function test_downloadSettingsPersistAndUseServerDefaults() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const folder = IMAPPump.inbox;
+  const db = folder.msgDatabase;
+  const original = db.msgDownloadSettings;
+  const serverSettings = folder.server.downloadSettings;
+  const defaults = {
+    useServerDefaults: serverSettings.useServerDefaults,
+    downloadByDate: serverSettings.downloadByDate,
+    downloadUnreadOnly: serverSettings.downloadUnreadOnly,
+    ageLimitOfMsgsToDownload: serverSettings.ageLimitOfMsgsToDownload,
+  };
+  const settings = Cc[
+    "@mozilla.org/msgDatabase/downloadSettings;1"
+  ].createInstance(Ci.nsIMsgDownloadSettings);
+  settings.useServerDefaults = false;
+  settings.downloadByDate = !defaults.downloadByDate;
+  settings.downloadUnreadOnly = !defaults.downloadUnreadOnly;
+  settings.ageLimitOfMsgsToDownload =
+    defaults.ageLimitOfMsgsToDownload == 17 ? 18 : 17;
+  try {
+    folder.downloadSettings = settings;
+    db.forceClosed();
+    const reopened = folder.msgDatabase;
+    Assert.notStrictEqual(reopened, db);
+    const stored = reopened.msgDownloadSettings;
+    Assert.equal(stored.useServerDefaults, false);
+    for (const property of [
+      "downloadByDate",
+      "downloadUnreadOnly",
+      "ageLimitOfMsgsToDownload",
+    ]) {
+      Assert.equal(stored[property], settings[property]);
+      Assert.equal(folder.downloadSettings[property], settings[property]);
+    }
+    stored.useServerDefaults = true;
+    folder.downloadSettings = stored;
+    reopened.forceClosed();
+    Assert.equal(
+      folder.msgDatabase.msgDownloadSettings.useServerDefaults,
+      true
+    );
+    const inherited = folder.downloadSettings;
+    const unchanged = folder.server.downloadSettings;
+    for (const [property, value] of Object.entries(defaults)) {
+      Assert.equal(inherited[property], value);
+      Assert.equal(unchanged[property], value, "Server defaults are unchanged");
+    }
+  } finally {
+    folder.downloadSettings = original;
   }
 });
 
@@ -84,6 +199,29 @@ add_task(
 
     // Make sure message reading fails.
     const NS_MSG_ERROR_MBOX_MALFORMED = 0x80550024;
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      const before = Array.from(inbox.messages, msg => ({
+        key: msg.messageKey,
+        token: msg.storeToken,
+        flags: msg.flags,
+        offlineMessageSize: msg.offlineMessageSize,
+      }));
+      Assert.throws(
+        () => inbox.msgDatabase.listAllOfflineMsgs(),
+        error => error.result == NS_MSG_ERROR_MBOX_MALFORMED,
+        "Direct offline enumeration reports the actual mbox read failure"
+      );
+      Assert.deepEqual(
+        Array.from(inbox.messages, msg => ({
+          key: msg.messageKey,
+          token: msg.storeToken,
+          flags: msg.flags,
+          offlineMessageSize: msg.offlineMessageSize,
+        })),
+        before,
+        "Enumeration errors retain physical rows and offline body metadata"
+      );
+    }
     for (const msg of inbox.messages) {
       const streamListener = new PromiseTestUtils.PromiseStreamListener();
       const uri = inbox.getUriForMsg(msg);

@@ -158,91 +158,117 @@ var FeedMessageHandler = {
   },
 
   /**
-   * Load a web page for feed messages. Use MsgHdrToMimeMessage() to get
-   * the content-base url from the message headers. We cannot rely on
-   * currentHeaderData; it has not yet been streamed at our entry point in
-   * displayMessageChanged(), and in the case of a collapsed message pane it
-   * is not streamed.
+   * The current setContent page retrieval, cleared when it settles or a summary
+   * is requested. Older failures must not reveal a newer page's hidden body.
    *
-   * @param {nsIMsgDBHdr} aMessageHdr - The message.
-   * @param {object} aWhere - name value=true pair, where name is in:
-   *                                    'messagepane', 'browser', 'tab', 'window'.
-   * @returns {void}
+   * @type {?Promise<nsIURI>}
+   */
+  _pendingWebPage: null,
+
+  /**
+   * Loads a feed article's Content-Base URL using the retained MIME utility.
+   * Reports failures even when the existing UI caller ignores the result.
+   *
+   * @param {nsIMsgDBHdr} aMessageHdr - The stored feed message.
+   * @param {{messagepane?: boolean, browser?: boolean, tab?: boolean,
+   *   window?: boolean}} aWhere - Where to load the article.
+   * @returns {Promise<nsIURI>} The article URI after starting its load. Rejects
+   *   with the original lookup/start exception or terminal failure code. A
+   *   missing MIME result or Content-Base rejects with NS_ERROR_NOT_AVAILABLE.
    */
   loadWebPage(aMessageHdr, aWhere) {
-    MsgHdrToMimeMessage(aMessageHdr, null, function (aMsgHdr, aMimeMsg) {
-      if (
-        aMimeMsg &&
-        aMimeMsg.headers["content-base"] &&
-        aMimeMsg.headers["content-base"][0]
-      ) {
-        let url = aMimeMsg.headers["content-base"],
-          uri;
+    const pending = new Promise((resolve, reject) => {
+      MsgHdrToMimeMessage(aMessageHdr, null, (aMsgHdr, aMimeMsg, status) => {
         try {
-          // The message and headers are stored as a string of UTF-8 bytes
-          // and we need to convert that cpp |string| to js UTF-16 explicitly
-          // for idn and non-ascii urls with this api.
-          url = decodeURIComponent(escape(url));
-          uri = Services.io.newURI(url);
-        } catch (ex) {
-          FeedUtils.log.info(
-            "FeedMessageHandler.loadWebPage: " +
-              "invalid Content-Base header url - " +
-              url
-          );
-          return;
+          if (!Components.isSuccessCode(status)) {
+            throw Components.Exception("Feed article retrieval failed", status);
+          }
+          const contentBase = aMimeMsg?.headers["content-base"]?.[0];
+          if (!contentBase) {
+            throw Components.Exception(
+              "Feed article Content-Base is unavailable",
+              Cr.NS_ERROR_NOT_AVAILABLE
+            );
+          }
+          // Stored MIME headers contain UTF-8 bytes; this URI API takes UTF-16.
+          const url = decodeURIComponent(escape(contentBase));
+          const uri = Services.io.newURI(url);
+          // Browser is currently used by SearchDialog for kOpenLoadInBrowser.
+          if (aWhere.browser) {
+            openLinkExternally(uri, { addToHistory: false });
+          } else if (aWhere.messagepane) {
+            const browser = getMessagePaneBrowser();
+            // Clear sandbox flags before switching to the web document.
+            MailE10SUtils.loadAboutBlank(browser);
+            MailE10SUtils.loadURI(browser, url);
+          } else if (aWhere.tab) {
+            openContentTab(url, "tab", null);
+          } else if (aWhere.window) {
+            openContentTab(url, "window", null);
+          }
+          resolve(uri);
+        } catch (error) {
+          reject(error);
         }
-        //TODO browser currently only used from SearchDialog for kOpenLoadInBrowser
-        if (aWhere.browser) {
-          openLinkExternally(uri, { addToHistory: false });
-        } else if (aWhere.messagepane) {
-          const browser = getMessagePaneBrowser();
-          // Load about:blank in the browser before (potentially) switching
-          // to a remote process. This prevents sandbox flags being carried
-          // over to the web document.
-          MailE10SUtils.loadAboutBlank(browser);
-          MailE10SUtils.loadURI(browser, url);
-        } else if (aWhere.tab) {
-          openContentTab(url, "tab", null);
-        } else if (aWhere.window) {
-          openContentTab(url, "window", null);
-        }
-      } else {
-        FeedUtils.log.info(
-          "FeedMessageHandler.loadWebPage: could not get " +
-            "Content-Base header url for this message"
-        );
-      }
+      });
     });
+    // Attach a handler to the returned promise itself. Fire-and-forget UI
+    // callers remain safe, while callers that await it receive the same error.
+    pending.catch(error => {
+      FeedUtils.log.info(
+        "FeedMessageHandler.loadWebPage: article load failed",
+        error
+      );
+    });
+    return pending;
   },
 
   /**
-   * Display summary or load web page for feed messages. Caller should already
-   * know if the message is a feed message.
+   * Displays a feed summary or starts loading its article web page. Restores
+   * the current summary body when its page retrieval fails.
    *
    * @param {nsIMsgDBHdr} aMsgHdr - The message.
-   * @param {boolean} aShowSummary - true if summary is to be displayed,
-   *                                 false if web page.
-   * @returns {void}
+   * @param {boolean} aShowSummary - Whether to display the summary.
+   * @returns {Promise<?nsIURI>} The page load result, or null for a summary.
+   *   Page failures retain the loadWebPage rejection and are handled internally
+   *   for existing callers that ignore the returned promise.
    */
   setContent(aMsgHdr, aShowSummary) {
     if (aShowSummary) {
+      this._pendingWebPage = null;
       // Only here if toggling to summary in 3pane.
       if (this.gToggle && window.gDBView) {
         ReloadMessage();
       }
-    } else {
-      const browser = getMessagePaneBrowser();
-      if (browser && browser.contentDocument && browser.contentDocument.body) {
-        browser.contentDocument.body.hidden = true;
-      }
-      // If in a non rss folder, hide possible remote content bar on a web
-      // page load, as it doesn't apply.
-      gMessageNotificationBar.clearMsgNotifications();
-
-      this.loadWebPage(aMsgHdr, { messagepane: true });
-      this.gToggle = false;
+      return Promise.resolve(null);
     }
+
+    const browser = getMessagePaneBrowser();
+    const body = browser?.contentDocument?.body;
+    if (body) {
+      body.hidden = true;
+    }
+    // Remote-content notifications do not apply to the article web page.
+    gMessageNotificationBar.clearMsgNotifications();
+    const pending = this.loadWebPage(aMsgHdr, { messagepane: true });
+    this._pendingWebPage = pending;
+    this.gToggle = false;
+    pending.then(
+      () => {
+        if (this._pendingWebPage == pending) {
+          this._pendingWebPage = null;
+        }
+      },
+      () => {
+        if (this._pendingWebPage == pending) {
+          this._pendingWebPage = null;
+          if (body && browser.contentDocument?.body == body) {
+            body.hidden = false;
+          }
+        }
+      }
+    );
+    return pending;
   },
 };
 

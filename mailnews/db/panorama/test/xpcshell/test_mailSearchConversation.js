@@ -950,3 +950,72 @@ add_task(async function test_inboxSentArchiveRolesKeepCurrentMovedSelection() {
   }
   await assertCurrentConversation(service, control, [control]);
 });
+
+add_task(async function test_lateAncestorsRefreshCurrentPhysicalMembership() {
+  const folders = ["leaf", "middle", "root"].map(name =>
+    conversationRoot
+      .createLocalSubfolder("conversation-late-ancestors-" + name)
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+  );
+  let service = null;
+  registerCleanupFunction(async () => {
+    await service?.close();
+    for (const folder of folders) {
+      conversationRoot.propagateDelete(folder, true);
+    }
+  });
+  const [a, b, c] = folders;
+  const rootId = "late-ancestor-root@conversation.invalid";
+  const middleId = "late-ancestor-middle@conversation.invalid";
+  const leafId = "late-ancestor-leaf@conversation.invalid";
+  const references = [rootId, middleId];
+  const leaf = addConversationMail(a, leafId, references);
+  const clicked = addConversationMail(b, leafId, references);
+  const sibling = addConversationMail(c, "late-sibling@conversation.invalid", [
+    rootId,
+  ]);
+  const control = addConversationMail(
+    c,
+    "late-unrelated@conversation.invalid",
+    []
+  );
+  Assert.equal(leaf.messageId, clicked.messageId);
+  Assert.notEqual(leaf.messageKey, clicked.messageKey);
+  const file = do_get_profile().clone();
+  file.append("conversation-late-ancestors.sqlite");
+  service = await MailSearchService.open(file, database.sourceId, messageDB);
+  Assert.equal(await service.getText(String(clicked.messageKey)), null);
+
+  // Missing ancestors connect their stored descendants, without invented rows.
+  const initial = [leaf, clicked, sibling];
+  for (const selected of initial) {
+    await assertCurrentConversation(service, selected, initial);
+  }
+  await assertCurrentConversation(service, control, [control]);
+
+  // Re-read through the retained service after each real late-ancestor ingress.
+  // The selected copy's stored thread is not the complete physical component.
+  const middle = addConversationMail(b, middleId, [rootId]);
+  const withMiddle = [...initial, middle];
+  for (const selected of withMiddle) {
+    await assertCurrentConversation(service, selected, withMiddle);
+  }
+  await assertCurrentConversation(service, control, [control]);
+
+  const root = addConversationMail(c, rootId, []);
+  const complete = [...withMiddle, root];
+  for (const selected of complete) {
+    await assertCurrentConversation(service, selected, complete);
+  }
+  await assertCurrentConversation(service, control, [control]);
+  for (const header of [leaf, clicked]) {
+    Assert.equal(header.numReferences, references.length);
+    Assert.deepEqual(
+      Array.from({ length: header.numReferences }, (_, index) =>
+        header.getStringReference(index)
+      ),
+      references,
+      "Late ancestors preserve the original ordered References"
+    );
+  }
+});

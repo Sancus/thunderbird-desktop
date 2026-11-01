@@ -332,6 +332,11 @@ add_task(async function test_saved_search_selected_physical_members() {
     Ci.nsMsgViewSortOrder.ascending
   );
   assertMembershipRows(expected, excluded);
+  Assert.deepEqual(
+    Array.from(first.msgDatabase.getCachedHits(both.URI), membershipIdentity),
+    expected,
+    "The global cache keeps both physical source members"
+  );
   await select_click_row(1);
   await assert_selected_and_displayed(b);
   Assert.deepEqual(
@@ -354,6 +359,11 @@ add_task(async function test_saved_search_selected_physical_members() {
     "Only the selected physical copy leaves the saved search"
   );
   assertMembershipRows([expected[0]], excluded);
+  Assert.deepEqual(
+    Array.from(first.msgDatabase.getCachedHits(both.URI), membershipIdentity),
+    [expected[0]],
+    "The actual deletion removes only the deleted physical member from cache"
+  );
   await assert_selected_and_displayed(a);
   Assert.deepEqual(
     membershipIdentity(get_about_message().gMessage),

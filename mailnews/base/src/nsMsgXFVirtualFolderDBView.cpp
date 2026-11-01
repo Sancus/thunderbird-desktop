@@ -185,6 +185,36 @@ nsresult nsMsgXFVirtualFolderDBView::OnNewHeader(nsIMsgDBHdr* newHdr,
 }
 
 NS_IMETHODIMP
+nsMsgXFVirtualFolderDBView::OnHdrDeleted(nsIMsgDBHdr* header,
+                                         nsMsgKey parentKey, int32_t flags,
+                                         nsIDBChangeListener* instigator) {
+  NS_ENSURE_ARG_POINTER(header);
+  nsresult cacheStatus = NS_OK;
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() && m_viewFolder) {
+    // Native hit keys are global. Remove this deleted key without enumerating
+    // its now-missing physical row or replacing another source folder's hits.
+    nsCString searchUri;
+    cacheStatus = m_viewFolder->GetURI(searchUri);
+    if (NS_SUCCEEDED(cacheStatus)) {
+      nsCOMPtr<nsIMsgDatabase> db;
+      cacheStatus = m_viewFolder->GetMsgDatabase(getter_AddRefs(db));
+      if (NS_SUCCEEDED(cacheStatus)) {
+        cacheStatus = db ? db->UpdateHdrInCache(searchUri, header, false)
+                         : NS_ERROR_UNEXPECTED;
+      }
+    }
+  }
+  // The real deletion must still leave the view if updating the cache fails.
+  nsresult rv =
+      nsMsgSearchDBView::OnHdrDeleted(header, parentKey, flags, instigator);
+  if (NS_FAILED(cacheStatus)) {
+    m_cacheStatus = cacheStatus;
+    return cacheStatus;
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
 nsMsgXFVirtualFolderDBView::OnHdrPropertyChanged(
     nsIMsgDBHdr* aHdrChanged, const nsACString& property, bool aPreChange,
     uint32_t* aStatus, nsIDBChangeListener* aInstigator) {

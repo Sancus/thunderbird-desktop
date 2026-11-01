@@ -27,7 +27,8 @@ class TestPanoramaSendLater(MarionetteTestCase):
                 "mail.panorama.enabled": True,
                 "mailnews.database.global.indexer.enabled": False,
                 "mailnews.sendInBackground": False,
-                "mailnews.sendLater.send_on_quit": False,
+                # Keep queued messages until the explicit post-restart send.
+                "offline.send.unsent_messages": 2,
             }
             for name, value in prefs.items():
                 self.saved_prefs[name] = {

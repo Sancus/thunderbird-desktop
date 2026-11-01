@@ -41,9 +41,8 @@ const { PanoramaSearchIndex } = ChromeUtils.importESModule(
 const { ChatSearchProvider, chatSearchDocumentId } = ChromeUtils.importESModule(
   "resource:///modules/panorama/ChatSearchProvider.sys.mjs"
 );
-const { getLogWriter, closeLogWriter } = ChromeUtils.importESModule(
-  "resource:///modules/logger.sys.mjs"
-);
+const { getLogWriter, closeLogWriter, queueFileOperation } =
+  ChromeUtils.importESModule("resource:///modules/logger.sys.mjs");
 
 let journal, lock, backedUp, originalGloda, work;
 const folders = new Map();
@@ -680,14 +679,42 @@ add_task(async function test_privacyErasureSurvivesReopenAndRebuild() {
   await recoverChat(input);
   Assert.ok((await input.provider.refreshLog(input.path)).indexed);
   const before = await IOUtils.read(input.indexPath);
-  await input.provider.redactMessage({
-    conversation: input.conversation,
-    noLog: true,
-    remoteId: "private-id",
-    time: 1,
-    who: "not-recorded",
-    displayMessage: "notrecordedneedle",
+  const [retained] = await input.provider.getRecoveryRecords(input.id);
+  Assert.ok(JSON.stringify(retained.payload).includes("privacyneedle"));
+  let release;
+  const hold = new Promise(resolve => {
+    release = resolve;
   });
+  const blocker = queueFileOperation(input.path, () => hold);
+  let redaction, overlappingRead;
+  try {
+    redaction = input.provider.redactMessage({
+      conversation: input.conversation,
+      noLog: true,
+      remoteId: "private-id",
+      time: 1,
+      who: "not-recorded",
+      displayMessage: "notrecordedneedle",
+    });
+    overlappingRead = input.provider.getRecoveryRecords(input.id);
+    Assert.ok(
+      (await IOUtils.readUTF8(input.path)).includes("privacyneedle"),
+      "Actual logger source remains unredacted behind its held file operation"
+    );
+    release();
+    await blocker;
+    Assert.deepEqual(await redaction, [input.path]);
+    Assert.deepEqual(
+      await overlappingRead,
+      [],
+      "A read started while source redaction is pending withholds the old payload"
+    );
+  } finally {
+    release();
+    await Promise.allSettled(
+      [blocker, redaction, overlappingRead].filter(Boolean)
+    );
+  }
   const [erased] = await input.provider.getRecoveryRecords(input.id);
   Assert.ok(erased.erased);
   Assert.equal(erased.payload, null);

@@ -157,6 +157,8 @@ prefs = ["mail.panorama.enabled=true"]
 
 ["test_imapTruncatedOfflineBody.js"]
 
+["test_imapLocalMoveUndo.js"]
+
 ["test_imapUndo.js"]
 
 ["test_imapUnsolicitedXDuringIdle.js"]

@@ -101,6 +101,12 @@ struct PendingDestination {
   uint64_t folderId{0};
   nsMsgKey key{nsMsgKey_None};
   uint32_t epoch{0};
+  // False is explicit absence, stored as SQL NULL, never an epoch-zero
+  // sentinel.
+  bool epochKnown{true};
+  static PendingDestination Unobserved(uint64_t folder, nsMsgKey physicalKey) {
+    return {folder, physicalKey, 0, false};
+  }
 };
 
 // Explicit pending destination metadata, not an inferred source-header match.
@@ -130,11 +136,56 @@ struct OfflineOperationData {
   nsTArray<Maybe<PendingDestination>> copyDestinationBindings;
 };
 
+// An explicitly identified surviving operation targeting the removed header.
+struct OfflineUndoCounterpart {
+  nsCString databaseSourceId;
+  uint64_t folderId{0};
+  nsMsgKey key{nsMsgKey_None};
+  uint32_t action{0};
+  Maybe<uint32_t> copyOrdinal;
+  PendingDestination destination;
+};
+
+// Native-owned identity, revision, full payload and immutable queued
+// provenance. Consumed together with RemovedMessage only after a successful
+// restore commit.
+class OfflineOperationUndo final {
+ public:
+  OfflineOperationUndo();
+  ~OfflineOperationUndo();
+  OfflineOperationUndo(OfflineOperationUndo&&);
+  OfflineOperationUndo& operator=(OfflineOperationUndo&&);
+  OfflineOperationUndo(const OfflineOperationUndo&) = delete;
+  OfflineOperationUndo& operator=(const OfflineOperationUndo&) = delete;
+  // Borrowed until move, replacement, successful restore/removal, or
+  // destruction. A separate selected-MOVE Redo output owns the full intent;
+  // this borrowed view is never permission to reconstruct or write a consumed
+  // snapshot.
+  const OfflineOperationData* Operation() const;
+
+ private:
+  friend class MessageDatabase;
+  struct Data;
+  UniquePtr<Data> mData;
+};
+
 struct ServerMessageLocation {
   uint64_t folderId{0};
   nsMsgKey key{nsMsgKey_None};
   uint32_t epoch{0};
   uint32_t uid{0};
+};
+
+// Immutable queued source identity for the narrow prepublication return-home
+// binding. The physical operation key is distinct from its historical source
+// key.
+struct QueuedSourceIdentity {
+  nsCString databaseSourceId;
+  uint64_t folderId{0};
+  nsMsgKey key{nsMsgKey_None};
+  uint64_t operationId{0};
+  uint64_t revision{0};
+  Maybe<ServerMessageLocation> source;
 };
 
 // Destination UIDVALIDITY and UID reported together by APPENDUID/COPYUID.
@@ -156,6 +207,17 @@ struct OfflineAttempt {
   Maybe<ServerMessageLocation> source;
   Maybe<PendingDestination> destination;
   Maybe<uint32_t> confirmedUid;
+  Maybe<uint32_t> confirmedEpoch;
+  // Explicit action snapshots preserve the whole ordered operation payload.
+  nsCString transferSourceId;
+  nsMsgKey operationKey{nsMsgKey_None};
+  Maybe<uint32_t> copyOrdinal;
+  bool transferAccepted{false};
+  Maybe<MessageBodyState> transferBody;
+  // An actual tagged APPEND OK is durable even without an authoritative UID.
+  // Keep Sent until an actual UID receipt confirms the destination.
+  bool appendAccepted{false};
+  Maybe<MessageBodyState> appendBody;
 };
 
 // Physical identity only; never a Message-ID or protocol UID.
@@ -351,13 +413,28 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult RemoveMessageForUndo(nsMsgKey key, uint64_t folderId,
                                 const nsACString& databaseSourceId,
                                 MessageRemovalAccounting accounting,
-                                RemovedMessage& output);
+                                RemovedMessage& output,
+                                OfflineOperationUndo* redo = nullptr,
+                                OfflineOperationUndo* nextOffline = nullptr);
   // Requires a fresh provider-finished target write, not old-token reuse.
   // Old removed bytes remain expunged; no UID binding is copied.
   // Allocates a fresh key; consumes captured only after successful commit.
   nsresult RestoreMessageForUndo(uint64_t folderId, RemovedMessage& captured,
                                  const FinishedMessageBody& finished,
-                                 nsMsgKey* key, Message** liveHeader = nullptr);
+                                 nsMsgKey* key, Message** liveHeader = nullptr,
+                                 OfflineOperationUndo* offline = nullptr,
+                                 const PendingDestination* cancelMove = nullptr,
+                                 OfflineOperationUndo* redo = nullptr);
+  // Explicit cancelMove selects only that queued unsent MOVE. The separate redo
+  // output owns the immutable full intent; default full restore is unchanged.
+  // Redo is consumed with nextOffline/RemovedMessage output only on removal
+  // commit. Capture before removing the queued operation. No dispatched
+  // resurrection. Optional counterpart must identify an actual COPY/MOVE
+  // destination binding.
+  nsresult CaptureOfflineOperationForUndo(
+      uint64_t folderId, nsMsgKey key, const nsACString& databaseSourceId,
+      OfflineOperationUndo& output,
+      const OfflineUndoCounterpart* counterpart = nullptr);
 
   // Pending relocation blocks new body resolutions and folder mutation.
   nsresult CheckFolderBodyAccess(uint64_t folderId);
@@ -382,6 +459,21 @@ class MessageDatabase : public nsIMessageDatabase {
   // Does not check the current server epoch or begin an attempt.
   nsresult GetOfflineOperationSource(uint64_t folderId, nsMsgKey key,
                                      Maybe<ServerMessageLocation>& output);
+  nsresult GetQueuedSourceIdentity(uint64_t folderId, nsMsgKey key,
+                                   QueuedSourceIdentity& output);
+  // Only a matching actual first UIDVALIDITY observation authorizes this call.
+  nsresult ObserveOfflineDestinationEpoch(const QueuedSourceIdentity& expected,
+                                          uint32_t action,
+                                          const Maybe<uint32_t>& copyOrdinal,
+                                          const PendingDestination& destination,
+                                          uint32_t observedEpoch);
+  // Return an actual queued destination to its captured server source, before
+  // publication. No generic staged UID/property bypass.
+  nsresult BindStagedMessageToQueuedSource(nsMsgKey stagedKey,
+                                           uint64_t folderId,
+                                           const QueuedSourceIdentity& expected,
+                                           const Maybe<uint32_t>& copyOrdinal,
+                                           const MessageBodyState& returning);
   nsresult StoreOfflineOperation(uint64_t folderId, nsMsgKey key,
                                  const OfflineOperationData& input);
   nsresult SetOfflineOperationPlayingBack(uint64_t folderId, nsMsgKey key,
@@ -395,10 +487,31 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult BeginOfflineAttempt(uint64_t folderId, nsMsgKey key,
                                uint32_t operation,
                                const Maybe<PendingDestination>& destination,
-                               uint64_t& attemptId);
+                               uint64_t& attemptId,
+                               const MessageBodyState* appendBody = nullptr);
+  // COPY selects its actual zero-based stored ordinal; other actions use
+  // Nothing. Existing legacy dispatch and mutation fences remain unchanged.
+  nsresult BeginOfflineAction(uint64_t folderId, nsMsgKey key, uint32_t action,
+                              const Maybe<PendingDestination>& destination,
+                              const Maybe<uint32_t>& copyOrdinal,
+                              uint64_t& attemptId);
+  nsresult GetOfflineAttemptForAction(uint64_t folderId, nsMsgKey key,
+                                      uint32_t action,
+                                      const Maybe<uint32_t>& copyOrdinal,
+                                      OfflineAttempt& output);
+  nsresult RecordOfflineCopyAcceptedWithoutUid(const OfflineAttempt& expected);
+  nsresult ValidateOfflineCopyAcceptedWithoutUid(
+      const OfflineAttempt& expected);
   nsresult GetOfflineAttempt(uint64_t attemptId, OfflineAttempt& output);
   nsresult GetCurrentOfflineAttempt(uint64_t folderId, nsMsgKey key,
                                     OfflineAttempt& output);
+  // Call only for a matching tagged APPEND OK without APPENDUID. Recording
+  // that fact does not depend on later local body/epoch settlement succeeding.
+  nsresult RecordOfflineAppendAcceptedWithoutUid(
+      const OfflineAttempt& expected);
+  // Local-only retry: retain the operation, body and unresolved destination.
+  nsresult ValidateOfflineAppendAcceptedWithoutUid(
+      const OfflineAttempt& expected);
   nsresult MarkOfflineAttemptAmbiguous(uint64_t attemptId);
   // Caller has proved no server effect, not merely lost an acknowledgement.
   nsresult ResolveOfflineAttemptNotApplied(uint64_t attemptId);
@@ -538,13 +651,57 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult InsertMessage(uint64_t folderId, const ::RawHdr& header, bool staged,
                          bool notifyLegacy, nsMsgKey* key, Message** liveHeader,
                          RemovedMessage* restoring = nullptr,
-                         const FinishedMessageBody* finished = nullptr);
+                         const FinishedMessageBody* finished = nullptr,
+                         OfflineOperationUndo* offline = nullptr,
+                         const PendingDestination* cancelMove = nullptr,
+                         OfflineOperationUndo* redo = nullptr);
 
   nsresult ReadOfflineOperationIdentity(uint64_t folderId, nsMsgKey key,
                                         int64_t& id, int64_t& revision,
                                         Maybe<ServerMessageLocation>& source,
                                         Maybe<uint32_t>* folderEpoch = nullptr);
   nsresult RequireOfflineOperationMutable(int64_t operationId);
+  nsresult ValidateQueuedSourceIdentity(const QueuedSourceIdentity& expected);
+  nsresult ObserveDestinationEpochInTransaction(
+      const QueuedSourceIdentity& expected, uint32_t action,
+      const Maybe<uint32_t>& copyOrdinal, const PendingDestination& destination,
+      uint32_t observedEpoch);
+  nsresult BeginOfflineAttemptInternal(
+      uint64_t folderId, nsMsgKey key, uint32_t operation,
+      const Maybe<PendingDestination>& destination, uint64_t& attemptId,
+      const MessageBodyState* appendBody, const Maybe<uint32_t>* copyOrdinal);
+  nsresult RequireOfflineActionDispatchable(int64_t id, int64_t revision,
+                                            uint32_t action,
+                                            const Maybe<uint32_t>& copyOrdinal);
+  nsresult ReadExpectedTransferAttempt(const OfflineAttempt& expected,
+                                       OfflineAttempt& actual);
+  nsresult ValidateTransferTargetInTransaction(const OfflineAttempt& attempt);
+  nsresult ReadExpectedAppendAttempt(const OfflineAttempt& expected,
+                                     OfflineAttempt& actual);
+  nsresult ValidateAppendTargetInTransaction(const OfflineAttempt& attempt);
+  nsresult RequireOfflineUndoQueued(int64_t operationId,
+                                    const OfflineOperationData& operation);
+  nsresult StoreOfflineOperationInTransaction(
+      uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
+      const OfflineOperationUndo* restoring = nullptr,
+      bool restoreEmptyCanceledMove = false,
+      const Maybe<uint32_t>& canceledDestination = Nothing());
+  nsresult CaptureOfflineOperationInTransaction(
+      uint64_t folderId, nsMsgKey key, const nsACString& databaseSourceId,
+      OfflineOperationUndo& output, const OfflineUndoCounterpart* counterpart,
+      const PendingDestination* extraTarget = nullptr);
+  nsresult ValidateOfflineUndoState(const OfflineOperationUndo::Data& saved,
+                                    bool allowMissingEmpty = false);
+  nsresult CancelOfflineMoveInTransaction(uint64_t folderId, nsMsgKey key,
+                                          const PendingDestination& selected,
+                                          const OfflineOperationUndo& full,
+                                          OfflineOperationUndo& canceled);
+  nsresult ReapplyOfflineMoveInTransaction(uint64_t folderId, nsMsgKey key,
+                                           const OfflineOperationUndo& redo,
+                                           OfflineOperationUndo& nextOffline);
+  nsresult RestoreOfflineOperationInTransaction(uint64_t folderId, nsMsgKey key,
+                                                const RemovedMessage& removed,
+                                                OfflineOperationUndo& offline);
   nsresult ValidatePendingDestination(const PendingDestination& destination,
                                       uint64_t folderId, nsMsgKey key,
                                       bool append, int64_t operationId);
@@ -555,7 +712,9 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
                                  const nsACString* databaseSourceId,
                                  MessageRemovalAccounting accounting,
-                                 RemovedMessage* output = nullptr);
+                                 RemovedMessage* output = nullptr,
+                                 OfflineOperationUndo* redo = nullptr,
+                                 OfflineOperationUndo* nextOffline = nullptr);
   nsresult ReadRemovedMessage(nsMsgKey key, RemovedMessage& output);
   nsresult AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
                                  const nsACString& databaseSourceId,

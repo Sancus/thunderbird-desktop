@@ -11,6 +11,9 @@
 #include "nsTArray.h"
 #include "nsImapUtils.h"
 #include "prmem.h"
+#ifdef MOZ_PANORAMA
+#  include "MessageDatabase.h"
+#endif
 
 class nsImapSearchResultIterator;
 class nsIImapFlagAndUidState;
@@ -61,6 +64,19 @@ class nsImapServerResponseParser : public nsImapGenericParser {
   int32_t NumberOfRecentMessages();
   ImapUid FolderUIDValidity();
   ImapUid CurrentResponseUID();
+#ifdef MOZ_PANORAMA
+  bool CopyAccepted() const { return mCopyAccepted; }
+  bool CopyRejected() const { return mCopyRejected; }
+  mozilla::Maybe<uint32_t> CopyEpoch() const { return mCopyEpoch; }
+  nsCString CopySourceUidSet() const { return mCopySourceSet; }
+  nsCString CopyDestinationUidSet() const { return mCopyDestinationSet; }
+  bool AppendAccepted() const { return mAppendAccepted; }
+  mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> AppendReceipt()
+      const {
+    return mAppendReceipt;
+  }
+  bool AppendRejected() const { return mAppendRejected; }
+#endif
   ImapUid HighestRecordedUID();
   void ResetHighestRecordedUID();
   bool IsNumericString(const char* string);
@@ -220,6 +236,19 @@ class nsImapServerResponseParser : public nsImapGenericParser {
   int32_t fNumberOfExistingMessages;
   int32_t fNumberOfRecentMessages;
   ImapUid fCurrentResponseUID;
+#ifdef MOZ_PANORAMA
+  mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> mAppendReceipt;
+  bool mParsingCopy = false;
+  bool mTaggedCopyOk = false;
+  bool mCopyAccepted = false;
+  bool mCopyRejected = false;
+  mozilla::Maybe<uint32_t> mCopyEpoch;
+  nsCString mCopySourceSet, mCopyDestinationSet;
+  bool mParsingAppend = false;
+  bool mTaggedAppendOk = false;
+  bool mAppendRejected = false;
+  bool mAppendAccepted = false;
+#endif
   ImapUid fHighestRecordedUID;
   // used to handle server that sends msg size after headers
   ImapUid fReceivedHeaderOrSizeForUID;

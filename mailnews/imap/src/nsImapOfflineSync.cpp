@@ -9,6 +9,13 @@
 #include "nsImapOfflineSync.h"
 #ifdef MOZ_PANORAMA
 #  include "mozilla/StaticPrefs_mail.h"
+#  include "DatabaseCore.h"
+#  include "nsImapUrl.h"
+#  include "PerFolderDatabase.h"
+#  include "nsIFolderLookupService.h"
+#  include "mozilla/ScopeExit.h"
+#  include "mozilla/ResultExtensions.h"
+#  include "mozilla/AutoRestore.h"
 #endif
 #include "nsImapMailFolder.h"
 #include "nsIMsgDatabase.h"
@@ -27,14 +34,67 @@
 
 /**
  * Set or clear the `nsMsgFolderFlags::OfflineEvents` flag on `folder`,
- * depending on whether it has any offline operations queued in its database.
- * Call this while that database is still open. Special case: if the database
- * cannot be asked, the flag is cleared.
+ * depending on whether it has dispatchable offline work in its database.
+ * Native accepted unknown-UID recovery is retained without redispatch; errors
+ * preserve the flag. The legacy branch retains its existing fallback.
  */
-static void UpdateOfflineEventsFlag(nsIMsgFolder* folder,
-                                    nsIMsgOfflineOpsDatabase* db) {
+static nsresult UpdateOfflineEventsFlag(nsIMsgFolder* folder,
+                                        nsIMsgOfflineOpsDatabase* db) {
   MOZ_ASSERT(folder);
   nsTArray<nsMsgKey> pending;
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_TRUE(db, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(db->ListAllOfflineOpIds(pending));
+    uint64_t folderId;
+    MOZ_TRY(folder->GetId(&folderId));
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    for (nsMsgKey key : pending) {
+      using namespace mozilla::mailnews;
+      OfflineOperationData payload;
+      MOZ_TRY(core->MessageDB().GetOfflineOperation(folderId, key, payload));
+      for (uint32_t action : {nsIMsgOfflineImapOperation::kFlagsChanged,
+                              nsIMsgOfflineImapOperation::kAddKeywords,
+                              nsIMsgOfflineImapOperation::kRemoveKeywords,
+                              nsIMsgOfflineImapOperation::kMsgCopy,
+                              nsIMsgOfflineImapOperation::kMsgMoved,
+                              nsIMsgOfflineImapOperation::kAppendDraft,
+                              nsIMsgOfflineImapOperation::kAppendTemplate,
+                              nsIMsgOfflineImapOperation::kDeleteAllMsgs}) {
+        if (!(payload.operation & action)) continue;
+        bool append = action == nsIMsgOfflineImapOperation::kAppendDraft ||
+                      action == nsIMsgOfflineImapOperation::kAppendTemplate;
+        bool copy = action == nsIMsgOfflineImapOperation::kMsgCopy;
+        uint32_t count = copy ? payload.copyDestinations.Length() : 1;
+        for (uint32_t ordinal = 0; ordinal < count; ++ordinal) {
+          OfflineAttempt attempt;
+          nsresult found =
+              append ? core->MessageDB().GetCurrentOfflineAttempt(folderId, key,
+                                                                  attempt)
+                     : core->MessageDB().GetOfflineAttemptForAction(
+                           folderId, key, action,
+                           copy ? mozilla::Some(ordinal) : mozilla::Nothing(),
+                           attempt);
+          if (found == NS_ERROR_NOT_AVAILABLE ||
+              (NS_SUCCEEDED(found) &&
+               (attempt.operation != action ||
+                attempt.state == OfflineAttemptState::Pending)))
+            return folder->SetFlag(nsMsgFolderFlags::OfflineEvents);
+          MOZ_TRY(found);
+          // A retained effect/uncertainty needs recovery, not another send.
+          // Counterpart-only records likewise do not make work dispatchable.
+          if (attempt.appendAccepted)
+            MOZ_TRY(core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
+                attempt));
+        }
+      }
+    }
+    // Accepted unknown-UID recovery is retained, but is not dispatchable work.
+    return folder->ClearFlag(nsMsgFolderFlags::OfflineEvents);
+  }
+#endif
   if (db && NS_SUCCEEDED(db->ListAllOfflineOpIds(pending)) &&
       !pending.IsEmpty()) {
     folder->SetFlag(nsMsgFolderFlags::OfflineEvents);
@@ -43,6 +103,7 @@ static void UpdateOfflineEventsFlag(nsIMsgFolder* folder,
     // instead of selecting it, so a flag we cannot justify has to go.
     folder->ClearFlag(nsMsgFolderFlags::OfflineEvents);
   }
+  return NS_OK;
 }
 
 NS_IMPL_ISUPPORTS(nsImapOfflineSync, nsIUrlListener, nsIMsgCopyServiceListener,
@@ -82,6 +143,23 @@ NS_IMETHODIMP nsImapOfflineSync::OnStartRunningUrl(nsIURI* url) {
 
 NS_IMETHODIMP
 nsImapOfflineSync::OnStopRunningUrl(nsIURI* url, nsresult exitCode) {
+#ifdef MOZ_PANORAMA
+  nsCOMPtr<nsIImapUrl> nativeImapUrl = do_QueryInterface(url);
+  if (nativeImapUrl && !static_cast<nsImapUrl*>(nativeImapUrl.get())
+                            ->CopyNativeQueuedCopies()
+                            .IsEmpty()) {
+    return mNativeTransfer ? CompleteNativeTransfer(url, exitCode) : NS_OK;
+  }
+  if (nativeImapUrl && static_cast<nsImapUrl*>(nativeImapUrl.get())
+                           ->CopyNativeQueuedAppendTarget()) {
+    if (!mNativeAppend) return NS_OK;
+    return CompleteNativeAppend(url, exitCode);
+  }
+#endif
+#ifdef MOZ_PANORAMA
+  if (mNativeAction && mNativeActionUrl == url)
+    return CompleteNativeAction(url, exitCode);
+#endif
   nsresult rv = exitCode;
 
   if (m_curTempFile) {
@@ -397,6 +475,404 @@ nsresult nsImapOfflineSync::ProcessKeywordOperation(
   return NS_OK;
 }
 
+#ifdef MOZ_PANORAMA
+nsresult nsImapOfflineSync::ClearNativeAppend(nsIMsgOfflineImapOperation* op,
+                                              uint32_t action) {
+  mozilla::AutoRestore<bool> restoring(mNativeAppendCompleting);
+  mNativeAppendCompleting = true;
+  MOZ_TRY(op->SetPlayingBack(false));
+  MOZ_TRY(op->ClearOperation(action));
+  nsOfflineImapOperationType remaining;
+  MOZ_TRY(op->GetOperation(&remaining));
+  if (!remaining) MOZ_TRY(m_currentDB->RemoveOfflineOp(op));
+  return NS_OK;
+}
+
+nsresult nsImapOfflineSync::ProcessNativeAction(nsIMsgOfflineImapOperation* op,
+                                                uint32_t action) {
+  using namespace mozilla::mailnews;
+  NS_ENSURE_TRUE(!mNativeAction && op, NS_ERROR_IN_PROGRESS);
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  uint64_t folderId;
+  nsMsgKey key;
+  MOZ_TRY(m_currentFolder->GetId(&folderId));
+  MOZ_TRY(op->GetMessageKey(&key));
+  uint64_t id;
+  MOZ_TRY(core->MessageDB().BeginOfflineAction(
+      folderId, key, action, mozilla::Nothing(), mozilla::Nothing(), id));
+  auto attempt = mozilla::MakeUnique<OfflineAttempt>();
+  MOZ_TRY(core->MessageDB().GetOfflineAttempt(id, *attempt));
+  NS_ENSURE_TRUE(attempt->source, NS_ERROR_NOT_AVAILABLE);
+  OfflineOperationData payload;
+  MOZ_TRY(core->MessageDB().GetOfflineOperation(folderId, key, payload));
+  nsAutoCString uid;
+  uid.AppendInt(attempt->source->uid);
+  mNativeAction = std::move(attempt);
+  nsCOMPtr<nsIImapService> service = mozilla::components::Imap::Service();
+  nsresult rv;
+  if (action == nsIMsgOfflineImapOperation::kFlagsChanged) {
+    rv = service->SetMessageFlags(m_currentFolder, this,
+                                  getter_AddRefs(mNativeActionUrl), uid,
+                                  payload.newFlags, true);
+  } else {
+    rv = service->StoreCustomKeywords(
+        m_currentFolder, m_window,
+        action == nsIMsgOfflineImapOperation::kAddKeywords
+            ? payload.keywordsToAdd
+            : EmptyCString(),
+        action == nsIMsgOfflineImapOperation::kRemoveKeywords
+            ? payload.keywordsToRemove
+            : EmptyCString(),
+        uid, getter_AddRefs(mNativeActionUrl));
+    if (NS_SUCCEEDED(rv) && mNativeActionUrl) {
+      nsCOMPtr<nsIMsgMailNewsUrl> news = do_QueryInterface(mNativeActionUrl);
+      rv = news ? news->RegisterListener(this) : NS_ERROR_NOT_AVAILABLE;
+    }
+  }
+  if (NS_SUCCEEDED(rv) && !mNativeActionUrl) rv = NS_ERROR_NOT_AVAILABLE;
+  if (NS_FAILED(rv)) {
+    (void)core->MessageDB().MarkOfflineAttemptAmbiguous(id);
+    mNativeAction = nullptr;
+    mNativeActionUrl = nullptr;
+  }
+  return rv;
+}
+
+nsresult nsImapOfflineSync::CompleteNativeAction(nsIURI* url, nsresult status) {
+  auto attempt = std::move(mNativeAction);
+  mNativeActionUrl = nullptr;
+  NS_ENSURE_TRUE(attempt, NS_ERROR_NOT_AVAILABLE);
+  RefPtr<nsImapOfflineSync> self(this);
+  RefPtr<mozilla::mailnews::DatabaseCore> core =
+      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  nsresult settled =
+      NS_SUCCEEDED(status)
+          ? core->MessageDB().ConfirmOfflineAttempt(attempt->id,
+                                                    mozilla::Nothing())
+          : core->MessageDB().MarkOfflineAttemptAmbiguous(attempt->id);
+  if (NS_SUCCEEDED(status)) status = settled;
+  if (NS_FAILED(status) && NS_SUCCEEDED(m_firstPlaybackError))
+    m_firstPlaybackError = status;
+  ++m_KeyIndex;
+  return ProcessNextOperation();
+}
+
+nsresult nsImapOfflineSync::ProcessNativeTransfer(
+    nsIMsgOfflineImapOperation* op, uint32_t action) {
+  using namespace mozilla::mailnews;
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core && op && m_currentFolder && !mNativeTransfer,
+                 NS_ERROR_NOT_AVAILABLE);
+  uint64_t folderId;
+  MOZ_TRY(m_currentFolder->GetId(&folderId));
+  nsMsgKey key;
+  MOZ_TRY(op->GetMessageKey(&key));
+  OfflineOperationData payload;
+  MOZ_TRY(core->MessageDB().GetOfflineOperation(folderId, key, payload));
+  bool copy = action == nsIMsgOfflineImapOperation::kMsgCopy;
+  uint32_t count = copy ? payload.copyDestinations.Length() : 1;
+  NS_ENSURE_TRUE(!copy || payload.copyDestinationBindings.Length() == count,
+                 NS_ERROR_NOT_AVAILABLE);
+  for (uint32_t index = 0; index < count; ++index) {
+    mozilla::Maybe<uint32_t> ordinal =
+        copy ? mozilla::Some(index) : mozilla::Nothing();
+    OfflineAttempt previous;
+    nsresult found = core->MessageDB().GetOfflineAttemptForAction(
+        folderId, key, action, ordinal, previous);
+    if (NS_SUCCEEDED(found) && previous.state != OfflineAttemptState::Pending) {
+      if (previous.transferAccepted && !previous.confirmedUid) {
+        nsresult validated =
+            core->MessageDB().ValidateOfflineCopyAcceptedWithoutUid(previous);
+        if (NS_FAILED(validated) && NS_SUCCEEDED(m_firstPlaybackError))
+          m_firstPlaybackError = validated;
+      }
+      // Preserve uncertainty/known effect and its entire frozen payload. The
+      // next ordinal/action is independent; this one is never sent again.
+      if ((previous.state == OfflineAttemptState::Sent ||
+           previous.state == OfflineAttemptState::Ambiguous) &&
+          !previous.transferAccepted && NS_SUCCEEDED(m_firstPlaybackError))
+        m_firstPlaybackError = NS_ERROR_NOT_AVAILABLE;
+      continue;
+    }
+    NS_ENSURE_TRUE(NS_SUCCEEDED(found) || found == NS_ERROR_NOT_AVAILABLE,
+                   found);
+    auto destination = copy ? payload.copyDestinationBindings[index]
+                            : payload.pendingDestination;
+    NS_ENSURE_TRUE(destination, NS_ERROR_NOT_AVAILABLE);
+    const nsCString& uri =
+        copy ? payload.copyDestinations[index] : payload.destinationFolderURI;
+    nsCOMPtr<nsIFolderLookupService> folders =
+        do_GetService(NS_FOLDERLOOKUPSERVICE_CONTRACTID);
+    NS_ENSURE_STATE(folders);
+    nsCOMPtr<nsIMsgFolder> target;
+    MOZ_TRY(folders->GetFolderForURL(uri, getter_AddRefs(target)));
+    NS_ENSURE_TRUE(target && DestFolderOnSameServer(target),
+                   NS_ERROR_NOT_AVAILABLE);
+    uint64_t targetId;
+    MOZ_TRY(target->GetId(&targetId));
+    NS_ENSURE_TRUE(targetId == destination->folderId, NS_ERROR_NOT_AVAILABLE);
+    if (!destination->epochKnown) {
+      uint32_t observed;
+      nsresult epoch =
+          core->FolderDB().GetFolderUidValidity(targetId, observed);
+      if (NS_SUCCEEDED(epoch)) {
+        QueuedSourceIdentity identity;
+        MOZ_TRY(
+            core->MessageDB().GetQueuedSourceIdentity(folderId, key, identity));
+        MOZ_TRY(core->MessageDB().ObserveOfflineDestinationEpoch(
+            identity, action, ordinal, *destination, observed));
+        destination->epoch = observed;
+        destination->epochKnown = true;
+      } else {
+        NS_ENSURE_TRUE(epoch == NS_ERROR_NOT_AVAILABLE, epoch);
+      }
+    }
+    uint64_t id;
+    MOZ_TRY(core->MessageDB().BeginOfflineAction(folderId, key, action,
+                                                 destination, ordinal, id));
+    auto attempt = mozilla::MakeUnique<OfflineAttempt>();
+    MOZ_TRY(core->MessageDB().GetOfflineAttempt(id, *attempt));
+    NS_ENSURE_TRUE(attempt->source && attempt->destination,
+                   NS_ERROR_NOT_AVAILABLE);
+    RefPtr<nsImapMailCopyState> state = new nsImapMailCopyState();
+    state->m_nativeQueuedCopies.AppendElement(*attempt);
+    nsAutoCString uid;
+    uid.AppendInt(attempt->source->uid);
+    mNativeTransfer = std::move(attempt);
+    nsCOMPtr<nsIImapService> service = mozilla::components::Imap::Service();
+    nsCOMPtr<nsIURI> url;
+    nsresult started =
+        service->OnlineMessageCopy(m_currentFolder, uid, target, true, !copy,
+                                   this, getter_AddRefs(url), state, m_window);
+    if (NS_FAILED(started) && mNativeTransfer) {
+      // A launch error does not prove no send; retain the fence and first
+      // error.
+      (void)core->MessageDB().MarkOfflineAttemptAmbiguous(mNativeTransfer->id);
+      mNativeTransfer = nullptr;
+    }
+    return started;
+  }
+  ++m_KeyIndex;
+  return ProcessNextOperation();
+}
+
+nsresult nsImapOfflineSync::CompleteNativeTransfer(nsIURI* url,
+                                                   nsresult status) {
+  using namespace mozilla::mailnews;
+  auto target = std::move(mNativeTransfer);
+  NS_ENSURE_TRUE(target, NS_ERROR_NOT_AVAILABLE);
+  RefPtr<nsImapOfflineSync> self(this);
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  OfflineAttempt actual;
+  nsresult read = core->MessageDB().GetOfflineAttempt(target->id, actual);
+  if (NS_SUCCEEDED(status) && NS_FAILED(read)) status = read;
+  if (NS_SUCCEEDED(read) && !actual.transferAccepted && !actual.confirmedUid) {
+    nsresult ambiguous =
+        core->MessageDB().MarkOfflineAttemptAmbiguous(actual.id);
+    if (NS_SUCCEEDED(status))
+      status = NS_FAILED(ambiguous) ? ambiguous : NS_ERROR_NOT_AVAILABLE;
+  }
+  if (target->operation == nsIMsgOfflineImapOperation::kMsgMoved) {
+    nsCOMPtr<nsIImapUrl> imap = do_QueryInterface(url);
+    if (NS_SUCCEEDED(status) &&
+        (!actual.confirmedUid || !imap ||
+         !static_cast<nsImapUrl*>(imap.get())->NativeSourceRetired()))
+      status = NS_ERROR_NOT_AVAILABLE;
+    // COPY confirmation is separate from source retirement. Never clear the
+    // full operation or delete its source on an unresolved/failed destination.
+    ++m_KeyIndex;
+  }
+  if (NS_FAILED(status) && NS_SUCCEEDED(m_firstPlaybackError))
+    m_firstPlaybackError = status;
+  return ProcessNextOperation();
+}
+
+nsresult nsImapOfflineSync::ProcessNativeAppend(nsIMsgOfflineImapOperation* op,
+                                                uint32_t action) {
+  using namespace mozilla::mailnews;
+  NS_ENSURE_FALSE(mNativeAppend, NS_ERROR_IN_PROGRESS);
+  nsMsgKey key;
+  MOZ_TRY(op->GetMessageKey(&key));
+  uint64_t folderId;
+  MOZ_TRY(m_currentFolder->GetId(&folderId));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  MOZ_TRY(m_currentDB->GetMsgHdrForKey(key, getter_AddRefs(header)));
+  NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  auto& db = core->MessageDB();
+  OfflineOperationData payload;
+  MOZ_TRY(db.GetOfflineOperation(folderId, key, payload));
+  NS_ENSURE_TRUE(payload.operation & action, NS_ERROR_NOT_AVAILABLE);
+  OfflineAttempt prior;
+  nsresult lookup = db.GetCurrentOfflineAttempt(folderId, key, prior);
+  if (NS_SUCCEEDED(lookup)) {
+    NS_ENSURE_TRUE(prior.operation == action, NS_ERROR_NOT_AVAILABLE);
+    if (prior.appendAccepted) {
+      MOZ_TRY(db.ValidateOfflineAppendAcceptedWithoutUid(prior));
+      return ProcessNextOperation();
+    }
+    if (prior.state == OfflineAttemptState::Confirmed) {
+      MOZ_TRY(ClearNativeAppend(op, action));
+      return ProcessNextOperation();
+    }
+    NS_ENSURE_TRUE(prior.state == OfflineAttemptState::Pending,
+                   NS_ERROR_NOT_AVAILABLE);
+  } else {
+    NS_ENSURE_TRUE(lookup == NS_ERROR_NOT_AVAILABLE, lookup);
+  }
+  auto target = mozilla::MakeUnique<NativeQueuedAppendTarget>();
+  MOZ_TRY(db.GetMessageBodyState(key, target->body));
+  NS_ENSURE_TRUE(target->body.folderId == folderId && target->body.storeToken &&
+                     (target->body.flags & nsMsgMessageFlags::Offline),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString source;
+  MOZ_TRY(core->GetSourceId(source));
+  NS_ENSURE_TRUE(source.Equals(target->body.databaseSourceId),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(m_currentDB->GetDBFolderInfo(getter_AddRefs(info)));
+  MOZ_TRY(info->GetImapUidValidity(&target->epoch));
+  NS_ENSURE_TRUE(target->epoch && target->epoch == GetCurrentUIDValidity(),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString uri;
+  MOZ_TRY(m_currentFolder->GetURI(uri));
+  NS_ENSURE_TRUE(payload.destinationFolderURI.Equals(uri),
+                 NS_ERROR_NOT_AVAILABLE);
+
+  nsCOMPtr<nsIFile> temporary;
+  MOZ_TRY(GetSpecialDirectoryWithFileName(NS_OS_TEMP_DIR, "nscpmsg.txt",
+                                          getter_AddRefs(temporary)));
+  MOZ_TRY(temporary->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 00600));
+  auto removeTemporary =
+      mozilla::MakeScopeExit([&] { temporary->Remove(false); });
+  nsCOMPtr<nsIInputStream> input;
+  MOZ_TRY(m_currentFolder->GetMsgInputStream(header, getter_AddRefs(input)));
+  auto closeInput = mozilla::MakeScopeExit([&] { input->Close(); });
+  nsCOMPtr<nsIOutputStream> output;
+  MOZ_TRY(MsgNewBufferedFileOutputStream(getter_AddRefs(output), temporary,
+                                         PR_WRONLY | PR_CREATE_FILE, 00600));
+  uint64_t copied = 0;
+  nsresult result = SyncCopyStream(input, output, copied, FILE_IO_BUFFER_SIZE);
+  nsresult inputClose = input->Close();
+  closeInput.release();
+  nsresult outputClose = output->Close();
+  MOZ_TRY(result);
+  MOZ_TRY(inputClose);
+  MOZ_TRY(outputClose);
+  NS_ENSURE_TRUE(copied == target->body.offlineMessageSize,
+                 NS_ERROR_NOT_AVAILABLE);
+  MessageBodyState afterRead;
+  MOZ_TRY(db.GetMessageBodyState(key, afterRead));
+  NS_ENSURE_TRUE(
+      afterRead.databaseSourceId.Equals(target->body.databaseSourceId) &&
+          afterRead.folderId == target->body.folderId &&
+          afterRead.storeToken == target->body.storeToken &&
+          afterRead.contentRevision == target->body.contentRevision &&
+          afterRead.locationRevision == target->body.locationRevision,
+      NS_ERROR_NOT_AVAILABLE);
+  uint64_t attemptId;
+  MOZ_TRY(db.BeginOfflineAttempt(
+      folderId, key, action,
+      mozilla::Some(PendingDestination{folderId, key, target->epoch}),
+      attemptId, &target->body));
+  MOZ_TRY(db.GetOfflineAttempt(attemptId, target->attempt));
+  RefPtr<nsImapMailCopyState> state = new nsImapMailCopyState();
+  state->m_messages.AppendElement(header);
+  state->m_nativeQueuedAppend =
+      mozilla::MakeUnique<NativeQueuedAppendTarget>(*target);
+  mNativeAppend = std::move(target);
+  mNativeAppendOp = op;
+  m_curTempFile = temporary;
+  removeTemporary.release();
+  nsCOMPtr<nsIImapService> service = mozilla::components::Imap::Service();
+  result = service ? service->AppendMessageFromFile(temporary, m_currentFolder,
+                                                    EmptyCString(), true, true,
+                                                    this, state, m_window)
+                   : NS_ERROR_NOT_AVAILABLE;
+  if (NS_FAILED(result)) {
+    // A failed launcher may have begun network work. Retain the attempt fence,
+    // and let our caller finish the playback exactly once with the first error.
+    (void)db.MarkOfflineAttemptAmbiguous(attemptId);
+    mNativeAppend = nullptr;
+    mNativeAppendOp = nullptr;
+    m_curTempFile->Remove(false);
+    m_curTempFile = nullptr;
+    return result;
+  }
+  return NS_OK;
+}
+
+nsresult nsImapOfflineSync::CompleteNativeAppend(nsIURI* url, nsresult status) {
+  using namespace mozilla::mailnews;
+  auto target = std::move(mNativeAppend);
+  nsCOMPtr<nsIMsgOfflineImapOperation> op = mNativeAppendOp.forget();
+  NS_ENSURE_TRUE(target && op, NS_ERROR_NOT_AVAILABLE);
+  if (m_curTempFile) {
+    m_curTempFile->Remove(false);
+    m_curTempFile = nullptr;
+  }
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  nsresult result = status;
+  nsresult settlement = [&]() -> nsresult {
+    NS_ENSURE_TRUE(core && m_currentDB && m_currentFolder,
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCString source;
+    MOZ_TRY(core->GetSourceId(source));
+    NS_ENSURE_TRUE(source.Equals(target->body.databaseSourceId),
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIImapUrl> acknowledgedUrl = do_QueryInterface(url);
+    auto receipt = acknowledgedUrl
+                       ? static_cast<nsImapUrl*>(acknowledgedUrl.get())
+                             ->CopyNativeQueuedAppendReceipt()
+                       : mozilla::Nothing();
+    if (receipt && !receipt->destination) {
+      // Durable acknowledgement is independent of later current-body
+      // settlement.
+      MOZ_TRY(core->MessageDB().RecordOfflineAppendAcceptedWithoutUid(
+          target->attempt));
+      MOZ_TRY(core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
+          target->attempt));
+      MOZ_TRY(status);
+      return NS_OK;
+    }
+    OfflineAttempt actual;
+    MOZ_TRY(core->MessageDB().GetCurrentOfflineAttempt(
+        target->body.folderId, target->body.key, actual));
+    NS_ENSURE_TRUE(actual.id == target->attempt.id &&
+                       actual.operationId == target->attempt.operationId &&
+                       actual.revision == target->attempt.revision,
+                   NS_ERROR_NOT_AVAILABLE);
+    if (actual.state != OfflineAttemptState::Confirmed) {
+      nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(url);
+      bool rejected =
+          imapUrl &&
+          static_cast<nsImapUrl*>(imapUrl.get())->NativeQueuedAppendRejected();
+      nsresult fence =
+          rejected
+              ? core->MessageDB().ResolveOfflineAttemptNotApplied(actual.id)
+              : core->MessageDB().MarkOfflineAttemptAmbiguous(actual.id);
+      MOZ_TRY(fence);
+      return NS_FAILED(status) ? status : NS_ERROR_NOT_AVAILABLE;
+    }
+    MOZ_TRY(status);
+    NS_ENSURE_TRUE(actual.destination && actual.confirmedUid &&
+                       actual.destination->folderId == target->body.folderId &&
+                       actual.destination->key == target->body.key &&
+                       actual.destination->epoch == target->epoch &&
+                       GetCurrentUIDValidity() == target->epoch,
+                   NS_ERROR_NOT_AVAILABLE);
+    return ClearNativeAppend(op, target->attempt.operation);
+  }();
+  if (NS_SUCCEEDED(result)) result = settlement;
+  if (NS_FAILED(result)) return FinishPlayback(url, result);
+  return ProcessNextOperation();
+}
+#endif
+
 // XXX This should not be void but return an error to indicate which low
 // level routine failed.
 void nsImapOfflineSync::ProcessAppendMsgOperation(
@@ -548,8 +1024,16 @@ void nsImapOfflineSync::ProcessMoveOperation(nsIMsgOfflineImapOperation* op) {
   nsCOMPtr<nsIMsgImapMailFolder> imapFolder =
       do_QueryInterface(m_currentFolder);
   if (imapFolder && DestFolderOnSameServer(destFolder)) {
-    imapFolder->ReplayOfflineMoveCopy(srcKeys, true, destFolder, this,
-                                      m_window);
+    nsresult launch = imapFolder->ReplayOfflineMoveCopy(
+        srcKeys, true, destFolder, this, m_window);
+    (void)launch;
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+        NS_FAILED(launch)) {
+      (void)FinishPlayback(nullptr, launch);
+      return;
+    }
+#endif
   } else {
     // NOTE: Is this dead code?
     // The source messages have already been removed from the database,
@@ -654,6 +1138,13 @@ void nsImapOfflineSync::ProcessCopyOperation(
   if (imapFolder && DestFolderOnSameServer(destFolder)) {
     rv = imapFolder->ReplayOfflineMoveCopy(matchingFlagKeys, false, destFolder,
                                            this, m_window);
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+        NS_FAILED(rv)) {
+      (void)FinishPlayback(nullptr, rv);
+      return;
+    }
+#endif
   } else {
     nsTArray<RefPtr<nsIMsgDBHdr>> messages;
     for (uint32_t keyIndex = 0; keyIndex < matchingFlagKeys.Length();
@@ -689,6 +1180,11 @@ ImapUid nsImapOfflineSync::GetCurrentUIDValidity() {
  * ProcessNextOperation.
  */
 nsresult nsImapOfflineSync::ProcessNextOperation() {
+#ifdef MOZ_PANORAMA
+  if (mNativeAppend || mNativeAppendCompleting || mNativeTransfer ||
+      mNativeAction)
+    return NS_ERROR_IN_PROGRESS;
+#endif
   nsresult rv = NS_OK;
 
   // Some annoying hoop-jumping for historical reasons.
@@ -709,7 +1205,11 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
   // if updating one folder only, restore m_currentFolder to that folder
   if (m_singleFolderToUpdate) m_currentFolder = m_singleFolderToUpdate;
 
-  uint32_t folderFlags;
+  uint32_t folderFlags = 0;
+  if (m_currentFolder) {
+    nsresult flags = m_currentFolder->GetFlags(&folderFlags);
+    if (NS_FAILED(flags)) return FinishPlayback(nullptr, flags);
+  }
   nsCOMPtr<nsIDBFolderInfo> folderInfo;
   while (m_currentFolder && !m_currentDB) {
     m_currentFolder->GetFlags(&folderFlags);
@@ -732,7 +1232,8 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
       m_KeyIndex = 0;
       if (NS_FAILED(m_currentDB->ListAllOfflineOpIds(m_CurrentKeys)) ||
           m_CurrentKeys.IsEmpty()) {
-        UpdateOfflineEventsFlag(m_currentFolder, m_currentDB);
+        rv = UpdateOfflineEventsFlag(m_currentFolder, m_currentDB);
+        if (NS_FAILED(rv)) return FinishPlayback(nullptr, rv);
         ClearDB();
         folderInfo = nullptr;  // can't hold onto folderInfo longer than db
       } else {
@@ -741,15 +1242,38 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
         for (uint32_t fakeIndex = 0; fakeIndex < m_CurrentKeys.Length();
              fakeIndex++) {
           nsCOMPtr<nsIMsgOfflineImapOperation> currentOp;
-          m_currentDB->GetOfflineOpForKey(m_CurrentKeys[fakeIndex], false,
-                                          getter_AddRefs(currentOp));
+          rv = m_currentDB->GetOfflineOpForKey(m_CurrentKeys[fakeIndex], false,
+                                               getter_AddRefs(currentOp));
+#ifdef MOZ_PANORAMA
+          if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+              NS_FAILED(rv))
+            return FinishPlayback(nullptr, rv);
+#endif
           if (currentOp) {
             nsOfflineImapOperationType opType;
-            currentOp->GetOperation(&opType);
+            rv = currentOp->GetOperation(&opType);
+#ifdef MOZ_PANORAMA
+            if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+              if (NS_FAILED(rv)) return FinishPlayback(nullptr, rv);
+              // Canceled recovery has no server action. Clean its operation
+              // record before LiteSelect's epoch gate; a never-selected target
+              // has no durable epoch yet. Physical rows and bodies stay owned
+              // by native Redo, which validates any later reactivation.
+              if (!opType) {
+                rv = m_currentDB->RemoveOfflineOp(currentOp);
+                if (NS_FAILED(rv)) return FinishPlayback(nullptr, rv);
+                continue;
+              }
+            }
+#endif
 
             // kMoveResult op holds the source folder URI and the source
             // msgKey.
-            if (opType == nsIMsgOfflineImapOperation::kMoveResult) {
+            if (opType == nsIMsgOfflineImapOperation::kMoveResult
+#ifdef MOZ_PANORAMA
+                && !mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()
+#endif
+            ) {
               // Get the destination msgKey.
               nsMsgKey curKey;
               currentOp->GetMessageKey(&curKey);
@@ -783,7 +1307,8 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
         m_CurrentKeys.Clear();
         if (NS_FAILED(m_currentDB->ListAllOfflineOpIds(m_CurrentKeys)) ||
             m_CurrentKeys.IsEmpty()) {
-          UpdateOfflineEventsFlag(m_currentFolder, m_currentDB);
+          rv = UpdateOfflineEventsFlag(m_currentFolder, m_currentDB);
+          if (NS_FAILED(rv)) return FinishPlayback(nullptr, rv);
           ClearDB();
         } else if (folderFlags & nsMsgFolderFlags::ImapBox) {
           // if pseudo offline, falls through to playing ops back.
@@ -820,9 +1345,26 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
     bool currentFolderFinished = false;
     if (!folderInfo) m_currentDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
     // user canceled the lite select! if GetCurrentUIDValidity() == 0
-    if (folderInfo && (m_KeyIndex < m_CurrentKeys.Length()) &&
+    bool nativeActionScan = false;
+#ifdef MOZ_PANORAMA
+    nativeActionScan = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+#endif
+    if (folderInfo &&
+        (m_KeyIndex < m_CurrentKeys.Length() || nativeActionScan) &&
         (m_pseudoOffline || (GetCurrentUIDValidity() != 0) ||
          !(folderFlags & nsMsgFolderFlags::ImapBox))) {
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+          GetCurrentUIDValidity()) {
+        nsCOMPtr<nsIMsgImapMailFolder> imap =
+            do_QueryInterface(m_currentFolder);
+        NS_ENSURE_TRUE(imap, NS_ERROR_NOT_AVAILABLE);
+        nsresult observed =
+            static_cast<nsImapMailFolder*>(m_currentFolder.get())
+                ->ObserveNativeQueuedDestinations(GetCurrentUIDValidity());
+        if (NS_FAILED(observed)) return FinishPlayback(nullptr, observed);
+      }
+#endif
       ImapUid curFolderUidValidity = 0;
       nsresult validityRv =
           folderInfo->GetImapUidValidity(&curFolderUidValidity);
@@ -840,13 +1382,71 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
       nsCOMPtr<nsIMsgOfflineImapOperation> currentOp;
       if (uidvalidityChanged)
         DeleteAllOfflineOpsForCurrentDB();
-      else
+      else if (m_KeyIndex < m_CurrentKeys.Length())
         m_currentDB->GetOfflineOpForKey(m_CurrentKeys[m_KeyIndex], false,
                                         getter_AddRefs(currentOp));
 
-      if (currentOp) {
-        nsOfflineImapOperationType opType;
-        currentOp->GetOperation(&opType);
+      bool nativePlayback = false;
+#ifdef MOZ_PANORAMA
+      nativePlayback = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+      if (nativePlayback) {
+        using namespace mozilla::mailnews;
+        RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+        NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+        uint64_t folderId;
+        MOZ_TRY(m_currentFolder->GetId(&folderId));
+        // Advance across missing/completed and accepted recovery records while
+        // retaining each operation identity. Reaching the end still advances
+        // the playback action, so later action types are not dropped.
+        for (; m_KeyIndex < m_CurrentKeys.Length(); ++m_KeyIndex) {
+          currentOp = nullptr;
+          MOZ_TRY(m_currentDB->GetOfflineOpForKey(
+              m_CurrentKeys[m_KeyIndex], false, getter_AddRefs(currentOp)));
+          if (!currentOp) continue;
+          nsOfflineImapOperationType dispatchable;
+          MOZ_TRY(currentOp->GetOperation(&dispatchable));
+          if (!dispatchable) {
+            MOZ_TRY(m_currentDB->RemoveOfflineOp(currentOp));
+            currentOp = nullptr;
+            continue;
+          }
+          OfflineAttempt attempt;
+          nsresult found = core->MessageDB().GetCurrentOfflineAttempt(
+              folderId, m_CurrentKeys[m_KeyIndex], attempt);
+          if (NS_SUCCEEDED(found) && attempt.appendAccepted) {
+            MOZ_TRY(core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
+                attempt));
+            dispatchable &= ~attempt.operation;
+          } else {
+            NS_ENSURE_TRUE(
+                NS_SUCCEEDED(found) || found == NS_ERROR_NOT_AVAILABLE, found);
+          }
+          if (dispatchable & mCurrentPlaybackOpType &&
+              (mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kFlagsChanged ||
+               mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kAddKeywords ||
+               mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kRemoveKeywords)) {
+            OfflineAttempt action;
+            nsresult actionRead = core->MessageDB().GetOfflineAttemptForAction(
+                folderId, m_CurrentKeys[m_KeyIndex], mCurrentPlaybackOpType,
+                mozilla::Nothing(), action);
+            NS_ENSURE_TRUE(NS_SUCCEEDED(actionRead) ||
+                               actionRead == NS_ERROR_NOT_AVAILABLE,
+                           actionRead);
+            if (NS_SUCCEEDED(actionRead) &&
+                action.state != OfflineAttemptState::Pending)
+              dispatchable &= ~mCurrentPlaybackOpType;
+          }
+          if (dispatchable & mCurrentPlaybackOpType) break;
+          currentOp = nullptr;
+        }
+      }
+#endif
+      if (currentOp || nativePlayback) {
+        nsOfflineImapOperationType opType = 0;
+        if (currentOp) currentOp->GetOperation(&opType);
         // loop until we find the next db record that matches the current
         // playback operation
         while (currentOp && !(opType & mCurrentPlaybackOpType)) {
@@ -897,11 +1497,29 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
 #endif
             ProcessNextOperation();
           } else {
-            DeleteAllOfflineOpsForCurrentDB();
+#ifdef MOZ_PANORAMA
+            if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+#endif
+              DeleteAllOfflineOpsForCurrentDB();
             currentFolderFinished = true;
           }
         } else {
 #ifdef MOZ_PANORAMA
+          if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+              (mCurrentPlaybackOpType == nsIMsgOfflineImapOperation::kMsgCopy ||
+               mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kMsgMoved)) {
+            rv = ProcessNativeTransfer(currentOp, mCurrentPlaybackOpType);
+            return NS_FAILED(rv) ? FinishPlayback(nullptr, rv) : rv;
+          }
+          if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+              (mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kAppendDraft ||
+               mCurrentPlaybackOpType ==
+                   nsIMsgOfflineImapOperation::kAppendTemplate)) {
+            rv = ProcessNativeAppend(currentOp, mCurrentPlaybackOpType);
+            return NS_FAILED(rv) ? FinishPlayback(nullptr, rv) : rv;
+          }
           if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
               (mCurrentPlaybackOpType ==
                    nsIMsgOfflineImapOperation::kFlagsChanged ||
@@ -909,12 +1527,7 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
                    nsIMsgOfflineImapOperation::kAddKeywords ||
                mCurrentPlaybackOpType ==
                    nsIMsgOfflineImapOperation::kRemoveKeywords)) {
-            // These operations finish through their URL listener. Do not
-            // report global completion while a later folder is still sending.
-            rv = mCurrentPlaybackOpType ==
-                         nsIMsgOfflineImapOperation::kFlagsChanged
-                     ? ProcessFlagOperation(currentOp)
-                     : ProcessKeywordOperation(currentOp);
+            rv = ProcessNativeAction(currentOp, mCurrentPlaybackOpType);
             return NS_FAILED(rv) ? FinishPlayback(nullptr, rv) : rv;
           }
 #endif
@@ -957,7 +1570,8 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
       currentFolderFinished = true;
 
     if (currentFolderFinished) {
-      UpdateOfflineEventsFlag(m_currentFolder, m_currentDB);
+      rv = UpdateOfflineEventsFlag(m_currentFolder, m_currentDB);
+      if (NS_FAILED(rv)) return FinishPlayback(nullptr, rv);
       ClearDB();
       if (!m_singleFolderToUpdate) {
         AdvanceToNextFolder();
@@ -1017,6 +1631,14 @@ nsresult nsImapOfflineSync::FinishPlayback(nsIURI* url, nsresult status) {
 }
 
 void nsImapOfflineSync::DeleteAllOfflineOpsForCurrentDB() {
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Checked native per-operation settlement removes completed work. Remaining
+    // Sent/accepted/ambiguous operations are recovery custody, never a sweep.
+    m_KeyIndex = m_CurrentKeys.Length();
+    return;
+  }
+#endif
   m_KeyIndex = 0;
   nsCOMPtr<nsIMsgOfflineImapOperation> currentOp;
   m_currentDB->GetOfflineOpForKey(m_CurrentKeys[m_KeyIndex], false,

@@ -4,67 +4,69 @@
 
 #include "nsImapService.h"
 
-#include "msgCore.h"  // precompiled header...
-#include "nsIDBFolderInfo.h"
-#include "nsIMsgDatabase.h"
-#include "nsImapCore.h"
-#include "netCore.h"
-#include "nsImapUrl.h"
-#include "nsCOMPtr.h"
-#include "nsIMsgFolder.h"
-#include "nsIMsgImapMailFolder.h"
-#include "nsIImapIncomingServer.h"
-#include "nsIImapMailFolderSink.h"
-#include "nsIImapMessageSink.h"
-#include "nsIImapServerSink.h"
-#include "nsIImapMockChannel.h"
-#include "nsImapUtils.h"
-#include "nsImapNamespace.h"
-#include "nsIDocShell.h"
-#include "nsIProgressEventSink.h"
-#include "nsILoadGroup.h"
-#include "nsIMsgAccountManager.h"
-#include "nsMsgFolderFlags.h"
-#include "nsMailDirServiceDefs.h"
-#include "nsIWebNavigation.h"
-#include "nsImapStringBundle.h"
-#include "plbase64.h"
-#include "nsImapOfflineDownloader.h"
-#include "nsImapOfflineSync.h"
-#include "nsIMsgHdr.h"
-#include "nsMsgUtils.h"
-#include "nsICacheStorage.h"
-#include "nsICacheStorageService.h"
-#include "nsIStreamListener.h"
-#include "nsIUrlListener.h"
-#include "nsNetCID.h"
-#include "nsMsgI18N.h"
-#include "nsIOutputStream.h"
-#include "nsIInputStream.h"
-#include "nsMsgLineBuffer.h"
-#include "nsIMsgParseMailMsgState.h"
-#include "nsIOutputStream.h"
-#include "nsIDocShell.h"
-#include "nsIWindowMediator.h"
-#include "nsIPrompt.h"
-#include "nsIWindowWatcher.h"
-#include "nsIMsgMailSession.h"
-#include "nsIStreamConverterService.h"
-#include "nsIAutoSyncManager.h"
-#include "nsNetUtil.h"
-#include "nsMsgMessageFlags.h"
-#include "nsIMsgPluggableStore.h"
 #include "../../base/src/MailnewsLoadContextInfo.h"
-#include "nsDocShellLoadState.h"
-#include "nsContentUtils.h"
-#include "nsURLHelper.h"
 #include "mozilla/Components.h"
 #include "mozilla/LoadInfo.h"
 #include "mozilla/Preferences.h"
-#include "mozilla/StaticPrefs_mail.h"
 #include "mozilla/ResultExtensions.h"
+#include "mozilla/StaticPrefs_mail.h"
+#include "msgCore.h"  // precompiled header...
+#include "netCore.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsDocShellLoadState.h"
+#include "nsIAutoSyncManager.h"
+#include "nsICacheStorage.h"
+#include "nsICacheStorageService.h"
+#include "nsIDBFolderInfo.h"
+#include "nsIDocShell.h"
+#include "nsIImapIncomingServer.h"
+#include "nsIImapMailFolderSink.h"
+#include "nsIImapMessageSink.h"
+#include "nsIImapMockChannel.h"
+#include "nsIImapServerSink.h"
+#include "nsIInputStream.h"
+#include "nsILoadGroup.h"
+#include "nsIMsgAccountManager.h"
+#include "nsIMsgDatabase.h"
+#include "nsIMsgFolder.h"
+#include "nsIMsgHdr.h"
+#include "nsIMsgImapMailFolder.h"
+#include "nsIMsgMailSession.h"
+#include "nsIMsgParseMailMsgState.h"
+#include "nsIMsgPluggableStore.h"
+#include "nsIOutputStream.h"
+#include "nsIProgressEventSink.h"
+#include "nsIPrompt.h"
+#include "nsIStreamConverterService.h"
+#include "nsIStreamListener.h"
+#include "nsIUrlListener.h"
+#include "nsIWebNavigation.h"
+#include "nsIWindowMediator.h"
+#include "nsIWindowWatcher.h"
+#include "nsImapCore.h"
+#include "nsImapNamespace.h"
+#include "nsImapOfflineDownloader.h"
+#include "nsImapOfflineSync.h"
+#include "nsImapStringBundle.h"
+#include "nsImapUrl.h"
+#include "nsImapUtils.h"
+#include "nsMailDirServiceDefs.h"
+#include "nsMsgFolderFlags.h"
+#include "nsMsgI18N.h"
+#include "nsMsgLineBuffer.h"
+#include "nsMsgMessageFlags.h"
+#include "nsMsgUtils.h"
+#include "nsNetCID.h"
+#include "nsNetUtil.h"
+#include "nsURLHelper.h"
 #include "nsWhitespaceTokenizer.h"
+#include "plbase64.h"
 #ifdef MOZ_PANORAMA
+#  include "../../local/src/nsLocalUtils.h"
+#  include "MessageDatabase.h"
+#  include "nsIMsgCopyServiceListener.h"
+#  include "nsIMsgOfflineImapOperation.h"
 #  include "nsImapMailFolder.h"
 #endif
 
@@ -1509,6 +1511,22 @@ nsresult nsImapService::DiddleFlags(nsIMsgFolder* aImapMailFolder,
       rv = mailnewsurl->SetSpecInternal(urlSpec);
 #ifdef MOZ_PANORAMA
       if (NS_SUCCEEDED(rv) &&
+          mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        nsCOMPtr<nsIMsgDatabase> database;
+        MOZ_TRY(aImapMailFolder->GetMsgDatabase(getter_AddRefs(database)));
+        NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIDBFolderInfo> info;
+        MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(info)));
+        NS_ENSURE_TRUE(info, NS_ERROR_NOT_AVAILABLE);
+        uint32_t epoch;
+        MOZ_TRY(info->GetImapUidValidity(&epoch));
+        if (epoch)
+          MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                      ->SetExpectedUidValidity(epoch));
+      }
+#endif
+#ifdef MOZ_PANORAMA
+      if (NS_SUCCEEDED(rv) &&
           mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
           (flags & kImapMsgDeletedFlag) && strcmp(howToDiddle, "setmsgflags")) {
         NS_ENSURE_TRUE(messageIdsAreUID, NS_ERROR_NOT_AVAILABLE);
@@ -1581,9 +1599,10 @@ NS_IMETHODIMP nsImapService::DiscoverAllFolders(nsIMsgFolder* aImapMailFolder,
   return rv;
 }
 
-NS_IMETHODIMP nsImapService::DiscoverAllAndSubscribedFolders(
-    nsIMsgFolder* aImapMailFolder, nsIUrlListener* aUrlListener,
-    nsIMsgWindow* aMsgWindow) {
+NS_IMETHODIMP
+nsImapService::DiscoverAllAndSubscribedFolders(nsIMsgFolder* aImapMailFolder,
+                                               nsIUrlListener* aUrlListener,
+                                               nsIMsgWindow* aMsgWindow) {
   NS_ENSURE_ARG_POINTER(aImapMailFolder);
 
   nsCOMPtr<nsIImapUrl> aImapUrl;
@@ -1713,17 +1732,138 @@ NS_IMETHODIMP nsImapService::OnlineMessageCopy(
     urlSpec.Append(folderName);
 
     rv = mailnewsurl->SetSpecInternal(urlSpec);
+#ifdef MOZ_PANORAMA
+    if (NS_SUCCEEDED(rv) && copyState) {
+      nsCOMPtr<nsImapMailCopyState> nativeState =
+          do_QueryInterface(copyState, &rv);
+      if (NS_SUCCEEDED(rv) && !nativeState->m_nativeQueuedCopies.IsEmpty()) {
+        rv = static_cast<nsImapUrl*>(imapUrl.get())
+                 ->PrepareNativeQueuedCopies(nativeState->m_nativeQueuedCopies);
+      }
+    }
+#endif
     if (NS_SUCCEEDED(rv))
       rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, aURL);
   }
   return rv;
 }
 
+#ifdef MOZ_PANORAMA
+// Keep the parser's line input separate from the verbatim provider write.
+class OfflineAppendParser final : public nsMsgLineBuffer {
+ public:
+  explicit OfflineAppendParser(nsIMsgParseMailMsgState* parser)
+      : mParser(parser) {}
+
+  nsresult HandleLine(const char* line, uint32_t length) override {
+    return mParser->ParseAFolderLine(line, length);
+  }
+
+ private:
+  nsCOMPtr<nsIMsgParseMailMsgState> mParser;
+};
+
+static nsresult AppendOfflineMessageNative(nsIFile* file, nsIURI* url,
+                                           nsIMsgFolder* folder,
+                                           nsIUrlListener* listener,
+                                           nsISupports* copyState) {
+  bool locked;
+  MOZ_TRY(folder->GetLocked(&locked));
+  NS_ENSURE_FALSE(locked, NS_MSG_FOLDER_BUSY);
+
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(database)));
+  NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  MOZ_TRY(database->CreateNewHdr(getter_AddRefs(draft)));
+  NS_ENSURE_TRUE(draft, NS_ERROR_UNEXPECTED);
+
+  nsresult rv;
+  nsCOMPtr<nsIMsgParseMailMsgState> parser =
+      do_CreateInstance("@mozilla.org/messenger/messagestateparser;1", &rv);
+  MOZ_TRY(rv);
+  MOZ_TRY(parser->SetMailDB(database));
+  MOZ_TRY(parser->SetNewMsgHdr(draft));
+  MOZ_TRY(parser->SetMsgUid(0));
+  MOZ_TRY(parser->SetState(nsIMsgParseMailMsgState::ParseHeadersState));
+
+  nsCOMPtr<nsIInputStream> input;
+  MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(input), file));
+  auto closeInput = mozilla::MakeScopeExit([&] { input->Close(); });
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+  nsCOMPtr<nsIOutputStream> output;
+  MOZ_TRY(store->GetNewMsgOutputStream(folder, getter_AddRefs(output)));
+  auto discard =
+      mozilla::MakeScopeExit([&] { store->DiscardNewMessage(folder, output); });
+
+  OfflineAppendParser lines(parser);
+  char buffer[16384];
+  uint64_t bytes = 0;
+  while (true) {
+    uint32_t count;
+    MOZ_TRY(input->Read(buffer, sizeof(buffer), &count));
+    if (!count) break;
+    bytes += count;
+    NS_ENSURE_TRUE(bytes <= UINT32_MAX, NS_ERROR_ILLEGAL_VALUE);
+    MOZ_TRY(lines.BufferInput(buffer, count));
+    MOZ_TRY(SyncWriteAll(output, buffer, count));
+  }
+  MOZ_TRY(lines.Flush());
+  MOZ_TRY(parser->FinishHeader());
+  nsresult closeRv = input->Close();
+  closeInput.release();
+  MOZ_TRY(closeRv);
+  MOZ_TRY(output->Flush());
+
+  // An attempted Finish can have installed bytes even when it returns failure.
+  // Neither that failure nor later metadata work authorizes discarding them.
+  discard.release();
+  nsAutoCString token;
+  MOZ_TRY(store->FinishNewMessage(folder, output, token));
+  uint32_t size, lineCount;
+  MOZ_TRY(ReadStoredMessageDetails(store, folder, token, &size, &lineCount));
+  MOZ_TRY(draft->SetStoreToken(token));
+  MOZ_TRY(draft->SetMessageSize(size));
+  MOZ_TRY(draft->SetOfflineMessageSize(size));
+  MOZ_TRY(draft->SetLineCount(lineCount));
+  uint32_t flags;
+  MOZ_TRY(draft->OrFlags(nsMsgMessageFlags::Offline | nsMsgMessageFlags::Read,
+                         &flags));
+
+  nsCOMPtr<nsImapMailCopyState> state;
+  if (copyState) {
+    state = do_QueryInterface(copyState, &rv);
+    MOZ_TRY(rv);
+    MOZ_TRY(draft->OrFlags(state->m_newMsgFlags, &flags));
+    MOZ_TRY(draft->SetStringProperty("keywords", state->m_newMsgKeywords));
+  }
+
+  mozilla::mailnews::FinishedMessageBody finished{token, size, size, lineCount,
+                                                  true};
+  nsMsgKey key;
+  MOZ_TRY(static_cast<nsImapMailFolder*>(folder)->QueueNativeOfflineAppend(
+      draft, finished, &key));
+  if (state && state->m_listener) {
+    MOZ_TRY(state->m_listener->SetMessageKey(key));
+  }
+  // Synchronous errors above stay with the launching caller. Only a completed
+  // local queue operation sends its existing URL completion callback here.
+  return listener ? listener->OnStopRunningUrl(url, NS_OK) : NS_OK;
+}
+#endif
+
 nsresult nsImapService::OfflineAppendFromFile(
     nsIFile* aFile, nsIURI* aUrl, nsIMsgFolder* aDstFolder,
     const nsACString& messageId,  // to be replaced
     bool inSelectedState,         // needs to be in
     nsIUrlListener* aListener, nsIURI** aURL, nsISupports* aCopyState) {
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return AppendOfflineMessageNative(aFile, aUrl, aDstFolder, aListener,
+                                      aCopyState);
+  }
+#endif
   nsCOMPtr<nsIMsgDatabase> destDB;
   nsresult rv = aDstFolder->GetMsgDatabase(getter_AddRefs(destDB));
   // ### might need to send some notifications instead of just returning
@@ -1861,6 +2001,15 @@ NS_IMETHODIMP nsImapService::AppendMessageFromFile(
     SetImapUrlSink(aDstFolder, imapUrl);
     imapUrl->SetMsgFile(aFile);
     imapUrl->SetCopyState(aCopyState);
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() && aCopyState) {
+      nsCOMPtr<nsImapMailCopyState> state = do_QueryInterface(aCopyState);
+      if (state && state->m_nativeQueuedAppend) {
+        MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                    ->PrepareNativeQueuedAppend(*state->m_nativeQueuedAppend));
+      }
+    }
+#endif
 
     nsCOMPtr<nsIMsgMailNewsUrl> mailnewsurl = do_QueryInterface(imapUrl);
 
@@ -2490,8 +2639,8 @@ NS_IMETHODIMP nsImapService::GetCanGetMessages(bool* aCanGetMessages) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapService::GetCanGetIncomingMessages(
-    bool* aCanGetIncomingMessages) {
+NS_IMETHODIMP
+nsImapService::GetCanGetIncomingMessages(bool* aCanGetIncomingMessages) {
   NS_ENSURE_ARG_POINTER(aCanGetIncomingMessages);
   *aCanGetIncomingMessages = true;
   return NS_OK;
@@ -2509,8 +2658,9 @@ NS_IMETHODIMP nsImapService::GetFoldersCreatedAsync(bool* aAsyncCreation) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapService::GetListOfFoldersOnServer(
-    nsIImapIncomingServer* aServer, nsIMsgWindow* aMsgWindow) {
+NS_IMETHODIMP
+nsImapService::GetListOfFoldersOnServer(nsIImapIncomingServer* aServer,
+                                        nsIMsgWindow* aMsgWindow) {
   nsresult rv;
 
   nsCOMPtr<nsIMsgIncomingServer> server = do_QueryInterface(aServer);
@@ -2818,6 +2968,21 @@ NS_IMETHODIMP nsImapService::DownloadMessagesForOffline(
     // correctly
     nsCOMPtr<nsIImapMessageSink> imapMessageSink(
         do_QueryInterface(aFolder, &rv));
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+        messageIds.FindChar('*') == kNotFound) {
+      // Selected-message recovery must not fetch a reused UID after reconnect.
+      auto* concrete = static_cast<nsImapUrl*>(imapUrl.get());
+      MOZ_TRY(concrete->CaptureFlagTargets(aFolder, messageIds));
+      nsTArray<nsMsgKey> keys;
+      nsTArray<ImapUid> uids;
+      for (const auto& target : concrete->CapturedFlagTargets()->messages) {
+        keys.AppendElement(target.key);
+        uids.AppendElement(target.uid);
+      }
+      MOZ_TRY(concrete->CaptureCopyTargets(aFolder, keys, uids));
+    }
+#endif
     rv = FetchMessage(imapUrl, nsImapUrl::nsImapMsgDownloadForOffline, aFolder,
                       imapMessageSink, aMsgWindow, nullptr, messageIds, false,
                       getter_AddRefs(runningURI));
@@ -2845,9 +3010,10 @@ NS_IMETHODIMP nsImapService::MessageURIToMsgHdr(const nsACString& uri,
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapService::PlaybackAllOfflineOperations(
-    nsIMsgWindow* aMsgWindow, nsIUrlListener* aListener,
-    nsISupports** aResult) {
+NS_IMETHODIMP
+nsImapService::PlaybackAllOfflineOperations(nsIMsgWindow* aMsgWindow,
+                                            nsIUrlListener* aListener,
+                                            nsISupports** aResult) {
   NS_ENSURE_ARG_POINTER(aResult);
 
   nsresult rv;
@@ -2859,8 +3025,9 @@ NS_IMETHODIMP nsImapService::PlaybackAllOfflineOperations(
   return NS_ERROR_OUT_OF_MEMORY;
 }
 
-NS_IMETHODIMP nsImapService::DownloadAllOffineImapFolders(
-    nsIMsgWindow* aMsgWindow, nsIUrlListener* aListener) {
+NS_IMETHODIMP
+nsImapService::DownloadAllOffineImapFolders(nsIMsgWindow* aMsgWindow,
+                                            nsIUrlListener* aListener) {
   RefPtr<nsImapOfflineDownloader> downloadForOffline =
       new nsImapOfflineDownloader(aMsgWindow, aListener);
   if (downloadForOffline) {
@@ -2895,8 +3062,9 @@ NS_IMETHODIMP nsImapService::GetCacheStorage(nsICacheStorage** result) {
   return rv;
 }
 
-NS_IMETHODIMP nsImapService::HandleContent(
-    const char* aContentType, nsIInterfaceRequestor* aWindowContext,
-    nsIRequest* request) {
+NS_IMETHODIMP
+nsImapService::HandleContent(const char* aContentType,
+                             nsIInterfaceRequestor* aWindowContext,
+                             nsIRequest* request) {
   return NS_ERROR_WONT_HANDLE_CONTENT;
 }

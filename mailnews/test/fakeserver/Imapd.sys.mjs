@@ -417,10 +417,19 @@ export class ImapMailbox {
     this.__highestuid = highest;
     return highest;
   }
-  expunge() {
+  /**
+   * Removes deleted messages from the supplied members of this mailbox.
+   *
+   * @param {ImapMessage[]} [messages=this._messages] - Messages eligible for removal.
+   * @returns {string} Untagged EXPUNGE responses with current sequence numbers.
+   */
+  expunge(messages = this._messages) {
     var response = "";
     for (var i = 0; i < this._messages.length; i++) {
-      if (this._messages[i].flags.includes("\\Deleted")) {
+      if (
+        messages.includes(this._messages[i]) &&
+        this._messages[i].flags.includes("\\Deleted")
+      ) {
         response += "* " + (i + 1) + " EXPUNGE\0";
         this._messages.splice(i--, 1);
       }
@@ -2434,8 +2443,25 @@ export var IMAP_RFC4315_extension = {
     toBeThis._preRFC4315MOVE = toBeThis.MOVE;
   },
   UID(args) {
-    // XXX: UID EXPUNGE is not supported.
-    return this._preRFC4315UID(args);
+    if (args[0] != "EXPUNGE") {
+      return this._preRFC4315UID(args);
+    }
+    if (
+      args.length != 2 ||
+      typeof args[1] != "string" ||
+      !args[1]
+        .split(",")
+        .every(part => /^(?:[1-9]\d*|\*)(?::(?:[1-9]\d*|\*))?$/.test(part))
+    ) {
+      return "BAD invalid UID EXPUNGE sequence set";
+    }
+    if (this._readOnly) {
+      return "NO mailbox is read-only";
+    }
+    const messages = this._parseSequenceSet(args[1], true);
+    const response = this._selectedMailbox.expunge(messages);
+    this._daemon.synchronize(this._selectedMailbox);
+    return response + "OK UID EXPUNGE completed";
   },
   APPEND(args) {
     let response = this._preRFC4315APPEND(args);

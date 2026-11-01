@@ -77,6 +77,7 @@
 #  include "DatabaseCore.h"
 #  include "DatabaseUtils.h"
 #  include "nsMsgLocalStoreUtils.h"
+#  include "../../local/src/nsLocalUtils.h"
 #  include "nsCharSeparatedTokenizer.h"
 #endif  // MOZ_PANORAMA
 
@@ -1598,6 +1599,15 @@ nsresult nsMsgDBFolder::EndNewOfflineMessage(nsresult status) {
   nsresult rv = store->FinishNewMessage(this, stream, storeToken);
   NS_ENSURE_SUCCESS(rv, rv);
   NS_ENSURE_FALSE(storeToken.IsEmpty(), NS_ERROR_UNEXPECTED);
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Publish the completed provider stream's size. Keep the existing offline
+    // line counter, which uses a different convention from stored body lines.
+    uint32_t measuredBodyLines;
+    MOZ_TRY(ReadStoredMessageDetails(store, this, storeToken, &size,
+                                     &measuredBodyLines));
+  }
+#endif
   MOZ_TRY(header->SetStoreToken(storeToken));
   MOZ_TRY(header->SetOfflineMessageSize(size));
   MOZ_TRY(header->SetLineCount(lines));

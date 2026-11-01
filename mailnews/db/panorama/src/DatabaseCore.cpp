@@ -515,7 +515,7 @@ static constexpr auto kThreadFlagsFolderDelete =
 nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version >= 0 && version <= 15, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 18, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -802,16 +802,20 @@ nsresult DatabaseCore::UpgradeSchema() {
         sConnection, "offline_copy_destinations",
         "operationId:INTEGER:1:1,ordinal:INTEGER:1:2,uri:TEXT:1:0"));
   }
-  MOZ_TRY(CheckReferenceSchemaTable(
-      sConnection, "offline_attempts",
-      "id:INTEGER:0:1,operationId:INTEGER:1:0,revision:INTEGER:1:0,state:"
-      "INTEGER:1:0,"
-      "sourceFolderId:INTEGER:0:0,sourceKey:INTEGER:0:0,sourceEpoch:INTEGER:0:"
-      "0,"
-      "sourceUid:INTEGER:0:0,destinationFolderId:INTEGER:0:0,destinationKey:"
-      "INTEGER:0:0,"
-      "destinationEpoch:INTEGER:0:0,confirmedUid:INTEGER:0:0,operationFolderId:"
-      "INTEGER:1:0,operationEpoch:INTEGER:0:0,operation:INTEGER:1:0"));
+  if (version < 17) {
+    MOZ_TRY(CheckReferenceSchemaTable(
+        sConnection, "offline_attempts",
+        "id:INTEGER:0:1,operationId:INTEGER:1:0,revision:INTEGER:1:0,state:"
+        "INTEGER:1:0,"
+        "sourceFolderId:INTEGER:0:0,sourceKey:INTEGER:0:0,sourceEpoch:INTEGER:"
+        "0:"
+        "0,"
+        "sourceUid:INTEGER:0:0,destinationFolderId:INTEGER:0:0,destinationKey:"
+        "INTEGER:0:0,"
+        "destinationEpoch:INTEGER:0:0,confirmedUid:INTEGER:0:0,"
+        "operationFolderId:"
+        "INTEGER:1:0,operationEpoch:INTEGER:0:0,operation:INTEGER:1:0"));
+  }
   if (version < 7) {
     MOZ_TRY(SearchChangeTriggers(sConnection,
                                  SearchTriggerAction::ReplacePolicy, false));
@@ -987,18 +991,21 @@ nsresult DatabaseCore::UpgradeSchema() {
         "ALTER TABLE offline_copy_destinations ADD COLUMN destinationEpoch INTEGER;"_ns));
     MOZ_TRY(sConnection->SetSchemaVersion(11));
   }
-  MOZ_TRY(CheckReferenceSchemaTable(
-      sConnection, "offline_operations",
-      "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
-      "INTEGER:1:0,"
-      "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
-      "INTEGER:1:0,"
-      "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
-      "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:1:"
-      "0,"
-      "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
-      "TEXT:1:0,folderEpoch:INTEGER:0:0,destinationFolderId:INTEGER:0:0,"
-      "destinationKey:INTEGER:0:0,destinationEpoch:INTEGER:0:0"));
+  if (version < 16) {
+    MOZ_TRY(CheckReferenceSchemaTable(
+        sConnection, "offline_operations",
+        "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
+        "INTEGER:1:0,"
+        "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
+        "INTEGER:1:0,"
+        "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
+        "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:"
+        "1:"
+        "0,"
+        "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
+        "TEXT:1:0,folderEpoch:INTEGER:0:0,destinationFolderId:INTEGER:0:0,"
+        "destinationKey:INTEGER:0:0,destinationEpoch:INTEGER:0:0"));
+  }
   MOZ_TRY(CheckReferenceSchemaTable(
       sConnection, "offline_copy_destinations",
       "operationId:INTEGER:1:1,ordinal:INTEGER:1:2,uri:TEXT:1:0,"
@@ -1139,6 +1146,83 @@ nsresult DatabaseCore::UpgradeSchema() {
       "raw:BLOB:1:0,receipt:TEXT:1:0"));
   MOZ_TRY(CheckReferenceSchemaTable(sConnection, "folder_cache_bindings",
                                     "folderId:INTEGER:1:1,token:TEXT:1:0"));
+  if (version < 16) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "ALTER TABLE offline_operations ADD COLUMN sourcePhysicalKey INTEGER"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(16));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_operations",
+      "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
+      "INTEGER:1:0,"
+      "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
+      "INTEGER:1:0,"
+      "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
+      "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:1:"
+      "0,"
+      "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
+      "TEXT:1:0,folderEpoch:INTEGER:0:0,destinationFolderId:INTEGER:0:0,"
+      "destinationKey:INTEGER:0:0,destinationEpoch:INTEGER:0:0,"
+      "sourcePhysicalKey:INTEGER:0:0"));
+  if (version < 17) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "ALTER TABLE offline_attempts ADD COLUMN appendAccepted INTEGER NOT "
+        "NULL "
+        "DEFAULT 0 CHECK(appendAccepted IN (0,1));"
+        "ALTER TABLE offline_attempts ADD COLUMN appendSourceId TEXT;"
+        "ALTER TABLE offline_attempts ADD COLUMN appendContentRevision INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN appendLocationRevision "
+        "INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN appendStoreToken TEXT;"
+        "ALTER TABLE offline_attempts ADD COLUMN appendMessageSize INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN appendOfflineSize INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN appendLineCount INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN appendFlags INTEGER;"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(17));
+  }
+  if (version < 18) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "ALTER TABLE offline_attempts ADD COLUMN transferSourceId TEXT;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferOperationKey INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN copyOrdinal INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferAccepted INTEGER NOT "
+        "NULL "
+        "DEFAULT 0 CHECK(transferAccepted IN (0,1));"
+        "ALTER TABLE offline_attempts ADD COLUMN transferContentRevision "
+        "INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferLocationRevision "
+        "INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferStoreToken TEXT;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferMessageSize INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferOfflineSize INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferLineCount INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN transferFlags INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN confirmedEpoch INTEGER;"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(18));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_attempts",
+      "id:INTEGER:0:1,operationId:INTEGER:1:0,revision:INTEGER:1:0,state:"
+      "INTEGER:1:0,"
+      "sourceFolderId:INTEGER:0:0,sourceKey:INTEGER:0:0,sourceEpoch:INTEGER:0:"
+      "0,"
+      "sourceUid:INTEGER:0:0,destinationFolderId:INTEGER:0:0,destinationKey:"
+      "INTEGER:0:0,"
+      "destinationEpoch:INTEGER:0:0,confirmedUid:INTEGER:0:0,operationFolderId:"
+      "INTEGER:1:0,"
+      "operationEpoch:INTEGER:0:0,operation:INTEGER:1:0,appendAccepted:INTEGER:"
+      "1:0,"
+      "appendSourceId:TEXT:0:0,appendContentRevision:INTEGER:0:0,"
+      "appendLocationRevision:INTEGER:0:0,appendStoreToken:TEXT:0:0,"
+      "appendMessageSize:INTEGER:0:0,appendOfflineSize:INTEGER:0:0,"
+      "appendLineCount:INTEGER:0:0,appendFlags:INTEGER:0:0,"
+      "transferSourceId:TEXT:0:0,transferOperationKey:INTEGER:0:0,"
+      "copyOrdinal:INTEGER:0:0,transferAccepted:INTEGER:1:0,"
+      "transferContentRevision:INTEGER:0:0,transferLocationRevision:INTEGER:0:"
+      "0,"
+      "transferStoreToken:TEXT:0:0,transferMessageSize:INTEGER:0:0,"
+      "transferOfflineSize:INTEGER:0:0,transferLineCount:INTEGER:0:0,"
+      "transferFlags:INTEGER:0:0,confirmedEpoch:INTEGER:0:0"));
   return NS_OK;
 }
 

@@ -210,3 +210,114 @@ add_task(function test_uidplusEmptyAndRejectedTransfersPreserveMessages() {
     );
   }
 });
+
+add_task(function test_uidplusExpungeOnlyRequestedDeletedUids() {
+  const { handler, messages, destination } = makeUidplusTransferFixture();
+  const mailbox = handler._selectedMailbox;
+  messages[0].setFlag("\\Deleted");
+  messages[1].setFlag("\\Deleted");
+  const uidnext = mailbox.uidnext;
+  let synchronized = 0;
+  handler._daemon.syncFunc = () => {
+    synchronized++;
+  };
+
+  Assert.equal(
+    handler.UID(["EXPUNGE", "1,41,105,999"]),
+    "* 1 EXPUNGE\0OK UID EXPUNGE completed"
+  );
+  Assert.deepEqual(mailbox._messages, [messages[1], messages[2]]);
+  Assert.equal(mailbox._messages[0], messages[1]);
+  Assert.equal(mailbox._messages[1], messages[2]);
+  Assert.deepEqual(messages[1].flags, ["\\Seen", "\\Deleted"]);
+  Assert.deepEqual(messages[2].flags, ["\\Seen"]);
+  Assert.deepEqual(destination._messages, []);
+  Assert.equal(mailbox.uidnext, uidnext);
+  Assert.equal(synchronized, 1);
+
+  Assert.equal(
+    handler.UID(["EXPUNGE", "1:2,999"]),
+    "OK UID EXPUNGE completed",
+    "Sequence numbers must not remove different UIDs"
+  );
+  Assert.deepEqual(mailbox._messages, [messages[1], messages[2]]);
+  Assert.equal(synchronized, 2);
+});
+
+add_task(function test_uidplusExpungeRangesAndSequenceRenumbering() {
+  for (const set of ["105:41,73,41", "41:*"]) {
+    const { handler, messages } = makeUidplusTransferFixture();
+    const mailbox = handler._selectedMailbox;
+    const uidnext = mailbox.uidnext;
+    for (const message of messages) {
+      message.setFlag("\\Deleted");
+    }
+    Assert.equal(mailbox._highestuid, 105);
+    Assert.equal(
+      handler.UID(["EXPUNGE", set]),
+      "* 1 EXPUNGE\0* 1 EXPUNGE\0* 1 EXPUNGE\0OK UID EXPUNGE completed",
+      "Overlapping UID members produce one current sequence response per message"
+    );
+    Assert.deepEqual(mailbox._messages, []);
+    Assert.equal(mailbox._highestuid, 0);
+    Assert.equal(mailbox.uidnext, uidnext);
+    Assert.equal(handler.UID(["EXPUNGE", "*"]), "OK UID EXPUNGE completed");
+  }
+});
+
+add_task(function test_uidplusExpungeRefusalsPreserveMessages() {
+  const { handler, messages } = makeUidplusTransferFixture();
+  messages[0].setFlag("\\Deleted");
+  const source = [...messages];
+  let synchronized = 0;
+  handler._daemon.syncFunc = () => {
+    synchronized++;
+  };
+  for (const args of [
+    ["EXPUNGE"],
+    ["EXPUNGE", "41", "73"],
+    ["EXPUNGE", "invalid"],
+    ["EXPUNGE", "0"],
+    ["EXPUNGE", "41,"],
+    ["EXPUNGE", "41::105"],
+    ["EXPUNGE", ["41"]],
+  ]) {
+    Assert.equal(handler.UID(args), "BAD invalid UID EXPUNGE sequence set");
+    Assert.deepEqual(handler._selectedMailbox._messages, source);
+  }
+  handler._tag = "T1";
+  handler._daemon.commandToFail = "UID";
+  Assert.equal(
+    handler._dispatchCommand("UID", ["EXPUNGE", "41"]),
+    "T1 NO UID failed",
+    "The existing forced command refusal runs before UID EXPUNGE"
+  );
+  handler._daemon.commandToFail = "";
+  handler._readOnly = true;
+  Assert.equal(handler.UID(["EXPUNGE", "41"]), "NO mailbox is read-only");
+  handler._readOnly = false;
+  handler._state = 1;
+  Assert.equal(
+    handler._dispatchCommand("UID", ["EXPUNGE", "41"]),
+    "T1 BAD illegal command for current state 1"
+  );
+  Assert.deepEqual(handler._selectedMailbox._messages, source);
+  Assert.deepEqual(messages[0].flags, ["\\Seen", "\\Deleted"]);
+  Assert.equal(synchronized, 0);
+});
+
+add_task(function test_uidplusPreservesOrdinaryExpungeAndUnsupportedUid() {
+  const { handler, messages } = makeStoreFixture();
+  messages[0].setFlag("\\Deleted");
+  messages[2].setFlag("\\Deleted");
+  Assert.equal(handler.UID(["EXPUNGE", "41"]), "BAD illegal command EXPUNGE");
+  Assert.deepEqual(handler._selectedMailbox._messages, messages);
+  mixinExtension(handler, IMAP_RFC4315_extension);
+  Assert.equal(handler.UID(["UNKNOWN", "41"]), "BAD illegal command UNKNOWN");
+  Assert.equal(
+    handler.EXPUNGE(),
+    "* 1 EXPUNGE\0* 2 EXPUNGE\0OK EXPUNGE completed",
+    "Ordinary EXPUNGE still removes every deleted message"
+  );
+  Assert.deepEqual(handler._selectedMailbox._messages, [messages[1]]);
+});

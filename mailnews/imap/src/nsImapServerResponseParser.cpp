@@ -7,6 +7,9 @@
 #include "nsImapCore.h"
 #include "nsImapProtocol.h"
 #include "nsImapServerResponseParser.h"
+#ifdef MOZ_PANORAMA
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
 #include "nsIImapFlagAndUidState.h"
 #include "nsImapNamespace.h"
 #include "nsImapUtils.h"
@@ -303,6 +306,25 @@ void nsImapServerResponseParser::PreProcessCommandToken(
     const char* commandToken, const char* currentCommand) {
   fCurrentCommandIsSingleMessageFetch = false;
   fWaitingForMoreClientInput = false;
+#ifdef MOZ_PANORAMA
+  nsAutoCString lowerCommand(currentCommand);
+  ToLowerCase(lowerCommand);
+  mParsingCopy = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+                 (!PL_strcasecmp(commandToken, "COPY") ||
+                  !PL_strcasecmp(commandToken, "MOVE") ||
+                  (!PL_strcasecmp(commandToken, "UID") &&
+                   (lowerCommand.Find(" copy ") >= 0 ||
+                    lowerCommand.Find(" move ") >= 0)));
+  mTaggedCopyOk = mCopyAccepted = mCopyRejected = false;
+  mCopyEpoch.reset();
+  mCopySourceSet.Truncate();
+  mCopyDestinationSet.Truncate();
+  mParsingAppend = !PL_strcasecmp(commandToken, "APPEND");
+  mTaggedAppendOk = false;
+  mAppendRejected = false;
+  mAppendAccepted = false;
+  mAppendReceipt.reset();
+#endif
 
   if (!PL_strcasecmp(commandToken, "SEARCH"))
     fSearchResults->ResetSequence();
@@ -1520,8 +1542,27 @@ void nsImapServerResponseParser::resp_cond_state(bool isTagged) {
       !PL_strcasecmp(fNextToken, "BAD"))
     fCurrentCommandFailed = true;
 
+#ifdef MOZ_PANORAMA
+  mTaggedCopyOk = mParsingCopy && isTagged && !PL_strcasecmp(fNextToken, "OK");
+  if (mTaggedCopyOk) mCopyAccepted = true;
+  if (mParsingCopy && isTagged &&
+      (!PL_strcasecmp(fNextToken, "NO") || !PL_strcasecmp(fNextToken, "BAD"))) {
+    mCopyRejected = true;
+  }
+  mTaggedAppendOk =
+      mParsingAppend && isTagged && !PL_strcasecmp(fNextToken, "OK");
+  if (mTaggedAppendOk) mAppendAccepted = true;
+  if (mParsingAppend && isTagged &&
+      (!PL_strcasecmp(fNextToken, "NO") || !PL_strcasecmp(fNextToken, "BAD"))) {
+    mAppendRejected = true;
+  }
+#endif
   AdvanceToNextToken();
   if (ContinueParse()) resp_text();
+#ifdef MOZ_PANORAMA
+  mTaggedAppendOk = false;
+  mTaggedCopyOk = false;
+#endif
 }
 
 /*
@@ -1691,30 +1732,89 @@ void nsImapServerResponseParser::resp_text_code() {
     } else if (!PL_strcasecmp(fNextToken, "APPENDUID")) {
       AdvanceToNextToken();
       if (ContinueParse()) {
-        // ** jt -- the returned uidvalidity is the destination folder
-        // uidvalidity; don't use it for current folder
-        // fFolderUIDValidity = atoi(fNextToken);
-        // fHighestRecordedUID = 0; ??? this should be wrong
+#ifdef MOZ_PANORAMA
+        // A single APPEND has exactly one positive epoch and UID. The closing
+        // bracket belongs to the UID token in the existing lexer.
+        auto positiveWord = [](const char* token, bool bracket,
+                               uint32_t& value) {
+          uint64_t number = 0;
+          const char* p = token;
+          if (!p || *p < '0' || *p > '9') return false;
+          while (*p >= '0' && *p <= '9') {
+            number = number * 10 + (*p++ - '0');
+            if (number > UINT32_MAX) return false;
+          }
+          if (bracket && *p == ']') ++p;
+          if (*p || !number) return false;
+          value = static_cast<uint32_t>(number);
+          return true;
+        };
+        uint32_t epoch = 0;
+        bool epochValid = positiveWord(fNextToken, false, epoch);
+#endif
         AdvanceToNextToken();
         if (ContinueParse()) {
           fCurrentResponseUID = strtoul(fNextToken, nullptr, 10);
+#ifdef MOZ_PANORAMA
+          uint32_t uid = 0;
+          if (mTaggedAppendOk) {
+            if (epochValid && positiveWord(fNextToken, true, uid) &&
+                !mAppendReceipt) {
+              mAppendReceipt.emplace(
+                  mozilla::mailnews::ServerUidConfirmation{epoch, uid});
+            } else {
+              mAppendReceipt.reset();
+              SetSyntaxError(true);
+            }
+          }
+#endif
           AdvanceToNextToken();
         }
       }
     } else if (!PL_strcasecmp(fNextToken, "COPYUID")) {
       AdvanceToNextToken();
       if (ContinueParse()) {
-        // ** jt -- destination folder uidvalidity
-        // fFolderUIDValidity = atoi(fNextToken);
-        // original message set; ignore it
+#ifdef MOZ_PANORAMA
+        bool nativeReceipt = mTaggedCopyOk;
+        uint64_t epoch = 0;
+        bool validEpoch =
+            nativeReceipt && fNextToken && *fNextToken && !mCopyEpoch;
+        if (validEpoch) {
+          for (const char* c = fNextToken; *c; ++c) {
+            if (*c < '0' || *c > '9' ||
+                epoch > (UINT32_MAX - (*c - '0')) / 10) {
+              validEpoch = false;
+              break;
+            }
+            epoch = epoch * 10 + (*c - '0');
+          }
+          validEpoch &= epoch != 0;
+        }
+#endif
         AdvanceToNextToken();
         if (ContinueParse()) {
-          // the resulting message set; should be in the form of
-          // either uid or uid1:uid2
+#ifdef MOZ_PANORAMA
+          nsAutoCString sources(fNextToken);
+#endif
           AdvanceToNextToken();
-          // clear copy response uid
-          fServerConnection.SetCopyResponseUid(fNextToken);
-          fCopyUidSet = fNextToken;  // New UIDs for the copy destination
+          if (ContinueParse()) {
+#ifdef MOZ_PANORAMA
+            if (nativeReceipt) {
+              nsAutoCString destinations(fNextToken);
+              if (validEpoch && !destinations.IsEmpty() &&
+                  destinations.Last() == ']') {
+                destinations.Truncate(destinations.Length() - 1);
+                mCopyEpoch = mozilla::Some(static_cast<uint32_t>(epoch));
+                mCopySourceSet = sources;
+                mCopyDestinationSet = destinations;
+              } else {
+                SetSyntaxError(true);
+              }
+            }
+#endif
+            fServerConnection.SetCopyResponseUid(fNextToken);
+            fCopyUidSet = fNextToken;
+          }
         }
         if (ContinueParse()) AdvanceToNextToken();
       }

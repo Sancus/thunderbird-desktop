@@ -205,6 +205,8 @@ class MboxParser {
   size_t mCursor{0};
   // Number of '>' characters at start of line, for eCountQuoting state.
   int mQuoteCnt{0};
+  // Quoting is reversible in the header block as well as the body.
+  bool mQuotingHeader{false};
 
   // Values potentially extracted by parsing the "From " line.
   nsAutoCString mEnvAddr;  // Empty = none.
@@ -382,11 +384,18 @@ class MboxParser {
   }
 
   // Decide if we're still in the header block.
-  // We don't need to worry about folded lines. Any non-blank line is just
-  // treated as a header line and output verbatim.
+  // We don't need to worry about folded lines. Reverse the writer's quoting
+  // here too, so malformed header lines retain their original bytes.
   span handle_eExpectHeaderLine(span data) {
     if (data.Length() < 2) {
       return PrematureEOF(data);
+    }
+
+    if (data[0] == '>') {
+      mQuoteCnt = 0;
+      mQuotingHeader = true;
+      mState = eCountQuoting;
+      return data;
     }
 
     // Start with an EOL? (CRLF or LF)
@@ -442,6 +451,7 @@ class MboxParser {
     // anything else in the buffer. So use a separate state to count them).
     if (data[0] == '>') {
       mQuoteCnt = 0;
+      mQuotingHeader = false;
       mState = eCountQuoting;
       return data;
     }
@@ -526,8 +536,8 @@ class MboxParser {
       Emit(span(">", 1));
     }
 
-    // Output the rest of the line as a normal body line.
-    mState = eEmitBodyLine;
+    // Continue in the same section after unescaping the line prefix.
+    mState = mQuotingHeader ? eEmitHeaderLine : eEmitBodyLine;
     return data;
   }
 

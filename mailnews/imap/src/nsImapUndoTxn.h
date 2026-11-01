@@ -13,6 +13,13 @@
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsIWeakReferenceUtils.h"
 #include "nsCOMArray.h"
+#ifdef MOZ_PANORAMA
+#  include "mozilla/UniquePtr.h"
+struct NativeImapUndoEntry;
+namespace mozilla::mailnews {
+struct PendingDestination;
+}
+#endif
 
 class nsImapMoveCopyMsgTxn : public nsMsgTxn, nsIUrlListener {
  public:
@@ -34,6 +41,20 @@ class nsImapMoveCopyMsgTxn : public nsMsgTxn, nsIUrlListener {
   nsresult AddDstKey(nsMsgKey aKey);
   nsresult UndoMailboxDelete();
   nsresult RedoMailboxDelete();
+#ifdef MOZ_PANORAMA
+  bool IsNativeLocalMove() const { return m_srcIsLocal && m_isMove; }
+  nsresult PrepareNativeSources(nsIMsgFolder* folder);
+  nsresult PrepareNativeQueuedSources(
+      nsIMsgFolder* folder,
+      const mozilla::mailnews::PendingDestination* cancelMove = nullptr);
+  nsresult AppendNativeDestination(uint32_t index, nsIMsgFolder* folder,
+                                   uint32_t epoch, ImapUid uid, nsMsgKey* key);
+  nsresult ValidateNativeDestinations();
+  nsresult RemoveNativeSources(nsIMsgFolder* folder,
+                               const nsTArray<nsMsgKey>& keys,
+                               bool captureOffline);
+  nsresult RestoreNativeSources(nsIMsgFolder* folder);
+#endif
   nsresult Init(nsIMsgFolder* srcFolder, nsTArray<nsMsgKey>* srcKeyArray,
                 const char* srcMsgIdString, nsIMsgFolder* dstFolder,
                 bool idsAreUids, bool isMove);
@@ -52,6 +73,18 @@ class nsImapMoveCopyMsgTxn : public nsMsgTxn, nsIUrlListener {
   bool m_idsAreUids;
   bool m_isMove;
   bool m_srcIsLocal;
+#ifdef MOZ_PANORAMA
+  nsresult ChangeNativeSources(nsIMsgFolder* folder,
+                               const nsTArray<nsMsgKey>& keys,
+                               bool captureOffline, bool remove);
+  nsTArray<mozilla::UniquePtr<NativeImapUndoEntry>> mNativeEntries;
+  bool mNativeChanging = false;
+  nsresult mNativeInitResult = NS_OK;
+  bool mNativeRedoPending = false;
+  nsresult mNativeRedoResult = NS_OK;
+  nsCOMPtr<nsIUrlListener> mNativeRedoListener;
+  nsCOMPtr<nsIURI> mNativeRedoUrl;
+#endif
   nsTArray<uint32_t> m_srcSizeArray;
   // this is used when we chain urls for imap undo, since "this" needs
   // to be the listener, but the folder may need to also be notified.

@@ -15,6 +15,11 @@
 #include "ImapTypes.h"
 
 class nsIMsgOfflineOpsDatabase;
+#ifdef MOZ_PANORAMA
+#  include "MessageDatabase.h"
+#  include "mozilla/UniquePtr.h"
+struct NativeQueuedAppendTarget;
+#endif
 
 class nsImapOfflineSync : public nsIUrlListener,
                           public nsIMsgCopyServiceListener,
@@ -65,6 +70,22 @@ class nsImapOfflineSync : public nsIUrlListener,
   void ProcessMoveOperation(nsIMsgOfflineImapOperation* currentOp);
   void ProcessCopyOperation(nsIMsgOfflineImapOperation* currentOp);
   void ProcessEmptyTrash();
+#ifdef MOZ_PANORAMA
+  nsresult ProcessNativeAction(nsIMsgOfflineImapOperation* op, uint32_t action);
+  nsresult CompleteNativeAction(nsIURI* url, nsresult status);
+  mozilla::UniquePtr<mozilla::mailnews::OfflineAttempt> mNativeAction;
+  nsCOMPtr<nsIURI> mNativeActionUrl;
+  nsresult ProcessNativeTransfer(nsIMsgOfflineImapOperation* op,
+                                 uint32_t action);
+  nsresult CompleteNativeTransfer(nsIURI* url, nsresult status);
+  mozilla::UniquePtr<mozilla::mailnews::OfflineAttempt> mNativeTransfer;
+  nsresult ProcessNativeAppend(nsIMsgOfflineImapOperation* op, uint32_t action);
+  nsresult CompleteNativeAppend(nsIURI* url, nsresult status);
+  nsresult ClearNativeAppend(nsIMsgOfflineImapOperation* op, uint32_t action);
+  mozilla::UniquePtr<NativeQueuedAppendTarget> mNativeAppend;
+  nsCOMPtr<nsIMsgOfflineImapOperation> mNativeAppendOp;
+  bool mNativeAppendCompleting = false;
+#endif
   void ProcessAppendMsgOperation(nsIMsgOfflineImapOperation* currentOp,
                                  nsOfflineImapOperationType opType);
 

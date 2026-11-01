@@ -52,7 +52,32 @@ var tests = [
       false
     );
 
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      Services.prefs.setCharPref(
+        "mail.server.default.storeContractID",
+        Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+      );
+    }
     setupIMAPPump();
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      const discovered = new PromiseTestUtils.PromiseUrlListener();
+      MailServices.imap.discoverAllFolders(
+        IMAPPump.incomingServer.rootFolder,
+        discovered,
+        null
+      );
+      await discovered.promise;
+      IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+        .getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox)
+        .QueryInterface(Ci.nsIMsgImapMailFolder);
+      Assert.ok(IMAPPump.inbox, "Native discovery supplied the real INBOX");
+      const expectedStore = {
+        "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+        "@mozilla.org/msgstore/maildirstore;1": "maildir",
+      }[Services.prefs.getCharPref("mail.serverDefaultStoreContractID")];
+      Assert.ok(expectedStore);
+      Assert.equal(IMAPPump.incomingServer.msgStore.storeType, expectedStore);
+    }
 
     const promiseFolderAdded = PromiseTestUtils.promiseFolderAdded("folder 1");
     IMAPPump.incomingServer.rootFolder.createSubfolder("folder 1", null);
@@ -118,6 +143,18 @@ var tests = [
     const promiseUrlListener = new PromiseTestUtils.PromiseUrlListener();
     IMAPPump.inbox.updateFolderWithListener(null, promiseUrlListener);
     await promiseUrlListener.promise;
+
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      // These assertions exercise cached pseudo-offline copies. The online
+      // file-APPEND inputs must have real downloaded bodies in the native store.
+      const downloaded = new PromiseTestUtils.PromiseUrlListener();
+      IMAPPump.inbox.downloadAllForOffline(downloaded, null);
+      await downloaded.promise;
+      for (const message of IMAPPump.inbox.msgDatabase.enumerateMessages()) {
+        Assert.ok(message.flags & Ci.nsMsgMessageFlags.Offline);
+        Assert.ok(message.storeToken);
+      }
+    }
 
     const db = IMAPPump.inbox.msgDatabase;
 
@@ -189,6 +226,44 @@ var tests = [
     for (const msgId of msgIds) {
       const newMsgHdr = gFolder1.msgDatabase.getMsgHdrForMessageID(msgId);
       Assert.ok(newMsgHdr.flags & Ci.nsMsgMessageFlags.Offline);
+      if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+        const source = IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(msgId);
+        Assert.ok(source);
+        Assert.notEqual(newMsgHdr.messageKey, source.messageKey);
+        Assert.equal(newMsgHdr.folder, gFolder1);
+        Assert.ok(!newMsgHdr.properties.includes("uidOnServer"));
+        for (const property of [
+          "storeToken",
+          "messageSize",
+          "offlineMessageSize",
+          "lineCount",
+        ]) {
+          Assert.ok(
+            newMsgHdr.properties.includes(property),
+            `${property} is present`
+          );
+        }
+        const counterpart = gFolder1.msgDatabase
+          .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+          .getOfflineOpForKey(newMsgHdr.messageKey, false);
+        Assert.ok(
+          counterpart,
+          "The allocated physical member has its operation"
+        );
+        Assert.equal(counterpart.messageKey, newMsgHdr.messageKey);
+        Assert.equal(counterpart.sourceFolderURI, IMAPPump.inbox.URI);
+        Assert.equal(counterpart.srcMessageKey, source.messageKey);
+        Assert.ok(
+          counterpart.operation & Ci.nsIMsgOfflineImapOperation.kMoveResult
+        );
+        const queued = IMAPPump.inbox.msgDatabase
+          .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+          .getOfflineOpForKey(source.messageKey, false);
+        Assert.ok(queued);
+        Assert.ok(queued.operation & Ci.nsIMsgOfflineImapOperation.kMsgCopy);
+        Assert.equal(queued.getCopyDestination(0), gFolder1.URI);
+        Assert.equal(queued.srcUid, source.getUint32Property("uidOnServer"));
+      }
       const msgURI = newMsgHdr.folder.getUriForMsg(newMsgHdr);
       const msgServ = MailServices.messageServiceFromURI(msgURI);
       const promiseStreamListener =
@@ -203,6 +278,27 @@ var tests = [
     const db = IMAPPump.inbox.msgDatabase;
     const messages = [...db.enumerateMessages()];
     Assert.greater(messages.length, 0);
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      for (const message of messages) {
+        const input = IMAPPump.inbox.getMsgInputStream(message);
+        const reader = Cc[
+          "@mozilla.org/scriptableinputstream;1"
+        ].createInstance(Ci.nsIScriptableInputStream);
+        reader.init(input);
+        let bytes = 0;
+        try {
+          while (reader.available()) {
+            bytes += reader.read(reader.available()).length;
+          }
+        } finally {
+          reader.close();
+        }
+        info(
+          `Queued source ${message.messageKey}: token=${message.storeToken}, ` +
+            `size=${message.messageSize}, offline=${message.offlineMessageSize}, actual=${bytes}`
+        );
+      }
+    }
     // this is sync, I believe?
     MailServices.copy.copyMessages(
       IMAPPump.inbox,

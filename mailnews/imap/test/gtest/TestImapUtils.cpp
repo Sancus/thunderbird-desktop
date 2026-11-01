@@ -6,6 +6,7 @@
 #include "nsImapUtils.h"
 #include "nsImapFlagAndUidState.h"
 #include "nsImapMailFolder.h"
+#include "nsImapUrl.h"
 
 // Invocation:
 // $ ./mach gtest "TestMsgImapUtils.*"
@@ -195,3 +196,54 @@ TEST(TestMsgImapUtils, ImapUidRangesKeepLargestEndpoint)
   ParseUidString("1005:1003", parsed);
   EXPECT_EQ((nsTArray<ImapUid>{1005, 1004, 1003}), parsed);
 }
+
+#ifdef MOZ_PANORAMA
+TEST(TestMsgImapUtils, UrlCloneKeepsHierarchyEvidenceWithoutContinuation)
+{
+  RefPtr<nsImapUrl> source = new nsImapUrl();
+  ASSERT_EQ(NS_OK,
+            source->SetSpecInternal("imap://user@host/fetch>UID>/INBOX>42"_ns));
+  ASSERT_EQ(NS_OK,
+            source->SetUri("imap-message://user@host/INBOX#42?part=1.2"_ns));
+  RefPtr<nsImapUrl> continuation = new nsImapUrl();
+  nsISupports* marker = static_cast<nsIImapUrl*>(continuation.get());
+  ASSERT_EQ(NS_OK, source->PrepareNativeHierarchy("source"_ns, "destination"_ns,
+                                                  marker, marker));
+  ASSERT_EQ(NS_OK, source->SetExpectedUidValidity(7101));
+
+  nsCOMPtr<nsIURI> clonedURI;
+  ASSERT_EQ(NS_OK, source->Clone(getter_AddRefs(clonedURI)));
+  nsCOMPtr<nsIImapUrl> clonedImap = do_QueryInterface(clonedURI);
+  ASSERT_TRUE(clonedImap);
+  auto* clone = static_cast<nsImapUrl*>(clonedImap.get());
+  EXPECT_NE(source.get(), clone);
+  EXPECT_TRUE(clone->HasNativeHierarchy());
+  EXPECT_FALSE(clone->NativeHierarchyConfirmed());
+  EXPECT_EQ(nullptr, clone->NativeHierarchyContinuation());
+  EXPECT_EQ(nullptr, clone->NativeHierarchyCopyState());
+  EXPECT_EQ(marker, source->NativeHierarchyContinuation());
+  EXPECT_EQ(marker, source->NativeHierarchyCopyState());
+  EXPECT_EQ(7101u, clone->ExpectedUidValidity());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, clone->SetExpectedUidValidity(7102));
+  nsCString messageURI;
+  ASSERT_EQ(NS_OK, clone->GetUri(messageURI));
+  EXPECT_EQ("imap-message://user@host/INBOX#42?part=1.2"_ns, messageURI);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            clone->ConfirmNativeHierarchy("other"_ns, "destination"_ns));
+  ASSERT_EQ(NS_OK,
+            clone->ConfirmNativeHierarchy("source"_ns, "destination"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            clone->ConfirmNativeHierarchy("source"_ns, "destination"_ns));
+  EXPECT_FALSE(source->NativeHierarchyConfirmed());
+  ASSERT_EQ(NS_OK,
+            source->ConfirmNativeHierarchy("source"_ns, "destination"_ns));
+  nsCOMPtr<nsIURI> confirmedURI;
+  ASSERT_EQ(NS_OK, source->Clone(getter_AddRefs(confirmedURI)));
+  nsCOMPtr<nsIImapUrl> confirmedImap = do_QueryInterface(confirmedURI);
+  ASSERT_TRUE(confirmedImap);
+  auto* confirmedClone = static_cast<nsImapUrl*>(confirmedImap.get());
+  EXPECT_TRUE(confirmedClone->NativeHierarchyConfirmed());
+  EXPECT_EQ(nullptr, confirmedClone->NativeHierarchyContinuation());
+  EXPECT_EQ(nullptr, confirmedClone->NativeHierarchyCopyState());
+}
+#endif

@@ -1147,6 +1147,7 @@ nsresult nsImapUrl::Clone(nsIURI** _retval) {
   NS_ENSURE_STATE(clonedImap);
   auto* clone = static_cast<nsImapUrl*>(clonedImap.get());
   MutexAutoLock lock(mLock);
+  MutexAutoLock cloneLock(clone->mLock);
   // A URI clone carries refusal/identity evidence, never the unique prepared
   // main-thread operation. It cannot complete local settlement on its own.
   if (mNativeHierarchy) clone->mNativeHierarchy = mNativeHierarchy;

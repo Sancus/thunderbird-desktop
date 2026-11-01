@@ -25,6 +25,7 @@
 #  include "mozilla/ScopeExit.h"
 #  include "mozilla/ResultExtensions.h"
 #  include "nsDirectoryServiceDefs.h"
+#  include "nsIInputStream.h"
 #  include "nsNetUtil.h"
 #  include "nsIMsgPluggableStore.h"
 #  include "nsIMsgFolderNotificationService.h"

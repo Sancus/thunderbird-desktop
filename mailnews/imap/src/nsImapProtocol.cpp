@@ -71,6 +71,9 @@
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ScopeExit.h"
+#ifdef MOZ_PANORAMA
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
 #include "nsIPrincipal.h"
 #include "nsContentSecurityManager.h"
 

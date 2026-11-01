@@ -89,8 +89,10 @@ add_setup(async function () {
   registerCleanupFunction(() => Object.assign(proto, original));
   setupIMAPPump();
   IMAPPump.incomingServer.useCondStore = false;
-  registerCleanupFunction(() => {
+  registerCleanupFunction(async () => {
     if (IMAPPump.incomingServer) {
+      // Release unused offline-operation wrappers before closing their stores.
+      await schedulePreciseGCAndForceCC(1);
       teardownIMAPPump();
     }
   });
@@ -1214,6 +1216,8 @@ if (panorama) {
   });
 }
 
-add_task(function endTest() {
+add_task(async function endTest() {
+  // Release unused offline-operation wrappers before closing their stores.
+  await schedulePreciseGCAndForceCC(1);
   teardownIMAPPump();
 });

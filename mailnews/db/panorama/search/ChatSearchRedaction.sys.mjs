@@ -6,6 +6,7 @@ import { IMServices } from "resource:///modules/IMServices.sys.mjs";
 import {
   encodeName,
   queueFileOperation,
+  readChatPrivacyTarget,
 } from "resource:///modules/logger.sys.mjs";
 import { chatSearchDocumentId } from "resource:///modules/panorama/ChatSearchProvider.sys.mjs";
 
@@ -124,4 +125,150 @@ export async function persistChatSearchRedaction(message, { signal } = {}) {
   }
   signal?.throwIfAborted();
   return changed;
+}
+
+/**
+ * Hashes exact UTF-8 source bytes for a captured logger version.
+ *
+ * @param {Uint8Array} bytes - Existing file or record bytes.
+ * @returns {string} Lower-case SHA-256 digest.
+ */
+function privacyDigest(bytes) {
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(hash.SHA256);
+  hash.update(bytes, bytes.length);
+  return Array.from(hash.finish(false), c =>
+    c.charCodeAt(0).toString(16).padStart(2, "0")
+  ).join("");
+}
+
+/**
+ * Builds a replacement for the exact stored record versions in a receipt.
+ * Later records that reuse the remote ID stay unchanged.
+ *
+ * @param {{bytes: Uint8Array, target: {records: object[]}}} snapshot -
+ *   Current source verified by the logger receipt reader.
+ * @param {{remoteId: string}} receipt - Validated stored privacy identity.
+ * @returns {{text: string, changed: boolean}} Replacement and whether it erases text.
+ * @throws {Error} If a captured record changed or its erased projection differs.
+ */
+function privacyReplacement(snapshot, receipt) {
+  const lines = new TextDecoder("utf-8", { fatal: true })
+    .decode(snapshot.bytes)
+    .split("\n");
+  const encoder = new TextEncoder();
+  let changed = false;
+  for (const record of snapshot.target.records) {
+    const line = lines[record.line];
+    if (typeof line != "string") {
+      throw new Error("Captured chat privacy record is missing");
+    }
+    const digest = privacyDigest(encoder.encode(line));
+    if (digest === record.erasedSha256) {
+      continue;
+    }
+    if (digest !== record.beforeSha256) {
+      throw new Error("Captured chat privacy record changed");
+    }
+    const value = JSON.parse(line);
+    if (value.remoteId !== receipt.remoteId || !Array.isArray(value.flags)) {
+      throw new Error("Captured chat privacy identity changed");
+    }
+    value.text = "";
+    if (!value.flags.includes("deleted")) {
+      value.flags.push("deleted");
+    }
+    const erased = JSON.stringify(value);
+    if (privacyDigest(encoder.encode(erased)) !== record.erasedSha256) {
+      throw new Error("Captured chat privacy projection changed");
+    }
+    lines[record.line] = erased;
+    changed = true;
+  }
+  return { text: lines.join("\n"), changed };
+}
+
+/**
+ * Checks whether a completed receipt's captured versions reappeared.
+ * This check does not authorize unknown history or write source bytes.
+ *
+ * @param {{id: string, remoteId: string, targets: object[]}} receipt - Stored receipt.
+ * @param {object} [options={}] - Existing source cancellation control.
+ * @param {AbortSignal} [options.signal] - Cancels before queued reads.
+ * @returns {Promise<boolean>} Whether a captured, non-erased version remains.
+ * @throws {Error} Original cancellation, source or receipt verification error.
+ */
+export async function chatSearchPrivacyNeedsErasure(receipt, { signal } = {}) {
+  let changed = false;
+  for (const target of receipt.targets) {
+    signal?.throwIfAborted();
+    const snapshot = await readChatPrivacyTarget(
+      receipt.id,
+      target.relativePath,
+      {
+        signal,
+      }
+    );
+    if (!snapshot.missing) {
+      const replacement = privacyReplacement(snapshot, receipt);
+      changed = replacement.changed || changed;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Erases only the captured versions, retaining every unrelated source line.
+ * Already-erased or absent targets are still returned for cache erasure on replay.
+ * Each file is rechecked inside its write queue; earlier writes are not rolled
+ * back if a later file or the destination index fails.
+ *
+ * @param {{id: string, remoteId: string, targets: object[]}} receipt - Stored receipt.
+ * @param {object} [options={}] - Source cancellation control.
+ * @param {AbortSignal} [options.signal] - Cancels before starting a source write.
+ * @returns {Promise<string[]>} All verified target paths, including unchanged ones.
+ * @throws {Error} Original I/O/cancellation or changed-source verification error.
+ */
+export async function applyChatSearchPrivacyReceipt(receipt, { signal } = {}) {
+  const paths = [];
+  for (const target of receipt.targets) {
+    signal?.throwIfAborted();
+    const snapshot = await readChatPrivacyTarget(
+      receipt.id,
+      target.relativePath,
+      {
+        signal,
+      }
+    );
+    await queueFileOperation(snapshot.path, async () => {
+      signal?.throwIfAborted();
+      if (snapshot.missing) {
+        try {
+          await IOUtils.stat(snapshot.path);
+        } catch (error) {
+          if (error.name == "NotFoundError") {
+            return;
+          }
+          throw error;
+        }
+        throw new Error("Chat source reappeared before privacy completion");
+      }
+      const bytes = await IOUtils.read(snapshot.path);
+      if (privacyDigest(bytes) !== snapshot.revision) {
+        throw new Error("Chat source changed before privacy erasure");
+      }
+      const replacement = privacyReplacement({ ...snapshot, bytes }, receipt);
+      if (replacement.changed) {
+        signal?.throwIfAborted();
+        await IOUtils.writeUTF8(snapshot.path, replacement.text, {
+          tmpPath: snapshot.path + ".panorama-redaction.tmp",
+          flush: true,
+        });
+      }
+    });
+    paths.push(snapshot.path);
+  }
+  return paths;
 }

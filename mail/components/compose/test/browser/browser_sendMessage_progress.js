@@ -10,6 +10,10 @@ const { MockRegistrar } = ChromeUtils.importESModule(
   "resource://testing-common/MockRegistrar.sys.mjs"
 );
 
+const { PromiseTestUtils: MailPromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+
 const gProgressEvents = [];
 let smtpIdentity;
 
@@ -35,6 +39,21 @@ add_setup(async function () {
     createSMTPAccount("imap"));
 
   const incomingServer = smtpAccount.incomingServer;
+  let mockTaskbar;
+  registerCleanupFunction(async function () {
+    incomingServer.closeCachedConnections();
+    smtpOutgoingServer.closeCachedConnections();
+    MailServices.accounts.removeAccount(smtpAccount, false);
+    await Services.logins.removeAllLoginsAsync();
+    MockRegistrar.unregister(mockTaskbar);
+  });
+  const discovery = new MailPromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    incomingServer.rootFolder,
+    discovery,
+    null
+  );
+  await discovery.promise;
   incomingServer.performBiff(window.msgWindow);
   await TestUtils.waitForCondition(
     () => incomingServer.rootFolder.containsChildNamed("Sent"),
@@ -44,7 +63,6 @@ add_setup(async function () {
   smtpIdentity.fccFolderURI = incomingServer.serverURI + "/Sent";
   smtpIdentity.fullName = "Bart Simpson";
 
-  let mockTaskbar;
   if (AppConstants.platform == "win") {
     mockTaskbar = MockRegistrar.register("@mozilla.org/windows-taskbar;1", {
       QueryInterface: ChromeUtils.generateQI(["nsIWinTaskbar"]),
@@ -94,15 +112,6 @@ add_setup(async function () {
       }
     );
   }
-
-  registerCleanupFunction(async function () {
-    smtpOutgoingServer.closeCachedConnections();
-
-    MailServices.accounts.removeAccount(smtpAccount, false);
-    await Services.logins.removeAllLoginsAsync();
-
-    MockRegistrar.unregister(mockTaskbar);
-  });
 });
 
 /**

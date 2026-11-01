@@ -8,6 +8,7 @@
 
 const [action, fixture, rejectDelivery] = arguments;
 const done = arguments[arguments.length - 1];
+dump(`S375 ${action} start\n`);
 const { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
@@ -300,6 +301,9 @@ async function stopServer() {
     const { SmtpDaemon, SMTP_RFC2821_handler } = ChromeUtils.importESModule(
       "resource://testing-common/mailnews/Smtpd.sys.mjs"
     );
+    const { MockRegistrar } = ChromeUtils.importESModule(
+      "resource://testing-common/MockRegistrar.sys.mjs"
+    );
     const daemon = new SmtpDaemon();
     daemon.received = [];
     daemon.rejectDelivery = rejectDelivery;
@@ -332,18 +336,24 @@ async function stopServer() {
     const events = { starts: [], messageStarts: [], errors: [], stops: [] };
     const previousPrompt = Services.prompt;
     const alerts = [];
-    Services.prompt = {
+    const prompt = {
       QueryInterface: ChromeUtils.generateQI(["nsIPromptService"]),
       alert(parent, title, text) {
         alerts.push(text);
+        dump(`S375 send alert: ${text}\n`);
       },
     };
+    // Native stream failures look up this contract directly instead of Services.prompt.
+    const promptCID = MockRegistrar.register("@mozilla.org/prompter;1", prompt);
+    Services.prompt = prompt;
     const listener = {
       QueryInterface: ChromeUtils.generateQI(["nsIMsgSendLaterListener"]),
       onStartSending(total) {
+        dump(`S375 send start total=${total}\n`);
         events.starts.push(total);
       },
       onMessageStartSending(current, total, header, usedIdentity) {
+        dump(`S375 send member=${current}/${total} key=${header.messageKey}\n`);
         events.messageStarts.push({
           current,
           total,
@@ -355,6 +365,7 @@ async function stopServer() {
       },
       onMessageSendProgress() {},
       onMessageSendError(current, header, status) {
+        dump(`S375 send error member=${current} status=${status}\n`);
         events.errors.push({
           current,
           key: header.messageKey,
@@ -363,6 +374,9 @@ async function stopServer() {
         });
       },
       onStopSending(status, message, tried, successful) {
+        dump(
+          `S375 send stop status=${status} tried=${tried} successful=${successful}\n`
+        );
         events.stops.push({ status, tried, successful });
         Services.tm.dispatchToMainThread(() => resolveStop());
       },
@@ -389,6 +403,7 @@ async function stopServer() {
     } finally {
       later.removeListener(listener);
       Services.prompt = previousPrompt;
+      MockRegistrar.unregister(promptCID);
       await stopServer();
     }
   }
@@ -456,11 +471,16 @@ async function stopServer() {
   }
   throw new Error(`Unknown send-later test action: ${action}`);
 })().then(
-  value => done({ value }),
-  error =>
+  value => {
+    dump(`S375 ${action} finished\n`);
+    done({ value });
+  },
+  error => {
+    dump(`S375 ${action} failed: ${error}\n`);
     done({
       error: String(error),
       stack: error.stack,
       fixture: action == "setup" ? owner.s375Fixture : null,
-    })
+    });
+  }
 );

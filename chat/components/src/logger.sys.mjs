@@ -65,6 +65,578 @@ export function queueFileOperation(aPath, aOperation) {
 }
 
 /**
+ * @typedef {object} ChatPrivacyTarget
+ * @property {string[]} relativePath - Four existing logger path components.
+ * @property {string} headerSha256 - Exact first-line identity digest.
+ * @property {{line: number, beforeSha256: string, erasedSha256: string}[]} records
+ *   Captured versions, including the expected erased form of each line.
+ */
+/**
+ * @typedef {object} ChatPrivacyReceipt
+ * @property {number} version - Persisted format version, currently 1.
+ * @property {string} id - Digest of this exact scope and captured version set.
+ * @property {string} status - Pending settlement or a completed exclusion.
+ * @property {string} kind - Always "erase".
+ * @property {{protocol: string, account: string, conversation: string,
+ *   isChat: boolean}} scope - Existing normalized logger identity.
+ * @property {string} remoteId - Identity found in an existing stored record.
+ * @property {ChatPrivacyTarget[]} targets - Exact existing source versions.
+ */
+
+let gChatPrivacyEpoch = 0;
+const gChatPrivacyCaptures = new Set();
+const gChatPrivacySubjects = new WeakMap();
+const gChatPrivacyAcknowledgements = new Map();
+const gChatPrivacyFailures = new Map();
+let gChatPrivacyCaptureTail = Promise.resolve();
+
+/** Returns the profile-owned pending/exclusion file, outside transcript folders. */
+function chatPrivacyPath() {
+  return PathUtils.join(PathUtils.profileDir, "logs", ".privacy-pending.json");
+}
+
+/** Hashes exact UTF-8 text or bytes without normalization. */
+function chatPrivacyHash(value) {
+  const bytes =
+    typeof value == "string" ? new TextEncoder().encode(value) : value;
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(hash.SHA256);
+  hash.update(bytes, bytes.length);
+  return Array.from(hash.finish(false), c =>
+    c.charCodeAt(0).toString(16).padStart(2, "0")
+  ).join("");
+}
+
+/** Returns the immutable portion used to identify a captured version set. */
+function chatPrivacyIdentity(receipt) {
+  const { version, kind, scope, remoteId, targets } = receipt;
+  return { version, kind, scope, remoteId, targets };
+}
+
+/** Checks persisted identity and path components before resolving any path. */
+function validateChatPrivacyReceipt(receipt) {
+  const digest = value =>
+    typeof value == "string" && /^[a-f0-9]{64}$/.test(value);
+  const scope = receipt?.scope;
+  if (
+    receipt?.version !== 1 ||
+    receipt.kind !== "erase" ||
+    !["pending", "complete"].includes(receipt.status) ||
+    !scope ||
+    typeof scope.protocol != "string" ||
+    !scope.protocol ||
+    /[\\/]/.test(scope.protocol) ||
+    [".", ".."].includes(scope.protocol) ||
+    typeof scope.account != "string" ||
+    !scope.account ||
+    typeof scope.conversation != "string" ||
+    !scope.conversation ||
+    typeof scope.isChat != "boolean" ||
+    typeof receipt.remoteId != "string" ||
+    !receipt.remoteId ||
+    !Array.isArray(receipt.targets) ||
+    !receipt.targets.length
+  ) {
+    throw new Error("Invalid chat privacy receipt");
+  }
+  const prefix = [
+    scope.protocol,
+    encodeName(scope.account),
+    encodeName(scope.conversation + (scope.isChat ? ".chat" : "")),
+  ];
+  const paths = new Set();
+  for (const target of receipt.targets) {
+    const parts = target?.relativePath;
+    if (
+      !Array.isArray(parts) ||
+      parts.length !== 4 ||
+      parts.some(
+        part =>
+          typeof part != "string" ||
+          !part ||
+          [".", ".."].includes(part) ||
+          /[\\/]/.test(part)
+      ) ||
+      !prefix.every((part, i) => part === parts[i]) ||
+      !/^\d{4}-\d{2}-\d{2}\.\d{6}[+-]\d{4}\.json$/.test(parts[3]) ||
+      !digest(target.headerSha256) ||
+      !Array.isArray(target.records) ||
+      !target.records.length ||
+      paths.has(JSON.stringify(parts))
+    ) {
+      throw new Error("Invalid chat privacy target");
+    }
+    paths.add(JSON.stringify(parts));
+    let previousLine = 0;
+    for (const record of target.records) {
+      if (
+        !Number.isSafeInteger(record.line) ||
+        record.line <= previousLine ||
+        !digest(record.beforeSha256) ||
+        !digest(record.erasedSha256)
+      ) {
+        throw new Error("Invalid chat privacy record version");
+      }
+      previousLine = record.line;
+    }
+  }
+  if (
+    receipt.id !== chatPrivacyHash(JSON.stringify(chatPrivacyIdentity(receipt)))
+  ) {
+    throw new Error("Chat privacy receipt identity changed");
+  }
+}
+
+/** Reads validated state; missing state grants no historical eligibility. */
+async function loadChatPrivacyState() {
+  let state;
+  try {
+    state = JSON.parse(await IOUtils.readUTF8(chatPrivacyPath()));
+  } catch (error) {
+    if (error.name === "NotFoundError") {
+      return { version: 1, receipts: [] };
+    }
+    throw error;
+  }
+  if (state?.version !== 1 || !Array.isArray(state.receipts)) {
+    throw new Error("Invalid chat privacy state");
+  }
+  const ids = new Set();
+  for (const receipt of state.receipts) {
+    validateChatPrivacyReceipt(receipt);
+    if (ids.has(receipt.id)) {
+      throw new Error("Duplicate chat privacy receipt");
+    }
+    ids.add(receipt.id);
+  }
+  return state;
+}
+
+/** Atomically replaces this state file after flushing its bytes. */
+async function saveChatPrivacyState(state) {
+  const path = chatPrivacyPath();
+  await IOUtils.makeDirectory(PathUtils.parent(path));
+  await IOUtils.writeUTF8(path, JSON.stringify(state), {
+    tmpPath: path + ".tmp",
+    flush: true,
+  });
+}
+
+/** Parses a complete logger source and verifies its scoped header. */
+function parseChatPrivacySource(bytes, scope) {
+  const lines = new TextDecoder("utf-8", { fatal: true })
+    .decode(bytes)
+    .split("\n");
+  const header = JSON.parse(lines[0]);
+  if (
+    header.protocol !== scope.protocol ||
+    header.account !== scope.account ||
+    header.normalizedName !== scope.conversation ||
+    header.isChat !== scope.isChat
+  ) {
+    throw new Error("Chat privacy source identity changed");
+  }
+  const records = [];
+  for (let line = 1; line < lines.length; line++) {
+    if (line === lines.length - 1 && lines[line] === "") {
+      continue;
+    }
+    const record = JSON.parse(lines[line]);
+    if (
+      !record ||
+      typeof record.text != "string" ||
+      !Array.isArray(record.flags) ||
+      record.flags.some(flag => typeof flag != "string") ||
+      (record.remoteId != null && typeof record.remoteId != "string")
+    ) {
+      throw new Error("Invalid chat privacy source record");
+    }
+    records.push({ line, record });
+  }
+  return { lines, records };
+}
+
+/** Captures only identity fields before an observer yields or closes a writer. */
+function chatPrivacyScope(message) {
+  const conversation = message.conversation;
+  const scope = {
+    protocol: conversation.account.protocol.normalizedName,
+    account: conversation.account.normalizedName,
+    conversation: conversation.normalizedName,
+    isChat: conversation.isChat,
+  };
+  if (
+    typeof scope.protocol != "string" ||
+    !scope.protocol ||
+    [".", ".."].includes(scope.protocol) ||
+    /[\\/]/.test(scope.protocol) ||
+    typeof scope.account != "string" ||
+    !scope.account ||
+    typeof scope.conversation != "string" ||
+    !scope.conversation ||
+    typeof scope.isChat != "boolean"
+  ) {
+    throw new TypeError("A normalized logger conversation is required");
+  }
+  return scope;
+}
+
+/** Joins an original subject and any ordinary deleted-notice append. */
+function beginChatPrivacyCapture(message, appendNotice = null) {
+  if (
+    (message.noLog !== true && message.deleted !== true) ||
+    typeof message.remoteId != "string" ||
+    !message.remoteId
+  ) {
+    return Promise.resolve(null);
+  }
+  const existing = gChatPrivacySubjects.get(message);
+  if (existing && (!appendNotice || !existing.started)) {
+    existing.appendNotice ||= appendNotice;
+    return existing.promise;
+  }
+  const scope = chatPrivacyScope(message);
+  const remoteId = message.remoteId;
+  const scopeKey = JSON.stringify(scope);
+  const prefix = [
+    scope.protocol,
+    encodeName(scope.account),
+    encodeName(scope.conversation + (scope.isChat ? ".chat" : "")),
+  ];
+  const directory = PathUtils.join(PathUtils.profileDir, "logs", ...prefix);
+  // Save actual promises before our later queued reads replace their map entries.
+  const previousWork = Array.from(gFilePromises, ([path, work]) =>
+    PathUtils.parent(path) === directory ? work : null
+  ).filter(Boolean);
+  const activePaths = [
+    ...(gLogWritersById.get(message.conversation.id)?.paths || []),
+  ];
+  const capture = {
+    started: false,
+    appendNotice,
+    durable: false,
+    promise: null,
+  };
+  ++gChatPrivacyEpoch;
+  const run = async () => {
+    capture.started = true;
+    let firstError;
+    let hasPriorError = false;
+    for (const result of await Promise.allSettled(previousWork)) {
+      if (result.status === "rejected" && !hasPriorError) {
+        firstError = result.reason;
+        hasPriorError = true;
+      }
+    }
+    try {
+      if (!hasPriorError && capture.appendNotice) {
+        await capture.appendNotice();
+      }
+      let children;
+      try {
+        children = await IOUtils.getChildren(directory);
+      } catch (error) {
+        if (error.name !== "NotFoundError" || activePaths.length) {
+          throw hasPriorError ? firstError : error;
+        }
+        children = [];
+      }
+      const paths = new Set([
+        ...activePaths,
+        ...children.filter(path =>
+          /^\d{4}-\d{2}-\d{2}\.\d{6}[+-]\d{4}\.json$/.test(
+            PathUtils.filename(path)
+          )
+        ),
+      ]);
+      const targets = [];
+      for (const path of [...paths].sort()) {
+        const bytes = await queueFileOperation(path, () => IOUtils.read(path));
+        const { lines, records } = parseChatPrivacySource(bytes, scope);
+        const versions = [];
+        for (const { line, record } of records) {
+          if (record.remoteId !== remoteId) {
+            continue;
+          }
+          const erased = { ...record, text: "", flags: [...record.flags] };
+          if (!erased.flags.includes("deleted")) {
+            erased.flags.push("deleted");
+          }
+          versions.push({
+            line,
+            beforeSha256: chatPrivacyHash(lines[line]),
+            erasedSha256: chatPrivacyHash(JSON.stringify(erased)),
+          });
+        }
+        if (versions.length) {
+          targets.push({
+            relativePath: [...prefix, PathUtils.filename(path)],
+            headerSha256: chatPrivacyHash(lines[0]),
+            records: versions,
+          });
+        }
+      }
+      if (!targets.length) {
+        if (hasPriorError) {
+          throw firstError;
+        }
+        gChatPrivacyFailures.delete(scopeKey);
+        return null;
+      }
+      const receipt = { version: 1, kind: "erase", scope, remoteId, targets };
+      receipt.id = chatPrivacyHash(JSON.stringify(receipt));
+      receipt.status = "pending";
+      await queueFileOperation(chatPrivacyPath(), async () => {
+        const state = await loadChatPrivacyState();
+        if (!state.receipts.some(item => item.id === receipt.id)) {
+          state.receipts.push(receipt);
+          await saveChatPrivacyState(state);
+        }
+      });
+      capture.durable = true;
+      gChatPrivacyFailures.delete(scopeKey);
+      if (hasPriorError) {
+        throw firstError;
+      }
+      return receipt;
+    } catch (error) {
+      throw hasPriorError ? firstError : error;
+    }
+  };
+  capture.promise = gChatPrivacyCaptureTail.then(run).catch(error => {
+    if (!capture.durable && !gChatPrivacyFailures.has(scopeKey)) {
+      gChatPrivacyFailures.set(scopeKey, error);
+    }
+    throw error;
+  });
+  gChatPrivacyCaptureTail = capture.promise.catch(() => {});
+  gChatPrivacyCaptures.add(capture.promise);
+  gChatPrivacySubjects.set(message, capture);
+  const finish = () => {
+    gChatPrivacyCaptures.delete(capture.promise);
+    if (gChatPrivacySubjects.get(message) === capture) {
+      gChatPrivacySubjects.delete(message);
+    }
+    ++gChatPrivacyEpoch;
+  };
+  capture.promise.then(finish, finish);
+  return capture.promise;
+}
+
+/**
+ * Captures exact previously logged privacy targets before returning a durable receipt.
+ * In-flight work changes the epoch synchronously. A no-match event stores no ID
+ * or payload. A rejected capture is never acknowledged by a successful reread.
+ *
+ * @param {prplIMessage} message - Explicit noLog/deleted event; text is never read.
+ * @returns {Promise<ChatPrivacyReceipt|null>} Flushed receipt, or no stored target.
+ * @throws {Error} Original queued/read/write failure or invalid source identity.
+ */
+export function captureChatPrivacyIntent(message) {
+  try {
+    return beginChatPrivacyCapture(message);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+/** Returns the live revision to compare before and after awaited delivery. */
+export function getChatPrivacyEpoch() {
+  return gChatPrivacyEpoch;
+}
+
+/**
+ * Drains captures and returns durable pending and completed version exclusions.
+ * Empty state never authorizes pre-producer or otherwise unknown history.
+ *
+ * @returns {Promise<{epoch: number, pending: ChatPrivacyReceipt[],
+ *   completed: ChatPrivacyReceipt[], historyKnown: boolean}>} Validated state copies.
+ * @throws {Error} Original capture or storage failure; reads do not clear failure.
+ */
+export async function getChatPrivacyState() {
+  while (gChatPrivacyCaptures.size) {
+    await Promise.all([...gChatPrivacyCaptures]);
+  }
+  if (gChatPrivacyFailures.size) {
+    throw gChatPrivacyFailures.values().next().value;
+  }
+  const state = await queueFileOperation(
+    chatPrivacyPath(),
+    loadChatPrivacyState
+  );
+  return {
+    epoch: gChatPrivacyEpoch,
+    pending: state.receipts.filter(
+      item =>
+        item.status === "pending" || gChatPrivacyAcknowledgements.has(item.id)
+    ),
+    completed: state.receipts.filter(
+      item =>
+        item.status === "complete" && !gChatPrivacyAcknowledgements.has(item.id)
+    ),
+    historyKnown: false,
+  };
+}
+
+/** Returns an exact validated pending or completed receipt. */
+async function findChatPrivacyReceipt(receiptId) {
+  const state = await queueFileOperation(
+    chatPrivacyPath(),
+    loadChatPrivacyState
+  );
+  const receipt = state.receipts.find(item => item.id === receiptId);
+  if (!receipt) {
+    throw new Error("Unknown chat privacy receipt");
+  }
+  return receipt;
+}
+
+/**
+ * Reads only the stored scoped target, accepting captured or already-erased lines.
+ * Later appended records reusing the ID are outside this receipt.
+ *
+ * @param {string} receiptId - Exact pending or complete receipt identity.
+ * @param {string[]} relativePath - Exact stored four-component target.
+ * @param {object} [options={}] - Cancellation controls.
+ * @param {AbortSignal} [options.signal] - Cancels delivery, not started logger I/O.
+ * @returns {Promise<{path: string, bytes: Uint8Array, revision: string,
+ *   target: ChatPrivacyTarget}>} Current source bytes and captured line descriptors.
+ * @throws {Error} Original error, foreign/replaced header or changed target version.
+ */
+export async function readChatPrivacyTarget(
+  receiptId,
+  relativePath,
+  { signal } = {}
+) {
+  signal?.throwIfAborted();
+  const receipt = await findChatPrivacyReceipt(receiptId);
+  const target = receipt.targets.find(
+    item => JSON.stringify(item.relativePath) === JSON.stringify(relativePath)
+  );
+  if (!target) {
+    throw new Error("Unknown chat privacy target");
+  }
+  const path = PathUtils.join(
+    PathUtils.profileDir,
+    "logs",
+    ...target.relativePath
+  );
+  const previous = gFilePromises.get(path);
+  if (previous) {
+    await previous;
+  }
+  const bytes = await queueFileOperation(path, () => IOUtils.read(path));
+  signal?.throwIfAborted();
+  const { lines } = parseChatPrivacySource(bytes, receipt.scope);
+  if (
+    chatPrivacyHash(lines[0]) !== target.headerSha256 ||
+    target.records.some(record => {
+      const hash = chatPrivacyHash(lines[record.line] ?? "");
+      return hash !== record.beforeSha256 && hash !== record.erasedSha256;
+    })
+  ) {
+    throw new Error("Chat privacy target version changed");
+  }
+  return { path, bytes, revision: chatPrivacyHash(bytes), target };
+}
+
+/**
+ * Requires every captured line erased and returns current ordered source digests.
+ *
+ * @param {string} receiptId - Pending or completed version exclusion.
+ * @param {object} [options={}] - Cancellation controls.
+ * @param {AbortSignal} [options.signal] - Cancels between source reads.
+ * @returns {Promise<{receiptId: string, targets: {relativePath: string[],
+ *   revision: string}[]}>} Actual current source proof; no semantic success claim.
+ * @throws {Error} Original failure or a captured source version remains unerased.
+ */
+export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
+  const receipt = await findChatPrivacyReceipt(receiptId);
+  const targets = [];
+  for (const target of receipt.targets) {
+    const source = await readChatPrivacyTarget(receiptId, target.relativePath, {
+      signal,
+    });
+    const { lines } = parseChatPrivacySource(source.bytes, receipt.scope);
+    if (
+      target.records.some(
+        record => chatPrivacyHash(lines[record.line]) !== record.erasedSha256
+      )
+    ) {
+      throw new Error("Chat privacy source is not erased");
+    }
+    targets.push({
+      relativePath: target.relativePath,
+      revision: source.revision,
+    });
+  }
+  signal?.throwIfAborted();
+  return { receiptId, targets };
+}
+
+/**
+ * Awaits actual caller-owned source/semantic settlement, then retains exclusions.
+ * Duplicate in-flight calls join. Failure leaves the previous durable status,
+ * including completed exclusions. Callback retries must be idempotent; no file
+ * and SQL transaction is claimed. The callback runs outside all logger locks.
+ *
+ * @param {string} receiptId - Exact pending or completed receipt.
+ * @param {function(ChatPrivacyReceipt): Promise<object>} complete - Finishes real
+ *   source/semantic/FTS/recovery erasure, then returns getChatPrivacySourceProof.
+ * @param {object} [options={}] - Cancellation controls.
+ * @param {AbortSignal} [options.signal] - Cancels before durable acknowledgment.
+ * @returns {Promise<void>} Resolves after a flushed complete exclusion.
+ * @throws {Error} Original callback/I/O/cancellation error or mismatched proof.
+ * @example
+ * await acknowledgeChatPrivacyIntent(id, async receipt => {
+ *   await eraseSourceAndSearchRows(receipt);
+ *   return getChatPrivacySourceProof(receipt.id);
+ * });
+ */
+export function acknowledgeChatPrivacyIntent(
+  receiptId,
+  complete,
+  { signal } = {}
+) {
+  if (gChatPrivacyAcknowledgements.has(receiptId)) {
+    return gChatPrivacyAcknowledgements.get(receiptId);
+  }
+  ++gChatPrivacyEpoch;
+  const work = (async () => {
+    signal?.throwIfAborted();
+    if (typeof complete != "function") {
+      throw new TypeError("A completed privacy operation is required");
+    }
+    const receipt = await findChatPrivacyReceipt(receiptId);
+    const proof = await complete(receipt);
+    signal?.throwIfAborted();
+    const actual = await getChatPrivacySourceProof(receiptId, { signal });
+    if (JSON.stringify(proof) !== JSON.stringify(actual)) {
+      throw new Error("Chat privacy completion proof changed");
+    }
+    await queueFileOperation(chatPrivacyPath(), async () => {
+      const state = await loadChatPrivacyState();
+      const current = state.receipts.find(item => item.id === receiptId);
+      if (!current) {
+        throw new Error("Chat privacy receipt disappeared");
+      }
+      signal?.throwIfAborted();
+      current.status = "complete";
+      await saveChatPrivacyState(state);
+    });
+  })();
+  gChatPrivacyAcknowledgements.set(receiptId, work);
+  const finish = () => {
+    gChatPrivacyAcknowledgements.delete(receiptId);
+    ++gChatPrivacyEpoch;
+  };
+  work.then(finish, finish);
+  return work;
+}
+
+/**
  * Convenience method to append to a file using the above queue system. If any of
  * the I/O operations reject, the returned promise will reject with the same reason.
  * We open the file, append, and close it immediately. The alternative is to keep
@@ -1109,7 +1681,26 @@ export class Logger {
             Services.prefs.getBoolPref("chat.otr.default.allowMsgLog")
           );
         }
-        if (!aSubject.noLog && !excludeBecauseEncrypted) {
+        if (aSubject.noLog === true || aSubject.deleted === true) {
+          // Register the privacy barrier before yielding, even with no consumer.
+          // Keep ordinary deletion notices inside the captured source versions.
+          const appendNotice =
+            !aSubject.noLog && !excludeBecauseEncrypted
+              ? async () => {
+                  const writer = getLogWriter(aSubject.conversation);
+                  const work = writer.logMessage(aSubject);
+                  await writer._initialized;
+                  const queued = gFilePromises.get(writer.currentPath);
+                  if (queued) {
+                    await queued;
+                  }
+                  await work;
+                }
+              : null;
+          beginChatPrivacyCapture(aSubject, appendNotice).catch(error =>
+            console.error("Failed to capture chat privacy:\n" + error)
+          );
+        } else if (!excludeBecauseEncrypted) {
           const log = getLogWriter(aSubject.conversation);
           log.logMessage(aSubject);
         }

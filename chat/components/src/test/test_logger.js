@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+"use strict";
+
 do_get_profile();
 
 var { IMServices } = ChromeUtils.importESModule(
@@ -10,6 +12,12 @@ var { IMServices } = ChromeUtils.importESModule(
 
 const {
   Logger,
+  captureChatPrivacyIntent,
+  getChatPrivacyEpoch,
+  getChatPrivacyState,
+  readChatPrivacyTarget,
+  getChatPrivacySourceProof,
+  acknowledgeChatPrivacyIntent,
   gFilePromises,
   gPendingCleanup,
   queueFileOperation,
@@ -858,3 +866,375 @@ add_task(test_getLogPathsForConversation);
 add_task(test_logging);
 
 add_task(test_logFileSplitting);
+
+/** Creates genuine logger files with stored versions, without a search fixture. */
+async function makePrivacyLog(
+  name,
+  { remoteId = "stored-id", rotated = false } = {}
+) {
+  const conversation = {
+    ...dummyConv,
+    id: "privacy-" + name,
+    normalizedName: "privacy-" + name,
+    name: "privacy-" + name,
+  };
+  const writer = getLogWriter(conversation);
+  registerCleanupFunction(() => closeLogWriter(conversation));
+  await writer.logMessage({
+    time: conversation.startDate / 1000000 + 10,
+    who: "known-sender",
+    displayMessage: "private-" + name,
+    remoteId,
+    incoming: true,
+  });
+  if (rotated) {
+    await writer.logMessage({
+      time: conversation.startDate / 1000000 + 2 * 86400,
+      who: "known-sender",
+      displayMessage: "older-version-" + name,
+      remoteId,
+      incoming: true,
+    });
+  }
+  return { conversation, writer, paths: [...writer.paths], remoteId };
+}
+
+/** Builds an explicit event whose private payload must never be read. */
+function privateNoLogEvent(source, remoteId = source.remoteId) {
+  return {
+    conversation: source.conversation,
+    remoteId,
+    noLog: true,
+    get displayMessage() {
+      throw new Error("A noLog payload was read");
+    },
+    get who() {
+      throw new Error("A noLog sender was read");
+    },
+    get time() {
+      throw new Error("A noLog timestamp was read");
+    },
+  };
+}
+
+/** Erases only fixture versions described by an actual receipt. */
+async function erasePrivacyVersions(receipt, targets = receipt.targets) {
+  for (const target of targets) {
+    const source = await readChatPrivacyTarget(receipt.id, target.relativePath);
+    await queueFileOperation(source.path, async () => {
+      const current = await IOUtils.read(source.path);
+      Assert.deepEqual(
+        [...current],
+        [...source.bytes],
+        "No newer snapshot is overwritten"
+      );
+      const lines = new TextDecoder().decode(current).split("\n");
+      for (const record of target.records) {
+        const value = JSON.parse(lines[record.line]);
+        value.text = "";
+        if (!value.flags.includes("deleted")) {
+          value.flags.push("deleted");
+        }
+        lines[record.line] = JSON.stringify(value);
+      }
+      await IOUtils.writeUTF8(source.path, lines.join("\n"), {
+        tmpPath: source.path + ".privacy-test.tmp",
+        flush: true,
+      });
+    });
+  }
+}
+
+add_task(async function test_explicitPrivacyIntentSurvivesLoggerRestart() {
+  const source = await makePrivacyLog("restart");
+  const before = await IOUtils.read(source.paths[0]);
+  const logger = new Logger();
+  const event = privateNoLogEvent(source);
+  const epoch = getChatPrivacyEpoch();
+  logger.observe(event, "new-text");
+  Assert.greater(
+    getChatPrivacyEpoch(),
+    epoch,
+    "Capture gates readers before its first await"
+  );
+  const receipt = await captureChatPrivacyIntent(event);
+  Assert.ok(receipt.id, "Actual logger event has a durable receipt");
+  Assert.deepEqual(
+    [...(await IOUtils.read(source.paths[0]))],
+    [...before],
+    "Capture does not erase or replace source"
+  );
+  const journal = PathUtils.join(logDirPath, ".privacy-pending.json");
+  const saved = await IOUtils.readUTF8(journal);
+  Assert.ok(
+    !saved.includes("private-restart"),
+    "No private source text enters receipts"
+  );
+  closeLogWriter(source.conversation);
+  new Logger();
+  let state = await getChatPrivacyState();
+  Assert.ok(
+    state.pending.some(item => item.id === receipt.id),
+    "Reopen reads persisted pending work"
+  );
+  Assert.strictEqual(
+    state.historyKnown,
+    false,
+    "No blanket historic authorization"
+  );
+  await Assert.rejects(
+    getChatPrivacySourceProof(receipt.id),
+    /not erased/,
+    "Source proof cannot acknowledge unerased text"
+  );
+  let completions = 0;
+  const complete = async current => {
+    ++completions;
+    await erasePrivacyVersions(current);
+    return getChatPrivacySourceProof(current.id);
+  };
+  await acknowledgeChatPrivacyIntent(receipt.id, complete);
+  new Logger();
+  state = await getChatPrivacyState();
+  Assert.ok(
+    state.completed.some(item => item.id === receipt.id),
+    "Completed exclusions survive reopen"
+  );
+  Assert.ok(
+    !state.pending.some(item => item.id === receipt.id),
+    "Actual settlement changes status"
+  );
+  await IOUtils.write(source.paths[0], before);
+  await Assert.rejects(
+    getChatPrivacySourceProof(receipt.id),
+    /not erased/,
+    "Restoring pre-privacy bytes does not restore eligibility"
+  );
+  await acknowledgeChatPrivacyIntent(receipt.id, complete);
+  Assert.equal(
+    completions,
+    2,
+    "A restored captured version can be erased again"
+  );
+  const writer = getLogWriter(source.conversation);
+  await writer.logMessage({
+    time: source.conversation.startDate / 1000000 + 20,
+    who: "known-sender",
+    displayMessage: "later legitimate ID reuse",
+    incoming: true,
+    remoteId: source.remoteId,
+  });
+  await acknowledgeChatPrivacyIntent(receipt.id, complete);
+  Assert.ok(
+    (await IOUtils.readUTF8(source.paths[0])).includes(
+      "later legitimate ID reuse"
+    ),
+    "An old exclusion does not erase a later appended same-ID version"
+  );
+});
+
+add_task(async function test_closedConversationPrivacyUsesVerifiedHistory() {
+  const source = await makePrivacyLog("closed", { rotated: true });
+  const control = await makePrivacyLog("foreign-control");
+  const controlBytes = await IOUtils.read(control.paths[0]);
+  const original = await IOUtils.read(source.paths[0]);
+  closeLogWriter(source.conversation);
+  const receipt = await captureChatPrivacyIntent(privateNoLogEvent(source));
+  Assert.equal(
+    receipt.targets.length,
+    2,
+    "Closed writer history includes both rotated files"
+  );
+  const target = receipt.targets[0];
+  const path = PathUtils.join(logDirPath, ...target.relativePath);
+  const bytes = await IOUtils.read(path);
+  const lines = new TextDecoder().decode(bytes).split("\n");
+  const header = JSON.parse(lines[0]);
+  header.account = "foreign-account";
+  lines[0] = JSON.stringify(header);
+  await IOUtils.writeUTF8(path, lines.join("\n"));
+  await Assert.rejects(
+    readChatPrivacyTarget(receipt.id, target.relativePath),
+    /identity changed/,
+    "Foreign headers cannot reuse a stored path"
+  );
+  await IOUtils.write(path, bytes);
+  const changed = new TextDecoder()
+    .decode(bytes)
+    .replace("private-closed", "replacement text");
+  await IOUtils.writeUTF8(path, changed);
+  await Assert.rejects(
+    readChatPrivacyTarget(receipt.id, target.relativePath),
+    /version changed/,
+    "A replaced target line is not accepted by name or remoteId alone"
+  );
+  await IOUtils.write(path, bytes);
+  await acknowledgeChatPrivacyIntent(receipt.id, async current => {
+    await erasePrivacyVersions(current);
+    return getChatPrivacySourceProof(current.id);
+  });
+  Assert.deepEqual(
+    [...(await IOUtils.read(control.paths[0]))],
+    [...controlBytes],
+    "Same remoteId in an unrelated conversation remains untouched"
+  );
+  Assert.notDeepEqual(
+    [...(await IOUtils.read(source.paths[0]))],
+    [...original],
+    "Actual historical source versions were erased"
+  );
+});
+
+add_task(async function test_failedPrivacyCompletionRetainsPendingIntent() {
+  const source = await makePrivacyLog("failure", { rotated: true });
+  const receipt = await captureChatPrivacyIntent(privateNoLogEvent(source));
+  const failure = new Error("actual consumer stopped after first source write");
+  await Assert.rejects(
+    acknowledgeChatPrivacyIntent(receipt.id, async current => {
+      await erasePrivacyVersions(current, current.targets.slice(0, 1));
+      throw failure;
+    }),
+    error => error === failure,
+    "First actual completion failure is preserved"
+  );
+  new Logger();
+  Assert.ok(
+    (await getChatPrivacyState()).pending.some(item => item.id === receipt.id),
+    "Partial source completion remains durably pending"
+  );
+  await Assert.rejects(
+    getChatPrivacySourceProof(receipt.id),
+    /not erased/,
+    "One completed file is not whole-source proof"
+  );
+  let release;
+  const barrier = new Promise(resolve => {
+    release = resolve;
+  });
+  let count = 0;
+  const first = acknowledgeChatPrivacyIntent(receipt.id, async current => {
+    ++count;
+    await barrier;
+    await erasePrivacyVersions(current);
+    return getChatPrivacySourceProof(current.id);
+  });
+  const duplicate = acknowledgeChatPrivacyIntent(receipt.id, () => {
+    throw new Error("Duplicate completion must not run");
+  });
+  Assert.strictEqual(
+    first,
+    duplicate,
+    "Same in-flight ID joins one completion promise"
+  );
+  release();
+  await first;
+  Assert.equal(count, 1, "One completion callback ran for the joined attempt");
+  const abort = new AbortController();
+  abort.abort(failure);
+  await Assert.rejects(
+    acknowledgeChatPrivacyIntent(receipt.id, () => {}, {
+      signal: abort.signal,
+    }),
+    error => error === failure,
+    "Cancellation retains its exact reason"
+  );
+  Assert.ok(
+    (await getChatPrivacyState()).completed.some(
+      item => item.id === receipt.id
+    ),
+    "Failed reapplication preserves completed exclusions"
+  );
+
+  const writeSource = await makePrivacyLog("ack-write-failure");
+  const writeReceipt = await captureChatPrivacyIntent(
+    privateNoLogEvent(writeSource)
+  );
+  const blockedTemporaryPath = PathUtils.join(
+    logDirPath,
+    ".privacy-pending.json.tmp"
+  );
+  await IOUtils.makeDirectory(blockedTemporaryPath);
+  try {
+    await Assert.rejects(
+      acknowledgeChatPrivacyIntent(writeReceipt.id, async current => {
+        await erasePrivacyVersions(current);
+        return getChatPrivacySourceProof(current.id);
+      }),
+      error =>
+        error.name === "NotAllowedError" &&
+        error.message.includes(".privacy-pending.json.tmp") &&
+        error.message.includes("failed to open file for writing"),
+      "The actual directory denial preserves its pinned write error"
+    );
+    Assert.ok(
+      (await getChatPrivacyState()).pending.some(
+        item => item.id === writeReceipt.id
+      ),
+      "Failed acknowledgment keeps the existing durable pending receipt"
+    );
+  } finally {
+    await IOUtils.remove(blockedTemporaryPath);
+  }
+  await acknowledgeChatPrivacyIntent(writeReceipt.id, async current => {
+    await erasePrivacyVersions(current);
+    return getChatPrivacySourceProof(current.id);
+  });
+
+  const queuedSource = await makePrivacyLog("queued-failure");
+  let rejectWork, started;
+  const began = new Promise(resolve => {
+    started = resolve;
+  });
+  const queued = queueFileOperation(queuedSource.paths[0], () => {
+    started();
+    return new Promise((resolve, reject) => {
+      rejectWork = reject;
+    });
+  });
+  queued.catch(() => {});
+  await began;
+  const before = await IOUtils.read(queuedSource.paths[0]);
+  const capture = captureChatPrivacyIntent(privateNoLogEvent(queuedSource));
+  rejectWork(failure);
+  await Assert.rejects(
+    capture,
+    error => error === failure,
+    "Capture preserves the actual pre-capture queued Error after a successful reread"
+  );
+  Assert.deepEqual(
+    [...(await IOUtils.read(queuedSource.paths[0]))],
+    [...before],
+    "The rejected capture does not mutate source bytes"
+  );
+  Assert.ok(
+    (await getChatPrivacyState()).pending.some(
+      item =>
+        item.scope.conversation === queuedSource.conversation.normalizedName
+    ),
+    "Known versions captured despite prior failure remain pending, never acknowledged"
+  );
+});
+
+add_task(async function test_noLogUnknownIdDoesNotPersistPayload() {
+  const source = await makePrivacyLog("unknown");
+  const journal = PathUtils.join(logDirPath, ".privacy-pending.json");
+  const before = await IOUtils.readUTF8(journal);
+  const event = privateNoLogEvent(source, "never-logged-private-identifier");
+  const receipt = await captureChatPrivacyIntent(event);
+  Assert.strictEqual(
+    receipt,
+    null,
+    "An unlogged event has no stored target receipt"
+  );
+  Assert.equal(
+    await IOUtils.readUTF8(journal),
+    before,
+    "No unlogged identifier or private noLog payload is persisted"
+  );
+  const known = await captureChatPrivacyIntent(privateNoLogEvent(source));
+  Assert.ok(known.id, "The genuine previously stored ID is still captured");
+  await acknowledgeChatPrivacyIntent(known.id, async current => {
+    await erasePrivacyVersions(current);
+    return getChatPrivacySourceProof(current.id);
+  });
+});

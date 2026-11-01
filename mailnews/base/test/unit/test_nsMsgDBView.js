@@ -1275,10 +1275,10 @@ add_task(function test_teardown() {
 
 add_task(async function test_physical_lookup_null_getter_errors_and_key_miss() {
   const folder = await messageInjection.makeEmptyFolder();
-  const [set] = await messageInjection.makeNewSetsInFolders(
-    [folder],
-    [{ count: 2 }]
+  const set = new SyntheticMessageSet(
+    gMessageGenerator.makeMessages({ count: 2 })
   );
+  await messageInjection.addSetsToFolders([folder], [set]);
   const headers = [...set.msgHdrs()];
   const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIMsgDBService

@@ -1,0 +1,52 @@
+{
+  "scope": "migration:fixture:rows",
+  "tableKind": "migration:fixture:table",
+  "tableId": 1,
+  "rowPosition": {
+    "initialIds": [1, 2, 3, 4],
+    "finalIds": [2, 3, 1, 4],
+    "move": {
+      "id": 1,
+      "from": 0,
+      "to": 2
+    },
+    "cells": {
+      "1": {
+        "Payload": "row-1"
+      },
+      "2": {
+        "Payload": "row-2"
+      },
+      "3": {
+        "Payload": "row-3"
+      },
+      "4": {
+        "Payload": "row-4"
+      }
+    },
+    "requiredSerializedSyntax": "native row1 !2 delta",
+    "control": "Fourth member is unchanged: native rowCount/4 change budget requires at least four members to avoid a full table rewrite."
+  },
+  "dictionaryForm": {
+    "rowId": 1,
+    "formName": "UTF-8",
+    "Payload": "dictionary \u00e9 (raw)\\$",
+    "presentEmpty": "",
+    "presentEmptyForm": 0,
+    "absentCell": "absentValue",
+    "requiredSerializedSyntax": [
+      "nondefault dictionary form metadata",
+      "nondefault row form metadata"
+    ]
+  },
+  "rowForm": {
+    "rowId": 1,
+    "formName": "UTF-8",
+    "Payload": "row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-row-form-\u00eb\r\n(raw)\\$",
+    "presentEmpty": "",
+    "presentEmptyForm": 0,
+    "absentCell": "absentValue",
+    "requiredSerializedSyntax": "nondefault row form metadata with genuine anonymous inline value >1024bytes"
+  },
+  "measurementSeparation": "Literal expectations specified before execution. Runtime scope/column/form token numbers, file hashes/sizes and emitted atom spellings are measured separately; no production date is assigned."
+}

@@ -318,6 +318,39 @@ class DeliveryCoreReferences : public testing::Test {
     }
   }
 
+  // A lower user_version must describe the old physical schema too. Remove
+  // only the columns added in versions 16-18, preserving the older row data.
+  nsresult RemovePost15OfflineColumns(mozIStorageConnection* connection) {
+    MOZ_TRY(connection->ExecuteSimpleSQL(
+        "ALTER TABLE offline_operations DROP COLUMN sourcePhysicalKey"_ns));
+    for (const char* column : {"confirmedEpoch",
+                               "transferFlags",
+                               "transferLineCount",
+                               "transferOfflineSize",
+                               "transferMessageSize",
+                               "transferStoreToken",
+                               "transferLocationRevision",
+                               "transferContentRevision",
+                               "transferAccepted",
+                               "copyOrdinal",
+                               "transferOperationKey",
+                               "transferSourceId",
+                               "appendFlags",
+                               "appendLineCount",
+                               "appendOfflineSize",
+                               "appendMessageSize",
+                               "appendStoreToken",
+                               "appendLocationRevision",
+                               "appendContentRevision",
+                               "appendSourceId",
+                               "appendAccepted"}) {
+      nsAutoCString sql("ALTER TABLE offline_attempts DROP COLUMN ");
+      sql.Append(column);
+      MOZ_TRY(connection->ExecuteSimpleSQL(sql));
+    }
+    return NS_OK;
+  }
+
   nsresult QueuedAppend(nsMsgKey& key, MessageBodyState& body,
                         OfflineAttempt& attempt, bool captureBody = true) {
     auto& db = mCore->MessageDB();
@@ -2516,7 +2549,7 @@ TEST_F(DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   EXPECT_TRUE(got.IsEmpty());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(15, version);
+  EXPECT_EQ(18, version);
   Stop();
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(7, got));
@@ -7053,12 +7086,13 @@ TEST_F(DeliveryCoreReferences,
       NS_OK,
       old->ExecuteSimpleSQL(
           "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(NS_OK, RemovePost15OfflineColumns(old));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(10));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(15, version);
+  EXPECT_EQ(18, version);
   OfflineOperationData got;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperation(mFolderId, key, got));
   EXPECT_EQ(input.operation, got.operation);
@@ -7336,6 +7370,7 @@ TEST_F(DeliveryCoreReferences, FolderIdsSurviveReopenAndOldOrphanUpgrade) {
       NS_OK,
       old->ExecuteSimpleSQL(
           "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(NS_OK, RemovePost15OfflineColumns(old));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(11));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -7728,6 +7763,7 @@ TEST_F(DeliveryCoreReferences, ThreadFlagsUpgradeDoesNotInferHeaderIgnored) {
       NS_OK,
       old->ExecuteSimpleSQL(
           "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(NS_OK, RemovePost15OfflineColumns(old));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(12));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
@@ -8953,12 +8989,13 @@ TEST_F(DeliveryCoreReferences, Schema14UpgradeKeepsThreadAndPendingState) {
       NS_OK,
       old->ExecuteSimpleSQL(
           "DROP TABLE folder_cache_bindings; DROP TABLE folder_cache_imports"_ns));
+  ASSERT_EQ(NS_OK, RemovePost15OfflineColumns(old));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(13));
   ASSERT_EQ(NS_OK, old->Close());
   ASSERT_EQ(NS_OK, Start());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(15, version);
+  EXPECT_EQ(18, version);
   nsCString reopenedId;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(reopenedId));
   EXPECT_EQ(sourceId, reopenedId);
@@ -9120,7 +9157,9 @@ TEST_F(DeliveryCoreReferences, QueuedSourceErrorsPreserveOutput) {
         "id, 'invalid' AS revision, epoch, uid, folderEpoch"}) {
     nsCString sql("CREATE TEMP VIEW offline_operations AS SELECT ");
     sql.Append(projection);
-    sql.AppendLiteral(", folderId, messageKey FROM main.offline_operations");
+    sql.AppendLiteral(
+        ", sourcePhysicalKey, folderId, messageKey FROM "
+        "main.offline_operations");
     ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
     Maybe<ServerMessageLocation> source =
         Some(ServerMessageLocation{99, 98, 97, 96});
@@ -9146,14 +9185,15 @@ TEST_F(DeliveryCoreReferences, QueuedSourceErrorsPreserveOutput) {
   RefPtr<FaultWitness> witness = new FaultWitness();
   ASSERT_EQ(NS_OK,
             mConnection->CreateFunction("source_read_fault"_ns, 1, witness));
-  ASSERT_EQ(
-      NS_OK,
-      mConnection->ExecuteSimpleSQL(
-          "CREATE TEMP VIEW offline_operations AS SELECT id, revision, "
-          "CASE WHEN source_read_fault(messageKey)=0 THEN "
-          "abs(-9223372036854775808) "
-          "ELSE epoch END AS epoch, uid, folderEpoch, folderId, messageKey "
-          "FROM main.offline_operations"_ns));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "CREATE TEMP VIEW offline_operations AS SELECT id, revision, "
+                "CASE WHEN source_read_fault(messageKey)=0 THEN "
+                "abs(-9223372036854775808) "
+                "ELSE epoch END AS epoch, uid, folderEpoch, sourcePhysicalKey, "
+                "folderId, "
+                "messageKey "
+                "FROM main.offline_operations"_ns));
   EXPECT_EQ(NS_ERROR_FAILURE,
             db.GetOfflineOperationSource(mFolderId, key, source));
   EXPECT_EQ(1u, witness->mCalls);
@@ -12094,35 +12134,7 @@ TEST_F(DeliveryCoreReferences,
   Stop();
   nsCOMPtr<mozIStorageConnection> old;
   ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
-  ASSERT_EQ(
-      NS_OK,
-      old->ExecuteSimpleSQL(
-          "ALTER TABLE offline_operations DROP COLUMN sourcePhysicalKey"_ns));
-  for (const char* column : {"confirmedEpoch",
-                             "transferFlags",
-                             "transferLineCount",
-                             "transferOfflineSize",
-                             "transferMessageSize",
-                             "transferStoreToken",
-                             "transferLocationRevision",
-                             "transferContentRevision",
-                             "transferAccepted",
-                             "copyOrdinal",
-                             "transferOperationKey",
-                             "transferSourceId",
-                             "appendFlags",
-                             "appendLineCount",
-                             "appendOfflineSize",
-                             "appendMessageSize",
-                             "appendStoreToken",
-                             "appendLocationRevision",
-                             "appendContentRevision",
-                             "appendSourceId",
-                             "appendAccepted"}) {
-    nsAutoCString sql("ALTER TABLE offline_attempts DROP COLUMN ");
-    sql.Append(column);
-    ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(sql));
-  }
+  ASSERT_EQ(NS_OK, RemovePost15OfflineColumns(old));
   ASSERT_EQ(NS_OK, old->SetSchemaVersion(15));
   ASSERT_EQ(NS_OK, old->Close());
   old = nullptr;

@@ -679,7 +679,7 @@ TEST_F(DeliveryCoreProperties, UpgradePreservesExistingValues) {
   EXPECT_EQ(before, after);
   int32_t version;
   ASSERT_EQ(NS_OK, Connection()->GetSchemaVersion(&version));
-  EXPECT_EQ(15, version);
+  EXPECT_EQ(18, version);
   ASSERT_NO_FATAL_FAILURE(CheckStored("message_properties"_ns, key,
                                       "native.unsigned"_ns, "4294967295"_ns,
                                       "integer"_ns));

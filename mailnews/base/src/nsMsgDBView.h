@@ -188,7 +188,8 @@ class nsMsgDBView : public nsIMsgDBView,
   nsresult SaveAndClearSelection(nsMsgKey* aCurrentMsgKey,
                                  nsTArray<nsMsgKey>& aMsgKeyArray);
   nsresult RestoreSelection(nsMsgKey aCurrentmsgKey,
-                            nsTArray<nsMsgKey>& aMsgKeyArray);
+                            nsTArray<nsMsgKey>& aMsgKeyArray,
+                            nsMsgKey aPivotMsgKey = nsMsgKey_None);
 
   // This is not safe to use when you have a selection.
   // RowCountChanged() will call AdjustSelection().

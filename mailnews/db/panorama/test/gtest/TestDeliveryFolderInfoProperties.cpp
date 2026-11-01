@@ -328,104 +328,103 @@ class KnownArtsFaultWitness final : public mozIStorageFunction {
 };
 NS_IMPL_ISUPPORTS(KnownArtsFaultWitness, mozIStorageFunction)
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, MissingUsesDefault) {
+TEST_F(DeliveryFolderInfoProperties, MissingUsesDefault) {
   CheckRead(NS_OK, kDefault);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, StoredZeroKeepsCanary) {
+TEST_F(DeliveryFolderInfoProperties, StoredZeroKeepsCanary) {
   ASSERT_NO_FATAL_FAILURE(Store(0));
   CheckRead(NS_OK, 0);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, StoredMaxKeepsCanary) {
+TEST_F(DeliveryFolderInfoProperties, StoredMaxKeepsCanary) {
   ASSERT_NO_FATAL_FAILURE(Store(std::numeric_limits<uint32_t>::max()));
   CheckRead(NS_OK, std::numeric_limits<uint32_t>::max());
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, RepeatedReadsKeepCanary) {
+TEST_F(DeliveryFolderInfoProperties, RepeatedReadsKeepCanary) {
   ASSERT_NO_FATAL_FAILURE(Store(42));
   CheckRead(NS_OK, 42);
   CheckRead(NS_OK, 42);
   CheckRead(NS_OK, 42);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, NegativePreservesDefault) {
+TEST_F(DeliveryFolderInfoProperties, NegativePreservesDefault) {
   ASSERT_NO_FATAL_FAILURE(Store(-1));
   CheckRead(NS_ERROR_LOSS_OF_SIGNIFICANT_DATA, kDefault);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, TooLargePreservesDefault) {
+TEST_F(DeliveryFolderInfoProperties, TooLargePreservesDefault) {
   ASSERT_NO_FATAL_FAILURE(Store(int64_t{1} << 32));
   CheckRead(NS_ERROR_LOSS_OF_SIGNIFICANT_DATA, kDefault);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, NullOutputFails) {
+TEST_F(DeliveryFolderInfoProperties, NullOutputFails) {
   EXPECT_EQ(NS_ERROR_INVALID_POINTER,
             mInfo->GetUint32Property("value", kDefault, nullptr));
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanStoredFalseKeepsCanary) {
+TEST_F(DeliveryFolderInfoProperties, BooleanStoredFalseKeepsCanary) {
   ASSERT_NO_FATAL_FAILURE(StoreBoolean(false));
   CheckBooleanRead(true, false);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanStoredTrueKeepsCanary) {
+TEST_F(DeliveryFolderInfoProperties, BooleanStoredTrueKeepsCanary) {
   ASSERT_NO_FATAL_FAILURE(StoreBoolean(true));
   CheckBooleanRead(false, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanMissingDefaultsFalse) {
+TEST_F(DeliveryFolderInfoProperties, BooleanMissingDefaultsFalse) {
   CheckBooleanRead(false, false);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanMissingDefaultsTrue) {
+TEST_F(DeliveryFolderInfoProperties, BooleanMissingDefaultsTrue) {
   CheckBooleanRead(true, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanRepeatedReadsKeepCanary) {
+TEST_F(DeliveryFolderInfoProperties, BooleanRepeatedReadsKeepCanary) {
   ASSERT_NO_FATAL_FAILURE(StoreBoolean(true));
   CheckBooleanRead(false, true);
   CheckBooleanRead(true, true);
   CheckBooleanRead(false, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanNullOutputFails) {
+TEST_F(DeliveryFolderInfoProperties, BooleanNullOutputFails) {
   EXPECT_EQ(NS_ERROR_INVALID_POINTER,
             mInfo->GetBooleanProperty("value", false, nullptr));
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanZeroIsFalse) {
+TEST_F(DeliveryFolderInfoProperties, BooleanZeroIsFalse) {
   ASSERT_NO_FATAL_FAILURE(Store(0));
   CheckBooleanRead(true, false);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanPositiveIsTrue) {
+TEST_F(DeliveryFolderInfoProperties, BooleanPositiveIsTrue) {
   ASSERT_NO_FATAL_FAILURE(Store(2));
   CheckBooleanRead(false, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanNegativeIsTrue) {
+TEST_F(DeliveryFolderInfoProperties, BooleanNegativeIsTrue) {
   ASSERT_NO_FATAL_FAILURE(Store(-1));
   CheckBooleanRead(false, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanWideIsTrue) {
+TEST_F(DeliveryFolderInfoProperties, BooleanWideIsTrue) {
   ASSERT_NO_FATAL_FAILURE(Store(int64_t{1} << 32));
   CheckBooleanRead(false, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanMinInt64IsTrue) {
+TEST_F(DeliveryFolderInfoProperties, BooleanMinInt64IsTrue) {
   ASSERT_NO_FATAL_FAILURE(Store(std::numeric_limits<int64_t>::min()));
   CheckBooleanRead(false, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, BooleanMaxInt64IsTrue) {
+TEST_F(DeliveryFolderInfoProperties, BooleanMaxInt64IsTrue) {
   ASSERT_NO_FATAL_FAILURE(Store(std::numeric_limits<int64_t>::max()));
   CheckBooleanRead(false, true);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties,
-       KnownArtsMissingReturnsOwnedEmpty) {
+TEST_F(DeliveryFolderInfoProperties, KnownArtsMissingReturnsOwnedEmpty) {
   char* result = nullptr;
   ASSERT_EQ(NS_OK, mInfo->GetKnownArtsSet(&result));
   ASSERT_TRUE(result);
@@ -444,12 +443,11 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
   EXPECT_EQ(0, statement->AsInt32(0));
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties, KnownArtsNullOutputFails) {
+TEST_F(DeliveryFolderInfoProperties, KnownArtsNullOutputFails) {
   EXPECT_EQ(NS_ERROR_INVALID_POINTER, mInfo->GetKnownArtsSet(nullptr));
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties,
-       KnownArtsOpaqueAliasIsFolderScoped) {
+TEST_F(DeliveryFolderInfoProperties, KnownArtsOpaqueAliasIsFolderScoped) {
   const nsLiteralCString opaque =
       " 0007-0009,3,3-2,not-a-range,\xc3\xa9,e\xcc\x81 "_ns;
   ASSERT_EQ(NS_OK, mInfo->SetCharProperty("knownArts", opaque));
@@ -487,8 +485,7 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
   EXPECT_EQ("other group"_ns, value);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties,
-       KnownArtsEmptyAndNullRemainPresent) {
+TEST_F(DeliveryFolderInfoProperties, KnownArtsEmptyAndNullRemainPresent) {
   for (const char* empty : {"", static_cast<const char*>(nullptr)}) {
     ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet("original"));
     ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet(empty));
@@ -512,8 +509,7 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
   }
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties,
-       KnownArtsReadStepFailureClearsOutput) {
+TEST_F(DeliveryFolderInfoProperties, KnownArtsReadStepFailureClearsOutput) {
   ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet("original,0007"));
   ASSERT_EQ(NS_OK, mInfo->SetCharProperty("readSet", "2-4"_ns));
   RefPtr<KnownArtsFaultWitness> witness = new KnownArtsFaultWitness(true);
@@ -554,8 +550,7 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
   EXPECT_EQ("2-4"_ns, value);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties,
-       KnownArtsWriteAbortPreservesRows) {
+TEST_F(DeliveryFolderInfoProperties, KnownArtsWriteAbortPreservesRows) {
   ASSERT_EQ(NS_OK, mInfo->SetKnownArtsSet("original,0007"));
   ASSERT_EQ(NS_OK, mInfo->SetCharProperty("readSet", "2-4"_ns));
   uint64_t otherId;
@@ -602,8 +597,7 @@ TEST_F(DISABLED_DeliveryFolderInfoProperties,
   EXPECT_EQ("other group"_ns, value);
 }
 
-TEST_F(DISABLED_DeliveryFolderInfoProperties,
-       KnownArtsColdReopenRetainsValues) {
+TEST_F(DeliveryFolderInfoProperties, KnownArtsColdReopenRetainsValues) {
   const nsLiteralCString opaque = "0007-0009,3,3-2,\xc3\xa9,e\xcc\x81 "_ns;
   const char* const expectedValues[] = {opaque.get(), ""};
   for (const char* expected : expectedValues) {

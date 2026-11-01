@@ -392,3 +392,66 @@ add_task(function test_nativeUnavailableSnippetDoesNotInventBodyText() {
     element.remove();
   }
 });
+
+add_task(function test_nativeRecipientsUseMailboxFieldsAndExactOthersCount() {
+  const cases = [
+    {
+      to: [{ name: "Alice", email: "alice@example.invalid" }],
+      cc: [{ name: "", email: "cc@example.invalid" }],
+      bcc: [{ name: "Carol", email: "carol@example.invalid" }],
+      expected: ["Alice", "cc@example.invalid", "Carol"],
+    },
+    {
+      to: [{ name: "Alice", email: "alice@example.invalid" }],
+      cc: [{ name: "Bob", email: "bob@example.invalid" }],
+      bcc: [
+        { name: "Carol", email: "carol@example.invalid" },
+        { name: "Dave", email: "dave@example.invalid" },
+      ],
+      expected: ["Alice", "Bob", "Carol", "1 other"],
+    },
+    {
+      to: [
+        { name: "Alice", email: "alice@example.invalid" },
+        { name: "Bob", email: "bob@example.invalid" },
+      ],
+      cc: [{ name: "Carol", email: "carol@example.invalid" }],
+      bcc: [
+        { name: "Dave", email: "dave@example.invalid" },
+        { name: "Erin", email: "erin@example.invalid" },
+      ],
+      expected: ["Alice", "Bob", "Carol", "2 others"],
+    },
+  ];
+
+  const previous = win.FacetContext.mailSearchResultSet;
+  try {
+    win.FacetContext.mailSearchResultSet = {};
+    for (const { to, cc, bcc, expected } of cases) {
+      const element = doc.createElement("facet-result-message");
+      element.message = {
+        subject: "Native recipients",
+        from: [{ name: "Native Author", email: "native@example.invalid" }],
+        to,
+        cc,
+        bcc,
+        date: new Date(),
+        read: true,
+        starred: false,
+        tagKeys: [],
+        attachmentInfos: null,
+        snippet: null,
+      };
+      registerCleanupFunction(() => element.remove());
+      doc.body.appendChild(element);
+      Assert.deepEqual(
+        getRecipients(element),
+        expected,
+        "Native To/Cc/Bcc use names or email, max three names and exact others"
+      );
+      element.remove();
+    }
+  } finally {
+    win.FacetContext.mailSearchResultSet = previous;
+  }
+});

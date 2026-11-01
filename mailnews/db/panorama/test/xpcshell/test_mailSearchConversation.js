@@ -957,7 +957,7 @@ add_task(async function test_lateAncestorsRefreshCurrentPhysicalMembership() {
       .createLocalSubfolder("conversation-late-ancestors-" + name)
       .QueryInterface(Ci.nsIMsgLocalMailFolder)
   );
-  let service;
+  let service = null;
   registerCleanupFunction(async () => {
     await service?.close();
     for (const folder of folders) {

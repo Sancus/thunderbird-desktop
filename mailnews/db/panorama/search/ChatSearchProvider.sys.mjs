@@ -6,9 +6,17 @@ import { IMServices } from "resource:///modules/IMServices.sys.mjs";
 import {
   encodeName,
   queueFileOperation,
+  captureChatPrivacyIntent,
+  getChatPrivacyEpoch,
+  getChatPrivacyState,
+  getChatPrivacySourceProof,
+  acknowledgeChatPrivacyIntent,
 } from "resource:///modules/logger.sys.mjs";
 import { PanoramaSearchIndex } from "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs";
-import { persistChatSearchRedaction } from "resource:///modules/panorama/ChatSearchRedaction.sys.mjs";
+import {
+  applyChatSearchPrivacyReceipt,
+  chatSearchPrivacyNeedsErasure,
+} from "resource:///modules/panorama/ChatSearchRedaction.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
@@ -241,8 +249,8 @@ async function readLogConversation(filePath, source, signal) {
  *
  * Callers supply changed files, or an active conversation whose writer has one
  * file. This class does not subscribe to observers or discover historical logs.
- * Explicit privacy updates use the existing logger redaction helper. Activation
- * still needs durable missed-event delivery and verified historical mapping.
+ * Explicit privacy updates replay the logger's durable version-specific receipts
+ * before text delivery. Ordinary observer/startup activation stays separate.
  * Recovered text without verified log policy is not accepted here.
  */
 export class ChatSearchProvider {
@@ -270,6 +278,19 @@ export class ChatSearchProvider {
     provider.#index = await PanoramaSearchIndex.open(file, (id, signal) =>
       provider.resolveDocument(id, { signal })
     );
+    try {
+      await provider.#reconcilePrivacy();
+    } catch (error) {
+      try {
+        await provider.#index.close();
+      } catch (closeError) {
+        throw new AggregateError(
+          [error, closeError],
+          "Chat privacy open and close failed"
+        );
+      }
+      throw error;
+    }
     return provider;
   }
 
@@ -331,9 +352,17 @@ export class ChatSearchProvider {
       throw new Error("Chat search provider is closing");
     }
     const revision = this.#redactions.size ? null : this.#privacyRevision;
-    const records = await this.#index.getRecoveryRecords(id);
+    const epoch = getChatPrivacyEpoch();
+    const records = await this.#enqueue(async () => {
+      await this.#reconcilePrivacy();
+      const value = await this.#index.getRecoveryRecords(id);
+      await this.#reconcilePrivacy();
+      return value;
+    });
     await this.#waitForRedactions();
-    return revision === this.#privacyRevision ? records : [];
+    return revision === this.#privacyRevision && epoch === getChatPrivacyEpoch()
+      ? records
+      : [];
   }
 
   /**
@@ -348,7 +377,11 @@ export class ChatSearchProvider {
       throw new Error("Chat search provider is closing");
     }
     await this.#waitForRedactions();
-    const result = this.#pending.then(() => this.#index.rebuild());
+    const result = this.#pending.then(async () => {
+      await this.#reconcilePrivacy();
+      await this.#index.rebuild();
+      await this.#reconcilePrivacy();
+    });
     this.#pending = result.then(
       () => {},
       () => {}
@@ -436,6 +469,10 @@ export class ChatSearchProvider {
   #queueRefresh(id, filePath, signal, eraseStoredText = false) {
     const result = this.#pending.then(async () => {
       signal?.throwIfAborted();
+      // An explicit refresh may succeed without clearing an earlier read hold.
+      if (!this.#privacyFailed) {
+        await this.#reconcilePrivacy();
+      }
       if (eraseStoredText) {
         await this.#index.remove(id);
       }
@@ -451,30 +488,26 @@ export class ChatSearchProvider {
 
   /**
    * Persists an explicit noLog/deleted update and erases affected stored text.
-   * Captures active logger paths before returning. Lookups withhold delivery
-   * until observed redactions finish, and reject the first privacy failure.
-   * This does not recover missed events or historical closed-writer paths.
+   * Registers logger capture before returning and joins the original subject.
+   * Awaits durable source and cache settlement for every captured target.
+   * Lookups withhold delivery and retain the first live privacy failure.
+   * Capture before its first durable write is not a recovered event.
    *
    * @param {prplIMessage} message - Existing notification with a real remoteId.
-   * @returns {Promise<string[]>} Changed paths after source and sidecar writes.
+   * @returns {Promise<string[]>} All captured paths after source and cache writes.
    * @throws {Error} Original source/storage error, or closing provider.
    */
   redactMessage(message) {
     if (this.#closing) {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
-    const redaction = persistChatSearchRedaction(message);
+    const capture = captureChatPrivacyIntent(message);
+    // Capture can fail while earlier writer work is still draining.
+    capture.catch(() => {});
     this.#privacyRevision++;
-    const result = redaction.then(async paths => {
-      for (const path of paths) {
-        await this.#queueRefresh(
-          chatSearchDocumentId(path),
-          path,
-          undefined,
-          true
-        );
-      }
-      return paths;
+    const result = this.#enqueue(async () => {
+      const receipt = await capture;
+      return receipt ? this.#completePrivacyReceipt(receipt, true) : [];
     });
     this.#redactions.add(result);
     result.then(
@@ -504,6 +537,85 @@ export class ChatSearchProvider {
       signal?.throwIfAborted();
     }
     if (this.#privacyFailed) {
+      throw this.#privacyFailure;
+    }
+  }
+
+  /**
+   * Serializes a provider operation without converting its error to success.
+   *
+   * @param {function(): Promise} operation - Work using the dedicated writer.
+   * @returns {Promise} The original result; only queue advancement absorbs failure.
+   */
+  #enqueue(operation) {
+    const result = this.#pending.then(operation);
+    this.#pending = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
+  }
+
+  /**
+   * Erases source and all target cache rows before acknowledging a receipt.
+   * Runs inside the provider queue; its callback must not reenter that queue.
+   *
+   * @param {{id: string, targets: object[]}} receipt - Validated logger receipt.
+   * @param {boolean} [refresh=false] - Refresh kept text only for an observed update.
+   *   Recovery replay leaves erased rows absent until an explicit refresh.
+   * @returns {Promise<string[]>} Every target path, including already-erased source.
+   * @throws {Error} Original source, index, proof or acknowledgment error.
+   */
+  async #completePrivacyReceipt(receipt, refresh = false) {
+    let paths = [];
+    await acknowledgeChatPrivacyIntent(receipt.id, async current => {
+      paths = await applyChatSearchPrivacyReceipt(current);
+      for (const path of paths) {
+        const id = chatSearchDocumentId(path);
+        await this.#index.remove(id);
+        if (refresh) {
+          await this.#refreshLog(id, path);
+        }
+      }
+      return getChatPrivacySourceProof(current.id);
+    });
+    return paths;
+  }
+
+  /**
+   * Replays captured privacy work and validates retained version exclusions.
+   * Empty pending state does not grant recovered or unknown history eligibility.
+   * Runs inside the writer queue, or once before the provider is published.
+   *
+   * @returns {Promise<void>} Resolves after the known durable work settles.
+   * @throws {Error} The first original privacy error for this provider instance.
+   */
+  async #reconcilePrivacy() {
+    if (this.#privacyFailed) {
+      throw this.#privacyFailure;
+    }
+    try {
+      let state = await getChatPrivacyState();
+      for (;;) {
+        for (const receipt of state.pending) {
+          await this.#completePrivacyReceipt(receipt);
+        }
+        for (const receipt of state.completed) {
+          if (await chatSearchPrivacyNeedsErasure(receipt)) {
+            await this.#completePrivacyReceipt(receipt);
+          }
+        }
+        const next = await getChatPrivacyState();
+        if (!next.pending.length && next.epoch === state.epoch) {
+          return;
+        }
+        state = next;
+      }
+    } catch (error) {
+      if (!this.#privacyFailed) {
+        this.#privacyFailed = true;
+        this.#privacyFailure = error;
+      }
       throw this.#privacyFailure;
     }
   }
@@ -599,10 +711,13 @@ export class ChatSearchProvider {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
     const controls = { ...options };
+    const epoch = getChatPrivacyEpoch();
     const revision = this.#redactions.size ? null : this.#privacyRevision;
     const result = this.#pending.then(async () => {
       controls.signal?.throwIfAborted();
+      await this.#reconcilePrivacy();
       const page = await this.#index.search(text, controls);
+      await this.#reconcilePrivacy();
       controls.signal?.throwIfAborted();
       return page;
     });
@@ -612,7 +727,10 @@ export class ChatSearchProvider {
     );
     return result.then(async page => {
       await this.#waitForRedactions(controls.signal);
-      if (revision !== this.#privacyRevision) {
+      if (
+        revision !== this.#privacyRevision ||
+        epoch !== getChatPrivacyEpoch()
+      ) {
         throw new Error("Chat privacy changed during search");
       }
       if (
@@ -661,10 +779,11 @@ export class ChatSearchProvider {
     }
     const filePath = logPath(request.id);
     const revision = this.#redactions.size ? null : this.#privacyRevision;
+    const epoch = getChatPrivacyEpoch();
     if (this.#closing) {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
-    const result = this.#pending.then(async () => {
+    const resolve = async () => {
       signal?.throwIfAborted();
       const state = await this.resolveDocument(request.id, { signal });
       signal?.throwIfAborted();
@@ -744,6 +863,13 @@ export class ChatSearchProvider {
         return { status: "stale" };
       }
       return { status: "ready", ...request, log, conversation };
+    };
+    const result = this.#pending.then(async () => {
+      signal?.throwIfAborted();
+      await this.#reconcilePrivacy();
+      const resolved = await resolve();
+      await this.#reconcilePrivacy();
+      return resolved;
     });
     this.#pending = result.then(
       () => {},
@@ -751,7 +877,8 @@ export class ChatSearchProvider {
     );
     return result.then(async resolved => {
       await this.#waitForRedactions(signal);
-      return revision === this.#privacyRevision
+      return revision === this.#privacyRevision &&
+        epoch === getChatPrivacyEpoch()
         ? resolved
         : { status: "stale" };
     });
@@ -772,9 +899,20 @@ export class ChatSearchProvider {
       return Promise.reject(new Error("Chat search provider is closing"));
     }
     const revision = this.#redactions.size ? null : this.#privacyRevision;
-    return this.#index.getText(id, options).then(async text => {
+    const epoch = getChatPrivacyEpoch();
+    const result = this.#enqueue(async () => {
+      options.signal?.throwIfAborted();
+      await this.#reconcilePrivacy();
+      const text = await this.#index.getText(id, options);
+      await this.#reconcilePrivacy();
+      return text;
+    });
+    return result.then(async text => {
       await this.#waitForRedactions(options.signal);
-      return revision === this.#privacyRevision ? text : null;
+      return revision === this.#privacyRevision &&
+        epoch === getChatPrivacyEpoch()
+        ? text
+        : null;
     });
   }
 

@@ -17,8 +17,17 @@ const { GenericConvIMPrototype } = ChromeUtils.importESModule(
 const { UIConversation } = ChromeUtils.importESModule(
   "resource:///modules/imConversations.sys.mjs"
 );
-const { getLogWriter, closeLogWriter, queueFileOperation, gFilePromises } =
-  ChromeUtils.importESModule("resource:///modules/logger.sys.mjs");
+const {
+  getLogWriter,
+  closeLogWriter,
+  queueFileOperation,
+  gFilePromises,
+  getChatPrivacyState,
+  acknowledgeChatPrivacyIntent,
+} = ChromeUtils.importESModule("resource:///modules/logger.sys.mjs");
+const { applyChatSearchPrivacyReceipt } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/ChatSearchRedaction.sys.mjs"
+);
 let privacyConversationId = 10000;
 
 /**
@@ -433,3 +442,313 @@ add_task(
     }
   }
 );
+
+add_task(async function test_observedEditSuppressesOldSemanticContent() {
+  const f = await privacyFixture("edit");
+  await writePrivacyMessage(f, "edit-id", "supersedededitneedle");
+  await writePrivacyMessage(f, "control-id", "unrelatededitcontrol");
+  const path = f.writer.currentPath;
+  const id = chatSearchDocumentId(path);
+  await f.provider.refreshLog(path);
+  const hit = (await f.provider.search("supersedededitneedle")).items[0];
+  Assert.equal(hit.id, id);
+
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  registerCleanupFunction(() => release.resolve());
+  const held = queueFileOperation(path, async () => {
+    entered.resolve();
+    await release.promise;
+  });
+  await entered.promise;
+  f.conversation.updateMessage("sender", "replacementeditneedle", {
+    incoming: true,
+    remoteId: "edit-id",
+    time: f.conversation.startDate / 1000000 + 2,
+  });
+  let delivered = false;
+  const text = f.provider.getText(id).then(value => {
+    delivered = true;
+    return value;
+  });
+  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+  Assert.ok(!delivered, "The old semantic read waits for the real logger edit");
+  release.resolve();
+  await held;
+  Assert.equal(await text, null, "Changed source hides the old indexed body");
+  Assert.equal((await f.provider.resolveLog(hit)).status, "stale");
+  Assert.deepEqual((await f.provider.search("supersedededitneedle")).items, []);
+
+  await f.provider.refreshLog(path);
+  Assert.equal(
+    (await f.provider.getText(id)).body,
+    "sender: unrelatededitcontrol\n\nsender: replacementeditneedle"
+  );
+  Assert.deepEqual((await f.provider.search("supersedededitneedle")).items, []);
+  Assert.deepEqual(
+    (await f.provider.search("replacementeditneedle")).items.map(
+      item => item.id
+    ),
+    [id]
+  );
+  Assert.deepEqual(
+    (await f.provider.search("unrelatededitcontrol")).items.map(
+      item => item.id
+    ),
+    [id]
+  );
+  Assert.deepEqual(f.errors, []);
+  await f.observer.close();
+});
+
+/**
+ * Returns the real pending receipt containing a fixture's exact physical log.
+ *
+ * @param {string} path - Existing logger file path.
+ * @returns {Promise<object>} The single durable receipt for that target.
+ */
+async function pendingPrivacyReceipt(path) {
+  const parts = JSON.stringify(JSON.parse(chatSearchDocumentId(path).slice(5)));
+  const state = await getChatPrivacyState();
+  const matching = state.pending.filter(receipt =>
+    receipt.targets.some(target => JSON.stringify(target.relativePath) == parts)
+  );
+  Assert.equal(matching.length, 1, "One actual durable intent owns this log");
+  return matching[0];
+}
+
+add_task(
+  async function test_loggerPrivacyReplayErasesTextBeforeAcknowledgement() {
+    const f = await privacyFixture("missed");
+    await writePrivacyMessage(f, "private-id", "missedprivateneedle");
+    await writePrivacyMessage(f, "keep-id", "missedkeptneedle");
+    const path = f.writer.currentPath;
+    const id = chatSearchDocumentId(path);
+    const original = await IOUtils.read(path);
+    await f.provider.refreshLog(path);
+    const hit = (await f.provider.search("missedprivateneedle")).items[0];
+    Assert.equal(hit.id, id);
+    await f.observer.close();
+    f.conversation.updateMessage("sender", "neverpersistmissedneedle", {
+      noLog: true,
+      remoteId: "private-id",
+    });
+    const receipt = await pendingPrivacyReceipt(path);
+    Assert.equal(receipt.targets.length, 1);
+    Assert.ok((await IOUtils.readUTF8(path)).includes("missedprivateneedle"));
+    await f.provider.close();
+
+    const reopened = await ChatSearchProvider.open(f.file);
+    try {
+      Assert.equal(
+        await reopened.getText(id),
+        null,
+        "Replay does not republish a row"
+      );
+      await reopened.refreshLog(path);
+      Assert.equal(
+        (await reopened.getText(id)).body,
+        "sender: missedkeptneedle"
+      );
+      Assert.deepEqual(
+        (await reopened.search("missedprivateneedle")).items,
+        []
+      );
+      Assert.equal((await reopened.resolveLog(hit)).status, "stale");
+      let state = await getChatPrivacyState();
+      Assert.ok(!state.pending.some(item => item.id == receipt.id));
+      Assert.ok(state.completed.some(item => item.id == receipt.id));
+      let raw = await IOUtils.readUTF8(path);
+      Assert.ok(!raw.includes("missedprivateneedle"));
+      Assert.ok(!raw.includes("neverpersistmissedneedle"));
+      Assert.ok(raw.includes("missedkeptneedle"));
+
+      await queueFileOperation(path, () => IOUtils.write(path, original));
+      await reopened.refreshLog(path);
+      raw = await IOUtils.readUTF8(path);
+      Assert.ok(
+        !raw.includes("missedprivateneedle"),
+        "Restored excluded version is erased again"
+      );
+      Assert.equal(
+        (await reopened.getText(id)).body,
+        "sender: missedkeptneedle"
+      );
+      Assert.deepEqual(
+        (await reopened.search("missedprivateneedle")).items,
+        []
+      );
+      state = await getChatPrivacyState();
+      Assert.ok(state.completed.some(item => item.id == receipt.id));
+    } finally {
+      await reopened.close();
+    }
+
+    await queueFileOperation(path, () => IOUtils.remove(path));
+    const absent = await ChatSearchProvider.open(f.file);
+    try {
+      Assert.equal(
+        await absent.getText(id),
+        null,
+        "Absent source is not empty text"
+      );
+      Assert.deepEqual((await absent.search("missedkeptneedle")).items, []);
+      Assert.deepEqual((await absent.search("missedprivateneedle")).items, []);
+    } finally {
+      await absent.close();
+    }
+    await queueFileOperation(path, () => IOUtils.write(path, original));
+    const restored = await ChatSearchProvider.open(f.file);
+    try {
+      Assert.equal(await restored.getText(id), null);
+      await restored.refreshLog(path);
+      Assert.equal(
+        (await restored.getText(id)).body,
+        "sender: missedkeptneedle"
+      );
+      Assert.deepEqual(
+        (await restored.search("missedprivateneedle")).items,
+        []
+      );
+      Assert.ok(
+        !(await IOUtils.readUTF8(path)).includes("missedprivateneedle")
+      );
+    } finally {
+      await restored.close();
+    }
+    Assert.deepEqual(f.errors, []);
+  }
+);
+
+add_task(async function test_partialPrivacyReplaySurvivesProviderRestart() {
+  const f = await privacyFixture("partial");
+  await writePrivacyMessage(f, "private-id", "partialfirstneedle");
+  await writePrivacyMessage(f, "keep-id", "partialkeptneedle");
+  f.writer.startNewFile(f.conversation.startDate / 1000 + 1000, true);
+  await f.writer._initialized;
+  await writePrivacyMessage(f, "private-id", "partialsecondneedle");
+  const paths = [...f.writer.paths];
+  Assert.equal(paths.length, 2);
+  for (const path of paths) {
+    await f.provider.refreshLog(path);
+  }
+  await f.observer.close();
+  f.conversation.updateMessage("sender", "neverpersistpartialneedle", {
+    noLog: true,
+    remoteId: "private-id",
+  });
+  const receipt = await pendingPrivacyReceipt(paths[0]);
+  Assert.equal(receipt.targets.length, 2);
+  const failure = new Error(
+    "Interrupted after the first actual privacy source write"
+  );
+  await Assert.rejects(
+    acknowledgeChatPrivacyIntent(receipt.id, async current => {
+      // Stop after one genuine captured target; the full receipt stays pending.
+      const firstPath = JSON.stringify(
+        JSON.parse(chatSearchDocumentId(paths[0]).slice(5))
+      );
+      const firstTarget = current.targets.find(
+        target => JSON.stringify(target.relativePath) == firstPath
+      );
+      Assert.ok(
+        firstTarget,
+        "The first physical file is actually in this receipt"
+      );
+      await applyChatSearchPrivacyReceipt({
+        ...current,
+        targets: [firstTarget],
+      });
+      throw failure;
+    }),
+    error => error === failure
+  );
+  Assert.ok(!(await IOUtils.readUTF8(paths[0])).includes("partialfirstneedle"));
+  Assert.ok((await IOUtils.readUTF8(paths[1])).includes("partialsecondneedle"));
+  Assert.ok(
+    (await getChatPrivacyState()).pending.some(item => item.id == receipt.id)
+  );
+  await f.provider.close();
+
+  const reopened = await ChatSearchProvider.open(f.file);
+  try {
+    const bodies = [];
+    for (const path of paths) {
+      const id = chatSearchDocumentId(path);
+      Assert.equal(
+        await reopened.getText(id),
+        null,
+        "Every replayed target row was erased"
+      );
+      await reopened.refreshLog(path);
+      bodies.push((await reopened.getText(id)).body);
+      Assert.ok(
+        !(await IOUtils.readUTF8(path)).includes("neverpersistpartialneedle")
+      );
+    }
+    Assert.deepEqual(bodies, ["sender: partialkeptneedle", ""]);
+    Assert.deepEqual((await reopened.search("partialfirstneedle")).items, []);
+    Assert.deepEqual((await reopened.search("partialsecondneedle")).items, []);
+    const state = await getChatPrivacyState();
+    Assert.ok(!state.pending.some(item => item.id == receipt.id));
+    Assert.ok(state.completed.some(item => item.id == receipt.id));
+  } finally {
+    await reopened.close();
+  }
+  Assert.deepEqual(f.errors, []);
+});
+
+add_task(async function test_closedWriterPrivacyPreservesScopedControl() {
+  const f = await privacyFixture("closed-target");
+  const control = await privacyFixture("closed-control");
+  await writePrivacyMessage(f, "shared-id", "closedprivateneedle");
+  await writePrivacyMessage(control, "shared-id", "closedcontrolneedle");
+  const path = f.writer.currentPath;
+  const controlPath = control.writer.currentPath;
+  const id = chatSearchDocumentId(path);
+  const controlId = chatSearchDocumentId(controlPath);
+  Assert.notEqual(id, controlId);
+  await f.provider.refreshLog(path);
+  await control.provider.refreshLog(controlPath);
+  const controlBytes = await IOUtils.readUTF8(controlPath);
+  await f.observer.close();
+  await control.observer.close();
+  await f.provider.close();
+  await control.provider.close();
+  closeLogWriter(f.conversation);
+  f.conversation.updateMessage("sender", "neverpersistclosedneedle", {
+    noLog: true,
+    remoteId: "shared-id",
+  });
+  const receipt = await pendingPrivacyReceipt(path);
+  Assert.equal(
+    receipt.targets.length,
+    1,
+    "Closed history stays in the exact account scope"
+  );
+  const reopened = await ChatSearchProvider.open(f.file);
+  let reopenedControl;
+  try {
+    reopenedControl = await ChatSearchProvider.open(control.file);
+    Assert.equal(await reopened.getText(id), null);
+    await reopened.refreshLog(path);
+    Assert.equal((await reopened.getText(id)).body, "");
+    Assert.deepEqual((await reopened.search("closedprivateneedle")).items, []);
+    Assert.equal(
+      (await reopenedControl.getText(controlId)).body,
+      "sender: closedcontrolneedle"
+    );
+    Assert.equal(await IOUtils.readUTF8(controlPath), controlBytes);
+    Assert.ok(
+      !(await IOUtils.readUTF8(path)).includes("neverpersistclosedneedle")
+    );
+  } finally {
+    try {
+      await reopenedControl?.close();
+    } finally {
+      await reopened.close();
+    }
+  }
+  Assert.deepEqual(f.errors, []);
+  Assert.deepEqual(control.errors, []);
+});

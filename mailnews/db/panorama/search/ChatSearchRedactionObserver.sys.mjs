@@ -10,10 +10,10 @@ import { AsyncShutdown } from "resource://gre/modules/AsyncShutdown.sys.mjs";
  * UIConversation forwards edited/deleted messages through that same topic.
  * Display-only remove-text and ordinary messages do not trigger a redaction.
  *
- * Startup is explicit and is not wired into MailGlue. The provider withholds
- * lookups during observed redactions. Full activation remains held for durable
- * missed-event delivery and historical mapping; a failed flush preserves that hold.
- * Ordinary change indexing is separate.
+ * Startup is explicit and is not wired into MailGlue. Passing the original
+ * subject lets the provider join the logger's durable privacy capture. The
+ * provider withholds lookups until source and cache work settles. This observer
+ * does not authorize unknown history or index ordinary transcript additions.
  */
 export class ChatSearchRedactionObserver {
   QueryInterface = ChromeUtils.generateQI(["nsIObserver"]);
@@ -89,12 +89,7 @@ export class ChatSearchRedactionObserver {
       ) {
         return;
       }
-      redaction = this.#provider.redactMessage({
-        noLog: subject.noLog,
-        deleted: subject.deleted,
-        remoteId: subject.remoteId,
-        conversation: subject.conversation,
-      });
+      redaction = this.#provider.redactMessage(subject);
     } catch (error) {
       redaction = Promise.reject(error);
     }

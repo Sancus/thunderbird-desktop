@@ -68,7 +68,7 @@ export function queueFileOperation(aPath, aOperation) {
 
 /**
  * @typedef {object} ChatPrivacyTarget
- * @property {string[]} relativePath - Four existing logger path components.
+ * @property {string[]} relativePath - Four components of this file's own identity.
  * @property {string} headerSha256 - Exact first-line identity digest.
  * @property {{line: number, beforeSha256: string, erasedSha256: string}[]} records
  *   Captured versions, including the expected erased form of each line.
@@ -80,7 +80,8 @@ export function queueFileOperation(aPath, aOperation) {
  * @property {string} status - Pending settlement or a completed exclusion.
  * @property {string} kind - Always "erase".
  * @property {{protocol: string, account: string, conversation: string,
- *   isChat: boolean}} scope - Existing normalized logger identity.
+ *   isChat: boolean}} scope - Normalized conversation at capture; each target
+ *   retains its own DM/group path and matching header identity.
  * @property {string} remoteId - Identity found in an existing stored record.
  * @property {ChatPrivacyTarget[]} targets - Exact existing source versions.
  */
@@ -143,10 +144,9 @@ function validateChatPrivacyReceipt(receipt) {
   ) {
     throw new Error("Invalid chat privacy receipt");
   }
-  const prefix = [
-    scope.protocol,
-    encodeName(scope.account),
-    encodeName(scope.conversation + (scope.isChat ? ".chat" : "")),
+  const conversationNames = [
+    encodeName(scope.conversation),
+    encodeName(scope.conversation + ".chat"),
   ];
   const paths = new Set();
   for (const target of receipt.targets) {
@@ -161,7 +161,9 @@ function validateChatPrivacyReceipt(receipt) {
           [".", ".."].includes(part) ||
           /[\\/]/.test(part)
       ) ||
-      !prefix.every((part, i) => part === parts[i]) ||
+      parts[0] !== scope.protocol ||
+      parts[1] !== encodeName(scope.account) ||
+      !conversationNames.includes(parts[2]) ||
       !/^\d{4}-\d{2}-\d{2}\.\d{6}[+-]\d{4}\.json$/.test(parts[3]) ||
       !digest(target.headerSha256) ||
       !Array.isArray(target.records) ||
@@ -227,7 +229,7 @@ async function saveChatPrivacyState(state) {
 }
 
 /** Parses a complete logger source and verifies its scoped header. */
-function parseChatPrivacySource(bytes, scope) {
+function parseChatPrivacySource(bytes, scope, relativePath) {
   const lines = new TextDecoder("utf-8", { fatal: true })
     .decode(bytes)
     .split("\n");
@@ -236,7 +238,9 @@ function parseChatPrivacySource(bytes, scope) {
     header.protocol !== scope.protocol ||
     header.account !== scope.account ||
     header.normalizedName !== scope.conversation ||
-    header.isChat !== scope.isChat
+    typeof header.isChat != "boolean" ||
+    relativePath[2] !==
+      encodeName(scope.conversation + (header.isChat ? ".chat" : ""))
   ) {
     throw new Error("Chat privacy source identity changed");
   }
@@ -309,15 +313,15 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
   const scope = chatPrivacyScope(message);
   const remoteId = message.remoteId;
   const scopeKey = JSON.stringify(scope);
-  const prefix = [
-    scope.protocol,
-    encodeName(scope.account),
-    encodeName(scope.conversation + (scope.isChat ? ".chat" : "")),
-  ];
-  const directory = PathUtils.join(PathUtils.profileDir, "logs", ...prefix);
+  const root = PathUtils.join(PathUtils.profileDir, "logs");
+  const prefix = [scope.protocol, encodeName(scope.account)];
+  const directories = [
+    encodeName(scope.conversation),
+    encodeName(scope.conversation + ".chat"),
+  ].map(name => PathUtils.join(root, ...prefix, name));
   // Save actual promises before our later queued reads replace their map entries.
   const previousWork = Array.from(gFilePromises, ([path, work]) =>
-    PathUtils.parent(path) === directory ? work : null
+    directories.includes(PathUtils.parent(path)) ? work : null
   ).filter(Boolean);
   const activePaths = [
     ...(gLogWritersById.get(message.conversation.id)?.paths || []),
@@ -344,27 +348,46 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
       if (!hasPriorError && capture.appendNotice) {
         await capture.appendNotice();
       }
-      let children;
-      try {
-        children = await IOUtils.getChildren(directory);
-      } catch (error) {
-        if (error.name !== "NotFoundError" || activePaths.length) {
-          throw hasPriorError ? firstError : error;
+      const paths = new Set(activePaths);
+      for (const directory of directories) {
+        let children;
+        try {
+          children = await IOUtils.getChildren(directory);
+        } catch (error) {
+          if (error.name !== "NotFoundError") {
+            throw hasPriorError ? firstError : error;
+          }
+          children = [];
         }
-        children = [];
+        for (const path of children) {
+          if (
+            /^\d{4}-\d{2}-\d{2}\.\d{6}[+-]\d{4}\.json$/.test(
+              PathUtils.filename(path)
+            )
+          ) {
+            paths.add(path);
+          }
+        }
       }
-      const paths = new Set([
-        ...activePaths,
-        ...children.filter(path =>
-          /^\d{4}-\d{2}-\d{2}\.\d{6}[+-]\d{4}\.json$/.test(
-            PathUtils.filename(path)
-          )
-        ),
-      ]);
       const targets = [];
       for (const path of [...paths].sort()) {
+        const relativePath = [
+          ...prefix,
+          PathUtils.filename(PathUtils.parent(path)),
+          PathUtils.filename(path),
+        ];
+        if (
+          !directories.includes(PathUtils.parent(path)) ||
+          PathUtils.join(root, ...relativePath) !== path
+        ) {
+          throw new Error("Chat privacy source path changed");
+        }
         const bytes = await queueFileOperation(path, () => IOUtils.read(path));
-        const { lines, records } = parseChatPrivacySource(bytes, scope);
+        const { lines, records } = parseChatPrivacySource(
+          bytes,
+          scope,
+          relativePath
+        );
         const versions = [];
         for (const { line, record } of records) {
           if (record.remoteId !== remoteId) {
@@ -382,7 +405,7 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
         }
         if (versions.length) {
           targets.push({
-            relativePath: [...prefix, PathUtils.filename(path)],
+            relativePath,
             headerSha256: chatPrivacyHash(lines[0]),
             records: versions,
           });
@@ -549,7 +572,11 @@ export async function readChatPrivacyTarget(
     throw error;
   }
   signal?.throwIfAborted();
-  const { lines } = parseChatPrivacySource(bytes, receipt.scope);
+  const { lines } = parseChatPrivacySource(
+    bytes,
+    receipt.scope,
+    target.relativePath
+  );
   if (
     chatPrivacyHash(lines[0]) !== target.headerSha256 ||
     target.records.some(record => {
@@ -594,7 +621,11 @@ export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
       });
       continue;
     }
-    const { lines } = parseChatPrivacySource(source.bytes, receipt.scope);
+    const { lines } = parseChatPrivacySource(
+      source.bytes,
+      receipt.scope,
+      target.relativePath
+    );
     if (
       target.records.some(
         record => chatPrivacyHash(lines[record.line]) !== record.erasedSha256
@@ -1752,45 +1783,46 @@ export class Logger {
             !aSubject.noLog && !excludeBecauseEncrypted
               ? getLogWriter(aSubject.conversation)
               : null;
-          const appendNotice = writer
-            ? () => {
-                // LogWriter used to snapshot these fields before its first await.
-                // Preserve that notification even if the original object changes.
-                const notice = Object.fromEntries(
-                  [
-                    "time",
-                    "who",
-                    "displayMessage",
-                    "remoteId",
-                    "alias",
-                    "delayed",
-                    "outgoing",
-                    "incoming",
-                    "system",
-                    "autoResponse",
-                    "containsNick",
-                    "error",
-                    "noFormat",
-                    "containsImages",
-                    "notification",
-                    "noLinkification",
-                    "isEncrypted",
-                    "action",
-                    "deleted",
-                  ].map(field => [field, aSubject[field]])
-                );
-                return async () => {
-                  const work = writer.logMessage(notice, true);
-                  work.catch(() => {});
-                  await writer._initialized;
-                  const queued = gFilePromises.get(writer.currentPath);
-                  if (queued) {
-                    await queued;
-                  }
-                  await work;
-                };
-              }
-            : null;
+          const appendNotice =
+            writer && writer !== dummyLogWriter
+              ? () => {
+                  // LogWriter used to snapshot these fields before its first await.
+                  // Preserve that notification even if the original object changes.
+                  const notice = Object.fromEntries(
+                    [
+                      "time",
+                      "who",
+                      "displayMessage",
+                      "remoteId",
+                      "alias",
+                      "delayed",
+                      "outgoing",
+                      "incoming",
+                      "system",
+                      "autoResponse",
+                      "containsNick",
+                      "error",
+                      "noFormat",
+                      "containsImages",
+                      "notification",
+                      "noLinkification",
+                      "isEncrypted",
+                      "action",
+                      "deleted",
+                    ].map(field => [field, aSubject[field]])
+                  );
+                  return async () => {
+                    const work = writer.logMessage(notice, true);
+                    work.catch(() => {});
+                    await writer._initialized;
+                    const queued = gFilePromises.get(writer.currentPath);
+                    if (queued) {
+                      await queued;
+                    }
+                    await work;
+                  };
+                }
+              : null;
           beginChatPrivacyCapture(aSubject, appendNotice).catch(error =>
             console.error("Failed to capture chat privacy:\n" + error)
           );

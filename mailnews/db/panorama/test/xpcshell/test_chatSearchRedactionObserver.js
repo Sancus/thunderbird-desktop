@@ -8,6 +8,9 @@ do_get_profile();
 const { ChatSearchRedactionObserver } = ChromeUtils.importESModule(
   "resource:///modules/panorama/ChatSearchRedactionObserver.sys.mjs"
 );
+const { PanoramaSearchIndex } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs"
+);
 const { ChatSearchProvider, chatSearchDocumentId } = ChromeUtils.importESModule(
   "resource:///modules/panorama/ChatSearchProvider.sys.mjs"
 );
@@ -751,4 +754,148 @@ add_task(async function test_closedWriterPrivacyPreservesScopedControl() {
   }
   Assert.deepEqual(f.errors, []);
   Assert.deepEqual(control.errors, []);
+});
+
+add_task(async function test_typeChangePrivacyUsesEveryPhysicalLog() {
+  for (const rotated of [false, true]) {
+    const f = await privacyFixture("type-change-" + rotated);
+    const control = await privacyFixture("type-control-" + rotated);
+    await writePrivacyMessage(control, "private-id", "typecontrolneedle");
+    const controlPath = control.writer.currentPath;
+    const controlId = chatSearchDocumentId(controlPath);
+    await control.provider.refreshLog(controlPath);
+    await control.observer.close();
+    const controlBytes = await IOUtils.read(controlPath);
+
+    await writePrivacyMessage(f, "private-id", "typeprivateneedle");
+    await writePrivacyMessage(f, "direct-keep", "typedirectkeepneedle");
+    const directPath = f.writer.currentPath;
+    // Protocols can change the same conversation from a DM to a group. Shadow
+    // GenericConvIMPrototype's read-only getter as a real type-changing protocol.
+    Object.defineProperty(f.conversation, "isChat", { value: true });
+    if (rotated) {
+      f.writer.startNewFile(f.conversation.startDate / 1000 + 1000, true);
+      await f.writer._initialized;
+      await writePrivacyMessage(f, "private-id", "typeprivateneedle");
+      await writePrivacyMessage(f, "group-keep", "typegroupkeepneedle");
+    }
+    const paths = [...f.writer.paths];
+    Assert.equal(paths.length, rotated ? 2 : 1);
+    Assert.equal(paths[0], directPath);
+    const records = [];
+    for (const [i, path] of paths.entries()) {
+      Assert.ok((await f.provider.refreshLog(path)).indexed);
+      const id = chatSearchDocumentId(path);
+      const text = await f.provider.getText(id);
+      const lines = (await IOUtils.readUTF8(path)).trimEnd().split("\n");
+      const header = JSON.parse(lines[0]);
+      Assert.equal(header.isChat, i == 1, "Each file retains its actual type");
+      records.push({
+        recordId: "type-recovery-" + id,
+        documentId: id,
+        kind: "chat",
+        sourceRevision: text.contentRevision,
+        // Exercise real recovery storage with this actual log's JSON records.
+        // This is a quarantined storage input, not a legacy import fixture.
+        payload: {
+          header,
+          records: lines.slice(1).map(line => JSON.parse(line)),
+        },
+        document: null,
+      });
+    }
+    const hits = (await f.provider.search("typeprivateneedle")).items;
+    Assert.deepEqual(
+      hits.map(hit => hit.id).sort(),
+      records.map(r => r.documentId).sort()
+    );
+    await f.observer.close();
+    await f.provider.close();
+    const index = await PanoramaSearchIndex.open(f.file, async () => null);
+    try {
+      await index.retainRecovery(records);
+    } finally {
+      await index.close();
+    }
+
+    const provider = await ChatSearchProvider.open(f.file);
+    const errors = [];
+    const observer = new ChatSearchRedactionObserver(provider, {
+      onError: error => errors.push(error),
+    });
+    observer.start();
+    try {
+      for (const record of records) {
+        const [stored] = await provider.getRecoveryRecords(record.documentId);
+        Assert.ok(
+          stored.payload.records.some(row => row.text == "typeprivateneedle")
+        );
+      }
+      f.conversation.updateMessage("sender", "neverpersisttypechange", {
+        noLog: true,
+        remoteId: "private-id",
+      });
+      await observer.flush();
+      Assert.deepEqual(errors, [], "Type changes do not poison privacy reads");
+      for (const [i, path] of paths.entries()) {
+        const id = chatSearchDocumentId(path);
+        const lines = (await IOUtils.readUTF8(path)).trimEnd().split("\n");
+        Assert.equal(JSON.parse(lines[0]).isChat, i == 1);
+        const versions = lines
+          .slice(1)
+          .map(line => JSON.parse(line))
+          .filter(row => row.remoteId == "private-id");
+        Assert.ok(versions.length);
+        Assert.ok(
+          versions.every(
+            row => row.text === "" && row.flags.includes("deleted")
+          )
+        );
+        Assert.ok(!lines.join("\n").includes("neverpersisttypechange"));
+        Assert.equal(
+          (await provider.getText(id)).body,
+          "sender: " + (i ? "typegroupkeepneedle" : "typedirectkeepneedle")
+        );
+        const [erased] = await provider.getRecoveryRecords(id);
+        Assert.ok(erased.erased, "The actual retained recovery row was erased");
+        Assert.equal(erased.payload, null);
+      }
+      Assert.deepEqual((await provider.search("typeprivateneedle")).items, []);
+      for (const hit of hits) {
+        Assert.equal((await provider.resolveLog(hit)).status, "stale");
+      }
+      Assert.equal(
+        (await control.provider.getText(controlId)).body,
+        "sender: typecontrolneedle"
+      );
+      Assert.deepEqual(
+        [...(await IOUtils.read(controlPath))],
+        [...controlBytes]
+      );
+    } finally {
+      try {
+        await observer.close();
+      } finally {
+        await provider.close();
+      }
+    }
+    const reopened = await ChatSearchProvider.open(f.file);
+    try {
+      Assert.deepEqual((await reopened.search("typeprivateneedle")).items, []);
+      for (const [i, path] of paths.entries()) {
+        const id = chatSearchDocumentId(path);
+        Assert.equal(
+          (await reopened.getText(id)).body,
+          "sender: " + (i ? "typegroupkeepneedle" : "typedirectkeepneedle")
+        );
+        const [erased] = await reopened.getRecoveryRecords(id);
+        Assert.ok(erased.erased);
+        Assert.equal(erased.payload, null);
+      }
+    } finally {
+      await reopened.close();
+    }
+    Assert.deepEqual(f.errors, []);
+    Assert.deepEqual(control.errors, []);
+  }
 });

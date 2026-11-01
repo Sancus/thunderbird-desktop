@@ -1344,3 +1344,185 @@ add_task(async function test_noLogUnknownIdDoesNotPersistPayload() {
     return getChatPrivacySourceProof(current.id);
   });
 });
+
+add_task(async function test_loggingDisabledDeletionKeepsPrivacyStateUsable() {
+  const pref = "purple.logging.log_ims";
+  const hadUserValue = Services.prefs.prefHasUserValue(pref);
+  const oldValue = Services.prefs.getBoolPref(pref);
+  const logger = new Logger();
+  let source;
+  const unlogged = {
+    ...dummyConv,
+    id: "privacy-disabled-unlogged",
+    name: "privacy-disabled-unlogged",
+    normalizedName: "privacy-disabled-unlogged",
+  };
+  try {
+    Services.prefs.setBoolPref(pref, true);
+    source = await makePrivacyLog("disabled-history");
+    closeLogWriter(source.conversation);
+    const original = await IOUtils.read(source.paths[0]);
+    Services.prefs.setBoolPref(pref, false);
+    const event = conversation => ({
+      conversation,
+      remoteId: source.remoteId,
+      deleted: true,
+      get displayMessage() {
+        throw new Error("A disabled deletion notice was read");
+      },
+    });
+    const journal = PathUtils.join(logDirPath, ".privacy-pending.json");
+    const beforeJournal = await IOUtils.readUTF8(journal);
+    const absentEvent = event(unlogged);
+    logger.observe(absentEvent, "new-text");
+    Assert.strictEqual(
+      await captureChatPrivacyIntent(absentEvent),
+      null,
+      "A deletion without logged history remains a supported no-op"
+    );
+    Assert.equal(
+      await IOUtils.readUTF8(journal),
+      beforeJournal,
+      "Logging off does not persist a new unlogged identifier or notice"
+    );
+    const historyEvent = event(source.conversation);
+    logger.observe(historyEvent, "new-text");
+    const receipt = await captureChatPrivacyIntent(historyEvent);
+    Assert.ok(
+      receipt.id,
+      "Logging off still captures genuine retained history"
+    );
+    Assert.deepEqual(
+      [...(await IOUtils.read(source.paths[0]))],
+      [...original],
+      "A disabled writer neither appends a notice nor changes stored history"
+    );
+    Assert.strictEqual(
+      await logger.getLogPathsForConversation(source.conversation),
+      null,
+      "Capturing retained history does not enable logging"
+    );
+    Assert.ok(
+      (await getChatPrivacyState()).pending.some(
+        item => item.id === receipt.id
+      ),
+      "An ordinary disabled deletion does not poison global privacy state"
+    );
+    await acknowledgeChatPrivacyIntent(receipt.id, async current => {
+      await erasePrivacyVersions(current);
+      return getChatPrivacySourceProof(current.id);
+    });
+    Assert.ok(
+      (await getChatPrivacyState()).completed.some(
+        item => item.id === receipt.id
+      ),
+      "The retained history can settle while logging remains disabled"
+    );
+  } finally {
+    closeLogWriter(unlogged);
+    if (source) {
+      closeLogWriter(source.conversation);
+    }
+    if (hadUserValue) {
+      Services.prefs.setBoolPref(pref, oldValue);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+});
+
+add_task(async function test_privacyCaptureRetainsEachFilesOwnType() {
+  const logger = new Logger();
+  const control = await makePrivacyLog("type-unrelated");
+  const controlBytes = await IOUtils.read(control.paths[0]);
+  for (const rotate of [false, true]) {
+    for (const closed of [false, true]) {
+      const source = await makePrivacyLog(`type-${rotate}-${closed}`);
+      source.conversation.isChat = true;
+      if (rotate) {
+        source.writer.startNewFile(
+          source.conversation.startDate / 1000 + 1000,
+          true
+        );
+        await source.writer._initialized;
+        await source.writer.logMessage({
+          time: source.conversation.startDate / 1000000 + 11,
+          who: "known-sender",
+          displayMessage: "private-group-version",
+          remoteId: source.remoteId,
+          incoming: true,
+        });
+      }
+      const paths = [...source.writer.paths];
+      const before = await Promise.all(
+        paths.map(path => IOUtils.readUTF8(path))
+      );
+      if (closed) {
+        closeLogWriter(source.conversation);
+      }
+      const event = privateNoLogEvent(source);
+      logger.observe(event, "new-text");
+      const receipt = await captureChatPrivacyIntent(event);
+      Assert.deepEqual(
+        receipt.targets
+          .map(target => PathUtils.join(logDirPath, ...target.relativePath))
+          .sort(),
+        [...paths].sort(),
+        "Capture retains every actual old/new type file even after writer close"
+      );
+      for (const target of receipt.targets) {
+        const snapshot = await readChatPrivacyTarget(
+          receipt.id,
+          target.relativePath
+        );
+        Assert.equal(
+          new TextDecoder().decode(snapshot.bytes),
+          before[paths.indexOf(snapshot.path)],
+          "Each target verifies its own actual header/path without changing source"
+        );
+      }
+      await acknowledgeChatPrivacyIntent(receipt.id, async current => {
+        await erasePrivacyVersions(current);
+        return getChatPrivacySourceProof(current.id);
+      });
+      for (const [i, path] of paths.entries()) {
+        const lines = (await IOUtils.readUTF8(path)).trimEnd().split("\n");
+        Assert.deepEqual(
+          JSON.parse(lines[0]),
+          JSON.parse(before[i].split("\n")[0]),
+          "Erasure preserves each file's original DM/group header identity"
+        );
+        Assert.ok(
+          lines
+            .slice(1)
+            .map(line => JSON.parse(line))
+            .every(
+              record => record.text === "" && record.flags.includes("deleted")
+            ),
+          "All captured DM/group versions are erased"
+        );
+      }
+      await IOUtils.writeUTF8(paths[0], before[0]);
+      await Assert.rejects(
+        getChatPrivacySourceProof(receipt.id),
+        /not erased/,
+        "Completed exclusions still reject restored old-type source versions"
+      );
+      await acknowledgeChatPrivacyIntent(receipt.id, async current => {
+        await erasePrivacyVersions(current);
+        return getChatPrivacySourceProof(current.id);
+      });
+      Assert.ok(
+        (await getChatPrivacyState()).completed.some(
+          item => item.id === receipt.id
+        ),
+        "Type changes do not poison privacy state or discard completed exclusions"
+      );
+    }
+  }
+  Assert.deepEqual(
+    [...(await IOUtils.read(control.paths[0]))],
+    [...controlBytes],
+    "The same remote ID in a separate conversation remains untouched"
+  );
+});

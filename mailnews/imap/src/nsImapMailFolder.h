@@ -315,11 +315,10 @@ class nsImapMailFolder : public nsMsgDBFolder,
   DeleteMessages(nsTArray<RefPtr<nsIMsgDBHdr>> const& msgHeaders,
                  nsIMsgWindow* msgWindow, bool deleteStorage, bool isMove,
                  nsIMsgCopyServiceListener* listener, bool allowUndo) override;
-  NS_IMETHOD CopyMessages(nsIMsgFolder* srcFolder,
-                          nsTArray<RefPtr<nsIMsgDBHdr>> const& messages,
-                          bool isMove, nsIMsgWindow* msgWindow,
-                          nsIMsgCopyServiceListener* listener, bool isFolder,
-                          bool allowUndo) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD CopyMessages(
+      nsIMsgFolder* srcFolder, nsTArray<RefPtr<nsIMsgDBHdr>> const& messages,
+      bool isMove, nsIMsgWindow* msgWindow, nsIMsgCopyServiceListener* listener,
+      bool isFolder, bool allowUndo) override;
   NS_IMETHOD CopyFolder(nsIMsgFolder* srcFolder, bool isMove,
                         nsIMsgWindow* msgWindow,
                         nsIMsgCopyServiceListener* listener) override;
@@ -503,7 +502,7 @@ class nsImapMailFolder : public nsMsgDBFolder,
 #ifdef MOZ_PANORAMA
   friend class nsImapOfflineSync;
   nsresult ObserveNativeQueuedDestinations(uint32_t epoch);
-  nsresult CopyMessagesOfflineNative(
+  MOZ_CAN_RUN_SCRIPT nsresult CopyMessagesOfflineNative(
       nsIMsgFolder* source, const nsTArray<RefPtr<nsIMsgDBHdr>>& messages,
       bool isMove, nsIMsgWindow* window, nsIMsgCopyServiceListener* listener,
       bool cancelPendingMove = false);

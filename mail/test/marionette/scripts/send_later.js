@@ -282,6 +282,11 @@ async function stopServer() {
         }
       }
     }
+    // Clear only the owned folders' session-only new-message lists before
+    // comparing persistent queue state across process restarts.
+    for (const uri of [data.outbox, data.control]) {
+      MailServices.folderLookup.getFolderForURL(uri).clearNewMessages();
+    }
     MailServices.accounts.saveAccountInfo();
     Services.prefs.savePrefFile(null);
     return { fixture: data, completions, snapshot: snapshot(data) };

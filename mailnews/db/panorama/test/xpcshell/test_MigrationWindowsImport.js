@@ -50,7 +50,7 @@ add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
     nativeProfile.remove(false);
   });
   work = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
+    PathUtils.parent(profile.path),
     "migration-windows-v2-"
   );
   registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));

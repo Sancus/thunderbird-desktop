@@ -1232,6 +1232,7 @@ function bindPanoramaMigrationTarget(
  * Reads the supported native message projection before an import checkpoint.
  * Uses only the complete committed physical-key map and actual folder. Every
  * public property name/value is checked, including derived body-field aliases.
+ * Stored flags are checked independently of the facade NewList contribution.
  * Does not write, reimport, validate opaque structural storage or prove that a
  * body is available. Caller retains its profile lock and writer quiescence.
  *
@@ -1256,6 +1257,7 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
   if (remaining.size) {
     throw new Error("Native migration message set differs from its receipt");
   }
+  const newKeys = new Set(folder.msgDatabase.getNewList());
   const equal = (actual, expected, name) => {
     if (actual !== expected) {
       throw new Error("Native migration message projection differs: " + name);
@@ -1265,6 +1267,10 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
     const key = keys.get(message.sourceKey);
     const actual = headers.get(key);
     const expected = message.header;
+    // Public flags include transient NewList status; the imported word must
+    // still match exactly, including a persisted New bit added after import.
+    const stored = database.messageDB.getSearchState(key);
+    equal(stored?.flags, expected.flags, "stored flags");
     equal(actual.messageKey, key, "messageKey");
     equal(actual.folder.id, request.folder.id, "folder");
     for (const [name, value] of [
@@ -1275,7 +1281,11 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       ["ccList", expected.ccList],
       ["bccList", expected.bccList],
       ["subject", expected.subject],
-      ["flags", expected.flags],
+      [
+        "flags",
+        (expected.flags | (newKeys.has(key) ? Ci.nsMsgMessageFlags.New : 0)) >>>
+          0,
+      ],
       ["priority", expected.priority],
       ["charset", expected.charset],
       ["threadId", keys.get(message.rootSourceKey)],

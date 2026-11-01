@@ -39,12 +39,17 @@ class nsMsgXFVirtualFolderDBView : public nsMsgSearchDBView {
 
   virtual nsresult OnNewHeader(nsIMsgDBHdr* newHdr, nsMsgKey parentKey,
                                bool ensureListed) override;
-  void UpdateCacheAndViewForPrevSearchedFolders(nsIMsgFolder* curSearchFolder);
-  void UpdateCacheAndViewForFolder(nsIMsgFolder* folder,
-                                   nsTArray<nsMsgKey> const& newHits);
+  nsresult UpdateCacheAndViewForPrevSearchedFolders(
+      nsIMsgFolder* curSearchFolder);
+  nsresult UpdateCacheAndViewForFolder(nsIMsgFolder* folder,
+                                       nsTArray<nsMsgKey> const& newHits);
   void RemovePendingDBListeners();
 
  protected:
+  nsresult UpdateNativeCacheAndViewForFolder(nsIMsgFolder* folder,
+                                             nsIMsgDatabase* db,
+                                             const nsACString& searchUri,
+                                             const nsTArray<nsMsgKey>& newHits);
   virtual nsresult GetMessageEnumerator(nsIMsgEnumerator** enumerator) override;
 
   nsCOMArray<nsIMsgFolder> m_foldersSearchingOver;
@@ -54,6 +59,8 @@ class nsMsgXFVirtualFolderDBView : public nsMsgSearchDBView {
   uint32_t m_curFolderStartKeyIndex;
   bool m_curFolderHasCachedHits;
   bool m_doingSearch;
+  bool m_searchBatchOpen;
+  nsresult m_cacheStatus;
   // Are we doing a quick search on top of the virtual folder search?
   bool m_doingQuickSearch;
 };

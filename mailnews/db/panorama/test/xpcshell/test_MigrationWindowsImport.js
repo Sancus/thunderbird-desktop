@@ -102,6 +102,7 @@ add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
     database
   );
   Assert.ok(database.sourceId);
+  Assert.equal(MailServices.accounts.accounts.length, 1);
   const root = MailServices.accounts.localFoldersServer.rootFolder;
   for (const name of inventories.keys()) {
     const folder = root.getChildNamed(name);

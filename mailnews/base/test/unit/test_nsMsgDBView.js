@@ -1268,6 +1268,200 @@ add_task(async function test_group() {
   await test_group_dummies_under_mutation_by_date();
 });
 
+add_task(async function test_threadDateSortReadErrorPreservesView() {
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  if (!("nsIDatabaseCore" in Ci) || !(service instanceof Ci.nsIDatabaseCore)) {
+    info("Native SQLite error control; the original eight cases cover Mork");
+    return;
+  }
+  const core = service.QueryInterface(Ci.nsIDatabaseCore);
+  const pref = "mailnews.sort_threads_by_root";
+  const hadPref = Services.prefs.prefHasUserValue(pref);
+  const oldPref = Services.prefs.getBoolPref(pref);
+  const parent = gMessageGenerator.makeMessage({
+    subject: "thread-date-error-parent",
+    age: { days: 3 },
+  });
+  const child = gMessageGenerator.makeMessage({
+    inReplyTo: parent,
+    age: { days: 2 },
+  });
+  const other = gMessageGenerator.makeMessage({
+    subject: "thread-date-error-other",
+    age: { days: 1 },
+  });
+  const connection = core.connectionForTests;
+  let renamed = false;
+  try {
+    Services.prefs.setBoolPref(pref, false);
+    await set_gTestFolder(new SyntheticMessageSet([parent, other, child]));
+    for (const viewType of ["threaded", "quicksearch"]) {
+      setup_view(viewType, Ci.nsMsgViewFlagsType.kThreadedDisplay);
+      Assert.equal(gDBView.rowCount, 3);
+      const first = gDBView.getMsgHdrAt(0);
+      const thread = gTestFolder.msgDatabase.getThreadContainingMsgHdr(first);
+      Assert.equal(thread.numChildren, 2);
+      const newest = thread.newestMsgDate;
+      Assert.greater(newest, first.dateInSeconds);
+      gFakeSelection.rangedSelect(0, 1, false);
+      gFakeSelection.clearRange(0, 0);
+      const physical = header => [
+        header.folder.URI,
+        header.messageKey,
+        header.messageId,
+      ];
+      const capture = () => ({
+        rows: Array.from({ length: gDBView.rowCount }, (_, index) => ({
+          identity: physical(gDBView.getMsgHdrAt(index)),
+          level: gTreeView.getLevel(index),
+        })),
+        selected: gDBView.getSelectedMsgHdrs().map(physical),
+        current: gFakeSelection.currentIndex,
+        pivot: gFakeSelection.shiftSelectPivot,
+        sortType: gDBView.sortType,
+        sortOrder: gDBView.sortOrder,
+        viewFlags: gDBView.viewFlags,
+      });
+      const before = capture();
+      for (const sortType of [
+        Ci.nsMsgViewSortType.byDate,
+        Ci.nsMsgViewSortType.byReceived,
+      ]) {
+        // Prime the existing view header cache before making the date query fail.
+        gDBView.getMsgHdrAt(0);
+        connection.executeSimpleSQL(
+          "ALTER TABLE messages RENAME TO unavailable_view_dates"
+        );
+        renamed = true;
+        try {
+          Assert.throws(
+            () => thread.newestMsgDate,
+            error => error.result == Cr.NS_ERROR_FAILURE,
+            "The actual native thread-date query fails"
+          );
+          Assert.throws(
+            () => gDBView.sort(sortType, Ci.nsMsgViewSortOrder.descending),
+            error => error.result == Cr.NS_ERROR_FAILURE,
+            "The original date query error reaches the public view sort"
+          );
+        } finally {
+          connection.executeSimpleSQL(
+            "ALTER TABLE unavailable_view_dates RENAME TO messages"
+          );
+          renamed = false;
+        }
+        Assert.deepEqual(
+          capture(),
+          before,
+          "A failed sort preserves every physical row, level and selection"
+        );
+        Assert.equal(thread.newestMsgDate, newest);
+      }
+      gDBView.sort(
+        Ci.nsMsgViewSortType.byDate,
+        Ci.nsMsgViewSortOrder.descending
+      );
+      Assert.equal(
+        gDBView.rowCount,
+        3,
+        "Sorting recovers after the real storage error"
+      );
+      Assert.deepEqual(
+        gDBView.getSelectedMsgHdrs().map(physical),
+        before.selected
+      );
+      Assert.deepEqual(
+        physical(gDBView.getMsgHdrAt(gFakeSelection.shiftSelectPivot)),
+        before.rows[before.pivot].identity,
+        "The unselected physical anchor survives a successful sort too"
+      );
+    }
+  } finally {
+    if (renamed) {
+      connection.executeSimpleSQL(
+        "ALTER TABLE unavailable_view_dates RENAME TO messages"
+      );
+    }
+    if (hadPref) {
+      Services.prefs.setBoolPref(pref, oldPref);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+});
+
+add_task(async function test_flatSortReadErrorRestoresSelection() {
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
+  );
+  if (!("nsIDatabaseCore" in Ci) || !(service instanceof Ci.nsIDatabaseCore)) {
+    info("Native SQLite error control; original cases retain Mork coverage");
+    return;
+  }
+  await set_gTestFolder(
+    new SyntheticMessageSet(gMessageGenerator.makeMessages({ count: 3 }))
+  );
+  setup_view("threaded", Ci.nsMsgViewFlagsType.kNone);
+  const connection = service.QueryInterface(
+    Ci.nsIDatabaseCore
+  ).connectionForTests;
+  const physical = header => [
+    header.folder.URI,
+    header.messageKey,
+    header.messageId,
+  ];
+  const capture = () => ({
+    rows: Array.from({ length: gDBView.rowCount }, (_, index) =>
+      physical(gDBView.getMsgHdrAt(index))
+    ),
+    selected: gDBView.getSelectedMsgHdrs().map(physical),
+    current: gFakeSelection.currentIndex,
+    pivot: gFakeSelection.shiftSelectPivot,
+    sortType: gDBView.sortType,
+    sortOrder: gDBView.sortOrder,
+  });
+  for (const sortType of [
+    Ci.nsMsgViewSortType.byDate,
+    Ci.nsMsgViewSortType.byReceived,
+  ]) {
+    gDBView.sort(Ci.nsMsgViewSortType.byId, Ci.nsMsgViewSortOrder.ascending);
+    gFakeSelection.rangedSelect(0, 1, false);
+    gFakeSelection.clearRange(0, 0);
+    const before = capture();
+    Assert.equal(gFakeSelection.selectEventsSuppressed, false);
+    connection.executeSimpleSQL(
+      "ALTER TABLE messages RENAME TO unavailable_flat_sort"
+    );
+    try {
+      Assert.throws(
+        () => gDBView.sort(sortType, Ci.nsMsgViewSortOrder.descending),
+        error => error.result == Cr.NS_ERROR_FAILURE,
+        "The original numeric field read failure is returned"
+      );
+      Assert.equal(
+        gFakeSelection.selectEventsSuppressed,
+        false,
+        "Failed flat sorting unfreezes selection events"
+      );
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE unavailable_flat_sort RENAME TO messages"
+      );
+    }
+    Assert.deepEqual(
+      capture(),
+      before,
+      "The physical selection/current/anchor and rows survive"
+    );
+  }
+  const selected = gDBView.getSelectedMsgHdrs().map(physical);
+  gDBView.sort(Ci.nsMsgViewSortType.byDate, Ci.nsMsgViewSortOrder.descending);
+  Assert.equal(gFakeSelection.selectEventsSuppressed, false);
+  Assert.deepEqual(gDBView.getSelectedMsgHdrs().map(physical), selected);
+});
+
 add_task(function test_teardown() {
   // Delete view reference to avoid a cycle leak.
   gFakeSelection.view = null;

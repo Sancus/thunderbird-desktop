@@ -15,7 +15,6 @@ for (let stack = Components.stack; stack; stack = stack.caller) {
   }
 }
 
-import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MailConsts } from "resource:///modules/MailConsts.sys.mjs";
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { MailUtils } from "resource:///modules/MailUtils.sys.mjs";
@@ -1148,17 +1147,11 @@ export async function delete_via_popup() {
     "DeleteOrMoveMsgFailed"
   );
   const win = get_about_3pane();
+  const popup = win.document.getElementById("mailContext");
   const ctxDelete = win.document.getElementById("navContext-delete");
-  if (AppConstants.platform == "macosx") {
-    // We need to use click() since the synthesizeMouseAtCenter doesn't work for
-    // context menu items on macos.
-    ctxDelete.click();
-  } else {
-    EventUtils.synthesizeMouseAtCenter(ctxDelete, {}, ctxDelete.documentGlobal);
-  }
-
-  // for reasons unknown, the pop-up does not close itself?
-  await close_popup(mc, win.document.getElementById("mailContext"));
+  const hidden = BrowserTestUtils.waitForPopupEvent(popup, "hidden");
+  popup.activateItem(ctxDelete);
+  await hidden;
   await wait_for_folder_events();
 }
 
@@ -1846,10 +1839,16 @@ async function _internal_assert_displayed(
     const dbView = get_db_view(troller);
     const desiredMessages = desiredIndices.map(i => dbView.getMsgHdrAt(i));
     const summary = multiMessageBrowser.contentWindow.gMessageSummary;
+    const summarizedMessages = [];
+    for (const { folder, members } of summary._folderStates.values()) {
+      for (const key of members.keys()) {
+        summarizedMessages.push(`${key}${folder.URI}`);
+      }
+    }
 
     Assert.deepEqual(
       desiredMessages.map(m => `${m.messageKey}${m.folder.URI}`).toSorted(),
-      Object.keys(summary._msgNodes).toSorted(),
+      summarizedMessages.toSorted(),
       "the selected messages should be summarised"
     );
   }

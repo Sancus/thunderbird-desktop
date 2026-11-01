@@ -215,7 +215,8 @@ nsresult nsMsgThreadedDBView::SortThreads(nsMsgViewSortTypeValue sortType,
   m_levels.SetLength(numThreads);
   // m_viewFlags &= ~nsMsgViewFlagsType::kThreadedDisplay;
   m_sortType = nsMsgViewSortType::byNone;  // sort from scratch
-  nsMsgDBView::Sort(sortType, sortOrder);
+  nsresult rv = nsMsgDBView::Sort(sortType, sortOrder);
+  NS_ENSURE_SUCCESS(rv, rv);
   m_viewFlags |= nsMsgViewFlagsType::kThreadedDisplay;
   SetSuppressChangeNotifications(true);
 
@@ -291,7 +292,28 @@ nsMsgThreadedDBView::Sort(nsMsgViewSortTypeValue sortType,
     sortType = nsMsgViewSortType::byId;
   }
 
+  // SortThreads compresses rows before reading sort fields. Retain the
+  // displayed state so an error cannot leave a partial thread list.
+  auto previousKeys = sortThreads ? m_keys.Clone() : nsTArray<nsMsgKey>();
+  auto previousFlags = sortThreads ? m_flags.Clone() : nsTArray<uint32_t>();
+  auto previousLevels = sortThreads ? m_levels.Clone() : nsTArray<uint32_t>();
+  const auto previousSortType = m_sortType;
+  const auto previousSortOrder = m_sortOrder;
+  const auto previousSortValid = m_sortValid;
+  const auto previousViewFlags = m_viewFlags;
+  auto previousSortColumns = m_sortColumns.Clone();
+  const auto previousSecondarySort = m_secondarySort;
+  const auto previousSecondaryOrder = m_secondarySortOrder;
+  const auto previousSecondaryColumn = m_secondaryCustomColumn;
   nsMsgKey preservedKey;
+  nsMsgKey preservedPivot = nsMsgKey_None;
+  if (mTreeSelection) {
+    int32_t pivot;
+    if (NS_SUCCEEDED(mTreeSelection->GetShiftSelectPivot(&pivot)) &&
+        pivot >= 0 && uint32_t(pivot) < GetSize()) {
+      preservedPivot = m_keys[pivot];
+    }
+  }
   AutoTArray<nsMsgKey, 1> preservedSelection;
   SaveAndClearSelection(&preservedKey, preservedSelection);
   // If the client wants us to forget our cached id arrays, they
@@ -316,7 +338,7 @@ nsMsgThreadedDBView::Sort(nsMsgViewSortTypeValue sortType,
         // this is safe when there is no selection.
         rv = AdjustRowCount(rowCountBeforeSort, GetSize());
 
-        RestoreSelection(preservedKey, preservedSelection);
+        RestoreSelection(preservedKey, preservedSelection, preservedPivot);
         if (mTree) mTree->Invalidate();
         if (mJSTree) mJSTree->Invalidate();
 
@@ -334,7 +356,7 @@ nsMsgThreadedDBView::Sort(nsMsgViewSortTypeValue sortType,
         // this is safe when there is no selection.
         rv = AdjustRowCount(rowCountBeforeSort, GetSize());
 
-        RestoreSelection(preservedKey, preservedSelection);
+        RestoreSelection(preservedKey, preservedSelection, preservedPivot);
         if (mTree) mTree->Invalidate();
         if (mJSTree) mJSTree->Invalidate();
 
@@ -344,7 +366,23 @@ nsMsgThreadedDBView::Sort(nsMsgViewSortTypeValue sortType,
                (m_sortType == nsMsgViewSortType::byThread || sortThreads)
                /* && !m_havePrevView*/) {
       if (sortThreads) {
-        SortThreads(sortType, sortOrder);
+        rv = SortThreads(sortType, sortOrder);
+        if (NS_FAILED(rv)) {
+          m_keys = std::move(previousKeys);
+          m_flags = std::move(previousFlags);
+          m_levels = std::move(previousLevels);
+          m_sortType = previousSortType;
+          m_sortOrder = previousSortOrder;
+          m_sortValid = previousSortValid;
+          m_viewFlags = previousViewFlags;
+          m_sortColumns = std::move(previousSortColumns);
+          m_secondarySort = previousSecondarySort;
+          m_secondarySortOrder = previousSecondaryOrder;
+          m_secondaryCustomColumn = previousSecondaryColumn;
+          SaveSortInfo(m_sortType, m_sortOrder);
+          RestoreSelection(preservedKey, preservedSelection, preservedPivot);
+          return rv;
+        }
         // Hack so base class won't do anything.
         sortType = nsMsgViewSortType::byThread;
       } else {
@@ -365,13 +403,20 @@ nsMsgThreadedDBView::Sort(nsMsgViewSortTypeValue sortType,
     }
   } else if (m_sortOrder != sortOrder) {
     // Check for toggling the sort.
-    nsMsgDBView::Sort(sortType, sortOrder);
+    rv = nsMsgDBView::Sort(sortType, sortOrder);
+    if (NS_FAILED(rv)) {
+      RestoreSelection(preservedKey, preservedSelection, preservedPivot);
+      return rv;
+    }
   }
 
   if (!sortThreads) {
     // Call the base class in case we're not sorting by thread.
     rv = nsMsgDBView::Sort(sortType, sortOrder);
-    NS_ENSURE_SUCCESS(rv, rv);
+    if (NS_FAILED(rv)) {
+      RestoreSelection(preservedKey, preservedSelection, preservedPivot);
+      return rv;
+    }
     SaveSortInfo(sortType, sortOrder);
   }
 
@@ -381,7 +426,7 @@ nsMsgThreadedDBView::Sort(nsMsgViewSortTypeValue sortType,
   // this is safe when there is no selection.
   rv = AdjustRowCount(rowCountBeforeSort, GetSize());
 
-  RestoreSelection(preservedKey, preservedSelection);
+  RestoreSelection(preservedKey, preservedSelection, preservedPivot);
   if (mTree) mTree->Invalidate();
   if (mJSTree) mJSTree->Invalidate();
 

@@ -937,7 +937,8 @@ nsresult nsMsgDBView::SaveAndClearSelection(nsMsgKey* aCurrentMsgKey,
 }
 
 nsresult nsMsgDBView::RestoreSelection(nsMsgKey aCurrentMsgKey,
-                                       nsTArray<nsMsgKey>& aMsgKeyArray) {
+                                       nsTArray<nsMsgKey>& aMsgKeyArray,
+                                       nsMsgKey aPivotMsgKey) {
   // We don't do anything on nested Save / Restore calls.
   m_saveRestoreSelectionDepth--;
   if (m_saveRestoreSelectionDepth) return NS_OK;
@@ -969,6 +970,19 @@ nsresult nsMsgDBView::RestoreSelection(nsMsgKey aCurrentMsgKey,
   if (aCurrentMsgKey != nsMsgKey_None)
     currentViewPosition = FindKey(aCurrentMsgKey, true);
 
+  if (aPivotMsgKey != nsMsgKey_None) {
+    nsMsgViewIndex pivot = FindKey(aPivotMsgKey, false);
+    if (pivot != nsMsgViewIndex_None) {
+      bool wasSelected = false;
+      mTreeSelection->IsSelected(pivot, &wasSelected);
+      // Install the anchor without adding an unselected row to the selection.
+      mTreeSelection->RangedSelect(pivot, pivot, true);
+      if (!wasSelected) {
+        mTreeSelection->ClearRange(pivot, pivot);
+      }
+      mTreeSelection->SetCurrentIndex(currentViewPosition);
+    }
+  }
   if (mJSTree) mJSTree->SetCurrentIndex(currentViewPosition);
 
   // Make sure the current message is once again visible in the thread pane
@@ -3111,7 +3125,7 @@ nsresult nsMsgDBView::GetLongField(nsIMsgDBHdr* msgHdr,
         nsCOMPtr<nsIMsgThread> thread;
         rv = GetThreadContainingMsgHdr(msgHdr, getter_AddRefs(thread));
         if (NS_SUCCEEDED(rv)) {
-          thread->GetNewestMsgDate(result);
+          rv = thread->GetNewestMsgDate(result);
           break;
         }
       }
@@ -3126,7 +3140,7 @@ nsresult nsMsgDBView::GetLongField(nsIMsgDBHdr* msgHdr,
         nsCOMPtr<nsIMsgThread> thread;
         rv = GetThreadContainingMsgHdr(msgHdr, getter_AddRefs(thread));
         NS_ENSURE_SUCCESS(rv, rv);
-        thread->GetNewestMsgDate(result);
+        rv = thread->GetNewestMsgDate(result);
       } else {
         // Already in seconds.
         rv = msgHdr->GetUint32Property("dateReceived", result);

@@ -179,6 +179,9 @@ async function checkGlobalResults(manifestVersion) {
     });
     browser.tabs.onUpdated.addListener((id, change, tab) => {
       events.push(["updated", id, change, tab]);
+      if (change.status == "complete" && tab.type == "mail") {
+        browser.test.sendMessage("updated-complete", id);
+      }
     });
     browser.tabs.onRemoved.addListener((id, info) => {
       events.push(["removed", id, info]);
@@ -317,6 +320,11 @@ async function checkGlobalResults(manifestVersion) {
   Assert.deepEqual(resolvePhysical(selectedList.messages), [
     physical(selected),
   ]);
+  Assert.equal(
+    await extension.awaitMessage("updated-complete"),
+    listAPI.id,
+    "The actual list update event completes before its event snapshot is inspected"
+  );
   extension.sendMessage("state", listAPI.id);
   const state = await extension.awaitMessage("state");
   Assert.deepEqual(resolvePhysical(state.selected.messages), [
@@ -356,9 +364,11 @@ async function checkGlobalResults(manifestVersion) {
     physical(selected),
   ]);
   Assert.ok(
-    !messageInfo.displayedFolder,
-    "A synthetic list has no physical displayed folder"
+    messageInfo.displayedFolder,
+    "The message menu reports its selected physical folder"
   );
+  Assert.equal(messageInfo.displayedFolder.accountId, gAccount.key);
+  Assert.equal(messageInfo.displayedFolder.path, "/" + selected.folder.name);
   await closeMenuPopup(messageMenu);
   const denied = ExtensionTestUtils.loadExtension({
     background: async () => {

@@ -429,15 +429,15 @@ add_task(async function test_queryWithoutGlobalIndex() {
     ) instanceof Ci.nsIDatabaseCore
   );
   const account = await createAccount();
-  const first = await createSubfolder(
+  const firstFolder = await createSubfolder(
     account.incomingServer.rootFolder,
     "SubstringFirst"
   );
-  const second = await createSubfolder(
+  const secondFolder = await createSubfolder(
     account.incomingServer.rootFolder,
     "SubstringSecond"
   );
-  Assert.equal(first.msgStore.storeType, "mbox");
+  Assert.equal(firstFolder.msgStore.storeType, "mbox");
   const generator = new MessageGenerator();
   const message = generator.makeMessage({
     subject: "prefixQuasarSuffix",
@@ -445,19 +445,19 @@ add_task(async function test_queryWithoutGlobalIndex() {
     body: { body: "before bodyNeedle after literal OR two" },
   });
   message.messageId = "extension101-duplicate@example.invalid";
-  await addGeneratedMessages(first, [message]);
-  await addGeneratedMessages(second, [message]);
-  await createMessages(first, {
+  await addGeneratedMessages(firstFolder, [message]);
+  await addGeneratedMessages(secondFolder, [message]);
+  await createMessages(firstFolder, {
     count: 1,
     subject: "Unrelated control",
     body: { body: "two before unrelated" },
   });
-  const a = [...first.messages][0];
-  const b = [...second.messages][0];
-  const control = [...first.messages][1];
-  first.markMessagesRead([a], true);
-  first.markMessagesFlagged([a], true);
-  first.addKeywordsToMessages([a], "$label1");
+  const a = [...firstFolder.messages][0];
+  const b = [...secondFolder.messages][0];
+  const control = [...firstFolder.messages][1];
+  firstFolder.markMessagesRead([a], true);
+  firstFolder.markMessagesFlagged([a], true);
+  firstFolder.addKeywordsToMessages([a], "$label1");
   const extension = ExtensionTestUtils.loadExtension({
     files: {
       "background.js": async () => {
@@ -492,6 +492,31 @@ add_task(async function test_queryWithoutGlobalIndex() {
             const again = await browser.messages.get(m.id);
             browser.test.assertEq(m.folder.id, again.folder.id);
             browser.test.assertEq(m.headerMessageId, again.headerMessageId);
+            browser.test.assertEq(data.accountId, m.folder.accountId);
+            browser.test.assertEq(
+              m.id == data.b ? "/SubstringSecond" : "/SubstringFirst",
+              m.folder.path,
+              "Current physical fixture location"
+            );
+            browser.test.assertEq(
+              m.id == data.control
+                ? data.controlMessageId
+                : "extension101-duplicate@example.invalid",
+              m.headerMessageId,
+              "Literal fixture identity"
+            );
+            browser.test.assertEq(m.id == data.a, m.read, "Fixture read state");
+            browser.test.assertEq(
+              m.id == data.a,
+              m.flagged,
+              "Fixture star state"
+            );
+            window.assertDeepEqual(
+              m.id == data.a ? ["$label1"] : [],
+              m.tags,
+              "Fixture tags",
+              { strict: true }
+            );
           }
         }
         await check({ subject: "Quasar" }, [data.a, data.b]);
@@ -542,6 +567,8 @@ add_task(async function test_queryWithoutGlobalIndex() {
     a: manager.convert(a).id,
     b: manager.convert(b).id,
     control: manager.convert(control).id,
+    accountId: account.key,
+    controlMessageId: control.messageId,
   });
   await extension.awaitFinish("finished");
   await extension.unload();

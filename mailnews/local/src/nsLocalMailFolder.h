@@ -195,8 +195,8 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
  protected:
   friend class LocalFolderCopy;
   friend class LocalMoveSourceListener;
-  nsresult CompleteMoveSource(LocalMoveSourceListener* listener,
-                              nsresult status);
+  MOZ_CAN_RUN_SCRIPT nsresult
+  CompleteMoveSource(LocalMoveSourceListener* listener, nsresult status);
   nsresult CompleteCopy(nsISupports* source, nsresult status);
 
   virtual ~nsMsgLocalMailFolder();

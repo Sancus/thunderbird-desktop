@@ -844,6 +844,7 @@ nsresult PerFolderDatabase::GetMsgHdrForProperty(const nsACString& name,
   NS_ENSURE_ARG_POINTER(result);
   *result = nullptr;
   MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
   nsTArray<nsMsgKey> keys;
   MOZ_TRY(ListAllKeys(keys));
   nsCOMPtr<nsIMsgDBHdr> found;

@@ -330,7 +330,7 @@ export class ChatSearchProvider {
     if (this.#closing) {
       throw new Error("Chat search provider is closing");
     }
-    const revision = this.#privacyRevision;
+    const revision = this.#redactions.size ? null : this.#privacyRevision;
     const records = await this.#index.getRecoveryRecords(id);
     await this.#waitForRedactions();
     return revision === this.#privacyRevision ? records : [];

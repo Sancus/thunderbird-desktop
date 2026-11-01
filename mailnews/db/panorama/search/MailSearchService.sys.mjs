@@ -30,12 +30,49 @@ import {
   readMailSearchResult,
 } from "resource:///modules/panorama/MailSearchResult.sys.mjs";
 
+/**
+ * Requires the original singular built-in encryption attribute to prove false.
+ * Unknown, duplicate, malformed or contradictory old metadata stays quarantined.
+ *
+ * @param {object} snapshot - Validated schema30 snapshot.
+ * @param {object} message - One original message with typed raw cells.
+ * @returns {boolean} Whether the original stored text is explicitly plaintext.
+ */
+function recoveredPlaintext(snapshot, message) {
+  const definitions = snapshot.attributeDefinitions.filter(
+    row =>
+      row.name.value === "isEncrypted" && row.extensionName.value === "built-in"
+  );
+  if (definitions.length !== 1 || message.raw.jsonAttributes?.type !== "text") {
+    return false;
+  }
+  const id = definitions[0].id.value;
+  if (message.attributes.some(row => row.attributeID.value === id)) {
+    return false;
+  }
+  try {
+    const values = JSON.parse(message.raw.jsonAttributes.value);
+    return (
+      values !== null &&
+      !Array.isArray(values) &&
+      Object.hasOwn(values, id) &&
+      values[id] === false
+    );
+  } catch {
+    return false;
+  }
+}
+
 const INDEXER_PREF = "mailnews.database.global.indexer.enabled";
 const DISPLAY_NAME_PREF = "mail.displayname.version";
 const MAX_BACKGROUND_RETRIES = 3;
 const BACKGROUND_RETRY_DELAY_MS = 1000;
 
 const lazy = {};
+ChromeUtils.defineESModuleGetters(lazy, {
+  readLegacyGlodaMailRecovery:
+    "resource:///modules/panorama/MigrationCoordinator.sys.mjs",
+});
 ChromeUtils.defineLazyGetter(lazy, "activityManager", () =>
   Cc["@mozilla.org/activity-manager;1"].getService(Ci.nsIActivityManager)
 );
@@ -305,6 +342,181 @@ export class MailSearchService {
   }
 
   /**
+   * Persists a receipt-bound recovery before retrying disposable body work.
+   * The caller retains its selected profile lock and quiesced writers throughout.
+   * Encryption-unknown and currently excluded records keep their raw payload but
+   * never receive a searchable projection. Failed publication does not erase it.
+   *
+   * @param {MigrationJournal} journal - Backed-up, committed source journal.
+   * @param {nsIDatabaseCore} core - Actual native database for this service.
+   * @param {function(string): (nsIMsgFolder|Promise<nsIMsgFolder>)} resolveFolder -
+   *   Resolves original source identities for the verified receipt lookup.
+   * @param {nsIProfileLock} profileLock - Caller-owned selected-profile lock.
+   * @param {string} path - Exact backed-up Gloda source path.
+   * @returns {Promise<{stored: number, eligible: number}>} Committed record counts.
+   * @throws {Error} Original validation, source, native, or destination error.
+   */
+  recoverMail(journal, core, resolveFolder, profileLock, path) {
+    if (this.#closed) {
+      return Promise.reject(new Error("Mail search is closed"));
+    }
+    const operation = this.#updates.then(async () => {
+      if (
+        core.sourceId !== this.#sourceId ||
+        core.messageDB !== this.#messageDB
+      ) {
+        throw new Error("Recovery belongs to another native database");
+      }
+      await this.#preparePreferences(this.#controller.signal);
+      const bundle = await lazy.readLegacyGlodaMailRecovery(
+        journal,
+        core,
+        resolveFolder,
+        profileLock,
+        path
+      );
+      this.#controller.signal.throwIfAborted();
+      let eligible = 0;
+      const records = bundle.mapped.map(row => {
+        if (row.sourceId !== this.#sourceId) {
+          throw new Error("Recovered database incarnation changed");
+        }
+        const id = String(row.key);
+        const state = this.resolveDocument(id);
+        if (!state || state.location?.folderId !== row.folderId) {
+          throw new Error("Recovered physical location changed");
+        }
+        const metadata = loadMailSearchMetadata(
+          {
+            id,
+            generation: state.generation,
+            policyRevision: state.policyRevision,
+          },
+          state
+        );
+        const allowed =
+          !!metadata &&
+          recoveredPlaintext(bundle.snapshot, row.message) &&
+          typeof row.message.text?.body === "string";
+        const document = allowed
+          ? {
+              ...metadata,
+              body: row.message.text.body,
+              attachmentNames: row.message.text.attachmentNames ?? "",
+              bodyIndexed: true,
+            }
+          : null;
+        eligible += Number(allowed);
+        return {
+          recordId:
+            "mail:" +
+            JSON.stringify([
+              this.#sourceId,
+              bundle.originalDatabasePath,
+              row.message.id,
+            ]),
+          documentId: id,
+          kind: "mail",
+          sourceRevision: bundle.snapshot.source.sha256,
+          payload: {
+            ...row,
+            attributeDefinitions: bundle.snapshot.attributeDefinitions,
+            backup: bundle.backup,
+            disposition: allowed ? "candidate" : "quarantined",
+          },
+          document,
+        };
+      });
+      for (const row of bundle.excluded) {
+        records.push({
+          recordId:
+            "mail:" +
+            JSON.stringify([
+              this.#sourceId,
+              bundle.originalDatabasePath,
+              row.message.id,
+            ]),
+          documentId: null,
+          kind: "mail",
+          sourceRevision: bundle.snapshot.source.sha256,
+          payload: {
+            ...row,
+            attributeDefinitions: bundle.snapshot.attributeDefinitions,
+            source: bundle.snapshot.source,
+            backup: bundle.backup,
+            disposition: "excluded",
+          },
+          document: null,
+        });
+      }
+      await this.#index.retainRecovery(records);
+      await this.#index.retryUnavailable();
+      this.#wake();
+      return { stored: records.length, eligible };
+    });
+    this.#updates = operation.catch(() => {});
+    return operation;
+  }
+
+  /**
+   * Reads the committed recovery payload without granting query eligibility.
+   *
+   * @param {?string} [id=null] - Exact physical key, or all records.
+   * @returns {Promise<object[]>} Raw/provenance records; erased payloads are null.
+   */
+  getRecoveryRecords(id = null) {
+    return this.#index.getRecoveryRecords(id);
+  }
+
+  /**
+   * Rebuilds disposable rows and republishes current recovered mail sources.
+   * Pending native changes remain with the normal bounded worker; every direct
+   * replacement still checks the accepted native generation and content revision.
+   *
+   * @returns {Promise<void>} Resolves after current recovery replacements and the FTS rebuild.
+   */
+  rebuild() {
+    if (this.#closed) {
+      return Promise.reject(new Error("Mail search is closed"));
+    }
+    const operation = this.#updates.then(async () => {
+      const records = await this.#index.getRecoveryRecords();
+      for (const id of new Set(
+        records
+          .filter(
+            row => row.kind === "mail" && !row.erased && row.documentId !== null
+          )
+          .map(row => row.documentId)
+      )) {
+        const retained = await this.#index.getRecoveredText(
+          id,
+          this.#controller.signal
+        );
+        if (!retained) {
+          continue;
+        }
+        const state = this.resolveDocument(id, this.#controller.signal);
+        const metadata =
+          state &&
+          loadMailSearchMetadata(retained, state, this.#controller.signal);
+        if (metadata) {
+          await this.#index.index({
+            ...metadata,
+            body: retained.body,
+            attachmentNames: retained.attachmentNames,
+            bodyIndexed: true,
+          });
+        }
+      }
+      await this.#index.rebuild();
+      await this.#index.retryUnavailable();
+      this.#wake();
+    });
+    this.#updates = operation.catch(() => {});
+    return operation;
+  }
+
+  /**
    * Processes one bounded native page and one bounded body batch.
    *
    * @param {object} [options] - Work controls.
@@ -330,7 +542,24 @@ export class MailSearchService {
       const before = await this.#index.getProgress();
       const progress = await processSearchIndexBatch(
         this.#index,
-        loadMailSearchDocument,
+        async (job, state, readSignal) => {
+          const document = await loadMailSearchDocument(job, state, readSignal);
+          if (!document || document.bodyIndexed) {
+            return document;
+          }
+          const retained = await this.#index.getRecoveredText(
+            job.id,
+            readSignal
+          );
+          return retained
+            ? {
+                ...document,
+                body: retained.body,
+                attachmentNames: retained.attachmentNames,
+                bodyIndexed: true,
+              }
+            : document;
+        },
         { limit, signal, loadMetadata: loadMailSearchMetadata }
       );
       const scan = await this.#index.getRescan();

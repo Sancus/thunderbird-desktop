@@ -265,7 +265,7 @@ export class PanoramaSearchIndex {
       Cc["@mozilla.org/messenger/fts3tokenizer;1"]
         .getService(Ci.nsIFts3Tokenizer)
         .registerTokenizer(connection);
-      if (connection.schemaVersion > 6) {
+      if (connection.schemaVersion > 7) {
         throw new Error("Unsupported search index schema");
       }
       await index.#transaction(async () => {
@@ -378,7 +378,15 @@ export class PanoramaSearchIndex {
             );
           }
         }
-        await index.#execute("PRAGMA user_version = 6");
+        await index.#execute(
+          "CREATE TABLE IF NOT EXISTS recovery_records (" +
+            "recordId TEXT PRIMARY KEY,documentId TEXT,kind TEXT NOT NULL," +
+            "sourceRevision TEXT NOT NULL,payload TEXT,document TEXT,erased INTEGER NOT NULL DEFAULT 0)"
+        );
+        await index.#execute(
+          "CREATE TABLE IF NOT EXISTS recovery_erased (documentId TEXT PRIMARY KEY)"
+        );
+        await index.#execute("PRAGMA user_version = 7");
       });
       return index;
     } catch (error) {
@@ -423,7 +431,7 @@ export class PanoramaSearchIndex {
    * Executes one native asynchronous statement and cancels it on abort.
    *
    * @param {string} sql - SQL with named parameters.
-   * @param {Record<string, string|number>} [params={}] - Bound values.
+   * @param {Record<string, string|number|null|Uint8Array>} [params={}] - Bound values.
    * @param {string[]} [columns=[]] - Result columns to copy before finalization.
    * @param {AbortSignal} [signal] - Statement cancellation.
    * @returns {Promise<Array<Record<string, string|number>>>} Copied result rows.
@@ -433,7 +441,11 @@ export class PanoramaSearchIndex {
     const statement = this.#connection.createAsyncStatement(sql);
     try {
       for (const [name, value] of Object.entries(params)) {
-        statement.params[name] = value;
+        if (value instanceof Uint8Array) {
+          statement.bindBlobByName(name, value);
+        } else {
+          statement.params[name] = value;
+        }
       }
     } catch (error) {
       statement.finalize();
@@ -616,10 +628,15 @@ export class PanoramaSearchIndex {
         );
       }
     }
+    // String variants bind as UTF-16, whose initial U+FEFF SQLite consumes as
+    // an encoding marker. Bind semantic UTF-8 bytes and cast to TEXT so exact
+    // leading BOMs, embedded NULs and the corresponding FTS offsets survive.
+    // Keep empty strings as strings: the native zero-length blob binds NULL.
+    const encoder = new TextEncoder();
     await this.#execute(
       "INSERT INTO documents " +
         "(documentId,generation,policyRevision,changeSequence,bodyIndexed,contentRevision,textRevision,subject,body,attachmentNames,attachmentPresence,attachmentTypes,attachmentInfos,author,recipients) " +
-        "VALUES(:id,:generation,:policyRevision,:sequence,:bodyIndexed,:contentRevision,:textRevision,:subject,:body,:attachmentNames,:attachmentPresence,:attachmentTypes,:attachmentInfos,:author,:recipients) " +
+        "VALUES(:id,:generation,:policyRevision,:sequence,:bodyIndexed,:contentRevision,:textRevision,CAST(:subject AS TEXT),CAST(:body AS TEXT),CAST(:attachmentNames AS TEXT),:attachmentPresence,:attachmentTypes,:attachmentInfos,CAST(:author AS TEXT),CAST(:recipients AS TEXT)) " +
         "ON CONFLICT(documentId) DO UPDATE SET " +
         "generation=excluded.generation,policyRevision=excluded.policyRevision,changeSequence=excluded.changeSequence," +
         "projectionReady=1,bodyIndexed=excluded.bodyIndexed,contentRevision=excluded.contentRevision,textRevision=excluded.textRevision," +
@@ -627,6 +644,15 @@ export class PanoramaSearchIndex {
         "attachmentNames=excluded.attachmentNames,attachmentPresence=excluded.attachmentPresence,attachmentTypes=excluded.attachmentTypes,attachmentInfos=excluded.attachmentInfos,author=excluded.author,recipients=excluded.recipients",
       {
         ...document,
+        subject: document.subject ? encoder.encode(document.subject) : "",
+        body: document.body ? encoder.encode(document.body) : "",
+        attachmentNames: document.attachmentNames
+          ? encoder.encode(document.attachmentNames)
+          : "",
+        author: document.author ? encoder.encode(document.author) : "",
+        recipients: document.recipients
+          ? encoder.encode(document.recipients)
+          : "",
         textRevision: Services.uuid.generateUUID().toString(),
         bodyIndexed: Number(document.bodyIndexed),
         attachmentPresence:
@@ -671,6 +697,14 @@ export class PanoramaSearchIndex {
       { id }
     );
     if (eraseText) {
+      await this.#execute(
+        "INSERT INTO recovery_erased(documentId) VALUES(:id) ON CONFLICT DO NOTHING",
+        { id }
+      );
+      await this.#execute(
+        "UPDATE recovery_records SET payload=NULL,document=NULL,erased=1 WHERE documentId=:id",
+        { id }
+      );
       await this.#execute("DELETE FROM documents WHERE documentId=:id", { id });
       await this.#execute("DELETE FROM retained_bodies WHERE documentId=:id", {
         id,
@@ -1040,6 +1074,28 @@ export class PanoramaSearchIndex {
         signal
       );
       if (!body || body.contentRevision != metadata.contentRevision) {
+        return false;
+      }
+      const recovered = await this.#execute(
+        "SELECT document FROM recovery_records WHERE documentId=:id AND kind='mail' " +
+          "AND erased=0 AND document IS NOT NULL",
+        { id: job.id },
+        ["document"],
+        signal
+      );
+      // An unchanged MIME body can cross a policy marker after current-source
+      // validation. Recovery is only admitted under its captured policy; do not
+      // let this metadata fast path turn a rejected backup into fresh evidence.
+      if (
+        recovered.some(row => {
+          const source = copyDocument(JSON.parse(row.document));
+          return (
+            source.contentRevision === body.contentRevision &&
+            source.body === body.body &&
+            source.policyRevision !== metadata.policyRevision
+          );
+        })
+      ) {
         return false;
       }
       const document = {
@@ -1464,6 +1520,172 @@ export class PanoramaSearchIndex {
         });
         await this.#execute("UPDATE index_state SET revision=revision+1");
       })
+    );
+  }
+
+  /**
+   * Stores verified recovery records independently of their disposable projection.
+   * A conflicting source revision rejects the whole batch. Erasure is permanent
+   * for this physical identity; retrying an old backup cannot restore its payload.
+   *
+   * @param {{recordId: string, documentId: ?string, kind: string,
+   *   sourceRevision: string, payload: object, document: ?SearchDocument}[]} records -
+   *   Records produced by the receipt-bound mail or quarantined chat caller.
+   * @returns {Promise<void>} Resolves after the complete record batch commits.
+   * @throws {TypeError} For malformed identities, text or revisions.
+   * @throws {Error} For conflicting source revisions or storage failures.
+   */
+  retainRecovery(records) {
+    if (!Array.isArray(records)) {
+      throw new TypeError("Recovery records must be an array");
+    }
+    const ids = new Set();
+    const copies = records.map(record => {
+      if (
+        typeof record.recordId != "string" ||
+        !record.recordId ||
+        ids.has(record.recordId) ||
+        (record.documentId !== null &&
+          (typeof record.documentId != "string" || !record.documentId)) ||
+        !["mail", "chat"].includes(record.kind) ||
+        typeof record.sourceRevision != "string" ||
+        !/^[0-9a-f]{64}$/.test(record.sourceRevision) ||
+        !record.payload ||
+        typeof record.payload != "object"
+      ) {
+        throw new TypeError("Invalid recovery record");
+      }
+      ids.add(record.recordId);
+      const document =
+        record.document === null ? null : copyDocument(record.document);
+      if (
+        document &&
+        (record.kind != "mail" || document.id !== record.documentId)
+      ) {
+        throw new TypeError(
+          "Recovery projection does not match its physical identity"
+        );
+      }
+      return {
+        recordId: record.recordId,
+        documentId: record.documentId,
+        kind: record.kind,
+        sourceRevision: record.sourceRevision,
+        payload: JSON.stringify(record.payload),
+        document: document === null ? null : JSON.stringify(document),
+      };
+    });
+    return this.#enqueue(() =>
+      this.#transaction(async () => {
+        for (const record of copies) {
+          const [old] = await this.#execute(
+            "SELECT sourceRevision,documentId,kind FROM recovery_records WHERE recordId=:recordId",
+            { recordId: record.recordId },
+            ["sourceRevision", "documentId", "kind"]
+          );
+          if (
+            old &&
+            (old.sourceRevision !== record.sourceRevision ||
+              old.documentId !== record.documentId ||
+              old.kind !== record.kind)
+          ) {
+            throw new Error("Recovered source or physical binding changed");
+          }
+          await this.#execute(
+            "INSERT INTO recovery_records(recordId,documentId,kind,sourceRevision,payload,document,erased) " +
+              "VALUES(:recordId,:documentId,:kind,:sourceRevision," +
+              "CASE WHEN EXISTS(SELECT 1 FROM recovery_erased WHERE documentId=:documentId) THEN NULL ELSE :payload END," +
+              "CASE WHEN EXISTS(SELECT 1 FROM recovery_erased WHERE documentId=:documentId) THEN NULL ELSE :document END," +
+              "EXISTS(SELECT 1 FROM recovery_erased WHERE documentId=:documentId)) " +
+              "ON CONFLICT(recordId) DO NOTHING",
+            record
+          );
+        }
+      })
+    );
+  }
+
+  /**
+   * Reads persisted recovery records, including explicit quarantine and erasure.
+   * This is not an eligibility grant and never reads the FTS table.
+   *
+   * @param {?string} [documentId=null] - Optional exact physical document identity.
+   * @returns {Promise<object[]>} Owned raw/provenance records; erased payloads are null.
+   */
+  getRecoveryRecords(documentId = null) {
+    if (documentId !== null && typeof documentId != "string") {
+      throw new TypeError("Invalid recovery lookup identity");
+    }
+    return this.#enqueue(async () => {
+      const rows = await this.#execute(
+        "SELECT recordId,documentId,kind,sourceRevision,payload,erased FROM recovery_records " +
+          (documentId === null ? "" : "WHERE documentId=:documentId ") +
+          "ORDER BY recordId",
+        documentId === null ? {} : { documentId },
+        [
+          "recordId",
+          "documentId",
+          "kind",
+          "sourceRevision",
+          "payload",
+          "erased",
+        ]
+      );
+      return rows.map(row => ({
+        ...row,
+        payload: row.payload === null ? null : JSON.parse(row.payload),
+        erased: !!row.erased,
+      }));
+    });
+  }
+
+  /**
+   * Loads recovered text only for its still-current native content and policy.
+   * Metadata-only generation changes may reuse the same content revision.
+   *
+   * @param {string} id - Exact physical mail key.
+   * @param {AbortSignal} [signal] - Cancels lookup and delivery.
+   * @returns {Promise<?SearchDocument>} A current projection, or null for quarantine/stale/erased data.
+   * @throws {Error} For conflicting sources, native lookup or storage failures.
+   */
+  getRecoveredText(id, signal) {
+    return withAbort(
+      this.#enqueue(async () => {
+        signal?.throwIfAborted();
+        const rows = await this.#execute(
+          "SELECT document FROM recovery_records WHERE documentId=:id AND kind='mail' " +
+            "AND erased=0 AND document IS NOT NULL",
+          { id },
+          ["document"],
+          signal
+        );
+        const state = await this.#resolveDocument(id, signal);
+        signal?.throwIfAborted();
+        if (state?.eligible !== true) {
+          return null;
+        }
+        const candidates = rows
+          .map(row => copyDocument(JSON.parse(row.document)))
+          .filter(
+            document =>
+              document.contentRevision === state.contentRevision &&
+              document.policyRevision === (state.policyRevision ?? 0)
+          );
+        if (!candidates.length) {
+          return null;
+        }
+        if (
+          candidates.some(
+            document =>
+              document.body !== candidates[0].body ||
+              document.attachmentNames !== candidates[0].attachmentNames
+          )
+        ) {
+          throw new Error("Conflicting recovered semantic sources");
+        }
+        return { ...candidates[0], generation: state.generation };
+      }),
+      signal
     );
   }
 

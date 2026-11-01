@@ -355,7 +355,9 @@ async function assertCommitted(input) {
       [imported.get(3), 0],
     ]
   );
-  Assert.deepEqual(input.folder.msgDatabase.getNewList(), [imported.get(3)]);
+  const readKey = imported.get(1);
+  const unreadKey = imported.get(3);
+  const newKeys = new Set(input.folder.msgDatabase.getNewList());
   const expected = [
     [1, "162378@invalid", "0", 578, "Secured value-added orchestration"],
     [3, "345692@invalid", "1143", 375, "Intuitive full-range analyzer"],
@@ -402,7 +404,10 @@ async function assertCommitted(input) {
     headers.get(imported.get(1)).date,
     new Date("2000-07-01T23:06:00Z").valueOf() * 1000
   );
-  Assert.equal(headers.get(imported.get(1)).flags, Ci.nsMsgMessageFlags.Read);
+  const readFlags =
+    Ci.nsMsgMessageFlags.Read |
+    (newKeys.has(readKey) ? Ci.nsMsgMessageFlags.New : 0);
+  Assert.equal(headers.get(readKey).flags, readFlags);
   Assert.equal(
     headers.get(imported.get(1)).getStringProperty("keywords"),
     "$label5"
@@ -416,7 +421,8 @@ async function assertCommitted(input) {
     headers.get(imported.get(3)).date,
     new Date("2022-09-13T05:40:00Z").valueOf() * 1000
   );
-  Assert.equal(headers.get(imported.get(3)).flags, Ci.nsMsgMessageFlags.New);
+  const unreadFlags = newKeys.has(unreadKey) ? Ci.nsMsgMessageFlags.New : 0;
+  Assert.equal(headers.get(unreadKey).flags, unreadFlags);
   Assert.equal(headers.get(imported.get(3)).getStringProperty("keywords"), "");
   Assert.equal(
     messageDB.getMessageProperty(imported.get(1), "sender_name"),
@@ -515,6 +521,12 @@ add_task(async function test_completeReaderCoordinatorNativeImportAndRepeat() {
   await resumeMorkImports(input.journal, target(input));
   Assert.equal(input.journal.state.stage, "validate");
   await assertCommitted(input);
+  const imported = new Map(input.journal.state.sources[0].receipt.keys);
+  Assert.deepEqual(input.folder.msgDatabase.getNewList(), [imported.get(3)]);
+  Assert.equal(
+    input.folder.msgDatabase.getMsgHdrForKey(imported.get(3)).flags,
+    Ci.nsMsgMessageFlags.New
+  );
   Assert.deepEqual(events.added, [], "Import uses native quiet publication");
   const before = destination(input);
   const changes = rows("SELECT total_changes() AS value", ["value"]);
@@ -1104,7 +1116,10 @@ add_task(async function test_projectionReadbackChecksRawFlagsBehindPublicNew() {
       );
       Assert.equal(messageDB.totalCount, count);
       Assert.deepEqual(destination(input), before);
-      Assert.deepEqual(rows("SELECT total_changes() AS value", ["value"]), changes);
+      Assert.deepEqual(
+        rows("SELECT total_changes() AS value", ["value"]),
+        changes
+      );
       Assert.equal(input.journal.state.sources[0].state, "importing");
       Assert.equal(input.journal.state.sources[0].receipt, null);
       Assert.deepEqual(
@@ -1131,7 +1146,10 @@ add_task(async function test_projectionReadbackChecksRawFlagsBehindPublicNew() {
   Assert.deepEqual(destination(input), before);
   Assert.deepEqual(rows("SELECT total_changes() AS value", ["value"]), changes);
   Assert.deepEqual(events.added, []);
-  Assert.deepEqual(await IOUtils.read(input.folder.summaryFile.path), summaryBytes);
+  Assert.deepEqual(
+    await IOUtils.read(input.folder.summaryFile.path),
+    summaryBytes
+  );
   Assert.deepEqual(await IOUtils.read(input.folder.filePath.path), bodyBytes);
   events.close();
 });

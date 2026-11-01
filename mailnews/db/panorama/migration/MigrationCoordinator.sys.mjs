@@ -1150,7 +1150,8 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
       ["subject", expected.subject],
       [
         "flags",
-        (expected.flags | (newKeys.has(key) ? Ci.nsMsgMessageFlags.New : 0)) >>> 0,
+        (expected.flags | (newKeys.has(key) ? Ci.nsMsgMessageFlags.New : 0)) >>>
+          0,
       ],
       ["priority", expected.priority],
       ["charset", expected.charset],

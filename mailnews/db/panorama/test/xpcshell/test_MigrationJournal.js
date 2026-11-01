@@ -394,6 +394,62 @@ add_task(async function test_freshBackupAllowsExactFileByteLowerBound() {
   }
 });
 
+add_task(
+  async function test_freshBackupRefusesInvalidVolumeSpaceBeforeCreatingOutput() {
+    const { sinon } = ChromeUtils.importESModule(
+      "resource://testing-common/Sinon.sys.mjs"
+    );
+    for (const available of [
+      -1,
+      NaN,
+      Infinity,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      const { root, plan } = await migrationFiles();
+      const paths = [
+        PathUtils.join(plan.profilePath, "prefs.js"),
+        plan.sources[0].path,
+        PathUtils.join(plan.mailPaths[0], "Inbox"),
+      ];
+      const originals = await Promise.all(
+        paths.map(path => IOUtils.read(path))
+      );
+      let queries = 0;
+      const space = stubBackupVolumeSpace(sinon, canonicalRoot(root), () => {
+        queries++;
+        return available;
+      });
+      const copy = sinon.spy(
+        Cu.getGlobalForObject(createMigrationBackup).IOUtils,
+        "copy"
+      );
+      try {
+        await Assert.rejects(
+          createMigrationBackup(
+            plan.profilePath,
+            plan.mailPaths,
+            plan.backupPath
+          ),
+          error =>
+            error.name == "Error" &&
+            error.message == "Migration backup free space is unavailable",
+          `An unavailable or inexact volume result (${available}) cannot admit output`
+        );
+        Assert.equal(queries, 1);
+        Assert.equal(copy.callCount, 0);
+        Assert.ok(!(await IOUtils.exists(plan.backupPath)));
+      } finally {
+        copy.restore();
+        space.restore();
+      }
+      for (const [index, path] of paths.entries()) {
+        Assert.deepEqual(await IOUtils.read(path), originals[index]);
+      }
+    }
+  }
+);
+
 add_task(async function test_cancelledBackupRetainsWorkAndResumes() {
   const { sinon } = ChromeUtils.importESModule(
     "resource://testing-common/Sinon.sys.mjs"
@@ -602,6 +658,156 @@ add_task(async function test_inventoryBacksUpNestedExternalRootsOnce() {
   );
   Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
 });
+
+add_task(
+  async function test_inventoryRetainsProfileMetadataAndLockExclusions() {
+    const { plan } = await migrationFiles();
+    const profile = plan.profilePath;
+    const directory = PathUtils.join(profile, "data");
+    const empty = PathUtils.join(directory, "empty");
+    const settings = PathUtils.join(directory, "settings-\u90ae\u4ef6.json");
+    const settingsBytes = new TextEncoder().encode(
+      '{"retained":"profile value"}'
+    );
+    const lock = PathUtils.join(profile, "parent.lock");
+    const lockBytes = new TextEncoder().encode("excluded profile lock");
+    await IOUtils.makeDirectory(empty, { createAncestors: true });
+    await IOUtils.write(settings, settingsBytes, { mode: "create" });
+    await IOUtils.write(lock, lockBytes, { mode: "create" });
+    const parts = [
+      ["data"],
+      ["data", "empty"],
+      ["data", "settings-\u90ae\u4ef6.json"],
+      ["prefs.js"],
+    ];
+    const measured = new Map();
+    for (const components of [[], ...parts]) {
+      const path = PathUtils.join(profile, ...components);
+      const info = await IOUtils.stat(path);
+      measured.set(components.join("/"), {
+        info,
+        sha256:
+          info.type == "regular"
+            ? await IOUtils.computeHexDigest(path, "sha256")
+            : null,
+      });
+    }
+    const receipt = await createMigrationBackup(
+      profile,
+      plan.mailPaths,
+      plan.backupPath
+    );
+    const manifest = await IOUtils.readJSON(receipt.path);
+    const inventory = manifest.roots[0];
+    Assert.equal(inventory.source, canonicalRoot(profile));
+    Assert.deepEqual(inventory.excluded, ["parent.lock"]);
+    Assert.deepEqual(
+      inventory.entries.map(entry => entry.parts.join("/")).toSorted(),
+      parts.map(components => components.join("/")).toSorted(),
+      "Full profile inventory retains empty directories and every non-lock file"
+    );
+    Assert.equal(inventory.permissions, measured.get("").info.permissions);
+    Assert.equal(inventory.lastModified, measured.get("").info.lastModified);
+    for (const entry of inventory.entries) {
+      const expected = measured.get(entry.parts.join("/"));
+      Assert.equal(entry.type, expected.info.type);
+      Assert.equal(entry.permissions, expected.info.permissions);
+      Assert.equal(entry.lastModified, expected.info.lastModified);
+      if (entry.type == "regular") {
+        Assert.equal(entry.size, expected.info.size);
+        Assert.equal(entry.sha256, expected.sha256);
+      }
+      if (AppConstants.platform == "win") {
+        const source = PathUtils.join(profile, ...entry.parts);
+        const lease = admitWindowsMigrationPath(
+          new FileUtils.File(source),
+          entry.type == "directory"
+            ? Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
+            : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+        );
+        try {
+          Assert.deepEqual(entry.physicalIdentity, {
+            version: 1,
+            id: lease.identity,
+            parentId: lease.parentIdentity,
+          });
+        } finally {
+          lease.close();
+        }
+      } else {
+        Assert.ok(!Object.hasOwn(entry, "physicalIdentity"));
+      }
+    }
+    Assert.deepEqual(await IOUtils.read(settings), settingsBytes);
+    Assert.deepEqual(await IOUtils.read(lock), lockBytes);
+    Assert.deepEqual(
+      await IOUtils.read(
+        PathUtils.join(
+          plan.backupPath,
+          "root-0",
+          "data",
+          "settings-\u90ae\u4ef6.json"
+        )
+      ),
+      settingsBytes
+    );
+    Assert.deepEqual(
+      await IOUtils.getChildren(
+        PathUtils.join(plan.backupPath, "root-0", "data", "empty")
+      ),
+      []
+    );
+    Assert.ok(
+      !(await IOUtils.exists(
+        PathUtils.join(plan.backupPath, "root-0", "parent.lock")
+      ))
+    );
+    Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), receipt);
+  }
+);
+
+add_task(async function test_inventoryRejectsOverlappingSourceAndBackupRoots() {
+  const { root, plan } = await migrationFiles();
+  const original = await IOUtils.read(plan.sources[0].path);
+  await Assert.rejects(
+    createMigrationBackup(plan.profilePath, [root], plan.backupPath),
+    error =>
+      error.name == "Error" &&
+      error.message == "External mail root contains the profile"
+  );
+  Assert.ok(!(await IOUtils.exists(plan.backupPath)));
+  const nestedBackup = PathUtils.join(plan.profilePath, "invalid-backup");
+  await Assert.rejects(
+    createMigrationBackup(plan.profilePath, plan.mailPaths, nestedBackup),
+    error =>
+      error.name == "Error" &&
+      error.message == "Backup must be outside migration source trees"
+  );
+  Assert.ok(!(await IOUtils.exists(nestedBackup)));
+  Assert.deepEqual(await IOUtils.read(plan.sources[0].path), original);
+});
+
+add_task(
+  { skip_if: () => AppConstants.platform == "win" },
+  async function test_inventoryRefusesLinkedDescendant() {
+    const { plan } = await migrationFiles();
+    const original = await IOUtils.read(plan.sources[0].path);
+    const link = PathUtils.join(plan.mailPaths[0], "Alias.msf");
+    makeMigrationPathLink(plan.sources[0].path, link);
+    await Assert.rejects(
+      createMigrationBackup(plan.profilePath, plan.mailPaths, plan.backupPath),
+      error =>
+        error.name == "Error" &&
+        error.message == "Migration source or destination contains a link"
+    );
+    Assert.ok(!(await IOUtils.exists(plan.backupPath)));
+    Assert.deepEqual(await IOUtils.read(plan.sources[0].path), original);
+    Assert.ok(
+      new FileUtils.File(link).isSymlink(),
+      "The original link is retained"
+    );
+  }
+);
 
 add_task(async function test_verifiedBackupRestoresProfileAndExternalMail() {
   const { root, plan } = await migrationFiles();

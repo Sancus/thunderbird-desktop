@@ -43,6 +43,13 @@ skip-if = ["os == 'win'"]
 
 ["test_MigrationRecovery.js"]
 
+["test_MigrationWindowsImport.js"]
+run-if = ["os == 'win'"]
+prefs = [
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
+]
+
 ["test_MorkFolderCacheImport.js"]
 support-files = ["../../../../base/test/unit/data/panacea.dat"]
 
@@ -178,6 +185,8 @@ prefs = [
 ["test_perFolderDatabase.js"]
 
 ["test_reconcile.js"]
+
+["test_recoveredSemanticContent.js"]
 
 ["test_relations.js"]
 

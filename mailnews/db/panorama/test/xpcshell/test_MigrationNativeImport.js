@@ -74,6 +74,7 @@ const names = [
   "invalid",
   "insertion",
   "control",
+  "flags",
 ];
 // ProfileCreator takes physical leaves. Native EncodeFilename escapes '%' and
 // '/', and nsMsgBrkMBoxStore discovers these names through DecodeFilename once.
@@ -280,8 +281,8 @@ function destination(input) {
   };
   return {
     messages: rows(
-      "SELECT id,messageId FROM messages WHERE folderId=:folder ORDER BY id",
-      ["id", "messageId"],
+      "SELECT id,messageId,flags FROM messages WHERE folderId=:folder ORDER BY id",
+      ["id", "messageId", "flags"],
       { folder: params.folder }
     ),
     properties: rows(
@@ -343,6 +344,18 @@ async function assertCommitted(input) {
     Array.from(input.folder.messages, h => [h.messageKey, h])
   );
   Assert.equal(headers.size, 2);
+  Assert.deepEqual(
+    rows(
+      "SELECT id,flags FROM messages WHERE folderId=:folder ORDER BY id",
+      ["id", "flags"],
+      { folder: input.folder.id }
+    ),
+    [
+      [imported.get(1), Ci.nsMsgMessageFlags.Read],
+      [imported.get(3), 0],
+    ]
+  );
+  Assert.deepEqual(input.folder.msgDatabase.getNewList(), [imported.get(3)]);
   const expected = [
     [1, "162378@invalid", "0", 578, "Secured value-added orchestration"],
     [3, "345692@invalid", "1143", 375, "Intuitive full-range analyzer"],
@@ -403,7 +416,7 @@ async function assertCommitted(input) {
     headers.get(imported.get(3)).date,
     new Date("2022-09-13T05:40:00Z").valueOf() * 1000
   );
-  Assert.equal(headers.get(imported.get(3)).flags, 0);
+  Assert.equal(headers.get(imported.get(3)).flags, Ci.nsMsgMessageFlags.New);
   Assert.equal(headers.get(imported.get(3)).getStringProperty("keywords"), "");
   Assert.equal(
     messageDB.getMessageProperty(imported.get(1), "sender_name"),
@@ -688,6 +701,7 @@ async function assertReferenceImport(input) {
     )
   );
   const headers = Array.from(input.folder.messages);
+  const newKeys = new Set(input.folder.msgDatabase.getNewList());
   Assert.deepEqual(headers.map(h => h.messageId).sort(), [
     "162378@invalid",
     "345692@invalid",
@@ -723,7 +737,15 @@ async function assertReferenceImport(input) {
       header.date,
       Date.parse(first ? "2000-07-01T23:06:00Z" : "2022-09-13T05:40:00Z") * 1000
     );
-    Assert.equal(header.flags, first ? Ci.nsMsgMessageFlags.Read : 0);
+    const flags = first ? Ci.nsMsgMessageFlags.Read : 0;
+    Assert.deepEqual(
+      rows("SELECT flags FROM messages WHERE id=:id", ["flags"], { id: key }),
+      [[flags]]
+    );
+    Assert.equal(
+      header.flags,
+      (flags | (newKeys.has(key) ? Ci.nsMsgMessageFlags.New : 0)) >>> 0
+    );
     Assert.equal(header.getStringProperty("keywords"), first ? "$label5" : "");
     Assert.equal(header.priority, Ci.nsMsgPriority.none);
     Assert.equal(header.ccList, "");
@@ -1053,6 +1075,66 @@ add_task(
     await assertReferenceImport(input);
   }
 );
+
+add_task(async function test_projectionReadbackChecksRawFlagsBehindPublicNew() {
+  const input = await planned("flags");
+  const events = observe(input);
+  await input.journal.beginImport(input.name);
+  const snapshot = await request(input);
+  const receipt = await database.importFolderSnapshot(input.folder, snapshot);
+  const key = new Map(receipt.keys).get(3);
+  const db = input.folder.msgDatabase;
+  const header = messageDB.getMessage(key);
+  Assert.deepEqual(db.getNewList(), [key]);
+  Assert.equal(header.flags, Ci.nsMsgMessageFlags.New);
+  const count = messageDB.totalCount;
+  for (const flags of [Ci.nsMsgMessageFlags.New, Ci.nsMsgMessageFlags.Marked]) {
+    header.flags = flags;
+    Assert.equal(header.flags, flags | Ci.nsMsgMessageFlags.New);
+    Assert.deepEqual(
+      rows("SELECT flags FROM messages WHERE id=:id", ["flags"], { id: key }),
+      [[flags]]
+    );
+    const before = destination(input);
+    const changes = rows("SELECT total_changes() AS value", ["value"]);
+    try {
+      await Assert.rejects(
+        resumeMorkImports(input.journal, target(input)),
+        /message projection differs: stored flags/
+      );
+      Assert.equal(messageDB.totalCount, count);
+      Assert.deepEqual(destination(input), before);
+      Assert.deepEqual(rows("SELECT total_changes() AS value", ["value"]), changes);
+      Assert.equal(input.journal.state.sources[0].state, "importing");
+      Assert.equal(input.journal.state.sources[0].receipt, null);
+      Assert.deepEqual(
+        database.getFolderImportReceipt(input.folder, snapshot),
+        receipt
+      );
+    } finally {
+      header.flags = 0;
+      db.addToNewList(key);
+    }
+  }
+  // NewList is transient facade state; clearing it must not change the imported
+  // word or prevent recovery of the already committed receipt.
+  db.clearNewList(false);
+  Assert.equal(header.flags, 0);
+  const before = destination(input);
+  const changes = rows("SELECT total_changes() AS value", ["value"]);
+  await resumeMorkImports(input.journal, target(input));
+  Assert.equal(input.journal.state.stage, "validate");
+  Assert.deepEqual(input.journal.state.sources[0].receipt.keys, receipt.keys);
+  Assert.deepEqual(destination(input), before);
+  Assert.deepEqual(rows("SELECT total_changes() AS value", ["value"]), changes);
+  await resumeMorkImports(input.journal, target(input));
+  Assert.deepEqual(destination(input), before);
+  Assert.deepEqual(rows("SELECT total_changes() AS value", ["value"]), changes);
+  Assert.deepEqual(events.added, []);
+  Assert.deepEqual(await IOUtils.read(input.folder.summaryFile.path), summaryBytes);
+  Assert.deepEqual(await IOUtils.read(input.folder.filePath.path), bodyBytes);
+  events.close();
+});
 
 add_task(
   async function test_projectionReadbackRejectsReorderedDuplicateReferences() {

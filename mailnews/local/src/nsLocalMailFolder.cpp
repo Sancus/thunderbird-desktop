@@ -65,6 +65,7 @@
 
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
+#  include "PerFolderDatabase.h"
 #  include "nsMsgLocalStoreUtils.h"
 #  include "mozilla/UniquePtr.h"
 #endif
@@ -2613,52 +2614,6 @@ static nsresult CopyLocalHdrProperties(nsIMsgDBHdr* destHdr,
   return NS_OK;
 }
 
-// Structural fields are separate from GetProperties() in Panorama.
-static nsresult CopyHdrStructure(nsIMsgDBHdr* destHdr, nsIMsgDBHdr* srcHdr) {
-  nsAutoCString value;
-  MOZ_TRY(srcHdr->GetSubject(value));
-  MOZ_TRY(destHdr->SetSubject(value));
-  MOZ_TRY(srcHdr->GetAuthor(value));
-  MOZ_TRY(destHdr->SetAuthor(value));
-  MOZ_TRY(srcHdr->GetRecipients(value));
-  MOZ_TRY(destHdr->SetRecipients(value));
-  MOZ_TRY(srcHdr->GetCcList(value));
-  MOZ_TRY(destHdr->SetCcList(value));
-  MOZ_TRY(srcHdr->GetBccList(value));
-  MOZ_TRY(destHdr->SetBccList(value));
-  MOZ_TRY(srcHdr->GetMessageId(value));
-  MOZ_TRY(destHdr->SetMessageId(value));
-
-  PRTime date;
-  MOZ_TRY(srcHdr->GetDate(&date));
-  MOZ_TRY(destHdr->SetDate(date));
-  uint32_t flags;
-  MOZ_TRY(srcHdr->GetFlags(&flags));
-  MOZ_TRY(destHdr->SetFlags(flags & ~nsMsgMessageFlags::Offline));
-  nsMsgPriorityValue priority;
-  MOZ_TRY(srcHdr->GetPriority(&priority));
-  MOZ_TRY(destHdr->SetPriority(priority));
-  MOZ_TRY(srcHdr->GetStringProperty("keywords", value));
-  MOZ_TRY(destHdr->SetStringProperty("keywords", value));
-
-  uint16_t count;
-  MOZ_TRY(srcHdr->GetNumReferences(&count));
-  nsTArray<nsCString> references;
-  nsAutoCString serialized;
-  for (uint16_t i = 0; i < count; ++i) {
-    MOZ_TRY(srcHdr->GetStringReference(i, value));
-    references.AppendElement(value);
-    serialized.Append('<');
-    serialized.Append(value);
-    serialized.AppendLiteral("> ");
-  }
-  // The detached setter uses this parser. Reject a lossy reconstruction before
-  // opening the destination stream.
-  if (ParseIdentificationFields(serialized) != references) {
-    return NS_ERROR_ILLEGAL_VALUE;
-  }
-  return destHdr->SetReferences(serialized);
-}
 #endif
 
 nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
@@ -2677,27 +2632,23 @@ nsresult nsMsgLocalMailFolder::InitCopyMsgHdrAndFileStream() {
   // NOTE: you can copy into folders without a database... (sigh).
   // See also test_copyToInvalidDB.js.
   if (mCopyState->m_destDB) {
-    rv = mCopyState->m_destDB->CreateNewHdr(
-        getter_AddRefs(mCopyState->m_newHdr));
-    NS_ENSURE_SUCCESS(rv, checked(rv));
 #ifdef MOZ_PANORAMA
     if (mail_panorama_enabled_AtStartup() && !mCopyState->m_parseMsgState &&
         mCopyState->m_curCopyIndex < mCopyState->m_messages.Length()) {
-      rv = CopyHdrStructure(mCopyState->m_newHdr,
-                            mCopyState->m_messages[mCopyState->m_curCopyIndex]);
-      if (NS_SUCCEEDED(rv)) {
-        rv = CopyLocalHdrProperties(
-            mCopyState->m_newHdr,
-            mCopyState->m_messages[mCopyState->m_curCopyIndex], EmptyCString());
-      }
-      if (NS_FAILED(rv)) {
-        mCopyState->m_newHdr = nullptr;
-        mCopyState->m_writeFailed = true;
-        mCopyState->m_copyError = rv;
-        return rv;
-      }
-    }
+      // Public reference getters filter the stored sequence. Clone native
+      // metadata without source storage, then fill it from the finished copy.
+      auto* database = static_cast<mozilla::mailnews::PerFolderDatabase*>(
+          mCopyState->m_destDB.get());
+      rv = database->CopyHdrForStore(
+          mCopyState->m_messages[mCopyState->m_curCopyIndex], false,
+          getter_AddRefs(mCopyState->m_newHdr));
+    } else
 #endif
+    {
+      rv = mCopyState->m_destDB->CreateNewHdr(
+          getter_AddRefs(mCopyState->m_newHdr));
+    }
+    NS_ENSURE_SUCCESS(rv, checked(rv));
   }
 
 #ifdef MOZ_PANORAMA

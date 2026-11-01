@@ -1074,6 +1074,44 @@ NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
   return NS_OK;
 }
 
+nsresult PerFolderDatabase::CopyHdrForStore(nsIMsgDBHdr* existingHdr,
+                                            bool preserveMessageSize,
+                                            nsIMsgDBHdr** draft) {
+  NS_ENSURE_ARG_POINTER(draft);
+  *draft = nullptr;
+  NS_ENSURE_ARG(existingHdr);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+
+  nsCOMPtr<nsIMsgDBHdr> copy;
+  MOZ_TRY(CopyHdrFromExistingHdr(nsMsgKey_None, existingHdr, false,
+                                 getter_AddRefs(copy)));
+  // Source getters can reenter while collecting the metadata.
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<DetachedMsgHdr> native = do_QueryObject(copy);
+  NS_ENSURE_TRUE(native, NS_ERROR_UNEXPECTED);
+  RawHdr& raw = native->mRaw;
+  raw.storeToken = Nothing();
+  raw.offlineMessageSize = Nothing();
+  raw.lineCount = Nothing();
+  if (!preserveMessageSize) {
+    raw.messageSize = Nothing();
+  }
+  raw.flags &= ~nsMsgMessageFlags::Offline;
+  raw.extras.RemoveElementsBy([preserveMessageSize](const auto& extra) {
+    return extra.k.EqualsLiteral("storeToken") ||
+           extra.k.EqualsLiteral("offlineMessageSize") ||
+           extra.k.EqualsLiteral("lineCount") ||
+           extra.k.EqualsLiteral("msgOffset") ||
+           extra.k.EqualsLiteral("uidOnServer") ||
+           (!preserveMessageSize && extra.k.EqualsLiteral("messageSize"));
+  });
+  copy.forget(draft);
+  return NS_OK;
+}
+
 NS_IMETHODIMP PerFolderDatabase::AddMsgHdr(RawHdr* msg, bool notify,
                                            nsIMsgDBHdr** newHdr) {
   NS_ENSURE_ARG(msg);

@@ -225,6 +225,29 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
 }
 
 /**
+ * Reads the complete stored reference sequence without the public header filter.
+ *
+ * @param {nsIDatabaseCore} database - Native database containing the message.
+ * @param {number} key - Physical message key.
+ * @returns {string[]} Stored references in their original order.
+ */
+function readStoredCopyReferences(database, key) {
+  const statement = database.connectionForTests.createStatement(
+    "SELECT token FROM message_references WHERE id = :id ORDER BY ordinal"
+  );
+  statement.params.id = key;
+  const references = [];
+  try {
+    while (statement.executeStep()) {
+      references.push(statement.row.token);
+    }
+  } finally {
+    statement.finalize();
+  }
+  return references;
+}
+
+/**
  * Copy or move one local message between different real store implementations.
  *
  * @param {string} sourceStore - Source provider contract ID.
@@ -290,7 +313,9 @@ async function checkCrossStoreTransfer(sourceStore, destinationStore, isMove) {
       "To: recipient@example.invalid\r\n" +
       "Date: Tue, 01 Jan 2019 00:00:00 +0000\r\n" +
       `Message-ID: <${id}@cross-store.invalid>\r\n` +
-      "References: <first@example.invalid> <second@example.invalid>\r\n" +
+      (native
+        ? `References: <first@example.invalid> <${id}@cross-store.invalid> <second@example.invalid> <first@example.invalid>\r\n`
+        : "References: <first@example.invalid> <second@example.invalid>\r\n") +
       `Subject: ${id}\r\n\r\nExact ${id} body.\r\n`;
     const selected = source.addMessage(raw("selected"));
     source.markMessagesRead([selected], true);
@@ -303,29 +328,106 @@ async function checkCrossStoreTransfer(sourceStore, destinationStore, isMove) {
       selected.setStringProperty("size", "0007 text");
       selected.setStringProperty("numLines", "0011 text");
       selected.setStringProperty("offlineMsgSize", "0013 text");
+      selected.setStringProperty("msgOffset", isMove ? "0007" : "");
+      selected.setStringProperty("uidOnServer", "00041");
+      selected.setStringProperty("UidOnServer", "0017 text");
     }
     const kept = source.addMessage(raw("unselected"));
     const prior = destination.addMessage(raw("preexisting"));
     const before = snapshot(source, selected);
     const bystander = snapshot(source, kept);
     const existing = snapshot(destination, prior);
+    const references = [
+      "first@example.invalid",
+      before.id,
+      "second@example.invalid",
+      "first@example.invalid",
+    ];
+    const core = native ? database.QueryInterface(Ci.nsIDatabaseCore) : null;
+    if (native) {
+      Assert.deepEqual(readStoredCopyReferences(core, before.key), references);
+      Assert.ok([...selected.properties].includes("msgOffset"));
+      Assert.equal(selected.getStringProperty("uidOnServer"), "00041");
+    }
+    let publications = 0;
+    const notification = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged() {},
+      onHdrDeleted() {},
+      onParentChanged() {},
+      onAnnouncerGoingAway() {},
+      onReadChanged() {},
+      onJunkScoreChanged() {},
+      onHdrPropertyChanged() {},
+      onEvent() {},
+      onHdrAdded(header) {
+        if (header.folder != destination || header.messageId != before.id) {
+          return;
+        }
+        publications++;
+        Assert.deepEqual(
+          readStoredCopyReferences(core, header.messageKey),
+          references
+        );
+        const properties = [...header.properties];
+        Assert.ok(!properties.includes("msgOffset"));
+        Assert.ok(!properties.includes("uidOnServer"));
+        Assert.ok(properties.includes("UidOnServer"));
+        Assert.equal(header.getStringProperty("UidOnServer"), "0017 text");
+        Assert.ok(!properties.includes("crossStoreAbsent"));
+        Assert.ok(properties.includes("crossStoreEmpty"));
+        for (const name of [
+          "storeToken",
+          "messageSize",
+          "offlineMessageSize",
+          "lineCount",
+        ]) {
+          Assert.ok(
+            properties.includes(name),
+            `${name} is known at publication`
+          );
+        }
+        Assert.notEqual(header.storeToken, "");
+        Assert.equal(header.messageSize, before.size);
+        Assert.equal(header.offlineMessageSize, 0);
+        Assert.equal(header.lineCount, 1);
+        Assert.equal(header.flags & Ci.nsMsgMessageFlags.Offline, 0);
+        Assert.equal(
+          mailTestUtils.loadMessageToString(destination, header),
+          before.body
+        );
+      },
+    };
     const stops = [];
     const listener = new PromiseTestUtils.PromiseCopyListener({
       onStopCopy(status) {
         stops.push(status);
       },
     });
-    MailServices.copy.copyMessages(
-      source,
-      [selected],
-      destination,
-      isMove,
-      listener,
-      null,
-      false
-    );
-    await listener.promise;
+    const destinationDB = destination.msgDatabase;
+    if (native) {
+      destinationDB.addListener(notification);
+    }
+    try {
+      MailServices.copy.copyMessages(
+        source,
+        [selected],
+        destination,
+        isMove,
+        listener,
+        null,
+        false
+      );
+      await listener.promise;
+    } finally {
+      if (native) {
+        destinationDB.removeListener(notification);
+      }
+    }
     Assert.deepEqual(stops, [Cr.NS_OK]);
+    if (native) {
+      Assert.equal(publications, 1);
+    }
     // CopyMessages does not promise the CopyFileMessage-only SetMessageKey hook.
     const copied = [...destination.messages].find(
       header => header.messageId == before.id
@@ -358,10 +460,19 @@ async function checkCrossStoreTransfer(sourceStore, destinationStore, isMove) {
       Assert.equal(copied.getStringProperty("size"), "0007 text");
       Assert.equal(copied.getStringProperty("numLines"), "0011 text");
       Assert.equal(copied.getStringProperty("offlineMsgSize"), "0013 text");
+      Assert.ok(![...copied.properties].includes("msgOffset"));
+      Assert.equal(copied.lineCount, 1);
+      Assert.deepEqual(
+        readStoredCopyReferences(core, copied.messageKey),
+        references
+      );
     }
-    Assert.equal(copied.numReferences, 2);
+    Assert.equal(copied.numReferences, native ? 3 : 2);
     Assert.equal(copied.getStringReference(0), "first@example.invalid");
     Assert.equal(copied.getStringReference(1), "second@example.invalid");
+    if (native) {
+      Assert.equal(copied.getStringReference(2), "first@example.invalid");
+    }
     Assert.deepEqual(
       snapshot(destination, destination.GetMessageHeader(existing.key)),
       existing
@@ -381,6 +492,12 @@ async function checkCrossStoreTransfer(sourceStore, destinationStore, isMove) {
       bystander
     );
     if (!isMove) {
+      if (native) {
+        Assert.equal(
+          source.GetMessageHeader(before.key).getStringProperty("uidOnServer"),
+          "00041"
+        );
+      }
       Assert.deepEqual(
         snapshot(source, source.GetMessageHeader(before.key)),
         before

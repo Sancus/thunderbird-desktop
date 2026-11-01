@@ -71,6 +71,11 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
 
   uint64_t FolderId() { return mFolderId; }
 
+  // Copy metadata without source storage identity into an unpublished draft.
+  // Local writes replace messageSize; uncached queued copies may retain it.
+  nsresult CopyHdrForStore(nsIMsgDBHdr* existingHdr, bool preserveMessageSize,
+                           nsIMsgDBHdr** draft);
+
   // Same-key completion from the actual parsed CreateNewHdr draft.
   // Once claimed, a failure seals the draft; caller retains finished bytes.
   nsresult CompletePartialHdr(const MessageBodyState& expected,

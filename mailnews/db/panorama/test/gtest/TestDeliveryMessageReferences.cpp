@@ -1163,6 +1163,180 @@ TEST_F(DeliveryHeaderProperties, DetachedUint32RetainsTypedStorage) {
             draft->GetUint32Property("delivery.number", nullptr));
 }
 
+TEST_F(DeliveryCompleteHeader, LocalStoreCopyExcludesStoragePresence) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("self@store-copy.invalid"_ns));
+  ASSERT_EQ(NS_OK,
+            source->SetReferences("<first@invalid> <self@store-copy.invalid> "
+                                  "<unresolved@invalid> <first@invalid>"_ns));
+  ASSERT_EQ(NS_OK, source->SetFlags(nsMsgMessageFlags::Read |
+                                    nsMsgMessageFlags::Offline));
+  ASSERT_EQ(NS_OK, source->SetMessageSize(0));
+  ASSERT_EQ(NS_OK, source->SetStoreToken(EmptyCString()));
+  ASSERT_EQ(NS_OK, source->SetOfflineMessageSize(0));
+  ASSERT_EQ(NS_OK, source->SetLineCount(0));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("msgOffset", EmptyCString()));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("size", "0007"_ns));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("numLines", "literal-lines"_ns));
+  ASSERT_EQ(NS_OK,
+            source->SetStringProperty("offlineMsgSize", "literal-size"_ns));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("custom.empty", EmptyCString()));
+
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, false, getter_AddRefs(draft)));
+  ASSERT_TRUE(draft);
+  bool isLive = true;
+  ASSERT_EQ(NS_OK, draft->GetIsLive(&isLive));
+  EXPECT_FALSE(isLive);
+  nsMsgKey key = 1;
+  ASSERT_EQ(NS_OK, draft->GetMessageKey(&key));
+  EXPECT_EQ(nsMsgKey_None, key);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, draft->GetProperties(names));
+  for (const auto& name :
+       {"storeToken"_ns, "messageSize"_ns, "offlineMessageSize"_ns,
+        "lineCount"_ns, "msgOffset"_ns}) {
+    EXPECT_FALSE(names.Contains(name)) << name.get();
+  }
+  nsAutoCString text;
+  for (const auto& name :
+       {"size"_ns, "numLines"_ns, "offlineMsgSize"_ns, "custom.empty"_ns}) {
+    EXPECT_TRUE(names.Contains(name)) << name.get();
+  }
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("size", text));
+  EXPECT_EQ("0007"_ns, text);
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("numLines", text));
+  EXPECT_EQ("literal-lines"_ns, text);
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("offlineMsgSize", text));
+  EXPECT_EQ("literal-size"_ns, text);
+  ASSERT_EQ(NS_OK, draft->GetStringProperty("custom.empty", text));
+  EXPECT_TRUE(text.IsEmpty());
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, draft->GetFlags(&flags));
+  EXPECT_EQ(nsMsgMessageFlags::Read, flags);
+
+  nsCOMPtr<nsIMsgDBHdr> live;
+  ASSERT_EQ(NS_OK, db->AttachHdr(draft, false, getter_AddRefs(live)));
+  ASSERT_EQ(NS_OK, live->GetMessageKey(&key));
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, references));
+  const nsTArray<nsCString> expected = {
+      "first@invalid"_ns, "self@store-copy.invalid"_ns, "unresolved@invalid"_ns,
+      "first@invalid"_ns};
+  EXPECT_EQ(expected, references);
+  ASSERT_EQ(NS_OK, live->GetProperties(names));
+  EXPECT_FALSE(names.Contains("msgOffset"_ns));
+  EXPECT_FALSE(names.Contains("storeToken"_ns));
+  EXPECT_FALSE(names.Contains("messageSize"_ns));
+  ASSERT_EQ(NS_OK, source->GetProperties(names));
+  EXPECT_TRUE(names.Contains("msgOffset"_ns));
+  EXPECT_TRUE(names.Contains("storeToken"_ns));
+  EXPECT_TRUE(names.Contains("messageSize"_ns));
+  ASSERT_EQ(NS_OK, source->GetFlags(&flags));
+  EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Offline, flags);
+}
+
+TEST_F(DeliveryCompleteHeader, UncachedStoreCopyKeepsLogicalMessageSize) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("uncached@store-copy.invalid"_ns));
+  ASSERT_EQ(NS_OK, source->SetMessageSize(12345));
+  ASSERT_EQ(NS_OK, source->SetStoreToken("source-token"_ns));
+  ASSERT_EQ(NS_OK, source->SetOfflineMessageSize(17));
+  ASSERT_EQ(NS_OK, source->SetLineCount(9));
+  ASSERT_EQ(NS_OK, source->SetFlags(nsMsgMessageFlags::Marked |
+                                    nsMsgMessageFlags::Offline));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("msgOffset", "0007"_ns));
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, true, getter_AddRefs(draft)));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, draft->GetProperties(names));
+  EXPECT_TRUE(names.Contains("messageSize"_ns));
+  for (const auto& name : {"storeToken"_ns, "offlineMessageSize"_ns,
+                           "lineCount"_ns, "msgOffset"_ns}) {
+    EXPECT_FALSE(names.Contains(name)) << name.get();
+  }
+  uint32_t value;
+  ASSERT_EQ(NS_OK, draft->GetMessageSize(&value));
+  EXPECT_EQ(12345u, value);
+  ASSERT_EQ(NS_OK, draft->GetFlags(&value));
+  EXPECT_EQ(nsMsgMessageFlags::Marked, value);
+  ASSERT_EQ(NS_OK, draft->SetSubject("editable destination"_ns));
+  ASSERT_EQ(NS_OK, source->GetOfflineMessageSize(&value));
+  EXPECT_EQ(17u, value);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+}
+
+TEST_F(DeliveryCompleteHeader, StoreCopyDoesNotCloneServerUidBinding) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("server-uid@store-copy.invalid"_ns));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("uidOnServer", "1"_ns));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("UidOnServer", "literal-case"_ns));
+  for (bool preserveMessageSize : {false, true}) {
+    nsCOMPtr<nsIMsgDBHdr> draft;
+    ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, preserveMessageSize,
+                                         getter_AddRefs(draft)));
+    nsTArray<nsCString> names;
+    ASSERT_EQ(NS_OK, draft->GetProperties(names));
+    EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+    EXPECT_TRUE(names.Contains("UidOnServer"_ns));
+    nsAutoCString text;
+    ASSERT_EQ(NS_OK, draft->GetStringProperty("UidOnServer", text));
+    EXPECT_EQ("literal-case"_ns, text);
+  }
+  nsCOMPtr<nsIMsgDBHdr> generic;
+  ASSERT_EQ(NS_OK, db->CopyHdrFromExistingHdr(nsMsgKey_None, source, false,
+                                              getter_AddRefs(generic)));
+  nsAutoCString text;
+  ASSERT_EQ(NS_OK, generic->GetStringProperty("uidOnServer", text));
+  EXPECT_EQ("1"_ns, text);
+  ASSERT_EQ(NS_OK, source->GetStringProperty("uidOnServer", text));
+  EXPECT_EQ("1"_ns, text);
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+  EXPECT_TRUE(keys.IsEmpty());
+}
+
+TEST_F(DeliveryCompleteHeader, StoreCopyRejectsStaleAndClosedDestination) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("source-guard@store-copy.invalid"_ns));
+  nsCOMPtr<nsIMsgDBHdr> draft = source;
+  EXPECT_EQ(NS_ERROR_NULL_POINTER, db->CopyHdrForStore(source, false, nullptr));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->CopyHdrForStore(nullptr, false, getter_AddRefs(draft)));
+  EXPECT_FALSE(draft);
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId = "
+                       "'{7a139b24-9c50-47fa-8322-168da90748c0}'"_ns));
+  draft = source;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->CopyHdrForStore(source, true, getter_AddRefs(draft)));
+  EXPECT_FALSE(draft);
+  bool inTransaction = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&inTransaction));
+  EXPECT_TRUE(inTransaction);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  draft = source;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->CopyHdrForStore(source, false, getter_AddRefs(draft)));
+  EXPECT_FALSE(draft);
+  CheckNoTransaction();
+}
+
 TEST_F(DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   nsCOMPtr<nsIMsgDBHdr> draft;

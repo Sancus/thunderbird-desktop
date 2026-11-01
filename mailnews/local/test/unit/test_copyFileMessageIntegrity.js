@@ -80,13 +80,51 @@ async function copyFileInto(subName, contents) {
   return dest;
 }
 
+/**
+ * Runs file-copy assertions with the selected real local store, then cleans up.
+ *
+ * @param {string} store - Provider contract ID.
+ * @param {Function} body - Assertions to run with the local account loaded.
+ * @returns {Promise<void>} Resolves after account and preference cleanup.
+ */
 async function withLocalAccount(store, body) {
-  Services.prefs.setCharPref("mail.serverDefaultStoreContractID", store);
-  localAccountUtils.loadLocalMailAccount();
+  const prefs = [
+    "mail.serverDefaultStoreContractID",
+    "mail.server.default.storeContractID",
+  ].map(name => ({
+    name,
+    hadValue: Services.prefs.prefHasUserValue(name),
+    value: Services.prefs.getCharPref(name, ""),
+  }));
   try {
+    localAccountUtils.clearAll();
+    for (const { name } of prefs) {
+      Services.prefs.setCharPref(name, store);
+    }
+    localAccountUtils.loadLocalMailAccount();
+    const type = store.includes("maildirstore") ? "maildir" : "mbox";
+    Assert.equal(localAccountUtils.incomingServer.msgStore.storeType, type);
+    Assert.equal(localAccountUtils.inboxFolder.msgStore.storeType, type);
+    const database = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    Assert.equal(
+      "nsIDatabaseCore" in Ci && database instanceof Ci.nsIDatabaseCore,
+      Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    );
     await body();
   } finally {
-    localAccountUtils.clearAll();
+    try {
+      localAccountUtils.clearAll();
+    } finally {
+      for (const { name, hadValue, value } of prefs) {
+        if (hadValue) {
+          Services.prefs.setCharPref(name, value);
+        } else {
+          Services.prefs.clearUserPref(name);
+        }
+      }
+    }
   }
 }
 

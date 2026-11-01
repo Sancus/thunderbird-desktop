@@ -288,3 +288,95 @@ add_task(async function testSaveLarge() {
 
   await BrowserTestUtils.closeWindow(composeWindow);
 });
+
+add_task(async function test_progressFailurePreservesOriginalStatus() {
+  let unavailableTaskbar;
+  let registered = false;
+  if (AppConstants.platform == "win") {
+    unavailableTaskbar = MockRegistrar.register(
+      "@mozilla.org/windows-taskbar;1",
+      {
+        QueryInterface: ChromeUtils.generateQI(["nsIWinTaskbar"]),
+        available: false,
+        getTaskbarProgress() {
+          Assert.ok(false, "An unavailable taskbar must not be requested");
+          throw Components.Exception(
+            "Taskbar unavailable",
+            Cr.NS_ERROR_NOT_AVAILABLE
+          );
+        },
+      }
+    );
+    registered = true;
+  }
+  registerCleanupFunction(() => {
+    if (registered) {
+      MockRegistrar.unregister(unavailableTaskbar);
+    }
+  });
+  const { composeWindow } = await newComposeWindow(
+    smtpIdentity,
+    "Queue failure status."
+  );
+  let closed = false;
+  registerCleanupFunction(async () => {
+    if (!closed && !composeWindow.closed) {
+      await BrowserTestUtils.closeWindow(composeWindow);
+    }
+  });
+  const { TaskbarProgress } = ChromeUtils.importESModule(
+    "resource:///modules/TaskbarProgress.sys.mjs"
+  );
+  const progress = TaskbarProgress.getTaskbarProgress(composeWindow);
+  if (AppConstants.platform == "win") {
+    Assert.equal(progress, null, "The unavailable Windows taskbar is optional");
+  } else {
+    Assert.ok(
+      progress,
+      "The existing platform progress mock remains available"
+    );
+  }
+  gProgressEvents.length = 0;
+  let completions = 0;
+  const observe = subject => {
+    if (subject.wrappedJSObject.composeWindow == composeWindow) {
+      completions++;
+    }
+  };
+  Services.obs.addObserver(observe, "mail:composeSendProgressStop");
+  registerCleanupFunction(() =>
+    Services.obs.removeObserver(observe, "mail:composeSendProgressStop")
+  );
+  const stopped = progressStopPromise(composeWindow);
+  composeWindow.progressListener.onStateChange(
+    null,
+    null,
+    Ci.nsIWebProgressListener.STATE_START,
+    Cr.NS_OK
+  );
+  composeWindow.progressListener.onStateChange(
+    null,
+    null,
+    Ci.nsIWebProgressListener.STATE_STOP,
+    Cr.NS_ERROR_FAILURE
+  );
+  const [subject] = await stopped;
+  Assert.equal(subject.wrappedJSObject.status, Cr.NS_ERROR_FAILURE);
+  Assert.equal(completions, 1, "The original failed operation completes once");
+  Assert.deepEqual(
+    gProgressEvents.map(event => event.state),
+    AppConstants.platform == "win"
+      ? []
+      : [
+          Ci.nsITaskbarProgress.STATE_NORMAL,
+          Ci.nsITaskbarProgress.STATE_NO_PROGRESS,
+        ],
+    "Available progress surfaces update; unavailable surfaces are not requested"
+  );
+  await BrowserTestUtils.closeWindow(composeWindow);
+  closed = true;
+  if (registered) {
+    MockRegistrar.unregister(unavailableTaskbar);
+    registered = false;
+  }
+});

@@ -186,7 +186,7 @@ async function stopServer() {
     data.identity = identity.key;
     data.sent = root.createLocalSubfolder("S375Sent").URI;
     data.control = root.createLocalSubfolder("S375Control").URI;
-    identity.fccFolder = data.sent;
+    identity.fccFolderURI = data.sent;
     MailServices.accounts.setSpecialFolders();
     const later = Cc["@mozilla.org/messengercompose/sendlater;1"].getService(
       Ci.nsIMsgSendLater
@@ -457,5 +457,10 @@ async function stopServer() {
   throw new Error(`Unknown send-later test action: ${action}`);
 })().then(
   value => done({ value }),
-  error => done({ error: String(error), stack: error.stack })
+  error =>
+    done({
+      error: String(error),
+      stack: error.stack,
+      fixture: action == "setup" ? owner.s375Fixture : null,
+    })
 );

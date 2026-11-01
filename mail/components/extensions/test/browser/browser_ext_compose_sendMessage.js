@@ -904,7 +904,7 @@ async function checkImapFcc(retry) {
   const identity = addIdentity(account, "imap-fcc@example.invalid");
   identity.smtpServerKey = gPopAccount.defaultIdentity.smtpServerKey;
   identity.doFcc = true;
-  identity.fccFolder = sent.URI;
+  identity.fccFolderURI = sent.URI;
   const subject = retry
     ? "IMAP FCC after rejected APPEND"
     : "Configured IMAP FCC";

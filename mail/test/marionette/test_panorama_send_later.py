@@ -17,56 +17,62 @@ class TestPanoramaSendLater(MarionetteTestCase):
         self.fixture = None
         self.saved_prefs = {}
         self.instance_prefs = self.marionette.instance.prefs
-        self.addCleanup(self.restore)
-        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
-        self.initial_profile = self.marionette.execute_script(
-            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
-        )
-        prefs = {
-            "mail.panorama.enabled": True,
-            "mailnews.database.global.indexer.enabled": False,
-            "mailnews.sendInBackground": False,
-            "mailnews.sendLater.send_on_quit": False,
-        }
-        for name, value in prefs.items():
-            self.saved_prefs[name] = {
-                "user": self.marionette.execute_script(
-                    "return Services.prefs.prefHasUserValue(arguments[0]);",
-                    script_args=[name],
-                ),
-                "value": self.marionette.get_pref(name),
+        self.restored = False
+        try:
+            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+            self.initial_profile = self.marionette.execute_script(
+                "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+            )
+            prefs = {
+                "mail.panorama.enabled": True,
+                "mailnews.database.global.indexer.enabled": False,
+                "mailnews.sendInBackground": False,
+                "mailnews.sendLater.send_on_quit": False,
             }
-            self.marionette.set_pref(name, value)
-        self.marionette.instance.prefs = {**(self.instance_prefs or {}), **prefs}
-        self.restart_same_profile()
-        result = self.perform("setup")
-        self.fixture = result["fixture"]
-        self.before = result["snapshot"]
-        self.assertEqual([{"count": 1, "status": 0}] * 2, result["completions"])
-        self.assert_backend(self.before)
-        self.assertEqual(2, len(self.before["queue"]))
-        self.assertEqual([], self.before["sent"])
-        self.assertEqual(1, len(self.before["control"]))
-        for n, header in enumerate(self.before["queue"], 1):
-            self.assertEqual(self.fixture["outbox"], header["folderURI"])
-            self.assertEqual(f"s375-queue-{n}@example.invalid", header["messageId"])
-            self.assertEqual(f"S375 queued message {n}", header["subject"])
-            self.assertIn(f"S375 exact queued body {n}.", header["raw"])
-            self.assertIn("queued-s375@example.invalid", header["author"])
-        self.assertEqual(
-            self.before["queue"][0]["messageId"],
-            self.before["control"][0]["messageId"],
-        )
-        self.assertNotEqual(
-            self.before["queue"][0]["folderURI"],
-            self.before["control"][0]["folderURI"],
-        )
+            for name, value in prefs.items():
+                self.saved_prefs[name] = {
+                    "user": self.marionette.execute_script(
+                        "return Services.prefs.prefHasUserValue(arguments[0]);",
+                        script_args=[name],
+                    ),
+                    "value": self.marionette.get_pref(name),
+                }
+                self.marionette.set_pref(name, value)
+            self.marionette.instance.prefs = {**(self.instance_prefs or {}), **prefs}
+            self.restart_same_profile()
+            result = self.perform("setup")
+            self.fixture = result["fixture"]
+            self.before = result["snapshot"]
+            self.assertEqual([{"count": 1, "status": 0}] * 2, result["completions"])
+            self.assert_backend(self.before)
+            self.assertEqual(2, len(self.before["queue"]))
+            self.assertEqual([], self.before["sent"])
+            self.assertEqual(1, len(self.before["control"]))
+            for n, header in enumerate(self.before["queue"], 1):
+                self.assertEqual(self.fixture["outbox"], header["folderURI"])
+                self.assertEqual(f"s375-queue-{n}@example.invalid", header["messageId"])
+                self.assertEqual(f"S375 queued message {n}", header["subject"])
+                self.assertIn(f"S375 exact queued body {n}.", header["raw"])
+                self.assertIn("queued-s375@example.invalid", header["author"])
+            self.assertEqual(
+                self.before["queue"][0]["messageId"],
+                self.before["control"][0]["messageId"],
+            )
+            self.assertNotEqual(
+                self.before["queue"][0]["folderURI"],
+                self.before["control"][0]["folderURI"],
+            )
+        except Exception:
+            self.restore()
+            raise
 
     def perform(self, action, reject_delivery=False):
         """Run the real store/SMTP operation and surface every fixture error."""
         result = self.marionette.execute_async_script(
             SCRIPT, script_args=[action, self.fixture, reject_delivery]
         )
+        if action == "setup" and result.get("fixture"):
+            self.fixture = result["fixture"]
         self.assertNotIn("error", result, result)
         return result["value"]
 
@@ -75,6 +81,7 @@ class TestPanoramaSendLater(MarionetteTestCase):
         old_pid = self.marionette.execute_script("return Services.appinfo.processID;")
         self.marionette.restart(in_app=True, clean=False)
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        self.marionette.switch_to_window(self.marionette.chrome_window_handles[0])
         self.assertNotEqual(
             old_pid,
             self.marionette.execute_script("return Services.appinfo.processID;"),
@@ -181,8 +188,17 @@ class TestPanoramaSendLater(MarionetteTestCase):
         self.assert_queue_unchanged(self.perform("snapshot"))
         self.assert_success(self.perform("send"))
 
+    def tearDown(self):
+        try:
+            self.restore()
+        finally:
+            super().tearDown()
+
     def restore(self):
         """Remove only owned messages/accounts and restore startup preferences."""
+        if self.restored:
+            return
+        self.restored = True
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         try:
             self.perform("cleanup")

@@ -13,6 +13,24 @@
 #include "nsIFile.h"
 #include "mozilla/Mutex.h"
 #include "mozilla/Maybe.h"
+#ifdef MOZ_PANORAMA
+#  include "MessageDatabase.h"
+
+struct NativeQueuedAppendTarget {
+  mozilla::mailnews::MessageBodyState body;
+  uint32_t epoch{0};
+  mozilla::mailnews::OfflineAttempt attempt;
+  uint32_t ordinal{0};
+};
+
+struct NativeQueuedAppendReceipt {
+  mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> destination;
+};
+struct NativeQueuedCopyReceipt {
+  ImapUid sourceUid = 0;
+  mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> destination;
+};
+#endif
 
 class nsImapUrl : public nsIImapUrl,
                   public nsMsgMailNewsUrl,
@@ -48,6 +66,21 @@ class nsImapUrl : public nsIImapUrl,
   static nsresult UnescapeSlashes(nsACString& path);
   static nsresult UnescapeSlashes(char* path);
 #ifdef MOZ_PANORAMA
+  nsresult PrepareNativeQueuedCopies(
+      const nsTArray<mozilla::mailnews::OfflineAttempt>& attempts);
+  nsTArray<mozilla::mailnews::OfflineAttempt> CopyNativeQueuedCopies();
+  nsresult RecordNativeCopyReceipts(
+      const nsTArray<NativeQueuedCopyReceipt>& receipts);
+  nsTArray<NativeQueuedCopyReceipt> CopyNativeCopyReceipts();
+  void RecordNativeSourceRetired();
+  bool NativeSourceRetired();
+  nsresult PrepareNativeQueuedAppend(const NativeQueuedAppendTarget& target);
+  mozilla::Maybe<NativeQueuedAppendTarget> CopyNativeQueuedAppendTarget();
+  nsresult RecordNativeQueuedAppendReceipt(
+      const NativeQueuedAppendReceipt& receipt);
+  mozilla::Maybe<NativeQueuedAppendReceipt> CopyNativeQueuedAppendReceipt();
+  void RecordNativeQueuedAppendRejected();
+  bool NativeQueuedAppendRejected();
   struct FlagTarget {
     nsMsgKey key;
     ImapUid uid;
@@ -197,6 +230,15 @@ class nsImapUrl : public nsIImapUrl,
   bool mAutodetectCharset;  // used by nsIMsgI18NUrl...
   mozilla::Mutex mLock;
 #ifdef MOZ_PANORAMA
+  nsTArray<mozilla::mailnews::OfflineAttempt> mNativeQueuedCopies
+      MOZ_GUARDED_BY(mLock);
+  nsTArray<NativeQueuedCopyReceipt> mNativeCopyReceipts MOZ_GUARDED_BY(mLock);
+  bool mNativeSourceRetired MOZ_GUARDED_BY(mLock) = false;
+  mozilla::Maybe<NativeQueuedAppendTarget> mNativeQueuedAppend
+      MOZ_GUARDED_BY(mLock);
+  mozilla::Maybe<NativeQueuedAppendReceipt> mNativeAppendReceipt
+      MOZ_GUARDED_BY(mLock);
+  bool mNativeAppendRejected MOZ_GUARDED_BY(mLock) = false;
   struct NativeHierarchyEvidence {
     nsCString source;
     nsCString destination;

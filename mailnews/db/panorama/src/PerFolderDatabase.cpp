@@ -1108,7 +1108,91 @@ nsresult PerFolderDatabase::CopyHdrForStore(nsIMsgDBHdr* existingHdr,
            extra.k.EqualsLiteral("uidOnServer") ||
            (!preserveMessageSize && extra.k.EqualsLiteral("messageSize"));
   });
+  native->mCopySourceId = mDatabaseSourceId;
   copy.forget(draft);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::StageHdrForOfflineCopy(nsIMsgDBHdr* detached,
+                                                   nsMsgKey* stagedKey) {
+  NS_ENSURE_ARG_POINTER(stagedKey);
+  NS_ENSURE_ARG(detached);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(detached);
+  NS_ENSURE_TRUE(draft && draft->mFolderId == mFolderId, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(!draft->mCopySourceId.IsEmpty() &&
+                     draft->mCopySourceId.Equals(mDatabaseSourceId),
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(draft->CheckMutable());
+  // Initial queued copies have no inferred source-server UID binding.
+  NS_ENSURE_FALSE(
+      std::any_of(draft->mRaw.extras.begin(), draft->mRaw.extras.end(),
+                  [](const auto& extra) {
+                    return extra.k.EqualsLiteral("uidOnServer");
+                  }),
+      NS_ERROR_INVALID_ARG);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attaching;
+  nsresult rv = MessageDB().StageMessage(mFolderId, draft->mRaw, stagedKey);
+  if (NS_FAILED(rv)) {
+    draft->mAttachError = rv;
+    draft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+    return rv;
+  }
+  draft->mCopyStagedKey = *stagedKey;
+  // Attaching also seals the draft while the caller installs associations.
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::PublishHdrForOfflineCopy(nsIMsgDBHdr* detached,
+                                                     bool notifyLegacy,
+                                                     Message** liveHeader) {
+  NS_ENSURE_ARG_POINTER(liveHeader);
+  NS_ENSURE_FALSE(*liveHeader, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_ARG(detached);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(detached);
+  NS_ENSURE_TRUE(draft && draft->mFolderId == mFolderId, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(!draft->mCopySourceId.IsEmpty() &&
+                     draft->mCopySourceId.Equals(mDatabaseSourceId),
+                 NS_ERROR_NOT_AVAILABLE);
+  if (draft->mAttachState == DetachedMsgHdr::AttachState::Failed) {
+    return draft->mAttachError;
+  }
+  NS_ENSURE_FALSE(draft->mAttachState == DetachedMsgHdr::AttachState::Attached,
+                  NS_ERROR_ALREADY_INITIALIZED);
+  NS_ENSURE_FALSE(draft->mCopyPublishing, NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(
+      draft->mAttachState == DetachedMsgHdr::AttachState::Attaching &&
+          draft->mCopyStagedKey != nsMsgKey_None,
+      NS_ERROR_INVALID_ARG);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  Maybe<CapturedMessage> pending;
+  MOZ_TRY(MessageDB().CaptureHeaderState(draft->mCopyStagedKey, pending));
+  NS_ENSURE_TRUE(pending && pending->folderId == mFolderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  AutoRestore<bool> publishing(draft->mCopyPublishing);
+  draft->mCopyPublishing = true;
+  // Native publication fills the persistent owning slot before callbacks.
+  // No SQL or fallible lookup follows its commit.
+  nsresult rv = MessageDB().PublishMessage(draft->mCopyStagedKey, notifyLegacy,
+                                           liveHeader);
+  if (NS_FAILED(rv)) {
+    draft->mAttachError = rv;
+    draft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+    return rv;
+  }
+  MOZ_ASSERT(*liveHeader);
+  draft->mAttachedHeader = *liveHeader;
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attached;
   return NS_OK;
 }
 
@@ -1627,6 +1711,66 @@ NS_IMETHODIMP PerFolderDatabase::DeleteHeader(nsIMsgDBHdr* msgHdr,
   NS_ENSURE_SUCCESS(rv, rv);
   // TODO: `instigator`, `commit` and `notify` ignored.
   return DeleteMessages({key}, instigator);
+}
+
+nsresult PerFolderDatabase::RemoveHdrForUndo(
+    nsMsgKey key, RemovedMessage& captured, OfflineOperationUndo* redo,
+    OfflineOperationUndo* nextOffline) {
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<MessageDatabase> messages = &MessageDB();
+  MOZ_TRY(messages->CheckFolderBodyAccess(mFolderId));
+  nsCOMPtr<nsIMsgFolder> folder;
+  MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+  nsCOMPtr<nsIMsgIncomingServer> server;
+  MOZ_TRY(folder->GetServer(getter_AddRefs(server)));
+  NS_ENSURE_TRUE(server, NS_ERROR_NOT_AVAILABLE);
+  nsCString databaseType;
+  MOZ_TRY(server->GetLocalDatabaseType(databaseType));
+  MessageRemovalAccounting accounting;
+  if (databaseType.EqualsLiteral("mailbox")) {
+    accounting = MessageRemovalAccounting::LocalMessageSize;
+  } else if (databaseType.EqualsLiteral("imap") ||
+             databaseType.EqualsLiteral("news")) {
+    accounting = MessageRemovalAccounting::OfflineMessageSize;
+  } else {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  return messages->RemoveMessageForUndo(key, mFolderId, mDatabaseSourceId,
+                                        accounting, captured, redo,
+                                        nextOffline);
+}
+
+nsresult PerFolderDatabase::CaptureOfflineOperationForUndo(
+    nsMsgKey key, OfflineOperationUndo& output,
+    const OfflineUndoCounterpart* counterpart) {
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<MessageDatabase> messages = &MessageDB();
+  return messages->CaptureOfflineOperationForUndo(
+      mFolderId, key, mDatabaseSourceId, output, counterpart);
+}
+
+nsresult PerFolderDatabase::RestoreHdrForUndo(
+    RemovedMessage& captured, const FinishedMessageBody& finished,
+    nsMsgKey* key, Message** liveHeader, OfflineOperationUndo* offline,
+    const PendingDestination* cancelMove, OfflineOperationUndo* redo) {
+  NS_ENSURE_ARG_POINTER(key);
+  NS_ENSURE_TRUE(!liveHeader || !*liveHeader, NS_ERROR_INVALID_ARG);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  const MessageBodyState* body = captured.Body();
+  NS_ENSURE_TRUE(body && body->folderId == mFolderId &&
+                     body->databaseSourceId == mDatabaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  RefPtr<MessageDatabase> messages = &MessageDB();
+  MOZ_TRY(messages->CheckFolderBodyAccess(mFolderId));
+  // Do not substitute local output variables: native publication can reenter.
+  return messages->RestoreMessageForUndo(mFolderId, captured, finished, key,
+                                         liveHeader, offline, cancelMove, redo);
 }
 
 NS_IMETHODIMP PerFolderDatabase::UndoDelete(nsIMsgDBHdr* msgHdr) {

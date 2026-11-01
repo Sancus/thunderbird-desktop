@@ -318,6 +318,131 @@ class DeliveryCoreReferences : public testing::Test {
     }
   }
 
+  nsresult QueuedAppend(nsMsgKey& key, MessageBodyState& body,
+                        OfflineAttempt& attempt, bool captureBody = true) {
+    auto& db = mCore->MessageDB();
+    MOZ_TRY(mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+    RawHdr raw;
+    raw.messageId = "queued-append@invalid"_ns;
+    raw.flags = nsMsgMessageFlags::Offline;
+    raw.storeToken = Some(nsCString("0"_ns));
+    raw.messageSize = Some(12u);
+    raw.offlineMessageSize = Some(12u);
+    raw.lineCount = Some(1u);
+    MOZ_TRY(db.AddMessage(mFolderId, raw, true, &key));
+    OfflineOperationData op;
+    op.operation = nsIMsgOfflineImapOperation::kAppendDraft;
+    op.pendingDestination = Some(PendingDestination{mFolderId, key, 7});
+    MOZ_TRY(db.StoreOfflineOperation(mFolderId, key, op));
+    MOZ_TRY(db.GetMessageBodyState(key, body));
+    uint64_t id;
+    MOZ_TRY(db.BeginOfflineAttempt(mFolderId, key, op.operation,
+                                   op.pendingDestination, id,
+                                   captureBody ? &body : nullptr));
+    return db.GetOfflineAttempt(id, attempt);
+  }
+
+  nsresult QueuedCopy(nsMsgKey& source, uint64_t& folder, nsMsgKey& target,
+                      OfflineAttempt& attempt, bool unobserved = false) {
+    auto& db = mCore->MessageDB();
+    MOZ_TRY(mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+    MOZ_TRY(Add("copy-source@invalid"_ns, {}, source));
+    MOZ_TRY(db.BindMessageToServerUid(source, mFolderId, 7, source));
+    nsAutoCString name("Receipt");
+    name.AppendInt(source);
+    MOZ_TRY(mCore->FolderDB().InsertFolder(mFolderId, name, &folder));
+    if (!unobserved) {
+      MOZ_TRY(mCore->FolderDB().SetFolderUidValidity(folder, 9));
+    }
+    RawHdr raw;
+    raw.messageId = "metadata-only-copy@invalid"_ns;
+    MOZ_TRY(db.AddMessage(folder, raw, true, &target));
+    OfflineOperationData payload;
+    payload.operation = nsIMsgOfflineImapOperation::kMsgCopy;
+    payload.copyDestinations = {"imap://actual/Copy"_ns};
+    payload.copyDestinationBindings = {
+        Some(unobserved ? PendingDestination::Unobserved(folder, target)
+                        : PendingDestination{folder, target, 9})};
+    MOZ_TRY(db.StoreOfflineOperation(mFolderId, source, payload));
+    uint64_t id;
+    MOZ_TRY(db.BeginOfflineAction(mFolderId, source, payload.operation,
+                                  payload.copyDestinationBindings[0], Some(0u),
+                                  id));
+    return db.GetOfflineAttempt(id, attempt);
+  }
+
+  nsresult QueuedSourceForUndo(nsMsgKey& source, nsMsgKey& target,
+                               QueuedSourceIdentity& identity) {
+    auto& db = mCore->MessageDB();
+    MOZ_TRY(mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+    MOZ_TRY(Add("retained-source@invalid"_ns, {"raw"_ns, "raw"_ns}, source));
+    MOZ_TRY(db.BindMessageToServerUid(source, mFolderId, 7, source));
+    MOZ_TRY(Add("actual-destination@invalid"_ns, {}, target));
+    OfflineOperationData payload;
+    payload.operation = nsIMsgOfflineImapOperation::kMsgCopy |
+                        nsIMsgOfflineImapOperation::kFlagsChanged;
+    payload.copyDestinations = {"actual-copy"_ns};
+    payload.copyDestinationBindings = {
+        Some(PendingDestination{mFolderId, target, 7})};
+    payload.flagOperation = 0x80000000;
+    payload.newFlags = UINT32_MAX;
+    payload.keywordsToAdd = "retained exact words"_ns;
+    MOZ_TRY(db.StoreOfflineOperation(mFolderId, source, payload));
+    OfflineOperationData counterpart;
+    counterpart.operation = nsIMsgOfflineImapOperation::kMoveResult;
+    counterpart.sourceKey = source;
+    counterpart.sourceUid = source;
+    counterpart.sourceFolderURI = "imap://actual/source"_ns;
+    MOZ_TRY(db.StoreOfflineOperation(mFolderId, target, counterpart));
+    return db.GetQueuedSourceIdentity(mFolderId, source, identity);
+  }
+
+  nsresult QueuedSourceForStagedReturn(nsMsgKey& source,
+                                       nsTArray<PendingDestination>& targets,
+                                       QueuedSourceIdentity& identity) {
+    auto& db = mCore->MessageDB();
+    nsMsgKey first;
+    MOZ_TRY(QueuedSourceForUndo(source, first, identity));
+    targets.AppendElement(PendingDestination{mFolderId, first, 7});
+    uint64_t folder;
+    MOZ_TRY(
+        mCore->FolderDB().InsertFolder(mFolderId, "ReturnTail"_ns, &folder));
+    MOZ_TRY(mCore->FolderDB().SetFolderUidValidity(folder, 9));
+    for (uint32_t i = 0; i < 2; ++i) {
+      RawHdr raw;
+      raw.messageId = i ? "return-selected-move"_ns : "return-copy-tail"_ns;
+      nsMsgKey key;
+      MOZ_TRY(db.AddMessage(folder, raw, true, &key));
+      targets.AppendElement(PendingDestination{folder, key, 9});
+      OfflineOperationData child;
+      child.operation = nsIMsgOfflineImapOperation::kMoveResult |
+                        nsIMsgOfflineImapOperation::kFlagsChanged;
+      child.sourceKey = source;
+      child.sourceUid = source;
+      child.sourceFolderURI = "imap://actual/source"_ns;
+      child.flagOperation = 0x80000000;
+      child.newFlags = UINT32_MAX;
+      child.keywordsToAdd = "unchanged child words"_ns;
+      MOZ_TRY(db.StoreOfflineOperation(folder, key, child));
+    }
+    OfflineOperationData payload;
+    MOZ_TRY(db.GetOfflineOperation(mFolderId, source, payload));
+    payload.operation |= nsIMsgOfflineImapOperation::kMsgMoved;
+    payload.sourceUid = source;
+    payload.messageSize = 12345;
+    payload.keywordsToRemove = "unchanged removal words"_ns;
+    payload.copyDestinations.AppendElement("actual-copy-tail"_ns);
+    payload.copyDestinationBindings.AppendElement(Some(targets[1]));
+    payload.pendingDestination = Some(targets[2]);
+    payload.destinationFolderURI = "actual-selected-move"_ns;
+    MOZ_TRY(db.StoreOfflineOperation(mFolderId, source, payload));
+    return db.GetQueuedSourceIdentity(mFolderId, source, identity);
+  }
+
+  nsresult MessageIsStaged(nsMsgKey key, bool& staged) {
+    return mCore->MessageDB().IsMessageStaged(key, staged);
+  }
+
   mozIStorageConnection* Connection() const {
     return DatabaseCore::sConnection.get();
   }
@@ -4321,6 +4446,787 @@ TEST_F(DeliveryCoreReferences, ReservedOfflineKeySurvivesReopenWithoutMessage) {
 }
 
 TEST_F(DeliveryCoreReferences,
+       AppendAcceptedWithoutUidSurvivesReopenAndFencesReplay) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  MessageBodyState body;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedAppend(key, body, expected));
+  auto& db = mCore->MessageDB();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK, reopened.GetCurrentOfflineAttempt(mFolderId, key, actual));
+  EXPECT_EQ(expected.id, actual.id);
+  EXPECT_TRUE(actual.appendAccepted);
+  EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+  EXPECT_FALSE(actual.confirmedUid);
+  ASSERT_TRUE(actual.appendBody);
+  EXPECT_EQ(body.databaseSourceId, actual.appendBody->databaseSourceId);
+  EXPECT_EQ(Some(nsCString("0"_ns)), actual.appendBody->storeToken);
+  EXPECT_EQ(body.contentRevision, actual.appendBody->contentRevision);
+  EXPECT_EQ(body.locationRevision, actual.appendBody->locationRevision);
+  EXPECT_EQ(12u, actual.appendBody->messageSize);
+  EXPECT_EQ(12u, actual.appendBody->offlineMessageSize);
+  EXPECT_EQ(1u, actual.appendBody->lineCount);
+  EXPECT_EQ(NS_OK, reopened.RecordOfflineAppendAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_OK, reopened.ValidateOfflineAppendAcceptedWithoutUid(actual));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened.ResolveOfflineAttemptNotApplied(actual.id));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened.MarkOfflineAttemptAmbiguous(actual.id));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            reopened.ConfirmOfflineAttempt(actual.id, Nothing()));
+  uint64_t untouched = 99;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            reopened.BeginOfflineAttempt(mFolderId, key, actual.operation,
+                                         actual.destination, untouched, &body));
+  EXPECT_EQ(99u, untouched);
+  OfflineOperationData op;
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, key, op));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            reopened.StoreOfflineOperation(mFolderId, key, op));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            reopened.RemoveOfflineOperation(mFolderId, key));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, reopened.GetMessagePropertyNames(key, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, reopened.MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, reopened.GetMessageBodyState(key, body));
+  EXPECT_EQ(Some(nsCString("0"_ns)), body.storeToken);
+  // Only a later authoritative UID receipt resolves identity.
+  ASSERT_EQ(NS_OK, reopened.ConfirmOfflineAttempt(
+                       actual.id, Some(ServerUidConfirmation{7, 42})));
+  ASSERT_EQ(NS_OK, reopened.GetOfflineAttempt(actual.id, actual));
+  EXPECT_TRUE(actual.appendAccepted);
+  EXPECT_EQ(OfflineAttemptState::Confirmed, actual.state);
+  EXPECT_EQ(Some(42u), actual.confirmedUid);
+  EXPECT_EQ(NS_OK, reopened.ConfirmOfflineAttempt(
+                       actual.id, Some(ServerUidConfirmation{7, 42})));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            reopened.ConfirmOfflineAttempt(actual.id,
+                                           Some(ServerUidConfirmation{7, 43})));
+  EXPECT_EQ(NS_OK, reopened.RecordOfflineAppendAcceptedWithoutUid(expected));
+}
+
+TEST_F(DeliveryCoreReferences,
+       CopyAcceptanceWithoutUidRetainsExactPhysicalState) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey source, target;
+  uint64_t folder;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedCopy(source, folder, target, expected));
+  auto& db = mCore->MessageDB();
+  ASSERT_TRUE(expected.transferBody);
+  EXPECT_FALSE(expected.transferBody->storeToken);
+  EXPECT_EQ(0u, expected.transferBody->flags & nsMsgMessageFlags::Offline);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ValidateOfflineCopyAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(source));
+  ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.ValidateOfflineCopyAcceptedWithoutUid(expected));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK,
+            reopened.GetOfflineAttemptForAction(
+                mFolderId, source, expected.operation, Some(0u), actual));
+  EXPECT_EQ(expected.id, actual.id);
+  EXPECT_EQ(expected.operationKey, actual.operationKey);
+  EXPECT_EQ(Some(0u), actual.copyOrdinal);
+  EXPECT_TRUE(actual.transferAccepted);
+  EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+  EXPECT_FALSE(actual.confirmedUid);
+  ASSERT_TRUE(actual.transferBody);
+  EXPECT_FALSE(actual.transferBody->storeToken);
+  EXPECT_EQ(expected.transferSourceId, actual.transferBody->databaseSourceId);
+  EXPECT_EQ(NS_OK, reopened.RecordOfflineCopyAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_OK, reopened.ValidateOfflineCopyAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            reopened.ConfirmOfflineAttempt(actual.id, Nothing()));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened.ResolveOfflineAttemptNotApplied(actual.id));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened.MarkOfflineAttemptAmbiguous(actual.id));
+  uint64_t untouched = 99;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, reopened.BeginOfflineAction(
+                                      mFolderId, source, actual.operation,
+                                      actual.destination, Some(0u), untouched));
+  EXPECT_EQ(99u, untouched);
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, source, payload));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            reopened.StoreOfflineOperation(mFolderId, source, payload));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            reopened.RemoveOfflineOperation(mFolderId, source));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, reopened.GetMessagePropertyNames(target, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  ASSERT_EQ(NS_OK, reopened.ConfirmOfflineAttempt(
+                       actual.id, Some(ServerUidConfirmation{9, 42})));
+  ASSERT_EQ(NS_OK, reopened.GetOfflineAttempt(actual.id, actual));
+  EXPECT_EQ(Some(42u), actual.confirmedUid);
+  EXPECT_EQ(Some(9u), actual.confirmedEpoch);
+  EXPECT_TRUE(actual.transferAccepted);
+  EXPECT_EQ(NS_OK, reopened.RecordOfflineCopyAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_OK, reopened.ConfirmOfflineAttempt(
+                       actual.id, Some(ServerUidConfirmation{9, 42})));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            reopened.ConfirmOfflineAttempt(actual.id,
+                                           Some(ServerUidConfirmation{9, 43})));
+}
+
+TEST_F(DeliveryCoreReferences, CopyAcceptanceKeepsOrderedActionsIndependent) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsMsgKey source, targets[3];
+  ASSERT_EQ(NS_OK, Add("ordered-source"_ns, {}, source));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(source, mFolderId, 7, 42));
+  for (auto& key : targets) {
+    ASSERT_EQ(NS_OK, Add("ordered-target"_ns, {}, key));
+  }
+  OfflineOperationData payload;
+  payload.operation = nsIMsgOfflineImapOperation::kMsgCopy |
+                      nsIMsgOfflineImapOperation::kMsgMoved |
+                      nsIMsgOfflineImapOperation::kFlagsChanged;
+  payload.copyDestinations = {"same"_ns, "same"_ns};
+  payload.copyDestinationBindings = {
+      Some(PendingDestination{mFolderId, targets[0], 7}),
+      Some(PendingDestination{mFolderId, targets[1], 7})};
+  payload.pendingDestination =
+      Some(PendingDestination{mFolderId, targets[2], 7});
+  payload.flagOperation = 0x80000000;
+  payload.newFlags = UINT32_MAX;
+  payload.keywordsToAdd = "preserved tail"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, source, payload));
+  uint64_t first, second, move, flags;
+  ASSERT_EQ(NS_OK, db.BeginOfflineAction(
+                       mFolderId, source, nsIMsgOfflineImapOperation::kMsgCopy,
+                       payload.copyDestinationBindings[0], Some(0u), first));
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(first, actual));
+  ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(actual));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.BeginOfflineAction(
+                mFolderId, source, nsIMsgOfflineImapOperation::kMsgCopy,
+                payload.copyDestinationBindings[0], Some(0u), second));
+  ASSERT_EQ(NS_OK, db.BeginOfflineAction(
+                       mFolderId, source, nsIMsgOfflineImapOperation::kMsgCopy,
+                       payload.copyDestinationBindings[1], Some(1u), second));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(second, actual));
+  EXPECT_EQ(Some(1u), actual.copyOrdinal);
+  EXPECT_EQ(targets[1], actual.destination->key);
+  // A lost receipt on the second COPY stays fenced independently.
+  ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(second));
+  ASSERT_EQ(NS_OK, db.BeginOfflineAction(
+                       mFolderId, source, nsIMsgOfflineImapOperation::kMsgMoved,
+                       payload.pendingDestination, Nothing(), move));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(move, actual));
+  EXPECT_FALSE(actual.copyOrdinal);
+  ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(actual));
+  // This records COPY effect only, never successful MOVE source STORE/delete.
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAction(mFolderId, source,
+                                  nsIMsgOfflineImapOperation::kFlagsChanged,
+                                  Nothing(), Nothing(), flags));
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(flags, Nothing()));
+  OfflineOperationData retained;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, source, retained));
+  EXPECT_EQ(payload.operation, retained.operation);
+  EXPECT_EQ(payload.copyDestinations, retained.copyDestinations);
+  EXPECT_EQ(payload.keywordsToAdd, retained.keywordsToAdd);
+  EXPECT_EQ(payload.newFlags, retained.newFlags);
+  ASSERT_EQ(2u, retained.copyDestinationBindings.Length());
+  EXPECT_EQ(targets[1], retained.copyDestinationBindings[1]->key);
+  EXPECT_EQ(targets[2], retained.pendingDestination->key);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.RemoveOfflineOperation(mFolderId, source));
+  OfflineAttempt lookup;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttemptForAction(
+                       mFolderId, source, nsIMsgOfflineImapOperation::kMsgCopy,
+                       Some(0u), lookup));
+  EXPECT_EQ(first, lookup.id);
+  ASSERT_EQ(NS_OK, db.GetOfflineAttemptForAction(
+                       mFolderId, source, nsIMsgOfflineImapOperation::kMsgCopy,
+                       Some(1u), lookup));
+  EXPECT_EQ(second, lookup.id);
+  EXPECT_EQ(OfflineAttemptState::Ambiguous, lookup.state);
+}
+
+TEST_F(DeliveryCoreReferences, CopyAcceptanceRequiresExactAttemptAndOrdinal) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey source, target;
+  uint64_t folder;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedCopy(source, folder, target, expected));
+  auto& db = mCore->MessageDB();
+  auto reject = [&](const OfflineAttempt& bad) {
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.RecordOfflineCopyAcceptedWithoutUid(bad));
+    OfflineAttempt actual;
+    ASSERT_EQ(NS_OK, db.GetOfflineAttempt(expected.id, actual));
+    EXPECT_FALSE(actual.transferAccepted);
+    EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+  };
+  OfflineAttempt bad = expected;
+  bad.copyOrdinal = Some(1u);
+  reject(bad);
+  bad = expected;
+  ++bad.operationId;
+  reject(bad);
+  bad = expected;
+  ++bad.revision;
+  reject(bad);
+  bad = expected;
+  ++bad.operationKey;
+  reject(bad);
+  bad = expected;
+  ++bad.source->uid;
+  reject(bad);
+  bad = expected;
+  ++bad.destination->key;
+  reject(bad);
+  bad = expected;
+  ++bad.destination->epoch;
+  reject(bad);
+  bad = expected;
+  bad.transferSourceId.Append('x');
+  reject(bad);
+  bad = expected;
+  bad.transferBody->storeToken = Some(nsCString("0"_ns));
+  reject(bad);
+  bad = expected;
+  ++bad.transferBody->locationRevision;
+  reject(bad);
+  uint64_t unchanged = 123;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.BeginOfflineAction(mFolderId, source,
+                                  nsIMsgOfflineImapOperation::kMsgCopy,
+                                  expected.destination, Nothing(), unchanged));
+  EXPECT_EQ(123u, unchanged);
+  ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(expected));
+}
+
+TEST_F(DeliveryCoreReferences, CopyAcceptanceLocalFailureRetainsKnownEffect) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey source, target;
+  uint64_t folder;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedCopy(source, folder, target, expected));
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(folder, 10));
+  ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ValidateOfflineCopyAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ConfirmOfflineAttempt(expected.id,
+                                     Some(ServerUidConfirmation{9, 42})));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(folder, 9));
+  ASSERT_EQ(NS_OK, db.ValidateOfflineCopyAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(target, "different-body"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ValidateOfflineCopyAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ResolveOfflineAttemptNotApplied(expected.id));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.RemoveOfflineOperation(mFolderId, source));
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(expected.id, actual));
+  EXPECT_TRUE(actual.transferAccepted);
+  EXPECT_FALSE(actual.confirmedUid);
+}
+
+TEST_F(DeliveryCoreReferences, CopyAcceptanceWriteAndCommitErrorsKeepFence) {
+  ASSERT_EQ(NS_OK, Start());
+  for (bool commitFailure : {false, true}) {
+    nsMsgKey source, target;
+    uint64_t folder;
+    OfflineAttempt expected;
+    ASSERT_EQ(NS_OK, QueuedCopy(source, folder, target, expected));
+    auto& db = mCore->MessageDB();
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "copy_ack_parent(id INTEGER PRIMARY KEY);"
+                           "CREATE TEMP TABLE copy_ack_child(id INTEGER "
+                           "REFERENCES copy_ack_parent(id) "
+                           "DEFERRABLE INITIALLY DEFERRED)"_ns));
+    }
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK,
+              mConnection->CreateFunction("copy_ack_fault"_ns, 1, witness));
+    nsAutoCString sql(
+        "CREATE TEMP TRIGGER reject_copy_ack AFTER UPDATE OF transferAccepted "
+        "ON main.offline_attempts WHEN NEW.transferAccepted=1 BEGIN "
+        "SELECT copy_ack_fault(NEW.id); ");
+    sql.Append(commitFailure ? "INSERT INTO copy_ack_child VALUES(NEW.id); END"
+                             : "SELECT RAISE(ABORT,'copy ack'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS reject_copy_ack"_ns));
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("copy_ack_fault"_ns));
+    });
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              db.RecordOfflineCopyAcceptedWithoutUid(expected));
+    EXPECT_EQ(1u, witness->mCalls);
+    bool active;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    OfflineAttempt actual;
+    ASSERT_EQ(NS_OK, db.GetOfflineAttempt(expected.id, actual));
+    EXPECT_FALSE(actual.transferAccepted);
+    EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db.RemoveOfflineOperation(mFolderId, source));
+    ASSERT_EQ(NS_OK,
+              mConnection->ExecuteSimpleSQL("DROP TRIGGER reject_copy_ack"_ns));
+    ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(expected));
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       UnobservedCopyEpochRequiresActualFirstObservation) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey source, target;
+  uint64_t folder;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedCopy(source, folder, target, expected, true));
+  auto& db = mCore->MessageDB();
+  ASSERT_TRUE(expected.destination);
+  EXPECT_FALSE(expected.destination->epochKnown);
+  uint32_t untouched = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->FolderDB().GetFolderUidValidity(folder, untouched));
+  EXPECT_EQ(123u, untouched);
+  ASSERT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.ValidateOfflineCopyAcceptedWithoutUid(expected));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, source, payload));
+  ASSERT_TRUE(payload.copyDestinationBindings[0]);
+  EXPECT_FALSE(payload.copyDestinationBindings[0]->epochKnown);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            reopened.ConfirmOfflineAttempt(expected.id, Nothing()));
+  // Known epoch zero is valid actual evidence and distinct from absence.
+  ASSERT_EQ(NS_OK, reopened.ConfirmOfflineAttempt(
+                       expected.id, Some(ServerUidConfirmation{0, 42})));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderUidValidity(folder, untouched));
+  EXPECT_EQ(0u, untouched);
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, source, payload));
+  EXPECT_TRUE(payload.copyDestinationBindings[0]->epochKnown);
+  EXPECT_EQ(0u, payload.copyDestinationBindings[0]->epoch);
+  ASSERT_EQ(NS_OK, reopened.GetOfflineAttempt(expected.id, expected));
+  EXPECT_FALSE(expected.destination->epochKnown);
+  EXPECT_EQ(Some(0u), expected.confirmedEpoch);
+  EXPECT_EQ(Some(42u), expected.confirmedUid);
+  EXPECT_EQ(NS_OK, reopened.ConfirmOfflineAttempt(
+                       expected.id, Some(ServerUidConfirmation{0, 42})));
+}
+
+TEST_F(DeliveryCoreReferences,
+       FirstDestinationEpochObservationGuardsQueuedIdentity) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey source, target;
+  uint64_t folder;
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, QueuedCopy(source, folder, target, attempt, true));
+  auto& db = mCore->MessageDB();
+  QueuedSourceIdentity expected;
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, source, expected));
+  auto bad = expected;
+  ++bad.revision;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ObserveOfflineDestinationEpoch(bad, attempt.operation, Some(0u),
+                                              *attempt.destination, 9));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.ObserveOfflineDestinationEpoch(
+                                        expected, attempt.operation, Some(1u),
+                                        *attempt.destination, 9));
+  ASSERT_EQ(NS_OK, db.ObserveOfflineDestinationEpoch(
+                       expected, attempt.operation, Some(0u),
+                       *attempt.destination, 9));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.ObserveOfflineDestinationEpoch(
+                                        expected, attempt.operation, Some(0u),
+                                        *attempt.destination, 10));
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, source, payload));
+  EXPECT_EQ(9u, payload.copyDestinationBindings[0]->epoch);
+  EXPECT_TRUE(payload.copyDestinationBindings[0]->epochKnown);
+  EXPECT_EQ(NS_OK, db.RecordOfflineCopyAcceptedWithoutUid(attempt));
+  EXPECT_EQ(NS_OK, db.ValidateOfflineCopyAcceptedWithoutUid(attempt));
+}
+
+TEST_F(DeliveryCoreReferences,
+       CopyAttemptSchemaPreservesLegacyAndTypedAbsence) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey source, target;
+  uint64_t folder;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedCopy(source, folder, target, expected));
+  auto& db = mCore->MessageDB();
+  for (const char* invalid :
+       {"transferSourceId=NULL", "transferSourceId=''",
+        "transferOperationKey=0", "copyOrdinal=NULL", "copyOrdinal=-1",
+        "transferContentRevision=NULL", "transferLocationRevision='bad'",
+        "transferMessageSize=-1", "transferFlags=-1",
+        "transferAccepted=1,state=0", "confirmedUid=42"}) {
+    ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+    nsAutoCString sql("UPDATE offline_attempts SET ");
+    sql.Append(invalid);
+    sql.AppendLiteral(" WHERE id=");
+    sql.AppendInt(expected.id);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    OfflineAttempt unchanged;
+    unchanged.id = 123;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              db.GetOfflineAttempt(expected.id, unchanged));
+    EXPECT_EQ(123u, unchanged.id);
+    ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  }
+  Stop();
+  nsCOMPtr<mozIStorageConnection> old;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
+  for (const char* column :
+       {"confirmedEpoch", "transferFlags", "transferLineCount",
+        "transferOfflineSize", "transferMessageSize", "transferStoreToken",
+        "transferLocationRevision", "transferContentRevision",
+        "transferAccepted", "copyOrdinal", "transferOperationKey",
+        "transferSourceId"}) {
+    nsAutoCString sql("ALTER TABLE offline_attempts DROP COLUMN ");
+    sql.Append(column);
+    ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(sql));
+  }
+  ASSERT_EQ(NS_OK, old->SetSchemaVersion(17));
+  ASSERT_EQ(NS_OK, old->Close());
+  old = nullptr;
+  ASSERT_EQ(NS_OK, Start());
+  OfflineAttempt legacy;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineAttempt(expected.id, legacy));
+  EXPECT_EQ(expected.operationId, legacy.operationId);
+  EXPECT_EQ(expected.revision, legacy.revision);
+  EXPECT_EQ(OfflineAttemptState::Sent, legacy.state);
+  EXPECT_TRUE(legacy.transferSourceId.IsEmpty());
+  EXPECT_FALSE(legacy.copyOrdinal);
+  EXPECT_FALSE(legacy.transferBody);
+  EXPECT_FALSE(legacy.transferAccepted);
+  uint64_t unchanged = 123;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, mCore->MessageDB().BeginOfflineAction(
+                                      mFolderId, source, legacy.operation,
+                                      legacy.destination, Some(0u), unchanged));
+  EXPECT_EQ(123u, unchanged);
+}
+
+TEST_F(DeliveryCoreReferences, AppendAcceptanceLocalFailureKeepsKnownEffect) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  MessageBodyState body;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedAppend(key, body, expected));
+  auto& db = mCore->MessageDB();
+  // The actual tagged receipt must survive a local epoch change before ACK.
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 8));
+  ASSERT_EQ(NS_OK, db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  ASSERT_EQ(NS_OK, db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP VIEW offline_operations AS SELECT * FROM "
+                       "main.offline_operations "
+                       "WHERE abs(-9223372036854775808)"_ns));
+  OfflineOperationData op;
+  nsresult original = db.GetOfflineOperation(mFolderId, key, op);
+  ASSERT_TRUE(NS_FAILED(original));
+  EXPECT_EQ(original, db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP VIEW temp.offline_operations"_ns));
+  // Ordinary read flags are not body identity; physical content changes are.
+  ASSERT_EQ(NS_OK,
+            db.SetMessageFlags(key, body.flags | nsMsgMessageFlags::Read));
+  ASSERT_EQ(NS_OK, db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "changed-body"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ConfirmOfflineAttempt(expected.id,
+                                     Some(ServerUidConfirmation{7, 42})));
+  ASSERT_EQ(NS_OK, db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(expected.id, actual));
+  EXPECT_TRUE(actual.appendAccepted);
+  EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+  EXPECT_FALSE(actual.confirmedUid);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ResolveOfflineAttemptNotApplied(actual.id));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.RemoveOfflineOperation(mFolderId, key));
+  bool active = true;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_FALSE(active);
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(key, body));
+  EXPECT_EQ(Some(nsCString("changed-body"_ns)), body.storeToken);
+}
+
+TEST_F(DeliveryCoreReferences, AppendAcceptanceWriteAndCommitErrorsKeepFence) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  for (bool commitFailure : {false, true}) {
+    nsMsgKey key;
+    MessageBodyState body;
+    OfflineAttempt expected;
+    ASSERT_EQ(NS_OK, QueuedAppend(key, body, expected));
+    if (commitFailure) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "ack_parent(id INTEGER PRIMARY KEY);"
+                           "CREATE TEMP TABLE ack_child(id INTEGER REFERENCES "
+                           "ack_parent(id) "
+                           "DEFERRABLE INITIALLY DEFERRED)"_ns));
+    }
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK,
+              mConnection->CreateFunction("append_ack_fault"_ns, 1, witness));
+    nsAutoCString sql(
+        "CREATE TEMP TRIGGER reject_append_ack AFTER UPDATE OF appendAccepted "
+        "ON main.offline_attempts WHEN NEW.appendAccepted=1 BEGIN "
+        "SELECT append_ack_fault(NEW.id); ");
+    sql.Append(commitFailure ? "INSERT INTO ack_child VALUES(NEW.id); END"
+                             : "SELECT RAISE(ABORT,'ack write'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS reject_append_ack"_ns));
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("append_ack_fault"_ns));
+    });
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              db.RecordOfflineAppendAcceptedWithoutUid(expected));
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(int64_t(expected.id), witness->mLastKey);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    OfflineAttempt actual;
+    ASSERT_EQ(NS_OK, db.GetOfflineAttempt(expected.id, actual));
+    EXPECT_FALSE(actual.appendAccepted);
+    EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+    EXPECT_FALSE(actual.confirmedUid);
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.RemoveOfflineOperation(mFolderId, key));
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER reject_append_ack"_ns));
+    ASSERT_EQ(NS_OK, db.RecordOfflineAppendAcceptedWithoutUid(expected));
+    ASSERT_EQ(NS_OK, db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  }
+}
+
+TEST_F(DeliveryCoreReferences, AppendAcceptanceRejectsForeignAttemptAndBody) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  MessageBodyState body;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedAppend(key, body, expected));
+  auto& db = mCore->MessageDB();
+  for (uint32_t field = 0; field < 6; ++field) {
+    OfflineAttempt changed = expected;
+    switch (field) {
+      case 0:
+        ++changed.operationId;
+        break;
+      case 1:
+        ++changed.revision;
+        break;
+      case 2:
+        changed.operation = nsIMsgOfflineImapOperation::kAppendTemplate;
+        break;
+      case 3:
+        ++changed.destination->key;
+        break;
+      case 4:
+        changed.appendBody->storeToken.reset();
+        break;
+      case 5:
+        changed.appendBody->databaseSourceId.AssignLiteral("foreign");
+        break;
+    }
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.RecordOfflineAppendAcceptedWithoutUid(changed));
+  }
+  OfflineAttempt invalid;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.RecordOfflineAppendAcceptedWithoutUid(invalid));
+  nsCString source = body.databaseSourceId;
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId='foreign'"_ns));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "UPDATE database_identity SET sourceId='{00000000-0000-4000-8000-000000000001}'"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  nsCOMPtr<mozIStorageStatement> restore;
+  ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                       "UPDATE database_identity SET sourceId=:source"_ns,
+                       getter_AddRefs(restore)));
+  ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("source"_ns, source));
+  ASSERT_EQ(NS_OK, restore->Execute());
+  restore = nullptr;
+  ASSERT_EQ(NS_OK, db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  // Begin must compare the actual current body, leaving output unchanged.
+  nsMsgKey second;
+  MessageBodyState other;
+  OfflineAttempt noBody;
+  ASSERT_EQ(NS_OK, QueuedAppend(second, other, noBody, false));
+  ASSERT_EQ(NS_OK, db.ResolveOfflineAttemptNotApplied(noBody.id));
+  ++other.locationRevision;
+  uint64_t untouched = 123;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BeginOfflineAttempt(mFolderId, second, noBody.operation,
+                                   noBody.destination, untouched, &other));
+  EXPECT_EQ(123u, untouched);
+  other.key = key;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.BeginOfflineAttempt(mFolderId, second, noBody.operation,
+                                   noBody.destination, untouched, &other));
+  EXPECT_EQ(123u, untouched);
+}
+
+TEST_F(DeliveryCoreReferences,
+       AppendAcceptanceRequiresActualQueuedAcknowledgement) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  MessageBodyState body;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedAppend(key, body, expected, false));
+  EXPECT_FALSE(expected.appendBody);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.ResolveOfflineAttemptNotApplied(expected.id));
+  uint64_t id;
+  ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(mFolderId, key, expected.operation,
+                                          expected.destination, id, &body));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(id, expected));
+  ASSERT_EQ(NS_OK, db.ResolveOfflineAttemptNotApplied(id));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(mFolderId, key, expected.operation,
+                                          expected.destination, id, &body));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(id, expected));
+  ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(id));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  // A late actual tagged OK resolves uncertainty to known acceptance, never
+  // UID.
+  ASSERT_EQ(NS_OK, db.RecordOfflineAppendAcceptedWithoutUid(expected));
+  ASSERT_EQ(NS_OK, db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.MarkOfflineAttemptAmbiguous(id));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.ResolveOfflineAttemptNotApplied(id));
+}
+
+TEST_F(DeliveryCoreReferences,
+       AppendAcceptanceSchemaPreservesLegacyAndPresence) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  MessageBodyState body;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, QueuedAppend(key, body, expected, false));
+  Stop();
+  nsCOMPtr<mozIStorageConnection> old;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
+  for (const char* column : {"confirmedEpoch",
+                             "transferFlags",
+                             "transferLineCount",
+                             "transferOfflineSize",
+                             "transferMessageSize",
+                             "transferStoreToken",
+                             "transferLocationRevision",
+                             "transferContentRevision",
+                             "transferAccepted",
+                             "copyOrdinal",
+                             "transferOperationKey",
+                             "transferSourceId",
+                             "appendFlags",
+                             "appendLineCount",
+                             "appendOfflineSize",
+                             "appendMessageSize",
+                             "appendStoreToken",
+                             "appendLocationRevision",
+                             "appendContentRevision",
+                             "appendSourceId",
+                             "appendAccepted"}) {
+    nsAutoCString sql("ALTER TABLE offline_attempts DROP COLUMN ");
+    sql.Append(column);
+    ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(sql));
+  }
+  ASSERT_EQ(NS_OK, old->SetSchemaVersion(16));
+  ASSERT_EQ(NS_OK, old->Close());
+  old = nullptr;
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(expected.id, actual));
+  EXPECT_EQ(expected.operationId, actual.operationId);
+  EXPECT_EQ(expected.revision, actual.revision);
+  EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+  EXPECT_FALSE(actual.appendAccepted);
+  EXPECT_FALSE(actual.appendBody);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.RecordOfflineAppendAcceptedWithoutUid(actual));
+  ASSERT_EQ(NS_OK, db.ResolveOfflineAttemptNotApplied(actual.id));
+  uint64_t id;
+  ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(mFolderId, key, actual.operation,
+                                          actual.destination, id, &body));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(id, actual));
+  ASSERT_TRUE(actual.appendBody);
+  EXPECT_EQ(Some(nsCString("0"_ns)), actual.appendBody->storeToken);
+  OfflineAttempt captured = actual;
+  // NULL is an absent captured token, never the valid token "0".
+  nsAutoCString sql(
+      "UPDATE offline_attempts SET appendStoreToken=NULL WHERE id=");
+  sql.AppendInt(id);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(id, actual));
+  ASSERT_TRUE(actual.appendBody);
+  EXPECT_FALSE(actual.appendBody->storeToken);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RecordOfflineAppendAcceptedWithoutUid(captured));
+  for (const char* invalid :
+       {"appendContentRevision=NULL", "appendLocationRevision='invalid'",
+        "appendMessageSize=-1", "appendFlags=0", "appendSourceId=NULL",
+        "appendAccepted=1,state=0", "appendAccepted=1,state=3",
+        "confirmedUid=42"}) {
+    ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+    nsAutoCString corrupt("UPDATE offline_attempts SET ");
+    corrupt.Append(invalid);
+    corrupt.AppendLiteral(" WHERE id=");
+    corrupt.AppendInt(id);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(corrupt));
+    OfflineAttempt untouched;
+    untouched.id = 123;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.GetOfflineAttempt(id, untouched));
+    EXPECT_EQ(123u, untouched.id);
+    ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
        AppendAttemptRetainsDestinationIdentityAcrossReopen) {
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 17));
@@ -6090,7 +6996,7 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(
       NS_OK,
       mConnection->ExecuteSimpleSQL(
-          "UPDATE offline_copy_destinations SET destinationEpoch=NULL WHERE ordinal=0"_ns));
+          "UPDATE offline_copy_destinations SET destinationKey=NULL WHERE ordinal=0"_ns));
   got.operation = 123;
   EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
             db.GetOfflineOperation(mFolderId, source, got));
@@ -9654,6 +10560,1607 @@ TEST_F(DeliveryCoreReferences,
       NS_ERROR_NOT_AVAILABLE,
       db.RestoreMessageForUndo(mFolderId, snapshot, finished, &untouched));
   EXPECT_EQ(123u, untouched);
+}
+
+static void CheckUndoOfflinePayload(const OfflineOperationData& expected,
+                                    const OfflineOperationData& actual) {
+  EXPECT_EQ(expected.operation, actual.operation);
+  EXPECT_EQ(expected.flagOperation, actual.flagOperation);
+  EXPECT_EQ(expected.newFlags, actual.newFlags);
+  EXPECT_EQ(expected.sourceKey, actual.sourceKey);
+  EXPECT_EQ(expected.sourceUid, actual.sourceUid);
+  EXPECT_EQ(expected.messageSize, actual.messageSize);
+  EXPECT_EQ(expected.playingBack, actual.playingBack);
+  EXPECT_EQ(expected.sourceFolderURI, actual.sourceFolderURI);
+  EXPECT_EQ(expected.destinationFolderURI, actual.destinationFolderURI);
+  EXPECT_EQ(expected.keywordsToAdd, actual.keywordsToAdd);
+  EXPECT_EQ(expected.keywordsToRemove, actual.keywordsToRemove);
+  EXPECT_EQ(expected.copyDestinations, actual.copyDestinations);
+  auto target = [](const Maybe<PendingDestination>& a,
+                   const Maybe<PendingDestination>& b) {
+    ASSERT_EQ(a.isSome(), b.isSome());
+    if (a) {
+      EXPECT_EQ(a->folderId, b->folderId);
+      EXPECT_EQ(a->key, b->key);
+      EXPECT_EQ(a->epoch, b->epoch);
+      EXPECT_EQ(a->epochKnown, b->epochKnown);
+    }
+  };
+  target(expected.pendingDestination, actual.pendingDestination);
+  ASSERT_EQ(expected.copyDestinationBindings.Length(),
+            actual.copyDestinationBindings.Length());
+  for (size_t i = 0; i < expected.copyDestinationBindings.Length(); ++i) {
+    target(expected.copyDestinationBindings[i],
+           actual.copyDestinationBindings[i]);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       RetainedSourceUndoSettlesChildrenBeforePublication) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, target;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+  OfflineOperationData expected;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, expected));
+  OfflineOperationUndo offline;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, offline));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  // The actual replay operation stays present, unchanged, through source
+  // removal.
+  QueuedSourceIdentity retained;
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, retained));
+  EXPECT_EQ(identity.operationId, retained.operationId);
+  EXPECT_EQ(identity.revision, retained.revision);
+  uint32_t calls = 0;
+  nsMsgKey fresh = nsMsgKey_None;
+  Message* live = nullptr;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message* message) {
+    ++calls;
+    EXPECT_EQ(live, message);
+    EXPECT_FALSE(removed.Body());
+    EXPECT_FALSE(offline.Operation());
+    OfflineOperationData child, source;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, target, child));
+    EXPECT_EQ(fresh, child.sourceKey);
+    EXPECT_EQ(old, child.sourceUid);
+    EXPECT_EQ("imap://actual/source"_ns, child.sourceFolderURI);
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, source));
+    CheckUndoOfflinePayload(expected, source);
+    QueuedSourceIdentity actual;
+    ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, fresh, actual));
+    EXPECT_EQ(identity.operationId, actual.operationId);
+    EXPECT_EQ(identity.revision, actual.revision);
+    ASSERT_TRUE(actual.source);
+    EXPECT_EQ(old, actual.source->key);
+    EXPECT_EQ(old, actual.source->uid);
+    EXPECT_EQ(7u, actual.source->epoch);
+    bool active;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+  });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  FinishedMessageBody finished{"actual-finished-restore"_ns, 23, 23, 2, true};
+  ASSERT_EQ(NS_OK, db.RestoreMessageForUndo(mFolderId, removed, finished,
+                                            &fresh, &live, &offline));
+  RefPtr<Message> hold = dont_AddRef(live);
+  EXPECT_NE(old, fresh);
+  EXPECT_EQ(1u, calls);
+  cleanup.release();
+  db.RemoveMessageListener(observer);
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  ASSERT_EQ(NS_OK,
+            reopened.GetQueuedSourceIdentity(mFolderId, fresh, retained));
+  EXPECT_EQ(identity.operationId, retained.operationId);
+  EXPECT_EQ(identity.revision, retained.revision);
+  OfflineOperationData child;
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, target, child));
+  EXPECT_EQ(fresh, child.sourceKey);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened.GetOfflineOperation(mFolderId, old, child));
+}
+
+TEST_F(DeliveryCoreReferences, RetainedSourceUndoRejectsChangedOrSentCustody) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  for (bool sent : {false, true}) {
+    nsMsgKey old, target;
+    QueuedSourceIdentity identity;
+    ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+    OfflineOperationUndo offline;
+    ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                         mFolderId, old, identity.databaseSourceId, offline));
+    RemovedMessage removed;
+    ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+    if (sent) {
+      OfflineOperationData op;
+      ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, op));
+      uint64_t attempt;
+      ASSERT_EQ(NS_OK, db.BeginOfflineAction(
+                           mFolderId, old, nsIMsgOfflineImapOperation::kMsgCopy,
+                           op.copyDestinationBindings[0], Some(0u), attempt));
+    } else {
+      OfflineOperationData child;
+      ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, target, child));
+      child.keywordsToAdd = "changed child"_ns;
+      ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, target, child));
+    }
+    FinishedMessageBody finished{"finished-recovery-kept"_ns, 12, 12, 1, true};
+    nsMsgKey untouched = 123;
+    Message* live = nullptr;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.RestoreMessageForUndo(mFolderId, removed, finished, &untouched,
+                                       &live, &offline));
+    EXPECT_EQ(123u, untouched);
+    EXPECT_EQ(nullptr, live);
+    EXPECT_TRUE(removed.Body());
+    EXPECT_TRUE(offline.Operation());
+    QueuedSourceIdentity retained;
+    ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, retained));
+    EXPECT_EQ(identity.operationId, retained.operationId);
+    OfflineOperationData child;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, target, child));
+    EXPECT_EQ(old, child.sourceKey);
+    bool active;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       RetainedSourceUndoRejectsChangedEpochOrMissingTarget) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  for (bool missing : {false, true}) {
+    nsMsgKey old, target;
+    QueuedSourceIdentity identity;
+    ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+    OfflineOperationUndo offline;
+    ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                         mFolderId, old, identity.databaseSourceId, offline));
+    RemovedMessage removed;
+    ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+    if (missing) {
+      ASSERT_EQ(NS_OK, db.RemoveMessage(target));
+    } else {
+      ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 8));
+    }
+    FinishedMessageBody finished{"retained-recovery"_ns, 12, 12, 1, true};
+    nsMsgKey unchanged = 123;
+    Message* live = nullptr;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.RestoreMessageForUndo(mFolderId, removed, finished, &unchanged,
+                                       &live, &offline));
+    EXPECT_EQ(123u, unchanged);
+    EXPECT_EQ(nullptr, live);
+    EXPECT_TRUE(removed.Body());
+    EXPECT_TRUE(offline.Operation());
+    QueuedSourceIdentity actual;
+    ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, actual));
+    EXPECT_EQ(identity.operationId, actual.operationId);
+    EXPECT_EQ(identity.revision, actual.revision);
+    ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       RetainedSourceUndoSqlFailureKeepsRecoveryAndMappings) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, target;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+  OfflineOperationUndo offline;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, offline));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  RefPtr<FaultWitness> witness = new FaultWitness();
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateFunction("retained_undo_fault"_ns, 1, witness));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER reject_retained_source AFTER "
+                       "UPDATE OF messageKey "
+                       "ON main.offline_operations BEGIN SELECT "
+                       "retained_undo_fault(NEW.id); "
+                       "SELECT RAISE(ABORT,'retained source'); END"_ns));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_retained_source"_ns));
+    EXPECT_EQ(NS_OK, mConnection->RemoveFunction("retained_undo_fault"_ns));
+  });
+  FinishedMessageBody finished{"finished-recovery-kept"_ns, 12, 12, 1, true};
+  nsMsgKey untouched = 123;
+  Message* live = nullptr;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &untouched,
+                                     &live, &offline));
+  EXPECT_EQ(1u, witness->mCalls);
+  EXPECT_EQ(123u, untouched);
+  EXPECT_EQ(nullptr, live);
+  EXPECT_TRUE(removed.Body());
+  EXPECT_TRUE(offline.Operation());
+  QueuedSourceIdentity retained;
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, retained));
+  EXPECT_EQ(identity.operationId, retained.operationId);
+  OfflineOperationData child;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, target, child));
+  EXPECT_EQ(old, child.sourceKey);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER reject_retained_source"_ns));
+  ASSERT_EQ(NS_OK, db.RestoreMessageForUndo(mFolderId, removed, finished,
+                                            &untouched, &live, &offline));
+  RefPtr<Message> hold = dont_AddRef(live);
+  EXPECT_NE(123u, untouched);
+}
+
+TEST_F(DeliveryCoreReferences,
+       TypedReturnHomeBindsCapturedTupleBeforePublication) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, target, staged;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(old));
+  RawHdr raw;
+  raw.messageId = "returning-metadata-only"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  MessageBodyState returning;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(target, returning));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindMessageToServerUid(staged, mFolderId, 7, old));
+  ASSERT_EQ(NS_OK, db.BindStagedMessageToQueuedSource(
+                       staged, mFolderId, identity, Some(0u), returning));
+  uint32_t uid;
+  RefPtr<Message> stagedHeader = new Message(staged);
+  ASSERT_EQ(NS_OK, stagedHeader->GetUint32Property("uidOnServer", &uid));
+  EXPECT_EQ(old, uid);
+  nsCString stored;
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          mConnection, staged,
+          "SELECT value FROM staged_message_properties WHERE id=:id AND name='uidOnServer'"_ns,
+          stored));
+  nsAutoCString expectedUid;
+  expectedUid.AppendInt(old);
+  EXPECT_EQ(expectedUid, stored);
+  bool isStaged;
+  ASSERT_EQ(NS_OK, MessageIsStaged(staged, isStaged));
+  EXPECT_TRUE(isStaged);
+  uint32_t calls = 0;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message* message) {
+    ++calls;
+    nsMsgKey actual;
+    ASSERT_EQ(NS_OK, message->GetMessageKey(&actual));
+    EXPECT_EQ(staged, actual);
+    ASSERT_EQ(NS_OK, db.GetMessageUidOnServer(actual, uid));
+    EXPECT_EQ(old, uid);
+  });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, db.PublishMessage(staged, true));
+  EXPECT_EQ(1u, calls);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                               Some(0u), returning));
+}
+
+TEST_F(DeliveryCoreReferences, TypedReturnHomeRejectsStaleTupleAndCollisions) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, target, staged;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+  RawHdr raw;
+  raw.messageId = "typed-return-home"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  MessageBodyState returning;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(target, returning));
+  // Preserve the existing typed binder's UID-collision error.
+  // The still-live original owns this exact server tuple.
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                               Some(0u), returning));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(old));
+  auto bad = identity;
+  ++bad.revision;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, bad, Some(0u),
+                                               returning));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                               Some(1u), returning));
+  auto changed = returning;
+  changed.storeToken = Some(nsCString("0"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                               Some(0u), changed));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 8));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                               Some(0u), returning));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(staged, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+}
+
+TEST_F(DeliveryCoreReferences,
+       TypedReturnHomeRekeysWholeSourceBeforePublication) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, staged;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  OfflineOperationData expected;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, expected));
+  nsTArray<OfflineOperationData> childPayloads;
+  for (const auto& target : targets) {
+    auto& child = *childPayloads.AppendElement();
+    ASSERT_EQ(NS_OK,
+              db.GetOfflineOperation(target.folderId, target.key, child));
+  }
+  ASSERT_EQ(NS_OK, db.RemoveMessage(old));
+  RawHdr raw;
+  raw.messageId = "real-staged-return"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  MessageBodyState returning;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(targets[2].key, returning));
+  uint32_t calls = 0;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message* message) {
+    ++calls;
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, message->GetMessageKey(&key));
+    EXPECT_EQ(staged, key);
+    OfflineOperationData actual;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, staged, actual));
+    CheckUndoOfflinePayload(expected, actual);
+    for (uint32_t i = 0; i < targets.Length(); ++i) {
+      const auto& target = targets[i];
+      OfflineOperationData child;
+      ASSERT_EQ(NS_OK,
+                db.GetOfflineOperation(target.folderId, target.key, child));
+      childPayloads[i].sourceKey = staged;
+      CheckUndoOfflinePayload(childPayloads[i], child);
+      EXPECT_EQ(staged, child.sourceKey);
+      EXPECT_EQ(old, child.sourceUid);
+      EXPECT_EQ("imap://actual/source"_ns, child.sourceFolderURI);
+    }
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                                 Nothing(), returning));
+  });
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, db.BindStagedMessageToQueuedSource(
+                       staged, mFolderId, identity, Nothing(), returning));
+  EXPECT_EQ(0u, calls);
+  QueuedSourceIdentity rekeyed;
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, staged, rekeyed));
+  EXPECT_EQ(identity.operationId, rekeyed.operationId);
+  EXPECT_EQ(identity.revision, rekeyed.revision);
+  ASSERT_TRUE(rekeyed.source);
+  ASSERT_TRUE(identity.source);
+  ASSERT_TRUE(rekeyed.source);
+  EXPECT_EQ(identity.source->folderId, rekeyed.source->folderId);
+  EXPECT_EQ(identity.source->key, rekeyed.source->key);
+  EXPECT_EQ(identity.source->epoch, rekeyed.source->epoch);
+  EXPECT_EQ(identity.source->uid, rekeyed.source->uid);
+  EXPECT_EQ(old, rekeyed.source->key);
+  OfflineOperationData absent;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetOfflineOperation(mFolderId, old, absent));
+  // The actual caller cancels only the selected MOVE, on this same operation.
+  // Its unrelated ordered COPY tail remains exclusively owned by this id.
+  expected.operation &= ~nsIMsgOfflineImapOperation::kMsgMoved;
+  expected.pendingDestination.reset();
+  expected.destinationFolderURI.Truncate();
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, staged, expected));
+  ASSERT_EQ(NS_OK, db.PublishMessage(staged, true));
+  EXPECT_EQ(1u, calls);
+  cleanup.release();
+  db.RemoveMessageListener(observer);
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  ASSERT_EQ(NS_OK,
+            reopened.GetQueuedSourceIdentity(mFolderId, staged, rekeyed));
+  EXPECT_EQ(identity.operationId, rekeyed.operationId);
+  EXPECT_EQ(identity.revision + 1, rekeyed.revision);
+  ASSERT_TRUE(identity.source);
+  ASSERT_TRUE(rekeyed.source);
+  EXPECT_EQ(identity.source->folderId, rekeyed.source->folderId);
+  EXPECT_EQ(identity.source->key, rekeyed.source->key);
+  EXPECT_EQ(identity.source->epoch, rekeyed.source->epoch);
+  EXPECT_EQ(identity.source->uid, rekeyed.source->uid);
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, staged, actual));
+  CheckUndoOfflinePayload(expected, actual);
+}
+
+TEST_F(DeliveryCoreReferences,
+       TypedReturnHomeRekeyRollsBackUidSourceAndChildren) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, staged;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  OfflineOperationData expected;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, expected));
+  nsTArray<OfflineOperationData> childPayloads;
+  for (const auto& target : targets) {
+    auto& child = *childPayloads.AppendElement();
+    ASSERT_EQ(NS_OK,
+              db.GetOfflineOperation(target.folderId, target.key, child));
+  }
+  ASSERT_EQ(NS_OK, db.RemoveMessage(old));
+  RawHdr raw;
+  raw.messageId = "failed-staged-return"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  MessageBodyState returning;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(targets[2].key, returning));
+  for (const auto& condition :
+       {"NEW.messageKey != OLD.messageKey"_ns, "OLD.messageKey = "_ns}) {
+    nsAutoCString sql(
+        "CREATE TEMP TRIGGER reject_staged_rekey BEFORE UPDATE "
+        "ON offline_operations WHEN ");
+    sql.Append(condition);
+    if (condition.EqualsLiteral("OLD.messageKey = ")) {
+      // This is the final COPY child, after another child has been updated.
+      sql.AppendInt(targets[1].key);
+    }
+    sql.AppendLiteral(" BEGIN SELECT RAISE(ABORT,'staged rekey'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                                 Nothing(), returning));
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER reject_staged_rekey"_ns));
+    QueuedSourceIdentity actual;
+    ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, actual));
+    EXPECT_EQ(identity.operationId, actual.operationId);
+    EXPECT_EQ(identity.revision, actual.revision);
+    ASSERT_TRUE(identity.source);
+    ASSERT_TRUE(actual.source);
+    EXPECT_EQ(identity.source->folderId, actual.source->folderId);
+    EXPECT_EQ(identity.source->key, actual.source->key);
+    EXPECT_EQ(identity.source->epoch, actual.source->epoch);
+    EXPECT_EQ(identity.source->uid, actual.source->uid);
+    OfflineOperationData payload;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, payload));
+    CheckUndoOfflinePayload(expected, payload);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.GetOfflineOperation(mFolderId, staged, payload));
+    for (uint32_t i = 0; i < targets.Length(); ++i) {
+      const auto& target = targets[i];
+      ASSERT_EQ(NS_OK,
+                db.GetOfflineOperation(target.folderId, target.key, payload));
+      CheckUndoOfflinePayload(childPayloads[i], payload);
+      EXPECT_EQ(old, payload.sourceKey);
+    }
+    nsTArray<nsCString> names;
+    ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(staged, names));
+    EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       TypedReturnHomeRekeyRejectsChangedOrActiveCounterpart) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, staged;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(old));
+  RawHdr raw;
+  raw.messageId = "guarded-staged-return"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  MessageBodyState returning;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(targets[2].key, returning));
+  const auto& sibling = targets[1];
+  OfflineOperationData child;
+  ASSERT_EQ(NS_OK,
+            db.GetOfflineOperation(sibling.folderId, sibling.key, child));
+  child.sourceKey = targets[0].key;
+  ASSERT_EQ(NS_OK,
+            db.StoreOfflineOperation(sibling.folderId, sibling.key, child));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                               Nothing(), returning));
+  child.sourceKey = old;
+  child.playingBack = true;
+  ASSERT_EQ(NS_OK,
+            db.StoreOfflineOperation(sibling.folderId, sibling.key, child));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BindStagedMessageToQueuedSource(staged, mFolderId, identity,
+                                               Nothing(), returning));
+  QueuedSourceIdentity actual;
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, actual));
+  EXPECT_EQ(identity.operationId, actual.operationId);
+  EXPECT_EQ(identity.revision, actual.revision);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, db.GetMessagePropertyNames(staged, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+}
+
+TEST_F(DeliveryCoreReferences,
+       SelectedMoveUndoRedoOwnsFullIntentBeforeCallbacks) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  const auto selected = targets[2];
+  OfflineOperationData fullPayload, canceled;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, fullPayload));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, canceled));
+  canceled.operation &= ~nsIMsgOfflineImapOperation::kMsgMoved;
+  canceled.pendingDestination.reset();
+  canceled.destinationFolderURI.Truncate();
+  OfflineOperationUndo full, redo;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, full));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  nsMsgKey fresh = nsMsgKey_None;
+  Message* live = nullptr;
+  uint32_t added = 0;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message* message) {
+    ++added;
+    EXPECT_EQ(live, message);
+    EXPECT_FALSE(removed.Body());
+    EXPECT_FALSE(full.Operation());
+    ASSERT_TRUE(redo.Operation());
+    CheckUndoOfflinePayload(fullPayload, *redo.Operation());
+    OfflineOperationData actual;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, actual));
+    CheckUndoOfflinePayload(canceled, actual);
+    uint32_t uid;
+    ASSERT_EQ(NS_OK, db.GetMessageUidOnServer(fresh, uid));
+    EXPECT_EQ(old, uid);
+    for (const auto& target : targets) {
+      ASSERT_EQ(NS_OK,
+                db.GetOfflineOperation(target.folderId, target.key, actual));
+      EXPECT_EQ(fresh, actual.sourceKey);
+      EXPECT_EQ(target.key != selected.key,
+                !!(actual.operation & nsIMsgOfflineImapOperation::kMoveResult));
+      if (target.key == selected.key) {
+        EXPECT_EQ(uint32_t(nsIMsgOfflineImapOperation::kFlagsChanged),
+                  actual.operation);
+        EXPECT_EQ(UINT32_MAX, actual.newFlags);
+        EXPECT_EQ("unchanged child words"_ns, actual.keywordsToAdd);
+      }
+    }
+  });
+  db.AddMessageListener(observer);
+  auto detach = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  FinishedMessageBody finished{"selected-move-finished"_ns, 12, 12, 1, true};
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &fresh,
+                                     &live, &full, &selected, &redo));
+  RefPtr<Message> hold = dont_AddRef(live);
+  EXPECT_EQ(1u, added);
+  EXPECT_NE(old, fresh);
+  QueuedSourceIdentity current;
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, fresh, current));
+  EXPECT_EQ(identity.operationId, current.operationId);
+  EXPECT_EQ(identity.revision + 1, current.revision);
+  ASSERT_TRUE(current.source);
+  EXPECT_EQ(old, current.source->key);
+  EXPECT_EQ(old, current.source->uid);
+  detach.release();
+  db.RemoveMessageListener(observer);
+  RemovedMessage removedAgain;
+  OfflineOperationUndo next;
+  uint32_t removedCalls = 0;
+  RefPtr<UndoRemovalObserver> removal = new UndoRemovalObserver([&](Message*) {
+    ++removedCalls;
+    EXPECT_TRUE(removedAgain.Body());
+    EXPECT_FALSE(redo.Operation());
+    ASSERT_TRUE(next.Operation());
+    CheckUndoOfflinePayload(fullPayload, *next.Operation());
+    OfflineOperationData actual;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, actual));
+    CheckUndoOfflinePayload(fullPayload, actual);
+    for (const auto& target : targets) {
+      ASSERT_EQ(NS_OK,
+                db.GetOfflineOperation(target.folderId, target.key, actual));
+      EXPECT_TRUE(actual.operation & nsIMsgOfflineImapOperation::kMoveResult);
+      EXPECT_EQ(fresh, actual.sourceKey);
+    }
+  });
+  db.AddMessageListener(removal);
+  auto detachRemoval =
+      MakeScopeExit([&] { db.RemoveMessageListener(removal); });
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(
+                       fresh, mFolderId, identity.databaseSourceId,
+                       MessageRemovalAccounting::OfflineMessageSize,
+                       removedAgain, &redo, &next));
+  EXPECT_EQ(1u, removedCalls);
+  EXPECT_FALSE(redo.Operation());
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, fresh, current));
+  EXPECT_EQ(identity.operationId, current.operationId);
+  EXPECT_EQ(identity.revision + 2, current.revision);
+  detachRemoval.release();
+  db.RemoveMessageListener(removal);
+  // A second Undo uses the newly owned full snapshot, not a borrowed consumed
+  // Operation() or a reconstructed partial MOVE.
+  nsMsgKey second = nsMsgKey_None;
+  Message* secondLive = nullptr;
+  OfflineOperationUndo secondRedo;
+  finished.storeToken = "second-selected-move-finished"_ns;
+  ASSERT_EQ(NS_OK, db.RestoreMessageForUndo(mFolderId, removedAgain, finished,
+                                            &second, &secondLive, &next,
+                                            &selected, &secondRedo));
+  RefPtr<Message> secondHold = dont_AddRef(secondLive);
+  EXPECT_NE(fresh, second);
+  EXPECT_FALSE(next.Operation());
+  ASSERT_TRUE(secondRedo.Operation());
+  CheckUndoOfflinePayload(fullPayload, *secondRedo.Operation());
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, second, actual));
+  CheckUndoOfflinePayload(canceled, actual);
+}
+
+TEST_F(DeliveryCoreReferences, SelectedMoveOnlyUndoKeepsNativeRedoCustody) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, target;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, payload));
+  payload.operation = nsIMsgOfflineImapOperation::kMsgMoved;
+  payload.copyDestinations.Clear();
+  payload.copyDestinationBindings.Clear();
+  const PendingDestination selected{mFolderId, target, 7};
+  payload.pendingDestination = Some(selected);
+  payload.destinationFolderURI = "actual-selected-move"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, payload));
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, identity));
+  OfflineOperationUndo full, redo;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, full));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  FinishedMessageBody finished{"move-only-finished"_ns, 15, 15, 2, true};
+  nsMsgKey fresh;
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &fresh,
+                                     nullptr, &full, &selected, &redo));
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, actual));
+  EXPECT_EQ(0u, actual.operation);
+  EXPECT_FALSE(actual.pendingDestination);
+  EXPECT_TRUE(actual.destinationFolderURI.IsEmpty());
+  EXPECT_FALSE(full.Operation());
+  ASSERT_TRUE(redo.Operation());
+  CheckUndoOfflinePayload(payload, *redo.Operation());
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(target, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, target, actual));
+  EXPECT_EQ(0u, actual.operation);
+  EXPECT_EQ(fresh, actual.sourceKey);
+  // Ordinary observation skips canceled counterpart markers even after reopen.
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  auto& reopened = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, target, actual));
+  EXPECT_EQ(0u, actual.operation);
+  ASSERT_EQ(NS_OK, reopened.MessageExists(target, exists));
+  EXPECT_TRUE(exists);
+  // Actual replay removes both zero-bit records before a later user Redo.
+  ASSERT_EQ(NS_OK, reopened.RemoveOfflineOperation(mFolderId, target));
+  ASSERT_EQ(NS_OK, reopened.RemoveOfflineOperation(mFolderId, fresh));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened.GetOfflineOperation(mFolderId, fresh, actual));
+  RemovedMessage again;
+  OfflineOperationUndo next;
+  ASSERT_EQ(NS_OK, reopened.RemoveMessageForUndo(
+                       fresh, mFolderId, identity.databaseSourceId,
+                       MessageRemovalAccounting::OfflineMessageSize, again,
+                       &redo, &next));
+  ASSERT_TRUE(next.Operation());
+  CheckUndoOfflinePayload(payload, *next.Operation());
+  ASSERT_EQ(NS_OK, reopened.GetOfflineOperation(mFolderId, target, actual));
+  EXPECT_TRUE(actual.operation & nsIMsgOfflineImapOperation::kMoveResult);
+  EXPECT_EQ(fresh, actual.sourceKey);
+}
+
+TEST_F(DeliveryCoreReferences,
+       SelectedMoveUndoFailureKeepsFullCaptureAndOwningOutputs) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  OfflineOperationData expected;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, expected));
+  OfflineOperationUndo full, redo;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, full));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  FinishedMessageBody finished{"retry-selected-finished"_ns, 12, 12, 1, true};
+  nsMsgKey untouched = 123;
+  Message* live = nullptr;
+  auto wrong = targets[0];
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &untouched,
+                                     &live, &full, &wrong, &redo));
+  nsAutoCString sql(
+      "CREATE TEMP TRIGGER fail_selected_cancel BEFORE UPDATE "
+      "OF operation ON offline_operations WHEN OLD.id=");
+  sql.AppendInt(identity.operationId);
+  sql.AppendLiteral(" BEGIN SELECT RAISE(ABORT,'selected cancel'); END");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &untouched,
+                                     &live, &full, &targets[2], &redo));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_selected_cancel"_ns));
+  EXPECT_EQ(123u, untouched);
+  EXPECT_EQ(nullptr, live);
+  EXPECT_TRUE(removed.Body());
+  ASSERT_TRUE(full.Operation());
+  EXPECT_FALSE(redo.Operation());
+  CheckUndoOfflinePayload(expected, *full.Operation());
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, actual));
+  CheckUndoOfflinePayload(expected, actual);
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(mFolderId, old, identity));
+  for (const auto& target : targets) {
+    ASSERT_EQ(NS_OK,
+              db.GetOfflineOperation(target.folderId, target.key, actual));
+    EXPECT_EQ(old, actual.sourceKey);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       SelectedMoveRedoRemovalFailureKeepsCanceledSourceAndRetry) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  OfflineOperationUndo full, redo;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, full));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  FinishedMessageBody finished{"redo-failure-finished"_ns, 12, 12, 1, true};
+  nsMsgKey fresh;
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &fresh,
+                                     nullptr, &full, &targets[2], &redo));
+  OfflineOperationData canceled, canceledChild;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, canceled));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(targets[2].folderId, targets[2].key,
+                                          canceledChild));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_selected_redo BEFORE DELETE "
+          "ON messages BEGIN SELECT RAISE(ABORT,'selected redo'); END"_ns));
+  RemovedMessage again;
+  OfflineOperationUndo next;
+  EXPECT_EQ(
+      NS_ERROR_STORAGE_CONSTRAINT,
+      db.RemoveMessageForUndo(fresh, mFolderId, identity.databaseSourceId,
+                              MessageRemovalAccounting::OfflineMessageSize,
+                              again, &redo, &next));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_selected_redo"_ns));
+  EXPECT_FALSE(again.Body());
+  EXPECT_FALSE(next.Operation());
+  ASSERT_TRUE(redo.Operation());
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(fresh, exists));
+  EXPECT_TRUE(exists);
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, actual));
+  CheckUndoOfflinePayload(canceled, actual);
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(targets[2].folderId, targets[2].key,
+                                          actual));
+  CheckUndoOfflinePayload(canceledChild, actual);
+  EXPECT_FALSE(actual.operation & nsIMsgOfflineImapOperation::kMoveResult);
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(
+                       fresh, mFolderId, identity.databaseSourceId,
+                       MessageRemovalAccounting::OfflineMessageSize, again,
+                       &redo, &next));
+  EXPECT_FALSE(redo.Operation());
+  ASSERT_TRUE(next.Operation());
+}
+
+TEST_F(DeliveryCoreReferences,
+       SelectedMoveRedoRefusesChangedCounterpartWithoutSourceLoss) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  OfflineOperationUndo full, redo;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, full));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  FinishedMessageBody finished{"stale-redo-finished"_ns, 12, 12, 1, true};
+  nsMsgKey fresh;
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &fresh,
+                                     nullptr, &full, &targets[2], &redo));
+  OfflineOperationData expected, child;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, expected));
+  ASSERT_EQ(NS_OK,
+            db.GetOfflineOperation(targets[1].folderId, targets[1].key, child));
+  child.keywordsToAdd = "later actual intent"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(targets[1].folderId, targets[1].key,
+                                            child));
+  RemovedMessage again;
+  OfflineOperationUndo next;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db.RemoveMessageForUndo(fresh, mFolderId, identity.databaseSourceId,
+                              MessageRemovalAccounting::OfflineMessageSize,
+                              again, &redo, &next));
+  EXPECT_FALSE(again.Body());
+  EXPECT_FALSE(next.Operation());
+  ASSERT_TRUE(redo.Operation());
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(fresh, exists));
+  EXPECT_TRUE(exists);
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, actual));
+  CheckUndoOfflinePayload(expected, actual);
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(targets[1].folderId, targets[1].key,
+                                          actual));
+  CheckUndoOfflinePayload(child, actual);
+}
+
+TEST_F(DeliveryCoreReferences,
+       SelectedMoveCounterpartCancellationFailureRollsBackBeforePublication) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old;
+  nsTArray<PendingDestination> targets;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForStagedReturn(old, targets, identity));
+  OfflineOperationData expected;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, expected));
+  nsTArray<OfflineOperationData> children;
+  for (const auto& target : targets) {
+    auto& child = *children.AppendElement();
+    ASSERT_EQ(NS_OK,
+              db.GetOfflineOperation(target.folderId, target.key, child));
+  }
+  OfflineOperationUndo full, redo;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, full));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  nsAutoCString sql(
+      "CREATE TEMP TRIGGER fail_selected_counterpart BEFORE UPDATE "
+      "OF operation ON offline_operations WHEN OLD.messageKey=");
+  sql.AppendInt(targets[2].key);
+  sql.AppendLiteral(" AND (OLD.operation & ");
+  sql.AppendInt(uint32_t(nsIMsgOfflineImapOperation::kMoveResult));
+  sql.AppendLiteral(")!=0 AND (NEW.operation & ");
+  sql.AppendInt(uint32_t(nsIMsgOfflineImapOperation::kMoveResult));
+  sql.AppendLiteral(")=0 BEGIN SELECT RAISE(ABORT,'canceled child'); END");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  FinishedMessageBody finished{"child-failure-finished"_ns, 12, 12, 1, true};
+  nsMsgKey result = 123;
+  Message* live = nullptr;
+  uint32_t publications = 0;
+  RefPtr<AddedObserver> observer =
+      new AddedObserver([&](Message*) { ++publications; });
+  db.AddMessageListener(observer);
+  auto detach = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &result,
+                                     &live, &full, &targets[2], &redo));
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TRIGGER fail_selected_counterpart"_ns));
+  EXPECT_EQ(123u, result);
+  EXPECT_EQ(nullptr, live);
+  EXPECT_EQ(0u, publications);
+  EXPECT_TRUE(removed.Body());
+  ASSERT_TRUE(full.Operation());
+  EXPECT_FALSE(redo.Operation());
+  CheckUndoOfflinePayload(expected, *full.Operation());
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, actual));
+  CheckUndoOfflinePayload(expected, actual);
+  for (uint32_t i = 0; i < targets.Length(); ++i) {
+    const auto& target = targets[i];
+    ASSERT_EQ(NS_OK,
+              db.GetOfflineOperation(target.folderId, target.key, actual));
+    CheckUndoOfflinePayload(children[i], actual);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       SelectedMoveRedoRejectsCleanedCounterpartBodyChange) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey old, target;
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, QueuedSourceForUndo(old, target, identity));
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, payload));
+  payload.operation = nsIMsgOfflineImapOperation::kMsgMoved;
+  payload.copyDestinations.Clear();
+  payload.copyDestinationBindings.Clear();
+  const PendingDestination selected{mFolderId, target, 7};
+  payload.pendingDestination = Some(selected);
+  payload.destinationFolderURI = "actual-selected-move"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, payload));
+  OfflineOperationUndo full, redo;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                       mFolderId, old, identity.databaseSourceId, full));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  FinishedMessageBody finished{"changed-child-finished"_ns, 15, 15, 2, true};
+  nsMsgKey fresh;
+  ASSERT_EQ(NS_OK,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &fresh,
+                                     nullptr, &full, &selected, &redo));
+  OfflineOperationData canceled;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, canceled));
+  ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, target));
+  ASSERT_EQ(NS_OK,
+            db.SetMessageStoreToken(target, "later-physical-location"_ns));
+  RemovedMessage again;
+  OfflineOperationUndo next;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db.RemoveMessageForUndo(fresh, mFolderId, identity.databaseSourceId,
+                              MessageRemovalAccounting::OfflineMessageSize,
+                              again, &redo, &next));
+  EXPECT_FALSE(again.Body());
+  EXPECT_FALSE(next.Operation());
+  ASSERT_TRUE(redo.Operation());
+  CheckUndoOfflinePayload(payload, *redo.Operation());
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(fresh, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db.MessageExists(target, exists));
+  EXPECT_TRUE(exists);
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, actual));
+  CheckUndoOfflinePayload(canceled, actual);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetOfflineOperation(mFolderId, target, actual));
+  MessageBodyState body;
+  ASSERT_EQ(NS_OK, db.GetMessageBodyState(target, body));
+  ASSERT_TRUE(body.storeToken);
+  EXPECT_EQ("later-physical-location"_ns, *body.storeToken);
+}
+
+TEST_F(DeliveryCoreReferences, UndoOfflineRestorePublishesCompleteAssociation) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  nsMsgKey old, sourceKey, sibling;
+  ASSERT_EQ(NS_OK,
+            Add("offline-undo@invalid"_ns, {"raw"_ns, ""_ns, "raw"_ns}, old));
+  ASSERT_EQ(NS_OK, Add("offline-source@invalid"_ns, {}, sourceKey));
+  ASSERT_EQ(NS_OK, Add("offline-sibling@invalid"_ns, {}, sibling));
+  ASSERT_EQ(NS_OK, db.SetMessageUidOnServer(sourceKey, 42));
+  OfflineOperationData original;
+  original.operation = nsIMsgOfflineImapOperation::kMoveResult |
+                       nsIMsgOfflineImapOperation::kFlagsChanged;
+  original.flagOperation = 0x80000000;
+  original.newFlags = UINT32_MAX;
+  original.sourceKey = sourceKey;
+  original.sourceUid = 42;
+  original.messageSize = UINT32_MAX;
+  original.sourceFolderURI = "imap://source/Inbox"_ns;
+  original.destinationFolderURI = "imap://destination/Copy"_ns;
+  original.keywordsToAdd = "first second"_ns;
+  original.keywordsToRemove = "old"_ns;
+  original.copyDestinations = {"same"_ns, "same"_ns, "last"_ns};
+  original.copyDestinationBindings = {Nothing(), Nothing(), Nothing()};
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, original));
+  OfflineOperationData source;
+  source.operation = nsIMsgOfflineImapOperation::kMsgCopy;
+  source.copyDestinations = {"duplicate"_ns, "duplicate"_ns, "last"_ns};
+  source.copyDestinationBindings = {
+      Nothing(), Some(PendingDestination{mFolderId, old, 7}),
+      Some(PendingDestination{mFolderId, sibling, 7})};
+  source.keywordsToAdd = "source unchanged"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, sourceKey, source));
+  OfflineUndoCounterpart counterpart{
+      sourceId,          mFolderId,
+      sourceKey,         nsIMsgOfflineImapOperation::kMsgCopy,
+      Some(uint32_t(1)), {mFolderId, old, 7}};
+  OfflineOperationUndo operation;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(mFolderId, old, sourceId,
+                                                     operation, &counterpart));
+  ASSERT_TRUE(operation.Operation());
+  CheckUndoOfflinePayload(original, *operation.Operation());
+  ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, old));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  FinishedMessageBody finished{"new-finished-body"_ns, 23, 23, 2, true};
+  nsMsgKey result = 123;
+  Message* live = nullptr;
+  uint32_t publications = 0;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message* message) {
+    ++publications;
+    EXPECT_FALSE(removed.Body());
+    EXPECT_FALSE(operation.Operation());
+    EXPECT_EQ(live, message);
+    nsMsgKey actual;
+    ASSERT_EQ(NS_OK, message->GetMessageKey(&actual));
+    EXPECT_EQ(result, actual);
+    EXPECT_NE(old, actual);
+    OfflineOperationData restored, rebound;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, actual, restored));
+    CheckUndoOfflinePayload(original, restored);
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, sourceKey, rebound));
+    source.copyDestinationBindings[1]->key = actual;
+    CheckUndoOfflinePayload(source, rebound);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+    nsCString count;
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, actual,
+            "SELECT COUNT(*) FROM messages m JOIN offline_operations o "
+            "ON o.messageKey=m.id AND o.folderId=m.folderId WHERE m.id=:id"_ns,
+            count));
+    EXPECT_EQ("1"_ns, count);
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, actual,
+            "SELECT COUNT(*) FROM message_properties WHERE id=:id AND name='uidOnServer'"_ns,
+            count));
+    EXPECT_EQ("0"_ns, count);
+  });
+  db.AddMessageListener(observer);
+  auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, db.RestoreMessageForUndo(mFolderId, removed, finished,
+                                            &result, &live, &operation));
+  RefPtr<Message> restored = dont_AddRef(live);
+  EXPECT_EQ(1u, publications);
+  db.RemoveMessageListener(observer);
+  unwatch.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  OfflineOperationData got;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolderId, result, got));
+  CheckUndoOfflinePayload(original, got);
+  Maybe<ServerMessageLocation> queued;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperationSource(
+                       mFolderId, result, queued));
+  EXPECT_FALSE(queued);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolderId, sourceKey, got));
+  source.copyDestinationBindings[1]->key = result;
+  CheckUndoOfflinePayload(source, got);
+}
+
+TEST_F(DeliveryCoreReferences, UndoOfflineRestoreKeepsSavedSourcePresence) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  for (bool bound : {false, true}) {
+    auto& db = mCore->MessageDB();
+    nsMsgKey old, control;
+    ASSERT_EQ(NS_OK, Add("queued-undo@invalid"_ns, {}, old));
+    ASSERT_EQ(NS_OK, Add("unchanged-operation@invalid"_ns, {}, control));
+    if (bound) ASSERT_EQ(NS_OK, db.SetMessageUidOnServer(old, 42));
+    OfflineOperationData original;
+    original.operation = bound ? nsIMsgOfflineImapOperation::kFlagsChanged
+                               : nsIMsgOfflineImapOperation::kAppendDraft;
+    if (!bound)
+      original.pendingDestination = Some(PendingDestination{mFolderId, old, 7});
+    original.newFlags = UINT32_MAX;
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, original));
+    OfflineOperationData controlOp;
+    controlOp.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+    controlOp.newFlags = UINT32_MAX;
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, control, controlOp));
+    // A later header binding must not turn captured Nothing into Some.
+    if (!bound) ASSERT_EQ(NS_OK, db.SetMessageUidOnServer(old, 99));
+    nsCString sourceId;
+    ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+    OfflineOperationUndo operation;
+    ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(mFolderId, old, sourceId,
+                                                       operation));
+    // An exact retained capture may now rekey atomically. Keep the original
+    // refusal/output-custody checks against a real later queue revision.
+    OfflineOperationData intervening;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, intervening));
+    intervening.keywordsToAdd = "queued after capture"_ns;
+    // This later queue revision drops its old APPEND association. The header
+    // is already UID-bound, so it must not remain a pending APPEND target.
+    intervening.pendingDestination.reset();
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, intervening));
+    RemovedMessage removed;
+    ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+    FinishedMessageBody finished{"finished-queued"_ns, 12, 12, 1, true};
+    nsMsgKey result = 123;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.RestoreMessageForUndo(mFolderId, removed, finished, &result,
+                                       nullptr, &operation));
+    EXPECT_EQ(123u, result);
+    ASSERT_TRUE(removed.Body());
+    ASSERT_TRUE(operation.Operation());
+    OfflineOperationData retained;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, old, retained));
+    CheckUndoOfflinePayload(intervening, retained);
+    ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, old));
+    ASSERT_EQ(NS_OK, db.RestoreMessageForUndo(mFolderId, removed, finished,
+                                              &result, nullptr, &operation));
+    EXPECT_NE(old, result);
+    if (original.pendingDestination) original.pendingDestination->key = result;
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    auto& current = mCore->MessageDB();
+    for (bool update : {false, true}) {
+      if (update) {
+        original.keywordsToAdd = "later payload update"_ns;
+        ASSERT_EQ(NS_OK,
+                  current.StoreOfflineOperation(mFolderId, result, original));
+      }
+      OfflineOperationData payload;
+      ASSERT_EQ(NS_OK, current.GetOfflineOperation(mFolderId, result, payload));
+      CheckUndoOfflinePayload(original, payload);
+      Maybe<ServerMessageLocation> queued;
+      ASSERT_EQ(NS_OK,
+                current.GetOfflineOperationSource(mFolderId, result, queued));
+      EXPECT_EQ(bound, queued.isSome());
+      if (bound) {
+        EXPECT_EQ(mFolderId, queued->folderId);
+        EXPECT_EQ(old, queued->key);
+        EXPECT_EQ(7u, queued->epoch);
+        EXPECT_EQ(42u, queued->uid);
+      }
+      nsCString stored;
+      ASSERT_EQ(
+          NS_OK,
+          PublicationCell(
+              mConnection, result,
+              "SELECT COALESCE(sourcePhysicalKey,'absent') FROM offline_operations WHERE messageKey=:id"_ns,
+              stored));
+      nsAutoCString expected;
+      if (bound)
+        expected.AppendInt(old);
+      else
+        expected = "absent"_ns;
+      EXPECT_EQ(expected, stored);
+    }
+    nsTArray<nsCString> names;
+    ASSERT_EQ(NS_OK, current.GetMessagePropertyNames(result, names));
+    EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+    OfflineOperationData unchanged;
+    ASSERT_EQ(NS_OK,
+              current.GetOfflineOperation(mFolderId, control, unchanged));
+    EXPECT_TRUE(unchanged.keywordsToAdd.IsEmpty());
+    EXPECT_EQ(UINT32_MAX, unchanged.newFlags);
+    nsCString revision;
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            mConnection, control,
+            "SELECT revision FROM offline_operations WHERE messageKey=:id"_ns,
+            revision));
+    EXPECT_EQ("1"_ns, revision);
+  }
+}
+
+TEST_F(DeliveryCoreReferences, UndoOfflineAssociationFailuresRetainEverything) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  for (bool commitFailure : {false, true}) {
+    nsMsgKey old, sourceKey;
+    ASSERT_EQ(NS_OK, Add("retained-source@invalid"_ns, {}, sourceKey));
+    ASSERT_EQ(NS_OK, Add("failed-association@invalid"_ns,
+                         {"retained-source@invalid"_ns}, old));
+    OfflineOperationData own;
+    own.operation = nsIMsgOfflineImapOperation::kMoveResult;
+    own.copyDestinations = {"retained-copy"_ns};
+    own.copyDestinationBindings = {Nothing()};
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, own));
+    OfflineOperationData source;
+    source.operation = nsIMsgOfflineImapOperation::kMsgMoved;
+    source.pendingDestination = Some(PendingDestination{mFolderId, old, 7});
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, sourceKey, source));
+    OfflineUndoCounterpart counterpart{
+        sourceId,  mFolderId,
+        sourceKey, nsIMsgOfflineImapOperation::kMsgMoved,
+        Nothing(), {mFolderId, old, 7}};
+    OfflineOperationUndo operation;
+    ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                         mFolderId, old, sourceId, operation, &counterpart));
+    ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, old));
+    RemovedMessage removed;
+    ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+    if (commitFailure) {
+      // Enable deferred checking after the ordinary fixture setup. The
+      // restored row has a real surviving parent, rather than a zero sentinel.
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                           "undo_parent(id INTEGER PRIMARY KEY); "
+                           "CREATE TEMP TABLE undo_child(id INTEGER REFERENCES "
+                           "undo_parent(id) "
+                           "DEFERRABLE INITIALLY DEFERRED)"_ns));
+    }
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK, mConnection->CreateFunction("undo_association_fault"_ns, 1,
+                                                 witness));
+    nsAutoCString sql("CREATE TEMP TRIGGER fail_undo_association ");
+    sql.Append(commitFailure ? "AFTER" : "BEFORE");
+    sql.AppendLiteral(
+        " UPDATE ON main.offline_operations WHEN NEW.messageKey=");
+    sql.AppendInt(sourceKey);
+    sql.AppendLiteral(
+        " BEGIN SELECT undo_association_fault(NEW.destinationKey); ");
+    sql.Append(commitFailure
+                   ? "INSERT INTO undo_child VALUES(NEW.destinationKey); END"
+                   : "SELECT RAISE(ABORT,'association write'); END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS fail_undo_association"_ns));
+      EXPECT_EQ(NS_OK,
+                mConnection->RemoveFunction("undo_association_fault"_ns));
+    });
+    uint32_t publications = 0;
+    RefPtr<AddedObserver> observer =
+        new AddedObserver([&](Message*) { ++publications; });
+    db.AddMessageListener(observer);
+    auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    FinishedMessageBody finished{"retained-finished"_ns, 12, 12, 1, true};
+    nsMsgKey result = 123;
+    Message* live = nullptr;
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              db.RestoreMessageForUndo(mFolderId, removed, finished, &result,
+                                       &live, &operation));
+    EXPECT_EQ(1u, witness->mCalls);
+    EXPECT_EQ(123u, result);
+    EXPECT_EQ(nullptr, live);
+    EXPECT_EQ(0u, publications);
+    ASSERT_TRUE(removed.Body());
+    EXPECT_EQ(old, removed.Body()->key);
+    ASSERT_TRUE(operation.Operation());
+    CheckUndoOfflinePayload(own, *operation.Operation());
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    OfflineOperationData unchanged;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, sourceKey, unchanged));
+    CheckUndoOfflinePayload(source, unchanged);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+    for (const auto& query :
+         {"SELECT COUNT(*) FROM messages WHERE id=:id"_ns,
+          "SELECT COUNT(*) FROM message_properties WHERE id=:id"_ns,
+          "SELECT COUNT(*) FROM offline_operations WHERE messageKey=:id"_ns}) {
+      nsCString count;
+      ASSERT_EQ(NS_OK,
+                PublicationCell(reader, witness->mLastKey, query, count));
+      EXPECT_EQ("0"_ns, count);
+    }
+    nsCString revision;
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, sourceKey,
+            "SELECT revision FROM offline_operations WHERE messageKey=:id"_ns,
+            revision));
+    EXPECT_EQ("1"_ns, revision);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER fail_undo_association"_ns));
+    ASSERT_EQ(NS_OK, db.RestoreMessageForUndo(mFolderId, removed, finished,
+                                              &result, &live, &operation));
+    RefPtr<Message> restored = dont_AddRef(live);
+    EXPECT_EQ(1u, publications);
+    EXPECT_FALSE(removed.Body());
+    EXPECT_FALSE(operation.Operation());
+  }
+}
+
+TEST_F(DeliveryCoreReferences, UndoOfflineCaptureAndRestoreGuardOwnedIdentity) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  nsMsgKey old, other, sourceKey;
+  ASSERT_EQ(NS_OK, Add("guarded-offline-undo@invalid"_ns, {}, old));
+  ASSERT_EQ(NS_OK, Add("wrong-capture@invalid"_ns, {}, other));
+  ASSERT_EQ(NS_OK, Add("guarded-counterpart@invalid"_ns, {}, sourceKey));
+  OfflineOperationData own;
+  own.operation = nsIMsgOfflineImapOperation::kMoveResult;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, own));
+  OfflineOperationData source;
+  source.operation = nsIMsgOfflineImapOperation::kMsgCopy;
+  source.copyDestinations = {"first"_ns};
+  source.copyDestinationBindings = {
+      Some(PendingDestination{mFolderId, old, 7})};
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, sourceKey, source));
+  OfflineUndoCounterpart counterpart{
+      sourceId,          mFolderId,
+      sourceKey,         nsIMsgOfflineImapOperation::kMsgCopy,
+      Some(uint32_t(0)), {mFolderId, old, 7}};
+  OfflineOperationUndo operation;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(mFolderId, old, sourceId,
+                                                     operation, &counterpart));
+  counterpart.copyOrdinal = Some(uint32_t(1));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.CaptureOfflineOperationForUndo(mFolderId, old, sourceId,
+                                              operation, &counterpart));
+  ASSERT_TRUE(operation.Operation());
+  counterpart.copyOrdinal.reset();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.CaptureOfflineOperationForUndo(mFolderId, old, sourceId,
+                                              operation, &counterpart));
+  counterpart.copyOrdinal = Some(uint32_t(0));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CaptureOfflineOperationForUndo(mFolderId, old, "foreign"_ns,
+                                              operation));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.CaptureOfflineOperationForUndo(
+                                      mFolderId, old, sourceId, operation));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  // A checked payload edit invalidates the captured native revision.
+  source.keywordsToAdd = "changed after capture"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, sourceKey, source));
+  ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, old));
+  RemovedMessage removed, wrong;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(other, wrong));
+  FinishedMessageBody finished{"owned-finished"_ns, 12, 12, 1, true};
+  nsMsgKey result = 123;
+  Message* live = nullptr;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RestoreMessageForUndo(mFolderId, wrong, finished, &result, &live,
+                                     &operation));
+  EXPECT_EQ(123u, result);
+  EXPECT_EQ(nullptr, live);
+  ASSERT_TRUE(wrong.Body());
+  ASSERT_TRUE(operation.Operation());
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &result,
+                                     &live, &operation));
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  RefPtr<Message> held = new Message(sourceKey);
+  live = held.get();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &result,
+                                     &live, &operation));
+  EXPECT_EQ(held.get(), live);
+  live = nullptr;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.RestoreMessageForUndo(mFolderId, removed, finished, &result,
+                                     &live, &operation));
+  EXPECT_EQ(123u, result);
+  ASSERT_TRUE(removed.Body());
+  ASSERT_TRUE(operation.Operation());
+  bool exists = true;
+  ASSERT_EQ(NS_OK, db.MessageExists(old, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences, UndoOfflineCaptureRejectsDispatchedOperations) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  for (OfflineAttemptState state :
+       {OfflineAttemptState::Sent, OfflineAttemptState::Confirmed,
+        OfflineAttemptState::Ambiguous}) {
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, Add("dispatched-undo@invalid"_ns, {}, key));
+    ASSERT_EQ(NS_OK, db.SetMessageUidOnServer(key, 42));
+    OfflineOperationData own;
+    own.operation = nsIMsgOfflineImapOperation::kFlagsChanged |
+                    nsIMsgOfflineImapOperation::kAddKeywords;
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, own));
+    OfflineOperationUndo operation;
+    ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(mFolderId, key, sourceId,
+                                                       operation));
+    ASSERT_EQ(NS_OK, db.SetOfflineOperationPlayingBack(mFolderId, key, true));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.CaptureOfflineOperationForUndo(
+                                          mFolderId, key, sourceId, operation));
+    ASSERT_EQ(NS_OK, db.SetOfflineOperationPlayingBack(mFolderId, key, false));
+    uint64_t attemptId = 0;
+    ASSERT_EQ(NS_OK,
+              db.BeginOfflineAttempt(mFolderId, key,
+                                     nsIMsgOfflineImapOperation::kFlagsChanged,
+                                     Nothing(), attemptId));
+    if (state == OfflineAttemptState::Confirmed) {
+      ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(attemptId, Nothing()));
+    } else if (state == OfflineAttemptState::Ambiguous) {
+      ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(attemptId));
+    }
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.CaptureOfflineOperationForUndo(
+                                          mFolderId, key, sourceId, operation));
+    ASSERT_TRUE(operation.Operation());
+    EXPECT_EQ(own.operation, operation.Operation()->operation);
+  }
+}
+
+TEST_F(DeliveryCoreReferences, UndoOfflineRestoreRejectsChangedCounterpart) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  for (uint32_t failure : {0u, 1u, 2u}) {
+    ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+    nsMsgKey old, sourceKey;
+    ASSERT_EQ(NS_OK, Add("stale-target@invalid"_ns, {}, old));
+    ASSERT_EQ(NS_OK, Add("stale-counterpart@invalid"_ns, {}, sourceKey));
+    ASSERT_EQ(NS_OK, db.SetMessageUidOnServer(sourceKey, 42));
+    OfflineOperationData own;
+    own.operation = nsIMsgOfflineImapOperation::kMoveResult;
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, old, own));
+    OfflineOperationData source;
+    source.operation = nsIMsgOfflineImapOperation::kMsgMoved;
+    source.pendingDestination = Some(PendingDestination{mFolderId, old, 7});
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, sourceKey, source));
+    OfflineUndoCounterpart counterpart{
+        sourceId,  mFolderId,
+        sourceKey, nsIMsgOfflineImapOperation::kMsgMoved,
+        Nothing(), {mFolderId, old, 7}};
+    OfflineOperationUndo operation;
+    ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(
+                         mFolderId, old, sourceId, operation, &counterpart));
+    if (failure == 0) {
+      // Same key and payload, different authoritative native identity.
+      ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, sourceKey));
+      ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, sourceKey, source));
+    } else if (failure == 1) {
+      ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 8));
+    } else {
+      uint64_t attemptId;
+      ASSERT_EQ(NS_OK,
+                db.BeginOfflineAttempt(mFolderId, sourceKey,
+                                       nsIMsgOfflineImapOperation::kMsgMoved,
+                                       source.pendingDestination, attemptId));
+    }
+    ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, old));
+    RemovedMessage removed;
+    ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(old, removed));
+    FinishedMessageBody finished{"stale-finished"_ns, 12, 12, 1, true};
+    nsMsgKey result = 123;
+    Message* live = nullptr;
+    uint32_t published = 0;
+    RefPtr<AddedObserver> observer =
+        new AddedObserver([&](Message*) { ++published; });
+    db.AddMessageListener(observer);
+    auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.RestoreMessageForUndo(mFolderId, removed, finished, &result,
+                                       &live, &operation));
+    EXPECT_EQ(123u, result);
+    EXPECT_EQ(nullptr, live);
+    EXPECT_EQ(0u, published);
+    ASSERT_TRUE(removed.Body());
+    ASSERT_TRUE(operation.Operation());
+    OfflineOperationData unchanged;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, sourceKey, unchanged));
+    CheckUndoOfflinePayload(source, unchanged);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       OfflineUndoSourceSchemaPreservesLegacyAndRejectsCorruption) {
+  ASSERT_EQ(NS_OK, Start());
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, Add("legacy-queued-source@invalid"_ns, {}, key));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().SetMessageUidOnServer(key, 42));
+  OfflineOperationData op;
+  op.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().StoreOfflineOperation(mFolderId, key, op));
+  Stop();
+  nsCOMPtr<mozIStorageConnection> old;
+  ASSERT_EQ(NS_OK, Open(getter_AddRefs(old)));
+  ASSERT_EQ(
+      NS_OK,
+      old->ExecuteSimpleSQL(
+          "ALTER TABLE offline_operations DROP COLUMN sourcePhysicalKey"_ns));
+  for (const char* column : {"confirmedEpoch",
+                             "transferFlags",
+                             "transferLineCount",
+                             "transferOfflineSize",
+                             "transferMessageSize",
+                             "transferStoreToken",
+                             "transferLocationRevision",
+                             "transferContentRevision",
+                             "transferAccepted",
+                             "copyOrdinal",
+                             "transferOperationKey",
+                             "transferSourceId",
+                             "appendFlags",
+                             "appendLineCount",
+                             "appendOfflineSize",
+                             "appendMessageSize",
+                             "appendStoreToken",
+                             "appendLocationRevision",
+                             "appendContentRevision",
+                             "appendSourceId",
+                             "appendAccepted"}) {
+    nsAutoCString sql("ALTER TABLE offline_attempts DROP COLUMN ");
+    sql.Append(column);
+    ASSERT_EQ(NS_OK, old->ExecuteSimpleSQL(sql));
+  }
+  ASSERT_EQ(NS_OK, old->SetSchemaVersion(15));
+  ASSERT_EQ(NS_OK, old->Close());
+  old = nullptr;
+  ASSERT_EQ(NS_OK, Start());
+  int32_t version;
+  ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
+  EXPECT_EQ(18, version);
+  auto& db = mCore->MessageDB();
+  Maybe<ServerMessageLocation> source;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(key, source->key);
+  EXPECT_EQ(7u, source->epoch);
+  EXPECT_EQ(42u, source->uid);
+  for (const char* invalid : {"0", "4294967295", "-1", "'invalid'"}) {
+    nsAutoCString sql("UPDATE offline_operations SET sourcePhysicalKey=");
+    sql.Append(invalid);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              db.GetOfflineOperationSource(mFolderId, key, source));
+    ASSERT_TRUE(source);
+    EXPECT_EQ(key, source->key);
+  }
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "UPDATE offline_operations SET sourcePhysicalKey=1,epoch=NULL,uid=NULL"_ns));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "UPDATE offline_operations SET sourcePhysicalKey=NULL,epoch=7,uid=42"_ns));
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, op));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(key, source->key);
 }
 
 TEST_F(DeliveryCoreReferences,

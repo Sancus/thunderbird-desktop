@@ -19,6 +19,34 @@ var { TestUtils } = ChromeUtils.importESModule(
 );
 
 var gDraftsFolder;
+var gNativeDraft;
+var gNativeDraftBytes;
+
+/**
+ * Reads the actual retained provider bytes to EOF.
+ *
+ * @param {nsIMsgDBHdr} header - The physical queued draft.
+ * @returns {string} The complete stored message.
+ */
+function readNativeDraftBytes(header) {
+  const stream = header.folder.getMsgInputStream(header);
+  const input = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(
+    Ci.nsIScriptableInputStream
+  );
+  input.init(stream);
+  try {
+    let result = "";
+    for (;;) {
+      const chunk = input.read(8192);
+      if (!chunk) {
+        return result;
+      }
+      result += chunk;
+    }
+  } finally {
+    input.close();
+  }
+}
 
 add_setup(function () {
   setupIMAPPump();
@@ -83,6 +111,37 @@ add_task(async function saveDraft() {
   Assert.equal(IMAPPump.daemon.getMailbox("Drafts")._messages.length, 0);
 });
 
+add_task(function test_nativeQueuedDraftHasFinishedBody() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const headers = Array.from(gDraftsFolder.messages);
+  Assert.equal(headers.length, 1);
+  gNativeDraft = headers[0];
+  Assert.equal(gNativeDraft.folder, gDraftsFolder);
+  Assert.ok(gNativeDraft.messageKey);
+  Assert.ok(gNativeDraft.flags & Ci.nsMsgMessageFlags.Offline);
+  Assert.ok(!gNativeDraft.properties.includes("uidOnServer"));
+  for (const property of [
+    "storeToken",
+    "messageSize",
+    "offlineMessageSize",
+    "lineCount",
+  ]) {
+    Assert.ok(gNativeDraft.properties.includes(property));
+  }
+  gNativeDraftBytes = readNativeDraftBytes(gNativeDraft);
+  Assert.greater(gNativeDraftBytes.length, 0);
+  Assert.equal(gNativeDraft.messageSize, gNativeDraftBytes.length);
+  Assert.equal(gNativeDraft.offlineMessageSize, gNativeDraftBytes.length);
+  const operation = gDraftsFolder.msgDatabase
+    .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+    .getOfflineOpForKey(gNativeDraft.messageKey, false);
+  Assert.ok(operation);
+  Assert.equal(operation.messageKey, gNativeDraft.messageKey);
+  Assert.ok(operation.operation & Ci.nsIMsgOfflineImapOperation.kAppendDraft);
+});
+
 add_task(async function goOnline() {
   const offlineManager = Cc[
     "@mozilla.org/messenger/offline-manager;1"
@@ -103,6 +162,54 @@ add_task(async function goOnline() {
   // Verify that message is now on the server.
   Assert.equal(IMAPPump.daemon.getMailbox("Drafts")._messages.length, 1);
 });
+
+add_task(
+  async function test_nativeAcceptedDraftKeepsUnboundRecoveryWithoutResend() {
+    if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      return;
+    }
+    const key = gNativeDraft.messageKey;
+    const database = gDraftsFolder.msgDatabase;
+    const retained = database.getMsgHdrForKey(key);
+    Assert.equal(retained.messageKey, gNativeDraft.messageKey);
+    Assert.equal(retained.folder, gNativeDraft.folder);
+    Assert.equal(retained.messageId, gNativeDraft.messageId);
+    Assert.equal(retained.storeToken, gNativeDraft.storeToken);
+    Assert.equal(database.getMsgHdrForKey(key), retained);
+    Assert.equal(readNativeDraftBytes(retained), gNativeDraftBytes);
+    Assert.ok(!gNativeDraft.properties.includes("uidOnServer"));
+    Assert.ok(gNativeDraft.flags & Ci.nsMsgMessageFlags.Offline);
+    Assert.equal(readNativeDraftBytes(gNativeDraft), gNativeDraftBytes);
+    const operations = database.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
+    Assert.ok(
+      operations.getOfflineOpForKey(key, false).operation &
+        Ci.nsIMsgOfflineImapOperation.kAppendDraft
+    );
+    const offlineManager = Cc[
+      "@mozilla.org/messenger/offline-manager;1"
+    ].getService(Ci.nsIMsgOfflineManager);
+    offlineManager.inProgress = true;
+    offlineManager.goOnline(false, true, null);
+    await TestUtils.waitForCondition(
+      () => !offlineManager.inProgress,
+      "The acknowledged unresolved draft is settled locally without another APPEND"
+    );
+    Assert.equal(IMAPPump.daemon.getMailbox("Drafts")._messages.length, 1);
+    const current = gDraftsFolder.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(current.messageKey, gNativeDraft.messageKey);
+    Assert.equal(current.folder, gNativeDraft.folder);
+    Assert.equal(current.messageId, gNativeDraft.messageId);
+    Assert.equal(current.storeToken, gNativeDraft.storeToken);
+    Assert.equal(gDraftsFolder.msgDatabase.getMsgHdrForKey(key), current);
+    Assert.equal(readNativeDraftBytes(current), gNativeDraftBytes);
+    Assert.ok(!gNativeDraft.properties.includes("uidOnServer"));
+    Assert.equal(readNativeDraftBytes(gNativeDraft), gNativeDraftBytes);
+    Assert.ok(
+      operations.getOfflineOpForKey(key, false).operation &
+        Ci.nsIMsgOfflineImapOperation.kAppendDraft
+    );
+  }
+);
 
 add_task(function endTest() {
   teardownIMAPPump();

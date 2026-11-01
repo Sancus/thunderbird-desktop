@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "nsIMsgOfflineImapOperation.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -1336,6 +1337,332 @@ TEST_F(DeliveryCompleteHeader, StoreCopyRejectsStaleAndClosedDestination) {
             db->CopyHdrForStore(source, false, getter_AddRefs(draft)));
   EXPECT_FALSE(draft);
   CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       UndoBridgeRejectsClosedWrapperWithoutConsumption) {
+  ASSERT_NO_FATAL_FAILURE(Create({"parent@undo.invalid"_ns}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RemovedMessage captured;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageForUndo(mKey, captured));
+  ASSERT_TRUE(captured.Body());
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->RemoveHdrForUndo(mKey, captured));
+  OfflineOperationUndo redo, nextOffline;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->RemoveHdrForUndo(mKey, captured, &redo, &nextOffline));
+  EXPECT_FALSE(redo.Operation());
+  EXPECT_FALSE(nextOffline.Operation());
+  ASSERT_TRUE(captured.Body());
+  EXPECT_EQ(mKey, captured.Body()->key);
+  OfflineOperationUndo offline;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->CaptureOfflineOperationForUndo(mKey, offline));
+  EXPECT_FALSE(offline.Operation());
+  FinishedMessageBody finished;
+  nsMsgKey key = 42;
+  Message* live = nullptr;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->RestoreHdrForUndo(captured, finished, &key, &live));
+  EXPECT_EQ(42u, key);
+  EXPECT_EQ(nullptr, live);
+  ASSERT_TRUE(captured.Body());
+  EXPECT_EQ(mKey, captured.Body()->key);
+}
+
+TEST_F(DeliveryCompleteHeader,
+       UndoBridgeRejectsForeignFolderAndOccupiedOutput) {
+  ASSERT_NO_FATAL_FAILURE(Create({"parent@undo.invalid"_ns}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<Message> occupiedOwner = new Message(mKey);
+  RemovedMessage captured;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageForUndo(mKey, captured));
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  RefPtr<PerFolderDatabase> foreign = new PerFolderDatabase(other, false);
+  FinishedMessageBody finished;
+  nsMsgKey key = 42;
+  Message* live = nullptr;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            foreign->RestoreHdrForUndo(captured, finished, &key, &live));
+  EXPECT_EQ(42u, key);
+  EXPECT_EQ(nullptr, live);
+  ASSERT_TRUE(captured.Body());
+  Message* occupied = occupiedOwner.get();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->RestoreHdrForUndo(captured, finished, &key, &occupied));
+  EXPECT_EQ(occupiedOwner.get(), occupied);
+  EXPECT_EQ(42u, key);
+  ASSERT_TRUE(captured.Body());
+  EXPECT_EQ(mKey, captured.Body()->key);
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            db->RestoreHdrForUndo(captured, finished, nullptr));
+  PendingDestination selected{mFolder, mKey, 7};
+  OfflineOperationUndo redo;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->RestoreHdrForUndo(captured, finished, &key, &live, nullptr,
+                                  &selected, nullptr));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->RestoreHdrForUndo(captured, finished, &key, &live, nullptr,
+                                  nullptr, &redo));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->RestoreHdrForUndo(captured, finished, &key, &live, &redo,
+                                  &selected, &redo));
+  EXPECT_EQ(42u, key);
+  EXPECT_EQ(nullptr, live);
+  EXPECT_FALSE(redo.Operation());
+  ASSERT_TRUE(captured.Body());
+  EXPECT_EQ(mKey, captured.Body()->key);
+}
+
+TEST_F(DeliveryCompleteHeader, UndoBridgeLeavesCallerTransactionAndOutputs) {
+  ASSERT_NO_FATAL_FAILURE(Create({"parent@undo.invalid"_ns}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RemovedMessage captured;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveMessageForUndo(mKey, captured));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  FinishedMessageBody finished;
+  nsMsgKey key = 42;
+  Message* live = nullptr;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->RestoreHdrForUndo(captured, finished, &key, &live));
+  EXPECT_EQ(42u, key);
+  EXPECT_EQ(nullptr, live);
+  ASSERT_TRUE(captured.Body());
+  OfflineOperationUndo offline;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->CaptureOfflineOperationForUndo(mKey, offline));
+  EXPECT_FALSE(offline.Operation());
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       OfflineCopyStagesOpaqueMetadataBeforePublication) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source, draft;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("copied@invalid"_ns));
+  ASSERT_EQ(NS_OK,
+            source->SetReferences(
+                "<copied@invalid> <parent@invalid> <copied@invalid>"_ns));
+  ASSERT_EQ(NS_OK, source->SetFlags(nsMsgMessageFlags::Read |
+                                    nsMsgMessageFlags::Marked));
+  ASSERT_EQ(NS_OK, source->SetMessageSize(73));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("Case", "00042"_ns));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("empty", ""_ns));
+  ASSERT_EQ(NS_OK, source->SetStringProperty("uidOnServer", "2a"_ns));
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, true, getter_AddRefs(draft)));
+  nsMsgKey key = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db->StageHdrForOfflineCopy(draft, &key));
+  ASSERT_NE(nsMsgKey_None, key);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(key, references));
+  EXPECT_EQ((nsTArray<nsCString>{"copied@invalid"_ns, "parent@invalid"_ns,
+                                 "copied@invalid"_ns}),
+            references);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessagePropertyNames(key, names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  EXPECT_FALSE(names.Contains("storeToken"_ns));
+  EXPECT_TRUE(names.Contains("empty"_ns));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, draft->SetSubject("after stage"_ns));
+  OfflineOperationData operation;
+  operation.operation = nsIMsgOfflineImapOperation::kAddedHeader;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().StoreOfflineOperation(mFolder, key, operation));
+  RefPtr<Message> output;
+  uint32_t publications = 0;
+  RefPtr<DeliveryEarlyMutationListener> listener =
+      new DeliveryEarlyMutationListener;
+  listener->publication = [&](const CapturedMessage& after, Message* live) {
+    ++publications;
+    EXPECT_EQ(key, after.id);
+    EXPECT_EQ(output.get(), live);
+    EXPECT_EQ(nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked, after.flags);
+    OfflineOperationData saved;
+    EXPECT_EQ(NS_OK,
+              mCore->MessageDB().GetOfflineOperation(mFolder, key, saved));
+    EXPECT_EQ(operation.operation, saved.operation);
+    nsMsgKey duplicateKey = 42;
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db->StageHdrForOfflineCopy(draft, &duplicateKey));
+    EXPECT_EQ(42u, duplicateKey);
+    RefPtr<Message> duplicate;
+    EXPECT_EQ(
+        NS_ERROR_IN_PROGRESS,
+        db->PublishHdrForOfflineCopy(draft, true, getter_AddRefs(duplicate)));
+    EXPECT_FALSE(duplicate);
+    nsCOMPtr<nsIMsgDBHdr> attached;
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db->AttachHdr(draft, true, getter_AddRefs(attached)));
+    EXPECT_FALSE(attached);
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, draft->SetSubject("reentrant"_ns));
+  };
+  mCore->MessageDB().AddMessageListener(listener);
+  auto remove = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(listener); });
+  ASSERT_EQ(NS_OK,
+            db->PublishHdrForOfflineCopy(draft, true, getter_AddRefs(output)));
+  ASSERT_TRUE(output);
+  EXPECT_EQ(1u, publications);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  RefPtr<Message> duplicate;
+  EXPECT_EQ(
+      NS_ERROR_ALREADY_INITIALIZED,
+      db->PublishHdrForOfflineCopy(draft, true, getter_AddRefs(duplicate)));
+  EXPECT_FALSE(duplicate);
+  EXPECT_EQ(1u, publications);
+  nsCString property;
+  ASSERT_EQ(NS_OK, output->GetStringProperty("Case", property));
+  EXPECT_EQ("00042"_ns, property);
+  uint32_t size;
+  ASSERT_EQ(NS_OK, output->GetMessageSize(&size));
+  EXPECT_EQ(73u, size);
+}
+
+TEST_F(DeliveryCompleteHeader,
+       OfflineCopyAdmissionKeepsCallerTransactionAndOutputs) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source, draft;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("guarded-copy@invalid"_ns));
+  nsMsgKey key = 42;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->StageHdrForOfflineCopy(source, &key));
+  EXPECT_EQ(42u, key);
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, true, getter_AddRefs(draft)));
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  RefPtr<PerFolderDatabase> foreign = new PerFolderDatabase(other, false);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, foreign->StageHdrForOfflineCopy(draft, &key));
+  EXPECT_EQ(42u, key);
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db->StageHdrForOfflineCopy(draft, &key));
+  EXPECT_EQ(42u, key);
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->StageHdrForOfflineCopy(draft, &key));
+  RefPtr<Message> output;
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->PublishHdrForOfflineCopy(draft, false, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  RefPtr<Message> occupied = new Message(key);
+  Message* slot = occupied.get();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->PublishHdrForOfflineCopy(draft, false, &slot));
+  EXPECT_EQ(occupied.get(), slot);
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            db->PublishHdrForOfflineCopy(draft, false, nullptr));
+  ASSERT_EQ(NS_OK,
+            db->PublishHdrForOfflineCopy(draft, false, getter_AddRefs(output)));
+  ASSERT_TRUE(output);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       OfflineCopyFailureSealsDraftAndRetainsStagedOperation) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source, draft;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("fault-copy@invalid"_ns));
+  ASSERT_EQ(NS_OK, source->SetReferences("<parent@invalid>"_ns));
+  ASSERT_NO_FATAL_FAILURE(InstallWitness());
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_stage_copy_fault "
+                       "BEFORE INSERT ON main.staged_message_references BEGIN "
+                       "SELECT delivery_references_fault(NEW.id); "
+                       "SELECT RAISE(ABORT,'stage copy failure'); END"_ns));
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, true, getter_AddRefs(draft)));
+  nsMsgKey key = 42;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->StageHdrForOfflineCopy(draft, &key));
+  EXPECT_EQ(42u, key);
+  EXPECT_EQ(1u, mWitness->mCalls);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER delivery_stage_copy_fault"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->StageHdrForOfflineCopy(draft, &key));
+  EXPECT_EQ(42u, key);
+  EXPECT_EQ(1u, mWitness->mCalls);
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, draft->SetSubject("retry"_ns));
+  nsTArray<nsMsgKey> staged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_TRUE(staged.IsEmpty());
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, true, getter_AddRefs(draft)));
+  ASSERT_EQ(NS_OK, db->StageHdrForOfflineCopy(draft, &key));
+  OfflineOperationData operation;
+  operation.operation = nsIMsgOfflineImapOperation::kAddedHeader;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().StoreOfflineOperation(mFolder, key, operation));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_publish_copy_fault "
+                       "BEFORE INSERT ON main.messages BEGIN "
+                       "SELECT delivery_references_fault(NEW.id); "
+                       "SELECT RAISE(ABORT,'publish copy failure'); END"_ns));
+  RefPtr<Message> output;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->PublishHdrForOfflineCopy(draft, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  EXPECT_EQ(2u, mWitness->mCalls);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER delivery_publish_copy_fault"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->PublishHdrForOfflineCopy(draft, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  EXPECT_EQ(2u, mWitness->mCalls);
+  OfflineOperationData retained;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, key, retained));
+  EXPECT_EQ(operation.operation, retained.operation);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), staged);
+  bool exists = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, OfflineCopyRejectsStaleAndClosedOwners) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> source, draft;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(source)));
+  ASSERT_EQ(NS_OK, source->SetMessageId("stale-copy@invalid"_ns));
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(source, true, getter_AddRefs(draft)));
+  nsMsgKey key = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db->StageHdrForOfflineCopy(draft, &key));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId="
+                       "'{7a139b24-9c50-47fa-8322-168da90748c0}'"_ns));
+  RefPtr<PerFolderDatabase> reopened = new PerFolderDatabase(mFolder, false);
+  RefPtr<Message> output;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, reopened->PublishHdrForOfflineCopy(
+                                        draft, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->PublishHdrForOfflineCopy(draft, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->PublishHdrForOfflineCopy(draft, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  nsTArray<nsMsgKey> staged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_EQ((nsTArray<nsMsgKey>{key}), staged);
 }
 
 TEST_F(DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {

@@ -917,6 +917,145 @@ NS_IMETHODIMP nsImapUrl::GetMimePartSelectorDetected(
 }
 
 #ifdef MOZ_PANORAMA
+nsresult nsImapUrl::PrepareNativeQueuedCopies(
+    const nsTArray<mozilla::mailnews::OfflineAttempt>& attempts) {
+  NS_ENSURE_FALSE(attempts.IsEmpty(), NS_ERROR_INVALID_ARG);
+  const auto& first = attempts[0];
+  NS_ENSURE_TRUE(first.source, NS_ERROR_NOT_AVAILABLE);
+  for (const auto& item : attempts) {
+    NS_ENSURE_TRUE(item.id && item.source && item.destination &&
+                       item.transferBody &&
+                       item.source->folderId == first.source->folderId &&
+                       item.source->epoch == first.source->epoch &&
+                       item.transferSourceId == first.transferSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(SetExpectedUidValidity(first.source->epoch));
+  mozilla::MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(mNativeQueuedCopies.IsEmpty(), NS_ERROR_ALREADY_INITIALIZED);
+  mNativeQueuedCopies = attempts.Clone();
+  return NS_OK;
+}
+
+nsTArray<mozilla::mailnews::OfflineAttempt>
+nsImapUrl::CopyNativeQueuedCopies() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeQueuedCopies.Clone();
+}
+
+nsresult nsImapUrl::RecordNativeCopyReceipts(
+    const nsTArray<NativeQueuedCopyReceipt>& receipts) {
+  mozilla::MutexAutoLock lock(mLock);
+  for (const auto& receipt : receipts) {
+    bool matched = false;
+    for (const auto& target : mNativeQueuedCopies) {
+      matched |= target.source && target.source->uid == receipt.sourceUid;
+    }
+    NS_ENSURE_TRUE(matched, NS_ERROR_NOT_AVAILABLE);
+    for (const auto& old : mNativeCopyReceipts) {
+      if (old.sourceUid == receipt.sourceUid) {
+        NS_ENSURE_TRUE(
+            old.destination.isSome() == receipt.destination.isSome() &&
+                (!old.destination ||
+                 (old.destination->epoch == receipt.destination->epoch &&
+                  old.destination->uid == receipt.destination->uid)),
+            NS_ERROR_NOT_AVAILABLE);
+      }
+    }
+  }
+  for (const auto& receipt : receipts) {
+    bool found = false;
+    for (const auto& old : mNativeCopyReceipts)
+      found |= old.sourceUid == receipt.sourceUid;
+    if (!found) mNativeCopyReceipts.AppendElement(receipt);
+  }
+  return NS_OK;
+}
+
+nsTArray<NativeQueuedCopyReceipt> nsImapUrl::CopyNativeCopyReceipts() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeCopyReceipts.Clone();
+}
+
+void nsImapUrl::RecordNativeSourceRetired() {
+  mozilla::MutexAutoLock lock(mLock);
+  mNativeSourceRetired = true;
+}
+
+bool nsImapUrl::NativeSourceRetired() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeSourceRetired;
+}
+
+nsresult nsImapUrl::PrepareNativeQueuedAppend(
+    const NativeQueuedAppendTarget& target) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(
+      target.epoch && target.body.folderId &&
+          target.body.key != nsMsgKey_None && target.body.storeToken &&
+          !target.body.databaseSourceId.IsEmpty() && target.attempt.id &&
+          target.ordinal == 0 && target.attempt.destination &&
+          target.attempt.destination->folderId == target.body.folderId &&
+          target.attempt.destination->key == target.body.key &&
+          target.attempt.destination->epoch == target.epoch,
+      NS_ERROR_INVALID_ARG);
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_FALSE(mNativeQueuedAppend, NS_ERROR_ALREADY_INITIALIZED);
+  m_expectedUidValidity = target.epoch;
+  mNativeQueuedAppend.emplace(target);
+  return NS_OK;
+}
+
+Maybe<NativeQueuedAppendTarget> nsImapUrl::CopyNativeQueuedAppendTarget() {
+  MutexAutoLock lock(mLock);
+  return mNativeQueuedAppend;
+}
+
+nsresult nsImapUrl::RecordNativeQueuedAppendReceipt(
+    const NativeQueuedAppendReceipt& receipt) {
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_FALSE(mNativeAppendRejected, NS_ERROR_NOT_AVAILABLE);
+  // Queued uploads retain a matching tagged OK even without APPENDUID.
+  // The ordinary online undo path requires the actual complete UID receipt.
+  NS_ENSURE_TRUE(mNativeQueuedAppend || receipt.destination,
+                 NS_ERROR_NOT_AVAILABLE);
+  if (receipt.destination) {
+    NS_ENSURE_TRUE(receipt.destination->epoch && receipt.destination->uid &&
+                       (!mNativeQueuedAppend || receipt.destination->epoch ==
+                                                    mNativeQueuedAppend->epoch),
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  if (mNativeAppendReceipt) {
+    const auto& old = mNativeAppendReceipt->destination;
+    NS_ENSURE_TRUE(old.isSome() == receipt.destination.isSome(),
+                   NS_ERROR_NOT_AVAILABLE);
+    if (old) {
+      NS_ENSURE_TRUE(old->epoch == receipt.destination->epoch &&
+                         old->uid == receipt.destination->uid,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+  } else {
+    mNativeAppendReceipt.emplace(receipt);
+  }
+  return NS_OK;
+}
+
+Maybe<NativeQueuedAppendReceipt> nsImapUrl::CopyNativeQueuedAppendReceipt() {
+  MutexAutoLock lock(mLock);
+  return mNativeAppendReceipt;
+}
+
+void nsImapUrl::RecordNativeQueuedAppendRejected() {
+  MutexAutoLock lock(mLock);
+  if (mNativeQueuedAppend && !mNativeAppendReceipt)
+    mNativeAppendRejected = true;
+}
+
+bool nsImapUrl::NativeQueuedAppendRejected() {
+  MutexAutoLock lock(mLock);
+  return mNativeAppendRejected;
+}
+
 nsresult nsImapUrl::PrepareNativeHierarchy(const nsACString& source,
                                            const nsACString& destination,
                                            nsISupports* continuation,
@@ -1136,6 +1275,9 @@ NS_IMETHODIMP nsImapUrl::SetMockChannel(nsIImapMockChannel* aChannel) {
 }
 
 nsresult nsImapUrl::Clone(nsIURI** _retval) {
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(CopyNativeQueuedAppendTarget(), NS_ERROR_NOT_AVAILABLE);
+#endif
   nsresult rv = nsMsgMailNewsUrl::Clone(_retval);
   NS_ENSURE_SUCCESS(rv, rv);
   // also clone the mURI member, because GetUri below won't work if

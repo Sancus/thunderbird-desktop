@@ -37,6 +37,39 @@ MOZ_RUNINIT nsTArray<MboxCase> mboxValidCases({
          "This is message two.\r\n"_ns,
      }},
 
+    // The writer quotes From lines everywhere, including malformed headers.
+    // Keep the literal envelope-like line used by image-attach-test, existing
+    // quoting, and the header/body boundary unchanged when reading it back.
+    {"From \r\n"
+     ">From - Fri May 20 16:47:38 2008\r\n"
+     ">>From already-quoted\r\n"
+     ">>>From twice-quoted\r\n"
+     ">Not-a-From-line\r\n"
+     "Message-ID: quoted-header\r\n"
+     "\r\n"
+     ">From body\r\n"
+     "\r\n"
+     "From \r\n"
+     "Message-ID: after-quoted-header\r\n"
+     "To: next@invalid\r\n"
+     "\r\n"
+     "Next message.\r\n"
+     "\r\n"_ns,
+     {
+         "From - Fri May 20 16:47:38 2008\r\n"
+         ">From already-quoted\r\n"
+         ">>From twice-quoted\r\n"
+         ">Not-a-From-line\r\n"
+         "Message-ID: quoted-header\r\n"
+         "\r\n"
+         "From body\r\n"_ns,
+
+         "Message-ID: after-quoted-header\r\n"
+         "To: next@invalid\r\n"
+         "\r\n"
+         "Next message.\r\n"_ns,
+     }},
+
     // Message with trailing blank lines.
     {"From \r\n"
      "Message-ID: body-has-trailing-eols\r\n"

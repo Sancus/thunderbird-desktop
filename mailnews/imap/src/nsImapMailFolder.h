@@ -7,26 +7,26 @@
 
 #include "mozilla/Attributes.h"
 #include "mozilla/UniquePtr.h"
-#include "nsIMsgDBView.h"
-#include "nsMsgDBFolder.h"
+#include "nsAutoSyncState.h"
+#include "nsICopyMessageListener.h"
+#include "nsIImapIncomingServer.h"  // we need this for its IID
 #include "nsIImapMailFolderSink.h"
 #include "nsIImapMessageSink.h"
-#include "nsICopyMessageListener.h"
-#include "nsIUrlListener.h"
-#include "nsIImapIncomingServer.h"  // we need this for its IID
-#include "nsIMsgParseMailMsgState.h"
-#include "nsImapUndoTxn.h"
-#include "nsIMsgMessageService.h"
+#include "nsIMsgDBView.h"
 #include "nsIMsgFilterHitNotify.h"
 #include "nsIMsgFilterList.h"
-#include "prmon.h"
-#include "nsIMsgImapMailFolder.h"
 #include "nsIMsgFilterPlugin.h"
+#include "nsIMsgImapMailFolder.h"
+#include "nsIMsgMessageService.h"
+#include "nsIMsgParseMailMsgState.h"
 #include "nsIMsgWindow.h"
+#include "nsITimer.h"
+#include "nsIUrlListener.h"
+#include "nsImapUndoTxn.h"
+#include "nsMsgDBFolder.h"
 #include "nsTHashMap.h"
 #include "nsTHashSet.h"
-#include "nsITimer.h"
-#include "nsAutoSyncState.h"
+#include "prmon.h"
 
 class nsImapMoveCoalescer;
 class nsIFolderLookupService;
@@ -35,6 +35,14 @@ class nsIMsgOfflineImapOperation;
 class nsIMsgThread;
 class nsImapUrl;
 class nsImapFolderRelocation;
+#ifdef MOZ_PANORAMA
+struct NativeQueuedAppendTarget;
+struct NativeOfflineCopyEntry;
+#  include "MessageDatabase.h"
+namespace mozilla::mailnews {
+struct FinishedMessageBody;
+}
+#endif
 
 #define COPY_BUFFER_SIZE 16384
 
@@ -62,8 +70,8 @@ class nsImapMailCopyState : public nsISupports {
                                        // folder)
 
   nsCOMPtr<nsIMsgMessageService>
-      m_msgService;        // source folder message service; can
-                           // be Nntp, Mailbox, or Imap
+      m_msgService;        // source folder message service;
+                           // can be Nntp, Mailbox, or Imap
   bool m_isMove;           // is a move
   bool m_isFolder;         // private message phase of a folder copy
   bool m_selectedState;    // needs to be in selected state; append msg
@@ -74,6 +82,8 @@ class nsImapMailCopyState : public nsISupports {
   bool m_streamCopy;
   bool m_waitingForSourceDelete;
 #ifdef MOZ_PANORAMA
+  nsTArray<mozilla::mailnews::OfflineAttempt> m_nativeQueuedCopies;
+  mozilla::UniquePtr<NativeQueuedAppendTarget> m_nativeQueuedAppend;
   struct StreamSource {
     struct Message {
       nsMsgKey key;
@@ -263,9 +273,9 @@ class nsImapMailFolder : public nsMsgDBFolder,
   NS_IMETHOD CompactAll(nsIUrlListener* aListener,
                         nsIMsgWindow* aMsgWindow) override;
   NS_IMETHOD EmptyTrash(nsIUrlListener* aListener) override;
-  NS_IMETHOD CopyDataToOutputStreamForAppend(
-      nsIInputStream* aIStream, int32_t aLength,
-      nsIOutputStream* outputStream) override;
+  NS_IMETHOD
+  CopyDataToOutputStreamForAppend(nsIInputStream* aIStream, int32_t aLength,
+                                  nsIOutputStream* outputStream) override;
   NS_IMETHOD CopyDataDone() override;
   NS_IMETHOD DeleteStorage() override;
   NS_IMETHOD Rename(const nsACString& newName,
@@ -283,8 +293,9 @@ class nsImapMailFolder : public nsMsgDBFolder,
 
   NS_IMETHOD ApplyRetentionSettings() override;
 
-  NS_IMETHOD AddMessageDispositionState(
-      nsIMsgDBHdr* aMessage, nsMsgDispositionState aDispositionFlag) override;
+  NS_IMETHOD
+  AddMessageDispositionState(nsIMsgDBHdr* aMessage,
+                             nsMsgDispositionState aDispositionFlag) override;
   NS_IMETHOD MarkMessagesRead(const nsTArray<RefPtr<nsIMsgDBHdr>>& messages,
                               bool markRead) override;
   NS_IMETHOD MarkAllMessagesRead(nsIMsgWindow* aMsgWindow) override;
@@ -294,8 +305,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
       const nsTArray<RefPtr<nsIMsgDBHdr>>& messages, nsMsgJunkScore junkScore,
       const nsACString& junkScoreOrigin, int32_t junkPercent) override;
   NS_IMETHOD DeleteSelf(nsIMsgWindow* msgWindow) override;
-  NS_IMETHOD ReadFromFolderCacheElem(
-      nsIMsgFolderCacheElement* element) override;
+  NS_IMETHOD
+  ReadFromFolderCacheElem(nsIMsgFolderCacheElement* element) override;
   NS_IMETHOD WriteToFolderCacheElem(nsIMsgFolderCacheElement* element) override;
 
   NS_IMETHOD GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
@@ -322,9 +333,9 @@ class nsImapMailFolder : public nsMsgDBFolder,
 
   NS_IMETHOD Shutdown(bool shutdownChildren) override;
 
-  NS_IMETHOD DownloadMessagesForOffline(
-      nsTArray<RefPtr<nsIMsgDBHdr>> const& messages,
-      nsIMsgWindow* msgWindow) override;
+  NS_IMETHOD
+  DownloadMessagesForOffline(nsTArray<RefPtr<nsIMsgDBHdr>> const& messages,
+                             nsIMsgWindow* msgWindow) override;
 
   NS_IMETHOD DownloadAllForOffline(nsIUrlListener* listener,
                                    nsIMsgWindow* msgWindow) override;
@@ -334,12 +345,12 @@ class nsImapMailFolder : public nsMsgDBFolder,
                                  nsIUrlListener* aUrlListener,
                                  bool* aAsyncResults) override;
 
-  NS_IMETHOD AddKeywordsToMessages(
-      const nsTArray<RefPtr<nsIMsgDBHdr>>& aMessages,
-      const nsACString& aKeywords) override;
-  NS_IMETHOD RemoveKeywordsFromMessages(
-      const nsTArray<RefPtr<nsIMsgDBHdr>>& aMessages,
-      const nsACString& aKeywords) override;
+  NS_IMETHOD
+  AddKeywordsToMessages(const nsTArray<RefPtr<nsIMsgDBHdr>>& aMessages,
+                        const nsACString& aKeywords) override;
+  NS_IMETHOD
+  RemoveKeywordsFromMessages(const nsTArray<RefPtr<nsIMsgDBHdr>>& aMessages,
+                             const nsACString& aKeywords) override;
 
   // overrides nsMsgDBFolder::HasMsgOffline()
   NS_IMETHOD HasMsgOffline(nsMsgKey msgKey, bool* _retval) override;
@@ -379,6 +390,12 @@ class nsImapMailFolder : public nsMsgDBFolder,
                                    const nsACString& destFolder,
                                    nsIMsgFilter* filter,
                                    nsIMsgWindow* msgWindow);
+
+#ifdef MOZ_PANORAMA
+  nsresult QueueNativeOfflineAppend(
+      nsIMsgDBHdr* parsed,
+      const mozilla::mailnews::FinishedMessageBody& finished, nsMsgKey* key);
+#endif
 
   // send notification to copy service listener.
   nsresult OnCopyCompleted(nsISupports* srcSupport, nsresult exitCode);
@@ -484,6 +501,15 @@ class nsImapMailFolder : public nsMsgDBFolder,
                          nsIMsgCopyServiceListener* listener,
                          nsIMsgWindow* msgWindow, bool allowUndo);
 #ifdef MOZ_PANORAMA
+  friend class nsImapOfflineSync;
+  nsresult ObserveNativeQueuedDestinations(uint32_t epoch);
+  nsresult CopyMessagesOfflineNative(
+      nsIMsgFolder* source, const nsTArray<RefPtr<nsIMsgDBHdr>>& messages,
+      bool isMove, nsIMsgWindow* window, nsIMsgCopyServiceListener* listener,
+      bool cancelPendingMove = false);
+  nsTArray<mozilla::UniquePtr<NativeOfflineCopyEntry>> mNativeOfflineCopies;
+  bool mNativeOfflineCopying = false;
+  bool mNativeOnlineCopyPending = false;
   nsresult CompleteFlagTargets(nsIImapUrl* url, bool addFlags);
   nsresult CompleteKeywordTargets(nsIImapUrl* url);
 #endif

@@ -101,6 +101,41 @@ struct MessageDatabase::QueuedMessageBatch {
   nsTArray<Flags> flagChanges;
 };
 
+struct OfflineOperationUndo::Data {
+  struct Operation {
+    uint64_t folderId{0};
+    nsMsgKey key{nsMsgKey_None};
+    int64_t id{0};
+    int64_t revision{0};
+    OfflineOperationData payload;
+    Maybe<ServerMessageLocation> source;
+    Maybe<uint32_t> folderEpoch;
+    // Only the selected canceled counterpart has native Redo body custody.
+    Maybe<MessageBodyState> restoredBody;
+  } operation;
+  nsCString databaseSourceId;
+  Maybe<OfflineUndoCounterpart> counterpart;
+  Operation counterpartOperation;
+  // Actual typed destinations of a captured SOURCE operation, including absent
+  // counterpart operations so a later claimant cannot silently join the
+  // restore.
+  nsTArray<Operation> destinationOperations;
+  // Only explicit selected-MOVE Undo produces a separate owning Redo token.
+  // The original full payload above stays immutable; this is its canceled
+  // state.
+  UniquePtr<Data> redoState;
+  Maybe<MessageBodyState> restoredBody;
+};
+
+OfflineOperationUndo::OfflineOperationUndo() = default;
+OfflineOperationUndo::~OfflineOperationUndo() = default;
+OfflineOperationUndo::OfflineOperationUndo(OfflineOperationUndo&&) = default;
+OfflineOperationUndo& OfflineOperationUndo::operator=(OfflineOperationUndo&&) =
+    default;
+const OfflineOperationData* OfflineOperationUndo::Operation() const {
+  return mData ? &mData->operation.payload : nullptr;
+}
+
 MessageDatabase::MessageDatabase() = default;
 MessageDatabase::~MessageDatabase() = default;
 
@@ -1496,12 +1531,11 @@ nsresult MessageDatabase::StageMessage(uint64_t folderId,
   return InsertMessage(folderId, header, true, false, key, liveHeader);
 }
 
-nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
-                                        const ::RawHdr& header, bool staged,
-                                        bool notifyLegacy, nsMsgKey* aKey,
-                                        Message** liveHeader,
-                                        RemovedMessage* restoring,
-                                        const FinishedMessageBody* finished) {
+nsresult MessageDatabase::InsertMessage(
+    uint64_t aFolderId, const ::RawHdr& header, bool staged, bool notifyLegacy,
+    nsMsgKey* aKey, Message** liveHeader, RemovedMessage* restoring,
+    const FinishedMessageBody* finished, OfflineOperationUndo* offline,
+    const PendingDestination* cancelMove, OfflineOperationUndo* redo) {
   NS_ENSURE_ARG_POINTER(aKey);
   if (staged) {
     NS_ENSURE_TRUE(aFolderId && aFolderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
@@ -1528,6 +1562,7 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
   RefPtr<Message> message;
   UniquePtr<QueuedMessageBatch> notification;
   MessageThreadBatch captured;
+  OfflineOperationUndo canceledState;
   if (!staged) {
     MOZ_TRY(PrepareMessageBatch(notification));
     notification->notifyLegacy = notifyLegacy;
@@ -1798,6 +1833,17 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
       }
     }
 
+    if (offline) {
+      if (cancelMove) {
+        MOZ_TRY(ValidateOfflineUndoState(*offline->mData));
+      }
+      MOZ_TRY(RestoreOfflineOperationInTransaction(aFolderId, cached.key,
+                                                   *restoring, *offline));
+      if (cancelMove) {
+        MOZ_TRY(CancelOfflineMoveInTransaction(
+            aFolderId, cached.key, *cancelMove, *offline, canceledState));
+      }
+    }
     if (!staged) {
       if (mConversationGroupingEnabled) {
         MOZ_TRY(PrepareConversationBatch(cached.key, notifyLegacy,
@@ -1859,6 +1905,14 @@ nsresult MessageDatabase::InsertMessage(uint64_t aFolderId,
   }
   if (restoring) {
     restoring->mData.reset();
+  }
+  if (offline) {
+    if (redo) {
+      offline->mData->redoState = std::move(canceledState.mData);
+      redo->mData = std::move(offline->mData);
+    } else {
+      offline->mData.reset();
+    }
   }
   if (notification) {
     QueueMessageBatch(std::move(notification));
@@ -2289,11 +2343,11 @@ nsresult ReadOfflineDestination(mozIStorageStatement* stmt, uint32_t column,
                                 Maybe<PendingDestination>& output) {
   bool absent;
   MOZ_TRY(stmt->GetIsNull(column, &absent));
-  for (uint32_t i = 1; i < 3; ++i) {
-    bool isNull;
-    MOZ_TRY(stmt->GetIsNull(column + i, &isNull));
-    NS_ENSURE_TRUE(isNull == absent, NS_ERROR_FILE_CORRUPTED);
-  }
+  bool keyAbsent, epochAbsent;
+  MOZ_TRY(stmt->GetIsNull(column + 1, &keyAbsent));
+  MOZ_TRY(stmt->GetIsNull(column + 2, &epochAbsent));
+  NS_ENSURE_TRUE(keyAbsent == absent && (!absent || epochAbsent),
+                 NS_ERROR_FILE_CORRUPTED);
   if (absent) {
     output.reset();
     return NS_OK;
@@ -2310,7 +2364,10 @@ nsresult ReadOfflineDestination(mozIStorageStatement* stmt, uint32_t column,
   MOZ_TRY(OfflineUint32(stmt, column + 1, found.key));
   NS_ENSURE_TRUE(found.key && found.key < nsMsgKey_None,
                  NS_ERROR_FILE_CORRUPTED);
-  MOZ_TRY(OfflineUint32(stmt, column + 2, found.epoch));
+  found.epochKnown = !epochAbsent;
+  if (found.epochKnown) {
+    MOZ_TRY(OfflineUint32(stmt, column + 2, found.epoch));
+  }
   output = Some(found);
   return NS_OK;
 }
@@ -2321,7 +2378,10 @@ nsresult BindOfflineDestination(mozIStorageStatement* stmt,
     MOZ_TRY(
         stmt->BindInt64ByName("destinationFolder"_ns, destination->folderId));
     MOZ_TRY(stmt->BindInt64ByName("destinationKey"_ns, destination->key));
-    return stmt->BindInt64ByName("destinationEpoch"_ns, destination->epoch);
+    return destination->epochKnown
+               ? stmt->BindInt64ByName("destinationEpoch"_ns,
+                                       destination->epoch)
+               : stmt->BindNullByName("destinationEpoch"_ns);
   }
   MOZ_TRY(stmt->BindNullByName("destinationFolder"_ns));
   MOZ_TRY(stmt->BindNullByName("destinationKey"_ns));
@@ -2330,7 +2390,43 @@ nsresult BindOfflineDestination(mozIStorageStatement* stmt,
 
 bool SamePendingDestination(const PendingDestination& a,
                             const PendingDestination& b) {
-  return a.folderId == b.folderId && a.key == b.key && a.epoch == b.epoch;
+  return a.folderId == b.folderId && a.key == b.key &&
+         a.epochKnown == b.epochKnown && (!a.epochKnown || a.epoch == b.epoch);
+}
+
+bool SameOfflineSource(const Maybe<ServerMessageLocation>& a,
+                       const Maybe<ServerMessageLocation>& b) {
+  return a.isSome() == b.isSome() &&
+         (!a || (a->folderId == b->folderId && a->key == b->key &&
+                 a->epoch == b->epoch && a->uid == b->uid));
+}
+
+bool SameOfflinePayload(const OfflineOperationData& a,
+                        const OfflineOperationData& b) {
+  if (a.operation != b.operation || a.flagOperation != b.flagOperation ||
+      a.newFlags != b.newFlags || a.sourceKey != b.sourceKey ||
+      a.sourceUid != b.sourceUid || a.messageSize != b.messageSize ||
+      a.playingBack != b.playingBack ||
+      a.sourceFolderURI != b.sourceFolderURI ||
+      a.destinationFolderURI != b.destinationFolderURI ||
+      a.keywordsToAdd != b.keywordsToAdd ||
+      a.keywordsToRemove != b.keywordsToRemove ||
+      a.copyDestinations != b.copyDestinations ||
+      a.pendingDestination.isSome() != b.pendingDestination.isSome() ||
+      (a.pendingDestination &&
+       !SamePendingDestination(*a.pendingDestination, *b.pendingDestination)) ||
+      a.copyDestinationBindings.Length() !=
+          b.copyDestinationBindings.Length()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.copyDestinationBindings.Length(); ++i) {
+    const auto& x = a.copyDestinationBindings[i];
+    const auto& y = b.copyDestinationBindings[i];
+    if (x.isSome() != y.isSome() || (x && !SamePendingDestination(*x, *y))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 nsresult FinishOfflineWrite(mozIStorageConnection* connection, nsresult rv) {
@@ -2357,7 +2453,8 @@ nsresult MessageDatabase::ReadOfflineOperationIdentity(
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
       "OfflineOperationIdentity"_ns,
-      "SELECT id, revision, epoch, uid, folderEpoch FROM offline_operations "
+      "SELECT id, revision, epoch, uid, folderEpoch, sourcePhysicalKey "
+      "FROM offline_operations "
       "WHERE folderId = :folder AND messageKey = :key"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
@@ -2379,9 +2476,17 @@ nsresult MessageDatabase::ReadOfflineOperationIdentity(
   MOZ_TRY(stmt->GetIsNull(2, &epochNull));
   MOZ_TRY(stmt->GetIsNull(3, &uidNull));
   NS_ENSURE_TRUE(epochNull == uidNull, NS_ERROR_FILE_CORRUPTED);
+  bool keyNull;
+  MOZ_TRY(stmt->GetIsNull(5, &keyNull));
+  NS_ENSURE_TRUE(!epochNull || keyNull, NS_ERROR_FILE_CORRUPTED);
   Maybe<ServerMessageLocation> target;
   if (!epochNull) {
     ServerMessageLocation location{folderId, key};
+    if (!keyNull) {
+      MOZ_TRY(OfflineUint32(stmt, 5, location.key));
+      NS_ENSURE_TRUE(location.key && location.key < nsMsgKey_None,
+                     NS_ERROR_FILE_CORRUPTED);
+    }
     MOZ_TRY(OfflineUint32(stmt, 2, location.epoch));
     MOZ_TRY(OfflineUint32(stmt, 3, location.uid));
     target = Some(location);
@@ -2417,6 +2522,261 @@ nsresult MessageDatabase::GetOfflineOperationSource(
   return NS_OK;
 }
 
+nsresult MessageDatabase::GetQueuedSourceIdentity(
+    uint64_t folderId, nsMsgKey key, QueuedSourceIdentity& output) {
+  QueuedSourceIdentity found;
+  int64_t id, revision;
+  MOZ_TRY(
+      ReadOfflineOperationIdentity(folderId, key, id, revision, found.source));
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(
+      found.databaseSourceId));
+  found.folderId = folderId;
+  found.key = key;
+  found.operationId = id;
+  found.revision = revision;
+  output = found;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ValidateQueuedSourceIdentity(
+    const QueuedSourceIdentity& expected) {
+  NS_ENSURE_TRUE(!expected.databaseSourceId.IsEmpty() && expected.operationId &&
+                     expected.revision,
+                 NS_ERROR_INVALID_ARG);
+  QueuedSourceIdentity actual;
+  MOZ_TRY(GetQueuedSourceIdentity(expected.folderId, expected.key, actual));
+  NS_ENSURE_TRUE(actual.databaseSourceId == expected.databaseSourceId &&
+                     actual.operationId == expected.operationId &&
+                     actual.revision == expected.revision &&
+                     SameOfflineSource(actual.source, expected.source),
+                 NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ObserveDestinationEpochInTransaction(
+    const QueuedSourceIdentity& expected, uint32_t action,
+    const Maybe<uint32_t>& copyOrdinal, const PendingDestination& destination,
+    uint32_t observedEpoch) {
+  MOZ_TRY(ValidateQueuedSourceIdentity(expected));
+  NS_ENSURE_TRUE(
+      (action == OfflineOp::kMsgCopy) == copyOrdinal.isSome() &&
+          (action == OfflineOp::kMsgCopy || action == OfflineOp::kMsgMoved ||
+           action == OfflineOp::kAppendDraft ||
+           action == OfflineOp::kAppendTemplate),
+      NS_ERROR_INVALID_ARG);
+  OfflineOperationData payload;
+  MOZ_TRY(GetOfflineOperation(expected.folderId, expected.key, payload));
+  NS_ENSURE_TRUE(payload.operation & action, NS_ERROR_NOT_AVAILABLE);
+  Maybe<PendingDestination> saved;
+  if (copyOrdinal) {
+    NS_ENSURE_TRUE(*copyOrdinal < payload.copyDestinationBindings.Length(),
+                   NS_ERROR_NOT_AVAILABLE);
+    saved = payload.copyDestinationBindings[*copyOrdinal];
+  } else {
+    saved = payload.pendingDestination;
+  }
+  NS_ENSURE_TRUE(
+      saved && saved->folderId == destination.folderId &&
+          saved->key == destination.key &&
+          (!saved->epochKnown || saved->epoch == observedEpoch) &&
+          (!destination.epochKnown || destination.epoch == observedEpoch),
+      NS_ERROR_NOT_AVAILABLE);
+  MessageBodyState body;
+  MOZ_TRY(ReadMessageBodyState(destination.key, body));
+  NS_ENSURE_TRUE(body.folderId == destination.folderId &&
+                     body.databaseSourceId == expected.databaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  uint32_t current;
+  nsresult rv = DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      destination.folderId, current);
+  if (NS_SUCCEEDED(rv)) {
+    NS_ENSURE_TRUE(current == observedEpoch, NS_ERROR_NOT_AVAILABLE);
+  } else {
+    NS_ENSURE_TRUE(rv == NS_ERROR_NOT_AVAILABLE, rv);
+    // This is only first observation. Never retire another message's UID as a
+    // side effect of binding a previously unobserved queued destination.
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "OfflineFirstEpochUidCollision"_ns,
+        "SELECT 1 FROM message_properties p JOIN messages m ON m.id=p.id "
+        "WHERE m.folderId=:folder AND p.name='uidOnServer' UNION ALL "
+        "SELECT 1 FROM staged_message_properties p JOIN staged_messages m "
+        "ON m.id=p.id WHERE m.folderId=:folder AND p.name='uidOnServer' LIMIT 1"_ns,
+        getter_AddRefs(stmt)));
+    {
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, destination.folderId));
+      bool collision;
+      MOZ_TRY(stmt->ExecuteStep(&collision));
+      NS_ENSURE_FALSE(collision, NS_ERROR_NOT_AVAILABLE);
+    }
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "OfflineFirstEpoch"_ns,
+        "INSERT INTO folder_properties(id,name,value) SELECT id,'UIDValidity',"
+        ":epoch FROM folders WHERE id=:folder RETURNING id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, destination.folderId));
+    MOZ_TRY(stmt->BindInt64ByName("epoch"_ns, observedEpoch));
+    bool changed;
+    MOZ_TRY(stmt->ExecuteStep(&changed));
+    NS_ENSURE_TRUE(changed, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(stmt->ExecuteStep(&changed));
+    NS_ENSURE_FALSE(changed, NS_ERROR_UNEXPECTED);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      copyOrdinal ? "ObserveOfflineCopyEpoch"_ns
+                  : "ObserveOfflineTargetEpoch"_ns,
+      copyOrdinal
+          ? "UPDATE offline_copy_destinations SET destinationEpoch=:epoch "
+            "WHERE operationId=:id AND ordinal=:ordinal AND "
+            "destinationFolderId=:folder AND destinationKey=:key"_ns
+          : "UPDATE offline_operations SET destinationEpoch=:epoch "
+            "WHERE id=:id AND destinationFolderId=:folder AND destinationKey=:key"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, expected.operationId));
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, destination.folderId));
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, destination.key));
+  MOZ_TRY(stmt->BindInt64ByName("epoch"_ns, observedEpoch));
+  if (copyOrdinal) {
+    MOZ_TRY(stmt->BindInt64ByName("ordinal"_ns, *copyOrdinal));
+  }
+  return stmt->Execute();
+}
+
+nsresult MessageDatabase::ObserveOfflineDestinationEpoch(
+    const QueuedSourceIdentity& expected, uint32_t action,
+    const Maybe<uint32_t>& copyOrdinal, const PendingDestination& destination,
+    uint32_t observedEpoch) {
+  MOZ_TRY(RequireCurrentOwner());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = ObserveDestinationEpochInTransaction(
+      expected, action, copyOrdinal, destination, observedEpoch);
+  if (NS_SUCCEEDED(rv)) {
+    rv = connection->CommitTransaction();
+  }
+  return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::BindStagedMessageToQueuedSource(
+    nsMsgKey stagedKey, uint64_t folderId, const QueuedSourceIdentity& expected,
+    const Maybe<uint32_t>& copyOrdinal, const MessageBodyState& returning) {
+  MOZ_TRY(RequireCurrentOwner());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(ValidateQueuedSourceIdentity(expected));
+    NS_ENSURE_TRUE(expected.source && folderId == expected.source->folderId &&
+                       stagedKey != returning.key && stagedKey != expected.key,
+                   NS_ERROR_NOT_AVAILABLE);
+    OfflineOperationData payload;
+    MOZ_TRY(GetOfflineOperation(expected.folderId, expected.key, payload));
+    MOZ_TRY(RequireOfflineUndoQueued(expected.operationId, payload));
+    Maybe<PendingDestination> target;
+    if (copyOrdinal) {
+      NS_ENSURE_TRUE(
+          (payload.operation & OfflineOp::kMsgCopy) &&
+              *copyOrdinal < payload.copyDestinationBindings.Length(),
+          NS_ERROR_NOT_AVAILABLE);
+      target = payload.copyDestinationBindings[*copyOrdinal];
+    } else {
+      NS_ENSURE_TRUE(payload.operation & OfflineOp::kMsgMoved,
+                     NS_ERROR_NOT_AVAILABLE);
+      target = payload.pendingDestination;
+    }
+    NS_ENSURE_TRUE(target && target->folderId == returning.folderId &&
+                       target->key == returning.key,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(ValidatePendingDestination(*target, expected.folderId, expected.key,
+                                       false, expected.operationId));
+    MessageBodyState actual;
+    MOZ_TRY(ReadMessageBodyState(returning.key, actual));
+    NS_ENSURE_TRUE(SameBodyGuard(actual, returning), NS_ERROR_NOT_AVAILABLE);
+    // Staged rows have no published journal revision. Guard their actual
+    // physical key/folder and current incarnation, not a fabricated body state.
+    bool isStaged;
+    MOZ_TRY(IsMessageStaged(stagedKey, isStaged));
+    NS_ENSURE_TRUE(isStaged, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(BindMessageToServerUidInTransaction(stagedKey, folderId,
+                                                expected.source->epoch,
+                                                expected.source->uid, true));
+    // This is the same queued SOURCE, not a new operation claiming its tail.
+    // Validate the whole physical counterpart set before changing any key.
+    nsTArray<OfflineOperationUndo::Data::Operation> children;
+    auto captureChild =
+        [&](const Maybe<PendingDestination>& destination) -> nsresult {
+      if (!destination) {
+        return NS_OK;
+      }
+      NS_ENSURE_TRUE(destination->key != stagedKey, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(ValidatePendingDestination(*destination, expected.folderId,
+                                         expected.key, false,
+                                         expected.operationId));
+      for (const auto& child : children) {
+        NS_ENSURE_TRUE(child.key != destination->key, NS_ERROR_NOT_AVAILABLE);
+      }
+      auto& child = *children.AppendElement();
+      child.folderId = destination->folderId;
+      child.key = destination->key;
+      MOZ_TRY(ReadOfflineOperationIdentity(child.folderId, child.key, child.id,
+                                           child.revision, child.source));
+      MOZ_TRY(GetOfflineOperation(child.folderId, child.key, child.payload));
+      NS_ENSURE_TRUE((child.payload.operation & OfflineOp::kMoveResult) &&
+                         child.payload.sourceKey == expected.key,
+                     NS_ERROR_NOT_AVAILABLE);
+      return RequireOfflineUndoQueued(child.id, child.payload);
+    };
+    MOZ_TRY(captureChild(payload.pendingDestination));
+    for (const auto& destination : payload.copyDestinationBindings) {
+      MOZ_TRY(captureChild(destination));
+    }
+    int64_t otherId, otherRevision;
+    Maybe<ServerMessageLocation> otherSource;
+    nsresult other = ReadOfflineOperationIdentity(folderId, stagedKey, otherId,
+                                                  otherRevision, otherSource);
+    NS_ENSURE_TRUE(other == NS_ERROR_NOT_AVAILABLE,
+                   NS_SUCCEEDED(other) ? NS_ERROR_NOT_AVAILABLE : other);
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "RekeyStagedOfflineSource"_ns,
+          "UPDATE offline_operations SET messageKey=:fresh WHERE id=:id "
+          "AND revision=:revision AND folderId=:folder AND messageKey=:old "
+          "RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("fresh"_ns, stagedKey));
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, expected.folderId));
+      MOZ_TRY(stmt->BindInt64ByName("old"_ns, expected.key));
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, expected.operationId));
+      MOZ_TRY(stmt->BindInt64ByName("revision"_ns, expected.revision));
+      bool changed;
+      MOZ_TRY(stmt->ExecuteStep(&changed));
+      NS_ENSURE_TRUE(changed, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(stmt->ExecuteStep(&changed));
+      NS_ENSURE_FALSE(changed, NS_ERROR_FILE_CORRUPTED);
+    }
+    // Store retains each existing child's identity and captured tuple. A write
+    // failure rolls back its siblings, the SOURCE key and the staged UID.
+    for (auto& child : children) {
+      child.payload.sourceKey = stagedKey;
+      MOZ_TRY(StoreOfflineOperationInTransaction(child.folderId, child.key,
+                                                 child.payload));
+    }
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
 nsresult MessageDatabase::RequireOfflineOperationMutable(int64_t id) {
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
@@ -2431,6 +2791,530 @@ nsresult MessageDatabase::RequireOfflineOperationMutable(int64_t id) {
   return active ? NS_ERROR_IN_PROGRESS : NS_OK;
 }
 
+nsresult MessageDatabase::RequireOfflineUndoQueued(
+    int64_t id, const OfflineOperationData& operation) {
+  NS_ENSURE_FALSE(operation.playingBack, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "OfflineUndoDispatched"_ns,
+      "SELECT 1 FROM offline_attempts WHERE operationId=:id "
+      "AND state IN (1,2,3) LIMIT 1"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  bool dispatched;
+  MOZ_TRY(stmt->ExecuteStep(&dispatched));
+  return dispatched ? NS_ERROR_NOT_AVAILABLE : NS_OK;
+}
+
+nsresult MessageDatabase::CaptureOfflineOperationForUndo(
+    uint64_t folderId, nsMsgKey key, const nsACString& databaseSourceId,
+    OfflineOperationUndo& output, const OfflineUndoCounterpart* counterpart) {
+  NS_ENSURE_TRUE(folderId && folderId <= INT64_MAX && key &&
+                     key < nsMsgKey_None && !databaseSourceId.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  if (counterpart) {
+    NS_ENSURE_TRUE(
+        counterpart->folderId && counterpart->folderId <= INT64_MAX &&
+            counterpart->key && counterpart->key < nsMsgKey_None &&
+            counterpart->destination.folderId == folderId &&
+            counterpart->destination.key == key &&
+            (counterpart->folderId != folderId || counterpart->key != key) &&
+            (counterpart->action == OfflineOp::kMsgCopy ||
+             counterpart->action == OfflineOp::kMsgMoved) &&
+            (counterpart->action == OfflineOp::kMsgCopy) ==
+                counterpart->copyOrdinal.isSome(),
+        NS_ERROR_INVALID_ARG);
+    NS_ENSURE_TRUE(counterpart->databaseSourceId == databaseSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(CheckFolderBodyAccess(folderId));
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  OfflineOperationUndo prepared;
+  nsresult rv = CaptureOfflineOperationInTransaction(
+      folderId, key, databaseSourceId, prepared, counterpart);
+  if (NS_SUCCEEDED(rv)) {
+    rv = connection->CommitTransaction();
+  }
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  output.mData = std::move(prepared.mData);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::CaptureOfflineOperationInTransaction(
+    uint64_t folderId, nsMsgKey key, const nsACString& databaseSourceId,
+    OfflineOperationUndo& output, const OfflineUndoCounterpart* counterpart,
+    const PendingDestination* extraTarget) {
+  auto saved = MakeUnique<OfflineOperationUndo::Data>();
+  saved->databaseSourceId = databaseSourceId;
+  saved->operation.folderId = folderId;
+  saved->operation.key = key;
+  nsCString current;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(current));
+  NS_ENSURE_TRUE(current == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  MessageBodyState body;
+  MOZ_TRY(ReadMessageBodyState(key, body));
+  NS_ENSURE_TRUE(body.folderId == folderId, NS_ERROR_NOT_AVAILABLE);
+  auto capture = [&](OfflineOperationUndo::Data::Operation& op) -> nsresult {
+    MOZ_TRY(ReadOfflineOperationIdentity(
+        op.folderId, op.key, op.id, op.revision, op.source, &op.folderEpoch));
+    MOZ_TRY(GetOfflineOperation(op.folderId, op.key, op.payload));
+    return RequireOfflineUndoQueued(op.id, op.payload);
+  };
+  MOZ_TRY(capture(saved->operation));
+  auto captureDestination = [&](const Maybe<PendingDestination>& target,
+                                bool canceledMove = false) -> nsresult {
+    if (!target || (target->folderId == folderId && target->key == key)) {
+      return NS_OK;
+    }
+    auto& child = *saved->destinationOperations.AppendElement();
+    child.folderId = target->folderId;
+    child.key = target->key;
+    nsresult found = ReadOfflineOperationIdentity(
+        child.folderId, child.key, child.id, child.revision, child.source,
+        &child.folderEpoch);
+    if (found == NS_ERROR_NOT_AVAILABLE) {
+      NS_ENSURE_FALSE(canceledMove, NS_ERROR_NOT_AVAILABLE);
+      return NS_OK;
+    }
+    MOZ_TRY(found);
+    MOZ_TRY(GetOfflineOperation(child.folderId, child.key, child.payload));
+    MOZ_TRY(RequireOfflineUndoQueued(child.id, child.payload));
+    NS_ENSURE_TRUE(
+        child.payload.sourceKey == key &&
+            (canceledMove ? !(child.payload.operation & OfflineOp::kMoveResult)
+                          : (child.payload.operation & OfflineOp::kMoveResult)),
+        NS_ERROR_NOT_AVAILABLE);
+    if (canceledMove) {
+      MessageBodyState body;
+      MOZ_TRY(ReadMessageBodyState(child.key, body));
+      NS_ENSURE_TRUE(body.folderId == child.folderId, NS_ERROR_NOT_AVAILABLE);
+      child.restoredBody = Some(std::move(body));
+    }
+    return NS_OK;
+  };
+  MOZ_TRY(captureDestination(saved->operation.payload.pendingDestination));
+  for (const auto& target : saved->operation.payload.copyDestinationBindings) {
+    MOZ_TRY(captureDestination(target));
+  }
+  if (extraTarget) {
+    MOZ_TRY(captureDestination(Some(*extraTarget), true));
+  }
+  if (counterpart) {
+    saved->counterpart = Some(*counterpart);
+    auto& op = saved->counterpartOperation;
+    op.folderId = counterpart->folderId;
+    op.key = counterpart->key;
+    MOZ_TRY(capture(op));
+    NS_ENSURE_TRUE(op.payload.operation & counterpart->action,
+                   NS_ERROR_NOT_AVAILABLE);
+    Maybe<PendingDestination> target;
+    if (counterpart->copyOrdinal) {
+      uint32_t ordinal = *counterpart->copyOrdinal;
+      NS_ENSURE_TRUE(ordinal < op.payload.copyDestinationBindings.Length(),
+                     NS_ERROR_INVALID_ARG);
+      target = op.payload.copyDestinationBindings[ordinal];
+    } else {
+      target = op.payload.pendingDestination;
+    }
+    NS_ENSURE_TRUE(
+        target && SamePendingDestination(*target, counterpart->destination),
+        NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(
+        ValidatePendingDestination(*target, op.folderId, op.key, false, op.id));
+  }
+  output.mData = std::move(saved);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ValidateOfflineUndoState(
+    const OfflineOperationUndo::Data& saved, bool allowMissingEmpty) {
+  nsCString sourceId;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+  NS_ENSURE_TRUE(sourceId == saved.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  auto validate =
+      [&](const OfflineOperationUndo::Data::Operation& expected) -> nsresult {
+    if (expected.restoredBody) {
+      MessageBodyState body;
+      MOZ_TRY(ReadMessageBodyState(expected.key, body));
+      NS_ENSURE_TRUE(SameBodyGuard(body, *expected.restoredBody),
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+    int64_t id = 0, revision = 0;
+    Maybe<ServerMessageLocation> source;
+    Maybe<uint32_t> folderEpoch;
+    nsresult found = ReadOfflineOperationIdentity(
+        expected.folderId, expected.key, id, revision, source, &folderEpoch);
+    if (!expected.id && found == NS_ERROR_NOT_AVAILABLE) {
+      return NS_OK;
+    }
+    if (found == NS_ERROR_NOT_AVAILABLE && allowMissingEmpty &&
+        (&expected == &saved.operation || expected.restoredBody) &&
+        !expected.payload.operation) {
+      // Ordinary replay removes zero-bit records. Only the native Redo owner
+      // can recover this canceled intent; retained dispatch fences still apply.
+      MOZ_TRY(RequireOfflineUndoQueued(expected.id, expected.payload));
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "CanceledOfflineIdentityStillAbsent"_ns,
+          "SELECT 1 FROM offline_operations WHERE id=:id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, expected.id));
+      bool exists;
+      MOZ_TRY(stmt->ExecuteStep(&exists));
+      NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+      if (expected.source) {
+        uint32_t epoch;
+        MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+            expected.source->folderId, epoch));
+        NS_ENSURE_TRUE(epoch == expected.source->epoch, NS_ERROR_NOT_AVAILABLE);
+      }
+      return NS_OK;
+    }
+    MOZ_TRY(found);
+    NS_ENSURE_TRUE(expected.id && id == expected.id &&
+                       revision == expected.revision &&
+                       SameOfflineSource(source, expected.source) &&
+                       folderEpoch == expected.folderEpoch,
+                   NS_ERROR_NOT_AVAILABLE);
+    OfflineOperationData payload;
+    MOZ_TRY(GetOfflineOperation(expected.folderId, expected.key, payload));
+    NS_ENSURE_TRUE(SameOfflinePayload(payload, expected.payload),
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(RequireOfflineUndoQueued(id, payload));
+    if (source) {
+      uint32_t epoch;
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+          source->folderId, epoch));
+      NS_ENSURE_TRUE(epoch == source->epoch, NS_ERROR_NOT_AVAILABLE);
+    }
+    return NS_OK;
+  };
+  MOZ_TRY(validate(saved.operation));
+  for (const auto& child : saved.destinationOperations) {
+    MOZ_TRY(validate(child));
+  }
+  return NS_OK;
+}
+
+nsresult MessageDatabase::CancelOfflineMoveInTransaction(
+    uint64_t folderId, nsMsgKey key, const PendingDestination& selected,
+    const OfflineOperationUndo& full, OfflineOperationUndo& canceled) {
+  const auto& saved = *full.mData;
+  const auto& op = saved.operation;
+  NS_ENSURE_TRUE(
+      !saved.counterpart && op.source && op.source->folderId == folderId &&
+          (op.payload.operation & OfflineOp::kMsgMoved) &&
+          op.payload.pendingDestination &&
+          SamePendingDestination(*op.payload.pendingDestination, selected),
+      NS_ERROR_NOT_AVAILABLE);
+  bool counterpart = false;
+  for (const auto& child : saved.destinationOperations) {
+    if (child.folderId == selected.folderId && child.key == selected.key) {
+      NS_ENSURE_TRUE(child.id &&
+                         (child.payload.operation & OfflineOp::kMoveResult) &&
+                         child.payload.sourceKey == op.key,
+                     NS_ERROR_NOT_AVAILABLE);
+      counterpart = true;
+    }
+  }
+  NS_ENSURE_TRUE(counterpart, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(BindMessageToServerUidInTransaction(key, folderId, op.source->epoch,
+                                              op.source->uid, false));
+  OfflineOperationData payload;
+  MOZ_TRY(GetOfflineOperation(folderId, key, payload));
+  payload.operation &= ~OfflineOp::kMsgMoved;
+  payload.pendingDestination.reset();
+  payload.destinationFolderURI.Truncate();
+  MOZ_TRY(StoreOfflineOperationInTransaction(folderId, key, payload));
+  OfflineOperationData child;
+  MOZ_TRY(GetOfflineOperation(selected.folderId, selected.key, child));
+  NS_ENSURE_TRUE(
+      (child.operation & OfflineOp::kMoveResult) && child.sourceKey == key,
+      NS_ERROR_NOT_AVAILABLE);
+  // The canceled counterpart is no longer an active requested destination.
+  // Preserve every other word and the physical row for the owning Redo.
+  child.operation &= ~OfflineOp::kMoveResult;
+  MOZ_TRY(StoreOfflineOperationInTransaction(selected.folderId, selected.key,
+                                             child));
+  // Keep the selected physical counterpart as explicitly owned Redo recovery.
+  // No accepted/unresolved row or provider body is deleted by cancellation.
+  MOZ_TRY(CaptureOfflineOperationInTransaction(
+      folderId, key, saved.databaseSourceId, canceled, nullptr, &selected));
+  MessageBodyState body;
+  MOZ_TRY(ReadMessageBodyState(key, body));
+  canceled.mData->restoredBody = Some(std::move(body));
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ReapplyOfflineMoveInTransaction(
+    uint64_t folderId, nsMsgKey key, const OfflineOperationUndo& redo,
+    OfflineOperationUndo& nextOffline) {
+  NS_ENSURE_TRUE(redo.mData && redo.mData->redoState, NS_ERROR_NOT_AVAILABLE);
+  const auto& saved = *redo.mData;
+  const auto& canceled = *saved.redoState;
+  NS_ENSURE_TRUE(canceled.restoredBody &&
+                     canceled.operation.folderId == folderId &&
+                     canceled.operation.key == key &&
+                     canceled.operation.id == saved.operation.id,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ValidateOfflineUndoState(canceled, true));
+  MessageBodyState body;
+  MOZ_TRY(ReadMessageBodyState(key, body));
+  NS_ENSURE_TRUE(SameBodyGuard(body, *canceled.restoredBody),
+                 NS_ERROR_NOT_AVAILABLE);
+  const auto& payload = saved.operation.payload;
+  NS_ENSURE_TRUE(
+      (payload.operation & OfflineOp::kMsgMoved) && payload.pendingDestination,
+      NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ValidatePendingDestination(*payload.pendingDestination, folderId, key,
+                                     false, canceled.operation.id));
+  for (const auto& target : payload.copyDestinationBindings) {
+    if (target) {
+      MOZ_TRY(ValidatePendingDestination(*target, folderId, key, false,
+                                         canceled.operation.id));
+    }
+  }
+  uint32_t uid;
+  MOZ_TRY(GetMessageUidOnServer(key, uid));
+  NS_ENSURE_TRUE(saved.operation.source && uid == saved.operation.source->uid,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool reactivated = false;
+  for (uint32_t i = 0; i < canceled.destinationOperations.Length(); ++i) {
+    const auto& child = canceled.destinationOperations[i];
+    if (!child.restoredBody) {
+      continue;
+    }
+    NS_ENSURE_TRUE(!reactivated &&
+                       child.folderId == payload.pendingDestination->folderId &&
+                       child.key == payload.pendingDestination->key,
+                   NS_ERROR_NOT_AVAILABLE);
+    const OfflineOperationUndo::Data::Operation* original = nullptr;
+    for (const auto& candidate : saved.destinationOperations) {
+      if (candidate.id == child.id && candidate.folderId == child.folderId &&
+          candidate.key == child.key) {
+        original = &candidate;
+        break;
+      }
+    }
+    NS_ENSURE_TRUE(
+        original && (original->payload.operation & OfflineOp::kMoveResult),
+        NS_ERROR_NOT_AVAILABLE);
+    const auto& full = original->payload;
+    OfflineOperationData restored{full.operation,
+                                  full.flagOperation,
+                                  full.newFlags,
+                                  key,
+                                  full.sourceUid,
+                                  full.messageSize,
+                                  full.playingBack,
+                                  full.sourceFolderURI,
+                                  full.destinationFolderURI,
+                                  full.keywordsToAdd,
+                                  full.keywordsToRemove,
+                                  full.copyDestinations.Clone(),
+                                  full.pendingDestination,
+                                  full.copyDestinationBindings.Clone()};
+    int64_t id, revision;
+    Maybe<ServerMessageLocation> source;
+    nsresult found = ReadOfflineOperationIdentity(child.folderId, child.key, id,
+                                                  revision, source);
+    NS_ENSURE_TRUE(NS_SUCCEEDED(found) || found == NS_ERROR_NOT_AVAILABLE,
+                   found);
+    bool cleanedEmpty = found == NS_ERROR_NOT_AVAILABLE;
+    MOZ_TRY(StoreOfflineOperationInTransaction(
+        child.folderId, child.key, restored, cleanedEmpty ? &redo : nullptr,
+        cleanedEmpty, cleanedEmpty ? Some(i) : Nothing()));
+    reactivated = true;
+  }
+  NS_ENSURE_TRUE(reactivated, NS_ERROR_NOT_AVAILABLE);
+  int64_t id, revision;
+  Maybe<ServerMessageLocation> source;
+  nsresult found =
+      ReadOfflineOperationIdentity(folderId, key, id, revision, source);
+  NS_ENSURE_TRUE(NS_SUCCEEDED(found) || found == NS_ERROR_NOT_AVAILABLE, found);
+  bool cleanedEmpty = found == NS_ERROR_NOT_AVAILABLE;
+  MOZ_TRY(StoreOfflineOperationInTransaction(
+      folderId, key, payload, cleanedEmpty ? &redo : nullptr, cleanedEmpty));
+  return CaptureOfflineOperationInTransaction(
+      folderId, key, saved.databaseSourceId, nextOffline, nullptr);
+}
+
+nsresult MessageDatabase::RestoreOfflineOperationInTransaction(
+    uint64_t folderId, nsMsgKey key, const RemovedMessage& removed,
+    OfflineOperationUndo& offline) {
+  const auto& saved = *offline.mData;
+  const auto& op = saved.operation;
+  const auto& body = removed.mData->body;
+  NS_ENSURE_TRUE(folderId == op.folderId && folderId == body.folderId &&
+                     op.key == body.key &&
+                     saved.databaseSourceId == body.databaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCString current;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(current));
+  NS_ENSURE_TRUE(current == saved.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(RequireOfflineUndoQueued(op.id, op.payload));
+  int64_t retainedId = 0, retainedRevision = 0;
+  Maybe<ServerMessageLocation> retainedSource;
+  Maybe<uint32_t> retainedEpoch;
+  nsresult retained = ReadOfflineOperationIdentity(
+      op.folderId, op.key, retainedId, retainedRevision, retainedSource,
+      &retainedEpoch);
+  if (NS_FAILED(retained) && retained != NS_ERROR_NOT_AVAILABLE) {
+    return retained;
+  }
+  if (NS_SUCCEEDED(retained)) {
+    OfflineOperationData payload;
+    MOZ_TRY(GetOfflineOperation(op.folderId, op.key, payload));
+    NS_ENSURE_TRUE(retainedId == op.id && retainedRevision == op.revision &&
+                       SameOfflineSource(retainedSource, op.source) &&
+                       retainedEpoch == op.folderEpoch &&
+                       SameOfflinePayload(payload, op.payload),
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(RequireOfflineUndoQueued(retainedId, payload));
+  }
+  // Retained operations bypass Store's source capture. Recheck the immutable
+  // server epoch and every actual physical target before rekeying that intent.
+  if (op.source) {
+    uint32_t epoch;
+    MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+        op.source->folderId, epoch));
+    NS_ENSURE_TRUE(epoch == op.source->epoch, NS_ERROR_NOT_AVAILABLE);
+  }
+  auto validateTarget = [&](const Maybe<PendingDestination>& target,
+                            bool selfAppend) -> nsresult {
+    if (!target) {
+      return NS_OK;
+    }
+    auto currentTarget = *target;
+    if (selfAppend) {
+      currentTarget.key = key;
+    }
+    return ValidatePendingDestination(
+        currentTarget, folderId, selfAppend ? key : op.key, selfAppend, op.id);
+  };
+  bool selfAppend = op.payload.pendingDestination &&
+                    op.payload.pendingDestination->folderId == folderId &&
+                    op.payload.pendingDestination->key == op.key &&
+                    (op.payload.operation &
+                     (OfflineOp::kAppendDraft | OfflineOp::kAppendTemplate));
+  MOZ_TRY(validateTarget(op.payload.pendingDestination, selfAppend));
+  for (const auto& target : op.payload.copyDestinationBindings) {
+    MOZ_TRY(validateTarget(target, false));
+  }
+  // Validate the whole captured target set before changing any association.
+  for (const auto& child : saved.destinationOperations) {
+    int64_t id = 0, revision = 0;
+    Maybe<ServerMessageLocation> source;
+    nsresult found = ReadOfflineOperationIdentity(child.folderId, child.key, id,
+                                                  revision, source);
+    if (!child.id && found == NS_ERROR_NOT_AVAILABLE) {
+      continue;
+    }
+    MOZ_TRY(found);
+    NS_ENSURE_TRUE(child.id && id == child.id && revision == child.revision &&
+                       SameOfflineSource(source, child.source),
+                   NS_ERROR_NOT_AVAILABLE);
+    OfflineOperationData payload;
+    MOZ_TRY(GetOfflineOperation(child.folderId, child.key, payload));
+    NS_ENSURE_TRUE(SameOfflinePayload(payload, child.payload),
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(RequireOfflineUndoQueued(id, payload));
+  }
+  OfflineOperationData restored{op.payload.operation,
+                                op.payload.flagOperation,
+                                op.payload.newFlags,
+                                op.payload.sourceKey,
+                                op.payload.sourceUid,
+                                op.payload.messageSize,
+                                op.payload.playingBack,
+                                op.payload.sourceFolderURI,
+                                op.payload.destinationFolderURI,
+                                op.payload.keywordsToAdd,
+                                op.payload.keywordsToRemove,
+                                op.payload.copyDestinations.Clone(),
+                                op.payload.pendingDestination,
+                                op.payload.copyDestinationBindings.Clone()};
+  // An explicitly saved APPEND target is the operation's own physical row.
+  // Reattach that actual binding, never a URI/key-based inferred counterpart.
+  if (restored.pendingDestination &&
+      restored.pendingDestination->folderId == folderId &&
+      restored.pendingDestination->key == op.key) {
+    NS_ENSURE_TRUE(restored.operation &
+                       (OfflineOp::kAppendDraft | OfflineOp::kAppendTemplate),
+                   NS_ERROR_INVALID_ARG);
+    restored.pendingDestination->key = key;
+  }
+  if (NS_SUCCEEDED(retained)) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "RestoreRetainedOfflineSource"_ns,
+        "UPDATE offline_operations SET messageKey=:fresh, "
+        "destinationKey=CASE WHEN destinationFolderId=:folder AND "
+        "destinationKey=:old THEN :fresh ELSE destinationKey END "
+        "WHERE id=:id AND revision=:revision AND folderId=:folder AND "
+        "messageKey=:old RETURNING id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("fresh"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("old"_ns, op.key));
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, op.id));
+    MOZ_TRY(stmt->BindInt64ByName("revision"_ns, op.revision));
+    bool changed;
+    MOZ_TRY(stmt->ExecuteStep(&changed));
+    NS_ENSURE_TRUE(changed, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(stmt->ExecuteStep(&changed));
+    NS_ENSURE_FALSE(changed, NS_ERROR_FILE_CORRUPTED);
+  } else {
+    MOZ_TRY(
+        StoreOfflineOperationInTransaction(folderId, key, restored, &offline));
+  }
+  for (const auto& child : saved.destinationOperations) {
+    if (!child.id) {
+      continue;
+    }
+    OfflineOperationData payload;
+    MOZ_TRY(GetOfflineOperation(child.folderId, child.key, payload));
+    payload.sourceKey = key;
+    MOZ_TRY(
+        StoreOfflineOperationInTransaction(child.folderId, child.key, payload));
+  }
+  if (saved.counterpart) {
+    const auto& expected = saved.counterpartOperation;
+    const auto& binding = *saved.counterpart;
+    int64_t id, revision;
+    Maybe<ServerMessageLocation> source;
+    MOZ_TRY(ReadOfflineOperationIdentity(expected.folderId, expected.key, id,
+                                         revision, source));
+    NS_ENSURE_TRUE(id == expected.id && revision == expected.revision,
+                   NS_ERROR_NOT_AVAILABLE);
+    OfflineOperationData payload;
+    MOZ_TRY(GetOfflineOperation(expected.folderId, expected.key, payload));
+    MOZ_TRY(RequireOfflineUndoQueued(id, payload));
+    NS_ENSURE_TRUE(payload.operation & binding.action, NS_ERROR_NOT_AVAILABLE);
+    Maybe<PendingDestination>* target;
+    if (binding.copyOrdinal) {
+      NS_ENSURE_TRUE(
+          *binding.copyOrdinal < payload.copyDestinationBindings.Length(),
+          NS_ERROR_NOT_AVAILABLE);
+      target = &payload.copyDestinationBindings[*binding.copyOrdinal];
+    } else {
+      target = &payload.pendingDestination;
+    }
+    NS_ENSURE_TRUE(
+        *target && SamePendingDestination(**target, binding.destination),
+        NS_ERROR_NOT_AVAILABLE);
+    (*target)->key = key;
+    MOZ_TRY(StoreOfflineOperationInTransaction(expected.folderId, expected.key,
+                                               payload));
+  }
+  return NS_OK;
+}
+
 nsresult MessageDatabase::ValidatePendingDestination(
     const PendingDestination& destination, uint64_t folderId, nsMsgKey key,
     bool append, int64_t operationId) {
@@ -2443,9 +3327,36 @@ nsresult MessageDatabase::ValidatePendingDestination(
       NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
   uint32_t epoch;
-  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
-      destination.folderId, epoch));
-  NS_ENSURE_TRUE(epoch == destination.epoch, NS_ERROR_NOT_AVAILABLE);
+  nsresult epochRv = DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      destination.folderId, epoch);
+  if (destination.epochKnown) {
+    MOZ_TRY(epochRv);
+    NS_ENSURE_TRUE(epoch == destination.epoch, NS_ERROR_NOT_AVAILABLE);
+  } else {
+    NS_ENSURE_TRUE(destination.epoch == 0, NS_ERROR_INVALID_ARG);
+    if (NS_FAILED(epochRv) && epochRv != NS_ERROR_NOT_AVAILABLE) {
+      return epochRv;
+    }
+    if (NS_SUCCEEDED(epochRv)) {
+      nsCOMPtr<mozIStorageStatement> queued;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "UnobservedDestinationAlreadyQueued"_ns,
+          "SELECT 1 FROM offline_operations WHERE id=:id AND "
+          "destinationFolderId=:folder AND destinationKey=:key AND "
+          "destinationEpoch IS NULL UNION ALL SELECT 1 FROM "
+          "offline_copy_destinations WHERE operationId=:id AND "
+          "destinationFolderId=:folder AND destinationKey=:key AND "
+          "destinationEpoch IS NULL LIMIT 1"_ns,
+          getter_AddRefs(queued)));
+      mozStorageStatementScoper scope(queued);
+      MOZ_TRY(queued->BindInt64ByName("id"_ns, operationId));
+      MOZ_TRY(queued->BindInt64ByName("folder"_ns, destination.folderId));
+      MOZ_TRY(queued->BindInt64ByName("key"_ns, destination.key));
+      bool prior;
+      MOZ_TRY(queued->ExecuteStep(&prior));
+      NS_ENSURE_TRUE(prior, NS_ERROR_NOT_AVAILABLE);
+    }
+  }
   {
     nsCOMPtr<mozIStorageStatement> member;
     MOZ_TRY(DatabaseCore::GetStatement(
@@ -2629,193 +3540,234 @@ nsresult MessageDatabase::StoreOfflineOperation(
   MOZ_TRY(connection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
   MOZ_TRY(connection->BeginTransaction());
-  nsresult rv = [&]() -> nsresult {
-    int64_t id = 0, revision = 0;
-    Maybe<ServerMessageLocation> source;
-    Maybe<uint32_t> folderEpoch;
-    nsresult found = ReadOfflineOperationIdentity(folderId, key, id, revision,
-                                                  source, &folderEpoch);
-    if (NS_FAILED(found) && found != NS_ERROR_NOT_AVAILABLE) {
-      return found;
-    }
-    if (id) {
-      MOZ_TRY(RequireOfflineOperationMutable(id));
-      NS_ENSURE_TRUE(revision < INT64_MAX, NS_ERROR_ILLEGAL_VALUE);
-    }
-    {
-      nsCOMPtr<mozIStorageStatement> member;
-      MOZ_TRY(DatabaseCore::GetStatement(
-          "OfflineOperationMember"_ns,
-          "SELECT folderId FROM messages WHERE id = :key UNION ALL "
-          "SELECT folderId FROM staged_messages WHERE id = :key"_ns,
-          getter_AddRefs(member)));
-      mozStorageStatementScoper scoper(member);
-      MOZ_TRY(member->BindInt64ByName("key"_ns, key));
-      bool exists;
-      MOZ_TRY(member->ExecuteStep(&exists));
-      if (!exists) {
-        // Existing operations survive local deletion with their captured tuple.
-        NS_ENSURE_TRUE(id, NS_ERROR_NOT_AVAILABLE);
-      } else {
-        int64_t actualFolder;
-        MOZ_TRY(member->GetInt64(0, &actualFolder));
-        NS_ENSURE_TRUE(actualFolder > 0 && uint64_t(actualFolder) == folderId,
-                       NS_ERROR_NOT_AVAILABLE);
-        nsTArray<nsCString> names;
-        MOZ_TRY(GetMessagePropertyNames(key, names));
-        MOZ_TRY(member->ExecuteStep(&exists));
-        NS_ENSURE_FALSE(exists, NS_ERROR_FILE_CORRUPTED);
-        // A missing historical tuple must never acquire a later binding.
-        if (!id && names.Contains("uidOnServer"_ns)) {
-          ServerMessageLocation location{folderId, key};
-          RefPtr<Message> header = new Message(key);
-          MOZ_TRY(header->GetUint32Property("uidOnServer", &location.uid));
-          NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
-          MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
-              folderId, location.epoch));
-          source = Some(location);
-        }
-      }
-    }
-    nsTArray<nsMsgKey> destinations;
-    if (input.pendingDestination) {
-      uint32_t action =
-          input.operation & (OfflineOp::kMsgMoved | OfflineOp::kAppendDraft |
-                             OfflineOp::kAppendTemplate);
-      NS_ENSURE_TRUE(action && !(action & (action - 1)), NS_ERROR_INVALID_ARG);
-      bool append = action != OfflineOp::kMsgMoved;
-      MOZ_TRY(ValidatePendingDestination(*input.pendingDestination, folderId,
-                                         key, append, id));
-      destinations.AppendElement(input.pendingDestination->key);
-    }
-    for (const auto& destination : input.copyDestinationBindings) {
-      if (!destination) {
-        continue;
-      }
-      // Clearing COPY consumes only its first entry; the saved tail is not
-      // dispatch authority until COPY is explicitly queued again.
-      NS_ENSURE_FALSE(destinations.Contains(destination->key),
-                      NS_ERROR_INVALID_ARG);
-      MOZ_TRY(
-          ValidatePendingDestination(*destination, folderId, key, false, id));
-      destinations.AppendElement(destination->key);
-    }
-    if (input.operation & OfflineOp::kDeleteAllMsgs) {
-      if (!folderEpoch) {
-        NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
-        uint32_t epoch;
-        MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
-            folderId, epoch));
-        folderEpoch = Some(epoch);
-      }
-    } else {
-      folderEpoch.reset();
-    }
-    {
-      nsCOMPtr<mozIStorageStatement> stmt;
-      MOZ_TRY(DatabaseCore::GetStatement(
-          "StoreOfflineOperation"_ns,
-          "INSERT INTO offline_operations(folderId, messageKey, revision, "
-          "epoch, uid, folderEpoch, "
-          "operation, flagOperation, newFlags, sourceKey, sourceUid, "
-          "messageSize, "
-          "playingBack, sourceFolderURI, destinationFolderURI, keywordsToAdd, "
-          "keywordsToRemove, destinationFolderId, destinationKey, "
-          "destinationEpoch) "
-          "VALUES(:folder, :key, :revision, :epoch, :uid, :folderEpoch, "
-          ":operation, :flags, "
-          ":newFlags, "
-          ":sourceKey, :sourceUid, :size, :playing, :sourceURI, "
-          ":destinationURI, :add, :remove, :destinationFolder, "
-          ":destinationKey, :destinationEpoch) "
-          "ON CONFLICT(folderId, messageKey) DO UPDATE SET revision = "
-          "excluded.revision, "
-          "epoch = excluded.epoch, uid = excluded.uid, folderEpoch = "
-          "excluded.folderEpoch, operation = "
-          "excluded.operation, "
-          "flagOperation = excluded.flagOperation, newFlags = "
-          "excluded.newFlags, "
-          "sourceKey = excluded.sourceKey, sourceUid = excluded.sourceUid, "
-          "messageSize = excluded.messageSize, playingBack = "
-          "excluded.playingBack, "
-          "sourceFolderURI = excluded.sourceFolderURI, destinationFolderURI = "
-          "excluded.destinationFolderURI, "
-          "keywordsToAdd = excluded.keywordsToAdd, keywordsToRemove = "
-          "excluded.keywordsToRemove, destinationFolderId = "
-          "excluded.destinationFolderId, "
-          "destinationKey = excluded.destinationKey, destinationEpoch = "
-          "excluded.destinationEpoch "
-          "RETURNING id"_ns,
-          getter_AddRefs(stmt)));
-      mozStorageStatementScoper scoper(stmt);
-      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
-      MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
-      MOZ_TRY(stmt->BindInt64ByName("revision"_ns, revision + 1));
-      if (source) {
-        MOZ_TRY(stmt->BindInt64ByName("epoch"_ns, source->epoch));
-        MOZ_TRY(stmt->BindInt64ByName("uid"_ns, source->uid));
-      } else {
-        MOZ_TRY(stmt->BindNullByName("epoch"_ns));
-        MOZ_TRY(stmt->BindNullByName("uid"_ns));
-      }
-      if (folderEpoch) {
-        MOZ_TRY(stmt->BindInt64ByName("folderEpoch"_ns, *folderEpoch));
-      } else {
-        MOZ_TRY(stmt->BindNullByName("folderEpoch"_ns));
-      }
-      MOZ_TRY(BindOfflineDestination(stmt, input.pendingDestination));
-      MOZ_TRY(stmt->BindInt64ByName("operation"_ns, input.operation));
-      MOZ_TRY(stmt->BindInt64ByName("flags"_ns, input.flagOperation));
-      MOZ_TRY(stmt->BindInt64ByName("newFlags"_ns, input.newFlags));
-      MOZ_TRY(stmt->BindInt64ByName("sourceKey"_ns, input.sourceKey));
-      MOZ_TRY(stmt->BindInt64ByName("sourceUid"_ns, input.sourceUid));
-      MOZ_TRY(stmt->BindInt64ByName("size"_ns, input.messageSize));
-      MOZ_TRY(stmt->BindInt32ByName("playing"_ns, input.playingBack));
-      MOZ_TRY(
-          stmt->BindUTF8StringByName("sourceURI"_ns, input.sourceFolderURI));
-      MOZ_TRY(stmt->BindUTF8StringByName("destinationURI"_ns,
-                                         input.destinationFolderURI));
-      MOZ_TRY(stmt->BindUTF8StringByName("add"_ns, input.keywordsToAdd));
-      MOZ_TRY(stmt->BindUTF8StringByName("remove"_ns, input.keywordsToRemove));
-      bool more;
-      MOZ_TRY(stmt->ExecuteStep(&more));
-      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
-      MOZ_TRY(stmt->GetInt64(0, &id));
-      MOZ_TRY(stmt->ExecuteStep(&more));
-      NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
-    }
-    {
-      nsCOMPtr<mozIStorageStatement> stmt;
-      MOZ_TRY(DatabaseCore::GetStatement(
-          "ClearOfflineCopies"_ns,
-          "DELETE FROM offline_copy_destinations WHERE operationId = :id"_ns,
-          getter_AddRefs(stmt)));
-      mozStorageStatementScoper scoper(stmt);
-      MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
-      MOZ_TRY(stmt->Execute());
-    }
-    nsCOMPtr<mozIStorageStatement> copy;
-    MOZ_TRY(DatabaseCore::GetStatement(
-        "StoreOfflineCopy"_ns,
-        "INSERT INTO offline_copy_destinations(operationId, ordinal, uri, "
-        "destinationFolderId, destinationKey, destinationEpoch) "
-        "VALUES(:id, :ordinal, :uri, :destinationFolder, :destinationKey, :destinationEpoch)"_ns,
-        getter_AddRefs(copy)));
-    for (size_t i = 0; i < input.copyDestinations.Length(); ++i) {
-      mozStorageStatementScoper scoper(copy);
-      MOZ_TRY(copy->BindInt64ByName("id"_ns, id));
-      MOZ_TRY(copy->BindInt64ByName("ordinal"_ns, i));
-      MOZ_TRY(copy->BindUTF8StringByName("uri"_ns, input.copyDestinations[i]));
-      Maybe<PendingDestination> destination;
-      if (!input.copyDestinationBindings.IsEmpty()) {
-        destination = input.copyDestinationBindings[i];
-      }
-      MOZ_TRY(BindOfflineDestination(copy, destination));
-      MOZ_TRY(copy->Execute());
-    }
-    return connection->CommitTransaction();
-  }();
+  nsresult rv = StoreOfflineOperationInTransaction(folderId, key, input);
+  if (NS_SUCCEEDED(rv)) {
+    rv = connection->CommitTransaction();
+  }
   return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::StoreOfflineOperationInTransaction(
+    uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
+    const OfflineOperationUndo* restoring, bool restoreEmptyCanceledMove,
+    const Maybe<uint32_t>& canceledDestination) {
+  int64_t id = 0, revision = 0;
+  Maybe<ServerMessageLocation> source;
+  Maybe<uint32_t> folderEpoch;
+  nsresult found = ReadOfflineOperationIdentity(folderId, key, id, revision,
+                                                source, &folderEpoch);
+  if (NS_FAILED(found) && found != NS_ERROR_NOT_AVAILABLE) {
+    return found;
+  }
+  if (restoring) {
+    NS_ENSURE_FALSE(id, NS_ERROR_NOT_AVAILABLE);
+    source = restoring->mData->operation.source;
+    folderEpoch = restoring->mData->operation.folderEpoch;
+  }
+  if (restoreEmptyCanceledMove) {
+    NS_ENSURE_TRUE(restoring && restoring->mData->redoState,
+                   NS_ERROR_NOT_AVAILABLE);
+    const auto& state = *restoring->mData->redoState;
+    const auto* canceled = &state.operation;
+    if (canceledDestination) {
+      NS_ENSURE_TRUE(
+          *canceledDestination < state.destinationOperations.Length(),
+          NS_ERROR_NOT_AVAILABLE);
+      canceled = &state.destinationOperations[*canceledDestination];
+      NS_ENSURE_TRUE(canceled->restoredBody, NS_ERROR_NOT_AVAILABLE);
+    }
+    NS_ENSURE_TRUE(!canceled->payload.operation &&
+                       canceled->folderId == folderId && canceled->key == key,
+                   NS_ERROR_NOT_AVAILABLE);
+    id = canceled->id;
+    revision = canceled->revision;
+    source = canceled->source;
+    folderEpoch = canceled->folderEpoch;
+  }
+  if (id) {
+    MOZ_TRY(RequireOfflineOperationMutable(id));
+    NS_ENSURE_TRUE(revision < INT64_MAX, NS_ERROR_ILLEGAL_VALUE);
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> member;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "OfflineOperationMember"_ns,
+        "SELECT folderId FROM messages WHERE id = :key UNION ALL "
+        "SELECT folderId FROM staged_messages WHERE id = :key"_ns,
+        getter_AddRefs(member)));
+    mozStorageStatementScoper scoper(member);
+    MOZ_TRY(member->BindInt64ByName("key"_ns, key));
+    bool exists;
+    MOZ_TRY(member->ExecuteStep(&exists));
+    if (!exists) {
+      // Existing operations survive local deletion with their captured tuple.
+      NS_ENSURE_TRUE(id, NS_ERROR_NOT_AVAILABLE);
+    } else {
+      int64_t actualFolder;
+      MOZ_TRY(member->GetInt64(0, &actualFolder));
+      NS_ENSURE_TRUE(actualFolder > 0 && uint64_t(actualFolder) == folderId,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsTArray<nsCString> names;
+      MOZ_TRY(GetMessagePropertyNames(key, names));
+      MOZ_TRY(member->ExecuteStep(&exists));
+      NS_ENSURE_FALSE(exists, NS_ERROR_FILE_CORRUPTED);
+      // A missing historical tuple must never acquire a later binding.
+      if (!id && !restoring && names.Contains("uidOnServer"_ns)) {
+        ServerMessageLocation location{folderId, key};
+        RefPtr<Message> header = new Message(key);
+        MOZ_TRY(header->GetUint32Property("uidOnServer", &location.uid));
+        NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+            folderId, location.epoch));
+        source = Some(location);
+      }
+    }
+  }
+  nsTArray<nsMsgKey> destinations;
+  if (input.pendingDestination) {
+    uint32_t action =
+        input.operation & (OfflineOp::kMsgMoved | OfflineOp::kAppendDraft |
+                           OfflineOp::kAppendTemplate);
+    NS_ENSURE_TRUE(action && !(action & (action - 1)), NS_ERROR_INVALID_ARG);
+    bool append = action != OfflineOp::kMsgMoved;
+    MOZ_TRY(ValidatePendingDestination(*input.pendingDestination, folderId, key,
+                                       append, id));
+    destinations.AppendElement(input.pendingDestination->key);
+  }
+  for (const auto& destination : input.copyDestinationBindings) {
+    if (!destination) {
+      continue;
+    }
+    // Clearing COPY consumes only its first entry; the saved tail is not
+    // dispatch authority until COPY is explicitly queued again.
+    NS_ENSURE_FALSE(destinations.Contains(destination->key),
+                    NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ValidatePendingDestination(*destination, folderId, key, false, id));
+    destinations.AppendElement(destination->key);
+  }
+  if (input.operation & OfflineOp::kDeleteAllMsgs) {
+    if (!folderEpoch) {
+      NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
+      uint32_t epoch;
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
+                                                                       epoch));
+      folderEpoch = Some(epoch);
+    }
+  } else {
+    folderEpoch.reset();
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "StoreOfflineOperation"_ns,
+        "INSERT INTO offline_operations(id, folderId, messageKey, revision, "
+        "epoch, uid, folderEpoch, sourcePhysicalKey, "
+        "operation, flagOperation, newFlags, sourceKey, sourceUid, "
+        "messageSize, "
+        "playingBack, sourceFolderURI, destinationFolderURI, keywordsToAdd, "
+        "keywordsToRemove, destinationFolderId, destinationKey, "
+        "destinationEpoch) "
+        "VALUES(:retainedId, :folder, :key, :revision, :epoch, :uid, "
+        ":folderEpoch, "
+        ":sourcePhysicalKey, "
+        ":operation, :flags, "
+        ":newFlags, "
+        ":sourceKey, :sourceUid, :size, :playing, :sourceURI, "
+        ":destinationURI, :add, :remove, :destinationFolder, "
+        ":destinationKey, :destinationEpoch) "
+        "ON CONFLICT(folderId, messageKey) DO UPDATE SET revision = "
+        "excluded.revision, "
+        "epoch = excluded.epoch, uid = excluded.uid, folderEpoch = "
+        "excluded.folderEpoch, sourcePhysicalKey = excluded.sourcePhysicalKey, "
+        "operation = "
+        "excluded.operation, "
+        "flagOperation = excluded.flagOperation, newFlags = "
+        "excluded.newFlags, "
+        "sourceKey = excluded.sourceKey, sourceUid = excluded.sourceUid, "
+        "messageSize = excluded.messageSize, playingBack = "
+        "excluded.playingBack, "
+        "sourceFolderURI = excluded.sourceFolderURI, destinationFolderURI = "
+        "excluded.destinationFolderURI, "
+        "keywordsToAdd = excluded.keywordsToAdd, keywordsToRemove = "
+        "excluded.keywordsToRemove, destinationFolderId = "
+        "excluded.destinationFolderId, "
+        "destinationKey = excluded.destinationKey, destinationEpoch = "
+        "excluded.destinationEpoch "
+        "RETURNING id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    if (restoreEmptyCanceledMove) {
+      MOZ_TRY(stmt->BindInt64ByName("retainedId"_ns, id));
+    } else {
+      MOZ_TRY(stmt->BindNullByName("retainedId"_ns));
+    }
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+    MOZ_TRY(stmt->BindInt64ByName("revision"_ns, revision + 1));
+    if (source) {
+      MOZ_TRY(stmt->BindInt64ByName("epoch"_ns, source->epoch));
+      MOZ_TRY(stmt->BindInt64ByName("uid"_ns, source->uid));
+      MOZ_TRY(stmt->BindInt64ByName("sourcePhysicalKey"_ns, source->key));
+    } else {
+      MOZ_TRY(stmt->BindNullByName("epoch"_ns));
+      MOZ_TRY(stmt->BindNullByName("uid"_ns));
+      MOZ_TRY(stmt->BindNullByName("sourcePhysicalKey"_ns));
+    }
+    if (folderEpoch) {
+      MOZ_TRY(stmt->BindInt64ByName("folderEpoch"_ns, *folderEpoch));
+    } else {
+      MOZ_TRY(stmt->BindNullByName("folderEpoch"_ns));
+    }
+    MOZ_TRY(BindOfflineDestination(stmt, input.pendingDestination));
+    MOZ_TRY(stmt->BindInt64ByName("operation"_ns, input.operation));
+    MOZ_TRY(stmt->BindInt64ByName("flags"_ns, input.flagOperation));
+    MOZ_TRY(stmt->BindInt64ByName("newFlags"_ns, input.newFlags));
+    MOZ_TRY(stmt->BindInt64ByName("sourceKey"_ns, input.sourceKey));
+    MOZ_TRY(stmt->BindInt64ByName("sourceUid"_ns, input.sourceUid));
+    MOZ_TRY(stmt->BindInt64ByName("size"_ns, input.messageSize));
+    MOZ_TRY(stmt->BindInt32ByName("playing"_ns, input.playingBack));
+    MOZ_TRY(stmt->BindUTF8StringByName("sourceURI"_ns, input.sourceFolderURI));
+    MOZ_TRY(stmt->BindUTF8StringByName("destinationURI"_ns,
+                                       input.destinationFolderURI));
+    MOZ_TRY(stmt->BindUTF8StringByName("add"_ns, input.keywordsToAdd));
+    MOZ_TRY(stmt->BindUTF8StringByName("remove"_ns, input.keywordsToRemove));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+    MOZ_TRY(stmt->GetInt64(0, &id));
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ClearOfflineCopies"_ns,
+        "DELETE FROM offline_copy_destinations WHERE operationId = :id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scoper(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+    MOZ_TRY(stmt->Execute());
+  }
+  nsCOMPtr<mozIStorageStatement> copy;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "StoreOfflineCopy"_ns,
+      "INSERT INTO offline_copy_destinations(operationId, ordinal, uri, "
+      "destinationFolderId, destinationKey, destinationEpoch) "
+      "VALUES(:id, :ordinal, :uri, :destinationFolder, :destinationKey, :destinationEpoch)"_ns,
+      getter_AddRefs(copy)));
+  for (size_t i = 0; i < input.copyDestinations.Length(); ++i) {
+    mozStorageStatementScoper scoper(copy);
+    MOZ_TRY(copy->BindInt64ByName("id"_ns, id));
+    MOZ_TRY(copy->BindInt64ByName("ordinal"_ns, i));
+    MOZ_TRY(copy->BindUTF8StringByName("uri"_ns, input.copyDestinations[i]));
+    Maybe<PendingDestination> destination;
+    if (!input.copyDestinationBindings.IsEmpty()) {
+      destination = input.copyDestinationBindings[i];
+    }
+    MOZ_TRY(BindOfflineDestination(copy, destination));
+    MOZ_TRY(copy->Execute());
+  }
+  return NS_OK;
 }
 
 nsresult MessageDatabase::SetOfflineOperationPlayingBack(uint64_t folderId,
@@ -2904,7 +3856,28 @@ nsresult MessageDatabase::ListOfflineOperations(uint64_t folderId,
 
 nsresult MessageDatabase::BeginOfflineAttempt(
     uint64_t folderId, nsMsgKey key, uint32_t operation,
-    const Maybe<PendingDestination>& destination, uint64_t& attemptId) {
+    const Maybe<PendingDestination>& destination, uint64_t& attemptId,
+    const MessageBodyState* appendBody) {
+  return BeginOfflineAttemptInternal(folderId, key, operation, destination,
+                                     attemptId, appendBody, nullptr);
+}
+
+nsresult MessageDatabase::BeginOfflineAction(
+    uint64_t folderId, nsMsgKey key, uint32_t action,
+    const Maybe<PendingDestination>& destination,
+    const Maybe<uint32_t>& copyOrdinal, uint64_t& attemptId) {
+  NS_ENSURE_TRUE((action == OfflineOp::kMsgCopy) == copyOrdinal.isSome() &&
+                     action != OfflineOp::kAppendDraft &&
+                     action != OfflineOp::kAppendTemplate,
+                 NS_ERROR_INVALID_ARG);
+  return BeginOfflineAttemptInternal(folderId, key, action, destination,
+                                     attemptId, nullptr, &copyOrdinal);
+}
+
+nsresult MessageDatabase::BeginOfflineAttemptInternal(
+    uint64_t folderId, nsMsgKey key, uint32_t operation,
+    const Maybe<PendingDestination>& destination, uint64_t& attemptId,
+    const MessageBodyState* appendBody, const Maybe<uint32_t>* copyOrdinal) {
   NS_ENSURE_TRUE(DatabaseCore::sInstance, NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
@@ -2919,7 +3892,12 @@ nsresult MessageDatabase::BeginOfflineAttempt(
     Maybe<uint32_t> folderEpoch;
     MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source,
                                          &folderEpoch));
-    MOZ_TRY(RequireOfflineOperationMutable(id));
+    if (copyOrdinal) {
+      MOZ_TRY(RequireOfflineActionDispatchable(id, revision, operation,
+                                               *copyOrdinal));
+    } else {
+      MOZ_TRY(RequireOfflineOperationMutable(id));
+    }
     OfflineOperationData payload;
     MOZ_TRY(GetOfflineOperation(folderId, key, payload));
     NS_ENSURE_TRUE(
@@ -2982,8 +3960,11 @@ nsresult MessageDatabase::BeginOfflineAttempt(
     Maybe<PendingDestination> saved;
     if (operation == OfflineOp::kMsgCopy) {
       if (!payload.copyDestinationBindings.IsEmpty()) {
-        saved = payload.copyDestinationBindings[0];
-        if (!saved) {
+        uint32_t ordinal = copyOrdinal ? **copyOrdinal : 0;
+        NS_ENSURE_TRUE(ordinal < payload.copyDestinationBindings.Length(),
+                       NS_ERROR_NOT_AVAILABLE);
+        saved = payload.copyDestinationBindings[ordinal];
+        if (!saved && !copyOrdinal) {
           // A later binding cannot stand in for the unresolved first copy.
           for (const auto& binding : payload.copyDestinationBindings) {
             NS_ENSURE_FALSE(binding, NS_ERROR_NOT_AVAILABLE);
@@ -2993,6 +3974,10 @@ nsresult MessageDatabase::BeginOfflineAttempt(
     } else if (operation & (OfflineOp::kMsgMoved | OfflineOp::kAppendDraft |
                             OfflineOp::kAppendTemplate)) {
       saved = payload.pendingDestination;
+    }
+    if (copyOrdinal && (operation == OfflineOp::kMsgCopy ||
+                        operation == OfflineOp::kMsgMoved)) {
+      NS_ENSURE_TRUE(saved, NS_ERROR_NOT_AVAILABLE);
     }
     if (saved) {
       NS_ENSURE_TRUE(
@@ -3006,6 +3991,21 @@ nsresult MessageDatabase::BeginOfflineAttempt(
       MOZ_TRY(ValidatePendingDestination(*destination, folderId, key,
                                          selfAppend, id));
     }
+    if (appendBody) {
+      NS_ENSURE_TRUE((operation == OfflineOp::kAppendDraft ||
+                      operation == OfflineOp::kAppendTemplate) &&
+                         destination && destination->folderId == folderId &&
+                         destination->key == key &&
+                         appendBody->folderId == folderId &&
+                         appendBody->key == key && appendBody->storeToken &&
+                         (appendBody->flags & nsMsgMessageFlags::Offline),
+                     NS_ERROR_INVALID_ARG);
+      MessageBodyState actual;
+      MOZ_TRY(ReadMessageBodyState(key, actual));
+      NS_ENSURE_TRUE(SameBodyGuard(actual, *appendBody),
+                     NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(CheckPendingMessageRelocation(key));
+    }
     {
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(DatabaseCore::GetStatement(
@@ -3013,10 +4013,15 @@ nsresult MessageDatabase::BeginOfflineAttempt(
           "INSERT INTO offline_attempts(operationId, revision, state, "
           "sourceFolderId, sourceKey, sourceEpoch, sourceUid, "
           "destinationFolderId, destinationKey, destinationEpoch, "
-          "operationFolderId, operationEpoch, operation) "
+          "operationFolderId, operationEpoch, operation, appendSourceId, "
+          "appendContentRevision, appendLocationRevision, appendStoreToken, "
+          "appendMessageSize, appendOfflineSize, appendLineCount, appendFlags) "
           "VALUES(:operation, :revision, 1, :sourceFolder, :sourceKey, "
           ":sourceEpoch, "
-          ":sourceUid, :destinationFolder, :destinationKey, :destinationEpoch, :folder, :folderEpoch, :action) RETURNING id"_ns,
+          ":sourceUid, :destinationFolder, :destinationKey, :destinationEpoch, "
+          ":folder, :folderEpoch, :action, "
+          ":appendSource, :appendContent, :appendLocation, :appendToken, "
+          ":appendSize, :appendOfflineSize, :appendLines, :appendFlags) RETURNING id"_ns,
           getter_AddRefs(stmt)));
       mozStorageStatementScoper scoper(stmt);
       MOZ_TRY(stmt->BindInt64ByName("operation"_ns, id));
@@ -3043,11 +4048,38 @@ nsresult MessageDatabase::BeginOfflineAttempt(
         MOZ_TRY(stmt->BindInt64ByName("destinationFolder"_ns,
                                       destination->folderId));
         MOZ_TRY(stmt->BindInt64ByName("destinationKey"_ns, destination->key));
-        MOZ_TRY(
-            stmt->BindInt64ByName("destinationEpoch"_ns, destination->epoch));
+        if (destination->epochKnown) {
+          MOZ_TRY(
+              stmt->BindInt64ByName("destinationEpoch"_ns, destination->epoch));
+        } else {
+          MOZ_TRY(stmt->BindNullByName("destinationEpoch"_ns));
+        }
       } else {
         for (const char* name :
              {"destinationFolder", "destinationKey", "destinationEpoch"}) {
+          MOZ_TRY(stmt->BindNullByName(nsDependentCString(name)));
+        }
+      }
+      if (appendBody) {
+        MOZ_TRY(stmt->BindUTF8StringByName("appendSource"_ns,
+                                           appendBody->databaseSourceId));
+        MOZ_TRY(stmt->BindInt64ByName("appendContent"_ns,
+                                      appendBody->contentRevision));
+        MOZ_TRY(stmt->BindInt64ByName("appendLocation"_ns,
+                                      appendBody->locationRevision));
+        MOZ_TRY(stmt->BindUTF8StringByName("appendToken"_ns,
+                                           *appendBody->storeToken));
+        MOZ_TRY(
+            stmt->BindInt64ByName("appendSize"_ns, appendBody->messageSize));
+        MOZ_TRY(stmt->BindInt64ByName("appendOfflineSize"_ns,
+                                      appendBody->offlineMessageSize));
+        MOZ_TRY(stmt->BindInt64ByName("appendLines"_ns, appendBody->lineCount));
+        MOZ_TRY(stmt->BindInt64ByName("appendFlags"_ns, appendBody->flags));
+      } else {
+        for (const char* name :
+             {"appendSource", "appendContent", "appendLocation", "appendToken",
+              "appendSize", "appendOfflineSize", "appendLines",
+              "appendFlags"}) {
           MOZ_TRY(stmt->BindNullByName(nsDependentCString(name)));
         }
       }
@@ -3058,6 +4090,63 @@ nsresult MessageDatabase::BeginOfflineAttempt(
       NS_ENSURE_TRUE(created > 0, NS_ERROR_FILE_CORRUPTED);
       MOZ_TRY(stmt->ExecuteStep(&more));
       NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+    }
+    if (copyOrdinal) {
+      nsCString sourceId;
+      MOZ_TRY(
+          DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+      Maybe<MessageBodyState> transfer;
+      if (operation == OfflineOp::kMsgCopy ||
+          operation == OfflineOp::kMsgMoved) {
+        MessageBodyState body;
+        MOZ_TRY(ReadMessageBodyState(destination->key, body));
+        NS_ENSURE_TRUE(body.folderId == destination->folderId &&
+                           body.databaseSourceId == sourceId,
+                       NS_ERROR_NOT_AVAILABLE);
+        transfer = Some(std::move(body));
+      }
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "SnapshotOfflineAction"_ns,
+          "UPDATE offline_attempts SET transferSourceId=:source, "
+          "transferOperationKey=:key, copyOrdinal=:ordinal, "
+          "transferContentRevision=:content, "
+          "transferLocationRevision=:location, "
+          "transferStoreToken=:token, transferMessageSize=:size, "
+          "transferOfflineSize=:offlineSize, transferLineCount=:lines, "
+          "transferFlags=:flags WHERE id=:id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, created));
+      MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, sourceId));
+      MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+      if (*copyOrdinal) {
+        MOZ_TRY(stmt->BindInt64ByName("ordinal"_ns, **copyOrdinal));
+      } else {
+        MOZ_TRY(stmt->BindNullByName("ordinal"_ns));
+      }
+      if (transfer) {
+        MOZ_TRY(stmt->BindInt64ByName("content"_ns, transfer->contentRevision));
+        MOZ_TRY(
+            stmt->BindInt64ByName("location"_ns, transfer->locationRevision));
+        if (transfer->storeToken) {
+          MOZ_TRY(
+              stmt->BindUTF8StringByName("token"_ns, *transfer->storeToken));
+        } else {
+          MOZ_TRY(stmt->BindNullByName("token"_ns));
+        }
+        MOZ_TRY(stmt->BindInt64ByName("size"_ns, transfer->messageSize));
+        MOZ_TRY(stmt->BindInt64ByName("offlineSize"_ns,
+                                      transfer->offlineMessageSize));
+        MOZ_TRY(stmt->BindInt64ByName("lines"_ns, transfer->lineCount));
+        MOZ_TRY(stmt->BindInt64ByName("flags"_ns, transfer->flags));
+      } else {
+        for (const char* name : {"content", "location", "token", "size",
+                                 "offlineSize", "lines", "flags"}) {
+          MOZ_TRY(stmt->BindNullByName(nsDependentCString(name)));
+        }
+      }
+      MOZ_TRY(stmt->Execute());
     }
     return connection->CommitTransaction();
   }();
@@ -3076,8 +4165,15 @@ nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
       "sourceEpoch, "
       "sourceUid, destinationFolderId, destinationKey, destinationEpoch, "
       "confirmedUid, "
-      "operationFolderId, operationEpoch, operation "
-      "FROM offline_attempts WHERE id = :id"_ns,
+      "operationFolderId, operationEpoch, operation, appendAccepted, "
+      "appendSourceId, "
+      "appendContentRevision, appendLocationRevision, appendStoreToken, "
+      "appendMessageSize, appendOfflineSize, appendLineCount, appendFlags, "
+      "transferSourceId, transferOperationKey, copyOrdinal, transferAccepted, "
+      "transferContentRevision, transferLocationRevision, transferStoreToken, "
+      "transferMessageSize, transferOfflineSize, transferLineCount, "
+      "transferFlags, "
+      "confirmedEpoch FROM offline_attempts WHERE id = :id"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindInt64ByName("id"_ns, attemptId));
@@ -3095,7 +4191,7 @@ nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
   found.operationId = id;
   found.revision = revision;
   found.state = static_cast<OfflineAttemptState>(state);
-  bool sourceNull, destinationNull;
+  bool sourceNull;
   MOZ_TRY(stmt->GetIsNull(3, &sourceNull));
   for (uint32_t column : {4, 5, 6}) {
     bool null;
@@ -3114,23 +4210,7 @@ nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
     MOZ_TRY(OfflineUint32(stmt, 6, location.uid));
     found.source = Some(location);
   }
-  MOZ_TRY(stmt->GetIsNull(7, &destinationNull));
-  for (uint32_t column : {8, 9}) {
-    bool null;
-    MOZ_TRY(stmt->GetIsNull(column, &null));
-    NS_ENSURE_TRUE(null == destinationNull, NS_ERROR_FILE_CORRUPTED);
-  }
-  if (!destinationNull) {
-    PendingDestination location;
-    MOZ_TRY(stmt->GetInt64(7, &id));
-    NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
-    location.folderId = id;
-    MOZ_TRY(OfflineUint32(stmt, 8, location.key));
-    NS_ENSURE_TRUE(location.key && location.key < nsMsgKey_None,
-                   NS_ERROR_FILE_CORRUPTED);
-    MOZ_TRY(OfflineUint32(stmt, 9, location.epoch));
-    found.destination = Some(location);
-  }
+  MOZ_TRY(ReadOfflineDestination(stmt, 7, found.destination));
   bool uidNull;
   MOZ_TRY(stmt->GetIsNull(10, &uidNull));
   if (!uidNull) {
@@ -3149,8 +4229,455 @@ nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
     MOZ_TRY(OfflineUint32(stmt, 12, epoch));
     found.folderEpoch = Some(epoch);
   }
+  uint32_t accepted;
+  MOZ_TRY(OfflineUint32(stmt, 14, accepted));
+  NS_ENSURE_TRUE(accepted <= 1, NS_ERROR_FILE_CORRUPTED);
+  found.appendAccepted = accepted;
+  bool bodyAbsent;
+  MOZ_TRY(stmt->GetIsNull(15, &bodyAbsent));
+  if (bodyAbsent) {
+    for (uint32_t column = 16; column <= 22; ++column) {
+      bool absent;
+      MOZ_TRY(stmt->GetIsNull(column, &absent));
+      NS_ENSURE_TRUE(absent, NS_ERROR_FILE_CORRUPTED);
+    }
+    NS_ENSURE_FALSE(found.appendAccepted, NS_ERROR_FILE_CORRUPTED);
+  } else {
+    NS_ENSURE_TRUE(found.destination &&
+                       found.destination->folderId == found.folderId &&
+                       (found.operation == OfflineOp::kAppendDraft ||
+                        found.operation == OfflineOp::kAppendTemplate),
+                   NS_ERROR_FILE_CORRUPTED);
+    MessageBodyState body;
+    body.key = found.destination->key;
+    body.folderId = found.destination->folderId;
+    int32_t type;
+    MOZ_TRY(stmt->GetTypeOfIndex(15, &type));
+    NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                   NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(stmt->GetUTF8String(15, body.databaseSourceId));
+    NS_ENSURE_TRUE(!body.databaseSourceId.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+    for (uint32_t column : {16, 17}) {
+      MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+      int64_t value;
+      MOZ_TRY(stmt->GetInt64(column, &value));
+      NS_ENSURE_TRUE(
+          type == mozIStorageValueArray::VALUE_TYPE_INTEGER && value > 0,
+          NS_ERROR_FILE_CORRUPTED);
+      (column == 16 ? body.contentRevision : body.locationRevision) = value;
+    }
+    bool tokenAbsent;
+    MOZ_TRY(stmt->GetIsNull(18, &tokenAbsent));
+    if (!tokenAbsent) {
+      MOZ_TRY(stmt->GetTypeOfIndex(18, &type));
+      NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                     NS_ERROR_FILE_CORRUPTED);
+      nsCString token;
+      MOZ_TRY(stmt->GetUTF8String(18, token));
+      body.storeToken = Some(std::move(token));
+    }
+    MOZ_TRY(OfflineUint32(stmt, 19, body.messageSize));
+    MOZ_TRY(OfflineUint32(stmt, 20, body.offlineMessageSize));
+    MOZ_TRY(OfflineUint32(stmt, 21, body.lineCount));
+    MOZ_TRY(OfflineUint32(stmt, 22, body.flags));
+    NS_ENSURE_TRUE((body.flags & nsMsgMessageFlags::Offline) &&
+                       (found.state == OfflineAttemptState::Confirmed
+                            ? found.confirmedUid.isSome()
+                            : found.confirmedUid.isNothing()) &&
+                       (!found.appendAccepted ||
+                        found.state == OfflineAttemptState::Sent ||
+                        found.state == OfflineAttemptState::Confirmed),
+                   NS_ERROR_FILE_CORRUPTED);
+    found.appendBody = Some(std::move(body));
+  }
+  bool transferAbsent;
+  MOZ_TRY(stmt->GetIsNull(23, &transferAbsent));
+  MOZ_TRY(OfflineUint32(stmt, 26, accepted));
+  NS_ENSURE_TRUE(accepted <= 1, NS_ERROR_FILE_CORRUPTED);
+  found.transferAccepted = accepted;
+  if (transferAbsent) {
+    for (uint32_t column : {24, 25, 27, 28, 29, 30, 31, 32, 33}) {
+      bool absent;
+      MOZ_TRY(stmt->GetIsNull(column, &absent));
+      NS_ENSURE_TRUE(absent, NS_ERROR_FILE_CORRUPTED);
+    }
+    NS_ENSURE_FALSE(found.transferAccepted, NS_ERROR_FILE_CORRUPTED);
+  } else {
+    int32_t type;
+    MOZ_TRY(stmt->GetTypeOfIndex(23, &type));
+    NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                   NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(stmt->GetUTF8String(23, found.transferSourceId));
+    NS_ENSURE_TRUE(!found.transferSourceId.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(OfflineUint32(stmt, 24, found.operationKey));
+    NS_ENSURE_TRUE(found.operationKey && found.operationKey < nsMsgKey_None,
+                   NS_ERROR_FILE_CORRUPTED);
+    bool ordinalAbsent;
+    MOZ_TRY(stmt->GetIsNull(25, &ordinalAbsent));
+    if (!ordinalAbsent) {
+      uint32_t ordinal;
+      MOZ_TRY(OfflineUint32(stmt, 25, ordinal));
+      found.copyOrdinal = Some(ordinal);
+    }
+    NS_ENSURE_TRUE(
+        (found.operation == OfflineOp::kMsgCopy) == found.copyOrdinal.isSome(),
+        NS_ERROR_FILE_CORRUPTED);
+    if (found.operation == OfflineOp::kMsgCopy ||
+        found.operation == OfflineOp::kMsgMoved) {
+      NS_ENSURE_TRUE(found.destination && found.source && !found.appendBody,
+                     NS_ERROR_FILE_CORRUPTED);
+      MessageBodyState body;
+      body.databaseSourceId = found.transferSourceId;
+      body.folderId = found.destination->folderId;
+      body.key = found.destination->key;
+      for (uint32_t column : {27, 28}) {
+        MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+        int64_t value;
+        MOZ_TRY(stmt->GetInt64(column, &value));
+        NS_ENSURE_TRUE(
+            type == mozIStorageValueArray::VALUE_TYPE_INTEGER && value > 0,
+            NS_ERROR_FILE_CORRUPTED);
+        (column == 27 ? body.contentRevision : body.locationRevision) = value;
+      }
+      bool tokenAbsent;
+      MOZ_TRY(stmt->GetIsNull(29, &tokenAbsent));
+      if (!tokenAbsent) {
+        MOZ_TRY(stmt->GetTypeOfIndex(29, &type));
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        nsCString token;
+        MOZ_TRY(stmt->GetUTF8String(29, token));
+        body.storeToken = Some(std::move(token));
+      }
+      MOZ_TRY(OfflineUint32(stmt, 30, body.messageSize));
+      MOZ_TRY(OfflineUint32(stmt, 31, body.offlineMessageSize));
+      MOZ_TRY(OfflineUint32(stmt, 32, body.lineCount));
+      MOZ_TRY(OfflineUint32(stmt, 33, body.flags));
+      found.transferBody = Some(std::move(body));
+      NS_ENSURE_TRUE((found.state == OfflineAttemptState::Confirmed) ==
+                         found.confirmedUid.isSome(),
+                     NS_ERROR_FILE_CORRUPTED);
+      NS_ENSURE_TRUE(!found.transferAccepted ||
+                         found.state == OfflineAttemptState::Sent ||
+                         found.state == OfflineAttemptState::Confirmed,
+                     NS_ERROR_FILE_CORRUPTED);
+    } else {
+      NS_ENSURE_FALSE(found.transferAccepted, NS_ERROR_FILE_CORRUPTED);
+      for (uint32_t column = 27; column <= 33; ++column) {
+        bool absent;
+        MOZ_TRY(stmt->GetIsNull(column, &absent));
+        NS_ENSURE_TRUE(absent, NS_ERROR_FILE_CORRUPTED);
+      }
+    }
+  }
+  bool confirmationAbsent;
+  MOZ_TRY(stmt->GetIsNull(34, &confirmationAbsent));
+  if (!confirmationAbsent) {
+    uint32_t epoch;
+    MOZ_TRY(OfflineUint32(stmt, 34, epoch));
+    NS_ENSURE_TRUE(found.confirmedUid && found.destination,
+                   NS_ERROR_FILE_CORRUPTED);
+    found.confirmedEpoch = Some(epoch);
+  } else if (found.confirmedUid && found.destination &&
+             found.destination->epochKnown) {
+    // Existing schema-17 confirmations retain their original known epoch.
+    found.confirmedEpoch = Some(found.destination->epoch);
+  }
   output = std::move(found);
   return NS_OK;
+}
+
+nsresult MessageDatabase::RequireOfflineActionDispatchable(
+    int64_t id, int64_t revision, uint32_t action,
+    const Maybe<uint32_t>& copyOrdinal) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "OfflineActionInFlight"_ns,
+      "SELECT 1 FROM offline_attempts WHERE operationId=:id AND "
+      "state IN (1,2,3) AND (transferSourceId IS NULL OR "
+      "(revision=:revision AND operation=:action AND copyOrdinal IS :ordinal)) "
+      "LIMIT 1"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  MOZ_TRY(stmt->BindInt64ByName("revision"_ns, revision));
+  MOZ_TRY(stmt->BindInt64ByName("action"_ns, action));
+  if (copyOrdinal) {
+    MOZ_TRY(stmt->BindInt64ByName("ordinal"_ns, *copyOrdinal));
+  } else {
+    MOZ_TRY(stmt->BindNullByName("ordinal"_ns));
+  }
+  bool blocked;
+  MOZ_TRY(stmt->ExecuteStep(&blocked));
+  return blocked ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
+nsresult MessageDatabase::GetOfflineAttemptForAction(
+    uint64_t folderId, nsMsgKey key, uint32_t action,
+    const Maybe<uint32_t>& copyOrdinal, OfflineAttempt& output) {
+  NS_ENSURE_TRUE((action == OfflineOp::kMsgCopy) == copyOrdinal.isSome(),
+                 NS_ERROR_INVALID_ARG);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "CurrentOfflineAction"_ns,
+      "SELECT a.id FROM offline_attempts a JOIN offline_operations o "
+      "ON o.id=a.operationId AND o.revision=a.revision "
+      "WHERE o.folderId=:folder AND o.messageKey=:key AND "
+      "a.transferSourceId IS NOT NULL AND a.operation=:action AND "
+      "a.copyOrdinal IS :ordinal ORDER BY a.id DESC LIMIT 1"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+  MOZ_TRY(stmt->BindInt64ByName("action"_ns, action));
+  if (copyOrdinal) {
+    MOZ_TRY(stmt->BindInt64ByName("ordinal"_ns, *copyOrdinal));
+  } else {
+    MOZ_TRY(stmt->BindNullByName("ordinal"_ns));
+  }
+  bool found;
+  MOZ_TRY(stmt->ExecuteStep(&found));
+  NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
+  int64_t id;
+  MOZ_TRY(stmt->GetInt64(0, &id));
+  NS_ENSURE_TRUE(id > 0, NS_ERROR_FILE_CORRUPTED);
+  return GetOfflineAttempt(id, output);
+}
+
+nsresult MessageDatabase::ReadExpectedTransferAttempt(
+    const OfflineAttempt& expected, OfflineAttempt& actual) {
+  NS_ENSURE_TRUE(expected.id && expected.transferBody && expected.destination &&
+                     expected.source && !expected.transferSourceId.IsEmpty() &&
+                     (expected.operation == OfflineOp::kMsgCopy ||
+                      expected.operation == OfflineOp::kMsgMoved),
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(GetOfflineAttempt(expected.id, actual));
+  NS_ENSURE_TRUE(
+      actual.transferBody && actual.destination &&
+          actual.transferSourceId == expected.transferSourceId &&
+          actual.operationKey == expected.operationKey &&
+          actual.folderId == expected.folderId &&
+          actual.operationId == expected.operationId &&
+          actual.revision == expected.revision &&
+          actual.operation == expected.operation &&
+          actual.copyOrdinal == expected.copyOrdinal &&
+          SameOfflineSource(actual.source, expected.source) &&
+          SamePendingDestination(*actual.destination, *expected.destination) &&
+          SameBodyGuard(*actual.transferBody, *expected.transferBody),
+      NS_ERROR_NOT_AVAILABLE);
+  nsCString sourceId;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+  NS_ENSURE_TRUE(sourceId == actual.transferSourceId, NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ValidateTransferTargetInTransaction(
+    const OfflineAttempt& attempt) {
+  QueuedSourceIdentity identity{attempt.transferSourceId, attempt.folderId,
+                                attempt.operationKey,     attempt.operationId,
+                                attempt.revision,         attempt.source};
+  MOZ_TRY(ValidateQueuedSourceIdentity(identity));
+  OfflineOperationData payload;
+  MOZ_TRY(GetOfflineOperation(attempt.folderId, attempt.operationKey, payload));
+  NS_ENSURE_TRUE(payload.operation & attempt.operation, NS_ERROR_NOT_AVAILABLE);
+  Maybe<PendingDestination> saved;
+  if (attempt.copyOrdinal) {
+    NS_ENSURE_TRUE(
+        *attempt.copyOrdinal < payload.copyDestinationBindings.Length(),
+        NS_ERROR_NOT_AVAILABLE);
+    saved = payload.copyDestinationBindings[*attempt.copyOrdinal];
+  } else {
+    saved = payload.pendingDestination;
+  }
+  const auto& target = *attempt.destination;
+  NS_ENSURE_TRUE(saved && saved->folderId == target.folderId &&
+                     saved->key == target.key &&
+                     (!target.epochKnown ||
+                      (saved->epochKnown && saved->epoch == target.epoch)),
+                 NS_ERROR_NOT_AVAILABLE);
+  uint32_t epoch;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      attempt.source->folderId, epoch));
+  NS_ENSURE_TRUE(epoch == attempt.source->epoch, NS_ERROR_NOT_AVAILABLE);
+  nsresult rv = DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      target.folderId, epoch);
+  if (saved->epochKnown) {
+    MOZ_TRY(rv);
+    NS_ENSURE_TRUE(epoch == saved->epoch, NS_ERROR_NOT_AVAILABLE);
+  } else {
+    NS_ENSURE_TRUE(rv == NS_ERROR_NOT_AVAILABLE,
+                   NS_FAILED(rv) ? rv : NS_ERROR_NOT_AVAILABLE);
+  }
+  MessageBodyState current;
+  MOZ_TRY(ReadMessageBodyState(target.key, current));
+  NS_ENSURE_TRUE(SameBodyGuard(current, *attempt.transferBody),
+                 NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::RecordOfflineCopyAcceptedWithoutUid(
+    const OfflineAttempt& expected) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedTransferAttempt(expected, actual));
+    if (actual.transferAccepted) {
+      return connection->CommitTransaction();
+    }
+    NS_ENSURE_TRUE((actual.state == OfflineAttemptState::Sent ||
+                    actual.state == OfflineAttemptState::Ambiguous) &&
+                       !actual.confirmedUid,
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "AcceptOfflineCopyWithoutUid"_ns,
+        "UPDATE offline_attempts SET transferAccepted=1,state=1 WHERE id=:id"_ns,
+        getter_AddRefs(stmt)));
+    {
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, actual.id));
+      MOZ_TRY(stmt->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::ValidateOfflineCopyAcceptedWithoutUid(
+    const OfflineAttempt& expected) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedTransferAttempt(expected, actual));
+    NS_ENSURE_TRUE(actual.transferAccepted && !actual.confirmedUid &&
+                       actual.state == OfflineAttemptState::Sent,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(ValidateTransferTargetInTransaction(actual));
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
+// Compare immutable native Begin input, not a caller's later mutable state.
+nsresult MessageDatabase::ReadExpectedAppendAttempt(
+    const OfflineAttempt& expected, OfflineAttempt& actual) {
+  NS_ENSURE_TRUE(expected.id && expected.id <= INT64_MAX &&
+                     expected.appendBody && expected.destination &&
+                     expected.operationId && expected.revision &&
+                     (expected.operation == OfflineOp::kAppendDraft ||
+                      expected.operation == OfflineOp::kAppendTemplate),
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(GetOfflineAttempt(expected.id, actual));
+  NS_ENSURE_TRUE(
+      actual.appendBody && actual.destination &&
+          actual.operationId == expected.operationId &&
+          actual.revision == expected.revision &&
+          actual.folderId == expected.folderId &&
+          actual.operation == expected.operation &&
+          actual.folderEpoch == expected.folderEpoch &&
+          SamePendingDestination(*actual.destination, *expected.destination) &&
+          actual.source.isSome() == expected.source.isSome() &&
+          SameBodyGuard(*actual.appendBody, *expected.appendBody),
+      NS_ERROR_NOT_AVAILABLE);
+  if (actual.source) {
+    const auto& a = *actual.source;
+    const auto& b = *expected.source;
+    NS_ENSURE_TRUE(a.folderId == b.folderId && a.key == b.key &&
+                       a.epoch == b.epoch && a.uid == b.uid,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  nsCString source;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(source));
+  NS_ENSURE_TRUE(source == actual.appendBody->databaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ValidateAppendTargetInTransaction(
+    const OfflineAttempt& attempt) {
+  const auto& body = *attempt.appendBody;
+  nsCString sourceId;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+  NS_ENSURE_TRUE(sourceId == body.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  int64_t id, revision;
+  Maybe<ServerMessageLocation> source;
+  MOZ_TRY(ReadOfflineOperationIdentity(body.folderId, body.key, id, revision,
+                                       source));
+  NS_ENSURE_TRUE(uint64_t(id) == attempt.operationId &&
+                     uint64_t(revision) == attempt.revision,
+                 NS_ERROR_NOT_AVAILABLE);
+  OfflineOperationData payload;
+  MOZ_TRY(GetOfflineOperation(body.folderId, body.key, payload));
+  NS_ENSURE_TRUE(payload.operation & attempt.operation, NS_ERROR_NOT_AVAILABLE);
+  uint32_t epoch;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      body.folderId, epoch));
+  NS_ENSURE_TRUE(epoch == attempt.destination->epoch, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckPendingMessageRelocation(body.key));
+  NS_ENSURE_TRUE(!payload.pendingDestination ||
+                     SamePendingDestination(*payload.pendingDestination,
+                                            *attempt.destination),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsTArray<nsCString> names;
+  MOZ_TRY(GetMessagePropertyNames(body.key, names));
+  NS_ENSURE_FALSE(names.Contains("uidOnServer"_ns), NS_ERROR_NOT_AVAILABLE);
+  MessageBodyState current;
+  MOZ_TRY(ReadMessageBodyState(body.key, current));
+  NS_ENSURE_TRUE(SameBodyGuard(current, body), NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::RecordOfflineAppendAcceptedWithoutUid(
+    const OfflineAttempt& expected) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedAppendAttempt(expected, actual));
+    // A duplicate cannot undo a later actual UID confirmation.
+    if (actual.appendAccepted) {
+      return connection->CommitTransaction();
+    }
+    NS_ENSURE_TRUE((actual.state == OfflineAttemptState::Sent ||
+                    actual.state == OfflineAttemptState::Ambiguous) &&
+                       !actual.confirmedUid,
+                   NS_ERROR_NOT_AVAILABLE);
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "AcceptOfflineAppendWithoutUid"_ns,
+          "UPDATE offline_attempts SET appendAccepted = 1, state = 1 WHERE id = :id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scoper(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, actual.id));
+      MOZ_TRY(stmt->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::ValidateOfflineAppendAcceptedWithoutUid(
+    const OfflineAttempt& expected) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedAppendAttempt(expected, actual));
+    NS_ENSURE_TRUE(actual.appendAccepted &&
+                       actual.state == OfflineAttemptState::Sent &&
+                       !actual.confirmedUid,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(ValidateAppendTargetInTransaction(actual));
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
 }
 
 nsresult MessageDatabase::GetCurrentOfflineAttempt(uint64_t folderId,
@@ -3186,6 +4713,7 @@ nsresult MessageDatabase::ResolveOfflineAttemptNotApplied(uint64_t attemptId) {
   MOZ_TRY(DatabaseCore::GetStatement(
       "ResolveOfflineAttemptNotApplied"_ns,
       "UPDATE offline_attempts SET state = 0 WHERE id = :id AND state IN (1,3) "
+      "AND appendAccepted = 0 AND transferAccepted = 0 "
       "RETURNING id"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
@@ -3207,6 +4735,7 @@ nsresult MessageDatabase::MarkOfflineAttemptAmbiguous(uint64_t attemptId) {
   MOZ_TRY(DatabaseCore::GetStatement(
       "MarkOfflineAttemptAmbiguous"_ns,
       "UPDATE offline_attempts SET state = 3 WHERE id = :id AND state IN (1,3) "
+      "AND appendAccepted = 0 AND transferAccepted = 0 "
       "RETURNING id"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
@@ -3234,16 +4763,29 @@ nsresult MessageDatabase::ConfirmOfflineAttempt(
     NS_ENSURE_TRUE(attempt.destination.isSome() == destinationUid.isSome(),
                    NS_ERROR_INVALID_ARG);
     if (attempt.state == OfflineAttemptState::Confirmed) {
-      NS_ENSURE_TRUE(destinationUid
-                         ? (attempt.confirmedUid == Some(destinationUid->uid) &&
-                            attempt.destination->epoch == destinationUid->epoch)
-                         : attempt.confirmedUid.isNothing(),
-                     NS_ERROR_FILE_CORRUPTED);
+      NS_ENSURE_TRUE(
+          destinationUid
+              ? (attempt.confirmedUid == Some(destinationUid->uid) &&
+                 attempt.confirmedEpoch == Some(destinationUid->epoch))
+              : attempt.confirmedUid.isNothing(),
+          NS_ERROR_FILE_CORRUPTED);
       return connection->CommitTransaction();
     }
     NS_ENSURE_TRUE(attempt.state == OfflineAttemptState::Sent ||
                        attempt.state == OfflineAttemptState::Ambiguous,
                    NS_ERROR_NOT_AVAILABLE);
+    if (!attempt.transferSourceId.IsEmpty()) {
+      QueuedSourceIdentity identity{
+          attempt.transferSourceId, attempt.folderId, attempt.operationKey,
+          attempt.operationId,      attempt.revision, attempt.source};
+      MOZ_TRY(ValidateQueuedSourceIdentity(identity));
+    }
+    if (attempt.transferBody) {
+      MOZ_TRY(ValidateTransferTargetInTransaction(attempt));
+    }
+    if (attempt.appendBody) {
+      MOZ_TRY(ValidateAppendTargetInTransaction(attempt));
+    }
     if (attempt.folderEpoch) {
       uint32_t epoch;
       MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
@@ -3257,8 +4799,19 @@ nsresult MessageDatabase::ConfirmOfflineAttempt(
       NS_ENSURE_TRUE(epoch == attempt.source->epoch, NS_ERROR_NOT_AVAILABLE);
     }
     if (attempt.destination) {
-      NS_ENSURE_TRUE(destinationUid->epoch == attempt.destination->epoch,
-                     NS_ERROR_NOT_AVAILABLE);
+      if (attempt.destination->epochKnown) {
+        NS_ENSURE_TRUE(destinationUid->epoch == attempt.destination->epoch,
+                       NS_ERROR_NOT_AVAILABLE);
+      } else {
+        NS_ENSURE_TRUE(!attempt.transferSourceId.IsEmpty(),
+                       NS_ERROR_NOT_AVAILABLE);
+        QueuedSourceIdentity identity{
+            attempt.transferSourceId, attempt.folderId, attempt.operationKey,
+            attempt.operationId,      attempt.revision, attempt.source};
+        MOZ_TRY(ObserveDestinationEpochInTransaction(
+            identity, attempt.operation, attempt.copyOrdinal,
+            *attempt.destination, destinationUid->epoch));
+      }
       MOZ_TRY(BindMessageToServerUidInTransaction(
           attempt.destination->key, attempt.destination->folderId,
           destinationUid->epoch, destinationUid->uid, true));
@@ -3267,14 +4820,17 @@ nsresult MessageDatabase::ConfirmOfflineAttempt(
       nsCOMPtr<mozIStorageStatement> stmt;
       MOZ_TRY(DatabaseCore::GetStatement(
           "ConfirmOfflineAttempt"_ns,
-          "UPDATE offline_attempts SET state = 2, confirmedUid = :uid WHERE id = :id"_ns,
+          "UPDATE offline_attempts SET state = 2, confirmedUid = :uid, "
+          "confirmedEpoch=:epoch WHERE id = :id"_ns,
           getter_AddRefs(stmt)));
       mozStorageStatementScoper scoper(stmt);
       MOZ_TRY(stmt->BindInt64ByName("id"_ns, attemptId));
       if (destinationUid) {
         MOZ_TRY(stmt->BindInt64ByName("uid"_ns, destinationUid->uid));
+        MOZ_TRY(stmt->BindInt64ByName("epoch"_ns, destinationUid->epoch));
       } else {
         MOZ_TRY(stmt->BindNullByName("uid"_ns));
+        MOZ_TRY(stmt->BindNullByName("epoch"_ns));
       }
       MOZ_TRY(stmt->Execute());
     }
@@ -3463,7 +5019,8 @@ nsresult MessageDatabase::RemoveMessageForUndo(nsMsgKey key,
 
 nsresult MessageDatabase::RemoveMessageForUndo(
     nsMsgKey key, uint64_t folderId, const nsACString& databaseSourceId,
-    MessageRemovalAccounting accounting, RemovedMessage& output) {
+    MessageRemovalAccounting accounting, RemovedMessage& output,
+    OfflineOperationUndo* redo, OfflineOperationUndo* nextOffline) {
   NS_ENSURE_TRUE(key != nsMsgKey_None && folderId && folderId <= INT64_MAX &&
                      !databaseSourceId.IsEmpty(),
                  NS_ERROR_INVALID_ARG);
@@ -3472,14 +5029,28 @@ nsresult MessageDatabase::RemoveMessageForUndo(
                  NS_ERROR_INVALID_ARG);
   MOZ_TRY(RequireCommittedSearchRead());
   RefPtr<MessageDatabase> self(this);
+  NS_ENSURE_TRUE((redo == nullptr) == (nextOffline == nullptr),
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(!redo || (redo != nextOffline && redo->mData &&
+                           redo->mData->redoState && !nextOffline->mData),
+                 NS_ERROR_NOT_AVAILABLE);
   return RemoveMessageInternal(key, folderId, &databaseSourceId, accounting,
-                               &output);
+                               &output, redo, nextOffline);
 }
 
 nsresult MessageDatabase::RestoreMessageForUndo(
     uint64_t folderId, RemovedMessage& captured,
-    const FinishedMessageBody& finished, nsMsgKey* key, Message** liveHeader) {
+    const FinishedMessageBody& finished, nsMsgKey* key, Message** liveHeader,
+    OfflineOperationUndo* offline, const PendingDestination* cancelMove,
+    OfflineOperationUndo* redo) {
   NS_ENSURE_ARG_POINTER(key);
+  NS_ENSURE_TRUE(!offline || !liveHeader || !*liveHeader, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(!offline || (offline->mData && !offline->mData->redoState),
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE((cancelMove == nullptr) == (redo == nullptr),
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(!redo || (offline && offline != redo && !redo->mData),
+                 NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_TRUE(captured.mData, NS_ERROR_NOT_AVAILABLE);
   NS_ENSURE_TRUE(folderId && folderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   MOZ_TRY(RequireCommittedSearchRead());
@@ -3489,7 +5060,8 @@ nsresult MessageDatabase::RestoreMessageForUndo(
                  NS_ERROR_NOT_AVAILABLE);
   RefPtr<MessageDatabase> self(this);
   return InsertMessage(folderId, captured.mData->header, false, true, key,
-                       liveHeader, &captured, &finished);
+                       liveHeader, &captured, &finished, offline, cancelMove,
+                       redo);
 }
 
 nsresult MessageDatabase::ReadRemovedMessage(nsMsgKey key,
@@ -3645,7 +5217,8 @@ nsresult MessageDatabase::AccountRemovedMessage(
 
 nsresult MessageDatabase::RemoveMessageInternal(
     nsMsgKey key, uint64_t folderId, const nsACString* databaseSourceId,
-    MessageRemovalAccounting accounting, RemovedMessage* output) {
+    MessageRemovalAccounting accounting, RemovedMessage* output,
+    OfflineOperationUndo* redo, OfflineOperationUndo* nextOffline) {
   MOZ_ASSERT(key != nsMsgKey_None);
   MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
@@ -3656,6 +5229,7 @@ nsresult MessageDatabase::RemoveMessageInternal(
   }
 
   RemovedMessage captured;
+  OfflineOperationUndo preparedOffline;
   CachedMsg cached;
   RefPtr<Message> message;
   UniquePtr<QueuedMessageBatch> notification;
@@ -3669,6 +5243,10 @@ nsresult MessageDatabase::RemoveMessageInternal(
     }
     if (output) {
       MOZ_TRY(ReadRemovedMessage(key, captured));
+    }
+    if (redo) {
+      MOZ_TRY(ReapplyOfflineMoveInTransaction(folderId, key, *redo,
+                                              preparedOffline));
     }
     MOZ_TRY(CaptureMessage(key, notification->before));
     {
@@ -3772,6 +5350,10 @@ nsresult MessageDatabase::RemoveMessageInternal(
   }
   if (output) {
     *output = std::move(captured);
+  }
+  if (redo) {
+    *nextOffline = std::move(preparedOffline);
+    redo->mData.reset();
   }
   QueueMessageBatch(std::move(notification));
   return NS_OK;

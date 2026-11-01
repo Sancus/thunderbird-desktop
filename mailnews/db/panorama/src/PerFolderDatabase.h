@@ -26,6 +26,9 @@ class nsIDBChangeListener;
 
 namespace mozilla::mailnews {
 
+class OfflineOperationUndo;
+struct OfflineUndoCounterpart;
+
 class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                           public SupportsWeakPtr,
                           public MessageListener {
@@ -75,6 +78,30 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   // Local writes replace messageSize; uncached queued copies may retain it.
   nsresult CopyHdrForStore(nsIMsgDBHdr* existingHdr, bool preserveMessageSize,
                            nsIMsgDBHdr** draft);
+
+  // Only an opaque common-copy draft may cross this initial offline-copy cut.
+  // Stage seals its metadata and returns a fresh unpublished physical key.
+  nsresult StageHdrForOfflineCopy(nsIMsgDBHdr* draft, nsMsgKey* stagedKey);
+  // The caller installs operation/counterpart mappings before publication.
+  // Its owning native output slot must be null and is filled before callbacks.
+  nsresult PublishHdrForOfflineCopy(nsIMsgDBHdr* draft, bool notifyLegacy,
+                                    Message** liveHeader);
+
+  // Callers own complete metadata and recovery bytes before removal callbacks.
+  nsresult RemoveHdrForUndo(nsMsgKey key, RemovedMessage& captured,
+                            OfflineOperationUndo* redo = nullptr,
+                            OfflineOperationUndo* nextOffline = nullptr);
+  nsresult CaptureOfflineOperationForUndo(
+      nsMsgKey key, OfflineOperationUndo& output,
+      const OfflineUndoCounterpart* counterpart = nullptr);
+  // Native commit fills persistent output slots before notifying listeners.
+  // Errors leave the captures and output values unchanged.
+  nsresult RestoreHdrForUndo(RemovedMessage& captured,
+                             const FinishedMessageBody& finished, nsMsgKey* key,
+                             Message** liveHeader = nullptr,
+                             OfflineOperationUndo* offline = nullptr,
+                             const PendingDestination* cancelMove = nullptr,
+                             OfflineOperationUndo* redo = nullptr);
 
   // Same-key completion from the actual parsed CreateNewHdr draft.
   // Once claimed, a failure seals the draft; caller retains finished bytes.

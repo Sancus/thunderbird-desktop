@@ -3006,14 +3006,20 @@ void nsImapProtocol::ProcessSelectedStateURL() {
         case nsIImapUrl::nsImapLiteSelectFolder:
           if (GetServerStateParser().LastCommandSuccessful() &&
               m_imapMailFolderSink && !moreHeadersToDownload) {
-            // Native synchronization validates retained sources before the
-            // epoch setter retires their bindings. The legacy path sets it
-            // here.
+            // This setter only fences in memory. Lite SELECT does not run
+            // full reconciliation, so queued first-use folders need this actual
+            // observation before native checked destination-epoch binding.
+            [[maybe_unused]] nsresult observed =
+                m_imapMailFolderSink->SetUidValidity(
+                    GetServerStateParser().FolderUIDValidity());
 #ifdef MOZ_PANORAMA
-            if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup())
+            if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+                NS_FAILED(observed)) {
+              if (NS_SUCCEEDED(m_mailboxUpdateResult))
+                m_mailboxUpdateResult = observed;
+              return;
+            }
 #endif
-              m_imapMailFolderSink->SetUidValidity(
-                  GetServerStateParser().FolderUIDValidity());
             ProcessMailboxUpdate(false);  // handle uidvalidity change
           }
           break;
@@ -3541,15 +3547,22 @@ void nsImapProtocol::ProcessSelectedStateURL() {
                     ? (ImapOnlineCopyState)
                           ImapOnlineCopyStateType::kSuccessfulCopy
                     : (ImapOnlineCopyState)ImapOnlineCopyStateType::kFailedCopy;
-          if (m_imapMailFolderSink)
+          bool nativeQueuedCopy = false;
+#ifdef MOZ_PANORAMA
+          nativeQueuedCopy = !static_cast<nsImapUrl*>(m_runningUrl.get())
+                                  ->CopyNativeQueuedCopies()
+                                  .IsEmpty();
+#endif
+          if (m_imapMailFolderSink && !nativeQueuedCopy)
             m_imapMailFolderSink->OnlineCopyCompleted(this, copyState);
           // Don't mark message 'Deleted' for servers that support the MOVE
           // extension, since we already issued a 'move' command.
           if (!DeathSignalReceived() && NS_SUCCEEDED(m_mailboxUpdateResult) &&
               GetServerStateParser().LastCommandSuccessful() &&
               (m_imapAction == nsIImapUrl::nsImapOnlineMove) &&
-              !(GetServerStateParser().GetCapabilityFlag() &
-                kHasMoveCapability)) {
+              (nativeQueuedCopy ||
+               !(GetServerStateParser().GetCapabilityFlag() &
+                 kHasMoveCapability))) {
             // Simulate MOVE for servers that don't support MOVE: do
             // COPY-DELETE-EXPUNGE.
             Store(messageIdString, "+FLAGS (\\Deleted \\Seen)",
@@ -3557,6 +3570,14 @@ void nsImapProtocol::ProcessSelectedStateURL() {
             bool storeSuccessful =
                 !DeathSignalReceived() && NS_SUCCEEDED(m_mailboxUpdateResult) &&
                 GetServerStateParser().LastCommandSuccessful();
+#ifdef MOZ_PANORAMA
+            if (nativeQueuedCopy && storeSuccessful)
+              static_cast<nsImapUrl*>(m_runningUrl.get())
+                  ->RecordNativeSourceRetired();
+            if (nativeQueuedCopy && !storeSuccessful &&
+                NS_SUCCEEDED(m_mailboxUpdateResult))
+              m_mailboxUpdateResult = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+#endif
             if (storeSuccessful) {
               // We are simulating a imap MOVE (on the same server). The
               // message(s) has/(have) been COPY'd and marked deleted. Only when
@@ -3589,7 +3610,7 @@ void nsImapProtocol::ProcessSelectedStateURL() {
                 }
               }
             }
-            if (m_imapMailFolderSink) {
+            if (m_imapMailFolderSink && !nativeQueuedCopy) {
               copyState = storeSuccessful
                               ? (ImapOnlineCopyState)
                                     ImapOnlineCopyStateType::kSuccessfulDelete
@@ -5118,6 +5139,12 @@ void nsImapProtocol::AddFolderRightsForUser(const char* mailboxName,
 }
 
 void nsImapProtocol::SetCopyResponseUid(const char* msgIdString) {
+#ifdef MOZ_PANORAMA
+  if (m_runningUrl && !static_cast<nsImapUrl*>(m_runningUrl.get())
+                           ->CopyNativeQueuedCopies()
+                           .IsEmpty())
+    return;
+#endif
   if (m_imapMailFolderSink)
     m_imapMailFolderSink->SetCopyResponseUid(msgIdString, m_runningUrl);
 }
@@ -6538,6 +6565,18 @@ void nsImapProtocol::OnLSubFolders() {
 }
 
 void nsImapProtocol::OnAppendMsgFromFile() {
+#ifdef MOZ_PANORAMA
+  auto* nativeUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
+  if (auto target = nativeUrl->CopyNativeQueuedAppendTarget()) {
+    if (target->epoch != GetServerStateParser().FolderUIDValidity()) {
+      // Nothing was sent, so this particular attempt is safe to resolve.
+      nativeUrl->RecordNativeQueuedAppendRejected();
+      m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+      GetServerStateParser().SetCommandFailed(true);
+      return;
+    }
+  }
+#endif
   nsCOMPtr<nsIFile> file;
   nsresult rv = NS_OK;
   rv = m_runningUrl->GetMsgFile(getter_AddRefs(file));
@@ -6584,6 +6623,9 @@ void nsImapProtocol::UploadMessageFromFile(nsIFile* file,
                                            imapMessageFlagsType flags,
                                            nsCString& keywords) {
   if (!file || !mailboxName) return;
+#ifdef MOZ_PANORAMA
+  auto* nativeUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
+#endif
   IncrementCommandTagNumber();
 
   int64_t fileSize = 0;
@@ -6711,6 +6753,21 @@ void nsImapProtocol::UploadMessageFromFile(nsIFile* file,
       if (NS_FAILED(rv)) goto done;
 
       ParseIMAPandCheckForNewMail(command.get());
+#ifdef MOZ_PANORAMA
+      if (nativeUrl->CopyNativeQueuedAppendTarget() &&
+          GetServerStateParser().AppendAccepted()) {
+        // Preserve matched tagged acceptance before NOOP or another command
+        // resets parser state. Nothing here is an acknowledged unknown UID,
+        // not absence of an acknowledgement and never a fabricated UID zero.
+        nsresult receiptRv = nativeUrl->RecordNativeQueuedAppendReceipt(
+            NativeQueuedAppendReceipt{GetServerStateParser().AppendReceipt()});
+        if (NS_FAILED(receiptRv)) {
+          m_mailboxUpdateResult = receiptRv;
+          urlOk = false;
+          goto done;
+        }
+      }
+#endif
       if (!GetServerStateParser().LastCommandSuccessful()) goto done;
 
       // If reached, the append completed without error. No more goto's!
@@ -6725,7 +6782,26 @@ void nsImapProtocol::UploadMessageFromFile(nsIFile* file,
           imapAction == nsIImapUrl::nsImapAppendMsgFromFile) {
         if (GetServerStateParser().GetCapabilityFlag() & kUidplusCapability) {
           ImapUid newUid = GetServerStateParser().CurrentResponseUID();
-          if (m_imapMailFolderSink)
+#ifdef MOZ_PANORAMA
+          auto* nativeUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
+          if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+            auto receipt = GetServerStateParser().AppendReceipt();
+            rv = receipt ? nativeUrl->RecordNativeQueuedAppendReceipt(
+                               NativeQueuedAppendReceipt{receipt})
+                         : NS_ERROR_NOT_AVAILABLE;
+            if (NS_SUCCEEDED(rv)) {
+              rv = m_imapMailFolderSink ? m_imapMailFolderSink->SetAppendMsgUid(
+                                              receipt->uid, m_runningUrl)
+                                        : NS_ERROR_NOT_AVAILABLE;
+            }
+            if (NS_FAILED(rv)) {
+              m_mailboxUpdateResult = rv;
+              urlOk = false;
+              goto done;
+            }
+          } else
+#endif
+              if (m_imapMailFolderSink)
             m_imapMailFolderSink->SetAppendMsgUid(newUid, m_runningUrl);
 
           // Courier imap server seems to have problems with recently
@@ -6734,6 +6810,9 @@ void nsImapProtocol::UploadMessageFromFile(nsIFile* file,
 
           if (!GetServerStateParser().LastCommandSuccessful()) urlOk = false;
         } else if (m_imapMailFolderSink &&
+#ifdef MOZ_PANORAMA
+                   !nativeUrl->CopyNativeQueuedAppendTarget() &&
+#endif
                    imapAction == nsIImapUrl::nsImapAppendDraftFromFile) {
           // No UIDPLUS capability and just appended a message to draft folder.
           // Must search the folder using the Message-ID to find the UID of the
@@ -6774,6 +6853,12 @@ void nsImapProtocol::UploadMessageFromFile(nsIFile* file,
     }
   }
 done:
+#ifdef MOZ_PANORAMA
+  if (GetServerStateParser().AppendRejected()) {
+    static_cast<nsImapUrl*>(m_runningUrl.get())
+        ->RecordNativeQueuedAppendRejected();
+  }
+#endif
   // If imap command fails or network goes down, make sure URL sees the failure.
   if (!urlOk) GetServerStateParser().SetCommandFailed(true);
 
@@ -8365,6 +8450,50 @@ void nsImapProtocol::Search(const char* searchCriteria, bool useUID,
   if (NS_SUCCEEDED(rv)) ParseIMAPandCheckForNewMail();
 }
 
+#ifdef MOZ_PANORAMA
+static bool ParseNativeCopyUidSet(const nsACString& text, uint32_t limit,
+                                  nsTArray<ImapUid>& output) {
+  nsAutoCString remaining(text);
+  const char* cursor = remaining.get();
+  auto number = [&]() -> mozilla::Maybe<uint32_t> {
+    uint64_t value = 0;
+    const char* first = cursor;
+    while (*cursor >= '0' && *cursor <= '9') {
+      value = value * 10 + (*cursor++ - '0');
+      if (value > UINT32_MAX) return mozilla::Nothing();
+    }
+    return cursor != first && value
+               ? mozilla::Some(static_cast<uint32_t>(value))
+               : mozilla::Nothing();
+  };
+  nsTArray<ImapUid> parsed;
+  do {
+    auto first = number();
+    if (!first) return false;
+    auto last = first;
+    if (*cursor == ':') {
+      ++cursor;
+      last = number();
+      if (!last) return false;
+    }
+    uint64_t count = *first <= *last ? uint64_t(*last) - *first + 1
+                                     : uint64_t(*first) - *last + 1;
+    if (count > limit || parsed.Length() > limit - count) return false;
+    uint32_t uid = *first;
+    for (uint64_t i = 0; i < count; ++i) {
+      if (parsed.Contains(uid)) return false;
+      parsed.AppendElement(uid);
+      if (i + 1 < count) uid = *first <= *last ? uid + 1 : uid - 1;
+    }
+    if (!*cursor) break;
+    if (*cursor++ != ',') return false;
+  } while (*cursor);
+  if (parsed.IsEmpty() || cursor[-1] == ',') return false;
+  output = std::move(parsed);
+  return true;
+}
+#endif
+
 void nsImapProtocol::Copy(const char* messageList,
                           const char* destinationMailbox, bool idsAreUid) {
   if (NS_FAILED(m_mailboxUpdateResult)) return;
@@ -8399,6 +8528,11 @@ void nsImapProtocol::Copy(const char* messageList,
     nsAutoCString protocolString(GetServerCommandTag());
     if (idsAreUid) protocolString.AppendLiteral(" uid");
     if (m_imapAction == nsIImapUrl::nsImapOnlineMove &&
+#ifdef MOZ_PANORAMA
+        static_cast<nsImapUrl*>(m_runningUrl.get())
+            ->CopyNativeQueuedCopies()
+            .IsEmpty() &&
+#endif
         GetServerStateParser().GetCapabilityFlag() & kHasMoveCapability)
       protocolString.AppendLiteral(" move ");
     else
@@ -8414,6 +8548,50 @@ void nsImapProtocol::Copy(const char* messageList,
     m_copyCommandIssued = true;
     nsresult rv = SendData(protocolString.get());
     if (NS_SUCCEEDED(rv)) ParseIMAPandCheckForNewMail(protocolString.get());
+#ifdef MOZ_PANORAMA
+    auto* nativeUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
+    if (!nativeUrl->CopyNativeQueuedCopies().IsEmpty() &&
+        GetServerStateParser().CopyAccepted()) {
+      nsTArray<NativeQueuedCopyReceipt> receipts;
+      nsTArray<ImapUid> sources, destinations;
+      auto epoch = GetServerStateParser().CopyEpoch();
+      bool mapped =
+          epoch &&
+          ParseNativeCopyUidSet(GetServerStateParser().CopySourceUidSet(),
+                                msgsToHandle, sources) &&
+          ParseNativeCopyUidSet(GetServerStateParser().CopyDestinationUidSet(),
+                                msgsToHandle, destinations) &&
+          sources.Length() == msgsToHandle &&
+          destinations.Length() == sources.Length();
+      if (mapped) {
+        for (ImapUid uid : sources) {
+          bool requested = false;
+          for (uint32_t i = msgsHandled - msgsToHandle; i < msgsHandled; ++i)
+            requested |= msgUids[i] == uid;
+          mapped &= requested;
+        }
+      }
+      if (mapped) {
+        for (uint32_t i = 0; i < sources.Length(); ++i) {
+          receipts.AppendElement(NativeQueuedCopyReceipt{
+              sources[i],
+              mozilla::Some(mozilla::mailnews::ServerUidConfirmation{
+                  *epoch, destinations[i]})});
+        }
+      } else {
+        // A matching COPY OK is durable even if its optional mapping is absent
+        // or unusable. It never supplies a fabricated UID or MOVE deletion.
+        for (uint32_t i = msgsHandled - msgsToHandle; i < msgsHandled; ++i)
+          receipts.AppendElement(
+              NativeQueuedCopyReceipt{msgUids[i], mozilla::Nothing()});
+      }
+      nsresult recorded = nativeUrl->RecordNativeCopyReceipts(receipts);
+      if (NS_SUCCEEDED(recorded) && m_imapMailFolderSink)
+        recorded = m_imapMailFolderSink->SetCopyResponseUid("", m_runningUrl);
+      if (NS_FAILED(recorded) && NS_SUCCEEDED(m_mailboxUpdateResult))
+        m_mailboxUpdateResult = recorded;
+    }
+#endif
     if (NS_SUCCEEDED(rv)) rv = GetConnectionStatus();
     if (NS_SUCCEEDED(rv) && !GetServerStateParser().LastCommandSuccessful()) {
       rv = NS_MSG_ERROR_IMAP_COMMAND_FAILED;

@@ -53,6 +53,11 @@ class DetachedMsgHdr : public DecodedSubjectHdr {
   nsresult mAttachError = NS_OK;
   nsCOMPtr<nsIMsgDBHdr> mAttachedHeader;
 
+  // Opaque common-copy provenance and its one unpublished physical member.
+  nsCString mCopySourceId;
+  nsMsgKey mCopyStagedKey{nsMsgKey_None};
+  bool mCopyPublishing = false;
+
   // Stuff I _really_ _really_ don't want here.
   uint64_t mFolderId{0};
 };

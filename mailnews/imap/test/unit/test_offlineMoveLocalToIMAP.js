@@ -9,7 +9,7 @@
 
 // NOTE: PromiseTestUtils and MailServices already imported
 
-function setupTest() {
+async function setupTest() {
   // Turn off autosync_offline_stores because
   // fetching messages is invoked after copying the messages.
   // (i.e. The fetching process will be invoked after OnStopCopy)
@@ -21,7 +21,27 @@ function setupTest() {
     false
   );
 
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    Services.prefs.setCharPref(
+      "mail.server.default.storeContractID",
+      Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+    );
+  }
   setupIMAPPump();
+  IMAPPump.server.setDebugLevel(nsMailServer.debugAll);
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(
+      IMAPPump.incomingServer.rootFolder,
+      discovered,
+      null
+    );
+    await discovered.promise;
+    IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+      .getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox)
+      .QueryInterface(Ci.nsIMsgImapMailFolder);
+    Assert.ok(IMAPPump.inbox, "Native discovery supplied the real INBOX");
+  }
 
   // These hacks are required because we've created the inbox before
   // running initial folder discovery, and adding the folder bails
@@ -77,7 +97,7 @@ async function loadTestMessage(folder) {
 }
 
 add_task(async function testOfflineMoveLocalToIMAP() {
-  setupTest();
+  await setupTest();
 
   // Install a test message in the local folder.
   await loadTestMessage(localAccountUtils.inboxFolder);

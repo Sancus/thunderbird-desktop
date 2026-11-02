@@ -1498,18 +1498,352 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
   });
 }
 
+const { MockRegistrar: CopyOrderRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
 const { NetUtil } = ChromeUtils.importESModule(
   "resource://gre/modules/NetUtil.sys.mjs"
 );
 
 /**
+ * Observes the real native providers and mailbox listeners for one copy case.
+ * Restores the three factories after all forwarded stop callbacks return.
+ *
+ * @param {string} storeType - The mbox or maildir provider.
+ * @returns {object} Per-case calls, issued streams, requests and cleanup methods.
+ */
+function observePublicationCalls(storeType) {
+  const storeContract = `@mozilla.org/msgstore/${storeType == "mbox" ? "berkeleystore" : "maildirstore"};1`;
+  const serviceContracts = [
+    "@mozilla.org/messenger/messageservice;1?type=mailbox",
+    "@mozilla.org/messenger/messageservice;1?type=mailbox-message",
+  ];
+  const contracts = [storeContract, ...serviceContracts];
+  const registrar = Components.manager.QueryInterface(Ci.nsIComponentRegistrar);
+  const cids = contracts.map(contract => registrar.contractIDToCID(contract));
+  const nativeService = Cc[serviceContracts[0]].getService(
+    Ci.nsIMsgMessageService
+  );
+  // This case owns one server and must acquire exactly one fresh native store.
+  const nativeStore = Cc[storeContract].createInstance(Ci.nsIMsgPluggableStore);
+  const registrations = [];
+  const order = {
+    destinationURI: null,
+    events: [],
+    requests: [],
+    instances: 0,
+    memberScope: null,
+    record(type, details = {}) {
+      const event = { type, seq: this.events.length, ...details };
+      this.events.push(event);
+      return event;
+    },
+    async drain() {
+      let count = 0;
+      while (count < this.requests.length) {
+        const pending = this.requests.slice(count);
+        count = this.requests.length;
+        await Promise.all(pending.map(request => request.finished));
+      }
+    },
+    restore() {
+      while (registrations.length) {
+        CopyOrderRegistrar.unregister(registrations.pop());
+      }
+      for (const [index, contract] of contracts.entries()) {
+        Assert.equal(
+          registrar.contractIDToCID(contract).toString(),
+          cids[index].toString()
+        );
+      }
+      const count = this.instances;
+      Assert.equal(
+        Cc[storeContract].createInstance(Ci.nsIMsgPluggableStore).storeType,
+        storeType
+      );
+      Assert.equal(
+        this.instances,
+        count,
+        "Fresh construction uses the restored native factory"
+      );
+    },
+  };
+
+  // Keep every argument and out parameter; only the actual listener is observed.
+  const copyRequest = (method, listenerIndex, args) => {
+    const request = {
+      id: order.requests.length + 1,
+      nextMember: 2,
+      method,
+      sourceURI: method == "CopyMessages" ? args[1].URI : args[0],
+      keys: method == "CopyMessages" ? Array.from(args[0]) : null,
+    };
+    request.finished = new Promise(resolve => {
+      request.settled = resolve;
+    });
+    order.requests.push(request);
+    const original = args[listenerIndex];
+    const copy = original.QueryInterface(Ci.nsICopyMessageListener);
+    order.record("service", {
+      id: request.id,
+      move: args[listenerIndex + 1],
+      urlListener: args[listenerIndex + 2],
+      msgWindow: args[listenerIndex + 3],
+    });
+    args[listenerIndex] = {
+      QueryInterface: ChromeUtils.generateQI([
+        "nsIStreamListener",
+        "nsIRequestObserver",
+        "nsICopyMessageListener",
+      ]),
+      onStartRequest(nativeRequest) {
+        return original.onStartRequest(nativeRequest);
+      },
+      onDataAvailable(...data) {
+        return original.onDataAvailable(...data);
+      },
+      onStopRequest(nativeRequest, status) {
+        order.record("stop", { id: request.id, nativeRequest, status });
+        try {
+          return original.onStopRequest(nativeRequest, status);
+        } finally {
+          request.settled();
+        }
+      },
+      beginCopy() {
+        return copy.beginCopy();
+      },
+      startMessage() {
+        const member = request.nextMember++;
+        const previous = order.memberScope;
+        order.memberScope = { id: request.id, member };
+        order.record("member", { id: request.id, member });
+        try {
+          return copy.startMessage();
+        } catch (error) {
+          order.record("member-error", {
+            id: request.id,
+            member,
+            result: error.result,
+          });
+          throw error;
+        } finally {
+          order.memberScope = previous;
+        }
+      },
+      copyData(...data) {
+        return copy.copyData(...data);
+      },
+      endMessage(key) {
+        return copy.endMessage(key);
+      },
+      endCopy(succeeded) {
+        return copy.endCopy(succeeded);
+      },
+      endMove(succeeded) {
+        return copy.endMove(succeeded);
+      },
+    };
+    try {
+      return nativeService[method](...args);
+    } catch (error) {
+      request.settled();
+      throw error;
+    }
+  };
+  const service = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgMessageService"]),
+    copyMessage(...args) {
+      return copyRequest("copyMessage", 1, args);
+    },
+    CopyMessages(...args) {
+      return copyRequest("CopyMessages", 2, args);
+    },
+  };
+  for (const method of [
+    "loadMessage",
+    "saveMessageToDisk",
+    "getUrlForUri",
+    "Search",
+    "streamMessage",
+    "streamHeaders",
+    "isMsgInMemCache",
+    "messageURIToMsgHdr",
+  ]) {
+    service[method] = (...args) => nativeService[method](...args);
+  }
+  try {
+    registrations.push(
+      CopyOrderRegistrar.register(storeContract, () => {
+        const native = nativeStore;
+        order.instances++;
+        const store = {
+          QueryInterface: ChromeUtils.generateQI(["nsIMsgPluggableStore"]),
+          get storeType() {
+            return native.storeType;
+          },
+          get supportsCompaction() {
+            return native.supportsCompaction;
+          },
+          getNewMsgOutputStream(folder) {
+            const event =
+              folder?.URI == order.destinationURI
+                ? order.record("open", { scope: order.memberScope })
+                : null;
+            const stream = native.getNewMsgOutputStream(folder);
+            if (event) {
+              event.stream = stream;
+            }
+            return stream;
+          },
+          finishNewMessage(folder, stream) {
+            const observing = folder?.URI == order.destinationURI;
+            if (observing) {
+              order.record("finish-entry", { stream });
+            }
+            try {
+              const token = native.finishNewMessage(folder, stream);
+              if (observing) {
+                order.record("finish", { stream, token });
+              }
+              return token;
+            } catch (error) {
+              if (observing) {
+                order.record("finish-error", { stream, result: error.result });
+              }
+              throw error;
+            }
+          },
+        };
+        for (const method of [
+          "discoverSubFolders",
+          "discoverChildFolders",
+          "createFolder",
+          "ensureLocalStore",
+          "deleteFolder",
+          "renameFolder",
+          "hasSpaceAvailable",
+          "copyFolder",
+          "discardNewMessage",
+          "getMsgInputStream",
+          "deleteMessages",
+          "deleteStoreMessages",
+          "copyMessages",
+          "asyncCompact",
+          "isSummaryFileValid",
+          "setSummaryFileValid",
+          "asyncScan",
+          "changeFlags",
+          "changeKeywords",
+          "estimateFolderSize",
+        ]) {
+          store[method] = (...args) => native[method](...args);
+        }
+        return store;
+      })
+    );
+    for (const contract of serviceContracts) {
+      registrations.push(CopyOrderRegistrar.register(contract, () => service));
+    }
+  } catch (error) {
+    order.restore();
+    throw error;
+  }
+  return order;
+}
+
+/**
+ * Checks actual provider returns before publication and native stop before completion.
+ * This does not establish physical close success or the whole stop callback return.
+ *
+ * @param {object} order - The per-case native observations.
+ * @param {number} finishedCount - Expected successful provider Finish calls.
+ * @param {number} requestCount - Expected native requests and public completions.
+ */
+function assertPublicationOrder(order, finishedCount, requestCount) {
+  const calls = type => order.events.filter(event => event.type == type);
+  const opens = calls("open");
+  const entries = calls("finish-entry");
+  const finishes = calls("finish");
+  Assert.equal(
+    order.instances,
+    1,
+    "The single owned native account acquired its one fresh provider"
+  );
+  Assert.equal(opens.length, finishedCount);
+  Assert.equal(
+    entries.length,
+    finishedCount,
+    "Each issued target receives one Finish call"
+  );
+  Assert.equal(finishes.length, finishedCount);
+  Assert.deepEqual(calls("finish-error"), []);
+  for (const [index, finish] of finishes.entries()) {
+    Assert.strictEqual(entries[index].stream, opens[index].stream);
+    Assert.strictEqual(finish.stream, opens[index].stream);
+    Assert.less(opens[index].seq, entries[index].seq);
+    Assert.less(entries[index].seq, finish.seq);
+    Assert.equal(typeof finish.token, "string");
+    Assert.notEqual(finish.token, "");
+  }
+  for (const published of calls("publish")) {
+    const matching = finishes.filter(
+      finish => finish.token === published.token
+    );
+    Assert.equal(
+      matching.length,
+      1,
+      "Publication has one actual provider result"
+    );
+    Assert.less(
+      matching[0].seq,
+      published.seq,
+      "Provider Finish returned before publication"
+    );
+  }
+  Assert.equal(order.requests.length, requestCount);
+  Assert.equal(calls("stop").length, requestCount);
+  Assert.equal(calls("complete").length, requestCount);
+  for (const request of order.requests) {
+    const stops = calls("stop").filter(event => event.id == request.id);
+    const completions = calls("complete").filter(
+      event => event.id == request.id
+    );
+    Assert.equal(stops.length, 1);
+    Assert.equal(completions.length, 1);
+    Assert.less(
+      stops[0].seq,
+      completions[0].seq,
+      "Native stop entry precedes public completion"
+    );
+  }
+  for (const event of calls("service")) {
+    Assert.equal(
+      event.move,
+      false,
+      "The native service does not retire the source"
+    );
+    Assert.equal(event.urlListener, null);
+    Assert.equal(event.msgWindow, null);
+  }
+}
+
+/**
  * Runs a publication case with a real native local account and store.
  *
  * @param {string} storeType - The mbox or maildir provider.
- * @param {(context: {rootFolder: nsIMsgLocalMailFolder, database: nsIDatabaseCore, accounts: nsIMsgAccount[]}) => Promise<void>} run - Receives the owned fixture.
+ * @param {(context: {rootFolder: nsIMsgLocalMailFolder, database: nsIDatabaseCore, accounts: nsIMsgAccount[], order: object|null}) => Promise<void>} run - Receives the owned fixture.
+ * @param {object} [options] - Direct observation and quarantine selection.
+ * @param {boolean} [options.observeOrder=false] - Observe actual provider and protocol calls.
+ * @param {boolean} [options.quarantine=false] - Write the observed mbox case through quarantine.
  * @returns {Promise<void>} Resolves after the case and owned account cleanup.
  */
-async function withPublicationStore(storeType, run) {
+async function withPublicationStore(
+  storeType,
+  run,
+  { observeOrder = false, quarantine = false } = {}
+) {
   const prefs = [
     "mail.serverDefaultStoreContractID",
     "mail.server.default.storeContractID",
@@ -1519,7 +1853,16 @@ async function withPublicationStore(storeType, run) {
     value: Services.prefs.getCharPref(name, ""),
   }));
   const accounts = [];
+  const scanPref = "mailnews.downloadToTempFile";
+  const hadScanPref = Services.prefs.prefHasUserValue(scanPref);
+  const oldScanPref = Services.prefs.getBoolPref(scanPref, false);
+  let order = null;
   try {
+    if (observeOrder) {
+      Services.prefs.setBoolPref(scanPref, quarantine);
+      Assert.equal(Services.prefs.getBoolPref(scanPref), quarantine);
+      order = observePublicationCalls(storeType);
+    }
     const contract = `@mozilla.org/msgstore/${storeType == "mbox" ? "berkeleystore" : "maildirstore"};1`;
     for (const { name } of prefs) {
       Services.prefs.setCharPref(name, contract);
@@ -1540,18 +1883,30 @@ async function withPublicationStore(storeType, run) {
       .getService(Ci.nsIMsgDBService)
       .QueryInterface(Ci.nsIDatabaseCore);
     Assert.equal(server.msgStore.storeType, storeType);
-    await run({ rootFolder, database, accounts });
+    await run({ rootFolder, database, accounts, order });
   } finally {
     try {
+      await order?.drain();
       for (const account of accounts.reverse()) {
         MailServices.accounts.removeAccount(account, false);
       }
     } finally {
-      for (const { name, hadValue, value } of prefs) {
-        if (hadValue) {
-          Services.prefs.setCharPref(name, value);
-        } else {
-          Services.prefs.clearUserPref(name);
+      try {
+        order?.restore();
+      } finally {
+        if (observeOrder) {
+          if (hadScanPref) {
+            Services.prefs.setBoolPref(scanPref, oldScanPref);
+          } else {
+            Services.prefs.clearUserPref(scanPref);
+          }
+        }
+        for (const { name, hadValue, value } of prefs) {
+          if (hadValue) {
+            Services.prefs.setCharPref(name, value);
+          } else {
+            Services.prefs.clearUserPref(name);
+          }
         }
       }
     }
@@ -1596,175 +1951,198 @@ function readPublicationBytes(stream) {
  *
  * @param {string} storeType - The mbox or maildir provider.
  * @param {boolean} isMove - Whether the first request moves its source messages.
+ * @param {boolean} [quarantine=false] - Enable the real mbox quarantine wrapper.
  * @returns {Promise<void>} Resolves after real copy completion and custody checks.
  */
-async function checkCompletePublication(storeType, isMove) {
-  await withPublicationStore(storeType, async ({ rootFolder }) => {
-    const name = isMove ? "complete-move" : "complete-copy";
-    const source = rootFolder
-      .createLocalSubfolder(name + "-source")
-      .QueryInterface(Ci.nsIMsgLocalMailFolder);
-    const destination = rootFolder
-      .createLocalSubfolder(name + "-destination")
-      .QueryInterface(Ci.nsIMsgLocalMailFolder);
-    assertPublicationFolder(source, storeType);
-    const db = assertPublicationFolder(destination, storeType);
-    const raw = [
-      "From: Sender <sender@invalid>",
-      "To: Recipient <recipient@invalid>",
-      "Date: Tue, 01 Jan 2019 00:00:00 +0000",
-      "Message-ID: <complete-copy@invalid>",
-      "Subject: Wire subject",
-      "",
-      "From a destination body.",
-      "Last destination line.",
-      "",
-    ].join("\r\n");
-    Assert.equal(raw.length, 217, "The literal fixture size is independent");
-    const original = source.addMessage(raw);
-    original.subject = "Stored subject";
-    original.flags =
-      Ci.nsMsgMessageFlags.Read |
-      Ci.nsMsgMessageFlags.Marked |
-      Ci.nsMsgMessageFlags.Replied |
-      Ci.nsMsgMessageFlags.Offline;
-    original.charset = "utf-8";
-    original.accountKey = "original-account";
-    original.messageSize = 65535;
-    original.offlineMessageSize = 123456;
-    original.lineCount = 888;
-    for (const [key, value] of [
-      ["size", "000Ff"],
-      ["numLines", "000Aa"],
-      ["offlineMsgSize", "000Bf"],
-      ["dateReceived", "00aBcD"],
-    ]) {
-      original.setStringProperty(key, value);
-    }
-    const sourceKey = original.messageKey;
-    const sourceToken = original.storeToken;
-    const additions = [];
-    const changes = [];
-    const listener = {
-      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
-      onHdrFlagsChanged() {
-        changes.push("flags");
-      },
-      onHdrDeleted() {},
-      onParentChanged() {},
-      onAnnouncerGoingAway() {},
-      onReadChanged() {},
-      onJunkScoreChanged() {},
-      onHdrPropertyChanged() {
-        changes.push("property");
-      },
-      onEvent() {},
-      onHdrAdded(header) {
-        const snapshot = {};
-        additions.push(snapshot);
-        try {
-          snapshot.subject = header.subject;
-          snapshot.messageId = header.messageId;
-          snapshot.flags = header.flags;
-          snapshot.size = header.messageSize;
-          snapshot.offlineSize = header.offlineMessageSize;
-          snapshot.lines = header.lineCount;
-          snapshot.charset = header.charset;
-          snapshot.account = header.accountKey;
-          snapshot.extras = [
-            "size",
-            "numLines",
-            "offlineMsgSize",
-            "dateReceived",
-          ].map(key => header.getStringProperty(key));
-          snapshot.member = db.containsKey(header.messageKey);
-          snapshot.total = destination.getTotalMessages(false);
-          snapshot.unread = destination.getNumUnread(false);
-          snapshot.hasToken = header.storeToken !== "";
-          if (snapshot.hasToken) {
-            snapshot.raw = readPublicationBytes(
-              destination.getMsgInputStream(header)
-            );
-            snapshot.storeRaw = readPublicationBytes(
-              destination.msgStore.getMsgInputStream(
-                destination,
-                header.storeToken,
-                0
-              )
-            );
-          }
-        } catch (error) {
-          snapshot.error = String(error);
-        }
-      },
-    };
-    db.addListener(listener);
-    registerCleanupFunction(() => db.removeListener(listener));
-    const stopped = new PromiseTestUtils.PromiseCopyListener();
-    MailServices.copy.copyMessages(
-      source,
-      [original],
-      destination,
-      isMove,
-      stopped,
-      null,
-      false
-    );
-    await stopped.promise;
-    Assert.deepEqual(
-      additions,
-      [
-        {
-          subject: "Stored subject",
-          messageId: "complete-copy@invalid",
-          flags:
-            Ci.nsMsgMessageFlags.Read |
-            Ci.nsMsgMessageFlags.Marked |
-            Ci.nsMsgMessageFlags.Replied,
-          size: 217,
-          offlineSize: 0,
-          lines: 2,
-          charset: "utf-8",
-          account: "original-account",
-          extras: ["000Ff", "000Aa", "000Bf", "00aBcD"],
-          member: true,
-          total: 1,
-          unread: 0,
-          hasToken: true,
-          raw,
-          storeRaw: raw,
+async function checkCompletePublication(storeType, isMove, quarantine = false) {
+  await withPublicationStore(
+    storeType,
+    async ({ rootFolder, order }) => {
+      const name = isMove ? "complete-move" : "complete-copy";
+      const source = rootFolder
+        .createLocalSubfolder(name + "-source")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const destination = rootFolder
+        .createLocalSubfolder(name + "-destination")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      assertPublicationFolder(source, storeType);
+      const db = assertPublicationFolder(destination, storeType);
+      const raw = [
+        "From: Sender <sender@invalid>",
+        "To: Recipient <recipient@invalid>",
+        "Date: Tue, 01 Jan 2019 00:00:00 +0000",
+        "Message-ID: <complete-copy@invalid>",
+        "Subject: Wire subject",
+        "",
+        "From a destination body.",
+        "Last destination line.",
+        "",
+      ].join("\r\n");
+      Assert.equal(raw.length, 217, "The literal fixture size is independent");
+      const original = source.addMessage(raw);
+      original.subject = "Stored subject";
+      original.flags =
+        Ci.nsMsgMessageFlags.Read |
+        Ci.nsMsgMessageFlags.Marked |
+        Ci.nsMsgMessageFlags.Replied |
+        Ci.nsMsgMessageFlags.Offline;
+      original.charset = "utf-8";
+      original.accountKey = "original-account";
+      original.messageSize = 65535;
+      original.offlineMessageSize = 123456;
+      original.lineCount = 888;
+      for (const [key, value] of [
+        ["size", "000Ff"],
+        ["numLines", "000Aa"],
+        ["offlineMsgSize", "000Bf"],
+        ["dateReceived", "00aBcD"],
+      ]) {
+        original.setStringProperty(key, value);
+      }
+      const sourceKey = original.messageKey;
+      const sourceToken = original.storeToken;
+      order.destinationURI = destination.URI;
+      const additions = [];
+      const changes = [];
+      const listener = {
+        QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+        onHdrFlagsChanged() {
+          changes.push("flags");
         },
-      ],
-      "One addition exposes destination storage and complete metadata"
-    );
-    Assert.deepEqual(
-      changes,
-      [],
-      "No later setters complete the published header"
-    );
-    assertPublicationFolder(destination, storeType);
-    const copied = Array.from(destination.messages);
-    Assert.equal(copied.length, 1);
-    Assert.equal(
-      readPublicationBytes(destination.getMsgInputStream(copied[0])),
-      raw
-    );
-    assertPublicationFolder(source, storeType);
-    Assert.deepEqual(
-      source.msgDatabase.listAllKeys(),
-      isMove ? [] : [sourceKey]
-    );
-    if (!isMove) {
-      Assert.equal(original.storeToken, sourceToken);
-      Assert.equal(original.messageSize, 65535);
-      Assert.equal(original.offlineMessageSize, 123456);
-      Assert.equal(original.lineCount, 888);
+        onHdrDeleted() {},
+        onParentChanged() {},
+        onAnnouncerGoingAway() {},
+        onReadChanged() {},
+        onJunkScoreChanged() {},
+        onHdrPropertyChanged() {
+          changes.push("property");
+        },
+        onEvent() {},
+        onHdrAdded(header) {
+          order.record("publish", { token: header.storeToken });
+          const snapshot = {};
+          additions.push(snapshot);
+          try {
+            snapshot.subject = header.subject;
+            snapshot.messageId = header.messageId;
+            snapshot.flags = header.flags;
+            snapshot.size = header.messageSize;
+            snapshot.offlineSize = header.offlineMessageSize;
+            snapshot.lines = header.lineCount;
+            snapshot.charset = header.charset;
+            snapshot.account = header.accountKey;
+            snapshot.extras = [
+              "size",
+              "numLines",
+              "offlineMsgSize",
+              "dateReceived",
+            ].map(key => header.getStringProperty(key));
+            snapshot.member = db.containsKey(header.messageKey);
+            snapshot.total = destination.getTotalMessages(false);
+            snapshot.unread = destination.getNumUnread(false);
+            snapshot.hasToken = header.storeToken !== "";
+            if (snapshot.hasToken) {
+              snapshot.raw = readPublicationBytes(
+                destination.getMsgInputStream(header)
+              );
+              snapshot.storeRaw = readPublicationBytes(
+                destination.msgStore.getMsgInputStream(
+                  destination,
+                  header.storeToken,
+                  0
+                )
+              );
+            }
+          } catch (error) {
+            snapshot.error = String(error);
+          }
+        },
+      };
+      db.addListener(listener);
+      registerCleanupFunction(() => db.removeListener(listener));
+      const stopped = new PromiseTestUtils.PromiseCopyListener({
+        onStopCopy(status) {
+          order.record("complete", { id: 1, status });
+        },
+      });
+      MailServices.copy.copyMessages(
+        source,
+        [original],
+        destination,
+        isMove,
+        stopped,
+        null,
+        false
+      );
+      await stopped.promise;
+      await order.drain();
+      assertPublicationOrder(order, 1, 1);
       Assert.equal(
-        readPublicationBytes(source.getMsgInputStream(original)),
+        order.events.filter(event => event.type == "publish").length,
+        1
+      );
+      Assert.equal(
+        order.events.find(event => event.type == "complete").status,
+        Cr.NS_OK
+      );
+      Assert.equal(order.requests[0].method, "copyMessage");
+      Assert.equal(order.requests[0].sourceURI, source.getUriForMsg(original));
+      Assert.deepEqual(
+        additions,
+        [
+          {
+            subject: "Stored subject",
+            messageId: "complete-copy@invalid",
+            flags:
+              Ci.nsMsgMessageFlags.Read |
+              Ci.nsMsgMessageFlags.Marked |
+              Ci.nsMsgMessageFlags.Replied,
+            size: 217,
+            offlineSize: 0,
+            lines: 2,
+            charset: "utf-8",
+            account: "original-account",
+            extras: ["000Ff", "000Aa", "000Bf", "00aBcD"],
+            member: true,
+            total: 1,
+            unread: 0,
+            hasToken: true,
+            raw,
+            storeRaw: raw,
+          },
+        ],
+        "One addition exposes destination storage and complete metadata"
+      );
+      Assert.deepEqual(
+        changes,
+        [],
+        "No later setters complete the published header"
+      );
+      assertPublicationFolder(destination, storeType);
+      const copied = Array.from(destination.messages);
+      Assert.equal(copied.length, 1);
+      Assert.equal(
+        readPublicationBytes(destination.getMsgInputStream(copied[0])),
         raw
       );
-    }
-  });
+      assertPublicationFolder(source, storeType);
+      Assert.deepEqual(
+        source.msgDatabase.listAllKeys(),
+        isMove ? [] : [sourceKey]
+      );
+      if (!isMove) {
+        Assert.equal(original.storeToken, sourceToken);
+        Assert.equal(original.messageSize, 65535);
+        Assert.equal(original.offlineMessageSize, 123456);
+        Assert.equal(original.lineCount, 888);
+        Assert.equal(
+          readPublicationBytes(source.getMsgInputStream(original)),
+          raw
+        );
+      }
+    },
+    { observeOrder: true, quarantine }
+  );
 }
 
 /**
@@ -1772,393 +2150,479 @@ async function checkCompletePublication(storeType, isMove) {
  *
  * @param {string} storeType - The mbox or maildir provider.
  * @param {boolean} isMove - Whether the first request moves its source messages.
+ * @param {boolean} [quarantine=false] - Enable the real mbox quarantine wrapper.
  * @returns {Promise<void>} Resolves after real copy completion and custody checks.
  */
-async function checkDeferredMailboxPublicationFailure(storeType, isMove) {
-  await withPublicationStore(storeType, async ({ rootFolder, database }) => {
-    const name = isMove ? "deferred-move" : "deferred-copy";
-    const source = rootFolder
-      .createLocalSubfolder(name + "-source")
-      .QueryInterface(Ci.nsIMsgLocalMailFolder);
-    const secondSource = rootFolder
-      .createLocalSubfolder(name + "-second-source")
-      .QueryInterface(Ci.nsIMsgLocalMailFolder);
-    const destination = rootFolder
-      .createLocalSubfolder(name + "-destination")
-      .QueryInterface(Ci.nsIMsgLocalMailFolder);
-    assertPublicationFolder(source, storeType);
-    assertPublicationFolder(secondSource, storeType);
-    const db = assertPublicationFolder(destination, storeType);
-    const subjects = ["Kept prefix", "Deferred attach fault", "Refused suffix"];
-    const raws = subjects.map((subject, index) =>
-      [
-        "From: sender@invalid",
-        "To: recipient@invalid",
-        "Date: Tue, 01 Jan 2019 00:00:00 +0000",
-        "Message-ID: <" + name + "-first-" + index + "@invalid>",
-        "Subject: " + subject,
-        "",
-        "First request body " + index + ".",
-        "",
-      ].join("\r\n")
-    );
-    const secondRaws = ["one", "two"].map(word =>
-      [
-        "From: second@invalid",
-        "To: destination@invalid",
-        "Date: Wed, 02 Jan 2019 00:00:00 +0000",
-        "Message-ID: <" + name + "-second-" + word + "@invalid>",
-        "Subject: Second wire " + word,
-        "",
-        "Second request body " + word + ".",
-        "",
-      ].join("\r\n")
-    );
-    const messages = raws.map(raw => source.addMessage(raw));
-    const secondMessages = secondRaws.map(raw => secondSource.addMessage(raw));
-    const firstFlags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
-    for (const header of messages) {
-      header.flags = firstFlags;
-    }
-    const secondFlags = [
-      Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Replied,
-      Ci.nsMsgMessageFlags.Read |
-        Ci.nsMsgMessageFlags.Marked |
-        Ci.nsMsgMessageFlags.Replied,
-    ];
-    for (const [index, header] of secondMessages.entries()) {
-      header.subject = "Second stored " + ["one", "two"][index];
-      header.flags = secondFlags[index];
-    }
-    const keys = messages.map(header => header.messageKey);
-    const tokens = messages.map(header => header.storeToken);
-    const secondKeys = secondMessages.map(header => header.messageKey);
-    const secondTokens = secondMessages.map(header => header.storeToken);
-    const sourcePaths =
-      storeType == "maildir"
-        ? tokens.map(token =>
-            PathUtils.join(source.filePath.path, "cur", token)
-          )
-        : [source.filePath.path];
-    const before = await Promise.all(
-      sourcePaths.map(file => IOUtils.read(file))
-    );
-    Assert.deepEqual(
-      messages.map(header =>
-        readPublicationBytes(source.getMsgInputStream(header))
-      ),
-      raws
-    );
-    Assert.deepEqual(
-      secondMessages.map(header =>
-        readPublicationBytes(secondSource.getMsgInputStream(header))
-      ),
-      secondRaws
-    );
+async function checkDeferredMailboxPublicationFailure(
+  storeType,
+  isMove,
+  quarantine = false
+) {
+  await withPublicationStore(
+    storeType,
+    async ({ rootFolder, database, order }) => {
+      const name = isMove ? "deferred-move" : "deferred-copy";
+      const source = rootFolder
+        .createLocalSubfolder(name + "-source")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const secondSource = rootFolder
+        .createLocalSubfolder(name + "-second-source")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const destination = rootFolder
+        .createLocalSubfolder(name + "-destination")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      assertPublicationFolder(source, storeType);
+      assertPublicationFolder(secondSource, storeType);
+      const db = assertPublicationFolder(destination, storeType);
+      const subjects = [
+        "Kept prefix",
+        "Deferred attach fault",
+        "Refused suffix",
+      ];
+      const raws = subjects.map((subject, index) =>
+        [
+          "From: sender@invalid",
+          "To: recipient@invalid",
+          "Date: Tue, 01 Jan 2019 00:00:00 +0000",
+          "Message-ID: <" + name + "-first-" + index + "@invalid>",
+          "Subject: " + subject,
+          "",
+          "First request body " + index + ".",
+          "",
+        ].join("\r\n")
+      );
+      const secondRaws = ["one", "two"].map(word =>
+        [
+          "From: second@invalid",
+          "To: destination@invalid",
+          "Date: Wed, 02 Jan 2019 00:00:00 +0000",
+          "Message-ID: <" + name + "-second-" + word + "@invalid>",
+          "Subject: Second wire " + word,
+          "",
+          "Second request body " + word + ".",
+          "",
+        ].join("\r\n")
+      );
+      const messages = raws.map(raw => source.addMessage(raw));
+      const secondMessages = secondRaws.map(raw =>
+        secondSource.addMessage(raw)
+      );
+      const firstFlags =
+        Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+      for (const header of messages) {
+        header.flags = firstFlags;
+      }
+      const secondFlags = [
+        Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Replied,
+        Ci.nsMsgMessageFlags.Read |
+          Ci.nsMsgMessageFlags.Marked |
+          Ci.nsMsgMessageFlags.Replied,
+      ];
+      for (const [index, header] of secondMessages.entries()) {
+        header.subject = "Second stored " + ["one", "two"][index];
+        header.flags = secondFlags[index];
+      }
+      const keys = messages.map(header => header.messageKey);
+      const tokens = messages.map(header => header.storeToken);
+      const secondKeys = secondMessages.map(header => header.messageKey);
+      const secondTokens = secondMessages.map(header => header.storeToken);
+      const sourcePaths =
+        storeType == "maildir"
+          ? tokens.map(token =>
+              PathUtils.join(source.filePath.path, "cur", token)
+            )
+          : [source.filePath.path];
+      const before = await Promise.all(
+        sourcePaths.map(file => IOUtils.read(file))
+      );
+      Assert.deepEqual(
+        messages.map(header =>
+          readPublicationBytes(source.getMsgInputStream(header))
+        ),
+        raws
+      );
+      Assert.deepEqual(
+        secondMessages.map(header =>
+          readPublicationBytes(secondSource.getMsgInputStream(header))
+        ),
+        secondRaws
+      );
 
-    const events = [];
-    const faults = [];
-    const additions = [];
-    const firstStatuses = [];
-    const secondStatuses = [];
-    const firstProgress = [];
-    const secondProgress = [];
-    let firstStop;
-    let secondStop;
-    const observer = {
-      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
-      onHdrFlagsChanged() {},
-      onHdrDeleted() {},
-      onParentChanged() {},
-      onAnnouncerGoingAway() {},
-      onReadChanged() {},
-      onJunkScoreChanged() {},
-      onHdrPropertyChanged() {},
-      onEvent() {},
-      onHdrAdded(header) {
-        try {
-          additions.push([
-            header.messageId,
-            header.subject,
-            header.author,
-            header.recipients,
-            header.flags,
-            readPublicationBytes(destination.getMsgInputStream(header)),
+      order.destinationURI = destination.URI;
+      const events = [];
+      const faults = [];
+      const additions = [];
+      const firstStatuses = [];
+      const secondStatuses = [];
+      const firstProgress = [];
+      const secondProgress = [];
+      let firstStop;
+      let secondStop;
+      const observer = {
+        QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+        onHdrFlagsChanged() {},
+        onHdrDeleted() {},
+        onParentChanged() {},
+        onAnnouncerGoingAway() {},
+        onReadChanged() {},
+        onJunkScoreChanged() {},
+        onHdrPropertyChanged() {},
+        onEvent() {},
+        onHdrAdded(header) {
+          order.record("publish", { token: header.storeToken });
+          try {
+            additions.push([
+              header.messageId,
+              header.subject,
+              header.author,
+              header.recipients,
+              header.flags,
+              readPublicationBytes(destination.getMsgInputStream(header)),
+              secondSource.msgDatabase.listAllKeys(),
+            ]);
+          } catch (error) {
+            additions.push(["callback error", String(error)]);
+          }
+        },
+      };
+      const secondListener = new PromiseTestUtils.PromiseCopyListener({
+        onStartCopy() {
+          events.push("second-start");
+        },
+        onProgress(current, total) {
+          secondProgress.push([
+            current,
+            total,
             secondSource.msgDatabase.listAllKeys(),
           ]);
-        } catch (error) {
-          additions.push(["callback error", String(error)]);
-        }
-      },
-    };
-    const secondListener = new PromiseTestUtils.PromiseCopyListener({
-      onStartCopy() {
-        events.push("second-start");
-      },
-      onProgress(current, total) {
-        secondProgress.push([
-          current,
-          total,
-          secondSource.msgDatabase.listAllKeys(),
-        ]);
-      },
-      onStopCopy(status) {
-        events.push("second-stop");
-        secondStatuses.push(status);
-        secondStop = secondSource.msgDatabase.listAllKeys();
-      },
-    });
-    const secondStopped = secondListener.promise.then(
-      () => true,
-      () => false
-    );
-    let started;
-    let startFailed;
-    const secondStarted = new Promise((resolve, reject) => {
-      started = resolve;
-      startFailed = reject;
-    });
-    const firstListener = new PromiseTestUtils.PromiseCopyListener({
-      onStartCopy() {
-        events.push("first-start");
-      },
-      onProgress(current, total) {
-        firstProgress.push([current, total]);
-      },
-      onStopCopy(status) {
-        events.push("first-stop");
-        firstStatuses.push(status);
-        if (firstStatuses.length != 1) {
-          return;
-        }
-        try {
-          firstStop = {
-            sourceKeys: source.msgDatabase.listAllKeys(),
-            secondKeys: secondSource.msgDatabase.listAllKeys(),
-            destinationIds: Array.from(
-              destination.messages,
-              header => header.messageId
-            ),
-            sourceBodies: messages.map(header =>
-              readPublicationBytes(source.getMsgInputStream(header))
-            ),
-            secondBodies: secondMessages.map(header =>
-              readPublicationBytes(secondSource.getMsgInputStream(header))
-            ),
-          };
-          MailServices.copy.copyMessages(
-            secondSource,
-            secondMessages,
-            destination,
-            true,
-            secondListener,
-            null,
-            false
-          );
-          started();
-        } catch (error) {
-          startFailed(error);
-        }
-      },
-    });
-    const firstStopped = firstListener.promise.then(
-      () => true,
-      () => false
-    );
-    const connection = database.connectionForTests;
-    connection.createFunction("delivery_local_deferred_abort", 1, {
-      onFunctionCall(args) {
-        events.push("fault");
-        faults.push(args.getUTF8String(0));
-        throw Components.Exception(
-          "Deferred AttachHdr fault",
-          Cr.NS_ERROR_FAILURE
-        );
-      },
-    });
-    let active = true;
-    const cleanup = () => {
-      if (active) {
-        active = false;
-        db.removeListener(observer);
-        try {
-          connection.executeSimpleSQL(
-            "DROP TRIGGER IF EXISTS temp.delivery_local_deferred_abort"
-          );
-        } finally {
-          connection.removeFunction("delivery_local_deferred_abort");
-        }
-      }
-    };
-    registerCleanupFunction(cleanup);
-    db.addListener(observer);
-    connection.executeSimpleSQL(
-      "CREATE TEMP TRIGGER delivery_local_deferred_abort BEFORE INSERT ON main.messages " +
-        "WHEN NEW.subject = 'Deferred attach fault' BEGIN SELECT " +
-        "delivery_local_deferred_abort(NEW.subject); END"
-    );
-    let firstSucceeded;
-    let secondSucceeded;
-    const scan = new PromiseTestUtils.PromiseStoreScanListener();
-    try {
-      MailServices.copy.copyMessages(
-        source,
-        messages,
-        destination,
-        isMove,
-        firstListener,
-        null,
-        false
+        },
+        onStopCopy(status) {
+          order.record("complete", { id: 2, status });
+          events.push("second-stop");
+          secondStatuses.push(status);
+          secondStop = secondSource.msgDatabase.listAllKeys();
+        },
+      });
+      const secondStopped = secondListener.promise.then(
+        () => true,
+        () => false
       );
-      firstSucceeded = await firstStopped;
-      await secondStarted;
-      secondSucceeded = await secondStopped;
-      destination.msgStore.asyncScan(destination, scan);
-      await scan.promise;
-    } finally {
-      cleanup();
-    }
-    Assert.equal(firstSucceeded, false);
-    Assert.equal(secondSucceeded, true);
-    Assert.deepEqual(faults, ["Deferred attach fault"]);
-    Assert.deepEqual(firstStatuses, [Cr.NS_ERROR_FAILURE]);
-    Assert.deepEqual(secondStatuses, [Cr.NS_OK]);
-    Assert.deepEqual(events, [
-      "first-start",
-      "fault",
-      "first-stop",
-      "second-start",
-      "second-stop",
-    ]);
-    Assert.deepEqual(firstProgress, [
-      [1, 3],
-      [2, 3],
-    ]);
-    Assert.deepEqual(secondProgress, [
-      [1, 2, secondKeys],
-      [2, 2, secondKeys],
-    ]);
-    Assert.deepEqual(firstStop, {
-      sourceKeys: keys,
-      secondKeys,
-      destinationIds: [name + "-first-0@invalid"],
-      sourceBodies: raws,
-      secondBodies: secondRaws,
-    });
-    Assert.deepEqual(
-      secondStop,
-      [],
-      "Only the successful second move deletes its sources"
-    );
-    Assert.deepEqual(additions, [
-      [
-        name + "-first-0@invalid",
-        "Kept prefix",
-        "sender@invalid",
-        "recipient@invalid",
-        firstFlags,
-        raws[0],
-        secondKeys,
-      ],
-      [
-        name + "-second-one@invalid",
-        "Second stored one",
-        "second@invalid",
-        "destination@invalid",
-        secondFlags[0],
-        secondRaws[0],
-        secondKeys,
-      ],
-      [
-        name + "-second-two@invalid",
-        "Second stored two",
-        "second@invalid",
-        "destination@invalid",
-        secondFlags[1],
-        secondRaws[1],
-        secondKeys,
-      ],
-    ]);
-    Assert.deepEqual(
-      Array.from(destination.messages, header => [
-        header.messageId,
-        header.subject,
-        header.flags,
-      ]).toSorted((a, b) => a[0].localeCompare(b[0])),
-      [
-        [name + "-first-0@invalid", "Kept prefix", firstFlags],
-        [name + "-second-one@invalid", "Second stored one", secondFlags[0]],
-        [name + "-second-two@invalid", "Second stored two", secondFlags[1]],
-      ]
-    );
-    Assert.deepEqual(
-      scan.messages.toSorted(),
-      [raws[0], raws[1], ...secondRaws].toSorted(),
-      "The store keeps the prefix, finished unpublished member and only the second request bodies"
-    );
-    const failedIndex = scan.messages.indexOf(raws[1]);
-    Assert.notEqual(scan.tokens[failedIndex], "");
-    Assert.equal(
-      readPublicationBytes(
-        destination.msgStore.getMsgInputStream(
+      let started;
+      let startFailed;
+      const secondStarted = new Promise((resolve, reject) => {
+        started = resolve;
+        startFailed = reject;
+      });
+      const firstListener = new PromiseTestUtils.PromiseCopyListener({
+        onStartCopy() {
+          events.push("first-start");
+        },
+        onProgress(current, total) {
+          firstProgress.push([current, total]);
+        },
+        onStopCopy(status) {
+          order.record("complete", { id: 1, status });
+          events.push("first-stop");
+          firstStatuses.push(status);
+          if (firstStatuses.length != 1) {
+            return;
+          }
+          try {
+            firstStop = {
+              sourceKeys: source.msgDatabase.listAllKeys(),
+              secondKeys: secondSource.msgDatabase.listAllKeys(),
+              destinationIds: Array.from(
+                destination.messages,
+                header => header.messageId
+              ),
+              sourceBodies: messages.map(header =>
+                readPublicationBytes(source.getMsgInputStream(header))
+              ),
+              secondBodies: secondMessages.map(header =>
+                readPublicationBytes(secondSource.getMsgInputStream(header))
+              ),
+            };
+            MailServices.copy.copyMessages(
+              secondSource,
+              secondMessages,
+              destination,
+              true,
+              secondListener,
+              null,
+              false
+            );
+            started();
+          } catch (error) {
+            startFailed(error);
+          }
+        },
+      });
+      const firstStopped = firstListener.promise.then(
+        () => true,
+        () => false
+      );
+      const connection = database.connectionForTests;
+      connection.createFunction("delivery_local_deferred_abort", 1, {
+        onFunctionCall(args) {
+          order.record("fault");
+          events.push("fault");
+          faults.push(args.getUTF8String(0));
+          throw Components.Exception(
+            "Deferred AttachHdr fault",
+            Cr.NS_ERROR_FAILURE
+          );
+        },
+      });
+      let active = true;
+      const cleanup = () => {
+        if (active) {
+          active = false;
+          db.removeListener(observer);
+          try {
+            connection.executeSimpleSQL(
+              "DROP TRIGGER IF EXISTS temp.delivery_local_deferred_abort"
+            );
+          } finally {
+            connection.removeFunction("delivery_local_deferred_abort");
+          }
+        }
+      };
+      registerCleanupFunction(cleanup);
+      db.addListener(observer);
+      connection.executeSimpleSQL(
+        "CREATE TEMP TRIGGER delivery_local_deferred_abort BEFORE INSERT ON main.messages " +
+          "WHEN NEW.subject = 'Deferred attach fault' BEGIN SELECT " +
+          "delivery_local_deferred_abort(NEW.subject); END"
+      );
+      let firstSucceeded;
+      let secondSucceeded;
+      const scan = new PromiseTestUtils.PromiseStoreScanListener();
+      try {
+        MailServices.copy.copyMessages(
+          source,
+          messages,
           destination,
-          scan.tokens[failedIndex],
-          0
-        )
-      ),
-      raws[1]
-    );
-    Assert.deepEqual(source.msgDatabase.listAllKeys(), keys);
-    Assert.deepEqual(
-      messages.map(header => header.storeToken),
-      tokens
-    );
-    Assert.deepEqual(
-      messages.map(header => header.subject),
-      subjects
-    );
-    Assert.deepEqual(
-      messages.map(header => header.flags),
-      [firstFlags, firstFlags, firstFlags]
-    );
-    for (const [index, file] of sourcePaths.entries()) {
-      Assert.deepEqual(await IOUtils.read(file), before[index]);
-    }
-    Assert.deepEqual(
-      messages.map(header =>
-        readPublicationBytes(source.getMsgInputStream(header))
-      ),
-      raws
-    );
-    Assert.deepEqual(secondSource.msgDatabase.listAllKeys(), []);
-    if (storeType == "maildir") {
-      Assert.deepEqual(
-        await IOUtils.getChildren(
-          PathUtils.join(destination.filePath.path, "tmp")
-        ),
-        []
-      );
-      Assert.equal(
-        (
-          await IOUtils.getChildren(
-            PathUtils.join(destination.filePath.path, "cur")
-          )
-        ).length,
-        4
-      );
-      for (const token of secondTokens) {
-        Assert.equal(
-          await IOUtils.exists(
-            PathUtils.join(secondSource.filePath.path, "cur", token)
-          ),
+          isMove,
+          firstListener,
+          null,
           false
         );
+        firstSucceeded = await firstStopped;
+        await secondStarted;
+        secondSucceeded = await secondStopped;
+        destination.msgStore.asyncScan(destination, scan);
+        await scan.promise;
+      } finally {
+        cleanup();
       }
-    }
-    for (const folder of [source, secondSource, destination]) {
-      assertPublicationFolder(folder, storeType);
-    }
-  });
+      await order.drain();
+      assertPublicationOrder(order, 4, 2);
+      Assert.deepEqual(
+        order.requests.map(request => [
+          request.method,
+          request.sourceURI,
+          request.keys,
+        ]),
+        [
+          ["CopyMessages", source.URI, keys],
+          ["CopyMessages", secondSource.URI, secondKeys],
+        ]
+      );
+      Assert.equal(
+        order.events.filter(event => event.type == "publish").length,
+        3
+      );
+      const stop = order.events.find(
+        event => event.type == "stop" && event.id == 1
+      );
+      const fault = order.events.find(event => event.type == "fault");
+      Assert.ok(fault);
+      Assert.less(fault.seq, stop.seq);
+      Assert.equal(
+        order.events.filter(
+          event => event.type == "open" && event.seq < stop.seq
+        ).length,
+        2
+      );
+      Assert.equal(
+        order.events.filter(
+          event =>
+            event.type == "open" &&
+            event.seq > fault.seq &&
+            event.seq < stop.seq
+        ).length,
+        0
+      );
+      Assert.deepEqual(
+        order.events
+          .filter(event => event.type == "member" && event.id == 1)
+          .map(event => event.member),
+        [2, 3]
+      );
+      Assert.deepEqual(
+        order.events
+          .filter(event => event.type == "member-error" && event.id == 1)
+          .map(event => [event.member, event.result]),
+        [[3, Cr.NS_ERROR_FAILURE]]
+      );
+      Assert.equal(
+        order.events.filter(
+          event =>
+            event.type == "open" &&
+            event.scope?.id == 1 &&
+            event.scope.member == 3
+        ).length,
+        0
+      );
+      Assert.deepEqual(
+        order.events
+          .filter(event => event.type == "complete")
+          .map(event => event.status),
+        [Cr.NS_ERROR_FAILURE, Cr.NS_OK]
+      );
+      Assert.equal(firstSucceeded, false);
+      Assert.equal(secondSucceeded, true);
+      Assert.deepEqual(faults, ["Deferred attach fault"]);
+      Assert.deepEqual(firstStatuses, [Cr.NS_ERROR_FAILURE]);
+      Assert.deepEqual(secondStatuses, [Cr.NS_OK]);
+      Assert.deepEqual(events, [
+        "first-start",
+        "fault",
+        "first-stop",
+        "second-start",
+        "second-stop",
+      ]);
+      Assert.deepEqual(firstProgress, [
+        [1, 3],
+        [2, 3],
+      ]);
+      Assert.deepEqual(secondProgress, [
+        [1, 2, secondKeys],
+        [2, 2, secondKeys],
+      ]);
+      Assert.deepEqual(firstStop, {
+        sourceKeys: keys,
+        secondKeys,
+        destinationIds: [name + "-first-0@invalid"],
+        sourceBodies: raws,
+        secondBodies: secondRaws,
+      });
+      Assert.deepEqual(
+        secondStop,
+        [],
+        "Only the successful second move deletes its sources"
+      );
+      Assert.deepEqual(additions, [
+        [
+          name + "-first-0@invalid",
+          "Kept prefix",
+          "sender@invalid",
+          "recipient@invalid",
+          firstFlags,
+          raws[0],
+          secondKeys,
+        ],
+        [
+          name + "-second-one@invalid",
+          "Second stored one",
+          "second@invalid",
+          "destination@invalid",
+          secondFlags[0],
+          secondRaws[0],
+          secondKeys,
+        ],
+        [
+          name + "-second-two@invalid",
+          "Second stored two",
+          "second@invalid",
+          "destination@invalid",
+          secondFlags[1],
+          secondRaws[1],
+          secondKeys,
+        ],
+      ]);
+      Assert.deepEqual(
+        Array.from(destination.messages, header => [
+          header.messageId,
+          header.subject,
+          header.flags,
+        ]).toSorted((a, b) => a[0].localeCompare(b[0])),
+        [
+          [name + "-first-0@invalid", "Kept prefix", firstFlags],
+          [name + "-second-one@invalid", "Second stored one", secondFlags[0]],
+          [name + "-second-two@invalid", "Second stored two", secondFlags[1]],
+        ]
+      );
+      Assert.deepEqual(
+        scan.messages.toSorted(),
+        [raws[0], raws[1], ...secondRaws].toSorted(),
+        "The store keeps the prefix, finished unpublished member and only the second request bodies"
+      );
+      const failedIndex = scan.messages.indexOf(raws[1]);
+      Assert.notEqual(scan.tokens[failedIndex], "");
+      Assert.equal(
+        readPublicationBytes(
+          destination.msgStore.getMsgInputStream(
+            destination,
+            scan.tokens[failedIndex],
+            0
+          )
+        ),
+        raws[1]
+      );
+      Assert.deepEqual(source.msgDatabase.listAllKeys(), keys);
+      Assert.deepEqual(
+        messages.map(header => header.storeToken),
+        tokens
+      );
+      Assert.deepEqual(
+        messages.map(header => header.subject),
+        subjects
+      );
+      Assert.deepEqual(
+        messages.map(header => header.flags),
+        [firstFlags, firstFlags, firstFlags]
+      );
+      for (const [index, file] of sourcePaths.entries()) {
+        Assert.deepEqual(await IOUtils.read(file), before[index]);
+      }
+      Assert.deepEqual(
+        messages.map(header =>
+          readPublicationBytes(source.getMsgInputStream(header))
+        ),
+        raws
+      );
+      Assert.deepEqual(secondSource.msgDatabase.listAllKeys(), []);
+      if (storeType == "maildir") {
+        Assert.deepEqual(
+          await IOUtils.getChildren(
+            PathUtils.join(destination.filePath.path, "tmp")
+          ),
+          []
+        );
+        Assert.equal(
+          (
+            await IOUtils.getChildren(
+              PathUtils.join(destination.filePath.path, "cur")
+            )
+          ).length,
+          4
+        );
+        for (const token of secondTokens) {
+          Assert.equal(
+            await IOUtils.exists(
+              PathUtils.join(secondSource.filePath.path, "cur", token)
+            ),
+            false
+          );
+        }
+      }
+      for (const folder of [source, secondSource, destination]) {
+        assertPublicationFolder(folder, storeType);
+      }
+    },
+    { observeOrder: true, quarantine }
+  );
 }
 
 /**
@@ -2779,6 +3243,18 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
   });
   add_task(async function test_movePublishesDestinationStorageMaildir() {
     await checkCompletePublication("maildir", true);
+  });
+  add_task(async function test_copyPublishesAfterQuarantineFinish() {
+    await checkCompletePublication("mbox", false, true);
+  });
+  add_task(async function test_movePublishesAfterQuarantineFinish() {
+    await checkCompletePublication("mbox", true, true);
+  });
+  add_task(async function test_copyDefersQuarantineFailureCompletion() {
+    await checkDeferredMailboxPublicationFailure("mbox", false, true);
+  });
+  add_task(async function test_moveDefersQuarantineFailureCompletion() {
+    await checkDeferredMailboxPublicationFailure("mbox", true, true);
   });
   add_task(async function test_propertyReadFailurePrecedesBodyWriteMbox() {
     await checkPropertyReadFailurePrecedesBodyWrite("mbox");

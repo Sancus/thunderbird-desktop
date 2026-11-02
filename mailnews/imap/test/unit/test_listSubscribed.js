@@ -17,6 +17,29 @@ var { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 
+add_setup(function configureNativeStore() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const pref = "mail.server.default.storeContractID";
+  const hadValue = Services.prefs.prefHasUserValue(pref);
+  const oldValue = Services.prefs.getCharPref(pref, "");
+  registerCleanupFunction(() => {
+    if (hadValue) {
+      Services.prefs.setCharPref(pref, oldValue);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+    if (IMAPPump.incomingServer) {
+      teardownIMAPPump();
+    }
+  });
+  Services.prefs.setCharPref(
+    pref,
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
+});
+
 add_setup(async function () {
   // Zimbra is one of the servers that supports LIST-EXTENDED
   // it also has a bug that causes a server crash in certain setups
@@ -42,6 +65,23 @@ add_setup(async function () {
     nonExistent: true,
   });
   IMAPPump.daemon.createMailbox("folder3", {});
+
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    IMAPPump.incomingServer.setBoolValue("autosync_offline_stores", false);
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+    Assert.ok(inbox, "Native discovery supplies the actual INBOX");
+    IMAPPump.inbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+    Assert.strictEqual(IMAPPump.inbox.parent, root);
+    Assert.strictEqual(IMAPPump.inbox.server, IMAPPump.incomingServer);
+    Assert.equal(
+      IMAPPump.inbox.msgStore.storeType,
+      IMAPPump.incomingServer.msgStore.storeType
+    );
+  }
 
   // select the inbox to force folder discovery, etc.
   const listener = new PromiseTestUtils.PromiseUrlListener();

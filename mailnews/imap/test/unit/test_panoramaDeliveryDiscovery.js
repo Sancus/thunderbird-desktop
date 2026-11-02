@@ -7,6 +7,10 @@
 /* import-globals-from head_server.js */
 /* import-globals-from ../../../db/panorama/test/xpcshell/head_delivery.js */
 
+const { MockRegistrar: discoveryMockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
 let fixture;
 
 add_setup(function setupDiscovery() {
@@ -26,9 +30,15 @@ add_setup(function setupDiscovery() {
 function seedMailboxes(nested) {
   const { daemon, rootFolder } = fixture;
   Assert.equal(rootFolder.getChildNamed("DeliveryParent"), null);
-  daemon.createMailbox("DeliveryParent", { subscribed: true });
+  daemon.createMailbox("DeliveryParent", {
+    subscribed: true,
+    uidvalidity: daemon.uidvalidity++,
+  });
   if (nested) {
-    daemon.createMailbox("DeliveryParent/DeliveryChild", { subscribed: true });
+    daemon.createMailbox("DeliveryParent/DeliveryChild", {
+      subscribed: true,
+      uidvalidity: daemon.uidvalidity++,
+    });
   }
   Assert.deepEqual(
     daemon.root.allChildren.map(mailbox => mailbox.fullName).sort(),
@@ -41,6 +51,9 @@ function seedMailboxes(nested) {
 
 /**
  * Runs production discovery and verifies actual mailbox listing commands.
+ *
+ * @returns {Promise<void>} Resolves when the discovery URL completes.
+ * @throws {Error} Rejects with the original discovery URL error.
  */
 async function discover() {
   info('DELIVERY_PHASE {"phase":"imap-discovery-started"}');
@@ -55,11 +68,17 @@ async function discover() {
         0
       );
   const previousListings = listingCount();
-  const listener = new PromiseTestUtils.PromiseUrlListener();
+  let completions = 0;
+  const listener = new PromiseTestUtils.PromiseUrlListener({
+    OnStopRunningUrl() {
+      completions++;
+    },
+  });
   MailServices.imap.discoverAllFolders(fixture.rootFolder, listener, null);
   try {
     await listener.promise;
   } finally {
+    Assert.equal(completions, 1, "Discovery completes its URL listener once");
     Assert.greater(
       listingCount(),
       previousListings,
@@ -108,6 +127,16 @@ function discoveredChild(parent, name, uri) {
 
 async function test_discoversChild() {
   seedMailboxes(false);
+  const { rootFolder, incomingServer, account, core, daemon } = fixture;
+  const junkURI = rootFolder.URI + "/Junk";
+  const templatesURI = rootFolder.URI + "/UnlistedTemplates";
+  if (core) {
+    account.defaultIdentity.templatesFolderURI = templatesURI;
+    incomingServer.spamSettings.actionTargetAccount = rootFolder.URI;
+    incomingServer.spamSettings.moveTargetMode =
+      Ci.nsISpamSettings.MOVE_TARGET_MODE_ACCOUNT;
+    Assert.equal(incomingServer.spamSettings.spamFolderURI, junkURI);
+  }
   await discover();
   const folder = discoveredChild(
     fixture.rootFolder,
@@ -115,6 +144,132 @@ async function test_discoversChild() {
     fixture.rootFolder.URI + "/DeliveryParent"
   );
   PanoramaDelivery.assertFolder(folder, fixture.lane);
+  if (core) {
+    for (const [name, uri] of [
+      ["Junk", junkURI],
+      ["UnlistedTemplates", templatesURI],
+    ]) {
+      Assert.equal(rootFolder.getChildNamed(name), null);
+      Assert.equal(core.folderDB.getFolderChildNamed(rootFolder.id, name), 0);
+      Assert.equal(MailServices.folderLookup.getFolderForURL(uri), null);
+      Assert.equal(
+        daemon.getMailbox(name),
+        null,
+        "Discovery invents no server mailbox"
+      );
+    }
+    Assert.equal(account.defaultIdentity.templatesFolderURI, templatesURI);
+    Assert.equal(incomingServer.spamSettings.spamFolderURI, junkURI);
+    daemon.createMailbox("Junk", { subscribed: true });
+    daemon.createMailbox("UnlistedTemplates", { subscribed: true });
+    await discover();
+    const junk = discoveredChild(rootFolder, "Junk", junkURI);
+    const templates = discoveredChild(
+      rootFolder,
+      "UnlistedTemplates",
+      templatesURI
+    );
+    const ids = [junk.id, templates.id];
+    Assert.ok(junk.getFlag(Ci.nsMsgFolderFlags.Junk));
+    Assert.ok(templates.getFlag(Ci.nsMsgFolderFlags.Templates));
+    incomingServer.spamSettings.actionTargetFolder =
+      rootFolder.URI + "/AbsentTarget";
+    incomingServer.spamSettings.moveTargetMode =
+      Ci.nsISpamSettings.MOVE_TARGET_MODE_FOLDER;
+    await discover();
+    Assert.equal(incomingServer.spamSettings.spamFolderURI, junkURI);
+    Assert.equal(
+      incomingServer.getStringValue("spamActionTargetFolder"),
+      junkURI
+    );
+    Assert.equal(
+      core.folderDB.getFolderChildNamed(rootFolder.id, "AbsentTarget"),
+      0
+    );
+    incomingServer.spamSettings.actionTargetFolder = folder.URI;
+    await discover();
+    Assert.equal(incomingServer.spamSettings.spamFolderURI, folder.URI);
+    Assert.ok(folder.getFlag(Ci.nsMsgFolderFlags.Junk));
+    Assert.strictEqual(rootFolder.getChildNamed("Junk"), junk);
+    Assert.strictEqual(
+      rootFolder.getChildNamed("UnlistedTemplates"),
+      templates
+    );
+    Assert.deepEqual([junk.id, templates.id], ids);
+
+    const settings = incomingServer.spamSettings;
+    const previousAccount = settings.actionTargetAccount;
+    const previousMode = settings.moveTargetMode;
+    const previousStoredAccount = incomingServer.getStringValue(
+      "spamActionTargetAccount"
+    );
+    const absentAccountURI = "imap://removed-discovery-account@127.0.0.1";
+    const rootIds = core.folderDB.getFolderChildren(0);
+    const childIds = core.folderDB.getFolderChildren(rootFolder.id);
+    try {
+      settings.actionTargetAccount = absentAccountURI;
+      settings.moveTargetMode = Ci.nsISpamSettings.MOVE_TARGET_MODE_ACCOUNT;
+      await discover();
+      Assert.equal(settings.actionTargetAccount, absentAccountURI);
+      Assert.equal(
+        settings.moveTargetMode,
+        Ci.nsISpamSettings.MOVE_TARGET_MODE_ACCOUNT
+      );
+      Assert.equal(
+        incomingServer.getStringValue("spamActionTargetAccount"),
+        previousStoredAccount,
+        "Discovery preserves the configured account preference"
+      );
+      Assert.equal(
+        MailServices.folderLookup.getFolderForURL(absentAccountURI),
+        null
+      );
+      Assert.equal(
+        MailServices.folderLookup.getFolderForURL(absentAccountURI + "/Junk"),
+        null
+      );
+      Assert.deepEqual(core.folderDB.getFolderChildren(0), rootIds);
+      Assert.deepEqual(
+        core.folderDB.getFolderChildren(rootFolder.id),
+        childIds
+      );
+      const selectCount = () =>
+        [fixture.server.playTransaction()]
+          .flat()
+          .reduce(
+            (count, transaction) =>
+              count +
+              transaction.them.filter(line =>
+                /^\S+ (SELECT|EXAMINE) /i.test(line)
+              ).length,
+            0
+          );
+      const previousSelects = selectCount();
+      let completions = 0;
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl() {
+          completions++;
+        },
+      });
+      folder.updateFolderWithListener(null, listener);
+      await listener.promise;
+      Assert.equal(completions, 1, "A later folder update finishes once");
+      Assert.greater(
+        selectCount(),
+        previousSelects,
+        "A later URL reaches SELECT"
+      );
+      Assert.strictEqual(rootFolder.getChildNamed("DeliveryParent"), folder);
+      Assert.deepEqual(core.folderDB.getFolderChildren(0), rootIds);
+      Assert.deepEqual(
+        core.folderDB.getFolderChildren(rootFolder.id),
+        childIds
+      );
+    } finally {
+      settings.actionTargetAccount = previousAccount;
+      settings.moveTargetMode = previousMode;
+    }
+  }
   info('DELIVERY_PHASE {"phase":"imap-discovery-child-verified"}');
 }
 
@@ -154,6 +309,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
   const ids = fixture.core ? [parent.id, child.id] : null;
   const rootChildren = root.subFolders;
   const nestedChildren = parent.subFolders;
+  const heldDatabase = fixture.core ? child.msgDatabase : null;
   info('DELIVERY_PHASE {"phase":"imap-discovery-repeat-ready"}');
   await discover();
   Assert.equal(
@@ -181,6 +337,19 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     "Repeated discovery adds no nested children"
   );
   if (ids) {
+    Assert.strictEqual(
+      child.msgDatabase,
+      heldDatabase,
+      "LIST preserves an already open database"
+    );
+    child.msgDatabase = null;
+    Assert.equal(child.databaseOpen, false);
+    await discover();
+    Assert.equal(
+      child.databaseOpen,
+      false,
+      "LIST releases only the metadata database it opened"
+    );
     Assert.deepEqual(
       [parent.id, child.id],
       ids,
@@ -264,6 +433,57 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     Assert.equal(parent.getChildNamed("DeliveryChild"), child);
     Assert.equal(child.filePath.path, childPath);
     Assert.deepEqual([parent.id, child.id], ids);
+    fixture.daemon.createMailbox("DeliveryParent/FactoryRetry", {
+      subscribed: true,
+    });
+    let factoryCalls = 0;
+    let pendingId;
+    const cid = discoveryMockRegistrar.register(
+      "@mozilla.org/mail/folder-factory;1?name=imap",
+      () => {
+        factoryCalls++;
+        throw Components.Exception(
+          "Discovery factory failure",
+          Cr.NS_ERROR_FAILURE
+        );
+      }
+    );
+    try {
+      await Assert.rejects(
+        discover(),
+        error => error.message == String(Cr.NS_ERROR_FAILURE),
+        "The actual child factory failure reaches discovery completion"
+      );
+      Assert.greater(factoryCalls, 0);
+      pendingId = fixture.core.folderDB.getFolderChildNamed(
+        parent.id,
+        "FactoryRetry"
+      );
+      Assert.greater(
+        pendingId,
+        0,
+        "Failed initialization retains the server row"
+      );
+      Assert.equal(parent.getChildNamed("FactoryRetry"), null);
+      Assert.equal(
+        MailServices.folderLookup.getFolderForURL(parent.URI + "/FactoryRetry"),
+        null,
+        "A failed factory never publishes a live wrapper"
+      );
+      Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
+      Assert.equal(child.filePath.path, childPath);
+    } finally {
+      discoveryMockRegistrar.unregister(cid);
+    }
+    await discover();
+    const completed = discoveredChild(
+      parent,
+      "FactoryRetry",
+      parent.URI + "/FactoryRetry"
+    );
+    Assert.equal(completed.id, pendingId);
+    Assert.equal(completed.onlineName, "DeliveryParent/FactoryRetry");
+    Assert.deepEqual([parent.id, child.id], ids);
   }
   info('DELIVERY_PHASE {"phase":"imap-discovery-repeat-verified"}');
 }
@@ -296,6 +516,46 @@ async function test_discoveryStoresOnlineName() {
     "DeliveryParent/DeliveryChild",
     "The mailbox-name accessor retains the complete server mailbox name"
   );
+  if (fixture.core) {
+    const connection = fixture.core.connectionForTests;
+    const id = child.id;
+    const path = child.filePath.path;
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER fail_discovery_pref BEFORE INSERT ON folder_properties " +
+        "WHEN NEW.id = " +
+        id +
+        " AND NEW.name = 'hierDelim' " +
+        "BEGIN SELECT RAISE(ABORT, 'discovery pref failure'); END"
+    );
+    try {
+      await Assert.rejects(
+        discover(),
+        error => error.message == String(Cr.NS_ERROR_STORAGE_CONSTRAINT),
+        "A real retained-row metadata write failure is not a successful LIST"
+      );
+      Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
+      Assert.equal(child.id, id);
+      Assert.equal(child.filePath.path, path);
+      Assert.equal(
+        fixture.core.folderDB.getFolderChildNamed(parent.id, "DeliveryChild"),
+        id
+      );
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER fail_discovery_pref");
+    }
+    await discover();
+    Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
+    Assert.equal(child.id, id);
+    Assert.equal(child.onlineName, "DeliveryParent/DeliveryChild");
+    Assert.throws(
+      () =>
+        fixture.incomingServer
+          .QueryInterface(Ci.nsIImapServerSink)
+          .possibleImapMailbox("", "/", 0),
+      /NS_ERROR_FAILURE/,
+      "An invalid mailbox declaration preserves its original error"
+    );
+  }
   info('DELIVERY_PHASE {"phase":"imap-discovery-online-name-verified"}');
 }
 
@@ -324,6 +584,39 @@ async function test_discoveryReportsDelimiter() {
   if (fixture.core) {
     Assert.equal(parentDB.dBFolderInfo.getUint32Property("hierDelim", 0), 47);
     Assert.equal(childDB.dBFolderInfo.getUint32Property("hierDelim", 0), 47);
+  }
+  if (fixture.core) {
+    const ids = [parent.id, child.id];
+    for (const mailbox of [
+      fixture.daemon.root,
+      ...fixture.daemon.root.allChildren,
+    ]) {
+      mailbox.delimiter = ".";
+    }
+    fixture.incomingServer.closeCachedConnections();
+    await discover();
+    Assert.strictEqual(
+      fixture.rootFolder.getChildNamed("DeliveryParent"),
+      parent
+    );
+    Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
+    Assert.deepEqual([parent.id, child.id], ids);
+    Assert.equal(
+      fixture.daemon.getMailbox("DeliveryParent.DeliveryChild").delimiter,
+      "."
+    );
+    Assert.equal(parent.hierarchyDelimiter, ".");
+    Assert.equal(child.hierarchyDelimiter, ".");
+    Assert.equal(child.onlineName, "DeliveryParent.DeliveryChild");
+    Assert.equal(
+      child.msgDatabase.dBFolderInfo.getUint32Property("hierDelim", 0),
+      46
+    );
+    child.ForceDBClosed();
+    Assert.equal(
+      child.msgDatabase.dBFolderInfo.mailboxName,
+      "DeliveryParent.DeliveryChild"
+    );
   }
   info('DELIVERY_PHASE {"phase":"imap-discovery-delimiter-verified"}');
 }

@@ -2365,15 +2365,108 @@ NS_IMETHODIMP PerFolderDatabase::HdrIsInCache(
   return NS_OK;
 }
 
+// The existing announcer owns this listener, not the enumerator. A cursor can
+// therefore be dropped independently, while a retained cursor cannot keep its
+// cloned statement open after the folder database goes away.
+class MessageEnumeratorStatementCloser final : public nsIDBChangeListener,
+                                               public SupportsWeakPtr {
+ public:
+  NS_DECL_ISUPPORTS
+
+  MessageEnumeratorStatementCloser(PerFolderDatabase* owner,
+                                   mozIStorageStatement* stmt)
+      : mOwner(owner), mStmt(stmt) {}
+
+  nsresult Watch() {
+    return mOwner ? mOwner->AddListener(this) : NS_ERROR_NOT_AVAILABLE;
+  }
+
+  bool IsOpen() const { return !!mStmt; }
+
+  nsresult Close() {
+    RefPtr<MessageEnumeratorStatementCloser> self(this);
+    nsresult rv = NS_OK;
+    if (mStmt) {
+      rv = mStmt->Finalize();
+      mStmt = nullptr;
+    }
+    if (mOwner) {
+      RefPtr<PerFolderDatabase> owner = mOwner.get();
+      mOwner = nullptr;
+      owner->RemoveListener(this);
+    }
+    return rv;
+  }
+
+  NS_IMETHOD OnAnnouncerGoingAway(nsIDBChangeAnnouncer*) override {
+    return Close();
+  }
+  NS_IMETHOD OnHdrFlagsChanged(nsIMsgDBHdr*, uint32_t, uint32_t,
+                               nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrDeleted(nsIMsgDBHdr*, nsMsgKey, int32_t,
+                          nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrAdded(nsIMsgDBHdr*, nsMsgKey, int32_t,
+                        nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnParentChanged(nsMsgKey, nsMsgKey, nsMsgKey,
+                             nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnReadChanged(nsIDBChangeListener*) override { return NS_OK; }
+  NS_IMETHOD OnJunkScoreChanged(nsIDBChangeListener*) override { return NS_OK; }
+  NS_IMETHOD OnHdrPropertyChanged(nsIMsgDBHdr*, const nsACString&, bool,
+                                  uint32_t*, nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnEvent(nsIMsgDatabase*, const char*) override { return NS_OK; }
+
+ private:
+  ~MessageEnumeratorStatementCloser() {
+    // The owner's destruction also drops the listener without a callback.
+    if (mStmt) {
+      mStmt->Finalize();
+    }
+  }
+
+  WeakPtr<PerFolderDatabase> mOwner;
+  nsCOMPtr<mozIStorageStatement> mStmt;
+};
+
+NS_IMPL_ISUPPORTS(MessageEnumeratorStatementCloser, nsIDBChangeListener)
+
 MessageEnumerator::MessageEnumerator(PerFolderDatabase* owner,
                                      mozIStorageStatement* stmt)
     : mOwner(owner), mGeneration(owner->mEnumeratorGeneration), mStmt(stmt) {
+  RefPtr<MessageEnumeratorStatementCloser> closer =
+      new MessageEnumeratorStatementCloser(owner, stmt);
+  mStatus = closer->Watch();
+  if (NS_FAILED(mStatus)) {
+    closer->Close();
+    mStmt = nullptr;
+    return;
+  }
+  mStatementCloser = closer;
   Advance();
+}
+
+MessageEnumerator::~MessageEnumerator() { ReleaseStatement(); }
+
+nsresult MessageEnumerator::ReleaseStatement() {
+  nsresult rv = mStatementCloser ? mStatementCloser->Close() : NS_OK;
+  mStatementCloser = nullptr;
+  mStmt = nullptr;
+  return rv;
 }
 
 bool MessageEnumerator::CheckOwner() {
   if (mOwner && !mOwner->mForceClosed &&
-      mGeneration == mOwner->mEnumeratorGeneration) {
+      mGeneration == mOwner->mEnumeratorGeneration &&
+      (!mHasNext || (mStatementCloser && mStatementCloser->IsOpen()))) {
     if (NS_SUCCEEDED(mStatus)) {
       mStatus = mOwner->CheckEnumerationState(mGeneration);
     }
@@ -2382,7 +2475,10 @@ bool MessageEnumerator::CheckOwner() {
     }
   }
   mHasNext = false;
-  mStmt = nullptr;
+  nsresult rv = ReleaseStatement();
+  if (NS_SUCCEEDED(mStatus)) {
+    mStatus = rv;
+  }
   mOwner = nullptr;
   return false;
 }
@@ -2391,8 +2487,9 @@ void MessageEnumerator::Advance() {
   mHasNext = false;
   mStatus = mStmt->ExecuteStep(&mHasNext);
   if (!mHasNext) {
-    // Reset promptly for JS consumers, preserving the original step error.
-    nsresult rv = mStmt->Reset();
+    // A reset clone still prevents connection shutdown. Finish its ownership
+    // here, preserving the original step error over any finalization error.
+    nsresult rv = ReleaseStatement();
     if (NS_SUCCEEDED(mStatus)) {
       mStatus = rv;
     }

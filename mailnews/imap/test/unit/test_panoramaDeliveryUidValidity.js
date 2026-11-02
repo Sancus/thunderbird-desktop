@@ -408,8 +408,8 @@ add_task(async function test_commandKeysTranslateToScopedUids() {
   const server = makeServer(daemon, "RFC2195,RFC4315", {
     kUsername: "command-user",
   });
-  let account;
-  let incomingServer;
+  let account = null;
+  let incomingServer = null;
   registerCleanupFunction(() => {
     try {
       incomingServer?.QueryInterface(Ci.nsIImapServerSink).abortQueuedUrls();

@@ -49,6 +49,9 @@ nsresult nsQuarantinedOutputStream::InitTemp() {
 void nsQuarantinedOutputStream::EnterErrorState(nsresult status) {
   mState = eError;
   mError = status;
+  if (mTarget && !mTargetCopyStarted) {
+    mTargetUntouchedAndClosed = NS_SUCCEEDED(mTarget->Close());
+  }
   mTarget = nullptr;
 
   if (mTempStream) {
@@ -120,10 +123,10 @@ NS_IMETHODIMP nsQuarantinedOutputStream::Close() {
   if (mState == eError) {
     return mError;
   }
-  if (mState != eOpen) {
-    // Already closed or no data written. That's OK.
+  if (mState == eClosed) {
     return NS_OK;
   }
+  // An unwritten wrapper must close its target before a replacement can commit.
   nsresult rv = NS_OK;
   if (mTempStream) {
     rv = mTempStream->Close();
@@ -134,6 +137,7 @@ NS_IMETHODIMP nsQuarantinedOutputStream::Close() {
     mTempFile = nullptr;
   }
   nsresult targetStatus = mTarget->Close();
+  mTargetUntouchedAndClosed = !mTargetCopyStarted && NS_SUCCEEDED(targetStatus);
   mTarget = nullptr;
   if (NS_SUCCEEDED(rv)) rv = targetStatus;
   if (NS_FAILED(rv)) {
@@ -180,6 +184,7 @@ NS_IMETHODIMP nsQuarantinedOutputStream::Finish() {
       EnterErrorState(rv);
       return rv;
     }
+    mTargetCopyStarted = true;
     rv = copyStreamSafely(ins, mTarget);
     if (NS_FAILED(rv)) {
       EnterErrorState(rv);

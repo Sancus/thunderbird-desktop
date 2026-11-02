@@ -35,12 +35,16 @@ class nsQuarantinedOutputStream : public nsIOutputStream, nsISafeOutputStream {
   NS_DECL_NSISAFEOUTPUTSTREAM
 
   /**
-   * Pass the target output stream in during construction. Upon Close(),
-   * the written data will be copied here.
+   * Finish() copies the quarantined data to this target. Close() discards
+   * the quarantined data and closes the target, including before any writes.
    */
   explicit nsQuarantinedOutputStream(nsIOutputStream* target)
       : mTarget(target) {}
   nsQuarantinedOutputStream() = delete;
+
+  // Failure cleanup may release provider admission only after an untouched
+  // target was successfully closed. A started copy remains uncertain.
+  bool IsTargetUntouchedAndClosed() const { return mTargetUntouchedAndClosed; }
 
  protected:
   virtual ~nsQuarantinedOutputStream();
@@ -65,6 +69,8 @@ class nsQuarantinedOutputStream : public nsIOutputStream, nsISafeOutputStream {
     eError           // An error has occurred (stored in mError).
   } mState{eUninitialized};
   nsresult mError{NS_OK};
+  bool mTargetCopyStarted{false};
+  bool mTargetUntouchedAndClosed{false};
 };
 
 #endif  // COMM_MAILNEWS_BASE_SRC_NSQUARANTINEDOUTPUTSTREAM_H_

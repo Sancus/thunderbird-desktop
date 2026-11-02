@@ -16,7 +16,10 @@ class FinishFailureTarget final : public nsIOutputStream,
  public:
   NS_DECL_THREADSAFE_ISUPPORTS
 
-  NS_IMETHOD Close() override { return NS_OK; }
+  NS_IMETHOD Close() override {
+    ++closeCalls;
+    return closeResult;
+  }
   NS_IMETHOD Flush() override { return NS_OK; }
   NS_IMETHOD Write(const char* data, uint32_t count,
                    uint32_t* written) override {
@@ -43,6 +46,8 @@ class FinishFailureTarget final : public nsIOutputStream,
 
   nsCString bytes;
   uint32_t finishCalls{0};
+  uint32_t closeCalls{0};
+  nsresult closeResult{NS_OK};
 
  private:
   ~FinishFailureTarget() = default;
@@ -199,6 +204,57 @@ TEST(QuarantinedOutputStream, RetainsAppendFailureWhenTruncateFails)
 TEST(QuarantinedOutputStream, RejectsZeroProgressAppend)
 {
   CheckAppendFailure(NS_OK, NS_OK, true);
+}
+
+// Close the wrapper's real temporary stream at the actual pre-copy boundary.
+class ClosedTemporaryStream final : public nsQuarantinedOutputStream {
+ public:
+  explicit ClosedTemporaryStream(nsIOutputStream* target)
+      : nsQuarantinedOutputStream(target) {}
+  nsresult CloseTemporaryStream() { return mTempStream->Close(); }
+  nsresult TemporaryFlushStatus() { return mTempStream->Flush(); }
+
+ private:
+  ~ClosedTemporaryStream() = default;
+};
+
+TEST(QuarantinedOutputStream, RetainsPreCopyFailureAfterTargetClose)
+{
+  RefPtr<FinishFailureTarget> target = new FinishFailureTarget();
+  RefPtr<ClosedTemporaryStream> stream = new ClosedTemporaryStream(target);
+  const nsCString data("Subject: failed temp flush\r\n\r\nExact body.\r\n"_ns);
+  uint32_t written = 0;
+  ASSERT_EQ(NS_OK, stream->Write(data.get(), data.Length(), &written));
+  ASSERT_EQ(data.Length(), written);
+  ASSERT_EQ(NS_OK, stream->CloseTemporaryStream());
+  const nsresult original = stream->TemporaryFlushStatus();
+  ASSERT_TRUE(NS_FAILED(original));
+  ASSERT_EQ(original, stream->Finish());
+  EXPECT_TRUE(stream->IsTargetUntouchedAndClosed());
+  EXPECT_TRUE(target->bytes.IsEmpty());
+  EXPECT_EQ(0u, target->finishCalls);
+  EXPECT_EQ(1u, target->closeCalls);
+  EXPECT_EQ(original, stream->Close());
+  EXPECT_EQ(original, stream->Finish());
+  EXPECT_EQ(original, stream->StreamStatus());
+  EXPECT_EQ(1u, target->closeCalls);
+}
+
+TEST(QuarantinedOutputStream, RetainsUnwrittenTargetCloseFailure)
+{
+  RefPtr<FinishFailureTarget> target = new FinishFailureTarget();
+  target->closeResult = NS_ERROR_FILE_ACCESS_DENIED;
+  RefPtr<nsQuarantinedOutputStream> stream =
+      new nsQuarantinedOutputStream(target);
+  ASSERT_EQ(NS_ERROR_FILE_ACCESS_DENIED, stream->Close());
+  EXPECT_FALSE(stream->IsTargetUntouchedAndClosed());
+  EXPECT_TRUE(target->bytes.IsEmpty());
+  EXPECT_EQ(0u, target->finishCalls);
+  EXPECT_EQ(1u, target->closeCalls);
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, stream->Finish());
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, stream->StreamStatus());
+  EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED, stream->Close());
+  EXPECT_EQ(1u, target->closeCalls);
 }
 
 }  // namespace

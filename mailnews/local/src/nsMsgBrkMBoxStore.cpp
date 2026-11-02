@@ -868,7 +868,12 @@ nsMsgBrkMBoxStore::FinishNewMessage(nsIMsgFolder* folder,
         gMboxLog, LogLevel::Error,
         ("QUARANTINE MSG failed before Finish stream=0x%p folder=%s rv=0x%x",
          outStream, folder->URI().get(), static_cast<uint32_t>(status)));
-    mOngoingWrites.remove(details);
+    if (static_cast<nsQuarantinedOutputStream*>(outStream)
+            ->IsTargetUntouchedAndClosed()) {
+      mOngoingWrites.remove(details);
+    } else {
+      details->value().status = status;
+    }
     return status;
   }
 
@@ -879,7 +884,13 @@ nsMsgBrkMBoxStore::FinishNewMessage(nsIMsgFolder* folder,
   // Commit the write.
   nsresult rv = safe->Finish();
   if (NS_FAILED(rv)) {
-    details->value().status = rv;
+    if (details->value().quarantined &&
+        static_cast<nsQuarantinedOutputStream*>(outStream)
+            ->IsTargetUntouchedAndClosed()) {
+      mOngoingWrites.remove(details);
+    } else {
+      details->value().status = rv;
+    }
     return rv;
   }
 
@@ -912,12 +923,15 @@ nsMsgBrkMBoxStore::DiscardNewMessage(nsIMsgFolder* folder,
       return details->value().status;
     }
     nsresult rv = outStream->Close();
-    if (NS_FAILED(rv) && !details->value().quarantined) {
+    if (NS_FAILED(rv) && (!details->value().quarantined ||
+                          !static_cast<nsQuarantinedOutputStream*>(outStream)
+                               ->IsTargetUntouchedAndClosed())) {
       details->value().status = rv;
       return rv;
     }
     if (NS_FAILED(rv)) {
-      // Close reports the old temporary-file error; the target was untouched.
+      // Keep the temporary-file error on its stream. The target is confirmed
+      // untouched and closed, so this provider admission can be released.
       MOZ_LOG(gMboxLog, LogLevel::Error,
               ("DISCARD QUARANTINE MSG stream=0x%p folder=%s rv=0x%x",
                outStream, folder->URI().get(), static_cast<uint32_t>(rv)));

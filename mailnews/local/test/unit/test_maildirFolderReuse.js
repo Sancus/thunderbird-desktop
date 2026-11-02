@@ -2097,3 +2097,174 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     // the shared core, delete a row, or fabricate successful restoration.
   });
 }
+
+/**
+ * Run a real native mbox operation with quarantine enabled and restore its pref.
+ *
+ * @param {Function} run - Receives the real folder and its provider.
+ * @returns {Promise<void>} Completes the operation and restores the account.
+ */
+async function withQuarantinedMbox(run) {
+  const pref = "mailnews.downloadToTempFile";
+  const hadPref = Services.prefs.prefHasUserValue(pref);
+  const oldPref = Services.prefs.getBoolPref(pref, false);
+  Services.prefs.setBoolPref(pref, true);
+  try {
+    await withTrashStore("mbox", async (root, folder, core) => {
+      Assert.ok(core, "The native backend supplies the real provider fixture");
+      Assert.equal(folder.msgStore.storeType, "mbox");
+      await run(folder, folder.msgStore);
+    });
+  } finally {
+    if (hadPref) {
+      Services.prefs.setBoolPref(pref, oldPref);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+}
+
+/**
+ * Preserve a pre-Finish error and both exact bodies through a later valid write.
+ *
+ * @param {string} cleanup - Discard, preempt, or reject Finish on the failed write.
+ * @returns {Promise<void>} Checks real native provider failure and reuse.
+ */
+async function checkNativeQuarantineTempFailure(cleanup) {
+  await withQuarantinedMbox(async (folder, store) => {
+    const original =
+      "From: writer@example.invalid\r\nSubject: Original before failure\r\n\r\nExact original body.\r\n";
+    const originalStream = store.getNewMsgOutputStream(folder);
+    Assert.equal(
+      originalStream.write(original, original.length),
+      original.length
+    );
+    const originalToken = store.finishNewMessage(folder, originalStream);
+    const originalFile = await IOUtils.read(folder.filePath.path);
+    const failed = store.getNewMsgOutputStream(folder);
+    const badTemp = do_get_profile().clone();
+    badTemp.append(`native-quarantine-${cleanup}-not-directory`);
+    try {
+      await IOUtils.writeUTF8(
+        badTemp.path,
+        "A file cannot contain temporary files."
+      );
+      const originalTemp = Services.dirsvc.get("TmpD", Ci.nsIFile);
+      let writeError;
+      Services.dirsvc.undefine("TmpD");
+      try {
+        Services.dirsvc.set("TmpD", badTemp);
+        try {
+          const rejected = "Rejected quarantine bytes.";
+          failed.write(rejected, rejected.length);
+        } catch (error) {
+          writeError = error;
+        }
+      } finally {
+        if (Services.dirsvc.has("TmpD")) {
+          Services.dirsvc.undefine("TmpD");
+        }
+        Services.dirsvc.set("TmpD", originalTemp);
+      }
+      Assert.ok(writeError, "The real temporary-file operation failed");
+      Assert.notEqual(writeError.result, Cr.NS_BASE_STREAM_CLOSED);
+      Assert.throws(
+        () => failed.streamStatus(),
+        error => error.result === writeError.result
+      );
+      if (cleanup === "discard") {
+        store.discardNewMessage(folder, failed);
+      } else if (cleanup === "finish") {
+        Assert.throws(
+          () => store.finishNewMessage(folder, failed),
+          error => error.result === writeError.result
+        );
+      }
+      const next = store.getNewMsgOutputStream(folder);
+      Assert.deepEqual(await IOUtils.read(folder.filePath.path), originalFile);
+      const replacement =
+        "From: writer@example.invalid\r\nSubject: Next valid write\r\n\r\nExact replacement body.\r\n";
+      Assert.equal(
+        next.write(replacement, replacement.length),
+        replacement.length
+      );
+      const replacementToken = store.finishNewMessage(folder, next);
+      Assert.throws(
+        () => failed.close(),
+        error => error.result === writeError.result
+      );
+      Assert.throws(
+        () => failed.QueryInterface(Ci.nsISafeOutputStream).finish(),
+        error => error.result === writeError.result
+      );
+      Assert.equal(
+        hierarchyInputBytes(store.getMsgInputStream(folder, originalToken, 0)),
+        original
+      );
+      Assert.equal(
+        hierarchyInputBytes(
+          store.getMsgInputStream(folder, replacementToken, 0)
+        ),
+        replacement
+      );
+      const scan = new PromiseTestUtils.PromiseStoreScanListener();
+      store.asyncScan(folder, scan);
+      await scan.promise;
+      Assert.deepEqual(scan.messages, [original, replacement]);
+    } finally {
+      await IOUtils.remove(badTemp.path, { ignoreAbsent: true });
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_nativeQuarantineTempFailureDiscard() {
+    await checkNativeQuarantineTempFailure("discard");
+  });
+  add_task(async function test_nativeQuarantineTempFailurePreemption() {
+    await checkNativeQuarantineTempFailure("preempt");
+  });
+  add_task(async function test_nativeQuarantineTempFailureFinish() {
+    await checkNativeQuarantineTempFailure("finish");
+  });
+  add_task(async function test_nativeQuarantineUnwrittenPreemption() {
+    await withQuarantinedMbox(async (folder, store) => {
+      const original =
+        "From: writer@example.invalid\r\nSubject: Original before preemption\r\n\r\nOriginal body.\r\n";
+      const first = store.getNewMsgOutputStream(folder);
+      Assert.equal(first.write(original, original.length), original.length);
+      const originalToken = store.finishNewMessage(folder, first);
+      let stale = store.getNewMsgOutputStream(folder);
+      const weak = Cu.getWeakReference(stale);
+      const next = store.getNewMsgOutputStream(folder);
+      const replacement =
+        "From: writer@example.invalid\r\nSubject: Surviving replacement\r\n\r\nExact replacement body.\r\n";
+      Assert.equal(
+        next.write(replacement, replacement.length),
+        replacement.length
+      );
+      const replacementToken = store.finishNewMessage(folder, next);
+      const committed = await IOUtils.read(folder.filePath.path);
+      stale = null;
+      Cu.forceGC();
+      Cu.forceCC();
+      Cu.forceGC();
+      Assert.equal(weak.get(), null, "The preempted wrapper has been released");
+      Assert.deepEqual(await IOUtils.read(folder.filePath.path), committed);
+      Assert.equal(
+        hierarchyInputBytes(store.getMsgInputStream(folder, originalToken, 0)),
+        original
+      );
+      Assert.equal(
+        hierarchyInputBytes(
+          store.getMsgInputStream(folder, replacementToken, 0)
+        ),
+        replacement
+      );
+      const scan = new PromiseTestUtils.PromiseStoreScanListener();
+      store.asyncScan(folder, scan);
+      await scan.promise;
+      Assert.deepEqual(scan.messages, [original, replacement]);
+    });
+  });
+}

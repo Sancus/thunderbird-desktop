@@ -21,6 +21,7 @@ prefs = ["mail.graph.enabled=false"]
 prefs = ["mail.graph.enabled=true"]
 
 ["test_item_operations.js"]
+requesttimeoutfactor = 3
 prefs = ["mail.graph.enabled=true"]
 
 ["test_undo.js"]

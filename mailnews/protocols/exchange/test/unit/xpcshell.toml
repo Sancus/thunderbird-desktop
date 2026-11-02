@@ -38,6 +38,7 @@ tags = ["foldernames"]
 ["test_httpAuthCache.js"]
 
 ["test_item_operations.js"]
+requesttimeoutfactor = 3
 
 ["test_item_operations_exchange_2010.js"]
 

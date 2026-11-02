@@ -370,7 +370,11 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
       const previous = mappedFolder.msgDatabase;
       core.QueryInterface(Ci.nsIMsgDBService).forceFolderDBClosed(mappedFolder);
       const reopened = mappedFolder.msgDatabase;
-      Assert.notStrictEqual(reopened, previous, "The folder facade is reopened");
+      Assert.notStrictEqual(
+        reopened,
+        previous,
+        "The folder facade is reopened"
+      );
       Assert.equal(reopened.dBFolderInfo.imapUidValidity, epoch);
       const header = reopened.getMsgHdrForKey(key);
       Assert.ok(header, "The persisted physical key resolves after reopen");

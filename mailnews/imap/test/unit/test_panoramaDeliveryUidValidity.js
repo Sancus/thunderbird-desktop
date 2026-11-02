@@ -42,6 +42,17 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
     "Before reset, removed UID",
     "This message disappears with the old epoch."
   );
+  const otherMailbox = daemon.createMailbox("DeliveryEpochOther", {
+    subscribed: true,
+    uidvalidity: 7101,
+  });
+  addEpochMessage(
+    otherMailbox,
+    5001,
+    "other-folder-same-uid@example.invalid",
+    "Another folder, same UID",
+    "The same wire UID names another physical message in this folder."
+  );
   Assert.deepEqual(
     oldMailbox._messages.map(message => message.uid),
     [5001, 5011],
@@ -85,6 +96,20 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
     );
   }
   folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+  const otherFolder = rootFolder
+    .getChildNamed("DeliveryEpochOther")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  PanoramaDelivery.assertFolder(otherFolder, lane);
+  otherFolder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+  await updateEpochFolder(otherFolder);
+  const otherHeader = otherFolder.msgDatabase.getMsgHdrForMessageID(
+    "other-folder-same-uid@example.invalid"
+  );
+  Assert.ok(otherHeader, "The other folder supplies its real parsed header");
+  Assert.equal(otherHeader.folder, otherFolder);
+  const otherKey = otherHeader.messageKey;
+  Assert.equal(otherFolder.msgDatabase.dBFolderInfo.imapUidValidity, 7101);
+  Assert.equal(otherFolder.getTotalMessages(false), 1);
   info('DELIVERY_PHASE {"phase":"imap-discovery-verified"}');
 
   await updateEpochFolder(folder);
@@ -132,6 +157,16 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
   Assert.ok(removedHeader, "The old-only UID initially has its header");
   const oldKey = oldHeader.messageKey;
   const removedKey = removedHeader.messageKey;
+  if (lane.backend == "panorama") {
+    Assert.equal(oldHeader.getUint32Property("uidOnServer"), 5001);
+    Assert.equal(removedHeader.getUint32Property("uidOnServer"), 5011);
+    Assert.equal(otherHeader.getUint32Property("uidOnServer"), 5001);
+    Assert.notEqual(
+      oldKey,
+      otherKey,
+      "The same UID and epoch in different folders have distinct physical keys"
+    );
+  }
   Assert.notEqual(
     oldKey,
     removedKey,
@@ -269,6 +304,12 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
       !folder.msgDatabase.containsKey(oldKey),
       "The reused UID's old global key no longer names a live folder message"
     );
+    Assert.equal(newHeader.getUint32Property("uidOnServer"), 5001);
+    Assert.notEqual(
+      newKey,
+      otherKey,
+      "The replacement epoch does not reuse the other folder's physical key"
+    );
     const globalHeader = core.messageDB.getMessage(newKey);
     Assert.ok(globalHeader, "The new global key resolves to a message");
     Assert.equal(globalHeader.messageId, "new-epoch-reused@example.invalid");
@@ -321,6 +362,38 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
     "Synchronization preserves the actual new epoch UID set"
   );
   Assert.equal(newMailbox.uidvalidity, 7202);
+  if (lane.backend == "panorama") {
+    for (const [mappedFolder, key, messageId, epoch] of [
+      [folder, newKey, "new-epoch-reused@example.invalid", 7202],
+      [otherFolder, otherKey, "other-folder-same-uid@example.invalid", 7101],
+    ]) {
+      const previous = mappedFolder.msgDatabase;
+      core.QueryInterface(Ci.nsIMsgDBService).forceFolderDBClosed(mappedFolder);
+      const reopened = mappedFolder.msgDatabase;
+      Assert.notStrictEqual(reopened, previous, "The folder facade is reopened");
+      Assert.equal(reopened.dBFolderInfo.imapUidValidity, epoch);
+      const header = reopened.getMsgHdrForKey(key);
+      Assert.ok(header, "The persisted physical key resolves after reopen");
+      Assert.equal(header.messageId, messageId);
+      Assert.equal(header.messageKey, key);
+      Assert.equal(header.folder, mappedFolder);
+      Assert.equal(header.getUint32Property("uidOnServer"), 5001);
+      Assert.equal(
+        reopened.getMsgHdrForMessageID(messageId).messageKey,
+        key,
+        "Public Message-ID lookup preserves the exact physical association"
+      );
+      const globalHeader = core.messageDB.getMessage(key);
+      Assert.equal(globalHeader.folder, mappedFolder);
+      Assert.equal(globalHeader.messageId, messageId);
+      Assert.equal(globalHeader.getUint32Property("uidOnServer"), 5001);
+      Assert.deepEqual(
+        Array.from(mappedFolder.messages, item => item.messageKey),
+        [key],
+        "Reopened membership contains only the expected physical message"
+      );
+    }
+  }
   info('DELIVERY_PHASE {"phase":"uidvalidity-reset-verified"}');
 });
 

@@ -917,9 +917,7 @@ nsMsgMaildirStore::FinishNewMessage(nsIMsgFolder* folder,
     rv = destPath->Exists(&exists);
     if (NS_FAILED(rv)) return fail(rv);
     if (!exists) {
-      rv = fail(NS_ERROR_FILE_NOT_FOUND);
-      NS_ERROR("FinishNewMessage - oops! file does not exist!");
-      return rv;
+      return fail(NS_ERROR_FILE_NOT_FOUND);
     }
   } else {
     // A failed rename may still have settled bytes in cur. Keep its identity.

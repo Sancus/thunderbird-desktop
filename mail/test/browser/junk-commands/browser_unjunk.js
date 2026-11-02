@@ -91,20 +91,10 @@ add_setup(async function () {
   about3Pane.folderPane.activeModes = ["all", "smart"];
   smartJunk = SmartMailboxUtils.getSmartMailbox().getSmartFolder("Junk");
 
-  registerCleanupFunction(async function () {
-    about3Pane.displayFolder(rootFolder);
-    await TestUtils.waitForCondition(
-      () => !about3Pane.gDBView,
-      "The message view is closed before removing its folders"
-    );
+  registerCleanupFunction(function () {
     inbox.deleteSelf(null);
     junk.deleteSelf(null);
     MailServices.accounts.removeAccount(otherAccount, false);
-    inbox = null;
-    junk = null;
-    otherInbox = null;
-    otherJunk = null;
-    smartJunk = null;
   });
 });
 

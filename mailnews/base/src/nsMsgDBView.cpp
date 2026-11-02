@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include "MailNewsTypes2.h"
+#include "mozilla/ClearOnShutdown.h"
 #include "mozilla/Components.h"
 #include "mozilla/dom/DataTransfer.h"
 #include "mozilla/intl/AppCollator.h"
@@ -160,6 +161,9 @@ void nsMsgDBView::InitializeLiterals() {
                             mozilla::StaticAutoPtr<nsString>& literal) {
     nsAutoString value;
     GetString(l10n, id, value);
+    if (!literal) {
+      mozilla::ClearOnShutdown(&literal);
+    }
     literal = new nsString(value);
   };
 

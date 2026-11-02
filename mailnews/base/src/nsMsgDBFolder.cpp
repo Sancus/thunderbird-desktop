@@ -56,6 +56,7 @@
 #include "nsIURIMutator.h"
 #include "nsIXULAppInfo.h"
 #include "mozilla/CheckedInt.h"
+#include "mozilla/ClearOnShutdown.h"
 #include "mozilla/Components.h"
 #include "mozilla/dom/Promise.h"
 #include "mozilla/intl/Localization.h"
@@ -2629,6 +2630,22 @@ nsresult nsMsgDBFolder::PerformBiffNotifications(void) {
 }
 
 nsresult nsMsgDBFolder::initializeStrings() {
+  static bool shutdownRegistered = false;
+  if (!shutdownRegistered) {
+    RunOnShutdown([] {
+      kLocalizedInboxName.Truncate();
+      kLocalizedTrashName.Truncate();
+      kLocalizedSentName.Truncate();
+      kLocalizedDraftsName.Truncate();
+      kLocalizedTemplatesName.Truncate();
+      kLocalizedUnsentName.Truncate();
+      kLocalizedJunkName.Truncate();
+      kLocalizedAllMailName.Truncate();
+      kLocalizedArchivesName.Truncate();
+      kLocalizedBrandShortName.Truncate();
+    });
+    shutdownRegistered = true;
+  }
   nsresult rv;
   nsCOMPtr<nsIStringBundleService> bundleService =
       mozilla::components::StringBundle::Service();

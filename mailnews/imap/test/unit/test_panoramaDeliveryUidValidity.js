@@ -405,7 +405,9 @@ let commandFixture;
 
 add_task(async function test_commandKeysTranslateToScopedUids() {
   const daemon = new ImapDaemon();
-  const server = makeServer(daemon, "RFC2195,RFC4315");
+  const server = makeServer(daemon, "RFC2195,RFC4315", {
+    kUsername: "command-user",
+  });
   let account;
   let incomingServer;
   registerCleanupFunction(() => {
@@ -421,7 +423,7 @@ add_task(async function test_commandKeysTranslateToScopedUids() {
   });
   account = MailServices.accounts.createAccount();
   incomingServer = MailServices.accounts
-    .createIncomingServer("user", "localhost", "imap")
+    .createIncomingServer("command-user", "localhost", "imap")
     .QueryInterface(Ci.nsIImapIncomingServer);
   account.incomingServer = incomingServer;
   const identity = MailServices.accounts.createIdentity();

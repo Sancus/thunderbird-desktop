@@ -38,10 +38,12 @@ class nsImapFolderRelocation;
 #ifdef MOZ_PANORAMA
 struct NativeQueuedAppendTarget;
 struct NativeOfflineCopyEntry;
+struct NativeFilterHeader;
 #  include "MessageDatabase.h"
 namespace mozilla::mailnews {
 struct FinishedMessageBody;
-}
+class ParsedServerHdr;
+}  // namespace mozilla::mailnews
 #endif
 
 #define COPY_BUFFER_SIZE 16384
@@ -443,6 +445,16 @@ class nsImapMailFolder : public nsMsgDBFolder,
                                       nsIImapUrl* imapUrl);
 
   void EndOfflineDownload();
+#ifdef MOZ_PANORAMA
+  nsresult ValidateFilterBodySource(
+      const mozilla::mailnews::ServerMessageLocation& source,
+      nsIMsgDBHdr* header);
+  nsresult FilterHeaderLocation(
+      mozilla::mailnews::ServerMessageLocation& location);
+  nsresult StartParsedFilterActions();
+  nsresult StoreFilterFlags(int32_t flags, bool add, nsMsgKey key);
+  void ClearParsedFilterHeader();
+#endif
 
   /**
    * At the end of a file-to-folder copy operation, copy the file to the
@@ -565,6 +577,15 @@ class nsImapMailFolder : public nsMsgDBFolder,
   nsTArray<nsMsgKey> mSpamKeysToMove;
   /// the junk destination folder
   nsCOMPtr<nsIMsgFolder> mSpamFolder;
+#ifdef MOZ_PANORAMA
+  mozilla::UniquePtr<NativeFilterHeader> m_filterHeader;
+  nsTArray<RefPtr<mozilla::mailnews::ParsedServerHdr>> m_failedFilterHeaders;
+  bool m_filterHeaderParsing = false;
+  mozilla::Maybe<mozilla::mailnews::ServerMessageLocation> m_filterBodySource;
+  nsCOMPtr<nsIMsgDatabase> m_filterBodyDatabase;
+  nsCOMPtr<nsIMsgDBHdr> m_filterBodyHeader;
+  bool m_filterBodyFinishing = false;
+#endif
   ImapUid m_curMsgUid;
   ImapUid m_previousHighestUid;
   ImapUid m_uidValidity;

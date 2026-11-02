@@ -807,9 +807,14 @@ class MessageDatabase : public nsIMessageDatabase {
   struct QueuedMessageBatch;
   nsresult PrepareMessageBatch(UniquePtr<QueuedMessageBatch>& output);
   nsresult CaptureThreadViewsBeforeInsert(QueuedMessageBatch& batch);
+  // Consume a staged action only after the final published thread is known,
+  // before any prepared delivery can observe its thread state.
+  nsresult ConsumeProtoThreadFlagsInTransaction(nsMsgKey key, uint64_t folderId,
+                                                nsMsgKey threadId);
   nsresult PrepareConversationBatch(nsMsgKey key, bool notifyLegacy,
                                     QueuedMessageBatch& notification,
-                                    MessageThreadBatch& captured);
+                                    MessageThreadBatch& captured,
+                                    bool consumeProtoThreadFlags = false);
   struct ThreadWordRemap {
     uint64_t folderId{0};
     nsMsgKey threadId{0};

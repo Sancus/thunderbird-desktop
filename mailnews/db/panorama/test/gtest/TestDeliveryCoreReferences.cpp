@@ -4193,6 +4193,379 @@ TEST_F(DeliveryCoreReferences, PublicationFailureRetainsStagingAndOutput) {
   EXPECT_TRUE(exists);
 }
 
+TEST_F(DeliveryCoreReferences, StagedThreadActionIsCompleteAtFirstCallback) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  const uint32_t words[] = {
+      nsMsgMessageFlags::Ignored, nsMsgMessageFlags::Watched,
+      uint32_t(nsMsgMessageFlags::Ignored | nsMsgMessageFlags::Watched) |
+          0x80000000u};
+  for (uint32_t word : words) {
+    SCOPED_TRACE(word);
+    RawHdr raw;
+    raw.messageId = "proto-first-"_ns;
+    raw.messageId.AppendInt(int64_t(word));
+    raw.flags = nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked;
+    nsMsgKey key;
+    RefPtr<Message> staged;
+    ASSERT_EQ(NS_OK,
+              db.StageMessage(mFolderId, raw, &key, getter_AddRefs(staged)));
+    ASSERT_EQ(NS_OK, staged->SetUint32Property("ProtoThreadFlags", word));
+    Message* output = nullptr;
+    uint32_t callbacks = 0;
+    RefPtr<PublicationObserver> observer =
+        new PublicationObserver([&](Message* message, bool notifyLegacy) {
+          ++callbacks;
+          EXPECT_TRUE(notifyLegacy);
+          EXPECT_EQ(message, output);
+          nsMsgKey thread;
+          ASSERT_EQ(NS_OK, message->GetThreadId(&thread));
+          uint32_t flags;
+          ASSERT_EQ(NS_OK, db.GetThreadFlags(mFolderId, thread, flags));
+          EXPECT_EQ(word, flags);
+          ASSERT_EQ(NS_OK, message->GetFlags(&flags));
+          EXPECT_EQ(raw.flags, flags);
+          ASSERT_EQ(NS_OK,
+                    message->GetUint32Property("ProtoThreadFlags", &flags));
+          EXPECT_EQ(0u, flags);
+          nsCOMPtr<mozIStorageConnection> reader;
+          ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+          auto close =
+              MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+          nsCString text;
+          ASSERT_EQ(
+              NS_OK,
+              PublicationCell(
+                  reader, key,
+                  "SELECT flags FROM thread_flags WHERE "
+                  "folderId=(SELECT folderId FROM messages WHERE id=:id) "
+                  "AND threadId=(SELECT threadId FROM messages WHERE id=:id)"_ns,
+                  text));
+          nsAutoCString expected;
+          expected.AppendInt(int64_t(word));
+          EXPECT_EQ(expected, text);
+          ASSERT_EQ(NS_OK,
+                    PublicationCell(
+                        reader, key,
+                        "SELECT count(*) FROM staged_messages WHERE id=:id"_ns,
+                        text));
+          EXPECT_EQ("0"_ns, text);
+          ASSERT_EQ(NS_OK, PublicationCell(
+                               reader, key,
+                               "SELECT value FROM message_properties WHERE "
+                               "id=:id AND name='ProtoThreadFlags'"_ns,
+                               text));
+          EXPECT_EQ("0"_ns, text);
+        });
+    db.AddMessageListener(observer);
+    auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    ASSERT_EQ(NS_OK, db.PublishMessage(key, true, &output));
+    RefPtr<Message> owned = dont_AddRef(output);
+    EXPECT_EQ(1u, callbacks);
+    EXPECT_EQ(0u, observer->mChanges);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.PublishMessage(key, true, &output));
+    EXPECT_EQ(owned.get(), output);
+    EXPECT_EQ(1u, callbacks);
+  }
+}
+
+TEST_F(DeliveryCoreReferences, StagedThreadActionUsesFinalScopedThread) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey root, thread, foreign;
+  ASSERT_EQ(NS_OK, Add("proto-final-root@invalid"_ns, {}, root));
+  ASSERT_EQ(NS_OK, db.GetMessageThreadId(root, thread));
+  uint64_t otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, "ProtoOther"_ns,
+                                                  &otherFolder));
+  RawHdr other;
+  other.messageId = "proto-foreign@invalid"_ns;
+  other.references = {"proto-final-root@invalid"_ns};
+  ASSERT_EQ(NS_OK, db.AddMessage(otherFolder, other, true, &foreign));
+  const uint32_t oldWord = 0x80000000u | nsMsgMessageFlags::Marked;
+  const uint32_t foreignWord = 0x40000000u;
+  ASSERT_EQ(NS_OK, db.SetThreadFlags(mFolderId, thread, oldWord));
+  ASSERT_EQ(NS_OK, db.SetThreadFlags(otherFolder, thread, foreignWord));
+  RawHdr raw;
+  raw.messageId = "proto-final-child@invalid"_ns;
+  raw.references = {"proto-final-root@invalid"_ns};
+  raw.extras = {{"literal"_ns, "00042"_ns}};
+  nsMsgKey key;
+  RefPtr<Message> staged;
+  ASSERT_EQ(NS_OK,
+            db.StageMessage(mFolderId, raw, &key, getter_AddRefs(staged)));
+  nsMsgKey stagedThread;
+  ASSERT_EQ(NS_OK, staged->GetThreadId(&stagedThread));
+  EXPECT_EQ(key, stagedThread);
+  EXPECT_NE(thread, stagedThread);
+  const uint32_t pending =
+      nsMsgMessageFlags::Ignored | nsMsgMessageFlags::Watched;
+  ASSERT_EQ(NS_OK, staged->SetUint32Property("ProtoThreadFlags", pending));
+  ASSERT_EQ(NS_OK, db.PublishMessage(key, true));
+  nsMsgKey actual;
+  ASSERT_EQ(NS_OK, db.GetMessageThreadId(key, actual));
+  EXPECT_EQ(thread, actual);
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, db.GetThreadFlags(mFolderId, thread, flags));
+  EXPECT_EQ(oldWord | pending, flags);
+  ASSERT_EQ(NS_OK, db.GetThreadFlags(otherFolder, thread, flags));
+  EXPECT_EQ(foreignWord, flags);
+  nsCString consumed, literal;
+  ASSERT_EQ(NS_OK, staged->GetStringProperty("ProtoThreadFlags", consumed));
+  EXPECT_EQ("0"_ns, consumed);
+  ASSERT_EQ(NS_OK, staged->GetStringProperty("literal", literal));
+  EXPECT_EQ("00042"_ns, literal);
+
+  // Carry the consumed property into a new unrelated staged header: the action
+  // must not run again merely because its metadata was copied.
+  RawHdr copied;
+  copied.messageId = "proto-consumed-copy@invalid"_ns;
+  copied.extras = {{"ProtoThreadFlags"_ns, consumed}};
+  nsMsgKey copyKey;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, copied, &copyKey));
+  ASSERT_EQ(NS_OK, db.PublishMessage(copyKey, true));
+  ASSERT_EQ(NS_OK, db.GetMessageThreadId(copyKey, actual));
+  ASSERT_EQ(NS_OK, db.GetThreadFlags(mFolderId, actual, flags));
+  EXPECT_EQ(0u, flags);
+}
+
+TEST_F(DeliveryCoreReferences,
+       StagedThreadActionPreservesAbsentAndZeroProperties) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  for (uint32_t mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    RawHdr raw;
+    raw.messageId = "proto-no-action-"_ns;
+    raw.messageId.AppendInt(mode);
+    raw.extras = {{"ProtoThreadFlags-other"_ns, "literal"_ns}};
+    nsCString expected(mode == 1 ? ""_ns : "00000000"_ns);
+    if (mode)
+      raw.extras.AppendElement(RawHdr::kv{"ProtoThreadFlags"_ns, expected});
+    nsMsgKey key;
+    RefPtr<Message> header;
+    ASSERT_EQ(NS_OK,
+              db.StageMessage(mFolderId, raw, &key, getter_AddRefs(header)));
+    ASSERT_EQ(NS_OK, db.PublishMessage(key, true));
+    nsCString text;
+    ASSERT_EQ(NS_OK,
+              PublicationCell(mConnection, key,
+                              "SELECT count(*) FROM message_properties "
+                              "WHERE id=:id AND name='ProtoThreadFlags'"_ns,
+                              text));
+    EXPECT_EQ(mode ? "1"_ns : "0"_ns, text);
+    if (mode) {
+      ASSERT_EQ(NS_OK, header->GetStringProperty("ProtoThreadFlags", text));
+      EXPECT_EQ(expected, text);
+    }
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            mConnection, key,
+            "SELECT count(*) FROM thread_flags WHERE "
+            "folderId=(SELECT folderId FROM messages WHERE id=:id) "
+            "AND threadId=(SELECT threadId FROM messages WHERE id=:id)"_ns,
+            text));
+    EXPECT_EQ("0"_ns, text);
+    ASSERT_EQ(NS_OK, header->GetStringProperty("ProtoThreadFlags-other", text));
+    EXPECT_EQ("literal"_ns, text);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       StagedThreadActionFailuresRetainPublicationAndRetry) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey root, thread;
+  ASSERT_EQ(NS_OK, Add("proto-retry-root@invalid"_ns, {}, root));
+  ASSERT_EQ(NS_OK, db.GetMessageThreadId(root, thread));
+  for (uint32_t mode = 0; mode < 4; ++mode) {
+    SCOPED_TRACE(mode);
+    const uint32_t oldWord = 0x80000000u;
+    ASSERT_EQ(NS_OK, db.SetThreadFlags(mFolderId, thread, oldWord));
+    RawHdr raw;
+    raw.messageId = "proto-retry-child-"_ns;
+    raw.messageId.AppendInt(mode);
+    raw.references = {"proto-retry-root@invalid"_ns};
+    nsMsgKey key;
+    RefPtr<Message> staged;
+    ASSERT_EQ(NS_OK,
+              db.StageMessage(mFolderId, raw, &key, getter_AddRefs(staged)));
+    ASSERT_EQ(NS_OK, staged->SetUint32Property("ProtoThreadFlags",
+                                               nsMsgMessageFlags::Watched));
+    nsCString pending;
+    ASSERT_EQ(NS_OK, staged->GetStringProperty("ProtoThreadFlags", pending));
+    uint32_t callbacks = 0;
+    RefPtr<PublicationObserver> observer =
+        new PublicationObserver([&](Message*, bool) { ++callbacks; });
+    db.AddMessageListener(observer);
+    auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    ASSERT_EQ(NS_OK,
+              mConnection->CreateFunction("proto_action_fault"_ns, 1, witness));
+    bool renamed = false;
+    auto cleanup = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS reject_proto_action"_ns));
+      if (renamed) {
+        EXPECT_EQ(
+            NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "ALTER TABLE unavailable_proto_words RENAME TO thread_flags"_ns));
+      }
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("proto_action_fault"_ns));
+    });
+    if (mode == 0) {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "ALTER TABLE thread_flags RENAME TO unavailable_proto_words"_ns));
+      renamed = true;
+    } else if (mode == 1) {
+      ASSERT_EQ(NS_OK,
+                mConnection->ExecuteSimpleSQL(
+                    "CREATE TEMP TRIGGER reject_proto_action BEFORE INSERT "
+                    "ON main.thread_flags BEGIN SELECT "
+                    "proto_action_fault(NEW.threadId); "
+                    "SELECT RAISE(ABORT,'proto word'); END"_ns));
+    } else if (mode == 2) {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "CREATE TEMP TRIGGER reject_proto_action BEFORE UPDATE OF value "
+              "ON main.message_properties WHEN OLD.name='ProtoThreadFlags' "
+              "BEGIN "
+              "SELECT proto_action_fault(NEW.id); SELECT RAISE(ABORT,'proto consume'); END"_ns));
+    } else {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "CREATE TEMP TABLE proto_commit_parent(id INTEGER PRIMARY KEY); "
+              "CREATE TEMP TABLE proto_commit_child(id INTEGER REFERENCES "
+              "proto_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); "
+              "CREATE TEMP TRIGGER reject_proto_action AFTER UPDATE OF value "
+              "ON main.message_properties WHEN OLD.name='ProtoThreadFlags' "
+              "BEGIN "
+              "SELECT proto_action_fault(NEW.id); INSERT INTO "
+              "proto_commit_child "
+              "VALUES(NEW.id); END"_ns));
+    }
+    Message* output = staged.get();
+    EXPECT_EQ(mode == 0 ? NS_ERROR_FAILURE : NS_ERROR_STORAGE_CONSTRAINT,
+              db.PublishMessage(key, true, &output));
+    EXPECT_EQ(staged.get(), output);
+    EXPECT_EQ(0u, callbacks);
+    EXPECT_EQ(mode == 0 ? 0u : 1u, witness->mCalls);
+    if (mode) EXPECT_EQ(int64_t(mode == 1 ? thread : key), witness->mLastKey);
+    bool active = true, exists = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(NS_OK, db.MessageExists(key, exists));
+    EXPECT_FALSE(exists);
+    nsTArray<nsMsgKey> stagedKeys;
+    ASSERT_EQ(NS_OK, db.ListStagedMessages(mFolderId, stagedKeys));
+    EXPECT_EQ((nsTArray<nsMsgKey>{key}), stagedKeys);
+    nsCString text;
+    ASSERT_EQ(NS_OK, staged->GetStringProperty("ProtoThreadFlags", text));
+    EXPECT_EQ(pending, text);
+    nsTArray<nsCString> references;
+    ASSERT_EQ(NS_OK, db.GetMessageReferences(key, references));
+    EXPECT_EQ(raw.references, references);
+    ASSERT_EQ(NS_OK,
+              PublicationCell(
+                  mConnection, key,
+                  "SELECT count(*) FROM message_changes WHERE messageId=:id"_ns,
+                  text));
+    EXPECT_EQ("0"_ns, text);
+    if (renamed) {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "ALTER TABLE unavailable_proto_words RENAME TO thread_flags"_ns));
+      renamed = false;
+    }
+    uint32_t flags;
+    ASSERT_EQ(NS_OK, db.GetThreadFlags(mFolderId, thread, flags));
+    EXPECT_EQ(oldWord, flags);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS reject_proto_action"_ns));
+    RefPtr<Message> published;
+    ASSERT_EQ(NS_OK, db.PublishMessage(key, true, getter_AddRefs(published)));
+    EXPECT_EQ(1u, callbacks);
+    ASSERT_EQ(NS_OK, db.GetThreadFlags(mFolderId, thread, flags));
+    EXPECT_EQ(oldWord | nsMsgMessageFlags::Watched, flags);
+    ASSERT_EQ(NS_OK, published->GetStringProperty("ProtoThreadFlags", text));
+    EXPECT_EQ("0"_ns, text);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       StagedThreadActionKeepsCallerTransactionAndQueueOrder) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey control, thread;
+  ASSERT_EQ(NS_OK, Add("proto-transaction-control@invalid"_ns, {}, control));
+  ASSERT_EQ(NS_OK, db.GetMessageThreadId(control, thread));
+  RawHdr raw;
+  raw.messageId = "proto-queued-first@invalid"_ns;
+  nsMsgKey first, second;
+  RefPtr<Message> firstStage, secondStage;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &first,
+                                   getter_AddRefs(firstStage)));
+  raw.messageId = "proto-queued-second@invalid"_ns;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &second,
+                                   getter_AddRefs(secondStage)));
+  ASSERT_EQ(NS_OK, firstStage->SetUint32Property("ProtoThreadFlags",
+                                                 nsMsgMessageFlags::Ignored));
+  ASSERT_EQ(NS_OK, secondStage->SetUint32Property("ProtoThreadFlags",
+                                                  nsMsgMessageFlags::Watched));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  {
+    auto rollback = MakeScopeExit(
+        [&] { EXPECT_EQ(NS_OK, mConnection->RollbackTransaction()); });
+    ASSERT_EQ(NS_OK,
+              db.SetMessageProperty(control, "caller"_ns, "retained"_ns));
+    Message* output = firstStage.get();
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.PublishMessage(first, true, &output));
+    EXPECT_EQ(firstStage.get(), output);
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db.SetThreadFlags(mFolderId, thread, UINT32_MAX));
+    bool active = false;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_TRUE(active);
+    nsCString text;
+    ASSERT_EQ(NS_OK, db.GetMessageProperty(control, "caller"_ns, text));
+    EXPECT_EQ("retained"_ns, text);
+  }
+  Message* firstOutput = nullptr;
+  Message* secondOutput = nullptr;
+  nsTArray<nsMsgKey> callbacks;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message* message, bool) {
+        nsMsgKey key, actualThread;
+        ASSERT_EQ(NS_OK, message->GetMessageKey(&key));
+        callbacks.AppendElement(key);
+        EXPECT_EQ(key == first ? firstOutput : secondOutput, message);
+        ASSERT_EQ(NS_OK, message->GetThreadId(&actualThread));
+        uint32_t flags;
+        ASSERT_EQ(NS_OK, db.GetThreadFlags(mFolderId, actualThread, flags));
+        EXPECT_EQ(key == first ? nsMsgMessageFlags::Ignored
+                               : nsMsgMessageFlags::Watched,
+                  flags);
+        if (key == first) {
+          ASSERT_EQ(NS_OK, db.PublishMessage(second, true, &secondOutput));
+          EXPECT_EQ((nsTArray<nsMsgKey>{first}), callbacks);
+        }
+      });
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, db.PublishMessage(first, true, &firstOutput));
+  RefPtr<Message> ownedFirst = dont_AddRef(firstOutput);
+  RefPtr<Message> ownedSecond = dont_AddRef(secondOutput);
+  EXPECT_EQ((nsTArray<nsMsgKey>{first, second}), callbacks);
+  EXPECT_EQ(0u, observer->mChanges);
+}
+
 TEST_F(DeliveryCoreReferences,
        StagingFailurePreservesOutputsAndForeignTransaction) {
   ASSERT_EQ(NS_OK, Start());

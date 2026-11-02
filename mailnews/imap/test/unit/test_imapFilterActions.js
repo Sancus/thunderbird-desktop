@@ -19,6 +19,8 @@ var gFilter; // a message filter with a subject search
 var gAction; // current message action (reused)
 var gBodyFilter; // a message filter with a body search
 var gInboxListener; // database listener object
+let gInboxDatabase = null;
+let gIncomingUid;
 var gHeader; // the current message db header
 var gInboxCount; // the previous number of messages in the Inbox
 var gSubfolderCount; // the previous number of messages in the subfolder
@@ -37,8 +39,57 @@ var gDbService = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
 
 var gSmtpServerD = setupSmtpServerDaemon();
 
-add_setup(async function () {
+add_setup(async function setupNativeFilterActions() {
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (native) {
+    const storePref = "mail.server.default.storeContractID";
+    const autosyncPref = "mail.server.default.autosync_offline_stores";
+    const hadStore = Services.prefs.prefHasUserValue(storePref);
+    const oldStore = Services.prefs.getCharPref(storePref, "");
+    const hadAutosync = Services.prefs.prefHasUserValue(autosyncPref);
+    const oldAutosync = Services.prefs.getBoolPref(autosyncPref, true);
+    registerCleanupFunction(() => {
+      if (IMAPPump.incomingServer) {
+        teardownIMAPPump();
+      }
+      if (hadStore) {
+        Services.prefs.setCharPref(storePref, oldStore);
+      } else {
+        Services.prefs.clearUserPref(storePref);
+      }
+      if (hadAutosync) {
+        Services.prefs.setBoolPref(autosyncPref, oldAutosync);
+      } else {
+        Services.prefs.clearUserPref(autosyncPref);
+      }
+    });
+    Services.prefs.setCharPref(
+      storePref,
+      Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+    );
+    Services.prefs.setBoolPref(autosyncPref, false);
+  }
   setupIMAPPump();
+  if (native) {
+    IMAPPump.mailbox.uidvalidity = 7301;
+    IMAPPump.mailbox.uidnext = 7401;
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+    Assert.ok(inbox, "Native discovery supplied the actual INBOX");
+    IMAPPump.inbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+    Assert.equal(IMAPPump.inbox.parent, root);
+    Assert.equal(IMAPPump.inbox.server, IMAPPump.incomingServer);
+    const expectedStore = {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[Services.prefs.getCharPref("mail.serverDefaultStoreContractID")];
+    Assert.ok(expectedStore);
+    Assert.equal(IMAPPump.incomingServer.msgStore.storeType, expectedStore);
+    Assert.equal(IMAPPump.inbox.msgStore.storeType, expectedStore);
+  }
   //   IMAPPump.server.setDebugLevel(nsMailServer.debugAll);
   gSmtpServerD.start();
   var gSmtpServer = localAccountUtils.create_outgoing_server(
@@ -58,7 +109,10 @@ add_setup(async function () {
     gSmtpServerD.stop();
     Services.prefs.clearUserPref("mail.filters.forward.enabled");
     Services.prefs.clearUserPref("mail.forward_message_mode");
-    if (gInboxListener) {
+    if (gInboxDatabase && gInboxListener) {
+      gInboxDatabase.removeListener(gInboxListener);
+      gInboxDatabase = null;
+    } else if (gInboxListener) {
       gDbService.unregisterPendingListener(gInboxListener);
     }
     gInboxListener = null;
@@ -444,16 +498,25 @@ async function setupTest(aFilter, ...aActions) {
       filterList.insertFilterAt(0, aFilter);
     }
   }
-  if (gInboxListener) {
+  if (gInboxDatabase && gInboxListener) {
+    gInboxDatabase.removeListener(gInboxListener);
+    gInboxDatabase = null;
+  } else if (gInboxListener) {
     gDbService.unregisterPendingListener(gInboxListener);
   }
 
   IMAPPump.inbox.clearNewMessages();
 
   gInboxListener = new DBListener();
-  gDbService.registerPendingListener(IMAPPump.inbox, gInboxListener);
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    gInboxDatabase = IMAPPump.inbox.msgDatabase;
+    gInboxDatabase.addListener(gInboxListener);
+  } else {
+    gDbService.registerPendingListener(IMAPPump.inbox, gInboxListener);
+  }
+  gIncomingUid = IMAPPump.mailbox.uidnext++;
   IMAPPump.mailbox.addMessage(
-    new ImapMessage(specForFileName(gMessage), IMAPPump.mailbox.uidnext++, [])
+    new ImapMessage(specForFileName(gMessage), gIncomingUid, [])
   );
   const promiseUrlListener = new PromiseTestUtils.PromiseUrlListener();
   IMAPPump.inbox.updateFolderWithListener(null, promiseUrlListener);
@@ -506,6 +569,11 @@ DBListener.prototype = {
   onHdrAdded(aHdrChanged) {
     this.counts.onHdrAdded++;
     gHeader = aHdrChanged;
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      Assert.equal(gHeader.getUint32Property("uidOnServer"), gIncomingUid);
+      Assert.notEqual(gHeader.messageKey, gIncomingUid);
+      Assert.ok(gInboxDatabase.containsKey(gHeader.messageKey));
+    }
   },
 
   onParentChanged() {
@@ -515,7 +583,10 @@ DBListener.prototype = {
   onAnnouncerGoingAway() {
     if (gInboxListener) {
       try {
-        IMAPPump.inbox.msgDatabase.removeListener(gInboxListener);
+        (gInboxDatabase || IMAPPump.inbox.msgDatabase).removeListener(
+          gInboxListener
+        );
+        gInboxDatabase = null;
       } catch (e) {
         dump(" listener not found\n");
       }
@@ -581,40 +652,36 @@ var gPreviousUnread = 0;
 //  aDbNewDelta:     change in new count for the database
 //
 function testCounts(aHasNew, aUnreadDelta, aFolderNewDelta, aDbNewDelta) {
-  try {
-    const folderNew = IMAPPump.inbox.getNumNewMessages(false);
-    const hasNew = IMAPPump.inbox.hasNewMessages;
-    const unread = IMAPPump.inbox.getNumUnread(false);
-    const arrayOut = db().getNewList();
-    const dbNew = arrayOut.length;
-    dump(
-      " hasNew: " +
-        hasNew +
-        " unread: " +
-        unread +
-        " folderNew: " +
-        folderNew +
-        " dbNew: " +
-        dbNew +
-        " prevUnread " +
-        gPreviousUnread +
-        "\n"
-    );
-    Assert.equal(aHasNew, hasNew);
-    Assert.equal(aUnreadDelta, unread - gPreviousUnread);
-    gPreviousUnread = unread;
-    // This seems to be reset for each folder update.
-    //
-    // This check seems to be failing in SeaMonkey builds, yet I can see no ill
-    // effects of this in the actual program. Fixing this is complex because of
-    // the messiness of new count management (see bug 507638 for a
-    // refactoring proposal, and attachment 398899 on bug 514801 for one possible
-    // fix to this particular test). So I am disabling this.
-    // Assert.equal(aFolderNewDelta, folderNew);
-    Assert.equal(aDbNewDelta, dbNew);
-  } catch (e) {
-    dump(e);
-  }
+  const folderNew = IMAPPump.inbox.getNumNewMessages(false);
+  const hasNew = IMAPPump.inbox.hasNewMessages;
+  const unread = IMAPPump.inbox.getNumUnread(false);
+  const arrayOut = db().getNewList();
+  const dbNew = arrayOut.length;
+  dump(
+    " hasNew: " +
+      hasNew +
+      " unread: " +
+      unread +
+      " folderNew: " +
+      folderNew +
+      " dbNew: " +
+      dbNew +
+      " prevUnread " +
+      gPreviousUnread +
+      "\n"
+  );
+  Assert.equal(aHasNew, hasNew);
+  Assert.equal(aUnreadDelta, unread - gPreviousUnread);
+  gPreviousUnread = unread;
+  // This seems to be reset for each folder update.
+  //
+  // This check seems to be failing in SeaMonkey builds, yet I can see no ill
+  // effects of this in the actual program. Fixing this is complex because of
+  // the messiness of new count management (see bug 507638 for a
+  // refactoring proposal, and attachment 398899 on bug 514801 for one possible
+  // fix to this particular test). So I am disabling this.
+  // Assert.equal(aFolderNewDelta, folderNew);
+  Assert.equal(aDbNewDelta, dbNew);
 }
 
 /**

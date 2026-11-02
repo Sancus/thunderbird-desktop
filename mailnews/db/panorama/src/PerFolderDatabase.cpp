@@ -381,9 +381,9 @@ void PerFolderDatabase::OnMessagePublished(Message* message,
     uint32_t flags;
     rv = MessageDB().GetMessageFlags(message->Key(), flags);
     NS_ENSURE_SUCCESS_VOID(rv);
-    // Unread messages join NewList even when legacy notifications are
-    // suppressed.
-    if (!(flags & nsMsgMessageFlags::Read)) {
+    // Only an explicit staged parser decision overrides the unread default.
+    bool notNew = mParsedServerNotNew.RemoveElement(message->Key());
+    if (!(flags & nsMsgMessageFlags::Read) && !notNew) {
       if (!mNewList.Contains(message->Key())) {
         mNewList.AppendElement(message->Key());
       }
@@ -489,7 +489,8 @@ void PerFolderDatabase::OnMessagePublishedCaptured(const CapturedMessage& after,
     return;
   }
   RefPtr<PerFolderDatabase> self(this);
-  if (!(after.flags & nsMsgMessageFlags::Read)) {
+  bool notNew = mParsedServerNotNew.RemoveElement(after.id);
+  if (!(after.flags & nsMsgMessageFlags::Read) && !notNew) {
     // Earlier native listeners may already have changed the live row. These
     // membership and notification facts belong to this captured publication.
     if (!mNewList.Contains(after.id)) {
@@ -675,6 +676,7 @@ NS_IMETHODIMP PerFolderDatabase::ForceClosed() {
   }
   RefPtr<PerFolderDatabase> self(this);
   mForceClosed = true;
+  mParsedServerNotNew.Clear();
   mCachedHeaders.Clear();
   // Invalidate this wrapper's weak cache entries before a listener reopens it.
   DetachWeakPtr();
@@ -991,12 +993,805 @@ NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,
   return NS_OK;
 }
 
+ParsedServerHdr::ParsedServerHdr(PerFolderDatabase* owner,
+                                 DetachedMsgHdr* draft, uint32_t epoch,
+                                 uint32_t uid)
+    : mOwner(owner), mDraft(draft), mSourceId(owner->mDatabaseSourceId) {
+  mLocation.folderId = owner->mFolderId;
+  mLocation.epoch = epoch;
+  mLocation.uid = uid;
+}
+
+ParsedServerHdr::~ParsedServerHdr() = default;
+
+NS_IMPL_ADDREF(ParsedServerHdr)
+NS_IMPL_RELEASE(ParsedServerHdr)
+NS_INTERFACE_MAP_BEGIN(ParsedServerHdr)
+  NS_INTERFACE_MAP_ENTRY(nsIMsgDBHdr)
+  NS_INTERFACE_MAP_ENTRY(DecodedSubjectHdr)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(ParsedServerHdr)
+NS_INTERFACE_MAP_END
+
+nsresult ParsedServerHdr::Check(bool writing) {
+  if (mState == State::Publishing || (writing && mWriting))
+    return NS_ERROR_IN_PROGRESS;
+  if (NS_FAILED(mError)) return mError;
+  if (mState == State::Aborted) return NS_ERROR_NOT_AVAILABLE;
+  MOZ_TRY(mOwner->ValidateParsedServerHdr(*this));
+  if (writing) {
+    MOZ_TRY(mOwner->CheckParsedServerWriteTransaction());
+  }
+  return NS_OK;
+}
+
+nsresult ParsedServerHdr::FinishWrite(nsresult rv) {
+  if (NS_FAILED(rv) && NS_SUCCEEDED(mError)) {
+    mError = rv;
+    if (mState == State::Staged) {
+      mDraft->mAttachError = rv;
+      mDraft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+    }
+  }
+  return rv;
+}
+
+nsresult ParsedServerHdr::CheckProperty(const char* name) const {
+  NS_ENSURE_ARG_POINTER(name);
+  if (mState == State::Staged) {
+    nsDependentCString property(name);
+    NS_ENSURE_FALSE(property.EqualsLiteral("uidOnServer") ||
+                        property.EqualsLiteral("storeToken") ||
+                        property.EqualsLiteral("msgOffset") ||
+                        property.EqualsLiteral("messageSize") ||
+                        property.EqualsLiteral("offlineMessageSize") ||
+                        property.EqualsLiteral("offlineMsgSize") ||
+                        property.EqualsLiteral("lineCount"),
+                    NS_ERROR_INVALID_ARG);
+  }
+  return NS_OK;
+}
+
+nsresult ParsedServerHdr::CheckFlags(uint32_t flags) const {
+  if (mState == State::Staged) {
+    uint32_t previous;
+    MOZ_TRY(mHeader->GetFlags(&previous));
+    NS_ENSURE_FALSE((previous ^ flags) & (nsMsgMessageFlags::Offline |
+                                          nsMsgMessageFlags::Expunged),
+                    NS_ERROR_INVALID_ARG);
+  }
+  return NS_OK;
+}
+
+nsresult ParsedServerHdr::GetLocation(ServerMessageLocation& location) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  location = mLocation;
+  return NS_OK;
+}
+
+nsresult ParsedServerHdr::UpdateKeywords(const nsACString& keywords, bool add) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  nsCString result;
+  MOZ_TRY(mHeader->GetStringProperty("keywords", result));
+  nsTArray<nsCString> changes;
+  ParseString(keywords, ' ', changes);
+  for (const auto& token : changes) {
+    int32_t start, length;
+    bool present = MsgFindKeyword(token, result, &start, &length);
+    if (add) {
+      if (!present) {
+        if (!result.IsEmpty()) result.Append(' ');
+        result.Append(token);
+      }
+    } else if (present) {
+      while (start && result.CharAt(start - 1) == ' ') {
+        --start;
+        ++length;
+      }
+      if (!start && length < static_cast<int32_t>(result.Length()) &&
+          result.CharAt(length) == ' ') {
+        ++length;
+      }
+      result.Cut(start, length);
+    }
+  }
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetStringProperty("keywords", result));
+}
+
+nsresult ParsedServerHdr::GetExistingThread(nsIMsgThread** thread) {
+  RefPtr<ParsedServerHdr> self(this);
+  NS_ENSURE_ARG_POINTER(thread);
+  NS_ENSURE_FALSE(*thread, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(Check());
+  nsMsgKey threadId;
+  MOZ_TRY(mHeader->GetThreadId(&threadId));
+  NS_ENSURE_TRUE(threadId && threadId != nsMsgKey_None, NS_ERROR_NOT_AVAILABLE);
+  RefPtr<Thread> existing = new Thread(mLocation.folderId, threadId);
+  uint32_t children;
+  MOZ_TRY(existing->GetNumChildren(&children));
+  if (children) existing.forget(thread);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::CheckParsedServerWriteTransaction() const {
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  return active ? NS_ERROR_IN_PROGRESS : NS_OK;
+}
+
+nsresult PerFolderDatabase::CheckParsedServerUid(uint32_t epoch, uint32_t uid,
+                                                 nsMsgKey ownKey) {
+  NS_ENSURE_TRUE(epoch && uid, NS_ERROR_INVALID_ARG);
+  uint32_t current;
+  MOZ_TRY(FolderDB().GetFolderUidValidity(mFolderId, current));
+  NS_ENSURE_TRUE(current == epoch, NS_ERROR_NOT_AVAILABLE);
+  nsMsgKey published = nsMsgKey_None;
+  nsresult rv =
+      MessageDB().GetMessageKeyForServerUid(mFolderId, epoch, uid, published);
+  if (NS_FAILED(rv) && rv != NS_ERROR_NOT_AVAILABLE) return rv;
+  NS_ENSURE_FALSE(NS_SUCCEEDED(rv) && published != ownKey,
+                  NS_ERROR_ALREADY_INITIALIZED);
+  nsTArray<nsMsgKey> keys;
+  MOZ_TRY(MessageDB().ListStagedMessages(mFolderId, keys));
+  for (nsMsgKey key : keys) {
+    if (key == ownKey) continue;
+    nsTArray<nsCString> names;
+    MOZ_TRY(MessageDB().GetMessagePropertyNames(key, names));
+    if (!names.Contains("uidOnServer"_ns)) continue;
+    RefPtr<Message> header = new Message(key);
+    uint32_t otherUid;
+    MOZ_TRY(header->GetUint32Property("uidOnServer", &otherUid));
+    NS_ENSURE_FALSE(otherUid == uid, NS_ERROR_ALREADY_INITIALIZED);
+  }
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::ValidateParsedServerHdr(ParsedServerHdr& staged,
+                                                    bool requireStaged) {
+  NS_ENSURE_TRUE(staged.mOwner.get() == this, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(staged.mSourceId == mDatabaseSourceId &&
+                     staged.mLocation.folderId == mFolderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(staged.mHeader && staged.mLocation.key &&
+                     staged.mLocation.key != nsMsgKey_None,
+                 NS_ERROR_NOT_AVAILABLE);
+  if (requireStaged && staged.mState != ParsedServerHdr::State::Staged)
+    return NS_ERROR_ALREADY_INITIALIZED;
+  Maybe<CapturedMessage> current;
+  MOZ_TRY(MessageDB().CaptureHeaderState(staged.mLocation.key, current));
+  NS_ENSURE_TRUE(current && current->folderId == mFolderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool published;
+  MOZ_TRY(MessageDB().MessageExists(staged.mLocation.key, published));
+  NS_ENSURE_TRUE(
+      published == (staged.mState == ParsedServerHdr::State::Published),
+      NS_ERROR_NOT_AVAILABLE);
+  nsTArray<nsCString> names;
+  MOZ_TRY(MessageDB().GetMessagePropertyNames(staged.mLocation.key, names));
+  NS_ENSURE_TRUE(names.Contains("uidOnServer"_ns), NS_ERROR_NOT_AVAILABLE);
+  uint32_t uid;
+  MOZ_TRY(staged.mHeader->GetUint32Property("uidOnServer", &uid));
+  NS_ENSURE_TRUE(uid == staged.mLocation.uid, NS_ERROR_NOT_AVAILABLE);
+  return CheckParsedServerUid(staged.mLocation.epoch, uid,
+                              staged.mLocation.key);
+}
+
+nsresult PerFolderDatabase::StageParsedServerHdr(nsIMsgDBHdr* parsed,
+                                                 uint32_t epoch, uint32_t uid,
+                                                 ParsedServerHdr** staged) {
+  NS_ENSURE_ARG_POINTER(staged);
+  NS_ENSURE_FALSE(*staged, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_ARG(parsed);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(parsed);
+  NS_ENSURE_TRUE(draft && draft->mFolderId == mFolderId, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(draft->mCopySourceId.IsEmpty(), NS_ERROR_INVALID_ARG);
+  MOZ_TRY(draft->CheckMutable());
+  nsTArray<nsCString> names;
+  MOZ_TRY(draft->GetProperties(names));
+  NS_ENSURE_TRUE(names.Contains("uidOnServer"_ns), NS_ERROR_NOT_AVAILABLE);
+  uint32_t actual;
+  MOZ_TRY(draft->GetUint32Property("uidOnServer", &actual));
+  NS_ENSURE_TRUE(actual == uid, NS_ERROR_NOT_AVAILABLE);
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(CheckParsedServerUid(epoch, uid));
+  RefPtr<ParsedServerHdr> result =
+      new (fallible) ParsedServerHdr(this, draft, epoch, uid);
+  NS_ENSURE_TRUE(result, NS_ERROR_OUT_OF_MEMORY);
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attaching;
+  nsresult rv =
+      MessageDB().StageMessage(mFolderId, draft->mRaw, &result->mLocation.key,
+                               getter_AddRefs(result->mHeader));
+  if (NS_FAILED(rv)) {
+    draft->mAttachError = rv;
+    draft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+    return rv;
+  }
+  result.forget(staged);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::PublishParsedServerHdr(ParsedServerHdr* staged,
+                                                   bool notifyLegacy,
+                                                   Message** liveHeader) {
+  RefPtr<ParsedServerHdr> selected(staged);
+  RefPtr<PerFolderDatabase> self(this);
+  NS_ENSURE_ARG_POINTER(liveHeader);
+  NS_ENSURE_FALSE(*liveHeader, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_ARG(staged);
+  NS_ENSURE_TRUE(staged->mOwner.get() == this, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(staged->Check(true));
+  MOZ_TRY(ValidateParsedServerHdr(*staged, true));
+  // A nested native publication queues its callback until the current fanout
+  // ends. Keep this exact key's intent in the owning facade, not on the stack
+  // or in the caller's possibly released capability. Allocate before commit.
+  if (staged->mSuppressNew &&
+      !mParsedServerNotNew.AppendElement(staged->mLocation.key, fallible)) {
+    return staged->FinishWrite(NS_ERROR_OUT_OF_MEMORY);
+  }
+  staged->mState = ParsedServerHdr::State::Publishing;
+  nsresult rv = MessageDB().PublishMessage(staged->mLocation.key, notifyLegacy,
+                                           liveHeader);
+  if (NS_FAILED(rv)) {
+    mParsedServerNotNew.RemoveElement(staged->mLocation.key);
+    staged->mState = ParsedServerHdr::State::Staged;
+    return staged->FinishWrite(rv);
+  }
+  staged->mState = ParsedServerHdr::State::Published;
+  staged->mHeader = *liveHeader;
+  staged->mDraft->mAttachedHeader = *liveHeader;
+  staged->mDraft->mAttachState = DetachedMsgHdr::AttachState::Attached;
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::AbortParsedServerHdr(ParsedServerHdr* staged) {
+  RefPtr<ParsedServerHdr> selected(staged);
+  RefPtr<PerFolderDatabase> self(this);
+  NS_ENSURE_ARG(staged);
+  NS_ENSURE_TRUE(staged->mOwner.get() == this, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_FALSE(
+      staged->mWriting || staged->mState == ParsedServerHdr::State::Publishing,
+      NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(staged->mState == ParsedServerHdr::State::Staged,
+                 NS_ERROR_ALREADY_INITIALIZED);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(staged->mSourceId == mDatabaseSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  Maybe<CapturedMessage> current;
+  MOZ_TRY(MessageDB().CaptureHeaderState(staged->mLocation.key, current));
+  NS_ENSURE_TRUE(current && current->folderId == mFolderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool published;
+  MOZ_TRY(MessageDB().MessageExists(staged->mLocation.key, published));
+  NS_ENSURE_FALSE(published, NS_ERROR_ALREADY_INITIALIZED);
+  // The exact owned row may be abandoned after epoch retirement or a prior
+  // error. AbortMessage independently refuses in-flight operation custody.
+  MOZ_TRY(MessageDB().AbortMessage(staged->mLocation.key));
+  mParsedServerNotNew.RemoveElement(staged->mLocation.key);
+  staged->mState = ParsedServerHdr::State::Aborted;
+  if (NS_SUCCEEDED(staged->mError)) staged->mError = NS_ERROR_ABORT;
+  staged->mDraft->mAttachError = staged->mError;
+  staged->mDraft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetStringProperty(const char* propertyName,
+                                   const nsACString& propertyValue) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  MOZ_TRY(CheckProperty(propertyName));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetStringProperty(propertyName, propertyValue));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetStringProperty(const char* propertyName,
+                                   nsACString& propertyValue) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetStringProperty(propertyName, propertyValue);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetUint32Property(const char* propertyName,
+                                   uint32_t* propertyValue) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetUint32Property(propertyName, propertyValue);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetUint32Property(const char* propertyName,
+                                   uint32_t propertyValue) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  MOZ_TRY(CheckProperty(propertyName));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetUint32Property(propertyName, propertyValue));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetProperties(nsTArray<nsCString>& properties) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetProperties(properties);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetIsRead(bool* isRead) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetIsRead(isRead);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetIsFlagged(bool* isFlagged) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetIsFlagged(isFlagged);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetIsKilled(bool* isKilled) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetIsKilled(isKilled);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::MarkRead(bool read) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->MarkRead(read));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::MarkFlagged(bool flagged) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->MarkFlagged(flagged));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::MarkHasAttachments(bool hasAttachments) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->MarkHasAttachments(hasAttachments));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetPriority(nsMsgPriorityValue* priority) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetPriority(priority);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetPriority(nsMsgPriorityValue priority) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetPriority(priority));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetFlags(uint32_t* flags) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetFlags(flags);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetFlags(uint32_t flags) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  MOZ_TRY(CheckFlags(flags));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  nsresult rv = FinishWrite(mHeader->SetFlags(flags));
+  if (NS_SUCCEEDED(rv) && mState == State::Staged) {
+    mSuppressNew = !(flags & nsMsgMessageFlags::New);
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::OrFlags(uint32_t flags, uint32_t* outFlags) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  uint32_t previous;
+  MOZ_TRY(mHeader->GetFlags(&previous));
+  MOZ_TRY(CheckFlags(previous | flags));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  nsresult rv = FinishWrite(mHeader->OrFlags(flags, outFlags));
+  if (NS_SUCCEEDED(rv) && mState == State::Staged &&
+      (flags & nsMsgMessageFlags::New)) {
+    mSuppressNew = false;
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::AndFlags(uint32_t flags, uint32_t* outFlags) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  uint32_t previous;
+  MOZ_TRY(mHeader->GetFlags(&previous));
+  MOZ_TRY(CheckFlags(previous & flags));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  nsresult rv = FinishWrite(mHeader->AndFlags(flags, outFlags));
+  if (NS_SUCCEEDED(rv) && mState == State::Staged &&
+      !(flags & nsMsgMessageFlags::New)) {
+    mSuppressNew = true;
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetThreadId(nsMsgKey* threadId) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetThreadId(threadId);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetThreadId(nsMsgKey threadId) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetThreadId(threadId));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetMessageKey(nsMsgKey* key) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetMessageKey(key);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetMessageKey(nsMsgKey key) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetMessageKey(key));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetThreadParent(nsMsgKey* threadParent) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetThreadParent(threadParent);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetThreadParent(nsMsgKey threadParent) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetThreadParent(threadParent));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetMessageSize(uint32_t* messageSize) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetMessageSize(messageSize);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetMessageSize(uint32_t messageSize) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  NS_ENSURE_FALSE(mState == State::Staged, NS_ERROR_INVALID_ARG);
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetMessageSize(messageSize));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetLineCount(uint32_t* lineCount) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetLineCount(lineCount);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetLineCount(uint32_t lineCount) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  NS_ENSURE_FALSE(mState == State::Staged, NS_ERROR_INVALID_ARG);
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetLineCount(lineCount));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetStoreToken(nsACString& storeToken) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetStoreToken(storeToken);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetStoreToken(const nsACString& storeToken) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  NS_ENSURE_FALSE(mState == State::Staged, NS_ERROR_INVALID_ARG);
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetStoreToken(storeToken));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetOfflineMessageSize(uint32_t* offlineMessageSize) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetOfflineMessageSize(offlineMessageSize);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetOfflineMessageSize(uint32_t offlineMessageSize) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  NS_ENSURE_FALSE(mState == State::Staged, NS_ERROR_INVALID_ARG);
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetOfflineMessageSize(offlineMessageSize));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetDate(PRTime* date) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetDate(date);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetDate(PRTime date) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetDate(date));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetDateInSeconds(uint32_t* dateInSeconds) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetDateInSeconds(dateInSeconds);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetMessageId(nsACString& messageId) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetMessageId(messageId);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetMessageId(const nsACString& messageId) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetMessageId(messageId));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetCcList(nsACString& ccList) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetCcList(ccList);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetCcList(const nsACString& ccList) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetCcList(ccList));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetBccList(nsACString& bccList) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetBccList(bccList);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetBccList(const nsACString& bccList) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetBccList(bccList));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetAuthor(nsACString& author) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetAuthor(author);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetAuthor(const nsACString& author) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetAuthor(author));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetSubject(nsACString& subject) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetSubject(subject);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetSubject(const nsACString& subject) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetSubject(subject));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetRecipients(nsACString& recipients) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetRecipients(recipients);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetRecipients(const nsACString& recipients) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetRecipients(recipients));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetReferences(const nsACString& references) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetReferences(references));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetNumReferences(uint16_t* numReferences) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetNumReferences(numReferences);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetStringReference(int32_t refNum, nsACString& reference) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetStringReference(refNum, reference);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetMime2DecodedAuthor(nsAString& mime2DecodedAuthor) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetMime2DecodedAuthor(mime2DecodedAuthor);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetMime2DecodedSubject(nsAString& mime2DecodedSubject) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetMime2DecodedSubject(mime2DecodedSubject);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetMime2DecodedRecipients(nsAString& mime2DecodedRecipients) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetMime2DecodedRecipients(mime2DecodedRecipients);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetCharset(nsACString& charset) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetCharset(charset);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetCharset(const nsACString& charset) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetCharset(charset));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetEffectiveCharset(nsACString& effectiveCharset) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetEffectiveCharset(effectiveCharset);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetAccountKey(nsACString& accountKey) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetAccountKey(accountKey);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::SetAccountKey(const nsACString& accountKey) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check(true));
+  AutoRestore<bool> changing(mWriting);
+  mWriting = true;
+  return FinishWrite(mHeader->SetAccountKey(accountKey));
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetFolder(nsIMsgFolder** aFolder) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetFolder(aFolder);
+}
+
+NS_IMETHODIMP
+ParsedServerHdr::GetIsLive(bool* isLive) {
+  RefPtr<ParsedServerHdr> self(this);
+  MOZ_TRY(Check());
+  return mHeader->GetIsLive(isLive);
+}
+
 NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
     nsMsgKey key, nsIMsgDBHdr* existingHdr, bool addHdrToDB,
     nsIMsgDBHdr** aRetVal) {
   NS_ENSURE_ARG_POINTER(aRetVal);
   *aRetVal = nullptr;
   NS_ENSURE_ARG(existingHdr);
+  RefPtr<ParsedServerHdr> selected = do_QueryObject(existingHdr);
+  if (selected) {
+    MOZ_TRY(selected->Check());
+  }
   MOZ_TRY(CheckFolderExists());
   // Global keys are allocated by the core, not requested by callers.
   NS_ENSURE_TRUE(key == nsMsgKey_None, NS_ERROR_NOT_IMPLEMENTED);
@@ -1030,6 +1825,9 @@ NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
     MOZ_TRY(MessageDB().GetMessageFlags(sourceKey, raw.flags));
     // The public getter filters self/empty tokens and has a uint16 limit.
     MOZ_TRY(MessageDB().GetMessageReferences(sourceKey, raw.references));
+  } else if (selected) {
+    MOZ_TRY(MessageDB().GetMessageReferences(selected->mLocation.key,
+                                             raw.references));
   } else {
     // Only native drafts carry the complete unfiltered references.
     RefPtr<DetachedMsgHdr> source = do_QueryObject(existingHdr);
@@ -1062,6 +1860,9 @@ NS_IMETHODIMP PerFolderDatabase::CopyHdrFromExistingHdr(
       extra.k = name;
       extra.v = propertyValue;
     }
+  }
+  if (selected) {
+    MOZ_TRY(selected->Check());
   }
   if (addHdrToDB) {
     return AttachHdr(draft, true, aRetVal);

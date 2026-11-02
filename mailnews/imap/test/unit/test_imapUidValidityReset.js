@@ -663,6 +663,7 @@ add_task(async function test_globalPlaybackContinuesPastHeldEpoch() {
   assertResetCounts(folder, 1);
 
   mailbox.uidvalidity = 7303;
+  IMAPPump.incomingServer.closeCachedConnections();
   await updateResetFolder(folder);
   const fresh = folder.msgDatabase.getMsgHdrForMessageID(
     "later-epoch-replay@example.invalid"

@@ -706,3 +706,102 @@ async function testForward(mode) {
   Assert.ok(msgData.includes(`Subject: Fwd: ${gMessageSubject}`));
   Assert.ok(msgData.includes(`${gMessageInBody}`));
 }
+
+add_task(async function test_nativeHeaderDeleteWithoutTrash() {
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    await checkNativeDeleteWithoutTrash(false);
+  }
+});
+
+add_task(async function test_nativeBodyDeleteWithoutTrash() {
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    await checkNativeDeleteWithoutTrash(true);
+  }
+});
+
+/**
+ * Checks a plain Delete against its physical source and actual server command.
+ *
+ * @param {boolean} needsBody - Whether the filter requires the finished body.
+ * @returns {Promise<void>} Resolves after deletion and repeated synchronization.
+ */
+async function checkNativeDeleteWithoutTrash(needsBody) {
+  const inbox = IMAPPump.inbox;
+  const server = IMAPPump.incomingServer;
+  const oldDeleteModel = server.deleteModel;
+  const oldFolderBiff = inbox.performingBiff;
+  const oldServerBiff = server.performingBiff;
+  const commands = () => {
+    const transaction = IMAPPump.server.playTransaction();
+    return (Array.isArray(transaction) ? transaction : [transaction])
+      .flatMap(item => item.them)
+      .map(command => command.toUpperCase());
+  };
+  const start = commands().length;
+  const uid = IMAPPump.mailbox.uidnext;
+  const deletes = () =>
+    commands()
+      .slice(start)
+      .filter(
+        command =>
+          command.includes("UID STORE") && command.includes("\\DELETED")
+      );
+  const headerFetches = () =>
+    commands()
+      .slice(start)
+      .filter(
+        command =>
+          command.includes("UID FETCH") && command.includes("BODY.PEEK[HEADER")
+      );
+  try {
+    server.deleteModel = Ci.nsMsgImapDeleteModels.IMAPDelete;
+    inbox.performingBiff = true;
+    gAction.type = Ci.nsMsgFilterAction.Delete;
+    await setupTest(needsBody ? gBodyFilter : gFilter, gAction);
+    const source = gHeader;
+    const key = source.messageKey;
+    Assert.equal(gIncomingUid, uid);
+    Assert.equal(source.getUint32Property("uidOnServer"), uid);
+    Assert.notEqual(key, uid);
+    Assert.ok(inbox.msgDatabase.containsKey(key));
+    Assert.ok(source.flags & Ci.nsMsgMessageFlags.IMAPDeleted);
+    Assert.ok(source.isRead);
+    Assert.ok(!(source.flags & Ci.nsMsgMessageFlags.New));
+    Assert.equal(inbox.getNumNewMessages(false), 0);
+    Assert.equal(inbox.hasNewMessages, false);
+    if (needsBody) {
+      Assert.ok(source.flags & Ci.nsMsgMessageFlags.Offline);
+    }
+    const message = IMAPPump.mailbox._messages.find(item => item.uid == uid);
+    Assert.ok(message);
+    await TestUtils.waitForCondition(
+      () => message.flags.includes("\\Deleted"),
+      "the actual source UID receives the deleted flag"
+    );
+    Assert.equal(deletes().length, 1);
+    Assert.ok(deletes()[0].includes(`UID STORE ${uid} `));
+    const fetched = headerFetches().length;
+    Assert.equal(fetched, 1);
+    for (let i = 0; i < 2; i++) {
+      const listener = new PromiseTestUtils.PromiseUrlListener();
+      inbox.updateFolderWithListener(null, listener);
+      await listener.promise;
+      Assert.ok(inbox.msgDatabase.containsKey(key));
+      Assert.equal(
+        inbox.msgDatabase.getMsgHdrForKey(key).getUint32Property("uidOnServer"),
+        uid
+      );
+      Assert.equal(inbox.getNumNewMessages(false), 0);
+    }
+    Assert.equal(headerFetches().length, fetched);
+    Assert.equal(deletes().length, 1);
+    Assert.equal(
+      IMAPPump.mailbox._messages.find(item => item.uid == uid),
+      message
+    );
+  } finally {
+    server.deleteModel = oldDeleteModel;
+    inbox.performingBiff = oldFolderBiff;
+    server.performingBiff = oldServerBiff;
+  }
+}

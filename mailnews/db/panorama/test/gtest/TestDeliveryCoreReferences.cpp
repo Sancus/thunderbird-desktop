@@ -4296,8 +4296,16 @@ TEST_F(DeliveryCoreReferences, StagedThreadActionUsesFinalScopedThread) {
             db.StageMessage(mFolderId, raw, &key, getter_AddRefs(staged)));
   nsMsgKey stagedThread;
   ASSERT_EQ(NS_OK, staged->GetThreadId(&stagedThread));
-  EXPECT_EQ(key, stagedThread);
-  EXPECT_NE(thread, stagedThread);
+  EXPECT_EQ(thread, stagedThread);
+  EXPECT_NE(key, stagedThread);
+  nsCString storedThread;
+  ASSERT_EQ(NS_OK, PublicationCell(
+                       mConnection, key,
+                       "SELECT threadId FROM staged_messages WHERE id=:id"_ns,
+                       storedThread));
+  nsAutoCString expectedStoredThread;
+  expectedStoredThread.AppendInt(int64_t(thread));
+  EXPECT_EQ(expectedStoredThread, storedThread);
   const uint32_t pending =
       nsMsgMessageFlags::Ignored | nsMsgMessageFlags::Watched;
   ASSERT_EQ(NS_OK, staged->SetUint32Property("ProtoThreadFlags", pending));
@@ -4440,6 +4448,7 @@ TEST_F(DeliveryCoreReferences,
       ASSERT_EQ(
           NS_OK,
           mConnection->ExecuteSimpleSQL(
+              "PRAGMA foreign_keys=ON; "
               "CREATE TEMP TABLE proto_commit_parent(id INTEGER PRIMARY KEY); "
               "CREATE TEMP TABLE proto_commit_child(id INTEGER REFERENCES "
               "proto_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); "
@@ -4449,6 +4458,17 @@ TEST_F(DeliveryCoreReferences,
               "SELECT proto_action_fault(NEW.id); INSERT INTO "
               "proto_commit_child "
               "VALUES(NEW.id); END"_ns));
+      nsCOMPtr<mozIStorageStatement> foreignKeys;
+      ASSERT_EQ(NS_OK,
+                mConnection->CreateStatement("PRAGMA foreign_keys"_ns,
+                                             getter_AddRefs(foreignKeys)));
+      bool more;
+      ASSERT_EQ(NS_OK, foreignKeys->ExecuteStep(&more));
+      ASSERT_TRUE(more);
+      int32_t enabled;
+      ASSERT_EQ(NS_OK, foreignKeys->GetInt32(0, &enabled));
+      EXPECT_EQ(1, enabled);
+      ASSERT_EQ(NS_OK, foreignKeys->Finalize());
     }
     Message* output = staged.get();
     EXPECT_EQ(mode == 0 ? NS_ERROR_FAILURE : NS_ERROR_STORAGE_CONSTRAINT,

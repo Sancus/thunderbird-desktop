@@ -4248,7 +4248,7 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
   if (mDatabase && publishHeader) {
 #ifdef MOZ_PANORAMA
     bool suppressParsedNew = false;
-    if (m_filterHeader && parsedWasNew && !m_msgMovedByFilter) {
+    if (m_filterHeader && parsedWasNew) {
       uint32_t flags;
       MOZ_TRY(newMsgHdr->GetFlags(&flags));
       suppressParsedNew = !(flags & nsMsgMessageFlags::New);
@@ -4257,8 +4257,8 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
     MOZ_TRY(AddNewImapHeaderToDB(newMsgHdr, expectedEpoch, uid));
 #ifdef MOZ_PANORAMA
     if (suppressParsedNew) {
-      // Settle this header's filter decision once after successful publication.
-      // Moves retain their existing deferred-delete count owner.
+      // Settle an actual New-to-not-New filter decision once after publication.
+      // A deferred delete only counts a source that still had New when queued.
       int32_t numNewMessages;
       MOZ_TRY(GetNumNewMessages(false, &numNewMessages));
       MOZ_TRY(SetNumNewMessages(numNewMessages - 1));
@@ -4681,12 +4681,14 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
           // note that delete falls through to move.
           [[fallthrough]];
         case nsMsgFilterAction::MoveToFolder: {
-          // if moving to a different file, do it.
+          // A no-Trash Delete has already queued its flags and has no move
+          // target.
           nsCString uri;
           rv = GetURI(uri);
           if (NS_FAILED(rv)) break;
 
-          if (!actionTargetFolderUri.Equals(uri)) {
+          if (!actionTargetFolderUri.IsEmpty() &&
+              !actionTargetFolderUri.Equals(uri)) {
             msgHdr->GetFlags(&msgFlags);
             if (msgFlags & nsMsgMessageFlags::MDNReportNeeded && !isRead) {
               rv = suppressMdn();
@@ -4901,7 +4903,8 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
               // are active, but we are not going to mark it read in this
               // action, preferring to leave the choice to the user.
               // So correct numNewMessages.
-              if (m_filterListRequiresBody) {
+              if (m_filterListRequiresBody &&
+                  !mail_panorama_enabled_AtStartup()) {
                 msgHdr->GetFlags(&msgFlags);
                 if (!(msgFlags & nsMsgMessageFlags::Read)) {
                   int32_t numNewMessages;
@@ -6168,9 +6171,39 @@ nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
           NS_ENSURE_SUCCESS(rv, rv);
         }
       }
-      MOZ_TRY(m_filterList->ApplyFiltersToHdr(nsMsgFilterType::InboxRule,
-                                              newMsgHdr, this, mDatabase,
-                                              EmptyCString(), this, msgWindow));
+#ifdef MOZ_PANORAMA
+      uint32_t bodyFlagsBefore = 0;
+      if (mail_panorama_enabled_AtStartup())
+        MOZ_TRY(newMsgHdr->GetFlags(&bodyFlagsBefore));
+#endif
+      nsresult filterRv = m_filterList->ApplyFiltersToHdr(
+          nsMsgFilterType::InboxRule, newMsgHdr, this, mDatabase,
+          EmptyCString(), this, msgWindow);
+      nsresult settleRv = NS_OK;
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup()) {
+        settleRv = [&]() -> nsresult {
+          NS_ENSURE_TRUE(m_filterBodySource, NS_ERROR_NOT_AVAILABLE);
+          MOZ_TRY(ValidateFilterBodySource(*m_filterBodySource, newMsgHdr));
+          uint32_t flags;
+          MOZ_TRY(newMsgHdr->GetFlags(&flags));
+          if ((bodyFlagsBefore & nsMsgMessageFlags::New) &&
+              !(flags & nsMsgMessageFlags::New)) {
+            // Native Read and New changes can notify separately. Settle this
+            // body's transition once; a combined legacy notification may
+            // already have reset the count to zero.
+            int32_t numNewMessages;
+            MOZ_TRY(GetNumNewMessages(false, &numNewMessages));
+            if (numNewMessages > 0)
+              MOZ_TRY(SetNumNewMessages(numNewMessages - 1));
+            MOZ_TRY(CheckWithNewMessagesStatus(false));
+          }
+          return NS_OK;
+        }();
+      }
+#endif
+      NS_ENSURE_SUCCESS(filterRv, filterRv);
+      NS_ENSURE_SUCCESS(settleRv, settleRv);
       MOZ_TRY(NotifyFolderEvent(kFiltersApplied));
     }
     // Process filter plugins and other items normally done at the end of
@@ -11315,7 +11348,8 @@ nsresult nsImapMailFolder::ProcessDeferredFilterActions() {
         mDatabase->MarkImapDeleted(key, true, nullptr);
         mDatabase->MarkNotNew(key, nullptr);
       }
-      if (!m_filterListRequiresBody && newMessagesToDelete > 0) {
+      if ((!m_filterListRequiresBody || mail_panorama_enabled_AtStartup()) &&
+          newMessagesToDelete > 0) {
         int32_t numNewMessages;
         GetNumNewMessages(false, &numNewMessages);
         SetNumNewMessages(std::max(

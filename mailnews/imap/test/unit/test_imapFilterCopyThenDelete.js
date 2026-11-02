@@ -119,6 +119,16 @@ add_setup(async function setupNativeCopyThenDelete() {
 });
 
 add_task(async function testCopyFinishesBeforeDelete() {
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (native) {
+    const oldFolderBiff = IMAPPump.inbox.performingBiff;
+    const oldServerBiff = IMAPPump.incomingServer.performingBiff;
+    registerCleanupFunction(() => {
+      IMAPPump.inbox.performingBiff = oldFolderBiff;
+      IMAPPump.incomingServer.performingBiff = oldServerBiff;
+    });
+    IMAPPump.inbox.performingBiff = true;
+  }
   const generator = new MessageGenerator();
   for (let index = 0; index < MESSAGE_COUNT; index++) {
     const message = generator.makeMessage({
@@ -188,5 +198,10 @@ add_task(async function testCopyFinishesBeforeDelete() {
       BODY_SENTINELS[index],
       `${MESSAGE_IDS[index]} should retain its complete body`
     );
+  }
+  if (native) {
+    Assert.equal(IMAPPump.inbox.getNumNewMessages(false), 0);
+    Assert.equal(IMAPPump.inbox.hasNewMessages, false);
+    Assert.equal(IMAPPump.inbox.msgDatabase.getNewList().length, 0);
   }
 });

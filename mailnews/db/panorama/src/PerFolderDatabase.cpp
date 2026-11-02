@@ -883,22 +883,18 @@ NS_IMETHODIMP PerFolderDatabase::ContainsKey(nsMsgKey key, bool* contains) {
   NS_ENSURE_ARG_POINTER(contains);
   *contains = false;
 
-  nsresult rv = MessageDB().MessageExists(key, *contains);
-  NS_ENSURE_SUCCESS(rv, rv);
-  if (!*contains) {
+  bool exists;
+  MOZ_TRY(MessageDB().MessageExists(key, exists));
+  if (!exists) {
     return NS_OK;
   }
 
-  // Sanity check.
-  uint64_t msgFolderId;
-  rv = MessageDB().GetMessageFolderId(key, msgFolderId);
-  NS_ENSURE_SUCCESS(rv, rv);
-  if (msgFolderId != mFolderId) {
-    *contains = false;
-  }
+  // Recheck the physical row even when its old folder is still cached.
+  CapturedMessage current;
+  MOZ_TRY(MessageDB().CaptureMessage(key, current));
+  *contains = current.folderId == mFolderId;
   return NS_OK;
 }
-
 NS_IMETHODIMP PerFolderDatabase::CreateNewHdr(nsIMsgDBHdr** aRetVal) {
   NS_ENSURE_ARG_POINTER(aRetVal);
   RefPtr<DetachedMsgHdr> hdr = new DetachedMsgHdr(mFolderId);

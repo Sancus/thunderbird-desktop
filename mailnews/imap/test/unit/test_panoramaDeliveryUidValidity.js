@@ -401,6 +401,509 @@ add_task(async function test_replacesMessagesFromOldUidValidity() {
   info('DELIVERY_PHASE {"phase":"uidvalidity-reset-verified"}');
 });
 
+let commandFixture;
+
+add_task(async function test_commandKeysTranslateToScopedUids() {
+  const daemon = new ImapDaemon();
+  const server = makeServer(daemon, "RFC2195,RFC4315", {
+    kUsername: "command-user",
+  });
+  let account = null;
+  let incomingServer = null;
+  registerCleanupFunction(() => {
+    try {
+      incomingServer?.QueryInterface(Ci.nsIImapServerSink).abortQueuedUrls();
+      incomingServer?.closeCachedConnections();
+    } finally {
+      server.stop();
+      if (account) {
+        MailServices.accounts.removeAccount(account, false);
+      }
+    }
+  });
+  account = MailServices.accounts.createAccount();
+  incomingServer = MailServices.accounts
+    .createIncomingServer("command-user", "localhost", "imap")
+    .QueryInterface(Ci.nsIImapIncomingServer);
+  account.incomingServer = incomingServer;
+  const identity = MailServices.accounts.createIdentity();
+  account.addIdentity(identity);
+  account.defaultIdentity = identity;
+  incomingServer.port = server.port;
+  incomingServer.password = "password";
+  incomingServer.maximumConnectionsNumber = 1;
+  incomingServer.useIdle = false;
+  incomingServer.useCondStore = false;
+  incomingServer.offlineDownload = false;
+  incomingServer.downloadOnBiff = false;
+  incomingServer.setBoolValue("autosync_offline_stores", false);
+  const root = incomingServer.rootFolder;
+  const mailbox = daemon.createMailbox("CommandSource", {
+    subscribed: true,
+    uidvalidity: 8101,
+  });
+  for (const uid of [4001, 4011, 4021, 4031]) {
+    addEpochMessage(
+      mailbox,
+      uid,
+      `command-${uid}@example.invalid`,
+      `Command ${uid}`,
+      `Source body at UID ${uid}.`
+    );
+  }
+  const foreignMailbox = daemon.createMailbox("CommandForeign", {
+    subscribed: true,
+    uidvalidity: 8101,
+  });
+  addEpochMessage(
+    foreignMailbox,
+    4001,
+    "foreign-command@example.invalid",
+    "Foreign command",
+    "Foreign body at the same UID."
+  );
+  const destinationMailbox = daemon.createMailbox("CommandDestination", {
+    subscribed: true,
+    uidvalidity: 8202,
+  });
+  addEpochMessage(
+    destinationMailbox,
+    9001,
+    "destination-sentinel@example.invalid",
+    "Destination sentinel",
+    "Keep the destination sentinel."
+  );
+  const discovery = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(root, discovery, null);
+  await discovery.promise;
+  const [source, foreign, destination] = [
+    "CommandSource",
+    "CommandForeign",
+    "CommandDestination",
+  ].map(name =>
+    root.getChildNamed(name).QueryInterface(Ci.nsIMsgImapMailFolder)
+  );
+  for (const folder of [source, foreign, destination]) {
+    PanoramaDelivery.assertFolder(folder, fixture.lane);
+    folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+    await updateEpochFolder(folder);
+  }
+  const headers = [4001, 4011, 4021, 4031].map(uid =>
+    source.msgDatabase.getMsgHdrForMessageID(`command-${uid}@example.invalid`)
+  );
+  const foreignHeader = foreign.msgDatabase.getMsgHdrForMessageID(
+    "foreign-command@example.invalid"
+  );
+  for (const [i, header] of headers.entries()) {
+    Assert.equal(header.folder, source);
+    Assert.equal(header.getUint32Property("uidOnServer"), 4001 + i * 10);
+    Assert.notEqual(header.messageKey, 4001 + i * 10);
+  }
+  Assert.notEqual(headers[0].messageKey, foreignHeader.messageKey);
+  commandFixture = {
+    daemon,
+    server,
+    incomingServer,
+    source,
+    foreign,
+    destination,
+    mailbox,
+    foreignMailbox,
+    destinationMailbox,
+    headers,
+    foreignHeader,
+  };
+
+  let before = commandWire().length;
+  await assertEpochBody(
+    foreign,
+    foreignHeader.messageKey,
+    "foreign-command@example.invalid",
+    "Foreign body at the same UID.\r\n"
+  );
+  await assertEpochBody(
+    source,
+    headers[1].messageKey,
+    "command-4011@example.invalid",
+    "Source body at UID 4011.\r\n"
+  );
+  await assertEpochBody(
+    source,
+    headers[0].messageKey,
+    "command-4001@example.invalid",
+    "Source body at UID 4001.\r\n"
+  );
+  const fetches = commandWire()
+    .slice(before)
+    .filter(line => / uid fetch /i.test(line));
+  Assert.ok(fetches.some(line => / uid fetch 4001 /i.test(line)));
+  Assert.ok(fetches.some(line => / uid fetch 4011 /i.test(line)));
+
+  before = commandWire().length;
+  const keys = [
+    headers[1].messageKey,
+    headers[0].messageKey,
+    headers[0].messageKey,
+  ];
+  const flags = new PromiseTestUtils.PromiseUrlListener();
+  source.storeImapFlags(0x0004 /* kImapMsgFlaggedFlag */, true, keys, flags);
+  await flags.promise;
+  Assert.deepEqual(
+    commandWire()
+      .slice(before)
+      .filter(line => / uid store /i.test(line))
+      .map(line => line.match(/ uid store (\S+)/i)[1]),
+    ["4001,4011"]
+  );
+  Assert.ok(mailbox._messages[0].flags.includes("\\Flagged"));
+  Assert.ok(mailbox._messages[1].flags.includes("\\Flagged"));
+  Assert.ok(!mailbox._messages[2].flags.includes("\\Flagged"));
+  Assert.deepEqual(foreignMailbox._messages[0].flags, []);
+  await commandKeyword("scoped", "", keys);
+  Assert.ok(mailbox._messages[0].flags.includes("Scoped"));
+  Assert.ok(mailbox._messages[1].flags.includes("Scoped"));
+  Assert.deepEqual(foreignMailbox._messages[0].flags, []);
+
+  before = commandWire().length;
+  const stops = [];
+  const copy = new PromiseTestUtils.PromiseCopyListener({
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
+  MailServices.copy.copyMessages(
+    source,
+    [headers[1], headers[0]],
+    destination,
+    false,
+    copy,
+    null,
+    false
+  );
+  await copy.promise;
+  Assert.deepEqual(stops, [Cr.NS_OK], "COPY completes exactly once");
+  Assert.deepEqual(
+    commandWire()
+      .slice(before)
+      .filter(line => / uid copy /i.test(line))
+      .map(line => line.match(/ uid copy (\S+)/i)[1]),
+    ["4001,4011"]
+  );
+  Assert.deepEqual(
+    mailbox._messages.map(message => message.uid),
+    [4001, 4011, 4021, 4031]
+  );
+  Assert.equal(
+    source.getTotalMessages(false),
+    4,
+    "COPY preserves source membership"
+  );
+  Assert.equal(destinationMailbox._messages.length, 3);
+  assertEpochSource(
+    destinationMailbox._messages[1].getText(),
+    "command-4001@example.invalid",
+    "Source body at UID 4001.\r\n"
+  );
+  assertEpochSource(
+    destinationMailbox._messages[2].getText(),
+    "command-4011@example.invalid",
+    "Source body at UID 4011.\r\n"
+  );
+  await updateEpochFolder(destination);
+  for (const header of headers.slice(0, 2)) {
+    const copied = destination.msgDatabase.getMsgHdrForMessageID(
+      header.messageId
+    );
+    Assert.equal(copied.folder, destination);
+    Assert.notEqual(copied.messageKey, header.messageKey);
+    Assert.greater(copied.getUint32Property("uidOnServer"), 9001);
+  }
+
+  incomingServer.deleteModel = Ci.nsMsgImapDeleteModels.IMAPDelete;
+  before = commandWire().length;
+  const deleted = [];
+  const deletion = new PromiseTestUtils.PromiseCopyListener({
+    onStopCopy(status) {
+      deleted.push(status);
+    },
+  });
+  source.deleteMessages([headers[2]], null, true, false, deletion, false);
+  await deletion.promise;
+  Assert.deepEqual(deleted, [Cr.NS_OK], "DELETE completes exactly once");
+  Assert.deepEqual(
+    commandWire()
+      .slice(before)
+      .filter(line => / uid store /i.test(line))
+      .map(line => line.match(/ uid store (\S+)/i)[1]),
+    ["4021"]
+  );
+  Assert.ok(mailbox._messages[2].flags.includes("\\Deleted"));
+  Assert.ok(!mailbox._messages[0].flags.includes("\\Deleted"));
+  Assert.ok(!mailbox._messages[1].flags.includes("\\Deleted"));
+  Assert.deepEqual(foreignMailbox._messages[0].flags, []);
+});
+
+add_task(async function test_commandPreflightRejectsInvalidAndForeignKeys() {
+  const { source, headers, foreignHeader } = commandFixture;
+  for (const key of [0, 0xffffffff]) {
+    assertCommandKeyRefused(key, Cr.NS_ERROR_INVALID_ARG);
+  }
+  assertCommandKeyRefused(foreignHeader.messageKey, Cr.NS_ERROR_NOT_AVAILABLE);
+  assertCommandCopyRefused(foreignHeader, Cr.NS_ERROR_ILLEGAL_VALUE);
+
+  const header = headers[1];
+  const uid = header.getUint32Property("uidOnServer");
+  try {
+    header.setUint32Property("uidOnServer", 0);
+    assertCommandKeyRefused(header.messageKey, Cr.NS_ERROR_NOT_AVAILABLE);
+    assertCommandCopyRefused(header, Cr.NS_ERROR_NOT_AVAILABLE);
+  } finally {
+    header.setUint32Property("uidOnServer", uid);
+  }
+  // Remove an actual parsed physical message, retaining its original key for
+  // the missing-input case. No replacement header or UID is manufactured.
+  const removedKey = headers[3].messageKey;
+  source.msgDatabase.deleteMessages([removedKey], null);
+  assertCommandKeyRefused(removedKey, Cr.NS_ERROR_UNEXPECTED);
+  await assertCommandRefusalBarrier();
+});
+
+add_task(async function test_commandPreflightRejectsStaleObservedEpoch() {
+  const { source, headers } = commandFixture;
+  const sink = source.QueryInterface(Ci.nsIImapMailFolderSink);
+  const epoch = source.msgDatabase.dBFolderInfo.imapUidValidity;
+  Assert.equal(sink.uidValidity, epoch);
+  try {
+    sink.uidValidity = epoch + 1;
+    assertCommandKeyRefused(headers[1].messageKey, Cr.NS_ERROR_NOT_AVAILABLE);
+    assertCommandCopyRefused(headers[1], Cr.NS_ERROR_NOT_AVAILABLE);
+    Assert.equal(
+      source.msgDatabase.dBFolderInfo.imapUidValidity,
+      epoch,
+      "Observing a different epoch does not persist or retire the old binding"
+    );
+  } finally {
+    sink.uidValidity = epoch;
+  }
+  await assertCommandRefusalBarrier();
+});
+
+/** @returns {string[]} All real commands on the dedicated UIDPLUS server. */
+function commandWire() {
+  const transactions = commandFixture.server.playTransaction();
+  return (Array.isArray(transactions) ? transactions : [transactions]).flatMap(
+    transaction => transaction.them
+  );
+}
+
+/**
+ * Runs a real keyword STORE and checks URL completion exactly once.
+ *
+ * @param {string} add - Keywords to add.
+ * @param {string} remove - Keywords to remove.
+ * @param {number[]} keys - Physical source keys.
+ * @returns {Promise<void>} Resolves after checked URL completion.
+ */
+async function commandKeyword(add, remove, keys) {
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseUrlListener({
+    OnStopRunningUrl(url, status) {
+      stops.push(status);
+    },
+  });
+  const uri = commandFixture.source.storeCustomKeywords(
+    null,
+    add,
+    remove,
+    keys
+  );
+  uri.QueryInterface(Ci.nsIMsgMailNewsUrl).RegisterListener(listener);
+  await listener.promise;
+  Assert.deepEqual(stops, [Cr.NS_OK]);
+}
+
+/**
+ * Checks synchronous key preflight, including the valid prefix of array inputs.
+ *
+ * @param {number} key - The rejected physical key.
+ * @param {nsresult} status - The exact expected failure.
+ */
+function assertCommandKeyRefused(key, status) {
+  const { source, headers } = commandFixture;
+  const before = commandWire();
+  const calls = [];
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI([
+      "nsIStreamListener",
+      "nsIUrlListener",
+      "nsIMsgCopyServiceListener",
+    ]),
+    onStartRequest() {
+      calls.push("stream-start");
+    },
+    onDataAvailable() {
+      calls.push("data");
+    },
+    onStopRequest() {
+      calls.push("stream-stop");
+    },
+    OnStartRunningUrl() {
+      calls.push("url-start");
+    },
+    OnStopRunningUrl() {
+      calls.push("url-stop");
+    },
+    onStartCopy() {
+      calls.push("copy-start");
+    },
+    onStopCopy() {
+      calls.push("copy-stop");
+    },
+  };
+  const uri = source.generateMessageURI(key);
+  const service = MailServices.messageServiceFromURI(uri);
+  for (const action of [
+    () =>
+      service.streamMessage(uri, listener, null, listener, false, "", false),
+    () =>
+      source.storeImapFlags(
+        0x0004,
+        true,
+        [headers[0].messageKey, key],
+        listener
+      ),
+    () =>
+      source.storeCustomKeywords(null, "blocked", "", [
+        headers[0].messageKey,
+        key,
+      ]),
+  ]) {
+    Assert.throws(
+      action,
+      error => error.result == status,
+      `Physical key ${key} is refused with its original typed error`
+    );
+  }
+  Assert.deepEqual(
+    calls,
+    [],
+    "Synchronous refusal starts no listener or byte stream"
+  );
+  Assert.deepEqual(
+    commandWire(),
+    before,
+    "No command is issued for a rejected key"
+  );
+}
+
+/**
+ * Checks full header-array preflight in COPY and key-array preflight in DELETE.
+ *
+ * @param {nsIMsgDBHdr} header - A real parsed header with a rejected association.
+ * @param {nsresult} copyStatus - The actual COPY membership/translation error.
+ */
+function assertCommandCopyRefused(header, copyStatus) {
+  const { source, destination, headers } = commandFixture;
+  const before = commandWire();
+  const stops = [];
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStopCopy(status) {
+      stops.push(status);
+    },
+  });
+  Assert.throws(
+    () =>
+      destination.copyMessages(
+        source,
+        [headers[0], header],
+        false,
+        null,
+        listener,
+        false,
+        false
+      ),
+    error => error.result == copyStatus
+  );
+  // DELETE addresses the source database, so a foreign key fails its reverse
+  // mapping rather than COPY's earlier public-header membership check.
+  const deleteStatus =
+    header.folder == source ? copyStatus : Cr.NS_ERROR_NOT_AVAILABLE;
+  Assert.throws(
+    () =>
+      source.deleteMessages(
+        [headers[0], header],
+        null,
+        true,
+        false,
+        listener,
+        false
+      ),
+    error => error.result == deleteStatus
+  );
+  Assert.deepEqual(
+    stops,
+    [],
+    "Preflight refusal does not report successful completion"
+  );
+  Assert.deepEqual(
+    commandWire(),
+    before,
+    "No COPY or DELETE command is issued"
+  );
+}
+
+/**
+ * Waits behind all rejected work and checks source/destination custody.
+ *
+ * @returns {Promise<void>} Resolves after the checked barrier STOREs.
+ */
+async function assertCommandRefusalBarrier() {
+  const { source, mailbox, foreignMailbox, destinationMailbox, headers } =
+    commandFixture;
+  const before = commandWire().length;
+  const snapshot = [mailbox, foreignMailbox, destinationMailbox].map(box =>
+    box._messages.map(message => [
+      message.uid,
+      [...message.flags],
+      message.getText(),
+    ])
+  );
+  const keys = source.msgDatabase.listAllKeys();
+  await commandKeyword("barrier", "", [headers[0].messageKey]);
+  await commandKeyword("", "barrier", [headers[0].messageKey]);
+  Assert.deepEqual(
+    commandWire()
+      .slice(before)
+      .filter(line => / uid (?:fetch|store|copy|move|expunge) /i.test(line))
+      .map(line =>
+        line
+          .match(/ uid store (\S+) ([+-]FLAGS)(?:\.SILENT)? \(([^)]*)\)/i)
+          .slice(1)
+      ),
+    [
+      ["4001", "+FLAGS", "barrier"],
+      ["4001", "-FLAGS", "barrier"],
+    ],
+    "Only the two explicit barrier STOREs reach the server"
+  );
+  Assert.deepEqual(
+    [mailbox, foreignMailbox, destinationMailbox].map(box =>
+      box._messages.map(message => [
+        message.uid,
+        [...message.flags],
+        message.getText(),
+      ])
+    ),
+    snapshot,
+    "Rejected work preserves every server UID, flag and body"
+  );
+  Assert.deepEqual(
+    source.msgDatabase.listAllKeys(),
+    keys,
+    "Rejected work preserves physical source membership"
+  );
+}
+
 /**
  * Adds literal message data to the fake mailbox at the supplied UID.
  *

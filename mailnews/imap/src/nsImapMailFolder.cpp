@@ -101,7 +101,7 @@
 // Owned slots survive synchronous publication and a failed association/commit.
 struct NativeFilterHeader {
   struct Action {
-    enum class Kind { Flags, Keywords, Copy, Forward };
+    enum class Kind { Flags, Keywords, ThreadFlags, Copy, Forward };
     Kind kind;
     int32_t flags = 0;
     bool add = false;
@@ -4795,36 +4795,52 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
         case nsMsgFilterAction::KillThread:
         case nsMsgFilterAction::WatchThread: {
           nsCOMPtr<nsIMsgThread> msgThread;
-          nsMsgKey threadKey;
 #ifdef MOZ_PANORAMA
           if (staged) {
             rv = staged->GetExistingThread(getter_AddRefs(msgThread));
+            if (NS_FAILED(rv)) break;
+            const uint32_t flag = actionType == nsMsgFilterAction::KillThread
+                                      ? nsMsgMessageFlags::Ignored
+                                      : nsMsgMessageFlags::Watched;
+            // The current physical key is still unpublished, even when its
+            // References have already resolved to an existing thread. Consume
+            // this intent on the final thread at the publication boundary.
+            rv = msgHdr->SetUint32Property("ProtoThreadFlags", flag);
+            if (NS_SUCCEEDED(rv) && msgThread) {
+              // Preserve the existing action's opposite-bit clearing and
+              // notification through the original live publication output.
+              NativeFilterHeader::Action operation;
+              operation.kind = NativeFilterHeader::Action::Kind::ThreadFlags;
+              operation.flags = flag;
+              m_filterHeader->actions.AppendElement(std::move(operation));
+            }
           } else
 #endif
           {
             rv = mDatabase->GetThreadContainingMsgHdr(
                 msgHdr, getter_AddRefs(msgThread));
-          }
-          if (NS_FAILED(rv)) break;
-          if (msgThread) {
-            rv = msgThread->GetThreadKey(&threadKey);
             if (NS_FAILED(rv)) break;
+            if (msgThread) {
+              nsMsgKey threadKey;
+              rv = msgThread->GetThreadKey(&threadKey);
+              if (NS_FAILED(rv)) break;
 #ifdef MOZ_PANORAMA
-            if (mail_panorama_enabled_AtStartup()) threadKey = msgKey;
+              if (mail_panorama_enabled_AtStartup()) threadKey = msgKey;
 #endif
-            if (actionType == nsMsgFilterAction::KillThread)
-              rv = mDatabase->MarkThreadIgnored(msgThread, threadKey, true,
-                                                nullptr);
-            else
-              rv = mDatabase->MarkThreadWatched(msgThread, threadKey, true,
-                                                nullptr);
-          } else {
-            if (actionType == nsMsgFilterAction::KillThread)
-              rv = msgHdr->SetUint32Property("ProtoThreadFlags",
-                                             nsMsgMessageFlags::Ignored);
-            else
-              rv = msgHdr->SetUint32Property("ProtoThreadFlags",
-                                             nsMsgMessageFlags::Watched);
+              if (actionType == nsMsgFilterAction::KillThread)
+                rv = mDatabase->MarkThreadIgnored(msgThread, threadKey, true,
+                                                  nullptr);
+              else
+                rv = mDatabase->MarkThreadWatched(msgThread, threadKey, true,
+                                                  nullptr);
+            } else {
+              if (actionType == nsMsgFilterAction::KillThread)
+                rv = msgHdr->SetUint32Property("ProtoThreadFlags",
+                                               nsMsgMessageFlags::Ignored);
+              else
+                rv = msgHdr->SetUint32Property("ProtoThreadFlags",
+                                               nsMsgMessageFlags::Watched);
+            }
           }
           if (actionType == nsMsgFilterAction::KillThread) {
             if (NS_SUCCEEDED(rv)) rv = markRead(true);
@@ -5418,8 +5434,21 @@ nsresult nsImapMailFolder::MoveIncorporatedMessage(
   nsresult rv;
   if (m_moveCoalescer) {
     nsCOMPtr<nsIMsgFolder> destIFolder;
-    rv = GetOrCreateFolder(destFolderUri, getter_AddRefs(destIFolder));
-    NS_ENSURE_SUCCESS(rv, rv);
+    if (mail_panorama_enabled_AtStartup()) {
+      MOZ_TRY(FindFolder(destFolderUri, getter_AddRefs(destIFolder)));
+      if (!destIFolder) {
+        if (filter) {
+          MOZ_TRY(filter->SetEnabled(false));
+          NS_ENSURE_STATE(m_filterList);
+          MOZ_TRY(m_filterList->SaveToDefaultFile());
+          MOZ_TRY(ThrowAlertMsg("filterDisabled", msgWindow));
+        }
+        return NS_MSG_NOT_A_MAIL_FOLDER;
+      }
+    } else {
+      rv = GetOrCreateFolder(destFolderUri, getter_AddRefs(destIFolder));
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
 
     if (destIFolder) {
       // check if the destination is a real folder (by checking for null parent)
@@ -5921,6 +5950,19 @@ nsresult nsImapMailFolder::StartParsedFilterActions() {
           break;
         case NativeFilterHeader::Action::Kind::Keywords:
           rv = AddKeywordsToMessages({header.get()}, operation.target);
+          break;
+        case NativeFilterHeader::Action::Kind::ThreadFlags:
+          rv = [&]() -> nsresult {
+            nsCOMPtr<nsIMsgThread> thread;
+            MOZ_TRY(mDatabase->GetThreadContainingMsgHdr(
+                header, getter_AddRefs(thread)));
+            NS_ENSURE_STATE(thread);
+            return operation.flags == nsMsgMessageFlags::Ignored
+                       ? mDatabase->MarkThreadIgnored(thread, location.key,
+                                                      true, nullptr)
+                       : mDatabase->MarkThreadWatched(thread, location.key,
+                                                      true, nullptr);
+          }();
           break;
         case NativeFilterHeader::Action::Kind::Forward: {
           nsCOMPtr<nsIMsgComposeService> service =

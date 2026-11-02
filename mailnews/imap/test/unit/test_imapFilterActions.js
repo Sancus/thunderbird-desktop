@@ -805,3 +805,247 @@ async function checkNativeDeleteWithoutTrash(needsBody) {
     server.performingBiff = oldServerBiff;
   }
 }
+
+add_task(async function test_nativeMissingMoveTargetDisablesAndRecovers() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const inbox = IMAPPump.inbox;
+  const root = IMAPPump.incomingServer.rootFolder;
+  const commands = () => {
+    const transaction = IMAPPump.server.playTransaction();
+    return (Array.isArray(transaction) ? transaction : [transaction])
+      .flatMap(item => item.them)
+      .map(command => command.toUpperCase());
+  };
+  const rowsForUid = uid =>
+    Array.from(inbox.msgDatabase.enumerateMessages()).filter(
+      header => header.getUint32Property("uidOnServer") == uid
+    );
+  for (const needsBody of [false, true]) {
+    const filter = needsBody ? gBodyFilter : gFilter;
+    const target =
+      root.URI +
+      (needsBody
+        ? "/missing-body-filter-target"
+        : "/missing-header-filter-target");
+    Assert.equal(MailServices.folderLookup.getFolderForURL(target), null);
+    const start = commands().length;
+    const uid = IMAPPump.mailbox.uidnext;
+    const sourceDataURI = specForFileName(gMessage);
+    const sourceText = new ImapMessage(sourceDataURI, uid, []).getText();
+    gAction.type = Ci.nsMsgFilterAction.MoveToFolder;
+    gAction.targetFolderUri = target;
+    // setupTest supplies the same retained file/UID through the real producer.
+    await Assert.rejects(
+      setupTest(filter, gAction),
+      error => Number(error.message) === Cr.NS_MSG_NOT_A_MAIL_FOLDER
+    );
+    Assert.equal(gIncomingUid, uid);
+    const actualSource = IMAPPump.mailbox._messages.find(
+      message => message.uid == uid
+    );
+    Assert.ok(actualSource);
+    Assert.equal(actualSource._URI, sourceDataURI);
+    Assert.equal(actualSource.getText(), sourceText);
+    Assert.ok(!actualSource.flags.includes("\\Deleted"));
+    Assert.equal(filter.enabled, false);
+    const list = IMAPPump.incomingServer.getFilterList(null);
+    Assert.ok(list.defaultFile.exists());
+    const saved = MailServices.filters.OpenFilterList(
+      list.defaultFile,
+      root,
+      null
+    );
+    const savedFilter = saved.getFilterNamed(filter.filterName);
+    Assert.ok(savedFilter);
+    Assert.equal(savedFilter.enabled, false);
+    Assert.equal(savedFilter.getActionAt(0).targetFolderUri, target);
+    const initialRows = rowsForUid(uid);
+    Assert.equal(initialRows.length, needsBody ? 1 : 0);
+    const originalKey = needsBody ? initialRows[0].messageKey : null;
+    if (needsBody) {
+      Assert.ok(initialRows[0].flags & Ci.nsMsgMessageFlags.Offline);
+    }
+    const headerFetches = () =>
+      commands()
+        .slice(start)
+        .filter(
+          command =>
+            command.includes("UID FETCH") &&
+            command.includes("BODY.PEEK[HEADER")
+        ).length;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const before = headerFetches();
+      const listener = new PromiseTestUtils.PromiseUrlListener();
+      inbox.updateFolderWithListener(null, listener);
+      await listener.promise;
+      const rows = rowsForUid(uid);
+      Assert.equal(rows.length, 1);
+      Assert.notEqual(rows[0].messageKey, uid);
+      if (needsBody) {
+        Assert.equal(rows[0].messageKey, originalKey);
+        Assert.ok(rows[0].flags & Ci.nsMsgMessageFlags.Offline);
+      }
+      Assert.equal(
+        headerFetches() - before,
+        !needsBody && attempt == 0 ? 1 : 0
+      );
+      Assert.equal(
+        IMAPPump.mailbox._messages.find(message => message.uid == uid),
+        actualSource
+      );
+    }
+    const nextUid = IMAPPump.mailbox.uidnext++;
+    gIncomingUid = nextUid;
+    IMAPPump.mailbox.addMessage(
+      new ImapMessage(specForFileName(gMessage), nextUid, [])
+    );
+    const later = new PromiseTestUtils.PromiseUrlListener();
+    inbox.updateFolderWithListener(null, later);
+    await later.promise;
+    Assert.equal(rowsForUid(uid).length, 1);
+    Assert.equal(actualSource.getText(), sourceText);
+    Assert.equal(rowsForUid(nextUid).length, 1);
+    Assert.notEqual(rowsForUid(nextUid)[0].messageKey, nextUid);
+    Assert.equal(MailServices.folderLookup.getFolderForURL(target), null);
+    Assert.ok(
+      !commands()
+        .slice(start)
+        .some(
+          command =>
+            command.includes("UID MOVE") ||
+            command.includes("UID COPY") ||
+            (command.includes("UID STORE") && command.includes("\\DELETED"))
+        )
+    );
+  }
+});
+
+add_task(async function test_nativeExistingThreadActions() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const inbox = IMAPPump.inbox;
+  const database = inbox.msgDatabase;
+  const list = IMAPPump.incomingServer.getFilterList(null);
+  const rowsForUid = uid =>
+    Array.from(database.enumerateMessages()).filter(
+      header => header.getUint32Property("uidOnServer") == uid
+    );
+  const clearFilters = () => {
+    while (list.filterCount) {
+      list.removeFilterAt(0);
+    }
+  };
+  const sync = async () => {
+    const listener = new PromiseTestUtils.PromiseUrlListener();
+    inbox.updateFolderWithListener(null, listener);
+    await listener.promise;
+    await PromiseTestUtils.promiseDelay(200);
+  };
+  const inject = (id, parentId = null) => {
+    const uid = IMAPPump.mailbox.uidnext++;
+    const source = [
+      "From: sender@example.invalid",
+      "To: recipient@example.invalid",
+      "Date: Sun, 1 Nov 2026 12:00:00 +0000",
+      `Message-ID: <${id}>`,
+      ...(parentId ? [`References: <${parentId}>`] : []),
+      `Subject: ${gMessageSubject}`,
+      "",
+      gMessageInBody,
+      "",
+    ].join("\r\n");
+    gIncomingUid = uid;
+    const message = new ImapMessage(
+      "data:text/plain;base64," + btoa(source),
+      uid,
+      []
+    );
+    IMAPPump.mailbox.addMessage(message);
+    return { uid, message };
+  };
+  const added = gInboxListener.onHdrAdded;
+  try {
+    for (const needsBody of [false, true]) {
+      clearFilters();
+      const parentId = `native-filter-parent-${needsBody}@example.invalid`;
+      const parentInput = inject(parentId);
+      await sync();
+      const parentRows = rowsForUid(parentInput.uid);
+      Assert.equal(parentRows.length, 1);
+      const parent = parentRows[0];
+      Assert.notEqual(parent.messageKey, parentInput.uid);
+      const threadKey = database.getThreadContainingMsgHdr(parent).threadKey;
+      let children = 1;
+      for (const type of [
+        Ci.nsMsgFilterAction.KillThread,
+        Ci.nsMsgFilterAction.WatchThread,
+        Ci.nsMsgFilterAction.KillThread,
+      ]) {
+        const flag =
+          type == Ci.nsMsgFilterAction.KillThread
+            ? Ci.nsMsgMessageFlags.Ignored
+            : Ci.nsMsgMessageFlags.Watched;
+        const opposite =
+          type == Ci.nsMsgFilterAction.KillThread
+            ? Ci.nsMsgMessageFlags.Watched
+            : Ci.nsMsgMessageFlags.Ignored;
+        clearFilters();
+        const filter = needsBody ? gBodyFilter : gFilter;
+        filter.enabled = true;
+        filter.clearActionList();
+        gAction.type = type;
+        filter.appendAction(gAction);
+        list.insertFilterAt(0, filter);
+        let publications = 0;
+        gInboxListener.onHdrAdded = function (header) {
+          added.call(this, header);
+          publications++;
+          if (!needsBody) {
+            Assert.ok(database.getThreadContainingMsgHdr(header).flags & flag);
+            Assert.equal(header.getUint32Property("ProtoThreadFlags"), 0);
+          }
+        };
+        const input = inject(
+          `native-filter-reply-${needsBody}-${children}@example.invalid`,
+          parentId
+        );
+        await sync();
+        const rows = rowsForUid(input.uid);
+        Assert.equal(rows.length, 1);
+        const reply = rows[0];
+        Assert.equal(publications, 1);
+        Assert.notEqual(reply.messageKey, input.uid);
+        Assert.equal(reply.numReferences, 1);
+        Assert.equal(reply.getStringReference(0), parentId);
+        const thread = database.getThreadContainingMsgHdr(reply);
+        Assert.equal(thread.threadKey, threadKey);
+        Assert.equal(thread.numChildren, ++children);
+        Assert.ok(thread.flags & flag);
+        Assert.equal(thread.flags & opposite, 0);
+        Assert.equal(reply.getUint32Property("ProtoThreadFlags"), 0);
+        if (needsBody) {
+          Assert.ok(reply.flags & Ci.nsMsgMessageFlags.Offline);
+        }
+        if (type == Ci.nsMsgFilterAction.KillThread) {
+          Assert.ok(reply.isRead);
+        }
+        Assert.equal(
+          IMAPPump.mailbox._messages.find(item => item.uid == input.uid),
+          input.message
+        );
+        Assert.ok(!input.message.flags.includes("\\Deleted"));
+        await sync();
+        Assert.equal(rowsForUid(input.uid).length, 1);
+        Assert.equal(rowsForUid(input.uid)[0].messageKey, reply.messageKey);
+        Assert.equal(publications, 1);
+        gInboxListener.onHdrAdded = added;
+      }
+    }
+  } finally {
+    gInboxListener.onHdrAdded = added;
+    clearFilters();
+  }
+});

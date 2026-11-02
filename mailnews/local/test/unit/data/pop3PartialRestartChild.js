@@ -236,8 +236,19 @@ async function checkRestart() {
     Assert.equal(raw.length, header.messageSize);
     Assert.ok(!folder.locked);
   }
-  // Close actual native state before this process exits; the next call starts anew.
-  Services.obs.notifyObservers(null, "profile-before-change", null);
+  // Follow the ordinary xpcshell profile shutdown phases before exiting.
+  Services.startup.advanceShutdownPhase(
+    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNNETTEARDOWN
+  );
+  Services.startup.advanceShutdownPhase(
+    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNTEARDOWN
+  );
+  Services.startup.advanceShutdownPhase(
+    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWN
+  );
+  Services.startup.advanceShutdownPhase(
+    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNQM
+  );
 }
 
 let settled = false;

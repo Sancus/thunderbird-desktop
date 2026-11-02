@@ -204,9 +204,9 @@ add_task(async function testJunkActionsUseEachPhysicalFolder() {
   );
 });
 
-add_task(async function testJunkControlsUseEachServersWhitelist() {
+add_task(async function testJunkControlsUseEachServersAllowList() {
   await SpecialPowers.pushPrefEnv({
-    set: [["mail.trusteddomains", "whitelist.invalid"]],
+    set: [["mail.trusteddomains", "trusted.invalid"]],
   });
   const server = inbox.server;
   const otherServer = otherInbox.server;
@@ -219,24 +219,24 @@ add_task(async function testJunkControlsUseEachServersWhitelist() {
   const generator = new MessageGenerator();
   const firstFolder = server.rootFolder
     .QueryInterface(Ci.nsIMsgLocalMailFolder)
-    .createLocalSubfolder("whitelistFirst")
+    .createLocalSubfolder("trustedFirst")
     .QueryInterface(Ci.nsIMsgLocalMailFolder);
   const secondFolder = otherServer.rootFolder
     .QueryInterface(Ci.nsIMsgLocalMailFolder)
-    .createLocalSubfolder("whitelistSecond")
+    .createLocalSubfolder("trustedSecond")
     .QueryInterface(Ci.nsIMsgLocalMailFolder);
   const first = firstFolder.addMessage(
     generator
-      .makeMessage({ from: ["Trusted Sender", "sender@whitelist.invalid"] })
+      .makeMessage({ from: ["Trusted Sender", "sender@trusted.invalid"] })
       .toMessageString()
   );
   const second = secondFolder.addMessage(
     generator
-      .makeMessage({ from: ["Trusted Sender", "sender@whitelist.invalid"] })
+      .makeMessage({ from: ["Trusted Sender", "sender@trusted.invalid"] })
       .toMessageString()
   );
   const search = VirtualFolderHelper.createNewVirtualFolder(
-    "whitelistSearch",
+    "trustedSearch",
     server.rootFolder,
     [firstFolder, secondFolder],
     "ALL",
@@ -299,7 +299,7 @@ async function checkStaleClassification(action, includeQueuedMessage = false) {
   const messageId = header.messageId;
   const excludedKey = excluded.messageKey;
   const settings = source.server.spamSettings;
-  const oldWhiteList = settings.useWhiteList;
+  const oldAllowList = settings.useWhiteList;
   settings.useWhiteList = false;
   const classifier = new about3Pane.MessageClassifier(
     includeQueuedMessage ? 2 : 1
@@ -397,7 +397,7 @@ async function checkStaleClassification(action, includeQueuedMessage = false) {
     Assert.equal(completions, 1, "A repeated result does not repeat actions");
   } finally {
     Services.obs.removeObserver(observer, "message-classification-complete");
-    settings.useWhiteList = oldWhiteList;
+    settings.useWhiteList = oldAllowList;
     source.deleteSelf(null);
     destination.deleteSelf(null);
     outside.deleteSelf(null);

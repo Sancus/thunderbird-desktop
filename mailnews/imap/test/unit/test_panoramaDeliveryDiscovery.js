@@ -230,6 +230,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
   const ids = fixture.core ? [parent.id, child.id] : null;
   const rootChildren = root.subFolders;
   const nestedChildren = parent.subFolders;
+  const heldDatabase = fixture.core ? child.msgDatabase : null;
   info('DELIVERY_PHASE {"phase":"imap-discovery-repeat-ready"}');
   await discover();
   Assert.equal(
@@ -257,6 +258,11 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     "Repeated discovery adds no nested children"
   );
   if (ids) {
+    Assert.strictEqual(
+      child.msgDatabase,
+      heldDatabase,
+      "LIST preserves an already open database"
+    );
     Assert.deepEqual(
       [parent.id, child.id],
       ids,

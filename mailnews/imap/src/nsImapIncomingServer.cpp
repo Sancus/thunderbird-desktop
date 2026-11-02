@@ -1156,73 +1156,88 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
                                         getter_AddRefs(child)));
     NS_ENSURE_TRUE(child, NS_ERROR_NOT_AVAILABLE);
   }
-  if (child) {
-    nsCOMPtr<nsIMsgImapMailFolder> imapFolder = do_QueryInterface(child);
-    if (imapFolder) {
-      nsAutoCString onlineName;
-      nsAutoString unicodeName;
-      // A folder that was only the Noselect parent of its children is new as
-      // a mailbox, so discovery fetches its rights, too.
-      bool wasNoselect = false;
-      if (found && !(boxFlags & kNoselect) &&
-          NS_SUCCEEDED(
-              child->GetFlag(nsMsgFolderFlags::ImapNoselect, &wasNoselect)) &&
-          wasNoselect) {
-        *aNewFolder = true;
-        nsCOMPtr<nsIImapMailFolderSink> folderSink = do_QueryInterface(child);
-        if (folderSink) folderSink->SetFolderNeedsACLListed(true);
-      }
+  bool closeDatabase = !found;
 #ifdef MOZ_PANORAMA
-      if (StaticPrefs::mail_panorama_enabled_AtStartup() && found) {
-        bool isMail;
-        rv = child->GetFlag(nsMsgFolderFlags::Mail, &isMail);
-        NS_ENSURE_SUCCESS(rv, rv);
-        if (!isMail) {
-          // Complete cold-restored partial rows before normal LIST updates.
-          rv = hostFolder->CreateClientSubfolderInfo(
-              dupFolderPath, hierarchyDelimiter, boxFlags, true);
-          NS_ENSURE_SUCCESS(rv, rv);
-        }
-      }
-#endif
-      MOZ_TRY(imapFolder->SetVerifiedAsOnlineFolder(true));
-      MOZ_TRY(imapFolder->SetHierarchyDelimiter(hierarchyDelimiter));
-      if (boxFlags & kImapTrash) {
-        int32_t deleteModel;
-        MOZ_TRY(GetDeleteModel(&deleteModel));
-        if (deleteModel == nsMsgImapDeleteModels::MoveToTrash) {
-          MOZ_TRY(child->SetFlag(nsMsgFolderFlags::Trash));
-        }
-      }
-
-      MOZ_TRY(imapFolder->SetBoxFlags(boxFlags));
-      MOZ_TRY(imapFolder->SetExplicitlyVerify(explicitlyVerify));
-      MOZ_TRY(imapFolder->GetOnlineName(onlineName));
-
-      // online name needs to use the correct hierarchy delimiter (I think...)
-      // or the canonical path - one or the other, but be consistent.
-      dupFolderPath.ReplaceChar('/', hierarchyDelimiter);
-      if (hierarchyDelimiter != '/') {
-        nsImapUrl::UnescapeSlashes(dupFolderPath);
-      }
-
-      // GMail gives us a localized name for the inbox but doesn't let
-      // us select that localized name.
-      if (boxFlags & kImapInbox)
-        MOZ_TRY(imapFolder->SetOnlineName("INBOX"_ns));
-      else if (onlineName.IsEmpty() || !onlineName.Equals(dupFolderPath))
-        MOZ_TRY(imapFolder->SetOnlineName(dupFolderPath));
-
-      if (hierarchyDelimiter != '/') {
-        nsImapUrl::UnescapeSlashes(folderName);
-      }
-      MOZ_TRY(CopyFolderNameToUTF16(folderName, unicodeName));
-      MOZ_TRY(child->SetName(NS_ConvertUTF16toUTF8(unicodeName)));
-    }
+  if (child && found && StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    bool wasOpen;
+    MOZ_TRY(child->GetDatabaseOpen(&wasOpen));
+    closeDatabase = !wasOpen;
   }
-  if (!found && child)
-    MOZ_TRY(child->SetMsgDatabase(nullptr));  // Close new folders' databases.
-  return NS_OK;
+#endif
+  nsresult updateResult = [&]() -> nsresult {
+    if (child) {
+      nsCOMPtr<nsIMsgImapMailFolder> imapFolder = do_QueryInterface(child);
+      if (imapFolder) {
+        nsAutoCString onlineName;
+        nsAutoString unicodeName;
+        // A folder that was only the Noselect parent of its children is new as
+        // a mailbox, so discovery fetches its rights, too.
+        bool wasNoselect = false;
+        if (found && !(boxFlags & kNoselect) &&
+            NS_SUCCEEDED(
+                child->GetFlag(nsMsgFolderFlags::ImapNoselect, &wasNoselect)) &&
+            wasNoselect) {
+          *aNewFolder = true;
+          nsCOMPtr<nsIImapMailFolderSink> folderSink = do_QueryInterface(child);
+          if (folderSink) folderSink->SetFolderNeedsACLListed(true);
+        }
+#ifdef MOZ_PANORAMA
+        if (StaticPrefs::mail_panorama_enabled_AtStartup() && found) {
+          bool isMail;
+          rv = child->GetFlag(nsMsgFolderFlags::Mail, &isMail);
+          NS_ENSURE_SUCCESS(rv, rv);
+          if (!isMail) {
+            // Complete cold-restored partial rows before normal LIST updates.
+            rv = hostFolder->CreateClientSubfolderInfo(
+                dupFolderPath, hierarchyDelimiter, boxFlags, true);
+            NS_ENSURE_SUCCESS(rv, rv);
+          }
+        }
+#endif
+        MOZ_TRY(imapFolder->SetVerifiedAsOnlineFolder(true));
+        MOZ_TRY(imapFolder->SetHierarchyDelimiter(hierarchyDelimiter));
+        if (boxFlags & kImapTrash) {
+          int32_t deleteModel;
+          MOZ_TRY(GetDeleteModel(&deleteModel));
+          if (deleteModel == nsMsgImapDeleteModels::MoveToTrash) {
+            MOZ_TRY(child->SetFlag(nsMsgFolderFlags::Trash));
+          }
+        }
+
+        MOZ_TRY(imapFolder->SetBoxFlags(boxFlags));
+        MOZ_TRY(imapFolder->SetExplicitlyVerify(explicitlyVerify));
+        MOZ_TRY(imapFolder->GetOnlineName(onlineName));
+
+        // online name needs to use the correct hierarchy delimiter (I think...)
+        // or the canonical path - one or the other, but be consistent.
+        dupFolderPath.ReplaceChar('/', hierarchyDelimiter);
+        if (hierarchyDelimiter != '/') {
+          nsImapUrl::UnescapeSlashes(dupFolderPath);
+        }
+
+        // GMail gives us a localized name for the inbox but doesn't let
+        // us select that localized name.
+        if (boxFlags & kImapInbox)
+          MOZ_TRY(imapFolder->SetOnlineName("INBOX"_ns));
+        else if (onlineName.IsEmpty() || !onlineName.Equals(dupFolderPath))
+          MOZ_TRY(imapFolder->SetOnlineName(dupFolderPath));
+
+        if (hierarchyDelimiter != '/') {
+          nsImapUrl::UnescapeSlashes(folderName);
+        }
+        MOZ_TRY(CopyFolderNameToUTF16(folderName, unicodeName));
+        MOZ_TRY(child->SetName(NS_ConvertUTF16toUTF8(unicodeName)));
+      }
+    }
+    return NS_OK;
+  }();
+  if (child && closeDatabase) {
+    // LIST owns only databases it opened. Keep the first metadata error even
+    // when releasing that temporary database also fails.
+    nsresult closeResult = child->SetMsgDatabase(nullptr);
+    if (NS_SUCCEEDED(updateResult)) updateResult = closeResult;
+  }
+  return updateResult;
 }
 
 NS_IMETHODIMP nsImapIncomingServer::AddFolderRights(

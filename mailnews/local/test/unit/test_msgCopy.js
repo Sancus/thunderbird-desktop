@@ -2829,3 +2829,238 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     }
   );
 }
+/**
+ * Keeps an initialization failure latched while the mailbox caller continues.
+ *
+ * @param {string} storeType - The mbox or maildir provider.
+ * @param {boolean} isMove - Whether to request source removal after copying.
+ * @returns {Promise<void>} Resolves after completion and source custody checks.
+ */
+async function checkDeferredInitializationFailure(storeType, isMove) {
+  await withPublicationStore(storeType, async ({ rootFolder, database }) => {
+    const name = isMove ? "init-move" : "init-copy";
+    const source = rootFolder
+      .createLocalSubfolder(name + "-source")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const destination = rootFolder
+      .createLocalSubfolder(name + "-destination")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const sourceDB = assertPublicationFolder(source, storeType);
+    const destinationDB = assertPublicationFolder(destination, storeType);
+    const raws = ["Kept prefix", "Header init fault", "Refused suffix"].map(
+      (subject, index) =>
+        [
+          "From: source@invalid",
+          "To: recipient@invalid",
+          "Date: Tue, 01 Jan 2019 00:00:00 +0000",
+          "Message-ID: <" + name + "-" + index + "@invalid>",
+          "Subject: " + subject,
+          "",
+          "Keep source body " + index + ".",
+          "",
+        ].join("\r\n")
+    );
+    const messages = raws.map(raw => source.addMessage(raw));
+    for (const [index, header] of messages.entries()) {
+      header.setStringProperty("initializationValue", "value-" + index);
+      header.flags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+    }
+    const keys = messages.map(header => header.messageKey);
+    const tokens = messages.map(header => header.storeToken);
+    const flags = messages.map(header => header.flags);
+    const sourcePaths =
+      storeType == "maildir"
+        ? tokens.map(token =>
+            PathUtils.join(source.filePath.path, "cur", token)
+          )
+        : [source.filePath.path];
+    const before = await Promise.all(
+      sourcePaths.map(file => IOUtils.read(file))
+    );
+    const additions = [];
+    const faults = [];
+    const statuses = [];
+    const progress = [];
+    let atStop;
+    const observer = {
+      QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+      onHdrFlagsChanged() {},
+      onHdrDeleted() {},
+      onParentChanged() {},
+      onAnnouncerGoingAway() {},
+      onReadChanged() {},
+      onJunkScoreChanged() {},
+      onHdrPropertyChanged() {},
+      onEvent() {},
+      onHdrAdded(header) {
+        // Allow the prefix to finish its storage/property writes before making
+        // the next header's real property read fail during initialization.
+        connection.executeSimpleSQL(
+          "CREATE TEMP VIEW message_properties AS SELECT id, name, " +
+            "local_initialization_fault(id, name, value) AS value FROM main.message_properties"
+        );
+        additions.push([
+          header.messageId,
+          readPublicationBytes(destination.getMsgInputStream(header)),
+          sourceDB.listAllKeys(),
+        ]);
+      },
+    };
+    const connection = database.connectionForTests;
+    connection.createFunction("local_initialization_fault", 3, {
+      onFunctionCall(args) {
+        if (
+          args.getInt64(0) == keys[1] &&
+          args.getUTF8String(1) == "initializationValue"
+        ) {
+          faults.push(args.getUTF8String(2));
+          throw Components.Exception("Header init fault", Cr.NS_ERROR_FAILURE);
+        }
+        return args.getUTF8String(2);
+      },
+    });
+    let active = true;
+    const cleanup = () => {
+      if (active) {
+        active = false;
+        destinationDB.removeListener(observer);
+        try {
+          connection.executeSimpleSQL(
+            "DROP VIEW IF EXISTS temp.message_properties"
+          );
+        } finally {
+          connection.removeFunction("local_initialization_fault");
+        }
+      }
+    };
+    registerCleanupFunction(cleanup);
+    destinationDB.addListener(observer);
+    const listener = new PromiseTestUtils.PromiseCopyListener({
+      onProgress(current, total) {
+        progress.push([current, total]);
+      },
+      onStopCopy(status) {
+        statuses.push(status);
+        atStop = {
+          sourceKeys: sourceDB.listAllKeys(),
+          destinationIds: Array.from(
+            destination.messages,
+            header => header.messageId
+          ),
+          sourceBodies: messages.map(header =>
+            readPublicationBytes(source.getMsgInputStream(header))
+          ),
+        };
+      },
+    });
+    const stopped = listener.promise.then(
+      () => true,
+      () => false
+    );
+    const scan = new PromiseTestUtils.PromiseStoreScanListener();
+    let succeeded;
+    try {
+      MailServices.copy.copyMessages(
+        source,
+        messages,
+        destination,
+        isMove,
+        listener,
+        null,
+        false
+      );
+      succeeded = await stopped;
+      destination.msgStore.asyncScan(destination, scan);
+      await scan.promise;
+    } finally {
+      cleanup();
+    }
+    Assert.equal(succeeded, false);
+    Assert.deepEqual(
+      faults,
+      ["value-1"],
+      "The second header initialization failed once"
+    );
+    Assert.deepEqual(
+      statuses,
+      [Cr.NS_ERROR_FAILURE],
+      "One terminal reports the initialization error"
+    );
+    Assert.deepEqual(
+      progress,
+      [[1, 3]],
+      "The continuing caller never starts a failed or later member"
+    );
+    Assert.deepEqual(additions, [[name + "-0@invalid", raws[0], keys]]);
+    Assert.deepEqual(atStop, {
+      sourceKeys: keys,
+      destinationIds: [name + "-0@invalid"],
+      sourceBodies: raws,
+    });
+    Assert.deepEqual(
+      scan.messages,
+      [raws[0]],
+      "Only the finished prefix has destination storage"
+    );
+    Assert.deepEqual(sourceDB.listAllKeys(), keys);
+    Assert.deepEqual(
+      messages.map(header => header.storeToken),
+      tokens
+    );
+    Assert.deepEqual(
+      messages.map(header => header.flags),
+      flags
+    );
+    Assert.deepEqual(
+      messages.map(header => header.getStringProperty("initializationValue")),
+      ["value-0", "value-1", "value-2"]
+    );
+    for (const [index, file] of sourcePaths.entries()) {
+      Assert.deepEqual(
+        await IOUtils.read(file),
+        before[index],
+        "Failure preserves source storage exactly"
+      );
+    }
+    Assert.deepEqual(
+      messages.map(header =>
+        readPublicationBytes(source.getMsgInputStream(header))
+      ),
+      raws
+    );
+    assertPublicationFolder(source, storeType);
+    assertPublicationFolder(destination, storeType);
+    Assert.equal(destinationDB.listAllKeys().length, 1);
+    if (storeType == "maildir") {
+      Assert.deepEqual(
+        await IOUtils.getChildren(
+          PathUtils.join(destination.filePath.path, "tmp")
+        ),
+        []
+      );
+      Assert.equal(
+        (
+          await IOUtils.getChildren(
+            PathUtils.join(destination.filePath.path, "cur")
+          )
+        ).length,
+        1
+      );
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_initializationFailureCopyMbox() {
+    await checkDeferredInitializationFailure("mbox", false);
+  });
+  add_task(async function test_initializationFailureCopyMaildir() {
+    await checkDeferredInitializationFailure("maildir", false);
+  });
+  add_task(async function test_initializationFailureMoveMbox() {
+    await checkDeferredInitializationFailure("mbox", true);
+  });
+  add_task(async function test_initializationFailureMoveMaildir() {
+    await checkDeferredInitializationFailure("maildir", true);
+  });
+}

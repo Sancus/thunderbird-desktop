@@ -21,6 +21,11 @@ const { AsyncShutdown } = ChromeUtils.importESModule(
 function searchGlue() {
   const glue = Object.create(MailGlue.prototype);
   registerCleanupFunction(() => {
+    if (glue._chatSearchShutdownBlocker) {
+      AsyncShutdown.profileBeforeChange.removeBlocker(
+        glue._chatSearchShutdownBlocker
+      );
+    }
     if (glue._mailSearchShutdownBlocker) {
       AsyncShutdown.profileBeforeChange.removeBlocker(
         glue._mailSearchShutdownBlocker
@@ -256,4 +261,152 @@ add_task(async function test_startupUsesTheActualSharedNativeFactory() {
   Assert.ok(progress.sourceId);
   // Do not close the application's shared service from this fixture. Its actual
   // MailGlue and service profile blockers retain shutdown ownership.
+});
+
+add_task(async function test_idleChatStartupLoadsTheSeparateNativeProvider() {
+  Assert.ok(Services.prefs.getBoolPref("mail.chat.enabled"));
+  await TestUtils.waitForCondition(
+    () =>
+      Cu.isESModuleLoaded(
+        "resource:///modules/panorama/ChatSearchService.sys.mjs"
+      ),
+    "The actual native idle task loads the separate chat provider"
+  );
+  Assert.ok(!Cu.isESModuleLoaded("resource:///modules/index_im.sys.mjs"));
+});
+
+add_task(async function test_chatStartupUsesTheActualSharedNativeService() {
+  const glue = searchGlue();
+  glue._startLegacyChatSearch = () =>
+    Assert.ok(false, "Native chat cannot fall back to Gloda");
+  const starting = glue._initChatSearch();
+  Assert.equal(starting, glue._initChatSearch());
+  await starting;
+  const { getChatSearchService } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/ChatSearchService.sys.mjs"
+  );
+  const [first, second] = await Promise.all([
+    getChatSearchService(),
+    getChatSearchService(),
+  ]);
+  Assert.equal(first, second);
+  Assert.deepEqual(
+    (await first.search("unusedstartuptranscriptneedle")).items,
+    []
+  );
+  Assert.ok(!Cu.isESModuleLoaded("resource:///modules/index_im.sys.mjs"));
+  // As above, the application's actual MailGlue owns this shared service close.
+});
+
+add_task(async function test_chatShutdownDuringOpenDrainsTheSameFactory() {
+  const glue = searchGlue();
+  const opening = Promise.withResolvers();
+  const entered = Promise.withResolvers();
+  const closeEntered = Promise.withResolvers();
+  let opens = 0;
+  let closes = 0;
+  let drained = false;
+  glue._startLegacyChatSearch = () =>
+    Assert.ok(false, "Native open never imports the retired indexer");
+  Object.defineProperty(glue, "_chatSearchModule", {
+    value: {
+      getChatSearchService() {
+        opens++;
+        entered.resolve();
+        return opening.promise;
+      },
+      closeChatSearch() {
+        closes++;
+        closeEntered.resolve();
+        return opening.promise.then(() => {
+          drained = true;
+        });
+      },
+    },
+  });
+  const starting = glue._initChatSearch();
+  try {
+    await entered.promise;
+    const closing = glue._chatSearchShutdownBlocker();
+    Assert.equal(closing, glue._shutdownChatSearch());
+    await closeEntered.promise;
+    Assert.equal(drained, false);
+    opening.resolve();
+    await Promise.all([starting, closing]);
+    await glue._initChatSearch();
+    Assert.equal(opens, 1);
+    Assert.equal(closes, 1);
+    Assert.equal(drained, true);
+  } finally {
+    opening.resolve();
+    await glue._shutdownChatSearch();
+  }
+});
+
+add_task(
+  async function test_disabledAndNonNativeChatPreserveStartupSelection() {
+    const disabled = searchGlue();
+    disabled._getMailSearchBackend = () => {
+      throw new Error("Disabled chat must not select a backend");
+    };
+    await SpecialPowers.pushPrefEnv({ set: [["mail.chat.enabled", false]] });
+    try {
+      await disabled._initChatSearch();
+      await disabled._shutdownChatSearch();
+      Assert.equal(disabled._chatSearchShutdownBlocker, null);
+    } finally {
+      await SpecialPowers.popPrefEnv();
+    }
+    const legacy = searchGlue();
+    let starts = 0;
+    legacy._getMailSearchBackend = () => ({});
+    legacy._startLegacyChatSearch = () => starts++;
+    Object.defineProperty(legacy, "_chatSearchModule", {
+      get() {
+        throw new Error("A nonnative backend must not open the native sidecar");
+      },
+    });
+    await legacy._initChatSearch();
+    await legacy._initChatSearch();
+    await legacy._shutdownChatSearch();
+    Assert.equal(starts, 1);
+    Assert.equal(legacy._chatSearchShutdownBlocker, null);
+  }
+);
+
+add_task(async function test_chatStartupErrorAndEarlyShutdownDoNotRetry() {
+  const glue = searchGlue();
+  const failure = new Error("Actual chat factory failure");
+  let opens = 0;
+  let closes = 0;
+  glue._startLegacyChatSearch = () =>
+    Assert.ok(false, "A native error cannot activate Gloda");
+  Object.defineProperty(glue, "_chatSearchModule", {
+    value: {
+      getChatSearchService() {
+        opens++;
+        throw failure;
+      },
+      async closeChatSearch() {
+        closes++;
+      },
+    },
+  });
+  const starting = glue._initChatSearch();
+  await Assert.rejects(starting, error => error === failure);
+  Assert.equal(glue._initChatSearch(), starting);
+  await Assert.rejects(glue._initChatSearch(), error => error === failure);
+  await glue._shutdownChatSearch();
+  Assert.equal(opens, 1);
+  Assert.equal(closes, 1);
+  const early = searchGlue();
+  let backendReads = 0;
+  early._getMailSearchBackend = () => {
+    backendReads++;
+    throw new Error("Early shutdown must prevent backend access");
+  };
+  const queued = early._initChatSearch();
+  await Promise.all([queued, early._shutdownChatSearch()]);
+  Assert.equal(backendReads, 0);
+  Assert.equal(early._chatSearchShutdownBlocker, null);
 });

@@ -112,9 +112,12 @@ function logPath(id) {
  */
 async function readSource(filePath, signal) {
   signal?.throwIfAborted();
-  const bytes = await queueFileOperation(filePath, () =>
-    IOUtils.read(filePath)
-  );
+  let bytes;
+  try {
+    bytes = await queueFileOperation(filePath, () => IOUtils.read(filePath));
+  } catch (error) {
+    throw sourceFailure(error);
+  }
   signal?.throwIfAborted();
   const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
     Ci.nsICryptoHash
@@ -198,6 +201,26 @@ function validateSource(bytes, parts) {
   };
 }
 
+/** Original file-read/parser errors, without changing their identity or type. */
+const sourceFailures = new WeakSet();
+
+/**
+ * Records a source-only failure without wrapping or mutating the original error.
+ * Cancellation and index/storage failures are recorded by neither caller.
+ *
+ * @param {unknown} error - Original file read or transcript parser failure.
+ * @returns {unknown} The same error for rejection.
+ */
+function sourceFailure(error) {
+  if (
+    error !== null &&
+    (typeof error == "object" || typeof error == "function")
+  ) {
+    sourceFailures.add(error);
+  }
+  return error;
+}
+
 /** The logger parse differs from the previously validated source. */
 class IncompleteChatTranscriptError extends Error {}
 
@@ -213,9 +236,16 @@ class IncompleteChatTranscriptError extends Error {}
  *   Real logger objects and their validated visible records.
  */
 async function readLogConversation(filePath, source, signal) {
-  const expected = validateSource(source.bytes, logComponents(filePath));
-  const log = await IMServices.logs.getLogFromFile(filePath);
-  const conversation = await log.getConversation();
+  let expected;
+  let log;
+  let conversation;
+  try {
+    expected = validateSource(source.bytes, logComponents(filePath));
+    log = await IMServices.logs.getLogFromFile(filePath);
+    conversation = await log.getConversation();
+  } catch (error) {
+    throw sourceFailure(error);
+  }
   signal?.throwIfAborted();
   const messages = conversation
     ?.getMessages()
@@ -230,8 +260,10 @@ async function readLogConversation(filePath, source, signal) {
         message.message != expected.messages[i].text
     )
   ) {
-    throw new IncompleteChatTranscriptError(
-      "Chat logger did not return the complete source transcript"
+    throw sourceFailure(
+      new IncompleteChatTranscriptError(
+        "Chat logger did not return the complete source transcript"
+      )
     );
   }
   return {
@@ -669,6 +701,18 @@ export class ChatSearchProvider {
     });
     signal?.throwIfAborted();
     return { id, indexed };
+  }
+
+  /**
+   * Identifies an original file-read or transcript-parser refresh failure.
+   * A privacy failure remains fatal even if its source read also failed.
+   * Closing, cancellation and index/storage errors are not source rejections.
+   *
+   * @param {unknown} error - The original rejected refresh error.
+   * @returns {boolean} Whether this rejected file can be skipped independently.
+   */
+  isSourceError(error) {
+    return !this.#privacyFailed && !this.#closing && sourceFailures.has(error);
   }
 
   /**

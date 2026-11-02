@@ -445,6 +445,15 @@ MailGlue.prototype = {
    */
   _mailSearchShutdownBlocker: null,
   _mailSearchShuttingDown: false,
+  /** @type {?Promise<void>} Coalesced separate chat startup. */
+  _chatSearchStartupPromise: null,
+  /** @type {?Promise<void>} Shared chat factory close. */
+  _chatSearchShutdownPromise: null,
+  /** @type {?function(): Promise<void>} Selected native chat close. */
+  _chatSearchClose: null,
+  /** @type {?function(): Promise<void>} Pending-open profile blocker. */
+  _chatSearchShutdownBlocker: null,
+  _chatSearchShuttingDown: false,
 
   // init (called at app startup)
   _init() {
@@ -575,6 +584,7 @@ MailGlue.prototype = {
         break;
       case "quit-application-granted":
         this._shutdownMailSearch().catch(console.error);
+        this._shutdownChatSearch().catch(console.error);
         Services.startup.trackStartupCrashEnd();
         if (AppConstants.MOZ_UPDATER) {
           lazy.UpdateListener.reset();
@@ -1017,6 +1027,83 @@ MailGlue.prototype = {
   },
 
   /**
+   * Loads the separate native chat provider on demand.
+   *
+   * @returns {{getChatSearchService: function(): Promise<ChatSearchService>,
+   *   closeChatSearch: function(): Promise<void>}} Shared chat factory.
+   */
+  get _chatSearchModule() {
+    return ChromeUtils.importESModule(
+      "resource:///modules/panorama/ChatSearchService.sys.mjs"
+    );
+  },
+
+  /** Starts the old chat indexer only for the nonnative backend. */
+  _startLegacyChatSearch() {
+    ChromeUtils.importESModule("resource:///modules/index_im.sys.mjs");
+  },
+
+  /**
+   * Starts chat indexing once for the startup-selected backend.
+   * A native failure remains rejected and never falls back to Gloda.
+   *
+   * @returns {Promise<void>} Initial transcript sweep, or no work after shutdown.
+   */
+  _initChatSearch() {
+    if (
+      this._chatSearchShuttingDown ||
+      Services.startup.shuttingDown ||
+      !Services.prefs.getBoolPref("mail.chat.enabled")
+    ) {
+      return Promise.resolve();
+    }
+    this._chatSearchStartupPromise ??= Promise.resolve().then(async () => {
+      if (this._chatSearchShuttingDown || Services.startup.shuttingDown) {
+        return;
+      }
+      const backend = this._getMailSearchBackend();
+      if (this._chatSearchShuttingDown || Services.startup.shuttingDown) {
+        return;
+      }
+      if (
+        !("nsIDatabaseCore" in Ci) ||
+        !(backend instanceof Ci.nsIDatabaseCore)
+      ) {
+        this._startLegacyChatSearch();
+        return;
+      }
+      const search = this._chatSearchModule;
+      if (this._chatSearchShuttingDown || Services.startup.shuttingDown) {
+        return;
+      }
+      this._chatSearchClose = search.closeChatSearch;
+      this._chatSearchShutdownBlocker = () => this._shutdownChatSearch();
+      lazy.AsyncShutdown.profileBeforeChange.addBlocker(
+        "MailGlue chat search",
+        this._chatSearchShutdownBlocker
+      );
+      await search.getChatSearchService();
+      if (this._chatSearchShuttingDown || Services.startup.shuttingDown) {
+        await this._shutdownChatSearch();
+      }
+    });
+    return this._chatSearchStartupPromise;
+  },
+
+  /**
+   * Prevents late chat activation and drains the selected factory once.
+   *
+   * @returns {Promise<void>} Shared close, retaining any original open/close error.
+   */
+  _shutdownChatSearch() {
+    this._chatSearchShuttingDown = true;
+    this._chatSearchShutdownPromise ??= Promise.resolve().then(() =>
+      this._chatSearchClose?.()
+    );
+    return this._chatSearchShutdownPromise;
+  },
+
+  /**
    * Use this function as an entry point to schedule tasks that
    * need to run only once after startup, and can be scheduled
    * by using an idle callback.
@@ -1100,9 +1187,9 @@ MailGlue.prototype = {
       },
       {
         condition: Services.prefs.getBoolPref("mail.chat.enabled"),
-        task() {
+        task: () => {
           lazy.ChatCore.idleStart();
-          ChromeUtils.importESModule("resource:///modules/index_im.sys.mjs");
+          this._initChatSearch().catch(console.error);
         },
       },
       {

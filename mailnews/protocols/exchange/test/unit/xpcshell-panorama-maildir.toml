@@ -12,17 +12,21 @@ tags = ["panorama", "maildir"]
 ["test_ewsAttachmentSaves.js"]
 
 ["test_exchange_service.js"]
+verbose = true
 prefs = ["mail.graph.enabled=true"]
 
 ["test_folder_sync.js"]
 prefs = ["mail.graph.enabled=false"]
 
 ["test_getMessage.js"]
+verbose = true
 prefs = ["mail.graph.enabled=true"]
 
 ["test_item_operations.js"]
+verbose = true
 requesttimeoutfactor = 3
 prefs = ["mail.graph.enabled=true"]
 
 ["test_undo.js"]
+verbose = true
 prefs = ["mail.graph.enabled=true"]

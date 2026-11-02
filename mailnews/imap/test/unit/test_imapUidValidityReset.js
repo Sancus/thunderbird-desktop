@@ -622,7 +622,8 @@ add_task(async function test_globalPlaybackContinuesPastHeldEpoch() {
   try {
     await expectResetFailure(folder, Cr.NS_ERROR_STORAGE_CONSTRAINT);
     Assert.ok(!serverMessage.flags.includes("\\Flagged"));
-    Assert.ok(serverMessage.flags.includes("epoch-kept"));
+    // The standard fake server canonicalizes keyword capitalization.
+    Assert.ok(serverMessage.flags.includes("Epoch-kept"));
     Assert.equal(queued.keywordsToAdd, "epoch-kept");
     Assert.deepEqual(laterDB.listAllOfflineOpIds(), [key]);
     Assert.equal(queued.newFlags, savedFlags);
@@ -658,7 +659,7 @@ add_task(async function test_globalPlaybackContinuesPastHeldEpoch() {
   Assert.deepEqual(reopened.listAllOfflineOpIds(), []);
   Assert.ok(!folder.getFlag(Ci.nsMsgFolderFlags.OfflineEvents));
   Assert.ok(!serverMessage.flags.includes("\\Flagged"));
-  Assert.ok(serverMessage.flags.includes("epoch-kept"));
+  Assert.ok(serverMessage.flags.includes("Epoch-kept"));
   assertResetCounts(folder, 1);
 
   mailbox.uidvalidity = 7303;

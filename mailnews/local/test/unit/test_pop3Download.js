@@ -10,6 +10,10 @@ const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
 
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
 const [daemon, server, handler] = setupServerDaemon();
 server.start();
 registerCleanupFunction(() => {
@@ -438,6 +442,19 @@ async function checkPop3PublicationFailure(incomingServer, folder) {
     });
     Assert.equal(faults, 1, "The real SQL insertion reached the fault");
     Assert.equal(daemon.getTotalMessages(), 1, "Failed delivery does not DELE");
+    const uidl = daemon._messages[0].uidl;
+    const statePath = PathUtils.join(
+      incomingServer.localPath.path,
+      "popstate.dat"
+    );
+    const state = (await IOUtils.exists(statePath))
+      ? await IOUtils.readUTF8(statePath)
+      : "";
+    Assert.deepEqual(
+      state.split(/\r?\n/).filter(line => line.split(" ")[1] == uidl),
+      [],
+      "An unpublished message has no received UIDL record"
+    );
     Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
     Assert.ok(!folder.locked);
     folder.msgStore.asyncScan(folder, scan);
@@ -611,4 +628,79 @@ add_task(async function testPop3ReplyWithoutRecipientMbox() {
 
 add_task(async function testPop3ReplyWithoutRecipientMaildir() {
   await checkPop3ReplyFailure("maildir", true);
+});
+
+/**
+ * Fetch through the public account route with a different supplied folder.
+ *
+ * @param {nsIPop3IncomingServer} incoming - Deferred source account.
+ * @param {nsIMsgLocalMailFolder} folder - Configured global Inbox.
+ * @returns {Promise<void>} Both fetches and the physical store checks finish.
+ */
+async function checkDeferredTarget(incoming, folder) {
+  incoming.leaveMessagesOnServer = true;
+  const sourceRoot = incoming.rootFolder;
+  const decoy = sourceRoot
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .createLocalSubfolder("not-the-configured-inbox");
+  Assert.notEqual(decoy.URI, folder.URI);
+  Assert.notEqual(sourceRoot.URI, folder.server.rootFolder.URI);
+  Assert.equal(incoming.rootMsgFolder.URI, folder.server.rootMsgFolder.URI);
+  const message = {
+    fileData:
+      "From: route@example.invalid\r\n" +
+      "To: target@example.invalid\r\n" +
+      "Subject: Configured deferred target\r\n" +
+      "Message-ID: <configured-deferred-target@example.invalid>\r\n\r\n" +
+      "The configured target owns this body.\r\n",
+  };
+  daemon.setMessages([message]);
+  const uidl = message.uidl;
+  const expected =
+    AppConstants.platform == "win"
+      ? message.fileData
+      : message.fileData.replaceAll("\r\n", "\n");
+  const fetch = async () => {
+    const listener = new PromiseTestUtils.PromiseUrlListener();
+    incoming.getNewMessages(decoy, null, listener);
+    await listener.promise;
+  };
+  await fetch();
+  const [header, extra] = [...folder.messages];
+  Assert.ok(header);
+  Assert.strictEqual(extra, undefined);
+  Assert.equal(header.folder.URI, folder.URI);
+  Assert.equal(header.subject, "Configured deferred target");
+  const key = header.messageKey;
+  const token = header.storeToken;
+  const bytes = readPop3StoredMessage(folder, token);
+  Assert.ok(bytes.endsWith(expected));
+  Assert.deepEqual(decoy.msgDatabase.listAllKeys(), []);
+  const statePath = PathUtils.join(incoming.localPath.path, "popstate.dat");
+  const rows = (await IOUtils.readUTF8(statePath))
+    .split(/\r?\n/)
+    .map(line => line.split(" "))
+    .filter(row => row[1] == uidl);
+  Assert.equal(rows.length, 1);
+  Assert.equal(rows[0][0], "k", "The finished delivery owns the kept UIDL");
+  Assert.greater(Number(rows[0][2]), 0);
+  await fetch();
+  Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+  Assert.equal(folder.msgDatabase.getMsgHdrForKey(key).storeToken, token);
+  Assert.equal(readPop3StoredMessage(folder, token), bytes);
+  Assert.deepEqual(decoy.msgDatabase.listAllKeys(), []);
+  Assert.equal(daemon.getTotalMessages(), 1);
+  const scan = new PromiseTestUtils.PromiseStoreScanListener();
+  folder.msgStore.asyncScan(folder, scan);
+  await scan.promise;
+  Assert.deepEqual(scan.tokens, [token]);
+  Assert.deepEqual(scan.messages, [bytes]);
+}
+
+add_task(async function test_deferredDeliveryUsesConfiguredInboxMbox() {
+  await withPop3Store("mbox", checkDeferredTarget);
+});
+
+add_task(async function test_deferredDeliveryUsesConfiguredInboxMaildir() {
+  await withPop3Store("maildir", checkDeferredTarget);
 });

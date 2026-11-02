@@ -2730,6 +2730,9 @@ TEST_F(DeliveryDatabaseClose, MessageStepFailureIsNotEmptyIteration) {
   ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   RefPtr<MessageEnumerator> iterator = new MessageEnumerator(db, stmt);
+  int32_t state = mozIStorageStatement::MOZ_STORAGE_STATEMENT_READY;
+  ASSERT_EQ(NS_OK, stmt->GetState(&state));
+  EXPECT_EQ(mozIStorageStatement::MOZ_STORAGE_STATEMENT_INVALID, state);
   EXPECT_EQ(1u, witness->mCalls);
   EXPECT_EQ(mKey, witness->mLastKey);
   bool more = true;
@@ -2737,6 +2740,143 @@ TEST_F(DeliveryDatabaseClose, MessageStepFailureIsNotEmptyIteration) {
   EXPECT_FALSE(more);
   nsIMsgDBHdr* output = mHeader;
   EXPECT_EQ(NS_ERROR_FAILURE, iterator->GetNext(&output));
+  EXPECT_EQ(nullptr, output);
+}
+
+TEST_F(DeliveryDatabaseClose, ExhaustedMessageCursorsPermitShutdown) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsTArray<RefPtr<MessageEnumerator>> cursors;
+  nsTArray<nsCOMPtr<mozIStorageStatement>> statements;
+  for (bool empty : {true, false}) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(NS_OK,
+              Connection()->CreateStatement(
+                  empty ? "SELECT id FROM messages WHERE id=:key AND 0"_ns
+                        : "SELECT id FROM messages WHERE id=:key"_ns,
+                  getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
+    RefPtr<MessageEnumerator> cursor = new MessageEnumerator(db, stmt);
+    bool more = false;
+    ASSERT_EQ(NS_OK, cursor->HasMoreElements(&more));
+    EXPECT_EQ(!empty, more);
+    if (more) {
+      nsCOMPtr<nsIMsgDBHdr> header;
+      ASSERT_EQ(NS_OK, cursor->GetNext(getter_AddRefs(header)));
+      ASSERT_TRUE(header);
+      more = true;
+      EXPECT_EQ(NS_OK, cursor->HasMoreElements(&more));
+      EXPECT_FALSE(more);
+    }
+    int32_t state = mozIStorageStatement::MOZ_STORAGE_STATEMENT_READY;
+    ASSERT_EQ(NS_OK, stmt->GetState(&state));
+    EXPECT_EQ(mozIStorageStatement::MOZ_STORAGE_STATEMENT_INVALID, state);
+    cursors.AppendElement(cursor);
+    statements.AppendElement(stmt);
+  }
+  // Keep both the JS-equivalent cursor and statement references alive while
+  // the real database shutdown drains its connection.
+  EXPECT_TRUE(Stop());
+  EXPECT_EQ(nullptr, Connection());
+}
+
+TEST_F(DeliveryDatabaseClose, DroppedMessageCursorFinalizesPartialStatement) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "SELECT id FROM messages WHERE id=:key"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
+  RefPtr<MessageEnumerator> cursor = new MessageEnumerator(db, stmt);
+  bool more = false;
+  ASSERT_EQ(NS_OK, cursor->HasMoreElements(&more));
+  ASSERT_TRUE(more);
+  cursor = nullptr;
+  int32_t state = mozIStorageStatement::MOZ_STORAGE_STATEMENT_READY;
+  ASSERT_EQ(NS_OK, stmt->GetState(&state));
+  EXPECT_EQ(mozIStorageStatement::MOZ_STORAGE_STATEMENT_INVALID, state);
+  // The existing listener list must not retain the dropped cursor.
+  EXPECT_EQ(NS_OK, db->NotifyAnnouncerGoingAway());
+}
+
+TEST_F(DeliveryDatabaseClose, HeldMessageCursorFinalizesOnOwnerClose) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  for (bool force : {false, true}) {
+    RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                         "SELECT id FROM messages WHERE id=:key"_ns,
+                         getter_AddRefs(stmt)));
+    ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
+    RefPtr<MessageEnumerator> cursor = new MessageEnumerator(db, stmt);
+    bool more = false;
+    ASSERT_EQ(NS_OK, cursor->HasMoreElements(&more));
+    ASSERT_TRUE(more);
+    ASSERT_EQ(NS_OK,
+              force ? db->ForceClosed() : db->NotifyAnnouncerGoingAway());
+    int32_t state = mozIStorageStatement::MOZ_STORAGE_STATEMENT_READY;
+    ASSERT_EQ(NS_OK, stmt->GetState(&state));
+    EXPECT_EQ(mozIStorageStatement::MOZ_STORAGE_STATEMENT_INVALID, state);
+    more = true;
+    EXPECT_EQ(NS_ERROR_FAILURE, cursor->HasMoreElements(&more));
+    EXPECT_FALSE(more);
+    nsIMsgDBHdr* output = mHeader;
+    EXPECT_EQ(NS_ERROR_FAILURE, cursor->GetNext(&output));
+    EXPECT_EQ(nullptr, output);
+  }
+}
+
+TEST_F(DeliveryDatabaseClose, HeldMessageCursorFinalizesOnOwnerDestruction) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "SELECT id FROM messages WHERE id=:key"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
+  RefPtr<MessageEnumerator> cursor = new MessageEnumerator(db, stmt);
+  bool more = false;
+  ASSERT_EQ(NS_OK, cursor->HasMoreElements(&more));
+  ASSERT_TRUE(more);
+  db = nullptr;
+  int32_t state = mozIStorageStatement::MOZ_STORAGE_STATEMENT_READY;
+  ASSERT_EQ(NS_OK, stmt->GetState(&state));
+  EXPECT_EQ(mozIStorageStatement::MOZ_STORAGE_STATEMENT_INVALID, state);
+  more = true;
+  EXPECT_EQ(NS_ERROR_FAILURE, cursor->HasMoreElements(&more));
+  EXPECT_FALSE(more);
+}
+
+TEST_F(DeliveryDatabaseClose, LaterMessageStepFailureFinalizesStatement) {
+  ASSERT_NO_FATAL_FAILURE(Create({}));
+  RefPtr<DeliveryMessageReferencesFaultWitness> witness =
+      new DeliveryMessageReferencesFaultWitness(true);
+  ASSERT_EQ(NS_OK, Connection()->CreateFunction("close_enum_later_fault"_ns, 1,
+                                                witness));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->RemoveFunction("close_enum_later_fault"_ns));
+  });
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "SELECT :key UNION ALL SELECT :key WHERE "
+                       "close_enum_later_fault(:key)=0"_ns,
+                       getter_AddRefs(stmt)));
+  ASSERT_EQ(NS_OK, stmt->BindInt64ByName("key"_ns, mKey));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<MessageEnumerator> cursor = new MessageEnumerator(db, stmt);
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, cursor->GetNext(getter_AddRefs(header)));
+  ASSERT_TRUE(header);
+  EXPECT_EQ(1u, witness->mCalls);
+  int32_t state = mozIStorageStatement::MOZ_STORAGE_STATEMENT_READY;
+  ASSERT_EQ(NS_OK, stmt->GetState(&state));
+  EXPECT_EQ(mozIStorageStatement::MOZ_STORAGE_STATEMENT_INVALID, state);
+  bool more = true;
+  EXPECT_EQ(NS_ERROR_FAILURE, cursor->HasMoreElements(&more));
+  EXPECT_FALSE(more);
+  nsIMsgDBHdr* output = mHeader;
+  EXPECT_EQ(NS_ERROR_FAILURE, cursor->GetNext(&output));
   EXPECT_EQ(nullptr, output);
 }
 

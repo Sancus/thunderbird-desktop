@@ -28,6 +28,7 @@ namespace mozilla::mailnews {
 
 class OfflineOperationUndo;
 struct OfflineUndoCounterpart;
+class MessageEnumeratorStatementCloser;
 
 class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                           public SupportsWeakPtr,
@@ -179,14 +180,16 @@ class MessageEnumerator : public nsBaseMsgEnumerator {
   NS_IMETHOD HasMoreElements(bool* aResult) override;
 
  private:
-  ~MessageEnumerator() = default;
+  ~MessageEnumerator();
   bool CheckOwner();
   void Advance();
+  nsresult ReleaseStatement();
 
   WeakPtr<PerFolderDatabase> mOwner;
   uint64_t mGeneration;
   nsresult mStatus = NS_OK;
   nsCOMPtr<mozIStorageStatement> mStmt;
+  WeakPtr<MessageEnumeratorStatementCloser> mStatementCloser;
   bool mHasNext = false;
 };
 

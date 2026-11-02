@@ -30,9 +30,15 @@ add_setup(function setupDiscovery() {
 function seedMailboxes(nested) {
   const { daemon, rootFolder } = fixture;
   Assert.equal(rootFolder.getChildNamed("DeliveryParent"), null);
-  daemon.createMailbox("DeliveryParent", { subscribed: true });
+  daemon.createMailbox("DeliveryParent", {
+    subscribed: true,
+    uidvalidity: daemon.uidvalidity++,
+  });
   if (nested) {
-    daemon.createMailbox("DeliveryParent/DeliveryChild", { subscribed: true });
+    daemon.createMailbox("DeliveryParent/DeliveryChild", {
+      subscribed: true,
+      uidvalidity: daemon.uidvalidity++,
+    });
   }
   Assert.deepEqual(
     daemon.root.allChildren.map(mailbox => mailbox.fullName).sort(),

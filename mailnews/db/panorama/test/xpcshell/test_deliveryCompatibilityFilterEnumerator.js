@@ -226,3 +226,67 @@ add_task(function test_filterEnumeratorSkipsReassignedSnapshotKeys() {
   Assert.equal(reassigned.folder, other);
   Assert.deepEqual(other.msgDatabase.listAllKeys(), [reassignedKey]);
 });
+
+add_task(
+  function test_filteredPrefetchRechecksMovedCachedMembersAndReadErrors() {
+    const folder = root.createLocalSubfolder("filter-prefetched-source");
+    const other = root.createLocalSubfolder("filter-prefetched-destination");
+    const first = insert(folder, "moved-prefetch@filter.invalid", "keep moved");
+    const removed = insert(
+      folder,
+      "deleted-prefetch@filter.invalid",
+      "keep deleted"
+    );
+    const last = insert(folder, "last-prefetch@filter.invalid", "keep last");
+    const excluded = insert(
+      folder,
+      "excluded-prefetch@filter.invalid",
+      "exclude"
+    );
+    const db = folder.msgDatabase;
+    const cached = db.getMsgHdrForKey(first.messageKey);
+    Assert.strictEqual(db.getMsgHdrForKey(first.messageKey), cached);
+    Assert.equal(cached.messageKey, first.messageKey);
+    Assert.strictEqual(cached.folder, folder);
+    Assert.equal(cached.subject, "keep moved");
+    const enumerator = db.getFilterEnumerator([
+      term(Ci.nsMsgSearchAttrib.Subject, Ci.nsMsgSearchOp.Contains, "keep"),
+    ]);
+    Assert.ok(enumerator.hasMoreElements());
+
+    // Reassign only the physical metadata row. This exercises enumeration
+    // membership with a warm cached header, not protocol MOVE or body transfer.
+    const connection = database.connectionForTests;
+    const update = connection.createStatement(
+      "UPDATE messages SET folderId = :folder WHERE id = :key"
+    );
+    try {
+      update.params.folder = other.id;
+      update.params.key = first.messageKey;
+      update.execute();
+    } finally {
+      update.finalize();
+    }
+    db.deleteMessage(removed.messageKey, null, true);
+    connection.executeSimpleSQL(
+      "ALTER TABLE messages RENAME TO unavailable_prefetched_messages"
+    );
+    try {
+      Assert.throws(
+        () => enumerator.hasMoreElements(),
+        error => error.result === Cr.NS_ERROR_FAILURE
+      );
+    } finally {
+      connection.executeSimpleSQL(
+        "ALTER TABLE unavailable_prefetched_messages RENAME TO messages"
+      );
+    }
+    Assert.ok(enumerator.hasMoreElements());
+    const next = enumerator.getNext();
+    Assert.equal(next.messageKey, last.messageKey);
+    Assert.strictEqual(next.folder, folder);
+    Assert.ok(!enumerator.hasMoreElements());
+    Assert.deepEqual(db.listAllKeys(), [last.messageKey, excluded.messageKey]);
+    Assert.deepEqual(other.msgDatabase.listAllKeys(), [first.messageKey]);
+  }
+);

@@ -337,6 +337,54 @@ add_task(function test_logicalRecipientsSurviveDraftAttachmentAndCopy() {
   }
 });
 
+add_task(function test_logicalAuthorAndSubjectPreserveValuesThroughCopy() {
+  const source = root.createLocalSubfolder("logical-fields-source");
+  const destination = root.createLocalSubfolder("logical-fields-copy");
+  const db = source.msgDatabase;
+  const inputs = [
+    "",
+    "ASCII text",
+    "Müller 中文 📨",
+    "=?ISO-8859-1?Q?M=FCller?=",
+  ];
+  for (const [index, text] of inputs.entries()) {
+    const draft = makeDraft(db, `logical-fields-${index}@mime.invalid`);
+    draft.author = text;
+    draft.subject = text;
+    draft.charset = "windows-1252";
+    const draftProperties = draft.properties;
+    Assert.equal(draft.mime2DecodedAuthor, text);
+    Assert.equal(draft.mime2DecodedSubject, text);
+    Assert.equal(draft.author, text);
+    Assert.equal(draft.subject, text);
+    Assert.deepEqual(draft.properties, draftProperties);
+    const header = db.attachHdr(draft, false);
+    const properties = header.properties;
+    Assert.equal(header.mime2DecodedAuthor, text);
+    Assert.equal(header.mime2DecodedSubject, text);
+    Assert.equal(header.author, text);
+    Assert.equal(header.subject, text);
+    Assert.equal(header.charset, "windows-1252");
+    Assert.deepEqual(header.properties, properties);
+    const copy = destination.msgDatabase.copyHdrFromExistingHdr(
+      0xffffffff,
+      header,
+      true
+    );
+    Assert.notEqual(copy.messageKey, header.messageKey);
+    Assert.strictEqual(copy.folder, destination);
+    Assert.equal(copy.mime2DecodedAuthor, text);
+    Assert.equal(copy.mime2DecodedSubject, text);
+    Assert.equal(copy.author, text);
+    Assert.equal(copy.subject, text);
+    Assert.equal(copy.charset, "windows-1252");
+    Assert.deepEqual(copy.properties, properties);
+    Assert.equal(header.mime2DecodedAuthor, text);
+    Assert.equal(header.mime2DecodedSubject, text);
+    Assert.strictEqual(header.folder, source);
+  }
+});
+
 add_task(function test_decodedRecipientsPropagateActualHeaderReadErrors() {
   const connection = database.connectionForTests;
   const row = connection.createStatement("SELECT 1 FROM messages WHERE id = 0");
@@ -352,6 +400,10 @@ add_task(function test_decodedRecipientsPropagateActualHeaderReadErrors() {
   const missing = messageDB.getMessage(0);
   Assert.throws(() => missing.recipients, /NS_ERROR_UNEXPECTED/);
   Assert.throws(() => missing.mime2DecodedRecipients, /NS_ERROR_UNEXPECTED/);
+  Assert.throws(() => missing.author, /NS_ERROR_UNEXPECTED/);
+  Assert.throws(() => missing.mime2DecodedAuthor, /NS_ERROR_UNEXPECTED/);
+  Assert.throws(() => missing.subject, /NS_ERROR_UNEXPECTED/);
+  Assert.throws(() => missing.mime2DecodedSubject, /NS_ERROR_UNEXPECTED/);
   connection.executeSimpleSQL(
     "ALTER TABLE messages RENAME TO unavailable_recipient_messages"
   );
@@ -364,6 +416,17 @@ add_task(function test_decodedRecipientsPropagateActualHeaderReadErrors() {
       () => missing.mime2DecodedRecipients,
       error => error.result === Cr.NS_ERROR_FAILURE
     );
+    for (const property of [
+      "author",
+      "mime2DecodedAuthor",
+      "subject",
+      "mime2DecodedSubject",
+    ]) {
+      Assert.throws(
+        () => missing[property],
+        error => error.result === Cr.NS_ERROR_FAILURE
+      );
+    }
   } finally {
     connection.executeSimpleSQL(
       "ALTER TABLE unavailable_recipient_messages RENAME TO messages"

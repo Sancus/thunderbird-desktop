@@ -190,6 +190,79 @@ async function test_discoversChild() {
       templates
     );
     Assert.deepEqual([junk.id, templates.id], ids);
+
+    const settings = incomingServer.spamSettings;
+    const previousAccount = settings.actionTargetAccount;
+    const previousMode = settings.moveTargetMode;
+    const previousStoredAccount = incomingServer.getStringValue(
+      "spamActionTargetAccount"
+    );
+    const absentAccountURI = "imap://removed-discovery-account@127.0.0.1";
+    const rootIds = core.folderDB.getFolderChildren(0);
+    const childIds = core.folderDB.getFolderChildren(rootFolder.id);
+    try {
+      settings.actionTargetAccount = absentAccountURI;
+      settings.moveTargetMode = Ci.nsISpamSettings.MOVE_TARGET_MODE_ACCOUNT;
+      await discover();
+      Assert.equal(settings.actionTargetAccount, absentAccountURI);
+      Assert.equal(
+        settings.moveTargetMode,
+        Ci.nsISpamSettings.MOVE_TARGET_MODE_ACCOUNT
+      );
+      Assert.equal(
+        incomingServer.getStringValue("spamActionTargetAccount"),
+        previousStoredAccount,
+        "Discovery preserves the configured account preference"
+      );
+      Assert.equal(
+        MailServices.folderLookup.getFolderForURL(absentAccountURI),
+        null
+      );
+      Assert.equal(
+        MailServices.folderLookup.getFolderForURL(absentAccountURI + "/Junk"),
+        null
+      );
+      Assert.deepEqual(core.folderDB.getFolderChildren(0), rootIds);
+      Assert.deepEqual(
+        core.folderDB.getFolderChildren(rootFolder.id),
+        childIds
+      );
+      const selectCount = () =>
+        [fixture.server.playTransaction()]
+          .flat()
+          .reduce(
+            (count, transaction) =>
+              count +
+              transaction.them.filter(line =>
+                /^\S+ (SELECT|EXAMINE) /i.test(line)
+              ).length,
+            0
+          );
+      const previousSelects = selectCount();
+      let completions = 0;
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl() {
+          completions++;
+        },
+      });
+      folder.updateFolderWithListener(null, listener);
+      await listener.promise;
+      Assert.equal(completions, 1, "A later folder update finishes once");
+      Assert.greater(
+        selectCount(),
+        previousSelects,
+        "A later URL reaches SELECT"
+      );
+      Assert.strictEqual(rootFolder.getChildNamed("DeliveryParent"), folder);
+      Assert.deepEqual(core.folderDB.getFolderChildren(0), rootIds);
+      Assert.deepEqual(
+        core.folderDB.getFolderChildren(rootFolder.id),
+        childIds
+      );
+    } finally {
+      settings.actionTargetAccount = previousAccount;
+      settings.moveTargetMode = previousMode;
+    }
   }
   info('DELIVERY_PHASE {"phase":"imap-discovery-child-verified"}');
 }

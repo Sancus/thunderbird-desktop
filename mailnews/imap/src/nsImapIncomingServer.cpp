@@ -1492,7 +1492,21 @@ NS_IMETHODIMP nsImapIncomingServer::DiscoveryDone() {
 
   nsCOMPtr<nsISpamSettings> spamSettings;
   MOZ_TRY(GetSpamSettings(getter_AddRefs(spamSettings)));
+  bool checkJunkFolder = true;
   if (spamSettings) {
+    int32_t moveTargetMode;
+    MOZ_TRY(spamSettings->GetMoveTargetMode(&moveTargetMode));
+    if (moveTargetMode == nsISpamSettings::MOVE_TARGET_MODE_ACCOUNT) {
+      nsCString accountUri;
+      MOZ_TRY(spamSettings->GetActionTargetAccount(accountUri));
+      if (!accountUri.IsEmpty()) {
+        nsCOMPtr<nsIMsgFolder> accountFolder;
+        MOZ_TRY(FindDiscoveryFolder(accountUri, getter_AddRefs(accountFolder)));
+        checkJunkFolder = bool(accountFolder);
+      }
+    }
+  }
+  if (spamSettings && checkJunkFolder) {
     nsCString spamFolderUri, existingUri;
     MOZ_TRY(spamSettings->GetSpamFolderURI(spamFolderUri));
     MOZ_TRY(
@@ -1695,11 +1709,16 @@ nsresult nsImapIncomingServer::FindDiscoveryFolder(const nsACString& uri,
     for (auto& server : servers) {
       nsCString serverUri;
       MOZ_TRY(server->GetServerURI(serverUri));
+      bool isRoot = uri.Equals(serverUri);
       serverUri.Append('/');
-      if (!StringBeginsWith(uri, serverUri)) continue;
+      if (!isRoot && !StringBeginsWith(uri, serverUri)) continue;
       nsCOMPtr<nsIMsgFolder> root;
       MOZ_TRY(server->GetRootFolder(getter_AddRefs(root)));
       NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
+      if (isRoot) {
+        root.forget(folder);
+        return NS_OK;
+      }
       return root->GetChildWithURI(uri, true, false, folder);
     }
     return NS_OK;

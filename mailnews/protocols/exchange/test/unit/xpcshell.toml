@@ -21,6 +21,7 @@ prefs = ["mail.graph.enabled=true"]
 ["test_exchangeRelativeUrls.js"]
 
 ["test_exchange_service.js"]
+verbose = true
 
 ["test_folderNamesEws.js"]
 tags = ["foldernames"]
@@ -34,10 +35,12 @@ tags = ["foldernames"]
 ["test_folder_sync.js"]
 
 ["test_getMessage.js"]
+verbose = true
 
 ["test_httpAuthCache.js"]
 
 ["test_item_operations.js"]
+verbose = true
 requesttimeoutfactor = 3
 
 ["test_item_operations_exchange_2010.js"]
@@ -59,5 +62,6 @@ requesttimeoutfactor = 3
 ["test_syncMessagesForFolder.js"]
 
 ["test_undo.js"]
+verbose = true
 
 ["test_verifyLogon.js"]

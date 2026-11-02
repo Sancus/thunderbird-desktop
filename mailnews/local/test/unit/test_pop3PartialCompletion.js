@@ -1880,7 +1880,11 @@ async function checkPartialProcessRestart(store) {
         output += chunk;
       }
       const { exitCode } = await child.wait();
-      Assert.equal(exitCode, 0, `${store} ${stage} process: ${output}`);
+      Assert.equal(
+        exitCode,
+        0,
+        `${store} ${stage} exit=${exitCode}: ${JSON.stringify(output)}`
+      );
       Assert.ok(output.includes(`POP3-PARTIAL-RESTART ${stage} PASS`));
     } finally {
       if (child.exitCode === null) {

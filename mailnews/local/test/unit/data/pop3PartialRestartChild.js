@@ -6,66 +6,6 @@
 
 /* globals pop3RestartInput, print, quit */
 
-const resources = Services.io
-  .getProtocolHandler("resource")
-  .QueryInterface(Ci.nsIResProtocolHandler);
-resources.setSubstitution(
-  "testing-common",
-  Services.io.newURI(pop3RestartInput.testingCommon)
-);
-const { Assert } = ChromeUtils.importESModule(
-  "resource://testing-common/Assert.sys.mjs"
-);
-const { updateAppInfo } = ChromeUtils.importESModule(
-  "resource://testing-common/AppInfo.sys.mjs"
-);
-updateAppInfo();
-
-const profile = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-profile.initWithPath(pop3RestartInput.profilePath);
-// Use the profile keys registered by the ordinary xpcshell harness.
-const profileProvider = {
-  getFile(prop, persistent) {
-    if (["ProfD", "ProfLD", "ProfDS", "ProfLDS", "TmpD"].includes(prop)) {
-      persistent.value = true;
-      return profile.clone();
-    }
-    return null;
-  },
-  QueryInterface: ChromeUtils.generateQI(["nsIDirectoryServiceProvider"]),
-};
-Services.dirsvc
-  .QueryInterface(Ci.nsIDirectoryService)
-  .registerProvider(profileProvider);
-for (const key of ["ProfD", "ProfLD", "ProfDS", "ProfLDS", "TmpD"]) {
-  try {
-    Services.dirsvc.undefine(key);
-  } catch (error) {
-    if (error.result != Cr.NS_ERROR_FAILURE) {
-      throw error;
-    }
-  }
-}
-const prefsFile = profile.clone();
-prefsFile.append("prefs.js");
-if (pop3RestartInput.stage == "read") {
-  Services.prefs.readUserPrefsFromFile(prefsFile);
-}
-Services.prefs.setBoolPref("security.nocertdb", true);
-Services.prefs.setBoolPref("mail.panorama.enabled", true);
-Services.obs.notifyObservers(
-  null,
-  "profile-do-change",
-  "xpcshell-do-get-profile"
-);
-
-const { MailServices } = ChromeUtils.importESModule(
-  "resource:///modules/MailServices.sys.mjs"
-);
-const { localAccountUtils } = ChromeUtils.importESModule(
-  "resource://testing-common/mailnews/LocalAccountUtils.sys.mjs"
-);
-
 /**
  * Read the complete selected provider message without changing its bytes.
  *
@@ -132,6 +72,65 @@ function deliver(incoming, folder, raw, flags, uri = "") {
 
 /** @returns {Promise<void>} The finished row is saved or checked after restart. */
 async function checkRestart() {
+  const resources = Services.io
+    .getProtocolHandler("resource")
+    .QueryInterface(Ci.nsIResProtocolHandler);
+  resources.setSubstitution(
+    "testing-common",
+    Services.io.newURI(pop3RestartInput.testingCommon)
+  );
+  const { Assert } = ChromeUtils.importESModule(
+    "resource://testing-common/Assert.sys.mjs"
+  );
+  const { updateAppInfo } = ChromeUtils.importESModule(
+    "resource://testing-common/AppInfo.sys.mjs"
+  );
+  updateAppInfo();
+
+  const profile = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+  profile.initWithPath(pop3RestartInput.profilePath);
+  // Use the profile keys registered by the ordinary xpcshell harness.
+  const profileProvider = {
+    getFile(prop, persistent) {
+      if (["ProfD", "ProfLD", "ProfDS", "ProfLDS", "TmpD"].includes(prop)) {
+        persistent.value = true;
+        return profile.clone();
+      }
+      return null;
+    },
+    QueryInterface: ChromeUtils.generateQI(["nsIDirectoryServiceProvider"]),
+  };
+  Services.dirsvc
+    .QueryInterface(Ci.nsIDirectoryService)
+    .registerProvider(profileProvider);
+  for (const key of ["ProfD", "ProfLD", "ProfDS", "ProfLDS", "TmpD"]) {
+    try {
+      Services.dirsvc.undefine(key);
+    } catch (error) {
+      if (error.result != Cr.NS_ERROR_FAILURE) {
+        throw error;
+      }
+    }
+  }
+  const prefsFile = profile.clone();
+  prefsFile.append("prefs.js");
+  if (pop3RestartInput.stage == "read") {
+    Services.prefs.readUserPrefsFromFile(prefsFile);
+  }
+  Services.prefs.setBoolPref("security.nocertdb", true);
+  Services.prefs.setBoolPref("mail.panorama.enabled", true);
+  Services.obs.notifyObservers(
+    null,
+    "profile-do-change",
+    "xpcshell-do-get-profile"
+  );
+
+  const { MailServices } = ChromeUtils.importESModule(
+    "resource:///modules/MailServices.sys.mjs"
+  );
+  const { localAccountUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/LocalAccountUtils.sys.mjs"
+  );
   const expectedPath = PathUtils.join(profile.path, "partial-expected.json");
   if (pop3RestartInput.stage == "write") {
     const contract =
@@ -249,7 +248,7 @@ checkRestart().then(
     settled = true;
   },
   error => {
-    console.error(error);
+    print(`POP3-PARTIAL-RESTART FAIL ${error}\n${error.stack || ""}`);
     result = 1;
     settled = true;
   }

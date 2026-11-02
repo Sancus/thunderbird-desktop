@@ -64,7 +64,13 @@ class TestPanoramaSendLater(MarionetteTestCase):
                 self.before["control"][0]["folderURI"],
             )
         except Exception:
-            self.restore()
+            try:
+                self.restore()
+            except Exception:
+                self.logger.error(
+                    "Failed to restore the Send Later fixture after setup failed",
+                    exc_info=True,
+                )
             raise
 
     def perform(self, action, reject_delivery=False):
@@ -80,7 +86,12 @@ class TestPanoramaSendLater(MarionetteTestCase):
     def restart_same_profile(self):
         """Restart the application process with the same persistent profile."""
         old_pid = self.marionette.execute_script("return Services.appinfo.processID;")
-        self.marionette.restart(in_app=True, clean=False)
+        capabilities = self.marionette.requested_capabilities
+        details = self.marionette.quit(in_app=True, clean=False)
+        self.assertTrue(details["in_app"], "Expected in-app shutdown")
+        self.assertFalse(details["forced"], "Expected non-forced shutdown")
+        self.assertEqual(self.marionette.instance.runner.returncode, 0)
+        self.marionette.start_session(capabilities)
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.marionette.switch_to_window(self.marionette.chrome_window_handles[0])
         self.assertNotEqual(
@@ -200,8 +211,8 @@ class TestPanoramaSendLater(MarionetteTestCase):
         if self.restored:
             return
         self.restored = True
-        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         try:
+            self.marionette.set_context(self.marionette.CONTEXT_CHROME)
             self.perform("cleanup")
         finally:
             self.marionette.instance.prefs = self.instance_prefs

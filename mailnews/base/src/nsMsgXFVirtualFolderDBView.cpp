@@ -46,6 +46,13 @@ void nsMsgXFVirtualFolderDBView::RemovePendingDBListeners() {
     // UnregisterPendingListener will return an error when there are no more
     // instances of this object registered as pending listeners.
     while (NS_SUCCEEDED(rv)) rv = msgDBService->UnregisterPendingListener(this);
+  } else {
+    // Native pending registration is immediate, and its service unregister is
+    // a no-op. Release the registrations owned by this view instead.
+    for (int32_t i = 0; i < m_dbToUseList.Count(); i++) {
+      m_dbToUseList[i]->RemoveListener(this);
+    }
+    m_dbToUseList.Clear();
   }
 }
 
@@ -79,6 +86,11 @@ nsMsgXFVirtualFolderDBView::CopyDBView(
 
   newMsgDBView->m_viewFolder = m_viewFolder;
   newMsgDBView->m_searchSession = m_searchSession;
+
+  // The base copy already registered the clone with its owned native DBs.
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return NS_OK;
+  }
 
   int32_t scopeCount;
   nsresult rv;
@@ -410,8 +422,20 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
       m_viewFolder->GetURI(searchUri);
       nsresult rv = searchFolder->GetMsgDatabase(getter_AddRefs(searchDB));
       if (NS_SUCCEEDED(rv) && searchDB) {
-        if (msgDBService)
+        if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+          if (m_dbToUseList.IndexOf(searchDB) < 0) {
+            if (!m_dbToUseList.AppendObject(searchDB)) {
+              return NS_ERROR_OUT_OF_MEMORY;
+            }
+            rv = searchDB->AddListener(this);
+            if (NS_FAILED(rv)) {
+              m_dbToUseList.RemoveObject(searchDB);
+              return rv;
+            }
+          }
+        } else if (msgDBService) {
           msgDBService->RegisterPendingListener(searchFolder, this);
+        }
 
         m_foldersSearchingOver.AppendObject(searchFolder);
         // Ignore cached hits in quick search case.

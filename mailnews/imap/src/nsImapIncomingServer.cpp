@@ -1713,14 +1713,16 @@ nsresult nsImapIncomingServer::FindDiscoveryFolder(const nsACString& uri,
 nsresult nsImapIncomingServer::FindDiscoveryFolderWithFlag(
     nsIMsgFolder* parent, uint32_t flag, nsIMsgFolder** folder) {
   *folder = nullptr;
-  uint32_t flags;
-  MOZ_TRY(parent->GetFlags(&flags));
-  if ((flags & flag) == flag) {
+  nsTArray<RefPtr<nsIMsgFolder>> children;
+  MOZ_TRY(parent->GetSubFolders(children));
+  // The initializer already loaded these physical flags. GetFlags would open
+  // metadata just for this lookup, and its legacy close path retains Trash.
+  bool matches;
+  MOZ_TRY(parent->GetFlag(flag, &matches));
+  if (matches) {
     NS_ADDREF(*folder = parent);
     return NS_OK;
   }
-  nsTArray<RefPtr<nsIMsgFolder>> children;
-  MOZ_TRY(parent->GetSubFolders(children));
   for (auto& child : children) {
     MOZ_TRY(FindDiscoveryFolderWithFlag(child, flag, folder));
     if (*folder) break;

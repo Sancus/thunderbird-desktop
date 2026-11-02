@@ -263,6 +263,14 @@ async function test_repeatedDiscoveryPreservesIdentity() {
       heldDatabase,
       "LIST preserves an already open database"
     );
+    child.msgDatabase = null;
+    Assert.equal(child.databaseOpen, false);
+    await discover();
+    Assert.equal(
+      child.databaseOpen,
+      false,
+      "LIST releases only the metadata database it opened"
+    );
     Assert.deepEqual(
       [parent.id, child.id],
       ids,

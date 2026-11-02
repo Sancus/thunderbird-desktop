@@ -17,6 +17,29 @@ var gSub2;
 var gSub3;
 var gTrash;
 
+add_setup(function configureNativeStore() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const pref = "mail.server.default.storeContractID";
+  const hadValue = Services.prefs.prefHasUserValue(pref);
+  const oldValue = Services.prefs.getCharPref(pref, "");
+  registerCleanupFunction(() => {
+    if (hadValue) {
+      Services.prefs.setCharPref(pref, oldValue);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+    if (IMAPPump.incomingServer) {
+      teardownIMAPPump();
+    }
+  });
+  Services.prefs.setCharPref(
+    pref,
+    Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+  );
+});
+
 add_task(async function test_not_using_subscriptions() {
   await setup(false);
   checkFoldersDiscovered();
@@ -40,7 +63,7 @@ async function setup(usingSubscriptions) {
   if (!usingSubscriptions) {
     // Vary which folder is subscribed during the test run for mbox or
     // maildir. Shouldn't really matter if subscribed or not but make sure.
-    if (IMAPPump.inbox.msgStore.storeType == "mbox") {
+    if (IMAPPump.incomingServer.msgStore.storeType == "mbox") {
       info("Testing for mbox, not using subscriptions");
       IMAPPump.daemon.createMailbox("folder1", { subscribed: false });
       IMAPPump.daemon.createMailbox("folder1/sub1", { subscribed: true });
@@ -59,7 +82,7 @@ async function setup(usingSubscriptions) {
     }
   } else {
     // Using subscriptions. Set each folder to subscribed for both storeType.
-    if (IMAPPump.inbox.msgStore.storeType == "mbox") {
+    if (IMAPPump.incomingServer.msgStore.storeType == "mbox") {
       info("Testing for mbox, using subscriptions");
     } else {
       info("Testing for maildir, using subscriptions");
@@ -75,7 +98,26 @@ async function setup(usingSubscriptions) {
   // discoverallboxes URL occurs and creates Trash and subscribes it. Give it
   // some time to finish since delay below 50 can produce errors in
   // checkFoldersDiscovered.
-  await PromiseTestUtils.promiseDelay(1000);
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    IMAPPump.incomingServer.setBoolValue("autosync_offline_stores", false);
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+    Assert.ok(inbox, "Native discovery supplies the actual INBOX");
+    IMAPPump.inbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+    Assert.strictEqual(IMAPPump.inbox.parent, root);
+    Assert.strictEqual(IMAPPump.inbox.server, IMAPPump.incomingServer);
+    Assert.equal(
+      IMAPPump.inbox.msgStore.storeType,
+      IMAPPump.incomingServer.msgStore.storeType
+    );
+  }
+
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    await PromiseTestUtils.promiseDelay(1000);
+  }
 }
 
 function checkFoldersDiscovered() {

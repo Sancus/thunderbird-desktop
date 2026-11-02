@@ -7,7 +7,7 @@
 /* import-globals-from head_server.js */
 /* import-globals-from ../../../db/panorama/test/xpcshell/head_delivery.js */
 
-const { MockRegistrar } = ChromeUtils.importESModule(
+const { MockRegistrar: discoveryMockRegistrar } = ChromeUtils.importESModule(
   "resource://testing-common/MockRegistrar.sys.mjs"
 );
 
@@ -345,7 +345,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     });
     let factoryCalls = 0;
     let pendingId;
-    const cid = MockRegistrar.register(
+    const cid = discoveryMockRegistrar.register(
       "@mozilla.org/mail/folder-factory;1?name=imap",
       () => {
         factoryCalls++;
@@ -380,7 +380,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
       Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
       Assert.equal(child.filePath.path, childPath);
     } finally {
-      MockRegistrar.unregister(cid);
+      discoveryMockRegistrar.unregister(cid);
     }
     await discover();
     const completed = discoveredChild(

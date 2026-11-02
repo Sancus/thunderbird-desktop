@@ -595,6 +595,83 @@ add_task(async function test_globalPlaybackContinuesPastHeldEpoch() {
     IMAPPump.daemon.getMailbox("EpochPendingSource")._messages[0].flags,
     []
   );
+
+  Services.io.offline = true;
+  try {
+    folder.markMessagesFlagged([header], false);
+    folder.storeCustomKeywords(null, "epoch-kept", "", [key]);
+  } finally {
+    Services.io.offline = false;
+  }
+  const queued = laterDB.getOfflineOpForKey(key, false);
+  const savedFlags = queued.newFlags;
+  Assert.equal(
+    queued.operation,
+    Ci.nsIMsgOfflineImapOperation.kFlagsChanged |
+      Ci.nsIMsgOfflineImapOperation.kAddKeywords
+  );
+  Assert.equal(queued.keywordsToAdd, "epoch-kept");
+  core.connectionForTests.executeSimpleSQL(
+    "CREATE TEMP TRIGGER fail_completed_flag_delete " +
+      "BEFORE DELETE ON offline_operations WHEN OLD.folderId = " +
+      folder.id +
+      " AND OLD.messageKey = " +
+      key +
+      " BEGIN SELECT RAISE(ABORT, 'confirmed flag cleanup failure'); END"
+  );
+  try {
+    await expectResetFailure(folder, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+    Assert.ok(!serverMessage.flags.includes("\\Flagged"));
+    Assert.ok(serverMessage.flags.includes("epoch-kept"));
+    Assert.equal(queued.keywordsToAdd, "epoch-kept");
+    Assert.deepEqual(laterDB.listAllOfflineOpIds(), [key]);
+    Assert.equal(queued.newFlags, savedFlags);
+    Assert.equal(queued.playingBack, false);
+    Assert.ok(folder.getFlag(Ci.nsMsgFolderFlags.OfflineEvents));
+    assertResetCounts(folder, 1);
+  } finally {
+    core.connectionForTests.executeSimpleSQL(
+      "DROP TRIGGER fail_completed_flag_delete"
+    );
+  }
+
+  const transactions = IMAPPump.server.playTransaction();
+  const commands = (
+    Array.isArray(transactions) ? transactions : [transactions]
+  ).flatMap(transaction => transaction.them);
+  const reopened = reopenResetFolder(folder).QueryInterface(
+    Ci.nsIMsgOfflineOpsDatabase
+  );
+  Assert.deepEqual(reopened.listAllOfflineOpIds(), [key]);
+  Assert.equal(reopened.getOfflineOpForKey(key, false).newFlags, savedFlags);
+  await updateResetFolder(folder);
+  const after = IMAPPump.server.playTransaction();
+  const afterCommands = (Array.isArray(after) ? after : [after]).flatMap(
+    transaction => transaction.them
+  );
+  Assert.ok(
+    !afterCommands
+      .slice(commands.length)
+      .some(command => / uid store /i.test(command)),
+    "Local cleanup after reopen does not resend the confirmed flag command"
+  );
+  Assert.deepEqual(reopened.listAllOfflineOpIds(), []);
+  Assert.ok(!folder.getFlag(Ci.nsMsgFolderFlags.OfflineEvents));
+  Assert.ok(!serverMessage.flags.includes("\\Flagged"));
+  Assert.ok(serverMessage.flags.includes("epoch-kept"));
+  assertResetCounts(folder, 1);
+
+  mailbox.uidvalidity = 7303;
+  await updateResetFolder(folder);
+  const fresh = folder.msgDatabase.getMsgHdrForMessageID(
+    "later-epoch-replay@example.invalid"
+  );
+  Assert.notEqual(fresh.messageKey, key);
+  Assert.ok(!folder.msgDatabase.containsKey(key));
+  Assert.equal(fresh.getUint32Property("uidOnServer"), 6101);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 7303);
+  assertResetCounts(folder, 1);
+  Assert.deepEqual(heldDB.listAllOfflineOpIds(), [heldKey]);
 });
 
 /**

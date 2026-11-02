@@ -69,6 +69,9 @@ add_task(async function test_removesOnlyConfirmedOldEpochRecords() {
   Assert.notEqual(stale[0].messageKey, 6101, "The physical key is not the UID");
   Assert.equal(stale[0].folder, folder);
   Assert.equal(stale[1].folder, folder);
+  info.imapTotalPendingMessages = 2;
+  info.imapUnreadPendingMessages = 1;
+  assertResetCounts(folder, 5, 2, 1);
 
   await updateResetFolder(folder);
 
@@ -105,6 +108,7 @@ add_task(async function test_removesOnlyConfirmedOldEpochRecords() {
   Assert.equal(local.getUint32Property("uidOnServer"), 0);
   Assert.equal(folder.getTotalMessages(false), 3);
   Assert.equal(info.numMessages, 3);
+  assertResetCounts(folder, 3);
   Assert.equal(info.imapUidValidity, 7202);
   Assert.equal(info.getCharProperty("highestModSeq"), "");
   Assert.equal(info.getUint32Property("highestRecordedUID", 0), 0);
@@ -134,6 +138,31 @@ add_task(async function test_removesOnlyConfirmedOldEpochRecords() {
   Assert.equal(info.numMessages, 3);
   Assert.equal(info.imapUidValidity, 7202);
   Assert.equal(pending.getStringProperty("pending-state"), "awaiting-append");
+  assertResetCounts(folder, 3);
+
+  const pendingKey = pending.messageKey;
+  const reopened = reopenResetFolder(folder);
+  assertResetCounts(folder, 3);
+  Assert.equal(reopened.dBFolderInfo.imapUidValidity, 7202);
+  Assert.deepEqual(
+    reopened.listAllKeys().sort((a, b) => a - b),
+    retainedKeys,
+    "Reopening preserves the reconciled membership"
+  );
+  const reopenedPending = reopened.getMsgHdrForKey(pendingKey);
+  Assert.equal(reopenedPending.getUint32Property("pseudoHdr"), 1);
+  Assert.equal(reopenedPending.getUint32Property("uidOnServer"), 0);
+  Assert.equal(
+    reopenedPending.getStringProperty("pending-state"),
+    "awaiting-append"
+  );
+  await updateResetFolder(folder);
+  assertResetCounts(folder, 3);
+  Assert.deepEqual(
+    reopened.listAllKeys().sort((a, b) => a - b),
+    retainedKeys,
+    "Synchronization after reopening does not reconcile the reset twice"
+  );
 });
 
 add_task(async function test_validatesAllBindingsBeforeDeletion() {
@@ -168,6 +197,10 @@ add_task(async function test_propagatesDeletionFailureAndRetries() {
   const stale = addResetHeader(folder, "delete-failure@example.invalid", 6101);
   stale.storeToken = "retained-body-token";
   stale.setStringProperty("retained-property", "keep-on-failure");
+  const staleKey = stale.messageKey;
+  info.imapTotalPendingMessages = 3;
+  info.imapUnreadPendingMessages = 2;
+  assertResetCounts(folder, 1, 3, 2);
   core.connectionForTests.executeSimpleSQL(
     "CREATE TEMP TRIGGER fail_epoch_delete BEFORE DELETE ON messages " +
       "WHEN OLD.id = " +
@@ -194,16 +227,38 @@ add_task(async function test_propagatesDeletionFailureAndRetries() {
     );
     Assert.equal(info.getUint32Property("highestRecordedUID", 0), 6999);
     Assert.equal(info.numMessages, 1);
+    assertResetCounts(folder, 1);
   } finally {
     core.connectionForTests.executeSimpleSQL("DROP TRIGGER fail_epoch_delete");
   }
 
+  const reopened = reopenResetFolder(folder);
+  assertResetCounts(folder, 1);
+  Assert.equal(reopened.dBFolderInfo.imapUidValidity, 7101);
+  const retained = reopened.getMsgHdrForKey(staleKey);
+  Assert.equal(retained.getUint32Property("uidOnServer"), 6101);
+  Assert.equal(
+    retained.getStringProperty("retained-property"),
+    "keep-on-failure"
+  );
+  Assert.equal(retained.storeToken, "retained-body-token");
+
   await updateResetFolder(folder);
-  Assert.ok(!db.containsKey(stale.messageKey));
+  Assert.ok(!reopened.containsKey(staleKey));
   Assert.deepEqual(Array.from(folder.messages), []);
-  Assert.equal(info.numMessages, 0);
-  Assert.equal(info.imapUidValidity, 7202);
-  Assert.equal(info.getUint32Property("highestRecordedUID", 0), 0);
+  Assert.equal(reopened.dBFolderInfo.numMessages, 0);
+  Assert.equal(reopened.dBFolderInfo.imapUidValidity, 7202);
+  Assert.equal(
+    reopened.dBFolderInfo.getUint32Property("highestRecordedUID", 0),
+    0
+  );
+  assertResetCounts(folder, 0);
+  await updateResetFolder(folder);
+  assertResetCounts(folder, 0);
+  const afterRetry = reopenResetFolder(folder);
+  Assert.equal(afterRetry.dBFolderInfo.imapUidValidity, 7202);
+  Assert.deepEqual(afterRetry.listAllKeys(), []);
+  assertResetCounts(folder, 0);
 });
 
 add_task(async function test_propagatesEpochStorageFailureAndRetries() {
@@ -218,6 +273,10 @@ add_task(async function test_propagatesEpochStorageFailureAndRetries() {
     "retained-after-write-failure@example.invalid",
     0
   );
+  const localKey = local.messageKey;
+  info.imapTotalPendingMessages = -1;
+  info.imapUnreadPendingMessages = -1;
+  assertResetCounts(folder, 2, -1, -1);
   core.connectionForTests.executeSimpleSQL(
     "CREATE TEMP TRIGGER fail_epoch_write BEFORE INSERT ON folder_properties " +
       "WHEN NEW.id = " +
@@ -238,20 +297,36 @@ add_task(async function test_propagatesEpochStorageFailureAndRetries() {
     );
     Assert.ok(db.containsKey(local.messageKey));
     Assert.equal(info.numMessages, 1);
+    assertResetCounts(folder, 1);
   } finally {
     core.connectionForTests.executeSimpleSQL("DROP TRIGGER fail_epoch_write");
   }
 
+  const reopened = reopenResetFolder(folder);
+  Assert.equal(reopened.dBFolderInfo.imapUidValidity, 7101);
+  Assert.deepEqual(reopened.listAllKeys(), [localKey]);
+  assertResetCounts(folder, 1);
   await updateResetFolder(folder);
-  Assert.equal(info.imapUidValidity, 7202);
+  Assert.equal(reopened.dBFolderInfo.imapUidValidity, 7202);
   Assert.deepEqual(
     Array.from(folder.messages, header => [
       header.messageId,
       header.messageKey,
     ]),
-    [["retained-after-write-failure@example.invalid", local.messageKey]]
+    [["retained-after-write-failure@example.invalid", localKey]]
   );
-  Assert.equal(info.numMessages, 1);
+  Assert.equal(reopened.dBFolderInfo.numMessages, 1);
+  assertResetCounts(folder, 1);
+  await updateResetFolder(folder);
+  assertResetCounts(folder, 1);
+  const afterRetry = reopenResetFolder(folder);
+  Assert.equal(afterRetry.dBFolderInfo.imapUidValidity, 7202);
+  Assert.deepEqual(afterRetry.listAllKeys(), [localKey]);
+  Assert.equal(
+    afterRetry.getMsgHdrForKey(localKey).getUint32Property("uidOnServer"),
+    0
+  );
+  assertResetCounts(folder, 1);
 });
 
 add_task(async function test_retainsPendingOperationWithoutLiveSource() {
@@ -601,6 +676,70 @@ function addResetHeader(folder, messageId, uid, pseudo = false) {
     draft.setUint32Property("pseudoHdr", 1);
   }
   return db.attachHdr(draft, true);
+}
+
+/**
+ * Checks physical, persisted pending and displayed counts for the unread records.
+ *
+ * @param {nsIMsgFolder} folder - The reset fixture folder.
+ * @param {number} physical - The number of live unread records.
+ * @param {number} [totalPending=0] - The persisted pending total delta.
+ * @param {number} [unreadPending=0] - The persisted pending unread delta.
+ */
+function assertResetCounts(
+  folder,
+  physical,
+  totalPending = 0,
+  unreadPending = 0
+) {
+  const info = folder.msgDatabase.dBFolderInfo;
+  Assert.equal(info.numMessages, physical, "Physical membership count");
+  Assert.equal(info.numUnreadMessages, physical, "Physical unread count");
+  Assert.equal(
+    info.imapTotalPendingMessages,
+    totalPending,
+    "Persisted total delta"
+  );
+  Assert.equal(
+    info.imapUnreadPendingMessages,
+    unreadPending,
+    "Persisted unread delta"
+  );
+  Assert.equal(
+    folder.numPendingTotalMessages,
+    totalPending,
+    "Public total delta"
+  );
+  Assert.equal(folder.numPendingUnread, unreadPending, "Public unread delta");
+  Assert.equal(
+    folder.getTotalMessages(false),
+    physical + totalPending,
+    "Displayed total"
+  );
+  Assert.equal(
+    folder.getNumUnread(false),
+    physical + unreadPending,
+    "Displayed unread"
+  );
+}
+
+/**
+ * Closes and reopens the fixture database through the production database service.
+ *
+ * @param {nsIMsgFolder} folder - The reset fixture folder.
+ * @returns {nsIMsgDatabase} A new database facade for the same physical folder.
+ */
+function reopenResetFolder(folder) {
+  const previous = folder.msgDatabase;
+  core.QueryInterface(Ci.nsIMsgDBService).forceFolderDBClosed(folder);
+  const reopened = folder.msgDatabase;
+  Assert.notStrictEqual(
+    reopened,
+    previous,
+    "The database was actually reopened"
+  );
+  Assert.equal(reopened.folder, folder);
+  return reopened;
 }
 
 /**

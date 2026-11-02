@@ -3540,3 +3540,383 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkDeferredInitializationFailure("maildir", true);
   });
 }
+
+/**
+ * Exercises the native local transaction with real provider bodies and keys.
+ *
+ * @param {string} storeType - The mbox or maildir provider.
+ * @param {boolean} move - Move the original messages instead of copying.
+ * @param {string} [fault=""] - Inject a delete, restore SQL, or maildir Finish fault.
+ */
+async function checkNativeLocalUndo(storeType, move, fault = "") {
+  await withPublicationStore(
+    storeType,
+    async ({ rootFolder, database, order }) => {
+      const source = rootFolder.createLocalSubfolder("undo-source");
+      const destination = rootFolder.createLocalSubfolder("undo-destination");
+      const sourceDB = assertPublicationFolder(source, storeType);
+      const destinationDB = assertPublicationFolder(destination, storeType);
+      const manager = MailServices.txns.transactionManager;
+      manager.clear();
+      const count = fault ? 1 : 3;
+      const originals = [];
+      const headers = [];
+      for (let i = 0; i < count; i++) {
+        const raw =
+          "From: undo@example.invalid\r\n" +
+          "To: recipient@example.invalid\r\n" +
+          `Subject: Local undo ${i}\r\n` +
+          (i ? "Message-ID: <duplicate-undo@example.invalid>\r\n" : "") +
+          "References: <first@invalid> <second@invalid> <first@invalid>\r\n" +
+          "\r\n" +
+          `Exact recovery body ${i}.\r\n\r\n`;
+        const header = source
+          .QueryInterface(Ci.nsIMsgLocalMailFolder)
+          .addMessage(raw);
+        header.setStringProperty("undoOrdinal", String(i));
+        header.setStringProperty("undoEmpty", "");
+        header.setStringProperty("undoUnicode", "\u2603\u00e9");
+        source.markMessagesRead([header], true);
+        source.markMessagesFlagged([header], true);
+        headers.push(header);
+        originals.push({
+          key: header.messageKey,
+          token: header.storeToken,
+          id: header.messageId,
+          flags: header.flags,
+          references: Array.from({ length: header.numReferences }, (_, index) =>
+            header.getStringReference(index)
+          ),
+          raw: readPublicationBytes(source.getMsgInputStream(header)),
+        });
+      }
+      const window = Cc["@mozilla.org/messenger/msgwindow;1"].createInstance(
+        Ci.nsIMsgWindow
+      );
+      const listener = new PromiseTestUtils.PromiseCopyListener();
+      MailServices.copy.copyMessages(
+        source,
+        headers.toReversed(),
+        destination,
+        move,
+        listener,
+        window,
+        true
+      );
+      await listener.promise;
+      Assert.equal(manager.numberOfUndoItems, 1);
+      const transaction = manager.peekUndoStack();
+      const firstDestination = Array.from(destination.messages, header => ({
+        key: header.messageKey,
+        token: header.storeToken,
+        raw: readPublicationBytes(destination.getMsgInputStream(header)),
+      }));
+      Assert.equal(firstDestination.length, count);
+      Assert.equal(sourceDB.listAllKeys().length, move ? 0 : count);
+      const additions = [];
+      const observers = [];
+      let reentrant = 0;
+      let faultActive = false;
+      let faultCalls = 0;
+      const connection = database.connectionForTests;
+      const dropFault = () => {
+        if (faultActive) {
+          connection.executeSimpleSQL(
+            "DROP TRIGGER IF EXISTS temp.local_undo_fault"
+          );
+          faultActive = false;
+        }
+      };
+      const observe = folder => {
+        const db = folder.msgDatabase;
+        const observer = {
+          QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+          onHdrFlagsChanged() {},
+          onHdrDeleted() {},
+          onParentChanged() {},
+          onAnnouncerGoingAway() {},
+          onReadChanged() {},
+          onJunkScoreChanged() {},
+          onHdrPropertyChanged() {},
+          onEvent() {},
+          onHdrAdded(header) {
+            const ordinal = Number(header.getStringProperty("undoOrdinal"));
+            const original = originals[ordinal];
+            const raw = readPublicationBytes(folder.getMsgInputStream(header));
+            additions.push({
+              folder: folder.URI,
+              key: header.messageKey,
+              token: header.storeToken,
+              raw,
+              ordinal,
+            });
+            Assert.ok(db.containsKey(header.messageKey));
+            Assert.equal(header.messageId, original.id);
+            Assert.equal(header.flags, original.flags);
+            Assert.equal(header.messageSize, raw.length);
+            Assert.equal(header.offlineMessageSize, 0);
+            Assert.equal(raw, original.raw);
+            Assert.ok(header.properties.includes("undoEmpty"));
+            Assert.equal(header.getStringProperty("undoEmpty"), "");
+            Assert.ok(!header.properties.includes("undoAbsent"));
+            Assert.equal(
+              header.getStringProperty("undoUnicode"),
+              "\u2603\u00e9"
+            );
+            Assert.deepEqual(
+              Array.from({ length: header.numReferences }, (_, index) =>
+                header.getStringReference(index)
+              ),
+              original.references
+            );
+            const finishes = order.events.filter(
+              event => event.type == "finish"
+            );
+            Assert.ok(finishes.some(event => event.token == header.storeToken));
+            for (const method of ["undoTransaction", "redoTransaction"]) {
+              Assert.throws(
+                () => transaction[method](),
+                error => error.result == Cr.NS_ERROR_IN_PROGRESS
+              );
+              reentrant++;
+            }
+          },
+        };
+        db.addListener(observer);
+        observers.push([db, observer]);
+      };
+      const failSql = phase => {
+        connection.createFunction("local_undo_fault", 0, {
+          onFunctionCall() {
+            faultCalls++;
+            return 0;
+          },
+        });
+        connection.executeSimpleSQL(
+          "CREATE TEMP TRIGGER local_undo_fault BEFORE " +
+            phase +
+            " ON main.messages BEGIN SELECT local_undo_fault(); " +
+            "SELECT RAISE(ABORT, 'Local undo failure'); END"
+        );
+        faultActive = true;
+      };
+      let heldCur;
+      const normalRecord = order.record;
+      try {
+        if (fault == "delete") {
+          failSql("DELETE");
+          Assert.throws(
+            () => manager.undoTransaction(),
+            error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+          );
+          Assert.equal(faultCalls, 1);
+          Assert.equal(manager.peekUndoStack(), transaction);
+          Assert.equal(manager.numberOfUndoItems, 1);
+          Assert.equal(manager.numberOfRedoItems, 0);
+          Assert.deepEqual(
+            destinationDB.listAllKeys(),
+            firstDestination.map(row => row.key)
+          );
+          Assert.equal(
+            readPublicationBytes(
+              destination.getMsgInputStream(
+                destinationDB.getMsgHdrForKey(firstDestination[0].key)
+              )
+            ),
+            firstDestination[0].raw
+          );
+          dropFault();
+        }
+        observe(source);
+        observe(destination);
+        order.destinationURI = source.URI;
+        manager.undoTransaction();
+        Assert.equal(manager.numberOfUndoItems, 0);
+        Assert.equal(manager.numberOfRedoItems, 1);
+        Assert.deepEqual(destinationDB.listAllKeys(), []);
+        const restoredSource = Array.from(source.messages);
+        Assert.equal(restoredSource.length, count);
+        for (const header of restoredSource) {
+          const original =
+            originals[Number(header.getStringProperty("undoOrdinal"))];
+          Assert.equal(
+            readPublicationBytes(source.getMsgInputStream(header)),
+            original.raw
+          );
+          if (move) {
+            Assert.notEqual(header.messageKey, original.key);
+            Assert.notEqual(header.storeToken, original.token);
+            Assert.ok(!sourceDB.containsKey(original.key));
+          } else {
+            Assert.equal(header.messageKey, original.key);
+            Assert.equal(header.storeToken, original.token);
+          }
+        }
+        // Repeated direct calls settle the original operation once.
+        transaction.undoTransaction();
+        Assert.equal(sourceDB.listAllKeys().length, count);
+        order.destinationURI = destination.URI;
+        if (fault == "restore") {
+          failSql("INSERT");
+        }
+        if (fault == "finish") {
+          order.record = function (type, details) {
+            const event = normalRecord.call(this, type, details);
+            if (type == "finish-entry" && !heldCur) {
+              const cur = destination.filePath.clone();
+              cur.append("cur");
+              heldCur = destination.filePath.clone();
+              heldCur.append("cur-before-undo-finish");
+              Assert.ok(cur.isDirectory());
+              Assert.ok(!heldCur.exists());
+              cur.moveTo(heldCur.parent, heldCur.leafName);
+              const block = destination.filePath.clone();
+              block.append("cur");
+              block.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+            }
+            return event;
+          };
+        }
+        if (fault == "restore" || fault == "finish") {
+          const expected =
+            fault == "restore"
+              ? Cr.NS_ERROR_STORAGE_CONSTRAINT
+              : Cr.NS_ERROR_FILE_DESTINATION_NOT_DIR;
+          Assert.throws(
+            () => manager.redoTransaction(),
+            error => error.result == expected
+          );
+          Assert.equal(manager.peekRedoStack(), transaction);
+          Assert.equal(manager.numberOfRedoItems, 1);
+          Assert.deepEqual(destinationDB.listAllKeys(), []);
+          Assert.equal(sourceDB.listAllKeys().length, count);
+          const entries = order.events.filter(
+            event => event.type == "finish-entry"
+          ).length;
+          Assert.equal(entries, 1);
+          if (fault == "finish") {
+            const cur = destination.filePath.clone();
+            cur.append("cur");
+            Assert.ok(cur.isFile());
+            Assert.equal(cur.fileSize, 0);
+            cur.remove(false);
+            heldCur.moveTo(destination.filePath, "cur");
+            heldCur = null;
+            order.record = normalRecord;
+            // An uncertain Finish cannot be retried or turned into success.
+            for (let i = 0; i < 2; i++) {
+              Assert.throws(
+                () => transaction.redoTransaction(),
+                error => error.result == expected
+              );
+              Assert.throws(
+                () => transaction.undoTransaction(),
+                error => error.result == expected
+              );
+            }
+            Assert.equal(
+              order.events.filter(event => event.type == "finish-entry").length,
+              entries
+            );
+            Assert.equal(additions.length, 0);
+            const pending = await IOUtils.getChildren(
+              PathUtils.join(destination.filePath.path, "tmp")
+            );
+            Assert.equal(pending.length, 1);
+            Assert.equal(await IOUtils.readUTF8(pending[0]), originals[0].raw);
+            return;
+          }
+          Assert.equal(faultCalls, 1);
+          dropFault();
+          manager.redoTransaction();
+          Assert.equal(
+            order.events.filter(event => event.type == "finish-entry").length,
+            entries
+          );
+        } else {
+          manager.redoTransaction();
+        }
+        Assert.equal(manager.numberOfUndoItems, 1);
+        Assert.equal(manager.numberOfRedoItems, 0);
+        Assert.equal(manager.peekUndoStack(), transaction);
+        const secondDestination = Array.from(destination.messages);
+        Assert.equal(secondDestination.length, count);
+        for (const header of secondDestination) {
+          Assert.ok(
+            !firstDestination.some(old => old.key == header.messageKey)
+          );
+          Assert.ok(
+            !firstDestination.some(old => old.token == header.storeToken)
+          );
+          const original =
+            originals[Number(header.getStringProperty("undoOrdinal"))];
+          Assert.equal(
+            readPublicationBytes(destination.getMsgInputStream(header)),
+            original.raw
+          );
+        }
+        transaction.redoTransaction();
+        Assert.equal(destinationDB.listAllKeys().length, count);
+        Assert.equal(sourceDB.listAllKeys().length, move ? 0 : count);
+        const added = additions.length;
+        order.destinationURI = source.URI;
+        manager.undoTransaction();
+        Assert.equal(additions.length, added + (move ? count : 0));
+        Assert.equal(reentrant, additions.length * 2);
+        Assert.deepEqual(destinationDB.listAllKeys(), []);
+        Assert.equal(sourceDB.listAllKeys().length, count);
+        Assert.equal(manager.numberOfUndoItems, 0);
+        Assert.equal(manager.numberOfRedoItems, 1);
+      } finally {
+        order.record = normalRecord;
+        if (heldCur?.exists()) {
+          const cur = destination.filePath.clone();
+          cur.append("cur");
+          Assert.ok(cur.isFile());
+          Assert.equal(cur.fileSize, 0);
+          cur.remove(false);
+          heldCur.moveTo(destination.filePath, "cur");
+        }
+        for (const [db, observer] of observers) {
+          db.removeListener(observer);
+        }
+        dropFault();
+        if (fault == "delete" || fault == "restore") {
+          connection.removeFunction("local_undo_fault");
+        }
+        manager.clear();
+      }
+    },
+    { observeOrder: true }
+  );
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_localCopyUndoMbox() {
+    await checkNativeLocalUndo("mbox", false);
+  });
+  add_task(async function test_localCopyUndoMaildir() {
+    await checkNativeLocalUndo("maildir", false);
+  });
+  add_task(async function test_localMoveUndoMbox() {
+    await checkNativeLocalUndo("mbox", true);
+  });
+  add_task(async function test_localMoveUndoMaildir() {
+    await checkNativeLocalUndo("maildir", true);
+  });
+  add_task(async function test_localUndoDeleteRetryMbox() {
+    await checkNativeLocalUndo("mbox", false, "delete");
+  });
+  add_task(async function test_localUndoDeleteRetryMaildir() {
+    await checkNativeLocalUndo("maildir", false, "delete");
+  });
+  add_task(async function test_localUndoRestoreRetryMbox() {
+    await checkNativeLocalUndo("mbox", false, "restore");
+  });
+  add_task(async function test_localUndoRestoreRetryMaildir() {
+    await checkNativeLocalUndo("maildir", false, "restore");
+  });
+  add_task(async function test_localUndoFinishFailureMaildir() {
+    await checkNativeLocalUndo("maildir", false, "finish");
+  });
+}

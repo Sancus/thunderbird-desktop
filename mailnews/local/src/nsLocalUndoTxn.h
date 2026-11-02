@@ -11,6 +11,11 @@
 #include "nsTArray.h"
 #include "nsIFolderListener.h"
 #include "nsIWeakReferenceUtils.h"
+#include "mozilla/UniquePtr.h"
+
+#ifdef MOZ_PANORAMA
+struct NativeLocalUndoState;
+#endif
 
 class nsLocalUndoFolderListener;
 
@@ -35,9 +40,19 @@ class nsLocalMoveCopyMsgTxn : public nsIFolderListener, public nsMsgTxn {
   nsresult UndoImapDeleteFlag(nsIMsgFolder* aFolder,
                               nsTArray<nsMsgKey>& aKeyArray, bool deleteFlag);
   nsresult UndoTransactionInternal();
+#ifdef MOZ_PANORAMA
+  bool UsesNativeLocalUndo() const { return !!mNativeUndo; }
+  nsresult PrepareNativeSourceRemoval(
+      nsIMsgFolder* folder, const nsTArray<RefPtr<nsIMsgDBHdr>>& headers);
+  nsresult RemoveNativeSourceHeader(nsIMsgFolder* folder, nsIMsgDBHdr* header);
+#endif
 
  private:
   virtual ~nsLocalMoveCopyMsgTxn();
+#ifdef MOZ_PANORAMA
+  nsresult RunNativeUndo(bool undoing);
+  mozilla::UniquePtr<NativeLocalUndoState> mNativeUndo;
+#endif
   nsWeakPtr m_srcFolder;
   nsTArray<nsMsgKey> m_srcKeyArray;  // used when src is local or imap
   nsWeakPtr m_dstFolder;

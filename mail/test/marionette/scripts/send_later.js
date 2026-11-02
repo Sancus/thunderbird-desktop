@@ -28,29 +28,31 @@ function registerModules() {
   }
   let root = Services.dirsvc.get("GreD", Ci.nsIFile);
   for (let depth = 0; root && depth < 5; depth++, root = root.parent) {
-    const modules = root.clone();
-    modules.append("_tests");
-    modules.append("modules");
-    const hasModule = name => {
-      const file = modules.clone();
-      file.append("mailnews");
-      file.append(name);
-      return file.exists();
-    };
-    if (["Auth.sys.mjs", "Maild.sys.mjs", "Smtpd.sys.mjs"].every(hasModule)) {
-      const previous = handler.hasSubstitution("testing-common")
-        ? handler.getSubstitution("testing-common")
-        : null;
-      owner.s375Modules = { previous };
-      handler.setSubstitution(
-        "testing-common",
-        Services.io.newFileURI(modules)
-      );
-      return handler;
+    for (const layout of ["_tests", "tests"]) {
+      const modules = root.clone();
+      modules.append(layout);
+      modules.append("modules");
+      const hasModule = name => {
+        const file = modules.clone();
+        file.append("mailnews");
+        file.append(name);
+        return file.exists();
+      };
+      if (["Auth.sys.mjs", "Maild.sys.mjs", "Smtpd.sys.mjs"].every(hasModule)) {
+        const previous = handler.hasSubstitution("testing-common")
+          ? handler.getSubstitution("testing-common")
+          : null;
+        owner.s375Modules = { previous };
+        handler.setSubstitution(
+          "testing-common",
+          Services.io.newFileURI(modules)
+        );
+        return handler;
+      }
     }
   }
   throw new Error(
-    "The ordinary installed _tests/modules/mailnews payload is missing"
+    "The ordinary installed test modules/mailnews payload is missing"
   );
 }
 

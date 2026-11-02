@@ -8125,10 +8125,14 @@ void nsImapProtocol::MailboxDiscoveryFinished() {
         m_hostSessionList->SetOnlineTrashFolderExistsForHost(GetImapServerKey(),
                                                              true);
     }  // if trash folder doesn't exist
-    m_hostSessionList->SetHaveWeEverDiscoveredFoldersForHost(GetImapServerKey(),
-                                                             true);
-    // notify front end that folder discovery is complete....
-    if (m_imapServerSink) m_imapServerSink->DiscoveryDone();
+    // A failed row or completion keeps its original error through URL finish.
+    if (m_imapServerSink && NS_SUCCEEDED(m_mailboxUpdateResult)) {
+      m_mailboxUpdateResult = m_imapServerSink->DiscoveryDone();
+    }
+    if (NS_SUCCEEDED(m_mailboxUpdateResult)) {
+      m_hostSessionList->SetHaveWeEverDiscoveredFoldersForHost(
+          GetImapServerKey(), true);
+    }
 
     // Clear the discovery in progress flag.
     m_hostSessionList->SetDiscoveryForHostInProgress(GetImapServerKey(), false);

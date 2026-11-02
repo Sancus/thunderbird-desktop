@@ -88,8 +88,11 @@ class nsImapIncomingServer : public nsMsgIncomingServer,
   nsresult GetFormattedStringFromName(const nsAString& aValue,
                                       const char* aName, nsAString& aResult);
   nsresult GetPrefForServerAttribute(const char* prefSuffix, bool* prefValue);
-  bool CheckSpecialFolder(nsCString& folderUri, uint32_t folderFlag,
-                          nsCString& existingUri);
+  nsresult FindDiscoveryFolder(const nsACString& uri, nsIMsgFolder** folder);
+  nsresult FindDiscoveryFolderWithFlag(nsIMsgFolder* parent, uint32_t flag,
+                                       nsIMsgFolder** folder);
+  nsresult CheckSpecialFolder(const nsACString& folderUri, uint32_t folderFlag,
+                              nsACString& existingUri);
 
   nsCOMArray<nsIImapProtocol> m_connectionCache;
 

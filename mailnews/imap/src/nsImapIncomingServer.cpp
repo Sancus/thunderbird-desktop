@@ -1185,19 +1185,19 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
         }
       }
 #endif
-      imapFolder->SetVerifiedAsOnlineFolder(true);
-      imapFolder->SetHierarchyDelimiter(hierarchyDelimiter);
+      MOZ_TRY(imapFolder->SetVerifiedAsOnlineFolder(true));
+      MOZ_TRY(imapFolder->SetHierarchyDelimiter(hierarchyDelimiter));
       if (boxFlags & kImapTrash) {
         int32_t deleteModel;
-        GetDeleteModel(&deleteModel);
+        MOZ_TRY(GetDeleteModel(&deleteModel));
         if (deleteModel == nsMsgImapDeleteModels::MoveToTrash) {
-          child->SetFlag(nsMsgFolderFlags::Trash);
+          MOZ_TRY(child->SetFlag(nsMsgFolderFlags::Trash));
         }
       }
 
-      imapFolder->SetBoxFlags(boxFlags);
-      imapFolder->SetExplicitlyVerify(explicitlyVerify);
-      imapFolder->GetOnlineName(onlineName);
+      MOZ_TRY(imapFolder->SetBoxFlags(boxFlags));
+      MOZ_TRY(imapFolder->SetExplicitlyVerify(explicitlyVerify));
+      MOZ_TRY(imapFolder->GetOnlineName(onlineName));
 
       // online name needs to use the correct hierarchy delimiter (I think...)
       // or the canonical path - one or the other, but be consistent.
@@ -1209,20 +1209,19 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
       // GMail gives us a localized name for the inbox but doesn't let
       // us select that localized name.
       if (boxFlags & kImapInbox)
-        imapFolder->SetOnlineName("INBOX"_ns);
+        MOZ_TRY(imapFolder->SetOnlineName("INBOX"_ns));
       else if (onlineName.IsEmpty() || !onlineName.Equals(dupFolderPath))
-        imapFolder->SetOnlineName(dupFolderPath);
+        MOZ_TRY(imapFolder->SetOnlineName(dupFolderPath));
 
       if (hierarchyDelimiter != '/') {
         nsImapUrl::UnescapeSlashes(folderName);
       }
-      if (NS_SUCCEEDED(CopyFolderNameToUTF16(folderName, unicodeName)))
-        child->SetName(NS_ConvertUTF16toUTF8(unicodeName));
+      MOZ_TRY(CopyFolderNameToUTF16(folderName, unicodeName));
+      MOZ_TRY(child->SetName(NS_ConvertUTF16toUTF8(unicodeName)));
     }
   }
   if (!found && child)
-    child->SetMsgDatabase(nullptr);  // close the db, so we don't hold open all
-                                     // the .msf files for new folders
+    MOZ_TRY(child->SetMsgDatabase(nullptr));  // Close new folders' databases.
   return NS_OK;
 }
 
@@ -1432,69 +1431,64 @@ NS_IMETHODIMP nsImapIncomingServer::DiscoveryDone() {
   if (mDoingSubscribeDialog) return NS_OK;
 
   nsCOMPtr<nsIMsgFolder> rootMsgFolder;
-  nsresult rv = GetRootFolder(getter_AddRefs(rootMsgFolder));
-  if (NS_SUCCEEDED(rv) && rootMsgFolder) {
-    // GetResource() may return a node which is not in the folder
-    // tree hierarchy but in the rdf cache in case of the non-existing default
-    // Sent, Drafts, and Templates folders. The resource will be eventually
-    // released when the rdf service shuts down. When we create the default
-    // folders later on in the imap server, the subsequent GetResource() of the
-    // same uri will get us the cached rdf resource which should have the folder
-    // flag set appropriately.
-
-    nsCOMPtr<nsIMsgAccountManager> accountMgr =
-        mozilla::components::AccountManager::Service();
-    nsCOMPtr<nsIMsgIdentity> identity;
-    rv = accountMgr->GetFirstIdentityForServer(this, getter_AddRefs(identity));
-    if (NS_SUCCEEDED(rv) && identity) {
-      nsCString folderUri;
-      identity->GetFccFolderURI(folderUri);
-      nsCString existingUri;
-
-      if (CheckSpecialFolder(folderUri, nsMsgFolderFlags::SentMail,
-                             existingUri)) {
-        identity->SetFccFolderURI(existingUri);
-        identity->SetFccFolderPickerMode("1"_ns);
-      }
-      identity->GetDraftsFolderURI(folderUri);
-      if (CheckSpecialFolder(folderUri, nsMsgFolderFlags::Drafts,
-                             existingUri)) {
-        identity->SetDraftsFolderURI(existingUri);
-        identity->SetDraftsFolderPickerMode("1"_ns);
-      }
-      bool archiveEnabled;
-      identity->GetArchiveEnabled(&archiveEnabled);
-      if (archiveEnabled) {
-        identity->GetArchivesFolderURI(folderUri);
-        if (CheckSpecialFolder(folderUri, nsMsgFolderFlags::Archive,
-                               existingUri)) {
-          identity->SetArchivesFolderURI(existingUri);
-          identity->SetArchivesFolderPickerMode("1"_ns);
-        }
-      }
-      identity->GetTemplatesFolderURI(folderUri);
-      if (!folderUri.IsEmpty()) {
-        nsCOMPtr<nsIMsgFolder> folder;
-        rv = GetOrCreateFolder(folderUri, getter_AddRefs(folder));
-        if (NS_SUCCEEDED(rv)) rv = folder->SetFlag(nsMsgFolderFlags::Templates);
+  MOZ_TRY(GetRootFolder(getter_AddRefs(rootMsgFolder)));
+  NS_ENSURE_TRUE(rootMsgFolder, NS_ERROR_NOT_AVAILABLE);
+  nsresult rv;
+  nsCOMPtr<nsIMsgAccountManager> accountMgr =
+      mozilla::components::AccountManager::Service();
+  NS_ENSURE_TRUE(accountMgr, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgIdentity> identity;
+  MOZ_TRY(
+      accountMgr->GetFirstIdentityForServer(this, getter_AddRefs(identity)));
+  if (identity) {
+    nsCString folderUri, existingUri;
+    MOZ_TRY(identity->GetFccFolderURI(folderUri));
+    MOZ_TRY(
+        CheckSpecialFolder(folderUri, nsMsgFolderFlags::SentMail, existingUri));
+    if (!existingUri.IsEmpty()) {
+      MOZ_TRY(identity->SetFccFolderURI(existingUri));
+      MOZ_TRY(identity->SetFccFolderPickerMode("1"_ns));
+    }
+    MOZ_TRY(identity->GetDraftsFolderURI(folderUri));
+    MOZ_TRY(
+        CheckSpecialFolder(folderUri, nsMsgFolderFlags::Drafts, existingUri));
+    if (!existingUri.IsEmpty()) {
+      MOZ_TRY(identity->SetDraftsFolderURI(existingUri));
+      MOZ_TRY(identity->SetDraftsFolderPickerMode("1"_ns));
+    }
+    bool archiveEnabled;
+    MOZ_TRY(identity->GetArchiveEnabled(&archiveEnabled));
+    if (archiveEnabled) {
+      MOZ_TRY(identity->GetArchivesFolderURI(folderUri));
+      MOZ_TRY(CheckSpecialFolder(folderUri, nsMsgFolderFlags::Archive,
+                                 existingUri));
+      if (!existingUri.IsEmpty()) {
+        MOZ_TRY(identity->SetArchivesFolderURI(existingUri));
+        MOZ_TRY(identity->SetArchivesFolderPickerMode("1"_ns));
       }
     }
+    MOZ_TRY(identity->GetTemplatesFolderURI(folderUri));
+    if (!folderUri.IsEmpty()) {
+      nsCOMPtr<nsIMsgFolder> folder;
+      MOZ_TRY(FindDiscoveryFolder(folderUri, getter_AddRefs(folder)));
+      if (folder) MOZ_TRY(folder->SetFlag(nsMsgFolderFlags::Templates));
+    }
+  }
 
-    nsCOMPtr<nsISpamSettings> spamSettings;
-    rv = GetSpamSettings(getter_AddRefs(spamSettings));
-    if (NS_SUCCEEDED(rv) && spamSettings) {
-      nsCString spamFolderUri, existingUri;
-      spamSettings->GetSpamFolderURI(spamFolderUri);
-      if (CheckSpecialFolder(spamFolderUri, nsMsgFolderFlags::Junk,
-                             existingUri)) {
-        // This only sets the cached values in the spam settings object.
-        spamSettings->SetActionTargetFolder(existingUri);
-        spamSettings->SetMoveTargetMode(
-            nsISpamSettings::MOVE_TARGET_MODE_FOLDER);
-        // Set the preferences too so that the values persist.
-        SetStringValue("spamActionTargetFolder", existingUri);
-        SetIntValue("moveTargetMode", nsISpamSettings::MOVE_TARGET_MODE_FOLDER);
-      }
+  nsCOMPtr<nsISpamSettings> spamSettings;
+  MOZ_TRY(GetSpamSettings(getter_AddRefs(spamSettings)));
+  if (spamSettings) {
+    nsCString spamFolderUri, existingUri;
+    MOZ_TRY(spamSettings->GetSpamFolderURI(spamFolderUri));
+    MOZ_TRY(
+        CheckSpecialFolder(spamFolderUri, nsMsgFolderFlags::Junk, existingUri));
+    if (!existingUri.IsEmpty()) {
+      MOZ_TRY(spamSettings->SetActionTargetFolder(existingUri));
+      MOZ_TRY(spamSettings->SetMoveTargetMode(
+          nsISpamSettings::MOVE_TARGET_MODE_FOLDER));
+      MOZ_TRY(SetStringValue("spamActionTargetFolder", existingUri));
+      MOZ_TRY(SetIntValue("moveTargetMode",
+                          nsISpamSettings::MOVE_TARGET_MODE_FOLDER));
     }
   }
 
@@ -1668,41 +1662,80 @@ NS_IMETHODIMP nsImapIncomingServer::DiscoveryDone() {
   return rv;
 }
 
-// Check if the special folder corresponding to the uri exists. If not, check
-// if there already exists a folder with the special folder flag (the server may
-// have told us about a folder to use through XLIST). If so, return the uri of
-// the existing special folder. If not, set the special flag on the folder so
-// it will be there if and when the folder is created.
-// Return true if we found an existing special folder different than
-// the one specified in prefs, and the one specified by prefs doesn't exist.
-bool nsImapIncomingServer::CheckSpecialFolder(nsCString& folderUri,
-                                              uint32_t folderFlag,
-                                              nsCString& existingUri) {
-  nsCOMPtr<nsIMsgFolder> folder;
-  nsCOMPtr<nsIMsgFolder> rootMsgFolder;
-  nsresult rv = GetRootFolder(getter_AddRefs(rootMsgFolder));
-  NS_ENSURE_SUCCESS(rv, false);
+// Resolve only retained native folders. A configured URI does not declare a
+// server mailbox, and must not create a dangling native wrapper.
+nsresult nsImapIncomingServer::FindDiscoveryFolder(const nsACString& uri,
+                                                   nsIMsgFolder** folder) {
+  NS_ENSURE_ARG_POINTER(folder);
+  *folder = nullptr;
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(FindFolder(uri, folder));
+    if (*folder || uri.IsEmpty()) return NS_OK;
+    nsCOMPtr<nsIMsgAccountManager> accounts =
+        mozilla::components::AccountManager::Service();
+    NS_ENSURE_TRUE(accounts, NS_ERROR_NOT_AVAILABLE);
+    nsTArray<RefPtr<nsIMsgIncomingServer>> servers;
+    MOZ_TRY(accounts->GetAllServers(servers));
+    for (auto& server : servers) {
+      nsCString serverUri;
+      MOZ_TRY(server->GetServerURI(serverUri));
+      serverUri.Append('/');
+      if (!StringBeginsWith(uri, serverUri)) continue;
+      nsCOMPtr<nsIMsgFolder> root;
+      MOZ_TRY(server->GetRootFolder(getter_AddRefs(root)));
+      NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
+      return root->GetChildWithURI(uri, true, false, folder);
+    }
+    return NS_OK;
+  }
+#endif
+  return GetOrCreateFolder(uri, folder);
+}
+
+// The common flag lookup is best-effort. Discovery must retain initializer and
+// source read errors instead of turning them into an absent special folder.
+nsresult nsImapIncomingServer::FindDiscoveryFolderWithFlag(
+    nsIMsgFolder* parent, uint32_t flag, nsIMsgFolder** folder) {
+  *folder = nullptr;
+  uint32_t flags;
+  MOZ_TRY(parent->GetFlags(&flags));
+  if ((flags & flag) == flag) {
+    NS_ADDREF(*folder = parent);
+    return NS_OK;
+  }
+  nsTArray<RefPtr<nsIMsgFolder>> children;
+  MOZ_TRY(parent->GetSubFolders(children));
+  for (auto& child : children) {
+    MOZ_TRY(FindDiscoveryFolderWithFlag(child, flag, folder));
+    if (*folder) break;
+  }
+  return NS_OK;
+}
+
+// Return an existing alternative only when the configured folder is absent.
+// Normal native absence leaves the configured target for a later real LIST.
+nsresult nsImapIncomingServer::CheckSpecialFolder(const nsACString& folderUri,
+                                                  uint32_t folderFlag,
+                                                  nsACString& existingUri) {
+  existingUri.Truncate();
+  nsCOMPtr<nsIMsgFolder> root;
+  MOZ_TRY(GetRootFolder(getter_AddRefs(root)));
+  NS_ENSURE_TRUE(root, NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<nsIMsgFolder> existingFolder;
-  rootMsgFolder->GetFolderWithFlags(folderFlag, getter_AddRefs(existingFolder));
-
-  if (!folderUri.IsEmpty() &&
-      NS_SUCCEEDED(GetOrCreateFolder(folderUri, getter_AddRefs(folder)))) {
-    nsCOMPtr<nsIMsgFolder> parent;
-    folder->GetParent(getter_AddRefs(parent));
-    if (parent) {
-      existingFolder = nullptr;
-    }
-    if (!existingFolder) {
-      folder->SetFlag(folderFlag);
+  MOZ_TRY(FindDiscoveryFolderWithFlag(root, folderFlag,
+                                      getter_AddRefs(existingFolder)));
+  if (!folderUri.IsEmpty()) {
+    nsCOMPtr<nsIMsgFolder> folder;
+    MOZ_TRY(FindDiscoveryFolder(folderUri, getter_AddRefs(folder)));
+    if (folder) {
+      nsCOMPtr<nsIMsgFolder> parent;
+      MOZ_TRY(folder->GetParent(getter_AddRefs(parent)));
+      if (parent) existingFolder = nullptr;
+      if (!existingFolder) MOZ_TRY(folder->SetFlag(folderFlag));
     }
   }
-
-  if (existingFolder) {
-    existingFolder->GetURI(existingUri);
-    return true;
-  }
-
-  return false;
+  return existingFolder ? existingFolder->GetURI(existingUri) : NS_OK;
 }
 
 bool nsImapIncomingServer::NoDescendantsAreVerified(
@@ -2343,7 +2376,7 @@ nsImapIncomingServer::OnStopRunningUrl(nsIURI* url, nsresult exitCode) {
         NS_ENSURE_SUCCESS(rv, rv);
         break;
       case nsIImapUrl::nsImapDiscoverAllBoxesUrl:
-        if (NS_SUCCEEDED(exitCode)) DiscoveryDone();
+        if (NS_SUCCEEDED(exitCode)) rv = DiscoveryDone();
         break;
       case nsIImapUrl::nsImapSelectFolder:
       case nsIImapUrl::nsImapFolderStatus: {

@@ -218,8 +218,8 @@ NS_IMETHODIMP nsMsgGroupThread::RemoveChildHdr(
   // if we're deleting the root of a dummy thread, need to update the threadKey
   // and the dummy header at position 0
   if (m_dummy && wasFirstChild && m_keys.Length() > 1) {
-    nsIMsgDBHdr* newRootChild;
-    rv = GetChildHdrAt(1, &newRootChild);
+    nsCOMPtr<nsIMsgDBHdr> newRootChild;
+    rv = GetChildHdrAt(1, getter_AddRefs(newRootChild));
     NS_ENSURE_SUCCESS(rv, rv);
     SetMsgHdrAt(0, newRootChild);
   }

@@ -1250,7 +1250,7 @@ add_task(async function test_repairSkipsExpungedMbox() {
     if (native) {
       Assert.equal(headers[0].messageKey, liveKey);
     } else {
-      Assert.ok(folder.msgDatabase.dBFolderInfo.expungedBytes > 0);
+      Assert.greater(folder.msgDatabase.dBFolderInfo.expungedBytes, 0);
     }
     Assert.equal(
       mailTestUtils.loadMessageToString(folder, headers[0]),
@@ -1300,7 +1300,7 @@ if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
       const headers = Array.from(folder.messages);
       Assert.equal(headers.length, 1);
       Assert.equal(mailTestUtils.loadMessageToString(folder, headers[0]), raw);
-      Assert.ok(folder.msgDatabase.dBFolderInfo.expungedBytes > 0);
+      Assert.greater(folder.msgDatabase.dBFolderInfo.expungedBytes, 0);
       Assert.deepEqual(await IOUtils.read(folder.filePath.path), before);
     });
   });

@@ -4,11 +4,16 @@
 
 #include "StoreIndexer.h"
 
+#include "LineReader.h"
+#include "mozilla/ScopeExit.h"
 #include "nsIDBFolderInfo.h"
 #include "nsLocalMailFolder.h"
 #include "nsParseMailbox.h"
-#include "LineReader.h"
-#include "mozilla/ScopeExit.h"
+#ifdef MOZ_PANORAMA
+#  include "PerFolderDatabase.h"
+#  include "mozilla/StaticPrefs_mail.h"
+#endif
+#include <limits>
 
 NS_IMPL_ISUPPORTS(StoreIndexer, nsIStoreScanListener)
 
@@ -30,18 +35,20 @@ nsresult StoreIndexer::GoIndex(nsMsgLocalMailFolder* folder,
                                std::function<void(nsresult)> completionFn) {
   MOZ_ASSERT(!mFolder);  // already in use?
 
+  mFirstError = NS_OK;
+  mScanFinished = false;
+
   // Only set mFolder if we can successfully lock it!
   // NOTE: the folder semaphore is not a thread-safe mechanism!
   // The folder just sets a member var to track who is currently holding
   // it. It's thoroughly main-thread-only.
   nsresult rv = folder->AcquireSemaphore(this, "StoreIndexer::GoIndex"_ns);
   NS_ENSURE_SUCCESS(rv, rv);
-  auto scopeGuard = mozilla::MakeScopeExit(
-      [&] { folder->ReleaseSemaphore(this, "StoreIndexer::GoIndex"_ns); });
+  mFolder = folder;
+  auto scopeGuard = mozilla::MakeScopeExit([&] { ReleaseFolder(); });
 
   mProgressFn = progressFn;
   mCompletionFn = completionFn;
-  mFolder = folder;
 
   nsCOMPtr<nsIMsgDBService> msgDBService =
       do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
@@ -49,6 +56,13 @@ nsresult StoreIndexer::GoIndex(nsMsgLocalMailFolder* folder,
   // Use OpenFolderDB to always open the db so that db's m_folder
   // is set correctly.
   rv = msgDBService->OpenFolderDB(mFolder, true, getter_AddRefs(mDB));
+#ifdef MOZ_PANORAMA
+  const bool native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+  // An invalid native summary retains its existing physical rows for repair.
+  if (native && mDB && rv == NS_MSG_ERROR_FOLDER_SUMMARY_OUT_OF_DATE) {
+    rv = NS_OK;
+  }
+#endif
   if (rv == NS_MSG_ERROR_FOLDER_SUMMARY_MISSING) {
     rv = msgDBService->CreateNewDB(mFolder, getter_AddRefs(mDB));
   }
@@ -61,35 +75,67 @@ nsresult StoreIndexer::GoIndex(nsMsgLocalMailFolder* folder,
   // and we still need to index the store. After all, there may not even
   // _be_ a primary database, let alone a backup. It's this indexing process
   // which is used to recreate missing DBs!
-  mFolder->GetBackupMsgDatabase(getter_AddRefs(mBackupDB));
+#ifdef MOZ_PANORAMA
+  if (native) {
+    mNativeDB = static_cast<mozilla::mailnews::PerFolderDatabase*>(mDB.get());
+    rv = mNativeDB->BeginFolderRepair(getter_AddRefs(mFolderRepair));
+    if (NS_FAILED(rv)) {
+      return RememberError(rv);
+    }
+  } else
+#endif
+  {
+    mFolder->GetBackupMsgDatabase(getter_AddRefs(mBackupDB));
+  }
 
   nsCOMPtr<nsIMsgPluggableStore> msgStore;
   rv = mFolder->GetMsgStore(getter_AddRefs(msgStore));
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, RememberError(rv));
 
   // Set up for progress updates.
   mCurrentCount = 0;
   rv = msgStore->EstimateFolderSize(mFolder, &mExpectedTotalCount);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, RememberError(rv));
 
   // Start iterating over all the messages.
   // AsyncScan() holds a refcounted ptr to the listener until the scan
   // completes, so we don't need our own kungfudeathgrip or anything.
   rv = msgStore->AsyncScan(mFolder, this);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, RememberError(rv));
 
-  // Reset forceReparse in the DB.
-  nsCOMPtr<nsIDBFolderInfo> folderInfo;
-  mDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
-  if (folderInfo) {
-    folderInfo->SetBooleanProperty("forceReparse", false);
+#ifdef MOZ_PANORAMA
+  if (!native)
+#endif
+  {
+    // Reset forceReparse in the DB.
+    nsCOMPtr<nsIDBFolderInfo> folderInfo;
+    mDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
+    if (folderInfo) {
+      folderInfo->SetBooleanProperty("forceReparse", false);
+    }
   }
 
   scopeGuard.release();
   return NS_OK;
 }
 
+nsresult StoreIndexer::RememberError(nsresult status) {
+  if (NS_FAILED(status) && NS_SUCCEEDED(mFirstError)) {
+    mFirstError = status;
+  }
+  return mFirstError;
+}
+
 void StoreIndexer::ReleaseFolder() {
+#ifdef MOZ_PANORAMA
+  if (mFolderRepair) {
+    // No body cleanup: a failed or interrupted scan retains all source bytes.
+    mNativeDB->AbortFolderRepair(
+        mFolderRepair, NS_FAILED(mFirstError) ? mFirstError : NS_ERROR_ABORT);
+    mFolderRepair = nullptr;
+  }
+  mNativeDB = nullptr;
+#endif
   // mFolder is only set if we took a lock on it.
   if (mFolder) {
     mFolder->ReleaseSemaphore(this, "StoreIndexer::ReleaseFolder"_ns);
@@ -102,13 +148,14 @@ void StoreIndexer::ReleaseFolder() {
 
 // nsIStoreScanListener.onStartScan()
 // Called at beginning of msgStore scan.
-NS_IMETHODIMP StoreIndexer::OnStartScan() { return NS_OK; }
+NS_IMETHODIMP StoreIndexer::OnStartScan() { return mFirstError; }
 
 // nsIStoreScanListener.onStartMessage()
 // Called when a new message is about to start.
 NS_IMETHODIMP StoreIndexer::OnStartMessage(nsACString const& token,
                                            nsACString const& envAddr,
                                            PRTime envDate) {
+  NS_ENSURE_SUCCESS(mFirstError, mFirstError);
   MOZ_ASSERT(!mParser);  // Can't be mid-message!
 
   mStoreToken = token;
@@ -116,9 +163,9 @@ NS_IMETHODIMP StoreIndexer::OnStartMessage(nsACString const& token,
   // Start a new header parser for this message...
   mParser = new nsParseMailMessageState();
   nsresult rv = mParser->SetMailDB(mDB);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, RememberError(rv));
   rv = mParser->SetBackupMailDB(mBackupDB);
-  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_SUCCESS(rv, RememberError(rv));
 
   mParser->SetEnvDetails(envAddr, envDate);
 
@@ -133,6 +180,7 @@ NS_IMETHODIMP StoreIndexer::OnStartMessage(nsACString const& token,
 // nsIStoreScanListener.onStartRequest()
 // Called after OnStartMessage(), but before the first OnDataAvailable().
 NS_IMETHODIMP StoreIndexer::OnStartRequest(nsIRequest* req) {
+  NS_ENSURE_SUCCESS(mFirstError, mFirstError);
   MOZ_ASSERT(!mStoreToken.IsEmpty());
   MOZ_ASSERT(mParser);
   // Nothing to do - OnStartMessage() has already set us up.
@@ -143,13 +191,15 @@ NS_IMETHODIMP StoreIndexer::OnStartRequest(nsIRequest* req) {
 NS_IMETHODIMP StoreIndexer::OnDataAvailable(nsIRequest* req,
                                             nsIInputStream* stream,
                                             uint64_t offset, uint32_t count) {
+  NS_ENSURE_SUCCESS(mFirstError, mFirstError);
   while (count > 0) {
     // Read in a chunk.
     uint32_t got;
     size_t freeSpace = mBuf.Length() - (mUsed + mUnused);
     nsresult rv = stream->Read(mBuf.Elements() + mUsed + mUnused,
                                std::min((uint32_t)freeSpace, count), &got);
-    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_SUCCESS(rv, RememberError(rv));
+    NS_ENSURE_TRUE(got, RememberError(NS_BASE_STREAM_CLOSED));
     mUnused += got;
     count -= got;
 
@@ -176,8 +226,8 @@ NS_IMETHODIMP StoreIndexer::OnDataAvailable(nsIRequest* req,
 
       if (!mIsStupidlyLongLine) {
         MOZ_ASSERT(!incompleteLine);
-        // Ignore result of ParseAFolderLine(). Better to just keep going.
-        mParser->ParseAFolderLine(line.Elements(), line.Length());
+        rv = mParser->ParseAFolderLine(line.Elements(), line.Length());
+        NS_ENSURE_SUCCESS(rv, RememberError(rv));
       } else if (!incompleteLine) {
         // Soaked up entire stupidly-long-line, stop discarding data.
         mIsStupidlyLongLine = false;
@@ -200,88 +250,119 @@ NS_IMETHODIMP StoreIndexer::OnDataAvailable(nsIRequest* req,
 // nsIStoreScanListener.onStopRequest()
 // Called at end of each message.
 NS_IMETHODIMP StoreIndexer::OnStopRequest(nsIRequest* req, nsresult status) {
-  nsresult rv;
-  // If there's an unfinished line left in the buffer, include it in the
-  // msgSize, but no point feeding it through the parser.
-  mCurrentMsgSize += mUnused;
+  auto clearMessage = mozilla::MakeScopeExit([&] {
+    mStoreToken.Truncate();
+    mCurrentMsgSize = 0;
+    if (mParser) {
+      mParser->SetNewMsgHdr(nullptr);
+      mParser = nullptr;
+    }
+  });
+  NS_ENSURE_SUCCESS(RememberError(status), mFirstError);
+  NS_ENSURE_TRUE(mParser, RememberError(NS_ERROR_UNEXPECTED));
 
-  // Update progress.
+  // An unfinished final line is still part of the retrievable message size.
+  mCurrentMsgSize += mUnused;
   mCurrentCount += (int64_t)mCurrentMsgSize;
   if (mProgressFn) {
     mProgressFn(mCurrentCount, mExpectedTotalCount);
   }
 
-  // This stuff is loosely based on nsMsgMailboxParser::PublishMsgHeader()
-
-  // Tell the world about the message header (add to db, and view, if any)
   nsCOMPtr<nsIMsgDBHdr> hdr;
-  mParser->GetNewMsgHdr(getter_AddRefs(hdr));
+  nsresult rv = mParser->GetNewMsgHdr(getter_AddRefs(hdr));
+  NS_ENSURE_SUCCESS(rv, RememberError(rv));
+#ifdef MOZ_PANORAMA
+  // A scanned body which never completed its headers cannot silently disappear
+  // from a successful native rebuild. Expunged headers are handled below.
+  if (mFolderRepair) {
+    NS_ENSURE_TRUE(hdr, RememberError(NS_ERROR_ILLEGAL_VALUE));
+  }
+#endif
   if (hdr) {
-    // nsParseMailMessageState will parse flags from X-Mozilla-Status[2],
-    // if present. So we can check to see if a message has been deleted
-    // but not yet cleaned up by compaction (should only really apply
-    // to mbox).
     uint32_t flags;
-    hdr->GetFlags(&flags);
+    rv = hdr->GetFlags(&flags);
+    NS_ENSURE_SUCCESS(rv, RememberError(rv));
     if (flags & nsMsgMessageFlags::Expunged) {
-      // Don't want to add this message to the DB!
       hdr = nullptr;
     }
   }
 
   if (hdr) {
-    hdr->SetMessageSize(mCurrentMsgSize);
-    hdr->SetLineCount(mParser->m_body_lines);
-
+    NS_ENSURE_TRUE(mCurrentMsgSize <= std::numeric_limits<uint32_t>::max(),
+                   RememberError(NS_ERROR_FILE_TOO_BIG));
+    rv = hdr->SetMessageSize(mCurrentMsgSize);
+    NS_ENSURE_SUCCESS(rv, RememberError(rv));
+    rv = hdr->SetLineCount(mParser->m_body_lines);
+    NS_ENSURE_SUCCESS(rv, RememberError(rv));
     MOZ_ASSERT(!mStoreToken.IsEmpty());
-    hdr->SetStoreToken(mStoreToken);
+    rv = hdr->SetStoreToken(mStoreToken);
+    NS_ENSURE_SUCCESS(rv, RememberError(rv));
 
-    // Add hdr but don't notify - shouldn't be requiring notifications
-    // during summary file rebuilding.
-    {
-      nsCOMPtr<nsIMsgDBHdr> liveHdr;
-      rv = mParser->m_mailDB->AttachHdr(hdr, false, getter_AddRefs(liveHdr));
-      NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+    if (mFolderRepair) {
+      // Retain a sealed parsed draft; the complete successful scan owns the
+      // only native settlement. Existing rows are never AttachHdr inserts.
+      return RememberError(mNativeDB->AddFolderRepairMessage(
+          mFolderRepair, hdr, mStoreToken, mCurrentMsgSize));
     }
+#endif
+    nsCOMPtr<nsIMsgDBHdr> liveHdr;
+    rv = mParser->m_mailDB->AttachHdr(hdr, false, getter_AddRefs(liveHdr));
+    NS_ENSURE_SUCCESS(rv, RememberError(rv));
   } else {
-    // The parser chose not to include the message.
-    // Likely, it was expunged/deleted.
+#ifdef MOZ_PANORAMA
+    if (mFolderRepair) {
+      return NS_OK;
+    }
+#endif
     nsCOMPtr<nsIDBFolderInfo> folderInfo;
     rv = mParser->m_mailDB->GetDBFolderInfo(getter_AddRefs(folderInfo));
     if (NS_SUCCEEDED(rv) && folderInfo) {
       folderInfo->ChangeExpungedBytes(mCurrentMsgSize);
     }
   }
-
-  // Clear up our per-message vars.
-  mStoreToken.Truncate();
-  mCurrentMsgSize = 0;
-  mParser->SetNewMsgHdr(nullptr);
-  mParser = nullptr;
   return NS_OK;
 }
 
 // nsIStoreScanListener.onStopScan()
 // Called when the scan completes.
 NS_IMETHODIMP StoreIndexer::OnStopScan(nsresult status) {
-  if (NS_SUCCEEDED(status)) {
-    status = mDB->SetSummaryValid(true);
+  if (mScanFinished) {
+    return NS_OK;
   }
+  mScanFinished = true;
+  RememberError(status);
+  if (mParser) {
+    RememberError(NS_ERROR_UNEXPECTED);
+    mParser->SetNewMsgHdr(nullptr);
+    mParser = nullptr;
+  }
+#ifdef MOZ_PANORAMA
+  if (mFolderRepair) {
+    if (NS_SUCCEEDED(mFirstError)) {
+      nsTArray<RefPtr<mozilla::mailnews::Message>> repaired;
+      RememberError(mNativeDB->CommitFolderRepair(mFolderRepair, mFirstError,
+                                                  true, repaired));
+    }
+    if (NS_FAILED(mFirstError)) {
+      RememberError(mNativeDB->AbortFolderRepair(mFolderRepair, mFirstError));
+    }
+    mFolderRepair = nullptr;
+  } else
+#endif
+      if (NS_SUCCEEDED(mFirstError)) {
+    RememberError(mDB->SetSummaryValid(true));
+  }
+  status = mFirstError;
   ReleaseFolder();
 
   if (NS_SUCCEEDED(status) && mProgressFn) {
-    // If it all worked, fudge a 100% progress report.
-    // Remember, nsIMsgPluggableStore.estimateFolderSize() includes things like
-    // mbox overhead ("From " lines and escaping) which are stripped out by
-    // the time we see the message data, so our byte total won't necessarily
-    // match exactly.
+    // Provider estimates include mbox framing, unlike the parsed byte total.
     mProgressFn(mExpectedTotalCount, mExpectedTotalCount);
   }
-  if (mCompletionFn) {
-    mCompletionFn(status);
+  auto completionFn = std::move(mCompletionFn);
+  if (completionFn) {
+    completionFn(status);
   }
-
-  // Our caller will probably be releasing its reference upon returning
-  // here, so likely we'll be deleted.
   return NS_OK;
 }

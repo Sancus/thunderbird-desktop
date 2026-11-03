@@ -37,6 +37,7 @@
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
 #include "nsTHashMap.h"
+#include "nsTHashSet.h"
 
 using mozilla::LazyLogModule;
 using mozilla::LogLevel;
@@ -72,7 +73,7 @@ struct MessageDatabase::ListenerRegistration {
 };
 
 struct MessageDatabase::QueuedMessageBatch {
-  enum class Kind { Publication, Thread, Removed, Flags, Tags, Body };
+  enum class Kind { Publication, Thread, Removed, Flags, Tags, Body, Repair };
   struct Delivery {
     RefPtr<ListenerRegistration> registration;
     RefPtr<MessageListener> listener;
@@ -97,6 +98,11 @@ struct MessageDatabase::QueuedMessageBatch {
   RefPtr<nsIMsgDBHdr> oldHeader;
   RefPtr<Message> live;
   nsTArray<Delivery> deliveries;
+  struct Repair {
+    Body change;
+    bool added{false};
+  };
+  nsTArray<Repair> repairs;
   nsTArray<Body> bodies;
   nsTArray<Flags> flagChanges;
 };
@@ -223,6 +229,23 @@ void MessageDatabase::DrainMessageBatches() {
       }
       continue;
     }
+    if (batch->kind == QueuedMessageBatch::Kind::Repair) {
+      for (const auto& repaired : batch->repairs) {
+        const auto& change = repaired.change;
+        for (auto& delivery : batch->deliveries) {
+          if (!mMessageListeners.Contains(delivery.registration)) continue;
+          if (repaired.added) {
+            delivery.listener->OnMessagePublishedCaptured(change.after,
+                                                          change.live, false);
+          } else {
+            delivery.listener->OnMessageBodyChangedCaptured(
+                change.before, change.after, change.oldHeader, change.live,
+                change.oldBody, change.newBody);
+          }
+        }
+      }
+      continue;
+    }
     if (batch->kind == QueuedMessageBatch::Kind::Body) {
       for (const auto& body : batch->bodies) {
         for (auto& delivery : batch->deliveries) {
@@ -260,10 +283,29 @@ void MessageDatabase::DrainMessageBatches() {
                                                  batch->oldHeader, batch->live);
           break;
         case QueuedMessageBatch::Kind::Body:
-          MOZ_ASSERT_UNREACHABLE("body batch handled above");
+        case QueuedMessageBatch::Kind::Repair:
+          MOZ_ASSERT_UNREACHABLE("bulk batch handled above");
       }
     }
   }
+}
+
+struct FolderRepairSnapshot::Data {
+  RefPtr<MessageDatabase> owner;
+  nsCString sourceId;
+  uint64_t folderId{0};
+  uint64_t parent{0};
+  nsCString name;
+  nsTArray<MessageBodyState> messages;
+};
+
+FolderRepairSnapshot::FolderRepairSnapshot() = default;
+FolderRepairSnapshot::~FolderRepairSnapshot() = default;
+FolderRepairSnapshot::FolderRepairSnapshot(FolderRepairSnapshot&&) = default;
+FolderRepairSnapshot& FolderRepairSnapshot::operator=(FolderRepairSnapshot&&) =
+    default;
+const nsTArray<MessageBodyState>* FolderRepairSnapshot::Messages() const {
+  return mData ? &mData->messages : nullptr;
 }
 
 struct RemovedMessage::Data {
@@ -305,6 +347,11 @@ void MessageDatabase::Shutdown() {
 namespace {
 
 constexpr uint64_t kMaxSearchSequence = 9007199254740991;
+
+nsresult ChangeHeader(const CapturedMessage& captured,
+                      RefPtr<DetachedMsgHdr>& output);
+nsresult RollbackMessageChange(mozIStorageConnection* connection,
+                               nsresult original);
 
 bool SearchText(JSContext* cx, JS::Handle<JSObject*> object, const char* name,
                 const nsACString& text) {
@@ -1111,6 +1158,347 @@ nsresult MessageDatabase::ReadMessageBodyState(nsMsgKey key,
   MOZ_TRY(stmt->ExecuteStep(&more));
   NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
   output = std::move(state);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ReadFolderRepairState(
+    uint64_t folderId, const nsACString& databaseSourceId,
+    FolderRepairSnapshot::Data& output) {
+  MOZ_TRY(RequireCurrentOwner());
+  NS_ENSURE_TRUE(
+      folderId && folderId <= INT64_MAX && !databaseSourceId.IsEmpty(),
+      NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckPendingFolderRelocation(folderId));
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "FolderRepairIdentity"_ns,
+        "SELECT f.parent,f.name,d.sourceId,p.value,typeof(p.value) "
+        "FROM folders f JOIN database_identity d ON d.singleton=1 "
+        "LEFT JOIN folder_properties p ON p.id=f.id AND p.name='summaryValid' "
+        "WHERE f.id=:folder"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int64_t parent, valid;
+    nsCString source, type;
+    MOZ_TRY(stmt->GetInt64(0, &parent));
+    MOZ_TRY(stmt->GetUTF8String(1, output.name));
+    MOZ_TRY(stmt->GetUTF8String(2, source));
+    MOZ_TRY(stmt->GetInt64(3, &valid));
+    MOZ_TRY(stmt->GetUTF8String(4, type));
+    NS_ENSURE_TRUE(parent >= 0, NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(source == databaseSourceId &&
+                       type.EqualsLiteral("integer") && valid == 0,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    output.parent = static_cast<uint64_t>(parent);
+  }
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "FolderRepairPendingStage"_ns,
+        "SELECT 1 FROM staged_messages WHERE folderId=:folder LIMIT 1"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_IN_PROGRESS);
+  }
+  nsTArray<nsMsgKey> keys;
+  MOZ_TRY(ListAllKeys(folderId, keys));
+  keys.Sort();
+  if (!output.messages.SetCapacity(keys.Length(), fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  nsTHashSet<nsCStringHashKey> tokens;
+  for (nsMsgKey key : keys) {
+    MessageBodyState body;
+    MOZ_TRY(ReadMessageBodyState(key, body));
+    NS_ENSURE_TRUE(body.folderId == folderId &&
+                       body.databaseSourceId == databaseSourceId &&
+                       body.storeToken && !body.storeToken->IsEmpty() &&
+                       !tokens.Contains(*body.storeToken),
+                   NS_ERROR_NOT_AVAILABLE);
+    tokens.Insert(*body.storeToken);
+    output.messages.AppendElement(std::move(body));
+  }
+  output.owner = this;
+  output.sourceId = databaseSourceId;
+  output.folderId = folderId;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::CaptureFolderRepair(
+    uint64_t folderId, const nsACString& databaseSourceId,
+    FolderRepairSnapshot& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  // The experimental aggregate is not activated or silently approximated here.
+  NS_ENSURE_FALSE(mConversationGroupingEnabled, NS_ERROR_NOT_AVAILABLE);
+  auto captured = UniquePtr<FolderRepairSnapshot::Data>(
+      new (fallible) FolderRepairSnapshot::Data());
+  NS_ENSURE_TRUE(captured, NS_ERROR_OUT_OF_MEMORY);
+  RefPtr<MessageDatabase> self(this);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = ReadFolderRepairState(folderId, databaseSourceId, *captured);
+  if (NS_SUCCEEDED(rv)) rv = connection->CommitTransaction();
+  if (NS_FAILED(rv)) return RollbackMessageChange(connection, rv);
+  output.mData = std::move(captured);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::CompleteFolderRepair(
+    FolderRepairSnapshot& snapshot,
+    const nsTArray<FolderRepairMessage>& messages, nsresult scanStatus,
+    bool scanComplete, nsTArray<RefPtr<Message>>& output) {
+  // The scanner's original first error outranks a later cleanup/owner error.
+  NS_ENSURE_SUCCESS(scanStatus, scanStatus);
+  NS_ENSURE_TRUE(scanComplete, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(RequireCommittedSearchRead());
+  NS_ENSURE_TRUE(snapshot.mData && snapshot.mData->owner.get() == this &&
+                     !mConversationGroupingEnabled,
+                 NS_ERROR_NOT_AVAILABLE);
+  const auto& saved = *snapshot.mData;
+  RefPtr<MessageDatabase> self(this);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  nsTArray<RefPtr<Message>> result;
+  nsTArray<CachedMsg> cached;
+  nsTArray<Maybe<uint32_t>> matches;
+  if (!result.SetLength(messages.Length(), fallible) ||
+      !cached.SetLength(messages.Length(), fallible) ||
+      !matches.SetLength(messages.Length(), fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  UniquePtr<QueuedMessageBatch> notification;
+  MOZ_TRY(PrepareMessageBatch(notification));
+  notification->kind = QueuedMessageBatch::Kind::Repair;
+  notification->notifyLegacy = false;
+  if (!notification->repairs.SetLength(messages.Length(), fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    FolderRepairSnapshot::Data actual;
+    MOZ_TRY(ReadFolderRepairState(saved.folderId, saved.sourceId, actual));
+    NS_ENSURE_TRUE(actual.parent == saved.parent && actual.name == saved.name &&
+                       actual.messages.Length() == saved.messages.Length(),
+                   NS_ERROR_NOT_AVAILABLE);
+    nsTHashMap<nsCStringHashKey, uint32_t> existing;
+    for (uint32_t i = 0; i < saved.messages.Length(); ++i) {
+      const auto& before = saved.messages[i];
+      const auto& now = actual.messages[i];
+      NS_ENSURE_TRUE(
+          now.key == before.key && now.storeToken == before.storeToken &&
+              now.contentRevision == before.contentRevision &&
+              now.locationRevision == before.locationRevision &&
+              now.messageSize == before.messageSize &&
+              now.offlineMessageSize == before.offlineMessageSize &&
+              now.lineCount == before.lineCount &&
+              !((now.flags ^ before.flags) & nsMsgMessageFlags::Offline),
+          NS_ERROR_NOT_AVAILABLE);
+      existing.InsertOrUpdate(*before.storeToken, i);
+    }
+    nsTHashSet<nsCStringHashKey> scanned;
+    for (uint32_t i = 0; i < messages.Length(); ++i) {
+      const auto& item = messages[i];
+      NS_ENSURE_TRUE(item.parsed && !item.storeToken.IsEmpty() &&
+                         item.messageSize <= UINT32_MAX &&
+                         !scanned.Contains(item.storeToken),
+                     NS_ERROR_INVALID_ARG);
+      const auto& header = *item.parsed;
+      NS_ENSURE_TRUE(
+          (item.referencesKnown || header.references.IsEmpty()) &&
+              (!header.storeToken || *header.storeToken == item.storeToken) &&
+              (!header.messageSize ||
+               *header.messageSize == item.messageSize) &&
+              (!header.lineCount || *header.lineCount == item.lineCount),
+          NS_ERROR_INVALID_ARG);
+      scanned.Insert(item.storeToken);
+      if (auto match = existing.Lookup(item.storeToken)) {
+        matches[i] = Some(match.Data());
+      } else {
+        NS_ENSURE_FALSE(header.flags & nsMsgMessageFlags::Expunged,
+                        NS_ERROR_INVALID_ARG);
+      }
+    }
+    for (const auto& before : saved.messages) {
+      NS_ENSURE_TRUE(scanned.Contains(*before.storeToken),
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+    for (uint32_t i = 0; i < messages.Length(); ++i) {
+      const auto& item = messages[i];
+      const auto& parsed = *item.parsed;
+      auto& row = cached[i];
+      auto& repaired = notification->repairs[i];
+      auto& change = repaired.change;
+      repaired.added = !matches[i];
+      if (matches[i]) {
+        change.oldBody = actual.messages[*matches[i]];
+        MOZ_TRY(FetchMsg(change.oldBody.key, row));
+        MOZ_TRY(CaptureMessage(row.key, change.before));
+        RefPtr<DetachedMsgHdr> old;
+        MOZ_TRY(ChangeHeader(change.before, old));
+        change.oldHeader = old;
+      } else {
+        MOZ_TRY(DatabaseCore::GetNextMessageKey(row.key));
+        row.folderId = saved.folderId;
+        row.threadId = row.key;
+        row.threadParent = 0;
+        row.flags = parsed.flags;
+        row.priority = parsed.priority;
+        row.tags = parsed.keywords;
+        for (const auto& extra : parsed.extras) {
+          NS_ENSURE_FALSE(extra.k.EqualsLiteral("uidOnServer"),
+                          NS_ERROR_INVALID_ARG);
+          if (extra.k.EqualsLiteral("keywords")) row.tags = extra.v;
+        }
+      }
+      row.messageId = MOZ_TRY(DatabaseUtils::Normalize(parsed.messageId));
+      row.date = parsed.date;
+      row.sender = MOZ_TRY(DatabaseUtils::Normalize(parsed.sender));
+      row.recipients = MOZ_TRY(DatabaseUtils::Normalize(parsed.recipients));
+      row.ccList = MOZ_TRY(DatabaseUtils::Normalize(parsed.ccList));
+      row.bccList = MOZ_TRY(DatabaseUtils::Normalize(parsed.bccList));
+      row.subject = MOZ_TRY(DatabaseUtils::Normalize(parsed.subject));
+      {
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(DatabaseCore::GetStatement(
+            repaired.added ? "InsertFolderRepairMessage"_ns
+                           : "UpdateFolderRepairMessage"_ns,
+            repaired.added ? "INSERT INTO messages("_ns MESSAGE_SQL_FIELDS
+                             ") VALUES "
+                             "(:id,:folder,:thread,:parent,:messageId,:date,:"
+                             "sender,:recipients,"
+                             ":cc,:bcc,:subject,:flags,:tags,:priority)"_ns
+                           : "UPDATE messages SET "
+                             "messageId=:messageId,date=:date,sender=:sender,"
+                             "recipients=:recipients,ccList=:cc,bccList=:bcc,"
+                             "subject=:subject "
+                             "WHERE id=:id"_ns,
+            getter_AddRefs(stmt)));
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("id"_ns, row.key));
+        MOZ_TRY(stmt->BindUTF8StringByName("messageId"_ns, row.messageId));
+        MOZ_TRY(stmt->BindInt64ByName("date"_ns, row.date));
+        MOZ_TRY(stmt->BindUTF8StringByName("sender"_ns, row.sender));
+        MOZ_TRY(stmt->BindUTF8StringByName("recipients"_ns, row.recipients));
+        MOZ_TRY(stmt->BindUTF8StringByName("cc"_ns, row.ccList));
+        MOZ_TRY(stmt->BindUTF8StringByName("bcc"_ns, row.bccList));
+        MOZ_TRY(stmt->BindUTF8StringByName("subject"_ns, row.subject));
+        if (repaired.added) {
+          MOZ_TRY(stmt->BindInt64ByName("folder"_ns, row.folderId));
+          MOZ_TRY(stmt->BindInt64ByName("thread"_ns, row.threadId));
+          MOZ_TRY(stmt->BindInt64ByName("parent"_ns, row.threadParent));
+          MOZ_TRY(stmt->BindInt64ByName("flags"_ns, row.flags));
+          MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, row.tags));
+          MOZ_TRY(stmt->BindInt32ByName("priority"_ns, row.priority));
+        }
+        MOZ_TRY(stmt->Execute());
+      }
+      if (item.referencesKnown) {
+        MOZ_TRY(
+            WriteMessageReferencesInTransaction(row.key, parsed.references));
+      } else {
+        for (const auto& sql :
+             {"DELETE FROM message_references WHERE id=:id"_ns,
+              "DELETE FROM message_reference_sets WHERE id=:id"_ns}) {
+          nsCOMPtr<mozIStorageStatement> stmt;
+          MOZ_TRY(connection->CreateStatement(sql, getter_AddRefs(stmt)));
+          mozStorageStatementScoper scope(stmt);
+          MOZ_TRY(stmt->BindInt64ByName("id"_ns, row.key));
+          MOZ_TRY(stmt->Execute());
+        }
+      }
+      if (repaired.added) {
+        if (!parsed.replyTo.IsEmpty())
+          MOZ_TRY(SetMessageProperty(row.key, "replyTo"_ns, parsed.replyTo));
+        if (!parsed.charset.IsEmpty())
+          MOZ_TRY(SetMessageProperty(row.key, "msgCharSet"_ns, parsed.charset));
+        if (!parsed.accountKey.IsEmpty())
+          MOZ_TRY(SetMessageProperty(row.key, "account"_ns, parsed.accountKey));
+        if (parsed.dateReceived) {
+          uint32_t seconds;
+          PRTime2Seconds(parsed.dateReceived, &seconds);
+          nsAutoCString value;
+          value.AppendInt(seconds, 16);
+          MOZ_TRY(SetMessageProperty(row.key, "dateReceived"_ns, value));
+        }
+        for (const auto& extra : parsed.extras) {
+          if (!extra.k.EqualsLiteral("keywords"))
+            MOZ_TRY(SetMessageProperty(row.key, extra.k, extra.v));
+        }
+        MOZ_TRY(SetMessageProperty(row.key, "storeToken"_ns, item.storeToken));
+        if (parsed.offlineMessageSize)
+          MOZ_TRY(SetMessageProperty(row.key, "offlineMessageSize"_ns,
+                                     *parsed.offlineMessageSize));
+      }
+      MOZ_TRY(SetMessageProperty(row.key, "messageSize"_ns,
+                                 uint32_t(item.messageSize)));
+      MOZ_TRY(SetMessageProperty(row.key, "lineCount"_ns, item.lineCount));
+      // Existing user flags, tags, priority and all other properties are not
+      // copied from the on-disk parser draft.
+    }
+    for (uint32_t i = 0; i < messages.Length(); ++i) {
+      auto& row = cached[i];
+      auto& change = notification->repairs[i].change;
+      if (notification->repairs[i].added &&
+          !messages[i].parsed->references.IsEmpty()) {
+        const auto& refs = messages[i].parsed->references;
+        nsMsgKey root = MOZ_TRY(FindByMessageId(refs[0]));
+        nsMsgKey parent = MOZ_TRY(FindByMessageId(refs.LastElement()));
+        row.threadId = root && root != row.key ? root : row.key;
+        row.threadParent = parent != row.key ? parent : 0;
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(DatabaseCore::GetStatement(
+            "FolderRepairNewThread"_ns,
+            "UPDATE messages SET threadId=:thread,threadParent=:parent WHERE id=:id"_ns,
+            getter_AddRefs(stmt)));
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("id"_ns, row.key));
+        MOZ_TRY(stmt->BindInt64ByName("thread"_ns, row.threadId));
+        MOZ_TRY(stmt->BindInt64ByName("parent"_ns, row.threadParent));
+        MOZ_TRY(stmt->Execute());
+      }
+      MOZ_TRY(CaptureMessage(row.key, change.after));
+      MOZ_TRY(ReadMessageBodyState(row.key, change.newBody));
+      change.live = new (fallible) Message(row.key);
+      NS_ENSURE_TRUE(change.live, NS_ERROR_OUT_OF_MEMORY);
+      result[i] = change.live;
+    }
+    auto capacity = CheckedInt<size_t>(mMsgCache.count()) + messages.Length();
+    NS_ENSURE_TRUE(capacity.isValid() && mMsgCache.reserve(capacity.value()),
+                   NS_ERROR_OUT_OF_MEMORY);
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "CompleteFolderRepairSummary"_ns,
+          "INSERT INTO folder_properties(id,name,value) VALUES "
+          "(:folder,'summaryValid',1),(:folder,'forceReparse',0) "
+          "ON CONFLICT(id,name) DO UPDATE SET value=excluded.value"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, saved.folderId));
+      MOZ_TRY(stmt->Execute());
+    }
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) return RollbackMessageChange(connection, rv);
+  for (auto& row : cached) {
+    auto entry = mMsgCache.lookup(row.key);
+    if (entry)
+      entry->value() = std::move(row);
+    else
+      mMsgCache.putNewInfallible(row.key, std::move(row));
+  }
+  snapshot.mData = nullptr;
+  output = std::move(result);
+  QueueMessageBatch(std::move(notification));
   return NS_OK;
 }
 

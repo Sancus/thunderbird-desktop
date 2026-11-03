@@ -97,6 +97,32 @@ struct FolderBodyRelocation {
   nsTArray<RelocatedMessageBody> messages;
 };
 
+// Opaque pre-scan custody. Failure/retry never consumes the captured rows.
+class FolderRepairSnapshot final {
+ public:
+  FolderRepairSnapshot();
+  ~FolderRepairSnapshot();
+  FolderRepairSnapshot(FolderRepairSnapshot&&);
+  FolderRepairSnapshot& operator=(FolderRepairSnapshot&&);
+  FolderRepairSnapshot(const FolderRepairSnapshot&) = delete;
+  FolderRepairSnapshot& operator=(const FolderRepairSnapshot&) = delete;
+  const nsTArray<MessageBodyState>* Messages() const;
+
+ private:
+  friend class MessageDatabase;
+  struct Data;
+  UniquePtr<Data> mData;
+};
+
+// Borrowed only during CompleteFolderRepair; the facade owns each parser draft.
+struct FolderRepairMessage {
+  const ::RawHdr* parsed{nullptr};
+  nsCString storeToken;
+  uint64_t messageSize{0};
+  uint32_t lineCount{0};
+  bool referencesKnown{false};
+};
+
 struct PendingDestination {
   uint64_t folderId{0};
   nsMsgKey key{nsMsgKey_None};
@@ -404,6 +430,20 @@ class MessageDatabase : public nsIMessageDatabase {
                                   const ::RawHdr& parsed,
                                   const FinishedMessageBody& finished,
                                   MessageBodyState& output);
+
+  // Caller first persistently invalidates the summary, then captures before
+  // the semaphore-guarded scan. Published physical rows only; no store I/O.
+  nsresult CaptureFolderRepair(uint64_t folderId,
+                               const nsACString& databaseSourceId,
+                               FolderRepairSnapshot& output);
+  // One complete successful physical scan. Matching uses captured token/body
+  // identity, never a header key/Message-ID/UID. No unmatched-row deletion.
+  // On error snapshot/output are unchanged and no callbacks are delivered.
+  // Success consumes the snapshot and sets all live outputs before callbacks.
+  nsresult CompleteFolderRepair(FolderRepairSnapshot& snapshot,
+                                const nsTArray<FolderRepairMessage>& messages,
+                                nsresult scanStatus, bool scanComplete,
+                                nsTArray<RefPtr<Message>>& output);
 
   // Captures complete SQL metadata before deletion, never from a cached header.
   // Output is unchanged on error and available before removal callbacks.
@@ -725,6 +765,9 @@ class MessageDatabase : public nsIMessageDatabase {
                                      const ::RawHdr* parsed,
                                      MessageBodyState& output);
   nsresult ReadMessageBodyState(nsMsgKey key, MessageBodyState& output);
+  nsresult ReadFolderRepairState(uint64_t folderId,
+                                 const nsACString& databaseSourceId,
+                                 FolderRepairSnapshot::Data& output);
   nsresult ReadBodyRelocation(uint64_t folderId,
                               Maybe<FolderBodyRelocation>& output);
   nsresult VerifyBodyRelocationRows(const FolderBodyRelocation& plan);

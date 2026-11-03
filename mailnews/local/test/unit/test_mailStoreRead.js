@@ -812,3 +812,327 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkRepairAttachError("maildir");
   });
 }
+
+/**
+ * Repair a complete real store without substituting its existing physical rows.
+ *
+ * @param {string} storeType - Expected provider type.
+ * @param {boolean} failUpdate - Fail the second real native metadata update.
+ */
+async function checkRepairExistingRows(storeType, failUpdate) {
+  await withAvailabilityStore(storeType, async folder => {
+    const store = folder.msgStore;
+    const raws = [
+      "From: repair@example.invalid\r\n" +
+        "Message-ID: <shared-repair@example.invalid>\r\n" +
+        "Subject: Repaired first row\r\n" +
+        "References: <older@example.invalid> <shared-repair@example.invalid> " +
+        "<older@example.invalid>\r\n\r\nFirst retained body.\r\n",
+      "From: repair@example.invalid\r\n" +
+        "Message-ID: <shared-repair@example.invalid>\r\n" +
+        "Subject: Repaired second row\r\n\r\nSecond retained body.\r\n",
+      "From: repair@example.invalid\r\n" +
+        "Message-ID: <shared-repair@example.invalid>\r\n" +
+        "Subject: Newly discovered row\r\nReferences: \r\n\r\nNew retained body.\r\n",
+    ];
+    const originals = raws.slice(0, 2).map((raw, index) => {
+      const header = folder.addMessage(raw);
+      header.subject = `Stale summary ${index}`;
+      header.setReferences("<stale-summary@example.invalid>");
+      header.flags |= Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+      header.priority = Ci.nsMsgPriority.high;
+      header.setStringProperty("repairUserState", `owned-${index}`);
+      header.setStringProperty("repairEmpty", "");
+      return {
+        key: header.messageKey,
+        token: header.storeToken,
+        size: header.messageSize,
+        flags: header.flags,
+        subject: header.subject,
+      };
+    });
+    Assert.notEqual(originals[0].key, originals[1].key);
+    Assert.notEqual(originals[0].token, originals[1].token);
+    const stream = store.getNewMsgOutputStream(folder);
+    Assert.equal(stream.write(raws[2], raws[2].length), raws[2].length);
+    const newToken = store.finishNewMessage(folder, stream);
+    Assert.notEqual(newToken, "");
+    const tokens = [...originals.map(original => original.token), newToken];
+    const paths =
+      storeType == "mbox"
+        ? [folder.filePath.path]
+        : tokens.map(token =>
+            PathUtils.join(folder.filePath.path, "cur", token)
+          );
+    const bytes = await Promise.all(paths.map(path => IOUtils.read(path)));
+    const id = folder.id;
+    const uri = folder.URI;
+    const keys = originals.map(original => original.key).sort((a, b) => a - b);
+    const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    ).connectionForTests;
+    let installed = false;
+    let faults = 0;
+    if (failUpdate) {
+      connection.createFunction("existing_repair_fault", 0, {
+        onFunctionCall() {
+          faults++;
+          return 0;
+        },
+      });
+    }
+    try {
+      if (failUpdate) {
+        connection.executeSimpleSQL(
+          "CREATE TEMP TRIGGER existing_repair_fault BEFORE UPDATE ON main.messages " +
+            `WHEN OLD.id=${originals[1].key} BEGIN SELECT existing_repair_fault(); ` +
+            "SELECT RAISE(ABORT, 'existing repair failure'); END"
+        );
+        installed = true;
+        const statuses = [];
+        const failed = new PromiseTestUtils.PromiseUrlListener({
+          OnStopRunningUrl(url, status) {
+            statuses.push(status);
+          },
+        });
+        folder.parseFolder(null, failed);
+        const result = await failed.promise.then(
+          () => Cr.NS_OK,
+          error => Number(error.message)
+        );
+        Assert.equal(
+          faults,
+          1,
+          "The second existing row reaches the actual SQL fault"
+        );
+        Assert.equal(result, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+        Assert.deepEqual(statuses, [Cr.NS_ERROR_STORAGE_CONSTRAINT]);
+        Assert.ok(!folder.locked);
+        Assert.ok(!folder.msgDatabase.summaryValid);
+        folder.msgDatabase.forceClosed();
+        folder.msgDatabase = null;
+        Assert.ok(
+          !folder.msgDatabase.summaryValid,
+          "Failed repair stays invalid after reopen"
+        );
+        Assert.deepEqual(
+          folder.msgDatabase.listAllKeys().sort((a, b) => a - b),
+          keys
+        );
+        for (const original of originals) {
+          const retained = folder.msgDatabase.getMsgHdrForKey(original.key);
+          Assert.equal(retained.subject, original.subject);
+          Assert.equal(
+            retained.getStringReference(0),
+            "stale-summary@example.invalid"
+          );
+          Assert.equal(retained.flags, original.flags);
+          Assert.equal(retained.storeToken, original.token);
+        }
+        for (const [index, path] of paths.entries()) {
+          Assert.deepEqual(await IOUtils.read(path), bytes[index]);
+        }
+        for (const [index, token] of tokens.entries()) {
+          Assert.equal(
+            readAll(store.getMsgInputStream(folder, token, 0)),
+            raws[index]
+          );
+        }
+        connection.executeSimpleSQL("DROP TRIGGER temp.existing_repair_fault");
+        installed = false;
+      }
+      const statuses = [];
+      const repeatedStatuses = [];
+      const repeated = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(url, status) {
+          repeatedStatuses.push(status);
+        },
+      });
+      const repaired = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(url, status) {
+          statuses.push(status);
+          if (status == Cr.NS_OK) {
+            // A completed scan has released its semaphore. The old listener
+            // must not clear this follow-on scan's listener after reentry.
+            folder.parseFolder(null, repeated);
+          }
+        },
+      });
+      if (failUpdate) {
+        // The failed repair's invalid native summary must launch a same-row
+        // reparse, including when this folder already has a cached wrapper.
+        Assert.throws(
+          () => folder.getDatabaseWithReparse(repaired, null),
+          error => error.result === Cr.NS_ERROR_NOT_INITIALIZED
+        );
+      } else {
+        folder.parseFolder(null, repaired);
+      }
+      await repaired.promise;
+      await repeated.promise;
+      Assert.deepEqual(statuses, [Cr.NS_OK]);
+      Assert.deepEqual(repeatedStatuses, [Cr.NS_OK]);
+      Assert.equal(folder.id, id);
+      Assert.equal(folder.URI, uri);
+      Assert.ok(!folder.locked);
+      Assert.ok(folder.msgDatabase.summaryValid);
+      const repairedKeys = folder.msgDatabase
+        .listAllKeys()
+        .sort((a, b) => a - b);
+      Assert.equal(repairedKeys.length, 3);
+      Assert.equal(folder.getTotalMessages(false), 3);
+      for (const key of keys) {
+        Assert.ok(
+          repairedKeys.includes(key),
+          "A matched physical row keeps its key"
+        );
+      }
+      const newKeys = repairedKeys.filter(key => !keys.includes(key));
+      Assert.equal(
+        newKeys.length,
+        1,
+        "Only the unmatched actual body receives a new key"
+      );
+      for (const [index, key] of [
+        ...originals.map(original => original.key),
+        newKeys[0],
+      ].entries()) {
+        const header = folder.msgDatabase.getMsgHdrForKey(key);
+        Assert.equal(header.messageId, "shared-repair@example.invalid");
+        Assert.equal(
+          header.subject,
+          ["Repaired first row", "Repaired second row", "Newly discovered row"][
+            index
+          ]
+        );
+        Assert.equal(header.storeToken, tokens[index]);
+        Assert.equal(header.messageSize, raws[index].length);
+        Assert.equal(
+          mailTestUtils.loadMessageToString(folder, header),
+          raws[index]
+        );
+        if (index < originals.length) {
+          Assert.equal(header.flags, originals[index].flags);
+          Assert.equal(header.priority, Ci.nsMsgPriority.high);
+          Assert.equal(
+            header.getStringProperty("repairUserState"),
+            `owned-${index}`
+          );
+          Assert.ok(header.properties.includes("repairEmpty"));
+          Assert.equal(header.getStringProperty("repairEmpty"), "");
+          Assert.ok(!header.properties.includes("repairAbsent"));
+        }
+        const references = Array.from(
+          { length: header.numReferences },
+          (_, n) => header.getStringReference(n)
+        );
+        Assert.deepEqual(
+          references,
+          index == 0
+            ? [
+                "older@example.invalid",
+                "shared-repair@example.invalid",
+                "older@example.invalid",
+              ]
+            : []
+        );
+        // RawHdr::references is a total ordered array. Native rows publish its
+        // canonical property even when the original RFC header was absent.
+        Assert.ok(header.properties.includes("references"));
+      }
+      folder.msgDatabase.forceClosed();
+      folder.msgDatabase = null;
+      Assert.ok(folder.msgDatabase.summaryValid);
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys().sort((a, b) => a - b),
+        repairedKeys
+      );
+      for (const [index, path] of paths.entries()) {
+        Assert.deepEqual(await IOUtils.read(path), bytes[index]);
+      }
+    } finally {
+      if (installed) {
+        connection.executeSimpleSQL("DROP TRIGGER temp.existing_repair_fault");
+      }
+      if (failUpdate) {
+        connection.removeFunction("existing_repair_fault");
+      }
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_repairExistingRowsMbox() {
+    await checkRepairExistingRows("mbox", false);
+  });
+  add_task(async function test_repairExistingRowsMaildir() {
+    await checkRepairExistingRows("maildir", false);
+  });
+  add_task(async function test_repairExistingRowsRollbackMbox() {
+    await checkRepairExistingRows("mbox", true);
+  });
+  add_task(async function test_repairExistingRowsRollbackMaildir() {
+    await checkRepairExistingRows("maildir", true);
+  });
+}
+
+/**
+ * A body with incomplete headers is retained without a false valid summary.
+ *
+ * @param {string} storeType - Expected provider type.
+ */
+async function checkRepairMalformedHeaders(storeType) {
+  await withAvailabilityStore(storeType, async folder => {
+    const store = folder.msgStore;
+    const good = "Subject: Existing row\r\n\r\nRetained existing bytes.\r\n";
+    const header = folder.addMessage(good);
+    const key = header.messageKey;
+    const token = header.storeToken;
+    const malformed = "Subject: Incomplete header block\r\nX-Unfinished: value";
+    const stream = store.getNewMsgOutputStream(folder);
+    Assert.equal(stream.write(malformed, malformed.length), malformed.length);
+    const malformedToken = store.finishNewMessage(folder, stream);
+    const paths =
+      storeType == "mbox"
+        ? [folder.filePath.path]
+        : [token, malformedToken].map(bodyToken =>
+            PathUtils.join(folder.filePath.path, "cur", bodyToken)
+          );
+    const before = await Promise.all(paths.map(path => IOUtils.read(path)));
+    const statuses = [];
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl(url, status) {
+        statuses.push(status);
+      },
+    });
+    folder.parseFolder(null, listener);
+    const result = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    Assert.equal(result, Cr.NS_ERROR_ILLEGAL_VALUE);
+    Assert.deepEqual(statuses, [Cr.NS_ERROR_ILLEGAL_VALUE]);
+    Assert.ok(!folder.locked);
+    Assert.ok(!folder.msgDatabase.summaryValid);
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    Assert.ok(!folder.msgDatabase.summaryValid);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+    const retained = folder.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(retained.storeToken, token);
+    Assert.equal(retained.subject, "Existing row");
+    Assert.equal(mailTestUtils.loadMessageToString(folder, retained), good);
+    for (const [index, path] of paths.entries()) {
+      Assert.deepEqual(await IOUtils.read(path), before[index]);
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_repairMalformedHeadersMbox() {
+    await checkRepairMalformedHeaders("mbox");
+  });
+  add_task(async function test_repairMalformedHeadersMaildir() {
+    await checkRepairMalformedHeaders("maildir");
+  });
+}

@@ -2326,6 +2326,488 @@ TEST_F(DeliveryCompleteHeader, ParsedServerNewFailureRetainsCustody) {
   CheckNoTransaction();
 }
 
+TEST_F(DeliveryCompleteHeader, FolderRepairRetainsParsedDraftsUntilSettlement) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr old{};
+  old.messageId = "old-repair@invalid"_ns;
+  old.subject = "old subject"_ns;
+  old.references = {"stale@invalid"_ns};
+  old.flags = nsMsgMessageFlags::Read | nsMsgMessageFlags::Marked;
+  old.keywords = "keep-tag"_ns;
+  old.priority = nsMsgPriority::high;
+  old.storeToken = Some("repair-old"_ns);
+  old.messageSize = Some(91u);
+  old.lineCount = Some(4u);
+  nsMsgKey originalKey;
+  RefPtr<Message> original;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolder, old, false, &originalKey,
+                                          getter_AddRefs(original)));
+  ASSERT_EQ(NS_OK, original->SetStringProperty("opaque", "0007"_ns));
+  ASSERT_EQ(NS_OK, original->SetStringProperty("empty", ""_ns));
+  RefPtr<FolderRepair> repair;
+  ASSERT_EQ(NS_OK, db->BeginFolderRepair(getter_AddRefs(repair)));
+  bool valid = true;
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("repaired@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetSubject("repaired subject"_ns));
+  ASSERT_EQ(NS_OK,
+            parsed->SetReferences("<a@invalid> <a@invalid> <b@invalid>"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStoreToken("repair-old"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetMessageSize(37));
+  ASSERT_EQ(NS_OK, parsed->SetLineCount(2));
+  ASSERT_EQ(NS_OK, parsed->SetPriority(nsMsgPriority::low));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("keywords", "replace-tag"_ns));
+  ASSERT_EQ(NS_OK,
+            db->AddFolderRepairMessage(repair, parsed, "repair-old"_ns, 37));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, parsed->SetSubject("late mutation"_ns));
+  parsed = nullptr;  // The ordinary parser may clear its own header now.
+
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("new-repair@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetReferences(""_ns));
+  // Normal parser drafts have no physical key; settlement allocates a fresh
+  // one.
+  nsMsgKey parsedKey = originalKey;
+  ASSERT_EQ(NS_OK, parsed->GetMessageKey(&parsedKey));
+  EXPECT_EQ(nsMsgKey_None, parsedKey);
+  ASSERT_EQ(NS_OK, parsed->SetStoreToken("repair-new"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetMessageSize(19));
+  ASSERT_EQ(NS_OK, parsed->SetLineCount(1));
+  ASSERT_EQ(NS_OK,
+            db->AddFolderRepairMessage(repair, parsed, "repair-new"_ns, 19));
+  parsed = nullptr;
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+  nsCString subject;
+  ASSERT_EQ(NS_OK, original->GetSubject(subject));
+  EXPECT_EQ("old subject"_ns, subject);
+
+  nsTArray<RefPtr<Message>> outputs;
+  uint32_t callbacks = 0;
+  RefPtr<DeliveryEarlyMutationListener> listener =
+      new DeliveryEarlyMutationListener;
+  listener->body = [&](const MessageBodyState& after) {
+    ++callbacks;
+    EXPECT_EQ(originalKey, after.key);
+    EXPECT_EQ(2u, outputs.Length());
+    EXPECT_EQ(originalKey, outputs[0]->Key());
+    nsCString currentSubject;
+    EXPECT_EQ(NS_OK, original->GetSubject(currentSubject));
+    EXPECT_EQ("repaired subject"_ns, currentSubject);
+    bool complete = false;
+    EXPECT_EQ(NS_OK, db->GetSummaryValid(&complete));
+    EXPECT_TRUE(complete);
+    nsTArray<RefPtr<Message>> nested;
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db->CommitFolderRepair(repair, NS_OK, true, nested));
+    EXPECT_TRUE(nested.IsEmpty());
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db->AbortFolderRepair(repair, NS_ERROR_ABORT));
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db->AddFolderRepairMessage(repair, nullptr, "reentry"_ns, 1));
+  };
+  mCore->MessageDB().AddMessageListener(listener);
+  auto unwatch = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(listener); });
+  ASSERT_EQ(NS_OK, db->CommitFolderRepair(repair, NS_OK, true, outputs));
+  EXPECT_EQ(1u, callbacks);
+  ASSERT_EQ(2u, outputs.Length());
+  EXPECT_EQ(originalKey, outputs[0]->Key());
+  EXPECT_NE(originalKey, outputs[1]->Key());
+  ASSERT_EQ(NS_OK, original->GetSubject(subject));
+  EXPECT_EQ("repaired subject"_ns, subject);
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, outputs[0]->GetFlags(&flags));
+  EXPECT_EQ(old.flags, flags);
+  nsMsgPriorityValue priority;
+  ASSERT_EQ(NS_OK, outputs[0]->GetPriority(&priority));
+  EXPECT_EQ(nsMsgPriority::high, priority);
+  nsCString property;
+  ASSERT_EQ(NS_OK, outputs[0]->GetStringProperty("keywords", property));
+  EXPECT_EQ("keep-tag"_ns, property);
+  ASSERT_EQ(NS_OK, outputs[0]->GetStringProperty("opaque", property));
+  EXPECT_EQ("0007"_ns, property);
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, outputs[0]->GetProperties(names));
+  EXPECT_TRUE(names.Contains("empty"_ns));
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageReferences(originalKey, references));
+  EXPECT_EQ(
+      (nsTArray<nsCString>{"a@invalid"_ns, "a@invalid"_ns, "b@invalid"_ns}),
+      references);
+  references.Clear();
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(outputs[1]->Key(),
+                                                           references));
+  EXPECT_TRUE(
+      references.IsEmpty());  // Known empty, not absent References state.
+  uint32_t size;
+  ASSERT_EQ(NS_OK, outputs[0]->GetMessageSize(&size));
+  EXPECT_EQ(37u, size);  // Measured bytes repair a wrong old summary size.
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_TRUE(valid);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+  nsTArray<RefPtr<Message>> repeated;
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED,
+            db->CommitFolderRepair(repair, NS_OK, true, repeated));
+  EXPECT_TRUE(repeated.IsEmpty());
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED,
+            db->AbortFolderRepair(repair, NS_ERROR_ABORT));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairDuplicateRetainsFirstError) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<FolderRepair> repair;
+  ASSERT_EQ(NS_OK, db->BeginFolderRepair(getter_AddRefs(repair)));
+  nsCOMPtr<nsIMsgDBHdr> first, second;
+  for (auto* output : {&first, &second}) {
+    ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(*output)));
+    ASSERT_EQ(NS_OK, (*output)->SetReferences(""_ns));
+    ASSERT_EQ(NS_OK, (*output)->SetStoreToken("same-token"_ns));
+    ASSERT_EQ(NS_OK, (*output)->SetMessageSize(17));
+    ASSERT_EQ(NS_OK, (*output)->SetLineCount(1));
+  }
+  ASSERT_EQ(NS_OK,
+            db->AddFolderRepairMessage(repair, first, "same-token"_ns, 17));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->AddFolderRepairMessage(repair, second, "same-token"_ns, 17));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, first->SetSubject("not editable"_ns));
+  nsTArray<RefPtr<Message>> outputs;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->CommitFolderRepair(repair, NS_ERROR_FAILURE, true, outputs));
+  EXPECT_TRUE(outputs.IsEmpty());
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->AbortFolderRepair(repair, NS_ERROR_ABORT));
+  nsTArray<nsMsgKey> staged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_TRUE(staged.IsEmpty());
+  bool valid = true;
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairAdmissionPreservesCallerAndOutputs) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr old{};
+  old.messageId = "admission@repair.invalid"_ns;
+  old.storeToken = Some("admission-token"_ns);
+  old.messageSize = Some(20u);
+  old.lineCount = Some(1u);
+  nsMsgKey key;
+  RefPtr<Message> original;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolder, old, false, &key,
+                                                 getter_AddRefs(original)));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  RefPtr<FolderRepair> repair;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->BeginFolderRepair(getter_AddRefs(repair)));
+  EXPECT_FALSE(repair);
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->BeginFolderRepair(getter_AddRefs(repair)));
+  FolderRepair* occupied = repair.get();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db->BeginFolderRepair(&occupied));
+  EXPECT_EQ(repair.get(), occupied);
+  RefPtr<PerFolderDatabase> other = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetReferences(""_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStoreToken("admission-token"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetMessageSize(21));
+  ASSERT_EQ(NS_OK, parsed->SetLineCount(2));
+  EXPECT_EQ(
+      NS_ERROR_INVALID_ARG,
+      other->AddFolderRepairMessage(repair, parsed, "admission-token"_ns, 21));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(
+      NS_ERROR_IN_PROGRESS,
+      db->AddFolderRepairMessage(repair, parsed, "admission-token"_ns, 21));
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->AddFolderRepairMessage(repair, parsed,
+                                              "admission-token"_ns, 21));
+  nsTArray<RefPtr<Message>> outputs{original};
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->CommitFolderRepair(repair, NS_OK, true, outputs));
+  ASSERT_EQ(1u, outputs.Length());
+  EXPECT_EQ(original.get(), outputs[0].get());
+  outputs.Clear();
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->CommitFolderRepair(repair, NS_OK, true, outputs));
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  EXPECT_TRUE(outputs.IsEmpty());
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->CommitFolderRepair(repair, NS_OK, true, outputs));
+  ASSERT_EQ(1u, outputs.Length());
+  EXPECT_EQ(key, outputs[0]->Key());
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairScanAndClosedOwnerRetainRows) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr old{};
+  old.messageId = "retained@repair.invalid"_ns;
+  old.subject = "retained"_ns;
+  old.storeToken = Some("retained-token"_ns);
+  old.messageSize = Some(33u);
+  old.lineCount = Some(2u);
+  nsMsgKey key;
+  RefPtr<Message> original;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolder, old, false, &key,
+                                                 getter_AddRefs(original)));
+  RefPtr<FolderRepair> repair;
+  ASSERT_EQ(NS_OK, db->BeginFolderRepair(getter_AddRefs(repair)));
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetReferences(""_ns));
+  ASSERT_EQ(NS_OK, parsed->SetSubject("must not publish"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStoreToken("retained-token"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetMessageSize(34));
+  ASSERT_EQ(NS_OK, parsed->SetLineCount(3));
+  ASSERT_EQ(NS_OK, db->AddFolderRepairMessage(repair, parsed,
+                                              "retained-token"_ns, 34));
+  nsTArray<RefPtr<Message>> outputs;
+  EXPECT_EQ(NS_ERROR_FAILURE,
+            db->CommitFolderRepair(repair, NS_ERROR_FAILURE, true, outputs));
+  EXPECT_TRUE(outputs.IsEmpty());
+  EXPECT_EQ(NS_ERROR_FAILURE, db->AbortFolderRepair(repair, NS_ERROR_ABORT));
+  nsCString subject;
+  ASSERT_EQ(NS_OK, original->GetSubject(subject));
+  EXPECT_EQ("retained"_ns, subject);
+  RefPtr<PerFolderDatabase> reopened = new PerFolderDatabase(mFolder, false);
+  bool valid = true;
+  ASSERT_EQ(NS_OK, reopened->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  RefPtr<FolderRepair> closed;
+  ASSERT_EQ(NS_OK, reopened->BeginFolderRepair(getter_AddRefs(closed)));
+  ASSERT_EQ(NS_OK, reopened->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened->CommitFolderRepair(closed, NS_OK, true, outputs));
+  EXPECT_TRUE(outputs.IsEmpty());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            reopened->AbortFolderRepair(closed, NS_ERROR_ABORT));
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+  ASSERT_EQ(NS_OK, original->GetSubject(subject));
+  EXPECT_EQ("retained"_ns, subject);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairReceiverFailureKeepsSummaryInvalid) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RawHdr old{};
+  old.messageId = "receiver@repair.invalid"_ns;
+  old.subject = "old receiver"_ns;
+  old.storeToken = Some("receiver-token"_ns);
+  old.messageSize = Some(41u);
+  old.lineCount = Some(2u);
+  nsMsgKey key;
+  RefPtr<Message> original;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AddMessage(mFolder, old, false, &key,
+                                                 getter_AddRefs(original)));
+  RefPtr<FolderRepair> repair;
+  ASSERT_EQ(NS_OK, db->BeginFolderRepair(getter_AddRefs(repair)));
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetReferences(""_ns));
+  ASSERT_EQ(NS_OK, parsed->SetSubject("new receiver"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStoreToken("receiver-token"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetMessageSize(42));
+  ASSERT_EQ(NS_OK, parsed->SetLineCount(3));
+  ASSERT_EQ(NS_OK, db->AddFolderRepairMessage(repair, parsed,
+                                              "receiver-token"_ns, 42));
+  // A reached receiver write failure must not make any repaired row visible.
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_repair_failure BEFORE "
+                       "UPDATE ON main.messages BEGIN SELECT "
+                       "RAISE(ABORT,'repair receiver failure'); END"_ns));
+  auto remove = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER delivery_repair_failure"_ns));
+  });
+  nsTArray<RefPtr<Message>> outputs;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->CommitFolderRepair(repair, NS_OK, true, outputs));
+  EXPECT_TRUE(outputs.IsEmpty());
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->CommitFolderRepair(repair, NS_OK, true, outputs));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->AbortFolderRepair(repair, NS_ERROR_ABORT));
+  nsCString subject;
+  ASSERT_EQ(NS_OK, original->GetSubject(subject));
+  EXPECT_EQ("old receiver"_ns, subject);
+  RefPtr<PerFolderDatabase> reopened = new PerFolderDatabase(mFolder, false);
+  bool valid = true;
+  ASSERT_EQ(NS_OK, reopened->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairRejectsMissingPhysicalInputs) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  for (uint32_t variant = 0; variant < 5; ++variant) {
+    RefPtr<FolderRepair> repair;
+    ASSERT_EQ(NS_OK, db->BeginFolderRepair(getter_AddRefs(repair)));
+    nsCOMPtr<nsIMsgDBHdr> parsed;
+    ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+    ASSERT_EQ(NS_OK, parsed->SetReferences(""_ns));
+    if (variant != 0) {
+      ASSERT_EQ(NS_OK, parsed->SetStoreToken("physical-input"_ns));
+    }
+    ASSERT_EQ(NS_OK, parsed->SetMessageSize(3));
+    if (variant != 1) {
+      ASSERT_EQ(NS_OK, parsed->SetLineCount(1));
+    }
+    uint64_t measured = variant == 2   ? uint64_t(UINT32_MAX) + 1
+                        : variant == 3 ? 4
+                                       : 3;
+    nsresult expected =
+        variant == 2 ? NS_ERROR_FILE_TOO_BIG : NS_ERROR_INVALID_ARG;
+    nsTArray<RefPtr<Message>> outputs;
+    if (variant == 4) {
+      ASSERT_EQ(NS_OK, db->AddFolderRepairMessage(
+                           repair, parsed, "physical-input"_ns, measured));
+      expected = NS_ERROR_NOT_AVAILABLE;
+      EXPECT_EQ(expected,
+                db->CommitFolderRepair(repair, NS_OK, false, outputs));
+    } else {
+      EXPECT_EQ(expected, db->AddFolderRepairMessage(
+                              repair, parsed, "physical-input"_ns, measured));
+    }
+    EXPECT_EQ(expected, db->CommitFolderRepair(repair, NS_OK, true, outputs));
+    EXPECT_TRUE(outputs.IsEmpty());
+    EXPECT_EQ(expected, db->AbortFolderRepair(repair, NS_ERROR_ABORT));
+    bool valid = true;
+    ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+    EXPECT_FALSE(valid);
+    ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+    CheckNoTransaction();
+  }
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairRejectsForeignDraftIncarnation) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  // Model an old parser draft without replacing the normal fixture/profile.
+  // The transactional source-identity fault is rolled back before repair.
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+    if (active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId = "
+                       "'{7a139b24-9c50-47fa-8322-168da90748c0}'"_ns));
+  RefPtr<PerFolderDatabase> foreign = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  ASSERT_EQ(NS_OK, foreign->CreateNewHdr(getter_AddRefs(draft)));
+  ASSERT_EQ(NS_OK, draft->SetReferences(""_ns));
+  ASSERT_EQ(NS_OK, draft->SetStoreToken("foreign-draft"_ns));
+  ASSERT_EQ(NS_OK, draft->SetMessageSize(3));
+  ASSERT_EQ(NS_OK, draft->SetLineCount(1));
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  rollback.release();
+  RefPtr<FolderRepair> repair;
+  ASSERT_EQ(NS_OK, db->BeginFolderRepair(getter_AddRefs(repair)));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->AddFolderRepairMessage(repair, draft, "foreign-draft"_ns, 3));
+  // Foreign input ownership was not consumed or silently retargeted.
+  EXPECT_EQ(NS_OK, draft->SetSubject("foreign recovery"_ns));
+  nsTArray<RefPtr<Message>> outputs;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->CommitFolderRepair(repair, NS_OK, true, outputs));
+  EXPECT_TRUE(outputs.IsEmpty());
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->AbortFolderRepair(repair, NS_ERROR_ABORT));
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairSummarySurvivesFacadeReopen) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  bool valid = false;
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_TRUE(valid);
+  ASSERT_EQ(NS_OK, db->SetSummaryValid(false));
+  RefPtr<PerFolderDatabase> reopened = new PerFolderDatabase(mFolder, false);
+  valid = true;
+  ASSERT_EQ(NS_OK, reopened->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  ASSERT_EQ(NS_OK, reopened->SetSummaryValid(true));
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_TRUE(valid);
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->SetSummaryValid(false));
+  valid = true;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  ASSERT_EQ(NS_OK, reopened->GetSummaryValid(&valid));
+  EXPECT_TRUE(valid);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairSummaryLeavesCallerTransaction) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  ASSERT_EQ(NS_OK, db->SetSummaryValid(false));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+    if (active) {
+      EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+    }
+  });
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db->SetSummaryValid(true));
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  bool valid = true;
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  rollback.release();
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, FolderRepairSummaryWriteFailureRemainsInvalid) {
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  ASSERT_EQ(NS_OK, db->SetSummaryValid(false));
+  // Only this write is faulted: a failed repair cannot become falsely valid.
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_summary_failure BEFORE "
+                       "INSERT ON main.folder_properties WHEN "
+                       "NEW.name = 'summaryValid' BEGIN SELECT "
+                       "RAISE(ABORT,'summary failure'); END"_ns));
+  auto remove = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER delivery_summary_failure"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, db->SetSummaryValid(true));
+  bool valid = true;
+  ASSERT_EQ(NS_OK, db->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  RefPtr<PerFolderDatabase> reopened = new PerFolderDatabase(mFolder, false);
+  ASSERT_EQ(NS_OK, reopened->GetSummaryValid(&valid));
+  EXPECT_FALSE(valid);
+  CheckNoTransaction();
+}
+
 TEST_F(DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   nsCOMPtr<nsIMsgDBHdr> draft;

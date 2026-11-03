@@ -432,10 +432,9 @@ NS_IMETHODIMP nsMsgLocalMailFolder::ParseFolder(nsIMsgWindow* window,
     nsAutoString msg;
     nsresult rv = bundle->FormatStringFromName(
         "localStatusDocumentDone", {NS_ConvertUTF8toUTF16(folderName)}, msg);
-    NS_ENSURE_SUCCESS(rv, rv);
     nsCOMPtr<nsIFeedbackService> feedback =
         mozilla::components::Feedback::Service();
-    if (feedback) {
+    if (NS_SUCCEEDED(rv) && feedback) {
       feedback->ReportStatus(NS_ConvertUTF16toUTF8(msg), "stop-meteors"_ns);
     }
     self->FinishUpAfterParseFolder(status);
@@ -499,9 +498,9 @@ void nsMsgLocalMailFolder::FinishUpAfterParseFolder(nsresult status) {
   UpdateSummaryTotals(true);
 
   // If a listener was passed into ParseFolder(), tell it the reparse is done.
-  if (mReparseListener) {
-    mReparseListener->OnStopRunningUrl(nullptr, status);
-    mReparseListener = nullptr;
+  nsCOMPtr<nsIUrlListener> listener = mReparseListener.forget();
+  if (listener) {
+    listener->OnStopRunningUrl(nullptr, status);
   }
 
   // If we're an inbox, and mCheckForNewMessagesAfterParsing is set,
@@ -615,12 +614,26 @@ NS_IMETHODIMP nsMsgLocalMailFolder::GetDatabaseWOReparse(
 NS_IMETHODIMP nsMsgLocalMailFolder::GetDatabaseWithReparse(
     nsIUrlListener* aReparseUrlListener, nsIMsgWindow* aMsgWindow,
     nsIMsgDatabase** aMsgDatabase) {
+  NS_ENSURE_ARG_POINTER(aMsgDatabase);
+  *aMsgDatabase = nullptr;
   nsresult rv = NS_OK;
   // if we're already reparsing, just remember the listener so we can notify it
   // when we've finished.
   if (m_parsingFolder) {
     return NS_MSG_ERROR_FOLDER_SUMMARY_OUT_OF_DATE;
   }
+
+#ifdef MOZ_PANORAMA
+  const bool native = mail_panorama_enabled_AtStartup();
+  if (native && mDatabase) {
+    bool valid;
+    MOZ_TRY(mDatabase->GetSummaryValid(&valid));
+    if (!valid) {
+      MOZ_TRY(ParseFolder(aMsgWindow, aReparseUrlListener));
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+  }
+#endif
 
   if (!mDatabase) {
     nsCOMPtr<nsIFile> pathFile;
@@ -639,7 +652,22 @@ NS_IMETHODIMP nsMsgLocalMailFolder::GetDatabaseWithReparse(
 
     nsresult folderOpen =
         msgDBService->OpenFolderDB(this, true, getter_AddRefs(mDatabase));
-    if (folderOpen == NS_MSG_ERROR_FOLDER_SUMMARY_OUT_OF_DATE) {
+#ifdef MOZ_PANORAMA
+    if (native && NS_SUCCEEDED(folderOpen) && mDatabase) {
+      bool valid;
+      MOZ_TRY(mDatabase->GetSummaryValid(&valid));
+      if (!valid) {
+        folderOpen = NS_MSG_ERROR_FOLDER_SUMMARY_OUT_OF_DATE;
+      }
+    }
+#endif
+    // Native repair keeps the existing rows and user state. The MSF backup/
+    // removal path below belongs to the legacy database implementation.
+    if (folderOpen == NS_MSG_ERROR_FOLDER_SUMMARY_OUT_OF_DATE
+#ifdef MOZ_PANORAMA
+        && !native
+#endif
+    ) {
       nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
       nsCOMPtr<nsIPropertyBag2> transferInfo;
       if (mDatabase) {

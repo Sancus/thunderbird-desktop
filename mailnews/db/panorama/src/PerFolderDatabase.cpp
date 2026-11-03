@@ -900,6 +900,7 @@ NS_IMETHODIMP PerFolderDatabase::ContainsKey(nsMsgKey key, bool* contains) {
 NS_IMETHODIMP PerFolderDatabase::CreateNewHdr(nsIMsgDBHdr** aRetVal) {
   NS_ENSURE_ARG_POINTER(aRetVal);
   RefPtr<DetachedMsgHdr> hdr = new DetachedMsgHdr(mFolderId);
+  hdr->mParsedSourceId = mDatabaseSourceId;
   hdr.forget(aRetVal);
   return NS_OK;
 }
@@ -991,6 +992,213 @@ NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,
   draft->mAttachState = DetachedMsgHdr::AttachState::Attached;
   live.forget(realHdr);
   return NS_OK;
+}
+
+struct FolderRepair::Data {
+  enum class State { Collecting, Settling, Committed, Aborted };
+  struct Entry {
+    RefPtr<DetachedMsgHdr> draft;
+    nsCString token;
+    uint64_t size;
+  };
+  FolderRepairSnapshot snapshot;
+  nsCString sourceId;
+  nsTArray<Entry> entries;
+  State state = State::Collecting;
+  nsresult firstError = NS_OK;
+};
+
+FolderRepair::FolderRepair(PerFolderDatabase* owner)
+    : mOwner(owner), mData(new (fallible) Data()) {}
+FolderRepair::~FolderRepair() = default;
+
+nsresult PerFolderDatabase::CheckFolderRepair(FolderRepair* repair) {
+  NS_ENSURE_ARG(repair);
+  NS_ENSURE_TRUE(repair->mOwner.get() == this && repair->mData,
+                 NS_ERROR_INVALID_ARG);
+  auto& data = *repair->mData;
+  if (data.state == FolderRepair::Data::State::Settling) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  if (NS_FAILED(data.firstError)) {
+    return data.firstError;
+  }
+  NS_ENSURE_TRUE(data.state == FolderRepair::Data::State::Collecting,
+                 NS_ERROR_ALREADY_INITIALIZED);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(data.sourceId == mDatabaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  return CheckParsedServerWriteTransaction();
+}
+
+nsresult PerFolderDatabase::FailFolderRepair(FolderRepair& repair,
+                                             nsresult failure) {
+  auto& data = *repair.mData;
+  if (NS_FAILED(failure) && NS_SUCCEEDED(data.firstError)) {
+    data.firstError = failure;
+    for (auto& entry : data.entries) {
+      entry.draft->mAttachError = failure;
+      entry.draft->mAttachState = DetachedMsgHdr::AttachState::Failed;
+    }
+  }
+  return data.firstError;
+}
+
+nsresult PerFolderDatabase::BeginFolderRepair(FolderRepair** repair) {
+  NS_ENSURE_ARG_POINTER(repair);
+  NS_ENSURE_FALSE(*repair, NS_ERROR_INVALID_ARG);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  MOZ_TRY(CheckParsedServerWriteTransaction());
+  RefPtr<FolderRepair> result = new (fallible) FolderRepair(this);
+  NS_ENSURE_TRUE(result && result->mData, NS_ERROR_OUT_OF_MEMORY);
+  result->mData->sourceId = mDatabaseSourceId;
+  // This is intentionally durable before the scan. Failure must not claim a
+  // valid summary; only the complete native metadata transaction restores it.
+  MOZ_TRY(SetSummaryValid(false));
+  MOZ_TRY(MessageDB().CaptureFolderRepair(mFolderId, mDatabaseSourceId,
+                                          result->mData->snapshot));
+  result.forget(repair);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::AddFolderRepairMessage(
+    FolderRepair* repair, nsIMsgDBHdr* parsed,
+    const nsACString& scannedStoreToken, uint64_t scannedMessageSize) {
+  RefPtr<PerFolderDatabase> self(this);
+  RefPtr<FolderRepair> selected(repair);
+  NS_ENSURE_ARG(repair);
+  NS_ENSURE_TRUE(repair->mOwner.get() == this && repair->mData,
+                 NS_ERROR_INVALID_ARG);
+  auto& data = *repair->mData;
+  nsresult rv = CheckFolderRepair(repair);
+  if (NS_FAILED(rv)) {
+    // A reentrant/caller-transaction refusal must not consume the operation.
+    return rv == NS_ERROR_IN_PROGRESS ||
+                   data.state != FolderRepair::Data::State::Collecting
+               ? rv
+               : FailFolderRepair(*repair, rv);
+  }
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(parsed);
+  if (!draft || draft->mFolderId != mFolderId ||
+      !draft->mParsedSourceId.Equals(data.sourceId) ||
+      !draft->mCopySourceId.IsEmpty()) {
+    return FailFolderRepair(*repair, NS_ERROR_INVALID_ARG);
+  }
+  if (scannedStoreToken.IsEmpty()) {
+    return FailFolderRepair(*repair, NS_ERROR_INVALID_ARG);
+  }
+  if (scannedMessageSize > UINT32_MAX) {
+    return FailFolderRepair(*repair, NS_ERROR_FILE_TOO_BIG);
+  }
+  for (const auto& entry : data.entries) {
+    if (entry.draft == draft || entry.token.Equals(scannedStoreToken)) {
+      return FailFolderRepair(*repair, NS_ERROR_INVALID_ARG);
+    }
+  }
+  rv = draft->CheckMutable();
+  if (NS_FAILED(rv)) {
+    return FailFolderRepair(*repair, rv);
+  }
+  const RawHdr& raw = draft->mRaw;
+  if (!raw.storeToken || !raw.storeToken->Equals(scannedStoreToken) ||
+      !raw.messageSize || *raw.messageSize != scannedMessageSize ||
+      !raw.lineCount || (raw.flags & nsMsgMessageFlags::Expunged)) {
+    return FailFolderRepair(*repair, NS_ERROR_INVALID_ARG);
+  }
+  if (!data.entries.AppendElement(
+          FolderRepair::Data::Entry{draft, nsCString(scannedStoreToken),
+                                    scannedMessageSize},
+          fallible)) {
+    return FailFolderRepair(*repair, NS_ERROR_OUT_OF_MEMORY);
+  }
+  // No native stage or row is allocated here. Keep the exact parser data sealed
+  // through parser Clear and the asynchronous scan's remaining callbacks.
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attaching;
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::CommitFolderRepair(
+    FolderRepair* repair, nsresult scanStatus, bool scanComplete,
+    nsTArray<RefPtr<Message>>& repaired) {
+  RefPtr<PerFolderDatabase> self(this);
+  RefPtr<FolderRepair> selected(repair);
+  NS_ENSURE_ARG(repair);
+  NS_ENSURE_TRUE(repair->mOwner.get() == this && repair->mData,
+                 NS_ERROR_INVALID_ARG);
+  auto& data = *repair->mData;
+  if (data.state == FolderRepair::Data::State::Settling) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  NS_ENSURE_TRUE(repaired.IsEmpty(), NS_ERROR_INVALID_ARG);
+  NS_ENSURE_FALSE(data.state == FolderRepair::Data::State::Committed,
+                  NS_ERROR_ALREADY_INITIALIZED);
+  if (NS_FAILED(data.firstError)) {
+    return data.firstError;
+  }
+  if (NS_FAILED(scanStatus)) {
+    return FailFolderRepair(*repair, scanStatus);
+  }
+  if (!scanComplete) {
+    return FailFolderRepair(*repair, NS_ERROR_NOT_AVAILABLE);
+  }
+  nsresult rv = CheckFolderRepair(repair);
+  if (NS_FAILED(rv)) {
+    return rv == NS_ERROR_IN_PROGRESS ||
+                   data.state != FolderRepair::Data::State::Collecting
+               ? rv
+               : FailFolderRepair(*repair, rv);
+  }
+  nsTArray<FolderRepairMessage> inputs;
+  if (!inputs.SetCapacity(data.entries.Length(), fallible)) {
+    return FailFolderRepair(*repair, NS_ERROR_OUT_OF_MEMORY);
+  }
+  for (const auto& entry : data.entries) {
+    FolderRepairMessage& input = *inputs.AppendElement();
+    input.parsed = &entry.draft->mRaw;
+    input.storeToken = entry.token;
+    input.messageSize = entry.size;
+    input.lineCount = *entry.draft->mRaw.lineCount;
+    // Normal parser FinalizeHeaders always calls SetReferences, including an
+    // empty known set when neither References nor In-Reply-To is present.
+    input.referencesKnown = true;
+  }
+  data.state = FolderRepair::Data::State::Settling;
+  rv = MessageDB().CompleteFolderRepair(data.snapshot, inputs, scanStatus,
+                                        scanComplete, repaired);
+  if (NS_FAILED(rv)) {
+    data.state = FolderRepair::Data::State::Collecting;
+    return FailFolderRepair(*repair, rv);
+  }
+  // Core preallocates and installs every scan-order output before callbacks.
+  // No fallible lookup, allocation or validity setter follows its commit.
+  MOZ_ASSERT(repaired.Length() == data.entries.Length());
+  data.state = FolderRepair::Data::State::Committed;
+  for (size_t i = 0; i < data.entries.Length(); ++i) {
+    data.entries[i].draft->mAttachedHeader = repaired[i];
+    data.entries[i].draft->mAttachState = DetachedMsgHdr::AttachState::Attached;
+  }
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::AbortFolderRepair(FolderRepair* repair,
+                                              nsresult firstError) {
+  RefPtr<PerFolderDatabase> self(this);
+  RefPtr<FolderRepair> selected(repair);
+  NS_ENSURE_ARG(repair);
+  NS_ENSURE_TRUE(repair->mOwner.get() == this && repair->mData,
+                 NS_ERROR_INVALID_ARG);
+  auto& data = *repair->mData;
+  if (data.state == FolderRepair::Data::State::Settling) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  NS_ENSURE_FALSE(data.state == FolderRepair::Data::State::Committed,
+                  NS_ERROR_ALREADY_INITIALIZED);
+  NS_ENSURE_TRUE(NS_FAILED(firstError), NS_ERROR_INVALID_ARG);
+  nsresult rv = FailFolderRepair(*repair, firstError);
+  data.state = FolderRepair::Data::State::Aborted;
+  return rv;
 }
 
 ParsedServerHdr::ParsedServerHdr(PerFolderDatabase* owner,
@@ -2924,12 +3132,26 @@ NS_IMETHODIMP PerFolderDatabase::AddToNewList(nsMsgKey aKey) {
 }
 NS_IMETHODIMP PerFolderDatabase::GetSummaryValid(bool* summaryValid) {
   NS_ENSURE_ARG_POINTER(summaryValid);
-  *summaryValid = true;
+  *summaryValid = false;
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  // Existing databases have no invalid-summary marker until a repair starts.
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(GetDBFolderInfo(getter_AddRefs(info)));
+  bool valid = true;
+  MOZ_TRY(info->GetBooleanProperty("summaryValid", true, &valid));
+  *summaryValid = valid;
   return NS_OK;
 }
-NS_IMETHODIMP PerFolderDatabase::SetSummaryValid(bool aSummaryValid) {
-  // Sure. Okay. Whatever.
-  return NS_OK;
+NS_IMETHODIMP PerFolderDatabase::SetSummaryValid(bool summaryValid) {
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(GetDBFolderInfo(getter_AddRefs(info)));
+  return info->SetBooleanProperty("summaryValid", summaryValid);
 }
 NS_IMETHODIMP PerFolderDatabase::ListAllOfflineMsgs(
     nsTArray<nsMsgKey>& aRetVal) {

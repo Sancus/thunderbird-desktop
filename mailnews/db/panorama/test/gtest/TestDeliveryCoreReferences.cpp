@@ -1200,6 +1200,27 @@ class DeliveryCoreReferences : public testing::Test {
     EXPECT_EQ("00042"_ns, text);
   }
 
+  nsresult CaptureRepair(uint64_t folder, FolderRepairSnapshot& output) {
+    MOZ_TRY(WriteFolderProperty(&mCore->FolderDB(), folder, "summaryValid"_ns,
+                                int64_t(0)));
+    MOZ_TRY(WriteFolderProperty(&mCore->FolderDB(), folder, "forceReparse"_ns,
+                                int64_t(1)));
+    nsCString source;
+    MOZ_TRY(mCore->GetSourceId(source));
+    return mCore->MessageDB().CaptureFolderRepair(folder, source, output);
+  }
+
+  nsresult AddRepairRow(uint64_t folder, const nsACString& token,
+                        nsMsgKey& key) {
+    RawHdr raw;
+    raw.messageId = "same@repair.invalid"_ns;
+    raw.subject = "old subject"_ns;
+    raw.storeToken = Some(nsCString(token));
+    raw.messageSize = Some(7u);
+    raw.lineCount = Some(1u);
+    return mCore->MessageDB().AddMessage(folder, raw, true, &key);
+  }
+
   nsresult Start() {
     // This native fixture selects the concrete Panorama implementation
     // directly.
@@ -16128,6 +16149,497 @@ TEST_F(DeliveryCoreReferences,
                        "DROP VIEW temp.database_identity"_ns));
   EXPECT_EQ(NS_ERROR_IN_PROGRESS,
             mCore->MessageDB().CheckFolderBodyAccess(root));
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRepairPreservesPhysicalIdentityAndUserState) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey first, second;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "physical-a"_ns, first));
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "physical-b"_ns, second));
+  RefPtr<Message> hot = new Message(first);
+  nsCString text;
+  ASSERT_EQ(NS_OK, hot->GetSubject(text));
+  EXPECT_EQ("old subject"_ns, text);
+  FolderRepairSnapshot snapshot;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, snapshot));
+  // These user changes do not change the captured physical body association.
+  const uint32_t retained = 0x80000000u | nsMsgMessageFlags::Read |
+                            nsMsgMessageFlags::Marked | nsMsgMessageFlags::New;
+  ASSERT_EQ(NS_OK, db.SetMessageFlags(first, retained));
+  ASSERT_EQ(NS_OK, db.SetMessageTags(first, "user tags"_ns));
+  ASSERT_EQ(NS_OK, db.SetMessagePriority(first, nsMsgPriority::highest));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(first, "Exact"_ns, "00042"_ns));
+  ASSERT_EQ(NS_OK, db.SetMessageProperty(first, "Empty"_ns, ""_ns));
+  RawHdr parsed[3];
+  for (auto& raw : parsed) {
+    raw.key = first;  // Never an identity or allocation request.
+    raw.messageId = "same-new@repair.invalid"_ns;
+    raw.subject = "repaired subject"_ns;
+    raw.sender = "new sender"_ns;
+    raw.flags = nsMsgMessageFlags::Expunged;
+    raw.priority = nsMsgPriority::lowest;
+    raw.keywords = "stale disk tags"_ns;
+    raw.extras = {{"Exact"_ns, "wrong"_ns}};
+  }
+  parsed[1].flags = nsMsgMessageFlags::Marked;
+  parsed[2].references = {"raw"_ns, "raw"_ns, "e\xcc\x81"_ns};
+  nsTArray<FolderRepairMessage> items = {
+      {&parsed[0], "physical-b"_ns, 19, 3, true},
+      {&parsed[1], "physical-new"_ns, 29, 4, true},
+      {&parsed[2], "physical-a"_ns, 39, 5, true}};
+  nsTArray<RefPtr<Message>> output;
+  uint32_t calls = 0;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char kind, const CapturedMessage&,
+                         const CapturedMessage&, Message*, bool notify) {
+    ++calls;
+    ASSERT_EQ(3u, output.Length());
+    EXPECT_FALSE(snapshot.Messages());
+    for (auto& header : output) ASSERT_TRUE(header);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(NS_OK, hot->GetSubject(text));
+    EXPECT_EQ("repaired subject"_ns, text);
+    if (kind == 'P') EXPECT_FALSE(notify);
+    int64_t valid = -1;
+    ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                        "summaryValid"_ns, valid));
+    EXPECT_EQ(1, valid);
+    nsCOMPtr<mozIStorageConnection> reader;
+    ASSERT_EQ(NS_OK, Open(getter_AddRefs(reader)));
+    auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, reader->Close()); });
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            reader, first,
+            "SELECT count(*) FROM messages WHERE folderId=(SELECT folderId FROM messages WHERE id=:id)"_ns,
+            text));
+    EXPECT_EQ("3"_ns, text);
+  };
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  EXPECT_EQ(3u, calls);
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, output[0]->GetMessageKey(&key));
+  EXPECT_EQ(second, key);
+  ASSERT_EQ(NS_OK, output[1]->GetMessageKey(&key));
+  EXPECT_GT(key, second);
+  ASSERT_EQ(NS_OK, output[2]->GetMessageKey(&key));
+  EXPECT_EQ(first, key);
+  uint32_t flags, size;
+  nsMsgPriorityValue priority;
+  ASSERT_EQ(NS_OK, hot->GetFlags(&flags));
+  EXPECT_EQ(retained, flags);
+  ASSERT_EQ(NS_OK, hot->GetPriority(&priority));
+  EXPECT_EQ(nsMsgPriorityValue(nsMsgPriority::highest), priority);
+  ASSERT_EQ(NS_OK, db.GetMessageTags(first, text));
+  EXPECT_EQ("user tags"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "Exact"_ns, text));
+  EXPECT_EQ("00042"_ns, text);
+  ASSERT_EQ(NS_OK, db.GetMessageProperty(first, "Empty"_ns, text));
+  EXPECT_EQ(""_ns, text);
+  ASSERT_EQ(
+      NS_OK,
+      PublicationCell(
+          mConnection, first,
+          "SELECT count(*) FROM message_properties WHERE id=:id AND name='Missing'"_ns,
+          text));
+  EXPECT_EQ("0"_ns, text);
+  ASSERT_EQ(NS_OK, hot->GetMessageSize(&size));
+  EXPECT_EQ(39u, size);
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK, db.GetMessageReferences(first, references));
+  EXPECT_EQ(parsed[2].references, references);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  EXPECT_EQ(3u, calls);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRepairRejectsAmbiguousAndUnmatchedInputs) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "unique"_ns, key));
+  FolderRepairSnapshot snapshot;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, snapshot));
+  RawHdr raw;
+  raw.subject = "new"_ns;
+  FolderRepairMessage item{&raw, "unique"_ns, 9, 2, true};
+  RefPtr<Message> sentinel = new Message(key);
+  nsTArray<RefPtr<Message>> output{sentinel};
+  nsTArray<FolderRepairMessage> items{item, item};
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  items.Clear();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  items = {item};
+  items[0].storeToken = "unknown"_ns;
+  raw.key = key;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  items = {item};
+  items[0].messageSize = uint64_t(UINT32_MAX) + 1;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  items = {item};
+  raw.messageSize = Some(1u);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  raw.messageSize.reset();
+  raw.storeToken = Some(nsCString("different"_ns));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  raw.storeToken.reset();
+  raw.references = {"actual"_ns};
+  items[0].referencesKnown = false;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  ASSERT_EQ(1u, output.Length());
+  EXPECT_EQ(sentinel.get(), output[0].get());
+  ASSERT_TRUE(snapshot.Messages());
+  EXPECT_EQ(1u, snapshot.Messages()->Length());
+  raw.references.Clear();
+  items[0].referencesKnown = true;
+  ASSERT_EQ(NS_OK,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  FolderRepairSnapshot occupied;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, occupied));
+  nsMsgKey other;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "unique"_ns, other));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, CaptureRepair(mFolderId, occupied));
+  ASSERT_TRUE(occupied.Messages());
+  EXPECT_EQ(1u, occupied.Messages()->Length());
+}
+
+TEST_F(DeliveryCoreReferences, FolderRepairScanErrorAndIncompleteLeaveCustody) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "scan"_ns, key));
+  FolderRepairSnapshot snapshot;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, snapshot));
+  RawHdr raw;
+  raw.subject = "after"_ns;
+  nsTArray<FolderRepairMessage> items{{&raw, "scan"_ns, 8, 2, true}};
+  RefPtr<Message> sentinel = new Message(key);
+  nsTArray<RefPtr<Message>> output{sentinel};
+  uint32_t calls = 0;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char, const CapturedMessage&, const CapturedMessage&,
+                         Message*, bool) { ++calls; };
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.CompleteFolderRepair(snapshot, items, NS_ERROR_FILE_CORRUPTED,
+                                    true, output));
+  EXPECT_EQ(
+      NS_ERROR_ABORT,
+      db.CompleteFolderRepair(snapshot, items, NS_ERROR_ABORT, false, output));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, false, output));
+  EXPECT_EQ(0u, calls);
+  ASSERT_TRUE(snapshot.Messages());
+  ASSERT_EQ(1u, output.Length());
+  EXPECT_EQ(sentinel.get(), output[0].get());
+  nsCString text;
+  ASSERT_EQ(NS_OK, db.GetMessageSubject(key, text));
+  EXPECT_EQ("old subject"_ns, text);
+  int64_t valid = -1;
+  ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                      "summaryValid"_ns, valid));
+  EXPECT_EQ(0, valid);
+  ASSERT_EQ(NS_OK,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  EXPECT_EQ(1u, calls);
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRepairRejectsChangedAssociationAndOldOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "original"_ns, key));
+  FolderRepairSnapshot snapshot;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, snapshot));
+  RawHdr raw;
+  raw.subject = "must not publish"_ns;
+  nsTArray<FolderRepairMessage> items{{&raw, "original"_ns, 8, 2, true}};
+  nsTArray<RefPtr<Message>> output;
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "changed"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "original"_ns));
+  // Returning to the old spelling does not restore the captured revision.
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  ASSERT_TRUE(snapshot.Messages());
+  FolderRepairSnapshot current;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, current));
+  nsMsgKey extra;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "extra"_ns, extra));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CompleteFolderRepair(current, items, NS_OK, true, output));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, mCore->MessageDB().CompleteFolderRepair(
+                                        current, items, NS_OK, true, output));
+  EXPECT_TRUE(output.IsEmpty());
+  nsCString text;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageSubject(key, text));
+  EXPECT_EQ("old subject"_ns, text);
+  int64_t valid = -1;
+  ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                      "summaryValid"_ns, valid));
+  EXPECT_EQ(0, valid);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRepairReferencesPresenceAndReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey first, second;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "absent"_ns, first));
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "known-empty"_ns, second));
+  FolderRepairSnapshot snapshot;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, snapshot));
+  RawHdr raw;
+  raw.subject = "parsed"_ns;
+  nsTArray<FolderRepairMessage> items{{&raw, "absent"_ns, 10, 3, false},
+                                      {&raw, "known-empty"_ns, 11, 4, true}};
+  nsTArray<RefPtr<Message>> output;
+  ASSERT_EQ(NS_OK,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  output.Clear();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  nsTArray<nsCString> refs{"sentinel"_ns};
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().GetMessageReferences(first, refs));
+  EXPECT_EQ((nsTArray<nsCString>{"sentinel"_ns}), refs);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(second, refs));
+  EXPECT_TRUE(refs.IsEmpty());
+  MessageBodyState body;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(first, body));
+  ASSERT_TRUE(body.storeToken);
+  EXPECT_EQ("absent"_ns, *body.storeToken);
+  EXPECT_EQ(10u, body.messageSize);
+  int64_t valid = -1, force = -1;
+  ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                      "summaryValid"_ns, valid));
+  ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), mFolderId,
+                                      "forceReparse"_ns, force));
+  EXPECT_EQ(1, valid);
+  EXPECT_EQ(0, force);
+}
+
+TEST_F(DeliveryCoreReferences, FolderRepairRejectsCallerTransactionAndStaging) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "caller"_ns, key));
+  FolderRepairSnapshot snapshot;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, snapshot));
+  nsCString source;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(source));
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, mConnection->RollbackTransaction()); });
+  FolderRepairSnapshot untouched;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.CaptureFolderRepair(mFolderId, source, untouched));
+  RawHdr raw;
+  nsTArray<FolderRepairMessage> items{{&raw, "caller"_ns, 7, 1, true}};
+  nsTArray<RefPtr<Message>> output;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  bool active = false;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  EXPECT_FALSE(untouched.Messages());
+  ASSERT_TRUE(snapshot.Messages());
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  rollback.release();
+  nsMsgKey staged;
+  ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &staged));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db.CaptureFolderRepair(mFolderId, source, untouched));
+  ASSERT_EQ(NS_OK, db.AbortMessage(staged));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.CaptureFolderRepair(mFolderId, "foreign"_ns, untouched));
+  ASSERT_EQ(NS_OK,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRepairWriteSummaryAndCommitFailuresRollback) {
+  ASSERT_EQ(NS_OK, Start());
+  for (uint32_t mode = 0; mode < 4; ++mode) {
+    SCOPED_TRACE(mode);
+    auto& db = mCore->MessageDB();
+    nsAutoCString name("RepairFault");
+    name.AppendInt(mode);
+    uint64_t folder;
+    ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolderId, name, &folder));
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, AddRepairRow(folder, "fault-source"_ns, key));
+    FolderRepairSnapshot snapshot;
+    ASSERT_EQ(NS_OK, CaptureRepair(folder, snapshot));
+    RefPtr<Message> hot = new Message(key);
+    nsCString text;
+    ASSERT_EQ(NS_OK, hot->GetSubject(text));
+    uint64_t watermark;
+    ASSERT_EQ(NS_OK, SearchWatermark(watermark));
+    if (mode == 0) {
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "CREATE TEMP TRIGGER repair_fault BEFORE UPDATE OF "
+                           "subject ON main.messages "
+                           "BEGIN SELECT RAISE(ABORT,'repair row'); END"_ns));
+    } else if (mode == 1) {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "CREATE TEMP TRIGGER repair_fault BEFORE INSERT ON "
+              "main.message_properties "
+              "WHEN NEW.name='messageSize' BEGIN SELECT RAISE(ABORT,'repair property'); END"_ns));
+    } else if (mode == 2) {
+      ASSERT_EQ(NS_OK,
+                mConnection->ExecuteSimpleSQL(
+                    "CREATE TEMP TRIGGER repair_fault BEFORE UPDATE ON "
+                    "main.folder_properties "
+                    "WHEN NEW.name='summaryValid' AND NEW.value=1 "
+                    "BEGIN SELECT RAISE(ABORT,'repair summary'); END"_ns));
+    } else {
+      // A real deferred constraint reaches commit failure after all row writes.
+      ASSERT_EQ(NS_OK,
+                mConnection->ExecuteSimpleSQL(
+                    "PRAGMA foreign_keys=ON; CREATE TEMP TABLE "
+                    "repair_parent(id INTEGER PRIMARY KEY); "
+                    "CREATE TEMP TABLE repair_child(id INTEGER REFERENCES "
+                    "repair_parent(id) "
+                    "DEFERRABLE INITIALLY DEFERRED); CREATE TEMP TRIGGER "
+                    "repair_fault "
+                    "AFTER INSERT ON main.message_properties WHEN "
+                    "NEW.name='messageSize' "
+                    "BEGIN INSERT INTO repair_child VALUES(NEW.id); END"_ns));
+    }
+    auto drop = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS repair_fault"_ns));
+    });
+    RawHdr parsed, fresh;
+    parsed.subject = "after repair"_ns;
+    fresh.subject = "new row"_ns;
+    nsTArray<FolderRepairMessage> items{
+        {&parsed, "fault-source"_ns, 18, 3, true},
+        {&fresh, "fresh-token"_ns, 22, 4, true}};
+    if (mode == 3) {
+      // Foreign-key enforcement also rejects the existing native zero-parent
+      // convention for new rows. Exercise deferred commit failure on the
+      // existing row; the other three modes retain fresh-key rollback checks.
+      items.RemoveLastElement();
+    }
+    const uint32_t repairedCount = items.Length();
+    nsTArray<RefPtr<Message>> output{hot};
+    uint32_t calls = 0;
+    RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+    observer->action = [&](char, const CapturedMessage&, const CapturedMessage&,
+                           Message*, bool) { ++calls; };
+    db.AddMessageListener(observer);
+    auto unwatch = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+    EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+              db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+    EXPECT_EQ(0u, calls);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(1u, output.Length());
+    EXPECT_EQ(hot.get(), output[0].get());
+    ASSERT_TRUE(snapshot.Messages());
+    ASSERT_EQ(NS_OK, hot->GetSubject(text));
+    EXPECT_EQ("old subject"_ns, text);
+    uint64_t after;
+    ASSERT_EQ(NS_OK, SearchWatermark(after));
+    EXPECT_EQ(watermark, after);
+    int64_t valid = -1;
+    ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), folder,
+                                        "summaryValid"_ns, valid));
+    EXPECT_EQ(0, valid);
+    ASSERT_EQ(
+        NS_OK,
+        PublicationCell(
+            mConnection, key,
+            "SELECT count(*) FROM messages WHERE folderId=(SELECT folderId FROM messages WHERE id=:id)"_ns,
+            text));
+    EXPECT_EQ("1"_ns, text);
+    ASSERT_EQ(NS_OK,
+              mConnection->ExecuteSimpleSQL("DROP TRIGGER repair_fault"_ns));
+    drop.release();
+    ASSERT_EQ(NS_OK,
+              db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+    EXPECT_EQ(repairedCount, calls);
+    ASSERT_EQ(repairedCount, output.Length());
+    nsMsgKey repairedKey;
+    ASSERT_EQ(NS_OK, output[0]->GetMessageKey(&repairedKey));
+    EXPECT_EQ(key, repairedKey);
+    if (mode != 3) {
+      nsMsgKey freshKey;
+      ASSERT_EQ(NS_OK, output[1]->GetMessageKey(&freshKey));
+      EXPECT_EQ(nsMsgKey(key + 1), freshKey);
+    }
+    db.RemoveMessageListener(observer);
+    unwatch.release();
+    output.Clear();
+    hot = nullptr;
+    Stop();
+    ASSERT_EQ(NS_OK, Start());
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageSubject(key, text));
+    EXPECT_EQ("after repair"_ns, text);
+    ASSERT_EQ(NS_OK, ReadFolderProperty(&mCore->FolderDB(), folder,
+                                        "summaryValid"_ns, valid));
+    EXPECT_EQ(1, valid);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       FolderRepairQueuesReentrantWritesAfterWholeBatch) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, AddRepairRow(mFolderId, "queue-source"_ns, key));
+  FolderRepairSnapshot snapshot;
+  ASSERT_EQ(NS_OK, CaptureRepair(mFolderId, snapshot));
+  RawHdr parsed, fresh;
+  parsed.subject = "settled"_ns;
+  nsTArray<FolderRepairMessage> items{{&parsed, "queue-source"_ns, 8, 2, true},
+                                      {&fresh, "queue-new"_ns, 9, 3, true}};
+  nsTArray<RefPtr<Message>> output;
+  nsTArray<char> order;
+  nsMsgKey reentrant = nsMsgKey_None;
+  RefPtr<ThreadQueueObserver> observer = new ThreadQueueObserver();
+  observer->action = [&](char kind, const CapturedMessage&,
+                         const CapturedMessage& after, Message*, bool) {
+    order.AppendElement(kind);
+    ASSERT_EQ(2u, output.Length());
+    EXPECT_FALSE(snapshot.Messages());
+    if (kind == 'B') {
+      EXPECT_EQ(key, after.id);
+      EXPECT_EQ("settled"_ns, after.subject);
+      RawHdr nested;
+      ASSERT_EQ(NS_OK, db.AddMessage(mFolderId, nested, true, &reentrant));
+      EXPECT_EQ(1u, order.Length());
+    }
+  };
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK,
+            db.CompleteFolderRepair(snapshot, items, NS_OK, true, output));
+  EXPECT_EQ((nsTArray<char>{'B', 'P', 'P'}), order);
+  EXPECT_NE(nsMsgKey_None, reentrant);
 }
 
 }  // namespace mozilla::mailnews

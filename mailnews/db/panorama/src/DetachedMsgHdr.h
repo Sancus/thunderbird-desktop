@@ -55,6 +55,8 @@ class DetachedMsgHdr : public DecodedSubjectHdr {
   nsCOMPtr<nsIMsgDBHdr> mAttachedHeader;
 
   // Opaque common-copy provenance and its one unpublished physical member.
+  // Origin of a newly created native parser draft, separate from copy custody.
+  nsCString mParsedSourceId;
   nsCString mCopySourceId;
   nsMsgKey mCopyStagedKey{nsMsgKey_None};
   bool mCopyPublishing = false;

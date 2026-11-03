@@ -70,6 +70,21 @@ class ParsedServerHdr final : public DecodedSubjectHdr {
   // No explicit New action keeps the ordinary unread publication default.
   bool mSuppressNew = false;
 };
+// One semaphore-guarded complete store scan. Accumulation owns only detached
+// parser metadata; native rows change only at successful complete settlement.
+class FolderRepair final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(FolderRepair)
+
+ private:
+  friend class PerFolderDatabase;
+  explicit FolderRepair(PerFolderDatabase* owner);
+  ~FolderRepair();
+  struct Data;
+  RefPtr<PerFolderDatabase> mOwner;
+  UniquePtr<Data> mData;
+};
+
 class MessageEnumeratorStatementCloser;
 
 class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
@@ -139,6 +154,15 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   // Explicit metadata cleanup only. The caller keeps its primary error/bytes.
   nsresult AbortParsedServerHdr(ParsedServerHdr* staged);
 
+  nsresult BeginFolderRepair(FolderRepair** repair);
+  nsresult AddFolderRepairMessage(FolderRepair* repair, nsIMsgDBHdr* parsed,
+                                  const nsACString& scannedStoreToken,
+                                  uint64_t scannedMessageSize);
+  nsresult CommitFolderRepair(FolderRepair* repair, nsresult scanStatus,
+                              bool scanComplete,
+                              nsTArray<RefPtr<Message>>& repaired);
+  nsresult AbortFolderRepair(FolderRepair* repair, nsresult firstError);
+
   // Callers own complete metadata and recovery bytes before removal callbacks.
   nsresult RemoveHdrForUndo(nsMsgKey key, RemovedMessage& captured,
                             OfflineOperationUndo* redo = nullptr,
@@ -179,6 +203,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   friend class MessageEnumerator;
   friend class ThreadEnumerator;
   friend class FilterEnumerator;
+
+  nsresult CheckFolderRepair(FolderRepair* repair);
+  nsresult FailFolderRepair(FolderRepair& repair, nsresult failure);
 
   nsresult ValidateParsedServerHdr(ParsedServerHdr& staged,
                                    bool requireStaged = false);

@@ -5,14 +5,20 @@
 #ifndef COMM_MAILNEWS_LOCAL_SRC_STOREINDEXER_H_
 #define COMM_MAILNEWS_LOCAL_SRC_STOREINDEXER_H_
 
-#include "nsIMsgPluggableStore.h"
 #include "nsCOMPtr.h"
+#include "nsIMsgPluggableStore.h"
 #include "nsString.h"
 #include <mozilla/Buffer.h>
 
 class nsMsgLocalMailFolder;
 class nsParseMailMessageState;
 class nsIMsgDatabase;
+#ifdef MOZ_PANORAMA
+namespace mozilla::mailnews {
+class FolderRepair;
+class PerFolderDatabase;
+}  // namespace mozilla::mailnews
+#endif
 
 /**
  * StoreIndexer iterates through all the messages in a folder's local
@@ -61,10 +67,17 @@ class StoreIndexer : public nsIStoreScanListener {
  private:
   virtual ~StoreIndexer();
   void ReleaseFolder();
+  nsresult RememberError(nsresult status);
 
   RefPtr<nsMsgLocalMailFolder> mFolder;
   nsCOMPtr<nsIMsgDatabase> mDB;
   nsCOMPtr<nsIMsgDatabase> mBackupDB;
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::PerFolderDatabase> mNativeDB;
+  RefPtr<mozilla::mailnews::FolderRepair> mFolderRepair;
+#endif
+  nsresult mFirstError = NS_OK;
+  bool mScanFinished = false;
 
   std::function<void(int64_t, int64_t)> mProgressFn;
   std::function<void(nsresult)> mCompletionFn;

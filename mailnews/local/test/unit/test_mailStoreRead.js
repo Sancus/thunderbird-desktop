@@ -812,3 +812,496 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkRepairAttachError("maildir");
   });
 }
+
+/**
+ * Repair a complete real store without substituting its existing physical rows.
+ *
+ * @param {string} storeType - Expected provider type.
+ * @param {boolean} failUpdate - Fail the second real native metadata update.
+ */
+async function checkRepairExistingRows(storeType, failUpdate) {
+  await withAvailabilityStore(storeType, async folder => {
+    const store = folder.msgStore;
+    const raws = [
+      "From: repair@example.invalid\r\n" +
+        "Message-ID: <shared-repair@example.invalid>\r\n" +
+        "Subject: Repaired first row\r\n" +
+        "References: <older@example.invalid> <shared-repair@example.invalid> " +
+        "<older@example.invalid>\r\n\r\nFirst retained body.\r\n",
+      "From: repair@example.invalid\r\n" +
+        "Message-ID: <shared-repair@example.invalid>\r\n" +
+        "Subject: Repaired second row\r\n\r\nSecond retained body.\r\n",
+      "From: repair@example.invalid\r\n" +
+        "Message-ID: <shared-repair@example.invalid>\r\n" +
+        "Subject: Newly discovered row\r\nReferences: \r\n\r\nNew retained body.\r\n",
+    ];
+    const originals = raws.slice(0, 2).map((raw, index) => {
+      const header = folder.addMessage(raw);
+      header.subject = `Stale summary ${index}`;
+      header.setReferences("<stale-summary@example.invalid>");
+      header.flags |= Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+      header.priority = Ci.nsMsgPriority.high;
+      header.setStringProperty("repairUserState", `owned-${index}`);
+      header.setStringProperty("repairEmpty", "");
+      return {
+        key: header.messageKey,
+        token: header.storeToken,
+        size: header.messageSize,
+        flags: header.flags,
+        subject: header.subject,
+      };
+    });
+    Assert.notEqual(originals[0].key, originals[1].key);
+    Assert.notEqual(originals[0].token, originals[1].token);
+    const stream = store.getNewMsgOutputStream(folder);
+    Assert.equal(stream.write(raws[2], raws[2].length), raws[2].length);
+    const newToken = store.finishNewMessage(folder, stream);
+    Assert.notEqual(newToken, "");
+    const tokens = [...originals.map(original => original.token), newToken];
+    const paths =
+      storeType == "mbox"
+        ? [folder.filePath.path]
+        : tokens.map(token =>
+            PathUtils.join(folder.filePath.path, "cur", token)
+          );
+    const bytes = await Promise.all(paths.map(path => IOUtils.read(path)));
+    const id = folder.id;
+    const uri = folder.URI;
+    const keys = originals.map(original => original.key).sort((a, b) => a - b);
+    const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    ).connectionForTests;
+    let installed = false;
+    let faults = 0;
+    if (failUpdate) {
+      connection.createFunction("existing_repair_fault", 0, {
+        onFunctionCall() {
+          faults++;
+          return 0;
+        },
+      });
+    }
+    try {
+      if (failUpdate) {
+        connection.executeSimpleSQL(
+          "CREATE TEMP TRIGGER existing_repair_fault BEFORE UPDATE ON main.messages " +
+            `WHEN OLD.id=${originals[1].key} BEGIN SELECT existing_repair_fault(); ` +
+            "SELECT RAISE(ABORT, 'existing repair failure'); END"
+        );
+        installed = true;
+        const statuses = [];
+        const failed = new PromiseTestUtils.PromiseUrlListener({
+          OnStopRunningUrl(url, status) {
+            statuses.push(status);
+          },
+        });
+        folder.parseFolder(null, failed);
+        const result = await failed.promise.then(
+          () => Cr.NS_OK,
+          error => Number(error.message)
+        );
+        Assert.equal(
+          faults,
+          1,
+          "The second existing row reaches the actual SQL fault"
+        );
+        Assert.equal(result, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+        Assert.deepEqual(statuses, [Cr.NS_ERROR_STORAGE_CONSTRAINT]);
+        Assert.ok(!folder.locked);
+        Assert.ok(!folder.msgDatabase.summaryValid);
+        folder.msgDatabase.forceClosed();
+        folder.msgDatabase = null;
+        Assert.ok(
+          !folder.msgDatabase.summaryValid,
+          "Failed repair stays invalid after reopen"
+        );
+        Assert.deepEqual(
+          folder.msgDatabase.listAllKeys().sort((a, b) => a - b),
+          keys
+        );
+        for (const original of originals) {
+          const retained = folder.msgDatabase.getMsgHdrForKey(original.key);
+          Assert.equal(retained.subject, original.subject);
+          Assert.equal(
+            retained.getStringReference(0),
+            "stale-summary@example.invalid"
+          );
+          Assert.equal(retained.flags, original.flags);
+          Assert.equal(retained.storeToken, original.token);
+        }
+        for (const [index, path] of paths.entries()) {
+          Assert.deepEqual(await IOUtils.read(path), bytes[index]);
+        }
+        for (const [index, token] of tokens.entries()) {
+          Assert.equal(
+            readAll(store.getMsgInputStream(folder, token, 0)),
+            raws[index]
+          );
+        }
+        connection.executeSimpleSQL("DROP TRIGGER temp.existing_repair_fault");
+        installed = false;
+      }
+      const statuses = [];
+      const repeatedStatuses = [];
+      const repeated = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(url, status) {
+          repeatedStatuses.push(status);
+        },
+      });
+      const repaired = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(url, status) {
+          statuses.push(status);
+          if (status == Cr.NS_OK) {
+            // A completed scan has released its semaphore. The old listener
+            // must not clear this follow-on scan's listener after reentry.
+            folder.parseFolder(null, repeated);
+          }
+        },
+      });
+      if (failUpdate) {
+        // The failed repair's invalid native summary must launch a same-row
+        // reparse, including when this folder already has a cached wrapper.
+        Assert.throws(
+          () => folder.getDatabaseWithReparse(repaired, null),
+          error => error.result === Cr.NS_ERROR_NOT_INITIALIZED
+        );
+      } else {
+        folder.parseFolder(null, repaired);
+      }
+      await repaired.promise;
+      await repeated.promise;
+      Assert.deepEqual(statuses, [Cr.NS_OK]);
+      Assert.deepEqual(repeatedStatuses, [Cr.NS_OK]);
+      Assert.equal(folder.id, id);
+      Assert.equal(folder.URI, uri);
+      Assert.ok(!folder.locked);
+      Assert.ok(folder.msgDatabase.summaryValid);
+      const repairedKeys = folder.msgDatabase
+        .listAllKeys()
+        .sort((a, b) => a - b);
+      Assert.equal(repairedKeys.length, 3);
+      Assert.equal(folder.getTotalMessages(false), 3);
+      for (const key of keys) {
+        Assert.ok(
+          repairedKeys.includes(key),
+          "A matched physical row keeps its key"
+        );
+      }
+      const newKeys = repairedKeys.filter(key => !keys.includes(key));
+      Assert.equal(
+        newKeys.length,
+        1,
+        "Only the unmatched actual body receives a new key"
+      );
+      for (const [index, key] of [
+        ...originals.map(original => original.key),
+        newKeys[0],
+      ].entries()) {
+        const header = folder.msgDatabase.getMsgHdrForKey(key);
+        Assert.equal(header.messageId, "shared-repair@example.invalid");
+        Assert.equal(
+          header.subject,
+          ["Repaired first row", "Repaired second row", "Newly discovered row"][
+            index
+          ]
+        );
+        Assert.equal(header.storeToken, tokens[index]);
+        Assert.equal(header.messageSize, raws[index].length);
+        Assert.equal(
+          mailTestUtils.loadMessageToString(folder, header),
+          raws[index]
+        );
+        if (index < originals.length) {
+          Assert.equal(header.flags, originals[index].flags);
+          Assert.equal(header.priority, Ci.nsMsgPriority.high);
+          Assert.equal(
+            header.getStringProperty("repairUserState"),
+            `owned-${index}`
+          );
+          Assert.ok(header.properties.includes("repairEmpty"));
+          Assert.equal(header.getStringProperty("repairEmpty"), "");
+          Assert.ok(!header.properties.includes("repairAbsent"));
+        }
+        const expectedReferences =
+          index == 0
+            ? [
+                "older@example.invalid",
+                "shared-repair@example.invalid",
+                "older@example.invalid",
+              ]
+            : [];
+        const statement = connection.createStatement(
+          "SELECT token FROM message_references WHERE id = :id ORDER BY ordinal"
+        );
+        statement.params.id = key;
+        const storedReferences = [];
+        try {
+          while (statement.executeStep()) {
+            storedReferences.push(statement.row.token);
+          }
+        } finally {
+          statement.finalize();
+        }
+        Assert.deepEqual(storedReferences, expectedReferences);
+        // The legacy getter filters self references; raw native custody above
+        // still retains their exact order and duplicate tokens.
+        Assert.deepEqual(
+          Array.from({ length: header.numReferences }, (_, n) =>
+            header.getStringReference(n)
+          ),
+          expectedReferences.filter(reference => reference != header.messageId)
+        );
+        // Known native References use a typed presence row, including when
+        // the original RFC header was absent or explicitly empty.
+        const presence = connection.createStatement(
+          "SELECT COUNT(*) AS count FROM message_reference_sets WHERE id = :id"
+        );
+        presence.params.id = key;
+        try {
+          Assert.ok(presence.executeStep());
+          Assert.equal(presence.row.count, 1);
+        } finally {
+          presence.finalize();
+        }
+      }
+      folder.msgDatabase.forceClosed();
+      folder.msgDatabase = null;
+      Assert.ok(folder.msgDatabase.summaryValid);
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys().sort((a, b) => a - b),
+        repairedKeys
+      );
+      for (const [index, path] of paths.entries()) {
+        Assert.deepEqual(await IOUtils.read(path), bytes[index]);
+      }
+    } finally {
+      if (installed) {
+        connection.executeSimpleSQL("DROP TRIGGER temp.existing_repair_fault");
+      }
+      if (failUpdate) {
+        connection.removeFunction("existing_repair_fault");
+      }
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_repairExistingRowsMbox() {
+    await checkRepairExistingRows("mbox", false);
+  });
+  add_task(async function test_repairExistingRowsMaildir() {
+    await checkRepairExistingRows("maildir", false);
+  });
+  add_task(async function test_repairExistingRowsRollbackMbox() {
+    await checkRepairExistingRows("mbox", true);
+  });
+  add_task(async function test_repairExistingRowsRollbackMaildir() {
+    await checkRepairExistingRows("maildir", true);
+  });
+}
+
+/**
+ * A body with incomplete headers is retained without a false valid summary.
+ *
+ * @param {string} storeType - Expected provider type.
+ */
+async function checkRepairMalformedHeaders(storeType) {
+  await withAvailabilityStore(storeType, async folder => {
+    const good = "Subject: Existing row\r\n\r\nRetained existing bytes.\r\n";
+    const header = folder.addMessage(good);
+    const key = header.messageKey;
+    const token = header.storeToken;
+    const malformed =
+      "From: malformed@example.invalid\r\n" +
+      "Subject: Incomplete header block\r\n" +
+      "Message-ID: <malformed-repair@example.invalid>\r\n" +
+      "X-Unfinished: value";
+    const malformedToken = "repair-malformed-input";
+    // Create retained corrupt input directly, like test_folderCompact2's
+    // malformed mbox. Normal mbox Finish adds termination/separator bytes and
+    // cannot reliably create this incomplete-header case. Setup/cleanup still
+    // use the real account fixture; all bytes below are snapshotted before scan.
+    if (storeType == "mbox") {
+      await IOUtils.writeUTF8(folder.filePath.path, `From \r\n${malformed}`, {
+        mode: "append",
+      });
+    } else {
+      await IOUtils.writeUTF8(
+        PathUtils.join(folder.filePath.path, "cur", malformedToken),
+        malformed,
+        { mode: "create" }
+      );
+    }
+    const paths =
+      storeType == "mbox"
+        ? [folder.filePath.path]
+        : [token, malformedToken].map(bodyToken =>
+            PathUtils.join(folder.filePath.path, "cur", bodyToken)
+          );
+    const before = await Promise.all(paths.map(path => IOUtils.read(path)));
+    const statuses = [];
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl(url, status) {
+        statuses.push(status);
+      },
+    });
+    folder.parseFolder(null, listener);
+    const result = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    // GetNewMsgHdr reports the original missing completed-header error.
+    Assert.equal(result, Cr.NS_ERROR_NULL_POINTER);
+    Assert.deepEqual(statuses, [Cr.NS_ERROR_NULL_POINTER]);
+    Assert.ok(!folder.locked);
+    Assert.ok(!folder.msgDatabase.summaryValid);
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    Assert.ok(!folder.msgDatabase.summaryValid);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), [key]);
+    const retained = folder.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(retained.storeToken, token);
+    Assert.equal(retained.subject, "Existing row");
+    Assert.equal(mailTestUtils.loadMessageToString(folder, retained), good);
+    for (const [index, path] of paths.entries()) {
+      Assert.deepEqual(await IOUtils.read(path), before[index]);
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_repairMalformedHeadersMbox() {
+    await checkRepairMalformedHeaders("mbox");
+  });
+  add_task(async function test_repairMalformedHeadersMaildir() {
+    await checkRepairMalformedHeaders("maildir");
+  });
+}
+
+/**
+ * Reparse an uncompacted mbox without resurrecting its deleted message.
+ * Runs in both ordinary backend manifest entries.
+ */
+add_task(async function test_repairSkipsExpungedMbox() {
+  await withAvailabilityStore("mbox", async folder => {
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    const liveRaw =
+      "X-Mozilla-Status: 0000\r\nX-Mozilla-Status2: 00000000\r\n" +
+      "From: retained@example.invalid\r\n" +
+      "Message-ID: <repair-live@example.invalid>\r\n" +
+      "Subject: Retained live row\r\n\r\nRetained live body.\r\n";
+    const deletedRaw =
+      "X-Mozilla-Status: 0000\r\nX-Mozilla-Status2: 00000000\r\n" +
+      "From: removed@example.invalid\r\n" +
+      "Message-ID: <repair-deleted@example.invalid>\r\n" +
+      "Subject: Deleted uncompacted row\r\n\r\nDeleted retained bytes.\r\n";
+    const live = folder.addMessage(liveRaw);
+    const removed = folder.addMessage(deletedRaw);
+    const liveKey = live.messageKey;
+    const liveToken = live.storeToken;
+    const removedKey = removed.messageKey;
+    const removedToken = removed.storeToken;
+    const deletionStatuses = [];
+    const deleted = new PromiseTestUtils.PromiseCopyListener({
+      onStopCopy(status) {
+        deletionStatuses.push(status);
+      },
+    });
+    folder.deleteMessages([removed], null, true, false, deleted, false);
+    await deleted.promise;
+    Assert.deepEqual(deletionStatuses, [Cr.NS_OK]);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), [liveKey]);
+    Assert.notEqual(liveKey, removedKey);
+    const deletedBytes = readAll(
+      folder.msgStore.getMsgInputStream(folder, removedToken, 0)
+    );
+    Assert.ok(
+      deletedBytes.includes("X-Mozilla-Status: 0008\r\n"),
+      "The real provider marked the uncompacted body Expunged"
+    );
+    const before = await IOUtils.read(folder.filePath.path);
+    if (native) {
+      folder.msgDatabase.summaryValid = false;
+    }
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    if (!native) {
+      await IOUtils.remove(folder.summaryFile.path);
+    }
+    const statuses = [];
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl(url, status) {
+        statuses.push(status);
+      },
+    });
+    Assert.throws(
+      () => folder.getDatabaseWithReparse(listener, null),
+      error => error.result === Cr.NS_ERROR_NOT_INITIALIZED
+    );
+    await listener.promise;
+    Assert.deepEqual(statuses, [Cr.NS_OK]);
+    Assert.ok(!folder.locked);
+    Assert.ok(folder.msgDatabase.summaryValid);
+    const headers = Array.from(folder.messages);
+    Assert.equal(headers.length, 1);
+    Assert.equal(folder.getTotalMessages(false), 1);
+    Assert.equal(headers[0].messageId, "repair-live@example.invalid");
+    Assert.equal(headers[0].storeToken, liveToken);
+    if (native) {
+      Assert.equal(headers[0].messageKey, liveKey);
+    } else {
+      Assert.greater(folder.msgDatabase.dBFolderInfo.expungedBytes, 0);
+    }
+    Assert.equal(
+      mailTestUtils.loadMessageToString(folder, headers[0]),
+      liveRaw
+    );
+    Assert.deepEqual(await IOUtils.read(folder.filePath.path), before);
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    Assert.ok(folder.msgDatabase.summaryValid);
+    Assert.equal(folder.getTotalMessages(false), 1);
+    Assert.equal(Array.from(folder.messages).length, 1);
+    Assert.deepEqual(await IOUtils.read(folder.filePath.path), before);
+  });
+});
+
+if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  /** Preserve the default backend's incomplete-header tail skip. */
+  add_task(async function test_repairSkipsIncompleteMboxTail() {
+    await withAvailabilityStore("mbox", async folder => {
+      const raw = "Subject: Retained row\r\n\r\nRetained body.\r\n";
+      folder.addMessage(raw);
+      // Like the native malformed-input case above, create a crash-cut header
+      // before scanning: normal mbox Finish would complete its terminator.
+      await IOUtils.writeUTF8(
+        folder.filePath.path,
+        "From \r\nSubject: Incomplete default-backend tail\r\nX-Unfinished: value",
+        { mode: "append" }
+      );
+      const before = await IOUtils.read(folder.filePath.path);
+      const statuses = [];
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(url, status) {
+          statuses.push(status);
+        },
+      });
+      folder.msgDatabase.forceClosed();
+      folder.msgDatabase = null;
+      await IOUtils.remove(folder.summaryFile.path);
+      Assert.throws(
+        () => folder.getDatabaseWithReparse(listener, null),
+        error => error.result === Cr.NS_ERROR_NOT_INITIALIZED
+      );
+      await listener.promise;
+      Assert.deepEqual(statuses, [Cr.NS_OK]);
+      Assert.ok(!folder.locked);
+      Assert.ok(folder.msgDatabase.summaryValid);
+      const headers = Array.from(folder.messages);
+      Assert.equal(headers.length, 1);
+      Assert.equal(mailTestUtils.loadMessageToString(folder, headers[0]), raw);
+      Assert.greater(folder.msgDatabase.dBFolderInfo.expungedBytes, 0);
+      Assert.deepEqual(await IOUtils.read(folder.filePath.path), before);
+    });
+  });
+}

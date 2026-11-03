@@ -1051,9 +1051,18 @@ async function checkRepairExistingRows(storeType, failUpdate) {
           ),
           expectedReferences.filter(reference => reference != header.messageId)
         );
-        // RawHdr::references is a total ordered array. Native rows publish its
-        // canonical property even when the original RFC header was absent.
-        Assert.ok(header.properties.includes("references"));
+        // Known native References use a typed presence row, including when
+        // the original RFC header was absent or explicitly empty.
+        const presence = connection.createStatement(
+          "SELECT COUNT(*) AS count FROM message_reference_sets WHERE id = :id"
+        );
+        presence.params.id = key;
+        try {
+          Assert.ok(presence.executeStep());
+          Assert.equal(presence.row.count, 1);
+        } finally {
+          presence.finalize();
+        }
       }
       folder.msgDatabase.forceClosed();
       folder.msgDatabase = null;

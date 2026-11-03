@@ -1852,10 +1852,16 @@ async function checkPartialProcessRestart(store) {
   registerCleanupFunction(() =>
     IOUtils.remove(profilePath, { recursive: true })
   );
+  const executable = Services.dirsvc.get("XREExeF", Ci.nsIFile);
+  // MSIX runs xpcshell through the application executable.
+  const shellArgs = ["xpcshell", "xpcshell.exe"].includes(executable.leafName)
+    ? []
+    : ["--xpcshell"];
   for (const stage of ["write", "read"]) {
     const child = await Subprocess.call({
-      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      command: executable.path,
       arguments: [
+        ...shellArgs,
         "-g",
         Services.dirsvc.get("GreD", Ci.nsIFile).path,
         "-a",

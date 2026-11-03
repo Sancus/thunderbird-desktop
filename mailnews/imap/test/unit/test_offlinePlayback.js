@@ -118,7 +118,7 @@ add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
       Assert.ok(mailbox._messages[0].flags.includes("\\Flagged"));
       Assert.ok(mailbox._messages[0].flags.includes("\\Draft"));
       Assert.ok(!mailbox._messages[0].flags.includes("\\Seen"));
-      Assert.ok(!mailbox._messages[0].flags.includes("$MDNSent"));
+      Assert.ok(!mailbox._messages[0].flags.includes("$Mdnsent"));
       const header = targets[i].msgDatabase.getMsgHdrForKey(physicalKeys[i]);
       Assert.equal(header.messageKey, physicalKeys[i]);
       Assert.equal(header.folder, targets[i]);
@@ -234,10 +234,12 @@ add_task(
       };
       Services.io.offline = false;
       const failed = new PromiseTestUtils.PromiseUrlListener();
-      const failedPromise = Assert.rejects(
-        failed.promise,
-        error => error.message != String(Cr.NS_OK)
-      );
+      const failedPromise = (async () => {
+        await Assert.rejects(
+          failed.promise,
+          error => error.message != String(Cr.NS_OK)
+        );
+      })();
       MailServices.imap.playbackAllOfflineOperations(null, failed);
       await failedPromise;
       Assert.equal(sets, 1);
@@ -253,7 +255,7 @@ add_task(
         "\\Seen",
         "\\Recent",
         "\\Flagged",
-        "$MDNSent",
+        "$Mdnsent",
       ]) {
         Assert.ok(
           message.flags.includes(flag),
@@ -278,10 +280,12 @@ add_task(
       stream.close();
       IMAPPump.incomingServer.closeCachedConnections();
       const repeated = new PromiseTestUtils.PromiseUrlListener();
-      const repeatedPromise = Assert.rejects(
-        repeated.promise,
-        error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
-      );
+      const repeatedPromise = (async () => {
+        await Assert.rejects(
+          repeated.promise,
+          error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
+        );
+      })();
       MailServices.imap.playbackAllOfflineOperations(null, repeated);
       await repeatedPromise;
       Assert.equal(sets, 1, "The acknowledged set step is not repeated");
@@ -432,7 +436,9 @@ add_task(async function test_nativeMoveSourceFailureAfterCopySurvivesReopen() {
     let copies = 0;
     let sourceStores = 0;
     IMAP_RFC3501_handler.prototype.COPY = function (args, uid) {
-      if (uid && String(args[0]) == "93001") copies++;
+      if (uid && String(args[0]) == "93001") {
+        copies++;
+      }
       return originalCopy.call(this, args, uid);
     };
     IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
@@ -444,10 +450,12 @@ add_task(async function test_nativeMoveSourceFailureAfterCopySurvivesReopen() {
     };
     Services.io.offline = false;
     const failed = new PromiseTestUtils.PromiseUrlListener();
-    const failedPromise = Assert.rejects(
-      failed.promise,
-      error => error.message != String(Cr.NS_OK)
-    );
+    const failedPromise = (async () => {
+      await Assert.rejects(
+        failed.promise,
+        error => error.message != String(Cr.NS_OK)
+      );
+    })();
     MailServices.imap.playbackAllOfflineOperations(null, failed);
     await failedPromise;
     Assert.equal(copies, 1);
@@ -475,10 +483,12 @@ add_task(async function test_nativeMoveSourceFailureAfterCopySurvivesReopen() {
     Assert.equal(retained.destinationFolderURI, destination.URI);
     Assert.equal(retained.srcUid, 93001);
     const repeated = new PromiseTestUtils.PromiseUrlListener();
-    const repeatedPromise = Assert.rejects(
-      repeated.promise,
-      error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
-    );
+    const repeatedPromise = (async () => {
+      await Assert.rejects(
+        repeated.promise,
+        error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
+      );
+    })();
     MailServices.imap.playbackAllOfflineOperations(null, repeated);
     await repeatedPromise;
     Assert.equal(copies, 1, "Reopen does not send a second COPY");

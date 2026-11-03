@@ -6033,14 +6033,18 @@ TEST_F(DeliveryCoreReferences, DeletedSourceRetainsExactDispatchedTuple) {
   ASSERT_EQ(NS_OK, Add("deleted-source@invalid"_ns, {}, key));
   ASSERT_EQ(NS_OK, Add("survivor@invalid"_ns, {}, control));
   ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 61, 700));
+  nsCString databaseSourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(databaseSourceId));
+  ASSERT_EQ(NS_OK,
+            db.QueueOfflineProtocolFlagMutation(
+                databaseSourceId, mFolderId, key,
+                ServerMessageLocation{mFolderId, key, 61, 700}, 128, true));
   OfflineOperationData payload;
-  payload.operation = 1;
-  payload.newFlags = 128;
-  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, key, payload));
   ASSERT_EQ(NS_OK, db.RemoveMessage(key));
   uint64_t attemptId;
-  ASSERT_EQ(NS_OK,
-            db.BeginOfflineAttempt(mFolderId, key, 1, Nothing(), attemptId));
+  ASSERT_EQ(NS_OK, db.BeginOfflineAction(mFolderId, key, 1, Nothing(),
+                                         Nothing(), attemptId));
   OfflineAttempt attempt;
   ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
   ASSERT_TRUE(attempt.source);
@@ -6050,6 +6054,11 @@ TEST_F(DeliveryCoreReferences, DeletedSourceRetainsExactDispatchedTuple) {
   EXPECT_EQ(700u, attempt.source->uid);
   EXPECT_EQ(1u, attempt.operation);
   EXPECT_NE(key, attempt.source->uid);
+  OfflineReplayCommandToken token;
+  ASSERT_EQ(NS_OK, db.BeginOfflineReplayCommand(
+                       attempt, OfflineReplayCommand::FlagSet, token));
+  ASSERT_EQ(NS_OK, db.RecordOfflineReplayCommand(
+                       token, OfflineReplayReceipt::Acknowledged, NS_OK));
   ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(attemptId, Nothing()));
   ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, key));
   ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
@@ -6093,16 +6102,21 @@ TEST_F(DeliveryCoreReferences, QueuedSourceIsNotSilentlyRetargeted) {
   nsMsgKey key;
   ASSERT_EQ(NS_OK, Add("queued-source@invalid"_ns, {}, key));
   ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 81, 42));
+  nsCString databaseSourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(databaseSourceId));
+  ASSERT_EQ(NS_OK,
+            db.QueueOfflineProtocolFlagMutation(
+                databaseSourceId, mFolderId, key,
+                ServerMessageLocation{mFolderId, key, 81, 42}, 128, true));
   OfflineOperationData payload;
-  payload.operation = 1;
-  payload.newFlags = 128;
-  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, key, payload));
   ASSERT_EQ(NS_OK, db.BindMessageToServerUid(key, mFolderId, 81, 43));
   payload.keywordsToAdd = "another edit"_ns;
   ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, key, payload));
   uint64_t attemptId = 123;
   EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
-            db.BeginOfflineAttempt(mFolderId, key, 1, Nothing(), attemptId));
+            db.BeginOfflineAction(mFolderId, key, 1, Nothing(), Nothing(),
+                                  attemptId));
   EXPECT_EQ(123u, attemptId);
   nsMsgKey found = nsMsgKey_None;
   ASSERT_EQ(NS_OK, db.GetMessageKeyForServerUid(mFolderId, 81, 43, found));
@@ -16962,6 +16976,119 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, db.SettleOfflineMove(attempt, result));
   EXPECT_FALSE(result.operationRetired);
   EXPECT_EQ(target, result.destinationKey);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ReplayFlagDeltaUsesSavedTupleAfterQueuedLocalRemoval) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsMsgKey source;
+  ASSERT_EQ(NS_OK, Add("removed-flag-source"_ns, {}, source));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(source, mFolderId, 7, 42));
+  nsCString id;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(id));
+  ASSERT_EQ(NS_OK,
+            db.QueueOfflineProtocolFlagMutation(
+                id, mFolderId, source,
+                ServerMessageLocation{mFolderId, source, 7, 42}, 1, true));
+  ASSERT_EQ(NS_OK, db.RemoveMessage(source));
+  uint64_t attemptId;
+  ASSERT_EQ(NS_OK,
+            db.BeginOfflineAction(mFolderId, source,
+                                  nsIMsgOfflineImapOperation::kFlagsChanged,
+                                  Nothing(), Nothing(), attemptId));
+  OfflineAttempt attempt;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+  ASSERT_TRUE(attempt.source);
+  EXPECT_EQ(source, attempt.source->key);
+  EXPECT_EQ(42u, attempt.source->uid);
+  OfflineReplayCommandToken token;
+  ASSERT_EQ(NS_OK, db.BeginOfflineReplayCommand(
+                       attempt, OfflineReplayCommand::FlagSet, token));
+  ASSERT_EQ(NS_OK, db.RecordOfflineReplayCommand(
+                       token, OfflineReplayReceipt::Acknowledged, NS_OK));
+  ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(attemptId, Nothing()));
+  bool exists;
+  ASSERT_EQ(NS_OK, db.MessageExists(source, exists));
+  EXPECT_FALSE(exists);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ReplayOpaqueUndoPreservesProvenanceAndOriginalPhysicalGuard) {
+  ASSERT_EQ(NS_OK, Start());
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 7));
+  nsMsgKey source, target;
+  ASSERT_EQ(NS_OK, Add("undo-replay-source"_ns, {}, source));
+  ASSERT_EQ(NS_OK, Add("undo-replay-target"_ns, {}, target));
+  ASSERT_EQ(NS_OK, db.BindMessageToServerUid(source, mFolderId, 7, 42));
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+  ASSERT_EQ(NS_OK,
+            db.QueueOfflineProtocolFlagMutation(
+                sourceId, mFolderId, source,
+                ServerMessageLocation{mFolderId, source, 7, 42}, 0x81, true));
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, source, payload));
+  payload.operation |= nsIMsgOfflineImapOperation::kMsgMoved;
+  payload.pendingDestination = Some(PendingDestination{mFolderId, target, 7});
+  payload.copyDestinations = {"same"_ns, "same"_ns};
+  payload.keywordsToAdd = "untouched"_ns;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, source, payload));
+  OfflineOperationUndo operation;
+  ASSERT_EQ(NS_OK, db.CaptureOfflineOperationForUndo(mFolderId, source,
+                                                     sourceId, operation));
+  ASSERT_TRUE(operation.Operation());
+  ASSERT_TRUE(operation.Operation()->flagMutation);
+  ASSERT_TRUE(operation.Operation()->moveSourceGuard);
+  const auto capturedBody = operation.Operation()->moveSourceGuard->original;
+  ASSERT_EQ(NS_OK, db.RemoveOfflineOperation(mFolderId, source));
+  RemovedMessage removed;
+  ASSERT_EQ(NS_OK, db.RemoveMessageForUndo(source, removed));
+  FinishedMessageBody finished{"finished-restored"_ns, 12, 12, 1, true};
+  nsMsgKey fresh = 123;
+  Message* live = nullptr;
+  uint32_t callbacks = 0;
+  RefPtr<AddedObserver> observer = new AddedObserver([&](Message*) {
+    ++callbacks;
+    ASSERT_NE(source, fresh);
+    EXPECT_FALSE(operation.Operation());
+    OfflineOperationData actual;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(mFolderId, fresh, actual));
+    ASSERT_TRUE(actual.flagMutation);
+    ASSERT_TRUE(actual.moveSourceGuard);
+    EXPECT_EQ(0x81u, actual.flagMutation->setMask);
+    EXPECT_EQ(0u, actual.flagMutation->clearMask);
+    EXPECT_EQ(source, actual.moveSourceGuard->original.key);
+    EXPECT_EQ(capturedBody.contentRevision,
+              actual.moveSourceGuard->original.contentRevision);
+    EXPECT_EQ(capturedBody.storeToken,
+              actual.moveSourceGuard->original.storeToken);
+    EXPECT_EQ(payload.copyDestinations, actual.copyDestinations);
+  });
+  db.AddMessageListener(observer);
+  ASSERT_EQ(NS_OK, db.RestoreMessageForUndo(mFolderId, removed, finished,
+                                            &fresh, &live, &operation));
+  RefPtr<Message> restored = dont_AddRef(live);
+  db.RemoveMessageListener(observer);
+  EXPECT_EQ(1u, callbacks);
+  restored = nullptr;
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  OfflineOperationData actual;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolderId, fresh, actual));
+  ASSERT_TRUE(actual.flagMutation);
+  ASSERT_TRUE(actual.moveSourceGuard);
+  EXPECT_EQ(0x81u, actual.flagMutation->setMask);
+  EXPECT_EQ(source, actual.moveSourceGuard->original.key);
+  Maybe<ServerMessageLocation> tuple;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperationSource(mFolderId,
+                                                                fresh, tuple));
+  ASSERT_TRUE(tuple);
+  EXPECT_EQ(source, tuple->key);
+  EXPECT_EQ(42u, tuple->uid);
 }
 
 }  // namespace mozilla::mailnews

@@ -51,7 +51,7 @@ add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
     const sourceUid = 900001;
     const uri = Services.io.newFileURI(do_get_file("../../../data/bugmail10"));
     IMAPPump.mailbox.addMessage(
-      new ImapMessage(uri.spec, sourceUid, ["\\Draft", "\\Seen"])
+      new ImapMessage(uri.spec, sourceUid, { "\\Draft": true, "\\Seen": true })
     );
     const root = IMAPPump.incomingServer.rootFolder;
     const discovery = new PromiseTestUtils.PromiseUrlListener();
@@ -173,7 +173,7 @@ add_task(
       );
       for (const uid of [91001, 91002]) {
         IMAPPump.mailbox.addMessage(
-          new ImapMessage(uri.spec, uid, ["\\Draft", "\\Seen", "\\Recent"])
+          new ImapMessage(uri.spec, uid, { "\\Draft": true, "\\Seen": true, "\\Recent": true })
         );
       }
       const root = IMAPPump.incomingServer.rootFolder;

@@ -3947,6 +3947,14 @@ nsresult MessageDatabase::ValidateReplaySource(const OfflineAttempt& attempt,
   bool more;
   MOZ_TRY(stmt->ExecuteStep(&more));
   if (!more) {
+    // A proven queued flag action addresses the once-captured server tuple.
+    // The queued MOVE producer may already have removed local membership.
+    // Absence grants no UID/epoch inference and no destructive MOVE authority.
+    if (attempt.operation == OfflineOp::kFlagsChanged && attempt.flagMutation) {
+      present = false;
+      return NS_OK;
+    }
+
     NS_ENSURE_TRUE(
         attempt.moveSourceGuard && attempt.moveSourceGuard->presence ==
                                        OfflineMoveLocalPresence::ExactOrAbsent,

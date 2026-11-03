@@ -9813,9 +9813,18 @@ NS_IMETHODIMP nsImapMockChannel::SetURI(nsIURI* aURI) {
       nsCOMPtr<nsIMsgMessageUrl> msgUrl(do_QueryInterface(m_url));
       if (msgUrl) {
         nsCOMPtr<nsIMsgDBHdr> msgHdr;
-        // A failure to get a message header isn't an error
-        msgUrl->GetMessageHeader(getter_AddRefs(msgHdr));
-        if (msgHdr) {
+        nsresult rv = msgUrl->GetMessageHeader(getter_AddRefs(msgHdr));
+#ifdef MOZ_PANORAMA
+        if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+          MOZ_TRY(rv);
+          NS_ENSURE_TRUE(msgHdr, NS_ERROR_NOT_AVAILABLE);
+          uint32_t messageSize;
+          MOZ_TRY(msgHdr->GetMessageSize(&messageSize));
+          return SetContentLength(messageSize);
+        }
+#endif
+        // Legacy external URLs can have no locally known message header.
+        if (NS_SUCCEEDED(rv) && msgHdr) {
           uint32_t messageSize;
           if (NS_SUCCEEDED(msgHdr->GetMessageSize(&messageSize)))
             SetContentLength(messageSize);

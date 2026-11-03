@@ -299,8 +299,11 @@ NS_IMETHODIMP nsImapService::FetchMimePart(nsIURI* aURI,
       nsCOMPtr<nsIMsgMailNewsUrl> msgurl(do_QueryInterface(aURI, &rv));
       NS_ENSURE_SUCCESS(rv, rv);
 
-      msgurl->SetMsgWindow(aMsgWindow);
-      msgurl->RegisterListener(aUrlListener);
+      nsCOMPtr<nsIMsgMessageUrl> messageUrl(do_QueryInterface(imapUrl, &rv));
+      MOZ_TRY(rv);
+      MOZ_TRY(messageUrl->SetUri(aMessageURI));
+      MOZ_TRY(msgurl->SetMsgWindow(aMsgWindow));
+      if (aUrlListener) MOZ_TRY(msgurl->RegisterListener(aUrlListener));
 
       if (!mimePart.IsEmpty()) {
         return FetchMimePartInternal(imapUrl, folder, imapMessageSink, aURL,
@@ -439,8 +442,26 @@ nsresult nsImapService::FetchMimePartInternal(nsIImapUrl* aImapUrl,
     nsCOMPtr<nsIURI> url = do_QueryInterface(aImapUrl);
     if (aURL) NS_IF_ADDREF(*aURL = url);
 
-    rv = url->GetSpec(urlSpec);
-    NS_ENSURE_SUCCESS(rv, rv);
+    // The message URI selects a physical message and a MIME section. The
+    // supplied transport URL can still describe only the whole message.
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(aImapMailFolder->GetMsgDatabase(getter_AddRefs(db)));
+    ImapUid uid = MOZ_TRY(UidFromMsgKey(db, msgKey));
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      MOZ_TRY(static_cast<nsImapUrl*>(aImapUrl)->CaptureCopyTargets(
+          aImapMailFolder, {msgKey}, {uid}));
+    }
+#endif
+    MOZ_TRY(url->GetPrePath(urlSpec));
+    urlSpec.AppendLiteral("/fetch>UID>");
+    urlSpec.Append(GetHierarchyDelimiter(aImapMailFolder));
+    nsCString folderName;
+    MOZ_TRY(GetFolderName(aImapMailFolder, folderName));
+    urlSpec.Append(folderName);
+    urlSpec.Append('>');
+    urlSpec.AppendInt(uid);
+    urlSpec.Append(mimePart);
 
     rv = msgurl->SetSpecInternal(urlSpec);
     NS_ENSURE_SUCCESS(rv, rv);
@@ -1226,7 +1247,14 @@ NS_IMETHODIMP nsImapService::GetBodyStart(
                             aImapMailFolder, aUrlListener, urlSpec,
                             hierarchyDelimiter);
   if (NS_SUCCEEDED(rv) && imapUrl) {
-    rv = imapUrl->SetImapAction(nsIImapUrl::nsImapMsgPreview);
+    MOZ_TRY(imapUrl->SetImapAction(nsIImapUrl::nsImapMsgPreview));
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      // Retain the selected physical messages before this URL is queued.
+      MOZ_TRY(static_cast<nsImapUrl*>(imapUrl.get())
+                  ->CaptureFlagTargets(aImapMailFolder, messageIdentifierList));
+    }
+#endif
     rv = SetImapUrlSink(aImapMailFolder, imapUrl);
 
     if (NS_SUCCEEDED(rv)) {
@@ -2537,7 +2565,7 @@ NS_IMETHODIMP nsImapService::NewChannel(nsIURI* aURI, nsILoadInfo* aLoadInfo,
   nsCOMPtr<nsIImapMockChannel> channel =
       do_CreateInstance("@mozilla.org/messenger/imapmockchannel;1", &rv);
   NS_ENSURE_SUCCESS(rv, rv);
-  channel->SetURI(aURI);
+  MOZ_TRY(channel->SetURI(aURI));
 
   rv = channel->SetLoadInfo(aLoadInfo);
   NS_ENSURE_SUCCESS(rv, rv);

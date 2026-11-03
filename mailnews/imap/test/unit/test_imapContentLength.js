@@ -133,6 +133,74 @@ add_task(async function verifyContentLength() {
   }
 });
 
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(function test_messageSizeLookupUsesPhysicalHeader() {
+    const folder = IMAPPump.inbox;
+    const database = folder.msgDatabase;
+    const sink = folder.QueryInterface(Ci.nsIImapMessageSink);
+    const folderSink = folder.QueryInterface(Ci.nsIImapMailFolderSink);
+    const uid = gMsgHdr.getUint32Property("uidOnServer");
+    const key = gMsgHdr.messageKey;
+    const epoch = database.dBFolderInfo.imapUidValidity;
+    const size = gMsgHdr.messageSize;
+    const source = {
+      messageId: gMsgHdr.messageId,
+      flags: gMsgHdr.flags,
+      storeToken: gMsgHdr.storeToken,
+      count: folder.getTotalMessages(false),
+    };
+    Assert.equal(uid, 6101);
+    Assert.notEqual(key, uid);
+    Assert.greater(size, 0);
+    Assert.equal(size, gFile.fileSize);
+    Assert.equal(folderSink.uidValidity, epoch);
+    Assert.equal(sink.getMessageSizeFromDB(uid), size);
+    Assert.throws(
+      () => sink.getMessageSizeFromDB(0),
+      error => error.result == Cr.NS_ERROR_INVALID_ARG
+    );
+    for (const absentUid of [key, uid + 1]) {
+      Assert.throws(
+        () => sink.getMessageSizeFromDB(absentUid),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+    try {
+      gMsgHdr.setUint32Property("uidOnServer", 0);
+      Assert.throws(
+        () => sink.getMessageSizeFromDB(uid),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    } finally {
+      gMsgHdr.setUint32Property("uidOnServer", uid);
+    }
+    Assert.equal(sink.getMessageSizeFromDB(uid), size);
+    try {
+      folderSink.uidValidity = epoch + 1;
+      Assert.equal(database.dBFolderInfo.imapUidValidity, epoch);
+      Assert.throws(
+        () => sink.getMessageSizeFromDB(uid),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    } finally {
+      folderSink.uidValidity = epoch;
+    }
+    for (let retry = 0; retry < 2; retry++) {
+      Assert.equal(sink.getMessageSizeFromDB(uid), size);
+      const retained = database.getMsgHdrForKey(key);
+      Assert.equal(retained.messageKey, key);
+      Assert.equal(retained.folder, folder);
+      Assert.equal(retained.getUint32Property("uidOnServer"), uid);
+      Assert.equal(retained.messageSize, size);
+      Assert.equal(retained.messageId, source.messageId);
+      Assert.equal(retained.flags, source.flags);
+      Assert.equal(retained.storeToken, source.storeToken);
+      Assert.equal(folder.getTotalMessages(false), source.count);
+      Assert.equal(database.dBFolderInfo.imapUidValidity, epoch);
+    }
+  });
+}
+
 add_task(function endTest() {
   MailServices.mfn.removeListener(msgAddedListener);
   teardownIMAPPump();

@@ -4848,7 +4848,8 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
             if (unpublishedLegacy && !msgThread && rv == NS_ERROR_FAILURE) {
               rv = NS_OK;
             }
-            if (NS_FAILED(rv)) break;
+            if (NS_FAILED(rv))
+              break;
             if (msgThread) {
               nsMsgKey threadKey;
               rv = msgThread->GetThreadKey(&threadKey);

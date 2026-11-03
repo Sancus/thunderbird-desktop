@@ -1634,7 +1634,24 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
       nsresult found =
           core->MessageDB().ListOfflineOperations(folderId, false, retained);
       if (NS_FAILED(found)) return FinishPlayback(nullptr, found);
-      inspectIntents = !retained.IsEmpty();
+      constexpr uint32_t actions = nsIMsgOfflineImapOperation::kFlagsChanged |
+                                   nsIMsgOfflineImapOperation::kAddKeywords |
+                                   nsIMsgOfflineImapOperation::kRemoveKeywords |
+                                   nsIMsgOfflineImapOperation::kMsgCopy |
+                                   nsIMsgOfflineImapOperation::kMsgMoved |
+                                   nsIMsgOfflineImapOperation::kAppendDraft |
+                                   nsIMsgOfflineImapOperation::kAppendTemplate |
+                                   nsIMsgOfflineImapOperation::kDeleteAllMsgs;
+      for (nsMsgKey key : retained) {
+        mozilla::mailnews::OfflineOperationData payload;
+        found = core->MessageDB().GetOfflineOperation(folderId, key, payload);
+        if (NS_FAILED(found)) return FinishPlayback(nullptr, found);
+        // Counterpart and inactive Undo/Redo custody are not server intents.
+        if (payload.operation & actions) {
+          inspectIntents = true;
+          break;
+        }
+      }
     }
 #endif
     if (inspectIntents) {

@@ -1107,7 +1107,6 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
  */
 async function checkRepairMalformedHeaders(storeType) {
   await withAvailabilityStore(storeType, async folder => {
-    const store = folder.msgStore;
     const good = "Subject: Existing row\r\n\r\nRetained existing bytes.\r\n";
     const header = folder.addMessage(good);
     const key = header.messageKey;

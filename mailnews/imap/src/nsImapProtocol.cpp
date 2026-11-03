@@ -3463,14 +3463,14 @@ void nsImapProtocol::ProcessSelectedStateURL() {
           // destructive command. The whole attempt remains uncertain.
           if (nativeDelete) {
             if (succeeded && NS_SUCCEEDED(m_mailboxUpdateResult) &&
-                GetConnectionStatus() >= 0 && !DeathSignalReceived()) {
+                NS_SUCCEEDED(GetConnectionStatus()) && !DeathSignalReceived()) {
               succeeded = DeleteSubFolders(mailboxName.get(), deleteSelf);
             } else {
               succeeded = false;
             }
             if (succeeded && GetServerStateParser().LastCommandSuccessful() &&
                 NS_SUCCEEDED(m_mailboxUpdateResult) &&
-                GetConnectionStatus() >= 0 && !DeathSignalReceived()) {
+                NS_SUCCEEDED(GetConnectionStatus()) && !DeathSignalReceived()) {
               static_cast<nsImapUrl*>(m_runningUrl.get())
                   ->RecordNativeFolderDeleteAcknowledged();
             } else if (NS_SUCCEEDED(m_mailboxUpdateResult)) {

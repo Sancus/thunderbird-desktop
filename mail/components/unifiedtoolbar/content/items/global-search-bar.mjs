@@ -51,9 +51,67 @@ class GlobalSearchBar extends SearchBar {
   }
 
   #completionResult = null;
+  #refreshSelection = null;
+  #observingNames = false;
+
+  #nameObserver = {
+    observe: (subject, topic, sourceId) => {
+      const provider = lazy.glodaCompleter;
+      const result = this.#completionResult;
+      if (
+        !this.isConnected ||
+        !this.popup.mPopupOpen ||
+        !result?.active ||
+        provider.curResult != result ||
+        (result.sourceId && result.sourceId != sourceId)
+      ) {
+        return;
+      }
+      const row = result.getObjectAt(this.popup.selectedIndex);
+      this.#refreshSelection = row
+        ? {
+            selection: JSON.stringify(row.selection ?? null),
+            fullText: !!row.fullText,
+            sourceId: row.sourceId ?? null,
+          }
+        : null;
+      provider.startSearch(
+        this.controller.searchString,
+        "global",
+        null,
+        this.#searchResultListener
+      );
+    },
+  };
+
+  /** Observe card delivery only while this native input is connected. */
+  #observeNames() {
+    if (this.#observingNames || !lazy.glodaCompleter.isNativeMailSearch) {
+      return;
+    }
+    this.#observingNames = true;
+    Services.obs.addObserver(
+      this.#nameObserver,
+      "panorama-mail-search-names-changed"
+    );
+    this.popup.addEventListener("popuphidden", this);
+  }
+
+  disconnectedCallback() {
+    this.#stopCompletion();
+    if (this.#observingNames) {
+      this.#observingNames = false;
+      Services.obs.removeObserver(
+        this.#nameObserver,
+        "panorama-mail-search-names-changed"
+      );
+      this.popup.removeEventListener("popuphidden", this);
+    }
+  }
 
   /** Stops delivery only for the result owned by this input. */
   #stopCompletion() {
+    this.#refreshSelection = null;
     const provider = lazy.glodaCompleter;
     if (provider.curResult && provider.curResult == this.#completionResult) {
       provider.stopSearch();
@@ -71,6 +129,18 @@ class GlobalSearchBar extends SearchBar {
         return;
       }
       this.#completionResult = search.wrappedJSObject ?? search;
+      if (provider.isNativeMailSearch && search.ongoing) {
+        this.popup.selectedIndex = -1;
+      } else if (this.#refreshSelection) {
+        const selected = this.#refreshSelection;
+        this.#refreshSelection = null;
+        this.popup.selectedIndex = search.rows.findIndex(
+          row =>
+            !!row.fullText == selected.fullText &&
+            (row.sourceId ?? null) == selected.sourceId &&
+            JSON.stringify(row.selection ?? null) == selected.selection
+        );
+      }
       this.controller.matchCount = search.matchCount;
       if (this.controller.matchCount < 1) {
         this.popup.closePopup();
@@ -94,6 +164,7 @@ class GlobalSearchBar extends SearchBar {
 
   connectedCallback() {
     if (this.shadowRoot) {
+      this.#observeNames();
       return;
     }
     if (
@@ -112,6 +183,7 @@ class GlobalSearchBar extends SearchBar {
     this.addEventListener("focus", this);
     this.addEventListener("blur", this);
     this.addEventListener("drop", this, { capture: true });
+    this.#observeNames();
   }
 
   #popupWasOpenAtDown = false;
@@ -144,6 +216,9 @@ class GlobalSearchBar extends SearchBar {
         if (!this.#popupWasOpenAtDown || event.key !== "Escape") {
           super.handleEvent(event);
         }
+        break;
+      case "popuphidden":
+        this.#stopCompletion();
         break;
       case "blur":
         this.#stopCompletion();
@@ -248,6 +323,7 @@ class GlobalSearchBar extends SearchBar {
   };
 
   #handleAutocomplete = event => {
+    this.#refreshSelection = null;
     this.controller.searchString = event.detail;
     if (!event.detail) {
       this.#stopCompletion();

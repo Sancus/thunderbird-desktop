@@ -100,6 +100,15 @@ add_task(async function test_cardNotificationsRefreshBothPhysicalCopies() {
   const before = await Promise.all(ids.map(id => service.getText(id)));
   Assert.ok(before.every(text => text.author.includes("InitialLiveCatalog")));
 
+  const deliveries = [];
+  const observer = (subject, topic, sourceId) => {
+    Assert.equal(sourceId, database.sourceId);
+    deliveries.push(Promise.all(ids.map(id => service.getText(id))));
+  };
+  Services.obs.addObserver(observer, "panorama-mail-search-names-changed");
+  registerCleanupFunction(() =>
+    Services.obs.removeObserver(observer, "panorama-mail-search-names-changed")
+  );
   settled = Promise.withResolvers();
   for (const name of ["IntermediateLiveCatalog", "FinalLiveCatalog"]) {
     added.displayName = name;
@@ -108,7 +117,17 @@ add_task(async function test_cardNotificationsRefreshBothPhysicalCopies() {
   // Only the real card notifications can wake this completed background run.
   // Do not query or call update before its next completion.
   await settled.promise;
+  Assert.equal(
+    deliveries.length,
+    1,
+    "One settled delivery coalesces card changes"
+  );
   const refreshed = await Promise.all(ids.map(id => service.getText(id)));
+  Assert.deepEqual(
+    await deliveries[0],
+    refreshed,
+    "Delivery follows current copied metadata"
+  );
   for (let i = 0; i < ids.length; i++) {
     Assert.equal(refreshed[i].id, ids[i]);
     Assert.ok(refreshed[i].author.includes("FinalLiveCatalog"));
@@ -122,7 +141,13 @@ add_task(async function test_cardNotificationsRefreshBothPhysicalCopies() {
   book.deleteCards([added]);
   removed = true;
   await settled.promise;
+  Assert.equal(
+    deliveries.length,
+    2,
+    "Deletion publishes one later settled pass"
+  );
   const deleted = await Promise.all(ids.map(id => service.getText(id)));
+  Assert.deepEqual(await deliveries[1], deleted);
   for (let i = 0; i < ids.length; i++) {
     Assert.equal(deleted[i].author, "Sender <live-catalog@example.invalid>");
     Assert.notEqual(deleted[i].textRevision, refreshed[i].textRevision);

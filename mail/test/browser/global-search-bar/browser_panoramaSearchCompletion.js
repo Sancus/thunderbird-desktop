@@ -204,6 +204,119 @@ add_task(
   }
 );
 
+add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
+  await SpecialPowers.pushPrefEnv({
+    set: [["gloda.show_as_list_by_default", true]],
+  });
+  const book = MailServices.ab.getDirectory("jsaddrbook://abook.sqlite");
+  const card = Cc["@mozilla.org/addressbook/cardproperty;1"].createInstance(
+    Ci.nsIAbCard
+  );
+  card.primaryEmail = "completionperson@example.invalid";
+  card.displayName = "Open Completion Card A";
+  let currentCard = book.addCard(card);
+  const input = document.querySelector(
+    "#unifiedToolbarContent global-search-bar"
+  );
+  let list;
+  try {
+    let progress;
+    do {
+      progress = await fixture.service.update({ limit: 500 });
+    } while (progress.moreWork);
+    input.focus();
+    input.dispatchEvent(
+      new CustomEvent("autocomplete", { detail: "completionperson" })
+    );
+    const initial = await completionResult("completionperson");
+    const initialIndex = initial.rows.findIndex(row => row.type == "person");
+    Assert.greaterOrEqual(initialIndex, 0);
+    Assert.equal(initial.rows[initialIndex].label, "Open Completion Card A");
+    input.popup.selectedIndex = initialIndex;
+    const tabs = tabmail.tabInfo.length;
+    currentCard.displayName = "Open Completion Card B";
+    book.modifyCard(currentCard);
+    await TestUtils.waitForCondition(
+      () =>
+        provider.curResult != initial &&
+        !provider.curResult.ongoing &&
+        provider.curResult.rows.some(
+          row => row.label == "Open Completion Card B"
+        ),
+      "The open native completion refreshes without another input event"
+    );
+    const changed = await completionResult("completionperson");
+    Assert.ok(!initial.active);
+    Assert.ok(input.popup.mPopupOpen);
+    Assert.strictEqual(input.popup.input, input);
+    Assert.equal(
+      changed.getObjectAt(input.popup.selectedIndex).label,
+      "Open Completion Card B"
+    );
+    Assert.equal(changed.sourceId, fixture.sourceId);
+    Assert.deepEqual(changed.getObjectAt(input.popup.selectedIndex).selection, {
+      type: "person",
+      emails: [card.primaryEmail],
+    });
+    Assert.equal(input.controller.searchString, "completionperson");
+    Assert.equal(tabmail.tabInfo.length, tabs);
+    book.deleteCards([currentCard]);
+    currentCard = null;
+    await TestUtils.waitForCondition(
+      () =>
+        provider.curResult != changed &&
+        !provider.curResult.ongoing &&
+        provider.curResult.rows.some(
+          row => row.type == "person" && row.label == "Completion Sender"
+        ),
+      "Deletion refreshes the same popup with the actual header-name fallback"
+    );
+    const fallback = await completionResult("completionperson");
+    const row = fallback.getObjectAt(input.popup.selectedIndex);
+    Assert.equal(row.label, "Completion Sender");
+    Assert.deepEqual(row.selection, {
+      type: "person",
+      emails: [card.primaryEmail],
+    });
+    Assert.equal(row.sourceId, fixture.sourceId);
+    input.dispatchEvent(
+      new CustomEvent("search", { detail: "completionperson" })
+    );
+    const pending = tabmail.currentTabInfo;
+    list = await pending.searchPromise;
+    Assert.deepEqual(
+      (await completionListRows(list)).toSorted(),
+      fixture.expected.toSorted(),
+      "The refreshed literal selection still opens exactly both physical copies and excludes the control"
+    );
+    tabmail.closeTab(list);
+    list = null;
+    Assert.ok(!fallback.active);
+    const settled = TestUtils.topicObserved(
+      "panorama-mail-search-names-changed",
+      (subject, sourceId) => sourceId == fixture.sourceId
+    );
+    currentCard = book.addCard(card);
+    await settled;
+    await TestUtils.waitForTick();
+    Assert.strictEqual(
+      provider.curResult,
+      fallback,
+      "Closed input owns no future name delivery"
+    );
+    Assert.ok(!input.popup.mPopupOpen);
+  } finally {
+    input.dispatchEvent(new CustomEvent("autocomplete", { detail: "" }));
+    if (list) {
+      tabmail.closeTab(list);
+    }
+    if (currentCard) {
+      book.deleteCards([currentCard]);
+    }
+    await SpecialPowers.popPrefEnv();
+  }
+});
+
 add_task(async function test_nativeToolbarTagUsesRetainedFacetUI() {
   await SpecialPowers.pushPrefEnv({
     set: [["gloda.show_as_list_by_default", false]],

@@ -92,6 +92,7 @@ export class MailSearchService {
   #index;
   #updates = Promise.resolve();
   #preferences = Promise.resolve();
+  #pendingNameVersion = null;
   #controller = new AbortController();
   #scheduled = false;
   #retryCount = 0;
@@ -235,9 +236,9 @@ export class MailSearchService {
         await this.#index.setPolicyFingerprint(fingerprint);
       }
       signal?.throwIfAborted();
-      await this.#index.prepareAddressBook(
-        Services.prefs.getIntPref(DISPLAY_NAME_PREF, 0)
-      );
+      const nameVersion = Services.prefs.getIntPref(DISPLAY_NAME_PREF, 0);
+      await this.#index.prepareAddressBook(nameVersion);
+      return nameVersion;
     });
     this.#preferences = operation.catch(() => {});
     return operation;
@@ -536,7 +537,7 @@ export class MailSearchService {
       : this.#controller.signal;
     const operation = this.#updates.then(async () => {
       signal.throwIfAborted();
-      await this.#preparePreferences(signal);
+      const nameVersion = await this.#preparePreferences(signal);
       await this.#readChanges(limit, signal);
       const refreshingNames = await this.#index.refreshAddressBook(limit);
       const before = await this.#index.getProgress();
@@ -562,6 +563,23 @@ export class MailSearchService {
         },
         { limit, signal, loadMetadata: loadMailSearchMetadata }
       );
+      // Unavailable bodies are not pending work: their current header metadata
+      // has already been copied. Publish only the latest settled name pass.
+      if (
+        this.#pendingNameVersion === nameVersion &&
+        Services.prefs.getIntPref(DISPLAY_NAME_PREF, 0) === nameVersion &&
+        !refreshingNames &&
+        !progress.pending &&
+        !signal.aborted &&
+        !this.#closed
+      ) {
+        this.#pendingNameVersion = null;
+        Services.obs.notifyObservers(
+          null,
+          "panorama-mail-search-names-changed",
+          this.#sourceId
+        );
+      }
       const scan = await this.#index.getRescan();
       const { watermark } = this.#messageDB.getSearchChanges(
         progress.acceptedThrough,
@@ -762,7 +780,13 @@ export class MailSearchService {
     }
   }
 
-  observe() {
+  observe(subject, topic, data) {
+    if (topic == "nsPref:changed" && data == DISPLAY_NAME_PREF) {
+      this.#pendingNameVersion = Services.prefs.getIntPref(
+        DISPLAY_NAME_PREF,
+        0
+      );
+    }
     this.#wake();
   }
   msgAdded() {

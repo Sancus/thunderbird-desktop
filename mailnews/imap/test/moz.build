@@ -9,6 +9,8 @@ XPCSHELL_TESTS_MANIFESTS += [
 
 if CONFIG["MOZ_PANORAMA"]:
     XPCSHELL_TESTS_MANIFESTS += [
+        "unit/xpcshell-panorama-ci041-maildir.toml",
+        "unit/xpcshell-panorama-ci041-mbox.toml",
         "unit/xpcshell-panorama-discovery-child-mork-maildir.toml",
         "unit/xpcshell-panorama-discovery-child-mork-mbox.toml",
         "unit/xpcshell-panorama-discovery-child-panorama-maildir.toml",

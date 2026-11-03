@@ -220,7 +220,7 @@ class TestPanoramaConversation(MarionetteTestCase):
             const state = window.conversation097 = {
                 origin, cancel, created: null, started: null,
                 baseline: [], openedTabs: 0, completionCount: 0,
-                windowEvents: [],
+                windowEvents: [], createdClosedObserved: false,
             };
             Services.prefs.setBoolPref("mailnews.database.global.indexer.enabled", false);
             state.disabled = !content.commandController.isCommandEnabled(
@@ -248,12 +248,16 @@ class TestPanoramaConversation(MarionetteTestCase):
             };
             state.observer = {
                 observe(subject, topic) {
-                    if (topic == "domwindowopened") {
+                    if (topic == "domwindowopened" && !state.created) {
                         state.created = subject;
                         subject.addEventListener("unload", state.onUnload);
-                        if (cancel) {
+                        if (cancel == "created") {
+                            subject.close();
+                        } else if (cancel) {
                             origin.close();
                         }
+                    } else if (topic == "domwindowclosed" && subject == state.created) {
+                        state.createdClosedObserved = true;
                     }
                 },
             };
@@ -294,7 +298,8 @@ class TestPanoramaConversation(MarionetteTestCase):
                     }
                     if (state.cancel) {
                         return state.completionCount == 1 &&
-                            state.created && state.created.closed;
+                            state.created && state.created.closed &&
+                            (state.cancel != "created" || state.createdClosedObserved);
                     }
                     if (!state.started) {
                         return false;
@@ -330,7 +335,8 @@ class TestPanoramaConversation(MarionetteTestCase):
                         cancelled: state.cancelled,
                         completionCount: state.completionCount,
                         lateSuccess: state.lateSuccess,
-                        startupReached: state.started !== null };
+                        startupReached: state.started !== null,
+                        createdClosedObserved: state.createdClosedObserved };
                 }
                 const tabs = state.tabmail.tabInfo.filter(
                     tab => !state.baseline.includes(tab)
@@ -354,6 +360,60 @@ class TestPanoramaConversation(MarionetteTestCase):
                 };
                 """
             )
+            if cancel == "created" and "error" not in result:
+                # Exercise the next ordinary startup before releasing the old request.
+                self.marionette.execute_script(
+                    """
+                    const state = window.conversation097;
+                    state.recoveryStartup = null;
+                    state.recoveryStartupObserver = subject => {
+                        state.recoveryStartup = subject;
+                    };
+                    Services.obs.addObserver(state.recoveryStartupObserver, "mail-startup-done");
+                    """
+                )
+                try:
+                    self.open_window(
+                        r"""
+                        Services.ww.openWindow(null, "chrome://messenger/content/messenger.xhtml",
+                            "_blank", "chrome,dialog=no,all",
+                            Cc["@mozilla.org/supports-string;1"].createInstance(Ci.nsISupportsString));
+                        """,
+                        "mail:3pane",
+                    )
+                finally:
+                    self.marionette.switch_to_window(self.activity)
+                Wait(self.marionette).until(
+                    lambda driver: driver.execute_script(
+                        """
+                        const win = window.conversation097.recoveryStartup;
+                        return win && win.document.getElementById("tabmail")?.tabInfo?.length > 0;
+                        """
+                    )
+                )
+                result["recovery"] = self.marionette.execute_script(
+                    """
+                    const state = window.conversation097;
+                    const win = Services.wm.getMostRecentWindow("mail:3pane");
+                    const tabs = win.document.getElementById("tabmail").tabInfo;
+                    const view = state.origin.messageBrowser.contentWindow.gDBView;
+                    const header = view.hdrForFirstSelectedMessage;
+                    return {
+                        startupMatches: state.recoveryStartup == win,
+                        mainWindows: [...Services.wm.getEnumerator("mail:3pane")].length,
+                        tabs: tabs.length,
+                        syntheticTabs: tabs.filter(tab =>
+                            tab.chromeBrowser?.contentWindow?.gViewWrapper?.isSynthetic).length,
+                        completionCount: state.completionCount,
+                        lateSuccess: state.lateSuccess,
+                        error: state.error ?? null,
+                        originClosed: state.origin.closed,
+                        selectedCount: view.numSelected,
+                        selected: { folderURI: header.folder.URI,
+                            key: header.messageKey, messageId: header.messageId },
+                    };
+                    """
+                )
             self.logger.info("Conversation097 actual " + json.dumps(result))
             return result
         except Exception:
@@ -396,6 +456,9 @@ class TestPanoramaConversation(MarionetteTestCase):
                     state.created.removeEventListener("unload", state.onUnload);
                 }
                 Services.obs.removeObserver(state.startup, "mail-startup-done");
+                if (state.recoveryStartupObserver) {
+                    Services.obs.removeObserver(state.recoveryStartupObserver, "mail-startup-done");
+                }
                 if (state.tabmail && !state.created.closed) {
                     state.tabmail.tabContainer.removeEventListener("TabOpen", state.onTab);
                 }
@@ -435,6 +498,33 @@ class TestPanoramaConversation(MarionetteTestCase):
         self.assertTrue(result["originClosed"])
         self.assertTrue(result["createdClosed"])
         self.assertEqual(0, result["mainWindows"])
+
+    def test_new_main_window_closed_before_startup(self):
+        result = self.open_conversation("created")
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["disabled"])
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["isPromise"])
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(1, result["completionCount"])
+        self.assertFalse(result["lateSuccess"])
+        self.assertFalse(result["startupReached"])
+        self.assertEqual(0, result["openedTabs"])
+        self.assertFalse(result["originClosed"])
+        self.assertTrue(result["createdClosed"])
+        self.assertTrue(result["createdClosedObserved"])
+        self.assertEqual(0, result["mainWindows"])
+        recovery = result["recovery"]
+        self.assertTrue(recovery["startupMatches"])
+        self.assertEqual(1, recovery["mainWindows"])
+        self.assertEqual(1, recovery["tabs"])
+        self.assertEqual(0, recovery["syntheticTabs"])
+        self.assertEqual(1, recovery["completionCount"])
+        self.assertFalse(recovery["lateSuccess"])
+        self.assertIsNone(recovery["error"])
+        self.assertFalse(recovery["originClosed"])
+        self.assertEqual(1, recovery["selectedCount"])
+        self.assertEqual(self.fixture["expected"][2], recovery["selected"])
 
     def restore(self):
         """Restore real windows, fixture folders and original startup preferences."""

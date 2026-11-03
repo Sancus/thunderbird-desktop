@@ -423,9 +423,20 @@ add_task(
       await TestUtils.waitForCondition(() => owner.searchPromise);
       await owner.searchPromise;
       const input = owner.panel.querySelector(".remote-gloda-search");
+      // Completion enumerates only current indexed projections. Settle native
+      // work queued by the previous consumer before starting this input.
+      let progress;
+      do {
+        progress = await fixture.service.update({ limit: 500 });
+      } while (progress.moreWork);
+      Assert.equal(progress.pending, 0, JSON.stringify(progress));
+      Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
       input.focus();
       input.value = "completionperson";
+      const previous = provider.curResult;
       input.controller.startSearch("completionperson");
+      // nsAutoCompleteController starts its provider through a delayed timer.
+      await TestUtils.waitForCondition(() => provider.curResult != previous);
       const result = await completionResult("completionperson");
       assertCompletionInputOwnership(input);
       const index = result.rows.findIndex(row => row.type == "person");

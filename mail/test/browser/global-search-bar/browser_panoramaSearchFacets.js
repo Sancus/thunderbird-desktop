@@ -192,6 +192,14 @@ add_task(
       }
     });
     await set_filter_text(fixture.term);
+    // The real folder/filter setup can queue metadata projection work. The
+    // global UI accepts one bounded update; finish fixture work before testing it.
+    let progress;
+    do {
+      progress = await fixture.service.update({ limit: 500 });
+    } while (progress.moreWork);
+    Assert.equal(progress.pending, 0, JSON.stringify(progress));
+    Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
     Assert.equal(
       pane.gDBView.numMsgsInView,
       0,

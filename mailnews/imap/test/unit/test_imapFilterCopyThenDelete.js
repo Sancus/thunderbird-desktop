@@ -30,8 +30,58 @@ function getImapCommands() {
     .map(command => command.toUpperCase());
 }
 
-add_setup(async function () {
+add_setup(async function setupNativeCopyThenDelete() {
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (native) {
+    const storePref = "mail.server.default.storeContractID";
+    const autosyncPref = "mail.server.default.autosync_offline_stores";
+    const hadStore = Services.prefs.prefHasUserValue(storePref);
+    const oldStore = Services.prefs.getCharPref(storePref, "");
+    const hadAutosync = Services.prefs.prefHasUserValue(autosyncPref);
+    const oldAutosync = Services.prefs.getBoolPref(autosyncPref, true);
+    registerCleanupFunction(() => {
+      if (IMAPPump.incomingServer) {
+        teardownIMAPPump();
+      }
+      if (hadStore) {
+        Services.prefs.setCharPref(storePref, oldStore);
+      } else {
+        Services.prefs.clearUserPref(storePref);
+      }
+      if (hadAutosync) {
+        Services.prefs.setBoolPref(autosyncPref, oldAutosync);
+      } else {
+        Services.prefs.clearUserPref(autosyncPref);
+      }
+    });
+    Services.prefs.setCharPref(
+      storePref,
+      Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+    );
+    Services.prefs.setBoolPref(autosyncPref, false);
+  }
   setupIMAPPump();
+  if (native) {
+    IMAPPump.mailbox.uidvalidity = 7301;
+    IMAPPump.mailbox.uidnext = 7401;
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+    Assert.ok(inbox, "Native discovery supplied the actual INBOX");
+    IMAPPump.inbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+    Assert.equal(IMAPPump.inbox.parent, root);
+    Assert.equal(IMAPPump.inbox.server, IMAPPump.incomingServer);
+    const expectedStore = {
+      "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+      "@mozilla.org/msgstore/maildirstore;1": "maildir",
+    }[Services.prefs.getCharPref("mail.serverDefaultStoreContractID")];
+    Assert.ok(expectedStore);
+    Assert.equal(IMAPPump.incomingServer.msgStore.storeType, expectedStore);
+    Assert.equal(IMAPPump.inbox.msgStore.storeType, expectedStore);
+  }
+
   Services.prefs.setBoolPref(
     "mail.server.default.autosync_offline_stores",
     false
@@ -69,6 +119,16 @@ add_setup(async function () {
 });
 
 add_task(async function testCopyFinishesBeforeDelete() {
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (native) {
+    const oldFolderBiff = IMAPPump.inbox.performingBiff;
+    const oldServerBiff = IMAPPump.incomingServer.performingBiff;
+    registerCleanupFunction(() => {
+      IMAPPump.inbox.performingBiff = oldFolderBiff;
+      IMAPPump.incomingServer.performingBiff = oldServerBiff;
+    });
+    IMAPPump.inbox.performingBiff = true;
+  }
   const generator = new MessageGenerator();
   for (let index = 0; index < MESSAGE_COUNT; index++) {
     const message = generator.makeMessage({
@@ -138,5 +198,10 @@ add_task(async function testCopyFinishesBeforeDelete() {
       BODY_SENTINELS[index],
       `${MESSAGE_IDS[index]} should retain its complete body`
     );
+  }
+  if (native) {
+    Assert.equal(IMAPPump.inbox.getNumNewMessages(false), 0);
+    Assert.equal(IMAPPump.inbox.hasNewMessages, false);
+    Assert.equal(IMAPPump.inbox.msgDatabase.getNewList().length, 0);
   }
 });

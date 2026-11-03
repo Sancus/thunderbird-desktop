@@ -125,6 +125,20 @@ async function checkUnsupportedImapMoveUndo(storeType) {
     Assert.equal(uid, serverMessage.uid);
     Assert.notEqual(key, uid);
     source.setStringProperty("copyErrorProperty", "exact retained value");
+    source.setStringProperty("UidOnServer", "retain case-distinct property");
+    const uidText = source.getStringProperty("uidOnServer");
+    const rawCopy = destination.msgDatabase.copyHdrFromExistingHdr(
+      0xffffffff /* nsMsgKey_None */,
+      source,
+      false
+    );
+    Assert.ok(rawCopy.properties.includes("uidOnServer"));
+    Assert.equal(rawCopy.getStringProperty("uidOnServer"), uidText);
+    Assert.equal(
+      rawCopy.getStringProperty("UidOnServer"),
+      "retain case-distinct property"
+    );
+    Assert.deepEqual(destination.msgDatabase.listAllKeys(), []);
     const stops = [];
     const copied = new PromiseTestUtils.PromiseCopyListener({
       onStopCopy(status) {
@@ -151,6 +165,12 @@ async function checkUnsupportedImapMoveUndo(storeType) {
     Assert.equal(retained.flags, flags);
     Assert.equal(retained.messageSize, size);
     Assert.equal(retained.getUint32Property("uidOnServer"), uid);
+    Assert.ok(retained.properties.includes("uidOnServer"));
+    Assert.equal(retained.getStringProperty("uidOnServer"), uidText);
+    Assert.equal(
+      retained.getStringProperty("UidOnServer"),
+      "retain case-distinct property"
+    );
     Assert.equal(
       retained.getStringProperty("copyErrorProperty"),
       "exact retained value"
@@ -163,6 +183,13 @@ async function checkUnsupportedImapMoveUndo(storeType) {
     Assert.notEqual(finished.messageKey, key);
     Assert.equal(finished.messageId, source.messageId);
     Assert.equal(finished.flags, flags & ~Ci.nsMsgMessageFlags.Offline);
+    Assert.ok(!finished.properties.includes("uidOnServer"));
+    Assert.equal(finished.getUint32Property("uidOnServer"), 0);
+    Assert.ok(finished.properties.includes("UidOnServer"));
+    Assert.equal(
+      finished.getStringProperty("UidOnServer"),
+      "retain case-distinct property"
+    );
     Assert.equal(
       finished.getStringProperty("copyErrorProperty"),
       "exact retained value"

@@ -1799,6 +1799,533 @@ TEST_F(DeliveryCompleteHeader, OfflineCopyRejectsStaleAndClosedOwners) {
   EXPECT_EQ((nsTArray<nsMsgKey>{key}), staged);
 }
 
+TEST_F(DeliveryCompleteHeader,
+       ParsedServerStagesMetadataAndCopyBeforePublication) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("parsed@invalid"_ns));
+  ASSERT_EQ(NS_OK,
+            parsed->SetReferences(
+                "<parsed@invalid> <parent@invalid> <parsed@invalid>"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetSubject("selected"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetMessageSize(73));
+  ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("opaque", "00042"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetStringProperty("empty", ""_ns));
+  RefPtr<ParsedServerHdr> selected;
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001,
+                                            getter_AddRefs(selected)));
+  ASSERT_TRUE(selected);
+  // Clearing the parser's reference does not discard the selected source.
+  parsed = nullptr;
+  ServerMessageLocation location;
+  ASSERT_EQ(NS_OK, selected->GetLocation(location));
+  EXPECT_EQ(mFolder, location.folderId);
+  EXPECT_EQ(73u, location.epoch);
+  EXPECT_EQ(4001u, location.uid);
+  EXPECT_NE(4001u, location.key);
+  EXPECT_NE(nsMsgKey_None, location.key);
+  bool live = true;
+  ASSERT_EQ(NS_OK, selected->GetIsLive(&live));
+  EXPECT_FALSE(live);
+  bool contains = true;
+  ASSERT_EQ(NS_OK, db->ContainsKey(location.key, &contains));
+  EXPECT_FALSE(contains);
+  nsCOMPtr<nsIMsgDBHdr> ordinary;
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+            db->GetMsgHdrForKey(location.key, getter_AddRefs(ordinary)));
+  EXPECT_FALSE(ordinary);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  ASSERT_EQ(NS_OK, selected->MarkRead(true));
+  ASSERT_EQ(NS_OK, selected->MarkFlagged(true));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK,
+            selected->OrFlags(nsMsgMessageFlags::MDNReportNeeded, &flags));
+  ASSERT_EQ(NS_OK, selected->SetUint32Property("ProtoThreadFlags",
+                                               nsMsgMessageFlags::Ignored));
+  ASSERT_EQ(NS_OK, selected->SetStringProperty("junkscore", "100"_ns));
+  ASSERT_EQ(NS_OK, selected->UpdateKeywords("tag1 tag2 tag1"_ns, true));
+  ASSERT_EQ(NS_OK, selected->UpdateKeywords("tag1"_ns, false));
+  nsCString keywords;
+  ASSERT_EQ(NS_OK, selected->GetStringProperty("keywords", keywords));
+  EXPECT_EQ("tag2"_ns, keywords);
+  // The generic non-live native object is not an owning parser capability.
+  RefPtr<Message> unowned = new Message(location.key);
+  nsCOMPtr<nsIMsgDBHdr> copy;
+  EXPECT_EQ(NS_ERROR_ILLEGAL_VALUE,
+            db->CopyHdrForStore(unowned, true, getter_AddRefs(copy)));
+  EXPECT_FALSE(copy);
+  ASSERT_EQ(NS_OK, db->CopyHdrForStore(selected, true, getter_AddRefs(copy)));
+  nsTArray<nsCString> names;
+  ASSERT_EQ(NS_OK, copy->GetProperties(names));
+  EXPECT_FALSE(names.Contains("uidOnServer"_ns));
+  EXPECT_FALSE(names.Contains("storeToken"_ns));
+  EXPECT_TRUE(names.Contains("empty"_ns));
+  nsCString property;
+  ASSERT_EQ(NS_OK, copy->GetStringProperty("opaque", property));
+  EXPECT_EQ("00042"_ns, property);
+  ASSERT_EQ(NS_OK, copy->GetStringProperty("junkscore", property));
+  EXPECT_EQ("100"_ns, property);
+  nsMsgKey copyKey = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db->StageHdrForOfflineCopy(copy, &copyKey));
+  nsTArray<nsCString> references;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetMessageReferences(copyKey, references));
+  EXPECT_EQ((nsTArray<nsCString>{"parsed@invalid"_ns, "parent@invalid"_ns,
+                                 "parsed@invalid"_ns}),
+            references);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().AbortMessage(copyKey));
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+
+  RefPtr<Message> output;
+  uint32_t publications = 0;
+  RefPtr<DeliveryEarlyMutationListener> listener =
+      new DeliveryEarlyMutationListener;
+  listener->publication = [&](const CapturedMessage& after,
+                              Message* published) {
+    ++publications;
+    EXPECT_EQ(output.get(), published);
+    EXPECT_EQ(location.key, after.id);
+    EXPECT_TRUE(after.flags & nsMsgMessageFlags::Read);
+    EXPECT_TRUE(after.flags & nsMsgMessageFlags::Marked);
+    RefPtr<Message> reentrant;
+    EXPECT_EQ(
+        NS_ERROR_IN_PROGRESS,
+        db->PublishParsedServerHdr(selected, true, getter_AddRefs(reentrant)));
+    EXPECT_FALSE(reentrant);
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, db->AbortParsedServerHdr(selected));
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS, selected->MarkRead(false));
+  };
+  mCore->MessageDB().AddMessageListener(listener);
+  auto remove = MakeScopeExit(
+      [&] { mCore->MessageDB().RemoveMessageListener(listener); });
+  ASSERT_EQ(NS_OK,
+            db->PublishParsedServerHdr(selected, true, getter_AddRefs(output)));
+  ASSERT_TRUE(output);
+  EXPECT_EQ(1u, publications);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+  nsMsgKey physical;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(
+                       mFolder, 73, 4001, physical));
+  EXPECT_EQ(location.key, physical);
+  ASSERT_EQ(NS_OK, selected->GetIsLive(&live));
+  EXPECT_TRUE(live);
+  RefPtr<Message> repeated;
+  EXPECT_EQ(
+      NS_ERROR_ALREADY_INITIALIZED,
+      db->PublishParsedServerHdr(selected, true, getter_AddRefs(repeated)));
+  EXPECT_FALSE(repeated);
+  EXPECT_EQ(1u, publications);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       ParsedServerAdmissionKeepsOwnershipAndTransaction) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("guard-parser@invalid"_ns));
+  RefPtr<ParsedServerHdr> selected;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db->StageParsedServerHdr(parsed, 73, 4001, getter_AddRefs(selected)));
+  ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001));
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db->StageParsedServerHdr(parsed, 73, 4002, getter_AddRefs(selected)));
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  RefPtr<PerFolderDatabase> foreign = new PerFolderDatabase(other, false);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            foreign->StageParsedServerHdr(parsed, 73, 4001,
+                                          getter_AddRefs(selected)));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(
+      NS_ERROR_IN_PROGRESS,
+      db->StageParsedServerHdr(parsed, 73, 4001, getter_AddRefs(selected)));
+  EXPECT_FALSE(selected);
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001,
+                                            getter_AddRefs(selected)));
+  ParsedServerHdr* occupied = selected.get();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->StageParsedServerHdr(parsed, 73, 4001, &occupied));
+  EXPECT_EQ(selected.get(), occupied);
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            parsed->SetSubject("cannot replay parser"_ns));
+  RefPtr<Message> output;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, foreign->PublishParsedServerHdr(
+                                      selected, false, getter_AddRefs(output)));
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, selected->MarkRead(true));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, db->PublishParsedServerHdr(
+                                      selected, false, getter_AddRefs(output)));
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ServerMessageLocation location;
+  ASSERT_EQ(NS_OK, selected->GetLocation(location));
+  RefPtr<Message> existing = new Message(location.key);
+  Message* slot = existing.get();
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->PublishParsedServerHdr(selected, false, &slot));
+  EXPECT_EQ(existing.get(), slot);
+  EXPECT_EQ(NS_ERROR_NULL_POINTER,
+            db->PublishParsedServerHdr(selected, false, nullptr));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            selected->SetUint32Property("uidOnServer", 9));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, selected->SetStoreToken("invented"_ns));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            selected->SetFlags(nsMsgMessageFlags::Offline));
+  ASSERT_EQ(NS_OK, db->PublishParsedServerHdr(selected, false,
+                                              getter_AddRefs(output)));
+  ASSERT_TRUE(output);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, ParsedServerRejectsDuplicateAndRetiredUid) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> first, second;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(first)));
+  ASSERT_EQ(NS_OK, first->SetMessageId("first-parser@invalid"_ns));
+  ASSERT_EQ(NS_OK, first->SetUint32Property("uidOnServer", 4001));
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(second)));
+  ASSERT_EQ(NS_OK, second->SetMessageId("second-parser@invalid"_ns));
+  ASSERT_EQ(NS_OK, second->SetUint32Property("uidOnServer", 4001));
+  RefPtr<ParsedServerHdr> selected, duplicate;
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(first, 73, 4001,
+                                            getter_AddRefs(selected)));
+  EXPECT_EQ(
+      NS_ERROR_ALREADY_INITIALIZED,
+      db->StageParsedServerHdr(second, 73, 4001, getter_AddRefs(duplicate)));
+  EXPECT_FALSE(duplicate);
+  ServerMessageLocation location;
+  ASSERT_EQ(NS_OK, selected->GetLocation(location));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 74));
+  ServerMessageLocation canary = location;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, selected->GetLocation(canary));
+  EXPECT_EQ(location.key, canary.key);
+  EXPECT_EQ(location.epoch, canary.epoch);
+  RefPtr<Message> output;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db->PublishParsedServerHdr(selected, false, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  bool live = true;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(location.key, live));
+  EXPECT_FALSE(live);
+  ASSERT_EQ(NS_OK, db->AbortParsedServerHdr(selected));
+  nsTArray<nsMsgKey> staged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_TRUE(staged.IsEmpty());
+  EXPECT_EQ(NS_ERROR_ABORT, selected->MarkRead(true));
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, ParsedServerMutationFailureRetainsFirstError) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("fault-parser@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001));
+  RefPtr<ParsedServerHdr> selected;
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001,
+                                            getter_AddRefs(selected)));
+  ServerMessageLocation location;
+  ASSERT_EQ(NS_OK, selected->GetLocation(location));
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER delivery_parser_flag_failure BEFORE UPDATE OF "
+          "flags "
+          "ON main.staged_messages BEGIN SELECT RAISE(ABORT,'parser flag failure'); END"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, selected->MarkRead(true));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER delivery_parser_flag_failure"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, selected->MarkRead(false));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            parsed->SetSubject("must not replay"_ns));
+  RefPtr<Message> output;
+  EXPECT_EQ(
+      NS_ERROR_STORAGE_CONSTRAINT,
+      db->PublishParsedServerHdr(selected, false, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  nsTArray<nsMsgKey> staged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_EQ((nsTArray<nsMsgKey>{location.key}), staged);
+  ASSERT_EQ(NS_OK, db->AbortParsedServerHdr(selected));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, selected->MarkRead(false));
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, ParsedServerPublicationFailureDoesNotReplay) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("publish-fault-parser@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001));
+  RefPtr<ParsedServerHdr> selected;
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001,
+                                            getter_AddRefs(selected)));
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER delivery_parser_publish_failure BEFORE INSERT "
+          "ON main.messages BEGIN SELECT RAISE(ABORT,'parser publish failure'); END"_ns));
+  RefPtr<Message> output;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->PublishParsedServerHdr(selected, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER delivery_parser_publish_failure"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->PublishParsedServerHdr(selected, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  ASSERT_EQ(NS_OK, db->AbortParsedServerHdr(selected));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, ParsedServerClosedOwnerKeepsUnpublishedSource) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("closed-parser@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001));
+  RefPtr<ParsedServerHdr> selected;
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001,
+                                            getter_AddRefs(selected)));
+  ServerMessageLocation location;
+  ASSERT_EQ(NS_OK, selected->GetLocation(location));
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, selected->MarkRead(true));
+  RefPtr<Message> output;
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      db->PublishParsedServerHdr(selected, false, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->AbortParsedServerHdr(selected));
+  selected = nullptr;
+  nsTArray<nsMsgKey> staged;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_EQ((nsTArray<nsMsgKey>{location.key}), staged);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, ParsedServerNewIntentPrecedesLegacyPublication) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  nsTArray<nsMsgKey> expectedNew;
+  for (uint32_t action = 0; action < 7; ++action) {
+    nsCOMPtr<nsIMsgDBHdr> parsed;
+    ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+    ASSERT_EQ(NS_OK, parsed->SetMessageId("parser-new@invalid"_ns));
+    ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001 + action));
+    RefPtr<ParsedServerHdr> selected;
+    ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001 + action,
+                                              getter_AddRefs(selected)));
+    uint32_t flags = 0;
+    switch (action) {
+      case 1:
+      case 3:
+      case 4:
+      case 6:
+        // Clearing an already absent raw bit still expresses filter intent.
+        ASSERT_EQ(NS_OK, selected->AndFlags(~nsMsgMessageFlags::New, &flags));
+        if (action == 3) {
+          ASSERT_EQ(NS_OK, selected->OrFlags(nsMsgMessageFlags::New, &flags));
+        } else if (action == 4) {
+          ASSERT_EQ(NS_OK, selected->SetFlags(nsMsgMessageFlags::New));
+        }
+        break;
+      case 2:
+        ASSERT_EQ(NS_OK, selected->SetFlags(nsMsgMessageFlags::Marked));
+        break;
+      case 5:
+        ASSERT_EQ(NS_OK, selected->OrFlags(nsMsgMessageFlags::Marked, &flags));
+        break;
+    }
+    bool expectNew = action == 0 || action == 3 || action == 4 || action == 5;
+    ServerMessageLocation location;
+    ASSERT_EQ(NS_OK, selected->GetLocation(location));
+    RefPtr<Message> output;
+    uint32_t eventCount = listener->events.Length();
+    ASSERT_EQ(NS_OK, db->PublishParsedServerHdr(selected, action != 6,
+                                                getter_AddRefs(output)));
+    ASSERT_TRUE(output);
+    if (expectNew) {
+      expectedNew.AppendElement(location.key);
+    }
+    nsTArray<nsMsgKey> actualNew;
+    ASSERT_EQ(NS_OK, db->GetNewList(actualNew));
+    EXPECT_EQ(expectedNew, actualNew);
+    CapturedMessage stored;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().CaptureMessage(location.key, stored));
+    EXPECT_FALSE(stored.flags & nsMsgMessageFlags::Read);
+    if (action != 6) {
+      ASSERT_EQ(eventCount + 1, listener->events.Length());
+      const auto& event = listener->events.LastElement();
+      EXPECT_EQ('A', event.kind);
+      EXPECT_EQ(location.key, event.key);
+      EXPECT_EQ(expectNew, bool(event.flags & nsMsgMessageFlags::New));
+      EXPECT_FALSE(event.flags & nsMsgMessageFlags::Read);
+      EXPECT_EQ(expectedNew, event.newKeys);
+      if (!expectNew) {
+        EXPECT_FALSE(event.liveFlags & nsMsgMessageFlags::New);
+      }
+    } else {
+      EXPECT_EQ(eventCount, listener->events.Length());
+    }
+  }
+  // Unrelated ordinary native publishers retain their unread-to-New default.
+  RawHdr raw{};
+  raw.messageId = "ordinary-new@invalid"_ns;
+  nsMsgKey ordinary;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolder, raw, true, &ordinary));
+  expectedNew.AppendElement(ordinary);
+  nsTArray<nsMsgKey> actualNew;
+  ASSERT_EQ(NS_OK, db->GetNewList(actualNew));
+  EXPECT_EQ(expectedNew, actualNew);
+  EXPECT_TRUE(listener->events.LastElement().flags & nsMsgMessageFlags::New);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(8));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, ParsedServerNewIntentSurvivesQueuedPublication) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  auto& native = mCore->MessageDB();
+  RefPtr<DeliveryEarlyMutationListener> early =
+      new DeliveryEarlyMutationListener;
+  native.AddMessageListener(early);
+  auto unwatch = MakeScopeExit([&] { native.RemoveMessageListener(early); });
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  RefPtr<DeliveryCapturedLegacyListener> listener =
+      new DeliveryCapturedLegacyListener(db);
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove = MakeScopeExit([&] { db->RemoveListener(listener); });
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("queued-not-new@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001));
+  RefPtr<ParsedServerHdr> selected;
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001,
+                                            getter_AddRefs(selected)));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, selected->AndFlags(~nsMsgMessageFlags::New, &flags));
+  ServerMessageLocation location;
+  ASSERT_EQ(NS_OK, selected->GetLocation(location));
+  RefPtr<Message> output;
+  bool queued = false;
+  uint32_t selectedCallbacks = 0;
+  early->publication = [&](const CapturedMessage& after, Message* live) {
+    if (after.id == location.key) {
+      ++selectedCallbacks;
+      EXPECT_EQ(output.get(), live);
+      EXPECT_FALSE(selected);
+      EXPECT_FALSE(after.flags & nsMsgMessageFlags::New);
+      EXPECT_FALSE(after.flags & nsMsgMessageFlags::Read);
+      return;
+    }
+    ASSERT_FALSE(queued);
+    queued = true;
+    EXPECT_EQ(NS_OK, db->PublishParsedServerHdr(selected, true,
+                                                getter_AddRefs(output)));
+    EXPECT_TRUE(output);
+    EXPECT_EQ(0u, selectedCallbacks);
+    EXPECT_TRUE(listener->events.IsEmpty());
+    RefPtr<Message> repeated;
+    EXPECT_EQ(
+        NS_ERROR_ALREADY_INITIALIZED,
+        db->PublishParsedServerHdr(selected, true, getter_AddRefs(repeated)));
+    EXPECT_FALSE(repeated);
+    // Both caller references can disappear before the queued callback.
+    selected = nullptr;
+    parsed = nullptr;
+  };
+  RawHdr raw{};
+  raw.messageId = "outer-default-new@invalid"_ns;
+  nsMsgKey outer;
+  ASSERT_EQ(NS_OK, native.AddMessage(mFolder, raw, true, &outer));
+  EXPECT_TRUE(queued);
+  EXPECT_EQ(1u, selectedCallbacks);
+  ASSERT_EQ(2u, listener->events.Length());
+  EXPECT_EQ(outer, listener->events[0].key);
+  EXPECT_TRUE(listener->events[0].flags & nsMsgMessageFlags::New);
+  const auto& added = listener->events[1];
+  EXPECT_EQ(location.key, added.key);
+  EXPECT_FALSE(added.flags & nsMsgMessageFlags::New);
+  EXPECT_FALSE(added.liveFlags & nsMsgMessageFlags::New);
+  EXPECT_FALSE(added.flags & nsMsgMessageFlags::Read);
+  EXPECT_EQ((nsTArray<nsMsgKey>{outer}), added.newKeys);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(2));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, ParsedServerNewFailureRetainsCustody) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 73));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(parsed)));
+  ASSERT_EQ(NS_OK, parsed->SetMessageId("not-new-failure@invalid"_ns));
+  ASSERT_EQ(NS_OK, parsed->SetUint32Property("uidOnServer", 4001));
+  RefPtr<ParsedServerHdr> selected;
+  ASSERT_EQ(NS_OK, db->StageParsedServerHdr(parsed, 73, 4001,
+                                            getter_AddRefs(selected)));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, selected->AndFlags(~nsMsgMessageFlags::New, &flags));
+  ServerMessageLocation location;
+  ASSERT_EQ(NS_OK, selected->GetLocation(location));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_not_new_failure BEFORE "
+                       "INSERT ON main.messages BEGIN SELECT "
+                       "RAISE(ABORT,'not new failure'); END"_ns));
+  RefPtr<Message> output;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->PublishParsedServerHdr(selected, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "DROP TRIGGER delivery_not_new_failure"_ns));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            selected->OrFlags(nsMsgMessageFlags::New, &flags));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->PublishParsedServerHdr(selected, true, getter_AddRefs(output)));
+  EXPECT_FALSE(output);
+  nsTArray<nsMsgKey> staged, newKeys;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().ListStagedMessages(mFolder, staged));
+  EXPECT_EQ((nsTArray<nsMsgKey>{location.key}), staged);
+  ASSERT_EQ(NS_OK, db->GetNewList(newKeys));
+  EXPECT_TRUE(newKeys.IsEmpty());
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(0));
+  ASSERT_EQ(NS_OK, db->AbortParsedServerHdr(selected));
+  RawHdr raw{};
+  raw.messageId = "after-not-new-failure@invalid"_ns;
+  nsMsgKey ordinary;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().AddMessage(mFolder, raw, true, &ordinary));
+  ASSERT_EQ(NS_OK, db->GetNewList(newKeys));
+  EXPECT_EQ((nsTArray<nsMsgKey>{ordinary}), newKeys);
+  ASSERT_NO_FATAL_FAILURE(CheckParentBridgeCount(1));
+  CheckNoTransaction();
+}
+
 TEST_F(DeliveryCompleteHeader, FailedAttachmentDoesNotReplay) {
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
   nsCOMPtr<nsIMsgDBHdr> draft;

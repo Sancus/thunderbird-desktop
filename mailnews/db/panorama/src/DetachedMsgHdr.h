@@ -32,6 +32,7 @@ class DetachedMsgHdr : public DecodedSubjectHdr {
  public:
   NS_INLINE_DECL_STATIC_IID(NS_DETACHED_MSG_HDR_IID)
   friend class PerFolderDatabase;
+  friend class ParsedServerHdr;
   DetachedMsgHdr() = delete;
   explicit DetachedMsgHdr(uint64_t folderId) : mFolderId(folderId) {}
 

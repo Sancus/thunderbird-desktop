@@ -7,6 +7,7 @@
 
 #include "DatabaseCore.h"
 #include "FolderDatabase.h"
+#include "Message.h"
 #include "MessageDatabase.h"
 #include "mozilla/RefPtr.h"
 #include "mozilla/WeakPtr.h"
@@ -28,6 +29,47 @@ namespace mozilla::mailnews {
 
 class OfflineOperationUndo;
 struct OfflineUndoCounterpart;
+
+class DetachedMsgHdr;
+class PerFolderDatabase;
+
+#define NS_PARSED_SERVER_HDR_IID \
+  {0x1c541b0d, 0xf213, 0x47dc, {0x9e, 0x24, 0x51, 0x93, 0xd1, 0x61, 0x08, 0x4c}}
+
+// A selected incoming header, not a published folder member until publication.
+// The strong owner and original draft survive parser Clear and copy callbacks.
+class ParsedServerHdr final : public DecodedSubjectHdr {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_PARSED_SERVER_HDR_IID)
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMSGDBHDR
+
+  nsresult GetLocation(ServerMessageLocation& location);
+  nsresult UpdateKeywords(const nsACString& keywords, bool add);
+  nsresult GetExistingThread(nsIMsgThread** thread);
+
+ private:
+  friend class PerFolderDatabase;
+  enum class State { Staged, Publishing, Published, Aborted };
+  ParsedServerHdr(PerFolderDatabase* owner, DetachedMsgHdr* draft,
+                  uint32_t epoch, uint32_t uid);
+  ~ParsedServerHdr();
+  nsresult Check(bool writing = false);
+  nsresult FinishWrite(nsresult rv);
+  nsresult CheckProperty(const char* name) const;
+  nsresult CheckFlags(uint32_t flags) const;
+
+  RefPtr<PerFolderDatabase> mOwner;
+  RefPtr<DetachedMsgHdr> mDraft;
+  RefPtr<Message> mHeader;
+  ServerMessageLocation mLocation;
+  nsCString mSourceId;
+  State mState = State::Staged;
+  nsresult mError = NS_OK;
+  bool mWriting = false;
+  // No explicit New action keeps the ordinary unread publication default.
+  bool mSuppressNew = false;
+};
 class MessageEnumeratorStatementCloser;
 
 class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
@@ -88,6 +130,15 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   nsresult PublishHdrForOfflineCopy(nsIMsgDBHdr* draft, bool notifyLegacy,
                                     Message** liveHeader);
 
+  // Server parser input is distinct from the UID-free offline-copy input.
+  // The null persistent output owns a fresh unpublished physical identity.
+  nsresult StageParsedServerHdr(nsIMsgDBHdr* parsed, uint32_t epoch,
+                                uint32_t uid, ParsedServerHdr** staged);
+  nsresult PublishParsedServerHdr(ParsedServerHdr* staged, bool notifyLegacy,
+                                  Message** liveHeader);
+  // Explicit metadata cleanup only. The caller keeps its primary error/bytes.
+  nsresult AbortParsedServerHdr(ParsedServerHdr* staged);
+
   // Callers own complete metadata and recovery bytes before removal callbacks.
   nsresult RemoveHdrForUndo(nsMsgKey key, RemovedMessage& captured,
                             OfflineOperationUndo* redo = nullptr,
@@ -122,11 +173,18 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
 
  private:
   friend class Message;
+  friend class ParsedServerHdr;
   friend class FolderInfo;
   friend class OfflineOperation;
   friend class MessageEnumerator;
   friend class ThreadEnumerator;
   friend class FilterEnumerator;
+
+  nsresult ValidateParsedServerHdr(ParsedServerHdr& staged,
+                                   bool requireStaged = false);
+  nsresult CheckParsedServerWriteTransaction() const;
+  nsresult CheckParsedServerUid(uint32_t epoch, uint32_t uid,
+                                nsMsgKey ownKey = nsMsgKey_None);
 
   struct UndoDeleteContext;
   UndoDeleteContext* mUndoDeleteContext = nullptr;
@@ -168,6 +226,9 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   bool mForceClosed = false;
   bool mNotifyingGoingAway = false;
   nsTArray<nsMsgKey> mNewList;
+  // Only pending publication callbacks for explicitly not-New parsed headers.
+  // Entries are consumed before legacy fanout, or removed on failure/close.
+  nsTArray<nsMsgKey> mParsedServerNotNew;
   nsTObserverArray<RefPtr<nsIDBChangeListener>> mListeners;
 };
 

@@ -2623,7 +2623,8 @@ static nsresult CopyLocalHdrProperties(nsIMsgDBHdr* destHdr,
         property.EqualsLiteral("msgOffset") ||
         property.EqualsLiteral("messageSize") ||
         property.EqualsLiteral("offlineMessageSize") ||
-        property.EqualsLiteral("lineCount")) {
+        property.EqualsLiteral("lineCount") ||
+        property.EqualsLiteral("uidOnServer")) {
       continue;
     }
     nsAutoCString name(" "_ns);

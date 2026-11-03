@@ -90,6 +90,7 @@
 #  include "DatabaseCore.h"
 #  include "Message.h"
 #  include "PerFolderDatabase.h"
+#  include "nsQueryObject.h"
 #  include "mozilla/AutoRestore.h"
 #  include "nsIFolderLookupService.h"
 #  include "nsImapUrl.h"
@@ -98,6 +99,26 @@
 
 #ifdef MOZ_PANORAMA
 // Owned slots survive synchronous publication and a failed association/commit.
+struct NativeFilterHeader {
+  struct Action {
+    enum class Kind { Flags, Keywords, ThreadFlags, Copy, Forward };
+    Kind kind;
+    int32_t flags = 0;
+    bool add = false;
+    nsCString target;
+    nsCOMPtr<nsIMsgCopyServiceListener> listener;
+    nsCOMPtr<nsIMsgWindow> window;
+    nsCOMPtr<nsIMsgIncomingServer> server;
+  };
+  RefPtr<mozilla::mailnews::ParsedServerHdr> staged;
+  // This persistent output is filled before native publication callbacks.
+  RefPtr<mozilla::mailnews::Message> live;
+  nsCOMPtr<nsIMsgDatabase> database;
+  mozilla::mailnews::ServerMessageLocation location;
+  nsTArray<Action> actions;
+  nsresult error = NS_OK;
+};
+
 struct NativeOfflineCopyEntry {
   nsCOMPtr<nsIMsgDBHdr> draft;
   RefPtr<mozilla::mailnews::Message> live;
@@ -3938,8 +3959,26 @@ nsresult nsImapMailFolder::AddNewImapHeaderToDB(nsCOMPtr<nsIMsgDBHdr>& header,
     if (existing.isOk()) return NS_ERROR_ALREADY_INITIALIZED;
     if (existing.unwrapErr() != NS_ERROR_NOT_AVAILABLE)
       return existing.unwrapErr();
-    nsCOMPtr<nsIMsgDBHdr> draft = header;
-    MOZ_TRY(mDatabase->AttachHdr(draft, true, getter_AddRefs(header)));
+    nsCOMPtr<mozilla::mailnews::ParsedServerHdr> selected =
+        do_QueryInterface(header);
+    if (selected) {
+      NS_ENSURE_TRUE(m_filterHeader && m_filterHeader->staged == selected &&
+                         !m_filterHeader->live,
+                     NS_ERROR_NOT_AVAILABLE);
+      mozilla::mailnews::ServerMessageLocation location;
+      MOZ_TRY(FilterHeaderLocation(location));
+      NS_ENSURE_TRUE(
+          location.uid == expectedUid && location.epoch == expectedEpoch,
+          NS_ERROR_NOT_AVAILABLE);
+      auto* native =
+          static_cast<mozilla::mailnews::PerFolderDatabase*>(mDatabase.get());
+      MOZ_TRY(native->PublishParsedServerHdr(
+          selected, true, getter_AddRefs(m_filterHeader->live)));
+      header = m_filterHeader->live;
+    } else {
+      nsCOMPtr<nsIMsgDBHdr> draft = header;
+      MOZ_TRY(mDatabase->AttachHdr(draft, true, getter_AddRefs(header)));
+    }
   } else
 #endif
   {
@@ -3962,6 +4001,13 @@ nsresult nsImapMailFolder::AddNewImapHeaderToDB(nsCOMPtr<nsIMsgDBHdr>& header,
 // Helper for ParseMsgHdrs().
 nsresult nsImapMailFolder::NormalEndHeaderParseStream(
     nsIImapProtocol* aProtocol, nsIImapUrl* imapUrl) {
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(m_filterHeaderParsing, NS_ERROR_IN_PROGRESS);
+  mozilla::AutoRestore<bool> parsing(m_filterHeaderParsing);
+  m_filterHeaderParsing = mail_panorama_enabled_AtStartup();
+  auto selectedCleanup =
+      mozilla::MakeScopeExit([&] { ClearParsedFilterHeader(); });
+#endif
   nsCOMPtr<nsIMsgDBHdr> newMsgHdr;
   nsresult rv;
   NS_ENSURE_TRUE(m_msgParser, NS_ERROR_NULL_POINTER);
@@ -4004,8 +4050,6 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup()) {
     MOZ_TRY(newMsgHdr->SetUint32Property("uidOnServer", uid));
-    // Body-filter staging is separate from complete header-only publication.
-    NS_ENSURE_FALSE(m_filterListRequiresBody, NS_ERROR_NOT_IMPLEMENTED);
   } else
 #endif
   {
@@ -4030,8 +4074,28 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
     MOZ_TRY(newMsgHdr->SetStringProperty("X-GM-LABELS", labelsValue));
   }
 
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup() &&
+      (mFlags & nsMsgFolderFlags::Inbox || m_applyIncomingFilters)) {
+    NS_ENSURE_FALSE(m_filterHeader, NS_ERROR_IN_PROGRESS);
+    auto selected = mozilla::MakeUnique<NativeFilterHeader>();
+    selected->database = mDatabase;
+    auto* native =
+        static_cast<mozilla::mailnews::PerFolderDatabase*>(mDatabase.get());
+    MOZ_TRY(native->StageParsedServerHdr(newMsgHdr, expectedEpoch, uid,
+                                         getter_AddRefs(selected->staged)));
+    m_filterHeader = std::move(selected);
+    MOZ_TRY(m_filterHeader->staged->GetLocation(m_filterHeader->location));
+    newMsgHdr = m_filterHeader->staged;
+  }
+#endif
   uint32_t messageSize;
   MOZ_TRY(newMsgHdr->GetMessageSize(&messageSize));
+#ifdef MOZ_PANORAMA
+  uint32_t parsedFlags = 0;
+  if (m_filterHeader) MOZ_TRY(newMsgHdr->GetFlags(&parsedFlags));
+  const bool parsedWasNew = parsedFlags & nsMsgMessageFlags::New;
+#endif
   m_msgMovedByFilter = false;
   m_filterIdentityRefused = false;
 
@@ -4107,11 +4171,6 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
         bool isDup;
         server->IsNewHdrDuplicate(newMsgHdr, &isDup);
         if (isDup) {
-#ifdef MOZ_PANORAMA
-          // These actions need a published physical source and epoch guard.
-          NS_ENSURE_FALSE(mail_panorama_enabled_AtStartup(),
-                          NS_ERROR_NOT_AVAILABLE);
-#endif
           // we want to do something similar to applying filter hits.
           // if a dup is marked read, it shouldn't trigger biff.
           // Same for deleting it or moving it to trash.
@@ -4121,8 +4180,16 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
               newMsgHdr->OrFlags(
                   nsMsgMessageFlags::Read | nsMsgMessageFlags::IMAPDeleted,
                   &newFlags);
-              StoreImapFlags(kImapMsgSeenFlag | kImapMsgDeletedFlag, true,
-                             {m_curMsgUid}, nullptr);
+#ifdef MOZ_PANORAMA
+              if (m_filterHeader) {
+                MOZ_TRY(StoreFilterFlags(kImapMsgSeenFlag | kImapMsgDeletedFlag,
+                                         true, m_filterHeader->location.key));
+              } else
+#endif
+              {
+                MOZ_TRY(StoreImapFlags(kImapMsgSeenFlag | kImapMsgDeletedFlag,
+                                       true, {m_curMsgUid}, nullptr));
+              }
               m_msgMovedByFilter = true;
             } break;
             case nsIMsgIncomingServer::moveDupsToTrash: {
@@ -4139,12 +4206,29 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
             case nsIMsgIncomingServer::markDupsRead: {
               uint32_t newFlags;
               newMsgHdr->OrFlags(nsMsgMessageFlags::Read, &newFlags);
-              StoreImapFlags(kImapMsgSeenFlag, true, {m_curMsgUid}, nullptr);
+#ifdef MOZ_PANORAMA
+              if (m_filterHeader) {
+                MOZ_TRY(StoreFilterFlags(kImapMsgSeenFlag, true,
+                                         m_filterHeader->location.key));
+              } else
+#endif
+              {
+                MOZ_TRY(StoreImapFlags(kImapMsgSeenFlag, true, {m_curMsgUid},
+                                       nullptr));
+              }
             } break;
           }
-          int32_t numNewMessages;
-          GetNumNewMessages(false, &numNewMessages);
-          SetNumNewMessages(numNewMessages - 1);
+#ifdef MOZ_PANORAMA
+          if (m_filterHeader) {
+            uint32_t flags;
+            MOZ_TRY(newMsgHdr->AndFlags(~nsMsgMessageFlags::New, &flags));
+          } else
+#endif
+          {
+            int32_t numNewMessages;
+            GetNumNewMessages(false, &numNewMessages);
+            SetNumNewMessages(numNewMessages - 1);
+          }
         }
       }
       rv = m_msgParser->GetAllHeaders(&headers, &headersSize);
@@ -4176,9 +4260,31 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
     }
   }
   // here we need to tweak flags from uid state..
-  if (mDatabase && (!m_msgMovedByFilter || ShowDeletedMessages())) {
+  bool publishHeader = !m_msgMovedByFilter || ShowDeletedMessages();
+#ifdef MOZ_PANORAMA
+  // Copies and moves need this selected physical source. Publish only after
+  // all header filters succeeded, then let the existing copy guards settle it.
+  publishHeader = publishHeader || m_filterHeader;
+#endif
+  if (mDatabase && publishHeader) {
+#ifdef MOZ_PANORAMA
+    bool suppressParsedNew = false;
+    if (m_filterHeader && parsedWasNew) {
+      uint32_t flags;
+      MOZ_TRY(newMsgHdr->GetFlags(&flags));
+      suppressParsedNew = !(flags & nsMsgMessageFlags::New);
+    }
+#endif
     MOZ_TRY(AddNewImapHeaderToDB(newMsgHdr, expectedEpoch, uid));
 #ifdef MOZ_PANORAMA
+    if (suppressParsedNew) {
+      // Settle an actual New-to-not-New filter decision once after publication.
+      // A deferred delete only counts a source that still had New when queued.
+      int32_t numNewMessages;
+      MOZ_TRY(GetNumNewMessages(false, &numNewMessages));
+      MOZ_TRY(SetNumNewMessages(numNewMessages - 1));
+      MOZ_TRY(CheckWithNewMessagesStatus(false));
+    }
     if (mail_panorama_enabled_AtStartup()) {
       nsCString origin, score;
       MOZ_TRY(newMsgHdr->GetStringProperty("junkscoreorigin", origin));
@@ -4196,6 +4302,11 @@ nsresult nsImapMailFolder::NormalEndHeaderParseStream(
 #endif
   }
 
+#ifdef MOZ_PANORAMA
+  if (m_filterHeader) {
+    MOZ_TRY(StartParsedFilterActions());
+  }
+#endif
   mFolderSize += messageSize;
   if (dbFolderInfo && raisesHighWater) {
     MOZ_TRY(
@@ -4392,10 +4503,30 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
   nsresult rv = NS_OK;
 
   nsCOMPtr<nsIMsgDBHdr> msgHdr;
-  if (m_filterListRequiresBody)
-    GetMessageHeader(m_curMsgUid, getter_AddRefs(msgHdr));
-  else if (m_msgParser)
-    m_msgParser->GetNewMsgHdr(getter_AddRefs(msgHdr));
+  if (m_filterListRequiresBody) {
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      NS_ENSURE_TRUE(m_filterBodySource && m_filterBodyHeader,
+                     NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(
+          ValidateFilterBodySource(*m_filterBodySource, m_filterBodyHeader));
+      msgHdr = m_filterBodyHeader;
+    } else
+#endif
+    {
+      MOZ_TRY(GetMessageHeader(m_curMsgUid, getter_AddRefs(msgHdr)));
+    }
+  }
+#ifdef MOZ_PANORAMA
+  else if (mail_panorama_enabled_AtStartup() && m_filterHeader) {
+    mozilla::mailnews::ServerMessageLocation location;
+    MOZ_TRY(FilterHeaderLocation(location));
+    msgHdr = m_filterHeader->staged;
+  }
+#endif
+  else if (m_msgParser) {
+    MOZ_TRY(m_msgParser->GetNewMsgHdr(getter_AddRefs(msgHdr)));
+  }
   NS_ENSURE_TRUE(msgHdr,
                  NS_ERROR_NULL_POINTER);  // fatal error, cannot apply filters
 
@@ -4408,9 +4539,9 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
   uint32_t numActions = filterActionList.Length();
 
   nsCString msgId;
-  msgHdr->GetMessageId(msgId);
+  MOZ_TRY(msgHdr->GetMessageId(msgId));
   nsMsgKey msgKey;
-  msgHdr->GetMessageKey(&msgKey);
+  MOZ_TRY(msgHdr->GetMessageKey(&msgKey));
   MOZ_LOG(FILTERLOGMODULE, LogLevel::Info,
           ("(Imap) Applying %" PRIu32
            " filter actions on message with key %" PRIu32,
@@ -4426,6 +4557,49 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
 
   rv = GetDatabase();
   NS_ENSURE_SUCCESS(rv, rv);
+
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::ParsedServerHdr> staged = do_QueryObject(msgHdr);
+#else
+  const bool staged = false;
+#endif
+  auto validateSource = [&]() -> nsresult {
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      if (staged) {
+        mozilla::mailnews::ServerMessageLocation location;
+        return FilterHeaderLocation(location);
+      }
+      NS_ENSURE_TRUE(m_filterBodySource, NS_ERROR_NOT_AVAILABLE);
+      return ValidateFilterBodySource(*m_filterBodySource, msgHdr);
+    }
+#endif
+    return NS_OK;
+  };
+  auto markRead = [&](bool read) -> nsresult {
+    return staged ? msgHdr->MarkRead(read)
+                  : mDatabase->MarkRead(msgKey, read, nullptr);
+  };
+  auto changeFlags = [&](uint32_t flags, bool set) -> nsresult {
+    uint32_t result;
+    return set ? msgHdr->OrFlags(flags, &result)
+               : msgHdr->AndFlags(~flags, &result);
+  };
+  auto storeFlags = [&](int32_t flags, bool add) -> nsresult {
+#ifdef MOZ_PANORAMA
+    return StoreFilterFlags(flags, add, msgKey);
+#else
+    return StoreImapFlags(flags, add, {msgKey}, nullptr);
+#endif
+  };
+  auto suppressMdn = [&]() -> nsresult {
+    if (staged) {
+      MOZ_TRY(changeFlags(nsMsgMessageFlags::MDNReportNeeded, false));
+      return changeFlags(nsMsgMessageFlags::MDNReportSent, true);
+    }
+    MOZ_TRY(mDatabase->MarkMDNNeeded(msgKey, false, nullptr));
+    return mDatabase->MarkMDNSent(msgKey, true, nullptr);
+  };
 
   nsresult finalResult = NS_OK;  // result of all actions
   for (uint32_t actionIndex = 0; actionIndex < numActions; actionIndex++) {
@@ -4443,9 +4617,14 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
       continue;
     }
 
-    rv = NS_OK;  // result of the current action
+    rv = validateSource();
+    if (NS_FAILED(rv)) {
+      if (NS_SUCCEEDED(finalResult)) finalResult = rv;
+      break;
+    }
     nsMsgRuleActionType actionType;
-    if (NS_SUCCEEDED(filterAction->GetType(&actionType))) {
+    rv = filterAction->GetType(&actionType);
+    if (NS_SUCCEEDED(rv)) {
       MOZ_LOG(FILTERLOGMODULE, LogLevel::Info,
               ("(Imap) Running filter action at index %" PRIu32
                ", action type = %i",
@@ -4478,7 +4657,11 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
       }
 
       uint32_t msgFlags;
-      msgHdr->GetFlags(&msgFlags);
+      rv = msgHdr->GetFlags(&msgFlags);
+      if (NS_FAILED(rv)) {
+        if (NS_SUCCEEDED(finalResult)) finalResult = rv;
+        continue;
+      }
       bool isRead = (msgFlags & nsMsgMessageFlags::Read);
 
       switch (actionType) {
@@ -4504,10 +4687,12 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
               *applyMore = false;
               break;
             }
-            mDatabase->MarkRead(msgKey, true, nullptr);
-            mDatabase->MarkImapDeleted(msgKey, true, nullptr);
-            rv = StoreImapFlags(kImapMsgSeenFlag | kImapMsgDeletedFlag, true,
-                                {msgKey}, nullptr);
+            rv = markRead(true);
+            if (NS_FAILED(rv)) break;
+            rv = staged ? changeFlags(nsMsgMessageFlags::IMAPDeleted, true)
+                        : mDatabase->MarkImapDeleted(msgKey, true, nullptr);
+            if (NS_FAILED(rv)) break;
+            rv = storeFlags(kImapMsgSeenFlag | kImapMsgDeletedFlag, true);
             if (NS_FAILED(rv)) break;
             // this will prevent us from adding the header to the db.
             m_msgMovedByFilter = true;
@@ -4517,18 +4702,20 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
           // note that delete falls through to move.
           [[fallthrough]];
         case nsMsgFilterAction::MoveToFolder: {
-          // if moving to a different file, do it.
+          // A no-Trash Delete has already queued its flags and has no move
+          // target.
           nsCString uri;
           rv = GetURI(uri);
           if (NS_FAILED(rv)) break;
 
-          if (!actionTargetFolderUri.Equals(uri)) {
+          if (!actionTargetFolderUri.IsEmpty() &&
+              !actionTargetFolderUri.Equals(uri)) {
             msgHdr->GetFlags(&msgFlags);
             if (msgFlags & nsMsgMessageFlags::MDNReportNeeded && !isRead) {
-              mDatabase->MarkMDNNeeded(msgKey, false, nullptr);
-              mDatabase->MarkMDNSent(msgKey, true, nullptr);
+              rv = suppressMdn();
+              if (NS_FAILED(rv)) break;
             }
-            nsresult rv = MoveIncorporatedMessage(
+            rv = MoveIncorporatedMessage(
                 msgHdr, mDatabase, actionTargetFolderUri, filter, msgWindow);
             if (NS_SUCCEEDED(rv)) {
               m_msgMovedByFilter = true;
@@ -4554,8 +4741,8 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
             // we probably want to suppress them only on the copies.
             msgHdr->GetFlags(&msgFlags);
             if (msgFlags & nsMsgMessageFlags::MDNReportNeeded && !isRead) {
-              mDatabase->MarkMDNNeeded(msgKey, false, nullptr);
-              mDatabase->MarkMDNSent(msgKey, true, nullptr);
+              rv = suppressMdn();
+              if (NS_FAILED(rv)) break;
             }
 
             // We register the copy before resolving the target folder so a
@@ -4581,6 +4768,19 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
               self->FilterCopyCompleted(msgKey, status);
               return NS_OK;
             };
+#ifdef MOZ_PANORAMA
+            if (staged) {
+              // An ordinary copy needs a published source. Retain its existing
+              // listener and input until the original header success boundary.
+              NativeFilterHeader::Action copy;
+              copy.kind = NativeFilterHeader::Action::Kind::Copy;
+              copy.target = actionTargetFolderUri;
+              copy.listener = copyListener;
+              copy.window = msgWindow;
+              m_filterHeader->actions.AppendElement(std::move(copy));
+              break;
+            }
+#endif
             nsCOMPtr<nsIMsgFolder> dstFolder;
             rv = GetExistingFolder(actionTargetFolderUri,
                                    getter_AddRefs(dstFolder));
@@ -4599,51 +4799,81 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
           }
         } break;
         case nsMsgFilterAction::MarkRead: {
-          mDatabase->MarkRead(msgKey, true, nullptr);
-          rv = StoreImapFlags(kImapMsgSeenFlag, true, {msgKey}, nullptr);
+          if (NS_SUCCEEDED(rv)) rv = markRead(true);
+          if (NS_SUCCEEDED(rv)) rv = storeFlags(kImapMsgSeenFlag, true);
           msgIsNew = false;
         } break;
         case nsMsgFilterAction::MarkUnread: {
-          mDatabase->MarkRead(msgKey, false, nullptr);
-          rv = StoreImapFlags(kImapMsgSeenFlag, false, {msgKey}, nullptr);
+          rv = markRead(false);
+          if (NS_SUCCEEDED(rv)) rv = storeFlags(kImapMsgSeenFlag, false);
           msgIsNew = true;
         } break;
         case nsMsgFilterAction::MarkFlagged: {
-          mDatabase->MarkMarked(msgKey, true, nullptr);
-          rv = StoreImapFlags(kImapMsgFlaggedFlag, true, {msgKey}, nullptr);
+          rv = staged ? msgHdr->MarkFlagged(true)
+                      : mDatabase->MarkMarked(msgKey, true, nullptr);
+          if (NS_SUCCEEDED(rv)) rv = storeFlags(kImapMsgFlaggedFlag, true);
         } break;
         case nsMsgFilterAction::KillThread:
         case nsMsgFilterAction::WatchThread: {
           nsCOMPtr<nsIMsgThread> msgThread;
-          nsMsgKey threadKey;
-          mDatabase->GetThreadContainingMsgHdr(msgHdr,
-                                               getter_AddRefs(msgThread));
-          if (msgThread) {
-            msgThread->GetThreadKey(&threadKey);
-            if (actionType == nsMsgFilterAction::KillThread)
-              rv = mDatabase->MarkThreadIgnored(msgThread, threadKey, true,
-                                                nullptr);
-            else
-              rv = mDatabase->MarkThreadWatched(msgThread, threadKey, true,
-                                                nullptr);
-          } else {
-            if (actionType == nsMsgFilterAction::KillThread)
-              rv = msgHdr->SetUint32Property("ProtoThreadFlags",
-                                             nsMsgMessageFlags::Ignored);
-            else
-              rv = msgHdr->SetUint32Property("ProtoThreadFlags",
-                                             nsMsgMessageFlags::Watched);
+#ifdef MOZ_PANORAMA
+          if (staged) {
+            rv = staged->GetExistingThread(getter_AddRefs(msgThread));
+            if (NS_FAILED(rv)) break;
+            const uint32_t flag = actionType == nsMsgFilterAction::KillThread
+                                      ? nsMsgMessageFlags::Ignored
+                                      : nsMsgMessageFlags::Watched;
+            // The current physical key is still unpublished, even when its
+            // References have already resolved to an existing thread. Consume
+            // this intent on the final thread at the publication boundary.
+            rv = msgHdr->SetUint32Property("ProtoThreadFlags", flag);
+            if (NS_SUCCEEDED(rv) && msgThread) {
+              // Preserve the existing action's opposite-bit clearing and
+              // notification through the original live publication output.
+              NativeFilterHeader::Action operation;
+              operation.kind = NativeFilterHeader::Action::Kind::ThreadFlags;
+              operation.flags = flag;
+              m_filterHeader->actions.AppendElement(std::move(operation));
+            }
+          } else
+#endif
+          {
+            rv = mDatabase->GetThreadContainingMsgHdr(
+                msgHdr, getter_AddRefs(msgThread));
+            if (NS_FAILED(rv)) break;
+            if (msgThread) {
+              nsMsgKey threadKey;
+              rv = msgThread->GetThreadKey(&threadKey);
+              if (NS_FAILED(rv)) break;
+#ifdef MOZ_PANORAMA
+              if (mail_panorama_enabled_AtStartup()) threadKey = msgKey;
+#endif
+              if (actionType == nsMsgFilterAction::KillThread)
+                rv = mDatabase->MarkThreadIgnored(msgThread, threadKey, true,
+                                                  nullptr);
+              else
+                rv = mDatabase->MarkThreadWatched(msgThread, threadKey, true,
+                                                  nullptr);
+            } else {
+              if (actionType == nsMsgFilterAction::KillThread)
+                rv = msgHdr->SetUint32Property("ProtoThreadFlags",
+                                               nsMsgMessageFlags::Ignored);
+              else
+                rv = msgHdr->SetUint32Property("ProtoThreadFlags",
+                                               nsMsgMessageFlags::Watched);
+            }
           }
           if (actionType == nsMsgFilterAction::KillThread) {
-            mDatabase->MarkRead(msgKey, true, nullptr);
-            rv = StoreImapFlags(kImapMsgSeenFlag, true, {msgKey}, nullptr);
+            if (NS_SUCCEEDED(rv)) rv = markRead(true);
+            if (NS_SUCCEEDED(rv)) rv = storeFlags(kImapMsgSeenFlag, true);
             msgIsNew = false;
           }
         } break;
         case nsMsgFilterAction::KillSubthread: {
-          mDatabase->MarkKilled(msgKey, true, nullptr);
-          mDatabase->MarkRead(msgKey, true, nullptr);
-          rv = StoreImapFlags(kImapMsgSeenFlag, true, {msgKey}, nullptr);
+          rv = staged ? changeFlags(nsMsgMessageFlags::Ignored, true)
+                      : mDatabase->MarkKilled(msgKey, true, nullptr);
+          if (NS_SUCCEEDED(rv)) rv = markRead(true);
+          if (NS_SUCCEEDED(rv)) rv = storeFlags(kImapMsgSeenFlag, true);
           msgIsNew = false;
         } break;
         case nsMsgFilterAction::ChangePriority: {
@@ -4654,14 +4884,30 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
         case nsMsgFilterAction::AddTag: {
           nsCString keyword;
           filterAction->GetStrValue(keyword);
-          rv = AddKeywordsToMessages({&*msgHdr}, keyword);
+#ifdef MOZ_PANORAMA
+          if (staged) {
+            rv = staged->UpdateKeywords(keyword, true);
+            if (NS_FAILED(rv)) break;
+            mozilla::mailnews::ServerMessageLocation location;
+            rv = FilterHeaderLocation(location);
+            if (NS_FAILED(rv)) break;
+            NativeFilterHeader::Action operation;
+            operation.kind = NativeFilterHeader::Action::Kind::Keywords;
+            operation.target = keyword;
+            m_filterHeader->actions.AppendElement(std::move(operation));
+            rv = NS_OK;
+          } else
+#endif
+          {
+            rv = AddKeywordsToMessages({&*msgHdr}, keyword);
+          }
         } break;
         case nsMsgFilterAction::JunkScore: {
           nsAutoCString junkScoreStr;
           int32_t junkScore;
           filterAction->GetJunkScore(&junkScore);
 #ifdef MOZ_PANORAMA
-          if (mail_panorama_enabled_AtStartup() && msgKey == nsMsgKey_None) {
+          if (staged) {
             junkScoreStr.AppendInt(junkScore);
             rv = msgHdr->SetStringProperty("junkscore", junkScoreStr);
             if (NS_SUCCEEDED(rv))
@@ -4679,11 +4925,11 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
             nsTArray<nsMsgKey>* keysToClassify = m_moveCoalescer->GetKeyBucket(
                 (junkScore == nsIJunkMailPlugin::IS_SPAM_SCORE) ? 0 : 1);
             NS_ASSERTION(keysToClassify, "error getting key bucket");
-            if (keysToClassify && msgKey != nsMsgKey_None)
+            if (keysToClassify && msgKey != nsMsgKey_None && !staged)
               keysToClassify->AppendElement(msgKey);
             if (msgIsNew && junkScore == nsIJunkMailPlugin::IS_SPAM_SCORE) {
               msgIsNew = false;
-              if (msgKey == nsMsgKey_None) {
+              if (msgKey == nsMsgKey_None || staged) {
                 rv = msgHdr->AndFlags(~nsMsgMessageFlags::New, &msgFlags);
               } else {
                 rv = mDatabase->MarkNotNew(msgKey, nullptr);
@@ -4694,7 +4940,8 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
               // are active, but we are not going to mark it read in this
               // action, preferring to leave the choice to the user.
               // So correct numNewMessages.
-              if (m_filterListRequiresBody) {
+              if (m_filterListRequiresBody &&
+                  !mail_panorama_enabled_AtStartup()) {
                 msgHdr->GetFlags(&msgFlags);
                 if (!(msgFlags & nsMsgMessageFlags::Read)) {
                   int32_t numNewMessages;
@@ -4713,6 +4960,17 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
           rv = GetServer(getter_AddRefs(server));
           if (NS_FAILED(rv)) break;
           if (!forwardTo.IsEmpty()) {
+#ifdef MOZ_PANORAMA
+            if (staged) {
+              NativeFilterHeader::Action operation;
+              operation.kind = NativeFilterHeader::Action::Kind::Forward;
+              operation.target = forwardTo;
+              operation.window = msgWindow;
+              operation.server = server;
+              m_filterHeader->actions.AppendElement(std::move(operation));
+              break;
+            }
+#endif
             nsCOMPtr<nsIMsgComposeService> compService =
                 mozilla::components::Compose::Service();
             rv = compService->ForwardMessage(
@@ -4776,7 +5034,7 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
       }
     }
     if (NS_FAILED(rv)) {
-      finalResult = rv;
+      if (NS_SUCCEEDED(finalResult)) finalResult = rv;
       MOZ_LOG(FILTERLOGMODULE, LogLevel::Error,
               ("(Imap) Action execution failed with error: %" PRIx32,
                static_cast<uint32_t>(rv)));
@@ -4789,14 +5047,26 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
               ("(Imap) Action execution succeeded"));
     }
   }
+  rv = validateSource();
+  if (NS_FAILED(rv)) {
+    return NS_FAILED(finalResult) ? finalResult : rv;
+  }
   if (!msgIsNew) {
     int32_t numNewMessages;
     GetNumNewMessages(false, &numNewMessages);
     // When database notifications are active, new counts will be reset
     // to zero in nsMsgDBFolder::SendFlagNotifications by the call to
     // SetBiffState(nsMsgBiffState_NoMail), so don't repeat them here.
-    if (!m_filterListRequiresBody) SetNumNewMessages(--numNewMessages);
-    if (mDatabase) mDatabase->MarkNotNew(msgKey, nullptr);
+    if (staged) {
+      nsresult rv = changeFlags(nsMsgMessageFlags::New, false);
+      if (NS_SUCCEEDED(finalResult)) finalResult = rv;
+    } else {
+      if (!m_filterListRequiresBody) SetNumNewMessages(--numNewMessages);
+      if (mDatabase) {
+        nsresult rv = mDatabase->MarkNotNew(msgKey, nullptr);
+        if (NS_SUCCEEDED(finalResult)) finalResult = rv;
+      }
+    }
     MOZ_LOG(FILTERLOGMODULE, LogLevel::Info,
             ("(Imap) Message will not be marked new"));
   }
@@ -5182,11 +5452,24 @@ nsresult nsImapMailFolder::MoveIncorporatedMessage(
     nsIMsgDBHdr* mailHdr, nsIMsgDatabase* sourceDB,
     const nsACString& destFolderUri, nsIMsgFilter* filter,
     nsIMsgWindow* msgWindow) {
-  nsresult rv;
+  nsresult rv = NS_OK;
   if (m_moveCoalescer) {
     nsCOMPtr<nsIMsgFolder> destIFolder;
-    rv = GetOrCreateFolder(destFolderUri, getter_AddRefs(destIFolder));
-    NS_ENSURE_SUCCESS(rv, rv);
+    if (mail_panorama_enabled_AtStartup()) {
+      MOZ_TRY(FindFolder(destFolderUri, getter_AddRefs(destIFolder)));
+      if (!destIFolder) {
+        if (filter) {
+          MOZ_TRY(filter->SetEnabled(false));
+          NS_ENSURE_STATE(m_filterList);
+          MOZ_TRY(m_filterList->SaveToDefaultFile());
+          MOZ_TRY(ThrowAlertMsg("filterDisabled", msgWindow));
+        }
+        return NS_MSG_NOT_A_MAIL_FOLDER;
+      }
+    } else {
+      rv = GetOrCreateFolder(destFolderUri, getter_AddRefs(destIFolder));
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
 
     if (destIFolder) {
       // check if the destination is a real folder (by checking for null parent)
@@ -5555,10 +5838,30 @@ nsImapMailFolder::ParseAdoptedMsgLine(const char* adoptedMessageLine,
     rv = db->GetMsgHdrForKey(msgKey, getter_AddRefs(m_offlineHeader));
     NS_ENSURE_SUCCESS(rv, rv);
 
+#ifdef MOZ_PANORAMA
+    mozilla::Maybe<mozilla::mailnews::ServerMessageLocation> filterSource;
+    if (mail_panorama_enabled_AtStartup() && m_filterListRequiresBody) {
+      mozilla::mailnews::ServerMessageLocation source;
+      MOZ_TRY(GetId(&source.folderId));
+      source.key = msgKey;
+      source.uid = uidOfMessage;
+      nsCOMPtr<nsIDBFolderInfo> info;
+      MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+      NS_ENSURE_STATE(info);
+      MOZ_TRY(info->GetImapUidValidity(&source.epoch));
+      NS_ENSURE_TRUE(source.epoch && source.epoch == m_uidValidity,
+                     NS_ERROR_NOT_AVAILABLE);
+      filterSource.emplace(source);
+    }
+#endif
     // StartNewOfflineMessage() sets up m_tempMessageStream and
     // m_tempMessageStreamBytesWritten.
     rv = StartNewOfflineMessage();
     NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+    m_filterBodySource = filterSource;
+    m_filterBodyDatabase = filterSource ? db.get() : nullptr;
+#endif
     m_curMsgUid = uidOfMessage;
   } else {
     // Continuing an existing message.
@@ -5590,7 +5893,194 @@ void nsImapMailFolder::EndOfflineDownload() {
     if (mDatabase) mDatabase->Commit(nsMsgDBCommitType::kLargeCommit);
   }
   m_offlineHeader = nullptr;
+#ifdef MOZ_PANORAMA
+  if (!m_filterBodyFinishing) {
+    if (m_filterBodySource) m_curMsgUid = 0;
+    m_filterBodySource.reset();
+    m_filterBodyDatabase = nullptr;
+    m_filterBodyHeader = nullptr;
+  }
+#endif
 }
+
+#ifdef MOZ_PANORAMA
+nsresult nsImapMailFolder::FilterHeaderLocation(
+    mozilla::mailnews::ServerMessageLocation& location) {
+  NS_ENSURE_TRUE(m_filterHeader && m_filterHeader->staged,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(GetDatabase());
+  NS_ENSURE_TRUE(mDatabase == m_filterHeader->database, NS_ERROR_NOT_AVAILABLE);
+  mozilla::mailnews::ServerMessageLocation selected;
+  MOZ_TRY(m_filterHeader->staged->GetLocation(selected));
+  uint64_t folderId;
+  MOZ_TRY(GetId(&folderId));
+  const auto& expected = m_filterHeader->location;
+  NS_ENSURE_TRUE(
+      selected.folderId == folderId && selected.key == expected.key &&
+          selected.uid == expected.uid && selected.epoch == expected.epoch &&
+          selected.epoch == m_uidValidity,
+      NS_ERROR_NOT_AVAILABLE);
+  location = selected;
+  return NS_OK;
+}
+
+nsresult nsImapMailFolder::StoreFilterFlags(int32_t flags, bool add,
+                                            nsMsgKey key) {
+  if (m_filterHeader && key == m_filterHeader->location.key) {
+    mozilla::mailnews::ServerMessageLocation location;
+    MOZ_TRY(FilterHeaderLocation(location));
+    NativeFilterHeader::Action operation;
+    operation.kind = NativeFilterHeader::Action::Kind::Flags;
+    operation.flags = flags;
+    operation.add = add;
+    m_filterHeader->actions.AppendElement(std::move(operation));
+    return NS_OK;
+  }
+  return StoreImapFlags(flags, add, {key}, nullptr);
+}
+
+nsresult nsImapMailFolder::StartParsedFilterActions() {
+  NS_ENSURE_TRUE(m_filterHeader && m_filterHeader->live,
+                 NS_ERROR_NOT_AVAILABLE);
+  // Use the exact native output; there is no post-publication header lookup.
+  // Detach these original ordered inputs before service callbacks can reenter.
+  nsTArray<NativeFilterHeader::Action> actions;
+  actions.SwapElements(m_filterHeader->actions);
+  RefPtr<nsIMsgDBHdr> header = m_filterHeader->live;
+  if (m_filterCopyState) {
+    for (auto& source : m_filterCopyState->mHeaders) {
+      if (source == m_filterHeader->staged) source = header;
+    }
+    for (auto& deletion : m_filterCopyState->mDeferredDeletes) {
+      if (deletion.mHeader == m_filterHeader->staged) deletion.mHeader = header;
+    }
+  }
+  mozilla::mailnews::ServerMessageLocation location;
+  nsresult sourceError = FilterHeaderLocation(location);
+  nsresult firstError = sourceError;
+  for (const auto& operation : actions) {
+    if (NS_SUCCEEDED(sourceError)) {
+      sourceError = FilterHeaderLocation(location);
+    }
+    nsresult rv = sourceError;
+    if (NS_SUCCEEDED(rv)) {
+      switch (operation.kind) {
+        case NativeFilterHeader::Action::Kind::Flags:
+          rv = StoreImapFlags(operation.flags, operation.add, {location.key},
+                              nullptr);
+          break;
+        case NativeFilterHeader::Action::Kind::Keywords:
+          rv = AddKeywordsToMessages({header.get()}, operation.target);
+          break;
+        case NativeFilterHeader::Action::Kind::ThreadFlags:
+          rv = [&]() -> nsresult {
+            nsCOMPtr<nsIMsgThread> thread;
+            MOZ_TRY(mDatabase->GetThreadContainingMsgHdr(
+                header, getter_AddRefs(thread)));
+            NS_ENSURE_STATE(thread);
+            return operation.flags == nsMsgMessageFlags::Ignored
+                       ? mDatabase->MarkThreadIgnored(thread, location.key,
+                                                      true, nullptr)
+                       : mDatabase->MarkThreadWatched(thread, location.key,
+                                                      true, nullptr);
+          }();
+          break;
+        case NativeFilterHeader::Action::Kind::Forward: {
+          nsCOMPtr<nsIMsgComposeService> service =
+              mozilla::components::Compose::Service();
+          rv = service->ForwardMessage(
+              NS_ConvertUTF8toUTF16(operation.target), header, operation.window,
+              operation.server, nsIMsgComposeService::kForwardAsDefault);
+          break;
+        }
+        case NativeFilterHeader::Action::Kind::Copy:
+          rv = [&]() -> nsresult {
+            nsCOMPtr<nsIMsgFolder> destination;
+            MOZ_TRY(GetExistingFolder(operation.target,
+                                      getter_AddRefs(destination)));
+            NS_ENSURE_STATE(destination);
+            nsCOMPtr<nsIMsgCopyService> service =
+                mozilla::components::Copy::Service();
+            NS_ENSURE_STATE(service);
+            return service->CopyMessages(this, {header.get()}, destination,
+                                         false, operation.listener,
+                                         operation.window, false);
+          }();
+          break;
+      }
+    }
+    if (NS_FAILED(rv)) {
+      if (NS_SUCCEEDED(firstError)) firstError = rv;
+      m_filterHeader->error = firstError;
+      if (m_moveCoalescer)
+        m_moveCoalescer->RemoveMove(m_filterHeader->location.key);
+      if (operation.kind == NativeFilterHeader::Action::Kind::Copy) {
+        // Existing listener custody handles a synchronous OnStopCopy too.
+        (void)operation.listener->OnStopCopy(rv);
+      }
+    }
+  }
+  m_filterHeader->error = firstError;
+  return firstError;
+}
+
+void nsImapMailFolder::ClearParsedFilterHeader() {
+  auto selected = std::move(m_filterHeader);
+  if (!selected) return;
+  if (!selected->actions.IsEmpty() || !selected->live ||
+      NS_FAILED(selected->error)) {
+    const nsMsgKey key = selected->location.key;
+    if (m_moveCoalescer) m_moveCoalescer->RemoveMove(key);
+    if (!selected->live && m_filterCopyState) {
+      // Never let failure restoration turn an unpublished source into a row.
+      m_filterCopyState->mDeferredDeletes.RemoveElementsBy(
+          [&](const auto& entry) { return entry.mHeader == selected->staged; });
+      m_filterCopyState->mHeaders.RemoveElement(selected->staged);
+    }
+    for (const auto& operation : selected->actions) {
+      if (operation.kind == NativeFilterHeader::Action::Kind::Copy) {
+        (void)operation.listener->OnStopCopy(NS_ERROR_ABORT);
+      }
+    }
+  }
+  if (!selected->live) {
+    auto* database = static_cast<mozilla::mailnews::PerFolderDatabase*>(
+        selected->database.get());
+    nsresult rv = database->AbortParsedServerHdr(selected->staged);
+    if (NS_FAILED(rv)) {
+      // Keep exact recovery custody. Cleanup cannot replace the primary error.
+      m_failedFilterHeaders.AppendElement(selected->staged);
+      MOZ_LOG(IMAP, mozilla::LogLevel::Error,
+              ("Parsed filter source cleanup failed: 0x%08x",
+               static_cast<uint32_t>(rv)));
+    }
+  }
+}
+
+nsresult nsImapMailFolder::ValidateFilterBodySource(
+    const mozilla::mailnews::ServerMessageLocation& source,
+    nsIMsgDBHdr* header) {
+  NS_ENSURE_STATE(header && m_filterBodyDatabase);
+  MOZ_TRY(GetDatabase());
+  NS_ENSURE_TRUE(mDatabase == m_filterBodyDatabase, NS_ERROR_NOT_AVAILABLE);
+  uint64_t folderId;
+  MOZ_TRY(GetId(&folderId));
+  nsMsgKey key;
+  MOZ_TRY(header->GetMessageKey(&key));
+  NS_ENSURE_TRUE(folderId == source.folderId && key == source.key &&
+                     m_uidValidity == source.epoch,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIDBFolderInfo> info;
+  MOZ_TRY(mDatabase->GetDBFolderInfo(getter_AddRefs(info)));
+  NS_ENSURE_STATE(info);
+  uint32_t epoch;
+  MOZ_TRY(info->GetImapUidValidity(&epoch));
+  NS_ENSURE_TRUE(epoch == source.epoch, NS_ERROR_NOT_AVAILABLE);
+  ImapUid uid = MOZ_TRY(UidFromMsgKey(mDatabase, source.key));
+  NS_ENSURE_TRUE(uid == source.uid, NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+#endif
 
 // nsIImapMessageSink.NormalEndMsgWriteStream() implementation.
 // Called by nsImapProtocol to complete a message write begun with
@@ -5602,11 +6092,32 @@ NS_IMETHODIMP
 nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
                                           nsIImapUrl* imapUrl,
                                           int32_t updatedMessageSize) {
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(m_filterBodyFinishing, NS_ERROR_IN_PROGRESS);
+  mozilla::AutoRestore<bool> finishing(m_filterBodyFinishing);
+  m_filterBodyFinishing = mail_panorama_enabled_AtStartup() &&
+                          (m_filterListRequiresBody || m_filterBodySource);
+  nsCOMPtr<nsIMsgDBHdr> filterHeader = m_offlineHeader;
+  auto sourceClear = mozilla::MakeScopeExit([&] {
+    m_filterBodyHeader = nullptr;
+    m_filterBodySource.reset();
+    m_filterBodyDatabase = nullptr;
+  });
+#endif
   NS_WARNING_ASSERTION((uidOfMessage == m_curMsgUid), "Interleaved messages?");
   auto uidClear = mozilla::MakeScopeExit([&] { m_curMsgUid = 0; });
 
+  const bool settleOffline = m_offlineHeader != nullptr;
   nsresult sizeResult = NS_OK;
-  if (updatedMessageSize != -1) {
+#ifdef MOZ_PANORAMA
+  if (m_filterBodyFinishing) {
+    sizeResult =
+        m_filterBodySource && uidOfMessage == m_filterBodySource->uid
+            ? ValidateFilterBodySource(*m_filterBodySource, filterHeader)
+            : NS_ERROR_NOT_AVAILABLE;
+  }
+#endif
+  if (NS_SUCCEEDED(sizeResult) && updatedMessageSize != -1) {
     // Retrieve the physical header if this download isn't writing offline.
     nsCOMPtr<nsIMsgDBHdr> msgHeader = m_offlineHeader;
     if (!msgHeader) {
@@ -5657,6 +6168,9 @@ nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
                 ("Updating stored message size from %u, new size %d", msgSize,
                  updatedMessageSize));
         sizeResult = msgHeader->SetMessageSize(updatedMessageSize);
+        MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
+                ("Completed downloaded message size update: 0x%08x",
+                 static_cast<uint32_t>(sizeResult)));
       }
       // Offline headers are settled by EndNewOfflineMessage below.
       if (NS_SUCCEEDED(sizeResult) && mDatabase && !m_offlineHeader)
@@ -5667,8 +6181,24 @@ nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
     }
   }
 
-  if (m_offlineHeader) {
+#ifdef MOZ_PANORAMA
+  if (m_filterBodyFinishing) {
+    if (NS_SUCCEEDED(sizeResult)) {
+      sizeResult = ValidateFilterBodySource(*m_filterBodySource, filterHeader);
+    }
+    if (NS_FAILED(sizeResult)) {
+      // Failed-source cleanup must not mark a replacement row offline. The
+      // original header stays owned locally; discard only this attempt's
+      // stream.
+      m_offlineHeader = nullptr;
+    }
+  }
+#endif
+  if (settleOffline) {
     nsresult rv = EndNewOfflineMessage(sizeResult);
+    MOZ_LOG(IMAP, mozilla::LogLevel::Debug,
+            ("Completed offline message settlement: 0x%08x",
+             static_cast<uint32_t>(rv)));
     if (NS_SUCCEEDED(sizeResult)) sizeResult = rv;
   }
   NS_ENSURE_SUCCESS(sizeResult, sizeResult);
@@ -5679,28 +6209,73 @@ nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
   if (m_filterListRequiresBody) {
     if (m_filterList) {
       nsCOMPtr<nsIMsgDBHdr> newMsgHdr;
-      GetMessageHeader(uidOfMessage, getter_AddRefs(newMsgHdr));
-      GetMoveCoalescer();
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup()) {
+        NS_ENSURE_TRUE(m_filterBodySource, NS_ERROR_NOT_AVAILABLE);
+        MOZ_TRY(ValidateFilterBodySource(*m_filterBodySource, filterHeader));
+        m_filterBodyHeader = filterHeader;
+        newMsgHdr = filterHeader;
+      } else
+#endif
+      {
+        MOZ_TRY(GetMessageHeader(uidOfMessage, getter_AddRefs(newMsgHdr)));
+      }
+      NS_ENSURE_STATE(newMsgHdr);
+      MOZ_TRY(GetMoveCoalescer());
       nsCOMPtr<nsIMsgWindow> msgWindow;
       if (imapUrl) {
         nsresult rv;
         nsCOMPtr<nsIMsgMailNewsUrl> msgUrl;
         msgUrl = do_QueryInterface(imapUrl, &rv);
-        if (msgUrl && NS_SUCCEEDED(rv))
-          msgUrl->GetMsgWindow(getter_AddRefs(msgWindow));
+        NS_ENSURE_SUCCESS(rv, rv);
+        // Background filter downloads have no message window.
+        rv = msgUrl->GetMsgWindow(getter_AddRefs(msgWindow));
+        if (rv != NS_ERROR_NULL_POINTER) {
+          NS_ENSURE_SUCCESS(rv, rv);
+        }
       }
-      m_filterList->ApplyFiltersToHdr(nsMsgFilterType::InboxRule, newMsgHdr,
-                                      this, mDatabase, EmptyCString(), this,
-                                      msgWindow);
-      NotifyFolderEvent(kFiltersApplied);
+#ifdef MOZ_PANORAMA
+      uint32_t bodyFlagsBefore = 0;
+      if (mail_panorama_enabled_AtStartup())
+        MOZ_TRY(newMsgHdr->GetFlags(&bodyFlagsBefore));
+#endif
+      nsresult filterRv = m_filterList->ApplyFiltersToHdr(
+          nsMsgFilterType::InboxRule, newMsgHdr, this, mDatabase,
+          EmptyCString(), this, msgWindow);
+      nsresult settleRv = NS_OK;
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup()) {
+        settleRv = [&]() -> nsresult {
+          NS_ENSURE_TRUE(m_filterBodySource, NS_ERROR_NOT_AVAILABLE);
+          MOZ_TRY(ValidateFilterBodySource(*m_filterBodySource, newMsgHdr));
+          uint32_t flags;
+          MOZ_TRY(newMsgHdr->GetFlags(&flags));
+          if ((bodyFlagsBefore & nsMsgMessageFlags::New) &&
+              !(flags & nsMsgMessageFlags::New)) {
+            // Native Read and New changes can notify separately. Settle this
+            // body's transition once; a combined legacy notification may
+            // already have reset the count to zero.
+            int32_t numNewMessages;
+            MOZ_TRY(GetNumNewMessages(false, &numNewMessages));
+            if (numNewMessages > 0)
+              MOZ_TRY(SetNumNewMessages(numNewMessages - 1));
+            MOZ_TRY(CheckWithNewMessagesStatus(false));
+          }
+          return NS_OK;
+        }();
+      }
+#endif
+      NS_ENSURE_SUCCESS(filterRv, filterRv);
+      NS_ENSURE_SUCCESS(settleRv, settleRv);
+      MOZ_TRY(NotifyFolderEvent(kFiltersApplied));
     }
     // Process filter plugins and other items normally done at the end of
     // HeaderFetchCompleted.
     bool pendingMoves = m_moveCoalescer && m_moveCoalescer->HasPendingMoves();
-    PlaybackCoalescedOperations();
+    MOZ_TRY(PlaybackCoalescedOperations());
 
-    bool filtersRun;
-    CallFilterPlugins(nullptr, &filtersRun);
+    bool filtersRun = false;
+    MOZ_TRY(CallFilterPlugins(nullptr, &filtersRun));
     int32_t numNewBiffMsgs = 0;
     if (m_performingBiff) GetNumNewMessages(false, &numNewBiffMsgs);
 
@@ -5729,6 +6304,12 @@ nsImapMailFolder::NormalEndMsgWriteStream(ImapUid uidOfMessage, bool markRead,
 // Called by protocol to abort a write begin with parseAdoptedMsgLine().
 NS_IMETHODIMP
 nsImapMailFolder::AbortMsgWriteStream() {
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(m_filterBodyFinishing, NS_ERROR_IN_PROGRESS);
+  m_filterBodySource.reset();
+  m_filterBodyDatabase = nullptr;
+  m_filterBodyHeader = nullptr;
+#endif
   if (m_offlineHeader) {
     EndNewOfflineMessage(NS_ERROR_ABORT);
   }
@@ -10830,7 +11411,8 @@ nsresult nsImapMailFolder::ProcessDeferredFilterActions() {
         mDatabase->MarkImapDeleted(key, true, nullptr);
         mDatabase->MarkNotNew(key, nullptr);
       }
-      if (!m_filterListRequiresBody && newMessagesToDelete > 0) {
+      if ((!m_filterListRequiresBody || mail_panorama_enabled_AtStartup()) &&
+          newMessagesToDelete > 0) {
         int32_t numNewMessages;
         GetNumNewMessages(false, &numNewMessages);
         SetNumNewMessages(std::max(

@@ -2188,6 +2188,78 @@ nsresult MessageDatabase::AbortMessage(nsMsgKey key) {
   return NS_OK;
 }
 
+nsresult MessageDatabase::ConsumeProtoThreadFlagsInTransaction(
+    nsMsgKey key, uint64_t folderId, nsMsgKey threadId) {
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_TRUE(active, NS_ERROR_IN_PROGRESS);
+
+  nsAutoCString text;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReadPublishedProtoThreadFlags"_ns,
+        "SELECT value FROM message_properties "
+        "WHERE id=:id AND name='ProtoThreadFlags'"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) {
+      return NS_OK;
+    }
+    MOZ_TRY(stmt->GetUTF8String(0, text));
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  // This is an ordinary header uint32 property, not a decimal storage field.
+  uint32_t pending = static_cast<uint32_t>(
+      MsgUnhex(text.get(), std::min<uint32_t>(8, text.Length())));
+  if (!pending) {
+    // Do not manufacture a property or normalize an existing empty/zero value.
+    return NS_OK;
+  }
+  uint32_t flags;
+  MOZ_TRY(GetThreadFlags(folderId, threadId, flags));
+  {
+    // SetThreadFlags deliberately rejects active caller transactions. This
+    // private write belongs to the publication that just inserted this member.
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "PublishProtoThreadFlags"_ns,
+        "INSERT INTO thread_flags(folderId,threadId,flags) "
+        "SELECT :folder,:thread,:flags WHERE EXISTS(SELECT 1 FROM messages "
+        "WHERE folderId=:folder AND threadId=:thread) "
+        "ON CONFLICT(folderId,threadId) DO UPDATE SET flags=excluded.flags "
+        "RETURNING folderId"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("thread"_ns, threadId));
+    MOZ_TRY(stmt->BindInt64ByName("flags"_ns, flags | pending));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ConsumePublishedProtoThreadFlags"_ns,
+      "UPDATE message_properties SET value='0' "
+      "WHERE id=:id AND name='ProtoThreadFlags' RETURNING id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  return NS_OK;
+}
+
 nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
                                          Message** liveHeader) {
   MOZ_TRY(RequireCurrentOwner());
@@ -2269,8 +2341,8 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
       MOZ_TRY(stmt->Execute());
     }
     if (mConversationGroupingEnabled) {
-      MOZ_TRY(
-          PrepareConversationBatch(key, notifyLegacy, *notification, captured));
+      MOZ_TRY(PrepareConversationBatch(key, notifyLegacy, *notification,
+                                       captured, true));
       for (const auto& row : captured.after) {
         if (row.id == key) {
           cached.threadId = row.threadId;
@@ -2278,6 +2350,8 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
         }
       }
     } else {
+      MOZ_TRY(ConsumeProtoThreadFlagsInTransaction(key, cached.folderId,
+                                                   cached.threadId));
       MOZ_TRY(CaptureMessage(key, notification->after));
     }
     if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
@@ -7350,7 +7424,7 @@ nsresult MessageDatabase::ApplyThreadWordRemap(
 
 nsresult MessageDatabase::PrepareConversationBatch(
     nsMsgKey key, bool notifyLegacy, QueuedMessageBatch& notification,
-    MessageThreadBatch& captured) {
+    MessageThreadBatch& captured, bool consumeProtoThreadFlags) {
   CapturedMessage publicationBefore;
   MOZ_TRY(CaptureMessage(key, publicationBefore));
   MOZ_TRY(PlanConversationInsertion(key, notifyLegacy, captured));
@@ -7387,6 +7461,12 @@ nsresult MessageDatabase::PrepareConversationBatch(
     NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
   }
   MOZ_TRY(ApplyThreadWordRemap(remaps));
+  if (consumeProtoThreadFlags) {
+    const auto* publication = FindThreadCapture(captured.after, key);
+    NS_ENSURE_TRUE(publication, NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(ConsumeProtoThreadFlagsInTransaction(key, publication->folderId,
+                                                 publication->threadId));
+  }
   notification.kind = QueuedMessageBatch::Kind::Thread;
   for (auto& delivery : notification.deliveries) {
     auto* listener = delivery.listener.get();

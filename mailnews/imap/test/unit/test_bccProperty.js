@@ -1209,6 +1209,193 @@ add_task(function test_flagLookupErrorsReachCommonCleanup() {
   }
 });
 
+if (panorama) {
+  add_task(async function test_staleIngestionDoesNotPublishAndCanRetry() {
+    const name = "IngestionEpoch";
+    const epoch = 7801;
+    const root = IMAPPump.incomingServer.rootFolder;
+    const created = new PromiseTestUtils.PromiseUrlListener();
+    root
+      .QueryInterface(Ci.nsIMsgImapMailFolder)
+      .createSubfolderWithListener(name, created);
+    await created.promise;
+    const folder = root
+      .getChildNamed(name)
+      .QueryInterface(Ci.nsIMsgImapMailFolder);
+    folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+    const mailbox = IMAPPump.daemon.getMailbox(name);
+    mailbox.uidvalidity = epoch;
+    const originalText =
+      "From: sender@example.invalid\r\n" +
+      "Message-ID: <ingestion-original@example.invalid>\r\n" +
+      "Subject: Retained source\r\n\r\nRetain this original body.\r\n";
+    const originalMessage = new ImapMessage(
+      "data:text/plain;base64," + btoa(originalText),
+      8101,
+      []
+    );
+    mailbox.addMessage(originalMessage);
+    const selected = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.selectFolder(folder, selected, null);
+    await selected.promise;
+    const database = folder.msgDatabase;
+    const original = database.getMsgHdrForMessageID(
+      "ingestion-original@example.invalid"
+    );
+    Assert.ok(original);
+    Assert.notEqual(original.messageKey, 8101);
+    Assert.equal(original.getUint32Property("uidOnServer"), 8101);
+    const keys = database.listAllKeys();
+    const flags = original.flags;
+    const token = original.storeToken;
+    const highest = database.dBFolderInfo.getUint32Property(
+      "highestRecordedUID",
+      0
+    );
+    const sink = folder.QueryInterface(Ci.nsIImapMailFolderSink);
+    Assert.equal(sink.uidValidity, epoch);
+    Assert.equal(database.dBFolderInfo.imapUidValidity, epoch);
+    const id = "ingestion-stale@example.invalid";
+    const text =
+      "From: sender@example.invalid\r\n" +
+      "Message-ID: <" +
+      id +
+      ">\r\n" +
+      "Subject: Recovered complete ingestion\r\n" +
+      "References: <ingest-r1@example.invalid> <ingest-r2@example.invalid> <ingest-r1@example.invalid>\r\n" +
+      "X-Publication: 18446744073709551615\r\n\r\nRetain the pending server body.\r\n";
+    const pending = new ImapMessage(
+      "data:text/plain;base64," + btoa(text),
+      8102,
+      []
+    );
+    pending.setFlag("\\Flagged");
+    mailbox.addMessage(pending);
+    mailbox.uidnext = 8103;
+    const added = [];
+    const observer = {
+      msgAdded(header) {
+        if (header.folder == folder) {
+          added.push({
+            id: header.messageId,
+            key: header.messageKey,
+            uid: header.getUint32Property("uidOnServer"),
+            subject: header.subject,
+            references: Array.from({ length: header.numReferences }, (_, i) =>
+              header.getStringReference(i)
+            ),
+            custom: header.getStringProperty("x-publication"),
+            flagged: header.isFlagged,
+          });
+        }
+      },
+    };
+    MailServices.mfn.addListener(observer, MailServices.mfn.msgAdded);
+    registerCleanupFunction(() => MailServices.mfn.removeListener(observer));
+    const proto = IMAP_RFC3501_handler.prototype;
+    const originalFetch = proto.FETCH;
+    let injections = 0;
+    proto.FETCH = function (args, isUid) {
+      const response = originalFetch.call(this, args, isUid);
+      if (
+        isUid &&
+        this._selectedMailbox == mailbox &&
+        response.includes("<" + id + ">")
+      ) {
+        // Deliver the old header after the real folder observer sees a newer
+        // epoch, while its durable binding remains available for reconciliation.
+        injections++;
+        sink.uidValidity = epoch + 1;
+      }
+      return response;
+    };
+    let stops = 0;
+    let status;
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl(_url, result) {
+        stops++;
+        status = result;
+      },
+    });
+    try {
+      const refusal = (async () => {
+        await Assert.rejects(
+          listener.promise,
+          error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
+        );
+      })();
+      folder.updateFolderWithListener(null, listener);
+      await refusal;
+      Assert.equal(injections, 1);
+      Assert.equal(stops, 1);
+      Assert.equal(status, Cr.NS_ERROR_NOT_AVAILABLE);
+      Assert.equal(sink.uidValidity, epoch + 1);
+      Assert.equal(database.dBFolderInfo.imapUidValidity, epoch);
+      Assert.deepEqual(database.listAllKeys(), keys);
+      Assert.deepEqual(added, []);
+      Assert.throws(
+        () => database.getMsgHdrForMessageID(id),
+        error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE
+      );
+      Assert.equal(
+        database.dBFolderInfo.getUint32Property("highestRecordedUID", 0),
+        highest
+      );
+      Assert.equal(original.flags, flags);
+      Assert.equal(original.storeToken, token);
+      Assert.equal(original.getUint32Property("uidOnServer"), 8101);
+      Assert.equal(originalMessage.getText(), originalText);
+      Assert.equal(pending.getText(), text);
+      Assert.deepEqual(
+        mailbox._messages.map(message => message.uid),
+        [8101, 8102]
+      );
+    } finally {
+      proto.FETCH = originalFetch;
+      sink.uidValidity = epoch;
+    }
+    let recoveredKey;
+    for (let retry = 0; retry < 2; retry++) {
+      let completions = 0;
+      const update = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(_url, result) {
+          completions++;
+          Assert.equal(result, Cr.NS_OK);
+        },
+      });
+      folder.updateFolderWithListener(null, update);
+      await update.promise;
+      Assert.equal(completions, 1);
+      const recovered = database.getMsgHdrForMessageID(id);
+      Assert.ok(recovered);
+      Assert.notEqual(recovered.messageKey, 8102);
+      Assert.equal(recovered.getUint32Property("uidOnServer"), 8102);
+      recoveredKey ??= recovered.messageKey;
+      Assert.equal(recovered.messageKey, recoveredKey);
+      Assert.equal(added.length, 1);
+      Assert.deepEqual(added[0], {
+        id,
+        key: recoveredKey,
+        uid: 8102,
+        subject: "Recovered complete ingestion",
+        references: [
+          "ingest-r1@example.invalid",
+          "ingest-r2@example.invalid",
+          "ingest-r1@example.invalid",
+        ],
+        custom: "18446744073709551615",
+        flagged: true,
+      });
+      Assert.deepEqual(database.listAllKeys(), [...keys, recoveredKey]);
+      Assert.equal(original.flags, flags);
+      Assert.equal(original.storeToken, token);
+      Assert.equal(originalMessage.getText(), originalText);
+      Assert.equal(pending.getText(), text);
+      Assert.equal(database.dBFolderInfo.imapUidValidity, epoch);
+    }
+  });
+}
+
 add_task(function endTest() {
   teardownIMAPPump();
 });

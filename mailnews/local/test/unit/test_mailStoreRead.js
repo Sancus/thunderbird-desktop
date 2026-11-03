@@ -1022,19 +1022,34 @@ async function checkRepairExistingRows(storeType, failUpdate) {
           Assert.equal(header.getStringProperty("repairEmpty"), "");
           Assert.ok(!header.properties.includes("repairAbsent"));
         }
-        const references = Array.from(
-          { length: header.numReferences },
-          (_, n) => header.getStringReference(n)
-        );
-        Assert.deepEqual(
-          references,
+        const expectedReferences =
           index == 0
             ? [
                 "older@example.invalid",
                 "shared-repair@example.invalid",
                 "older@example.invalid",
               ]
-            : []
+            : [];
+        const statement = connection.createStatement(
+          "SELECT token FROM message_references WHERE id = :id ORDER BY ordinal"
+        );
+        statement.params.id = key;
+        const storedReferences = [];
+        try {
+          while (statement.executeStep()) {
+            storedReferences.push(statement.row.token);
+          }
+        } finally {
+          statement.finalize();
+        }
+        Assert.deepEqual(storedReferences, expectedReferences);
+        // The legacy getter filters self references; raw native custody above
+        // still retains their exact order and duplicate tokens.
+        Assert.deepEqual(
+          Array.from({ length: header.numReferences }, (_, n) =>
+            header.getStringReference(n)
+          ),
+          expectedReferences.filter(reference => reference != header.messageId)
         );
         // RawHdr::references is a total ordered array. Native rows publish its
         // canonical property even when the original RFC header was absent.

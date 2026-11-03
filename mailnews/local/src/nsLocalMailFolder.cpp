@@ -1493,6 +1493,14 @@ nsMsgLocalMailFolder::DeleteMessages(
     nsTArray<RefPtr<nsIMsgDBHdr>> const& msgHeaders, nsIMsgWindow* msgWindow,
     bool deleteStorage, bool isMove, nsIMsgCopyServiceListener* listener,
     bool allowUndo) {
+  return DeleteMessagesInternal(msgHeaders, msgWindow, deleteStorage, isMove,
+                                listener, allowUndo, nullptr);
+}
+
+nsresult nsMsgLocalMailFolder::DeleteMessagesInternal(
+    const nsTArray<RefPtr<nsIMsgDBHdr>>& msgHeaders, nsIMsgWindow* msgWindow,
+    bool deleteStorage, bool isMove, nsIMsgCopyServiceListener* listener,
+    bool allowUndo, nsLocalMoveCopyMsgTxn* undo) {
   nsresult rv;
   // Validate the whole input before POP3 marking, deletion notifications or
   // provider mutations. A later foreign member must not retire a valid prefix.
@@ -1528,6 +1536,12 @@ nsMsgLocalMailFolder::DeleteMessages(
           body.storeToken ? token.Equals(*body.storeToken) : token.IsEmpty(),
           NS_ERROR_NOT_AVAILABLE);
     }
+  }
+#endif
+
+#ifdef MOZ_PANORAMA
+  if (undo) {
+    MOZ_TRY(undo->PrepareNativeSourceRemoval(this, msgHeaders));
   }
 #endif
 
@@ -1594,7 +1608,14 @@ nsMsgLocalMailFolder::DeleteMessages(
           rv = msgStore->DeleteMessages(msgHeaders);
           if (NS_SUCCEEDED(rv)) {
             for (auto hdr : msgHeaders) {
-              rv = msgDB->DeleteHeader(hdr, nullptr, false, true);
+#ifdef MOZ_PANORAMA
+              if (undo) {
+                rv = undo->RemoveNativeSourceHeader(this, hdr);
+              } else
+#endif
+              {
+                rv = msgDB->DeleteHeader(hdr, nullptr, false, true);
+              }
               if (NS_FAILED(rv)) break;
             }
           }
@@ -3436,6 +3457,18 @@ nsMsgLocalMailFolder::EndMove(bool moveSucceeded) {
         (void)completion->OnStopCopy(rv);
       }
       return NS_OK;
+    }
+#endif
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup() && localSrcFolder &&
+        mCopyState->m_undoMsgTxn &&
+        mCopyState->m_undoMsgTxn->UsesNativeLocalUndo()) {
+      RefPtr<nsLocalMoveCopyMsgTxn> undo = mCopyState->m_undoMsgTxn;
+      rv = static_cast<nsMsgLocalMailFolder*>(localSrcFolder.get())
+               ->DeleteMessagesInternal(mCopyState->m_messages,
+                                        mCopyState->m_msgWindow, true, true,
+                                        nullptr, mCopyState->m_allowUndo, undo);
+      return CompleteMoveSource(nullptr, rv);
     }
 #endif
     // lets delete these all at once - much faster that way

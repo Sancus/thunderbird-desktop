@@ -1112,10 +1112,27 @@ async function checkRepairMalformedHeaders(storeType) {
     const header = folder.addMessage(good);
     const key = header.messageKey;
     const token = header.storeToken;
-    const malformed = "Subject: Incomplete header block\r\nX-Unfinished: value";
-    const stream = store.getNewMsgOutputStream(folder);
-    Assert.equal(stream.write(malformed, malformed.length), malformed.length);
-    const malformedToken = store.finishNewMessage(folder, stream);
+    const malformed =
+      "From: malformed@example.invalid\r\n" +
+      "Subject: Incomplete header block\r\n" +
+      "Message-ID: <malformed-repair@example.invalid>\r\n" +
+      "X-Unfinished: value";
+    const malformedToken = "repair-malformed-input";
+    // Create retained corrupt input directly, like test_folderCompact2's
+    // malformed mbox. Normal mbox Finish adds termination/separator bytes and
+    // cannot reliably create this incomplete-header case. Setup/cleanup still
+    // use the real account fixture; all bytes below are snapshotted before scan.
+    if (storeType == "mbox") {
+      await IOUtils.writeUTF8(folder.filePath.path, `From \r\n${malformed}`, {
+        mode: "append",
+      });
+    } else {
+      await IOUtils.writeUTF8(
+        PathUtils.join(folder.filePath.path, "cur", malformedToken),
+        malformed,
+        { mode: "create" }
+      );
+    }
     const paths =
       storeType == "mbox"
         ? [folder.filePath.path]

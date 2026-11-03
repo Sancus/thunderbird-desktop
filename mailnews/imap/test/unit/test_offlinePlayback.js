@@ -200,6 +200,8 @@ add_task(
       );
       Assert.ok(headers.every(Boolean));
       const keys = headers.map(header => header.messageKey);
+      const epoch = source.msgDatabase.dBFolderInfo.imapUidValidity;
+      Assert.greater(epoch, 0);
       Assert.notEqual(keys[0], 91001);
       const operations = source.msgDatabase.QueryInterface(
         Ci.nsIMsgOfflineOpsDatabase
@@ -269,7 +271,11 @@ add_task(
       Assert.ok(
         retained.operation & Ci.nsIMsgOfflineImapOperation.kFlagsChanged
       );
-      Assert.equal(retained.srcUid, 91001);
+      // The legacy payload field is not the native captured protocol tuple.
+      Assert.equal(retained.srcUid, 0);
+      Assert.equal(retained.messageKey, keys[0]);
+      Assert.equal(headers[0].getUint32Property("uidOnServer"), 91001);
+      Assert.equal(source.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
       Assert.equal(operations.getOfflineOpForKey(keys[1], false), null);
       const stream = source.getMsgInputStream(headers[0]);
       Assert.greater(

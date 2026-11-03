@@ -19,8 +19,18 @@ var gMsgHdr = null;
 // Take a multipart message as we're testing attachment URLs as well
 var gFile = do_get_file("../../../data/multipart-complex2");
 
-add_setup(function () {
+add_setup(async function () {
   setupIMAPPump();
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    listener,
+    null
+  );
+  await listener.promise;
+  IMAPPump.inbox = IMAPPump.incomingServer.rootFolder
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
 
   // Set up nsIMsgFolderListener to get the header when it's received
   MailServices.mfn.addListener(msgAddedListener, MailServices.mfn.msgAdded);
@@ -31,9 +41,7 @@ add_setup(function () {
 // Adds some messages directly to a mailbox (eg new mail)
 add_task(async function addMessageToServer() {
   const URI = Services.io.newFileURI(gFile).QueryInterface(Ci.nsIFileURL);
-  IMAPPump.mailbox.addMessage(
-    new ImapMessage(URI.spec, IMAPPump.mailbox.uidnext++, [])
-  );
+  IMAPPump.mailbox.addMessage(new ImapMessage(URI.spec, 6101, []));
 
   const listener = new PromiseTestUtils.PromiseUrlListener();
   IMAPPump.inbox.updateFolderWithListener(null, listener);
@@ -58,6 +66,11 @@ var msgAddedListener = new MsgAddedListener();
 
 add_task(async function verifyContentLength() {
   await msgAddedListener.promise;
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  if (native) {
+    Assert.equal(gMsgHdr.getUint32Property("uidOnServer"), 6101);
+    Assert.notEqual(gMsgHdr.messageKey, 6101);
+  }
   const messageUri = IMAPPump.inbox.getUriForMsg(gMsgHdr);
   // Convert this to a URI that necko can run
   const messageService = MailServices.messageServiceFromURI(messageUri);
@@ -76,6 +89,9 @@ add_task(async function verifyContentLength() {
     Ci.nsIContentPolicy.TYPE_OTHER
   );
   Assert.equal(channel.contentLength, gFile.fileSize);
+  if (native) {
+    Assert.equal(urlToRun.QueryInterface(Ci.nsIMsgMessageUrl).uri, messageUri);
+  }
 
   // Now try an attachment. &part=1.2
   const attachmentURL = Services.io.newURI(neckoURL.spec + "&part=1.2");
@@ -90,6 +106,31 @@ add_task(async function verifyContentLength() {
   // Currently attachments have their content length set to the length of the
   // entire message
   Assert.equal(attachmentChannel.contentLength, gFile.fileSize);
+  if (native) {
+    Assert.equal(
+      attachmentURL.QueryInterface(Ci.nsIMsgMessageUrl).uri,
+      messageUri + "?part=1.2"
+    );
+    gMsgHdr.setUint32Property("uidOnServer", 0);
+    try {
+      Assert.throws(
+        () =>
+          Services.io.newChannelFromURI(
+            urlToRun,
+            null,
+            Services.scriptSecurityManager.getSystemPrincipal(),
+            null,
+            Ci.nsILoadInfo.SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+            Ci.nsIContentPolicy.TYPE_OTHER
+          ),
+        error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+      );
+      Assert.equal(gMsgHdr.storeToken, "");
+      Assert.equal(gMsgHdr.flags & Ci.nsMsgMessageFlags.Offline, 0);
+    } finally {
+      gMsgHdr.setUint32Property("uidOnServer", 6101);
+    }
+  }
 });
 
 add_task(function endTest() {

@@ -280,6 +280,185 @@ add_task(async function test_previewReadFailureDoesNotStartAnUrl() {
   );
 });
 
+add_task(async function test_mimePartKeepsPhysicalSourceAndSection() {
+  const states = [];
+  for (const name of ["MimeFirst", "MimeSecond"]) {
+    const raw = [
+      "From: sender@example.invalid",
+      "To: recipient@example.invalid",
+      "Message-ID: <" + name + "@example.invalid>",
+      "Subject: Selected MIME source",
+      'Content-Type: multipart/mixed; boundary="selected-source"',
+      "MIME-Version: 1.0",
+      "",
+      "--selected-source",
+      "Content-Type: text/plain; charset=us-ascii",
+      "",
+      name + " body",
+      "--selected-source",
+      "Content-Type: text/plain; charset=us-ascii",
+      'Content-Disposition: attachment; filename="selected.txt"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      btoa(name + " attachment\r\n"),
+      "--selected-source--",
+      "",
+    ].join("\r\n");
+    states.push(await createPreviewMessage(name, "", "", raw));
+  }
+  Assert.notEqual(states[0].header.messageKey, states[1].header.messageKey);
+  for (const state of states) {
+    Assert.equal(
+      await fetchPart(state, "1.2"),
+      state.folder.name + " attachment\r\n"
+    );
+    Assert.equal(state.header.flags & Ci.nsMsgMessageFlags.Offline, 0);
+    Assert.equal(state.header.storeToken, "");
+  }
+  for (const state of states) {
+    await download(state);
+  }
+  const wasOffline = Services.io.offline;
+  Services.io.offline = true;
+  try {
+    for (const state of states) {
+      Assert.equal(
+        await fetchPart(state, "1.2"),
+        state.folder.name + " attachment\r\n"
+      );
+      Assert.equal(readBody(state), STORE_HEADERS + state.raw);
+    }
+  } finally {
+    Services.io.offline = wasOffline;
+  }
+});
+
+add_task(async function test_remotePreviewRejectsReplacementPhysicalSource() {
+  await rejectChangedPreviewSource("rebound");
+});
+
+add_task(async function test_remotePreviewRejectsChangedEpoch() {
+  await rejectChangedPreviewSource("epoch");
+});
+
+/**
+ * Streams one MIME part through the existing message fetch service.
+ *
+ * @param {PreviewMessage} state - The selected physical message.
+ * @param {string} part - The numeric MIME section.
+ * @returns {Promise<string>} The decoded bytes of that section.
+ */
+async function fetchPart(state, part) {
+  const uri = state.folder.getUriForMsg(state.header);
+  const service = MailServices.messageServiceFromURI(uri);
+  const url = service.getUrlForUri(uri);
+  const listener = new PromiseTestUtils.PromiseStreamListener();
+  service
+    .QueryInterface(Ci.nsIMsgMessageFetchPartService)
+    .fetchMimePart(url, uri + "?part=" + part, listener, null, null);
+  return listener.promise;
+}
+
+/**
+ * Changes only the captured binding after the real preview FETCH is produced.
+ *
+ * @param {string} mode - Rebind the UID, or replace its durable epoch.
+ * @returns {Promise<void>} Resolves after refusal and a normal successful retry.
+ */
+async function rejectChangedPreviewSource(mode) {
+  const state = await createPreviewMessage(
+    "PreviewChanged" + mode,
+    "Selected preview bytes."
+  );
+  const otherRaw = state.raw
+    .replaceAll("PreviewChanged" + mode, "PreviewOther" + mode)
+    .replace("Selected preview bytes.", "Other physical bytes.");
+  const otherMessage = new ImapMessage(
+    "data:text/plain;base64," + btoa(otherRaw),
+    5102,
+    []
+  );
+  otherMessage.xGmMsgid = String(nextGmId++);
+  otherMessage.xGmThrid = "1266894439832287888";
+  otherMessage.xGmLabels = "()";
+  state.mailbox.addMessage(otherMessage);
+  const updated = new PromiseTestUtils.PromiseUrlListener();
+  state.folder.updateFolderWithListener(null, updated);
+  await updated.promise;
+  const other = state.folder.msgDatabase.getMsgHdrForMessageID(
+    "PreviewOther" + mode + "@example.invalid"
+  );
+  Assert.ok(other);
+  Assert.notEqual(other.messageKey, state.header.messageKey);
+  Assert.equal(other.getUint32Property("uidOnServer"), 5102);
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalFetch = proto.FETCH;
+  let fetches = 0;
+  proto.FETCH = function (args, isUid) {
+    const response = originalFetch.call(this, args, isUid);
+    if (isUid && String(args[0]) == "5101") {
+      fetches++;
+      if (mode == "epoch") {
+        state.folder.msgDatabase.dBFolderInfo.imapUidValidity = 7102;
+      } else {
+        state.header.setUint32Property("uidOnServer", 0);
+        other.setUint32Property("uidOnServer", 5101);
+      }
+    }
+    return response;
+  };
+  const calls = { starts: 0, stops: 0 };
+  const listener = new PromiseTestUtils.PromiseUrlListener({
+    OnStartRunningUrl() {
+      calls.starts++;
+    },
+    OnStopRunningUrl() {
+      calls.stops++;
+    },
+  });
+  try {
+    Assert.equal(
+      state.folder.fetchMsgPreviewText([state.header.messageKey], listener),
+      true
+    );
+    await Assert.rejects(
+      listener.promise,
+      error => Number(error.message) == Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    Assert.equal(fetches, 1);
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    Assert.equal(state.header.getStringProperty("preview"), "");
+    Assert.equal(other.getStringProperty("preview"), "");
+    Assert.deepEqual(
+      Array.from(state.folder.messages, hdr => hdr.messageKey).sort(
+        (a, b) => a - b
+      ),
+      [state.header.messageKey, other.messageKey].sort((a, b) => a - b)
+    );
+    Assert.deepEqual(
+      state.mailbox._messages.map(message => message.uid),
+      [5101, 5102]
+    );
+    for (const hdr of [state.header, other]) {
+      Assert.equal(hdr.storeToken, "");
+      Assert.equal(hdr.flags & Ci.nsMsgMessageFlags.Offline, 0);
+    }
+  } finally {
+    proto.FETCH = originalFetch;
+    if (mode == "epoch") {
+      state.folder.msgDatabase.dBFolderInfo.imapUidValidity = 7101;
+    }
+    state.header.setUint32Property("uidOnServer", 5101);
+    other.setUint32Property("uidOnServer", 5102);
+  }
+  await fetchPreview(state);
+  Assert.equal(
+    state.header.getStringProperty("preview"),
+    "Selected preview bytes."
+  );
+  Assert.equal(other.getStringProperty("preview"), "");
+}
+
 /**
  * Selects a real server message with an overlapping UID and independent body.
  *

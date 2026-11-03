@@ -3800,6 +3800,27 @@ nsImapMailFolder::ParseMsgHdrs(nsIImapProtocol* aProtocol,
     MOZ_TRY(headerInfo->GetMsgHdrs(msgHdrs));
     if (imapAction == nsIImapUrl::nsImapMsgPreview) {
       nsMsgKey key = MOZ_TRY(std::move(keyLookup));
+#ifdef MOZ_PANORAMA
+      if (mail_panorama_enabled_AtStartup()) {
+        const auto& captured =
+            static_cast<nsImapUrl*>(imapUrl.get())->CapturedFlagTargets();
+        NS_ENSURE_TRUE(captured, NS_ERROR_NOT_AVAILABLE);
+        uint64_t folderId;
+        MOZ_TRY(GetId(&folderId));
+        NS_ENSURE_TRUE(
+            folderId == captured->folderId && m_uidValidity == captured->epoch,
+            NS_ERROR_NOT_AVAILABLE);
+        bool found = false;
+        for (const auto& target : captured->messages) {
+          if (target.uid == uid) {
+            NS_ENSURE_TRUE(key == target.key, NS_ERROR_NOT_AVAILABLE);
+            found = true;
+            break;
+          }
+        }
+        NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
+      }
+#endif
       nsCOMPtr<nsIMsgDBHdr> msgHdr;
       MOZ_TRY(GetMessageHeader(key, getter_AddRefs(msgHdr)));
       NS_ENSURE_STATE(msgHdr);

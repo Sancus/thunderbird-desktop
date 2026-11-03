@@ -24,6 +24,8 @@
 #include "nsServiceManagerUtils.h"
 #include "nsURLHelper.h"
 #include "mozilla/Logging.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/StaticPrefs_mail.h"
 #include "mozilla/ResultExtensions.h"
 #include "nsIMsgDatabase.h"
 #include "nsIDBFolderInfo.h"
@@ -1587,6 +1589,75 @@ NS_IMETHODIMP nsImapUrl::SetStoreOfflineOnFallback(
 }
 
 NS_IMETHODIMP nsImapUrl::GetMessageHeader(nsIMsgDBHdr** aMsgHdr) {
+  NS_ENSURE_ARG_POINTER(aMsgHdr);
+  *aMsgHdr = nullptr;
+#ifdef MOZ_PANORAMA
+  if (StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      (m_imapAction == nsImapMsgFetch || m_imapAction == nsImapMsgFetchPeek)) {
+    MOZ_ASSERT(NS_IsMainThread());
+    NS_ENSURE_TRUE(m_idsAreUids, NS_ERROR_NOT_AVAILABLE);
+    nsCString ids;
+    MOZ_TRY(GetListOfMessageIds(ids));
+    // The legacy external attachment URL appends &part without a leading ?.
+    int32_t part = ids.Find("&part=");
+    if (part != kNotFound) ids.Truncate(part);
+    CheckedInt<ImapUid> uid(0);
+    for (const char* digit = ids.get(); *digit; ++digit) {
+      NS_ENSURE_TRUE(*digit >= '0' && *digit <= '9', NS_ERROR_ILLEGAL_VALUE);
+      uid = uid * 10 + (*digit - '0');
+    }
+    NS_ENSURE_TRUE(uid.isValid() && uid.value(), NS_ERROR_ILLEGAL_VALUE);
+    nsCOMPtr<nsIMsgFolder> folder;
+    MOZ_TRY(GetFolder(getter_AddRefs(folder)));
+    NS_ENSURE_TRUE(folder, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+    NS_ENSURE_STATE(db);
+    nsMsgKey key = MOZ_TRY(MsgKeyFromUid(db, uid.value()));
+    if (!mURI.IsEmpty()) {
+      nsCOMPtr<nsIMsgDBHdr> selected;
+      MOZ_TRY(GetMsgDBHdrFromURI(mURI, getter_AddRefs(selected)));
+      NS_ENSURE_TRUE(selected, NS_ERROR_NOT_AVAILABLE);
+      nsMsgKey selectedKey;
+      MOZ_TRY(selected->GetMessageKey(&selectedKey));
+      NS_ENSURE_TRUE(selectedKey == key, NS_ERROR_NOT_AVAILABLE);
+    }
+    if (mCopyTargets) {
+      uint64_t folderId;
+      MOZ_TRY(folder->GetId(&folderId));
+      nsCOMPtr<nsIDBFolderInfo> info;
+      MOZ_TRY(db->GetDBFolderInfo(getter_AddRefs(info)));
+      NS_ENSURE_STATE(info);
+      uint32_t epoch;
+      MOZ_TRY(info->GetImapUidValidity(&epoch));
+      NS_ENSURE_TRUE(folderId == mCopyTargets->folderId && epoch &&
+                         epoch == mCopyTargets->epoch &&
+                         mCopyTargets->messages.Length() == 1 &&
+                         mCopyTargets->messages[0].key == key &&
+                         mCopyTargets->messages[0].uid == uid.value(),
+                     NS_ERROR_NOT_AVAILABLE);
+    } else {
+      MOZ_TRY(CaptureCopyTargets(folder, {key}, {uid.value()}));
+    }
+    nsCOMPtr<nsIMsgDBHdr> header;
+    MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(header)));
+    NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+    if (mURI.IsEmpty()) {
+      // Retain the physical URI before asynchronous MIME/cache consumers run.
+      nsCString selectedURI;
+      MOZ_TRY(folder->GetUriForMsg(header, selectedURI));
+      const char* selector =
+          m_listOfMessageIds ? strpbrk(m_listOfMessageIds, "?&") : nullptr;
+      if (selector) {
+        selectedURI.Append('?');
+        selectedURI.Append(selector + 1);
+      }
+      mURI = selectedURI;
+    }
+    header.forget(aMsgHdr);
+    return NS_OK;
+  }
+#endif
   nsCString uri;
   nsresult rv = GetUri(uri);
   NS_ENSURE_SUCCESS(rv, rv);

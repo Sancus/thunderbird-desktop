@@ -515,7 +515,7 @@ static constexpr auto kThreadFlagsFolderDelete =
 nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version >= 0 && version <= 18, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 19, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -1151,19 +1151,6 @@ nsresult DatabaseCore::UpgradeSchema() {
         "ALTER TABLE offline_operations ADD COLUMN sourcePhysicalKey INTEGER"_ns));
     MOZ_TRY(sConnection->SetSchemaVersion(16));
   }
-  MOZ_TRY(CheckReferenceSchemaTable(
-      sConnection, "offline_operations",
-      "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
-      "INTEGER:1:0,"
-      "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
-      "INTEGER:1:0,"
-      "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
-      "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:1:"
-      "0,"
-      "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
-      "TEXT:1:0,folderEpoch:INTEGER:0:0,destinationFolderId:INTEGER:0:0,"
-      "destinationKey:INTEGER:0:0,destinationEpoch:INTEGER:0:0,"
-      "sourcePhysicalKey:INTEGER:0:0"));
   if (version < 17) {
     MOZ_TRY(sConnection->ExecuteSimpleSQL(
         "ALTER TABLE offline_attempts ADD COLUMN appendAccepted INTEGER NOT "
@@ -1200,6 +1187,87 @@ nsresult DatabaseCore::UpgradeSchema() {
         "ALTER TABLE offline_attempts ADD COLUMN confirmedEpoch INTEGER;"_ns));
     MOZ_TRY(sConnection->SetSchemaVersion(18));
   }
+  if (version < 19) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "ALTER TABLE offline_operations ADD COLUMN flagSetMask INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN flagClearMask INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardSourceId TEXT;"
+        "ALTER TABLE offline_operations ADD COLUMN guardFolderId INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardKey INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardContentRevision "
+        "INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardLocationRevision "
+        "INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardStoreToken TEXT;"
+        "ALTER TABLE offline_operations ADD COLUMN guardMessageSize INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardOfflineSize INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardLineCount INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardFlags INTEGER;"
+        "ALTER TABLE offline_operations ADD COLUMN guardPresence INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagSetMask INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagClearMask INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardSourceId TEXT;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardFolderId INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardKey INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardContentRevision INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardLocationRevision INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardStoreToken TEXT;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardMessageSize INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardOfflineSize INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardLineCount INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardFlags INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN guardPresence INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN replayVersion INTEGER NOT "
+        "NULL DEFAULT 0;"
+        "ALTER TABLE offline_attempts ADD COLUMN moveExpunge INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagSetState INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagSetGeneration INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagSetError INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagClearState INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagClearGeneration INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN flagClearError INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN sourceStoreState INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN sourceStoreGeneration INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN sourceStoreError INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN sourceExpungeState INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN sourceExpungeGeneration "
+        "INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN sourceExpungeError INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN moveSettled INTEGER NOT NULL "
+        "DEFAULT 0;"
+        "ALTER TABLE offline_attempts ADD COLUMN firstError INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN settledSourceRemoved INTEGER;"
+        "ALTER TABLE offline_attempts ADD COLUMN settledOperationRetired "
+        "INTEGER;"
+        ""_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(19));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "offline_operations",
+      "id:INTEGER:0:1,folderId:INTEGER:1:0,messageKey:INTEGER:1:0,revision:"
+      "INTEGER:1:0,"
+      "epoch:INTEGER:0:0,uid:INTEGER:0:0,operation:INTEGER:1:0,flagOperation:"
+      "INTEGER:1:0,"
+      "newFlags:INTEGER:1:0,sourceKey:INTEGER:1:0,sourceUid:INTEGER:1:0,"
+      "messageSize:INTEGER:1:0,playingBack:INTEGER:1:0,sourceFolderURI:TEXT:1:"
+      "0,"
+      "destinationFolderURI:TEXT:1:0,keywordsToAdd:TEXT:1:0,keywordsToRemove:"
+      "TEXT:1:0,folderEpoch:INTEGER:0:0,destinationFolderId:INTEGER:0:0,"
+      "destinationKey:INTEGER:0:0,destinationEpoch:INTEGER:0:0,"
+      "sourcePhysicalKey:INTEGER:0:0,"
+      "flagSetMask:INTEGER:0:0,"
+      "flagClearMask:INTEGER:0:0,"
+      "guardSourceId:TEXT:0:0,"
+      "guardFolderId:INTEGER:0:0,"
+      "guardKey:INTEGER:0:0,"
+      "guardContentRevision:INTEGER:0:0,"
+      "guardLocationRevision:INTEGER:0:0,"
+      "guardStoreToken:TEXT:0:0,"
+      "guardMessageSize:INTEGER:0:0,"
+      "guardOfflineSize:INTEGER:0:0,"
+      "guardLineCount:INTEGER:0:0,"
+      "guardFlags:INTEGER:0:0,"
+      "guardPresence:INTEGER:0:0"));
   MOZ_TRY(CheckReferenceSchemaTable(
       sConnection, "offline_attempts",
       "id:INTEGER:0:1,operationId:INTEGER:1:0,revision:INTEGER:1:0,state:"
@@ -1222,7 +1290,38 @@ nsresult DatabaseCore::UpgradeSchema() {
       "0,"
       "transferStoreToken:TEXT:0:0,transferMessageSize:INTEGER:0:0,"
       "transferOfflineSize:INTEGER:0:0,transferLineCount:INTEGER:0:0,"
-      "transferFlags:INTEGER:0:0,confirmedEpoch:INTEGER:0:0"));
+      "transferFlags:INTEGER:0:0,confirmedEpoch:INTEGER:0:0,"
+      "flagSetMask:INTEGER:0:0,"
+      "flagClearMask:INTEGER:0:0,"
+      "guardSourceId:TEXT:0:0,"
+      "guardFolderId:INTEGER:0:0,"
+      "guardKey:INTEGER:0:0,"
+      "guardContentRevision:INTEGER:0:0,"
+      "guardLocationRevision:INTEGER:0:0,"
+      "guardStoreToken:TEXT:0:0,"
+      "guardMessageSize:INTEGER:0:0,"
+      "guardOfflineSize:INTEGER:0:0,"
+      "guardLineCount:INTEGER:0:0,"
+      "guardFlags:INTEGER:0:0,"
+      "guardPresence:INTEGER:0:0,"
+      "replayVersion:INTEGER:1:0,"
+      "moveExpunge:INTEGER:0:0,"
+      "flagSetState:INTEGER:0:0,"
+      "flagSetGeneration:INTEGER:0:0,"
+      "flagSetError:INTEGER:0:0,"
+      "flagClearState:INTEGER:0:0,"
+      "flagClearGeneration:INTEGER:0:0,"
+      "flagClearError:INTEGER:0:0,"
+      "sourceStoreState:INTEGER:0:0,"
+      "sourceStoreGeneration:INTEGER:0:0,"
+      "sourceStoreError:INTEGER:0:0,"
+      "sourceExpungeState:INTEGER:0:0,"
+      "sourceExpungeGeneration:INTEGER:0:0,"
+      "sourceExpungeError:INTEGER:0:0,"
+      "moveSettled:INTEGER:1:0,"
+      "firstError:INTEGER:0:0,"
+      "settledSourceRemoved:INTEGER:0:0,"
+      "settledOperationRetired:INTEGER:0:0"));
   return NS_OK;
 }
 

@@ -247,6 +247,14 @@ class DeliveryMessageReferences : public testing::Test {
     ASSERT_TRUE(mHeader);
   }
 
+  void CreateOfflineProtocolSource() {
+    ASSERT_NO_FATAL_FAILURE(Create({}));
+    ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolder, 77));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().BindMessageToServerUid(mKey, mFolder,
+                                                               77, 7401));
+    ASSERT_NE(mKey, 7401u);
+  }
+
   nsresult StoreParentForBridge(nsMsgKey key, nsMsgKey thread,
                                 nsMsgKey parent) {
     nsCOMPtr<mozIStorageStatement> statement;
@@ -3437,6 +3445,280 @@ TEST_F(DeliveryDatabaseClose, ThreadStepFailureIsNotEmptyIteration) {
   nsIMsgThread* output = thread;
   EXPECT_EQ(NS_ERROR_FAILURE, iterator->GetNext(&output));
   EXPECT_EQ(nullptr, output);
+}
+
+TEST_F(DeliveryCompleteHeader, OfflineProtocolDeltaSurvivesNormalReopen) {
+  ASSERT_NO_FATAL_FAILURE(CreateOfflineProtocolSource());
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  const ServerMessageLocation source{mFolder, mKey, 77, 7401};
+  const uint32_t clientFlags = nsMsgMessageFlags::Forwarded;
+  ASSERT_EQ(NS_OK, mHeader->SetFlags(clientFlags));
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x81, true));
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, false));
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x40, true));
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  ASSERT_TRUE(payload.flagMutation);
+  EXPECT_EQ(0xc0u, payload.flagMutation->setMask);
+  EXPECT_EQ(0x01u, payload.flagMutation->clearMask);
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, mHeader->GetFlags(&flags));
+  EXPECT_EQ(clientFlags, flags);
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey,
+                                                              identity));
+  ASSERT_TRUE(identity.source);
+  EXPECT_EQ(mKey, identity.source->key);
+  EXPECT_EQ(7401u, identity.source->uid);
+  const auto revision = identity.revision;
+
+  // Use the fixture's ordinary asynchronous close/startup and same profile.
+  db = nullptr;
+  mHeader = nullptr;
+  ASSERT_TRUE(Stop());
+  mCore = DatabaseCore::GetInstanceForService();
+  ASSERT_EQ(NS_OK, mCore->Startup());
+  db = new PerFolderDatabase(mFolder, false);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  ASSERT_TRUE(payload.flagMutation);
+  EXPECT_EQ(0xc0u, payload.flagMutation->setMask);
+  EXPECT_EQ(0x01u, payload.flagMutation->clearMask);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey,
+                                                              identity));
+  EXPECT_EQ(revision, identity.revision);
+  ASSERT_TRUE(identity.source);
+  EXPECT_EQ(77u, identity.source->epoch);
+  EXPECT_EQ(7401u, identity.source->uid);
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x80, false));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  ASSERT_TRUE(payload.flagMutation);
+  EXPECT_EQ(0x40u, payload.flagMutation->setMask);
+  EXPECT_EQ(0x81u, payload.flagMutation->clearMask);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, OfflineProtocolLegacyWritersRemainUnknown) {
+  ASSERT_NO_FATAL_FAILURE(CreateOfflineProtocolSource());
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  const ServerMessageLocation source{mFolder, mKey, 77, 7401};
+  for (bool flagOperation : {false, true}) {
+    ASSERT_EQ(NS_OK,
+              db->QueueOfflineProtocolFlagMutation(mKey, source, 0x80, true));
+    OfflineOperationData before;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetOfflineOperation(mFolder, mKey, before));
+    ASSERT_TRUE(before.flagMutation);
+    nsCOMPtr<nsIMsgOfflineImapOperation> op;
+    ASSERT_EQ(NS_OK, db->GetOfflineOpForKey(mKey, false, getter_AddRefs(op)));
+    ASSERT_TRUE(op);
+    // Even the same legacy numeric word is an explicit unproven replacement.
+    if (flagOperation) {
+      ASSERT_EQ(NS_OK, op->SetFlagOperation(before.newFlags));
+    } else {
+      ASSERT_EQ(NS_OK, op->SetNewFlags(before.newFlags));
+    }
+    OfflineOperationData after;
+    ASSERT_EQ(NS_OK,
+              mCore->MessageDB().GetOfflineOperation(mFolder, mKey, after));
+    EXPECT_FALSE(after.flagMutation);
+    EXPECT_EQ(before.newFlags, after.newFlags);
+    EXPECT_TRUE(after.operation & nsIMsgOfflineImapOperation::kFlagsChanged);
+    QueuedSourceIdentity identity, retained;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey,
+                                                                identity));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, true));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey,
+                                                                retained));
+    EXPECT_EQ(identity.revision, retained.revision);
+    imapMessageFlagsType legacy = 0xa5;
+    ASSERT_EQ(NS_OK, op->GetNewFlags(&legacy));
+    EXPECT_EQ(before.newFlags, legacy);
+    // Each variant starts a distinct explicitly removed unsent intent.
+    op = nullptr;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveOfflineOperation(mFolder, mKey));
+  }
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, OfflineProtocolCombinedUpdatesKeepProvenance) {
+  ASSERT_NO_FATAL_FAILURE(CreateOfflineProtocolSource());
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  const ServerMessageLocation source{mFolder, mKey, 77, 7401};
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x81, true));
+  nsCOMPtr<nsIMsgOfflineImapOperation> op;
+  ASSERT_EQ(NS_OK, db->GetOfflineOpForKey(mKey, false, getter_AddRefs(op)));
+  ASSERT_TRUE(op);
+  ASSERT_EQ(NS_OK, op->SetMsgSize(3537));
+  ASSERT_EQ(NS_OK, op->AddKeywordToAdd("keep-tag"));
+  ASSERT_EQ(NS_OK,
+            op->AddMessageCopyOperation("imap://example.invalid/first"_ns));
+  ASSERT_EQ(NS_OK,
+            op->AddMessageCopyOperation("imap://example.invalid/second"_ns));
+  ASSERT_EQ(NS_OK, op->SetPlayingBack(true));
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  ASSERT_TRUE(payload.flagMutation);
+  EXPECT_EQ(0x81u, payload.flagMutation->setMask);
+  EXPECT_EQ(0u, payload.flagMutation->clearMask);
+  EXPECT_EQ(3537u, payload.messageSize);
+  EXPECT_EQ("keep-tag"_ns, payload.keywordsToAdd);
+  EXPECT_EQ((nsTArray<nsCString>{"imap://example.invalid/first"_ns,
+                                 "imap://example.invalid/second"_ns}),
+            payload.copyDestinations);
+  ASSERT_EQ(NS_OK,
+            op->ClearOperation(nsIMsgOfflineImapOperation::kFlagsChanged));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  EXPECT_FALSE(payload.flagMutation);
+  EXPECT_FALSE(payload.operation & nsIMsgOfflineImapOperation::kFlagsChanged);
+  EXPECT_TRUE(payload.operation & nsIMsgOfflineImapOperation::kMsgCopy);
+  EXPECT_TRUE(payload.operation & nsIMsgOfflineImapOperation::kAddKeywords);
+  EXPECT_EQ(2u, payload.copyDestinations.Length());
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x40, true));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  ASSERT_TRUE(payload.flagMutation);
+  EXPECT_EQ(0x40u, payload.flagMutation->setMask);
+  EXPECT_EQ("keep-tag"_ns, payload.keywordsToAdd);
+  EXPECT_EQ(2u, payload.copyDestinations.Length());
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, OfflineProtocolInputsPreserveCallerAndIdentity) {
+  ASSERT_NO_FATAL_FAILURE(CreateOfflineProtocolSource());
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  const ServerMessageLocation source{mFolder, mKey, 77, 7401};
+  for (int32_t mask : {-1, 0x20, 0x100, 0x10000, 0xe000}) {
+    EXPECT_EQ(NS_ERROR_INVALID_ARG,
+              db->QueueOfflineProtocolFlagMutation(mKey, source, mask, true));
+  }
+  ASSERT_EQ(NS_OK, db->QueueOfflineProtocolFlagMutation(mKey, source, 0, true));
+  nsTArray<nsMsgKey> keys;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().ListOfflineOperations(mFolder, false, keys));
+  EXPECT_TRUE(keys.IsEmpty());
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, true));
+  bool active = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, true));
+  QueuedSourceIdentity before, after;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey, before));
+  for (uint32_t variant = 0; variant < 3; ++variant) {
+    auto wrong = source;
+    if (variant == 0) ++wrong.epoch;
+    if (variant == 1) ++wrong.uid;
+    if (variant == 2) ++wrong.key;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db->QueueOfflineProtocolFlagMutation(mKey, wrong, 0x80, true));
+  }
+  uint64_t other;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "Other"_ns, &other));
+  RefPtr<PerFolderDatabase> foreign = new PerFolderDatabase(other, false);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, foreign->QueueOfflineProtocolFlagMutation(
+                                        mKey, source, 0x80, true));
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey, after));
+  EXPECT_EQ(before.operationId, after.operationId);
+  EXPECT_EQ(before.revision, after.revision);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       OfflineProtocolClosedAndForeignSourceKeepOutputs) {
+  ASSERT_NO_FATAL_FAILURE(CreateOfflineProtocolSource());
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  const ServerMessageLocation source{mFolder, mKey, 77, 7401};
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x80, true));
+  nsCOMPtr<nsIMsgOfflineImapOperation> op;
+  ASSERT_EQ(NS_OK, db->GetOfflineOpForKey(mKey, false, getter_AddRefs(op)));
+  ASSERT_TRUE(op);
+  // This precise stale-incarnation fault is restored before ordinary teardown.
+  // A real database replacement cannot occur inside the open native fixture.
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit([&] {
+    bool active = false;
+    EXPECT_EQ(NS_OK, Connection()->GetTransactionInProgress(&active));
+    if (active) EXPECT_EQ(NS_OK, Connection()->RollbackTransaction());
+  });
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId = "
+                       "'{7a139b24-9c50-47fa-8322-168da90748c0}'"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, true));
+  imapMessageFlagsType word = 0xa5;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, op->GetNewFlags(&word));
+  EXPECT_EQ(0xa5u, word);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, op->SetNewFlags(0));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, op->SetPlayingBack(true));
+  ASSERT_EQ(NS_OK, Connection()->RollbackTransaction());
+  rollback.release();
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  ASSERT_TRUE(payload.flagMutation);
+  EXPECT_EQ(0x80u, payload.flagMutation->setMask);
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, true));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, op->GetNewFlags(&word));
+  EXPECT_EQ(0xa5u, word);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, op->SetPlayingBack(true));
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, OfflineProtocolWriteFailureRetainsWholeIntent) {
+  ASSERT_NO_FATAL_FAILURE(CreateOfflineProtocolSource());
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, false);
+  const ServerMessageLocation source{mFolder, mKey, 77, 7401};
+  ASSERT_EQ(NS_OK,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, true));
+  nsCOMPtr<nsIMsgOfflineImapOperation> op;
+  ASSERT_EQ(NS_OK, db->GetOfflineOpForKey(mKey, false, getter_AddRefs(op)));
+  ASSERT_TRUE(op);
+  QueuedSourceIdentity before, after;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey, before));
+  // Force only the reached durable write to fail; normal setup/cleanup remains.
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER delivery_protocol_write_failure "
+                       "BEFORE UPDATE ON main.offline_operations BEGIN "
+                       "SELECT RAISE(ABORT,'protocol write failure'); END"_ns));
+  auto remove = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER delivery_protocol_write_failure"_ns));
+  });
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, op->SetNewFlags(0));
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->QueueOfflineProtocolFlagMutation(mKey, source, 0x01, false));
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetOfflineOperation(mFolder, mKey, payload));
+  ASSERT_TRUE(payload.flagMutation);
+  EXPECT_EQ(0x01u, payload.flagMutation->setMask);
+  EXPECT_EQ(0u, payload.flagMutation->clearMask);
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().GetQueuedSourceIdentity(mFolder, mKey, after));
+  EXPECT_EQ(before.operationId, after.operationId);
+  EXPECT_EQ(before.revision, after.revision);
+  CheckNoTransaction();
 }
 
 }  // namespace mozilla::mailnews

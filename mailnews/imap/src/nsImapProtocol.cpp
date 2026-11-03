@@ -2824,6 +2824,94 @@ const char* nsImapProtocol::GetServerCommandTag() {
  *  It will issue SELECT commands if needed to make sure the correct mailbox
  *  is selected.
  */
+#ifdef MOZ_PANORAMA
+void nsImapProtocol::ProcessNativeReplayCommand() {
+  using namespace mozilla::mailnews;
+  auto* url = static_cast<nsImapUrl*>(m_runningUrl.get());
+  auto token = url->CopyNativeReplayCommand();
+  MOZ_ASSERT(token && token->attempt.source);
+  auto reject = [&](nsresult status) {
+    // This path has not sent this command. A wire failure below never uses it.
+    url->RecordNativeReplayReceipt(OfflineReplayReceipt::RejectedNoEffect,
+                                   status);
+    m_mailboxUpdateResult = status;
+  };
+  const auto& source = *token->attempt.source;
+  if (source.epoch != GetServerStateParser().FolderUIDValidity() ||
+      GetServerStateParser().CurrentFolderReadOnly()) {
+    reject(NS_ERROR_NOT_AVAILABLE);
+    return;
+  }
+  bool flags = token->command == OfflineReplayCommand::FlagSet ||
+               token->command == OfflineReplayCommand::FlagClear ||
+               token->command == OfflineReplayCommand::MoveStore;
+  bool add = token->command != OfflineReplayCommand::FlagClear;
+  uint16_t mask = kImapMsgDeletedFlag | kImapMsgSeenFlag;
+  if (flags && token->command != OfflineReplayCommand::MoveStore) {
+    if (!token->attempt.flagMutation) {
+      reject(NS_ERROR_NOT_AVAILABLE);
+      return;
+    }
+    mask = add ? token->attempt.flagMutation->setMask
+               : token->attempt.flagMutation->clearMask;
+  }
+  if (flags) {
+    uint16_t writable = GetServerStateParser().SettablePermanentFlags();
+    uint16_t supported = GetServerStateParser().SupportsUserFlags();
+    if (supported & kImapMsgSupportForwardedFlag)
+      writable |= kImapMsgForwardedFlag;
+    if (supported & kImapMsgSupportMDNSentFlag) writable |= kImapMsgMDNSentFlag;
+    if (!mask || (mask & ~writable)) {
+      reject(NS_MSG_ERROR_IMAP_COMMAND_FAILED);
+      return;
+    }
+  } else if (token->command == OfflineReplayCommand::MoveUidExpunge &&
+             !(GetServerStateParser().GetCapabilityFlag() &
+               kUidplusCapability)) {
+    reject(NS_ERROR_NOT_AVAILABLE);
+    return;
+  }
+  nsAutoCString uid;
+  uid.AppendInt(source.uid);
+  m_runningUrl->SetExtraStatus(nsIImapUrl::ImapStatusNone);
+  // Reuse the existing non-repeatable-command fence. A lost response is a
+  // persisted ambiguous step, not permission for a transport retry.
+  m_copyCommandIssued = true;
+  if (flags) {
+    url->CollectNativeReplayFlags(true);
+    ProcessStoreFlags(uid, true, mask, add);
+    url->CollectNativeReplayFlags(false);
+  } else if (token->command == OfflineReplayCommand::MoveUidExpunge) {
+    UidExpunge(uid);
+  } else if (token->command == OfflineReplayCommand::MoveExpunge) {
+    Expunge();
+  } else {
+    reject(NS_ERROR_INVALID_ARG);
+    return;
+  }
+  nsresult status = m_mailboxUpdateResult;
+  if (NS_SUCCEEDED(status) && NS_FAILED(GetConnectionStatus()))
+    status = GetConnectionStatus();
+  if (NS_SUCCEEDED(status) && (DeathSignalReceived() ||
+                               !GetServerStateParser().LastCommandSuccessful()))
+    status = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+  if (NS_SUCCEEDED(status) && flags) {
+    int32_t extra;
+    status = m_runningUrl->GetExtraStatus(&extra);
+    if (NS_SUCCEEDED(status) && (extra != nsIImapUrl::ImapStatusNone ||
+                                 !url->NativeReplayFlagsMatched()))
+      status = NS_ERROR_NOT_AVAILABLE;
+  }
+  // Even a tagged NO may follow a partial server effect. Only the no-send
+  // preflights above prove RejectedNoEffect; uncertainty stays fenced.
+  url->RecordNativeReplayReceipt(NS_SUCCEEDED(status)
+                                     ? OfflineReplayReceipt::Acknowledged
+                                     : OfflineReplayReceipt::Ambiguous,
+                                 status);
+  m_mailboxUpdateResult = status;
+}
+#endif
+
 void nsImapProtocol::ProcessSelectedStateURL() {
   nsCString mailboxName;
   bool bMessageIdsAreUids = true;
@@ -2957,6 +3045,19 @@ void nsImapProtocol::ProcessSelectedStateURL() {
         !DeathSignalReceived() &&
         (uidValidityOk || m_imapAction == nsIImapUrl::nsImapDeleteAllMsgs)) {
 #ifdef MOZ_PANORAMA
+      auto* replayUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
+      if (replayUrl->CopyNativeReplayCommand()) {
+        // One existing wire command per durable dispatch token. In particular,
+        // an add-Deleted command must not run the legacy implicit EXPUNGE tail.
+        ProcessNativeReplayCommand();
+        return;
+      }
+      if (replayUrl->HasNativeFolderDelete() &&
+          m_imapAction == nsIImapUrl::nsImapDeleteAllMsgs &&
+          GetServerStateParser().CurrentFolderReadOnly()) {
+        m_mailboxUpdateResult = NS_ERROR_NOT_AVAILABLE;
+        return;
+      }
       if (expectedEpoch &&
           (m_imapAction == nsIImapUrl::nsImapAddMsgFlags ||
            m_imapAction == nsIImapUrl::nsImapSubtractMsgFlags)) {
@@ -3325,14 +3426,24 @@ void nsImapProtocol::ProcessSelectedStateURL() {
           DeleteFolderAndMsgs(mailboxName.get());
           break;
         case nsIImapUrl::nsImapDeleteAllMsgs: {
+#ifdef MOZ_PANORAMA
+          bool nativeDelete = static_cast<nsImapUrl*>(m_runningUrl.get())
+                                  ->HasNativeFolderDelete();
+#endif
+          bool succeeded = true;
+#ifdef MOZ_PANORAMA
+          if (nativeDelete) m_copyCommandIssued = true;
+#endif
           uint32_t numberOfMessages = GetServerStateParser().NumberOfMessages();
           if (numberOfMessages) {
             Store("1:*"_ns, "+FLAGS.SILENT (\\Deleted)",
                   false);  // use sequence #'s
-
-            if (GetServerStateParser().LastCommandSuccessful())
-              Expunge();  // expunge messages with deleted flag
-            if (GetServerStateParser().LastCommandSuccessful()) {
+            succeeded = GetServerStateParser().LastCommandSuccessful();
+            if (succeeded) {
+              Expunge();
+              succeeded = GetServerStateParser().LastCommandSuccessful();
+            }
+            if (succeeded) {
               nsCString canonicalName;
               const char* selectedMailboxName =
                   GetServerStateParser().GetSelectedMailboxName();
@@ -3341,14 +3452,35 @@ void nsImapProtocol::ProcessSelectedStateURL() {
                     nsDependentCString(selectedMailboxName),
                     kOnlineHierarchySeparatorUnknown, canonicalName);
               }
-
               if (m_imapMessageSink)
                 m_imapMessageSink->NotifyMessageDeleted(canonicalName.get(),
                                                         true, nullptr);
             }
           }
           bool deleteSelf = false;
-          DeleteSubFolders(mailboxName.get(), deleteSelf);  // don't delete self
+#ifdef MOZ_PANORAMA
+          // Do not let a later successful LIST overwrite the first failed
+          // destructive command. The whole attempt remains uncertain.
+          if (nativeDelete) {
+            if (succeeded && NS_SUCCEEDED(m_mailboxUpdateResult) &&
+                GetConnectionStatus() >= 0 && !DeathSignalReceived()) {
+              succeeded = DeleteSubFolders(mailboxName.get(), deleteSelf);
+            } else {
+              succeeded = false;
+            }
+            if (succeeded && GetServerStateParser().LastCommandSuccessful() &&
+                NS_SUCCEEDED(m_mailboxUpdateResult) &&
+                GetConnectionStatus() >= 0 && !DeathSignalReceived()) {
+              static_cast<nsImapUrl*>(m_runningUrl.get())
+                  ->RecordNativeFolderDeleteAcknowledged();
+            } else if (NS_SUCCEEDED(m_mailboxUpdateResult)) {
+              m_mailboxUpdateResult = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
+            }
+          } else
+#endif
+          {
+            DeleteSubFolders(mailboxName.get(), deleteSelf);
+          }
         } break;
         case nsIImapUrl::nsImapAppendDraftFromFile: {
           OnAppendMsgFromFile();
@@ -3563,9 +3695,9 @@ void nsImapProtocol::ProcessSelectedStateURL() {
           if (!DeathSignalReceived() && NS_SUCCEEDED(m_mailboxUpdateResult) &&
               GetServerStateParser().LastCommandSuccessful() &&
               (m_imapAction == nsIImapUrl::nsImapOnlineMove) &&
-              (nativeQueuedCopy ||
-               !(GetServerStateParser().GetCapabilityFlag() &
-                 kHasMoveCapability))) {
+              !nativeQueuedCopy &&
+              !(GetServerStateParser().GetCapabilityFlag() &
+                kHasMoveCapability)) {
             // Simulate MOVE for servers that don't support MOVE: do
             // COPY-DELETE-EXPUNGE.
             Store(messageIdString, "+FLAGS (\\Deleted \\Seen)",
@@ -5342,6 +5474,11 @@ bool nsImapProtocol::HandleKeywordResponse(imapMessageFlagsType flags,
                                            const nsACString& keywords,
                                            ImapUid uid, bool explicitUid) {
 #ifdef MOZ_PANORAMA
+  if (m_runningUrl) {
+    auto* replay = static_cast<nsImapUrl*>(m_runningUrl.get());
+    if (replay->CopyNativeReplayCommand())
+      replay->RecordNativeReplayFlags(uid, flags, explicitUid);
+  }
   if (mCollectKeywordResponses) {
     // A FLAGS-only response may have borrowed its UID from the sequence cache.
     // It cannot confirm this command or select a physical row to update.

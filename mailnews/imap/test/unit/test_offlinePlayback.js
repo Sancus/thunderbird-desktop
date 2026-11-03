@@ -50,7 +50,9 @@ add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
     }
     const sourceUid = 900001;
     const uri = Services.io.newFileURI(do_get_file("../../../data/bugmail10"));
-    IMAPPump.mailbox.addMessage(new ImapMessage(uri.spec, sourceUid, []));
+    IMAPPump.mailbox.addMessage(
+      new ImapMessage(uri.spec, sourceUid, ["\\Draft", "\\Seen"])
+    );
     const root = IMAPPump.incomingServer.rootFolder;
     const discovery = new PromiseTestUtils.PromiseUrlListener();
     MailServices.imap.discoverAllFolders(root, discovery, null);
@@ -76,6 +78,7 @@ add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
     IMAPPump.incomingServer.closeCachedConnections();
     Services.io.offline = true;
     source.markMessagesFlagged([original], true);
+    source.markMessagesRead([original], false);
     for (let i = 0; i < targets.length; ++i) {
       const listener = new PromiseTestUtils.PromiseCopyListener();
       MailServices.copy.copyMessages(
@@ -113,6 +116,9 @@ add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
       const mailbox = IMAPPump.daemon.getMailbox(names[i]);
       Assert.equal(mailbox._messages.length, 1);
       Assert.ok(mailbox._messages[0].flags.includes("\\Flagged"));
+      Assert.ok(mailbox._messages[0].flags.includes("\\Draft"));
+      Assert.ok(!mailbox._messages[0].flags.includes("\\Seen"));
+      Assert.ok(!mailbox._messages[0].flags.includes("$MDNSent"));
       const header = targets[i].msgDatabase.getMsgHdrForKey(physicalKeys[i]);
       Assert.equal(header.messageKey, physicalKeys[i]);
       Assert.equal(header.folder, targets[i]);
@@ -131,9 +137,7 @@ add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
       )
     );
     operation = operations.getOfflineOpForKey(oldKey, false);
-    Assert.equal(operation.getCopyDestination(0), targets[0].URI);
-    Assert.equal(operation.getCopyDestination(1), targets[1].URI);
-    Assert.equal(operation.destinationFolderURI, targets[2].URI);
+    Assert.equal(operation, null, "All selected actions settled exactly once");
     const repeated = new PromiseTestUtils.PromiseUrlListener();
     MailServices.imap.playbackAllOfflineOperations(null, repeated);
     await repeated.promise;
@@ -145,6 +149,345 @@ add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
       );
     }
   } finally {
+    Services.io.offline = wasOffline;
+    MailServices.txns.transactionManager.clear();
+    teardownIMAPPump();
+  }
+});
+
+add_task(
+  async function test_nativeFlagPartialFailureRetainsBodyAndDoesNotResend() {
+    if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      return;
+    }
+    Services.prefs.setCharPref(
+      "mail.server.default.storeContractID",
+      Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
+    );
+    setupIMAPPump("RFC2195,RFC4315");
+    const wasOffline = Services.io.offline;
+    const originalStore = IMAP_RFC3501_handler.prototype.STORE;
+    try {
+      const uri = Services.io.newFileURI(
+        do_get_file("../../../data/bugmail10")
+      );
+      for (const uid of [91001, 91002]) {
+        IMAPPump.mailbox.addMessage(
+          new ImapMessage(uri.spec, uid, ["\\Draft", "\\Seen", "\\Recent"])
+        );
+      }
+      const root = IMAPPump.incomingServer.rootFolder;
+      const discovery = new PromiseTestUtils.PromiseUrlListener();
+      MailServices.imap.discoverAllFolders(root, discovery, null);
+      await discovery.promise;
+      const source = root
+        .getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox)
+        .QueryInterface(Ci.nsIMsgImapMailFolder);
+      const selected = new PromiseTestUtils.PromiseUrlListener();
+      source.updateFolderWithListener(null, selected);
+      await selected.promise;
+      const downloaded = new PromiseTestUtils.PromiseUrlListener();
+      source.downloadAllForOffline(downloaded, null);
+      await downloaded.promise;
+      const headers = [91001, 91002].map(uid =>
+        Array.from(source.msgDatabase.enumerateMessages()).find(
+          header => header.getUint32Property("uidOnServer") == uid
+        )
+      );
+      Assert.ok(headers.every(Boolean));
+      const keys = headers.map(header => header.messageKey);
+      Assert.notEqual(keys[0], 91001);
+      const operations = source.msgDatabase.QueryInterface(
+        Ci.nsIMsgOfflineOpsDatabase
+      );
+      IMAPPump.incomingServer.closeCachedConnections();
+      Services.io.offline = true;
+      source.storeImapFlags(0, true, [keys[0]], null);
+      Assert.equal(operations.getOfflineOpForKey(keys[0], false), null);
+      Assert.throws(
+        () => source.storeImapFlags(0x20, true, [keys[0]], null),
+        /NS_ERROR_INVALID_ARG/
+      );
+      Assert.equal(operations.getOfflineOpForKey(keys[0], false), null);
+      source.storeImapFlags(0x84, true, [keys[0]], null); // MDNSent and Flagged.
+      source.storeImapFlags(0x01, false, [keys[0]], null); // Seen.
+      source.markMessagesFlagged([headers[1]], true);
+      let sets = 0;
+      let clears = 0;
+      let independent = 0;
+      IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
+        if (uid && String(args[0]) == "91001") {
+          if (args[1].startsWith("-")) {
+            clears++;
+            // The caller cannot prove no partial effect from tagged NO.
+            return "NO selected flag removal failed";
+          }
+          sets++;
+        } else if (uid && String(args[0]) == "91002") {
+          independent++;
+        }
+        return originalStore.call(this, args, uid);
+      };
+      Services.io.offline = false;
+      const failed = new PromiseTestUtils.PromiseUrlListener();
+      const failedPromise = Assert.rejects(
+        failed.promise,
+        error => error.message != String(Cr.NS_OK)
+      );
+      MailServices.imap.playbackAllOfflineOperations(null, failed);
+      await failedPromise;
+      Assert.equal(sets, 1);
+      Assert.equal(clears, 1);
+      Assert.equal(
+        independent,
+        1,
+        "A separate physical message still completes"
+      );
+      const message = IMAPPump.mailbox._messages.find(msg => msg.uid == 91001);
+      for (const flag of [
+        "\\Draft",
+        "\\Seen",
+        "\\Recent",
+        "\\Flagged",
+        "$MDNSent",
+      ]) {
+        Assert.ok(
+          message.flags.includes(flag),
+          `${flag} is retained or explicitly set`
+        );
+      }
+      Assert.ok(source.msgDatabase.containsKey(keys[0]));
+      Assert.ok(headers[0].flags & Ci.nsMsgMessageFlags.Offline);
+      Assert.ok(headers[0].storeToken);
+      const retained = operations.getOfflineOpForKey(keys[0], false);
+      Assert.ok(
+        retained.operation & Ci.nsIMsgOfflineImapOperation.kFlagsChanged
+      );
+      Assert.equal(retained.srcUid, 91001);
+      Assert.equal(operations.getOfflineOpForKey(keys[1], false), null);
+      const stream = source.getMsgInputStream(headers[0]);
+      Assert.greater(
+        stream.available(),
+        0,
+        "The real provider body is retained"
+      );
+      stream.close();
+      IMAPPump.incomingServer.closeCachedConnections();
+      const repeated = new PromiseTestUtils.PromiseUrlListener();
+      const repeatedPromise = Assert.rejects(
+        repeated.promise,
+        error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
+      );
+      MailServices.imap.playbackAllOfflineOperations(null, repeated);
+      await repeatedPromise;
+      Assert.equal(sets, 1, "The acknowledged set step is not repeated");
+      Assert.equal(clears, 1, "The ambiguous clear step is not repeated");
+      Assert.equal(independent, 1);
+      Assert.ok(operations.getOfflineOpForKey(keys[0], false));
+      Assert.equal(headers[0].getUint32Property("uidOnServer"), 91001);
+    } finally {
+      IMAP_RFC3501_handler.prototype.STORE = originalStore;
+      Services.io.offline = wasOffline;
+      teardownIMAPPump();
+    }
+  }
+);
+
+add_task(async function test_nativeEmptyTrashUsesDurableFolderIntent() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  setupIMAPPump("RFC2195,RFC4315");
+  const wasOffline = Services.io.offline;
+  const originalStore = IMAP_RFC3501_handler.prototype.STORE;
+  let stores = 0;
+  try {
+    IMAPPump.daemon.createMailbox("Trash", {
+      subscribed: true,
+      uidvalidity: IMAPPump.daemon.uidvalidity++,
+    });
+    const mailbox = IMAPPump.daemon.getMailbox("Trash");
+    const uri = Services.io.newFileURI(do_get_file("../../../data/bugmail10"));
+    mailbox.addMessage(new ImapMessage(uri.spec, 92001, []));
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovery = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovery, null);
+    await discovery.promise;
+    const trash = root
+      .getChildNamed("Trash")
+      .QueryInterface(Ci.nsIMsgImapMailFolder);
+    Assert.ok(trash.getFlag(Ci.nsMsgFolderFlags.Trash));
+    const selected = new PromiseTestUtils.PromiseUrlListener();
+    trash.updateFolderWithListener(null, selected);
+    await selected.promise;
+    const downloaded = new PromiseTestUtils.PromiseUrlListener();
+    trash.downloadAllForOffline(downloaded, null);
+    await downloaded.promise;
+    const header = Array.from(trash.msgDatabase.enumerateMessages())[0];
+    Assert.ok(header.flags & Ci.nsMsgMessageFlags.Offline);
+    const key = header.messageKey;
+    const operations = trash.msgDatabase.QueryInterface(
+      Ci.nsIMsgOfflineOpsDatabase
+    );
+    IMAPPump.incomingServer.closeCachedConnections();
+    Services.io.offline = true;
+    root.emptyTrash(null);
+    const operationKeys = operations.listAllOfflineOpIds();
+    Assert.equal(operationKeys.length, 1);
+    const operation = operations.getOfflineOpForKey(operationKeys[0], false);
+    Assert.equal(
+      operation.operation,
+      Ci.nsIMsgOfflineImapOperation.kDeleteAllMsgs
+    );
+    Assert.notEqual(operation.messageKey, key);
+    Assert.ok(
+      trash.msgDatabase.containsKey(key),
+      "Queueing retains the physical row"
+    );
+    IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
+      if (this._selectedMailbox == mailbox && String(args[0]) == "1:*") {
+        stores++;
+      }
+      return originalStore.call(this, args, uid);
+    };
+    Services.io.offline = false;
+    const replayed = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.playbackAllOfflineOperations(null, replayed);
+    await replayed.promise;
+    Assert.equal(stores, 1);
+    Assert.equal(mailbox._messages.length, 0);
+    Assert.ok(!trash.msgDatabase.containsKey(key));
+    Assert.deepEqual(operations.listAllOfflineOpIds(), []);
+    mailbox.addMessage(new ImapMessage(uri.spec, 92002, []));
+    const repeated = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.playbackAllOfflineOperations(null, repeated);
+    await repeated.promise;
+    Assert.equal(
+      stores,
+      1,
+      "An already settled folder intent is not sent again"
+    );
+    Assert.equal(mailbox._messages.length, 1, "New server mail is retained");
+    Assert.equal(mailbox._messages[0].uid, 92002);
+  } finally {
+    IMAP_RFC3501_handler.prototype.STORE = originalStore;
+    Services.io.offline = wasOffline;
+    teardownIMAPPump();
+  }
+});
+
+add_task(async function test_nativeMoveSourceFailureAfterCopySurvivesReopen() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  setupIMAPPump("RFC2195,RFC4315");
+  const wasOffline = Services.io.offline;
+  const originalStore = IMAP_RFC3501_handler.prototype.STORE;
+  const originalCopy = IMAP_RFC3501_handler.prototype.COPY;
+  try {
+    IMAPPump.daemon.createMailbox("PhaseMove", {
+      subscribed: true,
+      uidvalidity: IMAPPump.daemon.uidvalidity++,
+    });
+    const uri = Services.io.newFileURI(do_get_file("../../../data/bugmail10"));
+    const message = new ImapMessage(uri.spec, 93001, []);
+    IMAPPump.mailbox.addMessage(message);
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovery = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovery, null);
+    await discovery.promise;
+    const source = root
+      .getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox)
+      .QueryInterface(Ci.nsIMsgImapMailFolder);
+    const destination = root.getChildNamed("PhaseMove");
+    const selected = new PromiseTestUtils.PromiseUrlListener();
+    source.updateFolderWithListener(null, selected);
+    await selected.promise;
+    const downloaded = new PromiseTestUtils.PromiseUrlListener();
+    source.downloadAllForOffline(downloaded, null);
+    await downloaded.promise;
+    const header = Array.from(source.msgDatabase.enumerateMessages())[0];
+    const sourceKey = header.messageKey;
+    Assert.notEqual(sourceKey, 93001);
+    IMAPPump.incomingServer.closeCachedConnections();
+    Services.io.offline = true;
+    const copied = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.copy.copyMessages(
+      source,
+      [header],
+      destination,
+      true,
+      copied,
+      null,
+      true
+    );
+    const result = await copied.promise;
+    Assert.equal(result.messageKeys.length, 1);
+    const targetKey = result.messageKeys[0];
+    Assert.ok(!source.msgDatabase.containsKey(sourceKey));
+    let copies = 0;
+    let sourceStores = 0;
+    IMAP_RFC3501_handler.prototype.COPY = function (args, uid) {
+      if (uid && String(args[0]) == "93001") copies++;
+      return originalCopy.call(this, args, uid);
+    };
+    IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
+      if (uid && String(args[0]) == "93001" && args[2].includes("\\Deleted")) {
+        sourceStores++;
+        return "NO source STORE failed after actual COPYUID";
+      }
+      return originalStore.call(this, args, uid);
+    };
+    Services.io.offline = false;
+    const failed = new PromiseTestUtils.PromiseUrlListener();
+    const failedPromise = Assert.rejects(
+      failed.promise,
+      error => error.message != String(Cr.NS_OK)
+    );
+    MailServices.imap.playbackAllOfflineOperations(null, failed);
+    await failedPromise;
+    Assert.equal(copies, 1);
+    Assert.equal(sourceStores, 1);
+    const mailbox = IMAPPump.daemon.getMailbox("PhaseMove");
+    Assert.equal(mailbox._messages.length, 1);
+    Assert.ok(IMAPPump.mailbox._messages.includes(message));
+    Assert.ok(!message.flags.includes("\\Deleted"));
+    const target = destination.msgDatabase.getMsgHdrForKey(targetKey);
+    Assert.ok(target.storeToken);
+    Assert.ok(target.flags & Ci.nsMsgMessageFlags.Offline);
+    Assert.equal(
+      target.getUint32Property("uidOnServer"),
+      mailbox._messages[0].uid
+    );
+    const stream = destination.getMsgInputStream(target);
+    Assert.greater(stream.available(), 0);
+    stream.close();
+    IMAPPump.incomingServer.closeCachedConnections();
+    source.ForceDBClosed();
+    destination.ForceDBClosed();
+    const retained = source.msgDatabase
+      .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+      .getOfflineOpForKey(sourceKey, false);
+    Assert.equal(retained.destinationFolderURI, destination.URI);
+    Assert.equal(retained.srcUid, 93001);
+    const repeated = new PromiseTestUtils.PromiseUrlListener();
+    const repeatedPromise = Assert.rejects(
+      repeated.promise,
+      error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE)
+    );
+    MailServices.imap.playbackAllOfflineOperations(null, repeated);
+    await repeatedPromise;
+    Assert.equal(copies, 1, "Reopen does not send a second COPY");
+    Assert.equal(sourceStores, 1, "An ambiguous source command is held");
+    Assert.equal(mailbox._messages.length, 1);
+    Assert.ok(IMAPPump.mailbox._messages.includes(message));
+    Assert.equal(
+      destination.msgDatabase.getMsgHdrForKey(targetKey).messageKey,
+      targetKey
+    );
+  } finally {
+    IMAP_RFC3501_handler.prototype.STORE = originalStore;
+    IMAP_RFC3501_handler.prototype.COPY = originalCopy;
     Services.io.offline = wasOffline;
     MailServices.txns.transactionManager.clear();
     teardownIMAPPump();

@@ -4,6 +4,10 @@
 
 #include "msgCore.h"  // precompiled header...
 #include "nsImapUrl.h"
+#ifdef MOZ_PANORAMA
+#  include "nsIMsgOfflineImapOperation.h"
+#  include "nsImapCore.h"
+#endif
 #include "../public/nsIImapHostSessionList.h"
 #include "nsString.h"
 #include "prmem.h"
@@ -979,6 +983,102 @@ nsTArray<NativeQueuedCopyReceipt> nsImapUrl::CopyNativeCopyReceipts() {
   return mNativeCopyReceipts.Clone();
 }
 
+nsresult nsImapUrl::PrepareNativeReplayCommand(
+    const mozilla::mailnews::OfflineReplayCommandToken& token) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(token.attempt.id && token.attempt.replayVersion == 1 &&
+                     token.attempt.source && token.generation &&
+                     token.attempt.source->epoch && token.attempt.source->uid,
+                 NS_ERROR_NOT_AVAILABLE);
+  mozilla::MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(!mNativeReplayCommand && !mNativeFolderDelete,
+                 NS_ERROR_IN_PROGRESS);
+  mNativeReplayCommand = mozilla::Some(token);
+  return NS_OK;
+}
+
+mozilla::Maybe<mozilla::mailnews::OfflineReplayCommandToken>
+nsImapUrl::CopyNativeReplayCommand() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeReplayCommand;
+}
+
+void nsImapUrl::CollectNativeReplayFlags(bool collecting) {
+  mozilla::MutexAutoLock lock(mLock);
+  if (collecting) mNativeReplayFlagsMatched = false;
+  mCollectNativeReplayFlags = collecting;
+}
+
+void nsImapUrl::RecordNativeReplayFlags(ImapUid uid, imapMessageFlagsType flags,
+                                        bool explicitUid) {
+  using namespace mozilla::mailnews;
+  mozilla::MutexAutoLock lock(mLock);
+  if (!mCollectNativeReplayFlags || !explicitUid || !mNativeReplayCommand ||
+      !mNativeReplayCommand->attempt.source ||
+      uid != mNativeReplayCommand->attempt.source->uid)
+    return;
+  uint16_t mask;
+  bool add = true;
+  if (mNativeReplayCommand->command == OfflineReplayCommand::MoveStore) {
+    mask = kImapMsgDeletedFlag | kImapMsgSeenFlag;
+  } else {
+    if (!mNativeReplayCommand->attempt.flagMutation) return;
+    add = mNativeReplayCommand->command == OfflineReplayCommand::FlagSet;
+    mask = add ? mNativeReplayCommand->attempt.flagMutation->setMask
+               : mNativeReplayCommand->attempt.flagMutation->clearMask;
+  }
+  mNativeReplayFlagsMatched =
+      mask && (add ? (flags & mask) == mask : !(flags & mask));
+}
+
+bool nsImapUrl::NativeReplayFlagsMatched() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeReplayFlagsMatched;
+}
+
+void nsImapUrl::RecordNativeReplayReceipt(
+    mozilla::mailnews::OfflineReplayReceipt outcome, nsresult status) {
+  mozilla::MutexAutoLock lock(mLock);
+  if (mNativeReplayCommand && !mNativeReplayReceipt)
+    mNativeReplayReceipt =
+        mozilla::Some(NativeReplayCommandReceipt{outcome, status});
+}
+
+mozilla::Maybe<NativeReplayCommandReceipt>
+nsImapUrl::CopyNativeReplayReceipt() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeReplayReceipt;
+}
+
+nsresult nsImapUrl::PrepareNativeFolderDelete(
+    const mozilla::mailnews::OfflineAttempt& attempt) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(
+      attempt.id && attempt.folderEpoch &&
+          attempt.operation == nsIMsgOfflineImapOperation::kDeleteAllMsgs,
+      NS_ERROR_NOT_AVAILABLE);
+  mozilla::MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(!mNativeReplayCommand && !mNativeFolderDelete,
+                 NS_ERROR_IN_PROGRESS);
+  mNativeFolderDelete = mozilla::Some(attempt);
+  return NS_OK;
+}
+
+bool nsImapUrl::HasNativeFolderDelete() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeFolderDelete.isSome();
+}
+
+void nsImapUrl::RecordNativeFolderDeleteAcknowledged() {
+  mozilla::MutexAutoLock lock(mLock);
+  if (mNativeFolderDelete) mNativeFolderDeleteAcknowledged = true;
+}
+
+bool nsImapUrl::NativeFolderDeleteAcknowledged() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeFolderDeleteAcknowledged;
+}
+
 void nsImapUrl::RecordNativeSourceRetired() {
   mozilla::MutexAutoLock lock(mLock);
   mNativeSourceRetired = true;
@@ -1278,7 +1378,9 @@ NS_IMETHODIMP nsImapUrl::SetMockChannel(nsIImapMockChannel* aChannel) {
 
 nsresult nsImapUrl::Clone(nsIURI** _retval) {
 #ifdef MOZ_PANORAMA
-  NS_ENSURE_FALSE(CopyNativeQueuedAppendTarget(), NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_FALSE(CopyNativeQueuedAppendTarget() || CopyNativeReplayCommand() ||
+                      HasNativeFolderDelete(),
+                  NS_ERROR_NOT_AVAILABLE);
 #endif
   nsresult rv = nsMsgMailNewsUrl::Clone(_retval);
   NS_ENSURE_SUCCESS(rv, rv);

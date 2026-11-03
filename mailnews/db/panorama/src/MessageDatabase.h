@@ -117,6 +117,17 @@ struct PendingHeaderAttribute {
   Maybe<uint64_t> integer;
 };
 
+// A proven mutation of protocol flags, never a client flag snapshot.
+struct OfflineFlagMutation {
+  uint16_t setMask{0};
+  uint16_t clearMask{0};
+};
+enum class OfflineMoveLocalPresence : uint8_t { Exact, ExactOrAbsent };
+struct OfflineMoveSourceGuard {
+  MessageBodyState original;
+  OfflineMoveLocalPresence presence{OfflineMoveLocalPresence::Exact};
+};
+
 // Combined legacy operation payload; copy destinations retain their order.
 struct OfflineOperationData {
   uint32_t operation{0};
@@ -134,6 +145,11 @@ struct OfflineOperationData {
   Maybe<PendingDestination> pendingDestination;
   // Aligned with copyDestinations. Empty input means all bindings absent.
   nsTArray<Maybe<PendingDestination>> copyDestinationBindings;
+  Maybe<OfflineFlagMutation> flagMutation;
+  Maybe<OfflineMoveSourceGuard> moveSourceGuard;
+  // Input-only: an explicit legacy whole-word setter invalidates provenance.
+  // Ordinary read/modify/write preserves it; this never grants promotion.
+  bool invalidateFlagMutation{false};
 };
 
 // An explicitly identified surviving operation targeting the removed header.
@@ -194,6 +210,35 @@ struct ServerUidConfirmation {
   uint32_t uid{0};
 };
 
+enum class OfflineReplayCommand : uint8_t {
+  FlagSet,
+  FlagClear,
+  MoveStore,
+  MoveUidExpunge,
+  MoveExpunge
+};
+enum class OfflineReplayCommandState : uint8_t {
+  Pending,
+  Sent,
+  RejectedNoEffect,
+  Acknowledged,
+  Ambiguous
+};
+enum class OfflineReplayReceipt : uint8_t {
+  Acknowledged,
+  RejectedNoEffect,
+  Ambiguous
+};
+struct OfflineReplayCommandProgress {
+  OfflineReplayCommandState state{OfflineReplayCommandState::Pending};
+  uint64_t generation{0};
+  Maybe<nsresult> firstError;
+};
+enum class OfflineMoveExpunge : uint8_t { None, Uid, Mailbox };
+struct OfflineMoveSourcePlan {
+  OfflineMoveExpunge expunge{OfflineMoveExpunge::None};
+};
+
 enum class OfflineAttemptState { Pending, Sent, Confirmed, Ambiguous };
 
 struct OfflineAttempt {
@@ -218,6 +263,26 @@ struct OfflineAttempt {
   // Keep Sent until an actual UID receipt confirms the destination.
   bool appendAccepted{false};
   Maybe<MessageBodyState> appendBody;
+  uint32_t replayVersion{0};
+  Maybe<OfflineFlagMutation> flagMutation;
+  Maybe<OfflineMoveSourceGuard> moveSourceGuard;
+  Maybe<OfflineMoveSourcePlan> moveSourcePlan;
+  Maybe<OfflineReplayCommandProgress> flagSet, flagClear;
+  Maybe<OfflineReplayCommandProgress> sourceStore, sourceExpunge;
+  bool moveSettled{false};
+  Maybe<nsresult> firstError;
+};
+
+struct OfflineReplayCommandToken {
+  OfflineAttempt attempt;
+  OfflineReplayCommand command{OfflineReplayCommand::FlagSet};
+  uint64_t generation{0};
+};
+struct OfflineMoveSettlement {
+  uint64_t attemptId{0};
+  nsMsgKey destinationKey{nsMsgKey_None};
+  bool sourceRowRemoved{false};
+  bool operationRetired{false};
 };
 
 // Physical identity only; never a Message-ID or protocol UID.
@@ -474,6 +539,22 @@ class MessageDatabase : public nsIMessageDatabase {
                                            const QueuedSourceIdentity& expected,
                                            const Maybe<uint32_t>& copyOrdinal,
                                            const MessageBodyState& returning);
+  nsresult QueueOfflineProtocolFlagMutation(
+      const nsACString& databaseSourceId, uint64_t folderId,
+      nsMsgKey operationKey, const ServerMessageLocation& expectedSource,
+      int32_t protocolMask, bool addFlags);
+  nsresult PlanOfflineMoveSource(const OfflineAttempt& expected,
+                                 const OfflineMoveSourcePlan& plan,
+                                 OfflineAttempt& output);
+  nsresult BeginOfflineReplayCommand(const OfflineAttempt& expected,
+                                     OfflineReplayCommand command,
+                                     OfflineReplayCommandToken& output);
+  nsresult RecordOfflineReplayCommand(const OfflineReplayCommandToken& token,
+                                      OfflineReplayReceipt receipt,
+                                      nsresult actualStatus);
+  nsresult SettleOfflineMove(const OfflineAttempt& expected,
+                             OfflineMoveSettlement& output);
+
   nsresult StoreOfflineOperation(uint64_t folderId, nsMsgKey key,
                                  const OfflineOperationData& input);
   nsresult SetOfflineOperationPlayingBack(uint64_t folderId, nsMsgKey key,
@@ -681,11 +762,21 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult ValidateAppendTargetInTransaction(const OfflineAttempt& attempt);
   nsresult RequireOfflineUndoQueued(int64_t operationId,
                                     const OfflineOperationData& operation);
+  nsresult ReadExpectedReplayAttempt(const OfflineAttempt& expected,
+                                     OfflineAttempt& actual);
+  nsresult ValidateReplaySource(const OfflineAttempt& attempt, bool& present);
+  nsresult ValidateReplayMove(const OfflineAttempt& attempt);
+  nsresult OfflineReplayActionsComplete(const OfflineAttempt& move,
+                                        bool sourceOnly, bool& complete);
+  nsresult FinishOfflineMoveInTransaction(const OfflineAttempt& attempt,
+                                          bool removed,
+                                          OfflineMoveSettlement& output);
   nsresult StoreOfflineOperationInTransaction(
       uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
       const OfflineOperationUndo* restoring = nullptr,
       bool restoreEmptyCanceledMove = false,
-      const Maybe<uint32_t>& canceledDestination = Nothing());
+      const Maybe<uint32_t>& canceledDestination = Nothing(),
+      bool typedFlagMutation = false);
   nsresult CaptureOfflineOperationInTransaction(
       uint64_t folderId, nsMsgKey key, const nsACString& databaseSourceId,
       OfflineOperationUndo& output, const OfflineUndoCounterpart* counterpart,
@@ -709,12 +800,13 @@ class MessageDatabase : public nsIMessageDatabase {
                                                uint32_t epoch, uint32_t uid,
                                                bool allowStaged);
 
-  nsresult RemoveMessageInternal(nsMsgKey key, uint64_t folderId,
-                                 const nsACString* databaseSourceId,
-                                 MessageRemovalAccounting accounting,
-                                 RemovedMessage* output = nullptr,
-                                 OfflineOperationUndo* redo = nullptr,
-                                 OfflineOperationUndo* nextOffline = nullptr);
+  nsresult RemoveMessageInternal(
+      nsMsgKey key, uint64_t folderId, const nsACString* databaseSourceId,
+      MessageRemovalAccounting accounting, RemovedMessage* output = nullptr,
+      OfflineOperationUndo* redo = nullptr,
+      OfflineOperationUndo* nextOffline = nullptr,
+      const OfflineAttempt* settlement = nullptr,
+      OfflineMoveSettlement* settledOutput = nullptr);
   nsresult ReadRemovedMessage(nsMsgKey key, RemovedMessage& output);
   nsresult AccountRemovedMessage(nsMsgKey key, uint64_t folderId,
                                  const nsACString& databaseSourceId,

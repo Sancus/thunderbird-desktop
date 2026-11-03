@@ -14,6 +14,13 @@
 #include "nsIContentHandler.h"
 #include "nsICacheStorage.h"
 
+#ifdef MOZ_PANORAMA
+namespace mozilla::mailnews {
+struct OfflineAttempt;
+struct OfflineReplayCommandToken;
+}  // namespace mozilla::mailnews
+#endif
+
 class nsIImapUrl;
 class nsIMsgFolder;
 class nsIMsgIncomingServer;
@@ -51,6 +58,17 @@ class nsImapService : public nsIImapService,
   nsresult StoreCustomKeywordsForKeys(
       nsIMsgFolder* folder, nsIMsgWindow* window, const nsACString& add,
       const nsACString& subtract, const nsTArray<nsMsgKey>& keys, nsIURI** url);
+
+#ifdef MOZ_PANORAMA
+  // The caller has durably fenced this exact single command before dispatch.
+  nsresult ReplayOfflineCommand(
+      nsIMsgFolder* folder, nsIUrlListener* listener,
+      const mozilla::mailnews::OfflineReplayCommandToken& token, nsIURI** url);
+  nsresult ReplayOfflineFolderDelete(
+      nsIMsgFolder* folder, nsIUrlListener* listener,
+      const mozilla::mailnews::OfflineAttempt& attempt, bool refresh,
+      nsIURI** url);
+#endif
 
  protected:
   nsresult StoreCustomKeywordsInternal(nsIMsgFolder* folder,

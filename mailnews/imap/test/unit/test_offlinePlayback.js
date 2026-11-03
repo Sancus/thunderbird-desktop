@@ -173,7 +173,11 @@ add_task(
       );
       for (const uid of [91001, 91002]) {
         IMAPPump.mailbox.addMessage(
-          new ImapMessage(uri.spec, uid, { "\\Draft": true, "\\Seen": true, "\\Recent": true })
+          new ImapMessage(uri.spec, uid, {
+            "\\Draft": true,
+            "\\Seen": true,
+            "\\Recent": true,
+          })
         );
       }
       const root = IMAPPump.incomingServer.rootFolder;
@@ -206,7 +210,7 @@ add_task(
       Assert.equal(operations.getOfflineOpForKey(keys[0], false), null);
       Assert.throws(
         () => source.storeImapFlags(0x20, true, [keys[0]], null),
-        /NS_ERROR_INVALID_ARG/
+        error => error.result == Cr.NS_ERROR_INVALID_ARG
       );
       Assert.equal(operations.getOfflineOpForKey(keys[0], false), null);
       source.storeImapFlags(0x84, true, [keys[0]], null); // MDNSent and Flagged.

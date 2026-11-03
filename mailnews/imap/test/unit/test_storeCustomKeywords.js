@@ -35,6 +35,11 @@ var gSynthMessageForKeywordAdd;
 var gSynthMessageForKeywordRemove;
 
 add_setup(async function () {
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    // Native debug chunk/retry coverage exceeds the ordinary 30-second file
+    // budget while completing thousands of strict physical-message checks.
+    requestLongerTimeout(3);
+  }
   Services.prefs.setBoolPref(
     "mail.server.default.autosync_offline_stores",
     false

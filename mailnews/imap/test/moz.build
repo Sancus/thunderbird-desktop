@@ -31,6 +31,8 @@ if CONFIG["MOZ_PANORAMA"]:
         "unit/xpcshell-panorama-discovery-repeat-panorama-mbox.toml",
         "unit/xpcshell-panorama-epoch-maildir.toml",
         "unit/xpcshell-panorama-epoch-mbox.toml",
+        "unit/xpcshell-panorama-ingestion-maildir.toml",
+        "unit/xpcshell-panorama-ingestion-mbox.toml",
     ]
 
 LOCAL_INCLUDES += [

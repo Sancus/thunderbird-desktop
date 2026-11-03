@@ -57,6 +57,7 @@
 #include "mozilla/Preferences.h"
 #include "mozilla/ProfilerMarkers.h"
 #include "mozilla/StaticPrefs_mail.h"
+#include "mozilla/ScopeExit.h"
 #include "mozilla/Try.h"
 #include "mozilla/UniquePtr.h"
 #include "StoreIndexer.h"
@@ -391,6 +392,9 @@ NS_IMETHODIMP nsMsgLocalMailFolder::CreateLocalSubfolder(
 // Rebuild the msgDB by scanning the msgStore.
 NS_IMETHODIMP nsMsgLocalMailFolder::ParseFolder(nsIMsgWindow* window,
                                                 nsIUrlListener* listener) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(RecoverNativePurge(this));
+#endif
   RefPtr<StoreIndexer> indexer = new StoreIndexer();
   nsresult rv;
 
@@ -740,6 +744,9 @@ NS_IMETHODIMP nsMsgLocalMailFolder::GetDatabaseWithReparse(
 
 NS_IMETHODIMP
 nsMsgLocalMailFolder::UpdateFolder(nsIMsgWindow* aWindow) {
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) MOZ_TRY(RecoverNativePurge(this));
+#endif
   (void)RefreshSizeOnDisk();
   nsresult rv;
 
@@ -1542,6 +1549,10 @@ nsresult nsMsgLocalMailFolder::DeleteMessagesInternal(
 
   bool isTrashFolder = mFlags & nsMsgFolderFlags::Trash;
 #ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup() && !undo && !isMove &&
+      (deleteStorage || isTrashFolder)) {
+    return DeleteNativePermanentMessages(msgHeaders, msgWindow, listener);
+  }
   if (mail_panorama_enabled_AtStartup() && (deleteStorage || isTrashFolder)) {
     RefPtr<mozilla::mailnews::DatabaseCore> core =
         mozilla::mailnews::DatabaseCore::GetInstanceForService();
@@ -1678,6 +1689,61 @@ nsresult nsMsgLocalMailFolder::DeleteMessagesInternal(
   }
   return complete(rv);
 }
+
+#ifdef MOZ_PANORAMA
+nsresult nsMsgLocalMailFolder::DeleteNativePermanentMessages(
+    const nsTArray<RefPtr<nsIMsgDBHdr>>& headers, nsIMsgWindow* window,
+    nsIMsgCopyServiceListener* listener) {
+  // Keep the original synchronous callback contract. Reentry cannot launch a
+  // second selection or retire the source while the first operation settles.
+  NS_ENSURE_FALSE(mNativePurging, NS_ERROR_IN_PROGRESS);
+  mozilla::AutoRestore<bool> restore(mNativePurging);
+  mNativePurging = true;
+  nsCOMPtr<nsISupports> holder = static_cast<nsIMsgLocalMailFolder*>(this);
+  MOZ_TRY(AcquireSemaphore(holder, "DeleteNativePermanentMessages"_ns));
+  auto release = mozilla::MakeScopeExit(
+      [&] { ReleaseSemaphore(holder, "DeleteNativePermanentMessages"_ns); });
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(GetDatabaseWOReparse(getter_AddRefs(database)));
+  MOZ_TRY(RecoverNativePurge(this));
+  nsresult rv = EnableNotifications(allMessageCountNotifications, false);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (listener) listener->OnStartCopy();
+  nsTArray<RefPtr<nsIMsgDBHdr>> removed;
+  rv = PurgeNativeMessages(
+      this, database, headers, removed, [&](nsIMsgDBHdr* header) {
+        uint32_t detached = 0;
+        header->GetUint32Property("attachmentDetached", &detached);
+        if (!detached) MarkMsgsOnPop3Server({header}, POP3_DELETE);
+      });
+  // Notify only the committed prefix. A SQL/provider/custody error must not
+  // announce deletion of a later untouched source or erase the primary error.
+  if (!removed.IsEmpty()) {
+    nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+        mozilla::components::FolderNotification::Service();
+    notifier->NotifyMsgsDeleted(removed);
+  }
+  nsresult notify = EnableNotifications(allMessageCountNotifications, true);
+  if (NS_SUCCEEDED(rv)) rv = notify;
+  if (window) {
+    nsCOMPtr<nsIMsgTransactionService> txns =
+        mozilla::components::Txns::Service();
+    nsCOMPtr<nsITransactionManager> manager;
+    nsresult cleared =
+        txns ? txns->GetTransactionManager(getter_AddRefs(manager))
+             : NS_ERROR_UNEXPECTED;
+    if (NS_SUCCEEDED(cleared) && manager) cleared = manager->Clear();
+    if (NS_SUCCEEDED(rv)) rv = cleared;
+  }
+  NotifyFolderEvent(NS_SUCCEEDED(rv) ? kDeleteOrMoveMsgCompleted
+                                     : kDeleteOrMoveMsgFailed);
+  if (listener) listener->OnStopCopy(rv);
+  // Never compact unresolved custody. A later normal UpdateFolder reconciles
+  // it before any new retention selection, folder scan or provider mutation.
+  if (NS_SUCCEEDED(rv) && window) AutoCompact(window);
+  return rv;
+}
+#endif
 
 // Go through the given messages and tell the msgStore about their flags.
 nsresult nsMsgLocalMailFolder::UpdateMsgFlagsInStore(
@@ -2567,7 +2633,7 @@ nsresult nsMsgLocalMailFolder::WriteStartOfNewMessage() {
       // nsMsgMessageFlags::Offline
       PR_snprintf(statusStrBuf, sizeof(statusStrBuf),
                   X_MOZILLA_STATUS_FORMAT MSG_LINEBREAK,
-                  dbFlags & ~(nsMsgMessageFlags::RuntimeOnly) & 0x0000FFFF);
+                  dbFlags & ~(nsMsgMessageFlags::RuntimeOnly)&0x0000FFFF);
     } else {
       strcpy(statusStrBuf, "X-Mozilla-Status: 0001" MSG_LINEBREAK);
     }

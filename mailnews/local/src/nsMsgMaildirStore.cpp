@@ -11,6 +11,9 @@
 #include "prprf.h"
 #include "msgCore.h"
 #include "nsMsgMaildirStore.h"
+#ifdef MOZ_PANORAMA
+#  include "nsLocalUtils.h"
+#endif
 #include "nsIMsgFolder.h"
 #include "nsIMsgFolderNotificationService.h"
 #include "nsIDirectoryEnumerator.h"
@@ -246,6 +249,7 @@ NS_IMPL_ISUPPORTS(nsMsgMaildirStore, nsIMsgPluggableStore,
 
 NS_IMETHODIMP nsMsgMaildirStore::CheckFolderStorageMove(nsIMsgFolder* folder) {
   NS_ENSURE_ARG(folder);
+  MOZ_TRY(CheckNativePurgePending(folder));
   auto entry = mOngoingWrites.lookup(folder->URI());
   if (!entry) return NS_OK;
   if (NS_FAILED(entry->value().finishStatus))
@@ -789,6 +793,10 @@ NS_IMETHODIMP nsMsgMaildirStore::CopyFolder(
 
 nsresult nsMsgMaildirStore::InternalGetNewMsgOutputStream(
     nsIMsgFolder* folder, nsACString& storeToken, nsIOutputStream** outStream) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
+
   // Check path admission before preempting an issued stream. A failed native
   // relocation can deny this path while the previous stream still owns bytes.
   nsCOMPtr<nsIFile> admittedPath;
@@ -1028,6 +1036,10 @@ NS_IMETHODIMP nsMsgMaildirStore::DeleteMessages(
 
 NS_IMETHODIMP nsMsgMaildirStore::DeleteStoreMessages(
     nsIMsgFolder* folder, nsTArray<nsCString> const& storeTokens) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgeRemoval(folder, storeTokens));
+#endif
+
   NS_ENSURE_ARG(folder);
 
   for (auto storeToken : storeTokens) {
@@ -1222,6 +1234,9 @@ NS_IMETHODIMP nsMsgMaildirStore::AsyncCompact(
 
 NS_IMETHODIMP nsMsgMaildirStore::AsyncScan(nsIMsgFolder* folder,
                                            nsIStoreScanListener* scanListener) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
   nsCOMPtr<nsIFile> maildirPath;
   nsresult rv = folder->GetFilePath(getter_AddRefs(maildirPath));
   NS_ENSURE_SUCCESS(rv, rv);
@@ -1234,6 +1249,10 @@ NS_IMETHODIMP nsMsgMaildirStore::AsyncScan(nsIMsgFolder* folder,
 NS_IMETHODIMP nsMsgMaildirStore::ChangeFlags(
     nsIMsgFolder* folder, nsTArray<nsCString> const& storeTokens,
     nsTArray<uint32_t> const& newFlags) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
+
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG(storeTokens.Length() == newFlags.Length());
 
@@ -1293,6 +1312,9 @@ NS_IMETHODIMP nsMsgMaildirStore::ChangeKeywords(
   nsCOMPtr<nsIMsgFolder> folder;
   rv = aHdrArray[0]->GetFolder(getter_AddRefs(folder));
   NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
 
   for (auto msgHdr : aHdrArray) {
     nsAutoCString storeToken;

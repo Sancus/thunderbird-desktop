@@ -38,6 +38,7 @@
 #include "mozilla/Try.h"
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
+#  include "nsLocalUtils.h"
 #  include "mozilla/StaticPrefs_mail.h"
 #endif
 #include <charconv>
@@ -84,6 +85,7 @@ NS_IMPL_ISUPPORTS(nsMsgBrkMBoxStore, nsIMsgPluggableStore,
 
 NS_IMETHODIMP nsMsgBrkMBoxStore::CheckFolderStorageMove(nsIMsgFolder* folder) {
   NS_ENSURE_ARG(folder);
+  MOZ_TRY(CheckNativePurgePending(folder));
   auto entry = mOngoingWrites.lookup(folder->URI());
   if (!entry) return NS_OK;
   if (NS_FAILED(entry->value().status)) return entry->value().status;
@@ -750,6 +752,10 @@ nsresult nsMsgBrkMBoxStore::InvalidateOngoingWrite(nsIMsgFolder* folder) {
 NS_IMETHODIMP
 nsMsgBrkMBoxStore::GetNewMsgOutputStream(nsIMsgFolder* folder,
                                          nsIOutputStream** outStream) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
+
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG_POINTER(outStream);
 
@@ -1008,6 +1014,10 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::DeleteMessages(
 
 NS_IMETHODIMP nsMsgBrkMBoxStore::DeleteStoreMessages(
     nsIMsgFolder* folder, nsTArray<nsCString> const& storeTokens) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgeRemoval(folder, storeTokens));
+#endif
+
   NS_ENSURE_ARG(folder);
   if (storeTokens.IsEmpty()) {
     return NS_OK;  // Early out, don't need to open file.
@@ -1054,6 +1064,10 @@ nsMsgBrkMBoxStore::CopyMessages(bool isMove,
 
 NS_IMETHODIMP nsMsgBrkMBoxStore::AsyncScan(nsIMsgFolder* folder,
                                            nsIStoreScanListener* scanListener) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
+
   nsresult rv = CheckMboxBodyAccess(folder);
   NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIFile> mboxPath;
@@ -1065,6 +1079,10 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::AsyncScan(nsIMsgFolder* folder,
 }
 
 void nsMsgBrkMBoxStore::SetDBValid(nsIMsgFolder* folder) {
+#ifdef MOZ_PANORAMA
+  // Successful physical cleanup of one member is not whole-operation success.
+  if (NS_FAILED(CheckNativePurgePending(folder))) return;
+#endif
   nsCOMPtr<nsIMsgDatabase> db;
   folder->GetMsgDatabase(getter_AddRefs(db));
   if (db) {
@@ -1075,6 +1093,10 @@ void nsMsgBrkMBoxStore::SetDBValid(nsIMsgFolder* folder) {
 NS_IMETHODIMP nsMsgBrkMBoxStore::ChangeFlags(
     nsIMsgFolder* folder, nsTArray<nsCString> const& storeTokens,
     nsTArray<uint32_t> const& newFlags) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
+
   NS_ENSURE_ARG(folder);
   NS_ENSURE_ARG(storeTokens.Length() == newFlags.Length());
 
@@ -1123,6 +1145,9 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::ChangeKeywords(
   nsCOMPtr<nsIMsgFolder> folder;
   rv = aHdrArray[0]->GetFolder(getter_AddRefs(folder));
   NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
   rv = CheckMboxBodyAccess(folder);
   NS_ENSURE_SUCCESS(rv, rv);
 
@@ -1237,6 +1262,10 @@ nsMsgBrkMBoxStore::GetSupportsCompaction(bool* aSupportsCompaction) {
 NS_IMETHODIMP nsMsgBrkMBoxStore::AsyncCompact(
     nsIMsgFolder* folder, nsIStoreCompactListener* compactListener,
     bool patchXMozillaHeaders) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckNativePurgePending(folder));
+#endif
+
   nsresult rv = CheckMboxBodyAccess(folder);
   NS_ENSURE_SUCCESS(rv, rv);
 #ifdef MOZ_PANORAMA

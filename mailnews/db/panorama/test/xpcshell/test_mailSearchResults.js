@@ -66,7 +66,7 @@ add_setup(async function setupNativeResults() {
 async function drainResultWork() {
   for (let i = 0; ; i++) {
     Assert.less(i, 100, "Small native fixture finishes bounded work");
-    if (!(await service.update({ limit: 50 })).moreWork) {
+    if (!(await service.update({ limit: 500 })).moreWork) {
       return;
     }
   }
@@ -814,6 +814,7 @@ add_task(function test_selectionCopiesDoNotRetainAutocompleteObjects() {
 });
 
 add_task(async function test_typedSelectionReachesLaterMetadataPage() {
+  retireResultFixtures();
   const folder = rootFolder.createLocalSubfolder("later-typed-page");
   const controls = [];
   for (let i = 0; i < 100; i++) {

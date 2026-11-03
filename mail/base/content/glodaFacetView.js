@@ -32,6 +32,8 @@ ChromeUtils.defineESModuleGetters(this, {
   parseSearchTerms: "resource:///modules/panorama/SearchTerms.sys.mjs",
   getMailSearchFacetData:
     "resource:///modules/panorama/MailSearchFacets.sys.mjs",
+  getMailSearchOwnEmails:
+    "resource:///modules/panorama/MailSearchFacets.sys.mjs",
   refineMailSearchResults:
     "resource:///modules/panorama/MailSearchFacets.sys.mjs",
 });
@@ -479,7 +481,8 @@ function makeMailSearchFacetDriver(resultSet) {
   const tags = new Map(
     MailServices.tags.getAllTags().map(tag => [tag.key, tag.tag])
   );
-  const fullData = getMailSearchFacetData(resultSet);
+  const ownEmails = getMailSearchOwnEmails();
+  const fullData = getMailSearchFacetData(resultSet, { ownEmails });
   fullData.tags = fullData.tags.filter(group => tags.has(group.value));
   const definitions = [
     ["fromMe", "fromMe", "boolean"],
@@ -537,6 +540,7 @@ function makeMailSearchFacetDriver(resultSet) {
       native: true,
       type,
       field,
+      groupValue,
       attrDef: {
         attributeName: name,
         boundName: name == "date" ? "date" : field,
@@ -553,18 +557,23 @@ function makeMailSearchFacetDriver(resultSet) {
         if (type == "date") {
           items = refineMailSearchResults(resultSet, {
             dateRanges: groupValues,
+            ownEmails,
           }).items;
         } else if (type == "boolean") {
           items = groupValues.flatMap(
             value =>
-              refineMailSearchResults(resultSet, { [field]: value }).items
+              refineMailSearchResults(resultSet, { [field]: value, ownEmails })
+                .items
           );
         } else if (field == "attachmentCategories") {
           items = refineMailSearchResults(
             resultSet,
             groupValues.length
-              ? { attachmentCategories: groupValues.map(value => value.id) }
-              : { hasAttachments: true }
+              ? {
+                  attachmentCategories: groupValues.map(value => value.id),
+                  ownEmails,
+                }
+              : { hasAttachments: true, ownEmails }
           ).items;
         } else {
           const ids = new Set(
@@ -627,7 +636,10 @@ function makeMailSearchFacetDriver(resultSet) {
   return {
     faceters,
     go(items, callback, context) {
-      const data = getMailSearchFacetData({ ...resultSet, items });
+      const data = getMailSearchFacetData(
+        { ...resultSet, items },
+        { ownEmails }
+      );
       data.tags = data.tags.filter(group => tags.has(group.value));
       for (const faceter of faceters) {
         faceter.facetItems(items, data);
@@ -717,7 +729,12 @@ var FacetContext = {
       .sort((a, b) => b.date - a.date);
   },
 
-  initialBuild() {
+  /**
+   * Build native or retained facets from the current snapshot.
+   *
+   * @param {?object} [mailSearchState=null] - Native filters/sort saved for refresh.
+   */
+  initialBuild(mailSearchState = null) {
     if (this.mailSearchResultSet) {
       const { text, selection, andTerms } = this.tab.mailSearch;
       if (selection) {
@@ -771,7 +788,30 @@ var FacetContext = {
     if ("IMCollection" in this) {
       this.fullSet = this.fullSet.concat(this.IMCollection.items);
     }
-    this.build(this.fullSet);
+    if (mailSearchState) {
+      this._sortBy = mailSearchState.sortBy;
+      for (const saved of mailSearchState.constraints) {
+        const faceter = this.faceters.find(
+          candidate => candidate.attrDef.attributeName == saved.name
+        );
+        const constraintClass = faceter.attrDef.singular
+          ? ActiveSingularConstraint
+          : ActiveNonSingularConstraint;
+        const constraint = new constraintClass(faceter, saved.ranged);
+        for (const [inclusive, values] of saved.groups) {
+          constraint.constrain(
+            inclusive,
+            values.map(value =>
+              faceter.type == "date"
+                ? value
+                : faceter.groupValue(value?.id ?? value)
+            )
+          );
+        }
+        faceter.constraint = this._activeConstraints[saved.name] = constraint;
+      }
+    }
+    this.build(mailSearchState ? this._sieveAll() : this.fullSet);
   },
 
   /**
@@ -1314,15 +1354,79 @@ var FacetContext = {
   /**
    * Fetch a complete physical result set for this retained facet page.
    *
+   * @param {object} [options] - Refresh controls.
+   * @param {boolean} [options.preserveFilters=false] - Keep the open view's selections.
    * @returns {Promise<?MailSearchResultSet>} Current physical snapshot, or null on cancellation/error.
    */
-  async loadMailSearch() {
-    this.mailSearchQueryController?.abort();
-    const controller = (this.mailSearchQueryController = new AbortController());
-    const signal = AbortSignal.any([
-      controller.signal,
-      this.tab.mailSearchController.signal,
-    ]);
+  loadMailSearch(options = {}) {
+    // Closing this frame must still settle the promise owned by its mail tab.
+    const { promise, resolve, reject } = this.rootWin.Promise.withResolvers();
+    let stop = () => {};
+    try {
+      const { preserveFilters = false } = options;
+      this.mailSearchQueryController?.abort();
+      const controller = (this.mailSearchQueryController =
+        new AbortController());
+      const signal = AbortSignal.any([
+        controller.signal,
+        this.tab.mailSearchController.signal,
+      ]);
+      const cancelled = () => {
+        stop();
+        resolve(null);
+      };
+      stop = () => signal.removeEventListener("abort", cancelled);
+      signal.addEventListener("abort", cancelled, { once: true });
+      if (signal.aborted) {
+        cancelled();
+      } else {
+        this._loadMailSearch({ preserveFilters }, signal).then(
+          result => {
+            stop();
+            resolve(result);
+          },
+          error => {
+            stop();
+            reject(error);
+          }
+        );
+      }
+    } catch (error) {
+      stop();
+      reject(error);
+    }
+    return promise;
+  },
+
+  /**
+   * Builds this frame's current facets under the parent-owned query lifetime.
+   *
+   * @param {object} options - Refresh controls.
+   * @param {boolean} options.preserveFilters - Keep existing refinement and sort.
+   * @param {AbortSignal} signal - Parent tab and replacement cancellation.
+   * @returns {Promise<?MailSearchResultSet>} Current results, or null on cancellation/error.
+   */
+  async _loadMailSearch({ preserveFilters }, signal) {
+    const state = preserveFilters
+      ? {
+          sortBy: this._sortBy,
+          constraints: Object.entries(this._activeConstraints ?? {}).map(
+            ([name, constraint]) => ({
+              name,
+              ranged: constraint.ranged,
+              groups: constraint.attrDef.singular
+                ? [[constraint.inclusive, constraint.groupValues]]
+                : [
+                    [true, constraint.includedGroupValues],
+                    [false, constraint.excludedGroupValues],
+                  ].filter(([, values]) => values.length),
+            })
+          ),
+        }
+      : null;
+    if (!preserveFilters) {
+      this._activeConstraints = {};
+    }
     this.mailSearchResultSet = null;
     this._activeSet = [];
     this._relevantSortedItems = [];
@@ -1334,7 +1438,7 @@ var FacetContext = {
     if (this.faceters) {
       for (const faceter of this.faceters) {
         const node = faceter.xblNode;
-        if (node?.explicit) {
+        if (node?.explicit && !preserveFilters) {
           node.removeAttribute("checked");
           if (node.checkbox) {
             node.checkbox.checked = false;
@@ -1375,7 +1479,7 @@ var FacetContext = {
       }
       this.mailSearchResultSet = resultSet;
       this.facetDriver = makeMailSearchFacetDriver(resultSet);
-      this.initialBuild();
+      this.initialBuild(state);
       results.countNode.hidden = false;
       document.getElementById("gloda-facet-view").inert = false;
       return resultSet;
@@ -1385,6 +1489,79 @@ var FacetContext = {
       }
       return null;
     }
+  },
+
+  /**
+   * Refresh the open native consumer after settled card or account changes.
+   * Every refresh owns a new query; tab closure removes both observer routes.
+   */
+  observeMailSearchNames() {
+    const signal = this.tab.mailSearchController.signal;
+    let stopped = false;
+    let queued = false;
+    const observer = {
+      observe: (subject, topic, data) => {
+        if (stopped || signal.aborted) {
+          return;
+        }
+        if (topic == "panorama-mail-search-names-changed") {
+          const sourceId =
+            this.mailSearchResultSet?.sourceId ?? this.tab.mailSearch.sourceId;
+          if (sourceId && sourceId != data) {
+            return;
+          }
+        } else if (
+          !data.endsWith(".useremail") &&
+          !data.endsWith(".reply_to") &&
+          !data.endsWith(".identities") &&
+          data != "mail.accountmanager.accounts"
+        ) {
+          return;
+        }
+        if (queued) {
+          return;
+        }
+        queued = true;
+        // Account setters finish updating their retained identity lists first.
+        Promise.resolve().then(() => {
+          queued = false;
+          if (!stopped && !signal.aborted) {
+            this.tab.searchPromise = this.loadMailSearch({
+              preserveFilters: true,
+            });
+          }
+        });
+      },
+    };
+    const prefs = [
+      "mail.identity.",
+      "mail.account.",
+      "mail.accountmanager.accounts",
+    ];
+    const stop = () => {
+      if (stopped) {
+        return;
+      }
+      stopped = true;
+      Services.obs.removeObserver(
+        observer,
+        "panorama-mail-search-names-changed"
+      );
+      for (const pref of prefs) {
+        Services.prefs.removeObserver(pref, observer);
+      }
+      signal.removeEventListener("abort", stop);
+      window.removeEventListener("unload", stop);
+    };
+    if (signal.aborted) {
+      return;
+    }
+    Services.obs.addObserver(observer, "panorama-mail-search-names-changed");
+    for (const pref of prefs) {
+      Services.prefs.addObserver(pref, observer);
+    }
+    signal.addEventListener("abort", stop, { once: true });
+    window.addEventListener("unload", stop, { once: true });
   },
 
   /**
@@ -1636,6 +1813,7 @@ function reachOutAndTouchFrame() {
     }
   });
   if (aTab.mailSearch) {
+    FacetContext.observeMailSearchNames();
     aTab.searchPromise = FacetContext.loadMailSearch();
     return;
   }

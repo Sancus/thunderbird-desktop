@@ -95,17 +95,19 @@ class GlobalSearchBar extends SearchBar {
       "panorama-mail-search-names-changed"
     );
     this.popup.addEventListener("popuphidden", this);
+    window.addEventListener("unload", this, { once: true });
   }
 
   disconnectedCallback() {
-    this.#stopCompletion();
     if (this.#observingNames) {
+      this.#stopCompletion();
       this.#observingNames = false;
       Services.obs.removeObserver(
         this.#nameObserver,
         "panorama-mail-search-names-changed"
       );
       this.popup.removeEventListener("popuphidden", this);
+      window.removeEventListener("unload", this);
     }
   }
 
@@ -216,6 +218,9 @@ class GlobalSearchBar extends SearchBar {
         if (!this.#popupWasOpenAtDown || event.key !== "Escape") {
           super.handleEvent(event);
         }
+        break;
+      case "unload":
+        this.disconnectedCallback();
         break;
       case "popuphidden":
         this.#stopCompletion();
@@ -344,6 +349,10 @@ class GlobalSearchBar extends SearchBar {
   #handleKeydown = event => {
     if (event.ctrlKey) {
       return;
+    }
+    if (event.key == "ArrowDown" || event.key == "ArrowUp") {
+      // A choice made during refresh supersedes its earlier saved selection.
+      this.#refreshSelection = null;
     }
     if (event.key == "ArrowDown") {
       if (this.popup.selectedIndex < this.controller.matchCount - 1) {

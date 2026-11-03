@@ -218,6 +218,8 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
   const input = document.querySelector(
     "#unifiedToolbarContent global-search-bar"
   );
+  const originalComplete = fixture.service.complete;
+  let release = () => {};
   let list;
   try {
     let progress;
@@ -234,8 +236,28 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
     Assert.equal(initial.rows[initialIndex].label, "Open Completion Card A");
     input.popup.selectedIndex = initialIndex;
     const tabs = tabmail.tabInfo.length;
+    let completed = false;
+    const held = new Promise(resolve => {
+      release = resolve;
+    });
+    fixture.service.complete = async function (...args) {
+      const result = await originalComplete.apply(this, args);
+      completed = true;
+      await held;
+      return result;
+    };
     currentCard.displayName = "Open Completion Card B";
     book.modifyCard(currentCard);
+    await TestUtils.waitForCondition(
+      () => completed,
+      "Real refresh completion reaches the pending delivery boundary"
+    );
+    Assert.notStrictEqual(provider.curResult, initial);
+    Assert.ok(provider.curResult.ongoing);
+    EventUtils.synthesizeKey("KEY_ArrowDown", {}, window);
+    Assert.equal(input.popup.selectedIndex, 0);
+    release();
+    fixture.service.complete = originalComplete;
     await TestUtils.waitForCondition(
       () =>
         provider.curResult != initial &&
@@ -249,6 +271,13 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
     Assert.ok(!initial.active);
     Assert.ok(input.popup.mPopupOpen);
     Assert.strictEqual(input.popup.input, input);
+    Assert.ok(
+      changed.getObjectAt(input.popup.selectedIndex).fullText,
+      "A new keyboard choice during refresh is not overwritten by the old person selection"
+    );
+    input.popup.selectedIndex = changed.rows.findIndex(
+      row => row.type == "person"
+    );
     Assert.equal(
       changed.getObjectAt(input.popup.selectedIndex).label,
       "Open Completion Card B"
@@ -306,6 +335,8 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
     );
     Assert.ok(!input.popup.mPopupOpen);
   } finally {
+    release();
+    fixture.service.complete = originalComplete;
     input.dispatchEvent(new CustomEvent("autocomplete", { detail: "" }));
     if (list) {
       tabmail.closeTab(list);

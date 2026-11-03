@@ -562,6 +562,26 @@ add_task(
       const actual = await readNativeList(list);
       Assert.deepEqual(actual.identities, headers.map(physicalIdentity).sort());
       tabmail.closeTab(list);
+      const selected = context.activeSet.find(
+        item => item.id == String(headers[1].messageKey)
+      );
+      const conversation = await context.openMailSearchConversation(
+        selected,
+        true
+      );
+      Assert.ok(conversation);
+      const selectedView = await readNativeList(conversation);
+      // Equal Message-ID without a References edge must not substitute its peer.
+      Assert.deepEqual(selectedView.identities, [physicalIdentity(headers[1])]);
+      await TestUtils.waitForCondition(
+        () => selectedView.pane.gDBView.numSelected == 1
+      );
+      Assert.equal(
+        physicalIdentity(selectedView.pane.gDBView.hdrForFirstSelectedMessage),
+        physicalIdentity(headers[1]),
+        "The refreshed current token opens and selects the clicked physical copy"
+      );
+      tabmail.closeTab(conversation);
 
       let collected = false;
       const held = new Promise(resolve => {
@@ -608,6 +628,7 @@ add_task(async function test_openFacetIdentityChangesRecomputeOwnAddresses() {
   identity.email = "openown@example.invalid";
   identity.replyTo = "Open Reply <openreply@example.invalid>";
   account.addIdentity(identity);
+  let removed = false;
   const generator = new MessageGenerator();
   const term = "nativeopenidentityneedle";
   const raw = generator
@@ -705,11 +726,21 @@ add_task(async function test_openFacetIdentityChangesRecomputeOwnAddresses() {
       ),
       "Current own addresses are omitted from the people facet"
     );
+    MailServices.accounts.removeAccount(account);
+    removed = true;
+    await TestUtils.waitForCondition(
+      () => context.mailSearchResultSet && context.activeSet.length == 0,
+      "Removing the real account updates the same retained own-address selection"
+    );
+    await tab.searchPromise;
+    Assert.ok(toMe().constraint);
   } finally {
     if (tab) {
       tabmail.closeTab(tab);
     }
-    MailServices.accounts.removeAccount(account);
+    if (!removed) {
+      MailServices.accounts.removeAccount(account);
+    }
   }
 });
 

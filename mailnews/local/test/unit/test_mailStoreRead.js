@@ -1177,3 +1177,131 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkRepairMalformedHeaders("maildir");
   });
 }
+
+/**
+ * Reparse an uncompacted mbox without resurrecting its deleted message.
+ * Runs in both ordinary backend manifest entries.
+ */
+add_task(async function test_repairSkipsExpungedMbox() {
+  await withAvailabilityStore("mbox", async folder => {
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    const liveRaw =
+      "X-Mozilla-Status: 0000\r\nX-Mozilla-Status2: 00000000\r\n" +
+      "From: retained@example.invalid\r\n" +
+      "Message-ID: <repair-live@example.invalid>\r\n" +
+      "Subject: Retained live row\r\n\r\nRetained live body.\r\n";
+    const deletedRaw =
+      "X-Mozilla-Status: 0000\r\nX-Mozilla-Status2: 00000000\r\n" +
+      "From: removed@example.invalid\r\n" +
+      "Message-ID: <repair-deleted@example.invalid>\r\n" +
+      "Subject: Deleted uncompacted row\r\n\r\nDeleted retained bytes.\r\n";
+    const live = folder.addMessage(liveRaw);
+    const removed = folder.addMessage(deletedRaw);
+    const liveKey = live.messageKey;
+    const liveToken = live.storeToken;
+    const removedKey = removed.messageKey;
+    const removedToken = removed.storeToken;
+    const deletionStatuses = [];
+    const deleted = new PromiseTestUtils.PromiseCopyListener({
+      onStopCopy(status) {
+        deletionStatuses.push(status);
+      },
+    });
+    folder.deleteMessages([removed], null, true, false, deleted, false);
+    await deleted.promise;
+    Assert.deepEqual(deletionStatuses, [Cr.NS_OK]);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), [liveKey]);
+    Assert.notEqual(liveKey, removedKey);
+    const deletedBytes = readAll(
+      folder.msgStore.getMsgInputStream(folder, removedToken, 0)
+    );
+    Assert.ok(
+      deletedBytes.includes("X-Mozilla-Status: 0008\r\n"),
+      "The real provider marked the uncompacted body Expunged"
+    );
+    const before = await IOUtils.read(folder.filePath.path);
+    if (native) {
+      folder.msgDatabase.summaryValid = false;
+    }
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    if (!native) {
+      await IOUtils.remove(folder.summaryFile.path);
+    }
+    const statuses = [];
+    const listener = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl(url, status) {
+        statuses.push(status);
+      },
+    });
+    Assert.throws(
+      () => folder.getDatabaseWithReparse(listener, null),
+      error => error.result === Cr.NS_ERROR_NOT_INITIALIZED
+    );
+    await listener.promise;
+    Assert.deepEqual(statuses, [Cr.NS_OK]);
+    Assert.ok(!folder.locked);
+    Assert.ok(folder.msgDatabase.summaryValid);
+    const headers = Array.from(folder.messages);
+    Assert.equal(headers.length, 1);
+    Assert.equal(folder.getTotalMessages(false), 1);
+    Assert.equal(headers[0].messageId, "repair-live@example.invalid");
+    Assert.equal(headers[0].storeToken, liveToken);
+    if (native) {
+      Assert.equal(headers[0].messageKey, liveKey);
+    } else {
+      Assert.ok(folder.msgDatabase.dBFolderInfo.expungedBytes > 0);
+    }
+    Assert.equal(
+      mailTestUtils.loadMessageToString(folder, headers[0]),
+      liveRaw
+    );
+    Assert.deepEqual(await IOUtils.read(folder.filePath.path), before);
+    folder.msgDatabase.forceClosed();
+    folder.msgDatabase = null;
+    Assert.ok(folder.msgDatabase.summaryValid);
+    Assert.equal(folder.getTotalMessages(false), 1);
+    Assert.equal(Array.from(folder.messages).length, 1);
+    Assert.deepEqual(await IOUtils.read(folder.filePath.path), before);
+  });
+});
+
+if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  /** Preserve the default backend's incomplete-header tail skip. */
+  add_task(async function test_repairSkipsIncompleteMboxTail() {
+    await withAvailabilityStore("mbox", async folder => {
+      const raw = "Subject: Retained row\r\n\r\nRetained body.\r\n";
+      folder.addMessage(raw);
+      // Like the native malformed-input case above, create a crash-cut header
+      // before scanning: normal mbox Finish would complete its terminator.
+      await IOUtils.writeUTF8(
+        folder.filePath.path,
+        "From \r\nSubject: Incomplete default-backend tail\r\nX-Unfinished: value",
+        { mode: "append" }
+      );
+      const before = await IOUtils.read(folder.filePath.path);
+      const statuses = [];
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl(url, status) {
+          statuses.push(status);
+        },
+      });
+      folder.msgDatabase.forceClosed();
+      folder.msgDatabase = null;
+      await IOUtils.remove(folder.summaryFile.path);
+      Assert.throws(
+        () => folder.getDatabaseWithReparse(listener, null),
+        error => error.result === Cr.NS_ERROR_NOT_INITIALIZED
+      );
+      await listener.promise;
+      Assert.deepEqual(statuses, [Cr.NS_OK]);
+      Assert.ok(!folder.locked);
+      Assert.ok(folder.msgDatabase.summaryValid);
+      const headers = Array.from(folder.messages);
+      Assert.equal(headers.length, 1);
+      Assert.equal(mailTestUtils.loadMessageToString(folder, headers[0]), raw);
+      Assert.ok(folder.msgDatabase.dBFolderInfo.expungedBytes > 0);
+      Assert.deepEqual(await IOUtils.read(folder.filePath.path), before);
+    });
+  });
+}

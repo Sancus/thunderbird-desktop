@@ -270,7 +270,21 @@ NS_IMETHODIMP StoreIndexer::OnStopRequest(nsIRequest* req, nsresult status) {
 
   nsCOMPtr<nsIMsgDBHdr> hdr;
   nsresult rv = mParser->GetNewMsgHdr(getter_AddRefs(hdr));
-  NS_ENSURE_SUCCESS(rv, RememberError(rv));
+  if (NS_FAILED(rv)) {
+    NS_ENSURE_TRUE(rv == NS_ERROR_NULL_POINTER, RememberError(rv));
+#ifdef MOZ_PANORAMA
+    if (mFolderRepair) {
+      nsMailboxParseState state;
+      nsresult stateRv = mParser->GetState(&state);
+      NS_ENSURE_SUCCESS(stateRv, RememberError(stateRv));
+      // Completed Expunged headers deliberately produce no draft. Only an
+      // unfinished header block is a native repair error; legacy keeps skipping
+      // incomplete tails and accounting their expunged bytes below.
+      NS_ENSURE_TRUE(state != nsIMsgParseMailMsgState::ParseHeadersState,
+                     RememberError(rv));
+    }
+#endif
+  }
   if (hdr) {
     uint32_t flags;
     rv = hdr->GetFlags(&flags);

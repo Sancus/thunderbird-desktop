@@ -231,6 +231,7 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
       new CustomEvent("autocomplete", { detail: "completionperson" })
     );
     const initial = await completionResult("completionperson");
+    await TestUtils.waitForCondition(() => input.popup.mPopupOpen);
     const initialIndex = initial.rows.findIndex(row => row.type == "person");
     Assert.greaterOrEqual(initialIndex, 0);
     Assert.equal(initial.rows[initialIndex].label, "Open Completion Card A");
@@ -254,8 +255,14 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
     );
     Assert.notStrictEqual(provider.curResult, initial);
     Assert.ok(provider.curResult.ongoing);
+    Assert.equal(provider.curResult.matchCount, 0);
+    Assert.equal(input.popup.richlistbox.children.length, 0);
     EventUtils.synthesizeKey("KEY_ArrowDown", {}, window);
-    Assert.equal(input.popup.selectedIndex, 0);
+    Assert.equal(
+      input.popup.selectedIndex,
+      -1,
+      "Pending rows are not selectable"
+    );
     release();
     fixture.service.complete = originalComplete;
     await TestUtils.waitForCondition(
@@ -271,6 +278,13 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
     Assert.ok(!initial.active);
     Assert.ok(input.popup.mPopupOpen);
     Assert.strictEqual(input.popup.input, input);
+    Assert.equal(
+      input.popup.selectedIndex,
+      -1,
+      "The old person choice is not restored"
+    );
+    EventUtils.synthesizeKey("KEY_ArrowDown", {}, window);
+    Assert.equal(input.popup.selectedIndex, 0);
     Assert.ok(
       changed.getObjectAt(input.popup.selectedIndex).fullText,
       "A new keyboard choice during refresh is not overwritten by the old person selection"
@@ -337,13 +351,22 @@ add_task(async function test_openCompletionCardChangesRefreshCurrentLabels() {
   } finally {
     release();
     fixture.service.complete = originalComplete;
+    const hidden = input.popup.mPopupOpen
+      ? BrowserTestUtils.waitForEvent(input.popup, "popuphidden")
+      : Promise.resolve();
     input.dispatchEvent(new CustomEvent("autocomplete", { detail: "" }));
+    await hidden;
     if (list) {
       tabmail.closeTab(list);
     }
     if (currentCard) {
       book.deleteCards([currentCard]);
     }
+    // Finish the real cleanup notification before another test queries people.
+    let progress;
+    do {
+      progress = await fixture.service.update({ limit: 500 });
+    } while (progress.moreWork);
     await SpecialPowers.popPrefEnv();
   }
 });
@@ -391,8 +414,10 @@ add_task(
     await SpecialPowers.pushPrefEnv({
       set: [["gloda.show_as_list_by_default", false]],
     });
+    let owner;
+    let opened;
     try {
-      const owner = tabmail.openTab("glodaFacet", {
+      owner = tabmail.openTab("glodaFacet", {
         mailSearch: { text: "nativecompletionneedle" },
       });
       await TestUtils.waitForCondition(() => owner.searchPromise);
@@ -420,7 +445,7 @@ add_task(
         () => tabmail.currentTabInfo != owner,
         "The retained input opens the captured native selection"
       );
-      const opened = tabmail.currentTabInfo;
+      opened = tabmail.currentTabInfo;
       Assert.equal(
         opened.mailSearch.sourceId,
         result.getObjectAt(index).sourceId
@@ -432,9 +457,12 @@ add_task(
       await TestUtils.waitForCondition(() => opened.searchPromise);
       await opened.searchPromise;
       Assert.equal(opened.browser.contentWindow.FacetContext.fullSet.length, 2);
-      tabmail.closeTab(opened);
-      tabmail.closeTab(owner);
     } finally {
+      for (const tab of [opened, owner]) {
+        if (tab && tabmail.tabInfo.includes(tab)) {
+          tabmail.closeTab(tab);
+        }
+      }
       await SpecialPowers.popPrefEnv();
     }
   }
@@ -528,14 +556,14 @@ add_task(async function test_nativeQuickFilterUsesStartupBackend() {
   const { be_in_folder } = ChromeUtils.importESModule(
     "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
   );
-  const { set_filter_text } = ChromeUtils.importESModule(
-    "resource://testing-common/mail/QuickFilterBarHelpers.sys.mjs"
-  );
   await SpecialPowers.pushPrefEnv({
     set: [["gloda.show_as_list_by_default", false]],
   });
   try {
     await be_in_folder(fixture.folders[2]);
+    const { set_filter_text } = ChromeUtils.importESModule(
+      "resource://testing-common/mail/QuickFilterBarHelpers.sys.mjs"
+    );
     const pane = tabmail.currentTabInfo.chromeBrowser.contentWindow;
     const visible = pane.quickFilterBar.filterer.visible;
     pane.commandController.doCommand("cmd_showQuickFilterBar");

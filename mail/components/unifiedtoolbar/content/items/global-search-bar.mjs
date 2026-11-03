@@ -131,9 +131,15 @@ class GlobalSearchBar extends SearchBar {
         return;
       }
       this.#completionResult = search.wrappedJSObject ?? search;
+      this.controller.matchCount = search.matchCount;
       if (provider.isNativeMailSearch && search.ongoing) {
         this.popup.selectedIndex = -1;
-      } else if (this.#refreshSelection) {
+        // Hiding this shared popup calls stopSearch. Clear the old rows without
+        // cancelling the pending query that will replace them.
+        this.popup.invalidate();
+        return;
+      }
+      if (this.#refreshSelection) {
         const selected = this.#refreshSelection;
         this.#refreshSelection = null;
         this.popup.selectedIndex = search.rows.findIndex(
@@ -143,7 +149,6 @@ class GlobalSearchBar extends SearchBar {
             JSON.stringify(row.selection ?? null) == selected.selection
         );
       }
-      this.controller.matchCount = search.matchCount;
       if (this.controller.matchCount < 1) {
         this.popup.closePopup();
         if (provider.isNativeMailSearch) {

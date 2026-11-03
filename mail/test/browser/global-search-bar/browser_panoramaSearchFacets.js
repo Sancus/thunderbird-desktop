@@ -129,6 +129,7 @@ add_setup(async function setupNativeFacetMessages() {
     clicked,
     secondCopy,
     conversation: [rootHeader, secondCopy, clicked, tail],
+    generator,
     service,
   };
 });
@@ -432,7 +433,7 @@ add_task(
     card.primaryEmail = "livefacetcard@example.invalid";
     card.displayName = "Open Facet Card A";
     let currentCard = book.addCard(card);
-    const generator = new MessageGenerator();
+    const generator = fixture.generator;
     const term = "nativeopenfacetcardneedle";
     const raw = generator
       .makeMessage({
@@ -638,7 +639,7 @@ add_task(async function test_openFacetIdentityChangesRecomputeOwnAddresses() {
   identity.replyTo = "Open Reply <openreply@example.invalid>";
   account.addIdentity(identity);
   let removed = false;
-  const generator = new MessageGenerator();
+  const generator = fixture.generator;
   const term = "nativeopenidentityneedle";
   const raw = generator
     .makeMessage({

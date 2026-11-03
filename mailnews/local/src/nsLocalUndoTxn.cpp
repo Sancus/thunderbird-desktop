@@ -136,6 +136,7 @@ nsresult CaptureLocalUndo(nsIMsgFolder* folder, const nsTArray<nsMsgKey>& keys,
     NS_ENSURE_TRUE(SameUndoBody(before, after), NS_ERROR_NOT_AVAILABLE);
     if (entry.recovery && !entry.retainRecovery) entry.recovery->Remove(false);
     entry.recovery = recovery;
+    entry.expected.reset();
     entry.expected.emplace(std::move(before));
     entry.retainRecovery = false;
     remove.release();
@@ -181,6 +182,7 @@ nsresult RestoreLocalUndo(nsIMsgFolder* folder, nsTArray<nsMsgKey>& keys,
     auto& entry = *entries[i];
     if (!entry.removed.Body()) continue;
     NS_ENSURE_TRUE(entry.recovery, NS_ERROR_NOT_AVAILABLE);
+    entry.retainRecovery = true;
     if (entry.finishAttempted && !entry.finished) return entry.finishResult;
     if (!entry.finished) {
       nsCOMPtr<nsIInputStream> input;
@@ -520,7 +522,15 @@ nsresult nsLocalMoveCopyMsgTxn::RemoveNativeSourceHeader(nsIMsgFolder* folder,
                  NS_ERROR_NOT_AVAILABLE);
   mozilla::AutoRestore<bool> changing(mNativeUndo->changing);
   mNativeUndo->changing = true;
-  return RemoveLocalUndo(folder, key, *mNativeUndo->source[index]);
+  MOZ_TRY(RemoveLocalUndo(folder, key, *mNativeUndo->source[index]));
+  bool complete = true;
+  for (const auto& entry : mNativeUndo->source) {
+    if (!entry->removed.Body()) complete = false;
+  }
+  if (complete) {
+    for (auto& entry : mNativeUndo->source) entry->retainRecovery = false;
+  }
+  return NS_OK;
 }
 
 nsresult nsLocalMoveCopyMsgTxn::RunNativeUndo(bool undoing) {
@@ -529,14 +539,20 @@ nsresult nsLocalMoveCopyMsgTxn::RunNativeUndo(bool undoing) {
     return mNativeUndo->firstError;
   }
   if (!mNativeUndo->pending && mNativeUndo->undone == undoing) return NS_OK;
-  mNativeUndo->pending.emplace(undoing);
+  nsCOMPtr<nsIMsgFolder> source = do_QueryReferent(m_srcFolder);
+  nsCOMPtr<nsIMsgFolder> destination = do_QueryReferent(m_dstFolder);
+  NS_ENSURE_TRUE(source && destination, NS_ERROR_NOT_AVAILABLE);
+  bool sourceLocked, destinationLocked;
+  MOZ_TRY(source->GetLocked(&sourceLocked));
+  MOZ_TRY(destination->GetLocked(&destinationLocked));
+  if (sourceLocked || destinationLocked) {
+    return mNativeUndo->pending ? mNativeUndo->firstError : NS_MSG_FOLDER_BUSY;
+  }
+  if (!mNativeUndo->pending) mNativeUndo->pending.emplace(undoing);
   RefPtr<nsLocalMoveCopyMsgTxn> self(this);
   mozilla::AutoRestore<bool> changing(mNativeUndo->changing);
   mNativeUndo->changing = true;
   nsresult result = [&]() -> nsresult {
-    nsCOMPtr<nsIMsgFolder> source = do_QueryReferent(m_srcFolder);
-    nsCOMPtr<nsIMsgFolder> destination = do_QueryReferent(m_dstFolder);
-    NS_ENSURE_TRUE(source && destination, NS_ERROR_NOT_AVAILABLE);
     if (undoing) {
       // Capture all destination bodies before any source restoration or
       // removal.
@@ -567,6 +583,10 @@ nsresult nsLocalMoveCopyMsgTxn::RunNativeUndo(bool undoing) {
     mNativeUndo->undone = undoing;
     mNativeUndo->pending.reset();
     mNativeUndo->firstError = NS_OK;
+    // Explicit history cleanup can release settled recovery. Failed operations
+    // keep their independent bytes even if the original copy state is dropped.
+    for (auto& entry : mNativeUndo->source) entry->retainRecovery = false;
+    for (auto& entry : mNativeUndo->destination) entry->retainRecovery = false;
   } else if (NS_SUCCEEDED(mNativeUndo->firstError)) {
     mNativeUndo->firstError = result;
   }

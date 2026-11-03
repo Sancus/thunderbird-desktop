@@ -3756,6 +3756,26 @@ async function checkNativeLocalUndo(storeType, move, fault = "") {
         transaction.undoTransaction();
         Assert.equal(sourceDB.listAllKeys().length, count);
         order.destinationURI = destination.URI;
+        if (fault == "busy") {
+          const before = sourceDB.listAllKeys();
+          destination.acquireSemaphore(source, "test_nativeUndoBusy");
+          try {
+            Assert.throws(
+              () => manager.redoTransaction(),
+              error => error.result == Cr.NS_MSG_FOLDER_BUSY
+            );
+            Assert.equal(manager.peekRedoStack(), transaction);
+            Assert.equal(manager.numberOfRedoItems, 1);
+            Assert.deepEqual(destinationDB.listAllKeys(), []);
+            Assert.deepEqual(sourceDB.listAllKeys(), before);
+            Assert.equal(
+              order.events.filter(event => event.type == "finish-entry").length,
+              0
+            );
+          } finally {
+            destination.releaseSemaphore(source, "test_nativeUndoBusy");
+          }
+        }
         if (fault == "restore") {
           failSql("INSERT");
         }
@@ -3918,5 +3938,11 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
   });
   add_task(async function test_localUndoFinishFailureMaildir() {
     await checkNativeLocalUndo("maildir", false, "finish");
+  });
+  add_task(async function test_localUndoBusyRetryMbox() {
+    await checkNativeLocalUndo("mbox", false, "busy");
+  });
+  add_task(async function test_localUndoBusyRetryMaildir() {
+    await checkNativeLocalUndo("maildir", false, "busy");
   });
 }

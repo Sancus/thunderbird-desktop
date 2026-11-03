@@ -10,6 +10,7 @@ run-sequentially = true
 prefs = [
   "mail.panorama.enabled=true",
   "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/berkeleystore;1",
 ]
 tags = ["panorama-ci041", "mbox", "cpp"]
 
@@ -27,10 +28,10 @@ tags = ["panorama-ci041", "mbox", "cpp"]
 
 ["test_imapFilterCopyThenMove.js"]
 
+["test_imapOfflineBodyAdmission.js"]
+
 ["test_imapPreviewIdentity.js"]
 
 ["test_imapSearch.js"]
 
 ["test_imapUnsolicitedXDuringIdle.js"]
-
-["test_imapOfflineBodyAdmission.js"]

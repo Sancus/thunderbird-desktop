@@ -1422,7 +1422,17 @@ NS_IMETHODIMP nsImapIncomingServer::FolderVerifiedOnline(
   nsresult rv = GetRootFolder(getter_AddRefs(rootFolder));
   if (NS_SUCCEEDED(rv) && rootFolder) {
     nsCOMPtr<nsIMsgFolder> folder;
-    rv = rootFolder->FindSubFolder(folderName, getter_AddRefs(folder));
+#ifdef MOZ_PANORAMA
+    if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      // This is an existence predicate, not a folder producer. The native
+      // factory cannot create a dangling legacy wrapper for a missing row.
+      rv = GetExistingFolder(rootFolder, folderName, getter_AddRefs(folder));
+      if (rv == NS_MSG_ERROR_FOLDER_MISSING) return NS_OK;
+    } else
+#endif
+    {
+      rv = rootFolder->FindSubFolder(folderName, getter_AddRefs(folder));
+    }
     if (NS_SUCCEEDED(rv) && folder) {
       nsCOMPtr<nsIMsgImapMailFolder> imapFolder = do_QueryInterface(folder);
       if (imapFolder) imapFolder->GetVerifiedAsOnlineFolder(aResult);

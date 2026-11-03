@@ -73,6 +73,27 @@ class nsImapOfflineSync : public nsIUrlListener,
 #ifdef MOZ_PANORAMA
   nsresult ProcessNativeAction(nsIMsgOfflineImapOperation* op, uint32_t action);
   nsresult CompleteNativeAction(nsIURI* url, nsresult status);
+  nsresult ProcessNativeFlags(nsIMsgOfflineImapOperation* op);
+  nsresult ContinueNativeFlags(mozilla::mailnews::OfflineAttempt attempt);
+  nsresult ContinueNativeMove(mozilla::mailnews::OfflineAttempt attempt);
+  nsresult DispatchNativeReplay(
+      const mozilla::mailnews::OfflineAttempt& attempt,
+      mozilla::mailnews::OfflineReplayCommand command);
+  nsresult CompleteNativeReplay(nsIURI* url, nsresult status);
+  nsresult HoldNativeReplay(nsresult status);
+  mozilla::UniquePtr<mozilla::mailnews::OfflineReplayCommandToken>
+      mNativeReplay;
+  nsCOMPtr<nsIURI> mNativeReplayUrl;
+  uint64_t mNativeReplaySerial = 0;
+  bool mNativeReplayCompleting = false;
+  nsresult ProcessNativeFolderDelete(nsIMsgOfflineImapOperation* op);
+  nsresult StartNativeFolderDelete(
+      const mozilla::mailnews::OfflineAttempt& attempt, bool refresh);
+  nsresult CompleteNativeFolderDelete(nsIURI* url, nsresult status);
+  mozilla::UniquePtr<mozilla::mailnews::OfflineAttempt> mNativeFolderDelete;
+  nsCOMPtr<nsIURI> mNativeFolderDeleteUrl;
+  uint64_t mNativeFolderSerial = 0;
+  bool mNativeFolderRefreshing = false;
   mozilla::UniquePtr<mozilla::mailnews::OfflineAttempt> mNativeAction;
   nsCOMPtr<nsIURI> mNativeActionUrl;
   nsresult ProcessNativeTransfer(nsIMsgOfflineImapOperation* op,

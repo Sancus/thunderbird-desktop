@@ -1497,6 +1497,116 @@ NS_IMETHODIMP nsImapService::SetMessageFlags(
                      "setmsgflags", flags, messageIdsAreUID);
 }
 
+#ifdef MOZ_PANORAMA
+nsresult nsImapService::ReplayOfflineCommand(
+    nsIMsgFolder* folder, nsIUrlListener* listener,
+    const mozilla::mailnews::OfflineReplayCommandToken& token, nsIURI** url) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG_POINTER(url);
+  *url = nullptr;
+  NS_ENSURE_TRUE(folder && listener && token.attempt.source,
+                 NS_ERROR_INVALID_ARG);
+  uint64_t folderId;
+  MOZ_TRY(folder->GetId(&folderId));
+  NS_ENSURE_TRUE(folderId == token.attempt.source->folderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  uint16_t mask = 0;
+  const char* operation;
+  switch (token.command) {
+    case OfflineReplayCommand::FlagSet:
+    case OfflineReplayCommand::FlagClear:
+      NS_ENSURE_TRUE(token.attempt.flagMutation, NS_ERROR_NOT_AVAILABLE);
+      mask = token.command == OfflineReplayCommand::FlagSet
+                 ? token.attempt.flagMutation->setMask
+                 : token.attempt.flagMutation->clearMask;
+      NS_ENSURE_TRUE(mask, NS_ERROR_NOT_AVAILABLE);
+      operation = token.command == OfflineReplayCommand::FlagSet
+                      ? "/addmsgflags>"
+                      : "/subtractmsgflags>";
+      break;
+    case OfflineReplayCommand::MoveStore:
+      mask = kImapMsgDeletedFlag | kImapMsgSeenFlag;
+      operation = "/addmsgflags>";
+      break;
+    case OfflineReplayCommand::MoveUidExpunge:
+    case OfflineReplayCommand::MoveExpunge:
+      operation = "/Expunge>";
+      break;
+    default:
+      return NS_ERROR_INVALID_ARG;
+  }
+  nsCOMPtr<nsIImapUrl> imap;
+  nsAutoCString spec;
+  char delimiter = GetHierarchyDelimiter(folder);
+  MOZ_TRY(CreateStartOfImapUrl(EmptyCString(), getter_AddRefs(imap), folder,
+                               listener, spec, delimiter));
+  NS_ENSURE_TRUE(imap, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(imap->SetImapAction(mask ? nsIImapUrl::nsImapMsgFetch
+                                   : nsIImapUrl::nsImapExpungeFolder));
+  MOZ_TRY(SetImapUrlSink(folder, imap));
+  spec.Append(operation);
+  if (mask) {
+    spec.Append(uidString);
+    spec.Append('>');
+  }
+  spec.Append(delimiter);
+  nsCString name;
+  MOZ_TRY(GetFolderName(folder, name));
+  spec.Append(name);
+  if (mask) {
+    spec.Append('>');
+    spec.AppendInt(token.attempt.source->uid);
+    spec.Append('>');
+    spec.AppendInt(mask);
+  }
+  nsCOMPtr<nsIMsgMailNewsUrl> news = do_QueryInterface(imap);
+  NS_ENSURE_TRUE(news, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(news->SetSpecInternal(spec));
+  auto* native = static_cast<nsImapUrl*>(imap.get());
+  MOZ_TRY(native->SetExpectedUidValidity(token.attempt.source->epoch));
+  MOZ_TRY(native->PrepareNativeReplayCommand(token));
+  // This sets the permanent caller slot before connection/listener reentry.
+  // Captured native source identity replaces a live-header UID lookup here.
+  return GetImapConnectionAndLoadUrl(imap, nullptr, url);
+}
+
+nsresult nsImapService::ReplayOfflineFolderDelete(
+    nsIMsgFolder* folder, nsIUrlListener* listener,
+    const mozilla::mailnews::OfflineAttempt& attempt, bool refresh,
+    nsIURI** url) {
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG_POINTER(url);
+  *url = nullptr;
+  NS_ENSURE_TRUE(folder && listener && attempt.folderEpoch,
+                 NS_ERROR_INVALID_ARG);
+  uint64_t folderId;
+  MOZ_TRY(folder->GetId(&folderId));
+  NS_ENSURE_TRUE(folderId == attempt.folderId, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIImapUrl> imap;
+  nsAutoCString spec;
+  char delimiter = GetHierarchyDelimiter(folder);
+  MOZ_TRY(CreateStartOfImapUrl(EmptyCString(), getter_AddRefs(imap), folder,
+                               listener, spec, delimiter));
+  NS_ENSURE_TRUE(imap, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(imap->SetImapAction(refresh ? nsIImapUrl::nsImapSelectFolder
+                                      : nsIImapUrl::nsImapSelectNoopFolder));
+  MOZ_TRY(SetImapUrlSink(folder, imap));
+  spec.Append(refresh ? "/select>" : "/deleteallmsgs>");
+  spec.Append(delimiter);
+  nsCString name;
+  MOZ_TRY(GetFolderName(folder, name));
+  spec.Append(name);
+  nsCOMPtr<nsIMsgMailNewsUrl> news = do_QueryInterface(imap);
+  NS_ENSURE_TRUE(news, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(news->SetSpecInternal(spec));
+  auto* native = static_cast<nsImapUrl*>(imap.get());
+  MOZ_TRY(native->SetExpectedUidValidity(*attempt.folderEpoch));
+  MOZ_TRY(native->PrepareNativeFolderDelete(attempt));
+  return GetImapConnectionAndLoadUrl(imap, nullptr, url);
+}
+#endif
+
 nsresult nsImapService::DiddleFlags(nsIMsgFolder* aImapMailFolder,
                                     nsIUrlListener* aUrlListener, nsIURI** aURL,
                                     const nsACString& messageIdentifierList,

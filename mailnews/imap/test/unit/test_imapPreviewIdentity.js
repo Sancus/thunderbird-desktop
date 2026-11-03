@@ -6,6 +6,9 @@
 
 /* import-globals-from head_server.js */
 
+const { TestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/TestUtils.sys.mjs"
+);
 const { NetUtil } = ChromeUtils.importESModule(
   "resource://gre/modules/NetUtil.sys.mjs"
 );
@@ -356,7 +359,10 @@ add_task(async function test_mimePartKeepsPhysicalSourceAndSection() {
       );
       Assert.equal(state.header.messageKey, key);
       Assert.equal(state.header.storeToken, tokens[index]);
-      Assert.equal(state.folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+      Assert.equal(
+        state.folder.msgDatabase.dBFolderInfo.imapUidValidity,
+        epoch
+      );
       Assert.equal(readBody(state), STORE_HEADERS + state.raw);
     }
   } finally {

@@ -398,6 +398,107 @@ add_task(async function test_onlineSearchUsesPhysicalFolderKeys() {
   }
 });
 
+add_task(async function test_onlineSearchRejectsObservedEpochChange() {
+  if (!panorama) {
+    return;
+  }
+  const epoch = 7701;
+  const state = await createSearchFolder(
+    "SearchObservedEpoch",
+    "search-observed-epoch@example.invalid",
+    epoch
+  );
+  const selected = await onlineSearch(state.folder);
+  Assert.equal(selected.status, Cr.NS_OK);
+  Assert.deepEqual(
+    selected.hits.map(header => header.messageKey),
+    [state.header.messageKey]
+  );
+  const key = state.header.messageKey;
+  const flags = state.header.flags;
+  const token = state.header.storeToken;
+  Assert.notEqual(key, 8101);
+  const sink = state.folder.QueryInterface(Ci.nsIImapMailFolderSink);
+  Assert.equal(sink.uidValidity, epoch);
+  const added = [];
+  const deleted = [];
+  const listener = {
+    msgAdded(header) {
+      if (header.folder == state.folder) {
+        added.push(header);
+      }
+    },
+    msgsDeleted(headers) {
+      deleted.push(...headers.filter(header => header.folder == state.folder));
+    },
+  };
+  MailServices.mfn.addListener(
+    listener,
+    Ci.nsIMsgFolderNotificationService.msgAdded |
+      Ci.nsIMsgFolderNotificationService.msgsDeleted
+  );
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalSearch = proto.SEARCH;
+  let searches = 0;
+  proto.SEARCH = function (args, isUid) {
+    const response = originalSearch.call(this, args, isUid);
+    if (isUid && this._selectedMailbox == state.mailbox) {
+      searches++;
+      // Deliver an old response after a newer epoch has been observed. The
+      // real observer retains the durable binding for checked reconciliation.
+      sink.uidValidity = epoch + 1;
+    }
+    return response;
+  };
+  try {
+    const before = searchCommands().length;
+    const result = await onlineSearch(state.folder);
+    Assert.equal(searches, 1);
+    Assert.equal(searchCommands().length, before + 1);
+    Assert.equal(sink.uidValidity, epoch + 1);
+    Assert.equal(state.folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+    Assert.equal(result.starts, 1);
+    Assert.equal(result.stops, 1);
+    Assert.deepEqual(
+      [result.status, result.hits.map(header => header.messageKey)],
+      [Cr.NS_ERROR_NOT_AVAILABLE, []]
+    );
+    Assert.deepEqual(
+      Array.from(state.folder.messages, header => header.messageKey),
+      [key]
+    );
+    Assert.equal(state.header.messageKey, key);
+    Assert.equal(state.header.folder, state.folder);
+    Assert.equal(state.header.getUint32Property("uidOnServer"), 8101);
+    Assert.equal(state.header.flags, flags);
+    Assert.equal(state.header.storeToken, token);
+    Assert.equal(state.message.getText(), state.raw);
+    Assert.deepEqual(
+      state.mailbox._messages.map(message => message.uid),
+      [8101]
+    );
+    Assert.deepEqual(added, []);
+    Assert.deepEqual(deleted, []);
+  } finally {
+    proto.SEARCH = originalSearch;
+    sink.uidValidity = epoch;
+    MailServices.mfn.removeListener(listener);
+  }
+  for (let i = 0; i < 2; i++) {
+    const retry = await onlineSearch(state.folder);
+    Assert.equal(retry.status, Cr.NS_OK);
+    Assert.equal(retry.starts, 1);
+    Assert.equal(retry.stops, 1);
+    Assert.deepEqual(
+      retry.hits.map(header => header.messageKey),
+      [key]
+    );
+    Assert.equal(state.header.getUint32Property("uidOnServer"), 8101);
+    Assert.equal(state.folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+    Assert.equal(state.message.getText(), state.raw);
+  }
+});
+
 add_task(async function test_onlineSearchReportsMalformedUidsAndCanRetry() {
   const state = await createSearchFolder(
     "SearchMalformed",

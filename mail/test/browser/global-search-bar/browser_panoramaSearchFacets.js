@@ -612,12 +612,12 @@ add_task(
       tabmail.closeTab(tab);
       tab = null;
       const remaining = tabmail.tabInfo.length;
-      release();
       Assert.equal(
         await pending,
         null,
-        "Tab closure discards the in-flight refreshed snapshot"
+        "Tab closure settles the parent promise before the held query returns"
       );
+      release();
       Assert.equal(tabmail.tabInfo.length, remaining);
     } finally {
       release();

@@ -1358,7 +1358,55 @@ var FacetContext = {
    * @param {boolean} [options.preserveFilters=false] - Keep the open view's selections.
    * @returns {Promise<?MailSearchResultSet>} Current physical snapshot, or null on cancellation/error.
    */
-  async loadMailSearch({ preserveFilters = false } = {}) {
+  loadMailSearch(options = {}) {
+    // Closing this frame must still settle the promise owned by its mail tab.
+    const { promise, resolve, reject } = this.rootWin.Promise.withResolvers();
+    let stop = () => {};
+    try {
+      const { preserveFilters = false } = options;
+      this.mailSearchQueryController?.abort();
+      const controller = (this.mailSearchQueryController =
+        new AbortController());
+      const signal = AbortSignal.any([
+        controller.signal,
+        this.tab.mailSearchController.signal,
+      ]);
+      const cancelled = () => {
+        stop();
+        resolve(null);
+      };
+      stop = () => signal.removeEventListener("abort", cancelled);
+      signal.addEventListener("abort", cancelled, { once: true });
+      if (signal.aborted) {
+        cancelled();
+      } else {
+        this._loadMailSearch({ preserveFilters }, signal).then(
+          result => {
+            stop();
+            resolve(result);
+          },
+          error => {
+            stop();
+            reject(error);
+          }
+        );
+      }
+    } catch (error) {
+      stop();
+      reject(error);
+    }
+    return promise;
+  },
+
+  /**
+   * Builds this frame's current facets under the parent-owned query lifetime.
+   *
+   * @param {object} options - Refresh controls.
+   * @param {boolean} options.preserveFilters - Keep existing refinement and sort.
+   * @param {AbortSignal} signal - Parent tab and replacement cancellation.
+   * @returns {Promise<?MailSearchResultSet>} Current results, or null on cancellation/error.
+   */
+  async _loadMailSearch({ preserveFilters }, signal) {
     const state = preserveFilters
       ? {
           sortBy: this._sortBy,
@@ -1379,12 +1427,6 @@ var FacetContext = {
     if (!preserveFilters) {
       this._activeConstraints = {};
     }
-    this.mailSearchQueryController?.abort();
-    const controller = (this.mailSearchQueryController = new AbortController());
-    const signal = AbortSignal.any([
-      controller.signal,
-      this.tab.mailSearchController.signal,
-    ]);
     this.mailSearchResultSet = null;
     this._activeSet = [];
     this._relevantSortedItems = [];

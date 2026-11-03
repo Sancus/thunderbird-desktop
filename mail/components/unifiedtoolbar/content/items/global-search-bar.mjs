@@ -139,10 +139,11 @@ class GlobalSearchBar extends SearchBar {
         this.popup.invalidate();
         return;
       }
+      let selectedIndex = null;
       if (this.#refreshSelection) {
         const selected = this.#refreshSelection;
         this.#refreshSelection = null;
-        this.popup.selectedIndex = search.rows.findIndex(
+        selectedIndex = search.rows.findIndex(
           row =>
             !!row.fullText == selected.fullText &&
             (row.sourceId ?? null) == selected.sourceId &&
@@ -161,9 +162,17 @@ class GlobalSearchBar extends SearchBar {
           this,
           this.shadowRoot.querySelector("input")
         );
-        return;
+      } else {
+        this.popup.invalidate();
       }
-      this.popup.invalidate();
+      // The richlistbox cannot select an index until its new rows exist.
+      if (
+        selectedIndex !== null &&
+        this.#completionResult == (search.wrappedJSObject ?? search) &&
+        provider.curResult == this.#completionResult
+      ) {
+        this.popup.selectedIndex = selectedIndex;
+      }
     },
   };
 

@@ -315,17 +315,48 @@ add_task(async function test_mimePartKeepsPhysicalSourceAndSection() {
     Assert.equal(state.header.flags & Ci.nsMsgMessageFlags.Offline, 0);
     Assert.equal(state.header.storeToken, "");
   }
+  const selections = states.map(state => ({
+    state,
+    uri: state.folder.getUriForMsg(state.header),
+    key: state.header.messageKey,
+    epoch: state.folder.msgDatabase.dBFolderInfo.imapUidValidity,
+  }));
+  await TestUtils.waitForCondition(
+    () => IMAPPump.incomingServer.allConnectionsIdle
+  );
+  const connections = IMAPPump.server._readers.length;
+  IMAPPump.incomingServer.closeCachedConnections();
+  for (const { state, uri, key, epoch } of selections) {
+    Assert.equal(
+      await fetchPart(state, "1.2", uri),
+      state.folder.name + " attachment\r\n"
+    );
+    Assert.equal(state.header.messageKey, key);
+    Assert.equal(state.folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+    Assert.equal(state.header.storeToken, "");
+    Assert.equal(state.header.flags & Ci.nsMsgMessageFlags.Offline, 0);
+    await fetchPreview(state);
+    Assert.equal(
+      state.header.getStringProperty("preview"),
+      state.folder.name + " body"
+    );
+  }
+  Assert.greater(IMAPPump.server._readers.length, connections);
   for (const state of states) {
     await download(state);
   }
+  const tokens = states.map(state => state.header.storeToken);
   const wasOffline = Services.io.offline;
   Services.io.offline = true;
   try {
-    for (const state of states) {
+    for (const [index, { state, uri, key, epoch }] of selections.entries()) {
       Assert.equal(
-        await fetchPart(state, "1.2"),
+        await fetchPart(state, "1.2", uri),
         state.folder.name + " attachment\r\n"
       );
+      Assert.equal(state.header.messageKey, key);
+      Assert.equal(state.header.storeToken, tokens[index]);
+      Assert.equal(state.folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
       Assert.equal(readBody(state), STORE_HEADERS + state.raw);
     }
   } finally {
@@ -346,10 +377,14 @@ add_task(async function test_remotePreviewRejectsChangedEpoch() {
  *
  * @param {PreviewMessage} state - The selected physical message.
  * @param {string} part - The numeric MIME section.
+ * @param {string} [uri] - A saved physical message URI, or the current header URI.
  * @returns {Promise<string>} The decoded bytes of that section.
  */
-async function fetchPart(state, part) {
-  const uri = state.folder.getUriForMsg(state.header);
+async function fetchPart(
+  state,
+  part,
+  uri = state.folder.getUriForMsg(state.header)
+) {
   const service = MailServices.messageServiceFromURI(uri);
   const url = service.getUrlForUri(uri);
   const listener = new PromiseTestUtils.PromiseStreamListener();

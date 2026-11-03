@@ -188,6 +188,52 @@ add_task(async function test_availabilityRejectsForeignKeysAndUidAliases() {
   Assert.equal(readBody(first), STORE_HEADERS + RAW);
 });
 
+add_task(async function test_bodyReaderKeepsPhysicalSourceAcrossReconnect() {
+  const cached = await createBody("BodyReconnectCached", "");
+  const unavailable = await createBody("BodyReconnectUnavailable", "");
+  await download(cached);
+  const key = cached.header.messageKey;
+  const token = cached.header.storeToken;
+  const flags = cached.header.flags;
+  const epoch = cached.folder.msgDatabase.dBFolderInfo.imapUidValidity;
+  Assert.notEqual(key, unavailable.header.messageKey);
+  Assert.equal(unavailable.header.getUint32Property("uidOnServer"), 5101);
+
+  await TestUtils.waitForCondition(
+    () => IMAPPump.incomingServer.allConnectionsIdle
+  );
+  const connections = IMAPPump.server._readers.length;
+  IMAPPump.incomingServer.closeCachedConnections();
+  await select(unavailable.folder);
+  Assert.greater(IMAPPump.server._readers.length, connections);
+
+  Assert.throws(
+    () => cached.folder.getMsgInputStream(unavailable.header),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.throws(
+    () => unavailable.folder.getMsgInputStream(unavailable.header),
+    error => error.result == Cr.NS_ERROR_FAILURE
+  );
+  Assert.equal(unavailable.header.storeToken, "");
+  Assert.equal(unavailable.header.flags & Ci.nsMsgMessageFlags.Offline, 0);
+  const stream = cached.folder.getMsgInputStream(cached.header);
+  try {
+    let raw = "";
+    while (stream.available()) {
+      raw += NetUtil.readInputStreamToString(stream, stream.available());
+    }
+    Assert.equal(raw, STORE_HEADERS + RAW);
+  } finally {
+    stream.close();
+  }
+  Assert.equal(cached.header.messageKey, key);
+  Assert.equal(cached.header.storeToken, token);
+  Assert.equal(cached.header.flags, flags);
+  Assert.equal(cached.folder.msgDatabase.dBFolderInfo.imapUidValidity, epoch);
+  Assert.equal(readBody(cached), STORE_HEADERS + RAW);
+});
+
 /**
  * Creates a real Gmail mailbox with a literal server message and no local body.
  *

@@ -290,6 +290,168 @@ add_task(async function crossStreaming() {
   );
 });
 
+add_task(async function test_reconnectReconcilesNewEpochDuringDiscovery() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const inboxHeader = IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(gMsgId1);
+  const inboxKey = inboxHeader.messageKey;
+  const inboxToken = inboxHeader.storeToken;
+  const root = IMAPPump.incomingServer.rootFolder;
+  const allMail = root.getChildNamed("[Gmail]").getChildNamed("All Mail");
+  const allMailId = allMail.id;
+  const fooId = fooFolder.id;
+  const created = new PromiseTestUtils.PromiseUrlListener();
+  root
+    .QueryInterface(Ci.nsIMsgImapMailFolder)
+    .createSubfolderWithListener("RetryEpoch", created);
+  await created.promise;
+  const folder = root
+    .getChildNamed("RetryEpoch")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  const folderId = folder.id;
+  folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+  const mailbox = IMAPPump.daemon.getMailbox("RetryEpoch");
+  mailbox.uidvalidity = 9301;
+  const messages = ["old", "fresh"].map((phase, index) => {
+    const raw =
+      `Message-ID: <retry-${phase}@example.invalid>\r\n` +
+      "From: sender@example.invalid\r\n" +
+      "To: recipient@example.invalid\r\n" +
+      `Subject: ${phase} epoch\r\n` +
+      "Date: Sat, 1 Nov 2025 00:00:00 +0000\r\n\r\n" +
+      `The ${phase} epoch owns these bytes.\r\n`;
+    const message = new ImapMessage(
+      "data:text/plain;base64," + btoa(raw),
+      6101,
+      []
+    );
+    if (index) {
+      message.setFlag("\\Flagged");
+    }
+    message.messageId = `retry-${phase}@example.invalid`;
+    message.xGmMsgid = String(1278455345230334600n + BigInt(index));
+    message.xGmThrid = message.xGmMsgid;
+    message.xGmLabels = "()";
+    return message;
+  });
+  mailbox.addMessage(messages[0]);
+  mailbox.uidnext = 6102;
+  const initial = new PromiseTestUtils.PromiseUrlListener();
+  folder.updateFolderWithListener(null, initial);
+  await initial.promise;
+  const previous = folder.msgDatabase.getMsgHdrForMessageID(
+    "retry-old@example.invalid"
+  );
+  const oldKey = previous.messageKey;
+  const oldBytes = messages[0].getText();
+  Assert.notEqual(oldKey, 6101);
+  Assert.equal(previous.getUint32Property("uidOnServer"), 6101);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 9301);
+  const before = new PromiseTestUtils.PromiseStreamListener();
+  MailServices.messageServiceFromURI(
+    folder.getUriForMsg(previous)
+  ).streamMessage(
+    folder.getUriForMsg(previous),
+    before,
+    null,
+    null,
+    false,
+    "",
+    false
+  );
+  Assert.ok((await before.promise).includes("The old epoch owns these bytes."));
+  await TestUtils.waitForCondition(
+    () => IMAPPump.incomingServer.allConnectionsIdle
+  );
+  const readers = IMAPPump.server._readers.filter(reader => reader._isRunning);
+  Assert.equal(readers.length, 1);
+  const connectionCount = IMAPPump.server._readers.length;
+  await readers[0]._realCloseSocket();
+  Assert.equal(readers[0]._transport, null);
+
+  // The server reuses its UID in a new epoch; client state is left untouched.
+  mailbox.uidvalidity = 9402;
+  mailbox._messages.length = 0;
+  mailbox.addMessage(messages[1]);
+  mailbox.uidnext = 6102;
+  let starts = 0;
+  let stops = 0;
+  const retry = new PromiseTestUtils.PromiseUrlListener({
+    OnStartRunningUrl() {
+      starts++;
+    },
+    OnStopRunningUrl(url, status) {
+      stops++;
+      Assert.equal(status, Cr.NS_OK);
+      Assert.equal(url.QueryInterface(Ci.nsIMsgMailNewsUrl).folder, folder);
+    },
+  });
+  let discoveries = 0;
+  const discovered = new PromiseTestUtils.PromiseUrlListener({
+    OnStopRunningUrl(_url, status) {
+      discoveries++;
+      Assert.equal(status, Cr.NS_OK);
+    },
+  });
+  MailServices.imap.selectFolder(folder, retry, null);
+  MailServices.imap.discoverAllFolders(root, discovered, null);
+  await Promise.all([retry.promise, discovered.promise]);
+  Assert.equal(starts, 1);
+  Assert.equal(stops, 1);
+  Assert.equal(discoveries, 1);
+  Assert.equal(IMAPPump.server._readers.length, connectionCount + 1);
+  Assert.equal(folder.id, folderId);
+  Assert.equal(
+    root.getChildNamed("[Gmail]").getChildNamed("All Mail").id,
+    allMailId
+  );
+  Assert.equal(root.getChildNamed("foo").id, fooId);
+  const fresh = folder.msgDatabase.getMsgHdrForMessageID(
+    "retry-fresh@example.invalid"
+  );
+  Assert.equal(fresh.folder, folder);
+  Assert.notEqual(fresh.messageKey, oldKey);
+  Assert.notEqual(fresh.messageKey, 6101);
+  Assert.equal(fresh.getUint32Property("uidOnServer"), 6101);
+  Assert.equal(fresh.isFlagged, true);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 9402);
+  Assert.ok(!folder.msgDatabase.containsKey(oldKey));
+  Assert.deepEqual(folder.msgDatabase.listAllKeys(), [fresh.messageKey]);
+  Assert.equal(folder.getTotalMessages(false), 1);
+  Assert.equal(messages[0].getText(), oldBytes);
+  Assert.deepEqual(mailbox._messages, [messages[1]]);
+  const after = new PromiseTestUtils.PromiseStreamListener();
+  MailServices.messageServiceFromURI(folder.getUriForMsg(fresh)).streamMessage(
+    folder.getUriForMsg(fresh),
+    after,
+    null,
+    null,
+    false,
+    "",
+    false
+  );
+  Assert.ok(
+    (await after.promise).includes("The fresh epoch owns these bytes.")
+  );
+
+  let completions = 0;
+  const repeated = new PromiseTestUtils.PromiseUrlListener({
+    OnStopRunningUrl() {
+      completions++;
+    },
+  });
+  folder.updateFolderWithListener(null, repeated);
+  await repeated.promise;
+  Assert.equal(completions, 1);
+  Assert.deepEqual(folder.msgDatabase.listAllKeys(), [fresh.messageKey]);
+  Assert.equal(folder.msgDatabase.dBFolderInfo.imapUidValidity, 9402);
+  const retainedInbox =
+    IMAPPump.inbox.msgDatabase.getMsgHdrForMessageID(gMsgId1);
+  Assert.equal(retainedInbox.messageKey, inboxKey);
+  Assert.equal(retainedInbox.storeToken, inboxToken);
+});
+
 add_task(function endTest() {
   teardownIMAPPump();
 });

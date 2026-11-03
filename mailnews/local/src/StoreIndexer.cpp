@@ -271,13 +271,6 @@ NS_IMETHODIMP StoreIndexer::OnStopRequest(nsIRequest* req, nsresult status) {
   nsCOMPtr<nsIMsgDBHdr> hdr;
   nsresult rv = mParser->GetNewMsgHdr(getter_AddRefs(hdr));
   NS_ENSURE_SUCCESS(rv, RememberError(rv));
-#ifdef MOZ_PANORAMA
-  // A scanned body which never completed its headers cannot silently disappear
-  // from a successful native rebuild. Expunged headers are handled below.
-  if (mFolderRepair) {
-    NS_ENSURE_TRUE(hdr, RememberError(NS_ERROR_ILLEGAL_VALUE));
-  }
-#endif
   if (hdr) {
     uint32_t flags;
     rv = hdr->GetFlags(&flags);

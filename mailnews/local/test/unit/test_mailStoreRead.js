@@ -1110,8 +1110,9 @@ async function checkRepairMalformedHeaders(storeType) {
       () => Cr.NS_OK,
       error => Number(error.message)
     );
-    Assert.equal(result, Cr.NS_ERROR_ILLEGAL_VALUE);
-    Assert.deepEqual(statuses, [Cr.NS_ERROR_ILLEGAL_VALUE]);
+    // GetNewMsgHdr reports the original missing completed-header error.
+    Assert.equal(result, Cr.NS_ERROR_NULL_POINTER);
+    Assert.deepEqual(statuses, [Cr.NS_ERROR_NULL_POINTER]);
     Assert.ok(!folder.locked);
     Assert.ok(!folder.msgDatabase.summaryValid);
     folder.msgDatabase.forceClosed();

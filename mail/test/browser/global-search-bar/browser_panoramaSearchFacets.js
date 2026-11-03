@@ -347,6 +347,9 @@ add_task(
     );
     Assert.equal(attachments.constraint, null);
     context.addFacetConstraint(tag, true, [group], false, false);
+    // Folder/view initialization may have changed native metadata while these
+    // widgets were exercised. Keep the refinement, and capture current tokens.
+    await context.loadMailSearch({ preserveFilters: true });
     const list = await context.showActiveSetInTab();
     Assert.deepEqual(
       (await readNativeList(list)).identities,
@@ -523,6 +526,27 @@ add_task(
         "Earlier copied names remain snapshots"
       );
 
+      const selected = context.activeSet.find(
+        item => item.id == String(headers[1].messageKey)
+      );
+      const conversation = await context.openMailSearchConversation(
+        selected,
+        true
+      );
+      Assert.ok(conversation);
+      const selectedView = await readNativeList(conversation);
+      // Equal Message-ID without a References edge must not substitute its peer.
+      Assert.deepEqual(selectedView.identities, [physicalIdentity(headers[1])]);
+      await TestUtils.waitForCondition(
+        () => selectedView.pane.gDBView.numSelected == 1
+      );
+      Assert.equal(
+        physicalIdentity(selectedView.pane.gDBView.hdrForFirstSelectedMessage),
+        physicalIdentity(headers[1]),
+        "The refreshed current token opens and selects the clicked physical copy"
+      );
+      tabmail.closeTab(conversation);
+
       const failure = new Error("Live facet refresh original failure");
       let observedError;
       const showError = context.showMailSearchError;
@@ -562,26 +586,6 @@ add_task(
       const actual = await readNativeList(list);
       Assert.deepEqual(actual.identities, headers.map(physicalIdentity).sort());
       tabmail.closeTab(list);
-      const selected = context.activeSet.find(
-        item => item.id == String(headers[1].messageKey)
-      );
-      const conversation = await context.openMailSearchConversation(
-        selected,
-        true
-      );
-      Assert.ok(conversation);
-      const selectedView = await readNativeList(conversation);
-      // Equal Message-ID without a References edge must not substitute its peer.
-      Assert.deepEqual(selectedView.identities, [physicalIdentity(headers[1])]);
-      await TestUtils.waitForCondition(
-        () => selectedView.pane.gDBView.numSelected == 1
-      );
-      Assert.equal(
-        physicalIdentity(selectedView.pane.gDBView.hdrForFirstSelectedMessage),
-        physicalIdentity(headers[1]),
-        "The refreshed current token opens and selects the clicked physical copy"
-      );
-      tabmail.closeTab(conversation);
 
       let collected = false;
       const held = new Promise(resolve => {
@@ -593,7 +597,12 @@ add_task(
         await held;
         return result;
       };
-      currentCard = book.addCard(card);
+      const replacement = Cc[
+        "@mozilla.org/addressbook/cardproperty;1"
+      ].createInstance(Ci.nsIAbCard);
+      replacement.primaryEmail = card.primaryEmail;
+      replacement.displayName = "Open Facet Replacement";
+      currentCard = book.addCard(replacement);
       await TestUtils.waitForCondition(
         () => collected,
         "A later real card notification starts one refresh"

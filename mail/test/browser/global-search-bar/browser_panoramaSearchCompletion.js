@@ -156,11 +156,11 @@ function assertCompletionInputOwnership(input) {
 
 add_task(
   async function test_nativeToolbarPersonUsesLiteralSelectionAndSource() {
+    // The native backend preference is frozen at startup; changing it here
+    // would violate its StaticPrefs debug assertion before any UI is tested.
+    Assert.ok(Services.prefs.getBoolPref("mail.panorama.enabled"));
     await SpecialPowers.pushPrefEnv({
-      set: [
-        ["gloda.show_as_list_by_default", true],
-        ["mail.panorama.enabled", false],
-      ],
+      set: [["gloda.show_as_list_by_default", true]],
     });
     try {
       const input = document.querySelector(
@@ -523,89 +523,85 @@ add_task(async function test_nativeEmptyToolbarCancelsOldCompletion() {
   Assert.ok(!input.popup.mPopupOpen);
 });
 
-add_task(
-  async function test_nativeQuickFilterIgnoresMutableBackendPreference() {
-    const { be_in_folder } = ChromeUtils.importESModule(
-      "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
-    );
-    const { set_filter_text } = ChromeUtils.importESModule(
-      "resource://testing-common/mail/QuickFilterBarHelpers.sys.mjs"
-    );
-    await SpecialPowers.pushPrefEnv({
-      set: [
-        ["mail.panorama.enabled", false],
-        ["gloda.show_as_list_by_default", false],
-      ],
+add_task(async function test_nativeQuickFilterUsesStartupBackend() {
+  Assert.ok(Services.prefs.getBoolPref("mail.panorama.enabled"));
+  const { be_in_folder } = ChromeUtils.importESModule(
+    "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
+  );
+  const { set_filter_text } = ChromeUtils.importESModule(
+    "resource://testing-common/mail/QuickFilterBarHelpers.sys.mjs"
+  );
+  await SpecialPowers.pushPrefEnv({
+    set: [["gloda.show_as_list_by_default", false]],
+  });
+  try {
+    await be_in_folder(fixture.folders[2]);
+    const pane = tabmail.currentTabInfo.chromeBrowser.contentWindow;
+    const visible = pane.quickFilterBar.filterer.visible;
+    pane.commandController.doCommand("cmd_showQuickFilterBar");
+    registerCleanupFunction(() => {
+      pane.commandController.doCommand("cmd_resetQuickFilterBar");
+      if (pane.quickFilterBar.filterer.visible != visible) {
+        pane.commandController.doCommand("cmd_toggleQuickFilterBar");
+      }
     });
-    try {
-      await be_in_folder(fixture.folders[2]);
-      const pane = tabmail.currentTabInfo.chromeBrowser.contentWindow;
-      const visible = pane.quickFilterBar.filterer.visible;
-      pane.commandController.doCommand("cmd_showQuickFilterBar");
-      registerCleanupFunction(() => {
-        pane.commandController.doCommand("cmd_resetQuickFilterBar");
-        if (pane.quickFilterBar.filterer.visible != visible) {
-          pane.commandController.doCommand("cmd_toggleQuickFilterBar");
-        }
-      });
-      await set_filter_text("nativecompletionneedle");
-      // Earlier list selections can change metadata after fixture indexing.
-      let progress;
-      do {
-        progress = await fixture.service.update({ limit: 500 });
-      } while (progress.moreWork);
-      const snapshot = await fixture.service.collectResults(
-        "nativecompletionneedle"
-      );
-      const current = fixture.expected.map(([, key]) =>
-        fixture.service.resolveDocument(String(key))
-      );
-      const { getMailSearchHeader } = ChromeUtils.importESModule(
-        "resource:///modules/panorama/MailSearchPolicy.sys.mjs"
-      );
-      const indexed = snapshot.items.map(item => {
-        const state = fixture.service.resolveDocument(item.id);
-        Assert.equal(item.generation, state.generation);
-        Assert.equal(item.contentRevision, state.contentRevision);
-        Assert.equal(item.policyRevision, state.policyRevision);
-        Assert.deepEqual(item.location, state.location);
-        const header = getMailSearchHeader(state);
-        return [header.folder.URI, header.messageKey, item.messageId];
-      });
-      const revisions = states =>
-        states.map(state => ({
-          id: state?.id,
-          generation: state?.generation,
-          contentRevision: state?.contentRevision,
-          policyRevision: state?.policyRevision,
-          location: state?.location,
-        }));
-      Assert.deepEqual(
-        indexed.toSorted(),
-        fixture.expected.toSorted(),
-        `Both physical copies are current before escalation: ${JSON.stringify({
-          indexed: revisions(snapshot.items),
-          current: revisions(current),
-        })}`
-      );
-      pane.document.getElementById("qfb-qs-textbox").dispatchEvent(
-        new pane.CustomEvent("search", {
-          detail: "nativecompletionneedle",
-          cancelable: true,
-        })
-      );
-      const tab = tabmail.currentTabInfo;
-      Assert.equal(tab.mode.name, "glodaFacet");
-      Assert.equal(tab.mailSearch.text, "nativecompletionneedle");
-      await TestUtils.waitForCondition(() => tab.searchPromise);
-      await tab.searchPromise;
-      Assert.equal(tab.browser.contentWindow.FacetContext.fullSet.length, 2);
-      tabmail.closeTab(tab);
-    } finally {
-      await SpecialPowers.popPrefEnv();
-    }
+    await set_filter_text("nativecompletionneedle");
+    // Earlier list selections can change metadata after fixture indexing.
+    let progress;
+    do {
+      progress = await fixture.service.update({ limit: 500 });
+    } while (progress.moreWork);
+    const snapshot = await fixture.service.collectResults(
+      "nativecompletionneedle"
+    );
+    const current = fixture.expected.map(([, key]) =>
+      fixture.service.resolveDocument(String(key))
+    );
+    const { getMailSearchHeader } = ChromeUtils.importESModule(
+      "resource:///modules/panorama/MailSearchPolicy.sys.mjs"
+    );
+    const indexed = snapshot.items.map(item => {
+      const state = fixture.service.resolveDocument(item.id);
+      Assert.equal(item.generation, state.generation);
+      Assert.equal(item.contentRevision, state.contentRevision);
+      Assert.equal(item.policyRevision, state.policyRevision);
+      Assert.deepEqual(item.location, state.location);
+      const header = getMailSearchHeader(state);
+      return [header.folder.URI, header.messageKey, item.messageId];
+    });
+    const revisions = states =>
+      states.map(state => ({
+        id: state?.id,
+        generation: state?.generation,
+        contentRevision: state?.contentRevision,
+        policyRevision: state?.policyRevision,
+        location: state?.location,
+      }));
+    Assert.deepEqual(
+      indexed.toSorted(),
+      fixture.expected.toSorted(),
+      `Both physical copies are current before escalation: ${JSON.stringify({
+        indexed: revisions(snapshot.items),
+        current: revisions(current),
+      })}`
+    );
+    pane.document.getElementById("qfb-qs-textbox").dispatchEvent(
+      new pane.CustomEvent("search", {
+        detail: "nativecompletionneedle",
+        cancelable: true,
+      })
+    );
+    const tab = tabmail.currentTabInfo;
+    Assert.equal(tab.mode.name, "glodaFacet");
+    Assert.equal(tab.mailSearch.text, "nativecompletionneedle");
+    await TestUtils.waitForCondition(() => tab.searchPromise);
+    await tab.searchPromise;
+    Assert.equal(tab.browser.contentWindow.FacetContext.fullSet.length, 2);
+    tabmail.closeTab(tab);
+  } finally {
+    await SpecialPowers.popPrefEnv();
   }
-);
+});
 
 add_task(
   async function test_nativeProxyOwnedInputCancelsOnClearAndDisconnect() {

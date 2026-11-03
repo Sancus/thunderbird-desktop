@@ -1616,16 +1616,45 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
   nsCOMPtr<nsIDBFolderInfo> folderInfo;
   while (m_currentFolder && !m_currentDB) {
     m_currentFolder->GetFlags(&folderFlags);
-    // need to check if folder has offline events, /* or is configured for
-    // offline */ shouldn't need to check if configured for offline use, since
-    // any folder with events should have nsMsgFolderFlags::OfflineEvents set.
-    if (folderFlags &
-        (nsMsgFolderFlags::OfflineEvents /* | nsMsgFolderFlags::Offline */)) {
+    bool inspectIntents = folderFlags & nsMsgFolderFlags::OfflineEvents;
+#ifdef MOZ_PANORAMA
+    if (!inspectIntents && !m_mailboxupdatesStarted && !m_pseudoOffline &&
+        (folderFlags & nsMsgFolderFlags::ImapBox) &&
+        mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      // OfflineEvents selects dispatchable work for ordinary UpdateFolder.
+      // Explicit playback must also inspect retained uncertainty and report
+      // it without resending. Do not turn that custody back into an auto-send.
+      RefPtr<mozilla::mailnews::DatabaseCore> core =
+          mozilla::mailnews::DatabaseCore::GetInstanceForService();
+      if (!core) return FinishPlayback(nullptr, NS_ERROR_NOT_AVAILABLE);
+      uint64_t folderId;
+      nsresult identity = m_currentFolder->GetId(&folderId);
+      if (NS_FAILED(identity)) return FinishPlayback(nullptr, identity);
+      nsTArray<nsMsgKey> retained;
+      nsresult found =
+          core->MessageDB().ListOfflineOperations(folderId, false, retained);
+      if (NS_FAILED(found)) return FinishPlayback(nullptr, found);
+      inspectIntents = !retained.IsEmpty();
+    }
+#endif
+    if (inspectIntents) {
       nsCOMPtr<nsIMsgDatabase> db;
-      m_currentFolder->GetDBFolderInfoAndDB(getter_AddRefs(folderInfo),
-                                            getter_AddRefs(db));
+      rv = m_currentFolder->GetDBFolderInfoAndDB(getter_AddRefs(folderInfo),
+                                                 getter_AddRefs(db));
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+          (NS_FAILED(rv) || !db || !folderInfo))
+        return FinishPlayback(nullptr,
+                              NS_FAILED(rv) ? rv : NS_ERROR_NOT_AVAILABLE);
+#endif
       if (db) {
         m_currentDB = do_QueryInterface(db, &rv);
+#ifdef MOZ_PANORAMA
+        if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+            (NS_FAILED(rv) || !m_currentDB))
+          return FinishPlayback(nullptr,
+                                NS_FAILED(rv) ? rv : NS_ERROR_NOT_AVAILABLE);
+#endif
         m_currentDB->AddListener(this);
       }
     }

@@ -417,6 +417,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
     this.rootMsgFolder.createSubfolder(name, null);
   }
 
+  /**
+   * Save the current subscriptions and read ranges before returning.
+   *
+   * @throws {nsIException} If collecting, writing, or finishing the file fails.
+   *   The server remains dirty and the previous file is retained on failure.
+   */
   writeNewsrcFile() {
     if (!this.newsrcHasChanged) {
       return;
@@ -430,7 +436,29 @@ export class NntpIncomingServer extends MsgIncomingServer {
         lines.push(folder.newsrcLine);
       }
     }
-    IOUtils.writeUTF8(this.newsrcFilePath.path, lines.join(""));
+    // This is a void XPCOM method, so an asynchronous rejection cannot report
+    // failure to its caller. Finish the safe stream before clearing dirty state.
+    const bytes = new TextEncoder().encode(lines.join(""));
+    const output = Cc[
+      "@mozilla.org/network/safe-file-output-stream;1"
+    ].createInstance(Ci.nsIFileOutputStream);
+    try {
+      output.init(this.newsrcFilePath, -1, 0o644, 0);
+      const binary = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(
+        Ci.nsIBinaryOutputStream
+      );
+      binary.setOutputStream(output);
+      binary.writeByteArray(bytes);
+      output.QueryInterface(Ci.nsISafeOutputStream).finish();
+    } catch (error) {
+      try {
+        output.close();
+      } catch (closeError) {
+        // Preserve the original collection/write/finish error.
+      }
+      throw error;
+    }
+    this.newsrcHasChanged = false;
   }
 
   findGroup(name) {

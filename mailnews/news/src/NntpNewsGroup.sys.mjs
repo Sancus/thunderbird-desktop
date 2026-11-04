@@ -19,9 +19,17 @@ export class NntpNewsGroup {
     this._folder = folder;
     this._db = this._folder.msgDatabase;
     this._msgHdrs = [];
+    this._nativeBackend = Services.prefs.getBoolPref(
+      "mail.panorama.enabled",
+      false
+    );
+    // Protocol article numbers remain distinct from native physical keys.
+    this._articleNumbers = new WeakMap();
+    this._oldReadRange = null;
     // The msg hdrs created from the XOVER response, by article number.
     this._xoverHdrs = new Map();
     this._commitReadKeySet = false;
+    this._skipHead = false;
   }
 
   /**
@@ -41,6 +49,7 @@ export class NntpNewsGroup {
    * @returns {[number, number]} A tuple of the first and last article to fetch.
    */
   getArticlesRangeToFetch(msgWindow, firstPossible, lastPossible) {
+    this._lastPossible = lastPossible;
     this._msgWindow = msgWindow;
     if (!this._msgWindow) {
       try {
@@ -108,6 +117,7 @@ export class NntpNewsGroup {
         if (this._server.markOldRead) {
           this._readKeySet.addRange(firstPossible, start - 1);
           this._commitReadKeySet = true;
+          this._oldReadRange = [firstPossible, start - 1];
         }
       }
       return [start, end];
@@ -164,7 +174,10 @@ export class NntpNewsGroup {
       bytes,
       lines,
     ] = parts;
-    const msgHdr = this._db.createNewHdrWithSpecificMsgKey(articleNumber);
+    const msgHdr = this._createHeader(Number(articleNumber));
+    if (this._nativeBackend && msgHdr.isLive) {
+      return;
+    }
     msgHdr.orFlags(Ci.nsMsgMessageFlags.New);
     this.setSubject(msgHdr, subject);
     msgHdr.author = from;
@@ -174,7 +187,7 @@ export class NntpNewsGroup {
     msgHdr.messageSize = bytes;
     msgHdr.lineCount = lines;
     this._msgHdrs.push(msgHdr);
-    this._xoverHdrs.set(msgHdr.messageKey, msgHdr);
+    this._xoverHdrs.set(Number(articleNumber), msgHdr);
   }
 
   /**
@@ -233,9 +246,65 @@ export class NntpNewsGroup {
       this._msgHdrs.push(this._msgHdr);
     }
 
+    this._msgHdr = null;
+    this._skipHead = false;
     if (articleNumber >= 0) {
-      this._msgHdr = this._db.createNewHdrWithSpecificMsgKey(articleNumber);
+      const header = this._createHeader(articleNumber);
+      if (this._nativeBackend && header.isLive) {
+        this._skipHead = true;
+      } else {
+        this._msgHdr = header;
+      }
     }
+  }
+
+  /**
+   * Create a header while retaining its captured protocol article number.
+   *
+   * @param {number} articleNumber - The server's article number, including zero.
+   * @returns {nsIMsgDBHdr} The header returned by the news database.
+   * @throws {nsIException} If a native article cannot fit in the read-key set.
+   */
+  _createHeader(articleNumber) {
+    if (
+      this._nativeBackend &&
+      (!Number.isInteger(articleNumber) ||
+        articleNumber < 0 ||
+        articleNumber > 0x7fffffff)
+    ) {
+      throw Components.Exception(
+        "Invalid news article number",
+        Cr.NS_ERROR_ILLEGAL_VALUE
+      );
+    }
+    const header = this._db.createNewHdrWithSpecificMsgKey(articleNumber);
+    this._articleNumbers.set(header, articleNumber);
+    return header;
+  }
+
+  /**
+   * Merge the explicitly selected old-article range into the current read set.
+   * Keep later read changes to other articles when a request finishes.
+   */
+  _saveOldReadRange() {
+    if (this._nativeBackend && this._oldReadRange[0] > 0) {
+      // GROUP already marked earlier expired articles read. The existing
+      // native summary operation adds exactly that union while retaining the
+      // original native zero bit, which serialized newsrc cannot represent.
+      this._folder.updateSummaryFromNNTPInfo(
+        this._oldReadRange[1] + 1,
+        this._lastPossible,
+        this._folder.getTotalMessages(false)
+      );
+    } else {
+      const current = new MsgKeySet(
+        this._folder.newsrcLine.split(":")[1].trim()
+      );
+      current.addRange(...this._oldReadRange);
+      this._folder.setReadSetFromStr(current.toString());
+    }
+    this._commitReadKeySet = false;
+    this._oldReadRange = null;
   }
 
   /**
@@ -244,6 +313,9 @@ export class NntpNewsGroup {
    * @param {string} line - A HEAD response line.
    */
   processHeadLine(line) {
+    if (this._skipHead) {
+      return;
+    }
     const colonIndex = line.indexOf(":");
     const name = line.slice(0, colonIndex).toLowerCase();
     const value = line.slice(colonIndex + 1).trim();
@@ -281,10 +353,22 @@ export class NntpNewsGroup {
    * Run filters to all newly added msg hdrs.
    */
   _runFilters() {
+    if (this._nativeBackend && this._commitReadKeySet) {
+      this._saveOldReadRange();
+    }
     const folderFilterCount = this._folderFilterList.filterCount;
     const serverFilterCount = this._serverFilterList.filterCount;
 
     for (const msgHdr of this._msgHdrs) {
+      const article = this._articleNumbers.get(msgHdr);
+      if (this._nativeBackend) {
+        const current = new MsgKeySet(
+          this._folder.newsrcLine.split(":")[1].trim()
+        );
+        if (current.has(article)) {
+          msgHdr.orFlags(Ci.nsMsgMessageFlags.Read);
+        }
+      }
       this._filteringHdr = msgHdr;
       this._addHdrToDB = true;
       let headers = "";
@@ -322,14 +406,25 @@ export class NntpNewsGroup {
         );
         this._serverFilterList.flushLogIfNecessary();
       }
-      if (this._addHdrToDB && !this._db.containsKey(msgHdr.messageKey)) {
-        if (this._readKeySet.has(msgHdr.messageKey)) {
+      if (
+        this._addHdrToDB &&
+        (this._nativeBackend || !this._db.containsKey(msgHdr.messageKey))
+      ) {
+        if (!this._nativeBackend && this._readKeySet.has(article)) {
           msgHdr.flags |= Ci.nsMsgMessageFlags.Read;
         }
-        this._db.addNewHdrToDB(msgHdr, true);
-        MailServices.mfn.notifyMsgAdded(msgHdr);
+        let published;
+        if (this._nativeBackend) {
+          // The native facade returns the real physical header. It owns the
+          // inserted/dedup result and sends the global notification once.
+          published = this._db.attachHdr(msgHdr, true);
+        } else {
+          this._db.addNewHdrToDB(msgHdr, true);
+          MailServices.mfn.notifyMsgAdded(msgHdr);
+          published = msgHdr;
+        }
         this._folder.orProcessingFlags(
-          msgHdr.messageKey,
+          published.messageKey,
           Ci.nsMsgProcessingFlags.NotReportedClassified
         );
       }
@@ -351,10 +446,18 @@ export class NntpNewsGroup {
           this._addHdrToDB = false;
           break;
         case Ci.nsMsgFilterAction.MarkRead:
-          this._db.markRead(this._filteringHdr.messageKey, true, null);
+          if (this._nativeBackend) {
+            this._filteringHdr.markRead(true);
+          } else {
+            this._db.markRead(this._filteringHdr.messageKey, true, null);
+          }
           break;
         case Ci.nsMsgFilterAction.MarkUnread:
-          this._db.markRead(this._filteringHdr.messageKey, false, null);
+          if (this._nativeBackend) {
+            this._filteringHdr.markRead(false);
+          } else {
+            this._db.markRead(this._filteringHdr.messageKey, false, null);
+          }
           break;
         case Ci.nsMsgFilterAction.KillThread:
           this._filteringHdr.setUint32Property(
@@ -415,11 +518,19 @@ export class NntpNewsGroup {
    */
   cleanUp() {
     if (this._commitReadKeySet) {
-      this._folder.setReadSetFromStr(this._readKeySet);
-      this._commitReadKeySet = false;
+      if (this._nativeBackend) {
+        this._saveOldReadRange();
+      } else {
+        this._folder.setReadSetFromStr(this._readKeySet.toString());
+        this._commitReadKeySet = false;
+      }
     }
     this._folder.notifyFinishedDownloadinghdrs();
     this._db.commit(Ci.nsMsgDBCommitType.kSessionCommit);
-    this._db.close(true);
+    if (!this._nativeBackend) {
+      this._db.close(true);
+    }
+    // Native writes are already committed. Keep the folder-owned read-set
+    // binding for live flag/listener updates until real folder/database close.
   }
 }

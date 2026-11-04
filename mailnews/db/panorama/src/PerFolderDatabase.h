@@ -18,6 +18,8 @@
 #include "nsIMsgFolder.h"
 #include "nsIMsgHdr.h"
 #include "nsIMsgThread.h"
+#include "nsINewsDatabase.h"
+#include "nsMsgKeySet.h"
 #include "nsMsgEnumerator.h"
 #include "nsTHashMap.h"
 #include "prtime.h"
@@ -85,18 +87,44 @@ class FolderRepair final {
   UniquePtr<Data> mData;
 };
 
+// Concrete synchronous preparation shared only with the native news writer.
+// Strong pins expire at the end of that write; the installed slot stays
+// borrowed.
+class PreparedNewsReadSetInstall final {
+ public:
+  PreparedNewsReadSetInstall() = default;
+  PreparedNewsReadSetInstall(PreparedNewsReadSetInstall&&) = default;
+  PreparedNewsReadSetInstall& operator=(PreparedNewsReadSetInstall&&) = default;
+
+ private:
+  friend class MessageDatabase;
+  friend class PerFolderDatabase;
+  RefPtr<PerFolderDatabase> mOwner;
+  RefPtr<nsMsgKeySet> mTarget;
+  RefPtr<nsMsgKeySet> mPrepared;
+  NewsGroupIdentity mGroup;
+  uint64_t mGeneration = 0;
+  bool mAttach = false;
+};
+
 class MessageEnumeratorStatementCloser;
 
+#define NS_PER_FOLDER_DATABASE_IID \
+  {0x3a369f26, 0x552d, 0x4ff8, {0xa2, 0x80, 0x8c, 0x8a, 0x40, 0x73, 0xb9, 0xf4}}
+
 class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
+                          public nsINewsDatabase,
                           public SupportsWeakPtr,
                           public MessageListener {
  public:
+  NS_INLINE_DECL_STATIC_IID(NS_PER_FOLDER_DATABASE_IID)
   explicit PerFolderDatabase(uint64_t folderId, bool isNewsFolder);
 
   NS_DECL_ISUPPORTS
   NS_DECL_NSIDBCHANGEANNOUNCER
   NS_DECL_NSIMSGDATABASE
   NS_DECL_NSIMSGOFFLINEOPSDATABASE
+  NS_DECL_NSINEWSDATABASE
 
   // MessageListener functions.
   void OnMessageAdded(Message* message) override;
@@ -131,6 +159,19 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
                                     const MessageBodyState& newBody) override;
 
   uint64_t FolderId() { return mFolderId; }
+
+  // Explicit article namespace for existing C++ news consumers. Ordinary
+  // nsIMsgDatabase keys remain global physical keys, even for a news folder.
+  nsresult GetNewsArticleKey(uint32_t articleNumber, nsMsgKey& physicalKey);
+  nsresult GetNewsArticleHdr(uint32_t articleNumber, nsIMsgDBHdr** header);
+  // Passive load preserves known zero on exact unchanged serialized ranges.
+  // Explicit SetReadSet stays authoritative; failure leaves the target
+  // untouched.
+  nsresult InitializeNewsReadSetFromNewsrc(nsMsgKeySet* incoming,
+                                           const nsACString& serializedRanges);
+  // Matching-only cleanup for the C++ news owner. A stale owner cannot detach
+  // a replacement set; cleanup never reads storage or dereferences the set.
+  void DetachNewsReadSetIfMatches(nsMsgKeySet* expected);
 
   // Copy metadata without source storage identity into an unpublished draft.
   // Local writes replace messageSize; uncached queued copies may retain it.
@@ -197,6 +238,7 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
 
  private:
   friend class Message;
+  friend class MessageDatabase;
   friend class ParsedServerHdr;
   friend class FolderInfo;
   friend class OfflineOperation;
@@ -216,7 +258,17 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   struct UndoDeleteContext;
   UndoDeleteContext* mUndoDeleteContext = nullptr;
 
-  virtual ~PerFolderDatabase() {};
+  virtual ~PerFolderDatabase();
+
+  nsresult PrepareNewsReadSetInstall(const NewsGroupIdentity& expectedGroup,
+                                     nsMsgKeySet* targetBorrowedSet,
+                                     nsMsgKeySet* preparedOwnedSet,
+                                     bool attachAfterCommit,
+                                     PreparedNewsReadSetInstall& output);
+  void ApplyPreparedNewsReadSet(PreparedNewsReadSetInstall& prepared);
+  void DetachNewsReadSet();
+  nsresult AttachNewsHdr(DetachedMsgHdr& draft, bool notify,
+                         nsIMsgDBHdr** header);
 
   FolderDatabase& FolderDB() const {
     return *DatabaseCore::sInstance->mFolderDatabase;
@@ -243,6 +295,11 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
 
   uint64_t mFolderId;
   bool mIsNewsFolder;
+  // Owned by nsMsgNewsFolder, explicitly detached before that owner releases
+  // it.
+  nsMsgKeySet* mNewsReadSet = nullptr;
+  Maybe<NewsGroupIdentity> mNewsGroup;
+  uint64_t mNewsReadSetGeneration = 0;
   nsCString mDatabaseSourceId;
   nsresult mDatabaseSourceStatus = NS_ERROR_NOT_AVAILABLE;
   PRTime mLastUseTime = PR_Now();

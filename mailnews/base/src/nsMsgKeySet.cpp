@@ -11,6 +11,7 @@
 #include "prmem.h"
 #include "nsTArray.h"
 #include <ctype.h>
+#include <utility>
 
 /* A compressed encoding for sets of article.  This is usually for lines from
    the newsrc, which have article lists like
@@ -70,6 +71,14 @@ nsMsgKeySet::nsMsgKeySet(/* MSG_NewsHost* host*/) {
 }
 
 nsMsgKeySet::~nsMsgKeySet() { PR_FREEIF(m_data); }
+
+void nsMsgKeySet::SwapContents(nsMsgKeySet& other) noexcept {
+  std::swap(m_data, other.m_data);
+  std::swap(m_data_size, other.m_data_size);
+  std::swap(m_length, other.m_length);
+  std::swap(m_cached_value, other.m_cached_value);
+  std::swap(m_cached_value_index, other.m_cached_value_index);
+}
 
 bool nsMsgKeySet::Grow() {
   mozilla::CheckedInt<int32_t> new_size =

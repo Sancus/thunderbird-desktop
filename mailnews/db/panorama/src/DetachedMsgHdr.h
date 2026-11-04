@@ -7,6 +7,7 @@
 
 #include "MailNewsTypes.h"
 #include "Message.h"
+#include "MessageDatabase.h"
 #include "nsCOMPtr.h"
 #include "nsIMsgDatabase.h"  // For struct RawHdr
 #include "nsIMsgHdr.h"
@@ -57,6 +58,14 @@ class DetachedMsgHdr : public DecodedSubjectHdr {
   // Opaque common-copy provenance and its one unpublished physical member.
   // Origin of a newly created native parser draft, separate from copy custody.
   nsCString mParsedSourceId;
+  // Presence is explicit: article zero is a valid protocol article, not a key.
+  Maybe<uint32_t> mNewsArticleNumber;
+  // Only an explicit news draft MarkRead action supplies publication intent.
+  // Nothing inherits the checkpoint; Some(false) is an explicit unread action.
+  Maybe<bool> mNewsReadIntent;
+  nsCString mNewsGroupIncarnation;
+  // Persistent native output is filled before publication listeners run.
+  NewsArticleResult mNewsResult;
   nsCString mCopySourceId;
   nsMsgKey mCopyStagedKey{nsMsgKey_None};
   bool mCopyPublishing = false;

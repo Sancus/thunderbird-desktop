@@ -62,3 +62,17 @@ prefs = ["dom.security.https_first=false"]
 
 ["test_ext_oauth_provider.js"]
 tags = ["oauth"]
+
+["test_ext_messages_queryWithoutGlobalIndex.js"]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mailnews.database.global.indexer.enabled=false",
+]
+support-files = ["test_ext_messages_query.js", "messages/alternative.eml"]
+
+["test_ext_messages_encryptedWithoutGlobalIndex.js"]
+prefs = [
+  "mail.panorama.enabled=true",
+  "mailnews.database.global.indexer.enabled=false",
+]
+support-files = ["test_ext_messages_encrypted.js"]

@@ -9,6 +9,7 @@ const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   copyMailSearchSelection:
     "resource:///modules/panorama/MailSearchResult.sys.mjs",
+  MailServices: "resource:///modules/MailServices.sys.mjs",
   Gloda: "resource:///modules/gloda/GlodaPublic.sys.mjs",
   GlodaConstants: "resource:///modules/gloda/GlodaConstants.sys.mjs",
   GlodaIMSearcher: "resource:///modules/GlodaIMSearcher.sys.mjs",
@@ -91,10 +92,14 @@ class GlobalSearchBar extends SearchBar {
     }
     // Checking the registered backend must not construct the legacy completer
     // before the user starts a search.
+    lazy.MailServices.accounts;
     const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
       Ci.nsIMsgDBService
     );
-    if (!(backend instanceof Ci.nsIDatabaseCore)) {
+    if (
+      !(backend instanceof Ci.nsIDatabaseCore) ||
+      !lazy.glodaCompleter.isNativeMailSearch
+    ) {
       return;
     }
     this.#observingNames = true;
@@ -123,7 +128,13 @@ class GlobalSearchBar extends SearchBar {
   #stopCompletion() {
     this.#refreshSelection = null;
     if (!this.#completionResult) {
-      return;
+      lazy.MailServices.accounts;
+      const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+        Ci.nsIMsgDBService
+      );
+      if (!("nsIDatabaseCore" in Ci) || !(backend instanceof Ci.nsIDatabaseCore)) {
+        return;
+      }
     }
     const provider = lazy.glodaCompleter;
     if (provider.curResult && provider.curResult == this.#completionResult) {

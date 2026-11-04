@@ -43,7 +43,7 @@ add_setup(async function () {
   });
 });
 
-add_task(async function () {
+add_task(async function test_badStoreTokensReloadFromServer() {
   const tabmail = document.getElementById("tabmail");
   const about3Pane = tabmail.currentAbout3Pane;
   const messagePaneBrowser =

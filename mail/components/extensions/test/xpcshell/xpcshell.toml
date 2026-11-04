@@ -26,7 +26,6 @@ support-files = ["messages/**"]
 ["test_ext_messages_bug_1954372.js"]
 
 ["test_ext_messages_encrypted.js"]
-prefs = ["mailnews.database.global.indexer.enabled=false"]
 
 ["test_ext_messages_get.js"] # PGP test disabled for NNTP
 
@@ -48,7 +47,6 @@ support-files = ["messages/**"]
 ["test_ext_messages_onNewMailReceived.js"]
 
 ["test_ext_messages_query.js"]
-prefs = ["mailnews.database.global.indexer.enabled=false"]
 skip-if = [
   "ccov", # Bug 1827450.
 ]

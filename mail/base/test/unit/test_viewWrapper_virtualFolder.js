@@ -1145,6 +1145,8 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
       "No cached prefix is admitted as a successful source"
     );
   } finally {
+    // End the faulted view's owned search/scopes before restoring its storage.
+    wrapper.close();
     connection.executeSimpleSQL("DROP VIEW temp.search_folder_hits");
     // Finish the native search callback/iterator stack before removing its UDF.
     // SQLite refuses function changes while any statement is still active.

@@ -90,6 +90,9 @@ async function setupMarkAsRead(backend) {
     registerCleanupFunction(function () {
       ewsAccount.incomingServer.closeCachedConnections();
       MailServices.accounts.removeAccount(ewsAccount, false);
+      Cc["@mozilla.org/network/http-auth-manager;1"]
+        .getService(Ci.nsIHttpAuthManager)
+        .clearAll();
     });
     ewsAccount.addIdentity(MailServices.accounts.createIdentity());
     ewsAccount.incomingServer = MailServices.accounts.createIncomingServer(

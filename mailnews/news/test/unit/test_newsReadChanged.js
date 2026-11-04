@@ -909,26 +909,32 @@ add_task(async function test_subscriptionNewsrcPersistsAcrossReopen() {
 async function createColdReadSetAccount(hostname, names, newsrc) {
   const account = MailServices.accounts.createAccount();
   accounts.push(account);
-  const server = MailServices.accounts
-    .createIncomingServer("", hostname, "nntp")
-    .QueryInterface(Ci.nsINntpIncomingServer);
-  // Assigning a valid server loads its root and subfolders immediately.
-  server.valid = false;
-  account.incomingServer = server;
+  const key = `newsrcCold${accounts.length}`;
+  const branch = `mail.server.${key}.`;
+  Assert.equal(Services.prefs.getChildList(branch).length, 0);
+  Services.prefs.setCharPref(`${branch}type`, "nntp");
+  Services.prefs.setCharPref(`${branch}hostname`, hostname);
+  Services.prefs.setBoolPref(`${branch}valid`, false);
   const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
     Ci.nsIDatabaseCore
   );
   Assert.equal(
-    core.folderDB.getFolderChildNamed(0, server.key),
+    core.folderDB.getFolderChildNamed(0, key),
     0,
     "The ordinary account has not initialized its root before restoration"
   );
-  const rootId = core.folderDB.insertRoot(server.key);
+  const rootId = core.folderDB.insertRoot(key);
   const ids = names.map(name => {
     const id = core.folderDB.insertFolder(rootId, name);
     core.folderDB.updateFlags(id, Ci.nsMsgFolderFlags.Newsgroup);
     return id;
   });
+  // Both account-manager creation routes eagerly initialize the root. Seed the
+  // persisted identity before that normal load, as in the news factory test.
+  const server = MailServices.accounts
+    .getIncomingServer(key)
+    .QueryInterface(Ci.nsINntpIncomingServer);
+  account.incomingServer = server;
   await IOUtils.writeUTF8(server.newsrcFilePath.path, newsrc);
   server.valid = true;
   return { server, account, ids };

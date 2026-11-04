@@ -829,6 +829,12 @@ add_task(function test_strictInputSizeAndLimitArguments() {
   const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
   const parser = new MorkParser();
   Assert.equal(parser.parseForImport(header, header.length).rows.size, 0);
+  assertStrictImportFailure(
+    header,
+    { maxTokenBytes: 32 },
+    "RESOURCE_LIMIT",
+    32
+  );
   Assert.throws(
     () => parser.parseForImport(header + " ", header.length),
     error =>
@@ -870,55 +876,52 @@ add_task(function test_strictInputSizeAndLimitArguments() {
 add_task(function test_strictTokenSpanLimits() {
   const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
   const parser = new MorkParser();
-  for (const payload of [
-    "x".repeat(30),
-    "$41".repeat(10),
-    "a\\\r\n" + "x".repeat(26),
+  // Every complete-document test must admit the 33-byte header comment first.
+  for (const [payload, expected] of [
+    ["x".repeat(62), "x".repeat(62)],
+    ["$41".repeat(20) + "yz", "A".repeat(20) + "yz"],
+    ["a\\\r\n" + "x".repeat(58), "a" + "x".repeat(58)],
   ]) {
     const body = header + "[1:r(a=" + payload + ")]";
     const snapshot = parser.parseForImport(body, body.length, {
-      maxTokenBytes: 32,
+      maxTokenBytes: 64,
     });
     Assert.equal(snapshot.rows.size, 1);
-    Assert.equal(
-      snapshot.rows.get("1:r").cells.get("a"),
-      payload.startsWith("$") ? "A".repeat(10) : payload.replace("\\\r\n", "")
-    );
+    Assert.equal(snapshot.rows.get("1:r").cells.get("a"), expected);
     assertStrictImportFailure(
       header + "[1:r(a=" + payload + "x)]",
-      { maxTokenBytes: 32 },
+      { maxTokenBytes: 64 },
       "RESOURCE_LIMIT",
-      header.length + 6 + 32
+      header.length + 6 + 64
     );
   }
-  const column = "a".repeat(32);
+  const column = "a".repeat(64);
   const named = header + "[1:r(" + column + "=)]";
   Assert.ok(
     parser
-      .parseForImport(named, named.length, { maxTokenBytes: 32 })
+      .parseForImport(named, named.length, { maxTokenBytes: 64 })
       .rows.get("1:r")
       .cells.has(column)
   );
   assertStrictImportFailure(
     header + "[1:r(" + column + "a=)]",
-    { maxTokenBytes: 32 },
+    { maxTokenBytes: 64 },
     "RESOURCE_LIMIT",
-    header.length + 5 + 32
+    header.length + 5 + 64
   );
-  const comment = "/*" + "x".repeat(28) + "*/";
+  const comment = "/*" + "x".repeat(60) + "*/";
   const commented = header + comment;
   Assert.equal(
-    parser.parseForImport(commented, commented.length, { maxTokenBytes: 32 })
+    parser.parseForImport(commented, commented.length, { maxTokenBytes: 64 })
       .rows.size,
     0
   );
   assertStrictImportFailure(
-    header + "/*" + "x".repeat(29) + "*/",
-    { maxTokenBytes: 32 },
+    header + "/*" + "x".repeat(61) + "*/",
+    { maxTokenBytes: 64 },
     "RESOURCE_LIMIT",
-    header.length + 32
+    header.length + 64
   );
-  // The normal consumer path also enforces the existing default token bound.
   const defaultValue = header + "[1:r(a=" + "x".repeat(65534) + ")]";
   Assert.equal(
     parser.parseForImport(defaultValue).rows.get("1:r").cells.get("a").length,

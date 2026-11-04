@@ -10,6 +10,12 @@ const { MailServices } = ChromeUtils.importESModule(
 const { MessageGenerator } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
 );
+const { GlodaMsgIndexer } = ChromeUtils.importESModule(
+  "resource:///modules/gloda/IndexMsg.sys.mjs"
+);
+const { GlodaDatastore } = ChromeUtils.importESModule(
+  "resource:///modules/gloda/GlodaDatastore.sys.mjs"
+);
 const { getMailSearchService, closeMailSearch } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MailSearch.sys.mjs"
 );
@@ -112,6 +118,31 @@ add_setup(async function setupNativeFacetMessages() {
   first.addKeywordsToMessages([matches[2]], "not-a-ui-tag");
   second.addKeywordsToMessages([secondCopy], "$label1");
   first.markMessagesFlagged([clicked], true);
+  // This manifest keeps Gloda enabled. Its asynchronous commit writes gloda-id
+  // on the same physical headers, so finish that fixture metadata before taking
+  // the native index snapshot used by these UI assertions.
+  await Promise.all(
+    folders.map(
+      folder =>
+        new Promise((resolve, reject) => {
+          const queued = GlodaMsgIndexer.indexFolder(folder, {
+            force: true,
+            callback(success) {
+              if (!success) {
+                reject(new Error("Fixture Gloda indexing did not complete"));
+                return;
+              }
+              // The job callback runs inside the indexing transaction. Header
+              // properties are published by the earlier post-commit callback.
+              GlodaDatastore.runPostCommit(resolve);
+            },
+          });
+          if (!queued) {
+            reject(new Error("Fixture Gloda indexing was not queued"));
+          }
+        })
+    )
+  );
   const service = await getMailSearchService();
   let progress;
   do {

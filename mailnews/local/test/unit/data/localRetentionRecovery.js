@@ -129,6 +129,13 @@ async function checkRestart() {
           `From: retention@example.invalid\r\nSubject: Restart ${i}\r\n` +
           `Message-ID: <retention-restart-${i}@example.invalid>\r\n\r\nBody ${i}\r\n`;
         const header = folder.addMessage(raw);
+        // Capture durable flags, without the facade's session-only New list.
+        header.flags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
+        folder.msgDatabase.clearNewList(false);
+        Assert.equal(
+          header.flags,
+          Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked
+        );
         entries.push({
           key: header.messageKey,
           token: header.storeToken,

@@ -25,12 +25,11 @@ add_setup(async function () {
   const imapAccount = MailServices.accounts.createAccount();
   imapAccount.addIdentity(MailServices.accounts.createIdentity());
   imapAccount.incomingServer = MailServices.accounts.createIncomingServer(
-    `${imapAccount.key}user`,
+    "user",
     "localhost",
     "imap"
   );
   imapAccount.incomingServer.port = imapServer.port;
-  imapAccount.incomingServer.username = "user";
   imapAccount.incomingServer.password = "password";
   const imapRootFolder = imapAccount.incomingServer.rootFolder;
   imapFolder = imapRootFolder.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);

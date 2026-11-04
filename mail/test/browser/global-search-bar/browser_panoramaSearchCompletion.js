@@ -438,6 +438,18 @@ add_task(
       // nsAutoCompleteController starts its provider through a delayed timer.
       await TestUtils.waitForCondition(() => provider.curResult != previous);
       const result = await completionResult("completionperson");
+      info(
+        JSON.stringify({
+          searchParam: input.searchParam,
+          userContextId: input.userContextId,
+          searchString: result.searchString,
+          sourceId: result.sourceId,
+          rows: result.rows,
+          indexingEnabled: Services.prefs.getBoolPref(
+            "mailnews.database.global.indexer.enabled"
+          ),
+        })
+      );
       assertCompletionInputOwnership(input);
       const index = result.rows.findIndex(row => row.type == "person");
       Assert.greaterOrEqual(index, 0);

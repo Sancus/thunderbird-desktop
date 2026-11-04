@@ -278,7 +278,7 @@ nsresult LiveView::RefreshPublicStatus() {
   nsCString flags("flags");
   nsCString extra;
   for (auto iter = folders.Iter(); !iter.Done(); iter.Next()) {
-    const auto& folder = iter.UserData();
+    const auto& folder = iter.Data();
     if (!folder->used) continue;
     if (!folder->extraNew.IsEmpty()) {
       if (!extra.IsEmpty()) extra.Append(" OR ");

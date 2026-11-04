@@ -26,6 +26,10 @@ struct NativeQueuedAppendTarget {
 struct NativeQueuedAppendReceipt {
   mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> destination;
 };
+struct NativeReplayCommandReceipt {
+  mozilla::mailnews::OfflineReplayReceipt outcome;
+  nsresult status;
+};
 struct NativeQueuedCopyReceipt {
   ImapUid sourceUid = 0;
   mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> destination;
@@ -72,6 +76,22 @@ class nsImapUrl : public nsIImapUrl,
   nsresult RecordNativeCopyReceipts(
       const nsTArray<NativeQueuedCopyReceipt>& receipts);
   nsTArray<NativeQueuedCopyReceipt> CopyNativeCopyReceipts();
+  nsresult PrepareNativeReplayCommand(
+      const mozilla::mailnews::OfflineReplayCommandToken& token);
+  mozilla::Maybe<mozilla::mailnews::OfflineReplayCommandToken>
+  CopyNativeReplayCommand();
+  void CollectNativeReplayFlags(bool collecting);
+  void RecordNativeReplayFlags(ImapUid uid, imapMessageFlagsType flags,
+                               bool explicitUid);
+  bool NativeReplayFlagsMatched();
+  void RecordNativeReplayReceipt(
+      mozilla::mailnews::OfflineReplayReceipt outcome, nsresult status);
+  mozilla::Maybe<NativeReplayCommandReceipt> CopyNativeReplayReceipt();
+  nsresult PrepareNativeFolderDelete(
+      const mozilla::mailnews::OfflineAttempt& attempt);
+  bool HasNativeFolderDelete();
+  void RecordNativeFolderDeleteAcknowledged();
+  bool NativeFolderDeleteAcknowledged();
   void RecordNativeSourceRetired();
   bool NativeSourceRetired();
   nsresult PrepareNativeQueuedAppend(const NativeQueuedAppendTarget& target);
@@ -233,6 +253,15 @@ class nsImapUrl : public nsIImapUrl,
   nsTArray<mozilla::mailnews::OfflineAttempt> mNativeQueuedCopies
       MOZ_GUARDED_BY(mLock);
   nsTArray<NativeQueuedCopyReceipt> mNativeCopyReceipts MOZ_GUARDED_BY(mLock);
+  mozilla::Maybe<mozilla::mailnews::OfflineReplayCommandToken>
+      mNativeReplayCommand MOZ_GUARDED_BY(mLock);
+  mozilla::Maybe<NativeReplayCommandReceipt> mNativeReplayReceipt
+      MOZ_GUARDED_BY(mLock);
+  bool mCollectNativeReplayFlags MOZ_GUARDED_BY(mLock) = false;
+  bool mNativeReplayFlagsMatched MOZ_GUARDED_BY(mLock) = false;
+  mozilla::Maybe<mozilla::mailnews::OfflineAttempt> mNativeFolderDelete
+      MOZ_GUARDED_BY(mLock);
+  bool mNativeFolderDeleteAcknowledged MOZ_GUARDED_BY(mLock) = false;
   bool mNativeSourceRetired MOZ_GUARDED_BY(mLock) = false;
   mozilla::Maybe<NativeQueuedAppendTarget> mNativeQueuedAppend
       MOZ_GUARDED_BY(mLock);

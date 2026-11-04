@@ -256,7 +256,16 @@ nsMsgNewsFolder::GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) {
     if (NS_FAILED(rv)) return rv;
 
     rv = CreateSubFolders(path);
-    if (NS_FAILED(rv)) return rv;
+    if (NS_FAILED(rv)) {
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        // A partial newsrc load cannot authorize a rewrite of its source file.
+        // Keep the reentrancy guard during loading, then retry on next access.
+        mInitialized = false;
+      }
+#endif
+      return rv;
+    }
 
     // force ourselves to get initialized from cache
     // Don't care if it fails.  this will fail the first time after
@@ -1209,9 +1218,10 @@ nsMsgNewsFolder::GetNewsrcLine(nsACString& newsrcLine) {
     if (NS_SUCCEEDED(rv)) {
       newsrcLine.Append(' ');
       newsrcLine.Append(setStr);
-      newsrcLine.AppendLiteral(MSG_LINEBREAK);
     }
   }
+  // A restored native group can exist before its first newsrc write.
+  newsrcLine.AppendLiteral(MSG_LINEBREAK);
   return NS_OK;
 }
 

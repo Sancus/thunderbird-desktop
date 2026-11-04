@@ -848,3 +848,202 @@ add_task(async function test_subscriptionNewsrcPersistsAcrossReopen() {
     "Reopen does not rewrite the persisted source"
   );
 });
+
+/**
+ * Restore native groups before the ordinary newsrc loader has seen their lines.
+ *
+ * @param {string} hostname - The account's distinct hostname.
+ * @param {string[]} names - The persisted physical groups in insertion order.
+ * @param {string} newsrc - The existing file contents.
+ * @returns {Promise<{server: nsINntpIncomingServer, account: nsIMsgAccount,
+ *   ids: number[]}>} The cold account and its existing group identities.
+ */
+async function createColdReadSetAccount(hostname, names, newsrc) {
+  const account = MailServices.accounts.createAccount();
+  accounts.push(account);
+  const server = MailServices.accounts
+    .createIncomingServer("", hostname, "nntp")
+    .QueryInterface(Ci.nsINntpIncomingServer);
+  account.incomingServer = server;
+  server.valid = false;
+  const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  const rootId = core.folderDB.insertRoot(server.key);
+  const ids = names.map(name => {
+    const id = core.folderDB.insertFolder(rootId, name);
+    core.folderDB.updateFlags(id, Ci.nsMsgFolderFlags.Newsgroup);
+    return id;
+  });
+  await IOUtils.writeUTF8(server.newsrcFilePath.path, newsrc);
+  server.valid = true;
+  return { server, account, ids };
+}
+
+add_task(async function test_failedNewsrcLoadRetainsFileAndRetries() {
+  if (!nativeBackend) {
+    info("Failed native restoration and strict signed ranges are native-only");
+    return;
+  }
+  const names = ["a.group", "bad.group", "c.group"];
+  const previous = "a.group: 1-5\nbad.group: 2147483648\nc.group: 1-7\n";
+  const { server, ids } = await createColdReadSetAccount(
+    "failed-load.invalid",
+    names,
+    previous
+  );
+  const path = server.newsrcFilePath.path;
+  const root = server.rootFolder.QueryInterface(Ci.nsIMsgNewsFolder);
+  const first = root.addNewsgroup(names[0], "1-5");
+  Assert.equal(first.id, ids[0], "The live group reuses its persisted row");
+  Assert.throws(
+    () => root.subFolders,
+    exception => exception.result == Cr.NS_ERROR_ILLEGAL_VALUE,
+    "The malformed middle line stops loading with its primary error"
+  );
+  const open = sinon.spy(FileUtils, "openSafeFileOutputStream");
+  try {
+    Assert.throws(
+      () =>
+        server
+          .QueryInterface(Ci.nsISubscribableServer)
+          .commitSubscribeChanges(),
+      exception => exception.result == Cr.NS_ERROR_ILLEGAL_VALUE,
+      "The public dirty write retries loading and preserves the first error"
+    );
+    Assert.ok(!open.called, "Partial loading never opens a replacement stream");
+  } finally {
+    open.restore();
+  }
+  Assert.ok(server.newsrcHasChanged, "The failed write stays dirty");
+  Assert.equal(
+    await IOUtils.readUTF8(path),
+    previous,
+    "The malformed source and the unreached valid line remain byte-for-byte"
+  );
+  const repaired = "a.group: 1-5\nbad.group: 2-4\nc.group: 1-7\n";
+  await IOUtils.writeUTF8(path, repaired);
+  const selected = root.subFolders;
+  Assert.deepEqual(
+    selected.map(folder => folder.name),
+    names
+  );
+  Assert.deepEqual(
+    selected.map(folder => folder.id),
+    ids
+  );
+  Assert.equal(
+    selected[0],
+    first,
+    "Retry retains the existing physical object"
+  );
+  Assert.equal(new Set(selected.map(folder => folder.id)).size, names.length);
+  const lines = selected.map(
+    folder => folder.QueryInterface(Ci.nsIMsgNewsFolder).newsrcLine
+  );
+  Assert.deepEqual(
+    lines.map(line => line.trim()),
+    ["a.group: 1-5", "bad.group: 2-4", "c.group: 1-7"]
+  );
+  Assert.deepEqual(
+    root.subFolders,
+    selected,
+    "Repeat access adds no membership"
+  );
+  for (const name of names) {
+    Assert.ok(
+      server.containsNewsgroup(name),
+      "Each repaired group is subscribed"
+    );
+  }
+  server.writeNewsrcFile();
+  Assert.equal(await IOUtils.readUTF8(path), lines.join(""));
+  Assert.ok(
+    !server.newsrcHasChanged,
+    "Successful repaired persistence clears dirty"
+  );
+});
+
+add_task(async function test_restoredGroupWithoutNewsrcLineStaysSeparate() {
+  if (!nativeBackend) {
+    info("Native physical groups can predate their first newsrc write");
+    return;
+  }
+  const names = ["orphan.group", "a.group", "b.group"];
+  const { server, account, ids } = await createColdReadSetAccount(
+    "orphan-line.invalid",
+    names,
+    "a.group: 1-5\nb.group: 1-7\n"
+  );
+  const root = server.rootFolder;
+  const selected = root.subFolders;
+  Assert.deepEqual(
+    selected.map(folder => folder.name),
+    names
+  );
+  Assert.deepEqual(
+    selected.map(folder => folder.id),
+    ids
+  );
+  const lines = selected.map(
+    folder => folder.QueryInterface(Ci.nsIMsgNewsFolder).newsrcLine
+  );
+  const newline = lines[1].endsWith("\r\n") ? "\r\n" : "\n";
+  Assert.equal(
+    lines[0],
+    `orphan.group:${newline}`,
+    "An absent set has its own line"
+  );
+  Assert.deepEqual(
+    lines.map(line => line.trim()),
+    ["orphan.group:", "a.group: 1-5", "b.group: 1-7"]
+  );
+  server.QueryInterface(Ci.nsISubscribableServer).commitSubscribeChanges();
+  const path = server.newsrcFilePath.path;
+  const bytes = await IOUtils.read(path);
+  Assert.equal(new TextDecoder().decode(bytes), lines.join(""));
+  Assert.ok(!server.newsrcHasChanged);
+  for (const owned of accounts) {
+    MailServices.accounts
+      .getAccount(owned.key)
+      .incomingServer.QueryInterface(Ci.nsINntpIncomingServer)
+      .writeNewsrcFile();
+  }
+  MailServices.accounts.saveAccountInfo();
+  MailServices.accounts.unloadAccounts();
+  MailServices.accounts.loadAccounts();
+  const reopened = MailServices.accounts
+    .getAccount(account.key)
+    .incomingServer.QueryInterface(Ci.nsINntpIncomingServer);
+  Assert.notEqual(
+    reopened,
+    server,
+    "The real account manager recreated the server"
+  );
+  const restored = reopened.rootFolder.subFolders;
+  Assert.deepEqual(
+    restored.map(folder => folder.name),
+    names
+  );
+  Assert.deepEqual(
+    restored.map(folder => folder.id),
+    ids
+  );
+  Assert.equal(new Set(restored.map(folder => folder.id)).size, names.length);
+  Assert.deepEqual(
+    restored.map(folder =>
+      folder.QueryInterface(Ci.nsIMsgNewsFolder).newsrcLine.trim()
+    ),
+    ["orphan.group:", "a.group: 1-5", "b.group: 1-7"],
+    "Reload keeps both valid ranges separate from the formerly absent line"
+  );
+  Assert.deepEqual(reopened.rootFolder.subFolders, restored);
+  for (const name of names) {
+    Assert.ok(reopened.containsNewsgroup(name));
+  }
+  Assert.deepEqual(
+    await IOUtils.read(path),
+    bytes,
+    "Reload does not rewrite the file"
+  );
+});

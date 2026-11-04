@@ -217,16 +217,6 @@ add_task(
       "Unchecking clears the category and any-attachment constraint"
     );
     Assert.equal(attachments.constraint, null);
-    context.addFacetConstraint(tag, true, [group], false, false);
-    // Folder/view initialization may have changed native metadata while these
-    // widgets were exercised. Keep the refinement, and capture current tokens.
-    await context.loadMailSearch({ preserveFilters: true });
-    const list = await context.showActiveSetInTab();
-    Assert.deepEqual(
-      (await readNativeList(list)).identities,
-      [fixture.clicked, fixture.secondCopy].map(physicalIdentity).sort()
-    );
-    tabmail.closeTab(list);
     tabmail.closeTab(tab);
     Assert.equal(tabmail.currentTabInfo, origin);
     Assert.equal(

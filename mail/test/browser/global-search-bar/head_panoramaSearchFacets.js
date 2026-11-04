@@ -108,22 +108,9 @@ add_setup(async function setupNativeFacetMessages() {
   // for every padding message in this pagination fixture.
   matches.push(
     ...first.addMessageBatch(
-      Array.from({ length: paddingCount }, () => {
-        const message = generator.makeMessage({ subject: term });
-        if (pagination) {
-          // These rows test pagination, not hundreds of unrelated contacts.
-          // Keep each generated Message-ID, date, body and counter advance,
-          // while avoiding unique Gloda contacts and facet groups per row.
-          message.from = [
-            "Pagination Sender",
-            "pagination-sender@example.invalid",
-          ];
-          message.to = [
-            ["Pagination Recipient", "pagination-recipient@example.invalid"],
-          ];
-        }
-        return message.toMessageString();
-      })
+      Array.from({ length: paddingCount }, () =>
+        generator.makeMessage({ subject: term }).toMessageString()
+      )
     )
   );
   excluded.addMessage(

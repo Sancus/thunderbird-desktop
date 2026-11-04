@@ -26,6 +26,8 @@ subsuite = "thunderbird"
 
 ["browser_panoramaSearchFacets.js"]
 
+["browser_panoramaSearchFacetList.js"]
+
 ["browser_panoramaSearchFacetConversation.js"]
 
 ["browser_panoramaSearchList.js"]

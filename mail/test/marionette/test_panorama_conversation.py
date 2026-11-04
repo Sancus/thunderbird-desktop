@@ -536,8 +536,24 @@ class TestPanoramaConversation(MarionetteTestCase):
             const done = arguments[arguments.length - 1];
             // The final Marionette callback is not an action argument.
             values.pop();
-            const module = ChromeUtils.importESModule(uri);
-            Promise.resolve().then(() => module[action](...values)).then(
+            (async () => {
+                const file = Services.io.newURI(uri).QueryInterface(Ci.nsIFileURL).file;
+                if (!file.exists() || !file.isFile() || file.leafName != "search_lifecycle.sys.mjs") {
+                    throw new Error("The ordinary installed lifecycle payload is missing");
+                }
+                const handler = Services.io.getProtocolHandler("resource")
+                    .QueryInterface(Ci.nsIResProtocolHandler);
+                const name = "panorama-lifecycle-test";
+                const previous = handler.hasSubstitution(name) ? handler.getSubstitution(name) : null;
+                try {
+                    handler.setSubstitution(name, Services.io.newFileURI(file.parent));
+                    const module = ChromeUtils.importESModule(
+                        "resource://panorama-lifecycle-test/search_lifecycle.sys.mjs");
+                    return await module[action](...values);
+                } finally {
+                    handler.setSubstitution(name, previous);
+                }
+            })().then(
                 value => done({ value }),
                 error => done({ error: String(error), stack: error.stack })
             );
@@ -653,6 +669,9 @@ class TestPanoramaConversation(MarionetteTestCase):
                 and not self.marionette.session
             ):
                 self.marionette.start_session(capabilities)
+                # Window handles belong to the exited process, even if an ID is reused.
+                self.origin = None
+                self.activity = None
                 self.marionette.set_context(self.marionette.CONTEXT_CHROME)
                 self.marionette.switch_to_window(self.marionette.chrome_window_handles[0])
             elif self.marionette.session:

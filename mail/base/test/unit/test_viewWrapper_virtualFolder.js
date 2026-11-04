@@ -1013,6 +1013,22 @@ function assertScopedRows(wrapper, headers) {
   );
 }
 
+/**
+ * Waits for the ordinary permanent-delete completion before checking its result.
+ * Native body retirement finishes asynchronously, after deleteMessages returns.
+ *
+ * @param {nsIMsgFolder} folder - The real physical owner.
+ * @param {nsIMsgDBHdr} header - The stored message being deleted.
+ */
+async function deleteScopedMessage(folder, header) {
+  const { PromiseTestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
+  const listener = new PromiseTestUtils.PromiseCopyListener();
+  folder.deleteMessages([header], null, true, false, listener, false);
+  await listener.promise;
+}
+
 add_task(async function test_scopedCachePreservesOtherPhysicalSource() {
   if (!savedSearchCore()) {
     return;
@@ -1066,7 +1082,7 @@ add_task(async function test_emptySourceRefreshPreservesOtherHits() {
   info("S371 empty-source initial ordinary open");
   await view_open(wrapper, saved);
   info("S371 empty-source initial open finished");
-  a.deleteMessages([first], null, true, false, null, false);
+  await deleteScopedMessage(a, first);
   info("S371 physical deletion finished; reopening current scope");
   await view_open(wrapper, saved);
   info("S371 empty-source reopen finished");
@@ -1129,6 +1145,9 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
     );
   } finally {
     connection.executeSimpleSQL("DROP VIEW temp.search_folder_hits");
+    // Finish the native search callback/iterator stack before removing its UDF.
+    // SQLite refuses function changes while any statement is still active.
+    await new Promise(resolve => do_execute_soon(resolve));
     connection.removeFunction("s371_cache_read");
   }
   Assert.deepEqual(
@@ -1183,7 +1202,7 @@ add_task(
     const third = addScopedMessage(b, "notification-third@scope.invalid");
     addScopedMessage(outside, "notification-outside@scope.invalid");
     assertScopedRows(wrapper, [first, second, third]);
-    b.deleteMessages([third], null, true, false, null, false);
+    await deleteScopedMessage(b, third);
     assertScopedRows(wrapper, [first, second]);
     Assert.equal(saved.getTotalMessages(false), 2);
     // Tags and flags can add/remove existing headers, not just invalidate rows.

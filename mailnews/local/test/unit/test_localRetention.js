@@ -564,7 +564,7 @@ async function checkRetentionCleanupFailure(store, custodyFault) {
     const starts = [];
     const stops = [];
     const listener = {
-      OnStartCopy() {
+      onStartCopy() {
         starts.push(true);
         Assert.throws(
           () =>
@@ -580,7 +580,7 @@ async function checkRetentionCleanupFailure(store, custodyFault) {
           "The accepted deletion rejects synchronous reentry"
         );
       },
-      OnStopCopy(status) {
+      onStopCopy(status) {
         stops.push(status);
       },
       QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),

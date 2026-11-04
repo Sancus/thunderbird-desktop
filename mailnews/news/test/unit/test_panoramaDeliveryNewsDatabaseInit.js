@@ -334,7 +334,7 @@ add_task(async function test_summaryValidityPreservesNativeErrorsAndReopen() {
   const before = folder.newsrcLine;
   const old = shared;
   // Real nonrecursive shutdown drops the owner but retains the physical group.
-  folder.shutdown(false);
+  folder.Shutdown(false);
   Assert.ok(!folder.databaseOpen);
   shared = folder.msgDatabase;
   Assert.notEqual(shared, old);

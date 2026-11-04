@@ -9,6 +9,8 @@ import { MsgIncomingServer } from "resource:///modules/MsgIncomingServer.sys.mjs
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   CommonUtils: "resource://services-common/utils.sys.mjs",
+  FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
+  MailStringUtils: "resource:///modules/MailStringUtils.sys.mjs",
   NntpClient: "resource:///modules/NntpClient.sys.mjs",
   clearInterval: "resource://gre/modules/Timer.sys.mjs",
   setInterval: "resource://gre/modules/Timer.sys.mjs",
@@ -438,17 +440,22 @@ export class NntpIncomingServer extends MsgIncomingServer {
     }
     // This is a void XPCOM method, so an asynchronous rejection cannot report
     // failure to its caller. Finish the safe stream before clearing dirty state.
-    const bytes = new TextEncoder().encode(lines.join(""));
-    const output = Cc[
-      "@mozilla.org/network/safe-file-output-stream;1"
-    ].createInstance(Ci.nsIFileOutputStream);
+    const bytes = lazy.MailStringUtils.stringToByteString(lines.join(""));
+    const output = lazy.FileUtils.openSafeFileOutputStream(this.newsrcFilePath);
     try {
-      output.init(this.newsrcFilePath, -1, 0o644, 0);
-      const binary = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(
-        Ci.nsIBinaryOutputStream
-      );
-      binary.setOutputStream(output);
-      binary.writeByteArray(bytes);
+      let offset = 0;
+      // Write empty contents too, so the deferred stream opens its replacement.
+      do {
+        const remaining = bytes.length - offset;
+        const written = output.write(bytes.slice(offset), remaining);
+        if ((!written && remaining) || written > remaining) {
+          throw Components.Exception(
+            "Incomplete newsrc write",
+            Cr.NS_ERROR_UNEXPECTED
+          );
+        }
+        offset += written;
+      } while (offset < bytes.length);
       output.QueryInterface(Ci.nsISafeOutputStream).finish();
     } catch (error) {
       try {

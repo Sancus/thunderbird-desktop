@@ -11,8 +11,11 @@ load("../../../resources/filterTestUtils.js");
 var { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
-var { MockRegistrar } = ChromeUtils.importESModule(
-  "resource://testing-common/MockRegistrar.sys.mjs"
+var { FileUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/FileUtils.sys.mjs"
+);
+var { sinon } = ChromeUtils.importESModule(
+  "resource://testing-common/Sinon.sys.mjs"
 );
 var { MsgKeySet } = ChromeUtils.importESModule(
   "resource:///modules/MsgKeySet.sys.mjs"
@@ -404,7 +407,7 @@ add_task(function test_failedReadSetReplacementRetainsPreviousSet() {
   const before = folder.newsrcLine;
   Assert.throws(
     () => folder.setReadSetFromStr("2147483648"),
-    { result: Cr.NS_ERROR_ILLEGAL_VALUE },
+    exception => exception.result == Cr.NS_ERROR_ILLEGAL_VALUE,
     "Overflow is rejected before parsing"
   );
   Assert.equal(folder.newsrcLine, before);
@@ -421,7 +424,7 @@ add_task(function test_failedReadSetReplacementRetainsPreviousSet() {
       reached = true;
       Assert.throws(
         () => folder.setReadSetFromStr("6-7"),
-        { result: Cr.NS_ERROR_NOT_AVAILABLE },
+        exception => exception.result == Cr.NS_ERROR_NOT_AVAILABLE,
         "A real closed facade rejects replacement"
       );
       Assert.equal(
@@ -493,20 +496,12 @@ add_task(async function test_newsrcWriteFailureRetainsPreviousFileAndRetry() {
       `newsrc-${phase}`,
       Cr.NS_ERROR_FILE_ACCESS_DENIED
     );
-    const contract = "@mozilla.org/network/safe-file-output-stream;1";
-    const real = Cc[contract].createInstance(Ci.nsIFileOutputStream);
+    const real = FileUtils.openSafeFileOutputStream(server.newsrcFilePath);
     let writes = 0;
     let finishes = 0;
     let closes = 0;
-    const cid = MockRegistrar.register(contract, () => ({
-      QueryInterface: ChromeUtils.generateQI([
-        "nsIFileOutputStream",
-        "nsIOutputStream",
-        "nsISafeOutputStream",
-      ]),
-      init(...args) {
-        real.init(...args);
-      },
+    const mock = sinon.stub(FileUtils, "openSafeFileOutputStream").returns({
+      QueryInterface: ChromeUtils.generateQI(["nsISafeOutputStream"]),
       write(data, count) {
         writes++;
         if (phase == "write") {
@@ -526,21 +521,18 @@ add_task(async function test_newsrcWriteFailureRetainsPreviousFileAndRetry() {
         real.close();
         throw Components.Exception("secondary close", Cr.NS_ERROR_ABORT);
       },
-      isNonBlocking() {
-        return false;
-      },
-    }));
+    });
     try {
       Assert.throws(
         () =>
           server
             .QueryInterface(Ci.nsISubscribableServer)
             .commitSubscribeChanges(),
-        { result: error.result },
+        exception => exception.result == error.result,
         "The void public caller preserves the original error"
       );
     } finally {
-      MockRegistrar.unregister(cid);
+      mock.restore();
     }
     Assert.greater(
       writes,
@@ -652,7 +644,7 @@ add_task(function test_articleZeroDistinctFromMissing() {
   Assert.throws(
     () =>
       reader.processXOverLine("2147483648\tBad\tReader\tdate\t<bad>\t\t1\t1"),
-    { result: Cr.NS_ERROR_ILLEGAL_VALUE },
+    exception => exception.result == Cr.NS_ERROR_ILLEGAL_VALUE,
     "An unrepresentable article is rejected before native writes"
   );
   const absent = new NntpNewsGroup(server, folder);

@@ -16885,13 +16885,13 @@ TEST_F(DeliveryCoreReferences,
     ASSERT_EQ(NS_OK,
               mConnection->RemoveProgressHandler(getter_AddRefs(removed)));
     EXPECT_EQ(readFault.get(), removed.get());
-    ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderProperty(
-                         mFolderId, "readSetContainsZero"_ns, "bad"_ns));
+    ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                         "readSetContainsZero"_ns, "bad"_ns));
     EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
               ReadNewsZero(source, mFolderId, ""_ns, zero));
     EXPECT_EQ(Some(true), zero);
-    ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderProperty(
-                         mFolderId, "readSetContainsZero"_ns, int64_t(0)));
+    ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), mFolderId,
+                                         "readSetContainsZero"_ns, int64_t(0)));
     ASSERT_GE(set->Add(0), 0);
     ASSERT_EQ(NS_OK, owner->SetReadSet(set));  // Exact zero-only checkpoint.
     if (commitFailure) {
@@ -17247,8 +17247,8 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_EQ(Some(false), zero);  // Known empty is present and false.
   ASSERT_EQ(NS_OK, ReadNewsZero(source, other, ""_ns, zero));
   EXPECT_TRUE(zero.isNothing());  // No checkpoint yet.
-  ASSERT_EQ(NS_OK,
-            mCore->FolderDB().SetFolderProperty(other, "readSet"_ns, ""_ns));
+  ASSERT_EQ(NS_OK, WriteFolderProperty(&mCore->FolderDB(), other, "readSet"_ns,
+                                       ""_ns));
   ASSERT_EQ(NS_OK, ReadNewsZero(source, other, ""_ns, zero));
   EXPECT_TRUE(zero.isNothing());  // Legacy empty without companion is unknown.
   RefPtr<PerFolderDatabase> otherOwner = new PerFolderDatabase(other, true);

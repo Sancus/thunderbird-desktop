@@ -155,6 +155,19 @@ export class NntpNewsGroup {
   }
 
   /**
+   * Store a protocol message ID with the retained news header normalization.
+   *
+   * @param {nsIMsgDBHdr} msgHdr - The header receiving the parsed value.
+   * @param {string} messageId - The Message-ID from HEAD or XOVER.
+   */
+  _setMessageId(msgHdr, messageId) {
+    if (this._nativeBackend && messageId.startsWith("<")) {
+      messageId = messageId.slice(1, messageId.endsWith(">") ? -1 : undefined);
+    }
+    msgHdr.messageId = messageId;
+  }
+
+  /**
    * Parse an XOVER line to a msg hdr.
    *
    * @param {string} line - An XOVER response line.
@@ -182,7 +195,7 @@ export class NntpNewsGroup {
     this.setSubject(msgHdr, subject);
     msgHdr.author = from;
     msgHdr.date = new Date(date).valueOf() * 1000;
-    msgHdr.messageId = messageId;
+    this._setMessageId(msgHdr, messageId);
     msgHdr.setReferences(references);
     msgHdr.messageSize = bytes;
     msgHdr.lineCount = lines;
@@ -331,7 +344,7 @@ export class NntpNewsGroup {
         this._msgHdr.orFlags(Ci.nsMsgMessageFlags.New);
         break;
       case "message-id":
-        this._msgHdr.messageId = value;
+        this._setMessageId(this._msgHdr, value);
         break;
       case "references":
         this._msgHdr.setReferences(value);

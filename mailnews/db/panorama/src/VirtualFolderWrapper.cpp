@@ -615,8 +615,9 @@ NS_IMETHODIMP VirtualFolderWrapper::SetSearchString(
     const nsACString& searchString) {
   MOZ_TRY(CheckCurrent(false));
   nsCOMPtr<nsIMsgFilterList> list;
-  MOZ_TRY(components::Filter::Service()->GetTempFilterList(
-      mMsgFolder, getter_AddRefs(list)));
+  nsCOMPtr<nsIMsgFilterService> service = components::Filter::Service();
+  NS_ENSURE_TRUE(service, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(service->GetTempFilterList(mMsgFolder, getter_AddRefs(list)));
   nsCOMPtr<nsIMsgFilter> filter;
   MOZ_TRY(list->CreateFilter(u"temp"_ns, getter_AddRefs(filter)));
   MOZ_TRY(list->ParseCondition(filter, searchString));

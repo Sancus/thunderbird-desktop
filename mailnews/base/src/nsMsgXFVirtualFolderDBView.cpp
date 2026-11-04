@@ -289,7 +289,7 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
   NS_ENSURE_TRUE(db && m_viewFolder, NS_ERROR_NOT_INITIALIZED);
   nsCString uri;
   MOZ_TRY(m_viewFolder->GetURI(uri));
-  nsTArray<nsMsgKey> replacement(newHits);
+  nsTArray<nsMsgKey> replacement = newHits.Clone();
   nsCOMArray<nsIMsgDBHdr> oldSourceHits;
   bool native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
   if (native) {

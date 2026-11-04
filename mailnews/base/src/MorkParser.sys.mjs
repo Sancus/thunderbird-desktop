@@ -27,6 +27,23 @@ ChromeUtils.defineESModuleGetters(lazy, {
   MailStringUtils: "resource:///modules/MailStringUtils.sys.mjs",
 });
 
+// Match encoded-span/nesting budgets; operation counts follow the input-size cap.
+const MORK_IMPORT_LIMITS = {
+  maxTokenBytes: 64 * 1024,
+  maxCommentDepth: 16,
+  maxBlockDepth: 16,
+};
+
+/**
+ * @typedef {object} MorkImportLimits
+ * @property {number} [maxTokenBytes=65536] - Encoded bytes per token or comment.
+ * @property {number} [maxTokens] - Successful token reads; defaults to maxBytes.
+ * @property {number} [maxAtoms] - Distinct aliases together; defaults to maxBytes.
+ * @property {number} [maxRows] - Distinct scoped rows; defaults to maxBytes.
+ * @property {number} [maxCommentDepth=16] - Nested block-comment depth.
+ * @property {number} [maxBlockDepth=16] - Nested brackets of the same kind.
+ */
+
 /**
  * @typedef {object} MorkImportRow
  * @property {number} id - Original unsigned row ID.
@@ -501,21 +518,58 @@ export class MorkParser {
    *
    * @param {string} body - Original bytes, one byte per code unit.
    * @param {number} [maxBytes=67108864] - Maximum document size.
+   * @param {MorkImportLimits} [limits={}] - Positive safe integer import bounds.
    * @returns {MorkImportSnapshot} Rows and tables, keyed by decimal ID followed
    *   by ':' and resolved scope.
-   * @throws {MorkImportError} For malformed, truncated or unsupported input.
+   * @throws {TypeError} For a non-byte string or invalid limits object.
+   * @throws {RangeError} For an invalid positive safe integer bound.
+   * @throws {MorkImportError} For malformed, truncated, unsupported or over-limit
+   *   input. No partial snapshot is returned.
    */
-  parseForImport(body, maxBytes = 64 * 1024 * 1024) {
+  parseForImport(body, maxBytes = 64 * 1024 * 1024, limits = {}) {
     if (typeof body != "string" || /[\u0100-\uffff]/.test(body)) {
       throw new TypeError("Expected a Mork byte string");
     }
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
       throw new RangeError("Invalid Mork input limit");
     }
+    if (!limits || typeof limits != "object" || Array.isArray(limits)) {
+      throw new TypeError("Expected Mork limits");
+    }
+    // Each token, alias and row consumes input bytes. Follow the input cap by
+    // default so an ordinary folder is not refused at an arbitrary record count.
+    const defaults = {
+      ...MORK_IMPORT_LIMITS,
+      maxTokens: maxBytes,
+      maxAtoms: maxBytes,
+      maxRows: maxBytes,
+    };
+    const bounds = { ...defaults, ...limits };
+    for (const name of Object.keys(defaults)) {
+      if (!Number.isSafeInteger(bounds[name]) || bounds[name] <= 0) {
+        throw new RangeError("Invalid " + name);
+      }
+    }
     const whitespace = new Set("\b\t\n\f\r \x7f");
     let pos = 0;
-    const fail = (code, message) => {
-      throw new MorkImportError(code, pos, message);
+    let tokens = 0;
+    const fail = (code, message, offset = pos) => {
+      throw new MorkImportError(code, offset, message);
+    };
+    const token = () => {
+      if (tokens >= bounds.maxTokens) {
+        fail("RESOURCE_LIMIT", "Mork token count exceeded");
+      }
+      tokens++;
+    };
+    const span = (start, length) => {
+      if (length > bounds.maxTokenBytes) {
+        fail(
+          "RESOURCE_LIMIT",
+          "Mork token exceeds byte limit",
+          start + bounds.maxTokenBytes
+        );
+      }
     };
     if (body.length > maxBytes) {
       fail("RESOURCE_LIMIT", "Mork input exceeds byte limit");
@@ -537,7 +591,7 @@ export class MorkParser {
         if (whitespace.has(body[pos])) {
           pos++;
         } else if (body[pos] == "/") {
-          pos = this.importCommentEnd(body, pos);
+          pos = this.importCommentEnd(body, pos, bounds);
         } else if (body[pos] == "\\" && /[\r\n]/.test(body[pos + 1] || "")) {
           pos++;
           const first = body[pos++];
@@ -556,10 +610,17 @@ export class MorkParser {
           "Expected " + expected
         );
       }
+      token();
       pos++;
     };
     const hex = () => {
-      const match = /^[0-9a-f]+/i.exec(body.slice(pos));
+      token();
+      const match = /^[0-9a-f]+/i.exec(
+        body.slice(pos, pos + Math.min(9, bounds.maxTokenBytes + 1))
+      );
+      if (match) {
+        span(pos, match[0].length);
+      }
       if (!match || match[0].length > 8) {
         fail("MALFORMED_MORK", "Invalid 32-bit Mork ID");
       }
@@ -567,10 +628,14 @@ export class MorkParser {
       return parseInt(match[0], 16);
     };
     const name = () => {
-      const match = /^[a-z_:][a-z_:!+?\-]*/i.exec(body.slice(pos));
+      token();
+      const match = /^[a-z_:][a-z_:!+?\-]*/i.exec(
+        body.slice(pos, pos + bounds.maxTokenBytes + 1)
+      );
       if (!match) {
         fail("MALFORMED_MORK", "Expected column or scope name");
       }
+      span(pos, match[0].length);
       pos += match[0].length;
       return match[0];
     };
@@ -599,10 +664,16 @@ export class MorkParser {
       return { id, scope, key: id + ":" + scope };
     };
     const value = () => {
+      const start = pos;
       take("=");
+      // Check the encoded span before retaining or decoding another source byte.
+      const readByte = () => {
+        span(start, pos - start + 1);
+        return body[pos++];
+      };
       let result = "";
       while (pos < body.length) {
-        let ch = body[pos++];
+        let ch = readByte();
         if (ch == ")") {
           return result;
         }
@@ -610,19 +681,21 @@ export class MorkParser {
           if (pos == body.length) {
             break;
           }
-          ch = body[pos++];
+          ch = readByte();
           if (ch == "\r" || ch == "\n") {
             if (/[\r\n]/.test(body[pos] || "") && body[pos] != ch) {
-              pos++;
+              readByte();
             }
             continue;
           }
         } else if (ch == "$") {
           const digits = body.slice(pos, pos + 2);
           if (!/^[0-9a-f]{2}$/i.test(digits)) {
-            fail("MALFORMED_MORK", "Invalid byte escape");
+            const offset = pos + (/^[0-9a-f]$/i.test(body[pos] || "") ? 1 : 0);
+            fail("MALFORMED_MORK", "Invalid byte escape", offset);
           }
-          pos += 2;
+          readByte();
+          readByte();
           ch = String.fromCharCode(parseInt(digits, 16));
         }
         result += ch;
@@ -661,7 +734,16 @@ export class MorkParser {
       return [key, atoms.get(ref.id)];
     };
     const blockEnd = (open, close) => {
-      const block = this.consumeBlock(body, pos, open, close, cache, true);
+      token();
+      const block = this.consumeBlock(
+        body,
+        pos,
+        open,
+        close,
+        cache,
+        true,
+        bounds
+      );
       if (!block) {
         fail("TRUNCATED_MORK", "Unterminated " + open + " block");
       }
@@ -718,8 +800,15 @@ export class MorkParser {
           atoms = domain == "c" ? state.columns : state.values;
           continue;
         }
+        const atomStart = pos;
         take("(");
         const id = hex();
+        if (
+          !atoms.has(id) &&
+          state.columns.size + state.values.size >= bounds.maxAtoms
+        ) {
+          fail("RESOURCE_LIMIT", "Mork atom count exceeded", atomStart);
+        }
         // Native alias IDs allow whitespace before '=', not comments.
         while (whitespace.has(body[pos])) {
           pos++;
@@ -737,6 +826,7 @@ export class MorkParser {
       take(">");
     };
     const row = (table, meta = false, cut = false) => {
+      const rowStart = pos;
       const bracketed = body[pos] == "[";
       let end = null;
       let clear = false;
@@ -751,6 +841,9 @@ export class MorkParser {
       const ref = mid(table?.scope ?? state.rowScope);
       let record = state.rows.get(ref.key);
       if (!record) {
+        if (state.rows.size >= bounds.maxRows) {
+          fail("RESOURCE_LIMIT", "Mork row count exceeded", rowStart);
+        }
         record = { id: ref.id, scope: ref.scope, cells: new Map() };
         state.rows.set(ref.key, record);
       }
@@ -889,6 +982,7 @@ export class MorkParser {
           table();
           break;
         case "@": {
+          token();
           const marker = /^@\$\$([{}])([0-9a-f]+|~~)([{}])@/i.exec(
             body.slice(pos)
           );
@@ -940,16 +1034,28 @@ export class MorkParser {
    *
    * @param {string} body - Original byte string.
    * @param {number} pos - Offset of the initial slash.
+   * @param {MorkImportLimits} [limits={}] - Optional strict import bounds.
    * @returns {number} Offset after the comment.
-   * @throws {MorkImportError} For malformed or truncated comments.
+   * @throws {MorkImportError} For malformed, truncated or over-limit comments.
    */
-  importCommentEnd(body, pos) {
+  importCommentEnd(body, pos, limits = {}) {
     const start = pos;
-    const kind = body[++pos];
+    const advance = count => {
+      if (pos + count - start > limits.maxTokenBytes) {
+        throw new MorkImportError(
+          "RESOURCE_LIMIT",
+          start + limits.maxTokenBytes,
+          "Mork comment exceeds byte limit"
+        );
+      }
+      pos += count;
+    };
+    advance(1);
+    const kind = body[pos];
     if (kind == "/") {
-      pos++;
+      advance(1);
       while (pos < body.length && !/[\r\n]/.test(body[pos])) {
-        pos++;
+        advance(1);
       }
       return pos;
     }
@@ -957,19 +1063,26 @@ export class MorkParser {
       throw new MorkImportError("MALFORMED_MORK", start, "Invalid comment");
     }
     let depth = 1;
-    pos++;
+    advance(1);
     while (pos < body.length) {
       const pair = body.slice(pos, pos + 2);
       if (pair == "/*") {
+        if (depth >= limits.maxCommentDepth) {
+          throw new MorkImportError(
+            "RESOURCE_LIMIT",
+            pos,
+            "Mork comment depth exceeded"
+          );
+        }
         depth++;
-        pos += 2;
+        advance(2);
       } else if (pair == "*/") {
-        pos += 2;
+        advance(2);
         if (!--depth) {
           return pos;
         }
       } else {
-        pos++;
+        advance(1);
       }
     }
     throw new MorkImportError("TRUNCATED_MORK", start, "Unterminated comment");
@@ -990,11 +1103,20 @@ export class MorkParser {
    *   unterminated, the positions of all blocks nested in it are stored here,
    *   so that later calls for the same body don't rescan to the end.
    * @param {boolean} [strict=false] - Validate and skip native comments.
+   * @param {MorkImportLimits} [limits={}] - Bounds used only by strict import.
    * @returns {{text: string, nextPos: number}|null} An object containing the
    *   extracted text and the next cursor position, or null if the block is
    *   unterminated.
    */
-  consumeBlock(body, startPos, openChar, closeChar, cache, strict = false) {
+  consumeBlock(
+    body,
+    startPos,
+    openChar,
+    closeChar,
+    cache,
+    strict = false,
+    limits = {}
+  ) {
     const cached = cache?.get(openChar);
     if (cached && startPos >= cached.from) {
       const end = cached.ends.get(startPos);
@@ -1013,7 +1135,7 @@ export class MorkParser {
       const char = body[i];
 
       if (strict && !inParens && char == "/") {
-        i = this.importCommentEnd(body, i);
+        i = this.importCommentEnd(body, i, limits);
         continue;
       }
       if (char === "\\") {
@@ -1032,6 +1154,13 @@ export class MorkParser {
 
       if (!inParens) {
         if (char === openChar) {
+          if (strict && depth >= limits.maxBlockDepth) {
+            throw new MorkImportError(
+              "RESOURCE_LIMIT",
+              i,
+              "Mork block depth exceeded"
+            );
+          }
           depth++;
         } else if (char === closeChar) {
           depth--;
@@ -1045,10 +1174,13 @@ export class MorkParser {
       }
       i++;
     }
-    cache?.set(openChar, {
-      from: startPos,
-      ends: this.mapNestedBlocks(body, startPos, openChar, closeChar),
-    });
+    // Import stops on this error; only recovery needs a map of later blocks.
+    if (!strict) {
+      cache?.set(openChar, {
+        from: startPos,
+        ends: this.mapNestedBlocks(body, startPos, openChar, closeChar),
+      });
+    }
     return null; // Unterminated block
   }
 

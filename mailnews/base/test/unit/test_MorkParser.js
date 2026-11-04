@@ -761,3 +761,39 @@ add_task(function test_strictRowPositionFailures() {
     );
   }
 });
+
+add_task(function test_strictDictionaryFormWithFollowingAliases() {
+  // Grammar-unit regression: native dictionaries can have aliases after a form.
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const columns = "< <(a=c)> (80=r)(81=k)(82=Payload)(83=Other)(85=UTF-8)>\n";
+  const table = "{1:^80 {(k^81:c)(s=9)} [1(^82^81)(^83^82)]}";
+  for (const following of ["(82=y)", "(82<(f^0)>=y)"]) {
+    const input =
+      header + columns + "<(81\n<(f^85)>=x)" + following + ">\n" + table;
+    const snapshot = new MorkParser().parseForImport(input);
+    Assert.deepEqual(
+      [...snapshot.rows.get("1:r").cells],
+      [
+        ["Payload", "x"],
+        ["Other", "y"],
+      ]
+    );
+    Assert.deepEqual(snapshot.tables.get("1:r").rows, ["1:r"]);
+  }
+  for (const [following, code] of [
+    ["(82=y)", "TRUNCATED_MORK"],
+    ["(82<(f^FF)>=y)>", "MALFORMED_MORK"],
+  ]) {
+    let partial = null;
+    Assert.throws(
+      () => {
+        partial = new MorkParser().parseForImport(
+          header + columns + "<(81<(f^85)>=x)" + following
+        );
+      },
+      error => error.name == "MorkImportError" && error.code == code,
+      "A following invalid alias or missing dictionary end is not partial success"
+    );
+    Assert.equal(partial, null);
+  }
+});

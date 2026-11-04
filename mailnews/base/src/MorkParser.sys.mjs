@@ -699,11 +699,11 @@ export class MorkParser {
       take(close);
     };
     const dictionary = () => {
-      const end = blockEnd("<", ">");
+      blockEnd("<", ">");
       let atoms = state.values;
-      while (pos < end) {
+      while (true) {
         skip();
-        if (pos == end) {
+        if (body[pos] == ">") {
           break;
         }
         if (body[pos] == "<") {

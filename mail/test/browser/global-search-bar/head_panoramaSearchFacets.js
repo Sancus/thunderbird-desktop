@@ -102,11 +102,13 @@ add_setup(async function setupNativeFacetMessages() {
   tailMessage.subject = "Conversation tail outside query";
   const tail = second.addMessage(tailMessage.toMessageString());
   const matches = [secondCopy, clicked];
+  const pagination = gTestPath.endsWith("/browser_panoramaSearchFacets.js");
+  const paddingCount = pagination ? 100 : 1;
   // The ordinary batch API preserves header order and avoids one mailbox fsync
   // for every padding message in this pagination fixture.
   matches.push(
     ...first.addMessageBatch(
-      Array.from({ length: 100 }, () =>
+      Array.from({ length: paddingCount }, () =>
         generator.makeMessage({ subject: term }).toMessageString()
       )
     )
@@ -150,7 +152,11 @@ add_setup(async function setupNativeFacetMessages() {
   do {
     progress = await service.update({ limit: 500 });
   } while (progress.moreWork);
-  Assert.equal(first.getTotalMessages(false), 102);
+  if (pagination) {
+    Assert.equal(first.getTotalMessages(false), 102);
+  } else {
+    Assert.equal(first.getTotalMessages(false), 3);
+  }
   Assert.equal(second.getTotalMessages(false), 2);
   Assert.equal(excluded.getTotalMessages(false), 1);
   fixture = {

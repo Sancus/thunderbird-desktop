@@ -3,6 +3,7 @@
 # file, you can obtain one at http://mozilla.org/MPL/2.0/.
 
 import json
+from pathlib import Path
 
 from marionette_driver import Wait
 from marionette_harness import MarionetteTestCase
@@ -525,6 +526,166 @@ class TestPanoramaConversation(MarionetteTestCase):
         self.assertFalse(recovery["originClosed"])
         self.assertEqual(1, recovery["selectedCount"])
         self.assertEqual(self.fixture["expected"][2], recovery["selected"])
+
+    def search_lifecycle(self, action, *args):
+        """Call the installed test module outside closing window globals."""
+        uri = (Path(__file__).parent / "scripts" / "search_lifecycle.sys.mjs").resolve().as_uri()
+        result = self.marionette.execute_async_script(
+            """
+            const [uri, action, ...values] = arguments;
+            const done = arguments[arguments.length - 1];
+            // The final Marionette callback is not an action argument.
+            values.pop();
+            (async () => {
+                const file = Services.io.newURI(uri).QueryInterface(Ci.nsIFileURL).file;
+                if (!file.exists() || !file.isFile() || file.leafName != "search_lifecycle.sys.mjs") {
+                    throw new Error("The ordinary installed lifecycle payload is missing");
+                }
+                const handler = Services.io.getProtocolHandler("resource")
+                    .QueryInterface(Ci.nsIResProtocolHandler);
+                const name = "panorama-lifecycle-test";
+                const previous = handler.hasSubstitution(name) ? handler.getSubstitution(name) : null;
+                try {
+                    handler.setSubstitution(name, Services.io.newFileURI(file.parent));
+                    const module = ChromeUtils.importESModule(
+                        "resource://panorama-lifecycle-test/search_lifecycle.sys.mjs");
+                    return await module[action](...values);
+                } finally {
+                    handler.setSubstitution(name, previous);
+                }
+            })().then(
+                value => done({ value }),
+                error => done({ error: String(error), stack: error.stack })
+            );
+            """,
+            script_args=[uri, action, *args],
+        )
+        self.assertNotIn("error", result, result)
+        return result["value"]
+
+    def test_native_search_preferences_and_activity(self):
+        self.open_window(
+            r"""
+            Services.ww.openWindow(null, "chrome://messenger/content/messenger.xhtml",
+                "_blank", "chrome,dialog=no,all",
+                Cc["@mozilla.org/supports-string;1"].createInstance(Ci.nsISupportsString));
+            """,
+            "mail:3pane",
+        )
+        Wait(self.marionette).until(
+            lambda driver: driver.execute_script(
+                'return window.document.getElementById("tabmail")?.tabInfo?.length > 0;'
+            )
+        )
+        opened = self.marionette.execute_async_script(
+            """
+            const done = arguments[arguments.length - 1];
+            window.openPreferencesTab("paneGeneral", "enableGloda").then(
+                () => done(null), error => done(String(error)));
+            """
+        )
+        self.assertIsNone(opened, opened)
+        selection = self.fixture["expected"][2]
+        try:
+            for enabled in [False, True]:
+                self.marionette.execute_script(
+                    """
+                    const browser = window.document.getElementById("tabmail").currentTabInfo.browser;
+                    const checkbox = browser.contentDocument.getElementById("enableGloda");
+                    if (checkbox.checked != !arguments[0]) {
+                        throw new Error("Preferences must start in the opposite state");
+                    }
+                    checkbox.click();
+                    """,
+                    script_args=[enabled],
+                )
+                Wait(self.marionette).until(
+                    lambda driver: driver.execute_script(
+                        """
+                        const browser = window.document.getElementById("tabmail").currentTabInfo.browser;
+                        return browser.contentDocument.getElementById("enableGloda").checked == arguments[0] &&
+                            Services.prefs.getBoolPref("mailnews.database.global.indexer.enabled") == arguments[0];
+                        """,
+                        script_args=[enabled],
+                    )
+                )
+                policy = self.search_lifecycle("policy", selection)
+                self.assertEqual(enabled, policy["eligible"])
+                self.assertEqual("eligible" if enabled else "disabled", policy["reason"])
+            result = self.search_lifecycle("observeActivity", selection)
+            self.logger.info("S422 activity actual " + json.dumps(result))
+            self.assertTrue(result["sourceId"])
+            self.assertGreaterEqual(result["unavailable"], 1)
+            self.assertEqual(selection, result["physical"])
+            self.assertFalse(result["text"]["bodyIndexed"])
+            self.assertEqual(1, result["activityCount"])
+            self.assertTrue(result["waiting"])
+            self.assertEqual(-1, result["percent"])
+            self.assertTrue(result["status"])
+            closed = self.search_lifecycle("finishActivity")
+            self.assertTrue(closed["tokenRestored"])
+            self.assertTrue(closed["cancelled"])
+            self.assertEqual(0, closed["remaining"])
+        finally:
+            self.search_lifecycle("finishActivity")
+
+    def test_quit_with_pending_native_search_open(self):
+        receipt_name = "s422-quit-receipt.json"
+        armed = self.search_lifecycle("armQuit", receipt_name)
+        self.assertEqual(1, armed["opens"])
+        self.assertEqual([0, 0], armed["callbacks"])
+        self.assertTrue(armed["sourceId"])
+        old_pid = self.marionette.execute_script("return Services.appinfo.processID;")
+        profile = self.marionette.execute_script(
+            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+        )
+        capabilities = self.marionette.requested_capabilities
+        try:
+            details = self.marionette.quit(in_app=True, clean=False)
+            self.assertTrue(details["in_app"])
+            self.assertFalse(details["forced"])
+            self.assertEqual("shutdown", details["cause"])
+            self.assertEqual(0, self.marionette.instance.runner.returncode)
+            result = json.loads(Path(armed["receiptPath"]).read_text(encoding="utf-8"))
+            self.logger.info("S422 quit actual " + json.dumps(result))
+            self.assertNotIn("error", result, result)
+            self.assertEqual([], result["errors"])
+            self.assertEqual(armed["sourceId"], result["sourceId"])
+            self.assertEqual(1, result["opens"])
+            self.assertEqual([1, 1], result["callbacks"])
+            self.assertEqual([True, True], result["sameService"])
+            self.assertEqual(1, result["quitObserved"])
+            self.assertEqual(1, result["profileObserved"])
+            self.assertTrue(result["pendingAtQuit"])
+            self.assertTrue(result["shuttingDown"])
+            self.assertEqual([True, True], result["lateRejected"])
+            self.assertTrue(result["drained"])
+            self.assertTrue(result["closePromisesSame"])
+            self.assertTrue(result["closedUpdateRejected"])
+            self.assertEqual(0, result["activities"])
+        finally:
+            if (
+                self.marionette.instance.runner.returncode is not None
+                and not self.marionette.session
+            ):
+                self.marionette.start_session(capabilities)
+                # Window handles belong to the exited process, even if an ID is reused.
+                self.origin = None
+                self.activity = None
+                self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+                self.marionette.switch_to_window(self.marionette.chrome_window_handles[0])
+            elif self.marionette.session:
+                self.search_lifecycle("cancelQuit")
+            Path(armed["receiptPath"]).unlink(missing_ok=True)
+        self.assertNotEqual(
+            old_pid, self.marionette.execute_script("return Services.appinfo.processID;")
+        )
+        self.assertEqual(
+            profile,
+            self.marionette.execute_script(
+                "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+            ),
+        )
 
     def restore(self):
         """Restore real windows, fixture folders and original startup preferences."""

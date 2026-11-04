@@ -18,6 +18,7 @@
 #  include "mozilla/ResultExtensions.h"
 #  include "nsIInputStream.h"
 #  include "nsIMsgHdr.h"
+#  include "nsMsgMessageFlags.h"
 #  include "nsIMsgFolder.h"
 #  include "nsIMsgPluggableStore.h"
 #  include "nsMailHeaders.h"
@@ -336,10 +337,15 @@ nsIMsgFolder* sPurgeCleanupFolder = nullptr;
 const nsCString* sPurgeCleanupToken = nullptr;
 
 bool SamePurgeBody(const MessageBodyState& a, const MessageBodyState& b) {
+  // Read, Marked and other user flags can change while failed custody is held.
+  // They do not change the physical source whose cleanup this record guards.
+  constexpr uint32_t physicalFlags =
+      nsMsgMessageFlags::Offline | nsMsgMessageFlags::Expunged;
   return a.databaseSourceId == b.databaseSourceId && a.key == b.key &&
          a.folderId == b.folderId && a.storeToken == b.storeToken &&
          a.contentRevision == b.contentRevision &&
-         a.locationRevision == b.locationRevision && a.flags == b.flags &&
+         a.locationRevision == b.locationRevision &&
+         (a.flags & physicalFlags) == (b.flags & physicalFlags) &&
          a.messageSize == b.messageSize &&
          a.offlineMessageSize == b.offlineMessageSize &&
          a.lineCount == b.lineCount;
@@ -359,7 +365,9 @@ nsresult PurgeLocation(nsIMsgFolder* folder, PurgeCustody& custody) {
   // GetFilePath admits the current native wrapper before requesting a service.
   nsCOMPtr<nsIFile> path;
   MOZ_TRY(folder->GetFilePath(getter_AddRefs(path)));
-  MOZ_TRY(path->GetNativePath(custody.path));
+  nsAutoString folderPath;
+  MOZ_TRY(path->GetPath(folderPath));
+  CopyUTF16toUTF8(folderPath, custody.path);
   RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
   NS_ENSURE_STATE(core);
   MOZ_TRY(core->GetSourceId(custody.source));

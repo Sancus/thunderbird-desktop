@@ -1696,18 +1696,25 @@ nsresult nsMsgLocalMailFolder::DeleteNativePermanentMessages(
     nsIMsgCopyServiceListener* listener) {
   // Keep the original synchronous callback contract. Reentry cannot launch a
   // second selection or retire the source while the first operation settles.
-  NS_ENSURE_FALSE(mNativePurging, NS_ERROR_IN_PROGRESS);
+  auto complete = [&](nsresult result) {
+    if (listener) listener->OnStopCopy(result);
+    return result;
+  };
+  if (mNativePurging) return complete(NS_ERROR_IN_PROGRESS);
   mozilla::AutoRestore<bool> restore(mNativePurging);
   mNativePurging = true;
   nsCOMPtr<nsISupports> holder = static_cast<nsIMsgLocalMailFolder*>(this);
-  MOZ_TRY(AcquireSemaphore(holder, "DeleteNativePermanentMessages"_ns));
+  nsresult rv = AcquireSemaphore(holder, "DeleteNativePermanentMessages"_ns);
+  if (NS_FAILED(rv)) return complete(rv);
   auto release = mozilla::MakeScopeExit(
       [&] { ReleaseSemaphore(holder, "DeleteNativePermanentMessages"_ns); });
   nsCOMPtr<nsIMsgDatabase> database;
-  MOZ_TRY(GetDatabaseWOReparse(getter_AddRefs(database)));
-  MOZ_TRY(RecoverNativePurge(this));
-  nsresult rv = EnableNotifications(allMessageCountNotifications, false);
-  NS_ENSURE_SUCCESS(rv, rv);
+  rv = GetDatabaseWOReparse(getter_AddRefs(database));
+  if (NS_FAILED(rv)) return complete(rv);
+  rv = RecoverNativePurge(this);
+  if (NS_FAILED(rv)) return complete(rv);
+  rv = EnableNotifications(allMessageCountNotifications, false);
+  if (NS_FAILED(rv)) return complete(rv);
   if (listener) listener->OnStartCopy();
   nsTArray<RefPtr<nsIMsgDBHdr>> removed;
   rv = PurgeNativeMessages(
@@ -1737,7 +1744,7 @@ nsresult nsMsgLocalMailFolder::DeleteNativePermanentMessages(
   }
   NotifyFolderEvent(NS_SUCCEEDED(rv) ? kDeleteOrMoveMsgCompleted
                                      : kDeleteOrMoveMsgFailed);
-  if (listener) listener->OnStopCopy(rv);
+  complete(rv);
   // Never compact unresolved custody. A later normal UpdateFolder reconciles
   // it before any new retention selection, folder scan or provider mutation.
   if (NS_SUCCEEDED(rv) && window) AutoCompact(window);

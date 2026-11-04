@@ -1,0 +1,37 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+[DEFAULT]
+head = "head_imap_maildir.js"
+verbose = true
+dupe-manifest = true
+run-sequentially = true
+prefs = [
+  "mail.panorama.enabled=true",
+  "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/maildirstore;1",
+  "mail.server.default.storeContractID=@mozilla.org/msgstore/maildirstore;1",
+]
+tags = ["panorama-ci041", "maildir", "cpp"]
+
+["test_filterCustomHeaders.js"]
+
+["test_filterNeedsBody.js"]
+
+["test_imapContentLength.js"]
+
+["test_imapFilterActions.js"]
+
+["test_imapFilterCopyFailure.js"]
+
+["test_imapFilterCopyThenDelete.js"]
+
+["test_imapFilterCopyThenMove.js"]
+
+["test_imapOfflineBodyAdmission.js"]
+
+["test_imapPreviewIdentity.js"]
+
+["test_imapSearch.js"]
+
+["test_imapUnsolicitedXDuringIdle.js"]

@@ -22,7 +22,8 @@ config = {
                 "GTEST_FILTER": (
                     "TestMail*:TestMsg*:*XREAppDir*:"
                     "DeliveryCore*:FolderStorageMoveTest.*:"
-                    "LocalCopyHeaders.*:MigrationWindowsPath.*:QuarantinedOutputStream.*"
+                    "LocalCopyHeaders.*:MigrationWindowsPath.*:QuarantinedOutputStream.*:"
+                    "DeliveryCompleteHeader.FolderRepair*"
                 ),
             },
         },

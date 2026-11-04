@@ -1,4 +1,5 @@
 [DEFAULT]
+verbose = true
 head = "head.js"
 support-files = ["data/*"]
 prefs = [

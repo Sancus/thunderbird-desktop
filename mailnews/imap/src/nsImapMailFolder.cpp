@@ -4840,6 +4840,14 @@ NS_IMETHODIMP nsImapMailFolder::ApplyFilterHit(nsIMsgFilter* filter,
           {
             rv = mDatabase->GetThreadContainingMsgHdr(
                 msgHdr, getter_AddRefs(msgThread));
+            bool unpublishedLegacy = !m_filterListRequiresBody;
+#ifdef MOZ_PANORAMA
+            unpublishedLegacy &= !mail_panorama_enabled_AtStartup();
+#endif
+            // Legacy parsed headers need not have a thread before publication.
+            if (unpublishedLegacy && !msgThread && rv == NS_ERROR_FAILURE) {
+              rv = NS_OK;
+            }
             if (NS_FAILED(rv)) break;
             if (msgThread) {
               nsMsgKey threadKey;

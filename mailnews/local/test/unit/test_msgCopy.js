@@ -3973,3 +3973,102 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     await checkNativeLocalUndo("maildir", false, "busy");
   });
 }
+
+/**
+ * Inserts raw MIME messages and reads their flags and bodies from a native DB.
+ *
+ * @param {string} storeType - The mbox or maildir provider.
+ * @returns {Promise<void>} Resolves after insertion checks and account cleanup.
+ */
+async function checkRawMimeAttachmentNative(storeType) {
+  await withPublicationStore(storeType, async ({ rootFolder }) => {
+    const folder = rootFolder
+      .createLocalSubfolder("raw-mime-attachment")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
+    const database = assertPublicationFolder(folder, storeType);
+    const { Attachment, HasRe, Read, Replied, Marked, New } =
+      Ci.nsMsgMessageFlags;
+    const cases = [
+      {
+        contentType: "multipart/mixed; boundary=parts",
+        status: "",
+        subject: "MIME attachment",
+        // Native publication adds the existing facade New state for unread mail.
+        flags: Attachment | New,
+      },
+      {
+        contentType: "multipart/mixed; boundary=parts",
+        status: "X-Mozilla-Status: 00a7\r\n",
+        subject: "Re: MIME attachment",
+        flags: Attachment | HasRe | Read | Replied | Marked,
+      },
+      {
+        contentType: "multipart/mixed; boundary=parts",
+        status: "X-Mozilla-Status: 0015\r\n",
+        subject: "MIME attachment",
+        flags: Attachment | Read | Marked,
+      },
+      {
+        contentType: "text/plain; charset=UTF-8",
+        status: "X-Mozilla-Status: 0005\r\n",
+        subject: "MIME attachment",
+        flags: Read | Marked,
+      },
+    ];
+    const rawMessages = cases.map((test, index) => {
+      const headers =
+        "From: Sender <sender@example.invalid>\r\n" +
+        "To: recipient@example.invalid\r\n" +
+        "Date: Tue, 01 Jan 2019 00:00:00 +0000\r\n" +
+        `Message-ID: <raw-mime-${index}@example.invalid>\r\n` +
+        `Subject: ${test.subject}\r\n` +
+        `Content-Type: ${test.contentType}\r\n` +
+        test.status +
+        "\r\n";
+      const body = test.contentType.startsWith("multipart/")
+        ? "--parts\r\nContent-Type: text/plain\r\n\r\nVisible body.\r\n" +
+          "--parts\r\nContent-Type: application/octet-stream\r\n" +
+          'Content-Disposition: attachment; filename="example.txt"\r\n' +
+          "\r\nExact attached bytes.\r\n--parts--\r\n"
+        : "Exact plain bytes.\r\n";
+      return headers + body;
+    });
+    const inserted = folder.addMessageBatch(rawMessages);
+    Assert.equal(inserted.length, cases.length);
+    Assert.equal(folder.getTotalMessages(false), cases.length);
+    Assert.equal(
+      new Set(inserted.map(header => header.messageKey)).size,
+      cases.length
+    );
+    for (const [index, test] of cases.entries()) {
+      const original = inserted[index];
+      Assert.notEqual(original.messageKey, 0xffffffff);
+      Assert.equal(original.folder.URI, folder.URI);
+      Assert.ok(original.storeToken.length > 0);
+      Assert.equal(original.flags, test.flags);
+      const fresh = database.getMsgHdrForKey(original.messageKey);
+      Assert.equal(fresh.messageKey, original.messageKey);
+      Assert.equal(fresh.folder.URI, folder.URI);
+      Assert.equal(fresh.messageId, `raw-mime-${index}@example.invalid`);
+      Assert.equal(fresh.flags, test.flags);
+      Assert.equal(fresh.subject, "MIME attachment");
+      Assert.equal(fresh.author, "Sender <sender@example.invalid>");
+      Assert.equal(fresh.recipients, "recipient@example.invalid");
+      Assert.equal(fresh.storeToken, original.storeToken);
+      Assert.equal(fresh.messageSize, rawMessages[index].length);
+      Assert.equal(
+        readPublicationBytes(folder.getMsgInputStream(fresh)),
+        rawMessages[index]
+      );
+    }
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_rawMimeAttachmentNativeMbox() {
+    await checkRawMimeAttachmentNative("mbox");
+  });
+  add_task(async function test_rawMimeAttachmentNativeMaildir() {
+    await checkRawMimeAttachmentNative("maildir");
+  });
+}

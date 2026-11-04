@@ -17217,6 +17217,80 @@ TEST_F(DeliveryCoreReferences,
   invalid = zero;
   invalid.group.incarnation = "foreign"_ns;
   EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.GetNewsArticleKey(invalid, output));
+  NewsArticleIdentity maximum = zero;
+  maximum.articleNumber = INT32_MAX;
+  NewsArticleResult maximumResult;
+  ASSERT_EQ(NS_OK, db.AddNewsArticle(maximum, RawHdr{}, true, maximumResult));
+  nsMsgKey selected = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db.GetNewsArticleKey(maximum, selected));
+  EXPECT_EQ(maximumResult.physicalKey, selected);
+  ASSERT_EQ(NS_OK, db.GetNewsArticleKey(zero, selected));
+  EXPECT_EQ(result.physicalKey, selected);
+  NewsArticleIdentity missing = zero;
+  missing.articleNumber = 1;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.GetNewsArticleKey(missing, output));
+  EXPECT_EQ(12345u, output);
+
+  // A targeted lookup must not hide malformed bindings on another article.
+  for (const char* value : {"NULL", "'bad'", "X'00'", "-1", "2147483648"}) {
+    nsAutoCString update("UPDATE message_properties SET value=");
+    update.Append(value);
+    update.AppendLiteral(" WHERE name='newsArticleNumber' AND id=");
+    update.AppendInt(maximumResult.physicalKey);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(update));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.GetNewsArticleKey(zero, output));
+    EXPECT_EQ(12345u, output);
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.GetNewsArticleKey(missing, output));
+    EXPECT_EQ(12345u, output);
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              db.AddNewsArticle(missing, RawHdr{}, true, unchanged));
+    EXPECT_EQ(duplicate.physicalKey, unchanged.physicalKey);
+    EXPECT_EQ(duplicate.header, unchanged.header);
+    EXPECT_EQ(duplicate.inserted, unchanged.inserted);
+  }
+  nsAutoCString restoreArticle(
+      "UPDATE message_properties SET value=2147483647 "
+      "WHERE name='newsArticleNumber' AND id=");
+  restoreArticle.AppendInt(maximumResult.physicalKey);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(restoreArticle));
+  for (const char* value : {"NULL", "1", "'foreign'"}) {
+    nsAutoCString update("UPDATE message_properties SET value=");
+    update.Append(value);
+    update.AppendLiteral(" WHERE name='newsGroupIncarnation' AND id=");
+    update.AppendInt(maximumResult.physicalKey);
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(update));
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.GetNewsArticleKey(zero, output));
+    EXPECT_EQ(12345u, output);
+  }
+  nsAutoCString removeGroup("DELETE FROM message_properties WHERE id=");
+  removeGroup.AppendInt(maximumResult.physicalKey);
+  removeGroup.AppendLiteral(" AND name='newsGroupIncarnation'");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(removeGroup));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.GetNewsArticleKey(zero, output));
+  EXPECT_EQ(12345u, output);
+  nsAutoCString restoreGroup(
+      "INSERT INTO message_properties(id,name,value) SELECT ");
+  restoreGroup.AppendInt(maximumResult.physicalKey);
+  restoreGroup.AppendLiteral(",name,value FROM message_properties WHERE id=");
+  restoreGroup.AppendInt(result.physicalKey);
+  restoreGroup.AppendLiteral(" AND name='newsGroupIncarnation'");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(restoreGroup));
+  nsAutoCString removeArticle("DELETE FROM message_properties WHERE id=");
+  removeArticle.AppendInt(maximumResult.physicalKey);
+  removeArticle.AppendLiteral(" AND name='newsArticleNumber'");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(removeArticle));
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db.GetNewsArticleKey(zero, output));
+  EXPECT_EQ(12345u, output);
+  nsAutoCString restoreMissingArticle(
+      "INSERT INTO message_properties(id,name,value) VALUES (");
+  restoreMissingArticle.AppendInt(maximumResult.physicalKey);
+  restoreMissingArticle.AppendLiteral(", 'newsArticleNumber', 2147483647)");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(restoreMissingArticle));
+  ASSERT_EQ(NS_OK, db.GetNewsArticleKey(zero, selected));
+  EXPECT_EQ(result.physicalKey, selected);
+  ASSERT_EQ(NS_OK, db.GetNewsArticleKey(maximum, selected));
+  EXPECT_EQ(maximumResult.physicalKey, selected);
+
   nsMsgKey generic, staged;
   RawHdr raw;
   raw.extras = {{"newsArticleNumber"_ns, "0"_ns},

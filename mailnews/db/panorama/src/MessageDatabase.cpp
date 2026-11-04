@@ -628,15 +628,27 @@ nsresult MessageDatabase::GetNewsArticleKey(const NewsArticleIdentity& expected,
                                 expected.group.folderId, current, false));
   NS_ENSURE_TRUE(SameNewsGroup(current, expected.group),
                  NS_ERROR_NOT_AVAILABLE);
+  // Filter valid unrelated bindings in SQL, while still surfacing corruption
+  // anywhere in the group. Do not re-read source/group identity for every row.
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
       "FindNewsArticle"_ns,
-      "SELECT m.id FROM messages m WHERE m.folderId=:folder AND EXISTS "
-      "(SELECT 1 FROM message_properties p WHERE p.id=m.id AND "
-      "p.name IN ('newsArticleNumber','newsGroupIncarnation')) ORDER BY m.id"_ns,
+      "SELECT m.id,a.value,typeof(a.value),g.value,typeof(g.value) "
+      "FROM messages m LEFT JOIN message_properties a ON a.id=m.id "
+      "AND a.name='newsArticleNumber' LEFT JOIN message_properties g "
+      "ON g.id=m.id AND g.name='newsGroupIncarnation' "
+      "WHERE m.folderId=:folder "
+      "AND (a.name IS NOT NULL OR g.name IS NOT NULL) "
+      "AND (a.value=:article OR m.id<=0 OR m.id>=:invalidKey "
+      "OR typeof(a.value)!='integer' OR a.value<0 OR a.value>:maxArticle "
+      "OR typeof(g.value)!='text' OR g.value!=:incarnation) ORDER BY m.id"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scope(stmt);
   MOZ_TRY(stmt->BindInt64ByName("folder"_ns, current.folderId));
+  MOZ_TRY(stmt->BindInt64ByName("article"_ns, expected.articleNumber));
+  MOZ_TRY(stmt->BindInt64ByName("invalidKey"_ns, nsMsgKey_None));
+  MOZ_TRY(stmt->BindInt64ByName("maxArticle"_ns, INT32_MAX));
+  MOZ_TRY(stmt->BindUTF8StringByName("incarnation"_ns, current.incarnation));
   Maybe<nsMsgKey> found;
   while (true) {
     bool more;
@@ -645,14 +657,23 @@ nsresult MessageDatabase::GetNewsArticleKey(const NewsArticleIdentity& expected,
     int64_t key;
     MOZ_TRY(stmt->GetInt64(0, &key));
     NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
-    Maybe<NewsArticleIdentity> binding;
-    MOZ_TRY(ReadNewsArticle(key, binding));
-    NS_ENSURE_TRUE(binding && SameNewsGroup(binding->group, current),
+    nsCString articleType, groupType;
+    MOZ_TRY(stmt->GetUTF8String(2, articleType));
+    MOZ_TRY(stmt->GetUTF8String(4, groupType));
+    NS_ENSURE_TRUE(
+        articleType.EqualsLiteral("integer") && groupType.EqualsLiteral("text"),
+        NS_ERROR_FILE_CORRUPTED);
+    int64_t article;
+    MOZ_TRY(stmt->GetInt64(1, &article));
+    NS_ENSURE_TRUE(article >= 0 && article <= INT32_MAX &&
+                       article == int64_t(expected.articleNumber),
                    NS_ERROR_FILE_CORRUPTED);
-    if (binding->articleNumber == expected.articleNumber) {
-      NS_ENSURE_TRUE(!found, NS_ERROR_FILE_CORRUPTED);
-      found = Some(nsMsgKey(key));
-    }
+    nsCString incarnation;
+    MOZ_TRY(stmt->GetUTF8String(3, incarnation));
+    NS_ENSURE_TRUE(incarnation == current.incarnation,
+                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(!found, NS_ERROR_FILE_CORRUPTED);
+    found = Some(nsMsgKey(key));
   }
   NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
   physicalKey = *found;

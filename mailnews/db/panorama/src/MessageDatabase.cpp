@@ -1276,7 +1276,7 @@ nsresult MessageDatabase::CompleteFolderRepair(
     return NS_ERROR_OUT_OF_MEMORY;
   }
   // CachedMsg contains inline strings and must not be memmoved by nsTArray.
-  for (auto &row : cached) {
+  for (auto& row : cached) {
     row.reset(new (fallible) CachedMsg());
     NS_ENSURE_TRUE(row, NS_ERROR_OUT_OF_MEMORY);
   }
@@ -1339,7 +1339,7 @@ nsresult MessageDatabase::CompleteFolderRepair(
     for (uint32_t i = 0; i < messages.Length(); ++i) {
       const auto& item = messages[i];
       const auto& parsed = *item.parsed;
-      auto &row = *cached[i];
+      auto& row = *cached[i];
       auto& repaired = notification->repairs[i];
       auto& change = repaired.change;
       repaired.added = !matches[i];
@@ -1450,7 +1450,7 @@ nsresult MessageDatabase::CompleteFolderRepair(
       // copied from the on-disk parser draft.
     }
     for (uint32_t i = 0; i < messages.Length(); ++i) {
-      auto &row = *cached[i];
+      auto& row = *cached[i];
       auto& change = notification->repairs[i].change;
       if (notification->repairs[i].added &&
           !messages[i].parsed->references.IsEmpty()) {

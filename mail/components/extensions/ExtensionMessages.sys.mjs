@@ -1794,6 +1794,8 @@ class MessagePage {
  * Convenience class to keep track of the status of message lists.
  */
 export class MessageList {
+  #readTail = Promise.resolve();
+
   /**
    * @param {ExtensionData} extension
    * @param {MessageTracker} messageTracker
@@ -1833,6 +1835,9 @@ export class MessageList {
     // current page and adding a new one, resolving the current page.
     if (Cu.isInAutomation && this.approvePageFnForTests) {
       await this.approvePageFnForTests(this.pages.length);
+    }
+    if (this.isDone) {
+      return;
     }
 
     this.pages.push(new MessagePage());
@@ -1883,6 +1888,9 @@ export class MessageList {
     if (this.currentPage.messages.length >= this.messagesPerPage) {
       await this.addPage();
     }
+    if (this.isDone || !this.currentPage) {
+      return;
+    }
 
     if (msgHdr.folder && this.extension.folderManager) {
       if (this.folderCache.has(msgHdr.folder.URI)) {
@@ -1930,24 +1938,34 @@ export class MessageList {
    * @see /mail/components/extensions/schemas/messages.json
    */
   async getNextUnreadPage() {
-    if (this.failure) {
-      throw this.failure.error;
-    }
-    const page = this.pages.find(p => !p.read);
-    if (!page) {
-      return null;
-    }
+    // Claim pages in call order, including while a producer is still filling one.
+    const previousRead = this.#readTail;
+    const readDone = Promise.withResolvers();
+    this.#readTail = readDone.promise;
+    try {
+      await previousRead;
+      if (this.failure) {
+        throw this.failure.error;
+      }
+      const page = this.pages.find(p => !p.read);
+      if (!page) {
+        return null;
+      }
 
-    const messages = await page.promise;
-    if (this.failure) {
-      throw this.failure.error;
-    }
-    page.read = true;
+      const messages = await page.promise;
+      if (this.failure) {
+        throw this.failure.error;
+      }
+      page.read = true;
 
-    return {
-      id: this.pages.find(p => !p.read) ? this.id : null,
-      messages,
-    };
+      return {
+        id: this.pages.find(p => !p.read) ? this.id : null,
+        messages,
+      };
+    } finally {
+      // A failed read must also release any queued readers to observe the failure.
+      readDone.resolve();
+    }
   }
 }
 
@@ -2268,9 +2286,7 @@ export class MessageQuery {
     this.queryInfo = queryInfo;
     this.messageListTracker = messageListTracker;
 
-    this.messageList = this.messageListTracker.createList(this.extension, {
-      messagesPerPage: queryInfo.messagesPerPage,
-    });
+    this.messageList = null;
 
     this.checkSearchCriteriaFn = this.checkSearchCriteria;
     if (Cu.isInAutomation && checkSearchCriteriaFnForTests) {
@@ -2401,6 +2417,11 @@ export class MessageQuery {
         folders.push(account.rootFolder);
       }
     }
+
+    // Allocate only after validation and early-return paths have completed.
+    this.messageList = this.messageListTracker.createList(this.extension, {
+      messagesPerPage: this.queryInfo.messagesPerPage,
+    });
 
     // The searchFolders() function searches the provided folders for
     // messages matching the query and adds results to the messageList. It

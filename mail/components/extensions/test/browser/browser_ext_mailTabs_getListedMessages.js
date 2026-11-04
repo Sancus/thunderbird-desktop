@@ -311,7 +311,14 @@ add_task(async function test_listed_messages_as_viewed() {
     const actual = [];
     const dbView = gDefaultAbout3Pane.gDBView;
     for (let i = 0; i < dbView.rowCount; i++) {
-      actual.push(gMessages.indexOf(dbView.getMsgHdrAt(i)));
+      const header = dbView.getMsgHdrAt(i);
+      actual.push(
+        gMessages.findIndex(
+          message =>
+            message.folder.URI == header.folder.URI &&
+            message.messageKey == header.messageKey
+        )
+      );
     }
 
     Assert.deepEqual(actual, expected);

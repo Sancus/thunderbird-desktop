@@ -2028,7 +2028,21 @@ add_task(async function test_searchThreadDateErrorPreservesVisibleOrder() {
 
           // Rebuild from known physical inputs, not by replaying into the prefix.
           gDBView.close();
-          setup_view("search", Ci.nsMsgViewFlagsType.kThreadedDisplay);
+          gDBView = Cc[
+            "@mozilla.org/messenger/msgdbview;1?type=search"
+          ].createInstance(Ci.nsIMsgDBView);
+          gDBView.init(null, null);
+          gDBView.open(
+            null,
+            sortType,
+            Ci.nsMsgViewSortOrder.descending,
+            Ci.nsMsgViewFlagsType.kThreadedDisplay |
+              Ci.nsMsgViewFlagsType.kExpandAll
+          );
+          gTreeView = gDBView.QueryInterface(Ci.nsITreeView);
+          gTreeView.selection = gFakeSelection;
+          gFakeSelection.view = gTreeView;
+          gFakeSelection.clearSelection();
           const rebuilt = gDBView.QueryInterface(Ci.nsIMsgSearchNotify);
           rebuilt.onNewSearch();
           for (const header of [root, oldChild, outside]) {

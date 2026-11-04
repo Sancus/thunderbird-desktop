@@ -23,6 +23,7 @@
 #include "mozStorageHelper.h"
 #include "mozilla/AutoRestore.h"
 #include "mozilla/CheckedInt.h"
+#include "mozilla/Components.h"
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/RefPtr.h"
@@ -31,6 +32,7 @@
 #include "nsIInputStream.h"
 #include "nsIMsgDBView.h"
 #include "nsIMsgIncomingServer.h"
+#include "nsIMsgFolderNotificationService.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsIMsgPluggableStore.h"
 #include "nsIMsgSearchSession.h"
@@ -51,13 +53,152 @@ namespace mozilla::mailnews {
 
 extern LazyLogModule gPanoramaLog;
 
-NS_IMPL_ISUPPORTS(PerFolderDatabase, nsIDBChangeAnnouncer, nsIMsgDatabase,
-                  nsIMsgOfflineOpsDatabase)
+NS_IMPL_ADDREF(PerFolderDatabase)
+NS_IMPL_RELEASE(PerFolderDatabase)
+NS_INTERFACE_MAP_BEGIN(PerFolderDatabase)
+  NS_INTERFACE_MAP_ENTRY(nsIDBChangeAnnouncer)
+  NS_INTERFACE_MAP_ENTRY(nsIMsgDatabase)
+  NS_INTERFACE_MAP_ENTRY(nsIMsgOfflineOpsDatabase)
+  NS_INTERFACE_MAP_ENTRY_CONDITIONAL(nsINewsDatabase, mIsNewsFolder)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIMsgOfflineOpsDatabase)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(PerFolderDatabase)
+NS_INTERFACE_MAP_END
 
 PerFolderDatabase::PerFolderDatabase(uint64_t folderId, bool isNewsFolder)
     : mFolderId(folderId), mIsNewsFolder(isNewsFolder) {
   mDatabaseSourceStatus = CaptureDatabaseSourceId();
   MessageDB().AddFolderMessageListener(this);
+}
+
+PerFolderDatabase::~PerFolderDatabase() { DetachNewsReadSet(); }
+
+void PerFolderDatabase::DetachNewsReadSet() {
+  if (!mIsNewsFolder) {
+    return;
+  }
+  // This is cleanup, including after shutdown/source change. Never dereference
+  // the saved borrowed set, open a core, or serialize/checkpoint during detach.
+  if (DatabaseCore::sInstance && DatabaseCore::sInstance->mMessageDatabase) {
+    MessageDB().DetachNewsReadSet(*this, mNewsReadSet);
+  }
+  mNewsReadSet = nullptr;
+  mNewsGroup.reset();
+  ++mNewsReadSetGeneration;
+}
+
+void PerFolderDatabase::DetachNewsReadSetIfMatches(nsMsgKeySet* expected) {
+  if (mNewsReadSet == expected) {
+    DetachNewsReadSet();
+  }
+}
+
+NS_IMETHODIMP PerFolderDatabase::GetReadSet(nsMsgKeySet** readSet) {
+  NS_ENSURE_ARG_POINTER(readSet);
+  *readSet = nullptr;
+  NS_ENSURE_TRUE(mIsNewsFolder, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  *readSet = mNewsReadSet;
+  return NS_OK;
+}
+
+NS_IMETHODIMP PerFolderDatabase::SetReadSet(nsMsgKeySet* proposed) {
+  NS_ENSURE_TRUE(mIsNewsFolder, NS_ERROR_NOT_AVAILABLE);
+  if (!proposed) {
+    DetachNewsReadSet();
+    return NS_OK;
+  }
+  RefPtr<PerFolderDatabase> self(this);
+  RefPtr<nsMsgKeySet> pinned(proposed);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  // Core receives the persistent member slot. No local postcommit pointer or
+  // identity repair is allowed before the existing notification batch.
+  return MessageDB().SetNewsReadSet(mDatabaseSourceId, mFolderId, *this,
+                                    proposed, mNewsReadSet);
+}
+
+nsresult PerFolderDatabase::InitializeNewsReadSetFromNewsrc(
+    nsMsgKeySet* incoming, const nsACString& serializedRanges) {
+  NS_ENSURE_ARG(incoming);
+  NS_ENSURE_TRUE(mIsNewsFolder, NS_ERROR_NOT_AVAILABLE);
+  RefPtr<PerFolderDatabase> self(this);
+  RefPtr<nsMsgKeySet> pinned(incoming);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  nsCString serialized;
+  NS_ENSURE_TRUE(serialized.Assign(serializedRanges, fallible),
+                 NS_ERROR_OUT_OF_MEMORY);
+  // Core prepares an owned clone. Neither a failed initialization nor a
+  // changed file may partially edit the caller-owned borrowed set/slot.
+  return MessageDB().SetNewsReadSet(mDatabaseSourceId, mFolderId, *this,
+                                    incoming, mNewsReadSet,
+                                    Some(std::move(serialized)));
+}
+
+nsresult PerFolderDatabase::PrepareNewsReadSetInstall(
+    const NewsGroupIdentity& expectedGroup, nsMsgKeySet* targetBorrowedSet,
+    nsMsgKeySet* preparedOwnedSet, bool attachAfterCommit,
+    PreparedNewsReadSetInstall& output) {
+  NS_ENSURE_TRUE(mIsNewsFolder, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(targetBorrowedSet && preparedOwnedSet &&
+                     targetBorrowedSet != preparedOwnedSet,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(expectedGroup.databaseSourceId == mDatabaseSourceId &&
+                     expectedGroup.folderId == mFolderId &&
+                     !expectedGroup.incarnation.IsEmpty(),
+                 NS_ERROR_NOT_AVAILABLE);
+  if (!attachAfterCommit) {
+    NS_ENSURE_TRUE(
+        mNewsReadSet == targetBorrowedSet && mNewsGroup.isSome() &&
+            mNewsGroup->databaseSourceId == expectedGroup.databaseSourceId &&
+            mNewsGroup->folderId == expectedGroup.folderId &&
+            mNewsGroup->incarnation == expectedGroup.incarnation,
+        NS_ERROR_NOT_AVAILABLE);
+  }
+  PreparedNewsReadSetInstall prepared;
+  prepared.mOwner = this;
+  prepared.mTarget = targetBorrowedSet;
+  prepared.mPrepared = preparedOwnedSet;
+  prepared.mGroup = expectedGroup;
+  prepared.mGeneration = mNewsReadSetGeneration;
+  prepared.mAttach = attachAfterCommit;
+  output = std::move(prepared);
+  return NS_OK;
+}
+
+void PerFolderDatabase::ApplyPreparedNewsReadSet(
+    PreparedNewsReadSetInstall& prepared) {
+  MOZ_ASSERT(prepared.mOwner == this);
+  MOZ_ASSERT(!mForceClosed && prepared.mGeneration == mNewsReadSetGeneration);
+  MOZ_ASSERT(prepared.mTarget && prepared.mPrepared);
+  MOZ_ASSERT(prepared.mAttach || mNewsReadSet == prepared.mTarget);
+  prepared.mTarget->SwapContents(*prepared.mPrepared);
+  mNewsReadSet = prepared.mTarget;
+  mNewsGroup = Some(std::move(prepared.mGroup));
+  ++mNewsReadSetGeneration;
+}
+
+nsresult PerFolderDatabase::GetNewsArticleKey(uint32_t articleNumber,
+                                              nsMsgKey& physicalKey) {
+  NS_ENSURE_TRUE(mIsNewsFolder, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(articleNumber <= INT32_MAX, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(mNewsGroup.isSome(), NS_ERROR_NOT_AVAILABLE);
+  NewsArticleIdentity expected{*mNewsGroup, articleNumber};
+  return MessageDB().GetNewsArticleKey(expected, physicalKey);
+}
+
+nsresult PerFolderDatabase::GetNewsArticleHdr(uint32_t articleNumber,
+                                              nsIMsgDBHdr** header) {
+  NS_ENSURE_ARG_POINTER(header);
+  *header = nullptr;
+  nsMsgKey physicalKey;
+  MOZ_TRY(GetNewsArticleKey(articleNumber, physicalKey));
+  return GetMsgHdrForKey(physicalKey, header);
 }
 
 nsresult PerFolderDatabase::CaptureDatabaseSourceId() {
@@ -575,6 +716,12 @@ void PerFolderDatabase::OnMessageFlagsChangedCaptured(
   // Freeze both outgoing words before ordinary listeners can remove/re-add the
   // key, change flags again, or close this facade.
   NotifyHdrChangeAll(message, oldStatus, newStatus, nullptr);
+  if (mIsNewsFolder &&
+      ((before.flags ^ after.flags) & nsMsgMessageFlags::Read)) {
+    // The native writer already committed the checkpoint and installed/swapped
+    // the same borrowed set before delivering this captured flag event.
+    NotifyReadChanged(nullptr);
+  }
 }
 
 void PerFolderDatabase::OnMessageTagsChangedCaptured(
@@ -699,6 +846,7 @@ NS_IMETHODIMP PerFolderDatabase::OpenFromFile(nsIFile* aFolderName) {
 }
 NS_IMETHODIMP PerFolderDatabase::Close(bool forceCommit) {
   ++mEnumeratorGeneration;
+  DetachNewsReadSet();
   // Each native write is already committed. Never settle another caller's SQL.
   return forceCommit ? Commit(nsMsgDBCommitType::kSessionCommit) : NS_OK;
 }
@@ -711,6 +859,7 @@ NS_IMETHODIMP PerFolderDatabase::ForceClosed() {
   }
   RefPtr<PerFolderDatabase> self(this);
   mForceClosed = true;
+  DetachNewsReadSet();
   mParsedServerNotNew.Clear();
   mCachedHeaders.Clear();
   // Invalidate this wrapper's weak cache entries before a listener reopens it.
@@ -940,15 +1089,123 @@ NS_IMETHODIMP PerFolderDatabase::CreateNewHdr(nsIMsgDBHdr** aRetVal) {
   return NS_OK;
 }
 
+// The existing detached implementation remains shared by all other producers.
+// Only actual news drafts capture the explicit filter action before
+// publication.
+class NewsArticleDraft final : public DetachedMsgHdr {
+ public:
+  explicit NewsArticleDraft(uint64_t folderId) : DetachedMsgHdr(folderId) {}
+  NS_IMETHOD MarkRead(bool read) override {
+    MOZ_TRY(DetachedMsgHdr::MarkRead(read));
+    mNewsReadIntent = Some(read);
+    return NS_OK;
+  }
+
+ private:
+  ~NewsArticleDraft() override = default;
+};
+
 NS_IMETHODIMP PerFolderDatabase::CreateNewHdrWithSpecificMsgKey(
-    nsMsgKey aKey, nsIMsgDBHdr** aRetVal) {
-  return NS_ERROR_NOT_IMPLEMENTED;
+    nsMsgKey articleNumber, nsIMsgDBHdr** result) {
+  NS_ENSURE_ARG_POINTER(result);
+  *result = nullptr;
+  NS_ENSURE_TRUE(mIsNewsFolder && articleNumber <= INT32_MAX,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(mNewsGroup.isSome(), NS_ERROR_NOT_AVAILABLE);
+  NewsGroupIdentity current;
+  MOZ_TRY(
+      MessageDB().GetNewsGroupIdentity(mDatabaseSourceId, mFolderId, current));
+  NS_ENSURE_TRUE(current.incarnation == mNewsGroup->incarnation,
+                 NS_ERROR_NOT_AVAILABLE);
+  NewsArticleIdentity expected{current, articleNumber};
+  nsMsgKey existing;
+  nsresult rv = MessageDB().GetNewsArticleKey(expected, existing);
+  if (NS_SUCCEEDED(rv)) {
+    // A real retained article is already published; the protocol skips parser
+    // edits/filter/add and uses its actual physical identity.
+    return GetMsgHdrForKey(existing, result);
+  }
+  NS_ENSURE_TRUE(rv == NS_ERROR_NOT_AVAILABLE, rv);
+  // Missing membership is accepted only in the same checked group/source.
+  MOZ_TRY(CheckDatabaseSource());
+  NewsGroupIdentity rechecked;
+  MOZ_TRY(MessageDB().GetNewsGroupIdentity(mDatabaseSourceId, mFolderId,
+                                           rechecked));
+  NS_ENSURE_TRUE(rechecked.incarnation == current.incarnation,
+                 NS_ERROR_NOT_AVAILABLE);
+  RefPtr<DetachedMsgHdr> draft = new NewsArticleDraft(mFolderId);
+  draft->mParsedSourceId = mDatabaseSourceId;
+  draft->mNewsArticleNumber = Some(articleNumber);
+  draft->mNewsGroupIncarnation = current.incarnation;
+  draft.forget(result);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::AttachNewsHdr(DetachedMsgHdr& draft, bool notify,
+                                          nsIMsgDBHdr** header) {
+  NS_ENSURE_ARG_POINTER(header);
+  *header = nullptr;
+  NS_ENSURE_TRUE(mIsNewsFolder && draft.mNewsArticleNumber.isSome() &&
+                     *draft.mNewsArticleNumber <= INT32_MAX &&
+                     draft.mFolderId == mFolderId &&
+                     draft.mParsedSourceId == mDatabaseSourceId &&
+                     draft.mCopySourceId.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(mNewsGroup.isSome() &&
+                     mNewsGroup->incarnation == draft.mNewsGroupIncarnation,
+                 NS_ERROR_NOT_AVAILABLE);
+  if (draft.mAttachState == DetachedMsgHdr::AttachState::Attached) {
+    nsCOMPtr<nsIMsgDBHdr> live = draft.mAttachedHeader;
+    live.forget(header);
+    return NS_OK;
+  }
+  MOZ_TRY(draft.CheckMutable());
+  RefPtr<PerFolderDatabase> self(this);
+  RefPtr<DetachedMsgHdr> pinned(&draft);
+  nsresult rv = NS_OK;
+  nsCOMPtr<nsIMsgFolderNotificationService> notifier;
+  if (notify) {
+    // Prepare the existing global notifier before any native settlement.
+    notifier = components::FolderNotification::Service(&rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(notifier, NS_ERROR_NOT_AVAILABLE);
+  }
+  draft.mAttachState = DetachedMsgHdr::AttachState::Attaching;
+  NewsArticleIdentity expected{*mNewsGroup, *draft.mNewsArticleNumber};
+  // The public AttachHdr owning output is filled by Core before callbacks.
+  // The draft remains explicitly keyless and sealed, never a live proxy.
+  rv = MessageDB().AddNewsArticle(expected, draft.mRaw, notify,
+                                  draft.mNewsResult, header,
+                                  draft.mNewsReadIntent);
+  if (NS_FAILED(rv)) {
+    draft.mAttachError = rv;
+    draft.mAttachState = DetachedMsgHdr::AttachState::Failed;
+    return rv;
+  }
+  MOZ_ASSERT(draft.mNewsResult.header &&
+             draft.mNewsResult.physicalKey != nsMsgKey_None);
+  draft.mAttachedHeader = draft.mNewsResult.header;
+  draft.mAttachState = DetachedMsgHdr::AttachState::Attached;
+  MOZ_ASSERT(*header == draft.mNewsResult.header);
+  if (notifier && draft.mNewsResult.inserted) {
+    // Existing global notification is once per actual insertion, including a
+    // reentrant duplicate race. OP omits its native manual MFN notification.
+    notifier->NotifyMsgAdded(draft.mNewsResult.header);
+  }
+  return NS_OK;
 }
 
 NS_IMETHODIMP PerFolderDatabase::AddNewHdrToDB(nsIMsgDBHdr* newHdr,
                                                bool notify) {
-  NS_ERROR("AddNewHdrToDB() not supported");
-  return NS_ERROR_NOT_IMPLEMENTED;
+  NS_ENSURE_ARG(newHdr);
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(newHdr);
+  NS_ENSURE_TRUE(draft, NS_ERROR_INVALID_ARG);
+  nsCOMPtr<nsIMsgDBHdr> live;
+  return AttachNewsHdr(*draft, notify, getter_AddRefs(live));
 }
 
 nsresult PerFolderDatabase::CompletePartialHdr(
@@ -1007,6 +1264,9 @@ NS_IMETHODIMP PerFolderDatabase::AttachHdr(nsIMsgDBHdr* detachedHdr,
   NS_ENSURE_TRUE(draft, NS_ERROR_INVALID_ARG);
   if (draft->mFolderId != mFolderId) {
     return NS_ERROR_INVALID_ARG;
+  }
+  if (draft->mNewsArticleNumber.isSome()) {
+    return AttachNewsHdr(*draft, notify, realHdr);
   }
   if (draft->mAttachState == DetachedMsgHdr::AttachState::Attached) {
     nsCOMPtr<nsIMsgDBHdr> live = draft->mAttachedHeader;

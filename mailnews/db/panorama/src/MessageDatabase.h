@@ -21,12 +21,32 @@
 
 struct RawHdr;
 class mozIStorageStatement;
+class nsMsgKeySet;
 
 namespace mozilla::mailnews {
 
 class Folder;
 class Message;
 class PerFolderDatabase;
+
+// A persistent local group incarnation, never an inferred NNTP server epoch.
+struct NewsGroupIdentity {
+  nsCString databaseSourceId;
+  uint64_t folderId{0};
+  nsCString incarnation;
+};
+
+// This binding is present, including article 0. Physical keys are independent.
+struct NewsArticleIdentity {
+  NewsGroupIdentity group;
+  uint32_t articleNumber{0};
+};
+
+struct NewsArticleResult {
+  bool inserted{false};
+  nsMsgKey physicalKey{nsMsgKey_None};
+  RefPtr<Message> header;
+};
 
 // Committed physical body location; Nothing distinguishes an absent token.
 struct MessageBodyState {
@@ -454,6 +474,26 @@ class MessageDatabase : public nsIMessageDatabase {
                       bool notifyLegacy, nsMsgKey* key,
                       Message** liveHeader = nullptr);
 
+  // installed is the facade's persistent borrowed slot. All fallible work
+  // precedes commit; slot/set contents and owning outputs precede callbacks.
+  nsresult SetNewsReadSet(const nsACString& databaseSourceId, uint64_t folderId,
+                          PerFolderDatabase& owner, nsMsgKeySet* proposed,
+                          nsMsgKeySet*& installed,
+                          const Maybe<nsCString>& serializedNewsrc = Nothing());
+  // Cleanup only: never dereferences the borrowed set or opens the core.
+  void DetachNewsReadSet(PerFolderDatabase& owner, nsMsgKeySet*& installed);
+  nsresult GetNewsGroupIdentity(const nsACString& databaseSourceId,
+                                uint64_t folderId, NewsGroupIdentity& output);
+  nsresult GetNewsArticleKey(const NewsArticleIdentity& expected,
+                             nsMsgKey& physicalKey);
+  // Optional public owning output must be initially null. It is filled with
+  // the result before native callbacks; errors preserve both output slots.
+  nsresult AddNewsArticle(const NewsArticleIdentity& expected,
+                          const ::RawHdr& parsed, bool notifyLegacy,
+                          NewsArticleResult& output,
+                          nsIMsgDBHdr** liveHeader = nullptr,
+                          const Maybe<bool>& readIntent = Nothing());
+
   // Native facade entry: owns its transaction, verifies the physical folder
   // and database incarnation, and accounts bytes before committing removal.
   // OfflineMessageSize counts only rows with the Offline flag. Generic
@@ -775,7 +815,11 @@ class MessageDatabase : public nsIMessageDatabase {
                          const FinishedMessageBody* finished = nullptr,
                          OfflineOperationUndo* offline = nullptr,
                          const PendingDestination* cancelMove = nullptr,
-                         OfflineOperationUndo* redo = nullptr);
+                         OfflineOperationUndo* redo = nullptr,
+                         const NewsArticleIdentity* news = nullptr,
+                         NewsArticleResult* newsOutput = nullptr,
+                         nsIMsgDBHdr** newsLiveHeader = nullptr,
+                         const Maybe<bool>* newsReadIntent = nullptr);
 
   nsresult ReadOfflineOperationIdentity(uint64_t folderId, nsMsgKey key,
                                         int64_t& id, int64_t& revision,
@@ -972,6 +1016,27 @@ class MessageDatabase : public nsIMessageDatabase {
   bool mDeliveringMessageBatches{false};
   // Enabled only with the independently accepted producer/consumer aggregate.
   bool mConversationGroupingEnabled{false};
+
+  // Read-only passive initialization probe. Some is a known zero membership
+  // for unchanged exact file ranges; absent/legacy/changed inputs yield
+  // Nothing. Every storage/currentness/type error preserves output.
+  nsresult ReadNewsReadSetForInitialization(
+      const nsACString& databaseSourceId, uint64_t folderId,
+      const nsACString& exactFileSerialization, Maybe<bool>& zeroOverride);
+  struct NewsReadSetBinding;
+  struct PreparedNewsReadSet;
+  nsTArray<UniquePtr<NewsReadSetBinding>> mNewsReadSets;
+  nsresult ReadNewsGroupIdentity(const nsACString& sourceId, uint64_t folderId,
+                                 NewsGroupIdentity& output, bool create);
+  nsresult ReadNewsArticle(nsMsgKey key, Maybe<NewsArticleIdentity>& output);
+  nsresult PrepareNewsReadChanges(
+      const nsTArray<CapturedMessage>& rows,
+      nsTArray<UniquePtr<PreparedNewsReadSet>>& output);
+  nsresult PrepareNewsRecipients(PreparedNewsReadSet& prepared,
+                                 PerFolderDatabase* replacing = nullptr);
+  nsresult WriteNewsReadSets(
+      const nsTArray<UniquePtr<PreparedNewsReadSet>>& prepared);
+  void InstallNewsReadSets(nsTArray<UniquePtr<PreparedNewsReadSet>>& prepared);
 
   nsresult SetMessageFlagsInternal(Message* message, uint32_t newFlags);
 };

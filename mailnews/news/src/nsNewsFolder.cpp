@@ -4,6 +4,8 @@
 
 #include "nsNewsFolder.h"
 
+#include <utility>
+
 #include "nsIDBFolderInfo.h"
 #include "prlog.h"
 
@@ -43,6 +45,9 @@
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
 #  include "FolderDatabase.h"
+#  include "PerFolderDatabase.h"
+#  include "nsQueryObject.h"
+#  include "mozilla/CheckedInt.h"
 #  include "mozilla/ResultExtensions.h"
 #  include "mozilla/StaticPrefs_mail.h"
 #endif
@@ -61,7 +66,12 @@ nsMsgNewsFolder::nsMsgNewsFolder(void)
   mFolderSize = kSizeUnknown;
 }
 
-nsMsgNewsFolder::~nsMsgNewsFolder(void) {}
+nsMsgNewsFolder::~nsMsgNewsFolder(void) {
+#ifdef MOZ_PANORAMA
+  // The base destructor cannot dispatch to our Shutdown after members die.
+  DetachNativeReadSet();
+#endif
+}
 
 NS_IMPL_ADDREF_INHERITED(nsMsgNewsFolder, nsMsgDBFolder)
 NS_IMPL_RELEASE_INHERITED(nsMsgNewsFolder, nsMsgDBFolder)
@@ -71,6 +81,10 @@ NS_IMETHODIMP nsMsgNewsFolder::QueryInterface(REFNSIID aIID,
   if (!aInstancePtr) return NS_ERROR_NULL_POINTER;
   *aInstancePtr = nullptr;
 
+#ifdef MOZ_PANORAMA
+  if (aIID.Equals(NS_GET_IID(nsMsgNewsFolder)))
+    *aInstancePtr = static_cast<nsMsgNewsFolder*>(this);
+#endif
   if (aIID.Equals(NS_GET_IID(nsIMsgNewsFolder)))
     *aInstancePtr = static_cast<nsIMsgNewsFolder*>(this);
   if (*aInstancePtr) {
@@ -166,7 +180,8 @@ nsMsgNewsFolder::AddNewsgroup(const nsACString& name, const nsACString& setStr,
 #ifdef MOZ_PANORAMA
 nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
                                                    const nsACString& setStr,
-                                                   nsIMsgFolder** child) {
+                                                   nsIMsgFolder** child,
+                                                   bool passive) {
   *child = nullptr;
   NS_ENSURE_STATE(mFolderId);
   NS_ENSURE_ARG(!name.IsEmpty());
@@ -192,14 +207,26 @@ nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
   }
   nsCOMPtr<nsIMsgNewsFolder> newsFolder = do_QueryInterface(folder, &rv);
   NS_ENSURE_SUCCESS(rv, rv);
-  MOZ_TRY(newsFolder->SetReadSetFromStr(setStr));
   MOZ_TRY(folder->SetFlag(nsMsgFolderFlags::Newsgroup));
+  if (passive) {
+    RefPtr<nsMsgNewsFolder> native = do_QueryObject(folder, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    MOZ_TRY(native->SetNativeReadSetFromStr(setStr, true));
+  } else {
+    MOZ_TRY(newsFolder->SetReadSetFromStr(setStr));
+  }
 
   nsCOMPtr<nsINntpIncomingServer> nntpServer;
   MOZ_TRY(GetNntpServer(getter_AddRefs(nntpServer)));
   MOZ_TRY(nntpServer->AddNewsgroup(name));
-  if (!mSubFolders.Contains(folder)) {
-    mSubFolders.AppendObject(folder);
+  if (passive && mSubFolders.Contains(folder)) {
+    // Native restoration populated these retained children before newsrc was
+    // read. Replay its subscription order without replacing their identities.
+    // Prepare the new position before releasing the old array membership.
+    NS_ENSURE_TRUE(mSubFolders.AppendObject(folder), NS_ERROR_OUT_OF_MEMORY);
+    mSubFolders.RemoveObject(folder);
+  } else if (!mSubFolders.Contains(folder)) {
+    NS_ENSURE_TRUE(mSubFolders.AppendObject(folder), NS_ERROR_OUT_OF_MEMORY);
   }
   folder.forget(child);
   return NS_OK;
@@ -229,7 +256,16 @@ nsMsgNewsFolder::GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) {
     if (NS_FAILED(rv)) return rv;
 
     rv = CreateSubFolders(path);
-    if (NS_FAILED(rv)) return rv;
+    if (NS_FAILED(rv)) {
+#ifdef MOZ_PANORAMA
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        // A partial newsrc load cannot authorize a rewrite of its source file.
+        // Keep the reentrancy guard during loading, then retry on next access.
+        mInitialized = false;
+      }
+#endif
+      return rv;
+    }
 
     // force ourselves to get initialized from cache
     // Don't care if it fails.  this will fail the first time after
@@ -262,6 +298,15 @@ nsresult nsMsgNewsFolder::GetDatabase() {
     rv = db->GetReadSet(&previousSet);
     NS_ENSURE_SUCCESS(rv, rv);
     RefPtr<nsMsgKeySet> readSet = mReadSet;
+#ifdef MOZ_PANORAMA
+    const bool native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+    nsCOMPtr<nsINewsDatabase> previousBinding = mReadSetDatabase;
+    RefPtr<mozilla::mailnews::PerFolderDatabase> nativeDB;
+    if (native) {
+      nativeDB = do_QueryObject(db, &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+#endif
     NS_ENSURE_TRUE(!mDatabase, NS_ERROR_IN_PROGRESS);
 
     // Summary updates re-enter through GetDBFolderInfoAndDB.
@@ -274,7 +319,14 @@ nsresult nsMsgNewsFolder::GetDatabase() {
           NS_WARNING("Failed to detach news database listener");
         }
       }
-      if (readSetAttempted) {
+#ifdef MOZ_PANORAMA
+      if (native && readSetAttempted) {
+        if (readSet != previousSet) {
+          nativeDB->DetachNewsReadSetIfMatches(readSet);
+        }
+      } else
+#endif
+          if (readSetAttempted) {
         nsMsgKeySet* currentSet = nullptr;
         nsresult cleanupRv = db->GetReadSet(&currentSet);
         if (NS_SUCCEEDED(cleanupRv) && currentSet == readSet.get() &&
@@ -284,6 +336,11 @@ nsresult nsMsgNewsFolder::GetDatabase() {
         NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
                              "Failed to clear news database read set");
       }
+#ifdef MOZ_PANORAMA
+      if (native && mReadSetDatabase == db && mReadSet == readSet) {
+        mReadSetDatabase = previousBinding;
+      }
+#endif
       if (mDatabase == database) {
         mDatabase = nullptr;
       }
@@ -295,7 +352,23 @@ nsresult nsMsgNewsFolder::GetDatabase() {
       NS_ENSURE_TRUE(mDatabase == database, NS_ERROR_IN_PROGRESS);
     }
     readSetAttempted = true;
-    rv = db->SetReadSet(readSet);
+#ifdef MOZ_PANORAMA
+    if (native) {
+      mReadSetDatabase = db;
+    }
+#endif
+#ifdef MOZ_PANORAMA
+    if (native && mPendingNewsrcReadSet.isSome()) {
+      rv = nativeDB->InitializeNewsReadSetFromNewsrc(readSet,
+                                                     *mPendingNewsrcReadSet);
+      if (NS_SUCCEEDED(rv) && mReadSet == readSet && mReadSetDatabase == db) {
+        mPendingNewsrcReadSet.reset();
+      }
+    } else
+#endif
+    {
+      rv = db->SetReadSet(readSet);
+    }
     NS_ENSURE_SUCCESS(rv, rv);
     NS_ENSURE_TRUE(mDatabase == database, NS_ERROR_IN_PROGRESS);
 
@@ -575,19 +648,75 @@ nsMsgNewsFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
   return openErr;
 }
 
+#ifdef MOZ_PANORAMA
+void nsMsgNewsFolder::DetachNativeReadSet() {
+  RefPtr<mozilla::mailnews::PerFolderDatabase> native =
+      do_QueryObject(mReadSetDatabase);
+  if (native && mReadSet) {
+    // Match without inspecting the saved weak pointer, including after cache
+    // clearing, close, or source shutdown. A newer binding must survive.
+    native->DetachNewsReadSetIfMatches(mReadSet);
+  }
+  mReadSetDatabase = nullptr;
+  mPendingNewsrcReadSet.reset();
+}
+
+nsresult nsMsgNewsFolder::ApplyNativeReadRange(int32_t first, int32_t last) {
+  MOZ_TRY(GetDatabase());
+  RefPtr<nsMsgKeySet> owner = mReadSet;
+  NS_ENSURE_TRUE(owner, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsINewsDatabase> news = do_QueryInterface(mDatabase);
+  NS_ENSURE_TRUE(news, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsINntpIncomingServer> server;
+  MOZ_TRY(GetNntpServer(getter_AddRefs(server)));
+  nsCString encoded;
+  MOZ_TRY(owner->Output(getter_Copies(encoded)));
+  const bool zero = owner->IsMember(0);
+  RefPtr<nsMsgKeySet> prepared = nsMsgKeySet::Create(encoded.get());
+  NS_ENSURE_TRUE(prepared, NS_ERROR_OUT_OF_MEMORY);
+  NS_ENSURE_TRUE((zero ? prepared->Add(0) : prepared->Remove(0)) >= 0,
+                 NS_ERROR_OUT_OF_MEMORY);
+  int changed = prepared->AddRange(first, last);
+  NS_ENSURE_TRUE(changed >= 0, NS_ERROR_OUT_OF_MEMORY);
+  if (!changed) {
+    return NS_OK;
+  }
+  // The same borrowed identity is reconciled; the owning caller restores its
+  // exact old contents if native preparation/storage refuses the range.
+  owner->SwapContents(*prepared);
+  nsresult rv = news->SetReadSet(owner);
+  if (NS_FAILED(rv)) {
+    if (mReadSet == owner) {
+      owner->SwapContents(*prepared);
+    }
+    return rv;
+  }
+  return server->SetNewsrcHasChanged(true);
+}
+#endif
+
 /* this used to be MSG_FolderInfoNews::UpdateSummaryFromNNTPInfo() */
 NS_IMETHODIMP
 nsMsgNewsFolder::UpdateSummaryFromNNTPInfo(int32_t oldest, int32_t youngest,
                                            int32_t total) {
   NS_ENSURE_STATE(mReadSet);
-  /* First, mark all of the articles now known to be expired as read. */
-  if (oldest > 1) {
-    nsCString oldSet;
-    nsCString newSet;
-    mReadSet->Output(getter_Copies(oldSet));
-    mReadSet->AddRange(1, oldest - 1);
-    mReadSet->Output(getter_Copies(newSet));
-  }
+  bool dbWasOpen = mDatabase != nullptr;
+#ifdef MOZ_PANORAMA
+  const bool native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+  NS_ENSURE_TRUE(!native || (oldest >= 0 && youngest >= 0 && total >= 0),
+                 NS_ERROR_ILLEGAL_VALUE);
+  if (native && oldest > 1) {
+    MOZ_TRY(ApplyNativeReadRange(1, oldest - 1));
+  } else
+#endif
+    /* First, mark all of the articles now known to be expired as read. */
+    if (oldest > 1) {
+      nsCString oldSet;
+      nsCString newSet;
+      mReadSet->Output(getter_Copies(oldSet));
+      mReadSet->AddRange(1, oldest - 1);
+      mReadSet->Output(getter_Copies(newSet));
+    }
 
   /* Now search the newsrc line and figure out how many of these messages are
    * marked as unread. */
@@ -613,13 +742,23 @@ nsMsgNewsFolder::UpdateSummaryFromNNTPInfo(int32_t oldest, int32_t youngest,
     if (deltaInDB > 0) unread -= deltaInDB;
   }
 
-  bool dbWasOpen = mDatabase != nullptr;
   int32_t pendingUnreadDelta =
       unread - mNumUnreadMessages - mNumPendingUnreadMessages;
   int32_t pendingTotalDelta =
       total - mNumTotalMessages - mNumPendingTotalMessages;
-  ChangeNumPendingUnread(pendingUnreadDelta);
-  ChangeNumPendingTotalMessages(pendingTotalDelta);
+  nsresult pendingRv = ChangeNumPendingUnread(pendingUnreadDelta);
+#ifdef MOZ_PANORAMA
+  if (native) {
+    NS_ENSURE_SUCCESS(pendingRv, pendingRv);
+  }
+#endif
+  pendingRv = ChangeNumPendingTotalMessages(pendingTotalDelta);
+#ifdef MOZ_PANORAMA
+  if (native) {
+    NS_ENSURE_SUCCESS(pendingRv, pendingRv);
+  }
+#endif
+  (void)pendingRv;
   if (!dbWasOpen && mDatabase) {
     mDatabase->Commit(nsMsgDBCommitType::kLargeCommit);
     mDatabase->RemoveListener(this);
@@ -851,23 +990,34 @@ nsresult nsMsgNewsFolder::LoadNewsrcFileAndCreateNewsgroups() {
 
   while (more && NS_SUCCEEDED(rv)) {
     rv = lineInputStream->ReadLine(line, &more);
-    if (line.IsEmpty()) continue;
-    HandleNewsrcLine(line.get(), line.Length());
+    if (NS_FAILED(rv) || line.IsEmpty()) continue;
+    nsresult lineRv = HandleNewsrcLine(line.get(), line.Length());
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      rv = lineRv;
+    }
+#endif
   }
 
-  fileStream->Close();
+  nsresult closeRv = fileStream->Close();
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      NS_SUCCEEDED(rv)) {
+    return closeRv;
+  }
+#endif
   return rv;
 }
 
-int32_t nsMsgNewsFolder::HandleNewsrcLine(const char* line,
-                                          uint32_t line_size) {
+nsresult nsMsgNewsFolder::HandleNewsrcLine(const char* line,
+                                           uint32_t line_size) {
   nsresult rv;
 
   /* guard against blank line lossage */
-  if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') return 0;
+  if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') return NS_OK;
 
   if ((line[0] == 'o' || line[0] == 'O') && !PL_strncasecmp(line, "options", 7))
-    return 0;
+    return NS_OK;
 
   const char* s = nullptr;
   const char* setStr = nullptr;
@@ -877,13 +1027,13 @@ int32_t nsMsgNewsFolder::HandleNewsrcLine(const char* line,
     if ((*s == ':') || (*s == '!')) break;
 
   if (*s == 0) {
-    return 0;
+    return NS_OK;
   }
 
   bool subscribed = (*s == ':');
   setStr = s + 1;
 
-  if (*line == '\0') return 0;
+  if (*line == '\0') return NS_OK;
 
   // previous versions of Communicator polluted the
   // newsrc files with articles
@@ -912,12 +1062,22 @@ int32_t nsMsgNewsFolder::HandleNewsrcLine(const char* line,
     // we're subscribed, so add it
     nsCOMPtr<nsIMsgFolder> child;
 
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      // ReadLine removed structural line endings. Exclude only the writer's
+      // one separator byte; preserve the actual range syntax for comparison.
+      if (*setStr == ' ') ++setStr;
+      return AddNewsgroupWithFolderId(Substring(line, s),
+                                      nsDependentCString(setStr),
+                                      getter_AddRefs(child), true);
+    }
+#endif
     rv = AddNewsgroup(Substring(line, s), nsDependentCString(setStr),
                       getter_AddRefs(child));
-    if (NS_FAILED(rv)) return -1;
+    NS_ENSURE_SUCCESS(rv, rv);
   }
 
-  return 0;
+  return NS_OK;
 }
 
 NS_IMETHODIMP nsMsgNewsFolder::GetGroupUsername(nsACString& aGroupUsername) {
@@ -1045,19 +1205,97 @@ nsMsgNewsFolder::GetNewsrcLine(nsACString& newsrcLine) {
   newsrcLine = newsgroupName;
   newsrcLine.Append(':');
 
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      mPendingNewsrcReadSet.isSome()) {
+    MOZ_TRY(GetDatabase());
+  }
+#endif
   if (mReadSet) {
     nsCString setStr;
-    mReadSet->Output(getter_Copies(setStr));
+    rv = mReadSet->Output(getter_Copies(setStr));
+    NS_ENSURE_SUCCESS(rv, rv);
     if (NS_SUCCEEDED(rv)) {
       newsrcLine.Append(' ');
       newsrcLine.Append(setStr);
-      newsrcLine.AppendLiteral(MSG_LINEBREAK);
     }
   }
+  // A restored native group can exist before its first newsrc write.
+  newsrcLine.AppendLiteral(MSG_LINEBREAK);
   return NS_OK;
 }
 
+#ifdef MOZ_PANORAMA
+nsresult nsMsgNewsFolder::SetNativeReadSetFromStr(const nsACString& ranges,
+                                                  bool passive) {
+  // Reject overflow before the legacy signed parser changes range meaning.
+  mozilla::CheckedInt<int32_t> article = 0;
+  for (uint32_t i = 0; i < ranges.Length(); ++i) {
+    const char c = ranges.CharAt(i);
+    if (c >= '0' && c <= '9') {
+      article = article * 10 + (c - '0');
+      NS_ENSURE_TRUE(article.isValid(), NS_ERROR_ILLEGAL_VALUE);
+    } else {
+      article = 0;
+    }
+  }
+  RefPtr<nsMsgKeySet> replacement =
+      nsMsgKeySet::Create(PromiseFlatCString(ranges).get());
+  NS_ENSURE_TRUE(replacement, NS_ERROR_OUT_OF_MEMORY);
+  mozilla::Maybe<nsCString> pending;
+  if (passive) {
+    nsCString serialized;
+    NS_ENSURE_TRUE(serialized.Assign(ranges, mozilla::fallible),
+                   NS_ERROR_OUT_OF_MEMORY);
+    pending.emplace(std::move(serialized));
+  }
+  nsCOMPtr<nsINewsDatabase> previousBinding = mReadSetDatabase;
+  nsCOMPtr<nsINewsDatabase> newsDatabase = previousBinding;
+  if (mDatabase) {
+    nsresult rv;
+    newsDatabase = do_QueryInterface(mDatabase, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  RefPtr<mozilla::mailnews::PerFolderDatabase> nativeDB;
+  if (passive && newsDatabase) {
+    nsresult rv;
+    nativeDB = do_QueryObject(newsDatabase, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  // Install owning state before synchronous native callbacks. Keep the old
+  // owner/ranges alive until this exact attempt commits or rolls back.
+  RefPtr<nsMsgKeySet> previous = mReadSet;
+  auto previousRanges = std::move(mPendingNewsrcReadSet);
+  mReadSet = replacement;
+  mPendingNewsrcReadSet = std::move(pending);
+  if (!newsDatabase) {
+    return NS_OK;
+  }
+  mReadSetDatabase = newsDatabase;
+  nsresult rv =
+      passive ? nativeDB->InitializeNewsReadSetFromNewsrc(replacement, ranges)
+              : newsDatabase->SetReadSet(replacement);
+  if (mReadSetDatabase == newsDatabase && mReadSet == replacement) {
+    if (NS_FAILED(rv)) {
+      mReadSet = previous;
+      mReadSetDatabase = previousBinding;
+      mPendingNewsrcReadSet = std::move(previousRanges);
+    } else {
+      mPendingNewsrcReadSet.reset();
+    }
+  }
+  return rv;
+}
+#endif
+
 NS_IMETHODIMP nsMsgNewsFolder::SetReadSetFromStr(const nsACString& newsrcLine) {
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return SetNativeReadSetFromStr(newsrcLine, false);
+  }
+#endif
+
   mReadSet = nsMsgKeySet::Create(PromiseFlatCString(newsrcLine).get());
   NS_ENSURE_TRUE(mReadSet, NS_ERROR_OUT_OF_MEMORY);
 
@@ -1287,6 +1525,13 @@ NS_IMETHODIMP nsMsgNewsFolder::Shutdown(bool shutdownChildren) {
   }
 
   mInitialized = false;
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    DetachNativeReadSet();
+    mReadSet = nullptr;
+    return nsMsgDBFolder::Shutdown(shutdownChildren);
+  }
+#endif
   if (mReadSet) {
     // the nsINewsDatabase holds a weak ref to the readset,
     // and we outlive the db, so it's safe to delete it here.

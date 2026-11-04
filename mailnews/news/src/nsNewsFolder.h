@@ -15,10 +15,27 @@
 #include "nsIMsgNewsFolder.h"
 #include "nsCOMPtr.h"
 #include "nsIMsgFilterList.h"
+#ifdef MOZ_PANORAMA
+#  include "mozilla/Maybe.h"
+#endif
+
+class nsINewsDatabase;
+
+#ifdef MOZ_PANORAMA
+#  define NS_MSG_NEWS_FOLDER_IID \
+    {0xf5381803,                 \
+     0x376a,                     \
+     0x49ba,                     \
+     {0x8c, 0xc4, 0xe7, 0x8f, 0x80, 0x7c, 0x95, 0xae}}
+#endif
 
 class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
  public:
   nsMsgNewsFolder(void);
+#ifdef MOZ_PANORAMA
+  // Concrete QI is internal to the registered native news factory caller.
+  NS_INLINE_DECL_STATIC_IID(NS_MSG_NEWS_FOLDER_IID)
+#endif
 
   NS_DECL_ISUPPORTS_INHERITED
   NS_DECL_NSIMSGNEWSFOLDER
@@ -86,9 +103,12 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   nsresult GetDatabase() override;
 
 #ifdef MOZ_PANORAMA
+  void DetachNativeReadSet();
+  nsresult ApplyNativeReadRange(int32_t first, int32_t last);
+  nsresult SetNativeReadSetFromStr(const nsACString& ranges, bool passive);
   nsresult AddNewsgroupWithFolderId(const nsACString& name,
                                     const nsACString& setStr,
-                                    nsIMsgFolder** child);
+                                    nsIMsgFolder** child, bool passive = false);
 #endif
 
   nsresult LoadNewsrcFileAndCreateNewsgroups();
@@ -99,7 +119,7 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   nsresult GetNewsMessages(nsIMsgWindow* aMsgWindow, bool getOld,
                            nsIUrlListener* aListener);
 
-  int32_t HandleNewsrcLine(const char* line, uint32_t line_size);
+  nsresult HandleNewsrcLine(const char* line, uint32_t line_size);
   virtual nsresult CreateBaseMessageURI(const nsACString& aURI) override;
 
  protected:
@@ -109,6 +129,12 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   bool m_downloadMessageForOfflineUse;
 
   RefPtr<nsMsgKeySet> mReadSet;
+#ifdef MOZ_PANORAMA
+  // Binding ownership outlives the optional cached mDatabase reference.
+  nsCOMPtr<nsINewsDatabase> mReadSetDatabase;
+  // Only a passive file load may restore a known lossy zero companion.
+  mozilla::Maybe<nsCString> mPendingNewsrcReadSet;
+#endif
 
   nsCOMPtr<nsIFile> mNewsrcFilePath;
 

@@ -32,6 +32,9 @@ class nsMsgKeySet {
   // .newsrc file.
   nsresult Output(char** outputStr);
 
+  // Exchange prepared contents without allocating or changing either identity.
+  void SwapContents(nsMsgKeySet& other) noexcept;
+
   // IsMember() returns whether the given article is a member of this set.
   bool IsMember(int32_t art);
 

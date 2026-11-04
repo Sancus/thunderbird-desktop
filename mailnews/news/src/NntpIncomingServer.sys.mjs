@@ -9,6 +9,8 @@ import { MsgIncomingServer } from "resource:///modules/MsgIncomingServer.sys.mjs
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   CommonUtils: "resource://services-common/utils.sys.mjs",
+  FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
+  MailStringUtils: "resource:///modules/MailStringUtils.sys.mjs",
   NntpClient: "resource:///modules/NntpClient.sys.mjs",
   clearInterval: "resource://gre/modules/Timer.sys.mjs",
   setInterval: "resource://gre/modules/Timer.sys.mjs",
@@ -417,6 +419,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
     this.rootMsgFolder.createSubfolder(name, null);
   }
 
+  /**
+   * Save the current subscriptions and read ranges before returning.
+   *
+   * @throws {nsIException} If collecting, writing, or finishing the file fails.
+   *   The server remains dirty and the previous file is retained on failure.
+   */
   writeNewsrcFile() {
     if (!this.newsrcHasChanged) {
       return;
@@ -430,7 +438,34 @@ export class NntpIncomingServer extends MsgIncomingServer {
         lines.push(folder.newsrcLine);
       }
     }
-    IOUtils.writeUTF8(this.newsrcFilePath.path, lines.join(""));
+    // This is a void XPCOM method, so an asynchronous rejection cannot report
+    // failure to its caller. Finish the safe stream before clearing dirty state.
+    const bytes = lazy.MailStringUtils.stringToByteString(lines.join(""));
+    const output = lazy.FileUtils.openSafeFileOutputStream(this.newsrcFilePath);
+    try {
+      let offset = 0;
+      // Write empty contents too, so the deferred stream opens its replacement.
+      do {
+        const remaining = bytes.length - offset;
+        const written = output.write(bytes.slice(offset), remaining);
+        if ((!written && remaining) || written > remaining) {
+          throw Components.Exception(
+            "Incomplete newsrc write",
+            Cr.NS_ERROR_UNEXPECTED
+          );
+        }
+        offset += written;
+      } while (offset < bytes.length);
+      output.QueryInterface(Ci.nsISafeOutputStream).finish();
+    } catch (error) {
+      try {
+        output.close();
+      } catch (closeError) {
+        // Preserve the original collection/write/finish error.
+      }
+      throw error;
+    }
+    this.newsrcHasChanged = false;
   }
 
   findGroup(name) {
@@ -614,9 +649,19 @@ export class NntpIncomingServer extends MsgIncomingServer {
    *
    * @param {string} groupName - The newsgroup name.
    * @returns {Promise<void>} Resolves after removing expired articles. Rejects
-   *   with the request status if fetching the article list fails.
+   *   with the request status if fetching the article list fails, or
+   *   NS_ERROR_NOT_IMPLEMENTED when native article-to-key mapping is unavailable.
    */
   removeExpiredArticles(groupName) {
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      // LISTGROUP numbers cannot be compared with native physical message keys.
+      return Promise.reject(
+        Components.Exception(
+          "Native news expiry requires mapped article identities",
+          Cr.NS_ERROR_NOT_IMPLEMENTED
+        )
+      );
+    }
     return new Promise((resolve, reject) => {
       const newsFolder = this.rootFolder
         .getChildNamed(groupName)

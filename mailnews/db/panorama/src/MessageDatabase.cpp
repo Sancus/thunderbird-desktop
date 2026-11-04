@@ -23,6 +23,7 @@
 #include "mozStorageHelper.h"
 #include "mozilla/AutoRestore.h"
 #include "mozilla/CheckedInt.h"
+#include "mozilla/Components.h"
 #include "mozilla/Logging.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/Try.h"
@@ -31,13 +32,17 @@
 #include "nsIFile.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgOfflineImapOperation.h"
+#include "nsIUUIDGenerator.h"
 #include "nsImapCore.h"
 #include "nsLocalFile.h"
+#include "nsMsgFolderFlags.h"
+#include "nsMsgKeySet.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsReadableUtils.h"
 #include "nsTHashMap.h"
 #include "nsTHashSet.h"
+#include <cstdlib>
 
 using mozilla::LazyLogModule;
 using mozilla::LogLevel;
@@ -141,6 +146,20 @@ OfflineOperationUndo& OfflineOperationUndo::operator=(OfflineOperationUndo&&) =
 const OfflineOperationData* OfflineOperationUndo::Operation() const {
   return mData ? &mData->operation.payload : nullptr;
 }
+
+struct MessageDatabase::NewsReadSetBinding {
+  WeakPtr<PerFolderDatabase> owner;
+  PerFolderDatabase* identity{nullptr};
+  nsMsgKeySet** slot{nullptr};
+  NewsGroupIdentity group;
+};
+
+struct MessageDatabase::PreparedNewsReadSet {
+  NewsGroupIdentity group;
+  RefPtr<nsMsgKeySet> contents;
+  nsCString checkpoint;
+  nsTArray<PreparedNewsReadSetInstall> recipients;
+};
 
 MessageDatabase::MessageDatabase() = default;
 MessageDatabase::~MessageDatabase() = default;
@@ -389,6 +408,598 @@ nsresult MessageDatabase::RequireCommittedSearchRead() {
   return active ? NS_ERROR_IN_PROGRESS : NS_OK;
 }
 
+namespace {
+
+bool SameNewsGroup(const NewsGroupIdentity& a, const NewsGroupIdentity& b) {
+  return a.folderId == b.folderId && a.databaseSourceId == b.databaseSourceId &&
+         a.incarnation == b.incarnation;
+}
+
+bool IsNewsBindingProperty(const nsACString& name) {
+  return name.EqualsLiteral("newsArticleNumber") ||
+         name.EqualsLiteral("newsGroupIncarnation");
+}
+
+nsresult SerializeNewsSet(nsMsgKeySet& set, nsCString& output) {
+  char* text = nullptr;
+  nsresult rv = set.Output(&text);
+  if (NS_FAILED(rv)) {
+    free(text);
+    return rv;
+  }
+  NS_ENSURE_TRUE(text, NS_ERROR_OUT_OF_MEMORY);
+  output.Assign(text);
+  free(text);
+  return NS_OK;
+}
+
+// The legacy parser/serializer canonicalizes article 0. Restore its explicit
+// membership bit on owned storage; never use serialized emptiness as presence.
+nsresult CloneNewsSet(nsMsgKeySet& source, RefPtr<nsMsgKeySet>& output) {
+  bool zero = source.IsMember(0);
+  nsCString text;
+  MOZ_TRY(SerializeNewsSet(source, text));
+  RefPtr<nsMsgKeySet> copy = nsMsgKeySet::Create(text.get());
+  NS_ENSURE_TRUE(copy, NS_ERROR_OUT_OF_MEMORY);
+  int result = zero ? copy->Add(0) : copy->Remove(0);
+  NS_ENSURE_TRUE(result >= 0, NS_ERROR_OUT_OF_MEMORY);
+  output = std::move(copy);
+  return NS_OK;
+}
+
+}  // namespace
+
+nsresult MessageDatabase::ReadNewsGroupIdentity(const nsACString& sourceId,
+                                                uint64_t folderId,
+                                                NewsGroupIdentity& output,
+                                                bool create) {
+  MOZ_TRY(RequireCurrentOwner());
+  NS_ENSURE_TRUE(folderId && folderId <= INT64_MAX && !sourceId.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  nsCString current;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(current));
+  NS_ENSURE_TRUE(current == sourceId, NS_ERROR_NOT_AVAILABLE);
+  NewsGroupIdentity result;
+  result.databaseSourceId = current;
+  result.folderId = folderId;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReadNewsGroupIdentity"_ns,
+        "SELECT f.flags,p.value,typeof(p.value) FROM folders f "
+        "LEFT JOIN folder_properties p ON p.id=f.id "
+        "AND p.name='newsGroupIncarnation' WHERE f.id=:folder"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int64_t flags;
+    MOZ_TRY(stmt->GetInt64(0, &flags));
+    NS_ENSURE_TRUE(flags & nsMsgFolderFlags::Newsgroup, NS_ERROR_NOT_AVAILABLE);
+    nsCString type;
+    MOZ_TRY(stmt->GetUTF8String(2, type));
+    if (type.EqualsLiteral("text")) {
+      MOZ_TRY(stmt->GetUTF8String(1, result.incarnation));
+      NS_ENSURE_TRUE(!result.incarnation.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+    } else {
+      NS_ENSURE_TRUE(type.EqualsLiteral("null"), NS_ERROR_FILE_CORRUPTED);
+      NS_ENSURE_TRUE(create, NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  if (result.incarnation.IsEmpty()) {
+    nsCOMPtr<nsIUUIDGenerator> generator = components::UUIDGenerator::Service();
+    NS_ENSURE_TRUE(generator, NS_ERROR_FAILURE);
+    nsID id;
+    MOZ_TRY(generator->GenerateUUIDInPlace(&id));
+    char value[NSID_LENGTH];
+    id.ToProvidedString(value);
+    result.incarnation.Assign(value);
+  }
+  output = std::move(result);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::GetNewsGroupIdentity(const nsACString& sourceId,
+                                               uint64_t folderId,
+                                               NewsGroupIdentity& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  return ReadNewsGroupIdentity(sourceId, folderId, output, false);
+}
+
+nsresult MessageDatabase::ReadNewsReadSetForInitialization(
+    const nsACString& sourceId, uint64_t folderId,
+    const nsACString& exactFileSerialization, Maybe<bool>& zeroOverride) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  NS_ENSURE_TRUE(folderId && folderId <= INT64_MAX && !sourceId.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  nsCString current;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(current));
+  NS_ENSURE_TRUE(current == sourceId, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReadNewsInitialization"_ns,
+      "SELECT f.flags,r.name IS NOT NULL,r.value,typeof(r.value),"
+      "z.name IS NOT NULL,z.value,typeof(z.value),g.name IS NOT NULL,"
+      "g.value,typeof(g.value) FROM folders f "
+      "LEFT JOIN folder_properties r ON r.id=f.id AND r.name='readSet' "
+      "LEFT JOIN folder_properties z ON z.id=f.id AND "
+      "z.name='readSetContainsZero' "
+      "LEFT JOIN folder_properties g ON g.id=f.id AND "
+      "g.name='newsGroupIncarnation' "
+      "WHERE f.id=:folder"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  int64_t flags, hasRead, hasZero, hasGroup;
+  MOZ_TRY(stmt->GetInt64(0, &flags));
+  MOZ_TRY(stmt->GetInt64(1, &hasRead));
+  MOZ_TRY(stmt->GetInt64(4, &hasZero));
+  MOZ_TRY(stmt->GetInt64(7, &hasGroup));
+  NS_ENSURE_TRUE(flags & nsMsgFolderFlags::Newsgroup, NS_ERROR_NOT_AVAILABLE);
+  if (!hasRead) {
+    NS_ENSURE_TRUE(!hasZero && !hasGroup, NS_ERROR_FILE_CORRUPTED);
+    zeroOverride.reset();
+    return NS_OK;
+  }
+  nsCString text, readType;
+  MOZ_TRY(stmt->GetUTF8String(3, readType));
+  NS_ENSURE_TRUE(readType.EqualsLiteral("text"), NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(stmt->GetUTF8String(2, text));
+  if (hasGroup) {
+    nsCString incarnation, groupType;
+    MOZ_TRY(stmt->GetUTF8String(9, groupType));
+    NS_ENSURE_TRUE(groupType.EqualsLiteral("text"), NS_ERROR_FILE_CORRUPTED);
+    MOZ_TRY(stmt->GetUTF8String(8, incarnation));
+    NS_ENSURE_TRUE(!incarnation.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+  }
+  Maybe<bool> result;
+  if (hasZero) {
+    NS_ENSURE_TRUE(hasGroup, NS_ERROR_FILE_CORRUPTED);
+    nsCString zeroType;
+    MOZ_TRY(stmt->GetUTF8String(6, zeroType));
+    NS_ENSURE_TRUE(zeroType.EqualsLiteral("integer"), NS_ERROR_FILE_CORRUPTED);
+    int64_t zero;
+    MOZ_TRY(stmt->GetInt64(5, &zero));
+    NS_ENSURE_TRUE(zero == 0 || zero == 1, NS_ERROR_FILE_CORRUPTED);
+    if (text == exactFileSerialization) {
+      result = Some(zero == 1);
+    }
+  }
+  // A legacy readSet without the typed companion is unknown, even if empty.
+  // Changed file ranges are incoming authority; never repair them by inference.
+  zeroOverride = result;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ReadNewsArticle(nsMsgKey key,
+                                          Maybe<NewsArticleIdentity>& output) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReadNewsArticle"_ns,
+      "SELECT m.folderId,a.value,typeof(a.value),g.value,typeof(g.value) "
+      "FROM messages m LEFT JOIN message_properties a ON a.id=m.id "
+      "AND a.name='newsArticleNumber' LEFT JOIN message_properties g "
+      "ON g.id=m.id AND g.name='newsGroupIncarnation' WHERE m.id=:key"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  nsCString articleType, groupType;
+  MOZ_TRY(stmt->GetUTF8String(2, articleType));
+  MOZ_TRY(stmt->GetUTF8String(4, groupType));
+  if (articleType.EqualsLiteral("null") && groupType.EqualsLiteral("null")) {
+    output.reset();
+    return NS_OK;
+  }
+  NS_ENSURE_TRUE(
+      articleType.EqualsLiteral("integer") && groupType.EqualsLiteral("text"),
+      NS_ERROR_FILE_CORRUPTED);
+  int64_t folderId, article;
+  MOZ_TRY(stmt->GetInt64(0, &folderId));
+  MOZ_TRY(stmt->GetInt64(1, &article));
+  NS_ENSURE_TRUE(folderId > 0 && article >= 0 && article <= INT32_MAX,
+                 NS_ERROR_FILE_CORRUPTED);
+  NewsArticleIdentity result;
+  nsCString source;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(source));
+  MOZ_TRY(ReadNewsGroupIdentity(source, folderId, result.group, false));
+  nsCString incarnation;
+  MOZ_TRY(stmt->GetUTF8String(3, incarnation));
+  NS_ENSURE_TRUE(incarnation == result.group.incarnation,
+                 NS_ERROR_FILE_CORRUPTED);
+  result.articleNumber = article;
+  output = Some(std::move(result));
+  return NS_OK;
+}
+
+nsresult MessageDatabase::GetNewsArticleKey(const NewsArticleIdentity& expected,
+                                            nsMsgKey& physicalKey) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  NS_ENSURE_TRUE(expected.articleNumber <= INT32_MAX, NS_ERROR_INVALID_ARG);
+  NewsGroupIdentity current;
+  MOZ_TRY(ReadNewsGroupIdentity(expected.group.databaseSourceId,
+                                expected.group.folderId, current, false));
+  NS_ENSURE_TRUE(SameNewsGroup(current, expected.group),
+                 NS_ERROR_NOT_AVAILABLE);
+  // Filter valid unrelated bindings in SQL, while still surfacing corruption
+  // anywhere in the group. Do not re-read source/group identity for every row.
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "FindNewsArticle"_ns,
+      "SELECT m.id,a.value,typeof(a.value),g.value,typeof(g.value) "
+      "FROM messages m LEFT JOIN message_properties a ON a.id=m.id "
+      "AND a.name='newsArticleNumber' LEFT JOIN message_properties g "
+      "ON g.id=m.id AND g.name='newsGroupIncarnation' "
+      "WHERE m.folderId=:folder "
+      "AND (a.name IS NOT NULL OR g.name IS NOT NULL) "
+      "AND (a.value=:article OR m.id<=0 OR m.id>=:invalidKey "
+      "OR typeof(a.value)!='integer' OR a.value<0 OR a.value>:maxArticle "
+      "OR typeof(g.value)!='text' OR g.value!=:incarnation) ORDER BY m.id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("folder"_ns, current.folderId));
+  MOZ_TRY(stmt->BindInt64ByName("article"_ns, expected.articleNumber));
+  MOZ_TRY(stmt->BindInt64ByName("invalidKey"_ns, nsMsgKey_None));
+  MOZ_TRY(stmt->BindInt64ByName("maxArticle"_ns, INT32_MAX));
+  MOZ_TRY(stmt->BindUTF8StringByName("incarnation"_ns, current.incarnation));
+  Maybe<nsMsgKey> found;
+  while (true) {
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (!more) break;
+    int64_t key;
+    MOZ_TRY(stmt->GetInt64(0, &key));
+    NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+    nsCString articleType, groupType;
+    MOZ_TRY(stmt->GetUTF8String(2, articleType));
+    MOZ_TRY(stmt->GetUTF8String(4, groupType));
+    NS_ENSURE_TRUE(
+        articleType.EqualsLiteral("integer") && groupType.EqualsLiteral("text"),
+        NS_ERROR_FILE_CORRUPTED);
+    int64_t article;
+    MOZ_TRY(stmt->GetInt64(1, &article));
+    NS_ENSURE_TRUE(article >= 0 && article <= INT32_MAX &&
+                       article == int64_t(expected.articleNumber),
+                   NS_ERROR_FILE_CORRUPTED);
+    nsCString incarnation;
+    MOZ_TRY(stmt->GetUTF8String(3, incarnation));
+    NS_ENSURE_TRUE(incarnation == current.incarnation, NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(!found, NS_ERROR_FILE_CORRUPTED);
+    found = Some(nsMsgKey(key));
+  }
+  NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
+  physicalKey = *found;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::PrepareNewsRecipients(PreparedNewsReadSet& prepared,
+                                                PerFolderDatabase* replacing) {
+  MOZ_TRY(SerializeNewsSet(*prepared.contents, prepared.checkpoint));
+  for (const auto& binding : mNewsReadSets) {
+    RefPtr<PerFolderDatabase> owner = binding->owner.get();
+    if (!owner || owner == replacing ||
+        !SameNewsGroup(binding->group, prepared.group)) {
+      continue;
+    }
+    // Only a live, source-checked concrete facade permits slot dereference.
+    MOZ_TRY(owner->CheckDatabaseSource());
+    NS_ENSURE_TRUE(binding->slot && *binding->slot, NS_ERROR_NOT_AVAILABLE);
+    RefPtr<nsMsgKeySet> contents;
+    MOZ_TRY(CloneNewsSet(*prepared.contents, contents));
+    PreparedNewsReadSetInstall recipient;
+    MOZ_TRY(owner->PrepareNewsReadSetInstall(prepared.group, *binding->slot,
+                                             contents, false, recipient));
+    if (!prepared.recipients.AppendElement(std::move(recipient), fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult MessageDatabase::WriteNewsReadSets(
+    const nsTArray<UniquePtr<PreparedNewsReadSet>>& prepared) {
+  for (const auto& item : prepared) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "WriteNewsReadSet"_ns,
+        "REPLACE INTO folder_properties(id,name,value) VALUES "
+        "(:folder,'readSet',:set),(:folder,'readSetContainsZero',:zero),"
+        "(:folder,'newsGroupIncarnation',:group)"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, item->group.folderId));
+    MOZ_TRY(stmt->BindUTF8StringByName("set"_ns, item->checkpoint));
+    MOZ_TRY(
+        stmt->BindInt64ByName("zero"_ns, item->contents->IsMember(0) ? 1 : 0));
+    MOZ_TRY(stmt->BindUTF8StringByName("group"_ns, item->group.incarnation));
+    MOZ_TRY(stmt->Execute());
+  }
+  return NS_OK;
+}
+
+void MessageDatabase::InstallNewsReadSets(
+    nsTArray<UniquePtr<PreparedNewsReadSet>>& prepared) {
+  for (auto& item : prepared) {
+    for (auto& recipient : item->recipients) {
+      recipient.mOwner->ApplyPreparedNewsReadSet(recipient);
+    }
+  }
+}
+
+nsresult MessageDatabase::PrepareNewsReadChanges(
+    const nsTArray<CapturedMessage>& rows,
+    nsTArray<UniquePtr<PreparedNewsReadSet>>& output) {
+  nsTArray<UniquePtr<PreparedNewsReadSet>> prepared;
+  for (const auto& row : rows) {
+    Maybe<NewsArticleIdentity> article;
+    MOZ_TRY(ReadNewsArticle(row.id, article));
+    if (!article) {
+      continue;
+    }
+    PreparedNewsReadSet* item = nullptr;
+    for (auto& candidate : prepared) {
+      if (SameNewsGroup(candidate->group, article->group)) {
+        item = candidate.get();
+        break;
+      }
+    }
+    if (!item) {
+      auto next = MakeUnique<PreparedNewsReadSet>();
+      next->group = article->group;
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ReadNewsCheckpoint"_ns,
+          "SELECT r.value,typeof(r.value),z.value,typeof(z.value) "
+          "FROM folder_properties r LEFT JOIN folder_properties z "
+          "ON z.id=r.id AND z.name='readSetContainsZero' "
+          "WHERE r.id=:folder AND r.name='readSet'"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, article->group.folderId));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+      nsCString checkpoint, readType, zeroType;
+      MOZ_TRY(stmt->GetUTF8String(0, checkpoint));
+      MOZ_TRY(stmt->GetUTF8String(1, readType));
+      MOZ_TRY(stmt->GetUTF8String(3, zeroType));
+      int64_t zero;
+      MOZ_TRY(stmt->GetInt64(2, &zero));
+      NS_ENSURE_TRUE(readType.EqualsLiteral("text") &&
+                         zeroType.EqualsLiteral("integer") &&
+                         (zero == 0 || zero == 1),
+                     NS_ERROR_FILE_CORRUPTED);
+      next->contents = nsMsgKeySet::Create(checkpoint.get());
+      NS_ENSURE_TRUE(next->contents, NS_ERROR_OUT_OF_MEMORY);
+      NS_ENSURE_TRUE(
+          (zero ? next->contents->Add(0) : next->contents->Remove(0)) >= 0,
+          NS_ERROR_OUT_OF_MEMORY);
+      item = next.get();
+      if (!prepared.AppendElement(std::move(next), fallible)) {
+        return NS_ERROR_OUT_OF_MEMORY;
+      }
+    }
+    int result = row.flags & nsMsgMessageFlags::Read
+                     ? item->contents->Add(article->articleNumber)
+                     : item->contents->Remove(article->articleNumber);
+    NS_ENSURE_TRUE(result >= 0, NS_ERROR_OUT_OF_MEMORY);
+  }
+  for (auto& item : prepared) {
+    MOZ_TRY(PrepareNewsRecipients(*item));
+  }
+  output = std::move(prepared);
+  return NS_OK;
+}
+
+void MessageDatabase::DetachNewsReadSet(PerFolderDatabase& owner,
+                                        nsMsgKeySet*& installed) {
+  mNewsReadSets.RemoveElementsBy([&](const auto& binding) {
+    return binding->identity == &owner && binding->slot == &installed;
+  });
+  installed = nullptr;
+}
+
+nsresult MessageDatabase::SetNewsReadSet(
+    const nsACString& sourceId, uint64_t folderId, PerFolderDatabase& owner,
+    nsMsgKeySet* proposed, nsMsgKeySet*& installed,
+    const Maybe<nsCString>& serializedNewsrc) {
+  if (!proposed) {
+    DetachNewsReadSet(owner, installed);
+    return NS_OK;
+  }
+  MOZ_TRY(RequireCommittedSearchRead());
+  MOZ_TRY(owner.CheckDatabaseSource());
+  NS_ENSURE_TRUE(owner.mIsNewsFolder && owner.mFolderId == folderId &&
+                     owner.mDatabaseSourceId == sourceId &&
+                     &installed == &owner.mNewsReadSet,
+                 NS_ERROR_NOT_AVAILABLE);
+  RefPtr<PerFolderDatabase> pin = &owner;
+  RefPtr<nsMsgKeySet> incoming = proposed;
+  auto item = MakeUnique<PreparedNewsReadSet>();
+  MOZ_TRY(ReadNewsGroupIdentity(sourceId, folderId, item->group, true));
+  MOZ_TRY(CloneNewsSet(*incoming, item->contents));
+  if (serializedNewsrc) {
+    Maybe<bool> zeroOverride;
+    MOZ_TRY(ReadNewsReadSetForInitialization(sourceId, folderId,
+                                             *serializedNewsrc, zeroOverride));
+    if (zeroOverride) {
+      int changed =
+          *zeroOverride ? item->contents->Add(0) : item->contents->Remove(0);
+      NS_ENSURE_TRUE(changed >= 0, NS_ERROR_OUT_OF_MEMORY);
+    }
+  }
+  MOZ_TRY(PrepareNewsRecipients(*item, &owner));
+  PreparedNewsReadSetInstall attach;
+  RefPtr<nsMsgKeySet> contents;
+  MOZ_TRY(CloneNewsSet(*item->contents, contents));
+  MOZ_TRY(owner.PrepareNewsReadSetInstall(item->group, proposed, contents, true,
+                                          attach));
+  NS_ENSURE_TRUE(item->recipients.AppendElement(std::move(attach), fallible),
+                 NS_ERROR_OUT_OF_MEMORY);
+  auto binding = MakeUnique<NewsReadSetBinding>();
+  binding->owner = &owner;
+  binding->identity = &owner;
+  binding->slot = &installed;
+  binding->group = item->group;
+  NS_ENSURE_TRUE(
+      mNewsReadSets.SetCapacity(mNewsReadSets.Length() + 1, fallible),
+      NS_ERROR_OUT_OF_MEMORY);
+  nsTArray<UniquePtr<PreparedNewsReadSet>> prepared;
+  NS_ENSURE_TRUE(prepared.AppendElement(std::move(item), fallible),
+                 NS_ERROR_OUT_OF_MEMORY);
+  UniquePtr<QueuedMessageBatch> notification;
+  MOZ_TRY(PrepareMessageBatch(notification));
+  notification->kind = QueuedMessageBatch::Kind::Flags;
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    nsTArray<nsMsgKey> keys;
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "NewsReadSetRows"_ns,
+          "SELECT id FROM messages WHERE folderId=:folder ORDER BY id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+      while (true) {
+        bool more;
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        if (!more) break;
+        int64_t key;
+        MOZ_TRY(stmt->GetInt64(0, &key));
+        NS_ENSURE_TRUE(key > 0 && key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+        NS_ENSURE_TRUE(keys.AppendElement(nsMsgKey(key), fallible),
+                       NS_ERROR_OUT_OF_MEMORY);
+      }
+    }
+    for (nsMsgKey key : keys) {
+      Maybe<NewsArticleIdentity> article;
+      MOZ_TRY(ReadNewsArticle(key, article));
+      if (!article) continue;
+      NS_ENSURE_TRUE(SameNewsGroup(article->group, binding->group),
+                     NS_ERROR_NOT_AVAILABLE);
+      QueuedMessageBatch::Flags change;
+      MOZ_TRY(CaptureMessage(key, change.before));
+      uint32_t flags = change.before.flags & ~nsMsgMessageFlags::Read;
+      if (prepared[0]->contents->IsMember(article->articleNumber))
+        flags |= nsMsgMessageFlags::Read;
+      if (flags == change.before.flags) continue;
+      RefPtr<DetachedMsgHdr> old;
+      MOZ_TRY(ChangeHeader(change.before, old));
+      change.oldHeader = old;
+      change.live = new (fallible) Message(key);
+      NS_ENSURE_TRUE(change.live, NS_ERROR_OUT_OF_MEMORY);
+      {
+        nsCOMPtr<mozIStorageStatement> stmt;
+        MOZ_TRY(DatabaseCore::GetStatement(
+            "NewsReconcileRead"_ns,
+            "UPDATE messages SET flags=:flags WHERE id=:id"_ns,
+            getter_AddRefs(stmt)));
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("id"_ns, key));
+        MOZ_TRY(stmt->BindInt64ByName("flags"_ns, flags));
+        MOZ_TRY(stmt->Execute());
+      }
+      MOZ_TRY(CaptureMessage(key, change.after));
+      NS_ENSURE_TRUE(
+          notification->flagChanges.AppendElement(std::move(change), fallible),
+          NS_ERROR_OUT_OF_MEMORY);
+    }
+    MOZ_TRY(WriteNewsReadSets(prepared));
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) return RollbackMessageChange(connection, rv);
+  // No allocation, SQL or external code after commit until every recipient and
+  // persistent slot/cache is installed. Notifications may reenter afterwards.
+  InstallNewsReadSets(prepared);
+  for (const auto& change : notification->flagChanges) {
+    auto entry = mMsgCache.lookup(change.after.id);
+    if (entry) entry->value().flags = change.after.flags;
+  }
+  mNewsReadSets.RemoveElementsBy([&](const auto& old) {
+    return !old->owner || old->owner.get() == &owner;
+  });
+  installed = proposed;
+  mNewsReadSets.AppendElement(std::move(binding));
+  if (!notification->flagChanges.IsEmpty())
+    QueueMessageBatch(std::move(notification));
+  return NS_OK;
+}
+
+nsresult MessageDatabase::AddNewsArticle(const NewsArticleIdentity& expected,
+                                         const ::RawHdr& parsed,
+                                         bool notifyLegacy,
+                                         NewsArticleResult& output,
+                                         nsIMsgDBHdr** liveHeader,
+                                         const Maybe<bool>& readIntent) {
+  NS_ENSURE_TRUE(!liveHeader || !*liveHeader, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  NS_ENSURE_TRUE(expected.articleNumber <= INT32_MAX, NS_ERROR_INVALID_ARG);
+  nsMsgKey existing;
+  nsresult rv = GetNewsArticleKey(expected, existing);
+  if (NS_SUCCEEDED(rv)) {
+    RefPtr<Message> message = new (fallible) Message(existing);
+    NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
+    nsCOMPtr<nsIMsgDBHdr> owningHeader = message.get();
+    output = {false, existing, message};
+    if (liveHeader) {
+      owningHeader.forget(liveHeader);
+    }
+    return NS_OK;
+  }
+  NS_ENSURE_TRUE(rv == NS_ERROR_NOT_AVAILABLE, rv);
+  NewsGroupIdentity current;
+  MOZ_TRY(ReadNewsGroupIdentity(expected.group.databaseSourceId,
+                                expected.group.folderId, current, false));
+  NS_ENSURE_TRUE(SameNewsGroup(current, expected.group),
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "NewsArticleCheckpoint"_ns,
+      "SELECT r.value,typeof(r.value),z.value,typeof(z.value) "
+      "FROM folder_properties r JOIN folder_properties z ON z.id=r.id "
+      "AND z.name='readSetContainsZero' WHERE r.id=:folder AND r.name='readSet'"_ns,
+      getter_AddRefs(stmt)));
+  nsCString checkpoint, readType, zeroType;
+  int64_t zero;
+  {
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, current.folderId));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(stmt->GetUTF8String(0, checkpoint));
+    MOZ_TRY(stmt->GetUTF8String(1, readType));
+    MOZ_TRY(stmt->GetInt64(2, &zero));
+    MOZ_TRY(stmt->GetUTF8String(3, zeroType));
+  }
+  NS_ENSURE_TRUE(readType.EqualsLiteral("text") &&
+                     zeroType.EqualsLiteral("integer") &&
+                     (zero == 0 || zero == 1),
+                 NS_ERROR_FILE_CORRUPTED);
+  RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create(checkpoint.get());
+  NS_ENSURE_TRUE(set, NS_ERROR_OUT_OF_MEMORY);
+  NS_ENSURE_TRUE((zero ? set->Add(0) : set->Remove(0)) >= 0,
+                 NS_ERROR_OUT_OF_MEMORY);
+  // RawHdr owns move-only ordered arrays. Borrow the complete parsed input;
+  // only the typed Read word is resolved for the existing insertion path.
+  const Maybe<bool> insertionRead =
+      readIntent.isSome() ? readIntent
+                          : Some(set->IsMember(expected.articleNumber));
+  nsMsgKey key;
+  return InsertMessage(current.folderId, parsed, false, notifyLegacy, &key,
+                       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                       &expected, &output, liveHeader, &insertionRead);
+}
+
 nsresult MessageDatabase::GetSearchWatermark(uint64_t& sequence) {
   MOZ_TRY(RequireCommittedSearchRead());
   nsCOMPtr<mozIStorageStatement> stmt;
@@ -408,8 +1019,9 @@ nsresult MessageDatabase::GetSearchWatermark(uint64_t& sequence) {
   return NS_OK;
 }
 
-NS_IMETHODIMP MessageDatabase::GetSearchState(
-    nsMsgKey key, JSContext* cx, JS::MutableHandle<JS::Value> result) {
+NS_IMETHODIMP
+MessageDatabase::GetSearchState(nsMsgKey key, JSContext* cx,
+                                JS::MutableHandle<JS::Value> result) {
   MOZ_TRY(RequireCommittedSearchRead());
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
@@ -1709,9 +2321,9 @@ nsresult MessageDatabase::SettleMessageBodyInternal(
   return NS_OK;
 }
 
-NS_IMETHODIMP MessageDatabase::GetSearchChanges(
-    uint64_t after, uint32_t limit, JSContext* cx,
-    JS::MutableHandle<JS::Value> result) {
+NS_IMETHODIMP
+MessageDatabase::GetSearchChanges(uint64_t after, uint32_t limit, JSContext* cx,
+                                  JS::MutableHandle<JS::Value> result) {
   NS_ENSURE_ARG(limit > 0 && limit <= 1000 && after <= kMaxSearchSequence);
   uint64_t watermark;
   MOZ_TRY(GetSearchWatermark(watermark));
@@ -1785,9 +2397,10 @@ NS_IMETHODIMP MessageDatabase::GetSearchChanges(
   return NS_OK;
 }
 
-NS_IMETHODIMP MessageDatabase::GetSearchSnapshot(
-    nsMsgKey after, uint32_t limit, JSContext* cx,
-    JS::MutableHandle<JS::Value> result) {
+NS_IMETHODIMP
+MessageDatabase::GetSearchSnapshot(nsMsgKey after, uint32_t limit,
+                                   JSContext* cx,
+                                   JS::MutableHandle<JS::Value> result) {
   NS_ENSURE_ARG(limit > 0 && limit <= 1000 && after != nsMsgKey_None);
   uint64_t watermark;
   MOZ_TRY(GetSearchWatermark(watermark));
@@ -1923,8 +2536,12 @@ nsresult MessageDatabase::InsertMessage(
     uint64_t aFolderId, const ::RawHdr& header, bool staged, bool notifyLegacy,
     nsMsgKey* aKey, Message** liveHeader, RemovedMessage* restoring,
     const FinishedMessageBody* finished, OfflineOperationUndo* offline,
-    const PendingDestination* cancelMove, OfflineOperationUndo* redo) {
+    const PendingDestination* cancelMove, OfflineOperationUndo* redo,
+    const NewsArticleIdentity* news, NewsArticleResult* newsOutput,
+    nsIMsgDBHdr** newsLiveHeader, const Maybe<bool>* newsReadIntent) {
   NS_ENSURE_ARG_POINTER(aKey);
+  NS_ENSURE_TRUE(!newsLiveHeader || (news && newsOutput && !*newsLiveHeader),
+                 NS_ERROR_INVALID_ARG);
   if (staged) {
     NS_ENSURE_TRUE(aFolderId && aFolderId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   }
@@ -1948,9 +2565,11 @@ nsresult MessageDatabase::InsertMessage(
 
   CachedMsg cached;
   RefPtr<Message> message;
+  nsCOMPtr<nsIMsgDBHdr> owningNewsHeader;
   UniquePtr<QueuedMessageBatch> notification;
   MessageThreadBatch captured;
   OfflineOperationUndo canceledState;
+  nsTArray<UniquePtr<PreparedNewsReadSet>> newsPrepared;
   if (!staged) {
     MOZ_TRY(PrepareMessageBatch(notification));
     notification->notifyLegacy = notifyLegacy;
@@ -1996,6 +2615,11 @@ nsresult MessageDatabase::InsertMessage(
     }
     nsMsgKey allocated;
     MOZ_TRY(DatabaseCore::GetNextMessageKey(allocated));
+    if (newsLiveHeader) {
+      message = new (fallible) Message(allocated);
+      NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
+      owningNewsHeader = message;
+    }
     if (staged) {
       nsCOMPtr<mozIStorageStatement> parent;
       MOZ_TRY(
@@ -2085,6 +2709,14 @@ nsresult MessageDatabase::InsertMessage(
                                         nsMsgMessageFlags::Offline)) |
                           (finished->offline ? nsMsgMessageFlags::Offline : 0)
                     : header.flags;
+      // A keyless news filter records presence separately from its raw word.
+      // Only the typed insertion route may override the checkpoint default.
+      if (news && newsReadIntent && newsReadIntent->isSome()) {
+        flags &= ~nsMsgMessageFlags::Read;
+        if (**newsReadIntent) {
+          flags |= nsMsgMessageFlags::Read;
+        }
+      }
       MOZ_TRY(stmt->BindInt32ByName("flags"_ns, flags));
       MOZ_TRY(stmt->BindUTF8StringByName("tags"_ns, tags));
       MOZ_TRY(stmt->BindInt32ByName("priority"_ns, header.priority));
@@ -2154,7 +2786,8 @@ nsresult MessageDatabase::InsertMessage(
       for (const auto& property : restoring->mData->properties) {
         // A server binding belongs to the old physical row, not its restored
         // copy.
-        if (property.name.EqualsLiteral("uidOnServer")) {
+        if (property.name.EqualsLiteral("uidOnServer") ||
+            IsNewsBindingProperty(property.name)) {
           continue;
         }
         mozStorageStatementScoper scope(stmt);
@@ -2198,7 +2831,8 @@ nsresult MessageDatabase::InsertMessage(
         MOZ_TRY(SetMessageProperty(cached.key, "dateReceived"_ns, text));
       }
       for (const auto& extra : header.extras) {
-        if (!extra.k.EqualsLiteral("keywords")) {
+        if (!extra.k.EqualsLiteral("keywords") &&
+            !IsNewsBindingProperty(extra.k)) {
           MOZ_TRY(SetMessageProperty(cached.key, extra.k, extra.v));
         }
       }
@@ -2219,6 +2853,28 @@ nsresult MessageDatabase::InsertMessage(
         MOZ_TRY(
             SetMessageProperty(cached.key, "lineCount"_ns, *header.lineCount));
       }
+    }
+
+    if (news) {
+      NS_ENSURE_TRUE(!staged && !restoring && newsOutput &&
+                         news->articleNumber <= INT32_MAX,
+                     NS_ERROR_INVALID_ARG);
+      NewsGroupIdentity current;
+      MOZ_TRY(ReadNewsGroupIdentity(news->group.databaseSourceId, aFolderId,
+                                    current, false));
+      NS_ENSURE_TRUE(SameNewsGroup(current, news->group),
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "BindNewsArticle"_ns,
+          "INSERT INTO message_properties(id,name,value) VALUES "
+          "(:id,'newsArticleNumber',:article),(:id,'newsGroupIncarnation',:group)"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("id"_ns, cached.key));
+      MOZ_TRY(stmt->BindInt64ByName("article"_ns, news->articleNumber));
+      MOZ_TRY(stmt->BindUTF8StringByName("group"_ns, current.incarnation));
+      MOZ_TRY(stmt->Execute());
     }
 
     if (offline) {
@@ -2246,11 +2902,22 @@ nsresult MessageDatabase::InsertMessage(
         MOZ_TRY(CaptureMessage(cached.key, notification->after));
       }
     }
+    if (news) {
+      CapturedMessage row;
+      MOZ_TRY(CaptureMessage(cached.key, row));
+      nsTArray<CapturedMessage> rows;
+      NS_ENSURE_TRUE(rows.AppendElement(std::move(row), fallible),
+                     NS_ERROR_OUT_OF_MEMORY);
+      MOZ_TRY(PrepareNewsReadChanges(rows, newsPrepared));
+      MOZ_TRY(WriteNewsReadSets(newsPrepared));
+    }
     if (!mMsgCache.reserve(mMsgCache.count() + 1)) {
       return NS_ERROR_OUT_OF_MEMORY;
     }
-    message = new (fallible) Message(cached.key);
-    NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
+    if (!message) {
+      message = new (fallible) Message(cached.key);
+      NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
+    }
     if (notification) {
       notification->live = message;
       if (notification->kind == QueuedMessageBatch::Kind::Thread) {
@@ -2285,6 +2952,13 @@ nsresult MessageDatabase::InsertMessage(
     entry->value() = std::move(cached);
   } else {
     mMsgCache.putNewInfallible(key, std::move(cached));
+  }
+  InstallNewsReadSets(newsPrepared);
+  if (newsOutput) {
+    *newsOutput = {true, key, message};
+  }
+  if (newsLiveHeader) {
+    owningNewsHeader.forget(newsLiveHeader);
   }
   *aKey = key;
   if (liveHeader) {
@@ -7188,6 +7862,7 @@ nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
   MOZ_TRY(RequireCommittedSearchRead());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   nsTArray<nsMsgKey> marked;
+  nsTArray<UniquePtr<PreparedNewsReadSet>> newsPrepared;
   UniquePtr<QueuedMessageBatch> notification;
   MOZ_TRY(PrepareMessageBatch(notification));
   notification->kind = QueuedMessageBatch::Kind::Flags;
@@ -7260,6 +7935,13 @@ nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
       NS_ENSURE_TRUE(marked[i] == change.before.id, NS_ERROR_FILE_CORRUPTED);
       MOZ_TRY(CaptureMessage(marked[i], change.after));
     }
+    nsTArray<CapturedMessage> rows;
+    for (const auto& change : notification->flagChanges) {
+      NS_ENSURE_TRUE(rows.AppendElement(change.after, fallible),
+                     NS_ERROR_OUT_OF_MEMORY);
+    }
+    MOZ_TRY(PrepareNewsReadChanges(rows, newsPrepared));
+    MOZ_TRY(WriteNewsReadSets(newsPrepared));
     return connection->CommitTransaction();
   }();
   if (NS_FAILED(rv)) {
@@ -7273,6 +7955,7 @@ nsresult MessageDatabase::MarkAllRead(uint64_t aFolderId,
       entry->value().flags |= nsMsgMessageFlags::Read;
     }
   }
+  InstallNewsReadSets(newsPrepared);
   aMarkedKeys = std::move(marked);
   if (!notification->flagChanges.IsEmpty()) {
     QueueMessageBatch(std::move(notification));
@@ -7412,6 +8095,7 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
                                              const nsACString& aName,
                                              const nsACString& aValue) {
   MOZ_ASSERT(!aName.EqualsLiteral("keywords"));  // Use SetMessageTags().
+  NS_ENSURE_TRUE(!IsNewsBindingProperty(aName), NS_ERROR_INVALID_ARG);
 
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
@@ -7433,6 +8117,7 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
 nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
                                              const nsACString& aName,
                                              uint32_t aValue) {
+  NS_ENSURE_TRUE(!IsNewsBindingProperty(aName), NS_ERROR_INVALID_ARG);
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
       aKey, "SetMessageProperty"_ns, HeaderTable::Properties,
@@ -7852,6 +8537,7 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
   MOZ_TRY(PrepareMessageBatch(notification));
   notification->kind = QueuedMessageBatch::Kind::Flags;
   bool changed = false;
+  nsTArray<UniquePtr<PreparedNewsReadSet>> newsPrepared;
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
     MOZ_TRY(CaptureMessage(key, notification->before));
@@ -7874,6 +8560,13 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
     MOZ_TRY(CaptureMessage(key, notification->after));
     notification->live = new (fallible) Message(key);
     NS_ENSURE_TRUE(notification->live, NS_ERROR_OUT_OF_MEMORY);
+    if ((notification->before.flags ^ newFlags) & nsMsgMessageFlags::Read) {
+      nsTArray<CapturedMessage> rows;
+      NS_ENSURE_TRUE(rows.AppendElement(notification->after, fallible),
+                     NS_ERROR_OUT_OF_MEMORY);
+      MOZ_TRY(PrepareNewsReadChanges(rows, newsPrepared));
+      MOZ_TRY(WriteNewsReadSets(newsPrepared));
+    }
     changed = true;
     return connection->CommitTransaction();
   }();
@@ -7887,6 +8580,7 @@ nsresult MessageDatabase::SetMessageFlags(nsMsgKey key, uint32_t newFlags) {
   if (entry) {
     entry->value().flags = notification->after.flags;
   }
+  InstallNewsReadSets(newsPrepared);
   QueueMessageBatch(std::move(notification));
   return NS_OK;
 }
@@ -8854,8 +9548,9 @@ void MessageListener::DeliverThreadBatch(const PreparedThreadBatch& prepared) {
                              batch.notifyLegacy);
 }
 
-NS_IMETHODIMP MessageDatabase::GetConversationMessageKeys(
-    nsMsgKey key, nsTArray<nsMsgKey>& output) {
+NS_IMETHODIMP
+MessageDatabase::GetConversationMessageKeys(nsMsgKey key,
+                                            nsTArray<nsMsgKey>& output) {
   NS_ENSURE_ARG(key && key != nsMsgKey_None);
   MOZ_TRY(RequireCommittedSearchRead());
   nsCOMPtr<mozIStorageStatement> stmt;

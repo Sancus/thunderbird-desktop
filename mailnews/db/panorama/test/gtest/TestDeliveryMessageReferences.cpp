@@ -29,12 +29,15 @@
 #include "nsDirectoryServiceUtils.h"
 #include "nsIEventTarget.h"
 #include "nsIDBChangeListener.h"
+#include "nsIDBFolderInfo.h"
 #include "nsIFile.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgHdr.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
+#include "nsQueryObject.h"
 #include "nsServiceManagerUtils.h"
 #include "nsString.h"
 #include "nsThreadUtils.h"
@@ -166,6 +169,26 @@ class DeliveryMessageReferences : public testing::Test {
 
   static mozIStorageConnection* Connection() {
     return DatabaseCore::sConnection.get();
+  }
+
+  // TEST_F bodies derive from this fixture; Core friendship stays here.
+  nsresult ReadAdmissionSourceId(nsACString& output) {
+    return mCore->ReadSourceIdForFolderAdmission(output);
+  }
+
+  static nsresult ReadNewsCheckpoint(PerFolderDatabase& database,
+                                     nsACString& output) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(database.GetDBFolderInfo(getter_AddRefs(info)));
+    return info->GetCharProperty("readSet", output);
+  }
+
+  static nsresult ReadNewsZeroCheckpoint(PerFolderDatabase& database,
+                                         int64_t& output) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(database.GetDBFolderInfo(getter_AddRefs(info)));
+    // Keep the caller's sentinel when the stored zero checkpoint is absent.
+    return info->GetInt64Property("readSetContainsZero", output, &output);
   }
 
   bool Stop() {
@@ -3927,6 +3950,590 @@ TEST_F(DeliveryDatabaseClose, ThreadStepFailureIsNotEmptyIteration) {
   nsIMsgThread* output = thread;
   EXPECT_EQ(NS_ERROR_FAILURE, iterator->GetNext(&output));
   EXPECT_EQ(nullptr, output);
+}
+
+namespace {
+
+class DeliveryNewsReadListener final : public nsIDBChangeListener {
+ public:
+  NS_DECL_ISUPPORTS
+  uint32_t added = 0;
+  uint32_t flags = 0;
+  uint32_t reads = 0;
+  std::function<void(char)> observe;
+  NS_IMETHOD OnHdrAdded(nsIMsgDBHdr*, nsMsgKey, int32_t,
+                        nsIDBChangeListener*) override {
+    ++added;
+    if (observe) observe('A');
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrFlagsChanged(nsIMsgDBHdr*, uint32_t, uint32_t,
+                               nsIDBChangeListener*) override {
+    ++flags;
+    if (observe) observe('F');
+    return NS_OK;
+  }
+  NS_IMETHOD OnReadChanged(nsIDBChangeListener*) override {
+    ++reads;
+    if (observe) observe('R');
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrDeleted(nsIMsgDBHdr*, nsMsgKey, int32_t,
+                          nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnHdrPropertyChanged(nsIMsgDBHdr*, const nsACString&, bool,
+                                  uint32_t*, nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnParentChanged(nsMsgKey, nsMsgKey, nsMsgKey,
+                             nsIDBChangeListener*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnAnnouncerGoingAway(nsIDBChangeAnnouncer*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD OnJunkScoreChanged(nsIDBChangeListener*) override { return NS_OK; }
+  NS_IMETHOD OnEvent(nsIMsgDatabase*, const char*) override { return NS_OK; }
+
+ private:
+  ~DeliveryNewsReadListener() = default;
+};
+NS_IMPL_ISUPPORTS(DeliveryNewsReadListener, nsIDBChangeListener)
+
+nsresult AddFacadeNewsArticle(PerFolderDatabase& db, uint32_t article,
+                              const nsACString& messageId,
+                              nsIMsgDBHdr** header) {
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  MOZ_TRY(db.CreateNewHdrWithSpecificMsgKey(article, getter_AddRefs(draft)));
+  MOZ_TRY(draft->SetMessageId(messageId));
+  MOZ_TRY(draft->SetSubject("news subject"_ns));
+  MOZ_TRY(draft->SetReferences("<first@news.invalid> <first@news.invalid>"_ns));
+  MOZ_TRY(db.AddNewHdrToDB(draft, true));
+  return db.GetNewsArticleHdr(article, header);
+}
+
+void ExpectBorrowedNewsSet(PerFolderDatabase& db, nsMsgKeySet* expected) {
+  nsMsgKeySet* borrowed = nullptr;
+  ASSERT_EQ(NS_OK, db.GetReadSet(&borrowed));
+  EXPECT_EQ(expected, borrowed);
+}
+
+}  // namespace
+
+TEST_F(DeliveryCompleteHeader, NewsReadSetBorrowedIdentityAndDetach) {
+  RefPtr<PerFolderDatabase> local = new PerFolderDatabase(mFolder, false);
+  nsCOMPtr<nsINewsDatabase> nonNews =
+      do_QueryInterface(static_cast<nsIMsgDatabase*>(local.get()));
+  EXPECT_FALSE(nonNews);
+  // A news facade also requires a persisted Newsgroup folder. The local
+  // interface rejection above runs before changing the ordinary Inbox flags.
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  nsCOMPtr<nsINewsDatabase> news =
+      do_QueryInterface(static_cast<nsIMsgDatabase*>(db.get()));
+  ASSERT_TRUE(news);
+  RefPtr<PerFolderDatabase> concrete = do_QueryObject(news);
+  EXPECT_EQ(db, concrete);
+  RefPtr<nsMsgKeySet> incoming = nsMsgKeySet::Create("5-7");
+  ASSERT_TRUE(incoming);
+  ASSERT_EQ(NS_OK, news->SetReadSet(incoming));
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, incoming));
+  RefPtr<nsMsgKeySet> replacement = nsMsgKeySet::Create("9");
+  ASSERT_TRUE(replacement);
+  ASSERT_EQ(NS_OK, news->SetReadSet(replacement));
+  // An earlier owner's cleanup must leave the replacement binding installed.
+  db->DetachNewsReadSetIfMatches(incoming);
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, replacement));
+  db->DetachNewsReadSetIfMatches(nullptr);
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, replacement));
+  nsCOMPtr<nsIMsgDBHdr> live;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 9, "detached@news.invalid"_ns,
+                                        getter_AddRefs(live)));
+  ASSERT_EQ(NS_OK, live->MarkRead(false));
+  EXPECT_FALSE(replacement->IsMember(9));
+  db->DetachNewsReadSetIfMatches(replacement);
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, nullptr));
+  // Keep the live header after its former borrowed set's owner releases it.
+  replacement = nullptr;
+  ASSERT_EQ(NS_OK, live->MarkRead(true));
+  bool read = false;
+  ASSERT_EQ(NS_OK, live->GetIsRead(&read));
+  EXPECT_TRUE(read);
+  db->DetachNewsReadSetIfMatches(nullptr);
+  db->DetachNewsReadSetIfMatches(nullptr);
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, nullptr));
+  ASSERT_EQ(NS_OK, news->SetReadSet(incoming));
+  ASSERT_EQ(NS_OK, news->SetReadSet(nullptr));
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, nullptr));
+  incoming = nullptr;
+  // Detach has no dependency on the lifetime of the former borrowed object.
+  EXPECT_EQ(NS_OK, news->SetReadSet(nullptr));
+  RefPtr<nsMsgKeySet> closing = nsMsgKeySet::Create("11");
+  ASSERT_TRUE(closing);
+  ASSERT_EQ(NS_OK, news->SetReadSet(closing));
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  // Matching-only cleanup remains infallible and idempotent after force-close.
+  db->DetachNewsReadSetIfMatches(closing);
+  db->DetachNewsReadSetIfMatches(nullptr);
+  db->DetachNewsReadSetIfMatches(nullptr);
+  closing = nullptr;
+  EXPECT_EQ(NS_OK, news->SetReadSet(nullptr));
+  nsMsgKeySet* output = reinterpret_cast<nsMsgKeySet*>(uintptr_t(1));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, news->GetReadSet(&output));
+  EXPECT_EQ(nullptr, output);
+  RefPtr<nsMsgKeySet> passive = nsMsgKeySet::Create("1");
+  ASSERT_TRUE(passive);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->InitializeNewsReadSetFromNewsrc(passive, "1"_ns));
+  EXPECT_TRUE(passive->IsMember(0));
+}
+
+TEST_F(DeliveryCompleteHeader, NewsReadSetColdSyncAndNormalReopen) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  RefPtr<nsMsgKeySet> incoming = nsMsgKeySet::Create();
+  ASSERT_TRUE(incoming);
+  ASSERT_GE(incoming->Add(0), 0);
+  ASSERT_EQ(NS_OK, db->SetReadSet(incoming));
+  nsCOMPtr<nsIMsgDBHdr> zero, other;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 0, "zero@news.invalid"_ns,
+                                        getter_AddRefs(zero)));
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 9, "nine@news.invalid"_ns,
+                                        getter_AddRefs(other)));
+  bool read = false;
+  ASSERT_EQ(NS_OK, zero->GetIsRead(&read));
+  EXPECT_TRUE(read);
+  ASSERT_EQ(NS_OK, other->GetIsRead(&read));
+  EXPECT_FALSE(read);
+  nsMsgKey zeroKey;
+  ASSERT_EQ(NS_OK, zero->GetMessageKey(&zeroKey));
+  EXPECT_NE(0u, zeroKey);
+  NewsGroupIdentity identity;
+  nsCString sourceId;
+  ASSERT_EQ(NS_OK, ReadAdmissionSourceId(sourceId));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetNewsGroupIdentity(sourceId, mFolder,
+                                                           identity));
+  nsCString checkpoint;
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, checkpoint));
+  int64_t zeroMember = -1;
+  ASSERT_EQ(NS_OK, ReadNewsZeroCheckpoint(*db, zeroMember));
+  EXPECT_EQ(1, zeroMember);
+  // Use the fixture's normal application shutdown/async-close and startup.
+  ASSERT_EQ(NS_OK, db->SetReadSet(nullptr));
+  db = nullptr;
+  zero = other = nullptr;
+  ASSERT_TRUE(Stop());
+  mCore = DatabaseCore::GetInstanceForService();
+  ASSERT_EQ(NS_OK, mCore->Startup());
+  db = new PerFolderDatabase(mFolder, true);
+  nsCString reopened;
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, reopened));
+  EXPECT_EQ(checkpoint, reopened);
+  zeroMember = -1;
+  ASSERT_EQ(NS_OK, ReadNewsZeroCheckpoint(*db, zeroMember));
+  EXPECT_EQ(1, zeroMember);
+  RefPtr<nsMsgKeySet> restored = nsMsgKeySet::Create(reopened.get());
+  ASSERT_TRUE(restored);
+  EXPECT_FALSE(restored->IsMember(0));
+  ASSERT_EQ(NS_OK, db->InitializeNewsReadSetFromNewsrc(restored, reopened));
+  EXPECT_TRUE(restored->IsMember(0));
+  NewsGroupIdentity after;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetNewsGroupIdentity(
+                       identity.databaseSourceId, mFolder, after));
+  EXPECT_EQ(identity.incarnation, after.incarnation);
+  ASSERT_EQ(NS_OK, db->GetNewsArticleHdr(0, getter_AddRefs(zero)));
+  nsMsgKey actual;
+  ASSERT_EQ(NS_OK, zero->GetMessageKey(&actual));
+  EXPECT_EQ(zeroKey, actual);
+  ASSERT_EQ(NS_OK, zero->GetIsRead(&read));
+  EXPECT_TRUE(read);
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, restored));
+  // An explicit setter stays authoritative despite identical lossy text.
+  RefPtr<nsMsgKeySet> explicitEmpty = nsMsgKeySet::Create(reopened.get());
+  ASSERT_TRUE(explicitEmpty);
+  ASSERT_EQ(NS_OK, db->SetReadSet(explicitEmpty));
+  ASSERT_EQ(NS_OK, zero->GetIsRead(&read));
+  EXPECT_FALSE(read);
+
+  // Literal article1 with zero unread serializes to 1; its legacy parser
+  // would add zero. Passive initialization must preserve the known false bit.
+  RefPtr<nsMsgKeySet> oneOnly = nsMsgKeySet::Create();
+  ASSERT_TRUE(oneOnly);
+  ASSERT_GE(oneOnly->Add(1), 0);
+  EXPECT_FALSE(oneOnly->IsMember(0));
+  ASSERT_EQ(NS_OK, db->SetReadSet(oneOnly));
+  nsCString oneText;
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, oneText));
+  EXPECT_EQ("1"_ns, oneText);
+  RefPtr<nsMsgKeySet> parsedOne = nsMsgKeySet::Create(oneText.get());
+  ASSERT_TRUE(parsedOne);
+  EXPECT_TRUE(parsedOne->IsMember(0));
+  ASSERT_EQ(NS_OK, db->InitializeNewsReadSetFromNewsrc(parsedOne, oneText));
+  EXPECT_FALSE(parsedOne->IsMember(0));
+
+  // A genuinely changed range expression applies the file's incoming intent.
+  RefPtr<nsMsgKeySet> changed = nsMsgKeySet::Create("0-1");
+  ASSERT_TRUE(changed);
+  ASSERT_EQ(NS_OK, db->InitializeNewsReadSetFromNewsrc(changed, "0-1"_ns));
+  EXPECT_TRUE(changed->IsMember(0));
+  ASSERT_EQ(NS_OK, zero->GetIsRead(&read));
+  EXPECT_TRUE(read);
+  // Preserve the retained parser's historical 1-x zero-membership semantics.
+  RefPtr<nsMsgKeySet> legacy = nsMsgKeySet::Create("1-3");
+  ASSERT_TRUE(legacy);
+  EXPECT_TRUE(legacy->IsMember(0));
+}
+
+TEST_F(DeliveryCompleteHeader, NewsReadSetLiveFlagsAndMarkAllReadKeepSameSet) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create();
+  ASSERT_TRUE(set);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  nsCOMPtr<nsIMsgDBHdr> first, second;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 17, "first@read.invalid"_ns,
+                                        getter_AddRefs(first)));
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 29, "second@read.invalid"_ns,
+                                        getter_AddRefs(second)));
+  // A changed caller-owned set must reconcile even when its pointer is equal.
+  ASSERT_GE(set->Add(17), 0);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  bool read = false;
+  ASSERT_EQ(NS_OK, first->GetIsRead(&read));
+  EXPECT_TRUE(read);
+  ASSERT_GE(set->Remove(17), 0);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  ASSERT_EQ(NS_OK, first->GetIsRead(&read));
+  EXPECT_FALSE(read);
+  ASSERT_EQ(NS_OK, first->SetFlags(nsMsgMessageFlags::Marked |
+                                   nsMsgMessageFlags::Read));
+  EXPECT_TRUE(set->IsMember(17));
+  uint32_t result;
+  ASSERT_EQ(NS_OK, first->AndFlags(~nsMsgMessageFlags::Read, &result));
+  EXPECT_FALSE(set->IsMember(17));
+  ASSERT_EQ(NS_OK, first->OrFlags(nsMsgMessageFlags::Read, &result));
+  EXPECT_TRUE(set->IsMember(17));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, first->GetMessageKey(&key));
+  ASSERT_EQ(NS_OK, db->MarkRead(key, false, nullptr));
+  EXPECT_FALSE(set->IsMember(17));
+  nsTArray<nsMsgKey> marked;
+  ASSERT_EQ(NS_OK, db->MarkAllRead(marked));
+  EXPECT_EQ(2u, marked.Length());
+  EXPECT_TRUE(set->IsMember(17));
+  EXPECT_TRUE(set->IsMember(29));
+  ASSERT_EQ(NS_OK, first->GetFlags(&result));
+  EXPECT_TRUE(result & nsMsgMessageFlags::Marked);
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, set));
+}
+
+TEST_F(DeliveryCompleteHeader,
+       NewsReadSetFailuresKeepPointerRowsCheckpointAndEvents) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  RefPtr<nsMsgKeySet> previous = nsMsgKeySet::Create();
+  RefPtr<nsMsgKeySet> proposed = nsMsgKeySet::Create("17");
+  ASSERT_TRUE(previous && proposed);
+  ASSERT_EQ(NS_OK, db->SetReadSet(previous));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 17, "failure@read.invalid"_ns,
+                                        getter_AddRefs(header)));
+  RefPtr<DeliveryNewsReadListener> listener = new DeliveryNewsReadListener();
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, db->RemoveListener(listener));
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_news_insert"_ns));
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_news_update"_ns));
+  });
+  nsCString before;
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, before));
+  // A normal successful write cannot exercise transaction rollback. Only this
+  // critical failure body injects SQLite errors; ordinary cleanup removes them.
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_news_insert BEFORE INSERT ON "
+          "folder_properties "
+          "WHEN NEW.name='readSet' BEGIN SELECT RAISE(ABORT,'news checkpoint'); END"_ns));
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_news_update BEFORE UPDATE ON "
+          "folder_properties "
+          "WHEN NEW.name='readSet' BEGIN SELECT RAISE(ABORT,'news checkpoint'); END"_ns));
+  EXPECT_TRUE(NS_FAILED(db->SetReadSet(proposed)));
+  RefPtr<nsMsgKeySet> passive = nsMsgKeySet::Create();
+  ASSERT_TRUE(passive);
+  ASSERT_GE(passive->Add(0), 0);
+  EXPECT_TRUE(NS_FAILED(db->InitializeNewsReadSetFromNewsrc(passive, before)));
+  // Even restoration of a known false bit stays on Core's prepared clone
+  // until commit: the caller's proposed zero-only set survives failure.
+  EXPECT_TRUE(passive->IsMember(0));
+  EXPECT_FALSE(previous->IsMember(0));
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, previous));
+  EXPECT_FALSE(previous->IsMember(17));
+  EXPECT_TRUE(proposed->IsMember(17));
+  EXPECT_TRUE(NS_FAILED(header->MarkRead(true)));
+  bool read = true;
+  ASSERT_EQ(NS_OK, header->GetIsRead(&read));
+  EXPECT_FALSE(read);
+  nsCString after;
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, after));
+  EXPECT_EQ(before, after);
+  EXPECT_EQ(0u, listener->flags);
+  EXPECT_EQ(0u, listener->reads);
+  bool inTransaction = true;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&inTransaction));
+  EXPECT_FALSE(inTransaction);
+}
+
+TEST_F(DeliveryCompleteHeader,
+       NewsReadSetSourceGroupAndSignedArticleAdmission) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  RefPtr<nsMsgKeySet> firstSet = nsMsgKeySet::Create();
+  ASSERT_TRUE(firstSet);
+  ASSERT_EQ(NS_OK, db->SetReadSet(firstSet));
+  uint64_t otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "OtherGroup"_ns,
+                                                  &otherFolder));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(otherFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> other = new PerFolderDatabase(otherFolder, true);
+  RefPtr<nsMsgKeySet> otherSet = nsMsgKeySet::Create();
+  ASSERT_TRUE(otherSet);
+  ASSERT_EQ(NS_OK, other->SetReadSet(otherSet));
+  nsCOMPtr<nsIMsgDBHdr> first, second;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 0, "zero@first.invalid"_ns,
+                                        getter_AddRefs(first)));
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*other, 0, "zero@other.invalid"_ns,
+                                        getter_AddRefs(second)));
+  nsMsgKey firstKey, otherKey;
+  ASSERT_EQ(NS_OK, first->GetMessageKey(&firstKey));
+  ASSERT_EQ(NS_OK, second->GetMessageKey(&otherKey));
+  EXPECT_NE(firstKey, otherKey);
+  nsCOMPtr<nsIMsgDBHdr> absent, boundary;
+  ASSERT_EQ(NS_OK, db->CreateNewHdr(getter_AddRefs(absent)));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db->AddNewHdrToDB(absent, true));
+  ASSERT_EQ(NS_OK, db->CreateNewHdrWithSpecificMsgKey(
+                       INT32_MAX, getter_AddRefs(boundary)));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, other->AddNewHdrToDB(boundary, true));
+  EXPECT_EQ(NS_OK, boundary->SetSubject("not consumed by foreign group"_ns));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->CreateNewHdrWithSpecificMsgKey(uint32_t(INT32_MAX) + 1,
+                                               getter_AddRefs(absent)));
+  EXPECT_FALSE(absent);
+  nsMsgKey sentinel = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            db->GetNewsArticleKey(uint32_t(INT32_MAX) + 1, sentinel));
+  EXPECT_EQ(nsMsgKey_None, sentinel);
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  auto rollback = MakeScopeExit(
+      [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+  EXPECT_TRUE(NS_FAILED(db->SetReadSet(firstSet)));
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            db->InitializeNewsReadSetFromNewsrc(firstSet, EmptyCString()));
+  EXPECT_FALSE(firstSet->IsMember(0));
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "UPDATE database_identity SET sourceId="
+                       "'{7a139b24-9c50-47fa-8322-168da90748c0}'"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->CreateNewHdrWithSpecificMsgKey(1, getter_AddRefs(absent)));
+  EXPECT_FALSE(absent);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->GetNewsArticleKey(0, sentinel));
+  EXPECT_EQ(nsMsgKey_None, sentinel);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->InitializeNewsReadSetFromNewsrc(firstSet, EmptyCString()));
+  EXPECT_FALSE(firstSet->IsMember(0));
+  bool inTransaction = false;
+  ASSERT_EQ(NS_OK, Connection()->GetTransactionInProgress(&inTransaction));
+  EXPECT_TRUE(inTransaction);
+}
+
+TEST_F(DeliveryCompleteHeader, NewsReadSetReplacementAndListenerPublication) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  RefPtr<nsMsgKeySet> first = nsMsgKeySet::Create();
+  RefPtr<nsMsgKeySet> replacement = nsMsgKeySet::Create("17");
+  ASSERT_TRUE(first && replacement);
+  ASSERT_EQ(NS_OK, db->SetReadSet(first));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 17, "replacement@news.invalid"_ns,
+                                        getter_AddRefs(header)));
+  RefPtr<DeliveryNewsReadListener> listener = new DeliveryNewsReadListener();
+  listener->observe = [&](char) {
+    ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, replacement));
+    EXPECT_TRUE(replacement->IsMember(17));
+    bool read = false;
+    ASSERT_EQ(NS_OK, header->GetIsRead(&read));
+    EXPECT_TRUE(read);
+    nsCString checkpoint;
+    ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, checkpoint));
+    RefPtr<nsMsgKeySet> committed = nsMsgKeySet::Create(checkpoint.get());
+    ASSERT_TRUE(committed);
+    EXPECT_TRUE(committed->IsMember(17));
+  };
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto cleanup =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  ASSERT_EQ(NS_OK, db->SetReadSet(replacement));
+  EXPECT_EQ(1u, listener->flags);
+  EXPECT_EQ(1u, listener->reads);
+  EXPECT_FALSE(first->IsMember(17));
+  listener->observe = nullptr;
+  // A different facade's successful installation supersedes only Core's
+  // concrete binding. Detaching the old owner cannot remove the replacement.
+  RefPtr<PerFolderDatabase> next = new PerFolderDatabase(mFolder, true);
+  ASSERT_EQ(NS_OK, next->SetReadSet(replacement));
+  ASSERT_EQ(NS_OK, db->SetReadSet(nullptr));
+  ASSERT_EQ(NS_OK, header->MarkRead(false));
+  EXPECT_FALSE(replacement->IsMember(17));
+  ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*next, replacement));
+}
+
+TEST_F(DeliveryCompleteHeader, NewsDraftArticleIdentityAndPublication) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  RefPtr<nsMsgKeySet> incoming = nsMsgKeySet::Create();
+  ASSERT_TRUE(incoming);
+  ASSERT_GE(incoming->Add(0), 0);
+  ASSERT_EQ(NS_OK, db->SetReadSet(incoming));
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  ASSERT_EQ(NS_OK,
+            db->CreateNewHdrWithSpecificMsgKey(0, getter_AddRefs(draft)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, draft->GetMessageKey(&key));
+  EXPECT_EQ(nsMsgKey_None, key);
+  ASSERT_EQ(NS_OK, draft->SetMessageId("draft-zero@news.invalid"_ns));
+  ASSERT_EQ(NS_OK, draft->SetStringProperty("literal", EmptyCString()));
+  ASSERT_EQ(NS_OK, draft->MarkFlagged(true));
+  ASSERT_EQ(NS_OK, draft->MarkRead(false));
+  ASSERT_EQ(NS_OK,
+            draft->SetReferences(
+                "<one@news.invalid> <two@news.invalid> <one@news.invalid>"_ns));
+  nsCOMPtr<nsIMsgDBHdr> duplicate, live;
+  ASSERT_EQ(NS_OK,
+            db->CreateNewHdrWithSpecificMsgKey(0, getter_AddRefs(duplicate)));
+  ASSERT_EQ(NS_OK, duplicate->SetMessageId("raced-zero@news.invalid"_ns));
+  ASSERT_EQ(NS_OK, duplicate->MarkRead(true));
+  nsCOMPtr<nsIMsgDBHdr> publishingDraft = draft;
+  uint32_t publishingArticle = 0;
+  bool expectedRead = false;
+  RefPtr<DeliveryNewsReadListener> listener = new DeliveryNewsReadListener();
+  listener->observe = [&](char kind) {
+    if (kind != 'A') return;
+    // Core must install the existing public owning output before callbacks;
+    // the parser draft itself remains a sealed keyless metadata object.
+    ASSERT_TRUE(live);
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              publishingDraft->SetSubject("reentrant edit"_ns));
+    nsCOMPtr<nsIMsgDBHdr> published;
+    ASSERT_EQ(NS_OK, db->GetNewsArticleHdr(publishingArticle,
+                                           getter_AddRefs(published)));
+    bool read = false;
+    ASSERT_EQ(NS_OK, published->GetIsRead(&read));
+    EXPECT_EQ(expectedRead, read);
+    EXPECT_EQ(expectedRead, incoming->IsMember(publishingArticle));
+    ASSERT_NO_FATAL_FAILURE(ExpectBorrowedNewsSet(*db, incoming));
+  };
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto cleanup =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  ASSERT_EQ(NS_OK, db->AttachHdr(draft, true, getter_AddRefs(live)));
+  EXPECT_EQ(1u, listener->added);
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED, draft->SetSubject("sealed"_ns));
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED, draft->MarkRead(true));
+  EXPECT_FALSE(incoming->IsMember(0));
+  ASSERT_EQ(NS_OK, db->AddNewHdrToDB(draft, true));
+  EXPECT_EQ(1u, listener->added);
+  ASSERT_EQ(NS_OK, db->AttachHdr(draft, true, getter_AddRefs(live)));
+  ASSERT_TRUE(live);
+  ASSERT_EQ(NS_OK, live->GetMessageKey(&key));
+  EXPECT_NE(0u, key);
+  uint16_t count;
+  ASSERT_EQ(NS_OK, live->GetNumReferences(&count));
+  EXPECT_EQ(3u, count);
+  nsCString token;
+  ASSERT_EQ(NS_OK, live->GetStringReference(2, token));
+  EXPECT_EQ("one@news.invalid"_ns, token);
+  nsTArray<nsCString> properties;
+  ASSERT_EQ(NS_OK, live->GetProperties(properties));
+  EXPECT_TRUE(properties.Contains("literal"_ns));
+  nsCOMPtr<nsIMsgDBHdr> raced;
+  ASSERT_EQ(NS_OK, db->AttachHdr(duplicate, true, getter_AddRefs(raced)));
+  nsMsgKey racedKey;
+  ASSERT_EQ(NS_OK, raced->GetMessageKey(&racedKey));
+  EXPECT_EQ(key, racedKey);
+  EXPECT_EQ(1u, listener->added);
+  bool racedRead = true;
+  ASSERT_EQ(NS_OK, raced->GetIsRead(&racedRead));
+  EXPECT_FALSE(racedRead);  // A dedup race never refilters an existing row.
+  nsCOMPtr<nsIMsgDBHdr> existing;
+  ASSERT_EQ(NS_OK,
+            db->CreateNewHdrWithSpecificMsgKey(0, getter_AddRefs(existing)));
+  bool isLive = false;
+  ASSERT_EQ(NS_OK, existing->GetIsLive(&isLive));
+  EXPECT_TRUE(isLive);
+  ASSERT_EQ(NS_OK, existing->GetMessageKey(&racedKey));
+  EXPECT_EQ(key, racedKey);
+
+  nsCOMPtr<nsIMsgDBHdr> marked;
+  ASSERT_EQ(NS_OK,
+            db->CreateNewHdrWithSpecificMsgKey(23, getter_AddRefs(marked)));
+  ASSERT_EQ(NS_OK, marked->SetMessageId("read-intent@news.invalid"_ns));
+  ASSERT_EQ(NS_OK, marked->MarkFlagged(true));
+  ASSERT_EQ(NS_OK, marked->MarkRead(true));
+  publishingDraft = marked;
+  publishingArticle = 23;
+  expectedRead = true;
+  ASSERT_EQ(NS_OK, db->AttachHdr(marked, true, getter_AddRefs(live)));
+  EXPECT_EQ(2u, listener->added);
+  EXPECT_TRUE(incoming->IsMember(23));
+  uint32_t flags;
+  ASSERT_EQ(NS_OK, live->GetFlags(&flags));
+  EXPECT_TRUE(flags & nsMsgMessageFlags::Read);
+  EXPECT_TRUE(flags & nsMsgMessageFlags::Marked);
+
+  nsCOMPtr<nsIMsgDBHdr> failed;
+  ASSERT_EQ(NS_OK,
+            db->CreateNewHdrWithSpecificMsgKey(19, getter_AddRefs(failed)));
+  ASSERT_EQ(NS_OK, failed->SetMessageId("failed@news.invalid"_ns));
+  ASSERT_EQ(NS_OK, failed->MarkRead(true));
+  EXPECT_FALSE(incoming->IsMember(19));
+  auto removeFault = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_news_publication"_ns));
+  });
+  // Normal publication cannot exercise the first-error/output rollback cut.
+  // This bounded injected error retains normal fixture/trigger cleanup.
+  ASSERT_EQ(
+      NS_OK,
+      Connection()->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER fail_news_publication BEFORE INSERT ON messages "
+          "WHEN NEW.messageId='failed@news.invalid' "
+          "BEGIN SELECT RAISE(ABORT,'news publication'); END"_ns));
+  nsCOMPtr<nsIMsgDBHdr> output = live;
+  nsresult firstError = db->AttachHdr(failed, true, getter_AddRefs(output));
+  ASSERT_TRUE(NS_FAILED(firstError));
+  EXPECT_FALSE(output);
+  EXPECT_EQ(firstError, failed->SetSubject("first error retained"_ns));
+  EXPECT_EQ(firstError, failed->MarkRead(false));
+  EXPECT_FALSE(incoming->IsMember(19));
+  EXPECT_EQ(firstError, db->AddNewHdrToDB(failed, true));
+  EXPECT_EQ(2u, listener->added);
+  nsMsgKey missing = nsMsgKey_None;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->GetNewsArticleKey(19, missing));
+  EXPECT_EQ(nsMsgKey_None, missing);
 }
 
 TEST_F(DeliveryCompleteHeader, OfflineProtocolDeltaSurvivesNormalReopen) {

@@ -29,6 +29,7 @@
 #include "nsDirectoryServiceUtils.h"
 #include "nsIEventTarget.h"
 #include "nsIDBChangeListener.h"
+#include "nsIDBFolderInfo.h"
 #include "nsIFile.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgHdr.h"
@@ -167,6 +168,26 @@ class DeliveryMessageReferences : public testing::Test {
 
   static mozIStorageConnection* Connection() {
     return DatabaseCore::sConnection.get();
+  }
+
+  // TEST_F bodies derive from this fixture; Core friendship stays here.
+  nsresult ReadAdmissionSourceId(nsACString& output) {
+    return mCore->ReadSourceIdForFolderAdmission(output);
+  }
+
+  static nsresult ReadNewsCheckpoint(PerFolderDatabase& database,
+                                     nsACString& output) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(database.GetDBFolderInfo(getter_AddRefs(info)));
+    return info->GetCharProperty("readSet", output);
+  }
+
+  static nsresult ReadNewsZeroCheckpoint(PerFolderDatabase& database,
+                                         int64_t& output) {
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(database.GetDBFolderInfo(getter_AddRefs(info)));
+    // Keep the caller's sentinel when the stored zero checkpoint is absent.
+    return info->GetInt64Property("readSetContainsZero", output, &output);
   }
 
   bool Stop() {
@@ -4077,15 +4098,13 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetColdSyncAndNormalReopen) {
   EXPECT_NE(0u, zeroKey);
   NewsGroupIdentity identity;
   nsCString sourceId;
-  ASSERT_EQ(NS_OK, mCore->ReadSourceIdForFolderAdmission(sourceId));
+  ASSERT_EQ(NS_OK, ReadAdmissionSourceId(sourceId));
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetNewsGroupIdentity(sourceId, mFolder,
                                                            identity));
   nsCString checkpoint;
-  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderProperty(mFolder, "readSet"_ns,
-                                                       checkpoint));
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, checkpoint));
   int64_t zeroMember = -1;
-  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderProperty(
-                       mFolder, "readSetContainsZero"_ns, &zeroMember));
+  ASSERT_EQ(NS_OK, ReadNewsZeroCheckpoint(*db, zeroMember));
   EXPECT_EQ(1, zeroMember);
   // Use the fixture's normal application shutdown/async-close and startup.
   ASSERT_EQ(NS_OK, db->SetReadSet(nullptr));
@@ -4096,12 +4115,10 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetColdSyncAndNormalReopen) {
   ASSERT_EQ(NS_OK, mCore->Startup());
   db = new PerFolderDatabase(mFolder, true);
   nsCString reopened;
-  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderProperty(mFolder, "readSet"_ns,
-                                                       reopened));
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, reopened));
   EXPECT_EQ(checkpoint, reopened);
   zeroMember = -1;
-  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderProperty(
-                       mFolder, "readSetContainsZero"_ns, &zeroMember));
+  ASSERT_EQ(NS_OK, ReadNewsZeroCheckpoint(*db, zeroMember));
   EXPECT_EQ(1, zeroMember);
   RefPtr<nsMsgKeySet> restored = nsMsgKeySet::Create(reopened.get());
   ASSERT_TRUE(restored);
@@ -4134,8 +4151,7 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetColdSyncAndNormalReopen) {
   EXPECT_FALSE(oneOnly->IsMember(0));
   ASSERT_EQ(NS_OK, db->SetReadSet(oneOnly));
   nsCString oneText;
-  ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderProperty(mFolder, "readSet"_ns,
-                                                       oneText));
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, oneText));
   EXPECT_EQ("1"_ns, oneText);
   RefPtr<nsMsgKeySet> parsedOne = nsMsgKeySet::Create(oneText.get());
   ASSERT_TRUE(parsedOne);
@@ -4218,8 +4234,7 @@ TEST_F(DeliveryCompleteHeader,
                          "DROP TRIGGER IF EXISTS fail_news_update"_ns));
   });
   nsCString before;
-  ASSERT_EQ(NS_OK,
-            mCore->FolderDB().GetFolderProperty(mFolder, "readSet"_ns, before));
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, before));
   // A normal successful write cannot exercise transaction rollback. Only this
   // critical failure body injects SQLite errors; ordinary cleanup removes them.
   ASSERT_EQ(
@@ -4251,8 +4266,7 @@ TEST_F(DeliveryCompleteHeader,
   ASSERT_EQ(NS_OK, header->GetIsRead(&read));
   EXPECT_FALSE(read);
   nsCString after;
-  ASSERT_EQ(NS_OK,
-            mCore->FolderDB().GetFolderProperty(mFolder, "readSet"_ns, after));
+  ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, after));
   EXPECT_EQ(before, after);
   EXPECT_EQ(0u, listener->flags);
   EXPECT_EQ(0u, listener->reads);
@@ -4338,8 +4352,7 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetReplacementAndListenerPublication) {
     ASSERT_EQ(NS_OK, header->GetIsRead(&read));
     EXPECT_TRUE(read);
     nsCString checkpoint;
-    ASSERT_EQ(NS_OK, mCore->FolderDB().GetFolderProperty(mFolder, "readSet"_ns,
-                                                         checkpoint));
+    ASSERT_EQ(NS_OK, ReadNewsCheckpoint(*db, checkpoint));
     RefPtr<nsMsgKeySet> committed = nsMsgKeySet::Create(checkpoint.get());
     ASSERT_TRUE(committed);
     EXPECT_TRUE(committed->IsMember(17));

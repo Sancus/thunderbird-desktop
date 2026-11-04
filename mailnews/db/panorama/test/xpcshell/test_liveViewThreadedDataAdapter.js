@@ -1855,60 +1855,85 @@ add_task(async function test_publicNewThreadedUsesDisplayedMembers() {
   view.initWithFolder(folderId);
   const adapter = new LiveViewThreadedDataAdapter(view);
   adapter.setTree(statusTree);
-  registerCleanupFunction(() => adapter.setTree(null));
-  await adapter.sortBy("date", "descending");
-  rowChanges.length = 0;
+  try {
+    await adapter.sortBy("date", "descending");
+    rowChanges.length = 0;
 
-  Assert.equal(adapter.rowCount, 1, "The selected real members form one group");
-  const group = adapter.rowAt(0);
-  Assert.equal(group.rowCount, 2);
-  Assert.equal(
-    group.newCount,
-    2,
-    "The initial count includes raw and facade New"
-  );
-  Assert.equal(group.unreadCount, 2);
-  db.markRead(root.messageKey, true, null);
-  Assert.equal(
-    group.newCount,
-    1,
-    "Only the actual displayed New contribution is removed"
-  );
-  Assert.equal(group.unreadCount, 1);
-  db.addToNewList(root.messageKey);
-  Assert.ok(
-    root.flags & Ci.nsMsgMessageFlags.New,
-    "The accepted silent AddToNewList really changes public header state"
-  );
-  Assert.equal(
-    group.newCount,
-    1,
-    "No invented callback updates a silent addition"
-  );
-  db.markRead(root.messageKey, false, null);
-  Assert.equal(
-    group.newCount,
-    1,
-    "A frozen old public New word does not subtract from a displayed zero contribution"
-  );
-  Assert.equal(group.unreadCount, 2);
-  reply.flags = Ci.nsMsgMessageFlags.Marked;
-  Assert.equal(
-    group.newCount,
-    0,
-    "Raw/public delivery does not remove the same member twice"
-  );
-  Assert.equal(group.unreadCount, 2);
-  Assert.equal(group.rowCount, 2);
-  Assert.ok(!adapter.getRowProperties(0).split(" ").includes("hasNew"));
+    Assert.equal(
+      adapter.rowCount,
+      1,
+      "The selected real members form one group"
+    );
+    const group = adapter.rowAt(0);
+    Assert.equal(
+      group.thread.messageCount,
+      2,
+      "The real thread has both physical members"
+    );
+    Assert.equal(group.rowCount, 1, "The root owns one physical child");
+    Assert.equal(
+      group.newCount,
+      2,
+      "The initial count includes raw and facade New"
+    );
+    Assert.equal(group.unreadCount, 2);
+    db.markRead(root.messageKey, true, null);
+    Assert.equal(
+      group.newCount,
+      1,
+      "Only the actual displayed New contribution is removed"
+    );
+    Assert.equal(group.unreadCount, 1);
+    db.addToNewList(root.messageKey);
+    Assert.ok(
+      root.flags & Ci.nsMsgMessageFlags.New,
+      "The accepted silent AddToNewList really changes public header state"
+    );
+    Assert.equal(
+      group.newCount,
+      1,
+      "No invented callback updates a silent addition"
+    );
+    db.markRead(root.messageKey, false, null);
+    Assert.equal(
+      group.newCount,
+      1,
+      "A frozen old public New word does not subtract from a displayed zero contribution"
+    );
+    Assert.equal(group.unreadCount, 2);
+    reply.flags = Ci.nsMsgMessageFlags.Marked;
+    Assert.equal(
+      group.newCount,
+      0,
+      "Raw/public delivery does not remove the same member twice"
+    );
+    Assert.equal(group.unreadCount, 2);
+    Assert.equal(
+      group.thread.messageCount,
+      2,
+      "The real thread has both physical members"
+    );
+    Assert.equal(group.rowCount, 1, "The root owns one physical child");
+    Assert.ok(!adapter.getRowProperties(0).split(" ").includes("hasNew"));
 
-  Assert.deepEqual(rowChanges, [], "Flag changes preserve physical membership");
-  Assert.deepEqual(
-    copies.msgHdrList.map(header => header.flags),
-    otherBefore,
-    "The outside equal-ID physical copies are unchanged"
-  );
-  adapter.setTree(null);
-  db.markRead(root.messageKey, true, null);
-  Assert.deepEqual(rowChanges, [], "Detached observers do not reach the tree");
+    Assert.deepEqual(
+      rowChanges,
+      [],
+      "Flag changes preserve physical membership"
+    );
+    Assert.deepEqual(
+      copies.msgHdrList.map(header => header.flags),
+      otherBefore,
+      "The outside equal-ID physical copies are unchanged"
+    );
+    adapter.setTree(null);
+    db.markRead(root.messageKey, true, null);
+    Assert.deepEqual(
+      rowChanges,
+      [],
+      "Detached observers do not reach the tree"
+    );
+  } finally {
+    adapter.setTree(null);
+  }
 });

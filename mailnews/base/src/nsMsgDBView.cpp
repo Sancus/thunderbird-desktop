@@ -3624,8 +3624,9 @@ NS_IMETHODIMP nsMsgDBView::Sort(nsMsgViewSortTypeValue sortType,
         info->folder = folders ? folders->ObjectAt(i) : m_folder.get();
         nsCOMPtr<nsIMsgDBHdr> msgHdr;
         rv = GetMsgHdrForViewIndex(i, getter_AddRefs(msgHdr));
-        NS_ASSERTION(NS_SUCCEEDED(rv) && msgHdr, "header not found");
         NS_ENSURE_SUCCESS(rv, rv);
+        NS_ASSERTION(msgHdr, "successful header lookup returned no header");
+        NS_ENSURE_TRUE(msgHdr, NS_MSG_MESSAGE_NOT_FOUND);
         rv = GetCollationKey(msgHdr, sortType, info->key, colHandler);
         NS_ENSURE_SUCCESS(rv, rv);
       }
@@ -3664,8 +3665,9 @@ NS_IMETHODIMP nsMsgDBView::Sort(nsMsgViewSortTypeValue sortType,
         } else {
           nsCOMPtr<nsIMsgDBHdr> msgHdr;
           rv = GetMsgHdrForViewIndex(i, getter_AddRefs(msgHdr));
-          NS_ASSERTION(NS_SUCCEEDED(rv) && msgHdr, "header not found");
           NS_ENSURE_SUCCESS(rv, rv);
+          NS_ASSERTION(msgHdr, "successful header lookup returned no header");
+          NS_ENSURE_TRUE(msgHdr, NS_MSG_MESSAGE_NOT_FOUND);
           rv = GetLongField(msgHdr, sortType, &info->dword, colHandler);
           NS_ENSURE_SUCCESS(rv, rv);
         }
@@ -5747,11 +5749,13 @@ nsresult nsMsgDBView::SetThreadIgnored(nsIMsgThread* thread,
   NS_ENSURE_SUCCESS(rv, rv);
   threadIndex = FindKey(key, true);
   if (IsValidIndex(threadIndex)) {
+    // Preserve the successful notification/collapse order, after the write
+    // has actually succeeded.
+    NoteChange(threadIndex, 1, nsMsgViewNotificationCode::changed);
     if (ignored) {
       rv = CollapseByIndex(threadIndex, nullptr);
       NS_ENSURE_SUCCESS(rv, rv);
     }
-    NoteChange(threadIndex, 1, nsMsgViewNotificationCode::changed);
   }
   return NS_OK;
 }

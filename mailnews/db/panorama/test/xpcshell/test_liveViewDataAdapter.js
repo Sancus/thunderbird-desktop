@@ -2184,49 +2184,60 @@ add_task(async function test_publicNewFlatUsesDisplayedState() {
   view.initWithFolder(folderId);
   const adapter = new LiveViewDataAdapter(view);
   adapter.setTree(statusTree);
-  registerCleanupFunction(() => adapter.setTree(null));
-  await adapter.sortBy("date", "descending");
-  rowChanges.length = 0;
+  try {
+    await adapter.sortBy("date", "descending");
+    rowChanges.length = 0;
 
-  Assert.equal(adapter.rowCount, 2);
-  Assert.deepEqual(
-    listMessages(adapter)
-      .slice()
-      .sort((a, b) => a - b),
-    [root.messageKey, reply.messageKey].sort((a, b) => a - b)
-  );
-  let row = adapter._rowMap.find(item => item.message.id == root.messageKey);
-  Assert.equal(row.message.folderId, folderId);
-  Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.New);
-  db.markRead(root.messageKey, true, null);
-  row = adapter._rowMap.find(item => item.message.id == root.messageKey);
-  Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.Read);
-  db.addToNewList(root.messageKey);
-  Assert.equal(
-    row.message.flags,
-    Ci.nsMsgMessageFlags.Read,
-    "A silent addition does not fabricate a row callback"
-  );
-  db.markRead(root.messageKey, false, null);
-  row = adapter._rowMap.find(item => item.message.id == root.messageKey);
-  Assert.equal(row.message.flags, 0);
-  reply.flags = Ci.nsMsgMessageFlags.Marked;
-  row = adapter._rowMap.find(item => item.message.id == reply.messageKey);
-  Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.Marked);
-  Assert.deepEqual(
-    listMessages(adapter)
-      .slice()
-      .sort((a, b) => a - b),
-    [root.messageKey, reply.messageKey].sort((a, b) => a - b)
-  );
+    Assert.equal(adapter.rowCount, 2);
+    Assert.deepEqual(
+      listMessages(adapter)
+        .slice()
+        .sort((a, b) => a - b),
+      [root.messageKey, reply.messageKey].sort((a, b) => a - b)
+    );
+    let row = adapter._rowMap.find(item => item.message.id == root.messageKey);
+    Assert.equal(row.message.folderId, folderId);
+    Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.New);
+    db.markRead(root.messageKey, true, null);
+    row = adapter._rowMap.find(item => item.message.id == root.messageKey);
+    Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.Read);
+    db.addToNewList(root.messageKey);
+    Assert.equal(
+      row.message.flags,
+      Ci.nsMsgMessageFlags.Read,
+      "A silent addition does not fabricate a row callback"
+    );
+    db.markRead(root.messageKey, false, null);
+    row = adapter._rowMap.find(item => item.message.id == root.messageKey);
+    Assert.equal(row.message.flags, 0);
+    reply.flags = Ci.nsMsgMessageFlags.Marked;
+    row = adapter._rowMap.find(item => item.message.id == reply.messageKey);
+    Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.Marked);
+    Assert.deepEqual(
+      listMessages(adapter)
+        .slice()
+        .sort((a, b) => a - b),
+      [root.messageKey, reply.messageKey].sort((a, b) => a - b)
+    );
 
-  Assert.deepEqual(rowChanges, [], "Flag changes preserve physical membership");
-  Assert.deepEqual(
-    copies.msgHdrList.map(header => header.flags),
-    otherBefore,
-    "The outside equal-ID physical copies are unchanged"
-  );
-  adapter.setTree(null);
-  db.markRead(root.messageKey, true, null);
-  Assert.deepEqual(rowChanges, [], "Detached observers do not reach the tree");
+    Assert.deepEqual(
+      rowChanges,
+      [],
+      "Flag changes preserve physical membership"
+    );
+    Assert.deepEqual(
+      copies.msgHdrList.map(header => header.flags),
+      otherBefore,
+      "The outside equal-ID physical copies are unchanged"
+    );
+    adapter.setTree(null);
+    db.markRead(root.messageKey, true, null);
+    Assert.deepEqual(
+      rowChanges,
+      [],
+      "Detached observers do not reach the tree"
+    );
+  } finally {
+    adapter.setTree(null);
+  }
 });

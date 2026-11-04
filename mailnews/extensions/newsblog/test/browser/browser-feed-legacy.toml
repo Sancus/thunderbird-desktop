@@ -1,4 +1,5 @@
 [DEFAULT]
+dupe-manifest = true
 prefs = [
   "mail.panorama.enabled=false",
   "mail.serverDefaultStoreContractID=@mozilla.org/msgstore/berkeleystore;1",

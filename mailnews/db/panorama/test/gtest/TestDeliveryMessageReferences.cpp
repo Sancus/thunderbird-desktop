@@ -35,6 +35,7 @@
 #include "nsIMsgHdr.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
 #include "nsQueryObject.h"
 #include "nsServiceManagerUtils.h"
@@ -4017,6 +4018,10 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetBorrowedIdentityAndDetach) {
   nsCOMPtr<nsINewsDatabase> nonNews =
       do_QueryInterface(static_cast<nsIMsgDatabase*>(local.get()));
   EXPECT_FALSE(nonNews);
+  // A news facade also requires a persisted Newsgroup folder. The local
+  // interface rejection above runs before changing the ordinary Inbox flags.
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
   nsCOMPtr<nsINewsDatabase> news =
       do_QueryInterface(static_cast<nsIMsgDatabase*>(db.get()));
@@ -4078,6 +4083,8 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetBorrowedIdentityAndDetach) {
 }
 
 TEST_F(DeliveryCompleteHeader, NewsReadSetColdSyncAndNormalReopen) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
   RefPtr<nsMsgKeySet> incoming = nsMsgKeySet::Create();
   ASSERT_TRUE(incoming);
@@ -4173,6 +4180,8 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetColdSyncAndNormalReopen) {
 }
 
 TEST_F(DeliveryCompleteHeader, NewsReadSetLiveFlagsAndMarkAllReadKeepSameSet) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
   RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create();
   ASSERT_TRUE(set);
@@ -4216,6 +4225,8 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetLiveFlagsAndMarkAllReadKeepSameSet) {
 
 TEST_F(DeliveryCompleteHeader,
        NewsReadSetFailuresKeepPointerRowsCheckpointAndEvents) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
   RefPtr<nsMsgKeySet> previous = nsMsgKeySet::Create();
   RefPtr<nsMsgKeySet> proposed = nsMsgKeySet::Create("17");
@@ -4277,6 +4288,8 @@ TEST_F(DeliveryCompleteHeader,
 
 TEST_F(DeliveryCompleteHeader,
        NewsReadSetSourceGroupAndSignedArticleAdmission) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
   RefPtr<nsMsgKeySet> firstSet = nsMsgKeySet::Create();
   ASSERT_TRUE(firstSet);
@@ -4284,6 +4297,8 @@ TEST_F(DeliveryCompleteHeader,
   uint64_t otherFolder;
   ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "OtherGroup"_ns,
                                                   &otherFolder));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(otherFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> other = new PerFolderDatabase(otherFolder, true);
   RefPtr<nsMsgKeySet> otherSet = nsMsgKeySet::Create();
   ASSERT_TRUE(otherSet);
@@ -4336,6 +4351,8 @@ TEST_F(DeliveryCompleteHeader,
 }
 
 TEST_F(DeliveryCompleteHeader, NewsReadSetReplacementAndListenerPublication) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
   RefPtr<nsMsgKeySet> first = nsMsgKeySet::Create();
   RefPtr<nsMsgKeySet> replacement = nsMsgKeySet::Create("17");
@@ -4376,6 +4393,8 @@ TEST_F(DeliveryCompleteHeader, NewsReadSetReplacementAndListenerPublication) {
 }
 
 TEST_F(DeliveryCompleteHeader, NewsDraftArticleIdentityAndPublication) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
   RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
   RefPtr<nsMsgKeySet> incoming = nsMsgKeySet::Create();
   ASSERT_TRUE(incoming);

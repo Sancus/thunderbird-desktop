@@ -61,7 +61,7 @@ async function createAccount(type = "none", options = {}) {
 
   const account = MailServices.accounts.createAccount();
   account.incomingServer = MailServices.accounts.createIncomingServer(
-    `${account.key}user`,
+    ["imap", "ews"].includes(type) ? "user" : `${account.key}user`,
     "localhost",
     type
   );
@@ -75,7 +75,6 @@ async function createAccount(type = "none", options = {}) {
     const imapServer = new IMAPServer(options);
     imapServer.open();
     account.incomingServer.port = imapServer.port;
-    account.incomingServer.username = "user";
     account.incomingServer.password = "password";
     const inbox = account.incomingServer.rootFolder.getChildNamed("INBOX");
     inbox.QueryInterface(Ci.nsIMsgImapMailFolder).hierarchyDelimiter = "/";
@@ -95,7 +94,6 @@ async function createAccount(type = "none", options = {}) {
     const ewsServer = new EWSServer();
     ewsServer.open();
     account.incomingServer.port = ewsServer.port;
-    account.incomingServer.username = "user";
     account.incomingServer.password = "password";
     account.incomingServer.setStringValue(
       "ews_url",

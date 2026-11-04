@@ -59,7 +59,10 @@ add_task(function test_attachPublishesCompleteHeaderAndConsumesDraft() {
       Assert.equal(header.threadParent, parent);
       Assert.equal(header.folder, folder);
       Assert.equal(flags, Ci.nsMsgMessageFlags.HasRe);
-      Assert.equal(header.flags, Ci.nsMsgMessageFlags.HasRe);
+      Assert.equal(
+        header.flags,
+        Ci.nsMsgMessageFlags.HasRe | Ci.nsMsgMessageFlags.New
+      );
       Assert.equal(header.messageId, "complete-child@invalid");
       Assert.equal(header.subject, "Complete draft");
       Assert.equal(header.author, "Sender <sender@invalid>");

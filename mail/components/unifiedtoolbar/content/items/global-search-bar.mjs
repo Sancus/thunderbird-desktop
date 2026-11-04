@@ -86,7 +86,15 @@ class GlobalSearchBar extends SearchBar {
 
   /** Observe card delivery only while this native input is connected. */
   #observeNames() {
-    if (this.#observingNames || !lazy.glodaCompleter.isNativeMailSearch) {
+    if (this.#observingNames || !("nsIDatabaseCore" in Ci)) {
+      return;
+    }
+    // Checking the registered backend must not construct the legacy completer
+    // before the user starts a search.
+    const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    );
+    if (!(backend instanceof Ci.nsIDatabaseCore)) {
       return;
     }
     this.#observingNames = true;
@@ -114,6 +122,9 @@ class GlobalSearchBar extends SearchBar {
   /** Stops delivery only for the result owned by this input. */
   #stopCompletion() {
     this.#refreshSelection = null;
+    if (!this.#completionResult) {
+      return;
+    }
     const provider = lazy.glodaCompleter;
     if (provider.curResult && provider.curResult == this.#completionResult) {
       provider.stopSearch();

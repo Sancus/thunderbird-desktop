@@ -38,7 +38,10 @@ function insert(folder, id, reference) {
   if (reference) {
     draft.setReferences("<" + reference + ">");
   }
-  return db.attachHdr(draft, false);
+  const header = db.attachHdr(draft, false);
+  // Thread-flag tests start with unread messages that are no longer New.
+  db.clearNewList(false);
+  return header;
 }
 
 /**

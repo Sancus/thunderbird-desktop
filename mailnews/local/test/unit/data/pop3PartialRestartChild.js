@@ -117,6 +117,11 @@ async function checkRestart() {
   if (pop3RestartInput.stage == "read") {
     Services.prefs.readUserPrefsFromFile(prefsFile);
   }
+  // Match the ordinary xpcshell profile before profile observers can start
+  // region lookup. This isolated child does not load that harness profile.
+  Services.prefs.setBoolPref("geo.provider.testing", true);
+  Services.prefs.setBoolPref("geo.provider.network.scan", false);
+  Services.prefs.setCharPref("browser.region.network.url", "");
   Services.prefs.setBoolPref("security.nocertdb", true);
   Services.prefs.setBoolPref("mail.panorama.enabled", true);
   Services.obs.notifyObservers(

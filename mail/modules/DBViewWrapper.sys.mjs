@@ -957,7 +957,13 @@ DBViewWrapper.prototype = {
     const current = identity(selection?.currentIndex ?? -1);
     const generation = ++this._savedSearchGeneration;
     this._savedSearchError = null;
-    this._savedSearchSelection = { selected, current, generation, view: null };
+    this._savedSearchSelection = {
+      selected,
+      current,
+      generation,
+      view: null,
+      expandAll: Boolean(view?.viewFlags & Ci.nsMsgViewFlagsType.kExpandAll),
+    };
     this.beginViewUpdate();
     try {
       FolderNotificationHelper.removeNotifications(
@@ -999,6 +1005,9 @@ DBViewWrapper.prototype = {
     }
     this._savedSearchSelection = null;
     const view = this.dbView;
+    if (pending.expandAll) {
+      view.doCommand(Ci.nsMsgViewCommandType.expandAll);
+    }
     const find = identity => {
       if (!identity) {
         return -1;
@@ -1060,6 +1069,18 @@ DBViewWrapper.prototype = {
     let started = false;
     const current = () =>
       view == this.dbView && generation == this._savedSearchGeneration;
+    this.search._sessionListener = {
+      onNewSearch: () => {
+        if (current() && !this.searching) {
+          this.searching = true;
+        }
+      },
+      onSearchDone: () => {
+        if (current()) {
+          this.searching = false;
+        }
+      },
+    };
     const invoke = (name, args) => {
       if (!current()) {
         return;

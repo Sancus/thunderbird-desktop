@@ -1063,9 +1063,13 @@ add_task(async function test_emptySourceRefreshPreservesOtherHits() {
     subject: "scope-match",
   });
   const wrapper = make_view_wrapper();
+  info("S371 empty-source initial ordinary open");
   await view_open(wrapper, saved);
+  info("S371 empty-source initial open finished");
   a.deleteMessages([first], null, true, false, null, false);
+  info("S371 physical deletion finished; reopening current scope");
   await view_open(wrapper, saved);
+  info("S371 empty-source reopen finished");
   assertScopedRows(wrapper, [second]);
   Assert.deepEqual(
     scopedCache(a, saved),

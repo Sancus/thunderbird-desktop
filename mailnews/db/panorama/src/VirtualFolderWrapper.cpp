@@ -396,7 +396,7 @@ NS_IMETHODIMP SavedSearchBindings::OnHdrPropertyChanged(nsIMsgDBHdr*,
   return Sync();
 }
 NS_IMETHODIMP SavedSearchBindings::OnReadChanged(nsIDBChangeListener*) {
-  return Sync();
+  return Refresh();
 }
 NS_IMETHODIMP SavedSearchBindings::OnJunkScoreChanged(nsIDBChangeListener*) {
   return Sync();
@@ -429,11 +429,12 @@ NS_IMETHODIMP SavedSearchBindings::OnFolderRemoved(nsIMsgFolder*,
   return NS_OK;
 }
 NS_IMETHODIMP SavedSearchBindings::OnMessageAdded(nsIMsgFolder*, nsIMsgDBHdr*) {
-  return Sync();
+  // The enrolled physical DB already reconciled this committed publication.
+  return NS_OK;
 }
 NS_IMETHODIMP SavedSearchBindings::OnMessageRemoved(nsIMsgFolder*,
                                                     nsIMsgDBHdr*) {
-  return Sync();
+  return NS_OK;
 }
 NS_IMETHODIMP SavedSearchBindings::OnFolderPropertyChanged(nsIMsgFolder*,
                                                            const nsACString&,

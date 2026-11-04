@@ -503,9 +503,12 @@ add_task(async function test_cleanupFailureBeforeTerminalSuccess() {
 
 add_task(async function test_parserFailurePrecedesCleanupFailure() {
   await withServer(NNTP_RFC2980_handler, async () => {
+    Assert.equal([...folder.messages].length, 0, "The fixture has no headers");
+    let parsed = 0;
     await withReplacedMethod(
       "processXOverLine",
       () => {
+        parsed++;
         throw Components.Exception("parser failed", Cr.NS_ERROR_ILLEGAL_VALUE);
       },
       async () => {
@@ -528,8 +531,9 @@ add_task(async function test_parserFailurePrecedesCleanupFailure() {
         );
       }
     );
+    Assert.equal(parsed, 1, "The request fails at its first parsed article");
     Assert.equal(
-      folder.getTotalMessages(false),
+      [...folder.messages].length,
       0,
       "Failed parser input stays unpublished"
     );

@@ -1300,9 +1300,11 @@ add_task(function test_nativeFailedArticleProducerDoesNotPublish() {
     known,
     "Failed input does not mark a completed range"
   );
-  Assert.equal(
-    folder.msgDatabase.getMsgHdrForMessageID("failed-s364@example.invalid"),
-    null
+  Assert.throws(
+    () =>
+      folder.msgDatabase.getMsgHdrForMessageID("failed-s364@example.invalid"),
+    error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE,
+    "The failed article has no native Message-ID mapping"
   );
 });
 

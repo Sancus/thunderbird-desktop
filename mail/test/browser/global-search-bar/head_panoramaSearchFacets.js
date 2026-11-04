@@ -102,13 +102,15 @@ add_setup(async function setupNativeFacetMessages() {
   tailMessage.subject = "Conversation tail outside query";
   const tail = second.addMessage(tailMessage.toMessageString());
   const matches = [secondCopy, clicked];
-  for (let i = 0; i < 100; i++) {
-    matches.push(
-      first.addMessage(
+  // The ordinary batch API preserves header order and avoids one mailbox fsync
+  // for every padding message in this pagination fixture.
+  matches.push(
+    ...first.addMessageBatch(
+      Array.from({ length: 100 }, () =>
         generator.makeMessage({ subject: term }).toMessageString()
       )
-    );
-  }
+    )
+  );
   excluded.addMessage(
     generator
       .makeMessage({ subject: "Unrelated local control" })

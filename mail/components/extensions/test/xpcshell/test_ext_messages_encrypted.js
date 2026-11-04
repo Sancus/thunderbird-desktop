@@ -8,6 +8,8 @@
 
 load("head_ext_messages_encrypted.js");
 
+encryptedMessageFixtures = [1];
+
 add_task(async function test_openpgp_enc_nested_messages() {
   const extension = ExtensionTestUtils.loadExtension({
     files: {

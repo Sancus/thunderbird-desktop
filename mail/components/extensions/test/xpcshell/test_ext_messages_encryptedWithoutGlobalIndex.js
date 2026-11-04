@@ -8,6 +8,8 @@
 
 load("test_ext_messages_encrypted.js");
 
+encryptedMessageFixtures = [1, 3, 4];
+
 add_task(async function test_queryDecryptedBodyWithoutGlobalIndex() {
   Assert.ok(
     !Services.prefs.getBoolPref("mailnews.database.global.indexer.enabled")

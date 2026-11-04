@@ -241,36 +241,3 @@ add_task(
     pane.commandController.doCommand("cmd_resetQuickFilterBar");
   }
 );
-
-add_task(
-  async function test_facetConversationOpensCompleteThreadAndSelectedCopy() {
-    const { tab, context } = await openNativeFacets(fixture.term);
-    const message = context.fullSet.find(
-      item => Number(item.id) == fixture.clicked.messageKey
-    );
-    const list = await context.openMailSearchConversation(message, true);
-    Assert.ok(
-      list,
-      "The supplied native conversation facade opens an existing list"
-    );
-    const { pane, identities } = await readNativeList(list);
-    Assert.deepEqual(
-      identities,
-      fixture.conversation.map(physicalIdentity).sort(),
-      "Include non-matching root/tail and both physical Message-ID copies"
-    );
-    await TestUtils.waitForCondition(() => pane.gDBView.numSelected == 1);
-    Assert.equal(
-      physicalIdentity(pane.gDBView.hdrForFirstSelectedMessage),
-      physicalIdentity(fixture.clicked),
-      "The clicked folder/key is selected after asynchronous row delivery"
-    );
-    Assert.equal(
-      tabmail.currentTabInfo,
-      tab,
-      "Background opening retains the facet tab"
-    );
-    tabmail.closeTab(list);
-    tabmail.closeTab(tab);
-  }
-);

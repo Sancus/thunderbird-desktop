@@ -8,6 +8,8 @@
 
 load("head_ext_messages_encrypted.js");
 
+encryptedMessageFixtures = [4, 5];
+
 add_task(async function test_smime_enc_not_signed() {
   const enc = await readSmimeExpectations("alice.env.eml");
   const extension = ExtensionTestUtils.loadExtension({

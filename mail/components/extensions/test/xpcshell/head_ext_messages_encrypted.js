@@ -81,89 +81,103 @@ async function readSmimeExpectations(fileName) {
   return { date, derSize, bodyLines };
 }
 
+/** @type {number[]} Fixture numbers used by the current ordinary test file. */
+var encryptedMessageFixtures = [1, 2, 3, 4, 5];
+
 add_setup(async () => {
   await Services.logins.initializationPromise;
-  // Prepare OpenPGP messages.
-  await OpenPGPTestUtils.initOpenPGP();
-
   const _account = await createAccount();
   const _identity = addIdentity(_account);
-  const [id] = await OpenPGPTestUtils.importPrivateKey(
-    null,
-    new FileUtils.File(OPENPGP_KEY_PATH)
-  );
-  _identity.setUnicharAttribute("openpgp_key_id", id);
+  if (encryptedMessageFixtures.some(number => number <= 3)) {
+    await OpenPGPTestUtils.initOpenPGP();
+    const [id] = await OpenPGPTestUtils.importPrivateKey(
+      null,
+      new FileUtils.File(OPENPGP_KEY_PATH)
+    );
+    _identity.setUnicharAttribute("openpgp_key_id", id);
+  }
 
-  const _test1 = await createSubfolder(
-    _account.incomingServer.rootFolder,
-    "test1"
-  );
-  await createMessageFromFile(
-    _test1,
-    do_get_file("messages/encryptedNestedMessages.eml").path
-  );
+  if (encryptedMessageFixtures.includes(1)) {
+    const _test1 = await createSubfolder(
+      _account.incomingServer.rootFolder,
+      "test1"
+    );
+    await createMessageFromFile(
+      _test1,
+      do_get_file("messages/encryptedNestedMessages.eml").path
+    );
+  }
 
-  const _test2 = await createSubfolder(
-    _account.incomingServer.rootFolder,
-    "test2"
-  );
-  await createMessageFromFile(
-    _test2,
-    do_get_file("messages/msg-with-enc-openpgp-attachment.eml").path
-  );
+  if (encryptedMessageFixtures.includes(2)) {
+    const _test2 = await createSubfolder(
+      _account.incomingServer.rootFolder,
+      "test2"
+    );
+    await createMessageFromFile(
+      _test2,
+      do_get_file("messages/msg-with-enc-openpgp-attachment.eml").path
+    );
+  }
 
-  const _test3 = await createSubfolder(
-    _account.incomingServer.rootFolder,
-    "test3"
-  );
-  await createMessageFromFile(
-    _test3,
-    do_get_file("messages/msg-with-enc-openpgp-inline.eml").path
-  );
+  if (encryptedMessageFixtures.includes(3)) {
+    const _test3 = await createSubfolder(
+      _account.incomingServer.rootFolder,
+      "test3"
+    );
+    await createMessageFromFile(
+      _test3,
+      do_get_file("messages/msg-with-enc-openpgp-inline.eml").path
+    );
+  }
 
-  // Prepare SMIME messages.
-  SmimeUtils.ensureNSS();
+  if (encryptedMessageFixtures.some(number => number >= 4)) {
+    // Prepare SMIME messages.
+    SmimeUtils.ensureNSS();
 
-  SmimeUtils.loadPEMCertificate(
-    do_get_file(SMIME_DATA_DIR + "TestCA.pem"),
-    Ci.nsIX509Cert.CA_CERT
-  );
-  SmimeUtils.loadCertificateAndKey(
-    do_get_file(SMIME_DATA_DIR + "Alice.p12"),
-    "nss"
-  );
-  SmimeUtils.loadCertificateAndKey(
-    do_get_file(SMIME_DATA_DIR + "Bob.p12"),
-    "nss"
-  );
+    SmimeUtils.loadPEMCertificate(
+      do_get_file(SMIME_DATA_DIR + "TestCA.pem"),
+      Ci.nsIX509Cert.CA_CERT
+    );
+    SmimeUtils.loadCertificateAndKey(
+      do_get_file(SMIME_DATA_DIR + "Alice.p12"),
+      "nss"
+    );
+    SmimeUtils.loadCertificateAndKey(
+      do_get_file(SMIME_DATA_DIR + "Bob.p12"),
+      "nss"
+    );
+  }
 
-  const _test4 = await createSubfolder(
-    _account.incomingServer.rootFolder,
-    "test4"
-  );
-  const message4 = await IOUtils.readUTF8(
-    do_get_file(SMIME_DATA_DIR + "alice.env.eml").path
-  );
-  // The message does not have a Message-ID header, which will cause issues for
-  // our NNTP test server. Add it manually.
-  await createMessageFromString(
-    _test4,
-    "Message-ID: <test4@sample.message>\r\n" + message4
-  );
-
-  const _test5 = await createSubfolder(
-    _account.incomingServer.rootFolder,
-    "test5"
-  );
-  const message5 = await IOUtils.readUTF8(
-    do_get_file(SMIME_DATA_DIR + "alice.sig.SHA256.opaque.env.eml").path
-  );
-  // The message does not have a Message-ID header, which will cause issues for
-  // our NNTP test server. Add it manually.
-  await createMessageFromString(
-    _test5,
-    "Message-ID: <test5@sample.message>\r\n" + message5
-  );
+  if (encryptedMessageFixtures.includes(4)) {
+    const _test4 = await createSubfolder(
+      _account.incomingServer.rootFolder,
+      "test4"
+    );
+    const message4 = await IOUtils.readUTF8(
+      do_get_file(SMIME_DATA_DIR + "alice.env.eml").path
+    );
+    // The message does not have a Message-ID header, which will cause issues for
+    // our NNTP test server. Add it manually.
+    await createMessageFromString(
+      _test4,
+      "Message-ID: <test4@sample.message>\r\n" + message4
+    );
+  }
+  if (encryptedMessageFixtures.includes(5)) {
+    const _test5 = await createSubfolder(
+      _account.incomingServer.rootFolder,
+      "test5"
+    );
+    const message5 = await IOUtils.readUTF8(
+      do_get_file(SMIME_DATA_DIR + "alice.sig.SHA256.opaque.env.eml").path
+    );
+    // The message does not have a Message-ID header, which will cause issues for
+    // our NNTP test server. Add it manually.
+    await createMessageFromString(
+      _test5,
+      "Message-ID: <test5@sample.message>\r\n" + message5
+    );
+  }
 });
 
 /**

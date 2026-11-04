@@ -7,6 +7,8 @@
 /* import-globals-from test_ext_messages_encrypted.js */
 
 load("test_ext_messages_encrypted.js");
+load("test_ext_messages_encryptedNestedAttachments.js");
+load("test_ext_messages_encryptedInnerNested.js");
 
 encryptedMessageFixtures = [1, 3, 4];
 

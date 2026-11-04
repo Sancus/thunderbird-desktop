@@ -123,14 +123,15 @@ add_setup(async function setupNativeFacetMessages() {
   second.addKeywordsToMessages([secondCopy], "$label1");
   first.markMessagesFlagged([clicked], true);
   // This manifest keeps Gloda enabled. Its asynchronous commit writes gloda-id
-  // on the same physical headers, so finish that fixture metadata before taking
+  // on the same physical headers. Drain normal dirty-message indexing without
+  // forcing already indexed padding through a second pass, and finish metadata
+  // before taking
   // the native index snapshot used by these UI assertions.
   await Promise.all(
     folders.map(
       folder =>
         new Promise((resolve, reject) => {
           const queued = GlodaMsgIndexer.indexFolder(folder, {
-            force: true,
             callback(success) {
               if (!success) {
                 reject(new Error("Fixture Gloda indexing did not complete"));

@@ -75,14 +75,14 @@ prefs = [
   "mail.panorama.enabled=true",
   "mailnews.database.global.indexer.enabled=false",
 ]
-support-files = ["test_ext_messages_encrypted.js", "head_ext_messages_encrypted.js"]
+support-files = ["test_ext_messages_encrypted.js", "test_ext_messages_encryptedNestedAttachments.js", "test_ext_messages_encryptedInnerNested.js", "head_ext_messages_encrypted.js"]
 
 ["test_ext_messages_encryptedNativeOpenPGP.js"]
 prefs = [
   "mail.panorama.enabled=true",
   "mailnews.database.global.indexer.enabled=false",
 ]
-support-files = ["test_ext_messages_encryptedOpenPGP.js", "head_ext_messages_encrypted.js"]
+support-files = ["test_ext_messages_encryptedOpenPGP.js", "test_ext_messages_encryptedOpenPGPAttachment.js", "test_ext_messages_encryptedOpenPGPDelete.js", "head_ext_messages_encrypted.js"]
 
 ["test_ext_messages_encryptedNativeSmime.js"]
 prefs = [

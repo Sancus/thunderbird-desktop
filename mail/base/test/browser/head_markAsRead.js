@@ -88,6 +88,7 @@ async function setupMarkAsRead(backend) {
     ]);
     const ewsAccount = MailServices.accounts.createAccount();
     registerCleanupFunction(function () {
+      ewsAccount.incomingServer.closeCachedConnections();
       MailServices.accounts.removeAccount(ewsAccount, false);
     });
     ewsAccount.addIdentity(MailServices.accounts.createIdentity());

@@ -7,3 +7,7 @@
 /* import-globals-from test_ext_messages_encryptedOpenPGP.js */
 
 load("test_ext_messages_encryptedOpenPGP.js");
+load("test_ext_messages_encryptedOpenPGPAttachment.js");
+load("test_ext_messages_encryptedOpenPGPDelete.js");
+
+encryptedMessageFixtures = [1, 2, 3];

@@ -797,3 +797,342 @@ add_task(function test_strictDictionaryFormWithFollowingAliases() {
     Assert.equal(partial, null);
   }
 });
+
+/**
+ * Requires a complete import failure at an exact original byte offset.
+ *
+ * @param {string} body - Literal grammar-unit input, not a legacy fixture.
+ * @param {Record<string, number>} limits - Bounds for this import.
+ * @param {string} code - Exact structured failure code.
+ * @param {number} offset - Expected source byte position.
+ */
+function assertStrictImportFailure(body, limits, code, offset) {
+  let partial = null;
+  Assert.throws(
+    () => {
+      partial = new MorkParser().parseForImport(body, body.length, limits);
+    },
+    error =>
+      error.name === "MorkImportError" &&
+      error.code === code &&
+      error.offset === offset,
+    "The intended complete import fails with the exact code and byte offset"
+  );
+  Assert.equal(
+    partial,
+    null,
+    "An over-limit or malformed import has no snapshot"
+  );
+}
+
+add_task(function test_strictInputSizeAndLimitArguments() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const parser = new MorkParser();
+  Assert.equal(parser.parseForImport(header, header.length).rows.size, 0);
+  Assert.throws(
+    () => parser.parseForImport(header + " ", header.length),
+    error =>
+      error.name === "MorkImportError" &&
+      error.code === "RESOURCE_LIMIT" &&
+      error.offset === 0
+  );
+  for (const value of [0, -1, 1.5, NaN, Infinity]) {
+    Assert.throws(
+      () => parser.parseForImport(header, value),
+      error =>
+        error.name === "RangeError" &&
+        error.message === "Invalid Mork input limit"
+    );
+    for (const name of [
+      "maxTokenBytes",
+      "maxTokens",
+      "maxAtoms",
+      "maxRows",
+      "maxCommentDepth",
+      "maxBlockDepth",
+    ]) {
+      Assert.throws(
+        () => parser.parseForImport(header, header.length, { [name]: value }),
+        error =>
+          error.name === "RangeError" && error.message === "Invalid " + name
+      );
+    }
+  }
+  for (const limits of [null, false, 1, "limits", []]) {
+    Assert.throws(
+      () => parser.parseForImport(header, header.length, limits),
+      error =>
+        error.name === "TypeError" && error.message === "Expected Mork limits"
+    );
+  }
+});
+
+add_task(function test_strictTokenSpanLimits() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const parser = new MorkParser();
+  for (const payload of [
+    "x".repeat(30),
+    "$41".repeat(10),
+    "a\\\r\n" + "x".repeat(26),
+  ]) {
+    const body = header + "[1:r(a=" + payload + ")]";
+    const snapshot = parser.parseForImport(body, body.length, {
+      maxTokenBytes: 32,
+    });
+    Assert.equal(snapshot.rows.size, 1);
+    Assert.equal(
+      snapshot.rows.get("1:r").cells.get("a"),
+      payload.startsWith("$") ? "A".repeat(10) : payload.replace("\\\r\n", "")
+    );
+    assertStrictImportFailure(
+      header + "[1:r(a=" + payload + "x)]",
+      { maxTokenBytes: 32 },
+      "RESOURCE_LIMIT",
+      header.length + 6 + 32
+    );
+  }
+  const column = "a".repeat(32);
+  const named = header + "[1:r(" + column + "=)]";
+  Assert.ok(
+    parser
+      .parseForImport(named, named.length, { maxTokenBytes: 32 })
+      .rows.get("1:r")
+      .cells.has(column)
+  );
+  assertStrictImportFailure(
+    header + "[1:r(" + column + "a=)]",
+    { maxTokenBytes: 32 },
+    "RESOURCE_LIMIT",
+    header.length + 5 + 32
+  );
+  const comment = "/*" + "x".repeat(28) + "*/";
+  const commented = header + comment;
+  Assert.equal(
+    parser.parseForImport(commented, commented.length, { maxTokenBytes: 32 })
+      .rows.size,
+    0
+  );
+  assertStrictImportFailure(
+    header + "/*" + "x".repeat(29) + "*/",
+    { maxTokenBytes: 32 },
+    "RESOURCE_LIMIT",
+    header.length + 32
+  );
+  // The normal consumer path also enforces the existing default token bound.
+  const defaultValue = header + "[1:r(a=" + "x".repeat(65534) + ")]";
+  Assert.equal(
+    parser.parseForImport(defaultValue).rows.get("1:r").cells.get("a").length,
+    65534
+  );
+  assertStrictImportFailure(
+    header + "[1:r(a=" + "x".repeat(65535) + ")]",
+    {},
+    "RESOURCE_LIMIT",
+    header.length + 6 + 65536
+  );
+});
+
+add_task(function test_strictAtomAndRowBudgets() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const parser = new MorkParser();
+  const aliases = header + "<(80=x)(81=y)>[1:r(a^80)(b^81)]";
+  Assert.deepEqual(
+    [
+      ...parser
+        .parseForImport(aliases, aliases.length, { maxAtoms: 2 })
+        .rows.get("1:r").cells,
+    ],
+    [
+      ["a", "x"],
+      ["b", "y"],
+    ]
+  );
+  assertStrictImportFailure(
+    header + "<(80=x)(81=y)(82=z)>",
+    { maxAtoms: 2 },
+    "RESOURCE_LIMIT",
+    header.length + 13
+  );
+  const columns = "< <(a=c)> (80=col)>";
+  const domains = header + columns + "<(80=v)>[1:r(^80^80)]";
+  Assert.equal(
+    parser
+      .parseForImport(domains, domains.length, { maxAtoms: 2 })
+      .rows.get("1:r")
+      .cells.get("col"),
+    "v"
+  );
+  assertStrictImportFailure(
+    domains,
+    { maxAtoms: 1 },
+    "RESOURCE_LIMIT",
+    header.length + columns.length + 1
+  );
+  const duplicate = header + "<(80=x)><(80=x)>[1:r(a^80)]";
+  Assert.equal(
+    parser
+      .parseForImport(duplicate, duplicate.length, { maxAtoms: 1 })
+      .rows.get("1:r")
+      .cells.get("a"),
+    "x"
+  );
+  const rows = header + "[1:r][2:r]";
+  Assert.equal(
+    parser.parseForImport(rows, rows.length, { maxRows: 2 }).rows.size,
+    2
+  );
+  assertStrictImportFailure(
+    rows,
+    { maxRows: 1 },
+    "RESOURCE_LIMIT",
+    header.length + 5
+  );
+  const cutPrefix = header + "{1:r {(k=kind)} -1 -";
+  assertStrictImportFailure(
+    cutPrefix + "2}",
+    { maxRows: 1 },
+    "RESOURCE_LIMIT",
+    cutPrefix.length
+  );
+});
+
+add_task(function test_strictTokenBudget() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const parser = new MorkParser();
+  Assert.equal(
+    parser.parseForImport(header, header.length, { maxTokens: 1 }).rows.size,
+    0
+  );
+  const oneRow = header + "[1:r]";
+  Assert.equal(
+    parser.parseForImport(oneRow, oneRow.length, { maxTokens: 4 }).rows.size,
+    1
+  );
+  assertStrictImportFailure(
+    oneRow,
+    { maxTokens: 3 },
+    "RESOURCE_LIMIT",
+    header.length + 4
+  );
+  const repeats = header + "[1:r]".repeat(64);
+  Assert.equal(
+    parser.parseForImport(repeats, repeats.length, {
+      maxTokens: 256,
+      maxRows: 1,
+    }).rows.size,
+    1
+  );
+  assertStrictImportFailure(
+    repeats + "[1:r]",
+    { maxTokens: 256 },
+    "RESOURCE_LIMIT",
+    repeats.length
+  );
+});
+
+add_task(function test_strictNestingLimits() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const parser = new MorkParser();
+  const rowForm = header + "[1:r[(f^0)]]";
+  Assert.equal(
+    parser.parseForImport(rowForm, rowForm.length, { maxBlockDepth: 2 }).rows
+      .size,
+    1
+  );
+  assertStrictImportFailure(
+    rowForm,
+    { maxBlockDepth: 1 },
+    "RESOURCE_LIMIT",
+    header.length + 4
+  );
+  const comments = header + "/*a/*b*/c*/[1:r]";
+  Assert.equal(
+    parser.parseForImport(comments, comments.length, { maxCommentDepth: 2 })
+      .rows.size,
+    1
+  );
+  assertStrictImportFailure(
+    comments,
+    { maxCommentDepth: 1 },
+    "RESOURCE_LIMIT",
+    header.length + 3
+  );
+  const exactComments = header + "/*".repeat(16) + "*/".repeat(16);
+  Assert.equal(parser.parseForImport(exactComments).rows.size, 0);
+  assertStrictImportFailure(
+    header + "/*".repeat(17) + "*/".repeat(17),
+    {},
+    "RESOURCE_LIMIT",
+    header.length + 32
+  );
+  assertStrictImportFailure(
+    header + "[".repeat(8192),
+    {},
+    "RESOURCE_LIMIT",
+    header.length + 16
+  );
+});
+
+add_task(function test_strictMalformedOffsetsAndBoundedInput() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  assertStrictImportFailure(
+    header + "[1:r(a=$Q0)]",
+    {},
+    "MALFORMED_MORK",
+    header.length + 8
+  );
+  assertStrictImportFailure(
+    header + "[1:r(a=$0Q)]",
+    {},
+    "MALFORMED_MORK",
+    header.length + 9
+  );
+  const prefix = header + "[1:r(a=\xC3\xA9\\\r\n$0";
+  assertStrictImportFailure(
+    prefix + "Q)]",
+    {},
+    "MALFORMED_MORK",
+    prefix.length
+  );
+  assertStrictImportFailure(
+    header + "[1:r(a=value)",
+    {},
+    "TRUNCATED_MORK",
+    header.length
+  );
+  // A strict error never builds recovery's map of every delimiter in a comment.
+  assertStrictImportFailure(
+    header + "< /*" + "<".repeat(2048) + "*/",
+    {},
+    "TRUNCATED_MORK",
+    header.length
+  );
+});
+
+add_task(function test_strictRepeatedMembershipBounds() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const prefix = header + "{1:r {(k=kind)} [1(a=first)] [2(a=second)] ";
+  const input = prefix + "1 1 -1 1 ".repeat(2048) + "}";
+  const snapshot = new MorkParser().parseForImport(input, input.length, {
+    maxRows: 2,
+  });
+  Assert.equal(
+    snapshot.rows.size,
+    2,
+    "Repeated membership does not expand rows"
+  );
+  Assert.deepEqual(snapshot.tables.get("1:r").rows, ["2:r", "1:r"]);
+  Assert.deepEqual([...snapshot.rows.get("1:r").cells], [["a", "first"]]);
+  Assert.deepEqual([...snapshot.rows.get("2:r").cells], [["a", "second"]]);
+  Assert.equal(
+    input,
+    prefix + "1 1 -1 1 ".repeat(2048) + "}",
+    "Raw input stays exact"
+  );
+  assertStrictImportFailure(
+    input + "[3:r]",
+    { maxRows: 2 },
+    "RESOURCE_LIMIT",
+    input.length
+  );
+});

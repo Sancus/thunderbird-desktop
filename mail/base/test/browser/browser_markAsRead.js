@@ -194,9 +194,7 @@ async function subtest(testFolder) {
   );
   await promiseServerIdle(testFolder.server);
   checkReadFlags(message, true, "message should be read after load");
-  // Extra time to ensure loading completes. Not loading may lead to leaks.
-  // eslint-disable-next-line mozilla/no-arbitrary-setTimeout
-  await new Promise(resolve => setTimeout(resolve, 500));
+  await waitForMessageLoad(firstAbout3Pane.messageBrowser.contentWindow);
 
   firstAbout3Pane.threadTree.selectedIndex = -1; // Unload the message.
   const firstMessagePane =
@@ -236,6 +234,7 @@ async function subtest(testFolder) {
     true,
     "message 1 should be read after switching to the background tab"
   );
+  await waitForMessageLoad(tabmail.currentAboutMessage);
   tabmail.closeTab(1);
 
   // With the marking delayed by preferences, open a message in a background tab.
@@ -284,6 +283,7 @@ async function subtest(testFolder) {
     2000,
     "message 2 should be read after switching to the background tab and the 2s delay"
   );
+  await waitForMessageLoad(tabmail.currentAboutMessage);
   tabmail.closeTab(1);
 
   await SpecialPowers.pushPrefEnv({
@@ -319,6 +319,7 @@ async function subtest(testFolder) {
     false,
     "message 3 should not be read after switching to the background tab"
   );
+  await waitForMessageLoad(tabmail.currentAboutMessage);
   tabmail.closeTab(1);
 
   await SpecialPowers.pushPrefEnv({
@@ -364,6 +365,7 @@ async function subtest(testFolder) {
     true,
     "message 4 should be read after switching to the background tab"
   );
+  await waitForMessageLoad(tabmail.currentAboutMessage);
   tabmail.closeTab(1);
 
   // Open a message in a new foreground tab. It should get marked as read
@@ -383,9 +385,8 @@ async function subtest(testFolder) {
     true,
     "message 5 should be read after opening the foreground tab"
   );
-  // Extra time to ensure loading completes. Not loading may lead to leaks.
-  // eslint-disable-next-line mozilla/no-arbitrary-setTimeout
-  await new Promise(resolve => setTimeout(resolve, 500));
+
+  await waitForMessageLoad(tabmail.currentAboutMessage);
   tabmail.closeTab(1);
 
   // Open a message in a new window. It should get marked as read immediately.
@@ -411,8 +412,22 @@ async function subtest(testFolder) {
     true,
     "message 6 should be read after opening the foreground tab"
   );
-  // Extra time to ensure loading completes. Not loading may lead to leaks.
-  // eslint-disable-next-line mozilla/no-arbitrary-setTimeout
-  await new Promise(resolve => setTimeout(resolve, 500));
+  await waitForMessageLoad(
+    messageWindow.document.getElementById("messageBrowser").contentWindow
+  );
   await BrowserTestUtils.closeWindow(messageWindow);
+}
+
+/**
+ * Waits for the actual message document before its tab or window is closed.
+ *
+ * @param {Window} aboutMessage - The existing about:message window.
+ * @returns {Promise<void>} The display channel has finished loading.
+ */
+async function waitForMessageLoad(aboutMessage) {
+  const browser = aboutMessage.getMessagePaneBrowser();
+  await TestUtils.waitForCondition(
+    () => !browser.webProgress.isLoadingDocument,
+    "Waiting for the actual message display channel to finish"
+  );
 }

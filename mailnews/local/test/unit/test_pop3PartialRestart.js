@@ -24,7 +24,6 @@ const COMPLETE =
   "Content-Type: text/plain; charset=UTF-8\r\n\r\n" +
   "Completed body.\r\nSecond completed line.\r\n";
 
-
 /**
  * Complete a real Partial in one process and read its persisted row in another.
  *

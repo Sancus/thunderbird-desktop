@@ -19,6 +19,7 @@ prefs = [
   "mailnews.start_page.override_url=about:blank",
   "mailnews.start_page.url=about:blank",
 ]
+support-files = ["head_panoramaSearchCompletion.js", "head_panoramaSearchFacets.js"]
 subsuite = "thunderbird"
 
 ["browser_panoramaSearchCompletion.js"]
@@ -26,3 +27,19 @@ subsuite = "thunderbird"
 ["browser_panoramaSearchFacets.js"]
 
 ["browser_panoramaSearchList.js"]
+
+["browser_panoramaSearchInputs.js"]
+
+["browser_panoramaSearchTerms.js"]
+
+["browser_panoramaSearchFacetInput.js"]
+
+["browser_panoramaSearchFacetCards.js"]
+
+["browser_panoramaSearchFacetIdentities.js"]
+
+["browser_panoramaSearchFacetQueryLifetime.js"]
+
+["browser_panoramaSearchFacetConversationLifetime.js"]
+
+["browser_panoramaSearchFacetDeletedCopy.js"]

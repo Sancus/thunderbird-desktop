@@ -75,13 +75,15 @@ add_task(function test_onHdrAddedWithoutParent() {
   );
   Assert.deepEqual(
     added,
-    [[
-      root.messageKey,
-      noParentFolder.URI,
-      0xffffffff,
-      Ci.nsMsgMessageFlags.New,
-      null,
-    ]],
+    [
+      [
+        root.messageKey,
+        noParentFolder.URI,
+        0xffffffff,
+        Ci.nsMsgMessageFlags.New,
+        null,
+      ],
+    ],
     "Exactly one root addition uses the no-parent notification sentinel"
   );
   noParentDB.removeListener(listener);

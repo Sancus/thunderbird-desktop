@@ -132,7 +132,10 @@ class GlobalSearchBar extends SearchBar {
       const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
         Ci.nsIMsgDBService
       );
-      if (!("nsIDatabaseCore" in Ci) || !(backend instanceof Ci.nsIDatabaseCore)) {
+      if (
+        !("nsIDatabaseCore" in Ci) ||
+        !(backend instanceof Ci.nsIDatabaseCore)
+      ) {
         return;
       }
     }

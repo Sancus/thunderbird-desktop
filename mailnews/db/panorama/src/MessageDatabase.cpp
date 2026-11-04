@@ -1840,6 +1840,8 @@ NS_IMETHODIMP MessageDatabase::GetSearchSnapshot(
 }
 
 NS_IMETHODIMP MessageDatabase::NoteMessageContentChanged(nsMsgKey key) {
+  MOZ_LOG(gPanoramaLog, LogLevel::Debug,
+          ("Message content changed key=%u", key));
   MOZ_TRY(RequireCommittedSearchRead());
   MOZ_TRY(CheckMessageBodyAccess(key));
   bool exists;
@@ -6485,6 +6487,15 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
                                              const nsACString& aName,
                                              const nsACString& aValue) {
   MOZ_ASSERT(!aName.EqualsLiteral("keywords"));  // Use SetMessageTags().
+  if (MOZ_LOG_TEST(gPanoramaLog, LogLevel::Debug)) {
+    nsAutoCString existing;
+    nsresult readResult = GetMessageProperty(aKey, aName, existing);
+    MOZ_LOG(gPanoramaLog, LogLevel::Debug,
+            ("Property string key=%u name=%s unchanged=%d read=0x%08x", aKey,
+             PromiseFlatCString(aName).get(),
+             NS_SUCCEEDED(readResult) && existing.Equals(aValue),
+             static_cast<uint32_t>(readResult)));
+  }
 
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
@@ -6506,6 +6517,15 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
 nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
                                              const nsACString& aName,
                                              uint32_t aValue) {
+  if (MOZ_LOG_TEST(gPanoramaLog, LogLevel::Debug)) {
+    uint32_t existing = 0;
+    nsresult readResult = GetMessageProperty(aKey, aName, existing);
+    MOZ_LOG(gPanoramaLog, LogLevel::Debug,
+            ("Property uint32 key=%u name=%s unchanged=%d read=0x%08x", aKey,
+             PromiseFlatCString(aName).get(),
+             NS_SUCCEEDED(readResult) && existing == aValue,
+             static_cast<uint32_t>(readResult)));
+  }
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
       aKey, "SetMessageProperty"_ns, HeaderTable::Properties,
@@ -7304,6 +7324,7 @@ nsresult MessageDatabase::SetMessageRecipients(nsMsgKey key,
 }
 
 nsresult MessageDatabase::SetMessageTags(nsMsgKey key, nsACString const& tags) {
+  MOZ_LOG(gPanoramaLog, LogLevel::Debug, ("Message tags key=%u", key));
   MOZ_TRY(RequireCommittedSearchRead());
   bool staged;
   MOZ_TRY(IsMessageStaged(key, staged));

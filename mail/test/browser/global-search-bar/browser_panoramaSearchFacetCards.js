@@ -92,8 +92,22 @@ add_task(
       assertCurrent("Open Facet Card A");
       const oldSet = context.mailSearchResultSet;
       const tabs = tabmail.tabInfo.length;
+      const changeNames = async change => {
+        const changed = TestUtils.topicObserved(
+          "panorama-mail-search-names-changed",
+          (subject, sourceId) => sourceId == oldSet.sourceId
+        );
+        const previous = tab.searchPromise;
+        change();
+        await changed;
+        await TestUtils.waitForCondition(
+          () => tab.searchPromise != previous,
+          "The settled native name notification starts this tab's next query"
+        );
+        await tab.searchPromise;
+      };
       currentCard.displayName = "Open Facet Card B";
-      book.modifyCard(currentCard);
+      await changeNames(() => book.modifyCard(currentCard));
       await TestUtils.waitForCondition(
         () =>
           context.mailSearchResultSet != oldSet &&
@@ -169,7 +183,7 @@ add_task(
         throw failure;
       };
       currentCard.displayName = "Open Facet Card C";
-      book.modifyCard(currentCard);
+      await changeNames(() => book.modifyCard(currentCard));
       await TestUtils.waitForCondition(() => observedError);
       Assert.strictEqual(observedError, failure);
       Assert.equal(
@@ -180,7 +194,7 @@ add_task(
       Assert.equal(doc.getElementById("showEmpty").style.display, "none");
       context.showMailSearchError = showError;
       fixture.service.collectResults = originalCollect;
-      book.deleteCards([currentCard]);
+      await changeNames(() => book.deleteCards([currentCard]));
       currentCard = null;
       await TestUtils.waitForCondition(
         () =>
@@ -198,13 +212,16 @@ add_task(
       Assert.deepEqual(actual.identities, headers.map(physicalIdentity).sort());
       tabmail.closeTab(list);
 
-      let collected = false;
+      let signalCollected;
+      const collected = new Promise(resolve => {
+        signalCollected = resolve;
+      });
       const held = new Promise(resolve => {
         release = resolve;
       });
       fixture.service.collectResults = async function (...args) {
         const result = await originalCollect.apply(this, args);
-        collected = true;
+        signalCollected();
         await held;
         return result;
       };
@@ -214,10 +231,7 @@ add_task(
       replacement.primaryEmail = card.primaryEmail;
       replacement.displayName = "Open Facet Replacement";
       currentCard = book.addCard(replacement);
-      await TestUtils.waitForCondition(
-        () => collected,
-        "A later real card notification starts one refresh"
-      );
+      await collected;
       const pending = tab.searchPromise;
       tabmail.closeTab(tab);
       tab = null;

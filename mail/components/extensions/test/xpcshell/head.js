@@ -259,7 +259,7 @@ class IMAPServer {
     registerCleanupFunction(() => this.close());
   }
   close() {
-    this.server.stop();
+    return this.server.stop();
   }
   get port() {
     return this.server.port;
@@ -318,7 +318,7 @@ var NNTPServer = {
   },
 
   close() {
-    this.server.stop();
+    return this.server.stop();
   },
   get port() {
     return this.server.port;
@@ -370,7 +370,7 @@ class EWSServer {
   }
 
   close() {
-    this.server.stop();
+    return this.server.stop();
   }
 
   get port() {

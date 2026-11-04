@@ -32,11 +32,13 @@ add_task(
     } while (progress.moreWork);
     Assert.equal(progress.pending, 0, JSON.stringify(progress));
     Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
+    info("Native facet replay settled: " + JSON.stringify(progress));
     Assert.equal(
       pane.gDBView.numMsgsInView,
       0,
       "Local filter excludes every global hit"
     );
+    info("Native facet UI query starting");
     pane.document.getElementById("qfb-qs-textbox").dispatchEvent(
       new pane.CustomEvent("search", {
         detail: fixture.term,
@@ -56,6 +58,7 @@ add_task(
     );
     await TestUtils.waitForCondition(() => tab.searchPromise);
     await tab.searchPromise;
+    info("Native facet UI query completed");
     const context = tab.browser.contentWindow.FacetContext;
     Assert.equal(
       context.fullSet.length,

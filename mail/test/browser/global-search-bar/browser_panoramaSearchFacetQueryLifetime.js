@@ -14,19 +14,22 @@ add_task(async function test_replacedFacetQueryCannotInstallOldResults() {
   const { tab, context } = await openNativeFacets(fixture.term);
   const original = fixture.service.collectResults;
   let release;
-  let collected = false;
+  let signalCollected;
+  const collected = new Promise(resolve => {
+    signalCollected = resolve;
+  });
   const held = new Promise(resolve => {
     release = resolve;
   });
   fixture.service.collectResults = async function (...args) {
     const results = await original.apply(this, args);
-    collected = true;
+    signalCollected();
     await held;
     return results;
   };
   try {
     const old = context.loadMailSearch();
-    await TestUtils.waitForCondition(() => collected);
+    await collected;
     fixture.service.collectResults = original;
     tab.mailSearch.text = "nomatchreplacementfacetquery";
     await context.loadMailSearch();

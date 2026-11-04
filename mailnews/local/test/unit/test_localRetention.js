@@ -4,6 +4,8 @@
 
 "use strict";
 
+/* globals _PREFS_FILE */
+
 const { PromiseTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
 );
@@ -757,6 +759,7 @@ async function checkRetentionProcessRestart(store) {
           stage,
           store,
           profilePath,
+          prefsPath: _PREFS_FILE,
           testingCommon: resources.getSubstitution("testing-common").spec,
         })};`,
         "-f",

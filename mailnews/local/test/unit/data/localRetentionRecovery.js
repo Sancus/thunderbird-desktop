@@ -69,6 +69,18 @@ async function checkRestart() {
       }
     }
   }
+  // Standalone children load the same ordinary xpcshell prefs as their parent.
+  // Core's test-only SQL connection requires that existing automation mode.
+  const harnessPrefs = Cc["@mozilla.org/file/local;1"].createInstance(
+    Ci.nsIFile
+  );
+  harnessPrefs.initWithPath(retentionRestartInput.prefsPath);
+  Services.prefs.readUserPrefsFromFile(harnessPrefs);
+  Assert.ok(
+    Components.utils.isInAutomation,
+    "Ordinary harness automation is active"
+  );
+
   const prefsFile = profile.clone();
   prefsFile.append("prefs.js");
   if (retentionRestartInput.stage == "read") {
@@ -89,142 +101,153 @@ async function checkRestart() {
     "resource://testing-common/mailnews/LocalAccountUtils.sys.mjs"
   );
 
-  const expectedPath = PathUtils.join(profile.path, "retention-recovery.json");
-  const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
-    Ci.nsIDatabaseCore
-  );
-  if (retentionRestartInput.stage == "write") {
-    const contract =
-      retentionRestartInput.store == "mbox"
-        ? "@mozilla.org/msgstore/berkeleystore;1"
-        : "@mozilla.org/msgstore/maildirstore;1";
-    Services.prefs.setCharPref("mail.serverDefaultStoreContractID", contract);
-    Services.prefs.setCharPref("mail.server.default.storeContractID", contract);
-    localAccountUtils.loadLocalMailAccount();
-    const folder = localAccountUtils.rootFolder
-      .createLocalSubfolder("retention")
-      .QueryInterface(Ci.nsIMsgLocalMailFolder);
-    const entries = [];
-    for (let i = 0; i < 3; ++i) {
-      const raw =
-        `From: retention@example.invalid\r\nSubject: Restart ${i}\r\n` +
-        `Message-ID: <retention-restart-${i}@example.invalid>\r\n\r\nBody ${i}\r\n`;
-      const header = folder.addMessage(raw);
-      entries.push({
-        key: header.messageKey,
-        token: header.storeToken,
-        raw,
-        size: header.messageSize,
-        lines: header.lineCount,
-        flags: header.flags,
-      });
-    }
-    const connection = core.connectionForTests;
-    connection.executeSimpleSQL(
-      "CREATE TEMP TRIGGER retention_restart_fault BEFORE DELETE ON main.messages " +
-        `WHEN OLD.id = ${entries[1].key} BEGIN ` +
-        "SELECT RAISE(ABORT, 'Late restart retention failure'); END"
-    );
-    try {
-      Assert.throws(
-        () =>
-          folder.deleteMessages(
-            entries
-              .slice(0, 2)
-              .map(entry => folder.msgDatabase.getMsgHdrForKey(entry.key)),
-            null,
-            true,
-            false,
-            null,
-            false
-          ),
-        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
-      );
-    } finally {
-      connection.executeSimpleSQL("DROP TRIGGER temp.retention_restart_fault");
-    }
-    Assert.deepEqual(
-      folder.msgDatabase.listAllKeys(),
-      entries.slice(1).map(entry => entry.key)
-    );
-    await IOUtils.writeJSON(expectedPath, {
-      entries,
-      source: core.sourceId,
-      folderId: folder.id,
-      uri: folder.URI,
-      server: folder.server.key,
-    });
-    Services.prefs.savePrefFile(null);
-  } else {
-    const expected = await IOUtils.readJSON(expectedPath);
-    const root = MailServices.accounts.getIncomingServer(
-      expected.server
-    ).rootFolder;
-    const folder = root
-      .getChildNamed("retention")
-      .QueryInterface(Ci.nsIMsgLocalMailFolder);
-    Assert.equal(core.sourceId, expected.source);
-    Assert.equal(folder.id, expected.folderId);
-    Assert.equal(folder.URI, expected.uri);
-    Assert.equal(folder.msgStore.storeType, retentionRestartInput.store);
-    const pending = PathUtils.join(
+  try {
+    const expectedPath = PathUtils.join(
       profile.path,
-      "panorama-purge",
-      core.sourceId,
-      String(folder.id)
+      "retention-recovery.json"
     );
-    Assert.ok(await IOUtils.exists(pending));
-    for (const entry of expected.entries.slice(1)) {
-      const header = folder.msgDatabase.getMsgHdrForKey(entry.key);
-      Assert.equal(header.storeToken, entry.token);
-      Assert.equal(header.messageSize, entry.size);
-      Assert.equal(header.lineCount, entry.lines);
-      Assert.equal(header.flags, entry.flags);
-      Assert.equal(readRetentionBody(folder, entry.token), entry.raw);
+    const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    if (retentionRestartInput.stage == "write") {
+      const contract =
+        retentionRestartInput.store == "mbox"
+          ? "@mozilla.org/msgstore/berkeleystore;1"
+          : "@mozilla.org/msgstore/maildirstore;1";
+      Services.prefs.setCharPref("mail.serverDefaultStoreContractID", contract);
+      Services.prefs.setCharPref(
+        "mail.server.default.storeContractID",
+        contract
+      );
+      localAccountUtils.loadLocalMailAccount();
+      const folder = localAccountUtils.rootFolder
+        .createLocalSubfolder("retention")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      const entries = [];
+      for (let i = 0; i < 3; ++i) {
+        const raw =
+          `From: retention@example.invalid\r\nSubject: Restart ${i}\r\n` +
+          `Message-ID: <retention-restart-${i}@example.invalid>\r\n\r\nBody ${i}\r\n`;
+        const header = folder.addMessage(raw);
+        entries.push({
+          key: header.messageKey,
+          token: header.storeToken,
+          raw,
+          size: header.messageSize,
+          lines: header.lineCount,
+          flags: header.flags,
+        });
+      }
+      const connection = core.connectionForTests;
+      connection.executeSimpleSQL(
+        "CREATE TEMP TRIGGER retention_restart_fault BEFORE DELETE ON main.messages " +
+          `WHEN OLD.id = ${entries[1].key} BEGIN ` +
+          "SELECT RAISE(ABORT, 'Late restart retention failure'); END"
+      );
+      try {
+        Assert.throws(
+          () =>
+            folder.deleteMessages(
+              entries
+                .slice(0, 2)
+                .map(entry => folder.msgDatabase.getMsgHdrForKey(entry.key)),
+              null,
+              true,
+              false,
+              null,
+              false
+            ),
+          error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+        );
+      } finally {
+        connection.executeSimpleSQL(
+          "DROP TRIGGER temp.retention_restart_fault"
+        );
+      }
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys(),
+        entries.slice(1).map(entry => entry.key)
+      );
+      await IOUtils.writeJSON(expectedPath, {
+        entries,
+        source: core.sourceId,
+        folderId: folder.id,
+        uri: folder.URI,
+        server: folder.server.key,
+      });
+      Services.prefs.savePrefFile(null);
+    } else {
+      const expected = await IOUtils.readJSON(expectedPath);
+      const root = MailServices.accounts.getIncomingServer(
+        expected.server
+      ).rootFolder;
+      const folder = root
+        .getChildNamed("retention")
+        .QueryInterface(Ci.nsIMsgLocalMailFolder);
+      Assert.equal(core.sourceId, expected.source);
+      Assert.equal(folder.id, expected.folderId);
+      Assert.equal(folder.URI, expected.uri);
+      Assert.equal(folder.msgStore.storeType, retentionRestartInput.store);
+      const pending = PathUtils.join(
+        profile.path,
+        "panorama-purge",
+        core.sourceId,
+        String(folder.id)
+      );
+      Assert.ok(await IOUtils.exists(pending));
+      for (const entry of expected.entries.slice(1)) {
+        const header = folder.msgDatabase.getMsgHdrForKey(entry.key);
+        Assert.equal(header.storeToken, entry.token);
+        Assert.equal(header.messageSize, entry.size);
+        Assert.equal(header.lineCount, entry.lines);
+        Assert.equal(header.flags, entry.flags);
+        Assert.equal(readRetentionBody(folder, entry.token), entry.raw);
+      }
+      folder.updateFolder(null);
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys(),
+        expected.entries.slice(1).map(entry => entry.key)
+      );
+      Assert.equal(folder.getTotalMessages(false), 2);
+      Assert.ok(!(await IOUtils.exists(pending)));
+      folder.updateFolder(null);
+      Assert.equal(
+        folder.getTotalMessages(false),
+        2,
+        "Recovery did not remove/account twice"
+      );
+      folder.deleteMessages(
+        [folder.msgDatabase.getMsgHdrForKey(expected.entries[1].key)],
+        null,
+        true,
+        false,
+        null,
+        false
+      );
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), [
+        expected.entries[2].key,
+      ]);
+      Assert.equal(
+        readRetentionBody(folder, expected.entries[2].token),
+        expected.entries[2].raw
+      );
+      Assert.equal(folder.getTotalMessages(false), 1);
     }
-    folder.updateFolder(null);
-    Assert.deepEqual(
-      folder.msgDatabase.listAllKeys(),
-      expected.entries.slice(1).map(entry => entry.key)
+  } finally {
+    // Follow the ordinary xpcshell profile shutdown phases before exiting.
+    Services.startup.advanceShutdownPhase(
+      Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNNETTEARDOWN
     );
-    Assert.equal(folder.getTotalMessages(false), 2);
-    Assert.ok(!(await IOUtils.exists(pending)));
-    folder.updateFolder(null);
-    Assert.equal(
-      folder.getTotalMessages(false),
-      2,
-      "Recovery did not remove/account twice"
+    Services.startup.advanceShutdownPhase(
+      Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNTEARDOWN
     );
-    folder.deleteMessages(
-      [folder.msgDatabase.getMsgHdrForKey(expected.entries[1].key)],
-      null,
-      true,
-      false,
-      null,
-      false
+    Services.startup.advanceShutdownPhase(
+      Services.startup.SHUTDOWN_PHASE_APPSHUTDOWN
     );
-    Assert.deepEqual(folder.msgDatabase.listAllKeys(), [
-      expected.entries[2].key,
-    ]);
-    Assert.equal(
-      readRetentionBody(folder, expected.entries[2].token),
-      expected.entries[2].raw
+    Services.startup.advanceShutdownPhase(
+      Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNQM
     );
-    Assert.equal(folder.getTotalMessages(false), 1);
   }
-  // Follow the ordinary xpcshell profile shutdown phases before exiting.
-  Services.startup.advanceShutdownPhase(
-    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNNETTEARDOWN
-  );
-  Services.startup.advanceShutdownPhase(
-    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNTEARDOWN
-  );
-  Services.startup.advanceShutdownPhase(
-    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWN
-  );
-  Services.startup.advanceShutdownPhase(
-    Services.startup.SHUTDOWN_PHASE_APPSHUTDOWNQM
-  );
 }
 
 let settled = false;

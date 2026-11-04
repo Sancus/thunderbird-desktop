@@ -578,6 +578,9 @@ class nsImapProtocol : public nsIImapProtocol,
   void ProcessAuthenticatedStateURL();
   void ProcessAfterAuthenticated();
   void ProcessSelectedStateURL();
+#ifdef MOZ_PANORAMA
+  void ProcessNativeReplayCommand();
+#endif
   bool TryToLogon();
 
   // ProcessAuthenticatedStateURL() used to be one giant if statement. I've

@@ -2156,6 +2156,23 @@ NS_IMETHODIMP nsImapMailFolder::EmptyTrash(nsIUrlListener* aListener) {
   if (WeAreOffline()) {
     nsCOMPtr<nsIMsgDatabase> trashDB;
     rv = trashFolder->GetMsgDatabase(getter_AddRefs(trashDB));
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(trashDB, NS_ERROR_NOT_AVAILABLE);
+      RefPtr<mozilla::mailnews::DatabaseCore> core =
+          mozilla::mailnews::DatabaseCore::GetInstanceForService();
+      NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+      uint64_t folderId;
+      MOZ_TRY(trashFolder->GetId(&folderId));
+      nsMsgKey key;
+      MOZ_TRY(core->MessageDB().ReserveOfflineOperationKey(folderId, key));
+      mozilla::mailnews::OfflineOperationData payload;
+      payload.operation = nsIMsgOfflineImapOperation::kDeleteAllMsgs;
+      MOZ_TRY(core->MessageDB().StoreOfflineOperation(folderId, key, payload));
+      return trashFolder->SetFlag(nsMsgFolderFlags::OfflineEvents);
+    }
+#endif
     if (trashDB) {
       nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
           do_QueryInterface(trashDB, &rv);
@@ -5332,6 +5349,40 @@ NS_IMETHODIMP nsImapMailFolder::StoreImapFlags(int32_t flags, bool addFlags,
   } else {
     MOZ_TRY(GetDatabase());
     NS_ENSURE_STATE(mDatabase);
+#ifdef MOZ_PANORAMA
+    if (mail_panorama_enabled_AtStartup()) {
+      using namespace mozilla::mailnews;
+      RefPtr<nsImapMailFolder> self(this);
+      RefPtr<PerFolderDatabase> database =
+          static_cast<PerFolderDatabase*>(mDatabase.get());
+      RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+      NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+      uint64_t folderId;
+      MOZ_TRY(GetId(&folderId));
+      for (nsMsgKey key : keys) {
+        QueuedSourceIdentity queued;
+        nsresult found =
+            core->MessageDB().GetQueuedSourceIdentity(folderId, key, queued);
+        ServerMessageLocation source;
+        if (NS_SUCCEEDED(found)) {
+          NS_ENSURE_TRUE(queued.source, NS_ERROR_NOT_AVAILABLE);
+          source = *queued.source;
+        } else {
+          NS_ENSURE_TRUE(found == NS_ERROR_NOT_AVAILABLE, found);
+          ImapUid uid = MOZ_TRY(UidFromMsgKey(database, key));
+          uint32_t epoch;
+          MOZ_TRY(core->FolderDB().GetFolderUidValidity(folderId, epoch));
+          source = {folderId, key, epoch, uid};
+        }
+        // The input is the caller's protocol mutation, never header flags.
+        // The bridge retains committed work if later discoverability fails.
+        MOZ_TRY(database->QueueOfflineProtocolFlagMutation(key, source, flags,
+                                                           addFlags));
+        if (flags) MOZ_TRY(SetFlag(nsMsgFolderFlags::OfflineEvents));
+      }
+      return NS_OK;
+    }
+#endif
     nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb =
         do_QueryInterface(mDatabase, &rv);
     NS_ENSURE_SUCCESS(rv, rv);
@@ -7076,6 +7127,11 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
         case nsIImapUrl::nsImapSubtractMsgFlags: {
 #ifdef MOZ_PANORAMA
           if (mail_panorama_enabled_AtStartup()) {
+            // This URL's durable replay receiver owns local settlement. In
+            // particular, a MOVE STORE is not permission to delete its source.
+            if (static_cast<nsImapUrl*>(imapUrl.get())
+                    ->CopyNativeReplayCommand())
+              break;
             imapMessageFlagsType flags;
             flagCompletionRv = imapUrl->GetMsgFlags(&flags);
             if (NS_SUCCEEDED(flagCompletionRv) &&
@@ -7120,6 +7176,11 @@ nsImapMailFolder::OnStopRunningUrl(nsIURI* aUrl, nsresult aExitCode) {
         case nsIImapUrl::nsImapAddMsgFlags: {
 #ifdef MOZ_PANORAMA
           if (mail_panorama_enabled_AtStartup()) {
+            // This URL's durable replay receiver owns local settlement. In
+            // particular, a MOVE STORE is not permission to delete its source.
+            if (static_cast<nsImapUrl*>(imapUrl.get())
+                    ->CopyNativeReplayCommand())
+              break;
             imapMessageFlagsType flags;
             flagCompletionRv = imapUrl->GetMsgFlags(&flags);
             if (NS_SUCCEEDED(flagCompletionRv) &&

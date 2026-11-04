@@ -2863,9 +2863,268 @@ bool SameOfflineSource(const Maybe<ServerMessageLocation>& a,
                  a->epoch == b->epoch && a->uid == b->uid));
 }
 
+bool SameFlagMutation(const Maybe<OfflineFlagMutation>& a,
+                      const Maybe<OfflineFlagMutation>& b) {
+  return a.isSome() == b.isSome() &&
+         (!a || (a->setMask == b->setMask && a->clearMask == b->clearMask));
+}
+
+bool SameMoveGuard(const Maybe<OfflineMoveSourceGuard>& a,
+                   const Maybe<OfflineMoveSourceGuard>& b) {
+  return a.isSome() == b.isSome() &&
+         (!a || (a->presence == b->presence &&
+                 SameBodyGuard(a->original, b->original)));
+}
+
+nsresult ReplayInteger(mozIStorageStatement* stmt, uint32_t column,
+                       int64_t& value) {
+  int32_t type;
+  MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+  NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_INTEGER,
+                 NS_ERROR_FILE_CORRUPTED);
+  return stmt->GetInt64(column, &value);
+}
+
+nsresult ReadReplayPayload(mozIStorageStatement* stmt, uint32_t offset,
+                           Maybe<OfflineFlagMutation>& flags,
+                           Maybe<OfflineMoveSourceGuard>& guard) {
+  bool absent, other;
+  MOZ_TRY(stmt->GetIsNull(offset, &absent));
+  MOZ_TRY(stmt->GetIsNull(offset + 1, &other));
+  NS_ENSURE_TRUE(absent == other, NS_ERROR_FILE_CORRUPTED);
+  if (!absent) {
+    uint32_t set, clear;
+    MOZ_TRY(OfflineUint32(stmt, offset, set));
+    MOZ_TRY(OfflineUint32(stmt, offset + 1, clear));
+    NS_ENSURE_TRUE(!((set | clear) & ~0xDFu) && !(set & clear),
+                   NS_ERROR_FILE_CORRUPTED);
+    flags = Some(OfflineFlagMutation{uint16_t(set), uint16_t(clear)});
+  }
+  MOZ_TRY(stmt->GetIsNull(offset + 2, &absent));
+  for (uint32_t i = 3; i < 13; ++i) {
+    if (i == 7) continue;  // The store token has its own presence.
+    MOZ_TRY(stmt->GetIsNull(offset + i, &other));
+    NS_ENSURE_TRUE(absent == other, NS_ERROR_FILE_CORRUPTED);
+  }
+  if (absent) {
+    MOZ_TRY(stmt->GetIsNull(offset + 7, &other));
+    NS_ENSURE_TRUE(other, NS_ERROR_FILE_CORRUPTED);
+    return NS_OK;
+  }
+  OfflineMoveSourceGuard found;
+  auto& body = found.original;
+  int32_t type;
+  MOZ_TRY(stmt->GetTypeOfIndex(offset + 2, &type));
+  NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                 NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(stmt->GetUTF8String(offset + 2, body.databaseSourceId));
+  NS_ENSURE_TRUE(!body.databaseSourceId.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+  int64_t value;
+  MOZ_TRY(ReplayInteger(stmt, offset + 3, value));
+  NS_ENSURE_TRUE(value > 0, NS_ERROR_FILE_CORRUPTED);
+  body.folderId = value;
+  MOZ_TRY(OfflineUint32(stmt, offset + 4, body.key));
+  NS_ENSURE_TRUE(body.key && body.key < nsMsgKey_None, NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(ReplayInteger(stmt, offset + 5, value));
+  NS_ENSURE_TRUE(value > 0, NS_ERROR_FILE_CORRUPTED);
+  body.contentRevision = value;
+  MOZ_TRY(ReplayInteger(stmt, offset + 6, value));
+  NS_ENSURE_TRUE(value > 0, NS_ERROR_FILE_CORRUPTED);
+  body.locationRevision = value;
+  MOZ_TRY(stmt->GetIsNull(offset + 7, &absent));
+  if (!absent) {
+    MOZ_TRY(stmt->GetTypeOfIndex(offset + 7, &type));
+    NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                   NS_ERROR_FILE_CORRUPTED);
+    nsCString token;
+    MOZ_TRY(stmt->GetUTF8String(offset + 7, token));
+    body.storeToken = Some(std::move(token));
+  }
+  MOZ_TRY(OfflineUint32(stmt, offset + 8, body.messageSize));
+  MOZ_TRY(OfflineUint32(stmt, offset + 9, body.offlineMessageSize));
+  MOZ_TRY(OfflineUint32(stmt, offset + 10, body.lineCount));
+  MOZ_TRY(OfflineUint32(stmt, offset + 11, body.flags));
+  MOZ_TRY(ReplayInteger(stmt, offset + 12, value));
+  NS_ENSURE_TRUE(value == 0 || value == 1, NS_ERROR_FILE_CORRUPTED);
+  found.presence = static_cast<OfflineMoveLocalPresence>(value);
+  guard = Some(std::move(found));
+  return NS_OK;
+}
+
+nsresult BindReplayPayload(mozIStorageStatement* stmt,
+                           const Maybe<OfflineFlagMutation>& flags,
+                           const Maybe<OfflineMoveSourceGuard>& guard) {
+  if (flags) {
+    MOZ_TRY(stmt->BindInt64ByName("flagSetMask"_ns, flags->setMask));
+    MOZ_TRY(stmt->BindInt64ByName("flagClearMask"_ns, flags->clearMask));
+  } else {
+    MOZ_TRY(stmt->BindNullByName("flagSetMask"_ns));
+    MOZ_TRY(stmt->BindNullByName("flagClearMask"_ns));
+  }
+  if (guard) {
+    const auto& b = guard->original;
+    MOZ_TRY(stmt->BindUTF8StringByName("guardSourceId"_ns, b.databaseSourceId));
+    MOZ_TRY(stmt->BindInt64ByName("guardFolderId"_ns, b.folderId));
+    MOZ_TRY(stmt->BindInt64ByName("guardKey"_ns, b.key));
+    MOZ_TRY(
+        stmt->BindInt64ByName("guardContentRevision"_ns, b.contentRevision));
+    MOZ_TRY(
+        stmt->BindInt64ByName("guardLocationRevision"_ns, b.locationRevision));
+    if (b.storeToken) {
+      MOZ_TRY(stmt->BindUTF8StringByName("guardStoreToken"_ns, *b.storeToken));
+    } else {
+      MOZ_TRY(stmt->BindNullByName("guardStoreToken"_ns));
+    }
+    MOZ_TRY(stmt->BindInt64ByName("guardMessageSize"_ns, b.messageSize));
+    MOZ_TRY(stmt->BindInt64ByName("guardOfflineSize"_ns, b.offlineMessageSize));
+    MOZ_TRY(stmt->BindInt64ByName("guardLineCount"_ns, b.lineCount));
+    MOZ_TRY(stmt->BindInt64ByName("guardFlags"_ns, b.flags));
+    MOZ_TRY(
+        stmt->BindInt64ByName("guardPresence"_ns, int64_t(guard->presence)));
+  } else {
+    for (const char* n :
+         {"guardSourceId", "guardFolderId", "guardKey", "guardContentRevision",
+          "guardLocationRevision", "guardStoreToken", "guardMessageSize",
+          "guardOfflineSize", "guardLineCount", "guardFlags",
+          "guardPresence"}) {
+      MOZ_TRY(stmt->BindNullByName(nsDependentCString(n)));
+    }
+  }
+  return NS_OK;
+}
+
+nsresult ReadReplayError(mozIStorageStatement* stmt, uint32_t column,
+                         Maybe<nsresult>& error) {
+  bool absent;
+  MOZ_TRY(stmt->GetIsNull(column, &absent));
+  if (!absent) {
+    uint32_t value;
+    MOZ_TRY(OfflineUint32(stmt, column, value));
+    NS_ENSURE_TRUE(NS_FAILED(nsresult(value)), NS_ERROR_FILE_CORRUPTED);
+    error = Some(nsresult(value));
+  }
+  return NS_OK;
+}
+
+nsresult ReadReplayProgress(mozIStorageStatement* stmt, uint32_t offset,
+                            Maybe<OfflineReplayCommandProgress>& output) {
+  bool absent, generationAbsent;
+  MOZ_TRY(stmt->GetIsNull(offset, &absent));
+  MOZ_TRY(stmt->GetIsNull(offset + 1, &generationAbsent));
+  NS_ENSURE_TRUE(absent == generationAbsent, NS_ERROR_FILE_CORRUPTED);
+  if (absent) {
+    MOZ_TRY(stmt->GetIsNull(offset + 2, &absent));
+    return absent ? NS_OK : NS_ERROR_FILE_CORRUPTED;
+  }
+  int64_t state, generation;
+  MOZ_TRY(ReplayInteger(stmt, offset, state));
+  MOZ_TRY(ReplayInteger(stmt, offset + 1, generation));
+  NS_ENSURE_TRUE(state >= 0 && state <= 4 && generation >= 0 &&
+                     ((state == 0) == (generation == 0)),
+                 NS_ERROR_FILE_CORRUPTED);
+  OfflineReplayCommandProgress found;
+  found.state = static_cast<OfflineReplayCommandState>(state);
+  found.generation = generation;
+  MOZ_TRY(ReadReplayError(stmt, offset + 2, found.firstError));
+  output = Some(found);
+  return NS_OK;
+}
+
+nsresult BindReplayProgress(mozIStorageStatement* stmt, const char* prefix,
+                            const Maybe<OfflineReplayCommandProgress>& value) {
+  nsAutoCString state(prefix), generation(prefix), error(prefix);
+  state.AppendLiteral("State");
+  generation.AppendLiteral("Generation");
+  error.AppendLiteral("Error");
+  if (!value) {
+    MOZ_TRY(stmt->BindNullByName(state));
+    MOZ_TRY(stmt->BindNullByName(generation));
+    return stmt->BindNullByName(error);
+  }
+  MOZ_TRY(stmt->BindInt64ByName(state, int64_t(value->state)));
+  MOZ_TRY(stmt->BindInt64ByName(generation, value->generation));
+  return value->firstError
+             ? stmt->BindInt64ByName(error, uint32_t(*value->firstError))
+             : stmt->BindNullByName(error);
+}
+
+nsresult WriteOfflineReplayPayload(mozIStorageConnection* connection,
+                                   int64_t id,
+                                   const Maybe<OfflineFlagMutation>& flags,
+                                   const Maybe<OfflineMoveSourceGuard>& guard) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(connection->CreateStatement(
+      "UPDATE offline_operations SET flagSetMask=:flagSetMask, flagClearMask=:flagClearMask, guardSourceId=:guardSourceId, guardFolderId=:guardFolderId, guardKey=:guardKey, guardContentRevision=:guardContentRevision, guardLocationRevision=:guardLocationRevision, guardStoreToken=:guardStoreToken, guardMessageSize=:guardMessageSize, guardOfflineSize=:guardOfflineSize, guardLineCount=:guardLineCount, guardFlags=:guardFlags, guardPresence=:guardPresence WHERE id=:id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
+  MOZ_TRY(BindReplayPayload(stmt, flags, guard));
+  return stmt->Execute();
+}
+
+nsresult WriteReplayAttempt(mozIStorageConnection* connection,
+                            const OfflineAttempt& attempt) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(connection->CreateStatement(
+      "UPDATE offline_attempts SET flagSetMask=:flagSetMask, flagClearMask=:flagClearMask, guardSourceId=:guardSourceId, guardFolderId=:guardFolderId, guardKey=:guardKey, guardContentRevision=:guardContentRevision, guardLocationRevision=:guardLocationRevision, guardStoreToken=:guardStoreToken, guardMessageSize=:guardMessageSize, guardOfflineSize=:guardOfflineSize, guardLineCount=:guardLineCount, guardFlags=:guardFlags, guardPresence=:guardPresence, replayVersion=:replayVersion, moveExpunge=:moveExpunge, flagSetState=:flagSetState, flagSetGeneration=:flagSetGeneration, flagSetError=:flagSetError, flagClearState=:flagClearState, flagClearGeneration=:flagClearGeneration, flagClearError=:flagClearError, sourceStoreState=:sourceStoreState, sourceStoreGeneration=:sourceStoreGeneration, sourceStoreError=:sourceStoreError, sourceExpungeState=:sourceExpungeState, sourceExpungeGeneration=:sourceExpungeGeneration, sourceExpungeError=:sourceExpungeError, moveSettled=:moveSettled, firstError=:firstError WHERE id=:id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, attempt.id));
+  MOZ_TRY(
+      BindReplayPayload(stmt, attempt.flagMutation, attempt.moveSourceGuard));
+  MOZ_TRY(stmt->BindInt64ByName("replayVersion"_ns, attempt.replayVersion));
+  if (attempt.moveSourcePlan) {
+    MOZ_TRY(stmt->BindInt64ByName("moveExpunge"_ns,
+                                  int64_t(attempt.moveSourcePlan->expunge)));
+  } else {
+    MOZ_TRY(stmt->BindNullByName("moveExpunge"_ns));
+  }
+  MOZ_TRY(BindReplayProgress(stmt, "flagSet", attempt.flagSet));
+  MOZ_TRY(BindReplayProgress(stmt, "flagClear", attempt.flagClear));
+  MOZ_TRY(BindReplayProgress(stmt, "sourceStore", attempt.sourceStore));
+  MOZ_TRY(BindReplayProgress(stmt, "sourceExpunge", attempt.sourceExpunge));
+  MOZ_TRY(stmt->BindInt64ByName("moveSettled"_ns, attempt.moveSettled));
+  if (attempt.firstError) {
+    MOZ_TRY(
+        stmt->BindInt64ByName("firstError"_ns, uint32_t(*attempt.firstError)));
+  } else {
+    MOZ_TRY(stmt->BindNullByName("firstError"_ns));
+  }
+  return stmt->Execute();
+}
+
+bool ReplayAcknowledged(const Maybe<OfflineReplayCommandProgress>& step) {
+  return step && step->state == OfflineReplayCommandState::Acknowledged;
+}
+
+Maybe<OfflineReplayCommandProgress>* ReplayStep(OfflineAttempt& attempt,
+                                                OfflineReplayCommand command) {
+  switch (command) {
+    case OfflineReplayCommand::FlagSet:
+      return &attempt.flagSet;
+    case OfflineReplayCommand::FlagClear:
+      return &attempt.flagClear;
+    case OfflineReplayCommand::MoveStore:
+      return &attempt.sourceStore;
+    case OfflineReplayCommand::MoveUidExpunge:
+      return attempt.moveSourcePlan &&
+                     attempt.moveSourcePlan->expunge == OfflineMoveExpunge::Uid
+                 ? &attempt.sourceExpunge
+                 : nullptr;
+    case OfflineReplayCommand::MoveExpunge:
+      return attempt.moveSourcePlan && attempt.moveSourcePlan->expunge ==
+                                           OfflineMoveExpunge::Mailbox
+                 ? &attempt.sourceExpunge
+                 : nullptr;
+  }
+  return nullptr;
+}
+
 bool SameOfflinePayload(const OfflineOperationData& a,
                         const OfflineOperationData& b) {
-  if (a.operation != b.operation || a.flagOperation != b.flagOperation ||
+  if (!SameFlagMutation(a.flagMutation, b.flagMutation) ||
+      !SameMoveGuard(a.moveSourceGuard, b.moveSourceGuard) ||
+      a.operation != b.operation || a.flagOperation != b.flagOperation ||
       a.newFlags != b.newFlags || a.sourceKey != b.sourceKey ||
       a.sourceUid != b.sourceUid || a.messageSize != b.messageSize ||
       a.playingBack != b.playingBack ||
@@ -3244,7 +3503,7 @@ nsresult MessageDatabase::RequireOfflineOperationMutable(int64_t id) {
   MOZ_TRY(DatabaseCore::GetStatement(
       "OfflineOperationInFlight"_ns,
       "SELECT 1 FROM offline_attempts WHERE operationId = :id "
-      "AND state IN (1,3) LIMIT 1"_ns,
+      "AND (state IN (1,3) OR (replayVersion=1 AND moveExpunge IS NOT NULL AND moveSettled=0)) LIMIT 1"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindInt64ByName("id"_ns, id));
@@ -3579,7 +3838,9 @@ nsresult MessageDatabase::ReapplyOfflineMoveInTransaction(
                                   full.keywordsToRemove,
                                   full.copyDestinations.Clone(),
                                   full.pendingDestination,
-                                  full.copyDestinationBindings.Clone()};
+                                  full.copyDestinationBindings.Clone(),
+                                  full.flagMutation,
+                                  full.moveSourceGuard};
     int64_t id, revision;
     Maybe<ServerMessageLocation> source;
     nsresult found = ReadOfflineOperationIdentity(child.folderId, child.key, id,
@@ -3699,7 +3960,9 @@ nsresult MessageDatabase::RestoreOfflineOperationInTransaction(
                                 op.payload.keywordsToRemove,
                                 op.payload.copyDestinations.Clone(),
                                 op.payload.pendingDestination,
-                                op.payload.copyDestinationBindings.Clone()};
+                                op.payload.copyDestinationBindings.Clone(),
+                                op.payload.flagMutation,
+                                op.payload.moveSourceGuard};
   // An explicitly saved APPEND target is the operation's own physical row.
   // Reattach that actual binding, never a URI/key-based inferred counterpart.
   if (restored.pendingDestination &&
@@ -3879,7 +4142,10 @@ nsresult MessageDatabase::GetOfflineOperation(uint64_t folderId, nsMsgKey key,
       "SELECT id, operation, flagOperation, newFlags, sourceKey, sourceUid, "
       "messageSize, playingBack, sourceFolderURI, destinationFolderURI, "
       "keywordsToAdd, keywordsToRemove, destinationFolderId, destinationKey, "
-      "destinationEpoch FROM offline_operations "
+      "destinationEpoch, flagSetMask, flagClearMask, guardSourceId, "
+      "guardFolderId, guardKey, guardContentRevision, guardLocationRevision, "
+      "guardStoreToken, guardMessageSize, guardOfflineSize, guardLineCount, "
+      "guardFlags, guardPresence FROM offline_operations "
       "WHERE folderId = :folder AND messageKey = :key"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
@@ -3907,6 +4173,8 @@ nsresult MessageDatabase::GetOfflineOperation(uint64_t folderId, nsMsgKey key,
   MOZ_TRY(stmt->GetUTF8String(10, found.keywordsToAdd));
   MOZ_TRY(stmt->GetUTF8String(11, found.keywordsToRemove));
   MOZ_TRY(ReadOfflineDestination(stmt, 12, found.pendingDestination));
+  MOZ_TRY(
+      ReadReplayPayload(stmt, 15, found.flagMutation, found.moveSourceGuard));
   nsCOMPtr<mozIStorageStatement> copies;
   MOZ_TRY(DatabaseCore::GetStatement(
       "ReadOfflineCopies"_ns,
@@ -3934,6 +4202,478 @@ nsresult MessageDatabase::GetOfflineOperation(uint64_t folderId, nsMsgKey key,
     found.copyDestinationBindings.AppendElement(destination);
   }
   output = std::move(found);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::QueueOfflineProtocolFlagMutation(
+    const nsACString& databaseSourceId, uint64_t folderId,
+    nsMsgKey operationKey, const ServerMessageLocation& expectedSource,
+    int32_t protocolMask, bool addFlags) {
+  NS_ENSURE_TRUE(protocolMask >= 0 && !(uint32_t(protocolMask) & ~0xDFu) &&
+                     folderId && folderId <= INT64_MAX && operationKey &&
+                     operationKey < nsMsgKey_None &&
+                     expectedSource.folderId == folderId &&
+                     expectedSource.key && expectedSource.key < nsMsgKey_None,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  nsCString sourceId;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+  NS_ENSURE_TRUE(sourceId == databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  auto connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    int64_t id = 0, revision = 0;
+    Maybe<ServerMessageLocation> source;
+    nsresult found = ReadOfflineOperationIdentity(folderId, operationKey, id,
+                                                  revision, source);
+    OfflineOperationData payload;
+    if (found == NS_ERROR_NOT_AVAILABLE) {
+      MessageBodyState body;
+      MOZ_TRY(ReadMessageBodyState(operationKey, body));
+      NS_ENSURE_TRUE(
+          body.folderId == folderId && operationKey == expectedSource.key,
+          NS_ERROR_NOT_AVAILABLE);
+      uint32_t epoch, uid;
+      nsTArray<nsCString> names;
+      MOZ_TRY(GetMessagePropertyNames(operationKey, names));
+      NS_ENSURE_TRUE(names.Contains("uidOnServer"_ns), NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(GetMessageUidOnServer(operationKey, uid));
+      MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
+                                                                       epoch));
+      NS_ENSURE_TRUE(uid == expectedSource.uid && epoch == expectedSource.epoch,
+                     NS_ERROR_NOT_AVAILABLE);
+    } else {
+      MOZ_TRY(found);
+      NS_ENSURE_TRUE(SameOfflineSource(source, Some(expectedSource)),
+                     NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(GetOfflineOperation(folderId, operationKey, payload));
+    }
+    if (!protocolMask) return connection->CommitTransaction();
+    NS_ENSURE_TRUE(
+        !(payload.operation & OfflineOp::kFlagsChanged) || payload.flagMutation,
+        NS_ERROR_NOT_AVAILABLE);
+    if (!payload.flagMutation)
+      payload.flagMutation = Some(OfflineFlagMutation{});
+    auto& flags = *payload.flagMutation;
+    uint16_t mask = uint16_t(protocolMask);
+    if (addFlags) {
+      flags.setMask |= mask;
+      flags.clearMask &= ~mask;
+    } else {
+      flags.clearMask |= mask;
+      flags.setMask &= ~mask;
+    }
+    payload.operation |= OfflineOp::kFlagsChanged;
+    MOZ_TRY(StoreOfflineOperationInTransaction(
+        folderId, operationKey, payload, nullptr, false, Nothing(), true));
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::ReadExpectedReplayAttempt(
+    const OfflineAttempt& expected, OfflineAttempt& actual) {
+  NS_ENSURE_TRUE(expected.id, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(GetOfflineAttempt(expected.id, actual));
+  NS_ENSURE_TRUE(
+      actual.replayVersion == 1 && expected.replayVersion == 1 &&
+          actual.operationId == expected.operationId &&
+          actual.revision == expected.revision &&
+          actual.operation == expected.operation &&
+          actual.folderId == expected.folderId &&
+          actual.operationKey == expected.operationKey &&
+          actual.copyOrdinal == expected.copyOrdinal &&
+          actual.confirmedUid == expected.confirmedUid &&
+          actual.confirmedEpoch == expected.confirmedEpoch &&
+          actual.transferSourceId == expected.transferSourceId &&
+          SameOfflineSource(actual.source, expected.source) &&
+          actual.destination.isSome() == expected.destination.isSome() &&
+          (!actual.destination ||
+           SamePendingDestination(*actual.destination,
+                                  *expected.destination)) &&
+          actual.transferBody.isSome() == expected.transferBody.isSome() &&
+          (!actual.transferBody ||
+           SameBodyGuard(*actual.transferBody, *expected.transferBody)) &&
+          SameFlagMutation(actual.flagMutation, expected.flagMutation) &&
+          SameMoveGuard(actual.moveSourceGuard, expected.moveSourceGuard),
+      NS_ERROR_NOT_AVAILABLE);
+  nsCString sourceId;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+  NS_ENSURE_TRUE(actual.transferSourceId == sourceId, NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ValidateReplaySource(const OfflineAttempt& attempt,
+                                               bool& present) {
+  NS_ENSURE_TRUE(attempt.source, NS_ERROR_NOT_AVAILABLE);
+  uint32_t epoch;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      attempt.source->folderId, epoch));
+  NS_ENSURE_TRUE(epoch == attempt.source->epoch, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(DatabaseCore::sInstance->CheckFolderRelocationRecovery(
+      attempt.source->folderId));
+  {
+    nsCOMPtr<mozIStorageStatement> relocation;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReplaySourceFolderRelocation"_ns,
+        "SELECT 1 FROM body_relocations WHERE folderId=:folder AND state NOT IN(1,2) LIMIT 1"_ns,
+        getter_AddRefs(relocation)));
+    mozStorageStatementScoper scope(relocation);
+    MOZ_TRY(relocation->BindInt64ByName("folder"_ns, attempt.source->folderId));
+    bool pending;
+    MOZ_TRY(relocation->ExecuteStep(&pending));
+    NS_ENSURE_FALSE(pending, NS_ERROR_IN_PROGRESS);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReplaySourceMember"_ns,
+      "SELECT folderId,0 FROM messages WHERE id=:key UNION ALL "
+      "SELECT folderId,1 FROM staged_messages WHERE id=:key"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("key"_ns, attempt.source->key));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (!more) {
+    // A proven queued flag action addresses the once-captured server tuple.
+    // The queued MOVE producer may already have removed local membership.
+    // Absence grants no UID/epoch inference and no destructive MOVE authority.
+    if (attempt.operation == OfflineOp::kFlagsChanged && attempt.flagMutation) {
+      present = false;
+      return NS_OK;
+    }
+
+    NS_ENSURE_TRUE(
+        attempt.moveSourceGuard && attempt.moveSourceGuard->presence ==
+                                       OfflineMoveLocalPresence::ExactOrAbsent,
+        NS_ERROR_NOT_AVAILABLE);
+    const auto& original = attempt.moveSourceGuard->original;
+    NS_ENSURE_TRUE(original.key == attempt.source->key &&
+                       original.folderId == attempt.source->folderId &&
+                       original.databaseSourceId == attempt.transferSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+    present = false;
+    return NS_OK;
+  }
+  int64_t folder, staged;
+  MOZ_TRY(ReplayInteger(stmt, 0, folder));
+  MOZ_TRY(ReplayInteger(stmt, 1, staged));
+  NS_ENSURE_TRUE(
+      folder > 0 && uint64_t(folder) == attempt.source->folderId && !staged,
+      NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  nsTArray<nsCString> names;
+  MOZ_TRY(GetMessagePropertyNames(attempt.source->key, names));
+  NS_ENSURE_TRUE(names.Contains("uidOnServer"_ns), NS_ERROR_NOT_AVAILABLE);
+  uint32_t uid;
+  MOZ_TRY(GetMessageUidOnServer(attempt.source->key, uid));
+  NS_ENSURE_TRUE(uid == attempt.source->uid, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckPendingMessageRelocation(attempt.source->key));
+  if (attempt.moveSourceGuard) {
+    MessageBodyState actual;
+    MOZ_TRY(ReadMessageBodyState(attempt.source->key, actual));
+    NS_ENSURE_TRUE(SameBodyGuard(actual, attempt.moveSourceGuard->original),
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  present = true;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::OfflineReplayActionsComplete(
+    const OfflineAttempt& move, bool sourceOnly, bool& complete) {
+  OfflineOperationData payload;
+  MOZ_TRY(GetOfflineOperation(move.folderId, move.operationKey, payload));
+  for (uint32_t action = 1; action <= OfflineOp::kRemoveKeywords;
+       action <<= 1) {
+    if (!(payload.operation & action) || action == OfflineOp::kMoveResult ||
+        action == OfflineOp::kAddedHeader)
+      continue;
+    if (action == OfflineOp::kMsgMoved) continue;
+    if (sourceOnly && action != OfflineOp::kFlagsChanged &&
+        action != OfflineOp::kAddKeywords &&
+        action != OfflineOp::kRemoveKeywords && action != OfflineOp::kMsgCopy)
+      continue;
+    uint32_t count =
+        action == OfflineOp::kMsgCopy ? payload.copyDestinations.Length() : 1;
+    if (!count) {
+      complete = false;
+      return NS_OK;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      OfflineAttempt other;
+      nsresult rv = GetOfflineAttemptForAction(
+          move.folderId, move.operationKey, action,
+          action == OfflineOp::kMsgCopy ? Some(i) : Nothing(), other);
+      if (rv == NS_ERROR_NOT_AVAILABLE) {
+        complete = false;
+        return NS_OK;
+      }
+      MOZ_TRY(rv);
+      if (other.state != OfflineAttemptState::Confirmed ||
+          other.revision != move.revision) {
+        complete = false;
+        return NS_OK;
+      }
+    }
+  }
+  complete = true;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ValidateReplayMove(const OfflineAttempt& attempt) {
+  NS_ENSURE_TRUE(attempt.operation == OfflineOp::kMsgMoved &&
+                     !attempt.copyOrdinal && attempt.moveSourceGuard &&
+                     attempt.confirmedUid && attempt.confirmedEpoch &&
+                     attempt.state == OfflineAttemptState::Confirmed &&
+                     attempt.transferBody && attempt.destination,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ValidateTransferTargetInTransaction(attempt));
+  uint32_t uid;
+  nsTArray<nsCString> names;
+  MOZ_TRY(GetMessagePropertyNames(attempt.destination->key, names));
+  NS_ENSURE_TRUE(names.Contains("uidOnServer"_ns), NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(GetMessageUidOnServer(attempt.destination->key, uid));
+  NS_ENSURE_TRUE(uid == *attempt.confirmedUid, NS_ERROR_NOT_AVAILABLE);
+  uint32_t epoch;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      attempt.destination->folderId, epoch));
+  NS_ENSURE_TRUE(epoch == *attempt.confirmedEpoch, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckPendingMessageRelocation(attempt.destination->key));
+  bool present;
+  MOZ_TRY(ValidateReplaySource(attempt, present));
+  return NS_OK;
+}
+
+nsresult MessageDatabase::PlanOfflineMoveSource(
+    const OfflineAttempt& expected, const OfflineMoveSourcePlan& plan,
+    OfflineAttempt& output) {
+  NS_ENSURE_TRUE(uint8_t(plan.expunge) <= uint8_t(OfflineMoveExpunge::Mailbox),
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  auto connection = DatabaseCore::sConnection;
+  OfflineAttempt actual;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(ReadExpectedReplayAttempt(expected, actual));
+    MOZ_TRY(ValidateReplayMove(actual));
+    if (actual.moveSourcePlan) {
+      NS_ENSURE_TRUE(actual.moveSourcePlan->expunge == plan.expunge,
+                     NS_ERROR_NOT_AVAILABLE);
+    } else {
+      actual.moveSourcePlan = Some(plan);
+      actual.sourceStore = Some(OfflineReplayCommandProgress{});
+      if (plan.expunge != OfflineMoveExpunge::None)
+        actual.sourceExpunge = Some(OfflineReplayCommandProgress{});
+      MOZ_TRY(WriteReplayAttempt(DatabaseCore::sConnection, actual));
+    }
+    return connection->CommitTransaction();
+  }();
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  output = std::move(actual);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::BeginOfflineReplayCommand(
+    const OfflineAttempt& expected, OfflineReplayCommand command,
+    OfflineReplayCommandToken& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  auto connection = DatabaseCore::sConnection;
+  OfflineReplayCommandToken prepared;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    auto& actual = prepared.attempt;
+    MOZ_TRY(ReadExpectedReplayAttempt(expected, actual));
+    NS_ENSURE_FALSE(actual.moveSettled, NS_ERROR_NOT_AVAILABLE);
+    QueuedSourceIdentity identity{actual.transferSourceId, actual.folderId,
+                                  actual.operationKey,     actual.operationId,
+                                  actual.revision,         actual.source};
+    MOZ_TRY(ValidateQueuedSourceIdentity(identity));
+    auto* selected = ReplayStep(actual, command);
+    NS_ENSURE_TRUE(selected && *selected, NS_ERROR_NOT_AVAILABLE);
+    auto& step = **selected;
+    NS_ENSURE_TRUE(
+        step.state == OfflineReplayCommandState::Pending ||
+            step.state == OfflineReplayCommandState::RejectedNoEffect,
+        NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(step.generation < INT64_MAX, NS_ERROR_ILLEGAL_VALUE);
+    if (command == OfflineReplayCommand::FlagSet ||
+        command == OfflineReplayCommand::FlagClear) {
+      NS_ENSURE_TRUE(actual.operation == OfflineOp::kFlagsChanged &&
+                         actual.state == OfflineAttemptState::Sent,
+                     NS_ERROR_NOT_AVAILABLE);
+      bool present;
+      MOZ_TRY(ValidateReplaySource(actual, present));
+      if (command == OfflineReplayCommand::FlagClear && actual.flagSet)
+        NS_ENSURE_TRUE(ReplayAcknowledged(actual.flagSet),
+                       NS_ERROR_NOT_AVAILABLE);
+    } else {
+      MOZ_TRY(ValidateReplayMove(actual));
+      bool complete;
+      MOZ_TRY(OfflineReplayActionsComplete(actual, true, complete));
+      NS_ENSURE_TRUE(complete, NS_ERROR_NOT_AVAILABLE);
+      if (command != OfflineReplayCommand::MoveStore)
+        NS_ENSURE_TRUE(ReplayAcknowledged(actual.sourceStore),
+                       NS_ERROR_NOT_AVAILABLE);
+    }
+    step.state = OfflineReplayCommandState::Sent;
+    ++step.generation;
+    prepared.command = command;
+    prepared.generation = step.generation;
+    MOZ_TRY(WriteReplayAttempt(DatabaseCore::sConnection, actual));
+    return connection->CommitTransaction();
+  }();
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  output = std::move(prepared);
+  return NS_OK;
+}
+
+nsresult MessageDatabase::RecordOfflineReplayCommand(
+    const OfflineReplayCommandToken& token, OfflineReplayReceipt receipt,
+    nsresult actualStatus) {
+  NS_ENSURE_TRUE(uint8_t(receipt) <= uint8_t(OfflineReplayReceipt::Ambiguous) &&
+                     token.generation && token.generation <= INT64_MAX &&
+                     (receipt != OfflineReplayReceipt::Acknowledged ||
+                      NS_SUCCEEDED(actualStatus)) &&
+                     (receipt != OfflineReplayReceipt::RejectedNoEffect ||
+                      NS_FAILED(actualStatus)),
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  auto connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedReplayAttempt(token.attempt, actual));
+    NS_ENSURE_TRUE(actual.moveSourcePlan.isSome() ==
+                           token.attempt.moveSourcePlan.isSome() &&
+                       (!actual.moveSourcePlan ||
+                        actual.moveSourcePlan->expunge ==
+                            token.attempt.moveSourcePlan->expunge),
+                   NS_ERROR_NOT_AVAILABLE);
+    OfflineAttempt sent = token.attempt;
+    auto* dispatched = ReplayStep(sent, token.command);
+    NS_ENSURE_TRUE(
+        dispatched && *dispatched &&
+            (**dispatched).state == OfflineReplayCommandState::Sent &&
+            (**dispatched).generation == token.generation,
+        NS_ERROR_NOT_AVAILABLE);
+    auto* selected = ReplayStep(actual, token.command);
+    NS_ENSURE_TRUE(selected && *selected, NS_ERROR_NOT_AVAILABLE);
+    auto& step = **selected;
+    NS_ENSURE_TRUE(step.generation == token.generation, NS_ERROR_NOT_AVAILABLE);
+    auto state = receipt == OfflineReplayReceipt::Acknowledged
+                     ? OfflineReplayCommandState::Acknowledged
+                 : receipt == OfflineReplayReceipt::RejectedNoEffect
+                     ? OfflineReplayCommandState::RejectedNoEffect
+                     : OfflineReplayCommandState::Ambiguous;
+    if (step.state == state) return connection->CommitTransaction();
+    NS_ENSURE_TRUE(step.state == OfflineReplayCommandState::Sent,
+                   NS_ERROR_NOT_AVAILABLE);
+    QueuedSourceIdentity identity{actual.transferSourceId, actual.folderId,
+                                  actual.operationKey,     actual.operationId,
+                                  actual.revision,         actual.source};
+    MOZ_TRY(ValidateQueuedSourceIdentity(identity));
+    // A receipt records the wire fact even if the local body subsequently
+    // changed. Destructive dispatch/settlement still revalidate all physical
+    // guards.
+    step.state = state;
+    if (NS_FAILED(actualStatus)) {
+      if (!step.firstError) step.firstError = Some(actualStatus);
+      if (!actual.firstError) actual.firstError = Some(actualStatus);
+    }
+    MOZ_TRY(WriteReplayAttempt(DatabaseCore::sConnection, actual));
+    return connection->CommitTransaction();
+  }();
+  return FinishOfflineWrite(connection, rv);
+}
+
+nsresult MessageDatabase::FinishOfflineMoveInTransaction(
+    const OfflineAttempt& attempt, bool removed,
+    OfflineMoveSettlement& output) {
+  bool complete;
+  MOZ_TRY(OfflineReplayActionsComplete(attempt, false, complete));
+  if (complete) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "RetireSettledOfflineMove"_ns,
+        "DELETE FROM offline_operations WHERE id=:id AND revision=:revision RETURNING id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, attempt.operationId));
+    MOZ_TRY(stmt->BindInt64ByName("revision"_ns, attempt.revision));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "SettleOfflineMove"_ns,
+      "UPDATE offline_attempts SET moveSettled=1,settledSourceRemoved=:removed,"
+      "settledOperationRetired=:retired WHERE id=:id AND moveSettled=0 RETURNING id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scope(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, attempt.id));
+  MOZ_TRY(stmt->BindInt64ByName("removed"_ns, removed));
+  MOZ_TRY(stmt->BindInt64ByName("retired"_ns, complete));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
+  output = {attempt.id, attempt.destination->key, removed, complete};
+  return NS_OK;
+}
+
+nsresult MessageDatabase::SettleOfflineMove(const OfflineAttempt& expected,
+                                            OfflineMoveSettlement& output) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  RefPtr<MessageDatabase> self(this);
+  OfflineAttempt actual;
+  MOZ_TRY(ReadExpectedReplayAttempt(expected, actual));
+  NS_ENSURE_TRUE(
+      actual.operation == OfflineOp::kMsgMoved && actual.destination &&
+          actual.moveSourcePlan && ReplayAcknowledged(actual.sourceStore) &&
+          (!actual.sourceExpunge || ReplayAcknowledged(actual.sourceExpunge)),
+      NS_ERROR_NOT_AVAILABLE);
+  if (actual.moveSettled) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReadSettledOfflineMove"_ns,
+        "SELECT settledSourceRemoved,settledOperationRetired FROM offline_attempts WHERE id=:id"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("id"_ns, actual.id));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_FILE_CORRUPTED);
+    uint32_t removed, retired;
+    MOZ_TRY(OfflineUint32(stmt, 0, removed));
+    MOZ_TRY(OfflineUint32(stmt, 1, retired));
+    NS_ENSURE_TRUE(removed <= 1 && retired <= 1, NS_ERROR_FILE_CORRUPTED);
+    output = {actual.id, actual.destination->key, bool(removed), bool(retired)};
+    return NS_OK;
+  }
+  MOZ_TRY(ValidateReplayMove(actual));
+  bool present;
+  MOZ_TRY(ValidateReplaySource(actual, present));
+  if (present) {
+    return RemoveMessageInternal(actual.source->key, actual.source->folderId,
+                                 &actual.transferSourceId,
+                                 MessageRemovalAccounting::OfflineMessageSize,
+                                 nullptr, nullptr, nullptr, &actual, &output);
+  }
+  auto connection = DatabaseCore::sConnection;
+  OfflineMoveSettlement prepared;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(ValidateReplayMove(actual));
+    MOZ_TRY(FinishOfflineMoveInTransaction(actual, false, prepared));
+    return connection->CommitTransaction();
+  }();
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  output = prepared;
   return NS_OK;
 }
 
@@ -4012,7 +4752,7 @@ nsresult MessageDatabase::StoreOfflineOperation(
 nsresult MessageDatabase::StoreOfflineOperationInTransaction(
     uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
     const OfflineOperationUndo* restoring, bool restoreEmptyCanceledMove,
-    const Maybe<uint32_t>& canceledDestination) {
+    const Maybe<uint32_t>& canceledDestination, bool typedFlagMutation) {
   int64_t id = 0, revision = 0;
   Maybe<ServerMessageLocation> source;
   Maybe<uint32_t> folderEpoch;
@@ -4083,6 +4823,44 @@ nsresult MessageDatabase::StoreOfflineOperationInTransaction(
             folderId, location.epoch));
         source = Some(location);
       }
+    }
+  }
+  Maybe<OfflineFlagMutation> replayFlags;
+  Maybe<OfflineMoveSourceGuard> replayGuard;
+  OfflineOperationData previous;
+  if (id && !restoreEmptyCanceledMove) {
+    MOZ_TRY(GetOfflineOperation(folderId, key, previous));
+    replayFlags = previous.flagMutation;
+    replayGuard = previous.moveSourceGuard;
+  } else if (restoring) {
+    replayFlags = input.flagMutation;
+    replayGuard = input.moveSourceGuard;
+  }
+  if (typedFlagMutation) {
+    replayFlags = input.flagMutation;
+  } else if (input.invalidateFlagMutation) {
+    replayFlags.reset();
+  } else {
+    NS_ENSURE_TRUE(SameFlagMutation(input.flagMutation, replayFlags),
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  if (replayFlags) {
+    NS_ENSURE_TRUE(
+        !((replayFlags->setMask | replayFlags->clearMask) & ~0xDFu) &&
+            !(replayFlags->setMask & replayFlags->clearMask),
+        NS_ERROR_INVALID_ARG);
+  }
+  NS_ENSURE_TRUE(SameMoveGuard(input.moveSourceGuard, replayGuard),
+                 NS_ERROR_NOT_AVAILABLE);
+  if (!restoring && !replayGuard && (input.operation & OfflineOp::kMsgMoved) &&
+      !(previous.operation & OfflineOp::kMsgMoved)) {
+    if (source) {
+      MessageBodyState original;
+      MOZ_TRY(ReadMessageBodyState(source->key, original));
+      NS_ENSURE_TRUE(original.folderId == source->folderId,
+                     NS_ERROR_NOT_AVAILABLE);
+      replayGuard = Some(OfflineMoveSourceGuard{
+          std::move(original), OfflineMoveLocalPresence::ExactOrAbsent});
     }
   }
   nsTArray<nsMsgKey> destinations;
@@ -4200,6 +4978,8 @@ nsresult MessageDatabase::StoreOfflineOperationInTransaction(
     MOZ_TRY(stmt->ExecuteStep(&more));
     NS_ENSURE_FALSE(more, NS_ERROR_UNEXPECTED);
   }
+  MOZ_TRY(WriteOfflineReplayPayload(DatabaseCore::sConnection, id, replayFlags,
+                                    replayGuard));
   {
     nsCOMPtr<mozIStorageStatement> stmt;
     MOZ_TRY(DatabaseCore::GetStatement(
@@ -4292,7 +5072,7 @@ nsresult MessageDatabase::ListOfflineOperations(uint64_t folderId,
       "ListOfflineOperations"_ns,
       "SELECT messageKey FROM offline_operations WHERE folderId = :folder AND "
       "(:deletesOnly = 0 OR (operation & :moved) != 0 OR "
-      "((operation & :flagsChanged) != 0 AND (newFlags & :deleted) != 0)) ORDER BY messageKey"_ns,
+      "((operation & :flagsChanged) != 0 AND ((flagSetMask IS NULL AND (newFlags & :deleted) != 0) OR (flagSetMask & :deleted) != 0))) ORDER BY messageKey"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
@@ -4368,6 +5148,12 @@ nsresult MessageDatabase::BeginOfflineAttemptInternal(
             !(operation & (OfflineOp::kMoveResult | OfflineOp::kAddedHeader)) &&
             (payload.operation & operation),
         NS_ERROR_INVALID_ARG);
+    if (operation == OfflineOp::kFlagsChanged) {
+      NS_ENSURE_TRUE(copyOrdinal && payload.flagMutation &&
+                         (payload.flagMutation->setMask ||
+                          payload.flagMutation->clearMask),
+                     NS_ERROR_NOT_AVAILABLE);
+    }
     // One dispatched action from the combined payload, never an implicit batch.
     NS_ENSURE_TRUE(source || (operation & (OfflineOp::kAppendDraft |
                                            OfflineOp::kAppendTemplate |
@@ -4610,6 +5396,21 @@ nsresult MessageDatabase::BeginOfflineAttemptInternal(
       }
       MOZ_TRY(stmt->Execute());
     }
+    if (copyOrdinal) {
+      OfflineAttempt replay;
+      replay.id = created;
+      replay.replayVersion = 1;
+      if (operation == OfflineOp::kFlagsChanged) {
+        replay.flagMutation = payload.flagMutation;
+        if (replay.flagMutation->setMask)
+          replay.flagSet = Some(OfflineReplayCommandProgress{});
+        if (replay.flagMutation->clearMask)
+          replay.flagClear = Some(OfflineReplayCommandProgress{});
+      }
+      if (operation == OfflineOp::kMsgMoved)
+        replay.moveSourceGuard = payload.moveSourceGuard;
+      MOZ_TRY(WriteReplayAttempt(DatabaseCore::sConnection, replay));
+    }
     return connection->CommitTransaction();
   }();
   MOZ_TRY(FinishOfflineWrite(connection, rv));
@@ -4635,7 +5436,7 @@ nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
       "transferContentRevision, transferLocationRevision, transferStoreToken, "
       "transferMessageSize, transferOfflineSize, transferLineCount, "
       "transferFlags, "
-      "confirmedEpoch FROM offline_attempts WHERE id = :id"_ns,
+      "confirmedEpoch, flagSetMask, flagClearMask, guardSourceId, guardFolderId, guardKey, guardContentRevision, guardLocationRevision, guardStoreToken, guardMessageSize, guardOfflineSize, guardLineCount, guardFlags, guardPresence, replayVersion, moveExpunge, flagSetState, flagSetGeneration, flagSetError, flagClearState, flagClearGeneration, flagClearError, sourceStoreState, sourceStoreGeneration, sourceStoreError, sourceExpungeState, sourceExpungeGeneration, sourceExpungeError, moveSettled, firstError, settledSourceRemoved, settledOperationRetired FROM offline_attempts WHERE id = :id"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
   MOZ_TRY(stmt->BindInt64ByName("id"_ns, attemptId));
@@ -4844,6 +5645,84 @@ nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
              found.destination->epochKnown) {
     // Existing schema-17 confirmations retain their original known epoch.
     found.confirmedEpoch = Some(found.destination->epoch);
+  }
+  MOZ_TRY(
+      ReadReplayPayload(stmt, 35, found.flagMutation, found.moveSourceGuard));
+  MOZ_TRY(OfflineUint32(stmt, 48, found.replayVersion));
+  NS_ENSURE_TRUE(found.replayVersion <= 1, NS_ERROR_FILE_CORRUPTED);
+  bool planAbsent;
+  MOZ_TRY(stmt->GetIsNull(49, &planAbsent));
+  if (!planAbsent) {
+    uint32_t value;
+    MOZ_TRY(OfflineUint32(stmt, 49, value));
+    NS_ENSURE_TRUE(value <= 2, NS_ERROR_FILE_CORRUPTED);
+    found.moveSourcePlan =
+        Some(OfflineMoveSourcePlan{static_cast<OfflineMoveExpunge>(value)});
+  }
+  MOZ_TRY(ReadReplayProgress(stmt, 50, found.flagSet));
+  MOZ_TRY(ReadReplayProgress(stmt, 53, found.flagClear));
+  MOZ_TRY(ReadReplayProgress(stmt, 56, found.sourceStore));
+  MOZ_TRY(ReadReplayProgress(stmt, 59, found.sourceExpunge));
+  uint32_t settled;
+  MOZ_TRY(OfflineUint32(stmt, 62, settled));
+  NS_ENSURE_TRUE(settled <= 1, NS_ERROR_FILE_CORRUPTED);
+  found.moveSettled = settled;
+  MOZ_TRY(ReadReplayError(stmt, 63, found.firstError));
+  for (uint32_t column : {64, 65}) {
+    bool absent;
+    MOZ_TRY(stmt->GetIsNull(column, &absent));
+    NS_ENSURE_TRUE(absent == !found.moveSettled, NS_ERROR_FILE_CORRUPTED);
+    if (!absent) {
+      uint32_t value;
+      MOZ_TRY(OfflineUint32(stmt, column, value));
+      NS_ENSURE_TRUE(value <= 1, NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+
+  if (!found.replayVersion) {
+    NS_ENSURE_TRUE(!found.flagMutation && !found.moveSourceGuard &&
+                       !found.moveSourcePlan && !found.flagSet &&
+                       !found.flagClear && !found.sourceStore &&
+                       !found.sourceExpunge && !found.moveSettled &&
+                       !found.firstError,
+                   NS_ERROR_FILE_CORRUPTED);
+  } else {
+    NS_ENSURE_TRUE(!found.transferSourceId.IsEmpty(), NS_ERROR_FILE_CORRUPTED);
+    if (found.operation == OfflineOp::kFlagsChanged) {
+      NS_ENSURE_TRUE(
+          found.flagMutation &&
+              found.flagSet.isSome() == bool(found.flagMutation->setMask) &&
+              found.flagClear.isSome() == bool(found.flagMutation->clearMask),
+          NS_ERROR_FILE_CORRUPTED);
+    } else {
+      NS_ENSURE_TRUE(!found.flagMutation && !found.flagSet && !found.flagClear,
+                     NS_ERROR_FILE_CORRUPTED);
+    }
+    NS_ENSURE_TRUE(
+        !found.moveSourceGuard || found.operation == OfflineOp::kMsgMoved,
+        NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(found.moveSourcePlan.isSome() == found.sourceStore.isSome(),
+                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(found.sourceExpunge.isSome() ==
+                       (found.moveSourcePlan && found.moveSourcePlan->expunge !=
+                                                    OfflineMoveExpunge::None),
+                   NS_ERROR_FILE_CORRUPTED);
+    if (found.moveSourcePlan) {
+      NS_ENSURE_TRUE(found.operation == OfflineOp::kMsgMoved &&
+                         found.moveSourceGuard &&
+                         found.state == OfflineAttemptState::Confirmed &&
+                         found.confirmedUid && found.confirmedEpoch &&
+                         found.transferBody && !found.copyOrdinal,
+                     NS_ERROR_FILE_CORRUPTED);
+      NS_ENSURE_TRUE(!found.sourceExpunge || !found.sourceExpunge->generation ||
+                         ReplayAcknowledged(found.sourceStore),
+                     NS_ERROR_FILE_CORRUPTED);
+    }
+    NS_ENSURE_TRUE(
+        !found.moveSettled ||
+            (ReplayAcknowledged(found.sourceStore) &&
+             (!found.sourceExpunge || ReplayAcknowledged(found.sourceExpunge))),
+        NS_ERROR_FILE_CORRUPTED);
   }
   output = std::move(found);
   return NS_OK;
@@ -5175,7 +6054,8 @@ nsresult MessageDatabase::ResolveOfflineAttemptNotApplied(uint64_t attemptId) {
   MOZ_TRY(DatabaseCore::GetStatement(
       "ResolveOfflineAttemptNotApplied"_ns,
       "UPDATE offline_attempts SET state = 0 WHERE id = :id AND state IN (1,3) "
-      "AND appendAccepted = 0 AND transferAccepted = 0 "
+      "AND appendAccepted = 0 AND transferAccepted = 0 AND (replayVersion = 0 "
+      "OR (operation <> 1 AND moveExpunge IS NULL)) "
       "RETURNING id"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
@@ -5197,7 +6077,8 @@ nsresult MessageDatabase::MarkOfflineAttemptAmbiguous(uint64_t attemptId) {
   MOZ_TRY(DatabaseCore::GetStatement(
       "MarkOfflineAttemptAmbiguous"_ns,
       "UPDATE offline_attempts SET state = 3 WHERE id = :id AND state IN (1,3) "
-      "AND appendAccepted = 0 AND transferAccepted = 0 "
+      "AND appendAccepted = 0 AND transferAccepted = 0 AND (replayVersion = 0 "
+      "OR (operation <> 1 AND moveExpunge IS NULL)) "
       "RETURNING id"_ns,
       getter_AddRefs(stmt)));
   mozStorageStatementScoper scoper(stmt);
@@ -5222,6 +6103,13 @@ nsresult MessageDatabase::ConfirmOfflineAttempt(
   nsresult rv = [&]() -> nsresult {
     OfflineAttempt attempt;
     MOZ_TRY(GetOfflineAttempt(attemptId, attempt));
+    if (attempt.operation == OfflineOp::kFlagsChanged &&
+        attempt.replayVersion) {
+      NS_ENSURE_TRUE(
+          (!attempt.flagSet || ReplayAcknowledged(attempt.flagSet)) &&
+              (!attempt.flagClear || ReplayAcknowledged(attempt.flagClear)),
+          NS_ERROR_NOT_AVAILABLE);
+    }
     NS_ENSURE_TRUE(attempt.destination.isSome() == destinationUid.isSome(),
                    NS_ERROR_INVALID_ARG);
     if (attempt.state == OfflineAttemptState::Confirmed) {
@@ -5277,6 +6165,31 @@ nsresult MessageDatabase::ConfirmOfflineAttempt(
       MOZ_TRY(BindMessageToServerUidInTransaction(
           attempt.destination->key, attempt.destination->folderId,
           destinationUid->epoch, destinationUid->uid, true));
+      if (attempt.replayVersion == 1 &&
+          attempt.operation == OfflineOp::kMsgMoved &&
+          attempt.moveSourceGuard) {
+        // This checked UID-property write advances the destination journal.
+        // Retain its resulting incarnation inside the same confirmation TX;
+        // never accept a later lookup as proof that the COPY body still
+        // matches.
+        MessageBodyState bound;
+        MOZ_TRY(ReadMessageBodyState(attempt.destination->key, bound));
+        auto before = *attempt.transferBody;
+        before.contentRevision = bound.contentRevision;
+        before.locationRevision = bound.locationRevision;
+        NS_ENSURE_TRUE(SameBodyGuard(before, bound), NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<mozIStorageStatement> update;
+        MOZ_TRY(DatabaseCore::GetStatement(
+            "ConfirmMoveBodyIncarnation"_ns,
+            "UPDATE offline_attempts SET transferContentRevision=:content,"
+            "transferLocationRevision=:location WHERE id=:id"_ns,
+            getter_AddRefs(update)));
+        mozStorageStatementScoper scope(update);
+        MOZ_TRY(update->BindInt64ByName("content"_ns, bound.contentRevision));
+        MOZ_TRY(update->BindInt64ByName("location"_ns, bound.locationRevision));
+        MOZ_TRY(update->BindInt64ByName("id"_ns, attempt.id));
+        MOZ_TRY(update->Execute());
+      }
     }
     {
       nsCOMPtr<mozIStorageStatement> stmt;
@@ -5680,7 +6593,8 @@ nsresult MessageDatabase::AccountRemovedMessage(
 nsresult MessageDatabase::RemoveMessageInternal(
     nsMsgKey key, uint64_t folderId, const nsACString* databaseSourceId,
     MessageRemovalAccounting accounting, RemovedMessage* output,
-    OfflineOperationUndo* redo, OfflineOperationUndo* nextOffline) {
+    OfflineOperationUndo* redo, OfflineOperationUndo* nextOffline,
+    const OfflineAttempt* settlement, OfflineMoveSettlement* settledOutput) {
   MOZ_ASSERT(key != nsMsgKey_None);
   MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
@@ -5690,6 +6604,7 @@ nsresult MessageDatabase::RemoveMessageInternal(
     return NS_ERROR_IN_PROGRESS;
   }
 
+  OfflineMoveSettlement settled;
   RemovedMessage captured;
   OfflineOperationUndo preparedOffline;
   CachedMsg cached;
@@ -5699,6 +6614,20 @@ nsresult MessageDatabase::RemoveMessageInternal(
   notification->kind = QueuedMessageBatch::Kind::Removed;
   MOZ_TRY(connection->BeginTransaction());
   nsresult rv = [&]() -> nsresult {
+    if (settlement) {
+      OfflineAttempt actual;
+      MOZ_TRY(ReadExpectedReplayAttempt(*settlement, actual));
+      MOZ_TRY(ValidateReplayMove(actual));
+      NS_ENSURE_TRUE(!actual.moveSettled &&
+                         ReplayAcknowledged(actual.sourceStore) &&
+                         (!actual.sourceExpunge ||
+                          ReplayAcknowledged(actual.sourceExpunge)),
+                     NS_ERROR_NOT_AVAILABLE);
+      bool present;
+      MOZ_TRY(ValidateReplaySource(actual, present));
+      NS_ENSURE_TRUE(present && actual.source->key == key,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
     if (databaseSourceId) {
       MOZ_TRY(
           AccountRemovedMessage(key, folderId, *databaseSourceId, accounting));
@@ -5787,6 +6716,8 @@ nsresult MessageDatabase::RemoveMessageInternal(
     message = new (fallible) Message(key);
     NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
     notification->live = message;
+    if (settlement)
+      MOZ_TRY(FinishOfflineMoveInTransaction(*settlement, true, settled));
     return connection->CommitTransaction();
   }();
   if (NS_FAILED(rv)) {
@@ -5817,6 +6748,7 @@ nsresult MessageDatabase::RemoveMessageInternal(
     *nextOffline = std::move(preparedOffline);
     redo->mData.reset();
   }
+  if (settledOutput) *settledOutput = settled;
   QueueMessageBatch(std::move(notification));
   return NS_OK;
 }

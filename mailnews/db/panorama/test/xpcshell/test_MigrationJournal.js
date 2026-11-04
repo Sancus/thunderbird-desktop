@@ -1342,9 +1342,7 @@ add_task(async function test_committedSnapshotRetainsMappingsOnSourceRefusal() {
       journal.beginImport("folder-source"),
       error =>
         mode == "missing"
-          ? AppConstants.platform == "win"
-            ? error.result === Cr.NS_ERROR_FILE_NOT_FOUND
-            : error.name === "NotFoundError"
+          ? error.result === Cr.NS_ERROR_FILE_NOT_FOUND
           : error.name === "Error" &&
             error.message ===
               (mode == "replaced"

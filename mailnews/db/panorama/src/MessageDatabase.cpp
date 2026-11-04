@@ -928,7 +928,7 @@ nsresult MessageDatabase::AddNewsArticle(const NewsArticleIdentity& expected,
   if (NS_SUCCEEDED(rv)) {
     RefPtr<Message> message = new (fallible) Message(existing);
     NS_ENSURE_TRUE(message, NS_ERROR_OUT_OF_MEMORY);
-    nsCOMPtr<nsIMsgDBHdr> owningHeader = message;
+    nsCOMPtr<nsIMsgDBHdr> owningHeader = message.get();
     output = {false, existing, message};
     if (liveHeader) {
       owningHeader.forget(liveHeader);
@@ -969,14 +969,15 @@ nsresult MessageDatabase::AddNewsArticle(const NewsArticleIdentity& expected,
   NS_ENSURE_TRUE(set, NS_ERROR_OUT_OF_MEMORY);
   NS_ENSURE_TRUE((zero ? set->Add(0) : set->Remove(0)) >= 0,
                  NS_ERROR_OUT_OF_MEMORY);
-  RawHdr header = parsed;
-  header.flags &= ~nsMsgMessageFlags::Read;
-  if (set->IsMember(expected.articleNumber))
-    header.flags |= nsMsgMessageFlags::Read;
+  // RawHdr owns move-only ordered arrays. Borrow the complete parsed input;
+  // only the typed Read word is resolved for the existing insertion path.
+  const Maybe<bool> insertionRead =
+      readIntent.isSome() ? readIntent
+                          : Some(set->IsMember(expected.articleNumber));
   nsMsgKey key;
-  return InsertMessage(current.folderId, header, false, notifyLegacy, &key,
+  return InsertMessage(current.folderId, parsed, false, notifyLegacy, &key,
                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                       &expected, &output, liveHeader, &readIntent);
+                       &expected, &output, liveHeader, &insertionRead);
 }
 
 nsresult MessageDatabase::GetSearchWatermark(uint64_t& sequence) {

@@ -638,8 +638,10 @@ add_task(function test_articleZeroDistinctFromMissing() {
   const header = db.getMsgHdrForMessageID("zero-s363@example.invalid");
   Assert.ok(header, "A real captured article0 was published");
   Assert.ok(header.isRead, "Exact native zero membership is retained");
-  Assert.ok(
-    header.messageKey > 0 && header.messageKey != 0xffffffff,
+  Assert.greater(header.messageKey, 0, "The actual physical key is positive");
+  Assert.notEqual(
+    header.messageKey,
+    0xffffffff,
     "Zero is an article, not a fabricated physical key"
   );
   const keys = db.listAllKeys();

@@ -16804,13 +16804,13 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, owner->SetReadSet(set));
   NewsArticleIdentity unreadArticle;
   ASSERT_EQ(NS_OK, NewsArticle(source, mFolderId, 9002, unreadArticle));
-  RawHdr readRaw = raw;
-  readRaw.flags |= nsMsgMessageFlags::Read;
+  const uint32_t unreadFlags = raw.flags;
+  raw.flags |= nsMsgMessageFlags::Read;
   NewsArticleResult unmarked;
-  ASSERT_EQ(NS_OK, db.AddNewsArticle(unreadArticle, readRaw, true, unmarked,
+  ASSERT_EQ(NS_OK, db.AddNewsArticle(unreadArticle, raw, true, unmarked,
                                      nullptr, Some(false)));
   ASSERT_EQ(NS_OK, db.GetMessageFlags(unmarked.physicalKey, flags));
-  EXPECT_EQ(raw.flags, flags);
+  EXPECT_EQ(unreadFlags, flags);
   EXPECT_FALSE(set->IsMember(9002));
   EXPECT_TRUE(set->IsMember(9001));
   ASSERT_EQ(NS_OK, db.GetMessageReferences(unmarked.physicalKey, references));

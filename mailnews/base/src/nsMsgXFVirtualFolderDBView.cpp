@@ -293,6 +293,11 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
   nsCOMArray<nsIMsgDBHdr> oldSourceHits;
   bool native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
   if (native) {
+    uint32_t flags;
+    MOZ_TRY(m_viewFolder->GetFlags(&flags));
+    // The ordinary search-notify interface can also be populated directly on
+    // a physical folder, with no saved predicate or search-session scope.
+    if (!(flags & nsMsgFolderFlags::Virtual)) return NS_OK;
     nsCOMPtr<nsIMsgSearchSession> session = do_QueryReferent(m_searchSession);
     NS_ENSURE_TRUE(session, NS_ERROR_NOT_INITIALIZED);
     int32_t count;

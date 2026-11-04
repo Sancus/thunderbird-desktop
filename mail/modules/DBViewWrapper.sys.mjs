@@ -1055,6 +1055,7 @@ DBViewWrapper.prototype = {
     ) {
       return view;
     }
+    const notify = view.QueryInterface(Ci.nsIMsgSearchNotify);
     const generation = this._savedSearchGeneration;
     let started = false;
     const current = () =>
@@ -1064,7 +1065,7 @@ DBViewWrapper.prototype = {
         return;
       }
       try {
-        view[name](...args);
+        notify[name](...args);
       } catch (error) {
         this._savedSearchError ??= error;
         throw error;

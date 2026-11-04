@@ -1103,7 +1103,7 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
       "CREATE TEMP VIEW search_folder_hits AS SELECT folder_id, s371_cache_read(message_id) AS message_id FROM main.search_folder_hits"
     );
     Assert.throws(
-      () => wrapper.dbView.onNewSearch(),
+      () => wrapper.dbView.QueryInterface(Ci.nsIMsgSearchNotify).onNewSearch(),
       error => error.result == Cr.NS_ERROR_FAILURE,
       "A later real SQLite cached-hit read returns the original error"
     );

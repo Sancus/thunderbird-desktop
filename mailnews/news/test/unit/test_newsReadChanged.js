@@ -864,10 +864,16 @@ async function createColdReadSetAccount(hostname, names, newsrc) {
   const server = MailServices.accounts
     .createIncomingServer("", hostname, "nntp")
     .QueryInterface(Ci.nsINntpIncomingServer);
-  account.incomingServer = server;
+  // Assigning a valid server loads its root and subfolders immediately.
   server.valid = false;
+  account.incomingServer = server;
   const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
     Ci.nsIDatabaseCore
+  );
+  Assert.equal(
+    core.folderDB.getFolderChildNamed(0, server.key),
+    0,
+    "The ordinary account has not initialized its root before restoration"
   );
   const rootId = core.folderDB.insertRoot(server.key);
   const ids = names.map(name => {

@@ -56,6 +56,10 @@ support-files = ["../../../../base/test/unit/data/panacea.dat"]
 ["test_MorkSnapshotAdapter.js"]
 
 ["test_MorkSummaryReader.js"]
+support-files = [
+  "../../../../../mail/components/addrbook/test/browser/data/import.mab",
+  "../../../../base/test/unit/data/panacea.dat",
+]
 
 ["test_chatSearchProvider.js"]
 

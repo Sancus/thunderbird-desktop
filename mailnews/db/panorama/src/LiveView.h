@@ -7,6 +7,7 @@
 
 #include "LiveViewFilters.h"
 #include "MessageDatabase.h"
+#include "mozilla/UniquePtr.h"
 #include "js/Context.h"
 #include "mozIStorageConnection.h"
 #include "mozIStorageStatement.h"
@@ -20,6 +21,8 @@ namespace mozilla::mailnews {
 
 class LiveViewBatchCapability;
 class CapturedLiveView;
+class LiveViewFolderStatusListener;
+struct LiveViewPublicStatus;
 class LiveViewThreadBatchBuilder;
 
 class LiveView : public nsILiveView, public MessageListener {
@@ -69,6 +72,7 @@ class LiveView : public nsILiveView, public MessageListener {
   virtual ~LiveView();
 
   friend class SelectMessagesListener;
+  friend class LiveViewFolderStatusListener;
   friend class LiveViewThreadBatchBuilder;
 
   MessageDatabase& MessageDB() const {
@@ -82,6 +86,13 @@ class LiveView : public nsILiveView, public MessageListener {
   nsresult CaptureQueryView(const CapturedLiveView* context,
                             RefPtr<CapturedLiveView>& output);
   void ResetStatements();
+  nsresult RefreshPublicStatus();
+  void ClearPublicStatus();
+  void OnPublicStatusFlags(uint64_t attachment, uint64_t folderId, nsMsgKey key,
+                           uint32_t oldFlags, uint32_t newFlags);
+  void OnPublicStatusClosed(uint64_t attachment);
+  UniquePtr<LiveViewPublicStatus> mPublicStatus;
+  nsCString mPublicFlagsSQL = "flags"_ns;
   nsCString GetSQLClause();
   nsCString SelectSQL();
   nsCString SelectGroupSQL();

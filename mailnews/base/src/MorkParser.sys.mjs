@@ -496,6 +496,7 @@ export class MorkParser {
    * Reads a complete Mork 1.4 document without recovery or text conversion.
    * Cell names and values are byte strings. Maps keep empty cells, arbitrary
    * names, scoped row identity and table membership separate from metadata.
+   * Reads recorded UTF-8 form tokens and applies hexadecimal row positions.
    * Throws before returning any data if syntax or a supported form is invalid.
    *
    * @param {string} body - Original bytes, one byte per code unit.
@@ -667,12 +668,42 @@ export class MorkParser {
       pos++;
       return block.nextPos - 1;
     };
-    const dictionary = () => {
-      const end = blockEnd("<", ">");
-      let atoms = state.values;
-      while (pos < end) {
+    /**
+     * Reads a recorded form token without converting its cell bytes.
+     *
+     * @param {string} open - Metadata opening delimiter.
+     * @param {string} close - Metadata closing delimiter.
+     * @throws {MorkImportError} For unknown forms or invalid metadata.
+     */
+    const formBlock = (open, close) => {
+      take(open);
+      skip();
+      take("(");
+      if (name() != "f") {
+        fail("UNSUPPORTED_MORK", "Unsupported form metadata");
+      }
+      skip();
+      if (body[pos] == "^") {
+        pos++;
+        const id = hex();
+        // Forms use column tokens, independently of the value atom domain.
+        if (id != 0 && column(id) != "UTF-8") {
+          fail("UNSUPPORTED_MORK", "Unsupported text form");
+        }
         skip();
-        if (pos == end) {
+        take(")");
+      } else if (value() != "\0") {
+        fail("UNSUPPORTED_MORK", "Unsupported text form");
+      }
+      skip();
+      take(close);
+    };
+    const dictionary = () => {
+      blockEnd("<", ">");
+      let atoms = state.values;
+      while (true) {
+        skip();
+        if (body[pos] == ">") {
           break;
         }
         if (body[pos] == "<") {
@@ -694,7 +725,8 @@ export class MorkParser {
           pos++;
         }
         if (body[pos] == "<") {
-          fail("UNSUPPORTED_MORK", "Per-alias form override");
+          formBlock("<", ">");
+          skip();
         }
         const text = value();
         if (atoms.has(id) && atoms.get(id) != text) {
@@ -744,7 +776,8 @@ export class MorkParser {
             break;
           }
           if (body[pos] == "[") {
-            fail("UNSUPPORTED_MORK", "Row metadata block");
+            formBlock("[", "]");
+            continue;
           }
           let remove = false;
           if (body[pos] == "-") {
@@ -763,7 +796,16 @@ export class MorkParser {
       }
       skip();
       if (body[pos] == "!") {
-        fail("UNSUPPORTED_MORK", "Row position hints are not supported");
+        pos++;
+        const position = hex();
+        if (!table || meta || cut || position > 0x7fffffff) {
+          fail("UNSUPPORTED_MORK", "Unsupported row position");
+        }
+        // Native MoveRow shifts the intervening members and clamps to the end.
+        table.rows.delete(ref.key);
+        const members = [...table.rows];
+        members.splice(Math.min(position, members.length), 0, ref.key);
+        table.rows = new Set(members);
       }
     };
     const table = () => {

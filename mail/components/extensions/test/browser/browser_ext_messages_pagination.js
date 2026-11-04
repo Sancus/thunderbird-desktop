@@ -955,3 +955,473 @@ add_task(async function test_list_auto_early_page_return() {
 
   await SpecialPowers.popPrefEnv();
 });
+
+add_setup(function setupNativePagination() {
+  Assert.ok(Services.prefs.getBoolPref("mail.panorama.enabled"));
+  Assert.ok(
+    !Services.prefs.getBoolPref("mailnews.database.global.indexer.enabled")
+  );
+  Assert.ok(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIMsgDBService
+    ) instanceof Ci.nsIDatabaseCore
+  );
+  Assert.equal(subFolders.test1.msgStore.storeType, "mbox");
+});
+
+/**
+ * Hold a real producer while two extension continuation calls enter the list.
+ *
+ * @param {boolean} query - Use messages.query instead of messages.list.
+ * @param {boolean} [fail=false] - Reject the held producer with its original error.
+ */
+async function checkConcurrentPages(query, fail = false) {
+  const {
+    Management: {
+      global: { messageListTracker },
+    },
+  } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+  const { ExtensionError } = ChromeUtils.importESModule(
+    "resource://gre/modules/ExtensionUtils.sys.mjs"
+  );
+  const held = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const readersEntered = Promise.withResolvers();
+  const failure = new ExtensionError("Concurrent producer failure");
+  const headers = [...subFolders.test1.messages];
+  const physical = headers.map(header => [
+    header.folder.URI,
+    header.messageKey,
+  ]);
+  messageListTracker.checkSearchCriteriaFnForTests = null;
+  messageListTracker.approvePageFnForTests = async page => {
+    if (page == 2) {
+      held.resolve();
+      await release.promise;
+      if (fail) {
+        throw failure;
+      }
+    }
+  };
+  await SpecialPowers.pushPrefEnv({
+    set: [["extensions.webextensions.messagesPerPage", 10]],
+  });
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "utils.js": await getUtilsJS(),
+      "background.js": async () => {
+        const [{ query: useQuery, fail: rejectProducer, expected }] =
+          await window.sendMessage("fixtures");
+        const [folder] = await browser.folders.query({ name: "test1" });
+        let page = useQuery
+          ? await browser.messages.query({
+              folderId: folder.id,
+              messagesPerPage: 10,
+              autoPaginationTimeout: 0,
+            })
+          : await browser.messages.list(folder.id);
+        const id = page.id;
+        window.assertDeepEqual(
+          expected.slice(0, 10),
+          page.messages.map(m => m.id)
+        );
+        await window.sendMessage("initial-page", id);
+        const settled = [0, 0];
+        const pending = [0, 1].map(index =>
+          browser.messages.continueList(id).then(
+            result => {
+              settled[index]++;
+              return result;
+            },
+            error => {
+              settled[index]++;
+              throw error;
+            }
+          )
+        );
+        // Attach rejection handlers before the parent releases a failing producer.
+        const results = Promise.allSettled(pending);
+        await window.sendMessage("release-continuations");
+        const received = await results;
+        window.assertDeepEqual([1, 1], settled);
+        if (rejectProducer) {
+          for (const result of received) {
+            browser.test.assertEq("rejected", result.status);
+            browser.test.assertEq(
+              "Concurrent producer failure",
+              result.reason.message
+            );
+          }
+        } else {
+          const all = [...page.messages];
+          for (let index = 0; index < 2; index++) {
+            browser.test.assertEq("fulfilled", received[index].status);
+            page = received[index].value;
+            browser.test.assertEq(id, page.id);
+            window.assertDeepEqual(
+              expected.slice(10 + index * 10, 20 + index * 10),
+              page.messages.map(m => m.id)
+            );
+            all.push(...page.messages);
+          }
+          while (page.id) {
+            page = await browser.messages.continueList(id);
+            all.push(...page.messages);
+          }
+          window.assertDeepEqual(
+            expected,
+            all.map(m => m.id)
+          );
+          browser.test.assertEq(99, new Set(all.map(m => m.id)).size);
+          browser.test.assertTrue(all.every(m => m.folder.id == folder.id));
+          browser.test.assertEq(null, page.id);
+        }
+        await browser.test.assertRejects(
+          browser.messages.continueList(id),
+          new RegExp(`No message list for id ${id}`)
+        );
+        browser.test.notifyPass("concurrent-pages");
+      },
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["accountsRead", "messagesRead"],
+    },
+  });
+  let list;
+  let originalRead;
+  let entered = 0;
+  try {
+    await extension.startup();
+    await extension.awaitMessage("fixtures");
+    const nativeExtension = WebExtensionPolicy.getByID(extension.id).extension;
+    extension.sendMessage({
+      query,
+      fail,
+      expected: headers.map(
+        header => nativeExtension.messageManager.convert(header).id
+      ),
+    });
+    const id = await extension.awaitMessage("initial-page");
+    await held.promise;
+    list = messageListTracker.getList(id, nativeExtension);
+    originalRead = list.getNextUnreadPage;
+    // Observe actual API entry; never replace the producer or its page result.
+    list.getNextUnreadPage = function (...args) {
+      if (++entered == 2) {
+        readersEntered.resolve();
+      }
+      return originalRead.apply(this, args);
+    };
+    extension.sendMessage();
+    await extension.awaitMessage("release-continuations");
+    await readersEntered.promise;
+    Assert.equal(entered, 2, "Both real continuation calls entered while held");
+    list.getNextUnreadPage = originalRead;
+    release.resolve();
+    extension.sendMessage();
+    await extension.awaitFinish("concurrent-pages");
+    if (fail) {
+      Assert.strictEqual(
+        list.failure.error,
+        failure,
+        "Retain the original producer error"
+      );
+    }
+    Assert.deepEqual(
+      [...subFolders.test1.messages].map(header => [
+        header.folder.URI,
+        header.messageKey,
+      ]),
+      physical,
+      "Physical fixtures were not changed by pagination"
+    );
+  } finally {
+    release.resolve();
+    if (list && originalRead) {
+      list.getNextUnreadPage = originalRead;
+    }
+    messageListTracker.approvePageFnForTests = null;
+    messageListTracker.checkSearchCriteriaFnForTests = null;
+    await extension.unload();
+    await SpecialPowers.popPrefEnv();
+  }
+}
+
+add_task(async function test_continueListConcurrentQueryPages() {
+  await checkConcurrentPages(true);
+});
+
+add_task(async function test_continueListConcurrentFolderPages() {
+  await checkConcurrentPages(false);
+});
+
+add_task(async function test_continueListConcurrentFailureSettlesOnce() {
+  await checkConcurrentPages(true, true);
+  await checkConcurrentPages(false, true);
+});
+
+add_task(async function test_queryPrevalidationReleasesLists() {
+  const {
+    Management: {
+      global: { messageListTracker },
+    },
+  } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+  const headers = [...subFolders.test1.messages];
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "utils.js": await getUtilsJS(),
+      "background.js": async () => {
+        const [{ folderId, expected }] = await window.sendMessage("fixtures");
+        const missing = `${folderId}/missing-s426`;
+        await browser.test.assertRejects(
+          browser.messages.query({ folderId: missing }),
+          new RegExp(`Folder not found: ${missing}`)
+        );
+        await window.sendMessage("list-count");
+        await browser.test.assertRejects(
+          browser.messages.query({ online: true }),
+          /Property headerMessageId is required for online queries\./
+        );
+        await window.sendMessage("list-count");
+        const empty = await browser.messages.query({
+          tags: { mode: "all", tags: { "missing-s426-tag": true } },
+        });
+        window.assertDeepEqual({ id: null, messages: [] }, empty);
+        await window.sendMessage("list-count");
+        const recovered = await browser.messages.query({
+          folderId,
+          messagesPerPage: 150,
+          autoPaginationTimeout: 0,
+        });
+        browser.test.assertEq(null, recovered.id);
+        window.assertDeepEqual(
+          expected,
+          recovered.messages.map(m => m.id)
+        );
+        browser.test.assertTrue(
+          recovered.messages.every(m => m.folder.id == folderId)
+        );
+        await window.sendMessage("list-count");
+        browser.test.notifyPass("prevalidation");
+      },
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["accountsRead", "messagesRead"],
+    },
+  });
+  let folderId;
+  try {
+    await extension.startup();
+    await extension.awaitMessage("fixtures");
+    const nativeExtension = WebExtensionPolicy.getByID(extension.id).extension;
+    const baseline =
+      messageListTracker._contextLists.get(nativeExtension)?.size ?? 0;
+    folderId = nativeExtension.folderManager.convert(subFolders.test1).id;
+    extension.sendMessage({
+      folderId,
+      expected: headers.map(
+        header => nativeExtension.messageManager.convert(header).id
+      ),
+    });
+    for (let i = 0; i < 4; i++) {
+      await extension.awaitMessage("list-count");
+      Assert.equal(
+        messageListTracker._contextLists.get(nativeExtension)?.size ?? 0,
+        baseline,
+        "Settled validation/empty/recovery leaves no inaccessible list"
+      );
+      extension.sendMessage();
+    }
+    await extension.awaitFinish("prevalidation");
+  } finally {
+    await extension.unload();
+  }
+
+  const denied = ExtensionTestUtils.loadExtension({
+    files: {
+      "utils.js": await getUtilsJS(),
+      "background.js": async () => {
+        const [targetFolderId] = await window.sendMessage("folder-id");
+        await browser.test.assertRejects(
+          browser.messages.query({ folderId: targetFolderId }),
+          /Querying by folder requires the "accountsRead" permission/
+        );
+        await window.sendMessage("denied-settled");
+        browser.test.notifyPass("permission-prevalidation");
+      },
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["messagesRead"],
+    },
+  });
+  try {
+    await denied.startup();
+    await denied.awaitMessage("folder-id");
+    const nativeExtension = WebExtensionPolicy.getByID(denied.id).extension;
+    const baseline =
+      messageListTracker._contextLists.get(nativeExtension)?.size ?? 0;
+    denied.sendMessage(folderId);
+    await denied.awaitMessage("denied-settled");
+    Assert.equal(
+      messageListTracker._contextLists.get(nativeExtension)?.size ?? 0,
+      baseline
+    );
+    denied.sendMessage();
+    await denied.awaitFinish("permission-prevalidation");
+  } finally {
+    await denied.unload();
+  }
+});
+
+/**
+ * Abort a real producer inside its existing page-approval await.
+ *
+ * @param {boolean} query - Use messages.query instead of messages.list.
+ */
+async function checkAbortPendingPage(query) {
+  const {
+    Management: {
+      global: { messageListTracker },
+    },
+  } = ChromeUtils.importESModule("resource://gre/modules/Extension.sys.mjs");
+  const held = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const producerReturned = Promise.withResolvers();
+  messageListTracker.checkSearchCriteriaFnForTests = null;
+  messageListTracker.approvePageFnForTests = async page => {
+    if (page == 2) {
+      held.resolve();
+      await release.promise;
+    }
+  };
+  await SpecialPowers.pushPrefEnv({
+    set: [["extensions.webextensions.messagesPerPage", 10]],
+  });
+  const extension = ExtensionTestUtils.loadExtension({
+    files: {
+      "utils.js": await getUtilsJS(),
+      "background.js": async () => {
+        const [{ query: useQuery, expected }] =
+          await window.sendMessage("fixtures");
+        const [folder] = await browser.folders.query({ name: "test1" });
+        const first = useQuery
+          ? await browser.messages.query({
+              folderId: folder.id,
+              messagesPerPage: 10,
+              autoPaginationTimeout: 0,
+            })
+          : await browser.messages.list(folder.id);
+        window.assertDeepEqual(
+          expected.slice(0, 10),
+          first.messages.map(m => m.id)
+        );
+        await window.sendMessage("initial-page", first.id);
+        await browser.messages.abortList(first.id);
+        const last = await browser.messages.continueList(first.id);
+        browser.test.assertEq(null, last.id);
+        window.assertDeepEqual(
+          expected.slice(10, 20),
+          last.messages.map(m => m.id)
+        );
+        browser.test.assertTrue(
+          last.messages.every(m => m.folder.id == folder.id)
+        );
+        await window.sendMessage("release-producer");
+        await browser.test.assertRejects(
+          browser.messages.continueList(first.id),
+          new RegExp(`No message list for id ${first.id}`)
+        );
+        browser.test.notifyPass("aborted-page");
+      },
+    },
+    manifest: {
+      background: { scripts: ["utils.js", "background.js"] },
+      permissions: ["accountsRead", "messagesRead"],
+    },
+  });
+  const originalCreate = messageListTracker.createList;
+  let list;
+  let originalAdd;
+  try {
+    await extension.startup();
+    await extension.awaitMessage("fixtures");
+    const nativeExtension = WebExtensionPolicy.getByID(extension.id).extension;
+    messageListTracker.createList = function (context, options) {
+      const created = originalCreate.call(this, context, options);
+      if (context == nativeExtension) {
+        list = created;
+        originalAdd = list.addMessage;
+        // Observe the real pending add returning after abort, without a timer.
+        list.addMessage = async function (...args) {
+          try {
+            return await originalAdd.apply(this, args);
+          } finally {
+            if (this.isDone) {
+              producerReturned.resolve();
+            }
+          }
+        };
+      }
+      return created;
+    };
+    const headers = [...subFolders.test1.messages];
+    const physical = headers.map(header => [
+      header.folder.URI,
+      header.messageKey,
+    ]);
+    extension.sendMessage({
+      query,
+      expected: headers.map(
+        header => nativeExtension.messageManager.convert(header).id
+      ),
+    });
+    const id = await extension.awaitMessage("initial-page");
+    await held.promise;
+    Assert.strictEqual(list, messageListTracker.getList(id, nativeExtension));
+    Assert.equal(list.pages.length, 2);
+    const buffered = list.currentPage.messages.map(message => message.id);
+    Assert.equal(buffered.length, 10);
+    extension.sendMessage();
+    await extension.awaitMessage("release-producer");
+    release.resolve();
+    await producerReturned.promise;
+    Assert.equal(list.pages.length, 2, "No page is created after abort");
+    Assert.deepEqual(
+      list.currentPage.messages.map(message => message.id),
+      buffered
+    );
+    Assert.equal(
+      list.log.size,
+      20,
+      "The pending twenty-first physical message was not added"
+    );
+    Assert.ok(!messageListTracker._contextLists.get(nativeExtension).has(id));
+    extension.sendMessage();
+    await extension.awaitFinish("aborted-page");
+    Assert.deepEqual(
+      [...subFolders.test1.messages].map(header => [
+        header.folder.URI,
+        header.messageKey,
+      ]),
+      physical
+    );
+  } finally {
+    release.resolve();
+    messageListTracker.createList = originalCreate;
+    if (list && originalAdd) {
+      list.addMessage = originalAdd;
+    }
+    messageListTracker.approvePageFnForTests = null;
+    messageListTracker.checkSearchCriteriaFnForTests = null;
+    await extension.unload();
+    await SpecialPowers.popPrefEnv();
+  }
+}
+
+add_task(async function test_abortListStopsPendingPage() {
+  await checkAbortPendingPage(true);
+  await checkAbortPendingPage(false);
+});

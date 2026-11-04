@@ -14,6 +14,12 @@ const { MailStringUtils } = ChromeUtils.importESModule(
 const { parseMorkSummary } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MorkSummaryReader.sys.mjs"
 );
+const { parseMorkAddressBook } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MorkAddressBookReader.sys.mjs"
+);
+const { parseMorkFolderCache } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MorkFolderCache.sys.mjs"
+);
 
 add_task(async function test_legacySummarySnapshot() {
   const bytes = await IOUtils.read(do_get_file("data/migration.msf").path);
@@ -260,33 +266,35 @@ add_task(async function test_genuineDuplicateReferencesUpdate() {
   );
 });
 
-add_task(async function test_genuineNativeRowPositionRefusal() {
-  // A real MDB MoveRow/commit produced this input; native frozen reopen checks
-  // full order [2,3,1,4] and every original cell. This is not positive import.
+add_task(async function test_genuineNativeRowPosition() {
+  // Native MoveRow/commit/reopen produced this file and the literal order oracle.
   const path = do_get_file("data/migration-row-position.mork").path;
   const bytes = await IOUtils.read(path);
   const original = bytes.slice();
   const body = MailStringUtils.uint8ArrayToByteString(bytes);
   const offset = body.indexOf("!2 ");
   Assert.greater(offset, 0, "The genuine input includes the native move delta");
+  const expected = await IOUtils.readJSON(
+    do_get_file("data/migration-row-position.json").path
+  );
+  Assert.deepEqual(expected.finalIds, [2, 3, 1, 4]);
+  const snapshot = new MorkParser().parseForImport(body);
+  const table = snapshot.tables.get(expected.tableId + ":" + expected.scope);
+  Assert.equal(snapshot.tables.size, 1);
+  Assert.equal(snapshot.rows.size, 4);
+  Assert.equal(table.cells.get("k"), expected.tableKind);
+  Assert.deepEqual(
+    table.rows,
+    expected.finalIds.map(id => id + ":" + expected.scope),
+    "The committed native move changes membership order without dropping row4"
+  );
+  for (const id of expected.initialIds) {
+    const row = snapshot.rows.get(id + ":" + expected.scope);
+    Assert.equal(row.id, id);
+    Assert.equal(row.scope, expected.scope);
+    Assert.deepEqual([...row.cells], Object.entries(expected.cells[id]));
+  }
   const sentinel = {};
-  let snapshot = sentinel;
-  Assert.throws(
-    () => {
-      snapshot = new MorkParser().parseForImport(body);
-    },
-    error =>
-      error.name == "MorkImportError" &&
-      error.code == "UNSUPPORTED_MORK" &&
-      error.offset == offset &&
-      error.message == "Row position hints are not supported at byte " + offset,
-    "A valid native move cannot return stale pre-move membership"
-  );
-  Assert.equal(
-    snapshot,
-    sentinel,
-    "No partial structural snapshot was returned"
-  );
   let summary = sentinel;
   Assert.throws(
     () => {
@@ -295,9 +303,8 @@ add_task(async function test_genuineNativeRowPositionRefusal() {
     error =>
       error.name == "MorkImportError" &&
       error.code == "UNSUPPORTED_MORK" &&
-      error.offset == offset &&
-      error.message == "Row position hints are not supported at byte " + offset,
-    "The summary caller propagates the move refusal before projection"
+      error.message == "Expected one message table at byte 0",
+    "A generic native fixture is not a mail summary"
   );
   Assert.equal(summary, sentinel, "No partial summary was returned");
   Assert.deepEqual(bytes, original, "Neither caller mutates the input buffer");
@@ -308,33 +315,44 @@ add_task(async function test_genuineNativeRowPositionRefusal() {
   );
 });
 
-add_task(async function test_genuineNativeRowFormRefusal() {
-  // The unchanged MDB writer committed this nondefault inline UTF-8 form.
-  // A distinct frozen native reader checks exact bytes, form and presence.
+add_task(async function test_genuineNativeRowForm() {
+  // Native committed this anonymous inline value with an explicit UTF-8 form.
   const path = do_get_file("data/migration-row-form.mork").path;
   const bytes = await IOUtils.read(path);
   const original = bytes.slice();
   const body = MailStringUtils.uint8ArrayToByteString(bytes);
-  const offset = body.indexOf("[(f^");
-  Assert.greater(offset, 0, "The genuine input contains native row metadata");
-  const sentinel = {};
-  let snapshot = sentinel;
-  Assert.throws(
-    () => {
-      snapshot = new MorkParser().parseForImport(body);
-    },
-    error =>
-      error.name == "MorkImportError" &&
-      error.code == "UNSUPPORTED_MORK" &&
-      error.offset == offset &&
-      error.message == "Row metadata block at byte " + offset,
-    "A valid unsupported native form must not be decoded as default text"
+  Assert.greater(body.indexOf("[(f^85)]"), 0);
+  const expected = await IOUtils.readJSON(
+    do_get_file("data/migration-forms.json").path
   );
   Assert.equal(
-    snapshot,
-    sentinel,
-    "No partial structural snapshot was returned"
+    expected.rowForm.Payload,
+    "row-form-".repeat(128) + "ë\r\n(raw)\\$"
   );
+  const snapshot = new MorkParser().parseForImport(body);
+  const table = snapshot.tables.get(expected.tableId + ":" + expected.scope);
+  const key = expected.rowForm.rowId + ":" + expected.scope;
+  Assert.equal(snapshot.tables.size, 1);
+  Assert.equal(snapshot.rows.size, 1);
+  Assert.equal(table.cells.get("k"), expected.tableKind);
+  Assert.deepEqual(table.rows, [key]);
+  const row = snapshot.rows.get(key);
+  Assert.equal(row.id, expected.rowForm.rowId);
+  Assert.equal(row.scope, expected.scope);
+  Assert.deepEqual(
+    [...row.cells],
+    [
+      ["presentEmpty", ""],
+      [
+        "Payload",
+        MailStringUtils.uint8ArrayToByteString(
+          new TextEncoder().encode(expected.rowForm.Payload)
+        ),
+      ],
+    ]
+  );
+  Assert.ok(!row.cells.has(expected.rowForm.absentCell));
+  const sentinel = {};
   let summary = sentinel;
   Assert.throws(
     () => {
@@ -343,9 +361,8 @@ add_task(async function test_genuineNativeRowFormRefusal() {
     error =>
       error.name == "MorkImportError" &&
       error.code == "UNSUPPORTED_MORK" &&
-      error.offset == offset &&
-      error.message == "Row metadata block at byte " + offset,
-    "The summary caller propagates the native row form refusal before projection"
+      error.message == "Expected one message table at byte 0",
+    "The form can be read without treating the generic table as mail"
   );
   Assert.equal(summary, sentinel, "No partial summary was returned");
   Assert.deepEqual(bytes, original, "Neither caller mutates the input buffer");
@@ -356,9 +373,9 @@ add_task(async function test_genuineNativeRowFormRefusal() {
   );
 });
 
-add_task(async function test_genuineNativeDictionaryFormRefusal() {
-  // Native003 committed these bytes. Its discarded reader loses the alias form;
-  // the migration reader must refuse the saved form rather than lose its meaning.
+add_task(async function test_genuineNativeDictionaryForm() {
+  // Native003 committed these bytes. Its discarded reader's form failure stays
+  // historical; the retained migration reader must preserve the saved payload.
   const path = do_get_file("data/migration-dictionary-form.mork").path;
   const bytes = await IOUtils.read(path);
   const original = bytes.slice();
@@ -411,26 +428,31 @@ add_task(async function test_genuineNativeDictionaryFormRefusal() {
     "The absent cell stays absent"
   );
 
-  const offset = body.indexOf("<(f^");
-  Assert.greater(offset, 0);
+  Assert.equal(expected.dictionaryForm.Payload, "dictionary é (raw)\\$");
+  const snapshot = new MorkParser().parseForImport(body);
+  const table = snapshot.tables.get(expected.tableId + ":" + expected.scope);
+  const key = expected.dictionaryForm.rowId + ":" + expected.scope;
+  Assert.equal(snapshot.tables.size, 1);
+  Assert.equal(snapshot.rows.size, 1);
+  Assert.equal(table.cells.get("k"), expected.tableKind);
+  Assert.deepEqual(table.rows, [key]);
+  const row = snapshot.rows.get(key);
+  Assert.equal(row.id, expected.dictionaryForm.rowId);
+  Assert.equal(row.scope, expected.scope);
+  Assert.deepEqual(
+    [...row.cells],
+    [
+      ["presentEmpty", ""],
+      [
+        "Payload",
+        MailStringUtils.uint8ArrayToByteString(
+          new TextEncoder().encode(expected.dictionaryForm.Payload)
+        ),
+      ],
+    ]
+  );
+  Assert.ok(!row.cells.has(expected.dictionaryForm.absentCell));
   const sentinel = {};
-  let snapshot = sentinel;
-  Assert.throws(
-    () => {
-      snapshot = new MorkParser().parseForImport(body);
-    },
-    error =>
-      error.name == "MorkImportError" &&
-      error.code == "UNSUPPORTED_MORK" &&
-      error.offset == offset &&
-      error.message == "Per-alias form override at byte " + offset,
-    "The structural reader refuses the unsupported alias form before decoding"
-  );
-  Assert.equal(
-    snapshot,
-    sentinel,
-    "No partial structural snapshot was returned"
-  );
   let summary = sentinel;
   Assert.throws(
     () => {
@@ -439,9 +461,8 @@ add_task(async function test_genuineNativeDictionaryFormRefusal() {
     error =>
       error.name == "MorkImportError" &&
       error.code == "UNSUPPORTED_MORK" &&
-      error.offset == offset &&
-      error.message == "Per-alias form override at byte " + offset,
-    "The summary caller propagates the exact alias-form refusal"
+      error.message == "Expected one message table at byte 0",
+    "The generic dictionary-form fixture is not a mail summary"
   );
   Assert.equal(summary, sentinel, "No partial summary was returned");
   Assert.deepEqual(bytes, original, "Neither caller mutates the input buffer");
@@ -450,4 +471,62 @@ add_task(async function test_genuineNativeDictionaryFormRefusal() {
     original,
     "Source file is unchanged"
   );
+});
+
+add_task(async function test_genuineAddressBookConsumer() {
+  const path = do_get_file("import.mab").path;
+  const bytes = await IOUtils.read(path);
+  const original = bytes.slice();
+  const { cards, lists, metadata } = parseMorkAddressBook(bytes);
+  Assert.equal(cards.length, 1);
+  Assert.equal(lists.length, 1);
+  Assert.equal(cards[0].sourceKey, 1);
+  Assert.equal(cards[0].properties.get("DisplayName"), "contact number one");
+  Assert.equal(cards[0].properties.get("PrimaryEmail"), "contact1@invalid");
+  Assert.equal(cards[0].properties.get("RecordKey"), "1");
+  Assert.ok(cards[0].properties.has("Notes"));
+  Assert.equal(cards[0].properties.get("Notes"), "");
+  Assert.ok(!cards[0].properties.has("UID"));
+  Assert.equal(lists[0].sourceKey, 1, "Card and list IDs have separate scopes");
+  Assert.equal(lists[0].properties.get("ListName"), "list");
+  Assert.equal(lists[0].properties.get("ListDescription"), "a list of cards");
+  Assert.deepEqual(lists[0].members, [1]);
+  Assert.equal(
+    metadata.get("1:ns:addrbk:db:row:scope:data:all").get("LastRecordKey"),
+    "2"
+  );
+  Assert.deepEqual(bytes, original);
+  Assert.deepEqual(await IOUtils.read(path), original);
+});
+
+add_task(async function test_genuineFolderCacheConsumer() {
+  const path = do_get_file("panacea.dat").path;
+  const bytes = await IOUtils.read(path);
+  const original = bytes.slice();
+  const { entries, source } = parseMorkFolderCache(bytes);
+  Assert.equal(entries.size, 13);
+  Assert.equal(source.rows.size, 13);
+  const inbox = entries.get(
+    "/foo/bar/profile-default/ImapMail/imap.localhost/INBOX.msf"
+  );
+  Assert.equal(inbox.sourceKey, 1);
+  Assert.equal(inbox.properties.get("flags"), "88083014");
+  Assert.equal(inbox.values.flags, 2282237972);
+  Assert.equal(inbox.values.totalMsgs, 2);
+  Assert.equal(
+    inbox.values.MRUTime,
+    "1628202593",
+    "Unknown properties stay text"
+  );
+  const server = entries.get(
+    "/foo/bar/profile-default/ImapMail/imap.localhost"
+  );
+  Assert.ok(server.properties.has("onlineName"));
+  Assert.equal(server.properties.get("onlineName"), "");
+  Assert.ok(!server.properties.has("absent"));
+  Assert.equal(server.properties.get("folderSize"), "ffffffffffffffff");
+  Assert.equal(server.values.folderSize, -1);
+  Assert.equal(server.values.totalMsgs, -1);
+  Assert.deepEqual(bytes, original);
+  Assert.deepEqual(await IOUtils.read(path), original);
 });

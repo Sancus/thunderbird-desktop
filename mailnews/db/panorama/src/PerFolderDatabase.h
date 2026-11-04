@@ -173,6 +173,12 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   // a replacement set; cleanup never reads storage or dereferences the set.
   void DetachNewsReadSetIfMatches(nsMsgKeySet* expected);
 
+  // Explicit protocol delta against an actual saved native source tuple.
+  // No client flag conversion, new owning output or postcommit lookup.
+  nsresult QueueOfflineProtocolFlagMutation(
+      nsMsgKey operationKey, const ServerMessageLocation& expectedSource,
+      int32_t protocolMask, bool addFlags);
+
   // Copy metadata without source storage identity into an unpublished draft.
   // Local writes replace messageSize; uncached queued copies may retain it.
   nsresult CopyHdrForStore(nsIMsgDBHdr* existingHdr, bool preserveMessageSize,

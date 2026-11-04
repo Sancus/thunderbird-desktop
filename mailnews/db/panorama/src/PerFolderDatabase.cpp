@@ -240,6 +240,10 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
   NS_IMETHOD ClearOperation(nsOfflineImapOperationType value) override {
     return Update([&](auto& data) -> nsresult {
       data.operation &= ~static_cast<uint32_t>(value);
+      if (!(data.operation & kFlagsChanged)) {
+        data.flagMutation.reset();
+        if (value & kFlagsChanged) data.invalidateFlagMutation = true;
+      }
       if (!(data.operation & (kMsgMoved | kAppendDraft | kAppendTemplate))) {
         data.pendingDestination.reset();
       }
@@ -278,6 +282,9 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
   NS_IMETHOD SetFlagOperation(imapMessageFlagsType value) override {
     return Update([&](auto& data) {
       data.operation |= kFlagsChanged;
+      // A legacy whole-word writer supplies no protocol-delta provenance.
+      data.flagMutation.reset();
+      data.invalidateFlagMutation = true;
       data.newFlags = value;
       data.flagOperation |= value;
       return NS_OK;
@@ -287,7 +294,12 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
     return ReadNumber(&OfflineOperationData::newFlags, value);
   }
   NS_IMETHOD SetNewFlags(imapMessageFlagsType value) override {
-    return WriteField(&OfflineOperationData::newFlags, value);
+    return Update([&](auto& data) {
+      data.newFlags = value;
+      data.flagMutation.reset();
+      data.invalidateFlagMutation = true;
+      return NS_OK;
+    });
   }
   NS_IMETHOD GetDestinationFolderURI(nsACString& value) override {
     return ReadString(&OfflineOperationData::destinationFolderURI, value);
@@ -361,6 +373,7 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
   }
   NS_IMETHOD SetPlayingBack(bool value) override {
     MOZ_TRY(mDatabase->CheckFolderExists());
+    MOZ_TRY(mDatabase->CheckDatabaseSource());
     return mDatabase->MessageDB().SetOfflineOperationPlayingBack(
         mDatabase->FolderId(), mKey, value);
   }
@@ -369,6 +382,7 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
   ~OfflineOperation() = default;
   nsresult Read(OfflineOperationData& data) {
     MOZ_TRY(mDatabase->CheckFolderExists());
+    MOZ_TRY(mDatabase->CheckDatabaseSource());
     return mDatabase->MessageDB().GetOfflineOperation(mDatabase->FolderId(),
                                                       mKey, data);
   }
@@ -432,11 +446,30 @@ class OfflineOperation final : public nsIMsgOfflineImapOperation {
 };
 NS_IMPL_ISUPPORTS(OfflineOperation, nsIMsgOfflineImapOperation)
 
+nsresult PerFolderDatabase::QueueOfflineProtocolFlagMutation(
+    nsMsgKey operationKey, const ServerMessageLocation& expectedSource,
+    int32_t protocolMask, bool addFlags) {
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  MOZ_TRY(CheckParsedServerWriteTransaction());
+  NS_ENSURE_TRUE(expectedSource.folderId == mFolderId, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(protocolMask >= 0 && !(uint32_t(protocolMask) & ~0xdfu),
+                 NS_ERROR_INVALID_ARG);
+  // Core owns the checked transaction, saved tuple and per-bit composition.
+  // There are no callbacks or fallible facade lookups after this commit.
+  // The IM caller retains its existing OfflineEvents notification/first error.
+  return MessageDB().QueueOfflineProtocolFlagMutation(
+      mDatabaseSourceId, mFolderId, operationKey, expectedSource, protocolMask,
+      addFlags);
+}
+
 NS_IMETHODIMP PerFolderDatabase::GetOfflineOpForKey(
     nsMsgKey key, bool create, nsIMsgOfflineImapOperation** result) {
   NS_ENSURE_ARG_POINTER(result);
   *result = nullptr;
   MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
   OfflineOperationData data;
   nsresult rv = MessageDB().GetOfflineOperation(mFolderId, key, data);
   if (rv == NS_ERROR_NOT_AVAILABLE) {
@@ -447,7 +480,9 @@ NS_IMETHODIMP PerFolderDatabase::GetOfflineOpForKey(
     MOZ_TRY(MessageDB().CaptureHeaderState(key, captured));
     NS_ENSURE_TRUE(captured && captured->folderId == mFolderId,
                    NS_ERROR_NOT_AVAILABLE);
+    // Retain the legacy compatibility word, never a proven protocol snapshot.
     data.newFlags = static_cast<imapMessageFlagsType>(captured->flags);
+    data.flagMutation.reset();
     MOZ_TRY(MessageDB().StoreOfflineOperation(mFolderId, key, data));
   } else {
     NS_ENSURE_SUCCESS(rv, rv);

@@ -1462,6 +1462,429 @@ add_task(async function test_flatSortReadErrorRestoresSelection() {
   Assert.deepEqual(gDBView.getSelectedMsgHdrs().map(physical), selected);
 });
 
+/**
+ * A failed thread read keeps its committed physical prefix and original error.
+ */
+add_task(async function test_threadReadStopsAtOriginalWriteError() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    info(
+      "Native-only SQLite fault control; the existing ordinary Mork cases remain unchanged"
+    );
+    return;
+  }
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.ok(
+    core instanceof Ci.nsIDatabaseCore,
+    "The requested native backend is active"
+  );
+  const parent = gMessageGenerator.makeMessage({
+    subject: "selected-read-parent",
+  });
+  const child = gMessageGenerator.makeMessage({ inReplyTo: parent });
+  const control = gMessageGenerator.makeMessage({ subject: "read-control" });
+  const set = new SyntheticMessageSet([parent, child, control]);
+  await set_gTestFolder(set);
+  Assert.equal(
+    gTestFolder.server.getStringValue("storeContractID"),
+    "@mozilla.org/msgstore/berkeleystore;1"
+  );
+  const [root, reply, untouched] = set.msgHdrList;
+  const otherFolder = await messageInjection.makeEmptyFolder();
+  const copies = new SyntheticMessageSet([parent, child]);
+  await messageInjection.addSetsToFolders([otherFolder], [copies]);
+  const physical = header => [header.folder.URI, header.messageKey];
+  const otherBefore = copies.msgHdrList.map(header => [
+    physical(header),
+    header.flags,
+  ]);
+  const db = gTestFolder.msgDatabase;
+  root.flags = Ci.nsMsgMessageFlags.Marked;
+  reply.flags = 0;
+  db.addToNewList(root.messageKey);
+  db.addToNewList(reply.messageKey);
+  Assert.equal(
+    root.flags,
+    Ci.nsMsgMessageFlags.Marked | Ci.nsMsgMessageFlags.New
+  );
+  Assert.equal(reply.flags, Ci.nsMsgMessageFlags.New);
+  const controlBefore = untouched.flags;
+  setup_view(
+    "threaded",
+    Ci.nsMsgViewFlagsType.kThreadedDisplay | Ci.nsMsgViewFlagsType.kShowIgnored
+  );
+  const rootIndex = gDBView.findIndexOfMsgHdr(root, true);
+  gFakeSelection.select(rootIndex);
+  const thread = db.getThreadContainingMsgHdr(root);
+  Assert.deepEqual(
+    Array.from({ length: thread.numChildren }, (_, i) =>
+      physical(thread.getChildHdrAt(i))
+    ),
+    [physical(root), physical(reply)],
+    "The real completed fixture supplies the selected ordered physical thread"
+  );
+  const connection = core.connectionForTests;
+  connection.executeSimpleSQL(
+    `CREATE TEMP TRIGGER reject_selected_thread_read BEFORE UPDATE OF flags ON messages
+     WHEN OLD.id = ${reply.messageKey}
+     BEGIN SELECT RAISE(ABORT, 'selected thread write failure'); END`
+  );
+  try {
+    Assert.throws(
+      () => gDBView.doCommand(Ci.nsMsgViewCommandType.markThreadRead),
+      error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT,
+      "The public thread command returns the actual later write failure"
+    );
+    Assert.ok(root.isRead, "The earlier successful write remains committed");
+    Assert.equal(
+      root.flags,
+      Ci.nsMsgMessageFlags.Marked | Ci.nsMsgMessageFlags.Read
+    );
+    Assert.ok(!reply.isRead, "The failed member is not reported as read");
+    Assert.equal(reply.flags, Ci.nsMsgMessageFlags.New);
+    Assert.deepEqual(gDBView.getSelectedMsgHdrs().map(physical), [
+      physical(root),
+    ]);
+    Assert.equal(untouched.flags, controlBefore);
+    Assert.deepEqual(
+      copies.msgHdrList.map(header => [physical(header), header.flags]),
+      otherBefore,
+      "Equal Message-ID copies in another folder are unchanged"
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_selected_thread_read");
+  }
+  gDBView.doCommand(Ci.nsMsgViewCommandType.markThreadRead);
+  Assert.ok(
+    root.isRead && reply.isRead,
+    "The same operation recovers normally"
+  );
+  Assert.equal(reply.flags, Ci.nsMsgMessageFlags.Read);
+  gDBView.doCommand(Ci.nsMsgViewCommandType.selectThread);
+  Assert.deepEqual(gDBView.getSelectedMsgHdrs().map(physical), [
+    physical(root),
+    physical(reply),
+  ]);
+  gDBView.doCommand(Ci.nsMsgViewCommandType.markMessagesUnread);
+  Assert.ok(
+    !root.isRead && !reply.isRead,
+    "The selected thread becomes unread"
+  );
+  Assert.equal(root.flags, Ci.nsMsgMessageFlags.Marked);
+  Assert.equal(reply.flags, 0, "Unread does not recreate the cleared NewList");
+  Assert.equal(untouched.flags, controlBefore);
+  Assert.deepEqual(
+    copies.msgHdrList.map(header => [physical(header), header.flags]),
+    otherBefore
+  );
+  gDBView.close();
+});
+
+/**
+ * Watch/ignore errors leave row state truthful, and success survives reopen.
+ */
+add_task(async function test_watchedIgnoredErrorsAndReopen() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    info(
+      "Native-only SQLite fault control; the existing ordinary Mork cases remain unchanged"
+    );
+    return;
+  }
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.ok(
+    core instanceof Ci.nsIDatabaseCore,
+    "The requested native backend is active"
+  );
+  const parent = gMessageGenerator.makeMessage({ subject: "watched-parent" });
+  const child = gMessageGenerator.makeMessage({ inReplyTo: parent });
+  const control = gMessageGenerator.makeMessage({ subject: "watched-control" });
+  const set = new SyntheticMessageSet([parent, child, control]);
+  await set_gTestFolder(set);
+  const [root, reply, untouched] = set.msgHdrList;
+  const key = root.messageKey;
+  const preservedFlags = 0x80000000;
+  gTestFolder.msgDatabase.getThreadContainingMsgHdr(root).flags =
+    preservedFlags;
+  const physical = header => [header.folder.URI, header.messageKey];
+  setup_view(
+    "threaded",
+    Ci.nsMsgViewFlagsType.kThreadedDisplay | Ci.nsMsgViewFlagsType.kShowIgnored
+  );
+  gFakeSelection.select(gDBView.findIndexOfMsgHdr(root, true));
+  const before = Array.from({ length: gDBView.rowCount }, (_, i) =>
+    physical(gDBView.getMsgHdrAt(i))
+  );
+  const connection = core.connectionForTests;
+  connection.executeSimpleSQL(
+    `CREATE TEMP TRIGGER reject_selected_thread_state BEFORE INSERT ON thread_flags
+     BEGIN SELECT RAISE(ABORT, 'selected thread state failure'); END`
+  );
+  try {
+    Assert.throws(
+      () => gDBView.doCommand(Ci.nsMsgViewCommandType.toggleThreadWatched),
+      error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.throws(
+      () =>
+        gDBView.viewNavigate(
+          Ci.nsMsgNavigationType.toggleThreadKilled,
+          {},
+          {},
+          {},
+          false
+        ),
+      error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT,
+      "Ignore returns its original write failure without navigating away"
+    );
+    Assert.deepEqual(
+      Array.from({ length: gDBView.rowCount }, (_, i) =>
+        physical(gDBView.getMsgHdrAt(i))
+      ),
+      before,
+      "A failed thread-state write does not collapse or replace rows"
+    );
+    Assert.deepEqual(gDBView.getSelectedMsgHdrs().map(physical), [
+      physical(root),
+    ]);
+    Assert.equal(
+      gTestFolder.msgDatabase.getThreadContainingMsgHdr(root).flags,
+      preservedFlags
+    );
+    Assert.ok(
+      root.isRead && reply.isRead,
+      "Ignore's completed read prefix stays committed"
+    );
+    Assert.ok(!untouched.isRead);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_selected_thread_state");
+  }
+  gDBView.doCommand(Ci.nsMsgViewCommandType.toggleThreadWatched);
+  Assert.equal(
+    gTestFolder.msgDatabase.getThreadContainingMsgHdr(root).flags,
+    (preservedFlags | Ci.nsMsgMessageFlags.Watched) >>> 0
+  );
+  gDBView.close();
+  gTestFolder.ForceDBClosed();
+  let db = gTestFolder.msgDatabase;
+  let reopened = db.getMsgHdrForKey(key);
+  Assert.equal(
+    db.getThreadContainingMsgHdr(reopened).flags,
+    (preservedFlags | Ci.nsMsgMessageFlags.Watched) >>> 0
+  );
+  setup_view(
+    "threaded",
+    Ci.nsMsgViewFlagsType.kThreadedDisplay | Ci.nsMsgViewFlagsType.kShowIgnored
+  );
+  gFakeSelection.select(gDBView.findIndexOfMsgHdr(reopened, true));
+  gDBView.viewNavigate(
+    Ci.nsMsgNavigationType.toggleThreadKilled,
+    {},
+    {},
+    {},
+    false
+  );
+  Assert.equal(
+    db.getThreadContainingMsgHdr(reopened).flags,
+    (preservedFlags | Ci.nsMsgMessageFlags.Ignored) >>> 0
+  );
+  gDBView.close();
+  gTestFolder.ForceDBClosed();
+  db = gTestFolder.msgDatabase;
+  reopened = db.getMsgHdrForKey(key);
+  Assert.equal(
+    db.getThreadContainingMsgHdr(reopened).flags,
+    (preservedFlags | Ci.nsMsgMessageFlags.Ignored) >>> 0
+  );
+  Assert.equal(
+    db.getThreadContainingMsgHdr(db.getMsgHdrForKey(untouched.messageKey))
+      .flags,
+    0,
+    "The other physical thread remains unchanged across reopen"
+  );
+});
+
+/**
+ * Killed descendants and a failed read keep the exact selected physical branch.
+ */
+add_task(async function test_killedBranchErrorsAndReopen() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    info(
+      "Native-only SQLite fault control; the existing ordinary Mork cases remain unchanged"
+    );
+    return;
+  }
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.ok(
+    core instanceof Ci.nsIDatabaseCore,
+    "The requested native backend is active"
+  );
+  const rootMessage = gMessageGenerator.makeMessage({ subject: "killed-root" });
+  const branchMessage = gMessageGenerator.makeMessage({
+    inReplyTo: rootMessage,
+  });
+  const leafMessage = gMessageGenerator.makeMessage({
+    inReplyTo: branchMessage,
+  });
+  const siblingMessage = gMessageGenerator.makeMessage({
+    inReplyTo: rootMessage,
+  });
+  const set = new SyntheticMessageSet([
+    rootMessage,
+    branchMessage,
+    leafMessage,
+    siblingMessage,
+  ]);
+  await set_gTestFolder(set);
+  const [root, branch, leaf, sibling] = set.msgHdrList;
+  const otherFolder = await messageInjection.makeEmptyFolder();
+  const copies = new SyntheticMessageSet([branchMessage, leafMessage]);
+  await messageInjection.addSetsToFolders([otherFolder], [copies]);
+  const otherBefore = copies.msgHdrList.map(header => header.flags);
+  const db = gTestFolder.msgDatabase;
+  db.markKilled(sibling.messageKey, true, null);
+  Assert.ok(!sibling.isRead, "The preexisting killed sibling starts unread");
+  setup_view(
+    "threaded",
+    Ci.nsMsgViewFlagsType.kThreadedDisplay | Ci.nsMsgViewFlagsType.kShowIgnored
+  );
+  gFakeSelection.select(gDBView.findIndexOfMsgHdr(branch, true));
+  const connection = core.connectionForTests;
+  connection.executeSimpleSQL(
+    `CREATE TEMP TRIGGER reject_selected_descendant BEFORE UPDATE OF flags ON messages
+     WHEN OLD.id = ${leaf.messageKey} AND (NEW.flags & 1) != 0
+     BEGIN SELECT RAISE(ABORT, 'selected descendant read failure'); END`
+  );
+  try {
+    Assert.throws(
+      () =>
+        gDBView.viewNavigate(
+          Ci.nsMsgNavigationType.toggleSubthreadKilled,
+          {},
+          {},
+          {},
+          false
+        ),
+      error => error.result === Cr.NS_ERROR_STORAGE_CONSTRAINT
+    );
+    Assert.ok(
+      branch.isKilled,
+      "The successful selected marker remains committed"
+    );
+    Assert.ok(
+      branch.isRead,
+      "The completed selected read prefix remains committed"
+    );
+    Assert.ok(!leaf.isRead, "The failed descendant stays unread");
+    Assert.ok(
+      !root.isRead && !sibling.isRead,
+      "Root and sibling are outside the selected branch"
+    );
+    Assert.deepEqual(
+      gDBView.getSelectedMsgHdrs().map(header => header.messageKey),
+      [branch.messageKey]
+    );
+    Assert.deepEqual(
+      copies.msgHdrList.map(header => header.flags),
+      otherBefore
+    );
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_selected_descendant");
+  }
+  // Undo only the selected marker, then retry the same real command normally.
+  gDBView.viewNavigate(
+    Ci.nsMsgNavigationType.toggleSubthreadKilled,
+    {},
+    {},
+    {},
+    false
+  );
+  Assert.ok(!branch.isKilled);
+  gDBView.viewNavigate(
+    Ci.nsMsgNavigationType.toggleSubthreadKilled,
+    {},
+    {},
+    {},
+    false
+  );
+  Assert.ok(branch.isKilled && leaf.isKilled);
+  Assert.ok(branch.isRead && leaf.isRead);
+  Assert.ok(
+    !root.isRead && !sibling.isRead,
+    "An already killed sibling is not marked read"
+  );
+  const keys = set.msgHdrList.map(header => header.messageKey);
+  gDBView.close();
+  gTestFolder.ForceDBClosed();
+  const reopened = keys.map(key =>
+    gTestFolder.msgDatabase.getMsgHdrForKey(key)
+  );
+  Assert.deepEqual(
+    reopened.map(header => header.isKilled),
+    [false, true, true, true]
+  );
+  Assert.deepEqual(
+    reopened.map(header => header.isRead),
+    [false, true, true, false]
+  );
+  Assert.deepEqual(
+    copies.msgHdrList.map(header => header.flags),
+    otherBefore
+  );
+  gTestFolder.msgDatabase.markKilled(branch.messageKey, false, null);
+  setup_view(
+    "threaded",
+    Ci.nsMsgViewFlagsType.kThreadedDisplay | Ci.nsMsgViewFlagsType.kShowIgnored
+  );
+  gFakeSelection.select(gDBView.findIndexOfMsgHdr(reopened[1], true));
+  const beforeCycle = reopened.map(header => header.flags);
+  let savedParent;
+  const parentStatement = connection.createStatement(
+    "SELECT threadParent FROM messages WHERE id = :key"
+  );
+  try {
+    parentStatement.params.key = root.messageKey;
+    Assert.ok(parentStatement.executeStep());
+    savedParent = parentStatement.row.threadParent;
+  } finally {
+    parentStatement.finalize();
+  }
+  // A corrupt stored cycle cannot be produced by the checked normal callers.
+  // This critical failure control changes only the parent word and restores it
+  // before normal teardown, just as the existing storage-error controls do.
+  connection.executeSimpleSQL(
+    `UPDATE messages SET threadParent = ${leaf.messageKey} WHERE id = ${root.messageKey}`
+  );
+  try {
+    Assert.throws(
+      () =>
+        gDBView.viewNavigate(
+          Ci.nsMsgNavigationType.toggleSubthreadKilled,
+          {},
+          {},
+          {},
+          false
+        ),
+      error => error.result === Cr.NS_ERROR_FILE_CORRUPTED,
+      "The native cycle error reaches the selected retained operation"
+    );
+    Assert.deepEqual(
+      reopened.map(header => header.flags),
+      beforeCycle,
+      "A rejected physical cycle does not write a killed marker or read prefix"
+    );
+  } finally {
+    connection.executeSimpleSQL(
+      `UPDATE messages SET threadParent = ${savedParent === null ? "NULL" : savedParent} WHERE id = ${root.messageKey}`
+    );
+  }
+  gDBView.close();
+});
+
 add_task(function test_teardown() {
   // Delete view reference to avoid a cycle leak.
   gFakeSelection.view = null;

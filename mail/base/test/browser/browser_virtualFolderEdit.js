@@ -341,7 +341,7 @@ add_task(async function test_scopeEditPreservesPhysicalSelectionAndGrouping() {
       () =>
         about3Pane.gViewWrapper.displayedFolder == saved &&
         !about3Pane.gViewWrapper.searching &&
-        about3Pane.gDBView?.rowCount == 2,
+        about3Pane.gDBView?.numMsgsInView == 2,
       "The original real saved-search view is loaded"
     );
     const wrapper = about3Pane.gViewWrapper;

@@ -998,6 +998,12 @@ function scopedCache(receiver, saved) {
  * @param {nsIMsgDBHdr[]} headers - Exact physical members.
  */
 function assertScopedRows(wrapper, headers) {
+  Assert.equal(
+    wrapper.dbView.numMsgsInView,
+    headers.length,
+    "Exact complete membership before expanding threads"
+  );
+  wrapper.dbView.doCommand(Ci.nsMsgViewCommandType.expandAll);
   const physical = header => [header.folder.URI, header.messageKey];
   Assert.deepEqual(
     Array.from({ length: wrapper.dbView.rowCount }, (_, i) =>

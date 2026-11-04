@@ -1088,7 +1088,7 @@ DBViewWrapper.prototype = {
         if (!current()) {
           return;
         }
-        if (!Components.isSuccessCode(status)) {
+        if (status != Cr.NS_OK) {
           this._savedSearchError ??= Components.Exception(
             "Saved search failed",
             status
@@ -1097,7 +1097,11 @@ DBViewWrapper.prototype = {
         if (started) {
           // End only a successfully begun native search. A failed hit cannot
           // turn its admitted prefix into a successful cache replacement.
-          invoke("onSearchDone", [this._savedSearchError?.result || status]);
+          invoke("onSearchDone", [
+            this._savedSearchError
+              ? this._savedSearchError.result || Cr.NS_ERROR_FAILURE
+              : status,
+          ]);
         }
       },
     };

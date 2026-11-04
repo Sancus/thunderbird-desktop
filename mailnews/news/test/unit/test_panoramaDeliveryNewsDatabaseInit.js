@@ -44,7 +44,10 @@ async function createInitializationFixture() {
   Assert.equal(Services.prefs.getChildList(branch).length, 0);
   seededServerBranch = branch;
   Services.prefs.setCharPref(`${branch}type`, "nntp");
-  Services.prefs.setCharPref(`${branch}hostname`, "news-database-init.invalid");
+  Services.prefs.setCharPref(
+    `${branch}hostname`,
+    `news-database-init${fixtureNumber}.invalid`
+  );
   Services.prefs.setBoolPref(`${branch}valid`, false);
   const rootId = core.folderDB.insertRoot(key);
   const groupId = core.folderDB.insertFolder(rootId, "test.database-init");

@@ -194,6 +194,12 @@ nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
     MOZ_TRY(folderDB.InsertFolder(mFolderId, name, &id));
   }
 
+  // The native database captures its protocol at opening. Publish the group
+  // flag before SetFlag can reenter database initialization via summary counts.
+  uint32_t flags = MOZ_TRY(folderDB.GetFolderFlags(id));
+  if (!(flags & nsMsgFolderFlags::Newsgroup)) {
+    MOZ_TRY(folderDB.UpdateFlags(id, flags | nsMsgFolderFlags::Newsgroup));
+  }
   nsCOMPtr<nsIFile> path;
   MOZ_TRY(CreateDirectoryForFolder(getter_AddRefs(path)));
   nsCOMPtr<nsIMsgFolder> folder;

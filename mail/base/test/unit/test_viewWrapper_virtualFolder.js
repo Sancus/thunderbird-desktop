@@ -1084,6 +1084,11 @@ add_task(async function test_emptySourceRefreshPreservesOtherHits() {
   await view_open(wrapper, saved);
   info("S371 empty-source initial open finished");
   await deleteScopedMessage(a, first);
+  Assert.deepEqual(
+    scopedCache(a, saved),
+    [[b.URI, second.messageKey]],
+    "Completed deletion updates the full factory-owned cache before reopen"
+  );
   info("S371 physical deletion finished; reopening current scope");
   await view_open(wrapper, saved);
   info("S371 empty-source reopen finished");

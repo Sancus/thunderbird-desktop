@@ -541,6 +541,13 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
   m_totalMessagesInView = 0;
   mNativeMembers.Clear();
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Every search owns a fresh scope cursor and hit batch. In particular, an
+    // empty first scope must not leave the previous last scope/hits active.
+    m_curFolderGettingHits = nullptr;
+    m_curFolderHasCachedHits = false;
+    m_curFolderStartKeyIndex = 0;
+    m_hdrHits.Clear();
+    m_foldersSearchingOver.Clear();
     // Reusing this saved-search view must not reuse the old scope's members.
     m_threadsTable.Clear();
     m_hdrsTable.Clear();

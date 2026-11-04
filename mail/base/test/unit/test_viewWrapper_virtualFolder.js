@@ -1028,6 +1028,11 @@ async function deleteScopedMessage(folder, header) {
   const listener = new PromiseTestUtils.PromiseCopyListener();
   folder.deleteMessages([header], null, true, false, listener, false);
   await listener.promise;
+  // Leave the native provider's completion callback before reopening its store.
+  const { TestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/TestUtils.sys.mjs"
+  );
+  await TestUtils.waitForTick();
 }
 
 add_task(async function test_scopedCachePreservesOtherPhysicalSource() {
@@ -1109,7 +1114,7 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
   }
   const a = await messageInjection.makeEmptyFolder();
   const b = await messageInjection.makeEmptyFolder();
-  addScopedMessage(a, "enumerator-first@scope.invalid");
+  const first = addScopedMessage(a, "enumerator-first@scope.invalid");
   addScopedMessage(b, "enumerator-second@scope.invalid");
   const saved = messageInjection.makeVirtualFolder([a, b], {
     subject: "scope-match",
@@ -1118,31 +1123,30 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
   await view_open(wrapper, saved);
   const before = scopedCache(a, saved);
   const connection = core.connectionForTests;
-  let calls = 0;
-  connection.createFunction("s371_cache_read", 1, {
-    onFunctionCall(args) {
-      if (++calls == 2) {
-        throw Components.Exception(
-          "later saved-cache read",
-          Cr.NS_ERROR_FAILURE
-        );
-      }
-      return args.getInt64(0);
-    },
-  });
   try {
+    // Keep the indexed key ordering: the first real row succeeds, then SQLite
+    // reports its ordinary integer-overflow error while reading the next row.
     connection.executeSimpleSQL(
-      "CREATE TEMP VIEW search_folder_hits AS SELECT folder_id, s371_cache_read(message_id) AS message_id FROM main.search_folder_hits"
+      `CREATE TEMP VIEW search_folder_hits AS
+         SELECT folder_id, message_id FROM main.search_folder_hits
+         WHERE CASE WHEN message_id = ${first.messageKey}
+                    THEN 1 ELSE abs(-9223372036854775808) END`
+    );
+    const cursor = a.msgDatabase.getCachedHits(saved.URI);
+    Assert.equal(
+      cursor.getNext().messageKey,
+      first.messageKey,
+      "The real cursor returned the first row before the later read failed"
+    );
+    Assert.throws(
+      () => cursor.hasMoreElements(),
+      error => error.result == Cr.NS_ERROR_FAILURE,
+      "The later cached row retains the original SQLite read error"
     );
     Assert.throws(
       () => wrapper.dbView.QueryInterface(Ci.nsIMsgSearchNotify).onNewSearch(),
       error => error.result == Cr.NS_ERROR_FAILURE,
       "A later real SQLite cached-hit read returns the original error"
-    );
-    Assert.greaterOrEqual(
-      calls,
-      2,
-      "The first row was read before the later error"
     );
     Assert.equal(
       wrapper.dbView.rowCount,
@@ -1153,13 +1157,6 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
     // End the faulted view's owned search/scopes before restoring its storage.
     wrapper.close();
     connection.executeSimpleSQL("DROP VIEW temp.search_folder_hits");
-    // Finish the native search callback/iterator stack before removing its UDF.
-    // SQLite refuses function changes while any statement is still active.
-    const { TestUtils } = ChromeUtils.importESModule(
-      "resource://testing-common/TestUtils.sys.mjs"
-    );
-    await TestUtils.waitForTick();
-    connection.removeFunction("s371_cache_read");
   }
   Assert.deepEqual(
     scopedCache(a, saved),

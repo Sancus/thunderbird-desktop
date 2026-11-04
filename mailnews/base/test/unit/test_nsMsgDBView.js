@@ -1463,6 +1463,32 @@ add_task(async function test_flatSortReadErrorRestoresSelection() {
 });
 
 /**
+ * Checks the real body store against both independently declared startup inputs.
+ *
+ * @param {nsIMsgFolder} folder - The actual physical fixture folder.
+ */
+function assertDeclaredPhysicalStore(folder) {
+  const expectedStore = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Assert.ok(
+    expectedStore == "@mozilla.org/msgstore/berkeleystore;1" ||
+      expectedStore == "@mozilla.org/msgstore/maildirstore;1",
+    "The ordinary input independently declares a supported physical store"
+  );
+  Assert.equal(
+    Services.prefs.getCharPref("mail.server.default.storeContractID"),
+    expectedStore,
+    "Both startup store inputs agree"
+  );
+  Assert.equal(
+    folder.server.getStringValue("storeContractID"),
+    expectedStore,
+    "The actual physical store matches the independently declared input"
+  );
+}
+
+/**
  * A failed thread read keeps its committed physical prefix and original error.
  */
 add_task(async function test_threadReadStopsAtOriginalWriteError() {
@@ -1486,24 +1512,7 @@ add_task(async function test_threadReadStopsAtOriginalWriteError() {
   const control = gMessageGenerator.makeMessage({ subject: "read-control" });
   const set = new SyntheticMessageSet([parent, child, control]);
   await set_gTestFolder(set);
-  const expectedStore = Services.prefs.getCharPref(
-    "mail.serverDefaultStoreContractID"
-  );
-  Assert.ok(
-    expectedStore == "@mozilla.org/msgstore/berkeleystore;1" ||
-      expectedStore == "@mozilla.org/msgstore/maildirstore;1",
-    "The ordinary input independently declares a supported physical store"
-  );
-  Assert.equal(
-    Services.prefs.getCharPref("mail.server.default.storeContractID"),
-    expectedStore,
-    "Both startup store inputs agree"
-  );
-  Assert.equal(
-    gTestFolder.server.getStringValue("storeContractID"),
-    expectedStore,
-    "The actual physical store matches the independently declared input"
-  );
+  assertDeclaredPhysicalStore(gTestFolder);
   const [root, reply, untouched] = set.msgHdrList;
   const otherFolder = await messageInjection.makeEmptyFolder();
   const copies = new SyntheticMessageSet([parent, child]);
@@ -1963,10 +1972,7 @@ add_task(async function test_searchThreadDateErrorPreservesVisibleOrder() {
         const initial = new SyntheticMessageSet([parent, child, control]);
         await set_gTestFolder(initial);
         const [root, oldChild, outside] = initial.msgHdrList;
-        Assert.equal(
-          gTestFolder.server.getStringValue("storeContractID"),
-          "@mozilla.org/msgstore/berkeleystore;1"
-        );
+        assertDeclaredPhysicalStore(gTestFolder);
         if (zeroDates) {
           root.date = 0;
           oldChild.date = 0;
@@ -2136,10 +2142,7 @@ add_task(async function test_newHeaderDateErrorPreservesView() {
         const initial = new SyntheticMessageSet([parent, child, control]);
         await set_gTestFolder(initial);
         const [root, oldChild, outside] = initial.msgHdrList;
-        Assert.equal(
-          gTestFolder.server.getStringValue("storeContractID"),
-          "@mozilla.org/msgstore/berkeleystore;1"
-        );
+        assertDeclaredPhysicalStore(gTestFolder);
         if (zeroDates) {
           root.date = 0;
           oldChild.date = 0;

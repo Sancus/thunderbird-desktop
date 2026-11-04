@@ -208,15 +208,17 @@ nsresult nsMsgXFVirtualFolderDBView::NativeMemberIndex(nsIMsgDBHdr* header,
   index = mNativeMembers.IndexOf(header);
   if (index >= 0) return NS_OK;
   nsMsgKey key;
-  nsCOMPtr<nsIMsgFolder> folder;
   MOZ_TRY(header->GetMessageKey(&key));
-  MOZ_TRY(header->GetFolder(getter_AddRefs(folder)));
   for (int32_t i = 0; i < mNativeMembers.Count(); ++i) {
     nsMsgKey other;
-    nsCOMPtr<nsIMsgFolder> physical;
     MOZ_TRY(mNativeMembers[i]->GetMessageKey(&other));
+    if (other != key) continue;
+    // Retired scan hits retain their key but no longer resolve a folder. Only
+    // resolve an owner after finding a still-current native member with it.
+    nsCOMPtr<nsIMsgFolder> folder, physical;
+    MOZ_TRY(header->GetFolder(getter_AddRefs(folder)));
     MOZ_TRY(mNativeMembers[i]->GetFolder(getter_AddRefs(physical)));
-    if (other == key && physical == folder) {
+    if (physical == folder) {
       index = i;
       break;
     }
@@ -381,6 +383,16 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForPrevSearchedFolders(
     for (int32_t i = 0; i < m_hdrHits.Count(); ++i) {
       nsMsgKey key;
       MOZ_TRY(m_hdrHits[i]->GetMessageKey(&key));
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        int32_t member;
+        MOZ_TRY(NativeMemberIndex(m_hdrHits[i], member));
+        if (member < 0) continue;
+        nsCOMPtr<nsIMsgFolder> physical;
+        MOZ_TRY(mNativeMembers[member]->GetFolder(getter_AddRefs(physical)));
+        // Live notifications share this array with scanner hits. A matching
+        // member of another scope is preserved by its own cache partition.
+        if (physical != m_curFolderGettingHits || hits.Contains(key)) continue;
+      }
       hits.AppendElement(key);
     }
     hits.Sort();

@@ -1232,6 +1232,73 @@ add_task(
   }
 );
 
+add_task(async function test_savedSearchLiveChangesDuringScan() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const b = await messageInjection.makeEmptyFolder();
+  const scanned = addScopedMessage(a, "inflight-scanned@scope.invalid");
+  const rematch = addScopedMessage(a, "inflight-rematch@scope.invalid");
+  scanned.markFlagged(true);
+  const saved = messageInjection.makeVirtualFolder([a, b], {
+    subject: "scope-match",
+  });
+  VirtualFolderHelper.wrapVirtualFolder(saved).searchString =
+    "AND (status,is,flagged) AND (subject,contains,scope-match)";
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, saved);
+  const notify = wrapper._searchViewListener;
+  const progress = wrapper.search._sessionListener;
+  const originalLoaded = wrapper.listener.onMessagesLoaded;
+  let complete = 0;
+  wrapper.listener.onMessagesLoaded = function (all) {
+    if (all) {
+      complete++;
+    }
+    return originalLoaded.call(this, all);
+  };
+  try {
+    progress.onNewSearch();
+    notify.onNewSearch();
+    notify.onSearchHit(scanned, a);
+    const arrived = addScopedMessage(b, "inflight-arrived@scope.invalid");
+    arrived.markFlagged(true);
+    rematch.markFlagged(true);
+    // The live match was admitted before the scanner delivered this same key.
+    notify.onSearchHit(rematch, a);
+    await deleteScopedMessage(a, scanned);
+    // The scanner next reaches B; its earlier live hit must not enter A's batch.
+    notify.onSearchHit(arrived, b);
+    notify.onSearchDone(Cr.NS_OK);
+    progress.onSearchDone(Cr.NS_OK);
+    Assert.equal(
+      wrapper._savedSearchError,
+      null,
+      "The valid scan has no error"
+    );
+    Assert.equal(complete, 1, "The normal registered listener completes once");
+    Assert.ok(!wrapper.searching, "The completed scan is no longer loading");
+    assertScopedRows(wrapper, [rematch, arrived]);
+    Assert.deepEqual(
+      scopedCache(a, saved),
+      [
+        [a.URI, rematch.messageKey],
+        [b.URI, arrived.messageKey],
+      ],
+      "Only current matching physical members survive both scanner batches"
+    );
+    Assert.equal(saved.getTotalMessages(false), 2);
+    Assert.equal(saved.getNumUnread(false), 2);
+    await view_open(wrapper, saved);
+    assertScopedRows(wrapper, [rematch, arrived]);
+  } finally {
+    wrapper.listener.onMessagesLoaded = originalLoaded;
+    wrapper.close();
+    saved.parent.propagateDelete(saved, true);
+  }
+});
+
 add_task(async function test_savedSearchRebindDetachesOldScope() {
   if (!savedSearchCore()) {
     return;

@@ -397,14 +397,30 @@ export class NntpClient {
   };
 
   /**
-   * The close event handler.
+   * Complete an interrupted request only for the socket that closed.
+   *
+   * @param {TCPSocketEvent} [event] - The closed socket event.
    */
-  _onClose = async () => {
-    // Wait for `_onError` to finish.
-    await this._promiseErrorHandled;
-    delete this._promiseErrorHandled;
+  _onClose = async event => {
+    const socket = this._socket;
+    if (event?.target && event.target != socket) {
+      return;
+    }
+    const generation = this.#requestGeneration;
+    // Wait for this socket's error handling without clearing a newer error.
+    const pending = this._promiseErrorHandled;
+    await pending;
+    if (this._promiseErrorHandled == pending) {
+      delete this._promiseErrorHandled;
+    }
+    if (generation != this.#requestGeneration || socket != this._socket) {
+      return;
+    }
 
     this._logger.debug("Connection closed.");
+    if (!this._done) {
+      this._actionDone(Cr.NS_ERROR_NET_RESET);
+    }
   };
 
   /**
@@ -1312,9 +1328,9 @@ export class NntpClient {
   }
 
   /**
-   * Close the connection and do necessary cleanup.
+   * Settle database work and complete the current request once.
    *
-   * @param {nsresult} [status=Cr.NS_OK]
+   * @param {nsresult} [status=Cr.NS_OK] - The original request outcome.
    */
   _actionDone = (status = Cr.NS_OK) => {
     if (this._done) {
@@ -1322,14 +1338,41 @@ export class NntpClient {
     }
     this._done = true;
     this.#requestGeneration++;
+    const generation = this.#requestGeneration;
+    const { onDone, onIdle, urlListener, runningUri } = this;
+    const folder = this._newsFolder;
+    try {
+      this._newsGroup?.cleanUp(status);
+    } catch (error) {
+      this._logger.error("Failed to finish news database work.", error);
+      if (Components.isSuccessCode(status)) {
+        status =
+          typeof error?.result == "number" &&
+          !Components.isSuccessCode(error.result)
+            ? error.result
+            : Cr.NS_ERROR_FAILURE;
+      }
+    }
     this._logger.debug(`Done with status=${status}`);
-    this.onDone(status);
-    this._newsGroup?.cleanUp();
-    this._newsFolder?.OnStopRunningUrl?.(this.runningUri, status);
-    this.urlListener?.OnStopRunningUrl(this.runningUri, status);
-    this.runningUri?.SetUrlState(false, status);
+    // Detach the completed request before a callback can start another one.
+    // All remaining notifications use its captured context.
     this._reset();
-    this.onIdle?.();
+    for (const notify of [
+      () => onDone.call(this, status),
+      () => folder?.OnStopRunningUrl?.(runningUri, status),
+      () => urlListener?.OnStopRunningUrl(runningUri, status),
+      () => runningUri?.SetUrlState(false, status),
+    ]) {
+      try {
+        notify();
+      } catch (error) {
+        this._logger.error("Failed to notify news request completion.", error);
+      }
+    }
+    // A reentrant request still owns the busy connection until its own finish.
+    if (generation == this.#requestGeneration) {
+      onIdle?.call(this);
+    }
   };
 
   /**

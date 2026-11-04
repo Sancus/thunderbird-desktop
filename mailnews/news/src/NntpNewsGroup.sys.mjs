@@ -30,6 +30,28 @@ export class NntpNewsGroup {
     this._xoverHdrs = new Map();
     this._commitReadKeySet = false;
     this._skipHead = false;
+    this._finished = false;
+    this._finishing = false;
+    this._closed = false;
+    this._failure = null;
+  }
+
+  /**
+   * Reject input after completion, cleanup or an earlier publication failure.
+   *
+   * @param {boolean} [duringFinish=false] - Whether this is the active finish.
+   * @throws {nsIException} The first failure, or a closed/reentrant input error.
+   */
+  _checkOpen(duringFinish = false) {
+    if (this._failure) {
+      throw this._failure;
+    }
+    if (this._closed || this._finished) {
+      throw Components.Exception("News producer is closed", Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+    if (this._finishing && !duringFinish) {
+      throw Components.Exception("News producer is finishing", Cr.NS_ERROR_IN_PROGRESS);
+    }
   }
 
   /**
@@ -207,6 +229,7 @@ export class NntpNewsGroup {
    * Add a range (usually XOVER range) to the known key set.
    */
   addKnownArticles(start, end) {
+    this._checkOpen();
     this._knownKeySet.addRange(start, end);
   }
 
@@ -214,10 +237,27 @@ export class NntpNewsGroup {
    * Finish processing XOVER responses.
    */
   finishProcessingXOver() {
-    this._runFilters();
-    const groupInfo = this._db.dBFolderInfo;
-    if (groupInfo) {
-      groupInfo.knownArtsSet = this._knownKeySet.toString();
+    if (this._failure) {
+      throw this._failure;
+    }
+    if (this._finished) {
+      return;
+    }
+    this._checkOpen();
+    this._finishing = true;
+    try {
+      this._runFilters();
+      this._checkOpen(true);
+      const groupInfo = this._db.dBFolderInfo;
+      if (groupInfo) {
+        groupInfo.knownArtsSet = this._knownKeySet.toString();
+      }
+      this._finished = true;
+    } catch (error) {
+      this._failure = error;
+      throw error;
+    } finally {
+      this._finishing = false;
     }
   }
 
@@ -237,6 +277,7 @@ export class NntpNewsGroup {
    * @param {string} line - A XHDR response line.
    */
   processXHdrLine(header, line) {
+    this._checkOpen();
     const spaceIndex = line.indexOf(" ");
     const articleNumber = line.slice(0, spaceIndex);
     const value = line.slice(spaceIndex).trim();
@@ -255,6 +296,7 @@ export class NntpNewsGroup {
    * @param {number} articleNumber - The article number.
    */
   initHdr(articleNumber) {
+    this._checkOpen();
     if (this._msgHdr) {
       this._msgHdrs.push(this._msgHdr);
     }
@@ -290,6 +332,7 @@ export class NntpNewsGroup {
         Cr.NS_ERROR_ILLEGAL_VALUE
       );
     }
+    this._checkOpen();
     const header = this._db.createNewHdrWithSpecificMsgKey(articleNumber);
     this._articleNumbers.set(header, articleNumber);
     return header;
@@ -326,6 +369,7 @@ export class NntpNewsGroup {
    * @param {string} line - A HEAD response line.
    */
   processHeadLine(line) {
+    this._checkOpen();
     if (this._skipHead) {
       return;
     }
@@ -373,6 +417,7 @@ export class NntpNewsGroup {
     const serverFilterCount = this._serverFilterList.filterCount;
 
     for (const msgHdr of this._msgHdrs) {
+      this._checkOpen(true);
       const article = this._articleNumbers.get(msgHdr);
       if (this._nativeBackend) {
         const current = new MsgKeySet(
@@ -419,6 +464,7 @@ export class NntpNewsGroup {
         );
         this._serverFilterList.flushLogIfNecessary();
       }
+      this._checkOpen(true);
       if (
         this._addHdrToDB &&
         (this._nativeBackend || !this._db.containsKey(msgHdr.messageKey))
@@ -527,23 +573,56 @@ export class NntpNewsGroup {
   }
 
   /**
-   * Commit changes to msg db.
+   * Close this producer and settle successful database work before completion.
+   * Failed requests discard their unpublished inputs, not committed articles.
+   *
+   * @param {nsresult} [status=Cr.NS_OK] - The original request outcome.
+   * @throws {nsIException} The first database or cleanup failure.
    */
-  cleanUp() {
-    if (this._commitReadKeySet) {
-      if (this._nativeBackend) {
-        this._saveOldReadRange();
-      } else {
-        this._folder.setReadSetFromStr(this._readKeySet.toString());
-        this._commitReadKeySet = false;
-      }
+  cleanUp(status = Cr.NS_OK) {
+    if (this._closed) {
+      return;
     }
-    this._folder.notifyFinishedDownloadinghdrs();
-    this._db.commit(Ci.nsMsgDBCommitType.kSessionCommit);
-    if (!this._nativeBackend) {
-      this._db.close(true);
+    this._closed = true;
+    let failure = this._failure;
+    try {
+      if (Components.isSuccessCode(status)) {
+        if (this._finishing) {
+          throw Components.Exception("News publication is active", Cr.NS_ERROR_IN_PROGRESS);
+        }
+        if (failure) {
+          throw failure;
+        }
+        if (this._commitReadKeySet) {
+          if (this._nativeBackend) {
+            this._saveOldReadRange();
+          } else {
+            this._folder.setReadSetFromStr(this._readKeySet.toString());
+            this._commitReadKeySet = false;
+          }
+        }
+        this._db.commit(Ci.nsMsgDBCommitType.kSessionCommit);
+        this._folder.notifyFinishedDownloadinghdrs();
+      }
+    } catch (error) {
+      failure ||= error;
+    } finally {
+      this._msgHdr = null;
+      this._msgHdrs = [];
+      this._xoverHdrs.clear();
+      if (!this._nativeBackend) {
+        try {
+          this._db.close(true);
+        } catch (error) {
+          failure ||= error;
+        }
+      }
     }
     // Native writes are already committed. Keep the folder-owned read-set
     // binding for live flag/listener updates until real folder/database close.
+    this._failure = failure;
+    if (failure) {
+      throw failure;
+    }
   }
 }

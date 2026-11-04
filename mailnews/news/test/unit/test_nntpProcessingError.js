@@ -469,3 +469,58 @@ add_task(async function test_offlineDownloadFailure() {
     }
   });
 });
+
+
+add_task(async function test_cleanupFailureBeforeTerminalSuccess() {
+  await withServer(NNTP_RFC2980_handler, async () => {
+    let cleaned = 0;
+    await withReplacedMethod(
+      "cleanUp",
+      function (original, ...args) {
+        cleaned++;
+        original.apply(this, args);
+        throw Components.Exception("cleanup failed", Cr.NS_ERROR_FILE_ACCESS_DENIED);
+      },
+      async () => {
+        await Assert.rejects(
+          getNewMessages(),
+          new RegExp(Cr.NS_ERROR_FILE_ACCESS_DENIED),
+          "a cleanup failure must replace success before URL completion"
+        );
+      }
+    );
+    Assert.equal(cleaned, 1, "The failed request cleans up once");
+    await getNewMessages();
+    Assert.equal(folder.getTotalMessages(false), 8, "A queued retry can use the released connection without losing committed headers");
+  });
+});
+
+add_task(async function test_parserFailurePrecedesCleanupFailure() {
+  await withServer(NNTP_RFC2980_handler, async () => {
+    await withReplacedMethod(
+      "processXOverLine",
+      () => {
+        throw Components.Exception("parser failed", Cr.NS_ERROR_ILLEGAL_VALUE);
+      },
+      async () => {
+        await withReplacedMethod(
+          "cleanUp",
+          function (original, ...args) {
+            original.apply(this, args);
+            throw Components.Exception("cleanup failed later", Cr.NS_ERROR_FILE_ACCESS_DENIED);
+          },
+          async () => {
+            await Assert.rejects(
+              getNewMessages(),
+              new RegExp(Cr.NS_ERROR_ILLEGAL_VALUE),
+              "later cleanup must retain the original parser failure"
+            );
+          }
+        );
+      }
+    );
+    Assert.equal(folder.getTotalMessages(false), 0, "Failed parser input stays unpublished");
+    await getNewMessages();
+    Assert.equal(folder.getTotalMessages(false), 8);
+  });
+});

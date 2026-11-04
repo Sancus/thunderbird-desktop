@@ -162,3 +162,80 @@ add_task(async function test_staleReaderRejection() {
   );
   client._actionDone();
 });
+
+
+add_task(function test_reentrantCompletionRetainsNewRequest() {
+  const client = new NntpClient(incomingServer);
+  const socket = { readyState: "open", close() {} };
+  client._socket = socket;
+  client.connect();
+  const stops = [];
+  const oldUrl = client.startRunningUrl({
+    OnStartRunningUrl() {},
+    OnStopRunningUrl(url, status) {
+      stops.push([url, status]);
+    },
+  }, null);
+  let oldDone = 0;
+  let newDone = 0;
+  let idle = 0;
+  let newUrl;
+  client.onIdle = () => idle++;
+  client.onDone = status => {
+    oldDone++;
+    Assert.equal(status, Cr.NS_ERROR_NET_RESET);
+    newUrl = client.startRunningUrl(null, null);
+    client.onDone = () => newDone++;
+    client.connect();
+  };
+  client._actionDone(Cr.NS_ERROR_NET_RESET);
+  Assert.equal(oldDone, 1);
+  Assert.deepEqual(stops, [[oldUrl, Cr.NS_ERROR_NET_RESET]], "Old URL callbacks use only their captured context");
+  Assert.equal(client.runningUri, newUrl, "Old completion cannot clear the reentrant URL");
+  Assert.ok(!client._done, "The reentrant request is still active");
+  Assert.equal(idle, 0, "The connection stays owned by the reentrant request");
+  client._actionDone();
+  client._actionDone();
+  Assert.equal(newDone, 1);
+  Assert.equal(idle, 1, "The new request releases its connection once");
+});
+
+add_task(async function test_closedResponseFinishesOnce() {
+  const client = new NntpClient(incomingServer);
+  client._socket = { readyState: "open", close() {} };
+  client.connect();
+  const statuses = [];
+  let idle = 0;
+  client.onDone = status => statuses.push(status);
+  client.onIdle = () => idle++;
+  await client._onClose();
+  await client._onClose();
+  Assert.deepEqual(statuses, [Cr.NS_ERROR_NET_RESET], "An incomplete response cannot finish successfully on close");
+  Assert.equal(idle, 1);
+});
+
+
+add_task(async function test_staleCloseDoesNotFinishReusedClient() {
+  const client = new NntpClient(incomingServer);
+  const oldSocket = { readyState: "open", close() {} };
+  client._socket = oldSocket;
+  client.connect();
+  const pending = Promise.withResolvers();
+  client._promiseErrorHandled = pending.promise;
+  const closing = client._onClose({ target: oldSocket });
+  client._actionDone(Cr.NS_ERROR_NET_RESET);
+  client._socket = { readyState: "open", close() {} };
+  client.connect();
+  const newError = Promise.resolve();
+  client._promiseErrorHandled = newError;
+  let completions = 0;
+  client.onDone = () => completions++;
+  pending.resolve();
+  await closing;
+  await client._onClose({ target: oldSocket });
+  Assert.ok(!client._done, "Neither an awaited nor late old close can finish the new request");
+  Assert.equal(completions, 0);
+  Assert.equal(client._promiseErrorHandled, newError, "Old close cannot clear new error ownership");
+  client._actionDone();
+  Assert.equal(completions, 1);
+});

@@ -281,8 +281,20 @@ add_task(async function test_nativeOnlineMoveSettlesBothSources() {
     const mailbox = IMAPPump.daemon.getMailbox("OnlineMove");
     Assert.equal(mailbox._messages.length, 2);
     Assert.equal(copyUids.size, 2);
-    Assert.deepEqual(destinationOps.listAllOfflineOpIds(), []);
+    // Native counterpart records retain Undo/Redo custody, not server work.
+    Assert.deepEqual(
+      destinationOps.listAllOfflineOpIds().sort((a, b) => a - b),
+      staged.map(entry => entry.key).sort((a, b) => a - b)
+    );
     for (const { key, sourceKey, sourceUid } of staged) {
+      const counterpart = destinationOps.getOfflineOpForKey(key, false);
+      Assert.ok(counterpart);
+      Assert.equal(
+        counterpart.operation,
+        Ci.nsIMsgOfflineImapOperation.kMoveResult
+      );
+      Assert.equal(counterpart.sourceFolderURI, source.URI);
+      Assert.equal(counterpart.srcMessageKey, sourceKey);
       Assert.ok(!source.msgDatabase.containsKey(sourceKey));
       const receipt = copyUids.get(sourceUid);
       Assert.ok(receipt, "Each physical source has an actual COPYUID receipt");

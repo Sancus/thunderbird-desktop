@@ -222,6 +222,11 @@ NS_IMETHODIMP FolderLookupService::GetOrCreateFolderForURL(
     }
   }
 
+  // Native cache misses cannot be materialized through the legacy URI factory.
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
   nsCOMPtr<nsIMsgFolder> newFolder;
   rv = CreateDangling(url, getter_AddRefs(newFolder));
   NS_ENSURE_SUCCESS(rv, rv);

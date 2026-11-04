@@ -53,10 +53,13 @@ add_task(async function test_publishCommittedMessageOnce() {
   const root = folderDB.insertRoot("delivery-publication");
   const folderId = folderDB.insertFolder(root, "Inbox");
   // Observe raw rows without requiring an account-backed nsIMsgFolder.
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+  let view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   const events = [];
   view.setListener({
     onMessageAdded(message) {
@@ -177,10 +180,13 @@ add_task(async function test_folderFilteredEventsUseDatabaseIdentity() {
     /NS_ERROR_NOT_INITIALIZED/,
     "The raw folder has no account-backed folder object"
   );
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+  let view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   view.initWithFolder(folderId);
   const events = [];
   view.setListener({
@@ -244,11 +250,14 @@ add_task(async function test_tagThenReadPublishesEachMessageOnce() {
   const root = folderDB.insertRoot("delivery-tag-then-read");
   const folderId = folderDB.insertFolder(root, "Inbox");
   const tag = "delivery-snapshot-tag";
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+  let view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
   view.initWithTag(tag);
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   const events = [];
   view.setListener({
     onMessageAdded(message) {
@@ -326,11 +335,14 @@ add_task(async function test_tagChangesPreserveFlaggedMembership() {
   const root = folderDB.insertRoot("delivery-tag-flagged-snapshot");
   const folderId = folderDB.insertFolder(root, "Inbox");
   const flags = Ci.nsMsgMessageFlags.Read | Ci.nsMsgMessageFlags.Marked;
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+  let view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
   view.initWithFlaggedMessages();
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   const baseline = await view.countMessages();
   const events = [];
   view.setListener({
@@ -390,11 +402,14 @@ add_task(async function test_tagChangesPreserveFlaggedMembership() {
 add_task(async function test_tagChangesKeepReadMessagesOutOfUnreadView() {
   const root = folderDB.insertRoot("delivery-tag-unread-snapshot");
   const folderId = folderDB.insertFolder(root, "Inbox");
-  const view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
+  let view = Cc["@mozilla.org/mailnews/live-view;1"].createInstance(
     Ci.nsILiveView
   );
   view.initWithUnreadMessages();
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   const baseline = await view.countMessages();
   const events = [];
   view.setListener({
@@ -486,7 +501,10 @@ function recordSnapshotEvents(view) {
     },
     onSelectedChunk() {},
   });
-  registerCleanupFunction(() => view.clearListener());
+  registerCleanupFunction(() => {
+    view.clearListener();
+    view = null;
+  });
   return events;
 }
 

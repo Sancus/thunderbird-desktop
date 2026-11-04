@@ -5765,8 +5765,7 @@ nsresult nsMsgDBView::SetThreadIgnored(nsIMsgThread* thread,
             rv = mJSTree->EnsureRowIsVisible(currentIndex);
             NS_ENSURE_SUCCESS(rv, rv);
           } else if (mTree) {
-            rv = mTree->EnsureRowIsVisible(currentIndex);
-            NS_ENSURE_SUCCESS(rv, rv);
+            mTree->EnsureRowIsVisible(currentIndex);
           }
         }
       }

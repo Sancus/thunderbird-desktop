@@ -15,6 +15,9 @@ const { ProfileCreator } = ChromeUtils.importESModule(
 const Backup = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationBackup.sys.mjs"
 );
+const { hashMigrationFile } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationSource.sys.mjs"
+);
 const { MigrationJournal } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationJournal.sys.mjs"
 );
@@ -108,8 +111,9 @@ add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
   }
   for (const spec of REFERENCE_VARIANTS) {
     const fixture = do_get_file("data/" + spec.file + ".msf");
+    // Keep profile NSS stores closed until the original backup is complete.
     Assert.equal(
-      await IOUtils.computeHexDigest(fixture.path, "sha256"),
+      await hashMigrationFile(fixture.path),
       spec.sha256
     );
     const bytes = await IOUtils.read(fixture.path);

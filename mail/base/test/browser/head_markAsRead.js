@@ -87,12 +87,25 @@ async function setupMarkAsRead(backend) {
       ServerTestUtils.serverDefs.ews.plain,
     ]);
     const ewsAccount = MailServices.accounts.createAccount();
-    registerCleanupFunction(function () {
-      ewsAccount.incomingServer.closeCachedConnections();
+    registerCleanupFunction(async function () {
+      const incomingServer = ewsAccount.incomingServer;
+      if (incomingServer) {
+        incomingServer.shutdown();
+        incomingServer.QueryInterface(Ci.IExchangeIncomingServer);
+        await TestUtils.waitForCondition(
+          () => !incomingServer.protocolClientRunning,
+          "waiting for the EWS fixture client to shut down"
+        );
+      }
+      await ewsServer.stop();
       MailServices.accounts.removeAccount(ewsAccount, false);
+      await Services.logins.removeAllLoginsAsync();
       Cc["@mozilla.org/network/http-auth-manager;1"]
         .getService(Ci.nsIHttpAuthManager)
         .clearAll();
+      info(
+        "EWS fixture client and mock server stopped; HTTP authentication cache cleared"
+      );
     });
     ewsAccount.addIdentity(MailServices.accounts.createIdentity());
     ewsAccount.incomingServer = MailServices.accounts.createIncomingServer(

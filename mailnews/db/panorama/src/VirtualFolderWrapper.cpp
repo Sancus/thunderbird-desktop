@@ -339,19 +339,10 @@ nsresult SavedSearchBindings::Refresh(uint64_t focus) {
       // A real folder-loss notification retires missing sources only after a
       // complete checked current hierarchy read. Moves retain their live IDs.
       RefPtr<VirtualFolderWrapper> wrapper = new VirtualFolderWrapper(id);
-      nsTArray<uint64_t> before;
-      rv = wrapper->FolderDB().GetVirtualFolderFolders(id, before);
-      if (NS_SUCCEEDED(rv)) {
-        nsTArray<uint64_t> remaining;
-        for (uint64_t source : before) {
-          if (current.Contains(source)) remaining.AppendElement(source);
-        }
-        if (remaining != before) {
-          rv = wrapper->FolderDB().SetVirtualFolderFolders(id, remaining);
-          if (NS_SUCCEEDED(rv) && !mDefinitions.Contains(id)) {
-            mDefinitions.AppendElement(id);
-          }
-        }
+      bool changed;
+      rv = wrapper->RetireMissingSources(current, changed);
+      if (NS_SUCCEEDED(rv) && changed && !mDefinitions.Contains(id)) {
+        mDefinitions.AppendElement(id);
       }
       if (NS_FAILED(rv)) retireFailed = true;
     }
@@ -536,6 +527,22 @@ nsresult VirtualFolderWrapper::CheckCurrent(bool refresh) {
                                              getter_AddRefs(mMsgFolder)));
   }
   return refresh && sBindings ? sBindings->Refresh(mVirtualFolderId) : NS_OK;
+}
+
+nsresult VirtualFolderWrapper::RetireMissingSources(
+    const nsTArray<uint64_t>& current, bool& changed) {
+  changed = false;
+  MOZ_TRY(CheckCurrent(false));
+  nsTArray<uint64_t> before, remaining;
+  MOZ_TRY(FolderDB().GetVirtualFolderFolders(mVirtualFolderId, before));
+  for (uint64_t id : before) {
+    if (current.Contains(id)) remaining.AppendElement(id);
+  }
+  if (remaining != before) {
+    MOZ_TRY(FolderDB().SetVirtualFolderFolders(mVirtualFolderId, remaining));
+    changed = true;
+  }
+  return NS_OK;
 }
 
 NS_IMPL_ISUPPORTS(VirtualFolderWrapper, nsIVirtualFolderWrapper)

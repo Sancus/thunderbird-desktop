@@ -333,13 +333,7 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
           nsCOMPtr<nsIMsgDatabase> owner;
           MOZ_TRY(physical->GetMsgDatabase(getter_AddRefs(owner)));
           nsCOMPtr<nsIMsgDBHdr> current;
-          nsresult lookup =
-              owner->GetMsgHdrForKey(key, getter_AddRefs(current));
-          if (NS_FAILED(lookup)) {
-            printf_stderr("S371 other-source cache hit key=%u rv=%08x\n", key,
-                          unsigned(lookup));
-            return lookup;
-          }
+          MOZ_TRY(owner->GetMsgHdrForKey(key, getter_AddRefs(current)));
           NS_ENSURE_TRUE(current, NS_ERROR_NOT_AVAILABLE);
           NS_ENSURE_FALSE(replacement.Contains(key), NS_ERROR_ILLEGAL_VALUE);
           replacement.AppendElement(key);
@@ -348,12 +342,7 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
     }
     for (nsMsgKey key : newHits) {
       nsCOMPtr<nsIMsgDBHdr> header;
-      nsresult lookup = db->GetMsgHdrForKey(key, getter_AddRefs(header));
-      if (NS_FAILED(lookup)) {
-        printf_stderr("S371 current-source cache hit key=%u rv=%08x\n", key,
-                      unsigned(lookup));
-        return lookup;
-      }
+      MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(header)));
       NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
     }
   }

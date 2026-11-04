@@ -38,6 +38,8 @@ class VirtualFolderWrapper : public nsIVirtualFolderWrapper {
   static nsresult SavedFolderIds(nsTArray<uint64_t>& ids,
                                  nsTArray<uint64_t>& current);
   nsresult CheckCurrent(bool refresh = true);
+  nsresult RetireMissingSources(const nsTArray<uint64_t>& current,
+                                bool& changed);
 
  protected:
   virtual ~VirtualFolderWrapper() {};

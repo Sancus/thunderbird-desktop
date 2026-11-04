@@ -1277,3 +1277,109 @@ add_task(
     );
   }
 );
+
+add_task(async function test_committedSnapshotRetainsMappingsOnSourceRefusal() {
+  const modes = ["changed", "missing"];
+  if (AppConstants.platform == "win") {
+    modes.push("replaced");
+  }
+  for (const mode of modes) {
+    const { root, plan, path } = await migrationFiles();
+    const source = plan.sources[0];
+    const original = await IOUtils.read(source.path);
+    const saved = PathUtils.join(root, "retained-original.msf");
+    let journal = await MigrationJournal.create(path, plan);
+    registerCleanupFunction(() => journal.close());
+    const backup = await createMigrationBackup(
+      plan.profilePath,
+      plan.mailPaths,
+      plan.backupPath
+    );
+    await journal.recordBackup(backup);
+    const token = await journal.beginImport("folder-source");
+    await journal.recordImport("folder-source", {
+      token,
+      sourceSha256: source.sha256,
+      ...physicalReceiptModel(journal),
+      sourcePhysicalIdentity: journal.state.sources[0].physicalIdentity,
+      folderId: 9,
+      keys: [
+        [3, 700],
+        [1, 401],
+      ],
+    });
+    const committed = journal.state;
+    const persisted = await IOUtils.read(path);
+    Assert.equal(committed.sources[0].state, "imported");
+    Assert.deepEqual(committed.sources[0].receipt.keys, [
+      [1, 401],
+      [3, 700],
+    ]);
+    journal.close();
+
+    // Only mutate after the original operation and its leases have settled.
+    if (mode == "changed") {
+      const changed = original.slice();
+      changed[changed.length - 1] ^= 1;
+      await IOUtils.write(source.path, changed);
+      Assert.equal((await IOUtils.stat(source.path)).size, source.size);
+      Assert.notEqual(await hashMigrationFile(source.path), source.sha256);
+    } else {
+      await IOUtils.move(source.path, saved, { noOverwrite: true });
+      if (mode == "replaced") {
+        await IOUtils.copy(saved, source.path, { noOverwrite: true });
+        Assert.equal(await hashMigrationFile(source.path), source.sha256);
+      }
+    }
+
+    journal = await MigrationJournal.open(path, plan.profilePath);
+    Assert.deepEqual(
+      journal.state,
+      committed,
+      mode + ": reopen retains progress"
+    );
+    await Assert.rejects(
+      journal.beginImport("folder-source"),
+      error =>
+        mode == "missing"
+          ? AppConstants.platform == "win"
+            ? error.result === Cr.NS_ERROR_FILE_NOT_FOUND
+            : error.name === "NotFoundError"
+          : error.name === "Error" &&
+            error.message ===
+              (mode == "replaced"
+                ? "Migration source physical identity changed"
+                : "Migration source changed since backup"),
+      mode + ": committed progress cannot bypass source verification"
+    );
+    Assert.deepEqual(
+      journal.state,
+      committed,
+      mode + ": failure retains mapping"
+    );
+    Assert.deepEqual(
+      await IOUtils.read(path),
+      persisted,
+      mode + ": no journal write"
+    );
+    Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), backup);
+    journal.close();
+
+    if (mode == "changed") {
+      await IOUtils.write(source.path, original);
+    } else {
+      if (mode == "replaced") {
+        // This is the test replacement; the original still exists at saved.
+        await IOUtils.remove(source.path);
+      }
+      await IOUtils.move(saved, source.path, { noOverwrite: true });
+    }
+    journal = await MigrationJournal.open(path, plan.profilePath);
+    Assert.equal(await journal.beginImport("folder-source"), token);
+    Assert.deepEqual(journal.state, committed, mode + ": retry is read-only");
+    Assert.deepEqual(await IOUtils.read(path), persisted);
+    Assert.deepEqual(await IOUtils.read(source.path), original);
+    Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), backup);
+    journal.close();
+  }
+});

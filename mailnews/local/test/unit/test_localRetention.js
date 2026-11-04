@@ -533,13 +533,19 @@ async function checkRetentionCleanupFailure(store, custodyFault) {
       String(folder.id)
     );
     const blocked = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-    blocked.initWithPath(
-      custodyFault
-        ? PathUtils.join(pending, "occupied")
-        : store == "maildir"
-          ? PathUtils.join(folder.filePath.path, "cur", originals[0].token)
-          : folder.filePath.path
-    );
+    let blockedPath;
+    if (custodyFault) {
+      blockedPath = PathUtils.join(pending, "occupied");
+    } else if (store == "maildir") {
+      blockedPath = PathUtils.join(
+        folder.filePath.path,
+        "cur",
+        originals[0].token
+      );
+    } else {
+      blockedPath = folder.filePath.path;
+    }
+    blocked.initWithPath(blockedPath);
     const heldName = blocked.leafName + ".retention-held";
     const held = blocked.clone();
     held.leafName = heldName;
@@ -769,13 +775,16 @@ async function checkRetentionProcessRestart(store) {
     });
     let output = "";
     try {
-      for (let chunk; (chunk = await child.stdout.readString()); )
+      for (let chunk; (chunk = await child.stdout.readString()); ) {
         output += chunk;
+      }
       const { exitCode } = await child.wait();
       Assert.equal(exitCode, 0, `${store} ${stage}: ${JSON.stringify(output)}`);
       Assert.ok(output.includes(`LOCAL-RETENTION-RESTART ${stage} PASS`));
     } finally {
-      if (child.exitCode === null) await child.kill();
+      if (child.exitCode === null) {
+        await child.kill();
+      }
     }
   }
 }

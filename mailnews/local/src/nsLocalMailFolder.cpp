@@ -2633,7 +2633,7 @@ nsresult nsMsgLocalMailFolder::WriteStartOfNewMessage() {
       // nsMsgMessageFlags::Offline
       PR_snprintf(statusStrBuf, sizeof(statusStrBuf),
                   X_MOZILLA_STATUS_FORMAT MSG_LINEBREAK,
-                  dbFlags & ~(nsMsgMessageFlags::RuntimeOnly)&0x0000FFFF);
+                  dbFlags & ~(nsMsgMessageFlags::RuntimeOnly) & 0x0000FFFF);
     } else {
       strcpy(statusStrBuf, "X-Mozilla-Status: 0001" MSG_LINEBREAK);
     }

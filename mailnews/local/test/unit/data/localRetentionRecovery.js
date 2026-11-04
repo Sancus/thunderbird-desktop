@@ -20,7 +20,9 @@ function readRetentionBody(folder, token) {
   input.init(folder.msgStore.getMsgInputStream(folder, token, 0));
   try {
     let raw = "";
-    while (input.available()) raw += input.read(input.available());
+    while (input.available()) {
+      raw += input.read(input.available());
+    }
     return raw;
   } finally {
     input.close();
@@ -76,10 +78,7 @@ async function checkRestart() {
   );
   harnessPrefs.initWithPath(retentionRestartInput.prefsPath);
   Services.prefs.readUserPrefsFromFile(harnessPrefs);
-  Assert.ok(
-    Components.utils.isInAutomation,
-    "Ordinary harness automation is active"
-  );
+  Assert.ok(Cu.isInAutomation, "Ordinary harness automation is active");
 
   const prefsFile = profile.clone();
   prefsFile.append("prefs.js");

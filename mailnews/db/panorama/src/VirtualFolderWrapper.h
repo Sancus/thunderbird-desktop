@@ -35,7 +35,8 @@ class VirtualFolderWrapper : public nsIVirtualFolderWrapper {
   static mozIStorageConnection* CurrentConnection();
   static MessageDatabase* CurrentMessages();
   static nsresult CurrentSource(nsACString& source);
-  static nsresult SavedFolderIds(nsTArray<uint64_t>& ids);
+  static nsresult SavedFolderIds(nsTArray<uint64_t>& ids,
+                                 nsTArray<uint64_t>& current);
   nsresult CheckCurrent(bool refresh = true);
 
  protected:

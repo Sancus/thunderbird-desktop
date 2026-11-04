@@ -99,6 +99,7 @@ class SavedSearchBindings final : public MessageListener,
   uint64_t mSerial = 0;
   nsresult mError = NS_OK;
   bool mDirty = true;
+  bool mRetireMissingSources = false;
   bool mRefreshing = false;
   bool mQueued = false;
   bool mStopped = false;
@@ -286,26 +287,10 @@ nsresult SavedSearchBindings::Apply(const State& state) {
   if (!state.folder) return NS_OK;
   nsCString uri;
   MOZ_TRY(state.folder->GetURI(uri));
-  nsTArray<nsMsgKey> previous;
-  nsCOMPtr<nsIMsgEnumerator> cached;
-  MOZ_TRY(state.database->GetCachedHits(uri, getter_AddRefs(cached)));
-  if (cached) {
-    bool more;
-    while (true) {
-      MOZ_TRY(cached->HasMoreElements(&more));
-      if (!more) break;
-      nsCOMPtr<nsIMsgDBHdr> header;
-      MOZ_TRY(cached->GetNext(getter_AddRefs(header)));
-      NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
-      nsMsgKey key;
-      MOZ_TRY(header->GetMessageKey(&key));
-      previous.AppendElement(key);
-    }
-  }
-  if (previous != state.hits) {
-    nsTArray<nsMsgKey> stale;
-    MOZ_TRY(state.database->RefreshCache(uri, state.hits, stale));
-  }
+  // The fully checked current membership replaces raw cached keys. Resolving
+  // old cached headers first would fail on exactly the keys just deleted.
+  nsTArray<nsMsgKey> stale;
+  MOZ_TRY(state.database->RefreshCache(uri, state.hits, stale));
   int32_t total, unread, fresh;
   MOZ_TRY(state.info->GetNumMessages(&total));
   MOZ_TRY(state.info->GetNumUnreadMessages(&unread));
@@ -339,14 +324,38 @@ nsresult SavedSearchBindings::Refresh(uint64_t focus) {
   bool transaction;
   MOZ_TRY(mConnection->GetTransactionInProgress(&transaction));
   NS_ENSURE_FALSE(transaction, NS_ERROR_IN_PROGRESS);
-  nsTArray<uint64_t> ids;
-  MOZ_TRY(VirtualFolderWrapper::SavedFolderIds(ids));
+  nsTArray<uint64_t> ids, current;
+  MOZ_TRY(VirtualFolderWrapper::SavedFolderIds(ids, current));
+  bool retire = mRetireMissingSources;
+  bool retireFailed = false;
+  mRetireMissingSources = false;
   mDirty = false;
   nsCOMArray<nsIMsgDatabase> sources;
   for (uint64_t id : ids) {
     State state;
     uint64_t serial = mSerial;
-    nsresult rv = Read(id, state);
+    nsresult rv = NS_OK;
+    if (retire) {
+      // A real folder-loss notification retires missing sources only after a
+      // complete checked current hierarchy read. Moves retain their live IDs.
+      RefPtr<VirtualFolderWrapper> wrapper = new VirtualFolderWrapper(id);
+      nsTArray<uint64_t> before;
+      rv = wrapper->FolderDB().GetVirtualFolderFolders(id, before);
+      if (NS_SUCCEEDED(rv)) {
+        nsTArray<uint64_t> remaining;
+        for (uint64_t source : before) {
+          if (current.Contains(source)) remaining.AppendElement(source);
+        }
+        if (remaining != before) {
+          rv = wrapper->FolderDB().SetVirtualFolderFolders(id, remaining);
+          if (NS_SUCCEEDED(rv) && !mDefinitions.Contains(id)) {
+            mDefinitions.AppendElement(id);
+          }
+        }
+      }
+      if (NS_FAILED(rv)) retireFailed = true;
+    }
+    if (NS_SUCCEEDED(rv)) rv = Read(id, state);
     if (NS_SUCCEEDED(rv) && serial != mSerial) rv = NS_ERROR_IN_PROGRESS;
     if (NS_SUCCEEDED(rv)) rv = Apply(state);
     mErrors.InsertOrUpdate(id, rv);
@@ -362,6 +371,10 @@ nsresult SavedSearchBindings::Refresh(uint64_t focus) {
       mSources[i]->RemoveListener(this);
       mSources.RemoveObjectAt(i);
     }
+  }
+  if (retireFailed) {
+    mRetireMissingSources = true;
+    mDirty = true;
   }
   return focus ? mErrors.Get(focus) : NS_OK;
 }
@@ -425,16 +438,22 @@ NS_IMETHODIMP SavedSearchBindings::OnFolderAdded(nsIMsgFolder*, nsIMsgFolder*) {
 }
 NS_IMETHODIMP SavedSearchBindings::OnFolderRemoved(nsIMsgFolder*,
                                                    nsIMsgFolder*) {
+  mRetireMissingSources = true;
   Changed();
   return NS_OK;
 }
-NS_IMETHODIMP SavedSearchBindings::OnMessageAdded(nsIMsgFolder*, nsIMsgDBHdr*) {
-  // The enrolled physical DB already reconciled this committed publication.
-  return NS_OK;
+NS_IMETHODIMP SavedSearchBindings::OnMessageAdded(nsIMsgFolder* folder,
+                                                  nsIMsgDBHdr*) {
+  NS_ENSURE_TRUE(Current(), NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDatabase> db;
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+  // An enrolled physical DB already reconciled the publication. If a closed
+  // announcer was replaced, enroll and reconcile before returning instead.
+  return mSources.IndexOf(db) < 0 ? Sync() : Refresh();
 }
-NS_IMETHODIMP SavedSearchBindings::OnMessageRemoved(nsIMsgFolder*,
-                                                    nsIMsgDBHdr*) {
-  return NS_OK;
+NS_IMETHODIMP SavedSearchBindings::OnMessageRemoved(nsIMsgFolder* folder,
+                                                    nsIMsgDBHdr* header) {
+  return OnMessageAdded(folder, header);
 }
 NS_IMETHODIMP SavedSearchBindings::OnFolderPropertyChanged(nsIMsgFolder*,
                                                            const nsACString&,
@@ -483,7 +502,8 @@ VirtualFolderWrapper::VirtualFolderWrapper(uint64_t id)
   mSourceResult = CurrentSource(mSource);
 }
 
-nsresult VirtualFolderWrapper::SavedFolderIds(nsTArray<uint64_t>& ids) {
+nsresult VirtualFolderWrapper::SavedFolderIds(nsTArray<uint64_t>& ids,
+                                              nsTArray<uint64_t>& current) {
   NS_ENSURE_TRUE(DatabaseCore::sInstance && DatabaseCore::sConnection,
                  NS_ERROR_NOT_AVAILABLE);
   auto& db = *DatabaseCore::sInstance->mFolderDatabase;
@@ -492,6 +512,7 @@ nsresult VirtualFolderWrapper::SavedFolderIds(nsTArray<uint64_t>& ids) {
     nsTArray<uint64_t> descendants = MOZ_TRY(db.GetFolderDescendants(root));
     descendants.AppendElement(root);
     for (uint64_t id : descendants) {
+      current.AppendElement(id);
       uint32_t flags = MOZ_TRY(db.GetFolderFlags(id));
       if (flags & nsMsgFolderFlags::Virtual) ids.AppendElement(id);
     }

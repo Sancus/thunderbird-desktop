@@ -1665,8 +1665,8 @@ DBViewWrapper.prototype = {
    *  folders, we just update ourselves.  (Currently, cross-folder views are
    *  not clever enough to purge the mooted messages, so we need to do this to
    *  help them out.)
-   * We do not update virtual folder definitions as a result of deletion; we are
-   *  a display abstraction.  That (hopefully) happens elsewhere.
+   * Native saved searches persist a known physical source loss before their
+   * next cache read. Legacy definition maintenance remains outside the view.
    */
   _folderDeleted(aFolder) {
     // XXX When we empty the trash, we're actually sending a folder deleted
@@ -1695,6 +1695,15 @@ DBViewWrapper.prototype = {
       }
     }
 
+    if (
+      this.isVirtual &&
+      Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ) {
+      // Retire this known physical loss before rebuilding from the global
+      // cache. Its old headers may already be unavailable at this callback.
+      const saved = VirtualFolderHelper.wrapVirtualFolder(this.displayedFolder);
+      saved.searchFolders = this._underlyingFolders;
+    }
     if (this._underlyingFolders.length == 0) {
       this.close();
       return;

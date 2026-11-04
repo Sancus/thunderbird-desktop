@@ -41,6 +41,9 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   NS_DECL_NSIMSGNEWSFOLDER
 
   // nsIMsgFolder methods:
+  NS_IMETHOD GetMsgDatabase(nsIMsgDatabase** database) override;
+  NS_IMETHOD SetMsgDatabase(nsIMsgDatabase* database) override;
+
   NS_IMETHOD GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) override;
 
   NS_IMETHOD UpdateFolder(nsIMsgWindow* aWindow) override;
@@ -103,6 +106,8 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   nsresult GetDatabase() override;
 
 #ifdef MOZ_PANORAMA
+  nsresult GetNativeDatabase();
+  nsresult InitializeNativeDatabase(nsIMsgDatabase* database);
   void DetachNativeReadSet();
   nsresult ApplyNativeReadRange(int32_t first, int32_t last);
   nsresult SetNativeReadSetFromStr(const nsACString& ranges, bool passive);
@@ -130,6 +135,10 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
 
   RefPtr<nsMsgKeySet> mReadSet;
 #ifdef MOZ_PANORAMA
+  // Distinguish nested replacement, including replacement with the same facade.
+  uint64_t mNativeDatabaseGeneration{ 0 };
+  bool mNativeDatabaseInitializing{ false };
+  bool mNativeDatabaseReadingSummary{ false };
   // Binding ownership outlives the optional cached mDatabase reference.
   nsCOMPtr<nsINewsDatabase> mReadSetDatabase;
   // Only a passive file load may restore a known lossy zero companion.

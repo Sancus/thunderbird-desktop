@@ -10,3 +10,7 @@ prefs = [
 tags = ["panorama", "mbox"]
 
 ["test_newsReadChanged.js"]
+
+["test_panoramaDeliveryNewsDatabaseInit.js"]
+head = "head_server_setup.js ../../../db/panorama/test/xpcshell/head_delivery.js"
+environment = ["PANORAMA_DELIVERY_EXPECT=panorama:mbox"]

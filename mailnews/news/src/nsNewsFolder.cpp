@@ -8,6 +8,7 @@
 
 #include "nsIDBFolderInfo.h"
 #include "prlog.h"
+#include "prtime.h"
 
 #include "msgCore.h"  // precompiled header...
 #include "nsIMsgMailNewsUrl.h"
@@ -279,6 +280,11 @@ nsMsgNewsFolder::GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) {
 // Makes sure the database is open and exists.  If the database is valid then
 // returns NS_OK.  Otherwise returns a failure error value.
 nsresult nsMsgNewsFolder::GetDatabase() {
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return GetNativeDatabase();
+  }
+#endif
   nsresult rv;
   if (!mDatabase) {
     nsCOMPtr<nsIMsgDBService> msgDBService =
@@ -631,10 +637,68 @@ nsresult nsMsgNewsFolder::AbbreviatePrettyName(nsAString& prettyName,
 }
 
 NS_IMETHODIMP
+nsMsgNewsFolder::GetMsgDatabase(nsIMsgDatabase** database)
+{
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_ARG_POINTER(database);
+    *database = nullptr;
+    // Only the summary reader may reenter the in-progress initialization.
+    NS_ENSURE_TRUE(!mNativeDatabaseInitializing, NS_ERROR_IN_PROGRESS);
+    MOZ_TRY(GetNativeDatabase());
+    MOZ_TRY(mDatabase->SetLastUseTime(PR_Now()));
+    NS_ADDREF(*database = mDatabase);
+    return NS_OK;
+  }
+#endif
+  return nsMsgDBFolder::GetMsgDatabase(database);
+}
+
+NS_IMETHODIMP
+nsMsgNewsFolder::SetMsgDatabase(nsIMsgDatabase* database)
+{
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    if (database) {
+      return InitializeNativeDatabase(database);
+    }
+    ++mNativeDatabaseGeneration;
+    mNativeDatabaseInitializing = false;
+    mNativeDatabaseReadingSummary = false;
+    nsCOMPtr<nsIMsgDatabase> previous = mDatabase.forget();
+    if (previous) {
+      MOZ_TRY(previous->Commit(nsMsgDBCommitType::kLargeCommit));
+      MOZ_TRY(previous->RemoveListener(this));
+      MOZ_TRY(previous->ClearCachedHdrs());
+      MOZ_TRY(previous->GetNewList(m_newMsgs));
+    }
+    return NS_OK;
+  }
+#endif
+  return nsMsgDBFolder::SetMsgDatabase(database);
+}
+
+NS_IMETHODIMP
 nsMsgNewsFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
                                       nsIMsgDatabase** db) {
   NS_ENSURE_ARG_POINTER(folderInfo);
   NS_ENSURE_ARG_POINTER(db);
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    *folderInfo = nullptr;
+    *db = nullptr;
+    NS_ENSURE_TRUE(!mNativeDatabaseInitializing ||
+                     mNativeDatabaseReadingSummary,
+                   NS_ERROR_IN_PROGRESS);
+    MOZ_TRY(GetNativeDatabase());
+    nsCOMPtr<nsIMsgDatabase> database = mDatabase;
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(info)));
+    info.forget(folderInfo);
+    database.forget(db);
+    return NS_OK;
+  }
+#endif
   nsresult openErr;
   openErr = GetDatabase();
   if (!mDatabase) {
@@ -649,6 +713,121 @@ nsMsgNewsFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
 }
 
 #ifdef MOZ_PANORAMA
+nsresult
+nsMsgNewsFolder::GetNativeDatabase()
+{
+  if (mDatabase) {
+    nsresult rv;
+    RefPtr<mozilla::mailnews::PerFolderDatabase> native =
+      do_QueryObject(mDatabase, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(native->FolderId() == mFolderId, NS_ERROR_NOT_AVAILABLE);
+    nsMsgKeySet* current = nullptr;
+    MOZ_TRY(native->GetReadSet(&current));
+    if (mReadSet &&
+        mReadSetDatabase.get() == static_cast<nsINewsDatabase*>(native.get()) &&
+        current == mReadSet) {
+      return NS_OK;
+    }
+    NS_ENSURE_TRUE(!mNativeDatabaseInitializing, NS_ERROR_IN_PROGRESS);
+    return InitializeNativeDatabase(mDatabase);
+  }
+  nsresult rv;
+  nsCOMPtr<nsIMsgDBService> service =
+    do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(service->OpenFolderDB(this, false, getter_AddRefs(database)));
+  return InitializeNativeDatabase(database);
+}
+
+nsresult
+nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate)
+{
+  NS_ENSURE_ARG(candidate);
+  nsCOMPtr<nsIMsgDatabase> database = candidate;
+  nsresult rv;
+  RefPtr<mozilla::mailnews::PerFolderDatabase> native =
+    do_QueryObject(database, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(native->FolderId() == mFolderId, NS_ERROR_NOT_AVAILABLE);
+  nsMsgKeySet* previousSet = nullptr;
+  MOZ_TRY(native->GetReadSet(&previousSet));
+  RefPtr<nsMsgKeySet> readSet = mReadSet;
+  if (!readSet) {
+    // A restored group need not have a newsrc line. Read its persisted native
+    // checkpoint before attaching an owner; an empty default must not erase it.
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(database->GetDBFolderInfo(getter_AddRefs(info)));
+    nsCString ranges;
+    MOZ_TRY(info->GetCharProperty("readSet", ranges));
+    readSet = nsMsgKeySet::Create(ranges.get());
+    NS_ENSURE_TRUE(readSet, NS_ERROR_OUT_OF_MEMORY);
+    mReadSet = readSet;
+    mPendingNewsrcReadSet.emplace(std::move(ranges));
+  }
+  nsCOMPtr<nsINewsDatabase> previousBinding = mReadSetDatabase;
+  nsCOMPtr<nsINewsDatabase> news = do_QueryInterface(database, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (mDatabase && mDatabase != database) {
+    MOZ_TRY(mDatabase->RemoveListener(this));
+    MOZ_TRY(mDatabase->ClearCachedHdrs());
+  }
+
+  const uint64_t generation = ++mNativeDatabaseGeneration;
+  mNativeDatabaseInitializing = true;
+  mNativeDatabaseReadingSummary = false;
+  // ReadDBFolderInfo reenters with this exact facade after its read set binds.
+  mDatabase = database;
+  bool listenerAdded = false;
+  bool readSetAttempted = false;
+  auto cleanup = mozilla::MakeScopeExit([&] {
+    // A synchronous callback may have fully replaced this same object.
+    if (mNativeDatabaseGeneration != generation) {
+      return;
+    }
+    if (listenerAdded) {
+      nsresult cleanupRv = database->RemoveListener(this);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanupRv),
+                           "Failed to detach news database listener");
+    }
+    if (readSetAttempted && readSet != previousSet) {
+      native->DetachNewsReadSetIfMatches(readSet);
+    }
+    if (mReadSetDatabase == news && mReadSet == readSet) {
+      mReadSetDatabase = previousBinding;
+    }
+    mDatabase = nullptr;
+    mNativeDatabaseInitializing = false;
+    mNativeDatabaseReadingSummary = false;
+  });
+  if (mAddListener) {
+    MOZ_TRY(database->AddListener(this));
+    listenerAdded = true;
+  }
+  readSetAttempted = true;
+  mReadSetDatabase = news;
+  if (mPendingNewsrcReadSet.isSome()) {
+    MOZ_TRY(
+      native->InitializeNewsReadSetFromNewsrc(readSet, *mPendingNewsrcReadSet));
+    if (mReadSet == readSet && mReadSetDatabase == news) {
+      mPendingNewsrcReadSet.reset();
+    }
+  } else {
+    MOZ_TRY(news->SetReadSet(readSet));
+  }
+  NS_ENSURE_TRUE(mNativeDatabaseGeneration == generation, NS_ERROR_IN_PROGRESS);
+  mNativeDatabaseReadingSummary = true;
+  MOZ_TRY(UpdateSummaryTotals(true));
+  NS_ENSURE_TRUE(mNativeDatabaseGeneration == generation &&
+                   mDatabase == database,
+                 NS_ERROR_IN_PROGRESS);
+  mNativeDatabaseInitializing = false;
+  mNativeDatabaseReadingSummary = false;
+  cleanup.release();
+  return NS_OK;
+}
+
 void nsMsgNewsFolder::DetachNativeReadSet() {
   RefPtr<mozilla::mailnews::PerFolderDatabase> native =
       do_QueryObject(mReadSetDatabase);

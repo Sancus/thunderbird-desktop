@@ -27,12 +27,9 @@ ChromeUtils.defineESModuleGetters(lazy, {
   MailStringUtils: "resource:///modules/MailStringUtils.sys.mjs",
 });
 
-// Match the existing lexical budgets while retaining the import's 64MiB input cap.
+// Match encoded-span/nesting budgets; operation counts follow the input-size cap.
 const MORK_IMPORT_LIMITS = {
   maxTokenBytes: 64 * 1024,
-  maxTokens: 100000,
-  maxAtoms: 100000,
-  maxRows: 100000,
   maxCommentDepth: 16,
   maxBlockDepth: 16,
 };
@@ -40,9 +37,9 @@ const MORK_IMPORT_LIMITS = {
 /**
  * @typedef {object} MorkImportLimits
  * @property {number} [maxTokenBytes=65536] - Encoded bytes per token or comment.
- * @property {number} [maxTokens=100000] - Successful token reads across the input.
- * @property {number} [maxAtoms=100000] - Distinct column and value aliases together.
- * @property {number} [maxRows=100000] - Distinct scoped rows, including metadata.
+ * @property {number} [maxTokens] - Successful token reads; defaults to maxBytes.
+ * @property {number} [maxAtoms] - Distinct aliases together; defaults to maxBytes.
+ * @property {number} [maxRows] - Distinct scoped rows; defaults to maxBytes.
  * @property {number} [maxCommentDepth=16] - Nested block-comment depth.
  * @property {number} [maxBlockDepth=16] - Nested brackets of the same kind.
  */
@@ -539,8 +536,16 @@ export class MorkParser {
     if (!limits || typeof limits != "object" || Array.isArray(limits)) {
       throw new TypeError("Expected Mork limits");
     }
-    const bounds = { ...MORK_IMPORT_LIMITS, ...limits };
-    for (const name of Object.keys(MORK_IMPORT_LIMITS)) {
+    // Each token, alias and row consumes input bytes. Follow the input cap by
+    // default so an ordinary folder is not refused at an arbitrary record count.
+    const defaults = {
+      ...MORK_IMPORT_LIMITS,
+      maxTokens: maxBytes,
+      maxAtoms: maxBytes,
+      maxRows: maxBytes,
+    };
+    const bounds = { ...defaults, ...limits };
+    for (const name of Object.keys(defaults)) {
       if (!Number.isSafeInteger(bounds[name]) || bounds[name] <= 0) {
         throw new RangeError("Invalid " + name);
       }

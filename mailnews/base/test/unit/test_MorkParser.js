@@ -1139,3 +1139,21 @@ add_task(function test_strictRepeatedMembershipBounds() {
     input.length
   );
 });
+
+add_task(function test_strictDefaultCountBudgetsPreserveFolderSize() {
+  const count = 100001;
+  let body = '// <!-- <mdb:mork:z v="1.4"/> -->\n<';
+  for (let id = 1; id <= count; id++) {
+    body += "(" + id.toString(16) + "=value)";
+  }
+  body += ">";
+  for (let id = 1; id <= count; id++) {
+    body += "[" + id.toString(16) + ":r]";
+  }
+  body += "[1:r(a^1)][186a1:r(a^186a1)]";
+  Assert.less(body.length, 4 * 1024 * 1024, "An ordinary folder-sized document");
+  const snapshot = new MorkParser().parseForImport(body, body.length);
+  Assert.equal(snapshot.rows.size, 100001, "Default counts retain every row");
+  Assert.equal(snapshot.rows.get("1:r").cells.get("a"), "value");
+  Assert.equal(snapshot.rows.get("100001:r").cells.get("a"), "value");
+});

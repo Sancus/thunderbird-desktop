@@ -542,7 +542,11 @@ add_task(async function test_newsrcWriteFailureRetainsPreviousFileAndRetry() {
     } finally {
       MockRegistrar.unregister(cid);
     }
-    Assert.ok(writes > 0, "The actual safe writer reached its write operation");
+    Assert.greater(
+      writes,
+      0,
+      "The actual safe writer reached its write operation"
+    );
     Assert.equal(
       finishes,
       phase == "finish" ? 1 : 0,

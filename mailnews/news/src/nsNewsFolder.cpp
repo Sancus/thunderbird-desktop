@@ -999,10 +999,10 @@ nsresult nsMsgNewsFolder::HandleNewsrcLine(const char* line,
   nsresult rv;
 
   /* guard against blank line lossage */
-  if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') return 0;
+  if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') return NS_OK;
 
   if ((line[0] == 'o' || line[0] == 'O') && !PL_strncasecmp(line, "options", 7))
-    return 0;
+    return NS_OK;
 
   const char* s = nullptr;
   const char* setStr = nullptr;
@@ -1012,13 +1012,13 @@ nsresult nsMsgNewsFolder::HandleNewsrcLine(const char* line,
     if ((*s == ':') || (*s == '!')) break;
 
   if (*s == 0) {
-    return 0;
+    return NS_OK;
   }
 
   bool subscribed = (*s == ':');
   setStr = s + 1;
 
-  if (*line == '\0') return 0;
+  if (*line == '\0') return NS_OK;
 
   // previous versions of Communicator polluted the
   // newsrc files with articles
@@ -1062,7 +1062,7 @@ nsresult nsMsgNewsFolder::HandleNewsrcLine(const char* line,
     NS_ENSURE_SUCCESS(rv, rv);
   }
 
-  return 0;
+  return NS_OK;
 }
 
 NS_IMETHODIMP nsMsgNewsFolder::GetGroupUsername(nsACString& aGroupUsername) {
@@ -1214,7 +1214,8 @@ nsresult nsMsgNewsFolder::SetNativeReadSetFromStr(const nsACString& ranges,
                                                   bool passive) {
   // Reject overflow before the legacy signed parser changes range meaning.
   mozilla::CheckedInt<int32_t> article = 0;
-  for (char c : ranges) {
+  for (uint32_t i = 0; i < ranges.Length(); ++i) {
+    const char c = ranges.CharAt(i);
     if (c >= '0' && c <= '9') {
       article = article * 10 + (c - '0');
       NS_ENSURE_TRUE(article.isValid(), NS_ERROR_ILLEGAL_VALUE);

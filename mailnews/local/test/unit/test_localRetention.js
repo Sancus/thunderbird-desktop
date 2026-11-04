@@ -4,6 +4,10 @@
 
 "use strict";
 
+const { PromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+
 const RETENTION_STORES = {
   mbox: "@mozilla.org/msgstore/berkeleystore;1",
   maildir: "@mozilla.org/msgstore/maildirstore;1",

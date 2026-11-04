@@ -643,8 +643,7 @@ nsresult nsMsgNewsFolder::AbbreviatePrettyName(nsAString& prettyName,
 }
 
 NS_IMETHODIMP
-nsMsgNewsFolder::GetMsgDatabase(nsIMsgDatabase** database)
-{
+nsMsgNewsFolder::GetMsgDatabase(nsIMsgDatabase** database) {
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     NS_ENSURE_ARG_POINTER(database);
@@ -661,8 +660,7 @@ nsMsgNewsFolder::GetMsgDatabase(nsIMsgDatabase** database)
 }
 
 NS_IMETHODIMP
-nsMsgNewsFolder::SetMsgDatabase(nsIMsgDatabase* database)
-{
+nsMsgNewsFolder::SetMsgDatabase(nsIMsgDatabase* database) {
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     if (database) {
@@ -693,9 +691,9 @@ nsMsgNewsFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     *folderInfo = nullptr;
     *db = nullptr;
-    NS_ENSURE_TRUE(!mNativeDatabaseInitializing ||
-                     mNativeDatabaseReadingSummary,
-                   NS_ERROR_IN_PROGRESS);
+    NS_ENSURE_TRUE(
+        !mNativeDatabaseInitializing || mNativeDatabaseReadingSummary,
+        NS_ERROR_IN_PROGRESS);
     MOZ_TRY(GetNativeDatabase());
     nsCOMPtr<nsIMsgDatabase> database = mDatabase;
     nsCOMPtr<nsIDBFolderInfo> info;
@@ -719,13 +717,11 @@ nsMsgNewsFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
 }
 
 #ifdef MOZ_PANORAMA
-nsresult
-nsMsgNewsFolder::GetNativeDatabase()
-{
+nsresult nsMsgNewsFolder::GetNativeDatabase() {
   if (mDatabase) {
     nsresult rv;
     RefPtr<mozilla::mailnews::PerFolderDatabase> native =
-      do_QueryObject(mDatabase, &rv);
+        do_QueryObject(mDatabase, &rv);
     NS_ENSURE_SUCCESS(rv, rv);
     NS_ENSURE_TRUE(native->FolderId() == mFolderId, NS_ERROR_NOT_AVAILABLE);
     nsMsgKeySet* current = nullptr;
@@ -740,21 +736,19 @@ nsMsgNewsFolder::GetNativeDatabase()
   }
   nsresult rv;
   nsCOMPtr<nsIMsgDBService> service =
-    do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
+      do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
   NS_ENSURE_SUCCESS(rv, rv);
   nsCOMPtr<nsIMsgDatabase> database;
   MOZ_TRY(service->OpenFolderDB(this, false, getter_AddRefs(database)));
   return InitializeNativeDatabase(database);
 }
 
-nsresult
-nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate)
-{
+nsresult nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate) {
   NS_ENSURE_ARG(candidate);
   nsCOMPtr<nsIMsgDatabase> database = candidate;
   nsresult rv;
   RefPtr<mozilla::mailnews::PerFolderDatabase> native =
-    do_QueryObject(database, &rv);
+      do_QueryObject(database, &rv);
   NS_ENSURE_SUCCESS(rv, rv);
   NS_ENSURE_TRUE(native->FolderId() == mFolderId, NS_ERROR_NOT_AVAILABLE);
   nsMsgKeySet* previousSet = nullptr;
@@ -775,6 +769,11 @@ nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate)
   nsCOMPtr<nsINewsDatabase> previousBinding = mReadSetDatabase;
   nsCOMPtr<nsINewsDatabase> news = do_QueryInterface(database, &rv);
   NS_ENSURE_SUCCESS(rv, rv);
+  if (!mNativeDatabaseInitializing && mDatabase == database && mReadSet &&
+      previousSet == mReadSet && mReadSetDatabase == news) {
+    // A checked current binding needs no write or listener replacement.
+    return NS_OK;
+  }
   if (mDatabase && mDatabase != database) {
     MOZ_TRY(mDatabase->RemoveListener(this));
     MOZ_TRY(mDatabase->ClearCachedHdrs());
@@ -814,8 +813,8 @@ nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate)
   readSetAttempted = true;
   mReadSetDatabase = news;
   if (mPendingNewsrcReadSet.isSome()) {
-    MOZ_TRY(
-      native->InitializeNewsReadSetFromNewsrc(readSet, *mPendingNewsrcReadSet));
+    MOZ_TRY(native->InitializeNewsReadSetFromNewsrc(readSet,
+                                                    *mPendingNewsrcReadSet));
     if (mReadSet == readSet && mReadSetDatabase == news) {
       mPendingNewsrcReadSet.reset();
     }
@@ -825,9 +824,9 @@ nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate)
   NS_ENSURE_TRUE(mNativeDatabaseGeneration == generation, NS_ERROR_IN_PROGRESS);
   mNativeDatabaseReadingSummary = true;
   MOZ_TRY(UpdateSummaryTotals(true));
-  NS_ENSURE_TRUE(mNativeDatabaseGeneration == generation &&
-                   mDatabase == database,
-                 NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(
+      mNativeDatabaseGeneration == generation && mDatabase == database,
+      NS_ERROR_IN_PROGRESS);
   mNativeDatabaseInitializing = false;
   mNativeDatabaseReadingSummary = false;
   cleanup.release();

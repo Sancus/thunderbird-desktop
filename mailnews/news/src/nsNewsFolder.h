@@ -136,9 +136,9 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   RefPtr<nsMsgKeySet> mReadSet;
 #ifdef MOZ_PANORAMA
   // Distinguish nested replacement, including replacement with the same facade.
-  uint64_t mNativeDatabaseGeneration{ 0 };
-  bool mNativeDatabaseInitializing{ false };
-  bool mNativeDatabaseReadingSummary{ false };
+  uint64_t mNativeDatabaseGeneration{0};
+  bool mNativeDatabaseInitializing{false};
+  bool mNativeDatabaseReadingSummary{false};
   // Binding ownership outlives the optional cached mDatabase reference.
   nsCOMPtr<nsINewsDatabase> mReadSetDatabase;
   // Only a passive file load may restore a known lossy zero companion.

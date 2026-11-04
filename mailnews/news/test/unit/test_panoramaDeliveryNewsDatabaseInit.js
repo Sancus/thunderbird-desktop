@@ -55,7 +55,10 @@ async function createInitializationFixture() {
   incomingServer = MailServices.accounts.getIncomingServer(key);
   account.incomingServer = incomingServer;
   incomingServer.QueryInterface(Ci.nsINntpIncomingServer);
-  Assert.ok(incomingServer.localPath.exists(), "The real news directory exists");
+  Assert.ok(
+    incomingServer.localPath.exists(),
+    "The real news directory exists"
+  );
   await IOUtils.writeUTF8(incomingServer.newsrcFilePath.path, "");
   const rootFolder = incomingServer.rootFolder;
   incomingServer.valid = true;
@@ -184,8 +187,14 @@ add_task(async function test_retriesRejectedNewsDatabase() {
     for (const attempt of [1, 2]) {
       info(`Reject real initialization attempt ${attempt}`);
       assertAccessError(folder, Cr.NS_ERROR_IN_PROGRESS);
-      Assert.ok(connection.transactionInProgress, "The caller still owns its TX");
-      Assert.ok(!folder.databaseOpen, "No failed attempt publishes a cached DB");
+      Assert.ok(
+        connection.transactionInProgress,
+        "The caller still owns its TX"
+      );
+      Assert.ok(
+        !folder.databaseOpen,
+        "No failed attempt publishes a cached DB"
+      );
     }
   } finally {
     connection.rollbackTransaction();
@@ -201,9 +210,27 @@ add_task(async function test_retriesRejectedNewsDatabase() {
   Assert.equal(counts.foreign, 1, "The foreign listener remains attached");
   Assert.equal(counts.folder, 0, "The failed folder is not a DB listener");
   Assert.ok(!folder.databaseOpen, "Notification does not revive the failed DB");
-  folder.NotifyPropertyFlagChanged(hdr, "Flagged", 0, Ci.nsMsgMessageFlags.Marked);
+  folder.NotifyPropertyFlagChanged(
+    hdr,
+    "Flagged",
+    0,
+    Ci.nsMsgMessageFlags.Marked
+  );
   Assert.equal(counts.folder, 1, "The folder observer sees direct events");
   Assert.equal(folder.msgDatabase, shared, "Rollback permits a genuine retry");
+  const readSetBefore = folder.newsrcLine;
+  connection.beginTransaction();
+  try {
+    folder.msgDatabase = shared;
+    Assert.equal(folder.msgDatabase, shared, "The current binding is retained");
+    Assert.equal(folder.newsrcLine, readSetBefore);
+    Assert.ok(
+      connection.transactionInProgress,
+      "Same-object assignment does not settle or replace the caller transaction"
+    );
+  } finally {
+    connection.rollbackTransaction();
+  }
   counts.notify();
   Assert.equal(counts.foreign, 2);
   Assert.equal(counts.folder, 2, "A successful retry enrolls exactly once");
@@ -280,7 +307,11 @@ add_task(async function test_reentrantReplacementKeepsNewBinding() {
       reached = true;
       folder.msgDatabase = shared;
       folder.setReadSetFromStr("12-14");
-      Assert.equal(folder.msgDatabase, shared, "Nested initialization completed");
+      Assert.equal(
+        folder.msgDatabase,
+        shared,
+        "Nested initialization completed"
+      );
     },
   };
   folder.AddFolderListener(listener);
@@ -299,20 +330,31 @@ add_task(async function test_reentrantReplacementKeepsNewBinding() {
   const counts = observeEnrollment(folder, shared);
   counts.notify();
   Assert.equal(counts.foreign, 1);
-  Assert.equal(counts.folder, 1, "The retained folder is enrolled exactly once");
+  Assert.equal(
+    counts.folder,
+    1,
+    "The retained folder is enrolled exactly once"
+  );
 });
 
 add_task(async function test_summaryValidityPreservesNativeErrorsAndReopen() {
   const fixture = await createInitializationFixture();
   const { core, folder, service } = fixture;
   let shared = fixture.shared;
-  Assert.ok(shared.summaryValid, "Absent native summary validity defaults true");
+  Assert.ok(
+    shared.summaryValid,
+    "Absent native summary validity defaults true"
+  );
   shared.summaryValid = false;
   Assert.equal(folder.msgDatabase, shared);
   folder.msgDatabase = null;
   shared.close(false);
   Assert.equal(service.openFolderDB(folder, false).summaryValid, false);
-  Assert.equal(folder.msgDatabase.summaryValid, false, "Close does not reset it");
+  Assert.equal(
+    folder.msgDatabase.summaryValid,
+    false,
+    "Close does not reset it"
+  );
   shared.summaryValid = true;
   folder.msgDatabase = null;
   shared.close(false);
@@ -338,17 +380,31 @@ add_task(async function test_summaryValidityPreservesNativeErrorsAndReopen() {
   Assert.ok(!folder.databaseOpen);
   shared = folder.msgDatabase;
   Assert.notEqual(shared, old);
-  Assert.equal(folder.newsrcLine, before, "Cold ownership restores its checkpoint");
+  Assert.equal(
+    folder.newsrcLine,
+    before,
+    "Cold ownership restores its checkpoint"
+  );
   const restored = shared.getMsgHdrForMessageID("init-zero@example.invalid");
-  Assert.equal(restored.messageKey, physicalKey, "Cold reopen keeps physical identity");
-  Assert.ok(restored.isRead, "The exact zero companion survives cold ownership");
+  Assert.equal(
+    restored.messageKey,
+    physicalKey,
+    "Cold reopen keeps physical identity"
+  );
+  Assert.ok(
+    restored.isRead,
+    "The exact zero companion survives cold ownership"
+  );
   Assert.ok(shared.summaryValid, "Summary validity survives the cold reopen");
   shared.dBFolderInfo.imapTotalPendingMessages = 3;
   folder.msgDatabase = null;
   withInvalidPendingCount(core, folder, () => {
     assertAccessError(folder, Cr.NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
     Assert.ok(!folder.databaseOpen);
-    Assert.ok(shared.summaryValid, "A failed count read does not reset validity");
+    Assert.ok(
+      shared.summaryValid,
+      "A failed count read does not reset validity"
+    );
   });
   Assert.equal(folder.msgDatabase, shared);
   shared.forceClosed();

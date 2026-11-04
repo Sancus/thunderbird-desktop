@@ -1960,12 +1960,21 @@ add_task(async function test_searchThreadDateErrorPreservesVisibleOrder() {
         setup_view("search", Ci.nsMsgViewFlagsType.kThreadedDisplay);
         gDBView.sort(sortType, Ci.nsMsgViewSortOrder.descending);
         const incomingSet = new SyntheticMessageSet([
-          gMessageGenerator.makeMessage({ inReplyTo: parent }),
+          gMessageGenerator.makeMessage({
+            inReplyTo: parent,
+            age: { days: 0 },
+          }),
         ]);
         await messageInjection.addSetsToFolders([gTestFolder], [incomingSet]);
         const [incoming] = incomingSet.msgHdrList;
         if (zeroDates) {
           incoming.date = 0;
+        } else {
+          Assert.greater(
+            incoming.dateInSeconds,
+            outside.dateInSeconds,
+            "The real incoming fixture is newer than the outside thread"
+          );
         }
         gFakeSelection.select(gDBView.findIndexOfMsgHdr(oldChild, true));
         const before = capture();
@@ -2113,12 +2122,21 @@ add_task(async function test_newHeaderDateErrorPreservesView() {
         const listener = gDBView.QueryInterface(Ci.nsIDBChangeListener);
         db.removeListener(listener);
         const incomingSet = new SyntheticMessageSet([
-          gMessageGenerator.makeMessage({ inReplyTo: parent }),
+          gMessageGenerator.makeMessage({
+            inReplyTo: parent,
+            age: { days: 0 },
+          }),
         ]);
         await messageInjection.addSetsToFolders([gTestFolder], [incomingSet]);
         const [incoming] = incomingSet.msgHdrList;
         if (zeroDates) {
           incoming.date = 0;
+        } else {
+          Assert.greater(
+            incoming.dateInSeconds,
+            outside.dateInSeconds,
+            "The real incoming fixture is newer than the outside thread"
+          );
         }
         gFakeSelection.select(gDBView.findIndexOfMsgHdr(oldChild, true));
         const before = capture();

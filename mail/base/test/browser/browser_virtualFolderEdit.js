@@ -425,7 +425,9 @@ add_task(async function test_scopeEditPreservesPhysicalSelectionAndGrouping() {
 });
 
 add_task(async function test_scopeEditErrorsAreNotSuccessfulReopen() {
-  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) return;
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
   const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIDatabaseCore
   );
@@ -530,10 +532,11 @@ add_task(async function test_scopeEditErrorsAreNotSuccessfulReopen() {
       () => !wrapper.searching && wrapper.dbView?.rowCount == 1
     );
   } finally {
-    if (unavailable)
+    if (unavailable) {
       connection.executeSimpleSQL(
         "ALTER TABLE s371_unavailable_properties RENAME TO folder_properties"
       );
+    }
     about3Pane.displayFolder(first.URI);
     saved.parent.propagateDelete(saved, true);
   }

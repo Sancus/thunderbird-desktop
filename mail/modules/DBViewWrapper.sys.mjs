@@ -754,7 +754,9 @@ DBViewWrapper.prototype = {
     }
 
     doppel._savedSearchSignature = this._savedSearchSignature;
-    if (doppel.isVirtual) doppel._observeSavedSearch();
+    if (doppel.isVirtual) {
+      doppel._observeSavedSearch();
+    }
     return doppel;
   },
 
@@ -936,7 +938,7 @@ DBViewWrapper.prototype = {
         return null;
       }
       if (view.getFlagsAt(index) & MSG_VIEW_FLAG_DUMMY) {
-        return { group: view.getCellText(index, "subjectCol") };
+        return { group: view.cellTextForColumn(index, "subjectCol") };
       }
       const header = view.getMsgHdrAt(index);
       return { folder: header.folder.URI, key: header.messageKey };
@@ -998,19 +1000,26 @@ DBViewWrapper.prototype = {
     this._savedSearchSelection = null;
     const view = this.dbView;
     const find = identity => {
-      if (!identity) return -1;
+      if (!identity) {
+        return -1;
+      }
       for (let index = 0; index < view.rowCount; index++) {
         const dummy = Boolean(view.getFlagsAt(index) & MSG_VIEW_FLAG_DUMMY);
         if ("group" in identity) {
-          if (dummy && view.getCellText(index, "subjectCol") == identity.group)
+          if (
+            dummy &&
+            view.cellTextForColumn(index, "subjectCol") == identity.group
+          ) {
             return index;
+          }
         } else if (!dummy) {
           const header = view.getMsgHdrAt(index);
           if (
             header.folder.URI == identity.folder &&
             header.messageKey == identity.key
-          )
+          ) {
             return index;
+          }
         }
       }
       return -1;
@@ -1022,7 +1031,9 @@ DBViewWrapper.prototype = {
       selection.clearSelection();
       for (const identity of pending.selected) {
         const index = find(identity);
-        if (index >= 0) selection.rangedSelect(index, index, true);
+        if (index >= 0) {
+          selection.rangedSelect(index, index, true);
+        }
       }
       selection.currentIndex = find(pending.current);
     } finally {
@@ -1045,11 +1056,15 @@ DBViewWrapper.prototype = {
       return view;
     }
     const generation = this._savedSearchGeneration;
+    let started = false;
+    const current = () =>
+      view == this.dbView && generation == this._savedSearchGeneration;
     const invoke = (name, args) => {
-      if (view != this.dbView || generation != this._savedSearchGeneration)
+      if (!current()) {
         return;
+      }
       try {
-        return view[name](...args);
+        view[name](...args);
       } catch (error) {
         this._savedSearchError ??= error;
         throw error;
@@ -1060,18 +1075,30 @@ DBViewWrapper.prototype = {
       set searchSession(session) {
         view.searchSession = session;
       },
-      onNewSearch: () => invoke("onNewSearch", []),
-      onSearchHit: (header, folder) => invoke("onSearchHit", [header, folder]),
+      onNewSearch: () => {
+        invoke("onNewSearch", []);
+        started = current();
+      },
+      onSearchHit: (header, folder) => {
+        if (started && !this._savedSearchError) {
+          invoke("onSearchHit", [header, folder]);
+        }
+      },
       onSearchDone: status => {
-        if (view != this.dbView || generation != this._savedSearchGeneration)
+        if (!current()) {
           return;
+        }
         if (!Components.isSuccessCode(status)) {
           this._savedSearchError ??= Components.Exception(
             "Saved search failed",
             status
           );
         }
-        return invoke("onSearchDone", [status]);
+        if (started) {
+          // End only a successfully begun native search. A failed hit cannot
+          // turn its admitted prefix into a successful cache replacement.
+          invoke("onSearchDone", [this._savedSearchError?.result || status]);
+        }
       },
     };
   },

@@ -1008,7 +1008,9 @@ function assertScopedRows(wrapper, headers) {
 }
 
 add_task(async function test_scopedCachePreservesOtherPhysicalSource() {
-  if (!savedSearchCore()) return;
+  if (!savedSearchCore()) {
+    return;
+  }
   const a = await messageInjection.makeEmptyFolder();
   const b = await messageInjection.makeEmptyFolder();
   const outside = await messageInjection.makeEmptyFolder();
@@ -1044,7 +1046,9 @@ add_task(async function test_scopedCachePreservesOtherPhysicalSource() {
 });
 
 add_task(async function test_emptySourceRefreshPreservesOtherHits() {
-  if (!savedSearchCore()) return;
+  if (!savedSearchCore()) {
+    return;
+  }
   const a = await messageInjection.makeEmptyFolder();
   const b = await messageInjection.makeEmptyFolder();
   const first = addScopedMessage(a, "empty-first@scope.invalid");
@@ -1068,7 +1072,9 @@ add_task(async function test_emptySourceRefreshPreservesOtherHits() {
 
 add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
   const core = savedSearchCore();
-  if (!core) return;
+  if (!core) {
+    return;
+  }
   const a = await messageInjection.makeEmptyFolder();
   const b = await messageInjection.makeEmptyFolder();
   addScopedMessage(a, "enumerator-first@scope.invalid");
@@ -1083,11 +1089,12 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
   let calls = 0;
   connection.createFunction("s371_cache_read", 1, {
     onFunctionCall(args) {
-      if (++calls == 2)
+      if (++calls == 2) {
         throw Components.Exception(
           "later saved-cache read",
           Cr.NS_ERROR_FAILURE
         );
+      }
       return args.getInt64(0);
     },
   });
@@ -1131,7 +1138,9 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
 
 add_task(
   async function test_savedSearchNotificationsTrackMatchingPhysicalMembers() {
-    if (!savedSearchCore()) return;
+    if (!savedSearchCore()) {
+      return;
+    }
     const a = await messageInjection.makeEmptyFolder();
     const b = await messageInjection.makeEmptyFolder();
     const outside = await messageInjection.makeEmptyFolder();
@@ -1187,7 +1196,9 @@ add_task(
 );
 
 add_task(async function test_savedSearchRebindDetachesOldScope() {
-  if (!savedSearchCore()) return;
+  if (!savedSearchCore()) {
+    return;
+  }
   const a = await messageInjection.makeEmptyFolder();
   const b = await messageInjection.makeEmptyFolder();
   const first = addScopedMessage(a, "rebind@scope.invalid");
@@ -1218,7 +1229,9 @@ add_task(async function test_savedSearchRebindDetachesOldScope() {
 });
 
 add_task(async function test_savedSearchBindingSurvivesWrapperReopen() {
-  if (!savedSearchCore()) return;
+  if (!savedSearchCore()) {
+    return;
+  }
   const a = await messageInjection.makeEmptyFolder();
   const saved = messageInjection.makeVirtualFolder([a], {
     subject: "scope-match",
@@ -1255,7 +1268,9 @@ add_task(async function test_savedSearchBindingSurvivesWrapperReopen() {
 });
 
 add_task(async function test_savedSearchDetachRejectsLateNotification() {
-  if (!savedSearchCore()) return;
+  if (!savedSearchCore()) {
+    return;
+  }
   const a = await messageInjection.makeEmptyFolder();
   const saved = messageInjection.makeVirtualFolder([a], {
     subject: "scope-match",

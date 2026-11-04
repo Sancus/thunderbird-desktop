@@ -219,8 +219,14 @@ nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
   nsCOMPtr<nsINntpIncomingServer> nntpServer;
   MOZ_TRY(GetNntpServer(getter_AddRefs(nntpServer)));
   MOZ_TRY(nntpServer->AddNewsgroup(name));
-  if (!mSubFolders.Contains(folder)) {
-    mSubFolders.AppendObject(folder);
+  if (passive && mSubFolders.Contains(folder)) {
+    // Native restoration populated these retained children before newsrc was
+    // read. Replay its subscription order without replacing their identities.
+    // Prepare the new position before releasing the old array membership.
+    NS_ENSURE_TRUE(mSubFolders.AppendObject(folder), NS_ERROR_OUT_OF_MEMORY);
+    mSubFolders.RemoveObject(folder);
+  } else if (!mSubFolders.Contains(folder)) {
+    NS_ENSURE_TRUE(mSubFolders.AppendObject(folder), NS_ERROR_OUT_OF_MEMORY);
   }
   folder.forget(child);
   return NS_OK;

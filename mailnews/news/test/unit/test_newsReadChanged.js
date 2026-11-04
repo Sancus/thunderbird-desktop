@@ -35,6 +35,7 @@ const accounts = [];
 const servers = [];
 const folders = [];
 const databases = [];
+const wireCleanups = [];
 
 add_setup(function () {
   const contract = Services.prefs.getCharPref(
@@ -220,10 +221,21 @@ async function fetchReadSetArticles(
   const wire = makeServer(handler, daemon);
   wire.start();
   const { server, account } = createReadSetAccount("localhost", wire.port);
-  registerCleanupFunction(async () => {
-    server.closeCachedConnections();
-    await wire.stop();
-  });
+  let stopping;
+  /**
+   * Stop this fixture's network operations once, before account retirement.
+   *
+   * @returns {Promise<void>} Completion of the actual fake-server shutdown.
+   */
+  const stopWire = () => {
+    stopping ??= (async () => {
+      server.closeCachedConnections();
+      await wire.stop();
+    })();
+    return stopping;
+  };
+  wireCleanups.push(stopWire);
+  registerCleanupFunction(stopWire);
   const root = server.rootFolder.QueryInterface(Ci.nsIMsgNewsFolder);
   const selected = names.map((name, index) =>
     root
@@ -481,9 +493,18 @@ add_task(function test_failedReadSetReplacementRetainsPreviousSet() {
   const heldHeader = heldDB.getMsgHdrForMessageID(
     "held-binding@example.invalid"
   );
+  server.writeNewsrcFile();
+  Assert.ok(
+    !server.newsrcHasChanged,
+    "Persist live groups before retiring one"
+  );
   held.msgDatabase = null;
   held.Shutdown(false);
   heldHeader.markRead(false);
+  Assert.ok(
+    !server.newsrcHasChanged,
+    "A retired folder does not receive read events"
+  );
   Assert.ok(
     !heldHeader.isRead,
     "A retained live header is safe after its set owner shuts down with an empty DB cache"
@@ -756,6 +777,15 @@ add_task(async function test_subscriptionNewsrcPersistsAcrossReopen() {
     "Exact UTF-8 and normal line endings persist"
   );
   const accountKey = account.key;
+  for (const stopWire of wireCleanups) {
+    await stopWire();
+  }
+  for (const owned of accounts) {
+    MailServices.accounts
+      .getAccount(owned.key)
+      .incomingServer.QueryInterface(Ci.nsINntpIncomingServer)
+      .writeNewsrcFile();
+  }
   MailServices.accounts.saveAccountInfo();
   // The two earlier announcer-only fixtures intentionally own explicit listeners.
   // Remove those before the real account manager shuts down their databases.

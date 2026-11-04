@@ -28,6 +28,29 @@ let work, lock, backup, summaryBytes, bodyBytes;
 const inventories = new Map();
 const folders = new Map();
 
+const referenceInputs = new Map();
+const REFERENCE_VARIANTS = [
+  {
+    name: "genuine-ordered-references",
+    file: "deliveryMigrationReferences",
+    sha256: "b7a621f2e71c328d1b22393d9760dbc84e0f6d40145eb4745da9881a3f4064c8",
+    raw: "<ancestor@invalid>\r\n\t<parent@invalid> <nearest@invalid>",
+    references: ["ancestor@invalid", "parent@invalid", "nearest@invalid"],
+  },
+  {
+    name: "genuine-duplicate-references",
+    file: "deliveryMigrationDuplicateReferences",
+    sha256: "cf2b381c64436b231c1261751db590c7811355f3f4843c8ad0e5e4b1b6003962",
+    raw: "<ancestor@invalid> <parent@invalid>\r\n\t<ancestor@invalid> <nearest@invalid>",
+    references: [
+      "ancestor@invalid",
+      "parent@invalid",
+      "ancestor@invalid",
+      "nearest@invalid",
+    ],
+  },
+];
+
 add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
   const profile = do_get_profile();
   const provider = Cc["@mozilla.org/xre/directory-provider;1"]
@@ -82,6 +105,30 @@ add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
         profile
       )
     );
+  }
+  for (const spec of REFERENCE_VARIANTS) {
+    const fixture = do_get_file("data/" + spec.file + ".msf");
+    Assert.equal(
+      await IOUtils.computeHexDigest(fixture.path, "sha256"),
+      spec.sha256
+    );
+    const bytes = await IOUtils.read(fixture.path);
+    const copy = new FileUtils.File(PathUtils.join(work, spec.file + ".msf"));
+    await IOUtils.write(copy.path, bytes, { mode: "create" });
+    const original = await server.rootFolder.addMailFolder(spec.name, {
+      summary: copy,
+      mbox: body,
+    });
+    inventories.set(
+      spec.name,
+      Reader.captureMorkFolderWindowsInventory(
+        new FileUtils.File(original.summaryFilePath),
+        profile,
+        new FileUtils.File(original.mailFilePath),
+        profile
+      )
+    );
+    referenceInputs.set(spec.name, { ...spec, bytes });
   }
   Assert.ok(
     !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite")))
@@ -390,4 +437,174 @@ add_task(async function test_receiptCannotRebindAnEquivalentRootSpelling() {
     summaryBytes
   );
   Assert.deepEqual(await IOUtils.read(input.folder.filePath.path), bodyBytes);
+});
+
+add_task(async function test_genuineReferencesRetainWindowsThreadsAndRetry() {
+  for (const [name, spec] of referenceInputs) {
+    const input = await planned(name);
+    await input.journal.recordBackup(backup);
+    await input.journal.beginImport(name);
+    const receipt = await Adapter.importMorkFolderSnapshot(
+      database,
+      input.folder,
+      input.journal.state.sources[0]
+    );
+    Assert.equal(receipt.version, 2);
+    Assert.equal(receipt.sourceId, name);
+    Assert.equal(receipt.databaseSourceId, database.sourceId);
+    Assert.equal(receipt.sourceSha256, spec.sha256);
+    Assert.equal(receipt.folderId, input.folder.id);
+    Assert.deepEqual(
+      receipt.windowsAdmission,
+      Reader.validateMorkFolderWindowsInventory(input.inventory)
+    );
+    Assert.deepEqual(
+      receipt.keys.map(pair => pair[0]),
+      [1, 3]
+    );
+    const keys = new Map(receipt.keys);
+    Assert.equal(new Set(keys.values()).size, 2);
+    Assert.ok(!database.connectionForTests.transactionInProgress);
+    Assert.deepEqual(
+      Array.from(input.folder.messages, header => header.messageId).sort(),
+      ["162378@invalid", "345692@invalid"]
+    );
+    const threadIds = new Set();
+    for (const [oldKey, id, token, size] of [
+      [1, "162378@invalid", "0", 578],
+      [3, "345692@invalid", "1143", 375],
+    ]) {
+      const key = keys.get(oldKey);
+      Assert.greater(key, 0);
+      Assert.less(key, 0xffffffff);
+      const header = input.folder.msgDatabase.getMsgHdrForKey(key);
+      Assert.equal(
+        header.messageId,
+        id,
+        "Message-ID corroborates the physical-key join"
+      );
+      Assert.equal(header.folder.id, input.folder.id);
+      Assert.equal(header.storeToken, token);
+      Assert.equal(header.messageSize, size);
+      Assert.equal(
+        header.author,
+        oldKey == 1
+          ? '"Cicero Kutch" <cicero.kutch@invalid>'
+          : '"Zo\u00eb Yundt" <zoe.yundt@invalid>'
+      );
+      Assert.equal(
+        header.recipients,
+        oldKey == 1 ? "Ren\u00e9e Alsom <renee.alsom@invalid>" : ""
+      );
+      Assert.equal(
+        header.accountKey,
+        MailServices.accounts.findAccountForServer(input.folder.server).key
+      );
+      const expected = oldKey == 1 ? [] : spec.references;
+      const raw = oldKey == 1 ? "" : spec.raw;
+      Assert.equal(header.numReferences, expected.length);
+      Assert.deepEqual(
+        Array.from({ length: header.numReferences }, (_, ordinal) =>
+          header.getStringReference(ordinal)
+        ),
+        expected
+      );
+      Assert.ok(new Set(header.properties).has("references"));
+      Assert.equal(header.getStringProperty("references"), raw);
+      const references = database.connectionForTests.createStatement(
+        "SELECT ordinal,token FROM message_references WHERE id=:key ORDER BY ordinal"
+      );
+      try {
+        references.params.key = key;
+        const rows = [];
+        while (references.executeStep()) {
+          rows.push([references.row.ordinal, references.row.token]);
+        }
+        Assert.deepEqual(
+          rows,
+          expected.map((value, ordinal) => [ordinal, value])
+        );
+      } finally {
+        references.finalize();
+      }
+      const property = database.connectionForTests.createStatement(
+        "SELECT value,typeof(value) AS kind FROM message_properties WHERE id=:key AND name='references'"
+      );
+      try {
+        property.params.key = key;
+        Assert.ok(
+          property.executeStep(),
+          "Present-empty is a real property row"
+        );
+        Assert.strictEqual(property.row.value, raw);
+        Assert.equal(property.row.kind, "text");
+        Assert.ok(!property.executeStep());
+      } finally {
+        property.finalize();
+      }
+      Assert.equal(header.threadParent, 0);
+      Assert.greater(header.threadId, 0);
+      threadIds.add(header.threadId);
+      Assert.equal(
+        input.folder.msgDatabase
+          .getThreadContainingMsgHdr(header)
+          .getChildHdrAt(0).messageKey,
+        key
+      );
+      Assert.ok(
+        new TextDecoder()
+          .decode(bodyBytes.slice(Number(token), Number(token) + size))
+          .includes("Message-ID: <" + id + ">")
+      );
+    }
+    Assert.equal(
+      threadIds.size,
+      2,
+      "External ancestors preserve two independent roots"
+    );
+    await input.journal.recordImport(name, receipt);
+    input.journal.close();
+    input.journal = await MigrationJournal.open(
+      input.path,
+      lock.directory.path
+    );
+    const state = input.journal.state;
+    const before = await IOUtils.read(input.path);
+    const changes = database.connectionForTests.createStatement(
+      "SELECT total_changes() AS value"
+    );
+    try {
+      Assert.ok(changes.executeStep());
+      const count = changes.row.value;
+      changes.reset();
+      const repeated = await Adapter.importMorkFolderSnapshot(
+        database,
+        input.folder,
+        input.journal.state.sources[0]
+      );
+      Assert.deepEqual(repeated, receipt);
+      await input.journal.recordImport(name, repeated);
+      Assert.ok(changes.executeStep());
+      Assert.equal(changes.row.value, count, "Native retry is read-only");
+    } finally {
+      changes.finalize();
+    }
+    Assert.deepEqual(input.journal.state, state);
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+    Assert.equal(input.folder.getTotalMessages(false), 2);
+    Assert.deepEqual(
+      await IOUtils.read(input.folder.summaryFile.path),
+      spec.bytes
+    );
+    Assert.deepEqual(await IOUtils.read(input.folder.filePath.path), bodyBytes);
+    Assert.deepEqual(
+      await IOUtils.read(do_get_file("data/" + spec.file + ".msf").path),
+      spec.bytes
+    );
+    Assert.deepEqual(
+      await Backup.verifyMigrationBackup(PathUtils.parent(backup.path)),
+      backup
+    );
+    input.journal.close();
+  }
 });

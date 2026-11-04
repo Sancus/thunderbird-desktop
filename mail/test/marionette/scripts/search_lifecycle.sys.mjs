@@ -240,7 +240,7 @@ export async function armQuit(receiptName) {
       );
       state.record.activities = manager.getProcessesByContext(
         "panorama-search",
-        core.sourceId
+        state.record.sourceId
       ).length;
     } catch (error) {
       state.record.error = String(error) + "\n" + error.stack;

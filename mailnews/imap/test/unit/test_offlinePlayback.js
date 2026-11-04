@@ -178,11 +178,12 @@ add_task(async function test_nativeOnlineMoveSettlesBothSources() {
       copies.push(String(args[0]));
     }
     const response = originalCopy.call(this, args, uid);
-    const receipt = /^OK \[COPYUID (\d+) (\d+) (\d+)\]/.exec(response);
+    const receipt = /^OK \[COPYUID (\d+) (\d+) (\d+):(\d+)\]/.exec(response);
     if (uid && receipt) {
       copyUids.set(Number(receipt[2]), {
         epoch: Number(receipt[1]),
         uid: Number(receipt[3]),
+        lastUid: Number(receipt[4]),
       });
     }
     return response;
@@ -285,6 +286,7 @@ add_task(async function test_nativeOnlineMoveSettlesBothSources() {
       Assert.ok(!source.msgDatabase.containsKey(sourceKey));
       const receipt = copyUids.get(sourceUid);
       Assert.ok(receipt, "Each physical source has an actual COPYUID receipt");
+      Assert.equal(receipt.uid, receipt.lastUid, "One COPY returns one UID");
       Assert.equal(mailbox.uidvalidity, receipt.epoch);
       const message = mailbox._messages.find(item => item.uid == receipt.uid);
       Assert.ok(message);

@@ -354,6 +354,7 @@ nsresult PurgeChild(nsIFile* parent, const nsACString& leaf, nsIFile** result) {
 }
 
 nsresult PurgeLocation(nsIMsgFolder* folder, PurgeCustody& custody) {
+  NS_ENSURE_ARG(folder);
   MOZ_ASSERT(NS_IsMainThread());
   // GetFilePath admits the current native wrapper before requesting a service.
   nsCOMPtr<nsIFile> path;
@@ -520,12 +521,17 @@ nsresult PurgeBodyFile(PurgeCustody& custody, size_t index, nsIFile** result) {
 }
 
 // Refuse any published or staged token owner before removing an orphan.
-nsresult CheckPurgeTokenOwner(DatabaseCore* core, PurgeCustody& custody,
+nsresult CheckPurgeTokenOwner(nsIMsgFolder* folder, DatabaseCore* core,
+                              PurgeCustody& custody,
                               const MessageBodyState& expected, bool live) {
   nsTArray<nsMsgKey> keys;
   MOZ_TRY(core->MessageDB().ListStagedMessages(custody.folder, keys));
   NS_ENSURE_TRUE(keys.IsEmpty(), NS_ERROR_IN_PROGRESS);
-  MOZ_TRY(core->MessageDB().ListAllKeys(custody.folder, keys));
+  // Enumerate through the accepted public per-folder facade. The Core
+  // implementation's ListAllKeys helper is private to its checked receivers.
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(database)));
+  MOZ_TRY(database->ListAllKeys(keys));
   for (nsMsgKey key : keys) {
     MessageBodyState current;
     MOZ_TRY(core->MessageDB().GetMessageBodyState(key, current));
@@ -557,7 +563,7 @@ nsresult CleanPurgeMember(nsIMsgFolder* folder, PurgeCustody& custody,
   RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
   NS_ENSURE_STATE(core);
   MOZ_TRY(core->MessageDB().CheckFolderBodyAccess(custody.folder));
-  MOZ_TRY(CheckPurgeTokenOwner(core, custody, member.body, false));
+  MOZ_TRY(CheckPurgeTokenOwner(folder, core, custody, member.body, false));
   if (member.body.storeToken && !member.body.storeToken->IsEmpty()) {
     nsCOMPtr<nsIMsgPluggableStore> store;
     MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
@@ -612,7 +618,7 @@ nsresult RecoverPurge(nsIMsgFolder* folder, PurgeCustody& custody) {
       NS_ENSURE_TRUE(member.phase <= PurgePhase::CommitRequested &&
                          SamePurgeBody(current, member.body),
                      NS_ERROR_NOT_AVAILABLE);
-      MOZ_TRY(CheckPurgeTokenOwner(core, custody, member.body, true));
+      MOZ_TRY(CheckPurgeTokenOwner(folder, core, custody, member.body, true));
     } else {
       NS_ENSURE_TRUE(rv == NS_ERROR_NOT_AVAILABLE, rv);
       NS_ENSURE_TRUE(member.phase >= PurgePhase::CommitRequested,
@@ -667,7 +673,7 @@ nsresult PurgeNativeMessages(
   MOZ_TRY(RecoverNativePurge(folder));
   PurgeCustody custody;
   MOZ_TRY(PurgeLocation(folder, custody));
-  MOZ_TRY(CheckFolderStorageMove(folder));
+  MOZ_TRY(mozilla::mailnews::CheckFolderStorageMove(folder));
   MOZ_TRY(EnterPurge(custody));
   auto leave =
       mozilla::MakeScopeExit([&] { sPurging->RemoveElement(custody.path); });
@@ -696,7 +702,7 @@ nsresult PurgeNativeMessages(
                custody.members[j].body.storeToken != member.body.storeToken),
           NS_ERROR_ILLEGAL_VALUE);
     }
-    MOZ_TRY(CheckPurgeTokenOwner(core, custody, member.body, true));
+    MOZ_TRY(CheckPurgeTokenOwner(folder, core, custody, member.body, true));
     if (custody.store == "maildir" && !token.IsEmpty()) {
       // Preserve the ordinary nonempty-directory refusal before SQL changes.
       NS_ENSURE_TRUE(token.FindCharInSet("/\\") == kNotFound && token != "." &&
@@ -756,7 +762,7 @@ nsresult PurgeNativeMessages(
     if (NS_FAILED(rv)) return fail(rv);
     if (!SamePurgeBody(current, member.body))
       return fail(NS_ERROR_NOT_AVAILABLE);
-    rv = CheckPurgeTokenOwner(core, custody, member.body, true);
+    rv = CheckPurgeTokenOwner(folder, core, custody, member.body, true);
     if (NS_FAILED(rv)) return fail(rv);
     member.phase = PurgePhase::CommitRequested;
     rv = SavePurge(custody);

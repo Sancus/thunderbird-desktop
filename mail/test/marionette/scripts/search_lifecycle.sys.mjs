@@ -136,9 +136,13 @@ export async function finishActivity() {
  * @returns {Promise<object>} Actual pending-call counts and receipt path.
  */
 export async function armQuit(receiptName) {
-  if (quitState || receiptName != PathUtils.filename(receiptName)) {
+  if (quitState || receiptName != "s422-quit-receipt.json") {
     throw new Error("A unique profile lifecycle receipt is required");
   }
+  const { MailGlue } = ChromeUtils.importESModule(
+    "resource:///modules/MailGlue.sys.mjs"
+  );
+  await MailGlue.afterStartUp;
   await closeMailSearch();
   const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
     Ci.nsIDatabaseCore

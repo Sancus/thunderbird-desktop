@@ -26,6 +26,14 @@ support-files = ["messages/**"]
 ["test_ext_messages_bug_1954372.js"]
 
 ["test_ext_messages_encrypted.js"]
+support-files = ["head_ext_messages_encrypted.js"]
+
+["test_ext_messages_encryptedOpenPGP.js"]
+support-files = ["head_ext_messages_encrypted.js"]
+
+["test_ext_messages_encryptedSmime.js"]
+support-files = ["head_ext_messages_encrypted.js"]
+
 
 ["test_ext_messages_get.js"] # PGP test disabled for NNTP
 

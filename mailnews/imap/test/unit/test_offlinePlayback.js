@@ -166,17 +166,26 @@ add_task(async function test_nativeOnlineMoveSettlesBothSources() {
   const expungePref = "mail.imap.expunge_after_delete";
   const hadExpungePref = Services.prefs.prefHasUserValue(expungePref);
   const previousExpunge = Services.prefs.getBoolPref(expungePref, false);
-  const originalCopy = IMAP_RFC3501_handler.prototype.COPY;
+  const originalCopy = IMAP_RFC4315_extension.COPY;
   const originalStore = IMAP_RFC3501_handler.prototype.STORE;
   const originalUid = IMAP_RFC4315_extension.UID;
   const copies = [];
+  const copyUids = new Map();
   const stores = [];
   const expunges = [];
-  IMAP_RFC3501_handler.prototype.COPY = function (args, uid) {
+  IMAP_RFC4315_extension.COPY = function (args, uid) {
     if (uid) {
       copies.push(String(args[0]));
     }
-    return originalCopy.call(this, args, uid);
+    const response = originalCopy.call(this, args, uid);
+    const receipt = /^OK \[COPYUID (\d+) (\d+) (\d+)\]/.exec(response);
+    if (uid && receipt) {
+      copyUids.set(Number(receipt[2]), {
+        epoch: Number(receipt[1]),
+        uid: Number(receipt[3]),
+      });
+    }
+    return response;
   };
   IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
     if (uid && args[1].startsWith("+") && args[2].includes("\\Deleted")) {
@@ -235,7 +244,24 @@ add_task(async function test_nativeOnlineMoveSettlesBothSources() {
     );
     const result = await copied.promise;
     Assert.equal(result.messageKeys.length, 2);
-    const destinationKeys = [...result.messageKeys];
+    const destinationOps = destination.msgDatabase.QueryInterface(
+      Ci.nsIMsgOfflineOpsDatabase
+    );
+    // Bind each returned physical key before playback removes its counterpart.
+    // Copy-listener order is not a server UID association.
+    const staged = result.messageKeys.map(key => {
+      const operation = destinationOps.getOfflineOpForKey(key, false);
+      Assert.ok(operation);
+      Assert.equal(operation.sourceFolderURI, source.URI);
+      const sourceIndex = sourceKeys.indexOf(operation.srcMessageKey);
+      Assert.notEqual(sourceIndex, -1);
+      return {
+        key,
+        sourceKey: operation.srcMessageKey,
+        sourceUid: sourceUids[sourceIndex],
+      };
+    });
+    Assert.equal(new Set(staged.map(entry => entry.sourceKey)).size, 2);
     const operations = source.msgDatabase.QueryInterface(
       Ci.nsIMsgOfflineOpsDatabase
     );
@@ -253,20 +279,22 @@ add_task(async function test_nativeOnlineMoveSettlesBothSources() {
     Assert.deepEqual(operations.listAllOfflineOpIds(), []);
     const mailbox = IMAPPump.daemon.getMailbox("OnlineMove");
     Assert.equal(mailbox._messages.length, 2);
-    for (let i = 0; i < sourceKeys.length; ++i) {
-      Assert.ok(!source.msgDatabase.containsKey(sourceKeys[i]));
-      const target = destination.msgDatabase.getMsgHdrForKey(
-        destinationKeys[i]
-      );
+    Assert.equal(copyUids.size, 2);
+    Assert.deepEqual(destinationOps.listAllOfflineOpIds(), []);
+    for (const { key, sourceKey, sourceUid } of staged) {
+      Assert.ok(!source.msgDatabase.containsKey(sourceKey));
+      const receipt = copyUids.get(sourceUid);
+      Assert.ok(receipt, "Each physical source has an actual COPYUID receipt");
+      Assert.equal(mailbox.uidvalidity, receipt.epoch);
+      const message = mailbox._messages.find(item => item.uid == receipt.uid);
+      Assert.ok(message);
+      const target = destination.msgDatabase.getMsgHdrForKey(key);
       Assert.ok(target);
       Assert.equal(target.folder, destination);
-      Assert.equal(target.messageKey, destinationKeys[i]);
+      Assert.equal(target.messageKey, key);
       Assert.ok(target.properties.includes("uidOnServer"));
-      Assert.equal(
-        target.getUint32Property("uidOnServer"),
-        mailbox._messages[i].uid
-      );
-      Assert.notEqual(target.messageKey, mailbox._messages[i].uid);
+      Assert.equal(target.getUint32Property("uidOnServer"), receipt.uid);
+      Assert.notEqual(target.messageKey, receipt.uid);
       Assert.ok(target.storeToken);
       Assert.ok(target.flags & Ci.nsMsgMessageFlags.Offline);
       const stream = destination.getMsgInputStream(target);
@@ -274,7 +302,7 @@ add_task(async function test_nativeOnlineMoveSettlesBothSources() {
       stream.close();
     }
   } finally {
-    IMAP_RFC3501_handler.prototype.COPY = originalCopy;
+    IMAP_RFC4315_extension.COPY = originalCopy;
     IMAP_RFC3501_handler.prototype.STORE = originalStore;
     IMAP_RFC4315_extension.UID = originalUid;
     if (hadExpungePref) {

@@ -25,3 +25,5 @@ tags = ["panorama-delivery"]
 ["test_deliveryCompatibilityFolderInitIdentity.js"]
 
 ["test_deliveryCompatibilityFolderInitParentConflict.js"]
+
+["test_deliveryWorkflowSavedSearch.js"]

@@ -96,6 +96,16 @@ export class MessageInjection {
     server: null,
   };
   /**
+   * Resolves after opted-in IMAP discovery, flags, maps, and Inbox notification.
+   * Rejects with discovery/Inbox errors or if injection was torn down first.
+   * Constructor setup errors still throw synchronously.
+   * Synchronous setup leaves this promise resolved.
+   *
+   * @type {Promise<void>}
+   */
+  ready = Promise.resolve();
+
+  /**
    * Creates an environment for tests.
    * Usage either with "local" or "imap".
    * An Inbox folder is created. Retrieve it via `getInboxFolder`
@@ -107,6 +117,8 @@ export class MessageInjection {
    * @param {"local"|"imap"} injectionConfig.mode mode One of "local", "imap".
    * @param {boolean} [injectionConfig.offline] Should the folder be marked offline (and
    *     fully downloaded)?  Only relevant for IMAP.
+   * @param {boolean} [injectionConfig.awaitInbox=false] Wait for IMAP discovery.
+   *   Await `ready` in async test setup before using folders or messages.
    * @param {MessageGenerator} [msgGen] The MessageGenerator which generates the new
    *     SyntheticMessages. We do not create our own because we would lose track of
    *     messages created from another MessageGenerator.
@@ -184,7 +196,9 @@ export class MessageInjection {
       );
 
       // set up IMAP fakeserver and incoming server
-      setupIMAPPump("");
+      const inboxReady = setupIMAPPump("", {
+        awaitInbox: Boolean(this._mis.injectionConfig.awaitInbox),
+      });
       this._mis.daemon = IMAPPump.daemon;
       this._mis.server = IMAPPump.server;
       this._mis.incomingServer = IMAPPump.incomingServer;
@@ -210,21 +224,17 @@ export class MessageInjection {
 
       this._mis.rootFolder = this._mis.incomingServer.rootMsgFolder;
 
-      this._mis.inboxFolder = this._mis.rootFolder.getChildNamed("Inbox");
-      // make sure the inbox's offline state is correct. (may be excessive now
-      //  that we set the pref above?)
-      if (this._mis.injectionConfig.offline) {
-        this._mis.inboxFolder.setFlag(Ci.nsMsgFolderFlags.Offline);
+      if (inboxReady) {
+        const incomingServer = this._mis.incomingServer;
+        this.ready = inboxReady.then(inbox => {
+          if (this._mis.incomingServer !== incomingServer) {
+            throw new Error("Message injection ended during Inbox discovery");
+          }
+          this.#initializeIMAPInbox(inbox);
+        });
       } else {
-        this._mis.inboxFolder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+        this.#initializeIMAPInbox(this._mis.rootFolder.getChildNamed("Inbox"));
       }
-      this._mis.notifyListeners("onRealFolderCreated", [this._mis.inboxFolder]);
-
-      this._mis.handleUriToRealFolder = {};
-      this._mis.handleUriToFakeFolder = {};
-      this._mis.realUriToFakeFolder = {};
-      this._mis.realUriToFakeFolder[this._mis.inboxFolder.URI] =
-        this._mis.daemon.getMailbox("INBOX");
     } else {
       throw new Error(
         "Illegal injection config option: " + this._mis.injectionConfig.mode
@@ -236,6 +246,27 @@ export class MessageInjection {
 
     this._mis.trashHandle = null;
     this._mis.trashFolder = null;
+  }
+
+  /**
+   * Sets the real Inbox flags, notifies listeners, and creates URI maps.
+   *
+   * @param {nsIMsgFolder} inbox - The actual Inbox for this injection's server.
+   */
+  #initializeIMAPInbox(inbox) {
+    this._mis.inboxFolder = inbox;
+    if (this._mis.injectionConfig.offline) {
+      inbox.setFlag(Ci.nsMsgFolderFlags.Offline);
+    } else {
+      inbox.clearFlag(Ci.nsMsgFolderFlags.Offline);
+    }
+    this._mis.notifyListeners("onRealFolderCreated", [inbox]);
+
+    this._mis.handleUriToRealFolder = {};
+    this._mis.handleUriToFakeFolder = {};
+    this._mis.realUriToFakeFolder = {};
+    this._mis.realUriToFakeFolder[inbox.URI] =
+      this._mis.daemon.getMailbox("INBOX");
   }
 
   /**

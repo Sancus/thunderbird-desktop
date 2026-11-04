@@ -256,23 +256,29 @@ function onOK(event) {
   }
 
   if (window.arguments[0].editExistingFolder) {
-    // update the search terms
-    gSearchTermSession.searchTerms = saveSearchTerms(
-      gSearchTermSession.searchTerms,
-      gSearchTermSession
-    );
-    // save the settings
-    const virtualFolderWrapper = VirtualFolderHelper.wrapVirtualFolder(
-      window.arguments[0].folder
-    );
-    virtualFolderWrapper.searchTerms = gSearchTermSession.searchTerms;
-    virtualFolderWrapper.searchFolders = gSearchFolderURIs
-      .split("|")
-      .map(uri => MailServices.folderLookup.getFolderForURL(uri));
-    virtualFolderWrapper.onlineSearch = searchOnline;
-    virtualFolderWrapper.cleanUpMessageDatabase();
+    try {
+      // update the search terms
+      gSearchTermSession.searchTerms = saveSearchTerms(
+        gSearchTermSession.searchTerms,
+        gSearchTermSession
+      );
+      // save the settings
+      const virtualFolderWrapper = VirtualFolderHelper.wrapVirtualFolder(
+        window.arguments[0].folder
+      );
+      virtualFolderWrapper.searchTerms = gSearchTermSession.searchTerms;
+      virtualFolderWrapper.searchFolders = gSearchFolderURIs
+        .split("|")
+        .map(uri => MailServices.folderLookup.getFolderForURL(uri));
+      virtualFolderWrapper.onlineSearch = searchOnline;
+      virtualFolderWrapper.cleanUpMessageDatabase();
 
-    MailServices.accounts.saveVirtualFolders();
+      MailServices.accounts.saveVirtualFolders();
+    } catch (error) {
+      // A failed producer write/rebind must not accept and close the dialog.
+      event.preventDefault();
+      throw error;
+    }
 
     let color = document.getElementById("color").value;
     if (color == gDefaultColor || isDefaultColor) {

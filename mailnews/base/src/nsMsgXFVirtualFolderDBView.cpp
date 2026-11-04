@@ -6,6 +6,8 @@
 
 #include "mozilla/ProfilerMarkers.h"
 #include "mozilla/StaticPrefs_mail.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/ScopeExit.h"
 #include "msgCore.h"
 #include "nsIMsgHdr.h"
 #include "nsIMsgThread.h"
@@ -58,6 +60,8 @@ void nsMsgXFVirtualFolderDBView::RemovePendingDBListeners() {
 
 NS_IMETHODIMP
 nsMsgXFVirtualFolderDBView::Close() {
+  ++mNativeSearchSerial;
+  mNativeLiveMatches.Clear();
   RemovePendingDBListeners();
   return nsMsgSearchDBView::Close();
 }
@@ -84,6 +88,8 @@ nsMsgXFVirtualFolderDBView::CopyDBView(
       (nsMsgXFVirtualFolderDBView*)aNewMsgDBView;
 
   newMsgDBView->m_viewFolder = m_viewFolder;
+  newMsgDBView->mNativeMembers.Clear();
+  newMsgDBView->mNativeMembers.AppendObjects(mNativeMembers);
   newMsgDBView->m_searchSession = m_searchSession;
 
   // The base copy already registered the clone with its owned native DBs.
@@ -100,11 +106,12 @@ nsMsgXFVirtualFolderDBView::CopyDBView(
   nsCOMPtr<nsIMsgDBService> msgDBService =
       do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
   NS_ENSURE_SUCCESS(rv, rv);
-  searchSession->CountSearchScopes(&scopeCount);
+  MOZ_TRY(searchSession->CountSearchScopes(&scopeCount));
   for (int32_t i = 0; i < scopeCount; i++) {
     nsMsgSearchScopeValue scopeId;
     nsCOMPtr<nsIMsgFolder> searchFolder;
-    searchSession->GetNthSearchScope(i, &scopeId, getter_AddRefs(searchFolder));
+    MOZ_TRY(searchSession->GetNthSearchScope(i, &scopeId,
+                                             getter_AddRefs(searchFolder)));
     if (searchFolder)
       msgDBService->RegisterPendingListener(searchFolder, newMsgDBView);
   }
@@ -122,6 +129,9 @@ nsMsgXFVirtualFolderDBView::GetViewType(nsMsgViewTypeValue* aViewType) {
 nsresult nsMsgXFVirtualFolderDBView::OnNewHeader(nsIMsgDBHdr* newHdr,
                                                  nsMsgKey aParentKey,
                                                  bool /*ensureListed*/) {
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return UpdateNativeMatch(newHdr);
+  }
   if (newHdr) {
     bool match = false;
     nsCOMPtr<nsIMsgSearchSession> searchSession =
@@ -147,6 +157,11 @@ NS_IMETHODIMP
 nsMsgXFVirtualFolderDBView::OnHdrPropertyChanged(
     nsIMsgDBHdr* aHdrChanged, const nsACString& property, bool aPreChange,
     uint32_t* aStatus, nsIDBChangeListener* aInstigator) {
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_ARG_POINTER(aStatus);
+    *aStatus = 0;
+    return aPreChange ? NS_OK : UpdateNativeMatch(aHdrChanged);
+  }
   // If the junk mail plugin just activated on a message, then
   // we'll allow filters to remove from view.
   // Otherwise, just update the view line.
@@ -189,64 +204,256 @@ nsMsgXFVirtualFolderDBView::OnHdrPropertyChanged(
   return NS_OK;
 }
 
-void nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
+nsresult nsMsgXFVirtualFolderDBView::NativeMemberIndex(nsIMsgDBHdr* header,
+                                                       int32_t& index) {
+  NS_ENSURE_ARG(header);
+  index = mNativeMembers.IndexOf(header);
+  if (index >= 0) return NS_OK;
+  nsMsgKey key;
+  MOZ_TRY(header->GetMessageKey(&key));
+  for (int32_t i = 0; i < mNativeMembers.Count(); ++i) {
+    nsMsgKey other;
+    MOZ_TRY(mNativeMembers[i]->GetMessageKey(&other));
+    if (other != key) continue;
+    // Retired scan hits retain their key but no longer resolve a folder. Only
+    // resolve an owner after finding a still-current native member with it.
+    nsCOMPtr<nsIMsgFolder> folder, physical;
+    MOZ_TRY(header->GetFolder(getter_AddRefs(folder)));
+    MOZ_TRY(mNativeMembers[i]->GetFolder(getter_AddRefs(physical)));
+    if (physical == folder) {
+      index = i;
+      break;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult nsMsgXFVirtualFolderDBView::UpdateNativeMatch(nsIMsgDBHdr* header) {
+  NS_ENSURE_ARG(header);
+  nsCOMPtr<nsIMsgSearchSession> session = do_QueryReferent(m_searchSession);
+  NS_ENSURE_TRUE(session, NS_ERROR_NOT_INITIALIZED);
+  nsCOMPtr<nsIMsgFolder> physical;
+  MOZ_TRY(header->GetFolder(getter_AddRefs(physical)));
+  bool match = false;
+  int32_t count;
+  MOZ_TRY(session->CountSearchScopes(&count));
+  for (int32_t i = 0; i < count; ++i) {
+    nsMsgSearchScopeValue type;
+    nsCOMPtr<nsIMsgFolder> folder;
+    MOZ_TRY(session->GetNthSearchScope(i, &type, getter_AddRefs(folder)));
+    if (folder != physical) continue;
+    nsCOMPtr<nsIMsgDatabase> db;
+    MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+    MOZ_TRY(session->MatchHdr(header, db, &match));
+    break;
+  }
+  int32_t member;
+  MOZ_TRY(NativeMemberIndex(header, member));
+  if (match && member < 0) {
+    const bool duringSearch = m_doingSearch;
+    const uint64_t serial = mNativeSearchSerial;
+    mozilla::AutoRestore<bool> searching(m_doingSearch);
+    m_doingSearch = false;
+    MOZ_TRY(OnSearchHit(header, physical));
+    if (duringSearch && serial == mNativeSearchSerial &&
+        !mNativeLiveMatches.Contains(header)) {
+      mNativeLiveMatches.AppendObject(header);
+    }
+    return NS_OK;
+  }
+  if (!match && member >= 0)
+    return OnHdrDeleted(header, nsMsgKey_None, 0, this);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsMsgXFVirtualFolderDBView::OnHdrFlagsChanged(
+    nsIMsgDBHdr* header, uint32_t oldFlags, uint32_t newFlags,
+    nsIDBChangeListener* instigator) {
+  MOZ_TRY(nsMsgSearchDBView::OnHdrFlagsChanged(header, oldFlags, newFlags,
+                                               instigator));
+  return mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()
+             ? UpdateNativeMatch(header)
+             : NS_OK;
+}
+
+NS_IMETHODIMP nsMsgXFVirtualFolderDBView::OnHdrDeleted(
+    nsIMsgDBHdr* header, nsMsgKey parent, int32_t flags,
+    nsIDBChangeListener* instigator) {
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    int32_t member;
+    MOZ_TRY(NativeMemberIndex(header, member));
+    if (member >= 0) {
+      MOZ_TRY(
+          nsMsgSearchDBView::OnHdrDeleted(header, parent, flags, instigator));
+      mNativeMembers.RemoveObjectAt(member);
+      --m_totalMessagesInView;
+    }
+    nsMsgKey key;
+    MOZ_TRY(header->GetMessageKey(&key));
+    for (int32_t i = mNativeLiveMatches.Count() - 1; i >= 0; --i) {
+      nsMsgKey liveKey;
+      MOZ_TRY(mNativeLiveMatches[i]->GetMessageKey(&liveKey));
+      if (liveKey == key) mNativeLiveMatches.RemoveObjectAt(i);
+    }
+    return NS_OK;
+  }
+  return nsMsgSearchDBView::OnHdrDeleted(header, parent, flags, instigator);
+}
+
+nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
     nsIMsgFolder* folder, nsTArray<nsMsgKey> const& newHits) {
   nsCOMPtr<nsIMsgDatabase> db;
-  nsresult rv = folder->GetMsgDatabase(getter_AddRefs(db));
-  if (NS_SUCCEEDED(rv) && db) {
-    nsCString searchUri;
-    m_viewFolder->GetURI(searchUri);
-    nsTArray<nsMsgKey> badHits;
-    rv = db->RefreshCache(searchUri, newHits, badHits);
-    if (NS_SUCCEEDED(rv)) {
-      nsCOMPtr<nsIMsgDBHdr> badHdr;
-      for (nsMsgKey badKey : badHits) {
-        // ### of course, this isn't quite right, since we should be
-        // using FindHdr, and we shouldn't be expanding the threads.
-        db->GetMsgHdrForKey(badKey, getter_AddRefs(badHdr));
-        // Let nsMsgSearchDBView decide what to do about this header
-        // getting removed.
-        if (badHdr) OnHdrDeleted(badHdr, nsMsgKey_None, 0, this);
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(db)));
+  NS_ENSURE_TRUE(db && m_viewFolder, NS_ERROR_NOT_INITIALIZED);
+  nsCString uri;
+  MOZ_TRY(m_viewFolder->GetURI(uri));
+  nsTArray<nsMsgKey> replacement = newHits.Clone();
+  nsCOMArray<nsIMsgDBHdr> oldSourceHits;
+  bool native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+  if (native) {
+    uint32_t flags;
+    MOZ_TRY(m_viewFolder->GetFlags(&flags));
+    // The ordinary search-notify interface can also be populated directly on
+    // a physical folder, with no saved predicate or search-session scope.
+    if (!(flags & nsMsgFolderFlags::Virtual)) return NS_OK;
+    nsCOMPtr<nsIMsgSearchSession> session = do_QueryReferent(m_searchSession);
+    NS_ENSURE_TRUE(session, NS_ERROR_NOT_INITIALIZED);
+    int32_t count;
+    MOZ_TRY(session->CountSearchScopes(&count));
+    nsCOMArray<nsIMsgFolder> scopes;
+    for (int32_t i = 0; i < count; ++i) {
+      nsMsgSearchScopeValue type;
+      nsCOMPtr<nsIMsgFolder> scope;
+      MOZ_TRY(session->GetNthSearchScope(i, &type, getter_AddRefs(scope)));
+      NS_ENSURE_TRUE(scope, NS_ERROR_NOT_AVAILABLE);
+      scopes.AppendObject(scope);
+    }
+    // A live match can belong to a scope with no scanner hits, or to a row
+    // passed before that scope's first hit. Its lifetime is the whole search,
+    // not the current scanner batch.
+    for (int32_t i = 0; i < mNativeLiveMatches.Count(); ++i) {
+      int32_t member;
+      MOZ_TRY(NativeMemberIndex(mNativeLiveMatches[i], member));
+      if (member < 0) continue;
+      nsCOMPtr<nsIMsgFolder> physical;
+      MOZ_TRY(mNativeMembers[member]->GetFolder(getter_AddRefs(physical)));
+      if (physical != folder) continue;
+      nsMsgKey key;
+      MOZ_TRY(mNativeMembers[member]->GetMessageKey(&key));
+      if (!replacement.Contains(key)) replacement.AppendElement(key);
+    }
+    // Validate all same-source keys, including live admissions, before merging
+    // the other physical partitions from the complete native cache.
+    for (nsMsgKey key : replacement) {
+      nsCOMPtr<nsIMsgDBHdr> header;
+      MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(header)));
+      NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+    }
+    // Native cache keys are global, not partitioned by the receiver DB.
+    // Finish the old enumeration before replacing the complete live union.
+    nsCOMPtr<nsIMsgEnumerator> cached;
+    MOZ_TRY(db->GetCachedHits(uri, getter_AddRefs(cached)));
+    if (cached) {
+      bool more;
+      while (true) {
+        MOZ_TRY(cached->HasMoreElements(&more));
+        if (!more) break;
+        nsCOMPtr<nsIMsgDBHdr> header;
+        MOZ_TRY(cached->GetNext(getter_AddRefs(header)));
+        NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+        nsCOMPtr<nsIMsgFolder> physical;
+        MOZ_TRY(header->GetFolder(getter_AddRefs(physical)));
+        NS_ENSURE_TRUE(physical, NS_ERROR_NOT_AVAILABLE);
+        nsMsgKey key;
+        MOZ_TRY(header->GetMessageKey(&key));
+        if (physical == folder) {
+          oldSourceHits.AppendObject(header);
+        } else if (scopes.IndexOf(physical) >= 0) {
+          nsCOMPtr<nsIMsgDatabase> owner;
+          MOZ_TRY(physical->GetMsgDatabase(getter_AddRefs(owner)));
+          nsCOMPtr<nsIMsgDBHdr> current;
+          MOZ_TRY(owner->GetMsgHdrForKey(key, getter_AddRefs(current)));
+          NS_ENSURE_TRUE(current, NS_ERROR_NOT_AVAILABLE);
+          NS_ENSURE_FALSE(replacement.Contains(key), NS_ERROR_ILLEGAL_VALUE);
+          replacement.AppendElement(key);
+        }
       }
     }
   }
+  replacement.Sort();
+  for (size_t i = 1; i < replacement.Length(); ++i) {
+    NS_ENSURE_TRUE(replacement[i - 1] != replacement[i],
+                   NS_ERROR_ILLEGAL_VALUE);
+  }
+  nsTArray<nsMsgKey> stale;
+  MOZ_TRY(db->RefreshCache(uri, replacement, stale));
+  for (nsMsgKey key : stale) {
+    nsCOMPtr<nsIMsgDBHdr> header;
+    if (native) {
+      for (int32_t i = 0; i < oldSourceHits.Count(); ++i) {
+        nsMsgKey oldKey;
+        MOZ_TRY(oldSourceHits[i]->GetMessageKey(&oldKey));
+        if (key == oldKey) {
+          header = oldSourceHits[i];
+          break;
+        }
+      }
+      if (!header) continue;  // Never resolve another source's key through F.
+    } else {
+      MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(header)));
+    }
+    NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(OnHdrDeleted(header, nsMsgKey_None, 0, this));
+  }
+  return NS_OK;
 }
 
-void nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForPrevSearchedFolders(
-    nsIMsgFolder* curSearchFolder) {
-  // Handle the most recent folder with hits, if any.
+nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForPrevSearchedFolders(
+    nsIMsgFolder* current) {
   if (m_curFolderGettingHits) {
-    uint32_t count = m_hdrHits.Count();
-    nsTArray<nsMsgKey> newHits;
-    newHits.SetLength(count);
-    for (uint32_t i = 0; i < count; i++)
-      m_hdrHits[i]->GetMessageKey(&newHits[i]);
-
-    newHits.Sort();
-    UpdateCacheAndViewForFolder(m_curFolderGettingHits, newHits);
+    nsTArray<nsMsgKey> hits;
+    for (int32_t i = 0; i < m_hdrHits.Count(); ++i) {
+      nsMsgKey key;
+      MOZ_TRY(m_hdrHits[i]->GetMessageKey(&key));
+      if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        int32_t member;
+        MOZ_TRY(NativeMemberIndex(m_hdrHits[i], member));
+        if (member < 0) continue;
+        nsCOMPtr<nsIMsgFolder> physical;
+        MOZ_TRY(mNativeMembers[member]->GetFolder(getter_AddRefs(physical)));
+        // Live notifications share this array with scanner hits. A matching
+        // member of another scope is preserved by its own cache partition.
+        if (physical != m_curFolderGettingHits || hits.Contains(key)) continue;
+      }
+      hits.AppendElement(key);
+    }
+    hits.Sort();
+    MOZ_TRY(UpdateCacheAndViewForFolder(m_curFolderGettingHits, hits));
     m_foldersSearchingOver.RemoveObject(m_curFolderGettingHits);
   }
-
-  while (m_foldersSearchingOver.Count() > 0) {
-    // This new folder has cached hits.
-    if (m_foldersSearchingOver[0] == curSearchFolder) {
+  while (m_foldersSearchingOver.Count()) {
+    if (m_foldersSearchingOver[0] == current) {
       m_curFolderHasCachedHits = true;
       m_foldersSearchingOver.RemoveObjectAt(0);
       break;
-    } else {
-      // This must be a folder that had no hits with the current search.
-      // So all cached hits, if any, need to be removed.
-      nsTArray<nsMsgKey> noHits;
-      UpdateCacheAndViewForFolder(m_foldersSearchingOver[0], noHits);
-      m_foldersSearchingOver.RemoveObjectAt(0);
     }
+    nsTArray<nsMsgKey> empty;
+    MOZ_TRY(UpdateCacheAndViewForFolder(m_foldersSearchingOver[0], empty));
+    m_foldersSearchingOver.RemoveObjectAt(0);
   }
+  return NS_OK;
 }
+
 NS_IMETHODIMP
 nsMsgXFVirtualFolderDBView::OnSearchHit(nsIMsgDBHdr* aMsgHdr,
                                         nsIMsgFolder* aFolder) {
   NS_ENSURE_ARG(aMsgHdr);
   NS_ENSURE_ARG(aFolder);
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    nsCOMPtr<nsIMsgFolder> physical;
+    MOZ_TRY(aMsgHdr->GetFolder(getter_AddRefs(physical)));
+    NS_ENSURE_TRUE(physical == aFolder, NS_ERROR_ILLEGAL_VALUE);
+  }
 
   if (m_curFolderGettingHits != aFolder && m_doingSearch &&
       !m_doingQuickSearch) {
@@ -254,7 +461,7 @@ nsMsgXFVirtualFolderDBView::OnSearchHit(nsIMsgDBHdr* aMsgHdr,
     // Since we've gotten a hit for a new folder, the searches for
     // any previous folders are done, so deal with stale cached hits
     // for those folders now.
-    UpdateCacheAndViewForPrevSearchedFolders(aFolder);
+    MOZ_TRY(UpdateCacheAndViewForPrevSearchedFolders(aFolder));
     m_curFolderGettingHits = aFolder;
     m_hdrHits.Clear();
     m_curFolderStartKeyIndex = m_keys.Length();
@@ -266,74 +473,101 @@ nsMsgXFVirtualFolderDBView::OnSearchHit(nsIMsgDBHdr* aMsgHdr,
     nsCOMPtr<nsIDBFolderInfo> dummyInfo;
     nsresult rv = aFolder->GetDBFolderInfoAndDB(getter_AddRefs(dummyInfo),
                                                 getter_AddRefs(dbToUse));
-    if (NS_SUCCEEDED(rv)) {
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (dbToUse) {
       nsCString searchUri;
-      m_viewFolder->GetURI(searchUri);
-      dbToUse->HdrIsInCache(searchUri, aMsgHdr, &hdrInCache);
+      MOZ_TRY(m_viewFolder->GetURI(searchUri));
+      MOZ_TRY(dbToUse->HdrIsInCache(searchUri, aMsgHdr, &hdrInCache));
     }
   }
 
-  if (!m_doingSearch || !m_curFolderHasCachedHits || !hdrInCache) {
+  int32_t nativeMember = -1;
+  bool native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+  if (native) MOZ_TRY(NativeMemberIndex(aMsgHdr, nativeMember));
+  if ((native && nativeMember < 0) ||
+      (!native &&
+       (!m_doingSearch || !m_curFolderHasCachedHits || !hdrInCache))) {
     if (m_viewFlags & nsMsgViewFlagsType::kGroupBySort)
-      nsMsgGroupView::OnNewHeader(aMsgHdr, nsMsgKey_None, true);
+      MOZ_TRY(nsMsgGroupView::OnNewHeader(aMsgHdr, nsMsgKey_None, true));
     else if (m_sortValid)
-      InsertHdrFromFolder(aMsgHdr, aFolder);
+      MOZ_TRY(InsertHdrFromFolder(aMsgHdr, aFolder));
     else
-      AddHdrFromFolder(aMsgHdr, aFolder);
+      MOZ_TRY(AddHdrFromFolder(aMsgHdr, aFolder));
   }
 
   m_hdrHits.AppendObject(aMsgHdr);
-  m_totalMessagesInView++;
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    int32_t member;
+    MOZ_TRY(NativeMemberIndex(aMsgHdr, member));
+    if (member < 0) {
+      mNativeMembers.AppendObject(aMsgHdr);
+      ++m_totalMessagesInView;
+    }
+  } else {
+    ++m_totalMessagesInView;
+  }
 
   return NS_OK;
 }
 
 NS_IMETHODIMP
 nsMsgXFVirtualFolderDBView::OnSearchDone(nsresult status) {
+  const uint64_t serial = mNativeSearchSerial;
+  auto clearLiveMatches = mozilla::MakeScopeExit([&] {
+    if (serial == mNativeSearchSerial) mNativeLiveMatches.Clear();
+  });
   // This batch began in OnNewSearch.
   if (mJSTree) mJSTree->EndUpdateBatch();
 
   NS_ENSURE_TRUE(m_viewFolder, NS_ERROR_NOT_INITIALIZED);
 
+  m_doingSearch = false;
   // Handle any non verified hits we haven't handled yet.
   if (NS_SUCCEEDED(status) && !m_doingQuickSearch &&
       status != NS_MSG_SEARCH_INTERRUPTED) {
     if (mJSTree) mJSTree->BeginUpdateBatch();
-    UpdateCacheAndViewForPrevSearchedFolders(nullptr);
+    nsresult cacheResult = UpdateCacheAndViewForPrevSearchedFolders(nullptr);
     if (mJSTree) mJSTree->EndUpdateBatch();
+    NS_ENSURE_SUCCESS(cacheResult, cacheResult);
   }
 
   m_doingSearch = false;
+  NS_ENSURE_SUCCESS(status, status);
+  if (status == NS_MSG_SEARCH_INTERRUPTED) return status;
 
-  nsCOMPtr<nsIMsgDatabase> virtDatabase;
-  nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
-  nsresult rv = m_viewFolder->GetDBFolderInfoAndDB(
-      getter_AddRefs(dbFolderInfo), getter_AddRefs(virtDatabase));
-  NS_ENSURE_SUCCESS(rv, rv);
-  // Count up the number of unread and total messages from the view, and set
-  // those in the folder - easier than trying to keep the count up to date in
-  // the face of search hits coming in while the user is reading/deleting
-  // messages.
-  uint32_t numUnread = 0;
-  for (uint32_t i = 0; i < m_flags.Length(); i++) {
-    if (m_flags[i] & nsMsgMessageFlags::Elided) {
-      nsCOMPtr<nsIMsgThread> thread;
-      GetThreadContainingIndex(i, getter_AddRefs(thread));
-      if (thread) {
-        uint32_t unreadInThread;
-        thread->GetNumUnreadChildren(&unreadInThread);
-        numUnread += unreadInThread;
+  if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Native saved-folder summaries belong to the persistent complete binding,
+    // not to a view narrowed by a mail view or quick filter.
+    nsCOMPtr<nsIMsgDatabase> virtDatabase;
+    nsCOMPtr<nsIDBFolderInfo> dbFolderInfo;
+    nsresult rv = m_viewFolder->GetDBFolderInfoAndDB(
+        getter_AddRefs(dbFolderInfo), getter_AddRefs(virtDatabase));
+    NS_ENSURE_SUCCESS(rv, rv);
+    // Count up the number of unread and total messages from the view, and set
+    // those in the folder - easier than trying to keep the count up to date in
+    // the face of search hits coming in while the user is reading/deleting
+    // messages.
+    uint32_t numUnread = 0;
+    for (uint32_t i = 0; i < m_flags.Length(); i++) {
+      if (m_flags[i] & nsMsgMessageFlags::Elided) {
+        nsCOMPtr<nsIMsgThread> thread;
+        GetThreadContainingIndex(i, getter_AddRefs(thread));
+        if (thread) {
+          uint32_t unreadInThread;
+          thread->GetNumUnreadChildren(&unreadInThread);
+          numUnread += unreadInThread;
+        }
+      } else {
+        if (!(m_flags[i] & nsMsgMessageFlags::Read)) numUnread++;
       }
-    } else {
-      if (!(m_flags[i] & nsMsgMessageFlags::Read)) numUnread++;
     }
-  }
 
-  dbFolderInfo->SetNumUnreadMessages(numUnread);
-  dbFolderInfo->SetNumMessages(m_totalMessagesInView);
-  // Force update from db.
-  m_viewFolder->UpdateSummaryTotals(true);
-  virtDatabase->Commit(nsMsgDBCommitType::kLargeCommit);
+    MOZ_TRY(dbFolderInfo->SetNumUnreadMessages(numUnread));
+    MOZ_TRY(dbFolderInfo->SetNumMessages(m_totalMessagesInView));
+    // Force update from db.
+    MOZ_TRY(m_viewFolder->UpdateSummaryTotals(true));
+    MOZ_TRY(virtDatabase->Commit(nsMsgDBCommitType::kLargeCommit));
+  }
   if (!m_sortValid && m_sortType != nsMsgViewSortType::byThread &&
       !(m_viewFlags & nsMsgViewFlagsType::kThreadedDisplay)) {
     // Sort the results.
@@ -343,7 +577,7 @@ nsMsgXFVirtualFolderDBView::OnSearchDone(nsresult status) {
 
   m_foldersSearchingOver.Clear();
   m_curFolderGettingHits = nullptr;
-  return rv;
+  return NS_OK;
 }
 
 NS_IMETHODIMP
@@ -353,6 +587,23 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
   RemovePendingDBListeners();
   m_doingSearch = true;
   m_totalMessagesInView = 0;
+  mNativeMembers.Clear();
+  ++mNativeSearchSerial;
+  mNativeLiveMatches.Clear();
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    // Every search owns a fresh scope cursor and hit batch. In particular, an
+    // empty first scope must not leave the previous last scope/hits active.
+    m_curFolderGettingHits = nullptr;
+    m_curFolderHasCachedHits = false;
+    m_curFolderStartKeyIndex = 0;
+    m_hdrHits.Clear();
+    m_foldersSearchingOver.Clear();
+    // Reusing this saved-search view must not reuse the old scope's members.
+    m_threadsTable.Clear();
+    m_hdrsTable.Clear();
+    m_groupsTable.Clear();
+    m_nextThreadId = 1;
+  }
   m_folders.Clear();
   m_keys.Clear();
   m_levels.Clear();
@@ -377,7 +628,7 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
   NS_ENSURE_TRUE(searchSession, NS_OK);
   nsCOMPtr<nsIMsgDBService> msgDBService =
       do_GetService("@mozilla.org/msgDatabase/msgDBService;1");
-  searchSession->CountSearchScopes(&scopeCount);
+  MOZ_TRY(searchSession->CountSearchScopes(&scopeCount));
 
   // Figure out how many search terms the virtual folder has.
   nsCOMPtr<nsIMsgDatabase> virtDatabase;
@@ -411,16 +662,26 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
     if (mJSTree) mJSTree->BeginUpdateBatch();
   }
 
+  bool cacheBatch = !m_doingQuickSearch;
+  auto endCacheBatch = mozilla::MakeScopeExit([&] {
+    if (cacheBatch) {
+      if (mTree) mTree->EndUpdateBatch();
+      if (mJSTree) mJSTree->EndUpdateBatch();
+    }
+  });
   for (int32_t i = 0; i < scopeCount; i++) {
     nsMsgSearchScopeValue scopeId;
     nsCOMPtr<nsIMsgFolder> searchFolder;
-    searchSession->GetNthSearchScope(i, &scopeId, getter_AddRefs(searchFolder));
+    MOZ_TRY(searchSession->GetNthSearchScope(i, &scopeId,
+                                             getter_AddRefs(searchFolder)));
     if (searchFolder) {
       nsCOMPtr<nsIMsgDatabase> searchDB;
       nsCString searchUri;
-      m_viewFolder->GetURI(searchUri);
+      MOZ_TRY(m_viewFolder->GetURI(searchUri));
       nsresult rv = searchFolder->GetMsgDatabase(getter_AddRefs(searchDB));
-      if (NS_SUCCEEDED(rv) && searchDB) {
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(searchDB, NS_ERROR_NOT_AVAILABLE);
+      if (searchDB) {
         if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
           if (m_dbToUseList.IndexOf(searchDB) < 0) {
             if (!m_dbToUseList.AppendObject(searchDB)) {
@@ -441,30 +702,38 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
         if (m_doingQuickSearch) continue;
 
         nsCOMPtr<nsIMsgEnumerator> cachedHits;
-        searchDB->GetCachedHits(searchUri, getter_AddRefs(cachedHits));
-        bool hasMore;
+        MOZ_TRY(searchDB->GetCachedHits(searchUri, getter_AddRefs(cachedHits)));
+        nsCOMArray<nsIMsgDBHdr> admitted;
         if (cachedHits) {
-          cachedHits->HasMoreElements(&hasMore);
-          if (hasMore) {
-            mozilla::DebugOnly<nsMsgKey> prevKey = nsMsgKey_None;
-            while (hasMore) {
-              nsCOMPtr<nsIMsgDBHdr> header;
-              nsresult rv = cachedHits->GetNext(getter_AddRefs(header));
-              if (header && NS_SUCCEEDED(rv)) {
-                nsMsgKey msgKey;
-                header->GetMessageKey(&msgKey);
-                NS_ASSERTION(prevKey == nsMsgKey_None || msgKey > prevKey,
-                             "cached Hits not sorted");
-#ifdef DEBUG
-                prevKey = msgKey;
-#endif
-                AddHdrFromFolder(header, searchFolder);
-              } else {
-                break;
-              }
-
-              cachedHits->HasMoreElements(&hasMore);
+          bool more;
+          while (true) {
+            MOZ_TRY(cachedHits->HasMoreElements(&more));
+            if (!more) break;
+            nsCOMPtr<nsIMsgDBHdr> header;
+            MOZ_TRY(cachedHits->GetNext(getter_AddRefs(header)));
+            NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+            nsCOMPtr<nsIMsgFolder> physical;
+            MOZ_TRY(header->GetFolder(getter_AddRefs(physical)));
+            if (physical != searchFolder) {
+              NS_ENSURE_TRUE(
+                  mozilla::StaticPrefs::mail_panorama_enabled_AtStartup(),
+                  NS_ERROR_ILLEGAL_VALUE);
+              continue;
             }
+            nsMsgKey key;
+            MOZ_TRY(header->GetMessageKey(&key));
+            nsCOMPtr<nsIMsgDBHdr> current;
+            MOZ_TRY(searchDB->GetMsgHdrForKey(key, getter_AddRefs(current)));
+            NS_ENSURE_TRUE(current, NS_ERROR_NOT_AVAILABLE);
+            admitted.AppendObject(current);
+          }
+        }
+        // A failed/partial source enumeration must not publish its row prefix.
+        for (int32_t j = 0; j < admitted.Count(); ++j) {
+          MOZ_TRY(AddHdrFromFolder(admitted[j], searchFolder));
+          if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+            mNativeMembers.AppendObject(admitted[j]);
+            ++m_totalMessagesInView;
           }
         }
       }
@@ -476,6 +745,7 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
     if (mJSTree) mJSTree->EndUpdateBatch();
   }
 
+  cacheBatch = false;
   m_curFolderStartKeyIndex = 0;
   m_curFolderGettingHits = nullptr;
   m_curFolderHasCachedHits = false;

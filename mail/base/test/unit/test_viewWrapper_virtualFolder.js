@@ -931,3 +931,575 @@ add_task(async function test_virtual_folder_threading_persistence() {
     "View group-by-sort bit should be set."
   );
 });
+
+/** @returns {nsIDatabaseCore|null} The current native service for these controls. */
+function savedSearchCore() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    info(
+      "Native saved-search controls; the original cases retain Mork coverage"
+    );
+    return null;
+  }
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.ok(
+    core.connectionForTests.connectionReady,
+    "The native database is open"
+  );
+  return core;
+}
+
+/**
+ * Adds a real body-store message, retaining physical folder/key identity.
+ *
+ * @param {nsIMsgFolder} folder - The physical destination.
+ * @param {string} id - Literal Message-ID, without brackets.
+ * @param {string} [subject="scope-match"] - Subject used by the saved predicate.
+ * @returns {nsIMsgDBHdr} The stored physical header.
+ */
+function addScopedMessage(folder, id, subject = "scope-match") {
+  const expected = Services.prefs.getCharPref(
+    "mail.server.default.storeContractID"
+  );
+  Assert.equal(folder.server.getStringValue("storeContractID"), expected);
+  Assert.equal(
+    folder.server.msgStore.storeType,
+    expected.includes("maildirstore") ? "maildir" : "mbox",
+    "Actual physical body store"
+  );
+  return folder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .addMessage(
+      "From: scope@example.invalid\r\nTo: reader@example.invalid\r\n" +
+        "Date: Tue, 1 Sep 2026 12:00:00 +0000\r\n" +
+        `Message-ID: <${id}>\r\nSubject: ${subject}\r\n\r\nStored body.\r\n`
+    );
+}
+
+/**
+ * Reads complete physical cache identities using the ordinary DB interface.
+ *
+ * @param {nsIMsgFolder} receiver - The cache receiver, not a scope partition.
+ * @param {nsIMsgFolder} saved - The saved folder owning the global hit list.
+ * @returns {Array<[string, number]>} Sorted folder/key identities.
+ */
+function scopedCache(receiver, saved) {
+  return Array.from(
+    receiver.msgDatabase.getCachedHits(saved.URI) ?? [],
+    header => [header.folder.URI, header.messageKey]
+  ).sort((a, b) => a[1] - b[1]);
+}
+
+/**
+ * Checks real visible rows without conflating equal Message-IDs.
+ *
+ * @param {DBViewWrapper} wrapper - The open saved-search view.
+ * @param {nsIMsgDBHdr[]} headers - Exact physical members.
+ */
+function assertScopedRows(wrapper, headers) {
+  Assert.equal(
+    wrapper.dbView.numMsgsInView,
+    headers.length,
+    "Exact complete membership before expanding threads"
+  );
+  wrapper.dbView.doCommand(Ci.nsMsgViewCommandType.expandAll);
+  const physical = header => [header.folder.URI, header.messageKey];
+  Assert.deepEqual(
+    Array.from({ length: wrapper.dbView.rowCount }, (_, i) =>
+      physical(wrapper.dbView.getMsgHdrAt(i))
+    ).sort((a, b) => a[1] - b[1]),
+    headers.map(physical).sort((a, b) => a[1] - b[1])
+  );
+}
+
+/**
+ * Waits for the ordinary permanent-delete completion before checking its result.
+ * Native body retirement finishes asynchronously, after deleteMessages returns.
+ *
+ * @param {nsIMsgFolder} folder - The real physical owner.
+ * @param {nsIMsgDBHdr} header - The stored message being deleted.
+ * @returns {Promise<void>} Resolves after ordinary deletion completion.
+ */
+async function deleteScopedMessage(folder, header) {
+  const { PromiseTestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+  );
+  const listener = new PromiseTestUtils.PromiseCopyListener();
+  folder.deleteMessages([header], null, true, false, listener, false);
+  await listener.promise;
+  // Leave the native provider's completion callback before reopening its store.
+  const { TestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/TestUtils.sys.mjs"
+  );
+  await TestUtils.waitForTick();
+}
+
+add_task(async function test_scopedCachePreservesOtherPhysicalSource() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const b = await messageInjection.makeEmptyFolder();
+  const outside = await messageInjection.makeEmptyFolder();
+  const first = addScopedMessage(a, "physical-copies@scope.invalid");
+  const second = addScopedMessage(b, "physical-copies@scope.invalid");
+  const foreign = addScopedMessage(outside, "physical-copies@scope.invalid");
+  Assert.notEqual(
+    first.messageKey,
+    second.messageKey,
+    "Real native keys are globally allocated"
+  );
+  const saved = messageInjection.makeVirtualFolder([a, b], {
+    subject: "scope-match",
+  });
+  // A valid global facade cache can contain an old out-of-scope physical key.
+  a.msgDatabase.refreshCache(
+    saved.URI,
+    [first.messageKey, second.messageKey, foreign.messageKey].sort(
+      (x, y) => x - y
+    )
+  );
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, saved);
+  assertScopedRows(wrapper, [first, second]);
+  Assert.deepEqual(scopedCache(b, saved), [
+    [a.URI, first.messageKey],
+    [b.URI, second.messageKey],
+  ]);
+  await view_open(wrapper, saved);
+  assertScopedRows(wrapper, [first, second]);
+  wrapper.close();
+  saved.parent.propagateDelete(saved, true);
+});
+
+add_task(async function test_emptySourceRefreshPreservesOtherHits() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const b = await messageInjection.makeEmptyFolder();
+  const first = addScopedMessage(a, "empty-first@scope.invalid");
+  const second = addScopedMessage(b, "empty-second@scope.invalid");
+  const saved = messageInjection.makeVirtualFolder([a, b], {
+    subject: "scope-match",
+  });
+  const wrapper = make_view_wrapper();
+  info("S371 empty-source initial ordinary open");
+  await view_open(wrapper, saved);
+  info("S371 empty-source initial open finished");
+  await deleteScopedMessage(a, first);
+  Assert.deepEqual(
+    scopedCache(a, saved),
+    [[b.URI, second.messageKey]],
+    "Completed deletion updates the full factory-owned cache before reopen"
+  );
+  info("S371 physical deletion finished; reopening current scope");
+  await view_open(wrapper, saved);
+  info("S371 empty-source reopen finished");
+  assertScopedRows(wrapper, [second]);
+  Assert.deepEqual(
+    scopedCache(a, saved),
+    [[b.URI, second.messageKey]],
+    "An empty first source preserves the second physical partition"
+  );
+  wrapper.close();
+  saved.parent.propagateDelete(saved, true);
+});
+
+add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
+  const core = savedSearchCore();
+  if (!core) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const b = await messageInjection.makeEmptyFolder();
+  const first = addScopedMessage(a, "enumerator-first@scope.invalid");
+  addScopedMessage(b, "enumerator-second@scope.invalid");
+  const saved = messageInjection.makeVirtualFolder([a, b], {
+    subject: "scope-match",
+  });
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, saved);
+  const before = scopedCache(a, saved);
+  const connection = core.connectionForTests;
+  try {
+    // Keep the indexed key ordering: the first real row succeeds, then SQLite
+    // reports its ordinary integer-overflow error while reading the next row.
+    connection.executeSimpleSQL(
+      `CREATE TEMP VIEW search_folder_hits AS
+         SELECT folder_id, message_id FROM main.search_folder_hits
+         WHERE CASE WHEN message_id = ${first.messageKey}
+                    THEN 1 ELSE abs(-9223372036854775808) END`
+    );
+    const cursor = a.msgDatabase.getCachedHits(saved.URI);
+    Assert.equal(
+      cursor.getNext().messageKey,
+      first.messageKey,
+      "The real cursor returned the first row before the later read failed"
+    );
+    Assert.throws(
+      () => cursor.hasMoreElements(),
+      error => error.result == Cr.NS_ERROR_FAILURE,
+      "The later cached row retains the original SQLite read error"
+    );
+    Assert.throws(
+      () => wrapper.dbView.QueryInterface(Ci.nsIMsgSearchNotify).onNewSearch(),
+      error => error.result == Cr.NS_ERROR_FAILURE,
+      "A later real SQLite cached-hit read returns the original error"
+    );
+    Assert.equal(
+      wrapper.dbView.rowCount,
+      0,
+      "No cached prefix is admitted as a successful source"
+    );
+  } finally {
+    // End the faulted view's owned search/scopes before restoring its storage.
+    wrapper.close();
+    connection.executeSimpleSQL("DROP VIEW temp.search_folder_hits");
+  }
+  Assert.deepEqual(
+    scopedCache(a, saved),
+    before,
+    "A failed cached read did not replace the union"
+  );
+  await view_open(wrapper, saved);
+  Assert.equal(
+    wrapper.dbView.rowCount,
+    2,
+    "The normal search recovers after restoring storage"
+  );
+  wrapper.close();
+  saved.parent.propagateDelete(saved, true);
+});
+
+add_task(
+  async function test_savedSearchNotificationsTrackMatchingPhysicalMembers() {
+    if (!savedSearchCore()) {
+      return;
+    }
+    const a = await messageInjection.makeEmptyFolder();
+    const b = await messageInjection.makeEmptyFolder();
+    const outside = await messageInjection.makeEmptyFolder();
+    const first = addScopedMessage(a, "notification-first@scope.invalid");
+    const second = addScopedMessage(b, "notification-second@scope.invalid");
+    const saved = messageInjection.makeVirtualFolder([a, b], {
+      subject: "scope-match",
+    });
+    Assert.equal(
+      saved.getTotalMessages(false),
+      2,
+      "Counts exist before the first view opens"
+    );
+    const wrapped = VirtualFolderHelper.wrapVirtualFolder(saved);
+    wrapped.searchString =
+      "AND (status,isn't,read) AND (subject,contains,scope-match)";
+    const wrapper = make_view_wrapper();
+    await view_open(wrapper, saved);
+    first.markRead(true);
+    assertScopedRows(wrapper, [second]);
+    Assert.equal(saved.getTotalMessages(false), 1);
+    Assert.equal(saved.getNumUnread(false), 1);
+    first.markRead(false);
+    assertScopedRows(wrapper, [first, second]);
+    Assert.equal(
+      saved.getTotalMessages(false),
+      2,
+      "The view and persistent binding do not double count"
+    );
+    const third = addScopedMessage(b, "notification-third@scope.invalid");
+    addScopedMessage(outside, "notification-outside@scope.invalid");
+    assertScopedRows(wrapper, [first, second, third]);
+    await deleteScopedMessage(b, third);
+    assertScopedRows(wrapper, [first, second]);
+    Assert.equal(saved.getTotalMessages(false), 2);
+    // Tags and flags can add/remove existing headers, not just invalidate rows.
+    wrapped.searchString =
+      "AND (status,is,flagged) AND (subject,contains,scope-match)";
+    await view_open(wrapper, saved);
+    assertScopedRows(wrapper, []);
+    first.markFlagged(true);
+    assertScopedRows(wrapper, [first]);
+    first.markFlagged(false);
+    assertScopedRows(wrapper, []);
+    wrapper.close();
+    wrapped.searchString = "AND (tag,contains,$label1)";
+    a.addKeywordsToMessages([first], "$label1");
+    Assert.equal(saved.getTotalMessages(false), 1);
+    a.removeKeywordsFromMessages([first], "$label1");
+    Assert.equal(saved.getTotalMessages(false), 0);
+    saved.parent.propagateDelete(saved, true);
+  }
+);
+
+add_task(async function test_savedSearchLiveChangesDuringScan() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const b = await messageInjection.makeEmptyFolder();
+  const scanned = addScopedMessage(a, "inflight-scanned@scope.invalid");
+  const rematch = addScopedMessage(a, "inflight-rematch@scope.invalid");
+  scanned.markFlagged(true);
+  const saved = messageInjection.makeVirtualFolder([a, b], {
+    subject: "scope-match",
+  });
+  VirtualFolderHelper.wrapVirtualFolder(saved).searchString =
+    "AND (status,is,flagged) AND (subject,contains,scope-match)";
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, saved);
+  const notify = wrapper._searchViewListener;
+  const progress = wrapper.search._sessionListener;
+  const originalLoaded = wrapper.listener.onMessagesLoaded;
+  let complete = 0;
+  wrapper.listener.onMessagesLoaded = function (all) {
+    if (all) {
+      complete++;
+    }
+    return originalLoaded.call(this, all);
+  };
+  try {
+    progress.onNewSearch();
+    notify.onNewSearch();
+    notify.onSearchHit(scanned, a);
+    const arrived = addScopedMessage(b, "inflight-arrived@scope.invalid");
+    arrived.markFlagged(true);
+    rematch.markFlagged(true);
+    // The live match was admitted before the scanner delivered this same key.
+    notify.onSearchHit(rematch, a);
+    await deleteScopedMessage(a, scanned);
+    // The scanner next reaches B; its earlier live hit must not enter A's batch.
+    notify.onSearchHit(arrived, b);
+    notify.onSearchDone(Cr.NS_OK);
+    progress.onSearchDone(Cr.NS_OK);
+    Assert.equal(
+      wrapper._savedSearchError,
+      null,
+      "The valid scan has no error"
+    );
+    Assert.equal(complete, 1, "The normal registered listener completes once");
+    Assert.ok(!wrapper.searching, "The completed scan is no longer loading");
+    assertScopedRows(wrapper, [rematch, arrived]);
+    Assert.deepEqual(
+      scopedCache(a, saved),
+      [
+        [a.URI, rematch.messageKey],
+        [b.URI, arrived.messageKey],
+      ],
+      "Only current matching physical members survive both scanner batches"
+    );
+    Assert.equal(saved.getTotalMessages(false), 2);
+    Assert.equal(saved.getNumUnread(false), 2);
+    await view_open(wrapper, saved);
+    assertScopedRows(wrapper, [rematch, arrived]);
+  } finally {
+    wrapper.listener.onMessagesLoaded = originalLoaded;
+    wrapper.close();
+    saved.parent.propagateDelete(saved, true);
+  }
+});
+
+add_task(async function test_savedSearchLiveMatchesAcrossEmptyScanScopes() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  for (const passedRow of [false, true]) {
+    const a = await messageInjection.makeEmptyFolder();
+    const b = await messageInjection.makeEmptyFolder();
+    const c = await messageInjection.makeEmptyFolder();
+    const first = addScopedMessage(a, "three-scope-a@scope.invalid");
+    const last = addScopedMessage(c, "three-scope-c@scope.invalid");
+    first.markFlagged(true);
+    last.markFlagged(true);
+    let seed;
+    let live;
+    if (passedRow) {
+      live = addScopedMessage(b, "three-scope-passed@scope.invalid");
+      seed = addScopedMessage(b, "three-scope-seed@scope.invalid");
+      seed.markFlagged(true);
+    }
+    const saved = messageInjection.makeVirtualFolder([a, b, c], {
+      subject: "scope-match",
+    });
+    VirtualFolderHelper.wrapVirtualFolder(saved).searchString =
+      "AND (status,is,flagged) AND (subject,contains,scope-match)";
+    const wrapper = make_view_wrapper();
+    await view_open(wrapper, saved);
+    const notify = wrapper._searchViewListener;
+    const progress = wrapper.search._sessionListener;
+    const originalLoaded = wrapper.listener.onMessagesLoaded;
+    let complete = 0;
+    wrapper.listener.onMessagesLoaded = function (all) {
+      if (all) {
+        complete++;
+      }
+      return originalLoaded.call(this, all);
+    };
+    try {
+      progress.onNewSearch();
+      notify.onNewSearch();
+      notify.onSearchHit(first, a);
+      if (!passedRow) {
+        live = addScopedMessage(b, "three-scope-arrival@scope.invalid");
+      }
+      live.markFlagged(true);
+      if (passedRow) {
+        // The scanner already passed this previously unmatched row. Its first
+        // actual hit in B must not discard the earlier live admission.
+        notify.onSearchHit(seed, b);
+      }
+      // With no scanner hit in B, the A-to-C transition flushes B as empty.
+      notify.onSearchHit(last, c);
+      notify.onSearchDone(Cr.NS_OK);
+      progress.onSearchDone(Cr.NS_OK);
+      const expected = [first, live, ...(seed ? [seed] : []), last];
+      Assert.equal(
+        wrapper._savedSearchError,
+        null,
+        "The three-source scan has no error"
+      );
+      Assert.equal(
+        complete,
+        1,
+        "The three-source registered scan completes once"
+      );
+      Assert.ok(
+        !wrapper.searching,
+        "The three-source scan is no longer loading"
+      );
+      assertScopedRows(wrapper, expected);
+      Assert.deepEqual(
+        scopedCache(a, saved),
+        expected
+          .map(header => [header.folder.URI, header.messageKey])
+          .sort((left, right) => left[1] - right[1]),
+        passedRow
+          ? "A passed B row survives B's first scanner hit and cache flush"
+          : "A live match survives an empty B scanner batch"
+      );
+      Assert.equal(saved.getTotalMessages(false), expected.length);
+      Assert.equal(saved.getNumUnread(false), expected.length);
+      await view_open(wrapper, saved);
+      assertScopedRows(wrapper, expected);
+      Assert.deepEqual(
+        scopedCache(a, saved),
+        expected
+          .map(header => [header.folder.URI, header.messageKey])
+          .sort((left, right) => left[1] - right[1]),
+        "Normal reopen retains the same complete physical cache union"
+      );
+      Assert.equal(saved.getTotalMessages(false), expected.length);
+      Assert.equal(saved.getNumUnread(false), expected.length);
+    } finally {
+      wrapper.listener.onMessagesLoaded = originalLoaded;
+      wrapper.close();
+      saved.parent.propagateDelete(saved, true);
+    }
+  }
+});
+
+add_task(async function test_savedSearchRebindDetachesOldScope() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const b = await messageInjection.makeEmptyFolder();
+  const first = addScopedMessage(a, "rebind@scope.invalid");
+  const second = addScopedMessage(b, "rebind@scope.invalid");
+  const saved = messageInjection.makeVirtualFolder([a], {
+    subject: "scope-match",
+  });
+  const wrapped = VirtualFolderHelper.wrapVirtualFolder(saved);
+  wrapped.searchFolders = [b];
+  addScopedMessage(a, "retired-source@scope.invalid");
+  Assert.equal(saved.getTotalMessages(false), 1);
+  Assert.deepEqual(scopedCache(b, saved), [[b.URI, second.messageKey]]);
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, saved);
+  assertScopedRows(wrapper, [second]);
+  Assert.notEqual(first.messageKey, second.messageKey);
+  // Replacing the real source database detaches the old announcer and rebinds.
+  const retired = b.msgDatabase;
+  retired.forceClosed();
+  const current = b.msgDatabase;
+  Assert.notEqual(current, retired);
+  const added = addScopedMessage(b, "replacement-db@scope.invalid");
+  await view_open(wrapper, saved);
+  assertScopedRows(wrapper, [second, added]);
+  Assert.equal(saved.getTotalMessages(false), 2);
+  wrapper.close();
+  saved.parent.propagateDelete(saved, true);
+});
+
+add_task(async function test_savedSearchBindingSurvivesWrapperReopen() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const saved = messageInjection.makeVirtualFolder([a], {
+    subject: "scope-match",
+  });
+  let ephemeral = VirtualFolderHelper.wrapVirtualFolder(saved);
+  Assert.equal(ephemeral.virtualFolder, saved);
+  ephemeral = null;
+  const first = addScopedMessage(a, "unopened@scope.invalid");
+  Assert.equal(
+    saved.getTotalMessages(false),
+    1,
+    "The native factory retains an unopened search binding"
+  );
+  Assert.ok(
+    saved.hasNewMessages,
+    "New status propagates without a saved-search view"
+  );
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, saved);
+  assertScopedRows(wrapper, [first]);
+  wrapper.close();
+  a.clearNewMessages();
+  Assert.ok(
+    !saved.hasNewMessages,
+    "Clearing the physical New list is synchronous"
+  );
+  const second = addScopedMessage(a, "after-close@scope.invalid");
+  Assert.equal(saved.getTotalMessages(false), 2);
+  Assert.ok(saved.hasNewMessages);
+  await view_open(wrapper, saved);
+  assertScopedRows(wrapper, [first, second]);
+  wrapper.close();
+  saved.parent.propagateDelete(saved, true);
+});
+
+add_task(async function test_savedSearchDetachRejectsLateNotification() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  const a = await messageInjection.makeEmptyFolder();
+  const saved = messageInjection.makeVirtualFolder([a], {
+    subject: "scope-match",
+  });
+  const retained = VirtualFolderHelper.wrapVirtualFolder(saved);
+  const wrapper = make_view_wrapper();
+  await view_open(wrapper, saved);
+  // Queues the native reconciliation, then removes its saved-folder identity.
+  addScopedMessage(a, "before-delete@scope.invalid");
+  saved.parent.propagateDelete(saved, true);
+  Assert.equal(
+    wrapper.displayedFolder,
+    null,
+    "Deletion closed the retained UI consumer"
+  );
+  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+  Assert.throws(
+    () => retained.searchFolders,
+    error => !Components.isSuccessCode(error.result),
+    "A retired declaration cannot silently bind another or an empty folder"
+  );
+  addScopedMessage(a, "after-delete@scope.invalid");
+  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+  Assert.equal(
+    wrapper.displayedFolder,
+    null,
+    "Late native callbacks do not revive the closed consumer"
+  );
+});

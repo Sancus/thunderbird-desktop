@@ -17,6 +17,7 @@ import { localAccountUtils } from "resource://testing-common/mailnews/LocalAccou
 import { nsMailServer } from "resource://testing-common/mailnews/Maild.sys.mjs";
 import * as Imapd from "resource://testing-common/mailnews/Imapd.sys.mjs";
 import { updateAppInfo } from "resource://testing-common/AppInfo.sys.mjs";
+import { PromiseTestUtils } from "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs";
 
 // define globals
 export var IMAPPump = {
@@ -27,7 +28,18 @@ export var IMAPPump = {
   mailbox: null, // imap fake server mailbox
 };
 
-export function setupIMAPPump(extensions) {
+/**
+ * Starts the fake IMAP server and its accounts.
+ *
+ * @param {string} extensions - Fake-server extensions or configuration name.
+ * @param {object} [options] - Inbox discovery options.
+ * @param {boolean} [options.awaitInbox=false] - Wait for discovery before
+ *   publishing the actual Inbox. Existing callers retain synchronous setup.
+ * @returns {Promise<nsIMsgImapMailFolder>|undefined} With `awaitInbox`, resolves
+ *   to the discovered Inbox or rejects with discovery errors. Server/account
+ *   setup can still throw synchronously.
+ */
+export function setupIMAPPump(extensions, { awaitInbox = false } = {}) {
   // Create Application info if we need it.
   updateAppInfo();
 
@@ -102,11 +114,48 @@ export function setupIMAPPump(extensions) {
   Services.prefs.setBoolPref("mail.biff.animate_dock_icon", false);
   Services.prefs.setBoolPref("mail.biff.alert.show_preview", false);
 
+  if (awaitInbox) {
+    IMAPPump.inbox = null;
+    IMAPPump.mailbox = null;
+    return discoverIMAPInbox();
+  }
+
   IMAPPump.incomingServer.performExpand(null);
 
   IMAPPump.inbox = IMAPPump.incomingServer.rootFolder.getChildNamed("INBOX");
   IMAPPump.mailbox = IMAPPump.daemon.getMailbox("INBOX");
   IMAPPump.inbox instanceof Ci.nsIMsgImapMailFolder;
+  return undefined;
+}
+
+/**
+ * Discovers and publishes the Inbox for the current pump.
+ *
+ * @returns {Promise<nsIMsgImapMailFolder>} The actual Inbox after successful
+ *   discovery. Rejects if discovery fails, Inbox is absent, or setup was replaced.
+ */
+async function discoverIMAPInbox() {
+  const incomingServer = IMAPPump.incomingServer;
+  const daemon = IMAPPump.daemon;
+  const root = incomingServer.rootFolder;
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(root, listener, null);
+  await listener.promise;
+  if (IMAPPump.incomingServer !== incomingServer) {
+    throw new Error("IMAP pump changed during Inbox discovery");
+  }
+  const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+  if (!inbox) {
+    throw new Error("IMAP discovery completed without an Inbox");
+  }
+  const imapInbox = inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
+  const mailbox = daemon.getMailbox("INBOX");
+  if (!mailbox) {
+    throw new Error("The fake IMAP server has no Inbox mailbox");
+  }
+  IMAPPump.inbox = imapInbox;
+  IMAPPump.mailbox = mailbox;
+  return imapInbox;
 }
 
 // This will clear not only the imap accounts but also local accounts.

@@ -18,7 +18,10 @@ var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
 
-initViewWrapperTestUtils({ mode: "imap", offline: false });
+add_setup(async function setup_customPredicateFolders() {
+  initViewWrapperTestUtils({ mode: "imap", offline: false, awaitInbox: true });
+  await messageInjection.ready;
+});
 
 /**
  * A custom search term, that just does Subject Contains

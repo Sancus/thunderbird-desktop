@@ -25,8 +25,7 @@ class nsMsgXFVirtualFolderDBView : public nsMsgSearchDBView {
   NS_IMETHOD CloneDBView(nsIMsgWindow* aMsgWindow,
                          nsIMsgDBViewCommandUpdater* aCmdUpdater,
                          nsIMsgDBView** _retval) override;
-  NS_IMETHOD CopyDBView(nsMsgDBView* aNewMsgDBView,
-                        nsIMsgWindow* aMsgWindow,
+  NS_IMETHOD CopyDBView(nsMsgDBView* aNewMsgDBView, nsIMsgWindow* aMsgWindow,
                         nsIMsgDBViewCommandUpdater* aCmdUpdater) override;
   NS_IMETHOD Close() override;
   NS_IMETHOD GetViewType(nsMsgViewTypeValue* aViewType) override;
@@ -36,17 +35,28 @@ class nsMsgXFVirtualFolderDBView : public nsMsgSearchDBView {
                                   uint32_t* aStatus,
                                   nsIDBChangeListener* aInstigator) override;
   NS_IMETHOD GetMsgFolder(nsIMsgFolder** aMsgFolder) override;
+  NS_IMETHOD OnHdrFlagsChanged(nsIMsgDBHdr*, uint32_t, uint32_t,
+                               nsIDBChangeListener*) override;
+  NS_IMETHOD OnHdrDeleted(nsIMsgDBHdr*, nsMsgKey, int32_t,
+                          nsIDBChangeListener*) override;
 
   virtual nsresult OnNewHeader(nsIMsgDBHdr* newHdr, nsMsgKey parentKey,
                                bool ensureListed) override;
-  void UpdateCacheAndViewForPrevSearchedFolders(nsIMsgFolder* curSearchFolder);
-  void UpdateCacheAndViewForFolder(nsIMsgFolder* folder,
-                                   nsTArray<nsMsgKey> const& newHits);
+  nsresult UpdateCacheAndViewForPrevSearchedFolders(
+      nsIMsgFolder* curSearchFolder);
+  nsresult UpdateCacheAndViewForFolder(nsIMsgFolder* folder,
+                                       nsTArray<nsMsgKey> const& newHits);
   void RemovePendingDBListeners();
 
  protected:
   virtual nsresult GetMessageEnumerator(nsIMsgEnumerator** enumerator) override;
 
+  nsresult NativeMemberIndex(nsIMsgDBHdr* header, int32_t& index);
+  nsresult UpdateNativeMatch(nsIMsgDBHdr* header);
+  nsCOMArray<nsIMsgDBHdr> mNativeMembers;
+  // Live matches must survive scanner batches that skipped their source/row.
+  nsCOMArray<nsIMsgDBHdr> mNativeLiveMatches;
+  uint64_t mNativeSearchSerial = 0;
   nsCOMArray<nsIMsgFolder> m_foldersSearchingOver;
   nsCOMArray<nsIMsgDBHdr> m_hdrHits;
   nsCOMPtr<nsIMsgFolder> m_curFolderGettingHits;

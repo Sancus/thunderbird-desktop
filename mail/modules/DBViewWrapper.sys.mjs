@@ -519,9 +519,9 @@ IDBViewWrapperListener.prototype = {
  *  implementations.
  *
  * Things we do not do and why we do not do them:
- * - Selection.  This depends on having an nsITreeSelection object and we choose
- *   to avoid entanglement with XUL/layout code.  Selection accordingly must be
- *   handled a layer up in the FolderDisplayWidget.
+ * - General selection policy belongs to the display listener. An in-place
+ *   native saved-search scope refresh retains only existing physical selections
+ *   using the selection object supplied by that listener; it creates no UI.
  */
 export function DBViewWrapper(aListener) {
   this.displayedFolder = null;
@@ -554,6 +554,13 @@ export function DBViewWrapper(aListener) {
 
   this._folderLoading = false;
   this._searching = false;
+  this._savedSearchGeneration = 0;
+  this._savedSearchObserver = null;
+  this._savedSearchSignature = null;
+  this._savedSearchSelection = null;
+  this._savedSearchError = null;
+  this._searchViewListener = null;
+  this._savedSearchDissociating = false;
 }
 
 DBViewWrapper.prototype = {
@@ -746,6 +753,10 @@ DBViewWrapper.prototype = {
       FolderNotificationHelper.noteCuriosity(doppel);
     }
 
+    doppel._savedSearchSignature = this._savedSearchSignature;
+    if (doppel.isVirtual) {
+      doppel._observeSavedSearch();
+    }
     return doppel;
   },
 
@@ -763,6 +774,16 @@ DBViewWrapper.prototype = {
    *   bookkeeping is skipped too, so dead storage isn't rewritten.
    */
   close({ leavingFolder = true } = {}) {
+    ++this._savedSearchGeneration;
+    this._savedSearchSelection = null;
+    if (this._savedSearchObserver) {
+      Services.obs.removeObserver(
+        this._savedSearchObserver,
+        "search-folders-changed"
+      );
+      this._savedSearchObserver = null;
+    }
+    this._savedSearchSignature = null;
     if (this.displayedFolder != null) {
       // onLeavingFolder does all the application-level stuff related to leaving
       //  the folder (marking as read, etc.)
@@ -803,7 +824,7 @@ DBViewWrapper.prototype = {
 
     // kill off the view and its search association
     if (this.dbView) {
-      this.search.dissociateView(this.dbView);
+      this._dissociateSearch();
       this.dbView.setTree(null);
       this.dbView.setJSTree(null);
       this.dbView.selection = null;
@@ -811,6 +832,8 @@ DBViewWrapper.prototype = {
       this.listener.onDestroyingView(false);
       this.dbView = null;
     }
+    this._searchViewListener = null;
+    this._savedSearchError = null;
 
     // zero out the view update depth here.  We don't do it on open because it's
     //  theoretically be nice to be able to start a view update before you open
@@ -833,6 +856,279 @@ DBViewWrapper.prototype = {
     this.search = null;
   },
 
+  /** Unregisters the current search without reporting a cancelled load as success. */
+  _dissociateSearch() {
+    this._savedSearchDissociating = true;
+    try {
+      this.search.dissociateView(this._searchViewListener || this.dbView);
+    } finally {
+      this._savedSearchDissociating = false;
+    }
+  },
+
+  /**
+   * Reads a native saved-search definition before replacing its current view.
+   *
+   * @param {nsIMsgFolder} folder - The saved folder to read.
+   * @returns {{folders: nsIMsgFolder[], terms: nsIMsgSearchTerm[],
+   *   online: boolean, signature: string}} The complete checked definition.
+   * @throws {nsIException} The original scope, predicate, or native binding error.
+   */
+  _readSavedSearchScope(folder) {
+    const wrapped = VirtualFolderHelper.wrapVirtualFolder(folder);
+    const folders = wrapped.searchFolders.filter(source => !source.isServer);
+    const terms = wrapped.searchTerms;
+    const online = wrapped.onlineSearch;
+    return {
+      folders,
+      terms,
+      online,
+      signature: JSON.stringify([
+        wrapped.searchFolderURIs,
+        wrapped.searchString,
+        online,
+      ]),
+    };
+  },
+
+  /** Registers one scope observer for this open native saved-search view. */
+  _observeSavedSearch() {
+    if (
+      this._savedSearchObserver ||
+      !Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ) {
+      return;
+    }
+    this._savedSearchObserver = {
+      observe: folder => {
+        if (folder == this.displayedFolder && this.isVirtual) {
+          this._refreshSavedSearchScope();
+        }
+      },
+    };
+    Services.obs.addObserver(
+      this._savedSearchObserver,
+      "search-folders-changed"
+    );
+  },
+
+  /**
+   * Rebinds a saved-search view after its checked definition changes.
+   * Keeps sort/group flags and restores only surviving physical selections.
+   *
+   * @param {{folders: nsIMsgFolder[], terms: nsIMsgSearchTerm[],
+   *   online: boolean, signature: string}} [scope] - The checked definition.
+   * @param {boolean} [force=false] - Refreshes an unchanged explicit reopen.
+   * @throws {nsIException} The original definition or view error.
+   */
+  _refreshSavedSearchScope(
+    scope = this._readSavedSearchScope(this.displayedFolder),
+    force = false
+  ) {
+    if (
+      (!force || this.searching) &&
+      scope.signature == this._savedSearchSignature
+    ) {
+      return;
+    }
+    const view = this.dbView;
+    const selection = view?.selection;
+    const identity = index => {
+      if (!view || index < 0 || index >= view.rowCount) {
+        return null;
+      }
+      if (view.getFlagsAt(index) & MSG_VIEW_FLAG_DUMMY) {
+        return { group: view.cellTextForColumn(index, "subjectCol") };
+      }
+      const header = view.getMsgHdrAt(index);
+      return { folder: header.folder.URI, key: header.messageKey };
+    };
+    const selected = [];
+    if (selection) {
+      for (let range = 0; range < selection.getRangeCount(); range++) {
+        const start = {},
+          end = {};
+        selection.getRangeAt(range, start, end);
+        for (let index = start.value; index <= end.value; index++) {
+          selected.push(identity(index));
+        }
+      }
+    }
+    const current = identity(selection?.currentIndex ?? -1);
+    const generation = ++this._savedSearchGeneration;
+    this._savedSearchError = null;
+    this._savedSearchSelection = {
+      selected,
+      current,
+      generation,
+      view: null,
+      expandAll: Boolean(view?.viewFlags & Ci.nsMsgViewFlagsType.kExpandAll),
+    };
+    this.beginViewUpdate();
+    try {
+      FolderNotificationHelper.removeNotifications(
+        this._underlyingFolders,
+        this
+      );
+      FolderNotificationHelper.removeNotifications(
+        [this.displayedFolder],
+        this
+      );
+      this._underlyingFolders = scope.folders;
+      this._underlyingData =
+        scope.folders.length > 1
+          ? this.kUnderlyingMultipleFolder
+          : this.kUnderlyingRealFolder;
+      this.search.onlineSearch = scope.online;
+      this.search.virtualFolderTerms = scope.terms;
+      this._savedSearchSignature = scope.signature;
+      FolderNotificationHelper.stalkFolders(
+        scope.folders,
+        this.displayedFolder,
+        this
+      );
+    } finally {
+      this.endViewUpdate();
+    }
+  },
+
+  /** Restores saved physical rows after the same scope refresh completes. */
+  _restoreSavedSearchSelection() {
+    const pending = this._savedSearchSelection;
+    if (
+      !pending ||
+      pending.generation != this._savedSearchGeneration ||
+      pending.view != this.dbView ||
+      !this.dbView?.selection
+    ) {
+      return;
+    }
+    this._savedSearchSelection = null;
+    const view = this.dbView;
+    if (pending.expandAll) {
+      view.doCommand(Ci.nsMsgViewCommandType.expandAll);
+    }
+    const find = identity => {
+      if (!identity) {
+        return -1;
+      }
+      for (let index = 0; index < view.rowCount; index++) {
+        const dummy = Boolean(view.getFlagsAt(index) & MSG_VIEW_FLAG_DUMMY);
+        if ("group" in identity) {
+          if (
+            dummy &&
+            view.cellTextForColumn(index, "subjectCol") == identity.group
+          ) {
+            return index;
+          }
+        } else if (!dummy) {
+          const header = view.getMsgHdrAt(index);
+          if (
+            header.folder.URI == identity.folder &&
+            header.messageKey == identity.key
+          ) {
+            return index;
+          }
+        }
+      }
+      return -1;
+    };
+    const selection = view.selection;
+    const suppressed = selection.selectEventsSuppressed;
+    selection.selectEventsSuppressed = true;
+    try {
+      selection.clearSelection();
+      for (const identity of pending.selected) {
+        const index = find(identity);
+        if (index >= 0) {
+          selection.rangedSelect(index, index, true);
+        }
+      }
+      selection.currentIndex = find(pending.current);
+    } finally {
+      selection.selectEventsSuppressed = suppressed;
+    }
+  },
+
+  /**
+   * Wraps existing native search callbacks to retain their first failure.
+   * Late callbacks from a replaced view cannot finish the new view's search.
+   *
+   * @param {nsIMsgDBView} view - The view receiving the search callbacks.
+   * @returns {nsIMsgSearchNotify|nsIMsgDBView} The normal registered listener.
+   */
+  _savedSearchListener(view) {
+    if (
+      !this.isVirtual ||
+      !Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ) {
+      return view;
+    }
+    const notify = view.QueryInterface(Ci.nsIMsgSearchNotify);
+    const generation = this._savedSearchGeneration;
+    let started = false;
+    const current = () =>
+      view == this.dbView && generation == this._savedSearchGeneration;
+    this.search._sessionListener = {
+      onNewSearch: () => {
+        if (current() && !this.searching) {
+          this.searching = true;
+        }
+      },
+      onSearchDone: () => {
+        if (current()) {
+          this.searching = false;
+        }
+      },
+    };
+    const invoke = (name, args) => {
+      if (!current()) {
+        return;
+      }
+      try {
+        notify[name](...args);
+      } catch (error) {
+        this._savedSearchError ??= error;
+        throw error;
+      }
+    };
+    return {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgSearchNotify"]),
+      set searchSession(session) {
+        view.searchSession = session;
+      },
+      onNewSearch: () => {
+        invoke("onNewSearch", []);
+        started = current();
+      },
+      onSearchHit: (header, folder) => {
+        if (started && !this._savedSearchError) {
+          invoke("onSearchHit", [header, folder]);
+        }
+      },
+      onSearchDone: status => {
+        if (!current()) {
+          return;
+        }
+        if (status != Cr.NS_OK) {
+          this._savedSearchError ??= Components.Exception(
+            "Saved search failed",
+            status
+          );
+        }
+        if (started) {
+          // End only a successfully begun native search. A failed hit cannot
+          // turn its admitted prefix into a successful cache replacement.
+          invoke("onSearchDone", [
+            this._savedSearchError
+              ? this._savedSearchError.result || Cr.NS_ERROR_FAILURE
+              : status,
+          ]);
+        }
+      },
+    };
+  },
+
   /**
    * Open the passed-in nsIMsgFolder folder.  Use openSynthetic for synthetic
    *  view providers.
@@ -840,6 +1136,17 @@ DBViewWrapper.prototype = {
   open(aFolder) {
     if (aFolder == null) {
       this.close();
+      return;
+    }
+
+    // Validate the native definition before destroying a usable old view.
+    const saved =
+      aFolder.flags & Ci.nsMsgFolderFlags.Virtual &&
+      Services.prefs.getBoolPref("mail.panorama.enabled", false)
+        ? this._readSavedSearchScope(aFolder)
+        : null;
+    if (saved && this.displayedFolder == aFolder) {
+      this._refreshSavedSearchScope(saved, true);
       return;
     }
 
@@ -1014,7 +1321,14 @@ DBViewWrapper.prototype = {
     this.listener.onSearching(aSearching);
     // notify that all messages are loaded if searching has concluded
     if (!aSearching) {
+      if (this._savedSearchDissociating) {
+        return;
+      }
+      if (this._savedSearchError) {
+        throw this._savedSearchError;
+      }
       this.listener.onMessagesLoaded(true);
+      this._restoreSavedSearchSelection();
     }
   },
 
@@ -1121,6 +1435,12 @@ DBViewWrapper.prototype = {
 
       // retrieve and chew the search query
       this.search.virtualFolderTerms = virtFolder.searchTerms;
+      this._savedSearchSignature = JSON.stringify([
+        virtFolder.searchFolderURIs,
+        virtFolder.searchString,
+        virtFolder.onlineSearch,
+      ]);
+      this._observeSavedSearch();
     } else {
       this._underlyingData = this.kUnderlyingRealFolder;
       this._underlyingFolders = [this.displayedFolder];
@@ -1345,8 +1665,8 @@ DBViewWrapper.prototype = {
    *  folders, we just update ourselves.  (Currently, cross-folder views are
    *  not clever enough to purge the mooted messages, so we need to do this to
    *  help them out.)
-   * We do not update virtual folder definitions as a result of deletion; we are
-   *  a display abstraction.  That (hopefully) happens elsewhere.
+   * Native saved searches persist a known physical source loss before their
+   * next cache read. Legacy definition maintenance remains outside the view.
    */
   _folderDeleted(aFolder) {
     // XXX When we empty the trash, we're actually sending a folder deleted
@@ -1375,6 +1695,15 @@ DBViewWrapper.prototype = {
       }
     }
 
+    if (
+      this.isVirtual &&
+      Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ) {
+      // Retire this known physical loss before rebuilding from the global
+      // cache. Its old headers may already be unavailable at this callback.
+      const saved = VirtualFolderHelper.wrapVirtualFolder(this.displayedFolder);
+      saved.searchFolders = this._underlyingFolders;
+    }
     if (this._underlyingFolders.length == 0) {
       this.close();
       return;
@@ -1399,7 +1728,7 @@ DBViewWrapper.prototype = {
     this.__viewFlags = this.dbView.viewFlags;
     // We will have to re-create the view, so nuke the view now.
     this.listener.onDestroyingView(true);
-    this.search.dissociateView(this.dbView);
+    this._dissociateSearch();
     this.dbView.close();
     this.dbView = null;
   },
@@ -1546,7 +1875,7 @@ DBViewWrapper.prototype = {
         this.__viewFlags = this.dbView.viewFlags;
       }
       this.listener.onDestroyingView(true); // we will re-create it!
-      this.search.dissociateView(this.dbView);
+      this._dissociateSearch();
       this.dbView.close();
       this.dbView = null;
     }
@@ -1562,7 +1891,15 @@ DBViewWrapper.prototype = {
     this.listener.onCreatedView();
 
     // this ends up being a no-op if there are no search terms
-    this.search.associateView(this.dbView);
+    this._savedSearchError = null;
+    this._searchViewListener = this._savedSearchListener(this.dbView);
+    if (this._savedSearchSelection) {
+      this._savedSearchSelection.view = this.dbView;
+    }
+    this.search.associateView(this._searchViewListener);
+    if (this._savedSearchError) {
+      throw this._savedSearchError;
+    }
 
     // If we are searching, then the search will generate the all messages
     //  loaded notification.  Although in some cases the search may have
@@ -1574,6 +1911,7 @@ DBViewWrapper.prototype = {
     //  so we should not generate all messages loaded right now.
     if (!this.searching && !this.isFolderLoading()) {
       this.listener.onMessagesLoaded(true);
+      this._restoreSavedSearchSelection();
     } else if (this.dbView.numMsgsInView > 0) {
       this.listener.onMessagesLoaded(false);
     }

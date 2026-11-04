@@ -7,6 +7,9 @@
 
 #include "nsString.h"
 #include "MailNewsTypes2.h"
+#include "nsTArray.h"
+#include "mozilla/RefPtr.h"
+#include <functional>
 
 static const char kMailboxRootURI[] = "mailbox:/";
 static const char kMailboxMessageRootURI[] = "mailbox-message:/";
@@ -27,6 +30,22 @@ nsresult nsCreateLocalBaseMessageURI(const nsACString& baseURI,
 class nsIMsgDBHdr;
 class nsIMsgFolder;
 class nsIMsgPluggableStore;
+class nsIMsgDatabase;
+
+// Permanent native deletion only. Move/undo source retirement has its own
+// accepted contract. On failure, removed contains only confirmed SQL commits.
+nsresult PurgeNativeMessages(
+    nsIMsgFolder* folder, nsIMsgDatabase* database,
+    const nsTArray<RefPtr<nsIMsgDBHdr>>& headers,
+    nsTArray<RefPtr<nsIMsgDBHdr>>& removed,
+    const std::function<void(nsIMsgDBHdr*)>& beforeRemove);
+// Reconcile a previous permanent purge before a new selection or reparse.
+// This never replays metadata deletion, counts or copy-listener callbacks.
+nsresult RecoverNativePurge(nsIMsgFolder* folder);
+// Pending custody fences mutations/scans, but permits unchanged live reads.
+nsresult CheckNativePurgePending(nsIMsgFolder* folder);
+nsresult CheckNativePurgeRemoval(nsIMsgFolder* folder,
+                                 const nsTArray<nsCString>& tokens);
 
 nsresult ReadPop3MessageIdentity(nsIMsgFolder* folder, nsIMsgDBHdr* header,
                                  nsACString& account, nsACString& uidl);

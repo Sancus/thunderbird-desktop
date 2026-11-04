@@ -4,6 +4,12 @@
 
 "use strict";
 
+/* globals _PREFS_FILE */
+
+const { PromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+
 const RETENTION_STORES = {
   mbox: "@mozilla.org/msgstore/berkeleystore;1",
   maildir: "@mozilla.org/msgstore/maildirstore;1",
@@ -426,5 +432,506 @@ if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
 
   add_task(async function test_localRetentionForeignTransactionMaildir() {
     await checkRetentionForeignTransaction("maildir");
+  });
+}
+
+/**
+ * Check a real first/later row-delete failure after retention selected its set.
+ * The pre-existing timestamp fault does not reach this destructive boundary.
+ *
+ * @param {string} store - Native provider.
+ * @param {number} failedIndex - Selected member whose DELETE must abort.
+ * @returns {Promise<void>} The exact committed prefix and retry are checked.
+ */
+async function checkRetentionLateSQL(store, failedIndex) {
+  await withRetentionFolder(store, async folder => {
+    const originals = addRetentionMessages(folder);
+    setLocalRetention(folder, true);
+    const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const connection = core.connectionForTests;
+    let faults = 0;
+    connection.createFunction("retention_row_fault", 0, {
+      onFunctionCall() {
+        faults++;
+        return 0;
+      },
+    });
+    try {
+      connection.executeSimpleSQL(
+        "CREATE TEMP TRIGGER retention_row_fault BEFORE DELETE ON main.messages " +
+          `WHEN OLD.id = ${originals[failedIndex].key} BEGIN ` +
+          "SELECT retention_row_fault(); " +
+          "SELECT RAISE(ABORT, 'Selected retention member failed'); END"
+      );
+      Assert.throws(
+        () => folder.updateFolder(null),
+        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+      );
+      Assert.equal(faults, 1, "The selected row actually reached SQL DELETE");
+      assertRetentionMessages(folder, originals.slice(failedIndex));
+      Assert.equal(folder.getTotalMessages(false), 3 - failedIndex);
+      Assert.throws(
+        () => folder.msgStore.getNewMsgOutputStream(folder),
+        error => error.result == Cr.NS_ERROR_IN_PROGRESS,
+        "Pending custody prevents a new body from reusing physical storage"
+      );
+      Assert.throws(
+        () =>
+          folder.msgStore.asyncScan(
+            folder,
+            new PromiseTestUtils.PromiseStoreScanListener()
+          ),
+        error => error.result == Cr.NS_ERROR_IN_PROGRESS,
+        "A scan cannot bypass pending native cleanup"
+      );
+    } finally {
+      connection.executeSimpleSQL(
+        "DROP TRIGGER IF EXISTS temp.retention_row_fault"
+      );
+      connection.removeFunction("retention_row_fault");
+    }
+    folder.updateFolder(null);
+    assertRetentionMessages(folder, originals.slice(2));
+    Assert.equal(folder.getTotalMessages(false), 1);
+    folder.updateFolder(null);
+    assertRetentionMessages(folder, originals.slice(2));
+    const pending = PathUtils.join(
+      do_get_profile().path,
+      "panorama-purge",
+      core.sourceId,
+      String(folder.id)
+    );
+    Assert.ok(
+      !(await IOUtils.exists(pending)),
+      "Successful recovery released custody"
+    );
+  });
+}
+
+/**
+ * Recover a failed purge after ordinary user flags change on its live member.
+ *
+ * @param {string} store - Native provider.
+ * @returns {Promise<void>} Source custody, completion, later writes and retry settle.
+ */
+async function checkRetentionChangedFlags(store) {
+  await withRetentionFolder(store, async folder => {
+    const originals = addRetentionMessages(folder);
+    const settings = folder.retentionSettings;
+    settings.useServerDefaults = false;
+    settings.retainByPreference = Ci.nsIMsgRetentionSettings.nsMsgRetainAll;
+    folder.retentionSettings = settings;
+    const survivor = folder.msgDatabase.getMsgHdrForKey(originals[1].key);
+    folder.markMessagesRead([survivor], false);
+    originals[1].flags = survivor.flags;
+    const starts = [];
+    const stops = [];
+    const listener = {
+      onStartCopy() {
+        starts.push(true);
+      },
+      onStopCopy(status) {
+        stops.push(status);
+      },
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+    };
+    const holder = localAccountUtils.rootFolder;
+    folder.acquireSemaphore(holder, "test_retention_busy");
+    try {
+      Assert.throws(
+        () =>
+          folder.deleteMessages([survivor], null, true, false, listener, false),
+        error => error.result == Cr.NS_MSG_FOLDER_BUSY
+      );
+      Assert.deepEqual(starts, []);
+      Assert.deepEqual(stops, [Cr.NS_MSG_FOLDER_BUSY]);
+      assertRetentionMessages(folder, originals);
+    } finally {
+      folder.releaseSemaphore(holder, "test_retention_busy");
+    }
+    const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const pending = PathUtils.join(
+      do_get_profile().path,
+      "panorama-purge",
+      core.sourceId,
+      String(folder.id)
+    );
+    const connection = core.connectionForTests;
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER retention_changed_flags BEFORE DELETE ON main.messages " +
+        `WHEN OLD.id = ${survivor.messageKey} BEGIN ` +
+        "SELECT RAISE(ABORT, 'Later purge member failed'); END"
+    );
+    try {
+      Assert.throws(
+        () =>
+          folder.deleteMessages(
+            originals
+              .slice(0, 2)
+              .map(m => folder.msgDatabase.getMsgHdrForKey(m.key)),
+            null,
+            true,
+            false,
+            listener,
+            false
+          ),
+        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+      );
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER temp.retention_changed_flags");
+    }
+    Assert.deepEqual(starts, [true]);
+    Assert.deepEqual(stops, [
+      Cr.NS_MSG_FOLDER_BUSY,
+      Cr.NS_ERROR_STORAGE_CONSTRAINT,
+    ]);
+    assertRetentionMessages(folder, originals.slice(1));
+    Assert.ok(await IOUtils.exists(pending));
+    Assert.throws(
+      () => folder.markMessagesRead([survivor], true),
+      error => error.result == Cr.NS_ERROR_IN_PROGRESS
+    );
+    Assert.throws(
+      () => folder.markMessagesFlagged([survivor], true),
+      error => error.result == Cr.NS_ERROR_IN_PROGRESS
+    );
+    Assert.ok(survivor.flags & Ci.nsMsgMessageFlags.Read);
+    Assert.ok(survivor.flags & Ci.nsMsgMessageFlags.Marked);
+    originals[1].flags = survivor.flags;
+    folder.updateFolder(null);
+    Assert.ok(!(await IOUtils.exists(pending)));
+    assertRetentionMessages(folder, originals.slice(1));
+    Assert.equal(stops.length, 2, "Recovery did not repeat either completion");
+    folder.markMessagesRead([survivor], false);
+    folder.markMessagesFlagged([survivor], false);
+    Assert.ok(!(survivor.flags & Ci.nsMsgMessageFlags.Read));
+    Assert.ok(!(survivor.flags & Ci.nsMsgMessageFlags.Marked));
+    originals[1].flags = survivor.flags;
+    assertRetentionMessages(folder, originals.slice(1));
+    const delivered = folder.addMessage(originals[0].raw);
+    Assert.notEqual(delivered.messageKey, originals[0].key);
+    Assert.equal(
+      mailTestUtils.loadMessageToString(folder, delivered),
+      originals[0].raw
+    );
+    Assert.equal(folder.getTotalMessages(false), 3);
+    folder.deleteMessages([survivor], null, true, false, listener, false);
+    Assert.deepEqual(starts, [true, true]);
+    Assert.deepEqual(stops, [
+      Cr.NS_MSG_FOLDER_BUSY,
+      Cr.NS_ERROR_STORAGE_CONSTRAINT,
+      Cr.NS_OK,
+    ]);
+    Assert.deepEqual(folder.msgDatabase.listAllKeys(), [
+      originals[2].key,
+      delivered.messageKey,
+    ]);
+    Assert.equal(folder.getTotalMessages(false), 2);
+    Assert.equal(
+      mailTestUtils.loadMessageToString(
+        folder,
+        folder.msgDatabase.getMsgHdrForKey(originals[2].key)
+      ),
+      originals[2].raw
+    );
+    Assert.ok(!(await IOUtils.exists(pending)));
+  });
+}
+
+/**
+ * Fail physical cleanup only after the actual metadata DELETE has executed.
+ * A synchronous SQL test function is needed to reach this exact boundary;
+ * ordinary fixture setup would be rejected by the whole-input preflight.
+ *
+ * @param {string} store - Native provider.
+ * @param {boolean} custodyFault - Fail recovery-file cleanup, not provider cleanup.
+ * @returns {Promise<void>} Committed metadata, retained bytes and retry are checked.
+ */
+async function checkRetentionCleanupFailure(store, custodyFault) {
+  await withRetentionFolder(store, async folder => {
+    const originals = addRetentionMessages(folder);
+    const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const connection = core.connectionForTests;
+    const pending = PathUtils.join(
+      do_get_profile().path,
+      "panorama-purge",
+      core.sourceId,
+      String(folder.id)
+    );
+    const blocked = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+    let blockedPath;
+    if (custodyFault) {
+      blockedPath = PathUtils.join(pending, "occupied");
+    } else if (store == "maildir") {
+      blockedPath = PathUtils.join(
+        folder.filePath.path,
+        "cur",
+        originals[0].token
+      );
+    } else {
+      blockedPath = folder.filePath.path;
+    }
+    blocked.initWithPath(blockedPath);
+    const heldName = blocked.leafName + ".retention-held";
+    const held = blocked.clone();
+    held.leafName = heldName;
+    const sentinel = blocked.clone();
+    sentinel.append("occupied");
+    let faults = 0;
+    connection.createFunction("retention_cleanup_fault", 0, {
+      onFunctionCall() {
+        faults++;
+        if (custodyFault) {
+          // An unexpected owned-directory entry prevents final custody cleanup
+          // after the provider and metadata have both settled.
+          blocked.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+          return 0;
+        }
+        // Preserve the real body, then force a genuine Remove(false)/open error.
+        blocked.moveTo(null, heldName);
+        blocked.leafName = heldName.slice(0, -".retention-held".length);
+        blocked.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+        sentinel.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+        return 0;
+      },
+    });
+    const starts = [];
+    const stops = [];
+    const listener = {
+      onStartCopy() {
+        starts.push(true);
+        Assert.throws(
+          () =>
+            folder.deleteMessages(
+              [folder.msgDatabase.getMsgHdrForKey(originals[1].key)],
+              null,
+              true,
+              false,
+              null,
+              false
+            ),
+          error => error.result == Cr.NS_ERROR_IN_PROGRESS,
+          "The accepted deletion rejects synchronous reentry"
+        );
+      },
+      onStopCopy(status) {
+        stops.push(status);
+      },
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+    };
+    try {
+      connection.executeSimpleSQL(
+        "CREATE TEMP TRIGGER retention_cleanup_fault AFTER DELETE ON main.messages " +
+          `WHEN OLD.id = ${originals[0].key} BEGIN SELECT retention_cleanup_fault(); END`
+      );
+      let status;
+      try {
+        folder.deleteMessages(
+          [folder.msgDatabase.getMsgHdrForKey(originals[0].key)],
+          null,
+          true,
+          false,
+          listener,
+          false
+        );
+        Assert.ok(false, "The real cleanup fault must fail the operation");
+      } catch (error) {
+        status = error.result;
+        Assert.ok(
+          !Components.isSuccessCode(status),
+          "The original cleanup returned a failure"
+        );
+      }
+      Assert.equal(
+        faults,
+        1,
+        "The physical fault followed the selected DELETE"
+      );
+      Assert.deepEqual(starts, [true]);
+      Assert.deepEqual(
+        stops,
+        [status],
+        "Original completion carries its first error once"
+      );
+      Assert.deepEqual(
+        folder.msgDatabase.listAllKeys(),
+        originals.slice(1).map(m => m.key)
+      );
+      Assert.equal(
+        folder.getTotalMessages(false),
+        2,
+        "Metadata/count removal committed once"
+      );
+      Assert.ok(
+        await IOUtils.exists(pending),
+        "Unresolved physical custody remains explicit"
+      );
+      if (!custodyFault && store == "maildir") {
+        Assert.equal(await IOUtils.readUTF8(held.path), originals[0].raw);
+      }
+    } finally {
+      connection.executeSimpleSQL(
+        "DROP TRIGGER IF EXISTS temp.retention_cleanup_fault"
+      );
+      connection.removeFunction("retention_cleanup_fault");
+      if (custodyFault && blocked.exists()) {
+        blocked.remove(false);
+      } else if (held.exists()) {
+        sentinel.remove(false);
+        blocked.remove(false);
+        held.moveTo(null, blocked.leafName);
+      }
+    }
+    assertRetentionMessages(folder, originals.slice(1));
+    Assert.throws(
+      () => folder.msgStore.getNewMsgOutputStream(folder),
+      error => error.result == Cr.NS_ERROR_IN_PROGRESS
+    );
+    folder.updateFolder(null);
+    assertRetentionMessages(folder, originals.slice(1));
+    Assert.equal(folder.getTotalMessages(false), 2);
+    Assert.ok(!(await IOUtils.exists(pending)));
+    Assert.deepEqual(
+      stops.length,
+      1,
+      "Recovery never replays the original listener"
+    );
+    // Once cleanup is known to have settled, a normal later write is usable.
+    const stream = folder.msgStore.getNewMsgOutputStream(folder);
+    folder.msgStore.discardNewMessage(folder, stream);
+  });
+}
+
+/**
+ * Refuse a repeated physical member before any row, provider or callback mutation.
+ *
+ * @param {string} store - Native provider.
+ * @returns {Promise<void>} The complete source and a later normal purge are checked.
+ */
+async function checkRetentionDuplicate(store) {
+  await withRetentionFolder(store, async folder => {
+    const originals = addRetentionMessages(folder);
+    const header = folder.msgDatabase.getMsgHdrForKey(originals[0].key);
+    Assert.throws(
+      () =>
+        folder.deleteMessages([header, header], null, true, false, null, false),
+      error => error.result == Cr.NS_ERROR_ILLEGAL_VALUE
+    );
+    assertRetentionMessages(folder, originals);
+    setLocalRetention(folder, false);
+    folder.updateFolder(null);
+    assertRetentionMessages(folder, originals.slice(1));
+  });
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_localRetentionChangedFlagsMbox() {
+    await checkRetentionChangedFlags("mbox");
+  });
+  add_task(async function test_localRetentionChangedFlagsMaildir() {
+    await checkRetentionChangedFlags("maildir");
+  });
+  add_task(async function test_localRetentionFirstSQLFailureMbox() {
+    await checkRetentionLateSQL("mbox", 0);
+  });
+  add_task(async function test_localRetentionLaterSQLFailureMbox() {
+    await checkRetentionLateSQL("mbox", 1);
+  });
+  add_task(async function test_localRetentionFirstSQLFailureMaildir() {
+    await checkRetentionLateSQL("maildir", 0);
+  });
+  add_task(async function test_localRetentionLaterSQLFailureMaildir() {
+    await checkRetentionLateSQL("maildir", 1);
+  });
+  add_task(async function test_localRetentionProviderCleanupMbox() {
+    await checkRetentionCleanupFailure("mbox", false);
+  });
+  add_task(async function test_localRetentionProviderCleanupMaildir() {
+    await checkRetentionCleanupFailure("maildir", false);
+  });
+  add_task(async function test_localRetentionCustodyCleanupMbox() {
+    await checkRetentionCleanupFailure("mbox", true);
+  });
+  add_task(async function test_localRetentionCustodyCleanupMaildir() {
+    await checkRetentionCleanupFailure("maildir", true);
+  });
+  add_task(async function test_localRetentionDuplicateMbox() {
+    await checkRetentionDuplicate("mbox");
+  });
+  add_task(async function test_localRetentionDuplicateMaildir() {
+    await checkRetentionDuplicate("maildir");
+  });
+}
+
+/**
+ * Exercise the persisted committed prefix across two ordinary process lifetimes.
+ *
+ * @param {string} store - Native provider in both processes.
+ * @returns {Promise<void>} Writer and recovery reader have exited normally.
+ */
+async function checkRetentionProcessRestart(store) {
+  const { Subprocess } = ChromeUtils.importESModule(
+    "resource://gre/modules/Subprocess.sys.mjs"
+  );
+  const resources = Services.io
+    .getProtocolHandler("resource")
+    .QueryInterface(Ci.nsIResProtocolHandler);
+  const profilePath = PathUtils.join(
+    do_get_profile().path,
+    "retention-restart-" + store
+  );
+  await IOUtils.makeDirectory(profilePath);
+  registerCleanupFunction(() =>
+    IOUtils.remove(profilePath, { recursive: true })
+  );
+  for (const stage of ["write", "read"]) {
+    const child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: [
+        "-g",
+        Services.dirsvc.get("GreD", Ci.nsIFile).path,
+        "-a",
+        Services.dirsvc.get("XCurProcD", Ci.nsIFile).path,
+        "-e",
+        `const retentionRestartInput = ${JSON.stringify({
+          stage,
+          store,
+          profilePath,
+          prefsPath: _PREFS_FILE,
+          testingCommon: resources.getSubstitution("testing-common").spec,
+        })};`,
+        "-f",
+        do_get_file("data/localRetentionRecovery.js").path,
+      ],
+      stderr: "stdout",
+    });
+    let output = "";
+    try {
+      for (let chunk; (chunk = await child.stdout.readString()); ) {
+        output += chunk;
+      }
+      const { exitCode } = await child.wait();
+      Assert.equal(exitCode, 0, `${store} ${stage}: ${JSON.stringify(output)}`);
+      Assert.ok(output.includes(`LOCAL-RETENTION-RESTART ${stage} PASS`));
+    } finally {
+      if (child.exitCode === null) {
+        await child.kill();
+      }
+    }
+  }
+}
+
+if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+  add_task(async function test_localRetentionProcessRestartMbox() {
+    await checkRetentionProcessRestart("mbox");
+  });
+  add_task(async function test_localRetentionProcessRestartMaildir() {
+    await checkRetentionProcessRestart("maildir");
   });
 }

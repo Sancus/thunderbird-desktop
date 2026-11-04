@@ -195,6 +195,13 @@ class nsMsgLocalMailFolder : public nsMsgDBFolder,
  protected:
   friend class LocalFolderCopy;
   friend class LocalMoveSourceListener;
+#ifdef MOZ_PANORAMA
+  nsresult DeleteNativePermanentMessages(
+      const nsTArray<RefPtr<nsIMsgDBHdr>>& headers, nsIMsgWindow* window,
+      nsIMsgCopyServiceListener* listener);
+  bool mNativePurging = false;
+#endif
+
   nsresult DeleteMessagesInternal(const nsTArray<RefPtr<nsIMsgDBHdr>>& messages,
                                   nsIMsgWindow* msgWindow, bool deleteStorage,
                                   bool isMove,

@@ -2130,3 +2130,103 @@ add_task(
     Assert.equal(tree.resets.length, 1);
   }
 );
+
+/**
+ * Initial physical New and later public words update each displayed member once.
+ */
+add_task(async function test_publicNewFlatUsesDisplayedState() {
+  const { MessageInjection } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageInjection.sys.mjs"
+  );
+  const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const injection = new MessageInjection({ mode: "local" });
+  const generator = new MessageGenerator();
+  const parent = generator.makeMessage({ subject: "projected-new-adapter" });
+  const child = generator.makeMessage({ inReplyTo: parent });
+  const folder = await injection.makeEmptyFolder();
+  const other = await injection.makeEmptyFolder();
+  const set = new SyntheticMessageSet([parent, child]);
+  const copies = new SyntheticMessageSet([parent, child]);
+  await injection.addSetsToFolders([folder], [set]);
+  await injection.addSetsToFolders([other], [copies]);
+  Assert.ok(database instanceof Ci.nsIDatabaseCore);
+  Assert.equal(
+    folder.server.getStringValue("storeContractID"),
+    "@mozilla.org/msgstore/berkeleystore;1"
+  );
+  const [root, reply] = set.msgHdrList;
+  const db = folder.msgDatabase;
+  root.flags = 0;
+  reply.flags = Ci.nsMsgMessageFlags.New | Ci.nsMsgMessageFlags.Marked;
+  db.addToNewList(root.messageKey);
+  const otherBefore = copies.msgHdrList.map(header => header.flags);
+  const folderId = folderDB.getFolderByPath(
+    `${folder.server.key}/${folder.name}`
+  );
+  Assert.greater(folderId, 0);
+  const rowChanges = [];
+  const statusTree = {
+    rowCountChanged(index, delta) {
+      rowChanges.push([index, delta]);
+    },
+    invalidateRow() {},
+    invalidateRange() {},
+    reset() {
+      Assert.ok(
+        false,
+        "A normal projected flag change does not reset the view"
+      );
+    },
+  };
+  const view = new LiveView();
+  view.initWithFolder(folderId);
+  const adapter = new LiveViewDataAdapter(view);
+  adapter.setTree(statusTree);
+  registerCleanupFunction(() => adapter.setTree(null));
+  await adapter.sortBy("date", "descending");
+  rowChanges.length = 0;
+
+  Assert.equal(adapter.rowCount, 2);
+  Assert.deepEqual(
+    listMessages(adapter)
+      .slice()
+      .sort((a, b) => a - b),
+    [root.messageKey, reply.messageKey].sort((a, b) => a - b)
+  );
+  let row = adapter._rowMap.find(item => item.message.id == root.messageKey);
+  Assert.equal(row.message.folderId, folderId);
+  Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.New);
+  db.markRead(root.messageKey, true, null);
+  row = adapter._rowMap.find(item => item.message.id == root.messageKey);
+  Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.Read);
+  db.addToNewList(root.messageKey);
+  Assert.equal(
+    row.message.flags,
+    Ci.nsMsgMessageFlags.Read,
+    "A silent addition does not fabricate a row callback"
+  );
+  db.markRead(root.messageKey, false, null);
+  row = adapter._rowMap.find(item => item.message.id == root.messageKey);
+  Assert.equal(row.message.flags, 0);
+  reply.flags = Ci.nsMsgMessageFlags.Marked;
+  row = adapter._rowMap.find(item => item.message.id == reply.messageKey);
+  Assert.equal(row.message.flags, Ci.nsMsgMessageFlags.Marked);
+  Assert.deepEqual(
+    listMessages(adapter)
+      .slice()
+      .sort((a, b) => a - b),
+    [root.messageKey, reply.messageKey].sort((a, b) => a - b)
+  );
+
+  Assert.deepEqual(rowChanges, [], "Flag changes preserve physical membership");
+  Assert.deepEqual(
+    copies.msgHdrList.map(header => header.flags),
+    otherBefore,
+    "The outside equal-ID physical copies are unchanged"
+  );
+  adapter.setTree(null);
+  db.markRead(root.messageKey, true, null);
+  Assert.deepEqual(rowChanges, [], "Detached observers do not reach the tree");
+});

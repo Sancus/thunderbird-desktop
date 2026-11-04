@@ -5,6 +5,7 @@
 #include "nsMsgDBView.h"
 
 #include <algorithm>
+#include <utility>
 
 #include "MailNewsTypes2.h"
 #include "mozilla/ClearOnShutdown.h"
@@ -44,6 +45,7 @@
 #include "nsMsgUtils.h"
 #include "nsServiceManagerUtils.h"
 #include "nsTArray.h"
+#include "nsTHashMap.h"
 #include "nsTreeColumns.h"
 #include "prmem.h"
 
@@ -2493,7 +2495,8 @@ nsMsgDBView::ApplyCommandToIndices(nsMsgViewCommandTypeValue command,
   // for mark thread read.
   if (command == nsMsgViewCommandType::markThreadRead) {
     for (nsMsgViewIndex viewIndex : selection) {
-      SetThreadOfMsgReadByIndex(viewIndex, messageKeys, true);
+      rv = SetThreadOfMsgReadByIndex(viewIndex, messageKeys, true);
+      if (NS_FAILED(rv)) break;
     }
   } else {
     // Turn the selection into an array of msg hdrs. This may include messages
@@ -2547,7 +2550,7 @@ nsMsgDBView::ApplyCommandToIndices(nsMsgViewCommandTypeValue command,
       }
       case nsMsgViewCommandType::markMessagesRead:
       case nsMsgViewCommandType::markMessagesUnread:
-        folder->MarkMessagesRead(
+        rv = folder->MarkMessagesRead(
             messages, command == nsMsgViewCommandType::markMessagesRead);
         break;
       case nsMsgViewCommandType::unflagMessages:
@@ -5204,7 +5207,9 @@ nsresult nsMsgDBView::MarkThreadOfMsgRead(nsMsgKey msgId,
   rv = threadHdr->GetChildHdrAt(0, getter_AddRefs(firstHdr));
   NS_ENSURE_SUCCESS(rv, rv);
   nsMsgKey firstHdrId;
-  firstHdr->GetMessageKey(&firstHdrId);
+  NS_ENSURE_TRUE(firstHdr, NS_MSG_MESSAGE_NOT_FOUND);
+  rv = firstHdr->GetMessageKey(&firstHdrId);
+  NS_ENSURE_SUCCESS(rv, rv);
   if (msgId != firstHdrId)
     threadIndex = GetIndexOfFirstDisplayedKeyInThread(threadHdr);
   else
@@ -5218,31 +5223,40 @@ nsresult nsMsgDBView::MarkThreadRead(nsIMsgThread* threadHdr,
                                      nsTArray<nsMsgKey>& idsMarkedRead,
                                      bool bRead) {
   uint32_t numChildren;
-  threadHdr->GetNumChildren(&numChildren);
-  idsMarkedRead.SetCapacity(numChildren);
-  for (int32_t childIndex = 0; childIndex < (int32_t)numChildren;
-       childIndex++) {
-    nsCOMPtr<nsIMsgDBHdr> msgHdr;
-    threadHdr->GetChildHdrAt(childIndex, getter_AddRefs(msgHdr));
-    NS_ASSERTION(msgHdr, "msgHdr is null");
-    if (!msgHdr) continue;
-
-    bool isRead;
-    nsMsgKey msgKey;
-    msgHdr->GetMessageKey(&msgKey);
+  nsresult rv = threadHdr->GetNumChildren(&numChildren);
+  NS_ENSURE_SUCCESS(rv, rv);
+  struct Member {
     nsCOMPtr<nsIMsgDatabase> db;
-    nsresult rv = GetDBForHeader(msgHdr, getter_AddRefs(db));
+    nsMsgKey key;
+  };
+  nsTArray<Member> members;
+  members.SetCapacity(numChildren);
+  // Capture physical membership before a committed write can reenter the view.
+  for (uint32_t childIndex = 0; childIndex < numChildren; ++childIndex) {
+    nsCOMPtr<nsIMsgDBHdr> msgHdr;
+    rv = threadHdr->GetChildHdrAt(childIndex, getter_AddRefs(msgHdr));
     NS_ENSURE_SUCCESS(rv, rv);
-    db->IsRead(msgKey, &isRead);
-
+    NS_ENSURE_TRUE(msgHdr, NS_MSG_MESSAGE_NOT_FOUND);
+    Member member;
+    rv = msgHdr->GetMessageKey(&member.key);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = GetDBForHeader(msgHdr, getter_AddRefs(member.db));
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(member.db, NS_ERROR_NOT_AVAILABLE);
+    members.AppendElement(std::move(member));
+  }
+  idsMarkedRead.SetCapacity(idsMarkedRead.Length() + numChildren);
+  for (const auto& member : members) {
+    bool isRead;
+    rv = member.db->IsRead(member.key, &isRead);
+    NS_ENSURE_SUCCESS(rv, rv);
     if (isRead != bRead) {
-      // MarkRead will change the unread count on the thread.
-      db->MarkRead(msgKey, bRead, nullptr);
-      // Insert at the front. Should we insert at the end?
-      idsMarkedRead.InsertElementAt(0, msgKey);
+      rv = member.db->MarkRead(member.key, bRead, nullptr);
+      NS_ENSURE_SUCCESS(rv, rv);
+      // Earlier successful writes remain committed if a later member fails.
+      idsMarkedRead.InsertElementAt(0, member.key);
     }
   }
-
   return NS_OK;
 }
 
@@ -5442,8 +5456,9 @@ nsresult nsMsgDBView::NavigateFromPos(nsMsgNavigationTypeValue motion,
       break;
     case nsMsgNavigationType::nextUnreadThread:
       if (startIndex != nsMsgViewIndex_None) {
-        ApplyCommandToIndices(nsMsgViewCommandType::markThreadRead,
-                              {startIndex});
+        nsresult rv = ApplyCommandToIndices(
+            nsMsgViewCommandType::markThreadRead, {startIndex});
+        NS_ENSURE_SUCCESS(rv, rv);
       }
 
       return NavigateFromPos(nsMsgNavigationType::nextUnreadMessage, startIndex,
@@ -5452,7 +5467,8 @@ nsresult nsMsgDBView::NavigateFromPos(nsMsgNavigationTypeValue motion,
       bool resultKilled;
       nsMsgViewIndexArray selection;
       GetIndicesForSelection(selection);
-      ToggleIgnored(selection, &threadIndex, &resultKilled);
+      nsresult rv = ToggleIgnored(selection, &threadIndex, &resultKilled);
+      NS_ENSURE_SUCCESS(rv, rv);
       if (resultKilled) {
         return NavigateFromPos(nsMsgNavigationType::nextUnreadThread,
                                threadIndex, pResultKey, pResultIndex,
@@ -5467,7 +5483,8 @@ nsresult nsMsgDBView::NavigateFromPos(nsMsgNavigationTypeValue motion,
       bool resultKilled;
       nsMsgViewIndexArray selection;
       GetIndicesForSelection(selection);
-      ToggleMessageKilled(selection, &threadIndex, &resultKilled);
+      nsresult rv = ToggleMessageKilled(selection, &threadIndex, &resultKilled);
+      NS_ENSURE_SUCCESS(rv, rv);
       if (resultKilled) {
         return NavigateFromPos(nsMsgNavigationType::nextUnreadMessage,
                                threadIndex, pResultKey, pResultIndex,
@@ -5595,35 +5612,32 @@ nsresult nsMsgDBView::SetExtraFlag(nsMsgViewIndex index, uint32_t extraflag) {
 nsresult nsMsgDBView::ToggleIgnored(nsTArray<nsMsgViewIndex> const& selection,
                                     nsMsgViewIndex* resultIndex,
                                     bool* resultToggleState) {
+  NS_ENSURE_TRUE(!selection.IsEmpty(), NS_MSG_INVALID_DBVIEW_INDEX);
   nsCOMPtr<nsIMsgThread> thread;
-
-  // Ignored state is toggled based on the first selected thread.
-  nsMsgViewIndex threadIndex =
-      GetThreadFromMsgIndex(selection[0], getter_AddRefs(thread));
-  NS_ENSURE_STATE(thread);
+  nsresult rv = GetThreadContainingIndex(selection[0], getter_AddRefs(thread));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(thread, NS_MSG_MESSAGE_NOT_FOUND);
   uint32_t threadFlags;
-  thread->GetFlags(&threadFlags);
-  uint32_t ignored = threadFlags & nsMsgMessageFlags::Ignored;
-
-  // Process threads in reverse order.
-  // Otherwise collapsing the threads will invalidate the indices.
-  threadIndex = nsMsgViewIndex_None;
-  uint32_t numIndices = selection.Length();
-  while (numIndices) {
-    numIndices--;
-    if (selection[numIndices] < threadIndex) {
-      threadIndex =
-          GetThreadFromMsgIndex(selection[numIndices], getter_AddRefs(thread));
-      thread->GetFlags(&threadFlags);
-      if ((threadFlags & nsMsgMessageFlags::Ignored) == ignored)
-        SetThreadIgnored(thread, threadIndex, !ignored);
+  rv = thread->GetFlags(&threadFlags);
+  NS_ENSURE_SUCCESS(rv, rv);
+  bool ignored = threadFlags & nsMsgMessageFlags::Ignored;
+  nsMsgViewIndex threadIndex = nsMsgViewIndex_None;
+  for (uint32_t i = selection.Length(); i; --i) {
+    if (selection[i - 1] < threadIndex) {
+      rv = GetThreadContainingIndex(selection[i - 1], getter_AddRefs(thread));
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(thread, NS_MSG_MESSAGE_NOT_FOUND);
+      threadIndex = GetIndexOfFirstDisplayedKeyInThread(thread);
+      rv = thread->GetFlags(&threadFlags);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (bool(threadFlags & nsMsgMessageFlags::Ignored) == ignored) {
+        rv = SetThreadIgnored(thread, threadIndex, !ignored);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
     }
   }
-
   if (resultIndex) *resultIndex = threadIndex;
-
   if (resultToggleState) *resultToggleState = !ignored;
-
   return NS_OK;
 }
 
@@ -5638,7 +5652,8 @@ nsresult nsMsgDBView::ToggleMessageKilled(
   NS_ENSURE_SUCCESS(rv, rv);
 
   uint32_t msgFlags;
-  header->GetFlags(&msgFlags);
+  rv = header->GetFlags(&msgFlags);
+  NS_ENSURE_SUCCESS(rv, rv);
   uint32_t ignored = msgFlags & nsMsgMessageFlags::Ignored;
 
   // Process messages in reverse order.
@@ -5651,9 +5666,12 @@ nsresult nsMsgDBView::ToggleMessageKilled(
       msgIndex = selection[numIndices];
       rv = GetMsgHdrForViewIndex(msgIndex, getter_AddRefs(header));
       NS_ENSURE_SUCCESS(rv, rv);
-      header->GetFlags(&msgFlags);
-      if ((msgFlags & nsMsgMessageFlags::Ignored) == ignored)
-        SetSubthreadKilled(header, msgIndex, !ignored);
+      rv = header->GetFlags(&msgFlags);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if ((msgFlags & nsMsgMessageFlags::Ignored) == ignored) {
+        rv = SetSubthreadKilled(header, msgIndex, !ignored);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
     }
   }
 
@@ -5685,31 +5703,30 @@ nsMsgViewIndex nsMsgDBView::GetThreadFromMsgIndex(nsMsgViewIndex index,
 }
 
 nsresult nsMsgDBView::ToggleWatched(nsTArray<nsMsgViewIndex> const& selection) {
-  MOZ_ASSERT(!selection.IsEmpty());
+  NS_ENSURE_TRUE(!selection.IsEmpty(), NS_MSG_INVALID_DBVIEW_INDEX);
   nsCOMPtr<nsIMsgThread> thread;
-
-  // Watched state is toggled based on the first selected thread.
-  nsMsgViewIndex threadIndex =
-      GetThreadFromMsgIndex(selection[0], getter_AddRefs(thread));
-  NS_ENSURE_STATE(thread);
+  nsresult rv = GetThreadContainingIndex(selection[0], getter_AddRefs(thread));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(thread, NS_MSG_MESSAGE_NOT_FOUND);
   uint32_t threadFlags;
-  thread->GetFlags(&threadFlags);
-  uint32_t watched = threadFlags & nsMsgMessageFlags::Watched;
-
-  // Process threads in reverse order for consistency with ToggleIgnored.
-  threadIndex = nsMsgViewIndex_None;
-  uint32_t numIndices = selection.Length();
-  while (numIndices) {
-    numIndices--;
-    if (selection[numIndices] < threadIndex) {
-      threadIndex =
-          GetThreadFromMsgIndex(selection[numIndices], getter_AddRefs(thread));
-      thread->GetFlags(&threadFlags);
-      if ((threadFlags & nsMsgMessageFlags::Watched) == watched)
-        SetThreadWatched(thread, threadIndex, !watched);
+  rv = thread->GetFlags(&threadFlags);
+  NS_ENSURE_SUCCESS(rv, rv);
+  bool watched = threadFlags & nsMsgMessageFlags::Watched;
+  nsMsgViewIndex threadIndex = nsMsgViewIndex_None;
+  for (uint32_t i = selection.Length(); i; --i) {
+    if (selection[i - 1] < threadIndex) {
+      rv = GetThreadContainingIndex(selection[i - 1], getter_AddRefs(thread));
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(thread, NS_MSG_MESSAGE_NOT_FOUND);
+      threadIndex = GetIndexOfFirstDisplayedKeyInThread(thread);
+      rv = thread->GetFlags(&threadFlags);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (bool(threadFlags & nsMsgMessageFlags::Watched) == watched) {
+        rv = SetThreadWatched(thread, threadIndex, !watched);
+        NS_ENSURE_SUCCESS(rv, rv);
+      }
     }
   }
-
   return NS_OK;
 }
 
@@ -5717,74 +5734,101 @@ nsresult nsMsgDBView::SetThreadIgnored(nsIMsgThread* thread,
                                        nsMsgViewIndex threadIndex,
                                        bool ignored) {
   if (!IsValidIndex(threadIndex)) return NS_MSG_INVALID_DBVIEW_INDEX;
-
-  NoteChange(threadIndex, 1, nsMsgViewNotificationCode::changed);
+  nsCOMPtr<nsIMsgDatabase> db = m_db;
+  NS_ENSURE_TRUE(db, NS_ERROR_FAILURE);
+  nsMsgKey key = m_keys[threadIndex];
+  nsresult rv;
   if (ignored) {
     nsTArray<nsMsgKey> idsMarkedRead;
-    MarkThreadRead(thread, threadIndex, idsMarkedRead, true);
-    CollapseByIndex(threadIndex, nullptr);
+    rv = MarkThreadRead(thread, threadIndex, idsMarkedRead, true);
+    NS_ENSURE_SUCCESS(rv, rv);
   }
-
-  if (!m_db) return NS_ERROR_FAILURE;
-
-  return m_db->MarkThreadIgnored(thread, m_keys[threadIndex], ignored, this);
+  rv = db->MarkThreadIgnored(thread, key, ignored, this);
+  NS_ENSURE_SUCCESS(rv, rv);
+  threadIndex = FindKey(key, true);
+  if (IsValidIndex(threadIndex)) {
+    if (ignored) {
+      rv = CollapseByIndex(threadIndex, nullptr);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+    NoteChange(threadIndex, 1, nsMsgViewNotificationCode::changed);
+  }
+  return NS_OK;
 }
 
 nsresult nsMsgDBView::SetSubthreadKilled(nsIMsgDBHdr* header,
                                          nsMsgViewIndex msgIndex,
                                          bool ignored) {
   if (!IsValidIndex(msgIndex)) return NS_MSG_INVALID_DBVIEW_INDEX;
-
-  NoteChange(msgIndex, 1, nsMsgViewNotificationCode::changed);
-
-  if (!m_db) return NS_ERROR_FAILURE;
-
+  nsCOMPtr<nsIMsgDatabase> db = m_db;
+  NS_ENSURE_TRUE(db, NS_ERROR_FAILURE);
   nsMsgKey headKey;
-  header->GetMessageKey(&headKey);
-
-  nsresult rv = m_db->MarkKilled(headKey, ignored, this);
+  nsresult rv = header->GetMessageKey(&headKey);
   NS_ENSURE_SUCCESS(rv, rv);
-
+  nsTArray<nsMsgKey> descendants;
   if (ignored) {
     nsCOMPtr<nsIMsgThread> thread;
-    nsresult rv;
     rv = GetThreadContainingMsgHdr(header, getter_AddRefs(thread));
-    // So we didn't mark threads read.
-    if (NS_FAILED(rv)) return NS_OK;
-
-    uint32_t children, current;
-    thread->GetNumChildren(&children);
-
-    for (current = 0; current < children; current++) {
-      nsMsgKey newKey;
-      thread->GetChildKeyAt(current, &newKey);
-      if (newKey == headKey) break;
+    NS_ENSURE_SUCCESS(rv, rv);
+    NS_ENSURE_TRUE(thread, NS_MSG_MESSAGE_NOT_FOUND);
+    uint32_t children;
+    rv = thread->GetNumChildren(&children);
+    NS_ENSURE_SUCCESS(rv, rv);
+    nsTHashMap<nsMsgKey, nsMsgKey> parents;
+    nsTArray<nsMsgKey> members;
+    for (uint32_t i = 0; i < children; ++i) {
+      nsCOMPtr<nsIMsgDBHdr> child;
+      rv = thread->GetChildHdrAt(i, getter_AddRefs(child));
+      NS_ENSURE_SUCCESS(rv, rv);
+      NS_ENSURE_TRUE(child, NS_MSG_MESSAGE_NOT_FOUND);
+      nsMsgKey key, parent;
+      rv = child->GetMessageKey(&key);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = child->GetThreadParent(&parent);
+      NS_ENSURE_SUCCESS(rv, rv);
+      members.AppendElement(key);
+      parents.InsertOrUpdate(key, parent);
     }
-
-    // Process all messages, starting with this message.
-    for (; current < children; current++) {
-      nsCOMPtr<nsIMsgDBHdr> nextHdr;
-      bool isKilled;
-
-      thread->GetChildHdrAt(current, getter_AddRefs(nextHdr));
-      nextHdr->GetIsKilled(&isKilled);
-
-      // Ideally, the messages should stop processing here.
-      // However, the children are ordered not by thread...
-      if (isKilled) nextHdr->MarkRead(true);
+    NS_ENSURE_TRUE(parents.Contains(headKey), NS_MSG_MESSAGE_NOT_FOUND);
+    // Select this physical branch before callbacks can change thread
+    // membership.
+    for (nsMsgKey member : members) {
+      nsMsgKey key = member;
+      uint32_t depth = 0;
+      while (key && key != nsMsgKey_None) {
+        if (key == headKey) {
+          descendants.AppendElement(member);
+          break;
+        }
+        NS_ENSURE_TRUE(depth++ < children, NS_ERROR_FILE_CORRUPTED);
+        if (!parents.Get(key, &key)) break;
+      }
     }
   }
-
+  rv = db->MarkKilled(headKey, ignored, this);
+  NS_ENSURE_SUCCESS(rv, rv);
+  for (nsMsgKey key : descendants) {
+    rv = db->MarkRead(key, true, nullptr);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  msgIndex = FindKey(headKey, true);
+  if (IsValidIndex(msgIndex))
+    NoteChange(msgIndex, 1, nsMsgViewNotificationCode::changed);
   return NS_OK;
 }
 
 nsresult nsMsgDBView::SetThreadWatched(nsIMsgThread* thread,
                                        nsMsgViewIndex index, bool watched) {
   if (!IsValidIndex(index)) return NS_MSG_INVALID_DBVIEW_INDEX;
-
-  nsresult rv = m_db->MarkThreadWatched(thread, m_keys[index], watched, this);
-  NoteChange(index, 1, nsMsgViewNotificationCode::changed);
-  return rv;
+  nsCOMPtr<nsIMsgDatabase> db = m_db;
+  NS_ENSURE_TRUE(db, NS_ERROR_FAILURE);
+  nsMsgKey key = m_keys[index];
+  nsresult rv = db->MarkThreadWatched(thread, key, watched, this);
+  NS_ENSURE_SUCCESS(rv, rv);
+  index = FindKey(key, true);
+  if (IsValidIndex(index))
+    NoteChange(index, 1, nsMsgViewNotificationCode::changed);
+  return NS_OK;
 }
 
 NS_IMETHODIMP

@@ -10,6 +10,7 @@
 
 #include "DatabaseCore.h"
 #include "DetachedMsgHdr.h"
+#include "PerFolderDatabase.h"
 #include "js/Array.h"
 #include "js/CallAndConstruct.h"
 #include "js/Date.h"
@@ -63,8 +64,8 @@ class LiveViewBatchCapability final {
  public:
   NS_INLINE_DECL_REFCOUNTING(LiveViewBatchCapability)
   LiveViewBatchCapability(JSContext* cx, JS::Handle<JSObject*> receiver,
-                          JS::Handle<JSObject*> owner, JS::Handle<JS::Value> invalidate,
-                          uint64_t generation)
+                          JS::Handle<JSObject*> owner,
+                          JS::Handle<JS::Value> invalidate, uint64_t generation)
       : object(cx, receiver),
         owner(cx, owner),
         invalidator(cx, invalidate),
@@ -119,12 +120,274 @@ class PreparedLiveViewThreadBatch final : public nsISupports {
 };
 NS_IMPL_ISUPPORTS(PreparedLiveViewThreadBatch, nsISupports)
 
+// This consumes only the existing public per-folder status notifications. It
+// does not own the facade or alter the native captured-message contract.
+class LiveViewFolderStatusListener final : public nsIDBChangeListener {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIDBCHANGELISTENER
+  LiveViewFolderStatusListener(LiveView* owner, PerFolderDatabase* db,
+                               uint64_t folder, uint64_t attachment)
+      : mOwner(owner), mDB(db), mFolder(folder), mAttachment(attachment) {}
+  void Detach() {
+    mOwner = nullptr;
+    RefPtr<PerFolderDatabase> db = mDB.get();
+    mDB = nullptr;
+    if (db) db->RemoveListener(this);
+  }
+
+ private:
+  ~LiveViewFolderStatusListener() = default;
+  LiveView* mOwner;
+  WeakPtr<PerFolderDatabase> mDB;
+  const uint64_t mFolder;
+  const uint64_t mAttachment;
+};
+NS_IMPL_ISUPPORTS(LiveViewFolderStatusListener, nsIDBChangeListener)
+
+struct LiveViewPublicStatus {
+  struct Row {
+    CapturedMessage raw;
+    uint32_t flags;
+  };
+  nsTHashMap<nsMsgKey, Row> rows;
+  nsTArray<RefPtr<LiveViewFolderStatusListener>> listeners;
+  nsCString sourceId;
+  ~LiveViewPublicStatus() {
+    for (const auto& listener : listeners) listener->Detach();
+  }
+};
+
+NS_IMETHODIMP LiveViewFolderStatusListener::OnHdrFlagsChanged(
+    nsIMsgDBHdr* header, uint32_t oldFlags, uint32_t newFlags,
+    nsIDBChangeListener*) {
+  RefPtr<LiveView> owner = mOwner;
+  if (!owner) return NS_OK;
+  nsMsgKey key;
+  nsresult rv = header->GetMessageKey(&key);
+  if (NS_FAILED(rv)) {
+    owner->OnPublicStatusClosed(mAttachment);
+    return rv;
+  }
+  // Copy identity and outgoing scalar words before calling the view/JS
+  // listener.
+  owner->OnPublicStatusFlags(mAttachment, mFolder, key, oldFlags, newFlags);
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnAnnouncerGoingAway(
+    nsIDBChangeAnnouncer*) {
+  RefPtr<LiveView> owner = mOwner;
+  mDB = nullptr;
+  mOwner = nullptr;
+  if (owner) owner->OnPublicStatusClosed(mAttachment);
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnHdrDeleted(nsIMsgDBHdr*, nsMsgKey,
+                                                         int32_t,
+                                                         nsIDBChangeListener*) {
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnHdrAdded(nsIMsgDBHdr*, nsMsgKey,
+                                                       int32_t,
+                                                       nsIDBChangeListener*) {
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnParentChanged(
+    nsMsgKey, nsMsgKey, nsMsgKey, nsIDBChangeListener*) {
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnReadChanged(
+    nsIDBChangeListener*) {
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnJunkScoreChanged(
+    nsIDBChangeListener*) {
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnHdrPropertyChanged(
+    nsIMsgDBHdr*, const nsACString&, bool, uint32_t*, nsIDBChangeListener*) {
+  return NS_OK;
+}
+NS_IMETHODIMP LiveViewFolderStatusListener::OnEvent(nsIMsgDatabase*,
+                                                    const char*) {
+  return NS_OK;
+}
+
+void LiveView::ClearPublicStatus() {
+  auto status = std::move(mPublicStatus);
+  if (status) {
+    for (const auto& listener : status->listeners) listener->Detach();
+  }
+}
+
+nsresult LiveView::RefreshPublicStatus() {
+  ClearPublicStatus();
+  auto status = MakeUnique<LiveViewPublicStatus>();
+  RefPtr<DatabaseCore> core = DatabaseCore::sInstance;
+  MOZ_TRY(core->ReadSourceIdForFolderAdmission(status->sourceId));
+  struct Folder {
+    RefPtr<PerFolderDatabase> db;
+    nsTArray<nsMsgKey> newKeys;
+    nsTArray<nsMsgKey> extraNew;
+    bool used = false;
+  };
+  nsTHashMap<uint64_t, UniquePtr<Folder>> folders;
+  for (auto iter = core->mOpenDatabases.Iter(); !iter.Done(); iter.Next()) {
+    RefPtr<PerFolderDatabase> db = iter.UserData().get();
+    if (!db) continue;
+    auto folder = MakeUnique<Folder>();
+    folder->db = db;
+    MOZ_TRY(db->GetNewList(folder->newKeys));
+    folders.InsertOrUpdate(iter.Key(), std::move(folder));
+  }
+  if (!folders.IsEmpty()) {
+    nsAutoCString sql("SELECT id, folderId FROM messages WHERE ");
+    sql.Append(GetSQLClause());
+    nsCOMPtr<mozIStorageStatement> statement;
+    MOZ_TRY(Connection()->CreateStatement(sql, getter_AddRefs(statement)));
+    PrepareStatement(statement);
+    bool more;
+    nsresult rv;
+    while (NS_SUCCEEDED(rv = statement->ExecuteStep(&more)) && more) {
+      int64_t id, folderId;
+      MOZ_TRY(statement->GetInt64(0, &id));
+      MOZ_TRY(statement->GetInt64(1, &folderId));
+      auto folder = folders.Lookup(uint64_t(folderId));
+      if (!folder) continue;
+      nsCOMPtr<nsIMsgDBHdr> admitted;
+      // Unlike GetNewList/ContainsKey this checks source and physical
+      // membership.
+      MOZ_TRY(folder.Data()->db->GetMsgHdrForKey(nsMsgKey(id),
+                                                 getter_AddRefs(admitted)));
+      NS_ENSURE_TRUE(admitted, NS_ERROR_UNEXPECTED);
+      folder.Data()->used = true;
+      LiveViewPublicStatus::Row row;
+      MOZ_TRY(MessageDB().CaptureMessage(nsMsgKey(id), row.raw));
+      NS_ENSURE_TRUE(row.raw.folderId == uint64_t(folderId),
+                     NS_ERROR_NOT_AVAILABLE);
+      row.flags = row.raw.flags;
+      if (folder.Data()->newKeys.Contains(row.raw.id)) {
+        row.flags |= nsMsgMessageFlags::New;
+        if (!(row.raw.flags & nsMsgMessageFlags::New))
+          folder.Data()->extraNew.AppendElement(row.raw.id);
+      }
+      status->rows.InsertOrUpdate(row.raw.id, std::move(row));
+    }
+    MOZ_TRY(rv);
+  }
+  nsCString flags("flags");
+  nsCString extra;
+  for (auto iter = folders.Iter(); !iter.Done(); iter.Next()) {
+    const auto& folder = iter.UserData();
+    if (!folder->used) continue;
+    if (!folder->extraNew.IsEmpty()) {
+      if (!extra.IsEmpty()) extra.Append(" OR ");
+      extra.AppendLiteral("(folderId = ");
+      extra.AppendInt(int64_t(iter.Key()));
+      extra.AppendLiteral(" AND id IN (");
+      for (size_t i = 0; i < folder->extraNew.Length(); ++i) {
+        if (i) extra.Append(',');
+        extra.AppendInt(int64_t(folder->extraNew[i]));
+      }
+      extra.AppendLiteral("))");
+    }
+    if (mListener) {
+      RefPtr<LiveViewFolderStatusListener> listener =
+          new LiveViewFolderStatusListener(this, folder->db, iter.Key(),
+                                           mAttachmentGeneration);
+      MOZ_TRY(folder->db->AddListener(listener));
+      status->listeners.AppendElement(listener);
+    }
+  }
+  if (!extra.IsEmpty()) {
+    flags.AssignLiteral("CASE WHEN ");
+    flags.Append(extra);
+    flags.AppendLiteral(" THEN (flags | ");
+    flags.AppendInt(int64_t(nsMsgMessageFlags::New));
+    flags.AppendLiteral(") ELSE flags END");
+  }
+  if (flags != mPublicFlagsSQL) {
+    if (mSelectStmt) {
+      mSelectStmt->Finalize();
+      mSelectStmt = nullptr;
+    }
+    if (mSelectGroupStmt) {
+      mSelectGroupStmt->Finalize();
+      mSelectGroupStmt = nullptr;
+    }
+    mPublicFlagsSQL = flags;
+  }
+  mPublicStatus = std::move(status);
+  return NS_OK;
+}
+
+void LiveView::OnPublicStatusClosed(uint64_t attachment) {
+  if (attachment != mAttachmentGeneration) return;
+  nsCOMPtr<nsILiveViewListener> listener = mListener;
+  RefPtr<LiveViewBatchCapability> capability = mBatchCapability;
+  InvalidateCapturedConsumer(listener, capability, attachment);
+}
+
+void LiveView::OnPublicStatusFlags(uint64_t attachment, uint64_t folderId,
+                                   nsMsgKey key, uint32_t oldFlags,
+                                   uint32_t newFlags) {
+  if (attachment != mAttachmentGeneration || !mListener || !mPublicStatus)
+    return;
+  auto entry = mPublicStatus->rows.Lookup(key);
+  if (!entry || entry.Data().raw.folderId != folderId) return;
+  nsCString source;
+  if (NS_FAILED(
+          DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(source)) ||
+      source != mPublicStatus->sourceId) {
+    OnPublicStatusClosed(attachment);
+    return;
+  }
+  // Thread-state words do not change New. Only the actual projected status
+  // transition belongs to this bridge; other raw deltas use native captures.
+  const uint32_t changed = oldFlags ^ newFlags;
+  if (!(changed & nsMsgMessageFlags::New)) return;
+  const uint32_t displayed = entry.Data().flags;
+  // A native header change supplies both frozen words. A NewList-only change
+  // changes just New: retain raw fields already advanced by a nested listener.
+  // In either case the displayed word, not oldFlags, supplies the count delta.
+  const uint32_t projected = (changed & ~nsMsgMessageFlags::New)
+                                 ? newFlags
+                                 : (displayed & ~nsMsgMessageFlags::New) |
+                                       (newFlags & nsMsgMessageFlags::New);
+
+  if (displayed == projected) return;
+  CapturedMessage row = entry.Data().raw;
+  row.flags = projected;
+  entry.Data().flags = projected;
+  nsCOMPtr<nsILiveViewListener> listener = mListener;
+  RefPtr<LiveViewBatchCapability> capability = mBatchCapability;
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(PrivilegedJunkScope())) {
+    InvalidateCapturedConsumer(listener, capability, attachment);
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+  Rooted<JSObject*> object(cx);
+  CreateJSMessage(row.id, row.folderId, row.messageId.get(), row.date,
+                  row.sender.get(), row.recipients.get(), row.subject.get(),
+                  row.flags, row.tags.get(), row.threadId, row.threadParent, cx,
+                  object);
+  if (!object || JS_IsExceptionPending(cx)) {
+    InvalidateCapturedConsumer(listener, capability, attachment);
+    return;
+  }
+  Rooted<Value> value(cx, ObjectValue(*object));
+  if (NS_FAILED(listener->OnMessageFlagsChanged(value, displayed)))
+    InvalidateCapturedConsumer(listener, capability, attachment);
+}
+
 LiveView::LiveView()
     : mSortColumn(nsILiveView::SortColumn::DATE),
       mSortDescending(true),
       mGrouping(nsILiveView::Grouping::UNTHREADED) {}
 
 LiveView::~LiveView() {
+  ClearPublicStatus();
   delete mFolderFilter;
   ResetStatements();
 }
@@ -1380,6 +1643,13 @@ class SelectMessagesListener final : public mozIStorageStatementCallback {
       nsCString subject;
       row->GetUTF8String(6, subject);
       uint32_t flags = (uint32_t)(row->AsInt64(7));
+      if (mGroupQuery && mLiveView->mPublicStatus) {
+        auto entry = mLiveView->mPublicStatus->rows.Lookup(id);
+        if (entry && entry.Data().raw.folderId == folderId) {
+          flags = (flags & ~nsMsgMessageFlags::New) |
+                  (entry.Data().flags & nsMsgMessageFlags::New);
+        }
+      }
       nsCString tags;
       row->GetUTF8String(8, tags);
       nsMsgKey threadId = (nsMsgKey)(row->AsInt64(9));
@@ -1576,16 +1846,19 @@ nsCString LiveView::SelectSQL() {
           date, \
           sender AS formattedSender, \
           recipients AS formattedRecipients, \
-          subject, \
-          flags, \
+          subject, ");
+  sql.Append(mPublicFlagsSQL);
+  sql.Append(
+      " AS flags, \
           tags, \
           threadId, \
           threadParent");
   if (mGrouping == nsILiveView::THREADED ||
       mGrouping == nsILiveView::GROUPED_BY_SORT) {
     sql.Append(", COUNT(*) AS messageCount");
-    sql.AppendFmt(", SUM(flags & {} != 0) AS newCount",
-                  (uint32_t)nsMsgMessageFlags::New);
+    sql.Append(", SUM((");
+    sql.Append(mPublicFlagsSQL);
+    sql.AppendFmt(") & {} != 0) AS newCount", (uint32_t)nsMsgMessageFlags::New);
     sql.AppendFmt(", SUM(flags & {} = 0) AS unreadCount",
                   (uint32_t)nsMsgMessageFlags::Read);
   }
@@ -1657,6 +1930,7 @@ nsCString LiveView::SelectSQL() {
 NS_IMETHODIMP LiveView::SelectMessages(JSContext* cx, Promise** promise) {
   AUTO_PROFILER_LABEL("LiveView::SelectMessages", MAILNEWS);
   ++mQueryGeneration;
+  MOZ_TRY(RefreshPublicStatus());
   if (mBatchCapability) MOZ_TRY(CaptureQueryView(nullptr, mMappedQuery));
   if (mPendingStmt) {
     mPendingStmt->Cancel();
@@ -1802,11 +2076,33 @@ void LiveView::NotifyCaptured(const CapturedMessage* before,
   JSContext* cx = jsapi.cx();
   Rooted<JSObject*> object(cx);
   const auto& row = now ? *after : *before;
+  uint32_t flags = row.flags;
+  uint32_t displayedBefore = before ? before->flags : flags;
+  if (mPublicStatus) {
+    auto entry = mPublicStatus->rows.Lookup(row.id);
+    if (entry && entry.Data().raw.folderId == row.folderId) {
+      displayedBefore = entry.Data().flags;
+      bool extraNew = (displayedBefore & nsMsgMessageFlags::New) &&
+                      !(entry.Data().raw.flags & nsMsgMessageFlags::New);
+      if (before && after &&
+          (((before->flags ^ after->flags) & nsMsgMessageFlags::Read) ||
+           ((before->flags & nsMsgMessageFlags::New) &&
+            !(after->flags & nsMsgMessageFlags::New))))
+        extraNew = false;
+      if (extraNew) flags |= nsMsgMessageFlags::New;
+      entry.Data().raw = row;
+      entry.Data().flags = flags;
+      if (!now) entry.Remove();
+      if (change == CapturedChange::Flags && before && after &&
+          before->flags != after->flags && displayedBefore == flags)
+        return;
+    }
+  }
   // Ordinary metadata views also expose unassigned folders. Serialize the
   // captured scalars using their existing row contract, without a live header.
   CreateJSMessage(row.id, row.folderId, row.messageId.get(), row.date,
                   row.sender.get(), row.recipients.get(), row.subject.get(),
-                  row.flags, row.tags.get(), row.threadId, row.threadParent, cx,
+                  flags, row.tags.get(), row.threadId, row.threadParent, cx,
                   object);
   if (!object || JS_IsExceptionPending(cx)) {
     if (capability)
@@ -1820,7 +2116,7 @@ void LiveView::NotifyCaptured(const CapturedMessage* before,
   else if (!now)
     rv = listener->OnMessageRemoved(value);
   else if (change == CapturedChange::Flags)
-    rv = listener->OnMessageFlagsChanged(value, before->flags);
+    rv = listener->OnMessageFlagsChanged(value, displayedBefore);
   else if (change == CapturedChange::Tags)
     rv = listener->OnMessageTagsChanged(value, before->tags);
   if (NS_FAILED(rv) && capability)
@@ -1984,6 +2280,7 @@ NS_IMETHODIMP LiveView::SetListener(nsILiveViewListener* aListener) {
              mCountQuery->configuration == mConfigurationGeneration) {
     mMappedQuery = mCountQuery;
   }
+  ClearPublicStatus();
   bool hadListener = mListener;
   mListener = aListener;
   mBatchCapability = capability;
@@ -1998,6 +2295,7 @@ NS_IMETHODIMP LiveView::ClearListener(nsILiveViewListener* aListener) {
     return NS_OK;
   }
 
+  ClearPublicStatus();
   mListener = nullptr;
   mBatchCapability = nullptr;
   mMappedQuery = nullptr;

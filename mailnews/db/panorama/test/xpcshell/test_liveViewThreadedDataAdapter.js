@@ -1801,3 +1801,114 @@ add_task(function testSortThreadComplex() {
     [0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 3, 4]
   );
 });
+
+/**
+ * Initial physical New and later public words update each displayed member once.
+ */
+add_task(async function test_publicNewThreadedUsesDisplayedMembers() {
+  const { MessageInjection } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageInjection.sys.mjs"
+  );
+  const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const injection = new MessageInjection({ mode: "local" });
+  const generator = new MessageGenerator();
+  const parent = generator.makeMessage({ subject: "projected-new-adapter" });
+  const child = generator.makeMessage({ inReplyTo: parent });
+  const folder = await injection.makeEmptyFolder();
+  const other = await injection.makeEmptyFolder();
+  const set = new SyntheticMessageSet([parent, child]);
+  const copies = new SyntheticMessageSet([parent, child]);
+  await injection.addSetsToFolders([folder], [set]);
+  await injection.addSetsToFolders([other], [copies]);
+  Assert.ok(database instanceof Ci.nsIDatabaseCore);
+  Assert.equal(
+    folder.server.getStringValue("storeContractID"),
+    "@mozilla.org/msgstore/berkeleystore;1"
+  );
+  const [root, reply] = set.msgHdrList;
+  const db = folder.msgDatabase;
+  root.flags = 0;
+  reply.flags = Ci.nsMsgMessageFlags.New | Ci.nsMsgMessageFlags.Marked;
+  db.addToNewList(root.messageKey);
+  const otherBefore = copies.msgHdrList.map(header => header.flags);
+  const folderId = folderDB.getFolderByPath(
+    `${folder.server.key}/${folder.name}`
+  );
+  Assert.greater(folderId, 0);
+  const rowChanges = [];
+  const statusTree = {
+    rowCountChanged(index, delta) {
+      rowChanges.push([index, delta]);
+    },
+    invalidateRow() {},
+    invalidateRange() {},
+    reset() {
+      Assert.ok(
+        false,
+        "A normal projected flag change does not reset the view"
+      );
+    },
+  };
+  const view = new LiveView();
+  view.initWithFolder(folderId);
+  const adapter = new LiveViewThreadedDataAdapter(view);
+  adapter.setTree(statusTree);
+  registerCleanupFunction(() => adapter.setTree(null));
+  await adapter.sortBy("date", "descending");
+  rowChanges.length = 0;
+
+  Assert.equal(adapter.rowCount, 1, "The selected real members form one group");
+  const group = adapter.rowAt(0);
+  Assert.equal(group.rowCount, 2);
+  Assert.equal(
+    group.newCount,
+    2,
+    "The initial count includes raw and facade New"
+  );
+  Assert.equal(group.unreadCount, 2);
+  db.markRead(root.messageKey, true, null);
+  Assert.equal(
+    group.newCount,
+    1,
+    "Only the actual displayed New contribution is removed"
+  );
+  Assert.equal(group.unreadCount, 1);
+  db.addToNewList(root.messageKey);
+  Assert.ok(
+    root.flags & Ci.nsMsgMessageFlags.New,
+    "The accepted silent AddToNewList really changes public header state"
+  );
+  Assert.equal(
+    group.newCount,
+    1,
+    "No invented callback updates a silent addition"
+  );
+  db.markRead(root.messageKey, false, null);
+  Assert.equal(
+    group.newCount,
+    1,
+    "A frozen old public New word does not subtract from a displayed zero contribution"
+  );
+  Assert.equal(group.unreadCount, 2);
+  reply.flags = Ci.nsMsgMessageFlags.Marked;
+  Assert.equal(
+    group.newCount,
+    0,
+    "Raw/public delivery does not remove the same member twice"
+  );
+  Assert.equal(group.unreadCount, 2);
+  Assert.equal(group.rowCount, 2);
+  Assert.ok(!adapter.getRowProperties(0).split(" ").includes("hasNew"));
+
+  Assert.deepEqual(rowChanges, [], "Flag changes preserve physical membership");
+  Assert.deepEqual(
+    copies.msgHdrList.map(header => header.flags),
+    otherBefore,
+    "The outside equal-ID physical copies are unchanged"
+  );
+  adapter.setTree(null);
+  db.markRead(root.messageKey, true, null);
+  Assert.deepEqual(rowChanges, [], "Detached observers do not reach the tree");
+});

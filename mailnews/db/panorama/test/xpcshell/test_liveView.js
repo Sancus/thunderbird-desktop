@@ -488,3 +488,168 @@ function assertInitFails(liveView) {
     "setting the folder a second time should throw"
   );
 }
+
+/**
+ * Public New follows this physical facade without recapturing reentrant flags.
+ */
+add_task(async function test_publicNewUsesFrozenPhysicalStatus() {
+  const seen = [];
+  // Register the native view first. The adapter cases exercise the inverse
+  // native/public order with their already open physical-folder facades.
+  const view = new LiveView();
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsILiveViewListener"]),
+    onSelectedChunk() {},
+    onMessageAdded() {},
+    onMessageRemoved() {},
+    onMessageTagsChanged() {},
+    onMessageFlagsChanged(message, oldFlags) {
+      seen.push({ key: message.id, flags: message.flags, oldFlags });
+    },
+  };
+  view.setListener(listener);
+  const { MessageInjection } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageInjection.sys.mjs"
+  );
+  const { MessageGenerator, SyntheticMessageSet } = ChromeUtils.importESModule(
+    "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
+  );
+  const injection = new MessageInjection({ mode: "local" });
+  const generator = new MessageGenerator();
+  const parent = generator.makeMessage({ subject: "public-new-physical" });
+  const child = generator.makeMessage({ inReplyTo: parent });
+  const folder = await injection.makeEmptyFolder();
+  const other = await injection.makeEmptyFolder();
+  const set = new SyntheticMessageSet([parent, child]);
+  const copy = new SyntheticMessageSet([parent]);
+  await injection.addSetsToFolders([folder], [set]);
+  await injection.addSetsToFolders([other], [copy]);
+  Assert.equal(
+    folder.server.getStringValue("storeContractID"),
+    "@mozilla.org/msgstore/berkeleystore;1"
+  );
+  Assert.ok(database instanceof Ci.nsIDatabaseCore);
+  const [root, reply] = set.msgHdrList;
+  const db = folder.msgDatabase;
+  root.flags = 0;
+  reply.flags = Ci.nsMsgMessageFlags.New | Ci.nsMsgMessageFlags.Marked;
+  db.addToNewList(root.messageKey);
+  const copyBefore = copy.msgHdrList[0].flags;
+  const folderId = folderDB.getFolderByPath(
+    `${folder.server.key}/${folder.name}`
+  );
+  Assert.greater(folderId, 0);
+  let reentry = "readd";
+  const earlier = {
+    QueryInterface: ChromeUtils.generateQI(["nsIDBChangeListener"]),
+    onReadChanged() {},
+    onAnnouncerGoingAway() {},
+    onHdrFlagsChanged(header, oldFlags, newFlags) {
+      if (header.messageKey != root.messageKey) {
+        return;
+      }
+      if (reentry == "readd" && newFlags & Ci.nsMsgMessageFlags.Read) {
+        db.addToNewList(root.messageKey);
+      } else if (
+        reentry == "readDuringClear" &&
+        oldFlags & Ci.nsMsgMessageFlags.New &&
+        !(newFlags & Ci.nsMsgMessageFlags.New)
+      ) {
+        reentry = "none";
+        db.markRead(root.messageKey, true, null);
+      }
+    },
+  };
+  db.addListener(earlier);
+  view.initWithFolder(folderId);
+  try {
+    const rows = await view.selectMessages();
+    Assert.deepEqual(
+      rows.map(row => [row.folderId, row.id]).sort((a, b) => a[1] - b[1]),
+      [root, reply]
+        .map(header => [folderId, header.messageKey])
+        .sort((a, b) => a[1] - b[1])
+    );
+    Assert.equal(
+      rows.find(row => row.id == root.messageKey).flags,
+      Ci.nsMsgMessageFlags.New
+    );
+    Assert.equal(
+      rows.find(row => row.id == reply.messageKey).flags,
+      Ci.nsMsgMessageFlags.New | Ci.nsMsgMessageFlags.Marked
+    );
+    seen.length = 0;
+    db.markRead(root.messageKey, true, null);
+    Assert.ok(
+      root.flags & Ci.nsMsgMessageFlags.New,
+      "The earlier listener really re-added NewList after the frozen word"
+    );
+    const changed = seen.filter(row => row.key == root.messageKey);
+    Assert.greater(changed.length, 0);
+    Assert.ok(
+      changed.every(row => !(row.flags & Ci.nsMsgMessageFlags.New)),
+      "The retained consumer never reads future reentrant NewList state"
+    );
+    Assert.deepEqual(
+      changed.map(row => row.flags),
+      [Ci.nsMsgMessageFlags.Read],
+      "Native and public delivery install the complete changed word exactly once"
+    );
+    Assert.equal(copy.msgHdrList[0].flags, copyBefore);
+    Assert.equal(
+      reply.flags,
+      Ci.nsMsgMessageFlags.New | Ci.nsMsgMessageFlags.Marked
+    );
+    await view.selectMessages();
+    seen.length = 0;
+    db.clearNewList(true);
+    Assert.ok(
+      seen.some(
+        row =>
+          row.key == root.messageKey && row.flags == Ci.nsMsgMessageFlags.Read
+      ),
+      "A public NewList-only change reaches the consumer without a raw flag write"
+    );
+    reentry = "none";
+    db.markRead(root.messageKey, false, null);
+    db.addToNewList(root.messageKey);
+    await view.selectMessages();
+    seen.length = 0;
+    reentry = "readDuringClear";
+    db.clearNewList(true);
+    Assert.ok(
+      root.isRead,
+      "The earlier clear listener performed a real nested read"
+    );
+    Assert.deepEqual(
+      seen.filter(row => row.key == root.messageKey).map(row => row.flags),
+      [Ci.nsMsgMessageFlags.Read],
+      "The outer NewList-only word does not undo an already observed nested raw read"
+    );
+    const pending = view.selectMessages();
+    view.clearListener(listener);
+    await Assert.rejects(pending, error => error.name == "AbortError");
+    const count = seen.length;
+    db.markRead(root.messageKey, false, null);
+    Assert.equal(
+      seen.length,
+      count,
+      "Detached listeners receive no later update"
+    );
+    view.setListener(listener);
+    await view.selectMessages();
+    const closePending = view.selectMessages();
+    folder.ForceDBClosed();
+    await Assert.rejects(closePending, error => error.name == "AbortError");
+    const afterClose = seen.length;
+    folder.msgDatabase.markRead(root.messageKey, true, null);
+    Assert.equal(
+      seen.length,
+      afterClose,
+      "The closed facade's observer stays detached"
+    );
+  } finally {
+    view.clearListener(listener);
+    db.removeListener(earlier);
+  }
+});

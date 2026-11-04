@@ -470,7 +470,6 @@ add_task(async function test_offlineDownloadFailure() {
   });
 });
 
-
 add_task(async function test_cleanupFailureBeforeTerminalSuccess() {
   await withServer(NNTP_RFC2980_handler, async () => {
     let cleaned = 0;
@@ -479,7 +478,10 @@ add_task(async function test_cleanupFailureBeforeTerminalSuccess() {
       function (original, ...args) {
         cleaned++;
         original.apply(this, args);
-        throw Components.Exception("cleanup failed", Cr.NS_ERROR_FILE_ACCESS_DENIED);
+        throw Components.Exception(
+          "cleanup failed",
+          Cr.NS_ERROR_FILE_ACCESS_DENIED
+        );
       },
       async () => {
         await Assert.rejects(
@@ -491,7 +493,11 @@ add_task(async function test_cleanupFailureBeforeTerminalSuccess() {
     );
     Assert.equal(cleaned, 1, "The failed request cleans up once");
     await getNewMessages();
-    Assert.equal(folder.getTotalMessages(false), 8, "A queued retry can use the released connection without losing committed headers");
+    Assert.equal(
+      folder.getTotalMessages(false),
+      8,
+      "A queued retry can use the released connection without losing committed headers"
+    );
   });
 });
 
@@ -507,7 +513,10 @@ add_task(async function test_parserFailurePrecedesCleanupFailure() {
           "cleanUp",
           function (original, ...args) {
             original.apply(this, args);
-            throw Components.Exception("cleanup failed later", Cr.NS_ERROR_FILE_ACCESS_DENIED);
+            throw Components.Exception(
+              "cleanup failed later",
+              Cr.NS_ERROR_FILE_ACCESS_DENIED
+            );
           },
           async () => {
             await Assert.rejects(
@@ -519,7 +528,11 @@ add_task(async function test_parserFailurePrecedesCleanupFailure() {
         );
       }
     );
-    Assert.equal(folder.getTotalMessages(false), 0, "Failed parser input stays unpublished");
+    Assert.equal(
+      folder.getTotalMessages(false),
+      0,
+      "Failed parser input stays unpublished"
+    );
     await getNewMessages();
     Assert.equal(folder.getTotalMessages(false), 8);
   });

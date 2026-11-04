@@ -47,10 +47,16 @@ export class NntpNewsGroup {
       throw this._failure;
     }
     if (this._closed || this._finished) {
-      throw Components.Exception("News producer is closed", Cr.NS_ERROR_NOT_AVAILABLE);
+      throw Components.Exception(
+        "News producer is closed",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
     }
     if (this._finishing && !duringFinish) {
-      throw Components.Exception("News producer is finishing", Cr.NS_ERROR_IN_PROGRESS);
+      throw Components.Exception(
+        "News producer is finishing",
+        Cr.NS_ERROR_IN_PROGRESS
+      );
     }
   }
 
@@ -588,7 +594,10 @@ export class NntpNewsGroup {
     try {
       if (Components.isSuccessCode(status)) {
         if (this._finishing) {
-          throw Components.Exception("News publication is active", Cr.NS_ERROR_IN_PROGRESS);
+          throw Components.Exception(
+            "News publication is active",
+            Cr.NS_ERROR_IN_PROGRESS
+          );
         }
         if (failure) {
           throw failure;

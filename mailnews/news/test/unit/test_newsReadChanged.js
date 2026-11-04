@@ -1111,7 +1111,6 @@ add_task(async function test_restoredGroupWithoutNewsrcLineStaysSeparate() {
   );
 });
 
-
 /**
  * Create a real native group and its ordinary header producer.
  *
@@ -1143,25 +1142,43 @@ function articleProducerLine(article, id) {
 
 add_task(function test_nativeArticleProducerKeepsCapturedGroupIdentity() {
   if (!nativeBackend) {
-    info("Native physical article identity is covered by the native registrations");
+    info(
+      "Native physical article identity is covered by the native registrations"
+    );
     return;
   }
-  const fixtures = [createArticleProducer("identity-one"), createArticleProducer("identity-two")];
+  const fixtures = [
+    createArticleProducer("identity-one"),
+    createArticleProducer("identity-two"),
+  ];
   const keys = [];
   for (const { folder, reader } of fixtures) {
     for (const article of [0, 0x7fffffff]) {
-      reader.processXOverLine(articleProducerLine(article, "crosspost-s364@example.invalid"));
+      reader.processXOverLine(
+        articleProducerLine(article, "crosspost-s364@example.invalid")
+      );
     }
-    Assert.equal(folder.getTotalMessages(false), 0, "Detached parser input is not published");
+    Assert.equal(
+      folder.getTotalMessages(false),
+      0,
+      "Detached parser input is not published"
+    );
     reader.finishProcessingXOver();
     reader.cleanUp();
     for (const article of [0, 0x7fffffff]) {
       const live = folder.msgDatabase.createNewHdrWithSpecificMsgKey(article);
-      Assert.ok(live.isLive, "The article resolves through the captured native mapping");
+      Assert.ok(
+        live.isLive,
+        "The article resolves through the captured native mapping"
+      );
       Assert.equal(live.folder, folder);
       Assert.equal(live.messageId, "crosspost-s364@example.invalid");
       Assert.greater(live.messageKey, 0);
-      Assert.notEqual(live.messageKey, article, "A global key is not an article-number alias");
+      Assert.notEqual(
+        live.messageKey,
+        article,
+        "A global key is not an article-number alias"
+      );
       keys.push(live.messageKey);
     }
     Assert.equal(folder.getTotalMessages(false), 2);
@@ -1169,7 +1186,11 @@ add_task(function test_nativeArticleProducerKeepsCapturedGroupIdentity() {
     Assert.ok(!missing.isLive, "Absent article17 is not native article0");
     Assert.equal(missing.messageKey, 0xffffffff);
   }
-  Assert.equal(new Set(keys).size, 4, "Equal Message-IDs and article numbers stay scoped to each physical group");
+  Assert.equal(
+    new Set(keys).size,
+    4,
+    "Equal Message-IDs and article numbers stay scoped to each physical group"
+  );
 });
 
 add_task(async function test_nativeArticlePublicationWaitsForCompletedInput() {
@@ -1185,32 +1206,52 @@ add_task(async function test_nativeArticlePublicationWaitsForCompletedInput() {
           key: header.messageKey,
           subject: header.subject,
           extra: header.getStringProperty("x-s364-extra"),
-          references: Array.from({ length: header.numReferences }, (_, i) => header.getStringReference(i)),
+          references: Array.from({ length: header.numReferences }, (_, i) =>
+            header.getStringReference(i)
+          ),
           attached: folder.msgDatabase.containsKey(header.messageKey),
         });
       }
     },
   };
-  MailServices.mfn.addListener(listener, Ci.nsIMsgFolderNotificationService.msgAdded);
+  MailServices.mfn.addListener(
+    listener,
+    Ci.nsIMsgFolderNotificationService.msgAdded
+  );
   registerCleanupFunction(() => MailServices.mfn.removeListener(listener));
-  reader.processXOverLine(articleProducerLine(30001, "complete-s364@example.invalid"));
+  reader.processXOverLine(
+    articleProducerLine(30001, "complete-s364@example.invalid")
+  );
   Assert.equal(seen.length, 0, "Overview parsing alone does not publish");
   reader.processXHdrLine("x-s364-extra", "30001 completed-extra");
-  Assert.equal(seen.length, 0, "Extra-header parsing still precedes completion");
+  Assert.equal(
+    seen.length,
+    0,
+    "Extra-header parsing still precedes completion"
+  );
   reader.finishProcessingXOver();
   const live = folder.msgDatabase.createNewHdrWithSpecificMsgKey(30001);
-  Assert.deepEqual(seen, [{
-    key: live.messageKey,
-    subject: "S364 sübject",
-    extra: "completed-extra",
-    references: ["first@example.invalid", "second@example.invalid"],
-    attached: true,
-  }], "The one published notification observes the complete ingested header");
+  Assert.deepEqual(
+    seen,
+    [
+      {
+        key: live.messageKey,
+        subject: "S364 sübject",
+        extra: "completed-extra",
+        references: ["first@example.invalid", "second@example.invalid"],
+        attached: true,
+      },
+    ],
+    "The one published notification observes the complete ingested header"
+  );
   reader.finishProcessingXOver();
   reader.cleanUp();
   reader.cleanUp();
   Assert.equal(seen.length, 1, "Repeated successful finish never republishes");
-  Assert.throws(() => reader.processHeadLine("Subject: late"), error => error.result == Cr.NS_ERROR_NOT_AVAILABLE);
+  Assert.throws(
+    () => reader.processHeadLine("Subject: late"),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
   // Exercise the real HEAD fallback and XOVER/XHDR caller paths as well.
   for (const handler of [NNTP_RFC977_handler, NNTP_RFC2980_handler]) {
     const fixture = await fetchReadSetArticles(handler);
@@ -1224,19 +1265,45 @@ add_task(function test_nativeFailedArticleProducerDoesNotPublish() {
     return;
   }
   const { folder, reader } = createArticleProducer("failed");
-  reader.processXOverLine(articleProducerLine(30002, "failed-s364@example.invalid"));
+  reader.processXOverLine(
+    articleProducerLine(30002, "failed-s364@example.invalid")
+  );
   const known = folder.msgDatabase.dBFolderInfo.knownArtsSet;
   reader._db.forceClosed();
   let first;
-  Assert.throws(() => reader.finishProcessingXOver(), error => {
-    first = error;
-    return error.result == Cr.NS_ERROR_NOT_AVAILABLE;
-  });
-  Assert.throws(() => reader.finishProcessingXOver(), error => error === first, "The failed producer retains its first exception");
-  Assert.throws(() => reader.processXOverLine(articleProducerLine(30003, "late-s364@example.invalid")), error => error === first);
-  Assert.equal(folder.getTotalMessages(false), 0, "A failed detached producer leaves no published article");
-  Assert.equal(folder.msgDatabase.dBFolderInfo.knownArtsSet, known, "Failed input does not mark a completed range");
-  Assert.equal(folder.msgDatabase.getMsgHdrForMessageID("failed-s364@example.invalid"), null);
+  Assert.throws(
+    () => reader.finishProcessingXOver(),
+    error => {
+      first = error;
+      return error.result == Cr.NS_ERROR_NOT_AVAILABLE;
+    }
+  );
+  Assert.throws(
+    () => reader.finishProcessingXOver(),
+    error => error === first,
+    "The failed producer retains its first exception"
+  );
+  Assert.throws(
+    () =>
+      reader.processXOverLine(
+        articleProducerLine(30003, "late-s364@example.invalid")
+      ),
+    error => error === first
+  );
+  Assert.equal(
+    folder.getTotalMessages(false),
+    0,
+    "A failed detached producer leaves no published article"
+  );
+  Assert.equal(
+    folder.msgDatabase.dBFolderInfo.knownArtsSet,
+    known,
+    "Failed input does not mark a completed range"
+  );
+  Assert.equal(
+    folder.msgDatabase.getMsgHdrForMessageID("failed-s364@example.invalid"),
+    null
+  );
 });
 
 add_task(function test_nativeArticleCompletionKeepsFirstErrorAndFinishesOnce() {
@@ -1244,7 +1311,9 @@ add_task(function test_nativeArticleCompletionKeepsFirstErrorAndFinishesOnce() {
     return;
   }
   for (const initial of [Cr.NS_OK, Cr.NS_ERROR_NET_RESET]) {
-    const { server, folder, reader } = createArticleProducer(`completion-${initial}`);
+    const { server, folder, reader } = createArticleProducer(
+      `completion-${initial}`
+    );
     const client = new NntpClient(server);
     const statuses = [];
     let idle = 0;
@@ -1253,7 +1322,10 @@ add_task(function test_nativeArticleCompletionKeepsFirstErrorAndFinishesOnce() {
     reader.cleanUp = status => {
       cleanup++;
       original(status);
-      throw Components.Exception("Real caller cleanup cut", Cr.NS_ERROR_FILE_ACCESS_DENIED);
+      throw Components.Exception(
+        "Real caller cleanup cut",
+        Cr.NS_ERROR_FILE_ACCESS_DENIED
+      );
     };
     const listener = {
       OnStartRunningUrl() {},
@@ -1272,8 +1344,14 @@ add_task(function test_nativeArticleCompletionKeepsFirstErrorAndFinishesOnce() {
     client.onIdle = () => idle++;
     client._actionDone(initial);
     client._actionDone();
-    const expected = Components.isSuccessCode(initial) ? Cr.NS_ERROR_FILE_ACCESS_DENIED : initial;
-    Assert.deepEqual(statuses, [expected, expected], "Terminal consumers share the original first failure");
+    const expected = Components.isSuccessCode(initial)
+      ? Cr.NS_ERROR_FILE_ACCESS_DENIED
+      : initial;
+    Assert.deepEqual(
+      statuses,
+      [expected, expected],
+      "Terminal consumers share the original first failure"
+    );
     Assert.equal(cleanup, 1);
     Assert.equal(idle, 1, "The connection is released exactly once");
   }
@@ -1295,24 +1373,45 @@ add_task(function test_nativeArticleRetryKeepsCommittedIdentity() {
       }
     },
   };
-  MailServices.mfn.addListener(listener, Ci.nsIMsgFolderNotificationService.msgAdded);
+  MailServices.mfn.addListener(
+    listener,
+    Ci.nsIMsgFolderNotificationService.msgAdded
+  );
   registerCleanupFunction(() => MailServices.mfn.removeListener(listener));
   for (const article of [30004, 30005]) {
-    reader.processXOverLine(articleProducerLine(article, `retry-${article}@example.invalid`));
+    reader.processXOverLine(
+      articleProducerLine(article, `retry-${article}@example.invalid`)
+    );
   }
-  Assert.throws(() => reader.finishProcessingXOver(), error => error.result == Cr.NS_ERROR_NOT_AVAILABLE);
-  Assert.equal(seen.length, 1, "The completed prefix is retained when the next producer fails");
+  Assert.throws(
+    () => reader.finishProcessingXOver(),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE
+  );
+  Assert.equal(
+    seen.length,
+    1,
+    "The completed prefix is retained when the next producer fails"
+  );
   const firstKey = seen[0];
   const retry = new NntpNewsGroup(server, folder);
   retry.getArticlesRangeToFetch(null, 30004, 30005);
   for (const article of [30004, 30005]) {
-    retry.processXOverLine(articleProducerLine(article, `retry-${article}@example.invalid`));
+    retry.processXOverLine(
+      articleProducerLine(article, `retry-${article}@example.invalid`)
+    );
   }
   retry.finishProcessingXOver();
   retry.cleanUp();
-  Assert.equal(folder.msgDatabase.createNewHdrWithSpecificMsgKey(30004).messageKey, firstKey);
+  Assert.equal(
+    folder.msgDatabase.createNewHdrWithSpecificMsgKey(30004).messageKey,
+    firstKey
+  );
   Assert.equal(folder.getTotalMessages(false), 2);
-  Assert.equal(seen.length, 2, "Retry publishes only the previously absent article");
+  Assert.equal(
+    seen.length,
+    2,
+    "Retry publishes only the previously absent article"
+  );
   Assert.equal(new Set(seen).size, 2);
 });
 
@@ -1322,18 +1421,37 @@ add_task(function test_nativeStaleArticleProducerCannotComplete() {
   }
   const first = createArticleProducer("stale");
   const other = createArticleProducer("other");
-  first.reader.processXOverLine(articleProducerLine(30006, "stale-s364@example.invalid"));
+  first.reader.processXOverLine(
+    articleProducerLine(30006, "stale-s364@example.invalid")
+  );
   const draft = first.reader._msgHdrs[0];
-  Assert.throws(() => other.folder.msgDatabase.attachHdr(draft, true), error => error.result == Cr.NS_ERROR_INVALID_ARG, "A captured draft cannot publish into another physical group");
+  Assert.throws(
+    () => other.folder.msgDatabase.attachHdr(draft, true),
+    error => error.result == Cr.NS_ERROR_INVALID_ARG,
+    "A captured draft cannot publish into another physical group"
+  );
   first.reader.cleanUp(Cr.NS_ERROR_ABORT);
-  Assert.throws(() => first.reader.finishProcessingXOver(), error => error.result == Cr.NS_ERROR_NOT_AVAILABLE, "Aborted producer completion stays closed");
+  Assert.throws(
+    () => first.reader.finishProcessingXOver(),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "Aborted producer completion stays closed"
+  );
   Assert.equal(first.folder.getTotalMessages(false), 0);
   Assert.equal(other.folder.getTotalMessages(false), 0);
   const current = new NntpNewsGroup(first.server, first.folder);
   current.getArticlesRangeToFetch(null, 30006, 30006);
-  current.processXOverLine(articleProducerLine(30006, "current-s364@example.invalid"));
+  current.processXOverLine(
+    articleProducerLine(30006, "current-s364@example.invalid")
+  );
   current.finishProcessingXOver();
   current.cleanUp();
-  Assert.equal(first.folder.getTotalMessages(false), 1, "A fresh current producer still succeeds");
-  Assert.equal(first.folder.msgDatabase.createNewHdrWithSpecificMsgKey(30006).messageId, "current-s364@example.invalid");
+  Assert.equal(
+    first.folder.getTotalMessages(false),
+    1,
+    "A fresh current producer still succeeds"
+  );
+  Assert.equal(
+    first.folder.msgDatabase.createNewHdrWithSpecificMsgKey(30006).messageId,
+    "current-s364@example.invalid"
+  );
 });

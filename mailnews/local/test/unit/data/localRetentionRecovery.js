@@ -175,7 +175,7 @@ async function checkRestart() {
         uri: folder.URI,
         server: folder.server.key,
       });
-      Services.prefs.savePrefFile(null);
+      Services.prefs.savePrefFile(prefsFile);
     } else {
       const expected = await IOUtils.readJSON(expectedPath);
       const root = MailServices.accounts.getIncomingServer(

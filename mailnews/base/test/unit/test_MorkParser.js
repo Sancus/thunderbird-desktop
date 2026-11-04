@@ -1151,7 +1151,11 @@ add_task(function test_strictDefaultCountBudgetsPreserveFolderSize() {
     body += "[" + id.toString(16) + ":r]";
   }
   body += "[1:r(a^1)][186a1:r(a^186a1)]";
-  Assert.less(body.length, 4 * 1024 * 1024, "An ordinary folder-sized document");
+  Assert.less(
+    body.length,
+    4 * 1024 * 1024,
+    "An ordinary folder-sized document"
+  );
   const snapshot = new MorkParser().parseForImport(body, body.length);
   Assert.equal(snapshot.rows.size, 100001, "Default counts retain every row");
   Assert.equal(snapshot.rows.get("1:r").cells.get("a"), "value");

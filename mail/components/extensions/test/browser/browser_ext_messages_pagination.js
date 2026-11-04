@@ -1010,10 +1010,10 @@ async function checkConcurrentPages(query, fail = false) {
     files: {
       "utils.js": await getUtilsJS(),
       "background.js": async () => {
-        const [{ query, fail, expected }] =
+        const [{ query: useQuery, fail: rejectProducer, expected }] =
           await window.sendMessage("fixtures");
         const [folder] = await browser.folders.query({ name: "test1" });
-        let page = query
+        let page = useQuery
           ? await browser.messages.query({
               folderId: folder.id,
               messagesPerPage: 10,
@@ -1044,7 +1044,7 @@ async function checkConcurrentPages(query, fail = false) {
         await window.sendMessage("release-continuations");
         const received = await results;
         window.assertDeepEqual([1, 1], settled);
-        if (fail) {
+        if (rejectProducer) {
           for (const result of received) {
             browser.test.assertEq("rejected", result.status);
             browser.test.assertEq(
@@ -1243,9 +1243,9 @@ add_task(async function test_queryPrevalidationReleasesLists() {
     files: {
       "utils.js": await getUtilsJS(),
       "background.js": async () => {
-        const [folderId] = await window.sendMessage("folder-id");
+        const [targetFolderId] = await window.sendMessage("folder-id");
         await browser.test.assertRejects(
-          browser.messages.query({ folderId }),
+          browser.messages.query({ folderId: targetFolderId }),
           /Querying by folder requires the "accountsRead" permission/
         );
         await window.sendMessage("denied-settled");
@@ -1304,9 +1304,10 @@ async function checkAbortPendingPage(query) {
     files: {
       "utils.js": await getUtilsJS(),
       "background.js": async () => {
-        const [{ query, expected }] = await window.sendMessage("fixtures");
+        const [{ query: useQuery, expected }] =
+          await window.sendMessage("fixtures");
         const [folder] = await browser.folders.query({ name: "test1" });
-        const first = query
+        const first = useQuery
           ? await browser.messages.query({
               folderId: folder.id,
               messagesPerPage: 10,

@@ -162,16 +162,24 @@ add_task(function test_removedFolderListenerIsNotNotified() {
  * @returns {{server: nsINntpIncomingServer, account: nsIMsgAccount}} The account.
  */
 function createReadSetAccount(hostname, port = 119) {
+  // News server URIs omit the port. Distinct usernames keep these accounts'
+  // roots separate even when their fake servers all listen on localhost.
   const { server, account } =
     localAccountUtils.create_incoming_server_and_account(
       "nntp",
       port,
-      null,
+      `readset-${accounts.length}`,
       null,
       hostname
     );
   accounts.push(account);
   server.QueryInterface(Ci.nsINntpIncomingServer);
+  server.pushAuth = false;
+  Assert.equal(
+    server.rootFolder.server,
+    server,
+    "The root keeps its real account"
+  );
   server.maximumConnectionsNumber = 1;
   server.maxArticles = 1000;
   server.notifyOn = false;
@@ -222,6 +230,13 @@ async function fetchReadSetArticles(
       .addNewsgroup(name, index ? "" : "5001")
       .QueryInterface(Ci.nsIMsgNewsFolder)
   );
+  for (const folder of selected) {
+    Assert.equal(
+      folder.server,
+      server,
+      "Each group uses this fake server's filters"
+    );
+  }
   if (filters) {
     const list = server.getFilterList(null);
     createFilter(list, "subject", "Read set 1-0", "read");

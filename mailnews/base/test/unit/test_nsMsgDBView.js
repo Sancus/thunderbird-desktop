@@ -1486,9 +1486,23 @@ add_task(async function test_threadReadStopsAtOriginalWriteError() {
   const control = gMessageGenerator.makeMessage({ subject: "read-control" });
   const set = new SyntheticMessageSet([parent, child, control]);
   await set_gTestFolder(set);
+  const expectedStore = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  Assert.ok(
+    expectedStore == "@mozilla.org/msgstore/berkeleystore;1" ||
+      expectedStore == "@mozilla.org/msgstore/maildirstore;1",
+    "The ordinary input independently declares a supported physical store"
+  );
+  Assert.equal(
+    Services.prefs.getCharPref("mail.server.default.storeContractID"),
+    expectedStore,
+    "Both startup store inputs agree"
+  );
   Assert.equal(
     gTestFolder.server.getStringValue("storeContractID"),
-    "@mozilla.org/msgstore/berkeleystore;1"
+    expectedStore,
+    "The actual physical store matches the independently declared input"
   );
   const [root, reply, untouched] = set.msgHdrList;
   const otherFolder = await messageInjection.makeEmptyFolder();

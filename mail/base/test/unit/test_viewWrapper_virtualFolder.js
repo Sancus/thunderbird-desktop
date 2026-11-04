@@ -1019,6 +1019,7 @@ function assertScopedRows(wrapper, headers) {
  *
  * @param {nsIMsgFolder} folder - The real physical owner.
  * @param {nsIMsgDBHdr} header - The stored message being deleted.
+ * @returns {Promise<void>} Resolves after ordinary deletion completion.
  */
 async function deleteScopedMessage(folder, header) {
   const { PromiseTestUtils } = ChromeUtils.importESModule(
@@ -1147,7 +1148,10 @@ add_task(async function test_cacheReadErrorDoesNotPublishPartialSearch() {
     connection.executeSimpleSQL("DROP VIEW temp.search_folder_hits");
     // Finish the native search callback/iterator stack before removing its UDF.
     // SQLite refuses function changes while any statement is still active.
-    await new Promise(resolve => do_execute_soon(resolve));
+    const { TestUtils } = ChromeUtils.importESModule(
+      "resource://testing-common/TestUtils.sys.mjs"
+    );
+    await TestUtils.waitForTick();
     connection.removeFunction("s371_cache_read");
   }
   Assert.deepEqual(

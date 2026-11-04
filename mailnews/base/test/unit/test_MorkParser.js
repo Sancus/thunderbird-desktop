@@ -677,3 +677,87 @@ add_task(function test_strictRejectsGroupsAfterAbort() {
     "A later committed group cannot hide an earlier aborted write"
   );
 });
+
+add_task(function test_strictRecordedFormFailures() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  const columns = "< <(a=c)> (80=UTF-8)(81=UTF-16)>\n";
+  for (const [body, code] of [
+    ["[1:r[(f^81)](a=value)]", "UNSUPPORTED_MORK"],
+    ["<(90<(f^81)>=value)>", "UNSUPPORTED_MORK"],
+    ["[1:r[(f^FF)](a=value)]", "MALFORMED_MORK"],
+    ["<(90<(f^FF)>=value)>", "MALFORMED_MORK"],
+    ["[1:r[(a=v)](a=value)]", "UNSUPPORTED_MORK"],
+    ["[1:r[(f=1)](a=value)]", "UNSUPPORTED_MORK"],
+    ["[1:r[(f^80)](a=value)", "TRUNCATED_MORK"],
+    ["<(90<(f^80)>=value)", "TRUNCATED_MORK"],
+  ]) {
+    const input = header + columns + body;
+    let snapshot = null;
+    Assert.throws(
+      () => {
+        snapshot = new MorkParser().parseForImport(input);
+      },
+      error =>
+        error.name == "MorkImportError" &&
+        error.code == code &&
+        Number.isInteger(error.offset) &&
+        error.offset >= 0 &&
+        error.offset <= input.length,
+      body
+    );
+    Assert.equal(
+      snapshot,
+      null,
+      "Invalid forms never return a partial snapshot"
+    );
+  }
+});
+
+add_task(function test_strictRowPositionFailures() {
+  const header = '// <!-- <mdb:mork:z v="1.4"/> -->\n';
+  // Grammar-unit controls check native hexadecimal positions and end clamping.
+  const initial = Array.from(
+    { length: 12 },
+    (_, i) => "[" + (i + 1).toString(16) + "(a=v)]"
+  ).join(" ");
+  const snapshot = new MorkParser().parseForImport(
+    header + "{1:r {(k=kind)} " + initial + " 1 !a 2 !7fffffff}"
+  );
+  Assert.deepEqual(snapshot.tables.get("1:r").rows, [
+    "3:r",
+    "4:r",
+    "5:r",
+    "6:r",
+    "7:r",
+    "8:r",
+    "9:r",
+    "10:r",
+    "11:r",
+    "1:r",
+    "12:r",
+    "2:r",
+  ]);
+  for (const [body, code] of [
+    ["{1:r {(k=kind)} [1(a=v)] 1 !z}", "MALFORMED_MORK"],
+    ["{1:r {(k=kind)} [1(a=v)] 1 !100000000}", "MALFORMED_MORK"],
+    ["{1:r {(k=kind)} [1(a=v)] 1 !80000000}", "UNSUPPORTED_MORK"],
+    ["[1:r(a=v)] !0", "UNSUPPORTED_MORK"],
+    ["{1:r {(k=kind)[1(a=v)] !0}}", "UNSUPPORTED_MORK"],
+    ["{1:r {(k=kind)} [1(a=v)] -1 !0}", "UNSUPPORTED_MORK"],
+    ["{1:r {(k=kind)} [1(a=v)] 1 !", "TRUNCATED_MORK"],
+  ]) {
+    let partial = null;
+    Assert.throws(
+      () => {
+        partial = new MorkParser().parseForImport(header + body);
+      },
+      error => error.name == "MorkImportError" && error.code == code,
+      body
+    );
+    Assert.equal(
+      partial,
+      null,
+      "Invalid moves never return partial membership"
+    );
+  }
+});

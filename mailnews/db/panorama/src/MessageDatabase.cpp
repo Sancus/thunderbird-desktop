@@ -670,8 +670,7 @@ nsresult MessageDatabase::GetNewsArticleKey(const NewsArticleIdentity& expected,
                    NS_ERROR_FILE_CORRUPTED);
     nsCString incarnation;
     MOZ_TRY(stmt->GetUTF8String(3, incarnation));
-    NS_ENSURE_TRUE(incarnation == current.incarnation,
-                   NS_ERROR_FILE_CORRUPTED);
+    NS_ENSURE_TRUE(incarnation == current.incarnation, NS_ERROR_FILE_CORRUPTED);
     NS_ENSURE_TRUE(!found, NS_ERROR_FILE_CORRUPTED);
     found = Some(nsMsgKey(key));
   }

@@ -33,7 +33,87 @@ add_setup(() => {
     native,
     "The actual database service matches the startup backend"
   );
-  Assert.equal(rootFolder.id > 0, native, "The RSS root has native identity");
+  const rssServer = server;
+  Assert.equal(
+    rootFolder,
+    rssServer.rootFolder,
+    "The configured RSS root is retained"
+  );
+  Assert.equal(
+    rootFolder.server,
+    rssServer,
+    "The RSS root belongs to this server"
+  );
+  Assert.equal(
+    rssServer.type,
+    "rss",
+    "The configured server is an RSS account"
+  );
+  Assert.ok(rootFolder.isServer, "The RSS root is a server folder");
+  Assert.equal(rootFolder.parent, null, "The RSS root has no parent");
+  Assert.equal(
+    rootFolder.URI,
+    rssServer.serverURI,
+    "The RSS root has its server URI"
+  );
+  Assert.equal(
+    MailServices.folderLookup.getFolderForURL(rssServer.serverURI),
+    rootFolder,
+    "The existing folder lookup resolves the same RSS root"
+  );
+
+  // Numeric folder identity is an additional Panorama-only contract.
+  if (native) {
+    const folderDB = databaseService.QueryInterface(
+      Ci.nsIDatabaseCore
+    ).folderDB;
+    const rootId = folderDB.getFolderChildNamed(0, rssServer.key);
+    Assert.greater(
+      rootId,
+      0,
+      "The RSS server has a physical native root record"
+    );
+    Assert.equal(
+      rootFolder.id,
+      rootId,
+      "The RSS root has that exact native identity"
+    );
+    Assert.ok(
+      folderDB.getFolderIsServer(rootId),
+      "The native root is a server record"
+    );
+    Assert.equal(
+      folderDB.getFolderParent(rootId),
+      0,
+      "The native root has no parent"
+    );
+    Assert.equal(
+      folderDB.getFolderRoot(rootId),
+      rootId,
+      "The native root identifies itself"
+    );
+    const mappedRoot = folderDB.getMsgFolderForFolder(rootId);
+    Assert.equal(
+      mappedRoot,
+      rootFolder,
+      "The physical root maps to the retained RSS folder"
+    );
+    Assert.equal(
+      mappedRoot.server,
+      rssServer,
+      "The physical root retains server ownership"
+    );
+    Assert.equal(
+      mappedRoot.URI,
+      rssServer.serverURI,
+      "The physical root retains its URI"
+    );
+    Assert.greater(
+      mappedRoot.id,
+      0,
+      "The mapped RSS root retains positive native identity"
+    );
+  }
   const store = Services.prefs.getCharPref(
     "mail.server.server1.storeContractID"
   );

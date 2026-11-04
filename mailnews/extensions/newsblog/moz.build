@@ -21,6 +21,9 @@ JAR_MANIFESTS += ["jar.mn"]
 
 BROWSER_CHROME_MANIFESTS += [
     "test/browser/browser.toml",
+    "test/browser/browser-feed-legacy.toml",
+    "test/browser/browser-panorama-maildir.toml",
+    "test/browser/browser-panorama-mbox.toml",
 ]
 XPCSHELL_TESTS_MANIFESTS += [
     "test/unit/xpcshell.toml",

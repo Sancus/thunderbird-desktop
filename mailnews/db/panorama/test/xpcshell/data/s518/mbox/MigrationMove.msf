@@ -1,0 +1,52 @@
+// <!-- <mdb:mork:z v="1.4"/> -->
+< <(a=c)> // (f=iso-8859-1)
+  (B8=newFlags)(B9=srcMsgKey)(BA=srcUid)(BB=msgSize)(BC=inPlayback)
+  (BD=srcFolderURI)(BE=copyDests)(BF=moveDest)(C0=addedKeywords)
+  (C1=removedKeywords)(80=ns:msg:db:row:scope:msgs:all)(81=subject)
+  (82=sender)(83=message-id)(84=references)(85=recipients)(86=date)
+  (87=size)(88=flags)(89=priority)(8A=label)(8B=numLines)(8C=ccList)
+  (8D=bccList)(8E=msgThreadId)(8F=threadId)(90=threadFlags)
+  (91=threadNewestMsgDate)(92=children)(93=unreadChildren)
+  (94=threadSubject)(95=msgCharSet)(96=ns:msg:db:table:kind:msgs)
+  (97=ns:msg:db:table:kind:thread)(98=ns:msg:db:table:kind:allthreads)
+  (99=ns:msg:db:row:scope:threads:all)(9A=threadParent)(9B=threadRoot)
+  (9C=msgOffset)(9D=offlineMsgSize)(9E=uidOnServer)
+  (9F=ns:msg:db:row:scope:dbfolderinfo:all)
+  (A0=ns:msg:db:table:kind:dbfolderinfo)(A1=numMsgs)(A2=numNewMsgs)
+  (A3=folderSize)(A4=expungedBytes)(A5=folderDate)(A6=highWaterKey)
+  (A7=mailboxName)(A8=UIDValidity)(A9=totPendingMsgs)
+  (AA=unreadPendingMsgs)(AB=version)(AC=forceReparse)
+  (AD=fixedBadRefThreading)(AE=storeToken)(AF=keywords)
+  (B0=ProtoThreadFlags)(B1=ns:msg:db:row:scope:pending:all)
+  (B2=ns:msg:db:table:kind:pending)(B3=ns:msg:db:row:scope:ops:all)
+  (B4=ns:msg:db:table:kind:ops)(B5=op)(B6=msgKey)(B7=opFlags)>
+<(8E=ffffff80)(88=48496e93)(81=0)(80=1)>
+[1:m(^9B^8E)(^8F^8E)(^91^88)(^90=0)(^92=1)(^93=1)]
+
+<(82=200806061706.m56H6RWT004933@mrapp54.mozilla.org)(83
+    =[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications qui\
+te broken)(84=bugzilla-daemon@mozilla.org)(85=example@example.com)(86
+    =invalid@example.com)(87=)(89=a5a)(8A=d)(8B=84)(8C=0 s518-added)
+  (8D=ffffffff)>
+{1:^80 {(k^96:c)(s=9)} 
+  [FFFFFF80(^83^82)(^81^83)(^82^84)(^85^85)(^8C^86)(^8D=)(^86^88)(^89=1)
+    (^87^89)(^AE=0)(^9D^89)(^8B=d)(^88=84)(^84=)(^AF^8C)(^9A^8D)(^8E^8E)
+    (^B0=0)]}
+{FFFFFF80:^80 {(k^97:c)(s=9)1:m } FFFFFF80 }
+{FFFFFFFD:^99 {(k^98:c)(s=9)} [FFFFFF80(^94^83)]}
+
+<(8F=6aeb8dd7)(90=10000000)>
+{1:^9F {(k^A0:c)(s=9u)} 
+  [1(^AB=1)(^AC=0)(^AD=1)(^A1=1)(^A2=1)(^A6^8E)(^A8^8F)(^88^90)]}
+{1:^B1 {(k^B2:c)(s=9)} }
+
+<(91=1388)(94=8)(93=imap://user@localhost/MigrationClassic)>
+{1:^B3 {(k^B4:c)(s=9)} 
+  [FFFFFF80(^B6^8E)(^B8=0)(^B9^91)(^BA=0)(^B5=8)(^B7=0)(^BB=0)(^BC=0)
+    (^BD^93)]}
+
+@$${1{@
+@$$}1}@
+
+@$${2{@
+@$$}2}@

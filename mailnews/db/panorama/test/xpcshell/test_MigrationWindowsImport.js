@@ -6,6 +6,9 @@
 
 /* import-globals-from head.js */
 
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
 const { FileUtils } = ChromeUtils.importESModule(
   "resource://gre/modules/FileUtils.sys.mjs"
 );
@@ -27,6 +30,10 @@ const Reader = ChromeUtils.importESModule(
 const Adapter = ChromeUtils.importESModule(
   "resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs"
 );
+const { createWindowsPanoramaMigrationTarget, resumeMorkImports } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+  );
 let work, lock, backup, summaryBytes, bodyBytes;
 const inventories = new Map();
 const folders = new Map();
@@ -54,7 +61,13 @@ const REFERENCE_VARIANTS = [
   },
 ];
 
+let imapLedger, imapServerKey;
+const imapSourceFiles = new Map();
+const imapFolders = new Map();
+
 add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
+  // Hash the closed inputs without opening profile NSS database writers.
+  Services.prefs.setBoolPref("security.nocertdb", true);
   const profile = do_get_profile();
   const provider = Cc["@mozilla.org/xre/directory-provider;1"]
     .getService(Ci.nsIDirectoryServiceProvider)
@@ -131,6 +144,64 @@ add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
     );
     referenceInputs.set(spec.name, { ...spec, bytes });
   }
+  // These files are real committed/reopened MDB and provider output from the
+  // ordinary IM producer. Its independent readback ledger is a test oracle.
+  imapLedger = await IOUtils.readJSON(
+    do_get_file("data/s518/mbox/ledger.json").path
+  );
+  Assert.equal(imapLedger.backend, "panorama");
+  Assert.equal(imapLedger.store, "mbox");
+  Assert.equal(imapLedger.members.length, 6);
+  const originalUri = Services.io.newURI(imapLedger.members[0].uri);
+  const imap = creator.addServer(
+    decodeURIComponent(originalUri.username),
+    originalUri.host,
+    "imap"
+  );
+  imap.prefBranch.setIntPref("port", originalUri.port);
+  imap.prefBranch.setBoolPref("login_at_startup", false);
+  imap.prefBranch.setStringPref(
+    "storeContractID",
+    "@mozilla.org/msgstore/berkeleystore;1"
+  );
+  imapServerKey = imap.prefBranch.root.split(".")[2];
+  for (const saved of imapLedger.members) {
+    Assert.ok(
+      /^Migration(?:Classic|Explicit|CopyOne|CopyTwo|Move|Append)$/.test(
+        saved.name
+      )
+    );
+    const summaryInput = do_get_file("data/s518/mbox/" + saved.name + ".msf");
+    const bodyInput = do_get_file("data/s518/mbox/" + saved.name);
+    Assert.equal(
+      await IOUtils.computeHexDigest(summaryInput.path, "sha256"),
+      saved.sha256
+    );
+    Assert.equal((await IOUtils.stat(summaryInput.path)).size, saved.size);
+    Assert.equal(saved.bodies.length, 1);
+    Assert.equal(saved.bodies[0].relative, "");
+    Assert.equal(
+      await IOUtils.computeHexDigest(bodyInput.path, "sha256"),
+      saved.bodies[0].sha256
+    );
+    const files = await imap.rootFolder.addMailFolder(saved.name, {
+      summary: summaryInput,
+      mbox: bodyInput,
+    });
+    const inventory =
+      AppConstants.platform == "win"
+        ? Reader.captureMorkFolderWindowsInventory(
+            new FileUtils.File(files.summaryFilePath),
+            do_get_profile(),
+            new FileUtils.File(files.mailFilePath),
+            do_get_profile()
+          )
+        : undefined;
+    imapSourceFiles.set(saved.name, { saved, files, inventory });
+  }
+  Services.prefs.savePrefFile(
+    new FileUtils.File(PathUtils.join(do_get_profile().path, "prefs.js"))
+  );
   Assert.ok(
     !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite")))
   );
@@ -150,7 +221,32 @@ add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
     database
   );
   Assert.ok(database.sourceId);
-  Assert.equal(MailServices.accounts.accounts.length, 1);
+  Assert.equal(MailServices.accounts.accounts.length, 2);
+  let imapRoot = folderDB.getFolderByPath(imapServerKey);
+  if (!imapRoot) {
+    imapRoot = folderDB.insertRoot(imapServerKey);
+  }
+  const nativeImap = MailServices.accounts.getIncomingServer(imapServerKey);
+  Assert.equal(nativeImap.rootFolder.id, imapRoot);
+  for (const [name] of imapSourceFiles) {
+    let id = folderDB.getFolderByPath(imapServerKey + "/" + name);
+    if (!id) {
+      id = folderDB.insertFolder(imapRoot, name);
+    }
+    // The root facade was initialized before these physical rows were added.
+    // Attach its native child without changing the retained row's flags.
+    const flags = folderDB.getFolderFlags(id);
+    const folder = nativeImap.rootFolder.addSubfolder(name);
+    folder.flags = flags;
+    Assert.ok(folder);
+    Assert.equal(folderDB.getFolderFlags(id), flags);
+    Assert.equal(nativeImap.rootFolder.getChildNamed(name), folder);
+    Assert.equal(folder.id, id);
+    Assert.equal(folder.incomingServerType, "imap");
+    Assert.equal(folder.msgStore.storeType, "mbox");
+    imapFolders.set(name, folder);
+  }
+  registerCleanupFunction(() => nativeImap.closeCachedConnections());
   const root = MailServices.accounts.localFoldersServer.rootFolder;
   for (const name of inventories.keys()) {
     const folder = root.getChildNamed(name);
@@ -608,4 +704,346 @@ add_task(async function test_genuineReferencesRetainWindowsThreadsAndRetry() {
     );
     input.journal.close();
   }
+});
+
+/**
+ * Plans all six byte-identical retained IMAP sources under the existing backup.
+ * The captured readback ledger supplies assertions only, never converter input.
+ *
+ * @returns {Promise<object>} Owned journal, path and sorted complete source IDs.
+ */
+async function plannedImapUnit() {
+  const sources = [];
+  for (const [name, { saved, inventory }] of imapSourceFiles) {
+    const folder = imapFolders.get(name);
+    const input = await Reader.readMorkFolderImport(
+      folder,
+      "imap-plan-" + name,
+      inventory
+    );
+    Assert.equal(input.source.sha256, saved.sha256);
+    sources.push({
+      id: name,
+      protocol: "imap",
+      originalFolderURI: saved.uri,
+      databaseSourceId: database.sourceId,
+      destinationFolderId: folder.id,
+      ...input.source,
+      ...(inventory ? { inventory } : {}),
+    });
+  }
+  sources.sort((left, right) => left.id.localeCompare(right.id));
+  const path = PathUtils.join(work, "genuine-imap-unit.json");
+  const journal = await MigrationJournal.create(path, {
+    profilePath: lock.directory.path,
+    mailPaths: [],
+    backupPath: PathUtils.parent(backup.path),
+    sources,
+  });
+  const input = { journal, path, ids: sources.map(source => source.id) };
+  registerCleanupFunction(() => input.journal.close());
+  await journal.recordBackup(backup);
+  return input;
+}
+
+/**
+ * Creates the ordinary platform-specific target for the complete physical unit.
+ *
+ * @param {object} input - Current open journal and source IDs.
+ * @returns {object} Native checked receipt and import methods.
+ */
+function imapTarget(input) {
+  return createWindowsPanoramaMigrationTarget(
+    input.journal,
+    database,
+    id => {
+      Assert.ok(imapFolders.has(id));
+      return imapFolders.get(id);
+    },
+    lock
+  );
+}
+
+/**
+ * Reconstructs a request solely from current retained source bytes and the plan.
+ *
+ * @param {object} input - Current complete journal unit.
+ * @returns {Promise<object>} Version3 request with the original durable token.
+ */
+async function imapRequest(input) {
+  const unit = input.journal.state.protocolUnits[0];
+  const entries = [];
+  for (const id of input.ids) {
+    const source = input.journal.state.sources.find(value => value.id == id);
+    const folder = imapFolders.get(id);
+    const snapshot = await Reader.readMorkFolderImport(
+      folder,
+      source.token,
+      source.inventory
+    );
+    entries.push({
+      input: snapshot,
+      source,
+      folderFlags: folderDB.getFolderFlags(folder.id),
+    });
+  }
+  return Adapter.convertMorkProtocolUnit(
+    entries,
+    unit.token,
+    database.sourceId
+  );
+}
+
+/**
+ * Checks actual committed headers, body streams, epoch and complete queue data.
+ *
+ * @param {object} input - Current complete journal unit.
+ * @param {object} receipt - Exact committed native unit receipt.
+ * @returns {Promise<void>} All physical/source and independent ledger checks pass.
+ */
+async function assertImapUnit(input, receipt) {
+  Assert.equal(receipt.version, 3);
+  Assert.equal(receipt.databaseSourceId, database.sourceId);
+  Assert.equal(receipt.folders.length, imapLedger.members.length);
+  const keysBySource = new Map(
+    receipt.folders.map(member => [
+      member.sourceId,
+      new Map([...member.keys, ...member.imap.operationKeys]),
+    ])
+  );
+  const allKeys = receipt.folders.flatMap(member =>
+    [...member.keys, ...member.imap.operationKeys].map(([, key]) => key)
+  );
+  Assert.equal(
+    new Set(allKeys).size,
+    allKeys.length,
+    "All physical keys are globally distinct"
+  );
+  const profileFile = do_get_profile().clone();
+  profileFile.append("panorama.sqlite");
+  const reopened = Services.storage.openUnsharedDatabase(profileFile);
+  try {
+    for (const member of receipt.folders) {
+      const folder = imapFolders.get(member.sourceId);
+      const saved = imapLedger.members.find(
+        value => value.name == member.sourceId
+      );
+      Assert.equal(member.folderId, folder.id);
+      Assert.equal(
+        folder.msgDatabase.dBFolderInfo.imapUidValidity,
+        saved.epoch
+      );
+      Assert.equal([...folder.messages].length, saved.headers.length);
+      Assert.deepEqual(
+        member.keys.map(([old]) => old).sort((a, b) => a - b),
+        saved.headers.map(header => header.key).sort((a, b) => a - b)
+      );
+      for (const original of saved.headers) {
+        const key = keysBySource.get(member.sourceId).get(original.key);
+        const header = folder.msgDatabase.getMsgHdrForKey(key);
+        Assert.equal(header.folder, folder);
+        Assert.equal(header.messageKey, key);
+        Assert.equal(header.messageId, original.messageId);
+        Assert.equal(header.storeToken, original.storeToken);
+        Assert.equal(header.messageSize, original.size);
+        const nativeKey = saved.keyMap.find(
+          ([, old]) => old == original.key
+        )[0];
+        const captured = saved.captured.find(
+          value => value.nativeKey == nativeKey
+        );
+        Assert.equal(
+          header.properties.includes("uidOnServer"),
+          captured.uid !== null
+        );
+        if (captured.uid !== null) {
+          Assert.equal(header.getUint32Property("uidOnServer"), captured.uid);
+        }
+        const stream = Cc[
+          "@mozilla.org/scriptableinputstream;1"
+        ].createInstance(Ci.nsIScriptableInputStream);
+        stream.init(folder.getMsgInputStream(header));
+        let body = "";
+        try {
+          while (stream.available()) {
+            body += stream.read(stream.available());
+          }
+        } finally {
+          stream.close();
+        }
+        Assert.equal(
+          body,
+          captured.body,
+          "The original finished body is retained"
+        );
+        const statement = reopened.createStatement(
+          "SELECT m.folderId, p.value AS uid, typeof(p.value) AS uidType " +
+            "FROM messages m LEFT JOIN message_properties p " +
+            "ON p.id = m.id AND p.name = 'uidOnServer' WHERE m.id = :key"
+        );
+        try {
+          statement.params.key = key;
+          Assert.ok(
+            statement.executeStep(),
+            "A fresh connection sees the committed physical row"
+          );
+          Assert.equal(statement.row.folderId, folder.id);
+          Assert.equal(
+            statement.row.uid,
+            captured.uid === null ? null : captured.uid.toString(16),
+            "A fresh connection sees the exact canonical UID property or absence"
+          );
+          Assert.equal(
+            statement.row.uidType,
+            captured.uid === null ? "null" : "text"
+          );
+          Assert.ok(!statement.executeStep());
+        } finally {
+          statement.finalize();
+        }
+      }
+      const operations = folder.msgDatabase.QueryInterface(
+        Ci.nsIMsgOfflineOpsDatabase
+      );
+      Assert.equal(
+        operations.listAllOfflineOpIds().length,
+        saved.operations.length
+      );
+      for (const original of saved.operations) {
+        const mapped = member.imap.operations.find(
+          value => value.sourceKey == original.messageKey
+        );
+        Assert.ok(mapped);
+        Assert.greater(mapped.id, 0);
+        Assert.greater(mapped.revision, 0);
+        const operation = operations.getOfflineOpForKey(mapped.key, false);
+        for (const property of [
+          "operation",
+          "flagOperation",
+          "newFlags",
+          "srcUid",
+          "sourceFolderURI",
+          "destinationFolderURI",
+          "keywordsToAdd",
+          "keywordsToRemove",
+          "msgSize",
+          "playingBack",
+        ]) {
+          Assert.equal(operation[property], original[property], property);
+        }
+        const source = imapLedger.members.find(
+          value => value.uri == original.sourceFolderURI
+        );
+        const expectedSourceKey = source
+          ? keysBySource.get(source.name).get(original.srcMessageKey)
+          : original.srcMessageKey;
+        Assert.equal(operation.srcMessageKey, expectedSourceKey);
+        for (let ordinal = 0; ordinal < original.copies.length; ordinal++) {
+          Assert.equal(
+            operation.getCopyDestination(ordinal),
+            original.copies[ordinal]
+          );
+        }
+        Assert.throws(
+          () => operation.getCopyDestination(original.copies.length),
+          error =>
+            [Cr.NS_ERROR_ILLEGAL_VALUE, Cr.NS_ERROR_INVALID_ARG].includes(
+              error.result
+            )
+        );
+      }
+      Assert.equal(
+        await IOUtils.computeHexDigest(folder.summaryFile.path, "sha256"),
+        saved.sha256
+      );
+      Assert.equal(
+        await IOUtils.computeHexDigest(folder.filePath.path, "sha256"),
+        saved.bodies[0].sha256
+      );
+    }
+  } finally {
+    reopened.close();
+  }
+  Assert.ok(!database.connectionForTests.transactionInProgress);
+}
+
+add_task(async function test_genuineImapUnitRetainsWindowsPhysicalAdmission() {
+  const input = await plannedImapUnit();
+  await resumeMorkImports(input.journal, imapTarget(input));
+  Assert.equal(input.journal.state.stage, "validate");
+  const request = await imapRequest(input);
+  const anchor = imapFolders.get(input.ids[0]);
+  const receipt = database.getFolderImportReceipt(anchor, request);
+  Assert.deepEqual(input.journal.state.protocolUnits[0].receipt, receipt);
+
+  Assert.equal(input.journal.state.version, 6);
+  for (const member of receipt.folders) {
+    Assert.equal(member.version, 2);
+    const source = input.journal.state.sources.find(
+      value => value.id == member.sourceId
+    );
+    Assert.deepEqual(
+      member.windowsAdmission,
+      source.inventory.windowsAdmission
+    );
+    Assert.deepEqual(member.sourcePhysicalIdentity, source.physicalIdentity);
+  }
+  await assertImapUnit(input, receipt);
+  const journalHash = await IOUtils.computeHexDigest(input.path, "sha256");
+  const invalid = structuredClone(receipt);
+  const invalidOperation = invalid.folders.flatMap(
+    member => member.imap.operations
+  )[0];
+  Assert.ok(invalidOperation);
+  invalidOperation.id = 0;
+  await Assert.rejects(
+    input.journal.recordImportUnit(receipt.token, invalid),
+    error => error.message === "Native Mork offline payload/revision changed"
+  );
+  const rebound = structuredClone(receipt);
+  const reboundOperation = rebound.folders.flatMap(
+    member => member.imap.operations
+  )[0];
+  reboundOperation.revision++;
+  await Assert.rejects(
+    input.journal.recordImportUnit(receipt.token, rebound),
+    error => error.message === "Committed migration protocol receipt changed"
+  );
+  Assert.equal(
+    await IOUtils.computeHexDigest(input.path, "sha256"),
+    journalHash
+  );
+  Assert.deepEqual(database.getFolderImportReceipt(anchor, request), receipt);
+  input.journal.close();
+  input.journal = await MigrationJournal.open(input.path, lock.directory.path);
+  Assert.deepEqual(input.journal.state.protocolUnits[0].receipt, receipt);
+  const before = database.connectionForTests.createStatement(
+    "SELECT total_changes() AS value"
+  );
+  let changes;
+  try {
+    Assert.ok(before.executeStep());
+    changes = before.row.value;
+  } finally {
+    before.finalize();
+  }
+  Assert.deepEqual(
+    await database.importFolderSnapshot(anchor, request),
+    receipt
+  );
+  Assert.deepEqual(database.getFolderImportReceipt(anchor, request), receipt);
+  const after = database.connectionForTests.createStatement(
+    "SELECT total_changes() AS value"
+  );
+  try {
+    Assert.ok(after.executeStep());
+    Assert.equal(
+      after.row.value,
+      changes,
+      "Matching receipt retry does not allocate or requeue"
+    );
+  } finally {
+    after.finalize();
+  }
+  await assertImapUnit(input, receipt);
 });

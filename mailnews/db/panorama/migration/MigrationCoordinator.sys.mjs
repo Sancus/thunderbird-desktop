@@ -12,7 +12,9 @@ import {
 import { MigrationJournal } from "resource:///modules/panorama/MigrationJournal.sys.mjs";
 import {
   convertMorkFolderSnapshot,
+  convertMorkProtocolUnit,
   validateMorkFolderReceipt,
+  validateMorkProtocolUnitReceipt,
 } from "resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs";
 import {
   readMorkMigrationSource,
@@ -54,6 +56,10 @@ ChromeUtils.defineESModuleGetters(lazy, {
  * @param {function(object): Promise<object>} core.importFolder - Imports token,
  *   source identity, destinationFolderId, summary and original thread relations.
  *   Rejects on failure; resolves only with its committed complete receipt.
+ * @param {function(string,string[]): Promise<object|null>} [core.findProtocolUnitReceipt] -
+ *   Reconciles a complete retained IMAP source unit.
+ * @param {function(string,string[]): Promise<object>} [core.importProtocolUnit] -
+ *   Commits the complete prepared IMAP source unit and receipt.
  * @param {AbortSignal} [signal] - Stop at the next settled import boundary.
  * @returns {Promise<void>} Mail sources checkpointed; validation waits for all books.
  */
@@ -73,8 +79,49 @@ export async function resumeMorkImports(journal, core, signal) {
     throw new Error("Migration is not at the mail-import stage");
   }
   try {
+    const settledUnits = new Set();
     for (const source of journal.state.sources) {
       await checkCancelled();
+      if (source.protocol === "imap") {
+        const group = source.protocolUnitId ?? "imap";
+        if (settledUnits.has(group)) {
+          continue;
+        }
+        if (
+          typeof core.findProtocolUnitReceipt != "function" ||
+          typeof core.importProtocolUnit != "function"
+        ) {
+          throw new Error(
+            "Native complete protocol-unit migration is required"
+          );
+        }
+        const ids = journal.state.sources
+          .filter(
+            member =>
+              member.protocol === "imap" &&
+              (member.protocolUnitId ?? "imap") === group
+          )
+          .map(member => member.id)
+          .sort();
+        const token = await journal.beginImportUnit(ids);
+        let receipt = await core.findProtocolUnitReceipt(token, ids);
+        if (!receipt) {
+          if (
+            journal.state.sources.some(
+              member => ids.includes(member.id) && member.state === "imported"
+            )
+          ) {
+            throw new Error("Core lost a committed migration protocol receipt");
+          }
+          await checkCancelled();
+          receipt = await core.importProtocolUnit(token, ids);
+        }
+        // A real native commit is checkpointed for every member before cancel.
+        await journal.recordImportUnit(token, receipt);
+        settledUnits.add(group);
+        await checkCancelled();
+        continue;
+      }
       const token = await journal.beginImport(source.id);
       let receipt = await core.findReceipt(token, {
         sourceId: source.id,
@@ -1163,6 +1210,128 @@ function bindPanoramaMigrationTarget(
   checkLock();
   let prepared = null;
   return {
+    async findProtocolUnitReceipt(token, ids) {
+      prepared = null;
+      checkIdentity();
+      checkLock();
+      const unit = journal.state.protocolUnits?.find(
+        value => value.token === token
+      );
+      if (!unit || JSON.stringify(unit.sourceIds) !== JSON.stringify(ids)) {
+        throw new Error(
+          "Native protocol request differs from journal membership"
+        );
+      }
+      await checkBackup();
+      const entries = [];
+      const members = [];
+      for (const id of ids) {
+        const source = journal.state.sources.find(value => value.id === id);
+        if (
+          !source ||
+          source.protocol !== "imap" ||
+          source.protocolUnitToken !== token
+        ) {
+          throw new Error("Native protocol source is not in its retained unit");
+        }
+        const folder = (await resolveFolder(id)).QueryInterface(
+          Ci.nsIMsgFolder
+        );
+        checkIdentity();
+        checkLock();
+        checkPaths(folder, source);
+        const input = await readMorkFolderImport(
+          folder,
+          source.token,
+          windows ? source.inventory : undefined
+        );
+        checkIdentity();
+        checkLock();
+        checkPaths(folder, source, input);
+        entries.push({
+          input,
+          source,
+          folderFlags: database.folderDB.getFolderFlags(folder.id),
+        });
+        members.push({ folder, source });
+      }
+      const request = convertMorkProtocolUnit(entries, token, databaseSourceId);
+      await journal.bindImportUnit(request);
+      checkIdentity();
+      checkLock();
+      for (let index = 0; index < members.length; index++) {
+        checkPaths(
+          members[index].folder,
+          members[index].source,
+          request.folders[index]
+        );
+      }
+      const receipt = database.getFolderImportReceipt(
+        members[0].folder,
+        request
+      );
+      checkIdentity();
+      checkLock();
+      if (receipt !== null) {
+        // The durable receipt remains authoritative after legitimate queue use.
+        return validateMorkProtocolUnitReceipt(request, receipt);
+      }
+      prepared = { unit: true, request, members };
+      return null;
+    },
+    async importProtocolUnit(token, ids) {
+      const pending = prepared;
+      prepared = null;
+      const unit = journal.state.protocolUnits?.find(
+        value => value.token === token
+      );
+      if (
+        !pending?.unit ||
+        pending.request.token !== token ||
+        !unit ||
+        unit.state !== "importing" ||
+        !unit.input ||
+        JSON.stringify(unit.sourceIds) !== JSON.stringify(ids) ||
+        pending.members.length !== ids.length
+      ) {
+        throw new Error("Native protocol import has no matching prepared unit");
+      }
+      checkIdentity();
+      checkLock();
+      await checkBackup();
+      for (let index = 0; index < pending.members.length; index++) {
+        const { folder } = pending.members[index];
+        const source = journal.state.sources.find(
+          value => value.id === ids[index]
+        );
+        if (
+          !source ||
+          source.state !== "importing" ||
+          source.protocolUnitToken !== token
+        ) {
+          throw new Error("Native protocol import changed its journal source");
+        }
+        checkPaths(folder, source, pending.request.folders[index]);
+      }
+      const receipt = await database.importFolderSnapshot(
+        pending.members[0].folder,
+        pending.request
+      );
+      checkIdentity();
+      checkLock();
+      const checked = validateMorkProtocolUnitReceipt(pending.request, receipt);
+      for (let index = 0; index < pending.members.length; index++) {
+        const { folder, source } = pending.members[index];
+        checkPaths(folder, source, pending.request.folders[index]);
+        verifyNativeMessageProjection(
+          database,
+          folder,
+          pending.request.folders[index],
+          checked.folders[index]
+        );
+      }
+      return checked;
+    },
     async findReceipt(token, identity) {
       prepared = null;
       const source = plannedSource(token, identity);
@@ -1337,6 +1506,15 @@ function verifyNativeMessageProjection(database, folder, request, receipt) {
         // Original size/offlineMsgSize/numLines cells remain separate properties.
         properties.set(name, String(expected[name]));
       }
+    }
+    const uid = request.imap?.serverUids.find(
+      binding => binding.sourceKey === message.sourceKey
+    );
+    if (uid) {
+      // A classic source uses its old key as UID without a raw property cell.
+      // The explicit native binding materializes the canonical hex property.
+      equal(actual.getUint32Property("uidOnServer"), uid.uid, "uidOnServer");
+      properties.set("uidOnServer", uid.uid.toString(16));
     }
     const present = new Set(actual.properties);
     if (

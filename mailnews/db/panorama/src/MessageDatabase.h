@@ -826,6 +826,8 @@ class MessageDatabase : public nsIMessageDatabase {
                                         Maybe<ServerMessageLocation>& source,
                                         Maybe<uint32_t>* folderEpoch = nullptr);
   nsresult RequireOfflineOperationMutable(int64_t operationId);
+  nsresult ReadOfflineImportHold(int64_t operationId, bool& held);
+  nsresult RequireOfflineImportDispatchable(int64_t operationId);
   nsresult ValidateQueuedSourceIdentity(const QueuedSourceIdentity& expected);
   nsresult ObserveDestinationEpochInTransaction(
       const QueuedSourceIdentity& expected, uint32_t action,
@@ -855,6 +857,13 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult FinishOfflineMoveInTransaction(const OfflineAttempt& attempt,
                                           bool removed,
                                           OfflineMoveSettlement& output);
+  // Only DatabaseCore's fully checked connected migration unit can establish
+  // an operation without a live header. Ordinary callers retain their guard.
+  nsresult ImportOfflineOperationInTransaction(
+      uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
+      const Maybe<ServerMessageLocation>& source, uint64_t& operationId,
+      uint64_t& revision);
+
   nsresult StoreOfflineOperationInTransaction(
       uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
       const OfflineOperationUndo* restoring = nullptr,

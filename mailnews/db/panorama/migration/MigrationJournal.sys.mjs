@@ -26,6 +26,12 @@ import {
   validateMorkFolderCacheReceipt,
 } from "resource:///modules/panorama/MorkFolderCache.sys.mjs";
 
+import {
+  getMorkProtocolUnitIntent,
+  validateMorkProtocolUnitReceipt,
+} from "resource:///modules/panorama/MorkSnapshotAdapter.sys.mjs";
+
+const PROTOCOL_VERSION = 6;
 const CACHE_VERSION = 5;
 const PHYSICAL_VERSION = 4;
 const MAIL_VERSION = 1;
@@ -76,7 +82,11 @@ export class MigrationJournal {
       } else if (plan.books?.length) {
         version = BOOK_VERSION;
       }
+      if (plan.sources.some(source => source.protocol === "imap")) {
+        version = PROTOCOL_VERSION;
+      }
       const state = {
+        ...(version === PROTOCOL_VERSION ? { protocolUnits: [] } : {}),
         ...(originalRoots ? { originalRoots } : {}),
         version,
         profilePath: normalizedPath(plan.profilePath),
@@ -108,7 +118,7 @@ export class MigrationJournal {
           receipt: null,
         }));
       }
-      if (state.version == PHYSICAL_VERSION) {
+      if (isPhysicalJournal(state)) {
         state.profilePhysicalIdentity = physicalIdentity(
           state.profilePath,
           true
@@ -266,6 +276,9 @@ export class MigrationJournal {
     let token;
     await this.#change(async state => {
       const source = this.#source(state, id);
+      if (source.protocol === "imap") {
+        throw new Error("IMAP sources require a complete protocol import unit");
+      }
       await this.#checkSource(source);
       token = source.token;
       if (source.state == "imported") {
@@ -296,28 +309,13 @@ export class MigrationJournal {
   async recordImport(id, receipt) {
     await this.#change(state => {
       const source = this.#source(state, id);
+      if (source.protocol === "imap") {
+        throw new Error(
+          "IMAP receipts require a complete protocol import unit"
+        );
+      }
       this.#validateReceipt(source, receipt);
-      const normalized = {
-        token: receipt.token,
-        sourceSha256: receipt.sourceSha256,
-        folderId: receipt.folderId,
-        keys: receipt.keys.map(pair => [...pair]).sort((a, b) => a[0] - b[0]),
-        ...(source.inventory
-          ? {
-              version: 2,
-              sourceId: receipt.sourceId,
-              databaseSourceId: receipt.databaseSourceId,
-              windowsAdmission: structuredClone(receipt.windowsAdmission),
-            }
-          : {}),
-        ...(source.physicalIdentity
-          ? {
-              sourcePhysicalIdentity: structuredClone(
-                receipt.sourcePhysicalIdentity
-              ),
-            }
-          : {}),
-      };
+      const normalized = this.#normalizeReceipt(source, receipt);
       if (source.state == "imported") {
         if (JSON.stringify(source.receipt) != JSON.stringify(normalized)) {
           throw new Error("Committed migration receipt changed");
@@ -331,6 +329,239 @@ export class MigrationJournal {
       source.state = "imported";
       return true;
     });
+  }
+
+  /**
+   * Starts every source in a retained IMAP unit in one durable journal change.
+   * Uses a distinct unit token derived from canonical source-ID order on retry.
+   *
+   * @param {string[]} ids - Complete connected source set.
+   * @returns {Promise<string>} Stable unit token, never a new retry identity.
+   * @throws {Error} For overlapping units, changed membership or invalid sources.
+   */
+  async beginImportUnit(ids) {
+    let token;
+    await this.#change(async state => {
+      const sources = this.#protocolSources(state, ids);
+      for (const source of sources) {
+        await this.#checkSource(source);
+      }
+      token = "imap-unit:" + sources[0].token;
+      const existing = state.protocolUnits.find(unit => unit.token === token);
+      const sourceIds = sources.map(source => source.id);
+      if (existing) {
+        if (JSON.stringify(existing.sourceIds) !== JSON.stringify(sourceIds)) {
+          throw new Error("Migration protocol unit membership changed");
+        }
+        return false;
+      }
+      this.#requireActive(state, "import");
+      if (
+        sources.some(
+          source => source.state !== "pending" || source.protocolUnitToken
+        ) ||
+        state.protocolUnits.some(unit =>
+          unit.sourceIds.some(id => sourceIds.includes(id))
+        )
+      ) {
+        throw new Error("Migration protocol unit overlaps existing work");
+      }
+      state.protocolUnits.push({
+        token,
+        sourceIds,
+        state: "importing",
+        input: null,
+        receipt: null,
+      });
+      for (const source of sources) {
+        source.state = "importing";
+        source.protocolUnitToken = token;
+      }
+      return true;
+    });
+    return token;
+  }
+
+  /**
+   * Persists the checked unit's typed intent before native import or receipt lookup.
+   * Rebinding an existing token to different source/UID/counterpart data refuses.
+   *
+   * @param {object} request - Complete converted version3 source unit.
+   * @returns {Promise<void>}
+   * @throws {Error} For a changed or unstarted unit.
+   */
+  async bindImportUnit(request) {
+    const input = getMorkProtocolUnitIntent(request);
+    await this.#change(state => {
+      const unit = state.protocolUnits?.find(
+        value => value.token === input.token
+      );
+      if (!unit) {
+        throw new Error("Migration protocol import unit was not started");
+      }
+      this.#checkProtocolInput(state, unit, input);
+      if (unit.input) {
+        if (JSON.stringify(unit.input) !== JSON.stringify(input)) {
+          throw new Error("Migration protocol input changed after intent");
+        }
+        return false;
+      }
+      this.#requireActive(state, "import");
+      if (unit.state !== "importing") {
+        throw new Error("Migration protocol import intent is already settled");
+      }
+      unit.input = input;
+      return true;
+    });
+  }
+
+  /**
+   * Checkpoints the complete native protocol receipt and every member together.
+   * A cancellation after native commit does not hide the committed mapping.
+   *
+   * @param {string} token - Retained whole-unit token.
+   * @param {object} receipt - Actual committed native version3 unit receipt.
+   * @returns {Promise<void>}
+   * @throws {Error} For a missing, changed or incomplete receipt.
+   */
+  async recordImportUnit(token, receipt) {
+    await this.#change(state => {
+      const unit = state.protocolUnits?.find(value => value.token === token);
+      if (!unit?.input) {
+        throw new Error(
+          "Migration protocol import has no durable input intent"
+        );
+      }
+      const normalized = validateMorkProtocolUnitReceipt(unit.input, receipt);
+      if (unit.state === "imported") {
+        if (JSON.stringify(unit.receipt) !== JSON.stringify(normalized)) {
+          throw new Error("Committed migration protocol receipt changed");
+        }
+        return false;
+      }
+      if (state.stage !== "import" || unit.state !== "importing") {
+        throw new Error("Migration protocol import was not started");
+      }
+      const sources = this.#protocolSources(state, unit.sourceIds);
+      for (let index = 0; index < sources.length; index++) {
+        const source = sources[index];
+        if (
+          source.state !== "importing" ||
+          source.protocolUnitToken !== token
+        ) {
+          throw new Error(
+            "Migration protocol source is not in its retained unit"
+          );
+        }
+        this.#validateReceipt(source, normalized.folders[index]);
+      }
+      for (let index = 0; index < sources.length; index++) {
+        sources[index].receipt = this.#normalizeReceipt(
+          sources[index],
+          normalized.folders[index]
+        );
+        sources[index].state = "imported";
+      }
+      unit.receipt = normalized;
+      unit.state = "imported";
+      return true;
+    });
+  }
+
+  /**
+   * @param {object} state - Owned journal state.
+   * @param {string[]} ids - Complete retained source IDs.
+   * @returns {object[]} Sources in canonical source-ID order.
+   */
+  #protocolSources(state, ids) {
+    if (
+      state.version !== PROTOCOL_VERSION ||
+      !Array.isArray(ids) ||
+      !ids.length ||
+      ids.some(id => typeof id !== "string") ||
+      new Set(ids).size !== ids.length
+    ) {
+      throw new Error("Invalid migration protocol source membership");
+    }
+    return [...ids].sort().map(id => {
+      const source = this.#source(state, id);
+      if (source.protocol !== "imap") {
+        throw new Error("Migration protocol unit contains a non-IMAP source");
+      }
+      return source;
+    });
+  }
+
+  /**
+   * @param {object} state - Current journal state.
+   * @param {object} unit - Retained unit membership.
+   * @param {object} input - Checked protocol intent.
+   * @returns {void}
+   */
+  #checkProtocolInput(state, unit, input) {
+    const sources = this.#protocolSources(state, unit.sourceIds);
+    if (
+      input.version !== 3 ||
+      input.protocol !== "imap" ||
+      input.token !== unit.token ||
+      input.folders.length !== sources.length
+    ) {
+      throw new Error("Migration protocol intent differs from its source unit");
+    }
+    for (let index = 0; index < sources.length; index++) {
+      const source = sources[index];
+      const member = input.folders[index];
+      if (
+        member.sourceId !== source.id ||
+        member.token !== source.token ||
+        member.databaseSourceId !== source.databaseSourceId ||
+        member.databaseSourceId !== input.databaseSourceId ||
+        member.folder.protocol !== "imap" ||
+        member.folder.id !== source.destinationFolderId ||
+        member.source.path !== source.path ||
+        member.source.sha256 !== source.sha256 ||
+        member.source.size !== source.size ||
+        JSON.stringify([...member.source.messageKeys].sort((a, b) => a - b)) !==
+          JSON.stringify([...source.messageKeys].sort((a, b) => a - b)) ||
+        member.imap?.version !== 1 ||
+        (source.originalFolderURI !== undefined &&
+          member.imap.originalFolderURI !== source.originalFolderURI) ||
+        (source.inventory &&
+          JSON.stringify(member.windowsAdmission) !==
+            JSON.stringify(source.inventory.windowsAdmission))
+      ) {
+        throw new Error("Migration protocol intent changed a retained source");
+      }
+    }
+  }
+
+  /**
+   * @param {object} source - Retained individual source.
+   * @param {object} receipt - Checked native member receipt.
+   * @returns {object} Existing canonical per-source receipt representation.
+   */
+  #normalizeReceipt(source, receipt) {
+    return {
+      token: receipt.token,
+      sourceSha256: receipt.sourceSha256,
+      folderId: receipt.folderId,
+      keys: receipt.keys.map(pair => [...pair]).sort((a, b) => a[0] - b[0]),
+      ...(source.inventory
+        ? {
+            version: 2,
+            sourceId: receipt.sourceId,
+            databaseSourceId: receipt.databaseSourceId,
+            windowsAdmission: structuredClone(receipt.windowsAdmission),
+          }
+        : {}),
+      ...(source.physicalIdentity
+        ? {
+            sourcePhysicalIdentity: structuredClone(
+              receipt.sourcePhysicalIdentity
+            ),
+          }
+        : {}),
+    };
   }
 
   /**
@@ -456,7 +687,8 @@ export class MigrationJournal {
         return false;
       }
       this.#requireActive(state, "import");
-      state.version = CACHE_VERSION;
+      state.version =
+        state.version === PROTOCOL_VERSION ? PROTOCOL_VERSION : CACHE_VERSION;
       (state.caches ??= []).push(cache);
       await this.#checkSource(cache);
       await this.#checkBackup(state, state.backup);
@@ -674,7 +906,7 @@ export class MigrationJournal {
     }
     const manifest = await IOUtils.readJSON(actual.path);
     if (
-      state.version == PHYSICAL_VERSION &&
+      isPhysicalJournal(state) &&
       (manifest.version !== 3 ||
         JSON.stringify(manifest.originalRoots) !==
           JSON.stringify(state.originalRoots))
@@ -691,7 +923,7 @@ export class MigrationJournal {
       throw new Error("Migration backup belongs to another profile");
     }
     if (
-      state.version == PHYSICAL_VERSION &&
+      isPhysicalJournal(state) &&
       !samePhysical(
         manifest.roots[0].physicalIdentity,
         state.profilePhysicalIdentity
@@ -782,7 +1014,7 @@ export class MigrationJournal {
   }
 
   #workLease(state) {
-    if (state.version != PHYSICAL_VERSION) {
+    if (!isPhysicalJournal(state)) {
       return null;
     }
     const lease = admitWindowsMigrationPath(
@@ -930,19 +1162,117 @@ export class MigrationJournal {
     }
   }
 
+  /**
+   * @param {object} state - State to validate before persistence or after reopen.
+   * @returns {void}
+   */
+  #validateProtocolUnits(state) {
+    if (state.version !== PROTOCOL_VERSION) {
+      if (
+        "protocolUnits" in state ||
+        state.sources.some(
+          source => source.protocol === "imap" || "protocolUnitToken" in source
+        )
+      ) {
+        throw new Error("Protocol migration requires its version6 journal");
+      }
+      return;
+    }
+    if (
+      !Array.isArray(state.protocolUnits) ||
+      !state.sources.some(source => source.protocol === "imap")
+    ) {
+      throw new Error("Invalid migration protocol journal");
+    }
+    const tokens = new Set();
+    const members = new Set();
+    for (const unit of state.protocolUnits) {
+      const sources = this.#protocolSources(state, unit.sourceIds);
+      if (
+        unit.token !== "imap-unit:" + sources[0].token ||
+        state.sources.some(source => source.token === unit.token) ||
+        tokens.has(unit.token) ||
+        !["importing", "imported"].includes(unit.state) ||
+        JSON.stringify(unit.sourceIds) !==
+          JSON.stringify(sources.map(source => source.id))
+      ) {
+        throw new Error("Invalid retained migration protocol unit");
+      }
+      tokens.add(unit.token);
+      for (const source of sources) {
+        if (
+          members.has(source.id) ||
+          source.state !== unit.state ||
+          source.protocolUnitToken !== unit.token
+        ) {
+          throw new Error("Conflicting migration protocol membership/state");
+        }
+        members.add(source.id);
+      }
+      if (unit.input !== null) {
+        this.#checkProtocolInput(
+          state,
+          unit,
+          getMorkProtocolUnitIntent(unit.input)
+        );
+      }
+      if (unit.state === "imported") {
+        if (
+          !unit.input ||
+          JSON.stringify(
+            validateMorkProtocolUnitReceipt(unit.input, unit.receipt)
+          ) !== JSON.stringify(unit.receipt)
+        ) {
+          throw new Error("Invalid committed migration protocol receipt");
+        }
+        for (let index = 0; index < sources.length; index++) {
+          if (
+            JSON.stringify(sources[index].receipt) !==
+            JSON.stringify(
+              this.#normalizeReceipt(
+                sources[index],
+                unit.receipt.folders[index]
+              )
+            )
+          ) {
+            throw new Error(
+              "Protocol member receipt differs from its committed unit"
+            );
+          }
+        }
+      } else if (unit.receipt !== null) {
+        throw new Error("Uncommitted migration protocol unit has a receipt");
+      }
+    }
+    for (const source of state.sources) {
+      if (
+        ("protocolUnitToken" in source ||
+          (source.protocol === "imap" && source.state !== "pending")) &&
+        !members.has(source.id)
+      ) {
+        throw new Error("Migration protocol source lost its complete unit");
+      }
+    }
+  }
+
   #validate(state) {
     if (
       !state ||
-      ![MAIL_VERSION, BOOK_VERSION, PHYSICAL_VERSION, CACHE_VERSION].includes(
-        state.version
-      ) ||
-      (state.version == CACHE_VERSION
+      ![
+        MAIL_VERSION,
+        BOOK_VERSION,
+        PHYSICAL_VERSION,
+        CACHE_VERSION,
+        PROTOCOL_VERSION,
+      ].includes(state.version) ||
+      (state.version == CACHE_VERSION ||
+      (state.version === PROTOCOL_VERSION && "caches" in state)
         ? !Array.isArray(state.caches) || !state.caches.length
         : "caches" in state) ||
       ("books" in state &&
         (!Array.isArray(state.books) || !state.books.length)) ||
-      (AppConstants.platform == "win" && state.version != PHYSICAL_VERSION) ||
-      (state.version == PHYSICAL_VERSION && AppConstants.platform != "win") ||
+      (AppConstants.platform == "win" && !isPhysicalJournal(state)) ||
+      (state.version === PHYSICAL_VERSION && AppConstants.platform != "win") ||
       (state.version == MAIL_VERSION && "books" in state) ||
       (state.version == BOOK_VERSION &&
         (!Array.isArray(state.books) || !state.books.length)) ||
@@ -1005,7 +1335,7 @@ export class MigrationJournal {
       ) {
         throw new Error("Invalid migration source identity");
       }
-      if (state.version == PHYSICAL_VERSION) {
+      if (isPhysicalJournal(state)) {
         const measured = validateMorkFolderWindowsInventory(source.inventory);
         if (
           typeof source.databaseSourceId != "string" ||
@@ -1055,7 +1385,7 @@ export class MigrationJournal {
 
   #validatePhysicalIdentities(state, file) {
     if (
-      state.version != PHYSICAL_VERSION &&
+      !isPhysicalJournal(state) &&
       (state.profilePhysicalIdentity !== undefined ||
         state.workPhysicalIdentity !== undefined ||
         [
@@ -1066,7 +1396,7 @@ export class MigrationJournal {
     ) {
       throw new Error("Physical identities require migration journal version4");
     }
-    if (state.version == PHYSICAL_VERSION) {
+    if (isPhysicalJournal(state)) {
       if (
         !Array.isArray(state.originalRoots) ||
         !state.originalRoots.length ||
@@ -1201,8 +1531,9 @@ export class MigrationJournal {
         throw new Error("Uncommitted migration book has a receipt");
       }
     }
+    this.#validateProtocolUnits(state);
     if (
-      state.version == PHYSICAL_VERSION &&
+      isPhysicalJournal(state) &&
       ["activate", "complete"].includes(state.stage)
     ) {
       throw new Error("Windows migration activation remains held");
@@ -1243,6 +1574,17 @@ export class MigrationJournal {
       throw new Error("Migration stage skips incomplete imports");
     }
   }
+}
+
+/**
+ * @param {object} state - Retained journal state.
+ * @returns {boolean} Whether Windows physical admission is required.
+ */
+function isPhysicalJournal(state) {
+  return (
+    AppConstants.platform == "win" &&
+    [PHYSICAL_VERSION, PROTOCOL_VERSION].includes(state.version)
+  );
 }
 
 /** @param {unknown} value - Hash value. @returns {boolean} Whether it is SHA-256. */

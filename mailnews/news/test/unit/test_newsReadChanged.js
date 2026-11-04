@@ -467,7 +467,7 @@ add_task(function test_failedReadSetReplacementRetainsPreviousSet() {
     "held-binding@example.invalid"
   );
   held.msgDatabase = null;
-  held.shutdown(false);
+  held.Shutdown(false);
   heldHeader.markRead(false);
   Assert.ok(
     !heldHeader.isRead,
@@ -567,7 +567,23 @@ add_task(async function test_newsrcWriteFailureRetainsPreviousFileAndRetry() {
 
 add_task(async function test_headAndXoverUseCapturedArticleNumbers() {
   for (const handler of [NNTP_RFC977_handler, NNTP_RFC2980_handler]) {
-    const fixture = await fetchReadSetArticles(handler, true);
+    const filterHits = sinon.spy(NntpNewsGroup.prototype, "applyFilterHit");
+    let fixture;
+    try {
+      fixture = await fetchReadSetArticles(handler, true);
+      info(
+        JSON.stringify(
+          filterHits.getCalls().map(call => ({
+            filter: call.args[0].filterName,
+            messageId: call.thisValue._filteringHdr.messageId,
+            read: call.thisValue._filteringHdr.isRead,
+          }))
+        )
+      );
+      Assert.ok(filterHits.called, "The actual installed filter was hit");
+    } finally {
+      filterHits.restore();
+    }
     const [folder, other] = fixture.folders;
     const db = folder.msgDatabase;
     Assert.equal(

@@ -60,6 +60,8 @@ void nsMsgXFVirtualFolderDBView::RemovePendingDBListeners() {
 
 NS_IMETHODIMP
 nsMsgXFVirtualFolderDBView::Close() {
+  ++mNativeSearchSerial;
+  mNativeLiveMatches.Clear();
   RemovePendingDBListeners();
   return nsMsgSearchDBView::Close();
 }
@@ -248,9 +250,16 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateNativeMatch(nsIMsgDBHdr* header) {
   int32_t member;
   MOZ_TRY(NativeMemberIndex(header, member));
   if (match && member < 0) {
+    const bool duringSearch = m_doingSearch;
+    const uint64_t serial = mNativeSearchSerial;
     mozilla::AutoRestore<bool> searching(m_doingSearch);
     m_doingSearch = false;
-    return OnSearchHit(header, physical);
+    MOZ_TRY(OnSearchHit(header, physical));
+    if (duringSearch && serial == mNativeSearchSerial &&
+        !mNativeLiveMatches.Contains(header)) {
+      mNativeLiveMatches.AppendObject(header);
+    }
+    return NS_OK;
   }
   if (!match && member >= 0)
     return OnHdrDeleted(header, nsMsgKey_None, 0, this);
@@ -278,6 +287,13 @@ NS_IMETHODIMP nsMsgXFVirtualFolderDBView::OnHdrDeleted(
           nsMsgSearchDBView::OnHdrDeleted(header, parent, flags, instigator));
       mNativeMembers.RemoveObjectAt(member);
       --m_totalMessagesInView;
+    }
+    nsMsgKey key;
+    MOZ_TRY(header->GetMessageKey(&key));
+    for (int32_t i = mNativeLiveMatches.Count() - 1; i >= 0; --i) {
+      nsMsgKey liveKey;
+      MOZ_TRY(mNativeLiveMatches[i]->GetMessageKey(&liveKey));
+      if (liveKey == key) mNativeLiveMatches.RemoveObjectAt(i);
     }
     return NS_OK;
   }
@@ -312,6 +328,27 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
       NS_ENSURE_TRUE(scope, NS_ERROR_NOT_AVAILABLE);
       scopes.AppendObject(scope);
     }
+    // A live match can belong to a scope with no scanner hits, or to a row
+    // passed before that scope's first hit. Its lifetime is the whole search,
+    // not the current scanner batch.
+    for (int32_t i = 0; i < mNativeLiveMatches.Count(); ++i) {
+      int32_t member;
+      MOZ_TRY(NativeMemberIndex(mNativeLiveMatches[i], member));
+      if (member < 0) continue;
+      nsCOMPtr<nsIMsgFolder> physical;
+      MOZ_TRY(mNativeMembers[member]->GetFolder(getter_AddRefs(physical)));
+      if (physical != folder) continue;
+      nsMsgKey key;
+      MOZ_TRY(mNativeMembers[member]->GetMessageKey(&key));
+      if (!replacement.Contains(key)) replacement.AppendElement(key);
+    }
+    // Validate all same-source keys, including live admissions, before merging
+    // the other physical partitions from the complete native cache.
+    for (nsMsgKey key : replacement) {
+      nsCOMPtr<nsIMsgDBHdr> header;
+      MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(header)));
+      NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+    }
     // Native cache keys are global, not partitioned by the receiver DB.
     // Finish the old enumeration before replacing the complete live union.
     nsCOMPtr<nsIMsgEnumerator> cached;
@@ -341,11 +378,6 @@ nsresult nsMsgXFVirtualFolderDBView::UpdateCacheAndViewForFolder(
           replacement.AppendElement(key);
         }
       }
-    }
-    for (nsMsgKey key : newHits) {
-      nsCOMPtr<nsIMsgDBHdr> header;
-      MOZ_TRY(db->GetMsgHdrForKey(key, getter_AddRefs(header)));
-      NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
     }
   }
   replacement.Sort();
@@ -480,6 +512,10 @@ nsMsgXFVirtualFolderDBView::OnSearchHit(nsIMsgDBHdr* aMsgHdr,
 
 NS_IMETHODIMP
 nsMsgXFVirtualFolderDBView::OnSearchDone(nsresult status) {
+  const uint64_t serial = mNativeSearchSerial;
+  auto clearLiveMatches = mozilla::MakeScopeExit([&] {
+    if (serial == mNativeSearchSerial) mNativeLiveMatches.Clear();
+  });
   // This batch began in OnNewSearch.
   if (mJSTree) mJSTree->EndUpdateBatch();
 
@@ -552,6 +588,8 @@ nsMsgXFVirtualFolderDBView::OnNewSearch() {
   m_doingSearch = true;
   m_totalMessagesInView = 0;
   mNativeMembers.Clear();
+  ++mNativeSearchSerial;
+  mNativeLiveMatches.Clear();
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     // Every search owns a fresh scope cursor and hit batch. In particular, an
     // empty first scope must not leave the previous last scope/hits active.

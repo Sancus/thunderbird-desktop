@@ -1299,6 +1299,105 @@ add_task(async function test_savedSearchLiveChangesDuringScan() {
   }
 });
 
+add_task(async function test_savedSearchLiveMatchesAcrossEmptyScanScopes() {
+  if (!savedSearchCore()) {
+    return;
+  }
+  for (const passedRow of [false, true]) {
+    const a = await messageInjection.makeEmptyFolder();
+    const b = await messageInjection.makeEmptyFolder();
+    const c = await messageInjection.makeEmptyFolder();
+    const first = addScopedMessage(a, "three-scope-a@scope.invalid");
+    const last = addScopedMessage(c, "three-scope-c@scope.invalid");
+    first.markFlagged(true);
+    last.markFlagged(true);
+    let seed;
+    let live;
+    if (passedRow) {
+      live = addScopedMessage(b, "three-scope-passed@scope.invalid");
+      seed = addScopedMessage(b, "three-scope-seed@scope.invalid");
+      seed.markFlagged(true);
+    }
+    const saved = messageInjection.makeVirtualFolder([a, b, c], {
+      subject: "scope-match",
+    });
+    VirtualFolderHelper.wrapVirtualFolder(saved).searchString =
+      "AND (status,is,flagged) AND (subject,contains,scope-match)";
+    const wrapper = make_view_wrapper();
+    await view_open(wrapper, saved);
+    const notify = wrapper._searchViewListener;
+    const progress = wrapper.search._sessionListener;
+    const originalLoaded = wrapper.listener.onMessagesLoaded;
+    let complete = 0;
+    wrapper.listener.onMessagesLoaded = function (all) {
+      if (all) {
+        complete++;
+      }
+      return originalLoaded.call(this, all);
+    };
+    try {
+      progress.onNewSearch();
+      notify.onNewSearch();
+      notify.onSearchHit(first, a);
+      if (!passedRow) {
+        live = addScopedMessage(b, "three-scope-arrival@scope.invalid");
+      }
+      live.markFlagged(true);
+      if (passedRow) {
+        // The scanner already passed this previously unmatched row. Its first
+        // actual hit in B must not discard the earlier live admission.
+        notify.onSearchHit(seed, b);
+      }
+      // With no scanner hit in B, the A-to-C transition flushes B as empty.
+      notify.onSearchHit(last, c);
+      notify.onSearchDone(Cr.NS_OK);
+      progress.onSearchDone(Cr.NS_OK);
+      const expected = [first, live, ...(seed ? [seed] : []), last];
+      Assert.equal(
+        wrapper._savedSearchError,
+        null,
+        "The three-source scan has no error"
+      );
+      Assert.equal(
+        complete,
+        1,
+        "The three-source registered scan completes once"
+      );
+      Assert.ok(
+        !wrapper.searching,
+        "The three-source scan is no longer loading"
+      );
+      assertScopedRows(wrapper, expected);
+      Assert.deepEqual(
+        scopedCache(a, saved),
+        expected
+          .map(header => [header.folder.URI, header.messageKey])
+          .sort((left, right) => left[1] - right[1]),
+        passedRow
+          ? "A passed B row survives B's first scanner hit and cache flush"
+          : "A live match survives an empty B scanner batch"
+      );
+      Assert.equal(saved.getTotalMessages(false), expected.length);
+      Assert.equal(saved.getNumUnread(false), expected.length);
+      await view_open(wrapper, saved);
+      assertScopedRows(wrapper, expected);
+      Assert.deepEqual(
+        scopedCache(a, saved),
+        expected
+          .map(header => [header.folder.URI, header.messageKey])
+          .sort((left, right) => left[1] - right[1]),
+        "Normal reopen retains the same complete physical cache union"
+      );
+      Assert.equal(saved.getTotalMessages(false), expected.length);
+      Assert.equal(saved.getNumUnread(false), expected.length);
+    } finally {
+      wrapper.listener.onMessagesLoaded = originalLoaded;
+      wrapper.close();
+      saved.parent.propagateDelete(saved, true);
+    }
+  }
+});
+
 add_task(async function test_savedSearchRebindDetachesOldScope() {
   if (!savedSearchCore()) {
     return;

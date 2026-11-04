@@ -54,6 +54,9 @@ class nsMsgXFVirtualFolderDBView : public nsMsgSearchDBView {
   nsresult NativeMemberIndex(nsIMsgDBHdr* header, int32_t& index);
   nsresult UpdateNativeMatch(nsIMsgDBHdr* header);
   nsCOMArray<nsIMsgDBHdr> mNativeMembers;
+  // Live matches must survive scanner batches that skipped their source/row.
+  nsCOMArray<nsIMsgDBHdr> mNativeLiveMatches;
+  uint64_t mNativeSearchSerial = 0;
   nsCOMArray<nsIMsgFolder> m_foldersSearchingOver;
   nsCOMArray<nsIMsgDBHdr> m_hdrHits;
   nsCOMPtr<nsIMsgFolder> m_curFolderGettingHits;

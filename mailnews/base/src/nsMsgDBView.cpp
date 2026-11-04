@@ -5755,6 +5755,21 @@ nsresult nsMsgDBView::SetThreadIgnored(nsIMsgThread* thread,
     if (ignored) {
       rv = CollapseByIndex(threadIndex, nullptr);
       NS_ENSURE_SUCCESS(rv, rv);
+      // The selected child can disappear at the viewport's top edge. Keep
+      // the collapsed physical root visible before navigating to the next
+      // thread, so its newly committed ignored state remains in context.
+      if (m_db == db) {
+        nsMsgViewIndex currentIndex = FindKey(key, false);
+        if (IsValidIndex(currentIndex)) {
+          if (mJSTree) {
+            rv = mJSTree->EnsureRowIsVisible(currentIndex);
+            NS_ENSURE_SUCCESS(rv, rv);
+          } else if (mTree) {
+            rv = mTree->EnsureRowIsVisible(currentIndex);
+            NS_ENSURE_SUCCESS(rv, rv);
+          }
+        }
+      }
     }
   }
   return NS_OK;

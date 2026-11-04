@@ -421,6 +421,54 @@ add_task(function test_sameArticleNumberStaysScopedToGroup() {
   }
 });
 
+add_task(async function test_nativeExpiryRejectsBeforeUsingPhysicalKeys() {
+  if (!nativeBackend) {
+    info("Legacy expiry is checked by the existing ordinary expiry file");
+    return;
+  }
+  const {
+    server,
+    folders: [folder],
+  } = articleFixture;
+  const db = folder.msgDatabase;
+  const keys = db.listAllKeys();
+  Assert.equal(keys.length, 2, "The actual NNTP headers are retained");
+  Assert.ok(
+    keys.every(key => key != 5001 && key != 5002),
+    "Physical keys do not overlap the server's live article numbers"
+  );
+  const flags = keys.map(key => db.getMsgHdrForKey(key).flags);
+  const readSet = folder.newsrcLine;
+  const known = db.dBFolderInfo.knownArtsSet;
+  Assert.ok(new MsgKeySet(known).has(5001));
+  Assert.ok(new MsgKeySet(known).has(5002));
+  const dirty = server.newsrcHasChanged;
+  const pool = server.wrappedJSObject;
+  const withClient = sinon.spy(pool, "withClient");
+  try {
+    await Assert.rejects(
+      pool.removeExpiredArticles(folder.name),
+      /NS_ERROR_NOT_IMPLEMENTED/,
+      "Unmapped native expiry rejects its existing Promise before deletion"
+    );
+    Assert.ok(!withClient.called, "No LISTGROUP request is started");
+  } finally {
+    withClient.restore();
+  }
+  Assert.deepEqual(
+    db.listAllKeys(),
+    keys,
+    "No live physical header is removed"
+  );
+  Assert.deepEqual(
+    keys.map(key => db.getMsgHdrForKey(key).flags),
+    flags
+  );
+  Assert.equal(folder.newsrcLine, readSet);
+  Assert.equal(db.dBFolderInfo.knownArtsSet, known);
+  Assert.equal(server.newsrcHasChanged, dirty);
+});
+
 add_task(function test_failedReadSetReplacementRetainsPreviousSet() {
   if (!nativeBackend) {
     info("The closed native facade and signed range controls are native-only");

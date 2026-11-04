@@ -649,9 +649,19 @@ export class NntpIncomingServer extends MsgIncomingServer {
    *
    * @param {string} groupName - The newsgroup name.
    * @returns {Promise<void>} Resolves after removing expired articles. Rejects
-   *   with the request status if fetching the article list fails.
+   *   with the request status if fetching the article list fails, or
+   *   NS_ERROR_NOT_IMPLEMENTED when native article-to-key mapping is unavailable.
    */
   removeExpiredArticles(groupName) {
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      // LISTGROUP numbers cannot be compared with native physical message keys.
+      return Promise.reject(
+        Components.Exception(
+          "Native news expiry requires mapped article identities",
+          Cr.NS_ERROR_NOT_IMPLEMENTED
+        )
+      );
+    }
     return new Promise((resolve, reject) => {
       const newsFolder = this.rootFolder
         .getChildNamed(groupName)

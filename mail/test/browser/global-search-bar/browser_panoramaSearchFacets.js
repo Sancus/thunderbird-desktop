@@ -64,19 +64,28 @@ add_task(
     );
     if (context.fullSet.length != fixture.matches.length) {
       const actual = new Set(context.fullSet.map(item => Number(item.id)));
-      const database = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      const database = Cc["@mozilla.org/mailnews/database-core;1"].getService(
         Ci.nsIDatabaseCore
-      );
+      ).messageDB;
+      const missing = [];
+      for (const header of fixture.matches.filter(
+        candidate => !actual.has(candidate.messageKey)
+      )) {
+        missing.push({
+          key: header.messageKey,
+          messageId: header.messageId,
+          native: database.getSearchState(header.messageKey),
+          indexed: await fixture.service.getText(String(header.messageKey)),
+        });
+      }
       info(
         JSON.stringify({
           progress,
-          missing: fixture.matches
-            .filter(header => !actual.has(header.messageKey))
-            .map(header => ({
-              key: header.messageKey,
-              messageId: header.messageId,
-              native: database.getSearchState(header.messageKey),
-            })),
+          missing,
+          changesAfterFixture: database.getSearchChanges(
+            progress.acceptedThrough,
+            500
+          ),
         })
       );
     }

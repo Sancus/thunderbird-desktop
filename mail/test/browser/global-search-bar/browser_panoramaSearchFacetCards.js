@@ -102,7 +102,31 @@ add_task(
             node => node.textContent == "Open Facet Card B"
           ),
         "The already-open facet refreshes after the real card notification"
-      );
+      ).catch(async error => {
+        const database = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+          Ci.nsIDatabaseCore
+        ).messageDB;
+        const copies = [];
+        for (const header of headers) {
+          copies.push({
+            key: header.messageKey,
+            native: database.getSearchState(header.messageKey),
+            indexed: await fixture.service.getText(String(header.messageKey)),
+          });
+        }
+        info(
+          JSON.stringify({
+            nameRefreshChangedResultSet: context.mailSearchResultSet != oldSet,
+            authors: Array.from(
+              doc.querySelectorAll(".message-author"),
+              node => node.textContent
+            ),
+            activeIds: Array.from(context.activeSet, item => item.id),
+            copies,
+          })
+        );
+        throw error;
+      });
       await tab.searchPromise;
       Assert.equal(tabmail.tabInfo.length, tabs);
       assertCurrent("Open Facet Card B");

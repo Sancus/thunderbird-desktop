@@ -15,7 +15,7 @@ const context = about3Pane.document.getElementById("folderPaneContext");
 
 let rootFolder, wrappedVirtual, virtualFolder, first, second, third, fourth;
 
-add_setup(async function () {
+add_setup(async function setup_savedSearchFolders() {
   const localAccount = MailServices.accounts.createLocalMailAccount();
   rootFolder = localAccount.incomingServer.rootFolder;
   rootFolder.QueryInterface(Ci.nsIMsgLocalMailFolder);
@@ -48,7 +48,7 @@ add_setup(async function () {
   });
 });
 
-add_task(async function () {
+add_task(async function test_editSearchedFolders() {
   const virtualPropsPromise = BrowserTestUtils.promiseAlertDialog(
     undefined,
     "chrome://messenger/content/virtualFolderProperties.xhtml",
@@ -283,4 +283,258 @@ add_task(async function test_searchOnline() {
 
     doc.querySelector("dialog").getButton("cancel").click();
   });
+});
+
+/**
+ * Stores a real local message for retained edit/selection controls.
+ *
+ * @param {nsIMsgFolder} folder - Physical destination.
+ * @param {string} id - Literal Message-ID without brackets.
+ * @returns {nsIMsgDBHdr} The actual stored header.
+ */
+function addEditMessage(folder, id) {
+  const contract = Services.prefs.getCharPref(
+    "mail.server.default.storeContractID"
+  );
+  Assert.equal(
+    folder.server.msgStore.storeType,
+    contract.includes("maildirstore") ? "maildir" : "mbox",
+    "Actual local store"
+  );
+  return folder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .addMessage(
+      "From: edit@example.invalid\r\nTo: reader@example.invalid\r\n" +
+        "Date: Tue, 1 Sep 2026 12:00:00 +0000\r\n" +
+        `Message-ID: <${id}>\r\nSubject: scope-edit\r\n\r\nStored body.\r\n`
+    );
+}
+
+add_task(async function test_scopeEditPreservesPhysicalSelectionAndGrouping() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    info(
+      "Native physical scope controls; original dialog cases retain Mork coverage"
+    );
+    return;
+  }
+  Assert.ok(
+    Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(Ci.nsIDatabaseCore)
+  );
+  const a = rootFolder.createLocalSubfolder("edit-a");
+  const b = rootFolder.createLocalSubfolder("edit-b");
+  const c = rootFolder.createLocalSubfolder("edit-c");
+  const removed = addEditMessage(a, "same-edit-id@example.invalid");
+  const retained = addEditMessage(b, "same-edit-id@example.invalid");
+  const copy = addEditMessage(c, "same-edit-id@example.invalid");
+  const saved = VirtualFolderHelper.createNewVirtualFolder(
+    "retained-edit",
+    rootFolder,
+    [a, b],
+    "AND (subject,contains,scope-edit)",
+    false
+  ).virtualFolder;
+  const oldMessagePane = about3Pane.paneLayout.messagePaneVisible;
+  about3Pane.paneLayout.messagePaneVisible = false;
+  try {
+    about3Pane.displayFolder(saved.URI);
+    await TestUtils.waitForCondition(
+      () =>
+        about3Pane.gViewWrapper.displayedFolder == saved &&
+        !about3Pane.gViewWrapper.searching &&
+        about3Pane.gDBView?.rowCount == 2,
+      "The original real saved-search view is loaded"
+    );
+    const wrapper = about3Pane.gViewWrapper;
+    wrapper.beginViewUpdate();
+    wrapper.sort("subjectCol", Ci.nsMsgViewSortOrder.ascending);
+    wrapper.showGroupedBySort = true;
+    wrapper.endViewUpdate();
+    await TestUtils.waitForCondition(
+      () => !wrapper.searching && wrapper.dbView?.rowCount > 0
+    );
+    wrapper.dbView.doCommand(Ci.nsMsgViewCommandType.expandAll);
+    const view = wrapper.dbView;
+    const keepIndex = view.findIndexOfMsgHdr(retained, true);
+    const dropIndex = view.findIndexOfMsgHdr(removed, true);
+    Assert.notEqual(keepIndex, 0xffffffff);
+    Assert.notEqual(dropIndex, 0xffffffff);
+    view.selection.rangedSelect(dropIndex, dropIndex, false);
+    view.selection.rangedSelect(keepIndex, keepIndex, true);
+    view.selection.currentIndex = keepIndex;
+    const flags = view.viewFlags;
+    const props = BrowserTestUtils.promiseAlertDialog(
+      undefined,
+      "chrome://messenger/content/virtualFolderProperties.xhtml",
+      {
+        async callback(win) {
+          await SimpleTest.promiseFocus(win);
+          // The existing picker callback feeds the real retained accept handler.
+          win.onFolderListDialogCallback(`${b.URI}|${c.URI}`);
+          win.document.querySelector("dialog").getButton("accept").click();
+        },
+      }
+    );
+    window.openDialog(
+      "chrome://messenger/content/virtualFolderProperties.xhtml",
+      "",
+      "chrome,titlebar,modal,centerscreen",
+      {
+        folder: saved,
+        editExistingFolder: true,
+        onOKCallback() {
+          wrapper.open(saved);
+        },
+      }
+    );
+    await props;
+    await TestUtils.waitForCondition(
+      () => !wrapper.searching && wrapper.dbView != view,
+      "The real properties accept rebuilt the retained view"
+    );
+    Assert.ok(
+      wrapper.showGroupedBySort,
+      "Grouping survives the scope edit and reopen"
+    );
+    Assert.equal(wrapper.dbView.viewFlags, flags);
+    Assert.equal(wrapper.primarySortColumnId, "subjectCol");
+    const identity = header => [header.folder.URI, header.messageKey];
+    Assert.deepEqual(
+      wrapper.dbView.getSelectedMsgHdrs().map(identity),
+      [identity(retained)],
+      "Only the surviving physical selection is restored"
+    );
+    Assert.deepEqual(
+      identity(
+        wrapper.dbView.getMsgHdrAt(wrapper.dbView.selection.currentIndex)
+      ),
+      identity(retained),
+      "The current physical header survives"
+    );
+    Assert.notEqual(
+      retained.messageKey,
+      copy.messageKey,
+      "Equal Message-ID copies remain distinct"
+    );
+    Assert.equal(wrapper.dbView.findIndexOfMsgHdr(removed, false), 0xffffffff);
+    Assert.notEqual(wrapper.dbView.findIndexOfMsgHdr(copy, true), 0xffffffff);
+  } finally {
+    about3Pane.displayFolder(first.URI);
+    about3Pane.paneLayout.messagePaneVisible = oldMessagePane;
+    saved.parent.propagateDelete(saved, true);
+  }
+});
+
+add_task(async function test_scopeEditErrorsAreNotSuccessfulReopen() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) return;
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  const source = rootFolder.createLocalSubfolder("edit-errors");
+  const header = addEditMessage(source, "error-edit@example.invalid");
+  const saved = VirtualFolderHelper.createNewVirtualFolder(
+    "retained-edit-error",
+    rootFolder,
+    [source],
+    "AND (subject,contains,scope-edit)",
+    false
+  ).virtualFolder;
+  const connection = core.connectionForTests;
+  let unavailable = false;
+  try {
+    about3Pane.displayFolder(saved.URI);
+    await TestUtils.waitForCondition(
+      () =>
+        !about3Pane.gViewWrapper.searching &&
+        about3Pane.gViewWrapper.displayedFolder == saved &&
+        about3Pane.gDBView?.rowCount == 1
+    );
+    const wrapper = about3Pane.gViewWrapper;
+    const oldView = wrapper.dbView;
+    let accepted = false;
+    const props = BrowserTestUtils.promiseAlertDialog(
+      undefined,
+      "chrome://messenger/content/virtualFolderProperties.xhtml",
+      {
+        async callback(win) {
+          await SimpleTest.promiseFocus(win);
+          connection.executeSimpleSQL(
+            "ALTER TABLE folder_properties RENAME TO s371_unavailable_properties"
+          );
+          unavailable = true;
+          try {
+            Assert.throws(
+              () => wrapper.open(saved),
+              error => error.result == Cr.NS_ERROR_FAILURE,
+              "Reopen returns the actual native definition read error"
+            );
+            Assert.equal(
+              wrapper.dbView,
+              oldView,
+              "Preflight failure preserves the usable old view"
+            );
+            Assert.equal(
+              wrapper.dbView.getMsgHdrAt(0).messageKey,
+              header.messageKey
+            );
+            const failed = new Promise(resolve => {
+              win.addEventListener(
+                "error",
+                event => {
+                  event.preventDefault();
+                  resolve(event.error);
+                },
+                { once: true }
+              );
+            });
+            win.document.querySelector("dialog").getButton("accept").click();
+            const error = await failed;
+            Assert.equal(
+              error.result,
+              Cr.NS_ERROR_FAILURE,
+              "The accept handler exposes its original write error"
+            );
+            Assert.ok(
+              !win.closed,
+              "A failed native write cannot accept/close the real dialog"
+            );
+            Assert.ok(!accepted, "The success callback did not run");
+          } finally {
+            connection.executeSimpleSQL(
+              "ALTER TABLE s371_unavailable_properties RENAME TO folder_properties"
+            );
+            unavailable = false;
+          }
+          win.document.querySelector("dialog").getButton("accept").click();
+        },
+      }
+    );
+    window.openDialog(
+      "chrome://messenger/content/virtualFolderProperties.xhtml",
+      "",
+      "chrome,titlebar,modal,centerscreen",
+      {
+        folder: saved,
+        editExistingFolder: true,
+        onOKCallback() {
+          accepted = true;
+          wrapper.open(saved);
+        },
+      }
+    );
+    await props;
+    Assert.ok(
+      accepted,
+      "The ordinary edit succeeds after restoring the real producer"
+    );
+    await TestUtils.waitForCondition(
+      () => !wrapper.searching && wrapper.dbView?.rowCount == 1
+    );
+  } finally {
+    if (unavailable)
+      connection.executeSimpleSQL(
+        "ALTER TABLE s371_unavailable_properties RENAME TO folder_properties"
+      );
+    about3Pane.displayFolder(first.URI);
+    saved.parent.propagateDelete(saved, true);
+  }
 });

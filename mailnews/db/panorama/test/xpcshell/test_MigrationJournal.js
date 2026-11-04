@@ -1332,29 +1332,41 @@ add_task(async function test_committedSnapshotRetainsMappingsOnSourceRefusal() {
       }
     }
 
-    journal = await MigrationJournal.open(path, plan.profilePath);
-    Assert.deepEqual(
-      journal.state,
-      committed,
-      mode + ": reopen retains progress"
-    );
+    const reopenRefuses = AppConstants.platform == "win" && mode != "changed";
+    if (!reopenRefuses) {
+      journal = await MigrationJournal.open(path, plan.profilePath);
+      Assert.deepEqual(
+        journal.state,
+        committed,
+        mode + ": reopen retains progress"
+      );
+    }
     await Assert.rejects(
-      journal.beginImport("folder-source"),
+      reopenRefuses
+        ? MigrationJournal.open(path, plan.profilePath)
+        : journal.beginImport("folder-source"),
       error =>
         mode == "missing"
           ? error.result === Cr.NS_ERROR_FILE_NOT_FOUND
           : error.name === "Error" &&
             error.message ===
               (mode == "replaced"
-                ? "Migration source physical identity changed"
+                ? "Retained Windows migration physical identity changed"
                 : "Migration source changed since backup"),
       mode + ": committed progress cannot bypass source verification"
     );
     Assert.deepEqual(
-      journal.state,
+      await IOUtils.readJSON(path),
       committed,
-      mode + ": failure retains mapping"
+      mode + ": failure retains committed mapping"
     );
+    if (!reopenRefuses) {
+      Assert.deepEqual(
+        journal.state,
+        committed,
+        mode + ": failure retains mapping"
+      );
+    }
     Assert.deepEqual(
       await IOUtils.read(path),
       persisted,

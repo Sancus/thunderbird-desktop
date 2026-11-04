@@ -187,7 +187,11 @@ function assertDisplayed(messages) {
 
   Assert.deepEqual(
     messages.map(m => `${m.messageKey}${m.folder.URI}`).toSorted(),
-    Object.keys(summary._msgNodes).toSorted(),
+    Array.from(summary._folderStates, ([uri, state]) =>
+      Array.from(state.members.keys(), key => `${key}${uri}`)
+    )
+      .flat()
+      .toSorted(),
     "the selected messages should be summarised"
   );
 }

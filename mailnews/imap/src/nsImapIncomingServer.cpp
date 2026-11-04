@@ -1084,7 +1084,9 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
 
   nsAutoCString uri;
   nsCString serverUri;
-  GetServerURI(serverUri);
+  // Discovery must use the URI of the existing physical root. Account settings
+  // can change after that root was created; rebuilding its URI loses children.
+  MOZ_TRY(rootFolder->GetURI(serverUri));
   uri.Assign(serverUri);
   int32_t leafPos = folderName.RFindChar('/');
   nsAutoCString parentName(folderName);

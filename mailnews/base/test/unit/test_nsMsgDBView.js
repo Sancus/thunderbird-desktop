@@ -1885,6 +1885,379 @@ add_task(async function test_killedBranchErrorsAndReopen() {
   gDBView.close();
 });
 
+/**
+ * Forward a stored header while replacing specific getters for date faults.
+ *
+ * @param {nsIMsgDBHdr} header - The real physical fixture header.
+ * @param {object} getters - Test getters keyed by their attribute names.
+ * @returns {nsIMsgDBHdr} The forwarding scriptable header.
+ */
+function threadDateHeader(header, getters) {
+  return new Proxy(
+    { QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]) },
+    {
+      get(target, property) {
+        if (property === "QueryInterface") {
+          return target.QueryInterface;
+        }
+        if (Object.hasOwn(getters, property)) {
+          return getters[property]();
+        }
+        const value = header[property];
+        return typeof value === "function" ? value.bind(header) : value;
+      },
+    }
+  );
+}
+
+add_task(async function test_searchThreadDateErrorPreservesVisibleOrder() {
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.ok(core instanceof Ci.nsIDatabaseCore);
+  Assert.ok(Services.prefs.getBoolPref("mail.panorama.enabled", false));
+  const pref = "mailnews.sort_threads_by_root";
+  const hadPref = Services.prefs.prefHasUserValue(pref);
+  const oldPref = Services.prefs.getBoolPref(pref);
+  const physical = header => [header.folder.URI, header.messageKey];
+  const capture = () => ({
+    rows: Array.from({ length: gDBView.rowCount }, (_, i) => [
+      physical(gDBView.getMsgHdrAt(i)),
+      gTreeView.getLevel(i),
+      gDBView.getFlagsAt(i),
+    ]),
+    selected: gDBView.getSelectedMsgHdrs().map(physical),
+    current: gFakeSelection.currentIndex,
+    pivot: gFakeSelection.shiftSelectPivot,
+    suppressed: gFakeSelection.selectEventsSuppressed,
+    sortType: gDBView.sortType,
+    sortOrder: gDBView.sortOrder,
+  });
+  try {
+    Services.prefs.setBoolPref(pref, false);
+    for (const sortType of [
+      Ci.nsMsgViewSortType.byDate,
+      Ci.nsMsgViewSortType.byReceived,
+    ]) {
+      for (const zeroDates of [false, true]) {
+        const parent = gMessageGenerator.makeMessage({ age: { days: 3 } });
+        const child = gMessageGenerator.makeMessage({
+          inReplyTo: parent,
+          age: { days: 2 },
+        });
+        const control = gMessageGenerator.makeMessage({ age: { days: 1 } });
+        const initial = new SyntheticMessageSet([parent, child, control]);
+        await set_gTestFolder(initial);
+        const [root, oldChild, outside] = initial.msgHdrList;
+        Assert.equal(
+          gTestFolder.server.getStringValue("storeContractID"),
+          "@mozilla.org/msgstore/berkeleystore;1"
+        );
+        if (zeroDates) {
+          root.date = 0;
+          oldChild.date = 0;
+        }
+        setup_view("search", Ci.nsMsgViewFlagsType.kThreadedDisplay);
+        gDBView.sort(sortType, Ci.nsMsgViewSortOrder.descending);
+        const incomingSet = new SyntheticMessageSet([
+          gMessageGenerator.makeMessage({ inReplyTo: parent }),
+        ]);
+        await messageInjection.addSetsToFolders([gTestFolder], [incomingSet]);
+        const [incoming] = incomingSet.msgHdrList;
+        if (zeroDates) {
+          incoming.date = 0;
+        }
+        gFakeSelection.select(gDBView.findIndexOfMsgHdr(oldChild, true));
+        const before = capture();
+        Assert.deepEqual(
+          before.rows.map(row => row[0]),
+          [outside, root, oldChild].map(physical)
+        );
+        const notify = gDBView.QueryInterface(Ci.nsIMsgSearchNotify);
+        if (!zeroDates) {
+          let reads = 0;
+          const forwarded = threadDateHeader(incoming, {
+            dateInSeconds() {
+              if (++reads === 3) {
+                throw Components.Exception(
+                  "Late search date read",
+                  Cr.NS_ERROR_ILLEGAL_VALUE
+                );
+              }
+              return incoming.dateInSeconds;
+            },
+          });
+          Assert.throws(
+            () => notify.onSearchHit(forwarded, gTestFolder),
+            error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE,
+            "The late caller returns the original date error"
+          );
+          Assert.equal(reads, 3, "Both earlier XF AddHdr date reads succeeded");
+          Assert.deepEqual(
+            capture(),
+            before,
+            "No visible mutation after failure"
+          );
+          const thread = gDBView.getThreadContainingMsgHdr(root);
+          Assert.equal(
+            thread.numChildren,
+            3,
+            "The earlier XF member prefix stays"
+          );
+          Assert.deepEqual(
+            Array.from({ length: thread.numChildren }, (_, i) =>
+              physical(thread.getChildHdrAt(i))
+            ),
+            [root, oldChild, incoming].map(physical)
+          );
+          Assert.equal(thread.newestMsgDate, incoming.dateInSeconds);
+          Assert.equal(
+            gDBView.getThreadContainingMsgHdr(incoming).threadKey,
+            thread.threadKey,
+            "The earlier hash association stays too"
+          );
+
+          // Rebuild from known physical inputs, not by replaying into the prefix.
+          gDBView.close();
+          setup_view("search", Ci.nsMsgViewFlagsType.kThreadedDisplay);
+          const rebuilt = gDBView.QueryInterface(Ci.nsIMsgSearchNotify);
+          rebuilt.onNewSearch();
+          for (const header of [root, oldChild, outside]) {
+            rebuilt.onSearchHit(header, gTestFolder);
+          }
+          rebuilt.onSearchDone(Cr.NS_OK);
+          gDBView.sort(sortType, Ci.nsMsgViewSortOrder.descending);
+        }
+        gFakeSelection.select(gDBView.findIndexOfMsgHdr(oldChild, true));
+        const selected = gDBView.getSelectedMsgHdrs().map(physical);
+        gDBView
+          .QueryInterface(Ci.nsIMsgSearchNotify)
+          .onSearchHit(incoming, gTestFolder);
+        Assert.deepEqual(
+          capture().rows.map(row => row[0]),
+          (zeroDates
+            ? [outside, root, oldChild, incoming]
+            : [root, oldChild, incoming, outside]
+          ).map(physical),
+          "Successful dates keep the exact physical thread order"
+        );
+        Assert.deepEqual(gDBView.getSelectedMsgHdrs().map(physical), selected);
+        Assert.equal(
+          gDBView.getThreadContainingMsgHdr(root).newestMsgDate,
+          zeroDates ? 0 : incoming.dateInSeconds,
+          "Zero is a successful newest date"
+        );
+        Assert.equal(gDBView.getThreadContainingMsgHdr(outside).numChildren, 1);
+        gDBView.close();
+      }
+    }
+  } finally {
+    gDBView.close();
+    if (hadPref) {
+      Services.prefs.setBoolPref(pref, oldPref);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+});
+
+add_task(async function test_newHeaderDateErrorPreservesView() {
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  Assert.ok(core instanceof Ci.nsIDatabaseCore);
+  Assert.ok(Services.prefs.getBoolPref("mail.panorama.enabled", false));
+  const connection = core.connectionForTests;
+  const pref = "mailnews.sort_threads_by_root";
+  const hadPref = Services.prefs.prefHasUserValue(pref);
+  const oldPref = Services.prefs.getBoolPref(pref);
+  const physical = header => [header.folder.URI, header.messageKey];
+  const capture = () => ({
+    rows: Array.from({ length: gDBView.rowCount }, (_, i) => [
+      physical(gDBView.getMsgHdrAt(i)),
+      gTreeView.getLevel(i),
+      gDBView.getFlagsAt(i),
+    ]),
+    selected: gDBView.getSelectedMsgHdrs().map(physical),
+    current: gFakeSelection.currentIndex,
+    pivot: gFakeSelection.shiftSelectPivot,
+    suppressed: gFakeSelection.selectEventsSuppressed,
+  });
+  try {
+    Services.prefs.setBoolPref(pref, false);
+    for (const sortType of [
+      Ci.nsMsgViewSortType.byDate,
+      Ci.nsMsgViewSortType.byReceived,
+    ]) {
+      for (const zeroDates of [false, true]) {
+        const parent = gMessageGenerator.makeMessage({ age: { days: 3 } });
+        const child = gMessageGenerator.makeMessage({
+          inReplyTo: parent,
+          age: { days: 2 },
+        });
+        const control = gMessageGenerator.makeMessage({ age: { days: 1 } });
+        const initial = new SyntheticMessageSet([parent, child, control]);
+        await set_gTestFolder(initial);
+        const [root, oldChild, outside] = initial.msgHdrList;
+        Assert.equal(
+          gTestFolder.server.getStringValue("storeContractID"),
+          "@mozilla.org/msgstore/berkeleystore;1"
+        );
+        if (zeroDates) {
+          root.date = 0;
+          oldChild.date = 0;
+        }
+        setup_view("threaded", Ci.nsMsgViewFlagsType.kThreadedDisplay);
+        gDBView.sort(sortType, Ci.nsMsgViewSortOrder.descending);
+        const db = gTestFolder.msgDatabase;
+        const listener = gDBView.QueryInterface(Ci.nsIDBChangeListener);
+        db.removeListener(listener);
+        const incomingSet = new SyntheticMessageSet([
+          gMessageGenerator.makeMessage({ inReplyTo: parent }),
+        ]);
+        await messageInjection.addSetsToFolders([gTestFolder], [incomingSet]);
+        const [incoming] = incomingSet.msgHdrList;
+        if (zeroDates) {
+          incoming.date = 0;
+        }
+        gFakeSelection.select(gDBView.findIndexOfMsgHdr(oldChild, true));
+        const before = capture();
+        Assert.deepEqual(
+          before.rows.map(row => row[0]),
+          [outside, root, oldChild].map(physical)
+        );
+        if (!zeroDates) {
+          let keyReads = 0;
+          let dateReads = 0;
+          let armedReads = 0;
+          let armed = false;
+          const forwarded = threadDateHeader(incoming, {
+            messageKey() {
+              // The second forwarded key read starts the final native lookup.
+              armed = ++keyReads === 2;
+              return incoming.messageKey;
+            },
+            dateInSeconds() {
+              dateReads++;
+              throw Components.Exception(
+                "Later incoming date error",
+                Cr.NS_ERROR_ILLEGAL_VALUE
+              );
+            },
+          });
+          const columns = [];
+          const schema = connection.createStatement(
+            "PRAGMA main.table_info(messages)"
+          );
+          try {
+            while (schema.executeStep()) {
+              const name = schema.getUTF8String(1);
+              columns.push(
+                name === "date"
+                  ? "view_newest_date_fault(date) AS date"
+                  : `"${name}"`
+              );
+            }
+          } finally {
+            schema.finalize();
+          }
+          connection.createFunction("view_newest_date_fault", 1, {
+            onFunctionCall(args) {
+              // GetMsgHdrForKey and CaptureMessage read the physical member
+              // before the third date evaluation in GetThreadMaxDate.
+              if (armed && ++armedReads === 3) {
+                throw Components.Exception(
+                  "Newest date SQL error",
+                  Cr.NS_ERROR_FAILURE
+                );
+              }
+              return args.getInt64(0);
+            },
+          });
+          try {
+            connection.executeSimpleSQL(
+              `CREATE TEMP VIEW messages AS SELECT ${columns.join(", ")} FROM main.messages`
+            );
+            Assert.throws(
+              () => listener.onHdrAdded(forwarded, root.messageKey, 0, null),
+              error => error.result === Cr.NS_ERROR_FAILURE,
+              "The original newest-date error wins before the later header read"
+            );
+            Assert.equal(keyReads, 2, "The final physical lookup was reached");
+            Assert.equal(
+              armedReads,
+              3,
+              "Two physical reads precede the failed max read"
+            );
+            Assert.equal(
+              dateReads,
+              0,
+              "The later date getter was never called"
+            );
+          } finally {
+            try {
+              connection.executeSimpleSQL("DROP VIEW IF EXISTS temp.messages");
+            } finally {
+              connection.removeFunction("view_newest_date_fault");
+            }
+          }
+          Assert.deepEqual(
+            capture(),
+            before,
+            "The newest error preserves the view"
+          );
+          armed = false;
+          Assert.throws(
+            () => listener.onHdrAdded(forwarded, root.messageKey, 0, null),
+            error => error.result === Cr.NS_ERROR_ILLEGAL_VALUE,
+            "A successful newest read exposes the distinct later header error"
+          );
+          Assert.equal(dateReads, 1);
+          Assert.deepEqual(
+            capture(),
+            before,
+            "The later date error preserves the view"
+          );
+        }
+        listener.onHdrAdded(incoming, root.messageKey, 0, null);
+        Assert.deepEqual(
+          capture().rows.map(row => row[0]),
+          (zeroDates
+            ? [outside, root, oldChild, incoming]
+            : [root, oldChild, incoming, outside]
+          ).map(physical),
+          "The same real physical delivery recovers with no duplicate rows"
+        );
+        Assert.deepEqual(
+          gDBView.getSelectedMsgHdrs().map(physical),
+          before.selected
+        );
+        Assert.equal(gFakeSelection.selectEventsSuppressed, before.suppressed);
+        const thread = db.getThreadContainingMsgHdr(root);
+        Assert.equal(
+          thread.newestMsgDate,
+          zeroDates ? 0 : incoming.dateInSeconds
+        );
+        Assert.deepEqual(
+          Array.from({ length: thread.numChildren }, (_, i) =>
+            physical(thread.getChildHdrAt(i))
+          ),
+          [root, oldChild, incoming].map(physical)
+        );
+        Assert.equal(db.getThreadContainingMsgHdr(outside).numChildren, 1);
+        gDBView.close();
+      }
+    }
+  } finally {
+    gDBView.close();
+    if (hadPref) {
+      Services.prefs.setBoolPref(pref, oldPref);
+    } else {
+      Services.prefs.clearUserPref(pref);
+    }
+  }
+});
+
 add_task(function test_teardown() {
   // Delete view reference to avoid a cycle leak.
   gFakeSelection.view = null;

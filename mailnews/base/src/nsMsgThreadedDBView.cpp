@@ -578,8 +578,10 @@ nsresult nsMsgThreadedDBView::OnNewHeader(nsIMsgDBHdr* newHdr,
        m_sortType == nsMsgViewSortType::byReceived) &&
       !mSortThreadsByRoot) {
     uint32_t newestMsgInThread = 0, msgDate = 0;
-    threadHdr->GetNewestMsgDate(&newestMsgInThread);
-    newHdr->GetDateInSeconds(&msgDate);
+    nsresult rv = threadHdr->GetNewestMsgDate(&newestMsgInThread);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = newHdr->GetDateInSeconds(&msgDate);
+    NS_ENSURE_SUCCESS(rv, rv);
     moveThread = (msgDate == newestMsgInThread);
   }
 
@@ -890,8 +892,7 @@ nsMsgThreadedDBView::CloneDBView(nsIMsgWindow* aMsgWindow,
 
   if (!newMsgDBView) return NS_ERROR_OUT_OF_MEMORY;
 
-  nsresult rv =
-      CopyDBView(newMsgDBView, aMsgWindow, aCmdUpdater);
+  nsresult rv = CopyDBView(newMsgDBView, aMsgWindow, aCmdUpdater);
   NS_ENSURE_SUCCESS(rv, rv);
 
   NS_IF_ADDREF(*_retval = newMsgDBView);

@@ -420,8 +420,10 @@ nsresult nsMsgSearchDBView::AddHdrFromFolder(nsIMsgDBHdr* msgHdr,
            m_sortType == nsMsgViewSortType::byReceived) &&
           !mSortThreadsByRoot) {
         uint32_t newestMsgInThread = 0, msgDate = 0;
-        viewThread->GetNewestMsgDate(&newestMsgInThread);
-        msgHdr->GetDateInSeconds(&msgDate);
+        nsresult rv = viewThread->GetNewestMsgDate(&newestMsgInThread);
+        NS_ENSURE_SUCCESS(rv, rv);
+        rv = msgHdr->GetDateInSeconds(&msgDate);
+        NS_ENSURE_SUCCESS(rv, rv);
         moveThread = (msgDate == newestMsgInThread);
       }
 

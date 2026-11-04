@@ -112,10 +112,7 @@ add_setup(async function setupOriginalInventoryBeforeBackupAndNativeStartup() {
   for (const spec of REFERENCE_VARIANTS) {
     const fixture = do_get_file("data/" + spec.file + ".msf");
     // Keep profile NSS stores closed until the original backup is complete.
-    Assert.equal(
-      await hashMigrationFile(fixture.path),
-      spec.sha256
-    );
+    Assert.equal(await hashMigrationFile(fixture.path), spec.sha256);
     const bytes = await IOUtils.read(fixture.path);
     const copy = new FileUtils.File(PathUtils.join(work, spec.file + ".msf"));
     await IOUtils.write(copy.path, bytes, { mode: "create" });

@@ -4,16 +4,21 @@
 
 "use strict";
 
+var { NntpNewsGroup } = ChromeUtils.importESModule(
+  "resource:///modules/NntpNewsGroup.sys.mjs"
+);
+
 var incomingServer;
 var folder;
-
-add_setup(function () {
-  incomingServer = setupLocalServer(NNTP_PORT);
-  folder = incomingServer.rootFolder.getChildNamed("test.filter");
-});
+var articleKeys;
+let expiryFixtureId = 0;
+const nativeBackend = Services.prefs.getBoolPref(
+  "mail.panorama.enabled",
+  false
+);
 
 /**
- * Populate local headers and run a test against a fresh server.
+ * Populate real group articles and run a test against a fresh server/account.
  *
  * @param {typeof NNTP_RFC977_handler} handler - The server handler class.
  * @param {function(nsMailServer): Promise<void>} testFn - The test to run.
@@ -21,19 +26,73 @@ add_setup(function () {
 async function withServer(handler, testFn) {
   const server = makeServer(handler, setupNNTPDaemon());
   server.start();
-  incomingServer.port = server.port;
-  const db = folder.msgDatabase;
-  for (const key of [1, 2, 3]) {
-    const header = db.createNewHdrWithSpecificMsgKey(key);
-    header.messageId = `${key}@expired.invalid`;
-    db.attachHdr(header, true);
-  }
+  const created = localAccountUtils.create_incoming_server_and_account(
+    "nntp",
+    server.port,
+    `expiry-${expiryFixtureId++}`,
+    null,
+    "localhost"
+  );
+  incomingServer = created.server.QueryInterface(Ci.nsINntpIncomingServer);
+  incomingServer.pushAuth = false;
+  subscribeServer(incomingServer);
+  folder = incomingServer.rootFolder
+    .getChildNamed("test.filter")
+    .QueryInterface(Ci.nsIMsgNewsFolder);
   try {
+    const db = folder.msgDatabase;
+    if (nativeBackend) {
+      // A real producer in another group consumes the first global physical
+      // key so none of this group's keys can alias its wire articles 1,2,3.
+      const other = incomingServer.rootFolder
+        .getChildNamed("test.subscribe.simple")
+        .QueryInterface(Ci.nsIMsgNewsFolder);
+      const seed = new NntpNewsGroup(incomingServer, other);
+      try {
+        seed.getArticlesRangeToFetch(null, 1, 1);
+        seed.processXOverLine(
+          "1\tIndependent expiry group\tReader <reader@example.invalid>\tThu, 01 Oct 2026 12:00:00 +0000\t<expiry-seed@expired.invalid>\t\t20\t1"
+        );
+        seed.finishProcessingXOver();
+      } finally {
+        seed.cleanUp();
+      }
+      const reader = new NntpNewsGroup(incomingServer, folder);
+      try {
+        reader.getArticlesRangeToFetch(null, 1, 3);
+        for (const article of [1, 2, 3]) {
+          reader.processXOverLine(
+            `${article}\tExpiry ${article}\tReader <reader@example.invalid>\tThu, 01 Oct 2026 12:00:00 +0000\t<${article}@expired.invalid>\t\t20\t1`
+          );
+        }
+        reader.finishProcessingXOver();
+      } finally {
+        reader.cleanUp();
+      }
+    } else {
+      for (const key of [1, 2, 3]) {
+        const header = db.createNewHdrWithSpecificMsgKey(key);
+        header.messageId = `${key}@expired.invalid`;
+        db.attachHdr(header, true);
+      }
+    }
+    articleKeys = [1, 2, 3].map(article => {
+      const header = db.getMsgHdrForMessageID(`${article}@expired.invalid`);
+      Assert.ok(header, "The ordinary group producer published this article");
+      if (nativeBackend) {
+        Assert.notEqual(
+          header.messageKey,
+          article,
+          "Native physical key differs from the wire article"
+        );
+      }
+      return header.messageKey;
+    });
     await testFn(server);
   } finally {
     incomingServer.closeCachedConnections();
     await server.stop();
-    resetFolder(folder);
+    MailServices.accounts.removeAccount(created.account, false);
   }
 }
 
@@ -47,7 +106,7 @@ add_task(async function test_removeExpiredArticles() {
     await incomingServer.wrappedJSObject.removeExpiredArticles("test.filter");
     Assert.deepEqual(
       folder.msgDatabase.listAllKeys(),
-      [1, 3],
+      [articleKeys[0], articleKeys[2]],
       "a successful list should remove only articles absent from the server"
     );
     Assert.deepEqual(
@@ -72,7 +131,7 @@ add_task(async function test_failedListPreservesHeaders() {
     );
     Assert.deepEqual(
       folder.msgDatabase.listAllKeys(),
-      [1, 2, 3],
+      articleKeys,
       "a failed list should preserve every local header"
     );
   });
@@ -130,7 +189,7 @@ async function interruptList(interrupt, expectedError) {
     );
     Assert.deepEqual(
       folder.msgDatabase.listAllKeys(),
-      [1, 2, 3],
+      articleKeys,
       "an interrupted list should preserve every local header"
     );
     Assert.equal(
@@ -187,4 +246,88 @@ add_task(async function test_shutdownPreservesHeaders() {
     0,
     "shutdown should leave no cached connection"
   );
+});
+
+add_task(async function test_nativeMalformedListPreservesState() {
+  if (!nativeBackend) {
+    info("Mapped native LISTGROUP validation is inapplicable to Mork");
+    return;
+  }
+  class MalformedListHandler extends NNTP_RFC977_handler {
+    LISTGROUP() {
+      return "211 Articles follow:\n1\nnot-an-article\n.\n";
+    }
+  }
+  await withServer(MalformedListHandler, async () => {
+    const db = folder.msgDatabase;
+    const flags = articleKeys.map(key => db.getMsgHdrForKey(key).flags);
+    const newsrc = folder.newsrcLine;
+    const known = db.dBFolderInfo.knownArtsSet;
+    await Assert.rejects(
+      incomingServer.wrappedJSObject.removeExpiredArticles(folder.name),
+      /NS_ERROR_ILLEGAL_VALUE/,
+      "Malformed server article data preserves the original parse error"
+    );
+    Assert.deepEqual(
+      db.listAllKeys(),
+      articleKeys,
+      "Parsing failure removes no physical header"
+    );
+    Assert.deepEqual(
+      articleKeys.map(key => db.getMsgHdrForKey(key).flags),
+      flags
+    );
+    Assert.equal(folder.newsrcLine, newsrc);
+    Assert.equal(db.dBFolderInfo.knownArtsSet, known);
+  });
+});
+
+add_task(async function test_nativeClosedListSnapshotPreservesHeaders() {
+  if (!nativeBackend) {
+    info("Native captured-facade validation is inapplicable to Mork");
+    return;
+  }
+  class ListHandler extends NNTP_RFC977_handler {
+    LISTGROUP() {
+      return "211 Articles follow:\n1\n.\n";
+    }
+  }
+  await withServer(ListHandler, async () => {
+    const db = folder.msgDatabase;
+    const newsrc = folder.newsrcLine;
+    const pool = incomingServer.wrappedJSObject;
+    const withClient = pool.withClient;
+    let completions = 0;
+    pool.withClient = handler =>
+      withClient.call(pool, client => {
+        handler(client);
+        const onDone = client.onDone;
+        client.onDone = status => {
+          completions++;
+          Assert.equal(
+            status,
+            Cr.NS_OK,
+            "The real server list completed before invalidation"
+          );
+          db.forceClosed();
+          onDone(status);
+        };
+      });
+    try {
+      await Assert.rejects(
+        pool.removeExpiredArticles(folder.name),
+        /NS_ERROR_NOT_AVAILABLE/,
+        "A closed captured facade prevents the entire prune"
+      );
+    } finally {
+      pool.withClient = withClient;
+    }
+    Assert.equal(completions, 1, "LISTGROUP completes once");
+    Assert.deepEqual(
+      folder.msgDatabase.listAllKeys(),
+      articleKeys,
+      "A stale list removes no physical header"
+    );
+    Assert.equal(folder.newsrcLine, newsrc);
+  });
 });

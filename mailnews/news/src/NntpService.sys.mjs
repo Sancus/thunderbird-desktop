@@ -7,6 +7,8 @@ import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   NewsDownloader: "resource:///modules/NewsDownloader.sys.mjs",
+  captureNativeNewsArticle: "resource:///modules/NntpClient.sys.mjs",
+  revalidateNativeNewsArticle: "resource:///modules/NntpClient.sys.mjs",
 });
 ChromeUtils.defineLazyGetter(
   lazy,
@@ -122,7 +124,29 @@ export class NntpService {
     });
   }
 
+  /**
+   * Fetches the wire article bound to a local physical message key.
+   * Captured native source/group metadata is checked before dispatch and each
+   * data callback. Completion listeners receive the original request status.
+   *
+   * @param {nsIMsgFolder} folder - The owning newsgroup.
+   * @param {nsMsgKey} key - The physical message key (article key on Mork).
+   * @param {nsIMsgWindow} msgWindow - The request's message window.
+   * @param {nsISupports|null} consumer - An optional stream listener.
+   * @param {nsIUrlListener|null} urlListener - The URL completion listener.
+   * @returns {nsIURI} The URL identifying this exact pending request.
+   * @throws {nsIException} The original native binding error before dispatch.
+   */
   fetchMessage(folder, key, msgWindow, consumer, urlListener) {
+    const binding = Services.prefs.getBoolPref("mail.panorama.enabled", false)
+      ? lazy.captureNativeNewsArticle(
+          folder.QueryInterface(Ci.nsIMsgNewsFolder),
+          key
+        )
+      : null;
+    const saveOffline = folder.QueryInterface(
+      Ci.nsIMsgNewsFolder
+    ).saveArticleOffline;
     let streamListener, inputStream, outputStream;
     if (consumer instanceof Ci.nsIStreamListener) {
       streamListener = consumer;
@@ -131,23 +155,74 @@ export class NntpService {
       inputStream = pipe.inputStream;
       outputStream = pipe.outputStream;
     }
-
     const server = folder.server.QueryInterface(Ci.nsINntpIncomingServer);
-    server.wrappedJSObject.withClient(client => {
-      client.startRunningUrl(urlListener, msgWindow);
-
-      client.onOpen = () => {
-        client.getArticleByArticleNumber(folder.name, key);
-        streamListener?.onStartRequest(null);
-      };
-      client.onData = data => {
-        outputStream?.write(data, data.length);
-        streamListener?.onDataAvailable(null, inputStream, 0, data.length);
-      };
-      client.onDone = status => {
-        streamListener?.onStopRequest(null, status);
-      };
-    });
+    const uri = Services.io
+      .newURI(`news://${server.hostname}:${server.port}`)
+      .QueryInterface(Ci.nsIMsgMailNewsUrl);
+    let started = false;
+    let settled = false;
+    const finish = status => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (!started) {
+        started = true;
+        try {
+          streamListener?.onStartRequest(null);
+        } catch (error) {}
+      }
+      streamListener?.onStopRequest(null, status);
+    };
+    server.wrappedJSObject
+      .withClient(client => {
+        client.onDone = finish;
+        client.onOpen = () => {
+          try {
+            if (binding) {
+              lazy.revalidateNativeNewsArticle(binding);
+            }
+            started = true;
+            streamListener?.onStartRequest(null);
+            client.getArticleByArticleNumber(
+              folder.name,
+              binding?.articleNumber ?? key,
+              binding,
+              saveOffline
+            );
+          } catch (error) {
+            client._actionDone(error.result ?? Cr.NS_ERROR_FAILURE);
+          }
+        };
+        client.onData = data => {
+          if (
+            outputStream &&
+            outputStream.write(data, data.length) != data.length
+          ) {
+            throw Components.Exception(
+              "Short news service write",
+              Cr.NS_ERROR_FAILURE
+            );
+          }
+          streamListener?.onDataAvailable(null, inputStream, 0, data.length);
+        };
+        client.startRunningUrl(urlListener, msgWindow, uri);
+      })
+      .catch(error => {
+        if (settled) {
+          return;
+        }
+        const status = error.result ?? Cr.NS_ERROR_FAILURE;
+        try {
+          urlListener?.OnStartRunningUrl(uri, Cr.NS_OK);
+        } catch (e) {}
+        try {
+          finish(status);
+        } finally {
+          urlListener?.OnStopRunningUrl(uri, status);
+        }
+      });
+    return uri;
   }
 
   cancelMessage(cancelUrl, messageUri, consumer, urlListener, msgWindow) {
@@ -220,17 +295,21 @@ export class NntpService {
 
   downloadNewsgroupsForOffline(msgWindow, urlListener) {
     const downloader = new lazy.NewsDownloader(msgWindow, urlListener);
-    downloader.downloadAllOfflineNewsgroups();
+    downloader
+      .downloadAllOfflineNewsgroups()
+      .catch(error => console.error(error));
   }
 
   downloadFolderForOffline(folder, msgWindow) {
     const downloader = new lazy.NewsDownloader(msgWindow);
-    downloader.downloadFolder(folder);
+    downloader.downloadFolder(folder).catch(error => console.error(error));
   }
 
   downloadMessagesForOffline(folder, keys, msgWindow) {
     const downloader = new lazy.NewsDownloader(msgWindow);
-    downloader.downloadMessages(folder, keys);
+    downloader
+      .downloadMessages(folder, keys)
+      .catch(error => console.error(error));
   }
 
   /**

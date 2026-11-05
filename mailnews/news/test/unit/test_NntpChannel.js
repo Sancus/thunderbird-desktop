@@ -15,10 +15,56 @@ var { ServerTestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/ServerTestUtils.sys.mjs"
 );
 
-let server;
+var { NntpNewsGroup } = ChromeUtils.importESModule(
+  "resource:///modules/NntpNewsGroup.sys.mjs"
+);
 
-add_setup(function setup() {
-  const daemon = setupNNTPDaemon();
+let server;
+let daemon;
+const nativeBackend = Services.prefs.getBoolPref(
+  "mail.panorama.enabled",
+  false
+);
+
+/**
+ * Publishes a native article through the retained NNTP overview producer.
+ *
+ * @param {number} articleNumber - The actual wire article in test.filter.
+ * @returns {number} Its physical header key, or the legacy article key.
+ */
+function localArticleKey(articleNumber) {
+  if (!nativeBackend) {
+    return articleNumber;
+  }
+  const folder = _server.rootFolder
+    .getChildNamed("test.filter")
+    .QueryInterface(Ci.nsIMsgNewsFolder);
+  const article = daemon.getGroup("test.filter")[articleNumber];
+  Assert.ok(article, "The ordinary fake server owns this wire article");
+  const reader = new NntpNewsGroup(_server, folder);
+  try {
+    reader.getArticlesRangeToFetch(null, articleNumber, articleNumber);
+    reader.processXOverLine(
+      `${articleNumber}\tChannel article\tReader <reader@example.invalid>\tThu, 01 Oct 2026 12:00:00 +0000\t${article.messageID}\t\t20\t1`
+    );
+    reader.finishProcessingXOver();
+  } finally {
+    reader.cleanUp();
+  }
+  const header = folder.msgDatabase.getMsgHdrForMessageID(
+    article.messageID.slice(1, -1)
+  );
+  Assert.ok(header, "The real native producer published the requested header");
+  Assert.notEqual(
+    header.messageKey,
+    articleNumber,
+    "Physical key differs from the wire article"
+  );
+  return header.messageKey;
+}
+
+add_setup(async function setup() {
+  daemon = setupNNTPDaemon();
   server = new nsMailServer(() => {
     const handler = new NNTP_RFC977_handler(daemon);
     // Test NntpClient works with 201 response.
@@ -33,6 +79,20 @@ add_setup(function setup() {
   });
 
   setupLocalServer(NNTP_PORT);
+  if (nativeBackend) {
+    // Publish an actual article in another group first. Global physical keys
+    // must deliberately differ from the later test.filter wire numbers.
+    const seed = _server.rootFolder.getChildNamed("test.subscribe.simple");
+    seed.clearFlag(Ci.nsMsgFolderFlags.Offline);
+    const listener = new PromiseTestUtils.PromiseUrlListener();
+    seed.getNewMessages(null, listener);
+    await listener.promise;
+    Assert.equal(
+      seed.getTotalMessages(false),
+      1,
+      "Real NNTP ingestion reserves the independent group's physical row"
+    );
+  }
 });
 
 /**
@@ -43,7 +103,7 @@ add_task(async function test_fetchArticle() {
 
   // Init the uri and streamListener.
   const uri = Services.io.newURI(
-    `news://localhost:${NNTP_PORT}?group=test.filter&key=1`
+    `news://localhost:${NNTP_PORT}?group=test.filter&key=${localArticleKey(1)}`
   );
   const streamListener = new PromiseTestUtils.PromiseStreamListener();
 
@@ -503,19 +563,56 @@ add_task(async function test_nntpArticleWithoutHeaderInOfflineGroup() {
   _server.closeCachedConnections();
   server.resetTest();
   const folder = _server.rootFolder.getChildNamed("test.filter");
+  const newsFolder = folder.QueryInterface(Ci.nsIMsgNewsFolder);
+  const previousMode = newsFolder.saveArticleOffline;
+  const previousKeys = [...folder.messages].map(header => header.messageKey);
+  const previousReadSet = newsFolder.newsrcReadSet;
   folder.setFlag(Ci.nsMsgFolderFlags.Offline);
+  if (nativeBackend) {
+    // An online headerless fetch does not own another operation's save mode.
+    newsFolder.saveArticleOffline = true;
+  }
   try {
-    Assert.ok(
-      !folder.msgDatabase.containsKey(2),
-      "article 2 should have no local header"
-    );
+    if (nativeBackend) {
+      Assert.throws(
+        () => folder.msgDatabase.getMsgHdrForMessageID("2@regular.invalid"),
+        /NS_ERROR_ILLEGAL_VALUE/,
+        "The native message-ID getter reports exact absence for article 2"
+      );
+    } else {
+      Assert.ok(
+        !folder.msgDatabase.containsKey(2),
+        "article 2 should have no local header"
+      );
+    }
 
     const streamListener = new PromiseTestUtils.PromiseStreamListener();
     NetUtil.newChannel({
       uri: `nntp://localhost:${NNTP_PORT}/test.filter/2`,
       loadUsingSystemPrincipal: true,
     }).asyncOpen(streamListener);
-    await streamListener.promise;
+    Assert.stringContains(
+      await streamListener.promise,
+      "Message-ID: <2@regular.invalid>",
+      "The headerless online fetch returns its requested article"
+    );
+    if (nativeBackend) {
+      Assert.ok(
+        newsFolder.saveArticleOffline,
+        "The headerless fetch preserves the other operation's save mode"
+      );
+      Assert.deepEqual(
+        [...folder.messages].map(header => header.messageKey),
+        previousKeys,
+        "The headerless fetch never fabricates an offline physical row"
+      );
+      Assert.equal(newsFolder.newsrcReadSet, previousReadSet);
+      Assert.throws(
+        () => folder.msgDatabase.getMsgHdrForMessageID("2@regular.invalid"),
+        /NS_ERROR_ILLEGAL_VALUE/,
+        "The header remains absent after the successful body fetch"
+      );
+    }
 
     do_check_transaction(server.playTransaction(), [
       "MODE READER",
@@ -523,6 +620,7 @@ add_task(async function test_nntpArticleWithoutHeaderInOfflineGroup() {
       "ARTICLE 2",
     ]);
   } finally {
+    newsFolder.saveArticleOffline = previousMode;
     folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
   }
 });
@@ -536,7 +634,7 @@ add_task(async function test_groupAndKeyCacheEntries() {
   for (const key of [1, 2]) {
     const streamListener = new PromiseTestUtils.PromiseStreamListener();
     NetUtil.newChannel({
-      uri: `news://localhost:${NNTP_PORT}/?group=test.filter&key=${key}`,
+      uri: `news://localhost:${NNTP_PORT}/?group=test.filter&key=${localArticleKey(key)}`,
       loadUsingSystemPrincipal: true,
     }).asyncOpen(streamListener);
     const data = await streamListener.promise;
@@ -579,4 +677,80 @@ add_task(async function test_nntpCachedPartOffline() {
   } finally {
     Services.io.offline = false;
   }
+});
+
+add_task(function test_nativeMissingPhysicalKeyDoesNotFetchWireArticle() {
+  if (!nativeBackend) {
+    info("Strict physical binding applies to the native backend");
+    return;
+  }
+  const folder = _server.rootFolder.getChildNamed("test.filter");
+  const key = 0x7ffffffe;
+  Assert.ok(!folder.msgDatabase.containsKey(key));
+  const before = receivedCommands().filter(command =>
+    command.startsWith("ARTICLE ")
+  ).length;
+  const channel = NetUtil.newChannel({
+    uri: `news://localhost:${NNTP_PORT}/?group=test.filter&key=${key}`,
+    loadUsingSystemPrincipal: true,
+  });
+  Assert.throws(
+    () => channel.asyncOpen(new StatusListener()),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.equal(
+    receivedCommands().filter(command => command.startsWith("ARTICLE ")).length,
+    before,
+    "An unmapped physical key never becomes a wire ARTICLE request"
+  );
+});
+
+add_task(async function test_nativeMappedOfflineChannelUsesPhysicalBody() {
+  if (!nativeBackend) {
+    info("Native physical offline cache control is inapplicable to Mork");
+    return;
+  }
+  const folder = _server.rootFolder
+    .getChildNamed("test.filter")
+    .QueryInterface(Ci.nsIMsgNewsFolder);
+  const key = localArticleKey(1);
+  folder.saveArticleOffline = true;
+  const listener = new PromiseTestUtils.PromiseUrlListener();
+  try {
+    MailServices.nntp.fetchMessage(folder, key, null, null, listener);
+    await listener.promise;
+  } finally {
+    folder.saveArticleOffline = false;
+  }
+  Assert.ok(
+    folder.hasMsgOffline(key),
+    "The mapped physical row owns the actual stored body"
+  );
+  const before = receivedCommands().filter(command =>
+    command.startsWith("ARTICLE ")
+  ).length;
+  Services.io.offline = true;
+  try {
+    for (const uri of [
+      `news://localhost:${NNTP_PORT}/?group=test.filter&key=${key}`,
+      `nntp://localhost:${NNTP_PORT}/test.filter/1`,
+    ]) {
+      const stream = new PromiseTestUtils.PromiseStreamListener();
+      NetUtil.newChannel({ uri, loadUsingSystemPrincipal: true }).asyncOpen(
+        stream
+      );
+      Assert.stringContains(
+        await stream.promise,
+        "Message-ID: <1@regular.invalid>",
+        "Both local physical and explicit wire URLs read the same actual offline body"
+      );
+    }
+  } finally {
+    Services.io.offline = false;
+  }
+  Assert.equal(
+    receivedCommands().filter(command => command.startsWith("ARTICLE ")).length,
+    before,
+    "Offline display sends no new wire request"
+  );
 });

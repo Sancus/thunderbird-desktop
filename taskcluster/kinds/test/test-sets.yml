@@ -14,6 +14,7 @@
 
 gtest-tests:
     - gtest
+    - gtest-news-offline
 
 marionette-tests:
     - marionette

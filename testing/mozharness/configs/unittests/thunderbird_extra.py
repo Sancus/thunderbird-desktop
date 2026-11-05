@@ -22,8 +22,31 @@ config = {
                 "GTEST_FILTER": (
                     "TestMail*:TestMsg*:*XREAppDir*:"
                     "DeliveryCore*:FolderStorageMoveTest.*:"
-                    "LocalCopyHeaders.*:MigrationWindowsPath.*:QuarantinedOutputStream.*"
+                    "LocalCopyHeaders.*:MigrationWindowsPath.*:QuarantinedOutputStream.*:"
+                    "DeliveryCompleteHeader."
+                    "NewsArticleLocationRequiresExactPhysicalBinding:"
+                    "DeliveryCompleteHeader."
+                    "NewsArticleLocationRejectsStaleForeignAndCorruptBindings:"
+                    "DeliveryCompleteHeader."
+                    "NewsBodySettlementPreservesPreviousStateAndFlags:"
+                    "DeliveryCompleteHeader."
+                    "NewsBodySettlementFailureDoesNotReplay:"
+                    "DeliveryCompleteHeader."
+                    "NewsExpiryRequiresOriginalMappingBeforePhysicalRemoval"
                 ),
+            },
+        },
+        "gtest-news-offline": {
+            "env": {
+                "GTEST_FILTER": (
+                    "DeliveryNewsOfflineProvider."
+                    "NewsOfflineWriteFailuresRetainPriorBodyAndAllowFreshRetry:"
+                    "DeliveryNewsOfflineProvider."
+                    "NewsOfflineShortWritesRetainPriorBodyAndAllowFreshRetry:"
+                    "DeliveryNewsOfflineProvider."
+                    "NewsOfflineUncertainFinishDoesNotDiscardOrReplay"
+                ),
+                "MOZ_DEFAULT_PREFS": 'pref("mail.panorama.enabled", true);',
             },
         },
     },

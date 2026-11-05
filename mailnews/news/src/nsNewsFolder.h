@@ -107,6 +107,8 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
 
 #ifdef MOZ_PANORAMA
   nsresult GetNativeDatabase();
+  nsresult StoreNativeNewsArticle(uint32_t articleNumber,
+                                  const nsACString& data);
   nsresult InitializeNativeDatabase(nsIMsgDatabase* database);
   void DetachNativeReadSet();
   nsresult ApplyNativeReadRange(int32_t first, int32_t last);
@@ -139,6 +141,9 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   uint64_t mNativeDatabaseGeneration{0};
   bool mNativeDatabaseInitializing{false};
   bool mNativeDatabaseReadingSummary{false};
+  bool mNativeOfflineWriting{false};
+  class NativeDownload;
+  RefPtr<NativeDownload> mNativeDownload;
   // Binding ownership outlives the optional cached mDatabase reference.
   nsCOMPtr<nsINewsDatabase> mReadSetDatabase;
   // Only a passive file load may restore a known lossy zero companion.

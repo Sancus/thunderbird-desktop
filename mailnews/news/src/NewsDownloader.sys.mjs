@@ -34,65 +34,95 @@ export class NewsDownloader {
   }
 
   /**
-   * Download matching articles in all newsgroups that are set for offline use.
+   * Downloads matching articles in all groups configured for offline use.
+   * The optional batch listener receives the first error after all started
+   * servers settle; each failed server stops before its next folder.
+   *
+   * @returns {Promise<void>} Resolves after successful downloads, or rejects
+   *   with the original selection, body, provider or callback error.
    */
   async downloadAllOfflineNewsgroups() {
     this._logger.debug("Start downloading articles for offline use");
-    const servers = MailServices.accounts.allServers.filter(
-      x => x.type == "nntp"
-    );
-    // Download all servers concurrently.
-    await Promise.all(
-      servers.map(async server => {
-        const folders = server.rootFolder.descendants;
-        for (const folder of folders) {
-          if (folder.flags & Ci.nsMsgFolderFlags.Offline) {
-            // Download newsgroups set for offline use in a server one by one.
-            await this._downloadArticles(folder);
+    let failure = null;
+    try {
+      this._urlListener?.OnStartRunningUrl(null);
+      const servers = MailServices.accounts.allServers.filter(
+        x => x.type == "nntp"
+      );
+      // Keep existing server concurrency, but settle every started server before
+      // reporting the first actual failure to the batch listener.
+      await Promise.all(
+        servers.map(async server => {
+          try {
+            for (const folder of server.rootFolder.descendants) {
+              if (folder.flags & Ci.nsMsgFolderFlags.Offline) {
+                await this._downloadArticles(folder);
+              }
+            }
+          } catch (error) {
+            failure ??= error;
           }
-        }
-      })
-    );
-
-    this._urlListener?.OnStopRunningUrl(null, Cr.NS_OK);
-
+        })
+      );
+    } catch (error) {
+      failure ??= error;
+    }
+    try {
+      this._urlListener?.OnStopRunningUrl(
+        null,
+        failure?.result ?? (failure ? Cr.NS_ERROR_FAILURE : Cr.NS_OK)
+      );
+    } catch (error) {
+      failure ??= error;
+    }
+    this._clearStatus();
+    if (failure) {
+      throw failure;
+    }
     this._logger.debug("Finished downloading articles for offline use");
-    MailServices.feedback.reportStatus("");
   }
 
   /**
    * Download all matching articles in a single newsgroup.
    *
    * @param {nsIMsgFolder} folder - The newsgroup folder.
+   * @returns {Promise<void>} Resolves on success or rejects with the original
+   *   selection/body error, after restoring the offline mode.
    */
   async downloadFolder(folder) {
     this._logger.debug(
       "Start downloading articles for offline use in single folder."
     );
 
-    await this._downloadArticles(folder);
-
-    this._logger.debug(
-      "Finished downloading articles for offline use in single folder."
-    );
-    MailServices.feedback.reportStatus("");
+    try {
+      await this._downloadArticles(folder);
+      this._logger.debug(
+        "Finished downloading articles for offline use in single folder."
+      );
+    } finally {
+      this._clearStatus();
+    }
   }
 
   /**
    * Download specific articles in a single newsgroup.
    *
    * @param {nsIMsgFolder} folder - The newsgroup folder.
-   * @param {nsMsgKey[]} keys - The keys of the messages to download.
+   * @param {nsMsgKey[]} keys - The physical keys of messages to download.
+   * @returns {Promise<void>} Resolves on success or rejects with the original
+   *   download error, after restoring the offline mode.
    */
   async downloadMessages(folder, keys) {
     this._logger.debug("Start downloading specific articles for offline use");
 
-    await this._downloadArticles(folder, keys);
-
-    this._logger.debug(
-      "Finished downloading specific articles for offline use"
-    );
-    MailServices.feedback.reportStatus("");
+    try {
+      await this._downloadArticles(folder, keys);
+      this._logger.debug(
+        "Finished downloading specific articles for offline use"
+      );
+    } finally {
+      this._clearStatus();
+    }
   }
 
   /**
@@ -106,32 +136,50 @@ export class NewsDownloader {
   async _downloadArticles(folder, keys = null) {
     this._logger.debug(`Start downloading ${folder.URI}`);
 
-    keys ??= [...(await this._getKeysToDownload(folder))];
-    if (!keys.length) {
-      await this._updateStatus(folder, "no-articles-to-download", {
+    folder.QueryInterface(Ci.nsIMsgNewsFolder);
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    const previousSaveOffline = folder.saveArticleOffline;
+    if (native && previousSaveOffline) {
+      throw Components.Exception(
+        "News download already active",
+        Cr.NS_MSG_FOLDER_BUSY
+      );
+    }
+    folder.saveArticleOffline = true;
+    try {
+      keys ??= [...(await this._getKeysToDownload(folder))];
+      if (!keys.length) {
+        await this._updateStatus(folder, "no-articles-to-download", {
+          newsgroup: folder.localizedName,
+        });
+        return;
+      }
+
+      await this._updateStatus(folder, "downloading-articles-for-offline", {
+        count: keys.length,
         newsgroup: folder.localizedName,
       });
-      return;
-    }
 
-    await this._updateStatus(folder, "downloading-articles-for-offline", {
-      count: keys.length,
-      newsgroup: folder.localizedName,
-    });
-
-    folder.QueryInterface(Ci.nsIMsgNewsFolder).saveArticleOffline = true;
-    for (const key of keys) {
-      await new Promise(resolve => {
-        MailServices.nntp.fetchMessage(folder, key, this._msgWindow, null, {
-          OnStartRunningUrl() {},
-          OnStopRunningUrl() {
-            resolve();
-          },
+      for (const key of keys) {
+        await new Promise((resolve, reject) => {
+          MailServices.nntp.fetchMessage(folder, key, this._msgWindow, null, {
+            OnStartRunningUrl() {},
+            OnStopRunningUrl(uri, status) {
+              if (Components.isSuccessCode(status)) {
+                resolve();
+              } else {
+                reject(
+                  Components.Exception("Offline news download failed", status)
+                );
+              }
+            },
+          });
         });
-      });
+      }
+      folder.refreshSizeOnDisk();
+    } finally {
+      folder.saveArticleOffline = previousSaveOffline;
     }
-    folder.saveArticleOffline = false;
-    folder.refreshSizeOnDisk();
 
     this._logger.debug(`Finished downloading ${folder.URI}`);
   }
@@ -142,7 +190,7 @@ export class NewsDownloader {
    * (sub-)threads.
    *
    * @param {nsIMsgFolder} folder - The newsgroup folder.
-   * @returns {Set<number>}
+   * @returns {Promise<Set<number>>} The selected physical message keys.
    */
   async _getKeysToDownload(folder) {
     const searchSession = Cc[
@@ -197,21 +245,61 @@ export class NewsDownloader {
 
     const keysToDownload = new Set();
     const msgDatabase = folder.msgDatabase;
-    await new Promise(resolve => {
+    const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+    let selectionError = null;
+    await new Promise((resolve, reject) => {
       searchSession.registerListener(
         {
           onSearchHit(hdr) {
-            if (
-              hdr.flags & Ci.nsMsgMessageFlags.Offline ||
-              hdr.isKilled ||
-              msgDatabase.isIgnored(hdr.messageKey)
-            ) {
+            if (selectionError) {
               return;
             }
-            keysToDownload.add(hdr.messageKey);
+            try {
+              if (native) {
+                if (
+                  folder.msgDatabase != msgDatabase ||
+                  hdr.folder.id != folder.id
+                ) {
+                  throw Components.Exception(
+                    "News selection owner changed",
+                    Cr.NS_ERROR_NOT_AVAILABLE
+                  );
+                }
+                folder.getMessageIdForKey(hdr.messageKey);
+              }
+              if (
+                hdr.flags & Ci.nsMsgMessageFlags.Offline ||
+                hdr.isKilled ||
+                msgDatabase.isIgnored(hdr.messageKey)
+              ) {
+                return;
+              }
+              keysToDownload.add(hdr.messageKey);
+            } catch (error) {
+              selectionError = error;
+            }
           },
-          onSearchDone: () => {
-            resolve();
+          onSearchDone: status => {
+            try {
+              if (selectionError) {
+                throw selectionError;
+              }
+              if (!Components.isSuccessCode(status)) {
+                throw Components.Exception(
+                  "News download selection failed",
+                  status
+                );
+              }
+              if (native && folder.msgDatabase != msgDatabase) {
+                throw Components.Exception(
+                  "News selection owner changed",
+                  Cr.NS_ERROR_NOT_AVAILABLE
+                );
+              }
+              resolve();
+            } catch (error) {
+              reject(error);
+            }
           },
         },
         Ci.nsIMsgSearchSession.allNotifications
@@ -221,6 +309,15 @@ export class NewsDownloader {
     });
 
     return keysToDownload;
+  }
+
+  /** Clears status without replacing an earlier download failure. */
+  _clearStatus() {
+    try {
+      MailServices.feedback.reportStatus("");
+    } catch (error) {
+      this._logger.warn("Failed to clear news download status", error);
+    }
   }
 
   /**

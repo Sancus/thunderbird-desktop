@@ -12,6 +12,8 @@ ChromeUtils.defineESModuleGetters(lazy, {
   FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
   MailStringUtils: "resource:///modules/MailStringUtils.sys.mjs",
   NntpClient: "resource:///modules/NntpClient.sys.mjs",
+  captureNativeNewsArticle: "resource:///modules/NntpClient.sys.mjs",
+  revalidateNativeNewsArticle: "resource:///modules/NntpClient.sys.mjs",
   clearInterval: "resource://gre/modules/Timer.sys.mjs",
   setInterval: "resource://gre/modules/Timer.sys.mjs",
 });
@@ -638,8 +640,104 @@ export class NntpIncomingServer extends MsgIncomingServer {
       // Resolve the first waiting in queue.
       this._connectionWaitingQueue.shift()?.();
     };
-    handler(client);
-    client.connect();
+    client._prepareRequest();
+    try {
+      handler(client);
+      if (!client._done) {
+        client.connect();
+      }
+    } catch (error) {
+      client._actionDone(error.result ?? Cr.NS_ERROR_FAILURE);
+    }
+  }
+
+  /**
+   * Removes only absent articles from the captured native group's physical rows.
+   * A failed or malformed listing never starts removal. A later deletion failure
+   * retains actual committed prefix progress and returns the original error.
+   *
+   * @param {string} groupName - The subscribed newsgroup name.
+   * @returns {Promise<void>} Resolves after the checked removals.
+   * @throws {nsIException} The original listing, mapping or removal error.
+   */
+  async _removeExpiredNativeArticles(groupName) {
+    const folder = this.rootFolder
+      .getChildNamed(groupName)
+      .QueryInterface(Ci.nsIMsgNewsFolder);
+    const database = folder.msgDatabase;
+    const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const sourceId = core.sourceId;
+    const folderId = folder.id;
+    const articles = new Map();
+    for (const key of database.listAllKeys()) {
+      const binding = lazy.captureNativeNewsArticle(folder, key);
+      if (articles.has(binding.articleNumber)) {
+        throw Components.Exception(
+          "Duplicate native news article",
+          Cr.NS_ERROR_FILE_CORRUPTED
+        );
+      }
+      articles.set(binding.articleNumber, binding);
+    }
+    const present = new Set();
+    await new Promise((resolve, reject) => {
+      this.withClient(client => {
+        client.onDone = status => {
+          if (Components.isSuccessCode(status)) {
+            resolve();
+          } else {
+            reject(Components.Exception("List articles failed", status));
+          }
+        };
+        client.onOpen = () => {
+          try {
+            client.listgroup(groupName);
+          } catch (error) {
+            client._actionDone(error.result ?? Cr.NS_ERROR_FAILURE);
+          }
+        };
+        client.onData = line => {
+          const text = line.trim();
+          if (
+            !/^[0-9]+$/.test(text) ||
+            !Number.isSafeInteger(+text) ||
+            +text > 0x7fffffff
+          ) {
+            throw Components.Exception(
+              "Invalid LISTGROUP article",
+              Cr.NS_ERROR_ILLEGAL_VALUE
+            );
+          }
+          present.add(+text);
+        };
+        const uri = Services.io
+          .newURI(`news://${this.hostname}:${this.port}/${groupName}`)
+          .QueryInterface(Ci.nsIMsgMailNewsUrl);
+        client.startRunningUrl(null, null, uri);
+      }).catch(reject);
+    });
+    if (
+      core.sourceId != sourceId ||
+      folder.id != folderId ||
+      folder.msgDatabase != database
+    ) {
+      throw Components.Exception(
+        "News group changed during expiry",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+    // Check the entire captured selection before the first destructive call.
+    for (const binding of articles.values()) {
+      lazy.revalidateNativeNewsArticle(binding);
+    }
+    for (const [articleNumber, binding] of articles) {
+      if (!present.has(articleNumber)) {
+        lazy.revalidateNativeNewsArticle(binding);
+        folder.removeMessages([binding.physicalKey]);
+      }
+    }
   }
 
   /**
@@ -649,18 +747,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
    *
    * @param {string} groupName - The newsgroup name.
    * @returns {Promise<void>} Resolves after removing expired articles. Rejects
-   *   with the request status if fetching the article list fails, or
-   *   NS_ERROR_NOT_IMPLEMENTED when native article-to-key mapping is unavailable.
+   *   with the original request/database status if listing or validating the
+   *   selected physical group's article mappings fails.
    */
   removeExpiredArticles(groupName) {
     if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
-      // LISTGROUP numbers cannot be compared with native physical message keys.
-      return Promise.reject(
-        Components.Exception(
-          "Native news expiry requires mapped article identities",
-          Cr.NS_ERROR_NOT_IMPLEMENTED
-        )
-      );
+      return this._removeExpiredNativeArticles(groupName);
     }
     return new Promise((resolve, reject) => {
       const newsFolder = this.rootFolder

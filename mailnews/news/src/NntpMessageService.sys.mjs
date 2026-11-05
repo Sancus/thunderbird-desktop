@@ -7,6 +7,7 @@ import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   NntpUtils: "resource:///modules/NntpUtils.sys.mjs",
+  captureNativeNewsArticle: "resource:///modules/NntpClient.sys.mjs",
 });
 
 /**
@@ -237,7 +238,9 @@ class BaseMessageService {
     }
     const [folder, key] = this._decomposeNewsMessageURI(messageURI);
     const host = folder.rootFolder.URI;
-    const messageId = folder.getMessageIdForKey(key);
+    const messageId = Services.prefs.getBoolPref("mail.panorama.enabled", false)
+      ? lazy.captureNativeNewsArticle(folder, key).messageId
+      : folder.getMessageIdForKey(key);
     if (!messageId) {
       throw Components.Exception(
         `No message ID for message URI: ${messageURI}`,

@@ -164,6 +164,21 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   // nsIMsgDatabase keys remain global physical keys, even for a news folder.
   nsresult GetNewsArticleKey(uint32_t articleNumber, nsMsgKey& physicalKey);
   nsresult GetNewsArticleHdr(uint32_t articleNumber, nsIMsgDBHdr** header);
+  // Validate the unique current news binding of a physical member. Errors
+  // preserve outputs; article zero remains distinct from an absent binding.
+  nsresult GetNewsArticleLocation(nsMsgKey physicalKey,
+                                  NewsArticleIdentity& output);
+  nsresult CaptureNewsArticleBody(nsMsgKey physicalKey,
+                                  NewsArticleIdentity& article,
+                                  MessageBodyState& body);
+  // Storage has finished before settlement. Neither helper performs store I/O
+  // or retries a provider operation; current source/group/body guards remain.
+  nsresult SettleNewsArticleBody(const NewsArticleIdentity& expectedArticle,
+                                 const MessageBodyState& expectedBody,
+                                 const FinishedMessageBody& finished,
+                                 MessageBodyState& output);
+  nsresult RemoveNewsArticle(const NewsArticleIdentity& expectedArticle,
+                             nsMsgKey physicalKey);
   // Passive load preserves known zero on exact unchanged serialized ranges.
   // Explicit SetReadSet stays authoritative; failure leaves the target
   // untouched.

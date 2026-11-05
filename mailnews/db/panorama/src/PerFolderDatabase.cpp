@@ -201,6 +201,100 @@ nsresult PerFolderDatabase::GetNewsArticleHdr(uint32_t articleNumber,
   return GetMsgHdrForKey(physicalKey, header);
 }
 
+nsresult PerFolderDatabase::GetNewsArticleLocation(
+    nsMsgKey physicalKey, NewsArticleIdentity& output) {
+  NS_ENSURE_TRUE(mIsNewsFolder, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(physicalKey && physicalKey != nsMsgKey_None,
+                 NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  NS_ENSURE_TRUE(mNewsGroup.isSome(), NS_ERROR_NOT_AVAILABLE);
+  RefPtr<MessageDatabase> messages = &MessageDB();
+  MOZ_TRY(messages->RequireCommittedSearchRead());
+  NewsGroupIdentity current;
+  MOZ_TRY(
+      messages->GetNewsGroupIdentity(mDatabaseSourceId, mFolderId, current));
+  NS_ENSURE_TRUE(current.databaseSourceId == mNewsGroup->databaseSourceId &&
+                     current.folderId == mNewsGroup->folderId &&
+                     current.incarnation == mNewsGroup->incarnation,
+                 NS_ERROR_NOT_AVAILABLE);
+  Maybe<NewsArticleIdentity> article;
+  MOZ_TRY(messages->ReadNewsArticle(physicalKey, article));
+  NS_ENSURE_TRUE(article.isSome(), NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(article->group.databaseSourceId == current.databaseSourceId &&
+                     article->group.folderId == current.folderId &&
+                     article->group.incarnation == current.incarnation,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsMsgKey mapped;
+  MOZ_TRY(messages->GetNewsArticleKey(*article, mapped));
+  NS_ENSURE_TRUE(mapped == physicalKey, NS_ERROR_FILE_CORRUPTED);
+  output = std::move(*article);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::CaptureNewsArticleBody(nsMsgKey physicalKey,
+                                                   NewsArticleIdentity& article,
+                                                   MessageBodyState& body) {
+  NewsArticleIdentity preparedArticle;
+  MOZ_TRY(GetNewsArticleLocation(physicalKey, preparedArticle));
+  MessageBodyState preparedBody;
+  MOZ_TRY(MessageDB().GetMessageBodyState(physicalKey, preparedBody));
+  NS_ENSURE_TRUE(
+      preparedBody.databaseSourceId == preparedArticle.group.databaseSourceId &&
+          preparedBody.folderId == preparedArticle.group.folderId &&
+          preparedBody.key == physicalKey,
+      NS_ERROR_NOT_AVAILABLE);
+  article = std::move(preparedArticle);
+  body = std::move(preparedBody);
+  return NS_OK;
+}
+
+nsresult PerFolderDatabase::SettleNewsArticleBody(
+    const NewsArticleIdentity& expectedArticle,
+    const MessageBodyState& expectedBody, const FinishedMessageBody& finished,
+    MessageBodyState& output) {
+  RefPtr<PerFolderDatabase> self(this);
+  NS_ENSURE_TRUE(expectedArticle.articleNumber <= INT32_MAX,
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_FALSE(finished.storeToken.IsEmpty(), NS_ERROR_INVALID_ARG);
+  NewsArticleIdentity current;
+  MOZ_TRY(GetNewsArticleLocation(expectedBody.key, current));
+  NS_ENSURE_TRUE(
+      current.group.databaseSourceId ==
+              expectedArticle.group.databaseSourceId &&
+          current.group.folderId == expectedArticle.group.folderId &&
+          current.group.incarnation == expectedArticle.group.incarnation &&
+          current.articleNumber == expectedArticle.articleNumber &&
+          expectedBody.databaseSourceId == current.group.databaseSourceId &&
+          expectedBody.folderId == current.group.folderId,
+      NS_ERROR_NOT_AVAILABLE);
+  // Core fills the caller's output before its committed callbacks. Do not
+  // replace that output after a nested consumer has already observed it.
+  return MessageDB().SettleMessageBody(expectedBody, finished, output);
+}
+
+nsresult PerFolderDatabase::RemoveNewsArticle(
+    const NewsArticleIdentity& expectedArticle, nsMsgKey physicalKey) {
+  RefPtr<PerFolderDatabase> self(this);
+  NS_ENSURE_TRUE(expectedArticle.articleNumber <= INT32_MAX,
+                 NS_ERROR_INVALID_ARG);
+  NewsArticleIdentity current;
+  MOZ_TRY(GetNewsArticleLocation(physicalKey, current));
+  NS_ENSURE_TRUE(
+      current.group.databaseSourceId ==
+              expectedArticle.group.databaseSourceId &&
+          current.group.folderId == expectedArticle.group.folderId &&
+          current.group.incarnation == expectedArticle.group.incarnation &&
+          current.articleNumber == expectedArticle.articleNumber,
+      NS_ERROR_NOT_AVAILABLE);
+  // This is the same physical removal used by DeleteMessages for news. The
+  // validated news facade supplies its captured owner and offline accounting,
+  // without resolving a different folder wrapper during the operation.
+  return MessageDB().RemoveMessageFromFolder(
+      physicalKey, mFolderId, mDatabaseSourceId,
+      MessageRemovalAccounting::OfflineMessageSize);
+}
+
 nsresult PerFolderDatabase::CaptureDatabaseSourceId() {
   // Capture once without opening a core or changing a caller-owned transaction.
   // Keep both the original spelling and the first error for later admission.

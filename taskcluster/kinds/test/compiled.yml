@@ -37,3 +37,22 @@ gtest:
     test-manifest-loader: null  # don't load tests in the taskgraph
     target: null
     tier: default
+
+gtest-news-offline:
+    description: "News offline provider GTests run"
+    suite:
+        name: gtest-news-offline
+        category: gtest
+    treeherder-symbol: GTest-noff
+    instance-size:
+        by-test-platform:
+            linux.*: xlarge-noscratch
+            windows.*asan.*: xlarge
+            default: default
+    run-on-projects:
+        by-test-platform:
+            macosx.*: []  # currently fails on macOS
+            default: built-projects
+    test-manifest-loader: null  # don't load tests in the taskgraph
+    target: null
+    tier: default

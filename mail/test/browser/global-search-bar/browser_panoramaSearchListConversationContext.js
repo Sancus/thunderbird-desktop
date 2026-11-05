@@ -59,7 +59,10 @@ add_task(
       }
       await SpecialPowers.popPrefEnv();
     });
-    const localRoot = MailServices.accounts.localFoldersServer.rootFolder;
+    const localRoot =
+      MailServices.accounts.localFoldersServer.rootFolder.QueryInterface(
+        Ci.nsIMsgLocalMailFolder
+      );
     for (const [name, flag] of [
       ["Inbox", Ci.nsMsgFolderFlags.Inbox],
       ["Sent", Ci.nsMsgFolderFlags.SentMail],

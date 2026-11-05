@@ -7,11 +7,25 @@
  * Drafts folders.
  */
 
+const { MockAlertsService } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/MockAlertsService.sys.mjs"
+);
+
 let imapServer;
 let localAccount;
 let smtpAccount;
 let smtpIdentity;
 let smtpOutgoingServer;
+
+/**
+ * Finish the real server warning before another recovery operation starts.
+ */
+function finishServerAlert() {
+  if (MockAlertsService.alert) {
+    MockAlertsService.callbacks.onAlertFinished();
+    MockAlertsService.reset();
+  }
+}
 
 /**
  * Replace the prompt service with a recovery-prompt handler.
@@ -28,6 +42,13 @@ function mockRecoveryPrompt(composeWindow, buttonPressed, onPrompt) {
   Services.prompt = {
     QueryInterface: ChromeUtils.generateQI(["nsIPromptService"]),
     confirmEx(parentWindow) {
+      Assert.ok(
+        MockAlertsService.alert?.text.includes(
+          `${imapServer.daemon.commandToFail} failed`
+        ),
+        "The failed IMAP command emitted its separate server warning"
+      );
+      finishServerAlert();
       state.count++;
       state.hadOpenComposeParent &&=
         parentWindow == composeWindow && !composeWindow.closed;
@@ -39,6 +60,7 @@ function mockRecoveryPrompt(composeWindow, buttonPressed, onPrompt) {
   return {
     promptCalled: promptCalled.promise,
     restore() {
+      finishServerAlert();
       Services.prompt = originalPrompt;
     },
     state,
@@ -59,7 +81,7 @@ function progressStopPromise(composeWindow) {
 }
 
 add_setup(async function () {
-  await SpecialPowers.pushPrefEnv({ set: [["logging.IMAP", 5]] });
+  MockAlertsService.init();
   await addLoginInfo("imap://test.test", "user", "password");
   await addLoginInfo("smtp://test.test", "user", "password");
 
@@ -93,7 +115,7 @@ add_setup(async function () {
     MailServices.accounts.removeAccount(localAccount, false);
     await Services.logins.removeAllLoginsAsync();
   });
-  registerCleanupFunction(() => SpecialPowers.popPrefEnv());
+  registerCleanupFunction(() => MockAlertsService.cleanup());
 });
 
 add_task(async function testSentCopyFailureOffersRecovery() {

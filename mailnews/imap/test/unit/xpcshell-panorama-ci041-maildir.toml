@@ -35,3 +35,5 @@ tags = ["panorama-ci041", "maildir", "cpp"]
 ["test_imapSearch.js"]
 
 ["test_imapUnsolicitedXDuringIdle.js"]
+
+["test_multiFolderMove.js"]

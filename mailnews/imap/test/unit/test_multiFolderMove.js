@@ -19,6 +19,24 @@ const FOLDERS = ["a", "b", "c"];
 
 add_setup(async function () {
   setupIMAPPump();
+  const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const databaseService = Cc[
+    "@mozilla.org/msgDatabase/msgDBService;1"
+  ].getService(Ci.nsIMsgDBService);
+  Assert.equal(
+    "nsIDatabaseCore" in Ci && databaseService instanceof Ci.nsIDatabaseCore,
+    native,
+    "The ordinary manifest selects the actual database backend"
+  );
+  const storeContract = Services.prefs.getCharPref(
+    "mail.serverDefaultStoreContractID"
+  );
+  const storeType = {
+    "@mozilla.org/msgstore/berkeleystore;1": "mbox",
+    "@mozilla.org/msgstore/maildirstore;1": "maildir",
+  }[storeContract];
+  Assert.ok(storeType);
+  Assert.equal(IMAPPump.incomingServer.msgStore.storeType, storeType);
   IMAPPump.inbox.hierarchyDelimiter = "/";
   IMAPPump.inbox.verifiedAsOnlineFolder = true;
 
@@ -62,6 +80,25 @@ add_task(async function testMultiFolderMove() {
       `${name} should not be left in the Inbox after move`
     );
   }
+});
+
+add_task(async function testMoveFolderToAccountRoot() {
+  const root = IMAPPump.incomingServer.rootFolder;
+  const sourceParent = IMAPPump.inbox.getChildNamed("dest");
+  const source = sourceParent.getChildNamed("a");
+  Assert.ok(root.isServer, "The destination is the actual account root");
+  Assert.ok(source);
+  const listener = new PromiseTestUtils.PromiseCopyListener();
+  MailServices.copy.copyFolder(source, root, true, listener, null);
+  await listener.promise;
+  Assert.ok(root.getChildNamed("a"), "The moved folder exists at the root");
+  Assert.strictEqual(
+    sourceParent.getChildNamed("a"),
+    null,
+    "The source folder is removed only after the successful root move"
+  );
+  Assert.ok(sourceParent.getChildNamed("b"), "The sibling folder is preserved");
+  Assert.ok(sourceParent.getChildNamed("c"), "The other sibling is preserved");
 });
 
 add_task(function teardown() {

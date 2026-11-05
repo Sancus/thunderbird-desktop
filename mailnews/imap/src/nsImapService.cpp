@@ -133,6 +133,15 @@ nsresult nsImapService::GetFolderName(nsIMsgFolder* aImapFolder,
   nsCOMPtr<nsIMsgImapMailFolder> aFolder(do_QueryInterface(aImapFolder, &rv));
   NS_ENSURE_SUCCESS(rv, rv);
 
+  bool isServer;
+  MOZ_TRY(aImapFolder->GetIsServer(&isServer));
+  if (isServer) {
+    // The account root has no mailbox component. It is a valid destination,
+    // but nsImapURI2FullName deliberately requires a nonempty mailbox name.
+    aFolderName.Truncate();
+    return NS_OK;
+  }
+
   nsCString onlineName;
   // Online name is in MUTF-7 or UTF-8.
   rv = aFolder->GetOnlineName(onlineName);

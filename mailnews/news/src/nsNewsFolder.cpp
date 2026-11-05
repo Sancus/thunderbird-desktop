@@ -47,6 +47,14 @@
 #  include "DatabaseCore.h"
 #  include "FolderDatabase.h"
 #  include "PerFolderDatabase.h"
+#  include "../../local/src/nsLocalUtils.h"
+#  include "nsMsgLocalStoreUtils.h"
+#  include "nsPrintfCString.h"
+#  include "nsIMsgSearchSession.h"
+#  include "nsIMsgSearchNotify.h"
+#  include "nsIMsgSearchTerm.h"
+#  include "nsIMsgSearchValue.h"
+#  include "nsMsgSearchCore.h"
 #  include "nsQueryObject.h"
 #  include "mozilla/CheckedInt.h"
 #  include "mozilla/ResultExtensions.h"
@@ -57,6 +65,225 @@
 #define kNewsMessageRootURI "news-message:/"
 
 using mozilla::Preferences;
+
+#ifdef MOZ_PANORAMA
+// The existing folder API has a completion listener, while the legacy service's
+// folder downloader is void. Keep this native operation on those existing
+// search/URL interfaces so queue admission cannot be reported as body success.
+class nsMsgNewsFolder::NativeDownload final : public nsIMsgSearchNotify,
+                                              public nsIUrlListener {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMSGSEARCHNOTIFY
+  NS_DECL_NSIURLLISTENER
+
+  NativeDownload(nsMsgNewsFolder* folder, nsIUrlListener* listener,
+                 nsIMsgWindow* window)
+      : mFolder(folder), mListener(listener), mWindow(window) {}
+
+  nsresult Start() {
+    RefPtr<nsMsgNewsFolder> folder = mFolder;
+    NS_ENSURE_FALSE(folder->m_downloadMessageForOfflineUse, NS_MSG_FOLDER_BUSY);
+    mPreviousSaveOffline = folder->m_downloadMessageForOfflineUse;
+    folder->m_downloadMessageForOfflineUse = true;
+    mOwnsSaveOffline = true;
+    MOZ_TRY(folder->GetDatabase());
+    NS_ENSURE_FALSE(mDone, NS_BINDING_ABORTED);
+    mDatabase = folder->mDatabase;
+    mNative = do_QueryObject(mDatabase);
+    NS_ENSURE_TRUE(mNative, NS_ERROR_NOT_AVAILABLE);
+    nsresult rv;
+    nsCOMPtr<nsIDatabaseCore> core =
+        do_GetService("@mozilla.org/mailnews/database-core;1", &rv);
+    MOZ_TRY(rv);
+    MOZ_TRY(core->GetSourceId(mSourceId));
+    mService = do_GetService("@mozilla.org/messenger/nntpservice;1", &rv);
+    MOZ_TRY(rv);
+    mSearch = do_CreateInstance("@mozilla.org/messenger/searchSession;1", &rv);
+    MOZ_TRY(rv);
+    nsCOMPtr<nsIMsgDownloadSettings> settings;
+    MOZ_TRY(mFolder->GetDownloadSettings(getter_AddRefs(settings)));
+    bool unreadOnly, byDate;
+    uint32_t days;
+    MOZ_TRY(settings->GetDownloadUnreadOnly(&unreadOnly));
+    MOZ_TRY(settings->GetDownloadByDate(&byDate));
+    MOZ_TRY(settings->GetAgeLimitOfMsgsToDownload(&days));
+    if (unreadOnly) {
+      MOZ_TRY(AddTerm(nsMsgSearchAttrib::MsgStatus, nsMsgSearchOp::Isnt,
+                      nsMsgMessageFlags::Read));
+    }
+    if (byDate) {
+      MOZ_TRY(AddTerm(nsMsgSearchAttrib::AgeInDays, nsMsgSearchOp::IsLessThan,
+                      days));
+    }
+    MOZ_TRY(AddTerm(nsMsgSearchAttrib::MsgStatus, nsMsgSearchOp::Isnt,
+                    nsMsgMessageFlags::Offline));
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    MOZ_TRY(mFolder->GetServer(getter_AddRefs(server)));
+    bool limitSize;
+    int32_t maxSize;
+    MOZ_TRY(server->GetLimitOfflineMessageSize(&limitSize));
+    MOZ_TRY(server->GetMaxMessageSize(&maxSize));
+    if (limitSize && maxSize > 0) {
+      MOZ_TRY(AddTerm(nsMsgSearchAttrib::Size, nsMsgSearchOp::IsLessThan,
+                      static_cast<uint32_t>(maxSize)));
+    }
+    MOZ_TRY(mSearch->AddScopeTerm(nsMsgSearchScope::localNews, mFolder));
+    if (mListener) {
+      MOZ_TRY(mListener->OnStartRunningUrl(nullptr));
+    }
+    NS_ENSURE_FALSE(mDone, NS_BINDING_ABORTED);
+    MOZ_TRY(
+        mSearch->RegisterListener(this, nsIMsgSearchSession::allNotifications));
+    nsCOMPtr<nsIMsgSearchSession> search = mSearch;
+    return search->Search(mWindow);
+  }
+
+  void Cancel() { Complete(NS_BINDING_ABORTED); }
+
+  void Complete(nsresult status) {
+    if (mDone) return;
+    RefPtr<NativeDownload> self(this);
+    mDone = true;
+    if (mSearch) {
+      nsCOMPtr<nsIMsgSearchSession> search;
+      search.swap(mSearch);
+      search->UnregisterListener(this);
+      search->InterruptSearch();
+    }
+    RefPtr<nsMsgNewsFolder> folder;
+    folder.swap(mFolder);
+    if (folder && folder->mNativeDownload == this) {
+      if (mOwnsSaveOffline) {
+        folder->m_downloadMessageForOfflineUse = mPreviousSaveOffline;
+      }
+      folder->mNativeDownload = nullptr;
+    }
+    nsCOMPtr<nsIUrlListener> listener;
+    listener.swap(mListener);
+    mCurrentUri = nullptr;
+    if (listener) {
+      listener->OnStopRunningUrl(nullptr, status);
+    } else if (NS_FAILED(status)) {
+      NS_WARNING("Native news offline download failed");
+    }
+  }
+
+ private:
+  ~NativeDownload() = default;
+
+  nsresult AddTerm(nsMsgSearchAttribValue attribute, nsMsgSearchOpValue op,
+                   uint32_t number) {
+    nsCOMPtr<nsIMsgSearchTerm> term;
+    MOZ_TRY(mSearch->CreateTerm(getter_AddRefs(term)));
+    nsCOMPtr<nsIMsgSearchValue> value;
+    MOZ_TRY(term->GetValue(getter_AddRefs(value)));
+    MOZ_TRY(value->SetAttrib(attribute));
+    if (attribute == nsMsgSearchAttrib::MsgStatus) {
+      MOZ_TRY(value->SetStatus(number));
+    } else if (attribute == nsMsgSearchAttrib::AgeInDays) {
+      MOZ_TRY(value->SetAge(number));
+    } else {
+      MOZ_TRY(value->SetSize(number));
+    }
+    return mSearch->AddSearchTerm(attribute, op, value, true, nullptr);
+  }
+
+  nsresult Next() {
+    if (mDone) return NS_OK;
+    NS_ENSURE_TRUE(mFolder->mDatabase == mDatabase &&
+                       mFolder->m_downloadMessageForOfflineUse,
+                   NS_ERROR_NOT_AVAILABLE);
+    nsresult rv;
+    nsCOMPtr<nsIDatabaseCore> core =
+        do_GetService("@mozilla.org/mailnews/database-core;1", &rv);
+    MOZ_TRY(rv);
+    nsCString source;
+    MOZ_TRY(core->GetSourceId(source));
+    NS_ENSURE_TRUE(source == mSourceId, NS_ERROR_NOT_AVAILABLE);
+    if (mIndex == mKeys.Length()) {
+      Complete(NS_OK);
+      return NS_OK;
+    }
+    mozilla::mailnews::NewsArticleIdentity article;
+    MOZ_TRY(mNative->GetNewsArticleLocation(mKeys[mIndex], article));
+    // fetchMessage's existing nsIURI result identifies this exact pending call.
+    return mService->FetchMessage(mFolder, mKeys[mIndex++], mWindow, nullptr,
+                                  this, getter_AddRefs(mCurrentUri));
+  }
+
+  RefPtr<nsMsgNewsFolder> mFolder;
+  nsCOMPtr<nsIUrlListener> mListener;
+  nsCOMPtr<nsIMsgWindow> mWindow;
+  nsCOMPtr<nsIMsgDatabase> mDatabase;
+  RefPtr<mozilla::mailnews::PerFolderDatabase> mNative;
+  nsCOMPtr<nsINntpService> mService;
+  nsCOMPtr<nsIMsgSearchSession> mSearch;
+  nsCOMPtr<nsIURI> mCurrentUri;
+  nsTArray<nsMsgKey> mKeys;
+  nsCString mSourceId;
+  uint32_t mIndex{0};
+  nsresult mSelectionError{NS_OK};
+  bool mPreviousSaveOffline{false};
+  bool mOwnsSaveOffline{false};
+  bool mDone{false};
+};
+
+NS_IMPL_ISUPPORTS(nsMsgNewsFolder::NativeDownload, nsIMsgSearchNotify,
+                  nsIUrlListener)
+
+NS_IMETHODIMP nsMsgNewsFolder::NativeDownload::OnNewSearch() { return NS_OK; }
+
+NS_IMETHODIMP nsMsgNewsFolder::NativeDownload::OnSearchHit(
+    nsIMsgDBHdr* header, nsIMsgFolder* folder) {
+  if (mDone || NS_FAILED(mSelectionError)) return NS_OK;
+  mSelectionError = [&]() -> nsresult {
+    NS_ENSURE_TRUE(folder == static_cast<nsIMsgFolder*>(mFolder.get()),
+                   NS_ERROR_NOT_AVAILABLE);
+    nsMsgKey key;
+    bool killed, ignored;
+    uint32_t flags;
+    MOZ_TRY(header->GetMessageKey(&key));
+    MOZ_TRY(header->GetFlags(&flags));
+    MOZ_TRY(header->GetIsKilled(&killed));
+    MOZ_TRY(mDatabase->IsIgnored(key, &ignored));
+    if ((flags & nsMsgMessageFlags::Offline) || killed || ignored) return NS_OK;
+    mozilla::mailnews::NewsArticleIdentity article;
+    MOZ_TRY(mNative->GetNewsArticleLocation(key, article));
+    mKeys.AppendElement(key);
+    return NS_OK;
+  }();
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsMsgNewsFolder::NativeDownload::OnSearchDone(nsresult status) {
+  if (mDone) return NS_OK;
+  RefPtr<NativeDownload> self(this);
+  nsCOMPtr<nsIMsgSearchSession> search;
+  search.swap(mSearch);
+  if (search) search->UnregisterListener(this);
+  if (NS_FAILED(mSelectionError)) status = mSelectionError;
+  if (NS_SUCCEEDED(status)) {
+    status = Next();
+  }
+  if (NS_FAILED(status)) Complete(status);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsMsgNewsFolder::NativeDownload::OnStartRunningUrl(nsIURI* uri) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsMsgNewsFolder::NativeDownload::OnStopRunningUrl(
+    nsIURI* uri, nsresult status) {
+  if (mDone || uri != mCurrentUri) return NS_OK;
+  RefPtr<NativeDownload> self(this);
+  mCurrentUri = nullptr;
+  if (NS_SUCCEEDED(status)) status = Next();
+  if (NS_FAILED(status)) Complete(status);
+  return NS_OK;
+}
+#endif
 
 nsMsgNewsFolder::nsMsgNewsFolder(void)
     : mExpungedBytes(0),
@@ -1560,6 +1787,38 @@ NS_IMETHODIMP nsMsgNewsFolder::RemoveMessages(
   NS_ENSURE_SUCCESS(rv,
                     rv);  // if GetDatabase succeeds, mDatabase will be non-null
 
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    RefPtr<mozilla::mailnews::PerFolderDatabase> native =
+        do_QueryObject(mDatabase);
+    NS_ENSURE_TRUE(native, NS_ERROR_NOT_AVAILABLE);
+    struct Target {
+      nsMsgKey key;
+      mozilla::mailnews::NewsArticleIdentity article;
+      nsCOMPtr<nsIMsgDBHdr> header;
+    };
+    nsTArray<Target> targets;
+    for (nsMsgKey key : aMsgKeys) {
+      Target target;
+      target.key = key;
+      MOZ_TRY(native->GetNewsArticleLocation(key, target.article));
+      MOZ_TRY(native->GetMsgHdrForKey(key, getter_AddRefs(target.header)));
+      targets.AppendElement(std::move(target));
+    }
+    nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+        mozilla::components::FolderNotification::Service();
+    NS_ENSURE_TRUE(notifier, NS_ERROR_NOT_AVAILABLE);
+    for (const auto& target : targets) {
+      MOZ_TRY(native->RemoveNewsArticle(target.article, target.key));
+      // Only a confirmed removal may publish its global deletion notification.
+      // Later failures retain the actual committed prefix, not a false
+      // rollback.
+      notifier->NotifyMsgsDeleted({target.header.get()});
+    }
+    return NS_OK;
+  }
+#endif
+
   // Notify listeners of a multiple message delete
   nsCOMPtr<nsIMsgFolderNotificationService> notifier =
       mozilla::components::FolderNotification::Service();
@@ -1589,6 +1848,17 @@ NS_IMETHODIMP nsMsgNewsFolder::SetSaveArticleOffline(bool aBool) {
 
 NS_IMETHODIMP nsMsgNewsFolder::DownloadAllForOffline(nsIUrlListener* listener,
                                                      nsIMsgWindow* msgWindow) {
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    NS_ENSURE_FALSE(mNativeDownload, NS_ERROR_IN_PROGRESS);
+    RefPtr<NativeDownload> download =
+        new NativeDownload(this, listener, msgWindow);
+    mNativeDownload = download;
+    nsresult rv = download->Start();
+    if (NS_FAILED(rv)) download->Complete(rv);
+    return rv;
+  }
+#endif
   nsresult rv = NS_OK;
 
   nsCOMPtr<nsINntpService> nntpService(
@@ -1620,11 +1890,125 @@ NS_IMETHODIMP nsMsgNewsFolder::DownloadMessagesForOffline(
   return rv;
 }
 
+#ifdef MOZ_PANORAMA
+nsresult nsMsgNewsFolder::StoreNativeNewsArticle(uint32_t articleNumber,
+                                                 const nsACString& data) {
+  using namespace mozilla::mailnews;
+  NS_ENSURE_FALSE(mNativeOfflineWriting || m_tempMessageStream,
+                  NS_ERROR_IN_PROGRESS);
+  RefPtr<nsMsgNewsFolder> self(this);
+  mNativeOfflineWriting = true;
+  auto writing = mozilla::MakeScopeExit([&] { mNativeOfflineWriting = false; });
+  MOZ_TRY(GetDatabase());
+  RefPtr<PerFolderDatabase> database = do_QueryObject(mDatabase);
+  NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+  nsMsgKey key;
+  MOZ_TRY(database->GetNewsArticleKey(articleNumber, key));
+  NewsArticleIdentity article;
+  MessageBodyState before;
+  MOZ_TRY(database->CaptureNewsArticleBody(key, article, before));
+
+  bool locked = false, hasSemaphore = false;
+  MOZ_TRY(GetLocked(&locked));
+  if (locked) {
+    MOZ_TRY(TestSemaphore(static_cast<nsIMsgFolder*>(this), &hasSemaphore));
+    NS_ENSURE_TRUE(hasSemaphore, NS_MSG_FOLDER_BUSY);
+  }
+  if (!hasSemaphore) {
+    MOZ_TRY(AcquireSemaphore(static_cast<nsIMsgFolder*>(this),
+                             "nsMsgNewsFolder::StoreNativeNewsArticle"_ns));
+  }
+  auto semaphore = mozilla::MakeScopeExit([&] {
+    if (!hasSemaphore) {
+      ReleaseSemaphore(static_cast<nsIMsgFolder*>(this),
+                       "nsMsgNewsFolder::StoreNativeNewsArticle"_ns);
+    }
+  });
+  // Query the selected provider without preempting any issued stream, including
+  // one whose previous Finish has not settled. Unknown providers fail closed.
+  MOZ_TRY(CheckFolderStorageMove(this));
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(GetMsgStore(getter_AddRefs(store)));
+  NS_ENSURE_TRUE(store, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIOutputStream> stream;
+  bool finishAttempted = false;
+  auto discard = mozilla::MakeScopeExit([&] {
+    if (stream && !finishAttempted) {
+      nsresult cleanup = store->DiscardNewMessage(this, stream);
+      if (NS_FAILED(cleanup)) {
+        NS_WARNING("Failed to discard the new native news stream");
+      }
+    }
+  });
+  MOZ_TRY(store->GetNewMsgOutputStream(this, getter_AddRefs(stream)));
+  NS_ENSURE_TRUE(stream, NS_ERROR_UNEXPECTED);
+  auto write = [&](const nsACString& value) -> nsresult {
+    uint32_t written = 0;
+    MOZ_TRY(stream->Write(value.BeginReading(), value.Length(), &written));
+    NS_ENSURE_TRUE(written == value.Length(), NS_ERROR_FAILURE);
+    return NS_OK;
+  };
+  uint32_t flags = before.flags | nsMsgMessageFlags::Offline;
+  nsPrintfCString statusHeader("X-Mozilla-Status: %04x" MSG_LINEBREAK,
+                               flags & 0xffff);
+  nsPrintfCString statusHeader2("X-Mozilla-Status2: %08x" MSG_LINEBREAK,
+                                flags & 0xffff0000);
+  MOZ_TRY(write(statusHeader));
+  MOZ_TRY(write(statusHeader2));
+  MOZ_TRY(write(data));
+
+  // A provider write can call back into the folder. Refuse changed ownership
+  // while the newly issued stream can still be discarded safely.
+  NewsArticleIdentity currentArticle;
+  MessageBodyState current;
+  MOZ_TRY(database->CaptureNewsArticleBody(key, currentArticle, current));
+  NS_ENSURE_TRUE(
+      currentArticle.articleNumber == article.articleNumber &&
+          currentArticle.group.databaseSourceId ==
+              article.group.databaseSourceId &&
+          currentArticle.group.folderId == article.group.folderId &&
+          currentArticle.group.incarnation == article.group.incarnation &&
+          current.databaseSourceId == before.databaseSourceId &&
+          current.folderId == before.folderId && current.key == before.key &&
+          current.storeToken == before.storeToken &&
+          current.contentRevision == before.contentRevision &&
+          current.locationRevision == before.locationRevision &&
+          current.messageSize == before.messageSize &&
+          current.offlineMessageSize == before.offlineMessageSize &&
+          current.lineCount == before.lineCount &&
+          !((current.flags ^ before.flags) & nsMsgMessageFlags::Offline),
+      NS_ERROR_NOT_AVAILABLE);
+
+  // Finish owns provider settlement from this point. Never discard or repeat
+  // it after any Finish result. A later metadata failure leaves a completed
+  // orphan explicit and preserves the old committed metadata and body.
+  finishAttempted = true;
+  nsAutoCString token;
+  MOZ_TRY(store->FinishNewMessage(this, stream, token));
+  NS_ENSURE_FALSE(token.IsEmpty(), NS_ERROR_UNEXPECTED);
+  uint32_t size, measuredLines;
+  MOZ_TRY(ReadStoredMessageDetails(store, this, token, &size, &measuredLines));
+  FinishedMessageBody finished;
+  finished.storeToken = token;
+  finished.messageSize = before.messageSize;
+  finished.offlineMessageSize = size;
+  finished.lineCount = data.CountChar('\n');
+  finished.offline = true;
+  MessageBodyState published;
+  return database->SettleNewsArticleBody(article, before, finished, published);
+}
+#endif
+
 NS_IMETHODIMP nsMsgNewsFolder::NotifyArticleDownloaded(uint32_t articleNumber,
                                                        nsACString const& data) {
   if (!m_downloadMessageForOfflineUse) {
     return NS_OK;
   }
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    return StoreNativeNewsArticle(articleNumber, data);
+  }
+#endif
   if (m_tempMessageStream) {
     return NS_ERROR_IN_PROGRESS;
   }
@@ -1694,6 +2078,15 @@ NS_IMETHODIMP nsMsgNewsFolder::GetMessageIdForKey(nsMsgKey key,
     result.SetIsVoid(true);
     return NS_OK;
   }
+#ifdef MOZ_PANORAMA
+  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+    RefPtr<mozilla::mailnews::PerFolderDatabase> native =
+        do_QueryObject(mDatabase);
+    NS_ENSURE_TRUE(native, NS_ERROR_NOT_AVAILABLE);
+    mozilla::mailnews::NewsArticleIdentity article;
+    MOZ_TRY(native->GetNewsArticleLocation(key, article));
+  }
+#endif
   nsCOMPtr<nsIMsgDBHdr> hdr;
   rv = mDatabase->GetMsgHdrForKey(key, getter_AddRefs(hdr));
   NS_ENSURE_SUCCESS(rv, rv);
@@ -1701,6 +2094,9 @@ NS_IMETHODIMP nsMsgNewsFolder::GetMessageIdForKey(nsMsgKey key,
 }
 
 NS_IMETHODIMP nsMsgNewsFolder::Shutdown(bool shutdownChildren) {
+#ifdef MOZ_PANORAMA
+  if (mNativeDownload) mNativeDownload->Cancel();
+#endif
   if (mFilterList) {
     // close the filter log stream
     nsresult rv = mFilterList->SetLogStream(nullptr);

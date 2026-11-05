@@ -9,6 +9,10 @@ prefs = [
 ]
 tags = ["panorama-delivery"]
 
+["test_panoramaDeliveryNewsBody.js"]
+
+["test_panoramaDeliveryNewsFlag.js"]
+
 ["test_panoramaDeliveryNewsFolderInit.js"]
 
 ["test_panoramaDeliveryNewsIdentity.js"]

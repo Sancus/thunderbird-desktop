@@ -56,6 +56,96 @@ XPCOMUtils.defineLazyServiceGetter(
 );
 
 /**
+ * @typedef {object} NativeNewsArticle
+ * @property {nsIMsgNewsFolder} folder - The captured group object.
+ * @property {nsIMsgDatabase} database - The captured physical folder facade.
+ * @property {nsIMsgDBHdr} header - The captured physical article header.
+ * @property {number} physicalKey - The local message key.
+ * @property {number} articleNumber - The server article number, including zero.
+ * @property {number} folderId - The physical group ID.
+ * @property {string} sourceId - The database source identity.
+ * @property {string} incarnation - The persistent local group incarnation.
+ * @property {string} messageId - The header's message ID.
+ */
+
+/**
+ * Captures the native mapping of a physical news header. The existing native
+ * message-ID getter validates the complete typed binding before the protected
+ * string properties are used. Decimal zero is distinct from an absent binding.
+ *
+ * @param {nsIMsgNewsFolder} folder - The owning native group.
+ * @param {number|string} key - The physical message key.
+ * @returns {NativeNewsArticle} The validated group, header and article binding.
+ * @throws {nsIException} The original source/database error, or NOT_AVAILABLE
+ *   for a missing or changed binding.
+ */
+export function captureNativeNewsArticle(folder, key) {
+  folder.QueryInterface(Ci.nsIMsgNewsFolder);
+  const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  const sourceId = core.sourceId;
+  const folderId = folder.id;
+  const physicalKey = Number(key);
+  if (
+    !/^(0|[1-9][0-9]*)$/.test(String(key)) ||
+    !Number.isSafeInteger(physicalKey) ||
+    physicalKey >= 0xffffffff
+  ) {
+    throw Components.Exception("Invalid physical news key", Cr.NS_ERROR_INVALID_ARG);
+  }
+  const database = folder.msgDatabase;
+  if (!database.containsKey(physicalKey)) {
+    throw Components.Exception("News article is no longer present", Cr.NS_ERROR_NOT_AVAILABLE);
+  }
+  const messageId = folder.getMessageIdForKey(physicalKey);
+  const header = database.getMsgHdrForKey(physicalKey);
+  const rawArticle = header.getStringProperty("newsArticleNumber");
+  const incarnation = header.getStringProperty("newsGroupIncarnation");
+  const articleNumber = Number(rawArticle);
+  if (
+    !/^(0|[1-9][0-9]*)$/.test(rawArticle) ||
+    !Number.isSafeInteger(articleNumber) ||
+    articleNumber > 0x7fffffff ||
+    !incarnation ||
+    !sourceId ||
+    !Number.isSafeInteger(folderId) ||
+    folderId <= 0 ||
+    header.folder.id != folderId ||
+    header.messageKey != physicalKey ||
+    core.sourceId != sourceId ||
+    folder.id != folderId ||
+    folder.msgDatabase != database
+  ) {
+    throw Components.Exception("Native news binding changed", Cr.NS_ERROR_NOT_AVAILABLE);
+  }
+  return {
+    folder, database, header, physicalKey, articleNumber, folderId,
+    sourceId, incarnation, messageId,
+  };
+}
+
+/**
+ * Checks that an asynchronous request still owns its original native article.
+ *
+ * @param {NativeNewsArticle} expected - The binding captured before dispatch.
+ * @returns {NativeNewsArticle} The current matching physical header and binding.
+ * @throws {nsIException} The original native error, or NOT_AVAILABLE on change.
+ */
+export function revalidateNativeNewsArticle(expected) {
+  const current = captureNativeNewsArticle(expected.folder, expected.physicalKey);
+  for (const field of [
+    "database", "physicalKey", "articleNumber", "folderId", "sourceId",
+    "incarnation", "messageId",
+  ]) {
+    if (current[field] != expected[field]) {
+      throw Components.Exception("Stale native news request", Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  return current;
+}
+
+/**
  * A class to interact with NNTP server.
  */
 export class NntpClient {
@@ -102,19 +192,35 @@ export class NntpClient {
     this.urlListener = null;
     this._msgWindow = null;
     this._newsFolder = null;
+    this.channel = null;
     this._newsGroup = null;
     this._nextAction = null;
     this._currentAction = null;
     this._messageId = null;
     this._articleNumber = null;
+    this._articleBinding = null;
+    this._saveArticleOffline = false;
+    this._requestPrepared = false;
+  }
+
+  /**
+   * Starts ownership before the pool invokes the request's setup callback.
+   * Setup failures can then use normal once-only completion without connecting.
+   */
+  _prepareRequest() {
+    this.#requestGeneration++;
+    this._done = false;
+    this._requestPrepared = true;
   }
 
   /**
    * Initiate a connection to the server
    */
   connect() {
-    this.#requestGeneration++;
-    this._done = false;
+    if (!this._requestPrepared) {
+      this._prepareRequest();
+    }
+    this._requestPrepared = false;
     if (this._socket?.readyState == "open") {
       // Reuse the connection.
       this.onOpen();
@@ -274,7 +380,7 @@ export class NntpClient {
       this._nextAction?.(res);
     } catch (e) {
       this._logger.error(`Failed to process server response ${res}.`, e);
-      this._actionDone(Cr.NS_ERROR_FAILURE);
+      this._actionDone(e.result ?? Cr.NS_ERROR_FAILURE);
     }
   };
 
@@ -521,11 +627,15 @@ export class NntpClient {
    *
    * @param {string} groupName - The group name.
    * @param {integer} articleNumber - The article number.
+   * @param {NativeNewsArticle|null} [binding=null] - The original native mapping.
+   * @param {boolean|null} [saveOffline=null] - The captured offline-save request.
    */
-  getArticleByArticleNumber(groupName, articleNumber) {
+  getArticleByArticleNumber(groupName, articleNumber, binding = null, saveOffline = null) {
     this._newsFolder = this._server.rootFolder.getChildNamed(groupName);
     this._nextGroupName = this._getNextGroupName(groupName);
     this._articleNumber = articleNumber;
+    this._articleBinding = binding;
+    this._saveArticleOffline = saveOffline ?? this._newsFolder.saveArticleOffline;
     this._messageId = "";
     this._firstGroupCommand = this._actionArticle;
     this._actionModeReader(this._actionGroup);
@@ -538,7 +648,8 @@ export class NntpClient {
    */
   getArticleByMessageId(messageId) {
     this._messageId = `<${messageId}>`;
-    this._articleNumber = 0;
+    this._articleNumber = null;
+    this._articleBinding = null;
     this._actionModeReader(this._actionArticle);
   }
 
@@ -966,7 +1077,10 @@ export class NntpClient {
    * @see {@link https://www.rfc-editor.org/rfc/rfc3977#section-6.2.1|RFC 3977 §6.2.1}
    */
   _actionArticle = () => {
-    this._sendCommand(`ARTICLE ${this._articleNumber || this._messageId}`);
+    if (this._articleBinding) {
+      revalidateNativeNewsArticle(this._articleBinding);
+    }
+    this._sendCommand(`ARTICLE ${this._articleNumber ?? this._messageId}`);
     this._nextAction = this._actionArticleResponse;
   };
 
@@ -986,11 +1100,32 @@ export class NntpClient {
     this._readResponse(
       data,
       line => {
+        if (this._articleBinding) {
+          revalidateNativeNewsArticle(this._articleBinding);
+        }
         article += line.slice(0, -2) + lineSeparator;
         this.onData(line);
       },
       () => {
-        this._newsFolder?.notifyArticleDownloaded(this._articleNumber, article);
+        if (this.channel && !Components.isSuccessCode(this.channel.status)) {
+          this._actionDone(this.channel.status);
+          return;
+        }
+        if (this._articleBinding) {
+          revalidateNativeNewsArticle(this._articleBinding);
+        }
+        if (this._articleNumber !== null) {
+          if (this._articleBinding) {
+            if (this._saveArticleOffline) {
+              if (!this._newsFolder.saveArticleOffline) {
+                throw Components.Exception("Offline news request changed", Cr.NS_ERROR_NOT_AVAILABLE);
+              }
+              this._newsFolder.notifyArticleDownloaded(this._articleNumber, article);
+            }
+          } else {
+            this._newsFolder?.notifyArticleDownloaded(this._articleNumber, article);
+          }
+        }
         this._actionDone();
       }
     );

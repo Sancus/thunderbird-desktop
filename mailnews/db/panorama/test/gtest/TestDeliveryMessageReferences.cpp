@@ -3,6 +3,18 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "nsIMsgOfflineImapOperation.h"
+#include "../../../../news/src/nsNewsFolder.h"
+#include "mozilla/StaticPrefs_mail.h"
+#include "nsIFolderLookupService.h"
+#include "nsIInputStream.h"
+#include "nsIMsgAccount.h"
+#include "nsIMsgAccountManager.h"
+#include "nsIMsgDBService.h"
+#include "nsIMsgIncomingServer.h"
+#include "nsIMsgPluggableStore.h"
+#include "nsIOutputStream.h"
+#include "nsMsgLocalStoreUtils.h"
+#include "nsPrintfCString.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -4019,7 +4031,1048 @@ void ExpectBorrowedNewsSet(PerFolderDatabase& db, nsMsgKeySet* expected) {
   EXPECT_EQ(expected, borrowed);
 }
 
+void ExpectNewsArticleLocation(const NewsArticleIdentity& expected,
+                               const NewsArticleIdentity& actual) {
+  EXPECT_EQ(expected.group.databaseSourceId, actual.group.databaseSourceId);
+  EXPECT_EQ(expected.group.folderId, actual.group.folderId);
+  EXPECT_EQ(expected.group.incarnation, actual.group.incarnation);
+  EXPECT_EQ(expected.articleNumber, actual.articleNumber);
+}
+
+void ExpectNewsBodyState(const MessageBodyState& expected,
+                         const MessageBodyState& actual) {
+  EXPECT_EQ(expected.databaseSourceId, actual.databaseSourceId);
+  EXPECT_EQ(expected.key, actual.key);
+  EXPECT_EQ(expected.folderId, actual.folderId);
+  EXPECT_EQ(expected.storeToken, actual.storeToken);
+  EXPECT_EQ(expected.contentRevision, actual.contentRevision);
+  EXPECT_EQ(expected.locationRevision, actual.locationRevision);
+  EXPECT_EQ(expected.messageSize, actual.messageSize);
+  EXPECT_EQ(expected.offlineMessageSize, actual.offlineMessageSize);
+  EXPECT_EQ(expected.lineCount, actual.lineCount);
+  EXPECT_EQ(expected.flags, actual.flags);
+}
+
 }  // namespace
+
+TEST_F(DeliveryCompleteHeader,
+       NewsArticleLocationRequiresExactPhysicalBinding) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create();
+  ASSERT_TRUE(set);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  nsCOMPtr<nsIMsgDBHdr> zero, article;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 0, "location-zero@news.invalid"_ns,
+                                        getter_AddRefs(zero)));
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 7401, "location@news.invalid"_ns,
+                                        getter_AddRefs(article)));
+  nsMsgKey zeroKey, key;
+  ASSERT_EQ(NS_OK, zero->GetMessageKey(&zeroKey));
+  ASSERT_EQ(NS_OK, article->GetMessageKey(&key));
+  ASSERT_NE(0u, zeroKey);
+  ASSERT_NE(7401u, key);
+  NewsArticleIdentity location, zeroLocation;
+  ASSERT_EQ(NS_OK, db->GetNewsArticleLocation(key, location));
+  ASSERT_EQ(NS_OK, db->GetNewsArticleLocation(zeroKey, zeroLocation));
+  EXPECT_EQ(7401u, location.articleNumber);
+  EXPECT_EQ(0u, zeroLocation.articleNumber);
+  EXPECT_EQ(mFolder, location.group.folderId);
+  EXPECT_FALSE(location.group.incarnation.IsEmpty());
+  nsCString source;
+  ASSERT_EQ(NS_OK, ReadAdmissionSourceId(source));
+  EXPECT_EQ(source, location.group.databaseSourceId);
+  nsMsgKey roundtrip = nsMsgKey_None;
+  ASSERT_EQ(NS_OK, db->GetNewsArticleKey(7401, roundtrip));
+  EXPECT_EQ(key, roundtrip);
+  ASSERT_EQ(NS_OK, db->GetNewsArticleKey(0, roundtrip));
+  EXPECT_EQ(zeroKey, roundtrip);
+  // The existing script string route preserves decimal text and zero presence.
+  nsCString text;
+  ASSERT_EQ(NS_OK, article->GetStringProperty("newsArticleNumber", text));
+  EXPECT_EQ("7401"_ns, text);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            article->SetStringProperty("newsArticleNumber", "1"_ns));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG,
+            article->SetUint32Property("newsArticleNumber", 1));
+  const NewsArticleIdentity saved = location;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->GetNewsArticleLocation(nsMsgKey_None - 1, location));
+  ExpectNewsArticleLocation(saved, location);
+  ASSERT_EQ(NS_OK, db->Close(false));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->GetNewsArticleLocation(key, location));
+  ExpectNewsArticleLocation(saved, location);
+  RefPtr<PerFolderDatabase> reopened = new PerFolderDatabase(mFolder, true);
+  ASSERT_EQ(NS_OK, reopened->SetReadSet(set));
+  ASSERT_EQ(NS_OK, reopened->GetNewsArticleLocation(key, location));
+  ExpectNewsArticleLocation(saved, location);
+}
+
+TEST_F(DeliveryCompleteHeader,
+       NewsArticleLocationRejectsStaleForeignAndCorruptBindings) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create();
+  ASSERT_TRUE(set);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  nsCOMPtr<nsIMsgDBHdr> header, duplicate;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 7401, "checked@news.invalid"_ns,
+                                        getter_AddRefs(header)));
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 7402, "duplicate@news.invalid"_ns,
+                                        getter_AddRefs(duplicate)));
+  nsMsgKey key, duplicateKey;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  ASSERT_EQ(NS_OK, duplicate->GetMessageKey(&duplicateKey));
+  NewsArticleIdentity original;
+  MessageBodyState before;
+  ASSERT_EQ(NS_OK, db->CaptureNewsArticleBody(key, original, before));
+  NewsArticleIdentity output = original;
+  output.articleNumber = 19;
+  const NewsArticleIdentity sentinel = output;
+  MessageBodyState bodyOutput = before;
+  bodyOutput.key = nsMsgKey_None;
+  const MessageBodyState bodySentinel = bodyOutput;
+  RefPtr<PerFolderDatabase> local = new PerFolderDatabase(mFolder, false);
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, local->GetNewsArticleLocation(key, output));
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, db->GetNewsArticleLocation(0, output));
+  ExpectNewsArticleLocation(sentinel, output);
+
+  uint64_t otherFolder;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().InsertFolder(mFolder, "OtherLocation"_ns,
+                                                  &otherFolder));
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(otherFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<nsMsgKeySet> otherSet = nsMsgKeySet::Create();
+  ASSERT_TRUE(otherSet);
+  RefPtr<PerFolderDatabase> other = new PerFolderDatabase(otherFolder, true);
+  ASSERT_EQ(NS_OK, other->SetReadSet(otherSet));
+  nsCOMPtr<nsIMsgDBHdr> foreign;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*other, 7401, "foreign@news.invalid"_ns,
+                                        getter_AddRefs(foreign)));
+  nsMsgKey foreignKey;
+  ASSERT_EQ(NS_OK, foreign->GetMessageKey(&foreignKey));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->CaptureNewsArticleBody(foreignKey, output, bodyOutput));
+  ExpectNewsArticleLocation(sentinel, output);
+  ExpectNewsBodyState(bodySentinel, bodyOutput);
+
+  ASSERT_EQ(NS_OK, Connection()->BeginTransaction());
+  {
+    auto rollback = MakeScopeExit(
+        [&] { EXPECT_EQ(NS_OK, Connection()->RollbackTransaction()); });
+    EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+              db->CaptureNewsArticleBody(key, output, bodyOutput));
+    ExpectNewsArticleLocation(sentinel, output);
+    ExpectNewsBodyState(bodySentinel, bodyOutput);
+    ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "UPDATE database_identity SET sourceId="
+                         "'{7a139b24-9c50-47fa-8322-168da90748c0}'"_ns));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->GetNewsArticleLocation(key, output));
+    ExpectNewsArticleLocation(sentinel, output);
+  }
+  // Valid setters reject corruption. Only these critical reader controls alter
+  // stored binding values; each commits outside caller SQL and restores them.
+  auto restore = [&]() -> nsresult {
+    nsCOMPtr<mozIStorageStatement> statement;
+    MOZ_TRY(Connection()->CreateStatement(
+        "REPLACE INTO message_properties(id,name,value) VALUES "
+        "(:key,'newsArticleNumber',7401),"
+        "(:key,'newsGroupIncarnation',:group),"
+        "(:duplicate,'newsArticleNumber',7402)"_ns,
+        getter_AddRefs(statement)));
+    MOZ_TRY(statement->BindInt64ByName("key"_ns, key));
+    MOZ_TRY(statement->BindInt64ByName("duplicate"_ns, duplicateKey));
+    MOZ_TRY(statement->BindUTF8StringByName("group"_ns,
+                                            original.group.incarnation));
+    return statement->Execute();
+  };
+  auto cleanup = MakeScopeExit([&] { EXPECT_EQ(NS_OK, restore()); });
+  for (const nsCString& mutation : nsTArray<nsCString>{
+           "UPDATE message_properties SET value='broken' "
+           "WHERE id=:key AND name='newsArticleNumber'"_ns,
+           "UPDATE message_properties SET value=-1 "
+           "WHERE id=:key AND name='newsArticleNumber'"_ns,
+           "UPDATE message_properties SET value=2147483648 "
+           "WHERE id=:key AND name='newsArticleNumber'"_ns,
+           "UPDATE message_properties SET value=42 "
+           "WHERE id=:key AND name='newsGroupIncarnation'"_ns,
+           "UPDATE message_properties SET value='stale-group' "
+           "WHERE id=:key AND name='newsGroupIncarnation'"_ns}) {
+    nsCOMPtr<mozIStorageStatement> statement;
+    ASSERT_EQ(NS_OK, Connection()->CreateStatement(mutation,
+                                                   getter_AddRefs(statement)));
+    ASSERT_EQ(NS_OK, statement->BindInt64ByName("key"_ns, key));
+    ASSERT_EQ(NS_OK, statement->Execute());
+    ASSERT_EQ(NS_OK, statement->Finalize());
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db->GetNewsArticleLocation(key, output));
+    ExpectNewsArticleLocation(sentinel, output);
+    ASSERT_EQ(NS_OK, restore());
+  }
+  nsCOMPtr<mozIStorageStatement> statement;
+  ASSERT_EQ(NS_OK, Connection()->CreateStatement(
+                       "UPDATE message_properties SET value=7401 "
+                       "WHERE id=:key AND name='newsArticleNumber'"_ns,
+                       getter_AddRefs(statement)));
+  ASSERT_EQ(NS_OK, statement->BindInt64ByName("key"_ns, duplicateKey));
+  ASSERT_EQ(NS_OK, statement->Execute());
+  ASSERT_EQ(NS_OK, statement->Finalize());
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED, db->GetNewsArticleLocation(key, output));
+  ExpectNewsArticleLocation(sentinel, output);
+  ASSERT_EQ(NS_OK, restore());
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateStatement(
+                "DELETE FROM message_properties WHERE id=:key "
+                "AND name IN ('newsArticleNumber','newsGroupIncarnation')"_ns,
+                getter_AddRefs(statement)));
+  ASSERT_EQ(NS_OK, statement->BindInt64ByName("key"_ns, key));
+  ASSERT_EQ(NS_OK, statement->Execute());
+  ASSERT_EQ(NS_OK, statement->Finalize());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->GetNewsArticleLocation(key, output));
+  ExpectNewsArticleLocation(sentinel, output);
+  ASSERT_EQ(NS_OK, restore());
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->CaptureNewsArticleBody(key, output, bodyOutput));
+  ExpectNewsArticleLocation(sentinel, output);
+  ExpectNewsBodyState(bodySentinel, bodyOutput);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       NewsBodySettlementPreservesPreviousStateAndFlags) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create();
+  ASSERT_TRUE(set);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 17, "body@news.invalid"_ns,
+                                        getter_AddRefs(header)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  NewsArticleIdentity article;
+  MessageBodyState initial;
+  ASSERT_EQ(NS_OK, db->CaptureNewsArticleBody(key, article, initial));
+  FinishedMessageBody finished;
+  MessageBodyState invalidOutput = initial;
+  EXPECT_EQ(
+      NS_ERROR_INVALID_ARG,
+      db->SettleNewsArticleBody(article, initial, finished, invalidOutput));
+  ExpectNewsBodyState(initial, invalidOutput);
+  finished.storeToken = "old-news-body"_ns;
+  finished.messageSize = finished.offlineMessageSize = 43;
+  finished.lineCount = 4;
+  finished.offline = true;
+  MessageBodyState previous;
+  bool reached = false;
+  RefPtr<DeliveryNewsReadListener> listener = new DeliveryNewsReadListener();
+  listener->observe = [&](char kind) {
+    if (kind != 'F' || reached) return;
+    reached = true;
+    EXPECT_EQ(key, previous.key);
+    ASSERT_TRUE(previous.storeToken.isSome());
+    EXPECT_EQ(finished.storeToken, *previous.storeToken);
+    EXPECT_EQ(43u, previous.offlineMessageSize);
+    ASSERT_EQ(NS_OK, header->MarkRead(true));
+    uint32_t flags;
+    ASSERT_EQ(NS_OK, header->OrFlags(nsMsgMessageFlags::Marked, &flags));
+    ASSERT_EQ(NS_OK, header->SetStringProperty("keywords", "kept-tag"_ns));
+  };
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  // Native metadata controls use provider-finished values; actual store bytes
+  // and write/Finish faults belong to the same whole issue's ordinary tests.
+  ASSERT_EQ(NS_OK,
+            db->SettleNewsArticleBody(article, initial, finished, previous));
+  EXPECT_TRUE(reached);
+  listener->observe = nullptr;
+  EXPECT_TRUE(set->IsMember(17));
+  finished.storeToken = "new-news-body"_ns;
+  finished.messageSize = finished.offlineMessageSize = 57;
+  finished.lineCount = 6;
+  MessageBodyState output;
+  ASSERT_EQ(NS_OK,
+            db->SettleNewsArticleBody(article, previous, finished, output));
+  EXPECT_EQ(key, output.key);
+  EXPECT_EQ(mFolder, output.folderId);
+  ASSERT_TRUE(output.storeToken.isSome());
+  EXPECT_EQ(finished.storeToken, *output.storeToken);
+  EXPECT_TRUE(output.flags & nsMsgMessageFlags::Offline);
+  EXPECT_TRUE(output.flags & nsMsgMessageFlags::Read);
+  EXPECT_TRUE(output.flags & nsMsgMessageFlags::Marked);
+  nsCString tags;
+  ASSERT_EQ(NS_OK, header->GetStringProperty("keywords", tags));
+  EXPECT_EQ("kept-tag"_ns, tags);
+  MessageBodyState stored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(key, stored));
+  ExpectNewsBodyState(output, stored);
+  const MessageBodyState sentinel = output;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->SettleNewsArticleBody(article, previous, finished, output));
+  ExpectNewsBodyState(sentinel, output);
+  NewsArticleIdentity stale = article;
+  stale.group.incarnation = "stale"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->SettleNewsArticleBody(stale, stored, finished, output));
+  ExpectNewsBodyState(sentinel, output);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(key, stored));
+  ExpectNewsBodyState(sentinel, stored);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader, NewsBodySettlementFailureDoesNotReplay) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create();
+  ASSERT_TRUE(set);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  nsCOMPtr<nsIMsgDBHdr> header;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 19, "failed-body@news.invalid"_ns,
+                                        getter_AddRefs(header)));
+  nsMsgKey key;
+  ASSERT_EQ(NS_OK, header->GetMessageKey(&key));
+  NewsArticleIdentity article;
+  MessageBodyState empty, previous;
+  ASSERT_EQ(NS_OK, db->CaptureNewsArticleBody(key, article, empty));
+  FinishedMessageBody finished;
+  finished.storeToken = "prior-news-body"_ns;
+  finished.messageSize = finished.offlineMessageSize = 31;
+  finished.lineCount = 3;
+  finished.offline = true;
+  ASSERT_EQ(NS_OK,
+            db->SettleNewsArticleBody(article, empty, finished, previous));
+  mWitness = new DeliveryMessageReferencesFaultWitness();
+  ASSERT_EQ(NS_OK,
+            Connection()->CreateFunction("news_body_attempt"_ns, 1, mWitness));
+  auto cleanup = MakeScopeExit([&] {
+    EXPECT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                         "DROP TRIGGER IF EXISTS fail_news_body"_ns));
+    EXPECT_EQ(NS_OK, Connection()->RemoveFunction("news_body_attempt"_ns));
+  });
+  // A normal successful native write cannot reach rollback. Fault only this
+  // body's metadata insertion and let the existing fixture own all lifecycle.
+  ASSERT_EQ(NS_OK, Connection()->ExecuteSimpleSQL(
+                       "CREATE TEMP TRIGGER fail_news_body BEFORE INSERT ON "
+                       "message_properties WHEN NEW.name='storeToken' BEGIN "
+                       "SELECT news_body_attempt(NEW.id); "
+                       "SELECT RAISE(ABORT,'news body failure'); END"_ns));
+  RefPtr<DeliveryNewsReadListener> listener = new DeliveryNewsReadListener();
+  ASSERT_EQ(NS_OK, db->AddListener(listener));
+  auto remove =
+      MakeScopeExit([&] { EXPECT_EQ(NS_OK, db->RemoveListener(listener)); });
+  MessageBodyState output = previous;
+  output.key = nsMsgKey_None;
+  const MessageBodyState sentinel = output;
+  finished.storeToken = "failed-news-body"_ns;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT,
+            db->SettleNewsArticleBody(article, previous, finished, output));
+  EXPECT_EQ(1u, mWitness->mCalls);
+  EXPECT_EQ(int64_t(key), mWitness->mLastKey);
+  ExpectNewsBodyState(sentinel, output);
+  MessageBodyState stored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageBodyState(key, stored));
+  ExpectNewsBodyState(previous, stored);
+  EXPECT_EQ(0u, listener->flags);
+  EXPECT_EQ(0u, listener->reads);
+  CheckNoTransaction();
+  ASSERT_EQ(NS_OK,
+            Connection()->ExecuteSimpleSQL("DROP TRIGGER fail_news_body"_ns));
+  // This explicit fresh caller attempt is permitted; the helper never retries.
+  ASSERT_EQ(NS_OK,
+            db->SettleNewsArticleBody(article, stored, finished, output));
+  EXPECT_EQ(1u, mWitness->mCalls);
+  ASSERT_TRUE(output.storeToken.isSome());
+  EXPECT_EQ(finished.storeToken, *output.storeToken);
+  EXPECT_TRUE(output.flags & nsMsgMessageFlags::Offline);
+  CheckNoTransaction();
+}
+
+TEST_F(DeliveryCompleteHeader,
+       NewsExpiryRequiresOriginalMappingBeforePhysicalRemoval) {
+  ASSERT_EQ(NS_OK, mCore->FolderDB().UpdateFlags(mFolder,
+                                                 nsMsgFolderFlags::Newsgroup));
+  RefPtr<nsMsgKeySet> set = nsMsgKeySet::Create();
+  ASSERT_TRUE(set);
+  ASSERT_GE(set->Add(17), 0);
+  RefPtr<PerFolderDatabase> db = new PerFolderDatabase(mFolder, true);
+  ASSERT_EQ(NS_OK, db->SetReadSet(set));
+  nsCOMPtr<nsIMsgDBHdr> expired, retained;
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 17, "expired@news.invalid"_ns,
+                                        getter_AddRefs(expired)));
+  ASSERT_EQ(NS_OK, AddFacadeNewsArticle(*db, 29, "retained@news.invalid"_ns,
+                                        getter_AddRefs(retained)));
+  nsMsgKey key, retainedKey;
+  ASSERT_EQ(NS_OK, expired->GetMessageKey(&key));
+  ASSERT_EQ(NS_OK, retained->GetMessageKey(&retainedKey));
+  ASSERT_NE(17u, key);
+  NewsArticleIdentity article, retainedArticle;
+  MessageBodyState body, settled;
+  ASSERT_EQ(NS_OK, db->CaptureNewsArticleBody(key, article, body));
+  ASSERT_EQ(NS_OK, db->GetNewsArticleLocation(retainedKey, retainedArticle));
+  FinishedMessageBody finished;
+  finished.storeToken = "expired-news-body"_ns;
+  finished.messageSize = 91;
+  finished.offlineMessageSize = 37;
+  finished.lineCount = 4;
+  finished.offline = true;
+  ASSERT_EQ(NS_OK, db->SettleNewsArticleBody(article, body, finished, settled));
+  nsCOMPtr<nsIDBFolderInfo> info;
+  ASSERT_EQ(NS_OK, db->GetDBFolderInfo(getter_AddRefs(info)));
+  int64_t before;
+  ASSERT_EQ(NS_OK, info->GetExpungedBytes(&before));
+  NewsArticleIdentity wrong = article;
+  wrong.group.incarnation = "stale"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->RemoveNewsArticle(wrong, key));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->RemoveNewsArticle(article, retainedKey));
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(NS_OK, db->RemoveNewsArticle(article, key));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(retainedKey, exists));
+  EXPECT_TRUE(exists);
+  EXPECT_TRUE(set->IsMember(17));
+  int64_t after;
+  ASSERT_EQ(NS_OK, info->GetExpungedBytes(&after));
+  EXPECT_EQ(before + 37, after);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db->RemoveNewsArticle(article, key));
+  ASSERT_EQ(NS_OK, info->GetExpungedBytes(&after));
+  EXPECT_EQ(before + 37, after);
+  ASSERT_EQ(NS_OK, db->ForceClosed());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db->RemoveNewsArticle(retainedArticle, retainedKey));
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(retainedKey, exists));
+  EXPECT_TRUE(exists);
+  CheckNoTransaction();
+}
+
+namespace {
+
+// These faults must cross the real caller's C++ store/stream boundary: final
+// native providers create their own streams, and successful I/O cannot exercise
+// a short write or lost Finish acknowledgment. Admission and physical I/O still
+// belong to the actual provider. This local delegate adds no production hook.
+class NewsStoreForwarder : public nsIMsgPluggableStore {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_FORWARD_NSIMSGPLUGGABLESTORE(mStore->)
+  explicit NewsStoreForwarder(nsIMsgPluggableStore* store) : mStore(store) {}
+
+ protected:
+  virtual ~NewsStoreForwarder() = default;
+  nsCOMPtr<nsIMsgPluggableStore> mStore;
+};
+NS_IMPL_ISUPPORTS(NewsStoreForwarder, nsIMsgPluggableStore)
+
+enum class NewsWriteFault { None, Error, Short };
+
+class NewsWriteFaultStream final : public nsIOutputStream {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NewsWriteFaultStream(nsIOutputStream* stream, NewsWriteFault fault,
+                       uint32_t cut, std::function<void()> onCut)
+      : mStream(stream), mFault(fault), mCut(cut), mOnCut(std::move(onCut)) {}
+
+  NS_IMETHOD Close() override { return mStream->Close(); }
+  NS_IMETHOD Flush() override { return mStream->Flush(); }
+  NS_IMETHOD StreamStatus() override { return mStream->StreamStatus(); }
+  NS_IMETHOD IsNonBlocking(bool* value) override {
+    return mStream->IsNonBlocking(value);
+  }
+  NS_IMETHOD WriteFrom(nsIInputStream* input, uint32_t count,
+                       uint32_t* written) override {
+    return mStream->WriteFrom(input, count, written);
+  }
+  NS_IMETHOD WriteSegments(nsReadSegmentFun reader, void* closure,
+                           uint32_t count, uint32_t* written) override {
+    return mStream->WriteSegments(reader, closure, count, written);
+  }
+  NS_IMETHOD Write(const char* data, uint32_t count,
+                   uint32_t* written) override {
+    NS_ENSURE_ARG_POINTER(written);
+    requests.AppendElement(nsCString(data, count));
+    bool cutting = mFault != NewsWriteFault::None && requests.Length() == mCut;
+    uint32_t forwarded = cutting && count ? count - 1 : count;
+    *written = 0;
+    nsresult rv = mStream->Write(data, forwarded, written);
+    bytes.Append(data, *written);
+    if (NS_FAILED(rv)) return rv;
+    NS_ENSURE_TRUE(*written == forwarded, NS_ERROR_UNEXPECTED);
+    if (!cutting) return NS_OK;
+    cutRequested = count;
+    cutWritten = *written;
+    if (mOnCut) mOnCut();
+    return mFault == NewsWriteFault::Error ? NS_ERROR_FILE_NO_DEVICE_SPACE
+                                           : NS_OK;
+  }
+
+  nsTArray<nsCString> requests;
+  nsCString bytes;
+  uint32_t cutRequested = 0;
+  uint32_t cutWritten = 0;
+
+ private:
+  ~NewsWriteFaultStream() = default;
+  nsCOMPtr<nsIOutputStream> mStream;
+  NewsWriteFault mFault;
+  uint32_t mCut;
+  std::function<void()> mOnCut;
+};
+NS_IMPL_ISUPPORTS(NewsWriteFaultStream, nsIOutputStream)
+
+class NewsFaultStore final : public NewsStoreForwarder,
+                             public nsIFolderStorageMoveAdmission {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  explicit NewsFaultStore(nsIMsgPluggableStore* store)
+      : NewsStoreForwarder(store) {}
+
+  NS_IMETHOD CheckFolderStorageMove(nsIMsgFolder* folder) override {
+    ++admissions;
+    nsCOMPtr<nsIFolderStorageMoveAdmission> actual = do_QueryInterface(mStore);
+    NS_ENSURE_TRUE(actual, NS_ERROR_NOT_IMPLEMENTED);
+    return actual->CheckFolderStorageMove(folder);
+  }
+  NS_IMETHOD GetNewMsgOutputStream(nsIMsgFolder* folder,
+                                   nsIOutputStream** output) override {
+    NS_ENSURE_ARG_POINTER(output);
+    ++issued;
+    NS_ENSURE_FALSE(mOriginal || mCurrent, NS_ERROR_IN_PROGRESS);
+    MOZ_TRY(mStore->GetNewMsgOutputStream(folder, getter_AddRefs(mOriginal)));
+    mCurrent = new NewsWriteFaultStream(mOriginal, fault, cut, onCut);
+    last = mCurrent;
+    nsCOMPtr<nsIOutputStream> stream = mCurrent;
+    stream.forget(output);
+    return NS_OK;
+  }
+  NS_IMETHOD FinishNewMessage(nsIMsgFolder* folder, nsIOutputStream* stream,
+                              nsACString& token) override {
+    ++finishes;
+    NS_ENSURE_TRUE(mCurrent && stream == mCurrent && mOriginal,
+                   NS_ERROR_ILLEGAL_VALUE);
+    nsCString completed;
+    ++actualFinishes;
+    // Both providers compare this ORIGINAL pointer with their issued stream.
+    nsresult rv = mStore->FinishNewMessage(folder, mOriginal, completed);
+    if (NS_FAILED(rv)) return rv;  // Keep real uncertain custody untouched.
+    mOriginal = nullptr;
+    mCurrent = nullptr;
+    if (loseFinishAcknowledgment) {
+      orphanToken = completed;
+      return NS_ERROR_FILE_ACCESS_DENIED;
+    }
+    token = completed;
+    return NS_OK;
+  }
+  NS_IMETHOD DiscardNewMessage(nsIMsgFolder* folder,
+                               nsIOutputStream* stream) override {
+    ++discards;
+    NS_ENSURE_TRUE(mCurrent && stream == mCurrent && mOriginal,
+                   NS_ERROR_ILLEGAL_VALUE);
+    ++actualDiscards;
+    nsresult rv = mStore->DiscardNewMessage(folder, mOriginal);
+    if (NS_FAILED(rv)) return rv;
+    mOriginal = nullptr;
+    mCurrent = nullptr;
+    return cleanupResultFailure ? NS_ERROR_FILE_ACCESS_DENIED : NS_OK;
+  }
+  void ResetAttempt() {
+    EXPECT_FALSE(mOriginal);
+    EXPECT_FALSE(mCurrent);
+    issued = finishes = discards = actualFinishes = actualDiscards = 0;
+    admissions = 0;
+    fault = NewsWriteFault::None;
+    cut = 0;
+    onCut = nullptr;
+    loseFinishAcknowledgment = cleanupResultFailure = false;
+    orphanToken.Truncate();
+    last = nullptr;
+  }
+  bool HasUnsettledStream() const { return mOriginal || mCurrent; }
+
+  NewsWriteFault fault = NewsWriteFault::None;
+  uint32_t cut = 0;
+  std::function<void()> onCut;
+  bool loseFinishAcknowledgment = false;
+  bool cleanupResultFailure = false;
+  uint32_t admissions = 0, issued = 0, finishes = 0, discards = 0;
+  uint32_t actualFinishes = 0, actualDiscards = 0;
+  nsCString orphanToken;
+  RefPtr<NewsWriteFaultStream> last;
+
+ private:
+  ~NewsFaultStore() override = default;
+  nsCOMPtr<nsIOutputStream> mOriginal;
+  RefPtr<NewsWriteFaultStream> mCurrent;
+};
+NS_IMPL_ISUPPORTS_INHERITED(NewsFaultStore, NewsStoreForwarder,
+                            nsIFolderStorageMoveAdmission)
+
+class NativeNewsFaultFolder final : public nsMsgNewsFolder {
+ public:
+  NS_IMETHOD GetMsgStore(nsIMsgPluggableStore** result) override {
+    NS_ENSURE_ARG_POINTER(result);
+    nsCOMPtr<nsIMsgPluggableStore> actual;
+    MOZ_TRY(nsMsgNewsFolder::GetMsgStore(getter_AddRefs(actual)));
+    if (!store) {
+      realStore = actual;
+      store = new NewsFaultStore(actual);
+      // No private-admission QI is advertised by this negative control.
+      unknownStore = new NewsStoreForwarder(actual);
+    }
+    NS_ENSURE_TRUE(actual == realStore, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgPluggableStore> selected =
+        unknownAdmission
+            ? static_cast<nsIMsgPluggableStore*>(unknownStore.get())
+            : static_cast<nsIMsgPluggableStore*>(store.get());
+    selected.forget(result);
+    return NS_OK;
+  }
+
+  bool unknownAdmission = false;
+  nsCOMPtr<nsIMsgPluggableStore> realStore;
+  RefPtr<NewsFaultStore> store;
+  RefPtr<NewsStoreForwarder> unknownStore;
+
+ private:
+  ~NativeNewsFaultFolder() override = default;
+};
+
+struct NewsOfflineSnapshot {
+  NewsArticleIdentity article;
+  MessageBodyState body;
+  nsCString bytes, readSet, checkpoint, tags;
+  nsTArray<nsMsgKey> newKeys;
+  int32_t total = -1, unread = -1;
+  uint32_t publicFlags = 0;
+};
+
+// Uses the existing fixture's actual profile/core. Normal account, native
+// folder initialization, server shutdown, lookup eviction and account removal
+// surround only the scoped provider fault. No folder/database identity is
+// injected.
+class NewsOfflineNativeCase {
+ public:
+  nsresult Init(DatabaseCore& core, nsIFile* profile, bool maildir) {
+    nsresult rv;
+    accounts = do_GetService("@mozilla.org/messenger/account-manager;1", &rv);
+    MOZ_TRY(rv);
+    NS_ENSURE_TRUE(accounts, NS_ERROR_NOT_AVAILABLE);
+    static uint32_t serial = 0;
+    nsPrintfCString host("native-news-fault-%u.invalid", ++serial);
+    MOZ_TRY(accounts->CreateIncomingServer("reader"_ns, host, "nntp"_ns,
+                                           getter_AddRefs(server)));
+    MOZ_TRY(server->SetStringValue(
+        "storeContractID", maildir
+                               ? "@mozilla.org/msgstore/maildirstore;1"_ns
+                               : "@mozilla.org/msgstore/berkeleystore;1"_ns));
+    nsCOMPtr<nsIFile> path;
+    MOZ_TRY(profile->Clone(getter_AddRefs(path)));
+    MOZ_TRY(path->Append(u"news-offline-native"_ns));
+    MOZ_TRY(path->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(server->SetLocalPath(path));
+    MOZ_TRY(accounts->CreateAccount(getter_AddRefs(account)));
+    MOZ_TRY(account->SetIncomingServer(server));
+    boundAccount = true;
+    MOZ_TRY(server->GetRootFolder(getter_AddRefs(root)));
+    uint64_t rootId, groupId;
+    MOZ_TRY(root->GetId(&rootId));
+    MOZ_TRY(core.FolderDB().InsertFolder(rootId, "native.fault.group"_ns,
+                                         &groupId));
+    MOZ_TRY(core.FolderDB().UpdateFlags(groupId, nsMsgFolderFlags::Newsgroup));
+    folder = new NativeNewsFaultFolder();
+    MOZ_TRY(folder->InitWithFolderId(groupId));
+    MOZ_TRY(folder->SetParent(root));
+    // Complete normal subscription/parent/read-set setup through the public
+    // caller; its checked cache lookup must retain this exact native object.
+    nsCOMPtr<nsIMsgNewsFolder> newsRoot = do_QueryInterface(root);
+    NS_ENSURE_TRUE(newsRoot, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgFolder> registered;
+    MOZ_TRY(newsRoot->AddNewsgroup("native.fault.group"_ns, EmptyCString(),
+                                   getter_AddRefs(registered)));
+    NS_ENSURE_TRUE(registered == static_cast<nsIMsgFolder*>(folder.get()),
+                   NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgPluggableStore> selected;
+    MOZ_TRY(folder->GetMsgStore(getter_AddRefs(selected)));
+    MOZ_TRY(selected->EnsureLocalStore(folder));
+    nsCOMPtr<nsIMsgDatabase> database;
+    MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(database)));
+    native = do_QueryObject(database);
+    NS_ENSURE_TRUE(native, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(AddFacadeNewsArticle(*native, 7401,
+                                 "native-offline@news.invalid"_ns,
+                                 getter_AddRefs(header)));
+    MOZ_TRY(header->GetMessageKey(&key));
+    NS_ENSURE_TRUE(key && key != 7401 && key != nsMsgKey_None,
+                   NS_ERROR_UNEXPECTED);
+    MOZ_TRY(header->SetMessageSize(PriorData().Length()));
+    MOZ_TRY(header->MarkRead(true));
+    uint32_t flags;
+    MOZ_TRY(header->OrFlags(nsMsgMessageFlags::Marked, &flags));
+    MOZ_TRY(header->SetStringProperty("keywords", "native-kept-tag"_ns));
+    MOZ_TRY(folder->SetSaveArticleOffline(true));
+    MOZ_TRY(folder->NotifyArticleDownloaded(7401, PriorData()));
+    NS_ENSURE_TRUE(folder->store, NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
+
+  ~NewsOfflineNativeCase() {
+    header = nullptr;
+    native = nullptr;
+    if (folder) {
+      if (folder->realStore) {
+        nsCOMPtr<nsIFolderStorageMoveAdmission> admission =
+            do_QueryInterface(folder->realStore);
+        EXPECT_TRUE(admission);
+        if (admission)
+          EXPECT_EQ(NS_OK, admission->CheckFolderStorageMove(folder));
+      }
+      if (folder->store) {
+        EXPECT_FALSE(folder->store->HasUnsettledStream());
+        folder->store->onCut = nullptr;
+      }
+      EXPECT_EQ(NS_OK, folder->Shutdown(true));
+      nsCOMPtr<nsIFolderLookupService> lookup =
+          do_GetService("@mozilla.org/mail/folder-lookup;1");
+      EXPECT_TRUE(lookup);
+      if (lookup) EXPECT_EQ(NS_OK, lookup->EvictFolder(folder));
+      folder = nullptr;
+    }
+    root = nullptr;
+    if (account) EXPECT_EQ(NS_OK, accounts->RemoveAccount(account, false));
+    if (server && !boundAccount) {
+      EXPECT_EQ(NS_OK, accounts->RemoveIncomingServer(server, false));
+    }
+  }
+
+  static nsCString PriorData() {
+    return "From: original@example.invalid\r\nSubject: retained native body\r\n"
+           "\r\nPrior native body bytes.\r\n"_ns;
+  }
+  static nsCString RetryData() {
+    return "From: retry@example.invalid\r\nSubject: fresh native request\r\n"
+           "\r\nFresh explicit native body.\r\n"_ns;
+  }
+  nsresult ReadBody(const nsACString& token, nsACString& bytes) {
+    nsCOMPtr<nsIInputStream> stream;
+    MOZ_TRY(folder->realStore->GetMsgInputStream(folder, token, 0,
+                                                 getter_AddRefs(stream)));
+    nsCString result;
+    nsresult rv = NS_OK;
+    while (true) {
+      char buffer[256];
+      uint32_t count = 0;
+      rv = stream->Read(buffer, sizeof(buffer), &count);
+      if (NS_FAILED(rv) || !count) break;
+      result.Append(buffer, count);
+    }
+    nsresult closed = stream->Close();
+    MOZ_TRY(rv);
+    MOZ_TRY(closed);
+    bytes = result;
+    return NS_OK;
+  }
+  nsresult Capture(NewsOfflineSnapshot& output) {
+    NewsOfflineSnapshot result;
+    MOZ_TRY(native->CaptureNewsArticleBody(key, result.article, result.body));
+    NS_ENSURE_TRUE(result.body.storeToken.isSome(), NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(ReadBody(*result.body.storeToken, result.bytes));
+    nsMsgKeySet* readSet = nullptr;
+    MOZ_TRY(native->GetReadSet(&readSet));
+    NS_ENSURE_TRUE(readSet, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(readSet->Output(getter_Copies(result.readSet)));
+    MOZ_TRY(native->GetNewList(result.newKeys));
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(native->GetDBFolderInfo(getter_AddRefs(info)));
+    MOZ_TRY(info->GetNumMessages(&result.total));
+    MOZ_TRY(info->GetNumUnreadMessages(&result.unread));
+    MOZ_TRY(info->GetCharProperty("readSet", result.checkpoint));
+    MOZ_TRY(header->GetFlags(&result.publicFlags));
+    MOZ_TRY(header->GetStringProperty("keywords", result.tags));
+    output = std::move(result);
+    return NS_OK;
+  }
+  void ExpectUnchanged(const NewsOfflineSnapshot& expected) {
+    NewsOfflineSnapshot actual;
+    ASSERT_EQ(NS_OK, Capture(actual));
+    ExpectNewsArticleLocation(expected.article, actual.article);
+    ExpectNewsBodyState(expected.body, actual.body);
+    EXPECT_EQ(expected.bytes, actual.bytes);
+    EXPECT_EQ(expected.total, actual.total);
+    EXPECT_EQ(expected.unread, actual.unread);
+    EXPECT_EQ(expected.publicFlags, actual.publicFlags);
+    EXPECT_EQ(expected.newKeys, actual.newKeys);
+    EXPECT_EQ(expected.tags, actual.tags);
+    EXPECT_EQ(expected.readSet, actual.readSet);
+    EXPECT_EQ(expected.checkpoint, actual.checkpoint);
+  }
+  void ExpectFreshRetry(const NewsOfflineSnapshot& before) {
+    folder->store->ResetAttempt();
+    ASSERT_EQ(NS_OK, folder->NotifyArticleDownloaded(7401, RetryData()));
+    EXPECT_EQ(1u, folder->store->issued);
+    EXPECT_EQ(1u, folder->store->finishes);
+    EXPECT_EQ(1u, folder->store->actualFinishes);
+    EXPECT_EQ(0u, folder->store->discards);
+    ASSERT_TRUE(folder->store->last);
+    ASSERT_EQ(3u, folder->store->last->requests.Length());
+    NewsOfflineSnapshot after;
+    ASSERT_EQ(NS_OK, Capture(after));
+    ExpectNewsArticleLocation(before.article, after.article);
+    EXPECT_EQ(before.body.key, after.body.key);
+    EXPECT_EQ(before.body.folderId, after.body.folderId);
+    EXPECT_NE(before.body.storeToken, after.body.storeToken);
+    EXPECT_TRUE(after.body.flags & nsMsgMessageFlags::Offline);
+    EXPECT_EQ(before.publicFlags, after.publicFlags);
+    EXPECT_EQ(before.total, after.total);
+    EXPECT_EQ(before.unread, after.unread);
+    EXPECT_EQ(before.newKeys, after.newKeys);
+    EXPECT_EQ(before.tags, after.tags);
+    EXPECT_EQ(before.readSet, after.readSet);
+    EXPECT_EQ(before.checkpoint, after.checkpoint);
+    EXPECT_EQ(folder->store->last->bytes, after.bytes);
+    EXPECT_EQ(RetryData(), folder->store->last->requests[2]);
+    nsCString retained;
+    ASSERT_EQ(NS_OK, ReadBody(*before.body.storeToken, retained));
+    EXPECT_EQ(before.bytes, retained);
+  }
+
+  nsCOMPtr<nsIMsgAccountManager> accounts;
+  nsCOMPtr<nsIMsgAccount> account;
+  nsCOMPtr<nsIMsgIncomingServer> server;
+  nsCOMPtr<nsIMsgFolder> root;
+  RefPtr<NativeNewsFaultFolder> folder;
+  RefPtr<PerFolderDatabase> native;
+  nsCOMPtr<nsIMsgDBHdr> header;
+  nsMsgKey key = nsMsgKey_None;
+  bool boundAccount = false;
+};
+
+}  // namespace
+
+// Normal AccountManager startup owns the core used by real native folders.
+// The older direct-core fixture has already started it, so it cannot initialize
+// that application service as well. Run these three application caller cases
+// together in a fresh normal gtest process, with Panorama enabled at startup;
+// keep the existing direct-core cases in their ordinary invocation. The whole
+// job still owns both invocations. No service/factory reset or hot pref change.
+class DeliveryNewsOfflineProvider : public DeliveryMessageReferences {
+ protected:
+  void SetUp() override {
+    ASSERT_TRUE(mozilla::StaticPrefs::mail_panorama_enabled_AtStartup());
+    // Use the harness-owned application profile, not a replacement test
+    // profile.
+    ASSERT_EQ(NS_OK, NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                                            getter_AddRefs(mProfile)));
+    nsresult rv;
+    mAccounts = do_GetService("@mozilla.org/messenger/account-manager;1", &rv);
+    ASSERT_EQ(NS_OK, rv);
+    ASSERT_TRUE(mAccounts);
+    nsCOMPtr<nsIMsgDBService> service =
+        do_GetService("@mozilla.org/msgDatabase/msgDBService;1", &rv);
+    ASSERT_EQ(NS_OK, rv);
+    nsCOMPtr<nsIDatabaseCore> nativeService = do_QueryInterface(service, &rv);
+    ASSERT_EQ(NS_OK, rv);
+    ASSERT_TRUE(nativeService);
+    mCore = DatabaseCore::GetInstanceForService();
+    ASSERT_EQ(static_cast<nsIDatabaseCore*>(mCore.get()), nativeService.get());
+    ASSERT_TRUE(Connection());
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(mFile)));
+    ASSERT_EQ(NS_OK, mFile->Append(u"panorama.sqlite"_ns));
+    nsCOMPtr<nsIFile> actual;
+    ASSERT_EQ(NS_OK, Connection()->GetDatabaseFile(getter_AddRefs(actual)));
+    bool same = false;
+    ASSERT_EQ(NS_OK, mFile->Equals(actual, &same));
+    ASSERT_TRUE(same);
+  }
+  void TearDown() override {
+    // Each case removes only its real accounts/folders in scoped cleanup.
+    // Standard application/harness shutdown owns the shared profile and core;
+    // a per-case manual profile-before-change would retire the cached service.
+    mCore = nullptr;
+    mAccounts = nullptr;
+    mProfile = nullptr;
+    mFile = nullptr;
+  }
+  nsCOMPtr<nsIMsgAccountManager> mAccounts;
+};
+
+TEST_F(DeliveryNewsOfflineProvider,
+       NewsOfflineWriteFailuresRetainPriorBodyAndAllowFreshRetry) {
+  // Public native folder initialization/callbacks require this ordinary startup
+  // input, not a late mutation of a cached AtStartup preference. Never skip it.
+  ASSERT_TRUE(mozilla::StaticPrefs::mail_panorama_enabled_AtStartup());
+  for (bool maildir : {false, true}) {
+    SCOPED_TRACE(maildir ? "maildir" : "mbox");
+    NewsOfflineNativeCase item;
+    ASSERT_EQ(NS_OK, item.Init(*mCore, mProfile, maildir));
+    uint32_t completedCuts = 0;
+    for (uint32_t cut : {1u, 2u, 3u}) {
+      SCOPED_TRACE(cut);
+      NewsOfflineSnapshot before;
+      ASSERT_EQ(NS_OK, item.Capture(before));
+      EXPECT_TRUE(before.body.flags & nsMsgMessageFlags::Offline);
+      EXPECT_TRUE(before.publicFlags & nsMsgMessageFlags::Read);
+      EXPECT_TRUE(before.publicFlags & nsMsgMessageFlags::Marked);
+      item.folder->store->ResetAttempt();
+      item.folder->store->fault = NewsWriteFault::Error;
+      item.folder->store->cut = cut;
+      item.folder->store->cleanupResultFailure = true;
+      bool reentered = false;
+      item.folder->store->onCut = [&] {
+        reentered = true;
+        EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+                  item.folder->NotifyArticleDownloaded(
+                      7401, NewsOfflineNativeCase::RetryData()));
+      };
+      EXPECT_EQ(NS_ERROR_FILE_NO_DEVICE_SPACE,
+                item.folder->NotifyArticleDownloaded(
+                    7401, NewsOfflineNativeCase::RetryData()));
+      EXPECT_TRUE(reentered);
+      EXPECT_EQ(1u, item.folder->store->issued);
+      EXPECT_EQ(0u, item.folder->store->finishes);
+      EXPECT_EQ(0u, item.folder->store->actualFinishes);
+      EXPECT_EQ(1u, item.folder->store->discards);
+      EXPECT_EQ(1u, item.folder->store->actualDiscards);
+      ASSERT_TRUE(item.folder->store->last);
+      EXPECT_EQ(cut, item.folder->store->last->requests.Length());
+      EXPECT_GT(item.folder->store->last->cutRequested, 1u);
+      EXPECT_EQ(item.folder->store->last->cutRequested - 1,
+                item.folder->store->last->cutWritten);
+      ASSERT_NO_FATAL_FAILURE(item.ExpectUnchanged(before));
+      ASSERT_NO_FATAL_FAILURE(item.ExpectFreshRetry(before));
+      CheckNoTransaction();
+      ++completedCuts;
+    }
+    EXPECT_EQ(3u, completedCuts);
+    RecordProperty(maildir ? "maildir_completed_cuts" : "mbox_completed_cuts",
+                   completedCuts);
+  }
+}
+
+TEST_F(DeliveryNewsOfflineProvider,
+       NewsOfflineShortWritesRetainPriorBodyAndAllowFreshRetry) {
+  ASSERT_TRUE(mozilla::StaticPrefs::mail_panorama_enabled_AtStartup());
+  for (bool maildir : {false, true}) {
+    SCOPED_TRACE(maildir ? "maildir" : "mbox");
+    NewsOfflineNativeCase item;
+    ASSERT_EQ(NS_OK, item.Init(*mCore, mProfile, maildir));
+    uint32_t completedCuts = 0;
+    for (uint32_t cut : {1u, 2u, 3u}) {
+      SCOPED_TRACE(cut);
+      NewsOfflineSnapshot before;
+      ASSERT_EQ(NS_OK, item.Capture(before));
+      EXPECT_TRUE(before.body.flags & nsMsgMessageFlags::Offline);
+      item.folder->store->ResetAttempt();
+      item.folder->store->fault = NewsWriteFault::Short;
+      item.folder->store->cut = cut;
+      EXPECT_EQ(NS_ERROR_FAILURE,
+                item.folder->NotifyArticleDownloaded(
+                    7401, NewsOfflineNativeCase::RetryData()));
+      EXPECT_EQ(1u, item.folder->store->issued);
+      EXPECT_EQ(0u, item.folder->store->finishes);
+      EXPECT_EQ(0u, item.folder->store->actualFinishes);
+      EXPECT_EQ(1u, item.folder->store->discards);
+      EXPECT_EQ(1u, item.folder->store->actualDiscards);
+      ASSERT_TRUE(item.folder->store->last);
+      EXPECT_EQ(cut, item.folder->store->last->requests.Length());
+      EXPECT_GT(item.folder->store->last->cutRequested, 1u);
+      EXPECT_EQ(item.folder->store->last->cutRequested - 1,
+                item.folder->store->last->cutWritten);
+      ASSERT_NO_FATAL_FAILURE(item.ExpectUnchanged(before));
+      ASSERT_NO_FATAL_FAILURE(item.ExpectFreshRetry(before));
+      CheckNoTransaction();
+      ++completedCuts;
+    }
+    EXPECT_EQ(3u, completedCuts);
+    RecordProperty(maildir ? "maildir_completed_cuts" : "mbox_completed_cuts",
+                   completedCuts);
+  }
+}
+
+TEST_F(DeliveryNewsOfflineProvider,
+       NewsOfflineUncertainFinishDoesNotDiscardOrReplay) {
+  ASSERT_TRUE(mozilla::StaticPrefs::mail_panorama_enabled_AtStartup());
+  for (bool maildir : {false, true}) {
+    SCOPED_TRACE(maildir ? "maildir" : "mbox");
+    NewsOfflineNativeCase item;
+    ASSERT_EQ(NS_OK, item.Init(*mCore, mProfile, maildir));
+    NewsOfflineSnapshot before;
+    ASSERT_EQ(NS_OK, item.Capture(before));
+    EXPECT_TRUE(before.body.flags & nsMsgMessageFlags::Offline);
+    item.folder->store->ResetAttempt();
+    item.folder->unknownAdmission = true;
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+              item.folder->NotifyArticleDownloaded(
+                  7401, NewsOfflineNativeCase::RetryData()));
+    EXPECT_EQ(0u, item.folder->store->issued);
+    item.folder->unknownAdmission = false;
+    ASSERT_NO_FATAL_FAILURE(item.ExpectUnchanged(before));
+
+    // This stream belongs to this explicit test caller, not the news attempt.
+    nsCOMPtr<nsIOutputStream> busy;
+    ASSERT_EQ(NS_OK, item.folder->realStore->GetNewMsgOutputStream(
+                         item.folder, getter_AddRefs(busy)));
+    bool busyDiscardAttempted = false;
+    auto discardBusy = MakeScopeExit([&] {
+      if (busy && !busyDiscardAttempted) {
+        EXPECT_EQ(NS_OK,
+                  item.folder->realStore->DiscardNewMessage(item.folder, busy));
+      }
+    });
+    EXPECT_EQ(NS_MSG_FOLDER_BUSY,
+              item.folder->NotifyArticleDownloaded(
+                  7401, NewsOfflineNativeCase::RetryData()));
+    EXPECT_EQ(0u, item.folder->store->issued);
+    EXPECT_EQ(0u, item.folder->store->discards);
+    busyDiscardAttempted = true;
+    nsresult discarded =
+        item.folder->realStore->DiscardNewMessage(item.folder, busy);
+    busy = nullptr;
+    ASSERT_EQ(NS_OK, discarded);
+    ASSERT_NO_FATAL_FAILURE(item.ExpectUnchanged(before));
+
+    item.folder->store->ResetAttempt();
+    item.folder->store->loseFinishAcknowledgment = true;
+    EXPECT_EQ(NS_ERROR_FILE_ACCESS_DENIED,
+              item.folder->NotifyArticleDownloaded(
+                  7401, NewsOfflineNativeCase::RetryData()));
+    EXPECT_EQ(1u, item.folder->store->issued);
+    EXPECT_EQ(1u, item.folder->store->finishes);
+    EXPECT_EQ(1u, item.folder->store->actualFinishes);
+    EXPECT_EQ(0u, item.folder->store->discards);
+    EXPECT_EQ(0u, item.folder->store->actualDiscards);
+    ASSERT_FALSE(item.folder->store->orphanToken.IsEmpty());
+    nsCString orphan = item.folder->store->orphanToken;
+    ASSERT_TRUE(before.body.storeToken.isSome());
+    EXPECT_NE(*before.body.storeToken, orphan);
+    nsCString orphanBytes;
+    ASSERT_EQ(NS_OK, item.ReadBody(orphan, orphanBytes));
+    ASSERT_TRUE(item.folder->store->last);
+    ASSERT_EQ(3u, item.folder->store->last->requests.Length());
+    EXPECT_EQ(NewsOfflineNativeCase::RetryData(),
+              item.folder->store->last->requests[2]);
+    EXPECT_EQ(item.folder->store->last->bytes, orphanBytes);
+    ASSERT_NO_FATAL_FAILURE(item.ExpectUnchanged(before));
+    uint32_t failedAttemptFinishes = item.folder->store->actualFinishes;
+    // Underlying Finish really completed, so its real admission permits this
+    // NEW request. This does not claim recovery from an internal failed Finish.
+    ASSERT_NO_FATAL_FAILURE(item.ExpectFreshRetry(before));
+    nsCString retainedOrphan;
+    ASSERT_EQ(NS_OK, item.ReadBody(orphan, retainedOrphan));
+    EXPECT_EQ(orphanBytes, retainedOrphan);
+    EXPECT_EQ(2u, failedAttemptFinishes + item.folder->store->actualFinishes);
+    RecordProperty(maildir ? "maildir_actual_finishes" : "mbox_actual_finishes",
+                   failedAttemptFinishes + item.folder->store->actualFinishes);
+    CheckNoTransaction();
+  }
+}
 
 TEST_F(DeliveryCompleteHeader, NewsReadSetBorrowedIdentityAndDetach) {
   RefPtr<PerFolderDatabase> local = new PerFolderDatabase(mFolder, false);

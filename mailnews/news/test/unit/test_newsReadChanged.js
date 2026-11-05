@@ -424,15 +424,20 @@ add_task(function test_sameArticleNumberStaysScopedToGroup() {
   }
 });
 
-add_task(async function test_nativeExpiryRejectsBeforeUsingPhysicalKeys() {
+add_task(async function test_nativeFailedExpiryPreservesPhysicalState() {
   if (!nativeBackend) {
     info("Legacy expiry is checked by the existing ordinary expiry file");
     return;
   }
+  class MalformedListHandler extends NNTP_RFC2980_handler {
+    LISTGROUP() {
+      return "211 Articles follow:\n5001\ninvalid-article\n.\n";
+    }
+  }
   const {
     server,
     folders: [folder],
-  } = articleFixture;
+  } = await fetchReadSetArticles(MalformedListHandler);
   const db = folder.msgDatabase;
   const keys = db.listAllKeys();
   Assert.equal(keys.length, 2, "The actual NNTP headers are retained");
@@ -451,10 +456,10 @@ add_task(async function test_nativeExpiryRejectsBeforeUsingPhysicalKeys() {
   try {
     await Assert.rejects(
       pool.removeExpiredArticles(folder.name),
-      /NS_ERROR_NOT_IMPLEMENTED/,
-      "Unmapped native expiry rejects its existing Promise before deletion"
+      /NS_ERROR_ILLEGAL_VALUE/,
+      "Malformed LISTGROUP rejects with the actual parse error before deletion"
     );
-    Assert.ok(!withClient.called, "No LISTGROUP request is started");
+    Assert.equal(withClient.callCount, 1, "The actual LISTGROUP request was started");
   } finally {
     withClient.restore();
   }

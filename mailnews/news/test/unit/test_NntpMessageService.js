@@ -10,9 +10,28 @@ add_setup(function () {
   const server = setupLocalServer(NNTP_PORT);
   folder = server.rootFolder.getChildNamed("test.subscribe.simple");
   const db = folder.msgDatabase;
-  const header = db.createNewHdr();
-  header.messageId = "compose@nntp.invalid";
-  message = db.attachHdr(header, false);
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    const { NntpNewsGroup } = ChromeUtils.importESModule(
+      "resource:///modules/NntpNewsGroup.sys.mjs"
+    );
+    const reader = new NntpNewsGroup(server, folder.QueryInterface(Ci.nsIMsgNewsFolder));
+    try {
+      reader.getArticlesRangeToFetch(null, 7401, 7401);
+      reader.processXOverLine(
+        "7401\tCompose\tReader <reader@example.invalid>\tThu, 01 Oct 2026 12:00:00 +0000\t<compose@nntp.invalid>\t\t20\t1"
+      );
+      reader.finishProcessingXOver();
+    } finally {
+      reader.cleanUp();
+    }
+    message = db.getMsgHdrForMessageID("compose@nntp.invalid");
+    Assert.ok(message, "The real native overview producer published the compose header");
+    Assert.notEqual(message.messageKey, 7401, "Native physical key differs from article number");
+  } else {
+    const header = db.createNewHdr();
+    header.messageId = "compose@nntp.invalid";
+    message = db.attachHdr(header, false);
+  }
 });
 
 /**

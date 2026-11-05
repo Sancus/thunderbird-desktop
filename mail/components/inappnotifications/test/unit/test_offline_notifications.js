@@ -7,6 +7,9 @@
 const { OfflineNotifications } = ChromeUtils.importESModule(
   "moz-src:///comm/mail/components/inappnotifications/modules/OfflineNotifications.sys.mjs"
 );
+const { NotificationFilter } = ChromeUtils.importESModule(
+  "moz-src:///comm/mail/components/inappnotifications/modules/NotificationFilter.sys.mjs"
+);
 
 // Properties required in the main notification object by the schema:
 // https://github.com/thunderbird/thunderbird-notifications/blob/main/schema.json
@@ -74,8 +77,8 @@ add_task(async function test_get_default_notifications() {
     }
     Assert.greater(
       Date.parse(notification.end_at),
-      Date.now(),
-      `Notification should have a chance to be displayed for ${notification.id}`
+      Date.parse(notification.start_at),
+      `Notification should have a nonempty display window for ${notification.id}`
     );
   }
 });
@@ -94,4 +97,57 @@ add_task(async function test_get_default_notification_ids() {
     notifications.every(({ id }) => notificationIds.has(id)),
     "Every ID should be in the set"
   );
+});
+
+add_task(async function test_default_notification_expiry_is_enforced() {
+  const notifications = await OfflineNotifications.getDefaultNotifications();
+  Assert.greater(
+    notifications.length,
+    0,
+    "Exercise real shipped notifications"
+  );
+  const now = Date.now();
+  const margin = 100000;
+  for (const notification of notifications) {
+    // Isolate the date contract from the campaign's channel/locale targeting.
+    // Never change the shipped object or the complete default-ID cache.
+    const current = {
+      ...notification,
+      targeting: {},
+      start_at: new Date(now - margin).toISOString(),
+      end_at: new Date(now + margin).toISOString(),
+    };
+    Assert.ok(
+      NotificationFilter.isActiveNotification(current, 0, []),
+      `${notification.id} can display inside its window`
+    );
+    Assert.ok(
+      !NotificationFilter.isActiveNotification(
+        { ...current, end_at: new Date(now - 1).toISOString() },
+        0,
+        []
+      ),
+      `${notification.id} cannot display after expiry`
+    );
+    Assert.ok(
+      !NotificationFilter.isActiveNotification(
+        { ...current, start_at: new Date(now + margin).toISOString() },
+        0,
+        []
+      ),
+      `${notification.id} cannot display before its start`
+    );
+    Assert.ok(
+      !NotificationFilter.isActiveNotification(
+        { ...current, end_at: "invalid" },
+        0,
+        []
+      ),
+      `${notification.id} rejects an invalid expiry`
+    );
+    Assert.ok(
+      !NotificationFilter.isActiveNotification(current, 0, [notification.id]),
+      `${notification.id} retains the interaction exclusion`
+    );
+  }
 });

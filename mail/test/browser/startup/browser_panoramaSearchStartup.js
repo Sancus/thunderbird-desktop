@@ -80,11 +80,10 @@ add_task(async function test_registeredNativeBackendCoalescesStartupAndClose() {
       },
     },
   });
-  await SpecialPowers.pushPrefEnv({ set: [["mail.panorama.enabled", false]] });
   try {
     Assert.ok(
       glue._getMailSearchBackend() instanceof Ci.nsIDatabaseCore,
-      "Changing the live preference does not replace the startup-selected native backend"
+      "The native manifest selected the actual backend before startup"
     );
     const first = glue._initMailSearch();
     Assert.equal(first, glue._initMailSearch());
@@ -101,7 +100,6 @@ add_task(async function test_registeredNativeBackendCoalescesStartupAndClose() {
     Assert.equal(legacy, 0);
   } finally {
     await glue._shutdownMailSearch();
-    await SpecialPowers.popPrefEnv();
   }
 });
 

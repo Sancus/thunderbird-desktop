@@ -169,7 +169,13 @@ class TestPanoramaConversation(MarionetteTestCase):
             self.marionette.switch_to_window(self.activity)
             self.assertEqual(0, self.main_window_count())
         except Exception:
-            self.restore()
+            try:
+                self.restore()
+            except Exception:
+                self.logger.error(
+                    "Failed to restore the conversation fixture after setup failed",
+                    exc_info=True,
+                )
             raise
 
     def tearDown(self):

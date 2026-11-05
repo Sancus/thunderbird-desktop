@@ -42,11 +42,19 @@ subsuite = "thunderbird"
 
 ["browser_calendarDialogPositionDurationsSize0.js"]
 
+["browser_calendarDialogPositionDurationsSize0LaterOffsets.js"]
+
 ["browser_calendarDialogPositionDurationsSize1.js"]
+
+["browser_calendarDialogPositionDurationsSize1LaterOffsets.js"]
 
 ["browser_calendarDialogPositionDurationsSize2.js"]
 
+["browser_calendarDialogPositionDurationsSize2LaterOffsets.js"]
+
 ["browser_calendarDialogPositionDurationsSize3.js"]
+
+["browser_calendarDialogPositionDurationsSize3LaterOffsets.js"]
 
 ["browser_calendarDialogPositions0.js"]
 

@@ -1161,7 +1161,10 @@ export class NntpClient {
                 article
               );
             }
-          } else {
+          } else if (
+            this._saveArticleOffline ||
+            !Services.prefs.getBoolPref("mail.panorama.enabled", false)
+          ) {
             this._newsFolder?.notifyArticleDownloaded(
               this._articleNumber,
               article

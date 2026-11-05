@@ -9,7 +9,7 @@
 #include "nsIInputStream.h"
 #include "nsIMsgAccount.h"
 #include "nsIMsgAccountManager.h"
-#include "nsIMsgDBService.h"
+#include "nsIMsgDatabase.h"
 #include "nsIMsgIncomingServer.h"
 #include "nsIMsgPluggableStore.h"
 #include "nsIOutputStream.h"

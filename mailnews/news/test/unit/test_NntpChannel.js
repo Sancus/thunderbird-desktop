@@ -563,7 +563,15 @@ add_task(async function test_nntpArticleWithoutHeaderInOfflineGroup() {
   _server.closeCachedConnections();
   server.resetTest();
   const folder = _server.rootFolder.getChildNamed("test.filter");
+  const newsFolder = folder.QueryInterface(Ci.nsIMsgNewsFolder);
+  const previousMode = newsFolder.saveArticleOffline;
+  const previousKeys = [...folder.messages].map(header => header.messageKey);
+  const previousReadSet = newsFolder.newsrcReadSet;
   folder.setFlag(Ci.nsMsgFolderFlags.Offline);
+  if (nativeBackend) {
+    // An online headerless fetch does not own another operation's save mode.
+    newsFolder.saveArticleOffline = true;
+  }
   try {
     if (nativeBackend) {
       Assert.throws(
@@ -583,7 +591,28 @@ add_task(async function test_nntpArticleWithoutHeaderInOfflineGroup() {
       uri: `nntp://localhost:${NNTP_PORT}/test.filter/2`,
       loadUsingSystemPrincipal: true,
     }).asyncOpen(streamListener);
-    await streamListener.promise;
+    Assert.stringContains(
+      await streamListener.promise,
+      "Message-ID: <2@regular.invalid>",
+      "The headerless online fetch returns its requested article"
+    );
+    if (nativeBackend) {
+      Assert.ok(
+        newsFolder.saveArticleOffline,
+        "The headerless fetch preserves the other operation's save mode"
+      );
+      Assert.deepEqual(
+        [...folder.messages].map(header => header.messageKey),
+        previousKeys,
+        "The headerless fetch never fabricates an offline physical row"
+      );
+      Assert.equal(newsFolder.newsrcReadSet, previousReadSet);
+      Assert.throws(
+        () => folder.msgDatabase.getMsgHdrForMessageID("2@regular.invalid"),
+        /NS_ERROR_ILLEGAL_VALUE/,
+        "The header remains absent after the successful body fetch"
+      );
+    }
 
     do_check_transaction(server.playTransaction(), [
       "MODE READER",
@@ -591,6 +620,7 @@ add_task(async function test_nntpArticleWithoutHeaderInOfflineGroup() {
       "ARTICLE 2",
     ]);
   } finally {
+    newsFolder.saveArticleOffline = previousMode;
     folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
   }
 });

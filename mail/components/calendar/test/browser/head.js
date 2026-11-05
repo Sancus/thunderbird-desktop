@@ -229,7 +229,7 @@ async function createEvent({
  * Opens an event on the calendar.
  *
  * @param {HTMLElement} eventBox - Event box element to interact with.
- * @returns {HTMLElement}
+ * @returns {Promise<HTMLElement>} The event box after the dialog opens.
  */
 async function openEvent({ eventBox }) {
   const dblClickEvent = new MouseEvent("dblclick", {
@@ -238,6 +238,12 @@ async function openEvent({ eventBox }) {
     cancelable: true,
   });
   const readyPromise = waitForCalendarReady();
+
+  // Finish pending painting before sending synthetic input to the calendar.
+  await TestUtils.waitForCondition(
+    () => !window.windowUtils.isMozAfterPaintPending,
+    "Calendar painting should finish before opening the event"
+  );
 
   EventUtils.sendMouseEvent(dblClickEvent, eventBox, window);
 

@@ -1024,9 +1024,9 @@ add_task(async function test_filter_move_delete_settlement() {
                 },
               },
               {
-                get(target, key, receiver) {
-                  if (Reflect.has(target, key)) {
-                    return Reflect.get(target, key, receiver);
+                get(proxyTarget, key, receiver) {
+                  if (Reflect.has(proxyTarget, key)) {
+                    return Reflect.get(proxyTarget, key, receiver);
                   }
                   const value = folder[key];
                   return typeof value == "function"

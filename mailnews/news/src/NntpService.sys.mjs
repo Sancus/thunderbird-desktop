@@ -195,9 +195,6 @@ export class NntpService {
           }
         };
         client.onData = data => {
-          if (binding) {
-            lazy.revalidateNativeNewsArticle(binding);
-          }
           if (
             outputStream &&
             outputStream.write(data, data.length) != data.length

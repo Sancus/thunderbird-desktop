@@ -1133,9 +1133,6 @@ export class NntpClient {
     this._readResponse(
       data,
       line => {
-        if (this._articleBinding) {
-          revalidateNativeNewsArticle(this._articleBinding);
-        }
         article += line.slice(0, -2) + lineSeparator;
         this.onData(line);
       },

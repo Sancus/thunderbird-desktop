@@ -647,7 +647,6 @@ export class NntpChannel extends MailChannel {
           if (!Components.isSuccessCode(this._status)) {
             throw Components.Exception("Cancelled news body", this._status);
           }
-          this._revalidateNativeArticle();
           if (outputStream.write(data, data.length) != data.length) {
             throw Components.Exception(
               "Short news channel write",

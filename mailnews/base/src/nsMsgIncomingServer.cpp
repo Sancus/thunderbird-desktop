@@ -402,16 +402,41 @@ nsresult nsMsgIncomingServer::CreateLocalFolder(const nsACString& folderName,
   nsCOMPtr<nsIMsgFolder> rootFolder;
   nsresult rv = GetRootFolder(getter_AddRefs(rootFolder));
   NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  const bool initialDefault =
+      StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      nsMsgDBFolder::IsLocalCacheDefaultRole(folderName, flag);
+  auto finishDefault = [&]() -> nsresult {
+    if (initialDefault) {
+      return static_cast<nsMsgDBFolder*>(rootFolder.get())
+          ->InitializeLocalCacheDefaultChild(folderName, flag);
+    }
+    return NS_OK;
+  };
+#endif
   nsCOMPtr<nsIMsgFolder> child;
-  rootFolder->GetChildNamed(folderName, getter_AddRefs(child));
-  if (child) return NS_OK;
-  rootFolder->GetFolderWithFlags(flag, getter_AddRefs(child));
-  if (child) return NS_OK;
+  rv = rootFolder->GetChildNamed(folderName, getter_AddRefs(child));
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (child) {
+#ifdef MOZ_PANORAMA
+    return finishDefault();
+#else
+    return NS_OK;
+#endif
+  }
+  rv = rootFolder->GetFolderWithFlags(flag, getter_AddRefs(child));
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (child) return NS_OK;  // Preserve an existing alternate-name default.
   nsCOMPtr<nsIMsgLocalMailFolder> localRootFolder =
       do_QueryInterface(rootFolder);
   NS_ENSURE_TRUE(localRootFolder, NS_ERROR_FAILURE);
-  return localRootFolder->CreateLocalSubfolder(folderName,
-                                               getter_AddRefs(child));
+  rv = localRootFolder->CreateLocalSubfolder(folderName, getter_AddRefs(child));
+  NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  return finishDefault();
+#else
+  return NS_OK;
+#endif
 }
 
 nsresult nsMsgIncomingServer::CreateRootFolder() {

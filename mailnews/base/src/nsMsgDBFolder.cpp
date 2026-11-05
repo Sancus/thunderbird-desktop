@@ -89,6 +89,24 @@ static constexpr uint32_t kCacheImportClientMask =
     nsMsgFolderFlags::Elided | nsMsgFolderFlags::Offline |
     nsMsgFolderFlags::CheckNew | nsMsgFolderFlags::Favorite;
 
+#ifdef MOZ_PANORAMA
+// Keep these exact roles in step with nsLocalMailFolder's kDefaultFolders.
+struct LocalCacheDefaultRole {
+  nsLiteralCString name;
+  uint32_t flag;
+};
+static constexpr LocalCacheDefaultRole kLocalCacheDefaultRoles[] = {
+    {"Inbox"_ns, nsMsgFolderFlags::Inbox},
+    {"Sent"_ns, nsMsgFolderFlags::SentMail},
+    {"Drafts"_ns, nsMsgFolderFlags::Drafts},
+    {"Templates"_ns, nsMsgFolderFlags::Templates},
+    {"Trash"_ns, nsMsgFolderFlags::Trash},
+    {"Unsent Messages"_ns, nsMsgFolderFlags::Queue},
+    {"Junk"_ns, nsMsgFolderFlags::Junk},
+    {"Archives"_ns, nsMsgFolderFlags::Archive},
+};
+#endif
+
 #define oneHour 3600000000U
 
 extern LazyLogModule
@@ -4363,21 +4381,64 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
       NS_ENSURE_SUCCESS(rv, rv);
     }
 
+    using mozilla::mailnews::CacheDiscoveryFlagSite;
+    constexpr auto localSite = CacheDiscoveryFlagSite::LocalInitialChild;
     auto* nativeFolder = static_cast<nsMsgDBFolder*>(folder.get());
+    uint32_t defaultRole = 0;
+    if (isServer && localStoreType.EqualsLiteral("mailbox")) {
+      for (const auto& role : kLocalCacheDefaultRoles) {
+        if (actualName.Equals(role.name)) {
+          defaultRole = role.flag;
+          break;
+        }
+      }
+    }
     bool tracked = false;
-    MOZ_TRY(folderDB.HasCacheDiscoveryOrigin(
-        nativeFolder->mFolderDatabaseSourceId, subFolderId, tracked));
-    if (tracked) {
+    bool initialUsed = false;
+    if (defaultRole) {
+      // A denied live origin is not an unknown ordinary row. In particular,
+      // HasCacheDiscoveryOrigin(false) alone cannot authorize a public write.
+      MOZ_TRY(folderDB.CheckCacheOriginSource(
+          nativeFolder->mFolderDatabaseSourceId));
+      Maybe<mozilla::mailnews::FolderDatabase::CacheOrigin> origin;
+      MOZ_TRY(folderDB.ReadCacheOrigin(subFolderId, origin));
+      bool bound;
+      MOZ_TRY(folderDB.HasCacheImportBinding(subFolderId, bound));
+      if (origin) {
+        MOZ_TRY(folderDB.CheckCacheOriginLocation(*origin));
+        NS_ENSURE_TRUE(!origin->pending, NS_ERROR_NOT_AVAILABLE);
+        tracked = !origin->sealed && !bound &&
+                  !dbCore->mCacheOriginGeneration.IsEmpty() &&
+                  origin->generation == dbCore->mCacheOriginGeneration;
+        if (tracked) {
+          NS_ENSURE_TRUE(
+              !folderDB.mCacheOriginTainted &&
+                  origin->birthSite ==
+                      uint32_t(localSite),
+              NS_ERROR_NOT_AVAILABLE);
+          initialUsed =
+              origin->used &
+              (1u << uint32_t(localSite));
+        }
+      }
+    } else {
+      MOZ_TRY(folderDB.HasCacheDiscoveryOrigin(
+          nativeFolder->mFolderDatabaseSourceId, subFolderId, tracked));
+    }
+    if (tracked && !initialUsed) {
+      NS_ENSURE_TRUE(nativeFolder->mFlags ==
+                         MOZ_TRY(folderDB.GetFolderFlags(subFolderId)),
+                     NS_ERROR_NOT_AVAILABLE);
       auto write = MOZ_TRY(folderDB.BeginCacheDiscoveryFlags(
           nativeFolder->mFolderDatabaseSourceId, subFolderId,
-          mozilla::mailnews::CacheDiscoveryFlagSite::LocalInitialChild));
+          localSite));
       MOZ_TRY(nativeFolder->ApplyInitialCacheDiscoveryFlags(
-          std::move(write),
-          nativeFolder->mFlags | flags | nsMsgFolderFlags::Mail));
-    } else {
-      // Native participation is checked independently of the current word.
+          std::move(write), nativeFolder->mFlags | flags |
+                                nsMsgFolderFlags::Mail | defaultRole));
+    } else if (!tracked) {
+      // Unknown/public and valid old/sealed rows retain ordinary behavior.
       // No refused or acquired action falls back to an ordinary setter.
-      MOZ_TRY(folder->SetFlag(flags | nsMsgFolderFlags::Mail));
+      MOZ_TRY(folder->SetFlag(flags | nsMsgFolderFlags::Mail | defaultRole));
     }
     // A flag callback may have changed the physical owner or reentered here.
     MOZ_TRY(nativeFolder->CheckFolderPathAccess());
@@ -5091,6 +5152,108 @@ nsresult nsMsgDBFolder::RecordCacheClientFlagAttempt(
 }
 
 #ifdef MOZ_PANORAMA
+bool nsMsgDBFolder::IsLocalCacheDefaultRole(const nsACString& canonicalName,
+                                           uint32_t roleFlag) {
+  for (const auto& role : kLocalCacheDefaultRoles) {
+    if (canonicalName.Equals(role.name) && roleFlag == role.flag) {
+      return true;
+    }
+  }
+  return false;
+}
+
+nsresult nsMsgDBFolder::InitializeLocalCacheDefaultChild(
+    const nsACString& canonicalName, uint32_t roleFlag) {
+  using mozilla::mailnews::CacheDiscoveryFlagSite;
+  constexpr auto localSite = CacheDiscoveryFlagSite::LocalInitialChild;
+  NS_ENSURE_TRUE(IsLocalCacheDefaultRole(canonicalName, roleFlag),
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(StaticPrefs::mail_panorama_enabled_AtStartup(),
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckFolderPathAccess());
+  RefPtr<mozilla::mailnews::DatabaseCore> core =
+      mozilla::mailnews::DatabaseCore::sInstance;
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  auto& folders = core->FolderDB();
+  NS_ENSURE_TRUE(MOZ_TRY(folders.GetFolderParent(mFolderId)) == 0,
+                 NS_ERROR_INVALID_ARG);
+  nsCOMPtr<nsIMsgIncomingServer> server;
+  MOZ_TRY(GetServer(getter_AddRefs(server)));
+  nsAutoCString storeType;
+  MOZ_TRY(server->GetLocalStoreType(storeType));
+  NS_ENSURE_TRUE(storeType.EqualsLiteral("mailbox"), NS_ERROR_INVALID_ARG);
+
+  uint64_t id = MOZ_TRY(folders.GetFolderChildNamed(mFolderId, canonicalName));
+  nsCOMPtr<nsIMsgFolder> child;
+  if (!id) {
+    // Preserve the existing case-insensitive default lookup. Such an alias
+    // keeps its ordinary setter path; it is not a canonical initial action.
+    MOZ_TRY(GetChildNamed(canonicalName, getter_AddRefs(child)));
+    if (!child) {
+      return NS_OK;
+    }
+    MOZ_TRY(child->GetId(&id));
+  }
+  MOZ_TRY(GetCachedChild(id, getter_AddRefs(child)));
+  NS_ENSURE_TRUE(child, NS_ERROR_NOT_AVAILABLE);
+  auto* nativeChild = static_cast<nsMsgDBFolder*>(child.get());
+  MOZ_TRY(nativeChild->CheckFolderPathAccess());
+  NS_ENSURE_TRUE(nativeChild->mFolderId == id &&
+                     nativeChild->mFolderDatabaseSourceId.Equals(
+                         mFolderDatabaseSourceId) &&
+                     MOZ_TRY(folders.GetFolderParent(id)) == mFolderId,
+                 NS_ERROR_NOT_AVAILABLE);
+
+  nsCString actualName = MOZ_TRY(folders.GetFolderName(id));
+  Maybe<mozilla::mailnews::FolderDatabase::CacheOrigin> origin;
+  MOZ_TRY(folders.ReadCacheOrigin(id, origin));
+  bool bound;
+  MOZ_TRY(folders.HasCacheImportBinding(id, bound));
+  bool tracked = false;
+  if (origin) {
+    MOZ_TRY(folders.CheckCacheOriginLocation(*origin));
+    NS_ENSURE_TRUE(!origin->pending, NS_ERROR_NOT_AVAILABLE);
+    const bool live = !origin->sealed && !bound &&
+                      !core->mCacheOriginGeneration.IsEmpty() &&
+                      origin->generation == core->mCacheOriginGeneration;
+    if (live) {
+      NS_ENSURE_TRUE(!folders.mCacheOriginTainted, NS_ERROR_NOT_AVAILABLE);
+    }
+    tracked = live && actualName.Equals(canonicalName);
+    if (tracked) {
+      NS_ENSURE_TRUE(!folders.mCacheOriginTainted &&
+                         origin->birthSite ==
+                             uint32_t(localSite),
+                     NS_ERROR_NOT_AVAILABLE);
+      if (origin->used &
+          (1u << uint32_t(localSite))) {
+        // The first proposal already included this canonical role. A later
+        // explicit zero or callback mutation must not be overwritten here.
+        return NS_OK;
+      }
+    }
+  }
+  if (!tracked) {
+    // Select ordinary behavior before attempting any closed initial action.
+    // A public-created row never gains discovery origin from its name/flags.
+    return child->SetFlag(roleFlag);
+  }
+  uint32_t before = MOZ_TRY(folders.GetFolderFlags(id));
+  NS_ENSURE_TRUE(nativeChild->mFlags == before, NS_ERROR_NOT_AVAILABLE);
+  auto write = MOZ_TRY(folders.BeginCacheDiscoveryFlags(
+      mFolderDatabaseSourceId, id,
+      localSite));
+  return nativeChild->ApplyInitialCacheDiscoveryFlags(std::move(write),
+                                                     before | roleFlag);
+}
+
+nsresult nsMsgDBFolder::InitializeLocalCacheDefaultChildren() {
+  for (const auto& role : kLocalCacheDefaultRoles) {
+    MOZ_TRY(InitializeLocalCacheDefaultChild(role.name, role.flag));
+  }
+  return NS_OK;
+}
+
 nsresult nsMsgDBFolder::CheckCacheImportFlags(
     const nsACString& expectedSourceId, uint64_t folderId,
     uint32_t beforeFlags) {

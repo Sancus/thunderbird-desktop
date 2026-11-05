@@ -1377,6 +1377,31 @@ void nsImapMailFolder::DiscardPanoramaDiscovery(nsIFolderLookupService* fls) {
   mSubFolders.Clear();
 }
 
+// Both initial discovery and later LIST must preserve the same server-lock
+// publication order. The caller supplies only its already checked native
+// action.
+nsresult nsImapMailFolder::ApplyPanoramaBoxFlags(
+    mozilla::mailnews::CacheDiscoveryFlagWrite&& write, int32_t boxFlags) {
+  uint32_t boxFolderFlags = FolderFlagsForBoxFlags(boxFlags);
+  const uint32_t previousFlags = mFlags;
+  const uint32_t previousLockedFlags = mLockedFlags;
+  const int32_t previousBoxFlags = m_boxFlags;
+  // Expose server locks with the committed flag callbacks, restoring staged
+  // metadata on a prepublication failure without replacing later callback
+  // state.
+  m_boxFlags = boxFlags;
+  mLockedFlags = boxFolderFlags & nsMsgFolderFlags::SpecialUse;
+  auto restoreBox = mozilla::MakeScopeExit([&] {
+    if (mFlags == previousFlags) {
+      m_boxFlags = previousBoxFlags;
+      mLockedFlags = previousLockedFlags;
+    }
+  });
+  MOZ_TRY(ApplyInitialCacheDiscoveryFlags(std::move(write), boxFolderFlags));
+  restoreBox.release();
+  return NS_OK;
+}
+
 nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
     const nsACString& folderName, char hierarchyDelimiter, int32_t boxFlags,
     bool suppressNotification) {
@@ -1474,27 +1499,10 @@ nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
   nsAutoString displayName;
   MOZ_TRY(CopyFolderNameToUTF16(leaf, displayName));
   MOZ_TRY(child->SetName(NS_ConvertUTF16toUTF8(displayName)));
-  // The box-flags setter normally records an explicit client word. Discovery
-  // instead consumes its own ticket before any flag notifications can run.
+  // Initial discovery consumes its own phase, rather than the structural-only
+  // refresh ticket used by the existing-mailbox protocol setter.
   if (tracked) {
-    uint32_t boxFolderFlags = child->FolderFlagsForBoxFlags(boxFlags);
-    const uint32_t previousFlags = child->mFlags;
-    const uint32_t previousLockedFlags = child->mLockedFlags;
-    const int32_t previousBoxFlags = child->m_boxFlags;
-    // The corresponding committed flag callback must see the server locks and
-    // box metadata. Restore them on a prepublication failure, but never replace
-    // a later synchronous callback's state after a committed flag change.
-    child->m_boxFlags = boxFlags;
-    child->mLockedFlags = boxFolderFlags & nsMsgFolderFlags::SpecialUse;
-    auto restoreBox = mozilla::MakeScopeExit([&] {
-      if (child->mFlags == previousFlags) {
-        child->m_boxFlags = previousBoxFlags;
-        child->mLockedFlags = previousLockedFlags;
-      }
-    });
-    MOZ_TRY(child->ApplyInitialCacheDiscoveryFlags(std::move(*boxWrite),
-                                                   boxFolderFlags));
-    restoreBox.release();
+    MOZ_TRY(child->ApplyPanoramaBoxFlags(std::move(*boxWrite), boxFlags));
     boxWrite.reset();
   } else {
     // Old/sealed/incomplete rows keep ordinary native behavior without a new
@@ -1912,6 +1920,29 @@ uint32_t nsImapMailFolder::FolderFlagsForBoxFlags(int32_t aBoxFlags) {
 }
 
 NS_IMETHODIMP nsImapMailFolder::SetBoxFlags(int32_t aBoxFlags) {
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(CheckFolderPathAccess());
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    auto& folderDB = core->FolderDB();
+    bool tracked;
+    MOZ_TRY(folderDB.HasCacheDiscoveryOrigin(mFolderDatabaseSourceId, mFolderId,
+                                             tracked));
+    if (tracked) {
+      // Existing-mailbox LIST calls this protocol setter directly. Its
+      // generated whole word is structural refresh, not an explicit client flag
+      // choice. Claim before reads/callbacks, never replay initial defaults,
+      // and never turn an acquired action error into an untracked write.
+      auto write = MOZ_TRY(folderDB.BeginCacheDiscoveryFlags(
+          mFolderDatabaseSourceId, mFolderId,
+          mozilla::mailnews::CacheDiscoveryFlagSite::ImapServerRefresh));
+      MOZ_TRY(ReadDBFolderInfo(false));
+      return ApplyPanoramaBoxFlags(std::move(write), aBoxFlags);
+    }
+  }
+#endif
   ReadDBFolderInfo(false);
 
   m_boxFlags = aBoxFlags;

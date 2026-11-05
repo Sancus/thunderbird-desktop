@@ -18,7 +18,8 @@ const cacheClientMask = 0xa8000010;
  *
  * @param {nsIMsgFolder} folder - The actual physical folder.
  * @returns {{text: string, mask: number, revision: number, pending: number,
- *   used: number, generation: string}|null} The stored origin, or no record.
+ *   used: number, generation: string, source: string, id: number, parent: number,
+ *   name: string, birth: number}|null} The stored origin, or no record.
  */
 function readCacheOrigin(folder) {
   const statement = database.connectionForTests.createStatement(
@@ -46,6 +47,11 @@ function readCacheOrigin(folder) {
       pending: Number(cells[9]),
       used: Number(cells[10]),
       generation: cells[2],
+      source: cells[1],
+      id: Number(cells[3]),
+      parent: Number(cells[4]),
+      name: atob(cells[5]),
+      birth: Number(cells[6]),
     };
   } finally {
     statement.finalize();
@@ -58,34 +64,28 @@ function readCacheOrigin(folder) {
  * @param {string} label - The independent ordinary fixture name.
  * @param {string[]} names - Child body-store names to discover.
  * @param {function(): void} [beforeInit] - Optional factory fault setup.
+ * @param {string[]} [rootNames] - Additional real root-level body-store names.
  * @returns {Promise<nsIMsgFolder>} The normally initialized physical parent.
  */
-async function createObservedCacheChildren(label, names, beforeInit) {
+async function createObservedCacheChildren(
+  label,
+  names,
+  beforeInit,
+  rootNames = []
+) {
   const lane = PanoramaDelivery.expectedLane();
   do_get_profile();
   loadExistingDB();
-  const server = MailServices.accounts.createIncomingServer(
-    label,
-    label + ".invalid",
-    "none"
-  );
-  registerCleanupFunction(() =>
-    MailServices.accounts.removeIncomingServer(server, false)
-  );
-  server.setStringValue(
-    "storeContractID",
-    {
-      mbox: "@mozilla.org/msgstore/berkeleystore;1",
-      maildir: "@mozilla.org/msgstore/maildirstore;1",
-    }[lane.store]
-  );
   const directory = do_get_profile();
   directory.append(label);
   await IOUtils.makeDirectory(directory.path);
-  server.localPath = directory;
   const parentPath = PathUtils.join(directory.path, "ObservedParent");
-  for (const name of ["", ...names]) {
-    let body = name ? PathUtils.join(parentPath + ".sbd", name) : parentPath;
+  const bodies = [
+    parentPath,
+    ...names.map(name => PathUtils.join(parentPath + ".sbd", name)),
+    ...rootNames.map(name => PathUtils.join(directory.path, name)),
+  ];
+  for (let body of bodies) {
     if (lane.store == "maildir") {
       await IOUtils.makeDirectory(PathUtils.join(body, "tmp"));
       body = PathUtils.join(body, "cur", "retained");
@@ -93,7 +93,41 @@ async function createObservedCacheChildren(label, names, beforeInit) {
     await IOUtils.makeDirectory(PathUtils.parent(body));
     await IOUtils.writeUTF8(body, "From sender@invalid\norigin control body\n");
   }
+  // getIncomingServer creates and initializes the root before returning.
+  // Prepare its real store and preferences before that first exposure.
+  const serverKey = label;
+  const prefPrefix = "mail.server." + serverKey + ".";
+  let server = null;
+  registerCleanupFunction(() => {
+    try {
+      server ??= MailServices.accounts.getIncomingServer(serverKey);
+      MailServices.accounts.removeIncomingServer(server, false);
+    } finally {
+      Services.prefs.deleteBranch(prefPrefix);
+    }
+  });
+  Services.prefs.setStringPref(prefPrefix + "type", "none");
+  Services.prefs.setStringPref(prefPrefix + "userName", label);
+  Services.prefs.setStringPref(prefPrefix + "hostname", label + ".invalid");
+  Services.prefs.setStringPref(
+    prefPrefix + "storeContractID",
+    {
+      mbox: "@mozilla.org/msgstore/berkeleystore;1",
+      maildir: "@mozilla.org/msgstore/maildirstore;1",
+    }[lane.store]
+  );
+  Services.prefs.setComplexValue(
+    prefPrefix + "directory",
+    Ci.nsIFile,
+    directory
+  );
+  Assert.equal(
+    folderDB.getFolderChildNamed(0, serverKey),
+    0,
+    "No native root exists before the prepared store is exposed"
+  );
   beforeInit?.();
+  server = MailServices.accounts.getIncomingServer(serverKey);
   const root = server.rootFolder;
   Assert.ok(readCacheOrigin(root), "Normal native root creation was observed");
   const parent = root.getChildNamed("ObservedParent");
@@ -338,4 +372,160 @@ add_task(async function test_lockedFlagsRecordIntentBeforeTheirEarlyReturn() {
       "Locked no-op still records intent"
     );
   }
+});
+
+add_task(async function test_localDefaultsConsumeNativeInitialActionOnce() {
+  const lane = PanoramaDelivery.expectedLane();
+  const roles = [
+    ["Inbox", Ci.nsMsgFolderFlags.Inbox],
+    ["Sent", Ci.nsMsgFolderFlags.SentMail],
+    ["Drafts", Ci.nsMsgFolderFlags.Drafts],
+    ["Templates", Ci.nsMsgFolderFlags.Templates],
+    ["Trash", Ci.nsMsgFolderFlags.Trash],
+    ["Unsent Messages", Ci.nsMsgFolderFlags.Queue],
+    ["Junk", Ci.nsMsgFolderFlags.Junk],
+    ["Archives", Ci.nsMsgFolderFlags.Archive],
+  ];
+  const parent = await createObservedCacheChildren(
+    "origin-local-defaults",
+    [],
+    undefined,
+    roles.map(([name]) => name)
+  );
+  const root = parent.parent;
+  const server = MailServices.accounts.getIncomingServer(
+    "origin-local-defaults"
+  );
+  const localServer = server.QueryInterface(Ci.nsILocalMailIncomingServer);
+  Assert.equal(
+    readCacheOrigin(root).mask,
+    0,
+    "Child roles did not veto the root"
+  );
+  const snapshots = [];
+  for (const [name, role] of roles) {
+    const folder = root.getChildNamed(name);
+    Assert.ok(folder, "The real store contains " + name);
+    const origin = readCacheOrigin(folder);
+    Assert.equal(origin.source, database.sourceId);
+    Assert.equal(origin.id, folder.id);
+    Assert.equal(origin.parent, root.id);
+    Assert.equal(origin.name, name);
+    Assert.equal(origin.birth, 1, "Native local discovery owns the phase");
+    Assert.equal(origin.mask, 0, "Initial role is not public flag intent");
+    Assert.equal(
+      origin.used & 2,
+      2,
+      "The one local initial action was consumed"
+    );
+    Assert.equal(origin.pending, 0);
+    Assert.equal(origin.generation, readCacheOrigin(root).generation);
+    Assert.ok(folder.flags & role, "Public canonical role " + name);
+    Assert.ok(folderDB.getFolderFlags(folder.id) & role);
+    const body =
+      lane.store == "maildir"
+        ? PathUtils.join(folder.filePath.path, "cur", "retained")
+        : folder.filePath.path;
+    const bytes = await IOUtils.readUTF8(body);
+    Assert.equal(bytes, "From sender@invalid\norigin control body\n");
+    snapshots.push({ folder, origin, flags: folder.flags, body, bytes });
+  }
+  const ids = root.subFolders.map(folder => folder.id);
+  localServer.createDefaultMailboxes();
+  Assert.deepEqual(
+    root.subFolders.map(folder => folder.id),
+    ids
+  );
+  for (const { folder, origin, flags, body, bytes } of snapshots) {
+    Assert.equal(readCacheOrigin(folder).text, origin.text, "No phase replay");
+    Assert.equal(folder.flags, flags);
+    Assert.equal(folderDB.getFolderFlags(folder.id), flags);
+    Assert.strictEqual(
+      MailServices.folderLookup.getFolderForURL(folder.URI),
+      folder
+    );
+    Assert.equal(await IOUtils.readUTF8(body), bytes);
+  }
+  const trash = root.getChildNamed("Trash");
+  const beforeZero = readCacheOrigin(trash);
+  trash.flags = 0;
+  const explicit = readCacheOrigin(trash);
+  Assert.equal(explicit.mask, cacheClientMask);
+  Assert.greater(explicit.revision, beforeZero.revision);
+  localServer.createDefaultMailboxes();
+  Assert.ok(root.subFolders.includes(trash));
+  Assert.equal(
+    trash.flags,
+    0,
+    "Repeated internal entry preserves explicit zero"
+  );
+  Assert.equal(folderDB.getFolderFlags(trash.id), 0);
+  Assert.equal(readCacheOrigin(trash).text, explicit.text);
+  localServer.setFlagsOnDefaultMailboxes();
+  Assert.ok(
+    trash.flags & Ci.nsMsgFolderFlags.Trash,
+    "The public sweep stays explicit"
+  );
+  const publicSweep = readCacheOrigin(trash);
+  Assert.equal(publicSweep.mask, cacheClientMask);
+  Assert.greater(publicSweep.revision, explicit.revision);
+  const flags = folderDB.getFolderFlags(trash.id);
+  trash.msgDatabase.forceClosed();
+  Assert.equal(trash.msgDatabase.dBFolderInfo.flags >>> 0, flags >>> 0);
+  Assert.equal(readCacheOrigin(trash).text, publicSweep.text);
+});
+
+add_task(async function test_localDefaultNewAndPublicRowsRemainUnqualified() {
+  const label = "origin-local-public";
+  const parent = await createObservedCacheChildren(label, [], () => {
+    Services.prefs.setBoolPref("mail.server." + label + ".hidden", true);
+  });
+  const root = parent.parent;
+  const server = MailServices.accounts.getIncomingServer(label);
+  Assert.equal(root.getChildNamed("Trash"), null);
+  const id = folderDB.insertFolder(root.id, "Trash");
+  let body = PathUtils.join(server.localPath.path, "Trash");
+  if (PanoramaDelivery.expectedLane().store == "maildir") {
+    await IOUtils.makeDirectory(PathUtils.join(body, "tmp"));
+    body = PathUtils.join(body, "cur", "retained");
+  }
+  await IOUtils.makeDirectory(PathUtils.parent(body));
+  await IOUtils.writeUTF8(
+    body,
+    "From sender@invalid\npublic native row body\n"
+  );
+  const trash = root.addSubfolder("Trash");
+  Assert.equal(trash.id, id);
+  Assert.equal(
+    readCacheOrigin(trash),
+    null,
+    "A body does not promote a public row"
+  );
+  server.hidden = false;
+  server.QueryInterface(Ci.nsILocalMailIncomingServer).createDefaultMailboxes();
+  Assert.strictEqual(root.getChildNamed("Trash"), trash);
+  Assert.equal(readCacheOrigin(trash), null);
+  Assert.ok(trash.flags & Ci.nsMsgFolderFlags.Trash);
+  Assert.ok(folderDB.getFolderFlags(id) & Ci.nsMsgFolderFlags.Trash);
+  const queue = root.getChildNamed("Unsent Messages");
+  Assert.ok(queue, "The normal store created the missing default");
+  Assert.ok(
+    queue.flags & Ci.nsMsgFolderFlags.Queue,
+    "Creation forwards its role"
+  );
+  Assert.ok(folderDB.getFolderFlags(queue.id) & Ci.nsMsgFolderFlags.Queue);
+  Assert.equal(
+    readCacheOrigin(queue),
+    null,
+    "Public creation is not native birth proof"
+  );
+  Assert.ok(await IOUtils.exists(queue.filePath.path));
+  Assert.equal(
+    await IOUtils.readUTF8(body),
+    "From sender@invalid\npublic native row body\n"
+  );
+  Assert.strictEqual(
+    MailServices.folderLookup.getFolderForURL(trash.URI),
+    trash
+  );
 });

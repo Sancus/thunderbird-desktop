@@ -127,10 +127,11 @@ function discoveredChild(parent, name, uri) {
 
 // The independently selected cache policy permits only these client bits.
 const cacheClientFlags =
-  Ci.nsMsgFolderFlags.Elided |
-  Ci.nsMsgFolderFlags.Offline |
-  Ci.nsMsgFolderFlags.CheckNew |
-  Ci.nsMsgFolderFlags.Favorite;
+  (Ci.nsMsgFolderFlags.Elided |
+    Ci.nsMsgFolderFlags.Offline |
+    Ci.nsMsgFolderFlags.CheckNew |
+    Ci.nsMsgFolderFlags.Favorite) >>>
+  0;
 
 /**
  * Reads the committed native word without consulting the folder wrapper.
@@ -360,6 +361,28 @@ async function test_discoversNestedChild() {
   info('DELIVERY_PHASE {"phase":"imap-discovery-nested-verified"}');
 }
 
+/**
+ * Checks genuine discovery history without changing the native origin record.
+ *
+ * @param {nsIMsgFolder[]} folders - Physical folders reached by normal LIST.
+ * @param {string} stage - The completed read or discovery boundary.
+ */
+function assertDiscoveryHasNoClientChoice(folders, stage) {
+  Assert.equal(
+    cacheClientFlags,
+    0xa8000010,
+    "The complete client mask is exact"
+  );
+  for (const folder of folders) {
+    Assert.equal(
+      (storedDiscoveryOrigin(folder).explicitClientMask & cacheClientFlags) >>>
+        0,
+      0,
+      stage + ": no explicit client choice is inferred"
+    );
+  }
+}
+
 async function test_repeatedDiscoveryPreservesIdentity() {
   seedMailboxes(true);
   await discover();
@@ -377,7 +400,13 @@ async function test_repeatedDiscoveryPreservesIdentity() {
   const ids = fixture.core ? [parent.id, child.id] : null;
   const rootChildren = root.subFolders;
   const nestedChildren = parent.subFolders;
+  if (fixture.core) {
+    assertDiscoveryHasNoClientChoice([parent, child], "Initial real LIST");
+  }
   const heldDatabase = fixture.core ? child.msgDatabase : null;
+  if (fixture.core) {
+    assertDiscoveryHasNoClientChoice([parent, child], "Open native database");
+  }
   info('DELIVERY_PHASE {"phase":"imap-discovery-repeat-ready"}');
   await discover();
   Assert.equal(
@@ -405,6 +434,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     "Repeated discovery adds no nested children"
   );
   if (ids) {
+    assertDiscoveryHasNoClientChoice([parent, child], "Repeated real LIST");
     Assert.strictEqual(
       child.msgDatabase,
       heldDatabase,
@@ -418,6 +448,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
       false,
       "LIST releases only the metadata database it opened"
     );
+    assertDiscoveryHasNoClientChoice([parent, child], "Closed-database LIST");
     Assert.deepEqual(
       [parent.id, child.id],
       ids,
@@ -429,27 +460,34 @@ async function test_repeatedDiscoveryPreservesIdentity() {
   if (fixture.core) {
     for (const folder of [parent, child]) {
       const origin = storedDiscoveryOrigin(folder);
-      Assert.equal(origin.explicitClientMask & cacheClientFlags, 0);
+      Assert.equal((origin.explicitClientMask & cacheClientFlags) >>> 0, 0);
       folder.setFlag(cacheClientFlags);
       folder.clearFlag(cacheClientFlags);
       folder.flags = 0;
       folder.flags = 0;
-      Assert.equal(folder.flags & cacheClientFlags, 0);
-      Assert.equal(storedFolderFlags(folder) & cacheClientFlags, 0);
+      Assert.equal((folder.flags & cacheClientFlags) >>> 0, 0);
+      Assert.equal((storedFolderFlags(folder) & cacheClientFlags) >>> 0, 0);
       Assert.equal(
-        storedDiscoveryOrigin(folder).explicitClientMask & cacheClientFlags,
+        (storedDiscoveryOrigin(folder).explicitClientMask &
+          cacheClientFlags) >>>
+          0,
         cacheClientFlags,
         "An equal whole-word zero is still an explicit client choice"
       );
     }
     await discover();
     for (const folder of [parent, child]) {
-      Assert.equal(folder.flags & cacheClientFlags, 0);
-      Assert.equal(storedFolderFlags(folder) & cacheClientFlags, 0);
+      Assert.equal((folder.flags & cacheClientFlags) >>> 0, 0);
+      Assert.equal((storedFolderFlags(folder) & cacheClientFlags) >>> 0, 0);
       folder.ForceDBClosed();
-      Assert.equal(folder.msgDatabase.dBFolderInfo.flags & cacheClientFlags, 0);
       Assert.equal(
-        storedDiscoveryOrigin(folder).explicitClientMask & cacheClientFlags,
+        (folder.msgDatabase.dBFolderInfo.flags & cacheClientFlags) >>> 0,
+        0
+      );
+      Assert.equal(
+        (storedDiscoveryOrigin(folder).explicitClientMask &
+          cacheClientFlags) >>>
+          0,
         cacheClientFlags,
         "LIST and metadata reopen cannot reset the explicit-zero veto"
       );
@@ -582,8 +620,8 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     Assert.equal(completed.id, pendingId);
     Assert.equal(completed.onlineName, "DeliveryParent/FactoryRetry");
     Assert.deepEqual([parent.id, child.id], ids);
-    Assert.equal(parent.flags & cacheClientFlags, 0);
-    Assert.equal(child.flags & cacheClientFlags, 0);
+    Assert.equal((parent.flags & cacheClientFlags) >>> 0, 0);
+    Assert.equal((child.flags & cacheClientFlags) >>> 0, 0);
 
     let callbackWrites = 0;
     const callbackURI = parent.URI + "/CallbackChoice";
@@ -623,18 +661,23 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     );
     const callbackId = callbackFolder.id;
     for (const folder of [callbackFolder, parent]) {
-      Assert.equal(folder.flags & cacheClientFlags, 0);
-      Assert.equal(storedFolderFlags(folder) & cacheClientFlags, 0);
+      Assert.equal((folder.flags & cacheClientFlags) >>> 0, 0);
+      Assert.equal((storedFolderFlags(folder) & cacheClientFlags) >>> 0, 0);
       Assert.equal(
-        storedDiscoveryOrigin(folder).explicitClientMask & cacheClientFlags,
+        (storedDiscoveryOrigin(folder).explicitClientMask &
+          cacheClientFlags) >>>
+          0,
         cacheClientFlags
       );
     }
     await discover();
     Assert.strictEqual(parent.getChildNamed("CallbackChoice"), callbackFolder);
     Assert.equal(callbackFolder.id, callbackId);
-    Assert.equal(callbackFolder.flags & cacheClientFlags, 0);
-    Assert.equal(storedFolderFlags(callbackFolder) & cacheClientFlags, 0);
+    Assert.equal((callbackFolder.flags & cacheClientFlags) >>> 0, 0);
+    Assert.equal(
+      (storedFolderFlags(callbackFolder) & cacheClientFlags) >>> 0,
+      0
+    );
 
     const explicitFolder = root.addSubfolder("ExplicitCreation");
     const explicitId = explicitFolder.id;
@@ -656,11 +699,14 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     await discover();
     Assert.strictEqual(root.getChildNamed("ExplicitCreation"), explicitFolder);
     Assert.equal(explicitFolder.id, explicitId);
-    Assert.equal(explicitFolder.flags & cacheClientFlags, 0);
-    Assert.equal(storedFolderFlags(explicitFolder) & cacheClientFlags, 0);
+    Assert.equal((explicitFolder.flags & cacheClientFlags) >>> 0, 0);
+    Assert.equal(
+      (storedFolderFlags(explicitFolder) & cacheClientFlags) >>> 0,
+      0
+    );
     explicitFolder.ForceDBClosed();
     Assert.equal(
-      explicitFolder.msgDatabase.dBFolderInfo.flags & cacheClientFlags,
+      (explicitFolder.msgDatabase.dBFolderInfo.flags & cacheClientFlags) >>> 0,
       0,
       "A real later LIST cannot treat the existing public zero as absent"
     );

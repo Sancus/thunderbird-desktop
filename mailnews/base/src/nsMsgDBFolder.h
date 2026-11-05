@@ -186,6 +186,15 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
 
  private:
   friend class mozilla::mailnews::DatabaseCore;
+  friend class nsMsgIncomingServer;
+  friend class nsNoIncomingServer;
+  friend class nsMsgLocalMailFolder;
+  // Only actual local-default callers enter this closed initial phase.
+  static bool IsLocalCacheDefaultRole(const nsACString& canonicalName,
+                                     uint32_t roleFlag);
+  nsresult InitializeLocalCacheDefaultChild(const nsACString& canonicalName,
+                                           uint32_t roleFlag);
+  nsresult InitializeLocalCacheDefaultChildren();
   // Validate the pinned wrapper before the native cache import commits.
   nsresult CheckCacheImportFlags(const nsACString& expectedSourceId,
                                  uint64_t folderId, uint32_t beforeFlags);

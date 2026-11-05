@@ -238,38 +238,64 @@ function failureOriginText(folderId) {
  * Prepares a native root's real child store before ordinary initialization.
  *
  * @param {string} label - The independent ordinary fixture name.
+ * @param {function(): void} [beforeInit] - Optional critical native fault setup.
+ * @param {string[]} [rootNames] - Additional real root-level body-store names.
  * @returns {Promise<nsIMsgFolder>} The actual discovered child.
  */
-async function createFailureOriginChild(label) {
+async function createFailureOriginChild(label, beforeInit, rootNames = []) {
   const lane = PanoramaDelivery.expectedLane();
   do_get_profile();
   loadExistingDB();
-  const server = MailServices.accounts.createIncomingServer(
-    label,
-    label + ".invalid",
-    "none"
-  );
-  registerCleanupFunction(() =>
-    MailServices.accounts.removeIncomingServer(server, false)
-  );
-  server.setStringValue(
-    "storeContractID",
+  const directory = do_get_profile();
+  directory.append(label);
+  await IOUtils.makeDirectory(directory.path);
+  for (const name of ["Observed", ...rootNames]) {
+    let body = PathUtils.join(directory.path, name);
+    if (lane.store == "maildir") {
+      await IOUtils.makeDirectory(PathUtils.join(body, "tmp"));
+      body = PathUtils.join(body, "cur", "retained");
+    }
+    await IOUtils.makeDirectory(PathUtils.parent(body));
+    await IOUtils.writeUTF8(
+      body,
+      "From sender@invalid\nretained origin body\n"
+    );
+  }
+  // getIncomingServer creates and initializes the root before returning.
+  // Prepare its real store and preferences before that first exposure.
+  const serverKey = label;
+  const prefPrefix = "mail.server." + serverKey + ".";
+  let server = null;
+  registerCleanupFunction(() => {
+    try {
+      server ??= MailServices.accounts.getIncomingServer(serverKey);
+      MailServices.accounts.removeIncomingServer(server, false);
+    } finally {
+      Services.prefs.deleteBranch(prefPrefix);
+    }
+  });
+  Services.prefs.setStringPref(prefPrefix + "type", "none");
+  Services.prefs.setStringPref(prefPrefix + "userName", label);
+  Services.prefs.setStringPref(prefPrefix + "hostname", label + ".invalid");
+  Services.prefs.setStringPref(
+    prefPrefix + "storeContractID",
     {
       mbox: "@mozilla.org/msgstore/berkeleystore;1",
       maildir: "@mozilla.org/msgstore/maildirstore;1",
     }[lane.store]
   );
-  const directory = do_get_profile();
-  directory.append(label);
-  await IOUtils.makeDirectory(directory.path);
-  server.localPath = directory;
-  let body = PathUtils.join(directory.path, "Observed");
-  if (lane.store == "maildir") {
-    await IOUtils.makeDirectory(PathUtils.join(body, "tmp"));
-    body = PathUtils.join(body, "cur", "retained");
-  }
-  await IOUtils.makeDirectory(PathUtils.parent(body));
-  await IOUtils.writeUTF8(body, "From sender@invalid\nretained origin body\n");
+  Services.prefs.setComplexValue(
+    prefPrefix + "directory",
+    Ci.nsIFile,
+    directory
+  );
+  Assert.equal(
+    folderDB.getFolderChildNamed(0, serverKey),
+    0,
+    "No native root exists before the prepared store is exposed"
+  );
+  beforeInit?.();
+  server = MailServices.accounts.getIncomingServer(serverKey);
   const folder = server.rootFolder.getChildNamed("Observed");
   Assert.ok(folder, "Normal root discovery created the child");
   const origin = failureOriginText(folder.id).split("\n");
@@ -323,6 +349,110 @@ add_task(async function test_originSourceAndClosedOwnerFailuresPreserveState() {
     "Ordinary DB reopen does not reset origin"
   );
 });
+
+add_task(
+  async function test_localDefaultActionFailurePreservesPendingAndBody() {
+    const label = "origin-local-default-fault";
+    const connection = database.connectionForTests;
+    const contract = "@mozilla.org/mail/folder-factory;1?name=mailbox";
+    const created = Array.from({ length: 8 }, () =>
+      Cc[contract].createInstance(Ci.nsIMsgFolder)
+    );
+    let calls = 0;
+    let callbacks = 0;
+    let cid;
+    let triggerInstalled = false;
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+      onFolderIntPropertyChanged(folder, property) {
+        if (folder.name == "Trash" && property == "FolderFlag") {
+          callbacks++;
+        }
+      },
+    };
+    try {
+      await Assert.rejects(
+        createFailureOriginChild(label, () => {
+          // This real SQL fault must occur after the durable native claim,
+          // but before flag publication. Normal factory objects let us observe
+          // that no callback escaped before server creation returned its error.
+          connection.executeSimpleSQL(
+            "CREATE TEMP TRIGGER reject_local_default_flags BEFORE UPDATE OF flags ON folders " +
+              "WHEN OLD.name = 'Trash' AND EXISTS (SELECT 1 FROM folders AS root " +
+              "WHERE root.id = OLD.parent AND root.name = 'origin-local-default-fault') " +
+              "BEGIN SELECT RAISE(ABORT, 'local default publication fault'); END"
+          );
+          triggerInstalled = true;
+          cid = MockRegistrar.register(contract, () => {
+            Assert.less(calls, created.length);
+            const folder = created[calls++];
+            folder.AddFolderListener(listener);
+            return folder;
+          });
+        }, ["Trash"]),
+        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT,
+        "Normal server initialization propagates the exact native flag failure"
+      );
+      const rootId = folderDB.getFolderChildNamed(0, label);
+      const id = folderDB.getFolderChildNamed(rootId, "Trash");
+      Assert.greater(rootId, 0);
+      Assert.greater(id, 0);
+      const cells = failureOriginText(id).split("\n");
+      Assert.equal(cells[1], database.sourceId);
+      Assert.equal(Number(cells[3]), id);
+      Assert.equal(Number(cells[4]), rootId);
+      Assert.equal(atob(cells[5]), "Trash");
+      Assert.equal(Number(cells[6]), 1);
+      Assert.equal(Number(cells[7]), 0, "There was no public fallback or veto");
+      Assert.equal(
+        Number(cells[8]),
+        2,
+        "Only the durable initial claim advanced"
+      );
+      Assert.equal(
+        Number(cells[9]),
+        2,
+        "The failed action stays precisely pending"
+      );
+      Assert.equal(
+        Number(cells[10]),
+        0,
+        "No successful initial action is claimed"
+      );
+      Assert.equal(folderDB.getFolderFlags(id), 0);
+      Assert.equal(callbacks, 0);
+      Assert.ok(
+        !connection.transactionInProgress,
+        "Only its own transaction ended"
+      );
+      Assert.greaterOrEqual(
+        calls,
+        3,
+        "Real root and child factories were reached"
+      );
+      const directory = do_get_profile();
+      directory.append(label);
+      const body =
+        PanoramaDelivery.expectedLane().store == "maildir"
+          ? PathUtils.join(directory.path, "Trash", "cur", "retained")
+          : PathUtils.join(directory.path, "Trash");
+      Assert.equal(
+        await IOUtils.readUTF8(body),
+        "From sender@invalid\nretained origin body\n"
+      );
+    } finally {
+      if (triggerInstalled) {
+        connection.executeSimpleSQL("DROP TRIGGER reject_local_default_flags");
+      }
+      if (cid) {
+        MockRegistrar.unregister(cid);
+      }
+      for (const folder of created.slice(0, calls)) {
+        folder.RemoveFolderListener(listener);
+      }
+    }
+  }
+);
 
 add_task(async function test_failedVetoKeepsFlagsAndCallerTransaction() {
   const folder = await createFailureOriginChild("origin-write-failure");

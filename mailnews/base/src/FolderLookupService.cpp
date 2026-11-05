@@ -303,7 +303,7 @@ nsresult FolderLookupService::CreateDangling(const nsACString& url,
     nsAutoCString errorMessage{
         "Panorama is enabled. Refusing to create a folder object for url "};
     errorMessage.Append(url);
-    NS_ERROR(errorMessage.Data());
+    NS_WARNING(errorMessage.Data());
     return NS_ERROR_UNEXPECTED;
   }
 

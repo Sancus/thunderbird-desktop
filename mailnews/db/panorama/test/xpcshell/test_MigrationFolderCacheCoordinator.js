@@ -127,7 +127,11 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
     "mail.accountmanager.localfoldersserver",
     local.prefBranch.root.split(".")[2]
   );
-  const reconciledLocal = creator.addServer("cache-v2", "Cache Local", "none");
+  const reconciledLocal = creator.addServer(
+    "cache-v2",
+    "cache-v2-local.invalid",
+    "none"
+  );
   reconciledLocal.isMaildirStore = true;
   for (const name of LOCAL_NAMES) {
     await reconciledLocal.rootFolder.addMailFolder(name);

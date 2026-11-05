@@ -298,7 +298,12 @@ async function showEvent({
   let scrolledBox;
   await TestUtils.waitForCondition(() => {
     scrolledBox = weekView.getEventBoxAt(window, targetDate.getDay() + 1, 1);
-    return scrolledBox && BrowserTestUtils.isVisible(scrolledBox);
+    return (
+      scrolledBox?.isConnected &&
+      BrowserTestUtils.isVisible(scrolledBox) &&
+      scrolledBox.getBoundingClientRect().width > 0 &&
+      scrolledBox.getBoundingClientRect().height > 0
+    );
   }, "scrolled event box should exist and be laid out");
   return scrolledBox;
 }
@@ -324,7 +329,25 @@ async function openAndShowEvent({
   inline = "center",
 } = {}) {
   const box = await showEvent({ baseDate, offset, block, inline });
-  return openEvent({ eventBox: box, offset });
+  const occurrenceId = box.occurrence.hashId;
+  await openEvent({ eventBox: box });
+
+  // Opening the dialog awaits UI work that can recycle the calendar view.
+  // Measure the current box for the same occurrence, not the detached old node.
+  const targetDate = new Date(baseDate);
+  targetDate.setDate(targetDate.getDate() + offset);
+  let currentBox;
+  await TestUtils.waitForCondition(() => {
+    currentBox = weekView.getEventBoxAt(window, targetDate.getDay() + 1, 1);
+    return (
+      currentBox?.isConnected &&
+      currentBox.occurrence.hashId == occurrenceId &&
+      BrowserTestUtils.isVisible(currentBox) &&
+      currentBox.getBoundingClientRect().width > 0 &&
+      currentBox.getBoundingClientRect().height > 0
+    );
+  }, "opened event occurrence should still have a rendered target");
+  return currentBox;
 }
 
 /**

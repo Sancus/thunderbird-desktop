@@ -2014,7 +2014,8 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
       ++m_numNotNewMessages;
     }
     if (NS_SUCCEEDED(state->status)) {
-      state->Record(ApplyForwardAndReplyFilter(m_msgWindow));
+      // Compose remains best effort after successful publication.
+      (void)ApplyForwardAndReplyFilter(m_msgWindow);
     } else {
       m_forwardTo.Clear();
       m_replyTemplateUri.Clear();

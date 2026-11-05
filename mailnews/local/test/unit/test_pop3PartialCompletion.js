@@ -2807,9 +2807,16 @@ async function checkFreshExistingActions(store, mode) {
         Assert.equal(header.messageId, firstId);
         const physical = mode == "forward-after-move" ? destination : folder;
         Assert.equal(header.folder, physical);
-        Assert.equal(
-          physical.msgDatabase.getMsgHdrForKey(header.messageKey),
-          header
+        // A lookup may return another live facade for the same physical row.
+        const current = physical.msgDatabase.getMsgHdrForKey(header.messageKey);
+        Assert.deepEqual(
+          [
+            current.isLive,
+            current.folder.URI,
+            current.messageKey,
+            current.storeToken,
+          ],
+          [true, physical.URI, header.messageKey, header.storeToken]
         );
         Assert.ok(
           mailTestUtils.loadMessageToString(physical, header).includes(firstId)

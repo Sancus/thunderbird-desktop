@@ -949,6 +949,93 @@ add_task(async function test_filter_move_delete_settlement() {
           return nativeCopy.getArrivedFolder(...args);
         },
       };
+      // The local Delete implementation selects its built-in copy service.
+      // Delegate the existing folder interface so the success control can hold
+      // its real completion without replacing that native transfer or folder.
+      const filterFolder =
+        type == Ci.nsMsgFilterAction.Delete
+          ? new Proxy(
+              {
+                QueryInterface: ChromeUtils.generateQI([
+                  "nsIMsgFolder",
+                  "nsIMsgLocalMailFolder",
+                ]),
+                deleteMessages(headers, window, storage, move, listener, undo) {
+                  copyCalls++;
+                  Assert.deepEqual(
+                    headers.map(header => [
+                      header.folder.URI,
+                      header.messageKey,
+                    ]),
+                    [[folder.URI, originalKey]]
+                  );
+                  Assert.ok(!storage);
+                  Assert.ok(!move);
+                  Assert.ok(!undo);
+                  if (mode == "startFailure") {
+                    providerStopped.resolve(Cr.NS_ERROR_FILE_ACCESS_DENIED);
+                    throw Components.Exception(
+                      "filter delete start refused",
+                      Cr.NS_ERROR_FILE_ACCESS_DENIED
+                    );
+                  }
+                  if (mode == "terminalFailure") {
+                    // Explicit folder-provider failure, with no native delete
+                    // or destination publication claimed for this control.
+                    Services.tm.dispatchToMainThread(() => {
+                      providerStopped.resolve(Cr.NS_ERROR_FILE_ACCESS_DENIED);
+                      Assert.throws(
+                        () =>
+                          listener.onStopCopy(Cr.NS_ERROR_FILE_ACCESS_DENIED),
+                        error => error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED
+                      );
+                      listener.onStopCopy(Cr.NS_OK);
+                    });
+                    return;
+                  }
+                  folder.deleteMessages(
+                    headers,
+                    window,
+                    storage,
+                    move,
+                    {
+                      QueryInterface: ChromeUtils.generateQI([
+                        "nsIMsgCopyServiceListener",
+                      ]),
+                      onStartCopy() {
+                        listener.onStartCopy();
+                      },
+                      onProgress(...args) {
+                        listener.onProgress(...args);
+                      },
+                      setMessageKey(key) {
+                        listener.setMessageKey(key);
+                      },
+                      getMessageId() {
+                        return listener.getMessageId();
+                      },
+                      onStopCopy(status) {
+                        release = () => listener.onStopCopy(status);
+                        providerStopped.resolve(status);
+                      },
+                    },
+                    undo
+                  );
+                },
+              },
+              {
+                get(target, key, receiver) {
+                  if (Reflect.has(target, key)) {
+                    return Reflect.get(target, key, receiver);
+                  }
+                  const value = folder[key];
+                  return typeof value == "function"
+                    ? value.bind(folder)
+                    : value;
+                },
+              }
+            )
+          : folder;
       const cid = MockRegistrar.register(contract, proxy);
       try {
         const run = () =>
@@ -956,7 +1043,7 @@ add_task(async function test_filter_move_delete_settlement() {
             Ci.nsMsgFilterType.Manual,
             [target, excluded],
             [],
-            folder,
+            filterFolder,
             null,
             {
               QueryInterface: ChromeUtils.generateQI([
@@ -979,7 +1066,7 @@ add_task(async function test_filter_move_delete_settlement() {
         Assert.equal(
           copyCalls,
           1,
-          "The selected action dispatched through the registered copy service"
+          "The selected action dispatched through the controlled native provider"
         );
         const status = await providerStopped.promise;
         if (mode == "success") {

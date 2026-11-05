@@ -29,6 +29,7 @@
 #ifdef MOZ_PANORAMA
 #  include "nsMsgSearchScopeTerm.h"
 #  include "nsIMsgOperationListener.h"
+#  include "nsIMsgFolderListener.h"
 #  include "UrlListener.h"
 #  include "mozilla/AutoRestore.h"
 #  include "mozilla/RefCounted.h"
@@ -1128,17 +1129,115 @@ nsresult HardDeleteDetachedMessage(nsIMsgFolder* folder, nsIMsgDatabase* db,
 
 #ifdef MOZ_PANORAMA
 namespace {
-// A completed Move must retarget queued compose work using the returned key.
-class CompletedFilterCopyListener final : public CopyServiceListener {
+// CopyMessages guarantees terminal status, but local mailbox copies need not
+// call SetMessageKey. Their completed-move notification returns the exact live
+// destination header before source retirement. Observe only this active move.
+class CompletedFilterCopyListener final : public CopyServiceListener,
+                                          public nsIMsgFolderListener {
  public:
-  std::function<nsresult(nsMsgKey)> mKeyFn;
-  NS_IMETHOD SetMessageKey(nsMsgKey key) override {
-    return mKeyFn ? mKeyFn(key) : NS_OK;
+  NS_DECL_ISUPPORTS_INHERITED
+
+  std::function<nsresult(nsresult, nsMsgKey)> mKeyFn;
+  nsresult ObserveMove(nsIMsgDBHdr* source, nsIMsgFolder* destination) {
+    // The local producer returns live rows here; nonlocal notifications may
+    // contain no row or only a provisional header. Keep their existing key
+    // path.
+    nsCOMPtr<nsIMsgLocalMailFolder> local = do_QueryInterface(destination);
+    if (!local) return NS_OK;
+    mSource = source;
+    mDestination = destination;
+    mNotifier = mozilla::components::FolderNotification::Service();
+    NS_ENSURE_TRUE(mNotifier, NS_ERROR_NOT_AVAILABLE);
+    nsresult rv = mNotifier->AddListener(
+        this, nsIMsgFolderNotificationService::msgsMoveCopyCompleted);
+    if (NS_FAILED(rv)) mNotifier = nullptr;
+    return rv;
   }
+  void StopObserving() {
+    nsCOMPtr<nsIMsgFolderNotificationService> notifier = mNotifier.forget();
+    if (notifier) (void)notifier->RemoveListener(this);
+    mStarted = false;
+    mSource = nullptr;
+    mDestination = nullptr;
+  }
+  NS_IMETHOD OnStartCopy() override {
+    mStarted = true;
+    return CopyServiceListener::OnStartCopy();
+  }
+  NS_IMETHOD OnStopCopy(nsresult status) override {
+    RefPtr<CompletedFilterCopyListener> self(this);
+    StopObserving();
+    return CopyServiceListener::OnStopCopy(status);
+  }
+  NS_IMETHOD SetMessageKey(nsMsgKey key) override {
+    return mKeyFn ? mKeyFn(NS_OK, key) : NS_OK;
+  }
+  NS_IMETHOD MsgsMoveCopyCompleted(
+      bool move, const nsTArray<RefPtr<nsIMsgDBHdr>>& source,
+      nsIMsgFolder* destination,
+      const nsTArray<RefPtr<nsIMsgDBHdr>>& arrived) override {
+    if (!mStarted || !move || destination != mDestination ||
+        source.Length() != 1 || source[0] != mSource) {
+      return NS_OK;
+    }
+    nsMsgKey key = nsMsgKey_None;
+    nsresult rv = [&]() -> nsresult {
+      NS_ENSURE_TRUE(arrived.Length() == 1 && arrived[0], NS_ERROR_UNEXPECTED);
+      bool live;
+      MOZ_TRY(arrived[0]->GetIsLive(&live));
+      NS_ENSURE_TRUE(live, NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<nsIMsgFolder> folder;
+      MOZ_TRY(arrived[0]->GetFolder(getter_AddRefs(folder)));
+      NS_ENSURE_TRUE(folder == mDestination, NS_ERROR_UNEXPECTED);
+      return arrived[0]->GetMessageKey(&key);
+    }();
+    return mKeyFn ? mKeyFn(rv, key) : rv;
+  }
+
+  // Registered only for msgsMoveCopyCompleted; other notifications are inert.
+  NS_IMETHOD MsgAdded(nsIMsgDBHdr*) override { return NS_OK; }
+  NS_IMETHOD MsgPropertyChanged(nsIMsgDBHdr*, const char*, const nsACString&,
+                                const nsACString&) override {
+    return NS_OK;
+  }
+  NS_IMETHOD MsgsClassified(const nsTArray<RefPtr<nsIMsgDBHdr>>&, bool,
+                            bool) override {
+    return NS_OK;
+  }
+  NS_IMETHOD MsgsJunkStatusChanged(
+      const nsTArray<RefPtr<nsIMsgDBHdr>>&) override {
+    return NS_OK;
+  }
+  NS_IMETHOD MsgsDeleted(const nsTArray<RefPtr<nsIMsgDBHdr>>&) override {
+    return NS_OK;
+  }
+  NS_IMETHOD MsgKeyChanged(nsMsgKey, nsIMsgDBHdr*) override { return NS_OK; }
+  NS_IMETHOD MsgUnincorporatedMoved(nsIMsgFolder*, nsIMsgDBHdr*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD FolderAdded(nsIMsgFolder*) override { return NS_OK; }
+  NS_IMETHOD FolderDeleted(nsIMsgFolder*) override { return NS_OK; }
+  NS_IMETHOD FolderMoveCopyCompleted(bool, nsIMsgFolder*,
+                                     nsIMsgFolder*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD FolderRenamed(nsIMsgFolder*, nsIMsgFolder*) override {
+    return NS_OK;
+  }
+  NS_IMETHOD FolderCompactStart(nsIMsgFolder*) override { return NS_OK; }
+  NS_IMETHOD FolderCompactFinish(nsIMsgFolder*) override { return NS_OK; }
+  NS_IMETHOD FolderReindexTriggered(nsIMsgFolder*) override { return NS_OK; }
 
  private:
   ~CompletedFilterCopyListener() override = default;
+  nsCOMPtr<nsIMsgFolderNotificationService> mNotifier;
+  nsCOMPtr<nsIMsgDBHdr> mSource;
+  nsCOMPtr<nsIMsgFolder> mDestination;
+  bool mStarted = false;
 };
+
+NS_IMPL_ISUPPORTS_INHERITED(CompletedFilterCopyListener, CopyServiceListener,
+                            nsIMsgFolderListener)
 }  // namespace
 
 struct nsParseNewMailState::CompletedFilterState
@@ -1770,10 +1869,20 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             RefPtr<CompletedFilterCopyListener> listener =
                 new CompletedFilterCopyListener;
             listener->mKeyFn = [self = RefPtr{this}, hold = RefPtr{state},
-                                serial](nsMsgKey key) {
+                                serial](nsresult status, nsMsgKey key) {
               if (self->m_completedFilters == hold && hold->waiting &&
-                  hold->copySerial == serial)
-                hold->destinationKey = key;
+                  hold->copySerial == serial) {
+                hold->Record(status);
+                if (NS_SUCCEEDED(status)) {
+                  if (key == nsMsgKey_None ||
+                      (hold->destinationKey != nsMsgKey_None &&
+                       hold->destinationKey != key)) {
+                    hold->Record(NS_ERROR_UNEXPECTED);
+                  } else {
+                    hold->destinationKey = key;
+                  }
+                }
+              }
               return NS_OK;
             };
             listener->mStopCopyFn = [self = RefPtr{this}, hold = RefPtr{state},
@@ -1786,11 +1895,15 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             state->moveDestination = move ? destination.get() : nullptr;
             state->destinationKey = nsMsgKey_None;
             state->terminalAction = move;
+            if (state->fresh && move) {
+              MOZ_TRY(listener->ObserveMove(state->header, destination));
+            }
             state->waiting = state->dispatching = true;
             nsresult copyRv = copy->CopyMessages(
                 m_downloadFolder, {state->header.get()}, destination, move,
                 listener, m_msgWindow, false);
             state->dispatching = false;
+            if (NS_FAILED(copyRv)) listener->StopObserving();
             return copyRv;
           }
           default:

@@ -2420,7 +2420,11 @@ nsresult nsParseNewMailState::ApplyForwardAndReplyFilter(
       }
       {
         nsCOMPtr<nsIMsgComposeService> compService =
-            mozilla::components::Compose::Service();
+            do_GetService("@mozilla.org/messengercompose;1", &rv);
+        record(rv);
+        if (NS_FAILED(rv)) {
+          continue;
+        }
         rv = compService->ForwardMessage(
             forwardStr, m_msgToForwardOrReply, msgWindow, server,
             nsIMsgComposeService::kForwardAsDefault);
@@ -2449,7 +2453,11 @@ nsresult nsParseNewMailState::ApplyForwardAndReplyFilter(
       record(rv);
       if (NS_SUCCEEDED(rv) && server) {
         nsCOMPtr<nsIMsgComposeService> compService =
-            mozilla::components::Compose::Service();
+            do_GetService("@mozilla.org/messengercompose;1", &rv);
+        record(rv);
+        if (NS_FAILED(rv)) {
+          continue;
+        }
         rv = compService->ReplyWithTemplate(
             m_msgToForwardOrReply, m_replyTemplateUri[i], msgWindow, server);
         record(rv);

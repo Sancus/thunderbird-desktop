@@ -558,6 +558,7 @@ add_task(async function check_for_go_back_button() {
   const openPGPKeyManagerButton = tabDocument.getElementById(
     "openOpenPGPKeyManagerButton"
   );
+  openPGPKeyManagerButton.scrollIntoView({ block: "nearest" });
   info(
     "Key manager input: " +
       JSON.stringify({

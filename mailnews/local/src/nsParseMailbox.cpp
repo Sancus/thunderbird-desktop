@@ -1139,9 +1139,8 @@ class CompletedFilterCopyListener final : public CopyServiceListener,
 
   std::function<nsresult(nsresult, nsMsgKey)> mKeyFn;
   nsresult ObserveMove(nsIMsgDBHdr* source, nsIMsgFolder* destination) {
-    // The local producer returns live rows here; nonlocal notifications may
-    // contain no row or only a provisional header. Keep their existing key
-    // path.
+    // Only local producers return a live destination row here. Nonlocal
+    // moves settle through OnStopCopy without a native destination key.
     nsCOMPtr<nsIMsgLocalMailFolder> local = do_QueryInterface(destination);
     if (!local) return NS_OK;
     bool live;
@@ -1619,27 +1618,32 @@ nsresult nsParseNewMailState::OnCompletedFilterCopy(CompletedFilterState* state,
   state->Record(status);
   if (NS_SUCCEEDED(status) && state->moveDestination) {
     if (state->fresh) {
-      nsCOMPtr<nsIMsgDBHdr> destination;
-      nsresult rv =
-          state->destinationKey == nsMsgKey_None
-              ? NS_ERROR_UNEXPECTED
-              : state->moveDestination->GetMessageHeader(
-                    state->destinationKey, getter_AddRefs(destination));
-      MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
-              ("CompletedFilterCopy destination state=%p key=%u status=0x%08x",
-               state, state->destinationKey, static_cast<uint32_t>(rv)));
-      state->Record(rv);
-      if (NS_SUCCEEDED(rv)) {
-        if (m_msgToForwardOrReply == state->header) {
-          m_msgToForwardOrReply = destination;
+      nsCOMPtr<nsIMsgLocalMailFolder> localDestination =
+          do_QueryInterface(state->moveDestination);
+      if (localDestination) {
+        nsCOMPtr<nsIMsgDBHdr> destination;
+        nsresult rv =
+            state->destinationKey == nsMsgKey_None
+                ? NS_ERROR_UNEXPECTED
+                : state->moveDestination->GetMessageHeader(
+                      state->destinationKey, getter_AddRefs(destination));
+        MOZ_LOG(
+            FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy destination state=%p key=%u status=0x%08x",
+             state, state->destinationKey, static_cast<uint32_t>(rv)));
+        state->Record(rv);
+        if (NS_SUCCEEDED(rv)) {
+          if (m_msgToForwardOrReply == state->header) {
+            m_msgToForwardOrReply = destination;
+          }
+          // Logging and queued compose must not read the retired local row.
+          state->header = destination;
         }
-        // Logging and queued compose must not read the retired source row.
-        state->header = destination;
       }
       if (state->moveIsNew) {
         state->notNew = true;
         nsCString uri;
-        rv = state->moveDestination->GetURI(uri);
+        nsresult rv = state->moveDestination->GetURI(uri);
         state->Record(rv);
         if (NS_SUCCEEDED(rv)) {
           if (!m_filterTargetFoldersMsgMovedCount) {
@@ -1822,12 +1826,11 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             MOZ_TRY(m_mailDB->GetThreadContainingMsgHdr(
                 state->header, getter_AddRefs(thread)));
             NS_ENSURE_TRUE(thread, NS_ERROR_NOT_AVAILABLE);
-            nsMsgKey threadKey;
-            MOZ_TRY(thread->GetThreadKey(&threadKey));
+            // The root can be in another folder. The flag API requires a
+            // current member of this folder, not the global root key.
             return type == nsMsgFilterAction::KillThread
-                       ? m_mailDB->MarkThreadIgnored(thread, threadKey, true,
-                                                     nullptr)
-                       : m_mailDB->MarkThreadWatched(thread, threadKey, true,
+                       ? m_mailDB->MarkThreadIgnored(thread, key, true, nullptr)
+                       : m_mailDB->MarkThreadWatched(thread, key, true,
                                                      nullptr);
           }
           case nsMsgFilterAction::KillSubthread:
@@ -1931,26 +1934,40 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
                 do_GetService("@mozilla.org/messenger/messagecopyservice;1");
             NS_ENSURE_TRUE(copy, NS_ERROR_NOT_AVAILABLE);
             MOZ_TRY(state->status);
+            nsCOMPtr<nsIMsgLocalMailFolder> localDestination =
+                do_QueryInterface(destination);
+            bool nonlocalMove = state->fresh && move && !localDestination;
+            if (nonlocalMove) {
+              // No live destination row is returned for a nonlocal Move.
+              // Dispatch queued compose before CopyMessages retires the source,
+              // as the legacy path does before coalescer playback.
+              (void)ApplyForwardAndReplyFilter(m_msgWindow);
+              MOZ_TRY(state->status);
+            }
             uint64_t serial = ++state->copySerial;
             RefPtr<CompletedFilterCopyListener> listener =
                 new CompletedFilterCopyListener;
-            listener->mKeyFn = [self = RefPtr{this}, hold = RefPtr{state},
-                                serial](nsresult status, nsMsgKey key) {
-              if (self->m_completedFilters == hold && hold->waiting &&
-                  hold->copySerial == serial) {
-                hold->Record(status);
-                if (NS_SUCCEEDED(status)) {
-                  if (key == nsMsgKey_None ||
-                      (hold->destinationKey != nsMsgKey_None &&
-                       hold->destinationKey != key)) {
-                    hold->Record(NS_ERROR_UNEXPECTED);
-                  } else {
-                    hold->destinationKey = key;
+            // IMAP SetMessageKey may contain a server UID, not a native key.
+            // Only local Move receipts can retarget this completed message.
+            if (!nonlocalMove) {
+              listener->mKeyFn = [self = RefPtr{this}, hold = RefPtr{state},
+                                  serial](nsresult status, nsMsgKey key) {
+                if (self->m_completedFilters == hold && hold->waiting &&
+                    hold->copySerial == serial) {
+                  hold->Record(status);
+                  if (NS_SUCCEEDED(status)) {
+                    if (key == nsMsgKey_None ||
+                        (hold->destinationKey != nsMsgKey_None &&
+                         hold->destinationKey != key)) {
+                      hold->Record(NS_ERROR_UNEXPECTED);
+                    } else {
+                      hold->destinationKey = key;
+                    }
                   }
                 }
-              }
-              return NS_OK;
-            };
+                return NS_OK;
+              };
+            }
             listener->mStopCopyFn = [self = RefPtr{this}, hold = RefPtr{state},
                                      serial](nsresult status) {
               return self->OnCompletedFilterCopy(hold, serial, status);

@@ -3045,3 +3045,362 @@ add_task(async function test_pop3FreshExistingActionsMaildir() {
   await checkFreshExistingActions("maildir", "same-folder-move");
   await checkFreshExistingActions("maildir", "forward-after-move");
 });
+
+
+/**
+ * Move a fresh POP message to the real IMAP daemon before downloading later mail.
+ * Compose must receive the live local source, never an APPENDUID as a row key.
+ *
+ * @param {string} store - Actual local provider, mbox or maildir.
+ * @param {boolean} uidplus - Advertise UIDPLUS and return an APPENDUID.
+ * @returns {Promise<void>} Resolves after delivery and ordinary server cleanup.
+ */
+async function checkFreshImapMove(store, uidplus) {
+  const { IMAPPump, setupIMAPPump, teardownIMAPPump } =
+    ChromeUtils.importESModule(
+      "resource://testing-common/mailnews/IMAPpump.sys.mjs"
+    );
+  await withPartialStore(store, async (incoming, folder) => {
+    const accountKeys = new Set(
+      MailServices.accounts.accounts.map(account => account.key)
+    );
+    const prefs = [
+      ["mail.server.default.max_cached_connections", "Int"],
+      ["mail.server.default.download_on_biff", "Bool"],
+      ["mail.biff.play_sound", "Bool"],
+      ["mail.biff.show_alert", "Bool"],
+      ["mail.biff.show_tray_icon", "Bool"],
+      ["mail.biff.animate_dock_icon", "Bool"],
+      ["mail.biff.alert.show_preview", "Bool"],
+    ].map(([name, type]) => ({
+      name,
+      type,
+      hadValue: Services.prefs.prefHasUserValue(name),
+      value: Services.prefs[`get${type}Pref`](name, type == "Int" ? 0 : false),
+    }));
+    incoming.deferGetNewMail = true;
+    incoming.leaveMessagesOnServer = true;
+    incoming.headersOnly = false;
+    const firstId = `fresh-imap-${store}-${uidplus}@example.invalid`;
+    const laterId = `later-imap-${store}-${uidplus}@example.invalid`;
+    const firstRaw = COMPLETE.replace(
+      "completed-partial@example.invalid",
+      firstId
+    ).replace("Completed partial", "Fresh IMAP Move");
+    const laterRaw = COMPLETE.replace(
+      "completed-partial@example.invalid",
+      laterId
+    ).replace("Completed partial", "Later IMAP Move message");
+    popDaemon.setMessages([{ fileData: firstRaw }, { fileData: laterRaw }]);
+    const contract = "@mozilla.org/messengercompose;1";
+    const nativeCompose = Cc[contract].getService(Ci.nsIMsgComposeService);
+    const composeCalls = [];
+    let source;
+    let sourceKey;
+    const checkCompose = header => {
+      Assert.ok(header.isLive);
+      Assert.equal(header.folder, folder);
+      Assert.equal(header.messageId, firstId);
+      Assert.ok(header.storeToken);
+      Assert.ok(
+        mailTestUtils.loadMessageToString(folder, header).includes(firstRaw)
+      );
+      if (source) {
+        Assert.equal(header.messageKey, sourceKey);
+        Assert.equal(header.storeToken, source.storeToken);
+      } else {
+        source = header;
+        sourceKey = header.messageKey;
+      }
+    };
+    const compose = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeService"]),
+      forwardMessage(to, header, window, server) {
+        Assert.equal(to, "forward@example.invalid");
+        Assert.equal(server, incoming.QueryInterface(Ci.nsIMsgIncomingServer));
+        checkCompose(header);
+        composeCalls.push(["forward", header.messageKey]);
+      },
+      replyWithTemplate(header, uri, window, server) {
+        Assert.equal(uri, "mailbox://s373-template");
+        Assert.equal(server, incoming.QueryInterface(Ci.nsIMsgIncomingServer));
+        checkCompose(header);
+        composeCalls.push(["reply", header.messageKey]);
+      },
+    };
+    const list = incoming.getFilterList(null);
+    const implementation = incoming.wrappedJSObject;
+    const withClient = implementation.withClient;
+    const stopped = Promise.withResolvers();
+    const stops = [];
+    let client;
+    let rule;
+    let cid;
+    let started = false;
+    implementation.withClient = function (handler) {
+      return withClient.call(this, actual => {
+        client = actual;
+        handler(actual);
+        const onDone = actual.onDone;
+        actual.onDone = status => {
+          stops.push(status);
+          onDone?.(status);
+          stopped.resolve(status);
+        };
+      });
+    };
+    try {
+      started = true;
+      const destination = await setupIMAPPump(
+        uidplus ? "RFC2195,RFC4315" : "RFC2195",
+        { awaitInbox: true }
+      );
+      IMAPPump.incomingServer.setBoolValue("autosync_offline_stores", false);
+      Assert.ok(destination instanceof Ci.nsIMsgImapMailFolder);
+      const updated = new PromiseTestUtils.PromiseUrlListener();
+      destination.updateFolderWithListener(null, updated);
+      await updated.promise;
+      rule = addCompletedPartialFilter(list, [
+        {
+          type: Ci.nsMsgFilterAction.Forward,
+          strValue: "forward@example.invalid",
+        },
+        {
+          type: Ci.nsMsgFilterAction.Reply,
+          strValue: "mailbox://s373-template",
+        },
+        {
+          type: Ci.nsMsgFilterAction.MoveToFolder,
+          targetFolderUri: destination.URI,
+        },
+      ]);
+      const term = rule.createTerm();
+      term.attrib = Ci.nsMsgSearchAttrib.Subject;
+      term.op = Ci.nsMsgSearchOp.Is;
+      const value = term.value;
+      value.str = "Fresh IMAP Move";
+      term.value = value;
+      rule.searchTerms = [term];
+      cid = PartialCopyRegistrar.register(contract, compose);
+      popServer.resetTest();
+      MailServices.pop3.GetNewMail(null, null, folder, incoming);
+      Assert.equal(await stopped.promise, Cr.NS_OK);
+      Assert.deepEqual(stops, [Cr.NS_OK]);
+      Assert.ok(client._nativeDelivery);
+      Assert.deepEqual(composeCalls, [
+        ["forward", sourceKey],
+        ["reply", sourceKey],
+      ]);
+      Assert.ok(source);
+      Assert.ok(!source.isLive, "The confirmed APPEND retired its local source");
+      const headers = [...folder.messages];
+      Assert.equal(headers.length, 1);
+      Assert.equal(headers[0].messageId, laterId);
+      Assert.notEqual(headers[0].messageKey, sourceKey);
+      Assert.equal(client._sink.messageUri, folder.getUriForMsg(headers[0]));
+      Assert.equal(IMAPPump.mailbox._messages.length, 1);
+      const appended = IMAPPump.mailbox._messages[0];
+      Assert.ok(appended.getText().includes(firstId));
+      Assert.ok(appended.getText().includes("Completed body.\r\n"));
+      const imapTransactions = IMAPPump.server.playTransaction();
+      const imapWire = Array.isArray(imapTransactions)
+        ? imapTransactions
+        : [imapTransactions];
+      Assert.equal(
+        imapWire.flatMap(transaction => transaction.them).filter(
+          command => /^(?:\S+ )?APPEND /i.test(command)
+        ).length,
+        1
+      );
+      Assert.equal(
+        imapWire.flatMap(transaction => transaction.us).some(
+          response => response.includes("[APPENDUID ")
+        ),
+        uidplus
+      );
+      let popTransaction = popServer.playTransaction();
+      if (Array.isArray(popTransaction)) {
+        popTransaction = popTransaction[popTransaction.length - 1];
+      }
+      Assert.equal(
+        popTransaction.them.filter(command => command == "RETR 1").length,
+        1
+      );
+      Assert.equal(
+        popTransaction.them.filter(command => command == "RETR 2").length,
+        1
+      );
+      Assert.ok(!popTransaction.them.some(command => command.startsWith("DELE")));
+      Assert.equal(folder.getNumNewMessages(false), 1);
+      Assert.equal(destination.getNumNewMessages(false), 1);
+      Assert.ok(folder.hasNewMessages);
+      Assert.ok(destination.hasNewMessages);
+      Assert.ok(!folder.locked);
+      Assert.ok(!destination.locked);
+    } finally {
+      implementation.withClient = withClient;
+      if (cid) {
+        PartialCopyRegistrar.unregister(cid);
+      }
+      if (rule) {
+        list.removeFilter(rule);
+      }
+      try {
+        if (started) {
+          teardownIMAPPump();
+        }
+      } finally {
+        for (const account of MailServices.accounts.accounts) {
+          if (!accountKeys.has(account.key)) {
+            MailServices.accounts.removeAccount(account);
+          }
+        }
+        for (const { name, type, hadValue, value } of prefs) {
+          if (hadValue) {
+            Services.prefs[`set${type}Pref`](name, value);
+          } else {
+            Services.prefs.clearUserPref(name);
+          }
+        }
+      }
+      Assert.equal(Cc[contract].getService(Ci.nsIMsgComposeService), nativeCompose);
+    }
+  });
+}
+
+/**
+ * Apply Watch or Kill to a fresh reply whose thread root is in another folder.
+ *
+ * @param {string} store - Actual local provider, mbox or maildir.
+ * @param {boolean} ignored - Apply Kill Thread instead of Watch Thread.
+ * @returns {Promise<void>} Resolves after both fresh messages finish delivery.
+ */
+async function checkFreshForeignRoot(store, ignored) {
+  await withPartialStore(store, async (incoming, folder) => {
+    incoming.deferGetNewMail = true;
+    incoming.leaveMessagesOnServer = true;
+    incoming.headersOnly = false;
+    const archive = folder.parent
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("foreign-thread-root");
+    const rootId = `foreign-root-${store}-${ignored}@example.invalid`;
+    archive.addMessage(
+      COMPLETE.replace("completed-partial@example.invalid", rootId).replace(
+        /^References:.*\r\n/m,
+        ""
+      )
+    );
+    const root = archive.msgDatabase.getMsgHdrForMessageID(rootId);
+    Assert.ok(root.isLive);
+    Assert.equal(root.folder, archive);
+    const rootKey = root.messageKey;
+    const firstId = `foreign-reply-${store}-${ignored}@example.invalid`;
+    const laterId = `foreign-later-${store}-${ignored}@example.invalid`;
+    const firstRaw = COMPLETE.replace(
+      "completed-partial@example.invalid",
+      firstId
+    )
+      .replace("Completed partial", "Foreign root reply")
+      .replace(/^References:.*\r\n/m, `References: <${rootId}>\r\n`);
+    const laterRaw = COMPLETE.replace(
+      "completed-partial@example.invalid",
+      laterId
+    ).replace(/^References:.*\r\n/m, "");
+    popDaemon.setMessages([{ fileData: firstRaw }, { fileData: laterRaw }]);
+    const list = incoming.getFilterList(null);
+    const rule = addCompletedPartialFilter(list, [
+      {
+        type: ignored
+          ? Ci.nsMsgFilterAction.KillThread
+          : Ci.nsMsgFilterAction.WatchThread,
+      },
+      { type: Ci.nsMsgFilterAction.AddTag, strValue: "after-thread-action" },
+    ]);
+    const term = rule.createTerm();
+    term.attrib = Ci.nsMsgSearchAttrib.Subject;
+    term.op = Ci.nsMsgSearchOp.Is;
+    const value = term.value;
+    value.str = "Foreign root reply";
+    term.value = value;
+    rule.searchTerms = [term];
+    const implementation = incoming.wrappedJSObject;
+    const withClient = implementation.withClient;
+    const stopped = Promise.withResolvers();
+    const stops = [];
+    let client;
+    implementation.withClient = function (handler) {
+      return withClient.call(this, actual => {
+        client = actual;
+        handler(actual);
+        const onDone = actual.onDone;
+        actual.onDone = status => {
+          stops.push(status);
+          onDone?.(status);
+          stopped.resolve(status);
+        };
+      });
+    };
+    try {
+      popServer.resetTest();
+      MailServices.pop3.GetNewMail(null, null, folder, incoming);
+      Assert.equal(await stopped.promise, Cr.NS_OK);
+      Assert.deepEqual(stops, [Cr.NS_OK]);
+      Assert.ok(client._nativeDelivery);
+      const headers = [...folder.messages];
+      Assert.equal(headers.length, 2);
+      const reply = headers.find(header => header.messageId == firstId);
+      const later = headers.find(header => header.messageId == laterId);
+      Assert.ok(reply);
+      Assert.ok(later, "A foreign root does not stop the remaining POP download");
+      Assert.ok(reply.isLive);
+      Assert.equal(reply.folder, folder);
+      Assert.notEqual(reply.messageKey, rootKey);
+      Assert.ok(!folder.msgDatabase.listAllKeys().includes(rootKey));
+      const thread = folder.msgDatabase.getThreadContainingMsgHdr(reply);
+      Assert.equal(thread.threadKey, rootKey);
+      Assert.equal(Boolean(thread.flags & Ci.nsMsgMessageFlags.Ignored), ignored);
+      Assert.equal(Boolean(thread.flags & Ci.nsMsgMessageFlags.Watched), !ignored);
+      Assert.equal(reply.getStringProperty("keywords"), "after-thread-action");
+      Assert.equal(later.getStringProperty("keywords"), "");
+      Assert.equal(client._sink.messageUri, folder.getUriForMsg(later));
+      Assert.ok(root.isLive);
+      Assert.equal(root.folder, archive);
+      let transaction = popServer.playTransaction();
+      if (Array.isArray(transaction)) {
+        transaction = transaction[transaction.length - 1];
+      }
+      Assert.equal(transaction.them.filter(command => command == "RETR 1").length, 1);
+      Assert.equal(transaction.them.filter(command => command == "RETR 2").length, 1);
+      Assert.ok(!folder.locked);
+      Assert.ok(!archive.locked);
+    } finally {
+      implementation.withClient = withClient;
+      list.removeFilter(rule);
+    }
+  });
+}
+
+add_task(async function test_pop3FreshImapMoveUidplusMbox() {
+  await checkFreshImapMove("mbox", true);
+});
+add_task(async function test_pop3FreshImapMoveUidplusMaildir() {
+  await checkFreshImapMove("maildir", true);
+});
+add_task(async function test_pop3FreshImapMoveNoUidplusMbox() {
+  await checkFreshImapMove("mbox", false);
+});
+add_task(async function test_pop3FreshImapMoveNoUidplusMaildir() {
+  await checkFreshImapMove("maildir", false);
+});
+add_task(async function test_pop3FreshForeignRootWatchMbox() {
+  await checkFreshForeignRoot("mbox", false);
+});
+add_task(async function test_pop3FreshForeignRootWatchMaildir() {
+  await checkFreshForeignRoot("maildir", false);
+});
+add_task(async function test_pop3FreshForeignRootKillMbox() {
+  await checkFreshForeignRoot("mbox", true);
+});
+add_task(async function test_pop3FreshForeignRootKillMaildir() {
+  await checkFreshForeignRoot("maildir", true);
+});

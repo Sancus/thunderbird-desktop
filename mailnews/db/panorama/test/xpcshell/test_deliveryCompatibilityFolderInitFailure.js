@@ -210,3 +210,178 @@ add_task(async function test_failedDescendantKeepsRowsBodiesAndExistingChild() {
     );
   }
 });
+
+/**
+ * Reads the actual native record without changing its reserved datum.
+ *
+ * @param {number} folderId - The physical ID captured before invalidation.
+ * @returns {string} The complete version-one origin bytes.
+ */
+function failureOriginText(folderId) {
+  const statement = database.connectionForTests.createStatement(
+    "SELECT value FROM folder_properties WHERE id = :id " +
+      "AND name = 'panoramaCacheImportOrigin'"
+  );
+  try {
+    statement.params.id = folderId;
+    Assert.ok(statement.executeStep(), "Actual discovery produced the origin");
+    const text = statement.getUTF8String(0);
+    Assert.ok(!statement.executeStep());
+    Assert.equal(text.split("\n")[0], "1");
+    return text;
+  } finally {
+    statement.finalize();
+  }
+}
+
+/**
+ * Prepares a native root's real child store before ordinary initialization.
+ *
+ * @param {string} label - The independent ordinary fixture name.
+ * @returns {Promise<nsIMsgFolder>} The actual discovered child.
+ */
+async function createFailureOriginChild(label) {
+  const lane = PanoramaDelivery.expectedLane();
+  do_get_profile();
+  loadExistingDB();
+  const server = MailServices.accounts.createIncomingServer(
+    label, label + ".invalid", "none"
+  );
+  registerCleanupFunction(() =>
+    MailServices.accounts.removeIncomingServer(server, false)
+  );
+  server.setStringValue("storeContractID", {
+    mbox: "@mozilla.org/msgstore/berkeleystore;1",
+    maildir: "@mozilla.org/msgstore/maildirstore;1",
+  }[lane.store]);
+  const directory = do_get_profile();
+  directory.append(label);
+  await IOUtils.makeDirectory(directory.path);
+  server.localPath = directory;
+  let body = PathUtils.join(directory.path, "Observed");
+  if (lane.store == "maildir") {
+    await IOUtils.makeDirectory(PathUtils.join(body, "tmp"));
+    body = PathUtils.join(body, "cur", "retained");
+  }
+  await IOUtils.makeDirectory(PathUtils.parent(body));
+  await IOUtils.writeUTF8(body, "From sender@invalid\nretained origin body\n");
+  const folder = server.rootFolder.getChildNamed("Observed");
+  Assert.ok(folder, "Normal root discovery created the child");
+  const origin = failureOriginText(folder.id).split("\n");
+  Assert.equal(Number(origin[7]), 0, "No explicit choice before the control");
+  return folder;
+}
+
+add_task(async function test_originSourceAndClosedOwnerFailuresPreserveState() {
+  const folder = await createFailureOriginChild("origin-source-failure");
+  const id = folder.id;
+  const db = folder.msgDatabase;
+  const info = db.dBFolderInfo;
+  const original = failureOriginText(id);
+  const source = original.split("\n")[1];
+  const flags = folder.flags;
+  const connection = database.connectionForTests;
+  connection.executeSimpleSQL(
+    "UPDATE database_identity SET sourceId = '{12345678-1234-1234-1234-123456789abc}'"
+  );
+  try {
+    Assert.throws(() => { folder.flags = flags; }, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => info.orFlags(0), /NS_ERROR_NOT_AVAILABLE/);
+    Assert.equal(failureOriginText(id), original);
+    Assert.equal(folder.flags, flags);
+  } finally {
+    const restore = connection.createStatement(
+      "UPDATE database_identity SET sourceId = :source"
+    );
+    try {
+      restore.params.source = source;
+      restore.execute();
+    } finally {
+      restore.finalize();
+    }
+  }
+  db.forceClosed();
+  Assert.throws(() => { info.flags = 0; }, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.equal(
+    failureOriginText(id),
+    original,
+    "Closed owner cannot record or write"
+  );
+  Assert.equal(folder.msgDatabase.dBFolderInfo.flags >>> 0, flags >>> 0);
+  Assert.equal(
+    failureOriginText(id),
+    original,
+    "Ordinary DB reopen does not reset origin"
+  );
+});
+
+add_task(async function test_failedVetoKeepsFlagsAndCallerTransaction() {
+  const folder = await createFailureOriginChild("origin-write-failure");
+  const id = folder.id;
+  const info = folder.msgDatabase.dBFolderInfo;
+  const connection = database.connectionForTests;
+  const original = failureOriginText(id);
+  const flags = folder.flags;
+  let callbacks = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+    onFolderIntPropertyChanged(item, property) {
+      if (item == folder && property == "FolderFlag") {
+        callbacks++;
+      }
+    },
+  };
+  folder.AddFolderListener(listener);
+  registerCleanupFunction(() => folder.RemoveFolderListener(listener));
+  connection.executeSimpleSQL(
+    "CREATE TEMP TRIGGER reject_cache_origin_attempt BEFORE INSERT ON folder_properties " +
+      "WHEN NEW.name = 'panoramaCacheImportOrigin' " +
+      "BEGIN SELECT RAISE(ABORT, 'origin attempt write fault'); END"
+  );
+  try {
+    Assert.throws(
+      () => {
+        folder.flags = flags;
+      },
+      /NS_ERROR_STORAGE_CONSTRAINT/
+    );
+    Assert.throws(() => info.orFlags(0), /NS_ERROR_STORAGE_CONSTRAINT/);
+    Assert.equal(
+      failureOriginText(id),
+      original,
+      "Failed veto rolls back its record"
+    );
+    Assert.equal(folderDB.getFolderFlags(folder.id), flags);
+    Assert.equal(
+      folder.flags,
+      flags,
+      "Failure precedes even an equal-word return"
+    );
+    Assert.ok(
+      !connection.transactionInProgress,
+      "Only the failed owning transaction ended"
+    );
+    Assert.equal(callbacks, 0);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_cache_origin_attempt");
+  }
+  connection.beginTransaction();
+  try {
+    Assert.throws(() => folder.clearFlag(0), /NS_ERROR_IN_PROGRESS/);
+    Assert.throws(() => info.andFlags(-1), /NS_ERROR_IN_PROGRESS/);
+    Assert.ok(
+      connection.transactionInProgress,
+      "A foreign transaction is still owned by its caller"
+    );
+    Assert.equal(failureOriginText(id), original);
+    Assert.equal(folderDB.getFolderFlags(folder.id), flags);
+    Assert.equal(callbacks, 0);
+  } finally {
+    connection.rollbackTransaction();
+  }
+  // A later ordinary explicit attempt may succeed; it is not cache recovery.
+  folder.flags = flags;
+  Assert.equal(Number(failureOriginText(id).split("\n")[7]), 0xa8000010);
+  Assert.equal(folder.flags, flags);
+  Assert.equal(callbacks, 0);
+});

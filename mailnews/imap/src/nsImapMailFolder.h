@@ -408,6 +408,8 @@ class nsImapMailFolder : public nsMsgDBFolder,
  protected:
   virtual ~nsImapMailFolder();
   // Helper methods
+  // Derive the existing server contribution without persisting client flags.
+  uint32_t FolderFlagsForBoxFlags(int32_t boxFlags);
 #ifdef MOZ_PANORAMA
   nsresult CreatePanoramaClientSubfolderInfo(const nsACString& folderName,
                                              char hierarchyDelimiter,

@@ -71,7 +71,9 @@ using mozilla::intl::Collator;
 
 #ifdef MOZ_PANORAMA
 namespace mozilla::mailnews {
+class DatabaseCore;
 class NativeFolderRelocation;
+class CacheDiscoveryFlagWrite;
 class FolderRelocationRecovery;
 struct ImapFolderRelocationMetadata;
 }  // namespace mozilla::mailnews
@@ -162,6 +164,8 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
   // Validates captured native source without opening or owning a transaction.
   nsresult CheckFolderDatabaseSource();
   nsresult CheckFolderPathAccess();
+  // Record intent before an ordinary setter can return or open a database.
+  nsresult RecordCacheClientFlagAttempt(uint32_t attemptedClientMask);
 
 #ifdef MOZ_PANORAMA
   struct FolderInitialization {
@@ -172,7 +176,23 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
   nsresult InitWithFolderId(uint64_t folderId,
                             nsTArray<FolderInitialization>& initializedFolders);
   nsresult GetCachedChild(uint64_t folderId, nsIMsgFolder** child);
+  static void RollbackFolderInitialization(
+    nsIFolderLookupService* lookup,
+    nsTArray<FolderInitialization>& initializedFolders);
+  // The native action commits before warm flags or notifications change.
+  nsresult ApplyInitialCacheDiscoveryFlags(
+    mozilla::mailnews::CacheDiscoveryFlagWrite&& write,
+    uint32_t proposedNativeFlags);
 
+ private:
+  friend class mozilla::mailnews::DatabaseCore;
+  // Validate the pinned wrapper before the native cache import commits.
+  nsresult CheckCacheImportFlags(const nsACString& expectedSourceId,
+                                uint64_t folderId, uint32_t beforeFlags);
+  // Core calls this only after committing all folders, without callbacks.
+  void PublishCacheImportFlags(uint32_t committedFlags);
+
+ protected:
   // The canonical local EmptyTrash caller scopes this only while deleting a
   // child whose native rows have been retired. Ordinary DeleteSelf/move cleanup
   // must retain their existing nonempty-folder behavior.
@@ -287,6 +307,9 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
   // ID of this folder in FolderDatabase.
   uint64_t mFolderId{0};
   nsCString mFolderDatabaseSourceId;
+  // Restrictive intent only, including a whole-word zero before ID binding.
+  // Keep it on failed initialization; a new binding cannot erase the attempt.
+  uint32_t mPrebindExplicitCacheClientMask = 0;
   // Failed initialization requires a fresh object.
   bool mFolderInitAttempted{false};
   bool mFolderRelocated{false};

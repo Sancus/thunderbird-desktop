@@ -59,6 +59,8 @@ let control;
 let controlInventory;
 let serial = 0;
 const bindings = new Map();
+const reconciledBindings = new Map();
+let reconciledInput;
 
 add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
   // Hashing must not leave certificate database writers in this mail fixture.
@@ -119,6 +121,24 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
       mbox: body,
     }
   );
+  // A separate native family keeps permanent version1 bindings unchanged.
+  // Both families consume the same saved cache bytes, never a generated cache.
+  Services.prefs.setStringPref(
+    "mail.accountmanager.localfoldersserver",
+    local.prefBranch.root.split(".")[2]
+  );
+  const reconciledLocal = creator.addServer("cache-v2", "Cache Local", "none");
+  reconciledLocal.isMaildirStore = true;
+  for (const name of LOCAL_NAMES) {
+    await reconciledLocal.rootFolder.addMailFolder(name);
+  }
+  const reconciledImap = creator.addServer(
+    "cache-v2",
+    "cache-v2.invalid",
+    "imap"
+  );
+  reconciledImap.isMaildirStore = true;
+  await IOUtils.makeDirectory(reconciledImap.rootFolder.path);
   const serverKey = "migrationCacheImap";
   const prefix = "mail.server." + serverKey + ".";
   const directory = profile.clone();
@@ -177,7 +197,11 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
     PathUtils.join(backupRoot, "backup")
   );
   loadExistingDB();
-  MailServices.accounts.accounts;
+  Assert.equal(
+    MailServices.accounts.accounts.length,
+    3,
+    "The three configured fixture accounts are loaded before local-root lookup"
+  );
   const localRoot = MailServices.accounts.localFoldersServer.rootFolder;
   Assert.ok(localRoot, "The local root exists");
   control = localRoot.getChildNamed("cache-control");
@@ -246,6 +270,42 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
     "Unicode spelling is exact"
   );
   Assert.notEqual(descriptor, inbox.summaryFile.persistentDescriptor);
+  const nativeLocal = MailServices.accounts.getIncomingServer(
+    reconciledLocal.prefBranch.root.split(".")[2]
+  ).rootFolder;
+  const nativeImap = MailServices.accounts.getIncomingServer(
+    reconciledImap.prefBranch.root.split(".")[2]
+  ).rootFolder;
+  const nativeDiscovery = nativeImap.QueryInterface(Ci.nsIMsgImapMailFolder);
+  for (const name of IMAP_NAMES) {
+    nativeDiscovery.createClientSubfolderInfo(name, "/", 0, true);
+  }
+  for (const [key, folder] of [
+    [OLD_ROOT + "Mail/Local Folders", nativeLocal],
+    [OLD_ROOT + "ImapMail/imap.localhost", nativeImap],
+    ...LOCAL_NAMES.map(name => [
+      OLD_ROOT + "Mail/Local Folders/" + name + ".msf",
+      nativeLocal.getChildNamed(name),
+    ]),
+    ...IMAP_NAMES.map(name => [
+      OLD_ROOT + "ImapMail/imap.localhost/" + name + ".msf",
+      nativeImap.getChildNamed(name),
+    ]),
+  ]) {
+    Assert.ok(
+      folder,
+      "Actual discovery-created native cache destination: " + key
+    );
+    const file = (
+      folder.isServer ? folder.filePath : folder.summaryFile
+    ).clone();
+    const parent = file.parent;
+    parent.normalize();
+    parent.append(file.leafName);
+    reconciledBindings.set(key, { folder, descriptor: cacheKey(parent) });
+    Assert.equal(folder.msgStore.storeType, "maildir");
+  }
+  Assert.equal(reconciledBindings.size, 13);
 });
 
 /** @param {nsIFile} file - Actual native cache file. @returns {string} Exact UTF-8 JSON key. */
@@ -603,15 +663,22 @@ add_task(
   }
 );
 
-/** @returns {Promise<object>} Explicit backed-up cache plan, not an import. */
-async function plannedCache() {
+/**
+ * Plans one complete cache family without importing metadata.
+ *
+ * @param {number} [version=1] - Original provenance or reconciled request version.
+ * @param {Map<string, object>} [mapping=bindings] - Complete actual native family.
+ * @returns {Promise<object>} Open backed-up journal and its private path.
+ */
+async function plannedCache(version = 1, mapping = bindings) {
   const input = await cacheInput();
   const snapshot = await prepareMorkFolderCacheImport(
     input.journal,
     database,
     lock,
     source,
-    bindings
+    mapping,
+    version
   );
   const token = await input.journal.planCacheImport("panacea", snapshot);
   Assert.equal(input.journal.state.version, 5);
@@ -964,5 +1031,401 @@ add_task(
       await verifyMigrationBackup(PathUtils.parent(backup.path)),
       backup
     );
+  }
+);
+
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_selectedCacheV2RejectsChangedProof() {
+    reconciledInput = await plannedCache(2, reconciledBindings);
+    const cache = reconciledInput.journal.state.caches[0];
+    const request = createMorkFolderCacheRequest(cache);
+    Assert.equal(request.version, 2);
+    Assert.deepEqual(request.proof, {
+      profilePath: lock.directory.path,
+      manifest: {
+        path: backup.path,
+        size: (await IOUtils.stat(backup.path)).size,
+        sha256: backup.sha256,
+      },
+    });
+    Assert.equal(request.folders.length, 13);
+    for (const row of request.folders) {
+      Assert.equal(row.originalSummaryPath, row.isServer ? "" : row.cachePath);
+      Assert.equal(row.storeType, "maildir");
+    }
+    for (const mutate of [
+      unit => {
+        unit.requestVersion = 3;
+      },
+      unit => {
+        unit.proof.manifest.size = 0;
+      },
+      unit => {
+        unit.proof.manifest.path = "manifest.json";
+      },
+      unit => {
+        unit.folders.find(row => !row.isServer).originalSummaryPath =
+          "not-absolute";
+      },
+    ]) {
+      const invalid = structuredClone(cache);
+      mutate(invalid);
+      Assert.throws(
+        () => createMorkFolderCacheRequest(invalid),
+        /version|proof|original/
+      );
+    }
+    const before = committedCacheState();
+    for (const mutate of [
+      value => {
+        value.proof.manifest.sha256 = "0".repeat(64);
+      },
+      value => {
+        value.proof.manifest.size++;
+      },
+      value => {
+        value.proof.profilePath = work;
+      },
+      value => {
+        value.folders.find(row => !row.isServer).originalSummaryPath =
+          control.summaryFile.path;
+      },
+    ]) {
+      const invalid = structuredClone(request);
+      mutate(invalid);
+      Assert.throws(
+        () => database.importFolderCacheMetadata(invalid),
+        /NS_ERROR/
+      );
+      Assert.deepEqual(
+        committedCacheState(),
+        before,
+        "Changed proof commits no metadata, receipt or binding"
+      );
+      Assert.ok(!database.connectionForTests.transactionInProgress);
+    }
+    Assert.equal(reconciledInput.journal.state.caches[0].state, "pending");
+    Assert.strictEqual(reconciledInput.journal.state.caches[0].receipt, null);
+    Assert.deepEqual(
+      await IOUtils.read(source),
+      await IOUtils.read(do_get_file(CACHE_FILE).path)
+    );
+  }
+);
+
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_selectedCacheV2PreservesExplicitZeroAndPresentEmpty() {
+    const archive = reconciledBindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/Archives.msf"
+    ).folder;
+    const drafts = reconciledBindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/Drafts.msf"
+    ).folder;
+    const inbox = reconciledBindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf"
+    ).folder;
+    archive.setFlag(Ci.nsMsgFolderFlags.Favorite);
+    archive.clearFlag(Ci.nsMsgFolderFlags.Favorite);
+    Assert.equal(archive.flags & Ci.nsMsgFolderFlags.Favorite, 0);
+    drafts.msgDatabase.dBFolderInfo.flags = 0;
+    Assert.equal(
+      folderDB.getFolderFlags(drafts.id),
+      0,
+      "Explicit whole-word zero is real native authority"
+    );
+    const info = inbox.msgDatabase.dBFolderInfo;
+    info.imapTotalPendingMessages = 0;
+    info.imapUnreadPendingMessages = 0;
+    info.setCharProperty("onlineName", "");
+    Assert.equal(info.imapTotalPendingMessages, 0);
+    Assert.equal(info.imapUnreadPendingMessages, 0);
+    Assert.equal(info.getCharProperty("onlineName"), "");
+  }
+);
+
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_selectedCacheV2ProjectsNativeFieldsAndColdReopens() {
+    const input = reconciledInput;
+    const original = await IOUtils.read(source);
+    const controlBody = await IOUtils.read(control.filePath.path);
+    const controlSummary = await IOUtils.read(control.summaryFile.path);
+    Assert.deepEqual(
+      controlBody,
+      await IOUtils.read(do_get_file("data/migration").path)
+    );
+    Assert.deepEqual(
+      controlSummary,
+      await IOUtils.read(do_get_file("data/migration.msf").path)
+    );
+    const before = committedCacheState();
+    const nativeBefore = new Map(
+      before.folders.map(([id, name, flags]) => [id, { name, flags }])
+    );
+    const inbox = reconciledBindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/INBOX.msf"
+    ).folder;
+    const archive = reconciledBindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/Archives.msf"
+    ).folder;
+    const drafts = reconciledBindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/Drafts.msf"
+    ).folder;
+    const queue = reconciledBindings.get(
+      OLD_ROOT + "Mail/Local Folders/Unsent Messages.msf"
+    ).folder;
+    const queueName = queue.name;
+    const checkpointError = new Error(
+      "Version2 journal write failed after native commit"
+    );
+    input.journal.recordCacheImport = async () => {
+      throw checkpointError;
+    };
+    await Assert.rejects(
+      resumeMorkCacheImports(
+        input.journal,
+        database,
+        lock,
+        () => reconciledBindings
+      ),
+      error => error === checkpointError
+    );
+    const cache = input.journal.state.caches[0];
+    Assert.equal(cache.state, "importing");
+    Assert.strictEqual(cache.receipt, null);
+    Assert.equal(
+      input.journal.state.lastError.message,
+      checkpointError.message
+    );
+    const receipt = database.getFolderCacheImportReceipt(
+      createMorkFolderCacheRequest(cache)
+    );
+    Assert.ok(
+      receipt,
+      "Actual native version2 commit precedes the failed checkpoint"
+    );
+    Assert.equal(receipt.identity.version, 2);
+    Assert.equal(receipt.identity.policy, "native-reconciled-selected-v2");
+    validateMorkFolderCacheReceipt(cache, receipt);
+    for (const [mutate, expected] of [
+      [
+        value => {
+          value.identity.proof.manifest.sha256 = "0".repeat(64);
+        },
+        /proof changed/,
+      ],
+      [
+        value => {
+          value.cells.find(cell => cell.name == "pendingMsgs").target =
+            "pendingMsgs";
+        },
+        /field projection/,
+      ],
+      [
+        value => {
+          value.cells.find(cell => cell.name == "flags").eligibleMask =
+            0xffffffff;
+        },
+        /flags projection/,
+      ],
+      [
+        value => {
+          value.cells.find(cell => cell.name == "MRUTime").disposition =
+            "unreconciled";
+        },
+        /unreconciled/,
+      ],
+      [
+        value => {
+          value.cells.splice(
+            value.cells.findIndex(cell => cell.name == "MRUTime"),
+            1
+          );
+        },
+        /cells changed/,
+      ],
+    ]) {
+      const invalid = structuredClone(receipt);
+      mutate(invalid);
+      Assert.throws(
+        () => validateMorkFolderCacheReceipt(cache, invalid),
+        expected
+      );
+    }
+    const clientMask = 0xa8000010;
+    Assert.equal(
+      (folderDB.getFolderFlags(inbox.id) & clientMask) >>> 0,
+      0x88000010
+    );
+    for (const { folder } of reconciledBindings.values()) {
+      const actual = folderDB.getFolderFlags(folder.id);
+      const prior = nativeBefore.get(folder.id).flags;
+      Assert.equal(
+        (actual & ~clientMask) >>> 0,
+        (prior & ~clientMask) >>> 0,
+        "Native structural, type, special, virtual and offline-event bits survive"
+      );
+      Assert.equal(
+        folder.flags >>> 0,
+        actual >>> 0,
+        "Public folder flags use the committed native value"
+      );
+      if (!folder.isServer) {
+        const opened = folder.msgDatabase;
+        const expectedFlags = opened.dBFolderInfo.flags >>> 0;
+        folder.ForceDBClosed();
+        const reopened = folder.msgDatabase;
+        Assert.notStrictEqual(
+          reopened,
+          opened,
+          "Ordinary folder close creates a cold facade"
+        );
+        Assert.equal(reopened.dBFolderInfo.flags >>> 0, expectedFlags);
+        Assert.equal(folder.flags >>> 0, actual >>> 0);
+      }
+    }
+    Assert.equal(
+      folderDB.getFolderFlags(archive.id) & Ci.nsMsgFolderFlags.Favorite,
+      0
+    );
+    Assert.equal(folderDB.getFolderFlags(drafts.id), 0);
+    const freshInfo = inbox.msgDatabase.dBFolderInfo;
+    Assert.equal(freshInfo.imapTotalPendingMessages, 0);
+    Assert.equal(freshInfo.imapUnreadPendingMessages, 0);
+    Assert.equal(freshInfo.getCharProperty("onlineName"), "");
+    Assert.equal(freshInfo.getCharProperty("MRUTime"), "1628202593");
+    const properties = committedCacheState().properties;
+    for (const name of ["totPendingMsgs", "unreadPendingMsgs"]) {
+      Assert.ok(
+        properties.some(
+          ([id, key, type, value]) =>
+            id == inbox.id && key == name && type == "integer" && value === 0
+        ),
+        "Exact native pending alias has a present integer zero: " + name
+      );
+    }
+    Assert.ok(
+      !properties.some(
+        ([id, name]) =>
+          id == inbox.id && ["pendingMsgs", "pendingUnreadMsgs"].includes(name)
+      ),
+      "Cache spelling remains provenance rather than a second native pending field"
+    );
+    Assert.equal(
+      freshInfo.numMessages,
+      0,
+      "Cached total2 creates no physical mail rows"
+    );
+    Assert.equal(
+      freshInfo.numUnreadMessages,
+      0,
+      "Cached unread1 creates no unread rows"
+    );
+    Assert.equal(
+      queue.name,
+      queueName,
+      "Cached Outbox label does not rename native Queue"
+    );
+    const cell = name =>
+      receipt.cells.find(value => value.id == inbox.id && value.name == name);
+    Assert.equal(cell("flags").text, "88083014");
+    Assert.equal(cell("flags").integer, 2282237972);
+    Assert.equal(cell("MRUTime").text, "1628202593");
+    Assert.equal(
+      cell("onlineName").text,
+      "INBOX",
+      "Original cache text stays provenance beside native present-empty"
+    );
+    Assert.ok(!receipt.cells.some(value => value.name == "absent"));
+    Assert.deepEqual(
+      committedCacheState().messages,
+      before.messages,
+      "Unrelated committed physical mail survives"
+    );
+    Assert.ok(!database.connectionForTests.transactionInProgress);
+    Assert.ok(
+      !(await IOUtils.exists(
+        PathUtils.join(PathUtils.profileDir, "folderCache.json")
+      )),
+      "Native import and ordinary facade reopen never recreate the obsolete writer"
+    );
+    Assert.deepEqual(
+      await IOUtils.read(control.filePath.path),
+      controlBody,
+      "Cache metadata never changes genuine original body bytes"
+    );
+    Assert.deepEqual(
+      await IOUtils.read(control.summaryFile.path),
+      controlSummary,
+      "Cache metadata never changes genuine original summary bytes"
+    );
+    Assert.deepEqual(await IOUtils.read(source), original);
+    Assert.deepEqual(
+      await IOUtils.read(do_get_file(CACHE_FILE).path),
+      original
+    );
+  }
+);
+
+add_task(
+  { skip_if: skipOnWindows },
+  async function test_selectedCacheV2CommitBeforeCheckpointAndHistoricalRetry() {
+    const input = reconciledInput;
+    const cache = input.journal.state.caches[0];
+    const receipt = database.getFolderCacheImportReceipt(
+      createMorkFolderCacheRequest(cache)
+    );
+    const before = committedCacheState();
+    input.journal.close();
+    input.journal = await MigrationJournal.open(
+      input.path,
+      lock.directory.path
+    );
+    registerCleanupFunction(() => input.journal.close());
+    const noLiveBinding = () => {
+      throw new Error(
+        "Committed original audit must not resolve a new live mapping"
+      );
+    };
+    const count = changes();
+    await resumeMorkCacheImports(input.journal, database, lock, noLiveBinding);
+    Assert.equal(input.journal.state.caches[0].state, "imported");
+    Assert.deepEqual(input.journal.state.caches[0].receipt, receipt);
+    Assert.deepEqual(committedCacheState(), before);
+    Assert.equal(
+      changes(),
+      count,
+      "Commit-before-checkpoint reconciliation is SQL read-only"
+    );
+    const revision = input.journal.state.revision;
+    await resumeMorkCacheImports(input.journal, database, lock, noLiveBinding);
+    Assert.equal(input.journal.state.revision, revision);
+    Assert.equal(changes(), count);
+    const folder = reconciledBindings.get(
+      OLD_ROOT + "ImapMail/imap.localhost/foo.msf"
+    ).folder;
+    const originalName = folderDB.getFolderName(folder.id);
+    folderDB.updateName(folder.id, "renamed-after-transfer");
+    try {
+      const renamed = committedCacheState();
+      const renamedCount = changes();
+      await resumeMorkCacheImports(
+        input.journal,
+        database,
+        lock,
+        noLiveBinding
+      );
+      Assert.deepEqual(input.journal.state.caches[0].receipt, receipt);
+      Assert.deepEqual(
+        committedCacheState(),
+        renamed,
+        "Historical audit cannot rename or rebind current native rows"
+      );
+      Assert.equal(changes(), renamedCount);
+    } finally {
+      folderDB.updateName(folder.id, originalName);
+    }
   }
 );

@@ -53,6 +53,10 @@ namespace mozilla::mailnews {
 
 extern LazyLogModule gPanoramaLog;
 
+static constexpr uint32_t kCacheImportClientMask =
+  nsMsgFolderFlags::Elided | nsMsgFolderFlags::Offline |
+  nsMsgFolderFlags::CheckNew | nsMsgFolderFlags::Favorite;
+
 NS_IMPL_ADDREF(PerFolderDatabase)
 NS_IMPL_RELEASE(PerFolderDatabase)
 NS_INTERFACE_MAP_BEGIN(PerFolderDatabase)
@@ -4008,6 +4012,8 @@ NS_IMETHODIMP FolderInfo::GetFlags(int32_t* aFlags) {
 NS_IMETHODIMP FolderInfo::SetFlags(int32_t aFlags) {
   MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
   MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  MOZ_TRY(FolderDB().RecordCacheClientFlagAttempt(
+    mPerFolderDatabase->mDatabaseSourceId, mFolderId, kCacheImportClientMask));
   return FolderDB().UpdateFlags(mFolderId, aFlags);
 }
 
@@ -4015,6 +4021,8 @@ NS_IMETHODIMP FolderInfo::OrFlags(int32_t aFlags, int32_t* aOutFlags) {
   NS_ENSURE_ARG_POINTER(aOutFlags);
   MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
   MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  MOZ_TRY(FolderDB().RecordCacheClientFlagAttempt(
+    mPerFolderDatabase->mDatabaseSourceId, mFolderId, kCacheImportClientMask));
   uint32_t flags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
   flags |= aFlags;
   MOZ_TRY(FolderDB().UpdateFlags(mFolderId, flags));
@@ -4026,6 +4034,8 @@ NS_IMETHODIMP FolderInfo::AndFlags(int32_t aFlags, int32_t* aOutFlags) {
   NS_ENSURE_ARG_POINTER(aOutFlags);
   MOZ_TRY(mPerFolderDatabase->CheckFolderExists());
   MOZ_TRY(mPerFolderDatabase->CheckDatabaseSource());
+  MOZ_TRY(FolderDB().RecordCacheClientFlagAttempt(
+    mPerFolderDatabase->mDatabaseSourceId, mFolderId, kCacheImportClientMask));
   uint32_t flags = MOZ_TRY(FolderDB().GetFolderFlags(mFolderId));
   flags &= aFlags;
   MOZ_TRY(FolderDB().UpdateFlags(mFolderId, flags));

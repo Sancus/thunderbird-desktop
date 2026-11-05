@@ -649,12 +649,25 @@ export class MigrationJournal {
    * @returns {Promise<string>} Durable native operation token.
    */
   async planCacheImport(id, snapshot) {
+    if (
+      ![1, 2].includes(
+        snapshot.requestVersion === undefined ? 1 : snapshot.requestVersion
+      )
+    ) {
+      throw new Error("Unsupported native cache request version");
+    }
+    if ((snapshot.requestVersion ?? 1) === 1 && snapshot.proof !== undefined) {
+      throw new Error("Cache proof requires version2");
+    }
     let token;
     const cache = structuredClone({
       id,
       databaseSourceId: snapshot.databaseSourceId,
       ...snapshot.source,
       folders: snapshot.folders,
+      ...(snapshot.requestVersion === 2
+        ? { requestVersion: 2, proof: snapshot.proof }
+        : {}),
       token: Services.uuid.generateUUID().toString(),
       state: "pending",
       receipt: null,
@@ -1437,6 +1450,16 @@ export class MigrationJournal {
     for (const cache of state.caches ?? []) {
       createMorkFolderCacheRequest(cache);
       getMorkFolderCacheCells(cache.folders);
+      if (
+        cache.requestVersion === 2 &&
+        (cache.proof.profilePath !== state.profilePath ||
+          cache.proof.manifest.path !== state.backup?.path ||
+          cache.proof.manifest.sha256 !== state.backup.sha256)
+      ) {
+        throw new Error(
+          "Cache reconciliation proof differs from the journal backup"
+        );
+      }
       const source = new FileUtils.File(normalizedPath(cache.path));
       if (
         cache.path !== source.path ||
@@ -1456,7 +1479,13 @@ export class MigrationJournal {
       for (const folder of cache.folders) {
         if (
           cacheFolders.has(folder.id) ||
-          [folder.cachePath, folder.storePath].some(path => {
+          [
+            folder.cachePath,
+            folder.storePath,
+            ...(cache.requestVersion === 2 && !folder.isServer
+              ? [folder.originalSummaryPath]
+              : []),
+          ].some(path => {
             const child = new FileUtils.File(normalizedPath(path));
             return (
               child.path !== path ||

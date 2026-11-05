@@ -7,6 +7,106 @@
 /* import-globals-from head.js */
 /* import-globals-from head_delivery.js */
 
+const { MockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
+const cacheClientMask = 0xa8000010;
+
+/**
+ * Reads the private version-one origin produced by native discovery.
+ *
+ * @param {nsIMsgFolder} folder - The actual physical folder.
+ * @returns {{text: string, mask: number, revision: number, pending: number,
+ *   used: number, generation: string}|null} The stored origin, or no record.
+ */
+function readCacheOrigin(folder) {
+  const statement = database.connectionForTests.createStatement(
+    "SELECT value FROM folder_properties WHERE id = :id " +
+      "AND name = 'panoramaCacheImportOrigin'"
+  );
+  try {
+    statement.params.id = folder.id;
+    if (!statement.executeStep()) {
+      return null;
+    }
+    const text = statement.getUTF8String(0);
+    Assert.ok(!statement.executeStep(), "One private origin per physical row");
+    const cells = text.split("\n");
+    Assert.equal(cells.length, 13);
+    Assert.equal(cells[0], "1");
+    Assert.equal(cells[12], "end");
+    Assert.equal(Number(cells[3]), folder.id);
+    Assert.ok(cells[1], "The native database source is bound");
+    Assert.ok(cells[2], "The native birth generation is bound");
+    return {
+      text,
+      mask: Number(cells[7]),
+      revision: Number(cells[8]),
+      pending: Number(cells[9]),
+      used: Number(cells[10]),
+      generation: cells[2],
+    };
+  } finally {
+    statement.finalize();
+  }
+}
+
+/**
+ * Lets the real local store discover children before their wrappers exist.
+ *
+ * @param {string} label - The independent ordinary fixture name.
+ * @param {string[]} names - Child body-store names to discover.
+ * @param {function(): void} [beforeInit] - Optional factory fault setup.
+ * @returns {Promise<nsIMsgFolder>} The normally initialized physical parent.
+ */
+async function createObservedCacheChildren(label, names, beforeInit) {
+  const lane = PanoramaDelivery.expectedLane();
+  do_get_profile();
+  loadExistingDB();
+  const server = MailServices.accounts.createIncomingServer(
+    label, label + ".invalid", "none"
+  );
+  registerCleanupFunction(() =>
+    MailServices.accounts.removeIncomingServer(server, false)
+  );
+  server.setStringValue("storeContractID", {
+    mbox: "@mozilla.org/msgstore/berkeleystore;1",
+    maildir: "@mozilla.org/msgstore/maildirstore;1",
+  }[lane.store]);
+  const directory = do_get_profile();
+  directory.append(label);
+  await IOUtils.makeDirectory(directory.path);
+  server.localPath = directory;
+  const parentPath = PathUtils.join(directory.path, "ObservedParent");
+  for (const name of ["", ...names]) {
+    let body = name ? PathUtils.join(parentPath + ".sbd", name) : parentPath;
+    if (lane.store == "maildir") {
+      await IOUtils.makeDirectory(PathUtils.join(body, "tmp"));
+      body = PathUtils.join(body, "cur", "retained");
+    }
+    await IOUtils.makeDirectory(PathUtils.parent(body));
+    await IOUtils.writeUTF8(body, "From sender@invalid\norigin control body\n");
+  }
+  beforeInit?.();
+  const root = server.rootFolder;
+  Assert.ok(readCacheOrigin(root), "Normal native root creation was observed");
+  const parent = root.getChildNamed("ObservedParent");
+  Assert.ok(parent, "The real root store discovered its parent");
+  Assert.ok(readCacheOrigin(parent), "Native discovery classified the parent");
+  for (const name of names) {
+    const child = parent.getChildNamed(name);
+    Assert.ok(child, "The store discovered " + name);
+    Assert.equal(child.parent, parent);
+    Assert.strictEqual(
+      MailServices.folderLookup.getFolderForURL(child.URI),
+      child
+    );
+    Assert.ok(readCacheOrigin(child), "Actual native child birth was observed");
+  }
+  return parent;
+}
+
 add_task(function test_reusesCachedChildWithoutDuplicateAttachment() {
   const lane = PanoramaDelivery.expectedLane();
   Assert.equal(lane.backend, "panorama");
@@ -25,8 +125,192 @@ add_task(function test_reusesCachedChildWithoutDuplicateAttachment() {
   Assert.strictEqual(folder.addSubfolder("Cached"), child);
   Assert.deepEqual(folder.subFolders, [child]);
   Assert.equal(child.id, id);
+  Assert.equal(
+    readCacheOrigin(child),
+    null,
+    "Public insertion did not gain origin"
+  );
   Assert.equal(child.parent, folder);
   Assert.equal(child.URI, uri);
   Assert.strictEqual(MailServices.folderLookup.getFolderForURL(uri), child);
   Assert.deepEqual(folderDB.getFolderChildren(folder.id), [id]);
+});
+
+add_task(async function test_explicitFlagAttemptsIncludeZeroAndNoOps() {
+  const attempts = [
+    ["SetZero", folder => {
+      folder.flags = 0;
+    }],
+    ["SetEqual", folder => {
+      folder.flags = folder.flags;
+    }],
+    ["AddZero", folder => folder.setFlag(0)],
+    ["ClearZero", folder => folder.clearFlag(0)],
+    ["ToggleZero", folder => folder.toggleFlag(0)],
+    ["InfoZero", (folder, info) => {
+      info.flags = 0;
+    }],
+    ["InfoOrZero", (folder, info) => info.orFlags(0)],
+    ["InfoAndEqual", (folder, info) => info.andFlags(-1)],
+  ];
+  const parent = await createObservedCacheChildren(
+    "origin-attempts", attempts.map(([name]) => name)
+  );
+  for (const [name, attempt] of attempts) {
+    const folder = parent.getChildNamed(name);
+    const info = folder.msgDatabase.dBFolderInfo;
+    const before = readCacheOrigin(folder);
+    Assert.equal(before.mask, 0, "Opening the facade did not invent a choice");
+    const flags = folderDB.getFolderFlags(folder.id);
+    attempt(folder, info);
+    const after = readCacheOrigin(folder);
+    Assert.equal(after.mask, cacheClientMask, name + " is native authority");
+    Assert.greater(
+      after.revision,
+      before.revision,
+      name + " records its attempt"
+    );
+    Assert.equal(
+      folderDB.getFolderFlags(folder.id),
+      flags,
+      "No-op keeps native flags"
+    );
+    Assert.equal(after.generation, before.generation, "No renewed origin");
+    const text = after.text;
+    folder.msgDatabase.forceClosed();
+    Assert.equal(folder.msgDatabase.dBFolderInfo.flags >>> 0, flags >>> 0);
+    Assert.equal(
+      readCacheOrigin(folder).text,
+      text,
+      "Ordinary DB reopen keeps intent"
+    );
+  }
+});
+
+add_task(async function test_prebindZeroIsRestrictiveBeforeFactoryCallbacks() {
+  const contract = "@mozilla.org/mail/folder-factory;1?name=mailbox";
+  const created = Array.from({ length: 8 }, () =>
+    Cc[contract].createInstance(Ci.nsIMsgFolder)
+  );
+  let cid;
+  let calls = 0;
+  registerCleanupFunction(() => {
+    if (cid) {
+      MockRegistrar.unregister(cid);
+    }
+  });
+  let parent;
+  try {
+    parent = await createObservedCacheChildren(
+      "origin-prebind", ["Prebind"], () => {
+      // A real factory hook is necessary to attempt a write BEFORE ID binding.
+      // All returned objects are ordinary native folders, not JS/QI proxies.
+      cid = MockRegistrar.register(contract, () => {
+        Assert.less(calls, created.length);
+        const child = created[calls++];
+        Assert.equal(child.id, 0);
+        child.flags = 0;
+        return child;
+      });
+    });
+  } finally {
+    if (cid) {
+      MockRegistrar.unregister(cid);
+      cid = null;
+    }
+  }
+  Assert.greaterOrEqual(
+    calls,
+    2,
+    "Real native child factories attempted zero before binding"
+  );
+  const child = parent.getChildNamed("Prebind");
+  Assert.ok(created.includes(child));
+  Assert.equal(child.flags, 0);
+  Assert.equal(readCacheOrigin(child).mask, cacheClientMask);
+});
+
+add_task(async function test_reentrantChoicesKeepTheirAuthority() {
+  const parent = await createObservedCacheChildren(
+    "origin-reentry", ["First", "Sibling"]
+  );
+  const first = parent.getChildNamed("First");
+  const sibling = parent.getChildNamed("Sibling");
+  const info = first.msgDatabase.dBFolderInfo;
+  Assert.equal(readCacheOrigin(first).mask, 0);
+  Assert.equal(readCacheOrigin(sibling).mask, 0);
+  let calls = 0;
+  const listener = {
+    QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+    onFolderIntPropertyChanged(folder, property) {
+      if (folder != first || property != "FolderFlag" || calls) {
+        return;
+      }
+      calls++;
+      first.flags = 0;
+      info.flags = 0;
+      sibling.clearFlag(Ci.nsMsgFolderFlags.Favorite);
+    },
+  };
+  first.AddFolderListener(listener);
+  registerCleanupFunction(() => first.RemoveFolderListener(listener));
+  first.setFlag(Ci.nsMsgFolderFlags.Favorite);
+  Assert.equal(calls, 1, "The real synchronous flag callback ran");
+  Assert.equal(
+    first.flags,
+    0,
+    "The outer call did not republish an old warm word"
+  );
+  Assert.equal(folderDB.getFolderFlags(first.id), 0);
+  Assert.equal(readCacheOrigin(first).mask, cacheClientMask);
+  Assert.equal(readCacheOrigin(sibling).mask, cacheClientMask);
+  Assert.equal(readCacheOrigin(first).pending, 0);
+});
+
+add_task(async function test_lockedFlagsRecordIntentBeforeTheirEarlyReturn() {
+  const lane = PanoramaDelivery.expectedLane();
+  const server = MailServices.accounts.createIncomingServer(
+    "origin-locked", "origin-locked.invalid", "imap"
+  );
+  registerCleanupFunction(() =>
+    MailServices.accounts.removeIncomingServer(server, false)
+  );
+  server.setStringValue("storeContractID", {
+    mbox: "@mozilla.org/msgstore/berkeleystore;1",
+    maildir: "@mozilla.org/msgstore/maildirstore;1",
+  }[lane.store]);
+  const directory = do_get_profile();
+  directory.append("origin-locked");
+  await IOUtils.makeDirectory(directory.path);
+  server.localPath = directory;
+  const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
+  // kImapInbox in nsImapCore.h. This is production client metadata creation;
+  // the original IM whole cohort separately qualifies real LIST/LSUB traffic.
+  root.createClientSubfolderInfo("INBOX", "/", 0x4000, false);
+  const folder = root.getChildNamed("INBOX");
+  Assert.ok(folder.getFlag(Ci.nsMsgFolderFlags.Inbox));
+  const before = readCacheOrigin(folder);
+  Assert.equal(
+    before.mask,
+    0,
+    "Initial native box/default writes are classified"
+  );
+  for (const mutate of [
+    () => folder.clearFlag(Ci.nsMsgFolderFlags.Inbox),
+    () => folder.toggleFlag(Ci.nsMsgFolderFlags.Inbox),
+  ]) {
+    const previous = readCacheOrigin(folder);
+    mutate();
+    Assert.ok(
+      folder.getFlag(Ci.nsMsgFolderFlags.Inbox),
+      "The locked structural bit remains"
+    );
+    const after = readCacheOrigin(folder);
+    Assert.equal(after.mask, cacheClientMask);
+    Assert.greater(
+      after.revision,
+      previous.revision,
+      "Locked no-op still records intent"
+    );
+  }
 });

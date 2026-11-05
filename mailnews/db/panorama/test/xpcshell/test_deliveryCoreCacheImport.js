@@ -21,6 +21,11 @@ const { ProfileCreator } = ChromeUtils.importESModule(
 const { parseMorkFolderCache } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MorkFolderCache.sys.mjs"
 );
+const { createMigrationBackup } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/MigrationBackup.sys.mjs"
+);
+const CLIENT_MASK = 0xa8000010;
+const ORIGIN_PROPERTY = "panoramaCacheImportOrigin";
 const OLD_ROOT = "/foo/bar/profile-default/";
 const IMAP_NAMES = [
   "Archives",
@@ -34,7 +39,7 @@ const IMAP_NAMES = [
   "foo",
 ];
 let work, request, observer, localRoot, imapRoot;
-let originalBytes, controlKey;
+let originalBytes, controlKey, requestV2, proofBackup, originalControl;
 
 /**
  * Build the same canonical descriptor used by the native receiver.
@@ -56,11 +61,32 @@ function canonicalFile(file) {
 }
 
 add_setup(async function setupPhysicalCacheMappings() {
+  // Use the ordinary closed-profile backup helper before native discovery.
+  // No origin rows or permission flags are inserted by this fixture.
+  const oldNoCertDB = Services.prefs.getBoolPref("security.nocertdb", false);
+  const hadNoCertDB = Services.prefs.prefHasUserValue("security.nocertdb");
+  Services.prefs.setBoolPref("security.nocertdb", true);
+  registerCleanupFunction(() => {
+    if (hadNoCertDB) {
+      Services.prefs.setBoolPref("security.nocertdb", oldNoCertDB);
+    } else {
+      Services.prefs.clearUserPref("security.nocertdb");
+    }
+  });
+  work = await IOUtils.createUniqueDirectory(
+    PathUtils.tempDir,
+    "native-cache-"
+  );
+  registerCleanupFunction(() => IOUtils.remove(work, { recursive: true }));
   const creator = new ProfileCreator(do_get_profile());
   const local = creator.addLocalServer();
   for (const name of ["Trash", "Unsent Messages"]) {
     await local.rootFolder.addMailFolder(name);
   }
+  originalControl = await local.rootFolder.addMailFolder("cache-raw-control", {
+    summary: do_get_file("data/migration.msf"),
+    mbox: do_get_file("data/migration"),
+  });
   const imapServer = creator.addServer("cache", "cache.invalid", "imap");
   const directory = do_get_profile();
   directory.append("native-cache-\u90ae\u4ef6-e\u0301");
@@ -72,6 +98,17 @@ add_setup(async function setupPhysicalCacheMappings() {
   Services.prefs.savePrefFile(
     new FileUtils.File(PathUtils.join(do_get_profile().path, "prefs.js"))
   );
+  originalBytes = await IOUtils.read(do_get_file("panacea.dat").path);
+  const proofCache = PathUtils.join(do_get_profile().path, "panacea.dat");
+  await IOUtils.write(proofCache, originalBytes, { mode: "create" });
+  await IOUtils.computeHexDigest(proofCache, "sha256");
+  if (AppConstants.platform != "win") {
+    proofBackup = await createMigrationBackup(
+      do_get_profile().path,
+      [],
+      PathUtils.join(work, "backup")
+    );
+  }
   loadExistingDB();
   MailServices.accounts.accounts;
   localRoot = MailServices.accounts.localFoldersServer.rootFolder;
@@ -97,21 +134,13 @@ add_setup(async function setupPhysicalCacheMappings() {
       );
     }
   }
-  originalBytes = await IOUtils.read(do_get_file("panacea.dat").path);
   const parsed = parseMorkFolderCache(originalBytes);
-  work = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
-    "native-cache-"
-  );
   const source = PathUtils.join(work, "panacea.dat");
   await IOUtils.write(source, originalBytes);
   observer = Services.storage.openUnsharedDatabase(
     new FileUtils.File(PathUtils.join(do_get_profile().path, "panorama.sqlite"))
   );
-  registerCleanupFunction(async () => {
-    observer.close();
-    await IOUtils.remove(work, { recursive: true });
-  });
+  registerCleanupFunction(() => observer.close());
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   request = {
     version: 1,
@@ -143,6 +172,28 @@ add_setup(async function setupPhysicalCacheMappings() {
     }),
   };
   Assert.equal(request.folders.length, 13);
+  if (AppConstants.platform != "win") {
+    requestV2 = structuredClone(request);
+    requestV2.version = 2;
+    requestV2.token = "cache-native-policy-2";
+    requestV2.sourceId = "panacea-native-policy-2";
+    requestV2.source = {
+      path: canonicalFile(new FileUtils.File(proofCache)).path,
+      size: originalBytes.length,
+      sha256: await IOUtils.computeHexDigest(proofCache, "sha256"),
+    };
+    requestV2.proof = {
+      profilePath: canonicalFile(do_get_profile()).path,
+      manifest: {
+        path: canonicalFile(new FileUtils.File(proofBackup.path)).path,
+        size: (await IOUtils.stat(proofBackup.path)).size,
+        sha256: proofBackup.sha256,
+      },
+    };
+    for (const folder of requestV2.folders) {
+      folder.originalSummaryPath = folder.isServer ? "" : folder.cachePath;
+    }
+  }
   controlKey = messageDB.addMessage(
     imapRoot.getChildNamed("INBOX").id,
     "cache-control@invalid",
@@ -186,6 +237,366 @@ function scalar(sql, connection = observer) {
     statement.finalize();
   }
 }
+
+/**
+ * Read exact typed SQL values through the independent committed observer.
+ *
+ * @param {string} sql - Fixed SELECT statement supplied by this test.
+ * @returns {Array<Array<string|number|null>>} Rows in the SELECT's order.
+ */
+function cacheRows(sql) {
+  const statement = observer.createStatement(sql);
+  const rows = [];
+  try {
+    while (statement.executeStep()) {
+      const row = [];
+      for (let column = 0; column < statement.columnCount; column++) {
+        const type = statement.getTypeOfIndex(column);
+        if (type == Ci.mozIStorageValueArray.VALUE_TYPE_INTEGER) {
+          row.push(statement.getInt64(column));
+        } else if (type == Ci.mozIStorageValueArray.VALUE_TYPE_TEXT) {
+          row.push(statement.getUTF8String(column));
+        } else {
+          Assert.equal(type, Ci.mozIStorageValueArray.VALUE_TYPE_NULL);
+          row.push(null);
+        }
+      }
+      rows.push(row);
+    }
+    return rows;
+  } finally {
+    statement.finalize();
+  }
+}
+
+/**
+ * Capture committed native rows and current public flags for rollback checks.
+ *
+ * @returns {object} Exact SQL and warm public state, including private history.
+ */
+function cacheState() {
+  return {
+    folders: cacheRows("SELECT id,parent,name,flags FROM folders ORDER BY id"),
+    properties: cacheRows(
+      "SELECT id,name,typeof(value),value FROM folder_properties ORDER BY id,name"
+    ),
+    receipts: cacheRows(
+      "SELECT token,sourceId,path,identity,hex(raw),receipt FROM folder_cache_imports ORDER BY token"
+    ),
+    bindings: cacheRows(
+      "SELECT folderId,token FROM folder_cache_bindings ORDER BY folderId"
+    ),
+    messages: cacheRows("SELECT id,folderId,subject FROM messages ORDER BY id"),
+    warm: request.folders.map(f => folderDB.getMsgFolderForFolder(f.id).flags),
+  };
+}
+
+/**
+ * Assert an exact refusal with no failed return or mutation of retained state.
+ *
+ * @param {object} input - Existing native cache request.
+ * @param {number} expected - Exact expected nsresult.
+ */
+function assertCacheRefusal(input, expected) {
+  const before = cacheState();
+  let output = "unpublished";
+  Assert.throws(
+    () => (output = database.importFolderCacheMetadata(input)),
+    e => e.result == expected
+  );
+  Assert.equal(output, "unpublished");
+  Assert.deepEqual(cacheState(), before);
+  Assert.ok(!database.connectionForTests.transactionInProgress);
+}
+
+add_task(function test_v2UsesActualBirthAndKeepsOriginPrivate() {
+  if (AppConstants.platform == "win") {
+    return;
+  }
+  const generations = new Set();
+  for (const folder of requestV2.folders) {
+    const fields = scalar(
+      `SELECT value FROM folder_properties WHERE id=${folder.id} AND name='${ORIGIN_PROPERTY}'`
+    ).split("\n");
+    Assert.equal(fields.length, 13);
+    Assert.equal(fields[0], "1");
+    Assert.equal(fields[1], database.sourceId);
+    Assert.ok(fields[2], "Native discovery recorded a birth generation");
+    generations.add(fields[2]);
+    Assert.equal(Number(fields[3]), folder.id);
+    Assert.equal(
+      Number(fields[7]),
+      0,
+      "No public attempt is inferred from zero flags"
+    );
+    Assert.equal(Number(fields[9]), 0, "Every actual initial action completed");
+    Assert.equal(Number(fields[11]), 0, "New adoption has not been committed");
+    Assert.equal(fields[12], "end");
+    if (!folder.isServer && folder.protocol == "imap") {
+      Assert.equal(Number(fields[6]), 2);
+      Assert.equal(Number(fields[10]) & 12, 12, "Both IMAP initial phases ran");
+    }
+    const info = folderDB.getMsgFolderForFolder(folder.id).msgDatabase
+      .dBFolderInfo;
+    Assert.ok(!info.GetTransferInfo().hasKey(ORIGIN_PROPERTY));
+    for (const action of [
+      () => info.getCharProperty(ORIGIN_PROPERTY),
+      () => info.getUint32Property(ORIGIN_PROPERTY, 0),
+      () => info.setCharProperty(ORIGIN_PROPERTY, "spoofed"),
+      () => info.setUint32Property(ORIGIN_PROPERTY, 0),
+    ]) {
+      Assert.throws(action, e => e.result == Cr.NS_ERROR_INVALID_ARG);
+    }
+  }
+  Assert.equal(generations.size, 1);
+  Assert.equal(scalar("SELECT COUNT(*) FROM folder_cache_imports"), 0);
+});
+
+add_task(function test_v2RejectsChangedProofAndPublicInsertion() {
+  if (AppConstants.platform == "win") {
+    return;
+  }
+  for (const [change, expected] of [
+    [
+      r => (r.proof.manifest.sha256 = "0".repeat(64)),
+      Cr.NS_ERROR_NOT_AVAILABLE,
+    ],
+    [r => (r.proof.profilePath += "-other"), Cr.NS_ERROR_NOT_AVAILABLE],
+    [
+      r => (r.folders.find(f => !f.isServer).originalSummaryPath += "-other"),
+      Cr.NS_ERROR_INVALID_ARG,
+    ],
+  ]) {
+    const invalid = structuredClone(requestV2);
+    change(invalid);
+    assertCacheRefusal(invalid, expected);
+  }
+  const id = folderDB.insertFolder(imapRoot.id, "public-cache-unknown");
+  try {
+    const actual = folderDB.getMsgFolderForFolder(id);
+    Assert.strictEqual(
+      scalar(
+        `SELECT value FROM folder_properties WHERE id=${id} AND name='${ORIGIN_PROPERTY}'`
+      ),
+      null,
+      "An ordinary public insert never manufactures origin"
+    );
+    const invalid = structuredClone(requestV2);
+    const folder = invalid.folders.find(f =>
+      f.originalKey.endsWith("INBOX.msf")
+    );
+    const summary = canonicalFile(actual.summaryFile);
+    folder.id = id;
+    folder.cachePath = summary.path;
+    folder.originalSummaryPath = summary.path;
+    folder.storePath = canonicalFile(actual.filePath).path;
+    folder.descriptor = new TextDecoder("utf-8", { fatal: true }).decode(
+      MailStringUtils.byteStringToUint8Array(summary.persistentDescriptor)
+    );
+    assertCacheRefusal(invalid, Cr.NS_ERROR_NOT_AVAILABLE);
+  } finally {
+    folderDB.deleteFolder(id);
+  }
+});
+
+add_task(function test_v2RefusesMissingCorruptOrStaleNativeOrigin() {
+  if (AppConstants.platform == "win") {
+    return;
+  }
+  const id = imapRoot.getChildNamed("INBOX").id;
+  const original = scalar(
+    `SELECT value FROM folder_properties WHERE id=${id} AND name='${ORIGIN_PROPERTY}'`
+  );
+  const baseline = cacheState();
+  const connection = database.connectionForTests;
+  const write = value => {
+    const statement = connection.createStatement(
+      `INSERT OR REPLACE INTO folder_properties(id,name,value) VALUES(${id},'${ORIGIN_PROPERTY}',:value)`
+    );
+    try {
+      statement.params.value = value;
+      statement.execute();
+    } finally {
+      statement.finalize();
+    }
+  };
+  const changed = (field, value) => {
+    const fields = original.split("\n");
+    fields[field] = value;
+    return fields.join("\n");
+  };
+  for (const [value, expected] of [
+    [null, Cr.NS_ERROR_NOT_AVAILABLE],
+    [0, Cr.NS_ERROR_FILE_CORRUPTED],
+    ["broken", Cr.NS_ERROR_FILE_CORRUPTED],
+    [changed(1, database.sourceId + "-other"), Cr.NS_ERROR_NOT_AVAILABLE],
+    [changed(2, "earlier-generation"), Cr.NS_ERROR_NOT_AVAILABLE],
+    [changed(8, "0"), Cr.NS_ERROR_FILE_CORRUPTED],
+    [changed(9, "3"), Cr.NS_ERROR_NOT_AVAILABLE],
+    [changed(10, "4"), Cr.NS_ERROR_NOT_AVAILABLE],
+  ]) {
+    if (value === null) {
+      connection.executeSimpleSQL(
+        `DELETE FROM folder_properties WHERE id=${id} AND name='${ORIGIN_PROPERTY}'`
+      );
+    } else {
+      write(value);
+    }
+    try {
+      assertCacheRefusal(requestV2, expected);
+    } finally {
+      // Restore only the exact genuine datum retained before this SQL fault.
+      // Publicly inserted unknown rows above never receive a test-seeded grant.
+      write(original);
+    }
+    Assert.deepEqual(cacheState(), baseline);
+  }
+});
+
+add_task(function test_v2ProjectionRollbackPreservesExplicitAndPendingZero() {
+  if (AppConstants.platform == "win") {
+    return;
+  }
+  const inbox = imapRoot.getChildNamed("INBOX");
+  const explicit = imapRoot.getChildNamed("blah");
+  const explicitBefore = explicit.flags;
+  // Equal-word native writes still veto the entire client mask.
+  folderDB.updateFlags(explicit.id, explicitBefore);
+  Assert.equal(
+    Number(
+      scalar(
+        `SELECT value FROM folder_properties WHERE id=${explicit.id} AND name='${ORIGIN_PROPERTY}'`
+      ).split("\n")[7]
+    ),
+    CLIENT_MASK
+  );
+  const info = inbox.msgDatabase.dBFolderInfo;
+  info.setUint32Property("totPendingMsgs", 0);
+  info.setUint32Property("unreadPendingMsgs", 0);
+  info.setCharProperty("MRUTime", "");
+  const flags = ((inbox.flags & ~CLIENT_MASK) | 0x88000010) >>> 0;
+  Assert.equal((flags & CLIENT_MASK) >>> 0, 0x88000010);
+  const connection = database.connectionForTests;
+  // This fault is reached only after the exact allowed projection, preserved
+  // explicit word and typed pending zero are visible in the owning SQL TX.
+  connection.executeSimpleSQL(`
+    CREATE TEMP TRIGGER reject_checked_projection AFTER INSERT ON folder_cache_imports
+    WHEN (SELECT flags FROM folders WHERE id=${inbox.id})=${flags}
+      AND (SELECT flags FROM folders WHERE id=${explicit.id})=${explicitBefore}
+      AND (SELECT value FROM folder_properties WHERE id=${inbox.id} AND name='totPendingMsgs')=0
+      AND (SELECT typeof(value) FROM folder_properties WHERE id=${inbox.id} AND name='totPendingMsgs')='integer'
+      AND (SELECT value FROM folder_properties WHERE id=${inbox.id} AND name='MRUTime')=''
+      AND (SELECT COUNT(*) FROM messages WHERE folderId=${inbox.id})=1
+    BEGIN SELECT RAISE(ABORT,'checked native projection fault'); END;
+  `);
+  try {
+    assertCacheRefusal(requestV2, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+  } finally {
+    connection.executeSimpleSQL("DROP TRIGGER reject_checked_projection");
+  }
+  for (const table of ["folder_cache_imports", "folder_cache_bindings"]) {
+    connection.executeSimpleSQL(`
+      CREATE TEMP TRIGGER reject_v2_write BEFORE INSERT ON ${table}
+      BEGIN SELECT RAISE(ABORT,'native projection write fault'); END;
+    `);
+    try {
+      assertCacheRefusal(requestV2, Cr.NS_ERROR_STORAGE_CONSTRAINT);
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER reject_v2_write");
+    }
+  }
+});
+
+add_task(function test_v2ReadbackRejectsChangedFlagsReceiptAndBindings() {
+  if (AppConstants.platform == "win") {
+    return;
+  }
+  const inbox = imapRoot.getChildNamed("INBOX");
+  const connection = database.connectionForTests;
+  for (const mutation of [
+    `UPDATE folders SET flags=CASE WHEN (flags & 16)=0 THEN flags+16 ELSE flags-16 END WHERE id=${inbox.id}`,
+    "UPDATE folder_cache_imports SET receipt='{}' WHERE token=NEW.token",
+    "UPDATE folder_cache_imports SET raw=x'00' WHERE token=NEW.token",
+    "DELETE FROM folder_cache_bindings WHERE folderId=NEW.folderId",
+  ]) {
+    const table = mutation.startsWith("DELETE")
+      ? "folder_cache_bindings"
+      : "folder_cache_imports";
+    connection.executeSimpleSQL(`
+      CREATE TEMP TRIGGER corrupt_v2_readback AFTER INSERT ON ${table}
+      BEGIN ${mutation}; END;
+    `);
+    try {
+      assertCacheRefusal(requestV2, Cr.NS_ERROR_FILE_CORRUPTED);
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER corrupt_v2_readback");
+    }
+  }
+});
+
+add_task(async function test_v2RetainsRawSourceAndRefusesChangedCache() {
+  if (AppConstants.platform == "win") {
+    return;
+  }
+  const before = await IOUtils.read(requestV2.source.path);
+  const changed = before.slice();
+  changed[0] ^= 1;
+  await IOUtils.write(requestV2.source.path, changed);
+  try {
+    assertCacheRefusal(requestV2, Cr.NS_ERROR_NOT_AVAILABLE);
+  } finally {
+    await IOUtils.write(requestV2.source.path, before);
+  }
+  for (const [path, fixture] of [
+    [originalControl.summaryFilePath, "data/migration.msf"],
+    [originalControl.mailFilePath, "data/migration"],
+  ]) {
+    Assert.deepEqual(
+      await IOUtils.read(path),
+      await IOUtils.read(do_get_file(fixture).path)
+    );
+  }
+  Assert.deepEqual(await IOUtils.read(requestV2.source.path), originalBytes);
+  Assert.equal(scalar("SELECT COUNT(*) FROM folder_cache_imports"), 0);
+  Assert.equal(scalar("SELECT COUNT(*) FROM folder_cache_bindings"), 0);
+});
+
+add_task(function test_v2ForeignFlagAttemptDoesNotOwnCallerTransaction() {
+  if (AppConstants.platform == "win") {
+    return;
+  }
+  const inbox = imapRoot.getChildNamed("INBOX");
+  const before = cacheState();
+  const connection = database.connectionForTests;
+  connection.beginTransaction();
+  try {
+    connection.executeSimpleSQL(
+      `INSERT INTO folder_properties(id,name,value) VALUES(${inbox.id},'caller-owned-marker','uncommitted')`
+    );
+    Assert.throws(
+      () => folderDB.updateFlags(inbox.id, inbox.flags),
+      e => e.result == Cr.NS_ERROR_IN_PROGRESS
+    );
+    Assert.ok(connection.transactionInProgress);
+    Assert.strictEqual(
+      scalar(
+        `SELECT value FROM folder_properties WHERE id=${inbox.id} AND name='caller-owned-marker'`
+      ),
+      null
+    );
+    Assert.equal(
+      scalar(
+        `SELECT value FROM folder_properties WHERE id=${inbox.id} AND name='caller-owned-marker'`,
+        connection
+      ),
+      "uncommitted",
+      "Only the caller owns its pending SQL and rollback"
+    );
+  } finally {
+    connection.rollbackTransaction();
+  }
+  Assert.deepEqual(cacheState(), before);
+});
 
 add_task(function test_rejectsIncompleteOrChangedIdentityBeforeWrites() {
   if (AppConstants.platform == "win") {

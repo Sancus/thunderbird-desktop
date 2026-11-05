@@ -13,11 +13,53 @@
 #include "nsIFolderDatabase.h"
 #include "nsTHashMap.h"
 
+class nsMsgDBFolder;
+class nsMsgIncomingServer;
+class nsImapMailFolder;
+
 using mozilla::MozPromise;
 
 namespace mozilla::mailnews {
 
 struct FolderImportProperty;
+
+// Only the listed native discovery callers can obtain an initial action.
+enum class CacheDiscoveryFlagSite : uint32_t {
+  CommonRoot,
+  LocalInitialChild,
+  ImapInitialBoxFlags,
+  ImapInitialDefaults,
+  ImapServerRefresh
+};
+
+class FolderDatabase;
+
+// One checked flag write, never an ambient initialization permission.
+class CacheDiscoveryFlagWrite final {
+ public:
+  CacheDiscoveryFlagWrite(CacheDiscoveryFlagWrite&& other);
+  CacheDiscoveryFlagWrite(const CacheDiscoveryFlagWrite&) = delete;
+  CacheDiscoveryFlagWrite& operator=(const CacheDiscoveryFlagWrite&) = delete;
+  CacheDiscoveryFlagWrite& operator=(CacheDiscoveryFlagWrite&&) = delete;
+
+ private:
+  friend class FolderDatabase;
+  friend class ::nsMsgDBFolder;
+  // The owning facade checks the ticket before any native mutation.
+  uint64_t FolderId() const { return mFolder; }
+  const nsCString& SourceId() const { return mSource; }
+  CacheDiscoveryFlagWrite(FolderDatabase* owner, nsCString source,
+                          nsCString generation, uint64_t folder,
+                          uint64_t revision, uint32_t flags,
+                          CacheDiscoveryFlagSite site);
+  FolderDatabase* mOwner;
+  nsCString mSource;
+  nsCString mGeneration;
+  uint64_t mFolder;
+  uint64_t mRevision;
+  uint32_t mFlags;
+  CacheDiscoveryFlagSite mSite;
+};
 
 // Captured physical targets for one server-confirmed IMAP relocation. Wire
 // paths are supplied by the protocol owner, never derived from logical paths.
@@ -84,6 +126,63 @@ class FolderDatabase : public nsIFolderDatabase {
 
   FolderDatabase() = default;
 
+  friend class ::nsMsgDBFolder;
+  friend class ::nsMsgIncomingServer;
+  friend class ::nsImapMailFolder;
+
+  nsresult InsertCacheDiscoveryFolder(const nsACString& expectedSourceId,
+                                      uint64_t parentId,
+                                      const nsACString& nativeName,
+                                      CacheDiscoveryFlagSite site,
+                                      uint64_t& folderId);
+  nsresult ReconcileCacheDiscoveryChildren(
+      const nsACString& expectedSourceId, uint64_t parentId,
+      const nsTArray<nsCString>& childNames);
+  nsresult ObserveCacheFolderInitialization(const nsACString& expectedSourceId,
+                                            uint64_t folderId,
+                                            uint32_t prebindExplicitClientMask);
+  nsresult RecordCacheClientFlagAttempt(const nsACString& expectedSourceId,
+                                        uint64_t folderId,
+                                        uint32_t attemptedClientMask);
+  nsresult HasCacheDiscoveryOrigin(const nsACString& expectedSourceId,
+                                   uint64_t folderId, bool& tracked);
+  Result<CacheDiscoveryFlagWrite, nsresult> BeginCacheDiscoveryFlags(
+      const nsACString& expectedSourceId, uint64_t folderId,
+      CacheDiscoveryFlagSite site);
+  nsresult ApplyCacheDiscoveryFlags(CacheDiscoveryFlagWrite&& write,
+                                    uint32_t proposedNativeFlags,
+                                    uint32_t& storedFlags);
+
+  struct CacheOrigin {
+    nsCString source;
+    nsCString generation;
+    nsCString name;
+    uint64_t id{0};
+    uint64_t parent{0};
+    uint64_t revision{0};
+    uint32_t birthSite{0};
+    uint32_t explicitMask{0};
+    uint32_t pending{0};
+    uint32_t used{0};
+    bool sealed{false};
+  };
+  static constexpr uint32_t kCacheClientMask = 0xa8000010;
+  static constexpr auto kCacheOriginProperty = "panoramaCacheImportOrigin"_ns;
+  nsresult HasCacheImportBinding(uint64_t folderId, bool& bound);
+  nsresult ReadCacheOrigin(uint64_t folderId, Maybe<CacheOrigin>& output);
+  nsresult WriteCacheOrigin(const CacheOrigin& origin);
+  nsresult CheckCacheOriginSource(const nsACString& expectedSourceId);
+  nsresult CheckCacheOriginLocation(const CacheOrigin& origin);
+  nsresult CheckCacheProjectionOrigin(uint64_t folderId, CacheOrigin& origin);
+  nsresult WriteCacheFolderFlags(uint64_t folderId, uint32_t flags);
+  nsresult ReconcileInternal(uint64_t parentId,
+                             const nsTArray<nsCString>& childNames,
+                             bool cacheDiscovery);
+  nsresult InsertCacheOrigin(uint64_t id, uint64_t parent,
+                             const nsACString& name,
+                             CacheDiscoveryFlagSite site);
+  bool mCacheOriginTainted{false};
+
   // Historical spelling is only for checking an already identified receipt.
   Result<nsCString, nsresult> GetFolderPath(uint64_t folderId,
                                             bool escapePercent);
@@ -143,7 +242,8 @@ class FolderDatabase : public nsIFolderDatabase {
   // SQL-only helpers. Callers own the transaction and settle cache after
   // commit.
   nsresult InsertFolderRow(uint64_t parent, const nsACString& name,
-                           uint64_t* child);
+                           uint64_t* child,
+                           Maybe<CacheDiscoveryFlagSite> site = Nothing());
   nsresult DeleteFolderRows(uint64_t folder, bool root,
                             const nsACString& serverKey,
                             nsTArray<uint64_t>& removed);

@@ -6,9 +6,11 @@
 
 #include <utility>
 
+#include <charconv>
 #include <cstdint>
 
 #include "DatabaseCore.h"
+#include "mozilla/Base64.h"
 #include "DatabaseUtils.h"
 #include "FolderComparator.h"
 #include "mozilla/Components.h"
@@ -54,6 +56,421 @@ nsresult RollbackFolderUpdate(mozIStorageConnection* connection,
 }  // namespace
 
 NS_IMPL_ISUPPORTS(FolderDatabase, nsIFolderDatabase)
+
+CacheDiscoveryFlagWrite::CacheDiscoveryFlagWrite(
+    FolderDatabase* owner, nsCString source, nsCString generation,
+    uint64_t folder, uint64_t revision, uint32_t flags,
+    CacheDiscoveryFlagSite site)
+    : mOwner(owner),
+      mSource(std::move(source)),
+      mGeneration(std::move(generation)),
+      mFolder(folder),
+      mRevision(revision),
+      mFlags(flags),
+      mSite(site) {}
+
+CacheDiscoveryFlagWrite::CacheDiscoveryFlagWrite(
+    CacheDiscoveryFlagWrite&& other)
+    : mOwner(std::exchange(other.mOwner, nullptr)),
+      mSource(std::move(other.mSource)),
+      mGeneration(std::move(other.mGeneration)),
+      mFolder(other.mFolder),
+      mRevision(other.mRevision),
+      mFlags(other.mFlags),
+      mSite(other.mSite) {}
+
+nsresult FolderDatabase::CheckCacheOriginSource(
+    const nsACString& expectedSourceId) {
+  MOZ_TRY(RequireCurrentOwner());
+  nsCString source;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(source));
+  NS_ENSURE_TRUE(!expectedSourceId.IsEmpty() && source == expectedSourceId,
+                 NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult FolderDatabase::HasCacheImportBinding(uint64_t folderId, bool& bound) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::sConnection->CreateStatement(
+      "SELECT 1 FROM folder_cache_bindings WHERE folderId=:id"_ns,
+      getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+  return stmt->ExecuteStep(&bound);
+}
+
+nsresult FolderDatabase::ReadCacheOrigin(uint64_t folderId,
+                                         Maybe<CacheOrigin>& output) {
+  MOZ_TRY(RequireCurrentOwner());
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::sConnection->CreateStatement(
+      "SELECT value FROM folder_properties WHERE id=:id AND "
+      "name='panoramaCacheImportOrigin'"_ns,
+      getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+  bool row;
+  MOZ_TRY(stmt->ExecuteStep(&row));
+  if (!row) {
+    output = Nothing();
+    return NS_OK;
+  }
+  int32_t type;
+  MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+  NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_TEXT,
+                 NS_ERROR_FILE_CORRUPTED);
+  nsCString text;
+  MOZ_TRY(stmt->GetUTF8String(0, text));
+  nsTArray<nsCString> parts;
+  for (const auto& part : text.Split('\n'))
+    parts.AppendElement(nsCString(part));
+  NS_ENSURE_TRUE(parts.Length() == 13 && parts[0] == "1"_ns,
+                 NS_ERROR_FILE_CORRUPTED);
+  CacheOrigin value;
+  value.source = parts[1];
+  value.generation = parts[2];
+  MOZ_TRY(Base64Decode(parts[5], value.name));
+  auto number = [&](uint32_t index, uint64_t& result) -> nsresult {
+    const auto& input = parts[index];
+    const char* end = input.EndReading();
+    auto parsed = std::from_chars(input.BeginReading(), end, result);
+    NS_ENSURE_TRUE(
+        !input.IsEmpty() && parsed.ec == std::errc() && parsed.ptr == end,
+        NS_ERROR_FILE_CORRUPTED);
+    return NS_OK;
+  };
+  MOZ_TRY(number(3, value.id));
+  MOZ_TRY(number(4, value.parent));
+  uint64_t site, mask, pending, used, sealed;
+  MOZ_TRY(number(6, site));
+  MOZ_TRY(number(7, mask));
+  MOZ_TRY(number(8, value.revision));
+  MOZ_TRY(number(9, pending));
+  MOZ_TRY(number(10, used));
+  MOZ_TRY(number(11, sealed));
+  NS_ENSURE_TRUE(value.id == folderId && value.id && value.id <= INT64_MAX &&
+                     value.parent <= INT64_MAX && site <= 3 &&
+                     mask <= UINT32_MAX && !(mask & ~kCacheClientMask) &&
+                     pending <= 5 && used <= 31 && sealed <= 1 &&
+                     parts[12] == "end"_ns && !value.source.IsEmpty() &&
+                     !value.generation.IsEmpty() && value.revision &&
+                     value.revision < INT64_MAX,
+                 NS_ERROR_FILE_CORRUPTED);
+  value.birthSite = site;
+  value.explicitMask = mask;
+  value.pending = pending;
+  value.used = used;
+  value.sealed = sealed;
+  MOZ_TRY(CheckCacheOriginSource(value.source));
+  MOZ_TRY(stmt->ExecuteStep(&row));
+  NS_ENSURE_FALSE(row, NS_ERROR_FILE_CORRUPTED);
+  output = Some(std::move(value));
+  return NS_OK;
+}
+
+nsresult FolderDatabase::WriteCacheOrigin(const CacheOrigin& origin) {
+  nsCString encoded;
+  MOZ_TRY(Base64Encode(origin.name, encoded));
+  nsCString text("1\n");
+  text.Append(origin.source);
+  text.Append('\n');
+  text.Append(origin.generation);
+  for (uint64_t value : {origin.id, origin.parent}) {
+    text.Append('\n');
+    text.AppendInt(value);
+  }
+  text.Append('\n');
+  text.Append(encoded);
+  for (uint64_t value :
+       {uint64_t(origin.birthSite), uint64_t(origin.explicitMask),
+        origin.revision, uint64_t(origin.pending), uint64_t(origin.used),
+        uint64_t(origin.sealed)}) {
+    text.Append('\n');
+    text.AppendInt(value);
+  }
+  text.AppendLiteral("\nend");
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::sConnection->CreateStatement(
+      "REPLACE INTO folder_properties(id,name,value) VALUES "
+      "(:id,'panoramaCacheImportOrigin',:value)"_ns,
+      getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, origin.id));
+  MOZ_TRY(stmt->BindUTF8StringByName("value"_ns, text));
+  MOZ_TRY(stmt->Execute());
+  stmt = nullptr;
+  Maybe<CacheOrigin> stored;
+  MOZ_TRY(ReadCacheOrigin(origin.id, stored));
+  NS_ENSURE_TRUE(
+      stored && stored->source == origin.source &&
+          stored->generation == origin.generation &&
+          stored->name == origin.name && stored->parent == origin.parent &&
+          stored->birthSite == origin.birthSite &&
+          stored->explicitMask == origin.explicitMask &&
+          stored->revision == origin.revision &&
+          stored->pending == origin.pending && stored->used == origin.used &&
+          stored->sealed == origin.sealed,
+      NS_ERROR_FILE_CORRUPTED);
+  return NS_OK;
+}
+
+nsresult FolderDatabase::CheckCacheOriginLocation(const CacheOrigin& origin) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::sConnection->CreateStatement(
+      "SELECT parent,name FROM folders WHERE id=:id"_ns, getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, origin.id));
+  bool row;
+  MOZ_TRY(stmt->ExecuteStep(&row));
+  NS_ENSURE_TRUE(row, NS_ERROR_NOT_AVAILABLE);
+  int64_t parent;
+  nsCString name;
+  MOZ_TRY(stmt->GetInt64(0, &parent));
+  MOZ_TRY(stmt->GetUTF8String(1, name));
+  NS_ENSURE_TRUE(
+      parent >= 0 && uint64_t(parent) == origin.parent && name == origin.name,
+      NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult FolderDatabase::InsertCacheOrigin(uint64_t id, uint64_t parent,
+                                           const nsACString& name,
+                                           CacheDiscoveryFlagSite site) {
+  auto* core = DatabaseCore::sInstance.get();
+  if (core->mCacheOriginGeneration.IsEmpty()) return NS_OK;
+  CacheOrigin origin;
+  MOZ_TRY(core->ReadSourceIdForFolderAdmission(origin.source));
+  origin.generation = core->mCacheOriginGeneration;
+  origin.id = id;
+  origin.parent = parent;
+  origin.name = name;
+  origin.birthSite = uint32_t(site);
+  origin.revision = 1;
+  return WriteCacheOrigin(origin);
+}
+
+nsresult FolderDatabase::RecordCacheClientFlagAttempt(
+    const nsACString& expectedSourceId, uint64_t folderId,
+    uint32_t attemptedClientMask) {
+  MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
+  NS_ENSURE_TRUE(!(attemptedClientMask & ~kCacheClientMask),
+                 NS_ERROR_INVALID_ARG);
+  // Sealed/reopened or already tainted captures cannot confer new adoption.
+  // Preserve ordinary native writer behavior outside the live capture window.
+  const auto& generation = DatabaseCore::sInstance->mCacheOriginGeneration;
+  if (!attemptedClientMask || generation.IsEmpty() || mCacheOriginTainted)
+    return NS_OK;
+  bool bound;
+  MOZ_TRY(HasCacheImportBinding(folderId, bound));
+  if (bound) return NS_OK;  // Both immutable receipt policies end new adoption.
+  Maybe<CacheOrigin> origin;
+  MOZ_TRY(ReadCacheOrigin(folderId, origin));
+  if (!origin || origin->sealed || origin->generation != generation)
+    return NS_OK;
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  if (active) {
+    mCacheOriginTainted = true;
+    return NS_ERROR_IN_PROGRESS;
+  }
+  auto connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  auto apply = [&]() -> nsresult {
+    Maybe<CacheOrigin> current;
+    MOZ_TRY(ReadCacheOrigin(folderId, current));
+    NS_ENSURE_TRUE(current, NS_ERROR_NOT_AVAILABLE);
+    current->explicitMask |= attemptedClientMask;
+    NS_ENSURE_TRUE(current->revision < INT64_MAX - 1, NS_ERROR_ILLEGAL_VALUE);
+    ++current->revision;
+    MOZ_TRY(WriteCacheOrigin(*current));
+    return connection->CommitTransaction();
+  };
+  nsresult rv = apply();
+  if (NS_FAILED(rv)) {
+    mCacheOriginTainted = true;
+    return RollbackFolderUpdate(connection, rv);
+  }
+  return NS_OK;
+}
+
+nsresult FolderDatabase::ObserveCacheFolderInitialization(
+    const nsACString& expectedSourceId, uint64_t folderId,
+    uint32_t prebindExplicitClientMask) {
+  MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
+  NS_ENSURE_TRUE(folderId && MOZ_TRY(GetFolderRoot(folderId)),
+                 NS_ERROR_NOT_AVAILABLE);
+  return RecordCacheClientFlagAttempt(expectedSourceId, folderId,
+                                      prebindExplicitClientMask);
+}
+
+nsresult FolderDatabase::HasCacheDiscoveryOrigin(
+    const nsACString& expectedSourceId, uint64_t folderId, bool& tracked) {
+  MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
+  Maybe<CacheOrigin> origin;
+  MOZ_TRY(ReadCacheOrigin(folderId, origin));
+  tracked =
+      origin && !mCacheOriginTainted && !origin->sealed && !origin->pending &&
+      !origin->generation.IsEmpty() &&
+      origin->generation == DatabaseCore::sInstance->mCacheOriginGeneration;
+  return NS_OK;
+}
+
+Result<CacheDiscoveryFlagWrite, nsresult>
+FolderDatabase::BeginCacheDiscoveryFlags(const nsACString& expectedSourceId,
+                                         uint64_t folderId,
+                                         CacheDiscoveryFlagSite site) {
+  MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
+  NS_ENSURE_TRUE(uint32_t(site) <= 4, Err(NS_ERROR_INVALID_ARG));
+  Maybe<CacheOrigin> origin;
+  MOZ_TRY(ReadCacheOrigin(folderId, origin));
+  NS_ENSURE_TRUE(
+      origin && !origin->sealed && !origin->pending && !mCacheOriginTainted &&
+          !origin->generation.IsEmpty() &&
+          origin->generation == DatabaseCore::sInstance->mCacheOriginGeneration,
+      Err(NS_ERROR_NOT_AVAILABLE));
+  MOZ_TRY(CheckCacheOriginLocation(*origin));
+  uint32_t bit = 1u << uint32_t(site);
+  if (site != CacheDiscoveryFlagSite::ImapServerRefresh) {
+    NS_ENSURE_TRUE(!(origin->used & bit), Err(NS_ERROR_NOT_AVAILABLE));
+    bool permitted =
+        uint32_t(site) == origin->birthSite ||
+        (origin->birthSite ==
+             uint32_t(CacheDiscoveryFlagSite::ImapInitialBoxFlags) &&
+         site == CacheDiscoveryFlagSite::ImapInitialDefaults &&
+         (origin->used &
+          (1u << uint32_t(CacheDiscoveryFlagSite::ImapInitialBoxFlags))));
+    NS_ENSURE_TRUE(permitted, Err(NS_ERROR_NOT_AVAILABLE));
+  }
+  bool active;
+  auto connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, Err(NS_ERROR_IN_PROGRESS));
+  uint32_t flags = MOZ_TRY(GetFolderFlags(folderId));
+  NS_ENSURE_TRUE(origin->revision < INT64_MAX - 1, Err(NS_ERROR_ILLEGAL_VALUE));
+  ++origin->revision;
+  origin->pending = uint32_t(site) + 1;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = WriteCacheOrigin(*origin);
+  if (NS_SUCCEEDED(rv)) rv = connection->CommitTransaction();
+  if (NS_FAILED(rv)) {
+    mCacheOriginTainted = true;
+    return Err(RollbackFolderUpdate(connection, rv));
+  }
+  return CacheDiscoveryFlagWrite(this, nsCString(expectedSourceId),
+                                 origin->generation, folderId, origin->revision,
+                                 flags, site);
+}
+
+nsresult FolderDatabase::WriteCacheFolderFlags(uint64_t folderId,
+                                               uint32_t flags) {
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::sConnection->CreateStatement(
+      "UPDATE folders SET flags=:flags WHERE id=:id"_ns, getter_AddRefs(stmt)));
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, folderId));
+  MOZ_TRY(stmt->BindInt64ByName("flags"_ns, flags));
+  MOZ_TRY(stmt->Execute());
+  stmt = nullptr;
+  NS_ENSURE_TRUE(MOZ_TRY(GetFolderFlags(folderId)) == flags,
+                 NS_ERROR_FILE_CORRUPTED);
+  return NS_OK;
+}
+
+nsresult FolderDatabase::ApplyCacheDiscoveryFlags(
+    CacheDiscoveryFlagWrite&& write, uint32_t proposedNativeFlags,
+    uint32_t& storedFlags) {
+  NS_ENSURE_TRUE(std::exchange(write.mOwner, nullptr) == this,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckCacheOriginSource(write.mSource));
+  auto connection = DatabaseCore::sConnection;
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  uint32_t result = 0;
+  auto apply = [&]() -> nsresult {
+    Maybe<CacheOrigin> origin;
+    MOZ_TRY(ReadCacheOrigin(write.mFolder, origin));
+    NS_ENSURE_TRUE(origin && !origin->sealed && !mCacheOriginTainted &&
+                       origin->generation == write.mGeneration &&
+                       origin->generation ==
+                           DatabaseCore::sInstance->mCacheOriginGeneration &&
+                       origin->revision == write.mRevision &&
+                       origin->pending == uint32_t(write.mSite) + 1,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(CheckCacheOriginLocation(*origin));
+    uint32_t before = MOZ_TRY(GetFolderFlags(origin->id));
+    NS_ENSURE_TRUE(before == write.mFlags, NS_ERROR_NOT_AVAILABLE);
+    uint32_t preserve = write.mSite == CacheDiscoveryFlagSite::ImapServerRefresh
+                            ? kCacheClientMask
+                            : origin->explicitMask;
+    result = (proposedNativeFlags & ~preserve) | (before & preserve);
+    MOZ_TRY(WriteCacheFolderFlags(origin->id, result));
+    origin->used |= 1u << uint32_t(write.mSite);
+    origin->pending = 0;
+    NS_ENSURE_TRUE(origin->revision < INT64_MAX - 1, NS_ERROR_ILLEGAL_VALUE);
+    ++origin->revision;
+    MOZ_TRY(WriteCacheOrigin(*origin));
+    return connection->CommitTransaction();
+  };
+  nsresult rv = apply();
+  if (NS_FAILED(rv)) return RollbackFolderUpdate(connection, rv);
+  storedFlags = result;
+  return NS_OK;
+}
+
+nsresult FolderDatabase::CheckCacheProjectionOrigin(uint64_t folderId,
+                                                    CacheOrigin& output) {
+  Maybe<CacheOrigin> origin;
+  MOZ_TRY(ReadCacheOrigin(folderId, origin));
+  NS_ENSURE_TRUE(
+      origin && !origin->sealed && !origin->pending && !mCacheOriginTainted &&
+          !origin->generation.IsEmpty() &&
+          origin->generation == DatabaseCore::sInstance->mCacheOriginGeneration,
+      NS_ERROR_NOT_AVAILABLE);
+  if (origin->birthSite ==
+      uint32_t(CacheDiscoveryFlagSite::ImapInitialBoxFlags)) {
+    NS_ENSURE_TRUE(
+        origin->used &
+            (1u << uint32_t(CacheDiscoveryFlagSite::ImapInitialDefaults)),
+        NS_ERROR_NOT_AVAILABLE);
+  }
+  MOZ_TRY(CheckCacheOriginLocation(*origin));
+  output = std::move(*origin);
+  return NS_OK;
+}
+
+nsresult FolderDatabase::InsertCacheDiscoveryFolder(
+    const nsACString& expectedSourceId, uint64_t parentId,
+    const nsACString& nativeName, CacheDiscoveryFlagSite site,
+    uint64_t& folderId) {
+  MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
+  MOZ_TRY(RequireCommittedHierarchyMutation());
+  NS_ENSURE_TRUE(
+      (!parentId && site == CacheDiscoveryFlagSite::CommonRoot) ||
+          (parentId && site == CacheDiscoveryFlagSite::ImapInitialBoxFlags),
+      NS_ERROR_INVALID_ARG);
+  nsCString name = MOZ_TRY(DatabaseUtils::Normalize(nativeName));
+  NS_ENSURE_FALSE(name.IsEmpty(), NS_ERROR_INVALID_ARG);
+  uint64_t existing = MOZ_TRY(GetFolderChildNamed(parentId, name));
+  if (existing) {
+    folderId = existing;
+    return NS_OK;
+  }
+  if (parentId) MOZ_TRY(CheckFolderRelocationRecovery(parentId, false));
+  auto connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  uint64_t id;
+  nsresult rv = InsertFolderRow(parentId, name, &id, Some(site));
+  if (NS_SUCCEEDED(rv)) rv = connection->CommitTransaction();
+  if (NS_FAILED(rv)) return RollbackFolderUpdate(connection, rv);
+  folderId = id;
+  return NS_OK;
+}
+
+nsresult FolderDatabase::ReconcileCacheDiscoveryChildren(
+    const nsACString& expectedSourceId, uint64_t parentId,
+    const nsTArray<nsCString>& childNames) {
+  MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
+  bool tracked;
+  MOZ_TRY(HasCacheDiscoveryOrigin(expectedSourceId, parentId, tracked));
+  return ReconcileInternal(parentId, childNames, tracked);
+}
 
 /**
  * Lookup functions.
@@ -205,7 +622,8 @@ nsresult FolderDatabase::InternalInsertFolder(uint64_t parentId,
 // The caller owns the transaction and defers cache/output changes until commit.
 nsresult FolderDatabase::InsertFolderRow(uint64_t parentId,
                                          const nsACString& name,
-                                         uint64_t* childId) {
+                                         uint64_t* childId,
+                                         Maybe<CacheDiscoveryFlagSite> site) {
   NS_ENSURE_TRUE(parentId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   // DB has uniqueness constraint upon (parent, name).
   nsCOMPtr<mozIStorageStatement> stmt;
@@ -233,6 +651,8 @@ nsresult FolderDatabase::InsertFolderRow(uint64_t parentId,
   MOZ_TRY(stmt->ExecuteStep(&hasResult));
   NS_ENSURE_FALSE(hasResult, NS_ERROR_UNEXPECTED);
 
+  if (site)
+    MOZ_TRY(InsertCacheOrigin(uint64_t(storedId), parentId, name, *site));
   *childId = uint64_t(storedId);
   return NS_OK;
 }
@@ -329,6 +749,12 @@ nsresult FolderDatabase::DeleteFolderRows(uint64_t folderId, bool root,
 
 NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
                                         const nsTArray<nsCString>& childNames) {
+  return ReconcileInternal(parentId, childNames, false);
+}
+
+nsresult FolderDatabase::ReconcileInternal(
+    uint64_t parentId, const nsTArray<nsCString>& childNames,
+    bool cacheDiscovery) {
   // InsertFolder/UpdateName store NFC names. Normalize the complete incoming
   // list before comparing it, so equivalent spellings retain physical IDs and
   // normalization failures occur before any existing child is removed.
@@ -361,7 +787,10 @@ NS_IMETHODIMP FolderDatabase::Reconcile(uint64_t parentId,
       if (!id) {
         // As with InsertFolder, this operation cannot create root folders.
         NS_ENSURE_ARG(parentId);
-        MOZ_TRY(InsertFolderRow(parentId, name, &id));
+        MOZ_TRY(InsertFolderRow(
+            parentId, name, &id,
+            cacheDiscovery ? Some(CacheDiscoveryFlagSite::LocalInitialChild)
+                           : Nothing()));
       }
     }
     return connection->CommitTransaction();
@@ -869,6 +1298,10 @@ FolderDatabase::UpdateName(uint64_t folderId, const nsACString& newName) {
 NS_IMETHODIMP
 FolderDatabase::UpdateFlags(uint64_t folderId, uint64_t newFlags) {
   NS_ENSURE_ARG(folderId);
+  MOZ_TRY(RequireCurrentOwner());
+  nsCString source;
+  MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(source));
+  MOZ_TRY(RecordCacheClientFlagAttempt(source, folderId, kCacheClientMask));
 
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
@@ -1026,6 +1459,10 @@ nsresult FolderDatabase::GetFolderProperties(
                      NS_ERROR_FILE_CORRUPTED);
       FolderImportProperty property;
       MOZ_TRY(stmt->GetUTF8String(1, property.name));
+      if (property.name == kCacheOriginProperty) {
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        continue;
+      }
       MOZ_TRY(stmt->GetTypeOfIndex(2, &type));
       if (type == mozIStorageStatement::VALUE_TYPE_INTEGER) {
         int64_t value;
@@ -1047,6 +1484,7 @@ nsresult FolderDatabase::GetFolderProperties(
 nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
                                            nsACString& value) {
   MOZ_TRY(RequireCurrentOwner());
+  NS_ENSURE_TRUE(name != kCacheOriginProperty, NS_ERROR_INVALID_ARG);
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "GetFolderProperty"_ns,
@@ -1070,6 +1508,7 @@ nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
 nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
                                            int64_t* value) {
   MOZ_TRY(RequireCurrentOwner());
+  NS_ENSURE_TRUE(name != kCacheOriginProperty, NS_ERROR_INVALID_ARG);
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "GetFolderProperty"_ns,
@@ -1093,6 +1532,7 @@ nsresult FolderDatabase::GetFolderProperty(uint64_t id, const nsACString& name,
 nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
                                            const nsACString& value) {
   MOZ_TRY(RequireCurrentOwner());
+  NS_ENSURE_TRUE(name != kCacheOriginProperty, NS_ERROR_INVALID_ARG);
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "SetFolderProperty"_ns,
@@ -1110,6 +1550,7 @@ nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
 nsresult FolderDatabase::SetFolderProperty(uint64_t id, const nsACString& name,
                                            int64_t value) {
   MOZ_TRY(RequireCurrentOwner());
+  NS_ENSURE_TRUE(name != kCacheOriginProperty, NS_ERROR_INVALID_ARG);
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = DatabaseCore::GetStatement(
       "SetFolderProperty"_ns,

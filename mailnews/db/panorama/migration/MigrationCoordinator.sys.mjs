@@ -350,6 +350,8 @@ export async function resumeMorkBookImports(journal, profileLock, signal) {
  * @param {string} path - Original cache file covered by the complete backup.
  * @param {Map<string, {folder: nsIMsgFolder, descriptor: string}>} bindings -
  *   Every original key with its admitted canonical native cache descriptor.
+ * @param {number} [requestVersion=2] - Reconciled version2; explicit1 retains
+ *   original provenance-only plan semantics without upgrading old receipts.
  * @returns {Promise<object>} Owned source bytes/raw records and exact folder
  *   bindings/properties. This is read-only input, never an import completion.
  * @throws {Error} For unsupported paths, changed identity or incomplete mapping.
@@ -359,8 +361,133 @@ export async function prepareMorkFolderCacheImport(
   core,
   profileLock,
   path,
-  bindings
+  bindings,
+  requestVersion = 2
 ) {
+  if (requestVersion !== 1 && requestVersion !== 2) {
+    throw new Error("Unsupported native cache request version");
+  }
+  const database = core.QueryInterface(Ci.nsIDatabaseCore);
+  const input = await readBoundMorkFolderCacheInput(
+    journal,
+    core,
+    profileLock,
+    path
+  );
+  const {
+    databaseSourceId,
+    roots,
+    cache,
+    bytes,
+    identity,
+    proof,
+    checkTarget,
+    checkInput,
+  } = input;
+  if (
+    Object.prototype.toString.call(bindings) != "[object Map]" ||
+    bindings.size != cache.entries.size
+  ) {
+    throw new Error("Incomplete native folder-cache mapping");
+  }
+  const destinations = new Set();
+  const descriptors = new Set();
+  const capture = () =>
+    [...bindings].map(([key, binding]) => {
+      if (!cache.entries.has(key)) {
+        throw new Error("Unknown original folder-cache key");
+      }
+      const folder = binding.folder.QueryInterface(Ci.nsIMsgFolder);
+      const id = folder.id;
+      if (
+        !Number.isSafeInteger(id) ||
+        id <= 0 ||
+        destinations.has(id) ||
+        database.folderDB.getMsgFolderForFolder(id) !== folder
+      ) {
+        throw new Error(
+          "Folder-cache mapping has no unique current native identity"
+        );
+      }
+      const isServer = folder.isServer;
+      const storePath = admittedFolderPath(folder.filePath, roots);
+      const cachePath = isServer
+        ? storePath
+        : admittedFolderPath(folder.summaryFile, roots);
+      const descriptor = new TextDecoder("utf-8", {
+        fatal: true,
+        ignoreBOM: true,
+      }).decode(
+        MailStringUtils.byteStringToUint8Array(
+          new FileUtils.File(cachePath).persistentDescriptor
+        )
+      );
+      if (descriptor !== binding.descriptor || descriptors.has(descriptor)) {
+        throw new Error(
+          "Folder-cache canonical descriptor changed or collides"
+        );
+      }
+      destinations.add(id);
+      descriptors.add(descriptor);
+      return {
+        originalKey: key,
+        ...(requestVersion === 2
+          ? { originalSummaryPath: isServer ? "" : cachePath }
+          : {}),
+        id,
+        isServer,
+        descriptor,
+        cachePath,
+        storePath,
+        uri: folder.URI,
+        protocol: folder.incomingServerType,
+        storeType: folder.msgStore.storeType,
+      };
+    });
+  const folders = capture();
+  for (const folder of folders) {
+    for (const [file, types] of [
+      [folder.cachePath, [folder.isServer ? "directory" : "regular"]],
+      [folder.storePath, ["regular", "directory"]],
+    ]) {
+      if (
+        (await IOUtils.exists(file)) &&
+        !types.includes((await IOUtils.stat(file)).type)
+      ) {
+        throw new Error("Unsupported native folder-cache path type");
+      }
+    }
+  }
+  await checkInput();
+  destinations.clear();
+  descriptors.clear();
+  if (JSON.stringify(capture()) !== JSON.stringify(folders)) {
+    throw new Error("Native folder-cache bindings changed during preparation");
+  }
+  checkTarget();
+  return {
+    databaseSourceId,
+    source: identity,
+    bytes,
+    records: structuredClone(cache.source),
+    ...(requestVersion === 2 ? { requestVersion, proof } : {}),
+    folders: folders.map(folder => bindMorkFolderCacheRecord(folder, cache)),
+  };
+}
+
+/**
+ * Verifies the selected cache bytes and complete backup without live bindings.
+ * Committed version2 audits use the saved original paths after rename/retirement.
+ * This read never grants authority to apply cache fields.
+ *
+ * @param {MigrationJournal} journal - Open journal under the selected profile lock.
+ * @param {nsIDatabaseCore} core - Current native database incarnation.
+ * @param {nsIProfileLock} profileLock - Held selected profile lock.
+ * @param {string} path - Original backed-up cache path.
+ * @returns {Promise<object>} Original bytes, parsed cells, proof and recheck callback.
+ * @throws {Error} For changed inputs, backup, lock or database identity.
+ */
+async function readBoundMorkFolderCacheInput(journal, core, profileLock, path) {
   if (AppConstants.platform == "win") {
     throw new Error(
       "Windows cache migration requires native reparse admission"
@@ -436,118 +563,77 @@ export async function prepareMorkFolderCacheImport(
       "Migration cache source is not covered by the verified backup"
     );
   }
-  if (
-    Object.prototype.toString.call(bindings) != "[object Map]" ||
-    bindings.size != cache.entries.size
-  ) {
-    throw new Error("Incomplete native folder-cache mapping");
+  const manifestInfo = await IOUtils.stat(backup.path);
+  if (manifestInfo.type != "regular") {
+    throw new Error("Migration cache backup manifest is not a regular file");
   }
-  const destinations = new Set();
-  const descriptors = new Set();
-  const capture = () =>
-    [...bindings].map(([key, binding]) => {
-      if (!cache.entries.has(key)) {
-        throw new Error("Unknown original folder-cache key");
-      }
-      const folder = binding.folder.QueryInterface(Ci.nsIMsgFolder);
-      const id = folder.id;
-      if (
-        !Number.isSafeInteger(id) ||
-        id <= 0 ||
-        destinations.has(id) ||
-        database.folderDB.getMsgFolderForFolder(id) !== folder
-      ) {
-        throw new Error(
-          "Folder-cache mapping has no unique current native identity"
-        );
-      }
-      const isServer = folder.isServer;
-      const storePath = admittedFolderPath(folder.filePath, roots);
-      const cachePath = isServer
-        ? storePath
-        : admittedFolderPath(folder.summaryFile, roots);
-      const descriptor = new TextDecoder("utf-8", {
-        fatal: true,
-        ignoreBOM: true,
-      }).decode(
-        MailStringUtils.byteStringToUint8Array(
-          new FileUtils.File(cachePath).persistentDescriptor
-        )
-      );
-      if (descriptor !== binding.descriptor || descriptors.has(descriptor)) {
-        throw new Error(
-          "Folder-cache canonical descriptor changed or collides"
-        );
-      }
-      destinations.add(id);
-      descriptors.add(descriptor);
-      return {
-        originalKey: key,
-        id,
-        isServer,
-        descriptor,
-        cachePath,
-        storePath,
-        uri: folder.URI,
-        protocol: folder.incomingServerType,
-        storeType: folder.msgStore.storeType,
-      };
-    });
-  const folders = capture();
-  for (const folder of folders) {
-    for (const [file, types] of [
-      [folder.cachePath, [folder.isServer ? "directory" : "regular"]],
-      [folder.storePath, ["regular", "directory"]],
-    ]) {
-      if (
-        (await IOUtils.exists(file)) &&
-        !types.includes((await IOUtils.stat(file)).type)
-      ) {
-        throw new Error("Unsupported native folder-cache path type");
-      }
+  const proof = {
+    profilePath: state.profilePath,
+    manifest: {
+      path: backup.path,
+      size: manifestInfo.size,
+      sha256: backup.sha256,
+    },
+  };
+  const checkInput = async () => {
+    checkTarget();
+    if (
+      admittedFolderPath(original, roots) !== identity.path ||
+      (await IOUtils.computeHexDigest(identity.path, "sha256")) !==
+        identity.sha256 ||
+      (await IOUtils.computeHexDigest(backup.path, "sha256")) !== backup.sha256
+    ) {
+      throw new Error("Migration cache input changed during preparation");
     }
-  }
-  checkTarget();
-  if (
-    admittedFolderPath(original, roots) !== identity.path ||
-    (await IOUtils.computeHexDigest(identity.path, "sha256")) !==
-      identity.sha256 ||
-    (await IOUtils.computeHexDigest(backup.path, "sha256")) !== backup.sha256
-  ) {
-    throw new Error("Migration cache input changed during preparation");
-  }
-  destinations.clear();
-  descriptors.clear();
-  if (JSON.stringify(capture()) !== JSON.stringify(folders)) {
-    throw new Error("Native folder-cache bindings changed during preparation");
-  }
-  checkTarget();
+    if ((await IOUtils.stat(backup.path)).size !== proof.manifest.size) {
+      throw new Error("Migration cache backup manifest size changed");
+    }
+    checkTarget();
+  };
+  await checkInput();
   return {
     databaseSourceId,
-    source: identity,
+    roots,
+    cache,
     bytes,
-    records: structuredClone(cache.source),
-    folders: folders.map(folder => {
-      const entry = cache.entries.get(folder.originalKey);
-      return {
-        ...folder,
-        sourceKey: entry.sourceKey,
-        properties: [...entry.properties].map(([name, text]) => ({
-          name,
-          text,
-          ...(typeof entry.values[name] == "number"
-            ? { integer: entry.values[name] }
-            : {}),
-        })),
-      };
-    }),
+    identity,
+    proof,
+    checkTarget,
+    checkInput,
+  };
+}
+
+/**
+ * Copies one original cache row onto its retained physical destination binding.
+ *
+ * @param {object} folder - Native folder binding.
+ * @param {object} cache - Parsed complete original cache.
+ * @returns {object} Binding with exact original row key and presence-sensitive cells.
+ * @throws {Error} When a retained original key no longer exists.
+ */
+function bindMorkFolderCacheRecord(folder, cache) {
+  const entry = cache.entries.get(folder.originalKey);
+  if (!entry) {
+    throw new Error("Cache snapshot differs from the journal plan");
+  }
+  return {
+    ...folder,
+    sourceKey: entry.sourceKey,
+    properties: [...entry.properties].map(([name, text]) => ({
+      name,
+      text,
+      ...(typeof entry.values[name] == "number"
+        ? { integer: entry.values[name] }
+        : {}),
+    })),
   };
 }
 
 /**
  * Applies supported cache cells through native SQL receipts, then checkpoints.
  * The caller retains the selected profile lock and quiesces source/target writers.
- * Native-authoritative flags/counts/sizes/display remain provenance, not overrides.
+ * Version2 reconciles eligible fields against native origin and source proof.
+ * Committed version1 plans retain their original provenance-only semantics.
  *
  * @param {MigrationJournal} journal - Explicit version5 cache plan.
  * @param {nsIDatabaseCore} core - Actual native cache receiver.
@@ -588,18 +674,62 @@ export async function resumeMorkCacheImports(
   try {
     for (const cache of journal.state.caches) {
       await checkCancelled();
+      if (cache.requestVersion === 2) {
+        const input = await readBoundMorkFolderCacheInput(
+          journal,
+          database,
+          profileLock,
+          cache.path
+        );
+        if (input.cache.entries.size !== cache.folders.length) {
+          throw new Error("Cache snapshot differs from the journal plan");
+        }
+        const current = {
+          ...cache,
+          ...input.identity,
+          databaseSourceId: input.databaseSourceId,
+          proof: input.proof,
+          folders: cache.folders.map(folder =>
+            bindMorkFolderCacheRecord(folder, input.cache)
+          ),
+        };
+        if (
+          JSON.stringify(createMorkFolderCacheRequest(current)) !==
+            JSON.stringify(createMorkFolderCacheRequest(cache)) ||
+          JSON.stringify(getMorkFolderCacheCells(current.folders)) !==
+            JSON.stringify(getMorkFolderCacheCells(cache.folders))
+        ) {
+          throw new Error("Cache snapshot differs from the journal plan");
+        }
+        const receipt = database.getFolderCacheImportReceipt(
+          createMorkFolderCacheRequest(cache)
+        );
+        if (receipt !== null) {
+          const checked = validateMorkFolderCacheReceipt(cache, receipt);
+          await input.checkInput();
+          await journal.beginCacheImport(cache.id);
+          await journal.recordCacheImport(cache.id, checked);
+          await checkCancelled();
+          continue;
+        }
+        if (cache.state == "imported") {
+          throw new Error("Native database lost a committed cache receipt");
+        }
+      }
       const snapshot = await prepareMorkFolderCacheImport(
         journal,
         database,
         profileLock,
         cache.path,
-        await resolveBindings(cache.id)
+        await resolveBindings(cache.id),
+        cache.requestVersion ?? 1
       );
       const current = {
         ...cache,
         ...snapshot.source,
         folders: snapshot.folders,
         databaseSourceId: snapshot.databaseSourceId,
+        ...(snapshot.requestVersion === 2 ? { proof: snapshot.proof } : {}),
       };
       const request = createMorkFolderCacheRequest(cache);
       const actual = createMorkFolderCacheRequest(current);

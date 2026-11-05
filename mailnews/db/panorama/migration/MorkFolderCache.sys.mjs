@@ -240,10 +240,22 @@ const CACHE_AUTHORITY = new Set([
 /**
  * Builds the supported native cache envelope from a retained journal unit.
  *
+ * Version2 binds the verified backup and original physical input paths.
+ * Units without `requestVersion` retain their exact version1 envelope.
+ *
  * @param {object} unit - Exact source identity and complete physical bindings.
- * @returns {object} Version1 request; source bytes are read by native code.
+ * @returns {object} Native request; native code reads the source and proof files.
+ * @throws {Error} For invalid identity, proof, paths or duplicate bindings.
  */
 export function createMorkFolderCacheRequest(unit) {
+  const version = unit.requestVersion === undefined ? 1 : unit.requestVersion;
+  if (version !== 1 && version !== 2) {
+    throw new Error("Unsupported native cache request version");
+  }
+  const proof = version === 2 ? cacheReconciliationProof(unit.proof) : null;
+  if (version === 1 && unit.proof !== undefined) {
+    throw new Error("Cache proof requires version2");
+  }
   for (const value of [unit.id, unit.token, unit.databaseSourceId, unit.path]) {
     if (typeof value != "string" || !value || value.includes("\0")) {
       throw new Error("Invalid cache import identity");
@@ -269,6 +281,11 @@ export function createMorkFolderCacheRequest(unit) {
       "storePath",
     ].map(name => [name, new Set()])
   );
+  const fields =
+    version === 2
+      ? [...CACHE_BINDING_FIELDS, "originalSummaryPath"]
+      : CACHE_BINDING_FIELDS;
+  const originals = new Set();
   const folders = unit.folders.map(folder => {
     for (const name of CACHE_BINDING_FIELDS) {
       const value = folder[name];
@@ -301,17 +318,66 @@ export function createMorkFolderCacheRequest(unit) {
     ) {
       throw new Error("Unsupported cache folder binding");
     }
-    return Object.fromEntries(
-      CACHE_BINDING_FIELDS.map(name => [name, folder[name]])
-    );
+    if (version === 2) {
+      if (
+        typeof folder.originalSummaryPath != "string" ||
+        folder.originalSummaryPath.includes("\0") ||
+        (folder.isServer
+          ? folder.originalSummaryPath !== ""
+          : !PathUtils.isAbsolute(folder.originalSummaryPath) ||
+            folder.originalSummaryPath !== folder.cachePath ||
+            originals.has(folder.originalSummaryPath))
+      ) {
+        throw new Error("Invalid or duplicate original cache input path");
+      }
+      if (!folder.isServer) {
+        originals.add(folder.originalSummaryPath);
+      }
+    }
+    return Object.fromEntries(fields.map(name => [name, folder[name]]));
   });
   return {
-    version: 1,
+    version,
     token: unit.token,
     sourceId: unit.id,
     databaseSourceId: unit.databaseSourceId,
     source: { path: unit.path, size: unit.size, sha256: unit.sha256 },
+    ...(proof ? { proof } : {}),
     folders,
+  };
+}
+
+/**
+ * Copies the immutable backup identity used by version2 reconciliation.
+ * Native code verifies the manifest bytes and complete original-file inventory.
+ *
+ * @param {object} proof - Selected profile and verified manifest identity.
+ * @returns {object} Owned profile path and manifest path, byte size and SHA256.
+ * @throws {Error} For an incomplete or nonabsolute proof identity.
+ */
+function cacheReconciliationProof(proof) {
+  const manifest = proof?.manifest;
+  if (
+    typeof proof?.profilePath != "string" ||
+    !PathUtils.isAbsolute(proof.profilePath) ||
+    proof.profilePath.includes("\0") ||
+    typeof manifest?.path != "string" ||
+    !PathUtils.isAbsolute(manifest.path) ||
+    manifest.path.includes("\0") ||
+    !Number.isSafeInteger(manifest.size) ||
+    manifest.size <= 0 ||
+    manifest.size >= 0xffffffff ||
+    !/^[a-f0-9]{64}$/.test(manifest.sha256)
+  ) {
+    throw new Error("Invalid native cache reconciliation proof");
+  }
+  return {
+    profilePath: proof.profilePath,
+    manifest: {
+      path: manifest.path,
+      size: manifest.size,
+      sha256: manifest.sha256,
+    },
   };
 }
 
@@ -379,8 +445,11 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
   const expected = createMorkFolderCacheRequest(unit);
   const identity = receipt?.identity;
   if (
-    identity?.version !== 1 ||
-    identity.policy !== "native-authoritative-v1" ||
+    identity?.version !== expected.version ||
+    identity.policy !==
+      (expected.version === 2
+        ? "native-reconciled-selected-v2"
+        : "native-authoritative-v1") ||
     identity.token !== unit.token ||
     identity.sourceId !== unit.id ||
     identity.databaseSourceId !== unit.databaseSourceId ||
@@ -390,6 +459,13 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
     !Array.isArray(receipt.cells)
   ) {
     throw new Error("Invalid native cache receipt identity");
+  }
+  if (
+    expected.version === 2 &&
+    JSON.stringify(cacheReconciliationProof(identity.proof)) !==
+      JSON.stringify(expected.proof)
+  ) {
+    throw new Error("Native cache receipt proof changed");
   }
   const actual = createMorkFolderCacheRequest({
     ...unit,
@@ -407,7 +483,10 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
   for (const cell of receipt.cells) {
     const folder = byFolder.get(cell.id);
     let dispositions;
-    if (cell.name == "key") {
+    if (expected.version === 2) {
+      validateReconciledCacheCell(cell);
+      dispositions = [cell.disposition];
+    } else if (cell.name == "key") {
       dispositions = ["binding"];
     } else if (CACHE_AUTHORITY.has(cell.name)) {
       dispositions = ["native-authoritative"];
@@ -430,4 +509,111 @@ export function validateMorkFolderCacheReceipt(unit, receipt) {
     throw new Error("Native cache receipt cells changed");
   }
   return structuredClone(receipt);
+}
+
+/**
+ * Checks the closed native version2 field disposition and typed projection.
+ * Raw cells are compared separately against every original source cell.
+ *
+ * @param {object} cell - One actual native receipt cell.
+ * @throws {Error} For an invalid alias, value, mask or unresolved field.
+ */
+function validateReconciledCacheCell(cell) {
+  const pending =
+    cell.name == "pendingMsgs" || cell.name == "pendingUnreadMsgs";
+  let target = cell.name;
+  if (pending) {
+    target =
+      cell.name == "pendingMsgs" ? "totPendingMsgs" : "unreadPendingMsgs";
+  }
+  const integer = Object.hasOwn(cell, "nativeInteger");
+  const text = Object.hasOwn(cell, "nativeText");
+  const mask = Object.hasOwn(cell, "eligibleMask");
+  if (
+    cell.target !== target ||
+    (integer && !Number.isSafeInteger(cell.nativeInteger)) ||
+    (text && typeof cell.nativeText != "string")
+  ) {
+    throw new Error("Invalid native cache field projection");
+  }
+  let dispositions;
+  if (cell.name == "key") {
+    dispositions = ["binding"];
+    if (integer || text || mask) {
+      throw new Error("Invalid native cache binding projection");
+    }
+  } else {
+    if (integer === text || (cell.name != "flags" && mask)) {
+      throw new Error("Invalid native cache field value");
+    }
+    if (cell.name == "flags") {
+      dispositions = ["applied", "existing", "source-authoritative"];
+      validateReconciledCacheFlags(cell);
+    } else if (cell.name == "totalMsgs" || cell.name == "totalUnreadMsgs") {
+      dispositions = ["native-authoritative"];
+      if (
+        !integer ||
+        cell.nativeInteger < 0 ||
+        cell.nativeInteger > 0x7fffffff
+      ) {
+        throw new Error("Invalid native cache count projection");
+      }
+    } else if (cell.name == "folderName") {
+      dispositions = ["native-authoritative"];
+      if (!text) {
+        throw new Error("Invalid native cache name projection");
+      }
+    } else if (pending) {
+      dispositions = ["existing", "applied", "native-authoritative"];
+      if (
+        !integer ||
+        cell.nativeInteger < -0x80000000 ||
+        cell.nativeInteger > 0x7fffffff
+      ) {
+        throw new Error("Invalid native cache pending projection");
+      }
+    } else if (cell.name == "folderSize" || cell.name == "expungedBytes") {
+      dispositions = ["existing", "applied-native"];
+      if (!integer || cell.nativeInteger < 0) {
+        throw new Error("Invalid native cache accounting projection");
+      }
+    } else {
+      dispositions = ["existing", "applied"];
+      if (
+        cell.disposition == "applied" &&
+        (Object.hasOwn(cell, "integer")
+          ? !integer || cell.nativeInteger !== cell.integer
+          : !text || cell.nativeText !== cell.text)
+      ) {
+        throw new Error("Native cache applied value differs from the source");
+      }
+    }
+  }
+  if (!dispositions.includes(cell.disposition)) {
+    throw new Error("Invalid or unreconciled native cache cell disposition");
+  }
+}
+
+/**
+ * Checks the allowed native client mask and its exact applied flag bits.
+ *
+ * @param {object} cell - The version2 flags cell with its actual committed word.
+ * @throws {Error} For a noninteger word, invalid mask or mismatched projection.
+ */
+function validateReconciledCacheFlags(cell) {
+  const clientMask = 0xa8000010;
+  if (
+    !Object.hasOwn(cell, "nativeInteger") ||
+    cell.nativeInteger < 0 ||
+    cell.nativeInteger > 0xffffffff ||
+    !Number.isInteger(cell.eligibleMask) ||
+    cell.eligibleMask < 0 ||
+    cell.eligibleMask > 0xffffffff ||
+    (cell.eligibleMask & ~clientMask) !== 0 ||
+    (cell.eligibleMask !== 0) !== (cell.disposition == "applied") ||
+    (cell.nativeInteger & cell.eligibleMask) >>> 0 !==
+      (cell.integer & cell.eligibleMask) >>> 0
+  ) {
+    throw new Error("Invalid native cache flags projection");
+  }
 }

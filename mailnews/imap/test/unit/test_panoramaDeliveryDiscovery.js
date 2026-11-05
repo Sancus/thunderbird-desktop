@@ -125,6 +125,75 @@ function discoveredChild(parent, name, uri) {
   return folder;
 }
 
+// The independently selected cache policy permits only these client bits.
+const cacheClientFlags =
+  (Ci.nsMsgFolderFlags.Elided |
+    Ci.nsMsgFolderFlags.Offline |
+    Ci.nsMsgFolderFlags.CheckNew |
+    Ci.nsMsgFolderFlags.Favorite) >>>
+  0;
+
+/**
+ * Reads the committed native word without consulting the folder wrapper.
+ *
+ * @param {nsIMsgFolder} folder - The actual physical native folder.
+ * @returns {number} The unsigned committed folder flags.
+ */
+function storedFolderFlags(folder) {
+  const statement = fixture.core.connectionForTests.createStatement(
+    "SELECT flags FROM folders WHERE id = :id"
+  );
+  try {
+    statement.params.id = folder.id;
+    Assert.ok(statement.executeStep(), "The physical folder row exists");
+    const flags = statement.getInt64(0) >>> 0;
+    Assert.ok(!statement.executeStep(), "The physical ID has one row");
+    return flags;
+  } finally {
+    statement.finalize();
+  }
+}
+
+/**
+ * Reads the native-only origin record; this test never creates an origin grant.
+ *
+ * @param {nsIMsgFolder} folder - The actual physical native folder.
+ * @returns {{ explicitClientMask: number }} The native client-choice veto.
+ */
+function storedDiscoveryOrigin(folder) {
+  const statement = fixture.core.connectionForTests.createStatement(
+    "SELECT value FROM folder_properties " +
+      "WHERE id = :id AND name = 'panoramaCacheImportOrigin'"
+  );
+  try {
+    statement.params.id = folder.id;
+    Assert.ok(statement.executeStep(), "Actual discovery persisted its origin");
+    const fields = statement.getUTF8String(0).split("\n");
+    Assert.equal(
+      fields.length,
+      13,
+      "The native origin has its complete v1 shape"
+    );
+    Assert.equal(fields[0], "1");
+    Assert.equal(fields[3], String(folder.id));
+    Assert.equal(fields[4], String(folder.parent.id));
+    Assert.equal(fields[12], "end");
+    Assert.ok(fields[1], "The native origin binds its database source");
+    Assert.ok(fields[2], "The native origin binds its birth generation");
+    Assert.ok(
+      /^\d+$/.test(fields[7]),
+      "The explicit veto is a literal integer"
+    );
+    const explicitClientMask = Number(fields[7]);
+    Assert.ok(Number.isSafeInteger(explicitClientMask));
+    Assert.equal(explicitClientMask >>> 0, explicitClientMask);
+    Assert.ok(!statement.executeStep(), "The folder has one origin record");
+    return { explicitClientMask };
+  } finally {
+    statement.finalize();
+  }
+}
+
 async function test_discoversChild() {
   seedMailboxes(false);
   const { rootFolder, incomingServer, account, core, daemon } = fixture;
@@ -292,6 +361,28 @@ async function test_discoversNestedChild() {
   info('DELIVERY_PHASE {"phase":"imap-discovery-nested-verified"}');
 }
 
+/**
+ * Checks genuine discovery history without changing the native origin record.
+ *
+ * @param {nsIMsgFolder[]} folders - Physical folders reached by normal LIST.
+ * @param {string} stage - The completed read or discovery boundary.
+ */
+function assertDiscoveryHasNoClientChoice(folders, stage) {
+  Assert.equal(
+    cacheClientFlags,
+    0xa8000010,
+    "The complete client mask is exact"
+  );
+  for (const folder of folders) {
+    Assert.equal(
+      (storedDiscoveryOrigin(folder).explicitClientMask & cacheClientFlags) >>>
+        0,
+      0,
+      stage + ": no explicit client choice is inferred"
+    );
+  }
+}
+
 async function test_repeatedDiscoveryPreservesIdentity() {
   seedMailboxes(true);
   await discover();
@@ -309,7 +400,13 @@ async function test_repeatedDiscoveryPreservesIdentity() {
   const ids = fixture.core ? [parent.id, child.id] : null;
   const rootChildren = root.subFolders;
   const nestedChildren = parent.subFolders;
+  if (fixture.core) {
+    assertDiscoveryHasNoClientChoice([parent, child], "Initial real LIST");
+  }
   const heldDatabase = fixture.core ? child.msgDatabase : null;
+  if (fixture.core) {
+    assertDiscoveryHasNoClientChoice([parent, child], "Open native database");
+  }
   info('DELIVERY_PHASE {"phase":"imap-discovery-repeat-ready"}');
   await discover();
   Assert.equal(
@@ -337,6 +434,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     "Repeated discovery adds no nested children"
   );
   if (ids) {
+    assertDiscoveryHasNoClientChoice([parent, child], "Repeated real LIST");
     Assert.strictEqual(
       child.msgDatabase,
       heldDatabase,
@@ -350,6 +448,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
       false,
       "LIST releases only the metadata database it opened"
     );
+    assertDiscoveryHasNoClientChoice([parent, child], "Closed-database LIST");
     Assert.deepEqual(
       [parent.id, child.id],
       ids,
@@ -359,6 +458,40 @@ async function test_repeatedDiscoveryPreservesIdentity() {
   PanoramaDelivery.assertFolder(parent, fixture.lane);
   PanoramaDelivery.assertFolder(child, fixture.lane);
   if (fixture.core) {
+    for (const folder of [parent, child]) {
+      const origin = storedDiscoveryOrigin(folder);
+      Assert.equal((origin.explicitClientMask & cacheClientFlags) >>> 0, 0);
+      folder.setFlag(cacheClientFlags);
+      folder.clearFlag(cacheClientFlags);
+      folder.flags = 0;
+      folder.flags = 0;
+      Assert.equal((folder.flags & cacheClientFlags) >>> 0, 0);
+      Assert.equal((storedFolderFlags(folder) & cacheClientFlags) >>> 0, 0);
+      Assert.equal(
+        (storedDiscoveryOrigin(folder).explicitClientMask &
+          cacheClientFlags) >>>
+          0,
+        cacheClientFlags,
+        "An equal whole-word zero is still an explicit client choice"
+      );
+    }
+    await discover();
+    for (const folder of [parent, child]) {
+      Assert.equal((folder.flags & cacheClientFlags) >>> 0, 0);
+      Assert.equal((storedFolderFlags(folder) & cacheClientFlags) >>> 0, 0);
+      folder.ForceDBClosed();
+      Assert.equal(
+        (folder.msgDatabase.dBFolderInfo.flags & cacheClientFlags) >>> 0,
+        0
+      );
+      Assert.equal(
+        (storedDiscoveryOrigin(folder).explicitClientMask &
+          cacheClientFlags) >>>
+          0,
+        cacheClientFlags,
+        "LIST and metadata reopen cannot reset the explicit-zero veto"
+      );
+    }
     const parentPath = parent.filePath;
     const childPath = child.filePath.path;
     const unsupportedPath = parentPath.clone();
@@ -442,6 +575,9 @@ async function test_repeatedDiscoveryPreservesIdentity() {
       "@mozilla.org/mail/folder-factory;1?name=imap",
       () => {
         factoryCalls++;
+        // The sibling's inert discovery ticket grants this callback nothing.
+        parent.flags = 0;
+        child.flags = 0;
         throw Components.Exception(
           "Discovery factory failure",
           Cr.NS_ERROR_FAILURE
@@ -484,6 +620,96 @@ async function test_repeatedDiscoveryPreservesIdentity() {
     Assert.equal(completed.id, pendingId);
     Assert.equal(completed.onlineName, "DeliveryParent/FactoryRetry");
     Assert.deepEqual([parent.id, child.id], ids);
+    Assert.equal((parent.flags & cacheClientFlags) >>> 0, 0);
+    Assert.equal((child.flags & cacheClientFlags) >>> 0, 0);
+
+    let callbackWrites = 0;
+    const callbackURI = parent.URI + "/CallbackChoice";
+    const listener = {
+      onFolderIntPropertyChanged(folder, property) {
+        if (
+          folder.URI == callbackURI &&
+          property == "FolderFlag" &&
+          callbackWrites == 0
+        ) {
+          callbackWrites++;
+          // This runs synchronously after the box ticket was consumed. Neither
+          // this folder nor a sibling may inherit permission for client bits.
+          folder.flags = 0;
+          parent.flags = 0;
+        }
+      },
+      QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+    };
+    MailServices.mailSession.AddFolderListener(
+      listener,
+      Ci.nsIFolderListener.intPropertyChanged
+    );
+    try {
+      fixture.daemon.createMailbox("DeliveryParent/CallbackChoice", {
+        subscribed: true,
+      });
+      await discover();
+      Assert.equal(callbackWrites, 1, "A real initial flag callback ran once");
+    } finally {
+      MailServices.mailSession.RemoveFolderListener(listener);
+    }
+    const callbackFolder = discoveredChild(
+      parent,
+      "CallbackChoice",
+      callbackURI
+    );
+    const callbackId = callbackFolder.id;
+    for (const folder of [callbackFolder, parent]) {
+      Assert.equal((folder.flags & cacheClientFlags) >>> 0, 0);
+      Assert.equal((storedFolderFlags(folder) & cacheClientFlags) >>> 0, 0);
+      Assert.equal(
+        (storedDiscoveryOrigin(folder).explicitClientMask &
+          cacheClientFlags) >>>
+          0,
+        cacheClientFlags
+      );
+    }
+    await discover();
+    Assert.strictEqual(parent.getChildNamed("CallbackChoice"), callbackFolder);
+    Assert.equal(callbackFolder.id, callbackId);
+    Assert.equal((callbackFolder.flags & cacheClientFlags) >>> 0, 0);
+    Assert.equal(
+      (storedFolderFlags(callbackFolder) & cacheClientFlags) >>> 0,
+      0
+    );
+
+    const explicitFolder = root.addSubfolder("ExplicitCreation");
+    const explicitId = explicitFolder.id;
+    explicitFolder.flags = 0;
+    const originQuery = fixture.core.connectionForTests.createStatement(
+      "SELECT value FROM folder_properties " +
+        "WHERE id = :id AND name = 'panoramaCacheImportOrigin'"
+    );
+    try {
+      originQuery.params.id = explicitId;
+      Assert.ok(
+        !originQuery.executeStep(),
+        "Arbitrary public creation cannot manufacture discovery origin"
+      );
+    } finally {
+      originQuery.finalize();
+    }
+    fixture.daemon.createMailbox("ExplicitCreation", { subscribed: true });
+    await discover();
+    Assert.strictEqual(root.getChildNamed("ExplicitCreation"), explicitFolder);
+    Assert.equal(explicitFolder.id, explicitId);
+    Assert.equal((explicitFolder.flags & cacheClientFlags) >>> 0, 0);
+    Assert.equal(
+      (storedFolderFlags(explicitFolder) & cacheClientFlags) >>> 0,
+      0
+    );
+    explicitFolder.ForceDBClosed();
+    Assert.equal(
+      (explicitFolder.msgDatabase.dBFolderInfo.flags & cacheClientFlags) >>> 0,
+      0,
+      "A real later LIST cannot treat the existing public zero as absent"
+    );
   }
   info('DELIVERY_PHASE {"phase":"imap-discovery-repeat-verified"}');
 }
@@ -547,6 +773,37 @@ async function test_discoveryStoresOnlineName() {
     Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
     Assert.equal(child.id, id);
     Assert.equal(child.onlineName, "DeliveryParent/DeliveryChild");
+    const beforeFlags = child.flags;
+    const beforeStoredFlags = storedFolderFlags(child);
+    connection.executeSimpleSQL(
+      "CREATE TEMP TRIGGER fail_discovery_flags BEFORE UPDATE OF flags ON folders " +
+        "WHEN OLD.id = " +
+        id +
+        " BEGIN SELECT RAISE(ABORT, 'discovery flag failure'); END"
+    );
+    try {
+      await Assert.rejects(
+        discover(),
+        error => error.message == String(Cr.NS_ERROR_STORAGE_CONSTRAINT),
+        "A checked discovery flag write preserves its actual native failure"
+      );
+      Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
+      Assert.equal(child.id, id);
+      Assert.equal(child.filePath.path, path);
+      Assert.equal(
+        child.flags,
+        beforeFlags,
+        "Failed flags are not published warm"
+      );
+      Assert.equal(storedFolderFlags(child), beforeStoredFlags);
+    } finally {
+      connection.executeSimpleSQL("DROP TRIGGER fail_discovery_flags");
+    }
+    await discover();
+    Assert.strictEqual(parent.getChildNamed("DeliveryChild"), child);
+    Assert.equal(child.id, id);
+    Assert.equal(child.flags, beforeFlags);
+    Assert.equal(storedFolderFlags(child), beforeStoredFlags);
     Assert.throws(
       () =>
         fixture.incomingServer

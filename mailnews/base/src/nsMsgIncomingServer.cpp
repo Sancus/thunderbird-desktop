@@ -43,8 +43,8 @@
 #include "nsIUUIDGenerator.h"
 #include "nsIArray.h"
 #ifdef MOZ_PANORAMA
-#  include "nsIDatabaseCore.h"
-#  include "nsIFolderDatabase.h"
+#  include "DatabaseCore.h"
+#  include "FolderDatabase.h"
 #endif  // MOZ_PANORAMA
 #include "nsIMsgLocalMailFolder.h"
 
@@ -402,16 +402,41 @@ nsresult nsMsgIncomingServer::CreateLocalFolder(const nsACString& folderName,
   nsCOMPtr<nsIMsgFolder> rootFolder;
   nsresult rv = GetRootFolder(getter_AddRefs(rootFolder));
   NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  const bool initialDefault =
+      StaticPrefs::mail_panorama_enabled_AtStartup() &&
+      nsMsgDBFolder::IsLocalCacheDefaultRole(folderName, flag);
+  auto finishDefault = [&]() -> nsresult {
+    if (initialDefault) {
+      return static_cast<nsMsgDBFolder*>(rootFolder.get())
+          ->InitializeLocalCacheDefaultChild(folderName, flag);
+    }
+    return NS_OK;
+  };
+#endif
   nsCOMPtr<nsIMsgFolder> child;
-  rootFolder->GetChildNamed(folderName, getter_AddRefs(child));
-  if (child) return NS_OK;
-  rootFolder->GetFolderWithFlags(flag, getter_AddRefs(child));
-  if (child) return NS_OK;
+  rv = rootFolder->GetChildNamed(folderName, getter_AddRefs(child));
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (child) {
+#ifdef MOZ_PANORAMA
+    return finishDefault();
+#else
+    return NS_OK;
+#endif
+  }
+  rv = rootFolder->GetFolderWithFlags(flag, getter_AddRefs(child));
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (child) return NS_OK;  // Preserve an existing alternate-name default.
   nsCOMPtr<nsIMsgLocalMailFolder> localRootFolder =
       do_QueryInterface(rootFolder);
   NS_ENSURE_TRUE(localRootFolder, NS_ERROR_FAILURE);
-  return localRootFolder->CreateLocalSubfolder(folderName,
-                                               getter_AddRefs(child));
+  rv = localRootFolder->CreateLocalSubfolder(folderName, getter_AddRefs(child));
+  NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  return finishDefault();
+#else
+  return NS_OK;
+#endif
 }
 
 nsresult nsMsgIncomingServer::CreateRootFolder() {
@@ -423,17 +448,18 @@ nsresult nsMsgIncomingServer::CreateRootFolder() {
 
 #ifdef MOZ_PANORAMA
   if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
-    nsCOMPtr<nsIDatabaseCore> database = components::DatabaseCore::Service();
-    nsCOMPtr<nsIFolderDatabase> folders = database->GetFolderDB();
+    RefPtr<mozilla::mailnews::DatabaseCore> database =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    auto& folders = database->FolderDB();
+    nsCString sourceId;
+    MOZ_TRY(database->GetSourceId(sourceId));
 
-    // Create root folder in DB if it doesn't already exist.
-    uint64_t rootId;
-    rv = folders->GetFolderChildNamed(0, m_serverKey, &rootId);
-    NS_ENSURE_SUCCESS(rv, rv);
-    if (!rootId) {
-      rv = folders->InsertRoot(m_serverKey, &rootId);
-      NS_ENSURE_SUCCESS(rv, rv);
-    }
+    // Native row birth precedes factory exposure; existing roots stay native.
+    uint64_t rootId = 0;
+    MOZ_TRY(folders.InsertCacheDiscoveryFolder(
+        sourceId, 0, m_serverKey,
+        mozilla::mailnews::CacheDiscoveryFlagSite::CommonRoot, rootId));
+    MOZ_TRY(folders.ObserveCacheFolderInitialization(sourceId, rootId, 0));
 
     nsAutoCString localStoreType;
     rv = GetLocalStoreType(localStoreType);

@@ -68,6 +68,7 @@
 #include "nsIUUIDGenerator.h"
 #include "nsJSUtils.h"
 #include "nsMsgFolderFlags.h"
+#include "nsMsgDBFolder.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
 #include "nsNetUtil.h"
@@ -119,6 +120,12 @@ DatabaseCore::Startup() {
   nsresult rv = EnsureConnection(true);
   NS_ENSURE_SUCCESS(rv, rv);
 
+  mCacheOriginGeneration.Truncate();
+  if (sDatabaseIsNew) {
+    // The already committed new-incarnation UUID is native birth identity.
+    // Reopening the same file never recreates this live capture generation.
+    MOZ_TRY(ReadSourceIdForFolderAdmission(mCacheOriginGeneration));
+  }
   mFolderDatabase = new FolderDatabase();
 
   mMessageDatabase = new MessageDatabase();
@@ -4360,7 +4367,8 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
                        info.cells.Get(value.name, &raw) && raw == value.text,
                    NS_ERROR_INVALID_ARG);
     seen.InsertOrUpdate(value.name, true);
-    NS_ENSURE_TRUE(value.name != "morkMigrationSource"_ns,
+    NS_ENSURE_TRUE(value.name != "morkMigrationSource"_ns &&
+                       value.name != "panoramaCacheImportOrigin"_ns,
                    NS_ERROR_INVALID_ARG);
     bool present;
     NS_ENSURE_TRUE(JS_HasOwnProperty(cx, property, "integer", &present),
@@ -5954,19 +5962,24 @@ DatabaseCore::MigrateFolderDatabase(nsIMsgFolder* srcFolder, JSContext* aCx,
 // Cache imports are separate from message-summary imports. These records never
 // confer a new physical identity or permission to replace derived folder state.
 #ifndef XP_WIN
-namespace {
 struct CacheFolder {
   nsCString originalKey, descriptor, cachePath, storePath, protocol, storeType;
   uint64_t id;
   uint32_t sourceKey;
   bool isServer;
+  nsCString originalSummaryPath;
+  Maybe<uint32_t> originalFlags;
   nsTArray<FolderImportProperty> properties;
 };
 struct CacheImport {
   nsCString token, sourceId, databaseId, path, sha256;
+  uint32_t version{1};
   uint32_t size;
+  nsCString profilePath, manifestPath, manifestSha256;
+  uint32_t manifestSize{0};
   nsTArray<CacheFolder> folders;
 };
+namespace {
 
 bool CacheText(JSContext* cx, JS::Handle<JSObject*> object, const char* name,
                const nsACString& text) {
@@ -6007,7 +6020,8 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
   JS::Rooted<JS::Value> field(cx);
   int64_t number;
   MOZ_TRY(ImportMember(cx, request, "version", &field));
-  MOZ_TRY(ImportNumber(field, 1, 1, number));
+  MOZ_TRY(ImportNumber(field, 1, 2, number));
+  input.version = number;
   for (auto pair : {std::pair{"token", &input.token},
                     {"sourceId", &input.sourceId},
                     {"databaseSourceId", &input.databaseId}}) {
@@ -6034,6 +6048,33 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
   MOZ_TRY(ImportMember(cx, object, "size", &field));
   MOZ_TRY(ImportNumber(field, 1, UINT32_MAX - 1, number));
   input.size = number;
+  if (input.version == 2) {
+    MOZ_TRY(ImportMember(cx, request, "proof", &field));
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    object = &field.toObject();
+    MOZ_TRY(ImportMember(cx, object, "profilePath", &field));
+    MOZ_TRY(ImportText(cx, field, input.profilePath));
+    MOZ_TRY(ImportMember(cx, object, "manifest", &field));
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    object = &field.toObject();
+    MOZ_TRY(ImportMember(cx, object, "path", &field));
+    MOZ_TRY(ImportText(cx, field, input.manifestPath));
+    MOZ_TRY(ImportMember(cx, object, "sha256", &field));
+    MOZ_TRY(ImportText(cx, field, input.manifestSha256));
+    NS_ENSURE_TRUE(input.manifestSha256.Length() == 64 &&
+                       !input.profilePath.IsEmpty() &&
+                       !input.manifestPath.IsEmpty() &&
+                       input.profilePath.FindChar(0) < 0 &&
+                       input.manifestPath.FindChar(0) < 0,
+                   NS_ERROR_INVALID_ARG);
+    for (char c : input.manifestSha256.View()) {
+      NS_ENSURE_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+                     NS_ERROR_INVALID_ARG);
+    }
+    MOZ_TRY(ImportMember(cx, object, "size", &field));
+    MOZ_TRY(ImportNumber(field, 1, UINT32_MAX - 1, number));
+    input.manifestSize = number;
+  }
   MOZ_TRY(ImportMember(cx, request, "folders", &field));
   uint32_t length;
   MOZ_TRY(ImportArray(cx, field, &array, length));
@@ -6063,6 +6104,15 @@ nsresult CacheRequest(JSContext* cx, JS::Handle<JS::Value> value,
     MOZ_TRY(ImportMember(cx, object, "isServer", &field));
     NS_ENSURE_TRUE(field.isBoolean(), NS_ERROR_INVALID_ARG);
     folder.isServer = field.toBoolean();
+    if (input.version == 2) {
+      MOZ_TRY(ImportMember(cx, object, "originalSummaryPath", &field));
+      MOZ_TRY(ImportText(cx, field, folder.originalSummaryPath));
+      NS_ENSURE_TRUE(folder.originalSummaryPath.FindChar(0) < 0 &&
+                         (folder.isServer
+                              ? folder.originalSummaryPath.IsEmpty()
+                              : folder.originalSummaryPath == folder.cachePath),
+                     NS_ERROR_INVALID_ARG);
+    }
     for (const auto& previous : input.folders) {
       NS_ENSURE_TRUE(previous.id != folder.id &&
                          previous.originalKey != folder.originalKey &&
@@ -6150,8 +6200,11 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
   NS_ENSURE_TRUE(result && folders && JS_SetPrototype(cx, folders, nullptr),
                  NS_ERROR_OUT_OF_MEMORY);
   NS_ENSURE_TRUE(
-      JS_DefineProperty(cx, result, "version", 1, JSPROP_ENUMERATE) &&
-          CacheText(cx, result, "policy", "native-authoritative-v1"_ns),
+      JS_DefineProperty(cx, result, "version", input.version,
+                        JSPROP_ENUMERATE) &&
+          CacheText(cx, result, "policy",
+                    input.version == 1 ? "native-authoritative-v1"_ns
+                                       : "native-reconciled-selected-v2"_ns),
       NS_ERROR_OUT_OF_MEMORY);
   for (auto pair : {std::pair{"token", &input.token},
                     {"sourceId", &input.sourceId},
@@ -6164,6 +6217,23 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
   NS_ENSURE_TRUE(JS_DefineProperty(cx, result, "size", double(input.size),
                                    JSPROP_ENUMERATE),
                  NS_ERROR_OUT_OF_MEMORY);
+  if (input.version == 2) {
+    JS::Rooted<JSObject*> proof(
+        cx, JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
+    JS::Rooted<JSObject*> manifest(
+        cx, JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
+    NS_ENSURE_TRUE(
+        proof && manifest &&
+            CacheText(cx, proof, "profilePath", input.profilePath) &&
+            CacheText(cx, manifest, "path", input.manifestPath) &&
+            CacheText(cx, manifest, "sha256", input.manifestSha256) &&
+            JS_DefineProperty(cx, manifest, "size", double(input.manifestSize),
+                              JSPROP_ENUMERATE) &&
+            JS_DefineProperty(cx, proof, "manifest", manifest,
+                              JSPROP_ENUMERATE) &&
+            JS_DefineProperty(cx, result, "proof", proof, JSPROP_ENUMERATE),
+        NS_ERROR_OUT_OF_MEMORY);
+  }
   for (uint32_t i = 0; i < input.folders.Length(); ++i) {
     const auto& folder = input.folders[i];
     JS::Rooted<JSObject*> object(
@@ -6176,6 +6246,11 @@ nsresult CacheIdentity(JSContext* cx, const CacheImport& input,
                       {"protocol", &folder.protocol},
                       {"storeType", &folder.storeType}}) {
       NS_ENSURE_TRUE(CacheText(cx, object, pair.first, *pair.second),
+                     NS_ERROR_OUT_OF_MEMORY);
+    }
+    if (input.version == 2) {
+      NS_ENSURE_TRUE(CacheText(cx, object, "originalSummaryPath",
+                               folder.originalSummaryPath),
                      NS_ERROR_OUT_OF_MEMORY);
     }
     JS::Rooted<JS::Value> server(cx, JS::BooleanValue(folder.isServer));
@@ -6240,7 +6315,8 @@ bool CacheNativeAuthoritative(const nsACString& name) {
          name.EqualsLiteral("expungedBytes");
 }
 bool CacheUnsupportedAlias(const nsACString& name) {
-  return name.EqualsLiteral("morkMigrationSource") ||
+  return name.EqualsLiteral("panoramaCacheImportOrigin") ||
+         name.EqualsLiteral("morkMigrationSource") ||
          name.EqualsLiteral("UIDValidity") ||
          name.EqualsLiteral("highWaterKey") ||
          name.EqualsLiteral("folderDate") || name.EqualsLiteral("version") ||
@@ -6345,6 +6421,297 @@ nsresult ParseCacheBytes(JSContext* cx, const nsACString& bytes,
   return NS_OK;
 }
 
+nsresult ParseCacheOriginalSummary(JSContext* cx, const nsACString& bytes,
+                                   Maybe<uint32_t>& flags, uint32_t& messages) {
+  JS::Rooted<JSObject*> module(cx),
+      buffer(cx, JS_NewUint8Array(cx, bytes.Length()));
+  NS_ENSURE_TRUE(buffer, NS_ERROR_OUT_OF_MEMORY);
+  {
+    JS::AutoCheckCannotGC nogc;
+    bool shared;
+    memcpy(JS_GetUint8ArrayData(buffer, &shared, nogc), bytes.BeginReading(),
+           bytes.Length());
+  }
+  JS::Rooted<JSObject*> global(cx, JS::CurrentGlobalOrNull(cx));
+  dom::GlobalObject caller(cx, global);
+  ErrorResult error;
+  dom::ChromeUtils::ImportESModule(
+      caller, u"resource:///modules/panorama/MorkSummaryReader.sys.mjs"_ns,
+      dom::ImportESModuleOptionsDictionary(), &module, error);
+  if (error.Failed()) return error.StealNSResult();
+  JS::Rooted<JS::Value> function(cx), parsed(cx), value(cx),
+      argument(cx, JS::ObjectValue(*buffer));
+  NS_ENSURE_TRUE(JS_GetProperty(cx, module, "parseMorkSummary", &function) &&
+                     JS::Call(cx, module, function,
+                              JS::HandleValueArray(argument), &parsed) &&
+                     parsed.isObject(),
+                 NS_ERROR_FAILURE);
+  JS::Rooted<JSObject*> object(cx, &parsed.toObject()), array(cx), rows(cx);
+  MOZ_TRY(ImportMember(cx, object, "messages", &value));
+  MOZ_TRY(ImportArray(cx, value, &array, messages));
+  MOZ_TRY(ImportMember(cx, object, "source", &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  object = &value.toObject();
+  MOZ_TRY(ImportMember(cx, object, "rows", &value));
+  NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+  rows = &value.toObject();
+  NS_ENSURE_TRUE(JS::MapValues(cx, rows, &value), NS_ERROR_FAILURE);
+  JS::ForOfIterator iterator(cx);
+  NS_ENSURE_TRUE(iterator.init(value), NS_ERROR_FAILURE);
+  bool done, seen = false;
+  while (true) {
+    NS_ENSURE_TRUE(iterator.next(&value, &done), NS_ERROR_FAILURE);
+    if (done) break;
+    NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+    object = &value.toObject();
+    MOZ_TRY(ImportMember(cx, object, "scope", &value));
+    nsCString scope;
+    MOZ_TRY(ImportText(cx, value, scope));
+    if (scope != "ns:msg:db:row:scope:dbfolderinfo:all"_ns) continue;
+    NS_ENSURE_FALSE(seen, NS_ERROR_NOT_IMPLEMENTED);
+    seen = true;
+    MOZ_TRY(ImportMember(cx, object, "cells", &value));
+    NS_ENSURE_TRUE(value.isObject(), NS_ERROR_FILE_CORRUPTED);
+    JS::Rooted<JSObject*> cells(cx, &value.toObject());
+    JS::Rooted<JSString*> name(cx, JS_NewStringCopyZ(cx, "flags"));
+    NS_ENSURE_TRUE(name, NS_ERROR_OUT_OF_MEMORY);
+    JS::Rooted<JS::Value> key(cx, JS::StringValue(name));
+    bool present;
+    NS_ENSURE_TRUE(JS::MapHas(cx, cells, key, &present), NS_ERROR_FAILURE);
+    if (present) {
+      NS_ENSURE_TRUE(JS::MapGet(cx, cells, key, &value), NS_ERROR_FAILURE);
+      nsCString text;
+      MOZ_TRY(ImportText(cx, value, text));
+      uint64_t word;
+      MOZ_TRY(ImportHex(text, 8, word));
+      flags = Some(uint32_t(word));
+    }
+  }
+  NS_ENSURE_TRUE(seen, NS_ERROR_NOT_IMPLEMENTED);
+  return NS_OK;
+}
+
+struct CacheInventoryFile {
+  nsCString original, backup, sha;
+  uint32_t size;
+};
+
+nsresult CheckCacheProjectionProof(JSContext* cx, CacheImport& input,
+                                   mozIStorageConnection* connection,
+                                   nsTArray<CacheImport>& checkedFiles) {
+  nsCOMPtr<nsIFile> selected;
+  MOZ_TRY(NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                                 getter_AddRefs(selected)));
+  MOZ_TRY(NormalizeImportFile(selected));
+  nsAutoString profile;
+  MOZ_TRY(selected->GetPath(profile));
+  NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(profile) == input.profilePath,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> selector;
+  MOZ_TRY(selected->Clone(getter_AddRefs(selector)));
+  MOZ_TRY(selector->Append(u"panorama-profile.json"_ns));
+  bool exists;
+  MOZ_TRY(selector->Exists(&exists));
+  NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+  CacheImport manifest;
+  manifest.path = input.manifestPath;
+  manifest.sha256 = input.manifestSha256;
+  manifest.size = input.manifestSize;
+  nsCString bytes;
+  MOZ_TRY(ReadCacheBytes(manifest, bytes));
+  checkedFiles.AppendElement(std::move(manifest));
+  JS::Rooted<JS::Value> value(cx);
+  MOZ_TRY(CacheParseJSON(cx, bytes, &value));
+  JS::Rooted<JSObject*> object(cx, &value.toObject()), roots(cx), entries(cx),
+      parts(cx);
+  MOZ_TRY(ImportMember(cx, object, "complete", &value));
+  NS_ENSURE_TRUE(value.isBoolean() && value.toBoolean(),
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ImportMember(cx, object, "version", &value));
+  int64_t number;
+  MOZ_TRY(ImportNumber(value, 1, 1, number));
+  MOZ_TRY(ImportMember(cx, object, "roots", &value));
+  uint32_t rootCount;
+  MOZ_TRY(ImportArray(cx, value, &roots, rootCount));
+  NS_ENSURE_TRUE(rootCount, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> manifestFile, backupRoot;
+  MOZ_TRY(NS_NewLocalFile(NS_ConvertUTF8toUTF16(input.manifestPath),
+                          getter_AddRefs(manifestFile)));
+  MOZ_TRY(manifestFile->GetParent(getter_AddRefs(backupRoot)));
+  nsTArray<CacheInventoryFile> files;
+  nsTHashMap<nsCString, bool> paths, directories;
+  for (uint32_t r = 0; r < rootCount; ++r) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, roots, r, &value) && value.isObject(),
+                   NS_ERROR_INVALID_ARG);
+    object = &value.toObject();
+    MOZ_TRY(ImportMember(cx, object, "source", &value));
+    nsCString rootPath;
+    MOZ_TRY(ImportText(cx, value, rootPath));
+    NS_ENSURE_TRUE(r || rootPath == input.profilePath, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIFile> root;
+    MOZ_TRY(
+        NS_NewLocalFile(NS_ConvertUTF8toUTF16(rootPath), getter_AddRefs(root)));
+    MOZ_TRY(NormalizeImportFile(root));
+    nsAutoString canonical;
+    MOZ_TRY(root->GetPath(canonical));
+    NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(canonical) == rootPath,
+                   NS_ERROR_NOT_AVAILABLE);
+    directories.InsertOrUpdate(rootPath, true);
+    MOZ_TRY(ImportMember(cx, object, "directory", &value));
+    nsCString directory, expected("root-");
+    expected.AppendInt(r);
+    MOZ_TRY(ImportText(cx, value, directory));
+    NS_ENSURE_TRUE(directory == expected, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportMember(cx, object, "entries", &value));
+    uint32_t count;
+    MOZ_TRY(ImportArray(cx, value, &entries, count));
+    for (uint32_t e = 0; e < count; ++e) {
+      NS_ENSURE_TRUE(JS_GetElement(cx, entries, e, &value) && value.isObject(),
+                     NS_ERROR_INVALID_ARG);
+      object = &value.toObject();
+      nsCOMPtr<nsIFile> original, saved;
+      MOZ_TRY(root->Clone(getter_AddRefs(original)));
+      MOZ_TRY(backupRoot->Clone(getter_AddRefs(saved)));
+      MOZ_TRY(saved->Append(NS_ConvertUTF8toUTF16(directory)));
+      MOZ_TRY(ImportMember(cx, object, "parts", &value));
+      uint32_t length;
+      MOZ_TRY(ImportArray(cx, value, &parts, length));
+      NS_ENSURE_TRUE(length, NS_ERROR_INVALID_ARG);
+      for (uint32_t n = 0; n < length; ++n) {
+        NS_ENSURE_TRUE(JS_GetElement(cx, parts, n, &value), NS_ERROR_FAILURE);
+        nsCString component;
+        MOZ_TRY(ImportText(cx, value, component));
+        NS_ENSURE_TRUE(
+            !component.IsEmpty() && component != "."_ns &&
+                component != ".."_ns && component.FindChar('/') < 0 &&
+                component.FindChar('\\') < 0 && component.FindChar(0) < 0,
+            NS_ERROR_INVALID_ARG);
+        MOZ_TRY(original->Append(NS_ConvertUTF8toUTF16(component)));
+        MOZ_TRY(saved->Append(NS_ConvertUTF8toUTF16(component)));
+      }
+      nsAutoString originalPath, savedPath;
+      MOZ_TRY(original->GetPath(originalPath));
+      MOZ_TRY(saved->GetPath(savedPath));
+      nsCString path{NS_ConvertUTF16toUTF8(originalPath)};
+      NS_ENSURE_FALSE(paths.Contains(path), NS_ERROR_INVALID_ARG);
+      paths.InsertOrUpdate(path, true);
+      if (!r) {
+        const nsCString databasePath{input.profilePath + "/panorama.sqlite"_ns};
+        const nsCString selectorPath{input.profilePath +
+                                     "/panorama-profile.json"_ns};
+        NS_ENSURE_TRUE(path != databasePath && path != selectorPath,
+                       NS_ERROR_NOT_AVAILABLE);
+      }
+      MOZ_TRY(ImportMember(cx, object, "type", &value));
+      nsCString type;
+      MOZ_TRY(ImportText(cx, value, type));
+      if (type == "directory"_ns) {
+        directories.InsertOrUpdate(path, true);
+        continue;
+      }
+      NS_ENSURE_TRUE(type == "regular"_ns, NS_ERROR_NOT_IMPLEMENTED);
+      CacheInventoryFile file;
+      file.original = path;
+      file.backup = NS_ConvertUTF16toUTF8(savedPath);
+      MOZ_TRY(ImportMember(cx, object, "size", &value));
+      MOZ_TRY(ImportNumber(value, 0, UINT32_MAX - 1, number));
+      file.size = number;
+      MOZ_TRY(ImportMember(cx, object, "sha256", &value));
+      MOZ_TRY(ImportText(cx, value, file.sha));
+      NS_ENSURE_TRUE(file.sha.Length() == 64, NS_ERROR_INVALID_ARG);
+      files.AppendElement(std::move(file));
+    }
+  }
+  bool cacheCovered = false;
+  for (const auto& file : files) {
+    if (file.original == input.path) {
+      NS_ENSURE_TRUE(file.sha == input.sha256 && file.size == input.size,
+                     NS_ERROR_NOT_AVAILABLE);
+      CacheImport backup;
+      backup.path = file.backup;
+      backup.size = file.size;
+      backup.sha256 = file.sha;
+      nsCString copied;
+      MOZ_TRY(ReadCacheBytes(backup, copied));
+      checkedFiles.AppendElement(std::move(backup));
+      cacheCovered = true;
+    }
+  }
+  NS_ENSURE_TRUE(cacheCovered, NS_ERROR_NOT_AVAILABLE);
+  for (auto& folder : input.folders) {
+    if (folder.isServer) {
+      NS_ENSURE_TRUE(directories.Contains(folder.cachePath),
+                     NS_ERROR_NOT_AVAILABLE);
+      continue;
+    }
+    nsCOMPtr<nsIFile> summaryFile, parent;
+    MOZ_TRY(NS_NewLocalFile(NS_ConvertUTF8toUTF16(folder.originalSummaryPath),
+                            getter_AddRefs(summaryFile)));
+    MOZ_TRY(summaryFile->GetParent(getter_AddRefs(parent)));
+    MOZ_TRY(NormalizeImportFile(parent));
+    nsAutoString parentPath;
+    MOZ_TRY(parent->GetPath(parentPath));
+    NS_ENSURE_TRUE(directories.Contains(NS_ConvertUTF16toUTF8(parentPath)),
+                   NS_ERROR_NOT_AVAILABLE);
+    const CacheInventoryFile* found = nullptr;
+    for (const auto& file : files)
+      if (file.original == folder.originalSummaryPath) found = &file;
+    if (!found) {
+      // A present directory is not evidence that an original summary is absent.
+      NS_ENSURE_FALSE(paths.Contains(folder.originalSummaryPath),
+                      NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<nsIFile> absent;
+      MOZ_TRY(NS_NewLocalFile(NS_ConvertUTF8toUTF16(folder.originalSummaryPath),
+                              getter_AddRefs(absent)));
+      MOZ_TRY(NormalizeImportFile(absent));
+      MOZ_TRY(absent->Exists(&exists));
+      NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+      continue;
+    }
+    CacheImport source;
+    source.path = found->original;
+    source.size = found->size;
+    source.sha256 = found->sha;
+    nsCString summary;
+    MOZ_TRY(ReadCacheBytes(source, summary));
+    checkedFiles.AppendElement(std::move(source));
+    CacheImport backup;
+    backup.path = found->backup;
+    backup.size = found->size;
+    backup.sha256 = found->sha;
+    nsCString saved;
+    MOZ_TRY(ReadCacheBytes(backup, saved));
+    NS_ENSURE_TRUE(saved == summary, NS_ERROR_NOT_AVAILABLE);
+    checkedFiles.AppendElement(std::move(backup));
+    uint32_t messages;
+    MOZ_TRY(
+        ParseCacheOriginalSummary(cx, summary, folder.originalFlags, messages));
+    if (messages) {
+      nsCOMPtr<mozIStorageStatement> receipt;
+      MOZ_TRY(connection->CreateStatement(
+          "SELECT sourcePath,sourceSha256,databaseSourceId,messageCount FROM "
+          "folder_import_receipts WHERE folderId=:id"_ns,
+          getter_AddRefs(receipt)));
+      MOZ_TRY(receipt->BindInt64ByName("id"_ns, folder.id));
+      bool row;
+      MOZ_TRY(receipt->ExecuteStep(&row));
+      NS_ENSURE_TRUE(row, NS_ERROR_NOT_AVAILABLE);
+      nsString path;
+      nsCString hash, database;
+      int64_t count;
+      MOZ_TRY(receipt->GetString(0, path));
+      MOZ_TRY(receipt->GetUTF8String(1, hash));
+      MOZ_TRY(receipt->GetUTF8String(2, database));
+      MOZ_TRY(receipt->GetInt64(3, &count));
+      NS_ENSURE_TRUE(NS_ConvertUTF16toUTF8(path) == found->original &&
+                         hash == found->sha && database == input.databaseId &&
+                         count == messages,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  return NS_OK;
+}
+
 nsresult ReadCacheReceipt(mozIStorageConnection* connection,
                           const CacheImport& input, const nsACString& identity,
                           Maybe<nsCString>& output) {
@@ -6418,6 +6785,447 @@ nsresult ReadCacheReceipt(mozIStorageConnection* connection,
 }  // namespace
 #endif
 
+#ifndef XP_WIN
+nsresult DatabaseCore::ImportFolderCacheMetadataV2(
+    CacheImport& input, JSContext* cx, JS::MutableHandle<JS::Value> output) {
+  auto connection = sConnection;
+  RefPtr<FolderDatabase> folders = mFolderDatabase;
+  auto current = [&]() -> bool {
+    return sInstance.get() == this && sConnection == connection &&
+           mFolderDatabase == folders && !mShuttingDown;
+  };
+  NS_ENSURE_TRUE(current(), NS_ERROR_NOT_AVAILABLE);
+  nsCString source;
+  MOZ_TRY(ReadDatabaseSourceId(connection, source));
+  NS_ENSURE_TRUE(source == input.databaseId, NS_ERROR_NOT_AVAILABLE);
+  JS::Rooted<JSObject*> identityObject(cx);
+  MOZ_TRY(CacheIdentity(cx, input, &identityObject));
+  nsCString identity;
+  MOZ_TRY(CacheJSON(cx, identityObject, identity));
+  Maybe<nsCString> prior;
+  MOZ_TRY(ReadCacheReceipt(connection, input, identity, prior));
+  if (prior) {
+    nsCString bytes;
+    MOZ_TRY(ReadCacheBytes(input, bytes));
+    JS::Rooted<JS::Value> result(cx);
+    MOZ_TRY(CacheParseJSON(cx, *prior, &result));
+    NS_ENSURE_TRUE(current(), NS_ERROR_NOT_AVAILABLE);
+    output.set(result);
+    return NS_OK;
+  }
+  MOZ_TRY(CheckCacheFolders(this, connection, input));
+  nsCString bytes;
+  MOZ_TRY(ReadCacheBytes(input, bytes));
+  MOZ_TRY(ParseCacheBytes(cx, bytes, input));
+  nsTArray<CacheImport> checkedFiles;
+  MOZ_TRY(CheckCacheProjectionProof(cx, input, connection, checkedFiles));
+  NS_ENSURE_TRUE(current(), NS_ERROR_NOT_AVAILABLE);
+  struct Plan {
+    uint64_t id;
+    FolderDatabase::CacheOrigin origin;
+    uint32_t beforeFlags;
+    uint32_t warmBeforeFlags;
+    uint32_t afterFlags;
+    uint32_t eligibleMask;
+    uint64_t total;
+    uint64_t unread;
+    int64_t storeSize;
+    int32_t pendingOperations;
+    nsCString name;
+    nsTArray<FolderImportProperty> before;
+    nsTArray<FolderImportProperty> writes;
+    RefPtr<nsMsgDBFolder> wrapper;
+    nsCOMPtr<nsIMsgPluggableStore> store;
+  };
+  nsTArray<Plan> plans;
+  JS::Rooted<JSObject*> result(
+      cx, JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
+  JS::Rooted<JSObject*> cells(cx, JS::NewArrayObject(cx, 0));
+  NS_ENSURE_TRUE(
+      result && cells && JS_SetPrototype(cx, cells, nullptr) &&
+          JS_DefineProperty(cx, result, "identity", identityObject,
+                            JSPROP_ENUMERATE) &&
+          JS_DefineProperty(cx, result, "cells", cells, JSPROP_ENUMERATE),
+      NS_ERROR_OUT_OF_MEMORY);
+  uint32_t cellIndex = 0;
+  for (const auto& folder : input.folders) {
+    Plan plan;
+    plan.id = folder.id;
+    nsCOMPtr<nsIMsgFolder> wrapper;
+    MOZ_TRY(folders->GetMsgFolderForFolder(folder.id, getter_AddRefs(wrapper)));
+    NS_ENSURE_TRUE(wrapper, NS_ERROR_NOT_AVAILABLE);
+    plan.wrapper = static_cast<nsMsgDBFolder*>(wrapper.get());
+    MOZ_TRY(wrapper->GetMsgStore(getter_AddRefs(plan.store)));
+    NS_ENSURE_TRUE(plan.store, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(plan.store->EstimateFolderSize(wrapper, &plan.storeSize));
+    NS_ENSURE_TRUE(plan.storeSize >= 0, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(wrapper->GetFlags(&plan.warmBeforeFlags));
+    MOZ_TRY(folders->CheckCacheProjectionOrigin(folder.id, plan.origin));
+    plan.beforeFlags = MOZ_TRY(folders->GetFolderFlags(folder.id));
+    NS_ENSURE_FALSE(plan.beforeFlags & nsMsgFolderFlags::Virtual,
+                    NS_ERROR_NOT_IMPLEMENTED);
+    plan.afterFlags = plan.beforeFlags;
+    plan.eligibleMask =
+        FolderDatabase::kCacheClientMask & ~plan.origin.explicitMask;
+    if (folder.originalFlags) {
+      plan.afterFlags = (plan.beforeFlags & ~plan.eligibleMask) |
+                        (*folder.originalFlags & plan.eligibleMask);
+      plan.eligibleMask = 0;
+    }
+    MOZ_TRY(folders->GetFolderProperties(folder.id, plan.before));
+    plan.name = MOZ_TRY(folders->GetFolderName(folder.id));
+    MOZ_TRY(MessageDB().GetNumMessages(folder.id, &plan.total));
+    MOZ_TRY(MessageDB().GetNumUnread(folder.id, &plan.unread));
+    NS_ENSURE_TRUE(plan.total <= INT32_MAX && plan.unread <= INT32_MAX,
+                   NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+    nsCOMPtr<mozIStorageStatement> operations;
+    MOZ_TRY(connection->CreateStatement(
+        "SELECT EXISTS(SELECT 1 FROM offline_operations WHERE folderId=:id)"_ns,
+        getter_AddRefs(operations)));
+    MOZ_TRY(operations->BindInt64ByName("id"_ns, folder.id));
+    bool row;
+    MOZ_TRY(operations->ExecuteStep(&row));
+    NS_ENSURE_TRUE(row, NS_ERROR_FILE_CORRUPTED);
+    int32_t pendingOperations;
+    MOZ_TRY(operations->GetInt32(0, &pendingOperations));
+    operations = nullptr;
+    plan.pendingOperations = pendingOperations;
+    bool sawFlags = false;
+    for (const auto& property : folder.properties) {
+      nsCString target(property.name);
+      Maybe<int64_t> nativeInteger;
+      Maybe<nsCString> nativeText;
+      const char* disposition = "native-authoritative";
+      bool apply = false;
+      if (target == "flags"_ns) {
+        NS_ENSURE_TRUE(property.integer && *property.integer >= 0 &&
+                           uint64_t(*property.integer) <= UINT32_MAX,
+                       NS_ERROR_INVALID_ARG);
+        sawFlags = true;
+        plan.afterFlags = (plan.afterFlags & ~plan.eligibleMask) |
+                          (uint32_t(*property.integer) & plan.eligibleMask);
+        nativeInteger = Some(int64_t(plan.afterFlags));
+        disposition = plan.eligibleMask ? "applied"
+                      : folder.originalFlags && !plan.origin.explicitMask
+                          ? "source-authoritative"
+                          : "existing";
+      } else if (target == "totalMsgs"_ns || target == "totalUnreadMsgs"_ns) {
+        nativeInteger =
+            Some(int64_t(target == "totalMsgs"_ns ? plan.total : plan.unread));
+      } else if (target == "folderName"_ns) {
+        nativeText = Some(plan.name);
+      } else if (target == "key"_ns) {
+        disposition = "binding";
+      } else {
+        bool pending =
+            target == "pendingMsgs"_ns || target == "pendingUnreadMsgs"_ns;
+        if (pending)
+          target.Assign(property.name == "pendingMsgs"_ns
+                            ? "totPendingMsgs"
+                            : "unreadPendingMsgs");
+        const FolderImportProperty* present = nullptr;
+        for (const auto& old : plan.before)
+          if (old.name == target) present = &old;
+        if (present) {
+          if (target == "folderSize"_ns || target == "expungedBytes"_ns) {
+            NS_ENSURE_TRUE(present->integer && *present->integer >= 0,
+                           NS_ERROR_NOT_IMPLEMENTED);
+          }
+          nativeInteger = present->integer;
+          if (!present->integer) nativeText = Some(present->text);
+          disposition = "existing";
+        } else if (pending && pendingOperations) {
+          // No cached contribution is added to independently imported work.
+          nativeInteger = Some(int64_t{0});
+        } else if (target == "folderSize"_ns || target == "expungedBytes"_ns) {
+          // Missing native accounting is measured, never filled from a hint.
+          NS_ENSURE_TRUE(target == "folderSize"_ns || plan.storeSize == 0,
+                         NS_ERROR_NOT_IMPLEMENTED);
+          nativeInteger =
+              Some(target == "folderSize"_ns ? plan.storeSize : int64_t{0});
+          disposition = "applied-native";
+          apply = true;
+        } else {
+          nativeInteger = property.integer;
+          if (!property.integer) nativeText = Some(property.text);
+          disposition = "applied";
+          apply = true;
+        }
+        if (pending && nativeInteger) {
+          if (apply) {
+            NS_ENSURE_TRUE(
+                *nativeInteger >= INT32_MIN && *nativeInteger <= INT32_MAX,
+                NS_ERROR_INVALID_ARG);
+          } else {
+            NS_ENSURE_TRUE(
+                *nativeInteger >= 0 && uint64_t(*nativeInteger) <= UINT32_MAX,
+                NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+            nativeInteger = Some(int64_t(int32_t(uint32_t(*nativeInteger))));
+          }
+        }
+        if (apply) {
+          FolderImportProperty write{target, nativeText.valueOr(nsCString()),
+                                     nativeInteger};
+          if (pending && write.integer)
+            write.integer = Some(int64_t(uint32_t(int32_t(*write.integer))));
+          plan.writes.AppendElement(std::move(write));
+        }
+      }
+      JS::Rooted<JSObject*> cell(
+          cx, JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
+      NS_ENSURE_TRUE(cell &&
+                         JS_DefineProperty(cx, cell, "id", double(folder.id),
+                                           JSPROP_ENUMERATE) &&
+                         CacheText(cx, cell, "name", property.name) &&
+                         CacheText(cx, cell, "text", property.text) &&
+                         CacheText(cx, cell, "target", target) &&
+                         CacheText(cx, cell, "disposition",
+                                   nsDependentCString(disposition)),
+                     NS_ERROR_OUT_OF_MEMORY);
+      if (property.integer)
+        NS_ENSURE_TRUE(
+            JS_DefineProperty(cx, cell, "integer", double(*property.integer),
+                              JSPROP_ENUMERATE),
+            NS_ERROR_OUT_OF_MEMORY);
+      if (nativeInteger)
+        NS_ENSURE_TRUE(
+            JS_DefineProperty(cx, cell, "nativeInteger", double(*nativeInteger),
+                              JSPROP_ENUMERATE),
+            NS_ERROR_OUT_OF_MEMORY);
+      if (nativeText)
+        NS_ENSURE_TRUE(CacheText(cx, cell, "nativeText", *nativeText),
+                       NS_ERROR_OUT_OF_MEMORY);
+      if (property.name == "flags"_ns)
+        NS_ENSURE_TRUE(
+            JS_DefineProperty(cx, cell, "eligibleMask",
+                              double(plan.eligibleMask), JSPROP_ENUMERATE),
+            NS_ERROR_OUT_OF_MEMORY);
+      NS_ENSURE_TRUE(
+          JS_DefineElement(cx, cells, cellIndex++, cell, JSPROP_ENUMERATE),
+          NS_ERROR_OUT_OF_MEMORY);
+    }
+    NS_ENSURE_TRUE(sawFlags, NS_ERROR_NOT_IMPLEMENTED);
+    MOZ_TRY(plan.wrapper->CheckCacheImportFlags(input.databaseId, plan.id,
+                                                plan.warmBeforeFlags));
+    plans.AppendElement(std::move(plan));
+  }
+  nsCString receipt;
+  MOZ_TRY(CacheJSON(cx, result, receipt));
+  JS::Rooted<JS::Value> prepared(cx);
+  MOZ_TRY(CacheParseJSON(cx, receipt, &prepared));
+  // Re-measure through the existing provider before taking SQL ownership.
+  for (auto& plan : plans) {
+    int64_t size;
+    MOZ_TRY(plan.store->EstimateFolderSize(plan.wrapper, &size));
+    NS_ENSURE_TRUE(size == plan.storeSize, NS_ERROR_NOT_AVAILABLE);
+  }
+  nsCString reread;
+  MOZ_TRY(ReadCacheBytes(input, reread));
+  NS_ENSURE_TRUE(reread == bytes, NS_ERROR_NOT_AVAILABLE);
+  for (const auto& file : checkedFiles) {
+    MOZ_TRY(ReadCacheBytes(file, reread));
+  }
+  for (const auto& folder : input.folders) {
+    if (folder.isServer || folder.originalFlags) continue;
+    // Recheck absence after all callbacks, before taking SQL ownership.
+    // Present MSFs without a flags cell are in checkedFiles instead.
+    bool checked = false;
+    for (const auto& file : checkedFiles)
+      checked |= file.path == folder.originalSummaryPath;
+    if (checked) continue;
+    nsCOMPtr<nsIFile> absent;
+    MOZ_TRY(NS_NewLocalFile(NS_ConvertUTF8toUTF16(folder.originalSummaryPath),
+                            getter_AddRefs(absent)));
+    MOZ_TRY(NormalizeImportFile(absent));
+    bool exists;
+    MOZ_TRY(absent->Exists(&exists));
+    NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+  }
+  nsCOMPtr<nsIFile> selector;
+  MOZ_TRY(NS_NewLocalFile(NS_ConvertUTF8toUTF16(input.profilePath),
+                          getter_AddRefs(selector)));
+  MOZ_TRY(selector->Append(u"panorama-profile.json"_ns));
+  bool exists;
+  MOZ_TRY(selector->Exists(&exists));
+  NS_ENSURE_FALSE(exists, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(current(), NS_ERROR_NOT_AVAILABLE);
+  bool active;
+  MOZ_TRY(connection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  MOZ_TRY(connection->BeginTransaction());
+  auto apply = [&]() -> nsresult {
+    Maybe<nsCString> existing;
+    MOZ_TRY(ReadCacheReceipt(connection, input, identity, existing));
+    NS_ENSURE_FALSE(existing, NS_ERROR_ALREADY_INITIALIZED);
+    auto sameProperties = [](const nsTArray<FolderImportProperty>& left,
+                             const nsTArray<FolderImportProperty>& right) {
+      if (left.Length() != right.Length()) return false;
+      for (const auto& property : left) {
+        bool found = false;
+        for (const auto& other : right) {
+          if (property.name == other.name && property.text == other.text &&
+              property.integer == other.integer) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) return false;
+      }
+      return true;
+    };
+    auto checkPlan = [&](const Plan& plan, bool applied) -> nsresult {
+      NS_ENSURE_TRUE(current() && !folders->mCacheOriginTainted,
+                     NS_ERROR_NOT_AVAILABLE);
+      Maybe<FolderDatabase::CacheOrigin> origin;
+      MOZ_TRY(folders->ReadCacheOrigin(plan.id, origin));
+      NS_ENSURE_TRUE(
+          origin && origin->source == plan.origin.source &&
+              origin->generation == mCacheOriginGeneration &&
+              origin->generation == plan.origin.generation &&
+              origin->parent == plan.origin.parent &&
+              origin->name == plan.origin.name &&
+              origin->birthSite == plan.origin.birthSite &&
+              origin->explicitMask == plan.origin.explicitMask &&
+              origin->used == plan.origin.used && !origin->pending &&
+              origin->sealed == applied &&
+              origin->revision == plan.origin.revision + uint64_t(applied),
+          NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(folders->CheckCacheOriginLocation(*origin));
+      NS_ENSURE_TRUE(MOZ_TRY(folders->GetFolderFlags(plan.id)) ==
+                         (applied ? plan.afterFlags : plan.beforeFlags),
+                     NS_ERROR_FILE_CORRUPTED);
+      nsTArray<FolderImportProperty> properties;
+      MOZ_TRY(folders->GetFolderProperties(plan.id, properties));
+      auto expected = plan.before.Clone();
+      if (applied) expected.AppendElements(plan.writes);
+      NS_ENSURE_TRUE(sameProperties(properties, expected),
+                     NS_ERROR_FILE_CORRUPTED);
+      uint64_t total, unread;
+      MOZ_TRY(MessageDB().GetNumMessages(plan.id, &total));
+      MOZ_TRY(MessageDB().GetNumUnread(plan.id, &unread));
+      NS_ENSURE_TRUE(total == plan.total && unread == plan.unread,
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<mozIStorageStatement> guard;
+      MOZ_TRY(connection->CreateStatement(
+          "SELECT EXISTS(SELECT 1 FROM offline_operations WHERE folderId=:id),"
+          "EXISTS(SELECT 1 FROM body_relocations WHERE folderId=:id "
+          "AND state NOT IN(1,2))"_ns,
+          getter_AddRefs(guard)));
+      MOZ_TRY(guard->BindInt64ByName("id"_ns, plan.id));
+      bool row;
+      MOZ_TRY(guard->ExecuteStep(&row));
+      NS_ENSURE_TRUE(row, NS_ERROR_FILE_CORRUPTED);
+      int32_t operations, relocation;
+      MOZ_TRY(guard->GetInt32(0, &operations));
+      MOZ_TRY(guard->GetInt32(1, &relocation));
+      NS_ENSURE_TRUE(operations == plan.pendingOperations && !relocation,
+                     NS_ERROR_NOT_AVAILABLE);
+      return plan.wrapper->CheckCacheImportFlags(input.databaseId, plan.id,
+                                                 plan.warmBeforeFlags);
+    };
+    for (const auto& plan : plans) MOZ_TRY(checkPlan(plan, false));
+    nsCOMPtr<mozIStorageStatement> insert;
+    MOZ_TRY(connection->CreateStatement(
+        "INSERT INTO folder_properties(id,name,value) VALUES(:id,:name,:value)"_ns,
+        getter_AddRefs(insert)));
+    for (auto& plan : plans) {
+      for (const auto& property : plan.writes) {
+        mozStorageStatementScoper reset(insert);
+        MOZ_TRY(insert->BindInt64ByName("id"_ns, plan.id));
+        MOZ_TRY(insert->BindUTF8StringByName("name"_ns, property.name));
+        if (property.integer) {
+          MOZ_TRY(insert->BindInt64ByName("value"_ns, *property.integer));
+        } else {
+          MOZ_TRY(insert->BindUTF8StringByName("value"_ns, property.text));
+        }
+        MOZ_TRY(insert->Execute());
+      }
+      MOZ_TRY(folders->WriteCacheFolderFlags(plan.id, plan.afterFlags));
+      auto sealed = plan.origin;
+      NS_ENSURE_TRUE(sealed.revision < INT64_MAX - 1, NS_ERROR_ILLEGAL_VALUE);
+      ++sealed.revision;
+      sealed.sealed = true;
+      MOZ_TRY(folders->WriteCacheOrigin(sealed));
+    }
+    insert = nullptr;
+    nsCOMPtr<mozIStorageStatement> save;
+    MOZ_TRY(connection->CreateStatement(
+        "INSERT INTO "
+        "folder_cache_imports(token,sourceId,path,identity,raw,receipt) "
+        "VALUES(:token,:source,:path,:identity,:raw,:receipt)"_ns,
+        getter_AddRefs(save)));
+    for (auto pair : {std::pair{"token", &input.token},
+                      {"source", &input.sourceId},
+                      {"path", &input.path},
+                      {"identity", &identity},
+                      {"receipt", &receipt}}) {
+      MOZ_TRY(save->BindUTF8StringByName(nsDependentCString(pair.first),
+                                         *pair.second));
+    }
+    MOZ_TRY(save->BindBlobByName("raw"_ns,
+                                 reinterpret_cast<const uint8_t*>(bytes.get()),
+                                 bytes.Length()));
+    MOZ_TRY(save->Execute());
+    save = nullptr;
+    nsCOMPtr<mozIStorageStatement> bind;
+    MOZ_TRY(connection->CreateStatement(
+        "INSERT INTO folder_cache_bindings(folderId,token) VALUES(:id,:token)"_ns,
+        getter_AddRefs(bind)));
+    for (const auto& folder : input.folders) {
+      mozStorageStatementScoper reset(bind);
+      MOZ_TRY(bind->BindInt64ByName("id"_ns, folder.id));
+      MOZ_TRY(bind->BindUTF8StringByName("token"_ns, input.token));
+      MOZ_TRY(bind->Execute());
+    }
+    bind = nullptr;
+    // Independently reread the whole write set after every trigger has run.
+    for (const auto& plan : plans) MOZ_TRY(checkPlan(plan, true));
+    MOZ_TRY(ReadCacheReceipt(connection, input, identity, existing));
+    NS_ENSURE_TRUE(existing && *existing == receipt, NS_ERROR_FILE_CORRUPTED);
+    nsCOMPtr<mozIStorageStatement> raw;
+    MOZ_TRY(connection->CreateStatement(
+        "SELECT typeof(raw),length(raw),raw=:bytes FROM folder_cache_imports "
+        "WHERE token=:token"_ns,
+        getter_AddRefs(raw)));
+    MOZ_TRY(raw->BindUTF8StringByName("token"_ns, input.token));
+    MOZ_TRY(raw->BindBlobByName("bytes"_ns,
+                                reinterpret_cast<const uint8_t*>(bytes.get()),
+                                bytes.Length()));
+    bool row;
+    MOZ_TRY(raw->ExecuteStep(&row));
+    NS_ENSURE_TRUE(row, NS_ERROR_FILE_CORRUPTED);
+    nsCString type;
+    int64_t size;
+    int32_t equal;
+    MOZ_TRY(raw->GetUTF8String(0, type));
+    MOZ_TRY(raw->GetInt64(1, &size));
+    MOZ_TRY(raw->GetInt32(2, &equal));
+    NS_ENSURE_TRUE(type == "blob"_ns && size == bytes.Length() && equal == 1,
+                   NS_ERROR_FILE_CORRUPTED);
+    raw = nullptr;
+    nsCString finalSource;
+    MOZ_TRY(ReadDatabaseSourceId(connection, finalSource));
+    NS_ENSURE_TRUE(current() && finalSource == input.databaseId,
+                   NS_ERROR_NOT_AVAILABLE);
+    return connection->CommitTransaction();
+  };
+  nsresult rv = apply();
+  if (NS_FAILED(rv)) {
+    bool pending;
+    nsresult cleanup = connection->GetTransactionInProgress(&pending);
+    if (NS_SUCCEEDED(cleanup) && pending)
+      cleanup = connection->RollbackTransaction();
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanup),
+                         "Cache reconciliation rollback failed");
+    return rv;
+  }
+  for (auto& plan : plans)
+    plan.wrapper->PublishCacheImportFlags(plan.afterFlags);
+  output.set(prepared);
+  return NS_OK;
+}
+#endif
+
 NS_IMETHODIMP
 DatabaseCore::GetFolderCacheImportReceipt(JS::Handle<JS::Value> request,
                                           JSContext* cx,
@@ -6437,13 +7245,16 @@ DatabaseCore::GetFolderCacheImportReceipt(JS::Handle<JS::Value> request,
   // Request getters can reenter the core. Refuse to adopt their transaction.
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
-  MOZ_TRY(CheckCacheFolders(this, sConnection, input));
   JS::Rooted<JSObject*> identityObject(cx);
   MOZ_TRY(CacheIdentity(cx, input, &identityObject));
   nsCString identity;
   MOZ_TRY(CacheJSON(cx, identityObject, identity));
+  nsCString currentSource;
+  MOZ_TRY(ReadDatabaseSourceId(sConnection, currentSource));
+  NS_ENSURE_TRUE(currentSource == input.databaseId, NS_ERROR_NOT_AVAILABLE);
   Maybe<nsCString> receipt;
   MOZ_TRY(ReadCacheReceipt(sConnection, input, identity, receipt));
+  if (!receipt) MOZ_TRY(CheckCacheFolders(this, sConnection, input));
   JS::Rooted<JS::Value> result(cx, JS::NullValue());
   if (receipt) MOZ_TRY(CacheParseJSON(cx, *receipt, &result));
   output.set(result);
@@ -6469,6 +7280,9 @@ DatabaseCore::ImportFolderCacheMetadata(JS::Handle<JS::Value> request,
                  NS_ERROR_NOT_AVAILABLE);
   MOZ_TRY(sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  if (input.version == 2) {
+    return ImportFolderCacheMetadataV2(input, cx, output);
+  }
   MOZ_TRY(CheckCacheFolders(this, sConnection, input));
   JS::Rooted<JSObject*> identityObject(cx);
   MOZ_TRY(CacheIdentity(cx, input, &identityObject));

@@ -17,6 +17,10 @@
 #include "nsServiceManagerUtils.h"
 #include "nsMsgUtils.h"
 
+#ifdef MOZ_PANORAMA
+#  include "nsMsgDBFolder.h"
+#endif
+
 NS_IMPL_ISUPPORTS_INHERITED(nsNoIncomingServer, nsMsgIncomingServer,
                             nsINoIncomingServer, nsILocalMailIncomingServer)
 
@@ -32,8 +36,8 @@ nsresult nsNoIncomingServer::CreateRootFolder() {
     rv = CreateDefaultMailboxes();
     NS_ENSURE_SUCCESS(rv, rv);
 
-    rv = SetFlagsOnDefaultMailboxes();
-    NS_ENSURE_SUCCESS(rv, rv);
+    return static_cast<nsMsgDBFolder*>(m_rootFolder.get())
+        ->InitializeLocalCacheDefaultChildren();
   }
   return NS_OK;
 }
@@ -69,9 +73,7 @@ nsNoIncomingServer::SetFlagsOnDefaultMailboxes() {
 
   // None server may have an inbox if it's deferred to,
   // or if it's the smart mailboxes account.
-  localFolder->SetFlagsOnDefaultMailboxes(nsMsgFolderFlags::SpecialUse);
-
-  return NS_OK;
+  return localFolder->SetFlagsOnDefaultMailboxes(nsMsgFolderFlags::SpecialUse);
 }
 
 // TODO: make this work with maildir message store, bug 890742.

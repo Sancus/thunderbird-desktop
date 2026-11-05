@@ -1377,6 +1377,31 @@ void nsImapMailFolder::DiscardPanoramaDiscovery(nsIFolderLookupService* fls) {
   mSubFolders.Clear();
 }
 
+// Both initial discovery and later LIST must preserve the same server-lock
+// publication order. The caller supplies only its already checked native
+// action.
+nsresult nsImapMailFolder::ApplyPanoramaBoxFlags(
+    mozilla::mailnews::CacheDiscoveryFlagWrite&& write, int32_t boxFlags) {
+  uint32_t boxFolderFlags = FolderFlagsForBoxFlags(boxFlags);
+  const uint32_t previousFlags = mFlags;
+  const uint32_t previousLockedFlags = mLockedFlags;
+  const int32_t previousBoxFlags = m_boxFlags;
+  // Expose server locks with the committed flag callbacks, restoring staged
+  // metadata on a prepublication failure without replacing later callback
+  // state.
+  m_boxFlags = boxFlags;
+  mLockedFlags = boxFolderFlags & nsMsgFolderFlags::SpecialUse;
+  auto restoreBox = mozilla::MakeScopeExit([&] {
+    if (mFlags == previousFlags) {
+      m_boxFlags = previousBoxFlags;
+      mLockedFlags = previousLockedFlags;
+    }
+  });
+  MOZ_TRY(ApplyInitialCacheDiscoveryFlags(std::move(write), boxFolderFlags));
+  restoreBox.release();
+  return NS_OK;
+}
+
 nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
     const nsACString& folderName, char hierarchyDelimiter, int32_t boxFlags,
     bool suppressNotification) {
@@ -1406,10 +1431,25 @@ nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
   RefPtr<mozilla::mailnews::DatabaseCore> core =
       mozilla::mailnews::DatabaseCore::GetInstanceForService();
   auto& folderDB = core->FolderDB();
+  using mozilla::mailnews::CacheDiscoveryFlagSite;
   uint64_t id = MOZ_TRY(folderDB.GetFolderChildNamed(mFolderId, folderName));
-  if (!id) {
-    // The server row survives an object or metadata failure for the next LIST.
-    MOZ_TRY(folderDB.InsertFolder(mFolderId, folderName, &id));
+  // This selects the requested phase, not cache-import authority. Native code
+  // checks the recorded birth, source and revision independently. In
+  // particular, a retained row with no wrapper must not replay initial client
+  // defaults.
+  const bool initial = !id;
+  MOZ_TRY(folderDB.InsertCacheDiscoveryFolder(
+      mFolderDatabaseSourceId, mFolderId, folderName,
+      CacheDiscoveryFlagSite::ImapInitialBoxFlags, id));
+  bool tracked;
+  MOZ_TRY(
+      folderDB.HasCacheDiscoveryOrigin(mFolderDatabaseSourceId, id, tracked));
+  mozilla::Maybe<mozilla::mailnews::CacheDiscoveryFlagWrite> boxWrite;
+  if (tracked) {
+    boxWrite.emplace(MOZ_TRY(folderDB.BeginCacheDiscoveryFlags(
+        mFolderDatabaseSourceId, id,
+        initial ? CacheDiscoveryFlagSite::ImapInitialBoxFlags
+                : CacheDiscoveryFlagSite::ImapServerRefresh)));
   }
 
   nsCOMPtr<nsIMsgFolder> folder;
@@ -1447,7 +1487,6 @@ nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
 
   nsCOMPtr<nsIDBFolderInfo> info;
   MOZ_TRY(GetPanoramaFolderInfo(child, getter_AddRefs(info)));
-  bool needsDefaults = !(child->mFlags & nsMsgFolderFlags::Mail);
   nsAutoCString onlineName;
   MOZ_TRY(GetOnlineName(onlineName));
   nsAutoCString leaf(folderName);
@@ -1460,8 +1499,24 @@ nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
   nsAutoString displayName;
   MOZ_TRY(CopyFolderNameToUTF16(leaf, displayName));
   MOZ_TRY(child->SetName(NS_ConvertUTF16toUTF8(displayName)));
-  MOZ_TRY(child->SetBoxFlags(boxFlags));
+  // Initial discovery consumes its own phase, rather than the structural-only
+  // refresh ticket used by the existing-mailbox protocol setter.
+  if (tracked) {
+    MOZ_TRY(child->ApplyPanoramaBoxFlags(std::move(*boxWrite), boxFlags));
+    boxWrite.reset();
+  } else {
+    // Old/sealed/incomplete rows keep ordinary native behavior without a new
+    // cache-import grant. Never turn an acquired action failure into fallback.
+    MOZ_TRY(child->SetBoxFlags(boxFlags));
+  }
 
+  mozilla::Maybe<mozilla::mailnews::CacheDiscoveryFlagWrite> defaultsWrite;
+  if (tracked) {
+    defaultsWrite.emplace(MOZ_TRY(folderDB.BeginCacheDiscoveryFlags(
+        mFolderDatabaseSourceId, id,
+        initial ? CacheDiscoveryFlagSite::ImapInitialDefaults
+                : CacheDiscoveryFlagSite::ImapServerRefresh)));
+  }
   uint32_t flags = child->mFlags | nsMsgFolderFlags::Mail;
   if (mIsServer && folderName.LowerCaseEqualsLiteral("inbox")) {
     flags |= nsMsgFolderFlags::Inbox;
@@ -1477,7 +1532,7 @@ nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
       flags |= nsMsgFolderFlags::Trash;
     }
   }
-  if (needsDefaults) {
+  if (initial) {
     nsCOMPtr<nsIMsgIncomingServer> server;
     MOZ_TRY(GetServer(getter_AddRefs(server)));
     bool offline;
@@ -1496,8 +1551,14 @@ nsresult nsImapMailFolder::CreatePanoramaClientSubfolderInfo(
                                         kImapMsgSupportForwardedFlag |
                                         kImapMsgSupportMDNSentFlag));
   }
-  MOZ_TRY(info->SetFlags(flags));
-  MOZ_TRY(child->SetFlags(flags));
+  if (tracked) {
+    MOZ_TRY(child->ApplyInitialCacheDiscoveryFlags(std::move(*defaultsWrite),
+                                                   flags));
+    defaultsWrite.reset();
+  } else {
+    MOZ_TRY(info->SetFlags(flags));
+    MOZ_TRY(child->SetFlags(flags));
+  }
   MOZ_TRY(child->SetVerifiedAsOnlineFolder(true));
   bool added = !mSubFolders.Contains(folder);
   if (added) {
@@ -1793,46 +1854,43 @@ nsImapMailFolder::GetHierarchyDelimiter(char* aHierarchyDelimiter) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapMailFolder::SetBoxFlags(int32_t aBoxFlags) {
-  ReadDBFolderInfo(false);
-
-  m_boxFlags = aBoxFlags;
+uint32_t nsImapMailFolder::FolderFlagsForBoxFlags(int32_t aBoxFlags) {
   uint32_t newFlags = mFlags;
 
   newFlags |= nsMsgFolderFlags::ImapBox;
 
-  if (m_boxFlags & kNoinferiors)
+  if (aBoxFlags & kNoinferiors)
     newFlags |= nsMsgFolderFlags::ImapNoinferiors;
   else
     newFlags &= ~nsMsgFolderFlags::ImapNoinferiors;
-  if (m_boxFlags & kNoselect)
+  if (aBoxFlags & kNoselect)
     newFlags |= nsMsgFolderFlags::ImapNoselect;
   else
     newFlags &= ~nsMsgFolderFlags::ImapNoselect;
-  if (m_boxFlags & kPublicMailbox)
+  if (aBoxFlags & kPublicMailbox)
     newFlags |= nsMsgFolderFlags::ImapPublic;
   else
     newFlags &= ~nsMsgFolderFlags::ImapPublic;
-  if (m_boxFlags & kOtherUsersMailbox)
+  if (aBoxFlags & kOtherUsersMailbox)
     newFlags |= nsMsgFolderFlags::ImapOtherUser;
   else
     newFlags &= ~nsMsgFolderFlags::ImapOtherUser;
-  if (m_boxFlags & kPersonalMailbox)
+  if (aBoxFlags & kPersonalMailbox)
     newFlags |= nsMsgFolderFlags::ImapPersonal;
   else
     newFlags &= ~nsMsgFolderFlags::ImapPersonal;
 
   // The following are all flags returned by XLIST.
   // nsImapIncomingServer::DiscoveryDone checks for these folders.
-  if (m_boxFlags & kImapDrafts) newFlags |= nsMsgFolderFlags::Drafts;
+  if (aBoxFlags & kImapDrafts) newFlags |= nsMsgFolderFlags::Drafts;
 
-  if (m_boxFlags & kImapSpam) newFlags |= nsMsgFolderFlags::Junk;
+  if (aBoxFlags & kImapSpam) newFlags |= nsMsgFolderFlags::Junk;
 
-  if (m_boxFlags & kImapSent) newFlags |= nsMsgFolderFlags::SentMail;
+  if (aBoxFlags & kImapSent) newFlags |= nsMsgFolderFlags::SentMail;
 
-  if (m_boxFlags & kImapInbox) newFlags |= nsMsgFolderFlags::Inbox;
+  if (aBoxFlags & kImapInbox) newFlags |= nsMsgFolderFlags::Inbox;
 
-  if (m_boxFlags & kImapXListTrash) {
+  if (aBoxFlags & kImapXListTrash) {
     nsCOMPtr<nsIImapIncomingServer> imapServer;
     nsMsgImapDeleteModel deleteModel = nsMsgImapDeleteModels::MoveToTrash;
     (void)GetImapIncomingServer(getter_AddRefs(imapServer));
@@ -1854,9 +1912,41 @@ NS_IMETHODIMP nsImapMailFolder::SetBoxFlags(int32_t aBoxFlags) {
     }
   }
   // Treat the GMail all mail folder as the archive folder.
-  if (m_boxFlags & kImapAllMail)
+  if (aBoxFlags & kImapAllMail)
     newFlags |= nsMsgFolderFlags::Archive | nsMsgFolderFlags::AllMail;
-  if (m_boxFlags & kImapArchive) newFlags |= nsMsgFolderFlags::Archive;
+  if (aBoxFlags & kImapArchive) newFlags |= nsMsgFolderFlags::Archive;
+
+  return newFlags;
+}
+
+NS_IMETHODIMP nsImapMailFolder::SetBoxFlags(int32_t aBoxFlags) {
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    MOZ_TRY(CheckFolderPathAccess());
+    RefPtr<mozilla::mailnews::DatabaseCore> core =
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
+    NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+    auto& folderDB = core->FolderDB();
+    bool tracked;
+    MOZ_TRY(folderDB.HasCacheDiscoveryOrigin(mFolderDatabaseSourceId, mFolderId,
+                                             tracked));
+    if (tracked) {
+      // Existing-mailbox LIST calls this protocol setter directly. Its
+      // generated whole word is structural refresh, not an explicit client flag
+      // choice. Claim before reads/callbacks, never replay initial defaults,
+      // and never turn an acquired action error into an untracked write.
+      auto write = MOZ_TRY(folderDB.BeginCacheDiscoveryFlags(
+          mFolderDatabaseSourceId, mFolderId,
+          mozilla::mailnews::CacheDiscoveryFlagSite::ImapServerRefresh));
+      MOZ_TRY(ReadDBFolderInfo(false));
+      return ApplyPanoramaBoxFlags(std::move(write), aBoxFlags);
+    }
+  }
+#endif
+  ReadDBFolderInfo(false);
+
+  m_boxFlags = aBoxFlags;
+  uint32_t newFlags = FolderFlagsForBoxFlags(aBoxFlags);
 
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup()) {
@@ -2744,6 +2834,15 @@ nsImapMailFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
   nsCString onlineName;
   rv = (*folderInfo)->GetCharProperty("onlineName", onlineName);
   if (NS_FAILED(rv)) return rv;
+
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    // Native values, including an explicit empty string, are authoritative.
+    // Opening a facade must not synthesize or persist a legacy fallback.
+    m_onlineFolderName.Assign(onlineName);
+    return rv;
+  }
+#endif
 
   if (!onlineName.IsEmpty())
     m_onlineFolderName.Assign(onlineName);

@@ -41,6 +41,7 @@ struct NativeOfflineCopyEntry;
 struct NativeFilterHeader;
 #  include "MessageDatabase.h"
 namespace mozilla::mailnews {
+class CacheDiscoveryFlagWrite;
 struct FinishedMessageBody;
 class ParsedServerHdr;
 }  // namespace mozilla::mailnews
@@ -408,11 +409,15 @@ class nsImapMailFolder : public nsMsgDBFolder,
  protected:
   virtual ~nsImapMailFolder();
   // Helper methods
+  // Derive the existing server contribution without persisting client flags.
+  uint32_t FolderFlagsForBoxFlags(int32_t boxFlags);
 #ifdef MOZ_PANORAMA
   nsresult CreatePanoramaClientSubfolderInfo(const nsACString& folderName,
                                              char hierarchyDelimiter,
                                              int32_t boxFlags,
                                              bool suppressNotification);
+  nsresult ApplyPanoramaBoxFlags(
+      mozilla::mailnews::CacheDiscoveryFlagWrite&& write, int32_t boxFlags);
   void DiscardPanoramaDiscovery(nsIFolderLookupService* fls);
 #endif
   nsresult RenameSubFolders(nsIMsgWindow* msgWindow,

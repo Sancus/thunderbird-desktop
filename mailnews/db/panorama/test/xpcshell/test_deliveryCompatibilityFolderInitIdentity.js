@@ -568,7 +568,17 @@ add_task(async function test_feedsNamesKeepTheirOrdinaryRoles() {
       Assert.ok(folder, "The native Feeds root contains " + name);
       Assert.equal(folder.parent, root);
       Assert.equal(folderDB.getFolderParent(folder.id), root.id);
-      Assert.ok(folder.flags & Ci.nsMsgFolderFlags.Mail);
+      const expectedMailFlag = root == coldRoot ? 0 : Ci.nsMsgFolderFlags.Mail;
+      Assert.equal(
+        folder.flags & Ci.nsMsgFolderFlags.Mail,
+        expectedMailFlag,
+        "Public creation sets Mail; cold discovery keeps its native baseline"
+      );
+      Assert.equal(
+        folderDB.getFolderFlags(folder.id) & Ci.nsMsgFolderFlags.Mail,
+        expectedMailFlag,
+        "The native row retains its discovery or creation baseline"
+      );
       Assert.equal(
         folder.flags & roleMask,
         0,

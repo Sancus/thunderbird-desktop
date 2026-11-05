@@ -2789,6 +2789,9 @@ async function checkFreshExistingActions(store, mode) {
           0,
           "Compose is queued until filters finish"
         );
+        // Normal actions retain their order across this async boundary.
+        const thread = folder.msgDatabase.getThreadContainingMsgHdr(header);
+        Assert.ok(thread.flags & Ci.nsMsgMessageFlags.Watched);
         folder.addKeywordsToMessages(headers, value);
         Services.tm.dispatchToMainThread(() => {
           customFinished = true;
@@ -2857,8 +2860,6 @@ async function checkFreshExistingActions(store, mode) {
         },
         { type: Ci.nsMsgFilterAction.JunkScore, junkScore: 100 },
         { type: Ci.nsMsgFilterAction.WatchThread },
-        { type: Ci.nsMsgFilterAction.KillThread },
-        { type: Ci.nsMsgFilterAction.KillSubthread },
         {
           type: Ci.nsMsgFilterAction.Forward,
           strValue: "forward@example.invalid",
@@ -2872,6 +2873,8 @@ async function checkFreshExistingActions(store, mode) {
           customId: custom.id,
           strValue: "completed-custom",
         },
+        { type: Ci.nsMsgFilterAction.KillThread },
+        { type: Ci.nsMsgFilterAction.KillSubthread },
         { type: Ci.nsMsgFilterAction.DeleteFromPop3Server },
       ];
     } else if (mode == "same-folder-move") {
@@ -2976,7 +2979,7 @@ async function checkFreshExistingActions(store, mode) {
         Assert.equal(first.getStringProperty("junkscoreorigin"), "filter");
         Assert.ok(first.flags & Ci.nsMsgMessageFlags.Ignored);
         const thread = folder.msgDatabase.getThreadContainingMsgHdr(first);
-        Assert.ok(thread.flags & Ci.nsMsgMessageFlags.Watched);
+        Assert.ok(!(thread.flags & Ci.nsMsgMessageFlags.Watched));
         Assert.ok(thread.flags & Ci.nsMsgMessageFlags.Ignored);
         Assert.equal(customCalls, 1);
         Assert.deepEqual(composeCalls, [

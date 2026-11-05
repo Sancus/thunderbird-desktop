@@ -1144,8 +1144,18 @@ class CompletedFilterCopyListener final : public CopyServiceListener,
     // path.
     nsCOMPtr<nsIMsgLocalMailFolder> local = do_QueryInterface(destination);
     if (!local) return NS_OK;
+    bool live;
+    MOZ_TRY(source->GetIsLive(&live));
+    NS_ENSURE_TRUE(live, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(source->GetFolder(getter_AddRefs(mSourceFolder)));
+    MOZ_TRY(source->GetMessageKey(&mSourceKey));
+    NS_ENSURE_TRUE(mSourceFolder && mSourceKey != nsMsgKey_None,
+                   NS_ERROR_UNEXPECTED);
     mSource = source;
     mDestination = destination;
+    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy observe listener=%p sourceKey=%u", this,
+             mSourceKey));
     mNotifier = mozilla::components::FolderNotification::Service();
     NS_ENSURE_TRUE(mNotifier, NS_ERROR_NOT_AVAILABLE);
     nsresult rv = mNotifier->AddListener(
@@ -1158,30 +1168,65 @@ class CompletedFilterCopyListener final : public CopyServiceListener,
     if (notifier) (void)notifier->RemoveListener(this);
     mStarted = false;
     mSource = nullptr;
+    mSourceFolder = nullptr;
+    mSourceKey = nsMsgKey_None;
     mDestination = nullptr;
   }
   NS_IMETHOD OnStartCopy() override {
     mStarted = true;
+    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy start listener=%p sourceKey=%u", this,
+             mSourceKey));
     return CopyServiceListener::OnStartCopy();
   }
   NS_IMETHOD OnStopCopy(nsresult status) override {
     RefPtr<CompletedFilterCopyListener> self(this);
+    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy stop listener=%p status=0x%08x started=%d",
+             this, static_cast<uint32_t>(status), mStarted));
     StopObserving();
     return CopyServiceListener::OnStopCopy(status);
   }
   NS_IMETHOD SetMessageKey(nsMsgKey key) override {
+    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy set-key listener=%p key=%u", this, key));
     return mKeyFn ? mKeyFn(NS_OK, key) : NS_OK;
   }
   NS_IMETHOD MsgsMoveCopyCompleted(
       bool move, const nsTArray<RefPtr<nsIMsgDBHdr>>& source,
       nsIMsgFolder* destination,
       const nsTArray<RefPtr<nsIMsgDBHdr>>& arrived) override {
+    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy notify listener=%p started=%d move=%d "
+             "destinationMatch=%d sourceCount=%u arrivedCount=%u sameObject=%d",
+             this, mStarted, move, destination == mDestination, source.Length(),
+             arrived.Length(), source.Length() == 1 && source[0] == mSource));
     if (!mStarted || !move || destination != mDestination ||
-        source.Length() != 1 || source[0] != mSource) {
+        source.Length() != 1 || !source[0]) {
       return NS_OK;
     }
+    // Native local CopyMessages reloads its source array in key order. That
+    // header need not be AttachHdr's output object. Match the captured physical
+    // row in its source folder, never an object address or Message-ID.
+    nsMsgKey sourceKey = nsMsgKey_None;
+    nsCOMPtr<nsIMsgFolder> sourceFolder;
+    nsresult sourceRv = source[0]->GetMessageKey(&sourceKey);
+    if (NS_SUCCEEDED(sourceRv)) {
+      sourceRv = source[0]->GetFolder(getter_AddRefs(sourceFolder));
+    }
+    bool matches = NS_SUCCEEDED(sourceRv) && sourceKey == mSourceKey &&
+                   sourceFolder == mSourceFolder;
+    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy source listener=%p status=0x%08x key=%u "
+             "expectedKey=%u folderMatch=%d accepted=%d",
+             this, static_cast<uint32_t>(sourceRv), sourceKey, mSourceKey,
+             sourceFolder == mSourceFolder, matches));
+    if (!matches) return NS_OK;
     nsMsgKey key = nsMsgKey_None;
     nsresult rv = [&]() -> nsresult {
+      bool sourceLive;
+      MOZ_TRY(source[0]->GetIsLive(&sourceLive));
+      NS_ENSURE_TRUE(sourceLive, NS_ERROR_NOT_AVAILABLE);
       NS_ENSURE_TRUE(arrived.Length() == 1 && arrived[0], NS_ERROR_UNEXPECTED);
       bool live;
       MOZ_TRY(arrived[0]->GetIsLive(&live));
@@ -1191,6 +1236,9 @@ class CompletedFilterCopyListener final : public CopyServiceListener,
       NS_ENSURE_TRUE(folder == mDestination, NS_ERROR_UNEXPECTED);
       return arrived[0]->GetMessageKey(&key);
     }();
+    MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+            ("CompletedFilterCopy receipt listener=%p status=0x%08x key=%u",
+             this, static_cast<uint32_t>(rv), key));
     return mKeyFn ? mKeyFn(rv, key) : rv;
   }
 
@@ -1232,6 +1280,8 @@ class CompletedFilterCopyListener final : public CopyServiceListener,
   ~CompletedFilterCopyListener() override = default;
   nsCOMPtr<nsIMsgFolderNotificationService> mNotifier;
   nsCOMPtr<nsIMsgDBHdr> mSource;
+  nsCOMPtr<nsIMsgFolder> mSourceFolder;
+  nsMsgKey mSourceKey = nsMsgKey_None;
   nsCOMPtr<nsIMsgFolder> mDestination;
   bool mStarted = false;
 };
@@ -1556,6 +1606,13 @@ void nsParseNewMailState::CancelCompletedFilters(nsresult status) {
 nsresult nsParseNewMailState::OnCompletedFilterCopy(CompletedFilterState* state,
                                                     uint64_t serial,
                                                     nsresult status) {
+  MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+          ("CompletedFilterCopy completion state=%p serial=%llu current=%d "
+           "waiting=%d serialMatch=%d status=0x%08x key=%u first=0x%08x",
+           state, static_cast<unsigned long long>(serial),
+           m_completedFilters == state, state->waiting,
+           state->copySerial == serial, static_cast<uint32_t>(status),
+           state->destinationKey, static_cast<uint32_t>(state->status)));
   if (m_completedFilters != state || !state->waiting ||
       state->copySerial != serial)
     return NS_OK;
@@ -1568,6 +1625,9 @@ nsresult nsParseNewMailState::OnCompletedFilterCopy(CompletedFilterState* state,
               ? NS_ERROR_UNEXPECTED
               : state->moveDestination->GetMessageHeader(
                     state->destinationKey, getter_AddRefs(destination));
+      MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+              ("CompletedFilterCopy destination state=%p key=%u status=0x%08x",
+               state, state->destinationKey, static_cast<uint32_t>(rv)));
       state->Record(rv);
       if (NS_SUCCEEDED(rv)) {
         if (m_msgToForwardOrReply == state->header) {
@@ -1899,10 +1959,22 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
               MOZ_TRY(listener->ObserveMove(state->header, destination));
             }
             state->waiting = state->dispatching = true;
+            MOZ_LOG(
+                FILTERLOGMODULE, LogLevel::Debug,
+                ("CompletedFilterCopy dispatch state=%p listener=%p "
+                 "serial=%llu fresh=%d move=%d",
+                 state, listener.get(), static_cast<unsigned long long>(serial),
+                 state->fresh, move));
             nsresult copyRv = copy->CopyMessages(
                 m_downloadFolder, {state->header.get()}, destination, move,
                 listener, m_msgWindow, false);
             state->dispatching = false;
+            MOZ_LOG(
+                FILTERLOGMODULE, LogLevel::Debug,
+                ("CompletedFilterCopy dispatched state=%p status=0x%08x "
+                 "waiting=%d key=%u first=0x%08x",
+                 state, static_cast<uint32_t>(copyRv), state->waiting,
+                 state->destinationKey, static_cast<uint32_t>(state->status)));
             if (NS_FAILED(copyRv)) listener->StopObserving();
             return copyRv;
           }
@@ -1929,6 +2001,9 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
       if (NS_SUCCEEDED(countRv) && count > 0) {
         countRv = m_downloadFolder->SetNumNewMessages(count - 1);
       }
+      MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+              ("CompletedFilterCopy counts state=%p status=0x%08x", state,
+               static_cast<uint32_t>(countRv)));
       state->Record(countRv);
       ++m_numNotNewMessages;
     }
@@ -1940,6 +2015,11 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
       m_msgToForwardOrReply = nullptr;
     }
   }
+  MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
+          ("CompletedFilterCopy final state=%p fresh=%d notNew=%d "
+           "status=0x%08x",
+           state, state->fresh, state->notNew,
+           static_cast<uint32_t>(state->status)));
   m_completedFilters = nullptr;
   nsCOMPtr<nsIMsgOperationListener> completion = state->completion.forget();
   if (completion) (void)completion->OnStopOperation(state->status);

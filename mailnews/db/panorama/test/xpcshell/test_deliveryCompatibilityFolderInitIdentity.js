@@ -59,19 +59,21 @@ function readCacheOrigin(folder) {
 }
 
 /**
- * Lets the real local store discover children before their wrappers exist.
+ * Lets the real mailbox store discover children before their wrappers exist.
  *
  * @param {string} label - The independent ordinary fixture name.
  * @param {string[]} names - Child body-store names to discover.
  * @param {function(): void} [beforeInit] - Optional factory fault setup.
  * @param {string[]} [rootNames] - Additional real root-level body-store names.
+ * @param {"none"|"rss"} [serverType="none"] - The native account to create.
  * @returns {Promise<nsIMsgFolder>} The normally initialized physical parent.
  */
 async function createObservedCacheChildren(
   label,
   names,
   beforeInit,
-  rootNames = []
+  rootNames = [],
+  serverType = "none"
 ) {
   const lane = PanoramaDelivery.expectedLane();
   do_get_profile();
@@ -106,7 +108,7 @@ async function createObservedCacheChildren(
       Services.prefs.deleteBranch(prefPrefix);
     }
   });
-  Services.prefs.setStringPref(prefPrefix + "type", "none");
+  Services.prefs.setStringPref(prefPrefix + "type", serverType);
   Services.prefs.setStringPref(prefPrefix + "userName", label);
   Services.prefs.setStringPref(prefPrefix + "hostname", label + ".invalid");
   Services.prefs.setStringPref(
@@ -520,4 +522,87 @@ add_task(async function test_localDefaultNewAndPublicRowsRemainUnqualified() {
     MailServices.folderLookup.getFolderForURL(trash.URI),
     trash
   );
+});
+
+add_task(async function test_feedsNamesKeepTheirOrdinaryRoles() {
+  const lane = PanoramaDelivery.expectedLane();
+  const names = ["Drafts", "Archives", "Sent", "Templates", "Junk"];
+  const roleMask =
+    Ci.nsMsgFolderFlags.SentMail |
+    Ci.nsMsgFolderFlags.Drafts |
+    Ci.nsMsgFolderFlags.Templates |
+    Ci.nsMsgFolderFlags.Junk |
+    Ci.nsMsgFolderFlags.Archive;
+  const parent = await createObservedCacheChildren(
+    "origin-feeds-cold",
+    [],
+    undefined,
+    names,
+    "rss"
+  );
+  const coldRoot = parent.parent;
+  const publicParent = await createObservedCacheChildren(
+    "origin-feeds-public",
+    [],
+    undefined,
+    [],
+    "rss"
+  );
+  const publicRoot = publicParent.parent;
+  const localRoot = publicRoot.QueryInterface(Ci.nsIMsgLocalMailFolder);
+  for (const name of names) {
+    const folder = localRoot.createLocalSubfolder(name);
+    Assert.equal(
+      readCacheOrigin(folder),
+      null,
+      "Public creation has no origin"
+    );
+  }
+  for (const root of [coldRoot, publicRoot]) {
+    Assert.equal(root.server.type, "rss");
+    Assert.equal(root.server.localStoreType, "mailbox");
+    PanoramaDelivery._assertStore(root, lane);
+    const snapshots = [];
+    for (const name of names) {
+      const folder = root.getChildNamed(name);
+      Assert.ok(folder, "The native Feeds root contains " + name);
+      Assert.equal(folder.parent, root);
+      Assert.equal(folderDB.getFolderParent(folder.id), root.id);
+      Assert.ok(folder.flags & Ci.nsMsgFolderFlags.Mail);
+      Assert.equal(
+        folder.flags & roleMask,
+        0,
+        "A Feeds name does not grant a mail special-use role"
+      );
+      Assert.equal(folderDB.getFolderFlags(folder.id) & roleMask, 0);
+      const origin = readCacheOrigin(folder);
+      if (root == coldRoot) {
+        Assert.ok(origin, "Cold store discovery has native origin");
+        Assert.equal(origin.mask, 0, "Discovery is not public flag intent");
+      } else {
+        Assert.equal(origin, null, "Public rows stay unqualified");
+      }
+      snapshots.push({ folder, flags: folder.flags });
+    }
+    root.server
+      .QueryInterface(Ci.nsILocalMailIncomingServer)
+      .setFlagsOnDefaultMailboxes();
+    const trash = root.getChildNamed("Trash");
+    Assert.ok(trash.flags & Ci.nsMsgFolderFlags.Trash, "Feeds keeps its Trash");
+    Assert.ok(folderDB.getFolderFlags(trash.id) & Ci.nsMsgFolderFlags.Trash);
+    for (const { folder, flags } of snapshots) {
+      Assert.equal(
+        folder.flags,
+        flags,
+        "The Feeds sweep leaves this row alone"
+      );
+      Assert.equal(folderDB.getFolderFlags(folder.id), flags);
+      folder.msgDatabase.forceClosed();
+      Assert.equal(folder.msgDatabase.dBFolderInfo.flags >>> 0, flags >>> 0);
+      Assert.strictEqual(
+        MailServices.folderLookup.getFolderForURL(folder.URI),
+        folder
+      );
+    }
+  }
 });

@@ -4386,8 +4386,18 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
     auto* nativeFolder = static_cast<nsMsgDBFolder*>(folder.get());
     uint32_t defaultRole = 0;
     if (isServer && localStoreType.EqualsLiteral("mailbox")) {
+      nsAutoCString serverType;
+      MOZ_TRY(server->GetType(serverType));
+      uint32_t defaultRoleMask = 0;
+      if (serverType.EqualsLiteral("none")) {
+        defaultRoleMask = nsMsgFolderFlags::SpecialUse;
+      } else if (serverType.EqualsLiteral("pop3")) {
+        defaultRoleMask =
+            nsMsgFolderFlags::SpecialUse & ~nsMsgFolderFlags::Queue;
+      }
+      // Match the account's existing default sweep before classifying a role.
       for (const auto& role : kLocalCacheDefaultRoles) {
-        if (actualName.Equals(role.name)) {
+        if ((defaultRoleMask & role.flag) && actualName.Equals(role.name)) {
           defaultRole = role.flag;
           break;
         }
@@ -4433,7 +4443,7 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
     } else if (!tracked) {
       // Unknown/public and valid old/sealed rows retain ordinary behavior.
       // No refused or acquired action falls back to an ordinary setter.
-      MOZ_TRY(folder->SetFlag(flags | nsMsgFolderFlags::Mail | defaultRole));
+      MOZ_TRY(folder->SetFlag(flags | nsMsgFolderFlags::Mail));
     }
     // A flag callback may have changed the physical owner or reentered here.
     MOZ_TRY(nativeFolder->CheckFolderPathAccess());

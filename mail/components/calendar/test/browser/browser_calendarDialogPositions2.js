@@ -2,7 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, you can obtain one at http://mozilla.org/MPL/2.0/.
  *
- * globals setupPositining, runPositioningTest, sizes
+ * globals createCalendar, createEvent, openEvent, cal, CalendarTestUtils,
+ * checkTolerance
  */
 
 "use strict";
@@ -10,5 +11,5 @@
 add_setup(setupPositioning);
 
 add_task(async function test_scrollPositions() {
-  await runPositioningTest(sizes.slice(6, 9));
+  await runPositioningTest([sizes[6]], [0, 1, 2]);
 });

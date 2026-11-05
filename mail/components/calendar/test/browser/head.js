@@ -617,15 +617,19 @@ async function testDurations(size, offsets = [0, 1, 2, 3, 4, 5, 6]) {
 /**
  * Test dialog positions with different screensizes
  *
- * @param {object[]} windowSizes
+ * @param {object[]} windowSizes - Window sizes exercised by this test file.
+ * @param {number[]} [offsets] - Day offsets exercised by this test file.
  */
-async function runPositioningTest(windowSizes) {
+async function runPositioningTest(
+  windowSizes,
+  offsets = [0, 1, 2, 3, 4, 5, 6]
+) {
   const calendar = createCalendar();
 
   for (const size of windowSizes) {
     await resizeWindow(size);
 
-    for (const offset of [0, 1, 2, 3, 4, 5, 6]) {
+    for (const offset of offsets) {
       for (const hour of [0, 6, 12, 18, 23]) {
         await positionTest({ calendar, hour, offset, size });
       }

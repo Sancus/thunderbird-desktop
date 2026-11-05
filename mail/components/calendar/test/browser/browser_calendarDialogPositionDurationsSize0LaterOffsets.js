@@ -10,5 +10,5 @@
 add_setup(setupPositioning);
 
 add_task(async function test_duration0LaterOffsets() {
-  await testDurations(sizes[0], [3, 4, 5, 6]);
+  await testDurations(sizes[0], [3]);
 });

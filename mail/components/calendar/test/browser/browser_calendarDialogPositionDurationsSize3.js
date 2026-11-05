@@ -10,5 +10,5 @@
 add_setup(setupPositioning);
 
 add_task(async function test_duration3() {
-  await testDurations(sizes[3], [0, 1, 2]);
+  await testDurations(sizes[3], [0]);
 });

@@ -10,7 +10,8 @@ prefs = [
 ]
 head = ["head.js"]
 support-files = [
-  "files/*"
+  "files/*",
+  "head_calendarDialogIntegration.js"
 ]
 subsuite = "thunderbird"
 
@@ -75,3 +76,67 @@ subsuite = "thunderbird"
 ["browser_calendarEventCreateEditDialogRouting.js"]
 
 ["browser_positionedDialog.js"]
+
+["browser_calendarDialogIntegrationDeletion.js"]
+
+["browser_calendarDialogPositionsSize0LaterOffsets.js"]
+
+["browser_calendarDialogPositionsSize1EarlyOffsets.js"]
+
+["browser_calendarDialogPositionsSize1LaterOffsets.js"]
+
+["browser_calendarDialogPositionsSize3LaterOffsets.js"]
+
+["browser_calendarDialogPositionsSize4EarlyOffsets.js"]
+
+["browser_calendarDialogPositionsSize4LaterOffsets.js"]
+
+["browser_calendarDialogPositionsSize6LaterOffsets.js"]
+
+["browser_calendarDialogPositionsSize7EarlyOffsets.js"]
+
+["browser_calendarDialogPositionsSize7LaterOffsets.js"]
+
+["browser_calendarDialogPositionsSize8EarlyOffsets.js"]
+
+["browser_calendarDialogPositionsSize8LaterOffsets.js"]
+
+["browser_calendarDialogPositionDurationsSize0Offset1.js"]
+
+["browser_calendarDialogPositionDurationsSize0Offset2.js"]
+
+["browser_calendarDialogPositionDurationsSize0Offset4.js"]
+
+["browser_calendarDialogPositionDurationsSize0Offset5.js"]
+
+["browser_calendarDialogPositionDurationsSize0Offset6.js"]
+
+["browser_calendarDialogPositionDurationsSize1Offset1.js"]
+
+["browser_calendarDialogPositionDurationsSize1Offset2.js"]
+
+["browser_calendarDialogPositionDurationsSize1Offset4.js"]
+
+["browser_calendarDialogPositionDurationsSize1Offset5.js"]
+
+["browser_calendarDialogPositionDurationsSize1Offset6.js"]
+
+["browser_calendarDialogPositionDurationsSize2Offset1.js"]
+
+["browser_calendarDialogPositionDurationsSize2Offset2.js"]
+
+["browser_calendarDialogPositionDurationsSize2Offset4.js"]
+
+["browser_calendarDialogPositionDurationsSize2Offset5.js"]
+
+["browser_calendarDialogPositionDurationsSize2Offset6.js"]
+
+["browser_calendarDialogPositionDurationsSize3Offset1.js"]
+
+["browser_calendarDialogPositionDurationsSize3Offset2.js"]
+
+["browser_calendarDialogPositionDurationsSize3Offset4.js"]
+
+["browser_calendarDialogPositionDurationsSize3Offset5.js"]
+
+["browser_calendarDialogPositionDurationsSize3Offset6.js"]

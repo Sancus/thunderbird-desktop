@@ -293,6 +293,7 @@ add_task(async function testRSS() {
   await loadedPromise;
 
   Assert.notEqual(messagePane.currentURI.spec, "about:blank");
+  const summaryURI = messagePane.currentURI.spec;
   await SpecialPowers.spawn(messagePane, [], () => {
     const doc = content.document;
 
@@ -371,8 +372,25 @@ add_task(async function testRSS() {
 
   // Clean up.
 
-  await unsubscribeCurrentRow();
+  // Restoring this preference reloads the selected message. Finish that real
+  // summary load while the folder still exists, then unsubscribe and retire it.
+  loadedPromise = BrowserTestUtils.browserLoaded(
+    messagePane,
+    false,
+    summaryURI
+  );
   window.FeedMessageHandler.onSelectPref = 1;
+  await loadedPromise;
+  await TestUtils.waitForCondition(
+    () => messagePane.webProgress.isLoadingDocument === false,
+    "The restored RSS summary finishes loading before folder removal"
+  );
+  Assert.equal(
+    messagePane.currentURI.spec,
+    summaryURI,
+    "The original stored summary is restored before retiring its folder"
+  );
+  await unsubscribeCurrentRow();
   folderTree.selectedIndex = 0;
 });
 

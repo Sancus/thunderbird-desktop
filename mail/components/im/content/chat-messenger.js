@@ -1333,7 +1333,7 @@ var chatHandler = {
     if (convView) {
       convView.switchingToPanel();
     } else {
-      const browser = this.getBrowser();
+      const browser = chatTabType.getBrowser();
       if (browser?.id == "conv-log-browser") {
         browser.isActive = true;
       }
@@ -1344,7 +1344,7 @@ var chatHandler = {
     if (convView) {
       convView.switchingAwayFromPanel(aHidden);
     } else if (aHidden) {
-      const browser = this.getBrowser();
+      const browser = chatTabType.getBrowser();
       if (browser?.id == "conv-log-browser") {
         browser.isActive = false;
       }

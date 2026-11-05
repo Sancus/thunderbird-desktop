@@ -177,18 +177,18 @@ class nsMsgDBFolder : public nsSupportsWeakReference,
                             nsTArray<FolderInitialization>& initializedFolders);
   nsresult GetCachedChild(uint64_t folderId, nsIMsgFolder** child);
   static void RollbackFolderInitialization(
-    nsIFolderLookupService* lookup,
-    nsTArray<FolderInitialization>& initializedFolders);
+      nsIFolderLookupService* lookup,
+      nsTArray<FolderInitialization>& initializedFolders);
   // The native action commits before warm flags or notifications change.
   nsresult ApplyInitialCacheDiscoveryFlags(
-    mozilla::mailnews::CacheDiscoveryFlagWrite&& write,
-    uint32_t proposedNativeFlags);
+      mozilla::mailnews::CacheDiscoveryFlagWrite&& write,
+      uint32_t proposedNativeFlags);
 
  private:
   friend class mozilla::mailnews::DatabaseCore;
   // Validate the pinned wrapper before the native cache import commits.
   nsresult CheckCacheImportFlags(const nsACString& expectedSourceId,
-                                uint64_t folderId, uint32_t beforeFlags);
+                                 uint64_t folderId, uint32_t beforeFlags);
   // Core calls this only after committing all folders, without callbacks.
   void PublishCacheImportFlags(uint32_t committedFlags);
 

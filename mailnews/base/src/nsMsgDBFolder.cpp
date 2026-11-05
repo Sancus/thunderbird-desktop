@@ -86,8 +86,8 @@ using namespace mozilla;
 using mozilla::dom::Promise;
 
 static constexpr uint32_t kCacheImportClientMask =
-  nsMsgFolderFlags::Elided | nsMsgFolderFlags::Offline |
-  nsMsgFolderFlags::CheckNew | nsMsgFolderFlags::Favorite;
+    nsMsgFolderFlags::Elided | nsMsgFolderFlags::Offline |
+    nsMsgFolderFlags::CheckNew | nsMsgFolderFlags::Favorite;
 
 #define oneHour 3600000000U
 
@@ -2839,7 +2839,7 @@ NS_IMETHODIMP nsMsgDBFolder::InitWithFolderId(uint64_t folderId) {
 
   nsTArray<FolderInitialization> initializedFolders;
   auto rollback = mozilla::MakeScopeExit(
-    [&] { RollbackFolderInitialization(fls, initializedFolders); });
+      [&] { RollbackFolderInitialization(fls, initializedFolders); });
   rv = InitWithFolderId(folderId, initializedFolders);
   NS_ENSURE_SUCCESS(rv, rv);
   rollback.release();
@@ -2850,11 +2850,9 @@ NS_IMETHODIMP nsMsgDBFolder::InitWithFolderId(uint64_t folderId) {
 }
 
 #ifdef MOZ_PANORAMA
-void
-nsMsgDBFolder::RollbackFolderInitialization(
-  nsIFolderLookupService* lookup,
-  nsTArray<FolderInitialization>& initializedFolders)
-{
+void nsMsgDBFolder::RollbackFolderInitialization(
+    nsIFolderLookupService* lookup,
+    nsTArray<FolderInitialization>& initializedFolders) {
   // Only these objects and their new attachments belong to this attempt.
   for (size_t i = initializedFolders.Length(); i > 0; --i) {
     auto& entry = initializedFolders[i - 1];
@@ -2879,9 +2877,8 @@ nsMsgDBFolder::RollbackFolderInitialization(
   }
 }
 
-static nsresult
-EscapeLogicalFolderPath(const nsACString& path, nsACString& uriPath)
-{
+static nsresult EscapeLogicalFolderPath(const nsACString& path,
+                                        nsACString& uriPath) {
   // Logical paths already escape percent and slash within each physical name.
   // Decode each component once before URI escaping so an embedded slash cannot
   // become a hierarchy separator, and a literal percent is not escaped twice.
@@ -2954,7 +2951,7 @@ nsresult nsMsgDBFolder::InitWithFolderId(
   mozilla::mailnews::FolderDatabase& folderDB(dbCore->FolderDB());
   MOZ_TRY(dbCore->GetSourceId(mFolderDatabaseSourceId));
   MOZ_TRY(folderDB.ObserveCacheFolderInitialization(
-    mFolderDatabaseSourceId, folderId, mPrebindExplicitCacheClientMask));
+      mFolderDatabaseSourceId, folderId, mPrebindExplicitCacheClientMask));
 
   uint64_t parentId = MOZ_TRY(folderDB.GetFolderParent(folderId));
   mIsServer = (parentId == 0);
@@ -3024,8 +3021,8 @@ nsresult nsMsgDBFolder::InitWithFolderId(
     rv = store->DiscoverChildFolders(this, childNames);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    MOZ_TRY(folderDB.ReconcileCacheDiscoveryChildren(
-      mFolderDatabaseSourceId, folderId, childNames));
+    MOZ_TRY(folderDB.ReconcileCacheDiscoveryChildren(mFolderDatabaseSourceId,
+                                                     folderId, childNames));
   }
 
   nsAutoCString contractId("@mozilla.org/mail/folder-factory;1?name=");
@@ -4339,11 +4336,11 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
     }
 
     nsCOMPtr<nsIFolderLookupService> lookup =
-      do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
+        do_GetService("@mozilla.org/mail/folder-lookup;1", &rv);
     NS_ENSURE_SUCCESS(rv, rv);
     nsTArray<FolderInitialization> initializedFolders;
     auto rollback = mozilla::MakeScopeExit(
-      [&] { RollbackFolderInitialization(lookup, initializedFolders); });
+        [&] { RollbackFolderInitialization(lookup, initializedFolders); });
 
     nsCOMPtr<nsIMsgIncomingServer> server;
     rv = GetServer(getter_AddRefs(server));
@@ -4360,7 +4357,7 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
       folder = do_CreateInstance(contractId.get(), &rv);
       NS_ENSURE_SUCCESS(rv, rv);
       rv = static_cast<nsMsgDBFolder*>(folder.get())
-             ->InitWithFolderId(subFolderId, initializedFolders);
+               ->InitWithFolderId(subFolderId, initializedFolders);
       NS_ENSURE_SUCCESS(rv, rv);
       rv = folder->SetParent(this);
       NS_ENSURE_SUCCESS(rv, rv);
@@ -4369,15 +4366,14 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
     auto* nativeFolder = static_cast<nsMsgDBFolder*>(folder.get());
     bool tracked = false;
     MOZ_TRY(folderDB.HasCacheDiscoveryOrigin(
-      nativeFolder->mFolderDatabaseSourceId, subFolderId, tracked));
+        nativeFolder->mFolderDatabaseSourceId, subFolderId, tracked));
     if (tracked) {
       auto write = MOZ_TRY(folderDB.BeginCacheDiscoveryFlags(
-        nativeFolder->mFolderDatabaseSourceId,
-        subFolderId,
-        mozilla::mailnews::CacheDiscoveryFlagSite::LocalInitialChild));
+          nativeFolder->mFolderDatabaseSourceId, subFolderId,
+          mozilla::mailnews::CacheDiscoveryFlagSite::LocalInitialChild));
       MOZ_TRY(nativeFolder->ApplyInitialCacheDiscoveryFlags(
-        std::move(write),
-        nativeFolder->mFlags | flags | nsMsgFolderFlags::Mail));
+          std::move(write),
+          nativeFolder->mFlags | flags | nsMsgFolderFlags::Mail));
     } else {
       // Native participation is checked independently of the current word.
       // No refused or acquired action falls back to an ordinary setter.
@@ -5074,31 +5070,30 @@ NS_IMETHODIMP nsMsgDBFolder::ChangeNumPendingTotalMessages(int32_t delta) {
   return NS_OK;
 }
 
-nsresult
-nsMsgDBFolder::RecordCacheClientFlagAttempt(uint32_t attemptedClientMask)
-{
+nsresult nsMsgDBFolder::RecordCacheClientFlagAttempt(
+    uint32_t attemptedClientMask) {
 #ifdef MOZ_PANORAMA
   if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
     mPrebindExplicitCacheClientMask |=
-      attemptedClientMask & kCacheImportClientMask;
+        attemptedClientMask & kCacheImportClientMask;
     if (!mFolderId || mFolderDatabaseSourceId.IsEmpty()) {
       return NS_OK;
     }
     RefPtr<mozilla::mailnews::DatabaseCore> core =
-      mozilla::mailnews::DatabaseCore::sInstance;
+        mozilla::mailnews::DatabaseCore::sInstance;
     NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
     MOZ_TRY(CheckFolderPathAccess());
     return core->FolderDB().RecordCacheClientFlagAttempt(
-      mFolderDatabaseSourceId, mFolderId, attemptedClientMask);
+        mFolderDatabaseSourceId, mFolderId, attemptedClientMask);
   }
 #endif
   return NS_OK;
 }
 
 #ifdef MOZ_PANORAMA
-nsresult nsMsgDBFolder::CheckCacheImportFlags(const nsACString& expectedSourceId,
-                                           uint64_t folderId,
-                                           uint32_t beforeFlags) {
+nsresult nsMsgDBFolder::CheckCacheImportFlags(
+    const nsACString& expectedSourceId, uint64_t folderId,
+    uint32_t beforeFlags) {
   NS_ENSURE_TRUE(StaticPrefs::mail_panorama_enabled_AtStartup() && folderId &&
                      folderId == mFolderId && !expectedSourceId.IsEmpty() &&
                      mFolderDatabaseSourceId.Equals(expectedSourceId),
@@ -5116,17 +5111,15 @@ void nsMsgDBFolder::PublishCacheImportFlags(uint32_t committedFlags) {
   mFlags = committedFlags;
 }
 
-nsresult
-nsMsgDBFolder::ApplyInitialCacheDiscoveryFlags(
-  mozilla::mailnews::CacheDiscoveryFlagWrite&& write,
-  uint32_t proposedNativeFlags)
-{
+nsresult nsMsgDBFolder::ApplyInitialCacheDiscoveryFlags(
+    mozilla::mailnews::CacheDiscoveryFlagWrite&& write,
+    uint32_t proposedNativeFlags) {
   MOZ_TRY(CheckFolderPathAccess());
   NS_ENSURE_TRUE(write.FolderId() == mFolderId &&
-                   write.SourceId().Equals(mFolderDatabaseSourceId),
+                     write.SourceId().Equals(mFolderDatabaseSourceId),
                  NS_ERROR_NOT_AVAILABLE);
   RefPtr<mozilla::mailnews::DatabaseCore> core =
-    mozilla::mailnews::DatabaseCore::sInstance;
+      mozilla::mailnews::DatabaseCore::sInstance;
   NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
   const uint32_t before = mFlags;
   uint32_t stored;
@@ -5134,7 +5127,7 @@ nsMsgDBFolder::ApplyInitialCacheDiscoveryFlags(
     // Destroy the consumed action before any observer can run.
     auto action = std::move(write);
     MOZ_TRY(core->FolderDB().ApplyCacheDiscoveryFlags(
-      std::move(action), proposedNativeFlags | mLockedFlags, stored));
+        std::move(action), proposedNativeFlags | mLockedFlags, stored));
   }
   mFlags = stored;
   const uint32_t changed = before ^ stored;
@@ -5167,8 +5160,7 @@ nsMsgDBFolder::ApplyInitialCacheDiscoveryFlags(
 #endif
 
 NS_IMETHODIMP
-nsMsgDBFolder::SetFlag(uint32_t flag)
-{
+nsMsgDBFolder::SetFlag(uint32_t flag) {
   MOZ_TRY(RecordCacheClientFlagAttempt(kCacheImportClientMask));
   // If calling this function causes us to open the db (i.e., it was not
   // open before), we're going to close the db before returning.
@@ -5194,8 +5186,7 @@ nsMsgDBFolder::SetFlag(uint32_t flag)
 }
 
 NS_IMETHODIMP
-nsMsgDBFolder::ClearFlag(uint32_t flag)
-{
+nsMsgDBFolder::ClearFlag(uint32_t flag) {
   MOZ_TRY(RecordCacheClientFlagAttempt(kCacheImportClientMask));
   if (flag & mLockedFlags) {
     return NS_OK;
@@ -5229,8 +5220,7 @@ NS_IMETHODIMP nsMsgDBFolder::GetFlag(uint32_t flag, bool* _retval) {
 }
 
 NS_IMETHODIMP
-nsMsgDBFolder::ToggleFlag(uint32_t flag)
-{
+nsMsgDBFolder::ToggleFlag(uint32_t flag) {
   MOZ_TRY(RecordCacheClientFlagAttempt(kCacheImportClientMask));
   if (flag & mLockedFlags) {
     return NS_OK;
@@ -5268,8 +5258,7 @@ NS_IMETHODIMP nsMsgDBFolder::OnFlagChange(uint32_t flag) {
 }
 
 NS_IMETHODIMP
-nsMsgDBFolder::SetFlags(uint32_t aFlags)
-{
+nsMsgDBFolder::SetFlags(uint32_t aFlags) {
   MOZ_TRY(RecordCacheClientFlagAttempt(kCacheImportClientMask));
   aFlags |= mLockedFlags;
 

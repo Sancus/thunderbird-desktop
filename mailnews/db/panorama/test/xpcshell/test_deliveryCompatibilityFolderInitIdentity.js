@@ -65,15 +65,20 @@ async function createObservedCacheChildren(label, names, beforeInit) {
   do_get_profile();
   loadExistingDB();
   const server = MailServices.accounts.createIncomingServer(
-    label, label + ".invalid", "none"
+    label,
+    label + ".invalid",
+    "none"
   );
   registerCleanupFunction(() =>
     MailServices.accounts.removeIncomingServer(server, false)
   );
-  server.setStringValue("storeContractID", {
-    mbox: "@mozilla.org/msgstore/berkeleystore;1",
-    maildir: "@mozilla.org/msgstore/maildirstore;1",
-  }[lane.store]);
+  server.setStringValue(
+    "storeContractID",
+    {
+      mbox: "@mozilla.org/msgstore/berkeleystore;1",
+      maildir: "@mozilla.org/msgstore/maildirstore;1",
+    }[lane.store]
+  );
   const directory = do_get_profile();
   directory.append(label);
   await IOUtils.makeDirectory(directory.path);
@@ -138,23 +143,34 @@ add_task(function test_reusesCachedChildWithoutDuplicateAttachment() {
 
 add_task(async function test_explicitFlagAttemptsIncludeZeroAndNoOps() {
   const attempts = [
-    ["SetZero", folder => {
-      folder.flags = 0;
-    }],
-    ["SetEqual", folder => {
-      folder.flags = folder.flags;
-    }],
+    [
+      "SetZero",
+      folder => {
+        folder.flags = 0;
+      },
+    ],
+    [
+      "SetEqual",
+      folder => {
+        const flags = folder.flags;
+        folder.flags = flags;
+      },
+    ],
     ["AddZero", folder => folder.setFlag(0)],
     ["ClearZero", folder => folder.clearFlag(0)],
     ["ToggleZero", folder => folder.toggleFlag(0)],
-    ["InfoZero", (folder, info) => {
-      info.flags = 0;
-    }],
+    [
+      "InfoZero",
+      (folder, info) => {
+        info.flags = 0;
+      },
+    ],
     ["InfoOrZero", (folder, info) => info.orFlags(0)],
     ["InfoAndEqual", (folder, info) => info.andFlags(-1)],
   ];
   const parent = await createObservedCacheChildren(
-    "origin-attempts", attempts.map(([name]) => name)
+    "origin-attempts",
+    attempts.map(([name]) => name)
   );
   for (const [name, attempt] of attempts) {
     const folder = parent.getChildNamed(name);
@@ -202,17 +218,20 @@ add_task(async function test_prebindZeroIsRestrictiveBeforeFactoryCallbacks() {
   let parent;
   try {
     parent = await createObservedCacheChildren(
-      "origin-prebind", ["Prebind"], () => {
-      // A real factory hook is necessary to attempt a write BEFORE ID binding.
-      // All returned objects are ordinary native folders, not JS/QI proxies.
-      cid = MockRegistrar.register(contract, () => {
-        Assert.less(calls, created.length);
-        const child = created[calls++];
-        Assert.equal(child.id, 0);
-        child.flags = 0;
-        return child;
-      });
-    });
+      "origin-prebind",
+      ["Prebind"],
+      () => {
+        // A real factory hook is necessary to attempt a write BEFORE ID binding.
+        // All returned objects are ordinary native folders, not JS/QI proxies.
+        cid = MockRegistrar.register(contract, () => {
+          Assert.less(calls, created.length);
+          const child = created[calls++];
+          Assert.equal(child.id, 0);
+          child.flags = 0;
+          return child;
+        });
+      }
+    );
   } finally {
     if (cid) {
       MockRegistrar.unregister(cid);
@@ -231,9 +250,10 @@ add_task(async function test_prebindZeroIsRestrictiveBeforeFactoryCallbacks() {
 });
 
 add_task(async function test_reentrantChoicesKeepTheirAuthority() {
-  const parent = await createObservedCacheChildren(
-    "origin-reentry", ["First", "Sibling"]
-  );
+  const parent = await createObservedCacheChildren("origin-reentry", [
+    "First",
+    "Sibling",
+  ]);
   const first = parent.getChildNamed("First");
   const sibling = parent.getChildNamed("Sibling");
   const info = first.msgDatabase.dBFolderInfo;
@@ -270,15 +290,20 @@ add_task(async function test_reentrantChoicesKeepTheirAuthority() {
 add_task(async function test_lockedFlagsRecordIntentBeforeTheirEarlyReturn() {
   const lane = PanoramaDelivery.expectedLane();
   const server = MailServices.accounts.createIncomingServer(
-    "origin-locked", "origin-locked.invalid", "imap"
+    "origin-locked",
+    "origin-locked.invalid",
+    "imap"
   );
   registerCleanupFunction(() =>
     MailServices.accounts.removeIncomingServer(server, false)
   );
-  server.setStringValue("storeContractID", {
-    mbox: "@mozilla.org/msgstore/berkeleystore;1",
-    maildir: "@mozilla.org/msgstore/maildirstore;1",
-  }[lane.store]);
+  server.setStringValue(
+    "storeContractID",
+    {
+      mbox: "@mozilla.org/msgstore/berkeleystore;1",
+      maildir: "@mozilla.org/msgstore/maildirstore;1",
+    }[lane.store]
+  );
   const directory = do_get_profile();
   directory.append("origin-locked");
   await IOUtils.makeDirectory(directory.path);

@@ -424,7 +424,7 @@ nsresult nsMsgIncomingServer::CreateRootFolder() {
 #ifdef MOZ_PANORAMA
   if (StaticPrefs::mail_panorama_enabled_AtStartup()) {
     RefPtr<mozilla::mailnews::DatabaseCore> database =
-      mozilla::mailnews::DatabaseCore::GetInstanceForService();
+        mozilla::mailnews::DatabaseCore::GetInstanceForService();
     auto& folders = database->FolderDB();
     nsCString sourceId;
     MOZ_TRY(database->GetSourceId(sourceId));
@@ -432,11 +432,8 @@ nsresult nsMsgIncomingServer::CreateRootFolder() {
     // Native row birth precedes factory exposure; existing roots stay native.
     uint64_t rootId = 0;
     MOZ_TRY(folders.InsertCacheDiscoveryFolder(
-      sourceId,
-      0,
-      m_serverKey,
-      mozilla::mailnews::CacheDiscoveryFlagSite::CommonRoot,
-      rootId));
+        sourceId, 0, m_serverKey,
+        mozilla::mailnews::CacheDiscoveryFlagSite::CommonRoot, rootId));
     MOZ_TRY(folders.ObserveCacheFolderInitialization(sourceId, rootId, 0));
 
     nsAutoCString localStoreType;

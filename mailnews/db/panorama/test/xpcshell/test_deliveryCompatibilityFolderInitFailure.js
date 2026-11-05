@@ -245,15 +245,20 @@ async function createFailureOriginChild(label) {
   do_get_profile();
   loadExistingDB();
   const server = MailServices.accounts.createIncomingServer(
-    label, label + ".invalid", "none"
+    label,
+    label + ".invalid",
+    "none"
   );
   registerCleanupFunction(() =>
     MailServices.accounts.removeIncomingServer(server, false)
   );
-  server.setStringValue("storeContractID", {
-    mbox: "@mozilla.org/msgstore/berkeleystore;1",
-    maildir: "@mozilla.org/msgstore/maildirstore;1",
-  }[lane.store]);
+  server.setStringValue(
+    "storeContractID",
+    {
+      mbox: "@mozilla.org/msgstore/berkeleystore;1",
+      maildir: "@mozilla.org/msgstore/maildirstore;1",
+    }[lane.store]
+  );
   const directory = do_get_profile();
   directory.append(label);
   await IOUtils.makeDirectory(directory.path);
@@ -285,7 +290,9 @@ add_task(async function test_originSourceAndClosedOwnerFailuresPreserveState() {
     "UPDATE database_identity SET sourceId = '{12345678-1234-1234-1234-123456789abc}'"
   );
   try {
-    Assert.throws(() => { folder.flags = flags; }, /NS_ERROR_NOT_AVAILABLE/);
+    Assert.throws(() => {
+      folder.flags = flags;
+    }, /NS_ERROR_NOT_AVAILABLE/);
     Assert.throws(() => info.orFlags(0), /NS_ERROR_NOT_AVAILABLE/);
     Assert.equal(failureOriginText(id), original);
     Assert.equal(folder.flags, flags);
@@ -301,7 +308,9 @@ add_task(async function test_originSourceAndClosedOwnerFailuresPreserveState() {
     }
   }
   db.forceClosed();
-  Assert.throws(() => { info.flags = 0; }, /NS_ERROR_NOT_AVAILABLE/);
+  Assert.throws(() => {
+    info.flags = 0;
+  }, /NS_ERROR_NOT_AVAILABLE/);
   Assert.equal(
     failureOriginText(id),
     original,
@@ -339,12 +348,9 @@ add_task(async function test_failedVetoKeepsFlagsAndCallerTransaction() {
       "BEGIN SELECT RAISE(ABORT, 'origin attempt write fault'); END"
   );
   try {
-    Assert.throws(
-      () => {
-        folder.flags = flags;
-      },
-      /NS_ERROR_STORAGE_CONSTRAINT/
-    );
+    Assert.throws(() => {
+      folder.flags = flags;
+    }, /NS_ERROR_STORAGE_CONSTRAINT/);
     Assert.throws(() => info.orFlags(0), /NS_ERROR_STORAGE_CONSTRAINT/);
     Assert.equal(
       failureOriginText(id),

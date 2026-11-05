@@ -59,6 +59,7 @@ function progressStopPromise(composeWindow) {
 }
 
 add_setup(async function () {
+  await SpecialPowers.pushPrefEnv({ set: [["logging.IMAP", 5]] });
   await addLoginInfo("imap://test.test", "user", "password");
   await addLoginInfo("smtp://test.test", "user", "password");
 
@@ -92,6 +93,7 @@ add_setup(async function () {
     MailServices.accounts.removeAccount(localAccount, false);
     await Services.logins.removeAllLoginsAsync();
   });
+  registerCleanupFunction(() => SpecialPowers.popPrefEnv());
 });
 
 add_task(async function testSentCopyFailureOffersRecovery() {

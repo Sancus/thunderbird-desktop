@@ -84,6 +84,34 @@ async function makeMailSearchFixture(term, count) {
     key: header.messageKey,
     messageId: header.messageId,
   }));
+  const { GlodaMsgIndexer } = ChromeUtils.importESModule(
+    "resource:///modules/gloda/IndexMsg.sys.mjs"
+  );
+  const { waitForGlodaDBFlush } = ChromeUtils.importESModule(
+    "resource://testing-common/gloda/GlodaTestHelperFunctions.sys.mjs"
+  );
+  await Promise.all(
+    folders.map(
+      folder =>
+        new Promise((resolve, reject) => {
+          const queued = GlodaMsgIndexer.indexFolder(folder, {
+            callback(success) {
+              if (!success) {
+                reject(new Error("Fixture Gloda indexing did not complete"));
+                return;
+              }
+              resolve();
+            },
+          });
+          if (!queued) {
+            reject(new Error("Fixture Gloda indexing was not queued"));
+          }
+        })
+    )
+  );
+  // A completed indexing job may leave its transaction waiting for user idle.
+  // Use the existing real commit barrier before snapshotting native metadata.
+  await waitForGlodaDBFlush();
   const service = await getMailSearchService();
   let progress;
   do {

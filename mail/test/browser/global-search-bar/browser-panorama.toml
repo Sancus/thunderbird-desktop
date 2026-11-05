@@ -53,3 +53,23 @@ subsuite = "thunderbird"
 ["browser_panoramaSearchFacetConversationLifetime.js"]
 
 ["browser_panoramaSearchFacetDeletedCopy.js"]
+
+["browser_panoramaSearchListFacetSelection.js"]
+
+["browser_panoramaSearchListPendingClose.js"]
+
+["browser_panoramaSearchListTypedSelection.js"]
+
+["browser_panoramaSearchListQuickFilter.js"]
+
+["browser_panoramaSearchListResultInput.js"]
+
+["browser_panoramaSearchListConversationErrors.js"]
+
+["browser_panoramaSearchListConversationClosedOrigin.js"]
+
+["browser_panoramaSearchListConversationMovedSelection.js"]
+
+["browser_panoramaSearchListConversationStandalone.js"]
+
+["browser_panoramaSearchListConversationContext.js"]

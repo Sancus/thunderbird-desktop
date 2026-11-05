@@ -14,10 +14,8 @@ add_task(function testUnavailableTaskbarProgressIsOptional() {
   const cid = MockRegistrar.register("@mozilla.org/windows-taskbar;1", {
     QueryInterface: ChromeUtils.generateQI(["nsIWinTaskbar"]),
     getTaskbarProgress() {
-      throw Components.Exception(
-        "No taskbar preview",
-        Cr.NS_ERROR_NOT_AVAILABLE
-      );
+      Components.returnCode = Cr.NS_ERROR_NOT_AVAILABLE;
+      return null;
     },
   });
   try {
@@ -34,10 +32,8 @@ add_task(function testUnexpectedTaskbarProgressErrorIsPreserved() {
   const cid = MockRegistrar.register("@mozilla.org/windows-taskbar;1", {
     QueryInterface: ChromeUtils.generateQI(["nsIWinTaskbar"]),
     getTaskbarProgress() {
-      throw Components.Exception(
-        "Unexpected taskbar failure",
-        Cr.NS_ERROR_FAILURE
-      );
+      Components.returnCode = Cr.NS_ERROR_FAILURE;
+      return null;
     },
   });
   try {

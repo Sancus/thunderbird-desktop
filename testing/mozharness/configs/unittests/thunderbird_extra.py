@@ -26,6 +26,19 @@ config = {
                 ),
             },
         },
+        "gtest-news-offline": {
+            "env": {
+                "GTEST_FILTER": (
+                    "DeliveryNewsOfflineProvider."
+                    "NewsOfflineWriteFailuresRetainPriorBodyAndAllowFreshRetry:"
+                    "DeliveryNewsOfflineProvider."
+                    "NewsOfflineShortWritesRetainPriorBodyAndAllowFreshRetry:"
+                    "DeliveryNewsOfflineProvider."
+                    "NewsOfflineUncertainFinishDoesNotDiscardOrReplay"
+                ),
+                "MOZ_DEFAULT_PREFS": 'pref("mail.panorama.enabled", true);',
+            },
+        },
     },
     "all_mochitest_suites": {
         "mochitest-browser-chrome-thunderbird": [

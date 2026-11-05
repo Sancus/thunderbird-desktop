@@ -80,6 +80,16 @@ add_setup(async function setupNativeFacetMessages() {
   });
   const [first, second, excluded] = folders;
   const generator = new MessageGenerator();
+  // Folder retirement retains physical rows. Keep this fixture's generated IDs
+  // separate from earlier files sharing this native profile, while serializing
+  // the same reply twice below still creates the intended physical duplicates.
+  const messageIdNamespace = Services.uuid
+    .generateUUID()
+    .toString()
+    .slice(1, -1);
+  const makeMessageId = generator.makeMessageId.bind(generator);
+  generator.makeMessageId = message =>
+    `${messageIdNamespace}.${makeMessageId(message)}`;
   const term = "panoramafacetedphysicalneedle";
   const parent = generator.makeMessage({
     subject: "Conversation root outside query",
@@ -101,6 +111,21 @@ add_setup(async function setupNativeFacetMessages() {
   const tailMessage = generator.makeMessage({ inReplyTo: reply });
   tailMessage.subject = "Conversation tail outside query";
   const tail = second.addMessage(tailMessage.toMessageString());
+  Assert.equal(
+    clicked.messageId,
+    secondCopy.messageId,
+    "The two physical reply copies retain the same literal Message-ID"
+  );
+  Assert.equal(
+    clicked.getStringReference(0),
+    rootHeader.messageId,
+    "The reply retains its generated root reference"
+  );
+  Assert.equal(
+    tail.getStringReference(tail.numReferences - 1),
+    clicked.messageId,
+    "The tail retains its generated reply reference"
+  );
   const matches = [secondCopy, clicked];
   const pagination = gTestPath.endsWith("/browser_panoramaSearchFacets.js");
   const paddingCount = pagination ? 100 : 1;

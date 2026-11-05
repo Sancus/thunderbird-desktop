@@ -139,9 +139,14 @@ export class NntpService {
    */
   fetchMessage(folder, key, msgWindow, consumer, urlListener) {
     const binding = Services.prefs.getBoolPref("mail.panorama.enabled", false)
-      ? lazy.captureNativeNewsArticle(folder.QueryInterface(Ci.nsIMsgNewsFolder), key)
+      ? lazy.captureNativeNewsArticle(
+          folder.QueryInterface(Ci.nsIMsgNewsFolder),
+          key
+        )
       : null;
-    const saveOffline = folder.QueryInterface(Ci.nsIMsgNewsFolder).saveArticleOffline;
+    const saveOffline = folder.QueryInterface(
+      Ci.nsIMsgNewsFolder
+    ).saveArticleOffline;
     let streamListener, inputStream, outputStream;
     if (consumer instanceof Ci.nsIStreamListener) {
       streamListener = consumer;
@@ -151,7 +156,8 @@ export class NntpService {
       outputStream = pipe.outputStream;
     }
     const server = folder.server.QueryInterface(Ci.nsINntpIncomingServer);
-    const uri = Services.io.newURI(`news://${server.hostname}:${server.port}`)
+    const uri = Services.io
+      .newURI(`news://${server.hostname}:${server.port}`)
       .QueryInterface(Ci.nsIMsgMailNewsUrl);
     let started = false;
     let settled = false;
@@ -162,45 +168,63 @@ export class NntpService {
       settled = true;
       if (!started) {
         started = true;
-        try { streamListener?.onStartRequest(null); } catch (error) {}
+        try {
+          streamListener?.onStartRequest(null);
+        } catch (error) {}
       }
       streamListener?.onStopRequest(null, status);
     };
-    server.wrappedJSObject.withClient(client => {
-      client.onDone = finish;
-      client.onOpen = () => {
-        try {
+    server.wrappedJSObject
+      .withClient(client => {
+        client.onDone = finish;
+        client.onOpen = () => {
+          try {
+            if (binding) {
+              lazy.revalidateNativeNewsArticle(binding);
+            }
+            started = true;
+            streamListener?.onStartRequest(null);
+            client.getArticleByArticleNumber(
+              folder.name,
+              binding?.articleNumber ?? key,
+              binding,
+              saveOffline
+            );
+          } catch (error) {
+            client._actionDone(error.result ?? Cr.NS_ERROR_FAILURE);
+          }
+        };
+        client.onData = data => {
           if (binding) {
             lazy.revalidateNativeNewsArticle(binding);
           }
-          started = true;
-          streamListener?.onStartRequest(null);
-          client.getArticleByArticleNumber(folder.name, binding?.articleNumber ?? key,
-            binding, saveOffline);
-        } catch (error) {
-          client._actionDone(error.result ?? Cr.NS_ERROR_FAILURE);
+          if (
+            outputStream &&
+            outputStream.write(data, data.length) != data.length
+          ) {
+            throw Components.Exception(
+              "Short news service write",
+              Cr.NS_ERROR_FAILURE
+            );
+          }
+          streamListener?.onDataAvailable(null, inputStream, 0, data.length);
+        };
+        client.startRunningUrl(urlListener, msgWindow, uri);
+      })
+      .catch(error => {
+        if (settled) {
+          return;
         }
-      };
-      client.onData = data => {
-        if (binding) {
-          lazy.revalidateNativeNewsArticle(binding);
+        const status = error.result ?? Cr.NS_ERROR_FAILURE;
+        try {
+          urlListener?.OnStartRunningUrl(uri, Cr.NS_OK);
+        } catch (e) {}
+        try {
+          finish(status);
+        } finally {
+          urlListener?.OnStopRunningUrl(uri, status);
         }
-        if (outputStream && outputStream.write(data, data.length) != data.length) {
-          throw Components.Exception("Short news service write", Cr.NS_ERROR_FAILURE);
-        }
-        streamListener?.onDataAvailable(null, inputStream, 0, data.length);
-      };
-      client.startRunningUrl(urlListener, msgWindow, uri);
-    }).catch(error => {
-      if (settled) {
-        return;
-      }
-      const status = error.result ?? Cr.NS_ERROR_FAILURE;
-      try { urlListener?.OnStartRunningUrl(uri, Cr.NS_OK); } catch (e) {}
-      try { finish(status); } finally {
-        urlListener?.OnStopRunningUrl(uri, status);
-      }
-    });
+      });
     return uri;
   }
 
@@ -274,17 +298,21 @@ export class NntpService {
 
   downloadNewsgroupsForOffline(msgWindow, urlListener) {
     const downloader = new lazy.NewsDownloader(msgWindow, urlListener);
-    downloader.downloadAllOfflineNewsgroups().catch(error => Cu.reportError(error));
+    downloader
+      .downloadAllOfflineNewsgroups()
+      .catch(error => console.error(error));
   }
 
   downloadFolderForOffline(folder, msgWindow) {
     const downloader = new lazy.NewsDownloader(msgWindow);
-    downloader.downloadFolder(folder).catch(error => Cu.reportError(error));
+    downloader.downloadFolder(folder).catch(error => console.error(error));
   }
 
   downloadMessagesForOffline(folder, keys, msgWindow) {
     const downloader = new lazy.NewsDownloader(msgWindow);
-    downloader.downloadMessages(folder, keys).catch(error => Cu.reportError(error));
+    downloader
+      .downloadMessages(folder, keys)
+      .catch(error => console.error(error));
   }
 
   /**

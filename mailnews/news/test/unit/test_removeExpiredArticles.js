@@ -12,7 +12,10 @@ var incomingServer;
 var folder;
 var articleKeys;
 let expiryFixtureId = 0;
-const nativeBackend = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+const nativeBackend = Services.prefs.getBoolPref(
+  "mail.panorama.enabled",
+  false
+);
 
 /**
  * Populate real group articles and run a test against a fresh server/account.
@@ -24,19 +27,25 @@ async function withServer(handler, testFn) {
   const server = makeServer(handler, setupNNTPDaemon());
   server.start();
   const created = localAccountUtils.create_incoming_server_and_account(
-    "nntp", server.port, `expiry-${expiryFixtureId++}`, null, "localhost"
+    "nntp",
+    server.port,
+    `expiry-${expiryFixtureId++}`,
+    null,
+    "localhost"
   );
   incomingServer = created.server.QueryInterface(Ci.nsINntpIncomingServer);
   incomingServer.pushAuth = false;
   subscribeServer(incomingServer);
-  folder = incomingServer.rootFolder.getChildNamed("test.filter")
+  folder = incomingServer.rootFolder
+    .getChildNamed("test.filter")
     .QueryInterface(Ci.nsIMsgNewsFolder);
   try {
     const db = folder.msgDatabase;
     if (nativeBackend) {
       // A real producer in another group consumes the first global physical
       // key so none of this group's keys can alias its wire articles 1,2,3.
-      const other = incomingServer.rootFolder.getChildNamed("test.subscribe.simple")
+      const other = incomingServer.rootFolder
+        .getChildNamed("test.subscribe.simple")
         .QueryInterface(Ci.nsIMsgNewsFolder);
       const seed = new NntpNewsGroup(incomingServer, other);
       try {
@@ -71,7 +80,11 @@ async function withServer(handler, testFn) {
       const header = db.getMsgHdrForMessageID(`${article}@expired.invalid`);
       Assert.ok(header, "The ordinary group producer published this article");
       if (nativeBackend) {
-        Assert.notEqual(header.messageKey, article, "Native physical key differs from the wire article");
+        Assert.notEqual(
+          header.messageKey,
+          article,
+          "Native physical key differs from the wire article"
+        );
       }
       return header.messageKey;
     });
@@ -235,7 +248,6 @@ add_task(async function test_shutdownPreservesHeaders() {
   );
 });
 
-
 add_task(async function test_nativeMalformedListPreservesState() {
   if (!nativeBackend) {
     info("Mapped native LISTGROUP validation is inapplicable to Mork");
@@ -256,8 +268,15 @@ add_task(async function test_nativeMalformedListPreservesState() {
       /NS_ERROR_ILLEGAL_VALUE/,
       "Malformed server article data preserves the original parse error"
     );
-    Assert.deepEqual(db.listAllKeys(), articleKeys, "Parsing failure removes no physical header");
-    Assert.deepEqual(articleKeys.map(key => db.getMsgHdrForKey(key).flags), flags);
+    Assert.deepEqual(
+      db.listAllKeys(),
+      articleKeys,
+      "Parsing failure removes no physical header"
+    );
+    Assert.deepEqual(
+      articleKeys.map(key => db.getMsgHdrForKey(key).flags),
+      flags
+    );
     Assert.equal(folder.newsrcLine, newsrc);
     Assert.equal(db.dBFolderInfo.knownArtsSet, known);
   });
@@ -279,16 +298,21 @@ add_task(async function test_nativeClosedListSnapshotPreservesHeaders() {
     const pool = incomingServer.wrappedJSObject;
     const withClient = pool.withClient;
     let completions = 0;
-    pool.withClient = handler => withClient.call(pool, client => {
-      handler(client);
-      const onDone = client.onDone;
-      client.onDone = status => {
-        completions++;
-        Assert.equal(status, Cr.NS_OK, "The real server list completed before invalidation");
-        db.forceClosed();
-        onDone(status);
-      };
-    });
+    pool.withClient = handler =>
+      withClient.call(pool, client => {
+        handler(client);
+        const onDone = client.onDone;
+        client.onDone = status => {
+          completions++;
+          Assert.equal(
+            status,
+            Cr.NS_OK,
+            "The real server list completed before invalidation"
+          );
+          db.forceClosed();
+          onDone(status);
+        };
+      });
     try {
       await Assert.rejects(
         pool.removeExpiredArticles(folder.name),
@@ -299,7 +323,11 @@ add_task(async function test_nativeClosedListSnapshotPreservesHeaders() {
       pool.withClient = withClient;
     }
     Assert.equal(completions, 1, "LISTGROUP completes once");
-    Assert.deepEqual(folder.msgDatabase.listAllKeys(), articleKeys, "A stale list removes no physical header");
+    Assert.deepEqual(
+      folder.msgDatabase.listAllKeys(),
+      articleKeys,
+      "A stale list removes no physical header"
+    );
     Assert.equal(folder.newsrcLine, newsrc);
   });
 });

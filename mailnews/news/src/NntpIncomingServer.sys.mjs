@@ -661,17 +661,23 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * @throws {nsIException} The original listing, mapping or removal error.
    */
   async _removeExpiredNativeArticles(groupName) {
-    const folder = this.rootFolder.getChildNamed(groupName)
+    const folder = this.rootFolder
+      .getChildNamed(groupName)
       .QueryInterface(Ci.nsIMsgNewsFolder);
     const database = folder.msgDatabase;
-    const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(Ci.nsIDatabaseCore);
+    const core = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    );
     const sourceId = core.sourceId;
     const folderId = folder.id;
     const articles = new Map();
     for (const key of database.listAllKeys()) {
       const binding = lazy.captureNativeNewsArticle(folder, key);
       if (articles.has(binding.articleNumber)) {
-        throw Components.Exception("Duplicate native news article", Cr.NS_ERROR_FILE_CORRUPTED);
+        throw Components.Exception(
+          "Duplicate native news article",
+          Cr.NS_ERROR_FILE_CORRUPTED
+        );
       }
       articles.set(binding.articleNumber, binding);
     }
@@ -694,18 +700,33 @@ export class NntpIncomingServer extends MsgIncomingServer {
         };
         client.onData = line => {
           const text = line.trim();
-          if (!/^[0-9]+$/.test(text) || !Number.isSafeInteger(+text) || +text > 0x7fffffff) {
-            throw Components.Exception("Invalid LISTGROUP article", Cr.NS_ERROR_ILLEGAL_VALUE);
+          if (
+            !/^[0-9]+$/.test(text) ||
+            !Number.isSafeInteger(+text) ||
+            +text > 0x7fffffff
+          ) {
+            throw Components.Exception(
+              "Invalid LISTGROUP article",
+              Cr.NS_ERROR_ILLEGAL_VALUE
+            );
           }
           present.add(+text);
         };
-        const uri = Services.io.newURI(`news://${this.hostname}:${this.port}/${groupName}`)
+        const uri = Services.io
+          .newURI(`news://${this.hostname}:${this.port}/${groupName}`)
           .QueryInterface(Ci.nsIMsgMailNewsUrl);
         client.startRunningUrl(null, null, uri);
       }).catch(reject);
     });
-    if (core.sourceId != sourceId || folder.id != folderId || folder.msgDatabase != database) {
-      throw Components.Exception("News group changed during expiry", Cr.NS_ERROR_NOT_AVAILABLE);
+    if (
+      core.sourceId != sourceId ||
+      folder.id != folderId ||
+      folder.msgDatabase != database
+    ) {
+      throw Components.Exception(
+        "News group changed during expiry",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
     }
     // Check the entire captured selection before the first destructive call.
     for (const binding of articles.values()) {

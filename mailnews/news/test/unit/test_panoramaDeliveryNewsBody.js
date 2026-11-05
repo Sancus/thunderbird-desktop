@@ -45,7 +45,9 @@ add_task(async function test_streamsEachGroupsArticle() {
     } finally {
       if (account) {
         MailServices.accounts.removeAccount(account, false);
-        if (_account == account) _account = null;
+        if (_account == account) {
+          _account = null;
+        }
       }
     }
   });
@@ -120,7 +122,6 @@ add_task(async function test_streamsEachGroupsArticle() {
   info('DELIVERY_PHASE {"phase":"news-body-verified"}');
 });
 
-
 let offlineFixtureId = 0;
 
 /**
@@ -138,18 +139,24 @@ async function createOfflineNewsFixture() {
   const names = ["test.subscribe.simple", "test.filter"];
   for (const [index, name] of names.entries()) {
     daemon.addGroup(name);
-    daemon.addArticleToGroup(new NewsArticle([
-      "From: Sender <sender@example.invalid>",
-      "Date: Thu, 01 Oct 2026 12:00:00 +0000",
-      `Newsgroups: ${name}`,
-      `Subject: Offline article ${index}`,
-      `Message-ID: <offline-${index}@panorama.invalid>`,
-      "MIME-Version: 1.0",
-      "Content-Type: text/plain; charset=us-ascii",
-      "",
-      `Only offline group ${index} contains this body.`,
-      "",
-    ].join("\n")), name, 5001);
+    daemon.addArticleToGroup(
+      new NewsArticle(
+        [
+          "From: Sender <sender@example.invalid>",
+          "Date: Thu, 01 Oct 2026 12:00:00 +0000",
+          `Newsgroups: ${name}`,
+          `Subject: Offline article ${index}`,
+          `Message-ID: <offline-${index}@panorama.invalid>`,
+          "MIME-Version: 1.0",
+          "Content-Type: text/plain; charset=us-ascii",
+          "",
+          `Only offline group ${index} contains this body.`,
+          "",
+        ].join("\n")
+      ),
+      name,
+      5001
+    );
   }
   const server = makeServer(NNTP_RFC2980_handler, daemon);
   let incoming = null;
@@ -161,20 +168,27 @@ async function createOfflineNewsFixture() {
     } finally {
       if (account) {
         MailServices.accounts.removeAccount(account, false);
-        if (_account == account) _account = null;
+        if (_account == account) {
+          _account = null;
+        }
       }
     }
   });
   server.start();
   const created = localAccountUtils.create_incoming_server_and_account(
-    "nntp", server.port, `offline-${offlineFixtureId++}`, null, "localhost"
+    "nntp",
+    server.port,
+    `offline-${offlineFixtureId++}`,
+    null,
+    "localhost"
   );
   incoming = created.server.QueryInterface(Ci.nsINntpIncomingServer);
   incoming.pushAuth = false;
   account = created.account;
   subscribeServer(incoming);
-  const folders = names.map(name => incoming.rootFolder.getChildNamed(name)
-    .QueryInterface(Ci.nsIMsgNewsFolder));
+  const folders = names.map(name =>
+    incoming.rootFolder.getChildNamed(name).QueryInterface(Ci.nsIMsgNewsFolder)
+  );
   for (const folder of folders) {
     PanoramaDelivery.assertFolder(folder, lane);
     folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
@@ -182,14 +196,38 @@ async function createOfflineNewsFixture() {
     folder.getNewMessages(null, listener);
     await listener.promise;
   }
-  const header = folders[0].msgDatabase.getMsgHdrForMessageID("offline-0@panorama.invalid");
-  const otherHeader = folders[1].msgDatabase.getMsgHdrForMessageID("offline-1@panorama.invalid");
-  Assert.ok(header && otherHeader, "Real NNTP ingestion published both group headers");
+  const header = folders[0].msgDatabase.getMsgHdrForMessageID(
+    "offline-0@panorama.invalid"
+  );
+  const otherHeader = folders[1].msgDatabase.getMsgHdrForMessageID(
+    "offline-1@panorama.invalid"
+  );
+  Assert.ok(
+    header && otherHeader,
+    "Real NNTP ingestion published both group headers"
+  );
   if (lane.backend == "panorama") {
-    Assert.notEqual(header.messageKey, 5001, "Native physical key is not the wire article");
-    Assert.notEqual(header.messageKey, otherHeader.messageKey, "Groups have distinct physical rows");
+    Assert.notEqual(
+      header.messageKey,
+      5001,
+      "Native physical key is not the wire article"
+    );
+    Assert.notEqual(
+      header.messageKey,
+      otherHeader.messageKey,
+      "Groups have distinct physical rows"
+    );
   }
-  return { lane, folder: folders[0], otherFolder: folders[1], header, otherHeader, server, incoming, daemon };
+  return {
+    lane,
+    folder: folders[0],
+    otherFolder: folders[1],
+    header,
+    otherHeader,
+    server,
+    incoming,
+    daemon,
+  };
 }
 
 /**
@@ -200,7 +238,9 @@ async function createOfflineNewsFixture() {
  * @returns {string} The retained body bytes, including local status headers.
  */
 function readStoredNewsBody(folder, header) {
-  const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
+  const { NetUtil } = ChromeUtils.importESModule(
+    "resource://gre/modules/NetUtil.sys.mjs"
+  );
   const stream = folder.getMsgInputStream(header);
   try {
     return NetUtil.readInputStreamToString(stream, stream.available());
@@ -224,12 +264,24 @@ async function expectNewsResult(promise, expected) {
   }
   Assert.ok(failure, "The operation failed rather than reporting success");
   if (typeof failure.result == "number") {
-    Assert.equal(failure.result, expected, "Completion retains the original error");
+    Assert.equal(
+      failure.result,
+      expected,
+      "Completion retains the original error"
+    );
   } else {
     // PromiseUrlListener rejects new Error(aExitCode), while the downloader
     // rejects the original nsIException. Check each actual helper contract.
-    Assert.equal(failure.name, "Error", "The URL helper returned its documented Error");
-    Assert.equal(failure.message, String(expected), "URL completion retains the exact original status");
+    Assert.equal(
+      failure.name,
+      "Error",
+      "The URL helper returned its documented Error"
+    );
+    Assert.equal(
+      failure.message,
+      String(expected),
+      "URL completion retains the exact original status"
+    );
   }
 }
 
@@ -242,12 +294,19 @@ async function expectNewsResult(promise, expected) {
  */
 function fetchOfflineNews(folder, header) {
   const listener = new PromiseTestUtils.PromiseUrlListener();
-  MailServices.nntp.fetchMessage(folder, header.messageKey, null, null, listener);
+  MailServices.nntp.fetchMessage(
+    folder,
+    header.messageKey,
+    null,
+    null,
+    listener
+  );
   return listener.promise;
 }
 
 add_task(async function test_offlineFetchUsesPhysicalHeader() {
-  const { folder, otherFolder, header, otherHeader, server } = await createOfflineNewsFixture();
+  const { folder, otherFolder, header, otherHeader, server } =
+    await createOfflineNewsFixture();
   const key = header.messageKey;
   const newsrc = folder.newsrcLine;
   folder.saveArticleOffline = true;
@@ -256,18 +315,36 @@ add_task(async function test_offlineFetchUsesPhysicalHeader() {
   } finally {
     folder.saveArticleOffline = false;
   }
-  Assert.ok(folder.hasMsgOffline(key), "Actual body settlement marks the selected physical header offline");
+  Assert.ok(
+    folder.hasMsgOffline(key),
+    "Actual body settlement marks the selected physical header offline"
+  );
   Assert.ok(header.storeToken, "The selected provider published a real token");
   const body = readStoredNewsBody(folder, header);
   Assert.ok(body.includes("Only offline group 0 contains this body."));
   Assert.ok(!body.includes("Only offline group 1 contains this body."));
-  Assert.ok(!otherFolder.hasMsgOffline(otherHeader.messageKey), "Other group's same article number is untouched");
-  Assert.equal(header.messageKey, key, "Offline completion retains physical identity");
-  Assert.equal(folder.newsrcLine, newsrc, "Offline completion retains article read state");
+  Assert.ok(
+    !otherFolder.hasMsgOffline(otherHeader.messageKey),
+    "Other group's same article number is untouched"
+  );
+  Assert.equal(
+    header.messageKey,
+    key,
+    "Offline completion retains physical identity"
+  );
+  Assert.equal(
+    folder.newsrcLine,
+    newsrc,
+    "Offline completion retains article read state"
+  );
   const transactions = server.playTransaction();
-  const commands = (Array.isArray(transactions) ? transactions : [transactions])
-    .flatMap(transaction => transaction.them);
-  Assert.ok(commands.includes("ARTICLE 5001"), "Wire fetch uses the mapped article number");
+  const commands = (
+    Array.isArray(transactions) ? transactions : [transactions]
+  ).flatMap(transaction => transaction.them);
+  Assert.ok(
+    commands.includes("ARTICLE 5001"),
+    "Wire fetch uses the mapped article number"
+  );
 });
 
 add_task(async function test_failedOfflineFetchRetainsPriorBody() {
@@ -280,29 +357,51 @@ add_task(async function test_failedOfflineFetchRetainsPriorBody() {
   try {
     await fetchOfflineNews(folder, header);
     const previous = {
-      key: header.messageKey, token: header.storeToken,
-      size: header.offlineMessageSize, flags: header.flags,
-      newsrc: folder.newsrcLine, count: folder.getTotalMessages(false),
-      unread: folder.getNumUnread(false), bytes: readStoredNewsBody(folder, header),
+      key: header.messageKey,
+      token: header.storeToken,
+      size: header.offlineMessageSize,
+      flags: header.flags,
+      newsrc: folder.newsrcLine,
+      count: folder.getTotalMessages(false),
+      unread: folder.getNumUnread(false),
+      bytes: readStoredNewsBody(folder, header),
     };
     const owner = Services.io.newURI("about:blank");
     folder.acquireSemaphore(owner, "S365 body failure control");
     try {
-      await expectNewsResult(fetchOfflineNews(folder, header), Cr.NS_MSG_FOLDER_BUSY);
+      await expectNewsResult(
+        fetchOfflineNews(folder, header),
+        Cr.NS_MSG_FOLDER_BUSY
+      );
     } finally {
       folder.releaseSemaphore(owner, "S365 body failure control");
     }
     Assert.equal(header.messageKey, previous.key);
     Assert.equal(header.storeToken, previous.token);
     Assert.equal(header.offlineMessageSize, previous.size);
-    Assert.equal(header.flags, previous.flags, "Failure retains prior Offline/read/flag bits");
+    Assert.equal(
+      header.flags,
+      previous.flags,
+      "Failure retains prior Offline/read/flag bits"
+    );
     Assert.equal(folder.newsrcLine, previous.newsrc);
     Assert.equal(folder.getTotalMessages(false), previous.count);
     Assert.equal(folder.getNumUnread(false), previous.unread);
-    Assert.equal(readStoredNewsBody(folder, header), previous.bytes, "Failure retains exact prior provider bytes");
+    Assert.equal(
+      readStoredNewsBody(folder, header),
+      previous.bytes,
+      "Failure retains exact prior provider bytes"
+    );
     await fetchOfflineNews(folder, header);
-    Assert.ok(folder.hasMsgOffline(previous.key), "A fresh explicit retry succeeds");
-    Assert.ok(readStoredNewsBody(folder, header).includes("Only offline group 0 contains this body."));
+    Assert.ok(
+      folder.hasMsgOffline(previous.key),
+      "A fresh explicit retry succeeds"
+    );
+    Assert.ok(
+      readStoredNewsBody(folder, header).includes(
+        "Only offline group 0 contains this body."
+      )
+    );
   } finally {
     folder.saveArticleOffline = false;
   }
@@ -310,20 +409,37 @@ add_task(async function test_failedOfflineFetchRetainsPriorBody() {
 
 add_task(async function test_downloaderReportsFailureAndRestoresMode() {
   const { folder, header } = await createOfflineNewsFixture();
-  const { NewsDownloader } = ChromeUtils.importESModule("resource:///modules/NewsDownloader.sys.mjs");
+  const { NewsDownloader } = ChromeUtils.importESModule(
+    "resource:///modules/NewsDownloader.sys.mjs"
+  );
   const downloader = new NewsDownloader(null);
   const owner = Services.io.newURI("about:blank");
   folder.acquireSemaphore(owner, "S365 body failure control");
   try {
-    await expectNewsResult(downloader.downloadMessages(folder, [header.messageKey]), Cr.NS_MSG_FOLDER_BUSY);
+    await expectNewsResult(
+      downloader.downloadMessages(folder, [header.messageKey]),
+      Cr.NS_MSG_FOLDER_BUSY
+    );
   } finally {
     folder.releaseSemaphore(owner, "S365 body failure control");
   }
-  Assert.ok(!folder.saveArticleOffline, "Failed batch restores the original offline mode");
-  Assert.ok(!folder.hasMsgOffline(header.messageKey), "Failed batch never claims a body");
+  Assert.ok(
+    !folder.saveArticleOffline,
+    "Failed batch restores the original offline mode"
+  );
+  Assert.ok(
+    !folder.hasMsgOffline(header.messageKey),
+    "Failed batch never claims a body"
+  );
   await downloader.downloadMessages(folder, [header.messageKey]);
-  Assert.ok(!folder.saveArticleOffline, "Explicit retry also restores the mode");
-  Assert.ok(folder.hasMsgOffline(header.messageKey), "Explicit retry completes the actual provider write");
+  Assert.ok(
+    !folder.saveArticleOffline,
+    "Explicit retry also restores the mode"
+  );
+  Assert.ok(
+    folder.hasMsgOffline(header.messageKey),
+    "Explicit retry completes the actual provider write"
+  );
 });
 
 add_task(async function test_nativeStaleBodyRequestDoesNotPublishOffline() {
@@ -340,31 +456,53 @@ add_task(async function test_nativeStaleBodyRequestDoesNotPublishOffline() {
   let stops = 0;
   folder.saveArticleOffline = true;
   try {
-    MailServices.nntp.fetchMessage(folder, key, null, {
-      QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
-      onStartRequest() {},
-      onDataAvailable(request, stream, offset, count) {
-        const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
-        NetUtil.readInputStreamToString(stream, count);
-        if (!closed) {
-          closed = true;
-          database.forceClosed();
-        }
+    MailServices.nntp.fetchMessage(
+      folder,
+      key,
+      null,
+      {
+        QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+        onStartRequest() {},
+        onDataAvailable(request, stream, offset, count) {
+          const { NetUtil } = ChromeUtils.importESModule(
+            "resource://gre/modules/NetUtil.sys.mjs"
+          );
+          NetUtil.readInputStreamToString(stream, count);
+          if (!closed) {
+            closed = true;
+            database.forceClosed();
+          }
+        },
+        onStopRequest(request, status) {
+          stops++;
+          stopped.resolve(status);
+        },
       },
-      onStopRequest(request, status) {
-        stops++;
-        stopped.resolve(status);
-      },
-    }, null);
-    Assert.equal(await stopped.promise, Cr.NS_ERROR_NOT_AVAILABLE, "Stale native body request keeps the mapping error");
+      null
+    );
+    Assert.equal(
+      await stopped.promise,
+      Cr.NS_ERROR_NOT_AVAILABLE,
+      "Stale native body request keeps the mapping error"
+    );
   } finally {
     folder.saveArticleOffline = false;
   }
   Assert.ok(closed, "The real body callback closed the captured facade");
   Assert.equal(stops, 1, "Body failure completes once");
-  Assert.ok(!folder.hasMsgOffline(key), "Stale response never publishes an offline body");
-  Assert.equal(folder.newsrcLine, newsrc, "Stale response preserves read state");
-  Assert.equal(folder.msgDatabase.getMsgHdrForKey(key).messageId, "offline-0@panorama.invalid");
+  Assert.ok(
+    !folder.hasMsgOffline(key),
+    "Stale response never publishes an offline body"
+  );
+  Assert.equal(
+    folder.newsrcLine,
+    newsrc,
+    "Stale response preserves read state"
+  );
+  Assert.equal(
+    folder.msgDatabase.getMsgHdrForKey(key).messageId,
+    "offline-0@panorama.invalid"
+  );
 });
 
 add_task(async function test_nativeFolderBatchReportsFailureAndRetries() {
@@ -387,20 +525,31 @@ add_task(async function test_nativeFolderBatchReportsFailureAndRetries() {
   } finally {
     folder.releaseSemaphore(owner, "S365 body failure control");
   }
-  Assert.ok(!folder.saveArticleOffline, "Native folder failure releases its own batch mode");
+  Assert.ok(
+    !folder.saveArticleOffline,
+    "Native folder failure releases its own batch mode"
+  );
   Assert.ok(!folder.hasMsgOffline(header.messageKey));
   const retry = new PromiseTestUtils.PromiseUrlListener();
   folder.downloadAllForOffline(retry, null);
   await retry.promise;
-  Assert.ok(folder.hasMsgOffline(header.messageKey), "Public folder retry settles the actual native body");
-  Assert.ok(!folder.saveArticleOffline, "Successful native folder batch releases its mode");
+  Assert.ok(
+    folder.hasMsgOffline(header.messageKey),
+    "Public folder retry settles the actual native body"
+  );
+  Assert.ok(
+    !folder.saveArticleOffline,
+    "Successful native folder batch releases its mode"
+  );
 });
 
-
 add_task(async function test_nativeArticleZeroFetchesByPresence() {
-  const { lane, folder, server, incoming, daemon } = await createOfflineNewsFixture();
+  const { lane, folder, server, incoming, daemon } =
+    await createOfflineNewsFixture();
   if (lane.backend != "panorama") {
-    info("Present article zero is native metadata; explicit nntp URL validation stays unchanged");
+    info(
+      "Present article zero is native metadata; explicit nntp URL validation stays unchanged"
+    );
     return;
   }
   const source = [
@@ -409,10 +558,14 @@ add_task(async function test_nativeArticleZeroFetchesByPresence() {
     `Newsgroups: ${folder.name}`,
     "Subject: Present article zero",
     "Message-ID: <offline-zero@panorama.invalid>",
-    "", "The mapped article zero body.", "",
+    "",
+    "The mapped article zero body.",
+    "",
   ].join("\n");
   daemon.addArticleToGroup(new NewsArticle(source), folder.name, 0);
-  const { NntpNewsGroup } = ChromeUtils.importESModule("resource:///modules/NntpNewsGroup.sys.mjs");
+  const { NntpNewsGroup } = ChromeUtils.importESModule(
+    "resource:///modules/NntpNewsGroup.sys.mjs"
+  );
   const reader = new NntpNewsGroup(incoming, folder);
   try {
     reader.getArticlesRangeToFetch(null, 0, 0);
@@ -423,7 +576,9 @@ add_task(async function test_nativeArticleZeroFetchesByPresence() {
   } finally {
     reader.cleanUp();
   }
-  const header = folder.msgDatabase.getMsgHdrForMessageID("offline-zero@panorama.invalid");
+  const header = folder.msgDatabase.getMsgHdrForMessageID(
+    "offline-zero@panorama.invalid"
+  );
   Assert.ok(header, "The real native producer published present article zero");
   Assert.notEqual(header.messageKey, 0, "Physical identity remains nonzero");
   const keys = folder.msgDatabase.listAllKeys();
@@ -434,10 +589,21 @@ add_task(async function test_nativeArticleZeroFetchesByPresence() {
     folder.saveArticleOffline = false;
   }
   Assert.ok(folder.hasMsgOffline(header.messageKey));
-  Assert.ok(readStoredNewsBody(folder, header).includes("The mapped article zero body."));
-  Assert.deepEqual(folder.msgDatabase.listAllKeys(), keys, "Fetching zero creates no extra header");
-  const commands = [server.playTransaction()].flat().flatMap(transaction => transaction.them);
-  Assert.ok(commands.includes("ARTICLE 0"), "Zero is sent explicitly, not replaced by a message ID");
+  Assert.ok(
+    readStoredNewsBody(folder, header).includes("The mapped article zero body.")
+  );
+  Assert.deepEqual(
+    folder.msgDatabase.listAllKeys(),
+    keys,
+    "Fetching zero creates no extra header"
+  );
+  const commands = [server.playTransaction()]
+    .flat()
+    .flatMap(transaction => transaction.them);
+  Assert.ok(
+    commands.includes("ARTICLE 0"),
+    "Zero is sent explicitly, not replaced by a message ID"
+  );
   Assert.ok(!commands.includes("ARTICLE <offline-zero@panorama.invalid>"));
 });
 
@@ -455,28 +621,46 @@ add_task(async function test_nativeBatchCompletionCanStartFreshBatch() {
   const completed = Promise.withResolvers();
   let firstStops = 0;
   let secondStops = 0;
-  folder.downloadAllForOffline({
-    OnStartRunningUrl() {},
-    OnStopRunningUrl(uri, status) {
-      firstStops++;
-      Assert.equal(status, Cr.NS_OK);
-      Assert.ok(!folder.saveArticleOffline, "Old batch releases mode before its terminal callback");
-      Assert.ok(folder.hasMsgOffline(header.messageKey), "Old body is committed before notification");
-      folder.downloadAllForOffline({
-        OnStartRunningUrl() {},
-        OnStopRunningUrl(secondUri, secondStatus) {
-          secondStops++;
-          completed.resolve(secondStatus);
-        },
-      }, null);
+  folder.downloadAllForOffline(
+    {
+      OnStartRunningUrl() {},
+      OnStopRunningUrl(uri, status) {
+        firstStops++;
+        Assert.equal(status, Cr.NS_OK);
+        Assert.ok(
+          !folder.saveArticleOffline,
+          "Old batch releases mode before its terminal callback"
+        );
+        Assert.ok(
+          folder.hasMsgOffline(header.messageKey),
+          "Old body is committed before notification"
+        );
+        folder.downloadAllForOffline(
+          {
+            OnStartRunningUrl() {},
+            OnStopRunningUrl(secondUri, secondStatus) {
+              secondStops++;
+              completed.resolve(secondStatus);
+            },
+          },
+          null
+        );
+      },
     },
-  }, null);
-  Assert.equal(await completed.promise, Cr.NS_OK, "A fresh request from completion may finish normally");
+    null
+  );
+  Assert.equal(
+    await completed.promise,
+    Cr.NS_OK,
+    "A fresh request from completion may finish normally"
+  );
   Assert.equal(firstStops, 1);
   Assert.equal(secondStops, 1);
-  Assert.ok(!folder.saveArticleOffline, "The first request cannot leave or clear a later request's mode");
+  Assert.ok(
+    !folder.saveArticleOffline,
+    "The first request cannot leave or clear a later request's mode"
+  );
 });
-
 
 add_task(async function test_offlineBodyRetainsReadAndFlagStateAcrossReopen() {
   const { folder, header } = await createOfflineNewsFixture();
@@ -492,19 +676,35 @@ add_task(async function test_offlineBodyRetainsReadAndFlagStateAcrossReopen() {
   }
   const token = header.storeToken;
   Assert.ok(token, "Real body settlement produced an owning store token");
-  Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(Ci.nsIMsgDBService)
+  Cc["@mozilla.org/msgDatabase/msgDBService;1"]
+    .getService(Ci.nsIMsgDBService)
     .forceFolderDBClosed(folder);
-  const reopened = folder.msgDatabase.getMsgHdrForMessageID("offline-0@panorama.invalid");
+  const reopened = folder.msgDatabase.getMsgHdrForMessageID(
+    "offline-0@panorama.invalid"
+  );
   Assert.equal(reopened.messageKey, key);
   Assert.equal(reopened.storeToken, token);
-  Assert.ok(reopened.isRead && reopened.isFlagged, "Body settlement preserves current persisted read and flag state");
-  Assert.ok(folder.hasMsgOffline(key), "The reopened physical row owns the settled body");
-  Assert.equal(folder.newsrcLine, newsrc, "The article read set survives body settlement and actual reopen");
+  Assert.ok(
+    reopened.isRead && reopened.isFlagged,
+    "Body settlement preserves current persisted read and flag state"
+  );
+  Assert.ok(
+    folder.hasMsgOffline(key),
+    "The reopened physical row owns the settled body"
+  );
+  Assert.equal(
+    folder.newsrcLine,
+    newsrc,
+    "The article read set survives body settlement and actual reopen"
+  );
   Assert.equal(folder.getNumUnread(false), 0);
   Assert.equal(folder.getTotalMessages(false), 1);
-  Assert.ok(readStoredNewsBody(folder, reopened).includes("Only offline group 0 contains this body."));
+  Assert.ok(
+    readStoredNewsBody(folder, reopened).includes(
+      "Only offline group 0 contains this body."
+    )
+  );
 });
-
 
 add_task(async function test_nativeBatchSourceChangeFromStartFailsOnce() {
   const { lane, folder, header } = await createOfflineNewsFixture();
@@ -517,90 +717,125 @@ add_task(async function test_nativeBatchSourceChangeFromStartFailsOnce() {
   const completed = Promise.withResolvers();
   let starts = 0;
   let stops = 0;
-  folder.downloadAllForOffline({
-    OnStartRunningUrl() {
-      starts++;
-      database.forceClosed();
-    },
-    OnStopRunningUrl(uri, status) {
-      stops++;
-      Assert.ok(!folder.saveArticleOffline, "Stale batch releases its mode before failure notification");
-      completed.resolve(status);
-    },
-  }, null);
-  Assert.equal(await completed.promise, Cr.NS_ERROR_NOT_AVAILABLE,
-    "A real source change from the start callback cannot become empty-selection success");
-  Assert.equal(starts, 1);
-  Assert.equal(stops, 1);
-  Assert.ok(!folder.hasMsgOffline(key), "Stale public batch never settles a body");
-  Assert.equal(folder.msgDatabase.getMsgHdrForKey(key).messageId, "offline-0@panorama.invalid");
-});
-
-
-add_task(async function test_allServersOfflineBatchWaitsReportsFailureAndRetries() {
-  const failed = await createOfflineNewsFixture();
-  const successful = await createOfflineNewsFixture();
-  const selected = [failed.folder, successful.folder];
-  for (const folder of selected) {
-    const settings = folder.downloadSettings;
-    settings.useServerDefaults = false;
-    settings.downloadByDate = false;
-    settings.downloadUnreadOnly = false;
-    folder.downloadSettings = settings;
-    folder.setFlag(Ci.nsMsgFolderFlags.Offline);
-  }
-  /**
-   * Starts the real public all-server operation and records its URL boundary.
-   *
-   * @returns {object} Its actual completion and notification counters.
-   */
-  function startBatch() {
-    const done = Promise.withResolvers();
-    const listener = {
-      QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
-      starts: 0,
-      stops: 0,
+  folder.downloadAllForOffline(
+    {
       OnStartRunningUrl() {
-        this.starts++;
+        starts++;
+        database.forceClosed();
       },
       OnStopRunningUrl(uri, status) {
-        this.stops++;
-        done.resolve(status);
+        stops++;
+        Assert.ok(
+          !folder.saveArticleOffline,
+          "Stale batch releases its mode before failure notification"
+        );
+        completed.resolve(status);
       },
-    };
-    MailServices.nntp.downloadNewsgroupsForOffline(null, listener);
-    return { completion: done.promise, listener };
-  }
-  const owner = Services.io.newURI("about:blank");
-  try {
-    failed.folder.acquireSemaphore(owner, "S365 all-server failure control");
-    try {
-      const first = startBatch();
-      Assert.equal(await first.completion, Cr.NS_MSG_FOLDER_BUSY,
-        "The public batch reports the first real provider admission error");
-      Assert.equal(first.listener.starts, 1);
-      Assert.equal(first.listener.stops, 1);
-      Assert.ok(!failed.folder.hasMsgOffline(failed.header.messageKey),
-        "A failed server never claims its body");
-      Assert.ok(successful.folder.hasMsgOffline(successful.header.messageKey),
-        "The batch waits for another started server's actual provider completion before stopping");
-      Assert.ok(readStoredNewsBody(successful.folder, successful.header)
-        .includes("Only offline group 0 contains this body."));
-      Assert.ok(selected.every(folder => !folder.saveArticleOffline),
-        "Every started folder releases its owned mode before terminal notification");
-    } finally {
-      failed.folder.releaseSemaphore(owner, "S365 all-server failure control");
-    }
-    const retry = startBatch();
-    Assert.equal(await retry.completion, Cr.NS_OK, "A fresh explicit public batch retry succeeds");
-    Assert.equal(retry.listener.starts, 1);
-    Assert.equal(retry.listener.stops, 1);
-    Assert.ok(failed.folder.hasMsgOffline(failed.header.messageKey));
-    Assert.ok(successful.folder.hasMsgOffline(successful.header.messageKey));
-    Assert.ok(selected.every(folder => !folder.saveArticleOffline));
-  } finally {
-    for (const folder of selected) {
-      folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
-    }
-  }
+    },
+    null
+  );
+  Assert.equal(
+    await completed.promise,
+    Cr.NS_ERROR_NOT_AVAILABLE,
+    "A real source change from the start callback cannot become empty-selection success"
+  );
+  Assert.equal(starts, 1);
+  Assert.equal(stops, 1);
+  Assert.ok(
+    !folder.hasMsgOffline(key),
+    "Stale public batch never settles a body"
+  );
+  Assert.equal(
+    folder.msgDatabase.getMsgHdrForKey(key).messageId,
+    "offline-0@panorama.invalid"
+  );
 });
+
+add_task(
+  async function test_allServersOfflineBatchWaitsReportsFailureAndRetries() {
+    const failed = await createOfflineNewsFixture();
+    const successful = await createOfflineNewsFixture();
+    const selected = [failed.folder, successful.folder];
+    for (const folder of selected) {
+      const settings = folder.downloadSettings;
+      settings.useServerDefaults = false;
+      settings.downloadByDate = false;
+      settings.downloadUnreadOnly = false;
+      folder.downloadSettings = settings;
+      folder.setFlag(Ci.nsMsgFolderFlags.Offline);
+    }
+    /**
+     * Starts the real public all-server operation and records its URL boundary.
+     *
+     * @returns {object} Its actual completion and notification counters.
+     */
+    function startBatch() {
+      const done = Promise.withResolvers();
+      const listener = {
+        QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+        starts: 0,
+        stops: 0,
+        OnStartRunningUrl() {
+          this.starts++;
+        },
+        OnStopRunningUrl(uri, status) {
+          this.stops++;
+          done.resolve(status);
+        },
+      };
+      MailServices.nntp.downloadNewsgroupsForOffline(null, listener);
+      return { completion: done.promise, listener };
+    }
+    const owner = Services.io.newURI("about:blank");
+    try {
+      failed.folder.acquireSemaphore(owner, "S365 all-server failure control");
+      try {
+        const first = startBatch();
+        Assert.equal(
+          await first.completion,
+          Cr.NS_MSG_FOLDER_BUSY,
+          "The public batch reports the first real provider admission error"
+        );
+        Assert.equal(first.listener.starts, 1);
+        Assert.equal(first.listener.stops, 1);
+        Assert.ok(
+          !failed.folder.hasMsgOffline(failed.header.messageKey),
+          "A failed server never claims its body"
+        );
+        Assert.ok(
+          successful.folder.hasMsgOffline(successful.header.messageKey),
+          "The batch waits for another started server's actual provider completion before stopping"
+        );
+        Assert.ok(
+          readStoredNewsBody(successful.folder, successful.header).includes(
+            "Only offline group 0 contains this body."
+          )
+        );
+        Assert.ok(
+          selected.every(folder => !folder.saveArticleOffline),
+          "Every started folder releases its owned mode before terminal notification"
+        );
+      } finally {
+        failed.folder.releaseSemaphore(
+          owner,
+          "S365 all-server failure control"
+        );
+      }
+      const retry = startBatch();
+      Assert.equal(
+        await retry.completion,
+        Cr.NS_OK,
+        "A fresh explicit public batch retry succeeds"
+      );
+      Assert.equal(retry.listener.starts, 1);
+      Assert.equal(retry.listener.stops, 1);
+      Assert.ok(failed.folder.hasMsgOffline(failed.header.messageKey));
+      Assert.ok(successful.folder.hasMsgOffline(successful.header.messageKey));
+      Assert.ok(selected.every(folder => !folder.saveArticleOffline));
+    } finally {
+      for (const folder of selected) {
+        folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+      }
+    }
+  }
+);

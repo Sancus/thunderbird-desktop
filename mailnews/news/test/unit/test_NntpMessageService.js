@@ -14,7 +14,10 @@ add_setup(function () {
     const { NntpNewsGroup } = ChromeUtils.importESModule(
       "resource:///modules/NntpNewsGroup.sys.mjs"
     );
-    const reader = new NntpNewsGroup(server, folder.QueryInterface(Ci.nsIMsgNewsFolder));
+    const reader = new NntpNewsGroup(
+      server,
+      folder.QueryInterface(Ci.nsIMsgNewsFolder)
+    );
     try {
       reader.getArticlesRangeToFetch(null, 7401, 7401);
       reader.processXOverLine(
@@ -25,8 +28,15 @@ add_setup(function () {
       reader.cleanUp();
     }
     message = db.getMsgHdrForMessageID("compose@nntp.invalid");
-    Assert.ok(message, "The real native overview producer published the compose header");
-    Assert.notEqual(message.messageKey, 7401, "Native physical key differs from article number");
+    Assert.ok(
+      message,
+      "The real native overview producer published the compose header"
+    );
+    Assert.notEqual(
+      message.messageKey,
+      7401,
+      "Native physical key differs from article number"
+    );
   } else {
     const header = db.createNewHdr();
     header.messageId = "compose@nntp.invalid";

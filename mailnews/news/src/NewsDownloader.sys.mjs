@@ -46,25 +46,32 @@ export class NewsDownloader {
     let failure = null;
     try {
       this._urlListener?.OnStartRunningUrl(null);
-      const servers = MailServices.accounts.allServers.filter(x => x.type == "nntp");
+      const servers = MailServices.accounts.allServers.filter(
+        x => x.type == "nntp"
+      );
       // Keep existing server concurrency, but settle every started server before
       // reporting the first actual failure to the batch listener.
-      await Promise.all(servers.map(async server => {
-        try {
-          for (const folder of server.rootFolder.descendants) {
-            if (folder.flags & Ci.nsMsgFolderFlags.Offline) {
-              await this._downloadArticles(folder);
+      await Promise.all(
+        servers.map(async server => {
+          try {
+            for (const folder of server.rootFolder.descendants) {
+              if (folder.flags & Ci.nsMsgFolderFlags.Offline) {
+                await this._downloadArticles(folder);
+              }
             }
+          } catch (error) {
+            failure ??= error;
           }
-        } catch (error) {
-          failure ??= error;
-        }
-      }));
+        })
+      );
     } catch (error) {
       failure ??= error;
     }
     try {
-      this._urlListener?.OnStopRunningUrl(null, failure?.result ?? (failure ? Cr.NS_ERROR_FAILURE : Cr.NS_OK));
+      this._urlListener?.OnStopRunningUrl(
+        null,
+        failure?.result ?? (failure ? Cr.NS_ERROR_FAILURE : Cr.NS_OK)
+      );
     } catch (error) {
       failure ??= error;
     }
@@ -89,7 +96,9 @@ export class NewsDownloader {
 
     try {
       await this._downloadArticles(folder);
-      this._logger.debug("Finished downloading articles for offline use in single folder.");
+      this._logger.debug(
+        "Finished downloading articles for offline use in single folder."
+      );
     } finally {
       this._clearStatus();
     }
@@ -108,7 +117,9 @@ export class NewsDownloader {
 
     try {
       await this._downloadArticles(folder, keys);
-      this._logger.debug("Finished downloading specific articles for offline use");
+      this._logger.debug(
+        "Finished downloading specific articles for offline use"
+      );
     } finally {
       this._clearStatus();
     }
@@ -129,7 +140,10 @@ export class NewsDownloader {
     const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
     const previousSaveOffline = folder.saveArticleOffline;
     if (native && previousSaveOffline) {
-      throw Components.Exception("News download already active", Cr.NS_MSG_FOLDER_BUSY);
+      throw Components.Exception(
+        "News download already active",
+        Cr.NS_MSG_FOLDER_BUSY
+      );
     }
     folder.saveArticleOffline = true;
     try {
@@ -154,7 +168,9 @@ export class NewsDownloader {
               if (Components.isSuccessCode(status)) {
                 resolve();
               } else {
-                reject(Components.Exception("Offline news download failed", status));
+                reject(
+                  Components.Exception("Offline news download failed", status)
+                );
               }
             },
           });
@@ -240,8 +256,14 @@ export class NewsDownloader {
             }
             try {
               if (native) {
-                if (folder.msgDatabase != msgDatabase || hdr.folder.id != folder.id) {
-                  throw Components.Exception("News selection owner changed", Cr.NS_ERROR_NOT_AVAILABLE);
+                if (
+                  folder.msgDatabase != msgDatabase ||
+                  hdr.folder.id != folder.id
+                ) {
+                  throw Components.Exception(
+                    "News selection owner changed",
+                    Cr.NS_ERROR_NOT_AVAILABLE
+                  );
                 }
                 folder.getMessageIdForKey(hdr.messageKey);
               }
@@ -263,10 +285,16 @@ export class NewsDownloader {
                 throw selectionError;
               }
               if (!Components.isSuccessCode(status)) {
-                throw Components.Exception("News download selection failed", status);
+                throw Components.Exception(
+                  "News download selection failed",
+                  status
+                );
               }
               if (native && folder.msgDatabase != msgDatabase) {
-                throw Components.Exception("News selection owner changed", Cr.NS_ERROR_NOT_AVAILABLE);
+                throw Components.Exception(
+                  "News selection owner changed",
+                  Cr.NS_ERROR_NOT_AVAILABLE
+                );
               }
               resolve();
             } catch (error) {

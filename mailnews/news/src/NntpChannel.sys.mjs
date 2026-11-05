@@ -137,7 +137,9 @@ export class NntpChannel extends MailChannel {
     if (entry && identity) {
       let stored = null;
       if (!isNew) {
-        try { stored = entry.getMetaDataElement("native-news-identity"); } catch (error) {}
+        try {
+          stored = entry.getMetaDataElement("native-news-identity");
+        } catch (error) {}
       }
       if (!isNew && stored != identity) {
         entry.asyncDoom(null);
@@ -145,7 +147,9 @@ export class NntpChannel extends MailChannel {
         return;
       }
       if (isNew) {
-        try { entry.setMetaDataElement("native-news-identity", identity); } catch (error) {
+        try {
+          entry.setMetaDataElement("native-news-identity", identity);
+        } catch (error) {
           entry.asyncDoom(null);
           this._readFromServer();
           return;
@@ -161,7 +165,9 @@ export class NntpChannel extends MailChannel {
     if (isNew) {
       if (Services.io.offline) {
         entry.asyncDoom(null);
-        this._failBeforeNetwork(Components.Exception("News body is not cached", Cr.NS_ERROR_OFFLINE));
+        this._failBeforeNetwork(
+          Components.Exception("News body is not cached", Cr.NS_ERROR_OFFLINE)
+        );
         return;
       }
       // It's a new entry, needs to read from the server.
@@ -330,18 +336,27 @@ export class NntpChannel extends MailChannel {
    */
   _prepareNativeArticle() {
     this._localKey = this._articleNumber;
-    if (!this._newsFolder || !Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    if (
+      !this._newsFolder ||
+      !Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ) {
       return;
     }
     this._localKey = null;
     if (this.URI.scheme != "nntp") {
-      this._articleBinding = lazy.captureNativeNewsArticle(this._newsFolder, this._articleNumber);
+      this._articleBinding = lazy.captureNativeNewsArticle(
+        this._newsFolder,
+        this._articleNumber
+      );
     } else {
       for (const key of this._newsFolder.msgDatabase.listAllKeys()) {
         const binding = lazy.captureNativeNewsArticle(this._newsFolder, key);
         if (binding.articleNumber == Number(this._articleNumber)) {
           if (this._articleBinding) {
-            throw Components.Exception("Duplicate native article mapping", Cr.NS_ERROR_FILE_CORRUPTED);
+            throw Components.Exception(
+              "Duplicate native article mapping",
+              Cr.NS_ERROR_FILE_CORRUPTED
+            );
           }
           this._articleBinding = binding;
         }
@@ -367,7 +382,15 @@ export class NntpChannel extends MailChannel {
    */
   _nativeCacheIdentity() {
     const b = this._articleBinding;
-    return b ? JSON.stringify([b.sourceId, b.folderId, b.incarnation, b.physicalKey, b.articleNumber]) : null;
+    return b
+      ? JSON.stringify([
+          b.sourceId,
+          b.folderId,
+          b.incarnation,
+          b.physicalKey,
+          b.articleNumber,
+        ])
+      : null;
   }
 
   /** Releases only this channel's offline mode before completion callbacks. */
@@ -394,9 +417,15 @@ export class NntpChannel extends MailChannel {
     const listener = this._listener;
     this._listener = null;
     this._pending = false;
-    try { this.URI.SetUrlState(true, Cr.NS_OK); } catch (e) {}
-    try { listener?.onStartRequest(this); } catch (e) {}
-    try { listener?.onStopRequest(this, status); } finally {
+    try {
+      this.URI.SetUrlState(true, Cr.NS_OK);
+    } catch (e) {}
+    try {
+      listener?.onStartRequest(this);
+    } catch (e) {}
+    try {
+      listener?.onStopRequest(this, status);
+    } finally {
       this.URI.errorCode = status;
       this.URI.SetUrlState(false, status);
     }
@@ -411,7 +440,10 @@ export class NntpChannel extends MailChannel {
    */
   _hasLocalHeader() {
     this._revalidateNativeArticle();
-    return this._localKey !== null && !!this._newsFolder?.msgDatabase.containsKey(this._localKey);
+    return (
+      this._localKey !== null &&
+      !!this._newsFolder?.msgDatabase.containsKey(this._localKey)
+    );
   }
 
   /**
@@ -447,7 +479,9 @@ export class NntpChannel extends MailChannel {
     this._pump = pump;
     pump.asyncRead({
       onStartRequest: () => {
-        try { this._revalidateNativeArticle(); } catch (error) {
+        try {
+          this._revalidateNativeArticle();
+        } catch (error) {
           this.cancel(error.result ?? Cr.NS_ERROR_FAILURE);
         }
         this._pending = true;
@@ -460,7 +494,9 @@ export class NntpChannel extends MailChannel {
         }
         this._completed = true;
         if (Components.isSuccessCode(status)) {
-          try { this._revalidateNativeArticle(); } catch (error) {
+          try {
+            this._revalidateNativeArticle();
+          } catch (error) {
             status = error.result ?? Cr.NS_ERROR_FAILURE;
           }
         }
@@ -482,7 +518,9 @@ export class NntpChannel extends MailChannel {
         }
       },
       onDataAvailable: (request, stream, offset, count) => {
-        try { this._revalidateNativeArticle(); } catch (error) {
+        try {
+          this._revalidateNativeArticle();
+        } catch (error) {
           this.cancel(error.result ?? Cr.NS_ERROR_FAILURE);
           return;
         }
@@ -512,10 +550,14 @@ export class NntpChannel extends MailChannel {
   _startServerRead() {
     this._logger.debug("Read from server");
     if (Services.io.offline) {
-      throw Components.Exception("News body is not cached", Cr.NS_ERROR_OFFLINE);
+      throw Components.Exception(
+        "News body is not cached",
+        Cr.NS_ERROR_OFFLINE
+      );
     }
     if (!this._server) {
-      this._server = MailServices.accounts.createIncomingServer("", this.URI.asciiHost, "nntp")
+      this._server = MailServices.accounts
+        .createIncomingServer("", this.URI.asciiHost, "nntp")
         .QueryInterface(Ci.nsINntpIncomingServer);
       if (this.URI.scheme == "snews") {
         this._server.socketType = Ci.nsMsgSocketType.SSL;
@@ -526,14 +568,19 @@ export class NntpChannel extends MailChannel {
     pipe.init(true, true, 0, 0);
     const inputStream = pipe.inputStream;
     const outputStream = pipe.outputStream;
-    const saveOffline = this._newsFolder && this._hasLocalHeader() &&
+    const saveOffline =
+      this._newsFolder &&
+      this._hasLocalHeader() &&
       this._newsFolder.shouldStoreMsgOffline(this._localKey);
     if (this._newsFolder) {
       const folder = this._newsFolder.QueryInterface(Ci.nsIMsgNewsFolder);
       if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
         if (saveOffline) {
           if (folder.saveArticleOffline) {
-            throw Components.Exception("News download already active", Cr.NS_MSG_FOLDER_BUSY);
+            throw Components.Exception(
+              "News download already active",
+              Cr.NS_MSG_FOLDER_BUSY
+            );
           }
           folder.saveArticleOffline = true;
           this._ownsNativeOfflineMode = true;
@@ -542,63 +589,82 @@ export class NntpChannel extends MailChannel {
         folder.saveArticleOffline = !!saveOffline;
       }
     }
-    this._server.wrappedJSObject.withClient(client => {
-      client.channel = this;
-      client.onDone = status => {
-        if (this._completed) {
-          return;
-        }
-        this._completed = true;
-        this._releaseNativeOfflineMode();
-        if (!Components.isSuccessCode(this._status)) {
-          status = this._status;
-        }
-        this._status = status;
-        try { this.loadGroup?.removeRequest(this, null, status); } catch (error) {}
-        if (status != Cr.NS_OK || this.contentLength == 0) {
-          this.URI.errorCode = status != Cr.NS_OK ? status : Cr.NS_ERROR_FAILURE;
-          this._cacheEntry?.asyncDoom(null);
-        }
-        const listener = this._listener;
-        this._listener = null;
-        this._pending = false;
-        listener?.onStopRequest(this, status);
-        if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
-          this._newsFolder?.msgDatabase.commit(Ci.nsMsgDBCommitType.kSessionCommit);
-        }
-      };
-      client.onOpen = () => {
-        try {
+    this._server.wrappedJSObject
+      .withClient(client => {
+        client.channel = this;
+        client.onDone = status => {
+          if (this._completed) {
+            return;
+          }
+          this._completed = true;
+          this._releaseNativeOfflineMode();
           if (!Components.isSuccessCode(this._status)) {
-            throw Components.Exception("Cancelled news request", this._status);
+            status = this._status;
+          }
+          this._status = status;
+          try {
+            this.loadGroup?.removeRequest(this, null, status);
+          } catch (error) {}
+          if (status != Cr.NS_OK || this.contentLength == 0) {
+            this.URI.errorCode =
+              status != Cr.NS_OK ? status : Cr.NS_ERROR_FAILURE;
+            this._cacheEntry?.asyncDoom(null);
+          }
+          const listener = this._listener;
+          this._listener = null;
+          this._pending = false;
+          listener?.onStopRequest(this, status);
+          if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+            this._newsFolder?.msgDatabase.commit(
+              Ci.nsMsgDBCommitType.kSessionCommit
+            );
+          }
+        };
+        client.onOpen = () => {
+          try {
+            if (!Components.isSuccessCode(this._status)) {
+              throw Components.Exception(
+                "Cancelled news request",
+                this._status
+              );
+            }
+            this._revalidateNativeArticle();
+            if (this._messageId) {
+              client.getArticleByMessageId(this._messageId);
+            } else {
+              client.getArticleByArticleNumber(
+                this._groupName,
+                this._articleNumber,
+                this._articleBinding ?? null,
+                !!saveOffline
+              );
+            }
+          } catch (error) {
+            client._actionDone(error.result ?? Cr.NS_ERROR_FAILURE);
+          }
+        };
+        client.onData = data => {
+          if (!Components.isSuccessCode(this._status)) {
+            throw Components.Exception("Cancelled news body", this._status);
           }
           this._revalidateNativeArticle();
-          if (this._messageId) {
-            client.getArticleByMessageId(this._messageId);
-          } else {
-            client.getArticleByArticleNumber(this._groupName, this._articleNumber,
-              this._articleBinding ?? null, !!saveOffline);
+          if (outputStream.write(data, data.length) != data.length) {
+            throw Components.Exception(
+              "Short news channel write",
+              Cr.NS_ERROR_FAILURE
+            );
           }
-        } catch (error) {
-          client._actionDone(error.result ?? Cr.NS_ERROR_FAILURE);
-        }
-      };
-      client.onData = data => {
-        if (!Components.isSuccessCode(this._status)) {
-          throw Components.Exception("Cancelled news body", this._status);
-        }
-        this._revalidateNativeArticle();
-        if (outputStream.write(data, data.length) != data.length) {
-          throw Components.Exception("Short news channel write", Cr.NS_ERROR_FAILURE);
-        }
-        this.contentLength += data.length;
-        this._listener.onDataAvailable(this, inputStream, 0, data.length);
-      };
-      let msgWindow;
-      try { msgWindow = this.URI.msgWindow; } catch (error) {}
-      client.startRunningUrl(null, msgWindow, this.URI);
-      this._pending = true;
-      this._listener.onStartRequest(this);
-    }).catch(error => this._failBeforeNetwork(error));
+          this.contentLength += data.length;
+          this._listener.onDataAvailable(this, inputStream, 0, data.length);
+        };
+        let msgWindow;
+        try {
+          msgWindow = this.URI.msgWindow;
+        } catch (error) {}
+        client.startRunningUrl(null, msgWindow, this.URI);
+        this._pending = true;
+        this._listener.onStartRequest(this);
+      })
+      .catch(error => this._failBeforeNetwork(error));
   }
 }

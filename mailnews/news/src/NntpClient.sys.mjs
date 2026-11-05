@@ -92,11 +92,17 @@ export function captureNativeNewsArticle(folder, key) {
     !Number.isSafeInteger(physicalKey) ||
     physicalKey >= 0xffffffff
   ) {
-    throw Components.Exception("Invalid physical news key", Cr.NS_ERROR_INVALID_ARG);
+    throw Components.Exception(
+      "Invalid physical news key",
+      Cr.NS_ERROR_INVALID_ARG
+    );
   }
   const database = folder.msgDatabase;
   if (!database.containsKey(physicalKey)) {
-    throw Components.Exception("News article is no longer present", Cr.NS_ERROR_NOT_AVAILABLE);
+    throw Components.Exception(
+      "News article is no longer present",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
   }
   const messageId = folder.getMessageIdForKey(physicalKey);
   const header = database.getMsgHdrForKey(physicalKey);
@@ -117,11 +123,21 @@ export function captureNativeNewsArticle(folder, key) {
     folder.id != folderId ||
     folder.msgDatabase != database
   ) {
-    throw Components.Exception("Native news binding changed", Cr.NS_ERROR_NOT_AVAILABLE);
+    throw Components.Exception(
+      "Native news binding changed",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
   }
   return {
-    folder, database, header, physicalKey, articleNumber, folderId,
-    sourceId, incarnation, messageId,
+    folder,
+    database,
+    header,
+    physicalKey,
+    articleNumber,
+    folderId,
+    sourceId,
+    incarnation,
+    messageId,
   };
 }
 
@@ -133,13 +149,24 @@ export function captureNativeNewsArticle(folder, key) {
  * @throws {nsIException} The original native error, or NOT_AVAILABLE on change.
  */
 export function revalidateNativeNewsArticle(expected) {
-  const current = captureNativeNewsArticle(expected.folder, expected.physicalKey);
+  const current = captureNativeNewsArticle(
+    expected.folder,
+    expected.physicalKey
+  );
   for (const field of [
-    "database", "physicalKey", "articleNumber", "folderId", "sourceId",
-    "incarnation", "messageId",
+    "database",
+    "physicalKey",
+    "articleNumber",
+    "folderId",
+    "sourceId",
+    "incarnation",
+    "messageId",
   ]) {
     if (current[field] != expected[field]) {
-      throw Components.Exception("Stale native news request", Cr.NS_ERROR_NOT_AVAILABLE);
+      throw Components.Exception(
+        "Stale native news request",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
     }
   }
   return current;
@@ -630,12 +657,18 @@ export class NntpClient {
    * @param {NativeNewsArticle|null} [binding=null] - The original native mapping.
    * @param {boolean|null} [saveOffline=null] - The captured offline-save request.
    */
-  getArticleByArticleNumber(groupName, articleNumber, binding = null, saveOffline = null) {
+  getArticleByArticleNumber(
+    groupName,
+    articleNumber,
+    binding = null,
+    saveOffline = null
+  ) {
     this._newsFolder = this._server.rootFolder.getChildNamed(groupName);
     this._nextGroupName = this._getNextGroupName(groupName);
     this._articleNumber = articleNumber;
     this._articleBinding = binding;
-    this._saveArticleOffline = saveOffline ?? this._newsFolder.saveArticleOffline;
+    this._saveArticleOffline =
+      saveOffline ?? this._newsFolder.saveArticleOffline;
     this._messageId = "";
     this._firstGroupCommand = this._actionArticle;
     this._actionModeReader(this._actionGroup);
@@ -1118,12 +1151,21 @@ export class NntpClient {
           if (this._articleBinding) {
             if (this._saveArticleOffline) {
               if (!this._newsFolder.saveArticleOffline) {
-                throw Components.Exception("Offline news request changed", Cr.NS_ERROR_NOT_AVAILABLE);
+                throw Components.Exception(
+                  "Offline news request changed",
+                  Cr.NS_ERROR_NOT_AVAILABLE
+                );
               }
-              this._newsFolder.notifyArticleDownloaded(this._articleNumber, article);
+              this._newsFolder.notifyArticleDownloaded(
+                this._articleNumber,
+                article
+              );
             }
           } else {
-            this._newsFolder?.notifyArticleDownloaded(this._articleNumber, article);
+            this._newsFolder?.notifyArticleDownloaded(
+              this._articleNumber,
+              article
+            );
           }
         }
         this._actionDone();

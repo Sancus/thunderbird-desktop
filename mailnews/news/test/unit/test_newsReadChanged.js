@@ -459,7 +459,11 @@ add_task(async function test_nativeFailedExpiryPreservesPhysicalState() {
       /NS_ERROR_ILLEGAL_VALUE/,
       "Malformed LISTGROUP rejects with the actual parse error before deletion"
     );
-    Assert.equal(withClient.callCount, 1, "The actual LISTGROUP request was started");
+    Assert.equal(
+      withClient.callCount,
+      1,
+      "The actual LISTGROUP request was started"
+    );
   } finally {
     withClient.restore();
   }

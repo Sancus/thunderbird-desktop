@@ -21,7 +21,10 @@ var { NntpNewsGroup } = ChromeUtils.importESModule(
 
 let server;
 let daemon;
-const nativeBackend = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+const nativeBackend = Services.prefs.getBoolPref(
+  "mail.panorama.enabled",
+  false
+);
 
 /**
  * Publishes a native article through the retained NNTP overview producer.
@@ -33,7 +36,8 @@ function localArticleKey(articleNumber) {
   if (!nativeBackend) {
     return articleNumber;
   }
-  const folder = _server.rootFolder.getChildNamed("test.filter")
+  const folder = _server.rootFolder
+    .getChildNamed("test.filter")
     .QueryInterface(Ci.nsIMsgNewsFolder);
   const article = daemon.getGroup("test.filter")[articleNumber];
   Assert.ok(article, "The ordinary fake server owns this wire article");
@@ -47,9 +51,15 @@ function localArticleKey(articleNumber) {
   } finally {
     reader.cleanUp();
   }
-  const header = folder.msgDatabase.getMsgHdrForMessageID(article.messageID.slice(1, -1));
+  const header = folder.msgDatabase.getMsgHdrForMessageID(
+    article.messageID.slice(1, -1)
+  );
   Assert.ok(header, "The real native producer published the requested header");
-  Assert.notEqual(header.messageKey, articleNumber, "Physical key differs from the wire article");
+  Assert.notEqual(
+    header.messageKey,
+    articleNumber,
+    "Physical key differs from the wire article"
+  );
   return header.messageKey;
 }
 
@@ -77,7 +87,11 @@ add_setup(async function setup() {
     const listener = new PromiseTestUtils.PromiseUrlListener();
     seed.getNewMessages(null, listener);
     await listener.promise;
-    Assert.equal(seed.getTotalMessages(false), 1, "Real NNTP ingestion reserves the independent group's physical row");
+    Assert.equal(
+      seed.getTotalMessages(false),
+      1,
+      "Real NNTP ingestion reserves the independent group's physical row"
+    );
   }
 });
 
@@ -558,7 +572,10 @@ add_task(async function test_nntpArticleWithoutHeaderInOfflineGroup() {
         "The native message-ID getter reports exact absence for article 2"
       );
     } else {
-      Assert.ok(!folder.msgDatabase.containsKey(2), "article 2 should have no local header");
+      Assert.ok(
+        !folder.msgDatabase.containsKey(2),
+        "article 2 should have no local header"
+      );
     }
 
     const streamListener = new PromiseTestUtils.PromiseStreamListener();
@@ -632,7 +649,6 @@ add_task(async function test_nntpCachedPartOffline() {
   }
 });
 
-
 add_task(function test_nativeMissingPhysicalKeyDoesNotFetchWireArticle() {
   if (!nativeBackend) {
     info("Strict physical binding applies to the native backend");
@@ -641,23 +657,31 @@ add_task(function test_nativeMissingPhysicalKeyDoesNotFetchWireArticle() {
   const folder = _server.rootFolder.getChildNamed("test.filter");
   const key = 0x7ffffffe;
   Assert.ok(!folder.msgDatabase.containsKey(key));
-  const before = receivedCommands().filter(command => command.startsWith("ARTICLE ")).length;
+  const before = receivedCommands().filter(command =>
+    command.startsWith("ARTICLE ")
+  ).length;
   const channel = NetUtil.newChannel({
     uri: `news://localhost:${NNTP_PORT}/?group=test.filter&key=${key}`,
     loadUsingSystemPrincipal: true,
   });
-  Assert.throws(() => channel.asyncOpen(new StatusListener()), /NS_ERROR_NOT_AVAILABLE/);
-  Assert.equal(receivedCommands().filter(command => command.startsWith("ARTICLE ")).length,
-    before, "An unmapped physical key never becomes a wire ARTICLE request");
+  Assert.throws(
+    () => channel.asyncOpen(new StatusListener()),
+    /NS_ERROR_NOT_AVAILABLE/
+  );
+  Assert.equal(
+    receivedCommands().filter(command => command.startsWith("ARTICLE ")).length,
+    before,
+    "An unmapped physical key never becomes a wire ARTICLE request"
+  );
 });
-
 
 add_task(async function test_nativeMappedOfflineChannelUsesPhysicalBody() {
   if (!nativeBackend) {
     info("Native physical offline cache control is inapplicable to Mork");
     return;
   }
-  const folder = _server.rootFolder.getChildNamed("test.filter")
+  const folder = _server.rootFolder
+    .getChildNamed("test.filter")
     .QueryInterface(Ci.nsIMsgNewsFolder);
   const key = localArticleKey(1);
   folder.saveArticleOffline = true;
@@ -668,8 +692,13 @@ add_task(async function test_nativeMappedOfflineChannelUsesPhysicalBody() {
   } finally {
     folder.saveArticleOffline = false;
   }
-  Assert.ok(folder.hasMsgOffline(key), "The mapped physical row owns the actual stored body");
-  const before = receivedCommands().filter(command => command.startsWith("ARTICLE ")).length;
+  Assert.ok(
+    folder.hasMsgOffline(key),
+    "The mapped physical row owns the actual stored body"
+  );
+  const before = receivedCommands().filter(command =>
+    command.startsWith("ARTICLE ")
+  ).length;
   Services.io.offline = true;
   try {
     for (const uri of [
@@ -677,13 +706,21 @@ add_task(async function test_nativeMappedOfflineChannelUsesPhysicalBody() {
       `nntp://localhost:${NNTP_PORT}/test.filter/1`,
     ]) {
       const stream = new PromiseTestUtils.PromiseStreamListener();
-      NetUtil.newChannel({ uri, loadUsingSystemPrincipal: true }).asyncOpen(stream);
-      Assert.stringContains(await stream.promise, "Message-ID: <1@regular.invalid>",
-        "Both local physical and explicit wire URLs read the same actual offline body");
+      NetUtil.newChannel({ uri, loadUsingSystemPrincipal: true }).asyncOpen(
+        stream
+      );
+      Assert.stringContains(
+        await stream.promise,
+        "Message-ID: <1@regular.invalid>",
+        "Both local physical and explicit wire URLs read the same actual offline body"
+      );
     }
   } finally {
     Services.io.offline = false;
   }
-  Assert.equal(receivedCommands().filter(command => command.startsWith("ARTICLE ")).length,
-    before, "Offline display sends no new wire request");
+  Assert.equal(
+    receivedCommands().filter(command => command.startsWith("ARTICLE ")).length,
+    before,
+    "Offline display sends no new wire request"
+  );
 });

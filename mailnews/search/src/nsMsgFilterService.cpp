@@ -15,6 +15,7 @@
 #include "nsIUrlListener.h"
 #include "nsIMsgCopyServiceListener.h"
 #include "nsIMsgLocalMailFolder.h"
+#include "nsIMsgImapMailFolder.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgHdr.h"
 #include "nsIMsgCopyService.h"
@@ -54,7 +55,7 @@ LazyLogModule FILTERLOGMODULE("Filters");
     m_filters->LogFilterMessage(NS_LITERAL_STRING_FROM_CSTRING(_text), \
                                 m_curFilter);                          \
     NS_WARNING(_text);                                                 \
-    mFinalResult = _rv;                                                \
+    RememberFailure(_rv);                                              \
     break;                                                             \
   }
 
@@ -65,7 +66,7 @@ LazyLogModule FILTERLOGMODULE("Filters");
     m_filters->LogFilterMessage(NS_LITERAL_STRING_FROM_CSTRING(_text),      \
                                 m_curFilter);                               \
     NS_WARNING(_text);                                                      \
-    mFinalResult = _rv;                                                     \
+    RememberFailure(_rv);                                                   \
     if (m_msgWindow && !ContinueExecutionPrompt()) return OnEndExecution(); \
     continue;                                                               \
   }
@@ -77,7 +78,7 @@ LazyLogModule FILTERLOGMODULE("Filters");
     m_filters->LogFilterMessage(NS_LITERAL_STRING_FROM_CSTRING(_text), \
                                 m_curFilter);                          \
     NS_WARNING(_text);                                                 \
-    mFinalResult = NS_ERROR_FAILURE;                                   \
+    RememberFailure(NS_ERROR_FAILURE);                                 \
     break;                                                             \
   }
 
@@ -88,7 +89,7 @@ LazyLogModule FILTERLOGMODULE("Filters");
     m_filters->LogFilterMessage(NS_LITERAL_STRING_FROM_CSTRING(_text),      \
                                 m_curFilter);                               \
     NS_WARNING(_text);                                                      \
-    mFinalResult = NS_ERROR_FAILURE;                                        \
+    RememberFailure(NS_ERROR_FAILURE);                                      \
     if (m_msgWindow && !ContinueExecutionPrompt()) return OnEndExecution(); \
     continue;                                                               \
   }
@@ -274,6 +275,58 @@ nsresult nsMsgFilterService::ThrowFilterAlertMsg(const nsACString& fluentID,
                            NS_ConvertUTF8toUTF16(alertString).get());
 }
 
+// One native transfer owns one completion. Defer a synchronous callback until
+// dispatch returns, and ignore duplicates after advancing to another action.
+class FilterCopyListener final : public nsIMsgCopyServiceListener {
+ public:
+  explicit FilterCopyListener(nsIMsgCopyServiceListener* listener)
+      : mListener(listener) {}
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMSGCOPYSERVICELISTENER
+
+  nsresult CompleteDispatch(nsresult result, bool* completed) {
+    mDispatching = false;
+    if (NS_FAILED(result) && (!mCompleted || NS_SUCCEEDED(mResult))) {
+      mCompleted = true;
+      mResult = result;
+    }
+    *completed = mCompleted;
+    return mCompleted ? Notify() : NS_OK;
+  }
+
+ private:
+  ~FilterCopyListener() = default;
+  nsresult Notify() {
+    nsCOMPtr<nsIMsgCopyServiceListener> listener;
+    listener.swap(mListener);
+    return listener ? listener->OnStopCopy(mResult) : NS_OK;
+  }
+  nsCOMPtr<nsIMsgCopyServiceListener> mListener;
+  nsresult mResult = NS_OK;
+  bool mDispatching = true;
+  bool mCompleted = false;
+};
+
+NS_IMPL_ISUPPORTS(FilterCopyListener, nsIMsgCopyServiceListener)
+NS_IMETHODIMP FilterCopyListener::OnStartCopy() {
+  return mListener ? mListener->OnStartCopy() : NS_OK;
+}
+NS_IMETHODIMP FilterCopyListener::OnProgress(uint32_t current, uint32_t total) {
+  return mListener ? mListener->OnProgress(current, total) : NS_OK;
+}
+NS_IMETHODIMP FilterCopyListener::SetMessageKey(nsMsgKey key) {
+  return mListener ? mListener->SetMessageKey(key) : NS_OK;
+}
+NS_IMETHODIMP FilterCopyListener::GetMessageId(nsACString& id) {
+  return mListener ? mListener->GetMessageId(id) : NS_OK;
+}
+NS_IMETHODIMP FilterCopyListener::OnStopCopy(nsresult result) {
+  if (mCompleted) return NS_OK;
+  mCompleted = true;
+  mResult = result;
+  return mDispatching ? NS_OK : Notify();
+}
+
 // this class is used to run filters after the fact, i.e., after new mail has
 // been downloaded from the server. It can do the following:
 // 1. Apply a single imap or pop3 filter on a single folder.
@@ -319,6 +372,9 @@ class nsMsgFilterAfterTheFact : public nsIUrlListener,
    */
   nsresult ApplyFilter();
   nsresult OnEndExecution();  // do what we have to do to cleanup.
+  void RememberFailure(nsresult result) {
+    if (NS_FAILED(result) && NS_SUCCEEDED(mFinalResult)) mFinalResult = result;
+  }
   bool ContinueExecutionPrompt();
   nsCOMPtr<nsIMsgWindow> m_msgWindow;
   nsCOMPtr<nsIMsgFilterList> m_filters;
@@ -522,7 +578,7 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnStopRunningUrl(nsIURI* aUrl,
   if (!mNeedsRelease) return NS_OK;
   if (NS_SUCCEEDED(aExitCode)) return RunNextFilter();
 
-  mFinalResult = aExitCode;
+  RememberFailure(aExitCode);
   // If m_msgWindow then we are in a context where the user can deal with
   //  errors. Put up a prompt, and exit if user wants.
   if (m_msgWindow && !ContinueExecutionPrompt()) return OnEndExecution();
@@ -570,7 +626,7 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnSearchDone(nsresult status) {
   if (NS_SUCCEEDED(status))
     return m_searchHits.IsEmpty() ? RunNextFilter() : ApplyFilter();
 
-  mFinalResult = status;
+  RememberFailure(status);
   if (status == NS_MSG_SEARCH_INTERRUPTED) return OnEndExecution();
   if (m_msgWindow && !ContinueExecutionPrompt()) return OnEndExecution();
 
@@ -669,27 +725,39 @@ nsresult nsMsgFilterAfterTheFact::ApplyFilter() {
       // the bottom of this routine, because we run the next filter at the end
       // of this routine.
       switch (actionType) {
-        case nsMsgFilterAction::Delete:
-          // we can't pass ourselves in as a copy service listener because the
-          // copy service listener won't get called in several situations (e.g.,
-          // the delete model is imap delete) and we rely on the listener
-          // getting called to continue the filter application. This means we're
-          // going to end up firing off the delete, and then subsequently
-          // issuing a search for the next filter, which will block until the
-          // delete finishes.
+        case nsMsgFilterAction::Delete: {
+          // Local and IMAP delete settle through the existing copy listener.
+          // Do not expose our URL listener: IMAP must update its folder before
+          // forwarding the confirmed result through its direct-copy adapter.
+          nsCOMPtr<nsIMsgLocalMailFolder> local = do_QueryInterface(curFolder);
+          nsCOMPtr<nsIMsgImapMailFolder> imap = do_QueryInterface(curFolder);
+          if (local || imap) {
+            m_stopFiltering.AppendElements(m_searchHits);
+            for (nsMsgKey key : m_searchHits) {
+              curFolder->OrProcessingFlags(key,
+                                           nsMsgProcessingFlags::FilterToMove);
+            }
+            m_nextAction = numActions;
+            RefPtr<FilterCopyListener> listener = new FilterCopyListener(this);
+            rv = curFolder->DeleteMessages(m_searchHitHdrs, m_msgWindow, false,
+                                           false, listener, false);
+            bool completed = false;
+            rv = listener->CompleteDispatch(rv, &completed);
+            if (!mNeedsRelease) return mFinalResult;
+            return completed ? rv : NS_OK;
+          }
+          // Other folder providers retain their existing synchronous contract.
           rv = curFolder->DeleteMessages(m_searchHitHdrs, m_msgWindow, false,
                                          false, nullptr, false /*allow Undo*/);
           BREAK_ACTION_IF_FAILURE(rv, "Deleting messages failed");
-
-          // don't allow any more filters on this message
           m_stopFiltering.AppendElements(m_searchHits);
-          for (uint32_t i = 0; i < m_searchHits.Length(); i++)
-            curFolder->OrProcessingFlags(m_searchHits[i],
+          for (nsMsgKey key : m_searchHits) {
+            curFolder->OrProcessingFlags(key,
                                          nsMsgProcessingFlags::FilterToMove);
-          // if we are deleting then we couldn't care less about applying
-          // remaining filter actions
+          }
           m_nextAction = numActions;
           break;
+        }
 
         case nsMsgFilterAction::MoveToFolder:
           // Even if move fails we will not run additional actions, as they
@@ -744,21 +812,15 @@ nsresult nsMsgFilterAfterTheFact::ApplyFilter() {
                                            nsMsgProcessingFlags::FilterToMove);
           }
 
-          bool listenerFired = false;
-          {
-            AutoRestore<bool*> restore(m_copyListenerFired);
-            m_copyListenerFired = &listenerFired;
-            rv = copyService->CopyMessages(
-                curFolder, m_searchHitHdrs, destIFolder,
-                actionType == nsMsgFilterAction::MoveToFolder, this,
-                m_msgWindow, false);
-          }
+          RefPtr<FilterCopyListener> listener = new FilterCopyListener(this);
+          rv = copyService->CopyMessages(
+              curFolder, m_searchHitHdrs, destIFolder,
+              actionType == nsMsgFilterAction::MoveToFolder, listener,
+              m_msgWindow, false);
+          bool completed = false;
+          rv = listener->CompleteDispatch(rv, &completed);
           if (!mNeedsRelease) return mFinalResult;
-          if (listenerFired) return NS_OK;
-          BREAK_ACTION_IF_FAILURE(rv, "CopyMessages failed");
-          MOZ_LOG(FILTERLOGMODULE, LogLevel::Debug,
-                  ("(Post) Action execution continues async"));
-          return NS_OK;  // OnStopCopy callback to continue;
+          return completed ? rv : NS_OK;
         } break;
         case nsMsgFilterAction::MarkRead:
           // crud, no listener support here - we'll probably just need to go on
@@ -962,7 +1024,7 @@ nsresult nsMsgFilterAfterTheFact::ApplyFilter() {
                                   "Unexpected filter action");
       }
       if (NS_FAILED(finalResult)) {
-        mFinalResult = finalResult;
+        RememberFailure(finalResult);
         MOZ_LOG(FILTERLOGMODULE, LogLevel::Error,
                 ("(Post) Action execution failed with error: %" PRIx32,
                  static_cast<uint32_t>(mFinalResult)));
@@ -1237,7 +1299,8 @@ nsresult nsMsgApplyFiltersToMessages::RunNextFilter() {
         curFilter->SetScope(nullptr);
         return mFinalResult;
       }
-      if (NS_SUCCEEDED(rv) && matched) {
+      CONTINUE_IF_FAILURE(rv, "Could not match selected header");
+      if (matched) {
         // In order to work with nsMsgFilterAfterTheFact::ApplyFilter we
         // initialize nsMsgFilterAfterTheFact's information with a search hit
         // now for the message that we're filtering.
@@ -1354,7 +1417,7 @@ NS_IMETHODIMP nsMsgFilterAfterTheFact::OnStopCopy(nsresult aStatus) {
           ("(Post) Async message copy from filter action failed (%" PRIx32 ")",
            static_cast<uint32_t>(aStatus)));
 
-  mFinalResult = aStatus;
+  RememberFailure(aStatus);
   if (m_msgWindow && !ContinueExecutionPrompt()) return OnEndExecution();
 
   // Copy failed, so run the next filter

@@ -592,7 +592,7 @@ function addCompletedPartialFilter(list, actions) {
  * Exercise completed-row filtering after the actual provider/SQL settlement.
  *
  * @param {string} store - Store type.
- * @param {string} mode - Supported, action-error, unsupported, or single-UIDL.
+ * @param {string} mode - Supported, action-error, move, or single-UIDL.
  */
 async function checkCompletedPartialFilters(store, mode) {
   await withPartialStore(store, async (incoming, folder) => {
@@ -697,6 +697,57 @@ async function checkCompletedPartialFilters(store, mode) {
       sink.incorporateBegin("completion-uidl", 0);
       for (const line of COMPLETE.match(/[^\n]*\n/g)) {
         sink.incorporateWrite(line, line.length);
+      }
+      if (mode == "move") {
+        const stops = [];
+        const stopped = Promise.withResolvers();
+        sink.incorporateComplete(null, COMPLETE.length, {
+          onStopOperation(status) {
+            stops.push(status);
+            stopped.resolve(status);
+          },
+        });
+        Assert.equal(await stopped.promise, Cr.NS_OK);
+        sink.endMailDelivery(null);
+        finished = true;
+        Assert.deepEqual(stops, [Cr.NS_OK]);
+        Assert.ok(sink.confirmedPartialCompletion);
+        Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+        const moved = [...destination.messages];
+        Assert.equal(moved.length, 1);
+        const current = moved[0];
+        Assert.equal(current.folder, destination);
+        Assert.notEqual(current.messageKey, key);
+        Assert.ok(current.storeToken);
+        Assert.equal(current.subject, "Completed partial");
+        Assert.equal(current.author, "complete@example.invalid");
+        Assert.equal(
+          current.flags,
+          Ci.nsMsgMessageFlags.Replied | Ci.nsMsgMessageFlags.Read
+        );
+        Assert.equal(
+          current.getStringProperty("keywords"),
+          "$label1 complete-tag must-not-run"
+        );
+        Assert.equal(current.getStringProperty("opaque empty"), "");
+        Assert.equal(current.getStringProperty("opaque text"), "0007");
+        const raw = mailTestUtils.loadMessageToString(destination, current);
+        Assert.ok(raw.endsWith(COMPLETE));
+        Assert.ok(raw.includes("X-UIDL: completion-uidl"));
+        Assert.equal(current.messageSize, raw.length);
+        Assert.equal(current.lineCount, 2);
+        Assert.equal(current.offlineMessageSize, 0);
+        const scan = new PromiseTestUtils.PromiseStoreScanListener();
+        folder.msgStore.asyncScan(folder, scan);
+        await scan.promise;
+        Assert.equal(scan.messages[scan.tokens.indexOf(oldToken)], oldRaw);
+        // The old shell is retained; the completed source has been retired.
+        Assert.equal(scan.messages.length, store == "mbox" ? 2 : 1);
+        Assert.deepEqual(added, []);
+        Assert.equal(faults, 0);
+        Assert.ok(!folder.locked);
+        Assert.ok(!destination.locked);
+        return;
       }
       let error;
       if (mode == "action-error") {
@@ -821,12 +872,12 @@ add_task(async function test_pop3CompletePartialFilterErrorMaildir() {
   await checkCompletedPartialFilters("maildir", "action-error");
 });
 
-add_task(async function test_pop3CompletePartialFilterMoveHeldMbox() {
-  await checkCompletedPartialFilters("mbox", "unsupported");
+add_task(async function test_pop3CompletePartialFilterMoveMbox() {
+  await checkCompletedPartialFilters("mbox", "move");
 });
 
-add_task(async function test_pop3CompletePartialFilterMoveHeldMaildir() {
-  await checkCompletedPartialFilters("maildir", "unsupported");
+add_task(async function test_pop3CompletePartialFilterMoveMaildir() {
+  await checkCompletedPartialFilters("maildir", "move");
 });
 
 add_task(
@@ -1900,4 +1951,749 @@ add_task(async function test_partialPhysicalAssociationAfterRestartMbox() {
 
 add_task(async function test_partialPhysicalAssociationAfterRestartMaildir() {
   await checkPartialProcessRestart("maildir");
+});
+
+/**
+ * Run a real fresh POP filter transfer and a second same-UIDL session.
+ *
+ * @param {string} store - Actual local provider.
+ * @param {string} mode - Move/delete, write/Finish/publication/cleanup error,
+ *   rejected copy start, or cancellation after a real native move.
+ */
+async function checkFreshFilterTransfer(store, mode) {
+  const storeContract = `@mozilla.org/msgstore/${store == "mbox" ? "berkeleystore" : "maildirstore"};1`;
+  const nativeStore = Cc[storeContract].createInstance(Ci.nsIMsgPluggableStore);
+  const copyContract = "@mozilla.org/messenger/messagecopyservice;1";
+  const nativeCopy = Cc[copyContract].getService(Ci.nsIMsgCopyService);
+  const events = [];
+  let sourceURI;
+  let targetURI;
+  let faultStream;
+  let faultNativeStream;
+  let copyCid;
+  let release;
+  let calls = 0;
+  let sourceKey;
+  let sourceRaw;
+  let receiptURI;
+  let client;
+  let doneCalls = 0;
+  let faults = 0;
+  const nativeStopped = Promise.withResolvers();
+  const failure = Cr.NS_ERROR_FILE_ACCESS_DENIED;
+  const provider = {
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgPluggableStore"]),
+    get storeType() {
+      return nativeStore.storeType;
+    },
+    get supportsCompaction() {
+      return nativeStore.supportsCompaction;
+    },
+    getNewMsgOutputStream(folder) {
+      const stream = nativeStore.getNewMsgOutputStream(folder);
+      events.push(["open", folder.URI]);
+      if (mode != "write" || folder.URI != targetURI) {
+        return stream;
+      }
+      faultNativeStream = stream;
+      faultStream = {
+        QueryInterface: ChromeUtils.generateQI(["nsIOutputStream"]),
+        close() {
+          return stream.close();
+        },
+        flush() {
+          return stream.flush();
+        },
+        write() {
+          events.push(["write-error", folder.URI]);
+          throw Components.Exception("filter body write refused", failure);
+        },
+        writeFrom() {
+          throw Components.Exception("filter body write refused", failure);
+        },
+        isNonBlocking() {
+          return stream.isNonBlocking();
+        },
+      };
+      return faultStream;
+    },
+    finishNewMessage(folder, stream) {
+      events.push(["finish-entry", folder.URI]);
+      const token = nativeStore.finishNewMessage(folder, stream);
+      events.push(["finish", folder.URI, token]);
+      if (mode == "finish" && folder.URI == targetURI) {
+        // The real provider has safely settled this stream. Report an error
+        // after that settlement to prove the caller never Discards/retries it.
+        throw Components.Exception("settled filter Finish failed", failure);
+      }
+      return token;
+    },
+    discardNewMessage(folder, stream) {
+      events.push(["discard", folder.URI]);
+      return nativeStore.discardNewMessage(
+        folder,
+        folder.URI == targetURI && faultStream ? faultNativeStream : stream
+      );
+    },
+    deleteMessages(headers) {
+      if (headers[0]?.folder.URI == sourceURI) {
+        events.push(["delete", sourceURI]);
+        if (mode == "cleanup") {
+          throw Components.Exception("source retirement refused", failure);
+        }
+      }
+      return nativeStore.deleteMessages(headers);
+    },
+  };
+  for (const method of [
+    "discoverSubFolders",
+    "discoverChildFolders",
+    "createFolder",
+    "ensureLocalStore",
+    "deleteFolder",
+    "renameFolder",
+    "hasSpaceAvailable",
+    "copyFolder",
+    "getMsgInputStream",
+    "deleteStoreMessages",
+    "copyMessages",
+    "asyncCompact",
+    "isSummaryFileValid",
+    "setSummaryFileValid",
+    "asyncScan",
+    "changeFlags",
+    "changeKeywords",
+    "estimateFolderSize",
+  ]) {
+    provider[method] = (...args) => nativeStore[method](...args);
+  }
+  const storeCid = PartialCopyRegistrar.register(storeContract, () => provider);
+  try {
+    await withPartialStore(store, async (incoming, folder) => {
+      sourceURI = folder.URI;
+      incoming.deferGetNewMail = true;
+      incoming.leaveMessagesOnServer = true;
+      incoming.headersOnly = false;
+      const destination =
+        mode == "delete"
+          ? folder.parent.getFolderWithFlags(Ci.nsMsgFolderFlags.Trash)
+          : folder.parent
+              .QueryInterface(Ci.nsIMsgLocalMailFolder)
+              .createLocalSubfolder(`fresh-filter-${mode}`);
+      Assert.ok(destination);
+      Assert.equal(folder.msgStore.storeType, store);
+      Assert.equal(destination.msgStore.storeType, store);
+      targetURI = destination.URI;
+      const list = incoming.getFilterList(null);
+      const deferred = folder.server.getFilterList(null);
+      const rule = addCompletedPartialFilter(list, [
+        { type: Ci.nsMsgFilterAction.MarkFlagged },
+        {
+          type:
+            mode == "delete"
+              ? Ci.nsMsgFilterAction.Delete
+              : Ci.nsMsgFilterAction.MoveToFolder,
+          targetFolderUri: destination.URI,
+        },
+      ]);
+      const after = addCompletedPartialFilter(list, [
+        { type: Ci.nsMsgFilterAction.AddTag, strValue: "must-not-run" },
+      ]);
+      const later = addCompletedPartialFilter(deferred, [
+        { type: Ci.nsMsgFilterAction.AddTag, strValue: "must-not-run" },
+      ]);
+      const expectedRaw =
+        AppConstants.platform == "win"
+          ? COMPLETE
+          : COMPLETE.replaceAll("\r\n", "\n");
+      popDaemon.setMessages([{ fileData: COMPLETE }]);
+      const implementation = incoming.wrappedJSObject;
+      const withClient = implementation.withClient;
+      let wait;
+      implementation.withClient = function (handler) {
+        const stopped = wait;
+        wait = null;
+        return withClient.call(this, actual => {
+          client = actual;
+          handler(actual);
+          const onDone = actual.onDone;
+          actual.onDone = status => {
+            doneCalls++;
+            onDone?.(status);
+            stopped.resolve(status);
+          };
+        });
+      };
+      /** @returns {Promise<number>} Terminal status from the real POP client. */
+      const getMail = () => {
+        wait = Promise.withResolvers();
+        const result = wait.promise;
+        popServer.resetTest();
+        MailServices.pop3.GetNewMail(null, null, folder, incoming);
+        return result;
+      };
+      /** @returns {string[]} Commands from the latest real server connection. */
+      const commands = () => {
+        let transaction = popServer.playTransaction();
+        if (Array.isArray(transaction)) {
+          transaction = transaction[transaction.length - 1];
+        }
+        return transaction.them;
+      };
+      const proxy = {
+        QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyService"]),
+        copyMessages(source, headers, target, move, listener, window, undo) {
+          calls++;
+          try {
+            Assert.equal(source, folder);
+            Assert.equal(target, destination);
+            Assert.ok(move);
+            Assert.ok(!undo);
+            Assert.equal(headers.length, 1);
+            const header = headers[0];
+            Assert.ok(header.isLive);
+            Assert.equal(header.folder, folder);
+            sourceKey = header.messageKey;
+            sourceRaw = mailTestUtils.loadMessageToString(folder, header);
+            receiptURI = folder.getUriForMsg(header);
+            Assert.ok(sourceRaw.endsWith(expectedRaw));
+            Assert.equal(header.messageSize, sourceRaw.length);
+            Assert.ok(header.flags & Ci.nsMsgMessageFlags.Marked);
+            Assert.equal(
+              events.filter(
+                ([event, uri]) => event == "finish" && uri == sourceURI
+              ).length,
+              1
+            );
+            if (mode == "reject") {
+              nativeStopped.resolve(failure);
+              throw Components.Exception("filter copy start refused", failure);
+            }
+            nativeCopy.copyMessages(
+              source,
+              headers,
+              target,
+              move,
+              {
+                QueryInterface: ChromeUtils.generateQI([
+                  "nsIMsgCopyServiceListener",
+                ]),
+                onStartCopy() {
+                  listener.onStartCopy();
+                },
+                onProgress(...args) {
+                  listener.onProgress(...args);
+                },
+                setMessageKey(key) {
+                  listener.setMessageKey(key);
+                },
+                getMessageId() {
+                  return listener.getMessageId();
+                },
+                onStopCopy(status) {
+                  if (mode == "cancel") {
+                    release = () => listener.onStopCopy(status);
+                  } else {
+                    listener.onStopCopy(status);
+                  }
+                  nativeStopped.resolve(status);
+                },
+              },
+              window,
+              undo
+            );
+          } catch (error) {
+            // Do not turn a dispatch assertion/error into an unbounded wait.
+            nativeStopped.resolve(error.result || Cr.NS_ERROR_FAILURE);
+            throw error;
+          }
+        },
+      };
+      for (const method of [
+        "copyFolder",
+        "copyFileMessage",
+        "notifyCompletion",
+        "getArrivedFolder",
+      ]) {
+        proxy[method] = (...args) => nativeCopy[method](...args);
+      }
+      const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+        Ci.nsIDatabaseCore
+      ).connectionForTests;
+      let trigger = false;
+      let functionInstalled = false;
+      let reentrantCancels = 0;
+      const publicationListener = {
+        msgAdded(header) {
+          if (mode == "reentrant-cancel" && header.folder == folder) {
+            reentrantCancels++;
+            Assert.ok(client._pendingIncorporation.dispatching);
+            client._actionDone(Cr.NS_BINDING_ABORTED);
+          }
+        },
+      };
+      MailServices.mfn.addListener(
+        publicationListener,
+        MailServices.mfn.msgAdded
+      );
+      try {
+        if (mode == "publication") {
+          connection.createFunction("fresh_filter_fault", 0, {
+            onFunctionCall() {
+              faults++;
+              return 0;
+            },
+          });
+          functionInstalled = true;
+          connection.executeSimpleSQL(
+            "CREATE TEMP TRIGGER fresh_filter_fault BEFORE INSERT ON main.messages " +
+              `WHEN NEW.folderId = ${destination.id} BEGIN SELECT fresh_filter_fault(); ` +
+              "SELECT RAISE(ABORT, 'fresh destination publication failed'); END"
+          );
+          trigger = true;
+        }
+        copyCid = PartialCopyRegistrar.register(copyContract, proxy);
+        const before = Math.floor(Date.now() / 1000);
+        const first = getMail();
+        const nativeStatus = await nativeStopped.promise;
+        const expected = ["move", "delete"].includes(mode)
+          ? Cr.NS_OK
+          : mode == "publication"
+            ? Cr.NS_ERROR_STORAGE_CONSTRAINT
+            : ["cancel", "reentrant-cancel"].includes(mode)
+              ? Cr.NS_BINDING_ABORTED
+              : failure;
+        if (mode == "cancel") {
+          Assert.equal(
+            nativeStatus,
+            Cr.NS_OK,
+            "Withhold only a real native completion"
+          );
+          Assert.ok(release);
+          Assert.throws(
+            () => client._sink.incorporateBegin("other", 0),
+            error => error.result == Cr.NS_ERROR_IN_PROGRESS
+          );
+          Assert.equal(client._sink.messageUri, receiptURI);
+          const cancelled = client._actionDone(Cr.NS_BINDING_ABORTED);
+          release();
+          release();
+          await cancelled;
+        } else {
+          Assert.equal(
+            nativeStatus,
+            mode == "reentrant-cancel" ? Cr.NS_OK : expected
+          );
+        }
+        Assert.equal(await first, expected);
+        Assert.equal(reentrantCancels, mode == "reentrant-cancel" ? 1 : 0);
+        Assert.equal(doneCalls, 1);
+        Assert.equal(calls, 1);
+        Assert.ok(
+          !client._sink.confirmedPartialCompletion,
+          "A fresh receipt is not a Partial completion"
+        );
+        Assert.equal(client._sink.messageUri, receiptURI);
+        Assert.ok(commands().includes("RETR 1"));
+        Assert.ok(!commands().some(command => command.startsWith("DELE")));
+        Assert.equal(popDaemon.getTotalMessages(), 1);
+        Assert.equal(faults, mode == "publication" ? 1 : 0);
+        const sourceRetained = ![
+          "move",
+          "delete",
+          "cancel",
+          "reentrant-cancel",
+        ].includes(mode);
+        const destinationPublished = [
+          "move",
+          "delete",
+          "cleanup",
+          "cancel",
+          "reentrant-cancel",
+        ].includes(mode);
+        Assert.equal(folder.getTotalMessages(false), sourceRetained ? 1 : 0);
+        Assert.equal(
+          destination.getTotalMessages(false),
+          destinationPublished ? 1 : 0
+        );
+        if (sourceRetained) {
+          const current = folder.msgDatabase.getMsgHdrForKey(sourceKey);
+          Assert.equal(
+            mailTestUtils.loadMessageToString(folder, current),
+            sourceRaw
+          );
+          Assert.equal(current.getStringProperty("keywords"), "");
+        }
+        const targets = [...destination.messages];
+        if (destinationPublished) {
+          Assert.equal(targets.length, 1);
+          Assert.equal(targets[0].folder, destination);
+          Assert.notEqual(targets[0].messageKey, sourceKey);
+          Assert.ok(targets[0].storeToken);
+          Assert.equal(targets[0].getStringProperty("keywords"), "");
+          Assert.ok(targets[0].flags & Ci.nsMsgMessageFlags.Marked);
+          Assert.ok(
+            mailTestUtils
+              .loadMessageToString(destination, targets[0])
+              .endsWith(expectedRaw)
+          );
+        }
+        const count = (event, uri) =>
+          events.filter(([kind, owner]) => kind == event && owner == uri)
+            .length;
+        Assert.equal(count("finish-entry", sourceURI), 1);
+        Assert.equal(count("discard", sourceURI), 0);
+        Assert.equal(
+          count("finish-entry", targetURI),
+          ["write", "reject"].includes(mode) ? 0 : 1
+        );
+        Assert.equal(count("discard", targetURI), mode == "write" ? 1 : 0);
+        Assert.equal(count("delete", sourceURI), destinationPublished ? 1 : 0);
+        Assert.ok(!folder.locked);
+        Assert.ok(!destination.locked);
+        const uidl = /^X-UIDL: ([^\r\n]+)/m.exec(sourceRaw)[1];
+        const stateFile = PathUtils.join(
+          incoming.localPath.path,
+          "popstate.dat"
+        );
+        const saved = (await IOUtils.readUTF8(stateFile))
+          .split(/\r?\n/)
+          .find(line => line.split(" ")[1] == uidl);
+        Assert.ok(saved);
+        Assert.equal(saved.split(" ")[0], "k");
+        Assert.greaterOrEqual(Number(saved.split(" ")[2]), before);
+        const sourceScan = new PromiseTestUtils.PromiseStoreScanListener();
+        folder.msgStore.asyncScan(folder, sourceScan);
+        await sourceScan.promise;
+        Assert.equal(
+          sourceScan.messages.length,
+          sourceRetained || store == "mbox" ? 1 : 0
+        );
+        const targetScan = new PromiseTestUtils.PromiseStoreScanListener();
+        destination.msgStore.asyncScan(destination, targetScan);
+        await targetScan.promise;
+        Assert.equal(
+          targetScan.messages.length,
+          [
+            "move",
+            "delete",
+            "cleanup",
+            "cancel",
+            "publication",
+            "finish",
+            "reentrant-cancel",
+          ].includes(mode)
+            ? 1
+            : 0
+        );
+        if (targetScan.messages.length) {
+          Assert.ok(targetScan.messages[0].endsWith(expectedRaw));
+        }
+        const sourceKeys = folder.msgDatabase.listAllKeys();
+        const targetKeys = destination.msgDatabase.listAllKeys();
+        const tokens = targets.map(header => header.storeToken);
+        // The same UIDL is still on the real server. Its saved receipt must
+        // prevent another RETR, another destination, or another filter action.
+        Assert.equal(await getMail(), Cr.NS_OK);
+        Assert.equal(doneCalls, 2);
+        Assert.ok(!commands().some(command => command.startsWith("RETR")));
+        Assert.equal(calls, 1);
+        Assert.deepEqual(folder.msgDatabase.listAllKeys(), sourceKeys);
+        Assert.deepEqual(destination.msgDatabase.listAllKeys(), targetKeys);
+        Assert.deepEqual(
+          [...destination.messages].map(header => header.storeToken),
+          tokens
+        );
+        const retried = new PromiseTestUtils.PromiseStoreScanListener();
+        destination.msgStore.asyncScan(destination, retried);
+        await retried.promise;
+        Assert.deepEqual(retried.tokens, targetScan.tokens);
+        Assert.deepEqual(retried.messages, targetScan.messages);
+        Assert.equal(
+          (await IOUtils.readUTF8(stateFile))
+            .split(/\r?\n/)
+            .find(line => line.split(" ")[1] == uidl),
+          saved
+        );
+      } finally {
+        if (release) {
+          release();
+        }
+        MailServices.mfn.removeListener(publicationListener);
+        implementation.withClient = withClient;
+        if (copyCid) {
+          PartialCopyRegistrar.unregister(copyCid);
+          copyCid = null;
+        }
+        try {
+          if (trigger) {
+            connection.executeSimpleSQL("DROP TRIGGER temp.fresh_filter_fault");
+          }
+        } finally {
+          if (functionInstalled) {
+            connection.removeFunction("fresh_filter_fault");
+          }
+          list.removeFilter(rule);
+          list.removeFilter(after);
+          deferred.removeFilter(later);
+        }
+      }
+    });
+  } finally {
+    if (copyCid) {
+      PartialCopyRegistrar.unregister(copyCid);
+    }
+    PartialCopyRegistrar.unregister(storeCid);
+    Assert.equal(Cc[copyContract].getService(Ci.nsIMsgCopyService), nativeCopy);
+  }
+}
+
+/**
+ * Move a completed Partial to Trash using its confirmed physical source.
+ *
+ * @param {string} store - Actual local provider.
+ */
+async function checkCompletedPartialDelete(store) {
+  await withPartialStore(store, async (incoming, folder) => {
+    const original = seedPartial(incoming, folder);
+    const key = original.messageKey;
+    const list = incoming.getFilterList(null);
+    const rule = addCompletedPartialFilter(list, [
+      { type: Ci.nsMsgFilterAction.Delete },
+    ]);
+    const sink = Cc["@mozilla.org/messenger/pop3-sink;1"].createInstance(
+      Ci.nsIPop3Sink
+    );
+    let ended = false;
+    try {
+      sink.popServer = incoming;
+      sink.folder = folder;
+      sink.origMessageUri = folder.getUriForMsg(original);
+      sink.beginMailDelivery(false, null);
+      sink.incorporateBegin("completion-uidl", 0);
+      for (const line of COMPLETE.match(/[^\n]*\n/g)) {
+        sink.incorporateWrite(line, line.length);
+      }
+      const stopped = Promise.withResolvers();
+      const stops = [];
+      sink.incorporateComplete(null, 0, {
+        onStopOperation(status) {
+          stops.push(status);
+          stopped.resolve(status);
+        },
+      });
+      Assert.equal(await stopped.promise, Cr.NS_OK);
+      sink.endMailDelivery(null);
+      ended = true;
+      Assert.deepEqual(stops, [Cr.NS_OK]);
+      Assert.ok(sink.confirmedPartialCompletion);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), []);
+      const trash = folder.parent.getFolderWithFlags(Ci.nsMsgFolderFlags.Trash);
+      const headers = [...trash.messages];
+      Assert.equal(headers.length, 1);
+      Assert.equal(headers[0].folder, trash);
+      Assert.notEqual(headers[0].messageKey, key);
+      Assert.ok(!(headers[0].flags & Ci.nsMsgMessageFlags.Partial));
+      const raw = mailTestUtils.loadMessageToString(trash, headers[0]);
+      Assert.ok(raw.endsWith(COMPLETE));
+      Assert.ok(raw.includes("X-UIDL: completion-uidl"));
+      Assert.ok(!folder.locked);
+      Assert.ok(!trash.locked);
+    } finally {
+      if (!ended) {
+        try {
+          sink.abortMailDelivery(null);
+        } catch {}
+      }
+      list.removeFilter(rule);
+    }
+  });
+}
+
+/**
+ * Reject another physical folder even with the same Message-ID and UIDL.
+ *
+ * @param {string} store - Actual local provider.
+ */
+async function checkPartialWrongFolder(store) {
+  await withPartialStore(store, async (incoming, folder) => {
+    const original = seedPartial(incoming, folder);
+    const otherFolder = folder.parent
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder("wrong-partial-folder");
+    const other = seedPartial(incoming, otherFolder);
+    const originals = [original, other].map(header => ({
+      key: header.messageKey,
+      token: header.storeToken,
+      raw: mailTestUtils.loadMessageToString(header.folder, header),
+    }));
+    const sink = Cc["@mozilla.org/messenger/pop3-sink;1"].createInstance(
+      Ci.nsIPop3Sink
+    );
+    try {
+      sink.popServer = incoming;
+      sink.folder = folder;
+      sink.origMessageUri = otherFolder.getUriForMsg(other);
+      sink.buildMessageUri = true;
+      sink.beginMailDelivery(true, null);
+      Assert.throws(
+        () => sink.incorporateBegin("completion-uidl", 0),
+        error => error.result == Cr.NS_ERROR_INVALID_ARG
+      );
+      Assert.ok(!sink.confirmedPartialCompletion);
+      Assert.throws(
+        () => sink.messageUri,
+        error => error.result == Cr.NS_ERROR_FAILURE
+      );
+    } finally {
+      try {
+        sink.abortMailDelivery(null);
+      } catch {}
+    }
+    for (const [index, physical] of [folder, otherFolder].entries()) {
+      Assert.deepEqual(physical.msgDatabase.listAllKeys(), [
+        originals[index].key,
+      ]);
+      const header = physical.msgDatabase.getMsgHdrForKey(originals[index].key);
+      Assert.equal(header.storeToken, originals[index].token);
+      Assert.equal(
+        mailTestUtils.loadMessageToString(physical, header),
+        originals[index].raw
+      );
+    }
+  });
+}
+
+/**
+ * Clear a fresh receipt on a new admitted write, without confirming failed SQL.
+ *
+ * @param {string} store - Actual local provider.
+ */
+async function checkFreshPublicationReceiptReset(store) {
+  await withPartialStore(store, async (incoming, folder) => {
+    const sink = Cc["@mozilla.org/messenger/pop3-sink;1"].createInstance(
+      Ci.nsIPop3Sink
+    );
+    const connection = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+      Ci.nsIDatabaseCore
+    ).connectionForTests;
+    let trigger = false;
+    sink.popServer = incoming;
+    sink.folder = folder;
+    sink.buildMessageUri = true;
+    sink.beginMailDelivery(true, null);
+    try {
+      sink.incorporateBegin("receipt-first", 0);
+      for (const line of COMPLETE.match(/[^\n]*\n/g)) {
+        sink.incorporateWrite(line, line.length);
+      }
+      sink.incorporateComplete(null, 0);
+      const [first] = [...folder.messages];
+      Assert.equal(sink.messageUri, folder.getUriForMsg(first));
+      Assert.ok(!sink.confirmedPartialCompletion);
+      const token = first.storeToken;
+      const raw = mailTestUtils.loadMessageToString(folder, first);
+      sink.incorporateBegin("receipt-unpublished", 0);
+      Assert.throws(
+        () => sink.messageUri,
+        error => error.result == Cr.NS_ERROR_FAILURE
+      );
+      connection.executeSimpleSQL(
+        "CREATE TEMP TRIGGER fresh_unpublished BEFORE INSERT ON main.messages " +
+          `WHEN NEW.folderId = ${folder.id} BEGIN ` +
+          "SELECT RAISE(ABORT, 'fresh source publication failed'); END"
+      );
+      trigger = true;
+      for (const line of COMPLETE.match(/[^\n]*\n/g)) {
+        sink.incorporateWrite(line, line.length);
+      }
+      const stops = [];
+      sink.incorporateComplete(null, 0, {
+        onStopOperation(status) {
+          stops.push(status);
+        },
+      });
+      Assert.deepEqual(stops, [Cr.NS_ERROR_STORAGE_CONSTRAINT]);
+      Assert.throws(
+        () => sink.messageUri,
+        error => error.result == Cr.NS_ERROR_FAILURE
+      );
+      Assert.ok(!sink.confirmedPartialCompletion);
+      Assert.throws(
+        () => sink.incorporateComplete(null, 0),
+        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+      );
+      Assert.throws(
+        () => sink.abortMailDelivery(null),
+        error => error.result == Cr.NS_ERROR_STORAGE_CONSTRAINT
+      );
+      Assert.deepEqual(stops, [Cr.NS_ERROR_STORAGE_CONSTRAINT]);
+      Assert.deepEqual(folder.msgDatabase.listAllKeys(), [first.messageKey]);
+      Assert.equal(first.storeToken, token);
+      Assert.equal(mailTestUtils.loadMessageToString(folder, first), raw);
+      const scan = new PromiseTestUtils.PromiseStoreScanListener();
+      folder.msgStore.asyncScan(folder, scan);
+      await scan.promise;
+      Assert.equal(
+        scan.messages.length,
+        2,
+        "Unpublished finished bytes are retained"
+      );
+      Assert.ok(!folder.locked);
+    } finally {
+      if (trigger) {
+        connection.executeSimpleSQL("DROP TRIGGER temp.fresh_unpublished");
+      }
+      try {
+        sink.abortMailDelivery(null);
+      } catch {}
+    }
+  });
+}
+
+add_task(async function test_pop3FreshFilterMoveDeleteMbox() {
+  await checkFreshFilterTransfer("mbox", "move");
+  await checkFreshFilterTransfer("mbox", "delete");
+  await checkCompletedPartialDelete("mbox");
+});
+add_task(async function test_pop3FreshFilterMoveDeleteMaildir() {
+  await checkFreshFilterTransfer("maildir", "move");
+  await checkFreshFilterTransfer("maildir", "delete");
+  await checkCompletedPartialDelete("maildir");
+});
+add_task(async function test_pop3FilterFinishOwnershipErrorsMbox() {
+  await checkFreshFilterTransfer("mbox", "write");
+  await checkFreshFilterTransfer("mbox", "finish");
+  await checkFreshPublicationReceiptReset("mbox");
+});
+add_task(async function test_pop3FilterFinishOwnershipErrorsMaildir() {
+  await checkFreshFilterTransfer("maildir", "write");
+  await checkFreshFilterTransfer("maildir", "finish");
+  await checkFreshPublicationReceiptReset("maildir");
+});
+add_task(async function test_pop3FilterPublishCleanupLifetimeMbox() {
+  await checkFreshFilterTransfer("mbox", "publication");
+  await checkFreshFilterTransfer("mbox", "cleanup");
+  await checkFreshFilterTransfer("mbox", "cancel");
+  await checkFreshFilterTransfer("mbox", "reentrant-cancel");
+});
+add_task(async function test_pop3FilterPublishCleanupLifetimeMaildir() {
+  await checkFreshFilterTransfer("maildir", "publication");
+  await checkFreshFilterTransfer("maildir", "cleanup");
+  await checkFreshFilterTransfer("maildir", "cancel");
+  await checkFreshFilterTransfer("maildir", "reentrant-cancel");
+});
+add_task(async function test_pop3FilterCopyStartPhysicalIdentityMbox() {
+  await checkFreshFilterTransfer("mbox", "reject");
+  await checkCompletedPartialFilters("mbox", "unsupported");
+  await checkPartialIdentityRejected("mbox", false);
+  await checkPartialIdentityRejected("mbox", true);
+  await checkPartialWrongFolder("mbox");
+});
+add_task(async function test_pop3FilterCopyStartPhysicalIdentityMaildir() {
+  await checkFreshFilterTransfer("maildir", "reject");
+  await checkCompletedPartialFilters("maildir", "unsupported");
+  await checkPartialIdentityRejected("maildir", false);
+  await checkPartialIdentityRejected("maildir", true);
+  await checkPartialWrongFolder("maildir");
 });

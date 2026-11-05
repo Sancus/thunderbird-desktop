@@ -137,14 +137,16 @@ class nsParseNewMailState : public nsParseMailMessageState,
 
   NS_DECL_NSIMSGFILTERHITNOTIFY
 
-  virtual nsresult PublishMsgHeader(nsIMsgWindow* msgWindow);
+  // Native full POP delivery may defer filters until the returned row is live.
+  virtual nsresult PublishMsgHeader(nsIMsgWindow* msgWindow,
+                                    nsIMsgDBHdr** published = nullptr);
   void GetMsgWindow(nsIMsgWindow** aMsgWindow);
   nsresult EndMsgDownload();
 
   void ApplyFilters(bool* pMoved, nsIMsgWindow* msgWindow);
   nsresult ApplyForwardAndReplyFilter(nsIMsgWindow* msgWindow);
 #ifdef MOZ_PANORAMA
-  // A listener admits CopyToFolder and receives the terminal filter status.
+  // A listener admits Copy/Move/Delete and receives the terminal filter status.
   nsresult ApplyFiltersToCompletedMessage(
       nsIMsgDBHdr* header, nsIMsgOperationListener* completion = nullptr);
   void CancelCompletedFilters(nsresult status);

@@ -97,6 +97,12 @@ export class Pop3Client {
       Ci.nsIPop3Sink
     );
     this._sink.popServer = server;
+    if (
+      AppConstants.MOZ_PANORAMA &&
+      Services.prefs.getBoolPref("mail.panorama.enabled", false)
+    ) {
+      this._sink.buildMessageUri = true;
+    }
 
     this._logger = console.createInstance({
       // Prefix is "pop3.serverXX.YYY, e.g., where "serverXX" is server key
@@ -1678,9 +1684,15 @@ export class Pop3Client {
       uidl: this._currentMessage.uidl,
       sink: this._sink,
       confirmed: false,
+      freshReceipt:
+        size == 0 &&
+        AppConstants.MOZ_PANORAMA &&
+        Services.prefs.getBoolPref("mail.panorama.enabled", false) &&
+        !!this._sink.buildMessageUri,
       receivedAt: 0,
       dispatching: true,
       stopped: false,
+      cancelled: false,
       status: Cr.NS_OK,
     };
     this._pendingIncorporation = pending;
@@ -1759,7 +1771,11 @@ export class Pop3Client {
         record(error.result || Cr.NS_ERROR_FAILURE);
       }
       pending.dispatching = false;
-      settle();
+      if (pending.cancelled) {
+        this._actionDone(pending.status);
+      } else {
+        settle();
+      }
     }
   }
 
@@ -1767,7 +1783,8 @@ export class Pop3Client {
    * Preserve confirmed delivery separately from a later filter/copy failure.
    *
    * @param {{message: {uidl: string}, uidl: string, sink: nsIPop3Sink,
-   *   confirmed: boolean, receivedAt: number}} pending - Current incorporation.
+   *   confirmed: boolean, freshReceipt: boolean, receivedAt: number}} pending
+   *   - Current incorporation.
    * @param {boolean} preserve - Keep the received UIDL through error requeue.
    */
   _recordConfirmedPartial(pending, preserve) {
@@ -1780,9 +1797,24 @@ export class Pop3Client {
     ) {
       return;
     }
-    if (!pending.confirmed && pending.sink.confirmedPartialCompletion) {
-      pending.confirmed = true;
-      pending.receivedAt = Math.floor(Date.now() / 1000);
+    if (!pending.confirmed) {
+      let confirmed = pending.sink.confirmedPartialCompletion;
+      if (!confirmed && pending.freshReceipt) {
+        try {
+          // Native full incorporation exposes this URI only after Finish and
+          // Attach returned the actual physical row. It survives later filter
+          // errors/removal; a failed write/publication exposes no receipt.
+          confirmed = !!pending.sink.messageUri;
+        } catch (error) {
+          if (error.result != Cr.NS_ERROR_FAILURE) {
+            throw error;
+          }
+        }
+      }
+      if (confirmed) {
+        pending.confirmed = true;
+        pending.receivedAt = Math.floor(Date.now() / 1000);
+      }
     }
     if (!pending.confirmed || !preserve) {
       return;
@@ -1906,6 +1938,19 @@ export class Pop3Client {
    * @param {nsresult} status - Indicate if the last action succeeded.
    */
   _actionDone = async (status = Cr.NS_OK) => {
+    const pending = this._pendingIncorporation;
+    if (pending?.dispatching) {
+      // A publication notification may cancel reentrantly before the sink
+      // returns its actual receipt. Settle after that return, not with a stale
+      // URI or an unreceived UIDL. Keep the first dispatch/cancel error.
+      if (Components.isSuccessCode(pending.status)) {
+        pending.status = Components.isSuccessCode(status)
+          ? Cr.NS_BINDING_ABORTED
+          : status;
+      }
+      pending.cancelled = true;
+      return;
+    }
     if (this._done) {
       return;
     }
@@ -1917,7 +1962,7 @@ export class Pop3Client {
       try {
         this._recordConfirmedPartial(this._pendingIncorporation, true);
       } catch (error) {
-        this._logger.error("Reading confirmed Partial outcome failed", error);
+        this._logger.error("Reading confirmed delivery outcome failed", error);
       }
       try {
         this._sink.incorporateAbort();

@@ -38,7 +38,8 @@ class nsPop3Sink : public nsIPop3Sink, public nsIMsgOperationListener {
   virtual ~nsPop3Sink();
   nsresult WriteLineToMailbox(const nsACString& buffer);
   nsresult IncorporateBeginInternal(const char* uidlString, uint32_t flags);
-  nsresult IncorporateCompleteInternal(nsIMsgWindow* msgWindow, int32_t size);
+  nsresult IncorporateCompleteInternal(nsIMsgWindow* msgWindow, int32_t size,
+                                       nsIMsgDBHdr** completed);
   nsresult RecordIncorporateResult(nsresult status);
   nsresult FinishIncorporation(nsresult status);
   nsresult ReleaseFolderLock();

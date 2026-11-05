@@ -334,7 +334,11 @@ NS_IMETHODIMP nsPop3Sink::IncorporateBegin(const char* uidlString,
   if (m_outFileStream) return RecordIncorporateResult(NS_ERROR_IN_PROGRESS);
   m_finishCalled = false;
   nsresult rv = IncorporateBeginInternal(uidlString, flags);
-  if (NS_SUCCEEDED(rv)) m_confirmedPartialCompletion = false;
+  if (NS_SUCCEEDED(rv)) {
+    m_confirmedPartialCompletion = false;
+    // Only a successfully admitted message replaces the preceding receipt.
+    m_messageUri.Truncate();
+  }
   return RecordIncorporateResult(rv);
 }
 
@@ -510,14 +514,15 @@ NS_IMETHODIMP nsPop3Sink::IncorporateComplete(
     m_completionPending = true;
   }
   nsresult rv;
-#ifdef MOZ_PANORAMA
   nsCOMPtr<nsIMsgDBHdr> completed;
+#ifdef MOZ_PANORAMA
   if (m_partialBody) {
     rv = CompletePartialMessage(aSize, getter_AddRefs(completed));
   } else
 #endif
   {
-    rv = IncorporateCompleteInternal(aMsgWindow, aSize);
+    rv = IncorporateCompleteInternal(aMsgWindow, aSize,
+                                     getter_AddRefs(completed));
   }
   RecordIncorporateResult(rv);
 #ifdef MOZ_PANORAMA
@@ -684,8 +689,15 @@ nsresult nsPop3Sink::CompletePartialMessage(int32_t size,
 #endif
 
 nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
-                                                 int32_t aSize) {
-  if (m_buildMessageUri && !m_baseMessageUri.IsEmpty() && m_newMailParser) {
+                                                 int32_t aSize,
+                                                 nsIMsgDBHdr** completed) {
+  *completed = nullptr;
+  bool native = false;
+#ifdef MOZ_PANORAMA
+  native = mozilla::StaticPrefs::mail_panorama_enabled_AtStartup();
+#endif
+  if (!native && m_buildMessageUri && !m_baseMessageUri.IsEmpty() &&
+      m_newMailParser) {
     nsCOMPtr<nsIMsgDBHdr> hdr;
     m_newMailParser->GetNewMsgHdr(getter_AddRefs(hdr));
     if (hdr) {
@@ -759,7 +771,24 @@ nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
     rv = hdr->SetStoreToken(storeToken);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    rv = m_newMailParser->PublishMsgHeader(aMsgWindow);
+    rv = m_newMailParser->PublishMsgHeader(aMsgWindow, completed);
+    // A native full source is confirmed before filter execution. Its URI must
+    // come from the actual Attach-returned row, never the detached draft key.
+    if (*completed) {
+      RecordIncorporateResult(rv);
+      if (m_buildMessageUri) {
+        nsCOMPtr<nsIMsgFolder> publishedFolder;
+        nsresult receiptRv =
+            (*completed)->GetFolder(getter_AddRefs(publishedFolder));
+        if (NS_SUCCEEDED(receiptRv) && publishedFolder) {
+          receiptRv = publishedFolder->GetUriForMsg(*completed, m_messageUri);
+        } else if (NS_SUCCEEDED(receiptRv)) {
+          receiptRv = NS_ERROR_UNEXPECTED;
+        }
+        RecordIncorporateResult(receiptRv);
+      }
+      NS_ENSURE_SUCCESS(m_incorporateStatus, m_incorporateStatus);
+    }
     NS_ENSURE_SUCCESS(rv, rv);
     // The message is published; forward/reply failures do not undo delivery.
     (void)m_newMailParser->ApplyForwardAndReplyFilter(aMsgWindow);

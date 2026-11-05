@@ -1043,10 +1043,10 @@ nsresult WriteMsgFromStream(nsIInputStream* fileStream, nsIMsgDBHdr* hdr,
   NS_ENSURE_SUCCESS(rv, rv);
 
   nsAutoCString storeToken;
+  // An attempted Finish transfers settlement to the provider, even on error.
+  guard.release();
   rv = store->FinishNewMessage(destFolder, destOutputStream, storeToken);
   NS_ENSURE_SUCCESS(rv, rv);
-
-  guard.release();
 
   rv = hdr->SetStoreToken(storeToken);
   if (NS_SUCCEEDED(rv)) {
@@ -1136,6 +1136,7 @@ struct nsParseNewMailState::CompletedFilterState
   uint32_t list = 0, nextFilter = 0, filterCount = 0, nextAction = 0;
   uint64_t copySerial = 0;
   bool logging = false, running = false, dispatching = false, waiting = false;
+  bool terminalAction = false;
   nsresult status = NS_OK;
   void Record(nsresult rv) {
     if (NS_SUCCEEDED(status) && NS_FAILED(rv)) status = rv;
@@ -1220,8 +1221,11 @@ void nsParseNewMailState::DoneParsing() {
   }
 }
 
-nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
+nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow,
+                                               nsIMsgDBHdr** published) {
+  if (published) *published = nullptr;
   bool moved = false;
+  bool deferFilters = false;
   MOZ_TRY(FinishHeader());
 
   if (m_newMsgHdr) {
@@ -1231,6 +1235,11 @@ nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
           nsMsgMessageFlags::Read))  // don't mark read messages as new.
       MOZ_TRY(m_newMsgHdr->OrFlags(nsMsgMessageFlags::New, &newFlags));
 
+#ifdef MOZ_PANORAMA
+    deferFilters = published &&
+                   mozilla::StaticPrefs::mail_panorama_enabled_AtStartup() &&
+                   !(oldFlags & nsMsgMessageFlags::Partial);
+#endif
     if (!m_disableFilters) {
       nsCOMPtr<nsIMsgIncomingServer> server;
       nsresult rv = m_rootFolder->GetServer(getter_AddRefs(server));
@@ -1284,7 +1293,7 @@ nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
         }
       }
 
-      ApplyFilters(&moved, msgWindow);
+      if (!deferFilters) ApplyFilters(&moved, msgWindow);
     }
     if (!moved) {
       NS_ENSURE_STATE(m_mailDB);
@@ -1295,6 +1304,8 @@ nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow) {
         m_newMsgHdr = nullptr;
         rv = m_mailDB->AttachHdr(detachedHdr, true, getter_AddRefs(liveHdr));
         NS_ENSURE_SUCCESS(rv, rv);
+        // Preserve the confirmed result even if a later notification fails.
+        if (deferFilters) NS_IF_ADDREF(*published = liveHdr);
         nsCOMPtr<nsIMsgFolderNotificationService> notifier =
             mozilla::components::FolderNotification::Service();
         MOZ_TRY(notifier->NotifyMsgAdded(liveHdr));
@@ -1440,6 +1451,9 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
   state->running = true;
   nsresult rv = [&]() -> nsresult {
     while (NS_SUCCEEDED(state->status)) {
+      // A confirmed Move/Delete consumed this physical source. Do not match
+      // another rule or execute another action against its old key.
+      if (state->terminalAction) return NS_OK;
       if (!state->filter || state->nextAction == state->actions.Length()) {
         state->filter = nullptr;
         state->actions.Clear();
@@ -1497,6 +1511,8 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             case nsMsgFilterAction::StopExecution:
               break;
             case nsMsgFilterAction::CopyToFolder:
+            case nsMsgFilterAction::MoveToFolder:
+            case nsMsgFilterAction::Delete:
               if (state->completion) break;
               [[fallthrough]];
             default:
@@ -1541,18 +1557,30 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             state->nextAction = state->actions.Length();
             state->nextFilter = state->filterCount;
             return NS_OK;
-          case nsMsgFilterAction::CopyToFolder: {
-            nsCString target, source;
-            MOZ_TRY(action->GetTargetFolderUri(target));
-            NS_ENSURE_TRUE(!target.IsEmpty(), NS_ERROR_INVALID_ARG);
-            MOZ_TRY(m_downloadFolder->GetURI(source));
-            if (source.Equals(target)) return NS_OK;
+          case nsMsgFilterAction::CopyToFolder:
+          case nsMsgFilterAction::MoveToFolder:
+          case nsMsgFilterAction::Delete: {
+            bool move = type != nsMsgFilterAction::CopyToFolder;
             nsCOMPtr<nsIMsgFolder> destination;
-            MOZ_TRY(GetOrCreateFolder(target, getter_AddRefs(destination)));
+            if (type == nsMsgFilterAction::Delete) {
+              MOZ_TRY(GetTrashFolder(getter_AddRefs(destination)));
+            } else {
+              nsCString target, source;
+              MOZ_TRY(action->GetTargetFolderUri(target));
+              NS_ENSURE_TRUE(!target.IsEmpty(), NS_ERROR_INVALID_ARG);
+              MOZ_TRY(m_downloadFolder->GetURI(source));
+              if (source.Equals(target)) return NS_OK;
+              MOZ_TRY(GetOrCreateFolder(target, getter_AddRefs(destination)));
+            }
+            if (destination == m_downloadFolder) return NS_OK;
             NS_ENSURE_TRUE(destination, NS_ERROR_NOT_AVAILABLE);
             bool canFile;
             MOZ_TRY(destination->GetCanFileMessages(&canFile));
             NS_ENSURE_TRUE(canFile, NS_ERROR_INVALID_ARG);
+            if (type == nsMsgFilterAction::Delete) {
+              MOZ_TRY(m_downloadFolder->MarkMessagesRead({state->header.get()},
+                                                         true));
+            }
             nsCOMPtr<nsIMsgCopyService> copy =
                 do_GetService("@mozilla.org/messenger/messagecopyservice;1");
             NS_ENSURE_TRUE(copy, NS_ERROR_NOT_AVAILABLE);
@@ -1563,9 +1591,10 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
                                      serial](nsresult status) {
               return self->OnCompletedFilterCopy(hold, serial, status);
             };
+            state->terminalAction = move;
             state->waiting = state->dispatching = true;
             nsresult copyRv = copy->CopyMessages(
-                m_downloadFolder, {state->header.get()}, destination, false,
+                m_downloadFolder, {state->header.get()}, destination, move,
                 listener, m_msgWindow, false);
             state->dispatching = false;
             return copyRv;

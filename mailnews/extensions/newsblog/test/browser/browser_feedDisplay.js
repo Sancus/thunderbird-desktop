@@ -26,6 +26,28 @@ const { folderTree, threadTree, messageBrowser } = about3Pane;
 const aboutMessage = messageBrowser.contentWindow;
 const messagePane = aboutMessage.getMessagePaneBrowser();
 
+var { FeedbackService } = ChromeUtils.importESModule(
+  "resource:///modules/FeedbackService.sys.mjs"
+);
+let restoreRssFeedbackDiagnostic;
+add_setup(function traceRssFeedbackProducer() {
+  const original = FeedbackService.prototype.reportStatus;
+  FeedbackService.prototype.reportStatus = function (...args) {
+    info(
+      "RSS feedback producer: " +
+        JSON.stringify({
+          message: args[0],
+          meteors: args[1],
+          stack: new Error().stack,
+        })
+    );
+    return original.apply(this, args);
+  };
+  restoreRssFeedbackDiagnostic = () => {
+    FeedbackService.prototype.reportStatus = original;
+  };
+});
+
 const account = MailServices.accounts.getAccount("account1");
 const rootFolder = account.incomingServer.rootFolder;
 
@@ -745,6 +767,16 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
     }, "The RSS fixture's message pane finishes clearing");
     await TestUtils.waitForTick();
     const status = window.MsgStatusFeedback;
+    info(
+      "RSS strict cleanup entry: " +
+        JSON.stringify({
+          progressStarts: status._startRequests,
+          processes: status._activeProcesses.length,
+          meteorsSpinning: status._meteorsSpinning,
+          startTimer: Boolean(status._startTimeoutID),
+          stopTimer: Boolean(status._stopTimeoutID),
+        })
+    );
     await TestUtils.waitForCondition(
       () =>
         status._startRequests == 0 &&
@@ -804,4 +836,9 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
       );
     }
   });
+});
+
+// Queue restoration after the existing final cleanup, including on failure.
+registerCleanupFunction(function queueRssFeedbackDiagnosticRestoration() {
+  registerCleanupFunction(() => restoreRssFeedbackDiagnostic?.());
 });

@@ -500,6 +500,16 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
     }, "The RSS fixture's message pane finishes clearing");
     await TestUtils.waitForTick();
     const status = window.MsgStatusFeedback;
+    info(
+      "RSS strict cleanup entry: " +
+        JSON.stringify({
+          progressStarts: status._startRequests,
+          processes: status._activeProcesses.length,
+          meteorsSpinning: status._meteorsSpinning,
+          startTimer: Boolean(status._startTimeoutID),
+          stopTimer: Boolean(status._stopTimeoutID),
+        })
+    );
     await TestUtils.waitForCondition(
       () =>
         status._startRequests == 0 &&

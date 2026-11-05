@@ -13,8 +13,8 @@ const { MessageGenerator } = ChromeUtils.importESModule(
 const { GlodaMsgIndexer } = ChromeUtils.importESModule(
   "resource:///modules/gloda/IndexMsg.sys.mjs"
 );
-const { GlodaDatastore } = ChromeUtils.importESModule(
-  "resource:///modules/gloda/GlodaDatastore.sys.mjs"
+const { waitForGlodaDBFlush } = ChromeUtils.importESModule(
+  "resource://testing-common/gloda/GlodaTestHelperFunctions.sys.mjs"
 );
 const { getMailSearchService, closeMailSearch } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MailSearch.sys.mjs"
@@ -137,9 +137,7 @@ add_setup(async function setupNativeFacetMessages() {
                 reject(new Error("Fixture Gloda indexing did not complete"));
                 return;
               }
-              // The job callback runs inside the indexing transaction. Header
-              // properties are published by the earlier post-commit callback.
-              GlodaDatastore.runPostCommit(resolve);
+              resolve();
             },
           });
           if (!queued) {
@@ -148,6 +146,9 @@ add_setup(async function setupNativeFacetMessages() {
         })
     )
   );
+  // A completed indexing job may leave its transaction waiting for user idle.
+  // Use the existing real commit barrier before snapshotting native metadata.
+  await waitForGlodaDBFlush();
   const service = await getMailSearchService();
   let progress;
   do {
@@ -186,6 +187,56 @@ async function openNativeFacets(text) {
   do {
     progress = await fixture.service.update({ limit: 500 });
   } while (progress.moreWork);
+  // Retain the actual fail-closed availability facts when a conversation fails.
+  // Reading these test-only facts never repairs or changes reference history.
+  try {
+    const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+      Ci.nsIDatabaseCore
+    );
+    const connection = core.connectionForTests;
+    const availability = connection.createStatement(
+      "SELECT EXISTS(SELECT 1 FROM messages WHERE id = :seed) AS seedExists, " +
+        "EXISTS(SELECT 1 FROM messages m LEFT JOIN message_reference_sets s " +
+        "ON s.id = m.id WHERE s.id IS NULL) AS unknownHistory"
+    );
+    try {
+      availability.params.seed = fixture.clicked.messageKey;
+      availability.executeStep();
+      info(
+        "Native conversation availability: " +
+          JSON.stringify({
+            sourceId: core.sourceId,
+            seed: fixture.clicked.messageKey,
+            seedExists: availability.row.seedExists,
+            unknownHistory: availability.row.unknownHistory,
+            transactionInProgress: connection.transactionInProgress,
+          })
+      );
+    } finally {
+      availability.finalize();
+    }
+    const unknown = connection.createStatement(
+      "SELECT m.id, m.folderId, m.messageId FROM messages m " +
+        "LEFT JOIN message_reference_sets s ON s.id = m.id " +
+        "WHERE s.id IS NULL ORDER BY m.id LIMIT 32"
+    );
+    try {
+      while (unknown.executeStep()) {
+        info(
+          "Native conversation unknown row: " +
+            JSON.stringify({
+              id: unknown.row.id,
+              folderId: unknown.row.folderId,
+              messageId: unknown.row.messageId,
+            })
+        );
+      }
+    } finally {
+      unknown.finalize();
+    }
+  } catch (error) {
+    info("Native conversation diagnostic failed: " + error);
+  }
   const tab = tabmail.openTab("glodaFacet", { mailSearch: { text } });
   await TestUtils.waitForCondition(
     () => tab.searchPromise,

@@ -710,3 +710,35 @@ add_task(async function test_setContentRestoresBodyAfterFailure() {
       .includes("Stored article body.")
   );
 });
+
+// Record the actual remaining animation owner without disabling the vsync gate.
+registerCleanupFunction(function logRssRemainingAnimations() {
+  const documents = new Set([window.document]);
+  for (const doc of documents) {
+    for (const frame of doc.querySelectorAll("browser, iframe")) {
+      if (frame.contentDocument) {
+        documents.add(frame.contentDocument);
+      }
+    }
+    info(
+      "RSS remaining UI activity: " +
+        JSON.stringify({
+          document: doc.documentURI,
+          vsyncEnabled: ChromeUtils.vsyncEnabled(),
+          animations: doc.getAnimations().map(animation => ({
+            state: animation.playState,
+            target: animation.effect?.target?.localName,
+            id: animation.effect?.target?.id,
+            classes: animation.effect?.target?.getAttribute("class"),
+          })),
+          busy: Array.from(
+            doc.querySelectorAll('[busy="true"], .busy, [loading="true"]')
+          ).map(element => ({
+            target: element.localName,
+            id: element.id,
+            classes: element.getAttribute("class"),
+          })),
+        })
+    );
+  }
+});

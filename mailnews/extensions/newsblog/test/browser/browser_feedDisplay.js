@@ -711,34 +711,39 @@ add_task(async function test_setContentRestoresBodyAfterFailure() {
   );
 });
 
-// Record the actual remaining animation owner without disabling the vsync gate.
-registerCleanupFunction(function logRssRemainingAnimations() {
-  const documents = new Set([window.document]);
-  for (const doc of documents) {
-    for (const frame of doc.querySelectorAll("browser, iframe")) {
-      if (frame.contentDocument) {
-        documents.add(frame.contentDocument);
+// Read final UI activity after the ordinary fixture cleanup, preserving its order.
+registerCleanupFunction(function queueFinalRssActivityLog() {
+  registerCleanupFunction(function logRssRemainingAnimations() {
+    const documents = new Set([window.document]);
+    for (const doc of documents) {
+      for (const frame of doc.querySelectorAll("browser, iframe")) {
+        if (frame.contentDocument) {
+          documents.add(frame.contentDocument);
+        }
       }
+      info(
+        "RSS remaining UI activity: " +
+          JSON.stringify({
+            document: doc.documentURI,
+            vsyncEnabled: ChromeUtils.vsyncEnabled(),
+            progressStarts: window.MsgStatusFeedback?._startRequests,
+            meteorsSpinning: window.MsgStatusFeedback?._meteorsSpinning,
+            animations: doc.getAnimations().map(animation => ({
+              state: animation.playState,
+              name: animation.animationName,
+              target: animation.effect?.target?.localName,
+              id: animation.effect?.target?.id,
+              classes: animation.effect?.target?.getAttribute("class"),
+            })),
+            busy: Array.from(
+              doc.querySelectorAll('[busy="true"], .busy, [loading="true"]')
+            ).map(element => ({
+              target: element.localName,
+              id: element.id,
+              classes: element.getAttribute("class"),
+            })),
+          })
+      );
     }
-    info(
-      "RSS remaining UI activity: " +
-        JSON.stringify({
-          document: doc.documentURI,
-          vsyncEnabled: ChromeUtils.vsyncEnabled(),
-          animations: doc.getAnimations().map(animation => ({
-            state: animation.playState,
-            target: animation.effect?.target?.localName,
-            id: animation.effect?.target?.id,
-            classes: animation.effect?.target?.getAttribute("class"),
-          })),
-          busy: Array.from(
-            doc.querySelectorAll('[busy="true"], .busy, [loading="true"]')
-          ).map(element => ({
-            target: element.localName,
-            id: element.id,
-            classes: element.getAttribute("class"),
-          })),
-        })
-    );
-  }
+  });
 });

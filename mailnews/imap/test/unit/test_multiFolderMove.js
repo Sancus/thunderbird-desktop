@@ -17,7 +17,7 @@ var { MailServices } = ChromeUtils.importESModule(
 
 const FOLDERS = ["a", "b", "c"];
 
-add_setup(async function () {
+add_setup(async function setupMultiFolderMove() {
   setupIMAPPump();
   const native = Services.prefs.getBoolPref("mail.panorama.enabled", false);
   const databaseService = Cc[
@@ -37,6 +37,15 @@ add_setup(async function () {
   }[storeContract];
   Assert.ok(storeType);
   Assert.equal(IMAPPump.incomingServer.msgStore.storeType, storeType);
+  const root = IMAPPump.incomingServer.rootFolder;
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(root, discovered, null);
+  await discovered.promise;
+  IMAPPump.inbox = root
+    .getChildNamed("INBOX")
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  Assert.equal(IMAPPump.inbox.parent, root);
+  Assert.equal(IMAPPump.inbox.server, IMAPPump.incomingServer);
   IMAPPump.inbox.hierarchyDelimiter = "/";
   IMAPPump.inbox.verifiedAsOnlineFolder = true;
 

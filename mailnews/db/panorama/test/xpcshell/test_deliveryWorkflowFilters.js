@@ -117,7 +117,7 @@ add_task(async function test_manualFilterUpdatesTagMembershipAndReadState() {
   filter.filterType = Ci.nsMsgFilterType.Manual;
   list.insertFilterAt(0, filter);
 
-  const view = new LiveView();
+  let view = new LiveView();
   view.initWithTag(tag);
   view.grouping = Ci.nsILiveView.UNTHREADED;
   const additions = [];
@@ -135,7 +135,13 @@ add_task(async function test_manualFilterUpdatesTagMembershipAndReadState() {
     onSelectedChunk() {},
   };
   view.setListener(listener);
-  registerCleanupFunction(() => view.clearListener(listener));
+  registerCleanupFunction(() => {
+    try {
+      view.clearListener(listener);
+    } finally {
+      view = null;
+    }
+  });
   await assertTagged(view, []);
   await applyFilter(list, folder);
   const aIdentity = [a.messageKey, "shared-filter@delivery.invalid"];

@@ -367,6 +367,13 @@
     _forgetConv() {
       this._conv.removeObserver(this.observer);
       delete this._conv;
+      // tabmail caches the selected conversation browser. Release that alias
+      // before destroying its context, so later tab switches use a live browser.
+      const chatTab = document.getElementById("tabmail")?.tabModes.chat.tabs[0];
+      if (chatTab?.browser == this.convBrowser) {
+        delete chatTab.browser;
+        delete chatTab.linkedBrowser;
+      }
       this.convBrowser.destroy();
       this.findbar.destroy();
     }

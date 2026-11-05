@@ -243,6 +243,43 @@ async function openNativeFacets(text) {
     "The retained facet document starts its native query"
   );
   await tab.searchPromise;
+  // Capture the native read preconditions after facet initialization, at the
+  // boundary where the conversation action will use the current native core.
+  const core = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIDatabaseCore
+  );
+  try {
+    info(
+      "Native post-facet conversation keys: " +
+        JSON.stringify(
+          core.messageDB.getConversationMessageKeys(fixture.clicked.messageKey)
+        )
+    );
+  } catch (error) {
+    info("Native post-facet conversation error: " + error);
+    const rows = core.connectionForTests.createStatement(
+      "SELECT m.id,m.folderId,m.threadId,m.messageId,f.id AS existingFolder," +
+        "s.id AS referenceSet FROM messages m LEFT JOIN folders f ON f.id=m.folderId " +
+        "LEFT JOIN message_reference_sets s ON s.id=m.id ORDER BY m.id"
+    );
+    try {
+      while (rows.executeStep()) {
+        info(
+          "Native post-facet conversation row: " +
+            JSON.stringify({
+              id: rows.row.id,
+              folderId: rows.row.folderId,
+              threadId: rows.row.threadId,
+              messageId: rows.row.messageId,
+              existingFolder: rows.row.existingFolder,
+              referenceSet: rows.row.referenceSet,
+            })
+        );
+      }
+    } finally {
+      rows.finalize();
+    }
+  }
   return { tab, context: tab.browser.contentWindow.FacetContext };
 }
 

@@ -1996,25 +1996,18 @@ async function checkFreshFilterTransfer(store, mode) {
         return stream;
       }
       faultNativeStream = stream;
-      faultStream = {
-        QueryInterface: ChromeUtils.generateQI(["nsIOutputStream"]),
-        close() {
-          return stream.close();
-        },
-        flush() {
-          return stream.flush();
-        },
-        write() {
-          events.push(["write-error", folder.URI]);
-          throw Components.Exception("filter body write refused", failure);
-        },
-        writeFrom() {
-          throw Components.Exception("filter body write refused", failure);
-        },
-        isNonBlocking() {
-          return stream.isNonBlocking();
-        },
-      };
+      // nsIOutputStream is builtinclass. Use a native pipe carrying the exact
+      // write error; retain the real provider stream for Discard.
+      const pipe = Cc["@mozilla.org/pipe;1"].createInstance(Ci.nsIPipe);
+      pipe.init(true, true, 0, 0);
+      const input = pipe.inputStream;
+      const output = pipe.outputStream;
+      registerCleanupFunction(() => {
+        input.close();
+        output.close();
+      });
+      output.closeWithStatus(failure);
+      faultStream = output;
       return faultStream;
     },
     finishNewMessage(folder, stream) {

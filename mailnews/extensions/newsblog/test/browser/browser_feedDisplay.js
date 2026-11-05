@@ -160,55 +160,6 @@ async function unsubscribeCurrentRow() {
 }
 
 add_setup(async () => {
-  const feedback = window.MsgStatusFeedback;
-  const originalStart = feedback.startMeteors;
-  const originalStop = feedback.stopMeteors;
-  for (const [name, original] of [
-    ["startMeteors", originalStart],
-    ["stopMeteors", originalStop],
-  ]) {
-    feedback[name] = function (...args) {
-      info(
-        "RSS feedback transition: " +
-          JSON.stringify({
-            action: name,
-            before: this._startRequests,
-            stack: new Error().stack,
-          })
-      );
-      return original.apply(this, args);
-    };
-  }
-  const progressTrace = {
-    QueryInterface: ChromeUtils.generateQI([
-      "nsIWebProgressListener",
-      "nsISupportsWeakReference",
-    ]),
-    onStateChange(webProgress, request, flags, status) {
-      if (flags & Ci.nsIWebProgressListener.STATE_IS_NETWORK) {
-        info(
-          "RSS message network transition: " +
-            JSON.stringify({
-              flags,
-              status,
-              hidden: messagePane.hidden,
-              topLevel: webProgress.isTopLevel,
-              request: request?.name,
-              activeRequests: feedback._startRequests,
-            })
-        );
-      }
-    },
-  };
-  messagePane.webProgress.addProgressListener(
-    progressTrace,
-    Ci.nsIWebProgress.NOTIFY_STATE_NETWORK
-  );
-  registerCleanupFunction(() => {
-    messagePane.webProgress.removeProgressListener(progressTrace);
-    feedback.startMeteors = originalStart;
-    feedback.stopMeteors = originalStop;
-  });
   const databaseService = Cc[
     "@mozilla.org/msgDatabase/msgDBService;1"
   ].getService(Ci.nsIMsgDBService);
@@ -762,7 +713,47 @@ add_task(async function test_setContentRestoresBodyAfterFailure() {
 
 // Read final UI activity after the ordinary fixture cleanup, preserving its order.
 registerCleanupFunction(function queueFinalRssActivityLog() {
-  registerCleanupFunction(function logRssRemainingAnimations() {
+  registerCleanupFunction(async function logRssRemainingAnimations() {
+    // The fixture has retired its folders. Finish the real pane transition
+    // before the harness checks animations, preferences and remaining activity.
+    const pane = tabmail.currentAbout3Pane;
+    pane.messagePane.displayMessage();
+    await TestUtils.waitForCondition(() => {
+      const browser = pane.messageBrowser.contentWindow.getMessagePaneBrowser();
+      return (
+        browser.webProgress?.isLoadingDocument === false &&
+        browser.currentURI?.spec == "about:blank"
+      );
+    }, "The RSS fixture's message pane finishes clearing");
+    await TestUtils.waitForTick();
+    const status = window.MsgStatusFeedback;
+    await TestUtils.waitForCondition(
+      () =>
+        status._startRequests == 0 &&
+        !status._startTimeoutID &&
+        !status._meteorsSpinning &&
+        !status._stopTimeoutID &&
+        status._activeProcesses.length == 0,
+      "The RSS fixture's real status requests finish"
+    );
+    Assert.equal(
+      status._startRequests,
+      0,
+      "RSS cleanup leaves no status requests"
+    );
+    Assert.equal(
+      status._activeProcesses.length,
+      0,
+      "RSS cleanup leaves no activity processes"
+    );
+    Assert.ok(
+      BrowserTestUtils.isHidden(status._progressBar),
+      "RSS cleanup leaves the progress bar hidden"
+    );
+    Assert.ok(
+      status._progressBar.hasAttribute("value"),
+      "RSS cleanup leaves the progress bar determinate"
+    );
     const documents = new Set([window.document]);
     for (const doc of documents) {
       for (const frame of doc.querySelectorAll("browser, iframe")) {

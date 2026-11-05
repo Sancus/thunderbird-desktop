@@ -486,7 +486,47 @@ add_task(async function test_importCreateCollisionKeepsOtherFolder() {
 
 // Read final UI activity after the ordinary fixture cleanup, preserving its order.
 registerCleanupFunction(function queueFinalRssActivityLog() {
-  registerCleanupFunction(function logRssRemainingAnimations() {
+  registerCleanupFunction(async function logRssRemainingAnimations() {
+    // The fixture has retired its folders. Finish the real pane transition
+    // before the harness checks animations, preferences and remaining activity.
+    const pane = document.getElementById("tabmail").currentAbout3Pane;
+    pane.messagePane.displayMessage();
+    await TestUtils.waitForCondition(() => {
+      const browser = pane.messageBrowser.contentWindow.getMessagePaneBrowser();
+      return (
+        browser.webProgress?.isLoadingDocument === false &&
+        browser.currentURI?.spec == "about:blank"
+      );
+    }, "The RSS fixture's message pane finishes clearing");
+    await TestUtils.waitForTick();
+    const status = window.MsgStatusFeedback;
+    await TestUtils.waitForCondition(
+      () =>
+        status._startRequests == 0 &&
+        !status._startTimeoutID &&
+        !status._meteorsSpinning &&
+        !status._stopTimeoutID &&
+        status._activeProcesses.length == 0,
+      "The RSS fixture's real status requests finish"
+    );
+    Assert.equal(
+      status._startRequests,
+      0,
+      "RSS cleanup leaves no status requests"
+    );
+    Assert.equal(
+      status._activeProcesses.length,
+      0,
+      "RSS cleanup leaves no activity processes"
+    );
+    Assert.ok(
+      BrowserTestUtils.isHidden(status._progressBar),
+      "RSS cleanup leaves the progress bar hidden"
+    );
+    Assert.ok(
+      status._progressBar.hasAttribute("value"),
+      "RSS cleanup leaves the progress bar determinate"
+    );
     const documents = new Set([window.document]);
     for (const doc of documents) {
       for (const frame of doc.querySelectorAll("browser, iframe")) {

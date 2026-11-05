@@ -473,7 +473,28 @@ function checkTolerance(target, message, localDocument = document) {
     !horizontalContainer ||
     !verticalContainer
   ) {
-    info(JSON.stringify({ dialogRect, targetRect, containerRect }, null, 2));
+    const positionedDialog = localDocument.querySelector(
+      '[is="calendar-dialog"]'
+    );
+    info(
+      JSON.stringify(
+        {
+          dialogRect,
+          targetRect,
+          containerRect,
+          triggerMatchesTarget: positionedDialog.trigger === target,
+          triggerConnected: positionedDialog.trigger?.isConnected,
+          triggerRect: positionedDialog.trigger?.getBoundingClientRect(),
+          dialogStyle: {
+            top: positionedDialog.style.top,
+            left: positionedDialog.style.left,
+            maxHeight: positionedDialog.style.maxHeight,
+          },
+        },
+        null,
+        2
+      )
+    );
   }
 
   Assert.ok(

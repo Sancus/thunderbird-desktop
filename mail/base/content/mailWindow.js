@@ -344,6 +344,7 @@ function nsMsgStatusFeedback() {
   );
   this._throbber = document.getElementById("throbber-box");
   this._activeProcesses = [];
+  this._observedProcesses = new Map();
   this._statusQueue = [];
 
   // make sure the stop button is accurate from the get-go
@@ -388,6 +389,8 @@ nsMsgStatusFeedback.prototype = {
   _meteorsSpinning: false,
   _progressBarVisible: false,
   _activeProcesses: null,
+  // Paused and waiting processes remain observed so they can resume.
+  _observedProcesses: null,
   _statusFeedbackProgress: -1,
   _statusLastShown: 0,
   _statusQueue: null,
@@ -396,9 +399,10 @@ nsMsgStatusFeedback.prototype = {
   // unload - call to remove links to listeners etc.
   unload() {
     // Remove listeners for any active processes we have hooked ourselves into.
-    this._activeProcesses.forEach(function (element) {
-      element.removeListener(this);
-    }, this);
+    for (const process of this._observedProcesses.values()) {
+      process.removeListener(this);
+    }
+    this._observedProcesses.clear();
   },
 
   /**
@@ -686,46 +690,64 @@ nsMsgStatusFeedback.prototype = {
     if (activity instanceof Ci.nsIActivityEvent) {
       this.showStatusString(activity.displayText);
     } else if (activity instanceof Ci.nsIActivityProcess) {
-      this._activeProcesses.push(activity);
+      if (this._observedProcesses.has(aID)) {
+        return;
+      }
+      this._observedProcesses.set(aID, activity);
       activity.addListener(this);
-      this.startMeteors();
+      this.onStateChanged(activity);
     }
   },
 
   onRemovedActivity(id) {
-    const process = this._activeProcesses.find(p => p.id == id);
+    const process = this._observedProcesses.get(id);
     if (process) {
       this._releaseProcess(process);
     }
   },
 
   /**
-   * Balance the startMeteors() call we made for this process in
-   * onAddedActivity(), at most once per process.
+   * Adds or removes only this process's running status contribution.
+   * Paused and waiting processes stay observed without keeping the UI busy.
    *
-   * @param {nsIActivityProcess} process
+   * @param {nsIActivityProcess} process - The observed process.
+   * @param {boolean} running - Whether the process is in progress.
+   */
+  _setProcessRunning(process, running) {
+    const index = this._activeProcesses.indexOf(process);
+    if (running && index < 0) {
+      this._activeProcesses.push(process);
+      this.startMeteors();
+    } else if (!running && index >= 0) {
+      this._activeProcesses.splice(index, 1);
+      this.stopMeteors();
+    }
+  },
+
+  /**
+   * Stops observing a removed or terminal process and releases its status once.
+   *
+   * @param {nsIActivityProcess} process - The process to release.
    */
   _releaseProcess(process) {
-    const index = this._activeProcesses.indexOf(process);
-    if (index < 0) {
-      return;
-    }
-    this._activeProcesses.splice(index, 1);
+    this._setProcessRunning(process, false);
+    this._observedProcesses.delete(process.id);
     process.removeListener(this);
-    this.stopMeteors();
   },
 
   // nsIActivityListener
   onStateChanged(aActivity) {
-    // Each activity module is individually responsible for calling
-    // removeActivity() once its process is done, and the activity manager only
-    // prunes finished processes when the user clears the Activity Manager
-    // list. A module that forgets would otherwise leave the progress meter
-    // spinning -- and repainting -- for the lifetime of the window, so stop
-    // tracking a process as soon as it reaches a state it cannot leave.
+    if (!this._observedProcesses.has(aActivity.id)) {
+      return;
+    }
+    const states = Ci.nsIActivityProcess;
+    this._setProcessRunning(
+      aActivity,
+      aActivity.state == states.STATE_INPROGRESS
+    );
     if (
-      aActivity.state == Ci.nsIActivityProcess.STATE_COMPLETED ||
-      aActivity.state == Ci.nsIActivityProcess.STATE_CANCELED
+      aActivity.state == states.STATE_COMPLETED ||
+      aActivity.state == states.STATE_CANCELED
     ) {
       this._releaseProcess(aActivity);
     }

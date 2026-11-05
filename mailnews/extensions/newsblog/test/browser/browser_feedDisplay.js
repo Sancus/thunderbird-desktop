@@ -26,28 +26,6 @@ const { folderTree, threadTree, messageBrowser } = about3Pane;
 const aboutMessage = messageBrowser.contentWindow;
 const messagePane = aboutMessage.getMessagePaneBrowser();
 
-var { FeedbackService } = ChromeUtils.importESModule(
-  "resource:///modules/FeedbackService.sys.mjs"
-);
-let restoreRssFeedbackDiagnostic;
-add_setup(function traceRssFeedbackProducer() {
-  const original = FeedbackService.prototype.reportStatus;
-  FeedbackService.prototype.reportStatus = function (...args) {
-    info(
-      "RSS feedback producer: " +
-        JSON.stringify({
-          message: args[0],
-          meteors: args[1],
-          stack: new Error().stack,
-        })
-    );
-    return original.apply(this, args);
-  };
-  restoreRssFeedbackDiagnostic = () => {
-    FeedbackService.prototype.reportStatus = original;
-  };
-});
-
 const account = MailServices.accounts.getAccount("account1");
 const rootFolder = account.incomingServer.rootFolder;
 
@@ -772,6 +750,15 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
         JSON.stringify({
           progressStarts: status._startRequests,
           processes: status._activeProcesses.length,
+          observedProcesses: Array.from(
+            status._observedProcesses.values(),
+            process => ({
+              id: process.id,
+              state: process.state,
+              contextType: process.contextType,
+              displayText: process.displayText,
+            })
+          ),
           meteorsSpinning: status._meteorsSpinning,
           startTimer: Boolean(status._startTimeoutID),
           stopTimer: Boolean(status._stopTimeoutID),
@@ -836,9 +823,4 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
       );
     }
   });
-});
-
-// Queue restoration after the existing final cleanup, including on failure.
-registerCleanupFunction(function queueRssFeedbackDiagnosticRestoration() {
-  registerCleanupFunction(() => restoreRssFeedbackDiagnostic?.());
 });

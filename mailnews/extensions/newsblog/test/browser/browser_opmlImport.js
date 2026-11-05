@@ -505,6 +505,15 @@ registerCleanupFunction(function queueFinalRssActivityLog() {
         JSON.stringify({
           progressStarts: status._startRequests,
           processes: status._activeProcesses.length,
+          observedProcesses: Array.from(
+            status._observedProcesses.values(),
+            process => ({
+              id: process.id,
+              state: process.state,
+              contextType: process.contextType,
+              displayText: process.displayText,
+            })
+          ),
           meteorsSpinning: status._meteorsSpinning,
           startTimer: Boolean(status._startTimeoutID),
           stopTimer: Boolean(status._stopTimeoutID),

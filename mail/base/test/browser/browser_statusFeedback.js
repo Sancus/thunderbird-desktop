@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, you can obtain one at http://mozilla.org/MPL/2.0/. */
 
+"use strict";
+
 var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
@@ -188,4 +190,110 @@ add_task(async function test_statusWithMeteors() {
     "meteors should stop spinning"
   );
   Assert.equal(status._startRequests, 0, "should have no start requests");
+});
+
+add_task(async function test_pausedActivitiesResumeWithoutLeakingStatus() {
+  const status = window.MsgStatusFeedback;
+  const states = Ci.nsIActivityProcess;
+  const manager = Cc["@mozilla.org/activity-manager;1"].getService(
+    Ci.nsIActivityManager
+  );
+  const process = Cc["@mozilla.org/activity-process;1"].createInstance(states);
+  process.init("Pause and resume status regression", "status-feedback-test");
+  await TestUtils.waitForCondition(
+    () => !status._meteorsSpinning && !status._stopTimeoutID,
+    "The status bar is idle before the real process starts"
+  );
+  const starts = status._startRequests;
+  let registered = true;
+  manager.addActivity(process);
+  try {
+    for (const state of [
+      states.STATE_PAUSED,
+      states.STATE_WAITINGFORINPUT,
+      states.STATE_WAITINGFORRETRY,
+    ]) {
+      Assert.equal(
+        status._startRequests,
+        starts + 1,
+        "A running process contributes exactly one request"
+      );
+      await TestUtils.waitForCondition(
+        () => status._meteorsSpinning,
+        "The real running process makes the throbber busy"
+      );
+      process.state = state;
+      Assert.equal(
+        status._startRequests,
+        starts,
+        "Paused or waiting work releases only its running request"
+      );
+      Assert.ok(
+        !status._activeProcesses.includes(process),
+        "Paused or waiting work is not a running process"
+      );
+      Assert.equal(
+        manager.getActivity(process.id),
+        process,
+        "The same unfinished work remains in the Activity Manager"
+      );
+      Assert.equal(
+        status._observedProcesses.get(process.id),
+        process,
+        "Paused or waiting work remains observed for resume"
+      );
+      await TestUtils.waitForCondition(
+        () =>
+          !status._meteorsSpinning &&
+          !status._startTimeoutID &&
+          !status._stopTimeoutID,
+        "The paused process stops the real animation normally"
+      );
+      Assert.ok(
+        BrowserTestUtils.isHidden(status._progressBarContainer),
+        "The idle progress bar is hidden"
+      );
+      process.state = states.STATE_INPROGRESS;
+      status.onStateChanged(process);
+      Assert.equal(
+        status._startRequests,
+        starts + 1,
+        "Resume and duplicate state notification contribute only once"
+      );
+    }
+    process.state = states.STATE_COMPLETED;
+    Assert.equal(
+      status._startRequests,
+      starts,
+      "Completion releases the resumed request once"
+    );
+    Assert.ok(
+      !status._observedProcesses.has(process.id),
+      "A completed process is no longer observed"
+    );
+    manager.removeActivity(process.id);
+    registered = false;
+    Assert.equal(
+      status._startRequests,
+      starts,
+      "Removal after completion cannot decrement another request"
+    );
+  } finally {
+    if (registered) {
+      if (
+        process.state != states.STATE_COMPLETED &&
+        process.state != states.STATE_CANCELED
+      ) {
+        if (process.state != states.STATE_INPROGRESS) {
+          process.state = states.STATE_INPROGRESS;
+        }
+        process.state = states.STATE_CANCELED;
+      }
+      manager.removeActivity(process.id);
+    }
+  }
+  await TestUtils.waitForCondition(
+    () => !status._meteorsSpinning && !status._stopTimeoutID,
+    "The process finishes with the normal idle status bar"
+  );
 });

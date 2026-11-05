@@ -682,6 +682,8 @@ var chatHandler = {
       return;
     }
     browser.init(aConversation);
+    browser.isActive =
+      document.getElementById("tabmail").currentTabInfo == gChatTab;
     this._pendingLogBrowserLoad = true;
     if (aSearchTerm) {
       this._pendingSearchTerm = aSearchTerm;
@@ -1330,12 +1332,22 @@ var chatHandler = {
     const convView = chatHandler._getActiveConvView();
     if (convView) {
       convView.switchingToPanel();
+    } else {
+      const browser = this.getBrowser();
+      if (browser?.id == "conv-log-browser") {
+        browser.isActive = true;
+      }
     }
   },
   _onTabDeactivated(aHidden) {
     const convView = chatHandler._getActiveConvView();
     if (convView) {
       convView.switchingAwayFromPanel(aHidden);
+    } else if (aHidden) {
+      const browser = this.getBrowser();
+      if (browser?.id == "conv-log-browser") {
+        browser.isActive = false;
+      }
     }
   },
   async observe(aSubject, aTopic, aData) {

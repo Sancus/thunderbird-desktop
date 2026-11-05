@@ -430,6 +430,10 @@ async function openLegacyChatHit(
     facetWindow
   );
   await loaded;
+  Assert.ok(
+    browser.browsingContext.isActive,
+    "The selected log browser is active before displaying and finding text"
+  );
   await TestUtils.waitForCondition(
     () => browser.contentWindow.getSelection().toString() == text,
     "The real findbar selects the clicked result's first matching text"

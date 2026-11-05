@@ -396,6 +396,11 @@
         return;
       }
       this.loaded = true;
+      // Selection can precede the initial document load, while the selection
+      // observer deliberately ignores conversations that are not loaded yet.
+      if (this.tab?.selected) {
+        this.switchingToPanel();
+      }
       const messages = this._conv.getMessages();
       this._readCount = messages.length - this._conv.unreadMessageCount;
       if (this._readCount) {

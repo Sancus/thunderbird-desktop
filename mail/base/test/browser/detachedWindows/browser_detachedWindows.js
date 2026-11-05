@@ -166,24 +166,28 @@ add_task(async function testSecondMessengerWindow() {
 });
 
 add_task(async function testComposeWindow() {
-  info("Opening a compose window");
-  let composeWindowPromise = BrowserTestUtils.domWindowOpenedAndLoaded(
-    null,
-    win =>
-      win.document.documentURI ===
-      "chrome://messenger/content/messengercompose/messengercompose.xhtml"
-  );
-  window.MsgNewMessage();
+  // Release the async frame that owns the compose window and its promises
+  // before the memory reporter tests for detached windows.
+  await (async () => {
+    info("Opening a compose window");
+    let composeWindowPromise = BrowserTestUtils.domWindowOpenedAndLoaded(
+      null,
+      win =>
+        win.document.documentURI ===
+        "chrome://messenger/content/messengercompose/messengercompose.xhtml"
+    );
+    window.MsgNewMessage();
 
-  let composeWindow = await composeWindowPromise;
-  await SimpleTest.promiseFocus(composeWindow);
-  await TestUtils.waitForCondition(() => composeWindow.gLoadingComplete);
-  await new Promise(resolve => composeWindow.setTimeout(resolve, 500));
+    let composeWindow = await composeWindowPromise;
+    await SimpleTest.promiseFocus(composeWindow);
+    await TestUtils.waitForCondition(() => composeWindow.gLoadingComplete);
+    await new Promise(resolve => composeWindow.setTimeout(resolve, 500));
 
-  info("Closing the window");
-  await BrowserTestUtils.closeWindow(composeWindow);
-  composeWindow = null;
-  composeWindowPromise = null;
+    info("Closing the window");
+    await BrowserTestUtils.closeWindow(composeWindow);
+    composeWindow = null;
+    composeWindowPromise = null;
+  })();
 
   await assertNoDetachedWindows();
 });

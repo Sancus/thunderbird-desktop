@@ -10,6 +10,7 @@ prefs = [
 tags = ["panorama", "maildir"]
 
 ["test_NntpChannel.js"]
+run-sequentially = true  # Uses fixed NNTP_PORT
 
 ["test_NntpMessageService.js"]
 

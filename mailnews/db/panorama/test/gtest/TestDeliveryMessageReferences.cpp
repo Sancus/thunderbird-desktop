@@ -4865,6 +4865,11 @@ class NewsOfflineNativeCase {
 class DeliveryNewsOfflineProvider : public DeliveryMessageReferences {
  protected:
   void SetUp() override {
+    // This backend-specific fixture is inapplicable to Mork startup.
+    // The enabled invocation must run every case; a skip is not coverage.
+    if (!mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      GTEST_SKIP() << "Requires Panorama enabled before application startup.";
+    }
     ASSERT_TRUE(mozilla::StaticPrefs::mail_panorama_enabled_AtStartup());
     // Use the harness-owned application profile, not a replacement test
     // profile.
@@ -4906,7 +4911,7 @@ class DeliveryNewsOfflineProvider : public DeliveryMessageReferences {
 TEST_F(DeliveryNewsOfflineProvider,
        NewsOfflineWriteFailuresRetainPriorBodyAndAllowFreshRetry) {
   // Public native folder initialization/callbacks require this ordinary startup
-  // input, not a late mutation of a cached AtStartup preference. Never skip it.
+  // input, not a late mutation of a cached AtStartup preference.
   ASSERT_TRUE(mozilla::StaticPrefs::mail_panorama_enabled_AtStartup());
   for (bool maildir : {false, true}) {
     SCOPED_TRACE(maildir ? "maildir" : "mbox");

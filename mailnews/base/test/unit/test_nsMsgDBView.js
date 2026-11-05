@@ -2314,6 +2314,8 @@ add_task(function test_teardown() {
 
 add_task(async function test_physical_lookup_null_getter_errors_and_key_miss() {
   const folder = await messageInjection.makeEmptyFolder();
+  const outsideFolder = await messageInjection.makeEmptyFolder();
+  Assert.notEqual(outsideFolder.URI, folder.URI);
   const set = new SyntheticMessageSet(
     gMessageGenerator.makeMessages({ count: 2 })
   );
@@ -2361,6 +2363,21 @@ add_task(async function test_physical_lookup_null_getter_errors_and_key_miss() {
       "Public null input throws synchronously"
     );
     const key = headers[0].messageKey;
+    const foreignHeader = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]),
+      messageKey: key,
+      folder: outsideFolder,
+    };
+    Assert.notEqual(
+      view.findIndexOfMsgHdr(headers[0], false),
+      0xffffffff,
+      "The colliding key is present in this view"
+    );
+    Assert.equal(
+      view.findIndexOfMsgHdr(foreignHeader, false),
+      0xffffffff,
+      "A current member key paired with a real foreign folder is excluded"
+    );
     let folderCalls = 0;
     const keyFailure = {
       QueryInterface: ChromeUtils.generateQI(["nsIMsgDBHdr"]),

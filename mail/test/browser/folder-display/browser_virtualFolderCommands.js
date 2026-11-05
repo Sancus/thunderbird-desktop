@@ -332,11 +332,32 @@ add_task(async function test_saved_search_selected_physical_members() {
     Ci.nsMsgViewSortOrder.ascending
   );
   assertMembershipRows(expected, excluded);
-  Assert.deepEqual(
-    Array.from(first.msgDatabase.getCachedHits(both.URI), membershipIdentity),
-    expected,
-    "The global cache keeps both physical source members"
+  const service = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+    Ci.nsIMsgDBService
   );
+  const native =
+    "nsIDatabaseCore" in Ci && service instanceof Ci.nsIDatabaseCore;
+  if (native) {
+    Assert.deepEqual(
+      Array.from(first.msgDatabase.getCachedHits(both.URI), membershipIdentity),
+      expected,
+      "The global cache keeps both physical source members"
+    );
+  } else {
+    Assert.deepEqual(
+      Array.from(first.msgDatabase.getCachedHits(both.URI), membershipIdentity),
+      [expected[0]],
+      "The legacy first source cache keeps its physical member"
+    );
+    Assert.deepEqual(
+      Array.from(
+        second.msgDatabase.getCachedHits(both.URI),
+        membershipIdentity
+      ),
+      [expected[1]],
+      "The legacy second source cache keeps its physical member"
+    );
+  }
   await select_click_row(1);
   await assert_selected_and_displayed(b);
   Assert.deepEqual(
@@ -364,6 +385,16 @@ add_task(async function test_saved_search_selected_physical_members() {
     [expected[0]],
     "The actual deletion removes only the deleted physical member from cache"
   );
+  if (!native) {
+    Assert.deepEqual(
+      Array.from(
+        second.msgDatabase.getCachedHits(both.URI),
+        membershipIdentity
+      ),
+      [],
+      "The legacy deleted source cache is empty"
+    );
+  }
   await assert_selected_and_displayed(a);
   Assert.deepEqual(
     membershipIdentity(get_about_message().gMessage),

@@ -1273,8 +1273,21 @@ function bindPanoramaMigrationTarget(
       checkIdentity();
       checkLock();
       if (receipt !== null) {
-        // The durable receipt remains authoritative after legitimate queue use.
-        return validateMorkProtocolUnitReceipt(request, receipt);
+        const checked = validateMorkProtocolUnitReceipt(request, receipt);
+        if (unit.state !== "imported") {
+          for (let index = 0; index < members.length; index++) {
+            const { folder, source } = members[index];
+            checkPaths(folder, source, request.folders[index]);
+            verifyNativeMessageProjection(
+              database,
+              folder,
+              request.folders[index],
+              checked.folders[index]
+            );
+          }
+        }
+        // Only checkpointed receipts survive legitimate queue/header changes.
+        return checked;
       }
       prepared = { unit: true, request, members };
       return null;

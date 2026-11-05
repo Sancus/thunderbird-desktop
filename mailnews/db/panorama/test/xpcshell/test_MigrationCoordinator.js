@@ -1284,14 +1284,105 @@ async function assertImapUnit(input, receipt) {
   Assert.ok(!database.connectionForTests.transactionInProgress);
 }
 
-let imapInterrupted;
+let imapInterrupted, imapCommittedReceipt;
+add_task(
+  async function test_protocolUnitProjectionReadbackFailureKeepsActualCommitForRetry() {
+    const input = await plannedImapUnit();
+    imapInterrupted = input;
+    const token = await input.journal.beginImportUnit(input.ids);
+    const target = imapTarget(input);
+    Assert.equal(await target.findProtocolUnitReceipt(token, input.ids), null);
+    const receipt = await target.importProtocolUnit(token, input.ids);
+    imapCommittedReceipt = receipt;
+    const request = await imapRequest(input);
+    const member = receipt.folders[0];
+    const [sourceKey, key] = member.keys[0];
+    const expected = request.folders[0].messages.find(
+      message => message.sourceKey == sourceKey
+    ).header.subject;
+    const header = database.messageDB.getMessage(key);
+    const count = database.messageDB.totalCount;
+    header.subject = "Changed before protocol-unit checkpoint";
+    const changes = database.connectionForTests.createStatement(
+      "SELECT total_changes() AS value"
+    );
+    try {
+      Assert.ok(changes.executeStep());
+      const beforeChanges = changes.row.value;
+      changes.reset();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        // Reopen the durable uncheckpointed journal just as after process loss.
+        input.journal.close();
+        input.journal = await MigrationJournal.open(
+          input.path,
+          profileLock.directory.path
+        );
+        const before = input.journal.state;
+        Assert.equal(before.stage, "import");
+        Assert.equal(before.protocolUnits[0].state, "importing");
+        Assert.equal(before.protocolUnits[0].receipt, null);
+        await Assert.rejects(
+          resumeMorkImports(input.journal, {
+            ...imapTarget(input),
+            async importProtocolUnit() {
+              Assert.ok(
+                false,
+                "Retry must never import a committed unit again"
+              );
+            },
+          }),
+          error =>
+            error.name === "Error" &&
+            error.message ===
+              "Native migration message projection differs: subject"
+        );
+        const recorded = {
+          ...before,
+          revision: before.revision + 1,
+          lastError: {
+            name: "Error",
+            message: "Native migration message projection differs: subject",
+          },
+        };
+        Assert.deepEqual(
+          input.journal.state,
+          recorded,
+          "Only the actual error is recorded; all members stay uncheckpointed"
+        );
+        Assert.deepEqual(await IOUtils.readJSON(input.path), recorded);
+        Assert.equal(database.messageDB.totalCount, count);
+        Assert.deepEqual(
+          database.getFolderImportReceipt(
+            imapFolders.get(member.sourceId),
+            request
+          ),
+          receipt,
+          "The real native commit and exact operation identities remain intact"
+        );
+        Assert.ok(changes.executeStep());
+        Assert.equal(
+          changes.row.value,
+          beforeChanges,
+          "Retry performs no native write"
+        );
+        changes.reset();
+      }
+    } finally {
+      changes.finalize();
+      header.subject = expected;
+    }
+    await assertImapUnit(input, receipt);
+    Assert.deepEqual(
+      await imapTarget(input).findProtocolUnitReceipt(token, input.ids),
+      receipt,
+      "Restoring the exact projection permits the existing receipt"
+    );
+  }
+);
+
 add_task(async function test_protocolUnitCheckpointsCommitBeforeCancellation() {
-  const input = await plannedImapUnit();
-  imapInterrupted = input;
-  const token = await input.journal.beginImportUnit(input.ids);
-  const target = imapTarget(input);
-  Assert.equal(await target.findProtocolUnitReceipt(token, input.ids), null);
-  const receipt = await target.importProtocolUnit(token, input.ids);
+  const input = imapInterrupted;
+  const receipt = imapCommittedReceipt;
   Assert.ok(
     input.journal.state.sources.every(
       source => source.state == "importing" && source.receipt === null
@@ -1350,15 +1441,27 @@ add_task(async function test_protocolUnitReconcilesAfterJournalReopen() {
   Assert.deepEqual(input.journal.state.protocolUnits[0].receipt, receipt);
   await input.journal.setCancelled(false);
   const native = imapTarget(input);
-  await resumeMorkImports(input.journal, {
-    ...native,
-    async importProtocolUnit() {
-      Assert.ok(
-        false,
-        "Read-only reconciliation must preserve the existing queue identities"
-      );
-    },
-  });
+  const header = database.messageDB.getMessage(receipt.folders[0].keys[0][1]);
+  const subject = header.subject;
+  header.subject = "Legitimate edit after protocol-unit checkpoint";
+  try {
+    await resumeMorkImports(input.journal, {
+      ...native,
+      async importProtocolUnit() {
+        Assert.ok(
+          false,
+          "Read-only reconciliation must preserve the existing queue identities"
+        );
+      },
+    });
+    Assert.equal(
+      header.subject,
+      "Legitimate edit after protocol-unit checkpoint",
+      "Checkpointed receipt lookup permits current header edits"
+    );
+  } finally {
+    header.subject = subject;
+  }
   Assert.equal(input.journal.state.stage, "validate");
   Assert.deepEqual(input.journal.state.protocolUnits[0].receipt, receipt);
   await assertImapUnit(input, receipt);

@@ -37,6 +37,10 @@ add_setup(async function setupMultiFolderMove() {
   }[storeContract];
   Assert.ok(storeType);
   Assert.equal(IMAPPump.incomingServer.msgStore.storeType, storeType);
+  for (const name of [...FOLDERS, "dest"]) {
+    IMAPPump.daemon.createMailbox(`INBOX/${name}`, { subscribed: true });
+  }
+
   const root = IMAPPump.incomingServer.rootFolder;
   const discovered = new PromiseTestUtils.PromiseUrlListener();
   MailServices.imap.discoverAllFolders(root, discovered, null);
@@ -48,11 +52,6 @@ add_setup(async function setupMultiFolderMove() {
   Assert.equal(IMAPPump.inbox.server, IMAPPump.incomingServer);
   IMAPPump.inbox.hierarchyDelimiter = "/";
   IMAPPump.inbox.verifiedAsOnlineFolder = true;
-
-  for (const name of [...FOLDERS, "dest"]) {
-    IMAPPump.daemon.createMailbox(`INBOX/${name}`, { subscribed: true });
-  }
-  IMAPPump.server.performTest("LIST");
 
   const listener = new PromiseTestUtils.PromiseUrlListener();
   IMAPPump.inbox.updateFolderWithListener(null, listener);

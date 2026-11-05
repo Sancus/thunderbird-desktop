@@ -1286,8 +1286,171 @@ async function assertImapUnit(input, receipt) {
 
 let imapInterrupted, imapCommittedReceipt;
 add_task(
-  async function test_protocolUnitProjectionReadbackFailureKeepsActualCommitForRetry() {
+  async function test_protocolUnitPersistedReadbackFailurePreservesFirstError() {
     const input = await plannedImapUnit();
+    imapInterrupted = input;
+    const token = await input.journal.beginImportUnit(input.ids);
+    const native = imapTarget(input);
+    Assert.equal(await native.findProtocolUnitReceipt(token, input.ids), null);
+    const connection = database.connectionForTests;
+    const queries = [
+      ["messages", "id,folderId,messageId,subject,flags", "id"],
+      ["message_properties", "id,name,value", "id,name"],
+      ["message_references", "id,ordinal,token", "id,ordinal"],
+      ["folder_properties", "id,name,value", "id,name"],
+      [
+        "folder_import_receipts",
+        "token,sourceId,databaseSourceId,sourceSha256,folderId,folderPath,sourcePath,messageCount",
+        "token",
+      ],
+      [
+        "folder_import_keys",
+        "token,sourceKey,destinationKey",
+        "token,sourceKey",
+      ],
+      ["imap_import_units", "token,databaseSourceId,provenance", "token"],
+      [
+        "imap_import_operations",
+        "unitToken,member,sourceKey,messageKey,operationId,revision",
+        "unitToken,member,sourceKey",
+      ],
+      [
+        "imap_import_operation_holds",
+        "operationId,databaseSourceId,folderId,messageKey",
+        "operationId",
+      ],
+    ];
+    const snapshot = () =>
+      queries.map(([table, columns, order]) => {
+        const statement = connection.createStatement(
+          `SELECT ${columns} FROM ${table} ORDER BY ${order}`
+        );
+        try {
+          const values = [];
+          while (statement.executeStep()) {
+            values.push(columns.split(",").map(name => statement.row[name]));
+          }
+          return values;
+        } finally {
+          statement.finalize();
+        }
+      });
+    const before = snapshot();
+    const journalBefore = await IOUtils.read(input.path);
+    const stateBefore = input.journal.state;
+    const backupBefore = await IOUtils.computeHexDigest(backup.path, "sha256");
+    const reached = [];
+    connection.createFunction("s519_readback_fault", 1, {
+      onFunctionCall(args) {
+        reached.push(args.getInt32(0));
+        return 0;
+      },
+    });
+    const errorCheckpoint = input.journal.recordError.bind(input.journal);
+    let primaryError, checkpointError;
+    input.journal.recordError = async error => {
+      Assert.equal(
+        error,
+        primaryError,
+        "The original native error is recorded"
+      );
+      try {
+        await errorCheckpoint(error);
+      } catch (childError) {
+        checkpointError = childError;
+        throw childError;
+      }
+    };
+    const temporaryPath = input.path + ".tmp";
+    Assert.ok(!(await IOUtils.exists(temporaryPath)));
+    await IOUtils.makeDirectory(temporaryPath);
+    try {
+      // Reach the persisted unit after its member/operation writes, then make
+      // readback reject it. The journal's real temporary-path failure is separate.
+      connection.executeSimpleSQL(
+        "CREATE TEMP TRIGGER s519_readback_corruption AFTER INSERT ON imap_import_units BEGIN SELECT s519_readback_fault((SELECT COUNT(*) FROM imap_import_operations WHERE unitToken=NEW.token)); UPDATE imap_import_units SET provenance='s519 rejected persisted unit' WHERE token=NEW.token; END"
+      );
+      await Assert.rejects(
+        resumeMorkImports(input.journal, {
+          ...native,
+          async importProtocolUnit(unitToken, ids) {
+            try {
+              return await native.importProtocolUnit(unitToken, ids);
+            } catch (error) {
+              primaryError = error;
+              throw error;
+            }
+          },
+        }),
+        error =>
+          error === primaryError &&
+          error.result === Cr.NS_ERROR_ALREADY_INITIALIZED
+      );
+      Assert.deepEqual(
+        reached,
+        [
+          imapLedger.members.reduce(
+            (count, member) => count + member.operations.length,
+            0
+          ),
+        ],
+        "The actual persisted receipt follows every pending operation"
+      );
+      Assert.ok(checkpointError, "The real child journal write also failed");
+      Assert.notEqual(checkpointError, primaryError);
+      Assert.ok(!connection.transactionInProgress);
+      Assert.deepEqual(
+        snapshot(),
+        before,
+        "Earlier committed native data is unchanged"
+      );
+      Assert.deepEqual(input.journal.state, stateBefore);
+      Assert.deepEqual(await IOUtils.read(input.path), journalBefore);
+      Assert.equal(input.journal.state.protocolUnits[0].receipt, null);
+      Assert.ok(
+        input.journal.state.sources.every(
+          source => source.state === "importing" && source.receipt === null
+        )
+      );
+      Assert.equal(
+        await IOUtils.computeHexDigest(backup.path, "sha256"),
+        backupBefore
+      );
+      for (const [name, { saved }] of imapSourceFiles) {
+        const folder = imapFolders.get(name);
+        Assert.equal(
+          await IOUtils.computeHexDigest(folder.summaryFile.path, "sha256"),
+          saved.sha256
+        );
+        Assert.equal(
+          await IOUtils.computeHexDigest(folder.filePath.path, "sha256"),
+          saved.bodies[0].sha256
+        );
+      }
+    } finally {
+      connection.executeSimpleSQL(
+        "DROP TRIGGER IF EXISTS s519_readback_corruption"
+      );
+      connection.removeFunction("s519_readback_fault");
+      await IOUtils.remove(temporaryPath, { recursive: true });
+      input.journal.close();
+      input.journal = await MigrationJournal.open(
+        input.path,
+        profileLock.directory.path
+      );
+    }
+    Assert.deepEqual(input.journal.state, stateBefore);
+    Assert.equal(
+      await imapTarget(input).findProtocolUnitReceipt(token, input.ids),
+      null,
+      "Owned admissions are released and the failed unit has no durable receipt"
+    );
+  }
+);
+
+add_task(
+  async function test_protocolUnitProjectionReadbackFailureKeepsActualCommitForRetry() {
+    const input = imapInterrupted ?? (await plannedImapUnit());
     imapInterrupted = input;
     const token = await input.journal.beginImportUnit(input.ids);
     const target = imapTarget(input);

@@ -2936,6 +2936,22 @@ class DeliveryCoreReferences : public testing::Test {
     return stmt->GetInt64(1, &attempts);
   }
 
+  // Exercise the real receipt SELECT failure after all unit writes, through the
+  // existing friend fixture's statement cache. No production fault hook/API.
+  nsresult ImapReceiptReadError(bool enabled) {
+    DatabaseCore::sStatements.Remove("ReadImapImportOperations"_ns);
+    if (!enabled) return NS_OK;
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(mConnection->CreateStatement(
+        "SELECT sourceKey,messageKey,operationId,abs(-9223372036854775808) "
+        "FROM imap_import_operations WHERE unitToken=:token AND member=:member "
+        "ORDER BY sourceKey"_ns,
+        getter_AddRefs(stmt)));
+    DatabaseCore::sStatements.InsertOrUpdate("ReadImapImportOperations"_ns,
+                                             stmt);
+    return NS_OK;
+  }
+
   nsresult ImportImap(
       const ImapImportUnit& unit, ImapImportReceipt& output,
       const std::function<nsresult(const ImapImportReceipt&)>& prepare = {},
@@ -7757,6 +7773,303 @@ TEST_F(DeliveryCoreReferences, ImapImportRefusesUnresolvedOrAmbiguousUnit) {
   uint64_t count;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
   EXPECT_EQ(0u, count);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ImapImportPersistedReceiptReadbackPrecedesPublication) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ImapImportReceipt output;
+  output.token = "unchanged"_ns;
+  uint32_t prepared = 0, callbacks = 0;
+  bool published = false;
+  auto& db = mCore->MessageDB();
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) {
+        ++callbacks;
+        EXPECT_TRUE(published);
+        EXPECT_EQ(input.token, output.token);
+        EXPECT_EQ(3u, output.folders.Length());
+        bool active = true;
+        EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        EXPECT_FALSE(active);
+      });
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(
+      NS_OK,
+      ImportImap(
+          input, output,
+          [&](const ImapImportReceipt& value) -> nsresult {
+            ++prepared;
+            EXPECT_EQ("unchanged"_ns, output.token);
+            EXPECT_FALSE(published);
+            EXPECT_EQ(0u, callbacks);
+            bool active = false;
+            MOZ_TRY(mConnection->GetTransactionInProgress(&active));
+            EXPECT_TRUE(active);
+            EXPECT_EQ(input.token, value.token);
+            EXPECT_EQ(input.databaseSourceId, value.databaseSourceId);
+            EXPECT_EQ(3u, value.folders.Length());
+            // An independent SQL oracle observes every generated mapping and
+            // operation identity while the owning transaction is still open.
+            for (uint32_t i = 0; i < value.folders.Length(); ++i) {
+              const auto& member = value.folders[i];
+              for (const auto& key : member.folder.keys) {
+                nsCOMPtr<mozIStorageStatement> stmt;
+                MOZ_TRY(mConnection->CreateStatement(
+                    "SELECT destinationKey FROM folder_import_keys "
+                    "WHERE token=:token AND sourceKey=:source"_ns,
+                    getter_AddRefs(stmt)));
+                MOZ_TRY(stmt->BindUTF8StringByName(
+                    "token"_ns, member.folder.identity.token));
+                MOZ_TRY(stmt->BindInt64ByName("source"_ns, key.source));
+                bool more;
+                MOZ_TRY(stmt->ExecuteStep(&more));
+                NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+                int64_t stored;
+                MOZ_TRY(stmt->GetInt64(0, &stored));
+                EXPECT_EQ(key.destination, stored);
+                MOZ_TRY(stmt->ExecuteStep(&more));
+                EXPECT_FALSE(more);
+              }
+              for (const auto& op : member.operations) {
+                nsCOMPtr<mozIStorageStatement> stmt;
+                MOZ_TRY(mConnection->CreateStatement(
+                    "SELECT messageKey,operationId,revision FROM "
+                    "imap_import_operations WHERE unitToken=:token AND "
+                    "member=:member AND sourceKey=:source"_ns,
+                    getter_AddRefs(stmt)));
+                MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, value.token));
+                MOZ_TRY(stmt->BindInt64ByName("member"_ns, i));
+                MOZ_TRY(stmt->BindInt64ByName("source"_ns, op.sourceKey));
+                bool more;
+                MOZ_TRY(stmt->ExecuteStep(&more));
+                NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+                int64_t key, id, revision;
+                MOZ_TRY(stmt->GetInt64(0, &key));
+                MOZ_TRY(stmt->GetInt64(1, &id));
+                MOZ_TRY(stmt->GetInt64(2, &revision));
+                EXPECT_EQ(op.key, key);
+                EXPECT_EQ(op.id, id);
+                EXPECT_EQ(op.revision, revision);
+                MOZ_TRY(stmt->ExecuteStep(&more));
+                EXPECT_FALSE(more);
+              }
+            }
+            return NS_OK;
+          },
+          [&] {
+            EXPECT_EQ(input.token, output.token);
+            published = true;
+          }));
+  EXPECT_EQ(1u, prepared);
+  EXPECT_TRUE(published);
+  EXPECT_EQ(4u, callbacks);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportReadbackRejectsAlteredChildMap) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  uint32_t prepared = 0, callbacks = 0, published = 0;
+  auto& db = mCore->MessageDB();
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) { ++callbacks; });
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  // Each mutation leaves the INSERT successful. Same-count, valid-range
+  // changes require comparison with the generated receipt, not just parsing.
+  for (
+      const auto& fault :
+      {"UPDATE folder_import_keys SET sourceKey=sourceKey+1000 WHERE sourceKey=9;"_ns,
+       "UPDATE folder_import_keys SET destinationKey=destinationKey+1000 WHERE sourceKey=9;"_ns,
+       "UPDATE imap_import_operations SET operationId=operationId+1000;"_ns,
+       "UPDATE imap_import_operations SET revision=revision+1000;"_ns,
+       "DELETE FROM folder_import_keys WHERE sourceKey=9;"_ns,
+       "DELETE FROM imap_import_units;"_ns}) {
+    SCOPED_TRACE(fault.get());
+    nsAutoCString sql(
+        "CREATE TEMP TRIGGER alter_imap_receipt AFTER INSERT ON "
+        "imap_import_units BEGIN ");
+    sql.Append(fault);
+    sql.AppendLiteral(" END");
+    ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    auto drop = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER IF EXISTS alter_imap_receipt"_ns));
+    });
+    ImapImportReceipt output;
+    output.token = "unchanged"_ns;
+    EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+              ImportImap(
+                  input, output,
+                  [&](const ImapImportReceipt&) -> nsresult {
+                    ++prepared;
+                    return NS_ERROR_OUT_OF_MEMORY;
+                  },
+                  [&] { ++published; }));
+    EXPECT_EQ("unchanged"_ns, output.token);
+    EXPECT_TRUE(output.folders.IsEmpty());
+    EXPECT_EQ(0u, prepared);
+    EXPECT_EQ(0u, published);
+    EXPECT_EQ(0u, callbacks);
+    uint64_t count;
+    ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+    EXPECT_EQ(0u, count);
+    bool active = true;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    for (const auto& member : input.folders) {
+      Maybe<FolderImportReceipt> receipt;
+      ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(member.snapshot.identity,
+                                                     receipt));
+      EXPECT_FALSE(receipt);
+    }
+  }
+  ImapImportReceipt output;
+  ASSERT_EQ(NS_OK, ImportImap(input, output));
+  EXPECT_EQ(4u, callbacks);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ImapImportReadbackAndChildFailurePreservePriorCommit) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey control;
+  ASSERT_EQ(NS_OK, Add("prior-imap-control@invalid"_ns, {}, control));
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  uint32_t prepared = 0, callbacks = 0, published = 0;
+  auto& db = mCore->MessageDB();
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) { ++callbacks; });
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  int64_t highWater;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(NS_OK, mConnection->CreateStatement(
+                         "SELECT highWater FROM message_key_allocator "
+                         "WHERE singleton=1"_ns,
+                         getter_AddRefs(stmt)));
+    bool more;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    ASSERT_EQ(NS_OK, stmt->GetInt64(0, &highWater));
+  }
+  for (uint32_t mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    nsCOMPtr<mozIStorageStatement> unfinished;
+    if (mode == 0) {
+      ASSERT_EQ(NS_OK, ImapReceiptReadError(true));
+    } else if (mode == 1) {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "CREATE TEMP TRIGGER reject_imap_child BEFORE INSERT ON "
+              "folder_import_keys WHEN NEW.sourceKey=9 "
+              "BEGIN SELECT RAISE(ABORT,'named child write failure'); END"_ns));
+    } else {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "CREATE TEMP TABLE import_commit_witness(id INTEGER PRIMARY KEY)"_ns));
+      // A pending write cursor makes COMMIT fail with SQLITE_BUSY. Do not
+      // enable global FK enforcement: the existing import permits child-first
+      // thread rows and the ordinary absent-parent sentinel.
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->CreateStatement(
+              "INSERT INTO import_commit_witness DEFAULT VALUES RETURNING id"_ns,
+              getter_AddRefs(unfinished)));
+    }
+    auto clear = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, ImapReceiptReadError(false));
+      if (unfinished) {
+        EXPECT_EQ(NS_OK, unfinished->Reset());
+        unfinished = nullptr;
+      }
+      EXPECT_EQ(NS_OK,
+                mConnection->ExecuteSimpleSQL(
+                    "DROP TRIGGER IF EXISTS reject_imap_child; "
+                    "DROP TABLE IF EXISTS temp.import_commit_witness"_ns));
+    });
+    ImapImportReceipt output;
+    output.token = "unchanged"_ns;
+    EXPECT_EQ(mode == 0   ? NS_ERROR_FAILURE
+              : mode == 1 ? NS_ERROR_STORAGE_CONSTRAINT
+                          : NS_ERROR_STORAGE_BUSY,
+              ImportImap(
+                  input, output,
+                  [&](const ImapImportReceipt&) -> nsresult {
+                    ++prepared;
+                    if (unfinished) {
+                      bool more;
+                      MOZ_TRY(unfinished->ExecuteStep(&more));
+                      NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+                    }
+                    return NS_OK;
+                  },
+                  [&] { ++published; }));
+    if (unfinished) {
+      ASSERT_EQ(NS_OK, unfinished->Reset());
+      unfinished = nullptr;
+    }
+    EXPECT_EQ("unchanged"_ns, output.token);
+    EXPECT_TRUE(output.folders.IsEmpty());
+    EXPECT_EQ(mode == 2 ? 1u : 0u, prepared);
+    EXPECT_EQ(0u, published);
+    EXPECT_EQ(0u, callbacks);
+    bool active = true, exists = false;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    ASSERT_EQ(NS_OK, db.MessageExists(control, exists));
+    EXPECT_TRUE(exists);
+    uint64_t count;
+    ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+    EXPECT_EQ(1u, count);
+    nsCOMPtr<mozIStorageStatement> stmt;
+    ASSERT_EQ(
+        NS_OK,
+        mConnection->CreateStatement(
+            "SELECT (SELECT COUNT(*) FROM imap_import_units),"
+            "(SELECT COUNT(*) FROM folder_import_receipts),"
+            "(SELECT COUNT(*) FROM folder_import_keys),"
+            "(SELECT COUNT(*) FROM imap_import_operations),"
+            "(SELECT COUNT(*) FROM offline_operations),"
+            "(SELECT COUNT(*) FROM imap_import_operation_holds),"
+            "(SELECT COUNT(*) FROM offline_attempts),"
+            "(SELECT highWater FROM message_key_allocator WHERE singleton=1)"_ns,
+            getter_AddRefs(stmt)));
+    bool more;
+    ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    for (uint32_t column = 0; column < 8; ++column) {
+      int64_t value;
+      ASSERT_EQ(NS_OK, stmt->GetInt64(column, &value));
+      EXPECT_EQ(column == 7 ? highWater : 0, value);
+    }
+  }
+  ImapImportReceipt committed;
+  ASSERT_EQ(NS_OK, ImportImap(input, committed));
+  EXPECT_EQ(4u, callbacks);
+  auto saved = committed.folders[0].operations[0];
+  db.RemoveMessageListener(observer);
+  remove.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportReceipt retry;
+  ASSERT_EQ(NS_OK, ImportImap(input, retry));
+  EXPECT_EQ(saved.key, retry.folders[0].operations[0].key);
+  EXPECT_EQ(saved.id, retry.folders[0].operations[0].id);
+  EXPECT_EQ(saved.revision, retry.folders[0].operations[0].revision);
+  bool exists = false;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(control, exists));
+  EXPECT_TRUE(exists);
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(5u, count);
 }
 
 TEST_F(DeliveryCoreReferences, ImapImportReceiptFailureRollsBackWholeUnit) {

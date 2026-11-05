@@ -2336,6 +2336,58 @@ nsresult CheckImapImportBodies(const ImapImportFolder& member) {
   return NS_OK;
 }
 
+// Compare only a newly written unit. A committed retry may legitimately retain
+// receipt identities after its live messages or operations have been consumed.
+bool SameImapImportReceipt(const ImapImportReceipt& a,
+                           const ImapImportReceipt& b) {
+  if (a.token != b.token || a.databaseSourceId != b.databaseSourceId ||
+      a.folders.Length() != b.folders.Length()) {
+    return false;
+  }
+  for (uint32_t i = 0; i < a.folders.Length(); ++i) {
+    const auto& x = a.folders[i];
+    const auto& y = b.folders[i];
+    const auto& u = x.folder.identity;
+    const auto& v = y.folder.identity;
+    if (u.token != v.token || u.sourceId != v.sourceId ||
+        u.databaseSourceId != v.databaseSourceId ||
+        u.sourceSha256 != v.sourceSha256 || u.folderId != v.folderId ||
+        u.folderPath != v.folderPath || u.sourcePath != v.sourcePath ||
+        u.windows.isSome() != v.windows.isSome() ||
+        x.folder.keys.Length() != y.folder.keys.Length() ||
+        x.uidValidity != y.uidValidity ||
+        x.serverUids.Length() != y.serverUids.Length() ||
+        x.operations.Length() != y.operations.Length()) {
+      return false;
+    }
+    if (u.windows && (!SameImportPath(u.windows->summary, v.windows->summary) ||
+                      !SameImportPath(u.windows->store, v.windows->store))) {
+      return false;
+    }
+    for (uint32_t j = 0; j < x.folder.keys.Length(); ++j) {
+      if (x.folder.keys[j].source != y.folder.keys[j].source ||
+          x.folder.keys[j].destination != y.folder.keys[j].destination) {
+        return false;
+      }
+    }
+    for (uint32_t j = 0; j < x.serverUids.Length(); ++j) {
+      if (x.serverUids[j].sourceKey != y.serverUids[j].sourceKey ||
+          x.serverUids[j].uid != y.serverUids[j].uid) {
+        return false;
+      }
+    }
+    for (uint32_t j = 0; j < x.operations.Length(); ++j) {
+      const auto& op = x.operations[j];
+      const auto& stored = y.operations[j];
+      if (op.sourceKey != stored.sourceKey || op.key != stored.key ||
+          op.id != stored.id || op.revision != stored.revision) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 nsresult DatabaseCore::ReadImapImportReceipt(const ImapImportUnit& input,
@@ -2864,6 +2916,12 @@ nsresult DatabaseCore::ImportImapUnit(
       MOZ_TRY(stmt->BindUTF8StringByName("proof"_ns, proof));
       MOZ_TRY(stmt->Execute());
     }
+    // Validate the persisted unit before preparing caller output or committing.
+    // Structurally valid but altered child mappings must not become visible.
+    Maybe<ImapImportReceipt> stored;
+    MOZ_TRY(ReadImapImportReceipt(input, proof, stored));
+    NS_ENSURE_TRUE(stored && SameImapImportReceipt(result, *stored),
+                   NS_ERROR_FILE_CORRUPTED);
     for (const auto& message : live) {
       auto value = MakeUnique<MessageDatabase::CachedMsg>();
       MOZ_TRY(messages->FetchMsg(message->Key(), *value));

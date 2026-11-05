@@ -11,6 +11,10 @@ const { MockAlertsService } = ChromeUtils.importESModule(
   "resource://testing-common/mailnews/MockAlertsService.sys.mjs"
 );
 
+const { PromiseTestUtils: MailPromiseTestUtils } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/PromiseTestUtils.sys.mjs"
+);
+
 let imapServer;
 let localAccount;
 let smtpAccount;
@@ -100,7 +104,11 @@ add_setup(async function () {
   smtpIdentity.doFcc = true;
 
   const incomingServer = smtpAccount.incomingServer;
-  incomingServer.performBiff(window.msgWindow);
+  const discovered = new MailPromiseTestUtils.PromiseUrlListener();
+  incomingServer
+    .QueryInterface(Ci.nsIImapIncomingServer)
+    .discoverAllFolders(discovered, window.msgWindow);
+  await discovered.promise;
   await TestUtils.waitForCondition(
     () => incomingServer.rootFolder.containsChildNamed("Sent"),
     "waiting for the Sent folder to synchronise"
@@ -114,6 +122,7 @@ add_setup(async function () {
     MailServices.accounts.removeAccount(smtpAccount, false);
     MailServices.accounts.removeAccount(localAccount, false);
     await Services.logins.removeAllLoginsAsync();
+    await clearStatusBar(window);
   });
   registerCleanupFunction(() => MockAlertsService.cleanup());
 });
@@ -339,11 +348,16 @@ registerCleanupFunction(function queueFinalComposeActivityLog() {
           JSON.stringify({
             document: doc.documentURI,
             vsyncEnabled: ChromeUtils.vsyncEnabled(),
+            pendingTick:
+              doc.defaultView.windowUtils.refreshDriverHasPendingTick,
             progressStarts: window.MsgStatusFeedback?._startRequests,
             meteorsSpinning: window.MsgStatusFeedback?._meteorsSpinning,
             animations: doc.getAnimations().map(animation => ({
               state: animation.playState,
               name: animation.animationName,
+              transitionProperty: animation.transitionProperty,
+              currentTime: animation.currentTime,
+              endTime: animation.effect?.getComputedTiming().endTime,
               target: animation.effect?.target?.localName,
               id: animation.effect?.target?.id,
               classes: animation.effect?.target?.getAttribute("class"),

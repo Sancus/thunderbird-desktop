@@ -231,3 +231,5 @@ tags = ["compact"]
 ["test_trustSpamAssassin.js"]
 
 ["test_virtualFolderSuffixedParent.js"]
+
+["test_detachedFolderUrlCompletion.js"]

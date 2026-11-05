@@ -345,13 +345,20 @@ registerCleanupFunction(function queueFinalComposeActivityLog() {
           documents.add(frame.contentDocument);
         }
       }
+      let pendingTick = "unavailable";
+      try {
+        pendingTick = doc.defaultView.windowUtils.refreshDriverHasPendingTick;
+      } catch (ex) {
+        if (ex.result != Cr.NS_ERROR_NOT_AVAILABLE) {
+          throw ex;
+        }
+      }
       info(
         "Compose remaining UI activity: " +
           JSON.stringify({
             document: doc.documentURI,
             vsyncEnabled: ChromeUtils.vsyncEnabled(),
-            pendingTick:
-              doc.defaultView.windowUtils.refreshDriverHasPendingTick,
+            pendingTick,
             progressStarts: window.MsgStatusFeedback?._startRequests,
             meteorsSpinning: window.MsgStatusFeedback?._meteorsSpinning,
             animations: doc.getAnimations().map(animation => ({

@@ -8791,7 +8791,20 @@ nsImapMailFolder::SetUrlState(nsIImapProtocol* aProtocol,
 #endif
   // A committed native rename deliberately detached this old wrapper. Its URL
   // must still run common cleanup and notify the registered listeners once.
-  if (!mPath && !nativeHierarchy) return NS_OK;
+  if (!mPath && !nativeHierarchy) {
+    // Shutdown detached this folder while the protocol was finishing. Retire
+    // an already-started URL so its feedback and listeners cannot stay active.
+    // A completed native relocation follows the normal cleanup path above.
+    if (aUrl && !isRunning && !aSuspend) {
+      bool wasRunning = false;
+      nsresult rv = aUrl->GetUrlState(&wasRunning);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (wasRunning) {
+        return aUrl->SetUrlState(false, statusCode);
+      }
+    }
+    return NS_OK;
+  }
   if (!isRunning) {
     ProgressStatusString(aProtocol, "imapDone"_ns, ""_ns);
     m_urlRunning = false;

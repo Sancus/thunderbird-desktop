@@ -150,7 +150,16 @@ add_task(async function switch_sections() {
       "the start section should have a height"
     );
   } finally {
-    dialog?.cancelDialog();
+    if (dialog) {
+      // SubDialog removes its frame on the next main-thread turn.
+      const unloaded = BrowserTestUtils.waitForEvent(
+        dialog.documentGlobal,
+        "unload",
+        true
+      );
+      dialog.cancelDialog();
+      await unloaded;
+    }
   }
 });
 
@@ -205,7 +214,16 @@ add_task(async function missing_identity_name() {
       "the Generate key button should still be enabled"
     );
   } finally {
-    dialog?.cancelDialog();
+    if (dialog) {
+      // SubDialog removes its frame on the next main-thread turn.
+      const unloaded = BrowserTestUtils.waitForEvent(
+        dialog.documentGlobal,
+        "unload",
+        true
+      );
+      dialog.cancelDialog();
+      await unloaded;
+    }
     gIdentity.fullName = "Alice";
   }
 });

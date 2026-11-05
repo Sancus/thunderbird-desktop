@@ -1448,6 +1448,13 @@ class FolderImportAdmission final {
     uint16_t kind = expected.id.IsEmpty()
                         ? nsIPanoramaMigrationFileSystem::KIND_FILE_OR_MISSING
                         : nsIPanoramaMigrationFileSystem::KIND_FILE;
+    if (allowMissing && !expected.id.IsEmpty()) {
+      // This selects a candidate kind only. Native admission and the expected
+      // physical identities below still prove the original and live paths.
+      bool directory;
+      MOZ_TRY(original->IsDirectory(&directory));
+      if (directory) kind = nsIPanoramaMigrationFileSystem::KIND_DIRECTORY;
+    }
     nsCOMPtr<nsIPanoramaMigrationPath> lease;
     MOZ_TRY(mFileSystem->Admit(original, root, kind, getter_AddRefs(lease)));
     mLeases.AppendElement(lease);

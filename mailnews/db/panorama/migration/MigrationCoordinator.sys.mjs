@@ -989,7 +989,7 @@ export function createPanoramaMigrationTarget(
 }
 
 /**
- * Binds explicit Windows version2 imports to retained journal4/backup3 inputs.
+ * Binds Windows imports to physical journal4/6 and backup3 inputs.
  * Keeps the Unix/default factory's Windows refusal. Requires the caller's actual
  * selected-profile lock and quiesced source, backup and target writers. The native
  * receiver acquires separate leases and returns its measured durable receipt.
@@ -1014,7 +1014,7 @@ export function createWindowsPanoramaMigrationTarget(
   }
   if (
     !(journal instanceof MigrationJournal) ||
-    journal.state.version !== 4 ||
+    ![4, 6].includes(journal.state.version) ||
     !["import", "validate", "activate", "complete"].includes(
       journal.state.stage
     ) ||

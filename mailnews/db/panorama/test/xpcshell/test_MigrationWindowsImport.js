@@ -967,6 +967,57 @@ async function assertImapUnit(input, receipt) {
   Assert.ok(!database.connectionForTests.transactionInProgress);
 }
 
+add_task(async function test_directoryStoreInventoryRetainsPhysicalIdentity() {
+  const summary = new FileUtils.File(
+    PathUtils.join(work, "directory-store.msf")
+  );
+  const store = new FileUtils.File(PathUtils.join(work, "directory-store"));
+  const retained = PathUtils.join(work, "retained-directory-store");
+  const root = new FileUtils.File(work);
+  await IOUtils.write(summary.path, summaryBytes, { mode: "create" });
+  await IOUtils.makeDirectory(store.path);
+  const inventory = Reader.captureMorkFolderWindowsInventory(
+    summary,
+    root,
+    store,
+    root
+  );
+  const measured = Reader.validateMorkFolderWindowsInventory(inventory);
+  Assert.notEqual(measured.store.id, "");
+  Assert.deepEqual(Object.keys(inventory.windowsAdmission.store).sort(), [
+    "id",
+    "originalPath",
+    "originalRoot",
+    "parentId",
+    "rootId",
+  ]);
+  Assert.throws(
+    () => Reader.captureMorkFolderWindowsInventory(store, root, summary, root),
+    error => error.result === Cr.NS_ERROR_FILE_INVALID_PATH,
+    "A directory cannot replace the required summary file"
+  );
+  const saved = structuredClone(inventory);
+  await IOUtils.move(store.path, retained, { noOverwrite: true });
+  try {
+    await IOUtils.write(store.path, bodyBytes, { mode: "create" });
+    Assert.throws(
+      () => Reader.validateMorkFolderWindowsInventory(inventory),
+      error =>
+        error.message ===
+        "Retained Windows migration physical identity changed",
+      "A regular file cannot rebind the retained directory identity"
+    );
+    Assert.deepEqual(inventory, saved);
+  } finally {
+    await IOUtils.remove(store.path, { ignoreAbsent: true });
+    await IOUtils.move(retained, store.path, { noOverwrite: true });
+  }
+  Assert.deepEqual(
+    Reader.validateMorkFolderWindowsInventory(inventory),
+    measured
+  );
+});
+
 add_task(async function test_genuineImapUnitRetainsWindowsPhysicalAdmission() {
   const input = await plannedImapUnit();
   await resumeMorkImports(input.journal, imapTarget(input));

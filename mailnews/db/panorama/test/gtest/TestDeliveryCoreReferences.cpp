@@ -300,6 +300,9 @@ class DeliveryCoreReferences : public testing::Test {
       ASSERT_EQ(NS_OK,
                 NS_GetSpecialDirectory(NS_OS_TEMP_DIR, getter_AddRefs(base)));
     }
+    // AccountManager initializes process-wide NSS. Bind it to the harness
+    // profile before installing our removable per-case profile.
+    net_EnsurePSMInit();
     ASSERT_EQ(NS_OK, base->Clone(getter_AddRefs(mProfile)));
     ASSERT_EQ(NS_OK, mProfile->Append(u"delivery-core-references"_ns));
     ASSERT_EQ(NS_OK, mProfile->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
@@ -2412,12 +2415,12 @@ class DeliveryCoreReferences : public testing::Test {
   }
 
 #ifdef XP_WIN
-  nsresult ImportPathIdentity(nsIFile* file, FolderImportPathIdentity& output) {
+  nsresult ImportPathIdentity(
+      nsIFile* file, FolderImportPathIdentity& output,
+      uint16_t kind = nsIPanoramaMigrationFileSystem::KIND_FILE) {
     RefPtr<MigrationFileSystem> system = new MigrationFileSystem();
     nsCOMPtr<nsIPanoramaMigrationPath> lease;
-    MOZ_TRY(system->Admit(file, mProfile,
-                          nsIPanoramaMigrationFileSystem::KIND_FILE,
-                          getter_AddRefs(lease)));
+    MOZ_TRY(system->Admit(file, mProfile, kind, getter_AddRefs(lease)));
     auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, lease->Close()); });
     MOZ_TRY(file->GetPath(output.originalPath));
     MOZ_TRY(mProfile->GetPath(output.originalRoot));
@@ -2658,6 +2661,16 @@ class DeliveryCoreReferences : public testing::Test {
       row.header.messageSize = Some(uint32_t(bytes.Length()));
       row.header.offlineMessageSize = Some(uint32_t(bytes.Length()));
     }
+#ifdef XP_WIN
+    if (type == "maildir"_ns) {
+      NS_ENSURE_TRUE(member.snapshot.identity.windows, NS_ERROR_UNEXPECTED);
+      nsCOMPtr<nsIFile> actualStore;
+      MOZ_TRY(folder->GetFilePath(getter_AddRefs(actualStore)));
+      MOZ_TRY(ImportPathIdentity(
+          actualStore, member.snapshot.identity.windows->store,
+          nsIPanoramaMigrationFileSystem::KIND_DIRECTORY));
+    }
+#endif
     server.forget(owner);
     remove.release();
     return NS_OK;
@@ -2785,8 +2798,12 @@ class DeliveryCoreReferences : public testing::Test {
       ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(member.snapshot.identity,
                                                      receipt));
       EXPECT_FALSE(receipt);
+      // Windows caches GetFileSize on the original file object. Its clone
+      // starts with dirty stat data and observes the finished physical write.
+      nsCOMPtr<nsIFile> observed;
+      ASSERT_EQ(NS_OK, file->Clone(getter_AddRefs(observed)));
       int64_t after;
-      ASSERT_EQ(NS_OK, file->GetFileSize(&after));
+      ASSERT_EQ(NS_OK, observed->GetFileSize(&after));
       EXPECT_GT(after,
                 originalSize);  // Physical bytes are outside SQL rollback.
     } else {
@@ -10569,6 +10586,125 @@ TEST_F(DeliveryCoreReferences, WindowsImportRequiresOriginalPhysicalContext) {
   EXPECT_EQ(paths.summary.parentId,
             recovered->identity.windows->summary.parentId);
   EXPECT_EQ(paths.store.rootId, recovered->identity.windows->store.rootId);
+}
+
+TEST_F(DeliveryCoreReferences,
+       WindowsImportDirectoryStoreKeepsPhysicalGuardsAndReceipt) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  nsCOMPtr<nsIFile> store;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(store)));
+  ASSERT_EQ(NS_OK, store->Append(u"native-maildir"_ns));
+  ASSERT_EQ(NS_OK, store->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  for (const auto& name : {u"cur"_ns, u"tmp"_ns}) {
+    nsCOMPtr<nsIFile> child;
+    ASSERT_EQ(NS_OK, store->Clone(getter_AddRefs(child)));
+    ASSERT_EQ(NS_OK, child->Append(name));
+    ASSERT_EQ(NS_OK, child->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  }
+  ASSERT_EQ(NS_OK,
+            ImportPathIdentity(store, input.identity.windows->store,
+                               nsIPanoramaMigrationFileSystem::KIND_DIRECTORY));
+  const auto paths = *input.identity.windows;
+  FolderImportReceipt output;
+  output.identity.token = "unchanged"_ns;
+  uint32_t callbacks = 0;
+  RefPtr<PublicationObserver> observer = new PublicationObserver([&](Message*,
+                                                                     bool) {
+    ++callbacks;
+    EXPECT_EQ(input.identity.token, output.identity.token);
+    // The caller's capture lease has closed. Core's independent directory
+    // admission must prevent replacement until publication returns.
+    EXPECT_TRUE(NS_FAILED(store->RenameTo(mProfile, u"blocked-maildir"_ns)));
+    bool exists;
+    ASSERT_EQ(NS_OK, store->Exists(&exists));
+    EXPECT_TRUE(exists);
+  });
+  auto& db = mCore->MessageDB();
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  auto reject = [&](nsIFile* summary, nsresult expected) {
+    EXPECT_EQ(expected, ImportNativeFile(summary, input, output));
+    EXPECT_EQ("unchanged"_ns, output.identity.token);
+    EXPECT_EQ(0u, callbacks);
+    uint64_t count;
+    ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+    EXPECT_EQ(0u, count);
+  };
+  input.identity.windows->store.id.Assign(
+      "0000000000000000:00000000000000000000000000000000");
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.parentId.Assign(
+      "0000000000000000:00000000000000000000000000000000");
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.rootId.Assign(
+      "0000000000000000:00000000000000000000000000000000");
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.canonicalPath = paths.summary.canonicalPath;
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.id.Truncate();
+  reject(source,
+         NS_ERROR_FILE_INVALID_PATH);  // Absent cannot bless a directory.
+  input.identity.windows = Some(paths);
+  reject(store, NS_ERROR_FILE_INVALID_PATH);  // Live summary stays FILE-only.
+  input.identity.windows->summary = paths.store;
+  input.identity.sourcePath = paths.store.canonicalPath;
+  reject(store, NS_ERROR_FILE_INVALID_PATH);  // Original summary too.
+  input.identity.windows = Some(paths);
+  input.identity.sourcePath = paths.summary.canonicalPath;
+
+  // Replace the directory before acquisition, retaining the old object so its
+  // physical ID cannot be reused. A matching path/type is not sufficient.
+  ASSERT_EQ(NS_OK, store->RenameTo(mProfile, u"original-maildir"_ns));
+  nsCOMPtr<nsIFile> original, replacement;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(original)));
+  ASSERT_EQ(NS_OK, original->Append(u"original-maildir"_ns));
+  ASSERT_EQ(NS_OK, NS_NewLocalFile(paths.store.originalPath,
+                                   getter_AddRefs(replacement)));
+  ASSERT_EQ(NS_OK, replacement->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  ASSERT_EQ(NS_OK, replacement->Remove(true));
+  ASSERT_EQ(NS_OK, original->RenameTo(mProfile, u"native-maildir"_ns));
+  ASSERT_EQ(NS_OK,
+            NS_NewLocalFile(paths.store.originalPath, getter_AddRefs(store)));
+  Maybe<FolderImportReceipt> missing;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, missing));
+  EXPECT_FALSE(missing);
+
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, output));
+  EXPECT_EQ(2u, callbacks);
+  ASSERT_TRUE(output.identity.windows);
+  EXPECT_EQ(paths.store.id, output.identity.windows->store.id);
+  EXPECT_EQ(paths.store.originalPath,
+            output.identity.windows->store.originalPath);
+  EXPECT_EQ(paths.store.originalRoot,
+            output.identity.windows->store.originalRoot);
+  ASSERT_EQ(NS_OK, store->RenameTo(mProfile, u"after-maildir"_ns));
+  nsCOMPtr<nsIFile> after;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(after)));
+  ASSERT_EQ(NS_OK, after->Append(u"after-maildir"_ns));
+  ASSERT_EQ(NS_OK, after->RenameTo(mProfile, u"native-maildir"_ns));
+  db.RemoveMessageListener(observer);
+  cleanup.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  Maybe<FolderImportReceipt> recovered;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, recovered));
+  ASSERT_TRUE(recovered && recovered->identity.windows);
+  EXPECT_EQ(2u, recovered->keys.Length());
+  EXPECT_EQ(paths.store.id, recovered->identity.windows->store.id);
+  EXPECT_EQ(paths.store.parentId, recovered->identity.windows->store.parentId);
+  EXPECT_EQ(paths.store.rootId, recovered->identity.windows->store.rootId);
+  EXPECT_EQ(paths.store.canonicalPath,
+            recovered->identity.windows->store.canonicalPath);
+  EXPECT_EQ(paths.store.canonicalRoot,
+            recovered->identity.windows->store.canonicalRoot);
 }
 
 TEST_F(DeliveryCoreReferences, WindowsImportCannotRebindOldReceipt) {

@@ -3086,6 +3086,12 @@ async function checkFreshImapMove(store, uidplus) {
       "completed-partial@example.invalid",
       firstId
     ).replace("Completed partial", "Fresh IMAP Move");
+    // RETR writes use the POP client's platform separator. The stored payload
+    // follows the native metadata headers; compare it without normalizing it.
+    const expectedLocalMessage =
+      AppConstants.platform == "win"
+        ? firstRaw
+        : firstRaw.replaceAll("\r\n", "\n");
     const laterRaw = COMPLETE.replace(
       "completed-partial@example.invalid",
       laterId
@@ -3101,8 +3107,11 @@ async function checkFreshImapMove(store, uidplus) {
       Assert.equal(header.folder, folder);
       Assert.equal(header.messageId, firstId);
       Assert.ok(header.storeToken);
-      Assert.ok(
-        mailTestUtils.loadMessageToString(folder, header).includes(firstRaw)
+      Assert.equal(
+        mailTestUtils
+          .loadMessageToString(folder, header)
+          .slice(-expectedLocalMessage.length),
+        expectedLocalMessage
       );
       if (source) {
         Assert.equal(header.messageKey, sourceKey);

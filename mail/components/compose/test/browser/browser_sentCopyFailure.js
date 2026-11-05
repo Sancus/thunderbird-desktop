@@ -105,9 +105,11 @@ add_setup(async function () {
 
   const incomingServer = smtpAccount.incomingServer;
   const discovered = new MailPromiseTestUtils.PromiseUrlListener();
-  incomingServer
-    .QueryInterface(Ci.nsIImapIncomingServer)
-    .discoverAllFolders(discovered, window.msgWindow);
+  MailServices.imap.discoverAllFolders(
+    incomingServer.rootFolder,
+    discovered,
+    null
+  );
   await discovered.promise;
   await TestUtils.waitForCondition(
     () => incomingServer.rootFolder.containsChildNamed("Sent"),

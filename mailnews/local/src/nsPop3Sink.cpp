@@ -528,7 +528,7 @@ NS_IMETHODIMP nsPop3Sink::IncorporateComplete(
 #ifdef MOZ_PANORAMA
   if (completed && NS_SUCCEEDED(m_incorporateStatus)) {
     rv = m_newMailParser->ApplyFiltersToCompletedMessage(
-        completed, aCallback ? this : nullptr);
+        completed, aCallback ? this : nullptr, !m_partialBody);
     if (aCallback) {
       // May already have completed synchronously through OnStopOperation.
       if (NS_FAILED(rv)) (void)OnStopOperation(rv);
@@ -771,27 +771,15 @@ nsresult nsPop3Sink::IncorporateCompleteInternal(nsIMsgWindow* aMsgWindow,
     rv = hdr->SetStoreToken(storeToken);
     NS_ENSURE_SUCCESS(rv, rv);
 
-    rv = m_newMailParser->PublishMsgHeader(aMsgWindow, completed);
-    // A native full source is confirmed before filter execution. Its URI must
-    // come from the actual Attach-returned row, never the detached draft key.
-    if (*completed) {
-      RecordIncorporateResult(rv);
-      if (m_buildMessageUri) {
-        nsCOMPtr<nsIMsgFolder> publishedFolder;
-        nsresult receiptRv =
-            (*completed)->GetFolder(getter_AddRefs(publishedFolder));
-        if (NS_SUCCEEDED(receiptRv) && publishedFolder) {
-          receiptRv = publishedFolder->GetUriForMsg(*completed, m_messageUri);
-        } else if (NS_SUCCEEDED(receiptRv)) {
-          receiptRv = NS_ERROR_UNEXPECTED;
-        }
-        RecordIncorporateResult(receiptRv);
-      }
-      NS_ENSURE_SUCCESS(m_incorporateStatus, m_incorporateStatus);
-    }
+    rv = m_newMailParser->PublishMsgHeader(
+        aMsgWindow, completed,
+        native && m_buildMessageUri ? &m_messageUri : nullptr);
     NS_ENSURE_SUCCESS(rv, rv);
-    // The message is published; forward/reply failures do not undo delivery.
-    (void)m_newMailParser->ApplyForwardAndReplyFilter(aMsgWindow);
+    // Native fresh actions queue compose work on the published row and settle
+    // it after completed filters, including any asynchronous Move, finish.
+    if (!*completed) {
+      (void)m_newMailParser->ApplyForwardAndReplyFilter(aMsgWindow);
+    }
 
     if (oldMsgHdr) {
       // We had the partial message, but got the full now.

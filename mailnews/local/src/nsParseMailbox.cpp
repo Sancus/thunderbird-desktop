@@ -8,6 +8,7 @@
 #include "nsParseMailbox.h"
 #include "nsIMsgHdr.h"
 #include "nsIMsgDatabase.h"
+#include "nsIMsgThread.h"
 #include "nsMsgMessageFlags.h"
 #include "nsIInputStream.h"
 #include "nsMsgLocalFolderHdrs.h"
@@ -1126,6 +1127,20 @@ nsresult HardDeleteDetachedMessage(nsIMsgFolder* folder, nsIMsgDatabase* db,
 }  // namespace
 
 #ifdef MOZ_PANORAMA
+namespace {
+// A completed Move must retarget queued compose work using the returned key.
+class CompletedFilterCopyListener final : public CopyServiceListener {
+ public:
+  std::function<nsresult(nsMsgKey)> mKeyFn;
+  NS_IMETHOD SetMessageKey(nsMsgKey key) override {
+    return mKeyFn ? mKeyFn(key) : NS_OK;
+  }
+
+ private:
+  ~CompletedFilterCopyListener() override = default;
+};
+}  // namespace
+
 struct nsParseNewMailState::CompletedFilterState
     : public RefCounted<CompletedFilterState> {
   MOZ_DECLARE_REFCOUNTED_TYPENAME(CompletedFilterState)
@@ -1137,6 +1152,9 @@ struct nsParseNewMailState::CompletedFilterState
   uint64_t copySerial = 0;
   bool logging = false, running = false, dispatching = false, waiting = false;
   bool terminalAction = false;
+  bool fresh = false, notNew = false, moveIsNew = false;
+  nsCOMPtr<nsIMsgFolder> moveDestination;
+  nsMsgKey destinationKey = nsMsgKey_None;
   nsresult status = NS_OK;
   void Record(nsresult rv) {
     if (NS_SUCCEEDED(status) && NS_FAILED(rv)) status = rv;
@@ -1222,7 +1240,8 @@ void nsParseNewMailState::DoneParsing() {
 }
 
 nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow,
-                                               nsIMsgDBHdr** published) {
+                                               nsIMsgDBHdr** published,
+                                               nsACString* publishedURI) {
   if (published) *published = nullptr;
   bool moved = false;
   bool deferFilters = false;
@@ -1305,7 +1324,14 @@ nsresult nsParseNewMailState::PublishMsgHeader(nsIMsgWindow* msgWindow,
         rv = m_mailDB->AttachHdr(detachedHdr, true, getter_AddRefs(liveHdr));
         NS_ENSURE_SUCCESS(rv, rv);
         // Preserve the confirmed result even if a later notification fails.
-        if (deferFilters) NS_IF_ADDREF(*published = liveHdr);
+        if (deferFilters) {
+          NS_IF_ADDREF(*published = liveHdr);
+          // MFN listeners may synchronously retire this row. Capture its actual
+          // physical identity before notifying, while Attach's result is live.
+          if (publishedURI) {
+            MOZ_TRY(m_downloadFolder->GetUriForMsg(liveHdr, *publishedURI));
+          }
+        }
         nsCOMPtr<nsIMsgFolderNotificationService> notifier =
             mozilla::components::FolderNotification::Service();
         MOZ_TRY(notifier->NotifyMsgAdded(liveHdr));
@@ -1387,7 +1413,7 @@ void nsParseNewMailState::ApplyFilters(bool* pMoved, nsIMsgWindow* msgWindow) {
 
 #ifdef MOZ_PANORAMA
 nsresult nsParseNewMailState::ApplyFiltersToCompletedMessage(
-    nsIMsgDBHdr* header, nsIMsgOperationListener* completion) {
+    nsIMsgDBHdr* header, nsIMsgOperationListener* completion, bool fresh) {
   NS_ENSURE_TRUE(!m_completedFilters, NS_ERROR_IN_PROGRESS);
   if (m_disableFilters) {
     if (completion) (void)completion->OnStopOperation(NS_OK);
@@ -1402,6 +1428,7 @@ nsresult nsParseNewMailState::ApplyFiltersToCompletedMessage(
   RefPtr<CompletedFilterState> state = new CompletedFilterState;
   state->header = header;
   state->completion = completion;
+  state->fresh = fresh;
   m_completedFilters = state;
   RunCompletedFilters(state);
   return completion ? NS_OK : state->status;
@@ -1434,6 +1461,40 @@ nsresult nsParseNewMailState::OnCompletedFilterCopy(CompletedFilterState* state,
       state->copySerial != serial)
     return NS_OK;
   state->Record(status);
+  if (NS_SUCCEEDED(status) && state->moveDestination) {
+    if (state->fresh) {
+      nsCOMPtr<nsIMsgDBHdr> destination;
+      nsresult rv =
+          state->destinationKey == nsMsgKey_None
+              ? NS_ERROR_UNEXPECTED
+              : state->moveDestination->GetMessageHeader(
+                    state->destinationKey, getter_AddRefs(destination));
+      state->Record(rv);
+      if (NS_SUCCEEDED(rv)) {
+        if (m_msgToForwardOrReply == state->header) {
+          m_msgToForwardOrReply = destination;
+        }
+        // Logging and queued compose must not read the retired source row.
+        state->header = destination;
+      }
+      if (state->moveIsNew) {
+        state->notNew = true;
+        nsCString uri;
+        rv = state->moveDestination->GetURI(uri);
+        state->Record(rv);
+        if (NS_SUCCEEDED(rv)) {
+          if (!m_filterTargetFoldersMsgMovedCount) {
+            m_filterTargetFoldersMsgMovedCount =
+                std::make_unique<nsTHashMap<nsCStringHashKey, int32_t>>();
+          }
+          m_filterTargetFoldersMsgMovedCount->InsertOrUpdate(
+              uri, m_filterTargetFoldersMsgMovedCount->Get(uri) + 1);
+        }
+      }
+      m_filterTargetFolders.AppendObject(state->moveDestination);
+    }
+  }
+  state->moveDestination = nullptr;
   state->waiting = false;
   if (!state->dispatching) {
     LogCompletedFilterAction(state->filter,
@@ -1510,6 +1571,30 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             case nsMsgFilterAction::FetchBodyFromPop3Server:
             case nsMsgFilterAction::StopExecution:
               break;
+            case nsMsgFilterAction::ChangePriority:
+            case nsMsgFilterAction::JunkScore:
+            case nsMsgFilterAction::Forward:
+            case nsMsgFilterAction::Reply:
+            case nsMsgFilterAction::WatchThread:
+            case nsMsgFilterAction::KillThread:
+            case nsMsgFilterAction::KillSubthread:
+            case nsMsgFilterAction::DeleteFromPop3Server:
+              if (state->fresh) break;
+              [[fallthrough]];
+            case nsMsgFilterAction::Custom: {
+              if (state->fresh) {
+                nsCOMPtr<nsIMsgFilterCustomAction> custom;
+                MOZ_TRY(action->GetCustomAction(getter_AddRefs(custom)));
+                NS_ENSURE_TRUE(custom, NS_ERROR_NOT_AVAILABLE);
+                bool async;
+                MOZ_TRY(custom->GetIsAsync(&async));
+                if (!async || state->completion) break;
+              }
+              LogCompletedFilterAction(filter, action, state->header,
+                                       state->logging,
+                                       NS_ERROR_NOT_IMPLEMENTED);
+              return NS_ERROR_NOT_IMPLEMENTED;
+            }
             case nsMsgFilterAction::CopyToFolder:
             case nsMsgFilterAction::MoveToFolder:
             case nsMsgFilterAction::Delete:
@@ -1537,11 +1622,16 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
       nsresult actionRv = [&]() -> nsresult {
         switch (type) {
           case nsMsgFilterAction::MarkRead:
-            return m_downloadFolder->MarkMessagesRead({state->header.get()},
-                                                      true);
+            MOZ_TRY(m_downloadFolder->MarkMessagesRead({state->header.get()},
+                                                       true));
+            state->notNew = true;
+            return NS_OK;
           case nsMsgFilterAction::MarkUnread:
-            return m_downloadFolder->MarkMessagesRead({state->header.get()},
-                                                      false);
+            MOZ_TRY(m_downloadFolder->MarkMessagesRead({state->header.get()},
+                                                       false));
+            if (state->fresh) MOZ_TRY(m_mailDB->AddToNewList(key));
+            state->notNew = false;
+            return NS_OK;
           case nsMsgFilterAction::MarkFlagged:
             return m_downloadFolder->MarkMessagesFlagged({state->header.get()},
                                                          true);
@@ -1550,6 +1640,84 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             MOZ_TRY(action->GetStrValue(keyword));
             return m_downloadFolder->AddKeywordsToMessages(
                 {state->header.get()}, keyword);
+          }
+          case nsMsgFilterAction::ChangePriority: {
+            nsMsgPriorityValue priority;
+            MOZ_TRY(action->GetPriority(&priority));
+            return state->header->SetPriority(priority);
+          }
+          case nsMsgFilterAction::JunkScore: {
+            int32_t score;
+            MOZ_TRY(action->GetJunkScore(&score));
+            nsAutoCString value;
+            value.AppendInt(score);
+            MOZ_TRY(state->header->SetStringProperty("junkscore", value));
+            MOZ_TRY(state->header->SetStringProperty("junkscoreorigin",
+                                                     "filter"_ns));
+            if (score == nsIJunkMailPlugin::IS_SPAM_SCORE) state->notNew = true;
+            return NS_OK;
+          }
+          case nsMsgFilterAction::WatchThread:
+          case nsMsgFilterAction::KillThread: {
+            nsCOMPtr<nsIMsgThread> thread;
+            MOZ_TRY(m_mailDB->GetThreadContainingMsgHdr(
+                state->header, getter_AddRefs(thread)));
+            NS_ENSURE_TRUE(thread, NS_ERROR_NOT_AVAILABLE);
+            nsMsgKey threadKey;
+            MOZ_TRY(thread->GetThreadKey(&threadKey));
+            return type == nsMsgFilterAction::KillThread
+                       ? m_mailDB->MarkThreadIgnored(thread, threadKey, true,
+                                                     nullptr)
+                       : m_mailDB->MarkThreadWatched(thread, threadKey, true,
+                                                     nullptr);
+          }
+          case nsMsgFilterAction::KillSubthread:
+            return m_mailDB->MarkKilled(key, true, nullptr);
+          case nsMsgFilterAction::Forward:
+          case nsMsgFilterAction::Reply: {
+            nsCString value;
+            MOZ_TRY(action->GetStrValue(value));
+            if (type == nsMsgFilterAction::Forward) {
+              m_forwardTo.AppendElement(value);
+            } else {
+              m_replyTemplateUri.AppendElement(value);
+              m_ruleAction = action;
+              m_filter = state->filter;
+            }
+            m_msgToForwardOrReply = state->header;
+            return NS_OK;
+          }
+          case nsMsgFilterAction::DeleteFromPop3Server: {
+            nsCOMPtr<nsIMsgLocalMailFolder> local =
+                do_QueryInterface(m_downloadFolder);
+            NS_ENSURE_TRUE(local, NS_ERROR_NO_INTERFACE);
+            return local->MarkMsgsOnPop3Server({state->header.get()},
+                                               POP3_FORCE_DEL);
+          }
+          case nsMsgFilterAction::Custom: {
+            nsCOMPtr<nsIMsgFilterCustomAction> custom;
+            MOZ_TRY(action->GetCustomAction(getter_AddRefs(custom)));
+            nsCString value;
+            MOZ_TRY(action->GetStrValue(value));
+            bool async;
+            MOZ_TRY(custom->GetIsAsync(&async));
+            if (!async) {
+              return custom->ApplyAction({state->header.get()}, value, nullptr,
+                                         nsMsgFilterType::InboxRule,
+                                         m_msgWindow);
+            }
+            uint64_t serial = ++state->copySerial;
+            RefPtr<CopyServiceListener> listener = new CopyServiceListener;
+            listener->mStopCopyFn = [self = RefPtr{this}, hold = RefPtr{state},
+                                     serial](nsresult status) {
+              return self->OnCompletedFilterCopy(hold, serial, status);
+            };
+            state->waiting = state->dispatching = true;
+            nsresult customRv =
+                custom->ApplyAction({state->header.get()}, value, listener,
+                                    nsMsgFilterType::InboxRule, m_msgWindow);
+            state->dispatching = false;
+            return customRv;
           }
           case nsMsgFilterAction::FetchBodyFromPop3Server:
             return NS_OK;  // Already has its completed body.
@@ -1569,10 +1737,22 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
               MOZ_TRY(action->GetTargetFolderUri(target));
               NS_ENSURE_TRUE(!target.IsEmpty(), NS_ERROR_INVALID_ARG);
               MOZ_TRY(m_downloadFolder->GetURI(source));
-              if (source.Equals(target)) return NS_OK;
+              if (source.Equals(target)) {
+                if (move && state->fresh) {
+                  state->nextAction = state->actions.Length();
+                  state->nextFilter = state->filterCount;
+                }
+                return NS_OK;
+              }
               MOZ_TRY(GetOrCreateFolder(target, getter_AddRefs(destination)));
             }
-            if (destination == m_downloadFolder) return NS_OK;
+            if (destination == m_downloadFolder) {
+              if (move && state->fresh) {
+                state->nextAction = state->actions.Length();
+                state->nextFilter = state->filterCount;
+              }
+              return NS_OK;
+            }
             NS_ENSURE_TRUE(destination, NS_ERROR_NOT_AVAILABLE);
             bool canFile;
             MOZ_TRY(destination->GetCanFileMessages(&canFile));
@@ -1580,17 +1760,31 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
             if (type == nsMsgFilterAction::Delete) {
               MOZ_TRY(m_downloadFolder->MarkMessagesRead({state->header.get()},
                                                          true));
+              state->notNew = true;
             }
             nsCOMPtr<nsIMsgCopyService> copy =
                 do_GetService("@mozilla.org/messenger/messagecopyservice;1");
             NS_ENSURE_TRUE(copy, NS_ERROR_NOT_AVAILABLE);
             MOZ_TRY(state->status);
             uint64_t serial = ++state->copySerial;
-            RefPtr<CopyServiceListener> listener = new CopyServiceListener;
+            RefPtr<CompletedFilterCopyListener> listener =
+                new CompletedFilterCopyListener;
+            listener->mKeyFn = [self = RefPtr{this}, hold = RefPtr{state},
+                                serial](nsMsgKey key) {
+              if (self->m_completedFilters == hold && hold->waiting &&
+                  hold->copySerial == serial)
+                hold->destinationKey = key;
+              return NS_OK;
+            };
             listener->mStopCopyFn = [self = RefPtr{this}, hold = RefPtr{state},
                                      serial](nsresult status) {
               return self->OnCompletedFilterCopy(hold, serial, status);
             };
+            bool read;
+            MOZ_TRY(state->header->GetIsRead(&read));
+            state->moveIsNew = !read && !state->notNew;
+            state->moveDestination = move ? destination.get() : nullptr;
+            state->destinationKey = nsMsgKey_None;
             state->terminalAction = move;
             state->waiting = state->dispatching = true;
             nsresult copyRv = copy->CopyMessages(
@@ -1613,6 +1807,26 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
   }();
   state->Record(rv);
   if (state->waiting) return;
+  if (state->fresh) {
+    // Account once for this delivery, including a successful prefix before an
+    // error. Partial completion must not change fresh-download biff counts.
+    if (state->notNew) {
+      int32_t count;
+      nsresult countRv = m_downloadFolder->GetNumNewMessages(false, &count);
+      if (NS_SUCCEEDED(countRv) && count > 0) {
+        countRv = m_downloadFolder->SetNumNewMessages(count - 1);
+      }
+      state->Record(countRv);
+      ++m_numNotNewMessages;
+    }
+    if (NS_SUCCEEDED(state->status)) {
+      state->Record(ApplyForwardAndReplyFilter(m_msgWindow));
+    } else {
+      m_forwardTo.Clear();
+      m_replyTemplateUri.Clear();
+      m_msgToForwardOrReply = nullptr;
+    }
+  }
   m_completedFilters = nullptr;
   nsCOMPtr<nsIMsgOperationListener> completion = state->completion.forget();
   if (completion) (void)completion->OnStopOperation(state->status);
@@ -1979,6 +2193,10 @@ NS_IMETHODIMP nsParseNewMailState::ApplyFilterHit(nsIMsgFilter* filter,
 nsresult nsParseNewMailState::ApplyForwardAndReplyFilter(
     nsIMsgWindow* msgWindow) {
   nsresult rv = NS_OK;
+  nsresult firstError = NS_OK;
+  auto record = [&](nsresult status) {
+    if (NS_SUCCEEDED(firstError) && NS_FAILED(status)) firstError = status;
+  };
   nsCOMPtr<nsIMsgIncomingServer> server;
 
   uint32_t i;
@@ -1997,13 +2215,17 @@ nsresult nsParseNewMailState::ApplyForwardAndReplyFilter(
       nsAutoString forwardStr;
       CopyASCIItoUTF16(m_forwardTo[i], forwardStr);
       rv = m_rootFolder->GetServer(getter_AddRefs(server));
-      NS_ENSURE_SUCCESS(rv, rv);
+      if (NS_FAILED(rv)) {
+        record(rv);
+        continue;
+      }
       {
         nsCOMPtr<nsIMsgComposeService> compService =
             mozilla::components::Compose::Service();
         rv = compService->ForwardMessage(
             forwardStr, m_msgToForwardOrReply, msgWindow, server,
             nsIMsgComposeService::kForwardAsDefault);
+        record(rv);
         if (NS_FAILED(rv))
           MOZ_LOG(FILTERLOGMODULE, LogLevel::Error,
                   ("(Local) Forwarding failed"));
@@ -2025,11 +2247,13 @@ nsresult nsParseNewMailState::ApplyForwardAndReplyFilter(
       // copy this and truncate the original, so we don't accidentally reuse it
       // on the next hdr.
       rv = m_rootFolder->GetServer(getter_AddRefs(server));
-      if (server) {
+      record(rv);
+      if (NS_SUCCEEDED(rv) && server) {
         nsCOMPtr<nsIMsgComposeService> compService =
             mozilla::components::Compose::Service();
         rv = compService->ReplyWithTemplate(
             m_msgToForwardOrReply, m_replyTemplateUri[i], msgWindow, server);
+        record(rv);
         if (NS_FAILED(rv)) {
           NS_WARNING("ReplyWithTemplate failed");
           MOZ_LOG(FILTERLOGMODULE, LogLevel::Error,
@@ -2049,7 +2273,7 @@ nsresult nsParseNewMailState::ApplyForwardAndReplyFilter(
   }
   m_replyTemplateUri.Clear();
   m_msgToForwardOrReply = nullptr;
-  return rv;
+  return firstError;
 }
 
 void nsParseNewMailState::MarkFilteredMessageRead(nsIMsgDBHdr* msgHdr) {

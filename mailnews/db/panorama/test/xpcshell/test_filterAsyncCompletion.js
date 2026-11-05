@@ -976,6 +976,11 @@ add_task(async function test_filter_move_delete_settlement() {
         } else {
           run();
         }
+        Assert.equal(
+          copyCalls,
+          1,
+          "The selected action dispatched through the registered copy service"
+        );
         const status = await providerStopped.promise;
         if (mode == "success") {
           Assert.equal(status, Cr.NS_OK, "The real native transfer succeeded");

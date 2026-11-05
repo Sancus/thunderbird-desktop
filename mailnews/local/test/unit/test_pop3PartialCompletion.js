@@ -2084,6 +2084,13 @@ async function checkFreshFilterTransfer(store, mode) {
       Assert.equal(folder.msgStore.storeType, store);
       Assert.equal(destination.msgStore.storeType, store);
       targetURI = destination.URI;
+      if (["move", "delete"].includes(mode)) {
+        folder.hasNewMessages = false;
+        destination.hasNewMessages = false;
+        folder.biffState = Ci.nsIMsgFolder.nsMsgBiffState_NoMail;
+        folder.setNumNewMessages(0);
+        destination.setNumNewMessages(0);
+      }
       const list = incoming.getFilterList(null);
       const deferred = folder.server.getFilterList(null);
       const rule = addCompletedPartialFilter(list, [
@@ -2228,6 +2235,11 @@ async function checkFreshFilterTransfer(store, mode) {
           if (mode == "reentrant-cancel" && header.folder == folder) {
             reentrantCancels++;
             Assert.ok(client._pendingIncorporation.dispatching);
+            Assert.equal(
+              client._sink.messageUri,
+              folder.getUriForMsg(header),
+              "The Attach-returned URI is available before MFN can retire the row"
+            );
             client._actionDone(Cr.NS_BINDING_ABORTED);
           }
         },
@@ -2326,6 +2338,22 @@ async function checkFreshFilterTransfer(store, mode) {
             sourceRaw
           );
           Assert.equal(current.getStringProperty("keywords"), "");
+        }
+        if (["move", "delete"].includes(mode)) {
+          Assert.equal(folder.getNumNewMessages(false), 0);
+          Assert.ok(!folder.hasNewMessages);
+          Assert.equal(
+            destination.getNumNewMessages(false),
+            mode == "move" ? 1 : 0
+          );
+          Assert.equal(destination.hasNewMessages, mode == "move");
+          // Biff is per server; Inbox and target share this deferred account.
+          const biff =
+            mode == "move"
+              ? Ci.nsIMsgFolder.nsMsgBiffState_NewMail
+              : Ci.nsIMsgFolder.nsMsgBiffState_NoMail;
+          Assert.equal(folder.biffState, biff);
+          Assert.equal(destination.biffState, biff);
         }
         const targets = [...destination.messages];
         if (destinationPublished) {
@@ -2699,4 +2727,319 @@ add_task(async function test_pop3FilterCopyStartPhysicalIdentityMaildir() {
   await checkPartialIdentityRejected("maildir", false);
   await checkPartialIdentityRejected("maildir", true);
   await checkPartialWrongFolder("maildir");
+});
+
+/**
+ * Keep the preexisting fresh action set on the real deferred POP account.
+ *
+ * @param {string} store - Actual local provider.
+ * @param {string} mode - Existing actions, same-folder Move, or queued forward
+ *   after a real Move. Every case retrieves two distinct fresh messages.
+ */
+async function checkFreshExistingActions(store, mode) {
+  await withPartialStore(store, async (incoming, folder) => {
+    incoming.deferGetNewMail = true;
+    incoming.leaveMessagesOnServer = true;
+    incoming.headersOnly = false;
+    folder.hasNewMessages = false;
+    folder.biffState = Ci.nsIMsgFolder.nsMsgBiffState_NoMail;
+    folder.setNumNewMessages(0);
+    const destination = folder.parent
+      .QueryInterface(Ci.nsIMsgLocalMailFolder)
+      .createLocalSubfolder(`existing-actions-${mode}`);
+    const firstId = `fresh-first-${store}-${mode}@example.invalid`;
+    const laterId = `fresh-later-${store}-${mode}@example.invalid`;
+    const firstRaw = COMPLETE.replace(
+      "completed-partial@example.invalid",
+      firstId
+    ).replace("Completed partial", "Fresh action target");
+    const laterRaw = COMPLETE.replace(
+      "completed-partial@example.invalid",
+      laterId
+    )
+      .replace("Completed partial", "Later fresh message")
+      .replace(/^References:.*\r\n/m, "");
+    popDaemon.setMessages([{ fileData: firstRaw }, { fileData: laterRaw }]);
+    const composeContract = "@mozilla.org/messengercompose;1";
+    const nativeCompose = Cc[composeContract].getService(
+      Ci.nsIMsgComposeService
+    );
+    const composeCalls = [];
+    let customCalls = 0;
+    let customFinished = false;
+    const custom = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgFilterCustomAction"]),
+      id: `s373-fresh-${store}-${mode}@example.invalid#published`,
+      name: "Fresh published header",
+      allowDuplicates: false,
+      isAsync: true,
+      needsBody: true,
+      isValidForType() {
+        return true;
+      },
+      validateActionValue() {
+        return "";
+      },
+      applyAction(headers, value, listener, type) {
+        customCalls++;
+        Assert.equal(headers.length, 1);
+        Assert.equal(value, "completed-custom");
+        Assert.equal(type, Ci.nsMsgFilterType.InboxRule);
+        const header = headers[0];
+        Assert.ok(header.isLive);
+        Assert.equal(header.folder, folder);
+        Assert.equal(header.messageId, firstId);
+        Assert.ok(
+          mailTestUtils.loadMessageToString(folder, header).includes(firstId)
+        );
+        Assert.equal(
+          composeCalls.length,
+          0,
+          "Compose is queued until filters finish"
+        );
+        folder.addKeywordsToMessages(headers, value);
+        Services.tm.dispatchToMainThread(() => {
+          customFinished = true;
+          listener.onStopCopy(Cr.NS_OK);
+          listener.onStopCopy(Cr.NS_ERROR_FAILURE); // A stale duplicate cannot settle twice.
+        });
+      },
+    };
+    MailServices.filters.addCustomAction(custom);
+    const compose = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeService"]),
+      forwardMessage(to, header, window, server) {
+        Assert.equal(to, "forward@example.invalid");
+        Assert.equal(server, incoming.QueryInterface(Ci.nsIMsgIncomingServer));
+        Assert.ok(header.isLive);
+        Assert.equal(header.messageId, firstId);
+        const physical = mode == "forward-after-move" ? destination : folder;
+        Assert.equal(header.folder, physical);
+        Assert.equal(
+          physical.msgDatabase.getMsgHdrForKey(header.messageKey),
+          header
+        );
+        Assert.ok(
+          mailTestUtils.loadMessageToString(physical, header).includes(firstId)
+        );
+        if (mode == "existing-actions") {
+          Assert.ok(customFinished);
+          Assert.equal(
+            header.getStringProperty("keywords"),
+            "completed-custom later-own-rule"
+          );
+        } else {
+          Assert.equal(
+            folder.getTotalMessages(false),
+            0,
+            "Move retired its actual source"
+          );
+        }
+        composeCalls.push(["forward", header.messageKey]);
+      },
+      replyWithTemplate(header, uri, window, server) {
+        Assert.equal(uri, "mailbox://s373-template");
+        Assert.equal(server, incoming.QueryInterface(Ci.nsIMsgIncomingServer));
+        Assert.ok(customFinished);
+        Assert.ok(header.isLive);
+        Assert.equal(header.folder, folder);
+        Assert.equal(header.messageId, firstId);
+        composeCalls.push(["reply", header.messageKey]);
+      },
+    };
+    const list = incoming.getFilterList(null);
+    const deferred = folder.server.getFilterList(null);
+    let actions;
+    if (mode == "existing-actions") {
+      actions = [
+        {
+          type: Ci.nsMsgFilterAction.ChangePriority,
+          priority: Ci.nsMsgPriority.high,
+        },
+        { type: Ci.nsMsgFilterAction.JunkScore, junkScore: 100 },
+        { type: Ci.nsMsgFilterAction.WatchThread },
+        { type: Ci.nsMsgFilterAction.KillThread },
+        { type: Ci.nsMsgFilterAction.KillSubthread },
+        {
+          type: Ci.nsMsgFilterAction.Forward,
+          strValue: "forward@example.invalid",
+        },
+        {
+          type: Ci.nsMsgFilterAction.Reply,
+          strValue: "mailbox://s373-template",
+        },
+        {
+          type: Ci.nsMsgFilterAction.Custom,
+          customId: custom.id,
+          strValue: "completed-custom",
+        },
+        { type: Ci.nsMsgFilterAction.DeleteFromPop3Server },
+      ];
+    } else if (mode == "same-folder-move") {
+      actions = [
+        {
+          type: Ci.nsMsgFilterAction.MoveToFolder,
+          targetFolderUri: folder.URI,
+        },
+      ];
+    } else {
+      actions = [
+        {
+          type: Ci.nsMsgFilterAction.Forward,
+          strValue: "forward@example.invalid",
+        },
+        {
+          type: Ci.nsMsgFilterAction.MoveToFolder,
+          targetFolderUri: destination.URI,
+        },
+      ];
+    }
+    const rule = addCompletedPartialFilter(list, actions);
+    const term = rule.createTerm();
+    term.attrib = Ci.nsMsgSearchAttrib.Subject;
+    term.op = Ci.nsMsgSearchOp.Is;
+    const value = term.value;
+    value.str = "Fresh action target";
+    term.value = value;
+    rule.searchTerms = [term];
+    const after = addCompletedPartialFilter(list, [
+      { type: Ci.nsMsgFilterAction.AddTag, strValue: "later-own-rule" },
+    ]);
+    const deferredRule = addCompletedPartialFilter(deferred, [
+      { type: Ci.nsMsgFilterAction.MarkFlagged },
+    ]);
+    const implementation = incoming.wrappedJSObject;
+    const withClient = implementation.withClient;
+    const stopped = Promise.withResolvers();
+    const stops = [];
+    let client;
+    let composeCid;
+    implementation.withClient = function (handler) {
+      return withClient.call(this, actual => {
+        client = actual;
+        handler(actual);
+        const onDone = actual.onDone;
+        actual.onDone = status => {
+          stops.push(status);
+          onDone?.(status);
+          stopped.resolve(status);
+        };
+      });
+    };
+    try {
+      composeCid = PartialCopyRegistrar.register(composeContract, compose);
+      popServer.resetTest();
+      MailServices.pop3.GetNewMail(null, null, folder, incoming);
+      Assert.equal(await stopped.promise, Cr.NS_OK);
+      Assert.deepEqual(stops, [Cr.NS_OK]);
+      Assert.ok(client._nativeDelivery);
+      Assert.ok(client._sink.buildMessageUri);
+      Assert.ok(!client._sink.confirmedPartialCompletion);
+      let transaction = popServer.playTransaction();
+      if (Array.isArray(transaction)) {
+        transaction = transaction[transaction.length - 1];
+      }
+      const commands = transaction.them;
+      Assert.equal(commands.filter(command => command == "RETR 1").length, 1);
+      Assert.equal(commands.filter(command => command == "RETR 2").length, 1);
+      Assert.deepEqual(
+        commands.filter(command => command.startsWith("DELE")),
+        mode == "existing-actions" ? ["DELE 1"] : []
+      );
+      Assert.equal(
+        popDaemon.getTotalMessages(),
+        mode == "existing-actions" ? 1 : 2
+      );
+      const headers = [...folder.messages];
+      const first =
+        mode == "forward-after-move"
+          ? [...destination.messages][0]
+          : headers.find(header => header.messageId == firstId);
+      const later = headers.find(header => header.messageId == laterId);
+      Assert.ok(first);
+      Assert.ok(
+        later,
+        "A valid existing action does not stop the remaining download"
+      );
+      Assert.equal(
+        first.folder,
+        mode == "forward-after-move" ? destination : folder
+      );
+      Assert.equal(later.folder, folder);
+      Assert.ok(first.isLive);
+      Assert.ok(later.isLive);
+      Assert.ok(later.flags & Ci.nsMsgMessageFlags.Marked);
+      Assert.equal(later.getStringProperty("keywords"), "later-own-rule");
+      Assert.equal(client._sink.messageUri, folder.getUriForMsg(later));
+      if (mode == "existing-actions") {
+        Assert.equal(first.priority, Ci.nsMsgPriority.high);
+        Assert.equal(first.getStringProperty("junkscore"), "100");
+        Assert.equal(first.getStringProperty("junkscoreorigin"), "filter");
+        Assert.ok(first.flags & Ci.nsMsgMessageFlags.Ignored);
+        const thread = folder.msgDatabase.getThreadContainingMsgHdr(first);
+        Assert.ok(thread.flags & Ci.nsMsgMessageFlags.Watched);
+        Assert.ok(thread.flags & Ci.nsMsgMessageFlags.Ignored);
+        Assert.equal(customCalls, 1);
+        Assert.deepEqual(composeCalls, [
+          ["forward", first.messageKey],
+          ["reply", first.messageKey],
+        ]);
+        Assert.equal(
+          first.getStringProperty("keywords"),
+          "completed-custom later-own-rule"
+        );
+        Assert.equal(
+          folder.getNumNewMessages(false),
+          1,
+          "Spam is not a new biff message"
+        );
+      } else if (mode == "same-folder-move") {
+        Assert.equal(
+          first.getStringProperty("keywords"),
+          "",
+          "Same-folder Move stops own rules"
+        );
+        Assert.ok(
+          first.flags & Ci.nsMsgMessageFlags.Marked,
+          "Deferred account still runs"
+        );
+        Assert.deepEqual(composeCalls, []);
+        Assert.equal(folder.getNumNewMessages(false), 2);
+      } else {
+        Assert.deepEqual(composeCalls, [["forward", first.messageKey]]);
+        Assert.equal(first.getStringProperty("keywords"), "");
+        Assert.ok(!(first.flags & Ci.nsMsgMessageFlags.Marked));
+        Assert.equal(folder.getNumNewMessages(false), 1);
+        Assert.equal(destination.getNumNewMessages(false), 1);
+        Assert.ok(destination.hasNewMessages);
+      }
+      Assert.ok(folder.hasNewMessages);
+      Assert.equal(folder.biffState, Ci.nsIMsgFolder.nsMsgBiffState_NewMail);
+      Assert.ok(!folder.locked);
+      Assert.ok(!destination.locked);
+    } finally {
+      implementation.withClient = withClient;
+      if (composeCid) {
+        PartialCopyRegistrar.unregister(composeCid);
+      }
+      list.removeFilter(rule);
+      list.removeFilter(after);
+      deferred.removeFilter(deferredRule);
+      Assert.equal(
+        Cc[composeContract].getService(Ci.nsIMsgComposeService),
+        nativeCompose
+      );
+    }
+  });
+}
+
+add_task(async function test_pop3FreshExistingActionsMbox() {
+  await checkFreshExistingActions("mbox", "existing-actions");
+  await checkFreshExistingActions("mbox", "same-folder-move");
+  await checkFreshExistingActions("mbox", "forward-after-move");
+});
+add_task(async function test_pop3FreshExistingActionsMaildir() {
+  await checkFreshExistingActions("maildir", "existing-actions");
+  await checkFreshExistingActions("maildir", "same-folder-move");
+  await checkFreshExistingActions("maildir", "forward-after-move");
 });

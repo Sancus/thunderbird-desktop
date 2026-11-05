@@ -139,16 +139,19 @@ class nsParseNewMailState : public nsParseMailMessageState,
 
   // Native full POP delivery may defer filters until the returned row is live.
   virtual nsresult PublishMsgHeader(nsIMsgWindow* msgWindow,
-                                    nsIMsgDBHdr** published = nullptr);
+                                    nsIMsgDBHdr** published = nullptr,
+                                    nsACString* publishedURI = nullptr);
   void GetMsgWindow(nsIMsgWindow** aMsgWindow);
   nsresult EndMsgDownload();
 
   void ApplyFilters(bool* pMoved, nsIMsgWindow* msgWindow);
   nsresult ApplyForwardAndReplyFilter(nsIMsgWindow* msgWindow);
 #ifdef MOZ_PANORAMA
-  // A listener admits Copy/Move/Delete and receives the terminal filter status.
+  // Fresh delivery retains ordinary Inbox actions; Partial keeps its allowlist.
+  // A listener admits asynchronous actions and receives terminal filter status.
   nsresult ApplyFiltersToCompletedMessage(
-      nsIMsgDBHdr* header, nsIMsgOperationListener* completion = nullptr);
+      nsIMsgDBHdr* header, nsIMsgOperationListener* completion = nullptr,
+      bool fresh = false);
   void CancelCompletedFilters(nsresult status);
 #endif
 

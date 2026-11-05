@@ -97,10 +97,13 @@ export class Pop3Client {
       Ci.nsIPop3Sink
     );
     this._sink.popServer = server;
-    if (
-      AppConstants.MOZ_PANORAMA &&
-      Services.prefs.getBoolPref("mail.panorama.enabled", false)
-    ) {
+    // Query the selected backend, rather than a build constant unavailable to JS.
+    this._nativeDelivery =
+      "nsIDatabaseCore" in Ci &&
+      Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+        Ci.nsIMsgDBService
+      ) instanceof Ci.nsIDatabaseCore;
+    if (this._nativeDelivery) {
       this._sink.buildMessageUri = true;
     }
 
@@ -1685,10 +1688,7 @@ export class Pop3Client {
       sink: this._sink,
       confirmed: false,
       freshReceipt:
-        size == 0 &&
-        AppConstants.MOZ_PANORAMA &&
-        Services.prefs.getBoolPref("mail.panorama.enabled", false) &&
-        !!this._sink.buildMessageUri,
+        size == 0 && this._nativeDelivery && !!this._sink.buildMessageUri,
       receivedAt: 0,
       dispatching: true,
       stopped: false,

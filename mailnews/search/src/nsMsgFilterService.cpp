@@ -803,7 +803,8 @@ nsresult nsMsgFilterAfterTheFact::ApplyFilter() {
                                   "messages, disabling the filter");
           }
           nsCOMPtr<nsIMsgCopyService> copyService =
-              mozilla::components::Copy::Service();
+              do_GetService("@mozilla.org/messenger/messagecopyservice;1", &rv);
+          BREAK_ACTION_IF_FAILURE(rv, "Could not get copy service");
 
           if (actionType == nsMsgFilterAction::MoveToFolder) {
             m_stopFiltering.AppendElements(m_searchHits);
@@ -1299,7 +1300,19 @@ nsresult nsMsgApplyFiltersToMessages::RunNextFilter() {
         curFilter->SetScope(nullptr);
         return mFinalResult;
       }
-      CONTINUE_IF_FAILURE(rv, "Could not match selected header");
+      if (NS_FAILED(rv)) {
+        MOZ_LOG(FILTERLOGMODULE, LogLevel::Warning,
+                ("(Post) Filter problem: Could not match selected header"));
+        m_filters->LogFilterMessage(u"Could not match selected header"_ns,
+                                    m_curFilter);
+        NS_WARNING("Could not match selected header");
+        RememberFailure(rv);
+        if (m_msgWindow && !ContinueExecutionPrompt()) {
+          curFilter->SetScope(nullptr);
+          return OnEndExecution();
+        }
+        continue;
+      }
       if (matched) {
         // In order to work with nsMsgFilterAfterTheFact::ApplyFilter we
         // initialize nsMsgFilterAfterTheFact's information with a search hit

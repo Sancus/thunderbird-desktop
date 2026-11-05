@@ -160,6 +160,55 @@ async function unsubscribeCurrentRow() {
 }
 
 add_setup(async () => {
+  const feedback = window.MsgStatusFeedback;
+  const originalStart = feedback.startMeteors;
+  const originalStop = feedback.stopMeteors;
+  for (const [name, original] of [
+    ["startMeteors", originalStart],
+    ["stopMeteors", originalStop],
+  ]) {
+    feedback[name] = function (...args) {
+      info(
+        "RSS feedback transition: " +
+          JSON.stringify({
+            action: name,
+            before: this._startRequests,
+            stack: new Error().stack,
+          })
+      );
+      return original.apply(this, args);
+    };
+  }
+  const progressTrace = {
+    QueryInterface: ChromeUtils.generateQI([
+      "nsIWebProgressListener",
+      "nsISupportsWeakReference",
+    ]),
+    onStateChange(webProgress, request, flags, status) {
+      if (flags & Ci.nsIWebProgressListener.STATE_IS_NETWORK) {
+        info(
+          "RSS message network transition: " +
+            JSON.stringify({
+              flags,
+              status,
+              hidden: messagePane.hidden,
+              topLevel: webProgress.isTopLevel,
+              request: request?.name,
+              activeRequests: feedback._startRequests,
+            })
+        );
+      }
+    },
+  };
+  messagePane.webProgress.addProgressListener(
+    progressTrace,
+    Ci.nsIWebProgress.NOTIFY_STATE_NETWORK
+  );
+  registerCleanupFunction(() => {
+    messagePane.webProgress.removeProgressListener(progressTrace);
+    feedback.startMeteors = originalStart;
+    feedback.stopMeteors = originalStop;
+  });
   const databaseService = Cc[
     "@mozilla.org/msgDatabase/msgDBService;1"
   ].getService(Ci.nsIMsgDBService);

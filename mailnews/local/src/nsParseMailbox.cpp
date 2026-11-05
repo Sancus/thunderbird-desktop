@@ -1920,6 +1920,12 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
               MOZ_TRY(m_downloadFolder->MarkMessagesRead({state->header.get()},
                                                          true));
               state->notNew = true;
+              if (state->fresh) {
+                // MarkRead clears transient NewList membership, but native
+                // store copy preserves the stored New bit. Clear this row
+                // before copying; leave unrelated destination new mail alone.
+                MOZ_TRY(m_mailDB->MarkNotNew(key, nullptr));
+              }
             }
             nsCOMPtr<nsIMsgCopyService> copy =
                 do_GetService("@mozilla.org/messenger/messagecopyservice;1");

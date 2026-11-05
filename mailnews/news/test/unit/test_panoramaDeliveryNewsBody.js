@@ -535,3 +535,72 @@ add_task(async function test_nativeBatchSourceChangeFromStartFailsOnce() {
   Assert.ok(!folder.hasMsgOffline(key), "Stale public batch never settles a body");
   Assert.equal(folder.msgDatabase.getMsgHdrForKey(key).messageId, "offline-0@panorama.invalid");
 });
+
+
+add_task(async function test_allServersOfflineBatchWaitsReportsFailureAndRetries() {
+  const failed = await createOfflineNewsFixture();
+  const successful = await createOfflineNewsFixture();
+  const selected = [failed.folder, successful.folder];
+  for (const folder of selected) {
+    const settings = folder.downloadSettings;
+    settings.useServerDefaults = false;
+    settings.downloadByDate = false;
+    settings.downloadUnreadOnly = false;
+    folder.downloadSettings = settings;
+    folder.setFlag(Ci.nsMsgFolderFlags.Offline);
+  }
+  /**
+   * Starts the real public all-server operation and records its URL boundary.
+   *
+   * @returns {object} Its actual completion and notification counters.
+   */
+  function startBatch() {
+    const done = Promise.withResolvers();
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+      starts: 0,
+      stops: 0,
+      OnStartRunningUrl() {
+        this.starts++;
+      },
+      OnStopRunningUrl(uri, status) {
+        this.stops++;
+        done.resolve(status);
+      },
+    };
+    MailServices.nntp.downloadNewsgroupsForOffline(null, listener);
+    return { completion: done.promise, listener };
+  }
+  const owner = Services.io.newURI("about:blank");
+  try {
+    failed.folder.acquireSemaphore(owner, "S365 all-server failure control");
+    try {
+      const first = startBatch();
+      Assert.equal(await first.completion, Cr.NS_MSG_FOLDER_BUSY,
+        "The public batch reports the first real provider admission error");
+      Assert.equal(first.listener.starts, 1);
+      Assert.equal(first.listener.stops, 1);
+      Assert.ok(!failed.folder.hasMsgOffline(failed.header.messageKey),
+        "A failed server never claims its body");
+      Assert.ok(successful.folder.hasMsgOffline(successful.header.messageKey),
+        "The batch waits for another started server's actual provider completion before stopping");
+      Assert.ok(readStoredNewsBody(successful.folder, successful.header)
+        .includes("Only offline group 0 contains this body."));
+      Assert.ok(selected.every(folder => !folder.saveArticleOffline),
+        "Every started folder releases its owned mode before terminal notification");
+    } finally {
+      failed.folder.releaseSemaphore(owner, "S365 all-server failure control");
+    }
+    const retry = startBatch();
+    Assert.equal(await retry.completion, Cr.NS_OK, "A fresh explicit public batch retry succeeds");
+    Assert.equal(retry.listener.starts, 1);
+    Assert.equal(retry.listener.stops, 1);
+    Assert.ok(failed.folder.hasMsgOffline(failed.header.messageKey));
+    Assert.ok(successful.folder.hasMsgOffline(successful.header.messageKey));
+    Assert.ok(selected.every(folder => !folder.saveArticleOffline));
+  } finally {
+    for (const folder of selected) {
+      folder.clearFlag(Ci.nsMsgFolderFlags.Offline);
+    }
+  }
+});

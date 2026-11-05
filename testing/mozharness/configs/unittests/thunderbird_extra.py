@@ -22,7 +22,17 @@ config = {
                 "GTEST_FILTER": (
                     "TestMail*:TestMsg*:*XREAppDir*:"
                     "DeliveryCore*:FolderStorageMoveTest.*:"
-                    "LocalCopyHeaders.*:MigrationWindowsPath.*:QuarantinedOutputStream.*"
+                    "LocalCopyHeaders.*:MigrationWindowsPath.*:QuarantinedOutputStream.*:"
+                    "DeliveryCompleteHeader."
+                    "NewsArticleLocationRequiresExactPhysicalBinding:"
+                    "DeliveryCompleteHeader."
+                    "NewsArticleLocationRejectsStaleForeignAndCorruptBindings:"
+                    "DeliveryCompleteHeader."
+                    "NewsBodySettlementPreservesPreviousStateAndFlags:"
+                    "DeliveryCompleteHeader."
+                    "NewsBodySettlementFailureDoesNotReplay:"
+                    "DeliveryCompleteHeader."
+                    "NewsExpiryRequiresOriginalMappingBeforePhysicalRemoval"
                 ),
             },
         },

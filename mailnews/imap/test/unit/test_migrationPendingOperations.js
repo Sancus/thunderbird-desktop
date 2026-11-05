@@ -2044,3 +2044,241 @@ add_task(async function test_importHoldsAllowNewMailAndLaterPureCopy() {
     }
   }
 });
+
+add_task(async function test_importHoldsRefuseUserCopyAndMove() {
+  const wasOffline = Services.io.offline;
+  const originalCopy = IMAP_RFC4315_extension.COPY;
+  const copies = [];
+
+  /**
+   * Reads committed native identities without retaining a statement or row.
+   *
+   * @param {string} sql - Read-only query over the imported unit.
+   * @param {string[]} columns - Exact selected column names.
+   * @returns {Array<Record<string, string|number|null>>} Committed values.
+   */
+  function readRows(sql, columns) {
+    const statement = core.connectionForTests.createStatement(sql);
+    try {
+      const rows = [];
+      while (statement.executeStep()) {
+        rows.push(
+          Object.fromEntries(columns.map(name => [name, statement.row[name]]))
+        );
+      }
+      return rows;
+    } finally {
+      statement.finalize();
+    }
+  }
+
+  /**
+   * Captures queue custody, live headers, bodies and the actual import receipt.
+   *
+   * @returns {object} Exact committed state before or after a refused transfer.
+   */
+  function custody() {
+    return {
+      sourceId: core.sourceId,
+      operations: readRows(
+        "SELECT id,folderId,messageKey,revision,epoch,uid,sourcePhysicalKey " +
+          "FROM offline_operations ORDER BY id",
+        [
+          "id",
+          "folderId",
+          "messageKey",
+          "revision",
+          "epoch",
+          "uid",
+          "sourcePhysicalKey",
+        ]
+      ).map(row => {
+        const member = members.find(value => value.folder.id == row.folderId);
+        Assert.ok(
+          member,
+          "Each queued operation belongs to a real input folder"
+        );
+        return {
+          ...row,
+          payload: captureOperation(
+            member.folder.msgDatabase
+              .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+              .getOfflineOpForKey(row.messageKey, false)
+          ),
+        };
+      }),
+      holds: readRows(
+        "SELECT operationId,databaseSourceId,folderId,messageKey " +
+          "FROM imap_import_operation_holds ORDER BY operationId",
+        ["operationId", "databaseSourceId", "folderId", "messageKey"]
+      ),
+      receipt: core.getFolderImportReceipt(anchor(), unit),
+      folders: members.map(member => ({
+        id: member.folder.id,
+        flags: member.folder.flags,
+        headers: [...member.folder.messages].map(header => ({
+          key: header.messageKey,
+          properties: [...header.properties].sort(),
+          uid: header.getUint32Property("uidOnServer"),
+          flags: header.flags,
+          storeToken: header.storeToken,
+          size: header.messageSize,
+          offlineSize: header.offlineMessageSize,
+          lineCount: header.lineCount,
+          body:
+            header.flags & Ci.nsMsgMessageFlags.Offline
+              ? bodyBytes(member.folder, header)
+              : null,
+        })),
+        serverCount: IMAPPump.daemon.getMailbox(member.name)._messages.length,
+        serverUidNext: IMAPPump.daemon.getMailbox(member.name).uidnext,
+      })),
+    };
+  }
+
+  const before = custody();
+  const flag = before.holds.find(row => row.folderId == members[1].folder.id);
+  const move = before.holds.find(row => row.folderId == members[0].folder.id);
+  Assert.ok(flag && move, "Actual flag-only and MOVE origins remain held");
+  const direct = members[1].folder.msgDatabase.getMsgHdrForKey(flag.messageKey);
+  Assert.ok(direct);
+  Assert.equal(
+    captureOperation(
+      members[1].folder.msgDatabase
+        .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+        .getOfflineOpForKey(direct.messageKey, false)
+    ).operation,
+    OP.kFlagsChanged
+  );
+  const imported = receipt.folders.find(
+    folder => folder.folderId == members[2].folder.id
+  );
+  Assert.ok(imported, "The receipt binds the actual counterpart folder");
+  const counterpart = imported.imap.operations.find(
+    operation =>
+      members[2].folder.msgDatabase
+        .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+        .getOfflineOpForKey(operation.key, false).operation & OP.kMoveResult
+  );
+  Assert.ok(counterpart, "Use a genuinely imported physical COPY counterpart");
+  const redirected = members[2].folder.msgDatabase.getMsgHdrForKey(
+    counterpart.key
+  );
+  const redirect = captureOperation(
+    members[2].folder.msgDatabase
+      .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+      .getOfflineOpForKey(counterpart.key, false)
+  );
+  Assert.ok(redirected);
+  Assert.equal(redirect.srcMessageKey, move.messageKey);
+  Assert.equal(redirect.sourceFolderURI, members[0].folder.URI);
+  Assert.ok(
+    !before.holds.some(
+      row =>
+        row.folderId == members[2].folder.id &&
+        row.messageKey == counterpart.key
+    ),
+    "The selected counterpart itself is not held; its resolved origin is"
+  );
+  Assert.ok(!members[0].folder.msgDatabase.containsKey(move.messageKey));
+  for (const header of [direct, redirected]) {
+    Assert.ok(header.flags & Ci.nsMsgMessageFlags.Offline);
+    Assert.ok(bodyBytes(header.folder, header));
+  }
+  const stores = await Promise.all(
+    members.map(member => measureBodies(member.folder.filePath.path))
+  );
+  IMAP_RFC4315_extension.COPY = function (args, uid) {
+    copies.push({ uid, set: String(args[0]) });
+    return originalCopy.call(this, args, uid);
+  };
+  try {
+    for (const offline of [false, true]) {
+      IMAPPump.incomingServer.closeCachedConnections();
+      Services.io.offline = offline;
+      for (const header of [direct, redirected]) {
+        for (const isMove of [false, true]) {
+          info(
+            `S518_HELD_USER_TRANSFER offline=${offline} source=${header.folder.name} move=${isMove}`
+          );
+          const stops = [];
+          const keys = [];
+          const listener = new PromiseTestUtils.PromiseCopyListener({
+            onStopCopy(status) {
+              stops.push(status);
+            },
+            setMessageKey(key) {
+              keys.push(key);
+            },
+          });
+          // Observe listener settlement separately from the synchronous error.
+          const completed = listener.promise.then(
+            () => Cr.NS_OK,
+            error => Number(error.message)
+          );
+          let result = Cr.NS_OK;
+          try {
+            MailServices.copy.copyMessages(
+              header.folder,
+              [header],
+              members[5].folder,
+              isMove,
+              listener,
+              null,
+              true
+            );
+          } catch (error) {
+            result = error.result;
+          }
+          Assert.equal(
+            result,
+            Cr.NS_ERROR_NOT_AVAILABLE,
+            "The actual initiating call refuses held custody"
+          );
+          Assert.equal(await completed, Cr.NS_ERROR_NOT_AVAILABLE);
+          Assert.deepEqual(
+            stops,
+            [Cr.NS_ERROR_NOT_AVAILABLE],
+            "The original listener finishes exactly once with the first error"
+          );
+          Assert.deepEqual(keys, [], "Refusal publishes no destination key");
+          Assert.deepEqual(
+            custody(),
+            before,
+            "A held transfer preserves all rows, payloads, receipt, headers and bodies"
+          );
+          Assert.deepEqual(
+            await Promise.all(
+              members.map(member => measureBodies(member.folder.filePath.path))
+            ),
+            stores,
+            "Refusal creates no staged or provider-finished body"
+          );
+          Assert.deepEqual(
+            copies,
+            [],
+            "No refused COPY or MOVE reaches the server"
+          );
+        }
+      }
+    }
+    for (const saved of ledger.members) {
+      const member = members.find(value => value.name == saved.name);
+      Assert.equal(
+        await IOUtils.computeHexDigest(
+          member.folder.summaryFile.path,
+          "sha256"
+        ),
+        saved.sha256,
+        "Refused user operations never rewrite the original summary"
+      );
+    }
+  } finally {
+    try {
+      IMAPPump.incomingServer.closeCachedConnections();
+    } finally {
+      IMAP_RFC4315_extension.COPY = originalCopy;
+      Services.io.offline = wasOffline;
+    }
+  }
+});

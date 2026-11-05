@@ -196,8 +196,7 @@ RawHdr ParseRawMailHeaders(mozilla::Span<const char> raw) {
     }
   }
 
-  // Figure out flags from assorted headers.
-  out.flags = 0;
+  // Add status flags without discarding flags derived from MIME headers.
   if (mozstatus.Length() == 4 && MsgIsHex(mozstatus.get(), 4)) {
     uint32_t xflags = MsgUnhex(mozstatus.get(), 4);
     // Mask out a few "phantom" flags, which shouldn't be persisted.

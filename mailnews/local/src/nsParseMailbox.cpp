@@ -1755,8 +1755,6 @@ void nsParseNewMailState::RunCompletedFilters(CompletedFilterState* state) {
               return NS_ERROR_NOT_IMPLEMENTED;
             }
             case nsMsgFilterAction::CopyToFolder:
-            case nsMsgFilterAction::MoveToFolder:
-            case nsMsgFilterAction::Delete:
               if (state->completion) break;
               [[fallthrough]];
             default:

@@ -4548,7 +4548,7 @@ class NewsFaultStore final : public NewsStoreForwarder,
     MOZ_TRY(mStore->GetNewMsgOutputStream(folder, getter_AddRefs(mOriginal)));
     mCurrent = new NewsWriteFaultStream(mOriginal, fault, cut, onCut);
     last = mCurrent;
-    nsCOMPtr<nsIOutputStream> stream = mCurrent;
+    nsCOMPtr<nsIOutputStream> stream = mCurrent.get();
     stream.forget(output);
     return NS_OK;
   }

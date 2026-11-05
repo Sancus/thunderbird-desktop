@@ -308,6 +308,8 @@ async function showEvent({
   return scrolledBox;
 }
 
+const calendarPositionMeasurements = new WeakMap();
+
 /**
  * Show and open the dialog for an event on the calendar.
  *
@@ -330,7 +332,36 @@ async function openAndShowEvent({
 } = {}) {
   const box = await showEvent({ baseDate, offset, block, inline });
   const occurrenceId = box.occurrence.hashId;
-  await openEvent({ eventBox: box });
+  const measurements = { reads: [], scrolls: [] };
+  const ownRect = Object.getOwnPropertyDescriptor(box, "getBoundingClientRect");
+  const getRect = box.getBoundingClientRect;
+  const recordScroll = event => {
+    measurements.scrolls.push({
+      at: performance.now(),
+      target: event.target.id || event.target.localName,
+    });
+  };
+  // Observe the real reads without changing their values or adding a frame wait.
+  box.getBoundingClientRect = function (...args) {
+    const rect = getRect.apply(this, args);
+    measurements.reads.push({
+      at: performance.now(),
+      rect: rect.toJSON(),
+      stack: new Error().stack,
+    });
+    return rect;
+  };
+  window.addEventListener("scroll", recordScroll, true);
+  try {
+    await openEvent({ eventBox: box });
+  } finally {
+    if (ownRect) {
+      Object.defineProperty(box, "getBoundingClientRect", ownRect);
+    } else {
+      delete box.getBoundingClientRect;
+    }
+    window.removeEventListener("scroll", recordScroll, true);
+  }
 
   // Opening the dialog awaits UI work that can recycle the calendar view.
   // Measure the current box for the same occurrence, not the detached old node.
@@ -347,6 +378,7 @@ async function openAndShowEvent({
       currentBox.getBoundingClientRect().height > 0
     );
   }, "opened event occurrence should still have a rendered target");
+  calendarPositionMeasurements.set(currentBox, measurements);
   return currentBox;
 }
 
@@ -482,6 +514,7 @@ function checkTolerance(target, message, localDocument = document) {
           dialogRect,
           targetRect,
           containerRect,
+          openingMeasurements: calendarPositionMeasurements.get(target),
           triggerMatchesTarget: positionedDialog.trigger === target,
           triggerConnected: positionedDialog.trigger?.isConnected,
           triggerRect: positionedDialog.trigger?.getBoundingClientRect(),

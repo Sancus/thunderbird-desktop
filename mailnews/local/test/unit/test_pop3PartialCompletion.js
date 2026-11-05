@@ -2256,13 +2256,16 @@ async function checkFreshFilterTransfer(store, mode) {
         const before = Math.floor(Date.now() / 1000);
         const first = getMail();
         const nativeStatus = await nativeStopped.promise;
-        const expected = ["move", "delete"].includes(mode)
-          ? Cr.NS_OK
-          : mode == "publication"
-            ? Cr.NS_ERROR_STORAGE_CONSTRAINT
-            : ["cancel", "reentrant-cancel"].includes(mode)
-              ? Cr.NS_BINDING_ABORTED
-              : failure;
+        let expected;
+        if (["move", "delete"].includes(mode)) {
+          expected = Cr.NS_OK;
+        } else if (mode == "publication") {
+          expected = Cr.NS_ERROR_STORAGE_CONSTRAINT;
+        } else if (["cancel", "reentrant-cancel"].includes(mode)) {
+          expected = Cr.NS_BINDING_ABORTED;
+        } else {
+          expected = failure;
+        }
         if (mode == "cancel") {
           Assert.equal(
             nativeStatus,

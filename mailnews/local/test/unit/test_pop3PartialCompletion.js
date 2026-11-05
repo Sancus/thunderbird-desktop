@@ -3046,7 +3046,6 @@ add_task(async function test_pop3FreshExistingActionsMaildir() {
   await checkFreshExistingActions("maildir", "forward-after-move");
 });
 
-
 /**
  * Move a fresh POP message to the real IMAP daemon before downloading later mail.
  * Compose must receive the live local source, never an APPENDUID as a row key.
@@ -3192,7 +3191,10 @@ async function checkFreshImapMove(store, uidplus) {
         ["reply", sourceKey],
       ]);
       Assert.ok(source);
-      Assert.ok(!source.isLive, "The confirmed APPEND retired its local source");
+      Assert.ok(
+        !source.isLive,
+        "The confirmed APPEND retired its local source"
+      );
       const headers = [...folder.messages];
       Assert.equal(headers.length, 1);
       Assert.equal(headers[0].messageId, laterId);
@@ -3207,15 +3209,15 @@ async function checkFreshImapMove(store, uidplus) {
         ? imapTransactions
         : [imapTransactions];
       Assert.equal(
-        imapWire.flatMap(transaction => transaction.them).filter(
-          command => /^(?:\S+ )?APPEND /i.test(command)
-        ).length,
+        imapWire
+          .flatMap(transaction => transaction.them)
+          .filter(command => /^(?:\S+ )?APPEND /i.test(command)).length,
         1
       );
       Assert.equal(
-        imapWire.flatMap(transaction => transaction.us).some(
-          response => response.includes("[APPENDUID ")
-        ),
+        imapWire
+          .flatMap(transaction => transaction.us)
+          .some(response => response.includes("[APPENDUID ")),
         uidplus
       );
       let popTransaction = popServer.playTransaction();
@@ -3230,7 +3232,9 @@ async function checkFreshImapMove(store, uidplus) {
         popTransaction.them.filter(command => command == "RETR 2").length,
         1
       );
-      Assert.ok(!popTransaction.them.some(command => command.startsWith("DELE")));
+      Assert.ok(
+        !popTransaction.them.some(command => command.startsWith("DELE"))
+      );
       Assert.equal(folder.getNumNewMessages(false), 1);
       Assert.equal(destination.getNumNewMessages(false), 1);
       Assert.ok(folder.hasNewMessages);
@@ -3263,7 +3267,10 @@ async function checkFreshImapMove(store, uidplus) {
           }
         }
       }
-      Assert.equal(Cc[contract].getService(Ci.nsIMsgComposeService), nativeCompose);
+      Assert.equal(
+        Cc[contract].getService(Ci.nsIMsgComposeService),
+        nativeCompose
+      );
     }
   });
 }
@@ -3351,15 +3358,24 @@ async function checkFreshForeignRoot(store, ignored) {
       const reply = headers.find(header => header.messageId == firstId);
       const later = headers.find(header => header.messageId == laterId);
       Assert.ok(reply);
-      Assert.ok(later, "A foreign root does not stop the remaining POP download");
+      Assert.ok(
+        later,
+        "A foreign root does not stop the remaining POP download"
+      );
       Assert.ok(reply.isLive);
       Assert.equal(reply.folder, folder);
       Assert.notEqual(reply.messageKey, rootKey);
       Assert.ok(!folder.msgDatabase.listAllKeys().includes(rootKey));
       const thread = folder.msgDatabase.getThreadContainingMsgHdr(reply);
       Assert.equal(thread.threadKey, rootKey);
-      Assert.equal(Boolean(thread.flags & Ci.nsMsgMessageFlags.Ignored), ignored);
-      Assert.equal(Boolean(thread.flags & Ci.nsMsgMessageFlags.Watched), !ignored);
+      Assert.equal(
+        Boolean(thread.flags & Ci.nsMsgMessageFlags.Ignored),
+        ignored
+      );
+      Assert.equal(
+        Boolean(thread.flags & Ci.nsMsgMessageFlags.Watched),
+        !ignored
+      );
       Assert.equal(reply.getStringProperty("keywords"), "after-thread-action");
       Assert.equal(later.getStringProperty("keywords"), "");
       Assert.equal(client._sink.messageUri, folder.getUriForMsg(later));
@@ -3369,8 +3385,14 @@ async function checkFreshForeignRoot(store, ignored) {
       if (Array.isArray(transaction)) {
         transaction = transaction[transaction.length - 1];
       }
-      Assert.equal(transaction.them.filter(command => command == "RETR 1").length, 1);
-      Assert.equal(transaction.them.filter(command => command == "RETR 2").length, 1);
+      Assert.equal(
+        transaction.them.filter(command => command == "RETR 1").length,
+        1
+      );
+      Assert.equal(
+        transaction.them.filter(command => command == "RETR 2").length,
+        1
+      );
       Assert.ok(!folder.locked);
       Assert.ok(!archive.locked);
     } finally {

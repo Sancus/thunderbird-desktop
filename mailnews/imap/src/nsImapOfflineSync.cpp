@@ -56,6 +56,10 @@ static nsresult UpdateOfflineEventsFlag(nsIMsgFolder* folder,
     NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
     for (nsMsgKey key : pending) {
       using namespace mozilla::mailnews;
+      bool held;
+      MOZ_TRY(core->MessageDB().IsOfflineImportHeld(folderId, key, held));
+      // Imported custody must not repeatedly trigger automatic playback.
+      if (held) continue;
       OfflineOperationData payload;
       MOZ_TRY(core->MessageDB().GetOfflineOperation(folderId, key, payload));
       for (uint32_t action : {nsIMsgOfflineImapOperation::kFlagsChanged,
@@ -1859,6 +1863,18 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
           MOZ_TRY(m_currentDB->GetOfflineOpForKey(
               m_CurrentKeys[m_KeyIndex], false, getter_AddRefs(currentOp)));
           if (!currentOp) continue;
+          bool held;
+          nsresult hold = core->MessageDB().IsOfflineImportHeld(
+              folderId, m_CurrentKeys[m_KeyIndex], held);
+          if (NS_FAILED(hold)) return FinishPlayback(nullptr, hold);
+          if (held) {
+            // Keep the imported row and report uncertainty without blocking
+            // later dispatchable keys or action types in this folder.
+            if (NS_SUCCEEDED(m_firstPlaybackError))
+              m_firstPlaybackError = NS_ERROR_NOT_AVAILABLE;
+            currentOp = nullptr;
+            continue;
+          }
           nsOfflineImapOperationType dispatchable;
           MOZ_TRY(currentOp->GetOperation(&dispatchable));
           if (!dispatchable) {

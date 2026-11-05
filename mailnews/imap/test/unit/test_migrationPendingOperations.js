@@ -812,6 +812,8 @@ add_setup(async function captureRealOfflineOperationsAndMdbReadback() {
   );
   IMAPPump.incomingServer.closeCachedConnections();
   Services.io.offline = true;
+  // This independent real source supplies the flag-only imported hold.
+  explicit.folder.markMessagesFlagged([explicit], true);
   original.folder.markMessagesFlagged([original], true);
   original.folder.markMessagesRead([original], false);
   original.folder.addKeywordsToMessages([original], "s518-added");
@@ -1684,3 +1686,361 @@ add_task(
     await assertSourcesUnchanged();
   }
 );
+
+add_task(async function test_importHoldsAllowNewMailAndLaterPureCopy() {
+  const watched = [members[1], members[0]];
+  const wasOffline = Services.io.offline;
+  const originalSelect = IMAP_RFC3501_handler.prototype.SELECT;
+  const originalStore = IMAP_RFC3501_handler.prototype.STORE;
+  const originalCopy = IMAP_RFC4315_extension.COPY;
+  const selects = new Map(watched.map(member => [member.name, 0]));
+  const stores = [];
+  const copies = [];
+
+  /**
+   * Reads committed native custody without changing the operation or receipt.
+   *
+   * @param {string} sql - Read-only query over the imported unit.
+   * @param {string[]} columns - Exact selected column names.
+   * @returns {Array<Record<string, string|number|null>>} Committed query values.
+   */
+  function readRows(sql, columns) {
+    const statement = core.connectionForTests.createStatement(sql);
+    try {
+      const rows = [];
+      while (statement.executeStep()) {
+        rows.push(
+          Object.fromEntries(columns.map(name => [name, statement.row[name]]))
+        );
+      }
+      return rows;
+    } finally {
+      statement.finalize();
+    }
+  }
+
+  /**
+   * Captures exact held payloads, identity bindings and committed receipt bytes.
+   *
+   * @returns {{holds: object[], units: object[], mappings: object[]}} Held
+   *   operation identities/payloads and committed unit/receipt provenance.
+   */
+  function custody() {
+    const holds = readRows(
+      "SELECT h.operationId,h.databaseSourceId,h.folderId,h.messageKey," +
+        "o.revision,o.epoch,o.uid,o.sourcePhysicalKey " +
+        "FROM imap_import_operation_holds h JOIN offline_operations o " +
+        "ON o.id=h.operationId ORDER BY h.operationId",
+      [
+        "operationId",
+        "databaseSourceId",
+        "folderId",
+        "messageKey",
+        "revision",
+        "epoch",
+        "uid",
+        "sourcePhysicalKey",
+      ]
+    );
+    return {
+      holds: holds.map(hold => {
+        const member = members.find(value => value.folder.id == hold.folderId);
+        Assert.ok(member, "A hold belongs to a captured physical folder");
+        return {
+          ...hold,
+          payload: captureOperation(
+            member.folder.msgDatabase
+              .QueryInterface(Ci.nsIMsgOfflineOpsDatabase)
+              .getOfflineOpForKey(hold.messageKey, false)
+          ),
+        };
+      }),
+      units: readRows(
+        "SELECT token,databaseSourceId,provenance FROM imap_import_units " +
+          "ORDER BY token",
+        ["token", "databaseSourceId", "provenance"]
+      ),
+      mappings: readRows(
+        "SELECT unitToken,member,sourceKey,messageKey,operationId,revision " +
+          "FROM imap_import_operations ORDER BY unitToken,member,sourceKey",
+        [
+          "unitToken",
+          "member",
+          "sourceKey",
+          "messageKey",
+          "operationId",
+          "revision",
+        ]
+      ),
+    };
+  }
+
+  const before = custody();
+  Assert.equal(
+    before.holds.length,
+    2,
+    "Real flag-only and MOVE inputs are held"
+  );
+  const flag = before.holds.find(row => row.folderId == watched[0].folder.id);
+  const move = before.holds.find(row => row.folderId == watched[1].folder.id);
+  Assert.ok(flag && move);
+  Assert.equal(flag.payload.operation, OP.kFlagsChanged);
+  Assert.ok(move.payload.operation & OP.kMsgMoved);
+  Assert.ok(move.payload.operation & OP.kFlagsChanged);
+
+  IMAP_RFC3501_handler.prototype.SELECT = function (args) {
+    if (selects.has(args[0])) {
+      const count = selects.get(args[0]) + 1;
+      selects.set(args[0], count);
+      Assert.lessOrEqual(count, 6, "Held custody cannot cause a SELECT loop");
+    }
+    return originalSelect.call(this, args);
+  };
+  IMAP_RFC3501_handler.prototype.STORE = function (args, uid) {
+    const member = watched.find(
+      value => this._selectedMailbox === IMAPPump.daemon.getMailbox(value.name)
+    );
+    if (member) {
+      stores.push({ folder: member.name, uid, set: String(args[0]) });
+    }
+    return originalStore.call(this, args, uid);
+  };
+  IMAP_RFC4315_extension.COPY = function (args, uid) {
+    const member = watched.find(
+      value => this._selectedMailbox === IMAPPump.daemon.getMailbox(value.name)
+    );
+    if (member) {
+      copies.push({ folder: member.name, uid, set: String(args[0]) });
+    }
+    return originalCopy.call(this, args, uid);
+  };
+  try {
+    Services.io.offline = false;
+    const newUids = new Map();
+    const uri = Services.io.newFileURI(do_get_file("../../../data/bugmail10"));
+    for (const member of watched) {
+      const folder = member.folder;
+      const mailbox = IMAPPump.daemon.getMailbox(member.name);
+      const uid = mailbox.uidnext++;
+      mailbox.addMessage(new ImapMessage(uri.spec, uid, ["\\Seen"]));
+      newUids.set(member.name, uid);
+      IMAPPump.incomingServer.closeCachedConnections();
+      // Exercise the ordinary automatic-playback entry, not just explicit replay.
+      folder.setFlag(Ci.nsMsgFolderFlags.OfflineEvents);
+      let stops = 0;
+      const listener = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl() {
+          stops++;
+        },
+      });
+      const loaded = PromiseTestUtils.promiseFolderEvent(
+        folder,
+        "FolderLoaded"
+      );
+      folder.updateFolderWithListener(null, listener);
+      await Promise.all([listener.promise, loaded]);
+      Assert.equal(stops, 1, "The original update listener completes once");
+      Assert.greater(selects.get(member.name), 0);
+      Assert.lessOrEqual(selects.get(member.name), 2);
+      Assert.ok(
+        [...folder.messages].some(
+          header => header.getUint32Property("uidOnServer") == uid
+        ),
+        "Normal SELECT/FETCH receives the new server message past retained work"
+      );
+      Assert.ok(!(folder.flags & Ci.nsMsgFolderFlags.OfflineEvents));
+      Assert.deepEqual(
+        custody(),
+        before,
+        "Normal sync retains exact held custody"
+      );
+    }
+    Assert.deepEqual(stores, [], "Neither held source sends STORE");
+    Assert.deepEqual(copies, [], "The held MOVE does not send COPY");
+
+    const source = watched[1].folder;
+    const downloaded = new PromiseTestUtils.PromiseUrlListener();
+    source.downloadAllForOffline(downloaded, null);
+    await downloaded.promise;
+    const uid = newUids.get(watched[1].name);
+    const header = [...source.messages].find(
+      value => value.getUint32Property("uidOnServer") == uid
+    );
+    Assert.ok(header);
+    Assert.greater(
+      header.messageKey,
+      move.messageKey,
+      "Safe work is a later key"
+    );
+    const body = bodyBytes(source, header);
+    IMAPPump.incomingServer.closeCachedConnections();
+    Services.io.offline = true;
+    const destination = members[2].folder;
+    const destinationMailbox = IMAPPump.daemon.getMailbox(members[2].name);
+    const count = destinationMailbox._messages.length;
+    const destinationUid = destinationMailbox.uidnext;
+    const destinationEpoch = destinationMailbox.uidvalidity;
+    const physical = await offlineCopy(header, destination, false);
+    const operations = source.msgDatabase.QueryInterface(
+      Ci.nsIMsgOfflineOpsDatabase
+    );
+    const pure = operations.getOfflineOpForKey(header.messageKey, false);
+    Assert.ok(pure);
+    Assert.equal(
+      pure.operation,
+      OP.kMsgCopy,
+      "The later ordinary input is pure COPY"
+    );
+    const payload = captureOperation(pure);
+    const identities = readRows(
+      `SELECT id,revision,epoch,uid,sourcePhysicalKey FROM offline_operations
+       WHERE folderId=${source.id} AND messageKey=${header.messageKey}`,
+      ["id", "revision", "epoch", "uid", "sourcePhysicalKey"]
+    );
+    Assert.equal(identities.length, 1);
+    const [identity] = identities;
+    Assert.greater(identity.id, 0);
+    Assert.greater(identity.revision, 0);
+    Assert.equal(identity.uid, uid);
+    Assert.equal(
+      identity.epoch,
+      source.msgDatabase.dBFolderInfo.imapUidValidity
+    );
+    Assert.equal(identity.sourcePhysicalKey, header.messageKey);
+    Assert.deepEqual(custody(), before);
+    Services.io.offline = false;
+    const replayed = new PromiseTestUtils.PromiseUrlListener();
+    // A synchronous API failure must fail the task, not satisfy listener rejection.
+    MailServices.imap.playbackAllOfflineOperations(null, replayed);
+    await Assert.rejects(
+      replayed.promise,
+      error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE),
+      "Explicit playback reports retained uncertainty after later safe work"
+    );
+    Assert.deepEqual(copies, [
+      { folder: watched[1].name, uid: true, set: String(uid) },
+    ]);
+    Assert.deepEqual(
+      stores,
+      [],
+      "Held flag and MOVE sources still send no STORE"
+    );
+    Assert.equal(destinationMailbox._messages.length, count + 1);
+    // Transfer payload and ordinal history remain after confirmation. A wrapper
+    // proves row presence, not unfinished work (unlike removable flag payloads).
+    const retained = operations.getOfflineOpForKey(header.messageKey, false);
+    Assert.ok(retained, "Confirmed COPY history remains available");
+    Assert.deepEqual(captureOperation(retained), payload);
+    const actionSql = `SELECT a.id AS attemptId,a.operationId,a.revision,a.state,a.operation,
+       a.copyOrdinal,a.transferSourceId,a.transferOperationKey,
+       a.operationFolderId,a.operationEpoch,a.sourceFolderId,a.sourceKey,
+       a.sourceEpoch,a.sourceUid,a.destinationFolderId,a.destinationKey,
+       a.destinationEpoch,a.confirmedUid,a.confirmedEpoch
+       FROM offline_attempts a JOIN offline_operations o
+       ON o.id=a.operationId AND o.revision=a.revision
+       WHERE o.folderId=${source.id} AND o.messageKey=${header.messageKey}
+       ORDER BY a.id`;
+    const actionColumns = [
+      "attemptId",
+      "operationId",
+      "revision",
+      "state",
+      "operation",
+      "copyOrdinal",
+      "transferSourceId",
+      "transferOperationKey",
+      "operationFolderId",
+      "operationEpoch",
+      "sourceFolderId",
+      "sourceKey",
+      "sourceEpoch",
+      "sourceUid",
+      "destinationFolderId",
+      "destinationKey",
+      "destinationEpoch",
+      "confirmedUid",
+      "confirmedEpoch",
+    ];
+    const history = readRows(actionSql, actionColumns);
+    Assert.equal(
+      history.length,
+      1,
+      "One queued action owns exactly one receipt"
+    );
+    const { attemptId, ...action } = history[0];
+    Assert.greater(attemptId, 0);
+    Assert.deepEqual(action, {
+      operationId: identity.id,
+      revision: identity.revision,
+      state: 2, // OfflineAttemptState::Confirmed; Sent is not settlement.
+      operation: OP.kMsgCopy,
+      copyOrdinal: 0,
+      transferSourceId: core.sourceId,
+      transferOperationKey: header.messageKey,
+      operationFolderId: source.id,
+      // COPY uses sourceEpoch; only DELETEALL binds operationEpoch.
+      operationEpoch: null,
+      sourceFolderId: source.id,
+      sourceKey: header.messageKey,
+      sourceEpoch: identity.epoch,
+      sourceUid: uid,
+      destinationFolderId: destination.id,
+      destinationKey: physical.messageKey,
+      destinationEpoch,
+      confirmedUid: destinationUid,
+      confirmedEpoch: destinationEpoch,
+    });
+    const copied = destination.msgDatabase.getMsgHdrForKey(physical.messageKey);
+    Assert.ok(copied.properties.includes("uidOnServer"));
+    Assert.equal(copied.getUint32Property("uidOnServer"), destinationUid);
+    Assert.equal(bodyBytes(destination, copied), body);
+    const repeated = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.playbackAllOfflineOperations(null, repeated);
+    await Assert.rejects(
+      repeated.promise,
+      error => error.message == String(Cr.NS_ERROR_NOT_AVAILABLE),
+      "A second playback reports the same held uncertainty without another COPY"
+    );
+    Assert.deepEqual(copies, [
+      { folder: watched[1].name, uid: true, set: String(uid) },
+    ]);
+    Assert.deepEqual(stores, []);
+    Assert.equal(destinationMailbox._messages.length, count + 1);
+    Assert.deepEqual(readRows(actionSql, actionColumns), history);
+    Assert.deepEqual(
+      captureOperation(operations.getOfflineOpForKey(header.messageKey, false)),
+      payload
+    );
+    Assert.equal(copied.getUint32Property("uidOnServer"), destinationUid);
+    Assert.equal(bodyBytes(destination, copied), body);
+    Assert.deepEqual(
+      custody(),
+      before,
+      "Replay preserves every held row and receipt"
+    );
+    for (const member of watched) {
+      Assert.ok(!(member.folder.flags & Ci.nsMsgFolderFlags.OfflineEvents));
+      await selectFolder(member.folder);
+    }
+    for (const saved of ledger.members) {
+      const member = members.find(value => value.name == saved.name);
+      Assert.equal(
+        await IOUtils.computeHexDigest(
+          member.folder.summaryFile.path,
+          "sha256"
+        ),
+        saved.sha256,
+        "Ordinary post-import consumers never rewrite original MSF source"
+      );
+    }
+  } finally {
+    try {
+      IMAPPump.incomingServer.closeCachedConnections();
+    } finally {
+      IMAP_RFC3501_handler.prototype.SELECT = originalSelect;
+      IMAP_RFC3501_handler.prototype.STORE = originalStore;
+      IMAP_RFC4315_extension.COPY = originalCopy;
+      Services.io.offline = wasOffline;
+    }
+  }
+});

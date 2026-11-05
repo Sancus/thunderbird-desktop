@@ -4206,6 +4206,18 @@ nsresult MessageDatabase::ReadOfflineImportHold(int64_t operationId,
   return NS_OK;
 }
 
+nsresult MessageDatabase::IsOfflineImportHeld(uint64_t folderId, nsMsgKey key,
+                                              bool& held) {
+  NS_ENSURE_TRUE(
+      folderId && folderId <= INT64_MAX && key && key < nsMsgKey_None,
+      NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCurrentOwner());
+  int64_t id, revision;
+  Maybe<ServerMessageLocation> source;
+  MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source));
+  return ReadOfflineImportHold(id, held);
+}
+
 nsresult MessageDatabase::RequireOfflineImportDispatchable(
     int64_t operationId) {
   bool held;

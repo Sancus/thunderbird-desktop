@@ -7352,6 +7352,133 @@ TEST_F(DeliveryCoreReferences, ImapImportOperationOnlyKeysStayDistinct) {
   EXPECT_GT(next, key);
 }
 
+TEST_F(DeliveryCoreReferences, ImapImportHoldQueryKeepsFlagCustodyAndReceipt) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ASSERT_EQ(3u, input.folders.Length());
+  input.folders.RemoveElementAt(2);
+  input.folders.RemoveElementAt(1);
+  auto& operation = input.folders[0].operations[0];
+  operation.payload.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  operation.payload.copyDestinations.Clear();
+  operation.copies.Clear();
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  const auto saved = receipt.folders[0].operations[0];
+  const uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    if (pass) {
+      Stop();
+      ASSERT_EQ(NS_OK, Start());
+    }
+    auto& db = mCore->MessageDB();
+    bool held = false;
+    ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+    EXPECT_TRUE(held);
+    QueuedSourceIdentity identity;
+    ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(folder, saved.key, identity));
+    EXPECT_EQ(saved.id, identity.operationId);
+    EXPECT_EQ(saved.revision, identity.revision);
+    OfflineOperationData payload;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(folder, saved.key, payload));
+    EXPECT_EQ(uint32_t(nsIMsgOfflineImapOperation::kFlagsChanged),
+              payload.operation);
+    EXPECT_EQ(0x80000001u, payload.newFlags);
+    uint64_t attempt = 999;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BeginOfflineAttempt(folder, saved.key, payload.operation,
+                                     Nothing(), attempt));
+    EXPECT_EQ(999u, attempt);
+    int64_t holds, attempts;
+    ASSERT_EQ(NS_OK, MigrationHoldCounts(holds, attempts));
+    EXPECT_EQ(1, holds);
+    EXPECT_EQ(0, attempts);
+    ImapImportReceipt recovered;
+    ASSERT_EQ(NS_OK, ImportImap(input, recovered));
+    EXPECT_EQ(saved.id, recovered.folders[0].operations[0].id);
+    EXPECT_EQ(saved.revision, recovered.folders[0].operations[0].revision);
+  }
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportHoldQueryErrorsPreserveOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true, true));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  const auto saved = receipt.folders[0].operations[0];
+  const uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  RefPtr<MessageDatabase> retired = &mCore->MessageDB();
+  Stop();
+  bool held = true;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            retired->IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_TRUE(held);
+  ASSERT_EQ(NS_OK, Start());
+  held = false;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            retired->IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_TRUE(held);
+  for (bool original : {false, true}) {
+    held = original;
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, db.IsOfflineImportHeld(0, saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_INVALID_ARG,
+              db.IsOfflineImportHeld(UINT64_MAX, saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, db.IsOfflineImportHeld(folder, 0, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_INVALID_ARG,
+              db.IsOfflineImportHeld(folder, nsMsgKey_None, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(
+        NS_ERROR_NOT_AVAILABLE,
+        db.IsOfflineImportHeld(receipt.folders[1].folder.identity.folderId,
+                               saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.IsOfflineImportHeld(INT64_MAX, saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.IsOfflineImportHeld(folder, nsMsgKey_None - 1, held));
+    EXPECT_EQ(original, held);
+  }
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("UPDATE imap_import_operation_holds "
+                                          "SET messageKey=messageKey+1"_ns));
+  held = false;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "UPDATE imap_import_operation_holds "
+                "SET messageKey=messageKey-1, databaseSourceId='foreign'"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
+  {
+    nsCOMPtr<mozIStorageStatement> restore;
+    ASSERT_EQ(NS_OK,
+              mConnection->CreateStatement("UPDATE imap_import_operation_holds "
+                                           "SET databaseSourceId=:source"_ns,
+                                           getter_AddRefs(restore)));
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("source"_ns,
+                                                   input.databaseSourceId));
+    ASSERT_EQ(NS_OK, restore->Execute());
+  }
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_TRUE(held);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TABLE imap_import_operation_holds"_ns));
+  EXPECT_TRUE(NS_FAILED(db.IsOfflineImportHeld(folder, saved.key, held)));
+  EXPECT_TRUE(held);
+}
+
 TEST_F(DeliveryCoreReferences,
        ImapImportMissingMoveRetainsDurableDispatchHold) {
   ASSERT_EQ(NS_OK, Start());
@@ -7368,6 +7495,9 @@ TEST_F(DeliveryCoreReferences,
       ASSERT_EQ(NS_OK, Start());
     }
     auto& db = mCore->MessageDB();
+    bool held = false;
+    ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+    EXPECT_TRUE(held);
     OfflineOperationData payload;
     ASSERT_EQ(NS_OK, db.GetOfflineOperation(folder, saved.key, payload));
     EXPECT_EQ(word, payload.operation);
@@ -7415,6 +7545,9 @@ TEST_F(DeliveryCoreReferences,
     payload.operation = 0;
     payload.pendingDestination.reset();
     ASSERT_EQ(NS_OK, db.StoreOfflineOperation(folder, saved.key, payload));
+    held = false;
+    ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+    EXPECT_TRUE(held);
     payload.operation = word;
     payload.pendingDestination = destination;
     ASSERT_EQ(NS_OK, db.StoreOfflineOperation(folder, saved.key, payload));
@@ -7492,6 +7625,9 @@ TEST_F(DeliveryCoreReferences, ImapImportPureCopyKeepsTypedDispatchAdmission) {
   const uint64_t folder = receipt.folders[0].folder.identity.folderId;
   OfflineOperationData payload;
   ASSERT_EQ(NS_OK, db.GetOfflineOperation(folder, saved.key, payload));
+  bool held = true;
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
   uint64_t attempt = 999;
   ASSERT_EQ(NS_OK, db.BeginOfflineAction(
                        folder, saved.key, nsIMsgOfflineImapOperation::kMsgCopy,
@@ -7538,6 +7674,9 @@ TEST_F(DeliveryCoreReferences, ImapImportHoldRetiresBeforeOperationIdReuse) {
   QueuedSourceIdentity identity;
   ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(folder, key, identity));
   EXPECT_EQ(saved.id, identity.operationId);
+  bool held = true;
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, key, held));
+  EXPECT_FALSE(held);
   uint64_t attempt = 999;
   ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(folder, key, normal.operation,
                                           Nothing(), attempt));

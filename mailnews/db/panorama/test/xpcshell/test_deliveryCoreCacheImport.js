@@ -372,8 +372,12 @@ add_task(function test_v2RejectsChangedProofAndPublicInsertion() {
     assertCacheRefusal(invalid, expected);
   }
   const id = folderDB.insertFolder(imapRoot.id, "public-cache-unknown");
+  let actual;
   try {
-    const actual = folderDB.getMsgFolderForFolder(id);
+    actual = imapRoot.addSubfolder("public-cache-unknown");
+    Assert.ok(actual, "Public attachment provides the actual folder facade");
+    Assert.equal(actual.id, id, "Public attachment retains the inserted row");
+    Assert.strictEqual(folderDB.getMsgFolderForFolder(id), actual);
     Assert.strictEqual(
       scalar(
         `SELECT value FROM folder_properties WHERE id=${id} AND name='${ORIGIN_PROPERTY}'`
@@ -395,6 +399,9 @@ add_task(function test_v2RejectsChangedProofAndPublicInsertion() {
     );
     assertCacheRefusal(invalid, Cr.NS_ERROR_NOT_AVAILABLE);
   } finally {
+    if (actual) {
+      imapRoot.propagateDelete(actual, false);
+    }
     folderDB.deleteFolder(id);
   }
 });

@@ -54,6 +54,7 @@ const skipOnWindows = () => AppConstants.platform == "win";
 let lock;
 let work;
 let source;
+let reconciledSource;
 let backup;
 let control;
 let controlInventory;
@@ -167,6 +168,25 @@ add_setup(async function setupBackedUpProfileAndActualNativeFolders() {
     {
       mode: "create",
     }
+  );
+  // Version1 permanently binds its original cache source and path. Give the
+  // independent version2 destination family its own real backed-up input.
+  reconciledSource = PathUtils.join(
+    profile.path,
+    "cache-v2-input",
+    "panacea.dat"
+  );
+  await IOUtils.makeDirectory(PathUtils.parent(reconciledSource));
+  await IOUtils.write(
+    reconciledSource,
+    await IOUtils.read(do_get_file(CACHE_FILE).path),
+    { mode: "create" }
+  );
+  Assert.notEqual(reconciledSource, source);
+  Assert.deepEqual(
+    await IOUtils.read(reconciledSource),
+    await IOUtils.read(source),
+    "Both independent inputs retain the exact saved cache bytes"
   );
   Assert.ok(
     !(await IOUtils.exists(PathUtils.join(profile.path, "panorama.sqlite")))
@@ -668,7 +688,7 @@ add_task(
 );
 
 /**
- * Plans one complete cache family without importing metadata.
+ * Plans one independent backed-up cache input without importing metadata.
  *
  * @param {number} [version=1] - Original provenance or reconciled request version.
  * @param {Map<string, object>} [mapping=bindings] - Complete actual native family.
@@ -676,20 +696,22 @@ add_task(
  */
 async function plannedCache(version = 1, mapping = bindings) {
   const input = await cacheInput();
+  const inputPath = version == 2 ? reconciledSource : source;
+  const cacheId = version == 2 ? "panacea-v2" : "panacea";
   const snapshot = await prepareMorkFolderCacheImport(
     input.journal,
     database,
     lock,
-    source,
+    inputPath,
     mapping,
     version
   );
-  const token = await input.journal.planCacheImport("panacea", snapshot);
+  const token = await input.journal.planCacheImport(cacheId, snapshot);
   Assert.equal(input.journal.state.version, 5);
   Assert.equal(input.journal.state.caches[0].token, token);
   const revision = input.journal.state.revision;
   snapshot.folders.reverse();
-  Assert.equal(await input.journal.planCacheImport("panacea", snapshot), token);
+  Assert.equal(await input.journal.planCacheImport(cacheId, snapshot), token);
   Assert.equal(
     input.journal.state.revision,
     revision,
@@ -1043,6 +1065,13 @@ add_task(
   async function test_selectedCacheV2RejectsChangedProof() {
     reconciledInput = await plannedCache(2, reconciledBindings);
     const cache = reconciledInput.journal.state.caches[0];
+    Assert.equal(cache.id, "panacea-v2");
+    Assert.equal(cache.path, reconciledSource);
+    Assert.notEqual(cache.path, source);
+    Assert.deepEqual(
+      await IOUtils.read(cache.path),
+      await IOUtils.read(do_get_file(CACHE_FILE).path)
+    );
     const request = createMorkFolderCacheRequest(cache);
     Assert.equal(request.version, 2);
     Assert.deepEqual(request.proof, {
@@ -1153,7 +1182,7 @@ add_task(
   { skip_if: skipOnWindows },
   async function test_selectedCacheV2ProjectsNativeFieldsAndColdReopens() {
     const input = reconciledInput;
-    const original = await IOUtils.read(source);
+    const original = await IOUtils.read(reconciledSource);
     const controlBody = await IOUtils.read(control.filePath.path);
     const controlSummary = await IOUtils.read(control.summaryFile.path);
     Assert.deepEqual(
@@ -1365,7 +1394,7 @@ add_task(
       controlSummary,
       "Cache metadata never changes genuine original summary bytes"
     );
-    Assert.deepEqual(await IOUtils.read(source), original);
+    Assert.deepEqual(await IOUtils.read(reconciledSource), original);
     Assert.deepEqual(
       await IOUtils.read(do_get_file(CACHE_FILE).path),
       original

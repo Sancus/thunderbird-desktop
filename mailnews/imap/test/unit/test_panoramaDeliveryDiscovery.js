@@ -641,7 +641,7 @@ async function test_repeatedDiscoveryPreservesIdentity() {
       },
       QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
     };
-    MailServices.mailSession.addFolderListener(
+    MailServices.mailSession.AddFolderListener(
       listener,
       Ci.nsIFolderListener.intPropertyChanged
     );

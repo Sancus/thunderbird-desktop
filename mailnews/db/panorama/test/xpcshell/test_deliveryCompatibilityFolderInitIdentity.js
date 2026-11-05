@@ -331,18 +331,10 @@ add_task(async function test_lockedFlagsRecordIntentBeforeTheirEarlyReturn() {
   registerCleanupFunction(() =>
     MailServices.accounts.removeIncomingServer(server, false)
   );
-  server.setStringValue(
-    "storeContractID",
-    {
-      mbox: "@mozilla.org/msgstore/berkeleystore;1",
-      maildir: "@mozilla.org/msgstore/maildirstore;1",
-    }[lane.store]
-  );
-  const directory = do_get_profile();
-  directory.append("origin-locked");
-  await IOUtils.makeDirectory(directory.path);
-  server.localPath = directory;
+  // The factory already initialized the root with the lane's store and path.
+  // Retain that physical identity when creating the Inbox.
   const root = server.rootFolder.QueryInterface(Ci.nsIMsgImapMailFolder);
+  PanoramaDelivery._assertStore(root, lane);
   // kImapInbox in nsImapCore.h. This is production client metadata creation;
   // the original IM whole cohort separately qualifies real LIST/LSUB traffic.
   root.createClientSubfolderInfo("INBOX", "/", 0x4000, false);

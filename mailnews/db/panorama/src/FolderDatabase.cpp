@@ -251,11 +251,10 @@ nsresult FolderDatabase::RecordCacheClientFlagAttempt(
   MOZ_TRY(CheckCacheOriginSource(expectedSourceId));
   NS_ENSURE_TRUE(!(attemptedClientMask & ~kCacheClientMask),
                  NS_ERROR_INVALID_ARG);
-  // Sealed/reopened or already tainted captures cannot confer new adoption.
+  // Taint bars adoption, but later restrictive writes still report errors.
   // Preserve ordinary native writer behavior outside the live capture window.
   const auto& generation = DatabaseCore::sInstance->mCacheOriginGeneration;
-  if (!attemptedClientMask || generation.IsEmpty() || mCacheOriginTainted)
-    return NS_OK;
+  if (!attemptedClientMask || generation.IsEmpty()) return NS_OK;
   bool bound;
   MOZ_TRY(HasCacheImportBinding(folderId, bound));
   if (bound) return NS_OK;  // Both immutable receipt policies end new adoption.

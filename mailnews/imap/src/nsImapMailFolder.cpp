@@ -2835,6 +2835,15 @@ nsImapMailFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
   rv = (*folderInfo)->GetCharProperty("onlineName", onlineName);
   if (NS_FAILED(rv)) return rv;
 
+#ifdef MOZ_PANORAMA
+  if (mail_panorama_enabled_AtStartup()) {
+    // Native values, including an explicit empty string, are authoritative.
+    // Opening a facade must not synthesize or persist a legacy fallback.
+    m_onlineFolderName.Assign(onlineName);
+    return rv;
+  }
+#endif
+
   if (!onlineName.IsEmpty())
     m_onlineFolderName.Assign(onlineName);
   else {

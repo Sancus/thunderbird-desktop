@@ -4411,14 +4411,10 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
                   !dbCore->mCacheOriginGeneration.IsEmpty() &&
                   origin->generation == dbCore->mCacheOriginGeneration;
         if (tracked) {
-          NS_ENSURE_TRUE(
-              !folderDB.mCacheOriginTainted &&
-                  origin->birthSite ==
-                      uint32_t(localSite),
-              NS_ERROR_NOT_AVAILABLE);
-          initialUsed =
-              origin->used &
-              (1u << uint32_t(localSite));
+          NS_ENSURE_TRUE(!folderDB.mCacheOriginTainted &&
+                             origin->birthSite == uint32_t(localSite),
+                         NS_ERROR_NOT_AVAILABLE);
+          initialUsed = origin->used & (1u << uint32_t(localSite));
         }
       }
     } else {
@@ -4426,15 +4422,14 @@ NS_IMETHODIMP nsMsgDBFolder::AddSubfolder(const nsACString& name,
           nativeFolder->mFolderDatabaseSourceId, subFolderId, tracked));
     }
     if (tracked && !initialUsed) {
-      NS_ENSURE_TRUE(nativeFolder->mFlags ==
-                         MOZ_TRY(folderDB.GetFolderFlags(subFolderId)),
-                     NS_ERROR_NOT_AVAILABLE);
+      NS_ENSURE_TRUE(
+          nativeFolder->mFlags == MOZ_TRY(folderDB.GetFolderFlags(subFolderId)),
+          NS_ERROR_NOT_AVAILABLE);
       auto write = MOZ_TRY(folderDB.BeginCacheDiscoveryFlags(
-          nativeFolder->mFolderDatabaseSourceId, subFolderId,
-          localSite));
+          nativeFolder->mFolderDatabaseSourceId, subFolderId, localSite));
       MOZ_TRY(nativeFolder->ApplyInitialCacheDiscoveryFlags(
-          std::move(write), nativeFolder->mFlags | flags |
-                                nsMsgFolderFlags::Mail | defaultRole));
+          std::move(write),
+          nativeFolder->mFlags | flags | nsMsgFolderFlags::Mail | defaultRole));
     } else if (!tracked) {
       // Unknown/public and valid old/sealed rows retain ordinary behavior.
       // No refused or acquired action falls back to an ordinary setter.
@@ -5153,7 +5148,7 @@ nsresult nsMsgDBFolder::RecordCacheClientFlagAttempt(
 
 #ifdef MOZ_PANORAMA
 bool nsMsgDBFolder::IsLocalCacheDefaultRole(const nsACString& canonicalName,
-                                           uint32_t roleFlag) {
+                                            uint32_t roleFlag) {
   for (const auto& role : kLocalCacheDefaultRoles) {
     if (canonicalName.Equals(role.name) && roleFlag == role.flag) {
       return true;
@@ -5222,11 +5217,9 @@ nsresult nsMsgDBFolder::InitializeLocalCacheDefaultChild(
     tracked = live && actualName.Equals(canonicalName);
     if (tracked) {
       NS_ENSURE_TRUE(!folders.mCacheOriginTainted &&
-                         origin->birthSite ==
-                             uint32_t(localSite),
+                         origin->birthSite == uint32_t(localSite),
                      NS_ERROR_NOT_AVAILABLE);
-      if (origin->used &
-          (1u << uint32_t(localSite))) {
+      if (origin->used & (1u << uint32_t(localSite))) {
         // The first proposal already included this canonical role. A later
         // explicit zero or callback mutation must not be overwritten here.
         return NS_OK;
@@ -5240,11 +5233,10 @@ nsresult nsMsgDBFolder::InitializeLocalCacheDefaultChild(
   }
   uint32_t before = MOZ_TRY(folders.GetFolderFlags(id));
   NS_ENSURE_TRUE(nativeChild->mFlags == before, NS_ERROR_NOT_AVAILABLE);
-  auto write = MOZ_TRY(folders.BeginCacheDiscoveryFlags(
-      mFolderDatabaseSourceId, id,
-      localSite));
+  auto write = MOZ_TRY(
+      folders.BeginCacheDiscoveryFlags(mFolderDatabaseSourceId, id, localSite));
   return nativeChild->ApplyInitialCacheDiscoveryFlags(std::move(write),
-                                                     before | roleFlag);
+                                                      before | roleFlag);
 }
 
 nsresult nsMsgDBFolder::InitializeLocalCacheDefaultChildren() {

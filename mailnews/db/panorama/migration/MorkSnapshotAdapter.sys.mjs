@@ -15,6 +15,8 @@ const MESSAGE = "ns:msg:db:row:scope:msgs:all";
 const THREAD = "ns:msg:db:row:scope:threads:all";
 const INFO = "ns:msg:db:row:scope:dbfolderinfo:all";
 const KIND = "ns:msg:db:table:kind:";
+const OFFLINE = "ns:msg:db:row:scope:ops:all";
+const PENDING = "ns:msg:db:row:scope:pending:all";
 // Named legacy getters, never the spelling of an unknown cell's value.
 const UINT32_PROPERTIES = new Set([
   "numMsgs",
@@ -70,6 +72,32 @@ export function convertMorkFolderSnapshot(
   source,
   databaseSourceId,
   folderFlags
+) {
+  return convertMorkSnapshot(
+    input,
+    source,
+    databaseSourceId,
+    folderFlags,
+    false
+  );
+}
+
+/**
+ * Checks one source member before constructing a native request.
+ *
+ * @param {object} input - Complete reader snapshot.
+ * @param {object} source - Persisted source plan.
+ * @param {string} databaseSourceId - Current native incarnation.
+ * @param {number} folderFlags - Current native folder flags.
+ * @param {boolean} imap - Whether to account supported saved IMAP records.
+ * @returns {object} Checked owned request.
+ */
+function convertMorkSnapshot(
+  input,
+  source,
+  databaseSourceId,
+  folderFlags,
+  imap
 ) {
   if (
     (input.version !== 1 &&
@@ -129,7 +157,7 @@ export function convertMorkFolderSnapshot(
       throw new Error("Windows snapshot physical binding changed");
     }
   }
-  if (input.folder.protocol !== "none") {
+  if (input.folder.protocol !== (imap ? "imap" : "none")) {
     throw new Error("Unsupported Mork protocol identity/offline mapping");
   }
   const request = structuredClone(input);
@@ -137,9 +165,641 @@ export function convertMorkFolderSnapshot(
   request.databaseSourceId = databaseSourceId;
   request.recordsComplete = false;
   request.unhandledRecords = [];
-  request.folderProperties = accountRecords(request, folderFlags);
+  request.folderProperties = accountRecords(request, folderFlags, imap);
   request.recordsComplete = true;
   return request;
+}
+
+/**
+ * Converts a complete connected IMAP source unit without allocating native keys.
+ * Resolves saved counterpart identities from the source records and folder plan.
+ * The independent fixture ledger is not an input to this conversion.
+ *
+ * @param {{input: object, source: object, folderFlags: number}[]} entries -
+ *   Reader inputs and their persisted journal sources, in source-ID order.
+ * @param {string} token - Persisted whole-unit token.
+ * @param {string} databaseSourceId - Actual native database incarnation.
+ * @returns {object} Version3 unit with existing platform-bound member requests.
+ * @throws {Error} For an incomplete, ambiguous or conflicting source unit.
+ */
+export function convertMorkProtocolUnit(entries, token, databaseSourceId) {
+  if (
+    !Array.isArray(entries) ||
+    !entries.length ||
+    typeof token != "string" ||
+    !token ||
+    token.includes("\0")
+  ) {
+    throw new Error("Invalid Mork protocol import unit");
+  }
+  const folders = entries.map(({ input, source, folderFlags }) => {
+    if (source.protocol !== "imap") {
+      throw new Error("Mork protocol source is not in the retained IMAP plan");
+    }
+    const request = convertMorkSnapshot(
+      input,
+      source,
+      databaseSourceId,
+      folderFlags,
+      true
+    );
+    request.imap.originalFolderURI =
+      source.originalFolderURI ?? input.folder.uri;
+    return request;
+  });
+  const sources = new Set();
+  const destinations = new Set();
+  const uris = new Map();
+  for (const folder of folders) {
+    const uri = folder.imap.originalFolderURI;
+    if (
+      sources.has(folder.sourceId) ||
+      destinations.has(folder.folder.id) ||
+      typeof uri != "string" ||
+      !uri ||
+      uri.includes("\0") ||
+      uris.has(uri)
+    ) {
+      throw new Error("Duplicate or invalid Mork protocol folder identity");
+    }
+    sources.add(folder.sourceId);
+    destinations.add(folder.folder.id);
+    uris.set(uri, folder);
+  }
+  const keyOf = (folder, key) => {
+    if (
+      !isKey(key) ||
+      (!folder.source.messageKeys.includes(key) &&
+        !folder.imap.operations.some(op => op.sourceKey === key))
+    ) {
+      throw new Error("Missing Mork protocol physical counterpart");
+    }
+    return { sourceId: folder.sourceId, key };
+  };
+  for (const folder of folders) {
+    for (const operation of folder.imap.operations) {
+      const payload = operation.payload;
+      if (Object.hasOwn(payload, "sourceFolderURI")) {
+        const origin = uris.get(payload.sourceFolderURI);
+        if (!origin || !Object.hasOwn(payload, "sourceMessageKey")) {
+          throw new Error("Unresolved Mork offline source folder/key");
+        }
+        operation.source = keyOf(origin, payload.sourceMessageKey);
+        const uid = origin.imap.serverUids.find(
+          entry => entry.sourceKey === payload.sourceMessageKey
+        );
+        if (Object.hasOwn(payload, "sourceUid") && payload.sourceUid) {
+          if (uid && uid.uid !== payload.sourceUid) {
+            throw new Error("Conflicting Mork offline source UID");
+          }
+          if (!uid) {
+            if (
+              !origin.imap.uidValidity.present ||
+              !origin.imap.uidValidity.value
+            ) {
+              throw new Error("Mork offline source UID has no captured epoch");
+            }
+            origin.imap.serverUids.push({
+              sourceKey: payload.sourceMessageKey,
+              uid: payload.sourceUid,
+            });
+          }
+        }
+      }
+      if (operation.source) {
+        const origin = uris.get(payload.sourceFolderURI);
+        const originating = origin.imap.operations.find(
+          value => value.sourceKey === payload.sourceMessageKey
+        );
+        if (
+          !originating ||
+          !(
+            originating.payload.operation &
+            (Ci.nsIMsgOfflineImapOperation.kMsgCopy |
+              Ci.nsIMsgOfflineImapOperation.kMsgMoved)
+          ) ||
+          !(
+            originating.payload.copyDestinations?.includes(
+              folder.imap.originalFolderURI
+            ) ||
+            originating.payload.destinationFolderURI ===
+              folder.imap.originalFolderURI
+          )
+        ) {
+          throw new Error("Unresolved Mork offline counterpart operation");
+        }
+      }
+      if (
+        payload.operation & Ci.nsIMsgOfflineImapOperation.kMoveResult &&
+        !operation.source
+      ) {
+        throw new Error(
+          "Ambiguous Mork offline result has no captured source operation"
+        );
+      }
+      if (
+        payload.operation &
+          (Ci.nsIMsgOfflineImapOperation.kMsgMoved |
+            Ci.nsIMsgOfflineImapOperation.kAppendDraft |
+            Ci.nsIMsgOfflineImapOperation.kAppendTemplate) &&
+        !payload.destinationFolderURI
+      ) {
+        throw new Error("Mork pending operation has no captured destination");
+      }
+      const findCounterpart = uri => {
+        const destination = uris.get(uri);
+        if (!destination) {
+          throw new Error("Unresolved Mork offline destination folder");
+        }
+        const candidates = destination.imap.operations.filter(
+          candidate =>
+            candidate.payload.sourceFolderURI ===
+              folder.imap.originalFolderURI &&
+            candidate.payload.sourceMessageKey === operation.sourceKey
+        );
+        if (candidates.length !== 1) {
+          throw new Error("Ambiguous Mork offline physical counterpart");
+        }
+        return keyOf(destination, candidates[0].sourceKey);
+      };
+      if (payload.operation & Ci.nsIMsgOfflineImapOperation.kMsgCopy) {
+        const copies = payload.copyDestinations;
+        if (!copies?.length || new Set(copies).size !== copies.length) {
+          throw new Error("Ambiguous Mork ordered COPY counterparts");
+        }
+        operation.copies = copies.map((uri, ordinal) => ({
+          ...findCounterpart(uri),
+          ordinal,
+        }));
+      } else if (payload.copyDestinations?.length) {
+        throw new Error(
+          "Mork COPY destinations have no pending COPY operation"
+        );
+      }
+      if (Object.hasOwn(payload, "destinationFolderURI")) {
+        if (
+          payload.operation &
+          (Ci.nsIMsgOfflineImapOperation.kAppendDraft |
+            Ci.nsIMsgOfflineImapOperation.kAppendTemplate)
+        ) {
+          if (payload.destinationFolderURI !== folder.imap.originalFolderURI) {
+            throw new Error("Mork queued APPEND has an unresolved body owner");
+          }
+          operation.destination = keyOf(folder, operation.sourceKey);
+        } else if (
+          payload.operation & Ci.nsIMsgOfflineImapOperation.kMsgMoved
+        ) {
+          operation.destination = findCounterpart(payload.destinationFolderURI);
+        } else if (
+          payload.operation & Ci.nsIMsgOfflineImapOperation.kMoveResult &&
+          operation.source &&
+          payload.destinationFolderURI === folder.imap.originalFolderURI
+        ) {
+          operation.destination = keyOf(folder, operation.sourceKey);
+        } else {
+          throw new Error("Unresolved Mork offline destination state");
+        }
+      }
+    }
+  }
+  for (const folder of folders) {
+    for (const op of folder.imap.operations) {
+      if (
+        op.payload.operation &
+          (Ci.nsIMsgOfflineImapOperation.kFlagsChanged |
+            Ci.nsIMsgOfflineImapOperation.kMsgMoved |
+            Ci.nsIMsgOfflineImapOperation.kMsgCopy |
+            Ci.nsIMsgOfflineImapOperation.kDeletedMsg |
+            Ci.nsIMsgOfflineImapOperation.kMsgMarkedDeleted |
+            Ci.nsIMsgOfflineImapOperation.kAddKeywords |
+            Ci.nsIMsgOfflineImapOperation.kRemoveKeywords) &&
+        !(
+          op.payload.operation &
+          (Ci.nsIMsgOfflineImapOperation.kAppendDraft |
+            Ci.nsIMsgOfflineImapOperation.kAppendTemplate |
+            Ci.nsIMsgOfflineImapOperation.kMoveResult |
+            Ci.nsIMsgOfflineImapOperation.kAddedHeader)
+        ) &&
+        !folder.imap.serverUids.some(entry => entry.sourceKey === op.sourceKey)
+      ) {
+        throw new Error("Unresolved Mork offline server UID");
+      }
+    }
+    const seen = new Set();
+    for (const entry of folder.imap.serverUids) {
+      if (seen.has(entry.uid)) {
+        throw new Error("Duplicate Mork folder-scoped server UID");
+      }
+      seen.add(entry.uid);
+    }
+    folder.imap.serverUids.sort((a, b) => a.sourceKey - b.sourceKey);
+  }
+  return { version: 3, token, databaseSourceId, protocol: "imap", folders };
+}
+
+/**
+ * Copies the source identities and typed protocol intent for a journal checkpoint.
+ * Raw rows and headers remain in their immutable source files and native request.
+ *
+ * @param {object} request - Complete converted version3 request.
+ * @returns {object} Independent intent, without duplicated raw source contents.
+ * @throws {Error} For a missing protocol unit identity.
+ */
+export function getMorkProtocolUnitIntent(request) {
+  if (
+    request?.version !== 3 ||
+    request.protocol !== "imap" ||
+    typeof request.token != "string" ||
+    !request.token ||
+    request.token.includes("\0") ||
+    typeof request.databaseSourceId != "string" ||
+    !request.databaseSourceId ||
+    request.databaseSourceId.includes("\0") ||
+    !Array.isArray(request.folders) ||
+    !request.folders.length
+  ) {
+    throw new Error("Invalid Mork protocol unit intent");
+  }
+  return {
+    version: 3,
+    token: request.token,
+    databaseSourceId: request.databaseSourceId,
+    protocol: "imap",
+    folders: request.folders.map(folder => ({
+      version: folder.version,
+      token: folder.token,
+      sourceId: folder.sourceId,
+      databaseSourceId: folder.databaseSourceId,
+      folder: structuredClone(folder.folder),
+      source: structuredClone(folder.source),
+      ...(Object.hasOwn(folder, "windowsAdmission")
+        ? { windowsAdmission: structuredClone(folder.windowsAdmission) }
+        : {}),
+      imap: structuredClone(folder.imap),
+    })),
+  };
+}
+
+/**
+ * Checks a committed unit's complete message, UID and offline-operation maps.
+ * Uses receipt provenance after an operation has legitimately left the live queue.
+ * Does not allocate keys or infer a counterpart from allocation order.
+ *
+ * @param {object} request - Converted unit or its retained journal intent.
+ * @param {object} receipt - Actual native committed version3 receipt.
+ * @returns {object} Independent canonical receipt with all checked protocol data.
+ * @throws {Error} For changed identity, incomplete maps or conflicting payload.
+ */
+export function validateMorkProtocolUnitReceipt(request, receipt) {
+  const intent = getMorkProtocolUnitIntent(request);
+  if (
+    receipt?.version !== 3 ||
+    receipt.protocol !== "imap" ||
+    receipt.token !== intent.token ||
+    receipt.databaseSourceId !== intent.databaseSourceId ||
+    !Array.isArray(receipt.folders) ||
+    receipt.folders.length !== intent.folders.length
+  ) {
+    throw new Error("Invalid native Mork protocol unit receipt");
+  }
+  const maps = new Map();
+  const allocated = new Set();
+  const folders = intent.folders.map((member, index) => {
+    const native = receipt.folders[index];
+    const checked = validateMorkFolderReceipt(member, native);
+    if (
+      maps.has(member.sourceId) ||
+      native.imap?.version !== 1 ||
+      native.imap.originalFolderURI !== member.imap.originalFolderURI ||
+      !sameProtocolValue(native.imap.uidValidity, member.imap.uidValidity) ||
+      !Array.isArray(native.imap.operationKeys)
+    ) {
+      throw new Error("Invalid native Mork protocol member receipt");
+    }
+    const map = new Map(checked.keys);
+    for (const key of map.values()) {
+      if (allocated.has(key)) {
+        throw new Error("Mork unit reused a global physical key");
+      }
+      allocated.add(key);
+    }
+    const missing = new Set(
+      member.imap.operations
+        .map(op => op.sourceKey)
+        .filter(key => !map.has(key))
+    );
+    if (native.imap.operationKeys.length !== missing.size) {
+      throw new Error("Incomplete Mork operation-only key map");
+    }
+    const operationKeys = native.imap.operationKeys
+      .map(pair => {
+        if (
+          !Array.isArray(pair) ||
+          pair.length !== 2 ||
+          !missing.delete(pair[0]) ||
+          !isKey(pair[1], false) ||
+          allocated.has(pair[1])
+        ) {
+          throw new Error("Invalid Mork operation-only physical key");
+        }
+        map.set(pair[0], pair[1]);
+        allocated.add(pair[1]);
+        return [...pair];
+      })
+      .sort((a, b) => a[0] - b[0]);
+    maps.set(member.sourceId, map);
+    return {
+      ...checked,
+      imap: {
+        version: 1,
+        originalFolderURI: member.imap.originalFolderURI,
+        uidValidity: structuredClone(member.imap.uidValidity),
+        serverUids: [],
+        operationKeys,
+        operations: [],
+      },
+    };
+  });
+  const mapped = binding => {
+    const key = maps.get(binding.sourceId)?.get(binding.key);
+    if (key === undefined) {
+      throw new Error("Native Mork receipt lost a physical counterpart");
+    }
+    return {
+      sourceId: binding.sourceId,
+      key,
+      ...(Object.hasOwn(binding, "ordinal")
+        ? { ordinal: binding.ordinal }
+        : {}),
+    };
+  };
+  const operationIds = new Set();
+  for (let index = 0; index < intent.folders.length; index++) {
+    const member = intent.folders[index];
+    const native = receipt.folders[index].imap;
+    const checked = folders[index].imap;
+    const map = maps.get(member.sourceId);
+    if (
+      !Array.isArray(native.serverUids) ||
+      native.serverUids.length !== member.imap.serverUids.length ||
+      !Array.isArray(native.operations) ||
+      native.operations.length !== member.imap.operations.length
+    ) {
+      throw new Error("Incomplete native Mork UID/operation receipt");
+    }
+    checked.serverUids = member.imap.serverUids.map((binding, ordinal) => {
+      const expected = { ...binding, key: map.get(binding.sourceKey) };
+      if (
+        expected.key === undefined ||
+        !sameProtocolValue(native.serverUids[ordinal], expected)
+      ) {
+        throw new Error("Native Mork UID binding changed");
+      }
+      return expected;
+    });
+    checked.operations = member.imap.operations.map((operation, ordinal) => {
+      const actual = native.operations[ordinal];
+      const key = map.get(operation.sourceKey);
+      if (
+        !actual ||
+        actual.sourceKey !== operation.sourceKey ||
+        actual.key !== key ||
+        key === undefined ||
+        !Number.isSafeInteger(actual.id) ||
+        actual.id < 1 ||
+        operationIds.has(actual.id) ||
+        !Number.isSafeInteger(actual.revision) ||
+        actual.revision < 1 ||
+        !sameProtocolValue(actual.payload, operation.payload)
+      ) {
+        throw new Error("Native Mork offline payload/revision changed");
+      }
+      operationIds.add(actual.id);
+      const result = {
+        sourceKey: operation.sourceKey,
+        key,
+        id: actual.id,
+        revision: actual.revision,
+        payload: structuredClone(operation.payload),
+      };
+      for (const name of ["source", "destination", "copies"]) {
+        if (Object.hasOwn(actual, name) !== Object.hasOwn(operation, name)) {
+          throw new Error("Native Mork counterpart presence changed");
+        }
+        if (Object.hasOwn(operation, name)) {
+          const expected =
+            name === "copies"
+              ? operation.copies.map(mapped)
+              : mapped(operation[name]);
+          if (!sameProtocolValue(actual[name], expected)) {
+            throw new Error("Native Mork physical counterpart/order changed");
+          }
+          result[name] = expected;
+        }
+      }
+      return result;
+    });
+  }
+  return {
+    version: 3,
+    token: intent.token,
+    databaseSourceId: intent.databaseSourceId,
+    protocol: "imap",
+    folders,
+  };
+}
+
+/**
+ * Compares typed JSON records, preserving property presence and array order.
+ *
+ * @param {unknown} left - Actual protocol value.
+ * @param {unknown} right - Expected saved protocol value.
+ * @returns {boolean} Whether both values have the same complete structure.
+ */
+function sameProtocolValue(left, right) {
+  if (left === right) {
+    return true;
+  }
+  if (
+    !left ||
+    !right ||
+    typeof left !== "object" ||
+    typeof right !== "object"
+  ) {
+    return false;
+  }
+  if (
+    Array.isArray(left) !== Array.isArray(right) ||
+    (Array.isArray(left) && left.length !== right.length)
+  ) {
+    return false;
+  }
+  const keys = Object.keys(right);
+  return (
+    Object.keys(left).length === keys.length &&
+    keys.every(
+      key =>
+        Object.hasOwn(left, key) && sameProtocolValue(left[key], right[key])
+    )
+  );
+}
+
+/**
+ * Accounts the saved IMAP epoch, UID representation and full offline-op table.
+ *
+ * @param {object} request - Owned complete source member.
+ * @param {Map<string,string>} info - Exact folder-info cells.
+ * @param {object|undefined} table - Original offline table, if present.
+ * @param {Map<string,object>} rows - All original scoped rows.
+ * @returns {object} Version1 typed IMAP section with exact field presence.
+ * @throws {Error} For unsupported or possibly dispatched source state.
+ */
+function accountImapRecords(request, info, table, rows) {
+  const uidValidity = info.has("UIDValidity")
+    ? { present: true, value: hex(info.get("UIDValidity")) }
+    : { present: false };
+  const numeric = new Map([
+    ["opFlags", "flagOperation"],
+    ["newFlags", "newFlags"],
+    ["srcMsgKey", "sourceMessageKey"],
+    ["srcUid", "sourceUid"],
+    ["msgSize", "messageSize"],
+  ]);
+  const text = new Map([
+    ["srcFolderURI", "sourceFolderURI"],
+    ["moveDest", "destinationFolderURI"],
+    ["addedKeywords", "keywordsToAdd"],
+    ["removedKeywords", "keywordsToRemove"],
+  ]);
+  const allowed = new Set([
+    "op",
+    "msgKey",
+    "copyDests",
+    "numCopyDests",
+    "inPlayback",
+    ...numeric.keys(),
+    ...text.keys(),
+  ]);
+  const operations = (table?.rows ?? []).map(key => {
+    const row = rows.get(key);
+    if (!row || row.scope !== OFFLINE || rowKey(row) !== key) {
+      throw new Error("Invalid Mork offline table membership");
+    }
+    const original = row.cells;
+    if ([...original.keys()].some(name => !allowed.has(name))) {
+      throw new Error("Unsupported Mork offline property");
+    }
+    const sourceKey = hex(original.get("msgKey"));
+    const operation = hex(original.get("op"));
+    if (
+      sourceKey !== row.id ||
+      !isKey(sourceKey) ||
+      !operation ||
+      operation & ~0xfff
+    ) {
+      throw new Error("Invalid Mork offline operation identity/word");
+    }
+    const payload = { operation };
+    for (const [column, field] of numeric) {
+      if (original.has(column)) {
+        payload[field] = hex(original.get(column));
+      }
+    }
+    for (const [column, field] of text) {
+      if (original.has(column)) {
+        payload[field] = decode(original.get(column));
+        if (payload[field].includes("\0")) {
+          throw new Error("Invalid Mork offline text");
+        }
+      }
+    }
+    if (original.has("inPlayback")) {
+      const value = hex(original.get("inPlayback"));
+      if (value > 1) {
+        throw new Error("Invalid Mork offline playback state");
+      }
+      payload.playingBack = value === 1;
+    }
+    if (payload.playingBack) {
+      throw new Error(
+        "Ambiguous Mork offline operation may have been dispatched"
+      );
+    }
+    if (original.has("copyDests")) {
+      const value = decode(original.get("copyDests"));
+      payload.copyDestinations = value ? value.split("\u0001") : [];
+      if (payload.copyDestinations.some(uri => !uri || uri.includes("\0"))) {
+        throw new Error("Invalid Mork ordered COPY destination");
+      }
+    }
+    if (original.has("numCopyDests")) {
+      const count = hex(original.get("numCopyDests"));
+      if (count !== (payload.copyDestinations?.length ?? 0)) {
+        throw new Error("Mork COPY destination count differs from source");
+      }
+      payload.copyDestinationCount = count;
+    }
+    return { sourceKey, scope: OFFLINE, rowId: row.id, payload };
+  });
+  const serverUids = [];
+  for (const message of request.messages) {
+    const row = rows.get(message.sourceKey + ":" + MESSAGE);
+    const op = operations.find(value => value.sourceKey === message.sourceKey);
+    const pseudo = hex(row.cells.get("pseudoHdr") ?? "0");
+    const pending =
+      op &&
+      op.payload.operation &
+        (Ci.nsIMsgOfflineImapOperation.kMoveResult |
+          Ci.nsIMsgOfflineImapOperation.kAppendDraft |
+          Ci.nsIMsgOfflineImapOperation.kAppendTemplate |
+          Ci.nsIMsgOfflineImapOperation.kAddedHeader);
+    let uid;
+    if (row.cells.has("uidOnServer")) {
+      uid = hex(row.cells.get("uidOnServer"));
+      if (!uid || pending || pseudo) {
+        throw new Error("Conflicting Mork pending/confirmed UID state");
+      }
+    } else if (!pending && !pseudo) {
+      // The retained classic IMAP header producer sets MessageKey to its UID.
+      // Native captures carry uidOnServer explicitly instead.
+      uid = message.sourceKey;
+    } else if (!op) {
+      throw new Error("Mork pseudo header has no retained offline operation");
+    }
+    if (uid !== undefined) {
+      if (
+        !uid ||
+        !Number.isInteger(uid) ||
+        uid > 0xffffffff ||
+        !uidValidity.present ||
+        !uidValidity.value
+      ) {
+        throw new Error("Mork server UID has no valid captured folder epoch");
+      }
+      serverUids.push({ sourceKey: message.sourceKey, uid });
+    }
+    if (
+      pending &&
+      (!Object.hasOwn(message.header, "storeToken") ||
+        !message.header.storeToken ||
+        !(message.header.flags & Ci.nsMsgMessageFlags.Offline))
+    ) {
+      throw new Error("Mork pending message has no captured finished body");
+    }
+  }
+  for (const op of operations) {
+    if (
+      !request.source.messageKeys.includes(op.sourceKey) &&
+      !Object.hasOwn(op.payload, "sourceFolderURI") &&
+      op.payload.sourceUid
+    ) {
+      if (!uidValidity.present || !uidValidity.value) {
+        throw new Error("Mork operation-only UID has no captured epoch");
+      }
+      serverUids.push({ sourceKey: op.sourceKey, uid: op.payload.sourceUid });
+    }
+  }
+  return { version: 1, uidValidity, serverUids, operations };
 }
 
 /**
@@ -294,15 +954,89 @@ export function validateMorkFolderReceipt(request, receipt) {
 }
 
 /**
+ * Classifies supported table shapes and rejects duplicates or unknown tables.
+ *
+ * @param {Map<string, object>} tables - Tables with checked parameter cells.
+ * @param {boolean} imap - Accept the saved offline and empty pending tables.
+ * @returns {{messageTable: object|undefined, infoTable: object|undefined,
+ *   allThreads: object|undefined, offlineTable: object|undefined,
+ *   threadTables: Map<number, object>}} The selected tables and thread ID map.
+ * @throws {Error} If a table has an unsupported or duplicate shape.
+ */
+function classifyRecordTables(tables, imap) {
+  let messageTable;
+  let infoTable;
+  let allThreads;
+  let offlineTable;
+  let pendingTable;
+  const threadTables = new Map();
+  for (const [key, table] of tables) {
+    const kind = table.cells.get("k");
+    if (
+      table.scope == MESSAGE &&
+      kind == KIND + "msgs" &&
+      !messageTable &&
+      table.metaRow === null
+    ) {
+      messageTable = table;
+    } else if (
+      table.scope == MESSAGE &&
+      kind == KIND + "thread" &&
+      !threadTables.has(table.id)
+    ) {
+      threadTables.set(table.id, table);
+    } else if (
+      table.scope == INFO &&
+      kind == KIND + "dbfolderinfo" &&
+      !infoTable &&
+      table.metaRow === null
+    ) {
+      infoTable = table;
+    } else if (
+      table.scope == THREAD &&
+      kind == KIND + "allthreads" &&
+      !allThreads &&
+      table.metaRow === null
+    ) {
+      allThreads = table;
+    } else if (
+      imap &&
+      table.scope == OFFLINE &&
+      kind == KIND + "ops" &&
+      !offlineTable &&
+      table.metaRow === null
+    ) {
+      offlineTable = table;
+    } else if (
+      imap &&
+      table.scope == PENDING &&
+      table.id === 1 &&
+      kind == KIND + "pending" &&
+      !pendingTable &&
+      table.metaRow === null &&
+      table.rows.length === 0
+    ) {
+      // Adding an IMAP header creates this pending-attributes table even when
+      // no pending attributes exist. Nonempty pending state stays unsupported.
+      pendingTable = table;
+    } else {
+      throw new Error("Unsupported Mork structural/offline table: " + key);
+    }
+  }
+  return { messageTable, infoTable, allThreads, offlineTable, threadTables };
+}
+
+/**
  * Verifies all message, thread/cache and folder-info records against converted
- * messages. Unknown rows/tables, offline operations and nonzero thread state
- * cannot be represented by this receiver and reject before its first call.
+ * messages. The IMAP unit additionally accounts the saved offline table.
+ * Rejects unknown structure and unsupported thread state before native calls.
  *
  * @param {object} request - Owned cloned source input.
  * @param {number} folderFlags - Current folder flags; mismatches need native support.
+ * @param {boolean} [imap=false] - Account the typed saved IMAP operation section.
  * @returns {object[]} Exact text properties with explicit known numeric views.
  */
-function accountRecords(request, folderFlags) {
+function accountRecords(request, folderFlags, imap = false) {
   const rows = new Map();
   for (const row of request.records.rows) {
     const key = rowKey(row);
@@ -350,43 +1084,8 @@ function accountRecords(request, folderFlags) {
   if (!sameKeys([...messages.keys()], request.source.messageKeys)) {
     throw new Error("Incomplete Mork physical source key set");
   }
-  let messageTable;
-  let infoTable;
-  let allThreads;
-  const threadTables = new Map();
-  for (const [key, table] of tables) {
-    const kind = table.cells.get("k");
-    if (
-      table.scope == MESSAGE &&
-      kind == KIND + "msgs" &&
-      !messageTable &&
-      table.metaRow === null
-    ) {
-      messageTable = table;
-    } else if (
-      table.scope == MESSAGE &&
-      kind == KIND + "thread" &&
-      !threadTables.has(table.id)
-    ) {
-      threadTables.set(table.id, table);
-    } else if (
-      table.scope == INFO &&
-      kind == KIND + "dbfolderinfo" &&
-      !infoTable &&
-      table.metaRow === null
-    ) {
-      infoTable = table;
-    } else if (
-      table.scope == THREAD &&
-      kind == KIND + "allthreads" &&
-      !allThreads &&
-      table.metaRow === null
-    ) {
-      allThreads = table;
-    } else {
-      throw new Error("Unsupported Mork structural/offline table: " + key);
-    }
-  }
+  const { messageTable, infoTable, allThreads, offlineTable, threadTables } =
+    classifyRecordTables(tables, imap);
   if (
     !messageTable ||
     !infoTable ||
@@ -421,10 +1120,26 @@ function accountRecords(request, folderFlags) {
       throw new Error("Mork semantic thread map differs from source");
     }
   }
+  const retiredThreads = new Set();
   for (const [id, table] of threadTables) {
     const members = grouped.get(id) ?? [];
+    if (!members.length) {
+      const operationKey = id + ":" + OFFLINE;
+      const operation = rows.get(operationKey);
+      const retired =
+        imap &&
+        offlineTable?.rows.includes(operationKey) &&
+        operation &&
+        hex(operation.cells.get("op")) &
+          (Ci.nsIMsgOfflineImapOperation.kMsgMoved |
+            Ci.nsIMsgOfflineImapOperation.kDeletedMsg |
+            Ci.nsIMsgOfflineImapOperation.kMsgMarkedDeleted);
+      if (!retired) {
+        throw new Error("Unsupported empty or inconsistent Mork thread table");
+      }
+      retiredThreads.add(id);
+    }
     if (
-      !members.length ||
       !sameKeys(
         table.rows,
         members.map(key => key + ":" + MESSAGE)
@@ -433,11 +1148,14 @@ function accountRecords(request, folderFlags) {
       throw new Error("Unsupported empty or inconsistent Mork thread table");
     }
     const meta = rows.get(table.metaRow);
-    checkMeta(meta, id, members, messages);
+    checkMeta(meta, id, members, messages, imap);
     remaining.delete(table.metaRow);
     grouped.delete(id);
   }
-  if (grouped.size || allThreads.rows.length != threadTables.size) {
+  if (
+    grouped.size ||
+    allThreads.rows.length != threadTables.size - retiredThreads.size
+  ) {
     throw new Error("Missing Mork thread membership/index");
   }
   for (const key of allThreads.rows) {
@@ -449,6 +1167,7 @@ function accountRecords(request, folderFlags) {
       !row ||
       row.scope != THREAD ||
       !table ||
+      retiredThreads.has(row.id) ||
       row.cells.size != 1 ||
       row.cells.get("threadSubject") != subject
     ) {
@@ -464,7 +1183,7 @@ function accountRecords(request, folderFlags) {
   if (!info || info.scope != INFO || info.id != 1) {
     throw new Error("Invalid Mork folder-info row");
   }
-  const properties = folderProperties(info.cells, folderFlags);
+  const properties = folderProperties(info.cells, folderFlags, imap);
   for (const [name, expected] of [
     ["numMsgs", messages.size],
     [
@@ -479,9 +1198,36 @@ function accountRecords(request, folderFlags) {
     }
   }
   remaining.delete(infoKey);
+  if (imap) {
+    request.imap = accountImapRecords(request, info.cells, offlineTable, rows);
+    for (const operation of request.imap.operations) {
+      remaining.delete(operation.sourceKey + ":" + OFFLINE);
+      const retired = operation.sourceKey + ":" + MESSAGE;
+      if (
+        !messages.has(operation.sourceKey) &&
+        operation.payload.operation &
+          (Ci.nsIMsgOfflineImapOperation.kMsgMoved |
+            Ci.nsIMsgOfflineImapOperation.kDeletedMsg |
+            Ci.nsIMsgOfflineImapOperation.kMsgMarkedDeleted)
+      ) {
+        remaining.delete(retired);
+      }
+    }
+  }
   // Detached empty metadata has no live thread membership. Reject any state.
   for (const key of remaining) {
     const row = rows.get(key);
+    if (
+      imap &&
+      row.scope == THREAD &&
+      retiredThreads.has(row.id) &&
+      row.cells.size === 1 &&
+      row.cells.has("threadSubject")
+    ) {
+      // A removed source can leave its inactive subject index outside the live
+      // all-threads table. Its zero-member metadata was checked above.
+      continue;
+    }
     if (
       row.scope != "m" ||
       hex(row.cells.get("threadId")) != row.id ||
@@ -489,7 +1235,7 @@ function accountRecords(request, folderFlags) {
     ) {
       throw new Error("Unsupported unaccounted Mork row: " + key);
     }
-    checkMeta(row, row.id, [], messages);
+    checkMeta(row, row.id, [], messages, imap);
   }
   return properties;
 }
@@ -501,18 +1247,20 @@ function accountRecords(request, folderFlags) {
  * @param {number} id - Original thread table ID.
  * @param {number[]} members - Exact physical message keys.
  * @param {Map<number, object>} messages - Source messages by physical key.
+ * @param {boolean} [imap=false] - Honor the legacy omitted zero unread count.
  * @returns {number} Explicit original semantic root.
  */
-function checkMeta(row, id, members, messages) {
+function checkMeta(row, id, members, messages, imap = false) {
   if (
     !row ||
     row.scope != "m" ||
-    row.cells.size != META_FIELDS.size ||
+    row.cells.size !=
+      META_FIELDS.size - Number(imap && !row.cells.has("unreadChildren")) ||
     [...row.cells.keys()].some(name => !META_FIELDS.has(name)) ||
     hex(row.cells.get("threadId")) != id ||
     hex(row.cells.get("threadFlags")) != 0 ||
     hex(row.cells.get("children")) != members.length ||
-    hex(row.cells.get("unreadChildren")) !=
+    hex(row.cells.get("unreadChildren") ?? (imap ? "0" : undefined)) !=
       members.filter(
         key =>
           !(messages.get(key).message.header.flags & Ci.nsMsgMessageFlags.Read)
@@ -521,7 +1269,7 @@ function checkMeta(row, id, members, messages) {
     throw new Error("Unsupported Mork thread metadata/state");
   }
   const root = hex(row.cells.get("threadRoot"));
-  if (members.length && !members.includes(root)) {
+  if (members.length ? !members.includes(root) : imap && root !== id) {
     throw new Error("Missing Mork semantic root");
   }
   const newest = hex(row.cells.get("threadNewestMsgDate"));
@@ -542,9 +1290,10 @@ function checkMeta(row, id, members, messages) {
  *
  * @param {Map<string, string>} original - Exact original byte-string cells.
  * @param {number} flags - Actual current native folder flags.
+ * @param {boolean} [imap=false] - Retain pending counters and the offline event flag.
  * @returns {object[]} Explicit typed properties; original text also retained.
  */
-function folderProperties(original, flags) {
+function folderProperties(original, flags, imap = false) {
   return [...original].map(([bytes, value]) => {
     const name = decode(bytes);
     const text = decode(value);
@@ -573,10 +1322,15 @@ function folderProperties(original, flags) {
       }
       property.integer = Number(integer);
       if (
-        (name == "flags" && property.integer != flags) ||
-        (["totPendingMsgs", "unreadPendingMsgs", "forceReparse"].includes(
-          name
-        ) &&
+        (name == "flags" &&
+          (imap
+            ? (property.integer ^ flags) & ~Ci.nsMsgFolderFlags.OfflineEvents
+            : property.integer != flags)) ||
+        ((imap
+          ? name == "forceReparse"
+          : ["totPendingMsgs", "unreadPendingMsgs", "forceReparse"].includes(
+              name
+            )) &&
           property.integer != 0) ||
         (name == "version" && property.integer != 1)
       ) {

@@ -9237,6 +9237,14 @@ nsresult nsImapMailFolder::CopyMessagesOfflineNative(
       } else if (NS_SUCCEEDED(read)) {
         queued = std::move(current);
       }
+      if (NS_SUCCEEDED(read)) {
+        // Imported custody cannot accept a new transfer, including through a
+        // counterpart. Refuse before any draft, body copy or queue mutation.
+        bool held;
+        MOZ_TRY(
+            core->MessageDB().IsOfflineImportHeld(originId, originKey, held));
+        NS_ENSURE_FALSE(held, NS_ERROR_NOT_AVAILABLE);
+      }
       mozilla::Maybe<ServerMessageLocation> savedSource;
       nsresult saved = core->MessageDB().GetOfflineOperationSource(
           originId, originKey, savedSource);

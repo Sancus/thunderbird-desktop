@@ -4172,6 +4172,59 @@ nsresult MessageDatabase::BindStagedMessageToQueuedSource(
   return FinishOfflineWrite(connection, rv);
 }
 
+nsresult MessageDatabase::ReadOfflineImportHold(int64_t operationId,
+                                                bool& held) {
+  MOZ_TRY(RequireCurrentOwner());
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ReadOfflineImportHold"_ns,
+      "SELECT "
+      "h.databaseSourceId,h.folderId,h.messageKey,o.folderId,o.messageKey "
+      "FROM imap_import_operation_holds h LEFT JOIN offline_operations o "
+      "ON o.id=h.operationId WHERE h.operationId=:id"_ns,
+      getter_AddRefs(stmt)));
+  mozStorageStatementScoper scoper(stmt);
+  MOZ_TRY(stmt->BindInt64ByName("id"_ns, operationId));
+  bool more;
+  MOZ_TRY(stmt->ExecuteStep(&more));
+  if (more) {
+    nsCString storedSource, source;
+    MOZ_TRY(stmt->GetUTF8String(0, storedSource));
+    MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(source));
+    NS_ENSURE_TRUE(source == storedSource, NS_ERROR_NOT_AVAILABLE);
+    for (uint32_t column : {1u, 2u}) {
+      int64_t saved, actual;
+      bool missing;
+      MOZ_TRY(stmt->GetIsNull(column + 2, &missing));
+      NS_ENSURE_FALSE(missing, NS_ERROR_FILE_CORRUPTED);
+      MOZ_TRY(stmt->GetInt64(column, &saved));
+      MOZ_TRY(stmt->GetInt64(column + 2, &actual));
+      NS_ENSURE_TRUE(saved > 0 && saved == actual, NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+  held = more;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::IsOfflineImportHeld(uint64_t folderId, nsMsgKey key,
+                                              bool& held) {
+  NS_ENSURE_TRUE(
+      folderId && folderId <= INT64_MAX && key && key < nsMsgKey_None,
+      NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCurrentOwner());
+  int64_t id, revision;
+  Maybe<ServerMessageLocation> source;
+  MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source));
+  return ReadOfflineImportHold(id, held);
+}
+
+nsresult MessageDatabase::RequireOfflineImportDispatchable(
+    int64_t operationId) {
+  bool held;
+  MOZ_TRY(ReadOfflineImportHold(operationId, held));
+  return held ? NS_ERROR_NOT_AVAILABLE : NS_OK;
+}
+
 nsresult MessageDatabase::RequireOfflineOperationMutable(int64_t id) {
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
@@ -4188,6 +4241,7 @@ nsresult MessageDatabase::RequireOfflineOperationMutable(int64_t id) {
 
 nsresult MessageDatabase::RequireOfflineUndoQueued(
     int64_t id, const OfflineOperationData& operation) {
+  MOZ_TRY(RequireOfflineImportDispatchable(id));
   NS_ENSURE_FALSE(operation.playingBack, NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(DatabaseCore::GetStatement(
@@ -5423,6 +5477,81 @@ nsresult MessageDatabase::StoreOfflineOperation(
   return FinishOfflineWrite(connection, rv);
 }
 
+nsresult MessageDatabase::ImportOfflineOperationInTransaction(
+    uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
+    const Maybe<ServerMessageLocation>& source, uint64_t& operationId,
+    uint64_t& revision) {
+  MOZ_TRY(RequireCurrentOwner());
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_TRUE(active && folderId && key && key < nsMsgKey_None,
+                 NS_ERROR_INVALID_ARG);
+  NS_ENSURE_FALSE(
+      input.playingBack || input.flagMutation || input.moveSourceGuard,
+      NS_ERROR_NOT_AVAILABLE);
+  if (source) {
+    NS_ENSURE_TRUE(source->folderId == folderId && source->key == key,
+                   NS_ERROR_INVALID_ARG);
+    uint32_t epoch;
+    MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(folderId,
+                                                                     epoch));
+    NS_ENSURE_TRUE(epoch == source->epoch && epoch && source->uid,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(DatabaseCore::GetStatement(
+      "ImportOfflineOperationIdentity"_ns,
+      "INSERT INTO offline_operations(folderId,messageKey,revision,epoch,uid,"
+      "sourcePhysicalKey,operation,flagOperation,newFlags,sourceKey,sourceUid,"
+      "messageSize,playingBack,sourceFolderURI,destinationFolderURI,"
+      "keywordsToAdd,keywordsToRemove) VALUES(:folder,:key,1,:epoch,:uid,"
+      ":physical,0,0,0,4294967295,0,0,0,'','','','')"_ns,
+      getter_AddRefs(stmt)));
+  {
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+    if (source) {
+      MOZ_TRY(stmt->BindInt64ByName("epoch"_ns, source->epoch));
+      MOZ_TRY(stmt->BindInt64ByName("uid"_ns, source->uid));
+      MOZ_TRY(stmt->BindInt64ByName("physical"_ns, source->key));
+    } else {
+      MOZ_TRY(stmt->BindNullByName("epoch"_ns));
+      MOZ_TRY(stmt->BindNullByName("uid"_ns));
+      MOZ_TRY(stmt->BindNullByName("physical"_ns));
+    }
+    MOZ_TRY(stmt->Execute());
+  }
+  // Legacy words do not carry the typed replay provenance required by MOVE
+  // and flag mutation. Preserve the complete data under an atomic private hold;
+  // neither the imported UID nor a later live header can supply that authority.
+  if (input.operation & (OfflineOp::kMsgMoved | OfflineOp::kFlagsChanged)) {
+    nsCString sourceId;
+    MOZ_TRY(DatabaseCore::sInstance->ReadSourceIdForFolderAdmission(sourceId));
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "HoldImportedOfflineOperation"_ns,
+        "INSERT INTO imap_import_operation_holds(operationId,databaseSourceId,"
+        "folderId,messageKey) SELECT id,:source,folderId,messageKey "
+        "FROM offline_operations WHERE folderId=:folder AND messageKey=:key"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, sourceId));
+    MOZ_TRY(stmt->BindInt64ByName("folder"_ns, folderId));
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, key));
+    MOZ_TRY(stmt->Execute());
+  }
+  // The existing whole-payload writer retains all ordinary correspondence and
+  // mutation checks. Only the durable hold permits data without replay guards.
+  MOZ_TRY(StoreOfflineOperationInTransaction(folderId, key, input));
+  int64_t id, rev;
+  Maybe<ServerMessageLocation> captured;
+  MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, rev, captured));
+  NS_ENSURE_TRUE(id > 0 && rev > 0, NS_ERROR_FILE_CORRUPTED);
+  operationId = id;
+  revision = rev;
+  return NS_OK;
+}
+
 nsresult MessageDatabase::StoreOfflineOperationInTransaction(
     uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
     const OfflineOperationUndo* restoring, bool restoreEmptyCanceledMove,
@@ -5499,6 +5628,11 @@ nsresult MessageDatabase::StoreOfflineOperationInTransaction(
       }
     }
   }
+  bool held = false;
+  if (id) {
+    MOZ_TRY(ReadOfflineImportHold(id, held));
+  }
+  NS_ENSURE_FALSE(held && input.playingBack, NS_ERROR_NOT_AVAILABLE);
   Maybe<OfflineFlagMutation> replayFlags;
   Maybe<OfflineMoveSourceGuard> replayGuard;
   OfflineOperationData previous;
@@ -5526,7 +5660,8 @@ nsresult MessageDatabase::StoreOfflineOperationInTransaction(
   }
   NS_ENSURE_TRUE(SameMoveGuard(input.moveSourceGuard, replayGuard),
                  NS_ERROR_NOT_AVAILABLE);
-  if (!restoring && !replayGuard && (input.operation & OfflineOp::kMsgMoved) &&
+  if (!held && !restoring && !replayGuard &&
+      (input.operation & OfflineOp::kMsgMoved) &&
       !(previous.operation & OfflineOp::kMsgMoved)) {
     if (source) {
       MessageBodyState original;
@@ -5690,6 +5825,12 @@ nsresult MessageDatabase::SetOfflineOperationPlayingBack(uint64_t folderId,
                                                          nsMsgKey key,
                                                          bool playingBack) {
   MOZ_TRY(RequireCurrentOwner());
+  if (playingBack) {
+    int64_t id, revision;
+    Maybe<ServerMessageLocation> source;
+    MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source));
+    MOZ_TRY(RequireOfflineImportDispatchable(id));
+  }
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
@@ -5808,6 +5949,7 @@ nsresult MessageDatabase::BeginOfflineAttemptInternal(
     Maybe<uint32_t> folderEpoch;
     MOZ_TRY(ReadOfflineOperationIdentity(folderId, key, id, revision, source,
                                          &folderEpoch));
+    MOZ_TRY(RequireOfflineImportDispatchable(id));
     if (copyOrdinal) {
       MOZ_TRY(RequireOfflineActionDispatchable(id, revision, operation,
                                                *copyOrdinal));
@@ -6125,6 +6267,7 @@ nsresult MessageDatabase::GetOfflineAttempt(uint64_t attemptId,
   MOZ_TRY(stmt->GetInt64(2, &state));
   NS_ENSURE_TRUE(id > 0 && revision > 0 && state >= 0 && state <= 3,
                  NS_ERROR_FILE_CORRUPTED);
+  MOZ_TRY(RequireOfflineImportDispatchable(id));
   found.operationId = id;
   found.revision = revision;
   found.state = static_cast<OfflineAttemptState>(state);
@@ -6721,6 +6864,8 @@ nsresult MessageDatabase::GetCurrentOfflineAttempt(uint64_t folderId,
 nsresult MessageDatabase::ResolveOfflineAttemptNotApplied(uint64_t attemptId) {
   NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   MOZ_TRY(RequireCurrentOwner());
+  OfflineAttempt attempt;
+  MOZ_TRY(GetOfflineAttempt(attemptId, attempt));
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
@@ -6744,6 +6889,8 @@ nsresult MessageDatabase::ResolveOfflineAttemptNotApplied(uint64_t attemptId) {
 nsresult MessageDatabase::MarkOfflineAttemptAmbiguous(uint64_t attemptId) {
   NS_ENSURE_TRUE(attemptId && attemptId <= INT64_MAX, NS_ERROR_INVALID_ARG);
   MOZ_TRY(RequireCurrentOwner());
+  OfflineAttempt attempt;
+  MOZ_TRY(GetOfflineAttempt(attemptId, attempt));
   bool active;
   MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
   NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);

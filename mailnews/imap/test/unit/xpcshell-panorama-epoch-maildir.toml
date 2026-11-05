@@ -13,4 +13,6 @@ tags = ["panorama-delivery"]
 
 ["test_imapUidValidityReset.js"]
 
+["test_migrationPendingOperations.js"]
+
 ["test_panoramaDeliveryUidValidity.js"]

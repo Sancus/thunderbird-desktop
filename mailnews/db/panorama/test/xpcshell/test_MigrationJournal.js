@@ -1393,3 +1393,237 @@ add_task(async function test_committedSnapshotRetainsMappingsOnSourceRefusal() {
     journal.close();
   }
 });
+
+add_task(async function test_protocolUnitMembershipAndReceiptAreAtomic() {
+  const { plan, path } = await migrationFiles();
+  const directory = plan.mailPaths[0];
+  const secondPath = PathUtils.join(directory, "Second.msf");
+  const secondStore = PathUtils.join(directory, "Second");
+  await IOUtils.copy(plan.sources[0].path, secondPath);
+  await IOUtils.copy(PathUtils.join(directory, "Inbox"), secondStore);
+  plan.sources[0].protocol = "imap";
+  plan.sources[0].databaseSourceId = "journal-unit-without-native-target";
+  plan.sources.push({
+    ...structuredClone(plan.sources[0]),
+    id: "second-source",
+    path: secondPath,
+    destinationFolderId: 10,
+  });
+  if (AppConstants.platform == "win") {
+    const { captureMorkFolderWindowsInventory } = ChromeUtils.importESModule(
+      "resource:///modules/panorama/MorkFolderImport.sys.mjs"
+    );
+    plan.sources[1].inventory = captureMorkFolderWindowsInventory(
+      new FileUtils.File(secondPath),
+      new FileUtils.File(directory),
+      new FileUtils.File(secondStore),
+      new FileUtils.File(directory)
+    );
+  }
+  let journal = await MigrationJournal.create(path, plan);
+  registerCleanupFunction(() => journal.close());
+  Assert.equal(journal.state.version, 6);
+  await journal.recordBackup(
+    await createMigrationBackup(
+      plan.profilePath,
+      plan.mailPaths,
+      plan.backupPath
+    )
+  );
+  await Assert.rejects(
+    journal.beginImport("folder-source"),
+    error =>
+      error.message === "IMAP sources require a complete protocol import unit"
+  );
+  const ids = ["folder-source", "second-source"];
+  const token = await journal.beginImportUnit(ids);
+  Assert.ok(
+    journal.state.sources.every(source => source.token !== token),
+    "The durable unit token is distinct from every native member receipt token"
+  );
+  const intentRevision = journal.state.revision;
+  Assert.equal(await journal.beginImportUnit([...ids].reverse()), token);
+  Assert.equal(journal.state.revision, intentRevision);
+  await Assert.rejects(
+    journal.beginImportUnit(["second-source"]),
+    error => error.message === "Migration protocol unit overlaps existing work"
+  );
+  Assert.ok(
+    journal.state.sources.every(source => source.state === "importing")
+  );
+
+  // Model the committed native result to test journal checkpoint mechanics.
+  // The genuine protocol/MDB producer and native import execute in the IM test.
+  const sources = journal.state.sources;
+  const request = {
+    version: 3,
+    protocol: "imap",
+    token,
+    databaseSourceId: sources[0].databaseSourceId,
+    folders: sources.map((source, index) => {
+      let windowsAdmission;
+      let measured;
+      if (AppConstants.platform == "win") {
+        const { validateMorkFolderWindowsInventory } =
+          ChromeUtils.importESModule(
+            "resource:///modules/panorama/MorkFolderImport.sys.mjs"
+          );
+        windowsAdmission = source.inventory.windowsAdmission;
+        measured = validateMorkFolderWindowsInventory(source.inventory);
+      }
+      return {
+        version: AppConstants.platform == "win" ? 2 : 1,
+        token: source.token,
+        sourceId: source.id,
+        databaseSourceId: source.databaseSourceId,
+        folder: {
+          id: source.destinationFolderId,
+          uri: "imap://journal.invalid/" + source.id,
+          protocol: "imap",
+          summaryPath: measured?.summary.canonicalPath ?? source.path,
+          storePath:
+            measured?.store.canonicalPath ??
+            PathUtils.join(directory, index ? "Second" : "Inbox"),
+          storeType: "mbox",
+          storeExists: true,
+        },
+        source: {
+          path: source.path,
+          size: source.size,
+          sha256: source.sha256,
+          messageKeys: [...source.messageKeys],
+          ...(source.physicalIdentity
+            ? { physicalIdentity: source.physicalIdentity }
+            : {}),
+        },
+        ...(windowsAdmission ? { windowsAdmission } : {}),
+        imap: {
+          version: 1,
+          originalFolderURI: "imap://journal.invalid/" + source.id,
+          uidValidity: { present: true, value: 17 },
+          serverUids: [
+            { sourceKey: 1, uid: 11 },
+            { sourceKey: 3, uid: 13 },
+          ],
+          operations: [],
+        },
+      };
+    }),
+  };
+  const memberTokenRequest = structuredClone(request);
+  memberTokenRequest.token = request.folders[0].token;
+  const beforeBinding = await IOUtils.read(path);
+  await Assert.rejects(
+    journal.bindImportUnit(memberTokenRequest),
+    error =>
+      error.name === "Error" &&
+      error.message === "Migration protocol import unit was not started"
+  );
+  Assert.deepEqual(await IOUtils.read(path), beforeBinding);
+  await journal.bindImportUnit(request);
+  const boundRevision = journal.state.revision;
+  await journal.bindImportUnit(structuredClone(request));
+  Assert.equal(journal.state.revision, boundRevision);
+  const changedInput = structuredClone(request);
+  changedInput.folders[1].imap.uidValidity.value++;
+  await Assert.rejects(
+    journal.bindImportUnit(changedInput),
+    error => error.message === "Migration protocol input changed after intent"
+  );
+  Assert.equal(journal.state.revision, boundRevision);
+  const receipt = {
+    version: 3,
+    token,
+    databaseSourceId: request.databaseSourceId,
+    protocol: "imap",
+    folders: request.folders.map((member, index) => {
+      const base = 400 + index * 100;
+      let measured;
+      if (AppConstants.platform == "win") {
+        const { validateMorkFolderWindowsInventory } =
+          ChromeUtils.importESModule(
+            "resource:///modules/panorama/MorkFolderImport.sys.mjs"
+          );
+        measured = validateMorkFolderWindowsInventory(sources[index].inventory);
+      }
+      return {
+        token: member.token,
+        sourceId: member.sourceId,
+        databaseSourceId: member.databaseSourceId,
+        sourceSha256: member.source.sha256,
+        folderId: member.folder.id,
+        keys: [
+          [1, base + 1],
+          [3, base + 3],
+        ],
+        ...(measured
+          ? {
+              version: 2,
+              windowsAdmission: measured,
+              sourcePhysicalIdentity: member.source.physicalIdentity,
+            }
+          : {}),
+        imap: {
+          version: 1,
+          originalFolderURI: member.imap.originalFolderURI,
+          uidValidity: structuredClone(member.imap.uidValidity),
+          serverUids: member.imap.serverUids.map(binding => ({
+            ...binding,
+            key: base + binding.sourceKey,
+          })),
+          operationKeys: [],
+          operations: [],
+        },
+      };
+    }),
+  };
+  const before = await IOUtils.read(path);
+  const incomplete = structuredClone(receipt);
+  incomplete.folders[1].imap.serverUids[0].uid++;
+  await Assert.rejects(
+    journal.recordImportUnit(token, incomplete),
+    error =>
+      error.name === "Error" &&
+      error.message === "Native Mork UID binding changed"
+  );
+  Assert.deepEqual(await IOUtils.read(path), before);
+  Assert.ok(
+    journal.state.sources.every(source => source.state === "importing")
+  );
+  await journal.setCancelled(true);
+  await journal.recordImportUnit(token, receipt);
+  Assert.ok(journal.state.sources.every(source => source.state === "imported"));
+  const committedRevision = journal.state.revision;
+  await journal.recordImportUnit(token, structuredClone(receipt));
+  Assert.equal(journal.state.revision, committedRevision);
+  journal.close();
+  journal = await MigrationJournal.open(path, plan.profilePath);
+  Assert.equal(journal.state.protocolUnits[0].state, "imported");
+  Assert.equal(journal.state.protocolUnits[0].token, token);
+  Assert.ok(
+    journal.state.cancelled,
+    "Commit is checkpointed before honoring cancellation"
+  );
+  Assert.deepEqual(
+    journal.state.sources.map(source => source.receipt.keys),
+    [
+      [
+        [1, 401],
+        [3, 403],
+      ],
+      [
+        [1, 501],
+        [3, 503],
+      ],
+    ]
+  );
+  await journal.setCancelled(false);
+  await journal.finishStage("import");
+  if (AppConstants.platform == "win") {
+    await Assert.rejects(
+      journal.finishStage("validate"),
+      error => error.message === "Windows migration activation remains held"
+    );
+    Assert.equal(journal.state.stage, "validate");
+  }
+});

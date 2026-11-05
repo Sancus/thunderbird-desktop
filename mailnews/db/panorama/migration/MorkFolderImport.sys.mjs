@@ -128,7 +128,7 @@ export async function readMorkFolderImport(folder, token, inventory) {
  *
  * @param {nsIFile} summary - Original discovered summary file.
  * @param {nsIFile} summaryRoot - Explicit selected original summary root.
- * @param {nsIFile} store - Original discovered mbox, possibly absent.
+ * @param {nsIFile} store - Original mbox file or maildir directory; may be absent.
  * @param {nsIFile} storeRoot - Explicit selected original store root.
  * @returns {MorkWindowsInventory} Exact original strings and native IDs.
  * @throws {Error} For unsupported platforms, paths or native admission errors.
@@ -158,7 +158,7 @@ export function captureMorkFolderWindowsInventory(
     };
     const windowsAdmission = {
       summary: capture(summary, summaryRoot, fs.KIND_FILE),
-      store: capture(store, storeRoot, fs.KIND_FILE_OR_MISSING),
+      store: capture(store, storeRoot, windowsStoreKind(fs, store)),
     };
     for (const lease of leases) {
       fs.validate(lease);
@@ -245,6 +245,21 @@ function windowsFileSystem() {
 }
 
 /**
+ * Selects directory admission for an existing store directory.
+ * Native admission must still verify the original path and physical identity.
+ *
+ * @param {nsIPanoramaMigrationFileSystem} fs - Actual Windows admission service.
+ * @param {nsIFile} file - Original store path, before normalization.
+ * @returns {number} Directory or file-or-missing admission kind.
+ */
+function windowsStoreKind(fs, file) {
+  file.QueryInterface(Ci.nsIFile);
+  return file.exists() && file.isDirectory()
+    ? fs.KIND_DIRECTORY
+    : fs.KIND_FILE_OR_MISSING;
+}
+
+/**
  * Re-admits retained originals before canonical binding or reading source bytes.
  * Native IDs are comparisons, never proof that a later import owns a lease.
  *
@@ -294,10 +309,11 @@ function admitWindowsInventory(folder, inventory) {
   try {
     for (const kind of ["summary", "store"]) {
       const record = admission[kind];
+      const original = new FileUtils.File(record.originalPath);
       const lease = fs.admit(
-        new FileUtils.File(record.originalPath),
+        original,
         new FileUtils.File(record.originalRoot),
-        kind == "summary" ? fs.KIND_FILE : fs.KIND_FILE_OR_MISSING
+        kind == "summary" ? fs.KIND_FILE : windowsStoreKind(fs, original)
       );
       leases.push(lease);
       if (
@@ -332,7 +348,7 @@ function admitWindowsInventory(folder, inventory) {
         const actual = fs.admit(
           file,
           new FileUtils.File(admission[kind].originalRoot),
-          kind == "summary" ? fs.KIND_FILE : fs.KIND_FILE_OR_MISSING
+          retained.kind
         );
         try {
           fs.validate(actual);

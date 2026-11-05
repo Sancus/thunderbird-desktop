@@ -21,6 +21,8 @@
 #include "mozIStorageStatement.h"
 #include "mozIStorageValueArray.h"
 #include "mozStorageHelper.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/StaticPrefs_mail.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/ScopeExit.h"
 #include "mozilla/SpinEventLoopUntil.h"
@@ -33,9 +35,15 @@
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
 #include "nsIInputStream.h"
+#include "nsIOutputStream.h"
+#include "nsICryptoHash.h"
+#include "nsIMsgPluggableStore.h"
+#include "prio.h"
 #include "nsIInterfaceRequestorUtils.h"
+#include "nsIMsgAccountManager.h"
 #include "nsIMsgDatabase.h"
 #include "nsIMsgFolder.h"
+#include "nsIMsgIncomingServer.h"
 #include "nsIMsgOfflineImapOperation.h"
 #include "nsIProperties.h"
 #include "nsIVariant.h"
@@ -46,6 +54,7 @@
 #include "nsMsgMessageFlags.h"
 #include "nsNetUtil.h"
 #include "nsServiceManagerUtils.h"
+#include "nsStreamUtils.h"
 #include "nsThreadUtils.h"
 #include "xpcpublic.h"
 #include "gtest/gtest.h"
@@ -80,11 +89,13 @@ class FaultWitness final : public mozIStorageFunction {
   uint32_t mCalls = 0;
   int64_t mLastKey = 0;
   nsresult mFailure = NS_OK;
+  std::function<nsresult()> mAction;
   NS_IMETHOD OnFunctionCall(mozIStorageValueArray* args,
                             nsIVariant** result) override {
     ++mCalls;
     MOZ_TRY(args->GetInt64(0, &mLastKey));
     NS_ENSURE_SUCCESS(mFailure, mFailure);
+    if (mAction) MOZ_TRY(mAction());
     nsCOMPtr<nsIWritableVariant> value =
         do_CreateInstance("@mozilla.org/variant;1");
     NS_ENSURE_STATE(value);
@@ -289,6 +300,9 @@ class DeliveryCoreReferences : public testing::Test {
       ASSERT_EQ(NS_OK,
                 NS_GetSpecialDirectory(NS_OS_TEMP_DIR, getter_AddRefs(base)));
     }
+    // AccountManager initializes process-wide NSS. Bind it to the harness
+    // profile before installing our removable per-case profile.
+    net_EnsurePSMInit();
     ASSERT_EQ(NS_OK, base->Clone(getter_AddRefs(mProfile)));
     ASSERT_EQ(NS_OK, mProfile->Append(u"delivery-core-references"_ns));
     ASSERT_EQ(NS_OK, mProfile->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
@@ -320,8 +334,12 @@ class DeliveryCoreReferences : public testing::Test {
   }
 
   // A lower user_version must describe the old physical schema too. Remove
-  // only the columns added in versions 16-19, preserving the older row data.
+  // only the tables/columns added in versions 16-21, preserving older row data.
   nsresult RemoveReplayColumns(mozIStorageConnection* connection) {
+    MOZ_TRY(connection->ExecuteSimpleSQL(
+        "DROP TRIGGER delete_imap_import_hold; "
+        "DROP TABLE imap_import_operation_holds; "
+        "DROP TABLE imap_import_operations; DROP TABLE imap_import_units"_ns));
     MOZ_TRY(connection->ExecuteSimpleSQL(
         "ALTER TABLE offline_operations DROP COLUMN guardPresence"_ns));
     MOZ_TRY(connection->ExecuteSimpleSQL(
@@ -2397,12 +2415,12 @@ class DeliveryCoreReferences : public testing::Test {
   }
 
 #ifdef XP_WIN
-  nsresult ImportPathIdentity(nsIFile* file, FolderImportPathIdentity& output) {
+  nsresult ImportPathIdentity(
+      nsIFile* file, FolderImportPathIdentity& output,
+      uint16_t kind = nsIPanoramaMigrationFileSystem::KIND_FILE) {
     RefPtr<MigrationFileSystem> system = new MigrationFileSystem();
     nsCOMPtr<nsIPanoramaMigrationPath> lease;
-    MOZ_TRY(system->Admit(file, mProfile,
-                          nsIPanoramaMigrationFileSystem::KIND_FILE,
-                          getter_AddRefs(lease)));
+    MOZ_TRY(system->Admit(file, mProfile, kind, getter_AddRefs(lease)));
     auto close = MakeScopeExit([&] { EXPECT_EQ(NS_OK, lease->Close()); });
     MOZ_TRY(file->GetPath(output.originalPath));
     MOZ_TRY(mProfile->GetPath(output.originalRoot));
@@ -2470,6 +2488,459 @@ class DeliveryCoreReferences : public testing::Test {
   nsresult ImportNativeFile(nsIFile* source, const FolderImportSnapshot& input,
                             FolderImportReceipt& output) {
     return mCore->ImportFolderSnapshotFromFile(source, input, output);
+  }
+
+  // Trusted native transaction controls only. Genuine MDB/raw conversion and
+  // finished mbox/maildir stream coverage belong to the same whole IM/MI plan.
+  nsresult PrepareImapImport(ImapImportUnit& unit, bool pending = false,
+                             bool heldMove = false) {
+    auto& first = *unit.folders.AppendElement();
+    nsCOMPtr<nsIFile> summary;
+    MOZ_TRY(PrepareNativeImport(first.snapshot, getter_AddRefs(summary)));
+    first.uri = "imap://captured/source"_ns;
+    first.uidValidity = Some(61u);
+    first.snapshot.folderProperties.AppendElement(
+        FolderImportProperty{"UIDValidity"_ns, "3d"_ns, Some(int64_t(61))});
+    first.serverUids = {{0, 55}, {9, UINT32_MAX}};
+    unit.token = "connected-imap-unit"_ns;
+    unit.databaseSourceId = first.snapshot.identity.databaseSourceId;
+    if (!pending) return NS_OK;
+    // Retained old key7 is deliberately reused in two different source folders.
+    for (uint32_t i = 1; i <= (heldMove ? 3u : 2u); ++i) {
+      ImapImportFolder target;
+      target.uri.Assign(i == 1 ? "imap://captured/one" : "imap://captured/two");
+      if (i == 3) target.uri = "imap://captured/three"_ns;
+      target.snapshot.identity = unit.folders[0].snapshot.identity;
+      auto& id = target.snapshot.identity;
+      id.token.AppendInt(i);
+      id.sourceId.AppendInt(i);
+      nsAutoCString name("Pending");
+      name.AppendInt(i);
+      MOZ_TRY(mCore->FolderDB().InsertFolder(mFolderId, name, &id.folderId));
+      id.folderPath = MOZ_TRY(mCore->FolderDB().GetFolderPath(id.folderId));
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(mProfile->Clone(getter_AddRefs(file)));
+      MOZ_TRY(file->Append(u"pending-source.bin"_ns));
+      MOZ_TRY(file->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 0600));
+      MOZ_TRY(file->GetPath(id.sourcePath));
+#ifdef XP_WIN
+      FolderImportWindowsIdentity physical = *id.windows;
+      MOZ_TRY(ImportPathIdentity(file, physical.summary));
+      id.windows = Some(std::move(physical));
+      id.sourcePath = id.windows->summary.canonicalPath;
+#endif
+      target.snapshot.recordsComplete = true;
+      if (i == 1) {
+        target.uidValidity = Some(62u);
+        target.snapshot.folderProperties.AppendElement(
+            FolderImportProperty{"UIDValidity"_ns, "3e"_ns, Some(int64_t(62))});
+      }
+      auto& message = *target.snapshot.messages.AppendElement();
+      message.sourceKey = message.rootSourceKey = 7;
+      message.header.messageId.Assign(i == 1 ? "pending-one@invalid"
+                                             : "pending-two@invalid");
+      message.header.flags = nsMsgMessageFlags::Offline;
+      message.header.storeToken = Some(nsCString("retained-finished-body"_ns));
+      ImapImportOperation result;
+      result.sourceKey = 7;
+      result.payload.operation = nsIMsgOfflineImapOperation::kMoveResult;
+      result.payload.sourceFolderURI = unit.folders[0].uri;
+      result.payload.sourceKey = 0;
+      result.payload.sourceUid = 55;
+      result.source =
+          Some(ImapImportReference{unit.folders[0].snapshot.identity.token, 0});
+      target.operations.AppendElement(std::move(result));
+      unit.folders.AppendElement(std::move(target));
+    }
+    ImapImportOperation op;
+    op.sourceKey = 0;
+    op.payload.operation = nsIMsgOfflineImapOperation::kMsgCopy |
+                           nsIMsgOfflineImapOperation::kFlagsChanged |
+                           nsIMsgOfflineImapOperation::kAddKeywords;
+    op.payload.flagOperation = 1;
+    op.payload.newFlags = 0x80000001;
+    op.payload.keywordsToAdd = "captured ordered keywords"_ns;
+    op.payload.sourceUid = 55;
+    for (uint32_t i : {2u, 1u}) {
+      op.payload.copyDestinations.AppendElement(unit.folders[i].uri);
+      op.copies.AppendElement(Some(
+          ImapImportReference{unit.folders[i].snapshot.identity.token, 7}));
+    }
+    if (heldMove) {
+      op.payload.operation |= nsIMsgOfflineImapOperation::kMsgMoved;
+      op.payload.destinationFolderURI = unit.folders[3].uri;
+      op.destination =
+          Some(ImapImportReference{unit.folders[3].snapshot.identity.token, 7});
+      // The genuine producer may retain pending intent after its source header
+      // is deleted. This native control does not invent that missing body.
+      auto& source = unit.folders[0].snapshot.messages;
+      source.RemoveElementAt(1);
+      source[0].rootSourceKey = 9;
+      source[0].parentSourceKey.reset();
+    }
+    unit.folders[0].operations.AppendElement(std::move(op));
+    return NS_OK;
+  }
+
+  nsresult PrepareProviderImapImport(ImapImportUnit& unit,
+                                     const nsACString& type,
+                                     nsIMsgIncomingServer** owner) {
+    MOZ_TRY(PrepareImapImport(unit));
+    nsCOMPtr<nsIMsgAccountManager> manager =
+        do_GetService("@mozilla.org/messenger/account-manager;1");
+    NS_ENSURE_TRUE(manager, NS_ERROR_NOT_AVAILABLE);
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    MOZ_TRY(manager->CreateIncomingServer("body-import"_ns, "localhost"_ns,
+                                          "imap"_ns, getter_AddRefs(server)));
+    auto remove = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, manager->RemoveIncomingServer(server, false));
+    });
+    MOZ_TRY(server->SetStringValue(
+        "storeContractID", type == "mbox"_ns
+                               ? "@mozilla.org/msgstore/berkeleystore;1"_ns
+                               : "@mozilla.org/msgstore/maildirstore;1"_ns));
+    nsCOMPtr<nsIMsgFolder> root, folder;
+    MOZ_TRY(server->GetRootFolder(getter_AddRefs(root)));
+    MOZ_TRY(root->AddSubfolder("Body"_ns, getter_AddRefs(folder)));
+    auto& member = unit.folders[0];
+    member.folder = folder;
+    MOZ_TRY(folder->GetId(&member.snapshot.identity.folderId));
+    member.snapshot.identity.folderPath = MOZ_TRY(
+        mCore->FolderDB().GetFolderPath(member.snapshot.identity.folderId));
+    MOZ_TRY(folder->GetURI(member.uri));
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+    nsCString actualType;
+    MOZ_TRY(store->GetStoreType(actualType));
+    NS_ENSURE_TRUE(actualType == type, NS_ERROR_UNEXPECTED);
+    const auto text =
+        "From: body@example.invalid\r\n"
+        "Subject: native imported body\r\n\r\nfinished bytes\r\n"_ns;
+    for (auto& row : member.snapshot.messages) {
+      nsCOMPtr<nsIOutputStream> output;
+      MOZ_TRY(store->GetNewMsgOutputStream(folder, getter_AddRefs(output)));
+      auto discard =
+          MakeScopeExit([&] { store->DiscardNewMessage(folder, output); });
+      uint32_t written;
+      MOZ_TRY(output->Write(text.BeginReading(), text.Length(), &written));
+      NS_ENSURE_TRUE(written == text.Length(), NS_ERROR_UNEXPECTED);
+      nsCString token;
+      MOZ_TRY(store->FinishNewMessage(folder, output, token));
+      discard.release();
+      output = nullptr;
+      row.header.storeToken = Some(token);
+      row.header.flags |= nsMsgMessageFlags::Offline;
+    }
+    // Capture the complete finished folder, with valid two-header mbox
+    // boundaries, before using provider readback as the import body oracle.
+    for (auto& row : member.snapshot.messages) {
+      nsCOMPtr<nsIInputStream> input;
+      MOZ_TRY(store->GetMsgInputStream(folder, *row.header.storeToken, 0,
+                                       getter_AddRefs(input)));
+      auto close = MakeScopeExit([&] { input->Close(); });
+      nsCString bytes;
+      MOZ_TRY(NS_ConsumeStream(input, UINT32_MAX, bytes));
+      MOZ_TRY(input->Close());
+      close.release();
+      NS_ENSURE_TRUE(bytes == text, NS_ERROR_UNEXPECTED);
+      nsCOMPtr<nsICryptoHash> hash;
+      MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+      MOZ_TRY(
+          hash->Update(reinterpret_cast<const uint8_t*>(bytes.BeginReading()),
+                       bytes.Length()));
+      nsCString digest;
+      MOZ_TRY(hash->Finish(false, digest));
+      ImapImportBody body;
+      body.sourceKey = row.sourceKey;
+      body.size = bytes.Length();
+      for (unsigned char byte : digest.View()) {
+        body.sha256.Append("0123456789abcdef"[byte >> 4]);
+        body.sha256.Append("0123456789abcdef"[byte & 15]);
+      }
+      member.bodies.AppendElement(std::move(body));
+      row.header.messageSize = Some(uint32_t(bytes.Length()));
+      row.header.offlineMessageSize = Some(uint32_t(bytes.Length()));
+    }
+#ifdef XP_WIN
+    if (type == "maildir"_ns) {
+      NS_ENSURE_TRUE(member.snapshot.identity.windows, NS_ERROR_UNEXPECTED);
+      nsCOMPtr<nsIFile> actualStore;
+      MOZ_TRY(folder->GetFilePath(getter_AddRefs(actualStore)));
+      MOZ_TRY(ImportPathIdentity(
+          actualStore, member.snapshot.identity.windows->store,
+          nsIPanoramaMigrationFileSystem::KIND_DIRECTORY));
+    }
+#endif
+    server.forget(owner);
+    remove.release();
+    return NS_OK;
+  }
+
+  void CheckProviderImapImport(const nsACString& type, bool mutate) {
+    // This concrete native fixture also selects the existing native folder and
+    // provider branches. Restore the once-pref mirror before leaving the case;
+    // no preference/default is changed and whole real profile tests stay
+    // separate.
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> restoreNative(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    // AccountManager owns the ordinary native Startup and process-wide factory.
+    // Borrow its already-started core; a second Startup must remain refused.
+    nsCOMPtr<nsIMsgAccountManager> manager =
+        do_GetService("@mozilla.org/messenger/account-manager;1");
+    ASSERT_TRUE(manager);
+    mCore = DatabaseCore::GetInstanceForService();
+    mConnection = Connection();
+    ASSERT_TRUE(mCore && mConnection);
+    nsCOMPtr<nsIFile> actualFile;
+    ASSERT_EQ(NS_OK, mConnection->GetDatabaseFile(getter_AddRefs(actualFile)));
+    bool same;
+    ASSERT_EQ(NS_OK, mFile->Equals(actualFile, &same));
+    ASSERT_TRUE(same);
+    uint64_t root;
+    ASSERT_EQ(NS_OK,
+              mCore->FolderDB().InsertRoot("delivery-references"_ns, &root));
+    ASSERT_EQ(NS_OK,
+              mCore->FolderDB().InsertFolder(root, "Inbox"_ns, &mFolderId));
+    ImapImportUnit unit;
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    ASSERT_EQ(NS_OK,
+              PrepareProviderImapImport(unit, type, getter_AddRefs(server)));
+    auto remove = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, manager->RemoveIncomingServer(server, false));
+    });
+    auto& member = unit.folders[0];
+    nsCOMPtr<nsIFile> file;
+    ASSERT_EQ(NS_OK, member.folder->GetFilePath(getter_AddRefs(file)));
+    int64_t originalSize = 0;
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    bool installed = false;
+    auto unfault = MakeScopeExit([&] {
+      if (installed) {
+        EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                             "DROP TRIGGER IF EXISTS import_body_mutation"_ns));
+        EXPECT_EQ(NS_OK,
+                  mConnection->RemoveFunction("import_body_mutation"_ns));
+      }
+    });
+    if (mutate) {
+      ASSERT_EQ("mbox"_ns, type);
+      ASSERT_EQ(NS_OK, file->GetFileSize(&originalSize));
+      witness->mAction = [&]() -> nsresult {
+        if (witness->mCalls != 1) return NS_OK;
+        nsCOMPtr<nsIOutputStream> output;
+        MOZ_TRY(NS_NewLocalFileOutputStream(getter_AddRefs(output), file,
+                                            PR_WRONLY | PR_APPEND));
+        auto close = MakeScopeExit([&] { output->Close(); });
+        const auto changed = "changed after admission\r\n"_ns;
+        uint32_t written;
+        MOZ_TRY(
+            output->Write(changed.BeginReading(), changed.Length(), &written));
+        NS_ENSURE_TRUE(written == changed.Length(), NS_ERROR_UNEXPECTED);
+        MOZ_TRY(output->Close());
+        close.release();
+        return NS_OK;
+      };
+      ASSERT_EQ(NS_OK, mConnection->CreateFunction("import_body_mutation"_ns, 1,
+                                                   witness));
+      installed = true;
+      ASSERT_EQ(NS_OK,
+                mConnection->ExecuteSimpleSQL(
+                    "CREATE TEMP TRIGGER import_body_mutation AFTER INSERT ON "
+                    "messages "
+                    "BEGIN SELECT import_body_mutation(new.id); END"_ns));
+    }
+    ImapImportReceipt output;
+    output.token = "unchanged-output"_ns;
+    uint32_t prepared = 0, published = 0;
+    nsresult rv = ImportImap(
+        unit, output,
+        [&](const auto&) -> nsresult {
+          ++prepared;
+          EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+                    mCore->MessageDB().CheckFolderBodyAccess(
+                        member.snapshot.identity.folderId));
+          if (type == "mbox"_ns) {
+            nsCOMPtr<nsIMsgPluggableStore> store;
+            MOZ_TRY(member.folder->GetMsgStore(getter_AddRefs(store)));
+            nsCOMPtr<nsIInputStream> denied;
+            EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+                      store->GetMsgInputStream(
+                          member.folder,
+                          *member.snapshot.messages[0].header.storeToken, 0,
+                          getter_AddRefs(denied)));
+            EXPECT_FALSE(denied);
+          }
+          EXPECT_EQ("unchanged-output"_ns, output.token);
+          return NS_OK;
+        },
+        [&] {
+          ++published;
+          bool active;
+          EXPECT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+          EXPECT_FALSE(active);
+          EXPECT_EQ(unit.token, output.token);
+        });
+    EXPECT_EQ(mutate ? NS_ERROR_NOT_AVAILABLE : NS_OK, rv);
+    EXPECT_EQ(mutate ? 0u : 1u, prepared);
+    EXPECT_EQ(mutate ? 0u : 1u, published);
+    uint64_t count;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+    EXPECT_EQ(mutate ? 0u : 2u, count);
+    bool active;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+    if (mutate) {
+      EXPECT_GE(witness->mCalls, 1u);
+      EXPECT_EQ("unchanged-output"_ns, output.token);
+      Maybe<FolderImportReceipt> receipt;
+      ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(member.snapshot.identity,
+                                                     receipt));
+      EXPECT_FALSE(receipt);
+      // Windows caches GetFileSize on the original file object. Its clone
+      // starts with dirty stat data and observes the finished physical write.
+      nsCOMPtr<nsIFile> observed;
+      ASSERT_EQ(NS_OK, file->Clone(getter_AddRefs(observed)));
+      int64_t after;
+      ASSERT_EQ(NS_OK, observed->GetFileSize(&after));
+      EXPECT_GT(after,
+                originalSize);  // Physical bytes are outside SQL rollback.
+    } else {
+      EXPECT_EQ(unit.token, output.token);
+      ASSERT_EQ(1u, output.folders.Length());
+      EXPECT_EQ(2u, output.folders[0].folder.keys.Length());
+      EXPECT_EQ(NS_OK, mCore->MessageDB().CheckFolderBodyAccess(
+                           member.snapshot.identity.folderId));
+    }
+  }
+
+  nsString RawImportRecords(bool retired, bool pending, bool absentUnread,
+                            bool unread = false,
+                            Maybe<uint32_t> folderFlags = Nothing()) {
+    nsString data =
+        uR"json({
+      "unhandledRecords": [],
+      "folderProperties": [
+        {"name":"UIDValidity","text":"3d","integer":61},
+        {"name":"originalFolderURI","text":"imap://captured/source"}],
+      "records": {
+        "tables": [
+          {"id":1,"scope":"ns:msg:db:row:scope:msgs:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:msgs"}],"metaRow":null,"rows":["5001:ns:msg:db:row:scope:msgs:all"]},
+          {"id":1,"scope":"ns:msg:db:row:scope:dbfolderinfo:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:dbfolderinfo"}],"metaRow":null,"rows":["1:ns:msg:db:row:scope:dbfolderinfo:all"]},
+          {"id":4294967293,"scope":"ns:msg:db:row:scope:threads:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:allthreads"}],"metaRow":null,"rows":["5001:ns:msg:db:row:scope:threads:all"]},
+          {"id":5001,"scope":"ns:msg:db:row:scope:msgs:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:thread"}],"metaRow":"1:m","rows":["5001:ns:msg:db:row:scope:msgs:all"]}
+          @RETIRED_TABLES@ @PENDING@
+        ],
+        "rows": [
+          {"id":5001,"scope":"ns:msg:db:row:scope:msgs:all","cells":[{"k":"subject","v":"live"},{"k":"flags","v":"@FLAGS@"},{"k":"msgThreadId","v":"1389"},{"k":"threadParent","v":"ffffffff"}]},
+          {"id":1,"scope":"m","cells":[{"k":"threadRoot","v":"1389"},{"k":"threadId","v":"1389"},{"k":"threadFlags","v":"0"},{"k":"children","v":"1"},@UNREAD@{"k":"threadNewestMsgDate","v":"0"}]},
+          {"id":5001,"scope":"ns:msg:db:row:scope:threads:all","cells":[{"k":"threadSubject","v":"live"}]},
+          {"id":1,"scope":"ns:msg:db:row:scope:dbfolderinfo:all","cells":[{"k":"UIDValidity","v":"3d"},{"k":"originalFolderURI","v":"imap://captured/source"}]}
+          @RETIRED_ROWS@
+        ]},
+      "imap":{"version":1,"originalFolderURI":"imap://captured/source","uidValidity":{"present":true,"value":61},
+        "operations":[@OPERATIONS@],"serverUids":[{"sourceKey":5001,"uid":5001}]}
+    })json"_ns;
+    if (folderFlags) {
+      nsAutoString hex;
+      hex.AppendInt(*folderFlags, 16);
+      nsAutoString integer;
+      integer.AppendInt(*folderFlags);
+      nsString property =
+          u"\"folderProperties\": [{\"name\":\"flags\",\"text\":\""_ns + hex +
+          u"\",\"integer\":"_ns + integer + u"},"_ns;
+      data.ReplaceSubstring(u"\"folderProperties\": [", property.get());
+      nsString cell = u"{\"k\":\"flags\",\"v\":\""_ns + hex +
+                      u"\"},{\"k\":\"UIDValidity\""_ns;
+      data.ReplaceSubstring(u"{\"k\":\"UIDValidity\"", cell.get());
+    }
+    data.ReplaceSubstring(u"@FLAGS@", unread ? u"0" : u"1");
+    data.ReplaceSubstring(
+        u"@UNREAD@", absentUnread ? u""
+                     : unread     ? u"{\"k\":\"unreadChildren\",\"v\":\"1\"},"
+                                  : u"{\"k\":\"unreadChildren\",\"v\":\"0\"},");
+    data.ReplaceSubstring(u"@PENDING@", pending ? uR"json(,
+      {"id":1,"scope":"ns:msg:db:row:scope:pending:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:pending"}],"metaRow":null,"rows":[]})json"
+                                                : u"");
+    data.ReplaceSubstring(u"@RETIRED_TABLES@", retired ? uR"json(,
+      {"id":5000,"scope":"ns:msg:db:row:scope:msgs:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:thread"}],"metaRow":"2:m","rows":[]},
+      {"id":1,"scope":"ns:msg:db:row:scope:ops:all","cells":[{"k":"k","v":"ns:msg:db:table:kind:ops"}],"metaRow":null,"rows":["5000:ns:msg:db:row:scope:ops:all"]})json"
+                                                       : u"");
+    data.ReplaceSubstring(u"@RETIRED_ROWS@", retired ? uR"json(,
+      {"id":2,"scope":"m","cells":[{"k":"threadRoot","v":"1388"},{"k":"threadId","v":"1388"},{"k":"threadFlags","v":"0"},{"k":"children","v":"0"},{"k":"unreadChildren","v":"0"},{"k":"threadNewestMsgDate","v":"0"}]},
+      {"id":5000,"scope":"ns:msg:db:row:scope:msgs:all","cells":[]},
+      {"id":5000,"scope":"ns:msg:db:row:scope:threads:all","cells":[{"k":"threadSubject","v":"retired subject"}]},
+      {"id":5000,"scope":"ns:msg:db:row:scope:ops:all","cells":[{"k":"op","v":"2"},{"k":"msgKey","v":"1388"}]})json"
+                                                     : u"");
+    data.ReplaceSubstring(
+        u"@OPERATIONS@",
+        retired
+            ? uR"json({"sourceKey":5000,"rowId":5000,"scope":"ns:msg:db:row:scope:ops:all","payload":{"operation":2}})json"
+            : u"");
+    return data;
+  }
+
+  nsresult CheckRawImport(const nsAString& data, bool imap = true,
+                          bool unread = false,
+                          Maybe<uint32_t> folderFlags = Nothing()) {
+    mozilla::dom::AutoJSAPI jsapi;
+    NS_ENSURE_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()), NS_ERROR_FAILURE);
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> value(cx);
+    NS_ENSURE_TRUE(JS_ParseJSON(cx, data.BeginReading(), data.Length(), &value),
+                   NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSObject*> request(cx, &value.toObject());
+    nsCOMPtr<nsIMsgFolder> folder;
+    nsCOMPtr<nsIMsgAccountManager> manager;
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    auto removeServer = MakeScopeExit([&] {
+      if (server)
+        EXPECT_EQ(NS_OK, manager->RemoveIncomingServer(server, false));
+    });
+    manager = do_GetService("@mozilla.org/messenger/account-manager;1");
+    NS_ENSURE_TRUE(manager, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(manager->CreateIncomingServer("raw-import"_ns, "localhost"_ns,
+                                          imap ? "imap"_ns : "none"_ns,
+                                          getter_AddRefs(server)));
+    MOZ_TRY(server->GetRootFolder(getter_AddRefs(folder)));
+    NS_ENSURE_TRUE(folder, NS_ERROR_NOT_AVAILABLE);
+    if (folderFlags) {
+      MOZ_TRY(folder->SetFlags(*folderFlags));
+    }
+    ImapImportFolder member;
+    member.folder = folder;
+    auto& message = *member.snapshot.messages.AppendElement();
+    message.sourceKey = message.rootSourceKey = 5001;
+    message.header.subject = "live"_ns;
+    message.header.flags = unread ? 0 : nsMsgMessageFlags::Read;
+    message.header.priority = nsMsgPriority::notSet;
+    message.header.extras = {{"subject"_ns, "live"_ns},
+                             {"flags"_ns, unread ? "0"_ns : "1"_ns},
+                             {"msgThreadId"_ns, "1389"_ns},
+                             {"threadParent"_ns, "ffffffff"_ns}};
+    return mCore->CheckImportRecordsForTesting(
+        cx, request, folder, member.snapshot, imap ? &member : nullptr);
+  }
+
+  nsresult MigrationHoldCounts(int64_t& holds, int64_t& attempts) {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(mConnection->CreateStatement(
+        "SELECT (SELECT COUNT(*) FROM imap_import_operation_holds),"
+        "(SELECT COUNT(*) FROM offline_attempts)"_ns,
+        getter_AddRefs(stmt)));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+    MOZ_TRY(stmt->GetInt64(0, &holds));
+    return stmt->GetInt64(1, &attempts);
+  }
+
+  nsresult ImportImap(
+      const ImapImportUnit& unit, ImapImportReceipt& output,
+      const std::function<nsresult(const ImapImportReceipt&)>& prepare = {},
+      const std::function<void()>& publish = {}) {
+    return mCore->ImportImapUnit(unit, output, prepare, publish);
   }
 
   nsresult ThreadKeys(uint64_t folder, uint64_t parent, uint64_t thread,
@@ -2745,7 +3216,7 @@ TEST_F(DeliveryCoreReferences, UpgradeKeepsOldReferencesUnavailable) {
   EXPECT_TRUE(got.IsEmpty());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(19, version);
+  EXPECT_EQ(21, version);
   Stop();
   ASSERT_EQ(NS_OK, Start());
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageReferences(7, got));
@@ -6616,6 +7087,807 @@ TEST_F(DeliveryCoreReferences, NativeImportReceiptMapsForwardRootsAndReopens) {
             recovered->identity.databaseSourceId);
 }
 
+TEST_F(DeliveryCoreReferences, ImapRawRecordsAcceptExactInactiveForms) {
+  ASSERT_EQ(NS_OK, Start());
+  auto data = RawImportRecords(true, true, true);
+  const auto original = data;
+  EXPECT_EQ(NS_OK, CheckRawImport(data));
+  EXPECT_EQ(original, data);
+  EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, true, true)));
+  EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(true, false, false)));
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(0u, count);
+}
+
+TEST_F(DeliveryCoreReferences, ImapRawRecordsAllowOfflineEventsFlagDifference) {
+  ASSERT_EQ(NS_OK, Start());
+  const uint32_t base = nsMsgFolderFlags::Mail | nsMsgFolderFlags::Inbox;
+  const uint32_t pending = base | nsMsgFolderFlags::OfflineEvents;
+  for (uint32_t raw : {base, pending}) {
+    const auto data = RawImportRecords(false, false, false, false, Some(raw));
+    const auto original = data;
+    for (uint32_t current : {base, pending}) {
+      EXPECT_EQ(NS_OK, CheckRawImport(data, true, false, Some(current)));
+      EXPECT_EQ(original, data);
+    }
+    EXPECT_EQ(NS_OK, CheckRawImport(data, false, false, Some(raw)));
+  }
+}
+
+TEST_F(DeliveryCoreReferences, ImapRawRecordsRejectOtherFlagDifferences) {
+  ASSERT_EQ(NS_OK, Start());
+  const uint32_t base = nsMsgFolderFlags::Mail | nsMsgFolderFlags::Inbox;
+  const uint32_t pending = base | nsMsgFolderFlags::OfflineEvents;
+  const auto data = RawImportRecords(false, false, false, false, Some(pending));
+  for (uint32_t bit = 1; bit != 0; bit <<= 1) {
+    if (bit == nsMsgFolderFlags::OfflineEvents) {
+      continue;
+    }
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+              CheckRawImport(data, true, false, Some(base ^ bit)));
+  }
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(data, false, false, Some(base)));
+  EXPECT_EQ(
+      NS_ERROR_NOT_IMPLEMENTED,
+      CheckRawImport(RawImportRecords(false, false, false, false, Some(base)),
+                     false, false, Some(pending)));
+}
+
+TEST_F(DeliveryCoreReferences, ImapRawRecordsRefusePendingState) {
+  ASSERT_EQ(NS_OK, Start());
+  const auto source = RawImportRecords(false, true, false);
+  for (auto pair : {std::pair{u"pending\"}],\"metaRow\":null,\"rows\":[]",
+                              u"pending\"}],\"metaRow\":null,\"rows\":[\"5001:"
+                              u"ns:msg:db:row:scope:msgs:all\"]"},
+                    std::pair{u"pending\"}],\"metaRow\":null",
+                              u"pending\"}],\"metaRow\":\"1:m\""},
+                    std::pair{u"pending\"}]",
+                              u"pending\"},{\"k\":\"unknown\",\"v\":\"0\"}]"},
+                    std::pair{u"scope:pending:all", u"scope:foreign:all"}}) {
+    auto changed = source;
+    ASSERT_NE(kNotFound, changed.Find(pair.first));
+    changed.ReplaceSubstring(pair.first, pair.second);
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  }
+}
+
+TEST_F(DeliveryCoreReferences, ImapRawRecordsRequireExactUnreadCache) {
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, true, true)));
+  EXPECT_EQ(NS_OK, CheckRawImport(RawImportRecords(false, true, false, true),
+                                  true, true));
+  EXPECT_EQ(
+      NS_ERROR_NOT_IMPLEMENTED,
+      CheckRawImport(RawImportRecords(false, true, true, true), true, true));
+  auto changed = RawImportRecords(false, true, false);
+  changed.ReplaceSubstring(u"unreadChildren\",\"v\":\"0",
+                           u"unreadChildren\",\"v\":\"1");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  changed = RawImportRecords(false, true, true);
+  changed.ReplaceSubstring(u"threadNewestMsgDate", u"unknownMetaCell");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+}
+
+TEST_F(DeliveryCoreReferences,
+       ImapRawRecordsRefuseActiveOrUnboundRetiredThread) {
+  ASSERT_EQ(NS_OK, Start());
+  const auto source = RawImportRecords(true, true, false);
+  for (auto pair :
+       {std::pair{u"threadFlags\",\"v\":\"0\"},{\"k\":\"children\",\"v\":\"0",
+                  u"threadFlags\",\"v\":\"1\"},{\"k\":\"children\",\"v\":\"0"},
+        std::pair{u"threadRoot\",\"v\":\"1388", u"threadRoot\",\"v\":\"1389"},
+        std::pair{u"children\",\"v\":\"0\"},{\"k\":\"unreadChildren\",\"v\":"
+                  u"\"0\"},{\"k\":\"threadNewestMsgDate\",\"v\":\"0",
+                  u"children\",\"v\":\"0\"},{\"k\":\"unreadChildren\",\"v\":"
+                  u"\"0\"},{\"k\":\"threadNewestMsgDate\",\"v\":\"1"},
+        std::pair{u"\"op\",\"v\":\"2", u"\"op\",\"v\":\"4"},
+        std::pair{u"msgKey\",\"v\":\"1388", u"msgKey\",\"v\":\"1389"}}) {
+    auto changed = source;
+    ASSERT_NE(kNotFound, changed.Find(pair.first));
+    changed.ReplaceSubstring(pair.first, pair.second);
+    EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  }
+}
+
+TEST_F(DeliveryCoreReferences, ImapRawRecordsPreserveMembershipAndUnknownRows) {
+  ASSERT_EQ(NS_OK, Start());
+  auto changed = RawImportRecords(true, true, false);
+  changed.ReplaceSubstring(
+      u"scope:msgs:all\",\"cells\":[]",
+      u"scope:msgs:all\",\"cells\":[{\"k\":\"unknown\",\"v\":\"retained\"}]");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  changed = RawImportRecords(true, true, false);
+  changed.ReplaceSubstring(
+      u"\"rows\":[\"5001:ns:msg:db:row:scope:threads:all\"]",
+      u"\"rows\":[\"5001:ns:msg:db:row:scope:threads:all\",\"5000:ns:msg:db:"
+      u"row:scope:threads:all\"]");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+  changed = RawImportRecords(false, true, false);
+  changed.ReplaceSubstring(
+      u"\"rows\":[\"5001:ns:msg:db:row:scope:threads:all\"]", u"\"rows\":[]");
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED, CheckRawImport(changed));
+}
+
+TEST_F(DeliveryCoreReferences, LocalRawRecordsKeepExplicitUnreadAndNoPending) {
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_OK,
+            CheckRawImport(RawImportRecords(false, false, false), false));
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(RawImportRecords(false, false, true), false));
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(RawImportRecords(false, true, false), false));
+  EXPECT_EQ(NS_ERROR_NOT_IMPLEMENTED,
+            CheckRawImport(RawImportRecords(true, false, false), false));
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportMboxBodyRecheckKeepsCommittedGuard) {
+  CheckProviderImapImport("mbox"_ns, false);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportMaildirBodyRecheckKeepsFinishedBytes) {
+  CheckProviderImapImport("maildir"_ns, false);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ImapImportBodyMutationRollsBackBeforePublication) {
+  CheckProviderImapImport("mbox"_ns, true);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportEpochUidBindingsReopen) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  ASSERT_EQ(1u, receipt.folders.Length());
+  ASSERT_EQ(2u, receipt.folders[0].folder.keys.Length());
+  nsMsgKey root = receipt.folders[0].folder.keys[0].destination;
+  nsMsgKey child = receipt.folders[0].folder.keys[1].destination;
+  uint64_t folder = input.folders[0].snapshot.identity.folderId;
+  nsMsgKey found;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(folder, 61, 55,
+                                                                found));
+  EXPECT_EQ(root, found);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(
+                       folder, 61, UINT32_MAX, found));
+  EXPECT_EQ(child, found);
+  EXPECT_NE(root, 55u);
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportReceipt recovered;
+  ASSERT_EQ(NS_OK, ImportImap(input, recovered));
+  EXPECT_EQ(root, recovered.folders[0].folder.keys[0].destination);
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetMessageKeyForServerUid(folder, 61, 55,
+                                                                found));
+  EXPECT_EQ(root, found);
+  EXPECT_EQ(
+      NS_ERROR_NOT_AVAILABLE,
+      mCore->MessageDB().GetMessageKeyForServerUid(folder, 62, 55, found));
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportRejectsStaleAndConflictingUid) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input));
+  ImapImportReceipt output;
+  output.token = "unchanged"_ns;
+  input.folders[0].serverUids[1].uid = 55;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ImportImap(input, output));
+  EXPECT_EQ("unchanged"_ns, output.token);
+  input.folders[0].serverUids[1].uid = UINT32_MAX;
+  ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(
+                       input.folders[0].snapshot.identity.folderId, 62));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ImportImap(input, output));
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(0u, count);
+  EXPECT_EQ("unchanged"_ns, output.token);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportPendingUnitKeepsOrderedCounterparts) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  ASSERT_EQ(3u, receipt.folders.Length());
+  const auto& source = receipt.folders[0];
+  ASSERT_EQ(1u, source.operations.Length());
+  OfflineOperationData stored;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperation(
+                       source.folder.identity.folderId,
+                       source.operations[0].key, stored));
+  EXPECT_EQ(0x80000001u, stored.newFlags);
+  EXPECT_EQ("captured ordered keywords"_ns, stored.keywordsToAdd);
+  ASSERT_EQ(2u, stored.copyDestinations.Length());
+  ASSERT_EQ(2u, stored.copyDestinationBindings.Length());
+  ASSERT_TRUE(stored.copyDestinationBindings[0]);
+  ASSERT_TRUE(stored.copyDestinationBindings[1]);
+  EXPECT_EQ(input.folders[2].uri, stored.copyDestinations[0]);
+  EXPECT_EQ(receipt.folders[2].folder.identity.folderId,
+            stored.copyDestinationBindings[0]->folderId);
+  EXPECT_EQ(receipt.folders[2].folder.keys[0].destination,
+            stored.copyDestinationBindings[0]->key);
+  EXPECT_FALSE(stored.copyDestinationBindings[0]->epochKnown);
+  EXPECT_TRUE(stored.copyDestinationBindings[1]->epochKnown);
+  EXPECT_EQ(62u, stored.copyDestinationBindings[1]->epoch);
+  EXPECT_NE(stored.copyDestinationBindings[0]->key,
+            stored.copyDestinationBindings[1]->key);
+  OfflineOperationData child;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperation(
+                       receipt.folders[2].folder.identity.folderId,
+                       receipt.folders[2].operations[0].key, child));
+  EXPECT_EQ(source.operations[0].key, child.sourceKey);
+  EXPECT_EQ(55u, child.sourceUid);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportOperationOnlyKeysStayDistinct) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  // Remove the original source header but retain its real queued identity.
+  auto& first = input.folders[0];
+  first.snapshot.messages.RemoveElementAt(1);
+  first.snapshot.messages[0].rootSourceKey = 9;
+  first.snapshot.messages[0].parentSourceKey.reset();
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  ASSERT_EQ(1u, receipt.folders[0].folder.keys.Length());
+  nsMsgKey key = receipt.folders[0].operations[0].key;
+  bool exists;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().MessageExists(key, exists));
+  EXPECT_FALSE(exists);
+  EXPECT_NE(key, receipt.folders[0].folder.keys[0].destination);
+  Maybe<ServerMessageLocation> source;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperationSource(
+                       first.snapshot.identity.folderId, key, source));
+  ASSERT_TRUE(source);
+  EXPECT_EQ(key, source->key);
+  EXPECT_EQ(61u, source->epoch);
+  EXPECT_EQ(55u, source->uid);
+  nsMsgKey next;
+  ASSERT_EQ(NS_OK, Add("after-connected-unit@invalid"_ns, {}, next));
+  EXPECT_GT(next, key);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportHoldQueryKeepsFlagCustodyAndReceipt) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ASSERT_EQ(3u, input.folders.Length());
+  input.folders.RemoveElementAt(2);
+  input.folders.RemoveElementAt(1);
+  auto& operation = input.folders[0].operations[0];
+  operation.payload.operation = nsIMsgOfflineImapOperation::kFlagsChanged;
+  operation.payload.copyDestinations.Clear();
+  operation.copies.Clear();
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  const auto saved = receipt.folders[0].operations[0];
+  const uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    if (pass) {
+      Stop();
+      ASSERT_EQ(NS_OK, Start());
+    }
+    auto& db = mCore->MessageDB();
+    bool held = false;
+    ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+    EXPECT_TRUE(held);
+    QueuedSourceIdentity identity;
+    ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(folder, saved.key, identity));
+    EXPECT_EQ(saved.id, identity.operationId);
+    EXPECT_EQ(saved.revision, identity.revision);
+    OfflineOperationData payload;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(folder, saved.key, payload));
+    EXPECT_EQ(uint32_t(nsIMsgOfflineImapOperation::kFlagsChanged),
+              payload.operation);
+    EXPECT_EQ(0x80000001u, payload.newFlags);
+    uint64_t attempt = 999;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BeginOfflineAttempt(folder, saved.key, payload.operation,
+                                     Nothing(), attempt));
+    EXPECT_EQ(999u, attempt);
+    int64_t holds, attempts;
+    ASSERT_EQ(NS_OK, MigrationHoldCounts(holds, attempts));
+    EXPECT_EQ(1, holds);
+    EXPECT_EQ(0, attempts);
+    ImapImportReceipt recovered;
+    ASSERT_EQ(NS_OK, ImportImap(input, recovered));
+    EXPECT_EQ(saved.id, recovered.folders[0].operations[0].id);
+    EXPECT_EQ(saved.revision, recovered.folders[0].operations[0].revision);
+  }
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportHoldQueryErrorsPreserveOutput) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true, true));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  const auto saved = receipt.folders[0].operations[0];
+  const uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  RefPtr<MessageDatabase> retired = &mCore->MessageDB();
+  Stop();
+  bool held = true;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            retired->IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_TRUE(held);
+  ASSERT_EQ(NS_OK, Start());
+  held = false;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            retired->IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_TRUE(held);
+  for (bool original : {false, true}) {
+    held = original;
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, db.IsOfflineImportHeld(0, saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_INVALID_ARG,
+              db.IsOfflineImportHeld(UINT64_MAX, saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_INVALID_ARG, db.IsOfflineImportHeld(folder, 0, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_INVALID_ARG,
+              db.IsOfflineImportHeld(folder, nsMsgKey_None, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(
+        NS_ERROR_NOT_AVAILABLE,
+        db.IsOfflineImportHeld(receipt.folders[1].folder.identity.folderId,
+                               saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.IsOfflineImportHeld(INT64_MAX, saved.key, held));
+    EXPECT_EQ(original, held);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.IsOfflineImportHeld(folder, nsMsgKey_None - 1, held));
+    EXPECT_EQ(original, held);
+  }
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("UPDATE imap_import_operation_holds "
+                                          "SET messageKey=messageKey+1"_ns));
+  held = false;
+  EXPECT_EQ(NS_ERROR_FILE_CORRUPTED,
+            db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "UPDATE imap_import_operation_holds "
+                "SET messageKey=messageKey-1, databaseSourceId='foreign'"_ns));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
+  {
+    nsCOMPtr<mozIStorageStatement> restore;
+    ASSERT_EQ(NS_OK,
+              mConnection->CreateStatement("UPDATE imap_import_operation_holds "
+                                           "SET databaseSourceId=:source"_ns,
+                                           getter_AddRefs(restore)));
+    ASSERT_EQ(NS_OK, restore->BindUTF8StringByName("source"_ns,
+                                                   input.databaseSourceId));
+    ASSERT_EQ(NS_OK, restore->Execute());
+  }
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_TRUE(held);
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                       "DROP TABLE imap_import_operation_holds"_ns));
+  EXPECT_TRUE(NS_FAILED(db.IsOfflineImportHeld(folder, saved.key, held)));
+  EXPECT_TRUE(held);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ImapImportMissingMoveRetainsDurableDispatchHold) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true, true));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  const auto saved = receipt.folders[0].operations[0];
+  const uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  const uint32_t word = input.folders[0].operations[0].payload.operation;
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    if (pass) {
+      Stop();
+      ASSERT_EQ(NS_OK, Start());
+    }
+    auto& db = mCore->MessageDB();
+    bool held = false;
+    ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+    EXPECT_TRUE(held);
+    OfflineOperationData payload;
+    ASSERT_EQ(NS_OK, db.GetOfflineOperation(folder, saved.key, payload));
+    EXPECT_EQ(word, payload.operation);
+    EXPECT_EQ(0x80000001u, payload.newFlags);
+    EXPECT_EQ("captured ordered keywords"_ns, payload.keywordsToAdd);
+    EXPECT_EQ((nsTArray<nsCString>{input.folders[2].uri, input.folders[1].uri}),
+              payload.copyDestinations);
+    ASSERT_EQ(2u, payload.copyDestinationBindings.Length());
+    ASSERT_TRUE(payload.pendingDestination);
+    EXPECT_FALSE(payload.flagMutation);
+    EXPECT_FALSE(payload.moveSourceGuard);
+    bool exists = true;
+    ASSERT_EQ(NS_OK, db.MessageExists(saved.key, exists));
+    EXPECT_FALSE(exists);
+    uint64_t attempt = 999;
+    for (uint32_t action : {nsIMsgOfflineImapOperation::kMsgMoved,
+                            nsIMsgOfflineImapOperation::kMsgCopy,
+                            nsIMsgOfflineImapOperation::kFlagsChanged,
+                            nsIMsgOfflineImapOperation::kAddKeywords}) {
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                db.BeginOfflineAttempt(folder, saved.key, action,
+                                       payload.pendingDestination, attempt));
+      EXPECT_EQ(999u, attempt);
+      const bool copy = action == nsIMsgOfflineImapOperation::kMsgCopy;
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                db.BeginOfflineAction(folder, saved.key, action,
+                                      copy ? payload.copyDestinationBindings[0]
+                                           : payload.pendingDestination,
+                                      copy ? Some(0u) : Nothing(), attempt));
+      EXPECT_EQ(999u, attempt);
+    }
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BeginOfflineAction(
+                  folder, saved.key, nsIMsgOfflineImapOperation::kMsgCopy,
+                  payload.copyDestinationBindings[0], Some(0u), attempt));
+    EXPECT_EQ(999u, attempt);
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.SetOfflineOperationPlayingBack(folder, saved.key, true));
+    OfflineOperationUndo undo;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.CaptureOfflineOperationForUndo(folder, saved.key,
+                                                input.databaseSourceId, undo));
+    // Neither clearing all action bits nor rewriting the full data unholds it.
+    const auto destination = payload.pendingDestination;
+    payload.operation = 0;
+    payload.pendingDestination.reset();
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(folder, saved.key, payload));
+    held = false;
+    ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+    EXPECT_TRUE(held);
+    payload.operation = word;
+    payload.pendingDestination = destination;
+    ASSERT_EQ(NS_OK, db.StoreOfflineOperation(folder, saved.key, payload));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BeginOfflineAttempt(folder, saved.key,
+                                     nsIMsgOfflineImapOperation::kMsgMoved,
+                                     payload.pendingDestination, attempt));
+    int64_t holds, attempts;
+    ASSERT_EQ(NS_OK, MigrationHoldCounts(holds, attempts));
+    EXPECT_EQ(1, holds);
+    EXPECT_EQ(0, attempts);
+  }
+  auto& db = mCore->MessageDB();
+  Maybe<ServerMessageLocation> source;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(folder, saved.key, source));
+  ASSERT_TRUE(source);
+  // An explicit ordinary mutation removes the old unknown flag intent before
+  // queuing a genuinely typed delta. The operation's migration hold persists.
+  OfflineOperationData changed;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(folder, saved.key, changed));
+  changed.operation &= ~nsIMsgOfflineImapOperation::kFlagsChanged;
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(folder, saved.key, changed));
+  ASSERT_EQ(NS_OK,
+            db.QueueOfflineProtocolFlagMutation(input.databaseSourceId, folder,
+                                                saved.key, *source, 1, true));
+  uint64_t next = 999;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BeginOfflineAction(folder, saved.key,
+                                  nsIMsgOfflineImapOperation::kFlagsChanged,
+                                  Nothing(), Nothing(), next));
+  EXPECT_EQ(999u, next);
+  // An old attempt cannot become resumable even if a stale row is encountered.
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "INSERT INTO "
+          "offline_attempts(operationId,revision,state,operationFolderId,"
+          "operation) "
+          "SELECT id,revision,1,folderId,operation FROM offline_operations "
+          "WHERE id IN(SELECT operationId FROM imap_import_operation_holds)"_ns));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  ASSERT_EQ(NS_OK,
+            mConnection->CreateStatement("SELECT id FROM offline_attempts"_ns,
+                                         getter_AddRefs(stmt)));
+  bool more;
+  ASSERT_EQ(NS_OK, stmt->ExecuteStep(&more));
+  ASSERT_TRUE(more);
+  int64_t attemptId;
+  ASSERT_EQ(NS_OK, stmt->GetInt64(0, &attemptId));
+  ASSERT_EQ(NS_OK, stmt->Finalize());
+  OfflineAttempt output;
+  output.id = 999;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.GetOfflineAttempt(attemptId, output));
+  EXPECT_EQ(999u, output.id);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.GetCurrentOfflineAttempt(folder, saved.key, output));
+  EXPECT_EQ(999u, output.id);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ResolveOfflineAttemptNotApplied(attemptId));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.MarkOfflineAttemptAmbiguous(attemptId));
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ConfirmOfflineAttempt(attemptId, Nothing()));
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportPureCopyKeepsTypedDispatchAdmission) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  input.folders[0].operations[0].payload.operation =
+      nsIMsgOfflineImapOperation::kMsgCopy;
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  auto& db = mCore->MessageDB();
+  const auto saved = receipt.folders[0].operations[0];
+  const uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  OfflineOperationData payload;
+  ASSERT_EQ(NS_OK, db.GetOfflineOperation(folder, saved.key, payload));
+  bool held = true;
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, saved.key, held));
+  EXPECT_FALSE(held);
+  uint64_t attempt = 999;
+  ASSERT_EQ(NS_OK, db.BeginOfflineAction(
+                       folder, saved.key, nsIMsgOfflineImapOperation::kMsgCopy,
+                       payload.copyDestinationBindings[1], Some(1u), attempt));
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attempt, actual));
+  EXPECT_EQ(Some(1u), actual.copyOrdinal);
+  EXPECT_EQ(saved.id, actual.operationId);
+  int64_t holds, attempts;
+  ASSERT_EQ(NS_OK, MigrationHoldCounts(holds, attempts));
+  EXPECT_EQ(0, holds);
+  EXPECT_EQ(1, attempts);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportHoldRetiresBeforeOperationIdReuse) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true, true));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  const auto saved = receipt.folders[0].operations[0];
+  const uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  for (const auto& member : receipt.folders) {
+    for (const auto& op : member.operations) {
+      ASSERT_EQ(NS_OK, mCore->MessageDB().RemoveOfflineOperation(
+                           member.folder.identity.folderId, op.key));
+    }
+  }
+  int64_t holds, attempts;
+  ASSERT_EQ(NS_OK, MigrationHoldCounts(holds, attempts));
+  EXPECT_EQ(0, holds);
+  // Force actual SQLite ID reuse as a lifetime control. No hold or dispatch
+  // authority may leak from the retired row into an unrelated ordinary intent.
+  nsAutoCString reset("UPDATE sqlite_sequence SET seq=");
+  reset.AppendInt(saved.id - 1);
+  reset.AppendLiteral(" WHERE name='offline_operations'");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(reset));
+  nsMsgKey key = receipt.folders[0].folder.keys[0].destination;
+  OfflineOperationData normal;
+  normal.operation = nsIMsgOfflineImapOperation::kAddKeywords;
+  normal.keywordsToAdd = "new ordinary intent"_ns;
+  auto& db = mCore->MessageDB();
+  ASSERT_EQ(NS_OK, db.StoreOfflineOperation(folder, key, normal));
+  QueuedSourceIdentity identity;
+  ASSERT_EQ(NS_OK, db.GetQueuedSourceIdentity(folder, key, identity));
+  EXPECT_EQ(saved.id, identity.operationId);
+  bool held = true;
+  ASSERT_EQ(NS_OK, db.IsOfflineImportHeld(folder, key, held));
+  EXPECT_FALSE(held);
+  uint64_t attempt = 999;
+  ASSERT_EQ(NS_OK, db.BeginOfflineAttempt(folder, key, normal.operation,
+                                          Nothing(), attempt));
+  OfflineAttempt actual;
+  ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attempt, actual));
+  EXPECT_EQ(saved.id, actual.operationId);
+  ASSERT_TRUE(actual.source);
+  EXPECT_EQ(key, actual.source->key);
+  ASSERT_EQ(NS_OK, MigrationHoldCounts(holds, attempts));
+  EXPECT_EQ(0, holds);
+  EXPECT_EQ(1, attempts);
+  // Retirement must not erase or recreate the immutable imported receipt.
+  ImapImportReceipt recovered;
+  ASSERT_EQ(NS_OK, ImportImap(input, recovered));
+  EXPECT_EQ(saved.id, recovered.folders[0].operations[0].id);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportHoldWriteFailureRollsBackWholeUnit) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true, true));
+  ASSERT_EQ(
+      NS_OK,
+      mConnection->ExecuteSimpleSQL(
+          "CREATE TEMP TRIGGER reject_imap_hold BEFORE INSERT ON "
+          "imap_import_operation_holds BEGIN SELECT RAISE(ABORT,'hold failure'); END"_ns));
+  uint32_t callbacks = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) { ++callbacks; });
+  auto& db = mCore->MessageDB();
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ImapImportReceipt output;
+  output.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, ImportImap(input, output));
+  EXPECT_EQ("unchanged"_ns, output.token);
+  EXPECT_EQ(0u, callbacks);
+  int64_t holds, attempts;
+  ASSERT_EQ(NS_OK, MigrationHoldCounts(holds, attempts));
+  EXPECT_EQ(0, holds);
+  EXPECT_EQ(0, attempts);
+  uint64_t count;
+  ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+  EXPECT_EQ(0u, count);
+  for (const auto& member : input.folders) {
+    nsTArray<nsMsgKey> keys;
+    ASSERT_EQ(NS_OK, db.ListOfflineOperations(member.snapshot.identity.folderId,
+                                              false, keys));
+    EXPECT_TRUE(keys.IsEmpty());
+  }
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER reject_imap_hold"_ns));
+  ASSERT_EQ(NS_OK, ImportImap(input, output));
+  EXPECT_EQ(4u, callbacks);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportRefusesUnresolvedOrAmbiguousUnit) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  auto& copy = *input.folders[0].operations[0].copies[0];
+  nsCString token = copy.token;
+  copy.token = "not-in-connected-unit"_ns;
+  ImapImportReceipt output;
+  output.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ImportImap(input, output));
+  EXPECT_EQ("unchanged"_ns, output.token);
+  copy.token = token;
+  input.folders[0].operations[0].payload.playingBack = true;
+  EXPECT_EQ(NS_ERROR_INVALID_ARG, ImportImap(input, output));
+  input.folders[0].operations[0].payload.playingBack = false;
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS, ImportImap(input, output));
+  bool active;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(0u, count);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportReceiptFailureRollsBackWholeUnit) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL(
+                "CREATE TEMP TRIGGER reject_imap_unit BEFORE INSERT ON "
+                "imap_import_units "
+                "BEGIN SELECT RAISE(ABORT,'unit receipt failure'); END"_ns));
+  uint32_t callbacks = 0;
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) { ++callbacks; });
+  auto& db = mCore->MessageDB();
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ImapImportReceipt output;
+  output.token = "unchanged"_ns;
+  EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, ImportImap(input, output));
+  EXPECT_EQ("unchanged"_ns, output.token);
+  EXPECT_EQ(0u, callbacks);
+  uint64_t count;
+  ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+  EXPECT_EQ(0u, count);
+  for (const auto& member : input.folders) {
+    Maybe<FolderImportReceipt> old;
+    ASSERT_EQ(NS_OK,
+              mCore->GetFolderImportReceipt(member.snapshot.identity, old));
+    EXPECT_FALSE(old);
+  }
+  ASSERT_EQ(NS_OK,
+            mConnection->ExecuteSimpleSQL("DROP TRIGGER reject_imap_unit"_ns));
+  ASSERT_EQ(NS_OK, ImportImap(input, output));
+  EXPECT_EQ(4u, callbacks);
+}
+
+TEST_F(DeliveryCoreReferences,
+       ImapImportCommitBeforeCheckpointKeepsConsumedReceipt) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  uint64_t folder = receipt.folders[0].folder.identity.folderId;
+  auto saved = receipt.folders[0].operations[0];
+  ASSERT_EQ(NS_OK,
+            mCore->MessageDB().RemoveOfflineOperation(folder, saved.key));
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportReceipt recovered;
+  ASSERT_EQ(NS_OK, ImportImap(input, recovered));
+  EXPECT_EQ(saved.key, recovered.folders[0].operations[0].key);
+  EXPECT_EQ(saved.id, recovered.folders[0].operations[0].id);
+  EXPECT_EQ(saved.revision, recovered.folders[0].operations[0].revision);
+  OfflineOperationData absent;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            mCore->MessageDB().GetOfflineOperation(folder, saved.key, absent));
+  uint64_t count;
+  ASSERT_EQ(NS_OK, mCore->MessageDB().GetTotalCount(&count));
+  EXPECT_EQ(4u, count);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportRejectsChangedIdentityAndSource) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input));
+  ImapImportReceipt receipt;
+  ASSERT_EQ(NS_OK, ImportImap(input, receipt));
+  ImapImportReceipt output;
+  output.token = "unchanged"_ns;
+  nsCString hash = input.folders[0].snapshot.identity.sourceSha256;
+  input.folders[0].snapshot.identity.sourceSha256.Replace(0, 1, "a");
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ImportImap(input, output));
+  input.folders[0].snapshot.identity.sourceSha256 = hash;
+  input.databaseSourceId = "different-database-incarnation"_ns;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, ImportImap(input, output));
+  input.databaseSourceId = receipt.databaseSourceId;
+  input.folders[0].serverUids[0].uid = 57;
+  EXPECT_EQ(NS_ERROR_ALREADY_INITIALIZED, ImportImap(input, output));
+  EXPECT_EQ("unchanged"_ns, output.token);
+}
+
+TEST_F(DeliveryCoreReferences, ImapImportPublishesCompleteOutputsOnly) {
+  ASSERT_EQ(NS_OK, Start());
+  ImapImportUnit input;
+  ASSERT_EQ(NS_OK, PrepareImapImport(input, true));
+  ImapImportReceipt output;
+  output.token = "unchanged"_ns;
+  uint32_t prepared = 0, callbacks = 0;
+  bool published = false;
+  EXPECT_EQ(NS_ERROR_OUT_OF_MEMORY,
+            ImportImap(
+                input, output,
+                [&](const ImapImportReceipt& value) -> nsresult {
+                  EXPECT_EQ(3u, value.folders.Length());
+                  ++prepared;
+                  return NS_ERROR_OUT_OF_MEMORY;
+                },
+                [&] { published = true; }));
+  EXPECT_EQ("unchanged"_ns, output.token);
+  EXPECT_FALSE(published);
+  RefPtr<PublicationObserver> observer =
+      new PublicationObserver([&](Message*, bool) {
+        ++callbacks;
+        EXPECT_TRUE(published);
+        ASSERT_EQ(3u, output.folders.Length());
+        bool active = true;
+        ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+        EXPECT_FALSE(active);
+        OfflineOperationData copy;
+        ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperation(
+                             output.folders[0].folder.identity.folderId,
+                             output.folders[0].operations[0].key, copy));
+        EXPECT_EQ(2u, copy.copyDestinationBindings.Length());
+      });
+  auto& db = mCore->MessageDB();
+  db.AddMessageListener(observer);
+  auto remove = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  ASSERT_EQ(NS_OK, ImportImap(
+                       input, output,
+                       [&](const ImapImportReceipt& value) -> nsresult {
+                         EXPECT_EQ(3u, value.folders.Length());
+                         ++prepared;
+                         return NS_OK;
+                       },
+                       [&] { published = true; }));
+  EXPECT_EQ(2u, prepared);
+  EXPECT_EQ(4u, callbacks);
+}
+
 TEST_F(DeliveryCoreReferences,
        NativeImportHistoricalPathRetryPreservesReceipt) {
   ASSERT_EQ(NS_OK, Start());
@@ -7710,7 +8982,7 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, Start());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(19, version);
+  EXPECT_EQ(21, version);
   OfflineOperationData got;
   ASSERT_EQ(NS_OK, mCore->MessageDB().GetOfflineOperation(mFolderId, key, got));
   EXPECT_EQ(input.operation, got.operation);
@@ -9455,6 +10727,125 @@ TEST_F(DeliveryCoreReferences, WindowsImportRequiresOriginalPhysicalContext) {
   EXPECT_EQ(paths.store.rootId, recovered->identity.windows->store.rootId);
 }
 
+TEST_F(DeliveryCoreReferences,
+       WindowsImportDirectoryStoreKeepsPhysicalGuardsAndReceipt) {
+  ASSERT_EQ(NS_OK, Start());
+  FolderImportSnapshot input;
+  nsCOMPtr<nsIFile> source;
+  ASSERT_EQ(NS_OK, PrepareNativeImport(input, getter_AddRefs(source)));
+  nsCOMPtr<nsIFile> store;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(store)));
+  ASSERT_EQ(NS_OK, store->Append(u"native-maildir"_ns));
+  ASSERT_EQ(NS_OK, store->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  for (const auto& name : {u"cur"_ns, u"tmp"_ns}) {
+    nsCOMPtr<nsIFile> child;
+    ASSERT_EQ(NS_OK, store->Clone(getter_AddRefs(child)));
+    ASSERT_EQ(NS_OK, child->Append(name));
+    ASSERT_EQ(NS_OK, child->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  }
+  ASSERT_EQ(NS_OK,
+            ImportPathIdentity(store, input.identity.windows->store,
+                               nsIPanoramaMigrationFileSystem::KIND_DIRECTORY));
+  const auto paths = *input.identity.windows;
+  FolderImportReceipt output;
+  output.identity.token = "unchanged"_ns;
+  uint32_t callbacks = 0;
+  RefPtr<PublicationObserver> observer = new PublicationObserver([&](Message*,
+                                                                     bool) {
+    ++callbacks;
+    EXPECT_EQ(input.identity.token, output.identity.token);
+    // The caller's capture lease has closed. Core's independent directory
+    // admission must prevent replacement until publication returns.
+    EXPECT_TRUE(NS_FAILED(store->RenameTo(mProfile, u"blocked-maildir"_ns)));
+    bool exists;
+    ASSERT_EQ(NS_OK, store->Exists(&exists));
+    EXPECT_TRUE(exists);
+  });
+  auto& db = mCore->MessageDB();
+  db.AddMessageListener(observer);
+  auto cleanup = MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+  auto reject = [&](nsIFile* summary, nsresult expected) {
+    EXPECT_EQ(expected, ImportNativeFile(summary, input, output));
+    EXPECT_EQ("unchanged"_ns, output.identity.token);
+    EXPECT_EQ(0u, callbacks);
+    uint64_t count;
+    ASSERT_EQ(NS_OK, db.GetTotalCount(&count));
+    EXPECT_EQ(0u, count);
+  };
+  input.identity.windows->store.id.Assign(
+      "0000000000000000:00000000000000000000000000000000");
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.parentId.Assign(
+      "0000000000000000:00000000000000000000000000000000");
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.rootId.Assign(
+      "0000000000000000:00000000000000000000000000000000");
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.canonicalPath = paths.summary.canonicalPath;
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  input.identity.windows = Some(paths);
+  input.identity.windows->store.id.Truncate();
+  reject(source,
+         NS_ERROR_FILE_INVALID_PATH);  // Absent cannot bless a directory.
+  input.identity.windows = Some(paths);
+  reject(store, NS_ERROR_FILE_INVALID_PATH);  // Live summary stays FILE-only.
+  input.identity.windows->summary = paths.store;
+  input.identity.sourcePath = paths.store.canonicalPath;
+  reject(store, NS_ERROR_FILE_INVALID_PATH);  // Original summary too.
+  input.identity.windows = Some(paths);
+  input.identity.sourcePath = paths.summary.canonicalPath;
+
+  // Replace the directory before acquisition, retaining the old object so its
+  // physical ID cannot be reused. A matching path/type is not sufficient.
+  ASSERT_EQ(NS_OK, store->RenameTo(mProfile, u"original-maildir"_ns));
+  nsCOMPtr<nsIFile> original, replacement;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(original)));
+  ASSERT_EQ(NS_OK, original->Append(u"original-maildir"_ns));
+  ASSERT_EQ(NS_OK, NS_NewLocalFile(paths.store.originalPath,
+                                   getter_AddRefs(replacement)));
+  ASSERT_EQ(NS_OK, replacement->Create(nsIFile::DIRECTORY_TYPE, 0700));
+  reject(source, NS_ERROR_NOT_AVAILABLE);
+  ASSERT_EQ(NS_OK, replacement->Remove(true));
+  ASSERT_EQ(NS_OK, original->RenameTo(mProfile, u"native-maildir"_ns));
+  ASSERT_EQ(NS_OK,
+            NS_NewLocalFile(paths.store.originalPath, getter_AddRefs(store)));
+  Maybe<FolderImportReceipt> missing;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, missing));
+  EXPECT_FALSE(missing);
+
+  ASSERT_EQ(NS_OK, ImportNativeFile(source, input, output));
+  EXPECT_EQ(2u, callbacks);
+  ASSERT_TRUE(output.identity.windows);
+  EXPECT_EQ(paths.store.id, output.identity.windows->store.id);
+  EXPECT_EQ(paths.store.originalPath,
+            output.identity.windows->store.originalPath);
+  EXPECT_EQ(paths.store.originalRoot,
+            output.identity.windows->store.originalRoot);
+  ASSERT_EQ(NS_OK, store->RenameTo(mProfile, u"after-maildir"_ns));
+  nsCOMPtr<nsIFile> after;
+  ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(after)));
+  ASSERT_EQ(NS_OK, after->Append(u"after-maildir"_ns));
+  ASSERT_EQ(NS_OK, after->RenameTo(mProfile, u"native-maildir"_ns));
+  db.RemoveMessageListener(observer);
+  cleanup.release();
+  Stop();
+  ASSERT_EQ(NS_OK, Start());
+  Maybe<FolderImportReceipt> recovered;
+  ASSERT_EQ(NS_OK, mCore->GetFolderImportReceipt(input.identity, recovered));
+  ASSERT_TRUE(recovered && recovered->identity.windows);
+  EXPECT_EQ(2u, recovered->keys.Length());
+  EXPECT_EQ(paths.store.id, recovered->identity.windows->store.id);
+  EXPECT_EQ(paths.store.parentId, recovered->identity.windows->store.parentId);
+  EXPECT_EQ(paths.store.rootId, recovered->identity.windows->store.rootId);
+  EXPECT_EQ(paths.store.canonicalPath,
+            recovered->identity.windows->store.canonicalPath);
+  EXPECT_EQ(paths.store.canonicalRoot,
+            recovered->identity.windows->store.canonicalRoot);
+}
+
 TEST_F(DeliveryCoreReferences, WindowsImportCannotRebindOldReceipt) {
   ASSERT_EQ(NS_OK, Start());
   FolderImportSnapshot input;
@@ -9613,7 +11004,7 @@ TEST_F(DeliveryCoreReferences, Schema14UpgradeKeepsThreadAndPendingState) {
   ASSERT_EQ(NS_OK, Start());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(19, version);
+  EXPECT_EQ(21, version);
   nsCString reopenedId;
   ASSERT_EQ(NS_OK, mCore->GetSourceId(reopenedId));
   EXPECT_EQ(sourceId, reopenedId);
@@ -12759,7 +14150,7 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_EQ(NS_OK, Start());
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(19, version);
+  EXPECT_EQ(21, version);
   auto& db = mCore->MessageDB();
   Maybe<ServerMessageLocation> source;
   ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
@@ -18140,7 +19531,7 @@ TEST_F(DeliveryCoreReferences,
   EXPECT_EQ(123u, output.id);
   int32_t version;
   ASSERT_EQ(NS_OK, mConnection->GetSchemaVersion(&version));
-  EXPECT_EQ(19, version);
+  EXPECT_EQ(21, version);
 }
 
 TEST_F(DeliveryCoreReferences,

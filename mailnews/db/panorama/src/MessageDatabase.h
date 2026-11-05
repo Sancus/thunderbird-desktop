@@ -599,6 +599,10 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult ReserveOfflineOperationKey(uint64_t folderId, nsMsgKey& key);
   nsresult GetOfflineOperation(uint64_t folderId, nsMsgKey key,
                                OfflineOperationData& output);
+  // Read-only custody query for an existing exact folder/key operation.
+  // Missing, stale-owner, corrupt-binding and storage errors preserve held.
+  // False does not authorize dispatch or bypass the ordinary replay guards.
+  nsresult IsOfflineImportHeld(uint64_t folderId, nsMsgKey key, bool& held);
   // Reads the immutable queued tuple, even after local message removal.
   // Nothing means no captured tuple; a missing operation is NOT_AVAILABLE.
   // Does not check the current server epoch or begin an attempt.
@@ -826,6 +830,8 @@ class MessageDatabase : public nsIMessageDatabase {
                                         Maybe<ServerMessageLocation>& source,
                                         Maybe<uint32_t>* folderEpoch = nullptr);
   nsresult RequireOfflineOperationMutable(int64_t operationId);
+  nsresult ReadOfflineImportHold(int64_t operationId, bool& held);
+  nsresult RequireOfflineImportDispatchable(int64_t operationId);
   nsresult ValidateQueuedSourceIdentity(const QueuedSourceIdentity& expected);
   nsresult ObserveDestinationEpochInTransaction(
       const QueuedSourceIdentity& expected, uint32_t action,
@@ -855,6 +861,13 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult FinishOfflineMoveInTransaction(const OfflineAttempt& attempt,
                                           bool removed,
                                           OfflineMoveSettlement& output);
+  // Only DatabaseCore's fully checked connected migration unit can establish
+  // an operation without a live header. Ordinary callers retain their guard.
+  nsresult ImportOfflineOperationInTransaction(
+      uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
+      const Maybe<ServerMessageLocation>& source, uint64_t& operationId,
+      uint64_t& revision);
+
   nsresult StoreOfflineOperationInTransaction(
       uint64_t folderId, nsMsgKey key, const OfflineOperationData& input,
       const OfflineOperationUndo* restoring = nullptr,

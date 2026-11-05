@@ -1,0 +1,519 @@
+{
+  "version": 1,
+  "backend": "panorama",
+  "platform": "linux",
+  "captureProfilePath": "/build/obj-debug/temp/xpc-profile-0dbrpwet",
+  "store": "mbox",
+  "configuredStoreContractID": "@mozilla.org/msgstore/berkeleystore;1",
+  "members": [
+    {
+      "name": "MigrationClassic",
+      "uri": "imap://user@localhost/MigrationClassic",
+      "folderId": 6,
+      "folder": {
+        "id": 6,
+        "uri": "imap://user@localhost/MigrationClassic",
+        "protocol": "imap",
+        "summaryPath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationClassic.msf",
+        "storePath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationClassic",
+        "storeType": "mbox",
+        "rootURI": "imap://user@localhost",
+        "serverKey": "server1",
+        "mailRoot": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost"
+      },
+      "epoch": 1793822163,
+      "headers": [
+        {
+          "key": 5001,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "storeToken": "2685",
+          "size": 2599,
+          "offlineSize": 2650
+        }
+      ],
+      "operations": [
+        {
+          "messageKey": 5000,
+          "operation": 3079,
+          "flagOperation": 0,
+          "newFlags": 4,
+          "srcMessageKey": 4294967295,
+          "srcUid": 5000,
+          "sourceFolderURI": "",
+          "destinationFolderURI": "imap://user@localhost/MigrationMove",
+          "keywordsToAdd": "s518-added",
+          "keywordsToRemove": "s518-removed",
+          "msgSize": 2599,
+          "playingBack": false,
+          "copies": [
+            "imap://user@localhost/MigrationCopyOne",
+            "imap://user@localhost/MigrationCopyTwo"
+          ]
+        }
+      ],
+      "keyMap": [
+        [3, 5001],
+        [2, 5000]
+      ],
+      "sha256": "44eb3736b9851bdf6e293c62a8df0875acfe9df8102a8a5373f3c53a182b19f0",
+      "size": 2590,
+      "base64": "Ly8gPCEtLSA8bWRiOm1vcms6eiB2PSIxLjQiLz4gLS0+CjwgPChhPWMpPiAvLyAoZj1pc28tODg1OS0xKQogIChCOD1uZXdGbGFncykoQjk9c3JjTXNnS2V5KShCQT1zcmNVaWQpKEJCPW1zZ1NpemUpKEJDPWluUGxheWJhY2spCiAgKEJEPW1vdmVEZXN0KShCRT1hZGRlZEtleXdvcmRzKShCRj1yZW1vdmVkS2V5d29yZHMpKEMwPWNvcHlEZXN0cykKICAoQzE9c3JjRm9sZGVyVVJJKSg4MD1uczptc2c6ZGI6cm93OnNjb3BlOm1zZ3M6YWxsKSg4MT1zdWJqZWN0KQogICg4Mj1zZW5kZXIpKDgzPW1lc3NhZ2UtaWQpKDg0PXJlZmVyZW5jZXMpKDg1PXJlY2lwaWVudHMpKDg2PWRhdGUpCiAgKDg3PXNpemUpKDg4PWZsYWdzKSg4OT1wcmlvcml0eSkoOEE9bGFiZWwpKDhCPW51bUxpbmVzKSg4Qz1jY0xpc3QpCiAgKDhEPWJjY0xpc3QpKDhFPW1zZ1RocmVhZElkKSg4Rj10aHJlYWRJZCkoOTA9dGhyZWFkRmxhZ3MpCiAgKDkxPXRocmVhZE5ld2VzdE1zZ0RhdGUpKDkyPWNoaWxkcmVuKSg5Mz11bnJlYWRDaGlsZHJlbikKICAoOTQ9dGhyZWFkU3ViamVjdCkoOTU9bXNnQ2hhclNldCkoOTY9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6bXNncykKICAoOTc9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6dGhyZWFkKSg5OD1uczptc2c6ZGI6dGFibGU6a2luZDphbGx0aHJlYWRzKQogICg5OT1uczptc2c6ZGI6cm93OnNjb3BlOnRocmVhZHM6YWxsKSg5QT10aHJlYWRQYXJlbnQpKDlCPXRocmVhZFJvb3QpCiAgKDlDPW1zZ09mZnNldCkoOUQ9b2ZmbGluZU1zZ1NpemUpKDlFPXVpZE9uU2VydmVyKQogICg5Rj1uczptc2c6ZGI6cm93OnNjb3BlOmRiZm9sZGVyaW5mbzphbGwpCiAgKEEwPW5zOm1zZzpkYjp0YWJsZTpraW5kOmRiZm9sZGVyaW5mbykoQTE9bnVtTXNncykoQTI9bnVtTmV3TXNncykKICAoQTM9Zm9sZGVyU2l6ZSkoQTQ9ZXhwdW5nZWRCeXRlcykoQTU9Zm9sZGVyRGF0ZSkoQTY9aGlnaFdhdGVyS2V5KQogIChBNz1tYWlsYm94TmFtZSkoQTg9VUlEVmFsaWRpdHkpKEE5PXRvdFBlbmRpbmdNc2dzKQogIChBQT11bnJlYWRQZW5kaW5nTXNncykoQUI9dmVyc2lvbikoQUM9Zm9yY2VSZXBhcnNlKQogIChBRD1maXhlZEJhZFJlZlRocmVhZGluZykoQUU9c3RvcmVUb2tlbikoQUY9a2V5d29yZHMpCiAgKEIwPVByb3RvVGhyZWFkRmxhZ3MpKEIxPW5zOm1zZzpkYjpyb3c6c2NvcGU6cGVuZGluZzphbGwpCiAgKEIyPW5zOm1zZzpkYjp0YWJsZTpraW5kOnBlbmRpbmcpKEIzPW5zOm1zZzpkYjpyb3c6c2NvcGU6b3BzOmFsbCkKICAoQjQ9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6b3BzKShCNT1vcCkoQjY9bXNnS2V5KShCNz1vcEZsYWdzKT4KPCg4Rj0xMzg5KSg4OD00ODQ5NmU5MykoODE9MCkoODA9MSk+ClsxOm0oXjlCXjhGKSheOEZeOEYpKF45MV44OCkoXjkwPTApKF45Mj0xKSheOTM9MSldCjwoOTA9MTM4OCk+WzI6bSheOUJeOTApKF44Rl45MCkoXjkxPTApKF45MD0wKSheOTI9MCkoXjkzPTApXQoKPCg4Mj0yMDA4MDYwNjE3MDYubTU2SDZSV1QwMDQ5MzNAbXJhcHA1NC5tb3ppbGxhLm9yZykoODMKICAgID1bQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkIG5vdGlmaWNhdGlvbnMgcXVpXAp0ZSBicm9rZW4pKDg0PWJ1Z3ppbGxhLWRhZW1vbkBtb3ppbGxhLm9yZykoODU9ZXhhbXBsZUBleGFtcGxlLmNvbSkoODYKICAgID1pbnZhbGlkQGV4YW1wbGUuY29tKSg4Nz0pKDg5PWEyNykoOEE9MjY4NSkoOEI9YTVhKSg4Qz0zYykoOEQ9ODApCiAgKDhFPWZmZmZmZmZmKT4KezE6XjgwIHsoa145NjpjKShzPTkpfSAKICBbMTM4OSheODNeODIpKF44MV44MykoXjgyXjg0KSheODVeODUpKF44Q144NikoXjhEPSkoXjg2Xjg4KSheODk9MSkKICAgICheODdeODkpKF5BRV44QSkoXjlEXjhCKSheOEI9M2MpKF44OD04MCkoXjg0PSkoXkFGPTApKF45QV44RSkoXjhFXjhGKQogICAgKF5CMD0wKV19CnsxMzg4Ol44MCB7KGteOTc6Yykocz05KTI6bSB9IH0KezEzODk6XjgwIHsoa145NzpjKShzPTkpMTptIH0gMTM4OSB9WzEzODg6XjgwXQp7RkZGRkZGRkQ6Xjk5IHsoa145ODpjKShzPTkpfSAKICBbMTM4OSheOTReODMpXX0KWzEzODg6Xjk5KF45NF44MyldCgo8KDkyPTZhZWI4ZGQzKSg5Mz0xMDAwMDAwMCk+CnsxOl45RiB7KGteQTA6Yykocz05dSl9IAogIFsxKF5BQj0xKSheQUM9MCkoXkFEPTEpKF5BMT0xKSheQTI9MSkoXkE2XjhGKSheQTheOTIpKF44OF45MykoXkE0XjhCKV19CnsxOl5CMSB7KGteQjI6Yykocz05KX0gfQoKPCg5ND00KSg5RD1jMDcpKDk1PWltYXA6Ly91c2VyQGxvY2FsaG9zdC9NaWdyYXRpb25Nb3ZlKSg5Nz1zNTE4LWFkZGVkKQogICg5OT1zNTE4LXJlbW92ZWQpKDlDCiAgICA9aW1hcDovL3VzZXJAbG9jYWxob3N0L01pZ3JhdGlvbkNvcHlPbmUkMDFpbWFwOi8vdXNlckBsb2NhbGhvc3QvTWlncmF0aW9uQ1wKb3B5VHdvKT4KezE6XkIzIHsoa15CNDpjKShzPTkpfSAKICBbMTM4OCheQjZeOTApKF5COD00KSheQjleOEUpKF5CQV45MCkoXkI1XjlEKSheQjc9MCkoXkJCXjg5KSheQkM9MCkKICAgICheQkReOTUpKF5CRV45NykoXkJGXjk5KSheQzBeOUMpXX0KCkAkJHsxe0AKQCQkfTF9QAoKQCQkezJ7QApAJCR9Mn1ACg==",
+      "bodies": [
+        {
+          "relative": "",
+          "size": 5370,
+          "sha256": "200a777ecbea071ae78d83636fd9a33bacdfe542fb99338a9bda69ca729fc356",
+          "base64": "RnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQpYLU1vemlsbGEtU3RhdHVzMjogMDAwMDAwMDAKWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0KRnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQpYLU1vemlsbGEtU3RhdHVzMjogMDAwMDAwMDAKWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0K"
+        }
+      ],
+      "captured": [
+        {
+          "nativeKey": 3,
+          "uid": 5001,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 65664,
+          "priority": 1,
+          "messageSize": 2599,
+          "storeToken": "2685",
+          "offlineMessageSize": 2650,
+          "lineCount": 60,
+          "references": "",
+          "keywords": "0",
+          "body": "X-Mozilla-Status: 0001\nX-Mozilla-Status2: 00000000\nX-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        },
+        {
+          "nativeKey": 2,
+          "uid": 5000,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 65664,
+          "priority": 1,
+          "messageSize": 2599,
+          "storeToken": "0",
+          "offlineMessageSize": 2650,
+          "lineCount": 60,
+          "references": "",
+          "keywords": "0",
+          "body": "X-Mozilla-Status: 0001\nX-Mozilla-Status2: 00000000\nX-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        }
+      ]
+    },
+    {
+      "name": "MigrationExplicit",
+      "uri": "imap://user@localhost/MigrationExplicit",
+      "folderId": 7,
+      "folder": {
+        "id": 7,
+        "uri": "imap://user@localhost/MigrationExplicit",
+        "protocol": "imap",
+        "summaryPath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationExplicit.msf",
+        "storePath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationExplicit",
+        "storeType": "mbox",
+        "rootURI": "imap://user@localhost",
+        "serverKey": "server1",
+        "mailRoot": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost"
+      },
+      "epoch": 1793822164,
+      "headers": [
+        {
+          "key": 1,
+          "uid": 5000,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "storeToken": "0",
+          "size": 2599,
+          "offlineSize": 2650
+        },
+        {
+          "key": 2,
+          "uid": 5001,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "storeToken": "2685",
+          "size": 2599,
+          "offlineSize": 2650
+        }
+      ],
+      "operations": [],
+      "keyMap": [
+        [4, 1],
+        [5, 2]
+      ],
+      "sha256": "fed591c7509c59a0f153d3a3a3e259caa5d9d0c7c2110dd5b26d9dbc76e566c8",
+      "size": 2317,
+      "base64": "Ly8gPCEtLSA8bWRiOm1vcms6eiB2PSIxLjQiLz4gLS0+CjwgPChhPWMpPiAvLyAoZj1pc28tODg1OS0xKQogICg4MD1uczptc2c6ZGI6cm93OnNjb3BlOm1zZ3M6YWxsKSg4MT1zdWJqZWN0KSg4Mj1zZW5kZXIpKDgzPW1lc3NhZ2UtaWQpCiAgKDg0PXJlZmVyZW5jZXMpKDg1PXJlY2lwaWVudHMpKDg2PWRhdGUpKDg3PXNpemUpKDg4PWZsYWdzKSg4OT1wcmlvcml0eSkKICAoOEE9bGFiZWwpKDhCPW51bUxpbmVzKSg4Qz1jY0xpc3QpKDhEPWJjY0xpc3QpKDhFPW1zZ1RocmVhZElkKQogICg4Rj10aHJlYWRJZCkoOTA9dGhyZWFkRmxhZ3MpKDkxPXRocmVhZE5ld2VzdE1zZ0RhdGUpKDkyPWNoaWxkcmVuKQogICg5Mz11bnJlYWRDaGlsZHJlbikoOTQ9dGhyZWFkU3ViamVjdCkoOTU9bXNnQ2hhclNldCkKICAoOTY9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6bXNncykoOTc9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6dGhyZWFkKQogICg5OD1uczptc2c6ZGI6dGFibGU6a2luZDphbGx0aHJlYWRzKQogICg5OT1uczptc2c6ZGI6cm93OnNjb3BlOnRocmVhZHM6YWxsKSg5QT10aHJlYWRQYXJlbnQpKDlCPXRocmVhZFJvb3QpCiAgKDlDPW1zZ09mZnNldCkoOUQ9b2ZmbGluZU1zZ1NpemUpKDlFPXVpZE9uU2VydmVyKQogICg5Rj1uczptc2c6ZGI6cm93OnNjb3BlOmRiZm9sZGVyaW5mbzphbGwpCiAgKEEwPW5zOm1zZzpkYjp0YWJsZTpraW5kOmRiZm9sZGVyaW5mbykoQTE9bnVtTXNncykoQTI9bnVtTmV3TXNncykKICAoQTM9Zm9sZGVyU2l6ZSkoQTQ9ZXhwdW5nZWRCeXRlcykoQTU9Zm9sZGVyRGF0ZSkoQTY9aGlnaFdhdGVyS2V5KQogIChBNz1tYWlsYm94TmFtZSkoQTg9VUlEVmFsaWRpdHkpKEE5PXRvdFBlbmRpbmdNc2dzKQogIChBQT11bnJlYWRQZW5kaW5nTXNncykoQUI9dmVyc2lvbikoQUM9Zm9yY2VSZXBhcnNlKQogIChBRD1maXhlZEJhZFJlZlRocmVhZGluZykoQUU9c3RvcmVUb2tlbikoQUY9a2V5d29yZHMpCiAgKEIwPVByb3RvVGhyZWFkRmxhZ3MpKEIxPW5zOm1zZzpkYjpyb3c6c2NvcGU6cGVuZGluZzphbGwpCiAgKEIyPW5zOm1zZzpkYjp0YWJsZTpraW5kOnBlbmRpbmcpPgo8KDgwPTEpKDhGPWZmZmZmZmZlKSg4OD00ODQ5NmU5MykoODE9MCk+ClsxOm0oXjlCPTEpKF44Rl44RikoXjkxXjg4KSheOTA9MCkoXjkyPTEpKF45Mz0xKV0KPCg5Mj0yKT5bMjptKF45Qj0yKSheOEY9MikoXjkxXjg4KSheOTA9MCkoXjkyPTEpKF45Mz0xKV0KCjwoODI9MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmcpKDgzCiAgICA9W0J1ZyA0MzY4ODBdIElNQVAgaXRlbURlbGV0ZWQgYW5kIGl0ZW1Nb3ZlQ29weUNvbXBsZXRlZCBub3RpZmljYXRpb25zIHF1aVwKdGUgYnJva2VuKSg4ND1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpKDg1PWV4YW1wbGVAZXhhbXBsZS5jb20pKDg2CiAgICA9aW52YWxpZEBleGFtcGxlLmNvbSkoODc9KSg4OT1hMjcpKDhBPWE1YSkoOEI9M2MpKDhDPTgwKSg4RD0xMzg4KQogICg4RT1mZmZmZmZmZikoOTA9MjY4NSkoOTE9MTM4OSk+CnsxOl44MCB7KGteOTY6Yykocz05KX0gCiAgWzEoXjgzXjgyKSheODFeODMpKF44Ml44NCkoXjg1Xjg1KSheOENeODYpKF44RD0pKF44Nl44OCkoXjg5PTEpKF44N144OSkKICAgICheQUU9MCkoXjlEXjhBKSheOEI9M2MpKF44OD04MCkoXjg0PSkoXkFGPTApKF45RV44RCkoXjlBXjhFKSheOEVeOEYpCiAgICAoXkIwPTApXQogIFsyKF44M144MikoXjgxXjgzKSheODJeODQpKF44NV44NSkoXjhDXjg2KSheOEQ9KSheODZeODgpKF44OT0xKSheODdeODkpCiAgICAoXkFFXjkwKSheOUReOEEpKF44Qj0zYykoXjg4PTgwKSheODQ9KSheQUY9MCkoXjlFXjkxKSheOUFeOEUpKF44RT0yKQogICAgKF5CMD0wKV19CnsyOl44MCB7KGteOTc6Yykocz05KTI6bSB9IDIgfQp7RkZGRkZGRkU6XjgwIHsoa145NzpjKShzPTkpMTptIH0gMSB9CntGRkZGRkZGRDpeOTkgeyhrXjk4OmMpKHM9OSl9IFtGRkZGRkZGRSheOTReODMpXQogIFsyKF45NF44MyldfQoKPCg5Mz02YWViOGRkNCk+CnsxOl45RiB7KGteQTA6Yykocz05dSl9IAogIFsxKF5BQj0xKSheQUM9MCkoXkFEPTEpKF5BMT0yKSheQTI9MikoXkE2PTIpKF5BOF45MyldfQp7MTpeQjEgeyhrXkIyOmMpKHM9OSl9IH0KCkAkJHsxe0AKQCQkfTF9QAoKQCQkezJ7QApAJCR9Mn1ACgpAJCR7NHtACjwgPChhPWMpPiAvLyAoZj1pc28tODg1OS0xKQogIChCMz1uczptc2c6ZGI6cm93OnNjb3BlOm9wczphbGwpKEI0PW5zOm1zZzpkYjp0YWJsZTpraW5kOm9wcyk+CnstMTpeQjMgeyhrXkI0OmMpKHM9OSl9IH0KQCQkfTR9QAoKQCQkezV7QApAJCR9NX1ACg==",
+      "bodies": [
+        {
+          "relative": "",
+          "size": 5370,
+          "sha256": "200a777ecbea071ae78d83636fd9a33bacdfe542fb99338a9bda69ca729fc356",
+          "base64": "RnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQpYLU1vemlsbGEtU3RhdHVzMjogMDAwMDAwMDAKWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0KRnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQpYLU1vemlsbGEtU3RhdHVzMjogMDAwMDAwMDAKWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0K"
+        }
+      ],
+      "captured": [
+        {
+          "nativeKey": 4,
+          "uid": 5000,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 65664,
+          "priority": 1,
+          "messageSize": 2599,
+          "storeToken": "0",
+          "offlineMessageSize": 2650,
+          "lineCount": 60,
+          "references": "",
+          "keywords": "0",
+          "body": "X-Mozilla-Status: 0001\nX-Mozilla-Status2: 00000000\nX-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        },
+        {
+          "nativeKey": 5,
+          "uid": 5001,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 65664,
+          "priority": 1,
+          "messageSize": 2599,
+          "storeToken": "2685",
+          "offlineMessageSize": 2650,
+          "lineCount": 60,
+          "references": "",
+          "keywords": "0",
+          "body": "X-Mozilla-Status: 0001\nX-Mozilla-Status2: 00000000\nX-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        }
+      ]
+    },
+    {
+      "name": "MigrationCopyOne",
+      "uri": "imap://user@localhost/MigrationCopyOne",
+      "folderId": 8,
+      "folder": {
+        "id": 8,
+        "uri": "imap://user@localhost/MigrationCopyOne",
+        "protocol": "imap",
+        "summaryPath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationCopyOne.msf",
+        "storePath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationCopyOne",
+        "storeType": "mbox",
+        "rootURI": "imap://user@localhost",
+        "serverKey": "server1",
+        "mailRoot": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost"
+      },
+      "epoch": 1793822165,
+      "headers": [
+        {
+          "key": 4294967168,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "storeToken": "0",
+          "size": 2650,
+          "offlineSize": 2650
+        }
+      ],
+      "operations": [
+        {
+          "messageKey": 4294967168,
+          "operation": 8,
+          "flagOperation": 0,
+          "newFlags": 0,
+          "srcMessageKey": 5000,
+          "srcUid": 0,
+          "sourceFolderURI": "imap://user@localhost/MigrationClassic",
+          "destinationFolderURI": "",
+          "keywordsToAdd": "",
+          "keywordsToRemove": "",
+          "msgSize": 0,
+          "playingBack": false,
+          "copies": []
+        }
+      ],
+      "keyMap": [[6, 4294967168]],
+      "sha256": "7c057a965d21776395e159c17406769f490726622e07ea7e49b501b71bf461a8",
+      "size": 2330,
+      "base64": "Ly8gPCEtLSA8bWRiOm1vcms6eiB2PSIxLjQiLz4gLS0+CjwgPChhPWMpPiAvLyAoZj1pc28tODg1OS0xKQogIChCOD1uZXdGbGFncykoQjk9c3JjTXNnS2V5KShCQT1zcmNVaWQpKEJCPW1zZ1NpemUpKEJDPWluUGxheWJhY2spCiAgKEJEPXNyY0ZvbGRlclVSSSkoQkU9Y29weURlc3RzKShCRj1tb3ZlRGVzdCkoQzA9YWRkZWRLZXl3b3JkcykKICAoQzE9cmVtb3ZlZEtleXdvcmRzKSg4MD1uczptc2c6ZGI6cm93OnNjb3BlOm1zZ3M6YWxsKSg4MT1zdWJqZWN0KQogICg4Mj1zZW5kZXIpKDgzPW1lc3NhZ2UtaWQpKDg0PXJlZmVyZW5jZXMpKDg1PXJlY2lwaWVudHMpKDg2PWRhdGUpCiAgKDg3PXNpemUpKDg4PWZsYWdzKSg4OT1wcmlvcml0eSkoOEE9bGFiZWwpKDhCPW51bUxpbmVzKSg4Qz1jY0xpc3QpCiAgKDhEPWJjY0xpc3QpKDhFPW1zZ1RocmVhZElkKSg4Rj10aHJlYWRJZCkoOTA9dGhyZWFkRmxhZ3MpCiAgKDkxPXRocmVhZE5ld2VzdE1zZ0RhdGUpKDkyPWNoaWxkcmVuKSg5Mz11bnJlYWRDaGlsZHJlbikKICAoOTQ9dGhyZWFkU3ViamVjdCkoOTU9bXNnQ2hhclNldCkoOTY9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6bXNncykKICAoOTc9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6dGhyZWFkKSg5OD1uczptc2c6ZGI6dGFibGU6a2luZDphbGx0aHJlYWRzKQogICg5OT1uczptc2c6ZGI6cm93OnNjb3BlOnRocmVhZHM6YWxsKSg5QT10aHJlYWRQYXJlbnQpKDlCPXRocmVhZFJvb3QpCiAgKDlDPW1zZ09mZnNldCkoOUQ9b2ZmbGluZU1zZ1NpemUpKDlFPXVpZE9uU2VydmVyKQogICg5Rj1uczptc2c6ZGI6cm93OnNjb3BlOmRiZm9sZGVyaW5mbzphbGwpCiAgKEEwPW5zOm1zZzpkYjp0YWJsZTpraW5kOmRiZm9sZGVyaW5mbykoQTE9bnVtTXNncykoQTI9bnVtTmV3TXNncykKICAoQTM9Zm9sZGVyU2l6ZSkoQTQ9ZXhwdW5nZWRCeXRlcykoQTU9Zm9sZGVyRGF0ZSkoQTY9aGlnaFdhdGVyS2V5KQogIChBNz1tYWlsYm94TmFtZSkoQTg9VUlEVmFsaWRpdHkpKEE5PXRvdFBlbmRpbmdNc2dzKQogIChBQT11bnJlYWRQZW5kaW5nTXNncykoQUI9dmVyc2lvbikoQUM9Zm9yY2VSZXBhcnNlKQogIChBRD1maXhlZEJhZFJlZlRocmVhZGluZykoQUU9c3RvcmVUb2tlbikoQUY9a2V5d29yZHMpCiAgKEIwPVByb3RvVGhyZWFkRmxhZ3MpKEIxPW5zOm1zZzpkYjpyb3c6c2NvcGU6cGVuZGluZzphbGwpCiAgKEIyPW5zOm1zZzpkYjp0YWJsZTpraW5kOnBlbmRpbmcpKEIzPW5zOm1zZzpkYjpyb3c6c2NvcGU6b3BzOmFsbCkKICAoQjQ9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6b3BzKShCNT1vcCkoQjY9bXNnS2V5KShCNz1vcEZsYWdzKT4KPCg4RT1mZmZmZmY4MCkoODg9NDg0OTZlOTMpKDgxPTApKDgwPTEpPgpbMTptKF45Ql44RSkoXjhGXjhFKSheOTFeODgpKF45MD0wKSheOTI9MSkoXjkzPTEpXQoKPCg4Mj0yMDA4MDYwNjE3MDYubTU2SDZSV1QwMDQ5MzNAbXJhcHA1NC5tb3ppbGxhLm9yZykoODMKICAgID1bQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkIG5vdGlmaWNhdGlvbnMgcXVpXAp0ZSBicm9rZW4pKDg0PWJ1Z3ppbGxhLWRhZW1vbkBtb3ppbGxhLm9yZykoODU9ZXhhbXBsZUBleGFtcGxlLmNvbSkoODYKICAgID1pbnZhbGlkQGV4YW1wbGUuY29tKSg4Nz0pKDg5PWE1YSkoOEE9ZCkoOEI9ODQpKDhDPTAgczUxOC1hZGRlZCkKICAoOEQ9ZmZmZmZmZmYpPgp7MTpeODAgeyhrXjk2OmMpKHM9OSl9IAogIFtGRkZGRkY4MCheODNeODIpKF44MV44MykoXjgyXjg0KSheODVeODUpKF44Q144NikoXjhEPSkoXjg2Xjg4KSheODk9MSkKICAgICheODdeODkpKF5BRT0wKSheOUReODkpKF44Qj1kKSheODg9ODQpKF44ND0pKF5BRl44QykoXjlBXjhEKSheOEVeOEUpCiAgICAoXkIwPTApXX0Ke0ZGRkZGRjgwOl44MCB7KGteOTc6Yykocz05KTE6bSB9IEZGRkZGRjgwIH0Ke0ZGRkZGRkZEOl45OSB7KGteOTg6Yykocz05KX0gW0ZGRkZGRjgwKF45NF44MyldfQoKPCg4Rj02YWViOGRkNSkoOTA9MTAwMDAwMDApPgp7MTpeOUYgeyhrXkEwOmMpKHM9OXUpfSAKICBbMSheQUI9MSkoXkFDPTApKF5BRD0xKSheQTE9MSkoXkEyPTEpKF5BNl44RSkoXkE4XjhGKSheODheOTApXX0KezE6XkIxIHsoa15CMjpjKShzPTkpfSB9Cgo8KDkxPTEzODgpKDk0PTgpKDkzPWltYXA6Ly91c2VyQGxvY2FsaG9zdC9NaWdyYXRpb25DbGFzc2ljKT4KezE6XkIzIHsoa15CNDpjKShzPTkpfSAKICBbRkZGRkZGODAoXkI2XjhFKSheQjg9MCkoXkI5XjkxKSheQkE9MCkoXkI1PTgpKF5CNz0wKSheQkI9MCkoXkJDPTApCiAgICAoXkJEXjkzKV19CgpAJCR7MXtACkAkJH0xfUAKCkAkJHsye0AKQCQkfTJ9QAo=",
+      "bodies": [
+        {
+          "relative": "",
+          "size": 2685,
+          "sha256": "de5df4c7a0bbf377332707bf60289044da7898a03dc58ed8d8da0ba8db0d7f8c",
+          "base64": "RnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQpYLU1vemlsbGEtU3RhdHVzMjogMDAwMDAwMDAKWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0K"
+        }
+      ],
+      "captured": [
+        {
+          "nativeKey": 6,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 65668,
+          "priority": 1,
+          "messageSize": 2650,
+          "storeToken": "0",
+          "offlineMessageSize": 2650,
+          "lineCount": 13,
+          "references": "",
+          "keywords": "0 s518-added",
+          "body": "X-Mozilla-Status: 0001\nX-Mozilla-Status2: 00000000\nX-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        }
+      ]
+    },
+    {
+      "name": "MigrationCopyTwo",
+      "uri": "imap://user@localhost/MigrationCopyTwo",
+      "folderId": 9,
+      "folder": {
+        "id": 9,
+        "uri": "imap://user@localhost/MigrationCopyTwo",
+        "protocol": "imap",
+        "summaryPath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationCopyTwo.msf",
+        "storePath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationCopyTwo",
+        "storeType": "mbox",
+        "rootURI": "imap://user@localhost",
+        "serverKey": "server1",
+        "mailRoot": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost"
+      },
+      "epoch": 1793822166,
+      "headers": [
+        {
+          "key": 4294967168,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "storeToken": "0",
+          "size": 2650,
+          "offlineSize": 2650
+        }
+      ],
+      "operations": [
+        {
+          "messageKey": 4294967168,
+          "operation": 8,
+          "flagOperation": 0,
+          "newFlags": 0,
+          "srcMessageKey": 5000,
+          "srcUid": 0,
+          "sourceFolderURI": "imap://user@localhost/MigrationClassic",
+          "destinationFolderURI": "",
+          "keywordsToAdd": "",
+          "keywordsToRemove": "",
+          "msgSize": 0,
+          "playingBack": false,
+          "copies": []
+        }
+      ],
+      "keyMap": [[7, 4294967168]],
+      "sha256": "963540099a6b51610c87f6a6071a3412eaa22f0b4bce2fe9fcdfcd4c39a07330",
+      "size": 2330,
+      "base64": "Ly8gPCEtLSA8bWRiOm1vcms6eiB2PSIxLjQiLz4gLS0+CjwgPChhPWMpPiAvLyAoZj1pc28tODg1OS0xKQogIChCOD1uZXdGbGFncykoQjk9c3JjTXNnS2V5KShCQT1zcmNVaWQpKEJCPW1zZ1NpemUpKEJDPWluUGxheWJhY2spCiAgKEJEPXNyY0ZvbGRlclVSSSkoQkU9Y29weURlc3RzKShCRj1tb3ZlRGVzdCkoQzA9YWRkZWRLZXl3b3JkcykKICAoQzE9cmVtb3ZlZEtleXdvcmRzKSg4MD1uczptc2c6ZGI6cm93OnNjb3BlOm1zZ3M6YWxsKSg4MT1zdWJqZWN0KQogICg4Mj1zZW5kZXIpKDgzPW1lc3NhZ2UtaWQpKDg0PXJlZmVyZW5jZXMpKDg1PXJlY2lwaWVudHMpKDg2PWRhdGUpCiAgKDg3PXNpemUpKDg4PWZsYWdzKSg4OT1wcmlvcml0eSkoOEE9bGFiZWwpKDhCPW51bUxpbmVzKSg4Qz1jY0xpc3QpCiAgKDhEPWJjY0xpc3QpKDhFPW1zZ1RocmVhZElkKSg4Rj10aHJlYWRJZCkoOTA9dGhyZWFkRmxhZ3MpCiAgKDkxPXRocmVhZE5ld2VzdE1zZ0RhdGUpKDkyPWNoaWxkcmVuKSg5Mz11bnJlYWRDaGlsZHJlbikKICAoOTQ9dGhyZWFkU3ViamVjdCkoOTU9bXNnQ2hhclNldCkoOTY9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6bXNncykKICAoOTc9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6dGhyZWFkKSg5OD1uczptc2c6ZGI6dGFibGU6a2luZDphbGx0aHJlYWRzKQogICg5OT1uczptc2c6ZGI6cm93OnNjb3BlOnRocmVhZHM6YWxsKSg5QT10aHJlYWRQYXJlbnQpKDlCPXRocmVhZFJvb3QpCiAgKDlDPW1zZ09mZnNldCkoOUQ9b2ZmbGluZU1zZ1NpemUpKDlFPXVpZE9uU2VydmVyKQogICg5Rj1uczptc2c6ZGI6cm93OnNjb3BlOmRiZm9sZGVyaW5mbzphbGwpCiAgKEEwPW5zOm1zZzpkYjp0YWJsZTpraW5kOmRiZm9sZGVyaW5mbykoQTE9bnVtTXNncykoQTI9bnVtTmV3TXNncykKICAoQTM9Zm9sZGVyU2l6ZSkoQTQ9ZXhwdW5nZWRCeXRlcykoQTU9Zm9sZGVyRGF0ZSkoQTY9aGlnaFdhdGVyS2V5KQogIChBNz1tYWlsYm94TmFtZSkoQTg9VUlEVmFsaWRpdHkpKEE5PXRvdFBlbmRpbmdNc2dzKQogIChBQT11bnJlYWRQZW5kaW5nTXNncykoQUI9dmVyc2lvbikoQUM9Zm9yY2VSZXBhcnNlKQogIChBRD1maXhlZEJhZFJlZlRocmVhZGluZykoQUU9c3RvcmVUb2tlbikoQUY9a2V5d29yZHMpCiAgKEIwPVByb3RvVGhyZWFkRmxhZ3MpKEIxPW5zOm1zZzpkYjpyb3c6c2NvcGU6cGVuZGluZzphbGwpCiAgKEIyPW5zOm1zZzpkYjp0YWJsZTpraW5kOnBlbmRpbmcpKEIzPW5zOm1zZzpkYjpyb3c6c2NvcGU6b3BzOmFsbCkKICAoQjQ9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6b3BzKShCNT1vcCkoQjY9bXNnS2V5KShCNz1vcEZsYWdzKT4KPCg4RT1mZmZmZmY4MCkoODg9NDg0OTZlOTMpKDgxPTApKDgwPTEpPgpbMTptKF45Ql44RSkoXjhGXjhFKSheOTFeODgpKF45MD0wKSheOTI9MSkoXjkzPTEpXQoKPCg4Mj0yMDA4MDYwNjE3MDYubTU2SDZSV1QwMDQ5MzNAbXJhcHA1NC5tb3ppbGxhLm9yZykoODMKICAgID1bQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkIG5vdGlmaWNhdGlvbnMgcXVpXAp0ZSBicm9rZW4pKDg0PWJ1Z3ppbGxhLWRhZW1vbkBtb3ppbGxhLm9yZykoODU9ZXhhbXBsZUBleGFtcGxlLmNvbSkoODYKICAgID1pbnZhbGlkQGV4YW1wbGUuY29tKSg4Nz0pKDg5PWE1YSkoOEE9ZCkoOEI9ODQpKDhDPTAgczUxOC1hZGRlZCkKICAoOEQ9ZmZmZmZmZmYpPgp7MTpeODAgeyhrXjk2OmMpKHM9OSl9IAogIFtGRkZGRkY4MCheODNeODIpKF44MV44MykoXjgyXjg0KSheODVeODUpKF44Q144NikoXjhEPSkoXjg2Xjg4KSheODk9MSkKICAgICheODdeODkpKF5BRT0wKSheOUReODkpKF44Qj1kKSheODg9ODQpKF44ND0pKF5BRl44QykoXjlBXjhEKSheOEVeOEUpCiAgICAoXkIwPTApXX0Ke0ZGRkZGRjgwOl44MCB7KGteOTc6Yykocz05KTE6bSB9IEZGRkZGRjgwIH0Ke0ZGRkZGRkZEOl45OSB7KGteOTg6Yykocz05KX0gW0ZGRkZGRjgwKF45NF44MyldfQoKPCg4Rj02YWViOGRkNikoOTA9MTAwMDAwMDApPgp7MTpeOUYgeyhrXkEwOmMpKHM9OXUpfSAKICBbMSheQUI9MSkoXkFDPTApKF5BRD0xKSheQTE9MSkoXkEyPTEpKF5BNl44RSkoXkE4XjhGKSheODheOTApXX0KezE6XkIxIHsoa15CMjpjKShzPTkpfSB9Cgo8KDkxPTEzODgpKDk0PTgpKDkzPWltYXA6Ly91c2VyQGxvY2FsaG9zdC9NaWdyYXRpb25DbGFzc2ljKT4KezE6XkIzIHsoa15CNDpjKShzPTkpfSAKICBbRkZGRkZGODAoXkI2XjhFKSheQjg9MCkoXkI5XjkxKSheQkE9MCkoXkI1PTgpKF5CNz0wKSheQkI9MCkoXkJDPTApCiAgICAoXkJEXjkzKV19CgpAJCR7MXtACkAkJH0xfUAKCkAkJHsye0AKQCQkfTJ9QAo=",
+      "bodies": [
+        {
+          "relative": "",
+          "size": 2685,
+          "sha256": "de5df4c7a0bbf377332707bf60289044da7898a03dc58ed8d8da0ba8db0d7f8c",
+          "base64": "RnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQpYLU1vemlsbGEtU3RhdHVzMjogMDAwMDAwMDAKWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0K"
+        }
+      ],
+      "captured": [
+        {
+          "nativeKey": 7,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 65668,
+          "priority": 1,
+          "messageSize": 2650,
+          "storeToken": "0",
+          "offlineMessageSize": 2650,
+          "lineCount": 13,
+          "references": "",
+          "keywords": "0 s518-added",
+          "body": "X-Mozilla-Status: 0001\nX-Mozilla-Status2: 00000000\nX-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        }
+      ]
+    },
+    {
+      "name": "MigrationMove",
+      "uri": "imap://user@localhost/MigrationMove",
+      "folderId": 10,
+      "folder": {
+        "id": 10,
+        "uri": "imap://user@localhost/MigrationMove",
+        "protocol": "imap",
+        "summaryPath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationMove.msf",
+        "storePath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationMove",
+        "storeType": "mbox",
+        "rootURI": "imap://user@localhost",
+        "serverKey": "server1",
+        "mailRoot": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost"
+      },
+      "epoch": 1793822167,
+      "headers": [
+        {
+          "key": 4294967168,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "storeToken": "0",
+          "size": 2650,
+          "offlineSize": 2650
+        }
+      ],
+      "operations": [
+        {
+          "messageKey": 4294967168,
+          "operation": 8,
+          "flagOperation": 0,
+          "newFlags": 0,
+          "srcMessageKey": 5000,
+          "srcUid": 0,
+          "sourceFolderURI": "imap://user@localhost/MigrationClassic",
+          "destinationFolderURI": "",
+          "keywordsToAdd": "",
+          "keywordsToRemove": "",
+          "msgSize": 0,
+          "playingBack": false,
+          "copies": []
+        }
+      ],
+      "keyMap": [[8, 4294967168]],
+      "sha256": "e67c2ad49ebfc76d792e0c743b29b77729dadc656058f1eb768105dc094d519e",
+      "size": 2330,
+      "base64": "Ly8gPCEtLSA8bWRiOm1vcms6eiB2PSIxLjQiLz4gLS0+CjwgPChhPWMpPiAvLyAoZj1pc28tODg1OS0xKQogIChCOD1uZXdGbGFncykoQjk9c3JjTXNnS2V5KShCQT1zcmNVaWQpKEJCPW1zZ1NpemUpKEJDPWluUGxheWJhY2spCiAgKEJEPXNyY0ZvbGRlclVSSSkoQkU9Y29weURlc3RzKShCRj1tb3ZlRGVzdCkoQzA9YWRkZWRLZXl3b3JkcykKICAoQzE9cmVtb3ZlZEtleXdvcmRzKSg4MD1uczptc2c6ZGI6cm93OnNjb3BlOm1zZ3M6YWxsKSg4MT1zdWJqZWN0KQogICg4Mj1zZW5kZXIpKDgzPW1lc3NhZ2UtaWQpKDg0PXJlZmVyZW5jZXMpKDg1PXJlY2lwaWVudHMpKDg2PWRhdGUpCiAgKDg3PXNpemUpKDg4PWZsYWdzKSg4OT1wcmlvcml0eSkoOEE9bGFiZWwpKDhCPW51bUxpbmVzKSg4Qz1jY0xpc3QpCiAgKDhEPWJjY0xpc3QpKDhFPW1zZ1RocmVhZElkKSg4Rj10aHJlYWRJZCkoOTA9dGhyZWFkRmxhZ3MpCiAgKDkxPXRocmVhZE5ld2VzdE1zZ0RhdGUpKDkyPWNoaWxkcmVuKSg5Mz11bnJlYWRDaGlsZHJlbikKICAoOTQ9dGhyZWFkU3ViamVjdCkoOTU9bXNnQ2hhclNldCkoOTY9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6bXNncykKICAoOTc9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6dGhyZWFkKSg5OD1uczptc2c6ZGI6dGFibGU6a2luZDphbGx0aHJlYWRzKQogICg5OT1uczptc2c6ZGI6cm93OnNjb3BlOnRocmVhZHM6YWxsKSg5QT10aHJlYWRQYXJlbnQpKDlCPXRocmVhZFJvb3QpCiAgKDlDPW1zZ09mZnNldCkoOUQ9b2ZmbGluZU1zZ1NpemUpKDlFPXVpZE9uU2VydmVyKQogICg5Rj1uczptc2c6ZGI6cm93OnNjb3BlOmRiZm9sZGVyaW5mbzphbGwpCiAgKEEwPW5zOm1zZzpkYjp0YWJsZTpraW5kOmRiZm9sZGVyaW5mbykoQTE9bnVtTXNncykoQTI9bnVtTmV3TXNncykKICAoQTM9Zm9sZGVyU2l6ZSkoQTQ9ZXhwdW5nZWRCeXRlcykoQTU9Zm9sZGVyRGF0ZSkoQTY9aGlnaFdhdGVyS2V5KQogIChBNz1tYWlsYm94TmFtZSkoQTg9VUlEVmFsaWRpdHkpKEE5PXRvdFBlbmRpbmdNc2dzKQogIChBQT11bnJlYWRQZW5kaW5nTXNncykoQUI9dmVyc2lvbikoQUM9Zm9yY2VSZXBhcnNlKQogIChBRD1maXhlZEJhZFJlZlRocmVhZGluZykoQUU9c3RvcmVUb2tlbikoQUY9a2V5d29yZHMpCiAgKEIwPVByb3RvVGhyZWFkRmxhZ3MpKEIxPW5zOm1zZzpkYjpyb3c6c2NvcGU6cGVuZGluZzphbGwpCiAgKEIyPW5zOm1zZzpkYjp0YWJsZTpraW5kOnBlbmRpbmcpKEIzPW5zOm1zZzpkYjpyb3c6c2NvcGU6b3BzOmFsbCkKICAoQjQ9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6b3BzKShCNT1vcCkoQjY9bXNnS2V5KShCNz1vcEZsYWdzKT4KPCg4RT1mZmZmZmY4MCkoODg9NDg0OTZlOTMpKDgxPTApKDgwPTEpPgpbMTptKF45Ql44RSkoXjhGXjhFKSheOTFeODgpKF45MD0wKSheOTI9MSkoXjkzPTEpXQoKPCg4Mj0yMDA4MDYwNjE3MDYubTU2SDZSV1QwMDQ5MzNAbXJhcHA1NC5tb3ppbGxhLm9yZykoODMKICAgID1bQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkIG5vdGlmaWNhdGlvbnMgcXVpXAp0ZSBicm9rZW4pKDg0PWJ1Z3ppbGxhLWRhZW1vbkBtb3ppbGxhLm9yZykoODU9ZXhhbXBsZUBleGFtcGxlLmNvbSkoODYKICAgID1pbnZhbGlkQGV4YW1wbGUuY29tKSg4Nz0pKDg5PWE1YSkoOEE9ZCkoOEI9ODQpKDhDPTAgczUxOC1hZGRlZCkKICAoOEQ9ZmZmZmZmZmYpPgp7MTpeODAgeyhrXjk2OmMpKHM9OSl9IAogIFtGRkZGRkY4MCheODNeODIpKF44MV44MykoXjgyXjg0KSheODVeODUpKF44Q144NikoXjhEPSkoXjg2Xjg4KSheODk9MSkKICAgICheODdeODkpKF5BRT0wKSheOUReODkpKF44Qj1kKSheODg9ODQpKF44ND0pKF5BRl44QykoXjlBXjhEKSheOEVeOEUpCiAgICAoXkIwPTApXX0Ke0ZGRkZGRjgwOl44MCB7KGteOTc6Yykocz05KTE6bSB9IEZGRkZGRjgwIH0Ke0ZGRkZGRkZEOl45OSB7KGteOTg6Yykocz05KX0gW0ZGRkZGRjgwKF45NF44MyldfQoKPCg4Rj02YWViOGRkNykoOTA9MTAwMDAwMDApPgp7MTpeOUYgeyhrXkEwOmMpKHM9OXUpfSAKICBbMSheQUI9MSkoXkFDPTApKF5BRD0xKSheQTE9MSkoXkEyPTEpKF5BNl44RSkoXkE4XjhGKSheODheOTApXX0KezE6XkIxIHsoa15CMjpjKShzPTkpfSB9Cgo8KDkxPTEzODgpKDk0PTgpKDkzPWltYXA6Ly91c2VyQGxvY2FsaG9zdC9NaWdyYXRpb25DbGFzc2ljKT4KezE6XkIzIHsoa15CNDpjKShzPTkpfSAKICBbRkZGRkZGODAoXkI2XjhFKSheQjg9MCkoXkI5XjkxKSheQkE9MCkoXkI1PTgpKF5CNz0wKSheQkI9MCkoXkJDPTApCiAgICAoXkJEXjkzKV19CgpAJCR7MXtACkAkJH0xfUAKCkAkJHsye0AKQCQkfTJ9QAo=",
+      "bodies": [
+        {
+          "relative": "",
+          "size": 2685,
+          "sha256": "de5df4c7a0bbf377332707bf60289044da7898a03dc58ed8d8da0ba8db0d7f8c",
+          "base64": "RnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQpYLU1vemlsbGEtU3RhdHVzMjogMDAwMDAwMDAKWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0K"
+        }
+      ],
+      "captured": [
+        {
+          "nativeKey": 8,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 65668,
+          "priority": 1,
+          "messageSize": 2650,
+          "storeToken": "0",
+          "offlineMessageSize": 2650,
+          "lineCount": 13,
+          "references": "",
+          "keywords": "0 s518-added",
+          "body": "X-Mozilla-Status: 0001\nX-Mozilla-Status2: 00000000\nX-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        }
+      ]
+    },
+    {
+      "name": "MigrationAppend",
+      "uri": "imap://user@localhost/MigrationAppend",
+      "folderId": 11,
+      "folder": {
+        "id": 11,
+        "uri": "imap://user@localhost/MigrationAppend",
+        "protocol": "imap",
+        "summaryPath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationAppend.msf",
+        "storePath": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost/MigrationAppend",
+        "storeType": "mbox",
+        "rootURI": "imap://user@localhost",
+        "serverKey": "server1",
+        "mailRoot": "/build/obj-debug/temp/xpc-profile-0dbrpwet/ImapMail/localhost"
+      },
+      "epoch": 1793822168,
+      "headers": [
+        {
+          "key": 4294967168,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "storeToken": "0",
+          "size": 2599,
+          "offlineSize": 2599
+        }
+      ],
+      "operations": [
+        {
+          "messageKey": 4294967168,
+          "operation": 16,
+          "flagOperation": 0,
+          "newFlags": 0,
+          "srcMessageKey": 4294967295,
+          "srcUid": 0,
+          "sourceFolderURI": "",
+          "destinationFolderURI": "imap://user@localhost/MigrationAppend",
+          "keywordsToAdd": "",
+          "keywordsToRemove": "",
+          "msgSize": 0,
+          "playingBack": false,
+          "copies": []
+        }
+      ],
+      "keyMap": [[9, 4294967168]],
+      "sha256": "11d986650f0f16b462e19b75a7de884a4c5711acc447fb5468da257f9a503236",
+      "size": 2286,
+      "base64": "Ly8gPCEtLSA8bWRiOm1vcms6eiB2PSIxLjQiLz4gLS0+CjwgPChhPWMpPiAvLyAoZj1pc28tODg1OS0xKQogIChCOD1uZXdGbGFncykoQjk9c3JjTXNnS2V5KShCQT1zcmNVaWQpKEJCPW1zZ1NpemUpKEJDPWluUGxheWJhY2spCiAgKEJEPW1vdmVEZXN0KShCRT1jb3B5RGVzdHMpKEJGPXNyY0ZvbGRlclVSSSkoQzA9YWRkZWRLZXl3b3JkcykKICAoQzE9cmVtb3ZlZEtleXdvcmRzKSg4MD1uczptc2c6ZGI6cm93OnNjb3BlOm1zZ3M6YWxsKSg4MT1zdWJqZWN0KQogICg4Mj1zZW5kZXIpKDgzPW1lc3NhZ2UtaWQpKDg0PXJlZmVyZW5jZXMpKDg1PXJlY2lwaWVudHMpKDg2PWRhdGUpCiAgKDg3PXNpemUpKDg4PWZsYWdzKSg4OT1wcmlvcml0eSkoOEE9bGFiZWwpKDhCPW51bUxpbmVzKSg4Qz1jY0xpc3QpCiAgKDhEPWJjY0xpc3QpKDhFPW1zZ1RocmVhZElkKSg4Rj10aHJlYWRJZCkoOTA9dGhyZWFkRmxhZ3MpCiAgKDkxPXRocmVhZE5ld2VzdE1zZ0RhdGUpKDkyPWNoaWxkcmVuKSg5Mz11bnJlYWRDaGlsZHJlbikKICAoOTQ9dGhyZWFkU3ViamVjdCkoOTU9bXNnQ2hhclNldCkoOTY9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6bXNncykKICAoOTc9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6dGhyZWFkKSg5OD1uczptc2c6ZGI6dGFibGU6a2luZDphbGx0aHJlYWRzKQogICg5OT1uczptc2c6ZGI6cm93OnNjb3BlOnRocmVhZHM6YWxsKSg5QT10aHJlYWRQYXJlbnQpKDlCPXRocmVhZFJvb3QpCiAgKDlDPW1zZ09mZnNldCkoOUQ9b2ZmbGluZU1zZ1NpemUpKDlFPXVpZE9uU2VydmVyKQogICg5Rj1uczptc2c6ZGI6cm93OnNjb3BlOmRiZm9sZGVyaW5mbzphbGwpCiAgKEEwPW5zOm1zZzpkYjp0YWJsZTpraW5kOmRiZm9sZGVyaW5mbykoQTE9bnVtTXNncykoQTI9bnVtTmV3TXNncykKICAoQTM9Zm9sZGVyU2l6ZSkoQTQ9ZXhwdW5nZWRCeXRlcykoQTU9Zm9sZGVyRGF0ZSkoQTY9aGlnaFdhdGVyS2V5KQogIChBNz1tYWlsYm94TmFtZSkoQTg9VUlEVmFsaWRpdHkpKEE5PXRvdFBlbmRpbmdNc2dzKQogIChBQT11bnJlYWRQZW5kaW5nTXNncykoQUI9dmVyc2lvbikoQUM9Zm9yY2VSZXBhcnNlKQogIChBRD1maXhlZEJhZFJlZlRocmVhZGluZykoQUU9c3RvcmVUb2tlbikoQUY9a2V5d29yZHMpCiAgKEIwPVByb3RvVGhyZWFkRmxhZ3MpKEIxPW5zOm1zZzpkYjpyb3c6c2NvcGU6cGVuZGluZzphbGwpCiAgKEIyPW5zOm1zZzpkYjp0YWJsZTpraW5kOnBlbmRpbmcpKEIzPW5zOm1zZzpkYjpyb3c6c2NvcGU6b3BzOmFsbCkKICAoQjQ9bnM6bXNnOmRiOnRhYmxlOmtpbmQ6b3BzKShCNT1vcCkoQjY9bXNnS2V5KShCNz1vcEZsYWdzKT4KPCg4RD1mZmZmZmY4MCkoODg9NDg0OTZlOTMpKDgxPTApKDgwPTEpPgpbMTptKF45Ql44RCkoXjhGXjhEKSheOTFeODgpKF45MD0wKSheOTI9MSldCgo8KDgyPTIwMDgwNjA2MTcwNi5tNTZINlJXVDAwNDkzM0BtcmFwcDU0Lm1vemlsbGEub3JnKSg4MwogICAgPVtCdWcgNDM2ODgwXSBJTUFQIGl0ZW1EZWxldGVkIGFuZCBpdGVtTW92ZUNvcHlDb21wbGV0ZWQgbm90aWZpY2F0aW9ucyBxdWlcCnRlIGJyb2tlbikoODQ9YnVnemlsbGEtZGFlbW9uQG1vemlsbGEub3JnKSg4NT1leGFtcGxlQGV4YW1wbGUuY29tKSg4NgogICAgPWludmFsaWRAZXhhbXBsZS5jb20pKDg3PSkoODk9YTI3KSg4QT1kKSg4Qj04MSkoOEM9ZmZmZmZmZmYpPgp7MTpeODAgeyhrXjk2OmMpKHM9OSl9IAogIFtGRkZGRkY4MCheODNeODIpKF44MV44MykoXjgyXjg0KSheODVeODUpKF44Q144NikoXjhEPSkoXjg2Xjg4KSheODk9MSkKICAgICheODdeODkpKF5BRT0wKSheOUReODkpKF44Qj1kKSheODg9ODEpKF44ND0pKF5BRj0pKF45QV44QykoXjhFXjhEKQogICAgKF5CMD0wKV19CntGRkZGRkY4MDpeODAgeyhrXjk3OmMpKHM9OSkxOm0gfSBGRkZGRkY4MCB9CntGRkZGRkZGRDpeOTkgeyhrXjk4OmMpKHM9OSl9IFtGRkZGRkY4MCheOTReODMpXX0KCjwoOEU9NmFlYjhkZDgpKDhGPTEwMDAwMDAwKT4KezE6XjlGIHsoa15BMDpjKShzPTl1KX0gCiAgWzEoXkFCPTEpKF5BQz0wKSheQUQ9MSkoXkExPTEpKF5BNl44RCkoXkE4XjhFKSheODheOEYpXX0KezE6XkIxIHsoa15CMjpjKShzPTkpfSB9Cgo8KDkxPTEwKSg5MD1pbWFwOi8vdXNlckBsb2NhbGhvc3QvTWlncmF0aW9uQXBwZW5kKT4KezE6XkIzIHsoa15CNDpjKShzPTkpfSAKICBbRkZGRkZGODAoXkI2XjhEKSheQjg9MCkoXkI5XjhDKSheQkE9MCkoXkI1PTEwKSheQjc9MCkoXkJCPTApKF5CQz0wKQogICAgKF5CRF45MCldfQoKQCQkezF7QApAJCR9MX1ACgpAJCR7MntACkAkJH0yfUAK",
+      "bodies": [
+        {
+          "relative": "",
+          "size": 2634,
+          "sha256": "25da6cc667bf1fb32f0c4de013ecc26f30cbf64dd743ea635cfc1f20bde9fa54",
+          "base64": "RnJvbSAtIFdlZCBOb3YgMDQgMTk6NTY6MDEgMjAyNg0KWC1BY2NvdW50LUtleTogYWNjb3VudDMNClgtVUlETDogVUlEMjYtMTEwNjY0MjYwOA0KWC1Nb3ppbGxhLVN0YXR1czogMDAwMQ0KWC1Nb3ppbGxhLVN0YXR1czI6IDAwMDAwMDAwDQpYLU1vemlsbGEtS2V5czogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIA0KRGVsaXZlcmVkLVRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpSZWNlaXZlZDogYnkgMTAuMTEwLjQ5LjUgd2l0aCBTTVRQIGlkIHc1Y3MyNDQ2NjN0aXc7DQogICAgICAgIEZyaSwgNiBKdW4gMjAwOCAxMDowNjozNCAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQ6IGJ5IDEwLjExNC4xNzAuMSB3aXRoIFNNVFAgaWQgczFtcjQzMzUxN3dhZS4xMzMuMTIxMjc3MTk5MzkxNDsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmV0dXJuLVBhdGg6IDxidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmc+DQpSZWNlaXZlZDogZnJvbSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICh3ZWJhcHAwMS5zai5tb3ppbGxhLmNvbSBbNjMuMjQ1LjIwOC4xNDZdKQ0KICAgICAgICBieSBteC5nb29nbGUuY29tIHdpdGggRVNNVFAgaWQgaTEzc2k1NTkzNTc1d3hkLjUuMjAwOC4wNi4wNi4xMC4wNi4yOTsNCiAgICAgICAgRnJpLCAwNiBKdW4gMjAwOCAxMDowNjozMyAtMDcwMCAoUERUKQ0KUmVjZWl2ZWQtU1BGOiBuZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIGNsaWVudC1pcD02My4yNDUuMjA4LjE0NjsNCkF1dGhlbnRpY2F0aW9uLVJlc3VsdHM6IG14Lmdvb2dsZS5jb207IHNwZj1uZXV0cmFsIChnb29nbGUuY29tOiA2My4yNDUuMjA4LjE0NiBpcyBuZWl0aGVyIHBlcm1pdHRlZCBub3IgZGVuaWVkIGJ5IGRvbWFpbiBvZiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcpIHNtdHAubWFpbD1idWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClJlY2VpdmVkOiBmcm9tIG1yYXBwNTQubW96aWxsYS5vcmcgKHVudXNlZC0xMC0yLTExLTIzNi5tb3ppbGxhLm9yZyBbMTI3LjAuMC4xXSkNCglieSB3ZWJhcHAtb3V0Lm1vemlsbGEub3JnICg4LjEzLjgvOC4xMy44KSB3aXRoIEVTTVRQIGlkIG01Nkg2U1drMDA0OTM2DQoJZm9yIDxleGFtcGxlQGV4YW1wbGUuY29tPjsgRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI4IC0wNzAwDQpSZWNlaXZlZDogKGZyb20gcm9vdEBsb2NhbGhvc3QpDQoJYnkgbXJhcHA1NC5tb3ppbGxhLm9yZyAoOC4xMy44LzguMTMuOC9TdWJtaXQpIGlkIG01Nkg2UldUMDA0OTMzOw0KCUZyaSwgNiBKdW4gMjAwOCAxMDowNjoyNyAtMDcwMA0KRGF0ZTogRnJpLCA2IEp1biAyMDA4IDEwOjA2OjI3IC0wNzAwDQpNZXNzYWdlLUlkOiA8MjAwODA2MDYxNzA2Lm01Nkg2UldUMDA0OTMzQG1yYXBwNTQubW96aWxsYS5vcmc+DQpGcm9tOiBidWd6aWxsYS1kYWVtb25AbW96aWxsYS5vcmcNClRvOiBleGFtcGxlQGV4YW1wbGUuY29tDQpTdWJqZWN0OiBbQnVnIDQzNjg4MF0gSU1BUCBpdGVtRGVsZXRlZCBhbmQgaXRlbU1vdmVDb3B5Q29tcGxldGVkDQogbm90aWZpY2F0aW9ucyBxdWl0ZSBicm9rZW4NCkNjOiBpbnZhbGlkQGV4YW1wbGUuY29tDQpYLUJ1Z3ppbGxhLVJlYXNvbjogQXNzaWduZWRUbyBSZXBvcnRlcg0KWC1CdWd6aWxsYS1UeXBlOiBuZXdjaGFuZ2VkDQpYLUJ1Z3ppbGxhLVdhdGNoLVJlYXNvbjogTm9uZQ0KWC1CdWd6aWxsYS1Qcm9kdWN0OiBDb3JlDQpYLUJ1Z3ppbGxhLUNvbXBvbmVudDogTWFpbE5ld3M6IEJhY2tlbmQNClgtQnVnemlsbGEtS2V5d29yZHM6IA0KWC1CdWd6aWxsYS1TZXZlcml0eTogbm9ybWFsDQpYLUJ1Z3ppbGxhLVdobzogYnVnbWFpbEBleGFtcGxlLm9yZw0KWC1CdWd6aWxsYS1TdGF0dXM6IEFTU0lHTkVEDQpYLUJ1Z3ppbGxhLVByaW9yaXR5OiAtLQ0KWC1CdWd6aWxsYS1Bc3NpZ25lZC1UbzogZXhhbXBsZUBleGFtcGxlLmNvbQ0KWC1CdWd6aWxsYS1UYXJnZXQtTWlsZXN0b25lOiAtLS0NClgtQnVnemlsbGEtQ2hhbmdlZC1GaWVsZHM6IA0KSW4tUmVwbHktVG86IDxidWctNDM2ODgwLTMwNjc1NEBodHRwcy5idWd6aWxsYS5tb3ppbGxhLm9yZy8+DQpSZWZlcmVuY2VzOiA8YnVnLTQzNjg4MC0zMDY3NTRAaHR0cHMuYnVnemlsbGEubW96aWxsYS5vcmcvPg0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluOyBjaGFyc2V0PSJVVEYtOCINCk1JTUUtVmVyc2lvbjogMS4wDQoNCkRvIG5vdCByZXBseSB0byB0aGlzIGVtYWlsLiAgWW91IGNhbiBhZGQgY29tbWVudHMgdG8gdGhpcyBidWcgYXQNCmh0dHBzOi8vYnVnemlsbGEubW96aWxsYS5vcmcvc2hvd19idWcuY2dpP2lkPTQzNjg4MA0KDQoNCg0KDQotLSANCkNvbmZpZ3VyZSBidWdtYWlsOiBodHRwczovL2J1Z3ppbGxhLm1vemlsbGEub3JnL3VzZXJwcmVmcy5jZ2k/dGFiPWVtYWlsDQotLS0tLS0tIFlvdSBhcmUgcmVjZWl2aW5nIHRoaXMgbWFpbCBiZWNhdXNlOiAtLS0tLS0tDQpZb3UgYXJlIHRoZSBhc3NpZ25lZSBmb3IgdGhlIGJ1Zy4NCllvdSByZXBvcnRlZCB0aGUgYnVnLg0KDQoNCg0K"
+        }
+      ],
+      "captured": [
+        {
+          "nativeKey": 9,
+          "uid": null,
+          "messageId": "200806061706.m56H6RWT004933@mrapp54.mozilla.org",
+          "subject": "[Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted notifications quite broken",
+          "author": "bugzilla-daemon@mozilla.org",
+          "recipients": "example@example.com",
+          "ccList": "invalid@example.com",
+          "bccList": "",
+          "date": 1212771987000000,
+          "flags": 129,
+          "priority": 1,
+          "messageSize": 2599,
+          "storeToken": "0",
+          "offlineMessageSize": 2599,
+          "lineCount": 13,
+          "references": "",
+          "keywords": "",
+          "body": "X-Account-Key: account3\r\nX-UIDL: UID26-1106642608\r\nX-Mozilla-Status: 0001\r\nX-Mozilla-Status2: 00000000\r\nX-Mozilla-Keys:                                                                          \r\nDelivered-To: example@example.com\r\nReceived: by 10.110.49.5 with SMTP id w5cs244663tiw;\r\n        Fri, 6 Jun 2008 10:06:34 -0700 (PDT)\r\nReceived: by 10.114.170.1 with SMTP id s1mr433517wae.133.1212771993914;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReturn-Path: <bugzilla-daemon@mozilla.org>\r\nReceived: from webapp-out.mozilla.org (webapp01.sj.mozilla.com [63.245.208.146])\r\n        by mx.google.com with ESMTP id i13si5593575wxd.5.2008.06.06.10.06.29;\r\n        Fri, 06 Jun 2008 10:06:33 -0700 (PDT)\r\nReceived-SPF: neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) client-ip=63.245.208.146;\r\nAuthentication-Results: mx.google.com; spf=neutral (google.com: 63.245.208.146 is neither permitted nor denied by domain of bugzilla-daemon@mozilla.org) smtp.mail=bugzilla-daemon@mozilla.org\r\nReceived: from mrapp54.mozilla.org (unused-10-2-11-236.mozilla.org [127.0.0.1])\r\n\tby webapp-out.mozilla.org (8.13.8/8.13.8) with ESMTP id m56H6SWk004936\r\n\tfor <example@example.com>; Fri, 6 Jun 2008 10:06:28 -0700\r\nReceived: (from root@localhost)\r\n\tby mrapp54.mozilla.org (8.13.8/8.13.8/Submit) id m56H6RWT004933;\r\n\tFri, 6 Jun 2008 10:06:27 -0700\r\nDate: Fri, 6 Jun 2008 10:06:27 -0700\r\nMessage-Id: <200806061706.m56H6RWT004933@mrapp54.mozilla.org>\r\nFrom: bugzilla-daemon@mozilla.org\r\nTo: example@example.com\r\nSubject: [Bug 436880] IMAP itemDeleted and itemMoveCopyCompleted\r\n notifications quite broken\r\nCc: invalid@example.com\r\nX-Bugzilla-Reason: AssignedTo Reporter\r\nX-Bugzilla-Type: newchanged\r\nX-Bugzilla-Watch-Reason: None\r\nX-Bugzilla-Product: Core\r\nX-Bugzilla-Component: MailNews: Backend\r\nX-Bugzilla-Keywords: \r\nX-Bugzilla-Severity: normal\r\nX-Bugzilla-Who: bugmail@example.org\r\nX-Bugzilla-Status: ASSIGNED\r\nX-Bugzilla-Priority: --\r\nX-Bugzilla-Assigned-To: example@example.com\r\nX-Bugzilla-Target-Milestone: ---\r\nX-Bugzilla-Changed-Fields: \r\nIn-Reply-To: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nReferences: <bug-436880-306754@https.bugzilla.mozilla.org/>\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nMIME-Version: 1.0\r\n\r\nDo not reply to this email.  You can add comments to this bug at\r\nhttps://bugzilla.mozilla.org/show_bug.cgi?id=436880\r\n\r\n\r\n\r\n\r\n-- \r\nConfigure bugmail: https://bugzilla.mozilla.org/userprefs.cgi?tab=email\r\n------- You are receiving this mail because: -------\r\nYou are the assignee for the bug.\r\nYou reported the bug.\r\n\r\n\r\n"
+        }
+      ]
+    }
+  ]
+}

@@ -5,6 +5,8 @@
 #ifndef COMM_MAILNEWS_DB_PANORAMA_SRC_DATABASECORE_H_
 #define COMM_MAILNEWS_DB_PANORAMA_SRC_DATABASECORE_H_
 
+#include <functional>
+
 #include "FolderDatabase.h"
 #include "MessageDatabase.h"
 #include "mozilla/RefCounted.h"
@@ -94,6 +96,70 @@ struct FolderImportKey {
 struct FolderImportReceipt {
   FolderImportIdentity identity;
   nsTArray<FolderImportKey> keys;
+};
+
+// Private version3 connected import. All references name original member tokens
+// and physical source keys; only the owning transaction assigns native keys.
+struct ImapImportReference {
+  nsCString token;
+  nsMsgKey sourceKey{nsMsgKey_None};
+};
+
+struct ImapImportUid {
+  nsMsgKey sourceKey{nsMsgKey_None};
+  uint32_t uid{0};
+};
+
+struct ImapImportOperation {
+  nsMsgKey sourceKey{nsMsgKey_None};
+  OfflineOperationData payload;
+  // Presence of the twelve optional typed payload fields in the saved row.
+  uint32_t payloadPresence{0};
+  Maybe<ImapImportReference> source;
+  Maybe<ImapImportReference> destination;
+  nsTArray<Maybe<ImapImportReference>> copies;
+};
+
+struct ImapImportBody {
+  nsMsgKey sourceKey{nsMsgKey_None};
+  uint32_t size{0};
+  nsCString sha256;
+};
+
+struct ImapImportFolder {
+  FolderImportSnapshot snapshot;
+  nsCOMPtr<nsIMsgFolder> folder;
+  nsCString uri;
+  Maybe<uint32_t> uidValidity;
+  nsTArray<ImapImportUid> serverUids;
+  nsTArray<ImapImportOperation> operations;
+  nsTArray<ImapImportBody> bodies;
+};
+
+struct ImapImportUnit {
+  nsCString token;
+  nsCString databaseSourceId;
+  nsTArray<ImapImportFolder> folders;
+};
+
+struct ImapImportOperationReceipt {
+  nsMsgKey sourceKey{nsMsgKey_None};
+  nsMsgKey key{nsMsgKey_None};
+  uint64_t id{0};
+  uint64_t revision{0};
+};
+
+struct ImapImportFolderReceipt {
+  FolderImportReceipt folder;
+  Maybe<uint32_t> uidValidity;
+  nsTArray<ImapImportUid> serverUids;
+  nsTArray<ImapImportOperationReceipt> operations;
+};
+
+struct ImapImportReceipt {
+  nsCString token;
+  nsCString databaseSourceId;
+  nsTArray<ImapImportFolderReceipt> folders;
 };
 
 // One prepared folder operation. The protocol/local owner retains its exact
@@ -210,11 +276,27 @@ class DatabaseCore : public nsIDatabaseCore,
   nsresult ImportFolderSnapshotFromFile(nsIFile* source,
                                         const FolderImportSnapshot& input,
                                         FolderImportReceipt& output);
+  // Existing friend fixture exercises the real raw validator; no caller API.
+  static nsresult CheckImportRecordsForTesting(JSContext* cx,
+                                               JS::Handle<JSObject*> request,
+                                               nsIMsgFolder* folder,
+                                               FolderImportSnapshot& input,
+                                               ImapImportFolder* imap);
   nsresult CheckFolderImportIdentity(const FolderImportIdentity& identity);
   nsresult ReadFolderImportReceipt(const FolderImportIdentity& identity,
                                    Maybe<FolderImportReceipt>& output);
   nsresult WriteImportedMessage(uint64_t folderId, nsMsgKey key, nsMsgKey root,
                                 nsMsgKey parent, const RawHdr& header);
+
+  // Native-only complete unit; callbacks run after the entire SQL commit and
+  // output installation. The bridge may preallocate JS output before commit.
+  nsresult ImportImapUnit(
+      const ImapImportUnit& input, ImapImportReceipt& output,
+      const std::function<nsresult(const ImapImportReceipt&)>& prepare = {},
+      const std::function<void()>& publish = {});
+  nsresult ReadImapImportReceipt(const ImapImportUnit& input,
+                                 const nsACString& provenance,
+                                 Maybe<ImapImportReceipt>& output);
 
   static nsresult GetStatement(const nsACString& aName, const nsACString& aSQL,
                                mozIStorageStatement** aStmt);

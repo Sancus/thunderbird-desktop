@@ -9,36 +9,27 @@
 #endif
 
 #include <algorithm>
+#include <charconv>
+#include <limits>
 #include <cmath>
 #include <cstring>
 #include <utility>
 
 #include "DatabaseUtils.h"
+#include "FolderDatabase.h"
+#include "Message.h"
+#include "MboxMsgInputStream.h"
+#include "MessageDatabase.h"
+#include "PerFolderDatabase.h"
 #include "js/Array.h"
+#include "js/CharacterEncoding.h"
 #include "js/ForOfIterator.h"
 #include "js/JSON.h"
 #include "js/MapAndSet.h"
-#include "js/experimental/TypedData.h"
-#include "mozilla/dom/ChromeUtils.h"
-#include "mozilla/dom/ChromeUtilsBinding.h"
-#include "js/CharacterEncoding.h"
 #include "js/PropertyAndElement.h"
 #include "js/String.h"
+#include "js/experimental/TypedData.h"
 #include "jsapi.h"
-#include "nsJSUtils.h"
-#include "nsIMsgPluggableStore.h"
-#include "FolderDatabase.h"
-#include "Message.h"
-#include "MessageDatabase.h"
-#include "mozilla/Base64.h"
-#include "mozilla/Components.h"
-#include "mozilla/dom/Promise.h"
-#include "mozilla/Logging.h"
-#include "mozilla/ProfilerMarkers.h"
-#include "mozilla/Services.h"
-#include "mozilla/UniquePtr.h"
-#include "mozilla/fallible.h"
-#include "mozilla/ScopeExit.h"
 #include "mozIStorageBindingParams.h"
 #include "mozIStorageBindingParamsArray.h"
 #include "mozIStorageConnection.h"
@@ -50,6 +41,17 @@
 #include "mozIStorageStatement.h"
 #include "mozIStorageStatementCallback.h"
 #include "mozStorageHelper.h"
+#include "mozilla/Base64.h"
+#include "mozilla/Components.h"
+#include "mozilla/Logging.h"
+#include "mozilla/ProfilerMarkers.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Services.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/ChromeUtils.h"
+#include "mozilla/dom/ChromeUtilsBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/fallible.h"
 #include "msgCore.h"
 #include "nsAppDirectoryServiceDefs.h"
 #include "nsIClassInfoImpl.h"
@@ -57,17 +59,20 @@
 #include "nsID.h"
 #include "nsIFile.h"
 #include "nsIInputStream.h"
+#include "nsISeekableStream.h"
 #include "nsILineInputStream.h"
 #include "nsIMimeConverter.h"
+#include "nsIMsgOfflineImapOperation.h"
+#include "nsIMsgPluggableStore.h"
 #include "nsIObserverService.h"
 #include "nsIUUIDGenerator.h"
+#include "nsJSUtils.h"
 #include "nsMsgFolderFlags.h"
 #include "nsMsgMessageFlags.h"
 #include "nsMsgUtils.h"
-#include "nsReadableUtils.h"
 #include "nsNetUtil.h"
+#include "nsReadableUtils.h"
 #include "nsThreadUtils.h"
-#include "PerFolderDatabase.h"
 #include "xpcpublic.h"
 
 using mozilla::LazyLogModule;
@@ -515,7 +520,7 @@ static constexpr auto kThreadFlagsFolderDelete =
 nsresult DatabaseCore::UpgradeSchema() {
   int32_t version;
   MOZ_TRY(sConnection->GetSchemaVersion(&version));
-  NS_ENSURE_TRUE(version >= 0 && version <= 19, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(version >= 0 && version <= 21, NS_ERROR_NOT_AVAILABLE);
   // Both the original production schema and the old test fixture have these
   // columns. References discarded by either layout cannot be reconstructed.
   static constexpr struct {
@@ -1322,6 +1327,40 @@ nsresult DatabaseCore::UpgradeSchema() {
       "firstError:INTEGER:0:0,"
       "settledSourceRemoved:INTEGER:0:0,"
       "settledOperationRetired:INTEGER:0:0"));
+  if (version < 20) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE imap_import_units("
+        "token TEXT NOT NULL PRIMARY KEY, databaseSourceId TEXT NOT NULL, "
+        "provenance TEXT NOT NULL);"
+        "CREATE TABLE imap_import_operations("
+        "unitToken TEXT NOT NULL, member INTEGER NOT NULL, "
+        "sourceKey INTEGER NOT NULL, messageKey INTEGER NOT NULL, "
+        "operationId INTEGER NOT NULL, revision INTEGER NOT NULL, "
+        "PRIMARY KEY(unitToken,member,sourceKey));"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(20));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "imap_import_units",
+      "token:TEXT:1:1,databaseSourceId:TEXT:1:0,provenance:TEXT:1:0"));
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "imap_import_operations",
+      "unitToken:TEXT:1:1,member:INTEGER:1:2,sourceKey:INTEGER:1:3,"
+      "messageKey:INTEGER:1:0,operationId:INTEGER:1:0,revision:INTEGER:1:0"));
+  if (version < 21) {
+    MOZ_TRY(sConnection->ExecuteSimpleSQL(
+        "CREATE TABLE imap_import_operation_holds("
+        "operationId INTEGER PRIMARY KEY, databaseSourceId TEXT NOT NULL, "
+        "folderId INTEGER NOT NULL, messageKey INTEGER NOT NULL);"
+        "CREATE TRIGGER delete_imap_import_hold AFTER DELETE ON "
+        "offline_operations "
+        "BEGIN DELETE FROM imap_import_operation_holds "
+        "WHERE operationId=OLD.id; END"_ns));
+    MOZ_TRY(sConnection->SetSchemaVersion(21));
+  }
+  MOZ_TRY(CheckReferenceSchemaTable(
+      sConnection, "imap_import_operation_holds",
+      "operationId:INTEGER:0:1,databaseSourceId:TEXT:1:0,"
+      "folderId:INTEGER:1:0,messageKey:INTEGER:1:0"));
   return NS_OK;
 }
 
@@ -1409,6 +1448,13 @@ class FolderImportAdmission final {
     uint16_t kind = expected.id.IsEmpty()
                         ? nsIPanoramaMigrationFileSystem::KIND_FILE_OR_MISSING
                         : nsIPanoramaMigrationFileSystem::KIND_FILE;
+    if (allowMissing && !expected.id.IsEmpty()) {
+      // This selects a candidate kind only. Native admission and the expected
+      // physical identities below still prove the original and live paths.
+      bool directory;
+      MOZ_TRY(original->IsDirectory(&directory));
+      if (directory) kind = nsIPanoramaMigrationFileSystem::KIND_DIRECTORY;
+    }
     nsCOMPtr<nsIPanoramaMigrationPath> lease;
     MOZ_TRY(mFileSystem->Admit(original, root, kind, getter_AddRefs(lease)));
     mLeases.AppendElement(lease);
@@ -2046,6 +2092,812 @@ nsresult DatabaseCore::ImportFolderSnapshotFromFile(
   return NS_OK;
 }
 
+namespace {
+
+void ImapImportFrame(nsACString& output, const nsACString& value) {
+  output.AppendInt(value.Length());
+  output.Append(':');
+  output.Append(value);
+}
+
+void ImapImportNumber(nsACString& output, uint64_t value) {
+  nsAutoCString text;
+  text.AppendInt(value);
+  ImapImportFrame(output, text);
+}
+
+void ImapImportRef(nsACString& output,
+                   const Maybe<ImapImportReference>& value) {
+  ImapImportNumber(output, value.isSome());
+  if (value) {
+    ImapImportFrame(output, value->token);
+    ImapImportNumber(output, value->sourceKey);
+  }
+}
+
+nsCString ImapImportProvenance(const ImapImportUnit& input) {
+  nsCString proof;
+  ImapImportFrame(proof, input.token);
+  ImapImportFrame(proof, input.databaseSourceId);
+  ImapImportNumber(proof, input.folders.Length());
+  for (const auto& member : input.folders) {
+    const auto& snapshot = member.snapshot;
+    const auto& id = snapshot.identity;
+    for (const auto* text : {&id.token, &id.sourceId, &id.databaseSourceId,
+                             &id.sourceSha256, &id.folderPath, &member.uri}) {
+      ImapImportFrame(proof, *text);
+    }
+    ImapImportFrame(proof, NS_ConvertUTF16toUTF8(id.sourcePath));
+    ImapImportNumber(proof, id.folderId);
+    ImapImportNumber(proof, snapshot.sourceSize);
+    ImapImportNumber(proof, id.windows.isSome());
+    if (id.windows) {
+      for (const auto* path : {&id.windows->summary, &id.windows->store}) {
+        for (const auto* text : {&path->originalPath, &path->originalRoot,
+                                 &path->canonicalPath, &path->canonicalRoot}) {
+          ImapImportFrame(proof, NS_ConvertUTF16toUTF8(*text));
+        }
+        for (const auto* text : {&path->id, &path->parentId, &path->rootId}) {
+          ImapImportFrame(proof, *text);
+        }
+      }
+    }
+    ImapImportNumber(proof, member.uidValidity.isSome());
+    if (member.uidValidity) ImapImportNumber(proof, *member.uidValidity);
+    ImapImportNumber(proof, member.serverUids.Length());
+    for (const auto& uid : member.serverUids) {
+      ImapImportNumber(proof, uid.sourceKey);
+      ImapImportNumber(proof, uid.uid);
+    }
+    ImapImportNumber(proof, member.operations.Length());
+    for (const auto& operation : member.operations) {
+      const auto& op = operation.payload;
+      ImapImportNumber(proof, operation.sourceKey);
+      ImapImportNumber(proof, operation.payloadPresence);
+      for (uint32_t value :
+           {op.operation, op.flagOperation, op.newFlags, op.sourceKey,
+            op.sourceUid, op.messageSize, uint32_t(op.playingBack)}) {
+        ImapImportNumber(proof, value);
+      }
+      for (const auto* text : {&op.sourceFolderURI, &op.destinationFolderURI,
+                               &op.keywordsToAdd, &op.keywordsToRemove}) {
+        ImapImportFrame(proof, *text);
+      }
+      ImapImportRef(proof, operation.source);
+      ImapImportRef(proof, operation.destination);
+      ImapImportNumber(proof, op.copyDestinations.Length());
+      for (size_t i = 0; i < op.copyDestinations.Length(); ++i) {
+        ImapImportFrame(proof, op.copyDestinations[i]);
+        if (i < operation.copies.Length()) {
+          ImapImportRef(proof, operation.copies[i]);
+        }
+      }
+    }
+    ImapImportNumber(proof, member.bodies.Length());
+    for (const auto& body : member.bodies) {
+      ImapImportNumber(proof, body.sourceKey);
+      ImapImportNumber(proof, body.size);
+      ImapImportFrame(proof, body.sha256);
+    }
+  }
+  return proof;
+}
+
+// An ordinary provider open still requires committed metadata. Keep that first
+// measurement, then use this private checked path for the transaction's fresh
+// recheck. Retaining an mbox provider stream would retain its prefetched bytes.
+struct ImapImportBodyAdmission {
+  nsMsgKey sourceKey{nsMsgKey_None};
+  nsCString token;
+  nsCOMPtr<nsIFile> folderPath;
+  nsCOMPtr<nsIFile> file;
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  bool mbox{false};
+  int64_t offset{0};
+};
+
+nsresult AdmitImapImportBody(const ImapImportFolder& member,
+                             const ImapImportBody& body,
+                             ImapImportBodyAdmission& output) {
+  NS_ENSURE_TRUE(member.folder, NS_ERROR_NOT_AVAILABLE);
+  uint64_t folder;
+  MOZ_TRY(member.folder->GetId(&folder));
+  NS_ENSURE_TRUE(folder == member.snapshot.identity.folderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  const RawHdr* header = nullptr;
+  for (const auto& row : member.snapshot.messages) {
+    if (row.sourceKey == body.sourceKey) header = &row.header;
+  }
+  NS_ENSURE_TRUE(header && header->storeToken && !header->storeToken->IsEmpty(),
+                 NS_ERROR_NOT_AVAILABLE);
+  output.sourceKey = body.sourceKey;
+  output.token = *header->storeToken;
+  MOZ_TRY(member.folder->GetMsgStore(getter_AddRefs(output.store)));
+  NS_ENSURE_TRUE(output.store, NS_ERROR_NOT_AVAILABLE);
+  nsCString type;
+  MOZ_TRY(output.store->GetStoreType(type));
+  NS_ENSURE_TRUE(type == "mbox"_ns || type == "maildir"_ns,
+                 NS_ERROR_NOT_IMPLEMENTED);
+  output.mbox = type == "mbox"_ns;
+  MOZ_TRY(member.folder->GetFilePath(getter_AddRefs(output.folderPath)));
+  MOZ_TRY(output.folderPath->Clone(getter_AddRefs(output.file)));
+  if (output.mbox) {
+    uint64_t offset;
+    const char* end = output.token.EndReading();
+    auto parsed = std::from_chars(output.token.BeginReading(), end, offset);
+    NS_ENSURE_TRUE(parsed.ec == std::errc() && parsed.ptr == end &&
+                       offset <= uint64_t(std::numeric_limits<int64_t>::max()),
+                   NS_ERROR_ILLEGAL_VALUE);
+    output.offset = int64_t(offset);
+  } else {
+    MOZ_TRY(output.file->Append(u"cur"_ns));
+    MOZ_TRY(output.file->Append(NS_ConvertUTF8toUTF16(output.token)));
+  }
+  return NS_OK;
+}
+
+nsresult MeasureImapImportStream(nsIInputStream* stream,
+                                 ImapImportBody& output) {
+  NS_ENSURE_TRUE(stream, NS_ERROR_NOT_AVAILABLE);
+  auto close = MakeScopeExit([&] { stream->Close(); });
+  nsCOMPtr<nsICryptoHash> hash;
+  MOZ_TRY(NS_NewCryptoHash(nsICryptoHash::SHA256, getter_AddRefs(hash)));
+  char bytes[65536];
+  uint64_t size = 0;
+  while (true) {
+    uint32_t count;
+    MOZ_TRY(stream->Read(bytes, sizeof(bytes), &count));
+    if (!count) break;
+    size += count;
+    NS_ENSURE_TRUE(size <= UINT32_MAX, NS_ERROR_FILE_TOO_BIG);
+    MOZ_TRY(hash->Update(reinterpret_cast<const uint8_t*>(bytes), count));
+  }
+  MOZ_TRY(stream->Close());
+  close.release();
+  nsCString digest, hex;
+  MOZ_TRY(hash->Finish(false, digest));
+  for (unsigned char byte : digest.View()) {
+    hex.Append("0123456789abcdef"[byte >> 4]);
+    hex.Append("0123456789abcdef"[byte & 15]);
+  }
+  output.size = size;
+  output.sha256 = std::move(hex);
+  return NS_OK;
+}
+
+nsresult MeasureImapImportBody(const ImapImportFolder& member,
+                               const RawHdr& header, ImapImportBody& output) {
+  NS_ENSURE_TRUE(
+      member.folder && header.storeToken && !header.storeToken->IsEmpty(),
+      NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(member.folder->GetMsgStore(getter_AddRefs(store)));
+  NS_ENSURE_TRUE(store, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIInputStream> stream;
+  MOZ_TRY(store->GetMsgInputStream(member.folder, *header.storeToken, 0,
+                                   getter_AddRefs(stream)));
+  return MeasureImapImportStream(stream, output);
+}
+
+nsresult RecheckImapImportBody(const ImapImportFolder& member,
+                               const ImapImportBody& body,
+                               const ImapImportBodyAdmission& admission) {
+  NS_ENSURE_TRUE(member.folder && body.sourceKey == admission.sourceKey,
+                 NS_ERROR_NOT_AVAILABLE);
+  uint64_t folder;
+  MOZ_TRY(member.folder->GetId(&folder));
+  NS_ENSURE_TRUE(folder == member.snapshot.identity.folderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  const RawHdr* header = nullptr;
+  for (const auto& row : member.snapshot.messages) {
+    if (row.sourceKey == body.sourceKey) header = &row.header;
+  }
+  NS_ENSURE_TRUE(
+      header && header->storeToken && *header->storeToken == admission.token,
+      NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIFile> path;
+  MOZ_TRY(member.folder->GetFilePath(getter_AddRefs(path)));
+  bool same;
+  MOZ_TRY(admission.folderPath->Equals(path, &same));
+  NS_ENSURE_TRUE(same, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(member.folder->GetMsgStore(getter_AddRefs(store)));
+  NS_ENSURE_TRUE(store == admission.store, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIInputStream> stream;
+  MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(stream), admission.file));
+  if (admission.mbox) {
+    nsCOMPtr<nsISeekableStream> seekable = do_QueryInterface(stream);
+    NS_ENSURE_TRUE(seekable, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(seekable->Seek(PR_SEEK_SET, admission.offset));
+    stream = new MboxMsgInputStream(stream, 0);
+  }
+  ImapImportBody measured;
+  MOZ_TRY(MeasureImapImportStream(stream, measured));
+  NS_ENSURE_TRUE(measured.size == body.size && measured.sha256 == body.sha256,
+                 NS_ERROR_NOT_AVAILABLE);
+  return NS_OK;
+}
+
+nsresult CheckImapImportBodies(const ImapImportFolder& member) {
+  nsTHashMap<nsMsgKey, bool> seen;
+  for (const auto& body : member.bodies) {
+    NS_ENSURE_FALSE(seen.Contains(body.sourceKey), NS_ERROR_INVALID_ARG);
+    seen.InsertOrUpdate(body.sourceKey, true);
+    const RawHdr* header = nullptr;
+    for (const auto& row : member.snapshot.messages) {
+      if (row.sourceKey == body.sourceKey) header = &row.header;
+    }
+    NS_ENSURE_TRUE(header, NS_ERROR_NOT_AVAILABLE);
+    ImapImportBody measured;
+    MOZ_TRY(MeasureImapImportBody(member, *header, measured));
+    NS_ENSURE_TRUE(measured.size == body.size && measured.sha256 == body.sha256,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  return NS_OK;
+}
+
+}  // namespace
+
+nsresult DatabaseCore::ReadImapImportReceipt(const ImapImportUnit& input,
+                                             const nsACString& provenance,
+                                             Maybe<ImapImportReceipt>& output) {
+  NS_ENSURE_FALSE(input.folders.IsEmpty(), NS_ERROR_INVALID_ARG);
+  MOZ_TRY(CheckFolderImportIdentity(input.folders[0].snapshot.identity));
+  nsCOMPtr<mozIStorageStatement> stmt;
+  MOZ_TRY(GetStatement(
+      "ReadImapImportUnit"_ns,
+      "SELECT databaseSourceId,provenance FROM imap_import_units WHERE token=:token"_ns,
+      getter_AddRefs(stmt)));
+  {
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.token));
+    bool exists;
+    MOZ_TRY(stmt->ExecuteStep(&exists));
+    if (!exists) {
+      output.reset();
+      return NS_OK;
+    }
+    nsCString database, stored;
+    MOZ_TRY(stmt->GetUTF8String(0, database));
+    MOZ_TRY(stmt->GetUTF8String(1, stored));
+    NS_ENSURE_TRUE(database == input.databaseSourceId && stored == provenance,
+                   NS_ERROR_ALREADY_INITIALIZED);
+  }
+  ImapImportReceipt result;
+  result.token = input.token;
+  result.databaseSourceId = input.databaseSourceId;
+  MOZ_TRY(GetStatement(
+      "ReadImapImportOperations"_ns,
+      "SELECT sourceKey,messageKey,operationId,revision FROM "
+      "imap_import_operations WHERE unitToken=:token AND member=:member "
+      "ORDER BY sourceKey"_ns,
+      getter_AddRefs(stmt)));
+  nsTHashMap<nsMsgKey, bool> globalKeys;
+  nsTHashMap<uint64_t, bool> operationIds;
+  for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+    const auto& original = input.folders[i];
+    Maybe<FolderImportReceipt> member;
+    MOZ_TRY(CheckFolderImportIdentity(original.snapshot.identity));
+    MOZ_TRY(ReadFolderImportReceipt(original.snapshot.identity, member));
+    NS_ENSURE_TRUE(member, NS_ERROR_FILE_CORRUPTED);
+    auto& receipt = *result.folders.AppendElement();
+    receipt.folder = std::move(*member);
+    receipt.uidValidity = original.uidValidity;
+    receipt.serverUids = original.serverUids.Clone();
+    for (const auto& pair : receipt.folder.keys) {
+      NS_ENSURE_FALSE(globalKeys.Contains(pair.destination),
+                      NS_ERROR_FILE_CORRUPTED);
+      globalKeys.InsertOrUpdate(pair.destination, true);
+    }
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.token));
+    MOZ_TRY(stmt->BindInt64ByName("member"_ns, i));
+    bool more;
+    while (true) {
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (!more) break;
+      int64_t values[4];
+      for (uint32_t column = 0; column < 4; ++column) {
+        int32_t type;
+        MOZ_TRY(stmt->GetTypeOfIndex(column, &type));
+        NS_ENSURE_TRUE(type == mozIStorageStatement::VALUE_TYPE_INTEGER,
+                       NS_ERROR_FILE_CORRUPTED);
+        MOZ_TRY(stmt->GetInt64(column, &values[column]));
+      }
+      NS_ENSURE_TRUE(values[0] >= 0 && values[0] < nsMsgKey_None &&
+                         values[1] > 0 && values[1] < nsMsgKey_None &&
+                         values[2] > 0 && values[2] <= 9007199254740991LL &&
+                         values[3] > 0 && values[3] <= 9007199254740991LL,
+                     NS_ERROR_FILE_CORRUPTED);
+      bool captured = false;
+      for (const auto& op : original.operations) {
+        captured |= op.sourceKey == values[0];
+      }
+      NS_ENSURE_TRUE(captured && !operationIds.Contains(values[2]),
+                     NS_ERROR_FILE_CORRUPTED);
+      operationIds.InsertOrUpdate(values[2], true);
+      bool mapped = false;
+      for (const auto& pair : receipt.folder.keys) {
+        if (pair.source == values[0]) {
+          NS_ENSURE_TRUE(pair.destination == values[1],
+                         NS_ERROR_FILE_CORRUPTED);
+          mapped = true;
+        }
+      }
+      if (!mapped) {
+        NS_ENSURE_FALSE(globalKeys.Contains(values[1]),
+                        NS_ERROR_FILE_CORRUPTED);
+        globalKeys.InsertOrUpdate(values[1], true);
+      }
+      receipt.operations.AppendElement(
+          ImapImportOperationReceipt{nsMsgKey(values[0]), nsMsgKey(values[1]),
+                                     uint64_t(values[2]), uint64_t(values[3])});
+    }
+    NS_ENSURE_TRUE(receipt.operations.Length() == original.operations.Length(),
+                   NS_ERROR_FILE_CORRUPTED);
+  }
+  output = Some(std::move(result));
+  return NS_OK;
+}
+
+nsresult DatabaseCore::ImportImapUnit(
+    const ImapImportUnit& input, ImapImportReceipt& output,
+    const std::function<nsresult(const ImapImportReceipt&)>& prepare,
+    const std::function<void()>& publish) {
+  NS_ENSURE_TRUE(sInstance.get() == this && sConnection && mMessageDatabase,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(!input.token.IsEmpty() && input.token.FindChar(0) < 0 &&
+                     !input.folders.IsEmpty(),
+                 NS_ERROR_INVALID_ARG);
+  bool active;
+  MOZ_TRY(sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_FALSE(active, NS_ERROR_IN_PROGRESS);
+  nsCString current;
+  MOZ_TRY(GetSourceId(current));
+  NS_ENSURE_TRUE(current == input.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  struct Prepared {
+    FolderImportAdmission admission;
+    nsCString marker;
+    nsTHashMap<nsMsgKey, nsMsgKey> keys;
+    nsTArray<ImapImportBodyAdmission> bodies;
+  };
+  nsTArray<UniquePtr<Prepared>> members;
+  nsTHashMap<nsCString, uint32_t> tokens;
+  nsTHashMap<uint64_t, bool> folders;
+  for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+    const auto& member = input.folders[i];
+    const auto& snapshot = member.snapshot;
+    const auto& identity = snapshot.identity;
+    NS_ENSURE_TRUE(
+        snapshot.recordsComplete && snapshot.unhandledRecords.IsEmpty() &&
+            identity.databaseSourceId == current && !identity.token.IsEmpty() &&
+            identity.token != input.token && !tokens.Contains(identity.token) &&
+            !folders.Contains(identity.folderId),
+        NS_ERROR_INVALID_ARG);
+    tokens.InsertOrUpdate(identity.token, i);
+    folders.InsertOrUpdate(identity.folderId, true);
+    MOZ_TRY(CheckFolderImportIdentity(identity));
+    nsTHashMap<nsMsgKey, bool> uidKeys;
+    nsTHashMap<uint32_t, bool> uids;
+    for (const auto& uid : member.serverUids) {
+      NS_ENSURE_TRUE(member.uidValidity && *member.uidValidity && uid.uid &&
+                         uid.sourceKey != nsMsgKey_None &&
+                         !uidKeys.Contains(uid.sourceKey) &&
+                         !uids.Contains(uid.uid),
+                     NS_ERROR_NOT_AVAILABLE);
+      uidKeys.InsertOrUpdate(uid.sourceKey, true);
+      uids.InsertOrUpdate(uid.uid, true);
+    }
+    nsCOMPtr<nsIFile> file;
+    MOZ_TRY(NS_NewLocalFile(identity.sourcePath, getter_AddRefs(file)));
+    auto prepared = MakeUnique<Prepared>();
+    MOZ_TRY(prepared->admission.Acquire(identity, file));
+    MOZ_TRY(HashImportSource(prepared->admission.Summary(), identity,
+                             snapshot.sourceSize, &prepared->marker));
+    MOZ_TRY(CheckImapImportBodies(member));
+    if (!member.bodies.IsEmpty()) {
+      MOZ_TRY(mMessageDatabase->CheckFolderBodyAccess(identity.folderId));
+      for (const auto& body : member.bodies) {
+        MOZ_TRY(AdmitImapImportBody(member, body,
+                                    *prepared->bodies.AppendElement()));
+      }
+    }
+    members.AppendElement(std::move(prepared));
+  }
+  nsCString proof = ImapImportProvenance(input);
+  Maybe<ImapImportReceipt> previous;
+  MOZ_TRY(ReadImapImportReceipt(input, proof, previous));
+  if (previous) {
+    if (prepare) MOZ_TRY(prepare(*previous));
+    output = std::move(*previous);
+    if (publish) publish();
+    return NS_OK;
+  }
+  RefPtr<DatabaseCore> self(this);
+  RefPtr<MessageDatabase> messages = mMessageDatabase;
+  nsTArray<UniquePtr<MessageDatabase::CachedMsg>> cached;
+  nsTArray<RefPtr<Message>> live;
+  ImapImportReceipt result;
+  result.token = input.token;
+  result.databaseSourceId = current;
+  MOZ_TRY(sConnection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    nsMsgKey next;
+    MOZ_TRY(GetNextMessageKey(next));
+    auto allocate = [&](nsMsgKey& key) -> nsresult {
+      NS_ENSURE_TRUE(next && next < nsMsgKey_None, NS_ERROR_ILLEGAL_VALUE);
+      key = next++;
+      return NS_OK;
+    };
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      const auto& member = input.folders[i];
+      const auto& snapshot = member.snapshot;
+      const auto& identity = snapshot.identity;
+      Maybe<FolderImportReceipt> old;
+      MOZ_TRY(ReadFolderImportReceipt(identity, old));
+      NS_ENSURE_FALSE(old, NS_ERROR_ALREADY_INITIALIZED);
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(GetStatement(
+          "EmptyImapImportFolder"_ns,
+          "SELECT 1 FROM messages WHERE folderId=:folder UNION ALL "
+          "SELECT 1 FROM staged_messages WHERE folderId=:folder UNION ALL "
+          "SELECT 1 FROM offline_operations WHERE folderId=:folder LIMIT 1"_ns,
+          getter_AddRefs(stmt)));
+      {
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindInt64ByName("folder"_ns, identity.folderId));
+        bool occupied;
+        MOZ_TRY(stmt->ExecuteStep(&occupied));
+        NS_ENSURE_FALSE(occupied, NS_ERROR_ALREADY_INITIALIZED);
+      }
+      uint32_t epoch;
+      nsresult epochRv =
+          FolderDB().GetFolderUidValidity(identity.folderId, epoch);
+      NS_ENSURE_TRUE(epochRv == NS_ERROR_NOT_AVAILABLE ||
+                         (NS_SUCCEEDED(epochRv) && member.uidValidity &&
+                          epoch == *member.uidValidity),
+                     NS_FAILED(epochRv) ? epochRv : NS_ERROR_NOT_AVAILABLE);
+      auto& receipt = *result.folders.AppendElement();
+      receipt.folder.identity = identity;
+      receipt.uidValidity = member.uidValidity;
+      receipt.serverUids = member.serverUids.Clone();
+      for (const auto& row : snapshot.messages) {
+        NS_ENSURE_TRUE(row.sourceKey != nsMsgKey_None &&
+                           row.header.key == nsMsgKey_None &&
+                           !members[i]->keys.Contains(row.sourceKey),
+                       NS_ERROR_INVALID_ARG);
+        nsMsgKey key;
+        MOZ_TRY(allocate(key));
+        members[i]->keys.InsertOrUpdate(row.sourceKey, key);
+        receipt.folder.keys.AppendElement(FolderImportKey{row.sourceKey, key});
+      }
+    }
+    // Operation-only reservations follow all message keys, so message insertion
+    // keeps the existing monotonic physical allocator trigger unchanged.
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      nsTHashMap<nsMsgKey, bool> operations;
+      for (const auto& op : input.folders[i].operations) {
+        NS_ENSURE_TRUE(
+            op.sourceKey != nsMsgKey_None &&
+                !operations.Contains(op.sourceKey) && !op.payload.playingBack &&
+                op.copies.Length() == op.payload.copyDestinations.Length(),
+            NS_ERROR_INVALID_ARG);
+        operations.InsertOrUpdate(op.sourceKey, true);
+        if (!members[i]->keys.Contains(op.sourceKey)) {
+          nsMsgKey key;
+          MOZ_TRY(allocate(key));
+          members[i]->keys.InsertOrUpdate(op.sourceKey, key);
+        }
+      }
+    }
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      const auto& member = input.folders[i];
+      const auto& snapshot = member.snapshot;
+      auto& map = members[i]->keys;
+      for (const auto& row : snapshot.messages) {
+        nsMsgKey key, root, parent = 0;
+        NS_ENSURE_TRUE(map.Get(row.sourceKey, &key) &&
+                           map.Get(row.rootSourceKey, &root) &&
+                           (!row.parentSourceKey ||
+                            map.Get(*row.parentSourceKey, &parent)),
+                       NS_ERROR_INVALID_ARG);
+        MOZ_TRY(WriteImportedMessage(snapshot.identity.folderId, key, root,
+                                     parent, row.header));
+        live.AppendElement(new Message(key));
+      }
+      for (const auto& property : snapshot.folderProperties) {
+        NS_ENSURE_TRUE(property.name != "morkMigrationSource"_ns,
+                       NS_ERROR_INVALID_ARG);
+        if (property.integer) {
+          MOZ_TRY(FolderDB().SetFolderProperty(
+              snapshot.identity.folderId, property.name, *property.integer));
+        } else {
+          MOZ_TRY(FolderDB().SetFolderProperty(snapshot.identity.folderId,
+                                               property.name, property.text));
+        }
+      }
+      uint32_t epoch;
+      nsresult epochRv =
+          FolderDB().GetFolderUidValidity(snapshot.identity.folderId, epoch);
+      NS_ENSURE_TRUE(member.uidValidity
+                         ? NS_SUCCEEDED(epochRv) && epoch == *member.uidValidity
+                         : epochRv == NS_ERROR_NOT_AVAILABLE,
+                     NS_ERROR_INVALID_ARG);
+      nsTHashMap<nsMsgKey, bool> bound;
+      for (const auto& uid : member.serverUids) {
+        NS_ENSURE_TRUE(member.uidValidity && *member.uidValidity && uid.uid &&
+                           !bound.Contains(uid.sourceKey),
+                       NS_ERROR_INVALID_ARG);
+        bound.InsertOrUpdate(uid.sourceKey, true);
+        nsMsgKey key;
+        NS_ENSURE_TRUE(map.Get(uid.sourceKey, &key), NS_ERROR_INVALID_ARG);
+        bool liveHeader = false;
+        for (const auto& row : snapshot.messages)
+          liveHeader |= row.sourceKey == uid.sourceKey;
+        if (liveHeader) {
+          MOZ_TRY(messages->BindMessageToServerUidInTransaction(
+              key, snapshot.identity.folderId, *member.uidValidity, uid.uid,
+              false));
+        }
+      }
+      MOZ_TRY(FolderDB().SetFolderProperty(snapshot.identity.folderId,
+                                           "morkMigrationSource"_ns,
+                                           members[i]->marker));
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(GetStatement(
+          "ReserveImapImportKeys"_ns,
+          "UPDATE message_key_allocator SET highWater=:key WHERE singleton=1 AND highWater<=:key"_ns,
+          getter_AddRefs(stmt)));
+      MOZ_TRY(stmt->BindInt64ByName("key"_ns, uint64_t(next) - 1));
+      MOZ_TRY(stmt->Execute());
+    }
+    auto resolve = [&](const ImapImportReference& ref, PendingDestination& dest,
+                       uint32_t& index) -> nsresult {
+      NS_ENSURE_TRUE(tokens.Get(ref.token, &index), NS_ERROR_NOT_AVAILABLE);
+      const auto& target = input.folders[index];
+      nsMsgKey key;
+      NS_ENSURE_TRUE(members[index]->keys.Get(ref.sourceKey, &key),
+                     NS_ERROR_NOT_AVAILABLE);
+      dest = target.uidValidity
+                 ? PendingDestination{target.snapshot.identity.folderId, key,
+                                      *target.uidValidity}
+                 : PendingDestination::Unobserved(
+                       target.snapshot.identity.folderId, key);
+      return NS_OK;
+    };
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      const auto& member = input.folders[i];
+      for (const auto& original : member.operations) {
+        const auto& raw = original.payload;
+        OfflineOperationData op{raw.operation,
+                                raw.flagOperation,
+                                raw.newFlags,
+                                raw.sourceKey,
+                                raw.sourceUid,
+                                raw.messageSize,
+                                raw.playingBack,
+                                raw.sourceFolderURI,
+                                raw.destinationFolderURI,
+                                raw.keywordsToAdd,
+                                raw.keywordsToRemove,
+                                raw.copyDestinations.Clone(),
+                                raw.pendingDestination,
+                                raw.copyDestinationBindings.Clone(),
+                                raw.flagMutation,
+                                raw.moveSourceGuard,
+                                raw.invalidateFlagMutation};
+        nsMsgKey key;
+        NS_ENSURE_TRUE(members[i]->keys.Get(original.sourceKey, &key),
+                       NS_ERROR_INVALID_ARG);
+        Maybe<ServerMessageLocation> source;
+        if (original.source) {
+          PendingDestination physical;
+          uint32_t index;
+          MOZ_TRY(resolve(*original.source, physical, index));
+          const auto& from = input.folders[index];
+          if (!op.sourceFolderURI.IsEmpty()) {
+            NS_ENSURE_TRUE(op.sourceFolderURI == from.uri &&
+                               op.sourceKey == original.source->sourceKey,
+                           NS_ERROR_NOT_AVAILABLE);
+            op.sourceKey = physical.key;
+          } else {
+            NS_ENSURE_TRUE(
+                index == i && original.source->sourceKey == original.sourceKey,
+                NS_ERROR_NOT_AVAILABLE);
+          }
+          uint32_t uid = op.sourceUid;
+          for (const auto& binding : from.serverUids) {
+            if (binding.sourceKey == original.source->sourceKey) {
+              NS_ENSURE_TRUE(!uid || uid == binding.uid,
+                             NS_ERROR_NOT_AVAILABLE);
+              uid = binding.uid;
+            }
+          }
+          NS_ENSURE_TRUE(from.uidValidity && *from.uidValidity && uid,
+                         NS_ERROR_NOT_AVAILABLE);
+          if (index == i) {
+            NS_ENSURE_TRUE(physical.key == key, NS_ERROR_NOT_AVAILABLE);
+            source = Some(ServerMessageLocation{physical.folderId, key,
+                                                *from.uidValidity, uid});
+          }
+        } else {
+          NS_ENSURE_TRUE(op.sourceFolderURI.IsEmpty(), NS_ERROR_NOT_AVAILABLE);
+          for (const auto& uid : member.serverUids) {
+            if (uid.sourceKey == original.sourceKey) {
+              NS_ENSURE_TRUE(member.uidValidity && *member.uidValidity &&
+                                 (!op.sourceUid || op.sourceUid == uid.uid),
+                             NS_ERROR_NOT_AVAILABLE);
+              source = Some(
+                  ServerMessageLocation{member.snapshot.identity.folderId, key,
+                                        *member.uidValidity, uid.uid});
+            }
+          }
+        }
+        if (original.destination) {
+          PendingDestination dest;
+          uint32_t index;
+          MOZ_TRY(resolve(*original.destination, dest, index));
+          NS_ENSURE_TRUE(op.destinationFolderURI == input.folders[index].uri,
+                         NS_ERROR_NOT_AVAILABLE);
+          if (op.operation & (nsIMsgOfflineImapOperation::kMsgMoved |
+                              nsIMsgOfflineImapOperation::kAppendDraft |
+                              nsIMsgOfflineImapOperation::kAppendTemplate)) {
+            op.pendingDestination = Some(dest);
+          } else {
+            NS_ENSURE_TRUE(
+                (op.operation & nsIMsgOfflineImapOperation::kMoveResult) &&
+                    index == i && dest.key == key && original.source,
+                NS_ERROR_NOT_AVAILABLE);
+          }
+        } else {
+          NS_ENSURE_TRUE(op.destinationFolderURI.IsEmpty(),
+                         NS_ERROR_NOT_AVAILABLE);
+        }
+        op.copyDestinationBindings.Clear();
+        for (size_t n = 0; n < original.copies.Length(); ++n) {
+          NS_ENSURE_TRUE(original.copies[n], NS_ERROR_NOT_AVAILABLE);
+          PendingDestination dest;
+          uint32_t index;
+          MOZ_TRY(resolve(*original.copies[n], dest, index));
+          NS_ENSURE_TRUE(op.copyDestinations[n] == input.folders[index].uri,
+                         NS_ERROR_NOT_AVAILABLE);
+          op.copyDestinationBindings.AppendElement(Some(dest));
+        }
+        uint64_t id, revision;
+        MOZ_TRY(messages->ImportOfflineOperationInTransaction(
+            member.snapshot.identity.folderId, key, op, source, id, revision));
+        NS_ENSURE_TRUE(
+            id <= 9007199254740991ULL && revision <= 9007199254740991ULL,
+            NS_ERROR_ILLEGAL_VALUE);
+        result.folders[i].operations.AppendElement(
+            ImapImportOperationReceipt{original.sourceKey, key, id, revision});
+      }
+    }
+    // Reuse the unchanged platform member receipt representation. The new unit
+    // proof and operation map are separate, so old v1/v2 receipt bytes survive.
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      const auto& snapshot = input.folders[i].snapshot;
+      const auto& id = snapshot.identity;
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(GetStatement(
+          "WriteImapMemberReceipt"_ns,
+          "INSERT INTO folder_import_receipts(token,sourceId,databaseSourceId,"
+          "sourceSha256,folderId,folderPath,sourcePath,messageCount) VALUES("
+          ":token,:source,:database,:hash,:folder,:path,:sourcePath,:count)"_ns,
+          getter_AddRefs(stmt)));
+      {
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, id.token));
+        MOZ_TRY(stmt->BindUTF8StringByName("source"_ns, id.sourceId));
+        MOZ_TRY(stmt->BindUTF8StringByName("database"_ns, id.databaseSourceId));
+        MOZ_TRY(stmt->BindUTF8StringByName("hash"_ns, id.sourceSha256));
+        MOZ_TRY(stmt->BindInt64ByName("folder"_ns, id.folderId));
+        MOZ_TRY(stmt->BindUTF8StringByName("path"_ns, id.folderPath));
+        MOZ_TRY(stmt->BindStringByName("sourcePath"_ns, id.sourcePath));
+        MOZ_TRY(stmt->BindInt64ByName("count"_ns, snapshot.messages.Length()));
+        MOZ_TRY(stmt->Execute());
+      }
+      MOZ_TRY(GetStatement(
+          "WriteImapMemberKey"_ns,
+          "INSERT INTO folder_import_keys(token,sourceKey,destinationKey) "
+          "VALUES(:token,:source,:destination)"_ns,
+          getter_AddRefs(stmt)));
+      for (const auto& pair : result.folders[i].folder.keys) {
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, id.token));
+        MOZ_TRY(stmt->BindInt64ByName("source"_ns, pair.source));
+        MOZ_TRY(stmt->BindInt64ByName("destination"_ns, pair.destination));
+        MOZ_TRY(stmt->Execute());
+      }
+      MOZ_TRY(WriteWindowsImportReceipt(sConnection, id));
+      MOZ_TRY(GetStatement(
+          "WriteImapOperationReceipt"_ns,
+          "INSERT INTO imap_import_operations(unitToken,member,sourceKey,"
+          "messageKey,operationId,revision) VALUES(:token,:member,:source,:key,:id,:revision)"_ns,
+          getter_AddRefs(stmt)));
+      for (const auto& op : result.folders[i].operations) {
+        mozStorageStatementScoper scope(stmt);
+        MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.token));
+        MOZ_TRY(stmt->BindInt64ByName("member"_ns, i));
+        MOZ_TRY(stmt->BindInt64ByName("source"_ns, op.sourceKey));
+        MOZ_TRY(stmt->BindInt64ByName("key"_ns, op.key));
+        MOZ_TRY(stmt->BindInt64ByName("id"_ns, op.id));
+        MOZ_TRY(stmt->BindInt64ByName("revision"_ns, op.revision));
+        MOZ_TRY(stmt->Execute());
+      }
+      std::sort(
+          result.folders[i].folder.keys.begin(),
+          result.folders[i].folder.keys.end(),
+          [](const auto& a, const auto& b) { return a.source < b.source; });
+      std::sort(result.folders[i].operations.begin(),
+                result.folders[i].operations.end(),
+                [](const auto& a, const auto& b) {
+                  return a.sourceKey < b.sourceKey;
+                });
+      MOZ_TRY(HashImportSource(members[i]->admission.Summary(), id,
+                               snapshot.sourceSize));
+      MOZ_TRY(members[i]->admission.Validate());
+      const auto& member = input.folders[i];
+      NS_ENSURE_TRUE(member.bodies.Length() == members[i]->bodies.Length(),
+                     NS_ERROR_NOT_AVAILABLE);
+      if (!member.bodies.IsEmpty()) {
+        // Only this owning native transaction uses the precommitted admission.
+        // Ordinary body access retains its committed-read requirement.
+        MOZ_TRY(messages->CheckPendingFolderRelocation(id.folderId));
+        for (uint32_t j = 0; j < member.bodies.Length(); ++j) {
+          MOZ_TRY(RecheckImapImportBody(member, member.bodies[j],
+                                        members[i]->bodies[j]));
+        }
+      }
+    }
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(GetStatement(
+          "WriteImapImportUnit"_ns,
+          "INSERT INTO imap_import_units(token,databaseSourceId,provenance) "
+          "VALUES(:token,:database,:proof)"_ns,
+          getter_AddRefs(stmt)));
+      MOZ_TRY(stmt->BindUTF8StringByName("token"_ns, input.token));
+      MOZ_TRY(stmt->BindUTF8StringByName("database"_ns, current));
+      MOZ_TRY(stmt->BindUTF8StringByName("proof"_ns, proof));
+      MOZ_TRY(stmt->Execute());
+    }
+    for (const auto& message : live) {
+      auto value = MakeUnique<MessageDatabase::CachedMsg>();
+      MOZ_TRY(messages->FetchMsg(message->Key(), *value));
+      cached.AppendElement(std::move(value));
+    }
+    NS_ENSURE_TRUE(messages->mMsgCache.reserve(messages->mMsgCache.count() +
+                                               cached.Length()),
+                   NS_ERROR_OUT_OF_MEMORY);
+    if (prepare) MOZ_TRY(prepare(result));
+    return sConnection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    bool open;
+    nsresult cleanup = sConnection->GetTransactionInProgress(&open);
+    if (NS_SUCCEEDED(cleanup) && open)
+      cleanup = sConnection->RollbackTransaction();
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(cleanup),
+                         "Connected import rollback failed");
+    return rv;
+  }
+  for (auto& value : cached) {
+    nsMsgKey key = value->key;
+    auto entry = messages->mMsgCache.lookup(key);
+    if (entry)
+      entry->value() = std::move(*value);
+    else
+      messages->mMsgCache.putNewInfallible(key, std::move(*value));
+  }
+  output = std::move(result);
+  if (publish) publish();
+  for (const auto& message : live) messages->NotifyImportedMessage(message);
+  return NS_OK;
+}
+
 nsresult DatabaseCore::GetNextMessageKey(nsMsgKey& key) {
   nsCOMPtr<mozIStorageStatement> stmt;
   MOZ_TRY(GetStatement(
@@ -2152,7 +3004,8 @@ nsresult DatabaseCore::CreateNewDatabase() {
   return NS_OK;
 }
 
-NS_IMETHODIMP DatabaseCore::MigrateVirtualFolders() {
+NS_IMETHODIMP
+DatabaseCore::MigrateVirtualFolders() {
   if (!sDatabaseIsNew) {
     // Only do this if we created the database in this session.
     return NS_OK;
@@ -3426,7 +4279,8 @@ nsresult CheckImportHeader(const ImportSourceRecord& row, const RawHdr& header,
 nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
                                 const ImportSourceRecord& info, uint32_t flags,
                                 uint32_t total, uint32_t unread,
-                                nsTArray<FolderImportProperty>& output) {
+                                nsTArray<FolderImportProperty>& output,
+                                bool imap = false) {
   JS::Rooted<JS::Value> field(cx);
   JS::Rooted<JSObject*> array(cx);
   uint32_t count;
@@ -3501,7 +4355,11 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
       int64_t expected = negative ? -int64_t(magnitude) : int64_t(magnitude);
       NS_ENSURE_TRUE(*value.integer == expected, NS_ERROR_INVALID_ARG);
       if (value.name == "flags"_ns) {
-        NS_ENSURE_TRUE(expected == flags, NS_ERROR_NOT_IMPLEMENTED);
+        // IMAP may clear its pending-work marker without changing saved state.
+        // Preserve the raw property; every other flag must still match.
+        uint32_t allowed = imap ? nsMsgFolderFlags::OfflineEvents : 0;
+        NS_ENSURE_TRUE(((uint32_t(expected) ^ flags) & ~allowed) == 0,
+                       NS_ERROR_NOT_IMPLEMENTED);
       } else if (value.name == "numMsgs"_ns || value.name == "numNewMsgs"_ns) {
         NS_ENSURE_TRUE(
             expected == (value.name == "numMsgs"_ns ? total : unread),
@@ -3511,7 +4369,9 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
       } else if (value.name == "totPendingMsgs"_ns ||
                  value.name == "unreadPendingMsgs"_ns ||
                  value.name == "forceReparse"_ns) {
-        NS_ENSURE_TRUE(expected == 0, NS_ERROR_NOT_IMPLEMENTED);
+        NS_ENSURE_TRUE(
+            (imap && value.name != "forceReparse"_ns) || expected == 0,
+            NS_ERROR_NOT_IMPLEMENTED);
       }
     }
     output.AppendElement(std::move(value));
@@ -3519,14 +4379,269 @@ nsresult ImportFolderProperties(JSContext* cx, JS::Handle<JSObject*> request,
   return NS_OK;
 }
 
+// This checks the typed projection against the complete saved MDB rows. Neither
+// a caller's expected ledger nor URI/key equality confers server identity.
+nsresult CheckImapImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
+                                nsTArray<UniquePtr<ImportSourceRecord>>& rows,
+                                ImportSourceRecord* table,
+                                const ImportSourceRecord& info,
+                                ImapImportFolder& input) {
+  JS::Rooted<JS::Value> field(cx);
+  MOZ_TRY(ImportMember(cx, request, "imap", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::Rooted<JSObject*> object(cx, &field.toObject());
+  int64_t number;
+  MOZ_TRY(ImportMember(cx, object, "version", &field));
+  MOZ_TRY(ImportNumber(field, 1, 1, number));
+  MOZ_TRY(ImportMember(cx, object, "originalFolderURI", &field));
+  MOZ_TRY(ImportText(cx, field, input.uri));
+  NS_ENSURE_TRUE(!input.uri.IsEmpty() && input.uri.FindChar(0) < 0,
+                 NS_ERROR_INVALID_ARG);
+  nsCString originalURI;
+  if (!info.cells.Get("originalFolderURI"_ns, &originalURI)) {
+    MOZ_TRY(input.folder->GetURI(originalURI));
+  }
+  NS_ENSURE_TRUE(input.uri == originalURI, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ImportMember(cx, object, "uidValidity", &field));
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::Rooted<JSObject*> epoch(cx, &field.toObject());
+  MOZ_TRY(ImportMember(cx, epoch, "present", &field));
+  NS_ENSURE_TRUE(field.isBoolean() &&
+                     field.toBoolean() == info.cells.Contains("UIDValidity"_ns),
+                 NS_ERROR_INVALID_ARG);
+  bool present = field.toBoolean();
+  MOZ_TRY(ImportMember(cx, epoch, "value", &field, true));
+  NS_ENSURE_TRUE(present == !field.isUndefined(), NS_ERROR_INVALID_ARG);
+  if (present) {
+    MOZ_TRY(ImportNumber(field, 0, UINT32_MAX, number));
+    uint32_t expected;
+    MOZ_TRY(ImportCellNumber(info, "UIDValidity"_ns, expected));
+    NS_ENSURE_TRUE(number == expected, NS_ERROR_INVALID_ARG);
+    input.uidValidity = Some(expected);
+  }
+  MOZ_TRY(ImportMember(cx, object, "operations", &field));
+  JS::Rooted<JSObject*> array(cx);
+  uint32_t count;
+  MOZ_TRY(ImportArray(cx, field, &array, count));
+  NS_ENSURE_TRUE(count == (table ? table->members.Length() : 0),
+                 NS_ERROR_INVALID_ARG);
+  nsTHashMap<nsMsgKey, bool> seen;
+  for (uint32_t i = 0; i < count; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSObject*> entry(cx, &field.toObject());
+    ImapImportOperation operation;
+    MOZ_TRY(ImportMember(cx, entry, "sourceKey", &field));
+    MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+    operation.sourceKey = number;
+    MOZ_TRY(ImportMember(cx, entry, "rowId", &field));
+    MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+    NS_ENSURE_TRUE(
+        number == operation.sourceKey && !seen.Contains(operation.sourceKey),
+        NS_ERROR_INVALID_ARG);
+    seen.InsertOrUpdate(operation.sourceKey, true);
+    nsCString scope;
+    MOZ_TRY(ImportMember(cx, entry, "scope", &field));
+    MOZ_TRY(ImportText(cx, field, scope));
+    NS_ENSURE_TRUE(scope == "ns:msg:db:row:scope:ops:all"_ns,
+                   NS_ERROR_NOT_IMPLEMENTED);
+    ImportSourceRecord* row = nullptr;
+    for (auto& candidate : rows) {
+      if (candidate->id == operation.sourceKey && candidate->scope == scope) {
+        row = candidate.get();
+      }
+    }
+    NS_ENSURE_TRUE(
+        row && !row->accounted && table &&
+            table->memberSet.Contains(ImportSourceKey(row->id, scope)),
+        NS_ERROR_INVALID_ARG);
+    for (auto cell = row->cells.ConstIter(); !cell.Done(); cell.Next()) {
+      bool known = false;
+      for (const char* name :
+           {"op", "msgKey", "opFlags", "newFlags", "srcMsgKey", "srcUid",
+            "srcFolderURI", "moveDest", "msgSize", "inPlayback",
+            "addedKeywords", "removedKeywords", "numCopyDests", "copyDests"}) {
+        known |= cell.Key().Equals(name);
+      }
+      NS_ENSURE_TRUE(known, NS_ERROR_NOT_IMPLEMENTED);
+    }
+    uint32_t key;
+    NS_ENSURE_TRUE(
+        row->cells.Contains("msgKey"_ns) && row->cells.Contains("op"_ns),
+        NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportCellNumber(*row, "msgKey"_ns, key));
+    NS_ENSURE_TRUE(key == operation.sourceKey, NS_ERROR_INVALID_ARG);
+    MOZ_TRY(ImportMember(cx, entry, "payload", &field));
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSObject*> payload(cx, &field.toObject());
+    auto numeric = [&](const char* name, const char* column, uint32_t& output,
+                       uint32_t fallback = 0) -> nsresult {
+      MOZ_TRY(ImportMember(cx, payload, name, &field, true));
+      bool stored = row->cells.Contains(nsDependentCString(column));
+      NS_ENSURE_TRUE(stored == !field.isUndefined(), NS_ERROR_INVALID_ARG);
+      output = fallback;
+      if (stored) {
+        MOZ_TRY(ImportNumber(field, 0, UINT32_MAX, number));
+        MOZ_TRY(ImportCellNumber(*row, nsDependentCString(column), output));
+        NS_ENSURE_TRUE(number == output, NS_ERROR_INVALID_ARG);
+      }
+      return NS_OK;
+    };
+    auto text = [&](const char* name, const char* column,
+                    nsCString& output) -> nsresult {
+      MOZ_TRY(ImportMember(cx, payload, name, &field, true));
+      nsCString raw;
+      bool stored = row->cells.Get(nsDependentCString(column), &raw);
+      NS_ENSURE_TRUE(stored == !field.isUndefined(), NS_ERROR_INVALID_ARG);
+      if (stored) {
+        MOZ_TRY(ImportText(cx, field, output));
+        NS_ENSURE_TRUE(output == raw && output.FindChar(0) < 0,
+                       NS_ERROR_INVALID_ARG);
+      }
+      return NS_OK;
+    };
+    const char* optionalColumns[] = {
+        "opFlags",         "newFlags",     "srcMsgKey", "srcUid",
+        "msgSize",         "srcFolderURI", "moveDest",  "addedKeywords",
+        "removedKeywords", "inPlayback",   "copyDests", "numCopyDests"};
+    for (uint32_t bit = 0; bit < 12; ++bit) {
+      if (row->cells.Contains(nsDependentCString(optionalColumns[bit])))
+        operation.payloadPresence |= 1u << bit;
+    }
+    auto& op = operation.payload;
+    MOZ_TRY(numeric("operation", "op", op.operation));
+    NS_ENSURE_TRUE(op.operation && !(op.operation & ~0xfffu),
+                   NS_ERROR_NOT_IMPLEMENTED);
+    MOZ_TRY(numeric("flagOperation", "opFlags", op.flagOperation));
+    MOZ_TRY(numeric("newFlags", "newFlags", op.newFlags));
+    MOZ_TRY(
+        numeric("sourceMessageKey", "srcMsgKey", op.sourceKey, nsMsgKey_None));
+    MOZ_TRY(numeric("sourceUid", "srcUid", op.sourceUid));
+    MOZ_TRY(numeric("messageSize", "msgSize", op.messageSize));
+    MOZ_TRY(text("sourceFolderURI", "srcFolderURI", op.sourceFolderURI));
+    MOZ_TRY(text("destinationFolderURI", "moveDest", op.destinationFolderURI));
+    MOZ_TRY(text("keywordsToAdd", "addedKeywords", op.keywordsToAdd));
+    MOZ_TRY(text("keywordsToRemove", "removedKeywords", op.keywordsToRemove));
+    MOZ_TRY(ImportMember(cx, payload, "playingBack", &field, true));
+    NS_ENSURE_TRUE(row->cells.Contains("inPlayback"_ns) == !field.isUndefined(),
+                   NS_ERROR_INVALID_ARG);
+    if (!field.isUndefined()) {
+      uint32_t playing;
+      MOZ_TRY(ImportCellNumber(*row, "inPlayback"_ns, playing));
+      NS_ENSURE_TRUE(playing <= 1 && field.isBoolean() &&
+                         field.toBoolean() == bool(playing),
+                     NS_ERROR_INVALID_ARG);
+      NS_ENSURE_FALSE(playing, NS_ERROR_NOT_AVAILABLE);
+    }
+    MOZ_TRY(ImportMember(cx, payload, "copyDestinations", &field, true));
+    nsCString rawCopies;
+    bool copiesPresent = row->cells.Get("copyDests"_ns, &rawCopies);
+    NS_ENSURE_TRUE(copiesPresent == !field.isUndefined(), NS_ERROR_INVALID_ARG);
+    if (copiesPresent) {
+      JS::Rooted<JSObject*> copies(cx);
+      uint32_t length;
+      MOZ_TRY(ImportArray(cx, field, &copies, length));
+      uint32_t offset = 0;
+      for (uint32_t n = 0; n < length; ++n) {
+        NS_ENSURE_TRUE(JS_GetElement(cx, copies, n, &field), NS_ERROR_FAILURE);
+        nsCString uri;
+        MOZ_TRY(ImportText(cx, field, uri));
+        int32_t end = rawCopies.FindChar('\1', offset);
+        uint32_t stop = end < 0 ? rawCopies.Length() : uint32_t(end);
+        NS_ENSURE_TRUE(!uri.IsEmpty() && uri.FindChar(0) < 0 &&
+                           uri == Substring(rawCopies, offset, stop - offset),
+                       NS_ERROR_INVALID_ARG);
+        NS_ENSURE_TRUE((n + 1 == length) == (end < 0), NS_ERROR_INVALID_ARG);
+        offset = stop + (end >= 0);
+        op.copyDestinations.AppendElement(std::move(uri));
+      }
+      NS_ENSURE_TRUE(length || rawCopies.IsEmpty(), NS_ERROR_INVALID_ARG);
+    }
+    uint32_t copyCount;
+    MOZ_TRY(numeric("copyDestinationCount", "numCopyDests", copyCount,
+                    op.copyDestinations.Length()));
+    NS_ENSURE_TRUE(copyCount == op.copyDestinations.Length(),
+                   NS_ERROR_INVALID_ARG);
+    NS_ENSURE_TRUE(bool(op.operation & nsIMsgOfflineImapOperation::kMsgCopy) ==
+                       !op.copyDestinations.IsEmpty(),
+                   NS_ERROR_NOT_AVAILABLE);
+    row->accounted = true;
+    input.operations.AppendElement(std::move(operation));
+  }
+  MOZ_TRY(ImportMember(cx, object, "serverUids", &field));
+  MOZ_TRY(ImportArray(cx, field, &array, count));
+  seen.Clear();
+  nsTHashMap<uint32_t, bool> uids;
+  for (uint32_t i = 0; i < count; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, array, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSObject*> binding(cx, &field.toObject());
+    ImapImportUid uid;
+    MOZ_TRY(ImportMember(cx, binding, "sourceKey", &field));
+    MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, number));
+    uid.sourceKey = number;
+    MOZ_TRY(ImportMember(cx, binding, "uid", &field));
+    MOZ_TRY(ImportNumber(field, 1, UINT32_MAX, number));
+    uid.uid = number;
+    NS_ENSURE_TRUE(input.uidValidity && *input.uidValidity &&
+                       !seen.Contains(uid.sourceKey) && !uids.Contains(uid.uid),
+                   NS_ERROR_NOT_AVAILABLE);
+    seen.InsertOrUpdate(uid.sourceKey, true);
+    uids.InsertOrUpdate(uid.uid, true);
+    input.serverUids.AppendElement(uid);
+  }
+  for (const auto& message : input.snapshot.messages) {
+    ImportSourceRecord* row = nullptr;
+    for (auto& candidate : rows) {
+      if (candidate->id == message.sourceKey &&
+          candidate->scope == "ns:msg:db:row:scope:msgs:all"_ns)
+        row = candidate.get();
+    }
+    NS_ENSURE_TRUE(row, NS_ERROR_INVALID_ARG);
+    uint32_t pseudo;
+    MOZ_TRY(ImportCellNumber(*row, "pseudoHdr"_ns, pseudo));
+    uint32_t word = 0;
+    for (const auto& op : input.operations) {
+      if (op.sourceKey == message.sourceKey) word = op.payload.operation;
+    }
+    bool pending = word & (nsIMsgOfflineImapOperation::kMoveResult |
+                           nsIMsgOfflineImapOperation::kAppendDraft |
+                           nsIMsgOfflineImapOperation::kAppendTemplate |
+                           nsIMsgOfflineImapOperation::kAddedHeader);
+    Maybe<uint32_t> expected;
+    if (row->cells.Contains("uidOnServer"_ns)) {
+      uint32_t uid;
+      MOZ_TRY(ImportCellNumber(*row, "uidOnServer"_ns, uid));
+      NS_ENSURE_TRUE(uid && !pseudo && !pending, NS_ERROR_NOT_AVAILABLE);
+      expected = Some(uid);
+    } else if (!pseudo && !pending) {
+      NS_ENSURE_TRUE(message.sourceKey, NS_ERROR_NOT_AVAILABLE);
+      expected = Some(uint32_t(message.sourceKey));
+    } else {
+      NS_ENSURE_TRUE(word && message.header.storeToken &&
+                         !message.header.storeToken->IsEmpty() &&
+                         (message.header.flags & nsMsgMessageFlags::Offline),
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+    Maybe<uint32_t> projected;
+    for (const auto& uid : input.serverUids) {
+      if (uid.sourceKey == message.sourceKey) projected = Some(uid.uid);
+    }
+    NS_ENSURE_TRUE(expected == projected, NS_ERROR_NOT_AVAILABLE);
+  }
+  return NS_OK;
+}
+
 nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                                 nsIMsgFolder* folder,
-                                FolderImportSnapshot& input) {
+                                FolderImportSnapshot& input,
+                                ImapImportFolder* imap = nullptr) {
   nsCString protocol;
   uint32_t folderFlags;
   MOZ_TRY(folder->GetIncomingServerType(protocol));
   MOZ_TRY(folder->GetFlags(&folderFlags));
-  NS_ENSURE_TRUE(protocol == "none"_ns, NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE(protocol == (imap ? "imap"_ns : "none"_ns),
+                 NS_ERROR_NOT_IMPLEMENTED);
   JS::Rooted<JS::Value> field(cx);
   JS::Rooted<JSObject*> records(cx);
   MOZ_TRY(ImportMember(cx, request, "unhandledRecords", &field));
@@ -3551,7 +4666,8 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
   constexpr auto threadScope = "ns:msg:db:row:scope:threads:all"_ns;
   constexpr auto infoScope = "ns:msg:db:row:scope:dbfolderinfo:all"_ns;
   ImportSourceRecord *messageTable = nullptr, *infoTable = nullptr,
-                     *allThreads = nullptr;
+                     *allThreads = nullptr, *offlineTable = nullptr,
+                     *pendingTable = nullptr;
   nsTHashMap<uint32_t, uint32_t> threadTables;
   for (uint32_t i = 0; i < tables.Length(); ++i) {
     auto& table = *tables[i];
@@ -3575,16 +4691,24 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                kind == "ns:msg:db:table:kind:allthreads"_ns && !allThreads &&
                table.meta.IsEmpty()) {
       allThreads = &table;
+    } else if (imap && table.scope == "ns:msg:db:row:scope:ops:all"_ns &&
+               kind == "ns:msg:db:table:kind:ops"_ns && !offlineTable &&
+               table.meta.IsEmpty()) {
+      offlineTable = &table;
+    } else if (imap && table.scope == "ns:msg:db:row:scope:pending:all"_ns &&
+               table.id == 1 && kind == "ns:msg:db:table:kind:pending"_ns &&
+               !pendingTable && table.meta.IsEmpty() &&
+               table.members.IsEmpty()) {
+      pendingTable = &table;
     } else {
       return NS_ERROR_NOT_IMPLEMENTED;
     }
   }
-  NS_ENSURE_TRUE(
-      messageTable && infoTable && allThreads && !threadTables.IsEmpty(),
-      NS_ERROR_NOT_IMPLEMENTED);
+  NS_ENSURE_TRUE(messageTable && infoTable && allThreads &&
+                     (imap || !threadTables.IsEmpty()),
+                 NS_ERROR_NOT_IMPLEMENTED);
   NS_ENSURE_TRUE(messageTable->members.Length() == input.messages.Length() &&
-                     infoTable->members.Length() == 1 &&
-                     allThreads->members.Length() == threadTables.Count(),
+                     infoTable->members.Length() == 1,
                  NS_ERROR_INVALID_ARG);
   nsTHashMap<nsMsgKey, uint32_t> messages;
   nsCOMPtr<nsIMimeConverter> converter =
@@ -3606,15 +4730,20 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
   auto checkMeta = [&](ImportSourceRecord* meta, uint32_t id, uint32_t children,
                        uint32_t unreadChildren, uint32_t newest,
                        uint32_t& root) -> nsresult {
-    NS_ENSURE_TRUE(meta && !meta->accounted && meta->scope == "m"_ns &&
-                       meta->cells.Count() == 6,
+    NS_ENSURE_TRUE(meta && !meta->accounted && meta->scope == "m"_ns,
                    NS_ERROR_NOT_IMPLEMENTED);
-    uint32_t values[6];
+    // The legacy unread cache defaults to zero when absent. Only IMAP admits
+    // that exact representation, and the computed live unread count must agree.
+    bool absentUnread = imap && !meta->cells.Contains("unreadChildren"_ns);
+    NS_ENSURE_TRUE(meta->cells.Count() == (absentUnread ? 5u : 6u),
+                   NS_ERROR_NOT_IMPLEMENTED);
+    uint32_t values[6] = {};
     const char* names[] = {"threadRoot",     "threadId",
                            "threadFlags",    "children",
                            "unreadChildren", "threadNewestMsgDate"};
     for (uint32_t i = 0; i < 6; ++i) {
       nsDependentCString name(names[i]);
+      if (i == 4 && absentUnread) continue;
       NS_ENSURE_TRUE(meta->cells.Contains(name), NS_ERROR_NOT_IMPLEMENTED);
       MOZ_TRY(ImportCellNumber(*meta, name, values[i]));
     }
@@ -3626,9 +4755,33 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
     meta->accounted = true;
     return NS_OK;
   };
+  nsTHashMap<uint32_t, bool> retiredThreads;
+  constexpr uint32_t retiring = nsIMsgOfflineImapOperation::kMsgMoved |
+                                nsIMsgOfflineImapOperation::kDeletedMsg |
+                                nsIMsgOfflineImapOperation::kMsgMarkedDeleted;
   for (auto entry = threadTables.ConstIter(); !entry.Done(); entry.Next()) {
     const auto& table = *tables[entry.Data()];
-    NS_ENSURE_TRUE(!table.members.IsEmpty(), NS_ERROR_NOT_IMPLEMENTED);
+    if (table.members.IsEmpty()) {
+      auto operationKey =
+          ImportSourceKey(table.id, "ns:msg:db:row:scope:ops:all"_ns);
+      auto* operation = find(operationKey);
+      NS_ENSURE_TRUE(imap && !messages.Contains(table.id) && offlineTable &&
+                         offlineTable->memberSet.Contains(operationKey) &&
+                         operation,
+                     NS_ERROR_NOT_IMPLEMENTED);
+      uint32_t word, key, root;
+      MOZ_TRY(ImportCellNumber(*operation, "op"_ns, word));
+      MOZ_TRY(ImportCellNumber(*operation, "msgKey"_ns, key));
+      NS_ENSURE_TRUE((word & retiring) && key == table.id,
+                     NS_ERROR_NOT_IMPLEMENTED);
+      MOZ_TRY(checkMeta(find(table.meta), table.id, 0, 0, 0, root));
+      NS_ENSURE_TRUE(
+          root == table.id && !allThreads->memberSet.Contains(
+                                  ImportSourceKey(table.id, threadScope)),
+          NS_ERROR_NOT_IMPLEMENTED);
+      retiredThreads.InsertOrUpdate(table.id, true);
+      continue;
+    }
     uint32_t childrenUnread = 0, newest = 0;
     for (const auto& key : table.members) {
       auto* row = find(key);
@@ -3681,16 +4834,34 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
                    NS_ERROR_NOT_IMPLEMENTED);
     subject->accounted = true;
   }
-  NS_ENSURE_TRUE(assigned.Count() == input.messages.Length(),
+  NS_ENSURE_TRUE(assigned.Count() == input.messages.Length() &&
+                     allThreads->members.Length() ==
+                         threadTables.Count() - retiredThreads.Count(),
                  NS_ERROR_INVALID_ARG);
   auto* info = find(infoTable->members[0]);
   NS_ENSURE_TRUE(info && info->id == 1 && info->scope == infoScope,
                  NS_ERROR_NOT_IMPLEMENTED);
   MOZ_TRY(ImportFolderProperties(cx, request, *info, folderFlags,
                                  input.messages.Length(), unread,
-                                 input.folderProperties));
+                                 input.folderProperties, bool(imap)));
   info->accounted = true;
+  if (imap) {
+    MOZ_TRY(
+        CheckImapImportRecords(cx, request, rows, offlineTable, *info, *imap));
+  }
+  // CheckImapImportRecords above independently validates the entire raw op
+  // payload and exact typed projection before inactive remnants are accounted.
   for (const auto& row : rows) {
+    if (imap && !row->accounted && retiredThreads.Contains(row->id)) {
+      if (row->scope == threadScope && row->cells.Count() == 1 &&
+          row->cells.Contains("threadSubject"_ns)) {
+        row->accounted = true;
+      } else if (row->scope == messageScope && row->cells.IsEmpty() &&
+                 !messageTable->memberSet.Contains(
+                     ImportSourceKey(row->id, messageScope))) {
+        row->accounted = true;
+      }
+    }
     if (!row->accounted) {
       uint32_t root;
       MOZ_TRY(checkMeta(row.get(), row->id, 0, 0, 0, root));
@@ -3701,6 +4872,12 @@ nsresult CheckFullImportRecords(JSContext* cx, JS::Handle<JSObject*> request,
 }
 
 }  // namespace
+
+nsresult DatabaseCore::CheckImportRecordsForTesting(
+    JSContext* cx, JS::Handle<JSObject*> request, nsIMsgFolder* folder,
+    FolderImportSnapshot& input, ImapImportFolder* imap) {
+  return CheckFullImportRecords(cx, request, folder, input, imap);
+}
 
 namespace {
 
@@ -3842,7 +5019,8 @@ nsresult ImportIdentity(DatabaseCore* core, nsIMsgFolder* source, JSContext* cx,
 }
 
 nsresult ImportMessages(JSContext* cx, JS::Handle<JSObject*> request,
-                        nsIMsgFolder* folder, FolderImportSnapshot& input) {
+                        nsIMsgFolder* folder, FolderImportSnapshot& input,
+                        ImapImportFolder* imap = nullptr) {
   NS_ENSURE_ARG_POINTER(folder);
   bool full;
   NS_ENSURE_TRUE(JS_HasOwnProperty(cx, request, "folderProperties", &full),
@@ -3856,7 +5034,7 @@ nsresult ImportMessages(JSContext* cx, JS::Handle<JSObject*> request,
   MOZ_TRY(ImportNumber(field, 0, UINT32_MAX - 1, number));
   input.sourceSize = number;
   // Nonempty summaries cannot opt out of full raw-record accounting.
-  full = full || input.sourceSize != 0;
+  full = full || input.sourceSize != 0 || imap;
   MOZ_TRY(ImportMember(cx, source, "messageKeys", &field));
   JS::Rooted<JSObject*> keys(cx), messages(cx);
   uint32_t keyCount, count;
@@ -3940,11 +5118,274 @@ nsresult ImportMessages(JSContext* cx, JS::Handle<JSObject*> request,
     }
   }
   if (full) {
-    MOZ_TRY(CheckFullImportRecords(cx, request, folder, input));
+    MOZ_TRY(CheckFullImportRecords(cx, request, folder, input, imap));
   } else {
     MOZ_TRY(CheckProjectedImportRecords(cx, request, input));
   }
   input.recordsComplete = true;
+  return NS_OK;
+}
+
+nsresult ImportImapReference(JSContext* cx, JS::Handle<JSObject*> object,
+                             const char* name, const ImapImportUnit& unit,
+                             Maybe<ImapImportReference>& output,
+                             Maybe<uint32_t> ordinal = Nothing()) {
+  JS::Rooted<JS::Value> field(cx);
+  MOZ_TRY(ImportMember(cx, object, name, &field, true));
+  if (field.isUndefined()) return NS_OK;
+  NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+  JS::Rooted<JSObject*> reference(cx, &field.toObject());
+  nsCString source;
+  MOZ_TRY(ImportMember(cx, reference, "sourceId", &field));
+  MOZ_TRY(ImportText(cx, field, source));
+  int64_t key;
+  MOZ_TRY(ImportMember(cx, reference, "key", &field));
+  MOZ_TRY(ImportNumber(field, 0, nsMsgKey_None - 1, key));
+  if (ordinal) {
+    int64_t number;
+    MOZ_TRY(ImportMember(cx, reference, "ordinal", &field));
+    MOZ_TRY(ImportNumber(field, *ordinal, *ordinal, number));
+  }
+  for (const auto& member : unit.folders) {
+    if (member.snapshot.identity.sourceId == source) {
+      bool exists = false;
+      for (const auto& row : member.snapshot.messages)
+        exists |= row.sourceKey == key;
+      for (const auto& op : member.operations) exists |= op.sourceKey == key;
+      NS_ENSURE_TRUE(exists, NS_ERROR_NOT_AVAILABLE);
+      output = Some(
+          ImapImportReference{member.snapshot.identity.token, nsMsgKey(key)});
+      return NS_OK;
+    }
+  }
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+bool SameImapReference(const Maybe<ImapImportReference>& left,
+                       const Maybe<ImapImportReference>& right) {
+  return bool(left) == bool(right) &&
+         (!left ||
+          (left->token == right->token && left->sourceKey == right->sourceKey));
+}
+
+nsresult ImportImapUnitRequest(
+    DatabaseCore* core, nsIMsgFolder* anchor, JSContext* cx,
+    JS::Handle<JSObject*> request, ImapImportUnit& unit,
+    nsTArray<UniquePtr<FolderImportAdmission>>& admissions) {
+  NS_ENSURE_ARG_POINTER(anchor);
+  JS::Rooted<JS::Value> field(cx);
+  nsCString protocol;
+  MOZ_TRY(ImportMember(cx, request, "protocol", &field));
+  MOZ_TRY(ImportText(cx, field, protocol));
+  NS_ENSURE_TRUE(protocol == "imap"_ns, NS_ERROR_NOT_IMPLEMENTED);
+  for (auto pair : {std::pair{"token", &unit.token},
+                    {"databaseSourceId", &unit.databaseSourceId}}) {
+    MOZ_TRY(ImportMember(cx, request, pair.first, &field));
+    MOZ_TRY(ImportText(cx, field, *pair.second));
+    NS_ENSURE_TRUE(!pair.second->IsEmpty() && pair.second->FindChar(0) < 0,
+                   NS_ERROR_INVALID_ARG);
+  }
+  nsCString current;
+  MOZ_TRY(core->GetSourceId(current));
+  NS_ENSURE_TRUE(current == unit.databaseSourceId, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(ImportMember(cx, request, "folders", &field));
+  JS::Rooted<JSObject*> folders(cx);
+  uint32_t count;
+  MOZ_TRY(ImportArray(cx, field, &folders, count));
+  NS_ENSURE_TRUE(count, NS_ERROR_INVALID_ARG);
+  nsTHashMap<nsCString, bool> sourceIds, uris;
+  uint64_t anchorId;
+  MOZ_TRY(anchor->GetId(&anchorId));
+  for (uint32_t i = 0; i < count; ++i) {
+    NS_ENSURE_TRUE(JS_GetElement(cx, folders, i, &field), NS_ERROR_FAILURE);
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSObject*> requestMember(cx, &field.toObject());
+    MOZ_TRY(ImportMember(cx, requestMember, "folder", &field));
+    NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+    JS::Rooted<JSObject*> binding(cx, &field.toObject());
+    int64_t id;
+    MOZ_TRY(ImportMember(cx, binding, "id", &field));
+    MOZ_TRY(ImportNumber(field, 1, 9007199254740991., id));
+    NS_ENSURE_TRUE(i || uint64_t(id) == anchorId, NS_ERROR_NOT_AVAILABLE);
+    auto& member = *unit.folders.AppendElement();
+    MOZ_TRY(core->FolderDB().GetMsgFolderForFolder(
+        id, getter_AddRefs(member.folder)));
+    NS_ENSURE_TRUE(member.folder, NS_ERROR_NOT_AVAILABLE);
+    auto admission = MakeUnique<FolderImportAdmission>();
+    MOZ_TRY(ImportIdentity(core, member.folder, cx, requestMember,
+                           member.snapshot.identity, *admission));
+#ifndef XP_WIN
+    nsCOMPtr<nsIFile> summary;
+    MOZ_TRY(NS_NewLocalFile(member.snapshot.identity.sourcePath,
+                            getter_AddRefs(summary)));
+    MOZ_TRY(admission->Acquire(member.snapshot.identity, summary));
+#endif
+    NS_ENSURE_TRUE(
+        member.snapshot.identity.databaseSourceId == unit.databaseSourceId,
+        NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(ImportMessages(cx, requestMember, member.folder, member.snapshot,
+                           &member));
+    NS_ENSURE_FALSE(sourceIds.Contains(member.snapshot.identity.sourceId) ||
+                        uris.Contains(member.uri),
+                    NS_ERROR_INVALID_ARG);
+    sourceIds.InsertOrUpdate(member.snapshot.identity.sourceId, true);
+    uris.InsertOrUpdate(member.uri, true);
+    // The digest is measured from the real provider stream, never supplied by
+    // the semantic test ledger or inferred from the header's message size.
+    for (const auto& row : member.snapshot.messages) {
+      bool token = row.header.storeToken && !row.header.storeToken->IsEmpty();
+      NS_ENSURE_TRUE(!(row.header.flags & nsMsgMessageFlags::Offline) || token,
+                     NS_ERROR_NOT_AVAILABLE);
+      if (token) {
+        ImapImportBody body;
+        body.sourceKey = row.sourceKey;
+        MOZ_TRY(MeasureImapImportBody(member, row.header, body));
+        member.bodies.AppendElement(std::move(body));
+      }
+    }
+    admissions.AppendElement(std::move(admission));
+  }
+  auto memberFor = [&](const nsACString& uri) -> ImapImportFolder* {
+    for (auto& member : unit.folders)
+      if (member.uri == uri) return &member;
+    return nullptr;
+  };
+  auto ref = [](const ImapImportFolder& member, nsMsgKey key) {
+    return Some(ImapImportReference{member.snapshot.identity.token, key});
+  };
+  auto counterpart = [&](const ImapImportFolder& origin, nsMsgKey key,
+                         const nsACString& uri,
+                         Maybe<ImapImportReference>& output) -> nsresult {
+    auto* target = memberFor(uri);
+    NS_ENSURE_TRUE(target, NS_ERROR_NOT_AVAILABLE);
+    for (const auto& candidate : target->operations) {
+      if (candidate.payload.sourceFolderURI == origin.uri &&
+          candidate.payload.sourceKey == key) {
+        NS_ENSURE_FALSE(output, NS_ERROR_NOT_AVAILABLE);
+        NS_ENSURE_TRUE(candidate.payload.operation &
+                           nsIMsgOfflineImapOperation::kMoveResult,
+                       NS_ERROR_NOT_AVAILABLE);
+        output = ref(*target, candidate.sourceKey);
+      }
+    }
+    return output ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+  };
+  for (uint32_t i = 0; i < count; ++i) {
+    auto& member = unit.folders[i];
+    NS_ENSURE_TRUE(JS_GetElement(cx, folders, i, &field), NS_ERROR_FAILURE);
+    JS::Rooted<JSObject*> requestMember(cx, &field.toObject());
+    MOZ_TRY(ImportMember(cx, requestMember, "imap", &field));
+    JS::Rooted<JSObject*> imap(cx, &field.toObject());
+    MOZ_TRY(ImportMember(cx, imap, "operations", &field));
+    JS::Rooted<JSObject*> operations(cx, &field.toObject());
+    for (uint32_t n = 0; n < member.operations.Length(); ++n) {
+      auto& op = member.operations[n];
+      const auto& payload = op.payload;
+      NS_ENSURE_TRUE(JS_GetElement(cx, operations, n, &field),
+                     NS_ERROR_FAILURE);
+      JS::Rooted<JSObject*> entry(cx, &field.toObject());
+      MOZ_TRY(ImportImapReference(cx, entry, "source", unit, op.source));
+      MOZ_TRY(
+          ImportImapReference(cx, entry, "destination", unit, op.destination));
+      Maybe<ImapImportReference> expected;
+      if (!payload.sourceFolderURI.IsEmpty()) {
+        auto* origin = memberFor(payload.sourceFolderURI);
+        NS_ENSURE_TRUE(origin && payload.sourceKey != nsMsgKey_None,
+                       NS_ERROR_NOT_AVAILABLE);
+        expected = ref(*origin, payload.sourceKey);
+      }
+      NS_ENSURE_TRUE(SameImapReference(expected, op.source),
+                     NS_ERROR_NOT_AVAILABLE);
+      expected.reset();
+      if (!payload.destinationFolderURI.IsEmpty()) {
+        if (payload.operation & (nsIMsgOfflineImapOperation::kAppendDraft |
+                                 nsIMsgOfflineImapOperation::kAppendTemplate |
+                                 nsIMsgOfflineImapOperation::kMoveResult)) {
+          NS_ENSURE_TRUE(payload.destinationFolderURI == member.uri,
+                         NS_ERROR_NOT_AVAILABLE);
+          expected = ref(member, op.sourceKey);
+        } else if (payload.operation & nsIMsgOfflineImapOperation::kMsgMoved) {
+          MOZ_TRY(counterpart(member, op.sourceKey,
+                              payload.destinationFolderURI, expected));
+        } else {
+          return NS_ERROR_NOT_AVAILABLE;
+        }
+      }
+      NS_ENSURE_TRUE(SameImapReference(expected, op.destination),
+                     NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(ImportMember(cx, entry, "copies", &field, true));
+      JS::Rooted<JSObject*> copies(cx);
+      uint32_t length = 0;
+      if (!field.isUndefined())
+        MOZ_TRY(ImportArray(cx, field, &copies, length));
+      NS_ENSURE_TRUE(length == payload.copyDestinations.Length(),
+                     NS_ERROR_INVALID_ARG);
+      nsTHashMap<nsCString, bool> distinct;
+      for (uint32_t c = 0; c < length; ++c) {
+        NS_ENSURE_FALSE(distinct.Contains(payload.copyDestinations[c]),
+                        NS_ERROR_NOT_AVAILABLE);
+        distinct.InsertOrUpdate(payload.copyDestinations[c], true);
+        NS_ENSURE_TRUE(JS_GetElement(cx, copies, c, &field), NS_ERROR_FAILURE);
+        NS_ENSURE_TRUE(field.isObject(), NS_ERROR_INVALID_ARG);
+        JS::Rooted<JSObject*> copy(cx, JS_NewPlainObject(cx));
+        NS_ENSURE_TRUE(
+            copy && JS_DefineProperty(cx, copy, "ref", field, JSPROP_ENUMERATE),
+            NS_ERROR_OUT_OF_MEMORY);
+        Maybe<ImapImportReference> actual;
+        MOZ_TRY(ImportImapReference(cx, copy, "ref", unit, actual, Some(c)));
+        expected.reset();
+        MOZ_TRY(counterpart(member, op.sourceKey, payload.copyDestinations[c],
+                            expected));
+        NS_ENSURE_TRUE(SameImapReference(expected, actual),
+                       NS_ERROR_NOT_AVAILABLE);
+        op.copies.AppendElement(std::move(actual));
+      }
+    }
+  }
+  constexpr uint32_t serverActions =
+      nsIMsgOfflineImapOperation::kFlagsChanged |
+      nsIMsgOfflineImapOperation::kMsgMoved |
+      nsIMsgOfflineImapOperation::kMsgCopy |
+      nsIMsgOfflineImapOperation::kDeletedMsg |
+      nsIMsgOfflineImapOperation::kMsgMarkedDeleted |
+      nsIMsgOfflineImapOperation::kAddKeywords |
+      nsIMsgOfflineImapOperation::kRemoveKeywords;
+  for (const auto& member : unit.folders) {
+    for (const auto& uid : member.serverUids) {
+      bool live = false, evidence = false;
+      for (const auto& row : member.snapshot.messages)
+        live |= row.sourceKey == uid.sourceKey;
+      if (live)
+        continue;  // Independently checked against the saved header above.
+      bool operationKey = false;
+      for (const auto& op : member.operations) {
+        operationKey |= op.sourceKey == uid.sourceKey;
+        if (op.sourceKey == uid.sourceKey &&
+            op.payload.sourceFolderURI.IsEmpty()) {
+          evidence |= op.payload.sourceUid == uid.uid;
+        }
+      }
+      for (const auto& other : unit.folders) {
+        for (const auto& op : other.operations) {
+          if (op.payload.sourceFolderURI == member.uri &&
+              op.payload.sourceKey == uid.sourceKey) {
+            NS_ENSURE_TRUE(
+                !op.payload.sourceUid || op.payload.sourceUid == uid.uid,
+                NS_ERROR_NOT_AVAILABLE);
+            evidence |= op.payload.sourceUid == uid.uid;
+          }
+        }
+      }
+      NS_ENSURE_TRUE(operationKey && evidence, NS_ERROR_NOT_AVAILABLE);
+    }
+    for (const auto& op : member.operations) {
+      if (!(op.payload.operation & serverActions)) continue;
+      bool bound = false;
+      for (const auto& uid : member.serverUids)
+        bound |= uid.sourceKey == op.sourceKey;
+      NS_ENSURE_TRUE(bound, NS_ERROR_NOT_AVAILABLE);
+    }
+  }
   return NS_OK;
 }
 
@@ -4067,14 +5508,265 @@ bool ImportReceiptValue(JSContext* cx, const FolderImportReceipt& receipt,
   return true;
 }
 
+bool ImapImportText(JSContext* cx, JS::Handle<JSObject*> object,
+                    const char* name, const nsACString& text) {
+  JS::Rooted<JSString*> string(
+      cx, JS_NewStringCopyUTF8N(
+              cx, JS::UTF8Chars(text.BeginReading(), text.Length())));
+  return string &&
+         JS_DefineProperty(cx, object, name, string, JSPROP_ENUMERATE);
+}
+
+bool ImapPayloadValue(JSContext* cx, const ImapImportOperation& input,
+                      JS::MutableHandle<JSObject*> output) {
+  JS::Rooted<JSObject*> object(cx, JS_NewPlainObject(cx));
+  if (!object ||
+      !JS_DefineProperty(cx, object, "operation",
+                         double(input.payload.operation), JSPROP_ENUMERATE))
+    return false;
+  const auto& op = input.payload;
+  const char* numbers[] = {"flagOperation", "newFlags", "sourceMessageKey",
+                           "sourceUid", "messageSize"};
+  uint32_t values[] = {op.flagOperation, op.newFlags, op.sourceKey,
+                       op.sourceUid, op.messageSize};
+  for (uint32_t i = 0; i < 5; ++i) {
+    if ((input.payloadPresence & (1u << i)) &&
+        !JS_DefineProperty(cx, object, numbers[i], double(values[i]),
+                           JSPROP_ENUMERATE))
+      return false;
+  }
+  const char* names[] = {"sourceFolderURI", "destinationFolderURI",
+                         "keywordsToAdd", "keywordsToRemove"};
+  const nsCString* texts[] = {&op.sourceFolderURI, &op.destinationFolderURI,
+                              &op.keywordsToAdd, &op.keywordsToRemove};
+  for (uint32_t i = 0; i < 4; ++i) {
+    if ((input.payloadPresence & (1u << (i + 5))) &&
+        !ImapImportText(cx, object, names[i], *texts[i]))
+      return false;
+  }
+  JS::Rooted<JS::Value> playing(cx, JS::BooleanValue(op.playingBack));
+  if ((input.payloadPresence & (1u << 9)) &&
+      !JS_DefineProperty(cx, object, "playingBack", playing, JSPROP_ENUMERATE))
+    return false;
+  if (input.payloadPresence & (1u << 10)) {
+    JS::Rooted<JSObject*> copies(
+        cx, JS::NewArrayObject(cx, op.copyDestinations.Length()));
+    if (!copies) return false;
+    for (uint32_t i = 0; i < op.copyDestinations.Length(); ++i) {
+      JS::Rooted<JSString*> text(
+          cx, JS_NewStringCopyUTF8N(
+                  cx, JS::UTF8Chars(op.copyDestinations[i].get(),
+                                    op.copyDestinations[i].Length())));
+      if (!text || !JS_DefineElement(cx, copies, i, text, JSPROP_ENUMERATE))
+        return false;
+    }
+    if (!JS_DefineProperty(cx, object, "copyDestinations", copies,
+                           JSPROP_ENUMERATE))
+      return false;
+  }
+  if ((input.payloadPresence & (1u << 11)) &&
+      !JS_DefineProperty(cx, object, "copyDestinationCount",
+                         double(op.copyDestinations.Length()),
+                         JSPROP_ENUMERATE))
+    return false;
+  output.set(object);
+  return true;
+}
+
+bool ImapImportReceiptValue(JSContext* cx, const ImapImportUnit& input,
+                            const ImapImportReceipt& receipt,
+                            JS::MutableHandle<JS::Value> output) {
+  JS::Rooted<JSObject*> object(cx, JS_NewPlainObject(cx));
+  JS::Rooted<JSObject*> folders(
+      cx, JS::NewArrayObject(cx, receipt.folders.Length()));
+  if (!object || !folders ||
+      receipt.folders.Length() != input.folders.Length() ||
+      !JS_DefineProperty(cx, object, "version", double(3), JSPROP_ENUMERATE) ||
+      !ImapImportText(cx, object, "token", receipt.token) ||
+      !ImapImportText(cx, object, "databaseSourceId",
+                      receipt.databaseSourceId) ||
+      !ImapImportText(cx, object, "protocol", "imap"_ns))
+    return false;
+  auto mappedKey = [&](uint32_t member, nsMsgKey original) -> nsMsgKey {
+    for (const auto& pair : receipt.folders[member].folder.keys) {
+      if (pair.source == original) return pair.destination;
+    }
+    for (const auto& op : receipt.folders[member].operations) {
+      if (op.sourceKey == original) return op.key;
+    }
+    return nsMsgKey_None;
+  };
+  auto reference = [&](const ImapImportReference& ref, Maybe<uint32_t> ordinal,
+                       JS::MutableHandle<JSObject*> target) -> bool {
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      const auto& id = input.folders[i].snapshot.identity;
+      if (id.token != ref.token) continue;
+      nsMsgKey key = mappedKey(i, ref.sourceKey);
+      if (key == nsMsgKey_None) return false;
+      JS::Rooted<JSObject*> result(cx, JS_NewPlainObject(cx));
+      if (!result || !ImapImportText(cx, result, "sourceId", id.sourceId) ||
+          !JS_DefineProperty(cx, result, "key", double(key),
+                             JSPROP_ENUMERATE) ||
+          (ordinal && !JS_DefineProperty(cx, result, "ordinal",
+                                         double(*ordinal), JSPROP_ENUMERATE)))
+        return false;
+      target.set(result);
+      return true;
+    }
+    return false;
+  };
+  for (uint32_t i = 0; i < receipt.folders.Length(); ++i) {
+    const auto& member = receipt.folders[i];
+    const auto& original = input.folders[i];
+    JS::Rooted<JS::Value> value(cx);
+    if (!ImportReceiptValue(cx, member.folder, &value)) return false;
+    JS::Rooted<JSObject*> folder(cx, &value.toObject());
+    JS::Rooted<JSObject*> imap(cx, JS_NewPlainObject(cx)),
+        epoch(cx, JS_NewPlainObject(cx));
+    JS::Rooted<JSObject*> uids(
+        cx, JS::NewArrayObject(cx, member.serverUids.Length()));
+    JS::Rooted<JSObject*> operations(
+        cx, JS::NewArrayObject(cx, original.operations.Length()));
+    JS::Rooted<JSObject*> keys(cx, JS::NewArrayObject(cx, 0));
+    JS::Rooted<JS::Value> epochPresent(
+        cx, JS::BooleanValue(member.uidValidity.isSome()));
+    if (!imap || !epoch || !uids || !operations || !keys ||
+        !JS_DefineProperty(cx, imap, "version", double(1), JSPROP_ENUMERATE) ||
+        !ImapImportText(cx, imap, "originalFolderURI", original.uri) ||
+        !JS_DefineProperty(cx, epoch, "present", epochPresent,
+                           JSPROP_ENUMERATE) ||
+        (member.uidValidity &&
+         !JS_DefineProperty(cx, epoch, "value", double(*member.uidValidity),
+                            JSPROP_ENUMERATE)) ||
+        !JS_DefineProperty(cx, imap, "uidValidity", epoch, JSPROP_ENUMERATE))
+      return false;
+    for (uint32_t n = 0; n < member.serverUids.Length(); ++n) {
+      const auto& uid = member.serverUids[n];
+      nsMsgKey key = mappedKey(i, uid.sourceKey);
+      JS::Rooted<JSObject*> binding(cx, JS_NewPlainObject(cx));
+      if (key == nsMsgKey_None || !binding ||
+          !JS_DefineProperty(cx, binding, "sourceKey", double(uid.sourceKey),
+                             JSPROP_ENUMERATE) ||
+          !JS_DefineProperty(cx, binding, "key", double(key),
+                             JSPROP_ENUMERATE) ||
+          !JS_DefineProperty(cx, binding, "uid", double(uid.uid),
+                             JSPROP_ENUMERATE) ||
+          !JS_DefineElement(cx, uids, n, binding, JSPROP_ENUMERATE))
+        return false;
+    }
+    uint32_t missing = 0;
+    for (const auto& op : member.operations) {
+      bool live = false;
+      for (const auto& pair : member.folder.keys)
+        live |= pair.source == op.sourceKey;
+      if (live) continue;
+      JS::Rooted<JSObject*> pair(cx, JS::NewArrayObject(cx, 2));
+      if (!pair ||
+          !JS_DefineElement(cx, pair, 0, double(op.sourceKey),
+                            JSPROP_ENUMERATE) ||
+          !JS_DefineElement(cx, pair, 1, double(op.key), JSPROP_ENUMERATE) ||
+          !JS_DefineElement(cx, keys, missing++, pair, JSPROP_ENUMERATE))
+        return false;
+    }
+    for (uint32_t n = 0; n < original.operations.Length(); ++n) {
+      const auto& operation = original.operations[n];
+      const ImapImportOperationReceipt* saved = nullptr;
+      for (const auto& candidate : member.operations) {
+        if (candidate.sourceKey == operation.sourceKey) saved = &candidate;
+      }
+      JS::Rooted<JSObject*> result(cx, JS_NewPlainObject(cx)), payload(cx);
+      if (!saved || !result || !ImapPayloadValue(cx, operation, &payload) ||
+          !JS_DefineProperty(cx, result, "sourceKey", double(saved->sourceKey),
+                             JSPROP_ENUMERATE) ||
+          !JS_DefineProperty(cx, result, "key", double(saved->key),
+                             JSPROP_ENUMERATE) ||
+          !JS_DefineProperty(cx, result, "id", double(saved->id),
+                             JSPROP_ENUMERATE) ||
+          !JS_DefineProperty(cx, result, "revision", double(saved->revision),
+                             JSPROP_ENUMERATE) ||
+          !JS_DefineProperty(cx, result, "payload", payload, JSPROP_ENUMERATE))
+        return false;
+      for (const auto& pair : {std::pair{"source", &operation.source},
+                               {"destination", &operation.destination}}) {
+        if (!*pair.second) continue;
+        JS::Rooted<JSObject*> ref(cx);
+        if (!reference(**pair.second, Nothing(), &ref) ||
+            !JS_DefineProperty(cx, result, pair.first, ref, JSPROP_ENUMERATE))
+          return false;
+      }
+      if (!operation.copies.IsEmpty()) {
+        JS::Rooted<JSObject*> copies(
+            cx, JS::NewArrayObject(cx, operation.copies.Length()));
+        if (!copies) return false;
+        for (uint32_t c = 0; c < operation.copies.Length(); ++c) {
+          JS::Rooted<JSObject*> ref(cx);
+          if (!operation.copies[c] ||
+              !reference(*operation.copies[c], Some(c), &ref) ||
+              !JS_DefineElement(cx, copies, c, ref, JSPROP_ENUMERATE))
+            return false;
+        }
+        if (!JS_DefineProperty(cx, result, "copies", copies, JSPROP_ENUMERATE))
+          return false;
+      }
+      if (!JS_DefineElement(cx, operations, n, result, JSPROP_ENUMERATE))
+        return false;
+    }
+    if (!JS_DefineProperty(cx, imap, "serverUids", uids, JSPROP_ENUMERATE) ||
+        !JS_DefineProperty(cx, imap, "operationKeys", keys, JSPROP_ENUMERATE) ||
+        !JS_DefineProperty(cx, imap, "operations", operations,
+                           JSPROP_ENUMERATE) ||
+        !JS_DefineProperty(cx, folder, "imap", imap, JSPROP_ENUMERATE) ||
+        !JS_DefineElement(cx, folders, i, folder, JSPROP_ENUMERATE))
+      return false;
+  }
+  if (!JS_DefineProperty(cx, object, "folders", folders, JSPROP_ENUMERATE))
+    return false;
+  output.setObject(*object);
+  return true;
+}
+
 }  // namespace
 
-NS_IMETHODIMP DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
-                                                 JS::Handle<JS::Value> request,
-                                                 JSContext* cx,
-                                                 Promise** output) {
+NS_IMETHODIMP
+DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
+                                   JS::Handle<JS::Value> request, JSContext* cx,
+                                   Promise** output) {
   NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
   JS::Rooted<JSObject*> object(cx, &request.toObject());
+  JS::Rooted<JS::Value> version(cx);
+  MOZ_TRY(ImportMember(cx, object, "version", &version));
+  if (version.isNumber() && version.toNumber() == 3) {
+    ImapImportUnit input;
+    nsTArray<UniquePtr<FolderImportAdmission>> admissions;
+    MOZ_TRY(ImportImapUnitRequest(this, source, cx, object, input, admissions));
+    ErrorResult error;
+    RefPtr<Promise> promise =
+        Promise::Create(xpc::CurrentNativeGlobal(cx), error);
+    if (error.Failed()) return error.StealNSResult();
+    JS::Rooted<JS::Value> result(cx);
+    ImapImportReceipt receipt;
+    bool published = false;
+    nsresult rv = ImportImapUnit(
+        input, receipt,
+        [&](const ImapImportReceipt& prepared) -> nsresult {
+          return ImapImportReceiptValue(cx, input, prepared, &result)
+                     ? NS_OK
+                     : NS_ERROR_OUT_OF_MEMORY;
+        },
+        [&] {
+          promise->MaybeResolve(result);
+          RefPtr<Promise> returned = promise;
+          returned.forget(output);
+          published = true;
+        });
+    if (NS_FAILED(rv)) {
+      promise->MaybeReject(rv);
+      promise.forget(output);
+    } else {
+      MOZ_ASSERT(published);
+    }
+    return NS_OK;
+  }
   FolderImportSnapshot input;
   // Finish admission and JS conversion before the owned SQL transaction.
   FolderImportAdmission admission;
@@ -4132,11 +5824,38 @@ NS_IMETHODIMP DatabaseCore::ImportFolderSnapshot(nsIMsgFolder* source,
   return NS_OK;
 }
 
-NS_IMETHODIMP DatabaseCore::GetFolderImportReceipt(
-    nsIMsgFolder* source, JS::Handle<JS::Value> request, JSContext* cx,
-    JS::MutableHandle<JS::Value> output) {
+NS_IMETHODIMP
+DatabaseCore::GetFolderImportReceipt(nsIMsgFolder* source,
+                                     JS::Handle<JS::Value> request,
+                                     JSContext* cx,
+                                     JS::MutableHandle<JS::Value> output) {
   NS_ENSURE_TRUE(request.isObject(), NS_ERROR_INVALID_ARG);
   JS::Rooted<JSObject*> object(cx, &request.toObject());
+  JS::Rooted<JS::Value> version(cx);
+  MOZ_TRY(ImportMember(cx, object, "version", &version));
+  if (version.isNumber() && version.toNumber() == 3) {
+    ImapImportUnit input;
+    nsTArray<UniquePtr<FolderImportAdmission>> admissions;
+    MOZ_TRY(ImportImapUnitRequest(this, source, cx, object, input, admissions));
+    for (uint32_t i = 0; i < input.folders.Length(); ++i) {
+      const auto& member = input.folders[i];
+      MOZ_TRY(HashImportSource(admissions[i]->Summary(),
+                               member.snapshot.identity,
+                               member.snapshot.sourceSize));
+      MOZ_TRY(admissions[i]->Validate());
+    }
+    Maybe<ImapImportReceipt> receipt;
+    MOZ_TRY(ReadImapImportReceipt(input, ImapImportProvenance(input), receipt));
+    if (!receipt) {
+      output.setNull();
+      return NS_OK;
+    }
+    JS::Rooted<JS::Value> result(cx);
+    NS_ENSURE_TRUE(ImapImportReceiptValue(cx, input, *receipt, &result),
+                   NS_ERROR_OUT_OF_MEMORY);
+    output.set(result);
+    return NS_OK;
+  }
   FolderImportIdentity identity;
   FolderImportAdmission admission;
   MOZ_TRY(ImportIdentity(this, source, cx, object, identity, admission));
@@ -4641,9 +6360,10 @@ nsresult ReadCacheReceipt(mozIStorageConnection* connection,
 }  // namespace
 #endif
 
-NS_IMETHODIMP DatabaseCore::GetFolderCacheImportReceipt(
-    JS::Handle<JS::Value> request, JSContext* cx,
-    JS::MutableHandle<JS::Value> output) {
+NS_IMETHODIMP
+DatabaseCore::GetFolderCacheImportReceipt(JS::Handle<JS::Value> request,
+                                          JSContext* cx,
+                                          JS::MutableHandle<JS::Value> output) {
 #ifdef XP_WIN
   return NS_ERROR_NOT_AVAILABLE;
 #else
@@ -4673,9 +6393,10 @@ NS_IMETHODIMP DatabaseCore::GetFolderCacheImportReceipt(
 #endif
 }
 
-NS_IMETHODIMP DatabaseCore::ImportFolderCacheMetadata(
-    JS::Handle<JS::Value> request, JSContext* cx,
-    JS::MutableHandle<JS::Value> output) {
+NS_IMETHODIMP
+DatabaseCore::ImportFolderCacheMetadata(JS::Handle<JS::Value> request,
+                                        JSContext* cx,
+                                        JS::MutableHandle<JS::Value> output) {
 #ifdef XP_WIN
   return NS_ERROR_NOT_AVAILABLE;
 #else
@@ -4998,7 +6719,8 @@ nsresult DatabaseCore::ReadSourceIdForFolderAdmission(nsACString& output) {
   return ReadDatabaseSourceId(sConnection, output);
 }
 
-NS_IMETHODIMP DatabaseCore::GetSourceId(nsACString& sourceId) {
+NS_IMETHODIMP
+DatabaseCore::GetSourceId(nsACString& sourceId) {
   if (sInstance.get() != this || !sConnection) {
     return NS_ERROR_NOT_AVAILABLE;
   }
@@ -5025,9 +6747,9 @@ DatabaseCore::GetConnectionForTests(mozIStorageConnection** aConnection) {
   return NS_OK;
 }
 
-NS_IMETHODIMP DatabaseCore::OpenFolderDB(nsIMsgFolder* aFolder,
-                                         bool aLeaveInvalidDB,
-                                         nsIMsgDatabase** _retval) {
+NS_IMETHODIMP
+DatabaseCore::OpenFolderDB(nsIMsgFolder* aFolder, bool aLeaveInvalidDB,
+                           nsIMsgDatabase** _retval) {
   NS_ENSURE_ARG_POINTER(_retval);
   *_retval = nullptr;
   NS_ENSURE_ARG_POINTER(aFolder);
@@ -5055,8 +6777,8 @@ NS_IMETHODIMP DatabaseCore::OpenFolderDB(nsIMsgFolder* aFolder,
   db.forget(_retval);
   return NS_OK;
 }
-NS_IMETHODIMP DatabaseCore::CreateNewDB(nsIMsgFolder* aFolder,
-                                        nsIMsgDatabase** _retval) {
+NS_IMETHODIMP
+DatabaseCore::CreateNewDB(nsIMsgFolder* aFolder, nsIMsgDatabase** _retval) {
   NS_ENSURE_ARG_POINTER(_retval);
   *_retval = nullptr;
   NS_ENSURE_ARG_POINTER(aFolder);
@@ -5079,14 +6801,15 @@ NS_IMETHODIMP DatabaseCore::CreateNewDB(nsIMsgFolder* aFolder,
 
   return OpenFolderDB(aFolder, false, _retval);
 }
-NS_IMETHODIMP DatabaseCore::OpenDBFromFile(nsIFile* aFile,
-                                           nsIMsgFolder* aFolder, bool aCreate,
-                                           bool aLeaveInvalidDB,
-                                           nsIMsgDatabase** _retval) {
+NS_IMETHODIMP
+DatabaseCore::OpenDBFromFile(nsIFile* aFile, nsIMsgFolder* aFolder,
+                             bool aCreate, bool aLeaveInvalidDB,
+                             nsIMsgDatabase** _retval) {
   return NS_ERROR_NOT_IMPLEMENTED;
 }
-NS_IMETHODIMP DatabaseCore::RegisterPendingListener(
-    nsIMsgFolder* folder, nsIDBChangeListener* listener) {
+NS_IMETHODIMP
+DatabaseCore::RegisterPendingListener(nsIMsgFolder* folder,
+                                      nsIDBChangeListener* listener) {
   // This function was meant to wait for a database to open, but let's just
   // open it. They're not real anyway.
   nsCOMPtr<nsIMsgDatabase> database;
@@ -5095,12 +6818,13 @@ NS_IMETHODIMP DatabaseCore::RegisterPendingListener(
 
   return database->AddListener(listener);
 }
-NS_IMETHODIMP DatabaseCore::UnregisterPendingListener(
-    nsIDBChangeListener* listener) {
+NS_IMETHODIMP
+DatabaseCore::UnregisterPendingListener(nsIDBChangeListener* listener) {
   return NS_OK;
 }
-NS_IMETHODIMP DatabaseCore::CachedDBForFolder(nsIMsgFolder* aFolder,
-                                              nsIMsgDatabase** _retval) {
+NS_IMETHODIMP
+DatabaseCore::CachedDBForFolder(nsIMsgFolder* aFolder,
+                                nsIMsgDatabase** _retval) {
   NS_ENSURE_ARG_POINTER(_retval);
   *_retval = nullptr;
   NS_ENSURE_ARG_POINTER(aFolder);
@@ -5110,8 +6834,8 @@ NS_IMETHODIMP DatabaseCore::CachedDBForFolder(nsIMsgFolder* aFolder,
   db.forget(_retval);
   return NS_OK;
 }
-NS_IMETHODIMP DatabaseCore::CachedDBForFilePath(nsIFile* filePath,
-                                                nsIMsgDatabase** _retval) {
+NS_IMETHODIMP
+DatabaseCore::CachedDBForFilePath(nsIFile* filePath, nsIMsgDatabase** _retval) {
   NS_ENSURE_ARG_POINTER(_retval);
   *_retval = nullptr;
   NS_ENSURE_ARG_POINTER(filePath);
@@ -5121,13 +6845,14 @@ NS_IMETHODIMP DatabaseCore::CachedDBForFilePath(nsIFile* filePath,
   db.forget(_retval);
   return NS_OK;
 }
-NS_IMETHODIMP DatabaseCore::ForceFolderDBClosed(nsIMsgFolder* aFolder) {
+NS_IMETHODIMP
+DatabaseCore::ForceFolderDBClosed(nsIMsgFolder* aFolder) {
   nsCOMPtr<nsIMsgDatabase> db;
   MOZ_TRY(CachedDBForFolder(aFolder, getter_AddRefs(db)));
   return db ? db->ForceClosed() : NS_OK;
 }
-NS_IMETHODIMP DatabaseCore::GetOpenDBs(
-    nsTArray<RefPtr<nsIMsgDatabase>>& aOpenDBs) {
+NS_IMETHODIMP
+DatabaseCore::GetOpenDBs(nsTArray<RefPtr<nsIMsgDatabase>>& aOpenDBs) {
   aOpenDBs.Clear();
   for (auto iter = mOpenDatabases.Iter(); !iter.Done(); iter.Next()) {
     RefPtr<PerFolderDatabase> db = iter.UserData().get();
@@ -5142,8 +6867,8 @@ NS_IMETHODIMP DatabaseCore::GetOpenDBs(
 
 NS_IMPL_ISUPPORTS(DatabaseCoreFactory, nsIFactory)
 
-NS_IMETHODIMP DatabaseCoreFactory::CreateInstance(const nsIID& aIID,
-                                                  void** aResult) {
+NS_IMETHODIMP
+DatabaseCoreFactory::CreateInstance(const nsIID& aIID, void** aResult) {
   *aResult = nullptr;
   nsresult rv;
   nsCOMPtr<nsIDatabaseCore> core =

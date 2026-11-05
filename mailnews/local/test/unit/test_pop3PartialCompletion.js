@@ -2095,13 +2095,12 @@ async function checkFreshFilterTransfer(store, mode) {
       const deferred = folder.server.getFilterList(null);
       const rule = addCompletedPartialFilter(list, [
         { type: Ci.nsMsgFilterAction.MarkFlagged },
-        {
-          type:
-            mode == "delete"
-              ? Ci.nsMsgFilterAction.Delete
-              : Ci.nsMsgFilterAction.MoveToFolder,
-          targetFolderUri: destination.URI,
-        },
+        mode == "delete"
+          ? { type: Ci.nsMsgFilterAction.Delete }
+          : {
+              type: Ci.nsMsgFilterAction.MoveToFolder,
+              targetFolderUri: destination.URI,
+            },
       ]);
       const after = addCompletedPartialFilter(list, [
         { type: Ci.nsMsgFilterAction.AddTag, strValue: "must-not-run" },

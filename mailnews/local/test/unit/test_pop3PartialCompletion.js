@@ -3298,7 +3298,8 @@ async function checkFreshForeignRoot(store, ignored) {
     incoming.headersOnly = false;
     const archive = folder.parent
       .QueryInterface(Ci.nsIMsgLocalMailFolder)
-      .createLocalSubfolder("foreign-thread-root");
+      .createLocalSubfolder("foreign-thread-root")
+      .QueryInterface(Ci.nsIMsgLocalMailFolder);
     const rootId = `foreign-root-${store}-${ignored}@example.invalid`;
     archive.addMessage(
       COMPLETE.replace("completed-partial@example.invalid", rootId).replace(

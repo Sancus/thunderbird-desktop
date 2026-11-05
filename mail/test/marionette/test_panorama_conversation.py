@@ -39,7 +39,7 @@ class TestPanoramaConversation(MarionetteTestCase):
                 self.marionette.set_pref(name, value)
             self.marionette.instance.prefs = {**(self.instance_prefs or {}), **prefs}
             # Restart the application with the SAME profile for startup selection.
-            self.marionette.restart(in_app=True, clean=False)
+            self.restart_same_profile()
             self.marionette.set_context(self.marionette.CONTEXT_CHROME)
             self.assertEqual(
                 profile_before,
@@ -183,6 +183,31 @@ class TestPanoramaConversation(MarionetteTestCase):
             self.restore()
         finally:
             super().tearDown()
+
+    def restart_same_profile(self):
+        """Gracefully stop and relaunch the managed application with its profile."""
+        old_pid = self.marionette.execute_script("return Services.appinfo.processID;")
+        profile = self.marionette.execute_script(
+            "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+        )
+        capabilities = self.marionette.requested_capabilities
+        details = self.marionette.quit(in_app=True, clean=False)
+        self.assertTrue(details["in_app"], "Expected in-app shutdown")
+        self.assertFalse(details["forced"], "Expected non-forced shutdown")
+        self.assertEqual(self.marionette.instance.runner.returncode, 0)
+        self.marionette.start_session(capabilities)
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
+        self.marionette.switch_to_window(self.marionette.chrome_window_handles[0])
+        self.assertNotEqual(
+            old_pid,
+            self.marionette.execute_script("return Services.appinfo.processID;"),
+        )
+        self.assertEqual(
+            profile,
+            self.marionette.execute_script(
+                "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
+            ),
+        )
 
     def open_window(self, script, window_type, args=()):
         """Observe a real chrome window before switching the existing driver."""
@@ -515,5 +540,5 @@ class TestPanoramaConversation(MarionetteTestCase):
                 self.marionette.clear_pref(name)
         if self.saved_prefs:
             # Keep the same profile; restore startup backend selection too.
-            self.marionette.restart(in_app=True, clean=False)
+            self.restart_same_profile()
             self.marionette.set_context(self.marionette.CONTEXT_CHROME)

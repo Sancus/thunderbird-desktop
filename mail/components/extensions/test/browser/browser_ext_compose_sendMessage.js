@@ -918,11 +918,32 @@ async function checkImapFcc(retry) {
   const originalPrompt = Services.prompt;
   let loaded = false;
   let cleaned = false;
+  const notifications = { added: [], classified: [] };
+  const physicalHeader = header => ({
+    folderURI: header.folder.URI,
+    key: header.messageKey,
+    messageId: header.messageId,
+  });
+  const folderListener = {
+    msgAdded(header) {
+      if (header.folder.URI == sent.URI) {
+        notifications.added.push(physicalHeader(header));
+      }
+    },
+    msgsClassified(headers) {
+      for (const header of headers) {
+        if (header.folder.URI == sent.URI) {
+          notifications.classified.push(physicalHeader(header));
+        }
+      }
+    },
+  };
   const cleanup = async () => {
     if (cleaned) {
       return;
     }
     cleaned = true;
+    MailServices.mfn.removeListener(folderListener);
     Services.prompt = originalPrompt;
     imap.daemon.commandToFail = "";
     for (const win of Services.wm.getEnumerator("msgcompose")) {
@@ -942,6 +963,10 @@ async function checkImapFcc(retry) {
     }
   };
   registerCleanupFunction(cleanup);
+  MailServices.mfn.addListener(
+    folderListener,
+    MailServices.mfn.msgAdded | MailServices.mfn.msgsClassified
+  );
   if (retry) {
     imap.daemon.commandToFail = "APPEND";
     Services.prompt = {
@@ -995,6 +1020,10 @@ async function checkImapFcc(retry) {
         browser.test.assertEq("sendNow", result.mode);
         browser.test.assertEq(undefined, info.error);
         browser.test.assertEq(result.headerMessageId, info.headerMessageId);
+        await window.sendMessage(
+          "recordImapFccDelivery",
+          result.headerMessageId
+        );
         browser.test.assertEq(1, result.messages.length);
         browser.test.assertDeepEq(result.messages, info.messages);
         const [message] = result.messages;
@@ -1027,6 +1056,21 @@ async function checkImapFcc(retry) {
       body,
     })
   );
+  extension.onMessage("recordImapFccDelivery", messageId => {
+    info(
+      "S375_FCC_DELIVERY=" +
+        JSON.stringify({
+          messageId,
+          retry,
+          notifications,
+          nativeHeaders: [...sent.messages].map(physicalHeader),
+          serverMessages:
+            imap.daemon.getMailbox("ConfiguredSent")._messages.length,
+          smtpMessages: gSentMessages.slice(sentCount),
+        })
+    );
+    extension.sendMessage();
+  });
   extension.onMessage("checkImapFccStored", async messageId => {
     const listener = new MailPromiseTestUtils.PromiseUrlListener();
     sent.updateFolderWithListener(null, listener);

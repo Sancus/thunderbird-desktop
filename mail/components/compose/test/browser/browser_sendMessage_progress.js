@@ -22,7 +22,10 @@ add_setup(async function () {
   await addLoginInfo("smtp://test.test", "user", "password");
 
   const [imapServer] = await ServerTestUtils.createServers([
-    ServerTestUtils.serverDefs.imap.plain,
+    {
+      ...ServerTestUtils.serverDefs.imap.plain,
+      baseOptions: { extensions: ["RFC2195", "RFC4315"] },
+    },
     ServerTestUtils.serverDefs.smtp.plain,
   ]);
   imapServer.daemon.createMailbox("Drafts", {

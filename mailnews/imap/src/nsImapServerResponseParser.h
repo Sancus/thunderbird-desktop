@@ -5,6 +5,7 @@
 #ifndef COMM_MAILNEWS_IMAP_SRC_NSIMAPSERVERRESPONSEPARSER_H_
 #define COMM_MAILNEWS_IMAP_SRC_NSIMAPSERVERRESPONSEPARSER_H_
 
+#include "mozilla/Atomics.h"
 #include "../public/nsIImapHostSessionList.h"
 #include "nsImapSearchResults.h"
 #include "MailNewsTypes2.h"
@@ -279,7 +280,7 @@ class nsImapServerResponseParser : public nsImapGenericParser {
   nsCOMPtr<nsIImapFlagAndUidState>
       fFlagState;  // NOT owned by us, it's a copy, do not destroy
 
-  eIMAPstate fIMAPstate;
+  mozilla::Atomic<eIMAPstate> fIMAPstate;
 
   eIMAPCapabilityFlags fCapabilityFlag;
   nsCString fMailAccountUrl;

@@ -464,6 +464,11 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       copies.headers[0].messageKey
     ).policyRevision;
 
+    const heldRoot = PathUtils.join(work, "held-original-streams");
+    Assert.ok(!(await IOUtils.exists(heldRoot)));
+    await IOUtils.makeDirectory(heldRoot);
+    const emptyBodySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
     const expected = [];
     for (const [name, folder] of folders) {
       for (const oldKey of [1, 3]) {
@@ -488,10 +493,19 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         });
       }
       const bodyPath = folder.filePath.path;
-      const heldPath = bodyPath + ".s716-held";
+      // A held file in the mail root is discovered as a different native folder.
+      // Keep the original empty mailbox path and retain its payload outside Mail.
+      const heldPath = PathUtils.join(heldRoot, `${folder.id}.mbox`);
+      const bodySHA256 = await IOUtils.computeHexDigest(bodyPath, "sha256");
       Assert.ok(!(await IOUtils.exists(heldPath)));
-      await IOUtils.move(bodyPath, heldPath);
-      held.push({ folder, bodyPath, heldPath });
+      await IOUtils.move(bodyPath, heldPath, { noOverwrite: true });
+      held.push({ folder, bodyPath, heldPath, bodySHA256 });
+      await IOUtils.write(bodyPath, new Uint8Array(), { mode: "create" });
+      const placeholder = await IOUtils.stat(bodyPath);
+      Assert.equal(placeholder.type, "regular");
+      Assert.equal(placeholder.size, 0);
+      Assert.equal(await IOUtils.computeHexDigest(bodyPath, "sha256"), emptyBodySHA256);
+      Assert.equal(await IOUtils.computeHexDigest(heldPath, "sha256"), bodySHA256);
     }
     for (const header of copies.headers) {
       expected.push({
@@ -537,6 +551,7 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       chat.path,
       chat.indexPath,
       ...held.map(row => row.heldPath),
+      ...held.map(row => row.bodyPath),
       ...copies.folders.map(folder => folder.filePath.path),
     ];
     const sourceHashes = [];
@@ -617,8 +632,18 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         // Keep the successful handoff's intentionally unavailable bodies until
         // the real application case tests recovery, then restores these names.
         if (!complete) {
-          for (const { bodyPath, heldPath } of held.reverse()) {
-            await IOUtils.move(heldPath, bodyPath);
+          for (const { bodyPath, heldPath, bodySHA256 } of held.reverse()) {
+            Assert.equal(await IOUtils.computeHexDigest(heldPath, "sha256"), bodySHA256);
+            if (await IOUtils.exists(bodyPath)) {
+              const placeholder = await IOUtils.stat(bodyPath);
+              Assert.equal(placeholder.type, "regular");
+              Assert.equal(placeholder.size, 0);
+              Assert.equal(await IOUtils.computeHexDigest(bodyPath, "sha256"),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+              await IOUtils.remove(bodyPath, { ignoreAbsent: false });
+            }
+            await IOUtils.move(heldPath, bodyPath, { noOverwrite: true });
+            Assert.equal(await IOUtils.computeHexDigest(bodyPath, "sha256"), bodySHA256);
           }
           for (const { name, hadValue, value } of savedPrefs) {
             if (hadValue) {

@@ -24,6 +24,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.initial_profile_restore = self.initial_profile.restore
         self.trial_profile = None
         self.held = []
+        self.placeholders = {}
         self.saved_prefs = []
         # --testvars names the original fixture, not a --profile clone.
         self.fixture = dict(self.testvars)
@@ -80,8 +81,8 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         ).resolve()
         self.assertEqual(Path(self.fixture["profile"]).resolve(), self.profile)
         self.work = self.profile / "panorama-trial-rebuild"
-        self.assert_identity()
         self.validate_fixture()
+        self.assert_identity()
         self.assert_source_hashes()
         self.journal_hash = self.digest(Path(self.fixture["journalPath"]))
         self.assert_receipt_keys()
@@ -115,10 +116,31 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             body = self.owned_path(folder["bodyPath"])
             if folder["heldPath"] is not None:
                 held = self.owned_path(folder["heldPath"])
-                self.assertEqual(held, Path(str(body) + ".s716-held"))
-                self.assertFalse(body.exists(), "Only the imported original stream is held")
+                self.assertIs(type(folder["id"]), int)
+                self.assertGreater(folder["id"], 0)
+                self.assertEqual(
+                    held, self.work / "held-original-streams" / f"{folder['id']}.mbox"
+                )
+                self.assertEqual(Path(folder["heldPath"]), held)
+                self.assertEqual(Path(folder["bodyPath"]), body)
+                self.assertFalse(held.is_symlink())
+                self.assertFalse(body.is_symlink())
                 self.assertTrue(held.is_file())
-                self.held.append((body, held, self.digest(held)))
+                self.assertTrue(body.is_file())
+                self.assertEqual(body.stat().st_size, 0)
+                self.assertEqual(
+                    self.digest(body),
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                )
+                expected = next(
+                    row["sha256"]
+                    for row in f["sourceHashes"]
+                    if Path(row["path"]).resolve() == held
+                )
+                self.assertEqual(self.digest(held), expected)
+                placeholder = body.stat()
+                self.placeholders[body] = (placeholder.st_dev, placeholder.st_ino)
+                self.held.append((body, held, expected))
         self.assertEqual(len(f["folders"]), 4)
         self.assertEqual(len(self.held), 2)
         self.assertEqual(len(f["mail"]), 7)
@@ -213,9 +235,17 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                     pid: Services.appinfo.processID, sourceId: core.sourceId,
                     native: Services.prefs.getBoolPref('mail.panorama.enabled'),
                     indexing: Services.prefs.getBoolPref('mailnews.database.global.indexer.enabled'),
-                    members: arguments[0].map(({id}) => {
+                    members: arguments[0].map(({id, folderId}) => {
                         const state = core.messageDB.getSearchState(Number(id));
-                        return {id, folderId: state.folderId, generation: state.generation,
+                        if (!state || state.folderId !== folderId ||
+                            !Number.isInteger(state.folderFlags) ||
+                            state.folderFlags < 0 || state.folderFlags > 0xffffffff ||
+                            !(state.folderFlags & Ci.nsMsgFolderFlags.Mail) ||
+                            (state.folderFlags & Ci.nsMsgFolderFlags.Virtual)) {
+                            throw new Error('Trial native folder membership changed: ' + id);
+                        }
+                        return {id, folderId: state.folderId, folderFlags: state.folderFlags,
+                            generation: state.generation,
                             contentRevision: state.contentRevision,
                             rawPolicyRevision: state.policyRevision,
                             policyRevision: mailPolicyRevision(state.policyRevision)};
@@ -230,6 +260,9 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.assertIs(actual["native"], True)
         self.assertIs(actual["indexing"], True)
         for member in actual["members"]:
+            expected = next(row for row in self.fixture["mail"] if row["id"] == member["id"])
+            self.assertEqual(member["folderId"], expected["folderId"])
+            self.assertIs(type(member["folderFlags"]), int)
             raw_policy = member["rawPolicyRevision"]
             policy = member["policyRevision"]
             self.assertIs(type(raw_policy), str)
@@ -672,13 +705,32 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                     "Owned streams may only be restored after normal writer exit",
                 )
                 for body, held, expected in self.held:
-                    if held.exists():
-                        self.assertFalse(
-                            body.exists(), "Cleanup must never overwrite an existing source"
-                        )
-                        self.assertEqual(self.digest(held), expected)
-                        held.rename(body)
-                        self.assertEqual(self.digest(body), expected)
+                    self.assertFalse(held.is_symlink())
+                    self.assertTrue(held.is_file())
+                    self.assertEqual(self.digest(held), expected)
+                    self.assertEqual(body.resolve(), body)
+                    self.assertEqual(held.resolve(), held)
+                    self.assertFalse(body.is_symlink())
+                    self.assertTrue(body.is_file())
+                    placeholder = body.stat()
+                    self.assertEqual(
+                        (placeholder.st_dev, placeholder.st_ino), self.placeholders[body]
+                    )
+                    self.assertEqual(placeholder.st_size, 0)
+                    self.assertEqual(
+                        self.digest(body),
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    )
+                    body.unlink()
+                    self.assertFalse(
+                        body.exists(), "Cleanup must never overwrite an existing source"
+                    )
+                    # Link creation refuses an unexpected destination atomically.
+                    # Keep the retained payload until the restored bytes are checked.
+                    body.hardlink_to(held)
+                    self.assertTrue(body.samefile(held))
+                    self.assertEqual(self.digest(body), expected)
+                    held.unlink()
                 if self.trial_profile is not None:
                     # Remove only this Profile object's required-pref markers.
                     # restore=False keeps the original native storage and receipts.

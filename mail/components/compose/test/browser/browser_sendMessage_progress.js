@@ -136,6 +136,64 @@ add_setup(async function () {
  * @returns {Promise}
  */
 function progressStopPromise(composeWindow) {
+  const doc = composeWindow.document;
+  const saveButton = doc.getElementById("button-save");
+  const bounds = saveButton.getBoundingClientRect();
+  const center = doc.elementFromPoint(
+    bounds.x + bounds.width / 2,
+    bounds.y + bounds.height / 2
+  );
+  info(
+    "S375_SAVE_PREPARE=" +
+      JSON.stringify({
+        defaultSaveOperation: composeWindow.defaultSaveOperation,
+        saveInProgress: composeWindow.gSaveOperationInProgress,
+        button: {
+          x: bounds.x,
+          y: bounds.y,
+          width: bounds.width,
+          height: bounds.height,
+        },
+        center: {
+          id: center?.id,
+          node: center?.localName,
+          classes: center?.getAttribute("class"),
+        },
+        main: saveButton
+          .querySelector(".toolbarbutton-menubutton-button")
+          ?.getBoundingClientRect(),
+      })
+  );
+  const recordEvent = event => {
+    info(
+      "S375_SAVE_EVENT=" +
+        JSON.stringify({
+          type: event.type,
+          target: event.target.id,
+          path: event
+            .composedPath()
+            .filter(node => node.localName)
+            .map(node => ({
+              id: node.id,
+              node: node.localName,
+              classes: node.getAttribute("class"),
+            })),
+          defaultSaveOperation: composeWindow.defaultSaveOperation,
+          saveInProgress: composeWindow.gSaveOperationInProgress,
+          popup: doc.getElementById("button-savePopup").state,
+          progressEvents: gProgressEvents.length,
+        })
+    );
+  };
+  const eventTypes = ["click", "command", "popupshown"];
+  registerCleanupFunction(() => {
+    for (const type of eventTypes) {
+      composeWindow.removeEventListener(type, recordEvent, true);
+    }
+  });
+  for (const type of eventTypes) {
+    composeWindow.addEventListener(type, recordEvent, true);
+  }
   return TestUtils.topicObserved(
     "mail:composeSendProgressStop",
     subject => subject.wrappedJSObject.composeWindow == composeWindow

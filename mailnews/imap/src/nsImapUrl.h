@@ -76,6 +76,25 @@ class nsImapUrl : public nsIImapUrl,
   nsresult RecordNativeCopyReceipts(
       const nsTArray<NativeQueuedCopyReceipt>& receipts);
   nsTArray<NativeQueuedCopyReceipt> CopyNativeCopyReceipts();
+  bool HasNativeOnlineCopyTargets();
+  void MarkNativeOnlineCopyTargets();
+  struct OnlineCopyInput {
+    ImapUid sourceUid;
+    nsCString messageId;
+    nsCOMPtr<nsIFile> snapshot;
+    bool snapshotReady;
+  };
+  struct OnlineCopyObservation {
+    ImapUid sourceUid;
+    uint32_t epoch;
+    ImapUid uid;
+  };
+  nsresult SetNativeOnlineCopyInputs(nsTArray<OnlineCopyInput>&& inputs);
+  nsTArray<OnlineCopyInput> CopyNativeOnlineCopyInputs();
+  nsresult RecordNativeCopyObservation(ImapUid sourceUid, uint32_t epoch,
+                                       ImapUid uid);
+  nsTArray<OnlineCopyObservation> CopyNativeCopyObservations();
+
   nsresult PrepareNativeReplayCommand(
       const mozilla::mailnews::OfflineReplayCommandToken& token);
   mozilla::Maybe<mozilla::mailnews::OfflineReplayCommandToken>
@@ -94,6 +113,14 @@ class nsImapUrl : public nsIImapUrl,
   bool NativeFolderDeleteAcknowledged();
   void RecordNativeSourceRetired();
   bool NativeSourceRetired();
+  struct OnlineAppendObservation {
+    uint32_t epoch;
+    ImapUid uid;
+  };
+  void MarkNativeOnlineAppend();
+  bool HasNativeOnlineAppend();
+  nsresult RecordNativeAppendObservation(uint32_t epoch, ImapUid uid);
+  mozilla::Maybe<OnlineAppendObservation> CopyNativeAppendObservation();
   nsresult PrepareNativeQueuedAppend(const NativeQueuedAppendTarget& target);
   mozilla::Maybe<NativeQueuedAppendTarget> CopyNativeQueuedAppendTarget();
   nsresult RecordNativeQueuedAppendReceipt(
@@ -263,6 +290,9 @@ class nsImapUrl : public nsIImapUrl,
       MOZ_GUARDED_BY(mLock);
   bool mNativeFolderDeleteAcknowledged MOZ_GUARDED_BY(mLock) = false;
   bool mNativeSourceRetired MOZ_GUARDED_BY(mLock) = false;
+  bool mNativeOnlineAppend MOZ_GUARDED_BY(mLock) = false;
+  mozilla::Maybe<OnlineAppendObservation> mNativeAppendObservation
+      MOZ_GUARDED_BY(mLock);
   mozilla::Maybe<NativeQueuedAppendTarget> mNativeQueuedAppend
       MOZ_GUARDED_BY(mLock);
   mozilla::Maybe<NativeQueuedAppendReceipt> mNativeAppendReceipt
@@ -283,6 +313,10 @@ class nsImapUrl : public nsIImapUrl,
   mozilla::Maybe<FlagTargets> mFlagTargets;
   nsTArray<KeywordResponse> mKeywordResponses MOZ_GUARDED_BY(mLock);
   mozilla::Maybe<CopyTargets> mCopyTargets;
+  bool mNativeOnlineCopyTargets MOZ_GUARDED_BY(mLock) = false;
+  nsTArray<OnlineCopyInput> mNativeOnlineCopyInputs MOZ_GUARDED_BY(mLock);
+  nsTArray<OnlineCopyObservation> mNativeCopyObservations MOZ_GUARDED_BY(mLock);
+
   bool mFlagCompletionStarted = false;
   bool mFlagDeleteIsMove = false;
   nsresult mFlagCompletionResult = NS_ERROR_IN_PROGRESS;

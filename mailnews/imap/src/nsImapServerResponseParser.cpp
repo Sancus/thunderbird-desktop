@@ -1775,10 +1775,12 @@ void nsImapServerResponseParser::resp_text_code() {
       AdvanceToNextToken();
       if (ContinueParse()) {
 #ifdef MOZ_PANORAMA
-        bool nativeReceipt = mTaggedCopyOk;
+        // Some servers emit COPYUID in an untagged OK before the matching
+        // tagged COPY completion. Retain only this command's candidate tuple;
+        // the public receipt getters remain gated by actual tagged acceptance.
+        bool nativeReceipt = mParsingCopy;
         uint64_t epoch = 0;
-        bool validEpoch =
-            nativeReceipt && fNextToken && *fNextToken && !mCopyEpoch;
+        bool validEpoch = nativeReceipt && fNextToken && *fNextToken;
         if (validEpoch) {
           for (const char* c = fNextToken; *c; ++c) {
             if (*c < '0' || *c > '9' ||
@@ -1804,9 +1806,15 @@ void nsImapServerResponseParser::resp_text_code() {
               if (validEpoch && !destinations.IsEmpty() &&
                   destinations.Last() == ']') {
                 destinations.Truncate(destinations.Length() - 1);
-                mCopyEpoch = mozilla::Some(static_cast<uint32_t>(epoch));
-                mCopySourceSet = sources;
-                mCopyDestinationSet = destinations;
+                if (mCopyEpoch &&
+                    (*mCopyEpoch != epoch || !mCopySourceSet.Equals(sources) ||
+                     !mCopyDestinationSet.Equals(destinations))) {
+                  SetSyntaxError(true);
+                } else {
+                  mCopyEpoch = mozilla::Some(static_cast<uint32_t>(epoch));
+                  mCopySourceSet = sources;
+                  mCopyDestinationSet = destinations;
+                }
               } else {
                 SetSyntaxError(true);
               }

@@ -373,6 +373,48 @@ static nsresult CheckNativeUndoMetadata(nsIMsgDBHdr* header,
   return NS_OK;
 }
 
+nsresult nsImapMoveCopyMsgTxn::AdoptNativeDestination(
+    uint32_t index, nsIMsgFolder* folder,
+    const mozilla::mailnews::ServerMessageLocation& mapping,
+    nsIMsgDBHdr* header) {
+  using namespace mozilla::mailnews;
+  NS_ENSURE_TRUE(header && mapping.epoch && mapping.uid && !mNativeChanging,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsMsgKey key;
+  MOZ_TRY(header->GetMessageKey(&key));
+  uint64_t folderId;
+  MOZ_TRY(folder->GetId(&folderId));
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core && mapping.key == key && mapping.folderId == folderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  nsMsgKey bound;
+  MOZ_TRY(core->MessageDB().GetMessageKeyForServerUid(folderId, mapping.epoch,
+                                                      mapping.uid, bound));
+  NS_ENSURE_TRUE(bound == key, NS_ERROR_NOT_AVAILABLE);
+  // Ordinary online non-local transactions already store destination UIDs in
+  // their existing command list. Native local-move snapshots also retain the
+  // physical owning header for restoration and repeated Undo/Redo.
+  if (mNativeEntries.IsEmpty()) return AddDstKey(mapping.uid);
+  NS_ENSURE_TRUE(index < mNativeEntries.Length(), NS_ERROR_NOT_AVAILABLE);
+  auto& entry = *mNativeEntries[index];
+  if (entry.destinationHeader) {
+    nsMsgKey prior;
+    MOZ_TRY(entry.destinationHeader->GetMessageKey(&prior));
+    NS_ENSURE_TRUE(prior == key && entry.destinationEpoch == mapping.epoch &&
+                       entry.destinationUid == mapping.uid,
+                   NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
+  MOZ_TRY(core->GetSourceId(entry.destinationSourceId));
+  entry.destinationFolderId = folderId;
+  entry.destinationEpoch = mapping.epoch;
+  entry.destinationUid = mapping.uid;
+  entry.destinationHeader = header;
+  if (!m_dstMsgIdString.IsEmpty()) m_dstMsgIdString.Append(',');
+  m_dstMsgIdString.AppendInt(mapping.uid);
+  return NS_OK;
+}
+
 nsresult nsImapMoveCopyMsgTxn::AppendNativeDestination(uint32_t index,
                                                        nsIMsgFolder* folder,
                                                        uint32_t epoch,

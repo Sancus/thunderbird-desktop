@@ -67,9 +67,15 @@ class nsImapServerResponseParser : public nsImapGenericParser {
 #ifdef MOZ_PANORAMA
   bool CopyAccepted() const { return mCopyAccepted; }
   bool CopyRejected() const { return mCopyRejected; }
-  mozilla::Maybe<uint32_t> CopyEpoch() const { return mCopyEpoch; }
-  nsCString CopySourceUidSet() const { return mCopySourceSet; }
-  nsCString CopyDestinationUidSet() const { return mCopyDestinationSet; }
+  mozilla::Maybe<uint32_t> CopyEpoch() const {
+    return mCopyAccepted ? mCopyEpoch : mozilla::Nothing();
+  }
+  nsCString CopySourceUidSet() const {
+    return mCopyAccepted ? mCopySourceSet : nsCString();
+  }
+  nsCString CopyDestinationUidSet() const {
+    return mCopyAccepted ? mCopyDestinationSet : nsCString();
+  }
   bool AppendAccepted() const { return mAppendAccepted; }
   mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> AppendReceipt()
       const {

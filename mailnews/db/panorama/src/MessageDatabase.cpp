@@ -3322,8 +3322,188 @@ nsresult MessageDatabase::ConsumeProtoThreadFlagsInTransaction(
   return NS_OK;
 }
 
+nsresult MessageDatabase::PublishOnlineTransferDestination(
+    const OnlineTransferDestination& expected, uint32_t observedEpoch,
+    uint32_t observedUid, bool notifyLegacy, ServerMessageLocation& mapping,
+    Message** liveHeader) {
+  NS_ENSURE_ARG_POINTER(liveHeader);
+  NS_ENSURE_FALSE(*liveHeader, NS_ERROR_INVALID_ARG);
+  const auto& target = expected.destination;
+  NS_ENSURE_TRUE(!expected.databaseSourceId.IsEmpty() && target.folderId &&
+                     target.folderId <= INT64_MAX && target.key &&
+                     target.key < nsMsgKey_None && target.epochKnown &&
+                     observedEpoch && observedUid &&
+                     target.epoch == observedEpoch,
+                 NS_ERROR_INVALID_ARG);
+  // Listener preparation can reenter. Never borrow a caller's mutable input
+  // through that preparation or the synchronous postcommit fanout.
+  OnlineTransferDestination selected(expected);
+  return PublishMessageInternal(target.key, notifyLegacy, liveHeader, &selected,
+                                observedEpoch, observedUid, &mapping);
+}
+
+nsresult MessageDatabase::ValidateOnlineTransferDestination(
+    const OnlineTransferDestination& expected, uint32_t epoch,
+    const Maybe<uint32_t>& uid, bool staged) {
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_TRUE(active, NS_ERROR_UNEXPECTED);
+  const auto& target = expected.destination;
+  MOZ_TRY(CheckFolderBodyAccess(target.folderId));
+  uint32_t currentEpoch;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      target.folderId, currentEpoch));
+  NS_ENSURE_TRUE(currentEpoch == epoch, NS_ERROR_NOT_AVAILABLE);
+  uint32_t flags;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        staged ? "OnlineStagedDestination"_ns : "OnlinePublishedDestination"_ns,
+        staged ? "SELECT m.folderId,m.flags,d.sourceId FROM staged_messages m "
+                 "JOIN database_identity d ON d.singleton=1 WHERE m.id=:key"_ns
+               : "SELECT m.folderId,m.flags,d.sourceId FROM messages m "
+                 "JOIN database_identity d ON d.singleton=1 WHERE m.id=:key"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, target.key));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int64_t folder, storedFlags;
+    nsCString source;
+    MOZ_TRY(stmt->GetInt64(0, &folder));
+    MOZ_TRY(stmt->GetInt64(1, &storedFlags));
+    MOZ_TRY(stmt->GetUTF8String(2, source));
+    NS_ENSURE_TRUE(folder > 0 && uint64_t(folder) == target.folderId &&
+                       source == expected.databaseSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(
+        storedFlags >= INT32_MIN && storedFlags <= int64_t(UINT32_MAX),
+        NS_ERROR_FILE_CORRUPTED);
+    flags = static_cast<uint32_t>(storedFlags);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  {
+    // Even Pending and held imports own their destination. No ordinary-online
+    // entry point may promote that custody, including orphaned old attempts.
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "OnlineDestinationQueuedCustody"_ns,
+        "SELECT 1 FROM offline_operations WHERE messageKey=:key "
+        "OR destinationKey=:key UNION ALL SELECT 1 FROM "
+        "offline_copy_destinations WHERE destinationKey=:key UNION ALL "
+        "SELECT 1 FROM offline_attempts WHERE destinationKey=:key OR "
+        "sourceKey=:key UNION ALL SELECT 1 FROM imap_import_operation_holds "
+        "WHERE messageKey=:key LIMIT 1"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, target.key));
+    bool claimed;
+    MOZ_TRY(stmt->ExecuteStep(&claimed));
+    NS_ENSURE_FALSE(claimed, NS_ERROR_NOT_AVAILABLE);
+  }
+  Maybe<nsCString> token;
+  Maybe<uint32_t> size, offlineSize, lines, actualUid;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        staged ? "OnlineStagedBody"_ns : "OnlinePublishedBody"_ns,
+        staged ? "SELECT name,value FROM staged_message_properties "
+                 "WHERE id=:key AND name IN('storeToken','messageSize',"
+                 "'offlineMessageSize','lineCount','uidOnServer')"_ns
+               : "SELECT name,value FROM message_properties WHERE id=:key "
+                 "AND name IN('storeToken','messageSize','offlineMessageSize',"
+                 "'lineCount','uidOnServer')"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, target.key));
+    while (true) {
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (!more) break;
+      nsCString name;
+      MOZ_TRY(stmt->GetUTF8String(0, name));
+      int32_t type;
+      MOZ_TRY(stmt->GetTypeOfIndex(1, &type));
+      if (name.EqualsLiteral("storeToken")) {
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        nsCString text;
+        MOZ_TRY(stmt->GetUTF8String(1, text));
+        token = Some(std::move(text));
+      } else {
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_INTEGER,
+                       NS_ERROR_FILE_CORRUPTED);
+        int64_t value;
+        MOZ_TRY(stmt->GetInt64(1, &value));
+        NS_ENSURE_TRUE(value >= 0 && value <= UINT32_MAX,
+                       NS_ERROR_FILE_CORRUPTED);
+        auto number = Some(static_cast<uint32_t>(value));
+        if (name.EqualsLiteral("messageSize")) size = number;
+        if (name.EqualsLiteral("offlineMessageSize")) offlineSize = number;
+        if (name.EqualsLiteral("lineCount")) lines = number;
+        if (name.EqualsLiteral("uidOnServer")) actualUid = number;
+      }
+    }
+  }
+  NS_ENSURE_TRUE(actualUid == uid, NS_ERROR_NOT_AVAILABLE);
+  if (expected.finished) {
+    const auto& finished = *expected.finished;
+    NS_ENSURE_TRUE(
+        !finished.storeToken.IsEmpty() && token == Some(finished.storeToken) &&
+            size == Some(finished.messageSize) &&
+            offlineSize == Some(finished.offlineMessageSize) &&
+            lines == Some(finished.lineCount) &&
+            bool(flags & nsMsgMessageFlags::Offline) == finished.offline,
+        NS_ERROR_NOT_AVAILABLE);
+  } else {
+    NS_ENSURE_TRUE(expected.sourceLocation && expected.sourceBody && !token &&
+                       !offlineSize && !lines &&
+                       !(flags & nsMsgMessageFlags::Offline),
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  NS_ENSURE_TRUE(!expected.sourceLocation || expected.sourceBody,
+                 NS_ERROR_INVALID_ARG);
+  if (expected.sourceBody) {
+    const auto& source = *expected.sourceBody;
+    NS_ENSURE_TRUE(source.key != target.key &&
+                       source.databaseSourceId == expected.databaseSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(CheckMessageBodyAccess(source.key));
+    MessageBodyState current;
+    MOZ_TRY(ReadMessageBodyState(source.key, current));
+    NS_ENSURE_TRUE(SameBodyGuard(current, source), NS_ERROR_NOT_AVAILABLE);
+    if (expected.sourceLocation) {
+      const auto& location = *expected.sourceLocation;
+      NS_ENSURE_TRUE(location.key == source.key &&
+                         location.folderId == source.folderId &&
+                         location.epoch && location.uid,
+                     NS_ERROR_INVALID_ARG);
+      nsMsgKey found;
+      MOZ_TRY(GetMessageKeyForServerUid(location.folderId, location.epoch,
+                                        location.uid, found));
+      NS_ENSURE_TRUE(found == source.key, NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  if (uid) {
+    // Also recheck all published/staged aliases after listener preparation.
+    // This is read-only for the exact UID property already installed above.
+    MOZ_TRY(BindMessageToServerUidInTransaction(target.key, target.folderId,
+                                                epoch, *uid, true));
+  }
+  return NS_OK;
+}
+
 nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
                                          Message** liveHeader) {
+  return PublishMessageInternal(key, notifyLegacy, liveHeader);
+}
+
+nsresult MessageDatabase::PublishMessageInternal(
+    nsMsgKey key, bool notifyLegacy, Message** liveHeader,
+    const OnlineTransferDestination* online, uint32_t epoch, uint32_t uid,
+    ServerMessageLocation* mapping) {
   MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
@@ -3340,6 +3520,14 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
     bool staged;
     MOZ_TRY(IsMessageStaged(key, staged));
     NS_ENSURE_TRUE(staged, NS_ERROR_NOT_AVAILABLE);
+    if (online) {
+      MOZ_TRY(
+          ValidateOnlineTransferDestination(*online, epoch, Nothing(), true));
+      MOZ_TRY(BindMessageToServerUidInTransaction(
+          key, online->destination.folderId, epoch, uid, true));
+      MOZ_TRY(
+          ValidateOnlineTransferDestination(*online, epoch, Some(uid), true));
+    }
     MOZ_TRY(FetchMsg(key, cached));
     if (mConversationGroupingEnabled) {
       MOZ_TRY(CaptureThreadViewsBeforeInsert(*notification));
@@ -3427,6 +3615,10 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
         delivery.prepared.publicationLive = message;
       }
     }
+    if (online) {
+      MOZ_TRY(
+          ValidateOnlineTransferDestination(*online, epoch, Some(uid), false));
+    }
     return connection->CommitTransaction();
   }();
   if (NS_FAILED(rv)) {
@@ -3449,6 +3641,9 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
     entry->value() = std::move(cached);
   } else {
     mMsgCache.putNewInfallible(key, std::move(cached));
+  }
+  if (online) {
+    *mapping = {online->destination.folderId, key, epoch, uid};
   }
   if (liveHeader) {
     RefPtr<Message> result = message;

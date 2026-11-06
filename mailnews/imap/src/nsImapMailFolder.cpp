@@ -88,6 +88,7 @@
 #ifdef MOZ_PANORAMA
 #  include "../../local/src/nsLocalUtils.h"
 #  include "DatabaseCore.h"
+#  include "nsDirectoryServiceDefs.h"
 #  include "Message.h"
 #  include "PerFolderDatabase.h"
 #  include "nsQueryObject.h"
@@ -117,6 +118,17 @@ struct NativeFilterHeader {
   mozilla::mailnews::ServerMessageLocation location;
   nsTArray<Action> actions;
   nsresult error = NS_OK;
+};
+
+struct NativeOnlineTransferEntry {
+  mozilla::mailnews::OnlineTransferDestination expected;
+  nsCOMPtr<nsIMsgDBHdr> draft;
+  // These persistent outputs are installed before publication callbacks.
+  mozilla::mailnews::ServerMessageLocation mapping;
+  RefPtr<mozilla::mailnews::Message> live;
+  nsCOMPtr<nsIFile> recovery;
+  bool publishing = false;
+  bool settled = false;
 };
 
 struct NativeOfflineCopyEntry {
@@ -7550,6 +7562,23 @@ nsresult nsImapMailFolder::ResetPendingCounts() {
 
 nsresult nsImapMailFolder::UpdatePendingCounts() {
   if (!m_copyState) return NS_OK;
+#ifdef MOZ_PANORAMA
+  if (m_copyState->m_nativeOnlineAppend ||
+      !m_copyState->m_nativeOnlineCopies.IsEmpty()) {
+    bool settled = !m_copyState->m_nativeOnlineAppend ||
+                   m_copyState->m_nativeOnlineAppend->settled;
+    for (const auto& entry : m_copyState->m_nativeOnlineCopies)
+      settled &= entry->settled;
+    NS_ENSURE_TRUE(settled, NS_ERROR_NOT_AVAILABLE);
+    // Native membership is already counted by the real publication. Pending
+    // placeholders would double the ordinary draft's total and unread counts.
+    auto unseen = mozilla::CheckedInt<int32_t>(m_numServerUnseenMessages) +
+                  m_copyState->m_unreadCount;
+    NS_ENSURE_TRUE(unseen.isValid(), NS_ERROR_LOSS_OF_SIGNIFICANT_DATA);
+    m_numServerUnseenMessages = unseen.value();
+    return SummaryChanged();
+  }
+#endif
 
   mozilla::CheckedInt<int32_t> delta(
       m_copyState->m_isCrossServerOp ? 1 : m_copyState->m_messages.Length());
@@ -7602,6 +7631,16 @@ nsImapMailFolder::SetCopyResponseUid(const char* msgIdString,
   if (aUrl) {
     using namespace mozilla::mailnews;
     auto* nativeUrl = static_cast<nsImapUrl*>(aUrl);
+    if (nativeUrl->HasNativeOnlineCopyTargets()) {
+      nsCOMPtr<nsISupports> support;
+      MOZ_TRY(aUrl->GetCopyState(getter_AddRefs(support)));
+      nsCOMPtr<nsImapMailCopyState> state = do_QueryInterface(support);
+      NS_ENSURE_TRUE(state && state->m_nativeOnlineDestination,
+                     NS_ERROR_NOT_AVAILABLE);
+      return static_cast<nsImapMailFolder*>(
+                 state->m_nativeOnlineDestination.get())
+          ->PublishNativeOnlineCopies(aUrl);
+    }
     auto targets = nativeUrl->CopyNativeQueuedCopies();
     if (!targets.IsEmpty()) {
       RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
@@ -7802,6 +7841,9 @@ nsImapMailFolder::SetAppendMsgUid(ImapUid uid, nsIImapUrl* url) {
 #ifdef MOZ_PANORAMA
   if (mail_panorama_enabled_AtStartup() && url) {
     auto* nativeUrl = static_cast<nsImapUrl*>(url);
+    if (nativeUrl->HasNativeOnlineAppend()) {
+      return PublishNativeOnlineAppend(url, uid);
+    }
     auto target = nativeUrl->CopyNativeQueuedAppendTarget();
     if (target) {
       using namespace mozilla::mailnews;
@@ -7919,7 +7961,12 @@ nsImapMailFolder::GetMessageId(nsIImapUrl* aUrl, nsACString& messageId) {
     nsCOMPtr<nsImapMailCopyState> mailCopyState =
         do_QueryInterface(copyState, &rv);
     if (NS_FAILED(rv)) return rv;
-    if (mailCopyState->m_listener)
+#ifdef MOZ_PANORAMA
+    if (mailCopyState->m_nativeOnlineAppend) {
+      rv = mailCopyState->m_nativeOnlineAppend->draft->GetMessageId(messageId);
+    } else
+#endif
+        if (mailCopyState->m_listener)
       rv = mailCopyState->m_listener->GetMessageId(messageId);
   }
   if (NS_SUCCEEDED(rv) && messageId.Length() > 0) {
@@ -9192,6 +9239,301 @@ static nsresult FinishOfflineCopy(nsIMsgFolder* source, nsIMsgDBHdr* header,
   return entry.draft->OrFlags(nsMsgMessageFlags::Offline, &flags);
 }
 
+nsresult nsImapMailFolder::PrepareNativeOnlineCopy(nsIMsgFolder* source,
+                                                   nsImapMailCopyState* state,
+                                                   nsImapUrl* url) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(source && state && m_copyState == state &&
+                     state->m_nativeOnlineCopies.IsEmpty() &&
+                     state->m_nativeQueuedCopies.IsEmpty(),
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckFolderPathAccess());
+  auto keys = MOZ_TRY(MsgGetKeysFromHdrs(state->m_messages));
+  auto uids = MOZ_TRY(UidsFromHdrs(state->m_messages));
+  MOZ_TRY(url->CaptureCopyTargets(source, keys, uids));
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(GetMsgDatabase(getter_AddRefs(database)));
+  NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+  auto* native = static_cast<PerFolderDatabase*>(database.get());
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  uint32_t epoch;
+  nsresult observed =
+      core->FolderDB().GetFolderUidValidity(native->FolderId(), epoch);
+  NS_ENSURE_TRUE(NS_SUCCEEDED(observed) || observed == NS_ERROR_NOT_AVAILABLE,
+                 observed);
+  nsTArray<nsImapUrl::OnlineCopyInput> inputs;
+  for (uint32_t i = 0; i < keys.Length(); ++i) {
+    auto owned = mozilla::MakeUnique<NativeOnlineTransferEntry>();
+    auto& entry = *owned;
+    state->m_nativeOnlineCopies.AppendElement(std::move(owned));
+    MessageBodyState sourceBody;
+    MOZ_TRY(core->MessageDB().GetMessageBodyState(keys[i], sourceBody));
+    NS_ENSURE_TRUE(
+        sourceBody.key == keys[i] &&
+            sourceBody.folderId == url->CapturedCopyTargets()->folderId,
+        NS_ERROR_NOT_AVAILABLE);
+    entry.expected.databaseSourceId = sourceBody.databaseSourceId;
+    entry.expected.sourceBody.emplace(sourceBody);
+    entry.expected.sourceLocation.emplace(
+        ServerMessageLocation{sourceBody.folderId, keys[i],
+                              url->CapturedCopyTargets()->epoch, uids[i]});
+    MOZ_TRY(native->CopyHdrForStore(state->m_messages[i], true,
+                                    getter_AddRefs(entry.draft)));
+    bool local = sourceBody.flags & nsMsgMessageFlags::Offline;
+    if (local) {
+      NativeOfflineCopyEntry body;
+      body.draft = entry.draft;
+      MOZ_TRY(FinishOfflineCopy(source, state->m_messages[i], this, body));
+      entry.expected.finished = body.finished;
+    }
+    nsMsgKey staged;
+    MOZ_TRY(native->StageHdrForOfflineCopy(entry.draft, &staged));
+    entry.expected.destination =
+        NS_SUCCEEDED(observed)
+            ? PendingDestination{native->FolderId(), staged, epoch}
+            : PendingDestination::Unobserved(native->FolderId(), staged);
+    nsCString id;
+    MOZ_TRY(state->m_messages[i]->GetMessageId(id));
+    MOZ_TRY(GetSpecialDirectoryWithFileName(NS_OS_TEMP_DIR,
+                                            "imap-copy-source.eml",
+                                            getter_AddRefs(entry.recovery)));
+    MOZ_TRY(entry.recovery->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 00600));
+    if (local) {
+      nsCOMPtr<nsIInputStream> input;
+      MOZ_TRY(source->GetMsgInputStream(state->m_messages[i],
+                                        getter_AddRefs(input)));
+      auto closeInput = mozilla::MakeScopeExit([&] { input->Close(); });
+      nsCOMPtr<nsIOutputStream> output;
+      MOZ_TRY(
+          MsgNewBufferedFileOutputStream(getter_AddRefs(output), entry.recovery,
+                                         PR_WRONLY | PR_CREATE_FILE, 00600));
+      uint64_t bytes;
+      nsresult copied = SyncCopyStream(input, output, bytes);
+      nsresult closed = input->Close();
+      closeInput.release();
+      nsresult saved = output->Close();
+      MOZ_TRY(copied);
+      MOZ_TRY(closed);
+      MOZ_TRY(saved);
+      NS_ENSURE_TRUE(bytes == sourceBody.offlineMessageSize,
+                     NS_ERROR_NOT_AVAILABLE);
+    }
+    inputs.AppendElement(
+        nsImapUrl::OnlineCopyInput{uids[i], id, entry.recovery, local});
+  }
+  state->m_nativeOnlineDestination = this;
+  url->MarkNativeOnlineCopyTargets();
+  return url->SetNativeOnlineCopyInputs(std::move(inputs));
+}
+
+nsresult nsImapMailFolder::PublishNativeOnlineCopies(nsIImapUrl* url) {
+  nsCOMPtr<nsISupports> support;
+  MOZ_TRY(url->GetCopyState(getter_AddRefs(support)));
+  nsCOMPtr<nsImapMailCopyState> state = do_QueryInterface(support);
+  NS_ENSURE_TRUE(
+      state && state->m_nativeOnlineDestination == this && m_copyState == state,
+      NS_ERROR_NOT_AVAILABLE);
+  auto* nativeUrl = static_cast<nsImapUrl*>(url);
+  const auto& captured = nativeUrl->CapturedCopyTargets();
+  NS_ENSURE_TRUE(captured && captured->messages.Length() ==
+                                 state->m_nativeOnlineCopies.Length(),
+                 NS_ERROR_NOT_AVAILABLE);
+  auto receipts = nativeUrl->CopyNativeCopyReceipts();
+  auto observations = nativeUrl->CopyNativeCopyObservations();
+  for (uint32_t i = 0; i < captured->messages.Length(); ++i) {
+    uint32_t epoch = 0;
+    ImapUid uid = 0;
+    for (const auto& receipt : receipts) {
+      if (receipt.sourceUid == captured->messages[i].uid &&
+          receipt.destination) {
+        epoch = receipt.destination->epoch;
+        uid = receipt.destination->uid;
+      }
+    }
+    for (const auto& observed : observations) {
+      if (observed.sourceUid != captured->messages[i].uid) continue;
+      NS_ENSURE_TRUE(!uid || (epoch == observed.epoch && uid == observed.uid),
+                     NS_ERROR_NOT_AVAILABLE);
+      epoch = observed.epoch;
+      uid = observed.uid;
+    }
+    if (!uid) continue;
+    MOZ_TRY(PublishNativeOnlineTransfer(*state->m_nativeOnlineCopies[i], state,
+                                        i, epoch, uid));
+  }
+  return NS_OK;
+}
+
+nsresult nsImapMailFolder::StageNativeOnlineAppend(
+    nsIMsgDBHdr* parsed, const mozilla::mailnews::FinishedMessageBody& finished,
+    nsIFile* recovery, nsImapMailCopyState* state) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  NS_ENSURE_TRUE(state && m_copyState == state &&
+                     (!state->m_nativeOnlineAppend ||
+                      (state->m_nativeOnlineAppend->settled &&
+                       !state->m_nativeOnlineAppend->publishing)) &&
+                     !state->m_nativeQueuedAppend && recovery,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckFolderPathAccess());
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(GetMsgDatabase(getter_AddRefs(database)));
+  NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+  auto* native = static_cast<PerFolderDatabase*>(database.get());
+  auto owned = mozilla::MakeUnique<NativeOnlineTransferEntry>();
+  auto& entry = *owned;
+  entry.recovery = recovery;
+  entry.expected.finished.emplace(finished);
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(core->GetSourceId(entry.expected.databaseSourceId));
+  nsCOMPtr<nsIMsgDBHdr> metadata = parsed;
+  if (state->m_streamCopy && state->m_curIndex < state->m_messages.Length()) {
+    metadata = state->m_messages[state->m_curIndex];
+    nsCString parsedId, sourceId;
+    MOZ_TRY(parsed->GetMessageId(parsedId));
+    MOZ_TRY(metadata->GetMessageId(sourceId));
+    NS_ENSURE_TRUE(parsedId == sourceId, NS_ERROR_NOT_AVAILABLE);
+    nsMsgKey key;
+    MOZ_TRY(metadata->GetMessageKey(&key));
+    MessageBodyState sourceBody;
+    MOZ_TRY(core->MessageDB().GetMessageBodyState(key, sourceBody));
+    entry.expected.sourceBody.emplace(sourceBody);
+    nsCOMPtr<nsIMsgFolder> source = do_QueryInterface(state->m_srcSupport);
+    nsCOMPtr<nsIImapMailFolderSink> imapSource = do_QueryInterface(source);
+    if (imapSource) {
+      uint32_t epoch, uid;
+      MOZ_TRY(imapSource->GetUidValidity(&epoch));
+      MOZ_TRY(metadata->GetUint32Property("uidOnServer", &uid));
+      NS_ENSURE_TRUE(epoch && uid, NS_ERROR_NOT_AVAILABLE);
+      entry.expected.sourceLocation.emplace(
+          ServerMessageLocation{sourceBody.folderId, key, epoch, uid});
+    }
+  }
+  MOZ_TRY(
+      native->CopyHdrForStore(metadata, false, getter_AddRefs(entry.draft)));
+  MOZ_TRY(entry.draft->SetStoreToken(finished.storeToken));
+  MOZ_TRY(entry.draft->SetMessageSize(finished.messageSize));
+  MOZ_TRY(entry.draft->SetOfflineMessageSize(finished.offlineMessageSize));
+  MOZ_TRY(entry.draft->SetLineCount(finished.lineCount));
+  uint32_t flags;
+  MOZ_TRY(entry.draft->OrFlags(nsMsgMessageFlags::Offline, &flags));
+  nsMsgKey key;
+  MOZ_TRY(native->StageHdrForOfflineCopy(entry.draft, &key));
+  uint32_t epoch;
+  nsresult observed =
+      core->FolderDB().GetFolderUidValidity(native->FolderId(), epoch);
+  NS_ENSURE_TRUE(NS_SUCCEEDED(observed) || observed == NS_ERROR_NOT_AVAILABLE,
+                 observed);
+  entry.expected.destination =
+      NS_SUCCEEDED(observed)
+          ? PendingDestination{native->FolderId(), key, epoch}
+          : PendingDestination::Unobserved(native->FolderId(), key);
+  // No offline operation or visible recovery member is created here.
+  state->m_nativeOnlineAppend = std::move(owned);
+  return NS_OK;
+}
+
+nsresult nsImapMailFolder::PublishNativeOnlineAppend(nsIImapUrl* url,
+                                                     ImapUid uid) {
+  using namespace mozilla::mailnews;
+  MOZ_ASSERT(NS_IsMainThread());
+  nsCOMPtr<nsISupports> support;
+  MOZ_TRY(url->GetCopyState(getter_AddRefs(support)));
+  nsCOMPtr<nsImapMailCopyState> state = do_QueryInterface(support);
+  NS_ENSURE_TRUE(state && m_copyState == state && state->m_nativeOnlineAppend,
+                 NS_ERROR_NOT_AVAILABLE);
+  auto& entry = *state->m_nativeOnlineAppend;
+  auto* nativeUrl = static_cast<nsImapUrl*>(url);
+  auto receipt = nativeUrl->CopyNativeQueuedAppendReceipt();
+  auto observed = nativeUrl->CopyNativeAppendObservation();
+  NS_ENSURE_TRUE((receipt && receipt->destination) || observed,
+                 NS_ERROR_NOT_AVAILABLE);
+  uint32_t epoch = receipt && receipt->destination ? receipt->destination->epoch
+                                                   : observed->epoch;
+  ImapUid actualUid = receipt && receipt->destination
+                          ? receipt->destination->uid
+                          : observed->uid;
+  NS_ENSURE_TRUE(actualUid == uid, NS_ERROR_NOT_AVAILABLE);
+  return PublishNativeOnlineTransfer(entry, state, state->m_curIndex, epoch,
+                                     uid);
+}
+
+nsresult nsImapMailFolder::PublishNativeOnlineTransfer(
+    NativeOnlineTransferEntry& entry, nsImapMailCopyState* state,
+    uint32_t index, uint32_t epoch, ImapUid uid) {
+  using namespace mozilla::mailnews;
+  NS_ENSURE_TRUE(m_copyState == state, NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_TRUE(epoch && uid && !entry.publishing, NS_ERROR_NOT_AVAILABLE);
+  if (entry.settled) {
+    NS_ENSURE_TRUE(entry.mapping.epoch == epoch && entry.mapping.uid == uid,
+                   NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  }
+  NS_ENSURE_TRUE(!entry.expected.destination.epochKnown ||
+                     entry.expected.destination.epoch == epoch,
+                 NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckFolderPathAccess());
+  RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+  NS_ENSURE_TRUE(core, NS_ERROR_NOT_AVAILABLE);
+  uint32_t storedEpoch;
+  nsresult epochRv =
+      core->FolderDB().GetFolderUidValidity(mFolderId, storedEpoch);
+  NS_ENSURE_TRUE(NS_SUCCEEDED(epochRv) || epochRv == NS_ERROR_NOT_AVAILABLE,
+                 epochRv);
+  if (NS_SUCCEEDED(epochRv)) {
+    NS_ENSURE_TRUE(storedEpoch == epoch, NS_ERROR_NOT_AVAILABLE);
+  } else {
+    nsCOMPtr<nsIMsgDatabase> epochDB;
+    MOZ_TRY(GetMsgDatabase(getter_AddRefs(epochDB)));
+    nsCOMPtr<nsIDBFolderInfo> info;
+    MOZ_TRY(epochDB->GetDBFolderInfo(getter_AddRefs(info)));
+    MOZ_TRY(info->SetImapUidValidity(epoch));
+  }
+  entry.expected.destination.epoch = epoch;
+  entry.expected.destination.epochKnown = true;
+  MOZ_TRY(SetUidValidity(epoch));
+  NS_ENSURE_TRUE(
+      entry.expected.destination.folderId == mFolderId &&
+          entry.expected.databaseSourceId.Equals(mFolderDatabaseSourceId),
+      NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(GetMsgDatabase(getter_AddRefs(database)));
+  NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+  auto* native = static_cast<PerFolderDatabase*>(database.get());
+  mozilla::AutoRestore<bool> publishing(entry.publishing);
+  entry.publishing = true;
+  MOZ_TRY(native->PublishHdrForOnlineTransfer(entry.draft, entry.expected,
+                                              epoch, uid, false, entry.mapping,
+                                              getter_AddRefs(entry.live)));
+  NS_ENSURE_TRUE(entry.live &&
+                     entry.mapping.key == entry.expected.destination.key &&
+                     entry.mapping.epoch == epoch && entry.mapping.uid == uid,
+                 NS_ERROR_NOT_AVAILABLE);
+  if (state->m_undoMsgTxn) {
+    MOZ_TRY(state->m_undoMsgTxn->AdoptNativeDestination(
+        index, this, entry.mapping, entry.live));
+  }
+  if (state->m_nativeOnlineAppend) state->m_appendUID = uid;
+  entry.settled = true;
+  // The actual owning key and undo slot precede the public key/success path.
+  if (state->m_listener)
+    MOZ_TRY(state->m_listener->SetMessageKey(entry.mapping.key));
+  nsCOMPtr<nsIMsgFolderNotificationService> notifier =
+      mozilla::components::FolderNotification::Service();
+  NS_ENSURE_STATE(notifier);
+  notifier->NotifyMsgAdded(entry.live);
+  // Finished provider bytes now own recovery. The upload snapshot is redundant.
+  if (entry.recovery) {
+    nsresult removed = entry.recovery->Remove(false);
+    if (NS_FAILED(removed)) return removed;
+    entry.recovery = nullptr;
+  }
+  return NS_OK;
+}
+
 nsresult nsImapMailFolder::QueueNativeOfflineAppend(
     nsIMsgDBHdr* parsed, const mozilla::mailnews::FinishedMessageBody& finished,
     nsMsgKey* key) {
@@ -10257,12 +10599,7 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
           allMessageCountNotifications,
           false);  // disable message count notification
 
-    nsCOMPtr<nsIURI> resultUrl;
-    nsCOMPtr<nsISupports> copySupport = do_QueryInterface(m_copyState);
-    rv = imapService->OnlineMessageCopy(
-        srcFolder, messageIds, this, true, isMove, urlListener,
-        getter_AddRefs(resultUrl), copySupport, msgWindow);
-    if (NS_SUCCEEDED(rv) && m_copyState->m_allowUndo) {
+    if (m_copyState->m_allowUndo) {
       RefPtr<nsImapMoveCopyMsgTxn> undoMsgTxn = new nsImapMoveCopyMsgTxn;
       if (!undoMsgTxn ||
           NS_FAILED(undoMsgTxn->Init(srcFolder, &keyArray, messageIds.get(),
@@ -10278,6 +10615,12 @@ nsImapMailFolder::CopyMessages(nsIMsgFolder* srcFolder,
         undoMsgTxn->SetTransactionType(nsIMsgTransactionService::eCopyMsg);
       m_copyState->m_undoMsgTxn = undoMsgTxn;
     }
+
+    nsCOMPtr<nsIURI> resultUrl;
+    nsCOMPtr<nsISupports> copySupport = do_QueryInterface(m_copyState);
+    rv = imapService->OnlineMessageCopy(
+        srcFolder, messageIds, this, true, isMove, urlListener,
+        getter_AddRefs(resultUrl), copySupport, msgWindow);
 
   }  // endif
 

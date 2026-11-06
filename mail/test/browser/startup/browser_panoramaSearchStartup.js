@@ -43,6 +43,41 @@ add_task(async function test_idleStartupLoadsTheNativeFactory() {
   );
 });
 
+add_task(async function test_nativeActivityDoesNotStartTheLegacyIndexer() {
+  const legacyModule = "resource:///modules/gloda/GlodaPublic.sys.mjs";
+  Assert.ok(
+    !Cu.isESModuleLoaded(legacyModule),
+    "Native startup has not started the legacy mail indexer"
+  );
+  const manager = Cc["@mozilla.org/activity-manager;1"].getService(
+    Ci.nsIActivityManager
+  );
+  const process = Cc["@mozilla.org/activity-process;1"].createInstance(
+    Ci.nsIActivityProcess
+  );
+  process.init("Native search activity regression", "native-search-regression");
+  process.contextType = "panorama-search";
+  manager.addActivity(process);
+  try {
+    Assert.equal(
+      window.MsgStatusFeedback._observedProcesses.get(process.id),
+      process,
+      "The status bar observes the real native activity"
+    );
+    Assert.ok(
+      !Cu.isESModuleLoaded(legacyModule),
+      "Showing native search progress does not start the legacy mail indexer"
+    );
+  } finally {
+    process.state = Ci.nsIActivityProcess.STATE_COMPLETED;
+    manager.removeActivity(process.id);
+  }
+  Assert.ok(
+    !window.MsgStatusFeedback._observedProcesses.has(process.id),
+    "The completed native activity is no longer observed"
+  );
+});
+
 add_task(async function test_nonPanoramaBackendRetainsLegacyStartup() {
   const glue = searchGlue();
   let legacy = 0;

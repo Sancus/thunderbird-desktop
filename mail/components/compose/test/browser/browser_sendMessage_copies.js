@@ -292,7 +292,9 @@ async function removeFolder(folder) {
   );
   const listener = new PromiseTestUtils.PromiseUrlListener();
   rootFolder.emptyTrash(listener);
-  await listener.promise;
+  if (folder.incomingServerType == "imap") {
+    await listener.promise;
+  }
 }
 
 /**

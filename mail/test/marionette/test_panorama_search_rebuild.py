@@ -198,6 +198,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
     def assert_identity(self):
         actual = self.marionette.execute_script(
             """
+            const { mailPolicyRevision } = ChromeUtils.importESModule('resource:///modules/panorama/MailSearchSource.sys.mjs');
             const selected = Services.dirsvc.get('ProfD', Ci.nsIFile);
             selected.normalize();
             if (selected.path !== arguments[1]) {
@@ -215,7 +216,9 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                     members: arguments[0].map(({id}) => {
                         const state = core.messageDB.getSearchState(Number(id));
                         return {id, folderId: state.folderId, generation: state.generation,
-                            contentRevision: state.contentRevision, policyRevision: state.policyRevision};
+                            contentRevision: state.contentRevision,
+                            rawPolicyRevision: state.policyRevision,
+                            policyRevision: mailPolicyRevision(state.policyRevision)};
                     })};
         """,
             script_args=[self.fixture["mail"], str(self.profile), self.fixture["sourceId"]],
@@ -226,6 +229,14 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.assertEqual(actual["sourceId"], self.fixture["sourceId"])
         self.assertIs(actual["native"], True)
         self.assertIs(actual["indexing"], True)
+        for member in actual["members"]:
+            raw_policy = member["rawPolicyRevision"]
+            policy = member["policyRevision"]
+            self.assertIs(type(raw_policy), str)
+            self.assertIs(type(policy), int)
+            self.assertGreaterEqual(policy, 0)
+            self.assertLessEqual(policy, 2**53 - 1)
+            self.assertEqual(str(policy), raw_policy)
         return actual
 
     def snapshot(self, key):

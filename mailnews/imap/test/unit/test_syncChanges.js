@@ -193,13 +193,17 @@ async function selectFolder(folder) {
 
 /**
  * Releases unused offline-operation wrappers before closing their stores.
- * XPConnect finalizes collected natives after the current task, so a store
- * closed in the same task would still be referenced by those Mork rows.
+ * A wrapper kept alive only by a cycle through cycle-collected objects is
+ * garbage after CC but is collected by the next GC, and XPConnect may release
+ * the collected natives incrementally from an idle task. Otherwise those Mork
+ * rows are released at shutdown, after their stores closed.
  */
 async function releaseOfflineOpWrappers() {
-  await schedulePreciseGCAndForceCC(1);
-  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
-  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+  await schedulePreciseGCAndForceCC(3);
+  await new Promise(resolve => Cu.schedulePreciseGC(resolve));
+  await new Promise(resolve =>
+    ChromeUtils.idleDispatch(resolve, { timeout: 1000 })
+  );
 }
 
 async function closeConnections() {

@@ -17,6 +17,9 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
 
     def setUp(self):
         super().setUp()
+        self._fixture_mutation_started = False
+        if self.testvars is None or self.testvars == {}:
+            self.skipTest("Requires --testvars from the retained S716 xpcshell fixture")
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.instance_prefs = self.marionette.instance.prefs
         self.capabilities = dict(self.marionette.requested_capabilities)
@@ -54,6 +57,8 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             self.profile,
             "The disposable runner profile is separate from the retained corpus",
         )
+        # Cleanup owns restoration only after the first lifecycle change begins.
+        self._fixture_mutation_started = True
         self.stop()
         # The public setter cleans its old Profile. Keep that disposable profile
         # available for restoration, and never let Profile cleanup remove inputs.
@@ -90,7 +95,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
     def cleanTest(self):
         """Use Marionette's actual end hook, including a failed setUp."""
         try:
-            if hasattr(self, "initial_profile"):
+            if getattr(self, "_fixture_mutation_started", False):
                 self.restore_fixture()
         finally:
             super().cleanTest()

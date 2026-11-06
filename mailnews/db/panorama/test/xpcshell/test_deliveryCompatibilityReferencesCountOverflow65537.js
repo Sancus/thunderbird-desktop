@@ -38,12 +38,20 @@ add_task(function test_numReferencesOverflow65537PreservesStorage() {
   );
   statement.params.id = key;
   const before = [];
-  if (statement.executeStep()) {
-    const row = statement.row;
-    do {
-      before.push([row.ordinal, row.token]);
-    } while (statement.executeStep());
+  let beforeTypesValid = true;
+  while (statement.executeStep()) {
+    const ordinalType = statement.getTypeOfIndex(0);
+    const tokenType = statement.getTypeOfIndex(1);
+    beforeTypesValid &&=
+      (ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_INTEGER ||
+        ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_FLOAT) &&
+      tokenType == Ci.mozIStorageValueArray.VALUE_TYPE_TEXT;
+    before.push([statement.getDouble(0), statement.getString(1)]);
   }
+  Assert.ok(
+    beforeTypesValid,
+    "The raw reference SQL column types are preserved"
+  );
   statement.reset();
   Assert.equal(before.length, 65537);
   // Compare every tuple and report only the exact comparison result.
@@ -66,12 +74,20 @@ add_task(function test_numReferencesOverflow65537PreservesStorage() {
   );
   const after = [];
   statement.params.id = key;
-  if (statement.executeStep()) {
-    const row = statement.row;
-    do {
-      after.push([row.ordinal, row.token]);
-    } while (statement.executeStep());
+  let afterTypesValid = true;
+  while (statement.executeStep()) {
+    const ordinalType = statement.getTypeOfIndex(0);
+    const tokenType = statement.getTypeOfIndex(1);
+    afterTypesValid &&=
+      (ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_INTEGER ||
+        ordinalType == Ci.mozIStorageValueArray.VALUE_TYPE_FLOAT) &&
+      tokenType == Ci.mozIStorageValueArray.VALUE_TYPE_TEXT;
+    after.push([statement.getDouble(0), statement.getString(1)]);
   }
+  Assert.ok(
+    afterTypesValid,
+    "The raw reference SQL column types are preserved"
+  );
   statement.reset();
   Assert.ok(
     after.every(

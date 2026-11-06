@@ -91,8 +91,7 @@ add_setup(async function () {
   IMAPPump.incomingServer.useCondStore = false;
   registerCleanupFunction(async () => {
     if (IMAPPump.incomingServer) {
-      // Release unused offline-operation wrappers before closing their stores.
-      await schedulePreciseGCAndForceCC(1);
+      await releaseOfflineOpWrappers();
       teardownIMAPPump();
     }
   });
@@ -190,6 +189,17 @@ async function selectFolder(folder) {
   const listener = new PromiseTestUtils.PromiseUrlListener();
   MailServices.imap.selectFolder(folder, listener, null);
   await listener.promise;
+}
+
+/**
+ * Releases unused offline-operation wrappers before closing their stores.
+ * XPConnect finalizes collected natives after the current task, so a store
+ * closed in the same task would still be referenced by those Mork rows.
+ */
+async function releaseOfflineOpWrappers() {
+  await schedulePreciseGCAndForceCC(1);
+  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+  await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
 }
 
 async function closeConnections() {
@@ -703,8 +713,11 @@ if (panorama) {
     const token = headers[0].storeToken;
     const bytes = storedTokenBody(folder, token);
     Assert.ok(bytes.includes("Keep this exact pending source body."));
-    const op = queueIntent(folder, headers[0], "move");
-    const intent = [op.operation, op.newFlags, op.destinationFolderURI];
+    // Keep no offline-operation wrapper alive across forceClosed().
+    const intent = (() => {
+      const op = queueIntent(folder, headers[0], "move");
+      return [op.operation, op.newFlags, op.destinationFolderURI];
+    })();
     const identity = queuedIdentity(folder, key);
     Assert.deepEqual(identity.slice(2), [7101, 6101]);
     db.deleteMessages([key], null);
@@ -732,6 +745,7 @@ if (panorama) {
     try {
       for (let i = 0; i < 2; i++) {
         await closeConnections();
+        await releaseOfflineOpWrappers();
         folder.msgDatabase.forceClosed();
         await selectFolder(folder);
         const reopened = folder.msgDatabase.QueryInterface(
@@ -1217,7 +1231,6 @@ if (panorama) {
 }
 
 add_task(async function endTest() {
-  // Release unused offline-operation wrappers before closing their stores.
-  await schedulePreciseGCAndForceCC(1);
+  await releaseOfflineOpWrappers();
   teardownIMAPPump();
 });

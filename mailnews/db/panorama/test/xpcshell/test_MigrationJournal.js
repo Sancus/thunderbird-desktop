@@ -1627,3 +1627,109 @@ add_task(async function test_protocolUnitMembershipAndReceiptAreAtomic() {
     Assert.equal(journal.state.stage, "validate");
   }
 });
+
+add_task(async function test_stageTransitionsPersistCancellationAndReceipts() {
+  const { plan, path } = await migrationFiles();
+  const original = await IOUtils.read(plan.sources[0].path);
+  let journal = await MigrationJournal.create(path, plan);
+  registerCleanupFunction(() => journal.close());
+  const planned = journal.state.sources[0];
+  const reopenAtStage = async stage => {
+    const state = journal.state;
+    const bytes = await IOUtils.read(path);
+    Assert.equal(state.stage, stage);
+    journal.close();
+    journal = await MigrationJournal.open(path, plan.profilePath);
+    Assert.deepEqual(
+      journal.state,
+      state,
+      stage + ": exact state survives reopen"
+    );
+    Assert.deepEqual(
+      await IOUtils.read(path),
+      bytes,
+      stage + ": reopen is read-only"
+    );
+  };
+  const refuseTransition = async (
+    stage,
+    message = "Migration is cancelled or at another stage"
+  ) => {
+    const state = journal.state;
+    const bytes = await IOUtils.read(path);
+    await Assert.rejects(
+      journal.finishStage(stage),
+      error => error.name === "Error" && error.message === message,
+      stage + ": invalid transition refuses before writing"
+    );
+    Assert.deepEqual(journal.state, state, stage + ": refusal retains state");
+    Assert.deepEqual(
+      await IOUtils.read(path),
+      bytes,
+      stage + ": no journal write"
+    );
+  };
+
+  await reopenAtStage("backup");
+  await refuseTransition("import");
+  const backup = await createMigrationBackup(
+    plan.profilePath,
+    plan.mailPaths,
+    plan.backupPath
+  );
+  await journal.recordBackup(backup);
+  await reopenAtStage("import");
+  await refuseTransition("activate");
+  await refuseTransition("import", "Migration imports are incomplete");
+  const token = await journal.beginImport("folder-source");
+  await journal.recordImport("folder-source", {
+    token,
+    sourceSha256: plan.sources[0].sha256,
+    ...physicalReceiptModel(journal),
+    sourcePhysicalIdentity: journal.state.sources[0].physicalIdentity,
+    folderId: 9,
+    keys: [
+      [3, 700],
+      [1, 401],
+    ],
+  });
+  const committed = journal.state.sources[0].receipt;
+  await journal.recordError(new TypeError("validation retry required"));
+  await reopenAtStage("import");
+  Assert.deepEqual(journal.state.lastError, {
+    name: "TypeError",
+    message: "validation retry required",
+  });
+  await refuseTransition("activate");
+
+  // The stage owner records completed work; this test never activates a profile.
+  await journal.finishStage("import");
+  await reopenAtStage("validate");
+  await journal.setCancelled(true);
+  await reopenAtStage("validate");
+  await refuseTransition("validate");
+  await refuseTransition("activate");
+  await journal.setCancelled(false);
+  await refuseTransition("activate");
+  await journal.finishStage("validate");
+  await reopenAtStage("activate");
+  await refuseTransition("validate");
+  await journal.finishStage("activate");
+  await reopenAtStage("complete");
+  await refuseTransition("activate");
+
+  Assert.deepEqual(
+    { ...journal.state.sources[0], state: "pending", receipt: null },
+    planned,
+    "Every stage retains the exact original plan and intent"
+  );
+  Assert.deepEqual(journal.state.sources[0].receipt, committed);
+  Assert.equal(journal.state.sources[0].receipt.token, token);
+  Assert.deepEqual(journal.state.lastError, {
+    name: "TypeError",
+    message: "validation retry required",
+  });
+  Assert.deepEqual(await IOUtils.read(plan.sources[0].path), original);
+  Assert.deepEqual(await verifyMigrationBackup(plan.backupPath), backup);
+  journal.close();
+});

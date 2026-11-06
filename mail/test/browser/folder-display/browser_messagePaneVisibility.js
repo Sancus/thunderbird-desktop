@@ -348,6 +348,25 @@ add_task(async function test_message_pane_restores_stored_size_on_startup() {
       () => folderPane.getBoundingClientRect().width > 50,
       "the folder pane should be visible before dragging the message splitter"
     );
+    info(
+      "Message pane startup diagnostic: " +
+        JSON.stringify({
+          restoredWidth,
+          outerWidth: win.outerWidth,
+          innerWidth: win.innerWidth,
+          availableWidth: win.screen.availWidth,
+          pixelRatio: win.devicePixelRatio,
+          bodyWidth: about3Pane.document.body.clientWidth,
+          folderWidth: folderPane.getBoundingClientRect().width,
+          messageWidth: messagePane.getBoundingClientRect().width,
+          threadWidth: about3Pane.document
+            .getElementById("threadPane")
+            .getBoundingClientRect().width,
+          threadMinimum: about3Pane.getComputedStyle(
+            about3Pane.document.getElementById("threadPane")
+          ).minWidth,
+        })
+    );
     await TestUtils.waitForCondition(
       () =>
         Math.abs(messagePane.getBoundingClientRect().width - restoredWidth) <=

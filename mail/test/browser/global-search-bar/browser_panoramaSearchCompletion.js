@@ -254,6 +254,26 @@ add_task(async function test_nativeToolbarTagUsesRetainedFacetUI() {
     await TestUtils.waitForCondition(() => tab.searchPromise);
     await tab.searchPromise;
     const context = tab.browser.contentWindow.FacetContext;
+    info(
+      "Native completion diagnostic: " +
+        JSON.stringify({
+          query: tab.mailSearch,
+          sourceId: context.mailSearchResultSet?.sourceId,
+          resultItems: context.mailSearchResultSet?.items.map(item => ({
+            id: item.id,
+            tagKeys: item.tagKeys,
+          })),
+          sort: context._sortBy,
+          relevantCount: context._relevantSortedItems?.length,
+          dateCount: context._dateSortedItems?.length,
+          headers: fixture.folders.slice(0, 2).map(folder =>
+            [...folder.messages].map(header => ({
+              key: header.messageKey,
+              keywords: header.getStringProperty("keywords"),
+            }))
+          ),
+        })
+    );
     Assert.equal(context.mailSearchResultSet.sourceId, row.sourceId);
     Assert.deepEqual(
       context.fullSet.map(item => Number(item.id)).sort((a, b) => a - b),

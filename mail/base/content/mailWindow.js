@@ -683,8 +683,11 @@ nsMsgStatusFeedback.prototype = {
 
   // nsIActivityMgrListener
   onAddedActivity(aID, activity) {
-    // ignore Gloda activity for status bar purposes
-    if (activity.initiator == Gloda) {
+    // Ignore existing Gloda activity without starting its indexer for native work.
+    if (
+      Cu.isESModuleLoaded("resource:///modules/gloda/GlodaPublic.sys.mjs") &&
+      activity.initiator == Gloda
+    ) {
       return;
     }
     if (activity instanceof Ci.nsIActivityEvent) {

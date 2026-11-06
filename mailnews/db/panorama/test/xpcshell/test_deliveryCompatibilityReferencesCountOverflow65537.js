@@ -38,8 +38,11 @@ add_task(function test_numReferencesOverflow65537PreservesStorage() {
   );
   statement.params.id = key;
   const before = [];
-  while (statement.executeStep()) {
-    before.push([statement.row.ordinal, statement.row.token]);
+  if (statement.executeStep()) {
+    const row = statement.row;
+    do {
+      before.push([row.ordinal, row.token]);
+    } while (statement.executeStep());
   }
   statement.reset();
   Assert.equal(before.length, 65537);
@@ -61,8 +64,11 @@ add_task(function test_numReferencesOverflow65537PreservesStorage() {
   );
   const after = [];
   statement.params.id = key;
-  while (statement.executeStep()) {
-    after.push([statement.row.ordinal, statement.row.token]);
+  if (statement.executeStep()) {
+    const row = statement.row;
+    do {
+      after.push([row.ordinal, row.token]);
+    } while (statement.executeStep());
   }
   statement.reset();
   Assert.ok(

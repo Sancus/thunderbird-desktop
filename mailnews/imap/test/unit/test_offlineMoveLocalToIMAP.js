@@ -231,6 +231,7 @@ add_task(async function testOfflineMoveLocalToIMAP() {
     const mailbox = IMAPPump.daemon.getMailbox("INBOX");
     const associated = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(retainedKey);
     Assert.equal(associated.messageKey, retainedKey);
+    Assert.equal(associated.getUint32Property("pseudoHdr"), 0);
     Assert.equal(associated.storeToken, retainedToken);
     Assert.equal(readRetainedMoveBody(associated), retainedBytes);
     Assert.equal(
@@ -253,6 +254,7 @@ add_task(async function testOfflineMoveLocalToIMAP() {
     Assert.equal(mailbox._messages.length, 1);
     Assert.equal(IMAPPump.inbox.getTotalMessages(false), 1);
     const current = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(retainedKey);
+    Assert.equal(current.getUint32Property("pseudoHdr"), 0);
     Assert.equal(current.storeToken, retainedToken);
     Assert.equal(readRetainedMoveBody(current), retainedBytes);
     Assert.equal(

@@ -952,7 +952,8 @@ async function checkUncachedOnlineCopy(ambiguousMove) {
       error => error
     );
     if (ambiguousMove) {
-      Assert.ok(result instanceof Error);
+      Assert.equal(result.name, "Error");
+      Assert.equal(Number(result.message), Cr.NS_ERROR_NOT_AVAILABLE);
       Assert.deepEqual(
         destructive,
         [],

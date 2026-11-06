@@ -9346,8 +9346,10 @@ nsresult nsImapMailFolder::AssociateAcceptedAppendObservation(nsImapUrl* url,
                        mapping.key == attempt.appendBody->key &&
                        mapping.epoch == observed.epoch && mapping.uid == uid,
                    NS_ERROR_NOT_AVAILABLE);
-    // This is association of an already visible retained member. Normal
-    // refresh must neither publish nor notify a second member for its UID.
+    // The checked observation binds this existing member to its actual UID.
+    // Include it in server reconciliation instead of fetching a second header.
+    // The accepted attempt and its receipt remain unchanged.
+    MOZ_TRY(live->SetUint32Property("pseudoHdr", 0));
     return NS_OK;
   }
   return NS_ERROR_NOT_AVAILABLE;

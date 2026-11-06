@@ -2881,15 +2881,18 @@ class DeliveryCoreReferences : public testing::Test {
     // no preference/default is changed and whole real profile tests stay
     // separate.
     (void)StaticPrefs::mail_panorama_enabled_AtStartup();
-    AutoRestore<bool> restoreNative(
-        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
-    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
-    // AccountManager may already be cached from a preceding non-native case.
-    // Borrow an actual live core, or start this concrete native fixture once;
-    // never assume getService repeats AccountManager::Init for this profile.
     nsCOMPtr<nsIMsgAccountManager> manager =
         do_GetService("@mozilla.org/messenger/account-manager;1");
     ASSERT_TRUE(manager);
+    // Release the prior profile/backend through its normal lifecycle before
+    // selecting this native case. Legacy LoadAccounts installs a folder
+    // listener that native LoadAccounts deliberately does not register.
+    ASSERT_EQ(NS_OK, manager->UnloadAccounts());
+    AutoRestore<bool> restoreNative(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    // Borrow an actual live core, or start this concrete native fixture once;
+    // never assume getService repeats AccountManager::Init for this profile.
     mCore = DatabaseCore::GetInstanceForService();
     mConnection = Connection();
     if (!mConnection) {
@@ -2937,6 +2940,11 @@ class DeliveryCoreReferences : public testing::Test {
     });
     nsCOMPtr<nsIDatabaseCore> selected = do_GetService(contract);
     ASSERT_EQ(static_cast<nsIDatabaseCore*>(mCore.get()), selected.get());
+    // Provider/server cleanup runs first, then unload the native accounts
+    // while their real service and backend are still selected. A later case
+    // loads its own backend normally; no listener is individually suppressed.
+    auto unloadAccounts =
+        MakeScopeExit([&] { EXPECT_EQ(NS_OK, manager->UnloadAccounts()); });
     uint64_t root;
     ASSERT_EQ(NS_OK,
               mCore->FolderDB().InsertRoot("delivery-references"_ns, &root));

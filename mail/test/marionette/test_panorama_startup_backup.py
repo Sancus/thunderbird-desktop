@@ -20,12 +20,12 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.profile = Path(self.marionette.execute_script(
             "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
-        ))
+        )).resolve()
         self.original_args = list(self.marionette.instance.app_args or [])
         self.instance_prefs = self.marionette.instance.prefs
         self.saved_prefs = {}
         self.work = tempfile.TemporaryDirectory(prefix="comm-startup-copy-")
-        self.root = Path(self.work.name)
+        self.root = Path(self.work.name).resolve()
         self.addCleanup(self.work.cleanup)
         self.source = self.profile / ("startup-copy-" + uuid.uuid4().hex)
         self.source.write_bytes(b"Original profile message bytes.\n")
@@ -57,9 +57,10 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         }
         self.marionette.start_session()
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
-        self.assertEqual(str(self.profile), self.marionette.execute_script(
+        selected = self.marionette.execute_script(
             "return Services.dirsvc.get('ProfD', Ci.nsIFile).path;"
-        ))
+        )
+        self.assertEqual(self.profile, Path(selected).resolve())
         self.assertEqual("mail:3pane", self.marionette.get_window_type())
 
     def startup_code(self):
@@ -136,11 +137,11 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         self.assertIs(manifest["complete"], True)
         for source, digest in expected.items():
             root = next(item for item in manifest["roots"]
-                        if source.is_relative_to(Path(item["source"])))
-            copy = backup / root["directory"] / source.relative_to(root["source"])
+                        if source.is_relative_to(Path(item["source"]).resolve()))
+            copy = backup / root["directory"] / source.relative_to(Path(root["source"]).resolve())
             self.assertEqual(digest, hashlib.sha256(copy.read_bytes()).hexdigest())
         profile_root = next(item for item in manifest["roots"]
-                            if Path(item["source"]) == self.profile)
+                            if Path(item["source"]).resolve() == self.profile)
         for name, before in nss.items():
             self.assertEqual(before, (backup / profile_root["directory"] / name).read_bytes())
         code = self.startup_code()
@@ -252,7 +253,7 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
             if (self.profile / name).exists()
         }
         external_before = {
-            str(root): self.tree_snapshot(root) for root in (mbox, maildir)
+            root.resolve(): self.tree_snapshot(root) for root in (mbox, maildir)
         }
         backup = self.root / "complete-backup"
         self.start(["--panorama-backup", str(backup)])
@@ -261,8 +262,9 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         manifest_bytes = manifest_path.read_bytes()
         manifest = json.loads(manifest_bytes)
         self.assertIs(manifest["complete"], True)
-        roots = {root["source"]: root for root in manifest["roots"]}
-        self.assertEqual({str(self.profile), str(mbox), str(maildir)}, set(roots))
+        roots = {Path(root["source"]).resolve(): root for root in manifest["roots"]}
+        self.assertEqual({self.profile, mbox.resolve(), maildir.resolve()}, set(roots))
+        self.assertEqual(len(manifest["roots"]), len(roots))
         archive = {
             original: self.tree_snapshot(backup / root["directory"])
             for original, root in roots.items()
@@ -277,10 +279,10 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
             self.assertEqual(declared, archive[original], "Full archive inventory must match")
         for source, value in expected.items():
             root = next(root for root in roots.values()
-                        if source.is_relative_to(Path(root["source"])))
-            copied = backup / root["directory"] / source.relative_to(root["source"])
+                        if source.is_relative_to(Path(root["source"]).resolve()))
+            copied = backup / root["directory"] / source.relative_to(Path(root["source"]).resolve())
             self.assertEqual(value, copied.read_bytes(), "Stopped source bytes must survive")
-        profile_root = roots[str(self.profile)]
+        profile_root = roots[self.profile]
         for name, value in nss.items():
             self.assertEqual(value, (backup / profile_root["directory"] / name).read_bytes())
         for original, snapshot in external_before.items():
@@ -290,9 +292,9 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
         parent.mkdir()
         restored = self.stage_restore(backup, parent)
         self.assertNotIn("error", restored, restored)
-        restore_path = Path(restored["path"])
+        restore_path = Path(restored["path"]).resolve()
         self.assertEqual(parent, restore_path.parent)
-        restored_roots = {item["original"]: Path(item["staged"])
+        restored_roots = {Path(item["original"]).resolve(): Path(item["staged"]).resolve()
                           for item in restored["roots"]}
         self.assertEqual(set(roots), set(restored_roots))
         self.assertEqual(len(roots), len(restored["roots"]))
@@ -313,14 +315,15 @@ class TestPanoramaStartupBackup(MarionetteTestCase):
             })
             self.assertEqual(metadata, self.staged_metadata(target, root))
 
-        sentinel = restored_roots[str(self.profile)] / "restored-only-marker"
+        sentinel = restored_roots[self.profile] / "restored-only-marker"
         sentinel.write_bytes(b"Do not overwrite an earlier staged restore.\n")
         second = self.stage_restore(backup, parent)
         self.assertNotIn("error", second, second)
-        self.assertNotEqual(restored["path"], second["path"])
+        self.assertNotEqual(restore_path, Path(second["path"]).resolve())
         self.assertEqual(b"Do not overwrite an earlier staged restore.\n", sentinel.read_bytes())
         for item in second["roots"]:
-            self.assertEqual(archive[item["original"]], self.tree_snapshot(Path(item["staged"])))
+            self.assertEqual(archive[Path(item["original"]).resolve()],
+                             self.tree_snapshot(Path(item["staged"]).resolve()))
 
         corrupt = self.root / "corrupt-backup"
         shutil.copytree(backup, corrupt)

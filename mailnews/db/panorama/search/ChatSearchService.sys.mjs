@@ -4,7 +4,11 @@
 
 import { AsyncShutdown } from "resource://gre/modules/AsyncShutdown.sys.mjs";
 import { IMServices } from "resource:///modules/IMServices.sys.mjs";
-import { encodeName, gFilePromises } from "resource:///modules/logger.sys.mjs";
+import {
+  encodeName,
+  gFilePromises,
+  getChatPrivacyEpoch,
+} from "resource:///modules/logger.sys.mjs";
 
 import {
   ChatSearchProvider,
@@ -15,7 +19,23 @@ import { ChatSearchRedactionObserver } from "resource:///modules/panorama/ChatSe
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   MailServices: "resource:///modules/MailServices.sys.mjs",
+  getSearchBodySnippet: "resource:///modules/panorama/SearchOffsets.sys.mjs",
 });
+
+/**
+ * @typedef {object} ChatSearchResult
+ * @property {SearchHit} hit - Captured physical identity and exact text tokens.
+ * @property {SearchDocument} document - Matching current semantic text.
+ * @property {{text: string, ranges: {start: number, end: number}[],
+ *   firstMatchText: ?string}} snippet - Current Unicode snippet and body match.
+ */
+
+/**
+ * @typedef {object} ChatSearchResultSet
+ * @property {string} query - Original provider query text.
+ * @property {string} resultSetId - Identity shared by all collected query pages.
+ * @property {ChatSearchResult[]} items - Captured hits and matching snippets.
+ */
 
 /**
  * Delivers actual logger files to the separate native transcript provider.
@@ -339,6 +359,97 @@ export class ChatSearchService {
   }
 
   /**
+   * Collects all current transcript pages and their matching text snippets.
+   * Keeps the provider's physical hit and text tokens for checked opening.
+   * Rejects changed text, privacy or a failed page instead of returning a
+   * partial collection. Does not open a reader or load a Gloda searcher.
+   *
+   * @param {string} text - Existing provider query words or quoted phrases.
+   * @param {object} [options={}] - Query controls.
+   * @param {AbortSignal} [options.signal] - Cancels result delivery.
+   * @param {number} [options.limit=50] - Provider page size, from 1 to 500.
+   * @returns {Promise<ChatSearchResultSet>} Complete captured native results,
+   *   including title-only matches.
+   * @throws {Error} Original source/query errors, cancellation or close,
+   *   or a text/privacy change during collection.
+   */
+  async collectResults(text, { signal, limit = 50 } = {}) {
+    this.#checkReaderRequest(signal);
+    await this.flush();
+    this.#checkReaderRequest(signal);
+    const epoch = getChatPrivacyEpoch();
+    const items = [];
+    let cursor = null;
+    let resultSetId = null;
+    do {
+      const page = await this.search(text, { signal, limit, cursor });
+      this.#checkReaderRequest(signal);
+      if (resultSetId !== null && page.resultSetId !== resultSetId) {
+        throw new Error("Chat search pages belong to different queries");
+      }
+      resultSetId = page.resultSetId;
+      for (const hit of page.items) {
+        const document = await this.getText(hit.id, { signal });
+        this.#checkReaderRequest(signal);
+        const snippet = lazy.getSearchBodySnippet(hit, document);
+        if (!snippet || document.contentRevision !== hit.contentRevision) {
+          throw new Error("Chat transcript changed during query");
+        }
+        items.push({ hit: Object.freeze({ ...hit }), document, snippet });
+      }
+      cursor = page.cursor;
+    } while (cursor);
+    await this.flush();
+    this.#checkReaderRequest(signal);
+    if (epoch !== getChatPrivacyEpoch()) {
+      throw new Error("Chat privacy changed during query");
+    }
+    return { query: text, resultSetId, items };
+  }
+
+  /**
+   * Resolves the captured hit after observed source and privacy work drains.
+   * Copies the clicked tokens before waiting. Returns only the provider's
+   * checked physical log and parsed conversation; never reparses or substitutes
+   * a grouped log. A close or abort prevents delivery to the reader.
+   *
+   * @param {SearchHit} hit - Selected physical identity and exact text revisions.
+   * @param {object} [options={}] - Opening controls.
+   * @param {AbortSignal} [options.signal] - Cancels checked result delivery.
+   * @returns {Promise<{status: "ready", id: string, contentRevision: string,
+   *   textRevision: string, log: Log, conversation: LogConversation} |
+   *   {status: "deleted"|"ineligible"|"stale"}>} Checked opening disposition.
+   * @throws {TypeError} For an incomplete or noncanonical hit.
+   * @throws {Error} Original source/parser/privacy errors, cancellation or close.
+   */
+  async resolveLog(hit, { signal } = {}) {
+    const request = {
+      id: hit?.id,
+      contentRevision: hit?.contentRevision,
+      textRevision: hit?.textRevision,
+    };
+    this.#checkReaderRequest(signal);
+    await this.flush();
+    this.#checkReaderRequest(signal);
+    const result = await this.#provider.resolveLog(request, { signal });
+    this.#checkReaderRequest(signal);
+    return result;
+  }
+
+  /**
+   * Rejects a cancelled request or delivery from a closing service.
+   *
+   * @param {AbortSignal} [signal] - Original caller cancellation.
+   * @throws {Error} Original abort reason or a closing refusal.
+   */
+  #checkReaderRequest(signal) {
+    signal?.throwIfAborted();
+    if (this.#closing) {
+      throw new Error("Chat search service is closing");
+    }
+  }
+
+  /**
    * Detaches before draining and closes the owned provider once.
    * A failure still closes storage and remains rejected on subsequent closes.
    *
@@ -424,6 +535,25 @@ export function getChatSearchService() {
     current = { promise: ChatSearchService.open(file), closePromise: null };
   }
   return current.promise;
+}
+
+/**
+ * Collects current transcript results through the shared native service.
+ *
+ * @param {string} text - Existing provider query words or quoted phrases.
+ * @param {object} [options={}] - Query controls copied before factory startup.
+ * @param {AbortSignal} [options.signal] - Cancels delivery after pending startup.
+ * @param {number} [options.limit=50] - Provider page size, from 1 to 500.
+ * @returns {Promise<ChatSearchResultSet>} Complete native hits, current
+ *   documents and matching Unicode snippets.
+ * @throws {Error} Original startup/query error, cancellation or close.
+ */
+export async function findChatSearchResults(text, options = {}) {
+  const controls = { ...options };
+  controls.signal?.throwIfAborted();
+  const service = await getChatSearchService();
+  controls.signal?.throwIfAborted();
+  return service.collectResults(text, controls);
 }
 
 /**

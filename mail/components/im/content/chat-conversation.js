@@ -219,6 +219,7 @@
       });
       this.convBrowser.setAttribute("flex", "1");
       this.convBrowser.setAttribute("type", "content");
+      this.convBrowser.setAttribute("manualactiveness", "true");
       this.convBrowser.setAttribute("messagemanagergroup", "browsers");
 
       this.progressBar = document.createElementNS(
@@ -395,6 +396,11 @@
         return;
       }
       this.loaded = true;
+      // The selection observer skips conversations that have not loaded yet.
+      // Apply the current visible selection before queueing its first messages.
+      if (this.tab?.selected && !this.hidden) {
+        this.switchingToPanel();
+      }
       const messages = this._conv.getMessages();
       this._readCount = messages.length - this._conv.unreadMessageCount;
       if (this._readCount) {

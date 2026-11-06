@@ -515,9 +515,21 @@ add_task(async function test_nativeInputClearCancelsDeferredTypedSelection() {
     await TestUtils.waitForCondition(() => owner.searchPromise);
     await owner.searchPromise;
     const input = owner.panel.querySelector(".remote-gloda-search");
+    // Use the current native projection, including work queued by the owner tab.
+    let progress;
+    do {
+      progress = await fixture.service.update({ limit: 500 });
+    } while (progress.moreWork);
+    Assert.equal(progress.pending, 0, JSON.stringify(progress));
+    Assert.equal(progress.acceptedThrough, progress.sourceWatermark);
     input.focus();
     input.value = "completionperson";
+    const previous = provider.curResult;
     input.controller.startSearch("completionperson");
+    await TestUtils.waitForCondition(
+      () => provider.curResult != previous,
+      "The current input owns a fresh native completion"
+    );
     const result = await completionResult("completionperson");
     assertCompletionInputOwnership(input);
     input.popup.selectedIndex = result.rows.findIndex(

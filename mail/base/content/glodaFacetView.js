@@ -24,6 +24,10 @@ ChromeUtils.defineESModuleGetters(this, {
   GlodaSyntheticView: "resource:///modules/gloda/GlodaSyntheticView.sys.mjs",
   FacetDriver: "resource:///modules/gloda/Facet.sys.mjs",
   findMailSearchResults: "resource:///modules/panorama/MailSearch.sys.mjs",
+  findChatSearchResults:
+    "resource:///modules/panorama/ChatSearchService.sys.mjs",
+  getChatSearchService:
+    "resource:///modules/panorama/ChatSearchService.sys.mjs",
   getMailSearchConversation: "resource:///modules/panorama/MailSearch.sys.mjs",
   getMailSearchService: "resource:///modules/panorama/MailSearch.sys.mjs",
   openDefaultMailSearchResultsList:
@@ -1400,11 +1404,12 @@ var FacetContext = {
 
   /**
    * Builds this frame's current facets under the parent-owned query lifetime.
+   * Optional chat failures are reported without discarding healthy mail results.
    *
    * @param {object} options - Refresh controls.
    * @param {boolean} options.preserveFilters - Keep existing refinement and sort.
    * @param {AbortSignal} signal - Parent tab and replacement cancellation.
-   * @returns {Promise<?MailSearchResultSet>} Current results, or null on cancellation/error.
+   * @returns {Promise<?MailSearchResultSet>} Current mail results, or null on cancellation/mail error.
    */
   async _loadMailSearch({ preserveFilters }, signal) {
     const state = preserveFilters
@@ -1428,6 +1433,8 @@ var FacetContext = {
       this._activeConstraints = {};
     }
     this.mailSearchResultSet = null;
+    this.chatSearchResultSet = null;
+    document.querySelector(".native-chat-results")?.remove();
     this._activeSet = [];
     this._relevantSortedItems = [];
     this._dateSortedItems = [];
@@ -1462,10 +1469,24 @@ var FacetContext = {
     document.l10n.setAttributes(loading, "facet-view-search-loading");
     loading.style.display = "block";
     try {
-      const resultSet = await findMailSearchResults(this.tab.mailSearch.text, {
-        ...this.tab.mailSearch,
-        signal,
-      });
+      const input = this.tab.mailSearch;
+      const [resultSet, chatResults] = await Promise.all([
+        findMailSearchResults(input.text, { ...input, signal }),
+        !input.selection &&
+        !input.sourceId &&
+        input.text?.trim() &&
+        Services.prefs.getBoolPref("mail.chat.enabled", false)
+          ? (async () => {
+              try {
+                return await findChatSearchResults(input.text, { signal });
+              } catch (error) {
+                signal.throwIfAborted();
+                console.error(error);
+                return null;
+              }
+            })()
+          : null,
+      ]);
       signal.throwIfAborted();
       if (
         this.tab.mailSearch.sourceId !== null &&
@@ -1480,6 +1501,8 @@ var FacetContext = {
       this.mailSearchResultSet = resultSet;
       this.facetDriver = makeMailSearchFacetDriver(resultSet);
       this.initialBuild(state);
+      this.chatSearchResultSet = chatResults;
+      this.renderChatSearchResults(signal);
       results.countNode.hidden = false;
       document.getElementById("gloda-facet-view").inert = false;
       return resultSet;
@@ -1489,6 +1512,125 @@ var FacetContext = {
       }
       return null;
     }
+  },
+
+  /**
+   * Adds current transcript snippets beside the retained mail result list.
+   * The row closes over its physical hit and Unicode snippet, not a log path.
+   *
+   * @param {AbortSignal} signal - Current query and parent tab lifetime.
+   */
+  renderChatSearchResults(signal) {
+    document.querySelector(".native-chat-results")?.remove();
+    if (!this.chatSearchResultSet?.items.length || signal.aborted) {
+      return;
+    }
+    const list = document.createElement("div");
+    list.classList.add("native-chat-results");
+    for (const item of this.chatSearchResultSet.items) {
+      const row = document.createElement("article");
+      row.classList.add("native-chat-result");
+      row.dataset.id = item.hit.id;
+      const title = document.createElement("button");
+      title.classList.add("message-subject");
+      title.textContent = item.document.subject || item.snippet.text;
+      title.addEventListener("click", event => {
+        this.tab.chatSearchOpenPromise = this.openChatSearchConversation(
+          item,
+          event.ctrlKey || event.metaKey
+        );
+        const opening = this.chatSearchOpenController;
+        this.tab.chatSearchOpenPromise.catch(error => {
+          if (!signal.aborted && !opening.signal.aborted) {
+            this.showMailSearchError("facet-view-search-error", error);
+          }
+        });
+      });
+      const snippet = document.createElement("p");
+      snippet.classList.add("message-snippet");
+      let offset = 0;
+      for (const range of item.snippet.ranges) {
+        snippet.append(item.snippet.text.substring(offset, range.start));
+        const mark = document.createElement("mark");
+        mark.textContent = item.snippet.text.substring(range.start, range.end);
+        snippet.append(mark);
+        offset = range.end;
+      }
+      snippet.append(item.snippet.text.substring(offset));
+      row.append(title, snippet);
+      list.append(row);
+    }
+    document.getElementById("results").append(list);
+    document.getElementById("showEmpty").style.display = "none";
+  },
+
+  /**
+   * Resolves a captured transcript immediately before opening the existing reader.
+   * Refusals return null. Original parser, I/O and cancellation errors reject.
+   * Closing this frame still settles its parent-owned promise.
+   *
+   * @param {{hit: SearchHit, snippet: {firstMatchText: ?string}}} item - Clicked row.
+   * @param {boolean} [background=false] - Open without selecting the chat tab.
+   * @returns {Promise<?object>} Opened chat tab, or null for a retired/refused hit.
+   */
+  openChatSearchConversation(item, background = false) {
+    const { promise, resolve, reject } = this.rootWin.Promise.withResolvers();
+    this.chatSearchOpenController?.abort();
+    const controller = (this.chatSearchOpenController = new AbortController());
+    const signal = AbortSignal.any([
+      controller.signal,
+      this.mailSearchQueryController.signal,
+      this.tab.mailSearchController.signal,
+    ]);
+    const cancelled = () => reject(signal.reason);
+    signal.addEventListener("abort", cancelled, { once: true });
+    const stop = () => signal.removeEventListener("abort", cancelled);
+    if (signal.aborted) {
+      stop();
+      cancelled();
+      return promise;
+    }
+    // Copy every value before yielding to source or privacy work.
+    const hit = {
+      id: item.hit.id,
+      contentRevision: item.hit.contentRevision,
+      textRevision: item.hit.textRevision,
+    };
+    const searchTerm = item.snippet.firstMatchText;
+    (async () => {
+      const service = await getChatSearchService();
+      signal.throwIfAborted();
+      const result = await service.resolveLog(hit, { signal });
+      signal.throwIfAborted();
+      if (result.status != "ready") {
+        this.showMailSearchError(
+          "facet-view-conversation-stale",
+          new DOMException(
+            "The selected chat transcript is no longer current",
+            "InvalidStateError"
+          )
+        );
+        return null;
+      }
+      const tabmail = this.rootWin.document.getElementById("tabmail");
+      return tabmail.openTab("chat", {
+        convType: "log",
+        nativeChatLog: result,
+        searchTerm,
+        signal,
+        background,
+      });
+    })().then(
+      result => {
+        stop();
+        resolve(result);
+      },
+      error => {
+        stop();
+        reject(error);
+      }
+    );
+    return promise;
   },
 
   /**

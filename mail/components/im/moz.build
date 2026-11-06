@@ -36,5 +36,6 @@ if CONFIG["ENABLE_TESTS"]:
     ]
 
 BROWSER_CHROME_MANIFESTS += [
+    "test/browser/browser-panorama.toml",
     "test/browser/browser.toml",
 ]

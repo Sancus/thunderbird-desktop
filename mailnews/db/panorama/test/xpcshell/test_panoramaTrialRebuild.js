@@ -424,6 +424,22 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       "root-0",
       PathUtils.filename(originalGloda)
     );
+    // Finish native folder policy changes before capturing eligible recovery.
+    const copies = addMimeCopies(root);
+    const missingKey = messageDB.addMessage(
+      copies.folders[0].id,
+      "s716-unavailable@example.invalid",
+      [],
+      123456,
+      "Sender <sender@example.invalid>",
+      "Recipient <recipient@example.invalid>",
+      "",
+      "",
+      "s716metadataonly",
+      0,
+      "",
+      Ci.nsMsgPriority.notSet
+    );
     const mailSidecar = PathUtils.join(work, "mail.sqlite");
     mail = await MailSearchService.open(
       new FileUtils.File(mailSidecar),
@@ -444,6 +460,9 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
     // silently finish the native inventory before the application checkpoint.
     await mail.close();
     mail = null;
+    const recoveryPolicyRevision = messageDB.getSearchState(
+      copies.headers[0].messageKey
+    ).policyRevision;
 
     const expected = [];
     for (const [name, folder] of folders) {
@@ -474,7 +493,6 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       await IOUtils.move(bodyPath, heldPath);
       held.push({ folder, bodyPath, heldPath });
     }
-    const copies = addMimeCopies(root);
     for (const header of copies.headers) {
       expected.push({
         id: String(header.messageKey),
@@ -487,20 +505,6 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         bodyReady: true,
       });
     }
-    const missingKey = messageDB.addMessage(
-      copies.folders[0].id,
-      "s716-unavailable@example.invalid",
-      [],
-      123456,
-      "Sender <sender@example.invalid>",
-      "Recipient <recipient@example.invalid>",
-      "",
-      "",
-      "s716metadataonly",
-      0,
-      "",
-      Ci.nsMsgPriority.notSet
-    );
     expected.push({
       id: String(missingKey),
       folderId: copies.folders[0].id,
@@ -519,6 +523,11 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       Assert.equal(typeof state.contentRevision, "string");
     }
     const chat = await createChatInput(work);
+    Assert.equal(
+      messageDB.getSearchState(copies.headers[0].messageKey).policyRevision,
+      recoveryPolicyRevision,
+      "The fixed corpus must not invalidate captured recovery policy"
+    );
     const sourcePaths = [
       originalGloda,
       backedUp,

@@ -485,6 +485,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.assertIn("oldaggregateneedle", aggregate["payload"]["text"])
 
     def test_trial_rebuild_survives_real_application_restart(self):
+        self.maxDiff = None
         initial = self.snapshot("mailSidecar")
         self.record("marionette-initial", initial)
         history = []
@@ -494,30 +495,82 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             self.assert_progress(progress, mail)
             history.append(progress)
             pending_ids = {r["documentId"] for r in mail["index_jobs"]}
-            completed = {
-                r["documentId"]: r
-                for r in mail["documents"]
-                if r["bodyIndexed"] and r["documentId"] not in pending_ids
+            candidate_identity = self.assert_identity()
+            candidate_native = {row["id"]: row for row in candidate_identity["members"]}
+            candidate_versions = {row["documentId"]: row for row in mail["document_versions"]}
+            delivery_through = max(
+                progress["acceptedThrough"], mail["work_state"][0]["rescanSequence"] or 0
+            )
+            # Native generation is max(latest physical event, policy marker).
+            # A historical event can already carry that current generation.
+            # Its body is not delivery-current until the accepted token covers it.
+            completed = {}
+            for document in mail["documents"]:
+                key = document["documentId"]
+                version = candidate_versions.get(key)
+                state = candidate_native.get(key)
+                if (
+                    document["bodyIndexed"]
+                    and key not in pending_ids
+                    and version is not None
+                    and state is not None
+                    and version["kind"] == "index"
+                    and document["changeSequence"] == version["sequence"]
+                    and state["generation"] <= version["sequence"] <= delivery_through
+                    and all(
+                        document[field] == version[field] == state[field]
+                        for field in ("generation", "policyRevision")
+                    )
+                    and document["contentRevision"] == state["contentRevision"]
+                ):
+                    completed[key] = document
+            unaccepted_ids = {
+                key
+                for key, state in candidate_native.items()
+                if key not in candidate_versions
+                or candidate_versions[key]["sequence"] < state["generation"]
+            }
+            pending_work_ids = {
+                row["documentId"] for row in mail["index_jobs"] if row["status"] == "pending"
+            }
+            unfinished_ids = (unaccepted_ids | pending_work_ids) & self.mail_ids
+            selection = {
+                "batch": batch,
+                "identity": candidate_identity,
+                "mail": mail,
+                "progress": progress,
+                "deliveryThrough": delivery_through,
+                "completedIds": sorted(completed),
+                "unacceptedIds": sorted(unaccepted_ids),
+                "pendingWorkIds": sorted(pending_work_ids),
+                "unfinishedIds": sorted(unfinished_ids),
             }
             remaining = (
                 progress["pending"]
                 or progress["acceptedThrough"] < progress["sourceWatermark"]
                 or mail["work_state"][0]["rescanSequence"] is not None
             )
-            if completed and remaining:
+            if completed and remaining and unfinished_ids:
                 break
         else:
+            self.record("marionette-checkpoint-selection-unsettled", selection)
             self.record("marionette-checkpoint-unsettled", history)
             self.fail("The fixed corpus never produced a completed-and-unfinished checkpoint")
+        self.record("marionette-checkpoint-selection", selection)
+        self.assertTrue(completed)
+        self.assertTrue(unfinished_ids - set(completed))
         self.assertTrue(set(completed).issubset(self.mail_ids))
         chat = self.snapshot("chatSidecar")
         before = self.assert_identity()
+        self.assertEqual(before["members"], candidate_identity["members"])
         native = {row["id"]: row for row in before["members"]}
         versions = {row["documentId"]: row for row in mail["document_versions"]}
         self.assertEqual(set(native), self.mail_ids)
         for key, document in completed.items():
             self.assertEqual(versions[key]["kind"], "index")
             self.assertEqual(document["changeSequence"], versions[key]["sequence"])
+            self.assertGreaterEqual(versions[key]["sequence"], native[key]["generation"])
+            self.assertLessEqual(versions[key]["sequence"], delivery_through)
             for field in ("generation", "policyRevision"):
                 self.assertEqual(document[field], versions[key][field])
                 self.assertEqual(document[field], native[key][field])
@@ -558,6 +611,17 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             current_rows = {r["documentId"]: r for r in current["documents"]}
             current_versions = {r["documentId"]: r for r in current["document_versions"]}
             for key, document in completed.items():
+                if current_rows.get(key) != document or current_versions.get(key) != versions[key]:
+                    self.record(
+                        f"marionette-resume-mismatch-{batch:03d}-{key}",
+                        {
+                            "id": key,
+                            "checkpoint": checkpoint,
+                            "restartedIdentity": after,
+                            "progress": history,
+                            "mail": current,
+                        },
+                    )
                 self.assertEqual(
                     current_rows[key],
                     document,

@@ -440,6 +440,28 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       "",
       Ci.nsMsgPriority.notSet
     );
+    // The normal app factory opens this separate sidecar on first startup.
+    // Prepare its real preference fingerprint before capturing recovery so that
+    // an unchanged startup cannot journal a later global policy revision.
+    const startupMailSidecar = PathUtils.join(
+      profile.path,
+      `panorama-search-${database.sourceId}.sqlite`
+    );
+    Assert.ok(!(await IOUtils.exists(startupMailSidecar)));
+    const startupMail = await MailSearchService.open(
+      new FileUtils.File(startupMailSidecar),
+      database.sourceId,
+      messageDB
+    );
+    try {
+      Assert.equal(
+        await startupMail.getText(String(missingKey)),
+        null,
+        "Preparing the startup fingerprint must not consume the trial inventory"
+      );
+    } finally {
+      await startupMail.close();
+    }
     const mailSidecar = PathUtils.join(work, "mail.sqlite");
     mail = await MailSearchService.open(
       new FileUtils.File(mailSidecar),
@@ -463,6 +485,9 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
     const recoveryPolicyRevision = messageDB.getSearchState(
       copies.headers[0].messageKey
     ).policyRevision;
+
+    Assert.equal(typeof recoveryPolicyRevision, "string");
+    Assert.ok(/^[1-9][0-9]*$/.test(recoveryPolicyRevision));
 
     const heldRoot = PathUtils.join(work, "held-original-streams");
     Assert.ok(!(await IOUtils.exists(heldRoot)));
@@ -567,6 +592,8 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
       sourceId: database.sourceId,
       work,
       mailSidecar,
+      startupMailSidecar,
+      recoveryPolicyRevision,
       chatSidecar: chat.chatSidecar,
       journalPath,
       backupManifest: backup.path,

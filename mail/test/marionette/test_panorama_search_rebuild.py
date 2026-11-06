@@ -109,6 +109,16 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
     def validate_fixture(self):
         """Bind fixed expected inputs before opening either disposable writer."""
         f = self.fixture
+        self.assertIs(type(f["recoveryPolicyRevision"]), str)
+        self.assertRegex(f["recoveryPolicyRevision"], r"\A[1-9][0-9]*\Z")
+        startup_sidecar = Path(f["startupMailSidecar"])
+        self.assertEqual(startup_sidecar, self.profile / f"panorama-search-{f['sourceId']}.sqlite")
+        self.assertEqual(startup_sidecar, self.owned_path(f["startupMailSidecar"]))
+        self.assertFalse(startup_sidecar.is_symlink())
+        self.assertTrue(startup_sidecar.is_file())
+        self.assertNotIn(
+            startup_sidecar, {Path(row["path"]).resolve() for row in f["sourceHashes"]}
+        )
         self.assertEqual(self.owned_path(f["work"]), self.work)
         for key, name in [("mailSidecar", "mail.sqlite"), ("chatSidecar", "chat.sqlite")]:
             self.assertEqual(self.owned_path(f[key]), self.work / name)
@@ -266,6 +276,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
             raw_policy = member["rawPolicyRevision"]
             policy = member["policyRevision"]
             self.assertIs(type(raw_policy), str)
+            self.assertEqual(raw_policy, self.fixture["recoveryPolicyRevision"])
             self.assertIs(type(policy), int)
             self.assertGreaterEqual(policy, 0)
             self.assertLessEqual(policy, 2**53 - 1)
@@ -315,12 +326,12 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                     chat = await ChatSearchProvider.open(new FileUtils.File(f.chatSidecar));
                     if (phase === 'update') {
                         // No query/rebuild/default factory/start while checkpointing.
-                        value = await mail.update({limit: 1});
+                        value = await mail.update({limit: 2});
                     } else if (phase === 'final') {
                         await mail.rebuild();
                         let progress;
                         for (let batch = 0; batch < 200; batch++) {
-                            progress = await mail.update({limit: 1});
+                            progress = await mail.update({limit: 2});
                             if (!progress.rebuilding && !progress.pending &&
                                 progress.acceptedThrough === progress.sourceWatermark) {
                                 break;

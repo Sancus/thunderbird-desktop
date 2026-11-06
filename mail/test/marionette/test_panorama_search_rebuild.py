@@ -9,6 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 from marionette_harness import MarionetteTestCase
+from mozprofile import Profile
 
 
 class TestPanoramaSearchRebuild(MarionetteTestCase):
@@ -19,21 +20,79 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.instance_prefs = self.marionette.instance.prefs
         self.capabilities = dict(self.marionette.requested_capabilities)
+        self.initial_profile = self.marionette.instance.profile
+        self.initial_profile_restore = self.initial_profile.restore
+        self.trial_profile = None
+        self.held = []
+        self.saved_prefs = []
+        # --testvars names the original fixture, not a --profile clone.
+        self.fixture = dict(self.testvars)
+        self.profile = Path(self.fixture["profile"]).resolve()
+        self.work = self.profile / "panorama-trial-rebuild"
+        self.assertEqual(
+            self.fixture,
+            json.loads((self.work / "fixture.json").read_text(encoding="utf-8")),
+            "The declared input must be the actual retained fixture",
+        )
+        self.assertEqual(self.fixture["version"], 1)
+        f = self.fixture
+        allowed_prefs = {
+            "mail.panorama.enabled",
+            "mailnews.database.global.indexer.enabled",
+            "purple.logging.log_ims",
+            "chat.logging.cleanup",
+            "security.nocertdb",
+        }
+        self.assertEqual({p["name"] for p in f["savedPrefs"]}, allowed_prefs)
+        for pref in f["savedPrefs"]:
+            self.assertIsInstance(pref["hadValue"], bool)
+            self.assertIsInstance(pref["value"], bool)
+            self.saved_prefs.append(pref)
+        self.assertNotEqual(
+            Path(self.initial_profile.profile).resolve(),
+            self.profile,
+            "The disposable runner profile is separate from the retained corpus",
+        )
+        self.stop()
+        # The public setter cleans its old Profile. Keep that disposable profile
+        # available for restoration, and never let Profile cleanup remove inputs.
+        self.initial_profile.restore = False
+        self.marionette.instance.prefs = {
+            **(self.instance_prefs or {}),
+            "mail.panorama.enabled": True,
+            "mailnews.database.global.indexer.enabled": True,
+            "purple.logging.log_ims": True,
+            "chat.logging.cleanup": False,
+            "security.nocertdb": True,
+        }
+        self.trial_profile = Profile(
+            profile=str(self.profile),
+            restore=False,
+            **self.marionette.instance.profile_args,
+        )
+        self.assertFalse(self.trial_profile.create_new)
+        self.marionette.instance.profile = self.trial_profile
+        self.assertIs(self.marionette.instance.profile, self.trial_profile)
+        self.marionette.start_session(capabilities=self.capabilities)
+        self.marionette.set_context(self.marionette.CONTEXT_CHROME)
         self.profile = Path(
             self.marionette.execute_script("return Services.dirsvc.get('ProfD', Ci.nsIFile).path;")
         ).resolve()
-        self.work = self.profile / "panorama-trial-rebuild"
-        self.fixture = json.loads((self.work / "fixture.json").read_text(encoding="utf-8"))
-        self.assertEqual(self.fixture["version"], 1)
         self.assertEqual(Path(self.fixture["profile"]).resolve(), self.profile)
-        self.held = []
-        self.saved_prefs = []
-        self.addCleanup(self.restore_fixture)
-        self.validate_fixture()
+        self.work = self.profile / "panorama-trial-rebuild"
         self.assert_identity()
+        self.validate_fixture()
         self.assert_source_hashes()
         self.journal_hash = self.digest(Path(self.fixture["journalPath"]))
         self.assert_receipt_keys()
+
+    def cleanTest(self):
+        """Use Marionette's actual end hook, including a failed setUp."""
+        try:
+            if hasattr(self, "initial_profile"):
+                self.restore_fixture()
+        finally:
+            super().cleanTest()
 
     @staticmethod
     def digest(path):
@@ -52,7 +111,6 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.assertEqual(self.owned_path(f["work"]), self.work)
         for key, name in [("mailSidecar", "mail.sqlite"), ("chatSidecar", "chat.sqlite")]:
             self.assertEqual(self.owned_path(f[key]), self.work / name)
-        self.owned_path(f["journalPath"])
         for folder in f["folders"]:
             body = self.owned_path(folder["bodyPath"])
             if folder["heldPath"] is not None:
@@ -63,18 +121,6 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                 self.held.append((body, held, self.digest(held)))
         self.assertEqual(len(f["folders"]), 4)
         self.assertEqual(len(self.held), 2)
-        allowed_prefs = {
-            "mail.panorama.enabled",
-            "mailnews.database.global.indexer.enabled",
-            "purple.logging.log_ims",
-            "chat.logging.cleanup",
-            "security.nocertdb",
-        }
-        self.assertEqual({p["name"] for p in f["savedPrefs"]}, allowed_prefs)
-        for pref in f["savedPrefs"]:
-            self.assertIsInstance(pref["hadValue"], bool)
-            self.assertIsInstance(pref["value"], bool)
-            self.saved_prefs.append(pref)
         self.assertEqual(len(f["mail"]), 7)
         self.mail_ids = {row["id"] for row in f["mail"]}
         self.assertEqual(len(self.mail_ids), 7)
@@ -107,6 +153,13 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         backup = Path(f["backupManifest"]).resolve()
         self.assertTrue(backup.is_relative_to(self.profile.parent))
         self.assertFalse(backup.is_relative_to(self.profile))
+        journal = Path(f["journalPath"]).resolve()
+        self.assertEqual(journal, backup.parent.parent / "journal.json")
+        self.assertEqual(backup.parent.parent.parent, self.profile.parent)
+        self.assertTrue(journal.is_relative_to(self.profile.parent))
+        self.assertFalse(journal.is_relative_to(self.profile))
+        self.assertFalse(journal.is_relative_to(backup.parent))
+        self.assertTrue(journal.is_file())
         self.assertTrue(Path(f["backedUp"]).resolve().is_relative_to(backup.parent))
         for row in f["sourceHashes"]:
             path = Path(row["path"]).resolve()
@@ -145,8 +198,16 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
     def assert_identity(self):
         actual = self.marionette.execute_script(
             """
+            const selected = Services.dirsvc.get('ProfD', Ci.nsIFile);
+            selected.normalize();
+            if (selected.path !== arguments[1]) {
+                throw new Error('The original retained profile was not selected');
+            }
             const core = Cc['@mozilla.org/mailnews/database-core;1']
                 .getService(Ci.nsIDatabaseCore);
+            if (core.sourceId !== arguments[2]) {
+                throw new Error('The retained native incarnation changed');
+            }
             return {profile: Services.dirsvc.get('ProfD', Ci.nsIFile).path,
                     pid: Services.appinfo.processID, sourceId: core.sourceId,
                     native: Services.prefs.getBoolPref('mail.panorama.enabled'),
@@ -157,7 +218,7 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
                             contentRevision: state.contentRevision, policyRevision: state.policyRevision};
                     })};
         """,
-            script_args=[self.fixture["mail"]],
+            script_args=[self.fixture["mail"], str(self.profile), self.fixture["sourceId"]],
         )
         self.assertEqual(Path(actual["profile"]).resolve(), self.profile)
         self.assertEqual(actual["pid"], self.marionette.process_id)
@@ -515,31 +576,45 @@ class TestPanoramaSearchRebuild(MarionetteTestCase):
         self.assert_receipt_keys()
 
     def restore_fixture(self):
-        """Restore owned streams/prefs after normal writer exit; retain evidence."""
+        """Close writers, restore retained streams, then restore the runner."""
+        instance = self.marionette.instance
         try:
             if not self.marionette.session:
                 self.marionette.start_session(capabilities=self.capabilities)
             self.marionette.set_context(self.marionette.CONTEXT_CHROME)
-            for pref in self.saved_prefs:
-                if pref["hadValue"]:
-                    self.marionette.set_pref(pref["name"], pref["value"])
-                else:
-                    self.marionette.clear_pref(pref["name"])
+            if instance.profile is self.trial_profile:
+                for pref in self.saved_prefs:
+                    if pref["hadValue"]:
+                        self.marionette.set_pref(pref["name"], pref["value"])
+                    else:
+                        self.marionette.clear_pref(pref["name"])
         finally:
-            self.marionette.instance.prefs = self.instance_prefs
-            if self.marionette.session:
-                self.stop()
-            self.assertFalse(
-                self.marionette.instance.runner.is_running(),
-                "Owned streams may only be restored after normal writer exit",
-            )
-            for body, held, expected in self.held:
-                if held.exists():
-                    self.assertFalse(
-                        body.exists(), "Cleanup must never overwrite an existing source"
-                    )
-                    self.assertEqual(self.digest(held), expected)
-                    held.rename(body)
-                    self.assertEqual(self.digest(body), expected)
+            try:
+                if self.marionette.session:
+                    self.stop()
+                self.assertFalse(
+                    self.marionette.instance.runner.is_running(),
+                    "Owned streams may only be restored after normal writer exit",
+                )
+                for body, held, expected in self.held:
+                    if held.exists():
+                        self.assertFalse(
+                            body.exists(), "Cleanup must never overwrite an existing source"
+                        )
+                        self.assertEqual(self.digest(held), expected)
+                        held.rename(body)
+                        self.assertEqual(self.digest(body), expected)
+                if self.trial_profile is not None:
+                    # Remove only this Profile object's required-pref markers.
+                    # restore=False keeps the original native storage and receipts.
+                    self.trial_profile.clean_preferences()
+            finally:
+                instance.prefs = self.instance_prefs
+                try:
+                    self.assertFalse(instance.runner.is_running())
+                    instance.profile = self.initial_profile
+                finally:
+                    self.initial_profile.restore = self.initial_profile_restore
+            self.assertIs(instance.profile, self.initial_profile)
             self.marionette.start_session(capabilities=self.capabilities)
             self.marionette.set_context(self.marionette.CONTEXT_CHROME)

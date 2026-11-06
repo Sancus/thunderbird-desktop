@@ -399,7 +399,7 @@ add_task(async function test_createRetainedNativeRebuildTrial() {
         destinationFolderId: folder.id,
       });
     }
-    const journalPath = PathUtils.join(work, "journal.json");
+    const journalPath = PathUtils.join(backupRoot, "journal.json");
     journal = await MigrationJournal.create(journalPath, {
       profilePath: lock.directory.path,
       mailPaths: [],

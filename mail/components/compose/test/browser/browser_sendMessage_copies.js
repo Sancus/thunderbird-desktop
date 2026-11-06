@@ -275,15 +275,29 @@ async function removeFolder(folder) {
   info(`removing ${folder.URI}`);
   const rootFolder = folder.rootFolder;
   if (folder.incomingServerType == "imap") {
-    const deletedPromise = PromiseTestUtils.promiseFolderDeleted(folder);
+    const parent = folder.parent;
+    const name = folder.name;
     const promptPromise = BrowserTestUtils.promiseAlertDialog("accept");
     info("Folder removal: calling deleteSelf");
     folder.deleteSelf(null);
     info("Folder removal: deleteSelf returned");
     await promptPromise;
     info("Folder removal: confirmation accepted");
-    await deletedPromise;
-    info("Folder removal: deletion notification received");
+    await TestUtils.waitForCondition(
+      () =>
+        !parent.containsChildNamed(name) &&
+        rootFolder
+          .getFolderWithFlags(Ci.nsMsgFolderFlags.Trash)
+          .containsChildNamed(name),
+      "waiting for the folder to move to Trash"
+    );
+    await TestUtils.waitForCondition(
+      () =>
+        rootFolder.server.QueryInterface(Ci.nsIImapIncomingServer)
+          .allConnectionsIdle,
+      "waiting for the folder move URL to finish"
+    );
+    info("Folder removal: move to Trash completed");
   } else {
     folder.deleteSelf(null);
   }

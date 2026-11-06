@@ -58,6 +58,20 @@ async function setupTest() {
   setupIMAPPump();
   IMAPPump.server.setDebugLevel(nsMailServer.debugAll);
   if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    const proto = IMAP_RFC3501_handler.prototype;
+    const originalBody = proto._FETCH_BODY;
+    proto._FETCH_BODY = function (message, query) {
+      const response = originalBody.call(this, message, query);
+      if (query == "BODY[]" || query == "BODY.PEEK[]") {
+        // The full-body early return does not set this flag. Keep the real
+        // LF bytes and declared literal size instead of expanding them.
+        this.sendingLiteral = true;
+      }
+      return response;
+    };
+    registerCleanupFunction(() => {
+      proto._FETCH_BODY = originalBody;
+    });
     const discovered = new PromiseTestUtils.PromiseUrlListener();
     MailServices.imap.discoverAllFolders(
       IMAPPump.incomingServer.rootFolder,

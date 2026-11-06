@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include <cstdlib>
 #include <functional>
 #include <utility>
 
@@ -22,6 +23,7 @@
 #include "mozIStorageValueArray.h"
 #include "mozStorageHelper.h"
 #include "mozilla/AutoRestore.h"
+#include "mozilla/GenericFactory.h"
 #include "mozilla/StaticPrefs_mail.h"
 #include "mozilla/ResultExtensions.h"
 #include "mozilla/ScopeExit.h"
@@ -32,6 +34,8 @@
 #include "nsComponentManagerUtils.h"
 #include "nsDirectoryServiceDefs.h"
 #include "nsDirectoryServiceUtils.h"
+#include "nsIComponentRegistrar.h"
+#include "nsID.h"
 #include "nsIEventTarget.h"
 #include "nsIFile.h"
 #include "nsIInputStream.h"
@@ -2898,6 +2902,41 @@ class DeliveryCoreReferences : public testing::Test {
     bool same;
     ASSERT_EQ(NS_OK, mFile->Equals(actualFile, &same));
     ASSERT_TRUE(same);
+    // AccountManager::Init normally selects this service at application
+    // startup. A cached manager does not repeat that registration for our
+    // per-case native core; AddSubfolder/GetFlags would still open Mork.
+    nsCOMPtr<nsIComponentRegistrar> registrar;
+    ASSERT_EQ(NS_OK, NS_GetComponentRegistrar(getter_AddRefs(registrar)));
+    constexpr auto contract = "@mozilla.org/msgDatabase/msgDBService;1";
+    nsCID* previous = nullptr;
+    ASSERT_EQ(NS_OK, registrar->ContractIDToCID(contract, &previous));
+    ASSERT_TRUE(previous);
+    const nsCID originalCID = *previous;
+    std::free(previous);
+    const nsCID nativeCID = nsID::GenerateUUID();
+    RefPtr<GenericFactory> nativeFactory =
+        new GenericFactory([](const nsIID& iid, void** result) -> nsresult {
+          RefPtr<DatabaseCore> core = DatabaseCore::GetInstanceForService();
+          return core->QueryInterface(iid, result);
+        });
+    ASSERT_EQ(NS_OK, registrar->RegisterFactory(nativeCID, "", contract,
+                                                nativeFactory));
+    auto restoreService = MakeScopeExit([&] {
+      // Restore the original entry without touching its factory/service/cache.
+      EXPECT_EQ(NS_OK,
+                registrar->RegisterFactory(originalCID, "", contract, nullptr));
+      EXPECT_EQ(NS_OK, registrar->UnregisterFactory(nativeCID, nativeFactory));
+      nsCID* restored = nullptr;
+      EXPECT_EQ(NS_OK, registrar->ContractIDToCID(contract, &restored));
+      if (restored) {
+        EXPECT_TRUE(restored->Equals(originalCID));
+        std::free(restored);
+      } else {
+        ADD_FAILURE() << "Database service contract was not restored";
+      }
+    });
+    nsCOMPtr<nsIDatabaseCore> selected = do_GetService(contract);
+    ASSERT_EQ(static_cast<nsIDatabaseCore*>(mCore.get()), selected.get());
     uint64_t root;
     ASSERT_EQ(NS_OK,
               mCore->FolderDB().InsertRoot("delivery-references"_ns, &root));

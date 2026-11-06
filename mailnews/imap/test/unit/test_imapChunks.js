@@ -741,7 +741,7 @@ add_task(async function test_copyRejectsConflictingEarlyCopyUid() {
 
 add_task(async function test_onlineCopyOwnsEveryLateChunkMapping() {
   if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) return;
-  const { source, originals, text, readBody } = gCopyChunkSource;
+  const { source, originals, readBody } = gCopyChunkSource;
   const name = "online-late-chunk-mappings";
   const remote = gChunkServer.daemon.createMailbox(name, {
     subscribed: true,
@@ -788,20 +788,22 @@ add_task(async function test_onlineCopyOwnsEveryLateChunkMapping() {
     setMessageKey(key) {
       keys.push(key);
       const header = target.msgDatabase.getMsgHdrForKey(key);
-      const sourceUid = originals.find(
+      const original = originals.find(
         item => item.header.messageId == header.messageId
-      ).uid;
+      );
       Assert.equal(
         header.getUint32Property("uidOnServer"),
-        actual.get(sourceUid)
+        actual.get(original.uid)
       );
-      Assert.notEqual(key, actual.get(sourceUid));
+      Assert.notEqual(key, actual.get(original.uid));
       const input = target.getMsgInputStream(header);
       try {
         let bytes = "";
         while (input.available())
           bytes += NetUtil.readInputStreamToString(input, input.available());
-        Assert.equal(bytes, text(sourceUid));
+        // The provider owns its exact stored representation, including its
+        // status headers. Compare the captured physical source bytes.
+        Assert.equal(bytes, original.bytes);
       } finally {
         input.close();
       }

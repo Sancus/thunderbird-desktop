@@ -266,7 +266,9 @@ async function checkOnlineAppendIdentity(mode) {
       Assert.equal(folder.getTotalMessages(false), 1);
       Assert.equal(folder.getNumUnread(false), 1);
       const refreshed = new PromiseTestUtils.PromiseUrlListener();
-      folder.updateFolderWithListener(null, refreshed);
+      // Draft completion already starts a folder update. Queue an ordinary
+      // SELECT with its own URL listener instead of coalescing into that update.
+      MailServices.imap.selectFolder(folder, refreshed, null);
       await refreshed.promise;
       Assert.equal(folder.getTotalMessages(false), 1);
       Assert.equal(folder.getNumUnread(false), 1);

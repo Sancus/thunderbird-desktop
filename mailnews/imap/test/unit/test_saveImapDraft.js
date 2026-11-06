@@ -357,6 +357,193 @@ function readOnlineIdentityBody(folder, token) {
   }
 }
 
+add_task(async function test_fileAppendClassifiesBeforeCompletionOnce() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const name = "classified-file-append";
+  const mailbox = IMAPPump.daemon.createMailbox(name, {
+    subscribed: true,
+    uidvalidity: 9567,
+  });
+  mailbox.uidnext = 91007;
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    IMAPPump.incomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const folder = IMAPPump.incomingServer.rootFolder
+    .getChildNamed(name)
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  folder.updateFolderWithListener(null, selected);
+  await selected.promise;
+  const raw = [
+    "From: source@example.invalid",
+    "To: destination@example.invalid",
+    "Message-ID: <classified-file-append@example.invalid>",
+    "Subject: Confirmed file APPEND classification",
+    "Content-Type: text/plain; charset=us-ascii",
+    "",
+    "Keep the genuine provider bytes through failed APPEND and retry.",
+    "",
+  ].join("\r\n");
+  const file = do_get_profile();
+  file.append(name + ".eml");
+  await IOUtils.writeUTF8(file.path, raw);
+  const proto = IMAP_RFC3501_handler.prototype;
+  const saved = { APPEND: proto.APPEND, CAPABILITY: proto.CAPABILITY };
+  let rejectAppend = true;
+  let appends = 0;
+  const events = [];
+  const keys = [];
+  let addedHeader = null;
+  let classifiedHeader = null;
+  let completions = 0;
+  let completionStatus;
+  const notifications = {
+    msgAdded(header) {
+      if (header.folder.URI == folder.URI) {
+        events.push("added");
+        addedHeader = header;
+      }
+    },
+    msgsClassified(headers, junkProcessed, traitProcessed) {
+      for (const header of headers) {
+        if (header.folder.URI != folder.URI) {
+          continue;
+        }
+        events.push("classified");
+        classifiedHeader = header;
+        Assert.equal(header, addedHeader, "Classify the actual added header");
+        Assert.equal(header.messageKey, keys[0]);
+        Assert.equal(
+          folder.msgDatabase.getMsgHdrForKey(header.messageKey),
+          header,
+          "Synchronous notification reads the same live physical header"
+        );
+        Assert.equal(header.getUint32Property("uidOnServer"), 91007);
+        Assert.equal(readOnlineIdentityBody(folder, header.storeToken), raw);
+        Assert.equal(junkProcessed, false);
+        Assert.equal(traitProcessed, false);
+      }
+    },
+  };
+  MailServices.mfn.addListener(
+    notifications,
+    MailServices.mfn.msgAdded | MailServices.mfn.msgsClassified
+  );
+  try {
+    proto.CAPABILITY = function (...args) {
+      return saved.CAPABILITY.apply(this, args).replace(
+        "IMAP4rev1",
+        "IMAP4rev1 UIDPLUS"
+      );
+    };
+    proto.APPEND = function (args) {
+      if (args[0] != name) {
+        return saved.APPEND.call(this, args);
+      }
+      appends++;
+      if (rejectAppend) {
+        return "NO actual file APPEND rejection";
+      }
+      Assert.equal(saved.APPEND.call(this, args), "OK APPEND complete");
+      Assert.equal(mailbox._messages.length, 1);
+      Assert.equal(mailbox._messages[0].getText(), raw);
+      return "OK [APPENDUID 9567 91007] APPEND complete";
+    };
+    for (const reject of [true, false]) {
+      rejectAppend = reject;
+      events.length = 0;
+      keys.length = 0;
+      completions = 0;
+      completionStatus = undefined;
+      const listener = new PromiseTestUtils.PromiseCopyListener({
+        setMessageKey(key) {
+          events.push("key");
+          keys.push(key);
+        },
+        onStopCopy(status) {
+          completions++;
+          completionStatus = status;
+          events.push("stop");
+          Assert.deepEqual(
+            events,
+            reject ? ["stop"] : ["key", "added", "classified", "stop"],
+            "Real classification precedes the owning copy terminal exactly once"
+          );
+        },
+      });
+      IMAPPump.incomingServer.closeCachedConnections();
+      MailServices.copy.copyFileMessage(
+        file,
+        folder,
+        null,
+        false,
+        0,
+        "",
+        listener,
+        null
+      );
+      const status = await listener.promise.then(
+        () => Cr.NS_OK,
+        error => Number(error.message)
+      );
+      Assert.equal(completions, 1);
+      Assert.equal(
+        completionStatus,
+        status,
+        "Preserve the actual terminal status"
+      );
+      Assert.equal(await IOUtils.readUTF8(file.path), raw);
+      if (reject) {
+        Assert.notEqual(status, Cr.NS_OK);
+        Assert.deepEqual(keys, []);
+        Assert.equal(addedHeader, null);
+        Assert.equal(classifiedHeader, null);
+        Assert.equal(folder.getTotalMessages(false), 0);
+        Assert.equal([...folder.messages].length, 0);
+        Assert.equal(mailbox._messages.length, 0);
+        Assert.equal(appends, 1);
+        continue;
+      }
+      Assert.equal(status, Cr.NS_OK);
+      Assert.equal(keys.length, 1);
+      Assert.notEqual(keys[0], 91007, "Return the physical key, not the UID");
+      Assert.equal(classifiedHeader, addedHeader);
+      Assert.equal(classifiedHeader.messageKey, keys[0]);
+      Assert.equal(classifiedHeader.folder, folder);
+      Assert.equal(
+        classifiedHeader.messageId,
+        "classified-file-append@example.invalid"
+      );
+      Assert.equal(
+        readOnlineIdentityBody(folder, classifiedHeader.storeToken),
+        raw
+      );
+      Assert.equal(folder.getTotalMessages(false), 1);
+      Assert.equal(mailbox._messages.length, 1);
+      Assert.equal(appends, 2, "Only the explicit retry sends another APPEND");
+      const refreshed = new PromiseTestUtils.PromiseUrlListener();
+      MailServices.imap.selectFolder(folder, refreshed, null);
+      await refreshed.promise;
+      Assert.deepEqual(events, ["key", "added", "classified", "stop"]);
+      Assert.equal(completions, 1);
+      const current = [...folder.messages];
+      Assert.equal(current.length, 1);
+      Assert.equal(current[0].messageKey, keys[0]);
+      Assert.equal(readOnlineIdentityBody(folder, current[0].storeToken), raw);
+    }
+  } finally {
+    MailServices.mfn.removeListener(notifications);
+    Object.assign(proto, saved);
+    IMAPPump.incomingServer.closeCachedConnections();
+  }
+});
+
 add_task(function endTest() {
   teardownIMAPPump();
 });

@@ -161,12 +161,14 @@ add_task(async function test_overlapAndMissingRootsFailWithoutCompletion() {
     () => createMigrationBackupAtStartup(profile, [root], backup),
     /contains the profile/
   );
-  Assert.throws(() =>
-    createMigrationBackupAtStartup(
-      profile,
-      [PathUtils.join(root, "missing")],
-      backup
-    )
+  Assert.throws(
+    () =>
+      createMigrationBackupAtStartup(
+        profile,
+        [PathUtils.join(root, "missing")],
+        backup
+      ),
+    /NS_ERROR_FILE_NOT_FOUND/
   );
   Assert.ok(!(await IOUtils.exists(backup)));
 });

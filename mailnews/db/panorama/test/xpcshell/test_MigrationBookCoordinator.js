@@ -1367,7 +1367,13 @@ async function readPublishedBookInChild(input, published) {
     ])
   );
   const code = `
+    let finished = false;
+    let exitCode = 1;
+    (async () => {
     let held;
+    let manager;
+    let firstError;
+    let result;
     try {
       const { FileUtils } = ChromeUtils.importESModule("resource://gre/modules/FileUtils.sys.mjs");
       const root = new FileUtils.File(${JSON.stringify(input.profilePath)});
@@ -1384,25 +1390,63 @@ async function readPublishedBookInChild(input, published) {
       Services.prefs.readUserPrefsFromFile(prefs);
       Services.prefs.setBoolPref("security.nocertdb", true);
       const { MailServices } = ChromeUtils.importESModule("resource:///modules/MailServices.sys.mjs");
-      const directory = MailServices.ab.getDirectoryFromUID(${JSON.stringify(published.bookUID)});
+      manager = MailServices.ab;
+      const directory = manager.getDirectoryFromUID(${JSON.stringify(published.bookUID)});
       if (!directory) { throw new Error("Persisted public book is absent"); }
       const card = Array.from(directory.childCards).find(value => !value.isMailList);
-      const result = {
+      result = {
         bookUID: directory.UID, uri: directory.URI, dirPrefId: directory.dirPrefId,
         card: [card.UID, card.displayName, card.primaryEmail],
         lists: Array.from(directory.childNodes, list => [list.UID, list.dirName,
           Array.from(list.childCards, member => member.UID)]),
       };
-      print("BOOK-PUBLICATION-REOPEN " + JSON.stringify(result));
-      held.unlock(); held = null;
-      quit(0);
     } catch (error) {
-      print("BOOK-PUBLICATION-REOPEN-ERROR " + JSON.stringify({
-        message: String(error), result: error.result, stack: error.stack,
-      }));
-      held?.unlock();
-      quit(1);
+      firstError = error;
+    } finally {
+      if (manager) {
+        try {
+          const reloaded = new Promise(resolve => {
+            const observe = () => {
+              Services.obs.removeObserver(observe, "addrbook-reloaded");
+              resolve();
+            };
+            Services.obs.addObserver(observe, "addrbook-reloaded");
+          });
+          Services.obs.notifyObservers(null, "addrbook-reload");
+          await reloaded;
+        } catch (error) {
+          if (firstError) {
+            print("BOOK-PUBLICATION-CLEANUP-ERROR " + error);
+          } else {
+            firstError = error;
+          }
+        }
+      }
+      try {
+        held?.unlock();
+      } catch (error) {
+        if (firstError) {
+          print("BOOK-PUBLICATION-UNLOCK-ERROR " + error);
+        } else {
+          firstError = error;
+        }
+      }
     }
+    if (firstError) {
+      print("BOOK-PUBLICATION-REOPEN-ERROR " + JSON.stringify({
+        message: String(firstError), result: firstError.result,
+        stack: firstError.stack,
+      }));
+    } else {
+      print("BOOK-PUBLICATION-REOPEN " + JSON.stringify(result));
+      exitCode = 0;
+    }
+    })().then(() => { finished = true; }, error => {
+      print("BOOK-PUBLICATION-REOPEN-ERROR " + error);
+      finished = true;
+    });
+    Services.tm.spinEventLoopUntil("TestMigrationBook:PublicReopen", () => finished);
+    quit(exitCode);
   `;
   let child;
   let output = "";

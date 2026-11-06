@@ -105,8 +105,29 @@ add_task(async function saveDraft() {
   );
   const progressListener = new WebProgressListener();
   progress.registerListener(progressListener);
-  msgCompose.sendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, "", progress);
-  await progressListener.promise;
+  const { promise: saved, resolve } = Promise.withResolvers();
+  const stateListener = {
+    NotifyComposeFieldsReady() {},
+    NotifyComposeBodyReady() {},
+    SaveInFolderDone() {},
+    ComposeProcessDone(status) {
+      resolve(status);
+    },
+    QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+  };
+  msgCompose.RegisterStateListener(stateListener);
+  try {
+    msgCompose.sendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, "", progress);
+    await progressListener.promise;
+    Assert.equal(
+      await saved,
+      Cr.NS_OK,
+      "The draft copy/save completed successfully"
+    );
+  } finally {
+    msgCompose.UnregisterStateListener(stateListener);
+    progress.unregisterListener(progressListener);
+  }
   // Verify that message is not on the server yet.
   Assert.equal(IMAPPump.daemon.getMailbox("Drafts")._messages.length, 0);
 });

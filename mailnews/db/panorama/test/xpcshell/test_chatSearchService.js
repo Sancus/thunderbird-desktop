@@ -498,8 +498,20 @@ add_task(
     Assert.equal(resolved.contentRevision, hit.contentRevision);
     Assert.equal(resolved.textRevision, hit.textRevision);
     Assert.equal(snippet.firstMatchText, "Café");
+    const messages = resolved.conversation.getMessages();
+    Assert.equal(
+      messages.length,
+      2,
+      "One session header and the selected body"
+    );
+    Assert.equal(messages[0].who, "sessionstart");
+    Assert.equal(messages[0].message, "");
+    Assert.ok(messages[0].noLog);
+    Assert.ok(messages[0].notification);
     Assert.deepEqual(
-      resolved.conversation.getMessages().map(message => message.message),
+      messages
+        .filter(message => !message.noLog)
+        .map(message => message.message),
       ["é 😀 Café nativereadermatchneedle"]
     );
     await f.service.close();

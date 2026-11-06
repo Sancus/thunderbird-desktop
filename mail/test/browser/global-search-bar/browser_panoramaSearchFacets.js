@@ -762,6 +762,71 @@ add_task(async function test_openFacetIdentityChangesRecomputeOwnAddresses() {
   }
 });
 
+add_task(async function test_chatQueryFailureKeepsHealthyNativeMailResults() {
+  const { tab, context } = await openNativeFacets(fixture.term);
+  registerCleanupFunction(() => {
+    if (tabmail.tabInfo.includes(tab)) {
+      tabmail.closeTab(tab);
+    }
+  });
+  const win = Cu.waiveXrays(tab.browser.contentWindow);
+  const original = win.findChatSearchResults;
+  const originalReportError = win.console.error;
+  const reportedErrors = [];
+  const failure = new Error("The chat query failed independently of mail");
+  let chatQueries = 0;
+  await SpecialPowers.pushPrefEnv({ set: [["mail.chat.enabled", true]] });
+  win.findChatSearchResults = async (_text, { signal }) => {
+    signal.throwIfAborted();
+    chatQueries++;
+    throw failure;
+  };
+  win.console.error = (...args) => reportedErrors.push(args);
+  try {
+    for (let query = 0; query < 2; query++) {
+      const result = await context.loadMailSearch();
+      Assert.ok(result, "Healthy mail settles despite the same chat failure");
+      Assert.deepEqual(
+        context.fullSet.map(item => Number(item.id)).sort((a, b) => a - b),
+        fixture.matches.map(header => header.messageKey).sort((a, b) => a - b),
+        "Every real physical mail copy remains searchable"
+      );
+      const doc = tab.browser.contentDocument;
+      Assert.greater(
+        doc.querySelectorAll("facet-result-message").length,
+        0,
+        "The retained view renders actual mail result cards"
+      );
+      Assert.equal(
+        doc.querySelectorAll(".native-chat-result").length,
+        0,
+        "A rejected chat collection cannot publish transcript rows"
+      );
+      Assert.equal(
+        reportedErrors.length,
+        query + 1,
+        "Each failed chat query is separately reported once"
+      );
+      Assert.equal(reportedErrors[query]?.length, 1);
+      Assert.equal(
+        reportedErrors[query]?.[0],
+        failure,
+        "Report the original chat error without replacing or wrapping it"
+      );
+      Assert.ok(!doc.getElementById("results").countNode.hidden);
+      Assert.ok(!doc.getElementById("gloda-facet-view").inert);
+    }
+  } finally {
+    win.findChatSearchResults = original;
+    win.console.error = originalReportError;
+    await SpecialPowers.popPrefEnv();
+  }
+  Assert.equal(chatQueries, 2, "Both queries reach the same failed chat input");
+  Assert.equal(win.findChatSearchResults, original, "Restore the scoped hook");
+  Assert.equal(win.console.error, originalReportError, "Restore the reporter");
+  tabmail.closeTab(tab);
+});
+
 add_task(async function test_replacedFacetQueryCannotInstallOldResults() {
   const { tab, context } = await openNativeFacets(fixture.term);
   const original = fixture.service.collectResults;

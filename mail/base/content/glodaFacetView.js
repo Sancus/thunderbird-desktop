@@ -1404,11 +1404,12 @@ var FacetContext = {
 
   /**
    * Builds this frame's current facets under the parent-owned query lifetime.
+   * Optional chat failures are reported without discarding healthy mail results.
    *
    * @param {object} options - Refresh controls.
    * @param {boolean} options.preserveFilters - Keep existing refinement and sort.
    * @param {AbortSignal} signal - Parent tab and replacement cancellation.
-   * @returns {Promise<?MailSearchResultSet>} Current results, or null on cancellation/error.
+   * @returns {Promise<?MailSearchResultSet>} Current mail results, or null on cancellation/mail error.
    */
   async _loadMailSearch({ preserveFilters }, signal) {
     const state = preserveFilters
@@ -1475,7 +1476,15 @@ var FacetContext = {
         !input.sourceId &&
         input.text?.trim() &&
         Services.prefs.getBoolPref("mail.chat.enabled", false)
-          ? findChatSearchResults(input.text, { signal })
+          ? (async () => {
+              try {
+                return await findChatSearchResults(input.text, { signal });
+              } catch (error) {
+                signal.throwIfAborted();
+                console.error(error);
+                return null;
+              }
+            })()
           : null,
       ]);
       signal.throwIfAborted();

@@ -18,6 +18,8 @@ var { TestUtils } = ChromeUtils.importESModule(
   "resource://testing-common/TestUtils.sys.mjs"
 );
 
+const gAcceptedAppendSearches = [];
+
 var gDraftsFolder;
 var gNativeDraft;
 var gNativeDraftBytes;
@@ -49,6 +51,41 @@ function readNativeDraftBytes(header) {
 }
 
 add_setup(function () {
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    const proto = IMAP_RFC3501_handler.prototype;
+    const originalSearch = proto.SEARCH;
+    proto.SEARCH = function (args, uid) {
+      if (
+        args.length != 4 ||
+        args[0] != "UNDELETED" ||
+        args[1].toUpperCase() != "HEADER" ||
+        args[2].toLowerCase() != "message-id"
+      ) {
+        return originalSearch.call(this, args, uid);
+      }
+      Assert.ok(uid, "Discovery consumes actual server UIDs");
+      const needle = args[3].toLowerCase();
+      const matches = this._selectedMailbox._messages.filter(message => {
+        const headers = message.getPartHeaders("");
+        return (
+          !message.flags.includes("\\Deleted") &&
+          headers.has("message-id") &&
+          headers
+            .getRawHeader("message-id")
+            .some(value => value.toLowerCase().includes(needle))
+        );
+      });
+      gAcceptedAppendSearches.push(matches.map(message => message.uid));
+      return (
+        "* SEARCH" +
+        matches.map(message => " " + message.uid).join("") +
+        "\0OK SEARCH completed"
+      );
+    };
+    registerCleanupFunction(() => {
+      proto.SEARCH = originalSearch;
+    });
+  }
   setupIMAPPump();
   Services.prefs.setBoolPref(
     "mail.server.default.autosync_offline_stores",
@@ -210,6 +247,69 @@ add_task(
     );
   }
 );
+
+add_task(async function test_missingAcceptedDraftStillUpdatesFolder() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const mailbox = IMAPPump.daemon.getMailbox("Drafts");
+  Assert.equal(mailbox._messages.length, 1);
+  const key = gNativeDraft.messageKey;
+  const token = gNativeDraft.storeToken;
+  const operations = gDraftsFolder.msgDatabase.QueryInterface(
+    Ci.nsIMsgOfflineOpsDatabase
+  );
+  const operation = operations.getOfflineOpForKey(key, false).operation;
+  // A different client removes the accepted server draft before first SELECT.
+  mailbox._messages.splice(0, 1);
+  const unrelated = new ImapMessage(
+    "data:text/plain," +
+      encodeURI(
+        "Message-ID: <new-after-missing-draft@example.invalid>\r\n" +
+          "Subject: New unrelated draft\r\n\r\nbody\r\n"
+      ),
+    mailbox.uidnext++,
+    []
+  );
+  mailbox.addMessage(unrelated);
+  for (let pass = 0; pass < 2; pass++) {
+    const updated = new PromiseTestUtils.PromiseUrlListener();
+    const searchStart = gAcceptedAppendSearches.length;
+    gDraftsFolder.updateFolderWithListener(null, updated);
+    await updated.promise;
+    Assert.deepEqual(
+      gAcceptedAppendSearches.slice(searchStart),
+      [[]],
+      "The missing accepted draft has zero genuine Message-ID candidates"
+    );
+    const current = gDraftsFolder.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(current.messageKey, key);
+    Assert.equal(current.storeToken, token);
+    Assert.equal(readNativeDraftBytes(current), gNativeDraftBytes);
+    Assert.ok(!current.properties.includes("uidOnServer"));
+    Assert.equal(
+      operations.getOfflineOpForKey(key, false).operation,
+      operation
+    );
+    const members = [...gDraftsFolder.messages];
+    Assert.equal(
+      members.length,
+      2,
+      "Retained recovery and actual unrelated server draft both remain"
+    );
+    const server = members.filter(header =>
+      header.properties.includes("uidOnServer")
+    );
+    Assert.equal(server.length, 1);
+    Assert.equal(server[0].getUint32Property("uidOnServer"), unrelated.uid);
+    Assert.notEqual(server[0].messageKey, key);
+    Assert.equal(
+      mailbox._messages.length,
+      1,
+      "No automatic resend of the deleted accepted draft"
+    );
+  }
+});
 
 add_task(function endTest() {
   teardownIMAPPump();

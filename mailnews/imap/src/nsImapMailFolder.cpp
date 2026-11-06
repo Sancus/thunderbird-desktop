@@ -9325,7 +9325,7 @@ nsresult nsImapMailFolder::AssociateAcceptedAppendObservation(nsImapUrl* url,
   MOZ_TRY(CheckFolderPathAccess());
   auto inputs = url->CopyAcceptedAppendInputs();
   auto observations = url->CopyAcceptedAppendObservations();
-  NS_ENSURE_TRUE(inputs.Length() == observations.Length(),
+  NS_ENSURE_TRUE(observations.Length() <= inputs.Length(),
                  NS_ERROR_NOT_AVAILABLE);
   for (const auto& observed : observations) {
     if (observed.uid != uid) continue;

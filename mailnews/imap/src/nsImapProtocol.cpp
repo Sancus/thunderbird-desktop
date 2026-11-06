@@ -3260,22 +3260,44 @@ void nsImapProtocol::ProcessSelectedStateURL() {
             auto* selectedUrl = static_cast<nsImapUrl*>(m_runningUrl.get());
             auto inputs = selectedUrl->CopyAcceptedAppendInputs();
             nsresult association = [&]() -> nsresult {
-              // Discover every source ordinal before binding any member. A
-              // shared destination UID cannot satisfy two retained inputs.
+              // Resolve every input before binding any member. Unresolved
+              // custody must not prevent ordinary mailbox synchronization.
+              nsTArray<nsImapUrl::AcceptedAppendObservation> resolved;
               for (uint32_t i = 0; i < inputs.Length(); ++i) {
                 uint32_t epoch = 0;
                 ImapUid uid = 0;
-                MOZ_TRY(ResolveNativeTransferUid(
+                bool unresolved = false;
+                nsresult rv = ResolveNativeTransferUid(
                     inputs[i].snapshot, inputs[i].messageId, mailboxName.get(),
-                    epoch, uid));
-                MOZ_TRY(selectedUrl->RecordAcceptedAppendObservation(i, epoch,
-                                                                     uid));
+                    epoch, uid, &unresolved);
+                if (unresolved) continue;
+                MOZ_TRY(rv);
+                resolved.AppendElement(
+                    nsImapUrl::AcceptedAppendObservation{i, epoch, uid});
+              }
+              for (const auto& observed : resolved) {
+                bool shared = false;
+                for (const auto& other : resolved) {
+                  if (other.index != observed.index &&
+                      other.epoch == observed.epoch &&
+                      other.uid == observed.uid) {
+                    shared = true;
+                    break;
+                  }
+                }
+                // One real server member cannot identify two retained inputs.
+                if (shared) continue;
+                MOZ_TRY(selectedUrl->RecordAcceptedAppendObservation(
+                    observed.index, observed.epoch, observed.uid));
               }
               for (const auto& observed :
                    selectedUrl->CopyAcceptedAppendObservations()) {
                 NS_ENSURE_TRUE(m_imapMailFolderSink, NS_ERROR_NOT_AVAILABLE);
-                MOZ_TRY(m_imapMailFolderSink->SetAppendMsgUid(observed.uid,
-                                                              m_runningUrl));
+                nsresult rv = m_imapMailFolderSink->SetAppendMsgUid(
+                    observed.uid, m_runningUrl);
+                // An identity/body/alias refusal grants no association and
+                // changes no custody. SQL and transport failures stay errors.
+                if (rv != NS_ERROR_NOT_AVAILABLE) MOZ_TRY(rv);
               }
               return NS_OK;
             }();
@@ -4401,8 +4423,11 @@ void nsImapProtocol::HandleMessageDownLoadLine(const char* line,
   NS_ENSURE_TRUE_VOID(line);
 #ifdef MOZ_PANORAMA
   if (mNativeAppendReadback) {
-    if (NS_FAILED(mNativeAppendReadbackResult)) return;
     uint32_t length = strlen(line);
+    if (NS_FAILED(mNativeAppendReadbackResult)) {
+      if (mNativeAppendReadbackMismatch) mNativeAppendReadbackBytes += length;
+      return;
+    }
     if (mNativeAppendCaptureOutput) {
       mNativeAppendReadbackResult =
           SyncWriteAll(mNativeAppendCaptureOutput, line, length);
@@ -4428,6 +4453,9 @@ void nsImapProtocol::HandleMessageDownLoadLine(const char* line,
                        mNativeAppendReadbackUid, mNativeAppendReadbackBytes,
                        length, offset, count, uint32_t(rv))
                        .get());
+        mNativeAppendReadbackMismatch = NS_SUCCEEDED(rv);
+        if (mNativeAppendReadbackMismatch)
+          mNativeAppendReadbackBytes += length - offset;
         mNativeAppendReadbackResult =
             NS_FAILED(rv) ? rv : NS_ERROR_NOT_AVAILABLE;
         return;
@@ -4616,7 +4644,9 @@ void nsImapProtocol::NormalMessageEndDownload() {
                      GetServerStateParser().SizeOfMostRecentMessage(),
                      mNativeAppendReadbackBytes)
                      .get());
-      mNativeAppendReadbackResult = NS_ERROR_NOT_AVAILABLE;
+      mNativeAppendReadbackMismatch = false;
+      if (NS_SUCCEEDED(mNativeAppendReadbackResult))
+        mNativeAppendReadbackResult = NS_ERROR_NOT_AVAILABLE;
     }
     mNativeAppendReadbackEnded = true;
     return;
@@ -6904,7 +6934,9 @@ void nsImapProtocol::OnAppendMsgFromFile() {
 #ifdef MOZ_PANORAMA
 nsresult nsImapProtocol::VerifyNativeAppendReadback(nsIFile* file, ImapUid uid,
                                                     uint32_t epoch,
-                                                    bool capture) {
+                                                    bool capture,
+                                                    bool* unresolved) {
+  if (unresolved) *unresolved = false;
   NS_ENSURE_TRUE(file && uid && epoch && !mNativeAppendReadback &&
                      GetServerStateParser().FolderUIDValidity() == epoch,
                  NS_ERROR_NOT_AVAILABLE);
@@ -6923,6 +6955,7 @@ nsresult nsImapProtocol::VerifyNativeAppendReadback(nsIFile* file, ImapUid uid,
   mozilla::AutoRestore<bool> reading(mNativeAppendReadback);
   mNativeAppendReadback = true;
   mNativeAppendReadbackStarted = mNativeAppendReadbackEnded = false;
+  mNativeAppendReadbackMismatch = false;
   mNativeAppendReadbackBytes = 0;
   mNativeAppendReadbackUid = uid;
   mNativeAppendReadbackResult = NS_OK;
@@ -6930,18 +6963,20 @@ nsresult nsImapProtocol::VerifyNativeAppendReadback(nsIFile* file, ImapUid uid,
   ids.AppendInt(uid);
   FetchMessage(ids, kEveryThingRFC822Peek);
   nsresult result = mNativeAppendReadbackResult;
-  if (NS_SUCCEEDED(result) &&
-      (!mNativeAppendReadbackStarted || !mNativeAppendReadbackEnded ||
-       !GetServerStateParser().LastCommandSuccessful() ||
-       GetServerStateParser().FolderUIDValidity() != epoch)) {
-    result = NS_ERROR_NOT_AVAILABLE;
-  }
-  if (NS_SUCCEEDED(result)) result = GetConnectionStatus();
+  bool complete = mNativeAppendReadbackStarted && mNativeAppendReadbackEnded &&
+                  GetServerStateParser().LastCommandSuccessful() &&
+                  GetServerStateParser().FolderUIDValidity() == epoch;
+  if (NS_SUCCEEDED(result) && !complete) result = NS_ERROR_NOT_AVAILABLE;
+  nsresult connected = GetConnectionStatus();
+  if (NS_SUCCEEDED(result)) result = connected;
   if (NS_SUCCEEDED(result) && !capture) {
     char extra;
     uint32_t count;
     result = mNativeAppendReadbackInput->Read(&extra, 1, &count);
-    if (NS_SUCCEEDED(result) && count) result = NS_ERROR_NOT_AVAILABLE;
+    if (NS_SUCCEEDED(result) && count) {
+      mNativeAppendReadbackMismatch = true;
+      result = NS_ERROR_NOT_AVAILABLE;
+    }
   }
   nsresult closed = capture ? mNativeAppendCaptureOutput->Close()
                             : mNativeAppendReadbackInput->Close();
@@ -6956,14 +6991,20 @@ nsresult nsImapProtocol::VerifyNativeAppendReadback(nsIFile* file, ImapUid uid,
                                uint32_t(result), uint32_t(closed))
                    .get());
   }
+  if (unresolved && mNativeAppendReadbackMismatch && complete &&
+      NS_SUCCEEDED(connected) && NS_SUCCEEDED(closed) &&
+      result == NS_ERROR_NOT_AVAILABLE) {
+    *unresolved = true;
+  }
   return NS_FAILED(result) ? result : closed;
 }
 
 nsresult nsImapProtocol::ResolveNativeTransferUid(nsIFile* file,
                                                   const nsACString& messageId,
                                                   const char* mailboxName,
-                                                  uint32_t& epoch,
-                                                  ImapUid& uid) {
+                                                  uint32_t& epoch, ImapUid& uid,
+                                                  bool* unresolved) {
+  if (unresolved) *unresolved = false;
   NS_ENSURE_TRUE(!messageId.IsEmpty() &&
                      messageId.FindChar('\r') == kNotFound &&
                      messageId.FindChar('\n') == kNotFound &&
@@ -6990,8 +7031,11 @@ nsresult nsImapProtocol::ResolveNativeTransferUid(nsIFile* file,
   uint32_t count = uid ? 1 : 0;
   while (matches->GetNextMatchUid()) ++count;
   delete matches;
-  NS_ENSURE_TRUE(count == 1, NS_ERROR_NOT_AVAILABLE);
-  return VerifyNativeAppendReadback(file, uid, epoch);
+  if (count != 1) {
+    if (unresolved) *unresolved = true;
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  return VerifyNativeAppendReadback(file, uid, epoch, false, unresolved);
 }
 #endif
 

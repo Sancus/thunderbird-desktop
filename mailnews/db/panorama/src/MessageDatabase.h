@@ -698,6 +698,11 @@ class MessageDatabase : public nsIMessageDatabase {
   // Local-only retry: retain the operation, body and unresolved destination.
   nsresult ValidateOfflineAppendAcceptedWithoutUid(
       const OfflineAttempt& expected);
+  // Read retained accepted custody, not replay or UID-receipt authority.
+  // Success: false for exact unbound state, true for a checked private stamp.
+  // Failure leaves observed unchanged and never adopts a caller transaction.
+  nsresult ReadRetainedAcceptedAppend(const OfflineAttempt& expected,
+                                      bool& observed);
   // A later complete checked mailbox observation, never a UID receipt. Bind
   // the existing published member without changing Sent/acceptance history.
   // No message-added/publication callback is emitted for an existing member.
@@ -888,7 +893,7 @@ class MessageDatabase : public nsIMessageDatabase {
                                      OfflineAttempt& actual);
   nsresult ValidateAppendTargetInTransaction(const OfflineAttempt& attempt);
   nsresult ReadAcceptedAppendObservationInTransaction(
-      const OfflineAttempt& attempt, uint32_t epoch, uint32_t uid,
+      const OfflineAttempt& attempt, uint32_t epoch, const Maybe<uint32_t>& uid,
       bool& associated);
   nsresult RequireOfflineUndoQueued(int64_t operationId,
                                     const OfflineOperationData& operation);

@@ -761,13 +761,15 @@ class nsImapProtocol : public nsIImapProtocol,
   // Worker-only and reset at each Copy invocation, not each command chunk.
   nsTArray<CopyResponseMapping> mCopyResponseMappings;
   nsresult VerifyNativeAppendReadback(nsIFile* file, ImapUid uid,
-                                      uint32_t epoch, bool capture = false);
+                                      uint32_t epoch, bool capture = false,
+                                      bool* unresolved = nullptr);
   nsresult ResolveNativeTransferUid(nsIFile* file, const nsACString& messageId,
                                     const char* mailboxName, uint32_t& epoch,
-                                    ImapUid& uid);
+                                    ImapUid& uid, bool* unresolved = nullptr);
   bool mNativeAppendReadback = false;
   bool mNativeAppendReadbackStarted = false;
   bool mNativeAppendReadbackEnded = false;
+  bool mNativeAppendReadbackMismatch = false;
   ImapUid mNativeAppendReadbackUid = 0;
   uint64_t mNativeAppendReadbackBytes = 0;
   nsresult mNativeAppendReadbackResult = NS_OK;

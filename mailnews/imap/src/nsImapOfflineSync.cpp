@@ -112,9 +112,11 @@ static nsresult UpdateOfflineEventsFlag(nsIMsgFolder* folder,
             return folder->SetFlag(nsMsgFolderFlags::OfflineEvents);
           // A retained effect/uncertainty needs recovery, not another send.
           // Counterpart-only records likewise do not make work dispatchable.
-          if (attempt.appendAccepted)
-            MOZ_TRY(core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
-                attempt));
+          if (attempt.appendAccepted) {
+            bool observed;
+            MOZ_TRY(core->MessageDB().ReadRetainedAcceptedAppend(attempt,
+                                                                 observed));
+          }
         }
       }
     }
@@ -1123,7 +1125,12 @@ nsresult nsImapOfflineSync::ProcessNativeAppend(nsIMsgOfflineImapOperation* op,
   if (NS_SUCCEEDED(lookup)) {
     NS_ENSURE_TRUE(prior.operation == action, NS_ERROR_NOT_AVAILABLE);
     if (prior.appendAccepted) {
-      MOZ_TRY(db.ValidateOfflineAppendAcceptedWithoutUid(prior));
+      bool observed;
+      MOZ_TRY(db.ReadRetainedAcceptedAppend(prior, observed));
+      if (observed && !m_singleFolderToUpdate &&
+          NS_SUCCEEDED(m_firstPlaybackError)) {
+        m_firstPlaybackError = NS_ERROR_NOT_AVAILABLE;
+      }
       return ProcessNextOperation();
     }
     if (prior.state == OfflineAttemptState::Confirmed) {
@@ -1886,12 +1893,17 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
           nsresult found = core->MessageDB().GetCurrentOfflineAttempt(
               folderId, m_CurrentKeys[m_KeyIndex], attempt);
           if (NS_SUCCEEDED(found) && attempt.appendAccepted) {
+            bool observed;
             nsresult validated =
-                core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
-                    attempt);
-            // An observed binding does not grant a replay receipt. Complete
-            // the original listener on this refusal or any validation error.
+                core->MessageDB().ReadRetainedAcceptedAppend(attempt, observed);
             if (NS_FAILED(validated)) return FinishPlayback(nullptr, validated);
+            // Observed custody grants no replay receipt. Explicit playback
+            // reports that uncertainty once, after independent work completes.
+            // An ordinary folder refresh must still reach its normal SELECT.
+            if (observed && !m_singleFolderToUpdate &&
+                NS_SUCCEEDED(m_firstPlaybackError)) {
+              m_firstPlaybackError = NS_ERROR_NOT_AVAILABLE;
+            }
             dispatchable &= ~attempt.operation;
           } else {
             NS_ENSURE_TRUE(

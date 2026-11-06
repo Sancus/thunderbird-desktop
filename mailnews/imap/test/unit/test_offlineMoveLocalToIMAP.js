@@ -39,7 +39,69 @@ function readRetainedMoveBody(header) {
   }
 }
 
-async function setupTest() {
+const gAcceptedAppendSearches = [];
+const gAcceptedAppendBodyReads = [];
+
+add_setup(function () {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalSearch = proto.SEARCH;
+  proto.SEARCH = function (args, uid) {
+    if (
+      args.length != 4 ||
+      args[0] != "UNDELETED" ||
+      args[1].toUpperCase() != "HEADER" ||
+      args[2].toLowerCase() != "message-id"
+    ) {
+      return originalSearch.call(this, args, uid);
+    }
+    Assert.ok(uid, "Discovery consumes actual server UIDs");
+    const needle = args[3].toLowerCase();
+    const matches = this._selectedMailbox._messages.filter(message => {
+      const headers = message.getPartHeaders("");
+      return (
+        !message.flags.includes("\\Deleted") &&
+        headers.has("message-id") &&
+        headers
+          .getRawHeader("message-id")
+          .some(value => value.toLowerCase().includes(needle))
+      );
+    });
+    gAcceptedAppendSearches.push(matches.map(message => message.uid));
+    return (
+      "* SEARCH" +
+      matches.map(message => " " + message.uid).join("") +
+      "\0OK SEARCH completed"
+    );
+  };
+  registerCleanupFunction(() => {
+    proto.SEARCH = originalSearch;
+  });
+  const originalBody = proto._FETCH_BODY;
+  proto._FETCH_BODY = function (message, query) {
+    const response = originalBody.call(this, message, query);
+    if (query == "BODY[]" || query == "BODY.PEEK[]") {
+      // The full-body early return does not set this flag. Keep the real
+      // LF bytes and declared literal size instead of expanding them.
+      this.sendingLiteral = true;
+      gAcceptedAppendBodyReads.push(message.uid);
+    }
+    return response;
+  };
+  registerCleanupFunction(() => {
+    proto._FETCH_BODY = originalBody;
+  });
+});
+
+/**
+ * Creates the ordinary IMAP fixture and discovers its native INBOX.
+ *
+ * @param {string} [extensions] - Fake server extensions passed to the fixture.
+ * @returns {Promise<void>} Resolves after native folder discovery.
+ */
+async function setupTest(extensions) {
   // Turn off autosync_offline_stores because
   // fetching messages is invoked after copying the messages.
   // (i.e. The fetching process will be invoked after OnStopCopy)
@@ -57,23 +119,9 @@ async function setupTest() {
       Services.prefs.getCharPref("mail.serverDefaultStoreContractID")
     );
   }
-  setupIMAPPump();
+  setupIMAPPump(extensions);
   IMAPPump.server.setDebugLevel(nsMailServer.debugAll);
   if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
-    const proto = IMAP_RFC3501_handler.prototype;
-    const originalBody = proto._FETCH_BODY;
-    proto._FETCH_BODY = function (message, query) {
-      const response = originalBody.call(this, message, query);
-      if (query == "BODY[]" || query == "BODY.PEEK[]") {
-        // The full-body early return does not set this flag. Keep the real
-        // LF bytes and declared literal size instead of expanding them.
-        this.sendingLiteral = true;
-      }
-      return response;
-    };
-    registerCleanupFunction(() => {
-      proto._FETCH_BODY = originalBody;
-    });
     const discovered = new PromiseTestUtils.PromiseUrlListener();
     MailServices.imap.discoverAllFolders(
       IMAPPump.incomingServer.rootFolder,
@@ -189,38 +237,6 @@ add_task(async function testOfflineMoveLocalToIMAP() {
 
   await goOnline();
 
-  if (native) {
-    const mailbox = IMAPPump.daemon.getMailbox("INBOX");
-    Assert.equal(mailbox._messages.length, 1, "Exactly one actual APPEND");
-    const original = mailbox._messages[0];
-    const duplicate = new ImapMessage(
-      "data:text/plain," + encodeURI(original.getText()),
-      mailbox.uidnext++,
-      []
-    );
-    mailbox.addMessage(duplicate);
-    Assert.equal(duplicate.getText(), original.getText());
-    const refused = new PromiseTestUtils.PromiseUrlListener();
-    const refusal = refused.promise.then(
-      () => Cr.NS_OK,
-      error => Number(error.message)
-    );
-    try {
-      IMAPPump.inbox.updateFolderWithListener(null, refused);
-      Assert.equal(await refusal, Cr.NS_ERROR_NOT_AVAILABLE);
-      const kept = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(retainedKey);
-      Assert.ok(!kept.properties.includes("uidOnServer"));
-      Assert.equal(kept.storeToken, retainedToken);
-      Assert.equal(readRetainedMoveBody(kept), retainedBytes);
-      Assert.equal(IMAPPump.inbox.getTotalMessages(false), 1);
-      Assert.equal(mailbox._messages.length, 2);
-    } finally {
-      // Remove only the deliberately ambiguous server input. No application
-      // member or retained provider bytes are hidden to satisfy the count.
-      mailbox._messages.splice(mailbox._messages.indexOf(duplicate), 1);
-    }
-  }
-
   const imapINBOX = IMAPPump.inbox.QueryInterface(Ci.nsIMsgImapMailFolder);
   const listener = new PromiseTestUtils.PromiseUrlListener();
   imapINBOX.updateFolderWithListener(null, listener);
@@ -335,6 +351,370 @@ add_task(async function testOfflineCopyLocalToIMAPRetainsSource() {
     Assert.equal(copied[0].getUint32Property("pseudoHdr"), 1);
     Assert.equal(readRetainedMoveBody(copied[0]), bytes);
   } finally {
+    teardownTest();
+    Services.io.offline = false;
+  }
+});
+
+/**
+ * Verifies that unresolved accepted copies retain custody during normal refresh.
+ *
+ * @param {"ambiguous"|"wrongBody"} mode - The real server candidate mismatch.
+ * @returns {Promise<void>} Resolves after repeated refresh and no-resend checks.
+ */
+async function checkUnresolvedAcceptedAppendStillUpdates(mode) {
+  await setupTest();
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalAppend = proto.APPEND;
+  let appends = 0;
+  proto.APPEND = function (args) {
+    const response = originalAppend.call(this, args);
+    if (args[0] == "INBOX" && response.startsWith("OK")) {
+      appends++;
+    }
+    return response;
+  };
+  try {
+    const source = localAccountUtils.rootFolder.createLocalSubfolder(
+      "unresolved-accepted-" + mode
+    );
+    await loadTestMessage(source);
+    const original = [...source.messages][0];
+    const sourceToken = original.storeToken;
+    const sourceBytes = readRetainedMoveBody(original);
+    goOffline();
+    const copied = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.copy.copyMessages(
+      source,
+      [original],
+      IMAPPump.inbox,
+      false,
+      copied,
+      null,
+      false
+    );
+    const queued = await copied.promise;
+    Assert.equal(queued.messageKeys.length, 1);
+    const key = queued.messageKeys[0];
+    const retained = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(key);
+    const token = retained.storeToken;
+    const bytes = readRetainedMoveBody(retained);
+    const operations = IMAPPump.inbox.msgDatabase.QueryInterface(
+      Ci.nsIMsgOfflineOpsDatabase
+    );
+    const operation = operations.getOfflineOpForKey(key, false).operation;
+    Assert.ok(operation);
+    Assert.ok(!retained.properties.includes("uidOnServer"));
+    IMAPPump.daemon.closing = false;
+    Services.io.offline = false;
+    IMAPPump.server.start();
+    const first = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.playbackAllOfflineOperations(null, first);
+    await first.promise;
+    const mailbox = IMAPPump.daemon.getMailbox("INBOX");
+    Assert.equal(appends, 1);
+    Assert.equal(mailbox._messages.length, 1);
+    const accepted = mailbox._messages[0];
+    if (mode == "ambiguous") {
+      mailbox.addMessage(
+        new ImapMessage(
+          "data:text/plain," + encodeURI(accepted.getText()),
+          mailbox.uidnext++,
+          []
+        )
+      );
+    } else {
+      mailbox._messages[0] = new ImapMessage(
+        "data:text/plain," + encodeURI(accepted.getText() + "Different body\n"),
+        accepted.uid,
+        []
+      );
+    }
+    for (let pass = 0; pass < 2; pass++) {
+      const fresh = new ImapMessage(
+        "data:text/plain," +
+          encodeURI(
+            "Message-ID: <unrelated-" +
+              mode +
+              "-" +
+              pass +
+              "@example.invalid>\r\n" +
+              "Subject: Unrelated new mail\r\n\r\nUnrelated body\r\n"
+          ),
+        mailbox.uidnext++,
+        []
+      );
+      mailbox.addMessage(fresh);
+      let stops = 0;
+      const updated = new PromiseTestUtils.PromiseUrlListener({
+        OnStopRunningUrl() {
+          stops++;
+        },
+      });
+      const searchStart = gAcceptedAppendSearches.length;
+      const readStart = gAcceptedAppendBodyReads.length;
+      IMAPPump.inbox.updateFolderWithListener(null, updated);
+      await updated.promise;
+      Assert.equal(stops, 1);
+      const searches = gAcceptedAppendSearches.slice(searchStart);
+      Assert.equal(searches.length, 1);
+      Assert.equal(searches[0].length, mode == "ambiguous" ? 2 : 1);
+      Assert.deepEqual(
+        gAcceptedAppendBodyReads.slice(readStart),
+        mode == "ambiguous" ? [] : [accepted.uid]
+      );
+      const current = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(key);
+      Assert.equal(current.messageKey, key);
+      Assert.equal(current.storeToken, token);
+      Assert.equal(readRetainedMoveBody(current), bytes);
+      Assert.ok(!current.properties.includes("uidOnServer"));
+      Assert.equal(
+        operations.getOfflineOpForKey(key, false).operation,
+        operation
+      );
+      const all = [...IMAPPump.inbox.messages];
+      const uids = all
+        .filter(header => header.properties.includes("uidOnServer"))
+        .map(header => header.getUint32Property("uidOnServer"))
+        .sort((a, b) => a - b);
+      Assert.deepEqual(
+        uids,
+        mailbox._messages.map(message => message.uid).sort((a, b) => a - b)
+      );
+      Assert.equal(
+        all.length,
+        mailbox._messages.length + 1,
+        "All actual server members plus the unchanged unbound recovery remain visible"
+      );
+      Assert.ok(uids.includes(fresh.uid), "Unrelated new mail is synchronized");
+      Assert.equal(appends, 1, "Refresh cannot resend the accepted copy");
+    }
+    const repeated = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.playbackAllOfflineOperations(null, repeated);
+    await repeated.promise;
+    Assert.equal(appends, 1);
+    Assert.equal(source.getTotalMessages(false), 1);
+    Assert.equal(
+      source.msgDatabase.getMsgHdrForKey(original.messageKey).storeToken,
+      sourceToken
+    );
+    Assert.equal(readRetainedMoveBody(original), sourceBytes);
+  } finally {
+    proto.APPEND = originalAppend;
+    teardownTest();
+    Services.io.offline = false;
+  }
+}
+
+add_task(async function test_ambiguousAcceptedAppendStillUpdatesFolder() {
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    await checkUnresolvedAcceptedAppendStillUpdates("ambiguous");
+  }
+});
+
+add_task(async function test_wrongBodyAcceptedAppendStillUpdatesFolder() {
+  if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    await checkUnresolvedAcceptedAppendStillUpdates("wrongBody");
+  }
+});
+
+add_task(async function test_observedAcceptedAppendDoesNotStarveLaterWork() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const originalAppend = IMAP_RFC4315_extension.APPEND;
+  const originalCopy = IMAP_RFC4315_extension.COPY;
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalStore = proto.STORE;
+  const transactions = MailServices.txns.transactionManager;
+  transactions.clear();
+  let appends = 0;
+  let copies = 0;
+  let flagged = 0;
+  let freshUid;
+  IMAP_RFC4315_extension.APPEND = function (args) {
+    const response = originalAppend.call(this, args);
+    if (args[0] == "INBOX" && response.startsWith("OK")) {
+      appends++;
+      return response.replace(/\[APPENDUID [^\]]+\]/, "");
+    }
+    return response;
+  };
+  IMAP_RFC4315_extension.COPY = function (args, uid) {
+    if (uid && args[1] == "LaterPureMove") {
+      copies++;
+    }
+    return originalCopy.call(this, args, uid);
+  };
+  proto.STORE = function (args, uid) {
+    if (
+      uid &&
+      this._parseSequenceSet(args[0], uid).some(
+        message => message.uid == freshUid
+      ) &&
+      args[2].includes("\\Flagged")
+    ) {
+      flagged++;
+    }
+    return originalStore.call(this, args, uid);
+  };
+  try {
+    await setupTest("RFC2195,RFC4315");
+    IMAPPump.daemon.createMailbox("LaterPureMove", {
+      subscribed: true,
+      uidvalidity: IMAPPump.daemon.uidvalidity++,
+    });
+    const root = IMAPPump.incomingServer.rootFolder;
+    const discovered = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.discoverAllFolders(root, discovered, null);
+    await discovered.promise;
+    const destination = root
+      .getChildNamed("LaterPureMove")
+      .QueryInterface(Ci.nsIMsgImapMailFolder);
+    const selectedTarget = new PromiseTestUtils.PromiseUrlListener();
+    destination.updateFolderWithListener(null, selectedTarget);
+    await selectedTarget.promise;
+    const local = localAccountUtils.rootFolder.createLocalSubfolder(
+      "accepted-before-later-work"
+    );
+    await loadTestMessage(local);
+    goOffline();
+    const queued = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.copy.copyMessages(
+      local,
+      [...local.messages],
+      IMAPPump.inbox,
+      true,
+      queued,
+      null,
+      false
+    );
+    const retainedKey = (await queued.promise).messageKeys[0];
+    const retained = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(retainedKey);
+    const token = retained.storeToken;
+    const bytes = readRetainedMoveBody(retained);
+    const operations = IMAPPump.inbox.msgDatabase.QueryInterface(
+      Ci.nsIMsgOfflineOpsDatabase
+    );
+    const acceptedOperation = operations.getOfflineOpForKey(
+      retainedKey,
+      false
+    ).operation;
+    Assert.equal(local.getTotalMessages(false), 0);
+    IMAPPump.daemon.closing = false;
+    Services.io.offline = false;
+    IMAPPump.server.start();
+    const replayed = new PromiseTestUtils.PromiseUrlListener();
+    MailServices.imap.playbackAllOfflineOperations(null, replayed);
+    await replayed.promise;
+    const mailbox = IMAPPump.daemon.getMailbox("INBOX");
+    Assert.equal(appends, 1);
+    const observed = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.updateFolderWithListener(null, observed);
+    await observed.promise;
+    const acceptedUid = mailbox._messages[0].uid;
+    Assert.equal(retained.getUint32Property("uidOnServer"), acceptedUid);
+    Assert.equal(retained.messageKey, retainedKey);
+    Assert.notEqual(retainedKey, acceptedUid);
+    const uri = Services.io.newFileURI(do_get_file("../../../data/bugmail10"));
+    freshUid = mailbox.uidnext++;
+    const freshRemote = new ImapMessage(uri.spec, freshUid, []);
+    mailbox.addMessage(freshRemote);
+    const loaded = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.updateFolderWithListener(null, loaded);
+    await loaded.promise;
+    const downloaded = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.downloadAllForOffline(downloaded, null);
+    await downloaded.promise;
+    const fresh = [...IMAPPump.inbox.messages].find(
+      header => header.getUint32Property("uidOnServer") == freshUid
+    );
+    Assert.ok(fresh);
+    Assert.greater(fresh.messageKey, retainedKey);
+    IMAPPump.incomingServer.closeCachedConnections();
+    Services.io.offline = true;
+    IMAPPump.inbox.markMessagesFlagged([fresh], true);
+    Assert.ok(IMAPPump.inbox.flags & Ci.nsMsgFolderFlags.OfflineEvents);
+    Services.io.offline = false;
+    const afterFlag = new ImapMessage(
+      "data:text/plain," +
+        encodeURI(
+          "Message-ID: <after-retained-flag@example.invalid>\r\nSubject: New flag mail\r\n\r\nbody\r\n"
+        ),
+      mailbox.uidnext++,
+      []
+    );
+    mailbox.addMessage(afterFlag);
+    const flagsPlayed = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.updateFolderWithListener(null, flagsPlayed);
+    await flagsPlayed.promise;
+    Assert.equal(
+      flagged,
+      1,
+      "The later-key ordinary flag operation is dispatched once"
+    );
+    Assert.ok(freshRemote.flags.includes("\\Flagged"));
+    Assert.ok(
+      [...IMAPPump.inbox.messages].some(
+        header => header.getUint32Property("uidOnServer") == afterFlag.uid
+      )
+    );
+    const moved = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.copy.copyMessages(
+      IMAPPump.inbox,
+      [fresh],
+      destination,
+      true,
+      moved,
+      null,
+      true
+    );
+    const movedResult = await moved.promise;
+    Assert.equal(movedResult.messageKeys.length, 1);
+    const afterMove = new ImapMessage(
+      "data:text/plain," +
+        encodeURI(
+          "Message-ID: <after-retained-move@example.invalid>\r\nSubject: New move mail\r\n\r\nbody\r\n"
+        ),
+      mailbox.uidnext++,
+      []
+    );
+    mailbox.addMessage(afterMove);
+    const movePlayed = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.updateFolderWithListener(null, movePlayed);
+    await movePlayed.promise;
+    Assert.equal(
+      copies,
+      1,
+      "The later online undoable MOVE dispatches exactly one real COPY"
+    );
+    const target = IMAPPump.daemon.getMailbox("LaterPureMove");
+    Assert.equal(target._messages.length, 1);
+    Assert.ok(
+      [...IMAPPump.inbox.messages].some(
+        header => header.getUint32Property("uidOnServer") == afterMove.uid
+      )
+    );
+    const current = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(retainedKey);
+    Assert.equal(current.getUint32Property("uidOnServer"), acceptedUid);
+    Assert.equal(current.storeToken, token);
+    Assert.equal(readRetainedMoveBody(current), bytes);
+    Assert.equal(
+      operations.getOfflineOpForKey(retainedKey, false).operation,
+      acceptedOperation
+    );
+    const repeated = new PromiseTestUtils.PromiseUrlListener();
+    IMAPPump.inbox.updateFolderWithListener(null, repeated);
+    await repeated.promise;
+    Assert.equal(appends, 1);
+    Assert.equal(copies, 1);
+    Assert.equal(flagged, 1);
+    Assert.ok(!(IMAPPump.inbox.flags & Ci.nsMsgFolderFlags.OfflineEvents));
+  } finally {
+    IMAP_RFC4315_extension.APPEND = originalAppend;
+    IMAP_RFC4315_extension.COPY = originalCopy;
+    proto.STORE = originalStore;
+    transactions.clear();
     teardownTest();
     Services.io.offline = false;
   }

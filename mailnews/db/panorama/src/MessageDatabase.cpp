@@ -7077,8 +7077,78 @@ nsresult MessageDatabase::ValidateOfflineAppendAcceptedWithoutUid(
   return FinishOfflineWrite(connection, rv);
 }
 
+nsresult MessageDatabase::ReadRetainedAcceptedAppend(
+    const OfflineAttempt& expected, bool& observed) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  RefPtr<MessageDatabase> self(this);
+  const OfflineAttempt selected(expected);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  auto read = [&](bool& bound) -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedAppendAttempt(selected, actual));
+    Maybe<uint32_t> uid;
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ReadRetainedAcceptedAppendUid"_ns,
+          "SELECT value FROM message_properties WHERE id=:key AND "
+          "name='uidOnServer'"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("key"_ns, actual.destination->key));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (more) {
+        int32_t type;
+        MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        nsCString text;
+        MOZ_TRY(stmt->GetUTF8String(0, text));
+        NS_ENSURE_TRUE(!text.IsEmpty() && text.Length() <= 8,
+                       NS_ERROR_FILE_CORRUPTED);
+        for (uint32_t i = 0; i < text.Length(); ++i) {
+          char digit = text.CharAt(i);
+          NS_ENSURE_TRUE(
+              (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'),
+              NS_ERROR_FILE_CORRUPTED);
+        }
+        uint32_t value =
+            static_cast<uint32_t>(MsgUnhex(text.get(), text.Length()));
+        nsAutoCString canonical;
+        canonical.AppendInt(value, 16);
+        NS_ENSURE_TRUE(text == canonical, NS_ERROR_FILE_CORRUPTED);
+        NS_ENSURE_TRUE(value, NS_ERROR_NOT_AVAILABLE);
+        uid = Some(value);
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+      }
+    }
+    MOZ_TRY(ReadAcceptedAppendObservationInTransaction(
+        actual, actual.destination->epoch, uid, bound));
+    NS_ENSURE_TRUE(bound == uid.isSome(), NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  };
+  bool result = false;
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(read(result));
+    // SQL functions can reenter; revalidate the same immutable input before
+    // committing our read. No externally visible output precedes that commit.
+    MOZ_TRY(RequireCurrentOwner());
+    bool checked;
+    MOZ_TRY(read(checked));
+    NS_ENSURE_TRUE(checked == result, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(RequireCurrentOwner());
+    return connection->CommitTransaction();
+  }();
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  observed = result;
+  return NS_OK;
+}
+
 nsresult MessageDatabase::ReadAcceptedAppendObservationInTransaction(
-    const OfflineAttempt& attempt, uint32_t epoch, uint32_t uid,
+    const OfflineAttempt& attempt, uint32_t epoch, const Maybe<uint32_t>& uid,
     bool& associated) {
   MOZ_TRY(RequireCurrentOwner());
   bool active;
@@ -7091,7 +7161,8 @@ nsresult MessageDatabase::ReadAcceptedAppendObservationInTransaction(
                  NS_ERROR_NOT_AVAILABLE);
   const auto& body = *attempt.appendBody;
   const auto& target = *attempt.destination;
-  NS_ENSURE_TRUE(target.epochKnown && epoch && uid && target.epoch == epoch &&
+  NS_ENSURE_TRUE(target.epochKnown && epoch && (!uid || *uid) &&
+                     target.epoch == epoch &&
                      body.folderId == target.folderId && body.key == target.key,
                  NS_ERROR_NOT_AVAILABLE);
   uint32_t currentEpoch;
@@ -7192,9 +7263,9 @@ nsresult MessageDatabase::ReadAcceptedAppendObservationInTransaction(
   MOZ_TRY(GetMessagePropertyNames(body.key, names));
   if (stamp) {
     NS_ENSURE_TRUE(
-        names.Contains("uidOnServer"_ns) &&
+        uid && names.Contains("uidOnServer"_ns) &&
             current.locationRevision > body.locationRevision &&
-            *stamp == AcceptedAppendObservationStamp(attempt, epoch, uid,
+            *stamp == AcceptedAppendObservationStamp(attempt, epoch, *uid,
                                                      current.locationRevision),
         NS_ERROR_NOT_AVAILABLE);
     auto bound = body;
@@ -7202,12 +7273,12 @@ nsresult MessageDatabase::ReadAcceptedAppendObservationInTransaction(
     NS_ENSURE_TRUE(SameBodyGuard(current, bound), NS_ERROR_NOT_AVAILABLE);
     uint32_t actualUid;
     MOZ_TRY(GetMessageUidOnServer(body.key, actualUid));
-    NS_ENSURE_TRUE(actualUid == uid, NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(actualUid == *uid, NS_ERROR_NOT_AVAILABLE);
     // The row is already proven published by ReadMessageBodyState. With an
     // existing equal property this only reads back all published/staged
     // aliases; it must not create another journal event on repeated discovery.
     MOZ_TRY(BindMessageToServerUidInTransaction(body.key, body.folderId, epoch,
-                                                uid, true));
+                                                *uid, true));
   } else {
     NS_ENSURE_TRUE(
         !names.Contains("uidOnServer"_ns) && SameBodyGuard(current, body),
@@ -7236,7 +7307,7 @@ nsresult MessageDatabase::AssociateAcceptedAppendObservation(
     MOZ_TRY(ReadExpectedAppendAttempt(selected, actual));
     bool associated;
     MOZ_TRY(ReadAcceptedAppendObservationInTransaction(
-        actual, observedEpoch, observedUid, associated));
+        actual, observedEpoch, Some(observedUid), associated));
     const auto& body = *actual.appendBody;
     if (!associated) {
       MOZ_TRY(BindMessageToServerUidInTransaction(
@@ -7273,7 +7344,7 @@ nsresult MessageDatabase::AssociateAcceptedAppendObservation(
     MOZ_TRY(RequireCurrentOwner());
     MOZ_TRY(ReadExpectedAppendAttempt(selected, actual));
     MOZ_TRY(ReadAcceptedAppendObservationInTransaction(
-        actual, observedEpoch, observedUid, associated));
+        actual, observedEpoch, Some(observedUid), associated));
     NS_ENSURE_TRUE(associated, NS_ERROR_NOT_AVAILABLE);
     result = {actual.destination->folderId, actual.destination->key,
               observedEpoch, observedUid};

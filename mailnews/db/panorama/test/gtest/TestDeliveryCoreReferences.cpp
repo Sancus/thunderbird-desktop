@@ -21392,4 +21392,412 @@ TEST_F(DeliveryCoreReferences,
   }
 }
 
+TEST_F(DeliveryCoreReferences,
+       RetainedAcceptedAppendReadKeepsBothStatesAndGrantsNoAuthority) {
+  ASSERT_EQ(NS_OK, Start());
+  for (bool zero : {false, true}) {
+    SCOPED_TRACE(zero);
+    nsMsgKey key;
+    MessageBodyState body;
+    OfflineAttempt expected;
+    ASSERT_EQ(NS_OK, AcceptedAppend(key, body, expected, zero));
+    for (bool bound : {false, true}) {
+      SCOPED_TRACE(bound);
+      auto& db = mCore->MessageDB();
+      if (bound) {
+        ServerMessageLocation mapping = OnlineSentinel();
+        RefPtr<Message> live;
+        ASSERT_EQ(NS_OK, db.AssociateAcceptedAppendObservation(
+                             expected, 7, 810000 + key, mapping,
+                             getter_AddRefs(live)));
+        ASSERT_TRUE(live);
+      }
+      nsCString history, physical;
+      ASSERT_EQ(NS_OK, AppendObservationHistory(key, history));
+      ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, physical));
+      uint32_t callbacks = 0;
+      {
+        RefPtr<PublicationObserver> observer =
+            new PublicationObserver([&](Message*, bool) { ++callbacks; });
+        db.AddMessageListener(observer);
+        auto cleanup =
+            MakeScopeExit([&] { db.RemoveMessageListener(observer); });
+        for (uint32_t repeat = 0; repeat < 2; ++repeat) {
+          bool observed = !bound;
+          EXPECT_EQ(NS_OK, db.ReadRetainedAcceptedAppend(expected, observed));
+          EXPECT_EQ(bound, observed);
+          nsCString after;
+          ASSERT_EQ(NS_OK, AppendObservationHistory(key, after));
+          EXPECT_EQ(history, after);
+          ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, after));
+          EXPECT_EQ(physical, after);
+        }
+        EXPECT_EQ(0u, callbacks);
+      }
+      EXPECT_EQ(bound ? NS_ERROR_NOT_AVAILABLE : NS_OK,
+                db.ValidateOfflineAppendAcceptedWithoutUid(expected));
+      uint64_t attemptId = 123;
+      EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+                db.BeginOfflineAttempt(mFolderId, key, expected.operation,
+                                       expected.destination, attemptId, &body));
+      EXPECT_EQ(123u, attemptId);
+      if (bound) {
+        EXPECT_EQ(
+            NS_ERROR_NOT_AVAILABLE,
+            db.ConfirmOfflineAttempt(
+                expected.id, Some(ServerUidConfirmation{7, 810000 + key})));
+      }
+      Stop();
+      ASSERT_EQ(NS_OK, Start());
+      bool observed = !bound;
+      EXPECT_EQ(NS_OK, mCore->MessageDB().ReadRetainedAcceptedAppend(expected,
+                                                                     observed));
+      EXPECT_EQ(bound, observed);
+      OfflineAttempt actual;
+      ASSERT_EQ(NS_OK,
+                mCore->MessageDB().GetOfflineAttempt(expected.id, actual));
+      EXPECT_EQ(OfflineAttemptState::Sent, actual.state);
+      EXPECT_TRUE(actual.appendAccepted);
+      EXPECT_FALSE(actual.confirmedUid);
+      EXPECT_FALSE(actual.confirmedEpoch);
+      EXPECT_EQ(expected.operationId, actual.operationId);
+      EXPECT_EQ(expected.revision, actual.revision);
+      nsCString after;
+      ASSERT_EQ(NS_OK, AppendObservationHistory(key, after));
+      EXPECT_EQ(history, after);
+      ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, after));
+      EXPECT_EQ(physical, after);
+    }
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       RetainedAcceptedAppendReadRejectsForgedStaleAndMalformedState) {
+  ASSERT_EQ(NS_OK, Start());
+  for (uint32_t mode = 0; mode < 23; ++mode) {
+    SCOPED_TRACE(mode);
+    nsMsgKey key;
+    MessageBodyState body;
+    OfflineAttempt expected;
+    auto& db = mCore->MessageDB();
+    if (mode == 0) {
+      ASSERT_EQ(NS_OK, QueuedAppend(key, body, expected));
+    } else {
+      ASSERT_EQ(NS_OK, AcceptedAppend(key, body, expected));
+    }
+    uint32_t uid = 820000 + mode;
+    bool bound = mode != 0 && mode != 20 && mode != 21;
+    if (bound) {
+      ServerMessageLocation mapping = OnlineSentinel();
+      RefPtr<Message> live;
+      ASSERT_EQ(NS_OK, db.AssociateAcceptedAppendObservation(
+                           expected, 7, uid, mapping, getter_AddRefs(live)));
+    }
+    OfflineAttempt supplied(expected);
+    nsresult wanted = NS_ERROR_NOT_AVAILABLE;
+    nsAutoCString sql;
+    if (mode == 1)
+      sql = "UPDATE message_properties SET value='forged' WHERE id="_ns;
+    if (mode == 2) sql = "DELETE FROM message_properties WHERE id="_ns;
+    if (mode == 3) {
+      sql = "UPDATE message_properties SET value=1 WHERE id="_ns;
+      wanted = NS_ERROR_FILE_CORRUPTED;
+    }
+    if (mode >= 1 && mode <= 3) {
+      sql.AppendInt(key);
+      sql.AppendLiteral(" AND name='panoramaAcceptedAppendObservation'");
+    }
+    if (mode == 4) supplied.appendBody->databaseSourceId.Append("-foreign");
+    if (mode == 5) ++supplied.revision;
+    if (mode == 6) {
+      sql =
+          "UPDATE offline_operations SET revision=revision+1 WHERE messageKey="_ns;
+      sql.AppendInt(key);
+    }
+    if (mode == 7)
+      ASSERT_EQ(NS_OK, mCore->FolderDB().SetFolderUidValidity(mFolderId, 8));
+    if (mode == 8)
+      ASSERT_EQ(NS_OK, db.SetMessageStoreToken(key, "changed-body"_ns));
+    if (mode == 9 || mode == 21) {
+      RefPtr<Message> header = new Message(key);
+      ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", uid + 1));
+    }
+    if (mode >= 10 && mode <= 14) {
+      if (mode == 10) sql = "DELETE FROM message_properties WHERE id="_ns;
+      if (mode == 11) {
+        sql = "UPDATE message_properties SET value=17 WHERE id="_ns;
+        wanted = NS_ERROR_FILE_CORRUPTED;
+      }
+      if (mode == 12) {
+        sql = "UPDATE message_properties SET value='00' WHERE id="_ns;
+        wanted = NS_ERROR_FILE_CORRUPTED;
+      }
+      if (mode == 13)
+        sql = "UPDATE message_properties SET value='0' WHERE id="_ns;
+      if (mode == 14) {
+        sql = "UPDATE message_properties SET value='F' WHERE id="_ns;
+        wanted = NS_ERROR_FILE_CORRUPTED;
+      }
+      sql.AppendInt(key);
+      sql.AppendLiteral(" AND name='uidOnServer'");
+    }
+    if (mode == 15 || mode == 16) {
+      sql = mode == 15 ? "DELETE FROM message_properties WHERE id="_ns
+                       : "UPDATE message_properties SET value='0' WHERE id="_ns;
+      sql.AppendInt(key);
+      sql.AppendLiteral(" AND name='lineCount'");
+    }
+    if (mode == 17) ++supplied.destination->epoch;
+    if (mode == 18) ++supplied.appendBody->contentRevision;
+    if (mode == 19) ++supplied.appendBody->locationRevision;
+    if (mode == 20) {
+      sql = "INSERT INTO message_properties(id,name,value) VALUES("_ns;
+      sql.AppendInt(key);
+      sql.AppendLiteral(", 'panoramaAcceptedAppendObservation', 'forged')");
+    }
+    if (mode == 22) supplied.id = UINT64_MAX;
+    if (!sql.IsEmpty()) ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+    if (mode == 22) wanted = NS_ERROR_INVALID_ARG;
+    nsCString history, physical;
+    ASSERT_EQ(NS_OK, AppendObservationHistory(key, history));
+    ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, physical));
+    bool observed = !bound;
+    EXPECT_EQ(wanted, db.ReadRetainedAcceptedAppend(supplied, observed));
+    EXPECT_EQ(!bound, observed);
+    nsCString after;
+    ASSERT_EQ(NS_OK, AppendObservationHistory(key, after));
+    EXPECT_EQ(history, after);
+    ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, after));
+    EXPECT_EQ(physical, after);
+    bool active;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       RetainedAcceptedAppendReadRejectsOtherCustodyAndAliases) {
+  ASSERT_EQ(NS_OK, Start());
+  for (bool bound : {false, true}) {
+    for (uint32_t mode = 0; mode < (bound ? 6u : 4u); ++mode) {
+      SCOPED_TRACE(bound);
+      SCOPED_TRACE(mode);
+      nsMsgKey key;
+      MessageBodyState body;
+      OfflineAttempt expected;
+      ASSERT_EQ(NS_OK, AcceptedAppend(key, body, expected));
+      auto& db = mCore->MessageDB();
+      uint32_t uid = 830000 + key;
+      if (bound) {
+        ServerMessageLocation mapping = OnlineSentinel();
+        RefPtr<Message> live;
+        ASSERT_EQ(NS_OK, db.AssociateAcceptedAppendObservation(
+                             expected, 7, uid, mapping, getter_AddRefs(live)));
+      }
+      nsresult wanted = NS_ERROR_NOT_AVAILABLE;
+      nsAutoCString sql;
+      if (mode == 0) {
+        sql =
+            "INSERT INTO imap_import_operation_holds SELECT id,"
+            "(SELECT sourceId FROM database_identity),folderId,messageKey "
+            "FROM offline_operations WHERE messageKey="_ns;
+        sql.AppendInt(key);
+      } else if (mode == 1 || mode == 2) {
+        nsMsgKey other;
+        ASSERT_EQ(NS_OK, Add("retained-other-custody"_ns, {}, other));
+        OfflineOperationData op;
+        op.operation = mode == 1 ? nsIMsgOfflineImapOperation::kMsgMoved
+                                 : nsIMsgOfflineImapOperation::kMsgCopy;
+        if (mode == 2) op.copyDestinations = {"actual-other-destination"_ns};
+        ASSERT_EQ(NS_OK, db.StoreOfflineOperation(mFolderId, other, op));
+        sql =
+            mode == 1
+                ? "UPDATE offline_operations SET destinationFolderId="_ns
+                : "UPDATE offline_copy_destinations SET destinationFolderId="_ns;
+        sql.AppendInt(mFolderId);
+        sql.AppendLiteral(",destinationKey=");
+        sql.AppendInt(key);
+        sql.AppendLiteral(",destinationEpoch=7 WHERE ");
+        if (mode == 1) {
+          sql.AppendLiteral("messageKey=");
+          sql.AppendInt(other);
+        } else {
+          sql.AppendLiteral(
+              "operationId IN (SELECT id FROM offline_operations WHERE "
+              "messageKey=");
+          sql.AppendInt(other);
+          sql.Append(')');
+        }
+      } else if (mode == 3) {
+        nsMsgKey other;
+        MessageBodyState otherBody;
+        OfflineAttempt otherAttempt;
+        ASSERT_EQ(NS_OK, QueuedAppend(other, otherBody, otherAttempt));
+        sql = "UPDATE offline_attempts SET destinationKey="_ns;
+        sql.AppendInt(key);
+        sql.AppendLiteral(" WHERE id=");
+        sql.AppendInt(otherAttempt.id);
+      } else {
+        nsMsgKey other;
+        if (mode == 4) {
+          ASSERT_EQ(NS_OK, Add("retained-published-alias"_ns, {}, other));
+        } else {
+          ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, RawHdr{}, &other));
+        }
+        RefPtr<Message> header = new Message(other);
+        ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", uid));
+        wanted = NS_ERROR_FILE_CORRUPTED;
+      }
+      if (!sql.IsEmpty()) ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+      nsCString history, physical;
+      ASSERT_EQ(NS_OK, AppendObservationHistory(key, history));
+      ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, physical));
+      bool observed = !bound;
+      EXPECT_EQ(wanted, db.ReadRetainedAcceptedAppend(expected, observed));
+      EXPECT_EQ(!bound, observed);
+      nsCString after;
+      ASSERT_EQ(NS_OK, AppendObservationHistory(key, after));
+      EXPECT_EQ(history, after);
+      ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, after));
+      EXPECT_EQ(physical, after);
+    }
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       RetainedAcceptedAppendReadSqlAndReentryKeepOutputAndRows) {
+  ASSERT_EQ(NS_OK, Start());
+  for (uint32_t mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    nsMsgKey key;
+    MessageBodyState body;
+    OfflineAttempt expected;
+    ASSERT_EQ(NS_OK, AcceptedAppend(key, body, expected));
+    auto& db = mCore->MessageDB();
+    ServerMessageLocation mapping = OnlineSentinel();
+    RefPtr<Message> live;
+    ASSERT_EQ(NS_OK,
+              db.AssociateAcceptedAppendObservation(
+                  expected, 7, 840000 + key, mapping, getter_AddRefs(live)));
+    nsCString history, physical;
+    ASSERT_EQ(NS_OK, AppendObservationHistory(key, history));
+    ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, physical));
+    if (mode == 2) {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "PRAGMA foreign_keys=ON; "
+              "CREATE TEMP TABLE retained_parent(id INTEGER PRIMARY KEY); "
+              "CREATE TEMP TABLE retained_child(id INTEGER REFERENCES "
+              "retained_parent(id) DEFERRABLE INITIALLY DEFERRED)"_ns));
+    }
+    auto cleanupTables = MakeScopeExit([&] {
+      EXPECT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TABLE IF EXISTS temp.retained_child; "
+                           "DROP TABLE IF EXISTS temp.retained_parent; "
+                           "PRAGMA foreign_keys=OFF"_ns));
+    });
+    bool observed = false;
+    RefPtr<FaultWitness> witness = new FaultWitness();
+    witness->mAction = [&]() -> nsresult {
+      EXPECT_FALSE(observed);
+      bool nested = true;
+      EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+                db.ReadRetainedAcceptedAppend(expected, nested));
+      EXPECT_TRUE(nested);
+      ServerMessageLocation sentinel = OnlineSentinel();
+      RefPtr<Message> duplicate;
+      EXPECT_EQ(NS_ERROR_IN_PROGRESS, db.AssociateAcceptedAppendObservation(
+                                          expected, 7, 840000 + key, sentinel,
+                                          getter_AddRefs(duplicate)));
+      ExpectOnlineSentinel(sentinel);
+      EXPECT_FALSE(duplicate);
+      if (mode == 2 && witness->mCalls == 1) {
+        MOZ_TRY(mConnection->ExecuteSimpleSQL(
+            "INSERT INTO temp.retained_child VALUES(1)"_ns));
+      }
+      return mode == 1 && witness->mCalls == 2 ? NS_ERROR_FAILURE : NS_OK;
+    };
+    ASSERT_EQ(NS_OK, mConnection->CreateFunction("retained_read_reentry"_ns, 1,
+                                                 witness));
+    nsCOMPtr<mozIStorageStatement> previous;
+    ASSERT_EQ(NS_OK,
+              InstallOnlineStatementFault(
+                  "ReadRetainedAcceptedAppendUid"_ns,
+                  "SELECT value FROM message_properties WHERE id=:key "
+                  "AND name='uidOnServer' AND retained_read_reentry(:key)=0"_ns,
+                  previous));
+    auto restore = MakeScopeExit([&] {
+      RestoreOnlineStatement("ReadRetainedAcceptedAppendUid"_ns, previous);
+      EXPECT_EQ(NS_OK, mConnection->RemoveFunction("retained_read_reentry"_ns));
+    });
+    EXPECT_EQ(mode == 1   ? NS_ERROR_FAILURE
+              : mode == 2 ? NS_ERROR_STORAGE_CONSTRAINT
+                          : NS_OK,
+              db.ReadRetainedAcceptedAppend(expected, observed));
+    EXPECT_EQ(mode == 0, observed);
+    EXPECT_EQ(2u, witness->mCalls);
+    if (mode == 2) {
+      nsCString count;
+      ASSERT_EQ(NS_OK,
+                PublicationCell(mConnection, key,
+                                "SELECT count(*) FROM temp.retained_child "
+                                "WHERE :id>0"_ns,
+                                count));
+      EXPECT_EQ("0"_ns, count);
+    }
+    nsCString after;
+    ASSERT_EQ(NS_OK, AppendObservationHistory(key, after));
+    EXPECT_EQ(history, after);
+    ASSERT_EQ(NS_OK, AppendObservationPhysicalFacts(key, after));
+    EXPECT_EQ(physical, after);
+    bool active;
+    ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+    EXPECT_FALSE(active);
+  }
+}
+
+TEST_F(DeliveryCoreReferences,
+       RetainedAcceptedAppendReadPreservesForeignTransactionAndRetiredOwner) {
+  ASSERT_EQ(NS_OK, Start());
+  nsMsgKey key;
+  MessageBodyState body;
+  OfflineAttempt expected;
+  ASSERT_EQ(NS_OK, AcceptedAppend(key, body, expected));
+  RefPtr<MessageDatabase> old = &mCore->MessageDB();
+  ASSERT_EQ(NS_OK, mConnection->BeginTransaction());
+  nsAutoCString sql("INSERT INTO folder_properties(id,name,value) VALUES(");
+  sql.AppendInt(mFolderId);
+  sql.AppendLiteral(", 'retained-caller-owned', 'unchanged')");
+  ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(sql));
+  bool observed = true;
+  EXPECT_EQ(NS_ERROR_IN_PROGRESS,
+            old->ReadRetainedAcceptedAppend(expected, observed));
+  EXPECT_TRUE(observed);
+  bool active;
+  ASSERT_EQ(NS_OK, mConnection->GetTransactionInProgress(&active));
+  EXPECT_TRUE(active);
+  nsCString marker;
+  ASSERT_EQ(NS_OK, PublicationCell(
+                       mConnection, mFolderId,
+                       "SELECT value FROM folder_properties WHERE id=:id AND "
+                       "name='retained-caller-owned'"_ns,
+                       marker));
+  EXPECT_EQ("unchanged"_ns, marker);
+  ASSERT_EQ(NS_OK, mConnection->RollbackTransaction());
+  Stop();
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            old->ReadRetainedAcceptedAppend(expected, observed));
+  EXPECT_TRUE(observed);
+  ASSERT_EQ(NS_OK, Start());
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            old->ReadRetainedAcceptedAppend(expected, observed));
+  EXPECT_TRUE(observed);
+  EXPECT_EQ(NS_OK,
+            mCore->MessageDB().ReadRetainedAcceptedAppend(expected, observed));
+  EXPECT_FALSE(observed);
+  EXPECT_EQ(NS_OK, mCore->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
+                       expected));
+}
+
 }  // namespace mozilla::mailnews

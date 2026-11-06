@@ -1090,7 +1090,9 @@ async function publicationInput() {
   }
   await reloadPublishedBooks();
   const id = "publication-book-" + ++serial;
-  const root = PathUtils.join(home, id);
+  // Journal, backup and stage use the harness's separate per-test temp tree.
+  // The actual current profile remains the read-only source admission root.
+  const root = PathUtils.join(do_get_tempdir().path, id);
   await IOUtils.makeDirectory(root);
   const profilePath = publicationLock.directory.path;
   const source = PathUtils.join(profilePath, id + ".mab");

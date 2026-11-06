@@ -570,7 +570,9 @@ export class SQLiteDirectory extends AddrBookDirectory {
   /**
    * Reads a completed book and verifies its original bytes and scoped UID maps.
    * Never initializes a schema, imports a row or allocates an identity. A closed
-   * stage must have no cached owner or SQLite sidecar. A published retry can
+   * stage must have no cached owner or data-bearing WAL/rollback journal.
+   * Native empty WAL files and retained regular shared-memory indexes are safe.
+   * A published retry can
    * reuse its known directory connection without changing that connection.
    *
    * @param {nsIFile} file - Existing regular schema-4 book file.
@@ -626,8 +628,22 @@ export class SQLiteDirectory extends AddrBookDirectory {
       }
       if (!db) {
         for (const suffix of ["-wal", "-shm", "-journal"]) {
-          if (new lazy.FileUtils.File(target.path + suffix).exists()) {
-            throw new Error("Closed book stage has a SQLite sidecar");
+          const sidecar = new lazy.FileUtils.File(target.path + suffix);
+          try {
+            // lstat distinguishes dangling links from an absent auxiliary.
+            if (
+              sidecar.isSymlink() ||
+              !sidecar.isFile() ||
+              (suffix != "-shm" && sidecar.fileSize)
+            ) {
+              throw new Error(
+                "Closed book stage has an unsafe or data-bearing SQLite sidecar"
+              );
+            }
+          } catch (error) {
+            if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND) {
+              throw error;
+            }
           }
         }
       }

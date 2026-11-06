@@ -746,11 +746,40 @@ add_task(
     );
     input.connection.close();
     input.connection = null;
+    const wal = input.file.clone();
+    wal.leafName += "-wal";
+    if (wal.exists()) {
+      Assert.ok(wal.isFile(), "Native retained WAL is a regular file");
+      Assert.equal(wal.fileSize, 0, "Real close leaves no WAL page data");
+    }
     const before = await IOUtils.read(input.file.path);
     Assert.deepEqual(
       SQLiteDirectory.validateMigrationBook(input.file, input.bytes, SOURCE_ID),
       receipt
     );
+    // An empty native auxiliary is safe; actual retained page bytes are not.
+    const hadWal = wal.exists();
+    const originalWal = hadWal ? await IOUtils.read(wal.path) : null;
+    try {
+      await IOUtils.write(wal.path, new Uint8Array([1]));
+      Assert.throws(
+        () =>
+          SQLiteDirectory.validateMigrationBook(
+            input.file,
+            input.bytes,
+            SOURCE_ID
+          ),
+        /data-bearing SQLite sidecar/,
+        "A closed-looking stage with WAL bytes is refused without recovery"
+      );
+      Assert.deepEqual(await IOUtils.read(wal.path), new Uint8Array([1]));
+    } finally {
+      if (hadWal) {
+        await IOUtils.write(wal.path, originalWal);
+      } else {
+        await IOUtils.remove(wal.path);
+      }
+    }
     Assert.deepEqual(await IOUtils.read(input.file.path), before);
     Assert.deepEqual(seen, [], "Readback emits no publication events");
     Assert.throws(

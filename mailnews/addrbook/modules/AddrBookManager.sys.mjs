@@ -385,6 +385,40 @@ function checkMigrationBookSnapshot(sourceBytes) {
 }
 
 /**
+ * Rejects unsafe or data-bearing auxiliaries without changing a closed stage.
+ *
+ * Native close can retain empty WAL/journal files and a regular SHM index.
+ * The actual storage validator still owns live-connection/transaction checks.
+ *
+ * @param {nsIFile} stage - Canonical closed stage whose auxiliaries are read.
+ * @throws {Error} For unsafe/data-bearing auxiliaries or a native read failure.
+ */
+function checkMigrationBookAuxiliaries(stage) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const sidecar = stage.clone();
+    sidecar.leafName += suffix;
+    let linked;
+    try {
+      linked = sidecar.isSymlink();
+    } catch (error) {
+      // Unix lstat reports ENOENT for an absent auxiliary. Other read errors
+      // retain their original native identity; a dangling symlink is not absent.
+      if (error.result === Cr.NS_ERROR_FILE_NOT_FOUND) {
+        continue;
+      }
+      throw error;
+    }
+    if (
+      linked ||
+      (sidecar.exists() &&
+        (!sidecar.isFile() || (suffix != "-shm" && sidecar.fileSize)))
+    ) {
+      throw new Error("Migration book stage still has SQLite sidecar data");
+    }
+  }
+}
+
+/**
  * Publishes one complete, closed legacy-book stage in the current profile.
  *
  * The caller retains the native selected-profile lock through its journal
@@ -490,13 +524,7 @@ export async function adoptMigrationAddressBook({
       ),
       expected
     );
-    for (const suffix of ["-wal", "-shm", "-journal"]) {
-      const sidecar = stage.clone();
-      sidecar.leafName += suffix;
-      if (sidecar.exists() && sidecar.fileSize) {
-        throw new Error("Migration book stage still has SQLite sidecar data");
-      }
-    }
+    checkMigrationBookAuxiliaries(stage);
     const recordText = Services.prefs.getStringPref(key, "");
     let record = null;
     if (recordText) {
@@ -640,15 +668,7 @@ export async function adoptMigrationAddressBook({
           ),
           expected
         );
-        for (const suffix of ["-wal", "-shm", "-journal"]) {
-          const sidecar = stage.clone();
-          sidecar.leafName += suffix;
-          if (sidecar.exists() && sidecar.fileSize) {
-            throw new Error(
-              "Migration book stage still has SQLite sidecar data"
-            );
-          }
-        }
+        checkMigrationBookAuxiliaries(stage);
         if (targetExisted) {
           if (!migrationBookFile(target).isFile()) {
             throw new Error("Migration book destination is not a regular file");

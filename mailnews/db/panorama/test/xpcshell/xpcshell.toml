@@ -191,6 +191,8 @@ prefs = [
 
 ["test_msgFolders.js"]
 
+["test_panoramaTrialRebuild.js"]
+
 ["test_perFolderDatabase.js"]
 
 ["test_reconcile.js"]

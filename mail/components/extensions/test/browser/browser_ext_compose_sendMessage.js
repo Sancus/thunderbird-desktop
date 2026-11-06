@@ -976,8 +976,8 @@ async function checkImapFcc(retry) {
     recovery = (async () => {
       let retryDialog;
       await BrowserTestUtils.promiseAlertDialog(undefined, undefined, {
-        async callback(win) {
-          recoveryDialog = win;
+        async callback(alertWindow) {
+          recoveryDialog = alertWindow;
           await TestUtils.waitForTick();
           protocolAlerts++;
           Assert.equal(
@@ -986,7 +986,7 @@ async function checkImapFcc(retry) {
             "The rejected APPEND reports one command error"
           );
           Assert.stringContains(
-            win.document.getElementById("infoBody").textContent,
+            alertWindow.document.getElementById("infoBody").textContent,
             "APPEND failed.",
             "The original server rejection is shown before copy recovery"
           );
@@ -1038,7 +1038,10 @@ async function checkImapFcc(retry) {
               },
             }
           );
-          win.document.querySelector("dialog").getButton("accept").click();
+          alertWindow.document
+            .querySelector("dialog")
+            .getButton("accept")
+            .click();
         },
       });
       await retryDialog;

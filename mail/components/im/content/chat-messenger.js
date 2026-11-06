@@ -310,7 +310,19 @@ var chatTabType = {
     }
 
     const item = document.getElementById("searchResultConv");
-    item.log = aArgs.conv;
+    if (aArgs.nativeChatLog) {
+      if (aArgs.nativeChatLog.status != "ready" || aArgs.signal?.aborted) {
+        return;
+      }
+      item.nativeChatLog = {
+        resolved: aArgs.nativeChatLog,
+        signal: aArgs.signal,
+      };
+      delete item.log;
+    } else {
+      delete item.nativeChatLog;
+      item.log = aArgs.conv;
+    }
     if (aArgs.searchTerm) {
       item.searchTerm = aArgs.searchTerm;
     } else {
@@ -371,6 +383,7 @@ var chatTabType = {
     chatHandler._updateFocus();
   },
   closeTab() {
+    chatHandler.cancelNativeChatLog();
     gChatTab = null;
     const tabmail = document.getElementById("tabmail");
     tabmail.unregisterTabMonitor(this.tabMonitor);
@@ -674,8 +687,22 @@ var chatHandler = {
     if (!aConversation) {
       return;
     }
+    if (this._nativeChatLog?.request.resolved.conversation != aConversation) {
+      this._nativeChatLog = null;
+    }
     this._showLogPanel();
     const browser = document.getElementById("conv-log-browser");
+    if (this._logFindListener) {
+      browser.removeEventListener("MessagesDisplayed", this._logFindListener);
+      this._logFindListener = null;
+    }
+    delete this._pendingSearchTerm;
+    const findbar = document.getElementById("log-findbar");
+    findbar._findField.value = "";
+    findbar.close();
+    if (aSearchTerm) {
+      this._pendingSearchTerm = aSearchTerm;
+    }
     browser._convScrollEnabled = false;
     if (this._pendingLogBrowserLoad) {
       browser._conv = aConversation;
@@ -683,9 +710,6 @@ var chatHandler = {
     }
     browser.init(aConversation);
     this._pendingLogBrowserLoad = true;
-    if (aSearchTerm) {
-      this._pendingSearchTerm = aSearchTerm;
-    }
     Services.obs.addObserver(this, "conversation-loaded");
 
     // Conversation title may not be set yet if this is a search result.
@@ -915,9 +939,49 @@ var chatHandler = {
       item.convView.focus();
     }
   },
+  /**
+   * Cancels a native search selection and hides its old content and match.
+   * A pending browser load remains attached until its actual completion, so
+   * a replacement can reuse that load without adding another load listener.
+   */
+  cancelNativeChatLog() {
+    const state = this._nativeChatLog;
+    if (!state) {
+      return;
+    }
+    state.active = false;
+    state.request.signal?.removeEventListener("abort", state.cancel);
+    const item = document.getElementById("searchResultConv");
+    if (item.nativeChatLog === state.request) {
+      delete item.nativeChatLog;
+      item.hidden = true;
+    }
+    delete this._pendingSearchTerm;
+    const browser = document.getElementById("conv-log-browser");
+    if (this._logFindListener) {
+      browser.removeEventListener("MessagesDisplayed", this._logFindListener);
+      this._logFindListener = null;
+    }
+    const findbar = document.getElementById("log-findbar");
+    findbar._findField.value = "";
+    findbar.close();
+    hideConversationsBoxPanels();
+    document.getElementById("noConvScreen").hidden = false;
+    if (!this._pendingLogBrowserLoad) {
+      this._nativeChatLog = null;
+    }
+  },
+
   onListItemSelected() {
     const contactlistbox = document.getElementById("contactlistbox");
     const item = contactlistbox.selectedItem;
+    if (
+      this._nativeChatLog?.active &&
+      item?.nativeChatLog === this._nativeChatLog.request
+    ) {
+      return;
+    }
+    this.cancelNativeChatLog();
     if (
       !item ||
       item.hidden ||
@@ -944,14 +1008,41 @@ var chatHandler = {
       // Always hide encryption options for search conv
       ChatEncryption.hideEncryptionButton(document);
 
-      let path = "logs/" + item.log.path;
+      if (item.nativeChatLog) {
+        const request = item.nativeChatLog;
+        if (request.signal?.aborted) {
+          delete item.nativeChatLog;
+          item.hidden = true;
+          return;
+        }
+        const state = {
+          request,
+          active: true,
+          cancel: () => this.cancelNativeChatLog(),
+        };
+        this._nativeChatLog = state;
+        request.signal?.addEventListener("abort", state.cancel, { once: true });
+        document.getElementById("logTree").view = null;
+        this._showLog(request.resolved.conversation, item.searchTerm);
+        this.updateTitle();
+        return;
+      }
+      const selectedLog = item.log;
+      let path = "logs/" + selectedLog.path;
       path = PathUtils.join(
         Services.dirsvc.get("ProfD", Ci.nsIFile).path,
         ...path.split("/")
       );
       IMServices.logs.getLogFromFile(path, true).then(aLog => {
+        if (item.log !== selectedLog || item.nativeChatLog) {
+          return;
+        }
         IMServices.logs.getSimilarLogs(aLog).then(aSimilarLogs => {
-          if (contactlistbox.selectedItem != item) {
+          if (
+            contactlistbox.selectedItem != item ||
+            item.log !== selectedLog ||
+            item.nativeChatLog
+          ) {
             return;
           }
           this._pendingSearchTerm = item.searchTerm || undefined;
@@ -1333,6 +1424,9 @@ var chatHandler = {
     }
   },
   _onTabDeactivated(aHidden) {
+    if (aHidden) {
+      this.cancelNativeChatLog();
+    }
     const convView = chatHandler._getActiveConvView();
     if (convView) {
       convView.switchingAwayFromPanel(aHidden);
@@ -1350,6 +1444,20 @@ var chatHandler = {
         return;
       }
 
+      const native = this._nativeChatLog;
+      if (
+        native &&
+        (!native.active ||
+          native.request.signal?.aborted ||
+          !gChatTab ||
+          document.getElementById("contactlistbox").selectedItem
+            ?.nativeChatLog !== native.request)
+      ) {
+        this._pendingLogBrowserLoad = false;
+        this._nativeChatLog = null;
+        Services.obs.removeObserver(this, "conversation-loaded");
+        return;
+      }
       for (const msg of browser._conv.getMessages()) {
         if (!msg.system) {
           msg.color =
@@ -1364,7 +1472,11 @@ var chatHandler = {
         findbar.open();
         browser.focus();
         delete this._pendingSearchTerm;
-        const eventListener = function () {
+        const eventListener = () => {
+          if (native && (!native.active || native !== this._nativeChatLog)) {
+            browser.removeEventListener("MessagesDisplayed", eventListener);
+            return;
+          }
           findbar.onFindAgainCommand();
           if (findbar._findFailedString && browser._messageDisplayPending) {
             return;
@@ -1372,6 +1484,7 @@ var chatHandler = {
           // Search result found or all messages added, we're done.
           browser.removeEventListener("MessagesDisplayed", eventListener);
         };
+        this._logFindListener = eventListener;
         browser.addEventListener("MessagesDisplayed", eventListener);
       }
       this._pendingLogBrowserLoad = false;

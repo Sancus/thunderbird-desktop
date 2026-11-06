@@ -350,6 +350,312 @@ add_task(async function test_closeDrainsActualLoggerWorkAndRestartResumes() {
   await f.service.close();
 });
 
+add_task(async function test_collectResultsKeepsUnicodeAndPhysicalPages() {
+  const f = await serviceFixture("native-query-pages");
+  await writeServiceMessage(
+    f,
+    "first",
+    "é 😀 Café nativequerypagesneedle first"
+  );
+  const firstPath = f.writer.currentPath;
+  f.writer.startNewFile(f.conversation.startDate / 1000 + 1000, true);
+  await writeServiceMessage(
+    f,
+    "second",
+    "é 😀 Café nativequerypagesneedle second"
+  );
+  const secondPath = f.writer.currentPath;
+  const result = await f.service.collectResults("cafe nativequerypagesneedle", {
+    limit: 1,
+  });
+  Assert.equal(result.query, "cafe nativequerypagesneedle");
+  Assert.ok(result.resultSetId);
+  Assert.deepEqual(
+    result.items.map(item => item.hit.id).sort(),
+    [firstPath, secondPath].map(chatSearchDocumentId).sort()
+  );
+  for (const { hit, document, snippet } of result.items) {
+    Assert.equal(hit.id, document.id);
+    Assert.equal(hit.contentRevision, document.contentRevision);
+    Assert.equal(hit.textRevision, document.textRevision);
+    Assert.equal(snippet.firstMatchText, "Café");
+    Assert.equal(
+      snippet.text.substring(snippet.ranges[0].start, snippet.ranges[0].end),
+      "Café",
+      "FTS UTF8 offsets select the whole accented word after an astral character"
+    );
+    Assert.ok(Object.isFrozen(hit));
+  }
+  Assert.deepEqual(f.errors, []);
+  Assert.ok(
+    !Cu.isESModuleLoaded("resource:///modules/GlodaIMSearcher.sys.mjs")
+  );
+  await f.service.close();
+});
+
+add_task(async function test_collectResultsRejectsChangedProjectionAndAbort() {
+  const f = await serviceFixture("native-query-stale");
+  await writeServiceMessage(f, "edited", "nativequerystaleneedle");
+  const getText = f.service.getText;
+  f.service.getText = async function (...args) {
+    f.conversation.updateMessage("sender", "nativequeryreplacementneedle", {
+      incoming: true,
+      remoteId: "edited",
+      time: f.conversation.startDate / 1000000 + 2,
+    });
+    return getText.apply(this, args);
+  };
+  try {
+    await Assert.rejects(
+      f.service.collectResults("nativequerystaleneedle"),
+      /Chat transcript changed during query/,
+      "A real source replacement cannot become a partial or old-text success"
+    );
+  } finally {
+    f.service.getText = getText;
+  }
+  const controller = new AbortController();
+  const reason = new Error("Cancel current native chat query");
+  controller.abort(reason);
+  await Assert.rejects(
+    f.service.collectResults("nativequeryreplacementneedle", {
+      signal: controller.signal,
+    }),
+    error => error === reason
+  );
+  Assert.equal(
+    (await f.service.collectResults("nativequeryreplacementneedle")).items
+      .length,
+    1
+  );
+  await f.service.close();
+});
+
+add_task(
+  async function test_collectResultsKeepsTitleOnlyMatchWithoutBodyHighlight() {
+    const f = await serviceFixture("native-query-title");
+    await writeServiceMessage(f, "first", "nativebodywithouttitlematch");
+    const id = chatSearchDocumentId(f.writer.currentPath);
+    const row = (await f.service.collectResults("buddy")).items.find(
+      item => item.hit.id == id
+    );
+    Assert.ok(row, "The actual conversation title supplies this result");
+    Assert.deepEqual(row.snippet.ranges, []);
+    Assert.equal(row.snippet.firstMatchText, null);
+    await f.service.close();
+  }
+);
+
+add_task(async function test_collectResultsRejectsPrivacyAfterTextWasRead() {
+  const f = await serviceFixture("native-query-privacy");
+  await writeServiceMessage(f, "private", "nativequeryprivacyneedle");
+  const getText = f.service.getText;
+  f.service.getText = async function (...args) {
+    const document = await getText.apply(this, args);
+    f.conversation.updateMessage("sender", "neverpublishqueryprivacy", {
+      incoming: true,
+      noLog: true,
+      remoteId: "private",
+      time: f.conversation.startDate / 1000000 + 2,
+    });
+    return document;
+  };
+  try {
+    await Assert.rejects(
+      f.service.collectResults("nativequeryprivacyneedle"),
+      /Chat privacy changed during query/,
+      "Already read private text cannot be published after real observed erasure"
+    );
+  } finally {
+    f.service.getText = getText;
+  }
+  Assert.equal(
+    (await f.service.collectResults("nativequeryprivacyneedle")).items.length,
+    0
+  );
+  const bytes = await IOUtils.readUTF8(f.writer.currentPath);
+  Assert.ok(!bytes.includes("nativequeryprivacyneedle"));
+  Assert.ok(!bytes.includes("neverpublishqueryprivacy"));
+  await f.service.close();
+});
+
+add_task(
+  async function test_resolveLogKeepsCurrentUnicodeMatchAndPhysicalIdentity() {
+    const f = await serviceFixture("native-reader-match");
+    await writeServiceMessage(
+      f,
+      "selected",
+      "é 😀 Café nativereadermatchneedle"
+    );
+    const path = f.writer.currentPath;
+    const [{ hit, snippet }] = (
+      await f.service.collectResults("cafe nativereadermatchneedle")
+    ).items;
+    const resolved = await f.service.resolveLog(hit);
+    Assert.equal(resolved.status, "ready");
+    Assert.equal(resolved.log.path, path);
+    Assert.equal(resolved.id, chatSearchDocumentId(path));
+    Assert.equal(resolved.contentRevision, hit.contentRevision);
+    Assert.equal(resolved.textRevision, hit.textRevision);
+    Assert.equal(snippet.firstMatchText, "Café");
+    Assert.deepEqual(
+      resolved.conversation.getMessages().map(message => message.message),
+      ["é 😀 Café nativereadermatchneedle"]
+    );
+    await f.service.close();
+  }
+);
+
+add_task(
+  async function test_resolveLogCapturesHitAndDrainsPendingSourceChanges() {
+    const f = await serviceFixture("native-reader-pending");
+    await writeServiceMessage(f, "first", "nativereaderpendingneedle");
+    const path = f.writer.currentPath;
+    const [hit] = (await f.service.search("nativereaderpendingneedle")).items;
+    const gate = Promise.withResolvers();
+    const entered = Promise.withResolvers();
+    const held = queueFileOperation(path, async () => {
+      entered.resolve();
+      await gate.promise;
+    });
+    registerCleanupFunction(() => gate.resolve());
+    await entered.promise;
+    const mutable = { ...hit };
+    const opening = f.service.resolveLog(mutable);
+    mutable.id = "not-the-selected-file";
+    mutable.contentRevision = "not-the-selected-revision";
+    gate.resolve();
+    await held;
+    Assert.equal(
+      (await opening).id,
+      hit.id,
+      "Click tokens were copied before flush"
+    );
+
+    const sourceGate = Promise.withResolvers();
+    const sourceEntered = Promise.withResolvers();
+    const queued = queueFileOperation(path, async () => {
+      sourceEntered.resolve();
+      await sourceGate.promise;
+    });
+    registerCleanupFunction(() => sourceGate.resolve());
+    await sourceEntered.promise;
+    const staleOpening = f.service.resolveLog(hit);
+    f.conversation.writeMessage("sender", "nativependingappendneedle", {
+      incoming: true,
+      remoteId: "later",
+      time: f.conversation.startDate / 1000000 + 2,
+    });
+    sourceGate.resolve();
+    await queued;
+    Assert.deepEqual(await staleOpening, { status: "stale" });
+    Assert.equal(
+      (await f.service.collectResults("nativependingappendneedle")).items
+        .length,
+      1
+    );
+    await f.service.close();
+  }
+);
+
+add_task(
+  async function test_resolveLogSuppressesObservedPrivacyBeforeOpening() {
+    const f = await serviceFixture("native-reader-privacy");
+    await writeServiceMessage(f, "private", "nativereaderprivateneedle");
+    const [hit] = (await f.service.search("nativereaderprivateneedle")).items;
+    f.conversation.updateMessage("sender", "neverpersistreaderpayload", {
+      incoming: true,
+      noLog: true,
+      remoteId: "private",
+      time: f.conversation.startDate / 1000000 + 2,
+    });
+    Assert.deepEqual(await f.service.resolveLog(hit), { status: "stale" });
+    Assert.equal(
+      (await f.service.collectResults("nativereaderprivateneedle")).items
+        .length,
+      0
+    );
+    const bytes = await IOUtils.readUTF8(f.writer.currentPath);
+    Assert.ok(!bytes.includes("nativereaderprivateneedle"));
+    Assert.ok(!bytes.includes("neverpersistreaderpayload"));
+    await f.service.close();
+  }
+);
+
+add_task(async function test_resolveLogPreservesFailureCancellationAndClose() {
+  const f = await serviceFixture("native-reader-errors");
+  await writeServiceMessage(f, "first", "nativereadererrorneedle");
+  const [hit] = (await f.service.search("nativereadererrorneedle")).items;
+  const getLogFromFile = logs.getLogFromFile;
+  const failure = new Error("Original native reader parser failure");
+  logs.getLogFromFile = async () => {
+    throw failure;
+  };
+  try {
+    await Assert.rejects(f.service.resolveLog(hit), error => error === failure);
+  } finally {
+    logs.getLogFromFile = getLogFromFile;
+  }
+  Assert.equal((await f.service.resolveLog(hit)).status, "ready");
+  const controller = new AbortController();
+  const reason = new Error("Cancel current native chat opening");
+  controller.abort(reason);
+  await Assert.rejects(
+    f.service.resolveLog(hit, { signal: controller.signal }),
+    error => error === reason
+  );
+  await Assert.rejects(
+    f.service.resolveLog({ id: hit.id }),
+    /current chat search hit/
+  );
+  const closing = f.service.close();
+  await Assert.rejects(f.service.resolveLog(hit), /service is closing/);
+  await Assert.rejects(
+    f.service.collectResults("nativereadererrorneedle"),
+    /service is closing/
+  );
+  await closing;
+});
+
+add_task(
+  async function test_readerOperationsPreserveFirstObservedWriteFailure() {
+    const f = await serviceFixture("native-reader-write-failure");
+    await writeServiceMessage(f, "first", "nativebeforewritefailureneedle");
+    const [hit] = (await f.service.search("nativebeforewritefailureneedle"))
+      .items;
+    const index = PanoramaSearchIndex.prototype.index;
+    const failure = new Error("Original queued native reader index failure");
+    PanoramaSearchIndex.prototype.index = function (document, ...args) {
+      return document.id === hit.id
+        ? Promise.reject(failure)
+        : index.call(this, document, ...args);
+    };
+    f.expectedFailure = failure;
+    try {
+      await Assert.rejects(
+        writeServiceMessage(f, "later", "nativeretainedwritefailureneedle"),
+        error => error === failure
+      );
+      await Assert.rejects(
+        f.service.resolveLog(hit),
+        error => error === failure
+      );
+      await Assert.rejects(
+        f.service.collectResults("nativebeforewritefailureneedle"),
+        error => error === failure
+      );
+      Assert.ok(
+        (await IOUtils.readUTF8(f.writer.currentPath)).includes(
+          "nativeretainedwritefailureneedle"
+        )
+      );
+      await Assert.rejects(f.service.close(), error => error === failure);
+    } finally {
+      PanoramaSearchIndex.prototype.index = index;
+    }
+  }
+);
+
 add_task(async function test_indexFailureIsNotARejectedSourceFile() {
   const f = await serviceFixture("storage-failure");
   await writeServiceMessage(f, "first-id", "beforestoragefailureneedle");

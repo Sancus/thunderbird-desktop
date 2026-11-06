@@ -356,13 +356,16 @@ async function checkLivePendingSource(kind) {
   const key = header.messageKey;
   const bytes = storedBody(folder, header);
   Assert.ok(bytes.includes("Keep this exact pending source body."));
-  const op = queueIntent(folder, header, kind);
-  const intent = [
-    op.operation,
-    op.newFlags,
-    op.destinationFolderURI,
-    op.playingBack,
+  const readOp = queued => [
+    queued.operation,
+    queued.newFlags,
+    queued.destinationFolderURI,
+    queued.playingBack,
   ];
+  // A pending delete/move wrapper held across SELECT stays alive until
+  // shutdown, after teardown has closed its Mork store. Re-read the stored
+  // operation after each SELECT instead of keeping the queued wrapper.
+  const intent = readOp(queueIntent(folder, header, kind));
   Assert.ok(db.containsKey(key));
   const added = [],
     deleted = [];
@@ -405,10 +408,7 @@ async function checkLivePendingSource(kind) {
       Assert.deepEqual(added, []);
       Assert.deepEqual(deleted, [removed.messageKey]);
       Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
-      Assert.deepEqual(
-        [op.operation, op.newFlags, op.destinationFolderURI, op.playingBack],
-        intent
-      );
+      Assert.deepEqual(readOp(db.getOfflineOpForKey(key, false)), intent);
       Assert.deepEqual(
         remote._messages.map(item => item.uid),
         [6101]

@@ -1886,8 +1886,12 @@ nsresult nsImapOfflineSync::ProcessNextOperation() {
           nsresult found = core->MessageDB().GetCurrentOfflineAttempt(
               folderId, m_CurrentKeys[m_KeyIndex], attempt);
           if (NS_SUCCEEDED(found) && attempt.appendAccepted) {
-            MOZ_TRY(core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
-                attempt));
+            nsresult validated =
+                core->MessageDB().ValidateOfflineAppendAcceptedWithoutUid(
+                    attempt);
+            // An observed binding does not grant a replay receipt. Complete
+            // the original listener on this refusal or any validation error.
+            if (NS_FAILED(validated)) return FinishPlayback(nullptr, validated);
             dispatchable &= ~attempt.operation;
           } else {
             NS_ENSURE_TRUE(

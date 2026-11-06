@@ -253,6 +253,23 @@ add_task(async function testOfflineMoveLocalToIMAP() {
       () => !manager.inProgress,
       "Observed accepted APPEND remains fenced against another send"
     );
+    let replayStops = 0;
+    const terminal = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl() {
+        replayStops++;
+      },
+    });
+    const terminalResult = terminal.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    const playback = MailServices.imap.playbackAllOfflineOperations(
+      null,
+      terminal
+    );
+    Assert.ok(playback, "The ordinary service owns the explicit replay");
+    Assert.equal(await terminalResult, Cr.NS_ERROR_NOT_AVAILABLE);
+    Assert.equal(replayStops, 1);
     const repeated = new PromiseTestUtils.PromiseUrlListener();
     imapINBOX.updateFolderWithListener(null, repeated);
     await repeated.promise;
@@ -266,6 +283,7 @@ add_task(async function testOfflineMoveLocalToIMAP() {
       current.getUint32Property("uidOnServer"),
       mailbox._messages[0].uid
     );
+    Assert.equal(replayStops, 1, "Later refresh cannot complete replay twice");
   }
 
   teardownTest();

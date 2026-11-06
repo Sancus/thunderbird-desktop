@@ -11853,11 +11853,34 @@ TEST_F(DeliveryCoreReferences, QueuedSourceCaptureFailureRollsBackIntent) {
   ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
   EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
   EXPECT_EQ(1u, attempt.revision);
-  ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(attemptId));
+  OfflineReplayCommandToken token;
+  ASSERT_EQ(NS_OK, db.BeginOfflineReplayCommand(
+                       attempt, OfflineReplayCommand::FlagSet, token));
+  ASSERT_EQ(NS_OK,
+            db.RecordOfflineReplayCommand(
+                token, OfflineReplayReceipt::Ambiguous, NS_ERROR_NET_TIMEOUT));
   ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
   ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
-  EXPECT_EQ(OfflineAttemptState::Ambiguous, attempt.state);
+  // Typed replay keeps the action Sent and records ambiguity on its command.
+  EXPECT_EQ(OfflineAttemptState::Sent, attempt.state);
   EXPECT_EQ(1u, attempt.revision);
+  ASSERT_TRUE(attempt.flagSet);
+  EXPECT_EQ(OfflineReplayCommandState::Ambiguous, attempt.flagSet->state);
+  EXPECT_EQ(1u, attempt.flagSet->generation);
+  ASSERT_TRUE(attempt.flagSet->firstError);
+  EXPECT_EQ(NS_ERROR_NET_TIMEOUT, *attempt.flagSet->firstError);
+  ASSERT_TRUE(attempt.firstError);
+  EXPECT_EQ(NS_ERROR_NET_TIMEOUT, *attempt.firstError);
+  ASSERT_TRUE(source);
+  EXPECT_EQ(700u, source->uid);
+  OfflineReplayCommandToken retry;
+  retry.generation = 99;
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.BeginOfflineReplayCommand(attempt, OfflineReplayCommand::FlagSet,
+                                         retry));
+  EXPECT_EQ(99u, retry.generation);
+  EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+            db.ConfirmOfflineAttempt(attemptId, Nothing()));
 }
 
 TEST_F(DeliveryCoreReferences, RetiredReferencesKeepLiveConversationMembers) {
@@ -14643,19 +14666,50 @@ TEST_F(DeliveryCoreReferences, UndoOfflineCaptureRejectsDispatchedOperations) {
               db.BeginOfflineAction(mFolderId, key,
                                     nsIMsgOfflineImapOperation::kFlagsChanged,
                                     Nothing(), Nothing(), attemptId));
+    OfflineAttempt attempt;
+    ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+    OfflineReplayCommandToken token;
+    ASSERT_EQ(NS_OK, db.BeginOfflineReplayCommand(
+                         attempt, OfflineReplayCommand::FlagSet, token));
     if (state == OfflineAttemptState::Confirmed) {
       // Confirmation requires the actual typed flag command acknowledgement.
-      OfflineAttempt attempt;
-      ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
-      OfflineReplayCommandToken token;
-      ASSERT_EQ(NS_OK, db.BeginOfflineReplayCommand(
-                           attempt, OfflineReplayCommand::FlagSet, token));
       ASSERT_EQ(NS_OK, db.RecordOfflineReplayCommand(
                            token, OfflineReplayReceipt::Acknowledged, NS_OK));
       ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(attemptId, Nothing()));
     } else if (state == OfflineAttemptState::Ambiguous) {
-      ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(attemptId));
+      ASSERT_EQ(NS_OK, db.RecordOfflineReplayCommand(
+                           token, OfflineReplayReceipt::Ambiguous,
+                           NS_ERROR_NET_TIMEOUT));
     }
+    ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+    // Ambiguity belongs to the typed command, never a synthetic action state.
+    EXPECT_EQ(state == OfflineAttemptState::Ambiguous
+                  ? OfflineAttemptState::Sent
+                  : state,
+              attempt.state);
+    ASSERT_TRUE(attempt.flagSet);
+    EXPECT_EQ(state == OfflineAttemptState::Confirmed
+                  ? OfflineReplayCommandState::Acknowledged
+              : state == OfflineAttemptState::Ambiguous
+                  ? OfflineReplayCommandState::Ambiguous
+                  : OfflineReplayCommandState::Sent,
+              attempt.flagSet->state);
+    EXPECT_EQ(1u, attempt.flagSet->generation);
+    if (state == OfflineAttemptState::Ambiguous) {
+      ASSERT_TRUE(attempt.firstError);
+      EXPECT_EQ(NS_ERROR_NET_TIMEOUT, *attempt.firstError);
+      ASSERT_TRUE(attempt.flagSet->firstError);
+      EXPECT_EQ(NS_ERROR_NET_TIMEOUT, *attempt.flagSet->firstError);
+    } else {
+      EXPECT_FALSE(attempt.firstError);
+      EXPECT_FALSE(attempt.flagSet->firstError);
+    }
+    OfflineReplayCommandToken retry;
+    retry.generation = 99;
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              db.BeginOfflineReplayCommand(
+                  attempt, OfflineReplayCommand::FlagSet, retry));
+    EXPECT_EQ(99u, retry.generation);
     EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, db.CaptureOfflineOperationForUndo(
                                           mFolderId, key, sourceId, operation));
     ASSERT_TRUE(operation.Operation());

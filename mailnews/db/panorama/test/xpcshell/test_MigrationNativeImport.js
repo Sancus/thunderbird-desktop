@@ -536,6 +536,38 @@ async function assertCommitted(input) {
   Assert.ok(
     ![...headers.get(imported.get(3)).properties].includes("growKeywords")
   );
+  const presentHeader = headers.get(imported.get(1));
+  const absentHeader = headers.get(imported.get(3));
+  const presentNames = [...presentHeader.properties].sort();
+  const absentNames = [...absentHeader.properties].sort();
+  Assert.equal(
+    presentHeader.getUint32Property("growKeywords"),
+    1,
+    "Imported legacy text retains its public numeric view"
+  );
+  Assert.equal(
+    absentHeader.getUint32Property("growKeywords"),
+    0,
+    "Reading an absent property returns zero"
+  );
+  Assert.equal(
+    presentHeader.getUint32Property("references"),
+    0,
+    "A present-empty property has a zero numeric view"
+  );
+  Assert.equal(presentHeader.getStringProperty("growKeywords"), "1");
+  Assert.equal(presentHeader.getStringProperty("references"), "");
+  Assert.equal(absentHeader.getStringProperty("growKeywords"), "");
+  Assert.deepEqual(
+    [...presentHeader.properties].sort(),
+    presentNames,
+    "Numeric reads preserve present property names"
+  );
+  Assert.deepEqual(
+    [...absentHeader.properties].sort(),
+    absentNames,
+    "Numeric reads do not invent absent properties"
+  );
   Assert.equal(
     input.folder.msgDatabase.dBFolderInfo.getUint32Property("sortType", 0),
     18
@@ -627,6 +659,12 @@ add_task(async function test_completeReaderCoordinatorNativeImportAndRepeat() {
   await resumeMorkImports(input.journal, target(input));
   Assert.deepEqual(destination(input), before);
   Assert.deepEqual(rows("SELECT total_changes() AS value", ["value"]), changes);
+  await assertCommitted(input);
+  Assert.deepEqual(
+    rows("SELECT total_changes() AS value", ["value"]),
+    changes,
+    "Public property views remain read-only after repeat"
+  );
   Assert.deepEqual(events.added, []);
   events.close();
 });

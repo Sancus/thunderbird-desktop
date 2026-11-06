@@ -393,6 +393,8 @@ function queueIntent(folder, header, kind) {
 }
 
 async function checkLivePendingSource(kind) {
+  await releaseOfflineOpWrappers();
+  reportRetainedOfflineOps(`start-${kind}`);
   const { folder, remote, db, headers, messages } = await makePendingFolder(
     `live-${kind}`
   );
@@ -488,6 +490,8 @@ add_task(async function testSelectKeepsLivePendingMove() {
 });
 
 add_task(async function testSparseChangedSinceSkipsSequenceGap() {
+  await releaseOfflineOpWrappers();
+  reportRetainedOfflineOps("start-testSparseChangedSinceSkipsSequenceGap");
   const { folder, db, headers, remote, messages } =
     await makePendingFolder("sparse-condstore");
   const keys = headers.map(header => header.messageKey);
@@ -1079,6 +1083,8 @@ if (panorama) {
 }
 
 add_task(async function test_offlineFlagMasksPreserveSourceState() {
+  await releaseOfflineOpWrappers();
+  reportRetainedOfflineOps("start-test_offlineFlagMasksPreserveSourceState");
   const { folder, remote, db, headers } =
     await makePendingFolder("offline-mask-queue");
   const header = headers[0];

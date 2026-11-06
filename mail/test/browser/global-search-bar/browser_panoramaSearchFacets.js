@@ -473,7 +473,7 @@ add_task(
     try {
       const opened = await openNativeFacets(term);
       tab = opened.tab;
-      const { context } = opened;
+      const context = Cu.waiveXrays(opened.context);
       const win = tab.browser.contentWindow;
       const doc = win.document;
       Assert.equal(context.fullSet.length, 3);

@@ -190,7 +190,7 @@ add_task(
     );
     const item = nativeChatItem(view, selected);
     Assert.equal(item.snippet.firstMatchText, "café");
-    Assert.ok(item.snippet.ranges.length > 0);
+    Assert.greater(item.snippet.ranges.length, 0);
     const marks = [
       ...view.win.document.querySelectorAll(".native-chat-result mark"),
     ];
@@ -263,10 +263,9 @@ add_task(
     const privateLog = await nativeChatFixture("nativeeligibilityneedle");
     const privateView = await nativeChatQuery("nativeeligibilityneedle");
     const captured = nativeChatItem(privateView, privateLog);
-    Services.prefs.setBoolPref(
-      "mailnews.database.global.indexer.enabled",
-      false
-    );
+    await SpecialPowers.pushPrefEnv({
+      set: [["mailnews.database.global.indexer.enabled", false]],
+    });
     try {
       await nativeChatService.flush();
       Assert.equal(
@@ -275,10 +274,7 @@ add_task(
       );
       Assert.notEqual(nativeChatTabmail.currentTabInfo.mode.name, "chat");
     } finally {
-      Services.prefs.setBoolPref(
-        "mailnews.database.global.indexer.enabled",
-        true
-      );
+      await SpecialPowers.popPrefEnv();
       await nativeChatService.flush();
     }
   }

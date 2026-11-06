@@ -219,6 +219,7 @@
       });
       this.convBrowser.setAttribute("flex", "1");
       this.convBrowser.setAttribute("type", "content");
+      this.convBrowser.setAttribute("manualactiveness", "true");
       this.convBrowser.setAttribute("messagemanagergroup", "browsers");
 
       this.progressBar = document.createElementNS(

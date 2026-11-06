@@ -50,7 +50,7 @@ add_setup(async function () {
 });
 
 registerCleanupFunction(() => {
-  inboxFolder.propagateDelete(targetFolder, true);
+  targetFolder.parent.propagateDelete(targetFolder, true);
 });
 
 /**

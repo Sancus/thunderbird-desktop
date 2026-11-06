@@ -184,6 +184,8 @@ async function subtest_check_selection_after_account_deletion(tab) {
 
   // Get position of the current account in the account list.
   const accountIndex = accountList.indexOf(gPopAccount);
+  const expectedAccount =
+    accountList[accountIndex + 1] ?? accountList[accountIndex - 1];
 
   // Remove our account.
   await remove_account(gPopAccount, tab);
@@ -193,8 +195,5 @@ async function subtest_check_selection_after_account_deletion(tab) {
 
   // See if the currently selected account is the one next in the account list.
   const accountRow = accountTree.selectedIndex;
-  Assert.equal(
-    accountTree.rows[accountRow]._account,
-    accountList[accountIndex + 1]
-  );
+  Assert.equal(accountTree.rows[accountRow]._account, expectedAccount);
 }

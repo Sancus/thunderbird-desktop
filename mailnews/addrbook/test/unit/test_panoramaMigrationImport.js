@@ -725,3 +725,194 @@ add_task(async function test_repeatRejectsMissingListMembership() {
     "list membership"
   );
 });
+
+add_task(
+  async function test_validateMigrationBookRequiresClosedReadOnlyStage() {
+    const input = await emptyStage();
+    const receipt = SQLiteDirectory.importMorkSnapshot(
+      input.connection,
+      input.bytes,
+      SOURCE_ID
+    );
+    Assert.throws(
+      () =>
+        SQLiteDirectory.validateMigrationBook(
+          input.file,
+          input.bytes,
+          SOURCE_ID
+        ),
+      /SQLite sidecar/,
+      "The actual open WAL stage cannot be copied as a closed book"
+    );
+    input.connection.close();
+    input.connection = null;
+    const wal = input.file.clone();
+    wal.leafName += "-wal";
+    if (wal.exists()) {
+      Assert.ok(wal.isFile(), "Native retained WAL is a regular file");
+      Assert.equal(wal.fileSize, 0, "Real close leaves no WAL page data");
+    }
+    const before = await IOUtils.read(input.file.path);
+    Assert.deepEqual(
+      SQLiteDirectory.validateMigrationBook(input.file, input.bytes, SOURCE_ID),
+      receipt
+    );
+    // An empty native auxiliary is safe; actual retained page bytes are not.
+    const hadWal = wal.exists();
+    const originalWal = hadWal ? await IOUtils.read(wal.path) : null;
+    try {
+      await IOUtils.write(wal.path, new Uint8Array([1]));
+      Assert.throws(
+        () =>
+          SQLiteDirectory.validateMigrationBook(
+            input.file,
+            input.bytes,
+            SOURCE_ID
+          ),
+        /data-bearing SQLite sidecar/,
+        "A closed-looking stage with WAL bytes is refused without recovery"
+      );
+      Assert.deepEqual(await IOUtils.read(wal.path), new Uint8Array([1]));
+    } finally {
+      if (hadWal) {
+        await IOUtils.write(wal.path, originalWal);
+      } else {
+        await IOUtils.remove(wal.path);
+      }
+    }
+    Assert.deepEqual(await IOUtils.read(input.file.path), before);
+    Assert.deepEqual(seen, [], "Readback emits no publication events");
+    Assert.throws(
+      () =>
+        SQLiteDirectory.validateMigrationBook(
+          input.file,
+          new Uint8Array([...input.bytes, 10]),
+          SOURCE_ID
+        ),
+      /source identity changed/,
+      "A changed original snapshot cannot validate the committed book"
+    );
+    Assert.deepEqual(await IOUtils.read(input.file.path), before);
+    await assertSourceUnchanged(input);
+  }
+);
+
+add_task(
+  async function test_validateMigrationBookDoesNotInitializeProvenance() {
+    const input = await emptyStage();
+    input.connection.close();
+    input.connection = null;
+    const before = await IOUtils.read(input.file.path);
+    Assert.throws(
+      () =>
+        SQLiteDirectory.validateMigrationBook(
+          input.file,
+          input.bytes,
+          SOURCE_ID
+        ),
+      /Incomplete book import provenance/
+    );
+    Assert.deepEqual(await IOUtils.read(input.file.path), before);
+    const db = Services.storage.openUnsharedDatabase(input.file);
+    try {
+      Assert.equal(db.schemaVersion, 4);
+      Assert.ok(!db.tableExists("migration_source"));
+      Assert.ok(!db.tableExists("migration_records"));
+      Assert.ok(!db.tableExists("migration_properties"));
+      Assert.equal(scalar(db, "SELECT COUNT(*) FROM properties"), 0);
+    } finally {
+      db.close();
+    }
+    Assert.deepEqual(seen, []);
+    await assertSourceUnchanged(input);
+  }
+);
+
+add_task(
+  async function test_validateMigrationBookReusesOnlySettledLiveConnection() {
+    const input = await emptyStage();
+    const receipt = SQLiteDirectory.importMorkSnapshot(
+      input.connection,
+      input.bytes,
+      SOURCE_ID
+    );
+    input.connection.close();
+    input.connection = null;
+    Services.prefs.setStringPref(input.pref + ".filename", input.filename);
+    const book = new SQLiteDirectory();
+    book.init("jsaddrbook://" + input.filename);
+    try {
+      Assert.throws(
+        () =>
+          SQLiteDirectory.validateMigrationBook(
+            input.file,
+            input.bytes,
+            SOURCE_ID
+          ),
+        /active directory connection/
+      );
+      const db = book._dbConnection;
+      const changes = scalar(db, "SELECT total_changes()");
+      Assert.deepEqual(
+        SQLiteDirectory.validateMigrationBook(
+          input.file,
+          input.bytes,
+          SOURCE_ID,
+          {
+            requireClosed: false,
+          }
+        ),
+        receipt
+      );
+      Assert.equal(scalar(db, "SELECT total_changes()"), changes);
+      Assert.ok(
+        db.connectionReady,
+        "Readback retains the real directory owner"
+      );
+      db.beginTransaction();
+      try {
+        Assert.throws(
+          () =>
+            SQLiteDirectory.validateMigrationBook(
+              input.file,
+              input.bytes,
+              SOURCE_ID,
+              {
+                requireClosed: false,
+              }
+            ),
+          /settled schema-4 database/
+        );
+        Assert.ok(
+          db.transactionInProgress,
+          "The foreign transaction remains owned"
+        );
+      } finally {
+        db.rollbackTransaction();
+      }
+      const card = book.getCard(receipt.cards[0][1]);
+      card.displayName = "Changed actual public projection";
+      book.modifyCard(card);
+      Assert.throws(
+        () =>
+          SQLiteDirectory.validateMigrationBook(
+            input.file,
+            input.bytes,
+            SOURCE_ID,
+            {
+              requireClosed: false,
+            }
+          ),
+        /Staged book differs/,
+        "A changed live projection is not repaired or silently reimported"
+      );
+      Assert.equal(
+        book.getCard(card.UID).displayName,
+        "Changed actual public projection"
+      );
+    } finally {
+      await book.cleanUp();
+    }
+    await assertSourceUnchanged(input);
+  }
+);

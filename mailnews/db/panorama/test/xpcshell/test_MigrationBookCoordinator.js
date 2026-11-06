@@ -23,9 +23,10 @@ const { createMigrationBackup, verifyMigrationBackup } =
 const { readMorkAddressBookSource } = ChromeUtils.importESModule(
   "resource:///modules/panorama/MigrationSource.sys.mjs"
 );
-const { resumeMorkBookImports } = ChromeUtils.importESModule(
-  "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
-);
+const { resumeMorkBookImports, resumeMorkBookImportsAndPublish } =
+  ChromeUtils.importESModule(
+    "resource:///modules/panorama/MigrationCoordinator.sys.mjs"
+  );
 const MAB_FILE = "import.mab";
 const unixOnly = () => ({ skip_if: () => AppConstants.platform == "win" });
 let home;
@@ -48,7 +49,7 @@ add_setup(async function setupNativeProfiles() {
     Ci.nsIToolkitProfileService
   );
   home = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
+    do_get_tempdir().path,
     "migration-book-"
   );
   registerCleanupFunction(() => IOUtils.remove(home, { recursive: true }));
@@ -1048,3 +1049,770 @@ add_task(unixOnly(), async function test_killedSettledImportReopensReadOnly() {
   );
   await assertOriginals(input);
 });
+
+let publicationProfile;
+let publicationLock;
+
+/** Closes actual Manager connections before a controlled publication/restart. */
+async function reloadPublishedBooks() {
+  const { MailServices } = ChromeUtils.importESModule(
+    "resource:///modules/MailServices.sys.mjs"
+  );
+  const { TestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/TestUtils.sys.mjs"
+  );
+  Array.from(MailServices.ab.directories);
+  const reloaded = TestUtils.topicObserved("addrbook-reloaded");
+  Services.obs.notifyObservers(null, "addrbook-reload");
+  await reloaded;
+}
+
+/**
+ * Plans genuine book bytes under the retained native startup-profile lock.
+ * Other-profile staging cases above retain their original stage-only lifetime.
+ *
+ * @returns {Promise<object>} Actual current profile, genuine source, backup,
+ *   stage, journal, original book ID and selected display-name map.
+ */
+async function publicationInput() {
+  if (!publicationProfile) {
+    publicationProfile = profiles.createProfile(
+      do_get_profile(),
+      "s520-current-publication",
+      "tests"
+    );
+    const selected = {};
+    profiles.selectStartupProfile(
+      ["xpcshell", "-P", publicationProfile.name],
+      false,
+      AppConstants.MOZ_UPDATE_CHANNEL,
+      "",
+      {},
+      {},
+      selected
+    );
+    Assert.strictEqual(selected.value, publicationProfile);
+    Assert.strictEqual(profiles.currentProfile, publicationProfile);
+    publicationLock = publicationProfile.lock({});
+    registerCleanupFunction(async () => {
+      await reloadPublishedBooks();
+      publicationLock.unlock();
+      publicationProfile.remove(false);
+    });
+  }
+  await reloadPublishedBooks();
+  // This lock stands in for the process-lifetime lock held by real XRE startup.
+  // Reuse it for preparation, publication and journal work, without relocking.
+  const id = "publication-book-" + ++serial;
+  const root = PathUtils.join(do_get_tempdir().path, id);
+  await IOUtils.makeDirectory(root);
+  const profilePath = publicationLock.directory.path;
+  const source = PathUtils.join(profilePath, id + ".mab");
+  const bytes = await IOUtils.read(do_get_file(MAB_FILE).path);
+  await IOUtils.copy(do_get_file(MAB_FILE).path, source);
+  const { identity } = await readMorkAddressBookSource(source);
+  const stagingPath = PathUtils.join(root, "book.sqlite");
+  const path = PathUtils.join(root, "journal.json");
+  const backupPath = PathUtils.join(root, "backup");
+  const journal = await MigrationJournal.create(path, {
+    profilePath,
+    mailPaths: [],
+    backupPath,
+    sources: [],
+    books: [{ id, ...identity, stagingPath }],
+  });
+  const input = {
+    id,
+    root,
+    profilePath,
+    source,
+    bytes,
+    stagingPath,
+    path,
+    backupPath,
+    journal,
+    profile: publicationProfile,
+    names: new Map([[id, "Actual imported book é"]]),
+  };
+  registerCleanupFunction(() => input.journal.close());
+  input.backup = await createMigrationBackup(profilePath, [], backupPath);
+  await input.journal.recordBackup(input.backup);
+  return input;
+}
+
+/**
+ * Imports a corruption/error fixture under the retained startup native lock.
+ *
+ * @param {object} input - Current-profile journal and native toolkit profile.
+ * @returns {Promise<void>} Complete original stage-only import receipt.
+ */
+async function stagePublicationInput(input) {
+  Assert.strictEqual(input.profile, profiles.currentProfile);
+  await resumeMorkBookImports(input.journal, publicationLock);
+}
+
+/** @returns {{topics: string[], close: Function}} Actual creation events. */
+function watchBookPublication() {
+  const topics = [];
+  const observed = [
+    "addrbook-directory-created",
+    "addrbook-contact-created",
+    "addrbook-contacts-created",
+    "addrbook-list-created",
+    "addrbook-list-member-added",
+  ];
+  const observer = {
+    observe(subject, topic) {
+      topics.push(topic);
+    },
+  };
+  for (const topic of observed) {
+    Services.obs.addObserver(observer, topic);
+  }
+  let closed = false;
+  const close = () => {
+    if (closed) {
+      return;
+    }
+    for (const topic of observed) {
+      Services.obs.removeObserver(observer, topic);
+    }
+    closed = true;
+  };
+  registerCleanupFunction(close);
+  return { topics, close };
+}
+
+/**
+ * Checks the actual normal directory, genuine values and original scoped maps.
+ *
+ * @param {object} input - Current complete journal unit.
+ * @param {object} published - Actual Manager result.
+ */
+function assertPublishedBook(input, published) {
+  const book = input.journal.state.books[0];
+  const directory = published.directory;
+  Assert.equal(book.publication.state, "published");
+  Assert.equal(directory.UID, book.publication.bookUID);
+  Assert.equal(directory.dirName, "Actual imported book é");
+  Assert.equal(directory.dirPrefId, published.dirPrefId);
+  Assert.equal(directory.URI, published.uri);
+  Assert.deepEqual(published.cards, book.receipt.cards);
+  Assert.deepEqual(published.lists, book.receipt.lists);
+  const cards = Array.from(directory.childCards).filter(
+    card => !card.isMailList
+  );
+  Assert.equal(cards.length, 1);
+  Assert.equal(cards[0].UID, book.receipt.cards[0][1]);
+  Assert.equal(
+    cards[0].displayName,
+    "contact number one",
+    "Durable public book retains the genuine card name"
+  );
+  Assert.equal(cards[0].primaryEmail, "contact1@invalid");
+  const lists = Array.from(directory.childNodes);
+  Assert.equal(lists.length, 1);
+  Assert.equal(lists[0].UID, book.receipt.lists[0][1]);
+  Assert.equal(lists[0].dirName, "list");
+  Assert.equal(lists[0].listNickName, "nick name");
+  Assert.equal(lists[0].description, "a list of cards");
+  Assert.deepEqual(
+    Array.from(lists[0].childCards, card => card.UID),
+    [cards[0].UID]
+  );
+  const actual = SQLiteDirectory.forFile(published.fileName);
+  Assert.equal(actual.loadMigrationProperties(cards[0].UID).get("Notes"), "");
+  Assert.ok(!actual.loadMigrationProperties(cards[0].UID).has("UID"));
+  Assert.equal(
+    actual.loadMigrationProperties(lists[0].UID).get("Address1"),
+    "1"
+  );
+}
+
+add_task(
+  unixOnly(),
+  async function test_bookPublicationAwaitsNativePreferenceCommit() {
+    const input = await publicationInput();
+    const events = watchBookPublication();
+    const { withMigrationAddressBookPublication } = ChromeUtils.importESModule(
+      "resource:///modules/AddrBookManager.sys.mjs"
+    );
+    const managerServices = Cu.getGlobalForObject(
+      withMigrationAddressBookPublication
+    ).Services;
+    const prefs = managerServices.prefs;
+    const backupPrefFile = prefs.backupPrefFile;
+    let signalStarted;
+    const started = new Promise(resolve => {
+      signalStarted = resolve;
+    });
+    let releaseCommit;
+    const commit = new Promise(resolve => {
+      releaseCommit = resolve;
+    });
+    let first = true;
+    let operation;
+    const snapshot = function (...args) {
+      const native = backupPrefFile.apply(prefs, args);
+      if (!first) {
+        return native;
+      }
+      first = false;
+      signalStarted();
+      // Keep the actual native result, delaying only its successful delivery.
+      return native.then(() => commit);
+    };
+    // Forward native methods with their real receiver; only this module sees
+    // the controlled success-delivery boundary. Native methods stay readonly.
+    managerServices.prefs = new Proxy(
+      {},
+      {
+        get(target, name) {
+          const value = name == "backupPrefFile" ? snapshot : prefs[name];
+          return typeof value == "function" ? value.bind(prefs) : value;
+        },
+      }
+    );
+    try {
+      operation = resumeMorkBookImportsAndPublish(
+        input.journal,
+        input.profile,
+        input.names
+      );
+      await Promise.race([
+        started,
+        operation.then(() => {
+          throw new Error(
+            "Publication returned without the native preference commit"
+          );
+        }),
+      ]);
+      Assert.equal(
+        input.journal.state.books[0].publication.state,
+        "pending",
+        "An unsettled native publication never becomes a journal receipt"
+      );
+      Assert.deepEqual(
+        events.topics,
+        [],
+        "No creation before durable publication"
+      );
+      releaseCommit();
+      const [published] = await operation;
+      assertPublishedBook(input, published);
+      Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+      await assertOriginals(input);
+    } finally {
+      releaseCommit();
+      managerServices.prefs = prefs;
+      // Settle this test's operation before releasing its observer or profile.
+      try {
+        await operation;
+      } catch (error) {
+        console.error(
+          "Publication fixture settled after its primary failure",
+          error
+        );
+      }
+      events.close();
+    }
+  }
+);
+
+add_task(
+  unixOnly(),
+  async function test_completeBookPublicationPreservesOriginalUIDMaps() {
+    const input = await publicationInput();
+    const events = watchBookPublication();
+    const [published] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    assertPublishedBook(input, published);
+    await assertStartupProfileRemainsLocked(input);
+    Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+    const before = await IOUtils.read(input.path);
+    const [again] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    Assert.equal(again.reused, true);
+    Assert.equal(again.dirPrefId, published.dirPrefId);
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+    Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+    await assertOriginals(input);
+    await Assert.rejects(
+      input.journal.finishStage("validate"),
+      /publication and activation are not supported/
+    );
+    events.close();
+  }
+);
+
+/**
+ * Reads actual persisted prefs and public card/list data in a new OS process.
+ * The publication callback has released its native lock before this call.
+ * The parent closes real readers before the child acquires its own lock.
+ *
+ * @param {object} input - Published current-profile unit.
+ * @param {object} published - Actual stable Manager identity.
+ * @returns {Promise<object>} Child's independent public values, not parent data.
+ */
+async function readPublishedBookInChild(input, published) {
+  await reloadPublishedBooks();
+  const profileDirectories = Object.fromEntries(
+    ["DefProfRt", "DefProfLRt", "UAppData"].map(key => [
+      key,
+      Services.dirsvc.get(key, Ci.nsIFile).path,
+    ])
+  );
+  const code = `
+    let finished = false;
+    let exitCode = 1;
+    (async () => {
+    let held;
+    let manager;
+    let firstError;
+    let result;
+    try {
+      const { FileUtils } = ChromeUtils.importESModule("resource://gre/modules/FileUtils.sys.mjs");
+      const root = new FileUtils.File(${JSON.stringify(input.profilePath)});
+      Services.dirsvc.set("ProfD", root.clone());
+      Services.dirsvc.set("ProfLD", root.clone());
+      for (const [key, path] of Object.entries(${JSON.stringify(profileDirectories)})) {
+        Services.dirsvc.set(key, new FileUtils.File(path));
+      }
+      Cc["@mozilla.org/xre/directory-provider;1"].getService(Ci.nsIXREDirProvider);
+      const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(Ci.nsIToolkitProfileService);
+      const profile = service.createProfile(root, "s520-readback-child", "tests");
+      held = profile.lock({});
+      const prefs = root.clone(); prefs.append("prefs.js");
+      Services.prefs.readUserPrefsFromFile(prefs);
+      Services.prefs.setBoolPref("security.nocertdb", true);
+      const { MailServices } = ChromeUtils.importESModule("resource:///modules/MailServices.sys.mjs");
+      manager = MailServices.ab;
+      const directory = manager.getDirectoryFromUID(${JSON.stringify(published.bookUID)});
+      if (!directory) { throw new Error("Persisted public book is absent"); }
+      const card = Array.from(directory.childCards).find(value => !value.isMailList);
+      result = {
+        bookUID: directory.UID, uri: directory.URI, dirPrefId: directory.dirPrefId,
+        card: [card.UID, card.displayName, card.primaryEmail],
+        lists: Array.from(directory.childNodes, list => [list.UID, list.dirName,
+          Array.from(list.childCards, member => member.UID)]),
+      };
+    } catch (error) {
+      firstError = error;
+    } finally {
+      if (manager) {
+        try {
+          const reloaded = new Promise(resolve => {
+            const observe = () => {
+              Services.obs.removeObserver(observe, "addrbook-reloaded");
+              resolve();
+            };
+            Services.obs.addObserver(observe, "addrbook-reloaded");
+          });
+          Services.obs.notifyObservers(null, "addrbook-reload");
+          await reloaded;
+        } catch (error) {
+          if (firstError) {
+            print("BOOK-PUBLICATION-CLEANUP-ERROR " + error);
+          } else {
+            firstError = error;
+          }
+        }
+      }
+      try {
+        held?.unlock();
+      } catch (error) {
+        if (firstError) {
+          print("BOOK-PUBLICATION-UNLOCK-ERROR " + error);
+        } else {
+          firstError = error;
+        }
+      }
+    }
+    if (firstError) {
+      print("BOOK-PUBLICATION-REOPEN-ERROR " + JSON.stringify({
+        message: String(firstError), result: firstError.result,
+        stack: firstError.stack,
+      }));
+    } else {
+      print("BOOK-PUBLICATION-REOPEN " + JSON.stringify(result));
+      exitCode = 0;
+    }
+    })().then(() => { finished = true; }, error => {
+      print("BOOK-PUBLICATION-REOPEN-ERROR " + error);
+      finished = true;
+    });
+    Services.tm.spinEventLoopUntil("TestMigrationBook:PublicReopen", () => finished);
+    quit(exitCode);
+  `;
+  // A real process restart transfers lifetime only after normal Manager close.
+  publicationLock.unlock();
+  publicationLock = null;
+  try {
+    const output = await runPublicationChild(code);
+    const line = output
+      .split("\n")
+      .find(value => value.startsWith("BOOK-PUBLICATION-REOPEN "));
+    Assert.ok(
+      line,
+      "Actual process reopens the persisted public book: " +
+        JSON.stringify(output)
+    );
+    return JSON.parse(line.slice("BOOK-PUBLICATION-REOPEN ".length));
+  } finally {
+    publicationLock = input.profile.lock({});
+  }
+}
+
+/**
+ * Runs a genuine bounded native process and returns its captured stdout.
+ *
+ * @param {string} code - Actual native child operation.
+ * @returns {Promise<string>} Complete output from a successful real process.
+ */
+async function runPublicationChild(code) {
+  const { Subprocess } = ChromeUtils.importESModule(
+    "resource://gre/modules/Subprocess.sys.mjs"
+  );
+  const { TestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/TestUtils.sys.mjs"
+  );
+  let child;
+  let output = "";
+  let terminal;
+  let error;
+  let done = false;
+  let reading;
+  try {
+    child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: [
+        "-g",
+        Services.dirsvc.get("GreD", Ci.nsIFile).path,
+        "-a",
+        Services.dirsvc.get("XCurProcD", Ci.nsIFile).path,
+        "-e",
+        code,
+      ],
+      stderr: "stdout",
+    });
+    reading = (async () => {
+      try {
+        for (let chunk; (chunk = await child.stdout.readString()); ) {
+          output += chunk;
+        }
+        terminal = await child.wait();
+      } catch (failure) {
+        error = failure;
+      } finally {
+        done = true;
+      }
+    })();
+    await TestUtils.waitForCondition(
+      () => done,
+      "Actual publication fixture process exits",
+      100,
+      300
+    );
+    if (error) {
+      throw error;
+    }
+    Assert.equal(
+      terminal.exitCode,
+      0,
+      "Actual publication fixture process exits successfully: " +
+        JSON.stringify(output)
+    );
+    return output;
+  } finally {
+    if (child && child.exitCode === null) {
+      await child.kill(0);
+    }
+    await reading;
+  }
+}
+
+/**
+ * Verifies another native process cannot acquire the retained startup lock.
+ *
+ * @param {object} input - Current-profile publication unit.
+ * @returns {Promise<void>} Actual OS-process exclusion assertion.
+ */
+async function assertStartupProfileRemainsLocked(input) {
+  Assert.equal(publicationLock.directory.path, input.profilePath);
+  const code = `
+    const { FileUtils } = ChromeUtils.importESModule("resource://gre/modules/FileUtils.sys.mjs");
+    const root = new FileUtils.File(${JSON.stringify(input.profilePath)});
+    Services.dirsvc.set("ProfD", root.clone());
+    Services.dirsvc.set("ProfLD", root.clone());
+    for (const [key, path] of Object.entries(${JSON.stringify(
+      Object.fromEntries(
+        ["DefProfRt", "DefProfLRt", "UAppData"].map(key => [
+          key,
+          Services.dirsvc.get(key, Ci.nsIFile).path,
+        ])
+      )
+    )})) {
+      Services.dirsvc.set(key, new FileUtils.File(path));
+    }
+    Cc["@mozilla.org/xre/directory-provider;1"].getService(Ci.nsIXREDirProvider);
+    const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(Ci.nsIToolkitProfileService);
+    const profile = service.createProfile(root, "s520-lock-exclusion-child", "tests");
+    let result;
+    try {
+      const unexpected = profile.lock({});
+      unexpected.unlock();
+      result = { acquired: true };
+    } catch (error) {
+      result = { acquired: false, result: error.result };
+    }
+    print("BOOK-LOCK-ATTEMPT " + JSON.stringify(result));
+    quit(0);
+  `;
+  const output = await runPublicationChild(code);
+  const line = output
+    .split("\n")
+    .find(value => value.startsWith("BOOK-LOCK-ATTEMPT "));
+  Assert.ok(line, "Actual process attempted the profile lock: " + output);
+  Assert.deepEqual(JSON.parse(line.slice("BOOK-LOCK-ATTEMPT ".length)), {
+    acquired: false,
+    result: Cr.NS_ERROR_FILE_ACCESS_DENIED,
+  });
+}
+
+add_task(
+  unixOnly(),
+  async function test_bookPublicationReconcilesAfterJournalReopen() {
+    const input = await publicationInput();
+    const [published] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    const receipt = input.journal.state.books[0].receipt;
+    input.journal.close();
+    const actual = await readPublishedBookInChild(input, published);
+    Assert.deepEqual(actual, {
+      bookUID: published.bookUID,
+      uri: published.uri,
+      dirPrefId: published.dirPrefId,
+      card: [receipt.cards[0][1], "contact number one", "contact1@invalid"],
+      lists: [[receipt.lists[0][1], "list", [receipt.cards[0][1]]]],
+    });
+    input.journal = await MigrationJournal.open(input.path, input.profilePath);
+    const before = await IOUtils.read(input.path);
+    const events = watchBookPublication();
+    const [again] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    assertPublishedBook(input, again);
+    Assert.equal(again.reused, true);
+    Assert.equal(again.dirPrefId, published.dirPrefId);
+    Assert.deepEqual(await IOUtils.read(input.path), before);
+    Assert.deepEqual(events.topics, []);
+    await assertOriginals(input);
+    events.close();
+  }
+);
+
+add_task(
+  unixOnly(),
+  async function test_bookPublicationRequiresHeldSelectedProfile() {
+    const wrong = await bookInput();
+    const before = await IOUtils.read(wrong.path);
+    await Assert.rejects(
+      resumeMorkBookImportsAndPublish(
+        wrong.journal,
+        wrong.profile,
+        new Map([["original-book", "Wrong profile"]])
+      ),
+      /another profile/
+    );
+    Assert.deepEqual(await IOUtils.read(wrong.path), before);
+    Assert.ok(!wrong.journal.state.books[0].publication);
+    const input = await publicationInput();
+    const previous = await IOUtils.read(input.path);
+    const { withMigrationAddressBookPublication } = ChromeUtils.importESModule(
+      "resource:///modules/AddrBookManager.sys.mjs"
+    );
+    const events = watchBookPublication();
+    let released;
+    await withMigrationAddressBookPublication(
+      input.profile,
+      async publication => {
+        released = publication;
+        Assert.equal(publication.checkProfile().path, input.profilePath);
+      }
+    );
+    // Settling a publication must not release the startup owner's native lock.
+    await assertStartupProfileRemainsLocked(input);
+    Assert.throws(
+      () => released.checkProfile(),
+      /Book publication operation is closed/
+    );
+    await Assert.rejects(
+      released.adopt({}),
+      /Book publication operation is closed/
+    );
+    Assert.deepEqual(await IOUtils.read(input.path), previous);
+    Assert.ok(!(await IOUtils.exists(input.stagingPath)));
+    Assert.deepEqual(events.topics, []);
+    const [published] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    assertPublishedBook(input, published);
+    Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+    await assertOriginals(input);
+    events.close();
+  }
+);
+
+add_task(
+  unixOnly(),
+  async function test_bookPublicationRejectsChangedCommittedStage() {
+    const input = await publicationInput();
+    await stagePublicationInput(input);
+    const receipt = input.journal.state.books[0].receipt;
+    let db = openStage(input);
+    db.executeSimpleSQL(
+      "DELETE FROM migration_properties WHERE kind='card' AND name='Notes'"
+    );
+    db.close();
+    const events = watchBookPublication();
+    await Assert.rejects(
+      resumeMorkBookImportsAndPublish(
+        input.journal,
+        input.profile,
+        input.names
+      ),
+      /Staged book differs: raw properties/
+    );
+    Assert.deepEqual(events.topics, []);
+    Assert.equal(input.journal.state.books[0].publication.state, "pending");
+    Assert.deepEqual(input.journal.state.books[0].receipt, receipt);
+    db = openStage(input);
+    db.executeSimpleSQL(
+      "INSERT INTO migration_properties VALUES('card','1','Notes','')"
+    );
+    db.close();
+    const [published] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    assertPublishedBook(input, published);
+    Assert.deepEqual(published.cards, receipt.cards);
+    Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+    await assertOriginals(input);
+    events.close();
+  }
+);
+
+add_task(
+  unixOnly(),
+  async function test_cancelledPublicationSettlesActualCommit() {
+    const input = await publicationInput();
+    const controller = new AbortController();
+    const record = input.journal.recordBookPublication.bind(input.journal);
+    input.journal.recordBookPublication = (id, receipt) => {
+      controller.abort();
+      return record(id, receipt);
+    };
+    const events = watchBookPublication();
+    await Assert.rejects(
+      resumeMorkBookImportsAndPublish(
+        input.journal,
+        input.profile,
+        input.names,
+        controller.signal
+      ),
+      error => error.name === "AbortError"
+    );
+    const publication = input.journal.state.books[0].publication;
+    Assert.equal(publication.state, "published");
+    Assert.equal(input.journal.state.cancelled, true);
+    await assertStartupProfileRemainsLocked(input);
+    Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+    input.journal.recordBookPublication = record;
+    await input.journal.setCancelled(false);
+    const [again] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    Assert.deepEqual(input.journal.state.books[0].publication, publication);
+    assertPublishedBook(input, again);
+    Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
+    await assertOriginals(input);
+    events.close();
+  }
+);
+
+add_task(
+  unixOnly(),
+  async function test_bookPublicationPreservesOriginalChildError() {
+    const input = await publicationInput();
+    await input.journal.beginBookPublication(
+      input.id,
+      input.names.get(input.id)
+    );
+    await stagePublicationInput(input);
+    let db = openStage(input);
+    db.executeSimpleSQL(
+      "DELETE FROM migration_properties WHERE kind='card' AND name='Notes'"
+    );
+    db.close();
+    await IOUtils.makeDirectory(input.path + ".tmp");
+    const original = SQLiteDirectory.importMorkSnapshot;
+    let childError;
+    SQLiteDirectory.importMorkSnapshot = (...args) => {
+      try {
+        return original(...args);
+      } catch (error) {
+        childError = error;
+        throw error;
+      }
+    };
+    try {
+      await Assert.rejects(
+        resumeMorkBookImportsAndPublish(
+          input.journal,
+          input.profile,
+          input.names
+        ),
+        error =>
+          error === childError &&
+          /Staged book differs: raw properties/.test(error.message),
+        "The actual storage readback error stays primary when real journal IO also fails"
+      );
+    } finally {
+      SQLiteDirectory.importMorkSnapshot = original;
+      await IOUtils.remove(input.path + ".tmp", { recursive: true });
+    }
+    await assertStartupProfileRemainsLocked(input);
+    Assert.equal(input.journal.state.books[0].publication.state, "pending");
+    input.journal.close();
+    input.journal = await MigrationJournal.open(input.path, input.profilePath);
+    db = openStage(input);
+    db.executeSimpleSQL(
+      "INSERT INTO migration_properties VALUES('card','1','Notes','')"
+    );
+    db.close();
+    const [published] = await resumeMorkBookImportsAndPublish(
+      input.journal,
+      input.profile,
+      input.names
+    );
+    assertPublishedBook(input, published);
+    await assertOriginals(input);
+  }
+);

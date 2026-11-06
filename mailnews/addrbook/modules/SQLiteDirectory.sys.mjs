@@ -568,6 +568,151 @@ export class SQLiteDirectory extends AddrBookDirectory {
   }
 
   /**
+   * Reads a completed book and verifies its original bytes and scoped UID maps.
+   * Never initializes a schema, imports a row or allocates an identity. A closed
+   * stage must have no cached owner or data-bearing WAL/rollback journal.
+   * Native empty WAL files and retained regular shared-memory indexes are safe.
+   * A published retry can
+   * reuse its known directory connection without changing that connection.
+   *
+   * @param {nsIFile} file - Existing regular schema-4 book file.
+   * @param {Uint8Array} bytes - Complete original legacy snapshot.
+   * @param {string} storageSourceId - Original committed storage token.
+   * @param {object} [options] - Connection ownership requirements.
+   * @param {boolean} [options.requireClosed=true] - Refuse a live directory.
+   * @returns {object} Verified sourceId, sourceSha256, sourceSize and separate
+   *   cards/lists [originalKey, UID] maps; also the Windows physical identity.
+   * @throws {Error} On unsafe paths, missing provenance, a foreign transaction,
+   *   changed contents or storage failure. The first read or close error wins.
+   */
+  static validateMigrationBook(
+    file,
+    bytes,
+    storageSourceId,
+    { requireClosed = true } = {}
+  ) {
+    if (
+      typeof storageSourceId != "string" ||
+      !storageSourceId ||
+      !ArrayBuffer.isView(bytes) ||
+      Object.prototype.toString.call(bytes) != "[object Uint8Array]" ||
+      bytes.length > 64 * 1024 * 1024
+    ) {
+      throw new TypeError("Expected original book bytes and storage identity");
+    }
+    const target = file.QueryInterface(Ci.nsIFile).clone();
+    for (let current = target; current; current = current.parent) {
+      if (current.isSymlink()) {
+        throw new Error("Book validation path contains a link");
+      }
+    }
+    if (!target.exists() || !target.isFile()) {
+      throw new Error("Book validation requires an existing regular file");
+    }
+    target.normalize();
+    let db;
+    let ownsConnection = false;
+    let lease;
+    let result;
+    let failure;
+    try {
+      for (const [path, connection] of connections) {
+        const active = new lazy.FileUtils.File(path);
+        active.normalize();
+        if (active.equals(target)) {
+          if (requireClosed || (db && db !== connection)) {
+            throw new Error("Book stage has an active directory connection");
+          }
+          db = connection;
+        }
+      }
+      if (!db) {
+        for (const suffix of ["-wal", "-shm", "-journal"]) {
+          const sidecar = new lazy.FileUtils.File(target.path + suffix);
+          try {
+            // lstat distinguishes dangling links from an absent auxiliary.
+            if (
+              sidecar.isSymlink() ||
+              !sidecar.isFile() ||
+              (suffix != "-shm" && sidecar.fileSize)
+            ) {
+              throw new Error(
+                "Closed book stage has an unsafe or data-bearing SQLite sidecar"
+              );
+            }
+          } catch (error) {
+            if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND) {
+              throw error;
+            }
+          }
+        }
+      }
+      if (AppConstants.platform == "win") {
+        lease = lazy.admitWindowsMigrationPath(
+          target,
+          Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+        );
+        target.initWithPath(lease.canonicalPath);
+      }
+      const physical = lease ? lazy.migrationPhysicalIdentity(lease) : null;
+      if (!db) {
+        db = Services.storage.openUnsharedDatabase(target);
+        ownsConnection = true;
+        db.executeSimpleSQL("PRAGMA query_only=ON");
+      }
+      if (db.transactionInProgress || db.schemaVersion != 4) {
+        throw new Error("Book validation requires a settled schema-4 database");
+      }
+      const tables = [
+        "migration_source",
+        "migration_records",
+        "migration_properties",
+        ...(physical ? ["migration_file_identity"] : []),
+      ];
+      if (!tables.every(name => db.tableExists(name))) {
+        throw new Error("Incomplete book import provenance");
+      }
+      if (!physical && db.tableExists("migration_file_identity")) {
+        throw new Error("Book stage requires its original Windows identity");
+      }
+      const original = Uint8Array.from(bytes);
+      result = migrationReceipt(
+        db,
+        storageSourceId,
+        migrationHash(original),
+        original,
+        lazy.parseMorkAddressBook(original),
+        physical
+      );
+    } catch (error) {
+      failure = error;
+    } finally {
+      for (const close of [
+        () => {
+          if (ownsConnection) {
+            db?.close();
+          }
+        },
+        () => lease?.close(),
+      ]) {
+        try {
+          close();
+        } catch (error) {
+          if (failure) {
+            console.error("Could not close book validation input", error);
+          } else {
+            failure = error;
+          }
+        }
+      }
+    }
+    if (failure) {
+      throw failure;
+    }
+    return result;
+  }
+
+  /**
    * Imports one complete legacy book into an unregistered, empty schema-4 stage.
    * The caller owns the connection, backup, profile lock and writer quiescence.
    * Keeps original bytes and exact active card/list/data cells separately from

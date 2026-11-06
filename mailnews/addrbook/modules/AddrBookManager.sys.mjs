@@ -7,6 +7,7 @@ import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   MailGlue: "resource:///modules/MailGlue.sys.mjs",
+  SQLiteDirectory: "resource:///modules/SQLiteDirectory.sys.mjs",
   compareAddressBooks: "resource:///modules/AddrBookUtils.sys.mjs",
 });
 
@@ -111,6 +112,21 @@ function ensureInitialized() {
         }
       } else if (pref.endsWith(".dirType")) {
         const prefName = pref.substring(0, pref.length - 8);
+        const migration = Services.prefs.getStringPref(
+          prefName + ".panoramaMigration",
+          ""
+        );
+        if (migration) {
+          const publication = JSON.parse(migration);
+          if (
+            publication.version != 1 ||
+            publication.state != "published" ||
+            (migrationAdoption?.dirPrefId === prefName &&
+              !migrationAdoption.result)
+          ) {
+            continue;
+          }
+        }
         const dirType = Services.prefs.getIntPref(pref);
         const fileName = Services.prefs.getStringPref(
           `${prefName}.filename`,
@@ -211,6 +227,794 @@ Services.prefs.addObserver(
   "mail.addressDisplayFormat",
   incrementDisplayNameVersion
 );
+
+// Only this finite book publication is serialized, not other profile writers.
+let migrationAdoption = null;
+
+/**
+ * Rejects links in an existing path and returns its canonical file.
+ *
+ * @param {nsIFile} file - Existing regular file or directory.
+ * @returns {nsIFile} Independent canonical file.
+ */
+function migrationBookFile(file) {
+  const result = file.QueryInterface(Ci.nsIFile).clone();
+  for (let entry = result; entry; entry = entry.parent) {
+    if (entry.isSymlink()) {
+      throw new Error("Migration book path contains a link");
+    }
+  }
+  result.normalize();
+  return result;
+}
+
+/**
+ * Hashes the three independently scoped publication identities.
+ *
+ * @param {string[]} identities - Original source, storage token and book UID.
+ * @returns {string} Lowercase SHA-256 of their JSON array.
+ */
+function migrationBookIdentityHash(identities) {
+  const bytes = new TextEncoder().encode(JSON.stringify(identities));
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(Ci.nsICryptoHash.SHA256);
+  hash.update(bytes, bytes.length);
+  return Array.from(hash.finish(false), byte =>
+    byte.charCodeAt(0).toString(16).padStart(2, "0")
+  ).join("");
+}
+
+/**
+ * Compares the actual complete stage receipt with the settled original maps.
+ *
+ * @param {object} actual - MI's read-only storage validation result.
+ * @param {object} expected - Original coordinator book receipt.
+ */
+function checkMigrationBookReceipt(actual, expected) {
+  if (
+    actual.sourceId !== expected.storageSourceId ||
+    actual.sourceSha256 !== expected.sourceSha256 ||
+    actual.sourceSize !== expected.sourceSize ||
+    JSON.stringify(actual.cards) !== JSON.stringify(expected.cards) ||
+    JSON.stringify(actual.lists) !== JSON.stringify(expected.lists)
+  ) {
+    throw new Error("Migration book receipt or scoped UID maps changed");
+  }
+}
+
+/**
+ * Copies a closed stage to an exclusive private sibling, retaining failures.
+ *
+ * @param {nsIFile} source - Validated closed SQLite stage.
+ * @param {nsIFile} destination - Stable target used only to name its sibling.
+ * @returns {nsIFile} Complete closed private copy; not yet a published target.
+ */
+function copyMigrationBook(source, destination) {
+  let input;
+  let output;
+  let temporary;
+  let firstError;
+  try {
+    input = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
+      Ci.nsIFileInputStream
+    );
+    input.init(source, 0x01, 0, 0);
+    const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
+      Ci.nsIBinaryInputStream
+    );
+    binary.setInputStream(input);
+    output = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(
+      Ci.nsIFileOutputStream
+    );
+    temporary = destination.clone();
+    temporary.leafName += ".copy";
+    temporary.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+    // Only the file exclusively created above is opened. A failed or interrupted
+    // copy remains private evidence and never occupies the stable target.
+    output.init(temporary, 0x02, 0o600, 0);
+    const size = source.fileSize;
+    const modified = source.lastModifiedTime;
+    for (let remaining = size; remaining > 0; ) {
+      const count = Math.min(64 * 1024, remaining);
+      const bytes = binary.readBytes(count);
+      if (bytes.length != count) {
+        throw new Error("Migration book stage changed during copy");
+      }
+      for (let offset = 0; offset < count; ) {
+        const written = output.write(bytes.substring(offset), count - offset);
+        if (!written) {
+          throw Components.Exception(
+            "Migration book output made no progress",
+            Cr.NS_ERROR_FAILURE
+          );
+        }
+        offset += written;
+      }
+      remaining -= count;
+    }
+    if (source.fileSize != size || source.lastModifiedTime != modified) {
+      throw new Error("Migration book stage changed during copy");
+    }
+    output.flush();
+  } catch (error) {
+    firstError = error;
+  }
+  for (const stream of [output, input]) {
+    try {
+      stream?.close();
+    } catch (error) {
+      if (firstError) {
+        console.error("Could not close failed migration book stream", error);
+      } else {
+        firstError = error;
+      }
+    }
+  }
+  if (firstError) {
+    throw firstError;
+  }
+  return temporary;
+}
+
+/**
+ * Moves a complete private copy to a still-missing, owned stable destination.
+ *
+ * @param {nsIFile} temporary - Fully validated, closed exclusive private copy.
+ * @param {nsIFile} target - Stable destination which must remain absent.
+ * @param {function(): nsIFile} checkProfile - Current startup-owner check.
+ * @param {string} key - Exact prepared ownership preference.
+ * @param {string} prepared - Exact serialized ownership record.
+ * @throws {Error} For changed ownership or any occupied/linked destination.
+ */
+function publishMigrationBookCopy(
+  temporary,
+  target,
+  checkProfile,
+  key,
+  prepared
+) {
+  const profile = checkProfile();
+  let linked = false;
+  try {
+    linked = target.isSymlink();
+  } catch (error) {
+    if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND) {
+      throw error;
+    }
+  }
+  if (
+    Services.prefs.getStringPref(key) !== prepared ||
+    linked ||
+    target.exists()
+  ) {
+    throw new Error("Migration book publication ownership changed");
+  }
+  // No yield or replacement of an existing file between this check and move.
+  temporary.moveTo(profile, target.leafName);
+}
+
+/**
+ * Checks the caller's complete byte-snapshot type before cloning or validation.
+ *
+ * @param {Uint8Array} sourceBytes - Original legacy snapshot.
+ * @throws {TypeError} If the caller supplied another type.
+ */
+function checkMigrationBookSnapshot(sourceBytes) {
+  if (
+    !ArrayBuffer.isView(sourceBytes) ||
+    Object.prototype.toString.call(sourceBytes) != "[object Uint8Array]"
+  ) {
+    throw new TypeError("Expected a complete Uint8Array book snapshot");
+  }
+}
+
+/**
+ * Rejects unsafe or data-bearing auxiliaries without changing a closed stage.
+ *
+ * Native close can retain empty WAL/journal files and a regular SHM index.
+ * The actual storage validator still owns live-connection/transaction checks.
+ *
+ * @param {nsIFile} stage - Canonical closed stage whose auxiliaries are read.
+ * @throws {Error} For unsafe/data-bearing auxiliaries or a native read failure.
+ */
+function checkMigrationBookAuxiliaries(stage) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const sidecar = stage.clone();
+    sidecar.leafName += suffix;
+    let linked;
+    try {
+      linked = sidecar.isSymlink();
+    } catch (error) {
+      // Unix lstat reports ENOENT for an absent auxiliary. Other read errors
+      // retain their original native identity; a dangling symlink is not absent.
+      if (error.result === Cr.NS_ERROR_FILE_NOT_FOUND) {
+        continue;
+      }
+      throw error;
+    }
+    if (
+      linked ||
+      (sidecar.exists() &&
+        (!sidecar.isFile() || (suffix != "-shm" && sidecar.fileSize)))
+    ) {
+      throw new Error("Migration book stage still has SQLite sidecar data");
+    }
+  }
+}
+
+/**
+ * Settles whole-book publication under the process's selected startup profile.
+ *
+ * The startup caller retains its native profile lock and quiesces other writers
+ * throughout the callback and every started adoption. This operation neither
+ * acquires nor releases that lock. Its capability closes when the callback
+ * settles; pending adoptions still drain before this operation ends.
+ *
+ * @param {nsIToolkitProfile} profile - Genuine named startup-selected profile,
+ *   whose canonical root is the current ProfD.
+ * @param {function(object): *} callback - Complete import/publication and journal
+ *   checkpoint, using only checkProfile() and adopt(options).
+ * @returns {Promise<*>} Callback result after all started adoptions settle.
+ * @throws {Error} On an unselected/wrong profile or callback/adoption failure,
+ *   retaining the first actual error. A captured closed capability refuses with
+ *   "Book publication operation is closed".
+ */
+export async function withMigrationAddressBookPublication(profile, callback) {
+  if (typeof callback != "function") {
+    throw new TypeError("Expected a whole-book publication callback");
+  }
+  const nativeProfile = profile.QueryInterface(Ci.nsIToolkitProfile);
+  const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
+    Ci.nsIToolkitProfileService
+  );
+  const selected = migrationBookFile(nativeProfile.rootDir);
+  const current = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
+  if (profiles.currentProfile !== nativeProfile || !selected.equals(current)) {
+    throw new Error("Migration book lock selects another profile");
+  }
+  let accepting = true;
+  let held = true;
+  let failed = false;
+  let firstError;
+  let result;
+  const settlements = [];
+  const closedError = () => new Error("Book publication operation is closed");
+  const rememberError = error => {
+    if (!failed) {
+      failed = true;
+      firstError = error;
+    }
+  };
+  const checkHeldProfile = () => {
+    if (!held) {
+      throw closedError();
+    }
+    const actual = migrationBookFile(nativeProfile.rootDir);
+    const now = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
+    if (
+      profiles.currentProfile !== nativeProfile ||
+      !actual.equals(selected) ||
+      !actual.equals(now)
+    ) {
+      throw new Error("Migration book lock selects another profile");
+    }
+    return actual.clone();
+  };
+  const publication = Object.freeze({
+    checkProfile() {
+      if (!accepting) {
+        throw closedError();
+      }
+      return checkHeldProfile();
+    },
+    adopt(options) {
+      if (!accepting) {
+        return Promise.reject(closedError());
+      }
+      const operation = adoptMigrationAddressBook(options, checkHeldProfile);
+      // Observe even an adoption the callback does not await. Returning the
+      // original promise preserves its actual success or failure for callers.
+      settlements.push(operation.then(() => undefined, rememberError));
+      return operation;
+    },
+  });
+  try {
+    checkHeldProfile();
+    result = await callback(publication);
+  } catch (error) {
+    rememberError(error);
+  } finally {
+    accepting = false;
+    try {
+      // Admission is closed, so this list cannot grow during teardown.
+      await Promise.all(settlements);
+    } catch (error) {
+      rememberError(error);
+    }
+    held = false;
+  }
+  if (failed) {
+    throw firstError;
+  }
+  return result;
+}
+
+/**
+ * Publishes one complete, closed legacy-book stage in the current profile.
+ *
+ * The startup caller retains its native profile lock through the callback's
+ * journal checkpoint. The original source, stage and backup are never removed. A
+ * prepared preference record owns a retry artifact but is not a live book.
+ * The complete normal directory is stored before its single create event.
+ *
+ * @param {object} options - Settled original book publication.
+ * @param {nsIFile} options.stageFile - Closed, unregistered schema-4 stage.
+ * @param {Uint8Array} options.sourceBytes - Complete original legacy snapshot.
+ * @param {object} options.receipt - Settled source/token/hash/size/cards/lists.
+ * @param {string} options.bookUID - Stable book UID from the durable intent.
+ * @param {string} options.dirName - Exact selected display name.
+ * @param {function(): nsIFile} checkProfile - Startup-selected profile check.
+ * @returns {Promise<{directory: nsIAbDirectory, dirPrefId: string, uri: string,
+ *   fileName: string, bookUID: string, sourceId: string, storageSourceId: string,
+ *   sourceSha256: string, sourceSize: number, cards: [number, string][],
+ *   lists: [number, string][], reused: boolean}>} Durable owning directory/maps.
+ * @throws {Error} For a changed/wrong profile, changed/incomplete data, unrelated
+ *   occupants, active stage writers or IO/storage/preference/directory errors.
+ *   A preference change during a pending snapshot rejects with IN_PROGRESS;
+ *   the caller can retry without losing the newer preference values.
+ */
+async function adoptMigrationAddressBook(
+  { stageFile, sourceBytes, receipt, bookUID, dirName },
+  checkProfile
+) {
+  const profile = checkProfile();
+  const prefsFile = profile.clone();
+  prefsFile.append("prefs.js");
+  const stage = migrationBookFile(stageFile);
+  if (
+    !receipt ||
+    typeof receipt.sourceId != "string" ||
+    !receipt.sourceId ||
+    typeof receipt.storageSourceId != "string" ||
+    !receipt.storageSourceId ||
+    receipt.token !== receipt.storageSourceId ||
+    typeof bookUID != "string" ||
+    !bookUID ||
+    typeof dirName != "string" ||
+    !dirName ||
+    stage.path !== receipt.stagingPath ||
+    !stage.isFile()
+  ) {
+    throw new Error("Invalid migration book publication identity");
+  }
+  checkMigrationBookSnapshot(sourceBytes);
+  // Copy caller-owned values before validation or any synchronous reentry.
+  const expected = structuredClone(receipt);
+  const bytes = Uint8Array.from(sourceBytes);
+  const digest = migrationBookIdentityHash([
+    expected.sourceId,
+    expected.storageSourceId,
+    bookUID,
+  ]);
+  const fileName = "panorama-import-" + digest + ".sqlite";
+  const dirPrefId = "ldap_2.servers.panorama_import_" + digest;
+  const uri = "jsaddrbook://" + fileName;
+  const target = profile.clone();
+  target.append(fileName);
+  if (stage.equals(target)) {
+    throw new Error("Migration book stage cannot be its live destination");
+  }
+  const key = dirPrefId + ".panoramaMigration";
+  const identity = {
+    version: 1,
+    sourceId: expected.sourceId,
+    storageSourceId: expected.storageSourceId,
+    sourceSha256: expected.sourceSha256,
+    sourceSize: expected.sourceSize,
+    cards: expected.cards,
+    lists: expected.lists,
+    stagingPath: stage.path,
+    bookUID,
+    dirName,
+    fileName,
+    dirPrefId,
+    uri,
+  };
+  const identityJSON = JSON.stringify(identity);
+  const active = migrationAdoption;
+  if (active && (active.identity !== identityJSON || !active.result)) {
+    throw Components.Exception(
+      "Migration book publication is already in progress",
+      Cr.NS_ERROR_IN_PROGRESS
+    );
+  }
+  if (!active) {
+    migrationAdoption = { identity: identityJSON, dirPrefId, result: null };
+  }
+  try {
+    checkMigrationBookReceipt(
+      lazy.SQLiteDirectory.validateMigrationBook(
+        stage,
+        bytes,
+        expected.storageSourceId,
+        { requireClosed: true }
+      ),
+      expected
+    );
+    checkMigrationBookAuxiliaries(stage);
+    const recordText = Services.prefs.getStringPref(key, "");
+    let record = null;
+    if (recordText) {
+      const parsed = JSON.parse(recordText);
+      const { state, ...recordIdentity } = parsed;
+      if (
+        !["prepared", "published"].includes(state) ||
+        JSON.stringify(recordIdentity) !== identityJSON
+      ) {
+        throw new Error("Migration book publication ownership changed");
+      }
+      record = parsed;
+    } else if (
+      Services.prefs.getChildList(dirPrefId + ".").length ||
+      target.exists() ||
+      store?.has(uri)
+    ) {
+      throw new Error("Migration book destination is already occupied");
+    }
+    const normalPrefs = {
+      description: dirName,
+      filename: fileName,
+      dirType: Ci.nsIAbManager.JS_DIRECTORY_TYPE,
+      uid: bookUID,
+    };
+    for (const [name, value] of Object.entries(normalPrefs)) {
+      const pref = dirPrefId + "." + name;
+      if (
+        (record?.state == "published" &&
+          !Services.prefs.prefHasUserValue(pref)) ||
+        (Services.prefs.prefHasUserValue(pref) &&
+          (typeof value == "number"
+            ? Services.prefs.getIntPref(pref)
+            : Services.prefs.getStringPref(pref)) !== value)
+      ) {
+        throw new Error("Migration book directory preferences changed");
+      }
+    }
+    // A not-yet-loaded directory can still reserve the filename or book UID.
+    for (const pref of Services.prefs.getChildList("ldap_2.servers.")) {
+      if (pref.startsWith(dirPrefId + ".")) {
+        continue;
+      }
+      if (
+        (pref.endsWith(".filename") &&
+          Services.prefs.getStringPref(pref) === fileName) ||
+        (pref.endsWith(".uid") &&
+          Services.prefs.getStringPref(pref) === bookUID)
+      ) {
+        throw new Error(
+          "Migration book identity is reserved by another directory"
+        );
+      }
+    }
+    // Validate a retained target before normal initialization can open/create it.
+    if (record?.state == "published" && !target.exists()) {
+      throw new Error("Published migration book file is missing");
+    }
+    if (target.exists()) {
+      if (!migrationBookFile(target).isFile()) {
+        throw new Error("Migration book destination is not a regular file");
+      }
+      checkMigrationBookReceipt(
+        lazy.SQLiteDirectory.validateMigrationBook(
+          target,
+          bytes,
+          expected.storageSourceId,
+          { requireClosed: false }
+        ),
+        expected
+      );
+    }
+    checkProfile();
+    ensureInitialized();
+    for (const directory of store.values()) {
+      if (
+        (directory.UID === bookUID && directory.URI !== uri) ||
+        (directory.URI === uri &&
+          (directory.UID !== bookUID || directory.dirPrefId !== dirPrefId))
+      ) {
+        throw new Error(
+          "Migration book UID or URI belongs to another directory"
+        );
+      }
+    }
+    if (record?.state == "published" && !target.exists()) {
+      throw new Error("Published migration book file is missing");
+    }
+    const reused = record?.state == "published";
+    /**
+     * Commits one native preference snapshot without overwriting newer values.
+     *
+     * @param {"prepared"|"published"} state - Exact pending ownership state.
+     * @returns {Promise<void>} Native backup and same-directory commit completed.
+     */
+    const persistPreferences = async state => {
+      const targetExisted = target.exists();
+      const temporary = profile.clone();
+      temporary.append("panorama-book-prefs.tmp");
+      temporary.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+      let changed = false;
+      let observing = false;
+      const observe = () => {
+        changed = true;
+      };
+      try {
+        Services.prefs.addObserver("", observe);
+        observing = true;
+        // Unlike the blocking force-save call, this promise carries the actual
+        // safe writer's failure. The destination is never the current file.
+        await Services.prefs.backupPrefFile(temporary);
+        const refuseChangedSnapshot = () => {
+          if (changed) {
+            throw Components.Exception(
+              "Preferences changed during migration book publication",
+              Cr.NS_ERROR_IN_PROGRESS
+            );
+          }
+        };
+        refuseChangedSnapshot();
+        if (
+          !checkProfile().equals(profile) ||
+          !migrationBookFile(stageFile).equals(stage) ||
+          JSON.stringify(receipt) !== JSON.stringify(expected) ||
+          sourceBytes.length !== bytes.length ||
+          !sourceBytes.every((value, index) => value === bytes[index]) ||
+          Services.prefs.getStringPref(key) !==
+            JSON.stringify({ ...identity, state }) ||
+          target.exists() !== targetExisted
+        ) {
+          throw new Error(
+            "Migration book publication input or ownership changed"
+          );
+        }
+        checkMigrationBookReceipt(
+          lazy.SQLiteDirectory.validateMigrationBook(
+            stage,
+            bytes,
+            expected.storageSourceId,
+            { requireClosed: true }
+          ),
+          expected
+        );
+        checkMigrationBookAuxiliaries(stage);
+        if (targetExisted) {
+          if (!migrationBookFile(target).isFile()) {
+            throw new Error("Migration book destination is not a regular file");
+          }
+          checkMigrationBookReceipt(
+            lazy.SQLiteDirectory.validateMigrationBook(
+              target,
+              bytes,
+              expected.storageSourceId,
+              { requireClosed: false }
+            ),
+            expected
+          );
+        }
+        for (const [name, value] of Object.entries(normalPrefs)) {
+          const pref = dirPrefId + "." + name;
+          if (
+            (state == "published" && !Services.prefs.prefHasUserValue(pref)) ||
+            (Services.prefs.prefHasUserValue(pref) &&
+              (typeof value == "number"
+                ? Services.prefs.getIntPref(pref)
+                : Services.prefs.getStringPref(pref)) !== value)
+          ) {
+            throw new Error("Migration book directory preferences changed");
+          }
+        }
+        for (const pref of Services.prefs.getChildList("ldap_2.servers.")) {
+          if (
+            !pref.startsWith(dirPrefId + ".") &&
+            ((pref.endsWith(".filename") &&
+              Services.prefs.getStringPref(pref) === fileName) ||
+              (pref.endsWith(".uid") &&
+                Services.prefs.getStringPref(pref) === bookUID))
+          ) {
+            throw new Error(
+              "Migration book identity is reserved by another directory"
+            );
+          }
+        }
+        for (const directory of store?.values() ?? []) {
+          if (
+            (directory.UID === bookUID && directory.URI !== uri) ||
+            (directory.URI === uri &&
+              (directory.UID !== bookUID || directory.dirPrefId !== dirPrefId))
+          ) {
+            throw new Error(
+              "Migration book UID or URI belongs to another directory"
+            );
+          }
+        }
+        migrationBookFile(temporary);
+        if (prefsFile.exists()) {
+          migrationBookFile(prefsFile);
+        }
+        refuseChangedSnapshot();
+        // No yield between the final checks and the result-bearing native move.
+        // moveTo updates temporary to prefs.js; cleanup must not remove it.
+        temporary.moveTo(profile, prefsFile.leafName);
+      } finally {
+        if (observing) {
+          try {
+            Services.prefs.removeObserver("", observe);
+          } catch (error) {
+            console.error("Could not remove book preference observer", error);
+          }
+        }
+        try {
+          if (!temporary.equals(prefsFile) && temporary.exists()) {
+            temporary.remove(false);
+          }
+        } catch (error) {
+          console.error("Could not remove book preference temporary", error);
+        }
+      }
+    };
+    if (!reused) {
+      checkProfile();
+      Services.prefs.setStringPref(
+        key,
+        JSON.stringify({ ...identity, state: "prepared" })
+      );
+      await persistPreferences("prepared");
+      checkProfile();
+      if (
+        Services.prefs.getStringPref(key) !==
+        JSON.stringify({ ...identity, state: "prepared" })
+      ) {
+        throw new Error("Migration book publication ownership changed");
+      }
+    }
+    if (!target.exists()) {
+      const temporary = copyMigrationBook(stage, target);
+      checkMigrationBookReceipt(
+        lazy.SQLiteDirectory.validateMigrationBook(
+          migrationBookFile(temporary),
+          bytes,
+          expected.storageSourceId,
+          { requireClosed: true }
+        ),
+        expected
+      );
+      checkMigrationBookAuxiliaries(temporary);
+      publishMigrationBookCopy(
+        temporary,
+        target,
+        checkProfile,
+        key,
+        JSON.stringify({ ...identity, state: "prepared" })
+      );
+    }
+    if (!migrationBookFile(target).isFile()) {
+      throw new Error("Migration book destination is not a regular file");
+    }
+    checkMigrationBookReceipt(
+      lazy.SQLiteDirectory.validateMigrationBook(
+        target,
+        bytes,
+        expected.storageSourceId,
+        { requireClosed: false }
+      ),
+      expected
+    );
+    checkProfile();
+    if (!reused) {
+      for (const [name, value] of Object.entries(normalPrefs)) {
+        const pref = dirPrefId + "." + name;
+        if (typeof value == "number") {
+          Services.prefs.setIntPref(pref, value);
+        } else {
+          Services.prefs.setStringPref(pref, value);
+        }
+      }
+      Services.prefs.setStringPref(
+        key,
+        JSON.stringify({ ...identity, state: "published" })
+      );
+      try {
+        await persistPreferences("published");
+        // The caller's continuation also follows a promise boundary. Recheck
+        // the live owner before exposing the committed book to normal callers.
+        checkProfile();
+        if (
+          Services.prefs.getStringPref(key) !==
+            JSON.stringify({ ...identity, state: "published" }) ||
+          JSON.stringify(receipt) !== JSON.stringify(expected) ||
+          sourceBytes.length !== bytes.length ||
+          !sourceBytes.every((value, index) => value === bytes[index])
+        ) {
+          throw new Error(
+            "Migration book publication input or ownership changed"
+          );
+        }
+        for (const [name, value] of Object.entries(normalPrefs)) {
+          const pref = dirPrefId + "." + name;
+          if (
+            !Services.prefs.prefHasUserValue(pref) ||
+            (typeof value == "number"
+              ? Services.prefs.getIntPref(pref)
+              : Services.prefs.getStringPref(pref)) !== value
+          ) {
+            throw new Error("Migration book directory preferences changed");
+          }
+        }
+        checkMigrationBookReceipt(
+          lazy.SQLiteDirectory.validateMigrationBook(
+            target,
+            bytes,
+            expected.storageSourceId,
+            { requireClosed: false }
+          ),
+          expected
+        );
+      } catch (error) {
+        // Keep uncertain durable artifacts, and hide this branch in memory.
+        try {
+          // Do not roll back a newer owner's preference value.
+          if (
+            Services.prefs.getStringPref(key, "") ===
+            JSON.stringify({ ...identity, state: "published" })
+          ) {
+            Services.prefs.setStringPref(
+              key,
+              JSON.stringify({ ...identity, state: "prepared" })
+            );
+          }
+        } catch (recoveryError) {
+          console.error("Could not retain prepared book state", recoveryError);
+        }
+        throw error;
+      }
+    }
+    ensureInitialized();
+    const directory = store.get(uri) ?? createDirectoryObject(uri, true);
+    if (
+      directory.UID !== bookUID ||
+      directory.dirPrefId !== dirPrefId ||
+      directory.fileName !== fileName
+    ) {
+      throw new Error("Published migration book directory identity changed");
+    }
+    updateSortedDirectoryList();
+    const result = {
+      directory,
+      dirPrefId,
+      uri,
+      fileName,
+      bookUID,
+      sourceId: expected.sourceId,
+      storageSourceId: expected.storageSourceId,
+      sourceSha256: expected.sourceSha256,
+      sourceSize: expected.sourceSize,
+      cards: expected.cards.map(pair => [...pair]),
+      lists: expected.lists.map(pair => [...pair]),
+      reused,
+    };
+    migrationAdoption.result = result;
+    if (!reused) {
+      incrementDisplayNameVersion();
+      Services.obs.notifyObservers(directory, "addrbook-directory-created");
+    }
+    return result;
+  } finally {
+    if (!active) {
+      migrationAdoption = null;
+    }
+  }
+}
 
 /**
  * @implements {nsIAbManager}

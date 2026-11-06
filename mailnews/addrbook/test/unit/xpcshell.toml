@@ -48,6 +48,7 @@ tags = [
 ]
 
 ["test_jsaddrbook.js"]
+support-files = ["../../../../mail/components/addrbook/test/browser/data/import.mab"]
 
 ["test_ldap1.js"]
 

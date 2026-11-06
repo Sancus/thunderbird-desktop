@@ -565,6 +565,85 @@ export class MigrationJournal {
   }
 
   /**
+   * Records a stable public book identity before importing or publishing it.
+   * The caller retains the actual selected profile lock. A retry keeps its
+   * original UID and exact selected display name without rewriting the intent.
+   *
+   * @param {string} id - Original planned book identity.
+   * @param {string} dirName - Exact selected display name.
+   * @returns {Promise<{bookUID: string, dirName: string}>} Durable intent.
+   * @throws {Error} On cancelled work, changed source/name or journal failure.
+   */
+  async beginBookPublication(id, dirName) {
+    let intent;
+    await this.#change(async state => {
+      if (
+        state.cancelled ||
+        !["import", "validate"].includes(state.stage) ||
+        typeof dirName != "string" ||
+        dirName.includes("\0")
+      ) {
+        throw new Error("Book publication is cancelled or has an invalid name");
+      }
+      const book = this.#book(state, id);
+      await this.#checkSource(book);
+      await this.#checkBackup(state, state.backup);
+      if (book.publication) {
+        if (book.publication.dirName !== dirName) {
+          throw new Error("Book publication name changed");
+        }
+        intent = {
+          bookUID: book.publication.bookUID,
+          dirName,
+        };
+        return false;
+      }
+      intent = {
+        bookUID: Services.uuid.generateUUID().toString().slice(1, -1),
+        dirName,
+      };
+      book.publication = { ...intent, state: "pending", receipt: null };
+      return true;
+    });
+    return intent;
+  }
+
+  /**
+   * Checkpoints an actual durable Manager publication before cancellation.
+   * A failed journal write leaves the Manager's real commit available for the
+   * same-identity retry. Live objects and the transient reused flag are omitted.
+   *
+   * @param {string} id - Original planned book identity.
+   * @param {object} receipt - Actual Manager result and scoped card/list maps.
+   * @returns {Promise<void>} Persisted public identity or unchanged exact retry.
+   * @throws {Error} On a conflicting result, incomplete import or write failure.
+   */
+  async recordBookPublication(id, receipt) {
+    await this.#change(state => {
+      const book = this.#book(state, id);
+      if (
+        !["import", "validate"].includes(state.stage) ||
+        book.state != "imported" ||
+        !book.publication
+      ) {
+        throw new Error("Book publication has no settled import and intent");
+      }
+      const normalized = this.#bookPublicationReceipt(book, receipt);
+      if (book.publication.state == "published") {
+        if (
+          JSON.stringify(book.publication.receipt) != JSON.stringify(normalized)
+        ) {
+          throw new Error("Committed book publication changed");
+        }
+        return false;
+      }
+      book.publication.state = "published";
+      book.publication.receipt = normalized;
+      return true;
+    });
+  }
+
+  /**
    * Persists a book operation before creating its staged database.
    * The token is the opaque sourceId stored by SQLiteDirectory, not a card UID.
    *
@@ -1118,6 +1197,87 @@ export class MigrationJournal {
     }
   }
 
+  /**
+   * Normalizes the Manager identity while keeping the imported scoped maps.
+   *
+   * @param {object} book - Imported book with its durable publication intent.
+   * @param {object} receipt - Actual Manager result or stored normalized result.
+   * @returns {object} Stable serializable publication fields.
+   * @throws {Error} On any changed source, UID map or destination association.
+   */
+  #bookPublicationReceipt(book, receipt) {
+    const match = /^ldap_2\.servers\.panorama_import_([0-9a-f]{64})$/.exec(
+      receipt?.dirPrefId
+    );
+    if (
+      !match ||
+      receipt.fileName !== `panorama-import-${match[1]}.sqlite` ||
+      receipt.uri !== `jsaddrbook://${receipt.fileName}` ||
+      receipt.bookUID !== book.publication.bookUID ||
+      receipt.sourceId !== book.id ||
+      receipt.storageSourceId !== book.token ||
+      receipt.sourceSha256 !== book.sha256 ||
+      receipt.sourceSize !== book.size ||
+      !["cards", "lists"].every(kind => Array.isArray(receipt[kind]))
+    ) {
+      throw new Error("Invalid book publication receipt");
+    }
+    const result = {
+      dirPrefId: receipt.dirPrefId,
+      uri: receipt.uri,
+      fileName: receipt.fileName,
+      bookUID: receipt.bookUID,
+      sourceId: receipt.sourceId,
+      storageSourceId: receipt.storageSourceId,
+      sourceSha256: receipt.sourceSha256,
+      sourceSize: receipt.sourceSize,
+      cards: receipt.cards.map(pair => [...pair]).sort((a, b) => a[0] - b[0]),
+      lists: receipt.lists.map(pair => [...pair]).sort((a, b) => a[0] - b[0]),
+    };
+    for (const kind of ["cards", "lists"]) {
+      if (JSON.stringify(result[kind]) !== JSON.stringify(book.receipt[kind])) {
+        throw new Error("Book publication UID mapping changed");
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Validates the optional publication state without advancing global activation.
+   *
+   * @param {object} book - Current planned book and existing import receipt.
+   * @throws {Error} On an invalid intent or a publication without its import.
+   */
+  #validateBookPublication(book) {
+    const publication = book.publication;
+    if (publication === undefined) {
+      return;
+    }
+    if (
+      !publication ||
+      !["pending", "published"].includes(publication.state) ||
+      typeof publication.bookUID != "string" ||
+      !publication.bookUID ||
+      /[\0/\\]/u.test(publication.bookUID) ||
+      typeof publication.dirName != "string" ||
+      publication.dirName.includes("\0")
+    ) {
+      throw new Error("Invalid book publication intent");
+    }
+    if (publication.state == "pending") {
+      if (publication.receipt !== null) {
+        throw new Error("Uncommitted book publication has a receipt");
+      }
+    } else if (
+      book.state != "imported" ||
+      JSON.stringify(
+        this.#bookPublicationReceipt(book, publication.receipt)
+      ) !== JSON.stringify(publication.receipt)
+    ) {
+      throw new Error("Invalid committed book publication");
+    }
+  }
+
   #requireActive(state, stage) {
     if (state.cancelled || state.stage != stage) {
       throw new Error("Migration is cancelled or at another stage");
@@ -1509,6 +1669,7 @@ export class MigrationJournal {
   }
 
   #validateBooksAndStage(state, roots, file, ids, tokens, files) {
+    const publicationUIDs = new Set();
     const stages = [];
     for (const book of state.books ?? []) {
       if (
@@ -1558,6 +1719,13 @@ export class MigrationJournal {
         this.#validateBookReceipt(book, book.receipt, state);
       } else if (book.receipt !== null) {
         throw new Error("Uncommitted migration book has a receipt");
+      }
+      this.#validateBookPublication(book);
+      if (book.publication) {
+        if (publicationUIDs.has(book.publication.bookUID)) {
+          throw new Error("Duplicate book publication UID");
+        }
+        publicationUIDs.add(book.publication.bookUID);
       }
     }
     this.#validateProtocolUnits(state);

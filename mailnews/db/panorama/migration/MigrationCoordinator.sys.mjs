@@ -35,6 +35,8 @@ import {
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
+  withMigrationAddressBookPublication:
+    "resource:///modules/AddrBookManager.sys.mjs",
   MailServices: "resource:///modules/MailServices.sys.mjs",
   SQLiteDirectory: "resource:///modules/SQLiteDirectory.sys.mjs",
   readLegacyGlodaMail:
@@ -203,6 +205,19 @@ export async function resumeMorkBookImports(journal, profileLock, signal) {
       throw new Error("Migration profile lock selects another profile");
     }
   };
+  return resumeMorkBooksWithProfile(journal, checkLock, signal);
+}
+
+/**
+ * Imports and checkpoints books while the supplied owner holds the profile.
+ *
+ * @param {MigrationJournal} journal - Backed-up book import journal.
+ * @param {function():void} checkLock - Checks the owner's held profile and the
+ *   exact journal root at every existing import checkpoint.
+ * @param {AbortSignal} [signal] - Cancellation at a settled book boundary.
+ * @returns {Promise<void>} Imported book receipts and settled stage checkpoint.
+ */
+async function resumeMorkBooksWithProfile(journal, checkLock, signal) {
   const checkCancelled = async () => {
     if (signal?.aborted && !journal.state.cancelled) {
       await journal.setCancelled(true);
@@ -335,6 +350,176 @@ export async function resumeMorkBookImports(journal, profileLock, signal) {
     }
     throw error;
   }
+}
+
+/**
+ * Imports and publishes complete books in the selected startup profile.
+ * The startup caller retains its native profile lock throughout this operation.
+ * This entry never acquires or releases that process-lifetime lock. The caller
+ * awaits imports, Manager adoption and journal writes before writers start.
+ * Existing stage-only imports and the whole-profile activation hold remain.
+ * A Manager commit precedes its journal write; a retry uses the original public
+ * book identity and full scoped maps instead of importing or notifying twice.
+ *
+ * @param {MigrationJournal} journal - Actual backed-up import/validation journal.
+ * @param {nsIToolkitProfile} profile - Actual startup-selected current profile.
+ *   The caller retains the startup profile lock through all settled work.
+ * @param {Map<string, string>} bookNames - Exact planned ID/display-name pairs.
+ * @param {AbortSignal} [signal] - Cancellation after a settled book boundary.
+ * @returns {Promise<object[]>} Actual Manager directories and publication maps.
+ * @throws {Error} On unsupported admission, changed data, publication or journal
+ *   failure. The original child error is preserved if error checkpointing fails.
+ * @example
+ * await resumeMorkBookImportsAndPublish(journal, profile,
+ *   new Map([["original-book", "Imported address book"]]));
+ */
+export async function resumeMorkBookImportsAndPublish(
+  journal,
+  profile,
+  bookNames,
+  signal
+) {
+  if (AppConstants.platform == "win") {
+    throw new Error("Windows book migration requires native reparse admission");
+  }
+  if (!(journal instanceof MigrationJournal)) {
+    throw new TypeError("An actual migration journal is required");
+  }
+  return lazy.withMigrationAddressBookPublication(
+    profile,
+    async publication => {
+      const checkLock = () => {
+        const selected = publication.checkProfile();
+        const current = Services.dirsvc.get("ProfD", Ci.nsIFile).clone();
+        for (const file of [selected, current]) {
+          for (let parent = file; parent; parent = parent.parent) {
+            if (parent.isSymlink()) {
+              throw new Error("Book publication profile contains a link");
+            }
+          }
+          file.normalize();
+        }
+        if (
+          !selected.equals(current) ||
+          !selected.equals(new FileUtils.File(journal.state.profilePath))
+        ) {
+          throw new Error("Book publication requires the held current profile");
+        }
+      };
+      checkLock();
+      const initial = journal.state;
+      if (
+        !["import", "validate"].includes(initial.stage) ||
+        !initial.books?.length ||
+        Object.prototype.toString.call(bookNames) != "[object Map]"
+      ) {
+        throw new Error(
+          "Book publication requires an explicit current book plan"
+        );
+      }
+      const names = new Map(bookNames);
+      const ids = new Set(initial.books.map(book => book.id));
+      if (
+        names.size !== ids.size ||
+        [...names].some(
+          ([id, name]) =>
+            !ids.has(id) || typeof name != "string" || name.includes("\0")
+        )
+      ) {
+        throw new Error("Book publication names differ from the exact plan");
+      }
+      const checkCancelled = async () => {
+        if (signal?.aborted && !journal.state.cancelled) {
+          await journal.setCancelled(true);
+        }
+        if (journal.state.cancelled) {
+          throw new DOMException("Migration cancelled", "AbortError");
+        }
+      };
+      try {
+        await checkCancelled();
+        for (const book of initial.books) {
+          checkLock();
+          await journal.beginBookPublication(book.id, names.get(book.id));
+        }
+        await resumeMorkBooksWithProfile(journal, checkLock, signal);
+        const publications = [];
+        for (const book of journal.state.books) {
+          await checkCancelled();
+          checkLock();
+          const roots = [
+            journal.state.profilePath,
+            ...journal.state.mailPaths,
+          ].map(path => new FileUtils.File(path));
+          const source = new FileUtils.File(book.path);
+          if (admittedFolderPath(source, roots) !== book.path) {
+            throw new Error("Book publication source path changed");
+          }
+          const { bytes, identity } = await readMorkAddressBookSource(
+            book.path
+          );
+          if (
+            identity.path !== book.path ||
+            identity.sha256 !== book.sha256 ||
+            identity.size !== book.size ||
+            !sameKeys(identity.cardKeys, book.cardKeys) ||
+            !sameKeys(identity.listKeys, book.listKeys)
+          ) {
+            throw new Error("Book publication source differs from its plan");
+          }
+          const stage = new FileUtils.File(book.stagingPath);
+          if (admittedFolderPath(stage, [stage.parent]) !== book.stagingPath) {
+            throw new Error("Book publication staging path changed");
+          }
+          const checked = lazy.SQLiteDirectory.validateMigrationBook(
+            stage,
+            bytes,
+            book.token,
+            { requireClosed: true }
+          );
+          if (
+            book.state != "imported" ||
+            checked.sourceId !== book.receipt.storageSourceId ||
+            checked.sourceSha256 !== book.receipt.sourceSha256 ||
+            checked.sourceSize !== book.receipt.sourceSize ||
+            !["cards", "lists"].every(
+              kind =>
+                JSON.stringify(checked[kind]) ===
+                JSON.stringify(book.receipt[kind])
+            )
+          ) {
+            throw new Error(
+              "Book publication differs from its committed import"
+            );
+          }
+          await checkCancelled();
+          checkLock();
+          const published = await publication.adopt({
+            stageFile: stage,
+            sourceBytes: bytes,
+            receipt: book.receipt,
+            bookUID: book.publication.bookUID,
+            dirName: book.publication.dirName,
+          });
+          // Settle the real Manager commit even if an observer requested cancellation.
+          await journal.recordBookPublication(book.id, published);
+          publications.push(published);
+          await checkCancelled();
+        }
+        return publications;
+      } catch (error) {
+        try {
+          await journal.recordError(error);
+        } catch (journalError) {
+          console.error(
+            "Could not checkpoint book publication error",
+            journalError
+          );
+        }
+        throw error;
+      }
+    }
+  );
 }
 
 /**

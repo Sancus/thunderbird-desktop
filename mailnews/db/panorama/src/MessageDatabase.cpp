@@ -3444,7 +3444,8 @@ nsresult MessageDatabase::ValidateOnlineTransferDestination(
         MOZ_TRY(stmt->GetUTF8String(1, text));
         NS_ENSURE_TRUE(!text.IsEmpty() && text.Length() <= 8,
                        NS_ERROR_FILE_CORRUPTED);
-        for (char digit : text) {
+        for (uint32_t i = 0; i < text.Length(); ++i) {
+          char digit = text.CharAt(i);
           NS_ENSURE_TRUE(
               (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'),
               NS_ERROR_FILE_CORRUPTED);

@@ -18,7 +18,8 @@
 struct NativeImapUndoEntry;
 namespace mozilla::mailnews {
 struct PendingDestination;
-}
+struct ServerMessageLocation;
+}  // namespace mozilla::mailnews
 #endif
 
 class nsImapMoveCopyMsgTxn : public nsMsgTxn, nsIUrlListener {
@@ -47,6 +48,10 @@ class nsImapMoveCopyMsgTxn : public nsMsgTxn, nsIUrlListener {
   nsresult PrepareNativeQueuedSources(
       nsIMsgFolder* folder,
       const mozilla::mailnews::PendingDestination* cancelMove = nullptr);
+  nsresult AdoptNativeDestination(
+      uint32_t index, nsIMsgFolder* folder,
+      const mozilla::mailnews::ServerMessageLocation& mapping,
+      nsIMsgDBHdr* header);
   nsresult AppendNativeDestination(uint32_t index, nsIMsgFolder* folder,
                                    uint32_t epoch, ImapUid uid, nsMsgKey* key);
   nsresult ValidateNativeDestinations();

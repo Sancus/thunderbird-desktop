@@ -3,6 +3,8 @@
  * server lies about rfc822.size (known to happen for Exchange and gmail)
  */
 
+"use strict";
+
 const { NetUtil } = ChromeUtils.importESModule(
   "resource://gre/modules/NetUtil.sys.mjs"
 );
@@ -633,5 +635,368 @@ async function checkCopyChunkError(name, response, rejectedChunk, isMove) {
     proto.STORE = originalStore;
     proto.EXPUNGE = originalExpunge;
     MailServices.mfn.removeListener(notifier);
+  }
+}
+
+/**
+ * Refuses conflicting COPYUID tuples within one real COPY completion.
+ * Keeps the server effect, source and once-only callback visible on failure.
+ */
+add_task(async function test_copyRejectsConflictingEarlyCopyUid() {
+  const { source, remote, originals, text } = gCopyChunkSource;
+  const uid = originals[0].uid;
+  const name = "copy-conflicting-early-uid";
+  const destination = gChunkServer.daemon.createMailbox(name, {
+    subscribed: true,
+    uidvalidity: 9403,
+  });
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    gChunkIncomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const target = gChunkIncomingServer.rootFolder.getChildNamed(name);
+  const proto = IMAP_RFC3501_handler.prototype;
+  const originalCopy = proto.COPY;
+  let copies = 0;
+  proto.COPY = function (args, isUid) {
+    if (args[1] != name) {
+      return originalCopy.call(this, args, isUid);
+    }
+    Assert.equal(this._selectedMailbox, remote);
+    Assert.ok(isUid);
+    Assert.equal(String(args[0]), String(uid));
+    copies++;
+    const before = destination._messages.length;
+    const outcome = originalCopy.call(this, args, isUid);
+    Assert.ok(outcome.startsWith("OK"));
+    Assert.equal(destination._messages.length, before + 1);
+    const assigned = destination._messages.at(-1).uid;
+    // The fake server's NUL separator emits an untagged OK, followed by the
+    // tagged response for this same command. The second tuple conflicts.
+    return (
+      `* OK [COPYUID 9403 ${uid} ${assigned}] early mapping\0` +
+      `OK [COPYUID 9403 ${uid} ${assigned + 1}] conflicting mapping`
+    );
+  };
+  const calls = { starts: 0, stops: 0 };
+  const listener = new PromiseTestUtils.PromiseUrlListener({
+    OnStartRunningUrl() {
+      calls.starts++;
+    },
+    OnStopRunningUrl() {
+      calls.stops++;
+    },
+  });
+  try {
+    MailServices.imap.onlineMessageCopy(
+      source,
+      String(uid),
+      target,
+      true,
+      false,
+      listener,
+      {},
+      null,
+      null
+    );
+    const status = await listener.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
+    if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+      Assert.notEqual(status, Cr.NS_OK, "Conflicting identity is not success");
+    } else {
+      Assert.equal(
+        status,
+        Cr.NS_OK,
+        "Retain the unchanged legacy raw behavior"
+      );
+    }
+    Assert.equal(
+      copies,
+      1,
+      "The applied command is never automatically replayed"
+    );
+    Assert.deepEqual(calls, { starts: 1, stops: 1 });
+    Assert.equal(destination._messages.length, 1);
+    Assert.equal(destination._messages[0].getText(), text(uid));
+    const saved = originals[0];
+    Assert.equal(saved.header.messageKey, saved.key);
+    Assert.equal(saved.header.storeToken, saved.token);
+    Assert.equal(gCopyChunkSource.readBody(saved.header), saved.bytes);
+    Assert.equal(
+      remote._messages.find(message => message.uid == uid).getText(),
+      text(uid)
+    );
+  } finally {
+    proto.COPY = originalCopy;
+    // The deliberately malformed receipt poisoned this connection's parser.
+    // End that case before discovery for the following independent command.
+    gChunkIncomingServer.closeCachedConnections();
+  }
+});
+
+add_task(async function test_onlineCopyOwnsEveryLateChunkMapping() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const { source, originals, readBody } = gCopyChunkSource;
+  const name = "online-late-chunk-mappings";
+  const remote = gChunkServer.daemon.createMailbox(name, {
+    subscribed: true,
+    uidvalidity: 9405,
+  });
+  remote.uidnext = 970001;
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    gChunkIncomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const target = gChunkIncomingServer.rootFolder.getChildNamed(name);
+  const proto = IMAP_RFC3501_handler.prototype;
+  const saved = { COPY: proto.COPY, CAPABILITY: proto.CAPABILITY };
+  const actual = new Map();
+  let commands = 0;
+  proto.CAPABILITY = function (...args) {
+    return saved.CAPABILITY.apply(this, args).replace(
+      "IMAP4rev1",
+      "IMAP4rev1 UIDPLUS"
+    );
+  };
+  proto.COPY = function (args, uid) {
+    if (args[1] != name) {
+      return saved.COPY.call(this, args, uid);
+    }
+    const sources = this._parseSequenceSet(args[0], uid).map(
+      message => message.uid
+    );
+    const before = remote._messages.length;
+    const response = saved.COPY.call(this, args, uid);
+    Assert.ok(response.startsWith("OK"));
+    const destinations = remote._messages
+      .slice(before)
+      .map(message => message.uid);
+    Assert.equal(destinations.length, sources.length);
+    sources.forEach((sourceUid, i) => actual.set(sourceUid, destinations[i]));
+    commands++;
+    return `* OK [COPYUID 9405 ${sources.join(",")} ${destinations.join(",")}] late mapping\0OK COPY complete`;
+  };
+  const keys = [];
+  let stops = 0;
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    setMessageKey(key) {
+      keys.push(key);
+      const header = target.msgDatabase.getMsgHdrForKey(key);
+      const original = originals.find(
+        item => item.header.messageId == header.messageId
+      );
+      Assert.equal(
+        header.getUint32Property("uidOnServer"),
+        actual.get(original.uid)
+      );
+      Assert.notEqual(key, actual.get(original.uid));
+      const input = target.getMsgInputStream(header);
+      try {
+        let bytes = "";
+        while (input.available()) {
+          bytes += NetUtil.readInputStreamToString(input, input.available());
+        }
+        // The provider owns its exact stored representation, including its
+        // status headers. Compare the captured physical source bytes.
+        Assert.equal(bytes, original.bytes);
+      } finally {
+        input.close();
+      }
+    },
+    onStopCopy() {
+      stops++;
+    },
+  });
+  try {
+    gChunkIncomingServer.closeCachedConnections();
+    MailServices.copy.copyMessages(
+      source,
+      originals.map(item => item.header),
+      target,
+      false,
+      listener,
+      null,
+      false
+    );
+    await listener.promise;
+    Assert.greater(commands, 2);
+    Assert.equal(actual.size, originals.length);
+    Assert.equal(keys.length, originals.length);
+    Assert.equal(new Set(keys).size, originals.length);
+    Assert.equal(target.getTotalMessages(false), originals.length);
+    Assert.equal(stops, 1);
+    for (const savedSource of originals) {
+      Assert.equal(savedSource.header.messageKey, savedSource.key);
+      Assert.equal(savedSource.header.storeToken, savedSource.token);
+      Assert.equal(readBody(savedSource.header), savedSource.bytes);
+    }
+  } finally {
+    Object.assign(proto, saved);
+    gChunkIncomingServer.closeCachedConnections();
+  }
+});
+
+add_task(async function test_onlineCopyObservedUncachedPhysicalIdentity() {
+  await checkUncachedOnlineCopy(false);
+});
+
+add_task(async function test_onlineMoveAmbiguityRetainsUncachedSource() {
+  await checkUncachedOnlineCopy(true);
+});
+
+/**
+ * Exercises ordinary no-UID COPY discovery with a genuinely uncached source.
+ *
+ * @param {boolean} ambiguousMove - Introduce two indistinguishable destinations.
+ * @returns {Promise<void>} Resolves after the real operation and custody checks.
+ */
+async function checkUncachedOnlineCopy(ambiguousMove) {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  const suffix = ambiguousMove ? "ambiguous" : "unique";
+  const sourceName = "uncached-source-" + suffix;
+  const targetName = "uncached-target-" + suffix;
+  const sourceRemote = gChunkServer.daemon.createMailbox(sourceName, {
+    subscribed: true,
+    uidvalidity: 9407,
+  });
+  const targetRemote = gChunkServer.daemon.createMailbox(targetName, {
+    subscribed: true,
+    uidvalidity: 9409,
+  });
+  targetRemote.uidnext = 980001;
+  const raw = [
+    "From: uncached@example.invalid",
+    `Message-ID: <${suffix}@uncached-copy.invalid>`,
+    "References: <root@uncached-copy.invalid>",
+    "Subject: Uncached online COPY " + suffix,
+    "",
+    "Actual uncached source body.",
+    "",
+  ].join("\r\n");
+  sourceRemote.addMessage(
+    new ImapMessage("data:text/plain," + encodeURI(raw), 12001, [])
+  );
+  sourceRemote.uidnext = 12002;
+  const discovered = new PromiseTestUtils.PromiseUrlListener();
+  MailServices.imap.discoverAllFolders(
+    gChunkIncomingServer.rootFolder,
+    discovered,
+    null
+  );
+  await discovered.promise;
+  const source = gChunkIncomingServer.rootFolder
+    .getChildNamed(sourceName)
+    .QueryInterface(Ci.nsIMsgImapMailFolder);
+  const target = gChunkIncomingServer.rootFolder.getChildNamed(targetName);
+  const selected = new PromiseTestUtils.PromiseUrlListener();
+  source.updateFolderWithListener(null, selected);
+  await selected.promise;
+  const header = [...source.messages][0];
+  const key = header.messageKey;
+  Assert.equal(header.flags & Ci.nsMsgMessageFlags.Offline, 0);
+  Assert.equal(header.storeToken, "");
+  const proto = IMAP_RFC3501_handler.prototype;
+  const saved = {
+    COPY: proto.COPY,
+    CAPABILITY: proto.CAPABILITY,
+    STORE: proto.STORE,
+  };
+  let copies = 0;
+  const destructive = [];
+  proto.CAPABILITY = function (...args) {
+    return saved.CAPABILITY.apply(this, args).replace(/\bUIDPLUS\b/g, "");
+  };
+  proto.COPY = function (args, uid) {
+    if (args[1] != targetName) {
+      return saved.COPY.call(this, args, uid);
+    }
+    copies++;
+    const response = saved.COPY.call(this, args, uid);
+    Assert.ok(response.startsWith("OK"));
+    if (ambiguousMove) {
+      targetRemote.addMessage(
+        new ImapMessage(
+          "data:text/plain," + encodeURI(raw),
+          targetRemote.uidnext++,
+          []
+        )
+      );
+    }
+    return response.replace(/\[COPYUID [^\]]+\]/g, "");
+  };
+  proto.STORE = function (args, uid) {
+    if (this._selectedMailbox == sourceRemote) {
+      destructive.push(args);
+    }
+    return saved.STORE.call(this, args, uid);
+  };
+  let stops = 0;
+  const listener = new PromiseTestUtils.PromiseCopyListener({
+    onStopCopy() {
+      stops++;
+    },
+  });
+  try {
+    gChunkIncomingServer.closeCachedConnections();
+    MailServices.copy.copyMessages(
+      source,
+      [header],
+      target,
+      ambiguousMove,
+      listener,
+      null,
+      false
+    );
+    const result = await listener.promise.then(
+      value => value,
+      error => error
+    );
+    if (ambiguousMove) {
+      Assert.equal(result.name, "Error");
+      Assert.equal(Number(result.message), Cr.NS_ERROR_NOT_AVAILABLE);
+      Assert.deepEqual(
+        destructive,
+        [],
+        "No fallback source delete without identity"
+      );
+      Assert.equal(target.getTotalMessages(false), 0);
+      Assert.equal(targetRemote._messages.length, 2);
+    } else {
+      Assert.equal(result.messageKeys.length, 1);
+      const copied = target.msgDatabase.getMsgHdrForKey(result.messageKeys[0]);
+      Assert.notEqual(copied.messageKey, 980001);
+      Assert.equal(copied.getUint32Property("uidOnServer"), 980001);
+      Assert.equal(copied.flags & Ci.nsMsgMessageFlags.Offline, 0);
+      Assert.equal(
+        copied.storeToken,
+        "",
+        "Remote readback is not a fabricated offline store body"
+      );
+      Assert.equal(target.getTotalMessages(false), 1);
+      Assert.equal(targetRemote._messages.length, 1);
+    }
+    Assert.equal(copies, 1);
+    Assert.equal(stops, 1);
+    Assert.equal(source.msgDatabase.getMsgHdrForKey(key), header);
+    Assert.equal(header.storeToken, "");
+    Assert.equal(header.flags & Ci.nsMsgMessageFlags.Offline, 0);
+    Assert.equal(sourceRemote._messages.length, 1);
+    Assert.equal(sourceRemote._messages[0].getText(), raw);
+    Assert.ok(!sourceRemote._messages[0].flags.includes("\\Deleted"));
+  } finally {
+    Object.assign(proto, saved);
+    gChunkIncomingServer.closeCachedConnections();
   }
 }

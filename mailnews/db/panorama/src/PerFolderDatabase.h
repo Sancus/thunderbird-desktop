@@ -206,6 +206,13 @@ class PerFolderDatabase : public nsIMsgOfflineOpsDatabase,
   // Its owning native output slot must be null and is filled before callbacks.
   nsresult PublishHdrForOfflineCopy(nsIMsgDBHdr* draft, bool notifyLegacy,
                                     Message** liveHeader);
+  // Same sealed common-copy draft, with an actual ordinary online mapping.
+  // Owns both output slots before native callbacks. Queued custody is refused;
+  // failure retains the draft/staged body for explicit local recovery.
+  nsresult PublishHdrForOnlineTransfer(
+      nsIMsgDBHdr* stagedDraft, const OnlineTransferDestination& expected,
+      uint32_t observedEpoch, uint32_t observedUid, bool notifyLegacy,
+      ServerMessageLocation& mapping, Message** liveHeader);
 
   // Server parser input is distinct from the UID-free offline-copy input.
   // The null persistent output owns a fresh unpublished physical identity.

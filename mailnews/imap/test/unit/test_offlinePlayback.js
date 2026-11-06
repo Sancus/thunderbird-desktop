@@ -28,6 +28,46 @@ var gMsgId1 = "200806061706.m56H6RWT004933@mrapp54.mozilla.org";
 var gOfflineManager;
 var gOfflineAppendKeys;
 
+add_setup(function () {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  // The base fake SEARCH ignores HEADER and returns unrelated mailbox UIDs.
+  // Preserve complete literal Message-ID membership for later reconciliation.
+  const proto = IMAP_RFC3501_handler.prototype;
+  const search = proto.SEARCH;
+  proto.SEARCH = function (args, uid) {
+    if (
+      args.length != 4 ||
+      args[0] != "UNDELETED" ||
+      args[1].toUpperCase() != "HEADER" ||
+      args[2].toLowerCase() != "message-id"
+    ) {
+      return search.call(this, args, uid);
+    }
+    Assert.ok(uid, "Identity discovery requests actual server UIDs");
+    const needle = args[3].toLowerCase();
+    const matches = this._selectedMailbox._messages.filter(message => {
+      const headers = message.getPartHeaders("");
+      return (
+        !message.flags.includes("\\Deleted") &&
+        headers.has("message-id") &&
+        headers
+          .getRawHeader("message-id")
+          .some(value => value.toLowerCase().includes(needle))
+      );
+    });
+    return (
+      "* SEARCH" +
+      matches.map(message => " " + message.uid).join("") +
+      "\0OK SEARCH completed"
+    );
+  };
+  registerCleanupFunction(() => {
+    proto.SEARCH = search;
+  });
+});
+
 add_task(async function test_nativeOrderedCopiesAndMoveUseMatchedReceipts() {
   if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
     return;

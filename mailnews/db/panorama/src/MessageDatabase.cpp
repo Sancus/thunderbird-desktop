@@ -3322,8 +3322,211 @@ nsresult MessageDatabase::ConsumeProtoThreadFlagsInTransaction(
   return NS_OK;
 }
 
+nsresult MessageDatabase::PublishOnlineTransferDestination(
+    const OnlineTransferDestination& expected, uint32_t observedEpoch,
+    uint32_t observedUid, bool notifyLegacy, ServerMessageLocation& mapping,
+    Message** liveHeader) {
+  NS_ENSURE_ARG_POINTER(liveHeader);
+  NS_ENSURE_FALSE(*liveHeader, NS_ERROR_INVALID_ARG);
+  const auto& target = expected.destination;
+  NS_ENSURE_TRUE(!expected.databaseSourceId.IsEmpty() && target.folderId &&
+                     target.folderId <= INT64_MAX && target.key &&
+                     target.key < nsMsgKey_None && target.epochKnown &&
+                     observedEpoch && observedUid &&
+                     target.epoch == observedEpoch,
+                 NS_ERROR_INVALID_ARG);
+  // Listener preparation can reenter. Never borrow a caller's mutable input
+  // through that preparation or the synchronous postcommit fanout.
+  OnlineTransferDestination selected(expected);
+  return PublishMessageInternal(target.key, notifyLegacy, liveHeader, &selected,
+                                observedEpoch, observedUid, &mapping);
+}
+
+nsresult MessageDatabase::ValidateOnlineTransferDestination(
+    const OnlineTransferDestination& expected, uint32_t epoch,
+    const Maybe<uint32_t>& uid, bool staged) {
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_TRUE(active, NS_ERROR_UNEXPECTED);
+  const auto& target = expected.destination;
+  // This private validator runs only inside our publication transaction.
+  // Keep relocation/recovery fences without asking that owned transaction to
+  // satisfy the public committed-reader guard.
+  MOZ_TRY(CheckPendingFolderRelocation(target.folderId));
+  uint32_t currentEpoch;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      target.folderId, currentEpoch));
+  NS_ENSURE_TRUE(currentEpoch == epoch, NS_ERROR_NOT_AVAILABLE);
+  uint32_t flags;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        staged ? "OnlineStagedDestination"_ns : "OnlinePublishedDestination"_ns,
+        staged ? "SELECT m.folderId,m.flags,d.sourceId FROM staged_messages m "
+                 "JOIN database_identity d ON d.singleton=1 WHERE m.id=:key"_ns
+               : "SELECT m.folderId,m.flags,d.sourceId FROM messages m "
+                 "JOIN database_identity d ON d.singleton=1 WHERE m.id=:key"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, target.key));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+    int64_t folder, storedFlags;
+    nsCString source;
+    MOZ_TRY(stmt->GetInt64(0, &folder));
+    MOZ_TRY(stmt->GetInt64(1, &storedFlags));
+    MOZ_TRY(stmt->GetUTF8String(2, source));
+    NS_ENSURE_TRUE(folder > 0 && uint64_t(folder) == target.folderId &&
+                       source == expected.databaseSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+    NS_ENSURE_TRUE(
+        storedFlags >= INT32_MIN && storedFlags <= int64_t(UINT32_MAX),
+        NS_ERROR_FILE_CORRUPTED);
+    flags = static_cast<uint32_t>(storedFlags);
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+  }
+  {
+    // Even Pending and held imports own their destination. No ordinary-online
+    // entry point may promote that custody, including orphaned old attempts.
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "OnlineDestinationQueuedCustody"_ns,
+        "SELECT 1 FROM offline_operations WHERE messageKey=:key "
+        "OR destinationKey=:key UNION ALL SELECT 1 FROM "
+        "offline_copy_destinations WHERE destinationKey=:key UNION ALL "
+        "SELECT 1 FROM offline_attempts WHERE destinationKey=:key OR "
+        "sourceKey=:key UNION ALL SELECT 1 FROM imap_import_operation_holds "
+        "WHERE messageKey=:key LIMIT 1"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, target.key));
+    bool claimed;
+    MOZ_TRY(stmt->ExecuteStep(&claimed));
+    NS_ENSURE_FALSE(claimed, NS_ERROR_NOT_AVAILABLE);
+  }
+  Maybe<nsCString> token;
+  Maybe<uint32_t> size, offlineSize, lines, actualUid;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        staged ? "OnlineStagedBody"_ns : "OnlinePublishedBody"_ns,
+        staged ? "SELECT name,value FROM staged_message_properties "
+                 "WHERE id=:key AND name IN('storeToken','messageSize',"
+                 "'offlineMessageSize','lineCount','uidOnServer')"_ns
+               : "SELECT name,value FROM message_properties WHERE id=:key "
+                 "AND name IN('storeToken','messageSize','offlineMessageSize',"
+                 "'lineCount','uidOnServer')"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, target.key));
+    while (true) {
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (!more) break;
+      nsCString name;
+      MOZ_TRY(stmt->GetUTF8String(0, name));
+      int32_t type;
+      MOZ_TRY(stmt->GetTypeOfIndex(1, &type));
+      if (name.EqualsLiteral("storeToken")) {
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        nsCString text;
+        MOZ_TRY(stmt->GetUTF8String(1, text));
+        token = Some(std::move(text));
+      } else if (name.EqualsLiteral("uidOnServer")) {
+        // Message::SetUint32Property stores ordinary header properties as
+        // hexadecimal TEXT. Body sizes and line counts use native INTEGERs.
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        nsCString text;
+        MOZ_TRY(stmt->GetUTF8String(1, text));
+        NS_ENSURE_TRUE(!text.IsEmpty() && text.Length() <= 8,
+                       NS_ERROR_FILE_CORRUPTED);
+        for (uint32_t i = 0; i < text.Length(); ++i) {
+          char digit = text.CharAt(i);
+          NS_ENSURE_TRUE(
+              (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'),
+              NS_ERROR_FILE_CORRUPTED);
+        }
+        uint32_t value =
+            static_cast<uint32_t>(MsgUnhex(text.get(), text.Length()));
+        nsAutoCString canonical;
+        canonical.AppendInt(value, 16);
+        NS_ENSURE_TRUE(text == canonical, NS_ERROR_FILE_CORRUPTED);
+        actualUid = Some(value);
+      } else {
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_INTEGER,
+                       NS_ERROR_FILE_CORRUPTED);
+        int64_t value;
+        MOZ_TRY(stmt->GetInt64(1, &value));
+        NS_ENSURE_TRUE(value >= 0 && value <= UINT32_MAX,
+                       NS_ERROR_FILE_CORRUPTED);
+        auto number = Some(static_cast<uint32_t>(value));
+        if (name.EqualsLiteral("messageSize")) size = number;
+        if (name.EqualsLiteral("offlineMessageSize")) offlineSize = number;
+        if (name.EqualsLiteral("lineCount")) lines = number;
+      }
+    }
+  }
+  NS_ENSURE_TRUE(actualUid == uid, NS_ERROR_NOT_AVAILABLE);
+  if (expected.finished) {
+    const auto& finished = *expected.finished;
+    NS_ENSURE_TRUE(
+        !finished.storeToken.IsEmpty() && token == Some(finished.storeToken) &&
+            size == Some(finished.messageSize) &&
+            offlineSize == Some(finished.offlineMessageSize) &&
+            lines == Some(finished.lineCount) &&
+            bool(flags & nsMsgMessageFlags::Offline) == finished.offline,
+        NS_ERROR_NOT_AVAILABLE);
+  } else {
+    NS_ENSURE_TRUE(expected.sourceLocation && expected.sourceBody && !token &&
+                       !offlineSize && !lines &&
+                       !(flags & nsMsgMessageFlags::Offline),
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  NS_ENSURE_TRUE(!expected.sourceLocation || expected.sourceBody,
+                 NS_ERROR_INVALID_ARG);
+  if (expected.sourceBody) {
+    const auto& source = *expected.sourceBody;
+    NS_ENSURE_TRUE(source.key != target.key &&
+                       source.databaseSourceId == expected.databaseSourceId,
+                   NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(CheckPendingMessageRelocation(source.key));
+    MessageBodyState current;
+    MOZ_TRY(ReadMessageBodyState(source.key, current));
+    NS_ENSURE_TRUE(SameBodyGuard(current, source), NS_ERROR_NOT_AVAILABLE);
+    if (expected.sourceLocation) {
+      const auto& location = *expected.sourceLocation;
+      NS_ENSURE_TRUE(location.key == source.key &&
+                         location.folderId == source.folderId &&
+                         location.epoch && location.uid,
+                     NS_ERROR_INVALID_ARG);
+      nsMsgKey found;
+      MOZ_TRY(GetMessageKeyForServerUid(location.folderId, location.epoch,
+                                        location.uid, found));
+      NS_ENSURE_TRUE(found == source.key, NS_ERROR_NOT_AVAILABLE);
+    }
+  }
+  if (uid) {
+    // Also recheck all published/staged aliases after listener preparation.
+    // This is read-only for the exact UID property already installed above.
+    MOZ_TRY(BindMessageToServerUidInTransaction(target.key, target.folderId,
+                                                epoch, *uid, true));
+  }
+  return NS_OK;
+}
+
 nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
                                          Message** liveHeader) {
+  return PublishMessageInternal(key, notifyLegacy, liveHeader);
+}
+
+nsresult MessageDatabase::PublishMessageInternal(
+    nsMsgKey key, bool notifyLegacy, Message** liveHeader,
+    const OnlineTransferDestination* online, uint32_t epoch, uint32_t uid,
+    ServerMessageLocation* mapping) {
   MOZ_TRY(RequireCurrentOwner());
   nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
   bool active;
@@ -3340,6 +3543,14 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
     bool staged;
     MOZ_TRY(IsMessageStaged(key, staged));
     NS_ENSURE_TRUE(staged, NS_ERROR_NOT_AVAILABLE);
+    if (online) {
+      MOZ_TRY(
+          ValidateOnlineTransferDestination(*online, epoch, Nothing(), true));
+      MOZ_TRY(BindMessageToServerUidInTransaction(
+          key, online->destination.folderId, epoch, uid, true));
+      MOZ_TRY(
+          ValidateOnlineTransferDestination(*online, epoch, Some(uid), true));
+    }
     MOZ_TRY(FetchMsg(key, cached));
     if (mConversationGroupingEnabled) {
       MOZ_TRY(CaptureThreadViewsBeforeInsert(*notification));
@@ -3427,6 +3638,10 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
         delivery.prepared.publicationLive = message;
       }
     }
+    if (online) {
+      MOZ_TRY(
+          ValidateOnlineTransferDestination(*online, epoch, Some(uid), false));
+    }
     return connection->CommitTransaction();
   }();
   if (NS_FAILED(rv)) {
@@ -3450,6 +3665,9 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
   } else {
     mMsgCache.putNewInfallible(key, std::move(cached));
   }
+  if (online) {
+    *mapping = {online->destination.folderId, key, epoch, uid};
+  }
   if (liveHeader) {
     RefPtr<Message> result = message;
     result.forget(liveHeader);
@@ -3461,6 +3679,27 @@ nsresult MessageDatabase::PublishMessage(nsMsgKey key, bool notifyLegacy,
 namespace {
 
 using OfflineOp = nsIMsgOfflineImapOperation;
+
+// Private postbinding provenance in the existing property table. Ordinary
+// header writers may read it but cannot mint or replace this native stamp.
+constexpr char kAcceptedAppendObservationProperty[] =
+    "panoramaAcceptedAppendObservation";
+
+nsCString AcceptedAppendObservationStamp(const OfflineAttempt& attempt,
+                                         uint32_t epoch, uint32_t uid,
+                                         uint64_t locationRevision) {
+  nsAutoCString stamp("1:");
+  for (uint64_t value :
+       {attempt.id, attempt.operationId, attempt.revision,
+        attempt.destination->folderId, uint64_t(attempt.destination->key),
+        uint64_t(epoch), uint64_t(uid), attempt.appendBody->contentRevision,
+        attempt.appendBody->locationRevision, locationRevision}) {
+    stamp.AppendInt(static_cast<int64_t>(value));
+    stamp.Append(':');
+  }
+  stamp.Append(attempt.appendBody->databaseSourceId);
+  return stamp;
+}
 
 nsresult OfflineUint32(mozIStorageStatement* stmt, uint32_t column,
                        uint32_t& output) {
@@ -6838,6 +7077,291 @@ nsresult MessageDatabase::ValidateOfflineAppendAcceptedWithoutUid(
   return FinishOfflineWrite(connection, rv);
 }
 
+nsresult MessageDatabase::ReadRetainedAcceptedAppend(
+    const OfflineAttempt& expected, bool& observed) {
+  MOZ_TRY(RequireCommittedSearchRead());
+  RefPtr<MessageDatabase> self(this);
+  const OfflineAttempt selected(expected);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  MOZ_TRY(connection->BeginTransaction());
+  auto read = [&](bool& bound) -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedAppendAttempt(selected, actual));
+    Maybe<uint32_t> uid;
+    {
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "ReadRetainedAcceptedAppendUid"_ns,
+          "SELECT value FROM message_properties WHERE id=:key AND "
+          "name='uidOnServer'"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("key"_ns, actual.destination->key));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      if (more) {
+        int32_t type;
+        MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+        NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                       NS_ERROR_FILE_CORRUPTED);
+        nsCString text;
+        MOZ_TRY(stmt->GetUTF8String(0, text));
+        NS_ENSURE_TRUE(!text.IsEmpty() && text.Length() <= 8,
+                       NS_ERROR_FILE_CORRUPTED);
+        for (uint32_t i = 0; i < text.Length(); ++i) {
+          char digit = text.CharAt(i);
+          NS_ENSURE_TRUE(
+              (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'),
+              NS_ERROR_FILE_CORRUPTED);
+        }
+        uint32_t value =
+            static_cast<uint32_t>(MsgUnhex(text.get(), text.Length()));
+        nsAutoCString canonical;
+        canonical.AppendInt(value, 16);
+        NS_ENSURE_TRUE(text == canonical, NS_ERROR_FILE_CORRUPTED);
+        NS_ENSURE_TRUE(value, NS_ERROR_NOT_AVAILABLE);
+        uid = Some(value);
+        MOZ_TRY(stmt->ExecuteStep(&more));
+        NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+      }
+    }
+    MOZ_TRY(ReadAcceptedAppendObservationInTransaction(
+        actual, actual.destination->epoch, uid, bound));
+    NS_ENSURE_TRUE(bound == uid.isSome(), NS_ERROR_NOT_AVAILABLE);
+    return NS_OK;
+  };
+  bool result = false;
+  nsresult rv = [&]() -> nsresult {
+    MOZ_TRY(read(result));
+    // SQL functions can reenter; revalidate the same immutable input before
+    // committing our read. No externally visible output precedes that commit.
+    MOZ_TRY(RequireCurrentOwner());
+    bool checked;
+    MOZ_TRY(read(checked));
+    NS_ENSURE_TRUE(checked == result, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(RequireCurrentOwner());
+    return connection->CommitTransaction();
+  }();
+  MOZ_TRY(FinishOfflineWrite(connection, rv));
+  observed = result;
+  return NS_OK;
+}
+
+nsresult MessageDatabase::ReadAcceptedAppendObservationInTransaction(
+    const OfflineAttempt& attempt, uint32_t epoch, const Maybe<uint32_t>& uid,
+    bool& associated) {
+  MOZ_TRY(RequireCurrentOwner());
+  bool active;
+  MOZ_TRY(DatabaseCore::sConnection->GetTransactionInProgress(&active));
+  NS_ENSURE_TRUE(active, NS_ERROR_UNEXPECTED);
+  NS_ENSURE_TRUE(attempt.appendAccepted &&
+                     attempt.state == OfflineAttemptState::Sent &&
+                     !attempt.confirmedUid && !attempt.confirmedEpoch &&
+                     attempt.appendBody && attempt.destination,
+                 NS_ERROR_NOT_AVAILABLE);
+  const auto& body = *attempt.appendBody;
+  const auto& target = *attempt.destination;
+  NS_ENSURE_TRUE(target.epochKnown && epoch && (!uid || *uid) &&
+                     target.epoch == epoch &&
+                     body.folderId == target.folderId && body.key == target.key,
+                 NS_ERROR_NOT_AVAILABLE);
+  uint32_t currentEpoch;
+  MOZ_TRY(DatabaseCore::sInstance->FolderDB().GetFolderUidValidity(
+      target.folderId, currentEpoch));
+  NS_ENSURE_TRUE(currentEpoch == epoch, NS_ERROR_NOT_AVAILABLE);
+  MOZ_TRY(CheckPendingMessageRelocation(body.key));
+  OfflineAttempt currentAttempt;
+  MOZ_TRY(GetCurrentOfflineAttempt(body.folderId, body.key, currentAttempt));
+  NS_ENSURE_TRUE(currentAttempt.id == attempt.id, NS_ERROR_NOT_AVAILABLE);
+  int64_t operation, revision;
+  Maybe<ServerMessageLocation> source;
+  MOZ_TRY(ReadOfflineOperationIdentity(body.folderId, body.key, operation,
+                                       revision, source));
+  NS_ENSURE_TRUE(uint64_t(operation) == attempt.operationId &&
+                     uint64_t(revision) == attempt.revision &&
+                     source.isSome() == attempt.source.isSome(),
+                 NS_ERROR_NOT_AVAILABLE);
+  if (source) {
+    const auto& expected = *attempt.source;
+    NS_ENSURE_TRUE(
+        source->folderId == expected.folderId && source->key == expected.key &&
+            source->epoch == expected.epoch && source->uid == expected.uid,
+        NS_ERROR_NOT_AVAILABLE);
+  }
+  OfflineOperationData payload;
+  MOZ_TRY(GetOfflineOperation(body.folderId, body.key, payload));
+  NS_ENSURE_TRUE(
+      (payload.operation & attempt.operation) &&
+          (!payload.pendingDestination ||
+           SamePendingDestination(*payload.pendingDestination, target)),
+      NS_ERROR_NOT_AVAILABLE);
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "AcceptedAppendOtherCustody"_ns,
+        "SELECT 1 FROM offline_operations WHERE id<>:operation AND "
+        "(messageKey=:key OR destinationKey=:key) UNION ALL SELECT 1 FROM "
+        "offline_copy_destinations WHERE destinationKey=:key UNION ALL "
+        "SELECT 1 FROM offline_attempts WHERE id<>:attempt AND "
+        "(sourceKey=:key OR destinationKey=:key) UNION ALL SELECT 1 FROM "
+        "imap_import_operation_holds WHERE messageKey=:key LIMIT 1"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("operation"_ns, attempt.operationId));
+    MOZ_TRY(stmt->BindInt64ByName("attempt"_ns, attempt.id));
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, body.key));
+    bool claimed;
+    MOZ_TRY(stmt->ExecuteStep(&claimed));
+    NS_ENSURE_FALSE(claimed, NS_ERROR_NOT_AVAILABLE);
+  }
+  // Provider-finished zeroes are values, never missing or coerced cells.
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "AcceptedAppendBodyPresence"_ns,
+        "SELECT count(*) FROM message_properties WHERE id=:key AND "
+        "((name='storeToken' AND typeof(value)='text' AND length(value)>0) OR "
+        "(name IN('messageSize','offlineMessageSize','lineCount') AND "
+        "typeof(value)='integer' AND value BETWEEN 0 AND 4294967295))"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, body.key));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    NS_ENSURE_TRUE(more, NS_ERROR_UNEXPECTED);
+    int64_t present;
+    MOZ_TRY(stmt->GetInt64(0, &present));
+    NS_ENSURE_TRUE(present == 4, NS_ERROR_NOT_AVAILABLE);
+  }
+  MessageBodyState current;
+  MOZ_TRY(ReadMessageBodyState(body.key, current));
+  Maybe<nsCString> stamp;
+  {
+    nsCOMPtr<mozIStorageStatement> stmt;
+    MOZ_TRY(DatabaseCore::GetStatement(
+        "ReadAcceptedAppendObservation"_ns,
+        "SELECT value FROM message_properties WHERE id=:key AND "
+        "name='panoramaAcceptedAppendObservation'"_ns,
+        getter_AddRefs(stmt)));
+    mozStorageStatementScoper scope(stmt);
+    MOZ_TRY(stmt->BindInt64ByName("key"_ns, body.key));
+    bool more;
+    MOZ_TRY(stmt->ExecuteStep(&more));
+    if (more) {
+      int32_t type;
+      MOZ_TRY(stmt->GetTypeOfIndex(0, &type));
+      NS_ENSURE_TRUE(type == mozIStorageValueArray::VALUE_TYPE_TEXT,
+                     NS_ERROR_FILE_CORRUPTED);
+      nsCString value;
+      MOZ_TRY(stmt->GetUTF8String(0, value));
+      stamp = Some(std::move(value));
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+  }
+  nsTArray<nsCString> names;
+  MOZ_TRY(GetMessagePropertyNames(body.key, names));
+  if (stamp) {
+    NS_ENSURE_TRUE(
+        uid && names.Contains("uidOnServer"_ns) &&
+            current.locationRevision > body.locationRevision &&
+            *stamp == AcceptedAppendObservationStamp(attempt, epoch, *uid,
+                                                     current.locationRevision),
+        NS_ERROR_NOT_AVAILABLE);
+    auto bound = body;
+    bound.locationRevision = current.locationRevision;
+    NS_ENSURE_TRUE(SameBodyGuard(current, bound), NS_ERROR_NOT_AVAILABLE);
+    uint32_t actualUid;
+    MOZ_TRY(GetMessageUidOnServer(body.key, actualUid));
+    NS_ENSURE_TRUE(actualUid == *uid, NS_ERROR_NOT_AVAILABLE);
+    // The row is already proven published by ReadMessageBodyState. With an
+    // existing equal property this only reads back all published/staged
+    // aliases; it must not create another journal event on repeated discovery.
+    MOZ_TRY(BindMessageToServerUidInTransaction(body.key, body.folderId, epoch,
+                                                *uid, true));
+  } else {
+    NS_ENSURE_TRUE(
+        !names.Contains("uidOnServer"_ns) && SameBodyGuard(current, body),
+        NS_ERROR_NOT_AVAILABLE);
+  }
+  associated = stamp.isSome();
+  return NS_OK;
+}
+
+nsresult MessageDatabase::AssociateAcceptedAppendObservation(
+    const OfflineAttempt& expected, uint32_t observedEpoch,
+    uint32_t observedUid, ServerMessageLocation& mapping,
+    Message** liveHeader) {
+  NS_ENSURE_ARG_POINTER(liveHeader);
+  NS_ENSURE_FALSE(*liveHeader, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(observedEpoch && observedUid, NS_ERROR_INVALID_ARG);
+  MOZ_TRY(RequireCommittedSearchRead());
+  // Do not borrow a caller's mutable snapshot across any native SQL reentry.
+  const OfflineAttempt selected(expected);
+  nsCOMPtr<mozIStorageConnection> connection = DatabaseCore::sConnection;
+  RefPtr<Message> header;
+  ServerMessageLocation result;
+  MOZ_TRY(connection->BeginTransaction());
+  nsresult rv = [&]() -> nsresult {
+    OfflineAttempt actual;
+    MOZ_TRY(ReadExpectedAppendAttempt(selected, actual));
+    bool associated;
+    MOZ_TRY(ReadAcceptedAppendObservationInTransaction(
+        actual, observedEpoch, Some(observedUid), associated));
+    const auto& body = *actual.appendBody;
+    if (!associated) {
+      MOZ_TRY(BindMessageToServerUidInTransaction(
+          body.key, body.folderId, observedEpoch, observedUid, false));
+      MOZ_TRY(RequireCurrentOwner());
+      MessageBodyState bound;
+      MOZ_TRY(ReadMessageBodyState(body.key, bound));
+      auto original = body;
+      original.locationRevision = bound.locationRevision;
+      NS_ENSURE_TRUE(bound.locationRevision > body.locationRevision &&
+                         SameBodyGuard(bound, original),
+                     NS_ERROR_NOT_AVAILABLE);
+      nsCOMPtr<mozIStorageStatement> stmt;
+      MOZ_TRY(DatabaseCore::GetStatement(
+          "StoreAcceptedAppendObservation"_ns,
+          "INSERT INTO message_properties(id,name,value) VALUES(:key,"
+          "'panoramaAcceptedAppendObservation',:stamp) RETURNING id"_ns,
+          getter_AddRefs(stmt)));
+      mozStorageStatementScoper scope(stmt);
+      MOZ_TRY(stmt->BindInt64ByName("key"_ns, body.key));
+      MOZ_TRY(stmt->BindUTF8StringByName(
+          "stamp"_ns,
+          AcceptedAppendObservationStamp(actual, observedEpoch, observedUid,
+                                         bound.locationRevision)));
+      bool more;
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_TRUE(more, NS_ERROR_NOT_AVAILABLE);
+      MOZ_TRY(stmt->ExecuteStep(&more));
+      NS_ENSURE_FALSE(more, NS_ERROR_FILE_CORRUPTED);
+    }
+    // Any trigger/reentry changes to the original attempt/body/source or final
+    // mapping fail before commit. The attempt/operation/receipt rows are
+    // read-only.
+    MOZ_TRY(RequireCurrentOwner());
+    MOZ_TRY(ReadExpectedAppendAttempt(selected, actual));
+    MOZ_TRY(ReadAcceptedAppendObservationInTransaction(
+        actual, observedEpoch, Some(observedUid), associated));
+    NS_ENSURE_TRUE(associated, NS_ERROR_NOT_AVAILABLE);
+    result = {actual.destination->folderId, actual.destination->key,
+              observedEpoch, observedUid};
+    header = new (fallible) Message(result.key);
+    NS_ENSURE_TRUE(header, NS_ERROR_OUT_OF_MEMORY);
+    return connection->CommitTransaction();
+  }();
+  if (NS_FAILED(rv)) {
+    return FinishOfflineWrite(connection, rv);
+  }
+  // This is an existing published member, not a second publication. Install
+  // both owning outputs without a fallible lookup or message-added callback.
+  mapping = result;
+  header.forget(liveHeader);
+  return NS_OK;
+}
+
 nsresult MessageDatabase::GetCurrentOfflineAttempt(uint64_t folderId,
                                                    nsMsgKey key,
                                                    OfflineAttempt& output) {
@@ -8170,7 +8694,11 @@ nsresult MessageDatabase::GetMessagePropertyNames(nsMsgKey key,
     }
     nsCString name;
     MOZ_TRY(stmt->GetUTF8String(0, name));
-    found.AppendElement(std::move(name));
+    // Native association provenance belongs to this physical incarnation;
+    // ordinary header copies/undo metadata must not transplant it.
+    if (!name.EqualsLiteral(kAcceptedAppendObservationProperty)) {
+      found.AppendElement(std::move(name));
+    }
   }
   names = std::move(found);
 
@@ -8242,7 +8770,9 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
                                              const nsACString& aName,
                                              const nsACString& aValue) {
   MOZ_ASSERT(!aName.EqualsLiteral("keywords"));  // Use SetMessageTags().
-  NS_ENSURE_TRUE(!IsNewsBindingProperty(aName), NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(!IsNewsBindingProperty(aName) &&
+                     !aName.EqualsLiteral(kAcceptedAppendObservationProperty),
+                 NS_ERROR_INVALID_ARG);
 
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
@@ -8264,7 +8794,9 @@ nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
 nsresult MessageDatabase::SetMessageProperty(nsMsgKey aKey,
                                              const nsACString& aName,
                                              uint32_t aValue) {
-  NS_ENSURE_TRUE(!IsNewsBindingProperty(aName), NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(!IsNewsBindingProperty(aName) &&
+                     !aName.EqualsLiteral(kAcceptedAppendObservationProperty),
+                 NS_ERROR_INVALID_ARG);
   nsCOMPtr<mozIStorageStatement> stmt;
   nsresult rv = GetHeaderStatement(
       aKey, "SetMessageProperty"_ns, HeaderTable::Properties,

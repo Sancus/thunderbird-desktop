@@ -751,8 +751,32 @@ class nsImapProtocol : public nsIImapProtocol,
   bool m_autoSubscribe, m_autoUnsubscribe, m_autoSubscribeOnOpen;
   bool m_closeNeededBeforeSelect;
   bool m_retryUrlOnError;
-  // Worker-only: COPY/MOVE may have executed, so this URL cannot be replayed.
-  bool m_copyCommandIssued = false;
+  // Worker-only: COPY/MOVE/APPEND may have executed; do not replay this URL.
+  bool m_nonIdempotentCommandIssued = false;
+#ifdef MOZ_PANORAMA
+  struct CopyResponseMapping {
+    ImapUid sourceUid;
+    mozilla::Maybe<mozilla::mailnews::ServerUidConfirmation> destination;
+  };
+  // Worker-only and reset at each Copy invocation, not each command chunk.
+  nsTArray<CopyResponseMapping> mCopyResponseMappings;
+  nsresult VerifyNativeAppendReadback(nsIFile* file, ImapUid uid,
+                                      uint32_t epoch, bool capture = false,
+                                      bool* unresolved = nullptr);
+  nsresult ResolveNativeTransferUid(nsIFile* file, const nsACString& messageId,
+                                    const char* mailboxName, uint32_t& epoch,
+                                    ImapUid& uid, bool* unresolved = nullptr);
+  bool mNativeAppendReadback = false;
+  bool mNativeAppendReadbackStarted = false;
+  bool mNativeAppendReadbackEnded = false;
+  bool mNativeAppendReadbackMismatch = false;
+  ImapUid mNativeAppendReadbackUid = 0;
+  uint64_t mNativeAppendReadbackBytes = 0;
+  nsresult mNativeAppendReadbackResult = NS_OK;
+  nsCOMPtr<nsIInputStream> mNativeAppendReadbackInput;
+  nsCOMPtr<nsIOutputStream> mNativeAppendCaptureOutput;
+
+#endif
   bool m_preferPlainText;
   bool m_forceSelect;
 

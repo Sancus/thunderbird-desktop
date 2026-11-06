@@ -2594,6 +2594,43 @@ nsresult PerFolderDatabase::PublishHdrForOfflineCopy(nsIMsgDBHdr* detached,
   return NS_OK;
 }
 
+nsresult PerFolderDatabase::PublishHdrForOnlineTransfer(
+    nsIMsgDBHdr* stagedDraft, const OnlineTransferDestination& expected,
+    uint32_t observedEpoch, uint32_t observedUid, bool notifyLegacy,
+    ServerMessageLocation& mapping, Message** liveHeader) {
+  NS_ENSURE_ARG_POINTER(liveHeader);
+  NS_ENSURE_FALSE(*liveHeader, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_ARG(stagedDraft);
+  RefPtr<PerFolderDatabase> self(this);
+  MOZ_TRY(CheckFolderExists());
+  MOZ_TRY(CheckDatabaseSource());
+  RefPtr<DetachedMsgHdr> draft = do_QueryObject(stagedDraft);
+  NS_ENSURE_TRUE(draft && draft->mFolderId == mFolderId, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(draft->mCopySourceId == mDatabaseSourceId &&
+                     expected.databaseSourceId == mDatabaseSourceId &&
+                     expected.destination.folderId == mFolderId,
+                 NS_ERROR_NOT_AVAILABLE);
+  NS_ENSURE_FALSE(draft->mAttachState == DetachedMsgHdr::AttachState::Attached,
+                  NS_ERROR_ALREADY_INITIALIZED);
+  NS_ENSURE_FALSE(draft->mCopyPublishing, NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(
+      draft->mAttachState == DetachedMsgHdr::AttachState::Attaching &&
+          draft->mCopyStagedKey != nsMsgKey_None &&
+          draft->mCopyStagedKey == expected.destination.key,
+      NS_ERROR_INVALID_ARG);
+  AutoRestore<bool> publishing(draft->mCopyPublishing);
+  draft->mCopyPublishing = true;
+  // Failure leaves the sealed draft in Attaching for explicit local recovery;
+  // the caller retains its primary command error and owns the source bytes.
+  MOZ_TRY(MessageDB().PublishOnlineTransferDestination(
+      expected, observedEpoch, observedUid, notifyLegacy, mapping, liveHeader));
+  // Both owning outputs were installed before callbacks. Nothing fallible may
+  // follow that commit, even if a callback retired this facade's source.
+  draft->mAttachedHeader = *liveHeader;
+  draft->mAttachState = DetachedMsgHdr::AttachState::Attached;
+  return NS_OK;
+}
+
 NS_IMETHODIMP PerFolderDatabase::AddMsgHdr(RawHdr* msg, bool notify,
                                            nsIMsgDBHdr** newHdr) {
   NS_ENSURE_ARG(msg);

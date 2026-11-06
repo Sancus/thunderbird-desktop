@@ -65,6 +65,7 @@
 #ifdef MOZ_PANORAMA
 #  include "../../local/src/nsLocalUtils.h"
 #  include "MessageDatabase.h"
+#  include "nsDirectoryServiceDefs.h"
 #  include "nsIMsgCopyServiceListener.h"
 #  include "nsIMsgOfflineImapOperation.h"
 #  include "nsImapMailFolder.h"
@@ -203,6 +204,14 @@ NS_IMETHODIMP nsImapService::SelectFolder(nsIMsgFolder* aImapMailFolder,
       urlSpec.Append(hierarchyDelimiter);
       urlSpec.Append(folderName);
       rv = mailNewsUrl->SetSpecInternal(urlSpec);
+#ifdef MOZ_PANORAMA
+      if (NS_SUCCEEDED(rv) &&
+          mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        auto* folder = static_cast<nsImapMailFolder*>(aImapMailFolder);
+        rv = folder->PrepareAcceptedAppendDiscovery(
+            static_cast<nsImapUrl*>(imapUrl.get()));
+      }
+#endif
       if (NS_SUCCEEDED(rv))
         rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, aURL);
     }
@@ -1877,6 +1886,13 @@ NS_IMETHODIMP nsImapService::OnlineMessageCopy(
       if (NS_SUCCEEDED(rv) && !nativeState->m_nativeQueuedCopies.IsEmpty()) {
         rv = static_cast<nsImapUrl*>(imapUrl.get())
                  ->PrepareNativeQueuedCopies(nativeState->m_nativeQueuedCopies);
+      } else if (NS_SUCCEEDED(rv) && nativeState &&
+                 mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+        NS_ENSURE_TRUE(idsAreUids, NS_ERROR_NOT_AVAILABLE);
+        rv = static_cast<nsImapMailFolder*>(aDstFolder)
+                 ->PrepareNativeOnlineCopy(
+                     aSrcFolder, nativeState,
+                     static_cast<nsImapUrl*>(imapUrl.get()));
       }
     }
 #endif
@@ -1900,6 +1916,86 @@ class OfflineAppendParser final : public nsMsgLineBuffer {
  private:
   nsCOMPtr<nsIMsgParseMailMsgState> mParser;
 };
+
+// Make the upload and later no-UID readback consume the same closed snapshot.
+// The finished provider body and unpublished row remain recovery on refusal.
+static nsresult PrepareOnlineAppendNative(nsIFile* file, nsIImapUrl* url,
+                                          nsIMsgFolder* folder,
+                                          nsImapMailCopyState* state) {
+  NS_ENSURE_TRUE(state, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDatabase> database;
+  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(database)));
+  NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
+  nsCOMPtr<nsIMsgDBHdr> parsed;
+  MOZ_TRY(database->CreateNewHdr(getter_AddRefs(parsed)));
+  nsresult rv;
+  nsCOMPtr<nsIMsgParseMailMsgState> parser =
+      do_CreateInstance("@mozilla.org/messenger/messagestateparser;1", &rv);
+  MOZ_TRY(rv);
+  MOZ_TRY(parser->SetMailDB(database));
+  MOZ_TRY(parser->SetNewMsgHdr(parsed));
+  MOZ_TRY(parser->SetMsgUid(0));
+  MOZ_TRY(parser->SetState(nsIMsgParseMailMsgState::ParseHeadersState));
+  nsCOMPtr<nsIFile> snapshot;
+  MOZ_TRY(GetSpecialDirectoryWithFileName(NS_OS_TEMP_DIR, "imap-upload.eml",
+                                          getter_AddRefs(snapshot)));
+  MOZ_TRY(snapshot->CreateUnique(nsIFile::NORMAL_FILE_TYPE, 00600));
+  nsCOMPtr<nsIOutputStream> saved;
+  MOZ_TRY(MsgNewBufferedFileOutputStream(getter_AddRefs(saved), snapshot,
+                                         PR_WRONLY | PR_CREATE_FILE, 00600));
+  auto closeSaved = mozilla::MakeScopeExit([&] { saved->Close(); });
+  nsCOMPtr<nsIInputStream> input;
+  MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(input), file));
+  auto closeInput = mozilla::MakeScopeExit([&] { input->Close(); });
+  nsCOMPtr<nsIMsgPluggableStore> store;
+  MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+  nsCOMPtr<nsIOutputStream> output;
+  MOZ_TRY(store->GetNewMsgOutputStream(folder, getter_AddRefs(output)));
+  auto discard =
+      mozilla::MakeScopeExit([&] { store->DiscardNewMessage(folder, output); });
+  OfflineAppendParser lines(parser);
+  char buffer[16384];
+  uint64_t bytes = 0;
+  while (true) {
+    uint32_t count;
+    MOZ_TRY(input->Read(buffer, sizeof(buffer), &count));
+    if (!count) break;
+    bytes += count;
+    NS_ENSURE_TRUE(bytes <= UINT32_MAX, NS_ERROR_ILLEGAL_VALUE);
+    MOZ_TRY(lines.BufferInput(buffer, count));
+    MOZ_TRY(SyncWriteAll(saved, buffer, count));
+    MOZ_TRY(SyncWriteAll(output, buffer, count));
+  }
+  MOZ_TRY(lines.Flush());
+  MOZ_TRY(parser->FinishHeader());
+  nsresult inputClose = input->Close();
+  closeInput.release();
+  nsresult snapshotClose = saved->Close();
+  closeSaved.release();
+  MOZ_TRY(inputClose);
+  MOZ_TRY(snapshotClose);
+  MOZ_TRY(output->Flush());
+  // An attempted Finish may have installed bytes even on error.
+  discard.release();
+  mozilla::mailnews::FinishedMessageBody finished;
+  MOZ_TRY(store->FinishNewMessage(folder, output, finished.storeToken));
+  MOZ_TRY(ReadStoredMessageDetails(store, folder, finished.storeToken,
+                                   &finished.messageSize, &finished.lineCount));
+  NS_ENSURE_TRUE(bytes == finished.messageSize, NS_ERROR_NOT_AVAILABLE);
+  finished.offlineMessageSize = finished.messageSize;
+  finished.offline = true;
+  uint32_t flags;
+  // Preserve the requested read/unread state rather than forcing Read for a
+  // fresh online draft. Offline records only the actual local provider body.
+  MOZ_TRY(parsed->SetFlags(state->m_newMsgFlags));
+  MOZ_TRY(parsed->OrFlags(nsMsgMessageFlags::Offline, &flags));
+  MOZ_TRY(parsed->SetStringProperty("keywords", state->m_newMsgKeywords));
+  MOZ_TRY(static_cast<nsImapMailFolder*>(folder)->StageNativeOnlineAppend(
+      parsed, finished, snapshot, state));
+  MOZ_TRY(url->SetMsgFile(snapshot));
+  static_cast<nsImapUrl*>(url)->MarkNativeOnlineAppend();
+  return NS_OK;
+}
 
 static nsresult AppendOfflineMessageNative(nsIFile* file, nsIURI* url,
                                            nsIMsgFolder* folder,
@@ -2179,6 +2275,15 @@ NS_IMETHODIMP nsImapService::AppendMessageFromFile(
                                    inSelectedState, aListener, nullptr,
                                    aCopyState);
     }
+#ifdef MOZ_PANORAMA
+    if (NS_SUCCEEDED(rv) &&
+        mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      nsCOMPtr<nsImapMailCopyState> state = do_QueryInterface(aCopyState);
+      if (state && !state->m_nativeQueuedAppend) {
+        rv = PrepareOnlineAppendNative(aFile, imapUrl, aDstFolder, state);
+      }
+    }
+#endif
     if (NS_SUCCEEDED(rv))
       rv = GetImapConnectionAndLoadUrl(imapUrl, nullptr, nullptr);
   }

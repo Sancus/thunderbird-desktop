@@ -83,6 +83,15 @@ nsImapUrl::~nsImapUrl() {
   // hold a non-threadsafe nsWeakReference proxy that belongs to the main
   // thread, so it must be released there too.
 #ifdef MOZ_PANORAMA
+  {
+    MutexAutoLock lock(mLock);
+    for (const auto& input : mAcceptedAppendInputs) {
+      // Comparison copies only; original provider-finished custody is retained.
+      nsresult rv = input.snapshot->Remove(false);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "Accepted APPEND snapshot cleanup failed");
+    }
+  }
   NS_ReleaseOnMainThread("nsImapUrl::mNativeHierarchyContinuation",
                          mNativeHierarchyContinuation.forget());
   NS_ReleaseOnMainThread("nsImapUrl::mNativeHierarchyCopyState",
@@ -957,6 +966,10 @@ nsresult nsImapUrl::RecordNativeCopyReceipts(
     for (const auto& target : mNativeQueuedCopies) {
       matched |= target.source && target.source->uid == receipt.sourceUid;
     }
+    if (!matched && mNativeOnlineCopyTargets && mCopyTargets) {
+      for (const auto& target : mCopyTargets->messages)
+        matched |= target.uid == receipt.sourceUid;
+    }
     NS_ENSURE_TRUE(matched, NS_ERROR_NOT_AVAILABLE);
     for (const auto& old : mNativeCopyReceipts) {
       if (old.sourceUid == receipt.sourceUid) {
@@ -981,6 +994,104 @@ nsresult nsImapUrl::RecordNativeCopyReceipts(
 nsTArray<NativeQueuedCopyReceipt> nsImapUrl::CopyNativeCopyReceipts() {
   mozilla::MutexAutoLock lock(mLock);
   return mNativeCopyReceipts.Clone();
+}
+
+bool nsImapUrl::HasNativeOnlineCopyTargets() {
+  mozilla::MutexAutoLock lock(mLock);
+  return mNativeOnlineCopyTargets;
+}
+
+nsresult nsImapUrl::SetNativeOnlineCopyInputs(
+    nsTArray<OnlineCopyInput>&& inputs) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(mNativeOnlineCopyTargets && mCopyTargets &&
+                     inputs.Length() == mCopyTargets->messages.Length() &&
+                     mNativeOnlineCopyInputs.IsEmpty(),
+                 NS_ERROR_NOT_AVAILABLE);
+  mNativeOnlineCopyInputs = std::move(inputs);
+  return NS_OK;
+}
+
+nsTArray<nsImapUrl::OnlineCopyInput> nsImapUrl::CopyNativeOnlineCopyInputs() {
+  MutexAutoLock lock(mLock);
+  return mNativeOnlineCopyInputs.Clone();
+}
+
+nsresult nsImapUrl::RecordNativeCopyObservation(ImapUid sourceUid,
+                                                uint32_t epoch, ImapUid uid) {
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(mNativeOnlineCopyTargets && epoch && uid,
+                 NS_ERROR_NOT_AVAILABLE);
+  bool found = false;
+  for (const auto& input : mNativeOnlineCopyInputs)
+    found |= input.sourceUid == sourceUid;
+  NS_ENSURE_TRUE(found, NS_ERROR_NOT_AVAILABLE);
+  for (const auto& prior : mNativeCopyObservations) {
+    if (prior.sourceUid == sourceUid) {
+      return prior.epoch == epoch && prior.uid == uid ? NS_OK
+                                                      : NS_ERROR_NOT_AVAILABLE;
+    }
+    NS_ENSURE_TRUE(prior.epoch != epoch || prior.uid != uid,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  mNativeCopyObservations.AppendElement(
+      OnlineCopyObservation{sourceUid, epoch, uid});
+  return NS_OK;
+}
+
+nsTArray<nsImapUrl::OnlineCopyObservation>
+nsImapUrl::CopyNativeCopyObservations() {
+  MutexAutoLock lock(mLock);
+  return mNativeCopyObservations.Clone();
+}
+
+nsresult nsImapUrl::PrepareAcceptedAppendDiscovery(
+    nsTArray<AcceptedAppendInput>&& inputs) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(
+      mAcceptedAppendInputs.IsEmpty() && mAcceptedAppendObservations.IsEmpty(),
+      NS_ERROR_IN_PROGRESS);
+  mAcceptedAppendInputs = std::move(inputs);
+  return NS_OK;
+}
+
+nsTArray<nsImapUrl::AcceptedAppendInput> nsImapUrl::CopyAcceptedAppendInputs() {
+  MutexAutoLock lock(mLock);
+  return mAcceptedAppendInputs.Clone();
+}
+
+nsresult nsImapUrl::RecordAcceptedAppendObservation(uint32_t index,
+                                                    uint32_t epoch,
+                                                    ImapUid uid) {
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(index < mAcceptedAppendInputs.Length() && epoch && uid,
+                 NS_ERROR_NOT_AVAILABLE);
+  for (const auto& prior : mAcceptedAppendObservations) {
+    if (prior.index == index)
+      return prior.epoch == epoch && prior.uid == uid ? NS_OK
+                                                      : NS_ERROR_NOT_AVAILABLE;
+    NS_ENSURE_TRUE(prior.epoch != epoch || prior.uid != uid,
+                   NS_ERROR_NOT_AVAILABLE);
+  }
+  mAcceptedAppendObservations.AppendElement(
+      AcceptedAppendObservation{index, epoch, uid});
+  return NS_OK;
+}
+
+nsTArray<nsImapUrl::AcceptedAppendObservation>
+nsImapUrl::CopyAcceptedAppendObservations() {
+  MutexAutoLock lock(mLock);
+  return mAcceptedAppendObservations.Clone();
+}
+
+void nsImapUrl::MarkNativeOnlineCopyTargets() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mozilla::MutexAutoLock lock(mLock);
+  MOZ_RELEASE_ASSERT(mCopyTargets && !mNativeOnlineCopyTargets &&
+                     mNativeQueuedCopies.IsEmpty());
+  mNativeOnlineCopyTargets = true;
 }
 
 nsresult nsImapUrl::PrepareNativeReplayCommand(
@@ -1087,6 +1198,37 @@ void nsImapUrl::RecordNativeSourceRetired() {
 bool nsImapUrl::NativeSourceRetired() {
   mozilla::MutexAutoLock lock(mLock);
   return mNativeSourceRetired;
+}
+
+void nsImapUrl::MarkNativeOnlineAppend() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MutexAutoLock lock(mLock);
+  MOZ_RELEASE_ASSERT(!mNativeQueuedAppend && !mNativeOnlineAppend);
+  mNativeOnlineAppend = true;
+}
+
+bool nsImapUrl::HasNativeOnlineAppend() {
+  MutexAutoLock lock(mLock);
+  return mNativeOnlineAppend;
+}
+
+nsresult nsImapUrl::RecordNativeAppendObservation(uint32_t epoch, ImapUid uid) {
+  MutexAutoLock lock(mLock);
+  NS_ENSURE_TRUE(mNativeOnlineAppend && epoch && uid, NS_ERROR_NOT_AVAILABLE);
+  if (mNativeAppendObservation) {
+    NS_ENSURE_TRUE(mNativeAppendObservation->epoch == epoch &&
+                       mNativeAppendObservation->uid == uid,
+                   NS_ERROR_NOT_AVAILABLE);
+  } else {
+    mNativeAppendObservation.emplace(OnlineAppendObservation{epoch, uid});
+  }
+  return NS_OK;
+}
+
+Maybe<nsImapUrl::OnlineAppendObservation>
+nsImapUrl::CopyNativeAppendObservation() {
+  MutexAutoLock lock(mLock);
+  return mNativeAppendObservation;
 }
 
 nsresult nsImapUrl::PrepareNativeQueuedAppend(

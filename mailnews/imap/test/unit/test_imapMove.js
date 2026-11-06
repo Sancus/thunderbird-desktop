@@ -18,8 +18,8 @@ var gFolder1;
 
 var tests = [setupCUSTOM1, startTest, doMove, testMove, teardownIMAPPump];
 
-function setupCUSTOM1() {
-  setupIMAPPump("CUSTOM1");
+async function setupCUSTOM1() {
+  await setupIMAPPump("CUSTOM1", { awaitInbox: true });
   Services.prefs.setBoolPref(
     "mail.server.default.autosync_offline_stores",
     false
@@ -46,9 +46,27 @@ async function doMove() {
   gFolder1 = rootFolder
     .getChildNamed("folder 1")
     .QueryInterface(Ci.nsIMsgImapMailFolder);
-  const msg = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(
-    IMAPPump.mailbox.uidnext - 1
+  const uid = IMAPPump.mailbox.uidnext - 1;
+  const panorama = Services.prefs.getBoolPref("mail.panorama.enabled", false);
+  const candidates = [...IMAPPump.inbox.msgDatabase.enumerateMessages()].filter(
+    header =>
+      (panorama
+        ? header.getUint32Property("uidOnServer")
+        : header.messageKey) == uid
   );
+  Assert.equal(
+    candidates.length,
+    1,
+    "The actual server UID has one physical source"
+  );
+  const msg = candidates[0];
+  if (panorama) {
+    Assert.equal(msg.getUint32Property("uidOnServer"), uid);
+    Assert.equal(
+      IMAPPump.inbox.msgDatabase.getMsgHdrForKey(msg.messageKey),
+      msg
+    );
+  }
   IMAPPump.server._test = true;
   const listener = new PromiseTestUtils.PromiseCopyListener();
   MailServices.copy.copyMessages(

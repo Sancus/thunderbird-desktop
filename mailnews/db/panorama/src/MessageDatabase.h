@@ -256,6 +256,17 @@ struct ServerUidConfirmation {
   uint32_t uid{0};
 };
 
+// Caller-checked ordinary online destination, not a queued command receipt.
+// A file source stays owned by the protocol caller. Native sources carry their
+// actual body incarnation and, for an IMAP source, its current server tuple.
+struct OnlineTransferDestination {
+  nsCString databaseSourceId;
+  PendingDestination destination;
+  Maybe<FinishedMessageBody> finished;
+  Maybe<MessageBodyState> sourceBody;
+  Maybe<ServerMessageLocation> sourceLocation;
+};
+
 enum class OfflineReplayCommand : uint8_t {
   FlagSet,
   FlagClear,
@@ -508,6 +519,16 @@ class MessageDatabase : public nsIMessageDatabase {
   // Caller finishes body storage before publishing the completed header.
   nsresult PublishMessage(nsMsgKey key, bool notifyLegacy,
                           Message** liveHeader = nullptr);
+  // The caller has reconciled this positive UID with the complete actual
+  // command/mailbox result. Bind/read back/publish the exact unqueued staged
+  // destination in one transaction. This never confirms an offline attempt.
+  // Failure preserves mapping and the null owning header slot. Both outputs
+  // are installed before callbacks; the caller must keep them alive through
+  // synchronous publication and retain its source until successful settlement.
+  nsresult PublishOnlineTransferDestination(
+      const OnlineTransferDestination& expected, uint32_t observedEpoch,
+      uint32_t observedUid, bool notifyLegacy, ServerMessageLocation& mapping,
+      Message** liveHeader);
   // Removes staged metadata only; never deletes stored body bytes.
   nsresult AbortMessage(nsMsgKey key);
   nsresult ListStagedMessages(uint64_t folderId, nsTArray<nsMsgKey>& keys);
@@ -677,6 +698,20 @@ class MessageDatabase : public nsIMessageDatabase {
   // Local-only retry: retain the operation, body and unresolved destination.
   nsresult ValidateOfflineAppendAcceptedWithoutUid(
       const OfflineAttempt& expected);
+  // Read retained accepted custody, not replay or UID-receipt authority.
+  // Success: false for exact unbound state, true for a checked private stamp.
+  // Failure leaves observed unchanged and never adopts a caller transaction.
+  nsresult ReadRetainedAcceptedAppend(const OfflineAttempt& expected,
+                                      bool& observed);
+  // A later complete checked mailbox observation, never a UID receipt. Bind
+  // the existing published member without changing Sent/acceptance history.
+  // No message-added/publication callback is emitted for an existing member.
+  // Failure preserves mapping and the initially-null owning header slot.
+  nsresult AssociateAcceptedAppendObservation(const OfflineAttempt& expected,
+                                              uint32_t observedEpoch,
+                                              uint32_t observedUid,
+                                              ServerMessageLocation& mapping,
+                                              Message** liveHeader);
   nsresult MarkOfflineAttemptAmbiguous(uint64_t attemptId);
   // Caller has proved no server effect, not merely lost an acknowledgement.
   nsresult ResolveOfflineAttemptNotApplied(uint64_t attemptId);
@@ -813,6 +848,13 @@ class MessageDatabase : public nsIMessageDatabase {
                               const nsACString& suffix,
                               mozIStorageStatement** statement,
                               bool* staged = nullptr);
+  nsresult PublishMessageInternal(
+      nsMsgKey key, bool notifyLegacy, Message** liveHeader,
+      const OnlineTransferDestination* online = nullptr, uint32_t epoch = 0,
+      uint32_t uid = 0, ServerMessageLocation* mapping = nullptr);
+  nsresult ValidateOnlineTransferDestination(
+      const OnlineTransferDestination& expected, uint32_t epoch,
+      const Maybe<uint32_t>& uid, bool staged);
   nsresult InsertMessage(uint64_t folderId, const ::RawHdr& header, bool staged,
                          bool notifyLegacy, nsMsgKey* key, Message** liveHeader,
                          RemovedMessage* restoring = nullptr,
@@ -850,6 +892,9 @@ class MessageDatabase : public nsIMessageDatabase {
   nsresult ReadExpectedAppendAttempt(const OfflineAttempt& expected,
                                      OfflineAttempt& actual);
   nsresult ValidateAppendTargetInTransaction(const OfflineAttempt& attempt);
+  nsresult ReadAcceptedAppendObservationInTransaction(
+      const OfflineAttempt& attempt, uint32_t epoch, const Maybe<uint32_t>& uid,
+      bool& associated);
   nsresult RequireOfflineUndoQueued(int64_t operationId,
                                     const OfflineOperationData& operation);
   nsresult ReadExpectedReplayAttempt(const OfflineAttempt& expected,

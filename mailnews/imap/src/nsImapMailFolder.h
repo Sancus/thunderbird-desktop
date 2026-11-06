@@ -38,6 +38,7 @@ class nsImapFolderRelocation;
 #ifdef MOZ_PANORAMA
 struct NativeQueuedAppendTarget;
 struct NativeOfflineCopyEntry;
+struct NativeOnlineTransferEntry;
 struct NativeFilterHeader;
 #  include "MessageDatabase.h"
 namespace mozilla::mailnews {
@@ -87,6 +88,9 @@ class nsImapMailCopyState : public nsISupports {
 #ifdef MOZ_PANORAMA
   nsTArray<mozilla::mailnews::OfflineAttempt> m_nativeQueuedCopies;
   mozilla::UniquePtr<NativeQueuedAppendTarget> m_nativeQueuedAppend;
+  mozilla::UniquePtr<NativeOnlineTransferEntry> m_nativeOnlineAppend;
+  nsTArray<mozilla::UniquePtr<NativeOnlineTransferEntry>> m_nativeOnlineCopies;
+  nsCOMPtr<nsIMsgFolder> m_nativeOnlineDestination;
   struct StreamSource {
     struct Message {
       nsMsgKey key;
@@ -394,6 +398,20 @@ class nsImapMailFolder : public nsMsgDBFolder,
                                    nsIMsgWindow* msgWindow);
 
 #ifdef MOZ_PANORAMA
+  nsresult PrepareAcceptedAppendDiscovery(nsImapUrl* url);
+  nsresult AssociateAcceptedAppendObservation(nsImapUrl* url, ImapUid uid);
+  nsresult PrepareNativeOnlineCopy(nsIMsgFolder* source,
+                                   nsImapMailCopyState* state, nsImapUrl* url);
+  nsresult PublishNativeOnlineCopies(nsIImapUrl* url);
+  nsresult PublishNativeOnlineTransfer(NativeOnlineTransferEntry& entry,
+                                       nsImapMailCopyState* state,
+                                       uint32_t index, uint32_t epoch,
+                                       ImapUid uid);
+  nsresult StageNativeOnlineAppend(
+      nsIMsgDBHdr* parsed,
+      const mozilla::mailnews::FinishedMessageBody& finished, nsIFile* recovery,
+      nsImapMailCopyState* state);
+  nsresult PublishNativeOnlineAppend(nsIImapUrl* url, ImapUid uid);
   nsresult QueueNativeOfflineAppend(
       nsIMsgDBHdr* parsed,
       const mozilla::mailnews::FinishedMessageBody& finished, nsMsgKey* key);

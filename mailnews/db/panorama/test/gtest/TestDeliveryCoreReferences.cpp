@@ -11843,9 +11843,9 @@ TEST_F(DeliveryCoreReferences, QueuedSourceCaptureFailureRollsBackIntent) {
   ASSERT_NO_FATAL_FAILURE(CheckOfflineSource(key, 101, 700));
   uint64_t attemptId;
   ASSERT_EQ(NS_OK,
-            db.BeginOfflineAttempt(mFolderId, key,
-                                   nsIMsgOfflineImapOperation::kFlagsChanged,
-                                   Nothing(), attemptId));
+            db.BeginOfflineAction(mFolderId, key,
+                                  nsIMsgOfflineImapOperation::kFlagsChanged,
+                                  Nothing(), Nothing(), attemptId));
   ASSERT_EQ(NS_OK, db.GetOfflineOperationSource(mFolderId, key, source));
   ASSERT_TRUE(source);
   EXPECT_EQ(700u, source->uid);
@@ -14640,10 +14640,18 @@ TEST_F(DeliveryCoreReferences, UndoOfflineCaptureRejectsDispatchedOperations) {
     ASSERT_EQ(NS_OK, db.SetOfflineOperationPlayingBack(mFolderId, key, false));
     uint64_t attemptId = 0;
     ASSERT_EQ(NS_OK,
-              db.BeginOfflineAttempt(mFolderId, key,
-                                     nsIMsgOfflineImapOperation::kFlagsChanged,
-                                     Nothing(), attemptId));
+              db.BeginOfflineAction(mFolderId, key,
+                                    nsIMsgOfflineImapOperation::kFlagsChanged,
+                                    Nothing(), Nothing(), attemptId));
     if (state == OfflineAttemptState::Confirmed) {
+      // Confirmation requires the actual typed flag command acknowledgement.
+      OfflineAttempt attempt;
+      ASSERT_EQ(NS_OK, db.GetOfflineAttempt(attemptId, attempt));
+      OfflineReplayCommandToken token;
+      ASSERT_EQ(NS_OK, db.BeginOfflineReplayCommand(
+                           attempt, OfflineReplayCommand::FlagSet, token));
+      ASSERT_EQ(NS_OK, db.RecordOfflineReplayCommand(
+                           token, OfflineReplayReceipt::Acknowledged, NS_OK));
       ASSERT_EQ(NS_OK, db.ConfirmOfflineAttempt(attemptId, Nothing()));
     } else if (state == OfflineAttemptState::Ambiguous) {
       ASSERT_EQ(NS_OK, db.MarkOfflineAttemptAmbiguous(attemptId));
@@ -20611,11 +20619,12 @@ TEST_F(DeliveryCoreReferences, OnlineMissingAndAliasedUidRetainStaging) {
       RawHdr raw;
       nsMsgKey alias;
       ASSERT_EQ(NS_OK, db.StageMessage(mFolderId, raw, &alias));
-      ASSERT_EQ(NS_OK, db.SetMessageProperty(alias, "uidOnServer"_ns, uid));
+      RefPtr<Message> header = new Message(alias);
+      ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", uid));
     }
     if (mode == 4) {
-      ASSERT_EQ(NS_OK, db.SetMessageProperty(expected.destination.key,
-                                             "uidOnServer"_ns, uid + 1));
+      RefPtr<Message> header = new Message(expected.destination.key);
+      ASSERT_EQ(NS_OK, header->SetUint32Property("uidOnServer", uid + 1));
     }
     nsCString before;
     ASSERT_EQ(NS_OK, OnlineStageFacts(expected.destination.key, before));

@@ -9955,7 +9955,11 @@ nsresult nsImapMailFolder::CopyMessagesOfflineNative(
       step = "source undo capture";
       bool sameServer = false;
       MOZ_TRY(IsOnSameServer(source, this, &sameServer));
-      if (isMove && sameServer && cached) {
+      // A local MOVE can retire its source after the real queued body and
+      // operation are durable. Capture its independent undo recovery before
+      // publication, just as for a cached same-server source; no UID is
+      // implied.
+      if (isMove && cached && (sameServer || !actualImapSource)) {
         nsTArray<nsMsgKey> sourceKeys{key};
         nsCOMArray<nsIMsgDBHdr> sourceHeaders;
         sourceHeaders.AppendObject(header);

@@ -176,6 +176,11 @@ add_task(async function testOfflineMoveLocalToIMAP() {
     retainedBytes = readRetainedMoveBody(retained[0]);
     Assert.ok(!retained[0].properties.includes("uidOnServer"));
     Assert.ok(retained[0].flags & Ci.nsMsgMessageFlags.Offline);
+    Assert.equal(
+      localAccountUtils.inboxFolder.getTotalMessages(false),
+      0,
+      "The completed offline MOVE owns finished destination and undo recovery"
+    );
   }
 
   // Now, go back online and see if the operation has been performed
@@ -264,4 +269,53 @@ add_task(async function testOfflineMoveLocalToIMAP() {
   }
 
   teardownTest();
+});
+
+add_task(async function testOfflineCopyLocalToIMAPRetainsSource() {
+  if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
+    return;
+  }
+  await setupTest();
+  try {
+    const source = localAccountUtils.inboxFolder;
+    await loadTestMessage(source);
+    const original = [...source.msgDatabase.enumerateMessages()];
+    Assert.equal(original.length, 1);
+    const header = original[0];
+    const key = header.messageKey;
+    const token = header.storeToken;
+    const flags = header.flags;
+    const bytes = readRetainedMoveBody(header);
+    IMAPPump.incomingServer.closeCachedConnections();
+    Services.io.offline = true;
+
+    const listener = new PromiseTestUtils.PromiseCopyListener();
+    MailServices.copy.copyMessages(
+      source,
+      [header],
+      IMAPPump.inbox,
+      false,
+      listener,
+      null,
+      false
+    );
+    const result = await listener.promise;
+    Assert.equal(result.messageKeys.length, 1);
+    Assert.equal(source.getTotalMessages(false), 1);
+    const kept = source.msgDatabase.getMsgHdrForKey(key);
+    Assert.equal(kept, header);
+    Assert.equal(kept.storeToken, token);
+    Assert.equal(kept.flags, flags);
+    Assert.equal(readRetainedMoveBody(kept), bytes);
+    const copied = [...IMAPPump.inbox.msgDatabase.enumerateMessages()];
+    Assert.equal(copied.length, 1);
+    Assert.equal(copied[0].messageKey, result.messageKeys[0]);
+    Assert.ok(!copied[0].properties.includes("uidOnServer"));
+    Assert.ok(copied[0].flags & Ci.nsMsgMessageFlags.Offline);
+    Assert.equal(copied[0].getUint32Property("pseudoHdr"), 1);
+    Assert.equal(readRetainedMoveBody(copied[0]), bytes);
+  } finally {
+    teardownTest();
+    Services.io.offline = false;
+  }
 });

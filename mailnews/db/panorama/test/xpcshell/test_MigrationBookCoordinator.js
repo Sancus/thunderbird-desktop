@@ -49,7 +49,7 @@ add_setup(async function setupNativeProfiles() {
     Ci.nsIToolkitProfileService
   );
   home = await IOUtils.createUniqueDirectory(
-    PathUtils.tempDir,
+    do_get_tempdir().path,
     "migration-book-"
   );
   registerCleanupFunction(() => IOUtils.remove(home, { recursive: true }));

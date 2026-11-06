@@ -95,6 +95,7 @@ function getSelectedPanel() {
  * no conversation screen.
  */
 function hideConversationsBoxPanels() {
+  document.getElementById("conv-log-browser").isActive = false;
   for (const element of document.getElementById("conversationsBox").children) {
     element.hidden = true;
   }
@@ -1419,12 +1420,19 @@ var chatHandler = {
   },
   _onTabActivated() {
     const convView = chatHandler._getActiveConvView();
-    if (convView) {
+    if (convView && !convView.hidden) {
       convView.switchingToPanel();
+    }
+    if (
+      !this._pendingLogBrowserLoad &&
+      !document.getElementById("logDisplay").hidden
+    ) {
+      document.getElementById("conv-log-browser").isActive = true;
     }
   },
   _onTabDeactivated(aHidden) {
     if (aHidden) {
+      document.getElementById("conv-log-browser").isActive = false;
       this.cancelNativeChatLog();
     }
     const convView = chatHandler._getActiveConvView();
@@ -1458,6 +1466,11 @@ var chatHandler = {
         Services.obs.removeObserver(this, "conversation-loaded");
         return;
       }
+      // Manually managed log browsers start inactive, including after a load
+      // that completed while another tab was selected.
+      browser.isActive =
+        !!gChatTab?.tabNode.selected &&
+        !document.getElementById("logDisplay").hidden;
       for (const msg of browser._conv.getMessages()) {
         if (!msg.system) {
           msg.color =

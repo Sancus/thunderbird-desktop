@@ -727,7 +727,7 @@ async function assertMigrationStartupProfileHeld() {
     ])
   );
   const code = [
-    "const provider = Cc['@mozilla.org/xre/directory-provider;1'].createInstance(Ci.nsIDirectoryServiceProvider).QueryInterface(Ci.nsIXREDirProvider);",
+    "const provider = Cc['@mozilla.org/xre/directory-provider;1'].getService(Ci.nsIXREDirProvider);",
     "const directories = " + JSON.stringify(directories) + ";",
     "for (const [key, path] of Object.entries(directories)) { const dir = Cc['@mozilla.org/file/local;1'].createInstance(Ci.nsIFile); dir.initWithPath(path); Services.dirsvc.set(key, dir); }",
     "const root = Cc['@mozilla.org/file/local;1'].createInstance(Ci.nsIFile);",

@@ -43,6 +43,7 @@
 #include "mozilla/mailnews/MsgSubjectUtils.h"
 #ifdef MOZ_PANORAMA
 #  include "Message.h"
+#  include "MigrationWriterLease.h"
 #endif
 
 using namespace mozilla::mailnews;
@@ -134,6 +135,13 @@ nsMsgDBService::~nsMsgDBService() {
 NS_IMETHODIMP nsMsgDBService::OpenFolderDB(nsIMsgFolder* aFolder,
                                            bool aLeaveInvalidDB,
                                            nsIMsgDatabase** _retval) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   AUTO_PROFILER_LABEL("nsMsgDBService::OpenFolderDB", MAILNEWS);
 
   NS_ENSURE_ARG(aFolder);
@@ -271,6 +279,13 @@ NS_IMETHODIMP nsMsgDBService::OpenDBFromFile(nsIFile* aDBPath,
                                              nsIMsgFolder* aFolder,
                                              bool aCreate, bool aLeaveInvalidDB,
                                              nsIMsgDatabase** pMessageDB) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   AUTO_PROFILER_LABEL("nsMsgDBService::OpenDBFromFile", MAILNEWS);
 
   nsresult rv;
@@ -330,6 +345,13 @@ NS_IMETHODIMP nsMsgDBService::OpenDBFromFile(nsIFile* aDBPath,
 
 NS_IMETHODIMP nsMsgDBService::CreateNewDB(nsIMsgFolder* aFolder,
                                           nsIMsgDatabase** _retval) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   NS_ENSURE_ARG(aFolder);
 
   nsCOMPtr<nsIMsgIncomingServer> incomingServer;
@@ -375,6 +397,13 @@ NS_IMETHODIMP nsMsgDBService::CreateNewDB(nsIMsgFolder* aFolder,
  * aListener); */
 NS_IMETHODIMP nsMsgDBService::RegisterPendingListener(
     nsIMsgFolder* aFolder, nsIDBChangeListener* aListener) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   // need to make sure we don't hold onto these forever. Maybe a shutdown
   // listener? if there is a db open on this folder already, we should register
   // the listener.
@@ -396,8 +425,13 @@ NS_IMETHODIMP nsMsgDBService::UnregisterPendingListener(
   int32_t listenerIndex = m_pendingListeners.IndexOfObject(aListener);
   if (listenerIndex != -1) {
     nsCOMPtr<nsIMsgDatabase> msgDB;
-    CachedDBForFolder(m_foldersPendingListeners[listenerIndex],
-                      getter_AddRefs(msgDB));
+    nsCOMPtr<nsIFile> summaryFilePath;
+    nsIMsgFolder* folder = m_foldersPendingListeners[listenerIndex];
+    // This removes an existing listener, rather than admitting a new writer.
+    if (folder &&
+        NS_SUCCEEDED(folder->GetSummaryFile(getter_AddRefs(summaryFilePath)))) {
+      msgDB = dont_AddRef(FindInCache(summaryFilePath));
+    }
 
     if (msgDB) {
       msgDB->RemoveListener(aListener);
@@ -412,6 +446,13 @@ NS_IMETHODIMP nsMsgDBService::UnregisterPendingListener(
 
 NS_IMETHODIMP nsMsgDBService::CachedDBForFolder(nsIMsgFolder* aFolder,
                                                 nsIMsgDatabase** aRetDB) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   NS_ENSURE_ARG_POINTER(aFolder);
   NS_ENSURE_ARG_POINTER(aRetDB);
 
@@ -425,6 +466,13 @@ NS_IMETHODIMP nsMsgDBService::CachedDBForFolder(nsIMsgFolder* aFolder,
 
 NS_IMETHODIMP nsMsgDBService::CachedDBForFilePath(nsIFile* filePath,
                                                   nsIMsgDatabase** retDB) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   NS_ENSURE_ARG_POINTER(filePath);
   NS_ENSURE_ARG_POINTER(retDB);
 
@@ -438,12 +486,17 @@ NS_IMETHODIMP nsMsgDBService::CachedDBForFilePath(nsIFile* filePath,
 }
 
 NS_IMETHODIMP nsMsgDBService::ForceFolderDBClosed(nsIMsgFolder* aFolder) {
-  nsCOMPtr<nsIMsgDatabase> mailDB;
-  nsresult rv = CachedDBForFolder(aFolder, getter_AddRefs(mailDB));
+  NS_ENSURE_ARG_POINTER(aFolder);
+  nsCOMPtr<nsIFile> summaryFilePath;
+  nsresult rv = aFolder->GetSummaryFile(getter_AddRefs(summaryFilePath));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  // Closing already-owned work must not acquire another writable database.
+  RefPtr<nsMsgDatabase> mailDB = dont_AddRef(FindInCache(summaryFilePath));
   if (mailDB) {
     mailDB->ForceClosed();
   }
-  return rv;
+  return NS_OK;
 }
 
 NS_IMETHODIMP nsMsgDBService::GetOpenDBs(
@@ -876,8 +929,12 @@ bool nsMsgDatabase::MatchDbName(nsIFile* dbFile) {
 void nsMsgDBService::AddToCache(nsMsgDatabase* pMessageDB) {
 #ifdef DEBUG
   if (pMessageDB->m_folder) {
-    nsCOMPtr<nsIMsgDatabase> msgDB;
-    CachedDBForFolder(pMessageDB->m_folder, getter_AddRefs(msgDB));
+    RefPtr<nsMsgDatabase> msgDB;
+    nsCOMPtr<nsIFile> summaryFilePath;
+    if (NS_SUCCEEDED(pMessageDB->m_folder->GetSummaryFile(
+            getter_AddRefs(summaryFilePath)))) {
+      msgDB = dont_AddRef(FindInCache(summaryFilePath));
+    }
     NS_ASSERTION(!msgDB, "shouldn't have db in cache");
   }
 #endif
@@ -1125,6 +1182,13 @@ nsresult nsMsgDatabase::Open(nsMsgDBService* aDBService, nsIFile* aFolderName,
 }
 
 NS_IMETHODIMP nsMsgDatabase::OpenFromFile(nsIFile* aFolderName) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   // This is here to open the database without using the database service.
   // It is used only for migrating to the new global database.
   MOZ_ASSERT(StaticPrefs::mail_panorama_enabled_AtStartup());
@@ -1134,6 +1198,13 @@ NS_IMETHODIMP nsMsgDatabase::OpenFromFile(nsIFile* aFolderName) {
 nsresult nsMsgDatabase::OpenInternal(nsMsgDBService* aDBService,
                                      nsIFile* summaryFile, bool aCreate,
                                      bool aLeaveInvalidDB, bool sync) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   MOZ_LOG(DBLog, LogLevel::Info,
           ("nsMsgDatabase::Open(%s, %s, %p, %s)",
            summaryFile->HumanReadablePath().get(), aCreate ? "TRUE" : "FALSE",
@@ -1260,6 +1331,13 @@ nsresult nsMsgDatabase::CheckForErrors(nsresult err, bool sync,
  * the database object so other database calls can work.
  */
 nsresult nsMsgDatabase::OpenMDB(nsIFile* dbFile, bool create, bool sync) {
+#ifdef MOZ_PANORAMA
+  nsresult migrationRv =
+      CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                           MigrationWriterCheck::NewAdmission);
+  NS_ENSURE_SUCCESS(migrationRv, migrationRv);
+#endif
+
   PROFILER_MARKER_TEXT("nsMsgDatabase::OpenMDB", MAILNEWS,
                        MarkerOptions(MarkerTiming::IntervalStart()),
                        dbFile->HumanReadablePath());

@@ -410,3 +410,28 @@ add_task(async function test_chatStartupErrorAndEarlyShutdownDoNotRetry() {
   Assert.equal(backendReads, 0);
   Assert.equal(early._chatSearchShutdownBlocker, null);
 });
+
+add_task(async function test_nativeMigrationAdmissionRunsBeforeBackendLookup() {
+  await SpecialPowers.pushPrefEnv({ set: [["mail.chat.enabled", true]] });
+  for (const [method, domain] of [
+    ["_initMailSearch", "mail-search"],
+    ["_initChatSearch", "chat-search"],
+  ]) {
+    const glue = searchGlue();
+    const failure = Components.Exception(
+      "Controlled native admission rejection",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
+    let checked = 0;
+    glue._checkSearchWriterAdmission = actual => {
+      Assert.equal(actual, domain);
+      checked++;
+      throw failure;
+    };
+    glue._getMailSearchBackend = () => {
+      Assert.ok(false, "Denied search must not initialize accounts/backend");
+    };
+    await Assert.rejects(glue[method](), error => error === failure);
+    Assert.equal(checked, 1, "Original native rejection prevents startup");
+  }
+});

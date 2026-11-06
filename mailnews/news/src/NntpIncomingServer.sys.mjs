@@ -6,6 +6,24 @@ import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { MsgIncomingServer } from "resource:///modules/MsgIncomingServer.sys.mjs";
 
+/**
+ * Checks native process admission before starting a news writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "news");
+}
+
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   CommonUtils: "resource://services-common/utils.sys.mjs",
@@ -37,6 +55,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   ]);
 
   constructor() {
+    checkMigrationWriterAdmission();
     super();
 
     this._subscribed = new Set();
@@ -90,6 +109,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * @returns {nsIMsgFolder} The account's news root.
    */
   get rootFolder() {
+    checkMigrationWriterAdmission();
     if (!Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
       return super.rootFolder;
     }
@@ -128,6 +148,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * this._subscribable.
    */
   get _subscribable() {
+    checkMigrationWriterAdmission();
     if (!this._subscribableServer) {
       this._subscribableServer = Cc[
         "@mozilla.org/messenger/subscribableserver;1"
@@ -156,10 +177,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * @param {boolean} getOnlyNew
    */
   startPopulating(msgWindow, forceToServer, getOnlyNew) {
+    checkMigrationWriterAdmission();
     this._startPopulating(msgWindow, forceToServer, getOnlyNew);
   }
 
   stopPopulating(msgWindow) {
+    checkMigrationWriterAdmission();
     // Calling nsISubscribableServer.setAsSubscribed with a path that does not
     // exist in the tree will add a new node. This must be done before
     // nsISubscribableServer.stopPopulating, as only then will the internal row
@@ -172,6 +195,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   addTo(name, addAsSubscribed, subscribale, changeIfExists) {
+    checkMigrationWriterAdmission();
     try {
       this._subscribable.addTo(
         name,
@@ -188,10 +212,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   subscribe(name) {
+    checkMigrationWriterAdmission();
     this.subscribeToNewsgroup(name);
   }
 
   unsubscribe(name) {
+    checkMigrationWriterAdmission();
     this.rootMsgFolder.propagateDelete(
       this.rootMsgFolder.getChildNamed(name),
       true // delete storage
@@ -200,11 +226,13 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   commitSubscribeChanges() {
+    checkMigrationWriterAdmission();
     this.newsrcHasChanged = true;
     this.writeNewsrcFile();
   }
 
   setAsSubscribed(path) {
+    checkMigrationWriterAdmission();
     // Calling nsISubscribableServer.isSubscribable with a path that does not
     // exist in the tree will add a new node and return false. These paths will
     // be displayed grayed out.
@@ -214,10 +242,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   updateSubscribed() {
+    checkMigrationWriterAdmission();
     this._subscribed.forEach(path => this.setAsSubscribed(path));
   }
 
   setState(path, state) {
+    checkMigrationWriterAdmission();
     return this._subscribable.setState(path, state);
   }
 
@@ -285,6 +315,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   performExpand(msgWindow) {
+    checkMigrationWriterAdmission();
     if (!Services.prefs.getBoolPref("news.update_unread_on_expand", false)) {
       return;
     }
@@ -295,6 +326,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   performBiff(msgWindow) {
+    checkMigrationWriterAdmission();
     this.performExpand(msgWindow);
   }
 
@@ -315,6 +347,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   set charset(value) {
+    checkMigrationWriterAdmission();
     this.setStringValue("charset", value);
   }
 
@@ -331,6 +364,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   set maximumConnectionsNumber(value) {
+    checkMigrationWriterAdmission();
     this.setIntValue("max_cached_connections", value);
   }
 
@@ -345,10 +379,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   set connectionTimeout(value) {
+    checkMigrationWriterAdmission();
     this.setIntValue("connection_timeout", value);
   }
 
   get newsrcRootPath() {
+    checkMigrationWriterAdmission();
     let file = this.getFileValue("mail.newsrc_root-rel", "mail.newsrc_root");
     if (!file) {
       file = Services.dirsvc.get("NewsD", Ci.nsIFile);
@@ -358,10 +394,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   set newsrcRootPath(value) {
+    checkMigrationWriterAdmission();
     this.setFileValue("mail.newsrc_root-rel", "mail.newsrc_root", value);
   }
 
   get newsrcFilePath() {
+    checkMigrationWriterAdmission();
     if (!this._newsrcFilePath) {
       this._newsrcFilePath = this.getFileValue(
         "newsrc.file-rel",
@@ -384,6 +422,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   set newsrcFilePath(value) {
+    checkMigrationWriterAdmission();
     if (!value.exists()) {
       value.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
     }
@@ -392,6 +431,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   addNewsgroupToList(name) {
+    checkMigrationWriterAdmission();
     name = new TextDecoder(this.charset).decode(
       lazy.CommonUtils.byteStringToArrayBuffer(name)
     );
@@ -399,10 +439,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   addNewsgroup(name) {
+    checkMigrationWriterAdmission();
     this._subscribed.add(name);
   }
 
   removeNewsgroup(name) {
+    checkMigrationWriterAdmission();
     this._subscribed.delete(name);
   }
 
@@ -415,6 +457,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   subscribeToNewsgroup(name) {
+    checkMigrationWriterAdmission();
     if (this.containsNewsgroup(name)) {
       return;
     }
@@ -428,6 +471,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    *   The server remains dirty and the previous file is retained on failure.
    */
   writeNewsrcFile() {
+    checkMigrationWriterAdmission();
     if (!this.newsrcHasChanged) {
       return;
     }
@@ -477,6 +521,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   loadNewsUrl(uri, msgWindow, consumer) {
+    checkMigrationWriterAdmission();
     if (consumer instanceof Ci.nsIStreamListener) {
       this.withClient(client => {
         client.loadNewsUrl(uri.spec, msgWindow, consumer);
@@ -485,6 +530,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
   }
 
   forgetPassword() {
+    checkMigrationWriterAdmission();
     const newsFolder = this.rootFolder.QueryInterface(Ci.nsIMsgNewsFolder);
     // Clear password of root folder.
     let finished = false;
@@ -534,6 +580,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * @see startPopulating
    */
   async _startPopulating(msgWindow, forceToServer, getOnlyNew) {
+    checkMigrationWriterAdmission();
     this._msgWindow = msgWindow;
     this._subscribable.startPopulating(msgWindow, forceToServer, getOnlyNew);
     this._groups = [];
@@ -557,6 +604,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * contain any group.
    */
   async _loadHostInfo() {
+    checkMigrationWriterAdmission();
     this._hostInfoFile = this.localPath;
     this._hostInfoFile.append("hostinfo.dat");
     if (!this._hostInfoFile.exists()) {
@@ -578,6 +626,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * Save this._groups to hostinfo.dat.
    */
   async _saveHostInfo() {
+    checkMigrationWriterAdmission();
     if (!this._hostInfoChanged) {
       return;
     }
@@ -606,6 +655,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * @returns {NntpClient}
    */
   async _getNextClient() {
+    checkMigrationWriterAdmission();
     // The newest connection is the least likely to have timed out.
     let client = this._idleConnections.pop();
     if (client) {
@@ -633,6 +683,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    *   instance, and do some actions.
    */
   async withClient(handler) {
+    checkMigrationWriterAdmission();
     const client = await this._getNextClient();
     client.onIdle = () => {
       this._busyConnections = this._busyConnections.filter(c => c != client);
@@ -640,6 +691,12 @@ export class NntpIncomingServer extends MsgIncomingServer {
       // Resolve the first waiting in queue.
       this._connectionWaitingQueue.shift()?.();
     };
+    try {
+      checkMigrationWriterAdmission();
+    } catch (error) {
+      client.onIdle();
+      throw error;
+    }
     client._prepareRequest();
     try {
       handler(client);
@@ -661,6 +718,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    * @throws {nsIException} The original listing, mapping or removal error.
    */
   async _removeExpiredNativeArticles(groupName) {
+    checkMigrationWriterAdmission();
     const folder = this.rootFolder
       .getChildNamed(groupName)
       .QueryInterface(Ci.nsIMsgNewsFolder);
@@ -751,6 +809,7 @@ export class NntpIncomingServer extends MsgIncomingServer {
    *   selected physical group's article mappings fails.
    */
   removeExpiredArticles(groupName) {
+    checkMigrationWriterAdmission();
     if (Services.prefs.getBoolPref("mail.panorama.enabled", false)) {
       return this._removeExpiredNativeArticles(groupName);
     }

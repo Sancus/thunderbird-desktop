@@ -259,3 +259,115 @@ add_task(async function test_staleCloseDoesNotFinishReusedClient() {
   client._actionDone();
   Assert.equal(completions, 1);
 });
+
+const { AppConstants: migrationAppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+const { MockRegistrar: migrationMockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
+/**
+ * Rejects service lookup to test refusal before a caller's first side effect.
+ * This fixture never supplies native selection or claims a Held lease.
+ *
+ * @param {function(nsIException): Promise<void>} task - Refusal assertions.
+ * @returns {Promise<void>} Resolves after restoring the real native service.
+ */
+async function withMigrationGateFailure(task) {
+  const error = Components.Exception(
+    "Migration gate service lookup failed",
+    Cr.NS_ERROR_FILE_ACCESS_DENIED
+  );
+  const cid = migrationMockRegistrar.register(
+    "@mozilla.org/mailnews/migration-writer-lease;1",
+    () => {
+      throw error;
+    }
+  );
+  try {
+    await task(error);
+  } finally {
+    migrationMockRegistrar.unregister(cid);
+  }
+}
+
+/**
+ * Checks sticky native history in this already initialized ordinary fixture.
+ *
+ * @param {string} domain - One fixed native writer domain.
+ */
+function assertMigrationWriterStarted(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), 1);
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "An initialized or previously used writer cannot certify NeverStarted"
+  );
+}
+
+add_task(async function test_newsMigrationRefusesQueuedOrRetiredGeneration() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const client = new NntpClient(incomingServer);
+  client._prepareRequest();
+  client._actionDone(Cr.NS_ERROR_ABORT);
+  const socket = client._socket;
+  const authClient = new NntpClient(incomingServer);
+  authClient._prepareRequest();
+  const completion = Promise.withResolvers();
+  let notified = 0;
+  let returned = 0;
+  authClient.onDone = status => {
+    ++notified;
+    completion.resolve(status);
+  };
+  authClient.onIdle = () => ++returned;
+  await withMigrationGateFailure(async original => {
+    Assert.throws(() => client._prepareRequest(), error => error.result == original.result);
+    Assert.throws(() => client.connect(), error => error.result == original.result);
+    // The real 480 response path does not await its authentication Promise.
+    authClient._onData({
+      data: new TextEncoder().encode("480 Authentication required\r\n").buffer,
+    });
+    Assert.equal(await completion.promise, original.result);
+    authClient._actionDone(Cr.NS_ERROR_ABORT);
+  });
+  Assert.equal(notified, 1);
+  Assert.equal(returned, 1);
+  Assert.strictEqual(client._socket, socket);
+  assertMigrationWriterStarted("news");
+});
+
+add_task(async function test_newsMigrationCancelDoesNotReleaseUnsettledOwnership() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const client = new NntpClient(incomingServer);
+  client._prepareRequest();
+  let cleaned = 0;
+  let notified = 0;
+  const secondary = Components.Exception("Cleanup failed", Cr.NS_ERROR_FAILURE);
+  client._newsGroup = { cleanUp() { ++cleaned; throw secondary; } };
+  client.onDone = status => {
+    Assert.equal(status, Cr.NS_ERROR_ABORT, "The original request error remains primary");
+    ++notified;
+  };
+  await withMigrationGateFailure(async original => {
+    Assert.throws(() => client.connect(), error => error.result == original.result);
+    client._actionDone(Cr.NS_ERROR_ABORT);
+    client._actionDone(Cr.NS_ERROR_ABORT);
+  });
+  Assert.equal(cleaned, 1);
+  Assert.equal(notified, 1);
+  assertMigrationWriterStarted("news");
+});

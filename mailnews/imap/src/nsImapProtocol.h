@@ -12,43 +12,43 @@
 
 #include "nsIImapUrl.h"
 
-#include "nsMsgProtocol.h"
-#include "nsIStreamListener.h"
-#include "nsIAsyncOutputStream.h"
 #include "nsIAsyncInputStream.h"
-#include "nsImapCore.h"
-#include "nsIProgressEventSink.h"
+#include "nsIAsyncOutputStream.h"
 #include "nsIInterfaceRequestor.h"
+#include "nsIProgressEventSink.h"
 #include "nsISocketTransport.h"
+#include "nsIStreamListener.h"
+#include "nsImapCore.h"
+#include "nsMsgProtocol.h"
 
 // UI Thread proxy helper
 #include "nsIImapProtocolSink.h"
 
 #include "../public/nsIImapHostSessionList.h"
-#include "nsImapServerResponseParser.h"
+#include "mozilla/ReentrantMonitor.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsHashPropertyBag.h"
+#include "nsIAsyncInputStream.h"
+#include "nsICacheEntryOpenCallback.h"
+#include "nsIImapHeaderXferInfo.h"
+#include "nsIImapMockChannel.h"
+#include "nsIInputStream.h"
+#include "nsILoadGroup.h"
+#include "nsIMsgAsyncPrompter.h"
+#include "nsIMsgFolder.h"
+#include "nsIMsgIncomingServer.h"
+#include "nsIMsgWindow.h"
+#include "nsIProtocolProxyCallback.h"
+#include "nsIWeakReferenceUtils.h"
 #include "nsImapFlagAndUidState.h"
 #include "nsImapNamespace.h"
-#include "nsTArray.h"
-#include "nsIWeakReferenceUtils.h"
-#include "nsMsgLineBuffer.h"  // we need this to use the nsMsgLineStreamBuffer helper class...
-#include "nsIInputStream.h"
-#include "nsIMsgIncomingServer.h"
-#include "nsCOMArray.h"
-#include "nsIImapMockChannel.h"
-#include "nsILoadGroup.h"
-#include "nsCOMPtr.h"
-#include "nsIMsgWindow.h"
-#include "nsIImapHeaderXferInfo.h"
-#include "nsMsgLineBuffer.h"
-#include "nsIAsyncInputStream.h"
-#include "nsIMsgFolder.h"
-#include "nsIMsgAsyncPrompter.h"
-#include "mozilla/ReentrantMonitor.h"
-#include "nsSyncRunnableHelpers.h"
-#include "nsICacheEntryOpenCallback.h"
-#include "nsIProtocolProxyCallback.h"
-#include "nsHashPropertyBag.h"
+#include "nsImapServerResponseParser.h"
 #include "nsMailChannel.h"
+#include "nsMsgLineBuffer.h"  // we need this to use the nsMsgLineStreamBuffer helper class...
+#include "nsMsgLineBuffer.h"
+#include "nsSyncRunnableHelpers.h"
+#include "nsTArray.h"
 
 #include "mozilla/Monitor.h"
 
@@ -173,6 +173,10 @@ class nsIMAPMailboxInfo {
  * it dispatches a call to the real sink object on the main thread, then
  * blocks until the call is completed.
  */
+#ifdef MOZ_PANORAMA
+#  include "ImapMigrationWriterLease.h"
+#endif
+
 class nsImapProtocol : public nsIImapProtocol,
                        public nsIInputStreamCallback,
                        public nsSupportsWeakReference,
@@ -181,6 +185,18 @@ class nsImapProtocol : public nsIImapProtocol,
                        public nsIMsgAsyncPromptListener,
                        public nsIProtocolProxyCallback {
  public:
+#ifdef MOZ_PANORAMA
+  friend class mozilla::mailnews::ImapMigrationWriterLeaseTest;
+#endif
+
+#ifdef MOZ_PANORAMA
+  void RequestMigrationDrain();
+  void CancelMigrationWork(nsresult aReason);
+  RefPtr<mozilla::mailnews::ImapMigrationWork> MigrationWork() const {
+    return mMigrationWork;
+  }
+#endif
+
   struct TCPKeepalive {
     // For enabling and setting TCP keepalive (not related to IMAP IDLE).
     std::atomic<bool> enabled;
@@ -376,6 +392,12 @@ class nsImapProtocol : public nsIImapProtocol,
   bool RunImapThreadMainLoop();
 
  private:
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::ImapMigrationWork> mMigrationWork;
+  bool mMigrationThreadOwned = false;
+  nsCOMPtr<nsIThread> mMigrationThread;
+#endif
+
   virtual ~nsImapProtocol();
   // the following flag is used to determine when a url is currently being run.
   // It is cleared when we finish processng a url and it is set whenever we call

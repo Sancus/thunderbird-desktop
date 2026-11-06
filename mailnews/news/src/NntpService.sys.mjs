@@ -2,7 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
+
+/**
+ * Checks native process admission before starting a news writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "news");
+}
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
@@ -23,6 +42,7 @@ export class NntpService {
   QueryInterface = ChromeUtils.generateQI(["nsINntpService"]);
 
   get cacheStorage() {
+    checkMigrationWriterAdmission();
     if (!this._cacheStorage) {
       this._cacheStorage = Services.cache2.memoryCacheStorage(
         Services.loadContextInfo.custom(false, {})
@@ -32,6 +52,7 @@ export class NntpService {
   }
 
   postMessage(messageFile, groupNames, accountKey, urlListener, msgWindow) {
+    checkMigrationWriterAdmission();
     let server = MailServices.accounts.getAccount(accountKey)?.incomingServer;
     if (!server) {
       // If no matching server, find the first news server and use it.
@@ -78,6 +99,7 @@ export class NntpService {
    * @param {nsIMsgWindow} msgWindow
    */
   getNewNews(server, uri, getOld, urlListener, msgWindow) {
+    checkMigrationWriterAdmission();
     if (Services.io.offline) {
       const NS_MSG_ERROR_OFFLINE = 0x80550014;
       // @see nsMsgNewsFolder::UpdateFolder
@@ -113,6 +135,7 @@ export class NntpService {
    * @param {boolean} getOnlyNew
    */
   getListOfGroupsOnServer(server, msgWindow, getOnlyNew) {
+    checkMigrationWriterAdmission();
     server.wrappedJSObject.withClient(client => {
       client.startRunningUrl(server.wrappedJSObject, msgWindow);
       client.onOpen = () => {
@@ -138,6 +161,7 @@ export class NntpService {
    * @throws {nsIException} The original native binding error before dispatch.
    */
   fetchMessage(folder, key, msgWindow, consumer, urlListener) {
+    checkMigrationWriterAdmission();
     const binding = Services.prefs.getBoolPref("mail.panorama.enabled", false)
       ? lazy.captureNativeNewsArticle(
           folder.QueryInterface(Ci.nsIMsgNewsFolder),
@@ -226,6 +250,7 @@ export class NntpService {
   }
 
   cancelMessage(cancelUrl, messageUri, consumer, urlListener, msgWindow) {
+    checkMigrationWriterAdmission();
     // The cancelUrl is in the form of "news://host/message-id?cancel"
     const url = new URL(cancelUrl);
     const messageId = "<" + decodeURIComponent(url.pathname.slice(1)) + ">";
@@ -294,6 +319,7 @@ export class NntpService {
   }
 
   downloadNewsgroupsForOffline(msgWindow, urlListener) {
+    checkMigrationWriterAdmission();
     const downloader = new lazy.NewsDownloader(msgWindow, urlListener);
     downloader
       .downloadAllOfflineNewsgroups()
@@ -301,11 +327,13 @@ export class NntpService {
   }
 
   downloadFolderForOffline(folder, msgWindow) {
+    checkMigrationWriterAdmission();
     const downloader = new lazy.NewsDownloader(msgWindow);
     downloader.downloadFolder(folder).catch(error => console.error(error));
   }
 
   downloadMessagesForOffline(folder, keys, msgWindow) {
+    checkMigrationWriterAdmission();
     const downloader = new lazy.NewsDownloader(msgWindow);
     downloader
       .downloadMessages(folder, keys)

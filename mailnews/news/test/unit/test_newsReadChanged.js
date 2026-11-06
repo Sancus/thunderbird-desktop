@@ -1466,3 +1466,129 @@ add_task(function test_nativeStaleArticleProducerCannotComplete() {
     "current-s364@example.invalid"
   );
 });
+
+const { AppConstants: migrationAppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+const { MockRegistrar: migrationMockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
+/**
+ * Rejects service lookup to test refusal before a caller's first side effect.
+ * This fixture never supplies native selection or claims a Held lease.
+ *
+ * @param {function(nsIException): Promise<void>} task - Refusal assertions.
+ * @returns {Promise<void>} Resolves after restoring the real native service.
+ */
+async function withMigrationGateFailure(task) {
+  const error = Components.Exception(
+    "Migration gate service lookup failed",
+    Cr.NS_ERROR_FILE_ACCESS_DENIED
+  );
+  const cid = migrationMockRegistrar.register(
+    "@mozilla.org/mailnews/migration-writer-lease;1",
+    () => {
+      throw error;
+    }
+  );
+  try {
+    await task(error);
+  } finally {
+    migrationMockRegistrar.unregister(cid);
+  }
+}
+
+/**
+ * Checks sticky native history in this already initialized ordinary fixture.
+ *
+ * @param {string} domain - One fixed native writer domain.
+ */
+function assertMigrationWriterStarted(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), 1);
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "An initialized or previously used writer cannot certify NeverStarted"
+  );
+}
+
+add_task(async function test_newsMigrationLeaseRefusesForeignOrStartedContext() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  assertMigrationWriterStarted("news");
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const foreign = Cc["@mozilla.org/hash-property-bag;1"].createInstance(
+    Ci.nsIWritablePropertyBag2
+  );
+  Assert.throws(
+    () => gate.observe(foreign, "check-writer-never-started", "news"),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "A script-created bag cannot supply native process identity"
+  );
+});
+
+add_task(async function test_newsMigrationAdmissionKeepsNewsrcHostinfoAndSubscriptionUnchanged() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const server = MailServices.accounts
+    .getAccount(accounts[0].key)
+    .incomingServer.QueryInterface(Ci.nsINntpIncomingServer);
+  const pool = server.wrappedJSObject;
+  const before = [...server.rootFolder.subFolders].map(folder => folder.URI);
+  const dirty = server.newsrcHasChanged;
+  const idle = [...pool._idleConnections];
+  const busy = [...pool._busyConnections];
+  await withMigrationGateFailure(async original => {
+    Assert.throws(
+      () => server.QueryInterface(Ci.nsISubscribableServer)
+        .subscribe("migration.must.not.subscribe"),
+      error => error.result == original.result
+    );
+    Assert.throws(
+      () => server.writeNewsrcFile(),
+      error => error.result == original.result
+    );
+    await Assert.rejects(pool._getNextClient(), error => error.result == original.result);
+  });
+  Assert.equal(server.newsrcHasChanged, dirty);
+  Assert.deepEqual([...server.rootFolder.subFolders].map(folder => folder.URI), before);
+  Assert.deepEqual(pool._idleConnections, idle);
+  Assert.deepEqual(pool._busyConnections, busy);
+});
+
+add_task(async function test_newsMigrationExternalMetadataRetainsPrimaryError() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const server = MailServices.accounts
+    .getAccount(accounts[0].key)
+    .incomingServer.QueryInterface(Ci.nsINntpIncomingServer);
+  const pool = server.wrappedJSObject;
+  const dirty = pool._hostInfoChanged;
+  const file = server.localPath.clone();
+  file.append("hostinfo.dat");
+  const before = file.exists() ? [...await IOUtils.read(file.path)] : null;
+  try {
+    pool._hostInfoChanged = true;
+    await withMigrationGateFailure(async original => {
+      await Assert.rejects(pool._saveHostInfo(), error => error.result == original.result);
+      Assert.equal(pool._hostInfoChanged, true, "Failed admission cannot clear dirty state");
+    });
+    Assert.deepEqual(file.exists() ? [...await IOUtils.read(file.path)] : null, before);
+  } finally {
+    pool._hostInfoChanged = dirty;
+  }
+});

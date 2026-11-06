@@ -2,24 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import {
+  openSearchWriter,
+  SearchWriter,
+  recordSearchWriterFailure,
+} from "resource:///modules/panorama/SearchMigrationHold.sys.mjs";
+
 import { IMServices } from "resource:///modules/IMServices.sys.mjs";
-import {
-  encodeName,
-  queueFileOperation,
-  captureChatPrivacyIntent,
-  getChatPrivacyEpoch,
-  getChatPrivacyState,
-  getChatPrivacySourceProof,
-  acknowledgeChatPrivacyIntent,
-} from "resource:///modules/logger.sys.mjs";
 import { PanoramaSearchIndex } from "resource:///modules/panorama/PanoramaSearchIndex.sys.mjs";
-import {
-  applyChatSearchPrivacyReceipt,
-  chatSearchPrivacyNeedsErasure,
-} from "resource:///modules/panorama/ChatSearchRedaction.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
+  encodeName: "resource:///modules/logger.sys.mjs",
+  getChatLogArchive: "resource:///modules/logger.sys.mjs",
+  getChatPrivacyEpoch: "resource:///modules/logger.sys.mjs",
+  applyChatSearchPrivacyReceipt:
+    "resource:///modules/panorama/ChatSearchRedaction.sys.mjs",
+  chatSearchPrivacyNeedsErasure:
+    "resource:///modules/panorama/ChatSearchRedaction.sys.mjs",
   readLegacyGlodaChat:
     "resource:///modules/panorama/LegacyGlodaChatReader.sys.mjs",
   readLegacyChatLog:
@@ -107,16 +107,33 @@ function logPath(id) {
  * Does not convert read failures into empty transcripts.
  *
  * @param {string} filePath - Current log path.
- * @param {AbortSignal} [signal] - Cancels delivery, not queued logger I/O.
+ * @param {AbortSignal} signal - Cancels delivery, not queued logger I/O.
+ * @param {object} archive - Queue bound to the actual pending chat-search work.
  * @returns {Promise<{bytes: Uint8Array, revision: string}>} Bytes and SHA-256 digest.
  */
-async function readSource(filePath, signal) {
+async function readSource(filePath, signal, archive) {
   signal?.throwIfAborted();
   let bytes;
+  let missing;
   try {
-    bytes = await queueFileOperation(filePath, () => IOUtils.read(filePath));
+    bytes = await archive.queueFileOperation(filePath, async wait => {
+      try {
+        return await wait(() => IOUtils.read(filePath));
+      } catch (error) {
+        if (error.name != "NotFoundError") {
+          throw error;
+        }
+        // The actual read has settled. Let the authoritative resolver handle
+        // absence outside the child queue, without retaining a writer failure.
+        missing = error;
+        return null;
+      }
+    });
   } catch (error) {
     throw sourceFailure(error);
+  }
+  if (missing) {
+    throw sourceFailure(missing);
   }
   signal?.throwIfAborted();
   const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
@@ -156,8 +173,8 @@ function validateSource(bytes, parts) {
     typeof header.isChat != "boolean" ||
     !Number.isFinite(Date.parse(header.date)) ||
     header.protocol != parts[0] ||
-    encodeName(header.account) != parts[1] ||
-    encodeName(header.normalizedName + (header.isChat ? ".chat" : "")) !=
+    lazy.encodeName(header.account) != parts[1] ||
+    lazy.encodeName(header.normalizedName + (header.isChat ? ".chat" : "")) !=
       parts[2]
   ) {
     throw new Error("Invalid chat log metadata");
@@ -230,18 +247,19 @@ class IncompleteChatTranscriptError extends Error {}
  *
  * @param {string} filePath - Current physical log file.
  * @param {{bytes: Uint8Array}} source - Complete source bytes.
- * @param {AbortSignal} [signal] - Cancel parsed result delivery.
+ * @param {AbortSignal} signal - Cancels parsed result delivery.
+ * @param {object} archive - Parser bound to the actual pending chat-search work.
  * @returns {Promise<{log: Log, conversation: LogConversation,
  *   messages: imIMessage[], hasNoLogRecords: boolean}>}
  *   Real logger objects and their validated visible records.
  */
-async function readLogConversation(filePath, source, signal) {
+async function readLogConversation(filePath, source, signal, archive) {
   let expected;
   let log;
   let conversation;
   try {
     expected = validateSource(source.bytes, logComponents(filePath));
-    log = await IMServices.logs.getLogFromFile(filePath);
+    log = await archive.getLogFromFile(filePath);
     conversation = await log.getConversation();
   } catch (error) {
     throw sourceFailure(error);
@@ -286,8 +304,64 @@ async function readLogConversation(filePath, source, signal) {
  * Recovered text without verified log policy is not accepted here.
  */
 export class ChatSearchProvider {
+  /** @type {SearchWriter} Concrete retained writer and pending operations. */
+  #migration;
+  #storageTerminal = true;
+  /** @returns {boolean} Actual storage callback settlement, independent of errors. */
+  get migrationSettled() {
+    return this.#migration.terminal;
+  }
+
+  /** @type {unknown[]} Original failures retained before queue advancement. */
+  #migrationFailures = [];
+
+  /**
+   * Returns original failures without granting native lease ownership.
+   * Ordinary retries and successful cleanup do not clear this diagnostic copy.
+   *
+   * @returns {unknown[]} First error followed by later distinct failures.
+   */
+  get migrationFailures() {
+    return [...this.#migrationFailures];
+  }
+
+  /**
+   * Retains a rejected operation before its queue advances.
+   *
+   * @param {unknown} error - Exact original rejection, without normalization.
+   */
+  #rememberMigrationFailure(error) {
+    if (!this.#migrationFailures.includes(error)) {
+      this.#migrationFailures.push(error);
+      recordSearchWriterFailure("chat-search", error);
+    }
+  }
+
+  /** @param {?object} [migrationWork=null] - Captured same-domain open.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
+   */
+  constructor(migrationWork = null) {
+    this.#migration = new SearchWriter(
+      "chat-search",
+      () => this.#stopMigrationNotifications(),
+      () => this.close(),
+      () => this.#storageTerminal,
+      migrationWork
+    );
+  }
+
+  /** This provider has no independent notification or timer source. */
+  #stopMigrationNotifications() {}
+
   /** @type {PanoramaSearchIndex} */
   #index;
+  /**
+   * Archive bound to the real operation executing in the serialized index queue.
+   *
+   * @type {?object}
+   */
+  #archive = null;
+
   /** @type {Promise<void>} */
   #pending = Promise.resolve();
   /** @type {Set<Promise<string[]>>} */
@@ -304,26 +378,35 @@ export class ChatSearchProvider {
    *
    * @param {nsIFile} file - Dedicated chat search database, never the mail sidecar.
    * @returns {Promise<ChatSearchProvider>} Provider with fresh log-state resolution.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  static async open(file) {
-    const provider = new ChatSearchProvider();
-    provider.#index = await PanoramaSearchIndex.open(file, (id, signal) =>
-      provider.resolveDocument(id, { signal })
+  static open(file, migrationWork = null) {
+    return openSearchWriter(
+      "chat-search",
+      async work => {
+        const provider = new ChatSearchProvider(work);
+        try {
+          await provider.#migration.wait(async () => {
+            provider.#storageTerminal = false;
+            provider.#index = await PanoramaSearchIndex.open(
+              file,
+              (id, signal) => provider.#resolveDocument(id, { signal })
+            );
+          });
+          await provider.#enqueue(() => provider.#reconcilePrivacy(), work);
+          return provider;
+        } catch (error) {
+          provider.#rememberMigrationFailure(error);
+          try {
+            await provider.close();
+          } catch (closeError) {
+            provider.#rememberMigrationFailure(closeError);
+          }
+          throw error;
+        }
+      },
+      migrationWork
     );
-    try {
-      await provider.#reconcilePrivacy();
-    } catch (error) {
-      try {
-        await provider.#index.close();
-      } catch (closeError) {
-        throw new AggregateError(
-          [error, closeError],
-          "Chat privacy open and close failed"
-        );
-      }
-      throw error;
-    }
-    return provider;
   }
 
   /**
@@ -335,40 +418,45 @@ export class ChatSearchProvider {
    * @param {string[]} relativePaths - Exact physical log paths from that snapshot.
    * @returns {Promise<number>} Number of committed quarantined records.
    * @throws {Error} Original source/validation/storage error or closing provider.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  recoverLegacy(indexPath, logsRoot, relativePaths) {
-    if (this.#closing) {
-      return Promise.reject(new Error("Chat search provider is closing"));
-    }
-    const result = this.#pending.then(async () => {
-      const snapshot = await lazy.readLegacyGlodaChat(indexPath);
-      const logs = [];
-      for (const path of relativePaths) {
-        logs.push(await lazy.readLegacyChatLog(logsRoot, path));
+  recoverLegacy(indexPath, logsRoot, relativePaths, migrationWork = null) {
+    return this.#migration.run(work => {
+      if (this.#closing) {
+        return Promise.reject(new Error("Chat search provider is closing"));
       }
-      const bound = lazy.bindLegacyChatLogs(snapshot, logs);
-      const records = bound.records.map(record => ({
-        recordId: "chat:" + JSON.stringify([snapshot.source.path, record.id]),
-        documentId: chatSearchDocumentId(
-          PathUtils.join(
-            PathUtils.profileDir,
-            "logs",
-            ...record.relativePath.split("/")
-          )
-        ),
-        kind: "chat",
-        sourceRevision: snapshot.source.sha256,
-        payload: record,
-        document: null,
-      }));
-      await this.#index.retainRecovery(records);
-      return records.length;
-    });
-    this.#pending = result.then(
-      () => {},
-      () => {}
-    );
-    return result;
+      const result = this.#enqueue(async () => {
+        const snapshot = await this.#migration.wait(() =>
+          lazy.readLegacyGlodaChat(indexPath)
+        );
+        const logs = [];
+        for (const path of relativePaths) {
+          logs.push(
+            await this.#migration.wait(() =>
+              lazy.readLegacyChatLog(logsRoot, path)
+            )
+          );
+        }
+        const bound = lazy.bindLegacyChatLogs(snapshot, logs);
+        const records = bound.records.map(record => ({
+          recordId: "chat:" + JSON.stringify([snapshot.source.path, record.id]),
+          documentId: chatSearchDocumentId(
+            PathUtils.join(
+              PathUtils.profileDir,
+              "logs",
+              ...record.relativePath.split("/")
+            )
+          ),
+          kind: "chat",
+          sourceRevision: snapshot.source.sha256,
+          payload: record,
+          document: null,
+        }));
+        await this.#migration.wait(() => this.#index.retainRecovery(records));
+        return records.length;
+      }, work);
+      return result;
+    }, migrationWork);
   }
 
   /**
@@ -378,23 +466,31 @@ export class ChatSearchProvider {
    * @returns {Promise<object[]>} Stored records; erased payloads are null. An
    *   overlapping privacy operation withholds this read, as for getText.
    * @throws {Error} Original privacy/storage failure or closing provider.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async getRecoveryRecords(id = null) {
-    if (this.#closing) {
-      throw new Error("Chat search provider is closing");
-    }
-    const revision = this.#redactions.size ? null : this.#privacyRevision;
-    const epoch = getChatPrivacyEpoch();
-    const records = await this.#enqueue(async () => {
-      await this.#reconcilePrivacy();
-      const value = await this.#index.getRecoveryRecords(id);
-      await this.#reconcilePrivacy();
-      return value;
-    });
-    await this.#waitForRedactions();
-    return revision === this.#privacyRevision && epoch === getChatPrivacyEpoch()
-      ? records
-      : [];
+  async getRecoveryRecords(id = null, migrationWork = null) {
+    return this.#migration.run(async work => {
+      if (this.#closing) {
+        throw new Error("Chat search provider is closing");
+      }
+      const revision = this.#redactions.size ? null : this.#privacyRevision;
+      const epoch = lazy.getChatPrivacyEpoch();
+      const records = await this.#migration.wait(() =>
+        this.#enqueue(async () => {
+          await this.#migration.wait(() => this.#reconcilePrivacy());
+          const value = await this.#migration.wait(() =>
+            this.#index.getRecoveryRecords(id)
+          );
+          await this.#migration.wait(() => this.#reconcilePrivacy());
+          return value;
+        }, work)
+      );
+      await this.#migration.wait(() => this.#waitForRedactions());
+      return revision === this.#privacyRevision &&
+        epoch === lazy.getChatPrivacyEpoch()
+        ? records
+        : [];
+    }, migrationWork);
   }
 
   /**
@@ -403,23 +499,22 @@ export class ChatSearchProvider {
    *
    * @returns {Promise<void>} Resolves after observed privacy work and FTS rebuild.
    * @throws {Error} Original privacy/storage failure or closing provider.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async rebuild() {
-    if (this.#closing) {
-      throw new Error("Chat search provider is closing");
-    }
-    await this.#waitForRedactions();
-    const result = this.#pending.then(async () => {
-      await this.#reconcilePrivacy();
-      await this.#index.rebuild();
-      await this.#reconcilePrivacy();
-    });
-    this.#pending = result.then(
-      () => {},
-      () => {}
-    );
-    await result;
-    await this.#waitForRedactions();
+  async rebuild(migrationWork = null) {
+    return this.#migration.run(async work => {
+      if (this.#closing) {
+        throw new Error("Chat search provider is closing");
+      }
+      await this.#migration.wait(() => this.#waitForRedactions());
+      const result = this.#enqueue(async () => {
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+        await this.#migration.wait(() => this.#index.rebuild());
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+      }, work);
+      await this.#migration.wait(() => result);
+      await this.#migration.wait(() => this.#waitForRedactions());
+    }, migrationWork);
   }
 
   /**
@@ -430,36 +525,19 @@ export class ChatSearchProvider {
    * @param {AbortSignal} [options.signal] - Cancels delivery after queued I/O.
    * @returns {Promise<SearchDocumentState|{eligible: false}|null>} Current revision, disabled policy, or deleted.
    * @throws {Error} Original read errors other than a missing file.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async resolveDocument(id, { signal } = {}) {
-    const filePath = logPath(id);
-    signal?.throwIfAborted();
-    try {
-      const source = await readSource(filePath, signal);
-      if (
-        !Services.prefs.getBoolPref(
-          "mailnews.database.global.indexer.enabled",
-          false
-        )
-      ) {
-        return { eligible: false };
-      }
-      // The logger has no incarnation counter; exact bytes carry its revision.
-      return {
-        eligible: true,
-        generation: 0,
-        policyRevision: 0,
-        contentRevision: source.revision,
-        location: null,
-        originalContentAvailable: true,
-      };
-    } catch (error) {
-      signal?.throwIfAborted();
-      if (error.name == "NotFoundError") {
-        return null;
-      }
-      throw error;
-    }
+  async resolveDocument(id, { signal } = {}, migrationWork = null) {
+    return this.#migration.run(async work => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      const archive = await this.#migration.wait(() =>
+        lazy.getChatLogArchive(work)
+      );
+      return this.#resolveDocument(id, { signal, archive });
+    }, migrationWork);
   }
 
   /**
@@ -477,16 +555,23 @@ export class ChatSearchProvider {
    * @returns {Promise<{id: string, indexed: boolean}>} Identity and publication result.
    * @throws {Error} Original I/O/cancellation/storage errors, or invalid source.
    * @throws {TypeError} For a non-boolean erasure option.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  refreshLog(filePath, { signal, eraseStoredText = false } = {}) {
-    const id = chatSearchDocumentId(filePath);
-    if (typeof eraseStoredText != "boolean") {
-      throw new TypeError("Chat stored-text erasure must be boolean");
-    }
-    if (this.#closing) {
-      return Promise.reject(new Error("Chat search provider is closing"));
-    }
-    return this.#queueRefresh(id, filePath, signal, eraseStoredText);
+  refreshLog(
+    filePath,
+    { signal, eraseStoredText = false } = {},
+    migrationWork = null
+  ) {
+    return this.#migration.run(work => {
+      const id = chatSearchDocumentId(filePath);
+      if (typeof eraseStoredText != "boolean") {
+        throw new TypeError("Chat stored-text erasure must be boolean");
+      }
+      if (this.#closing) {
+        return Promise.reject(new Error("Chat search provider is closing"));
+      }
+      return this.#queueRefresh(id, filePath, signal, eraseStoredText, work);
+    }, migrationWork);
   }
 
   /**
@@ -495,32 +580,29 @@ export class ChatSearchProvider {
    * @param {string} id - Validated physical log identity.
    * @param {string} filePath - Validated current path.
    * @param {AbortSignal} [signal] - Cancels delivery after queued I/O.
-   * @param {boolean} [eraseStoredText=false] - Erase old semantic text first.
+   * @param {boolean} eraseStoredText - Erase old semantic text first.
+   * @param {object} work - Actual pending refresh token.
    * @returns {Promise<{id: string, indexed: boolean}>} Publication result.
    */
-  #queueRefresh(id, filePath, signal, eraseStoredText = false) {
-    const result = this.#pending.then(async () => {
+  #queueRefresh(id, filePath, signal, eraseStoredText, work) {
+    const result = this.#enqueue(async () => {
       signal?.throwIfAborted();
       // An explicit refresh may succeed without clearing an earlier read hold.
       if (!this.#privacyFailed) {
-        await this.#reconcilePrivacy();
+        await this.#migration.wait(() => this.#reconcilePrivacy());
       }
       if (eraseStoredText) {
-        await this.#index.remove(id);
+        await this.#migration.wait(() => this.#index.remove(id));
       }
       signal?.throwIfAborted();
       return this.#refreshLog(id, filePath, signal);
-    });
-    this.#pending = result.then(
-      () => {},
-      () => {}
-    );
+    }, work);
     return result;
   }
 
   /**
    * Persists an explicit noLog/deleted update and erases affected stored text.
-   * Registers logger capture before returning and joins the original subject.
+   * Registers pending work before durable capture and joins the original subject.
    * Awaits durable source and cache settlement for every captured target.
    * Lookups withhold delivery and retain the first live privacy failure.
    * Capture before its first durable write is not a recovered event.
@@ -528,31 +610,37 @@ export class ChatSearchProvider {
    * @param {prplIMessage} message - Existing notification with a real remoteId.
    * @returns {Promise<string[]>} All captured paths after source and cache writes.
    * @throws {Error} Original source/storage error, or closing provider.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  redactMessage(message) {
-    if (this.#closing) {
-      return Promise.reject(new Error("Chat search provider is closing"));
-    }
-    const capture = captureChatPrivacyIntent(message);
-    // Capture can fail while earlier writer work is still draining.
-    capture.catch(() => {});
-    this.#privacyRevision++;
-    const result = this.#enqueue(async () => {
-      const receipt = await capture;
-      return receipt ? this.#completePrivacyReceipt(receipt, true) : [];
-    });
-    this.#redactions.add(result);
-    result.then(
-      () => this.#redactions.delete(result),
-      error => {
-        this.#redactions.delete(result);
-        if (!this.#privacyFailed) {
-          this.#privacyFailed = true;
-          this.#privacyFailure = error;
-        }
+  redactMessage(message, migrationWork = null) {
+    return this.#migration.run(work => {
+      if (this.#closing) {
+        return Promise.reject(new Error("Chat search provider is closing"));
       }
-    );
-    return result;
+      const capture = this.#migration.wait(async () => {
+        const archive = await lazy.getChatLogArchive(work);
+        return archive.captureChatPrivacyIntent(message);
+      });
+      // Capture can fail while earlier writer work is still draining.
+      capture.catch(() => {});
+      this.#privacyRevision++;
+      const result = this.#enqueue(async () => {
+        const receipt = await this.#migration.wait(() => capture);
+        return receipt ? this.#completePrivacyReceipt(receipt, true) : [];
+      }, work);
+      this.#redactions.add(result);
+      result.then(
+        () => this.#redactions.delete(result),
+        error => {
+          this.#redactions.delete(result);
+          if (!this.#privacyFailed) {
+            this.#privacyFailed = true;
+            this.#privacyFailure = error;
+          }
+        }
+      );
+      return result;
+    }, migrationWork);
   }
 
   /**
@@ -565,7 +653,9 @@ export class ChatSearchProvider {
   async #waitForRedactions(signal) {
     signal?.throwIfAborted();
     while (this.#redactions.size) {
-      await Promise.allSettled([...this.#redactions]);
+      await this.#migration.wait(() =>
+        Promise.allSettled([...this.#redactions])
+      );
       signal?.throwIfAborted();
     }
     if (this.#privacyFailed) {
@@ -577,13 +667,24 @@ export class ChatSearchProvider {
    * Serializes a provider operation without converting its error to success.
    *
    * @param {function(): Promise} operation - Work using the dedicated writer.
+   * @param {object} work - Actual pending caller that owns archive/parser work.
    * @returns {Promise} The original result; only queue advancement absorbs failure.
    */
-  #enqueue(operation) {
-    const result = this.#pending.then(operation);
+  #enqueue(operation, work) {
+    const result = this.#pending.then(async () => {
+      const archive = await this.#migration.wait(() =>
+        lazy.getChatLogArchive(work)
+      );
+      this.#archive = archive;
+      try {
+        return await operation();
+      } finally {
+        this.#archive = null;
+      }
+    });
     this.#pending = result.then(
       () => {},
-      () => {}
+      error => this.#rememberMigrationFailure(error)
     );
     return result;
   }
@@ -600,17 +701,23 @@ export class ChatSearchProvider {
    */
   async #completePrivacyReceipt(receipt, refresh = false) {
     let paths = [];
-    await acknowledgeChatPrivacyIntent(receipt.id, async current => {
-      paths = await applyChatSearchPrivacyReceipt(current);
-      for (const path of paths) {
-        const id = chatSearchDocumentId(path);
-        await this.#index.remove(id);
-        if (refresh) {
-          await this.#refreshLog(id, path);
+    await this.#migration.wait(() =>
+      this.#archive.acknowledgeChatPrivacyIntent(receipt.id, async current => {
+        paths = await this.#migration.wait(() =>
+          lazy.applyChatSearchPrivacyReceipt(current, {
+            archive: this.#archive,
+          })
+        );
+        for (const path of paths) {
+          const id = chatSearchDocumentId(path);
+          await this.#migration.wait(() => this.#index.remove(id));
+          if (refresh) {
+            await this.#migration.wait(() => this.#refreshLog(id, path));
+          }
         }
-      }
-      return getChatPrivacySourceProof(current.id);
-    });
+        return this.#archive.getChatPrivacySourceProof(current.id);
+      })
+    );
     return paths;
   }
 
@@ -627,17 +734,31 @@ export class ChatSearchProvider {
       throw this.#privacyFailure;
     }
     try {
-      let state = await getChatPrivacyState();
+      let state = await this.#migration.wait(() =>
+        this.#archive.getChatPrivacyState()
+      );
       for (;;) {
         for (const receipt of state.pending) {
-          await this.#completePrivacyReceipt(receipt);
+          await this.#migration.wait(() =>
+            this.#completePrivacyReceipt(receipt)
+          );
         }
         for (const receipt of state.completed) {
-          if (await chatSearchPrivacyNeedsErasure(receipt)) {
-            await this.#completePrivacyReceipt(receipt);
+          if (
+            await this.#migration.wait(() =>
+              lazy.chatSearchPrivacyNeedsErasure(receipt, {
+                archive: this.#archive,
+              })
+            )
+          ) {
+            await this.#migration.wait(() =>
+              this.#completePrivacyReceipt(receipt)
+            );
           }
         }
-        const next = await getChatPrivacyState();
+        const next = await this.#migration.wait(() =>
+          this.#archive.getChatPrivacyState()
+        );
         if (!next.pending.length && next.epoch === state.epoch) {
           return;
         }
@@ -661,20 +782,22 @@ export class ChatSearchProvider {
    * @returns {Promise<{id: string, indexed: boolean}>} Publication result.
    */
   async #refreshLog(id, filePath, signal) {
-    const state = await this.resolveDocument(id, { signal });
+    const state = await this.#migration.wait(() =>
+      this.#resolveDocument(id, { signal })
+    );
     if (!state) {
-      await this.#index.remove(id);
+      await this.#migration.wait(() => this.#index.remove(id));
       signal?.throwIfAborted();
       return { id, indexed: false };
     }
     if (!state.eligible) {
       return { id, indexed: false };
     }
-    const source = await readSource(filePath, signal);
-    const { conversation, messages } = await readLogConversation(
-      filePath,
-      source,
-      signal
+    const source = await this.#migration.wait(() =>
+      readSource(filePath, signal, this.#archive)
+    );
+    const { conversation, messages } = await this.#migration.wait(() =>
+      readLogConversation(filePath, source, signal, this.#archive)
     );
     const body = messages
       .map(message => {
@@ -688,17 +811,19 @@ export class ChatSearchProvider {
       })
       .join("\n\n");
     signal?.throwIfAborted();
-    const indexed = await this.#index.index({
-      id,
-      generation: 0,
-      policyRevision: 0,
-      contentRevision: source.revision,
-      subject: conversation.title,
-      body,
-      attachmentNames: "",
-      author: "",
-      recipients: "",
-    });
+    const indexed = await this.#migration.wait(() =>
+      this.#index.index({
+        id,
+        generation: 0,
+        policyRevision: 0,
+        contentRevision: source.revision,
+        subject: conversation.title,
+        body,
+        attachmentNames: "",
+        author: "",
+        recipients: "",
+      })
+    );
     signal?.throwIfAborted();
     return { id, indexed };
   }
@@ -723,18 +848,28 @@ export class ChatSearchProvider {
    * @param {object} [options={}] - Refresh options passed to refreshLog.
    * @returns {Promise<Array<{id: string, indexed: boolean}>>} Empty for no writer.
    * @throws {Error} For rotating writers; cross-file redaction is not supported yet.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async refreshConversation(conversation, options = {}) {
-    options.signal?.throwIfAborted();
-    const paths =
-      await IMServices.logs.getLogPathsForConversation(conversation);
-    options.signal?.throwIfAborted();
-    if (paths?.length > 1) {
-      throw new Error(
-        "Cross-file chat refresh requires logger edit/redaction support"
+  async refreshConversation(conversation, options = {}, migrationWork = null) {
+    return this.#migration.run(async work => {
+      options.signal?.throwIfAborted();
+      const paths = await this.#migration.wait(() =>
+        IMServices.logs.getLogPathsForConversation(conversation)
       );
-    }
-    return paths?.length ? [await this.refreshLog(paths[0], options)] : [];
+      options.signal?.throwIfAborted();
+      if (paths?.length > 1) {
+        throw new Error(
+          "Cross-file chat refresh requires logger edit/redaction support"
+        );
+      }
+      return paths?.length
+        ? [
+            await this.#migration.wait(() =>
+              this.refreshLog(paths[0], options, work)
+            ),
+          ]
+        : [];
+    }, migrationWork);
   }
 
   /**
@@ -749,44 +884,54 @@ export class ChatSearchProvider {
    * @returns {Promise<{items: SearchHit[], cursor: ?object, resultSetId: string}>}
    *   Eligible physical transcript hits, with opaque paging cursors.
    * @throws {Error} Original query/cancellation/storage error, or closing provider.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  search(text, options = {}) {
-    if (this.#closing) {
-      return Promise.reject(new Error("Chat search provider is closing"));
-    }
-    const controls = { ...options };
-    const epoch = getChatPrivacyEpoch();
-    const revision = this.#redactions.size ? null : this.#privacyRevision;
-    const result = this.#pending.then(async () => {
-      controls.signal?.throwIfAborted();
-      await this.#reconcilePrivacy();
-      const page = await this.#index.search(text, controls);
-      await this.#reconcilePrivacy();
-      controls.signal?.throwIfAborted();
-      return page;
-    });
-    this.#pending = result.then(
-      () => {},
-      () => {}
-    );
-    return result.then(async page => {
-      await this.#waitForRedactions(controls.signal);
-      if (
-        revision !== this.#privacyRevision ||
-        epoch !== getChatPrivacyEpoch()
-      ) {
-        throw new Error("Chat privacy changed during search");
+  search(text, options = {}, migrationWork = null) {
+    return this.#migration.run(work => {
+      options = {
+        ...options,
+        signal: AbortSignal.any([
+          this.#migration.deliverySignal,
+          ...(options.signal ? [options.signal] : []),
+        ]),
+      };
+      if (this.#closing) {
+        return Promise.reject(new Error("Chat search provider is closing"));
       }
-      if (
-        !Services.prefs.getBoolPref(
-          "mailnews.database.global.indexer.enabled",
-          false
-        )
-      ) {
-        return { ...page, items: [], cursor: null };
-      }
-      return page;
-    });
+      const controls = { ...options };
+      const epoch = lazy.getChatPrivacyEpoch();
+      const revision = this.#redactions.size ? null : this.#privacyRevision;
+      const result = this.#enqueue(async () => {
+        controls.signal?.throwIfAborted();
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+        const page = await this.#migration.wait(() =>
+          this.#index.search(text, controls)
+        );
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+        controls.signal?.throwIfAborted();
+        return page;
+      }, work);
+      return result.then(async page => {
+        await this.#migration.wait(() =>
+          this.#waitForRedactions(controls.signal)
+        );
+        if (
+          revision !== this.#privacyRevision ||
+          epoch !== lazy.getChatPrivacyEpoch()
+        ) {
+          throw new Error("Chat privacy changed during search");
+        }
+        if (
+          !Services.prefs.getBoolPref(
+            "mailnews.database.global.indexer.enabled",
+            false
+          )
+        ) {
+          return { ...page, items: [], cursor: null };
+        }
+        return page;
+      });
+    }, migrationWork);
   }
 
   /**
@@ -809,123 +954,139 @@ export class ChatSearchProvider {
    *   Ready objects, or deleted/ineligible/stale without substitute content.
    * @throws {TypeError} For an incomplete or noncanonical transcript token.
    * @throws {Error} Source I/O/parser errors, logger/cancellation failures, or closing provider.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  resolveLog(hit, { signal } = {}) {
-    const request = {
-      id: hit?.id,
-      contentRevision: hit?.contentRevision,
-      textRevision: hit?.textRevision,
-    };
-    if (
-      Object.values(request).some(value => typeof value != "string" || !value)
-    ) {
-      throw new TypeError("A current chat search hit is required");
-    }
-    const filePath = logPath(request.id);
-    const revision = this.#redactions.size ? null : this.#privacyRevision;
-    const epoch = getChatPrivacyEpoch();
-    if (this.#closing) {
-      return Promise.reject(new Error("Chat search provider is closing"));
-    }
-    const resolve = async () => {
-      signal?.throwIfAborted();
-      const state = await this.resolveDocument(request.id, { signal });
-      signal?.throwIfAborted();
-      if (!state) {
-        return { status: "deleted" };
-      }
-      if (!state.eligible) {
-        return { status: "ineligible" };
-      }
-      if (state.contentRevision !== request.contentRevision) {
-        return { status: "stale" };
-      }
-      const text = await this.#index.getText(request.id, { signal });
-      signal?.throwIfAborted();
+  resolveLog(hit, { signal } = {}, migrationWork = null) {
+    return this.#migration.run(work => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      const request = {
+        id: hit?.id,
+        contentRevision: hit?.contentRevision,
+        textRevision: hit?.textRevision,
+      };
       if (
-        !text ||
-        text.textRevision !== request.textRevision ||
-        text.contentRevision !== request.contentRevision
+        Object.values(request).some(value => typeof value != "string" || !value)
       ) {
-        return { status: "stale" };
+        throw new TypeError("A current chat search hit is required");
       }
-      const source = await readSource(filePath, signal);
-      if (source.revision !== request.contentRevision) {
-        return { status: "stale" };
+      const filePath = logPath(request.id);
+      const revision = this.#redactions.size ? null : this.#privacyRevision;
+      const epoch = lazy.getChatPrivacyEpoch();
+      if (this.#closing) {
+        return Promise.reject(new Error("Chat search provider is closing"));
       }
-      let parsed;
-      try {
-        parsed = await readLogConversation(filePath, source, signal);
-      } catch (error) {
-        if (!(error instanceof IncompleteChatTranscriptError)) {
+      const resolve = async () => {
+        signal?.throwIfAborted();
+        const state = await this.#migration.wait(() =>
+          this.#resolveDocument(request.id, { signal })
+        );
+        signal?.throwIfAborted();
+        if (!state) {
+          return { status: "deleted" };
+        }
+        if (!state.eligible) {
+          return { status: "ineligible" };
+        }
+        if (state.contentRevision !== request.contentRevision) {
+          return { status: "stale" };
+        }
+        const text = await this.#migration.wait(() =>
+          this.#index.getText(request.id, { signal })
+        );
+        signal?.throwIfAborted();
+        if (
+          !text ||
+          text.textRevision !== request.textRevision ||
+          text.contentRevision !== request.contentRevision
+        ) {
+          return { status: "stale" };
+        }
+        const source = await this.#migration.wait(() =>
+          readSource(filePath, signal, this.#archive)
+        );
+        if (source.revision !== request.contentRevision) {
+          return { status: "stale" };
+        }
+        let parsed;
+        try {
+          parsed = await this.#migration.wait(() =>
+            readLogConversation(filePath, source, signal, this.#archive)
+          );
+        } catch (error) {
+          if (!(error instanceof IncompleteChatTranscriptError)) {
+            throw error;
+          }
+          let current;
+          try {
+            current = await this.#migration.wait(() =>
+              this.#resolveDocument(request.id, { signal })
+            );
+          } catch (readError) {
+            signal?.throwIfAborted();
+            this.#rememberMigrationFailure(error);
+            this.#rememberMigrationFailure(readError);
+            throw error;
+          }
+          signal?.throwIfAborted();
+          if (!current) {
+            return { status: "deleted" };
+          }
+          if (!current.eligible) {
+            return { status: "ineligible" };
+          }
+          if (current.contentRevision !== request.contentRevision) {
+            return { status: "stale" };
+          }
           throw error;
         }
-        let current;
-        try {
-          current = await this.resolveDocument(request.id, { signal });
-        } catch (readError) {
-          signal?.throwIfAborted();
-          throw new AggregateError(
-            [error, readError],
-            "Could not validate the changed transcript"
+        const { log, conversation, hasNoLogRecords } = parsed;
+        if (hasNoLogRecords) {
+          return { status: "ineligible" };
+        }
+        if (log.path !== filePath) {
+          throw new Error(
+            "Chat logger returned a different physical transcript"
           );
         }
+        const current = await this.#migration.wait(() =>
+          this.#resolveDocument(request.id, { signal })
+        );
         signal?.throwIfAborted();
         if (!current) {
           return { status: "deleted" };
         }
-        if (!current.eligible) {
+        if (
+          !current.eligible ||
+          !Services.prefs.getBoolPref(
+            "mailnews.database.global.indexer.enabled",
+            false
+          )
+        ) {
           return { status: "ineligible" };
         }
         if (current.contentRevision !== request.contentRevision) {
           return { status: "stale" };
         }
-        throw error;
-      }
-      const { log, conversation, hasNoLogRecords } = parsed;
-      if (hasNoLogRecords) {
-        return { status: "ineligible" };
-      }
-      if (log.path !== filePath) {
-        throw new Error("Chat logger returned a different physical transcript");
-      }
-      const current = await this.resolveDocument(request.id, { signal });
-      signal?.throwIfAborted();
-      if (!current) {
-        return { status: "deleted" };
-      }
-      if (
-        !current.eligible ||
-        !Services.prefs.getBoolPref(
-          "mailnews.database.global.indexer.enabled",
-          false
-        )
-      ) {
-        return { status: "ineligible" };
-      }
-      if (current.contentRevision !== request.contentRevision) {
-        return { status: "stale" };
-      }
-      return { status: "ready", ...request, log, conversation };
-    };
-    const result = this.#pending.then(async () => {
-      signal?.throwIfAborted();
-      await this.#reconcilePrivacy();
-      const resolved = await resolve();
-      await this.#reconcilePrivacy();
-      return resolved;
-    });
-    this.#pending = result.then(
-      () => {},
-      () => {}
-    );
-    return result.then(async resolved => {
-      await this.#waitForRedactions(signal);
-      return revision === this.#privacyRevision &&
-        epoch === getChatPrivacyEpoch()
-        ? resolved
-        : { status: "stale" };
-    });
+        return { status: "ready", ...request, log, conversation };
+      };
+      const result = this.#enqueue(async () => {
+        signal?.throwIfAborted();
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+        const resolved = await this.#migration.wait(() => resolve());
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+        return resolved;
+      }, work);
+      return result.then(async resolved => {
+        await this.#migration.wait(() => this.#waitForRedactions(signal));
+        return revision === this.#privacyRevision &&
+          epoch === lazy.getChatPrivacyEpoch()
+          ? resolved
+          : { status: "stale" };
+      });
+    }, migrationWork);
   }
 
   /**
@@ -936,28 +1097,42 @@ export class ChatSearchProvider {
    * @param {string} id - Canonical log identity.
    * @param {object} [options={}] - Existing index cancellation options.
    * @returns {Promise<?SearchDocument>} Current text, or null if stale/ineligible.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  getText(id, options = {}) {
-    logPath(id);
-    if (this.#closing) {
-      return Promise.reject(new Error("Chat search provider is closing"));
-    }
-    const revision = this.#redactions.size ? null : this.#privacyRevision;
-    const epoch = getChatPrivacyEpoch();
-    const result = this.#enqueue(async () => {
-      options.signal?.throwIfAborted();
-      await this.#reconcilePrivacy();
-      const text = await this.#index.getText(id, options);
-      await this.#reconcilePrivacy();
-      return text;
-    });
-    return result.then(async text => {
-      await this.#waitForRedactions(options.signal);
-      return revision === this.#privacyRevision &&
-        epoch === getChatPrivacyEpoch()
-        ? text
-        : null;
-    });
+  getText(id, options = {}, migrationWork = null) {
+    return this.#migration.run(work => {
+      options = {
+        ...options,
+        signal: AbortSignal.any([
+          this.#migration.deliverySignal,
+          ...(options.signal ? [options.signal] : []),
+        ]),
+      };
+      logPath(id);
+      if (this.#closing) {
+        return Promise.reject(new Error("Chat search provider is closing"));
+      }
+      const revision = this.#redactions.size ? null : this.#privacyRevision;
+      const epoch = lazy.getChatPrivacyEpoch();
+      const result = this.#enqueue(async () => {
+        options.signal?.throwIfAborted();
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+        const text = await this.#migration.wait(() =>
+          this.#index.getText(id, options)
+        );
+        await this.#migration.wait(() => this.#reconcilePrivacy());
+        return text;
+      }, work);
+      return result.then(async text => {
+        await this.#migration.wait(() =>
+          this.#waitForRedactions(options.signal)
+        );
+        return revision === this.#privacyRevision &&
+          epoch === lazy.getChatPrivacyEpoch()
+          ? text
+          : null;
+      });
+    }, migrationWork);
   }
 
   /**
@@ -966,27 +1141,70 @@ export class ChatSearchProvider {
    * with the original error, or both errors if storage close also fails.
    *
    * @returns {Promise<void>} Resolves after storage closes.
-   * @throws {Error} Original privacy/storage failure, or both in AggregateError.
+   * @throws {Error} First original privacy/storage failure; later errors are retained.
    */
   close() {
-    this.#closing ??= (async () => {
+    this.#closing ??= this.#migration.finish(async () => {
+      const errors = [];
       try {
         await this.#waitForRedactions();
       } catch (error) {
-        try {
-          await this.#pending;
-          await this.#index.close();
-        } catch (closeError) {
-          throw new AggregateError(
-            [error, closeError],
-            "Chat privacy and storage close failed"
-          );
-        }
-        throw error;
+        errors.push(error);
       }
-      await this.#pending;
-      await this.#index.close();
-    })();
+      try {
+        await this.#pending;
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await this.#index?.close();
+        if (this.#index) {
+          this.#storageTerminal = true;
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+      for (const error of errors) {
+        this.#rememberMigrationFailure(error);
+      }
+      if (errors.length) {
+        throw errors[0];
+      }
+    });
     return this.#closing;
+  }
+
+  async #resolveDocument(id, { signal, archive = this.#archive } = {}) {
+    this.#migration.check();
+    const filePath = logPath(id);
+    signal?.throwIfAborted();
+    try {
+      const source = await this.#migration.wait(() =>
+        readSource(filePath, signal, archive)
+      );
+      if (
+        !Services.prefs.getBoolPref(
+          "mailnews.database.global.indexer.enabled",
+          false
+        )
+      ) {
+        return { eligible: false };
+      }
+      // The logger has no incarnation counter; exact bytes carry its revision.
+      return {
+        eligible: true,
+        generation: 0,
+        policyRevision: 0,
+        contentRevision: source.revision,
+        location: null,
+        originalContentAvailable: true,
+      };
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (error.name == "NotFoundError") {
+        return null;
+      }
+      throw error;
+    }
   }
 }

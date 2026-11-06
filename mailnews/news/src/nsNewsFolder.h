@@ -104,6 +104,7 @@ class nsMsgNewsFolder : public nsMsgDBFolder, public nsIMsgNewsFolder {
   nsresult CreateSubFolders(nsIFile* path);
   nsresult AddDirectorySeparator(nsIFile* path);
   nsresult GetDatabase() override;
+  static nsresult CheckMigrationWriterAdmission();
 
 #ifdef MOZ_PANORAMA
   nsresult GetNativeDatabase();

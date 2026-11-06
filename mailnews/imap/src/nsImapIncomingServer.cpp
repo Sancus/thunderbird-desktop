@@ -4,48 +4,54 @@
 
 #include "nsImapIncomingServer.h"
 
+#include "../public/nsIImapHostSessionList.h"
 #include "msgCore.h"
 #include "netCore.h"
-#include "../public/nsIImapHostSessionList.h"
 #include "nsFmtString.h"
+#include "nsIImapUrl.h"
 #include "nsIMsgAccountManager.h"
 #include "nsIMsgIdentity.h"
-#include "nsIImapUrl.h"
 #include "nsIUrlListener.h"
-#include "nsThreadUtils.h"
 #include "nsImapProtocol.h"
+#include "nsThreadUtils.h"
+#ifdef MOZ_PANORAMA
+#  include "ImapMigrationWriterLease.h"
+using mozilla::mailnews::CheckImapMigrationAdmission;
+using mozilla::mailnews::ImapMigrationWork;
+using mozilla::mailnews::ImapMigrationWorkKind;
+#endif
 #include "nsCOMPtr.h"
-#include "nsMsgFolderFlags.h"
-#include "prmem.h"
-#include "plstr.h"
+#include "nsICryptoHash.h"
+#include "nsIImapMockChannel.h"
+#include "nsIImapService.h"
 #include "nsIMsgFolder.h"
+#include "nsIMsgMailNewsUrl.h"
 #include "nsIMsgWindow.h"
 #include "nsIWindowMediator.h"
 #include "nsImapMailFolder.h"
-#include "nsIMsgMailNewsUrl.h"
-#include "nsIImapService.h"
+#include "nsMsgFolderFlags.h"
 #include "nsMsgI18N.h"
-#include "nsIImapMockChannel.h"
-#include "nsICryptoHash.h"
+#include "plstr.h"
+#include "prmem.h"
 // for the memory cache...
-#include "nsICacheEntry.h"
-#include "nsImapUrl.h"
-#include "nsIMsgMailSession.h"
-#include "nsImapNamespace.h"
-#include "nsMsgUtils.h"
 #include "UrlListener.h"
-#include "nsServiceManagerUtils.h"
-#include "nsComponentManagerUtils.h"
 #include "mozilla/Components.h"
-#include "nsNetUtil.h"
-#include "nsIPrompt.h"
-#include "nsEmbedCID.h"
-#include "nsIPromptService.h"
-#include "mozilla/Utf8.h"
 #include "mozilla/LoadInfo.h"
 #include "mozilla/ResultExtensions.h"
+#include "mozilla/Utf8.h"
+#include "nsComponentManagerUtils.h"
+#include "nsEmbedCID.h"
+#include "nsICacheEntry.h"
+#include "nsIMsgMailSession.h"
 #include "nsINetUtil.h"
+#include "nsIPrompt.h"
+#include "nsIPromptService.h"
+#include "nsImapNamespace.h"
+#include "nsImapUrl.h"
+#include "nsMsgUtils.h"
 #include "nsNSSComponent.h"
+#include "nsNetUtil.h"
+#include "nsServiceManagerUtils.h"
 
 #ifdef MOZ_PANORAMA
 #  include "mozilla/StaticPrefs_mail.h"
@@ -177,9 +183,15 @@ nsImapIncomingServer::nsImapIncomingServer()
   m_userAuthenticated = false;
   m_shuttingDown = false;
   mUtf8AcceptEnabled = false;
+#ifdef MOZ_PANORAMA
+  mozilla::mailnews::TrackImapMigrationServer(this);
+#endif
 }
 
 nsImapIncomingServer::~nsImapIncomingServer() {
+#ifdef MOZ_PANORAMA
+  mozilla::mailnews::UntrackImapMigrationServer(this);
+#endif
   mozilla::DebugOnly<nsresult> rv = ClearInner();
   NS_ASSERTION(NS_SUCCEEDED(rv), "ClearInner failed");
   CloseCachedConnections();
@@ -188,6 +200,9 @@ nsImapIncomingServer::~nsImapIncomingServer() {
 NS_IMETHODIMP nsImapIncomingServer::SetKey(
     const nsACString& aKey)  // override nsMsgIncomingServer's implementation...
 {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   nsMsgIncomingServer::SetKey(aKey);
 
   // okay now that the key has been set, we need to add ourselves to the
@@ -498,10 +513,22 @@ NS_IMPL_SERVERPREF_BOOL(nsImapIncomingServer, SendID, "send_client_info")
 NS_IMETHODIMP
 nsImapIncomingServer::GetImapConnectionAndLoadUrl(nsIImapUrl* aImapUrl,
                                                   nsISupports* aConsumer) {
+#ifdef MOZ_PANORAMA
+  RefPtr<ImapMigrationWork> queuedWork =
+      MOZ_TRY(ImapMigrationWork::AdmitUrl(aImapUrl));
+#endif
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   nsCOMPtr<nsIImapProtocol> aProtocol;
 
   nsresult rv = GetImapConnection(aImapUrl, getter_AddRefs(aProtocol));
-  NS_ENSURE_SUCCESS(rv, rv);
+  if (NS_FAILED(rv)) {
+#ifdef MOZ_PANORAMA
+    queuedWork->Complete(rv);
+#endif
+    return rv;
+  }
 
   nsCOMPtr<nsIMsgMailNewsUrl> mailnewsurl = do_QueryInterface(aImapUrl, &rv);
   if (aProtocol) {
@@ -509,7 +536,8 @@ nsImapIncomingServer::GetImapConnectionAndLoadUrl(nsIImapUrl* aImapUrl,
     // *** jt - in case of the time out situation or the connection gets
     // terminated by some unforeseen problems let's give it a second chance
     // to run the url
-    if (NS_FAILED(rv) && rv != NS_ERROR_ILLEGAL_VALUE) {
+    if (NS_FAILED(rv) && rv != NS_ERROR_ILLEGAL_VALUE &&
+        rv != NS_ERROR_NOT_AVAILABLE) {
       rv = aProtocol->LoadImapUrl(mailnewsurl, aConsumer);
     }
   } else {  // unable to get an imap connection to run the url; add to the url
@@ -524,6 +552,9 @@ nsImapIncomingServer::GetImapConnectionAndLoadUrl(nsIImapUrl* aImapUrl,
     bool urlRun;
     rv = LoadNextQueuedUrl(nullptr, &urlRun);
   }
+#ifdef MOZ_PANORAMA
+  if (NS_FAILED(rv)) queuedWork->Complete(rv);
+#endif
   return rv;
 }
 
@@ -538,6 +569,13 @@ nsImapIncomingServer::PrepareToRetryUrl(nsIImapUrl* aImapUrl,
 
 NS_IMETHODIMP
 nsImapIncomingServer::SuspendUrl(nsIImapUrl* aImapUrl) {
+#ifdef MOZ_PANORAMA
+  RefPtr<ImapMigrationWork> queuedWork =
+      MOZ_TRY(ImapMigrationWork::AdmitUrl(aImapUrl));
+#endif
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   NS_ENSURE_ARG_POINTER(aImapUrl);
   nsImapProtocol::LogImapUrl("suspending url", aImapUrl);
   PR_CEnterMonitor(this);
@@ -550,6 +588,9 @@ nsImapIncomingServer::SuspendUrl(nsIImapUrl* aImapUrl) {
 NS_IMETHODIMP
 nsImapIncomingServer::RetryUrl(nsIImapUrl* aImapUrl,
                                nsIImapMockChannel* aChannel) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   nsresult rv;
   // Get current thread event queue
   aImapUrl->SetMockChannel(aChannel);
@@ -575,6 +616,11 @@ nsImapIncomingServer::RetryUrl(nsIImapUrl* aImapUrl,
 NS_IMETHODIMP
 nsImapIncomingServer::LoadNextQueuedUrl(nsIImapProtocol* aProtocol,
                                         bool* aResult) {
+#ifdef MOZ_PANORAMA
+  if (aResult) *aResult = false;
+  // An active drain cancels owned queued requests itself, outside server locks.
+  if (mozilla::mailnews::ImapMigrationDrainActive()) return NS_OK;
+#endif
   if (m_hasShutDown) return NS_ERROR_FAILURE;
   if (WeAreOffline()) return NS_MSG_ERROR_OFFLINE;
 
@@ -661,6 +707,54 @@ nsImapIncomingServer::AbortQueuedUrls() {
   return rv;
 }
 
+#ifdef MOZ_PANORAMA
+nsresult nsImapIncomingServer::CancelMigrationQueuedUrls() {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsCOMArray<nsIImapUrl> urls;
+  nsTArray<nsISupports*> consumers;
+  {
+    MutexAutoLock lock(mLock);
+    PR_CEnterMonitor(this);
+    urls.SwapElements(m_urlQueue);
+    consumers.SwapElements(m_urlConsumers);
+    PR_CExitMonitor(this);
+  }
+  nsresult first = NS_OK;
+  for (int32_t i = 0; i < urls.Count(); ++i) {
+    nsCOMPtr<nsISupports> consumer = dont_AddRef(consumers[i]);
+    RefPtr<ImapMigrationWork> work = ImapMigrationWork::FindUrl(urls[i]);
+    if (work) work->RecordError(NS_BINDING_ABORTED);
+    auto record = [&](nsresult rv) {
+      if (work) work->RecordError(rv);
+      if (NS_SUCCEEDED(first) && NS_FAILED(rv)) first = rv;
+    };
+    nsCOMPtr<nsIImapMockChannel> channel;
+    nsresult rv = urls[i]->GetMockChannel(getter_AddRefs(channel));
+    record(rv);
+    if (channel) {
+      rv = channel->Cancel(NS_BINDING_ABORTED);
+      record(rv);
+      nsCOMPtr<nsIStreamListener> listener;
+      rv = channel->GetChannelListener(getter_AddRefs(listener));
+      record(rv);
+      if (listener) {
+        rv = listener->OnStopRequest(channel, NS_BINDING_ABORTED);
+        record(rv);
+      }
+      rv = channel->Close();
+      record(rv);
+    }
+    nsCOMPtr<nsIMsgMailNewsUrl> url = do_QueryInterface(urls[i]);
+    if (url) {
+      rv = url->SetUrlState(false, NS_BINDING_ABORTED);
+      record(rv);
+    }
+    ImapMigrationWork::CompleteUrl(urls[i], NS_BINDING_ABORTED, rv);
+  }
+  return first;
+}
+#endif
+
 // if this url has a channel with an error, doom it and its mem cache entries,
 // and notify url listeners.
 nsresult nsImapIncomingServer::DoomUrlIfChannelHasError(nsIImapUrl* aImapUrl,
@@ -732,6 +826,9 @@ bool nsImapIncomingServer::ConnectionTimeOut(nsIImapProtocol* aConnection) {
 
 nsresult nsImapIncomingServer::GetImapConnection(
     nsIImapUrl* aImapUrl, nsIImapProtocol** aImapConnection) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   NS_ENSURE_ARG_POINTER(aImapUrl);
 
   nsresult rv = NS_OK;
@@ -824,6 +921,9 @@ nsresult nsImapIncomingServer::GetImapConnection(
 
 nsresult nsImapIncomingServer::CreateProtocolInstance(
     nsIImapProtocol** aImapConnection) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   // create a new connection and add it to the connection cache
   // we may need to flag the protocol connection as busy so we don't get
   // a race condition where someone else goes through this code
@@ -861,8 +961,8 @@ nsresult nsImapIncomingServer::CreateProtocolInstance(
   return rv;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::CloseConnectionForFolder(
-    nsIMsgFolder* aMsgFolder) {
+NS_IMETHODIMP
+nsImapIncomingServer::CloseConnectionForFolder(nsIMsgFolder* aMsgFolder) {
   nsresult rv = NS_OK;
   nsCOMPtr<nsIImapProtocol> connection;
   bool isBusy = false, isInbox = false;
@@ -895,8 +995,8 @@ NS_IMETHODIMP nsImapIncomingServer::CloseConnectionForFolder(
   return rv;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::ResetConnection(
-    const nsACString& folderName) {
+NS_IMETHODIMP
+nsImapIncomingServer::ResetConnection(const nsACString& folderName) {
   nsresult rv = NS_OK;
   nsCOMPtr<nsIImapProtocol> connection;
   bool isBusy = false, isInbox = false;
@@ -1003,9 +1103,10 @@ nsImapIncomingServer::CloseCachedConnections() {
 // nsIImapServerSink impl
 // aNewFolder will not be set if we're listing for the subscribe UI, since
 // that's the way 4.x worked.
-NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
-    const nsACString& folderPath, char hierarchyDelimiter, int32_t boxFlags,
-    bool* aNewFolder) {
+NS_IMETHODIMP
+nsImapIncomingServer::PossibleImapMailbox(const nsACString& folderPath,
+                                          char hierarchyDelimiter,
+                                          int32_t boxFlags, bool* aNewFolder) {
   NS_ENSURE_ARG_POINTER(aNewFolder);
   NS_ENSURE_TRUE(!folderPath.IsEmpty(), NS_ERROR_FAILURE);
 
@@ -1240,9 +1341,10 @@ NS_IMETHODIMP nsImapIncomingServer::PossibleImapMailbox(
   return updateResult;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::AddFolderRights(
-    const nsACString& mailboxName, const nsACString& userName,
-    const nsACString& rights) {
+NS_IMETHODIMP
+nsImapIncomingServer::AddFolderRights(const nsACString& mailboxName,
+                                      const nsACString& userName,
+                                      const nsACString& rights) {
   nsCOMPtr<nsIMsgFolder> rootFolder;
   nsresult rv = GetRootFolder(getter_AddRefs(rootFolder));
   if (NS_SUCCEEDED(rv) && rootFolder) {
@@ -1258,8 +1360,9 @@ NS_IMETHODIMP nsImapIncomingServer::AddFolderRights(
   return rv;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::FolderNeedsACLInitialized(
-    const nsACString& folderPath, bool* aNeedsACLInitialized) {
+NS_IMETHODIMP
+nsImapIncomingServer::FolderNeedsACLInitialized(const nsACString& folderPath,
+                                                bool* aNeedsACLInitialized) {
   NS_ENSURE_ARG_POINTER(aNeedsACLInitialized);
   nsCOMPtr<nsIMsgFolder> rootFolder;
   nsresult rv = GetRootFolder(getter_AddRefs(rootFolder));
@@ -1281,8 +1384,8 @@ NS_IMETHODIMP nsImapIncomingServer::FolderNeedsACLInitialized(
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::RefreshFolderRights(
-    const nsACString& folderPath) {
+NS_IMETHODIMP
+nsImapIncomingServer::RefreshFolderRights(const nsACString& folderPath) {
   nsCOMPtr<nsIMsgFolder> rootFolder;
   nsresult rv = GetRootFolder(getter_AddRefs(rootFolder));
   if (NS_SUCCEEDED(rv) && rootFolder) {
@@ -1320,19 +1423,20 @@ nsresult nsImapIncomingServer::GetFolder(const nsACString& name,
   return rv;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::OnlineFolderDelete(
-    const nsACString& aFolderName) {
+NS_IMETHODIMP
+nsImapIncomingServer::OnlineFolderDelete(const nsACString& aFolderName) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::OnlineFolderCreateFailed(
-    const nsACString& aFolderName) {
+NS_IMETHODIMP
+nsImapIncomingServer::OnlineFolderCreateFailed(const nsACString& aFolderName) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::OnlineFolderRename(
-    nsIMsgWindow* msgWindow, const nsACString& oldName,
-    const nsACString& newName) {
+NS_IMETHODIMP
+nsImapIncomingServer::OnlineFolderRename(nsIMsgWindow* msgWindow,
+                                         const nsACString& oldName,
+                                         const nsACString& newName) {
   nsresult rv = NS_ERROR_FAILURE;
   if (!newName.IsEmpty()) {
     nsCOMPtr<nsIMsgFolder> me;
@@ -1400,8 +1504,9 @@ NS_IMETHODIMP nsImapIncomingServer::OnlineFolderRename(
   return rv;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::FolderIsNoSelect(
-    const nsACString& aFolderName, bool* result) {
+NS_IMETHODIMP
+nsImapIncomingServer::FolderIsNoSelect(const nsACString& aFolderName,
+                                       bool* result) {
   NS_ENSURE_ARG_POINTER(result);
   nsCOMPtr<nsIMsgFolder> msgFolder;
   nsresult rv = GetFolder(aFolderName, getter_AddRefs(msgFolder));
@@ -1414,8 +1519,9 @@ NS_IMETHODIMP nsImapIncomingServer::FolderIsNoSelect(
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::FolderVerifiedOnline(
-    const nsACString& folderName, bool* aResult) {
+NS_IMETHODIMP
+nsImapIncomingServer::FolderVerifiedOnline(const nsACString& folderName,
+                                           bool* aResult) {
   NS_ENSURE_ARG_POINTER(aResult);
   *aResult = false;
   nsCOMPtr<nsIMsgFolder> rootFolder;
@@ -1986,8 +2092,9 @@ nsImapIncomingServer::FEAlertWithName(const char* aMsgName,
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::FEAlertFromServer(
-    const nsACString& aServerString, nsIMsgMailNewsUrl* aUrl, bool forBye) {
+NS_IMETHODIMP
+nsImapIncomingServer::FEAlertFromServer(const nsACString& aServerString,
+                                        nsIMsgMailNewsUrl* aUrl, bool forBye) {
   NS_ENSURE_TRUE(!aServerString.IsEmpty(), NS_OK);
 
   nsCString message(aServerString);
@@ -2059,8 +2166,9 @@ NS_IMETHODIMP nsImapIncomingServer::FEAlertFromServer(
   return AlertUser(fullMessage, aUrl);
 }
 
-NS_IMETHODIMP nsImapIncomingServer::FEAlertCertError(
-    nsITransportSecurityInfo* securityInfo, nsIMsgMailNewsUrl* url) {
+NS_IMETHODIMP
+nsImapIncomingServer::FEAlertCertError(nsITransportSecurityInfo* securityInfo,
+                                       nsIMsgMailNewsUrl* url) {
   nsCOMPtr<nsIMsgMailSession> mailSession =
       mozilla::components::MailSession::Service();
   mailSession->AlertCertError(securityInfo, url, m_serverKey);
@@ -2282,8 +2390,8 @@ nsImapIncomingServer::PromptPassword(nsIMsgWindow* aMsgWindow,
 }
 
 // for the nsIImapServerSink interface
-NS_IMETHODIMP nsImapIncomingServer::SetCapability(
-    eIMAPCapabilityFlags capability) {
+NS_IMETHODIMP
+nsImapIncomingServer::SetCapability(eIMAPCapabilityFlags capability) {
   m_capability = capability;
   SetIsGMailServer((capability & kGmailImapCapability) != 0);
   return NS_OK;
@@ -2338,8 +2446,8 @@ NS_IMETHODIMP nsImapIncomingServer::ResetNamespaceReferences() {
   return rv;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::SetUserAuthenticated(
-    bool aUserAuthenticated) {
+NS_IMETHODIMP
+nsImapIncomingServer::SetUserAuthenticated(bool aUserAuthenticated) {
   m_userAuthenticated = aUserAuthenticated;
   if (aUserAuthenticated) {
     nsCOMPtr<nsIMsgAccountManager> accountManager =
@@ -2349,8 +2457,8 @@ NS_IMETHODIMP nsImapIncomingServer::SetUserAuthenticated(
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::GetUserAuthenticated(
-    bool* aUserAuthenticated) {
+NS_IMETHODIMP
+nsImapIncomingServer::GetUserAuthenticated(bool* aUserAuthenticated) {
   NS_ENSURE_ARG_POINTER(aUserAuthenticated);
   *aUserAuthenticated = m_userAuthenticated;
   return NS_OK;
@@ -2358,9 +2466,10 @@ NS_IMETHODIMP nsImapIncomingServer::GetUserAuthenticated(
 
 /* void SetMailServerUrls (in string manageMailAccount, in string manageLists,
  * in string manageFilters); */
-NS_IMETHODIMP nsImapIncomingServer::SetMailServerUrls(
-    const nsACString& manageMailAccount, const nsACString& manageLists,
-    const nsACString& manageFilters) {
+NS_IMETHODIMP
+nsImapIncomingServer::SetMailServerUrls(const nsACString& manageMailAccount,
+                                        const nsACString& manageLists,
+                                        const nsACString& manageFilters) {
   return SetManageMailAccountUrl(manageMailAccount);
 }
 
@@ -2985,8 +3094,8 @@ NS_IMETHODIMP nsImapIncomingServer::GetTrashFolderName(nsACString& retval) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapIncomingServer::SetTrashFolderName(
-    const nsACString& chvalue) {
+NS_IMETHODIMP
+nsImapIncomingServer::SetTrashFolderName(const nsACString& chvalue) {
   // Clear trash flag from the old pref.
   // Despite its name, this returns the trash folder path, for example
   // INBOX/Trash.

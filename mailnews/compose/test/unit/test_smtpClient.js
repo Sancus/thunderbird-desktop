@@ -567,3 +567,89 @@ add_task(async function testSplitReply() {
   );
   Assert.equal(client._parseRemainder, "", "nothing should be left pending");
 });
+
+const { AppConstants: migrationAppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+const { MockRegistrar: migrationMockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
+/**
+ * Rejects service lookup to test refusal before a caller's first side effect.
+ * This fixture never supplies native selection or claims a Held lease.
+ *
+ * @param {function(nsIException): Promise<void>} task - Refusal assertions.
+ * @returns {Promise<void>} Resolves after restoring the real native service.
+ */
+async function withMigrationGateFailure(task) {
+  const error = Components.Exception(
+    "Migration gate service lookup failed",
+    Cr.NS_ERROR_FILE_ACCESS_DENIED
+  );
+  const cid = migrationMockRegistrar.register(
+    "@mozilla.org/mailnews/migration-writer-lease;1",
+    () => {
+      throw error;
+    }
+  );
+  try {
+    await task(error);
+  } finally {
+    migrationMockRegistrar.unregister(cid);
+  }
+}
+
+/**
+ * Checks sticky native history in this already initialized ordinary fixture.
+ *
+ * @param {string} domain - One fixed native writer domain.
+ */
+function assertMigrationWriterStarted(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), 1);
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "An initialized or previously used writer cannot certify NeverStarted"
+  );
+}
+
+add_task(async function test_snapshotAdmissionRejectsDirectSMTPAndLateRetry() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const { SmtpClient } = ChromeUtils.importESModule("resource:///modules/SmtpClient.sys.mjs");
+  const smtp = getBasicSmtpServer(server.port);
+  const client = new SmtpClient(smtp);
+  const socket = client.socket;
+  const completion = Promise.withResolvers();
+  let notified = 0;
+  let freed = 0;
+  client.onerror = status => {
+    ++notified;
+    completion.resolve(status);
+  };
+  client.onFree = () => ++freed;
+  await withMigrationGateFailure(async original => {
+    Assert.throws(() => new SmtpClient(smtp), error => error.result == original.result);
+    Assert.throws(() => client.connect(), error => error.result == original.result);
+    Assert.throws(() => client.useEnvelope({}), error => error.result == original.result);
+    await Assert.rejects(client._authenticateUser(false), error => error.result == original.result);
+    // The real HELO callback does not await its authentication Promise.
+    client._actionHELO({ success: true });
+    Assert.equal(await completion.promise, original.result);
+  });
+  Assert.equal(notified, 1);
+  Assert.equal(freed, 1);
+  Assert.strictEqual(client.socket, socket);
+  client.close(true);
+  assertMigrationWriterStarted("smtp");
+});

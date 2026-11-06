@@ -12,6 +12,12 @@ import {
   isMigrationPhysicalIdentity,
 } from "resource:///modules/panorama/MigrationSource.sys.mjs";
 
+import {
+  selectedMigrationIO,
+  selectedMigrationCopy,
+  validateSelectedMigrationView,
+} from "resource:///modules/panorama/MigrationQuiescence.sys.mjs";
+
 const BACKUP_VERSION = AppConstants.platform == "win" ? 3 : 1;
 const PROFILE_LOCKS = new Set(["parent.lock", ".parentlock", "lock"]);
 
@@ -87,14 +93,20 @@ export function captureWindowsMigrationRoots(paths) {
  * @param {string[]} mailPaths - All configured mail-store directories.
  * @param {string} backupPath - Backup outside all source trees; parent exists.
  * @param {AbortSignal} [signal] - Stop at a file boundary, keeping incomplete copies.
+ * @param {nsISupports} [nativeView] - Actual native selected view; when supplied,
+ *   every awaited operation is validated before IO and after settlement.
  * @returns {Promise<{path: string, sha256: string}>} Verified complete manifest.
  */
 export async function createMigrationBackup(
   profilePath,
   mailPaths,
   backupPath,
-  signal
+  signal,
+  nativeView
 ) {
+  if (nativeView) {
+    validateSelectedMigrationView(nativeView, "before-source-read");
+  }
   checkCancellation(signal);
   const originalRoots =
     AppConstants.platform == "win"
@@ -102,11 +114,19 @@ export async function createMigrationBackup(
       : null;
   const profile = physicalFile(profilePath);
   const backup = physicalFile(backupPath);
-  if (AppConstants.platform == "win" && (await IOUtils.exists(backup.path))) {
+  if (
+    AppConstants.platform == "win" &&
+    (await selectedMigrationIO(nativeView, () => IOUtils.exists(backup.path)))
+  ) {
     const existing = physicalFile(PathUtils.join(backup.path, "manifest.json"));
     if (
-      (await IOUtils.stat(existing.path)).type != "regular" ||
-      (await IOUtils.readJSON(existing.path)).version !== BACKUP_VERSION
+      (await selectedMigrationIO(nativeView, () => IOUtils.stat(existing.path)))
+        .type != "regular" ||
+      (
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.readJSON(existing.path)
+        )
+      ).version !== BACKUP_VERSION
     ) {
       throw new Error("Migration backup format cannot be resumed");
     }
@@ -135,7 +155,9 @@ export async function createMigrationBackup(
   }
   const roots = [];
   for (const [index, source] of sources.entries()) {
-    const info = await IOUtils.stat(source.path);
+    const info = await selectedMigrationIO(nativeView, () =>
+      IOUtils.stat(source.path)
+    );
     if (info.type != "directory") {
       throw new Error("Migration source root is not a directory");
     }
@@ -144,17 +166,26 @@ export async function createMigrationBackup(
       directory: "root-" + index,
       permissions: info.permissions,
       lastModified: info.lastModified,
-      ...(await inventory(source.path, index == 0, signal)),
+      ...(await selectedMigrationIO(nativeView, () =>
+        inventory(source.path, index == 0, signal, nativeView)
+      )),
     });
   }
   const manifestPath = PathUtils.join(backup.path, "manifest.json");
   let manifest;
-  if (await IOUtils.exists(backup.path)) {
+  if (
+    await selectedMigrationIO(nativeView, () => IOUtils.exists(backup.path))
+  ) {
     physicalFile(manifestPath);
-    if ((await IOUtils.stat(manifestPath)).type != "regular") {
+    if (
+      (await selectedMigrationIO(nativeView, () => IOUtils.stat(manifestPath)))
+        .type != "regular"
+    ) {
       throw new Error("Migration backup manifest is not a regular file");
     }
-    manifest = await IOUtils.readJSON(manifestPath);
+    manifest = await selectedMigrationIO(nativeView, () =>
+      IOUtils.readJSON(manifestPath)
+    );
     if (
       manifest.version != BACKUP_VERSION ||
       (originalRoots &&
@@ -167,7 +198,7 @@ export async function createMigrationBackup(
       );
     }
     if (manifest.complete === true) {
-      return verifyMigrationBackup(backup.path);
+      return verifyMigrationBackup(backup.path, nativeView);
     }
     if (manifest.complete !== false) {
       throw new Error("Invalid incomplete migration backup");
@@ -201,28 +232,36 @@ export async function createMigrationBackup(
       );
     }
     checkCancellation(signal);
-    await IOUtils.makeDirectory(backup.path, {
-      createAncestors: false,
-      ignoreExisting: false,
-      permissions: 0o700,
-    });
+    await selectedMigrationIO(nativeView, () =>
+      IOUtils.makeDirectory(backup.path, {
+        createAncestors: false,
+        ignoreExisting: false,
+        permissions: 0o700,
+      })
+    );
     manifest = {
       version: BACKUP_VERSION,
       complete: false,
       roots,
       ...(originalRoots ? { originalRoots } : {}),
     };
-    await IOUtils.writeJSON(manifestPath, manifest, {
-      mode: "create",
-      flush: true,
-    });
+    await selectedMigrationIO(nativeView, () =>
+      IOUtils.writeJSON(manifestPath, manifest, {
+        mode: "create",
+        flush: true,
+      })
+    );
   }
   const scratch = PathUtils.join(backup.path, "scratch");
-  await IOUtils.makeDirectory(scratch, { permissions: 0o700 });
+  await selectedMigrationIO(nativeView, () =>
+    IOUtils.makeDirectory(scratch, { permissions: 0o700 })
+  );
   physicalFile(scratch);
   for (const root of roots) {
     const destination = PathUtils.join(backup.path, root.directory);
-    await IOUtils.makeDirectory(destination, { permissions: 0o700 });
+    await selectedMigrationIO(nativeView, () =>
+      IOUtils.makeDirectory(destination, { permissions: 0o700 })
+    );
     physicalFile(destination);
     for (const entry of root.entries) {
       checkCancellation(signal);
@@ -231,14 +270,18 @@ export async function createMigrationBackup(
       physicalFile(source);
       physicalFile(target);
       if (entry.type == "directory") {
-        await IOUtils.makeDirectory(target, { permissions: 0o700 });
-      } else if (await IOUtils.exists(target)) {
-        await verifyFile(target, entry);
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.makeDirectory(target, { permissions: 0o700 })
+        );
+      } else if (
+        await selectedMigrationIO(nativeView, () => IOUtils.exists(target))
+      ) {
+        await selectedMigrationIO(nativeView, () =>
+          verifyFile(target, entry, nativeView)
+        );
       } else {
-        const temporary = await IOUtils.createUniqueFile(
-          scratch,
-          "copy-",
-          0o600
+        const temporary = await selectedMigrationIO(nativeView, () =>
+          IOUtils.createUniqueFile(scratch, "copy-", 0o600)
         );
         const lease =
           AppConstants.platform == "win"
@@ -255,30 +298,48 @@ export async function createMigrationBackup(
           ) {
             throw new Error("Migration source physical identity changed");
           }
-          await IOUtils.copy(source, temporary);
+          await selectedMigrationIO(nativeView, () =>
+            selectedMigrationCopy(nativeView, source, temporary)
+          );
           if (lease) {
             migrationPhysicalIdentity(lease);
           }
         } finally {
           lease?.close();
         }
-        await IOUtils.setPermissions(temporary, 0o600, false);
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.setPermissions(temporary, 0o600, false)
+        );
         // Flush the copied file without changing its contents.
-        await IOUtils.write(temporary, new Uint8Array(), {
-          mode: "append",
-          flush: true,
-        });
-        await verifyFile(temporary, entry);
-        await IOUtils.setModificationTime(temporary, entry.lastModified);
-        await IOUtils.setPermissions(temporary, entry.permissions, false);
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.write(temporary, new Uint8Array(), {
+            mode: "append",
+            flush: true,
+          })
+        );
+        await selectedMigrationIO(nativeView, () =>
+          verifyFile(temporary, entry, nativeView)
+        );
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.setModificationTime(temporary, entry.lastModified)
+        );
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.setPermissions(temporary, entry.permissions, false)
+        );
         checkCancellation(signal);
-        await IOUtils.move(temporary, target, { noOverwrite: true });
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.move(temporary, target, { noOverwrite: true })
+        );
       }
     }
   }
   for (const [index, root] of roots.entries()) {
     if (
-      JSON.stringify(await inventory(root.source, index == 0, signal)) !=
+      JSON.stringify(
+        await selectedMigrationIO(nativeView, () =>
+          inventory(root.source, index == 0, signal, nativeView)
+        )
+      ) !=
       JSON.stringify({
         entries: root.entries,
         excluded: root.excluded,
@@ -291,14 +352,21 @@ export async function createMigrationBackup(
     }
   }
   // Completion is published only after source and destination verification.
-  await verifyCopies(backup.path, manifest);
+  await selectedMigrationIO(nativeView, () =>
+    verifyCopies(backup.path, manifest, nativeView)
+  );
   checkCancellation(signal);
+  if (nativeView) {
+    validateSelectedMigrationView(nativeView, "before-publication");
+  }
   manifest.complete = true;
-  await IOUtils.writeJSON(manifestPath, manifest, {
-    tmpPath: manifestPath + ".tmp",
-    flush: true,
-  });
-  return verifyMigrationBackup(backup.path);
+  await selectedMigrationIO(nativeView, () =>
+    IOUtils.writeJSON(manifestPath, manifest, {
+      tmpPath: manifestPath + ".tmp",
+      flush: true,
+    })
+  );
+  return verifyMigrationBackup(backup.path, nativeView);
 }
 
 /**
@@ -306,9 +374,14 @@ export async function createMigrationBackup(
  * This also runs when resuming a journal, before any new destructive work.
  *
  * @param {string} backupPath - Completed backup directory.
+ * @param {nsISupports} [nativeView] - Actual selected view retained through IO.
  * @returns {Promise<{path: string, sha256: string}>} Manifest identity.
  */
-export async function verifyMigrationBackup(backupPath) {
+export async function verifyMigrationBackup(backupPath, nativeView) {
+  if (nativeView) {
+    validateSelectedMigrationView(nativeView, "before-source-read");
+  }
+
   const backup = physicalFile(backupPath);
   const path = PathUtils.join(backup.path, "manifest.json");
   const lease =
@@ -320,11 +393,18 @@ export async function verifyMigrationBackup(backupPath) {
       : null;
   try {
     physicalFile(path);
-    if ((await IOUtils.stat(path)).type != "regular") {
+    if (
+      (await selectedMigrationIO(nativeView, () => IOUtils.stat(path))).type !=
+      "regular"
+    ) {
       throw new Error("Migration backup manifest is not a regular file");
     }
-    const before = await hashMigrationFile(path);
-    const manifest = await IOUtils.readJSON(path);
+    const before = await selectedMigrationIO(nativeView, () =>
+      hashMigrationFile(path)
+    );
+    const manifest = await selectedMigrationIO(nativeView, () =>
+      IOUtils.readJSON(path)
+    );
     if (
       ![1, 2, 3].includes(manifest.version) ||
       (AppConstants.platform == "win" && ![2, 3].includes(manifest.version)) ||
@@ -379,8 +459,13 @@ export async function verifyMigrationBackup(backupPath) {
         throw new Error("Invalid original migration backup roots");
       }
     }
-    await verifyCopies(backup.path, manifest);
-    if (before != (await hashMigrationFile(path))) {
+    await selectedMigrationIO(nativeView, () =>
+      verifyCopies(backup.path, manifest, nativeView)
+    );
+    if (
+      before !=
+      (await selectedMigrationIO(nativeView, () => hashMigrationFile(path)))
+    ) {
       throw new Error("Migration backup manifest changed during verification");
     }
     return { path, sha256: before };
@@ -551,9 +636,14 @@ function physicalFile(path) {
  * @param {string} root - Directory to read.
  * @param {boolean} profile - Whether to exclude root-level profile locks.
  * @param {AbortSignal} [signal] - Stop without publishing backup completion.
+ * @param {nsISupports} [nativeView] - Actual selected view retained through IO.
  * @returns {Promise<{entries: object[], excluded: string[]}>} Stable inventory.
  */
-async function inventory(root, profile, signal) {
+async function inventory(root, profile, signal, nativeView) {
+  if (nativeView) {
+    validateSelectedMigrationView(nativeView, "before-source-read");
+  }
+
   const rootLease =
     AppConstants.platform == "win"
       ? admitWindowsMigrationPath(
@@ -567,7 +657,11 @@ async function inventory(root, profile, signal) {
     const pending = [{ path: root, parts: [] }];
     while (pending.length) {
       const current = pending.pop();
-      const children = (await IOUtils.getChildren(current.path)).sort();
+      const children = (
+        await selectedMigrationIO(nativeView, () =>
+          IOUtils.getChildren(current.path)
+        )
+      ).sort();
       for (const path of children) {
         checkCancellation(signal);
         const leaf = PathUtils.filename(path);
@@ -575,14 +669,17 @@ async function inventory(root, profile, signal) {
           const file = new FileUtils.File(path);
           if (
             file.isSymlink() ||
-            (await IOUtils.stat(path)).type == "regular"
+            (await selectedMigrationIO(nativeView, () => IOUtils.stat(path)))
+              .type == "regular"
           ) {
             excluded.push(leaf);
             continue;
           }
         }
         physicalFile(path);
-        const info = await IOUtils.stat(path);
+        const info = await selectedMigrationIO(nativeView, () =>
+          IOUtils.stat(path)
+        );
         const entry = {
           parts: [...current.parts, leaf],
           type: info.type,
@@ -606,8 +703,12 @@ async function inventory(root, profile, signal) {
             pending.push({ path, parts: entry.parts });
           } else if (info.type == "regular") {
             entry.size = info.size;
-            entry.sha256 = await hashMigrationFile(path);
-            const after = await IOUtils.stat(path);
+            entry.sha256 = await selectedMigrationIO(nativeView, () =>
+              hashMigrationFile(path)
+            );
+            const after = await selectedMigrationIO(nativeView, () =>
+              IOUtils.stat(path)
+            );
             if (
               after.size != info.size ||
               after.lastModified != info.lastModified
@@ -669,8 +770,19 @@ function childPath(root, parts) {
   return file.path;
 }
 
-/** @param {string} path - Copy path. @param {object} entry - Expected file. */
-async function verifyFile(path, entry) {
+/**
+ * Checks the copied bytes against the original entry.
+ *
+ * @param {string} path - Copy path.
+ * @param {object} entry - Expected size, hash and metadata.
+ * @param {nsISupports} [nativeView] - Actual selected view retained through IO.
+ * @returns {Promise<void>} Resolves after the exact copy is verified.
+ */
+async function verifyFile(path, entry, nativeView) {
+  if (nativeView) {
+    validateSelectedMigrationView(nativeView, "before-source-read");
+  }
+
   const lease =
     AppConstants.platform == "win"
       ? admitWindowsMigrationPath(
@@ -680,12 +792,15 @@ async function verifyFile(path, entry) {
       : null;
   try {
     physicalFile(path);
-    const info = await IOUtils.stat(path);
+    const info = await selectedMigrationIO(nativeView, () =>
+      IOUtils.stat(path)
+    );
     if (
       info.type != "regular" ||
       info.size != entry.size ||
       !/^[a-f0-9]{64}$/.test(entry.sha256) ||
-      (await hashMigrationFile(path)) != entry.sha256
+      (await selectedMigrationIO(nativeView, () => hashMigrationFile(path))) !=
+        entry.sha256
     ) {
       throw new Error("Migration backup file differs from its source");
     }
@@ -697,8 +812,19 @@ async function verifyFile(path, entry) {
   }
 }
 
-/** @param {string} path - Backup root. @param {object} manifest - Saved inventory. */
-async function verifyCopies(path, manifest) {
+/**
+ * Verifies every saved root and copied entry in the complete manifest.
+ *
+ * @param {string} path - Backup root.
+ * @param {object} manifest - Saved inventory.
+ * @param {nsISupports} [nativeView] - Actual selected view retained through IO.
+ * @returns {Promise<void>} Resolves after every declared copy is verified.
+ */
+async function verifyCopies(path, manifest, nativeView) {
+  if (nativeView) {
+    validateSelectedMigrationView(nativeView, "before-source-read");
+  }
+
   for (const [index, root] of manifest.roots.entries()) {
     if (
       root.directory != "root-" + index ||
@@ -712,7 +838,10 @@ async function verifyCopies(path, manifest) {
     }
     const directory = PathUtils.join(path, root.directory);
     physicalFile(directory);
-    if ((await IOUtils.stat(directory)).type != "directory") {
+    if (
+      (await selectedMigrationIO(nativeView, () => IOUtils.stat(directory)))
+        .type != "directory"
+    ) {
       throw new Error("Missing migration backup root");
     }
     const seen = new Set();
@@ -725,11 +854,16 @@ async function verifyCopies(path, manifest) {
       const target = childPath(directory, entry.parts);
       physicalFile(target);
       if (entry.type == "directory") {
-        if ((await IOUtils.stat(target)).type != "directory") {
+        if (
+          (await selectedMigrationIO(nativeView, () => IOUtils.stat(target)))
+            .type != "directory"
+        ) {
           throw new Error("Missing migration backup directory");
         }
       } else if (entry.type == "regular") {
-        await verifyFile(target, entry);
+        await selectedMigrationIO(nativeView, () =>
+          verifyFile(target, entry, nativeView)
+        );
       } else {
         throw new Error("Invalid migration backup entry");
       }
@@ -751,5 +885,281 @@ function validMetadata(entry) {
 function checkCancellation(signal) {
   if (signal?.aborted) {
     throw new DOMException("Migration backup cancelled", "AbortError");
+  }
+}
+
+/**
+ * Copies the native selected inventory into a fresh snapshot bundle.
+ * Directory backups retain their existing manifest/restore format. External
+ * metadata leaves outside those directories are copied individually; an absent
+ * leaf is recorded without copying its parent or unrelated siblings.
+ *
+ * @param {object} inventory - Exact native inventory-json value.
+ * @param {string} backupPath - Fresh bundle path outside all selected sources.
+ * @param {AbortSignal} signal - Native operation cancellation signal.
+ * @param {nsISupports} nativeView - Exact live selected view.
+ * @returns {Promise<{path: string, sha256: string}>} Complete snapshot manifest.
+ * @throws {*} Original IO, cancellation or native identity error.
+ */
+export async function createSelectedMigrationBackup(
+  inventory,
+  backupPath,
+  signal,
+  nativeView
+) {
+  validateSelectedMigrationView(nativeView, "before-source-read");
+  const bag = nativeView.QueryInterface(Ci.nsIPropertyBag2);
+  if (
+    JSON.stringify(inventory) !=
+    JSON.stringify(JSON.parse(bag.getPropertyAsAString("inventory-json")))
+  ) {
+    throw new Error("Snapshot inventory differs from native custody");
+  }
+  const directoryRoots = inventory.roots.filter(
+    root => root.kind == "directory"
+  );
+  const fileRoots = inventory.roots.filter(root => root.kind == "file");
+  const profile = inventory.roots.find(root => root.role == "profile");
+  if (
+    !profile ||
+    directoryRoots.length + fileRoots.length != inventory.roots.length
+  ) {
+    throw new Error("Unsupported selected snapshot inventory");
+  }
+  await selectedMigrationIO(nativeView, () =>
+    IOUtils.makeDirectory(backupPath, {
+      createAncestors: false,
+      ignoreExisting: false,
+      permissions: 0o700,
+    })
+  );
+  const directories = await createMigrationBackup(
+    profile.canonicalPath,
+    directoryRoots.map(root => root.canonicalPath),
+    PathUtils.join(backupPath, "directories"),
+    signal,
+    nativeView
+  );
+  const filesPath = PathUtils.join(backupPath, "files");
+  await selectedMigrationIO(nativeView, () =>
+    IOUtils.makeDirectory(filesPath, {
+      ignoreExisting: false,
+      permissions: 0o700,
+    })
+  );
+  const externalFiles = [];
+  const saved = new Set();
+  for (const root of fileRoots) {
+    const source = new FileUtils.File(root.canonicalPath);
+    if (
+      saved.has(source.path) ||
+      directoryRoots.some(directory =>
+        new FileUtils.File(directory.canonicalPath).contains(source)
+      )
+    ) {
+      continue;
+    }
+    saved.add(source.path);
+    checkCancellation(signal);
+    // Native validation binds the absence/leaf and its original physical parent.
+    validateSelectedMigrationView(nativeView, "before-source-read");
+    if (!root.exists) {
+      if (source.exists()) {
+        throw new Error("Absent snapshot metadata appeared");
+      }
+      externalFiles.push({ source: source.path, exists: false });
+      continue;
+    }
+    physicalFile(source.path);
+    const before = await selectedMigrationIO(nativeView, () =>
+      IOUtils.stat(source.path)
+    );
+    if (before.type != "regular") {
+      throw new Error("Snapshot metadata is not a regular file");
+    }
+    const digest = await selectedMigrationIO(nativeView, () =>
+      hashMigrationFile(source.path)
+    );
+    const file = "file-" + externalFiles.length;
+    const output = PathUtils.join(filesPath, file);
+    await selectedMigrationCopy(nativeView, source.path, output, {
+      noOverwrite: true,
+    });
+    await selectedMigrationIO(nativeView, () =>
+      IOUtils.setPermissions(output, 0o600, false)
+    );
+    await selectedMigrationIO(nativeView, () =>
+      IOUtils.write(output, new Uint8Array(), { mode: "append", flush: true })
+    );
+    const entry = {
+      source: source.path,
+      exists: true,
+      file,
+      size: before.size,
+      sha256: digest,
+      permissions: before.permissions,
+      lastModified: before.lastModified,
+    };
+    await verifyFile(output, entry, nativeView);
+    const after = await selectedMigrationIO(nativeView, () =>
+      IOUtils.stat(source.path)
+    );
+    if (
+      before.size != after.size ||
+      before.lastModified != after.lastModified ||
+      digest !=
+        (await selectedMigrationIO(nativeView, () =>
+          hashMigrationFile(source.path)
+        ))
+    ) {
+      throw new Error("Snapshot metadata changed during copy");
+    }
+    externalFiles.push(entry);
+  }
+  const manifest = {
+    version: 1,
+    kind: "selected-profile-snapshot",
+    complete: true,
+    inventory,
+    directories,
+    externalFiles,
+  };
+  await verifySelectedCopies(
+    new FileUtils.File(backupPath),
+    manifest,
+    nativeView
+  );
+  validateSelectedMigrationView(nativeView, "before-publication");
+  const path = PathUtils.join(backupPath, "snapshot.json");
+  await selectedMigrationIO(nativeView, () =>
+    IOUtils.writeJSON(path, manifest, { mode: "create", flush: true })
+  );
+  return verifySelectedMigrationBackup(backupPath, nativeView);
+}
+
+/**
+ * Verifies all copied directory and external-file bytes in a snapshot bundle.
+ * This reads the bundle only. A saved inventory never grants a selected lease.
+ *
+ * @param {string} backupPath - Existing selected snapshot bundle.
+ * @param {nsISupports} [nativeView] - Live view for an ongoing selected operation.
+ * @returns {Promise<{path: string, sha256: string}>} Verified manifest identity.
+ * @throws {Error} For an incomplete, altered or inconsistent bundle.
+ */
+export async function verifySelectedMigrationBackup(backupPath, nativeView) {
+  const bundle = physicalFile(backupPath);
+  const path = PathUtils.join(bundle.path, "snapshot.json");
+  physicalFile(path);
+  const digest = await selectedMigrationIO(nativeView, () =>
+    hashMigrationFile(path)
+  );
+  const manifest = await selectedMigrationIO(nativeView, () =>
+    IOUtils.readJSON(path)
+  );
+  if (
+    manifest.version !== 1 ||
+    manifest.kind !== "selected-profile-snapshot" ||
+    manifest.complete !== true ||
+    !Array.isArray(manifest.inventory?.roots) ||
+    !Array.isArray(manifest.externalFiles)
+  ) {
+    throw new Error("Invalid selected snapshot manifest");
+  }
+  await verifySelectedCopies(bundle, manifest, nativeView);
+  if (
+    digest !==
+    (await selectedMigrationIO(nativeView, () => hashMigrationFile(path)))
+  ) {
+    throw new Error("Selected snapshot manifest changed during verification");
+  }
+  return { path, sha256: digest };
+}
+
+/**
+ * Checks selected root coverage and all copied bytes before publishing completion.
+ *
+ * @param {nsIFile} bundle - Existing fresh bundle directory.
+ * @param {object} manifest - Candidate complete snapshot inventory.
+ * @param {nsISupports} [nativeView] - Actual selected view, when ongoing.
+ * @returns {Promise<void>} All selected directory/leaf copies are verified.
+ */
+async function verifySelectedCopies(bundle, manifest, nativeView) {
+  const actual = await verifyMigrationBackup(
+    PathUtils.join(bundle.path, "directories"),
+    nativeView
+  );
+  if (
+    actual.path !== manifest.directories?.path ||
+    actual.sha256 !== manifest.directories.sha256
+  ) {
+    throw new Error("Snapshot directory backup changed");
+  }
+  const directories = await selectedMigrationIO(nativeView, () =>
+    IOUtils.readJSON(actual.path)
+  );
+  const expected = new Set();
+  for (const root of manifest.inventory.roots) {
+    if (!PathUtils.isAbsolute(root.canonicalPath)) {
+      throw new Error("Invalid selected snapshot source");
+    }
+    const source = new FileUtils.File(root.canonicalPath);
+    const covered = directories.roots.find(directory => {
+      const parent = new FileUtils.File(directory.source);
+      return parent.equals(source) || parent.contains(source);
+    });
+    const entries =
+      covered?.entries.filter(
+        entry =>
+          PathUtils.join(covered.source, ...entry.parts) === root.canonicalPath
+      ) ?? [];
+    if (root.kind == "directory") {
+      if (
+        !covered ||
+        (covered.source !== root.canonicalPath &&
+          (entries.length !== 1 || entries[0].type !== "directory"))
+      ) {
+        throw new Error("Snapshot omits a selected directory");
+      }
+    } else if (root.kind == "file") {
+      if (!covered) {
+        expected.add(root.canonicalPath);
+      } else if (
+        root.exists
+          ? entries.length !== 1 || entries[0].type !== "regular"
+          : entries.length !== 0
+      ) {
+        throw new Error(
+          "Directory backup omits selected metadata or its absence"
+        );
+      }
+    } else {
+      throw new Error("Unsupported selected snapshot root");
+    }
+  }
+  for (const [index, entry] of manifest.externalFiles.entries()) {
+    if (!expected.delete(entry.source) || typeof entry.exists != "boolean") {
+      throw new Error("Duplicate or foreign snapshot metadata");
+    }
+    const descriptors = manifest.inventory.roots.filter(
+      root => root.canonicalPath === entry.source
+    );
+    if (descriptors.some(root => root.exists !== entry.exists)) {
+      throw new Error("Snapshot metadata absence changed");
+    }
+    if (entry.exists) {
+      if (entry.file !== "file-" + index || !validMetadata(entry)) {
+        throw new Error("Invalid snapshot metadata copy");
+      }
+      await verifyFile(
+        PathUtils.join(bundle.path, "files", entry.file),
+        entry,
+        nativeView
+      );
+    } else if (entry.file !== undefined) {
+      throw new Error("Absent snapshot metadata has a copy");
+    }
+  }
+  if (expected.size) {
+    throw new Error("Snapshot omits selected external metadata");
   }
 }

@@ -238,6 +238,11 @@ add_task(async function test_firstPrivacyFailureHoldsFlushAndClose() {
   });
   await Assert.rejects(f.observer.flush(), error => error === failure);
   Assert.deepEqual(f.errors, [failure]);
+  Assert.strictEqual(
+    f.observer.migrationFailures[0],
+    failure,
+    "Detaching or draining cannot discard the original privacy failure"
+  );
   Assert.equal(await IOUtils.readUTF8(path), before);
   await Assert.rejects(
     f.provider.search("sourceuntouchedneedle"),

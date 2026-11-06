@@ -23,6 +23,22 @@ ChromeUtils.defineLazyGetter(
 const nsMsgKey_None = 0xffffffff;
 
 /**
+ * Checks native compose admission before starting file or delivery work.
+ *
+ * @throws {nsIException} If the native writer gate refuses admission.
+ */
+function checkComposeAdmission() {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const processSubject = gate
+    .QueryInterface(Ci.nsIPropertyBag2)
+    .getPropertyAsInterface("writer-admission-subject", Ci.nsISupports);
+  // Observe is void: success is undefined, and failure must propagate.
+  gate.observe(processSubject, "check-writer-admission", "compose");
+}
+
+/**
  * A class to manage sending processes.
  *
  * @implements {nsIMsgSend}
@@ -77,6 +93,8 @@ export class MessageSend {
     originalMsgURI,
     compType
   ) {
+    checkComposeAdmission();
+
     this._userIdentity = userIdentity;
     this._accountKey = accountKey || this._accountKeyForIdentity(userIdentity);
     this._compFields = compFields;
@@ -197,6 +215,8 @@ export class MessageSend {
     listener,
     smtpPassword
   ) {
+    checkComposeAdmission();
+
     this._userIdentity = userIdentity;
     this._accountKey = accountKey || this._accountKeyForIdentity(userIdentity);
     this._compFields = compFields;
@@ -231,7 +251,12 @@ export class MessageSend {
     return this._deliverMessage(messageFile);
   }
 
-  // @see nsIMsgSend
+  /**
+   * Creates a message file through the existing nsIMsgSend void entrypoint.
+   *
+   * @see nsIMsgSend.createRFC822Message
+   * @throws {nsIException} If native compose admission is refused, before work.
+   */
   createRFC822Message(
     userIdentity,
     compFields,
@@ -242,6 +267,8 @@ export class MessageSend {
     embeddedObjects,
     listener
   ) {
+    checkComposeAdmission();
+
     this._userIdentity = userIdentity;
     this._compFields = compFields;
     this._dontDeliver = true;
@@ -418,6 +445,8 @@ export class MessageSend {
    * Reopen the send progress dialog if it was cancelled before retrying.
    */
   _prepareFccRetry() {
+    checkComposeAdmission();
+
     if (
       !this._sendProgress?.processCanceledByUser ||
       !Services.prefs.getBoolPref("mailnews.show_send_progress")
@@ -801,6 +830,8 @@ export class MessageSend {
    * @param {nsIFile} file - The message file to deliver.
    */
   async _deliverMessage(file) {
+    checkComposeAdmission();
+
     if (this._dontDeliver) {
       this.notifyListenerOnStopSending(null, Cr.NS_OK, null, file);
       return;
@@ -849,6 +880,8 @@ export class MessageSend {
    * @returns {nsIFile}
    */
   async _createDeliveryFile() {
+    checkComposeAdmission();
+
     if (!this._compFields.bcc) {
       return this._messageFile;
     }
@@ -892,6 +925,8 @@ export class MessageSend {
    * @returns {nsIFile}
    */
   async _createCopyFile() {
+    checkComposeAdmission();
+
     if (!this._folderUri.startsWith("mailbox:")) {
       return this._messageFile;
     }
@@ -939,6 +974,8 @@ export class MessageSend {
    * Start copy operation according to this._fcc value.
    */
   async _doFcc() {
+    checkComposeAdmission();
+
     if (!this._fcc || !lazy.MsgUtils.canSaveToFolder(this._fcc)) {
       return this._handleSuccessfulFccCopy(Cr.NS_OK);
     }
@@ -955,6 +992,8 @@ export class MessageSend {
    * @param {nsMsgDeliverMode} [deliverMode=this._deliverMode] - The deliver mode.
    */
   async _mimeDoFcc(fccHeader = this._fcc, deliverMode = this._deliverMode) {
+    checkComposeAdmission();
+
     let failedFolderUri;
     let fallbackUri;
     let originalError;
@@ -1032,6 +1071,8 @@ export class MessageSend {
     deliverMode = this._deliverMode,
     createTarget = false
   ) {
+    checkComposeAdmission();
+
     // Do not let a destination from an earlier attempt make a folder lookup
     // failure appear recoverable.
     this._folderUri = null;
@@ -1181,6 +1222,8 @@ export class MessageSend {
    * Run filters on the just sent message.
    */
   _filterSentMessage() {
+    checkComposeAdmission();
+
     this.sendReport.currentProcess = Ci.nsIMsgSendReport.process_Filter;
     const folder = lazy.MailUtils.getExistingFolder(this._folderUri);
     const msgHdr = folder.GetMessageHeader(this._messageKey);
@@ -1221,6 +1264,8 @@ export class MessageSend {
    * Send this._deliveryFile to the outgoing service.
    */
   async _deliverAsMail() {
+    checkComposeAdmission();
+
     this.sendReport.currentProcess = Ci.nsIMsgSendReport.process_SMTP;
     this._setStatusMessage("send-progress-sending-message");
 
@@ -1293,6 +1338,8 @@ export class MessageSend {
    * Send this._deliveryFile to nntp service.
    */
   async _deliverAsNews() {
+    checkComposeAdmission();
+
     this.sendReport.currentProcess = Ci.nsIMsgSendReport.process_NNTP;
     lazy.MsgUtils.sendLogger.debug("Delivering news message");
 

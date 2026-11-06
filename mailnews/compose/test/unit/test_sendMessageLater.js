@@ -180,6 +180,32 @@ function sendMessageLater() {
 }
 
 add_task(async function run_the_test() {
+  const writerGate = Cc[
+    "@mozilla.org/mailnews/migration-writer-lease;1"
+  ].getService(Ci.nsIObserver);
+  const writerHistory = writerGate.QueryInterface(Ci.nsIPropertyBag2);
+  const processSubject = writerHistory.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  // The top-level service construction already called native Init. This
+  // ordinary process cannot stand in for the real early-XRE cold child.
+  Assert.equal(
+    writerHistory.getPropertyAsUint32("writer-history.send-later"),
+    1,
+    "Native Init records Started even before a queue is populated"
+  );
+  Assert.throws(
+    () =>
+      writerGate.observe(
+        processSubject,
+        "check-writer-never-started",
+        "send-later"
+      ),
+    ex => ex.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "An initialized send-later service is not a cold writer"
+  );
+
   // Test file - for bug 429891
   originalData = await IOUtils.readUTF8(testFile.path);
 
@@ -238,6 +264,21 @@ add_task(async function run_the_test() {
     null,
     copyListener,
     null
+  );
+  Assert.equal(
+    writerHistory.getPropertyAsUint32("writer-history.compose"),
+    1,
+    "Compose admission is recorded before asynchronous file or FCC work"
+  );
+  Assert.throws(
+    () =>
+      writerGate.observe(
+        processSubject,
+        "check-writer-never-started",
+        "compose"
+      ),
+    ex => ex.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "Admitted compose work cannot be reclassified as cold"
   );
 
   // Now we wait till we get copy notification of completion.

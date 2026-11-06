@@ -44,6 +44,14 @@ add_task(async function test_coalescesNativeIdentityAndReopensSidecar() {
     progress.acceptedThrough,
     "Reopening does not reset the sidecar checkpoint"
   );
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIPropertyBag2
+  );
+  Assert.equal(
+    gate.getPropertyAsUint32("writer-history.mail-search"),
+    1,
+    "Closing/reopening the actual factory never resets native Started history"
+  );
 });
 
 add_task(async function test_defaultEntryUsesExistingListAndCancellation() {
@@ -303,4 +311,25 @@ add_task(async function test_shutdownPreventsReopening() {
   } finally {
     await closeMailSearch();
   }
+});
+
+add_task(async function test_factoryReplacesOnlyAnActuallyClosedOwner() {
+  const service = await getMailSearchService();
+  const close = service.close();
+  Assert.equal(
+    service.close(),
+    close,
+    "Direct close keeps the same real terminal"
+  );
+  await close;
+  Assert.ok(service.closed);
+  const replacement = await getMailSearchService();
+  Assert.notEqual(
+    replacement,
+    service,
+    "A retired actual writer is not returned by the factory"
+  );
+  const progress = await replacement.update({ limit: 1 });
+  Assert.equal(progress.sourceId, database.sourceId);
+  await closeMailSearch();
 });

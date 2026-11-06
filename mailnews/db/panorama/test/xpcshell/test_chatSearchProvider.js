@@ -17,6 +17,7 @@ const { PanoramaSearchIndex } = ChromeUtils.importESModule(
 );
 const {
   logs,
+  Logger,
   getLogWriter,
   closeLogWriter,
   queueFileOperation,
@@ -114,6 +115,88 @@ add_setup(function setupChatSearchPreferences() {
     }
   });
 });
+
+add_task(
+  async function test_stoppedArchiveUsesPhysicalSourceWithoutLiveLogger() {
+    const folder = PathUtils.join(
+      PathUtils.profileDir,
+      "logs",
+      "search-test",
+      "s508-provider-archive",
+      "buddy"
+    );
+    const path = PathUtils.join(folder, "2022-03-04.120000+0000.json");
+    const file = do_get_profile().clone();
+    file.append("s508-provider-archive.sqlite");
+    await IOUtils.makeDirectory(folder, { createAncestors: true });
+    const header = {
+      date: "2022-03-04T12:00:00.000Z",
+      name: "buddy",
+      title: "Stopped archive",
+      account: "s508-provider-archive",
+      normalizedName: "buddy",
+      protocol: "search-test",
+      isChat: false,
+    };
+    const record = {
+      date: "2022-03-04T12:00:01.000Z",
+      who: "sender",
+      text: "archivephysicalneedle",
+      flags: ["incoming"],
+      remoteId: "retained-first",
+    };
+    await IOUtils.writeUTF8(
+      path,
+      JSON.stringify(header) + "\n" + JSON.stringify(record) + "\n"
+    );
+    let owned;
+    registerCleanupFunction(async () => {
+      await owned?.close();
+      await IOUtils.remove(folder, { recursive: true, ignoreAbsent: true });
+    });
+    const original = logs.getLogFromFile;
+    logs.getLogFromFile = () => {
+      throw new Error("Stopped archive must not activate the live logger");
+    };
+    try {
+      owned = await ChatSearchProvider.open(file);
+      Assert.ok((await owned.refreshLog(path)).indexed);
+      const page = await owned.search("archivephysicalneedle");
+      Assert.equal(
+        page.items.length,
+        1,
+        "The actual stopped physical transcript is searchable"
+      );
+      Assert.equal(
+        page.items[0].id,
+        chatSearchDocumentId(path),
+        "The hit retains the physical path identity"
+      );
+      const text = await owned.getText(page.items[0].id);
+      Assert.ok(
+        text.body.includes("archivephysicalneedle"),
+        "The source text survives the archive queue/parser and index"
+      );
+      const resolved = await owned.resolveLog(page.items[0]);
+      Assert.equal(resolved.status, "ready");
+      Assert.equal(
+        resolved.log.path,
+        path,
+        "Opening resolves the same single physical log"
+      );
+      await IOUtils.remove(path);
+      Assert.equal(await owned.resolveDocument(page.items[0].id), null);
+      Assert.equal(
+        owned.migrationFailures.length,
+        0,
+        "Verified missing source is not a sticky writer failure"
+      );
+    } finally {
+      logs.getLogFromFile = original;
+      await owned?.close();
+    }
+  }
+);
 
 add_task(async function test_loggedEditsRedactionAndNoLog() {
   const fixture = await openChatFixture("edits");
@@ -452,8 +535,8 @@ add_task(async function test_cancellationAndCloseDrainQueuedReads() {
 add_task(async function test_sourceChangeDuringParsingDoesNotPublishOldText() {
   const fixture = await openChatFixture("source-race");
   await logText(fixture, "oldraceneedle", { remoteId: "edited" });
-  const original = logs.getLogFromFile;
-  logs.getLogFromFile = async function (...args) {
+  const original = Logger.prototype.getLogFromFile;
+  Logger.prototype.getLogFromFile = async function (...args) {
     const log = await original.apply(this, args);
     const getConversation = log.getConversation;
     log.getConversation = async function () {
@@ -472,7 +555,7 @@ add_task(async function test_sourceChangeDuringParsingDoesNotPublishOldText() {
     );
     Assert.equal(await fixture.provider.getText(result.id), null);
   } finally {
-    logs.getLogFromFile = original;
+    Logger.prototype.getLogFromFile = original;
   }
   Assert.ok((await fixture.provider.refreshLog(fixture.filePath)).indexed);
   Assert.equal(
@@ -700,18 +783,23 @@ add_task(async function test_resolveLogPreservesErrorsAndDetectsParseRaces() {
   await logText(fixture, "oldopeningrace", { remoteId: "edited" });
   await provider.refreshLog(filePath);
   const [hit] = (await provider.search("oldopeningrace")).items;
-  const original = logs.getLogFromFile;
+  const original = Logger.prototype.getLogFromFile;
   const failure = new Error("Original logger read failure");
-  logs.getLogFromFile = async () => {
+  Logger.prototype.getLogFromFile = async () => {
     throw failure;
   };
   try {
     await Assert.rejects(provider.resolveLog(hit), error => error === failure);
+    Assert.strictEqual(
+      provider.migrationFailures[0],
+      failure,
+      "Queue advancement retains the exact original read failure"
+    );
   } finally {
-    logs.getLogFromFile = original;
+    Logger.prototype.getLogFromFile = original;
   }
   Assert.equal((await provider.resolveLog(hit)).status, "ready");
-  logs.getLogFromFile = async function (...args) {
+  Logger.prototype.getLogFromFile = async function (...args) {
     const log = await original.apply(this, args);
     const getConversation = log.getConversation;
     log.getConversation = async function () {
@@ -724,13 +812,13 @@ add_task(async function test_resolveLogPreservesErrorsAndDetectsParseRaces() {
   try {
     Assert.deepEqual(await provider.resolveLog(hit), { status: "stale" });
   } finally {
-    logs.getLogFromFile = original;
+    Logger.prototype.getLogFromFile = original;
   }
   await provider.refreshLog(filePath);
   const [current] = (await provider.search("replacementopeningrace")).items;
   const controller = new AbortController();
   const reason = new Error("Cancel after parsing the physical transcript");
-  logs.getLogFromFile = async function (...args) {
+  Logger.prototype.getLogFromFile = async function (...args) {
     const log = await original.apply(this, args);
     const getConversation = log.getConversation;
     log.getConversation = async function () {
@@ -746,7 +834,7 @@ add_task(async function test_resolveLogPreservesErrorsAndDetectsParseRaces() {
       error => error === reason
     );
   } finally {
-    logs.getLogFromFile = original;
+    Logger.prototype.getLogFromFile = original;
   }
   Assert.equal((await provider.resolveLog(current)).status, "ready");
 });
@@ -785,8 +873,8 @@ add_task(async function test_appendBeforeParsingMakesTheOpeningStale() {
   await logText(fixture, "beforeparseneedle", { remoteId: "edited" });
   await provider.refreshLog(filePath);
   const [hit] = (await provider.search("beforeparseneedle")).items;
-  const original = logs.getLogFromFile;
-  logs.getLogFromFile = async function (...args) {
+  const original = Logger.prototype.getLogFromFile;
+  Logger.prototype.getLogFromFile = async function (...args) {
     await logText(fixture, "afterappendneedle", { remoteId: "edited" });
     return original.apply(this, args);
   };
@@ -797,7 +885,7 @@ add_task(async function test_appendBeforeParsingMakesTheOpeningStale() {
       "An append between source validation and the logger read is a stale hit"
     );
   } finally {
-    logs.getLogFromFile = original;
+    Logger.prototype.getLogFromFile = original;
   }
   await provider.refreshLog(filePath);
   const [current] = (await provider.search("afterappendneedle")).items;
@@ -810,16 +898,16 @@ add_task(async function test_loggerFailureSurvivesAConcurrentAppend() {
   await logText(fixture, "beforeerrorappend", { remoteId: "edited" });
   await provider.refreshLog(filePath);
   const [hit] = (await provider.search("beforeerrorappend")).items;
-  const original = logs.getLogFromFile;
+  const original = Logger.prototype.getLogFromFile;
   const failure = new Error("Original read failed while the source changed");
-  logs.getLogFromFile = async () => {
+  Logger.prototype.getLogFromFile = async () => {
     await logText(fixture, "aftererrorappend", { remoteId: "edited" });
     throw failure;
   };
   try {
     await Assert.rejects(provider.resolveLog(hit), error => error === failure);
   } finally {
-    logs.getLogFromFile = original;
+    Logger.prototype.getLogFromFile = original;
   }
   await provider.refreshLog(filePath);
   const [current] = (await provider.search("aftererrorappend")).items;

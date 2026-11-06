@@ -4,6 +4,41 @@
 
 #include <functional>
 #include <utility>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include "MigrationWriterLease.h"
+#include "LocalStoreMigrationLease.h"
+#include "../../../../local/src/nsLocalUtils.h"
+#include "nsIMsgAccount.h"
+#include "nsIMsgLocalMailFolder.h"
+#include "nsIMsgCopyServiceListener.h"
+#include "nsIPop3Sink.h"
+#include "nsIPop3IncomingServer.h"
+#include "nsIMsgOperationListener.h"
+#include "nsIMsgFilter.h"
+#include "nsIMsgFilterList.h"
+#include "nsIMsgSearchTerm.h"
+#include "nsIServerSocket.h"
+#include "nsContentUtils.h"
+#include "nsReadableUtils.h"
+#include "js/SourceText.h"
+#include "js/CompilationAndEvaluation.h"
+#include "js/CompileOptions.h"
+#include "js/Wrapper.h"
+#include "js/CallAndConstruct.h"
+#include "mozilla/Preferences.h"
+#include "nsIToolkitProfile.h"
+#include "nsIPropertyBag2.h"
+#include "nsIWritablePropertyBag2.h"
+#include "nsIMsgSendLater.h"
+#include "nsIMsgSend.h"
+#include "mozilla/dom/Promise.h"
+#include "js/Promise.h"
+#include "js/PropertyAndElement.h"
+#include "js/Conversions.h"
+#include "js/CharacterEncoding.h"
+#include "js/Realm.h"
 
 #include "DatabaseCore.h"
 #include "FolderDatabase.h"
@@ -39,6 +74,8 @@
 #include "nsICryptoHash.h"
 #include "nsIMsgPluggableStore.h"
 #include "prio.h"
+#include "nss.h"
+#include "nsIFts3Tokenizer.h"
 #include "nsIInterfaceRequestorUtils.h"
 #include "nsIMsgAccountManager.h"
 #include "nsIMsgDatabase.h"
@@ -58,6 +95,12 @@
 #include "nsThreadUtils.h"
 #include "xpcpublic.h"
 #include "gtest/gtest.h"
+
+// Existing pinned Gecko native profile-lock declaration (nsAppRunner.h).
+// This fixture owns a real OS lock; no script can manufacture selection
+// authority.
+nsresult NS_LockProfilePath(nsIFile*, nsIFile*, nsIProfileUnlocker**,
+                            nsIProfileLock**);
 
 namespace mozilla::mailnews {
 namespace {
@@ -284,6 +327,95 @@ class RecoveryPlanOwner final : public nsISupports, public SupportsWeakPtr {
   ~RecoveryPlanOwner() = default;
 };
 NS_IMPL_ISUPPORTS(RecoveryPlanOwner, nsISupports)
+
+// Only actual platform callbacks report progress. These observers have no
+// authority to resolve the migration promise or synthesize an owner terminal.
+class SelectedCopyObserver final : public nsIMsgCopyServiceListener {
+ public:
+  NS_DECL_ISUPPORTS
+  std::function<nsresult()> start;
+  std::function<nsresult(nsresult)> stop;
+  uint32_t starts = 0;
+  uint32_t stops = 0;
+  nsresult result = NS_ERROR_IN_PROGRESS;
+  NS_IMETHOD OnStartCopy() override {
+    ++starts;
+    return start ? start() : NS_OK;
+  }
+  NS_IMETHOD OnProgress(uint32_t, uint32_t) override { return NS_OK; }
+  NS_IMETHOD SetMessageKey(nsMsgKey) override { return NS_OK; }
+  NS_IMETHOD GetMessageId(nsACString& aId) override {
+    aId.Truncate();
+    return NS_OK;
+  }
+  NS_IMETHOD OnStopCopy(nsresult aResult) override {
+    ++stops;
+    result = aResult;
+    return stop ? stop(aResult) : NS_OK;
+  }
+
+ private:
+  ~SelectedCopyObserver() = default;
+};
+NS_IMPL_ISUPPORTS(SelectedCopyObserver, nsIMsgCopyServiceListener)
+
+class SelectedSinkObserver final : public nsIMsgOperationListener {
+ public:
+  NS_DECL_ISUPPORTS
+  std::function<void(nsresult)> stopped;
+  uint32_t calls = 0;
+  nsresult result = NS_ERROR_IN_PROGRESS;
+  NS_IMETHOD OnStopOperation(nsresult aStatus) override {
+    ++calls;
+    result = aStatus;
+    if (stopped) stopped(aStatus);
+    return NS_OK;
+  }
+
+ private:
+  ~SelectedSinkObserver() = default;
+};
+NS_IMPL_ISUPPORTS(SelectedSinkObserver, nsIMsgOperationListener)
+
+class SelectedCompactObserver final : public nsIStoreCompactListener {
+ public:
+  NS_DECL_ISUPPORTS
+  std::function<nsresult(nsresult)> complete;
+  std::function<void(nsresult)> summary;
+  uint32_t begins = 0;
+  uint32_t finals = 0;
+  uint32_t retained = 0;
+  nsresult result = NS_ERROR_IN_PROGRESS;
+  NS_IMETHOD OnCompactionBegin() override {
+    ++begins;
+    return NS_OK;
+  }
+  NS_IMETHOD OnRetentionQuery(const nsACString&, uint32_t* aFlags,
+                              nsACString& aKeywords, bool* aKeep) override {
+    *aFlags = 0;
+    aKeywords.Truncate();
+    *aKeep = true;
+    return NS_OK;
+  }
+  NS_IMETHOD OnMessageRetained(const nsACString&, const nsACString&,
+                               int64_t) override {
+    ++retained;
+    return NS_OK;
+  }
+  NS_IMETHOD OnCompactionComplete(nsresult aResult) override {
+    return complete ? complete(aResult) : NS_OK;
+  }
+  NS_IMETHOD OnFinalSummary(nsresult aResult, int64_t, int64_t) override {
+    ++finals;
+    result = aResult;
+    if (summary) summary(aResult);
+    return NS_OK;
+  }
+
+ private:
+  ~SelectedCompactObserver() = default;
+};
+NS_IMPL_ISUPPORTS(SelectedCompactObserver, nsIStoreCompactListener)
 
 class DeliveryCoreReferences : public testing::Test {
  protected:
@@ -1412,6 +1544,2055 @@ class DeliveryCoreReferences : public testing::Test {
     raw.messageSize = Some(7u);
     raw.lineCount = Some(1u);
     return mCore->MessageDB().AddMessage(folder, raw, true, &key);
+  }
+
+  nsresult WaitMigration(const RefPtr<MigrationSettlementPromise>& aPromise) {
+    bool finished = false;
+    nsresult result = NS_ERROR_IN_PROGRESS;
+    aPromise->Then(
+        GetMainThreadSerialEventTarget(), __func__,
+        [&](bool ok) {
+          result = ok ? NS_OK : NS_ERROR_UNEXPECTED;
+          finished = true;
+        },
+        [&](nsresult error) {
+          result = error;
+          finished = true;
+        });
+    EXPECT_TRUE(SpinEventLoopUntil("DeliveryCoreReferences::Migration"_ns,
+                                   [&] { return finished; }));
+    return result;
+  }
+
+  struct SelectedLocalContext {
+    nsCOMPtr<nsIMsgAccountManager> manager;
+    nsCOMPtr<nsIMsgIncomingServer> server;
+    nsCOMPtr<nsIMsgAccount> account;
+    nsCOMPtr<nsIMsgFolder> folder;
+    nsCOMPtr<nsIMsgFolder> destination;
+    nsCOMPtr<nsIMsgLocalMailFolder> local;
+    nsCOMPtr<nsIMsgPluggableStore> store;
+    nsCOMPtr<nsIMsgDatabase> database;
+    nsCOMPtr<nsIFile> directory;
+    nsCOMPtr<nsIFile> unrelated;
+    nsTArray<RefPtr<nsIMsgDBHdr>> headers;
+    nsTArray<nsCString> bodies;
+    nsTArray<nsCString> tokens;
+  };
+  struct SelectedRunProbe final {
+    NS_INLINE_DECL_REFCOUNTING(SelectedRunProbe)
+    bool drained = false;
+    uint32_t terminals = 0;
+    nsresult result = NS_ERROR_IN_PROGRESS;
+
+   private:
+    ~SelectedRunProbe() = default;
+  };
+  struct SelectedNativeRun {
+    nsCOMPtr<nsIProfileLock> lock;
+    RefPtr<MigrationWriterLease> lease;
+    RefPtr<MigrationSettlementPromise> drain;
+    RefPtr<LocalStoreMigrationLease> local;
+    RefPtr<SelectedRunProbe> observation = new SelectedRunProbe();
+    bool& drained = observation->drained;
+    uint32_t& terminals = observation->terminals;
+    nsresult& result = observation->result;
+  };
+
+  nsresult ReadSelectedFile(nsIFile* aFile, nsACString& aBytes) {
+    nsCOMPtr<nsIInputStream> input;
+    MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(input), aFile));
+    auto close = MakeScopeExit([&] { (void)input->Close(); });
+    MOZ_TRY(NS_ConsumeStream(input, UINT32_MAX, aBytes));
+    return input->Close();
+  }
+  nsresult SelectedBody(SelectedLocalContext& aContext,
+                        const nsACString& aToken, nsACString& aBody) {
+    nsCOMPtr<nsIInputStream> input;
+    MOZ_TRY(aContext.store->GetMsgInputStream(aContext.folder, aToken, 0,
+                                              getter_AddRefs(input)));
+    auto close = MakeScopeExit([&] { (void)input->Close(); });
+    MOZ_TRY(NS_ConsumeStream(input, UINT32_MAX, aBody));
+    return input->Close();
+  }
+  nsresult PrepareSelectedLocal(SelectedLocalContext& c, bool aMaildir,
+                                bool aExternal, bool aPop = false) {
+    c.manager = do_GetService("@mozilla.org/messenger/account-manager;1");
+    NS_ENSURE_TRUE(c.manager, NS_ERROR_NOT_AVAILABLE);
+    mCore = DatabaseCore::GetInstanceForService();
+    mConnection = Connection();
+    NS_ENSURE_TRUE(mCore && mConnection, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(c.manager->CreateIncomingServer("selected-owner"_ns, "localhost"_ns,
+                                            aPop ? "pop3"_ns : "none"_ns,
+                                            getter_AddRefs(c.server)));
+    MOZ_TRY(c.manager->CreateAccount(getter_AddRefs(c.account)));
+    MOZ_TRY(c.account->SetIncomingServer(c.server));
+    MOZ_TRY(c.server->SetStringValue(
+        "storeContractID", aMaildir
+                               ? "@mozilla.org/msgstore/maildirstore;1"_ns
+                               : "@mozilla.org/msgstore/berkeleystore;1"_ns));
+    if (aExternal) {
+      MOZ_TRY(mProfile->GetParent(getter_AddRefs(c.directory)));
+    } else {
+      MOZ_TRY(mProfile->Clone(getter_AddRefs(c.directory)));
+    }
+    MOZ_TRY(c.directory->Append(u"selected-real-store"_ns));
+    MOZ_TRY(c.directory->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    MOZ_TRY(c.server->SetLocalPath(c.directory));
+    nsCOMPtr<nsIMsgFolder> root;
+    MOZ_TRY(c.server->GetRootFolder(getter_AddRefs(root)));
+    nsCOMPtr<nsIMsgLocalMailFolder> rootLocal = do_QueryInterface(root);
+    NS_ENSURE_TRUE(rootLocal, NS_ERROR_NO_INTERFACE);
+    MOZ_TRY(rootLocal->CreateLocalSubfolder("Captured"_ns,
+                                            getter_AddRefs(c.folder)));
+    MOZ_TRY(rootLocal->CreateLocalSubfolder("Destination"_ns,
+                                            getter_AddRefs(c.destination)));
+    c.local = do_QueryInterface(c.folder);
+    MOZ_TRY(c.folder->GetMsgStore(getter_AddRefs(c.store)));
+    nsAutoCString type;
+    MOZ_TRY(c.store->GetStoreType(type));
+    NS_ENSURE_TRUE(type.Equals(aMaildir ? "maildir" : "mbox"),
+                   NS_ERROR_UNEXPECTED);
+    MOZ_TRY(c.folder->GetMsgDatabase(getter_AddRefs(c.database)));
+    for (uint32_t i = 0; i < 3; ++i) {
+      nsAutoCString raw("From: selected@example.invalid\r\nSubject: retained ");
+      raw.AppendInt(i);
+      raw.AppendLiteral("\r\nMessage-ID: <selected-");
+      raw.AppendInt(i);
+      raw.AppendLiteral("@invalid>\r\n\r\noriginal body ");
+      raw.AppendInt(i);
+      raw.AppendLiteral("\r\n");
+      nsCOMPtr<nsIMsgDBHdr> header;
+      MOZ_TRY(c.local->AddMessage(raw.get(), getter_AddRefs(header)));
+      NS_ENSURE_TRUE(header, NS_ERROR_UNEXPECTED);
+      nsCString token, actual;
+      MOZ_TRY(header->GetStoreToken(token));
+      MOZ_TRY(SelectedBody(c, token, actual));
+      NS_ENSURE_TRUE(actual == raw, NS_ERROR_UNEXPECTED);
+      c.headers.AppendElement(header);
+      c.bodies.AppendElement(raw);
+      c.tokens.AppendElement(token);
+    }
+    // An independently owned regular file catches accidental broad cleanup.
+    MOZ_TRY(mProfile->Clone(getter_AddRefs(c.unrelated)));
+    MOZ_TRY(c.unrelated->Append(u"unrelated-selected-control"_ns));
+    nsCOMPtr<nsIOutputStream> file;
+    MOZ_TRY(NS_NewLocalFileOutputStream(getter_AddRefs(file), c.unrelated));
+    constexpr auto unchanged = "unrelated original bytes"_ns;
+    uint32_t written;
+    MOZ_TRY(
+        file->Write(unchanged.BeginReading(), unchanged.Length(), &written));
+    NS_ENSURE_TRUE(written == unchanged.Length(), NS_ERROR_UNEXPECTED);
+    return file->Close();
+  }
+  void CheckSelectedOriginals(SelectedLocalContext& c) {
+    nsTArray<nsMsgKey> keys;
+    ASSERT_EQ(NS_OK, c.database->ListAllKeys(keys));
+    ASSERT_EQ(c.headers.Length(), keys.Length());
+    for (uint32_t i = 0; i < c.headers.Length(); ++i) {
+      nsMsgKey key;
+      ASSERT_EQ(NS_OK, c.headers[i]->GetMessageKey(&key));
+      EXPECT_TRUE(keys.Contains(key));
+      nsCString token, body;
+      ASSERT_EQ(NS_OK, c.headers[i]->GetStoreToken(token));
+      EXPECT_EQ(c.tokens[i], token);
+      ASSERT_EQ(NS_OK, SelectedBody(c, token, body));
+      EXPECT_EQ(c.bodies[i], body);
+    }
+    nsCString unrelated;
+    ASSERT_EQ(NS_OK, ReadSelectedFile(c.unrelated, unrelated));
+    EXPECT_EQ("unrelated original bytes"_ns, unrelated);
+  }
+  nsresult ArmSelectedRun(SelectedNativeRun& r) {
+    nsCOMPtr<nsIProfileUnlocker> unlocker;
+    MOZ_TRY(NS_LockProfilePath(mProfile, mProfile, getter_AddRefs(unlocker),
+                               getter_AddRefs(r.lock)));
+    SelectedSnapshotRequest request;
+    MOZ_TRY(mProfile->GetPath(request.path));
+    request.path.AppendLiteral(".live-owner-request.json");
+    auto armed =
+        MigrationWriterLease::ArmSelected(r.lock, mProfile, mProfile, request);
+    if (armed.isErr()) return armed.unwrapErr();
+    r.lease = armed.unwrap();
+    r.drain = r.lease->AcquireAndDrain();
+    r.local = r.lease->mLocalStore;
+    RefPtr<SelectedRunProbe> observation = r.observation;
+    r.drain->Then(
+        GetMainThreadSerialEventTarget(), __func__,
+        [observation](bool ok) {
+          observation->result = ok ? NS_OK : NS_ERROR_UNEXPECTED;
+          ++observation->terminals;
+          observation->drained = true;
+        },
+        [observation](nsresult error) {
+          observation->result = error;
+          ++observation->terminals;
+          observation->drained = true;
+        });
+    return NS_OK;
+  }
+  void FinishSelectedRun(SelectedNativeRun& r, nsresult aExpected) {
+    ASSERT_TRUE(r.lease && r.drain);
+    EXPECT_EQ(aExpected, WaitMigration(r.drain));
+    EXPECT_TRUE(r.drained);
+    EXPECT_EQ(1u, r.terminals);
+    EXPECT_EQ(aExpected, r.result);
+    EXPECT_EQ(aExpected, r.lease->FirstError());
+    EXPECT_EQ(NS_SUCCEEDED(aExpected) ? MigrationPhase::Held
+                                      : MigrationPhase::FailedHeld,
+              r.lease->Phase());
+    EXPECT_EQ(0u, r.lease->mReleasePasses);
+    EXPECT_EQ(0u, r.lease->mReleaseCompletions);
+    auto release = r.lease->SettleConsumerAndRelease(aExpected);
+    EXPECT_EQ(release, r.lease->SettleConsumerAndRelease(aExpected));
+    EXPECT_EQ(aExpected, WaitMigration(release));
+    EXPECT_EQ(1u, r.lease->mReleasePasses);
+    EXPECT_EQ(1u, r.lease->mReleaseCompletions);
+    EXPECT_EQ(release, r.lease->SettleConsumerAndRelease(aExpected));
+    EXPECT_EQ(1u, r.lease->mReleasePasses);
+    EXPECT_EQ(1u, r.lease->mReleaseCompletions);
+    if (r.local)
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                r.local->ValidateHeld(r.lease->Generation()));
+    if (NS_SUCCEEDED(aExpected)) {
+      EXPECT_EQ(MigrationPhase::Released, r.lease->Phase());
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                r.lease->ValidateGeneration(r.lease->Generation()));
+      EXPECT_EQ(NS_OK, CheckMigrationWriter(MigrationWriterDomain::LocalStore));
+    } else {
+      EXPECT_EQ(MigrationPhase::FailedHeld, r.lease->Phase());
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                CheckMigrationWriter(MigrationWriterDomain::LocalStore));
+    }
+    EXPECT_EQ(NS_OK, r.lock->Unlock());
+  }
+
+  void CheckSelectedStoreOutput(bool aMaildir, uint32_t aBranch) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, aMaildir, false));
+    nsCOMPtr<nsIOutputStream> output;
+    ASSERT_EQ(NS_OK,
+              c.store->GetNewMsgOutputStream(c.folder, getter_AddRefs(output)));
+    constexpr auto body =
+        "From: pending@invalid\r\nSubject: pending\r\n\r\npending real bytes\r\n"_ns;
+    uint32_t written;
+    ASSERT_EQ(NS_OK,
+              output->Write(body.BeginReading(), body.Length(), &written));
+    ASSERT_EQ(body.Length(), written);
+    SelectedNativeRun r;
+    ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+    ASSERT_TRUE(r.local);
+    EXPECT_FALSE(r.drained);
+    EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+    EXPECT_EQ(r.drain, r.lease->AcquireAndDrain());
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              r.local->ValidateHeld(r.lease->Generation() + 1));
+    nsresult expected = NS_OK;
+    if (aBranch == 1) {
+      nsCOMPtr<nsIOutputStream> late;
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                c.store->GetNewMsgOutputStream(c.folder, getter_AddRefs(late)));
+      EXPECT_FALSE(late);
+      expected = NS_ERROR_NOT_AVAILABLE;
+    } else if (aBranch == 2) {
+      r.lease->Cancel(NS_ERROR_ABORT);
+      EXPECT_FALSE(r.drained);
+      expected = NS_ERROR_ABORT;
+    } else if (aBranch == 3) {
+      // Real mbox Close aborts the uncommitted write; subsequent Finish must
+      // report its exact closed-stream failure and cannot manufacture a token.
+      nsCString unchanged("not-a-token");
+      if (aMaildir) {
+        nsCOMPtr<nsIFile> cur, held, folder;
+        ASSERT_EQ(NS_OK, c.folder->GetFilePath(getter_AddRefs(folder)));
+        ASSERT_EQ(NS_OK, folder->Clone(getter_AddRefs(cur)));
+        ASSERT_EQ(NS_OK, cur->Append(u"cur"_ns));
+        ASSERT_EQ(NS_OK, cur->Clone(getter_AddRefs(held)));
+        ASSERT_EQ(NS_OK, held->MoveTo(folder, u"cur.original-held"_ns));
+        ASSERT_EQ(NS_OK, cur->Create(nsIFile::NORMAL_FILE_TYPE, 0600));
+        expected = c.store->FinishNewMessage(c.folder, output, unchanged);
+        EXPECT_TRUE(NS_FAILED(expected));
+        ASSERT_EQ(NS_OK, cur->Remove(false));
+        ASSERT_EQ(NS_OK, held->MoveTo(folder, u"cur"_ns));
+      } else {
+        ASSERT_EQ(NS_OK, output->Close());
+        expected = c.store->FinishNewMessage(c.folder, output, unchanged);
+        ASSERT_EQ(NS_BASE_STREAM_CLOSED, expected);
+      }
+      ASSERT_TRUE(NS_FAILED(expected));
+      EXPECT_EQ("not-a-token"_ns, unchanged);
+      EXPECT_FALSE(r.drained);
+    }
+    nsCString token;
+    if (!aBranch) {
+      ASSERT_EQ(NS_OK, c.store->FinishNewMessage(c.folder, output, token));
+      EXPECT_FALSE(token.IsEmpty());
+      nsCString committed;
+      ASSERT_EQ(NS_OK, SelectedBody(c, token, committed));
+      EXPECT_EQ(body, committed);
+    } else {
+      // Discard is actual already-owned cleanup, never a new admission.
+      nsresult discarded = c.store->DiscardNewMessage(c.folder, output);
+      EXPECT_EQ(aBranch == 3 && !aMaildir ? expected : NS_OK, discarded);
+      CheckSelectedOriginals(c);
+    }
+    output = nullptr;
+    FinishSelectedRun(r, expected);
+  }
+
+  void CheckSelectedCopy(bool aMaildir, bool aMove) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, aMaildir, false));
+    SelectedNativeRun r;
+    RefPtr<SelectedCopyObserver> listener = new SelectedCopyObserver();
+    listener->start = [&]() {
+      nsresult rv = ArmSelectedRun(r);
+      EXPECT_EQ(NS_OK, rv);
+      EXPECT_FALSE(r.drained);
+      EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+      return rv;
+    };
+    listener->stop = [&](nsresult status) {
+      EXPECT_EQ(NS_OK, status);
+      EXPECT_FALSE(r.drained);
+      EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+      nsTArray<nsMsgKey> source, destination;
+      EXPECT_EQ(NS_OK, c.database->ListAllKeys(source));
+      EXPECT_EQ(aMove ? 2u : 3u, source.Length());
+      nsCOMPtr<nsIMsgDatabase> db;
+      EXPECT_EQ(NS_OK, c.destination->GetMsgDatabase(getter_AddRefs(db)));
+      if (db) {
+        EXPECT_EQ(NS_OK, db->ListAllKeys(destination));
+        EXPECT_EQ(1u, destination.Length());
+        if (destination.Length() == 1) {
+          nsCOMPtr<nsIMsgDBHdr> header;
+          EXPECT_EQ(NS_OK, db->GetMsgHdrForKey(destination[0],
+                                               getter_AddRefs(header)));
+          nsCString token;
+          if (header) EXPECT_EQ(NS_OK, header->GetStoreToken(token));
+          nsCOMPtr<nsIInputStream> input;
+          EXPECT_EQ(NS_OK, c.store->GetMsgInputStream(c.destination, token, 0,
+                                                      getter_AddRefs(input)));
+          if (input) {
+            nsCString actual;
+            EXPECT_EQ(NS_OK, NS_ConsumeStream(input, UINT32_MAX, actual));
+            EXPECT_EQ(c.bodies[0], actual);
+            EXPECT_EQ(NS_OK, input->Close());
+          }
+        }
+      }
+      return NS_OK;
+    };
+    nsTArray<RefPtr<nsIMsgDBHdr>> selected{c.headers[0]};
+    ASSERT_EQ(NS_OK,
+              c.destination->CopyMessages(c.folder, selected, aMove, nullptr,
+                                          listener, false, false));
+    ASSERT_TRUE(SpinEventLoopUntil("Selected real copy callback"_ns,
+                                   [&] { return listener->stops != 0; }));
+    EXPECT_EQ(1u, listener->starts);
+    EXPECT_EQ(1u, listener->stops);
+    EXPECT_EQ(NS_OK, listener->result);
+    FinishSelectedRun(r, NS_OK);
+  }
+
+  void CheckSelectedExternal(bool aMaildir, bool aAlias) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, aMaildir, true));
+    auto removeExternal =
+        MakeScopeExit([&] { EXPECT_EQ(NS_OK, c.directory->Remove(true)); });
+    SelectedNativeRun r;
+    if (aAlias) {
+      nsCOMPtr<nsIMsgIncomingServer> other;
+      ASSERT_EQ(NS_OK, c.manager->CreateIncomingServer(
+                           "alias"_ns, "localhost"_ns, "none"_ns,
+                           getter_AddRefs(other)));
+      ASSERT_EQ(NS_OK, other->SetLocalPath(c.directory));
+      nsAutoCString key;
+      ASSERT_EQ(NS_OK, other->GetKey(key));
+      nsAutoString path;
+      ASSERT_EQ(NS_OK, c.directory->GetPath(path));
+      path.AppendLiteral("/.");
+      nsAutoCString pref("mail.server.");
+      pref.Append(key);
+      nsAutoCString relative(pref);
+      relative.AppendLiteral(".directory-rel");
+      nsAutoCString absolute(pref);
+      absolute.AppendLiteral(".directory");
+      Preferences::ClearUser(relative.get());
+      ASSERT_EQ(NS_OK, Preferences::SetCString(absolute.get(),
+                                               NS_ConvertUTF16toUTF8(path)));
+      ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+      // This is an actual persisted ambiguous root, not a fabricated view.
+      CheckSelectedOriginals(c);
+      EXPECT_TRUE(NS_FAILED(WaitMigration(r.drain)));
+      EXPECT_TRUE(NS_FAILED(r.lease->FirstError()));
+      EXPECT_NE(MigrationPhase::Held, r.lease->Phase());
+      nsresult error = r.lease->FirstError();
+      FinishSelectedRun(r, error);
+      return;
+    }
+    nsCOMPtr<nsIOutputStream> output;
+    ASSERT_EQ(NS_OK,
+              c.store->GetNewMsgOutputStream(c.folder, getter_AddRefs(output)));
+    ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+    ASSERT_TRUE(r.local);
+    EXPECT_FALSE(r.drained);
+    bool found = false;
+    nsAutoString original;
+    ASSERT_EQ(NS_OK, c.directory->GetPath(original));
+    for (const auto& root : r.lease->RootBindings()) {
+      if (root.canonicalPath.Equals(original)) {
+        found = true;
+        EXPECT_FALSE(root.physicalIdentity.IsEmpty());
+        EXPECT_FALSE(root.parentIdentity.IsEmpty());
+      }
+    }
+    ASSERT_TRUE(found);
+    nsCOMPtr<nsIFile> held, parent;
+    ASSERT_EQ(NS_OK, c.directory->Clone(getter_AddRefs(held)));
+    ASSERT_EQ(NS_OK, c.directory->GetParent(getter_AddRefs(parent)));
+    nsAutoString leaf;
+    ASSERT_EQ(NS_OK, c.directory->GetLeafName(leaf));
+    nsAutoString moved(leaf);
+    moved.AppendLiteral(".owned-held");
+    ASSERT_EQ(NS_OK, held->MoveTo(parent, moved));
+    ASSERT_EQ(NS_OK, c.directory->Create(nsIFile::DIRECTORY_TYPE, 0700));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, r.lease->ValidateSelectedIdentity());
+    r.lease->Cancel(NS_ERROR_NOT_AVAILABLE);
+    EXPECT_FALSE(r.drained);
+    ASSERT_EQ(NS_OK, c.directory->Remove(false));
+    ASSERT_EQ(NS_OK, held->MoveTo(parent, leaf));
+    EXPECT_EQ(NS_OK, r.lease->ValidateSelectedIdentity());
+    ASSERT_EQ(NS_OK, c.store->DiscardNewMessage(c.folder, output));
+    CheckSelectedOriginals(c);
+    FinishSelectedRun(r, NS_ERROR_NOT_AVAILABLE);
+  }
+
+  void CheckSelectedCompaction(bool aRenameFailure) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, false, false));
+    nsCOMPtr<nsIFile> source;
+    ASSERT_EQ(NS_OK, c.folder->GetFilePath(getter_AddRefs(source)));
+    nsCString original;
+    ASSERT_EQ(NS_OK, ReadSelectedFile(source, original));
+    SelectedNativeRun r;
+    RefPtr<SelectedCompactObserver> listener = new SelectedCompactObserver();
+    listener->complete = [&](nsresult status) {
+      EXPECT_EQ(NS_OK, status);
+      EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+      EXPECT_FALSE(r.drained);
+      if (aRenameFailure) {
+        nsCOMPtr<nsIFile> candidate;
+        nsresult rv = source->GetParent(getter_AddRefs(candidate));
+        if (NS_FAILED(rv)) return rv;
+        rv = candidate->Append(u".compact-temp"_ns);
+        if (NS_FAILED(rv)) return rv;
+        nsAutoString leaf;
+        rv = source->GetLeafName(leaf);
+        if (NS_FAILED(rv)) return rv;
+        leaf.AppendLiteral(".compacted");
+        rv = candidate->Append(leaf);
+        if (NS_FAILED(rv)) return rv;
+        // Remove only the newly produced candidate. The subsequent real rename
+        // fails; MboxCompactor must restore its original backup, not commit.
+        rv = candidate->Remove(false);
+        EXPECT_EQ(NS_OK, rv);
+        return rv;
+      }
+      return NS_OK;
+    };
+    listener->summary = [&](nsresult status) {
+      EXPECT_FALSE(r.drained);
+      EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+      nsCOMPtr<nsIFile> temporary;
+      EXPECT_EQ(NS_OK, source->GetParent(getter_AddRefs(temporary)));
+      if (temporary) {
+        EXPECT_EQ(NS_OK, temporary->Append(u".compact-temp"_ns));
+        bool exists = false;
+        EXPECT_EQ(NS_OK, temporary->Exists(&exists));
+        EXPECT_TRUE(
+            exists);  // Actual final removal is still ahead of callback.
+      }
+      EXPECT_EQ(aRenameFailure, NS_FAILED(status));
+      if (aRenameFailure) {
+        nsCString bytes;
+        EXPECT_EQ(NS_OK, ReadSelectedFile(source, bytes));
+        EXPECT_EQ(original, bytes);
+      }
+    };
+    ASSERT_EQ(NS_OK, c.store->AsyncCompact(c.folder, listener, false));
+    ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+    ASSERT_TRUE(r.local);
+    EXPECT_FALSE(r.drained);
+    ASSERT_TRUE(
+        SpinEventLoopUntil("Selected actual final compaction callback"_ns,
+                           [&] { return listener->finals != 0; }));
+    EXPECT_EQ(1u, listener->begins);
+    EXPECT_EQ(1u, listener->finals);
+    EXPECT_EQ(3u, listener->retained);
+    nsresult expected = aRenameFailure ? listener->result : NS_OK;
+    if (aRenameFailure) ASSERT_TRUE(NS_FAILED(expected));
+    FinishSelectedRun(r, expected);
+    nsCOMPtr<nsIFile> temporary;
+    ASSERT_EQ(NS_OK, source->GetParent(getter_AddRefs(temporary)));
+    ASSERT_EQ(NS_OK, temporary->Append(u".compact-temp"_ns));
+    bool exists = true;
+    ASSERT_EQ(NS_OK, temporary->Exists(&exists));
+    EXPECT_FALSE(exists);
+  }
+
+  void CheckSelectedPurge(bool aMaildir, bool aRetainedFailure) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, aMaildir, false));
+    if (aRetainedFailure) {
+      ASSERT_EQ(
+          NS_OK,
+          mConnection->ExecuteSimpleSQL(
+              "CREATE TEMP TRIGGER selected_purge_fail BEFORE DELETE ON "
+              "messages "
+              "BEGIN SELECT RAISE(ABORT,'actual selected purge failure'); END"_ns));
+    }
+    SelectedNativeRun r;
+    uint32_t callbacks = 0;
+    nsTArray<RefPtr<nsIMsgDBHdr>> selected{c.headers[0]}, removed;
+    nsresult purged = PurgeNativeMessages(
+        c.folder, c.database, selected, removed, [&](nsIMsgDBHdr* header) {
+          EXPECT_EQ(c.headers[0], header);
+          ++callbacks;
+          // This is the original real purge's callback, while its physical and
+          // metadata ownership is still on the production stack.
+          EXPECT_EQ(NS_OK, ArmSelectedRun(r));
+          EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+          EXPECT_FALSE(r.drained);
+          EXPECT_EQ(NS_ERROR_IN_PROGRESS, CheckNativePurgePending(c.folder));
+        });
+    ASSERT_EQ(1u, callbacks);
+    ASSERT_TRUE(r.lease && r.local);
+    if (aRetainedFailure) {
+      ASSERT_TRUE(NS_FAILED(purged));
+      EXPECT_TRUE(removed.IsEmpty());
+      EXPECT_FALSE(r.drained);
+      EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+      EXPECT_EQ(NS_ERROR_IN_PROGRESS, CheckNativePurgePending(c.folder));
+      CheckSelectedOriginals(c);
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(
+                           "DROP TRIGGER selected_purge_fail"_ns));
+      // Reconcile that exact retained production record, without replaying
+      // selection/deletion/count callbacks. A resolved native error stays
+      // error.
+      ASSERT_EQ(NS_OK, RecoverNativePurge(c.folder));
+      EXPECT_EQ(1u, callbacks);
+      EXPECT_EQ(NS_OK, CheckNativePurgePending(c.folder));
+      CheckSelectedOriginals(c);
+      FinishSelectedRun(r, purged);
+    } else {
+      ASSERT_EQ(NS_OK, purged);
+      ASSERT_EQ(1u, removed.Length());
+      EXPECT_EQ(c.headers[0], removed[0]);
+      EXPECT_EQ(NS_OK, CheckNativePurgePending(c.folder));
+      nsTArray<nsMsgKey> keys;
+      ASSERT_EQ(NS_OK, c.database->ListAllKeys(keys));
+      EXPECT_EQ(2u, keys.Length());
+      FinishSelectedRun(r, NS_OK);
+    }
+  }
+
+  nsresult BeginSelectedSink(SelectedLocalContext& c, const nsACString& aRaw,
+                             uint32_t aFlags, const nsACString& aOriginal,
+                             nsIPop3Sink** aSink) {
+    nsCOMPtr<nsIPop3IncomingServer> pop = do_QueryInterface(c.server);
+    NS_ENSURE_TRUE(pop, NS_ERROR_NO_INTERFACE);
+    nsCOMPtr<nsIPop3Sink> sink =
+        do_CreateInstance("@mozilla.org/messenger/pop3-sink;1");
+    NS_ENSURE_TRUE(sink, NS_ERROR_NOT_AVAILABLE);
+    MOZ_TRY(sink->SetPopServer(pop));
+    MOZ_TRY(sink->SetFolder(c.folder));
+    MOZ_TRY(sink->SetOrigMessageUri(aOriginal));
+    MOZ_TRY(sink->SetBuildMessageUri(!aOriginal.IsEmpty()));
+    nsAutoCString base;
+    MOZ_TRY(c.folder->GetBaseMessageURI(base));
+    MOZ_TRY(sink->SetBaseMessageUri(base));
+    MOZ_TRY(sink->BeginMailDelivery(true, nullptr));
+    MOZ_TRY(sink->IncorporateBegin("selected-live-uidl", aFlags));
+    int32_t begin = 0;
+    while (begin < int32_t(aRaw.Length())) {
+      int32_t end = aRaw.FindChar('\n', begin);
+      NS_ENSURE_TRUE(end != kNotFound, NS_ERROR_INVALID_ARG);
+      nsAutoCString line(Substring(aRaw, begin, end + 1 - begin));
+      MOZ_TRY(sink->IncorporateWrite(line.get(), line.Length()));
+      begin = end + 1;
+    }
+    sink.forget(aSink);
+    return NS_OK;
+  }
+  void CheckSelectedPopSink(bool aMaildir, bool aFailure) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, aMaildir, false, true));
+    constexpr auto partial =
+        "From: selected@invalid\r\nSubject: Partial selected\r\n"
+        "Message-ID: <selected-partial@invalid>\r\n\r\npartial original\r\n"_ns;
+    constexpr auto full =
+        "From: selected@invalid\r\nSubject: Completed selected\r\n"
+        "Message-ID: <selected-partial@invalid>\r\n\r\ncomplete actual body\r\n"_ns;
+    nsCOMPtr<nsIPop3Sink> sink;
+    nsCString originalURI, partialToken, originalPartialBody,
+        originalCompletedBody;
+    nsMsgKey partialKey = nsMsgKey_None;
+    if (aFailure) {
+      ASSERT_EQ(NS_OK, BeginSelectedSink(c, partial, nsMsgMessageFlags::Partial,
+                                         EmptyCString(), getter_AddRefs(sink)));
+      ASSERT_EQ(NS_OK,
+                sink->IncorporateComplete(nullptr, partial.Length(), nullptr));
+      ASSERT_EQ(NS_OK, sink->EndMailDelivery(nullptr));
+      nsTArray<nsMsgKey> keys;
+      ASSERT_EQ(NS_OK, c.database->ListAllKeys(keys));
+      ASSERT_EQ(4u, keys.Length());
+      for (nsMsgKey key : keys) {
+        nsCOMPtr<nsIMsgDBHdr> h;
+        ASSERT_EQ(NS_OK, c.database->GetMsgHdrForKey(key, getter_AddRefs(h)));
+        uint32_t flags;
+        ASSERT_EQ(NS_OK, h->GetFlags(&flags));
+        if (flags & nsMsgMessageFlags::Partial) {
+          partialKey = key;
+          ASSERT_EQ(NS_OK, h->GetStoreToken(partialToken));
+          ASSERT_EQ(NS_OK, c.folder->GetUriForMsg(h, originalURI));
+        }
+      }
+      ASSERT_NE(nsMsgKey_None, partialKey);
+      ASSERT_EQ(NS_OK, SelectedBody(c, partialToken, originalPartialBody));
+      EXPECT_TRUE(StringEndsWith(originalPartialBody, partial));
+      nsAutoCString trigger(
+          "CREATE TEMP TRIGGER selected_partial_failure BEFORE UPDATE OF "
+          "subject ON messages WHEN OLD.id=");
+      trigger.AppendInt(partialKey);
+      trigger.AppendLiteral(
+          " BEGIN SELECT RAISE(ABORT,'actual partial metadata failure'); END");
+      ASSERT_EQ(NS_OK, mConnection->ExecuteSimpleSQL(trigger));
+    } else {
+      // Cross-store Move requires the real stream-copy/filter callback rather
+      // than the synchronous maildir fast path. No callback/promise is faked.
+      nsCOMPtr<nsIMsgIncomingServer> target;
+      ASSERT_EQ(NS_OK, c.manager->CreateIncomingServer(
+                           "filter-target"_ns, "localhost"_ns, "none"_ns,
+                           getter_AddRefs(target)));
+      ASSERT_EQ(NS_OK,
+                target->SetStringValue(
+                    "storeContractID",
+                    aMaildir ? "@mozilla.org/msgstore/berkeleystore;1"_ns
+                             : "@mozilla.org/msgstore/maildirstore;1"_ns));
+      nsCOMPtr<nsIFile> dir;
+      ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(dir)));
+      ASSERT_EQ(NS_OK, dir->Append(u"actual-filter-target"_ns));
+      ASSERT_EQ(NS_OK, dir->Create(nsIFile::DIRECTORY_TYPE, 0700));
+      ASSERT_EQ(NS_OK, target->SetLocalPath(dir));
+      nsCOMPtr<nsIMsgFolder> root;
+      ASSERT_EQ(NS_OK, target->GetRootFolder(getter_AddRefs(root)));
+      nsCOMPtr<nsIMsgLocalMailFolder> local = do_QueryInterface(root);
+      ASSERT_TRUE(local);
+      ASSERT_EQ(NS_OK, local->CreateLocalSubfolder(
+                           "Filtered"_ns, getter_AddRefs(c.destination)));
+      nsCOMPtr<nsIMsgFilterList> filters;
+      ASSERT_EQ(NS_OK,
+                c.server->GetFilterList(nullptr, getter_AddRefs(filters)));
+      nsCOMPtr<nsIMsgFilter> filter;
+      ASSERT_EQ(NS_OK,
+                filters->CreateFilter("actual selected asynchronous move"_ns,
+                                      getter_AddRefs(filter)));
+      ASSERT_EQ(NS_OK, filter->SetEnabled(true));
+      ASSERT_EQ(NS_OK, filter->SetFilterType(nsMsgFilterType::InboxRule));
+      nsCOMPtr<nsIMsgSearchTerm> term;
+      ASSERT_EQ(NS_OK, filter->CreateTerm(getter_AddRefs(term)));
+      ASSERT_EQ(NS_OK, term->SetMatchAll(true));
+      ASSERT_EQ(NS_OK, filter->AppendTerm(term));
+      nsCOMPtr<nsIMsgRuleAction> action;
+      ASSERT_EQ(NS_OK, filter->CreateAction(getter_AddRefs(action)));
+      ASSERT_EQ(NS_OK, action->SetType(nsMsgFilterAction::MoveToFolder));
+      nsAutoCString destination;
+      ASSERT_EQ(NS_OK, c.destination->GetURI(destination));
+      ASSERT_EQ(NS_OK, action->SetTargetFolderUri(destination));
+      ASSERT_EQ(NS_OK, filter->AppendAction(action));
+      ASSERT_EQ(NS_OK, filters->InsertFilterAt(0, filter));
+    }
+    ASSERT_EQ(NS_OK,
+              BeginSelectedSink(c, full, 0, originalURI, getter_AddRefs(sink)));
+    SelectedNativeRun r;
+    RefPtr<SelectedSinkObserver> terminal = new SelectedSinkObserver();
+    terminal->stopped = [&](nsresult result) {
+      EXPECT_EQ(1u, terminal->calls);
+      EXPECT_FALSE(r.drained);
+      if (r.lease) EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+      EXPECT_TRUE(DatabaseCore::sConnection);
+      EXPECT_EQ(aFailure, NS_FAILED(result));
+    };
+    if (aFailure) {
+      ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+      EXPECT_FALSE(r.drained);
+      ASSERT_EQ(NS_OK,
+                sink->IncorporateComplete(nullptr, full.Length(), terminal));
+      ASSERT_EQ(1u, terminal->calls);
+      EXPECT_EQ(NS_ERROR_STORAGE_CONSTRAINT, terminal->result);
+      // Same physical Partial key/token/body/flags survive the actual SQL
+      // fault.
+      nsCOMPtr<nsIMsgDBHdr> retained;
+      ASSERT_EQ(NS_OK, c.database->GetMsgHdrForKey(partialKey,
+                                                   getter_AddRefs(retained)));
+      nsCString token, body;
+      ASSERT_EQ(NS_OK, retained->GetStoreToken(token));
+      EXPECT_EQ(partialToken, token);
+      uint32_t flags;
+      ASSERT_EQ(NS_OK, retained->GetFlags(&flags));
+      EXPECT_TRUE(flags & nsMsgMessageFlags::Partial);
+      ASSERT_EQ(NS_OK, SelectedBody(c, token, body));
+      EXPECT_EQ(originalPartialBody, body);
+      ASSERT_EQ(NS_ERROR_STORAGE_CONSTRAINT, sink->AbortMailDelivery(nullptr));
+      FinishSelectedRun(r, NS_ERROR_STORAGE_CONSTRAINT);
+    } else {
+      ASSERT_EQ(NS_OK,
+                sink->IncorporateComplete(nullptr, full.Length(), terminal));
+      ASSERT_EQ(0u,
+                terminal->calls);  // A synchronous substitute is not coverage.
+      nsTArray<nsMsgKey> sourceKeys;
+      ASSERT_EQ(NS_OK, c.database->ListAllKeys(sourceKeys));
+      ASSERT_EQ(4u, sourceKeys.Length());
+      for (nsMsgKey key : sourceKeys) {
+        bool old = false;
+        for (const auto& h : c.headers) {
+          nsMsgKey originalKey;
+          ASSERT_EQ(NS_OK, h->GetMessageKey(&originalKey));
+          old |= key == originalKey;
+        }
+        if (!old) {
+          nsCOMPtr<nsIMsgDBHdr> header;
+          ASSERT_EQ(NS_OK,
+                    c.database->GetMsgHdrForKey(key, getter_AddRefs(header)));
+          nsCString token;
+          ASSERT_EQ(NS_OK, header->GetStoreToken(token));
+          ASSERT_EQ(NS_OK, SelectedBody(c, token, originalCompletedBody));
+          EXPECT_TRUE(StringEndsWith(originalCompletedBody, full));
+          uint32_t size;
+          ASSERT_EQ(NS_OK, header->GetMessageSize(&size));
+          EXPECT_EQ(originalCompletedBody.Length(), size);
+        }
+      }
+      ASSERT_FALSE(originalCompletedBody.IsEmpty());
+      ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+      ASSERT_TRUE(r.local);
+      EXPECT_FALSE(r.drained);
+      ASSERT_TRUE(SpinEventLoopUntil("Selected actual POP filter completion"_ns,
+                                     [&] { return terminal->calls != 0; }));
+      EXPECT_EQ(1u, terminal->calls);
+      EXPECT_EQ(NS_OK, terminal->result);
+      ASSERT_EQ(NS_OK, sink->EndMailDelivery(nullptr));
+      nsCOMPtr<nsIMsgDatabase> db;
+      ASSERT_EQ(NS_OK, c.destination->GetMsgDatabase(getter_AddRefs(db)));
+      nsTArray<nsMsgKey> keys;
+      ASSERT_EQ(NS_OK, db->ListAllKeys(keys));
+      ASSERT_EQ(1u, keys.Length());
+      nsCOMPtr<nsIMsgDBHdr> header;
+      ASSERT_EQ(NS_OK, db->GetMsgHdrForKey(keys[0], getter_AddRefs(header)));
+      nsCString token;
+      ASSERT_EQ(NS_OK, header->GetStoreToken(token));
+      nsCOMPtr<nsIMsgPluggableStore> targetStore;
+      ASSERT_EQ(NS_OK, c.destination->GetMsgStore(getter_AddRefs(targetStore)));
+      nsCOMPtr<nsIInputStream> input;
+      ASSERT_EQ(NS_OK, targetStore->GetMsgInputStream(c.destination, token, 0,
+                                                      getter_AddRefs(input)));
+      nsCString bytes;
+      ASSERT_EQ(NS_OK, NS_ConsumeStream(input, UINT32_MAX, bytes));
+      ASSERT_EQ(NS_OK, input->Close());
+      EXPECT_EQ(originalCompletedBody, bytes);
+      CheckSelectedOriginals(c);
+      FinishSelectedRun(r, NS_OK);
+    }
+    terminal->stopped = nullptr;
+  }
+
+  already_AddRefed<dom::Promise> SelectedJSPromise(JSContext* cx,
+                                                   JS::HandleValue aValue) {
+    if (!aValue.isObject()) return nullptr;
+    JS::RootedObject object(cx, js::CheckedUnwrapStatic(&aValue.toObject()));
+    if (!object || !JS::IsPromiseObject(object)) return nullptr;
+    JSAutoRealm realm(cx, object);
+    RefPtr<dom::Promise> promise = dom::Promise::CreateFromExisting(
+        xpc::NativeGlobal(JS::CurrentGlobalOrNull(cx)), object);
+    if (!promise || !promise->SetAnyPromiseIsHandled()) return nullptr;
+    return promise.forget();
+  }
+  nsresult CallSelectedJS(JSContext* cx, JS::HandleObject aObject,
+                          const char* aMethod, JS::MutableHandleValue aResult) {
+    JS::RootedValue method(cx);
+    if (!JS_GetProperty(cx, aObject, aMethod, &method) ||
+        !JS::Call(cx, aObject, method, JS::HandleValueArray::empty(), aResult))
+      return NS_ERROR_FAILURE;
+    return NS_OK;
+  }
+  void CheckSelectedPopUidl(uint32_t aBranch) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, false, false, true));
+    nsCOMPtr<nsIFile> stateFile;
+    ASSERT_EQ(NS_OK, c.directory->Clone(getter_AddRefs(stateFile)));
+    ASSERT_EQ(NS_OK, stateFile->Append(u"popstate.dat"_ns));
+    constexpr auto original =
+        "# genuine selected UIDL\n*localhost selected-owner\nk selected-live-uidl 1\n"_ns;
+    nsCOMPtr<nsIOutputStream> output;
+    ASSERT_EQ(NS_OK,
+              NS_NewLocalFileOutputStream(getter_AddRefs(output), stateFile));
+    uint32_t written;
+    ASSERT_EQ(NS_OK, output->Write(original.BeginReading(), original.Length(),
+                                   &written));
+    ASSERT_EQ(original.Length(), written);
+    ASSERT_EQ(NS_OK, output->Close());
+    output = nullptr;
+    if (aBranch == 2) {
+      // Bind an actual loopback port, close only our own socket, then use the
+      // ordinary POP connection failure/cancellation path. No network mock or
+      // manual onFree/terminal invocation can release the queued client.
+      nsCOMPtr<nsIServerSocket> port =
+          do_CreateInstance("@mozilla.org/network/server-socket;1");
+      ASSERT_TRUE(port);
+      ASSERT_EQ(NS_OK, port->Init(-1, true, -1));
+      int32_t number;
+      ASSERT_EQ(NS_OK, port->GetPort(&number));
+      ASSERT_EQ(NS_OK, c.server->SetPort(number));
+      ASSERT_EQ(NS_OK, c.server->SetPassword(u"selected-test-only"_ns));
+      ASSERT_EQ(NS_OK, port->Close());
+    }
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    // Test orchestration calls only real product clients and real IO promises.
+    // There are no replacement IO methods, deferred promises or selected bags.
+    constexpr char script[] = R"js((server => {
+      const { Pop3Client } = ChromeUtils.importESModule("resource:///modules/Pop3Client.sys.mjs");
+      const owner = server.wrappedJSObject;
+      return {
+        first: new Pop3Client(server), second: new Pop3Client(server),
+        firstClients: 0, secondClients: 0, done: 0,
+        preload() { return this.first._loadUidlState(); },
+        start() {
+          this.write = this.first.markMessages(new Map([["selected-live-uidl", "f"]]));
+          this.read = this.second._loadUidlState();
+        },
+        queue() {
+          this.firstQueue = owner.withClient(client => {
+            this.firstClients++;
+            client.onDone = () => { this.done++; };
+          });
+          this.secondQueue = owner.withClient(client => { this.secondClients++; });
+          this.firstQueue.catch(() => {});
+          this.secondQueue.catch(() => {});
+        },
+      };
+    }))js";
+    JS::SourceText<mozilla::Utf8Unit> text;
+    ASSERT_TRUE(text.init(cx, script, sizeof(script) - 1,
+                          JS::SourceOwnership::Borrowed));
+    JS::CompileOptions options(cx);
+    options.setFileAndLine(__FILE__, __LINE__);
+    JS::RootedValue factory(cx), server(cx), state(cx), value(cx);
+    ASSERT_TRUE(JS::Evaluate(cx, options, text, &factory));
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, c.server, &server));
+    ASSERT_TRUE(JS::Call(cx, JS::UndefinedHandleValue, factory,
+                         JS::HandleValueArray(server), &state));
+    ASSERT_TRUE(state.isObject());
+    JS::RootedObject object(cx, &state.toObject());
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "preload", &value));
+    RefPtr<dom::Promise> preload = SelectedJSPromise(cx, value);
+    ASSERT_TRUE(preload);
+    ASSERT_TRUE(SpinEventLoopUntil("Selected actual UIDL preload"_ns, [&] {
+      return preload->State() != dom::Promise::PromiseState::Pending;
+    }));
+    ASSERT_EQ(dom::Promise::PromiseState::Resolved, preload->State());
+    nsCOMPtr<nsIFile> heldState;
+    if (aBranch == 1) {
+      // A real nonempty directory in place of popstate makes both read/atomic
+      // replacement fail without deleting the original UIDL bytes.
+      ASSERT_EQ(NS_OK, stateFile->Clone(getter_AddRefs(heldState)));
+      ASSERT_EQ(NS_OK,
+                heldState->MoveTo(c.directory, u"popstate.original-held"_ns));
+      ASSERT_EQ(NS_OK, stateFile->Create(nsIFile::DIRECTORY_TYPE, 0700));
+      nsCOMPtr<nsIFile> child;
+      ASSERT_EQ(NS_OK, stateFile->Clone(getter_AddRefs(child)));
+      ASSERT_EQ(NS_OK, child->Append(u"refuse-empty-directory-replacement"_ns));
+      ASSERT_EQ(NS_OK, child->Create(nsIFile::NORMAL_FILE_TYPE, 0600));
+    }
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "start", &value));
+    JS::RootedValue read(cx), write(cx);
+    ASSERT_TRUE(JS_GetProperty(cx, object, "read", &read));
+    ASSERT_TRUE(JS_GetProperty(cx, object, "write", &write));
+    RefPtr<dom::Promise> realRead = SelectedJSPromise(cx, read);
+    RefPtr<dom::Promise> realWrite = SelectedJSPromise(cx, write);
+    ASSERT_TRUE(realRead && realWrite);
+    EXPECT_EQ(dom::Promise::PromiseState::Pending, realRead->State());
+    EXPECT_EQ(dom::Promise::PromiseState::Pending, realWrite->State());
+    if (aBranch == 2) {
+      ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "queue", &value));
+      // Real first client creation, not completion, must occur before the
+      // fence.
+      ASSERT_TRUE(
+          SpinEventLoopUntil("Selected actual queued POP client"_ns, [&] {
+            JS::RootedValue count(cx);
+            return JS_GetProperty(cx, object, "firstClients", &count) &&
+                   count.isNumber() && count.toNumber() == 1;
+          }));
+    }
+    SelectedNativeRun r;
+    ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+    EXPECT_FALSE(r.drained);
+    EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+    if (aBranch == 2) r.lease->Cancel(NS_ERROR_ABORT);
+    ASSERT_TRUE(SpinEventLoopUntil(
+        "Selected actual UIDL and independent mark terminal"_ns, [&] {
+          return realRead->State() != dom::Promise::PromiseState::Pending &&
+                 realWrite->State() != dom::Promise::PromiseState::Pending;
+        }));
+    if (aBranch == 0) {
+      EXPECT_EQ(dom::Promise::PromiseState::Resolved, realRead->State());
+      EXPECT_EQ(dom::Promise::PromiseState::Resolved, realWrite->State());
+      nsCString bytes;
+      ASSERT_EQ(NS_OK, ReadSelectedFile(stateFile, bytes));
+      EXPECT_NE(kNotFound, bytes.Find("f selected-live-uidl 1"));
+      FinishSelectedRun(r, NS_OK);
+    } else {
+      if (aBranch == 1) {
+        EXPECT_EQ(dom::Promise::PromiseState::Rejected, realRead->State());
+        EXPECT_EQ(dom::Promise::PromiseState::Rejected, realWrite->State());
+        nsCString bytes;
+        ASSERT_EQ(NS_OK, ReadSelectedFile(heldState, bytes));
+        EXPECT_EQ(original, bytes);
+      }
+      ASSERT_TRUE(SpinEventLoopUntil(
+          "Selected actual failed POP participant terminal"_ns,
+          [&] { return r.drained; }));
+      nsresult expected = r.lease->FirstError();
+      ASSERT_TRUE(NS_FAILED(expected));
+      if (aBranch == 2) {
+        EXPECT_EQ(NS_ERROR_ABORT, expected);
+        JS::RootedValue count(cx);
+        ASSERT_TRUE(JS_GetProperty(cx, object, "secondClients", &count));
+        ASSERT_TRUE(count.isNumber());
+        EXPECT_EQ(0, count.toNumber());
+        ASSERT_TRUE(JS_GetProperty(cx, object, "done", &count));
+        ASSERT_TRUE(count.isNumber());
+        EXPECT_EQ(1, count.toNumber());
+      }
+      FinishSelectedRun(r, expected);
+      if (aBranch == 1) {
+        ASSERT_EQ(NS_OK, stateFile->Remove(true));
+        ASSERT_EQ(NS_OK, heldState->MoveTo(c.directory, u"popstate.dat"_ns));
+      }
+    }
+  }
+
+  void CheckSelectedSearchMail(uint32_t aBranch) {
+    (void)StaticPrefs::mail_panorama_enabled_AtStartup();
+    AutoRestore<bool> native(
+        StaticPrefs::sMirror_mail_panorama_enabled_AtStartup);
+    StaticPrefs::sMirror_mail_panorama_enabled_AtStartup = true;
+    const char* pref = "mailnews.database.global.indexer.enabled";
+    bool hadPref = Preferences::HasUserValue(pref);
+    bool oldPref = Preferences::GetBool(pref, false);
+    ASSERT_EQ(NS_OK, Preferences::SetBool(pref, true));
+    auto restorePref = MakeScopeExit([&] {
+      if (hadPref)
+        (void)Preferences::SetBool(pref, oldPref);
+      else
+        (void)Preferences::ClearUser(pref);
+    });
+    SelectedLocalContext c;
+    ASSERT_EQ(NS_OK, PrepareSelectedLocal(c, false, false));
+    nsCString sourceId;
+    ASSERT_EQ(NS_OK, mCore->GetSourceId(sourceId));
+    nsCOMPtr<nsIFile> sidecar, openingFile, deniedFile;
+    auto path = [&](const nsAString& name, nsIFile** output) -> nsresult {
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(mProfile->Clone(getter_AddRefs(file)));
+      MOZ_TRY(file->Append(name));
+      file.forget(output);
+      return NS_OK;
+    };
+    ASSERT_EQ(NS_OK,
+              path(u"selected-mail-search.sqlite"_ns, getter_AddRefs(sidecar)));
+    ASSERT_EQ(NS_OK, path(u"selected-opening-search.sqlite"_ns,
+                          getter_AddRefs(openingFile)));
+    ASSERT_EQ(NS_OK, path(u"selected-denied-search.sqlite"_ns,
+                          getter_AddRefs(deniedFile)));
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    constexpr char script[] =
+        R"js(((file, openingFile, deniedFile, nativeDB, sourceId) => {
+      const { MailSearchService } = ChromeUtils.importESModule("resource:///modules/panorama/MailSearchService.sys.mjs");
+      return {
+        async prepare() {
+          this.service = await MailSearchService.open(file, sourceId, nativeDB);
+          for (let pass = 0; pass < 16; pass++) {
+            const progress = await this.service.update({ limit: 500 });
+            if (!progress.moreWork) return;
+          }
+          throw new Error("Actual bounded warm search did not finish");
+        },
+        start() {
+          this.writeSettled = this.openSettled = false;
+          this.write = this.service.update({ limit: 1 });
+          this.opening = MailSearchService.open(openingFile, sourceId, nativeDB);
+          this.write.then(value => { this.progress = value; this.writeSettled = true; }, error => { this.writeError = error; this.writeSettled = true; });
+          this.opening.then(value => { this.opened = value; this.openSettled = true; }, error => { this.openError = error; this.openSettled = true; });
+        },
+        deny() {
+          return MailSearchService.open(deniedFile, sourceId, nativeDB).then(
+            () => { throw new Error("Late actual search factory was admitted"); },
+            error => { if (error.result !== Cr.NS_ERROR_NOT_AVAILABLE) throw error; this.denial = error; }
+          );
+        },
+        check() {
+          if (!this.writeSettled || !this.openSettled || this.writeError || this.openError ||
+              !this.service.closed || !this.service.migrationSettled ||
+              !this.opened?.closed || !this.opened.migrationSettled) {
+            throw new Error("Captured original search work/storage callbacks did not settle");
+          }
+          return this.progress.acceptedThrough;
+        },
+      };
+    }))js";
+    JS::SourceText<mozilla::Utf8Unit> text;
+    ASSERT_TRUE(text.init(cx, script, sizeof(script) - 1,
+                          JS::SourceOwnership::Borrowed));
+    JS::CompileOptions options(cx);
+    options.setFileAndLine(__FILE__, __LINE__);
+    JS::RootedValue factory(cx), value(cx), state(cx);
+    ASSERT_TRUE(JS::Evaluate(cx, options, text, &factory));
+    JS::RootedValueArray<5> args(cx);
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, sidecar, args[0]));
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, openingFile, args[1]));
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, deniedFile, args[2]));
+    ASSERT_EQ(NS_OK,
+              nsContentUtils::WrapNative(
+                  cx, static_cast<nsIMessageDatabase*>(&mCore->MessageDB()),
+                  args[3]));
+    JS::RootedString source(
+        cx, JS_NewStringCopyN(cx, sourceId.get(), sourceId.Length()));
+    ASSERT_TRUE(source);
+    args[4].setString(source);
+    ASSERT_TRUE(JS::Call(cx, JS::UndefinedHandleValue, factory, args, &state));
+    ASSERT_TRUE(state.isObject());
+    JS::RootedObject object(cx, &state.toObject());
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "prepare", &value));
+    RefPtr<dom::Promise> prepare = SelectedJSPromise(cx, value);
+    ASSERT_TRUE(prepare);
+    ASSERT_TRUE(SpinEventLoopUntil("Selected real mail search prepare"_ns, [&] {
+      return prepare->State() != dom::Promise::PromiseState::Pending;
+    }));
+    ASSERT_EQ(dom::Promise::PromiseState::Resolved, prepare->State());
+    uint64_t before, through;
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetSearchWatermark(before));
+    nsCOMPtr<nsIMsgDBHdr> added;
+    ASSERT_EQ(
+        NS_OK,
+        c.local->AddMessage(
+            "From: native@example.invalid\r\nTo: "
+            "original@example.invalid\r\nSubject: "
+            "selected-s508-live-mail\r\nMessage-ID: "
+            "<selected-s508-live-mail@invalid>\r\nContent-Type: text/plain; "
+            "charset=utf-8\r\n\r\nretained-s508-real-mail-body\r\n",
+            getter_AddRefs(added)));
+    nsMsgKey key;
+    ASSERT_EQ(NS_OK, added->GetMessageKey(&key));
+    ASSERT_EQ(NS_OK, mCore->MessageDB().GetSearchWatermark(through));
+    ASSERT_GT(through, before);
+    nsCOMPtr<nsIFile> actualStore;
+    ASSERT_EQ(NS_OK, c.folder->GetFilePath(getter_AddRefs(actualStore)));
+    nsCString originalBytes;
+    ASSERT_EQ(NS_OK, ReadSelectedFile(actualStore, originalBytes));
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "start", &value));
+    JS::RootedValue write(cx), opening(cx);
+    ASSERT_TRUE(JS_GetProperty(cx, object, "write", &write));
+    ASSERT_TRUE(JS_GetProperty(cx, object, "opening", &opening));
+    RefPtr<dom::Promise> actualWrite = SelectedJSPromise(cx, write);
+    RefPtr<dom::Promise> actualOpen = SelectedJSPromise(cx, opening);
+    ASSERT_TRUE(actualWrite && actualOpen);
+    // No event-loop turn, synthetic resolver or sleep between these real calls
+    // and selection. Already-finished work fails the required pending ordering.
+    ASSERT_EQ(dom::Promise::PromiseState::Pending, actualWrite->State());
+    ASSERT_EQ(dom::Promise::PromiseState::Pending, actualOpen->State());
+    SelectedNativeRun r;
+    ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+    EXPECT_FALSE(r.drained);
+    EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+    RefPtr<dom::Promise> denied;
+    if (aBranch == 1) r.lease->Cancel(NS_ERROR_ABORT);
+    if (aBranch == 2) {
+      ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "deny", &value));
+      denied = SelectedJSPromise(cx, value);
+      ASSERT_TRUE(denied);
+    }
+    nsresult expected = aBranch == 0   ? NS_OK
+                        : aBranch == 1 ? NS_ERROR_ABORT
+                                       : NS_ERROR_NOT_AVAILABLE;
+    ASSERT_EQ(expected, WaitMigration(r.drain));
+    ASSERT_EQ(dom::Promise::PromiseState::Resolved, actualWrite->State());
+    ASSERT_EQ(dom::Promise::PromiseState::Resolved, actualOpen->State());
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "check", &value));
+    ASSERT_TRUE(value.isNumber());
+    uint64_t accepted = uint64_t(value.toNumber());
+    EXPECT_GT(accepted, before);
+    EXPECT_LE(accepted, through);
+    if (denied) {
+      ASSERT_EQ(dom::Promise::PromiseState::Resolved, denied->State());
+      bool exists;
+      ASSERT_EQ(NS_OK, deniedFile->Exists(&exists));
+      EXPECT_FALSE(exists);
+    }
+    nsCOMPtr<nsIProfileLock> conflict;
+    nsCOMPtr<nsIProfileUnlocker> conflictUnlocker;
+    EXPECT_TRUE(NS_FAILED(NS_LockProfilePath(mProfile, mProfile,
+                                             getter_AddRefs(conflictUnlocker),
+                                             getter_AddRefs(conflict))));
+    EXPECT_FALSE(conflict);
+    FinishSelectedRun(r, expected);
+    nsCString afterBytes;
+    ASSERT_EQ(NS_OK, ReadSelectedFile(actualStore, afterBytes));
+    EXPECT_EQ(originalBytes, afterBytes);
+    // Read the real settled sidecar with ordinary storage. The source/cursor,
+    // physical key and actual text must have committed; empty work cannot pass.
+    nsCOMPtr<mozIStorageConnection> check;
+    ASSERT_EQ(NS_OK,
+              mStorage->OpenUnsharedDatabase(sidecar, getter_AddRefs(check)));
+    nsCOMPtr<mozIStorageStatement> row;
+    ASSERT_EQ(NS_OK, check->CreateStatement(
+                         "SELECT sourceId,checkpoint FROM work_state"_ns,
+                         getter_AddRefs(row)));
+    bool more;
+    ASSERT_EQ(NS_OK, row->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    nsCString recorded;
+    int64_t checkpoint;
+    ASSERT_EQ(NS_OK, row->GetUTF8String(0, recorded));
+    EXPECT_EQ(sourceId, recorded);
+    ASSERT_EQ(NS_OK, row->GetInt64(1, &checkpoint));
+    EXPECT_EQ(accepted, uint64_t(checkpoint));
+    ASSERT_EQ(NS_OK, row->Finalize());
+    ASSERT_EQ(NS_OK,
+              check->CreateStatement(
+                  "SELECT subject,body FROM documents WHERE documentId=:id"_ns,
+                  getter_AddRefs(row)));
+    nsAutoCString id;
+    id.AppendInt(key);
+    ASSERT_EQ(NS_OK, row->BindUTF8StringByName("id"_ns, id));
+    ASSERT_EQ(NS_OK, row->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    ASSERT_EQ(NS_OK, row->GetUTF8String(0, recorded));
+    EXPECT_EQ("selected-s508-live-mail"_ns, recorded);
+    ASSERT_EQ(NS_OK, row->GetUTF8String(1, recorded));
+    EXPECT_NE(kNotFound, recorded.Find("retained-s508-real-mail-body"));
+    ASSERT_EQ(NS_OK, row->Finalize());
+    row = nullptr;
+    ASSERT_EQ(NS_OK, check->Close());
+  }
+
+  void CheckSelectedChatSidecar(nsIFile* aFile, uint32_t aBranch,
+                                const nsACString& aExpectedRevision) {
+    nsCOMPtr<mozIStorageConnection> connection;
+    ASSERT_EQ(NS_OK, mStorage->OpenUnsharedDatabase(
+                         aFile, getter_AddRefs(connection)));
+    nsCOMPtr<nsIFts3Tokenizer> tokenizer =
+        do_GetService("@mozilla.org/messenger/fts3tokenizer;1");
+    ASSERT_TRUE(tokenizer);
+    ASSERT_EQ(NS_OK, tokenizer->RegisterTokenizer(connection));
+    nsCOMPtr<mozIStorageStatement> row;
+    constexpr auto id =
+        "chat:[\"search-test\",\"s508-archive\",\"buddy\",\"2022-03-04.120000+0000.json\"]"_ns;
+    ASSERT_EQ(
+        NS_OK,
+        connection->CreateStatement(
+            "SELECT contentRevision,textRevision,subject,body FROM documents WHERE documentId=:id"_ns,
+            getter_AddRefs(row)));
+    ASSERT_EQ(NS_OK, row->BindUTF8StringByName("id"_ns, id));
+    bool more;
+    ASSERT_EQ(NS_OK, row->ExecuteStep(&more));
+    if (aBranch == 3) {
+      // A genuine SQLite BEFORE INSERT failure must not publish partial text.
+      EXPECT_FALSE(more);
+    } else {
+      ASSERT_TRUE(more);
+      nsCString revision, textRevision, subject, body;
+      ASSERT_EQ(NS_OK, row->GetUTF8String(0, revision));
+      EXPECT_EQ(aExpectedRevision, revision);
+      ASSERT_EQ(NS_OK, row->GetUTF8String(1, textRevision));
+      EXPECT_FALSE(textRevision.IsEmpty());
+      ASSERT_EQ(NS_OK, row->GetUTF8String(2, subject));
+      EXPECT_EQ("Retained S508 archive"_ns, subject);
+      ASSERT_EQ(NS_OK, row->GetUTF8String(3, body));
+      EXPECT_NE(kNotFound, body.Find("retained-s508-archive-source"));
+      if (aBranch != 7)
+        EXPECT_NE(kNotFound, body.Find("retained-s508-native-queued-change"));
+      ASSERT_EQ(NS_OK, row->ExecuteStep(&more));
+      EXPECT_FALSE(more);
+    }
+    ASSERT_EQ(NS_OK, row->Finalize());
+    ASSERT_EQ(
+        NS_OK,
+        connection->CreateStatement(
+            "SELECT count(*) FROM search_text JOIN documents d ON d.id=search_text.docid WHERE d.documentId=:id AND search_text MATCH :words"_ns,
+            getter_AddRefs(row)));
+    ASSERT_EQ(NS_OK, row->BindUTF8StringByName("id"_ns, id));
+    ASSERT_EQ(NS_OK,
+              row->BindUTF8StringByName(
+                  "words"_ns, aBranch == 7 ? "archive"_ns : "queued"_ns));
+    ASSERT_EQ(NS_OK, row->ExecuteStep(&more));
+    ASSERT_TRUE(more);
+    int64_t count;
+    ASSERT_EQ(NS_OK, row->GetInt64(0, &count));
+    EXPECT_EQ(aBranch == 3 ? 0 : 1, count);
+    ASSERT_EQ(NS_OK, row->Finalize());
+    row = nullptr;
+    ASSERT_EQ(NS_OK, connection->Close());
+  }
+
+  // 0 pending provider/service publication + real MI consumer; 1 cancellation;
+  // 2 late real factory/Logger refusal; 3 real SQL/cleanup IO first+later
+  // errors; 4 root loss with actual terminals but withheld native custody; 5
+  // genuine opaque-work lifetime/foreign/reentry/once; 6 exact pending privacy
+  // capture only (never erasure credit); 7 strict malformed tail; 8 warm Chat
+  // refusal; 9 pre-capture/early release cannot certify actual GS settlement.
+  void CheckSelectedSearchChat(uint32_t aBranch) {
+    ASSERT_LE(aBranch, 9u);
+    const char* pref = "mailnews.database.global.indexer.enabled";
+    bool hadPref = Preferences::HasUserValue(pref);
+    bool oldPref = Preferences::GetBool(pref, false);
+    ASSERT_EQ(NS_OK, Preferences::SetBool(pref, true));
+    auto restorePref = MakeScopeExit([&] {
+      if (hadPref)
+        (void)Preferences::SetBool(pref, oldPref);
+      else
+        (void)Preferences::ClearUser(pref);
+    });
+    nsCOMPtr<nsIFile> controls, requestFile, logFile, mainFile;
+    ASSERT_EQ(NS_OK, mProfile->GetParent(getter_AddRefs(controls)));
+    ASSERT_EQ(NS_OK, controls->Append(u"selected-chat-consumer-controls"_ns));
+    ASSERT_EQ(NS_OK, controls->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(requestFile)));
+    nsAutoString leaf;
+    ASSERT_EQ(NS_OK, requestFile->GetLeafName(leaf));
+    leaf.AppendLiteral(".live-owner-request.json");
+    ASSERT_EQ(NS_OK, requestFile->SetLeafName(leaf));
+    bool preserveUnknown = false;
+    auto cleanup = MakeScopeExit([&] {
+      if (preserveUnknown) return;
+      bool exists;
+      if (NS_SUCCEEDED(requestFile->Exists(&exists)) && exists)
+        EXPECT_EQ(NS_OK, requestFile->Remove(false));
+      EXPECT_EQ(NS_OK, controls->Remove(true));
+    });
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(logFile)));
+    for (const auto* component : {u"logs", u"search-test", u"s508-archive",
+                                  u"buddy", u"2022-03-04.120000+0000.json"})
+      ASSERT_EQ(NS_OK, logFile->Append(nsDependentString(component)));
+    ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(mainFile)));
+    ASSERT_EQ(NS_OK, mainFile->Append(u"selected-native-chat.sqlite"_ns));
+    constexpr auto initial =
+        "{\"date\":\"2022-03-04T12:00:00.000Z\",\"name\":\"buddy\",\"title\":\"Retained S508 archive\",\"account\":\"s508-archive\",\"normalizedName\":\"buddy\",\"protocol\":\"search-test\",\"isChat\":false}\n{\"date\":\"2022-03-04T12:00:01.000Z\",\"who\":\"sender\",\"text\":\"retained-s508-archive-source\",\"flags\":[\"incoming\"],\"remoteId\":\"s508-archive-first\"}\n"_ns;
+    constexpr auto extra =
+        "{\"date\":\"2022-03-04T12:00:02.000Z\",\"who\":\"sender\",\"text\":\"retained-s508-native-queued-change\",\"flags\":[\"incoming\"],\"remoteId\":\"s508-archive-second\"}\n"_ns;
+    nsCString expected(initial);
+    if (aBranch == 7)
+      expected.AppendLiteral("{\"date\":");
+    else if (aBranch != 6)
+      expected.Append(extra);
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    constexpr char script[] = R"js(((profile, controls, branch) => {
+  const { FileUtils } = ChromeUtils.importESModule("resource://gre/modules/FileUtils.sys.mjs");
+  const { ChatSearchProvider, chatSearchDocumentId } = ChromeUtils.importESModule("resource:///modules/panorama/ChatSearchProvider.sys.mjs");
+  const { ChatSearchService } = ChromeUtils.importESModule("resource:///modules/panorama/ChatSearchService.sys.mjs");
+  const { PanoramaSearchIndex } = ChromeUtils.importESModule("resource:///modules/panorama/PanoramaSearchIndex.sys.mjs");
+  const migration = ChromeUtils.importESModule("resource:///modules/panorama/SearchMigrationHold.sys.mjs");
+  const logger = ChromeUtils.importESModule("resource:///modules/logger.sys.mjs");
+  if (PathUtils.profileDir !== profile.path) throw new Error("Real profile binding differs; no cache reset is allowed");
+  const parts = ["search-test", "s508-archive", "buddy", "2022-03-04.120000+0000.json"];
+  const path = PathUtils.join(profile.path, "logs", ...parts);
+  const id = chatSearchDocumentId(path);
+  const initial = '{"date":"2022-03-04T12:00:00.000Z","name":"buddy","title":"Retained S508 archive","account":"s508-archive","normalizedName":"buddy","protocol":"search-test","isChat":false}\n{"date":"2022-03-04T12:00:01.000Z","who":"sender","text":"retained-s508-archive-source","flags":["incoming"],"remoteId":"s508-archive-first"}\n';
+  const extra = '{"date":"2022-03-04T12:00:02.000Z","who":"sender","text":"retained-s508-native-queued-change","flags":["incoming"],"remoteId":"s508-archive-second"}\n';
+  const expected = branch === 6 ? initial : branch === 7 ? initial + '{"date":' : initial + extra;
+  const file = name => new FileUtils.File(PathUtils.join(profile.path, name));
+  const files = { main: file("selected-native-chat.sqlite"), opening: file("selected-native-chat-opening.sqlite"), service: file("selected-native-chat-service.sqlite"), deniedProvider: file("selected-native-chat-denied-provider.sqlite"), deniedService: file("selected-native-chat-denied-service.sqlite") };
+  function digest(bytes) {
+    const hash = Cc["@mozilla.org/security/hash;1"].createInstance(Ci.nsICryptoHash);
+    hash.init(hash.SHA256); hash.update(bytes, bytes.length);
+    return Array.from(hash.finish(false), c => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  }
+  const textDigest = text => digest(new TextEncoder().encode(text));
+  const state = {
+    files, path, id, expected, initial, expectedRevision: textDigest(expected), initialRevision: textDigest(initial),
+    records: {}, closes: new Map(), indexes: [], background: [], forbiddenCalls: 0,
+    observe(name, promise) {
+      const record = this.records[name] = { promise, settled: false, terminals: 0 };
+      promise.then(value => { record.value = value; record.settled = true; record.terminals++; }, error => { record.error = error; record.settled = true; record.terminals++; });
+      return promise;
+    },
+    async rejectBeforeIO(operation) {
+      let rejected = false;
+      try { await operation(); } catch (error) {
+        if (error.result !== Cr.NS_ERROR_NOT_AVAILABLE) throw error;
+        rejected = true;
+      }
+      if (!rejected) throw new Error("Unknown/expired archive operation was admitted");
+      this.forbiddenCalls++;
+    },
+    async prepare() {
+      await IOUtils.makeDirectory(PathUtils.parent(path), { createAncestors: true });
+      await IOUtils.writeUTF8(path, initial, { noOverwrite: true });
+      if (digest(await IOUtils.read(path)) !== "a5f11ed9c57031b1eca9dc5c4180fe6a01bf45bd6d39bcb99b5ad516be5c0a00") throw new Error("Original GS172 stopped source bytes differ");
+      await IOUtils.writeJSON(profile.path + ".live-owner-request.json", {
+        version: 1, operationId: "native-chat-" + branch,
+        profilePath: profile.path, localProfilePath: profile.path,
+        backupPath: PathUtils.join(controls.path, "backup"), journalPath: PathUtils.join(controls.path, "journal.json"), resultPath: PathUtils.join(controls.path, "result.json"),
+      }, { noOverwrite: true });
+      if (branch === 6) return;
+      this.provider = await ChatSearchProvider.open(files.main);
+      if (branch !== 3) {
+        const refreshed = await this.provider.refreshLog(path);
+        if (refreshed.id !== id || refreshed.indexed !== true) throw new Error("Actual stopped parser/index did not publish the original physical transcript");
+        const page = await this.provider.search("retained-s508-archive-source");
+        const hit = page.items.find(item => item.id === id);
+        if (!hit || hit.contentRevision !== textDigest(initial) || !hit.textRevision) throw new Error("Real canonical search/source/text tokens are missing");
+        const resolved = await this.provider.resolveLog(hit);
+        if (resolved.status !== "ready" || resolved.id !== id || resolved.contentRevision !== hit.contentRevision || resolved.textRevision !== hit.textRevision || !resolved.log || !resolved.conversation) throw new Error("Actual provider source/parser readback did not resolve its current hit");
+        this.originalHit = hit;
+      }
+      await migration.openSearchWriter("chat-search", async work => {
+        const archive = await logger.getChatLogArchive(work);
+        await archive.queueFileOperation(path, wait => wait(() => IOUtils.writeUTF8(path, expected)));
+      });
+      if (branch === 5) {
+        await this.rejectBeforeIO(() => logger.getChatLogArchive(null));
+        await this.rejectBeforeIO(() => logger.getChatLogArchive({}));
+        await migration.openSearchWriter("mail-search", async work => {
+          await this.rejectBeforeIO(() => logger.getChatLogArchive(work));
+        });
+        await migration.openSearchWriter("chat-search", async work => {
+          this.expiredArchive = await logger.getChatLogArchive(work);
+          this.expiredLog = await this.expiredArchive.getLogFromFile(path);
+          const conversation = await this.expiredLog.getConversation();
+          if (!conversation || conversation.title !== "Retained S508 archive") throw new Error("Real stopped Log parser was not reached");
+        });
+        await this.rejectBeforeIO(() => this.expiredArchive.getLogFromFile(path));
+        await this.rejectBeforeIO(() => this.expiredLog.getConversation());
+        if (this.forbiddenCalls !== 5) throw new Error("Required provenance refusals did not execute");
+      }
+      if (branch === 8) {
+        // Ordinary public Chat admission, real queued IO and its actual terminal.
+        // Even after it finishes, sticky Started cannot become cold selection.
+        await logger.queueFileOperation(path, () => IOUtils.read(path));
+      }
+    },
+    start() {
+      if (branch === 6) {
+        this.observe("capture", migration.openSearchWriter("chat-search", async work => {
+          const archive = await logger.getChatLogArchive(work);
+          const message = {
+            deleted: true, remoteId: "s508-archive-first",
+            conversation: { account: { normalizedName: "s508-archive", protocol: { normalizedName: "search-test" } }, normalizedName: "buddy", isChat: false },
+            get message() { throw new Error("Private payload must not be read for identity capture"); },
+            get displayMessage() { throw new Error("Private display payload must not be read"); },
+          };
+          const receipt = await archive.captureChatPrivacyIntent(message);
+          const privacy = await archive.getChatPrivacyState();
+          if (!receipt || receipt.status !== "pending" || receipt.remoteId !== message.remoteId || receipt.targets.length !== 1 || privacy.historyKnown !== false || privacy.completed.length !== 0 || !privacy.pending.some(item => item.id === receipt.id)) throw new Error("Actual durable pending capture/history contract differs");
+          const target = receipt.targets[0];
+          const lines = initial.trimEnd().split("\n");
+          if (JSON.stringify(target.relativePath) !== JSON.stringify(parts) || target.headerSha256 !== textDigest(lines[0]) || target.records.length !== 1 || target.records[0].line !== 1 || target.records[0].beforeSha256 !== textDigest(lines[1])) throw new Error("Capture did not bind the exact existing header/line version");
+          const source = await archive.readChatPrivacyTarget(receipt.id, parts);
+          if (source.missing || source.revision !== textDigest(initial)) throw new Error("Original source version/absence was replaced by authority");
+          this.captureReceipt = receipt;
+          return receipt;
+        }));
+        return;
+      }
+      if (branch === 3) {
+        this.observe("refresh", migration.openSearchWriter("chat-search", async work => {
+          let first;
+          try { await this.provider.refreshLog(path, {}, work); } catch (error) { first = error; }
+          if (!first || !String(first.message).includes("core_native_chat_index_fault")) throw new Error("Actual SQLite trigger failure was not reached");
+          this.primary = first;
+          const archive = await logger.getChatLogArchive(work);
+          try {
+            await archive.queueFileOperation(path, wait => wait(() => IOUtils.read(PathUtils.parent(path))));
+          } catch (error) { this.secondary = error; }
+          if (!this.secondary || this.secondary === first) throw new Error("Distinct actual cleanup IO failure was not retained");
+          const recovered = await archive.queueFileOperation(path, wait => wait(() => IOUtils.read(path)));
+          if (digest(recovered) !== this.expectedRevision) throw new Error("Recovered real queue successor did not read the original physical bytes");
+          this.recovered = true;
+          throw first;
+        }));
+      } else if (branch === 7) {
+        this.observe("refresh", migration.openSearchWriter("chat-search", async work => {
+          try { return await this.provider.refreshLog(path, {}, work); }
+          catch (error) {
+            // Classify the original source rejection while this genuine parent
+            // operation still owns it, before normal close changes isSourceError.
+            this.malformed = { error, source: this.provider.isSourceError(error) };
+            throw error;
+          }
+        }));
+      } else {
+        this.observe("refresh", this.provider.refreshLog(path));
+      }
+      this.observe("opening", ChatSearchProvider.open(files.opening));
+      this.observe("service", ChatSearchService.open(files.service, { onError: error => this.background.push(error) }));
+    },
+    bind(view) {
+      this.view = view;
+      this.observe("gsDrain", migration.drainSearchMigrationWriters(view));
+    },
+    late() {
+      this.observe("deniedProvider", ChatSearchProvider.open(files.deniedProvider));
+      this.observe("deniedService", ChatSearchService.open(files.deniedService));
+      try { logger.logs.init(); } catch (error) { this.liveDenied = error; }
+      if (this.liveDenied?.result !== Cr.NS_ERROR_NOT_AVAILABLE) throw new Error("Actual live Logger was not refused before construction");
+    },
+    unknownConcreteTerminals() {
+      return ["refresh", "opening", "service"].every(name => this.records[name]?.settled && this.records[name].terminals === 1) &&
+        this.closes.size === 3 && [...this.closes.values()].every(entry => entry.completions === 1);
+    },
+    inspect() {
+      const names = branch === 6 ? ["capture", "gsDrain"] : branch === 4 ? ["refresh", "opening", "service"] : ["refresh", "opening", "service", "gsDrain"];
+      for (const name of names) {
+        const record = this.records[name];
+        if (!record?.settled || record.terminals !== 1) throw new Error("Original actual promise/callback did not finish once: " + name);
+      }
+      if (branch !== 6) {
+        const opening = this.records.opening;
+        const service = this.records.service;
+        if (branch !== 4 && (opening.error || service.error)) throw opening.error ?? service.error;
+        if (branch !== 4 && (this.provider.migrationSettled !== true || opening.value.migrationSettled !== true || service.value.closed !== true)) throw new Error("Real provider/service/storage callback ownership is not terminal");
+      }
+      if (branch !== 3 && branch !== 4 && branch !== 7 && branch !== 6 && this.records.refresh.error) throw this.records.refresh.error;
+      if (branch === 3) {
+        if (!this.indexes.some(entry => entry.document.id === id && entry.document.contentRevision === this.expectedRevision && entry.document.body.includes("retained-s508-native-queued-change") && entry.completed && entry.error === this.primary)) throw new Error("Actual physical index write/failure identity was not observed");
+        const errors = migration.getSearchMigrationErrors(this.view);
+        if (this.records.refresh.error !== this.primary || !this.recovered || errors[0] !== this.primary || !errors.includes(this.secondary) || errors.indexOf(this.secondary) <= errors.indexOf(this.primary) || !this.provider.migrationFailures.includes(this.primary)) throw new Error("Original first/raw secondary identity was normalized or reordered");
+      }
+      if (![3, 4, 6, 7].includes(branch) && !this.indexes.some(entry => entry.document.id === id && entry.document.contentRevision === this.expectedRevision && entry.document.body.includes("retained-s508-native-queued-change") && entry.completed && entry.value === true)) throw new Error("No nonempty physical current-revision transaction actually committed");
+      if (branch === 7 && (!this.records.refresh.error || this.malformed?.error !== this.records.refresh.error || this.malformed.source !== true)) throw new Error("Malformed physical tail was not a strict original source rejection");
+      if (branch === 2) {
+        for (const name of ["deniedProvider", "deniedService"]) {
+          const record = this.records[name];
+          if (!record.settled || record.terminals !== 1 || record.error?.result !== Cr.NS_ERROR_NOT_AVAILABLE) throw new Error("Late actual factory changed its native error");
+        }
+      }
+      if (branch !== 4 && !this.closes.size && branch !== 6) throw new Error("No real storage close was observed");
+      for (const entry of this.closes.values()) {
+        if (entry.calls !== 1 || entry.completions !== 1 || entry.error) throw new Error("Actual original asyncClose did not finish once");
+      }
+      return true;
+    },
+    checkRepeatClose() {
+      const counts = [...this.closes.values()].map(entry => [entry.calls, entry.completions]);
+      if (this.provider && this.provider.close() !== this.provider.close()) throw new Error("Provider repeated close returned another actual promise");
+      const released = migration.releaseSearchMigrationWriters(this.view, this.nativeResult);
+      if (released !== migration.releaseSearchMigrationWriters(this.view, this.nativeResult)) throw new Error("GS repeated release lost the original promise");
+      if (JSON.stringify(counts) !== JSON.stringify([...this.closes.values()].map(entry => [entry.calls, entry.completions]))) throw new Error("Repeated cleanup launched another storage close");
+      return released;
+    },
+    async verifySource() {
+      if (await IOUtils.readUTF8(path) !== expected) throw new Error("Real source bytes changed during capture/drain/cleanup");
+      if (branch === 2 && (await IOUtils.exists(files.deniedProvider.path) || await IOUtils.exists(files.deniedService.path))) throw new Error("Denied factory created a physical sidecar");
+    },
+    async verifyConsumer() {
+      const result = PathUtils.join(controls.path, "result.json");
+      if ([0, 5, 6].includes(branch)) {
+        const receipt = await IOUtils.readJSON(result);
+        if (receipt.state !== "CONSUMER_VERIFIED" || receipt.nativeRelease !== "PENDING") throw new Error("Consumer receipt was substituted for native release");
+      } else if (await IOUtils.exists(result)) throw new Error("Failed/cancelled selection published a consumer result");
+    },
+    restoreObservers() { PanoramaSearchIndex.prototype.close = originalClose; PanoramaSearchIndex.prototype.index = originalIndex; },
+  };
+  const originalClose = PanoramaSearchIndex.prototype.close;
+  PanoramaSearchIndex.prototype.close = function(...args) {
+    let entry = state.closes.get(this);
+    if (!entry) state.closes.set(this, entry = { calls: 0, completions: 0 });
+    entry.calls++;
+    const pending = originalClose.apply(this, args);
+    // Observes the original promise; returns it unchanged and creates no gate.
+    pending.then(() => entry.completions++, error => { entry.completions++; entry.error = error; });
+    return pending;
+  };
+  const originalIndex = PanoramaSearchIndex.prototype.index;
+  PanoramaSearchIndex.prototype.index = function(document) {
+    const entry = { document };
+    state.indexes.push(entry);
+    const pending = originalIndex.call(this, document);
+    pending.then(value => { entry.completed = true; entry.value = value; }, error => { entry.completed = true; entry.error = error; });
+    return pending;
+  };
+  return state;
+}))js";
+    JS::SourceText<mozilla::Utf8Unit> text;
+    ASSERT_TRUE(text.init(cx, script, sizeof(script) - 1,
+                          JS::SourceOwnership::Borrowed));
+    JS::CompileOptions options(cx);
+    options.setFileAndLine(__FILE__, __LINE__);
+    JS::RootedValue factory(cx), state(cx), value(cx);
+    ASSERT_TRUE(JS::Evaluate(cx, options, text, &factory));
+    JS::RootedValueArray<3> args(cx);
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, mProfile, args[0]));
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, controls, args[1]));
+    args[2].setNumber(aBranch);
+    ASSERT_TRUE(JS::Call(cx, JS::UndefinedHandleValue, factory, args, &state));
+    ASSERT_TRUE(state.isObject());
+    JS::RootedObject object(cx, &state.toObject());
+    auto waitJS = [&](JS::HandleValue pending,
+                      dom::Promise::PromiseState wanted) {
+      RefPtr<dom::Promise> promise = SelectedJSPromise(cx, pending);
+      ASSERT_TRUE(promise);
+      ASSERT_TRUE(
+          SpinEventLoopUntil("Selected actual Chat original IO"_ns, [&] {
+            return promise->State() != dom::Promise::PromiseState::Pending;
+          }));
+      ASSERT_EQ(wanted, promise->State());
+    };
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "prepare", &value));
+    ASSERT_NO_FATAL_FAILURE(
+        waitJS(value, dom::Promise::PromiseState::Resolved));
+    nsCString bytes;
+    ASSERT_EQ(NS_OK, ReadSelectedFile(logFile, bytes));
+    EXPECT_EQ(expected, bytes);
+    MigrationWriterHistory chatHistory;
+    ASSERT_EQ(NS_OK, GetMigrationWriterHistory(MigrationWriterDomain::Chat,
+                                               &chatHistory));
+    EXPECT_EQ(aBranch == 8 ? MigrationWriterHistory::Started
+                           : MigrationWriterHistory::NeverStarted,
+              chatHistory);
+    if (aBranch == 3) {
+      // Real fixture-owned SQLite failure, visible to the original connection.
+      // This oracle connection is closed before native selection.
+      nsCOMPtr<mozIStorageConnection> fault;
+      ASSERT_EQ(NS_OK, mStorage->OpenUnsharedDatabase(mainFile,
+                                                      getter_AddRefs(fault)));
+      nsCOMPtr<nsIFts3Tokenizer> tokenizer =
+          do_GetService("@mozilla.org/messenger/fts3tokenizer;1");
+      ASSERT_TRUE(tokenizer);
+      ASSERT_EQ(NS_OK, tokenizer->RegisterTokenizer(fault));
+      ASSERT_EQ(
+          NS_OK,
+          fault->ExecuteSimpleSQL(
+              "CREATE TRIGGER core_native_chat_index_fault BEFORE INSERT ON documents BEGIN SELECT RAISE(FAIL,'core_native_chat_index_fault'); END"_ns));
+      ASSERT_EQ(NS_OK, fault->Close());
+    }
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "start", &value));
+    JS::RootedValue recordsValue(cx);
+    ASSERT_TRUE(JS_GetProperty(cx, object, "records", &recordsValue));
+    ASSERT_TRUE(recordsValue.isObject());
+    JS::RootedObject records(cx, &recordsValue.toObject());
+    constexpr const char* pendingNames[]{"refresh", "opening", "service"};
+    for (uint32_t i = 0; i < (aBranch == 6 ? 1u : 3u); ++i) {
+      const char* name = aBranch == 6 ? "capture" : pendingNames[i];
+      JS::RootedValue entry(cx), promise(cx);
+      ASSERT_TRUE(JS_GetProperty(cx, records, name, &entry));
+      ASSERT_TRUE(entry.isObject());
+      JS::RootedObject record(cx, &entry.toObject());
+      ASSERT_TRUE(JS_GetProperty(cx, record, "promise", &promise));
+      RefPtr<dom::Promise> actual = SelectedJSPromise(cx, promise);
+      ASSERT_TRUE(actual);
+      ASSERT_EQ(dom::Promise::PromiseState::Pending, actual->State());
+    }
+    SelectedNativeRun r;
+    RefPtr<MigrationSettlementPromise> premature;
+    if (aBranch == 9) {
+      nsCOMPtr<nsIProfileUnlocker> unlocker;
+      ASSERT_EQ(NS_OK,
+                NS_LockProfilePath(mProfile, mProfile, getter_AddRefs(unlocker),
+                                   getter_AddRefs(r.lock)));
+      SelectedSnapshotRequest request;
+      ASSERT_EQ(NS_OK, requestFile->GetPath(request.path));
+      auto armed = MigrationWriterLease::ArmSelected(r.lock, mProfile, mProfile,
+                                                     request);
+      ASSERT_TRUE(armed.isOk());
+      r.lease = armed.unwrap();
+      // An unowned GS record cannot certify settlement merely by refusing.
+      EXPECT_TRUE(NS_FAILED(r.lease->CollectSearchErrors(false)));
+      EXPECT_EQ(NS_OK, r.lease->FirstError());
+      premature = r.lease->SettleConsumerAndRelease(NS_OK);
+      EXPECT_EQ(0u, r.lease->mReleasePasses);
+      EXPECT_EQ(0u, r.lease->mReleaseCompletions);
+      EXPECT_EQ(NS_ERROR_IN_PROGRESS, r.lease->FirstError());
+      r.drain = r.lease->AcquireAndDrain();
+      r.local = r.lease->mLocalStore;
+      RefPtr<SelectedRunProbe> probe = r.observation;
+      r.drain->Then(
+          GetMainThreadSerialEventTarget(), __func__,
+          [probe](bool ok) {
+            probe->result = ok ? NS_OK : NS_ERROR_UNEXPECTED;
+            probe->terminals++;
+            probe->drained = true;
+          },
+          [probe](nsresult error) {
+            probe->result = error;
+            probe->terminals++;
+            probe->drained = true;
+          });
+    } else {
+      ASSERT_EQ(NS_OK, ArmSelectedRun(r));
+    }
+    ASSERT_TRUE(r.lease && r.drain);
+    EXPECT_FALSE(r.drained);
+    EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+    nsCOMPtr<nsISupports> nativeView = r.lease->SelectedView();
+    JS::RootedValue view(cx), bind(cx);
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, nativeView, &view));
+    ASSERT_TRUE(JS_GetProperty(cx, object, "bind", &bind));
+    ASSERT_TRUE(JS::Call(cx, object, bind, JS::HandleValueArray(view), &value));
+    if (aBranch == 1 || aBranch == 4) r.lease->Cancel(NS_ERROR_ABORT);
+    if (aBranch == 2)
+      ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "late", &value));
+    if (aBranch == 5) {
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                r.lease->ValidateGeneration(r.lease->Generation() + 1));
+      SelectedSnapshotRequest request;
+      ASSERT_EQ(NS_OK, requestFile->GetPath(request.path));
+      auto other = MigrationWriterLease::ArmSelected(r.lock, mProfile, mProfile,
+                                                     request);
+      ASSERT_TRUE(other.isErr());
+      EXPECT_EQ(NS_ERROR_IN_PROGRESS, other.unwrapErr());
+      nsCOMPtr<nsIObserver> gate = CreateMigrationWriterGate();
+      EXPECT_EQ(
+          NS_ERROR_NOT_AVAILABLE,
+          gate->Observe(nullptr, "validate-selected-view", u"after-await"));
+      EXPECT_EQ(NS_OK, r.lease->FirstError());
+    }
+    if (aBranch == 4) {
+      preserveUnknown = true;
+      nsCOMPtr<nsIFile> parent, held, replacement;
+      nsAutoString originalName;
+      ASSERT_EQ(NS_OK, mProfile->GetLeafName(originalName));
+      ASSERT_EQ(NS_OK, mProfile->GetParent(getter_AddRefs(parent)));
+      ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(held)));
+      nsAutoString retainedName(originalName);
+      retainedName.AppendLiteral("-held-original");
+      ASSERT_EQ(NS_OK, held->MoveTo(parent, retainedName));
+      ASSERT_EQ(NS_OK, mProfile->Create(nsIFile::DIRECTORY_TYPE, 0700));
+      EXPECT_TRUE(NS_FAILED(r.lease->ValidateSelectedIdentity()));
+      // Wait for concrete public-operation terminals and the three actual
+      // original asyncClose callbacks, never an elapsed interval or fake gate.
+      ASSERT_TRUE(SpinEventLoopUntil(
+          "Actual Chat IO/storage ends under lost root custody"_ns, [&] {
+            JS::RootedValue observed(cx);
+            return NS_SUCCEEDED(CallSelectedJS(
+                       cx, object, "unknownConcreteTerminals", &observed)) &&
+                   observed.isBoolean() && observed.toBoolean();
+          }));
+      EXPECT_FALSE(r.drained);
+      EXPECT_EQ(0u, r.terminals);
+      EXPECT_EQ(0u, r.lease->mReleasePasses);
+      EXPECT_EQ(0u, r.lease->mReleaseCompletions);
+      EXPECT_EQ(NS_ERROR_ABORT, r.lease->FirstError());
+      ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(replacement)));
+      nsAutoString replacementName(originalName);
+      replacementName.AppendLiteral("-held-replacement");
+      ASSERT_EQ(NS_OK, replacement->MoveTo(parent, replacementName));
+      ASSERT_EQ(NS_OK, held->MoveTo(parent, originalName));
+      EXPECT_EQ(NS_OK, r.lease->ValidateSelectedIdentity());
+      ASSERT_EQ(NS_OK, ReadSelectedFile(logFile, bytes));
+      EXPECT_EQ(expected, bytes);
+      auto unqualified = r.lease->SettleConsumerAndRelease(NS_ERROR_ABORT);
+      EXPECT_EQ(unqualified, r.lease->SettleConsumerAndRelease(NS_ERROR_ABORT));
+      EXPECT_FALSE(r.drained);
+      EXPECT_EQ(MigrationPhase::Draining, r.lease->Phase());
+      EXPECT_EQ(0u, r.lease->mReleasePasses);
+      EXPECT_EQ(0u, r.lease->mReleaseCompletions);
+      nsCOMPtr<nsIProfileLock> conflict;
+      nsCOMPtr<nsIProfileUnlocker> conflictUnlocker;
+      EXPECT_TRUE(NS_FAILED(NS_LockProfilePath(mProfile, mProfile,
+                                               getter_AddRefs(conflictUnlocker),
+                                               getter_AddRefs(conflict))));
+      EXPECT_FALSE(conflict);
+      if (::testing::Test::HasFailure()) std::_Exit(1);
+      // This distinct expected negative exit contains deliberately retained
+      // custody. It is NEVER a safe-release/consumer/cleanup receipt. No
+      // TearDown or source removal runs, and native settlement counters remain
+      // zero.
+      std::fprintf(stderr, "PANORAMA_NATIVE_UNKNOWN_CUSTODY_RETAINED\n");
+      std::fflush(stderr);
+      std::_Exit(88);
+    }
+    nsresult expectedResult = NS_OK;
+    if (aBranch == 1)
+      expectedResult = NS_ERROR_ABORT;
+    else if (aBranch == 2 || aBranch == 8)
+      expectedResult = NS_ERROR_NOT_AVAILABLE;
+    else if (aBranch == 3 || aBranch == 7)
+      expectedResult = NS_ERROR_FAILURE;
+    else if (aBranch == 9)
+      expectedResult = NS_ERROR_IN_PROGRESS;
+    ASSERT_EQ(expectedResult, WaitMigration(r.drain));
+    EXPECT_EQ(expectedResult, r.lease->FirstError());
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "inspect", &value));
+    ASSERT_TRUE(value.isBoolean() && value.toBoolean());
+    if (aBranch == 3) EXPECT_GE(r.lease->SecondaryErrors().Length(), 1u);
+    ASSERT_EQ(NS_OK, GetMigrationWriterHistory(MigrationWriterDomain::Chat,
+                                               &chatHistory));
+    EXPECT_EQ(aBranch == 8 ? MigrationWriterHistory::Started
+                           : MigrationWriterHistory::NeverStarted,
+              chatHistory);
+    nsCOMPtr<nsIProfileLock> conflict;
+    nsCOMPtr<nsIProfileUnlocker> conflictUnlocker;
+    EXPECT_TRUE(NS_FAILED(NS_LockProfilePath(mProfile, mProfile,
+                                             getter_AddRefs(conflictUnlocker),
+                                             getter_AddRefs(conflict))));
+    EXPECT_FALSE(conflict);
+    if (NS_SUCCEEDED(expectedResult)) {
+      EXPECT_EQ(MigrationPhase::Held, r.lease->Phase());
+      EXPECT_EQ(0u, r.lease->mReleasePasses);
+      EXPECT_EQ(0u, r.lease->mReleaseCompletions);
+      ASSERT_EQ(NS_OK, r.lease->RunBeforeAppStartup());
+      EXPECT_EQ(MigrationPhase::Released, r.lease->Phase());
+      EXPECT_EQ(1u, r.lease->mReleasePasses);
+      EXPECT_EQ(1u, r.lease->mReleaseCompletions);
+      EXPECT_EQ(NS_OK, WaitMigration(r.lease->SettleConsumerAndRelease(NS_OK)));
+      EXPECT_EQ(1u, r.lease->mReleasePasses);
+      EXPECT_EQ(1u, r.lease->mReleaseCompletions);
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                r.lease->ValidateGeneration(r.lease->Generation()));
+      EXPECT_EQ(NS_OK, r.lock->Unlock());
+    } else {
+      FinishSelectedRun(r, expectedResult);
+      if (premature)
+        EXPECT_EQ(premature, r.lease->SettleConsumerAndRelease(expectedResult));
+    }
+    JS::RootedValue code(cx, JS::NumberValue(uint32_t(expectedResult)));
+    ASSERT_TRUE(JS_SetProperty(cx, object, "nativeResult", code));
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "checkRepeatClose", &value));
+    ASSERT_NO_FATAL_FAILURE(
+        waitJS(value, dom::Promise::PromiseState::Resolved));
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "verifySource", &value));
+    ASSERT_NO_FATAL_FAILURE(
+        waitJS(value, dom::Promise::PromiseState::Resolved));
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "verifyConsumer", &value));
+    ASSERT_NO_FATAL_FAILURE(
+        waitJS(value, dom::Promise::PromiseState::Resolved));
+    ASSERT_EQ(NS_OK, ReadSelectedFile(logFile, bytes));
+    EXPECT_EQ(expected, bytes);
+    if (aBranch != 6) {
+      JS::RootedValue revision(cx);
+      ASSERT_TRUE(JS_GetProperty(
+          cx, object, aBranch == 7 ? "initialRevision" : "expectedRevision",
+          &revision));
+      ASSERT_TRUE(revision.isString());
+      JS::RootedString revisionString(cx, revision.toString());
+      JS::UniqueChars utf8 = JS_EncodeStringToUTF8(cx, revisionString);
+      ASSERT_TRUE(utf8);
+      ASSERT_NO_FATAL_FAILURE(CheckSelectedChatSidecar(
+          mainFile, aBranch, nsDependentCString(utf8.get())));
+    }
+    ASSERT_EQ(NS_OK, CallSelectedJS(cx, object, "restoreObservers", &value));
+  }
+
+  void CheckRejectedWriterPromise(dom::Promise* aPromise) {
+    ASSERT_TRUE(aPromise);
+    ASSERT_TRUE(aPromise->SetAnyPromiseIsHandled());
+    ASSERT_TRUE(
+        SpinEventLoopUntil("DeliveryCoreReferences::DeniedPromise"_ns, [&] {
+          return aPromise->State() != dom::Promise::PromiseState::Pending;
+        }));
+    ASSERT_EQ(dom::Promise::PromiseState::Rejected, aPromise->State());
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    JS::RootedObject object(cx, aPromise->PromiseObj());
+    JSAutoRealm realm(cx, object);
+    JS::RootedValue error(cx, JS::GetPromiseResult(object));
+    ASSERT_TRUE(error.isObject());
+    JS::RootedObject exception(cx, &error.toObject());
+    JS::RootedValue result(cx);
+    ASSERT_TRUE(JS_GetProperty(cx, exception, "result", &result));
+    uint32_t code = 0;
+    ASSERT_TRUE(JS::ToUint32(cx, result, &code));
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, nsresult(code));
+  }
+
+  void CheckSelectedLease(uint32_t aCase) {
+    nsCOMPtr<nsIProfileLock> profileLock;
+    nsCOMPtr<nsIProfileUnlocker> unlocker;
+    ASSERT_EQ(NS_OK,
+              NS_LockProfilePath(mProfile, mProfile, getter_AddRefs(unlocker),
+                                 getter_AddRefs(profileLock)));
+    auto unlock =
+        MakeScopeExit([&] { EXPECT_EQ(NS_OK, profileLock->Unlock()); });
+    // Real native-close cases begin with an actual started SQLite Core. Empty
+    // fixed domain producers still supply their own actual terminal promises.
+    if (aCase == 4 || aCase == 6) ASSERT_EQ(NS_OK, Start());
+    nsCOMPtr<nsIMsgDBService> legacy;
+    nsCOMPtr<nsIFile> legacyFile;
+    if (aCase == 2) {
+      legacy = do_GetService("@mozilla.org/msgDatabase/msgDBService;1");
+      ASSERT_TRUE(legacy);
+      ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(legacyFile)));
+      ASSERT_EQ(NS_OK, legacyFile->Append(u"sticky-legacy.msf"_ns));
+      nsCOMPtr<nsIMsgDatabase> opened;
+      ASSERT_EQ(NS_OK, legacy->OpenDBFromFile(legacyFile, nullptr, true, true,
+                                              getter_AddRefs(opened)));
+      ASSERT_TRUE(opened);
+      ASSERT_EQ(NS_OK, opened->ForceClosed());
+      opened = nullptr;
+      // An actual successful close does not erase admission history.
+      MigrationWriterHistory history;
+      ASSERT_EQ(NS_OK, GetMigrationWriterHistory(
+                           MigrationWriterDomain::LegacyDatabase, &history));
+      ASSERT_EQ(MigrationWriterHistory::Started, history);
+    }
+    SelectedSnapshotRequest request;
+    ASSERT_EQ(NS_OK, mProfile->GetPath(request.path));
+    request.path.AppendLiteral(".snapshot-request.json");
+    auto armed = MigrationWriterLease::ArmSelected(profileLock, mProfile,
+                                                   mProfile, request);
+    ASSERT_TRUE(armed.isOk());
+    RefPtr<MigrationWriterLease> lease = armed.unwrap();
+    ASSERT_EQ(NS_OK, lease->ValidateSelectedIdentity());
+    switch (aCase) {
+      case 0: {
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  lease->ValidateGeneration(lease->Generation() + 1));
+        auto other = MigrationWriterLease::ArmSelected(profileLock, mProfile,
+                                                       mProfile, request);
+        ASSERT_TRUE(other.isErr());
+        EXPECT_EQ(NS_ERROR_IN_PROGRESS, other.unwrapErr());
+        nsCOMPtr<nsIObserver> gate = CreateMigrationWriterGate();
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  gate->Observe(nullptr, "validate-selected-view",
+                                u"before-source-read"));
+        // A rejected foreign view cannot complete/release the actual owner.
+        EXPECT_EQ(NS_OK, lease->ValidateGeneration(lease->Generation()));
+        EXPECT_EQ(MigrationPhase::Armed, lease->Phase());
+        nsCOMPtr<nsISupports> view = lease->SelectedView();
+        ASSERT_TRUE(view);
+        nsCOMPtr<nsIWritablePropertyBag2> writable = do_QueryInterface(view);
+        EXPECT_FALSE(writable);
+        nsCOMPtr<nsIPropertyBag2> fields = do_QueryInterface(view);
+        nsCOMPtr<nsIFile> borrowed =
+            do_GetProperty(fields, u"profile-directory"_ns);
+        ASSERT_TRUE(borrowed);
+        ASSERT_EQ(NS_OK,
+                  borrowed->Append(u"view-path-is-not-native-selection"_ns));
+        EXPECT_EQ(NS_OK, lease->ValidateSelectedIdentity());
+        EXPECT_EQ(NS_OK, lease->ValidateGeneration(lease->Generation()));
+        nsAutoString immutablePath, selectedPath;
+        ASSERT_EQ(NS_OK, fields->GetPropertyAsAString(u"profile-path"_ns,
+                                                      immutablePath));
+        ASSERT_EQ(NS_OK, mProfile->GetPath(selectedPath));
+        EXPECT_EQ(selectedPath, immutablePath);
+        break;
+      }
+      case 1: {
+        ASSERT_EQ(NS_OK, WaitMigration(lease->AcquireAndDrain()));
+        EXPECT_EQ(MigrationPhase::Held, lease->Phase());
+        const auto& roots = lease->RootBindings();
+        ASSERT_GE(roots.Length(), 2u);
+        EXPECT_FALSE(roots[0].physicalIdentity.IsEmpty());
+        EXPECT_FALSE(roots[0].parentIdentity.IsEmpty());
+        EXPECT_EQ(NS_OK, lease->ValidateRoot(mProfile));
+        nsCOMPtr<nsISupports> view = lease->SelectedView();
+        nsCOMPtr<nsIPropertyBag2> inventory = do_QueryInterface(view);
+        ASSERT_TRUE(inventory);
+        nsAutoString rootJSON;
+        EXPECT_EQ(NS_OK, inventory->GetPropertyAsAString(u"inventory-json"_ns,
+                                                         rootJSON));
+        EXPECT_FALSE(rootJSON.IsEmpty());
+        nsCOMPtr<nsIProfileLock> exposed =
+            do_GetProperty(inventory, u"profile-lock"_ns);
+        EXPECT_FALSE(exposed);
+        nsCOMPtr<nsIProfileLock> conflicting;
+        nsCOMPtr<nsIProfileUnlocker> conflictUnlocker;
+        EXPECT_TRUE(NS_FAILED(NS_LockProfilePath(
+            mProfile, mProfile, getter_AddRefs(conflictUnlocker),
+            getter_AddRefs(conflicting))));
+        EXPECT_FALSE(conflicting);
+        EXPECT_EQ(NS_OK, lease->ValidateSelectedIdentity());
+        // Native unit consumer has issued no IO. Its authority remains held
+        // until the explicit native settlement below, not a JS status value.
+        EXPECT_EQ(MigrationPhase::Held, lease->Phase());
+        break;
+      }
+      case 2: {
+        nsCOMPtr<nsIObserver> gate = CreateMigrationWriterGate();
+        nsCOMPtr<nsIPropertyBag2> bag = do_QueryInterface(gate);
+        ASSERT_TRUE(bag);
+        nsCOMPtr<nsISupports> subject =
+            do_GetProperty(bag, u"writer-admission-subject"_ns);
+        ASSERT_TRUE(subject);
+        MigrationWriterHistory before, after;
+        ASSERT_EQ(NS_OK, GetMigrationWriterHistory(
+                             MigrationWriterDomain::Compose, &before));
+        EXPECT_EQ(MigrationWriterHistory::NeverStarted, before);
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  gate->Observe(subject, "check-writer-admission", u"compose"));
+        EXPECT_EQ(
+            NS_ERROR_NOT_AVAILABLE,
+            CheckMigrationWriter(MigrationWriterDomain::LegacyDatabase,
+                                 MigrationWriterCheck::RequireNeverStarted));
+        nsCOMPtr<nsIMsgDatabase> deniedDatabase;
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  legacy->OpenDBFromFile(legacyFile, nullptr, true, true,
+                                         getter_AddRefs(deniedDatabase)));
+        EXPECT_FALSE(deniedDatabase);
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  legacy->CreateNewDB(nullptr, getter_AddRefs(deniedDatabase)));
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  legacy->CachedDBForFilePath(legacyFile,
+                                              getter_AddRefs(deniedDatabase)));
+        EXPECT_FALSE(deniedDatabase);
+        RefPtr<DatabaseCore> deniedCore = DatabaseCore::GetInstanceForService();
+        ASSERT_TRUE(deniedCore);
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, deniedCore->Startup());
+        EXPECT_FALSE(DatabaseCore::sConnection);
+        // Reach actual JS-backed XPCOM void AND Promise methods. Their null
+        // ordinary arguments must never be examined after native admission.
+        nsCOMPtr<nsIMsgSend> send =
+            do_CreateInstance("@mozilla.org/messengercompose/send;1");
+        ASSERT_TRUE(send);
+        nsTArray<RefPtr<nsIMsgAttachedFile>> attached;
+        nsTArray<RefPtr<nsIMsgEmbeddedImageData>> embedded;
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  send->CreateRFC822Message(nullptr, nullptr, "text/plain",
+                                            "blocked"_ns, false, attached,
+                                            embedded, nullptr));
+        RefPtr<dom::Promise> deniedSend;
+        ASSERT_EQ(NS_OK, send->SendMessageFile(
+                             nullptr, nullptr, nullptr, legacyFile, false,
+                             false, nsIMsgSend::nsMsgDeliverNow, nullptr,
+                             nullptr, nullptr, getter_AddRefs(deniedSend)));
+        CheckRejectedWriterPromise(deniedSend);
+        deniedSend = nullptr;
+        ASSERT_EQ(NS_OK,
+                  send->CreateAndSendMessage(
+                      nullptr, nullptr, nullptr, nullptr, false, false,
+                      nsIMsgSend::nsMsgDeliverNow, nullptr, "text/plain",
+                      u"blocked"_ns, nullptr, nullptr, nullptr, EmptyString(),
+                      EmptyCString(), 0, getter_AddRefs(deniedSend)));
+        CheckRejectedWriterPromise(deniedSend);
+        // Real native send-later Init is reached via its actual component.
+        nsresult denied = NS_OK;
+        nsCOMPtr<nsIMsgSendLater> later = do_CreateInstance(
+            "@mozilla.org/messengercompose/sendlater;1", &denied);
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, denied);
+        EXPECT_FALSE(later);
+        ASSERT_EQ(NS_OK, GetMigrationWriterHistory(
+                             MigrationWriterDomain::Compose, &after));
+        EXPECT_EQ(before, after);  // Denied work did not actually start.
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE, lease->FirstError());
+        break;
+      }
+      case 3: {
+        auto drain = lease->AcquireAndDrain();
+        EXPECT_EQ(drain, lease->AcquireAndDrain());
+        EXPECT_EQ(MigrationPhase::Draining, lease->Phase());
+        nsCOMPtr<nsISupports> view = lease->SelectedView();
+        nsCOMPtr<nsIObserver> gate = CreateMigrationWriterGate();
+        EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                  gate->Observe(view, "validate-selected-view",
+                                u"before-source-read"));
+        ASSERT_EQ(NS_OK, WaitMigration(drain));
+        EXPECT_EQ(NS_OK, gate->Observe(view, "validate-selected-view",
+                                       u"before-source-read"));
+        break;
+      }
+      case 4: {
+        ASSERT_TRUE(DatabaseCore::sConnection);
+        auto drain = lease->AcquireAndDrain();
+        // Queued real IM/LS/sidecar terminals precede retiring native metadata.
+        EXPECT_TRUE(mCore->mMessageDatabase);
+        EXPECT_TRUE(DatabaseCore::sConnection);
+        ASSERT_EQ(NS_OK, WaitMigration(drain));
+        EXPECT_FALSE(mCore->mMessageDatabase);
+        EXPECT_FALSE(DatabaseCore::sConnection);
+        EXPECT_EQ(MigrationPhase::Held, lease->Phase());
+        break;
+      }
+      case 5: {
+        nsCOMPtr<nsIFile> missing;
+        ASSERT_EQ(NS_OK, mProfile->Clone(getter_AddRefs(missing)));
+        ASSERT_EQ(NS_OK, missing->Append(u"owned-missing-source-control"_ns));
+        nsCOMPtr<nsIInputStream> input;
+        nsresult primary =
+            NS_NewLocalFileInputStream(getter_AddRefs(input), missing);
+        ASSERT_TRUE(NS_FAILED(primary));
+        lease->RecordError(primary);
+        nsresult cleanupError = missing->Remove(false);
+        ASSERT_TRUE(NS_FAILED(cleanupError));
+        lease->RecordError(cleanupError);
+        EXPECT_EQ(primary, lease->FirstError());
+        auto additional = lease->SecondaryErrors();
+        ASSERT_EQ(1u, additional.Length());
+        EXPECT_EQ(cleanupError, additional[0]);
+        EXPECT_FALSE(input);
+        break;
+      }
+      case 6: {
+        auto drain = lease->AcquireAndDrain();
+        EXPECT_EQ(MigrationPhase::Draining, lease->Phase());
+        lease->Cancel(NS_ERROR_ABORT);
+        EXPECT_EQ(NS_ERROR_ABORT, lease->FirstError());
+        EXPECT_TRUE(NS_FAILED(WaitMigration(drain)));
+        EXPECT_FALSE(DatabaseCore::sConnection);
+        EXPECT_EQ(MigrationPhase::FailedHeld, lease->Phase());
+        break;
+      }
+      default:
+        FAIL() << "Unknown actual native lease scenario";
+    }
+    if (lease->Phase() == MigrationPhase::Armed) {
+      nsresult expected = lease->FirstError();
+      EXPECT_EQ(expected, WaitMigration(lease->AcquireAndDrain()));
+    }
+    nsresult expected = lease->FirstError();
+    EXPECT_EQ(0u, lease->mReleasePasses);
+    EXPECT_EQ(0u, lease->mReleaseCompletions);
+    auto released = lease->SettleConsumerAndRelease(expected);
+    EXPECT_EQ(released, lease->SettleConsumerAndRelease(expected));
+    EXPECT_EQ(expected, WaitMigration(released));
+    EXPECT_EQ(1u, lease->mReleasePasses);
+    EXPECT_EQ(1u, lease->mReleaseCompletions);
+    EXPECT_EQ(released, lease->SettleConsumerAndRelease(expected));
+    EXPECT_EQ(1u, lease->mReleasePasses);
+    EXPECT_EQ(1u, lease->mReleaseCompletions);
+    if (NS_SUCCEEDED(expected)) {
+      EXPECT_EQ(MigrationPhase::Released, lease->Phase());
+      EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+                lease->ValidateGeneration(lease->Generation()));
+    } else {
+      EXPECT_EQ(MigrationPhase::FailedHeld, lease->Phase());
+      EXPECT_EQ(expected, lease->FirstError());
+    }
   }
 
   nsresult Start() {
@@ -20002,6 +22183,777 @@ TEST_F(DeliveryCoreReferences,
   ASSERT_TRUE(tuple);
   EXPECT_EQ(source, tuple->key);
   EXPECT_EQ(42u, tuple->uid);
+}
+
+// Sticky native process history has no reset. Use the existing GoogleTest
+// threadsafe death-test subprocess, with real native ownership in each child.
+TEST_F(DeliveryCoreReferences,
+       SelectedXreLeaseRejectsForeignStaleAndReentrantContext) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedLease(0);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process native ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       SelectedXreLeaseRetainsActualLockUntilConsumerSettlement) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedLease(1);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process native ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences, SelectedXreLeaseDeniesNativeAndLegacyLateOpen) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedLease(2);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process native ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       SelectedXreLeaseRequiresAllFixedDomainTerminals) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedLease(3);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process native ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       SelectedXreLeaseKeepsBodyCallbacksAheadOfDatabaseClose) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedLease(4);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process native ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       SelectedXreLeaseRetainsPrimaryAndSecondaryCleanupErrors) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedLease(5);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process native ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       SelectedXreLeaseCancelsOnlyAtActualSettlementAndReleasesOnce) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedLease(6);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process native ownership controls are unavailable";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXreLocalStoreDrainMbox) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(false, 0);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(false, 1);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(false, 2);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(false, 3);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedCopy(false, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedCopy(false, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXreLocalStoreDrainMaildir) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(true, 0);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(true, 1);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(true, 2);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedStoreOutput(true, 3);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedCopy(true, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedCopy(true, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXreExternalRootLeaseMbox) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedExternal(false, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedExternal(false, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXreExternalRootLeaseMaildir) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedExternal(true, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedExternal(true, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXreCompactionFinalCleanupDrain) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedCompaction(false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedCompaction(true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXrePop3UidlDrain) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedPopUidl(0);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedPopUidl(1);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedPopUidl(2);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXrePop3SinkDrainMbox) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedPopSink(false, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedPopSink(false, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXrePop3SinkDrainMaildir) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedPopSink(true, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedPopSink(true, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXreRetainedPurgeCustodyMbox) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedPurge(false, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedPurge(false, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences, SelectedXreRetainedPurgeCustodyMaildir) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedPurge(true, false);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedPurge(true, true);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Actual sticky-process native owner cases require normal "
+            "death-test support";
+#endif
+}
+
+// This fixture deliberately does not inherit DeliveryCoreReferences::SetUp.
+// Loading PSM and subsequently shutting it down cannot prove cold discovery.
+class DeliveryCoreColdSearchReferences : public testing::Test {
+ protected:
+  void CheckColdSelectedSearch() {
+    ASSERT_FALSE(NSS_IsInitialized());
+    auto checkHistories = [] {
+      for (auto domain :
+           {MigrationWriterDomain::MailSearch,
+            MigrationWriterDomain::ChatSearch, MigrationWriterDomain::Chat}) {
+        MigrationWriterHistory history;
+        ASSERT_EQ(NS_OK, GetMigrationWriterHistory(domain, &history));
+        EXPECT_EQ(MigrationWriterHistory::NeverStarted, history);
+      }
+    };
+    ASSERT_NO_FATAL_FAILURE(checkHistories());
+    nsCOMPtr<nsIProperties> directories =
+        do_GetService(NS_DIRECTORY_SERVICE_CONTRACTID);
+    ASSERT_TRUE(directories);
+    nsCOMPtr<nsIFile> root, profile, local, requestFile, oldProfile, oldLocal;
+    ASSERT_EQ(NS_OK,
+              NS_GetSpecialDirectory(NS_OS_TEMP_DIR, getter_AddRefs(root)));
+    ASSERT_EQ(NS_OK, root->Append(u"selected-real-cold-search"_ns));
+    ASSERT_EQ(NS_OK, root->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700));
+    nsCOMPtr<nsIProfileLock> profileLock;
+    bool safeToRemove = true, changedProfile = false, changedLocal = false;
+    (void)directories->Get(NS_APP_USER_PROFILE_50_DIR, NS_GET_IID(nsIFile),
+                           getter_AddRefs(oldProfile));
+    (void)directories->Get(NS_APP_USER_PROFILE_LOCAL_50_DIR,
+                           NS_GET_IID(nsIFile), getter_AddRefs(oldLocal));
+    auto cleanup = MakeScopeExit([&] {
+      // An assertion failure with unknown custody preserves the test's roots;
+      // process exit never supplies a successful settlement or cleanup oracle.
+      if (!safeToRemove) return;
+      if (profileLock) EXPECT_EQ(NS_OK, profileLock->Unlock());
+      if (changedProfile) {
+        (void)directories->Undefine(NS_APP_USER_PROFILE_50_DIR);
+        if (oldProfile)
+          EXPECT_EQ(NS_OK,
+                    directories->Set(NS_APP_USER_PROFILE_50_DIR, oldProfile));
+      }
+      if (changedLocal) {
+        (void)directories->Undefine(NS_APP_USER_PROFILE_LOCAL_50_DIR);
+        if (oldLocal)
+          EXPECT_EQ(NS_OK, directories->Set(NS_APP_USER_PROFILE_LOCAL_50_DIR,
+                                            oldLocal));
+      }
+      EXPECT_EQ(NS_OK, root->Remove(true));
+    });
+    auto child = [&](const nsAString& name, nsIFile** out,
+                     bool directory) -> nsresult {
+      nsCOMPtr<nsIFile> file;
+      MOZ_TRY(root->Clone(getter_AddRefs(file)));
+      MOZ_TRY(file->Append(name));
+      if (directory) MOZ_TRY(file->Create(nsIFile::DIRECTORY_TYPE, 0700));
+      file.forget(out);
+      return NS_OK;
+    };
+    ASSERT_EQ(NS_OK, child(u"profile"_ns, getter_AddRefs(profile), true));
+    ASSERT_EQ(NS_OK, child(u"local"_ns, getter_AddRefs(local), true));
+    ASSERT_EQ(NS_OK,
+              child(u"request.json"_ns, getter_AddRefs(requestFile), false));
+    (void)directories->Undefine(NS_APP_USER_PROFILE_50_DIR);
+    changedProfile = true;
+    ASSERT_EQ(NS_OK, directories->Set(NS_APP_USER_PROFILE_50_DIR, profile));
+    (void)directories->Undefine(NS_APP_USER_PROFILE_LOCAL_50_DIR);
+    changedLocal = true;
+    ASSERT_EQ(NS_OK, directories->Set(NS_APP_USER_PROFILE_LOCAL_50_DIR, local));
+    nsCOMPtr<nsIFile> marker;
+    ASSERT_EQ(NS_OK, profile->Clone(getter_AddRefs(marker)));
+    ASSERT_EQ(NS_OK, marker->Append(u"retained-cold-source.bin"_ns));
+    nsCOMPtr<nsIOutputStream> output;
+    ASSERT_EQ(NS_OK,
+              NS_NewLocalFileOutputStream(getter_AddRefs(output), marker));
+    constexpr auto original = "retained native cold source bytes\n"_ns;
+    uint32_t written;
+    ASSERT_EQ(NS_OK,
+              output->Write(original.get(), original.Length(), &written));
+    ASSERT_EQ(original.Length(), written);
+    ASSERT_EQ(NS_OK, output->Close());
+    output = nullptr;
+    dom::AutoJSAPI jsapi;
+    ASSERT_TRUE(jsapi.Init(xpc::PrivilegedJunkScope()));
+    JSContext* cx = jsapi.cx();
+    auto evaluate = [&](const char* source, JS::MutableHandleValue result) {
+      JS::SourceText<mozilla::Utf8Unit> text;
+      if (!text.init(cx, source, std::strlen(source),
+                     JS::SourceOwnership::Borrowed))
+        return false;
+      JS::CompileOptions options(cx);
+      options.setFileAndLine(__FILE__, __LINE__);
+      return JS::Evaluate(cx, options, text, result);
+    };
+    auto checkColdModules = [&] {
+      JS::RootedValue value(cx);
+      ASSERT_TRUE(evaluate(R"js((() => {
+        if (Cu.isESModuleLoaded("resource:///modules/logger.sys.mjs")) return false;
+        for (const name of ["SearchMigrationHold", "MailSearchService", "ChatSearchService"]) {
+          ChromeUtils.importESModule(`resource:///modules/panorama/${name}.sys.mjs`);
+        }
+        return !Cu.isESModuleLoaded("resource:///modules/logger.sys.mjs");
+      })())js",
+                           &value));
+      ASSERT_TRUE(value.isBoolean());
+      EXPECT_TRUE(value.toBoolean());
+      ASSERT_NO_FATAL_FAILURE(checkHistories());
+      EXPECT_FALSE(NSS_IsInitialized());
+    };
+    ASSERT_NO_FATAL_FAILURE(checkColdModules());
+    JS::RootedValue factory(cx), pending(cx);
+    ASSERT_TRUE(evaluate(R"js(((root, profile, local) => IOUtils.writeJSON(
+      PathUtils.join(root.path, "request.json"), {
+        version: 1, operationId: "native-cold-search",
+        profilePath: profile.path, localProfilePath: local.path,
+        backupPath: PathUtils.join(root.path, "backup"),
+        journalPath: PathUtils.join(root.path, "journal.json"),
+        resultPath: PathUtils.join(root.path, "result.json"),
+      }, { noOverwrite: true })))js",
+                         &factory));
+    JS::RootedValueArray<3> args(cx);
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, root, args[0]));
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, profile, args[1]));
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, local, args[2]));
+    ASSERT_TRUE(
+        JS::Call(cx, JS::UndefinedHandleValue, factory, args, &pending));
+    auto waitJS = [&](JS::HandleValue value) {
+      ASSERT_TRUE(value.isObject());
+      JS::RootedObject object(cx, js::CheckedUnwrapStatic(&value.toObject()));
+      ASSERT_TRUE(object && JS::IsPromiseObject(object));
+      JSAutoRealm realm(cx, object);
+      RefPtr<dom::Promise> promise = dom::Promise::CreateFromExisting(
+          xpc::NativeGlobal(JS::CurrentGlobalOrNull(cx)), object);
+      ASSERT_TRUE(promise);
+      ASSERT_TRUE(promise->SetAnyPromiseIsHandled());
+      ASSERT_TRUE(
+          SpinEventLoopUntil("Cold selected actual consumer IO"_ns, [&] {
+            return promise->State() != dom::Promise::PromiseState::Pending;
+          }));
+      ASSERT_EQ(dom::Promise::PromiseState::Resolved, promise->State());
+    };
+    ASSERT_NO_FATAL_FAILURE(waitJS(pending));
+    EXPECT_FALSE(NSS_IsInitialized());
+    nsCOMPtr<nsIProfileUnlocker> unlocker;
+    ASSERT_EQ(NS_OK,
+              NS_LockProfilePath(profile, local, getter_AddRefs(unlocker),
+                                 getter_AddRefs(profileLock)));
+    SelectedSnapshotRequest request;
+    ASSERT_EQ(NS_OK, requestFile->GetPath(request.path));
+    auto armed =
+        MigrationWriterLease::ArmSelected(profileLock, profile, local, request);
+    ASSERT_TRUE(armed.isOk());
+    RefPtr<MigrationWriterLease> lease = armed.unwrap();
+    safeToRemove = false;
+    bool drained = false;
+    nsresult drainResult = NS_ERROR_IN_PROGRESS;
+    lease->AcquireAndDrain()->Then(
+        GetMainThreadSerialEventTarget(), __func__,
+        [&](bool ok) {
+          drainResult = ok ? NS_OK : NS_ERROR_UNEXPECTED;
+          drained = true;
+        },
+        [&](nsresult error) {
+          drainResult = error;
+          drained = true;
+        });
+    ASSERT_TRUE(SpinEventLoopUntil("Cold selected actual native drain"_ns,
+                                   [&] { return drained; }));
+    ASSERT_EQ(NS_OK, drainResult);
+    ASSERT_EQ(MigrationPhase::Held, lease->Phase());
+    ASSERT_EQ(NS_OK, lease->ValidateRoot(profile));
+    ASSERT_EQ(NS_OK, lease->ValidateRoot(local));
+    ASSERT_NO_FATAL_FAILURE(checkColdModules());
+    nsCOMPtr<nsIProfileLock> conflicting;
+    nsCOMPtr<nsIProfileUnlocker> conflictUnlocker;
+    EXPECT_TRUE(NS_FAILED(NS_LockProfilePath(profile, local,
+                                             getter_AddRefs(conflictUnlocker),
+                                             getter_AddRefs(conflicting))));
+    EXPECT_FALSE(conflicting);
+    // Reuses the identical actual drain and calls the real MI consumer. It
+    // returns only after consumer IO and reverse native release terminals.
+    ASSERT_EQ(NS_OK, lease->RunBeforeAppStartup());
+    safeToRemove = true;
+    EXPECT_EQ(MigrationPhase::Released, lease->Phase());
+    EXPECT_EQ(NS_ERROR_NOT_AVAILABLE,
+              lease->ValidateGeneration(lease->Generation()));
+    ASSERT_NO_FATAL_FAILURE(checkColdModules());
+    ASSERT_TRUE(evaluate(R"js((async root => {
+      const receipt = await IOUtils.readJSON(PathUtils.join(root.path, "result.json"));
+      if (receipt.state !== "CONSUMER_VERIFIED" || receipt.nativeRelease !== "PENDING") {
+        throw new Error("Actual consumer receipt cannot stand for native release");
+      }
+      const original = await IOUtils.readUTF8(PathUtils.join(root.path, "profile", "retained-cold-source.bin"));
+      if (original !== "retained native cold source bytes\n") throw new Error("Original selected source changed");
+    }))js",
+                         &factory));
+    JS::RootedValue rootValue(cx);
+    ASSERT_EQ(NS_OK, nsContentUtils::WrapNative(cx, root, &rootValue));
+    ASSERT_TRUE(JS::Call(cx, JS::UndefinedHandleValue, factory,
+                         JS::HandleValueArray(rootValue), &pending));
+    ASSERT_NO_FATAL_FAILURE(waitJS(pending));
+    EXPECT_FALSE(NSS_IsInitialized());
+  }
+};
+
+TEST_F(DeliveryCoreColdSearchReferences,
+       test_coldNeverOpenedDoesNotInitializeLoggerOrNSS) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckColdSelectedSearch();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process actual cold NSS ownership controls are unavailable";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences,
+       SelectedXreSearchMailPendingOpenAndWritesDrainBeforeHeld) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedSearchMail(0);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process actual search ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       SelectedXreSearchMailCancelRetainsActualWorkAndStorageSettlement) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedSearchMail(1);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process actual search ownership controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       SelectedXreSearchMailLateFactoryRefusesBeforeFileCreation) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedSearchMail(2);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process actual search ownership controls are unavailable";
+#endif
+}
+
+TEST_F(DeliveryCoreReferences,
+       test_holdPrecedesAccountLoggerAndSearchAdmission) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  for (uint32_t branch : {8u, 6u}) {
+    ASSERT_EXIT(
+        {
+          CheckSelectedSearchChat(branch);
+          TearDown();
+          std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+  }
+#else
+  FAIL() << "Fresh-process real Chat/capture native ownership is unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences, test_pendingOpenAndQueuedWritesDrainBeforeHeld) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedSearchChat(0);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process actual Chat work/storage controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       test_factoryAndDirectOpenRemainExcludedThroughSettlement) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedSearchChat(2);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+  FAIL() << "Fresh-process real factory/Logger exclusion is unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       test_firstFailureSurvivesTailNormalizationAndCleanup) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  for (uint32_t branch : {3u, 7u}) {
+    ASSERT_EXIT(
+        {
+          CheckSelectedSearchChat(branch);
+          TearDown();
+          std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+  }
+#else
+  FAIL()
+      << "Fresh-process original SQL/source/raw error controls are unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       test_cancelAndPartialAcquisitionKeepOwnershipUntilSettlement) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        CheckSelectedSearchChat(1);
+        TearDown();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ASSERT_EXIT(
+      {
+        CheckSelectedSearchChat(4);
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 2);
+      },
+      ::testing::ExitedWithCode(88),
+      "PANORAMA_NATIVE_UNKNOWN_CUSTODY_RETAINED");
+#else
+  FAIL() << "Fresh-process real cancellation/unknown custody controls are "
+            "unavailable";
+#endif
+}
+TEST_F(DeliveryCoreReferences,
+       test_foreignGenerationReentryAndRepeatedRelease) {
+#if GTEST_HAS_DEATH_TEST
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  for (uint32_t branch : {5u, 9u}) {
+    ASSERT_EXIT(
+        {
+          CheckSelectedSearchChat(branch);
+          TearDown();
+          std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+  }
+#else
+  FAIL() << "Fresh-process real token/generation/once custody controls are "
+            "unavailable";
+#endif
 }
 
 }  // namespace mozilla::mailnews

@@ -571,3 +571,89 @@ add_task(async function test_proto_item_id_is_stored_as_own_key() {
     "reloaded __proto__ item should keep its feed URL"
   );
 });
+
+const { AppConstants: migrationAppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+const { MockRegistrar: migrationMockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
+/**
+ * Rejects service lookup to test refusal before a caller's first side effect.
+ * This fixture never supplies native selection or claims a Held lease.
+ *
+ * @param {function(nsIException): Promise<void>} task - Refusal assertions.
+ * @returns {Promise<void>} Resolves after restoring the real native service.
+ */
+async function withMigrationGateFailure(task) {
+  const error = Components.Exception(
+    "Migration gate service lookup failed",
+    Cr.NS_ERROR_FILE_ACCESS_DENIED
+  );
+  const cid = migrationMockRegistrar.register(
+    "@mozilla.org/mailnews/migration-writer-lease;1",
+    () => {
+      throw error;
+    }
+  );
+  try {
+    await task(error);
+  } finally {
+    migrationMockRegistrar.unregister(cid);
+  }
+}
+
+/**
+ * Checks sticky native history in this already initialized ordinary fixture.
+ *
+ * @param {string} domain - One fixed native writer domain.
+ */
+function assertMigrationWriterStarted(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), 1);
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "An initialized or previously used writer cannot certify NeverStarted"
+  );
+}
+
+add_task(async function test_snapshotHoldDoesNotInitializeOrSaveFeedStores() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const account = FeedUtils.createRssAccount("migration-refusal");
+  const server = account.incomingServer;
+  const root = server.rootFolder;
+  const cache = FeedUtils[server.serverURI];
+  const item = new FeedItem();
+  item.feed = { server, folder: root };
+  const before = [...root.subFolders].map(folder => folder.URI);
+  try {
+    await withMigrationGateFailure(async original => {
+      for (const call of [
+        () => new FeedItem(),
+        () => item.store(),
+        () => item.writeToFolder(),
+        () => FeedUtils.getSubscriptionsDS(server),
+        () => FeedUtils.getItemsDS(server),
+        () => FeedUtils.setSubscriptionAttr("https://example.invalid/", server, "title", "denied"),
+      ]) {
+        Assert.throws(call, error => error.result == original.result);
+      }
+    });
+    Assert.strictEqual(FeedUtils[server.serverURI], cache);
+    Assert.deepEqual([...root.subFolders].map(folder => folder.URI), before);
+    assertMigrationWriterStarted("rss");
+  } finally {
+    MailServices.accounts.removeAccount(account, false);
+  }
+});

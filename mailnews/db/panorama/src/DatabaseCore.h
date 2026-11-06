@@ -9,6 +9,7 @@
 
 #include "FolderDatabase.h"
 #include "MessageDatabase.h"
+#include "MigrationWriterLease.h"
 #include "mozilla/RefCounted.h"
 #include "mozilla/RefPtr.h"
 #include "mozilla/StaticPtr.h"
@@ -225,6 +226,9 @@ class DatabaseCore : public nsIDatabaseCore,
   // Does not open a core, own SQL, or erase numeric diagnostic identities.
   nsresult CheckFolderRelocationRecovery(uint64_t folderId);
 
+  static RefPtr<MigrationSettlementPromise> CloseForMigration(
+      MigrationWriterLease& aLease);
+
   FolderDatabase& FolderDB() { return *mFolderDatabase; }
   MessageDatabase& MessageDB() { return *mMessageDatabase; }
 
@@ -257,6 +261,9 @@ class DatabaseCore : public nsIDatabaseCore,
   friend class ThreadMessageEnumerator;
   friend class VirtualFolderWrapper;
 
+  MozPromiseHolder<MigrationSettlementPromise> mMigrationClose;
+  RefPtr<MigrationSettlementPromise> mMigrationCloseResult;
+  nsCOMPtr<mozIStorageConnection> mMigrationConnection;
   static StaticRefPtr<DatabaseCore> sInstance;
   static bool sDatabaseIsNew;  // If the database was created in this session.
   nsCString mCacheOriginGeneration;  // Empty after reopening an existing DB.

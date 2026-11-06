@@ -3,87 +3,93 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "nsImapProtocol.h"
+#ifdef MOZ_PANORAMA
+#  include "ImapMigrationWriterLease.h"
+using mozilla::mailnews::CheckImapMigrationAdmission;
+using mozilla::mailnews::ImapMigrationWork;
+using mozilla::mailnews::ImapMigrationWorkKind;
+#endif
 
 #include "msgCore.h"  // for pre-compiled headers
+#include "nsIFeedbackService.h"
 #include "nsMsgDBFolder.h"
 #include "nsMsgUtils.h"
 #include "nsWhitespaceTokenizer.h"
-#include "nsIFeedbackService.h"
 
 #include "nsImapStringBundle.h"
 #include "nsVersionComparator.h"
 
-#include "nsThreadUtils.h"
-#include "nsImapCore.h"
-#include "nsIMsgMailNewsUrl.h"
 #include "../public/nsIImapHostSessionList.h"
-#include "nsImapMailFolder.h"
-#include "nsImapUrl.h"
-#include "nsIMsgAccountManager.h"
-#include "nsImapServerResponseParser.h"
-#include "nspr.h"
-#include "plbase64.h"
+#include "nsIDBFolderInfo.h"
 #include "nsIEventTarget.h"
 #include "nsIImapService.h"
+#include "nsIInputStreamPump.h"
+#include "nsIMsgAccountManager.h"
+#include "nsIMsgFolder.h"
+#include "nsIMsgHdr.h"
+#include "nsIMsgMailNewsUrl.h"
+#include "nsIPipe.h"
 #include "nsISocketTransportService.h"
 #include "nsIStreamListenerTee.h"
-#include "nsIInputStreamPump.h"
-#include "nsNetUtil.h"
-#include "nsIDBFolderInfo.h"
-#include "nsIPipe.h"
-#include "nsIMsgFolder.h"
-#include "nsMsgMessageFlags.h"
-#include "nsTransportUtils.h"
-#include "nsIMsgHdr.h"
+#include "nsImapCore.h"
+#include "nsImapMailFolder.h"
+#include "nsImapServerResponseParser.h"
+#include "nsImapUrl.h"
 #include "nsMsgI18N.h"
+#include "nsMsgMessageFlags.h"
+#include "nsNetUtil.h"
+#include "nsThreadUtils.h"
+#include "nsTransportUtils.h"
+#include "nspr.h"
+#include "plbase64.h"
 // for the memory cache...
-#include "nsICacheEntry.h"
-#include "nsICacheStorage.h"
-#include "nsICacheEntryOpenCallback.h"
 #include "CacheObserver.h"
+#include "nsICacheEntry.h"
+#include "nsICacheEntryOpenCallback.h"
+#include "nsICacheStorage.h"
 #include "nsIURIMutator.h"
 
-#include "nsIDocShell.h"
-#include "nsILoadInfo.h"
 #include "nsCOMPtr.h"
-#include "nsMimeTypes.h"
+#include "nsICancelable.h"
+#include "nsIDocShell.h"
 #include "nsIInterfaceRequestor.h"
-#include "nsXPCOMCIDInternal.h"
+#include "nsILoadInfo.h"
 #include "nsIXULAppInfo.h"
+#include "nsMimeTypes.h"
 #include "nsSocketTransportService2.h"
 #include "nsSyncRunnableHelpers.h"
-#include "nsICancelable.h"
+#include "nsXPCOMCIDInternal.h"
 
 // netlib required files
-#include "nsIStreamListener.h"
-#include "nsIMsgIncomingServer.h"
-#include "nsIImapIncomingServer.h"
-#include "nsImapUtils.h"
-#include "nsIStreamConverterService.h"
-#include "nsIProxyInfo.h"
-#include "nsProtocolProxyService.h"
-#include "nsITLSSocketControl.h"
-#include "nsITransportSecurityInfo.h"
-#include "nsProxyRelease.h"
-#include "nsDebug.h"
-#include "nsMsgCompressIStream.h"
-#include "nsMsgCompressOStream.h"
 #include "mozilla/Logging.h"
 #include "mozilla/Preferences.h"
 #include "mozilla/ScopeExit.h"
+#include "nsDebug.h"
+#include "nsIImapIncomingServer.h"
+#include "nsIMsgIncomingServer.h"
+#include "nsIProxyInfo.h"
+#include "nsIStreamConverterService.h"
+#include "nsIStreamListener.h"
+#include "nsITLSSocketControl.h"
+#include "nsITransportSecurityInfo.h"
+#include "nsImapUtils.h"
+#include "nsMsgCompressIStream.h"
+#include "nsMsgCompressOStream.h"
+#include "nsProtocolProxyService.h"
+#include "nsProxyRelease.h"
 #ifdef MOZ_PANORAMA
 #  include "mozilla/StaticPrefs_mail.h"
 #endif
-#include "nsIPrincipal.h"
 #include "nsContentSecurityManager.h"
+#include "nsIPrincipal.h"
 
 // imap event sinks
 #include "nsIImapMailFolderSink.h"
-#include "nsIImapServerSink.h"
 #include "nsIImapMessageSink.h"
+#include "nsIImapServerSink.h"
 
-#include "mozilla/dom/InternalResponse.h"
 #include "mozilla/NullPrincipal.h"
+#include "mozilla/dom/InternalResponse.h"
 
 // TLS alerts
 #include "NSSErrorsService.h"
@@ -171,8 +177,8 @@ class ImapInputStreamCallback final : public nsIInputStreamCallback {
 
 NS_IMPL_ISUPPORTS(ImapInputStreamCallback, nsIInputStreamCallback)
 
-NS_IMETHODIMP ImapInputStreamCallback::OnInputStreamReady(
-    nsIAsyncInputStream* aStream) {
+NS_IMETHODIMP
+ImapInputStreamCallback::OnInputStreamReady(nsIAsyncInputStream* aStream) {
   return mCallback->OnInputStreamReady(aStream);
 }
 
@@ -509,11 +515,19 @@ class nsImapProtocolMainLoopRunnable final : public mozilla::Runnable {
       return NS_OK;
     }
 
+#ifdef MOZ_PANORAMA
+    // Retain the independent ticket across protocol release. Loop exit alone
+    // is not terminal: BeginShutdown's completion receipt is still pending.
+    RefPtr<ImapMigrationWork> migrationWork = mProtocol->MigrationWork();
+    nsCOMPtr<nsIThread> imapThread(do_GetCurrentThread());
+    if (migrationWork) migrationWork->ThreadLoopExited(imapThread);
+#endif
     // Release protocol object on the main thread to avoid destruction of
     // nsImapProtocol on the IMAP thread, which causes grief for weak
     // references.
     NS_ReleaseOnMainThread("nsImapProtocol::this", mProtocol.forget());
 
+#ifndef MOZ_PANORAMA
     // shutdown this thread, but do it from the main thread
     nsCOMPtr<nsIThread> imapThread(do_GetCurrentThread());
     if (NS_FAILED(NS_DispatchToMainThread(
@@ -523,6 +537,7 @@ class nsImapProtocolMainLoopRunnable final : public mozilla::Runnable {
                                    })))) {
       NS_WARNING("Failed to dispatch nsImapThreadShutdownEvent");
     }
+#endif
     return NS_OK;
   }
 
@@ -690,49 +705,86 @@ nsresult nsImapProtocol::Configure(int32_t TooFastTime, int32_t IdealTime,
 NS_IMETHODIMP
 nsImapProtocol::Initialize(nsIImapHostSessionList* aHostSessionList,
                            nsIImapIncomingServer* aServer) {
-  NS_ASSERTION(
-      aHostSessionList && aServer,
-      "oops...trying to initialize with a null host session list or server!");
-  if (!aHostSessionList || !aServer) return NS_ERROR_NULL_POINTER;
+#ifdef MOZ_PANORAMA
+  NS_ENSURE_FALSE(mMigrationWork, NS_ERROR_ALREADY_INITIALIZED);
+  nsCOMPtr<nsIMsgIncomingServer> migrationServer = do_QueryInterface(aServer);
+  mMigrationWork = MOZ_TRY(ImapMigrationWork::Admit(
+      ImapMigrationWorkKind::Protocol, static_cast<nsIImapProtocol*>(this),
+      migrationServer));
+#endif
+  nsresult initialization = [&]() -> nsresult {
+    NS_ASSERTION(
+        aHostSessionList && aServer,
+        "oops...trying to initialize with a null host session list or server!");
+    if (!aHostSessionList || !aServer) return NS_ERROR_NULL_POINTER;
 
-  nsresult rv = m_downloadLineCache->GrowBuffer(kDownLoadCacheSize);
-  NS_ENSURE_SUCCESS(rv, rv);
+    nsresult rv = m_downloadLineCache->GrowBuffer(kDownLoadCacheSize);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  m_flagState = new nsImapFlagAndUidState(kImapFlagAndUidStateSize);
-  if (!m_flagState) return NS_ERROR_OUT_OF_MEMORY;
+    m_flagState = new nsImapFlagAndUidState(kImapFlagAndUidStateSize);
+    if (!m_flagState) return NS_ERROR_OUT_OF_MEMORY;
 
-  aServer->GetUseIdle(&m_useIdle);
-  aServer->GetForceSelect(&m_forceSelect);
-  aServer->GetUseCondStore(&m_useCondStore);
-  aServer->GetUseCompressDeflate(&m_useCompressDeflate);
-  aServer->GetAllowUTF8Accept(&m_allowUTF8Accept);
+    aServer->GetUseIdle(&m_useIdle);
+    aServer->GetForceSelect(&m_forceSelect);
+    aServer->GetUseCondStore(&m_useCondStore);
+    aServer->GetUseCompressDeflate(&m_useCompressDeflate);
+    aServer->GetAllowUTF8Accept(&m_allowUTF8Accept);
 
-  m_hostSessionList = aHostSessionList;
-  m_parser.SetHostSessionList(aHostSessionList);
-  m_parser.SetFlagState(m_flagState);
+    m_hostSessionList = aHostSessionList;
+    m_parser.SetHostSessionList(aHostSessionList);
+    m_parser.SetFlagState(m_flagState);
 
-  // Initialize the empty mime part string on the main thread.
-  nsCOMPtr<nsIStringBundle> bundle;
-  rv = IMAPGetStringBundle(getter_AddRefs(bundle));
-  NS_ENSURE_SUCCESS(rv, rv);
+    // Initialize the empty mime part string on the main thread.
+    nsCOMPtr<nsIStringBundle> bundle;
+    rv = IMAPGetStringBundle(getter_AddRefs(bundle));
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  rv = bundle->GetStringFromName("imapEmptyMimePart", m_emptyMimePartString);
-  NS_ENSURE_SUCCESS(rv, rv);
+    rv = bundle->GetStringFromName("imapEmptyMimePart", m_emptyMimePartString);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  // Now initialize the thread for the connection
-  if (m_thread == nullptr) {
-    nsCOMPtr<nsIThread> imapThread;
-    nsresult rv = NS_NewNamedThread("IMAP", getter_AddRefs(imapThread));
-    if (NS_FAILED(rv)) {
-      NS_ASSERTION(imapThread, "Unable to create imap thread.");
-      return rv;
+    // Now initialize the thread for the connection
+    if (m_thread == nullptr) {
+      nsCOMPtr<nsIThread> imapThread;
+      nsresult rv = NS_NewNamedThread("IMAP", getter_AddRefs(imapThread));
+      if (NS_FAILED(rv)) {
+        NS_ASSERTION(imapThread, "Unable to create imap thread.");
+        return rv;
+      }
+#ifdef MOZ_PANORAMA
+      mMigrationThreadOwned = true;
+      mMigrationThread = imapThread;
+#endif
+      RefPtr<nsImapProtocolMainLoopRunnable> runnable =
+          new nsImapProtocolMainLoopRunnable(this);
+      nsresult dispatchRv =
+          imapThread->Dispatch(runnable.forget(), NS_DISPATCH_NORMAL);
+      if (NS_FAILED(dispatchRv)) {
+#ifdef MOZ_PANORAMA
+        mMigrationWork->RecordError(dispatchRv);
+        mMigrationWork->ThreadLoopExited(imapThread);
+#else
+        imapThread->AsyncShutdown();
+#endif
+        return dispatchRv;
+      }
+      nsresult threadRv = imapThread->GetPRThread(&m_thread);
+#ifdef MOZ_PANORAMA
+      mMigrationWork->RecordError(threadRv);
+#endif
+      if (NS_FAILED(threadRv)) {
+        TellThreadToDie(false);
+        return threadRv;
+      }
     }
-    RefPtr<nsImapProtocolMainLoopRunnable> runnable =
-        new nsImapProtocolMainLoopRunnable(this);
-    imapThread->Dispatch(runnable.forget(), NS_DISPATCH_NORMAL);
-    imapThread->GetPRThread(&m_thread);
+    return NS_OK;
+  }();
+#ifdef MOZ_PANORAMA
+  mMigrationWork->RecordError(initialization);
+  if (NS_FAILED(initialization) && !mMigrationThreadOwned) {
+    mMigrationWork->Complete(initialization);
   }
-  return NS_OK;
+#endif
+  return initialization;
 }
 
 nsImapProtocol::~nsImapProtocol() {
@@ -1166,14 +1218,37 @@ class nsImapCancelProxy : public mozilla::Runnable {
  public:
   explicit nsImapCancelProxy(nsICancelable* aProxyRequest)
       : mozilla::Runnable("nsImapCancelProxy"), mRequest(aProxyRequest) {}
+#ifdef MOZ_PANORAMA
+  void SetMigrationWork(ImapMigrationWork* aWork) { mWork = aWork; }
+#endif
   NS_IMETHOD Run() {
-    if (mRequest) mRequest->Cancel(NS_BINDING_ABORTED);
-    return NS_OK;
+    nsresult rv = mRequest ? mRequest->Cancel(NS_BINDING_ABORTED) : NS_OK;
+#ifdef MOZ_PANORAMA
+    if (mWork) mWork->RecordError(rv);
+#endif
+    return rv;
   }
 
  private:
   nsCOMPtr<nsICancelable> mRequest;
+#ifdef MOZ_PANORAMA
+  RefPtr<ImapMigrationWork> mWork;
+#endif
 };
+
+#ifdef MOZ_PANORAMA
+void nsImapProtocol::RequestMigrationDrain() {
+  MOZ_ASSERT(NS_IsMainThread());
+  ReentrantMonitorAutoEnter monitor(m_urlReadyToRunMonitor);
+  monitor.NotifyAll();
+}
+
+void nsImapProtocol::CancelMigrationWork(nsresult aReason) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mMigrationWork) mMigrationWork->RecordError(aReason);
+  TellThreadToDie(false);
+}
+#endif
 
 bool nsImapProtocol::RunImapThreadMainLoop() {
   PR_CEnterMonitor(this);
@@ -1194,9 +1269,15 @@ bool nsImapProtocol::RunImapThreadMainLoop() {
     // Cancel proxy on main thread.
     RefPtr<nsImapCancelProxy> cancelProxy =
         new nsImapCancelProxy(m_proxyRequest);
-    NS_DispatchAndSpinEventLoopUntilComplete(
+#ifdef MOZ_PANORAMA
+    cancelProxy->SetMigrationWork(mMigrationWork);
+#endif
+    nsresult cancelRv = NS_DispatchAndSpinEventLoopUntilComplete(
         "nsImapProtocol::RunImapThreadMainLoop"_ns,
         GetMainThreadSerialEventTarget(), cancelProxy.forget());
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(cancelRv);
+#endif
     m_proxyRequest = nullptr;
   }
 
@@ -1210,7 +1291,12 @@ bool nsImapProtocol::RunImapThreadMainLoop() {
   }
 
   // close streams via UI thread if it's not already done
-  if (m_imapProtocolSink) m_imapProtocolSink->CloseStreams();
+  if (m_imapProtocolSink) {
+    nsresult closeRv = m_imapProtocolSink->CloseStreams();
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(closeRv);
+#endif
+  }
 
   m_imapMailFolderSink = nullptr;
   m_imapMailFolderSinkSelected = nullptr;
@@ -1232,28 +1318,34 @@ NS_IMETHODIMP nsImapProtocol::CloseStreams() {
   MOZ_ASSERT(NS_IsMainThread(),
              "CloseStreams() should not be called from an off UI thread");
 
+  decltype(m_transport) transport;
+  decltype(m_mockChannel) channel;
+  decltype(m_inputStream) input;
+  decltype(m_outputStream) output;
+  decltype(m_channelListener) listener;
+  decltype(m_channelInputStream) channelInput;
+  decltype(m_channelOutputStream) channelOutput;
   {
     ReentrantMonitorAutoEnter mon(mMonitor);
-    if (m_transport) {
-      // make sure the transport closes (even if someone is still indirectly
-      // referencing it).
-      m_transport->Close(NS_ERROR_ABORT);
-      m_transport = nullptr;
-    }
-    m_inputStream = nullptr;
-    m_outputStream = nullptr;
-    m_channelListener = nullptr;
-    if (m_mockChannel) {
-      m_mockChannel->Close();
-      m_mockChannel = nullptr;
-    }
-    m_channelInputStream = nullptr;
-    m_channelOutputStream = nullptr;
-
-    // Close scope because we must let go of the monitor before calling
-    // RemoveConnection to unblock anyone who tries to get a monitor to the
-    // protocol object while holding onto a monitor to the server.
+    transport = m_transport.forget();
+    channel = m_mockChannel.forget();
+    input = m_inputStream.forget();
+    output = m_outputStream.forget();
+    listener = m_channelListener.forget();
+    channelInput = m_channelInputStream.forget();
+    channelOutput = m_channelOutputStream.forget();
   }
+  nsresult closeResult = transport ? transport->Close(NS_ERROR_ABORT) : NS_OK;
+  if (channel) {
+    nsresult channelResult = channel->Close();
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(channelResult);
+#endif
+    if (NS_SUCCEEDED(closeResult)) closeResult = channelResult;
+  }
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) mMigrationWork->RecordError(closeResult);
+#endif
   nsCOMPtr<nsIMsgIncomingServer> me_server = do_QueryReferent(m_server);
   if (me_server) {
     nsresult result;
@@ -1270,7 +1362,7 @@ NS_IMETHODIMP nsImapProtocol::CloseStreams() {
     Preferences::SetInt("mail.imap.min_chunk_size_threshold", gChunkThreshold);
     gChunkSizeDirty = false;
   }
-  return NS_OK;
+  return closeResult;
 }
 
 NS_IMETHODIMP nsImapProtocol::GetUrlWindow(nsIMsgMailNewsUrl* aUrl,
@@ -1451,7 +1543,10 @@ void nsImapProtocol::TellThreadToDie() {
   PR_CExitMonitor(this);
   // close streams via UI thread
   if (m_imapProtocolSink) {
-    m_imapProtocolSink->CloseStreams();
+    nsresult closeRv = m_imapProtocolSink->CloseStreams();
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(closeRv);
+#endif
     m_imapProtocolSink = nullptr;
   }
   Log("TellThreadToDie", nullptr, "close socket connection");
@@ -1525,8 +1620,17 @@ void nsImapProtocol::ImapThreadMainLoop() {
     nsresult rv = NS_OK;
     bool urlReadyToRun;
 
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork && mMigrationWork->DrainRequested()) {
+      TellThreadToDie();
+      break;
+    }
+#endif
     // wait for a URL or idle response to process...
     while (!DeathSignalReceived()) {
+#ifdef MOZ_PANORAMA
+      if (mMigrationWork && mMigrationWork->DrainRequested()) break;
+#endif
       {
         ReentrantMonitorAutoEnter mon(m_threadDeathMonitor);
         if (m_threadShouldDie) {
@@ -1562,6 +1666,12 @@ void nsImapProtocol::ImapThreadMainLoop() {
       }
     }
 
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork && mMigrationWork->DrainRequested()) {
+      TellThreadToDie();
+      break;
+    }
+#endif
     // This will happen if the UI thread signals us to die
     if (m_threadShouldDie) {
       TellThreadToDie();
@@ -1606,6 +1716,12 @@ void nsImapProtocol::ImapThreadMainLoop() {
         }
         m_imapMailFolderSink = nullptr;
       } else {
+#ifdef MOZ_PANORAMA
+        if (mMigrationWork && mMigrationWork->DrainRequested()) {
+          TellThreadToDie();
+          break;
+        }
+#endif
         // No more URLs setup to run. Set idle pending if user has configured
         // idle and if a URL is not in progress and if the server has IDLE
         // capability. Just set idlePending since want to wait a short time
@@ -1670,6 +1786,17 @@ bool nsImapProtocol::HandleIdleResponses() {
   // data on the socket transport thread by OnInputStreamReady() above, which
   // will trigger the imap thread main loop to run and call this function again.
   if (GetServerStateParser().Connected() && rvIdleOk) {
+#ifdef MOZ_PANORAMA
+    // Finish parsing the owned response, but do not initiate another IDLE URL
+    // or asynchronous wait after the native fence/capture.
+    if (mMigrationWork && mMigrationWork->DrainRequested()) return rvIdleOk;
+    nsresult admission = mozilla::mailnews::CheckMigrationWriter(
+        mozilla::mailnews::MigrationWriterDomain::Imap);
+    if (NS_FAILED(admission)) {
+      if (mMigrationWork) mMigrationWork->RecordError(admission);
+      return rvIdleOk;
+    }
+#endif
     if (m_imapMailFolderSinkSelected && untagged) {
       Log("HandleIdleResponses", nullptr, "idle response");
       m_imapMailFolderSinkSelected->OnNewIdleMessages();
@@ -2102,6 +2229,12 @@ bool nsImapProtocol::ProcessCurrentURL() {
           NS_SUCCEEDED(status))
         status = NS_MSG_ERROR_IMAP_COMMAND_FAILED;
       rv = m_channelListener->OnStopRequest(m_mockChannel, status);
+#ifdef MOZ_PANORAMA
+      if (mMigrationWork) {
+        mMigrationWork->RecordError(status);
+        mMigrationWork->RecordError(rv);
+      }
+#endif
     }
   }
   bool suspendUrl = false;
@@ -2130,7 +2263,14 @@ bool nsImapProtocol::ProcessCurrentURL() {
     }
     // Inform any nsIUrlListeners that the URL has finished. This will invoke
     // nsIUrlListener.onStopRunningUrl().
-    m_imapMailFolderSink->SetUrlState(this, mailnewsurl, false, suspendUrl, rv);
+    nsresult callbackRv = m_imapMailFolderSink->SetUrlState(
+        this, mailnewsurl, false, suspendUrl, rv);
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) {
+      mMigrationWork->RecordError(rv);
+      mMigrationWork->RecordError(callbackRv);
+    }
+#endif
 
     // Doom the cache entry if shutting down or thread is terminated.
     if (NS_FAILED(rv) && DeathSignalReceived() && m_mockChannel) {
@@ -2191,6 +2331,17 @@ bool nsImapProtocol::ProcessCurrentURL() {
   } else
     MOZ_LOG(IMAP, LogLevel::Info, ("null imapMailFolderSink"));
 
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork) {
+    mMigrationWork->RecordError(GetConnectionStatus());
+    mMigrationWork->RecordError(m_mailboxUpdateResult);
+    mMigrationWork->RecordError(rv);
+    if (mMigrationWork->DrainRequested()) {
+      TellThreadToDie();
+      return false;
+    }
+  }
+#endif
   // now try queued urls, now that we've released this connection.
   if (m_imapServerSink) {
     if (NS_SUCCEEDED(GetConnectionStatus()))
@@ -2389,16 +2540,25 @@ class UrlListenerNotifierEvent : public mozilla::Runnable {
         mProtocol(aProtocol) {}
 
   NS_IMETHOD Run() {
+    nsresult rv = NS_ERROR_NOT_AVAILABLE;
     if (mUrl) {
       nsCOMPtr<nsIMsgFolder> folder;
-      mUrl->GetFolder(getter_AddRefs(folder));
-      NS_ENSURE_TRUE(folder, NS_OK);
-      nsCOMPtr<nsIImapMailFolderSink> folderSink(do_QueryInterface(folder));
-      // This causes the url listener to get OnStart and Stop notifications.
-      folderSink->SetUrlState(mProtocol, mUrl, true, false, NS_OK);
-      folderSink->SetUrlState(mProtocol, mUrl, false, false, NS_OK);
+      rv = mUrl->GetFolder(getter_AddRefs(folder));
+      nsCOMPtr<nsIImapMailFolderSink> folderSink = do_QueryInterface(folder);
+      if (NS_SUCCEEDED(rv) && folderSink) {
+        rv = folderSink->SetUrlState(mProtocol, mUrl, true, false, NS_OK);
+        nsresult stop =
+            folderSink->SetUrlState(mProtocol, mUrl, false, false, rv);
+        if (NS_SUCCEEDED(rv)) rv = stop;
+      } else if (NS_SUCCEEDED(rv)) {
+        rv = NS_ERROR_NOT_AVAILABLE;
+      }
+#ifdef MOZ_PANORAMA
+      nsCOMPtr<nsIImapUrl> url = do_QueryInterface(mUrl);
+      ImapMigrationWork::CompleteUrl(url, rv, NS_OK);
+#endif
     }
-    return NS_OK;
+    return rv;
   }
 
  private:
@@ -2457,7 +2617,11 @@ bool nsImapProtocol::TryToRunUrlLocally(nsIURI* aURL, nsISupports* aConsumer) {
           new UrlListenerNotifierEvent(mailnewsUrl, this);
       // Post this as an event because it can lead to re-entrant calls to
       // LoadNextQueuedUrl if the listener runs a new url.
-      if (event) NS_DispatchToCurrentThread(event);
+      rv = event ? NS_DispatchToCurrentThread(event) : NS_ERROR_OUT_OF_MEMORY;
+#ifdef MOZ_PANORAMA
+      if (NS_FAILED(rv)) ImapMigrationWork::CompleteUrl(imapUrl, rv, NS_OK);
+#endif
+      // A failed dispatch is a handled local failure, never a network retry.
       return true;
     }
   }
@@ -2497,12 +2661,30 @@ bool nsImapProtocol::TryToRunUrlLocally(nsIURI* aURL, nsISupports* aConsumer) {
 // connection.
 NS_IMETHODIMP nsImapProtocol::LoadImapUrl(nsIURI* aURL,
                                           nsISupports* aConsumer) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   nsresult rv = NS_ERROR_FAILURE;
   if (aURL) {
     // We might be able to fulfill the request locally (e.g. fetching a message
     // which is already stored offline).
+#ifdef MOZ_PANORAMA
+    nsCOMPtr<nsIImapUrl> migrationUrl = do_QueryInterface(aURL);
+    RefPtr<ImapMigrationWork> urlWork =
+        MOZ_TRY(ImapMigrationWork::AdmitUrl(migrationUrl));
+#endif
     if (TryToRunUrlLocally(aURL, aConsumer)) return NS_OK;
+#ifdef MOZ_PANORAMA
+    rv = CheckImapMigrationAdmission();
+    if (NS_FAILED(rv)) {
+      urlWork->Complete(rv);
+      return rv;
+    }
+#endif
     rv = SetupWithUrl(aURL, aConsumer);
+#ifdef MOZ_PANORAMA
+    if (NS_FAILED(rv)) urlWork->Complete(rv);
+#endif
     m_lastActiveTime = PR_Now();
     if (NS_FAILED(rv)) {
       TellThreadToDie(true);
@@ -4565,8 +4747,14 @@ void nsImapProtocol::AbortMessageDownLoad() {
   if (GetServerStateParser().GetDownloadingHeaders()) {
     if (m_imapMailFolderSink)
       m_imapMailFolderSink->AbortHeaderParseStream(this);
-  } else if (m_imapMessageSink)
-    m_imapMessageSink->AbortMsgWriteStream();
+  } else if (m_imapMessageSink) {
+    nsresult abortRv = m_imapMessageSink->AbortMsgWriteStream();
+#ifdef MOZ_PANORAMA
+    if (mMigrationWork) mMigrationWork->RecordError(abortRv);
+#endif
+    if (NS_SUCCEEDED(m_mailboxUpdateResult) && NS_FAILED(abortRv))
+      m_mailboxUpdateResult = abortRv;
+  }
 
   m_curHdrInfo = nullptr;
 }
@@ -4930,8 +5118,8 @@ void nsImapProtocol::WaitForPotentialListOfBodysToFetch(
 
 // libmsg uses this to notify a running imap url about message bodies it should
 // download. why not just have libmsg explicitly download the message bodies?
-NS_IMETHODIMP nsImapProtocol::NotifyBodysToDownload(
-    const nsTArray<ImapUid>& uids) {
+NS_IMETHODIMP
+nsImapProtocol::NotifyBodysToDownload(const nsTArray<ImapUid>& uids) {
   ReentrantMonitorAutoEnter fetchListMon(m_fetchBodyListMonitor);
   m_fetchBodyIdList = uids.Clone();
   m_fetchBodyListIsNew = true;
@@ -4954,8 +5142,8 @@ NS_IMETHODIMP nsImapProtocol::GetFlagsForUID(ImapUid uid, bool* foundIt,
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapProtocol::GetFlagAndUidState(
-    nsIImapFlagAndUidState** aFlagState) {
+NS_IMETHODIMP
+nsImapProtocol::GetFlagAndUidState(nsIImapFlagAndUidState** aFlagState) {
   NS_ENSURE_ARG_POINTER(aFlagState);
   NS_IF_ADDREF(*aFlagState = m_flagState);
   return NS_OK;
@@ -6599,7 +6787,7 @@ nsresult nsImapProtocol::AuthLogin(const char* userName,
 
       rv = SendDataParseIMAPandCheckForNewMail(m_dataOutputBuf, currentCommand);
     }  // if the last command succeeded
-  }  // if auth plain capability
+  }    // if auth plain capability
   else if (flag & kHasAuthLoginCapability) {
     MOZ_LOG(IMAP, LogLevel::Debug, ("LOGIN auth"));
     PR_snprintf(m_dataOutputBuf, OUTPUT_BUFFER_SIZE,
@@ -6627,9 +6815,9 @@ nsresult nsImapProtocol::AuthLogin(const char* userName,
           rv = SendData(m_dataOutputBuf, true /* suppress logging */);
           if (NS_SUCCEEDED(rv)) ParseIMAPandCheckForNewMail(currentCommand);
         }  // if last command successful
-      }  // if last command successful
-    }  // if last command successful
-  }  // if has auth login capability
+      }    // if last command successful
+    }      // if last command successful
+  }        // if has auth login capability
   else if (flag & kHasAuthOldLoginCapability) {
     MOZ_LOG(IMAP, LogLevel::Debug, ("old-style auth"));
     ProgressEventFunctionUsingName("imapStatusSendingLogin");
@@ -8502,6 +8690,15 @@ void nsImapProtocol::Unsubscribe(const char* mailboxName) {
 }
 
 void nsImapProtocol::Idle() {
+#ifdef MOZ_PANORAMA
+  if (mMigrationWork && mMigrationWork->DrainRequested()) return;
+  nsresult admission = mozilla::mailnews::CheckMigrationWriter(
+      mozilla::mailnews::MigrationWriterDomain::Imap);
+  if (NS_FAILED(admission)) {
+    if (mMigrationWork) mMigrationWork->RecordError(admission);
+    return;
+  }
+#endif
   IncrementCommandTagNumber();
 
   if (IsUrlInProgress()) {
@@ -9150,8 +9347,8 @@ nsresult nsImapProtocol::GetPassword(nsString& password,
   return rv;
 }
 
-NS_IMETHODIMP nsImapProtocol::OnPromptStartAsync(
-    nsIMsgAsyncPromptCallback* aCallback) {
+NS_IMETHODIMP
+nsImapProtocol::OnPromptStartAsync(nsIMsgAsyncPromptCallback* aCallback) {
   bool result = false;
   OnPromptStart(&result);
   return aCallback->OnAuthResult(result);
@@ -9447,8 +9644,8 @@ bool nsImapProtocol::TryToLogon() {
         m_currentBiffState = nsIMsgFolder::nsMsgBiffState_Unknown;
         SendSetBiffIndicatorEvent(m_currentBiffState);
       }  // all methods failed
-    }  // login failed
-  }  // while
+    }    // login failed
+  }      // while
 
   if (loginSucceeded) {
     MOZ_LOG(IMAP, LogLevel::Debug, ("login succeeded"));
@@ -9767,14 +9964,32 @@ class ImapOfflineMsgStreamListener : public nsIStreamListener {
     AUTO_PROFILER_LABEL("ImapOfflineMsgStreamListener::OnStopRequest",
                         MAILNEWS);
     MOZ_RELEASE_ASSERT(NS_IsMainThread());
+#ifdef MOZ_PANORAMA
+    nsCOMPtr<nsIURI> uri;
+    mChannel->GetURI(getter_AddRefs(uri));
+    nsCOMPtr<nsIImapUrl> url = do_QueryInterface(uri);
+    RefPtr<ImapMigrationWork> work = ImapMigrationWork::FindUrl(url);
+    if (work) work->RecordError(status);
+#endif
     nsresult rv = mListener->OnStopRequest(mChannel, status);
+#ifdef MOZ_PANORAMA
+    if (work) work->RecordError(rv);
+#endif
     mListener = nullptr;
-    mChannel->Close();
+    nsresult close = mChannel->Close();
+#ifdef MOZ_PANORAMA
+    if (work) work->RecordError(close);
+#endif
+    if (NS_SUCCEEDED(rv)) rv = close;
     mChannel = nullptr;
     if (NS_FAILED(status) &&
         Preferences::GetBool("mail.discard_offline_msg_on_failure", true)) {
       // The streaming failed, discard the offline copy of the message.
-      mFolder->DiscardOfflineMsg(mMsgKey);
+      nsresult discardRv = mFolder->DiscardOfflineMsg(mMsgKey);
+#ifdef MOZ_PANORAMA
+      if (work) work->RecordError(discardRv);
+#endif
+      if (NS_SUCCEEDED(rv)) rv = discardRv;
     }
     return rv;
   }
@@ -9844,8 +10059,9 @@ nsresult nsImapMockChannel::NotifyStartEndReadFromCache(bool start) {
 }
 
 NS_IMETHODIMP nsImapMockChannel::Close() {
+  nsresult result = NS_OK;
   if (mReadingFromCache)
-    NotifyStartEndReadFromCache(false);
+    result = NotifyStartEndReadFromCache(false);
   else {
     nsCOMPtr<nsIMsgMailNewsUrl> mailnewsUrl = do_QueryInterface(m_url);
     if (mailnewsUrl) {
@@ -9858,13 +10074,13 @@ NS_IMETHODIMP nsImapMockChannel::Close() {
       // use our load group (they may differ)
       if (!loadGroup) mailnewsUrl->GetLoadGroup(getter_AddRefs(loadGroup));
       if (loadGroup)
-        loadGroup->RemoveRequest((nsIRequest*)this, nullptr, NS_OK);
+        result = loadGroup->RemoveRequest((nsIRequest*)this, nullptr, NS_OK);
     }
   }
 
   m_channelListener = nullptr;
   mChannelClosed = true;
-  return NS_OK;
+  return result;
 }
 
 NS_IMETHODIMP nsImapMockChannel::GetProgressEventSink(
@@ -9879,8 +10095,8 @@ NS_IMETHODIMP nsImapMockChannel::SetProgressEventSink(
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapMockChannel::GetChannelListener(
-    nsIStreamListener** aChannelListener) {
+NS_IMETHODIMP
+nsImapMockChannel::GetChannelListener(nsIStreamListener** aChannelListener) {
   NS_IF_ADDREF(*aChannelListener = m_channelListener);
   return NS_OK;
 }
@@ -10320,8 +10536,8 @@ nsresult nsImapMockChannel::ReadFromCache2(nsICacheEntry* entry) {
         MOZ_LOG(IMAPCache, LogLevel::Debug,
                 ("%s: Cache entry accepted and being read", __func__));
       }  // if AsyncRead succeeded.
-    }  // new pump
-  }  // if useCacheEntry
+    }    // new pump
+  }      // if useCacheEntry
 
   if (!useCacheEntry || NS_FAILED(rv)) {
     // Cache entry appears to be unusable. Return an error so will still attempt
@@ -10381,6 +10597,14 @@ nsresult nsImapMockChannel::RunOnStopRequestFailure() {
 // creates an imap connection to process the url. This is usually called from
 // the mock channel or possibly from nsImapCacheStreamListener::OnDataAvailable.
 NS_IMETHODIMP nsImapMockChannel::ReadFromImapConnection() {
+#ifdef MOZ_PANORAMA
+  nsresult admission = CheckImapMigrationAdmission();
+  if (NS_FAILED(admission)) {
+    nsCOMPtr<nsIImapUrl> url = do_QueryInterface(m_url);
+    ImapMigrationWork::CompleteUrl(url, admission, NS_OK);
+    return admission;
+  }
+#endif
   nsresult rv = NS_OK;
   nsCOMPtr<nsIImapUrl> imapUrl = do_QueryInterface(m_url);
   nsCOMPtr<nsIMsgMailNewsUrl> mailnewsUrl = do_QueryInterface(m_url);
@@ -10456,6 +10680,15 @@ bool nsImapMockChannel::ReadFromLocalCache() {
   if (!folder) {
     return false;
   }
+#ifdef MOZ_PANORAMA
+  auto admitted = ImapMigrationWork::AdmitBody(folder, imapUrl);
+  if (admitted.isErr()) return false;
+  RefPtr<ImapMigrationWork> streamWork = admitted.unwrap();
+  bool started = false;
+  auto failedStart = mozilla::MakeScopeExit([&] {
+    if (!started) streamWork->Complete(NS_FAILED(rv) ? rv : NS_ERROR_FAILURE);
+  });
+#endif
   // we want to create a file channel and read the msg from there.
 
   // Need the message key to get to offline copy.
@@ -10499,7 +10732,16 @@ bool nsImapMockChannel::ReadFromLocalCache() {
   RefPtr<ImapOfflineMsgStreamListener> offlineMsgListener =
       new ImapOfflineMsgStreamListener(folder, msgKey, m_channelListener, this);
 
+#ifdef MOZ_PANORAMA
+  streamWork->SetRequest(pump);
+  nsCOMPtr<nsIStreamListener> tracked =
+      mozilla::mailnews::TrackImapMigrationStream(offlineMsgListener,
+                                                  streamWork);
+  rv = pump->AsyncRead(tracked);
+  if (NS_SUCCEEDED(rv)) started = true;
+#else
   rv = pump->AsyncRead(offlineMsgListener);
+#endif
   NS_ENSURE_SUCCESS(rv, false);
 
   // if the msg is unread, we should mark it read on the server. This lets
@@ -10509,58 +10751,70 @@ bool nsImapMockChannel::ReadFromLocalCache() {
 }
 
 NS_IMETHODIMP nsImapMockChannel::AsyncOpen(nsIStreamListener* aListener) {
-  MOZ_ASSERT(NS_IsMainThread(),
-             "nsIChannel methods must be called from main thread");
-  mLoadFlags |= nsIChannel::LOAD_REPLACE;
-  nsCOMPtr<nsIStreamListener> listener = aListener;
-  nsresult rv =
-      nsContentSecurityManager::doContentSecurityCheck(this, listener);
-  NS_ENSURE_SUCCESS(rv, rv);
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+  nsCOMPtr<nsIImapUrl> migrationUrl = do_QueryInterface(m_url);
+  RefPtr<ImapMigrationWork> migrationUrlWork =
+      MOZ_TRY(ImapMigrationWork::AdmitUrl(migrationUrl));
+#endif
+  nsresult migrationResult = [&]() -> nsresult {
+    MOZ_ASSERT(NS_IsMainThread(),
+               "nsIChannel methods must be called from main thread");
+    mLoadFlags |= nsIChannel::LOAD_REPLACE;
+    nsCOMPtr<nsIStreamListener> listener = aListener;
+    nsresult rv =
+        nsContentSecurityManager::doContentSecurityCheck(this, listener);
+    NS_ENSURE_SUCCESS(rv, rv);
 
-  int32_t port;
-  if (!m_url) return NS_ERROR_NULL_POINTER;
-  rv = m_url->GetPort(&port);
-  if (NS_FAILED(rv)) return rv;
+    int32_t port;
+    if (!m_url) return NS_ERROR_NULL_POINTER;
+    rv = m_url->GetPort(&port);
+    if (NS_FAILED(rv)) return rv;
 
-  rv = NS_CheckPortSafety(port, "imap");
-  if (NS_FAILED(rv)) return rv;
+    rv = NS_CheckPortSafety(port, "imap");
+    if (NS_FAILED(rv)) return rv;
 
-  // set the stream listener and then load the url
-  NS_ASSERTION(!m_channelListener, "shouldn't already have a listener");
-  m_channelListener = listener;
-  nsCOMPtr<nsIImapUrl> imapUrl(do_QueryInterface(m_url));
+    // set the stream listener and then load the url
+    NS_ASSERTION(!m_channelListener, "shouldn't already have a listener");
+    m_channelListener = listener;
+    nsCOMPtr<nsIImapUrl> imapUrl(do_QueryInterface(m_url));
 
-  nsImapAction imapAction;
-  imapUrl->GetImapAction(&imapAction);
+    nsImapAction imapAction;
+    imapUrl->GetImapAction(&imapAction);
 
-  bool externalLink = true;
-  imapUrl->GetExternalLinkUrl(&externalLink);
+    bool externalLink = true;
+    imapUrl->GetExternalLinkUrl(&externalLink);
 
-  if (externalLink) {
-    // For security purposes, only allow IMAP URLs originating from external
-    // sources to fetch messages.
-    if (!(imapAction == nsIImapUrl::nsImapMsgFetch ||
-          imapAction == nsIImapUrl::nsImapMsgFetchPeek))
-      // Abort the running of this url... it failed a security check.
-      return NS_ERROR_FAILURE;
-  }
+    if (externalLink) {
+      // For security purposes, only allow IMAP URLs originating from external
+      // sources to fetch messages.
+      if (!(imapAction == nsIImapUrl::nsImapMsgFetch ||
+            imapAction == nsIImapUrl::nsImapMsgFetchPeek))
+        // Abort the running of this url... it failed a security check.
+        return NS_ERROR_FAILURE;
+    }
 
-  if (ReadFromLocalCache()) {
-    (void)NotifyStartEndReadFromCache(true);
-    return NS_OK;
-  }
+    if (ReadFromLocalCache()) {
+      (void)NotifyStartEndReadFromCache(true);
+      return NS_OK;
+    }
 
-  // okay, it's not in the local cache, now check the memory cache...
-  // but we can't download for offline use from the memory cache
-  if (imapAction != nsIImapUrl::nsImapMsgDownloadForOffline) {
-    rv = OpenCacheEntry();
-    if (NS_SUCCEEDED(rv)) return rv;
-  }
+    // okay, it's not in the local cache, now check the memory cache...
+    // but we can't download for offline use from the memory cache
+    if (imapAction != nsIImapUrl::nsImapMsgDownloadForOffline) {
+      rv = OpenCacheEntry();
+      if (NS_SUCCEEDED(rv)) return rv;
+    }
 
-  SetupPartExtractorListener(imapUrl, m_channelListener);
-  // if for some reason open cache entry failed then just default to opening an
-  // imap connection for the url
-  return ReadFromImapConnection();
+    SetupPartExtractorListener(imapUrl, m_channelListener);
+    // if for some reason open cache entry failed then just default to opening
+    // an imap connection for the url
+    return ReadFromImapConnection();
+  }();
+#ifdef MOZ_PANORAMA
+  if (NS_FAILED(migrationResult)) migrationUrlWork->Complete(migrationResult);
+#endif
+  return migrationResult;
 }
 
 nsresult nsImapMockChannel::SetupPartExtractorListener(
@@ -10613,8 +10867,8 @@ NS_IMETHODIMP nsImapMockChannel::GetContentType(nsACString& aContentType) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapMockChannel::SetContentType(
-    const nsACString& aContentType) {
+NS_IMETHODIMP
+nsImapMockChannel::SetContentType(const nsACString& aContentType) {
   nsAutoCString charset;
   nsresult rv =
       NS_ParseResponseContentType(aContentType, mContentType, charset);
@@ -10623,14 +10877,14 @@ NS_IMETHODIMP nsImapMockChannel::SetContentType(
   return rv;
 }
 
-NS_IMETHODIMP nsImapMockChannel::GetContentCharset(
-    nsACString& aContentCharset) {
+NS_IMETHODIMP
+nsImapMockChannel::GetContentCharset(nsACString& aContentCharset) {
   aContentCharset.Assign(mCharset);
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapMockChannel::SetContentCharset(
-    const nsACString& aContentCharset) {
+NS_IMETHODIMP
+nsImapMockChannel::SetContentCharset(const nsACString& aContentCharset) {
   mCharset.Assign(aContentCharset);
   return NS_OK;
 }
@@ -10686,14 +10940,14 @@ NS_IMETHODIMP nsImapMockChannel::SetOwner(nsISupports* aPrincipal) {
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapMockChannel::GetSecurityInfo(
-    nsITransportSecurityInfo** aSecurityInfo) {
+NS_IMETHODIMP
+nsImapMockChannel::GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo) {
   NS_IF_ADDREF(*aSecurityInfo = mSecurityInfo);
   return NS_OK;
 }
 
-NS_IMETHODIMP nsImapMockChannel::SetSecurityInfo(
-    nsITransportSecurityInfo* aSecurityInfo) {
+NS_IMETHODIMP
+nsImapMockChannel::SetSecurityInfo(nsITransportSecurityInfo* aSecurityInfo) {
   mSecurityInfo = aSecurityInfo;
   return NS_OK;
 }

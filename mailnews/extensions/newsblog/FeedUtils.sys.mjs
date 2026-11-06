@@ -2,7 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
+
+/**
+ * Checks native process admission before starting an RSS writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "rss");
+}
 
 const lazy = {};
 
@@ -133,6 +152,7 @@ export var FeedUtils = {
    * @returns {nsIMsgAccount} - The creaged account.
    */
   createRssAccount(aName) {
+    checkMigrationWriterAdmission();
     const userName = "nobody";
     let hostname = "Feeds";
     const hostnamePref = hostname;
@@ -216,6 +236,7 @@ export var FeedUtils = {
    * @returns {Promise<void>} When all feeds downloading have been set off.
    */
   async downloadFeed(aFolder, aUrlListener, aIsBiff, aMsgWindow) {
+    checkMigrationWriterAdmission();
     FeedUtils.log.debug(
       "downloadFeed: account isBiff:isOffline - " +
         aIsBiff +
@@ -445,6 +466,7 @@ export var FeedUtils = {
    * @returns {void}
    */
   subscribeToFeed(aUrl, aFolder) {
+    checkMigrationWriterAdmission();
     // We don't support the ability to subscribe to several feeds at once yet.
     // For now, abort the subscription if we are already in the middle of
     // subscribing to a feed via drag and drop.
@@ -500,6 +522,7 @@ export var FeedUtils = {
    * @returns {void}
    */
   pauseFeedFolderUpdates(aFolder, aPause, aBiffNow) {
+    checkMigrationWriterAdmission();
     if (aFolder.isServer) {
       const serverFolder = aFolder.server.rootFolder;
       // Remove server from biff first. If enabling biff, this will make the
@@ -556,6 +579,7 @@ export var FeedUtils = {
    * @returns {void}
    */
   addFeed(aFeed) {
+    checkMigrationWriterAdmission();
     // Find or create subscription entry.
     const ds = this.getSubscriptionsDS(aFeed.server);
     let sub = ds.data.find(x => x.url == aFeed.url);
@@ -583,6 +607,7 @@ export var FeedUtils = {
    * @returns {void}
    */
   deleteFeed(aFeed) {
+    checkMigrationWriterAdmission();
     // Remove items associated with this feed from the items db.
     aFeed.invalidateItems();
     aFeed.removeInvalidItems(true);
@@ -605,6 +630,7 @@ export var FeedUtils = {
    * @returns {boolean} - true if successful, else false.
    */
   changeUrlForFeed(aFeed, aNewUrl) {
+    checkMigrationWriterAdmission();
     if (!aFeed || !aFeed.folder || !aNewUrl) {
       return false;
     }
@@ -728,6 +754,7 @@ export var FeedUtils = {
    * @returns {boolean} - true if msgDb is available, else false
    */
   isMsgDatabaseOpenable(aFolder, aReparse, aUrlListener) {
+    checkMigrationWriterAdmission();
     let msgDb;
     try {
       msgDb = Cc["@mozilla.org/msgDatabase/msgDBService;1"]
@@ -866,6 +893,7 @@ export var FeedUtils = {
    * @returns {void}
    */
   setStatus(aFolder, aUrl, aProperty, aValue) {
+    checkMigrationWriterAdmission();
     if (!aFolder || !aUrl || !aProperty) {
       return;
     }
@@ -899,6 +927,7 @@ export var FeedUtils = {
    * @returns {Promise<string>} - The favicon url or empty string.
    */
   async getFavicon(folder, feedURL) {
+    checkMigrationWriterAdmission();
     if (
       !Services.prefs.getBoolPref("browser.chrome.site_icons") ||
       !Services.prefs.getBoolPref("browser.chrome.favicons") ||
@@ -1056,6 +1085,7 @@ export var FeedUtils = {
    * @returns {void}
    */
   updateSubscriptionsDS(aFolder, aOrigFolder, aAction) {
+    checkMigrationWriterAdmission();
     this.log.debug(
       "FeedUtils.updateSubscriptionsDS: " +
         "\nfolder changed - " +
@@ -1121,6 +1151,7 @@ export var FeedUtils = {
     aNewAncestorURI,
     aOrigAncestorURI
   ) {
+    checkMigrationWriterAdmission();
     this.log.debug(
       "updateFolderChangeInFeedsDS: " +
         "\naFolder       - " +
@@ -1332,12 +1363,14 @@ export var FeedUtils = {
   },
 
   setOptionsAcct(aServer, aOptions) {
+    checkMigrationWriterAdmission();
     const optionsAcctPref = "mail.server." + aServer.key + ".feed_options";
     aOptions = aOptions || this.optionsTemplate;
     Services.prefs.setCharPref(optionsAcctPref, JSON.stringify(aOptions));
   },
 
   initAcct(aServer) {
+    checkMigrationWriterAdmission();
     const serverPrefStr = "mail.server." + aServer.key;
     // System polling interval. Effective after current interval expires on
     // change; no user facing ui.
@@ -1431,6 +1464,7 @@ export var FeedUtils = {
    *                       in its data field.
    */
   getSubscriptionsDS(aServer) {
+    checkMigrationWriterAdmission();
     if (this[aServer.serverURI] && this[aServer.serverURI].FeedsDS) {
       return this[aServer.serverURI].FeedsDS;
     }
@@ -1487,6 +1521,7 @@ export var FeedUtils = {
    * @returns {void}
    */
   setSubscriptionAttr(feedURL, server, attrName, value) {
+    checkMigrationWriterAdmission();
     const ds = this.getSubscriptionsDS(server);
     let sub = ds.data.find(feed => feed.url == feedURL);
     if (sub === undefined) {
@@ -1507,6 +1542,7 @@ export var FeedUtils = {
    *                       of feeditems indexed by item url.
    */
   getItemsDS(aServer) {
+    checkMigrationWriterAdmission();
     if (this[aServer.serverURI] && this[aServer.serverURI].FeedItemsDS) {
       return this[aServer.serverURI].FeedItemsDS;
     }

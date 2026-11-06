@@ -2,9 +2,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { IMServices } from "resource:///modules/IMServices.sys.mjs";
 import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
 import { GenericMessagePrototype } from "resource:///modules/jsProtoHelper.sys.mjs";
+
+/**
+ * Checks native process admission before starting a chat writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate
+    .QueryInterface(Ci.nsIPropertyBag2)
+    .getPropertyAsInterface("writer-admission-subject", Ci.nsISupports);
+  gate.observe(subject, "check-writer-admission", "chat");
+}
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
@@ -44,6 +62,18 @@ XPCOMUtils.defineLazyPreferenceGetter(
 
 // Uses above map to queue operations on a file.
 export function queueFileOperation(aPath, aOperation) {
+  checkMigrationWriterAdmission();
+  return queueFileOperationInternal(aPath, aOperation);
+}
+
+/**
+ * Serializes one already-admitted operation with the existing file queue.
+ *
+ * @param {string} aPath - Exact path shared with ordinary logger work.
+ * @param {function(): *} aOperation - Operation that returns its full settlement.
+ * @returns {Promise<*>} Original operation result or rejection.
+ */
+function queueFileOperationInternal(aPath, aOperation) {
   // Ensure the operation is queued regardless of whether the last one succeeded.
   // This is safe since the promise is returned and consumers are expected to
   // handle any errors. If there's no promise existing for the given path already,
@@ -64,6 +94,119 @@ export function queueFileOperation(aPath, aOperation) {
   promise.then(cleanup, cleanup);
 
   return promise;
+}
+
+const archiveContexts = new WeakSet();
+const archiveReaders = new WeakMap();
+const archiveLogs = new WeakMap();
+
+/**
+ * Returns the existing GS capture module without starting live chat.
+ *
+ * @returns {object} SearchMigrationHold exports.
+ */
+function searchMigration() {
+  return ChromeUtils.importESModule(
+    "resource:///modules/panorama/SearchMigrationHold.sys.mjs"
+  );
+}
+
+/**
+ * Rejects a forged or settled context before launching or joining file work.
+ *
+ * @param {object} context - Private context over genuine pending search work.
+ * @throws {nsIException} Unknown context, settled work or invalid native view.
+ */
+function validateLogContext(context) {
+  if (!archiveContexts.has(context)) {
+    throw Components.Exception(
+      "Unknown chat archive work",
+      Cr.NS_ERROR_NOT_AVAILABLE
+    );
+  }
+  context.check();
+}
+
+/**
+ * Retains one genuine pending GS operation; it grants no native selection.
+ *
+ * @param {object} work - Opaque token minted by SearchMigrationHold.
+ * @param {?object} [owner=null] - Original pending operation for returned parsers.
+ * @returns {object} Internal checked queue and IO continuations.
+ */
+function chatArchiveContext(work, owner = null) {
+  const migration = searchMigration();
+  const context = {
+    owner: null,
+    check() {
+      migration.checkSearchWriterWork(work);
+    },
+    wait(operation) {
+      return migration.waitForSearchWriter(work, operation);
+    },
+    run(operation) {
+      return migration.openSearchWriter(
+        "chat-search",
+        child => operation(chatArchiveContext(child, context.owner)),
+        work
+      );
+    },
+    queue(path, operation) {
+      return context.run(child =>
+        queueFileOperationInternal(path, () =>
+          child.wait(() => operation(child))
+        )
+      );
+    },
+  };
+  context.owner = owner || context;
+  archiveContexts.add(context);
+  return context;
+}
+
+/**
+ * Joins actual I/O under a retained GS generation, or ordinary live work.
+ *
+ * @param {?object} context - Private archive context, or null for live work.
+ * @param {function(): *} operation - Actual operation, including its settlement.
+ * @returns {*} Original live result, or checked archive settlement promise.
+ */
+function waitLogOperation(context, operation) {
+  if (context !== null) {
+    validateLogContext(context);
+    return context.wait(operation);
+  }
+  return operation();
+}
+
+/**
+ * Uses the same per-file serializer for live and captured archive operations.
+ *
+ * @param {?object} context - Private archive context, or null for live work.
+ * @param {string} path - Exact logger file path.
+ * @param {function(?object): *} operation - Receives its private queued context.
+ * @returns {Promise<*>} Original result after preceding file work settles.
+ */
+function queueLogOperation(context, path, operation) {
+  if (context !== null) {
+    validateLogContext(context);
+    return context.queue(path, operation);
+  }
+  return queueFileOperation(path, () => operation(null));
+}
+
+/**
+ * Checks a live producer or an actual already-captured archive operation.
+ *
+ * @param {?object} context - Private archive context, or null for live work.
+ * @throws {nsIException} Original native admission or retained-view failure.
+ */
+function checkLogOperation(context) {
+  if (context === null) {
+    checkMigrationWriterAdmission();
+  } else {
+    validateLogContext(context);
+  }
 }
 
 /**
@@ -194,10 +337,12 @@ function validateChatPrivacyReceipt(receipt) {
 }
 
 /** Reads validated state; missing state grants no historical eligibility. */
-async function loadChatPrivacyState() {
+async function loadChatPrivacyState(context = null) {
   let state;
   try {
-    state = JSON.parse(await IOUtils.readUTF8(chatPrivacyPath()));
+    state = JSON.parse(
+      await waitLogOperation(context, () => IOUtils.readUTF8(chatPrivacyPath()))
+    );
   } catch (error) {
     if (error.name === "NotFoundError") {
       return { version: 1, receipts: [] };
@@ -219,13 +364,17 @@ async function loadChatPrivacyState() {
 }
 
 /** Atomically replaces this state file after flushing its bytes. */
-async function saveChatPrivacyState(state) {
+async function saveChatPrivacyState(state, context = null) {
   const path = chatPrivacyPath();
-  await IOUtils.makeDirectory(PathUtils.parent(path));
-  await IOUtils.writeUTF8(path, JSON.stringify(state), {
-    tmpPath: path + ".tmp",
-    flush: true,
-  });
+  await waitLogOperation(context, () =>
+    IOUtils.makeDirectory(PathUtils.parent(path))
+  );
+  await waitLogOperation(context, () =>
+    IOUtils.writeUTF8(path, JSON.stringify(state), {
+      tmpPath: path + ".tmp",
+      flush: true,
+    })
+  );
 }
 
 /** Parses a complete logger source and verifies its scoped header. */
@@ -290,7 +439,8 @@ function chatPrivacyScope(message) {
 }
 
 /** Joins an original subject and any ordinary deleted-notice append. */
-function beginChatPrivacyCapture(message, appendNotice = null) {
+function beginChatPrivacyCapture(message, appendNotice = null, context = null) {
+  checkLogOperation(context);
   if (
     (message.noLog !== true && message.deleted !== true) ||
     typeof message.remoteId != "string" ||
@@ -339,9 +489,17 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
     let firstError;
     let hasPriorError = false;
     for (const result of await Promise.allSettled(previousWork)) {
-      if (result.status === "rejected" && !hasPriorError) {
-        firstError = result.reason;
-        hasPriorError = true;
+      if (result.status === "rejected") {
+        if (context !== null) {
+          searchMigration().recordSearchWriterFailure(
+            "chat-search",
+            result.reason
+          );
+        }
+        if (!hasPriorError) {
+          firstError = result.reason;
+          hasPriorError = true;
+        }
       }
     }
     try {
@@ -352,7 +510,9 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
       for (const directory of directories) {
         let children;
         try {
-          children = await IOUtils.getChildren(directory);
+          children = await waitLogOperation(context, () =>
+            IOUtils.getChildren(directory)
+          );
         } catch (error) {
           if (error.name !== "NotFoundError") {
             throw hasPriorError ? firstError : error;
@@ -382,7 +542,9 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
         ) {
           throw new Error("Chat privacy source path changed");
         }
-        const bytes = await queueFileOperation(path, () => IOUtils.read(path));
+        const bytes = await queueLogOperation(context, path, () =>
+          IOUtils.read(path)
+        );
         const { lines, records } = parseChatPrivacySource(
           bytes,
           scope,
@@ -421,11 +583,11 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
       const receipt = { version: 1, kind: "erase", scope, remoteId, targets };
       receipt.id = chatPrivacyHash(JSON.stringify(receipt));
       receipt.status = "pending";
-      await queueFileOperation(chatPrivacyPath(), async () => {
-        const state = await loadChatPrivacyState();
+      await queueLogOperation(context, chatPrivacyPath(), async child => {
+        const state = await loadChatPrivacyState(child);
         if (!state.receipts.some(item => item.id === receipt.id)) {
           state.receipts.push(receipt);
-          await saveChatPrivacyState(state);
+          await saveChatPrivacyState(state, child);
         }
       });
       capture.durable = true;
@@ -435,6 +597,9 @@ function beginChatPrivacyCapture(message, appendNotice = null) {
       }
       return receipt;
     } catch (error) {
+      if (context !== null) {
+        searchMigration().recordSearchWriterFailure("chat-search", error);
+      }
       throw hasPriorError ? firstError : error;
     }
   };
@@ -484,20 +649,22 @@ export function getChatPrivacyEpoch() {
  * Drains captures and returns durable pending and completed version exclusions.
  * Empty state never authorizes pre-producer or otherwise unknown history.
  *
+ * @param {?object} context - Private archive context, or null for live work.
  * @returns {Promise<{epoch: number, pending: ChatPrivacyReceipt[],
  *   completed: ChatPrivacyReceipt[], historyKnown: boolean}>} Validated state copies.
  * @throws {Error} Original capture or storage failure; reads do not clear failure.
  */
-export async function getChatPrivacyState() {
+async function getChatPrivacyStateInContext(context) {
   while (gChatPrivacyCaptures.size) {
-    await Promise.all([...gChatPrivacyCaptures]);
+    await waitLogOperation(context, () =>
+      Promise.all([...gChatPrivacyCaptures])
+    );
   }
   if (gChatPrivacyFailures.size) {
     throw gChatPrivacyFailures.values().next().value;
   }
-  const state = await queueFileOperation(
-    chatPrivacyPath(),
-    loadChatPrivacyState
+  const state = await queueLogOperation(context, chatPrivacyPath(), child =>
+    loadChatPrivacyState(child)
   );
   return {
     epoch: gChatPrivacyEpoch,
@@ -514,10 +681,9 @@ export async function getChatPrivacyState() {
 }
 
 /** Returns an exact validated pending or completed receipt. */
-async function findChatPrivacyReceipt(receiptId) {
-  const state = await queueFileOperation(
-    chatPrivacyPath(),
-    loadChatPrivacyState
+async function findChatPrivacyReceipt(receiptId, context = null) {
+  const state = await queueLogOperation(context, chatPrivacyPath(), child =>
+    loadChatPrivacyState(child)
   );
   const receipt = state.receipts.find(item => item.id === receiptId);
   if (!receipt) {
@@ -534,18 +700,20 @@ async function findChatPrivacyReceipt(receiptId) {
  * @param {string[]} relativePath - Exact stored four-component target.
  * @param {object} [options={}] - Cancellation controls.
  * @param {AbortSignal} [options.signal] - Cancels delivery, not started logger I/O.
+ * @param {?object} context - Private archive context, or null for live work.
  * @returns {Promise<{path: string, bytes: Uint8Array|null, revision: string|null,
  *   target: ChatPrivacyTarget, missing: boolean}>} Current source or explicit
  *   absence of this validated target. Missing never means invented empty text.
  * @throws {Error} Original error, foreign/replaced header or changed target version.
  */
-export async function readChatPrivacyTarget(
+async function readChatPrivacyTargetInContext(
   receiptId,
   relativePath,
-  { signal } = {}
+  { signal } = {},
+  context
 ) {
   signal?.throwIfAborted();
-  const receipt = await findChatPrivacyReceipt(receiptId);
+  const receipt = await findChatPrivacyReceipt(receiptId, context);
   const target = receipt.targets.find(
     item => JSON.stringify(item.relativePath) === JSON.stringify(relativePath)
   );
@@ -559,19 +727,22 @@ export async function readChatPrivacyTarget(
   );
   const previous = gFilePromises.get(path);
   if (previous) {
-    await previous;
+    await waitLogOperation(context, () => previous);
   }
-  let bytes;
-  try {
-    bytes = await queueFileOperation(path, () => IOUtils.read(path));
-  } catch (error) {
-    signal?.throwIfAborted();
-    if (error.name === "NotFoundError") {
-      return { path, target, missing: true, bytes: null, revision: null };
+  const bytes = await queueLogOperation(context, path, async () => {
+    try {
+      return await IOUtils.read(path);
+    } catch (error) {
+      if (error.name === "NotFoundError") {
+        return null;
+      }
+      throw error;
     }
-    throw error;
-  }
+  });
   signal?.throwIfAborted();
+  if (bytes === null) {
+    return { path, target, missing: true, bytes: null, revision: null };
+  }
   const { lines } = parseChatPrivacySource(
     bytes,
     receipt.scope,
@@ -601,18 +772,28 @@ export async function readChatPrivacyTarget(
  * @param {string} receiptId - Pending or completed version exclusion.
  * @param {object} [options={}] - Cancellation controls.
  * @param {AbortSignal} [options.signal] - Cancels between source reads.
+ * @param {?object} context - Private archive context, or null for live work.
  * @returns {Promise<{receiptId: string, targets: {relativePath: string[],
  *   revision: string|null, missing: boolean}[]}>} Exact erasure/absence proof;
  *   no semantic success claim. Other I/O failures remain original failures.
  * @throws {Error} Original failure or a captured source version remains unerased.
  */
-export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
-  const receipt = await findChatPrivacyReceipt(receiptId);
+async function getChatPrivacySourceProofInContext(
+  receiptId,
+  { signal } = {},
+  context
+) {
+  const receipt = await findChatPrivacyReceipt(receiptId, context);
   const targets = [];
   for (const target of receipt.targets) {
-    const source = await readChatPrivacyTarget(receiptId, target.relativePath, {
-      signal,
-    });
+    const source = await readChatPrivacyTargetInContext(
+      receiptId,
+      target.relativePath,
+      {
+        signal,
+      },
+      context
+    );
     if (source.missing) {
       targets.push({
         relativePath: target.relativePath,
@@ -654,6 +835,7 @@ export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
  *   source/semantic/FTS/recovery erasure, then returns getChatPrivacySourceProof.
  * @param {object} [options={}] - Cancellation controls.
  * @param {AbortSignal} [options.signal] - Cancels before durable acknowledgment.
+ * @param {?object} context - Private archive context, or null for live work.
  * @returns {Promise<void>} Resolves after a flushed complete exclusion.
  * @throws {Error} Original callback/I/O/cancellation error or mismatched proof.
  * @example
@@ -662,36 +844,42 @@ export async function getChatPrivacySourceProof(receiptId, { signal } = {}) {
  *   return getChatPrivacySourceProof(receipt.id);
  * });
  */
-export function acknowledgeChatPrivacyIntent(
+function acknowledgeChatPrivacyIntentInContext(
   receiptId,
   complete,
-  { signal } = {}
+  { signal } = {},
+  context
 ) {
   if (gChatPrivacyAcknowledgements.has(receiptId)) {
     return gChatPrivacyAcknowledgements.get(receiptId);
   }
+  checkLogOperation(context);
   ++gChatPrivacyEpoch;
   const work = (async () => {
     signal?.throwIfAborted();
     if (typeof complete != "function") {
       throw new TypeError("A completed privacy operation is required");
     }
-    const receipt = await findChatPrivacyReceipt(receiptId);
-    const proof = await complete(receipt);
+    const receipt = await findChatPrivacyReceipt(receiptId, context);
+    const proof = await waitLogOperation(context, () => complete(receipt));
     signal?.throwIfAborted();
-    const actual = await getChatPrivacySourceProof(receiptId, { signal });
+    const actual = await getChatPrivacySourceProofInContext(
+      receiptId,
+      { signal },
+      context
+    );
     if (JSON.stringify(proof) !== JSON.stringify(actual)) {
       throw new Error("Chat privacy completion proof changed");
     }
-    await queueFileOperation(chatPrivacyPath(), async () => {
-      const state = await loadChatPrivacyState();
+    await queueLogOperation(context, chatPrivacyPath(), async child => {
+      const state = await loadChatPrivacyState(child);
       const current = state.receipts.find(item => item.id === receiptId);
       if (!current) {
         throw new Error("Chat privacy receipt disappeared");
       }
       signal?.throwIfAborted();
       current.status = "complete";
-      await saveChatPrivacyState(state);
+      await saveChatPrivacyState(state, child);
     });
   })();
   gChatPrivacyAcknowledgements.set(receiptId, work);
@@ -701,6 +889,64 @@ export function acknowledgeChatPrivacyIntent(
   };
   work.then(finish, finish);
   return work;
+}
+
+/**
+ * Returns validated live privacy state after existing captures settle.
+ *
+ * @returns {Promise<object>} Epoch, pending/completed receipts and historyKnown=false.
+ * @throws {Error} Original capture or storage failure.
+ */
+export function getChatPrivacyState() {
+  return getChatPrivacyStateInContext(null);
+}
+
+/**
+ * Reads an exact live privacy target through the ordinary Chat queue.
+ *
+ * @param {string} receiptId - Exact pending or complete receipt.
+ * @param {string[]} relativePath - Four stored target path components.
+ * @param {object} [options={}] - Optional AbortSignal in signal.
+ * @returns {Promise<object>} Validated bytes/revision or explicit missing target.
+ * @throws {Error} Original failure or changed source identity/version.
+ */
+export function readChatPrivacyTarget(receiptId, relativePath, options = {}) {
+  return readChatPrivacyTargetInContext(receiptId, relativePath, options, null);
+}
+
+/**
+ * Returns the original ordered live source/absence proof.
+ *
+ * @param {string} receiptId - Exact pending or complete receipt.
+ * @param {object} [options={}] - Optional AbortSignal in signal.
+ * @returns {Promise<object>} Receipt ID and ordered erased/absent source revisions.
+ * @throws {Error} Original failure or an unerased captured source version.
+ */
+export function getChatPrivacySourceProof(receiptId, options = {}) {
+  return getChatPrivacySourceProofInContext(receiptId, options, null);
+}
+
+/**
+ * Completes a live privacy intent after actual source and search settlement.
+ *
+ * @param {string} receiptId - Exact pending or complete receipt.
+ * @param {function(ChatPrivacyReceipt): Promise<object>} complete - Real erasure
+ *   followed by getChatPrivacySourceProof; retries must be idempotent.
+ * @param {object} [options={}] - Optional AbortSignal in signal.
+ * @returns {Promise<void>} Flushed complete exclusion, joining duplicate calls.
+ * @throws {Error} Original failure/cancellation or a changed completion proof.
+ */
+export function acknowledgeChatPrivacyIntent(
+  receiptId,
+  complete,
+  options = {}
+) {
+  return acknowledgeChatPrivacyIntentInContext(
+    receiptId,
+    complete,
+    options,
+    null
+  );
 }
 
 /**
@@ -813,6 +1059,7 @@ function queueLogFileCleanup(path) {
   if (!lazy.SHOULD_CLEANUP_LOGS) {
     return Promise.resolve();
   }
+  checkMigrationWriterAdmission();
   let resolveCleanup, rejectCleanup;
   const completion = new Promise((resolve, reject) => {
     resolveCleanup = resolve;
@@ -833,66 +1080,74 @@ function queueLogFileCleanup(path) {
     // reading the log and writing it back. This means we might run this when
     // the application isn't idle, but due to the async operations that is
     // very hard to guarantee either way.
-    queueFileOperation(path, async () => {
-      try {
-        const logContents = await IOUtils.readUTF8(path);
-        const logLines = logContents.split("\n").map(line => {
-          try {
-            return JSON.parse(line);
-          } catch {
-            return line;
-          }
-        });
-        let lastDeletionIndex = 0;
-        const deletedMessages = new Set(
-          logLines
-            .filter((message, index) => {
-              if (message.flags?.includes("deleted") && message.remoteId) {
-                lastDeletionIndex = index;
-                return true;
-              }
-              return false;
-            })
-            .map(message => message.remoteId)
-        );
-        for (const [index, message] of logLines.entries()) {
-          // If we are past the last deletion in the logs, there is no more
-          // work to be done.
-          if (index >= lastDeletionIndex) {
-            break;
-          }
-          if (
-            deletedMessages.has(message.remoteId) &&
-            !message.flags?.includes("deleted")
-          ) {
-            // Void the text of deleted messages but keep the message
-            // metadata for journaling.
-            message.text = "";
-          }
-        }
-        const cleanedLog = logLines
-          .map(line => {
-            if (typeof line === "string") {
+    let operation;
+    try {
+      operation = queueFileOperation(path, async () => {
+        try {
+          const logContents = await IOUtils.readUTF8(path);
+          const logLines = logContents.split("\n").map(line => {
+            try {
+              return JSON.parse(line);
+            } catch {
               return line;
             }
-            return JSON.stringify(line);
-          })
-          .join("\n");
-        await IOUtils.writeUTF8(path, cleanedLog);
-      } catch (error) {
-        console.error(
-          "Error cleaning up log file contents for " + path + ": " + error
-        );
-        throw error;
-      } finally {
-        gPendingCleanup.delete(path);
-        Services.prefs.setStringPref(
-          kPendingLogCleanupPref,
-          JSON.stringify(Array.from(gPendingCleanup.values()))
-        );
-        gLogCleanupPromises.delete(path);
-      }
-    }).then(resolveCleanup, rejectCleanup);
+          });
+          let lastDeletionIndex = 0;
+          const deletedMessages = new Set(
+            logLines
+              .filter((message, index) => {
+                if (message.flags?.includes("deleted") && message.remoteId) {
+                  lastDeletionIndex = index;
+                  return true;
+                }
+                return false;
+              })
+              .map(message => message.remoteId)
+          );
+          for (const [index, message] of logLines.entries()) {
+            // If we are past the last deletion in the logs, there is no more
+            // work to be done.
+            if (index >= lastDeletionIndex) {
+              break;
+            }
+            if (
+              deletedMessages.has(message.remoteId) &&
+              !message.flags?.includes("deleted")
+            ) {
+              // Void the text of deleted messages but keep the message
+              // metadata for journaling.
+              message.text = "";
+            }
+          }
+          const cleanedLog = logLines
+            .map(line => {
+              if (typeof line === "string") {
+                return line;
+              }
+              return JSON.stringify(line);
+            })
+            .join("\n");
+          await IOUtils.writeUTF8(path, cleanedLog);
+        } catch (error) {
+          console.error(
+            "Error cleaning up log file contents for " + path + ": " + error
+          );
+          throw error;
+        } finally {
+          gPendingCleanup.delete(path);
+          Services.prefs.setStringPref(
+            kPendingLogCleanupPref,
+            JSON.stringify(Array.from(gPendingCleanup.values()))
+          );
+          gLogCleanupPromises.delete(path);
+        }
+      });
+    } catch (error) {
+      gLogCleanupPromises.delete(path);
+      rejectCleanup(error);
+      return;
+    }
+    operation.then(resolveCleanup, rejectCleanup);
   };
   ChromeUtils.idleDispatch(idleCallback);
   gPendingCleanup.add(path);
@@ -908,6 +1163,7 @@ function queueLogFileCleanup(path) {
  * application was running.
  */
 function initLogCleanup() {
+  checkMigrationWriterAdmission();
   if (!lazy.SHOULD_CLEANUP_LOGS) {
     return;
   }
@@ -942,6 +1198,7 @@ function initLogCleanup() {
  */
 class LogWriter {
   constructor(aConversation) {
+    checkMigrationWriterAdmission();
     this._conv = aConversation;
     this.paths = [];
     this.startNewFile(this._conv.startDate / 1000);
@@ -971,6 +1228,7 @@ class LogWriter {
   _lastMessageTime = null;
   _messageCount = 0;
   startNewFile(aStartTime, aContinuedSession) {
+    checkMigrationWriterAdmission();
     // We start a new log file every 1000 messages. The start time of this new
     // log file is the time of the next message. Since message times are in seconds,
     // if we receive 1000 messages within a second after starting the new file,
@@ -1034,6 +1292,7 @@ class LogWriter {
    * @throws {Error} Original initialization or explicitly joined cleanup failure.
    */
   async logMessage(aMessage, awaitCleanup = false) {
+    checkMigrationWriterAdmission();
     // aMessage.time is in seconds, we need it in milliseconds.
     const messageTime = aMessage.time * 1000;
     const messageMidnight = new Date(messageTime).setHours(0, 0, 0, 0);
@@ -1110,6 +1369,7 @@ var dummyLogWriter = {
 
 var gLogWritersById = new Map();
 export function getLogWriter(aConversation) {
+  checkMigrationWriterAdmission();
   const id = aConversation.id;
   if (!gLogWritersById.has(id)) {
     const prefName =
@@ -1268,7 +1528,11 @@ class Log {
    *
    * @param {{path: string, time: Date}[]|string} aEntries
    */
-  constructor(aEntries) {
+  constructor(aEntries, context = null) {
+    if (context !== null) {
+      validateLogContext(context);
+      archiveLogs.set(this, context.owner);
+    }
     if (typeof aEntries == "string") {
       // Assume that aEntries is a single path.
       const path = aEntries;
@@ -1334,9 +1598,20 @@ class Log {
    *
    * @returns {Promise<?LogConversation>}
    */
-  async getConversation() {
-    /*
-     */
+  getConversation() {
+    const context = archiveLogs.get(this);
+    return context
+      ? context.run(child => this.#readConversation(child))
+      : this.#readConversation(null);
+  }
+
+  /**
+   * Reads the existing parser input under its real archive operation, if any.
+   *
+   * @param {?object} context - Private archive context, or null for live work.
+   * @returns {Promise<?LogConversation>} Parsed conversation or invalid header.
+   */
+  async #readConversation(context) {
     let messages = [];
     const properties = {};
     let firstFile = true;
@@ -1345,11 +1620,14 @@ class Log {
     for (const path of this._entryPaths) {
       let lines;
       try {
-        const contents = await queueFileOperation(path, () =>
+        const contents = await queueLogOperation(context, path, () =>
           IOUtils.read(path)
         );
         lines = decoder.decode(contents).split("\n");
       } catch (aError) {
+        if (context !== null) {
+          throw aError;
+        }
         console.error('Error reading log file "' + path + '":\n' + aError);
         continue;
       }
@@ -1494,6 +1772,7 @@ export class Logger {
   QueryInterface = ChromeUtils.generateQI(["nsIObserver"]);
 
   constructor() {
+    checkMigrationWriterAdmission();
     IOUtils.profileBeforeChange.addBlocker(
       "Chat logger: writing all pending messages",
       async function () {
@@ -1542,8 +1821,12 @@ export class Logger {
    * @returns {Promise<Log>}
    */
   async getLogFromFile(aFilePath, aGroupByDay) {
+    const context = archiveReaders.get(this) || null;
+    if (context !== null) {
+      validateArchivePath(aFilePath);
+    }
     if (!aGroupByDay) {
-      return new Log(aFilePath);
+      return new Log(aFilePath, context);
     }
     let [targetDate] = getDateFromFilename(PathUtils.filename(aFilePath));
     if (!targetDate) {
@@ -1555,8 +1838,10 @@ export class Logger {
     // We'll assume that the files relevant to our interests are
     // in the same folder as the one provided.
     const relevantEntries = [];
-    for (const path of await IOUtils.getChildren(PathUtils.parent(aFilePath))) {
-      const stat = await IOUtils.stat(path);
+    for (const path of await waitLogOperation(context, () =>
+      IOUtils.getChildren(PathUtils.parent(aFilePath))
+    )) {
+      const stat = await waitLogOperation(context, () => IOUtils.stat(path));
       if (stat.type === "directory") {
         continue;
       }
@@ -1570,7 +1855,7 @@ export class Logger {
         });
       }
     }
-    return new Log(relevantEntries);
+    return new Log(relevantEntries, context);
   }
 
   /**
@@ -1668,6 +1953,7 @@ export class Logger {
    * @param {imIAccount} aAccount - Account to remove the logs of.
    */
   deleteLogFolderForAccount(aAccount) {
+    checkMigrationWriterAdmission();
     if (!aAccount.disconnecting && !aAccount.disconnected) {
       throw new Error(
         "Account must be disconnected first before deleting logs."
@@ -1711,12 +1997,18 @@ export class Logger {
    *   this promise resolves. If it throws (or rejects), iteration will stop.
    */
   async forEach(aCallback) {
+    const context = archiveReaders.get(this) || null;
     const getAllSubdirs = async function (aPaths, aErrorMsg) {
       let entries = [];
       for (const path of aPaths) {
         try {
-          entries = entries.concat(await IOUtils.getChildren(path));
+          entries = entries.concat(
+            await waitLogOperation(context, () => IOUtils.getChildren(path))
+          );
         } catch (aError) {
+          if (context !== null && aError.name !== "NotFoundError") {
+            throw aError;
+          }
           if (aErrorMsg) {
             console.error(aErrorMsg + "\n" + aError);
           }
@@ -1724,7 +2016,7 @@ export class Logger {
       }
       const filteredPaths = [];
       for (const path of entries) {
-        const stat = await IOUtils.stat(path);
+        const stat = await waitLogOperation(context, () => IOUtils.stat(path));
         if (stat.type === "directory") {
           filteredPaths.push(path);
         }
@@ -1747,16 +2039,20 @@ export class Logger {
     );
     for (const folder of logFolders) {
       try {
-        for (const path of await IOUtils.getChildren(folder)) {
-          const stat = await IOUtils.stat(path);
+        for (const path of await waitLogOperation(context, () =>
+          IOUtils.getChildren(folder)
+        )) {
+          const stat = await waitLogOperation(context, () =>
+            IOUtils.stat(path)
+          );
           if (stat.type === "directory" || !path.endsWith(".json")) {
             continue;
           }
-          await aCallback.processLog(path);
+          await waitLogOperation(context, () => aCallback.processLog(path));
         }
       } catch (aError) {
         // If the callback threw, reject the promise and let the caller handle it.
-        if (!DOMException.isInstance(aError)) {
+        if (context !== null || !DOMException.isInstance(aError)) {
           throw aError;
         }
         console.error("Error sweeping log folder:\n" + aError);
@@ -1842,4 +2138,154 @@ export class Logger {
   }
 }
 
-export const logs = new Logger();
+/**
+ * Rejects source paths outside the profile-owned logger root.
+ *
+ * @param {string} path - Absolute file or directory path.
+ * @throws {TypeError} Non-absolute path or path outside this profile's logs.
+ */
+function validateArchivePath(path) {
+  const root = PathUtils.split(PathUtils.join(PathUtils.profileDir, "logs"));
+  if (typeof path !== "string" || !PathUtils.isAbsolute(path)) {
+    throw new TypeError("Invalid chat archive path");
+  }
+  const parts = PathUtils.split(path);
+  if (
+    !root.every((part, index) => parts[index] === part) ||
+    parts.some(part => part === "." || part === "..")
+  ) {
+    throw new TypeError("Chat archive path is outside the logger root");
+  }
+}
+
+/**
+ * Binds stopped archive parsing/privacy to an actual pending GS operation.
+ * The opaque work token grants neither native selection nor Held/release.
+ * Every returned reader is usable only while that original operation is pending.
+ *
+ * @param {object} work - Existing SearchMigrationHold chat-search work token.
+ * Returned methods join nested work in the same GS domain. Callers must await
+ * each method and each parser before their original operation settles.
+ * queueFileOperation(path, operation) supplies operation with a wait(thunk)
+ * function. Use wait for each real I/O step, and return the complete operation.
+ * No live writer, observer, cleanup timer or profile blocker starts here.
+ *
+ * @returns {Promise<object>} Archive getLogFromFile/forEach/queueFileOperation
+ *   and the same-named durable privacy capture/state/target/proof/ack methods.
+ * @throws {nsIException} For foreign, wrong-domain or settled work before IO.
+ */
+export function getChatLogArchive(work) {
+  if (work === null || typeof work !== "object") {
+    return Promise.reject(
+      Components.Exception(
+        "A pending chat-search operation is required",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      )
+    );
+  }
+  return searchMigration().openSearchWriter(
+    "chat-search",
+    () => {
+      const context = chatArchiveContext(work);
+      const read = (method, args) =>
+        context.run(child => {
+          const reader = Object.create(Logger.prototype);
+          archiveReaders.set(reader, child);
+          return reader[method](...args);
+        });
+      return Object.freeze({
+        queueFileOperation(path, operation) {
+          validateArchivePath(path);
+          return context.queue(path, child =>
+            operation(step => waitLogOperation(child, step))
+          );
+        },
+        getLogFromFile(path, groupByDay = false) {
+          return read("getLogFromFile", [path, groupByDay]);
+        },
+        forEach(callback) {
+          return read("forEach", [callback]);
+        },
+        captureChatPrivacyIntent(message) {
+          return context.run(child =>
+            beginChatPrivacyCapture(message, null, child)
+          );
+        },
+        getChatPrivacyEpoch() {
+          validateLogContext(context);
+          return getChatPrivacyEpoch();
+        },
+        getChatPrivacyState() {
+          return context.run(child => getChatPrivacyStateInContext(child));
+        },
+        readChatPrivacyTarget(id, parts, options = {}) {
+          return context.run(child =>
+            readChatPrivacyTargetInContext(id, parts, options, child)
+          );
+        },
+        getChatPrivacySourceProof(id, options = {}) {
+          return context.run(child =>
+            getChatPrivacySourceProofInContext(id, options, child)
+          );
+        },
+        acknowledgeChatPrivacyIntent(id, complete, options = {}) {
+          return context.run(child =>
+            acknowledgeChatPrivacyIntentInContext(id, complete, options, child)
+          );
+        },
+      });
+    },
+    work
+  );
+}
+
+let liveLogger = null;
+
+/**
+ * Starts the existing live observer only when a live caller explicitly uses it.
+ *
+ * @returns {Logger} The shared native Chat-gated live logger.
+ * @throws {nsIException} Original native Chat admission failure, before effects.
+ */
+function initializeLiveLogger() {
+  checkMigrationWriterAdmission();
+  return (liveLogger ??= new Logger());
+}
+
+/**
+ * Lazy live service. Archive utility imports install no writer or observer.
+ * init installs the shared observer before live account/conversation startup.
+ */
+export const logs = {
+  init: initializeLiveLogger,
+  QueryInterface(...args) {
+    return initializeLiveLogger().QueryInterface(...args);
+  },
+  observe(...args) {
+    return initializeLiveLogger().observe(...args);
+  },
+  getLogFromFile(...args) {
+    return initializeLiveLogger().getLogFromFile(...args);
+  },
+  forEach(...args) {
+    return initializeLiveLogger().forEach(...args);
+  },
+  getLogPathsForConversation(...args) {
+    return initializeLiveLogger().getLogPathsForConversation(...args);
+  },
+  getLogsForContact(...args) {
+    return initializeLiveLogger().getLogsForContact(...args);
+  },
+  getLogsForConversation(...args) {
+    return initializeLiveLogger().getLogsForConversation(...args);
+  },
+  getSimilarLogs(...args) {
+    return initializeLiveLogger().getSimilarLogs(...args);
+  },
+  getLogFolderPathForAccount(...args) {
+    return initializeLiveLogger().getLogFolderPathForAccount(...args);
+  },
+  deleteLogFolderForAccount(...args) {
+    return initializeLiveLogger().deleteLogFolderForAccount(...args);
+  },
+};

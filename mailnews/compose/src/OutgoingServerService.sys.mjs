@@ -2,6 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+/**
+ * Checks native process admission before starting a smtp writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "smtp");
+}
+
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   MsgUtils: "resource:///modules/MimeMessageUtils.sys.mjs",
@@ -20,6 +40,7 @@ export class OutgoingServerService {
   QueryInterface = ChromeUtils.generateQI(["nsIMsgOutgoingServerService"]);
 
   constructor() {
+    checkMigrationWriterAdmission();
     this._servers = [];
     this._logger = lazy.MsgUtils.smtpLogger;
   }
@@ -28,6 +49,7 @@ export class OutgoingServerService {
    * @see nsIMsgOutgoingServerService
    */
   get defaultServer() {
+    checkMigrationWriterAdmission();
     const defaultServerKey = Services.prefs.getCharPref(
       "mail.smtp.defaultserver",
       ""
@@ -46,6 +68,7 @@ export class OutgoingServerService {
   }
 
   set defaultServer(server) {
+    checkMigrationWriterAdmission();
     if (server) {
       Services.prefs.setCharPref("mail.smtp.defaultserver", server.key);
     } else {
@@ -54,6 +77,7 @@ export class OutgoingServerService {
   }
 
   get servers() {
+    checkMigrationWriterAdmission();
     if (!this._servers.length) {
       // Load outgoing servers from prefs.
       this._servers = this._getServerKeys()
@@ -67,6 +91,7 @@ export class OutgoingServerService {
    * @see nsIMsgOutgoingServerService
    */
   getServerByIdentity(userIdentity) {
+    checkMigrationWriterAdmission();
     return (
       (userIdentity.smtpServerKey &&
         this.getServerByKey(userIdentity.smtpServerKey)) ||
@@ -78,6 +103,7 @@ export class OutgoingServerService {
    * @see nsIMsgOutgoingServerService
    */
   getServerByKey(key) {
+    checkMigrationWriterAdmission();
     return this.servers.find(s => s.key == key);
   }
 
@@ -85,6 +111,7 @@ export class OutgoingServerService {
    * @see nsIMsgOutgoingServerService
    */
   createServer(type) {
+    checkMigrationWriterAdmission();
     if (!(OUTGOING_CONTRACT_ID_PREFIX + type in Cc)) {
       // The error thrown when the contract ID is unknown can be a bit cryptic,
       // and can seem to come from an unusual place (the getter for this.servers),
@@ -115,6 +142,7 @@ export class OutgoingServerService {
    * @see nsIMsgOutgoingServerService
    */
   deleteServer(server) {
+    checkMigrationWriterAdmission();
     const serverKeys = this._getServerKeys().filter(k => k != server.key);
     this._servers = this.servers.filter(s => s.key != server.key);
     this._saveServerKeys(serverKeys);
@@ -137,6 +165,7 @@ export class OutgoingServerService {
    * @see nsIMsgOutgoingServerService
    */
   findServer(username, hostname, type) {
+    checkMigrationWriterAdmission();
     username = username?.toLowerCase();
     // Note: we don't need to wrap the username in square brackets if it's an
     // IPv6, because nsIURI.host does not include brackets.
@@ -172,6 +201,7 @@ export class OutgoingServerService {
    * @param {string[]} keys - The key list to save.
    */
   _saveServerKeys(keys) {
+    checkMigrationWriterAdmission();
     return Services.prefs.setCharPref("mail.smtpservers", keys.join(","));
   }
 
@@ -184,6 +214,7 @@ export class OutgoingServerService {
    * @returns {nsIMsgOutgoingServer}
    */
   _keyToServer(key, newServer) {
+    checkMigrationWriterAdmission();
     // Ideally we should be failing early if we can't figure out the type,
     // because we might be trying to configure the server for the wrong
     // protocol. However, We might be currently migrating an old profile that

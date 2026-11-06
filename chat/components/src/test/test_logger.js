@@ -12,6 +12,7 @@ var { IMServices } = ChromeUtils.importESModule(
 
 const {
   Logger,
+  getChatLogArchive,
   captureChatPrivacyIntent,
   getChatPrivacyEpoch,
   getChatPrivacyState,
@@ -34,6 +35,235 @@ var logDirPath = PathUtils.join(
   Services.dirsvc.get("ProfD", Ci.nsIFile).path,
   "logs"
 );
+
+// This runs before any live logger/write task in this ordinary test file.
+add_task(async function test_stoppedArchiveKeepsLiveChatNeverStarted() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const { openSearchWriter } = ChromeUtils.importESModule(
+    "resource:///modules/panorama/SearchMigrationHold.sys.mjs"
+  );
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  const assertCold = () => {
+    Assert.equal(bag.getPropertyAsUint32("writer-history.chat"), 0);
+    gate.observe(subject, "check-writer-never-started", "chat");
+  };
+  assertCold();
+  const unavailable = error => error.result === Cr.NS_ERROR_NOT_AVAILABLE;
+  await Assert.rejects(getChatLogArchive(null), unavailable);
+  await Assert.rejects(getChatLogArchive({}), unavailable);
+  Assert.equal(bag.getPropertyAsUint32("writer-history.chat-search"), 0);
+
+  const parts = [
+    "search-test",
+    "s508-archive",
+    "buddy",
+    "2022-03-04.120000+0000.json",
+  ];
+  const path = PathUtils.join(logDirPath, ...parts);
+  const journal = PathUtils.join(logDirPath, ".privacy-pending.json");
+  const header = {
+    date: "2022-03-04T12:00:00.000Z",
+    name: "buddy",
+    title: "Retained S508 archive",
+    account: "s508-archive",
+    normalizedName: "buddy",
+    protocol: "search-test",
+    isChat: false,
+  };
+  const record = {
+    date: "2022-03-04T12:00:01.000Z",
+    who: "sender",
+    text: "retained-s508-archive-source",
+    flags: ["incoming"],
+    remoteId: "s508-archive-first",
+  };
+  const original =
+    JSON.stringify(header) + "\n" + JSON.stringify(record) + "\n";
+  // Fixture preparation precedes captured work; it starts no live Chat producer.
+  await IOUtils.makeDirectory(PathUtils.parent(path));
+  await IOUtils.writeUTF8(path, original);
+  let archive, log;
+  try {
+    await openSearchWriter("mail-search", work =>
+      Assert.rejects(getChatLogArchive(work), unavailable)
+    );
+    await openSearchWriter("chat-search", async work => {
+      archive = await getChatLogArchive(work);
+      const paths = [];
+      await archive.forEach({ processLog: file => paths.push(file) });
+      Assert.deepEqual(paths, [path]);
+      log = await archive.getLogFromFile(path);
+      const conversation = await log.getConversation();
+      Assert.equal(conversation.normalizedName, "buddy");
+      Assert.equal(conversation.isChat, false);
+      Assert.deepEqual(
+        conversation
+          .getMessages()
+          .filter(message => message.incoming)
+          .map(message => message.originalMessage),
+        [record.text]
+      );
+      assertCold();
+      const before = await archive.getChatPrivacyState();
+      Assert.strictEqual(before.historyKnown, false);
+      Assert.deepEqual(before.pending, []);
+      Assert.deepEqual(before.completed, []);
+      const receipt = await archive.captureChatPrivacyIntent({
+        noLog: true,
+        remoteId: record.remoteId,
+        conversation: {
+          account: {
+            normalizedName: header.account,
+            protocol: { normalizedName: header.protocol },
+          },
+          normalizedName: header.normalizedName,
+          isChat: false,
+        },
+        get displayMessage() {
+          throw new Error("A noLog payload was read");
+        },
+        get who() {
+          throw new Error("A noLog sender was read");
+        },
+        get time() {
+          throw new Error("A noLog timestamp was read");
+        },
+      });
+      Assert.deepEqual(
+        receipt.targets.map(target => target.relativePath),
+        [parts]
+      );
+      Assert.equal(await IOUtils.readUTF8(path), original);
+      Assert.ok(!(await IOUtils.readUTF8(journal)).includes(record.text));
+      Assert.equal(
+        (await archive.getChatPrivacyState()).pending[0].id,
+        receipt.id
+      );
+
+      // Both calls enter the actual shared logger queue before either completes.
+      const pending = Promise.withResolvers();
+      const started = Promise.withResolvers();
+      const order = [];
+      const first = archive.queueFileOperation(path, async wait => {
+        order.push("first");
+        started.resolve();
+        await wait(() => pending.promise);
+      });
+      await started.promise;
+      const read = archive
+        .readChatPrivacyTarget(receipt.id, parts)
+        .then(source => {
+          order.push("read");
+          return source;
+        });
+      try {
+        Assert.deepEqual(order, ["first"]);
+      } finally {
+        pending.resolve();
+        await first;
+      }
+      const source = await read;
+      Assert.deepEqual(order, ["first", "read"]);
+      Assert.equal(new TextDecoder().decode(source.bytes), original);
+
+      let callbacks = 0;
+      await archive.acknowledgeChatPrivacyIntent(receipt.id, async current => {
+        ++callbacks;
+        Assert.equal(current.id, receipt.id);
+        await archive.queueFileOperation(path, async wait => {
+          const bytes = await wait(() => IOUtils.readUTF8(path));
+          Assert.equal(bytes, original);
+          const erased = {
+            ...record,
+            text: "",
+            flags: ["incoming", "deleted"],
+          };
+          await wait(() =>
+            IOUtils.writeUTF8(
+              path,
+              JSON.stringify(header) + "\n" + JSON.stringify(erased) + "\n",
+              { tmpPath: path + ".privacy-test.tmp", flush: true }
+            )
+          );
+        });
+        return archive.getChatPrivacySourceProof(receipt.id);
+      });
+      Assert.equal(callbacks, 1);
+      const state = await archive.getChatPrivacyState();
+      Assert.deepEqual(state.pending, []);
+      Assert.equal(state.completed[0].id, receipt.id);
+      Assert.strictEqual(state.historyKnown, false);
+      await archive.queueFileOperation(path, wait =>
+        wait(() => IOUtils.remove(path))
+      );
+      const proof = await archive.getChatPrivacySourceProof(receipt.id);
+      Assert.deepEqual(proof.targets, [
+        { relativePath: parts, missing: true, revision: null },
+      ]);
+      assertCold();
+    });
+    await Assert.rejects(
+      log.getConversation(),
+      unavailable,
+      "A returned parser cannot escape its settled GS owner"
+    );
+    let called = false;
+    await Assert.rejects(
+      archive.queueFileOperation(path, () => {
+        called = true;
+      }),
+      unavailable
+    );
+    Assert.strictEqual(called, false);
+    assertCold();
+  } finally {
+    await IOUtils.remove(PathUtils.join(logDirPath, parts[0]), {
+      recursive: true,
+    });
+    await IOUtils.remove(journal, { ignoreAbsent: true });
+  }
+});
+
+add_task(async function test_lazyLiveLoggerStartsBeforeFirstMessage() {
+  const logger = IMServices.logs.init();
+  Assert.strictEqual(IMServices.logs.init(), logger);
+  const conversation = {
+    ...dummyConv,
+    id: "explicit-live-start",
+    normalizedName: "explicit-live-start",
+  };
+  const message = {
+    QueryInterface: ChromeUtils.generateQI(["prplIMessage", "imIMessage"]),
+    conversation,
+    time: conversation.startDate / 1000000 + 10,
+    who: "first-sender",
+    displayMessage: "first message after live startup",
+    incoming: true,
+  };
+  let paths;
+  try {
+    Services.obs.notifyObservers(message, "new-text");
+    paths = await IMServices.logs.getLogPathsForConversation(conversation);
+    Assert.equal(paths.length, 1);
+    Assert.ok(
+      (await IOUtils.readUTF8(paths[0])).includes(message.displayMessage)
+    );
+  } finally {
+    closeLogWriter(conversation);
+    for (const path of paths || []) {
+      await IOUtils.remove(path);
+    }
+  }
+});
 
 var dummyAccount = {
   name: "dummy-account",
@@ -1526,3 +1756,182 @@ add_task(async function test_privacyCaptureRetainsEachFilesOwnType() {
     "The same remote ID in a separate conversation remains untouched"
   );
 });
+
+const { AppConstants: migrationAppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+const { MockRegistrar: migrationMockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
+/**
+ * Rejects service lookup to test refusal before a caller's first side effect.
+ * This fixture never supplies native selection or claims a Held lease.
+ *
+ * @param {function(nsIException): Promise<void>} task - Refusal assertions.
+ * @returns {Promise<void>} Resolves after restoring the real native service.
+ */
+async function withMigrationGateFailure(task) {
+  const error = Components.Exception(
+    "Migration gate service lookup failed",
+    Cr.NS_ERROR_FILE_ACCESS_DENIED
+  );
+  const cid = migrationMockRegistrar.register(
+    "@mozilla.org/mailnews/migration-writer-lease;1",
+    () => {
+      throw error;
+    }
+  );
+  try {
+    await task(error);
+  } finally {
+    migrationMockRegistrar.unregister(cid);
+  }
+}
+
+/**
+ * Checks sticky native history in this already initialized ordinary fixture.
+ *
+ * @param {string} domain - One fixed native writer domain.
+ */
+function assertMigrationWriterStarted(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), 1);
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "An initialized or previously used writer cannot certify NeverStarted"
+  );
+}
+
+add_task(async function test_migrationHoldRejectsStartedLogger() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  assertMigrationWriterStarted("chat");
+  closeLogWriter(dummyConv);
+  assertMigrationWriterStarted("chat");
+  await withMigrationGateFailure(async original => {
+    Assert.throws(
+      () => new Logger(),
+      error => error.result == original.result
+    );
+    Assert.throws(
+      () => getLogWriter(dummyConv),
+      error => error.result == original.result
+    );
+  });
+});
+
+add_task(async function test_migrationHoldRejectsPendingPrivacyAndCleanup() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const source = await makePrivacyLog("migration-pending");
+  const pending = Promise.withResolvers();
+  const queued = queueFileOperation(source.paths[0], () => pending.promise);
+  const capture = captureChatPrivacyIntent(privateNoLogEvent(source));
+  try {
+    Assert.ok(
+      gFilePromises.has(source.paths[0]),
+      "Real queued work remains owned"
+    );
+    assertMigrationWriterStarted("chat");
+  } finally {
+    pending.resolve();
+    await queued;
+  }
+  const receipt = await capture;
+  await erasePrivacyVersions(receipt);
+  await acknowledgeChatPrivacyIntent(receipt.id, () =>
+    getChatPrivacySourceProof(receipt.id)
+  );
+  closeLogWriter(source.conversation);
+  assertMigrationWriterStarted("chat");
+});
+
+add_task(
+  async function test_migrationHoldPreservesPrimaryErrorAndReleasesOnce() {
+    if (!migrationAppConstants.NIGHTLY_BUILD) {
+      return;
+    }
+    const path = PathUtils.join(logDirPath, "migration-denied.log");
+    let called = 0;
+    const epoch = getChatPrivacyEpoch();
+    await withMigrationGateFailure(async original => {
+      Assert.throws(
+        () =>
+          queueFileOperation(path, () => {
+            ++called;
+          }),
+        error => error.result == original.result
+      );
+      Assert.throws(
+        () =>
+          acknowledgeChatPrivacyIntent("missing", () => {
+            ++called;
+          }),
+        error => error.result == original.result
+      );
+      await Assert.rejects(
+        captureChatPrivacyIntent({
+          noLog: true,
+          get displayMessage() {
+            throw new Error("A noLog payload was read");
+          },
+        }),
+        error => error.result == original.result
+      );
+    });
+    Assert.equal(called, 0);
+    Assert.equal(getChatPrivacyEpoch(), epoch);
+    Assert.ok(!gFilePromises.has(path));
+    Assert.ok(!(await IOUtils.exists(path)));
+  }
+);
+
+add_task(
+  async function test_archiveQueueRetainsOriginalFailureAcrossRecovery() {
+    if (!migrationAppConstants.NIGHTLY_BUILD) {
+      return;
+    }
+    const { openSearchWriter } = ChromeUtils.importESModule(
+      "resource:///modules/panorama/SearchMigrationHold.sys.mjs"
+    );
+    const path = PathUtils.join(logDirPath, "archive-error-order.json");
+    const original = new Error("Actual archive operation failed");
+    await openSearchWriter("chat-search", async work => {
+      const archive = await getChatLogArchive(work);
+      const started = Promise.withResolvers();
+      const finish = Promise.withResolvers();
+      const first = archive.queueFileOperation(path, async wait => {
+        started.resolve();
+        await wait(() => finish.promise);
+        throw original;
+      });
+      // Observe the first rejection before permitting the real queued failure.
+      const failed = Assert.rejects(first, error => error === original);
+      await started.promise;
+      let recovered = false;
+      const next = archive.queueFileOperation(path, () => {
+        recovered = true;
+      });
+      try {
+        Assert.strictEqual(recovered, false);
+      } finally {
+        finish.resolve();
+      }
+      await failed;
+      await next;
+      Assert.strictEqual(recovered, true);
+      Assert.ok(!gFilePromises.has(path));
+    });
+  }
+);

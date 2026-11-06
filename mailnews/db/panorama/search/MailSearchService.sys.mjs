@@ -2,6 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import {
+  openSearchWriter,
+  SearchWriter,
+  recordSearchWriterFailure,
+} from "resource:///modules/panorama/SearchMigrationHold.sys.mjs";
+
 import { completeMailSearchMetadata } from "resource:///modules/panorama/MailSearchCompletion.sys.mjs";
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { AsyncShutdown } from "resource://gre/modules/AsyncShutdown.sys.mjs";
@@ -87,6 +93,44 @@ ChromeUtils.defineLazyGetter(lazy, "activityStrings", () =>
  * subscriptions or create a reader UI.
  */
 export class MailSearchService {
+  /** @type {SearchWriter} Concrete retained writer and pending operations. */
+  #migration;
+  #storageTerminal = true;
+  /** @returns {boolean} Whether the actual owned storage close succeeded. */
+  get closed() {
+    return this.#migration.closed;
+  }
+
+  /** @returns {boolean} Actual storage callback settlement, independent of errors. */
+  get migrationSettled() {
+    return this.#migration.terminal;
+  }
+
+  /** @type {unknown[]} Original failures retained before queue advancement. */
+  #migrationFailures = [];
+
+  /**
+   * Returns original failures without granting native lease ownership.
+   * Ordinary retries and successful cleanup do not clear this diagnostic copy.
+   *
+   * @returns {unknown[]} First error followed by later distinct failures.
+   */
+  get migrationFailures() {
+    return [...this.#migrationFailures];
+  }
+
+  /**
+   * Retains a rejected operation before its queue advances.
+   *
+   * @param {unknown} error - Exact original rejection, without normalization.
+   */
+  #rememberMigrationFailure(error) {
+    if (!this.#migrationFailures.includes(error)) {
+      this.#migrationFailures.push(error);
+      recordSearchWriterFailure("mail-search", error);
+    }
+  }
+
   #messageDB;
   #sourceId;
   #index;
@@ -99,8 +143,8 @@ export class MailSearchService {
   /** @type {?number} Timer.sys.mjs timeout identifier. */
   #retryTimer = null;
   #started = false;
+  #migrationStopped = false;
   #closed = false;
-  #closePromise;
   /** @type {?nsIActivityProcess} Activity for this physical source incarnation. */
   #activity = null;
   #shutdown = () => this.close();
@@ -123,58 +167,76 @@ export class MailSearchService {
    * @param {string} sourceId - Durable core incarnation, supplied by activation.
    * @param {nsIMessageDatabase} [messageDB] - Current native message database.
    * @returns {Promise<MailSearchService>} Open service; call start for background work.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  static async open(
-    file,
-    sourceId,
-    messageDB = Cc["@mozilla.org/mailnews/database-core;1"].getService(
-      Ci.nsIDatabaseCore
-    ).messageDB
-  ) {
-    if (typeof sourceId != "string" || !sourceId) {
-      throw new TypeError("A durable core incarnation is required");
-    }
-    if (
-      typeof messageDB.getSearchState != "function" ||
-      typeof messageDB.getSearchChanges != "function" ||
-      typeof messageDB.getSearchSnapshot != "function"
-    ) {
-      throw new Error("Committed core search APIs are required");
-    }
-    const service = new MailSearchService(messageDB, sourceId);
-    service.#index = await PanoramaSearchIndex.open(file, (id, signal) =>
-      service.resolveDocument(id, signal)
+  static open(file, sourceId, messageDB, migrationWork = null) {
+    return openSearchWriter(
+      "mail-search",
+      async work => {
+        if (messageDB === undefined) {
+          messageDB = Cc["@mozilla.org/mailnews/database-core;1"].getService(
+            Ci.nsIDatabaseCore
+          ).messageDB;
+        }
+        if (typeof sourceId != "string" || !sourceId) {
+          throw new TypeError("A durable core incarnation is required");
+        }
+        if (
+          typeof messageDB.getSearchState != "function" ||
+          typeof messageDB.getSearchChanges != "function" ||
+          typeof messageDB.getSearchSnapshot != "function"
+        ) {
+          throw new Error("Committed core search APIs are required");
+        }
+        const service = new MailSearchService(messageDB, sourceId, work);
+        try {
+          await service.#migration.wait(async () => {
+            service.#storageTerminal = false;
+            service.#index = await PanoramaSearchIndex.open(
+              file,
+              (id, signal) => service.#resolveDocument(id, signal)
+            );
+          });
+          await service.#migration.wait(() =>
+            service.#index.applyChanges({
+              sourceId,
+              from: 0,
+              through: 0,
+              changes: [],
+            })
+          );
+          AsyncShutdown.profileBeforeChange.addBlocker(
+            "Panorama mail search",
+            service.#shutdown
+          );
+          return service;
+        } catch (error) {
+          service.#rememberMigrationFailure(error);
+          try {
+            await service.close();
+          } catch (closeError) {
+            service.#rememberMigrationFailure(closeError);
+          }
+          throw error;
+        }
+      },
+      migrationWork
     );
-    try {
-      await service.#index.applyChanges({
-        sourceId,
-        from: 0,
-        through: 0,
-        changes: [],
-      });
-      AsyncShutdown.profileBeforeChange.addBlocker(
-        "Panorama mail search",
-        service.#shutdown
-      );
-      return service;
-    } catch (error) {
-      try {
-        await service.#index.close();
-      } catch (closeError) {
-        throw new AggregateError(
-          [error, closeError],
-          "Mail search open failed"
-        );
-      }
-      throw error;
-    }
   }
 
   /**
    * @param {nsIMessageDatabase} messageDB - Current native database.
    * @param {string} sourceId - Durable core incarnation.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  constructor(messageDB, sourceId) {
+  constructor(messageDB, sourceId, migrationWork = null) {
+    this.#migration = new SearchWriter(
+      "mail-search",
+      () => this.#stopMigrationNotifications(),
+      () => this.close(),
+      () => this.#storageTerminal,
+      migrationWork
+    );
     this.#messageDB = messageDB;
     this.#sourceId = sourceId;
   }
@@ -185,16 +247,12 @@ export class MailSearchService {
    * @param {string} id - Decimal global key.
    * @param {AbortSignal} [signal] - Lookup cancellation.
    * @returns {?SearchDocumentState} Authoritative eligible state, or null.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  resolveDocument(id, signal) {
-    if (this.#closed) {
-      throw new Error("Mail search is closed");
-    }
-    const state = resolveMailSearchDocument(this.#messageDB, id, signal);
-    if (state?.contentError) {
-      this.#reportError(state.contentError);
-    }
-    return state;
+  resolveDocument(id, signal, migrationWork = null) {
+    return this.#migration.run(() => {
+      return this.#resolveDocument(id, signal);
+    }, migrationWork);
   }
 
   /**
@@ -230,17 +288,27 @@ export class MailSearchService {
         2,
         Services.prefs.getBoolPref(INDEXER_PREF, false),
       ]);
-      if ((await this.#index.getPolicyFingerprint()) != fingerprint) {
+      if (
+        (await this.#migration.wait(() =>
+          this.#index.getPolicyFingerprint()
+        )) != fingerprint
+      ) {
         signal?.throwIfAborted();
         this.#messageDB.noteSearchPolicyChanged();
-        await this.#index.setPolicyFingerprint(fingerprint);
+        await this.#migration.wait(() =>
+          this.#index.setPolicyFingerprint(fingerprint)
+        );
       }
       signal?.throwIfAborted();
       const nameVersion = Services.prefs.getIntPref(DISPLAY_NAME_PREF, 0);
-      await this.#index.prepareAddressBook(nameVersion);
+      await this.#migration.wait(() =>
+        this.#index.prepareAddressBook(nameVersion)
+      );
       return nameVersion;
     });
-    this.#preferences = operation.catch(() => {});
+    this.#preferences = operation.catch(error =>
+      this.#rememberMigrationFailure(error)
+    );
     return operation;
   }
 
@@ -252,13 +320,13 @@ export class MailSearchService {
    */
   async #readChanges(limit, signal) {
     signal.throwIfAborted();
-    const scan = await this.#index.getRescan();
+    const scan = await this.#migration.wait(() => this.#index.getRescan());
     if (scan) {
       const page = this.#messageDB.getSearchSnapshot(scan.afterKey, limit);
       const changes = [];
       for (const raw of page.messages) {
         const id = String(raw.messageKey);
-        const state = this.resolveDocument(id, signal);
+        const state = this.#resolveDocument(id, signal);
         if (state) {
           changes.push({
             id,
@@ -270,17 +338,21 @@ export class MailSearchService {
         }
       }
       signal.throwIfAborted();
-      await this.#index.applyRescanPage({
-        sequence: scan.sequence,
-        afterKey: scan.afterKey,
-        nextKey: page.nextKey,
-        changes,
-        done: !page.messages.length,
-      });
+      await this.#migration.wait(() =>
+        this.#index.applyRescanPage({
+          sequence: scan.sequence,
+          afterKey: scan.afterKey,
+          nextKey: page.nextKey,
+          changes,
+          done: !page.messages.length,
+        })
+      );
       return;
     }
 
-    const { acceptedThrough: from } = await this.#index.getProgress();
+    const { acceptedThrough: from } = await this.#migration.wait(() =>
+      this.#index.getProgress()
+    );
     const page = this.#messageDB.getSearchChanges(from, limit);
     const markerIndex = page.changes.findIndex(row => row.messageKey === null);
     const rows =
@@ -311,7 +383,7 @@ export class MailSearchService {
         });
         continue;
       }
-      const state = this.resolveDocument(id, signal);
+      const state = this.#resolveDocument(id, signal);
       if (state) {
         changes.push({
           id,
@@ -325,19 +397,23 @@ export class MailSearchService {
       // state must not be converted into a fabricated earlier deletion.
     }
     signal.throwIfAborted();
-    await this.#index.applyChanges({
-      sourceId: this.#sourceId,
-      from,
-      through:
-        markerIndex < 0
-          ? page.nextSequence
-          : page.changes[lastMarker].sequence - 1,
-      changes,
-    });
+    await this.#migration.wait(() =>
+      this.#index.applyChanges({
+        sourceId: this.#sourceId,
+        from,
+        through:
+          markerIndex < 0
+            ? page.nextSequence
+            : page.changes[lastMarker].sequence - 1,
+        changes,
+      })
+    );
     if (markerIndex >= 0) {
-      await this.#index.beginRescan(
-        this.#sourceId,
-        page.changes[lastMarker].sequence
+      await this.#migration.wait(() =>
+        this.#index.beginRescan(
+          this.#sourceId,
+          page.changes[lastMarker].sequence
+        )
       );
     }
   }
@@ -356,107 +432,123 @@ export class MailSearchService {
    * @param {string} path - Exact backed-up Gloda source path.
    * @returns {Promise<{stored: number, eligible: number}>} Committed record counts.
    * @throws {Error} Original validation, source, native, or destination error.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  recoverMail(journal, core, resolveFolder, profileLock, path) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    const operation = this.#updates.then(async () => {
-      if (
-        core.sourceId !== this.#sourceId ||
-        core.messageDB !== this.#messageDB
-      ) {
-        throw new Error("Recovery belongs to another native database");
+  recoverMail(
+    journal,
+    core,
+    resolveFolder,
+    profileLock,
+    path,
+    migrationWork = null
+  ) {
+    return this.#migration.run(() => {
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
       }
-      await this.#preparePreferences(this.#controller.signal);
-      const bundle = await lazy.readLegacyGlodaMailRecovery(
-        journal,
-        core,
-        resolveFolder,
-        profileLock,
-        path
-      );
-      this.#controller.signal.throwIfAborted();
-      let eligible = 0;
-      const records = bundle.mapped.map(row => {
-        if (row.sourceId !== this.#sourceId) {
-          throw new Error("Recovered database incarnation changed");
+      const operation = this.#updates.then(async () => {
+        if (
+          core.sourceId !== this.#sourceId ||
+          core.messageDB !== this.#messageDB
+        ) {
+          throw new Error("Recovery belongs to another native database");
         }
-        const id = String(row.key);
-        const state = this.resolveDocument(id);
-        if (!state || state.location?.folderId !== row.folderId) {
-          throw new Error("Recovered physical location changed");
-        }
-        const metadata = loadMailSearchMetadata(
-          {
-            id,
-            generation: state.generation,
-            policyRevision: state.policyRevision,
-          },
-          state
+        await this.#migration.wait(() =>
+          this.#preparePreferences(this.#controller.signal)
         );
-        const allowed =
-          !!metadata &&
-          recoveredPlaintext(bundle.snapshot, row.message) &&
-          typeof row.message.text?.body === "string";
-        const document = allowed
-          ? {
-              ...metadata,
-              body: row.message.text.body,
-              attachmentNames: row.message.text.attachmentNames ?? "",
-              bodyIndexed: true,
-            }
-          : null;
-        eligible += Number(allowed);
-        return {
-          recordId:
-            "mail:" +
-            JSON.stringify([
-              this.#sourceId,
-              bundle.originalDatabasePath,
-              row.message.id,
-            ]),
-          documentId: id,
-          kind: "mail",
-          sourceRevision: bundle.snapshot.source.sha256,
-          payload: {
-            ...row,
-            attributeDefinitions: bundle.snapshot.attributeDefinitions,
-            backup: bundle.backup,
-            disposition: allowed ? "candidate" : "quarantined",
-          },
-          document,
-        };
-      });
-      for (const row of bundle.excluded) {
-        records.push({
-          recordId:
-            "mail:" +
-            JSON.stringify([
-              this.#sourceId,
-              bundle.originalDatabasePath,
-              row.message.id,
-            ]),
-          documentId: null,
-          kind: "mail",
-          sourceRevision: bundle.snapshot.source.sha256,
-          payload: {
-            ...row,
-            attributeDefinitions: bundle.snapshot.attributeDefinitions,
-            source: bundle.snapshot.source,
-            backup: bundle.backup,
-            disposition: "excluded",
-          },
-          document: null,
+        const bundle = await this.#migration.wait(() =>
+          lazy.readLegacyGlodaMailRecovery(
+            journal,
+            core,
+            resolveFolder,
+            profileLock,
+            path
+          )
+        );
+        this.#controller.signal.throwIfAborted();
+        let eligible = 0;
+        const records = bundle.mapped.map(row => {
+          if (row.sourceId !== this.#sourceId) {
+            throw new Error("Recovered database incarnation changed");
+          }
+          const id = String(row.key);
+          const state = this.#resolveDocument(id);
+          if (!state || state.location?.folderId !== row.folderId) {
+            throw new Error("Recovered physical location changed");
+          }
+          const metadata = loadMailSearchMetadata(
+            {
+              id,
+              generation: state.generation,
+              policyRevision: state.policyRevision,
+            },
+            state
+          );
+          const allowed =
+            !!metadata &&
+            recoveredPlaintext(bundle.snapshot, row.message) &&
+            typeof row.message.text?.body === "string";
+          const document = allowed
+            ? {
+                ...metadata,
+                body: row.message.text.body,
+                attachmentNames: row.message.text.attachmentNames ?? "",
+                bodyIndexed: true,
+              }
+            : null;
+          eligible += Number(allowed);
+          return {
+            recordId:
+              "mail:" +
+              JSON.stringify([
+                this.#sourceId,
+                bundle.originalDatabasePath,
+                row.message.id,
+              ]),
+            documentId: id,
+            kind: "mail",
+            sourceRevision: bundle.snapshot.source.sha256,
+            payload: {
+              ...row,
+              attributeDefinitions: bundle.snapshot.attributeDefinitions,
+              backup: bundle.backup,
+              disposition: allowed ? "candidate" : "quarantined",
+            },
+            document,
+          };
         });
-      }
-      await this.#index.retainRecovery(records);
-      await this.#index.retryUnavailable();
-      this.#wake();
-      return { stored: records.length, eligible };
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+        for (const row of bundle.excluded) {
+          records.push({
+            recordId:
+              "mail:" +
+              JSON.stringify([
+                this.#sourceId,
+                bundle.originalDatabasePath,
+                row.message.id,
+              ]),
+            documentId: null,
+            kind: "mail",
+            sourceRevision: bundle.snapshot.source.sha256,
+            payload: {
+              ...row,
+              attributeDefinitions: bundle.snapshot.attributeDefinitions,
+              source: bundle.snapshot.source,
+              backup: bundle.backup,
+              disposition: "excluded",
+            },
+            document: null,
+          });
+        }
+        await this.#migration.wait(() => this.#index.retainRecovery(records));
+        await this.#migration.wait(() => this.#index.retryUnavailable());
+        this.#wake();
+        return { stored: records.length, eligible };
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
+      );
+      return operation;
+    }, migrationWork);
   }
 
   /**
@@ -464,9 +556,12 @@ export class MailSearchService {
    *
    * @param {?string} [id=null] - Exact physical key, or all records.
    * @returns {Promise<object[]>} Raw/provenance records; erased payloads are null.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  getRecoveryRecords(id = null) {
-    return this.#index.getRecoveryRecords(id);
+  getRecoveryRecords(id = null, migrationWork = null) {
+    return this.#migration.run(() => {
+      return this.#index.getRecoveryRecords(id);
+    }, migrationWork);
   }
 
   /**
@@ -475,46 +570,55 @@ export class MailSearchService {
    * replacement still checks the accepted native generation and content revision.
    *
    * @returns {Promise<void>} Resolves after current recovery replacements and the FTS rebuild.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  rebuild() {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    const operation = this.#updates.then(async () => {
-      const records = await this.#index.getRecoveryRecords();
-      for (const id of new Set(
-        records
-          .filter(
-            row => row.kind === "mail" && !row.erased && row.documentId !== null
-          )
-          .map(row => row.documentId)
-      )) {
-        const retained = await this.#index.getRecoveredText(
-          id,
-          this.#controller.signal
-        );
-        if (!retained) {
-          continue;
-        }
-        const state = this.resolveDocument(id, this.#controller.signal);
-        const metadata =
-          state &&
-          loadMailSearchMetadata(retained, state, this.#controller.signal);
-        if (metadata) {
-          await this.#index.index({
-            ...metadata,
-            body: retained.body,
-            attachmentNames: retained.attachmentNames,
-            bodyIndexed: true,
-          });
-        }
+  rebuild(migrationWork = null) {
+    return this.#migration.run(() => {
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
       }
-      await this.#index.rebuild();
-      await this.#index.retryUnavailable();
-      this.#wake();
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+      const operation = this.#updates.then(async () => {
+        const records = await this.#migration.wait(() =>
+          this.#index.getRecoveryRecords()
+        );
+        for (const id of new Set(
+          records
+            .filter(
+              row =>
+                row.kind === "mail" && !row.erased && row.documentId !== null
+            )
+            .map(row => row.documentId)
+        )) {
+          const retained = await this.#migration.wait(() =>
+            this.#index.getRecoveredText(id, this.#controller.signal)
+          );
+          if (!retained) {
+            continue;
+          }
+          const state = this.#resolveDocument(id, this.#controller.signal);
+          const metadata =
+            state &&
+            loadMailSearchMetadata(retained, state, this.#controller.signal);
+          if (metadata) {
+            await this.#migration.wait(() =>
+              this.#index.index({
+                ...metadata,
+                body: retained.body,
+                attachmentNames: retained.attachmentNames,
+                bodyIndexed: true,
+              })
+            );
+          }
+        }
+        await this.#migration.wait(() => this.#index.rebuild());
+        await this.#migration.wait(() => this.#index.retryUnavailable());
+        this.#wake();
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
+      );
+      return operation;
+    }, migrationWork);
   }
 
   /**
@@ -524,113 +628,134 @@ export class MailSearchService {
    * @param {number} [options.limit=20] - Maximum rows/jobs, from 1 to 500.
    * @param {AbortSignal} [options.signal] - Cancel before another load/transaction.
    * @returns {Promise<object>} Durable progress, source watermark and moreWork.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  update({ limit = 20, signal } = {}) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
-      throw new RangeError("Mail search batch size must be from 1 to 500");
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    const operation = this.#updates.then(async () => {
-      signal.throwIfAborted();
-      const nameVersion = await this.#preparePreferences(signal);
-      await this.#readChanges(limit, signal);
-      const refreshingNames = await this.#index.refreshAddressBook(limit);
-      const before = await this.#index.getProgress();
-      const progress = await processSearchIndexBatch(
-        this.#index,
-        async (job, state, readSignal) => {
-          const document = await loadMailSearchDocument(job, state, readSignal);
-          if (!document || document.bodyIndexed) {
-            return document;
-          }
-          const retained = await this.#index.getRecoveredText(
-            job.id,
-            readSignal
-          );
-          return retained
-            ? {
-                ...document,
-                body: retained.body,
-                attachmentNames: retained.attachmentNames,
-                bodyIndexed: true,
-              }
-            : document;
-        },
-        { limit, signal, loadMetadata: loadMailSearchMetadata }
-      );
-      // Unavailable bodies are not pending work: their current header metadata
-      // has already been copied. Publish only the latest settled name pass.
-      if (
-        this.#pendingNameVersion === nameVersion &&
-        Services.prefs.getIntPref(DISPLAY_NAME_PREF, 0) === nameVersion &&
-        !refreshingNames &&
-        !progress.pending &&
-        !signal.aborted &&
-        !this.#closed
-      ) {
-        this.#pendingNameVersion = null;
-        Services.obs.notifyObservers(
-          null,
-          "panorama-mail-search-names-changed",
-          this.#sourceId
-        );
+  update({ limit = 20, signal } = {}, migrationWork = null) {
+    return this.#migration.run(() => {
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
       }
-      const scan = await this.#index.getRescan();
-      const { watermark } = this.#messageDB.getSearchChanges(
-        progress.acceptedThrough,
-        1
+      if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+        throw new RangeError("Mail search batch size must be from 1 to 500");
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      const operation = this.#updates.then(async () => {
+        signal.throwIfAborted();
+        const nameVersion = await this.#migration.wait(() =>
+          this.#preparePreferences(signal)
+        );
+        await this.#migration.wait(() => this.#readChanges(limit, signal));
+        const refreshingNames = await this.#migration.wait(() =>
+          this.#index.refreshAddressBook(limit)
+        );
+        const before = await this.#migration.wait(() =>
+          this.#index.getProgress()
+        );
+        const progress = await this.#migration.wait(() =>
+          processSearchIndexBatch(
+            this.#index,
+            async (job, state, readSignal) => {
+              const document = await this.#migration.wait(() =>
+                loadMailSearchDocument(job, state, readSignal)
+              );
+              if (!document || document.bodyIndexed) {
+                return document;
+              }
+              const retained = await this.#migration.wait(() =>
+                this.#index.getRecoveredText(job.id, readSignal)
+              );
+              return retained
+                ? {
+                    ...document,
+                    body: retained.body,
+                    attachmentNames: retained.attachmentNames,
+                    bodyIndexed: true,
+                  }
+                : document;
+            },
+            { limit, signal, loadMetadata: loadMailSearchMetadata }
+          )
+        );
+        // Unavailable bodies are not pending work: their current header metadata
+        // has already been copied. Publish only the latest settled name pass.
+        if (
+          this.#pendingNameVersion === nameVersion &&
+          Services.prefs.getIntPref(DISPLAY_NAME_PREF, 0) === nameVersion &&
+          !refreshingNames &&
+          !progress.pending &&
+          !signal.aborted &&
+          !this.#closed
+        ) {
+          this.#pendingNameVersion = null;
+          Services.obs.notifyObservers(
+            null,
+            "panorama-mail-search-names-changed",
+            this.#sourceId
+          );
+        }
+        const scan = await this.#migration.wait(() => this.#index.getRescan());
+        const { watermark } = this.#messageDB.getSearchChanges(
+          progress.acceptedThrough,
+          1
+        );
+        return {
+          ...progress,
+          sourceWatermark: watermark,
+          rebuilding: !!scan || refreshingNames,
+          moreWork:
+            refreshingNames ||
+            !!scan ||
+            progress.acceptedThrough < watermark ||
+            (progress.pending > 0 && progress.pending < before.pending),
+        };
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
       );
-      return {
-        ...progress,
-        sourceWatermark: watermark,
-        rebuilding: !!scan || refreshingNames,
-        moreWork:
-          refreshingNames ||
-          !!scan ||
-          progress.acceptedThrough < watermark ||
-          (progress.pending > 0 && progress.pending < before.pending),
-      };
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+      return operation;
+    }, migrationWork);
   }
 
-  /** Starts coalesced background work using existing mail notifications. */
-  start() {
-    if (this.#closed) {
-      throw new Error("Mail search is closed");
-    }
-    if (!this.#started) {
-      this.#started = true;
-      Services.prefs.addObserver(INDEXER_PREF, this);
-      Services.prefs.addObserver(DISPLAY_NAME_PREF, this);
-      const flags = Ci.nsIMsgFolderNotificationService;
-      MailServices.mfn.addListener(
-        this,
-        flags.msgAdded |
-          flags.msgsDeleted |
-          flags.msgsMoveCopyCompleted |
-          flags.msgsClassified |
-          flags.msgKeyChanged |
-          flags.msgsJunkStatusChanged |
-          flags.msgPropertyChanged |
-          flags.folderDeleted |
-          flags.folderRenamed |
-          flags.folderMoveCopyCompleted |
-          flags.folderCompactFinish |
-          flags.folderReindexTriggered
-      );
-    }
-    this.#wake();
+  /** Starts coalesced background work using existing mail notifications.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
+   */
+  start(migrationWork = null) {
+    return this.#migration.run(() => {
+      if (this.#closed) {
+        throw new Error("Mail search is closed");
+      }
+      if (!this.#started && !this.#migrationStopped) {
+        this.#started = true;
+        Services.prefs.addObserver(INDEXER_PREF, this);
+        Services.prefs.addObserver(DISPLAY_NAME_PREF, this);
+        const flags = Ci.nsIMsgFolderNotificationService;
+        MailServices.mfn.addListener(
+          this,
+          flags.msgAdded |
+            flags.msgsDeleted |
+            flags.msgsMoveCopyCompleted |
+            flags.msgsClassified |
+            flags.msgKeyChanged |
+            flags.msgsJunkStatusChanged |
+            flags.msgPropertyChanged |
+            flags.folderDeleted |
+            flags.folderRenamed |
+            flags.folderMoveCopyCompleted |
+            flags.folderCompactFinish |
+            flags.folderReindexTriggered
+        );
+      }
+      this.#wake();
+    }, migrationWork);
   }
 
   /** Resumes work after an external change or explicit search. */
   #wake() {
+    if (this.#migrationStopped) {
+      return;
+    }
     this.#retryCount = 0;
     if (this.#retryTimer !== null) {
       clearTimeout(this.#retryTimer);
@@ -645,13 +770,13 @@ export class MailSearchService {
    * Unfinished work remains durable after the retry budget is exhausted.
    */
   #schedule() {
-    if (this.#scheduled || this.#closed) {
+    if (this.#scheduled || this.#closed || this.#migrationStopped) {
       return;
     }
     this.#scheduled = true;
     Services.tm.idleDispatchToMainThread(() => {
       this.#scheduled = false;
-      if (this.#closed) {
+      if (this.#closed || this.#migrationStopped) {
         return;
       }
       this.update()
@@ -659,7 +784,7 @@ export class MailSearchService {
           this.#retryCount = 0;
           this.#updateActivity(progress);
           try {
-            this.onProgress?.(progress);
+            this.onProgress(progress);
           } catch (error) {
             this.#reportError(error);
           }
@@ -834,18 +959,25 @@ export class MailSearchService {
    * @param {object} [options] - PanoramaSearchIndex query controls.
    * @param {AbortSignal} [options.signal] - Cancel query delivery.
    * @returns {Promise<object>} Physical hits, cursor and result-set identity.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async search(text, { signal, ...options } = {}) {
-    if (this.#closed) {
-      throw new Error("Mail search is closed");
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    await this.#preparePreferences(signal);
-    signal.throwIfAborted();
-    this.start();
-    return this.#index.search(text, { ...options, signal });
+  async search(text, { signal, ...options } = {}, migrationWork = null) {
+    return this.#migration.run(async work => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        throw new Error("Mail search is closed");
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      await this.#migration.wait(() => this.#preparePreferences(signal));
+      signal.throwIfAborted();
+      this.start(work);
+      return this.#index.search(text, { ...options, signal });
+    }, migrationWork);
   }
 
   /**
@@ -860,50 +992,66 @@ export class MailSearchService {
    * @param {boolean} [options.andTerms=true] - Require every term.
    * @param {AbortSignal} [options.signal] - Stop selection/delivery.
    * @returns {Promise<{resultSetId: string, count: number}>} Delivered result set.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  streamHeaders(text, onHeader, { andTerms = true, signal } = {}) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    if (typeof onHeader != "function") {
-      throw new TypeError("A native header listener is required");
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    const operation = this.#updates.then(async () => {
-      await this.#preparePreferences(signal);
-      let cursor;
-      let resultSetId;
-      let count = 0;
-      do {
-        const page = await this.#index.search(text, {
-          andTerms,
-          limit: 100,
-          cursor,
-          signal,
-        });
-        resultSetId = page.resultSetId;
-        for (const hit of page.items) {
-          signal.throwIfAborted();
-          const state = this.resolveDocument(hit.id, signal);
-          const current =
-            state?.eligible &&
-            state.generation == hit.generation &&
-            state.contentRevision == hit.contentRevision &&
-            state.policyRevision == hit.policyRevision;
-          const header = current && getMailSearchHeader(state);
-          if (header) {
-            onHeader(header);
-            count++;
+  streamHeaders(
+    text,
+    onHeader,
+    { andTerms = true, signal } = {},
+    migrationWork = null
+  ) {
+    return this.#migration.run(() => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
+      }
+      if (typeof onHeader != "function") {
+        throw new TypeError("A native header listener is required");
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      const operation = this.#updates.then(async () => {
+        await this.#migration.wait(() => this.#preparePreferences(signal));
+        let cursor;
+        let resultSetId;
+        let count = 0;
+        do {
+          const page = await this.#migration.wait(() =>
+            this.#index.search(text, {
+              andTerms,
+              limit: 100,
+              cursor,
+              signal,
+            })
+          );
+          resultSetId = page.resultSetId;
+          for (const hit of page.items) {
+            signal.throwIfAborted();
+            const state = this.#resolveDocument(hit.id, signal);
+            const current =
+              state?.eligible &&
+              state.generation == hit.generation &&
+              state.contentRevision == hit.contentRevision &&
+              state.policyRevision == hit.policyRevision;
+            const header = current && getMailSearchHeader(state);
+            if (header) {
+              onHeader(header);
+              count++;
+            }
           }
-        }
-        cursor = page.cursor;
-      } while (cursor);
-      return { resultSetId, count };
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+          cursor = page.cursor;
+        } while (cursor);
+        return { resultSetId, count };
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
+      );
+      return operation;
+    }, migrationWork);
   }
 
   /**
@@ -915,28 +1063,37 @@ export class MailSearchService {
    * @param {number} [options.limit=20] - Maximum choices per kind, from 1 to 100.
    * @param {AbortSignal} [options.signal] - Cancel native selection/delivery.
    * @returns {Promise<{sourceId: string, items: MailSearchCompletion[]}>} Current choices.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async complete(text, { limit = 20, signal } = {}) {
-    if (this.#closed) {
-      throw new Error("Mail search is closed");
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    signal.throwIfAborted();
-    this.start();
-    const operation = this.#updates.then(async () => {
-      await this.#preparePreferences(signal);
-      return completeMailSearchMetadata(
-        this,
-        this.#index,
-        this.#sourceId,
-        text,
-        { limit, signal }
+  async complete(text, { limit = 20, signal } = {}, migrationWork = null) {
+    return this.#migration.run(async work => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        throw new Error("Mail search is closed");
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      signal.throwIfAborted();
+      this.start(work);
+      const operation = this.#updates.then(async () => {
+        await this.#migration.wait(() => this.#preparePreferences(signal));
+        return completeMailSearchMetadata(
+          this,
+          this.#index,
+          this.#sourceId,
+          text,
+          { limit, signal }
+        );
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
       );
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+      return operation;
+    }, migrationWork);
   }
 
   /**
@@ -952,61 +1109,77 @@ export class MailSearchService {
    * @param {?MailSearchSelection} [options.selection=null] - Exact typed values.
    * @param {AbortSignal} [options.signal] - Cancel collection and delivery.
    * @returns {Promise<MailSearchResultSet>} Physical members and copied metadata.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
   async collectResults(
     text,
-    { andTerms = true, selection = null, signal } = {}
+    { andTerms = true, selection = null, signal } = {},
+    migrationWork = null
   ) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    selection = copyMailSearchSelection(selection);
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    signal.throwIfAborted();
-    this.start();
-    // Accept one current change page before collecting indexed physical copies.
-    // In particular, flag/tag changes must refresh their existing projection.
-    try {
-      await this.update({ limit: 500, signal });
-    } catch (error) {
-      if (signal.aborted) {
-        throw error;
+    return this.#migration.run(async work => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
       }
-      this.#reportError(error);
-    }
-    const operation = this.#updates.then(async () => {
-      await this.#preparePreferences(signal);
-      const items = [];
-      let cursor;
-      let resultSetId;
-      do {
-        const page = await this.#index.search(text, {
-          andTerms,
-          matchAll: !!selection,
-          limit: 100,
-          cursor,
-          signal,
-        });
-        resultSetId = page.resultSetId;
-        for (const hit of page.items) {
-          const result = await readMailSearchResult(this, hit, { signal });
-          if (result && matchesMailSearchSelection(result, selection)) {
-            items.push(result);
-          }
-        }
-        cursor = page.cursor;
-      } while (cursor);
+      selection = copyMailSearchSelection(selection);
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
       signal.throwIfAborted();
-      return {
-        sourceId: this.#sourceId,
-        resultSetId,
-        items: items.filter(item => this.#currentHeader(item, signal)),
-      };
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+      this.start(work);
+      // Accept one current change page before collecting indexed physical copies.
+      // In particular, flag/tag changes must refresh their existing projection.
+      try {
+        await this.#migration.wait(() =>
+          this.update({ limit: 500, signal }, work)
+        );
+      } catch (error) {
+        if (signal.aborted) {
+          throw error;
+        }
+        this.#reportError(error);
+      }
+      const operation = this.#updates.then(async () => {
+        await this.#migration.wait(() => this.#preparePreferences(signal));
+        const items = [];
+        let cursor;
+        let resultSetId;
+        do {
+          const page = await this.#migration.wait(() =>
+            this.#index.search(text, {
+              andTerms,
+              matchAll: !!selection,
+              limit: 100,
+              cursor,
+              signal,
+            })
+          );
+          resultSetId = page.resultSetId;
+          for (const hit of page.items) {
+            const result = await this.#migration.wait(() =>
+              readMailSearchResult(this, hit, { signal })
+            );
+            if (result && matchesMailSearchSelection(result, selection)) {
+              items.push(result);
+            }
+          }
+          cursor = page.cursor;
+        } while (cursor);
+        signal.throwIfAborted();
+        return {
+          sourceId: this.#sourceId,
+          resultSetId,
+          items: items.filter(item => this.#currentHeader(item, signal)),
+        };
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
+      );
+      return operation;
+    }, migrationWork);
   }
 
   /**
@@ -1017,7 +1190,7 @@ export class MailSearchService {
    * @returns {?nsIMsgDBHdr} Current eligible header, or null for a stale result.
    */
   #currentHeader(hit, signal) {
-    const state = this.resolveDocument(hit.id, signal);
+    const state = this.#resolveDocument(hit.id, signal);
     return state?.eligible &&
       state.generation == hit.generation &&
       state.contentRevision == hit.contentRevision &&
@@ -1039,68 +1212,78 @@ export class MailSearchService {
    * @returns {Promise<{resultSetId: string, count: number}>} Delivered membership.
    * @throws {TypeError} If the result set belongs to another native incarnation.
    * @throws {nsIException} For stale membership when requireComplete is true.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
   streamResultHeaders(
     resultSet,
     onHeader,
-    { signal, requireComplete = false } = {}
+    { signal, requireComplete = false } = {},
+    migrationWork = null
   ) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    if (
-      resultSet?.sourceId !== this.#sourceId ||
-      typeof resultSet.resultSetId != "string" ||
-      !Array.isArray(resultSet.items) ||
-      typeof onHeader != "function"
-    ) {
-      throw new TypeError("A result set from this mail database is required");
-    }
-    const resultSetId = resultSet.resultSetId;
-    const selected = resultSet.items.map(
-      ({ id, generation, contentRevision, policyRevision }) => ({
-        id,
-        generation,
-        contentRevision,
-        policyRevision,
-      })
-    );
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    const operation = this.#updates.then(async () => {
-      await this.#preparePreferences(signal);
-      const seen = new Set();
-      const resolve = hit => {
-        signal.throwIfAborted();
-        const header = this.#currentHeader(hit, signal);
-        if (!header && requireComplete) {
-          throw Components.Exception(
-            `Search result changed (physical key ${hit.id})`,
-            Cr.NS_ERROR_IN_PROGRESS
-          );
+    return this.#migration.run(() => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
+      }
+      if (
+        resultSet?.sourceId !== this.#sourceId ||
+        typeof resultSet.resultSetId != "string" ||
+        !Array.isArray(resultSet.items) ||
+        typeof onHeader != "function"
+      ) {
+        throw new TypeError("A result set from this mail database is required");
+      }
+      const resultSetId = resultSet.resultSetId;
+      const selected = resultSet.items.map(
+        ({ id, generation, contentRevision, policyRevision }) => ({
+          id,
+          generation,
+          contentRevision,
+          policyRevision,
+        })
+      );
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      const operation = this.#updates.then(async () => {
+        await this.#migration.wait(() => this.#preparePreferences(signal));
+        const seen = new Set();
+        const resolve = hit => {
+          signal.throwIfAborted();
+          const header = this.#currentHeader(hit, signal);
+          if (!header && requireComplete) {
+            throw Components.Exception(
+              `Search result changed (physical key ${hit.id})`,
+              Cr.NS_ERROR_IN_PROGRESS
+            );
+          }
+          return header;
+        };
+        if (requireComplete) {
+          selected.forEach(resolve);
         }
-        return header;
-      };
-      if (requireComplete) {
-        selected.forEach(resolve);
-      }
-      let count = 0;
-      for (const hit of selected) {
-        const header = !seen.has(hit.id) && resolve(hit);
-        if (header) {
-          seen.add(hit.id);
-          onHeader(header);
-          count++;
+        let count = 0;
+        for (const hit of selected) {
+          const header = !seen.has(hit.id) && resolve(hit);
+          if (header) {
+            seen.add(hit.id);
+            onHeader(header);
+            count++;
+          }
         }
-      }
-      if (requireComplete) {
-        selected.forEach(resolve);
-      }
-      return { resultSetId, count };
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+        if (requireComplete) {
+          selected.forEach(resolve);
+        }
+        return { resultSetId, count };
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
+      );
+      return operation;
+    }, migrationWork);
   }
 
   /**
@@ -1111,13 +1294,20 @@ export class MailSearchService {
    * @param {object} [options] - Lookup controls.
    * @param {AbortSignal} [options.signal] - Cancel selection and text delivery.
    * @returns {Promise<?SearchDocument>} Eligible stored text.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async getText(id, { signal } = {}) {
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    await this.#preparePreferences(signal);
-    return this.#index.getText(id, { signal });
+  async getText(id, { signal } = {}, migrationWork = null) {
+    return this.#migration.run(async () => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      await this.#migration.wait(() => this.#preparePreferences(signal));
+      return this.#index.getText(id, { signal });
+    }, migrationWork);
   }
 
   /**
@@ -1130,24 +1320,33 @@ export class MailSearchService {
    * @param {AbortSignal} [options.signal] - Cancel before writing or delivering.
    * @returns {Promise<{sourceId: ?string, acceptedThrough: number, pending: number,
    *   unavailable: number}>} Durable unfinished-work counts and checkpoint.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  retryUnavailable({ signal } = {}) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    const operation = this.#updates.then(async () => {
-      signal.throwIfAborted();
-      await this.#index.retryUnavailable({ signal });
-      const progress = await this.#index.getProgress();
-      signal.throwIfAborted();
-      this.start();
-      return progress;
-    });
-    this.#updates = operation.catch(() => {});
-    return operation;
+  retryUnavailable({ signal } = {}, migrationWork = null) {
+    return this.#migration.run(work => {
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      const operation = this.#updates.then(async () => {
+        signal.throwIfAborted();
+        await this.#migration.wait(() =>
+          this.#index.retryUnavailable({ signal })
+        );
+        const progress = await this.#migration.wait(() =>
+          this.#index.getProgress()
+        );
+        signal.throwIfAborted();
+        this.start(work);
+        return progress;
+      });
+      this.#updates = operation.catch(error =>
+        this.#rememberMigrationFailure(error)
+      );
+      return operation;
+    }, migrationWork);
   }
 
   /**
@@ -1158,21 +1357,28 @@ export class MailSearchService {
    * @param {object} [options={}] - Lookup controls.
    * @param {AbortSignal} [options.signal] - Cancel selection/delivery.
    * @returns {Promise<MailSearchConversationSnapshot|{status: string}>} Native snapshot or non-ready status.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  getConversation(request, { signal } = {}) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    return readMailSearchConversation(
-      this,
-      this.#sourceId,
-      this.#messageDB,
-      request,
-      { signal }
-    );
+  getConversation(request, { signal } = {}, migrationWork = null) {
+    return this.#migration.run(() => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      return readMailSearchConversation(
+        this,
+        this.#sourceId,
+        this.#messageDB,
+        request,
+        { signal }
+      );
+    }, migrationWork);
   }
 
   /**
@@ -1186,47 +1392,58 @@ export class MailSearchService {
    * @returns {Promise<MailSearchConversationSnapshot|{status: string}>} Complete
    *   eligible members, or deleted/ineligible/stale/unavailable without members.
    * @throws {TypeError} For an invalid physical message key.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async getConversationForHeader(header, { signal } = {}) {
-    if (this.#closed) {
-      throw new Error("Mail search is closed");
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    signal.throwIfAborted();
-    const id = String(header?.messageKey);
-    const key = mailSearchKey(id);
-    const folderId = header.folder?.id;
-    await this.#preparePreferences(signal);
-    signal.throwIfAborted();
-    const state = this.resolveDocument(id, signal);
-    if (!state) {
-      return { status: "deleted" };
-    }
-    if (!state.eligible) {
-      return { status: "ineligible" };
-    }
-    if (
-      state.location?.folderId !== folderId ||
-      state.location.messageKey !== key
-    ) {
-      return { status: "stale" };
-    }
-    return readMailSearchConversation(
-      this,
-      this.#sourceId,
-      this.#messageDB,
-      {
-        sourceId: this.#sourceId,
-        id,
-        generation: state.generation,
-        policyRevision: state.policyRevision,
-        contentRevision: state.contentRevision,
-        location: { ...state.location },
-      },
-      { signal }
-    );
+  async getConversationForHeader(
+    header,
+    { signal } = {},
+    migrationWork = null
+  ) {
+    return this.#migration.run(async () => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        throw new Error("Mail search is closed");
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      signal.throwIfAborted();
+      const id = String(header?.messageKey);
+      const key = mailSearchKey(id);
+      const folderId = header.folder?.id;
+      await this.#migration.wait(() => this.#preparePreferences(signal));
+      signal.throwIfAborted();
+      const state = this.#resolveDocument(id, signal);
+      if (!state) {
+        return { status: "deleted" };
+      }
+      if (!state.eligible) {
+        return { status: "ineligible" };
+      }
+      if (
+        state.location?.folderId !== folderId ||
+        state.location.messageKey !== key
+      ) {
+        return { status: "stale" };
+      }
+      return readMailSearchConversation(
+        this,
+        this.#sourceId,
+        this.#messageDB,
+        {
+          sourceId: this.#sourceId,
+          id,
+          generation: state.generation,
+          policyRevision: state.policyRevision,
+          contentRevision: state.contentRevision,
+          location: { ...state.location },
+        },
+        { signal }
+      );
+    }, migrationWork);
   }
 
   /**
@@ -1237,19 +1454,30 @@ export class MailSearchService {
    * @param {boolean} [options.allowDownload=false] - Permit remote retrieval/actions.
    * @param {AbortSignal} [options.signal] - Cancel MIME/result delivery.
    * @returns {Promise<MailSearchAttachmentResolution>} Fresh details or a non-ready status.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  resolveAttachment(request, { allowDownload = false, signal } = {}) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    request = copyMailSearchAttachmentRequest(this.#sourceId, request);
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    return resolveMailSearchAttachment(this, this.#sourceId, request, {
-      allowDownload,
-      signal,
-    });
+  resolveAttachment(
+    request,
+    { allowDownload = false, signal } = {},
+    migrationWork = null
+  ) {
+    return this.#migration.run(() => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
+      }
+      request = copyMailSearchAttachmentRequest(this.#sourceId, request);
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      return resolveMailSearchAttachment(this, this.#sourceId, request, {
+        allowDownload,
+        signal,
+      });
+    }, migrationWork);
   }
 
   /**
@@ -1262,23 +1490,31 @@ export class MailSearchService {
    * @param {AbortSignal} [options.signal] - Cancel before dispatch; an existing
    *   reader action cannot be revoked after handoff.
    * @returns {Promise<MailSearchAttachmentResolution>} Dispatched or non-ready status.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
   openAttachment(
     request,
-    { browsingContext, allowDownload = false, signal } = {}
+    { browsingContext, allowDownload = false, signal } = {},
+    migrationWork = null
   ) {
-    if (this.#closed) {
-      return Promise.reject(new Error("Mail search is closed"));
-    }
-    request = copyMailSearchAttachmentRequest(this.#sourceId, request);
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    return openMailSearchAttachment(this, this.#sourceId, request, {
-      browsingContext,
-      allowDownload,
-      signal,
-    });
+    return this.#migration.run(() => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        return Promise.reject(new Error("Mail search is closed"));
+      }
+      request = copyMailSearchAttachmentRequest(this.#sourceId, request);
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      return openMailSearchAttachment(this, this.#sourceId, request, {
+        browsingContext,
+        allowDownload,
+        signal,
+      });
+    }, migrationWork);
   }
 
   /**
@@ -1291,19 +1527,30 @@ export class MailSearchService {
    * @param {DBViewWrapper} [options.viewWrapper] - View to clone for the reader.
    * @param {Element} [options.tabmail] - Target tabmail, or the reader default.
    * @returns {Promise<object>} Current resolution/opening status.
+   * @param {?object} [migrationWork=null] - Internal token from an actual pending same-domain operation.
    */
-  async openResult(id, { signal, viewWrapper, tabmail } = {}) {
-    if (this.#closed) {
-      throw new Error("Mail search is closed");
-    }
-    signal = signal
-      ? AbortSignal.any([signal, this.#controller.signal])
-      : this.#controller.signal;
-    return openMailSearchResult(
-      id,
-      (key, lookupSignal) => this.resolveDocument(key, lookupSignal),
-      { signal, viewWrapper, tabmail }
-    );
+  async openResult(
+    id,
+    { signal, viewWrapper, tabmail } = {},
+    migrationWork = null
+  ) {
+    return this.#migration.run(async () => {
+      signal = AbortSignal.any([
+        this.#migration.deliverySignal,
+        ...(signal ? [signal] : []),
+      ]);
+      if (this.#closed) {
+        throw new Error("Mail search is closed");
+      }
+      signal = signal
+        ? AbortSignal.any([signal, this.#controller.signal])
+        : this.#controller.signal;
+      return openMailSearchResult(
+        id,
+        (key, lookupSignal) => this.#resolveDocument(key, lookupSignal),
+        { signal, viewWrapper, tabmail }
+      );
+    }, migrationWork);
   }
 
   /**
@@ -1312,25 +1559,75 @@ export class MailSearchService {
    * @returns {Promise<void>} Resolves after the sidecar closes.
    */
   close() {
-    if (!this.#closePromise) {
+    return this.#migration.finish(async () => {
       this.#closed = true;
-      if (this.#retryTimer !== null) {
-        clearTimeout(this.#retryTimer);
-        this.#retryTimer = null;
+      const errors = [];
+      try {
+        this.#stopMigrationNotifications();
+      } catch (error) {
+        errors.push(error);
       }
       this.#controller.abort(new Error("Mail search closed"));
-      if (this.#started) {
-        Services.prefs.removeObserver(INDEXER_PREF, this);
-        Services.prefs.removeObserver(DISPLAY_NAME_PREF, this);
-        MailServices.mfn.removeListener(this);
+      const queued = await Promise.allSettled([
+        this.#updates,
+        this.#preferences,
+      ]);
+      for (const result of queued) {
+        if (result.status === "rejected") {
+          errors.push(result.reason);
+        }
       }
-      this.#closePromise = Promise.all([this.#updates, this.#preferences])
-        .then(() => this.#index.close())
-        .finally(() => {
-          this.#clearActivity(true);
-          AsyncShutdown.profileBeforeChange.removeBlocker(this.#shutdown);
-        });
+      try {
+        await this.#index?.close();
+        if (this.#index) {
+          this.#storageTerminal = true;
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        this.#clearActivity(true);
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        AsyncShutdown.profileBeforeChange.removeBlocker(this.#shutdown);
+      } catch (error) {
+        errors.push(error);
+      }
+      for (const error of errors) {
+        this.#rememberMigrationFailure(error);
+      }
+      if (errors.length) {
+        throw errors[0];
+      }
+    });
+  }
+
+  #resolveDocument(id, signal) {
+    this.#migration.check();
+    if (this.#closed) {
+      throw new Error("Mail search is closed");
     }
-    return this.#closePromise;
+    const state = resolveMailSearchDocument(this.#messageDB, id, signal);
+    if (state?.contentError) {
+      this.#reportError(state.contentError);
+    }
+    return state;
+  }
+
+  /** Stops new notification work without cancelling captured I/O. */
+  #stopMigrationNotifications() {
+    this.#migrationStopped = true;
+    if (this.#retryTimer !== null) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = null;
+    }
+    if (this.#started) {
+      Services.prefs.removeObserver(INDEXER_PREF, this);
+      Services.prefs.removeObserver(DISPLAY_NAME_PREF, this);
+      MailServices.mfn.removeListener(this);
+      this.#started = false;
+    }
   }
 }

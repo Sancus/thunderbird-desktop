@@ -10,6 +10,7 @@ UNIFIED_SOURCES += [
     "TestDeliveryCoreReferences.cpp",
     "TestDeliveryFolderInfoProperties.cpp",
     "TestDeliveryMessageReferences.cpp",
+    "TestImapMigrationWriterLease.cpp",
 ]
 
 if CONFIG["OS_ARCH"] == "WINNT":

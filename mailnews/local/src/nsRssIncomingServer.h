@@ -33,6 +33,7 @@ class nsRssIncomingServer : public nsMailboxServer,
   NS_IMETHOD GetCanSearchMessages(bool* canSearchMessages) override;
 
   nsRssIncomingServer();
+  nsresult Init();
 
  protected:
   virtual ~nsRssIncomingServer();
@@ -41,6 +42,7 @@ class nsRssIncomingServer : public nsMailboxServer,
   nsresult FillInDataSourcePath(const nsAString& aDataSourceName,
                                 nsIFile** aLocation);
   static nsrefcnt gInstanceCount;
+  bool mMigrationWriterInitialized = false;
 };
 
 #endif  // COMM_MAILNEWS_LOCAL_SRC_NSRSSINCOMINGSERVER_H_

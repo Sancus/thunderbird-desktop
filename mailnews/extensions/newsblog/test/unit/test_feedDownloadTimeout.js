@@ -111,3 +111,109 @@ add_task(async function test_slow_progressing_response() {
     "a slow download that keeps receiving data should succeed"
   );
 });
+
+const { AppConstants: migrationAppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+const { MockRegistrar: migrationMockRegistrar } = ChromeUtils.importESModule(
+  "resource://testing-common/MockRegistrar.sys.mjs"
+);
+
+/**
+ * Rejects service lookup to test refusal before a caller's first side effect.
+ * This fixture never supplies native selection or claims a Held lease.
+ *
+ * @param {function(nsIException): Promise<void>} task - Refusal assertions.
+ * @returns {Promise<void>} Resolves after restoring the real native service.
+ */
+async function withMigrationGateFailure(task) {
+  const error = Components.Exception(
+    "Migration gate service lookup failed",
+    Cr.NS_ERROR_FILE_ACCESS_DENIED
+  );
+  const cid = migrationMockRegistrar.register(
+    "@mozilla.org/mailnews/migration-writer-lease;1",
+    () => {
+      throw error;
+    }
+  );
+  try {
+    await task(error);
+  } finally {
+    migrationMockRegistrar.unregister(cid);
+  }
+}
+
+/**
+ * Checks sticky native history in this already initialized ordinary fixture.
+ *
+ * @param {string} domain - One fixed native writer domain.
+ */
+function assertMigrationWriterStarted(domain) {
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const bag = gate.QueryInterface(Ci.nsIPropertyBag2);
+  const subject = bag.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  Assert.equal(bag.getPropertyAsUint32(`writer-history.${domain}`), 1);
+  Assert.throws(
+    () => gate.observe(subject, "check-writer-never-started", domain),
+    error => error.result == Cr.NS_ERROR_NOT_AVAILABLE,
+    "An initialized or previously used writer cannot certify NeverStarted"
+  );
+}
+
+add_task(async function test_snapshotAdmissionRejectsDirectFeedAndLateTimer() {
+  if (!migrationAppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const feed = new Feed("https://example.invalid/migration.xml", rootFolder);
+  const request = feed.request;
+  const timer = feed.inactivityTimer;
+  let called = 0;
+  await withMigrationGateFailure(async original => {
+    Assert.throws(
+      () => new Feed("https://example.invalid/migration.xml", rootFolder),
+      error => error.result == original.result
+    );
+    Assert.throws(
+      () => feed.download(true, { downloaded() { ++called; } }),
+      error => error.result == original.result
+    );
+    Assert.throws(() => feed.resetInactivityTimer(), error => error.result == original.result);
+    await Assert.rejects(
+      FeedUtils.downloadFeed(rootFolder, null, false, null),
+      error => error.result == original.result
+    );
+  });
+  Assert.strictEqual(feed.request, request);
+  Assert.strictEqual(feed.inactivityTimer, timer);
+  Assert.equal(called, 0);
+  const primary = Components.Exception("Earlier feed failure", Cr.NS_ERROR_ABORT);
+  feed.parseItems = true;
+  feed.itemsToStore = [{}];
+  feed.itemsToStoreIndex = 1;
+  feed.downloadCallback = {
+    downloaded(completed, status) {
+      Assert.strictEqual(completed, feed);
+      Assert.equal(status, FeedUtils.kNewsBlogFileError);
+      ++called;
+    },
+  };
+  await withMigrationGateFailure(async () => {
+    Assert.throws(
+      () => feed.cleanupParsingState(feed, FeedUtils.kNewsBlogFileError, primary),
+      error => error.result == primary.result,
+      "Store lookup cleanup cannot replace the first operation error"
+    );
+  });
+  Assert.equal(called, 1);
+  Assert.strictEqual(feed.request, null);
+  Assert.deepEqual(feed.itemsToStore, []);
+  Assert.equal(feed.itemsToStoreIndex, 0);
+  Assert.strictEqual(feed.storeItemsTimer, null);
+  assertMigrationWriterStarted("rss");
+});

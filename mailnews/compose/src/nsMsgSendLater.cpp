@@ -4,6 +4,8 @@
 
 #include "nsMsgSendLater.h"
 
+#include "MigrationWriterLease.h"
+
 #include "mozilla/CheckedInt.h"
 #include "nsCOMPtr.h"
 #include "nsComponentManagerUtils.h"
@@ -37,6 +39,8 @@
 #include "mozilla/Preferences.h"
 
 using mozilla::Preferences;
+using mozilla::mailnews::CheckMigrationWriter;
+using mozilla::mailnews::MigrationWriterDomain;
 
 // Consts for checking and sending mail in milliseconds
 
@@ -96,6 +100,9 @@ nsMsgSendLater::~nsMsgSendLater() {
 }
 
 nsresult nsMsgSendLater::Init() {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   // If we're not sending in the background, don't do anything else
   if (!Preferences::GetBool("mailnews.sendInBackground")) return NS_OK;
 
@@ -134,6 +141,9 @@ NS_IMETHODIMP
 nsMsgSendLater::Observe(nsISupports* aSubject, const char* aTopic,
                         const char16_t* aData) {
   if (aSubject == mTimer && !strcmp(aTopic, "timer-callback")) {
+    nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+    NS_ENSURE_SUCCESS(admission, admission);
+
     if (mTimer)
       mTimer->Cancel();
     else
@@ -332,7 +342,9 @@ nsMsgSendLater::OnStartRunningUrl(nsIURI* url) { return NS_OK; }
 
 NS_IMETHODIMP
 nsMsgSendLater::OnStopRunningUrl(nsIURI* url, nsresult aExitCode) {
-  if (NS_SUCCEEDED(aExitCode)) InternalSendMessages(mUserInitiated, mIdentity);
+  if (NS_SUCCEEDED(aExitCode)) {
+    return InternalSendMessages(mUserInitiated, mIdentity);
+  }
   return NS_OK;
 }
 
@@ -439,6 +451,9 @@ SendOperationListener::OnStopCopy(nsresult aStatus) {
 }
 
 nsresult nsMsgSendLater::CompleteMailFileSend() {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   // get the identity from the key
   // if no key, or we fail to find the identity
   // use the default identity on the default account
@@ -551,6 +566,11 @@ nsresult nsMsgSendLater::StartNextMailFileSend(nsresult prevStatus) {
     return NS_OK;
   }
 
+  // Completing the captured queue above remains possible after a refusal.
+  // Starting another message is new work, not terminal cleanup.
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, NS_FAILED(prevStatus) ? prevStatus : admission);
+
   // If we've already sent a message, and are sending more, send out a progress
   // update with 100% for both send and copy as we must have finished by now.
   if (mTotalSendCount > 0) {
@@ -607,6 +627,9 @@ nsresult nsMsgSendLater::StartNextMailFileSend(nsresult prevStatus) {
 NS_IMETHODIMP
 nsMsgSendLater::GetUnsentMessagesFolder(nsIMsgIdentity* aIdentity,
                                         nsIMsgFolder** aFolder) {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   nsresult rv = NS_OK;
   nsCOMPtr<nsIMsgFolder> folder = do_QueryReferent(mMessageFolder);
   if (!folder) {
@@ -632,6 +655,9 @@ nsMsgSendLater::GetUnsentMessagesFolder(nsIMsgIdentity* aIdentity,
 
 NS_IMETHODIMP
 nsMsgSendLater::HasUnsentMessages(nsIMsgIdentity* aIdentity, bool* aResult) {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   NS_ENSURE_ARG_POINTER(aResult);
   *aResult = false;
   nsresult rv;
@@ -691,11 +717,17 @@ nsMsgSendLater::HasUnsentMessages(nsIMsgIdentity* aIdentity, bool* aResult) {
 //
 NS_IMETHODIMP
 nsMsgSendLater::SendUnsentMessages(nsIMsgIdentity* aIdentity) {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   return InternalSendMessages(true, aIdentity);
 }
 
 // Returns NS_OK if the db is OK, an error otherwise, e.g., we had to reparse.
 nsresult nsMsgSendLater::ReparseDBIfNeeded(nsIUrlListener* aListener) {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   // This will kick off a reparse, if needed. So the next time we check if
   // there are unsent messages, the db will be up to date.
   nsCOMPtr<nsIMsgDatabase> unsentDB;
@@ -709,6 +741,9 @@ nsresult nsMsgSendLater::ReparseDBIfNeeded(nsIUrlListener* aListener) {
 
 nsresult nsMsgSendLater::InternalSendMessages(bool aUserInitiated,
                                               nsIMsgIdentity* aIdentity) {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   if (WeAreOffline()) return NS_MSG_ERROR_OFFLINE;
 
   // Protect against being called whilst we're already sending.
@@ -1133,6 +1168,9 @@ nsresult nsMsgSendLater::DeliverQueuedLine(const char* line, int32_t length) {
 
 NS_IMETHODIMP
 nsMsgSendLater::AddListener(nsIMsgSendLaterListener* aListener) {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   NS_ENSURE_ARG_POINTER(aListener);
   mListenerArray.AppendElement(aListener);
   return NS_OK;
@@ -1306,6 +1344,9 @@ nsresult nsMsgSendLater::GetIdentityFromKey(const char* aKey,
 }
 
 nsresult nsMsgSendLater::StartTimer() {
+  nsresult admission = CheckMigrationWriter(MigrationWriterDomain::SendLater);
+  NS_ENSURE_SUCCESS(admission, admission);
+
   // No need to trigger if timer is already set
   if (mTimerSet) return NS_OK;
 

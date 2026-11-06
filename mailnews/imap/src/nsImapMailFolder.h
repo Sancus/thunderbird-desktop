@@ -41,6 +41,8 @@ struct NativeOfflineCopyEntry;
 struct NativeFilterHeader;
 #  include "MessageDatabase.h"
 namespace mozilla::mailnews {
+class ImapMigrationWork;
+class ImapMigrationWriterLeaseTest;
 class CacheDiscoveryFlagWrite;
 struct FinishedMessageBody;
 class ParsedServerHdr;
@@ -49,8 +51,12 @@ class ParsedServerHdr;
 
 #define COPY_BUFFER_SIZE 16384
 
-#define NS_IMAPMAILCOPYSTATE_IID \
-  {0xb64534f0, 0x3d53, 0x11d3, {0xac, 0x2a, 0x00, 0x80, 0x5f, 0x8a, 0xc9, 0x68}}
+#define NS_IMAPMAILCOPYSTATE_IID                     \
+  {                                                  \
+    0xb64534f0, 0x3d53, 0x11d3, {                    \
+      0xac, 0x2a, 0x00, 0x80, 0x5f, 0x8a, 0xc9, 0x68 \
+    }                                                \
+  }
 
 class nsImapMailCopyState : public nsISupports {
  public:
@@ -243,6 +249,10 @@ class nsImapMailFolder : public nsMsgDBFolder,
   static const uint32_t PLAYBACK_TIMER_INTERVAL_IN_MS = 500;
 
  public:
+#ifdef MOZ_PANORAMA
+  friend class mozilla::mailnews::ImapMigrationWriterLeaseTest;
+#endif
+
   nsImapMailFolder();
 #ifdef MOZ_PANORAMA
   friend class nsImapFolderRelocation;
@@ -368,6 +378,15 @@ class nsImapMailFolder : public nsMsgDBFolder,
   NS_DECL_NSIMSGIMAPMAILFOLDER
   NS_DECL_NSIIMAPMAILFOLDERSINK
   NS_DECL_NSIIMAPMESSAGESINK
+#ifdef MOZ_PANORAMA
+ private:
+  RefPtr<mozilla::mailnews::ImapMigrationWork> mMigrationBodyWork;
+  nsCOMPtr<nsIImapUrl> mMigrationUrl;
+  nsCOMPtr<nsIImapUrl> mMigrationBodyUrl;
+  bool mMigrationBodyFinishing = false;
+
+ public:
+#endif
   NS_DECL_NSICOPYMESSAGELISTENER
 
   // nsIUrlListener methods

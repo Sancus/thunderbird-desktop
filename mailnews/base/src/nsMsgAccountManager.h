@@ -60,12 +60,21 @@ class VirtualFolderChangeListener final : public nsIDBChangeListener {
   ~VirtualFolderChangeListener() {}
 };
 
+namespace mozilla::mailnews {
+class MigrationWriterLease;
+}
+
 class nsMsgAccountManager : public nsIMsgAccountManager,
                             public nsIObserver,
                             public nsSupportsWeakReference,
                             public nsIFolderListener,
                             public nsIAsyncShutdownBlocker {
  public:
+#ifdef MOZ_PANORAMA
+  static nsresult CloseForMigration(
+      const mozilla::mailnews::MigrationWriterLease& aLease);
+#endif
+
   nsMsgAccountManager();
 
   NS_DECL_THREADSAFE_ISUPPORTS
@@ -103,6 +112,9 @@ class nsMsgAccountManager : public nsIMsgAccountManager,
 
   // These are static because the account manager may go away during
   // shutdown, and get recreated.
+#ifdef MOZ_PANORAMA
+  nsCOMPtr<nsIFile> mMigrationProfile;
+#endif
   static bool m_haveShutdown;
   static bool m_shutdownInProgress;
 

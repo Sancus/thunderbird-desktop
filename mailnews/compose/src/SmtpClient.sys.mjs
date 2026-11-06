@@ -31,6 +31,24 @@ import { MsgUtils } from "resource:///modules/MimeMessageUtils.sys.mjs";
 import { setTimeout, clearTimeout } from "resource://gre/modules/Timer.sys.mjs";
 import { SmtpAuthenticator } from "resource:///modules/MailAuthenticator.sys.mjs";
 
+/**
+ * Checks native process admission before starting a smtp writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "smtp");
+}
+
 const lazy = {};
 ChromeUtils.defineLazyGetter(
   lazy,
@@ -61,6 +79,7 @@ export class SmtpClient {
    * @param {SmtpServer} server - The associated SmtpServer instance.
    */
   constructor(server) {
+    checkMigrationWriterAdmission();
     this.options = {
       alwaysSTARTTLS: server.socketType == Ci.nsMsgSocketType.alwaysSTARTTLS,
       requireTLS: server.socketType == Ci.nsMsgSocketType.SSL,
@@ -139,6 +158,7 @@ export class SmtpClient {
    * send the message. This occurs each time a message is sent.
    */
   connect() {
+    checkMigrationWriterAdmission();
     // First, clear the QUIT delay timer if it's running.
     if (this._quitTimer) {
       clearTimeout(this._quitTimer);
@@ -257,6 +277,7 @@ export class SmtpClient {
    * @param {boolean} envelope.messageId - The message id.
    */
   useEnvelope(envelope) {
+    checkMigrationWriterAdmission();
     this._envelope = envelope || {};
     this._envelope.from = [].concat(
       this._envelope.from || "anonymous@" + this._getHelloArgument()
@@ -762,6 +783,7 @@ export class SmtpClient {
    * @param {boolean} _forceNewPassword - Discard cached password.
    */
   async _authenticateUser(_forceNewPassword) {
+    checkMigrationWriterAdmission();
     if (
       this._preferredAuthMethods.length == 0 ||
       this._supportedAuthMethods.length == 0
@@ -882,7 +904,9 @@ export class SmtpClient {
     if (!this._freed) {
       if (this._nextAuthMethod) {
         // Try the next auth method.
-        this._authenticateUser();
+        this._authenticateUser().catch(error =>
+          this._onAuthenticationFailure(error)
+        );
         return;
       } else if (!this._currentAuthMethod) {
         // No auth method was even tried.
@@ -942,7 +966,25 @@ export class SmtpClient {
     this._nextAuthMethod = this._possibleAuthMethods[0];
     if (action == 2 || action == 0) {
       // action = 0 means retry button pressed.
-      this._authenticateUser();
+      this._authenticateUser().catch(error =>
+        this._onAuthenticationFailure(error)
+      );
+    }
+  }
+
+  /**
+   * Reports an auth rejection through the existing request error callback.
+   * Closes the old connection after reporting its original failure.
+   *
+   * @param {Error|nsIException} error - The authentication failure.
+   */
+  _onAuthenticationFailure(error) {
+    this._authenticating = false;
+    this.isRetry = false;
+    try {
+      this.onerror(error.result ?? Cr.NS_ERROR_FAILURE);
+    } finally {
+      this.close(true);
     }
   }
 
@@ -1078,7 +1120,9 @@ export class SmtpClient {
       this._currentAction = this._actionCLIENTID;
       this._sendCommand("CLIENTID UUID " + this._server.clientid, true);
     } else {
-      this._authenticateUser();
+      this._authenticateUser().catch(error =>
+        this._onAuthenticationFailure(error)
+      );
     }
   }
 
@@ -1113,7 +1157,9 @@ export class SmtpClient {
       this._onNsError("smtp-server-error", command.data);
       return;
     }
-    this._authenticateUser();
+    this._authenticateUser().catch(error =>
+      this._onAuthenticationFailure(error)
+    );
   }
 
   /**
@@ -1127,7 +1173,9 @@ export class SmtpClient {
       this._onNsError("smtp-server-error", command.data);
       return;
     }
-    this._authenticateUser();
+    this._authenticateUser().catch(error =>
+      this._onAuthenticationFailure(error)
+    );
   }
 
   /**

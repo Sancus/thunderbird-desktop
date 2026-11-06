@@ -5,19 +5,24 @@
 #ifndef COMM_MAILNEWS_IMAP_SRC_NSIMAPINCOMINGSERVER_H_
 #define COMM_MAILNEWS_IMAP_SRC_NSIMAPINCOMINGSERVER_H_
 
+#include "mozilla/Monitor.h"
+#ifdef MOZ_PANORAMA
+namespace mozilla::mailnews {
+class ImapMigrationWriterLeaseTest;
+}
+#endif
+#include "mozilla/Mutex.h"
 #include "msgCore.h"
-#include "nsImapCore.h"
+#include "nsCOMArray.h"
 #include "nsIImapIncomingServer.h"
-#include "nsMsgIncomingServer.h"
 #include "nsIImapServerSink.h"
+#include "nsIMsgImapMailFolder.h"
 #include "nsIStringBundle.h"
 #include "nsISubscribableServer.h"
 #include "nsIUrlListener.h"
-#include "nsIMsgImapMailFolder.h"
-#include "nsCOMArray.h"
+#include "nsImapCore.h"
+#include "nsMsgIncomingServer.h"
 #include "nsTArray.h"
-#include "mozilla/Mutex.h"
-#include "mozilla/Monitor.h"
 
 /* get some implementation from nsMsgIncomingServer */
 class nsImapIncomingServer : public nsMsgIncomingServer,
@@ -26,9 +31,17 @@ class nsImapIncomingServer : public nsMsgIncomingServer,
                              public nsISubscribableServer,
                              public nsIUrlListener {
  public:
+#ifdef MOZ_PANORAMA
+  friend class mozilla::mailnews::ImapMigrationWriterLeaseTest;
+#endif
+
   NS_DECL_ISUPPORTS_INHERITED
 
   nsImapIncomingServer();
+
+#ifdef MOZ_PANORAMA
+  nsresult CancelMigrationQueuedUrls();
+#endif
 
   // overriding nsMsgIncomingServer methods
   NS_IMETHOD SetKey(const nsACString& aKey)
@@ -48,10 +61,10 @@ class nsImapIncomingServer : public nsMsgIncomingServer,
   NS_IMETHOD GetCanBeDefaultServer(bool* canBeDefaultServer) override;
   NS_IMETHOD GetCanSearchMessages(bool* canSearchMessages) override;
   NS_IMETHOD GetOfflineSupportLevel(int32_t* aSupportLevel) override;
-  NS_IMETHOD GetCanCreateFoldersOnServer(
-      bool* aCanCreateFoldersOnServer) override;
-  NS_IMETHOD GetCanFileMessagesOnServer(
-      bool* aCanFileMessagesOnServer) override;
+  NS_IMETHOD
+  GetCanCreateFoldersOnServer(bool* aCanCreateFoldersOnServer) override;
+  NS_IMETHOD
+  GetCanFileMessagesOnServer(bool* aCanFileMessagesOnServer) override;
   NS_IMETHOD GetFilterScope(nsMsgSearchScopeValue* filterScope) override;
   NS_IMETHOD GetSearchScope(nsMsgSearchScopeValue* searchScope) override;
   NS_IMETHOD GetServerRequiresPasswordForBiff(

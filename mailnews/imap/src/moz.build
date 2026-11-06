@@ -46,3 +46,7 @@ LOCAL_INCLUDES += [
 XPCOM_MANIFESTS += [
     "components.conf",
 ]
+
+if CONFIG["MOZ_PANORAMA"]:
+    SOURCES += ["ImapMigrationWriterLease.cpp"]
+    EXPORTS += ["ImapMigrationWriterLease.h"]

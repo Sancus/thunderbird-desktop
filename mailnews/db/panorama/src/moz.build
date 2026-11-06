@@ -3,6 +3,7 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 EXPORTS += [
+    "MigrationWriterLease.h",
     "DatabaseCore.h",
     "DatabaseUtils.h",
     "DetachedMsgHdr.h",
@@ -47,3 +48,5 @@ EXPORTS += [
 SOURCES += ["../migration/MigrationFileSystem.cpp"]
 if CONFIG["OS_ARCH"] == "WINNT":
     SOURCES += ["../migration/WindowsMigrationPath.cpp"]
+
+SOURCES += ["MigrationWriterLease.cpp"]

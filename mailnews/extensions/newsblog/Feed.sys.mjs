@@ -2,6 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+/**
+ * Checks native process admission before starting an RSS writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "rss");
+}
+
 const lazy = {};
 
 ChromeUtils.defineESModuleGetters(lazy, {
@@ -60,6 +80,7 @@ var FeedCache = {
  *                                     subscription.
  */
 export function Feed(aFeedUrl, aFolder) {
+  checkMigrationWriterAdmission();
   this.url = aFeedUrl;
   this.server = aFolder.server;
   if (!aFolder.isServer) {
@@ -89,6 +110,7 @@ Feed.prototype = {
   },
 
   set folder(aFolder) {
+    checkMigrationWriterAdmission();
     this.mFolder = aFolder;
   },
 
@@ -118,6 +140,7 @@ Feed.prototype = {
   },
 
   download(aParseItems, aCallback) {
+    checkMigrationWriterAdmission();
     // May be null.
     this.downloadCallback = aCallback;
 
@@ -204,6 +227,7 @@ Feed.prototype = {
   },
 
   resetInactivityTimer() {
+    checkMigrationWriterAdmission();
     lazy.clearTimeout(this.inactivityTimer);
     this.inactivityTimer = lazy.setTimeout(() => {
       this.inactivityTimer = null;
@@ -253,6 +277,15 @@ Feed.prototype = {
     feed.fileSize = aEvent.loaded;
 
     // The download callback is called asynchronously when parse() is done.
+    try {
+      checkMigrationWriterAdmission();
+    } catch (error) {
+      try {
+        feed.cleanupParsingState(feed, lazy.FeedUtils.kNewsBlogFileError, error);
+      } finally {
+        throw error;
+      }
+    }
     feed.parse();
   },
 
@@ -392,6 +425,7 @@ Feed.prototype = {
   },
 
   set title(aNewTitle) {
+    checkMigrationWriterAdmission();
     if (!aNewTitle) {
       return;
     }
@@ -413,6 +447,7 @@ Feed.prototype = {
   },
 
   set lastModified(aLastModified) {
+    checkMigrationWriterAdmission();
     lazy.FeedUtils.setSubscriptionAttr(
       this.url,
       this.server,
@@ -432,6 +467,7 @@ Feed.prototype = {
   },
 
   set quickMode(aNewQuickMode) {
+    checkMigrationWriterAdmission();
     lazy.FeedUtils.setSubscriptionAttr(
       this.url,
       this.server,
@@ -457,6 +493,7 @@ Feed.prototype = {
   },
 
   set options(aOptions) {
+    checkMigrationWriterAdmission();
     const newOptions = aOptions ? aOptions : lazy.FeedUtils.optionsTemplate;
     lazy.FeedUtils.setSubscriptionAttr(
       this.url,
@@ -476,6 +513,7 @@ Feed.prototype = {
   },
 
   set link(aNewLink) {
+    checkMigrationWriterAdmission();
     if (!aNewLink) {
       return;
     }
@@ -483,6 +521,7 @@ Feed.prototype = {
   },
 
   parse() {
+    checkMigrationWriterAdmission();
     // Create a feed parser which will parse the feed.
     let parser = new lazy.FeedParser();
     try {
@@ -527,6 +566,7 @@ Feed.prototype = {
    * @returns {void}
    */
   invalidateItems() {
+    checkMigrationWriterAdmission();
     const ds = lazy.FeedUtils.getItemsDS(this.server);
     for (const id in ds.data) {
       const item = ds.data[id];
@@ -548,6 +588,7 @@ Feed.prototype = {
    * @returns {void}
    */
   removeInvalidItems(aDeleteFeed) {
+    checkMigrationWriterAdmission();
     const ds = lazy.FeedUtils.getItemsDS(this.server);
     lazy.FeedUtils.log.debug("Feed.removeInvalidItems: for url - " + this.url);
 
@@ -586,6 +627,7 @@ Feed.prototype = {
   },
 
   createFolder() {
+    checkMigrationWriterAdmission();
     if (this.folder) {
       return;
     }
@@ -617,6 +659,16 @@ Feed.prototype = {
       return;
     }
 
+    try {
+      checkMigrationWriterAdmission();
+    } catch (error) {
+      try {
+        this.cleanupParsingState(this, lazy.FeedUtils.kNewsBlogFileError, error);
+      } finally {
+        throw error;
+      }
+    }
+
     if (this.itemsToStore.length == 0) {
       let code = lazy.FeedUtils.kNewsBlogSuccess;
       this.createFolder();
@@ -638,7 +690,7 @@ Feed.prototype = {
       lazy.FeedUtils.log.error(
         "Feed.storeNextItem: error storing item - " + ex
       );
-      this.cleanupParsingState(this, lazy.FeedUtils.kNewsBlogFileError);
+      this.cleanupParsingState(this, lazy.FeedUtils.kNewsBlogFileError, ex);
       return;
     }
 
@@ -690,37 +742,49 @@ Feed.prototype = {
     }
   },
 
-  cleanupParsingState(aFeed, aCode) {
-    // Now that we are done parsing the feed, remove the feed from the cache.
+  /**
+   * Flushes item changes and completes the existing download callback.
+   * Clears request and item state even if a new store lookup is refused.
+   *
+   * @param {Feed} aFeed - The download being completed.
+   * @param {number} aCode - The original feed completion code.
+   * @param {?(Error|nsIException)} [primaryError=null] - An earlier operation failure.
+   * @throws {Error|nsIException} The first failure if flushing or notification fails.
+   */
+  cleanupParsingState(aFeed, aCode, primaryError = null) {
+    // A denied new store lookup must not prevent the owned callback/cleanup.
     FeedCache.removeFeed(aFeed.url);
-
-    if (aFeed.parseItems) {
-      // Do this only if we're in parse/store mode.
-      if (aCode != lazy.FeedUtils.kNewsBlogFileError) {
-        aFeed.removeInvalidItems(false);
+    let cleanupError;
+    try {
+      if (aFeed.parseItems) {
+        if (aCode != lazy.FeedUtils.kNewsBlogFileError) {
+          aFeed.removeInvalidItems(false);
+        }
+        if (aCode == lazy.FeedUtils.kNewsBlogSuccess && aFeed.mLastModified) {
+          aFeed.lastModified = aFeed.mLastModified;
+        }
+        const ds = lazy.FeedUtils.getItemsDS(aFeed.server);
+        ds.saveSoon();
+        lazy.FeedUtils.log.debug(
+          "Feed.cleanupParsingState: items stored - " + this.itemsStored
+        );
       }
-
-      if (aCode == lazy.FeedUtils.kNewsBlogSuccess && aFeed.mLastModified) {
-        aFeed.lastModified = aFeed.mLastModified;
-      }
-
-      // Flush any feed item changes to disk.
-      const ds = lazy.FeedUtils.getItemsDS(aFeed.server);
-      ds.saveSoon();
-      lazy.FeedUtils.log.debug(
-        "Feed.cleanupParsingState: items stored - " + this.itemsStored
-      );
+    } catch (error) {
+      cleanupError = error;
+      aCode = lazy.FeedUtils.kNewsBlogFileError;
     }
 
-    // Force the xml http request to go away.  This helps reduce some nasty
-    // assertions on shut down.
     this.request = null;
     this.itemsToStore = [];
     this.itemsToStoreIndex = 0;
     this.storeItemsTimer = null;
-
-    if (aFeed.downloadCallback) {
-      aFeed.downloadCallback.downloaded(aFeed, aCode);
+    try {
+      aFeed.downloadCallback?.downloaded(aFeed, aCode);
+    } catch (error) {
+      cleanupError ||= error;
+    }
+    if (cleanupError) {
+      throw primaryError || cleanupError;
     }
   },
 

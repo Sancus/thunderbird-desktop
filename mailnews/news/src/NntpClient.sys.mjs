@@ -10,6 +10,24 @@ import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { LineReader } from "resource:///modules/LineReader.sys.mjs";
 import { NntpNewsGroup } from "resource:///modules/NntpNewsGroup.sys.mjs";
 
+/**
+ * Checks native process admission before starting a news writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "news");
+}
+
 // Server response code.
 const AUTH_ACCEPTED = 281;
 const AUTH_PASSWORD_REQUIRED = 381;
@@ -183,6 +201,7 @@ export class NntpClient {
    * @param {nsINntpIncomingServer} server - The associated server instance.
    */
   constructor(server) {
+    checkMigrationWriterAdmission();
     this._server = server;
     this._reset();
     this._logger = console.createInstance({
@@ -235,6 +254,7 @@ export class NntpClient {
    * Setup failures can then use normal once-only completion without connecting.
    */
   _prepareRequest() {
+    checkMigrationWriterAdmission();
     this.#requestGeneration++;
     this._done = false;
     this._requestPrepared = true;
@@ -244,6 +264,7 @@ export class NntpClient {
    * Initiate a connection to the server
    */
   connect() {
+    checkMigrationWriterAdmission();
     if (!this._requestPrepared) {
       this._prepareRequest();
     }
@@ -281,6 +302,7 @@ export class NntpClient {
    * @returns {nsIMsgMailNewsUrl}
    */
   startRunningUrl(urlListener, msgWindow, runningUri) {
+    checkMigrationWriterAdmission();
     this.urlListener = urlListener;
     this._msgWindow = msgWindow;
     this.runningUri = runningUri;
@@ -343,7 +365,9 @@ export class NntpClient {
     switch (res.status) {
       case AUTH_REQUIRED:
         this._currentGroupName = null;
-        this._actionAuthUser();
+        this._actionAuthUser().catch(error =>
+          this._actionDone(error.result ?? Cr.NS_ERROR_FAILURE)
+        );
         return;
       case SYNTAX_ERROR:
       case SERVICE_UNAVAILABLE:
@@ -624,6 +648,7 @@ export class NntpClient {
    * @param {boolean} getOnlyNew - List only new groups.
    */
   getListOfGroups(getOnlyNew) {
+    checkMigrationWriterAdmission();
     if (!getOnlyNew) {
       this._actionModeReader(this._actionList);
     } else {
@@ -639,6 +664,7 @@ export class NntpClient {
    * @param {boolean} getOld - Get old articles as well.
    */
   getNewNews(groupName, getOld) {
+    checkMigrationWriterAdmission();
     this._currentGroupName = null;
     this._newsFolder = this._getNewsFolder(groupName);
     this._newsGroup = new NntpNewsGroup(this._server, this._newsFolder);
@@ -663,6 +689,7 @@ export class NntpClient {
     binding = null,
     saveOffline = null
   ) {
+    checkMigrationWriterAdmission();
     this._newsFolder = this._server.rootFolder.getChildNamed(groupName);
     this._nextGroupName = this._getNextGroupName(groupName);
     this._articleNumber = articleNumber;
@@ -680,6 +707,7 @@ export class NntpClient {
    * @param {string} messageId - The message id.
    */
   getArticleByMessageId(messageId) {
+    checkMigrationWriterAdmission();
     this._messageId = `<${messageId}>`;
     this._articleNumber = null;
     this._articleBinding = null;
@@ -693,6 +721,7 @@ export class NntpClient {
    * @param {string} groupName - The group name.
    */
   cancelArticle(groupName) {
+    checkMigrationWriterAdmission();
     this._nextGroupName = this._getNextGroupName(groupName);
     this._firstGroupCommand = this.post;
     this._actionModeReader(this._actionGroup);
@@ -706,6 +735,7 @@ export class NntpClient {
    * @param {string[]} xpatLines - An array of xpat lines to send.
    */
   search(groupName, xpatLines) {
+    checkMigrationWriterAdmission();
     this._nextGroupName = this._getNextGroupName(groupName);
     this._xpatLines = xpatLines;
     this._firstGroupCommand = this._actionXPat;
@@ -720,6 +750,7 @@ export class NntpClient {
    * @param {nsIStreamListener} streamListener - The listener for the request.
    */
   loadNewsUrl(uri, msgWindow, streamListener) {
+    checkMigrationWriterAdmission();
     this._logger.debug(`Loading ${uri}`);
     const url = new URL(uri);
     const path = url.pathname.slice(1);
@@ -761,6 +792,7 @@ export class NntpClient {
    * @param {string} groupName - The group to request.
    */
   listgroup(groupName) {
+    checkMigrationWriterAdmission();
     this._actionModeReader(() => {
       this._nextAction = this._actionListgroupResponse;
       this._sendCommand(`LISTGROUP ${groupName}`);
@@ -771,13 +803,16 @@ export class NntpClient {
    * Send `POST` request to the server.
    */
   post() {
+    checkMigrationWriterAdmission();
     const action = () => {
       this._nextAction = this._actionHandlePost;
       this._sendCommand("POST");
     };
     this._currentAction = action;
     if (this._server.pushAuth && !this._authenticated) {
-      this._actionAuthUser();
+      this._actionAuthUser().catch(error =>
+        this._actionDone(error.result ?? Cr.NS_ERROR_FAILURE)
+      );
     } else {
       action();
     }
@@ -842,7 +877,9 @@ export class NntpClient {
       this._nextAction = () => {
         if (this._server.pushAuth && !this._authenticated) {
           this._currentAction = nextAction;
-          this._actionAuthUser();
+          this._actionAuthUser().catch(error =>
+            this._actionDone(error.result ?? Cr.NS_ERROR_FAILURE)
+          );
         } else {
           nextAction();
         }
@@ -1257,6 +1294,7 @@ export class NntpClient {
    * @param {boolean} [forcePrompt=false] - Whether to force showing an auth prompt.
    */
   async _actionAuthUser(forcePrompt = false) {
+    checkMigrationWriterAdmission();
     if (!this._newsFolder) {
       this._newsFolder = this._server.rootFolder.QueryInterface(
         Ci.nsIMsgNewsFolder
@@ -1393,7 +1431,9 @@ export class NntpClient {
           this._newsFolder.groupPassword = "";
         }
         // Retry.
-        this._actionAuthUser();
+        this._actionAuthUser().catch(error =>
+          this._actionDone(error.result ?? Cr.NS_ERROR_FAILURE)
+        );
         return;
       }
       default:

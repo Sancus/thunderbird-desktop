@@ -74,6 +74,7 @@
 #include "nsNetUtil.h"
 #include "nsReadableUtils.h"
 #include "nsThreadUtils.h"
+#include "mozIStorageCompletionCallback.h"
 #include "xpcpublic.h"
 
 using mozilla::LazyLogModule;
@@ -109,6 +110,7 @@ DatabaseCore::DatabaseCore() {
 
 NS_IMETHODIMP
 DatabaseCore::Startup() {
+  MOZ_TRY(CheckMigrationWriter(MigrationWriterDomain::NativeDatabase));
   NS_ENSURE_FALSE(mShuttingDown, NS_ERROR_NOT_AVAILABLE);
   if (sConnection) {
     MOZ_LOG(gPanoramaLog, LogLevel::Error, ("DatabaseCore is already started"));
@@ -189,6 +191,96 @@ DatabaseCore::Observe(nsISupports* aSubject, const char* aTopic,
   return NS_OK;
 }
 
+namespace {
+class MigrationStorageClosed final : public mozIStorageCompletionCallback {
+ public:
+  NS_DECL_ISUPPORTS
+  explicit MigrationStorageClosed(std::function<void(nsresult)> aDone)
+      : mDone(std::move(aDone)) {}
+  NS_IMETHOD Complete(nsresult aResult, nsISupports*) override {
+    NS_ENSURE_TRUE(mDone, NS_ERROR_UNEXPECTED);
+    auto done = std::move(mDone);
+    done(aResult);
+    return NS_OK;
+  }
+
+ private:
+  ~MigrationStorageClosed() = default;
+  std::function<void(nsresult)> mDone;
+};
+NS_IMPL_ISUPPORTS(MigrationStorageClosed, mozIStorageCompletionCallback)
+}  // namespace
+
+RefPtr<MigrationSettlementPromise> DatabaseCore::CloseForMigration(
+    MigrationWriterLease& aLease) {
+  if (NS_FAILED(aLease.ValidateGeneration(aLease.Generation()))) {
+    return MigrationSettlementPromise::CreateAndReject(NS_ERROR_NOT_AVAILABLE,
+                                                       __func__);
+  }
+  // Inspect only the already-created Core; service resolution would open it.
+  RefPtr<DatabaseCore> core = sInstance;
+  if (!core)
+    return MigrationSettlementPromise::CreateAndResolve(true, __func__);
+  if (core->mMigrationCloseResult) return core->mMigrationCloseResult;
+  core->mMigrationCloseResult = core->mMigrationClose.Ensure(__func__);
+  RefPtr<MigrationWriterLease> lease = &aLease;
+  core->mShuttingDown = true;
+  nsTArray<RefPtr<nsIMsgDatabase>> databases;
+  lease->RecordError(core->GetOpenDBs(databases));
+  // IM/LS terminal handoffs precede this method. Their last metadata callbacks
+  // may not run against a retired facade or closed SQLite connection.
+  for (const auto& database : databases) {
+    lease->RecordError(database->ForceClosed());
+  }
+  core->mOpenDatabases.Clear();
+  core->mOpenDatabasesByFile.Clear();
+  for (auto iter = sStatements.Iter(); !iter.Done(); iter.Next()) {
+    lease->RecordError(iter.UserData()->Finalize());
+  }
+  sStatements.Clear();
+  core->mFolderRelocationRecoveries.Clear();
+  core->mFolderDatabase = nullptr;
+  if (core->mMessageDatabase) {
+    core->mMessageDatabase->Shutdown();
+    core->mMessageDatabase = nullptr;
+  }
+  core->mMigrationConnection = sConnection;
+  auto complete = [core, lease](nsresult status) {
+    lease->RecordError(status);
+    if (NS_SUCCEEDED(status)) {
+      core->mMigrationConnection = nullptr;
+      sConnection = nullptr;
+      if (sInstance == core) sInstance = nullptr;
+    }
+    nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+    if (obs)
+      lease->RecordError(obs->RemoveObserver(core, "profile-before-change"));
+    if (NS_FAILED(lease->FirstError())) {
+      core->mMigrationClose.RejectIfExists(lease->FirstError(), __func__);
+    } else {
+      core->mMigrationClose.ResolveIfExists(true, __func__);
+    }
+  };
+  if (!core->mMigrationConnection) {
+    complete(NS_OK);
+  } else {
+    RefPtr<MigrationStorageClosed> closed =
+        new MigrationStorageClosed(complete);
+    nsresult status = core->mMigrationConnection->AsyncClose(closed);
+    if (NS_FAILED(status)) {
+      lease->RecordError(status);
+      // No async close was admitted. Attempt actual safe owned close; retain
+      // the connection and unresolved promise if even that cannot settle it.
+      nsresult cleanup = core->mMigrationConnection->Close();
+      if (NS_SUCCEEDED(cleanup))
+        complete(NS_OK);
+      else
+        lease->RecordError(cleanup);
+    }
+  }
+  return core->mMigrationCloseResult;
+}
+
 /**
  * Ensures a mozIStorageConnection to panorama.sqlite in the profile folder.
  */
@@ -196,6 +288,7 @@ nsresult DatabaseCore::EnsureConnection(bool aAllowNewConnection) {
   if (sConnection) {
     return NS_OK;
   }
+  MOZ_TRY(CheckMigrationWriter(MigrationWriterDomain::NativeDatabase));
   // Only explicit startup may open a connection after native teardown.
   NS_ENSURE_TRUE(aAllowNewConnection && sInstance && !sInstance->mShuttingDown,
                  NS_ERROR_NOT_AVAILABLE);

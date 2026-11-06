@@ -36,6 +36,7 @@ let conversationId = 40000;
  * @returns {Promise<object>} Actual conversation, service and owned cleanup state.
  */
 async function serviceFixture(name) {
+  logs.init();
   const conversation = Object.create(GenericConvIMPrototype);
   conversation._name = "buddy";
   conversation._date = new Date("2022-03-04T12:00:00Z").valueOf() * 1000;
@@ -131,6 +132,72 @@ add_setup(function setupServicePreferences() {
       }
     }
   });
+});
+
+add_task(async function test_archiveStartupDoesNotUseLiveLogger() {
+  const folder = PathUtils.join(
+    PathUtils.profileDir,
+    "logs",
+    "search-test",
+    "s508-service-archive",
+    "buddy"
+  );
+  const path = PathUtils.join(folder, "2022-03-04.120000+0000.json");
+  const file = do_get_profile().clone();
+  file.append("s508-service-archive.sqlite");
+  await IOUtils.makeDirectory(folder, { createAncestors: true });
+  const header = {
+    date: "2022-03-04T12:00:00.000Z",
+    name: "buddy",
+    title: "Stopped archive",
+    account: "s508-service-archive",
+    normalizedName: "buddy",
+    protocol: "search-test",
+    isChat: false,
+  };
+  const record = {
+    date: "2022-03-04T12:00:01.000Z",
+    who: "sender",
+    text: "archivestartupneedle",
+    flags: ["incoming"],
+    remoteId: "retained-first",
+  };
+  await IOUtils.writeUTF8(
+    path,
+    JSON.stringify(header) + "\n" + JSON.stringify(record) + "\n"
+  );
+  let owned;
+  registerCleanupFunction(async () => {
+    await owned?.close();
+    await IOUtils.remove(folder, { recursive: true, ignoreAbsent: true });
+  });
+  const original = logs.forEach;
+  logs.forEach = () => {
+    throw new Error("Stopped archive must not activate the live logger");
+  };
+  try {
+    owned = await ChatSearchService.open(file);
+
+    const page = await owned.search("archivestartupneedle");
+    Assert.equal(
+      page.items.length,
+      1,
+      "The actual stopped physical transcript is searchable"
+    );
+    Assert.equal(
+      page.items[0].id,
+      chatSearchDocumentId(path),
+      "The hit retains the physical path identity"
+    );
+    const text = await owned.getText(page.items[0].id);
+    Assert.ok(
+      text.body.includes("archivestartupneedle"),
+      "The source text survives the archive queue/parser and index"
+    );
+  } finally {
+    logs.forEach = original;
+    await owned?.close();
+  }
 });
 
 add_task(async function test_realAdditionsPersistPhysicalIdentity() {
@@ -374,6 +441,11 @@ add_task(async function test_indexFailureIsNotARejectedSourceFile() {
     );
     await Assert.rejects(f.service.getText(id), error => error === failure);
     Assert.deepEqual(f.errors, [failure]);
+    Assert.strictEqual(
+      f.service.migrationFailures[0],
+      failure,
+      "The owned service retains its first asynchronous storage failure"
+    );
     Assert.ok(
       (await IOUtils.readUTF8(path)).includes("retainedstoragesourceneedle")
     );

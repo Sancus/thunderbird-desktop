@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { clearTimeout, setTimeout } from "resource://gre/modules/Timer.sys.mjs";
 import { enforcePrimaryPassword } from "resource:///modules/PrimaryPassword.sys.mjs";
 import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
@@ -16,6 +17,24 @@ import {
   GenericAccountPrototype,
   GenericAccountBuddyPrototype,
 } from "resource:///modules/jsProtoHelper.sys.mjs";
+
+/**
+ * Checks native process admission before starting a chat writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "chat");
+}
 
 const lazy = {};
 ChromeUtils.defineLazyGetter(
@@ -62,6 +81,7 @@ var SavePrefTimer = {
     }
   },
   initTimer() {
+    checkMigrationWriterAdmission();
     if (!this._timer) {
       this._timer = setTimeout(this.saveNow.bind(this), 5000);
     }
@@ -163,6 +183,7 @@ UnknownAccountBuddy.prototype = GenericAccountBuddyPrototype;
  *  account preferences is used instead.
  */
 function imAccount(aKey, aName, aPrplId) {
+  checkMigrationWriterAdmission();
   if (!aKey.startsWith(kAccountKeyPrefix)) {
     throw Components.Exception(`Invalid key: ${aKey}`, Cr.NS_ERROR_INVALID_ARG);
   }
@@ -445,6 +466,7 @@ imAccount.prototype = {
   timeOfNextReconnect: 0,
   _reconnectTimer: null,
   _startReconnectTimer() {
+    checkMigrationWriterAdmission();
     if (Services.io.offline) {
       console.error("_startReconnectTimer called while offline");
       return;
@@ -484,6 +506,7 @@ imAccount.prototype = {
     }
   },
   set firstConnectionState(aState) {
+    checkMigrationWriterAdmission();
     if (aState == Ci.imIAccount.FIRST_CONNECTION_OK) {
       this.prefBranch.clearUserPref(kPrefAccountFirstConnectionState);
     } else {
@@ -499,6 +522,7 @@ imAccount.prototype = {
 
   _pendingReconnectForConnectionInfoChange: false,
   _connectionInfoChanged() {
+    checkMigrationWriterAdmission();
     // The next connection will be the first connection with these parameters.
     this.firstConnectionState = Ci.imIAccount.FIRST_CONNECTION_UNKNOWN;
 
@@ -561,6 +585,7 @@ imAccount.prototype = {
   },
 
   set alias(val) {
+    checkMigrationWriterAdmission();
     if (val) {
       this.prefBranch.setStringPref(kPrefAccountAlias, val);
     } else {
@@ -642,6 +667,7 @@ imAccount.prototype = {
     this._setPassword(aPassword);
   },
   async _setPassword(password) {
+    checkMigrationWriterAdmission();
     this._password = password;
     if (gUserCanceledPrimaryPasswordPrompt) {
       return;
@@ -709,12 +735,14 @@ imAccount.prototype = {
     return this.prefBranch.getBoolPref(kPrefAccountAutoLogin, true);
   },
   set autoLogin(val) {
+    checkMigrationWriterAdmission();
     this.prefBranch.setBoolPref(kPrefAccountAutoLogin, val);
     SavePrefTimer.initTimer();
     this._sendUpdateNotification();
   },
   _autoLoginPending: false,
   checkAutoLogin() {
+    checkMigrationWriterAdmission();
     // No auto-login if: the account has an error at the imIAccount level
     // (unknown protocol, missing password, first connection crashed),
     // the account is already connected or connecting, or autoLogin is off.
@@ -748,6 +776,7 @@ imAccount.prototype = {
    * Delete the account (from the preferences, mozStorage, and call unInit).
    */
   remove() {
+    checkMigrationWriterAdmission();
     const passwordURI = "im://" + this.protocol.id;
     const username = this.normalizedName;
     if (this.connected || this.connecting) {
@@ -819,6 +848,7 @@ imAccount.prototype = {
     throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
   },
   connect() {
+    checkMigrationWriterAdmission();
     if (!this.prplAccount) {
       throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
     }
@@ -883,6 +913,7 @@ imAccount.prototype = {
               connectionErrorReason == Ci.prplIAccount.ERROR_NETWORK_ERROR ||
               connectionErrorReason == Ci.prplIAccount.ERROR_ENCRYPTION_ERROR)
           ) {
+            checkMigrationWriterAdmission();
             this.prplAccount.connect();
           } else if (this.connected) {
             this.prplAccount.observe(aSubject, aTopic, aData);
@@ -941,12 +972,15 @@ imAccount.prototype = {
     this._cancelReconnection();
   },
   createConversation(aName) {
+    checkMigrationWriterAdmission();
     return this._ensurePrplAccount.createConversation(aName);
   },
   addBuddy(aTag, aName) {
+    checkMigrationWriterAdmission();
     this._ensurePrplAccount.addBuddy(aTag, aName);
   },
   loadBuddy(aBuddy, aTag) {
+    checkMigrationWriterAdmission();
     if (this.prplAccount) {
       return this.prplAccount.loadBuddy(aBuddy, aTag);
     }
@@ -954,6 +988,7 @@ imAccount.prototype = {
     return new UnknownAccountBuddy(this, aBuddy, aTag);
   },
   requestBuddyInfo(aBuddyName) {
+    checkMigrationWriterAdmission();
     this._ensurePrplAccount.requestBuddyInfo(aBuddyName);
   },
   getChatRoomFields() {
@@ -969,9 +1004,11 @@ imAccount.prototype = {
     return this.prplAccount ? this.prplAccount.canJoinChat : false;
   },
   joinChat(aComponents) {
+    checkMigrationWriterAdmission();
     this._ensurePrplAccount.joinChat(aComponents);
   },
   setBool(aName, aVal) {
+    checkMigrationWriterAdmission();
     this.prefBranch.setBoolPref(kAccountOptionPrefPrefix + aName, aVal);
     this._connectionInfoChanged();
     if (this.prplAccount) {
@@ -980,6 +1017,7 @@ imAccount.prototype = {
     SavePrefTimer.initTimer();
   },
   setInt(aName, aVal) {
+    checkMigrationWriterAdmission();
     this.prefBranch.setIntPref(kAccountOptionPrefPrefix + aName, aVal);
     this._connectionInfoChanged();
     if (this.prplAccount) {
@@ -988,6 +1026,7 @@ imAccount.prototype = {
     SavePrefTimer.initTimer();
   },
   setString(aName, aVal) {
+    checkMigrationWriterAdmission();
     this.prefBranch.setStringPref(kAccountOptionPrefPrefix + aName, aVal);
     this._connectionInfoChanged();
     if (this.prplAccount) {
@@ -996,6 +1035,7 @@ imAccount.prototype = {
     SavePrefTimer.initTimer();
   },
   save() {
+    checkMigrationWriterAdmission();
     SavePrefTimer.saveNow();
   },
 
@@ -1039,6 +1079,7 @@ class AccountsService {
   });
 
   initAccounts() {
+    checkMigrationWriterAdmission();
     this._initAutoLoginStatus();
     this._accounts = [];
     this._accountsById = {};
@@ -1098,6 +1139,7 @@ class AccountsService {
    */
   autoLoginStatus = this.AUTOLOGIN.ENABLED;
   _initAutoLoginStatus() {
+    checkMigrationWriterAdmission();
     /* If auto-login is already disabled, do nothing */
     if (this.autoLoginStatus != this.AUTOLOGIN.ENABLED) {
       return;
@@ -1198,6 +1240,7 @@ class AccountsService {
    *   - after a loss of internet connectivity that disconnected all accounts.
    */
   processAutoLogin() {
+    checkMigrationWriterAdmission();
     if (!this._accounts) {
       // if we're already shutting down
       return;
@@ -1273,6 +1316,7 @@ class AccountsService {
    * @returns {imIAccount}
    */
   createAccount(aName, aPrpl) {
+    checkMigrationWriterAdmission();
     // Ensure an account with the same name and protocol doesn't already exist.
     const prpl = IMServices.core.getProtocolById(aPrpl);
     if (!prpl) {
@@ -1317,6 +1361,7 @@ class AccountsService {
    * @param {string} aAccountId
    */
   deleteAccount(aAccountId) {
+    checkMigrationWriterAdmission();
     const account = this.getAccountById(aAccountId);
     if (!account) {
       throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);

@@ -6,6 +6,9 @@
 
 #include "mozilla/Components.h"
 #include "mozilla/StaticPrefs_mail.h"
+#ifdef MOZ_PANORAMA
+#  include "MigrationWriterLease.h"
+#endif
 #include "nsMsgFolderFlags.h"
 #include "nsINewsBlogFeedDownloader.h"
 #include "nsIFile.h"
@@ -20,23 +23,41 @@ NS_IMPL_ISUPPORTS_INHERITED(nsRssIncomingServer, nsMsgIncomingServer,
                             nsIRssIncomingServer, nsIMsgFolderListener,
                             nsILocalMailIncomingServer)
 
-nsRssIncomingServer::nsRssIncomingServer() {
-  m_canHaveFilters = true;
+static nsresult CheckRssMigrationWriterAdmission() {
+#ifdef MOZ_PANORAMA
+  return mozilla::mailnews::CheckMigrationWriter(
+      mozilla::mailnews::MigrationWriterDomain::Rss);
+#else
+  return NS_OK;
+#endif
+}
 
+nsRssIncomingServer::nsRssIncomingServer() { m_canHaveFilters = true; }
+
+nsresult nsRssIncomingServer::Init() {
+  nsresult rv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (mMigrationWriterInitialized) return NS_OK;
+  rv = nsMsgIncomingServer::Init();
+  NS_ENSURE_SUCCESS(rv, rv);
   if (gInstanceCount == 0) {
     nsCOMPtr<nsIMsgFolderNotificationService> notifyService =
         mozilla::components::FolderNotification::Service();
-    notifyService->AddListener(
+    NS_ENSURE_TRUE(notifyService, NS_ERROR_NOT_AVAILABLE);
+    rv = notifyService->AddListener(
         this, nsIMsgFolderNotificationService::folderAdded |
                   nsIMsgFolderNotificationService::folderDeleted |
                   nsIMsgFolderNotificationService::folderMoveCopyCompleted |
                   nsIMsgFolderNotificationService::folderRenamed);
+    NS_ENSURE_SUCCESS(rv, rv);
   }
-
-  gInstanceCount++;
+  ++gInstanceCount;
+  mMigrationWriterInitialized = true;
+  return NS_OK;
 }
 
 nsRssIncomingServer::~nsRssIncomingServer() {
+  if (!mMigrationWriterInitialized) return;
   gInstanceCount--;
 
   if (gInstanceCount == 0) {
@@ -50,6 +71,8 @@ nsRssIncomingServer::~nsRssIncomingServer() {
 
 #ifdef MOZ_PANORAMA
 nsresult nsRssIncomingServer::CreateRootFolder() {
+  nsresult admissionRv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = nsMsgIncomingServer::CreateRootFolder();
   NS_ENSURE_SUCCESS(rv, rv);
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
@@ -65,6 +88,8 @@ nsresult nsRssIncomingServer::CreateRootFolder() {
 
 nsresult nsRssIncomingServer::FillInDataSourcePath(
     const nsAString& aDataSourceName, nsIFile** aLocation) {
+  nsresult admissionRv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv;
   // Get the local path for this server.
   nsCOMPtr<nsIFile> localFile;
@@ -87,11 +112,15 @@ NS_IMETHODIMP nsRssIncomingServer::GetFeedItemsPath(nsIFile** aLocation) {
 }
 
 NS_IMETHODIMP nsRssIncomingServer::CreateDefaultMailboxes() {
+  nsresult admissionRv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   // For Feeds, all we have is Trash.
   return CreateLocalFolder("Trash"_ns, nsMsgFolderFlags::Trash);
 }
 
 NS_IMETHODIMP nsRssIncomingServer::SetFlagsOnDefaultMailboxes() {
+  nsresult admissionRv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsCOMPtr<nsIMsgFolder> rootFolder;
   nsresult rv = GetRootFolder(getter_AddRefs(rootFolder));
   NS_ENSURE_SUCCESS(rv, rv);
@@ -105,6 +134,8 @@ NS_IMETHODIMP nsRssIncomingServer::SetFlagsOnDefaultMailboxes() {
 }
 
 NS_IMETHODIMP nsRssIncomingServer::PerformBiff(nsIMsgWindow* aMsgWindow) {
+  nsresult admissionRv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   // Get the account root (server) folder and pass it on.
   nsCOMPtr<nsIMsgFolder> rootRSSFolder;
   GetRootMsgFolder(getter_AddRefs(rootRSSFolder));
@@ -122,6 +153,8 @@ NS_IMETHODIMP nsRssIncomingServer::GetNewMail(nsIMsgWindow* aMsgWindow,
                                               nsIUrlListener* aUrlListener,
                                               nsIMsgFolder* aFolder,
                                               nsIURI** _retval) {
+  nsresult admissionRv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   // Pass the selected folder on to the downloader.
   if (_retval) {
     *_retval = nullptr;
@@ -226,6 +259,8 @@ NS_IMETHODIMP nsRssIncomingServer::FolderRenamed(nsIMsgFolder* aOrigFolder,
 nsresult nsRssIncomingServer::FolderChanged(nsIMsgFolder* aFolder,
                                             nsIMsgFolder* aOrigFolder,
                                             const char* aAction) {
+  nsresult admissionRv = CheckRssMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   if (!aFolder) return NS_OK;
 
   nsresult rv;

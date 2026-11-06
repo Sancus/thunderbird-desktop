@@ -6,6 +6,24 @@ import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { OAuth2Module } from "resource:///modules/OAuth2Module.sys.mjs";
 
+/**
+ * Checks native process admission before starting a smtp writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "smtp");
+}
+
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   SmtpClient: "resource:///modules/SmtpClient.sys.mjs",
@@ -27,6 +45,7 @@ export class SmtpServer {
   ]);
 
   constructor() {
+    checkMigrationWriterAdmission();
     this._key = "";
     this._loadPrefs();
     this._uri = null;
@@ -93,6 +112,7 @@ export class SmtpServer {
   }
 
   initialize(key) {
+    checkMigrationWriterAdmission();
     if (this._key) {
       throw new Components.Exception(
         `Server already initialized for key ${key}`,
@@ -104,6 +124,7 @@ export class SmtpServer {
   }
 
   get UID() {
+    checkMigrationWriterAdmission();
     const uid = this._prefs.getStringPref("uid", "");
     if (uid) {
       return uid;
@@ -115,6 +136,7 @@ export class SmtpServer {
   }
 
   set UID(uid) {
+    checkMigrationWriterAdmission();
     if (this._prefs.prefHasUserValue("uid")) {
       throw new Components.Exception("uid is already set", Cr.NS_ERROR_ABORT);
     }
@@ -126,6 +148,7 @@ export class SmtpServer {
   }
 
   set description(value) {
+    checkMigrationWriterAdmission();
     this._prefs.setStringPref("description", value);
   }
 
@@ -134,6 +157,7 @@ export class SmtpServer {
   }
 
   set hostname(value) {
+    checkMigrationWriterAdmission();
     if (value.toLowerCase() != this.hostname.toLowerCase()) {
       // Reset password so that users are prompted for new password for the new
       // host.
@@ -147,6 +171,7 @@ export class SmtpServer {
   }
 
   set port(value) {
+    checkMigrationWriterAdmission();
     if (value) {
       this._prefs.setIntPref("port", value);
     } else {
@@ -167,6 +192,7 @@ export class SmtpServer {
   }
 
   set username(value) {
+    checkMigrationWriterAdmission();
     if (value != this.username) {
       // Reset password so that users are prompted for new password for the new
       // username.
@@ -183,6 +209,7 @@ export class SmtpServer {
   }
 
   set clientid(value) {
+    checkMigrationWriterAdmission();
     if (this.clientidEnabled) {
       this._setCharPref("clientid", value);
     }
@@ -197,6 +224,7 @@ export class SmtpServer {
   }
 
   set clientidEnabled(value) {
+    checkMigrationWriterAdmission();
     this._prefs.setBoolPref("clientidEnabled", value);
   }
 
@@ -208,6 +236,7 @@ export class SmtpServer {
   }
 
   set authMethod(value) {
+    checkMigrationWriterAdmission();
     this._prefs.setIntPref("authMethod", value);
   }
 
@@ -216,6 +245,7 @@ export class SmtpServer {
   }
 
   set socketType(value) {
+    checkMigrationWriterAdmission();
     this._prefs.setIntPref("try_ssl", value);
   }
 
@@ -267,6 +297,7 @@ export class SmtpServer {
    * remains in place if needed in the future.
    */
   get maximumConnectionsNumber() {
+    checkMigrationWriterAdmission();
     const maxConnections = this._getIntPrefWithDefault(
       "max_cached_connections",
       1
@@ -276,10 +307,12 @@ export class SmtpServer {
   }
 
   set maximumConnectionsNumber(value) {
+    checkMigrationWriterAdmission();
     this._prefs.setIntPref("max_cached_connections", value);
   }
 
   get password() {
+    checkMigrationWriterAdmission();
     if (this._password) {
       return this._password;
     }
@@ -334,10 +367,12 @@ export class SmtpServer {
   }
 
   set password(password) {
+    checkMigrationWriterAdmission();
     this._password = password;
   }
 
   getPasswordWithUI(promptMessage, promptTitle) {
+    checkMigrationWriterAdmission();
     // This prompt has a checkbox for saving password.
     const authPrompt = Cc["@mozilla.org/messenger/msgAuthPrompt;1"].getService(
       Ci.nsIAuthPrompt
@@ -388,6 +423,7 @@ export class SmtpServer {
   }
 
   forgetPassword() {
+    checkMigrationWriterAdmission();
     let finished = false;
     this.#forgetPasswordInternal().finally(() => (finished = true));
     Services.tm.spinEventLoopUntilOrQuit(
@@ -426,6 +462,7 @@ export class SmtpServer {
   }
 
   verifyLogon(urlListener) {
+    checkMigrationWriterAdmission();
     const client = new lazy.SmtpClient(this);
     client.connect();
     client.onerror = (nsError, errorMessage, secInfo) => {
@@ -444,6 +481,7 @@ export class SmtpServer {
   }
 
   clearAllValues() {
+    checkMigrationWriterAdmission();
     for (const prefName of this._prefs.getChildList("")) {
       this._prefs.clearUserPref(prefName);
     }
@@ -453,6 +491,7 @@ export class SmtpServer {
    * @returns {string}
    */
   async _getPasswordWithoutUI() {
+    checkMigrationWriterAdmission();
     const serverURI = this._getServerURISpec();
     const logins = await Services.logins.searchLoginsAsync({
       origin: serverURI,
@@ -492,6 +531,7 @@ export class SmtpServer {
    * Get the associated pref branch and the default SMTP server branch.
    */
   _loadPrefs() {
+    checkMigrationWriterAdmission();
     this._prefs = Services.prefs.getBranch(`mail.smtpserver.${this._key}.`);
     this._defaultPrefs = Services.prefs.getBranch("mail.smtpserver.default.");
   }
@@ -503,6 +543,7 @@ export class SmtpServer {
    * @param {string} value - The preference value.
    */
   _setCharPref(name, value) {
+    checkMigrationWriterAdmission();
     if (value) {
       this._prefs.setCharPref(name, value);
     } else {
@@ -517,6 +558,7 @@ export class SmtpServer {
    * @param {string} value - The preference value.
    */
   _setStringPref(name, value) {
+    checkMigrationWriterAdmission();
     if (value) {
       this._prefs.setStringPref(name, value);
     } else {
@@ -584,6 +626,7 @@ export class SmtpServer {
    * @returns {SmtpClient}
    */
   async _getNextClient() {
+    checkMigrationWriterAdmission();
     // The newest connection is the least likely to have timed out.
     let client = this._freeConnections.pop();
     if (client) {
@@ -648,7 +691,16 @@ export class SmtpServer {
     messageId,
     listener
   ) {
+    checkMigrationWriterAdmission();
     const client = await this._getNextClient();
+    try {
+      checkMigrationWriterAdmission();
+    } catch (error) {
+      this._busyConnections = this._busyConnections.filter(c => c != client);
+      this._freeConnections.push(client);
+      this._connectionWaitingQueue.shift()?.();
+      throw error;
+    }
     const { resolve, promise } = Promise.withResolvers();
     let requestCancelled = false;
     let stopNotified = false;

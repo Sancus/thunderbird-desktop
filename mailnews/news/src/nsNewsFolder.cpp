@@ -45,6 +45,7 @@
 
 #ifdef MOZ_PANORAMA
 #  include "DatabaseCore.h"
+#  include "MigrationWriterLease.h"
 #  include "FolderDatabase.h"
 #  include "PerFolderDatabase.h"
 #  include "../../local/src/nsLocalUtils.h"
@@ -285,6 +286,15 @@ NS_IMETHODIMP nsMsgNewsFolder::NativeDownload::OnStopRunningUrl(
 }
 #endif
 
+nsresult nsMsgNewsFolder::CheckMigrationWriterAdmission() {
+#ifdef MOZ_PANORAMA
+  return mozilla::mailnews::CheckMigrationWriter(
+      mozilla::mailnews::MigrationWriterDomain::News);
+#else
+  return NS_OK;
+#endif
+}
+
 nsMsgNewsFolder::nsMsgNewsFolder(void)
     : mExpungedBytes(0),
       mGettingNews(false),
@@ -326,6 +336,8 @@ NS_IMETHODIMP nsMsgNewsFolder::QueryInterface(REFNSIID aIID,
 ////////////////////////////////////////////////////////////////////////////////
 
 nsresult nsMsgNewsFolder::CreateSubFolders(nsIFile* path) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv;
   bool isNewsServer = false;
   rv = GetIsServer(&isNewsServer);
@@ -348,6 +360,8 @@ nsresult nsMsgNewsFolder::CreateSubFolders(nsIFile* path) {
 NS_IMETHODIMP
 nsMsgNewsFolder::AddNewsgroup(const nsACString& name, const nsACString& setStr,
                               nsIMsgFolder** child) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   NS_ENSURE_ARG_POINTER(child);
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
@@ -410,6 +424,8 @@ nsresult nsMsgNewsFolder::AddNewsgroupWithFolderId(const nsACString& name,
                                                    const nsACString& setStr,
                                                    nsIMsgFolder** child,
                                                    bool passive) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   *child = nullptr;
   NS_ENSURE_STATE(mFolderId);
   NS_ENSURE_ARG(!name.IsEmpty());
@@ -480,6 +496,8 @@ nsresult nsMsgNewsFolder::AddDirectorySeparator(nsIFile* path) {
 
 NS_IMETHODIMP
 nsMsgNewsFolder::GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   if (!mInitialized) {
     // do this first, so we make sure to do it, even on failure.
     // see bug #70494
@@ -513,6 +531,8 @@ nsMsgNewsFolder::GetSubFolders(nsTArray<RefPtr<nsIMsgFolder>>& folders) {
 // Makes sure the database is open and exists.  If the database is valid then
 // returns NS_OK.  Otherwise returns a failure error value.
 nsresult nsMsgNewsFolder::GetDatabase() {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     return GetNativeDatabase();
@@ -623,6 +643,8 @@ nsresult nsMsgNewsFolder::GetDatabase() {
 
 NS_IMETHODIMP
 nsMsgNewsFolder::UpdateFolder(nsIMsgWindow* aWindow) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   // Get news.get_messages_on_select pref
 
   // Only if news.get_messages_on_select is true do we get new messages
@@ -718,6 +740,8 @@ NS_IMETHODIMP nsMsgNewsFolder::SetNewsrcHasChanged(bool newsrcHasChanged) {
 
 NS_IMETHODIMP nsMsgNewsFolder::CreateSubfolder(const nsACString& newsgroupName,
                                                nsIMsgWindow* msgWindow) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = NS_OK;
   if (newsgroupName.IsEmpty()) return NS_MSG_ERROR_INVALID_FOLDER_NAME;
 
@@ -750,6 +774,8 @@ NS_IMETHODIMP nsMsgNewsFolder::CreateSubfolder(const nsACString& newsgroupName,
 }
 
 NS_IMETHODIMP nsMsgNewsFolder::DeleteStorage() {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = nsMsgDBFolder::DeleteStorage();
   NS_ENSURE_SUCCESS(rv, rv);
 
@@ -871,6 +897,8 @@ nsresult nsMsgNewsFolder::AbbreviatePrettyName(nsAString& prettyName,
 
 NS_IMETHODIMP
 nsMsgNewsFolder::GetMsgDatabase(nsIMsgDatabase** database) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     NS_ENSURE_ARG_POINTER(database);
@@ -912,6 +940,8 @@ nsMsgNewsFolder::SetMsgDatabase(nsIMsgDatabase* database) {
 NS_IMETHODIMP
 nsMsgNewsFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
                                       nsIMsgDatabase** db) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   NS_ENSURE_ARG_POINTER(folderInfo);
   NS_ENSURE_ARG_POINTER(db);
 #ifdef MOZ_PANORAMA
@@ -945,6 +975,8 @@ nsMsgNewsFolder::GetDBFolderInfoAndDB(nsIDBFolderInfo** folderInfo,
 
 #ifdef MOZ_PANORAMA
 nsresult nsMsgNewsFolder::GetNativeDatabase() {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   if (mDatabase) {
     nsresult rv;
     RefPtr<mozilla::mailnews::PerFolderDatabase> native =
@@ -971,6 +1003,8 @@ nsresult nsMsgNewsFolder::GetNativeDatabase() {
 }
 
 nsresult nsMsgNewsFolder::InitializeNativeDatabase(nsIMsgDatabase* candidate) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   NS_ENSURE_ARG(candidate);
   nsCOMPtr<nsIMsgDatabase> database = candidate;
   nsresult rv;
@@ -1073,6 +1107,8 @@ void nsMsgNewsFolder::DetachNativeReadSet() {
 }
 
 nsresult nsMsgNewsFolder::ApplyNativeReadRange(int32_t first, int32_t last) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   MOZ_TRY(GetDatabase());
   RefPtr<nsMsgKeySet> owner = mReadSet;
   NS_ENSURE_TRUE(owner, NS_ERROR_NOT_AVAILABLE);
@@ -1110,6 +1146,8 @@ nsresult nsMsgNewsFolder::ApplyNativeReadRange(int32_t first, int32_t last) {
 NS_IMETHODIMP
 nsMsgNewsFolder::UpdateSummaryFromNNTPInfo(int32_t oldest, int32_t youngest,
                                            int32_t total) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   NS_ENSURE_STATE(mReadSet);
   bool dbWasOpen = mDatabase != nullptr;
 #ifdef MOZ_PANORAMA
@@ -1244,6 +1282,8 @@ nsMsgNewsFolder::DeleteMessages(nsTArray<RefPtr<nsIMsgDBHdr>> const& msgHdrs,
                                 bool isMove,
                                 nsIMsgCopyServiceListener* listener,
                                 bool allowUndo) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = NS_OK;
   NS_ENSURE_ARG_POINTER(aMsgWindow);
 
@@ -1284,6 +1324,8 @@ nsMsgNewsFolder::DeleteMessages(nsTArray<RefPtr<nsIMsgDBHdr>> const& msgHdrs,
 NS_IMETHODIMP nsMsgNewsFolder::CancelMessage(nsIMsgDBHdr* msgHdr,
                                              nsIUrlListener* aUrlListener,
                                              nsIMsgWindow* aMsgWindow) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   NS_ENSURE_ARG_POINTER(msgHdr);
 
   nsresult rv;
@@ -1341,6 +1383,8 @@ NS_IMETHODIMP nsMsgNewsFolder::GetNextNMessages(nsIMsgWindow* aMsgWindow) {
 nsresult nsMsgNewsFolder::GetNewsMessages(nsIMsgWindow* aMsgWindow,
                                           bool aGetOld,
                                           nsIUrlListener* aUrlListener) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = NS_OK;
 
   nsCOMPtr<nsINntpService> nntpService =
@@ -1377,6 +1421,8 @@ nsresult nsMsgNewsFolder::GetNewsMessages(nsIMsgWindow* aMsgWindow,
 }
 
 nsresult nsMsgNewsFolder::LoadNewsrcFileAndCreateNewsgroups() {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = NS_OK;
   if (!mNewsrcFilePath) return NS_ERROR_FAILURE;
 
@@ -1498,6 +1544,8 @@ NS_IMETHODIMP nsMsgNewsFolder::GetGroupUsername(nsACString& aGroupUsername) {
 
 NS_IMETHODIMP nsMsgNewsFolder::SetGroupUsername(
     const nsACString& aGroupUsername) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   mGroupUsername = aGroupUsername;
   return NS_OK;
 }
@@ -1509,6 +1557,8 @@ NS_IMETHODIMP nsMsgNewsFolder::GetGroupPassword(nsACString& aGroupPassword) {
 
 NS_IMETHODIMP nsMsgNewsFolder::SetGroupPassword(
     const nsACString& aGroupPassword) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   mGroupPassword = aGroupPassword;
   return NS_OK;
 }
@@ -1639,6 +1689,8 @@ nsMsgNewsFolder::GetNewsrcLine(nsACString& newsrcLine) {
 #ifdef MOZ_PANORAMA
 nsresult nsMsgNewsFolder::SetNativeReadSetFromStr(const nsACString& ranges,
                                                   bool passive) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   // Reject overflow before the legacy signed parser changes range meaning.
   mozilla::CheckedInt<int32_t> article = 0;
   for (uint32_t i = 0; i < ranges.Length(); ++i) {
@@ -1701,6 +1753,8 @@ nsresult nsMsgNewsFolder::SetNativeReadSetFromStr(const nsACString& ranges,
 #endif
 
 NS_IMETHODIMP nsMsgNewsFolder::SetReadSetFromStr(const nsACString& newsrcLine) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     return SetNativeReadSetFromStr(newsrcLine, false);
@@ -1766,6 +1820,8 @@ nsMsgNewsFolder::GetNntpServer(nsINntpIncomingServer** result) {
 // this gets called after the message actually gets cancelled
 // it removes the cancelled message from the db
 NS_IMETHODIMP nsMsgNewsFolder::RemoveMessage(nsMsgKey key) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = GetDatabase();
   NS_ENSURE_SUCCESS(rv,
                     rv);  // if GetDatabase succeeds, mDatabase will be non-null
@@ -1783,6 +1839,8 @@ NS_IMETHODIMP nsMsgNewsFolder::RemoveMessage(nsMsgKey key) {
 
 NS_IMETHODIMP nsMsgNewsFolder::RemoveMessages(
     const nsTArray<nsMsgKey>& aMsgKeys) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = GetDatabase();
   NS_ENSURE_SUCCESS(rv,
                     rv);  // if GetDatabase succeeds, mDatabase will be non-null
@@ -1848,6 +1906,8 @@ NS_IMETHODIMP nsMsgNewsFolder::SetSaveArticleOffline(bool aBool) {
 
 NS_IMETHODIMP nsMsgNewsFolder::DownloadAllForOffline(nsIUrlListener* listener,
                                                      nsIMsgWindow* msgWindow) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
 #ifdef MOZ_PANORAMA
   if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
     NS_ENSURE_FALSE(mNativeDownload, NS_ERROR_IN_PROGRESS);
@@ -1872,6 +1932,8 @@ NS_IMETHODIMP nsMsgNewsFolder::DownloadAllForOffline(nsIUrlListener* listener,
 
 NS_IMETHODIMP nsMsgNewsFolder::DownloadMessagesForOffline(
     nsTArray<RefPtr<nsIMsgDBHdr>> const& messages, nsIMsgWindow* msgWindow) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   nsresult rv = NS_OK;
 
   nsTArray<nsMsgKey> srcKeyArray(messages.Length());
@@ -2064,6 +2126,8 @@ NS_IMETHODIMP nsMsgNewsFolder::NotifyFinishedDownloadinghdrs() {
 
 NS_IMETHODIMP
 nsMsgNewsFolder::ApplyRetentionSettings() {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   return nsMsgDBFolder::ApplyRetentionSettings(false);
 }
 
@@ -2138,6 +2202,8 @@ nsMsgNewsFolder::SetFilterList(nsIMsgFilterList* aFilterList) {
 NS_IMETHODIMP
 nsMsgNewsFolder::GetFilterList(nsIMsgWindow* aMsgWindow,
                                nsIMsgFilterList** aResult) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   if (mIsServer) {
     nsCOMPtr<nsIMsgIncomingServer> server;
     nsresult rv = GetServer(getter_AddRefs(server));
@@ -2187,6 +2253,8 @@ nsMsgNewsFolder::GetFilterList(nsIMsgWindow* aMsgWindow,
 NS_IMETHODIMP
 nsMsgNewsFolder::GetEditableFilterList(nsIMsgWindow* aMsgWindow,
                                        nsIMsgFilterList** aResult) {
+  nsresult admissionRv = CheckMigrationWriterAdmission();
+  NS_ENSURE_SUCCESS(admissionRv, admissionRv);
   // We don't support pluggable filter list types for news.
   return GetFilterList(aMsgWindow, aResult);
 }

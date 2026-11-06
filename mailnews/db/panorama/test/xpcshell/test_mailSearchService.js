@@ -519,6 +519,11 @@ add_task(async function test_backgroundRetriesAfterTransientReplayFailure() {
     "Background replay resumes without an unrelated mail notification"
   );
   Assert.deepEqual(reports, [failure], "The original error remains reportable");
+  Assert.strictEqual(
+    service.migrationFailures[0],
+    failure,
+    "Successful retry cannot erase the original rejected writer operation"
+  );
   Assert.equal(progress[0].acceptedThrough, 0);
   Assert.equal(progress[0].sourceWatermark, 0);
   Assert.equal(progress[0].moreWork, false);

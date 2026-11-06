@@ -2,6 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import {
+  openSearchWriter,
+  waitForSearchWriter,
+  recordSearchWriterFailure,
+} from "resource:///modules/panorama/SearchMigrationHold.sys.mjs";
+
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 
 const lazy = {};
@@ -25,67 +31,80 @@ let current = null;
  * @returns {Promise<MailSearchService>} Shared service; close through closeMailSearch.
  * @throws {Error} If opening or native identity lookup fails, or shutdown has started.
  */
-export async function getMailSearchService() {
-  if (Services.startup.shuttingDown) {
-    throw Components.Exception(
-      "Mail search is shutting down",
-      Cr.NS_ERROR_NOT_AVAILABLE
-    );
-  }
-  // Account manager initialization registers and starts the native backend.
-  MailServices.accounts;
-  const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
-    Ci.nsIMsgDBService
-  );
-  if (!("nsIDatabaseCore" in Ci) || !(backend instanceof Ci.nsIDatabaseCore)) {
-    throw Components.Exception(
-      "Panorama search requires the active native database",
-      Cr.NS_ERROR_NOT_AVAILABLE
-    );
-  }
-  const core = backend.QueryInterface(Ci.nsIDatabaseCore);
-  const sourceId = core.sourceId;
-  if (typeof sourceId != "string" || !sourceId) {
-    throw Components.Exception(
-      "Native search identity is required",
-      Cr.NS_ERROR_NOT_AVAILABLE
-    );
-  }
-  if (current) {
-    if (current.sourceId != sourceId || current.closePromise) {
-      throw Components.Exception(
-        "Mail search core changed or is closing",
-        Cr.NS_ERROR_NOT_AVAILABLE
-      );
-    }
-    return current.promise;
-  }
-  const file = Services.dirsvc.get("ProfD", Ci.nsIFile).clone();
-  // sourceId is a UUID validated by the native getter, not a path-derived ID.
-  file.append("panorama-search-" + sourceId + ".sqlite");
-  current = {
-    sourceId,
-    promise: lazy.MailSearchService.open(file, sourceId, core.messageDB).then(
-      async service => {
-        try {
-          service.start();
-          return service;
-        } catch (error) {
-          try {
-            await service.close();
-          } catch (closeError) {
-            throw new AggregateError(
-              [error, closeError],
-              "Mail search start and close failed"
-            );
-          }
-          throw error;
-        }
+export function getMailSearchService(migrationWork = null) {
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      if (Services.startup.shuttingDown) {
+        throw Components.Exception(
+          "Mail search is shutting down",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
       }
-    ),
-    closePromise: null,
-  };
-  return current.promise;
+      // Account manager initialization registers and starts the native backend.
+      MailServices.accounts;
+      const backend = Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
+        Ci.nsIMsgDBService
+      );
+      if (
+        !("nsIDatabaseCore" in Ci) ||
+        !(backend instanceof Ci.nsIDatabaseCore)
+      ) {
+        throw Components.Exception(
+          "Panorama search requires the active native database",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      }
+      const core = backend.QueryInterface(Ci.nsIDatabaseCore);
+      const sourceId = core.sourceId;
+      if (typeof sourceId != "string" || !sourceId) {
+        throw Components.Exception(
+          "Native search identity is required",
+          Cr.NS_ERROR_NOT_AVAILABLE
+        );
+      }
+      if (current?.service?.closed) {
+        current = null;
+      }
+      if (current) {
+        if (current.sourceId != sourceId || current.closePromise) {
+          throw Components.Exception(
+            "Mail search core changed or is closing",
+            Cr.NS_ERROR_NOT_AVAILABLE
+          );
+        }
+        return current.promise;
+      }
+      const file = Services.dirsvc.get("ProfD", Ci.nsIFile).clone();
+      // sourceId is a UUID validated by the native getter, not a path-derived ID.
+      file.append("panorama-search-" + sourceId + ".sqlite");
+      current = {
+        sourceId,
+        promise: lazy.MailSearchService.open(
+          file,
+          sourceId,
+          core.messageDB,
+          work
+        ).then(async service => {
+          try {
+            service.start(work);
+            current.service = service;
+            return service;
+          } catch (error) {
+            try {
+              await service.close();
+            } catch (closeError) {
+              recordSearchWriterFailure("mail-search", closeError);
+            }
+            throw error;
+          }
+        }),
+        closePromise: null,
+      };
+      return current.promise;
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -126,23 +145,38 @@ export async function closeMailSearch() {
  * @param {AbortSignal} [options.signal] - Prevent opening after cancellation.
  * @returns {Promise<object>} Existing mail3PaneTab; captured members finish delivery before return.
  */
-export async function openDefaultMailSearchList(
+export function openDefaultMailSearchList(
   tabmail,
   text,
-  { signal, selection = null, ...options } = {}
+  { signal, selection = null, ...options } = {},
+  migrationWork = null
 ) {
-  signal?.throwIfAborted();
-  const service = await getMailSearchService();
-  const resultSet = selection
-    ? await service.collectResults(text, { ...options, selection, signal })
-    : null;
-  signal?.throwIfAborted();
-  return resultSet
-    ? lazy.openMailSearchResultsList(tabmail, service, resultSet, {
-        ...options,
-        signal,
-      })
-    : lazy.openMailSearchList(tabmail, service, text, options);
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      signal?.throwIfAborted();
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      const resultSet = selection
+        ? await waitForSearchWriter(work, () =>
+            service.collectResults(
+              text,
+              { ...options, selection, signal },
+              work
+            )
+          )
+        : null;
+      signal?.throwIfAborted();
+      return resultSet
+        ? lazy.openMailSearchResultsList(tabmail, service, resultSet, {
+            ...options,
+            signal,
+          })
+        : lazy.openMailSearchList(tabmail, service, text, options);
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -153,10 +187,18 @@ export async function openDefaultMailSearchList(
  * @param {object} [options] - MailSearchService.collectResults controls.
  * @returns {Promise<MailSearchResultSet>} Physical query members and metadata.
  */
-export async function findMailSearchResults(text, options) {
-  options?.signal?.throwIfAborted();
-  const service = await getMailSearchService();
-  return service.collectResults(text, options);
+export function findMailSearchResults(text, options, migrationWork = null) {
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      options?.signal?.throwIfAborted();
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      return service.collectResults(text, options, work);
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -173,18 +215,27 @@ export async function findMailSearchResults(text, options) {
  * @returns {Promise<object>} Existing mail3PaneTab after complete initial delivery.
  * @throws {Error} If captured membership changed or delivery failed.
  */
-export async function openDefaultMailSearchResultsList(
+export function openDefaultMailSearchResultsList(
   tabmail,
   resultSet,
-  { signal, ...options } = {}
+  { signal, ...options } = {},
+  migrationWork = null
 ) {
-  signal?.throwIfAborted();
-  const service = await getMailSearchService();
-  signal?.throwIfAborted();
-  return lazy.openMailSearchResultsList(tabmail, service, resultSet, {
-    ...options,
-    signal,
-  });
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      signal?.throwIfAborted();
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      signal?.throwIfAborted();
+      return lazy.openMailSearchResultsList(tabmail, service, resultSet, {
+        ...options,
+        signal,
+      });
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -196,10 +247,18 @@ export async function openDefaultMailSearchResultsList(
  * @returns {Promise<{sourceId: ?string, acceptedThrough: number, pending: number,
  *   unavailable: number}>} Durable unfinished-work counts and checkpoint.
  */
-export async function retryUnavailableMailSearch(options) {
-  options?.signal?.throwIfAborted();
-  const service = await getMailSearchService();
-  return service.retryUnavailable(options);
+export function retryUnavailableMailSearch(options, migrationWork = null) {
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      options?.signal?.throwIfAborted();
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      return service.retryUnavailable(options, work);
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -210,10 +269,22 @@ export async function retryUnavailableMailSearch(options) {
  * @param {object} [options] - resolveAttachment controls, including allowDownload.
  * @returns {Promise<MailSearchAttachmentResolution>} Fresh details or a non-ready status.
  */
-export async function resolveMailSearchAttachment(request, options) {
-  options?.signal?.throwIfAborted();
-  const service = await getMailSearchService();
-  return service.resolveAttachment(request, options);
+export function resolveMailSearchAttachment(
+  request,
+  options,
+  migrationWork = null
+) {
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      options?.signal?.throwIfAborted();
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      return service.resolveAttachment(request, options, work);
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -223,10 +294,22 @@ export async function resolveMailSearchAttachment(request, options) {
  * @param {object} options - Existing browsingContext, permission and signal.
  * @returns {Promise<MailSearchAttachmentResolution>} Dispatched or non-ready status.
  */
-export async function openMailSearchAttachment(request, options) {
-  options?.signal?.throwIfAborted();
-  const service = await getMailSearchService();
-  return service.openAttachment(request, options);
+export function openMailSearchAttachment(
+  request,
+  options,
+  migrationWork = null
+) {
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      options?.signal?.throwIfAborted();
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      return service.openAttachment(request, options, work);
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -239,14 +322,26 @@ export async function openMailSearchAttachment(request, options) {
  * @param {AbortSignal} [options.signal] - Prevent query/delivery after cancellation.
  * @returns {Promise<MailSearchConversationSnapshot|{status: string}>} Snapshot or non-ready status.
  */
-export async function getMailSearchConversation(request, { signal } = {}) {
-  signal?.throwIfAborted();
-  request = {
-    ...request,
-    location: request?.location && { ...request.location },
-  };
-  const service = await getMailSearchService();
-  return service.getConversation(request, { signal });
+export function getMailSearchConversation(
+  request,
+  { signal } = {},
+  migrationWork = null
+) {
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      signal?.throwIfAborted();
+      request = {
+        ...request,
+        location: request?.location && { ...request.location },
+      };
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      return service.getConversation(request, { signal }, work);
+    },
+    migrationWork
+  );
 }
 
 /**
@@ -259,8 +354,20 @@ export async function getMailSearchConversation(request, { signal } = {}) {
  * @param {AbortSignal} [options.signal] - Cancel this completion only.
  * @returns {Promise<{sourceId: string, items: MailSearchCompletion[]}>} Typed choices.
  */
-export async function completeMailSearch(text, { limit = 20, signal } = {}) {
-  signal?.throwIfAborted();
-  const service = await getMailSearchService();
-  return service.complete(text, { limit, signal });
+export function completeMailSearch(
+  text,
+  { limit = 20, signal } = {},
+  migrationWork = null
+) {
+  return openSearchWriter(
+    "mail-search",
+    async work => {
+      signal?.throwIfAborted();
+      const service = await waitForSearchWriter(work, () =>
+        getMailSearchService(work)
+      );
+      return service.complete(text, { limit, signal }, work);
+    },
+    migrationWork
+  );
 }

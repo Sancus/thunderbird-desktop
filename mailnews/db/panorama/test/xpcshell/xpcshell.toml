@@ -41,6 +41,8 @@ skip-if = ["os == 'win'"]
 # Native retained Windows import/activation remains a separate held composition.
 skip-if = ["os == 'win'"]
 
+["test_MigrationQuiescence.js"]
+
 ["test_MigrationRecovery.js"]
 
 ["test_MigrationWindowsImport.js"]
@@ -214,6 +216,8 @@ support-files = [
 ["test_searchMimeRetrieval.js"]
 
 ["test_searchMimeTypes.js"]
+
+["test_searchMigrationHold.js"]
 
 ["test_searchOffsets.js"]
 

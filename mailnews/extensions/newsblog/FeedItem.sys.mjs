@@ -2,8 +2,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
 import { MailServices } from "resource:///modules/MailServices.sys.mjs";
 import { MailStringUtils } from "resource:///modules/MailStringUtils.sys.mjs";
+
+/**
+ * Checks native process admission before starting an RSS writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate.QueryInterface(Ci.nsIPropertyBag2).getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  gate.observe(subject, "check-writer-admission", "rss");
+}
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
@@ -11,6 +30,7 @@ ChromeUtils.defineESModuleGetters(lazy, {
 });
 
 export function FeedItem() {
+  checkMigrationWriterAdmission();
   this.mDate = lazy.FeedUtils.getValidRFC5322Date();
   this.mParserUtils = Cc["@mozilla.org/parserutils;1"].getService(
     Ci.nsIParserUtils
@@ -105,6 +125,7 @@ FeedItem.prototype = {
    * @returns {void}
    */
   store() {
+    checkMigrationWriterAdmission();
     // this.title and this.content contain HTML.
     // this.mUrl and this.contentBase contain plain text.
 
@@ -148,6 +169,7 @@ FeedItem.prototype = {
   },
 
   findStoredResource() {
+    checkMigrationWriterAdmission();
     // Checks to see if the item has already been stored in its feed's
     // message folder.
     lazy.FeedUtils.log.trace(
@@ -181,6 +203,7 @@ FeedItem.prototype = {
   },
 
   markValid(resource) {
+    checkMigrationWriterAdmission();
     resource.lastSeenTime = new Date().getTime();
     // Items can be in multiple feeds.
     if (!resource.feedURLs.includes(this.feed.url)) {
@@ -190,6 +213,7 @@ FeedItem.prototype = {
   },
 
   markStored(resource) {
+    checkMigrationWriterAdmission();
     // Items can be in multiple feeds.
     if (!resource.feedURLs.includes(this.feed.url)) {
       resource.feedURLs.push(this.feed.url);
@@ -198,6 +222,7 @@ FeedItem.prototype = {
   },
 
   writeToFolder() {
+    checkMigrationWriterAdmission();
     lazy.FeedUtils.log.trace(
       "FeedItem.writeToFolder: " +
         this.identity +
@@ -379,6 +404,7 @@ FeedItem.prototype = {
    * @returns {string[]} The tag keys.
    */
   getTagKeys(aKeywords) {
+    checkMigrationWriterAdmission();
     const category = this.feed.options.category;
     if (!aKeywords.length || !category.enabled) {
       return [];

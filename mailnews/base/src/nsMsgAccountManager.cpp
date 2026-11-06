@@ -7,6 +7,9 @@
  */
 
 #include "nsMsgAccountManager.h"
+#ifdef MOZ_PANORAMA
+#  include "MigrationWriterLease.h"
+#endif
 
 #include "nsCOMPtr.h"
 #include "nsISupports.h"
@@ -102,6 +105,10 @@ using mozilla::Preferences;
 
 const char* kSearchFolderUriProp = "searchFolderUri";
 
+#ifdef MOZ_PANORAMA
+static nsTArray<nsMsgAccountManager*> sMigrationAccountManagers;
+#endif
+
 bool nsMsgAccountManager::m_haveShutdown = false;
 bool nsMsgAccountManager::m_shutdownInProgress = false;
 
@@ -120,6 +127,9 @@ nsMsgAccountManager::nsMsgAccountManager()
       m_lastUniqueServerKey(1) {}
 
 nsMsgAccountManager::~nsMsgAccountManager() {
+#ifdef MOZ_PANORAMA
+  sMigrationAccountManagers.RemoveElement(this);
+#endif
   if (!m_haveShutdown) {
     // Don't remove from Observer service in Shutdown because Shutdown also gets
     // called from xpcom shutdown observer.  And we don't want to remove from
@@ -153,6 +163,10 @@ static nsCOMPtr<nsIAsyncShutdownClient> GetProfileBeforeChange() {
 }
 
 nsresult nsMsgAccountManager::Init() {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckMigrationWriter(
+      mozilla::mailnews::MigrationWriterDomain::Account));
+#endif
   AUTO_PROFILER_LABEL("nsMsgAccountManager::Init", MAILNEWS);
   if (!XRE_IsParentProcess()) {
     return NS_ERROR_NOT_AVAILABLE;
@@ -196,6 +210,12 @@ nsresult nsMsgAccountManager::Init() {
   GetProfileBeforeChange()->AddBlocker(
       this, NS_LITERAL_STRING_FROM_CSTRING(__FILE__), __LINE__,
       u"nsMsgAccountManager shutdown"_ns);
+
+#ifdef MOZ_PANORAMA
+  (void)NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
+                               getter_AddRefs(mMigrationProfile));
+  sMigrationAccountManagers.AppendElement(this);
+#endif
 
   // Make sure PSM gets initialized before any accounts use certificates.
   net_EnsurePSMInit();
@@ -803,6 +823,10 @@ nsresult nsMsgAccountManager::createKeyedServer(
   }
 
   // construct the contractid
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckMigrationWriter(
+      mozilla::mailnews::MigrationWriterDomain::Account));
+#endif
   nsAutoCString serverContractID("@mozilla.org/messenger/server;1?type=");
   serverContractID += type;
 
@@ -1198,6 +1222,10 @@ nsMsgAccountManager::GetAllServers(
 }
 
 nsresult nsMsgAccountManager::LoadAccounts() {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(mozilla::mailnews::CheckMigrationWriter(
+      mozilla::mailnews::MigrationWriterDomain::Account));
+#endif
   nsresult rv;
 
   // for now safeguard multiple calls to this function
@@ -3642,3 +3670,40 @@ nsMsgAccountManager::ReorderAccounts(const nsTArray<nsCString>& newAccounts) {
 
   return OutputAccountsPref();
 }
+
+#ifdef MOZ_PANORAMA
+nsresult nsMsgAccountManager::CloseForMigration(
+    const mozilla::mailnews::MigrationWriterLease& aLease) {
+  nsresult identity = aLease.ValidateSelectedIdentity();
+  if (NS_FAILED(identity)) {
+    aLease.RecordError(identity);
+    return identity;
+  }
+  nsresult first = NS_OK;
+  nsTArray<RefPtr<nsMsgAccountManager>> captured;
+  for (auto* owner : sMigrationAccountManagers) captured.AppendElement(owner);
+  for (const auto& manager : captured) {
+    bool sameProfile = false;
+    nsresult result = manager->mMigrationProfile
+                          ? manager->mMigrationProfile->Equals(
+                                aLease.ProfileDirectory(), &sameProfile)
+                          : NS_ERROR_NOT_AVAILABLE;
+    if (NS_SUCCEEDED(result) && !sameProfile) result = NS_ERROR_NOT_AVAILABLE;
+    if (NS_SUCCEEDED(result) && manager->m_msgFolderCache) {
+      // IM/LS actual terminals precede this already-owned cache flush.
+      // Never materialize accounts or use ShutdownServers as a drain receipt.
+      result = manager->WriteToFolderCache(manager->m_msgFolderCache);
+    }
+    if (NS_FAILED(result)) {
+      aLease.RecordError(result);
+      if (NS_SUCCEEDED(first)) first = result;
+    }
+  }
+  return first;
+}
+namespace mozilla::mailnews {
+nsresult CloseMigrationAccountState(const MigrationWriterLease& aLease) {
+  return nsMsgAccountManager::CloseForMigration(aLease);
+}
+}  // namespace mozilla::mailnews
+#endif  // MOZ_PANORAMA

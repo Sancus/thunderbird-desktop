@@ -9,6 +9,23 @@ import {
   initLogModule,
 } from "resource:///modules/imXPCOMUtils.sys.mjs";
 
+/**
+ * Checks native process admission before starting a chat writer.
+ * The native gate retains process history and throws its original failure.
+ */
+function checkMigrationWriterAdmission() {
+  if (!AppConstants.NIGHTLY_BUILD) {
+    return;
+  }
+  const gate = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIObserver
+  );
+  const subject = gate
+    .QueryInterface(Ci.nsIPropertyBag2)
+    .getPropertyAsInterface("writer-admission-subject", Ci.nsISupports);
+  gate.observe(subject, "check-writer-admission", "chat");
+}
+
 var kQuitApplicationGranted = "quit-application-granted";
 
 var kPrefReportIdle = "messenger.status.reportIdle";
@@ -52,6 +69,7 @@ const BUILT_IN_PROTOCOLS = new Set(Object.keys(protocols));
  * @param {string} cid - The contract ID of the protocol.
  */
 export function registerProtocol(id, cid) {
+  checkMigrationWriterAdmission();
   if (protocols.hasOwnProperty(id)) {
     return;
   }
@@ -66,6 +84,7 @@ export function registerProtocol(id, cid) {
  * @param {string} id
  */
 export function unregisterProtocol(id) {
+  checkMigrationWriterAdmission();
   if (BUILT_IN_PROTOCOLS.has(id)) {
     return;
   }
@@ -234,6 +253,7 @@ UserStatus.prototype = {
     );
   },
   setStatus(aStatus, aMessage) {
+    checkMigrationWriterAdmission();
     if (aStatus != Ci.imIStatusInfo.STATUS_UNKNOWN) {
       this._statusType = aStatus;
     }
@@ -245,6 +265,7 @@ UserStatus.prototype = {
 
   _getProfileDir: () => Services.dirsvc.get("ProfD", Ci.nsIFile),
   setUserIcon(aIconFile) {
+    checkMigrationWriterAdmission();
     const folder = this._getProfileDir();
 
     let newName = "";
@@ -300,6 +321,7 @@ UserStatus.prototype = {
     return Services.prefs.getStringPref(kPrefUserDisplayname);
   },
   set displayName(aDisplayName) {
+    checkMigrationWriterAdmission();
     Services.prefs.setStringPref(kPrefUserDisplayname, aDisplayName);
     this._notifyObservers("user-display-name-changed", aDisplayName);
   },
@@ -345,6 +367,7 @@ class CoreService {
    * contacts, conversations and commands.
    */
   init() {
+    checkMigrationWriterAdmission();
     if (this._initialized) {
       return;
     }
@@ -365,7 +388,7 @@ class CoreService {
     });
 
     // Make sure logger has registered its observers.
-    IMServices.logs;
+    IMServices.logs.init();
     IMServices.accounts.initAccounts();
     IMServices.contacts.initContacts();
     IMServices.conversations.initConversations();
@@ -416,6 +439,7 @@ class CoreService {
    * @returns {prplIProtocol[]}
    */
   getProtocols() {
+    checkMigrationWriterAdmission();
     if (!this._initialized) {
       throw Components.Exception("", Cr.NS_ERROR_NOT_INITIALIZED);
     }
@@ -442,6 +466,7 @@ class CoreService {
    * @returns {prplIProtocol}
    */
   getProtocolById(aPrplId) {
+    checkMigrationWriterAdmission();
     if (!this._initialized) {
       throw Components.Exception("", Cr.NS_ERROR_NOT_INITIALIZED);
     }

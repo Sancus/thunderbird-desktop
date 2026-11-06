@@ -929,12 +929,28 @@ MailGlue.prototype = {
   },
 
   /**
+   * Checks native search admission without starting a writer.
+   *
+   * @param {"mail-search"|"chat-search"} domain - Fixed search writer domain.
+   * @throws {nsIException} Original native admission or component failure.
+   */
+  _checkSearchWriterAdmission(domain) {
+    if ("nsIDatabaseCore" in Ci) {
+      ChromeUtils.importESModule(
+        "resource:///modules/panorama/SearchMigrationHold.sys.mjs"
+      ).checkSearchWriterAdmission(domain);
+    }
+  },
+
+  /**
    * Returns the startup-selected database service after account initialization.
    * A mutable preference does not identify the registered backend.
    *
+   * @param {"mail-search"|"chat-search"} [domain="mail-search"] - Caller domain.
    * @returns {nsIMsgDBService} Active database, without independently creating core.
    */
-  _getMailSearchBackend() {
+  _getMailSearchBackend(domain = "mail-search") {
+    this._checkSearchWriterAdmission(domain);
     lazy.MailServices.accounts;
     return Cc["@mozilla.org/msgDatabase/msgDBService;1"].getService(
       Ci.nsIMsgDBService
@@ -955,6 +971,7 @@ MailGlue.prototype = {
 
   /** Starts the existing indexer only for a non-Panorama backend. */
   _startLegacyMailSearch() {
+    this._checkSearchWriterAdmission("mail-search");
     ChromeUtils.importESModule("resource:///modules/gloda/GlodaPublic.sys.mjs");
   },
 
@@ -975,6 +992,7 @@ MailGlue.prototype = {
         if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
           return;
         }
+        this._checkSearchWriterAdmission("mail-search");
         const backend = this._getMailSearchBackend();
         if (this._mailSearchShuttingDown || Services.startup.shuttingDown) {
           return;
@@ -1040,6 +1058,7 @@ MailGlue.prototype = {
 
   /** Starts the old chat indexer only for the nonnative backend. */
   _startLegacyChatSearch() {
+    this._checkSearchWriterAdmission("chat-search");
     ChromeUtils.importESModule("resource:///modules/index_im.sys.mjs");
   },
 
@@ -1058,10 +1077,11 @@ MailGlue.prototype = {
       return Promise.resolve();
     }
     this._chatSearchStartupPromise ??= Promise.resolve().then(async () => {
+      this._checkSearchWriterAdmission("chat-search");
       if (this._chatSearchShuttingDown || Services.startup.shuttingDown) {
         return;
       }
-      const backend = this._getMailSearchBackend();
+      const backend = this._getMailSearchBackend("chat-search");
       if (this._chatSearchShuttingDown || Services.startup.shuttingDown) {
         return;
       }

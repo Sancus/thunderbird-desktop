@@ -100,6 +100,25 @@ msl.prototype = {
 };
 
 add_task(async function run_the_test() {
+  const writerGate = Cc[
+    "@mozilla.org/mailnews/migration-writer-lease;1"
+  ].getService(Ci.nsIObserver);
+  const writerHistory = writerGate.QueryInterface(Ci.nsIPropertyBag2);
+  const processSubject = writerHistory.getPropertyAsInterface(
+    "writer-admission-subject",
+    Ci.nsISupports
+  );
+  Assert.equal(
+    writerHistory.getPropertyAsUint32("writer-history.compose"),
+    0,
+    "This test process has not admitted compose work yet"
+  );
+  Assert.strictEqual(
+    writerGate.observe(processSubject, "check-writer-never-started", "compose"),
+    undefined,
+    "A native void check succeeds without returning a boolean or nsresult"
+  );
+
   server = setupServerDaemon();
 
   // Test file - for bug 429891
@@ -152,6 +171,21 @@ add_task(async function run_the_test() {
       null,
       messageListener,
       null
+    );
+    Assert.equal(
+      writerHistory.getPropertyAsUint32("writer-history.compose"),
+      1,
+      "Compose admission is recorded before asynchronous file or FCC work"
+    );
+    Assert.throws(
+      () =>
+        writerGate.observe(
+          processSubject,
+          "check-writer-never-started",
+          "compose"
+        ),
+      ex => ex.result == Cr.NS_ERROR_NOT_AVAILABLE,
+      "Admitted compose work cannot be reclassified as cold"
     );
 
     server.performTest();

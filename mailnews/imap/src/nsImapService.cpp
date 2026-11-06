@@ -3,6 +3,12 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "nsImapService.h"
+#ifdef MOZ_PANORAMA
+#  include "ImapMigrationWriterLease.h"
+using mozilla::mailnews::CheckImapMigrationAdmission;
+using mozilla::mailnews::ImapMigrationWork;
+using mozilla::mailnews::ImapMigrationWorkKind;
+#endif
 
 #include "../../base/src/MailnewsLoadContextInfo.h"
 #include "mozilla/Components.h"
@@ -573,7 +579,7 @@ NS_IMETHODIMP nsImapService::CopyMessage(const nsACString& aSrcMailboxURI,
           FetchMessage(imapUrl, imapAction, folder, imapMessageSink, aMsgWindow,
                        aMailboxCopy, msgIds, false, getter_AddRefs(dummyURI));
     }  // if we got an imap message sink
-  }  // if we decomposed the imap message
+  }    // if we decomposed the imap message
   return rv;
 }
 
@@ -1904,86 +1910,100 @@ class OfflineAppendParser final : public nsMsgLineBuffer {
 static nsresult AppendOfflineMessageNative(nsIFile* file, nsIURI* url,
                                            nsIMsgFolder* folder,
                                            nsIUrlListener* listener,
-                                           nsISupports* copyState) {
+                                           nsISupports* copyState,
+                                           ImapMigrationWork* appendWork) {
   bool locked;
-  MOZ_TRY(folder->GetLocked(&locked));
+  MOZ_TRY(appendWork->RecordResult(folder->GetLocked(&locked)));
   NS_ENSURE_FALSE(locked, NS_MSG_FOLDER_BUSY);
 
   nsCOMPtr<nsIMsgDatabase> database;
-  MOZ_TRY(folder->GetMsgDatabase(getter_AddRefs(database)));
+  MOZ_TRY(appendWork->RecordResult(
+      folder->GetMsgDatabase(getter_AddRefs(database))));
   NS_ENSURE_TRUE(database, NS_ERROR_NOT_AVAILABLE);
   nsCOMPtr<nsIMsgDBHdr> draft;
-  MOZ_TRY(database->CreateNewHdr(getter_AddRefs(draft)));
+  MOZ_TRY(
+      appendWork->RecordResult(database->CreateNewHdr(getter_AddRefs(draft))));
   NS_ENSURE_TRUE(draft, NS_ERROR_UNEXPECTED);
 
   nsresult rv;
   nsCOMPtr<nsIMsgParseMailMsgState> parser =
       do_CreateInstance("@mozilla.org/messenger/messagestateparser;1", &rv);
-  MOZ_TRY(rv);
-  MOZ_TRY(parser->SetMailDB(database));
-  MOZ_TRY(parser->SetNewMsgHdr(draft));
-  MOZ_TRY(parser->SetMsgUid(0));
-  MOZ_TRY(parser->SetState(nsIMsgParseMailMsgState::ParseHeadersState));
+  MOZ_TRY(appendWork->RecordResult(rv));
+  MOZ_TRY(appendWork->RecordResult(parser->SetMailDB(database)));
+  MOZ_TRY(appendWork->RecordResult(parser->SetNewMsgHdr(draft)));
+  MOZ_TRY(appendWork->RecordResult(parser->SetMsgUid(0)));
+  MOZ_TRY(appendWork->RecordResult(
+      parser->SetState(nsIMsgParseMailMsgState::ParseHeadersState)));
 
   nsCOMPtr<nsIInputStream> input;
-  MOZ_TRY(NS_NewLocalFileInputStream(getter_AddRefs(input), file));
-  auto closeInput = mozilla::MakeScopeExit([&] { input->Close(); });
+  MOZ_TRY(appendWork->RecordResult(
+      NS_NewLocalFileInputStream(getter_AddRefs(input), file)));
+  auto closeInput =
+      mozilla::MakeScopeExit([&] { appendWork->RecordError(input->Close()); });
   nsCOMPtr<nsIMsgPluggableStore> store;
-  MOZ_TRY(folder->GetMsgStore(getter_AddRefs(store)));
+  MOZ_TRY(appendWork->RecordResult(folder->GetMsgStore(getter_AddRefs(store))));
   nsCOMPtr<nsIOutputStream> output;
-  MOZ_TRY(store->GetNewMsgOutputStream(folder, getter_AddRefs(output)));
-  auto discard =
-      mozilla::MakeScopeExit([&] { store->DiscardNewMessage(folder, output); });
+  MOZ_TRY(appendWork->RecordResult(
+      store->GetNewMsgOutputStream(folder, getter_AddRefs(output))));
+  auto discard = mozilla::MakeScopeExit([&] {
+    appendWork->RecordError(store->DiscardNewMessage(folder, output));
+  });
 
   OfflineAppendParser lines(parser);
   char buffer[16384];
   uint64_t bytes = 0;
   while (true) {
     uint32_t count;
-    MOZ_TRY(input->Read(buffer, sizeof(buffer), &count));
+    MOZ_TRY(
+        appendWork->RecordResult(input->Read(buffer, sizeof(buffer), &count)));
     if (!count) break;
     bytes += count;
     NS_ENSURE_TRUE(bytes <= UINT32_MAX, NS_ERROR_ILLEGAL_VALUE);
-    MOZ_TRY(lines.BufferInput(buffer, count));
-    MOZ_TRY(SyncWriteAll(output, buffer, count));
+    MOZ_TRY(appendWork->RecordResult(lines.BufferInput(buffer, count)));
+    MOZ_TRY(appendWork->RecordResult(SyncWriteAll(output, buffer, count)));
   }
-  MOZ_TRY(lines.Flush());
-  MOZ_TRY(parser->FinishHeader());
+  MOZ_TRY(appendWork->RecordResult(lines.Flush()));
+  MOZ_TRY(appendWork->RecordResult(parser->FinishHeader()));
   nsresult closeRv = input->Close();
   closeInput.release();
-  MOZ_TRY(closeRv);
-  MOZ_TRY(output->Flush());
+  MOZ_TRY(appendWork->RecordResult(closeRv));
+  MOZ_TRY(appendWork->RecordResult(output->Flush()));
 
   // An attempted Finish can have installed bytes even when it returns failure.
   // Neither that failure nor later metadata work authorizes discarding them.
   discard.release();
   nsAutoCString token;
-  MOZ_TRY(store->FinishNewMessage(folder, output, token));
+  MOZ_TRY(
+      appendWork->RecordResult(store->FinishNewMessage(folder, output, token)));
   uint32_t size, lineCount;
-  MOZ_TRY(ReadStoredMessageDetails(store, folder, token, &size, &lineCount));
-  MOZ_TRY(draft->SetStoreToken(token));
-  MOZ_TRY(draft->SetMessageSize(size));
-  MOZ_TRY(draft->SetOfflineMessageSize(size));
-  MOZ_TRY(draft->SetLineCount(lineCount));
+  MOZ_TRY(appendWork->RecordResult(
+      ReadStoredMessageDetails(store, folder, token, &size, &lineCount)));
+  MOZ_TRY(appendWork->RecordResult(draft->SetStoreToken(token)));
+  MOZ_TRY(appendWork->RecordResult(draft->SetMessageSize(size)));
+  MOZ_TRY(appendWork->RecordResult(draft->SetOfflineMessageSize(size)));
+  MOZ_TRY(appendWork->RecordResult(draft->SetLineCount(lineCount)));
   uint32_t flags;
-  MOZ_TRY(draft->OrFlags(nsMsgMessageFlags::Offline | nsMsgMessageFlags::Read,
-                         &flags));
+  MOZ_TRY(appendWork->RecordResult(draft->OrFlags(
+      nsMsgMessageFlags::Offline | nsMsgMessageFlags::Read, &flags)));
 
   nsCOMPtr<nsImapMailCopyState> state;
   if (copyState) {
     state = do_QueryInterface(copyState, &rv);
-    MOZ_TRY(rv);
-    MOZ_TRY(draft->OrFlags(state->m_newMsgFlags, &flags));
-    MOZ_TRY(draft->SetStringProperty("keywords", state->m_newMsgKeywords));
+    MOZ_TRY(appendWork->RecordResult(rv));
+    MOZ_TRY(
+        appendWork->RecordResult(draft->OrFlags(state->m_newMsgFlags, &flags)));
+    MOZ_TRY(appendWork->RecordResult(
+        draft->SetStringProperty("keywords", state->m_newMsgKeywords)));
   }
 
   mozilla::mailnews::FinishedMessageBody finished{token, size, size, lineCount,
                                                   true};
   nsMsgKey key;
-  MOZ_TRY(static_cast<nsImapMailFolder*>(folder)->QueueNativeOfflineAppend(
-      draft, finished, &key));
+  MOZ_TRY(appendWork->RecordResult(
+      static_cast<nsImapMailFolder*>(folder)->QueueNativeOfflineAppend(
+          draft, finished, &key)));
   if (state && state->m_listener) {
-    MOZ_TRY(state->m_listener->SetMessageKey(key));
+    MOZ_TRY(appendWork->RecordResult(state->m_listener->SetMessageKey(key)));
   }
   // Synchronous errors above stay with the launching caller. Only a completed
   // local queue operation sends its existing URL completion callback here.
@@ -1997,116 +2017,133 @@ nsresult nsImapService::OfflineAppendFromFile(
     bool inSelectedState,         // needs to be in
     nsIUrlListener* aListener, nsIURI** aURL, nsISupports* aCopyState) {
 #ifdef MOZ_PANORAMA
-  if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
-    return AppendOfflineMessageNative(aFile, aUrl, aDstFolder, aListener,
-                                      aCopyState);
-  }
+  MOZ_TRY(CheckImapMigrationAdmission());
+  RefPtr<ImapMigrationWork> appendWork = MOZ_TRY(ImapMigrationWork::Admit(
+      ImapMigrationWorkKind::Append, aDstFolder, nullptr));
 #endif
-  nsCOMPtr<nsIMsgDatabase> destDB;
-  nsresult rv = aDstFolder->GetMsgDatabase(getter_AddRefs(destDB));
-  // ### might need to send some notifications instead of just returning
-
-  bool isLocked;
-  aDstFolder->GetLocked(&isLocked);
-  if (isLocked) return NS_MSG_FOLDER_BUSY;
-
-  if (NS_SUCCEEDED(rv) && destDB) {
-    nsMsgKey fakeKey;
-    destDB->GetNextFakeOfflineMsgKey(&fakeKey);
-
-    nsCOMPtr<nsIMsgOfflineImapOperation> op;
-    nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb = do_QueryInterface(destDB, &rv);
-    NS_ENSURE_SUCCESS(rv, rv);
-    rv = opsDb->GetOfflineOpForKey(fakeKey, true, getter_AddRefs(op));
-    if (NS_SUCCEEDED(rv) && op) {
-      nsCString destFolderUri;
-      aDstFolder->GetURI(destFolderUri);
-      op->SetOperation(
-          nsIMsgOfflineImapOperation::kAppendDraft);  // ### do we care if it's
-                                                      // a template?
-      op->SetDestinationFolderURI(destFolderUri);
-      nsCOMPtr<nsIOutputStream> outputStream;
-      nsCOMPtr<nsIMsgPluggableStore> msgStore;
-      nsCOMPtr<nsIMsgIncomingServer> dstServer;
-      nsCOMPtr<nsIMsgDBHdr> newMsgHdr;
-
-      aDstFolder->GetServer(getter_AddRefs(dstServer));
-      rv = dstServer->GetMsgStore(getter_AddRefs(msgStore));
-      NS_ENSURE_SUCCESS(rv, rv);
-      rv = destDB->CreateNewHdrWithSpecificMsgKey(fakeKey,
-                                                  getter_AddRefs(newMsgHdr));
-      NS_ENSURE_SUCCESS(rv, rv);
-      rv = msgStore->GetNewMsgOutputStream(aDstFolder,
-                                           getter_AddRefs(outputStream));
-      NS_ENSURE_SUCCESS(rv, rv);
-
-      auto outGuard = mozilla::MakeScopeExit(
-          [&] { msgStore->DiscardNewMessage(aDstFolder, outputStream); });
-
-      nsCOMPtr<nsIInputStream> inputStream;
-      nsCOMPtr<nsIMsgParseMailMsgState> msgParser =
-          do_CreateInstance("@mozilla.org/messenger/messagestateparser;1", &rv);
-      msgParser->SetMailDB(destDB);
-
-      rv = NS_NewLocalFileInputStream(getter_AddRefs(inputStream), aFile);
-      NS_ENSURE_SUCCESS(rv, rv);
-
-      // now, copy the temp file to the offline store for the dest folder.
-      RefPtr<nsMsgLineStreamBuffer> inputStreamBuffer =
-          new nsMsgLineStreamBuffer(
-              FILE_IO_BUFFER_SIZE,
-              true,    // allocate new lines
-              false);  // leave CRLFs on the returned string
-      int64_t fileSize;
-      aFile->GetFileSize(&fileSize);
-      rv = NS_OK;
-      // rv = inputStream->Read(inputBuffer, inputBufferSize, &bytesRead);
-      // if (NS_SUCCEEDED(rv) && bytesRead > 0)
-      msgParser->SetState(nsIMsgParseMailMsgState::ParseHeadersState);
-      msgParser->SetNewMsgHdr(newMsgHdr);
-      // Set the new UID to fake key so the msg hdr will have that for a key.
-      // See https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
-      msgParser->SetMsgUid((ImapUid)fakeKey);
-      bool needMoreData = false;
-      char* newLine = nullptr;
-      uint32_t numBytesInLine = 0;
-      do {
-        newLine = inputStreamBuffer->ReadNextLine(inputStream, numBytesInLine,
-                                                  needMoreData);
-        if (newLine) {
-          msgParser->ParseAFolderLine(newLine, numBytesInLine);
-          rv = SyncWriteAll(outputStream, newLine, numBytesInLine);
-          free(newLine);
-        }
-        if (NS_FAILED(rv)) {
-          break;
-        }
-      } while (newLine);
-      msgParser->FinishHeader();
-
-      if (NS_SUCCEEDED(rv)) {
-        uint32_t resultFlags;
-        newMsgHdr->OrFlags(nsMsgMessageFlags::Offline | nsMsgMessageFlags::Read,
-                           &resultFlags);
-        newMsgHdr->SetOfflineMessageSize(fileSize);
-        destDB->AddNewHdrToDB(newMsgHdr, true /* notify */);
-        aDstFolder->SetFlag(nsMsgFolderFlags::OfflineEvents);
-        nsAutoCString storeToken;
-        rv = msgStore->FinishNewMessage(aDstFolder, outputStream, storeToken);
-        if (NS_SUCCEEDED(rv)) {
-          outGuard.release();
-          newMsgHdr->SetStoreToken(storeToken);
-        }
-      }
-      // tell the listener we're done.
-      inputStream->Close();
-      inputStream = nullptr;
-      aListener->OnStopRunningUrl(aUrl, NS_OK);
+  nsresult migrationResult = [&]() -> nsresult {
+#ifdef MOZ_PANORAMA
+    if (mozilla::StaticPrefs::mail_panorama_enabled_AtStartup()) {
+      return AppendOfflineMessageNative(aFile, aUrl, aDstFolder, aListener,
+                                        aCopyState, appendWork);
     }
-  }
+#endif
+    nsCOMPtr<nsIMsgDatabase> destDB;
+    nsresult rv = aDstFolder->GetMsgDatabase(getter_AddRefs(destDB));
+    // ### might need to send some notifications instead of just returning
 
-  if (destDB) destDB->Close(true);
-  return rv;
+    bool isLocked;
+    aDstFolder->GetLocked(&isLocked);
+    if (isLocked) return NS_MSG_FOLDER_BUSY;
+
+    if (NS_SUCCEEDED(rv) && destDB) {
+      nsMsgKey fakeKey;
+      destDB->GetNextFakeOfflineMsgKey(&fakeKey);
+
+      nsCOMPtr<nsIMsgOfflineImapOperation> op;
+      nsCOMPtr<nsIMsgOfflineOpsDatabase> opsDb = do_QueryInterface(destDB, &rv);
+      NS_ENSURE_SUCCESS(rv, rv);
+      rv = opsDb->GetOfflineOpForKey(fakeKey, true, getter_AddRefs(op));
+      if (NS_SUCCEEDED(rv) && op) {
+        nsCString destFolderUri;
+        aDstFolder->GetURI(destFolderUri);
+        op->SetOperation(
+            nsIMsgOfflineImapOperation::kAppendDraft);  // ### do we care if
+                                                        // it's a template?
+        op->SetDestinationFolderURI(destFolderUri);
+        nsCOMPtr<nsIOutputStream> outputStream;
+        nsCOMPtr<nsIMsgPluggableStore> msgStore;
+        nsCOMPtr<nsIMsgIncomingServer> dstServer;
+        nsCOMPtr<nsIMsgDBHdr> newMsgHdr;
+
+        aDstFolder->GetServer(getter_AddRefs(dstServer));
+        rv = dstServer->GetMsgStore(getter_AddRefs(msgStore));
+        NS_ENSURE_SUCCESS(rv, rv);
+        rv = destDB->CreateNewHdrWithSpecificMsgKey(fakeKey,
+                                                    getter_AddRefs(newMsgHdr));
+        NS_ENSURE_SUCCESS(rv, rv);
+        rv = msgStore->GetNewMsgOutputStream(aDstFolder,
+                                             getter_AddRefs(outputStream));
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        auto outGuard = mozilla::MakeScopeExit([&] {
+          nsresult discardRv =
+              msgStore->DiscardNewMessage(aDstFolder, outputStream);
+#ifdef MOZ_PANORAMA
+          appendWork->RecordError(discardRv);
+#endif
+        });
+
+        nsCOMPtr<nsIInputStream> inputStream;
+        nsCOMPtr<nsIMsgParseMailMsgState> msgParser = do_CreateInstance(
+            "@mozilla.org/messenger/messagestateparser;1", &rv);
+        msgParser->SetMailDB(destDB);
+
+        rv = NS_NewLocalFileInputStream(getter_AddRefs(inputStream), aFile);
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        // now, copy the temp file to the offline store for the dest folder.
+        RefPtr<nsMsgLineStreamBuffer> inputStreamBuffer =
+            new nsMsgLineStreamBuffer(
+                FILE_IO_BUFFER_SIZE,
+                true,    // allocate new lines
+                false);  // leave CRLFs on the returned string
+        int64_t fileSize;
+        aFile->GetFileSize(&fileSize);
+        rv = NS_OK;
+        // rv = inputStream->Read(inputBuffer, inputBufferSize, &bytesRead);
+        // if (NS_SUCCEEDED(rv) && bytesRead > 0)
+        msgParser->SetState(nsIMsgParseMailMsgState::ParseHeadersState);
+        msgParser->SetNewMsgHdr(newMsgHdr);
+        // Set the new UID to fake key so the msg hdr will have that for a key.
+        // See https://bugzilla.mozilla.org/show_bug.cgi?id=1806770
+        msgParser->SetMsgUid((ImapUid)fakeKey);
+        bool needMoreData = false;
+        char* newLine = nullptr;
+        uint32_t numBytesInLine = 0;
+        do {
+          newLine = inputStreamBuffer->ReadNextLine(inputStream, numBytesInLine,
+                                                    needMoreData);
+          if (newLine) {
+            msgParser->ParseAFolderLine(newLine, numBytesInLine);
+            rv = SyncWriteAll(outputStream, newLine, numBytesInLine);
+            free(newLine);
+          }
+          if (NS_FAILED(rv)) {
+            break;
+          }
+        } while (newLine);
+        msgParser->FinishHeader();
+
+        if (NS_SUCCEEDED(rv)) {
+          uint32_t resultFlags;
+          newMsgHdr->OrFlags(
+              nsMsgMessageFlags::Offline | nsMsgMessageFlags::Read,
+              &resultFlags);
+          newMsgHdr->SetOfflineMessageSize(fileSize);
+          destDB->AddNewHdrToDB(newMsgHdr, true /* notify */);
+          aDstFolder->SetFlag(nsMsgFolderFlags::OfflineEvents);
+          nsAutoCString storeToken;
+          rv = msgStore->FinishNewMessage(aDstFolder, outputStream, storeToken);
+          if (NS_SUCCEEDED(rv)) {
+            outGuard.release();
+            newMsgHdr->SetStoreToken(storeToken);
+          }
+        }
+        // tell the listener we're done.
+        inputStream->Close();
+        inputStream = nullptr;
+        aListener->OnStopRunningUrl(aUrl, NS_OK);
+      }
+    }
+
+    if (destDB) destDB->Close(true);
+    return rv;
+  }();
+#ifdef MOZ_PANORAMA
+  appendWork->Complete(migrationResult);
+#endif
+  return migrationResult;
 }
 
 /* append message from file url */
@@ -2188,6 +2225,9 @@ NS_IMETHODIMP nsImapService::AppendMessageFromFile(
 nsresult nsImapService::GetImapConnectionAndLoadUrl(nsIImapUrl* aImapUrl,
                                                     nsISupports* aConsumer,
                                                     nsIURI** aURL) {
+#ifdef MOZ_PANORAMA
+  MOZ_TRY(CheckImapMigrationAdmission());
+#endif
   NS_ENSURE_ARG_POINTER(aImapUrl);
 
   bool isValidUrl;

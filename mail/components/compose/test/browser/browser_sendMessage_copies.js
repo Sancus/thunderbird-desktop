@@ -298,7 +298,8 @@ async function removeFolder(folder) {
 /**
  * @param {string} action
  * @param {nsIMsgFolder} expectedParent
- * @returns {nsIMsgFolder}
+ * @param {string} [expectedName] - Expected destination folder name.
+ * @returns {Promise<nsIMsgFolder>}
  */
 async function subtest(action, expectedParent, expectedName) {
   const property = {
@@ -340,18 +341,40 @@ async function subtest(action, expectedParent, expectedName) {
     );
     await BrowserTestUtils.domWindowClosed(composeWindow);
   } else {
-    EventUtils.synthesizeMouseAtCenter(
-      composeWindow.document.querySelector("#button-save > dropmarker"),
-      {},
-      composeWindow
-    );
-    const savePopup = composeWindow.document.getElementById("button-savePopup");
-    await BrowserTestUtils.waitForPopupEvent(savePopup, "shown");
-    savePopup.activateItem(
-      composeWindow.document.getElementById(`savePopup_${action}`)
-    );
-    await BrowserTestUtils.waitForPopupEvent(savePopup, "hidden");
-    // Don't close the window, we'll do that at the end.
+    const msgCompose = composeWindow.gMsgCompose;
+    const { promise: completed, resolve } = Promise.withResolvers();
+    const stateListener = {
+      NotifyComposeFieldsReady() {},
+      NotifyComposeBodyReady() {},
+      SaveInFolderDone(folderURI) {
+        resolve(folderURI);
+      },
+      ComposeProcessDone(status) {
+        info(`Final ${action} copy callback status ${status}`);
+      },
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+    };
+    msgCompose.RegisterStateListener(stateListener);
+    try {
+      EventUtils.synthesizeMouseAtCenter(
+        composeWindow.document.querySelector("#button-save > dropmarker"),
+        {},
+        composeWindow
+      );
+      const savePopup =
+        composeWindow.document.getElementById("button-savePopup");
+      await BrowserTestUtils.waitForPopupEvent(savePopup, "shown");
+      savePopup.activateItem(
+        composeWindow.document.getElementById(`savePopup_${action}`)
+      );
+      await BrowserTestUtils.waitForPopupEvent(savePopup, "hidden");
+      // Don't close the window, we'll do that at the end.
+      const folderURI = await completed;
+      info(`Final ${action} copy saved in ${folderURI}`);
+      await TestUtils.waitForTick();
+    } finally {
+      msgCompose.UnregisterStateListener(stateListener);
+    }
   }
 
   // Check that the folder is created.

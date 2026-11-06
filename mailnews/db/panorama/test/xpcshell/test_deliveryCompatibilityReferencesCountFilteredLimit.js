@@ -37,7 +37,7 @@ add_task(function test_numReferencesLimitsTheFilteredView() {
   });
   statement = reader.createStatement(
     "SELECT json_group_array(json_array(ordinal, token) ORDER BY ordinal), " +
-      "min(typeof(ordinal) IN ('integer', 'real') AND typeof(token) = 'text') " +
+      "min(typeof(ordinal) = 'integer' AND typeof(token) = 'text') " +
       "FROM message_references WHERE id = :id"
   );
   statement.params.id = key;

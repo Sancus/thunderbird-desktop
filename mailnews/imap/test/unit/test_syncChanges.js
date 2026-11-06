@@ -198,12 +198,53 @@ async function selectFolder(folder) {
  * the collected natives incrementally from an idle task. Otherwise those Mork
  * rows are released at shutdown, after their stores closed.
  */
+
+// DIAGNOSTIC ONLY (not for landing): weakly track offline-op wrappers and
+// report what still retains them after the pre-teardown GC.
+const gTrackedOfflineOps = [];
+function trackOfflineOp(op, label) {
+  if (op) {
+    gTrackedOfflineOps.push({ label, ref: new WeakRef(op) });
+  }
+  return op;
+}
+
+function reportRetainedOfflineOps(where) {
+  const alive = gTrackedOfflineOps.filter(item => item.ref.deref());
+  dump(`OFFLINE-OP-DIAG ${where}: tracked=${gTrackedOfflineOps.length} alive=${alive.length} [${alive.map(item => item.label).join(", ")}]
+`);
+  if (!alive.length) {
+    return;
+  }
+  const { shortestPaths } = Cu.getJSTestingFunctions();
+  const describe = node => {
+    try {
+      return typeof node == "object" && node
+        ? `${Object.prototype.toString.call(node)}${node.constructor?.name ? ":" + node.constructor.name : ""}`
+        : String(node);
+    } catch (e) {
+      return "<" + e + ">";
+    }
+  };
+  const paths = shortestPaths(
+    alive.map(item => item.ref.deref()),
+    { maxNumPaths: 2 }
+  );
+  paths.forEach((set, index) => {
+    set.forEach((path, n) => {
+      dump(`OFFLINE-OP-DIAG ${where} ${alive[index].label} path${n}: ${path.map(step => `${describe(step.predecessor)} -[${step.edge}]->`).join(" ")} op
+`);
+    });
+  });
+}
+
 async function releaseOfflineOpWrappers() {
   await schedulePreciseGCAndForceCC(3);
   await new Promise(resolve => Cu.schedulePreciseGC(resolve));
   await new Promise(resolve =>
     ChromeUtils.idleDispatch(resolve, { timeout: 1000 })
   );
+  reportRetainedOfflineOps("after-gc");
 }
 
 async function closeConnections() {
@@ -328,7 +369,10 @@ function queueIntent(folder, header, kind) {
     Services.io.offline = false;
   }
   const db = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
-  const op = db.getOfflineOpForKey(header.messageKey, false);
+  const op = trackOfflineOp(
+    db.getOfflineOpForKey(header.messageKey, false),
+    "line 331"
+  );
   Assert.ok(op);
   if (kind == "move") {
     op.operation = Ci.nsIMsgOfflineImapOperation.kMsgMoved;
@@ -758,7 +802,10 @@ if (panorama) {
         Assert.deepEqual(reopened.listAllKeys(), [headers[1].messageKey]);
         Assert.deepEqual(reopened.listAllOfflineOpIds(), [key]);
         Assert.deepEqual(queuedIdentity(folder, key), identity);
-        const retained = reopened.getOfflineOpForKey(key, false);
+        const retained = trackOfflineOp(
+          reopened.getOfflineOpForKey(key, false),
+          "line 761"
+        );
         Assert.deepEqual(
           [
             retained.operation,
@@ -1046,14 +1093,14 @@ add_task(async function test_offlineFlagMasksPreserveSourceState() {
   Services.io.offline = true;
   try {
     folder.storeImapFlags(0x04, true, [key], null);
-    let op = db.getOfflineOpForKey(key, false);
+    let op = trackOfflineOp(db.getOfflineOpForKey(key, false), "line 1049");
     Assert.equal(op.operation, Ci.nsIMsgOfflineImapOperation.kFlagsChanged);
     Assert.equal(op.newFlags, seed | 0x04);
     folder.storeImapFlags(0x04, false, [key], null);
-    op = db.getOfflineOpForKey(key, false);
+    op = trackOfflineOp(db.getOfflineOpForKey(key, false), "line 1053");
     Assert.equal(op.newFlags, seed & ~0x04);
     folder.storeCustomKeywords(null, "keep-tag", "drop-tag", [key]);
-    op = db.getOfflineOpForKey(key, false);
+    op = trackOfflineOp(db.getOfflineOpForKey(key, false), "line 1056");
     Assert.equal(
       op.operation,
       Ci.nsIMsgOfflineImapOperation.kFlagsChanged |
@@ -1139,7 +1186,10 @@ async function checkOfflineQueueFailure(
     const retained = failedIndex || updating ? [keys[0]] : [];
     Assert.deepEqual(db.listAllOfflineOpIds(), retained);
     if (retained.length) {
-      const op = db.getOfflineOpForKey(keys[0], false);
+      const op = trackOfflineOp(
+        db.getOfflineOpForKey(keys[0], false),
+        "line 1142"
+      );
       if (keywords) {
         let expectedOperation = 0;
         if (mutation == "create") {

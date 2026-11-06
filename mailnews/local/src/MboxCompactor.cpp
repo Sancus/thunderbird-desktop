@@ -60,7 +60,12 @@ nsresult MboxCompactor::BeginCompaction(nsIFile* srcMbox,
     // no kungfudeathgrippery required here (and MboxScanner holds itself
     // in existence until finished).
     RefPtr<MboxScanner> scanner(new MboxScanner());
-    rv = scanner->BeginScan(mPaths.Source, this);
+    rv = scanner->BeginScan(mPaths.Source, this
+#ifdef MOZ_PANORAMA
+                            ,
+                            mMigrationWork
+#endif
+    );
     if (NS_FAILED(rv)) {
 #ifdef MOZ_PANORAMA
       mMigrationWork->RecordError(rv);

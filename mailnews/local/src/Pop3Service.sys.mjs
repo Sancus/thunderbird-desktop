@@ -58,6 +58,18 @@ export class Pop3Service {
     }
   }
 
+  /**
+   * Retains this request's URI and listener before queuing client construction.
+   * Reports setup rejection through the same once-only URL listener used by the
+   * real client. Active client IO keeps its ordinary completion callbacks.
+   *
+   * @param {boolean} downloadNewMail - Whether to download new message bodies.
+   * @param {nsIMsgWindow} msgWindow - The request's message window.
+   * @param {?nsIUrlListener} urlListener - The original completion listener.
+   * @param {nsIMsgFolder} inbox - The delivery folder.
+   * @param {nsIPop3IncomingServer} server - The server whose client queue is used.
+   * @throws {nsIException} If offline or synchronous admission/setup fails.
+   */
   _getMail(downloadNewMail, msgWindow, urlListener, inbox, server) {
     if (Services.io.offline) {
       throw Components.Exception(
@@ -65,13 +77,63 @@ export class Pop3Service {
         Cr.NS_MSG_ERROR_OFFLINE
       );
     }
-    server.wrappedJSObject.withClient(client => {
-      client.runningUri.msgWindow = msgWindow;
-      client.urlListener = urlListener;
-      client.onOpen = () => {
-        client.getMail(downloadNewMail, msgWindow, inbox);
-      };
-    });
+    const incoming = server.QueryInterface(Ci.nsIMsgIncomingServer);
+    const uri = Services.io
+      .newURI(`pop3://${incoming.hostname}:${incoming.port}`)
+      .QueryInterface(Ci.nsIMsgMailNewsUrl);
+    uri.msgWindow = msgWindow;
+    let started = false;
+    let stopped = false;
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+      OnStartRunningUrl(url, status) {
+        if (started || stopped) {
+          return;
+        }
+        started = true;
+        urlListener?.OnStartRunningUrl(url, status);
+      },
+      OnStopRunningUrl(url, status) {
+        if (stopped) {
+          return;
+        }
+        // Set before user code. Reentrant cancellation or a later native
+        // cleanup callback must not deliver another terminal for this request.
+        stopped = true;
+        urlListener?.OnStopRunningUrl(url, status);
+      },
+    };
+    /**
+     * Delivers the actual setup error without losing a listener cleanup error.
+     *
+     * @param {Error|nsIException} error - The original rejected setup outcome.
+     */
+    const rejected = error => {
+      try {
+        listener.OnStopRunningUrl(uri, error.result || Cr.NS_ERROR_FAILURE);
+      } catch (cleanup) {
+        // The server retains this same rejection object for native settlement.
+        // Listener failure is secondary to the real refusal/setup error.
+        error.secondaryErrors = [...(error.secondaryErrors || []), cleanup];
+      }
+    };
+    let pending;
+    try {
+      pending = server.wrappedJSObject.withClient(client => {
+        client.runningUri = uri;
+        client.urlListener = listener;
+        client.onOpen = () => {
+          client.getMail(downloadNewMail, msgWindow, inbox);
+        };
+      });
+    } catch (error) {
+      rejected(error);
+      throw error;
+    }
+    // Install before returning to the event loop. A queued refusal calls the
+    // original listener before the server's joined settlement Promise resolves.
+    // No rejected queue Promise is left unobserved and no new client is needed.
+    pending.catch(rejected);
   }
 }
 

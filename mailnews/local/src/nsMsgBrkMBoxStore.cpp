@@ -1261,9 +1261,8 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::AsyncScan(nsIMsgFolder* folder,
   nsCOMPtr<nsIStoreScanListener> migrationListener =
       mozilla::mailnews::WrapLocalStoreMigrationScan(migration, scanListener);
 #else
-  nsIStoreScanListener* migrationListener = scanListener;
+    nsIStoreScanListener* migrationListener = scanListener;
 #endif
-  [[maybe_unused]] bool migrationAttempted = false;
 #ifdef MOZ_PANORAMA
   nsresult migrationResult = [&]() -> nsresult {
 #endif
@@ -1280,17 +1279,21 @@ NS_IMETHODIMP nsMsgBrkMBoxStore::AsyncScan(nsIMsgFolder* folder,
     // Fire and forget. MboxScanner will hold itself in existence until
     // finished.
     RefPtr<MboxScanner> scanner(new MboxScanner());
-    migrationAttempted = true;
-    nsresult started = scanner->BeginScan(mboxPath, migrationListener);
+    nsresult started = scanner->BeginScan(mboxPath, migrationListener
+#ifdef MOZ_PANORAMA
+                                          ,
+                                          migration
+#endif
+    );
 
     return started;
 
 #ifdef MOZ_PANORAMA
   }();
   if (NS_FAILED(migrationResult)) {
-    migration->Complete(
-        migrationResult,
-        !migrationAttempted || migrationResult == NS_ERROR_FILE_NOT_FOUND);
+    // Scanner setup closes its actual input before returning. Any uncertain
+    // close has already retained the original work and prevents completion.
+    migration->Complete(migrationResult);
   }
   return migrationResult;
 #endif

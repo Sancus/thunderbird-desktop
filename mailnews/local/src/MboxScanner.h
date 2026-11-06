@@ -8,6 +8,10 @@
 #include "nsIInputStreamPump.h"
 #include "nsIStreamListener.h"
 #include "MboxMsgInputStream.h"
+#ifdef MOZ_PANORAMA
+#  include "LocalStoreMigrationLease.h"
+class MboxMigrationInput;
+#endif
 
 class nsIFile;
 class nsIStoreScanListener;
@@ -31,10 +35,24 @@ class MboxScanner : public nsIStreamListener {
 
   // If BeginScan() is successful, a reference-counted pointer to
   // scanListener will be held until the scan completes.
-  nsresult BeginScan(nsIFile* mboxFile, nsIStoreScanListener* scanListener);
+  nsresult BeginScan(
+      nsIFile* mboxFile, nsIStoreScanListener* scanListener
+#ifdef MOZ_PANORAMA
+      ,
+      mozilla::mailnews::LocalStoreMigrationWork* migration = nullptr
+#endif
+  );
 
  private:
-  virtual ~MboxScanner() = default;
+  virtual ~MboxScanner();
+  nsresult CloseInput(nsresult status);
+  void FinishScan(nsresult status);
+#ifdef MOZ_PANORAMA
+  RefPtr<mozilla::mailnews::LocalStoreMigrationWork> mMigrationWork;
+  RefPtr<MboxMigrationInput> mMigrationInput;
+#endif
+  bool mCloseAttempted = false;
+  bool mStopped = false;
   nsCOMPtr<nsIStoreScanListener> mScanListener;
 
   RefPtr<MboxScanner> mKungFuDeathGrip;

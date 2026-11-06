@@ -21,6 +21,8 @@ const { UIConversation } = ChromeUtils.importESModule(
   "resource:///modules/imConversations.sys.mjs"
 );
 const {
+  logs,
+  getChatLogArchive,
   getLogWriter,
   closeLogWriter,
   queueFileOperation,
@@ -30,6 +32,9 @@ const {
 } = ChromeUtils.importESModule("resource:///modules/logger.sys.mjs");
 const { applyChatSearchPrivacyReceipt } = ChromeUtils.importESModule(
   "resource:///modules/panorama/ChatSearchRedaction.sys.mjs"
+);
+const { openSearchWriter } = ChromeUtils.importESModule(
+  "resource:///modules/panorama/SearchMigrationHold.sys.mjs"
 );
 let privacyConversationId = 10000;
 
@@ -41,6 +46,7 @@ let privacyConversationId = 10000;
  * @returns {Promise<object>} Owned conversation, writer, provider and observer.
  */
 async function privacyFixture(name) {
+  logs.init();
   const conversation = Object.create(GenericConvIMPrototype);
   conversation._name = "buddy";
   conversation._date = new Date("2022-03-04T12:00:00Z").valueOf() * 1000;
@@ -127,6 +133,95 @@ async function writePrivacyMessage(fixture, id, text) {
   await gFilePromises.get(fixture.writer.currentPath);
 }
 
+/**
+ * Writes a stopped physical transcript and opens the real search provider.
+ * No live logger, protocol account, conversation or selected view is created.
+ *
+ * @param {string} name - Test-owned archive account and sidecar suffix.
+ * @returns {Promise<object>} Actual source bytes, scope, sidecar and provider.
+ */
+async function stoppedPrivacyFixture(name) {
+  const folder = PathUtils.join(
+    PathUtils.profileDir,
+    "logs",
+    "search-test",
+    name,
+    "buddy"
+  );
+  const path = PathUtils.join(folder, "2022-03-04.120000+0000.json");
+  const file = do_get_profile().clone();
+  file.append(name + ".sqlite");
+  const header = {
+    date: "2022-03-04T12:00:00.000Z",
+    name: "buddy",
+    title: "Retained stopped privacy",
+    account: name,
+    normalizedName: "buddy",
+    protocol: "search-test",
+    isChat: false,
+  };
+  const records = [
+    {
+      date: "2022-03-04T12:00:01.000Z",
+      who: "sender",
+      text: "stoppedprivateneedle",
+      flags: ["incoming"],
+      remoteId: "private-id",
+    },
+    {
+      date: "2022-03-04T12:00:02.000Z",
+      who: "sender",
+      text: "stoppedcontrolneedle",
+      flags: ["incoming"],
+      remoteId: "keep-id",
+    },
+  ];
+  const original = new TextEncoder().encode(
+    [header, ...records].map(row => JSON.stringify(row)).join("\n") + "\n"
+  );
+  const subject = {
+    noLog: true,
+    remoteId: "private-id",
+    conversation: {
+      account: {
+        normalizedName: name,
+        protocol: { normalizedName: "search-test" },
+      },
+      normalizedName: "buddy",
+      isChat: false,
+    },
+    get displayMessage() {
+      throw new Error("NoLog payload must never be read");
+    },
+    get who() {
+      throw new Error("NoLog sender must never be read");
+    },
+    get time() {
+      throw new Error("NoLog timestamp must never be read");
+    },
+  };
+  const fixture = {
+    folder,
+    path,
+    file,
+    id: chatSearchDocumentId(path),
+    header,
+    records,
+    original,
+    subject,
+    provider: null,
+  };
+  registerCleanupFunction(async () => {
+    await fixture.provider?.close();
+    await IOUtils.remove(folder, { recursive: true, ignoreAbsent: true });
+  });
+  await IOUtils.makeDirectory(folder, { createAncestors: true });
+  await IOUtils.write(path, original);
+  fixture.provider = await ChatSearchProvider.open(file);
+  Assert.ok((await fixture.provider.refreshLog(path)).indexed);
+  return fixture;
+}
+
 add_setup(function setupPrivacyPreferences() {
   const names = [
     "purple.logging.log_ims",
@@ -150,6 +245,146 @@ add_setup(function setupPrivacyPreferences() {
       }
     }
   });
+});
+
+// These stopped-source cases run before the normal live conversation fixtures.
+add_task(async function test_stoppedArchiveErasesSourceTextAndRecovery() {
+  const bag = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIPropertyBag2
+  );
+  Assert.equal(bag.getPropertyAsUint32("writer-history.chat"), 0);
+  const f = await stoppedPrivacyFixture("s508-stopped-privacy");
+  const [hit] = (await f.provider.search("stoppedprivateneedle")).items;
+  Assert.equal(hit.id, f.id);
+  const text = await f.provider.getText(f.id);
+  await f.provider.close();
+  const index = await PanoramaSearchIndex.open(f.file, async () => null);
+  try {
+    // Actual quarantined storage for this transcript, not a legacy import or
+    // invented eligible document. The null document cannot authorize a hit.
+    await index.retainRecovery([
+      {
+        recordId: "stopped-recovery-" + f.id,
+        documentId: f.id,
+        kind: "chat",
+        sourceRevision: text.contentRevision,
+        payload: { header: f.header, records: f.records },
+        document: null,
+      },
+    ]);
+  } finally {
+    await index.close();
+  }
+  f.provider = await ChatSearchProvider.open(f.file);
+  const [retained] = await f.provider.getRecoveryRecords(f.id);
+  Assert.equal(retained.payload.records[0].text, "stoppedprivateneedle");
+  Assert.deepEqual(await f.provider.redactMessage(f.subject), [f.path]);
+  const erasedSource = await IOUtils.readUTF8(f.path);
+  Assert.ok(!erasedSource.includes("stoppedprivateneedle"));
+  Assert.ok(erasedSource.includes("stoppedcontrolneedle"));
+  Assert.equal(
+    (await f.provider.getText(f.id)).body,
+    "sender: stoppedcontrolneedle"
+  );
+  Assert.deepEqual((await f.provider.search("stoppedprivateneedle")).items, []);
+  Assert.equal((await f.provider.resolveLog(hit)).status, "stale");
+  const [erased] = await f.provider.getRecoveryRecords(f.id);
+  Assert.ok(erased.erased);
+  Assert.equal(erased.payload, null);
+  await openSearchWriter("chat-search", async work => {
+    const archive = await getChatLogArchive(work);
+    const state = await archive.getChatPrivacyState();
+    Assert.ok(
+      !state.pending.some(row => row.scope.account === f.header.account)
+    );
+    Assert.ok(
+      state.completed.some(
+        row =>
+          row.scope.account === f.header.account && row.targets.length === 1
+      )
+    );
+    Assert.strictEqual(state.historyKnown, false);
+  });
+  await f.provider.close();
+  await openSearchWriter("chat-search", async work => {
+    const archive = await getChatLogArchive(work);
+    await archive.queueFileOperation(f.path, wait =>
+      wait(() => IOUtils.write(f.path, f.original))
+    );
+  });
+  f.provider = await ChatSearchProvider.open(f.file);
+  Assert.equal(
+    await f.provider.getText(f.id),
+    null,
+    "Receipt replay erases rather than publishing a row"
+  );
+  Assert.ok(!(await IOUtils.readUTF8(f.path)).includes("stoppedprivateneedle"));
+  await f.provider.refreshLog(f.path);
+  Assert.equal(
+    (await f.provider.getText(f.id)).body,
+    "sender: stoppedcontrolneedle"
+  );
+  Assert.deepEqual((await f.provider.search("stoppedprivateneedle")).items, []);
+  const [replayed] = await f.provider.getRecoveryRecords(f.id);
+  Assert.ok(replayed.erased);
+  Assert.equal(replayed.payload, null);
+  Assert.equal(
+    bag.getPropertyAsUint32("writer-history.chat"),
+    0,
+    "Actual stopped erasure/replay did not start live Chat"
+  );
+});
+
+add_task(async function test_stoppedArchiveCancellationRetainsPendingReceipt() {
+  const f = await stoppedPrivacyFixture("s508-stopped-cancel");
+  const receipt = await openSearchWriter("chat-search", async work => {
+    const archive = await getChatLogArchive(work);
+    return archive.captureChatPrivacyIntent(f.subject);
+  });
+  Assert.equal(receipt.targets.length, 1);
+  const reason = new Error(
+    "Cancel while the real archive file queue is reading"
+  );
+  await openSearchWriter("chat-search", async work => {
+    const archive = await getChatLogArchive(work);
+    const controller = new AbortController();
+    const reading = archive.queueFileOperation(f.path, async wait => {
+      await wait(() => IOUtils.read(f.path));
+      controller.abort(reason);
+    });
+    const erasing = applyChatSearchPrivacyReceipt(receipt, {
+      signal: controller.signal,
+      archive,
+    });
+    erasing.catch(() => {});
+    await reading;
+    await Assert.rejects(erasing, error => error === reason);
+    Assert.deepEqual([...(await IOUtils.read(f.path))], [...f.original]);
+    const state = await archive.getChatPrivacyState();
+    Assert.ok(
+      state.pending.some(row => row.id === receipt.id),
+      "Canceled actual IO cannot acknowledge privacy completion"
+    );
+  });
+  await f.provider.close();
+  f.provider = await ChatSearchProvider.open(f.file);
+  Assert.equal(await f.provider.getText(f.id), null);
+  await f.provider.refreshLog(f.path);
+  Assert.equal(
+    (await f.provider.getText(f.id)).body,
+    "sender: stoppedcontrolneedle"
+  );
+  Assert.deepEqual((await f.provider.search("stoppedprivateneedle")).items, []);
+  await openSearchWriter("chat-search", async work => {
+    const archive = await getChatLogArchive(work);
+    const state = await archive.getChatPrivacyState();
+    Assert.ok(!state.pending.some(row => row.id === receipt.id));
+    Assert.ok(state.completed.some(row => row.id === receipt.id));
+  });
+  const bag = Cc["@mozilla.org/mailnews/migration-writer-lease;1"].getService(
+    Ci.nsIPropertyBag2
+  );
+  Assert.equal(bag.getPropertyAsUint32("writer-history.chat"), 0);
 });
 
 add_task(

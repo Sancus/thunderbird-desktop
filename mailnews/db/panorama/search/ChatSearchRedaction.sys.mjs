@@ -197,20 +197,23 @@ function privacyReplacement(snapshot, receipt) {
  * @param {{id: string, remoteId: string, targets: object[]}} receipt - Stored receipt.
  * @param {object} [options={}] - Existing source cancellation control.
  * @param {AbortSignal} [options.signal] - Cancels before queued reads.
+ * @param {?object} [options.archive=null] - Logger archive bound to actual pending
+ *   chat-search work. Omission keeps the native Chat-gated live reader.
  * @returns {Promise<boolean>} Whether a captured, non-erased version remains.
  * @throws {Error} Original cancellation, source or receipt verification error.
  */
-export async function chatSearchPrivacyNeedsErasure(receipt, { signal } = {}) {
+export async function chatSearchPrivacyNeedsErasure(
+  receipt,
+  { signal, archive = null } = {}
+) {
   let changed = false;
   for (const target of receipt.targets) {
     signal?.throwIfAborted();
-    const snapshot = await readChatPrivacyTarget(
-      receipt.id,
-      target.relativePath,
-      {
-        signal,
-      }
-    );
+    const snapshot = await (archive
+      ? archive.readChatPrivacyTarget(receipt.id, target.relativePath, {
+          signal,
+        })
+      : readChatPrivacyTarget(receipt.id, target.relativePath, { signal }));
     if (!snapshot.missing) {
       const replacement = privacyReplacement(snapshot, receipt);
       changed = replacement.changed || changed;
@@ -228,25 +231,29 @@ export async function chatSearchPrivacyNeedsErasure(receipt, { signal } = {}) {
  * @param {{id: string, remoteId: string, targets: object[]}} receipt - Stored receipt.
  * @param {object} [options={}] - Source cancellation control.
  * @param {AbortSignal} [options.signal] - Cancels before starting a source write.
+ * @param {?object} [options.archive=null] - Logger archive over the actual pending
+ *   chat-search operation. Its queue validates ownership around every I/O step.
+ *   Omission keeps the native Chat-gated live target reader and file queue.
  * @returns {Promise<string[]>} All verified target paths, including unchanged ones.
  * @throws {Error} Original I/O/cancellation or changed-source verification error.
  */
-export async function applyChatSearchPrivacyReceipt(receipt, { signal } = {}) {
+export async function applyChatSearchPrivacyReceipt(
+  receipt,
+  { signal, archive = null } = {}
+) {
   const paths = [];
   for (const target of receipt.targets) {
     signal?.throwIfAborted();
-    const snapshot = await readChatPrivacyTarget(
-      receipt.id,
-      target.relativePath,
-      {
-        signal,
-      }
-    );
-    await queueFileOperation(snapshot.path, async () => {
+    const snapshot = await (archive
+      ? archive.readChatPrivacyTarget(receipt.id, target.relativePath, {
+          signal,
+        })
+      : readChatPrivacyTarget(receipt.id, target.relativePath, { signal }));
+    const erase = async wait => {
       signal?.throwIfAborted();
       if (snapshot.missing) {
         try {
-          await IOUtils.stat(snapshot.path);
+          await wait(() => IOUtils.stat(snapshot.path));
         } catch (error) {
           if (error.name == "NotFoundError") {
             return;
@@ -255,19 +262,26 @@ export async function applyChatSearchPrivacyReceipt(receipt, { signal } = {}) {
         }
         throw new Error("Chat source reappeared before privacy completion");
       }
-      const bytes = await IOUtils.read(snapshot.path);
+      const bytes = await wait(() => IOUtils.read(snapshot.path));
       if (privacyDigest(bytes) !== snapshot.revision) {
         throw new Error("Chat source changed before privacy erasure");
       }
       const replacement = privacyReplacement({ ...snapshot, bytes }, receipt);
       if (replacement.changed) {
         signal?.throwIfAborted();
-        await IOUtils.writeUTF8(snapshot.path, replacement.text, {
-          tmpPath: snapshot.path + ".panorama-redaction.tmp",
-          flush: true,
-        });
+        await wait(() =>
+          IOUtils.writeUTF8(snapshot.path, replacement.text, {
+            tmpPath: snapshot.path + ".panorama-redaction.tmp",
+            flush: true,
+          })
+        );
       }
-    });
+    };
+    if (archive) {
+      await archive.queueFileOperation(snapshot.path, erase);
+    } else {
+      await queueFileOperation(snapshot.path, () => erase(step => step()));
+    }
     paths.push(snapshot.path);
   }
   return paths;

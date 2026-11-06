@@ -26,6 +26,10 @@ run-if = [
 run-if = ["nightly_build"]
 tags = ["panorama"]
 
+["test_panorama_search_rebuild.py"]
+run-if = ["nightly_build"]
+tags = ["panorama"]
+
 ["test_panorama_send_later.py"]
 run-if = ["nightly_build"]
 tags = ["panorama"]

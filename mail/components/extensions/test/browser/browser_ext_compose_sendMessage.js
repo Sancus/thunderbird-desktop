@@ -915,7 +915,7 @@ async function checkImapFcc(retry) {
   const body = "Exactly one SMTP delivery and one confirmed IMAP sent copy.";
   const sentCount = gSentMessages.length;
   let prompts = 0;
-  const originalPrompt = Services.prompt;
+  let recoveryDialog;
   let loaded = false;
   let cleaned = false;
   const notifications = { added: [], classified: [] };
@@ -944,7 +944,9 @@ async function checkImapFcc(retry) {
     }
     cleaned = true;
     MailServices.mfn.removeListener(folderListener);
-    Services.prompt = originalPrompt;
+    if (recoveryDialog && !recoveryDialog.closed) {
+      recoveryDialog.close();
+    }
     imap.daemon.commandToFail = "";
     for (const win of Services.wm.getEnumerator("msgcompose")) {
       if (win.gMsgCompose.compFields.subject == subject) {
@@ -967,16 +969,23 @@ async function checkImapFcc(retry) {
     folderListener,
     MailServices.mfn.msgAdded | MailServices.mfn.msgsClassified
   );
+  let recovery = Promise.resolve();
   if (retry) {
     imap.daemon.commandToFail = "APPEND";
-    Services.prompt = {
-      QueryInterface: ChromeUtils.generateQI(["nsIPromptService"]),
-      confirmEx() {
+    recovery = BrowserTestUtils.promiseAlertDialog(undefined, undefined, {
+      async callback(win) {
+        recoveryDialog = win;
+        await TestUtils.waitForTick();
         prompts++;
         Assert.equal(
           prompts,
           1,
           "The real failed APPEND asks once for recovery"
+        );
+        Assert.stringContains(
+          win.document.getElementById("infoBody").textContent,
+          sent.localizedName,
+          "The real recovery dialog names the configured sent folder"
         );
         Assert.equal(
           imap.daemon.getMailbox("ConfiguredSent")._messages.length,
@@ -989,9 +998,10 @@ async function checkImapFcc(retry) {
           "SMTP has already succeeded before copy recovery"
         );
         imap.daemon.commandToFail = "";
-        return 0; // Retry the copy, not the already delivered SMTP message.
+        // Retry the copy, not the already delivered SMTP message.
+        win.document.querySelector("dialog").getButton("accept").click();
       },
-    };
+    });
   }
   const extension = ExtensionTestUtils.loadExtension({
     files: {
@@ -1112,7 +1122,7 @@ async function checkImapFcc(retry) {
   });
   await extension.startup();
   loaded = true;
-  await extension.awaitFinish("imap-fcc");
+  await Promise.all([extension.awaitFinish("imap-fcc"), recovery]);
   await cleanup();
 }
 

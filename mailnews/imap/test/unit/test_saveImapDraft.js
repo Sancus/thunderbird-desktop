@@ -419,11 +419,32 @@ add_task(async function test_fileAppendClassifiesBeforeCompletionOnce() {
         classifiedHeader = header;
         Assert.equal(header, addedHeader, "Classify the actual added header");
         Assert.equal(header.messageKey, keys[0]);
+        const database = folder.msgDatabase;
+        const lookup = database.getMsgHdrForKey(keys[0]);
         Assert.equal(
-          folder.msgDatabase.getMsgHdrForKey(header.messageKey),
-          header,
-          "Synchronous notification reads the same live physical header"
+          database.getMsgHdrForKey(keys[0]),
+          lookup,
+          "This facade retains the same checked lookup in its header cache"
         );
+        Assert.equal(lookup.messageKey, header.messageKey);
+        Assert.equal(lookup.messageKey, keys[0]);
+        Assert.equal(lookup.folder, folder);
+        Assert.equal(lookup.folder.id, header.folder.id);
+        Assert.equal(lookup.folder.URI, header.folder.URI);
+        Assert.equal(database.folder.id, folder.id);
+        Assert.equal(database.dBFolderInfo.imapUidValidity, 9567);
+        Assert.equal(
+          lookup.getUint32Property("uidOnServer"),
+          header.getUint32Property("uidOnServer")
+        );
+        Assert.equal(lookup.messageId, header.messageId);
+        Assert.equal(lookup.flags, header.flags);
+        Assert.ok(lookup.flags & Ci.nsMsgMessageFlags.Offline);
+        Assert.equal(lookup.storeToken, header.storeToken);
+        Assert.equal(lookup.messageSize, header.messageSize);
+        Assert.equal(lookup.offlineMessageSize, header.offlineMessageSize);
+        Assert.equal(lookup.lineCount, header.lineCount);
+        Assert.equal(readOnlineIdentityBody(folder, lookup.storeToken), raw);
         Assert.equal(header.getUint32Property("uidOnServer"), 91007);
         Assert.equal(readOnlineIdentityBody(folder, header.storeToken), raw);
         Assert.equal(junkProcessed, false);

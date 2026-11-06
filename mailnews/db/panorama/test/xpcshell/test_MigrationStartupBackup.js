@@ -23,9 +23,10 @@ do_get_profile();
 /**
  * Creates real profile and external-store files outside the running profile.
  *
+ * @param {number} [bodySize=257] - Real binary message fixture size.
  * @returns {Promise<object>} Disposable source and destination paths.
  */
-async function startupCopyFixture() {
+async function startupCopyFixture(bodySize = 257) {
   const root = await IOUtils.createUniqueDirectory(
     PathUtils.tempDir,
     "startup-copy-"
@@ -52,7 +53,7 @@ async function startupCopyFixture() {
     "original mbox bytes\n"
   );
   const body = PathUtils.join(external, "Inbox", "cur", "message");
-  const bytes = new Uint8Array(1024 * 1024 + 37);
+  const bytes = new Uint8Array(bodySize);
   for (let index = 0; index < bytes.length; index++) {
     bytes[index] = index % 251;
   }
@@ -62,7 +63,9 @@ async function startupCopyFixture() {
 }
 
 add_task(async function test_realBytesMatchExistingVerifierAndRestore() {
-  const { root, profile, external, body, backup } = await startupCopyFixture();
+  const { root, profile, external, body, backup } = await startupCopyFixture(
+    1024 * 1024 + 37
+  );
   const originalHash = await IOUtils.computeHexDigest(body, "sha256");
   const result = createMigrationBackupAtStartup(profile, [external], backup);
   Assert.ok(!result.then, "The startup copy completes without an event loop");

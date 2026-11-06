@@ -16,11 +16,8 @@
 var { be_in_folder, create_folder } = ChromeUtils.importESModule(
   "resource://testing-common/mail/FolderDisplayHelpers.sys.mjs"
 );
-var { inboxFolder } = ChromeUtils.importESModule(
-  "resource://testing-common/mail/MessageInjectionHelpers.sys.mjs"
-);
-var { add_message_to_folder, create_message } = ChromeUtils.importESModule(
-  "resource://testing-common/mail/MessageInjectionHelpers.sys.mjs"
+var { MessageGenerator } = ChromeUtils.importESModule(
+  "resource://testing-common/mailnews/MessageGenerator.sys.mjs"
 );
 var { AttachmentInfo } = ChromeUtils.importESModule(
   "resource:///modules/AttachmentInfo.sys.mjs"
@@ -35,22 +32,28 @@ var { MailUtils } = ChromeUtils.importESModule(
 const tabmail = document.getElementById("tabmail");
 const about3Pane = tabmail.currentAbout3Pane;
 
+let inboxFolder;
 let targetFolder;
 
 add_setup(async function () {
   targetFolder = await create_folder("DragDropTarget");
   targetFolder.setFlag(Ci.nsMsgFolderFlags.Mail);
 
-  // Put a test message in the inbox so we have a valid URL for the data
-  // transfer used in the drag-and-drop test.
-  await add_message_to_folder(
-    [inboxFolder],
-    create_message({ subject: "Test message for drag source" })
-  );
+  // Own the drag source too. MessageInjectionHelpers creates a persistent
+  // local Inbox at import time, which changes later folder-pane fixtures.
+  inboxFolder = await create_folder("DragDropSource");
+  inboxFolder
+    .QueryInterface(Ci.nsIMsgLocalMailFolder)
+    .addMessage(
+      new MessageGenerator()
+        .makeMessage({ subject: "Test message for drag source" })
+        .toMessageString()
+    );
 });
 
 registerCleanupFunction(() => {
   targetFolder.parent.propagateDelete(targetFolder, true);
+  inboxFolder.parent.propagateDelete(inboxFolder, true);
 });
 
 /**

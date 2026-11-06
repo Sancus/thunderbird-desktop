@@ -32,12 +32,17 @@ function checkUnlockedPref(prefName, prefValue) {
 }
 
 async function withNewTab(options, taskFn) {
+  const expectedURI = Services.io.newURI(options.url);
   let pageLoaded;
   const tab = window.openTab("contentTab", {
     url: options.url,
+    duplicate: true,
     onListener(browser) {
       pageLoaded = BrowserTestUtils.browserLoaded(browser, {
-        wantLoad: options.url,
+        // Preferences selects a category fragment before its load event.
+        wantLoad: url =>
+          Services.io.newURI(url).specIgnoringRef ==
+          expectedURI.specIgnoringRef,
       });
     },
   });

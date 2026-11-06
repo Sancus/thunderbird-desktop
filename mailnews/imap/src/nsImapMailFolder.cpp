@@ -9634,7 +9634,7 @@ nsresult nsImapMailFolder::PublishNativeOnlineTransfer(
         index, this, entry.mapping, entry.live));
   }
   if (state->m_nativeOnlineAppend) state->m_appendUID = uid;
-  nsCOMPtr<nsIMsgDBHdr> published = entry.live;
+  nsCOMPtr<nsIMsgDBHdr> published = entry.live.get();
   nsCOMPtr<nsIFile> fileSource;
   if (heldState->m_nativeOnlineAppend.get() == &entry) {
     fileSource = do_QueryInterface(heldState->m_srcSupport);

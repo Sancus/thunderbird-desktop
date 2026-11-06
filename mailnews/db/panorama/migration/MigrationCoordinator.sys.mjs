@@ -353,17 +353,17 @@ async function resumeMorkBooksWithProfile(journal, checkLock, signal) {
 }
 
 /**
- * Imports and publishes complete books under an owned current-profile lock.
- * Acquires the selected native profile lock before any publication intent.
- * Releases the lock after imports, Manager adoption and journal writes settle.
- * The caller awaits this entry before address-book writers start. Existing
- * stage-only imports and the separate whole-profile activation hold remain.
+ * Imports and publishes complete books in the selected startup profile.
+ * The startup caller retains its native profile lock throughout this operation.
+ * This entry never acquires or releases that process-lifetime lock. The caller
+ * awaits imports, Manager adoption and journal writes before writers start.
+ * Existing stage-only imports and the whole-profile activation hold remain.
  * A Manager commit precedes its journal write; a retry uses the original public
  * book identity and full scoped maps instead of importing or notifying twice.
  *
  * @param {MigrationJournal} journal - Actual backed-up import/validation journal.
- * @param {nsIToolkitProfile} profile - Actual current profile, with no caller-held
- *   native lock. The publication operation acquires and releases its own lock.
+ * @param {nsIToolkitProfile} profile - Actual startup-selected current profile.
+ *   The caller retains the startup profile lock through all settled work.
  * @param {Map<string, string>} bookNames - Exact planned ID/display-name pairs.
  * @param {AbortSignal} [signal] - Cancellation after a settled book boundary.
  * @returns {Promise<object[]>} Actual Manager directories and publication maps.

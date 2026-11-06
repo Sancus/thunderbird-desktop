@@ -285,14 +285,16 @@ function checkMigrationBookReceipt(actual, expected) {
 }
 
 /**
- * Copies a closed stage to an exclusively created file, retaining every failure.
+ * Copies a closed stage to an exclusive private sibling, retaining failures.
  *
  * @param {nsIFile} source - Validated closed SQLite stage.
- * @param {nsIFile} destination - Missing destination; never overwritten.
+ * @param {nsIFile} destination - Stable target used only to name its sibling.
+ * @returns {nsIFile} Complete closed private copy; not yet a published target.
  */
 function copyMigrationBook(source, destination) {
   let input;
   let output;
+  let temporary;
   let firstError;
   try {
     input = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
@@ -306,8 +308,12 @@ function copyMigrationBook(source, destination) {
     output = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(
       Ci.nsIFileOutputStream
     );
-    // PR_WRONLY | PR_CREATE_FILE | PR_EXCL: never truncate an existing file.
-    output.init(destination, 0x02 | 0x08 | 0x80, 0o600, 0);
+    temporary = destination.clone();
+    temporary.leafName += ".copy";
+    temporary.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+    // Only the file exclusively created above is opened. A failed or interrupted
+    // copy remains private evidence and never occupies the stable target.
+    output.init(temporary, 0x02, 0o600, 0);
     const size = source.fileSize;
     const modified = source.lastModifiedTime;
     for (let remaining = size; remaining > 0; ) {
@@ -349,6 +355,44 @@ function copyMigrationBook(source, destination) {
   if (firstError) {
     throw firstError;
   }
+  return temporary;
+}
+
+/**
+ * Moves a complete private copy to a still-missing, owned stable destination.
+ *
+ * @param {nsIFile} temporary - Fully validated, closed exclusive private copy.
+ * @param {nsIFile} target - Stable destination which must remain absent.
+ * @param {function(): nsIFile} checkProfile - Current startup-owner check.
+ * @param {string} key - Exact prepared ownership preference.
+ * @param {string} prepared - Exact serialized ownership record.
+ * @throws {Error} For changed ownership or any occupied/linked destination.
+ */
+function publishMigrationBookCopy(
+  temporary,
+  target,
+  checkProfile,
+  key,
+  prepared
+) {
+  const profile = checkProfile();
+  let linked = false;
+  try {
+    linked = target.isSymlink();
+  } catch (error) {
+    if (error.result !== Cr.NS_ERROR_FILE_NOT_FOUND) {
+      throw error;
+    }
+  }
+  if (
+    Services.prefs.getStringPref(key) !== prepared ||
+    linked ||
+    target.exists()
+  ) {
+    throw new Error("Migration book publication ownership changed");
+  }
+  // No yield or replacement of an existing file between this check and move.
+  temporary.moveTo(profile, target.leafName);
 }
 
 /**
@@ -401,32 +445,35 @@ function checkMigrationBookAuxiliaries(stage) {
 }
 
 /**
- * Runs one quiesced whole-book publication under a private native profile lock.
+ * Settles whole-book publication under the process's selected startup profile.
  *
- * The caller must transfer at a boundary where it owns no other profile lock
- * or writer. The capability closes when the callback settles. Every adoption
- * started during that callback settles before the actual native unlock, even
- * if the callback fails. No native lock escapes this operation.
+ * The startup caller retains its native profile lock and quiesces other writers
+ * throughout the callback and every started adoption. This operation neither
+ * acquires nor releases that lock. Its capability closes when the callback
+ * settles; pending adoptions still drain before this operation ends.
  *
- * @param {nsIToolkitProfile} profile - Genuine native current profile.
- * @param {function(object): *} callback - Complete import/publication
- *   and journal checkpoint, using only checkProfile() and adopt(options).
- * @returns {Promise<*>} Callback result after all started adoptions and unlock.
- * @throws {Error} On wrong profile, actual native acquisition/callback/adoption
- *   failure, or cleanup failure when no earlier failure exists. A captured
- *   closed capability refuses with "Book publication operation is closed".
+ * @param {nsIToolkitProfile} profile - Genuine named startup-selected profile,
+ *   whose canonical root is the current ProfD.
+ * @param {function(object): *} callback - Complete import/publication and journal
+ *   checkpoint, using only checkProfile() and adopt(options).
+ * @returns {Promise<*>} Callback result after all started adoptions settle.
+ * @throws {Error} On an unselected/wrong profile or callback/adoption failure,
+ *   retaining the first actual error. A captured closed capability refuses with
+ *   "Book publication operation is closed".
  */
 export async function withMigrationAddressBookPublication(profile, callback) {
   if (typeof callback != "function") {
     throw new TypeError("Expected a whole-book publication callback");
   }
   const nativeProfile = profile.QueryInterface(Ci.nsIToolkitProfile);
+  const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
+    Ci.nsIToolkitProfileService
+  );
   const selected = migrationBookFile(nativeProfile.rootDir);
   const current = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
-  if (!selected.equals(current)) {
+  if (profiles.currentProfile !== nativeProfile || !selected.equals(current)) {
     throw new Error("Migration book lock selects another profile");
   }
-  const lock = nativeProfile.lock({});
   let accepting = true;
   let held = true;
   let failed = false;
@@ -444,10 +491,13 @@ export async function withMigrationAddressBookPublication(profile, callback) {
     if (!held) {
       throw closedError();
     }
-    // This getter is safe: only this closure owns or releases the native lock.
-    const actual = migrationBookFile(lock.directory);
+    const actual = migrationBookFile(nativeProfile.rootDir);
     const now = migrationBookFile(Services.dirsvc.get("ProfD", Ci.nsIFile));
-    if (!actual.equals(selected) || !actual.equals(now)) {
+    if (
+      profiles.currentProfile !== nativeProfile ||
+      !actual.equals(selected) ||
+      !actual.equals(now)
+    ) {
       throw new Error("Migration book lock selects another profile");
     }
     return actual.clone();
@@ -484,15 +534,6 @@ export async function withMigrationAddressBookPublication(profile, callback) {
       rememberError(error);
     }
     held = false;
-    try {
-      lock.unlock();
-    } catch (error) {
-      if (failed) {
-        console.error("Could not unlock failed book publication", error);
-      } else {
-        rememberError(error);
-      }
-    }
   }
   if (failed) {
     throw firstError;
@@ -503,7 +544,7 @@ export async function withMigrationAddressBookPublication(profile, callback) {
 /**
  * Publishes one complete, closed legacy-book stage in the current profile.
  *
- * The owning callback retains its private native profile lock through its
+ * The startup caller retains its native profile lock through the callback's
  * journal checkpoint. The original source, stage and backup are never removed. A
  * prepared preference record owns a retry artifact but is not a live book.
  * The complete normal directory is stored before its single create event.
@@ -514,12 +555,12 @@ export async function withMigrationAddressBookPublication(profile, callback) {
  * @param {object} options.receipt - Settled source/token/hash/size/cards/lists.
  * @param {string} options.bookUID - Stable book UID from the durable intent.
  * @param {string} options.dirName - Exact selected display name.
- * @param {function(): nsIFile} checkProfile - Owning scope's held-profile check.
+ * @param {function(): nsIFile} checkProfile - Startup-selected profile check.
  * @returns {Promise<{directory: nsIAbDirectory, dirPrefId: string, uri: string,
  *   fileName: string, bookUID: string, sourceId: string, storageSourceId: string,
  *   sourceSha256: string, sourceSize: number, cards: [number, string][],
  *   lists: [number, string][], reused: boolean}>} Durable owning directory/maps.
- * @throws {Error} For lost/wrong lock, changed/incomplete data, unrelated
+ * @throws {Error} For a changed/wrong profile, changed/incomplete data, unrelated
  *   occupants, active stage writers or IO/storage/preference/directory errors.
  *   A preference change during a pending snapshot rejects with IN_PROGRESS;
  *   the caller can retry without losing the newer preference values.
@@ -838,7 +879,24 @@ async function adoptMigrationAddressBook(
       }
     }
     if (!target.exists()) {
-      copyMigrationBook(stage, target);
+      const temporary = copyMigrationBook(stage, target);
+      checkMigrationBookReceipt(
+        lazy.SQLiteDirectory.validateMigrationBook(
+          migrationBookFile(temporary),
+          bytes,
+          expected.storageSourceId,
+          { requireClosed: true }
+        ),
+        expected
+      );
+      checkMigrationBookAuxiliaries(temporary);
+      publishMigrationBookCopy(
+        temporary,
+        target,
+        checkProfile,
+        key,
+        JSON.stringify({ ...identity, state: "prepared" })
+      );
     }
     if (!migrationBookFile(target).isFile()) {
       throw new Error("Migration book destination is not a regular file");

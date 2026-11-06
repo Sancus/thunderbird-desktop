@@ -1051,6 +1051,7 @@ add_task(unixOnly(), async function test_killedSettledImportReopensReadOnly() {
 });
 
 let publicationProfile;
+let publicationLock;
 
 /** Closes actual Manager connections before a controlled publication/restart. */
 async function reloadPublishedBooks() {
@@ -1067,7 +1068,7 @@ async function reloadPublishedBooks() {
 }
 
 /**
- * Plans genuine book bytes under a native lock, then releases that lock.
+ * Plans genuine book bytes under the retained native startup-profile lock.
  * Other-profile staging cases above retain their original stage-only lifetime.
  *
  * @returns {Promise<object>} Actual current profile, genuine source, backup,
@@ -1080,68 +1081,74 @@ async function publicationInput() {
       "s520-current-publication",
       "tests"
     );
+    const selected = {};
+    profiles.selectStartupProfile(
+      ["xpcshell", "-P", publicationProfile.name],
+      false,
+      AppConstants.MOZ_UPDATE_CHANNEL,
+      "",
+      {},
+      {},
+      selected
+    );
+    Assert.strictEqual(selected.value, publicationProfile);
+    Assert.strictEqual(profiles.currentProfile, publicationProfile);
+    publicationLock = publicationProfile.lock({});
     registerCleanupFunction(async () => {
       await reloadPublishedBooks();
+      publicationLock.unlock();
       publicationProfile.remove(false);
     });
   }
   await reloadPublishedBooks();
-  // Prepare the genuine source and backup before transferring lock ownership.
-  const preparationLock = publicationProfile.lock({});
-  try {
-    const id = "publication-book-" + ++serial;
-    const root = PathUtils.join(do_get_tempdir().path, id);
-    await IOUtils.makeDirectory(root);
-    const profilePath = preparationLock.directory.path;
-    const source = PathUtils.join(profilePath, id + ".mab");
-    const bytes = await IOUtils.read(do_get_file(MAB_FILE).path);
-    await IOUtils.copy(do_get_file(MAB_FILE).path, source);
-    const { identity } = await readMorkAddressBookSource(source);
-    const stagingPath = PathUtils.join(root, "book.sqlite");
-    const path = PathUtils.join(root, "journal.json");
-    const backupPath = PathUtils.join(root, "backup");
-    const journal = await MigrationJournal.create(path, {
-      profilePath,
-      mailPaths: [],
-      backupPath,
-      sources: [],
-      books: [{ id, ...identity, stagingPath }],
-    });
-    const input = {
-      id,
-      root,
-      profilePath,
-      source,
-      bytes,
-      stagingPath,
-      path,
-      backupPath,
-      journal,
-      profile: publicationProfile,
-      names: new Map([[id, "Actual imported book é"]]),
-    };
-    registerCleanupFunction(() => input.journal.close());
-    input.backup = await createMigrationBackup(profilePath, [], backupPath);
-    await input.journal.recordBackup(input.backup);
-    return input;
-  } finally {
-    preparationLock.unlock();
-  }
+  // This lock stands in for the process-lifetime lock held by real XRE startup.
+  // Reuse it for preparation, publication and journal work, without relocking.
+  const id = "publication-book-" + ++serial;
+  const root = PathUtils.join(do_get_tempdir().path, id);
+  await IOUtils.makeDirectory(root);
+  const profilePath = publicationLock.directory.path;
+  const source = PathUtils.join(profilePath, id + ".mab");
+  const bytes = await IOUtils.read(do_get_file(MAB_FILE).path);
+  await IOUtils.copy(do_get_file(MAB_FILE).path, source);
+  const { identity } = await readMorkAddressBookSource(source);
+  const stagingPath = PathUtils.join(root, "book.sqlite");
+  const path = PathUtils.join(root, "journal.json");
+  const backupPath = PathUtils.join(root, "backup");
+  const journal = await MigrationJournal.create(path, {
+    profilePath,
+    mailPaths: [],
+    backupPath,
+    sources: [],
+    books: [{ id, ...identity, stagingPath }],
+  });
+  const input = {
+    id,
+    root,
+    profilePath,
+    source,
+    bytes,
+    stagingPath,
+    path,
+    backupPath,
+    journal,
+    profile: publicationProfile,
+    names: new Map([[id, "Actual imported book é"]]),
+  };
+  registerCleanupFunction(() => input.journal.close());
+  input.backup = await createMigrationBackup(profilePath, [], backupPath);
+  await input.journal.recordBackup(input.backup);
+  return input;
 }
 
 /**
- * Imports a corruption/error fixture under a separate actual native lock.
+ * Imports a corruption/error fixture under the retained startup native lock.
  *
  * @param {object} input - Current-profile journal and native toolkit profile.
  * @returns {Promise<void>} Complete original stage-only import receipt.
  */
 async function stagePublicationInput(input) {
-  const lock = input.profile.lock({});
-  try {
-    await resumeMorkBookImports(input.journal, lock);
-  } finally {
-    lock.unlock();
-  }
+  Assert.strictEqual(input.profile, profiles.currentProfile);
+  await resumeMorkBookImports(input.journal, publicationLock);
 }
 
 /** @returns {{topics: string[], close: Function}} Actual creation events. */
@@ -1323,6 +1330,7 @@ add_task(
       input.names
     );
     assertPublishedBook(input, published);
+    await assertStartupProfileRemainsLocked(input);
     Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
     const before = await IOUtils.read(input.path);
     const [again] = await resumeMorkBookImportsAndPublish(
@@ -1353,12 +1361,6 @@ add_task(
  * @returns {Promise<object>} Child's independent public values, not parent data.
  */
 async function readPublishedBookInChild(input, published) {
-  const { Subprocess } = ChromeUtils.importESModule(
-    "resource://gre/modules/Subprocess.sys.mjs"
-  );
-  const { TestUtils } = ChromeUtils.importESModule(
-    "resource://testing-common/TestUtils.sys.mjs"
-  );
   await reloadPublishedBooks();
   const profileDirectories = Object.fromEntries(
     ["DefProfRt", "DefProfLRt", "UAppData"].map(key => [
@@ -1448,6 +1450,38 @@ async function readPublishedBookInChild(input, published) {
     Services.tm.spinEventLoopUntil("TestMigrationBook:PublicReopen", () => finished);
     quit(exitCode);
   `;
+  // A real process restart transfers lifetime only after normal Manager close.
+  publicationLock.unlock();
+  publicationLock = null;
+  try {
+    const output = await runPublicationChild(code);
+    const line = output
+      .split("\n")
+      .find(value => value.startsWith("BOOK-PUBLICATION-REOPEN "));
+    Assert.ok(
+      line,
+      "Actual process reopens the persisted public book: " +
+        JSON.stringify(output)
+    );
+    return JSON.parse(line.slice("BOOK-PUBLICATION-REOPEN ".length));
+  } finally {
+    publicationLock = input.profile.lock({});
+  }
+}
+
+/**
+ * Runs a genuine bounded native process and returns its captured stdout.
+ *
+ * @param {string} code - Actual native child operation.
+ * @returns {Promise<string>} Complete output from a successful real process.
+ */
+async function runPublicationChild(code) {
+  const { Subprocess } = ChromeUtils.importESModule(
+    "resource://gre/modules/Subprocess.sys.mjs"
+  );
+  const { TestUtils } = ChromeUtils.importESModule(
+    "resource://testing-common/TestUtils.sys.mjs"
+  );
   let child;
   let output = "";
   let terminal;
@@ -1481,7 +1515,7 @@ async function readPublishedBookInChild(input, published) {
     })();
     await TestUtils.waitForCondition(
       () => done,
-      "Actual public-book process exits",
+      "Actual publication fixture process exits",
       100,
       300
     );
@@ -1491,24 +1525,64 @@ async function readPublishedBookInChild(input, published) {
     Assert.equal(
       terminal.exitCode,
       0,
-      "Actual Manager process-reopen exits successfully: " +
+      "Actual publication fixture process exits successfully: " +
         JSON.stringify(output)
     );
-    const line = output
-      .split("\n")
-      .find(value => value.startsWith("BOOK-PUBLICATION-REOPEN "));
-    Assert.ok(
-      line,
-      "Actual process reopens the persisted public book: " +
-        JSON.stringify(output)
-    );
-    return JSON.parse(line.slice("BOOK-PUBLICATION-REOPEN ".length));
+    return output;
   } finally {
     if (child && child.exitCode === null) {
       await child.kill(0);
     }
     await reading;
   }
+}
+
+/**
+ * Verifies another native process cannot acquire the retained startup lock.
+ *
+ * @param {object} input - Current-profile publication unit.
+ * @returns {Promise<void>} Actual OS-process exclusion assertion.
+ */
+async function assertStartupProfileRemainsLocked(input) {
+  Assert.equal(publicationLock.directory.path, input.profilePath);
+  const code = `
+    const { FileUtils } = ChromeUtils.importESModule("resource://gre/modules/FileUtils.sys.mjs");
+    const root = new FileUtils.File(${JSON.stringify(input.profilePath)});
+    Services.dirsvc.set("ProfD", root.clone());
+    Services.dirsvc.set("ProfLD", root.clone());
+    for (const [key, path] of Object.entries(${JSON.stringify(
+      Object.fromEntries(
+        ["DefProfRt", "DefProfLRt", "UAppData"].map(key => [
+          key,
+          Services.dirsvc.get(key, Ci.nsIFile).path,
+        ])
+      )
+    )})) {
+      Services.dirsvc.set(key, new FileUtils.File(path));
+    }
+    Cc["@mozilla.org/xre/directory-provider;1"].getService(Ci.nsIXREDirProvider);
+    const service = Cc["@mozilla.org/toolkit/profile-service;1"].getService(Ci.nsIToolkitProfileService);
+    const profile = service.createProfile(root, "s520-lock-exclusion-child", "tests");
+    let result;
+    try {
+      const unexpected = profile.lock({});
+      unexpected.unlock();
+      result = { acquired: true };
+    } catch (error) {
+      result = { acquired: false, result: error.result };
+    }
+    print("BOOK-LOCK-ATTEMPT " + JSON.stringify(result));
+    quit(0);
+  `;
+  const output = await runPublicationChild(code);
+  const line = output
+    .split("\n")
+    .find(value => value.startsWith("BOOK-LOCK-ATTEMPT "));
+  Assert.ok(line, "Actual process attempted the profile lock: " + output);
+  Assert.deepEqual(JSON.parse(line.slice("BOOK-LOCK-ATTEMPT ".length)), {
+    acquired: false,
+    result: Cr.NS_ERROR_FILE_ACCESS_DENIED,
+  });
 }
 
 add_task(
@@ -1577,9 +1651,8 @@ add_task(
         Assert.equal(publication.checkProfile().path, input.profilePath);
       }
     );
-    // Exercise a new real native acquisition after the owned callback settles.
-    const nextLock = input.profile.lock({});
-    nextLock.unlock();
+    // Settling a publication must not release the startup owner's native lock.
+    await assertStartupProfileRemainsLocked(input);
     Assert.throws(
       () => released.checkProfile(),
       /Book publication operation is closed/
@@ -1667,6 +1740,7 @@ add_task(
     const publication = input.journal.state.books[0].publication;
     Assert.equal(publication.state, "published");
     Assert.equal(input.journal.state.cancelled, true);
+    await assertStartupProfileRemainsLocked(input);
     Assert.deepEqual(events.topics, ["addrbook-directory-created"]);
     input.journal.recordBookPublication = record;
     await input.journal.setCancelled(false);
@@ -1724,6 +1798,7 @@ add_task(
       SQLiteDirectory.importMorkSnapshot = original;
       await IOUtils.remove(input.path + ".tmp", { recursive: true });
     }
+    await assertStartupProfileRemainsLocked(input);
     Assert.equal(input.journal.state.books[0].publication.state, "pending");
     input.journal.close();
     input.journal = await MigrationJournal.open(input.path, input.profilePath);

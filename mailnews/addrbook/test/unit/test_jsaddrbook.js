@@ -546,9 +546,11 @@ const migrationPublicationOnly = () => ({
 });
 let migrationPublicationSerial = 0;
 let migrationPublicationDirectoriesRegistered = false;
+let migrationPublicationProfile;
+let migrationPublicationStartupLock;
 
 /**
- * Creates a genuine closed stage and native profile for an owned operation.
+ * Creates a genuine closed stage under a retained native startup-profile lock.
  *
  * @returns {Promise<object>} Owned fixture, adoption call, events and cleanup.
  */
@@ -575,20 +577,36 @@ async function migrationPublicationInput() {
   const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
     Ci.nsIToolkitProfileService
   );
+  if (!migrationPublicationProfile) {
+    const created = profiles.createProfile(
+      do_get_profile(),
+      "manager-publication-startup",
+      "tests"
+    );
+    registerCleanupFunction(() => {
+      migrationPublicationStartupLock?.unlock();
+      created.remove(false);
+    });
+    const root = {};
+    const local = {};
+    const selected = {};
+    profiles.selectStartupProfile(
+      ["xpcshell", "-P", created.name],
+      false,
+      AppConstants.MOZ_UPDATE_CHANNEL,
+      "",
+      root,
+      local,
+      selected
+    );
+    Assert.equal(selected.value, created, "Actual named startup selection");
+    Assert.equal(profiles.currentProfile, created);
+    Assert.ok(root.value.equals(do_get_profile()));
+    migrationPublicationStartupLock = created.lock({});
+    migrationPublicationProfile = created;
+  }
+  const profile = migrationPublicationProfile;
   const serial = ++migrationPublicationSerial;
-  const profile = profiles.createProfile(
-    do_get_profile(),
-    "manager-publication-" + serial,
-    "tests"
-  );
-  let profileRemoved = false;
-  const removeProfile = () => {
-    if (!profileRemoved) {
-      profile.remove(false);
-      profileRemoved = true;
-    }
-  };
-  registerCleanupFunction(removeProfile);
   const stageFile = do_get_profile().clone();
   stageFile.append("manager-stage-" + serial + ".sqlite");
   const sourceBytes = await IOUtils.read(do_get_file("import.mab").path);
@@ -653,6 +671,7 @@ async function migrationPublicationInput() {
     options,
     profile,
     prefsFile,
+    managerGlobal: Cu.getGlobalForObject(withMigrationAddressBookPublication),
     managerServices: Cu.getGlobalForObject(withMigrationAddressBookPublication)
       .Services,
     target,
@@ -686,11 +705,253 @@ async function migrationPublicationInput() {
       if (stageFile.exists()) {
         stageFile.remove(false);
       }
-      removeProfile();
     },
   };
   registerCleanupFunction(() => input.cleanup());
   return input;
+}
+
+/**
+ * Verifies a separate native process still cannot acquire the startup lock.
+ *
+ * @returns {Promise<void>} Child refused the actual native lock and exited.
+ */
+async function assertMigrationStartupProfileHeld() {
+  const { Subprocess } = ChromeUtils.importESModule(
+    "resource://gre/modules/Subprocess.sys.mjs"
+  );
+  const directories = Object.fromEntries(
+    ["DefProfRt", "DefProfLRt", "UAppData"].map(key => [
+      key,
+      Services.dirsvc.get(key, Ci.nsIFile).path,
+    ])
+  );
+  const code = [
+    "const provider = Cc['@mozilla.org/xre/directory-provider;1'].createInstance(Ci.nsIDirectoryServiceProvider).QueryInterface(Ci.nsIXREDirProvider);",
+    "const directories = " + JSON.stringify(directories) + ";",
+    "for (const [key, path] of Object.entries(directories)) { const dir = Cc['@mozilla.org/file/local;1'].createInstance(Ci.nsIFile); dir.initWithPath(path); Services.dirsvc.set(key, dir); }",
+    "const root = Cc['@mozilla.org/file/local;1'].createInstance(Ci.nsIFile);",
+    "root.initWithPath(" + JSON.stringify(do_get_profile().path) + ");",
+    "Services.dirsvc.set('ProfD', root.clone()); Services.dirsvc.set('ProfLD', root.clone());",
+    "const profiles = Cc['@mozilla.org/toolkit/profile-service;1'].getService(Ci.nsIToolkitProfileService);",
+    "const profile = profiles.createProfile(root, 'publication-lock-probe', 'tests');",
+    "let lock;",
+    "try { lock = profile.lock({}); } catch (error) { print('PUBLICATION-LOCK-REFUSED ' + error.result); quit(error.result == Cr.NS_ERROR_FILE_ACCESS_DENIED ? 0 : 3); }",
+    "print('PUBLICATION-LOCK-ACQUIRED'); lock.unlock(); quit(2);",
+  ].join("\n");
+  let child;
+  let output = "";
+  let terminal;
+  let readError;
+  let done = false;
+  let reading;
+  try {
+    child = await Subprocess.call({
+      command: Services.dirsvc.get("XREExeF", Ci.nsIFile).path,
+      arguments: [
+        "-g",
+        Services.dirsvc.get("GreD", Ci.nsIFile).path,
+        "-a",
+        Services.dirsvc.get("XCurProcD", Ci.nsIFile).path,
+        "-e",
+        code,
+      ],
+      stderr: "stdout",
+    });
+    reading = (async () => {
+      try {
+        for (let chunk; (chunk = await child.stdout.readString()); ) {
+          output += chunk;
+        }
+        terminal = await child.wait();
+      } catch (error) {
+        readError = error;
+      } finally {
+        done = true;
+      }
+    })();
+    await TestUtils.waitForCondition(
+      () => done,
+      "Actual startup-lock exclusion child exits",
+      100,
+      300
+    );
+    if (readError) {
+      throw readError;
+    }
+    Assert.equal(terminal.exitCode, 0, output);
+    Assert.ok(
+      output.includes(
+        "PUBLICATION-LOCK-REFUSED " + Cr.NS_ERROR_FILE_ACCESS_DENIED
+      ),
+      output
+    );
+    Assert.ok(!output.includes("PUBLICATION-LOCK-ACQUIRED"), output);
+    Assert.ok(!output.includes("###!!! ASSERTION"), output);
+  } finally {
+    if (child && !done) {
+      child.kill();
+    }
+    await reading;
+  }
+}
+
+/**
+ * Fails a real native write after a private copy exists, then retries unchanged.
+ *
+ * The scoped JS class-table proxy delegates to the real builtin stream. It closes
+ * that stream after one real byte and propagates its actual closed-stream write
+ * error; it does not return a fabricated write result or error.
+ *
+ * @returns {Promise<void>} Strict native error, private orphan and retry checked.
+ */
+async function assertMigrationPrivateCopyFailure() {
+  const input = await migrationPublicationInput();
+  const global = input.managerGlobal;
+  const classes = global.Cc;
+  const descriptor = Object.getOwnPropertyDescriptor(global, "Cc");
+  Assert.ok(descriptor.writable && descriptor.configurable);
+  const contract = "@mozilla.org/network/file-output-stream;1";
+  const originalStage = await IOUtils.read(input.options.stageFile.path);
+  let partial;
+  let nativeFailure;
+  let reached = false;
+  // Only the test's JS call boundary is replaced. The factory still creates a
+  // real builtin nsIFileOutputStream; no XPCOM factory or QI is emulated.
+  global.Cc = new Proxy(
+    {},
+    {
+      get(target, name) {
+        if (name != contract) {
+          return classes[name];
+        }
+        return {
+          createInstance(iid) {
+            const stream = classes[contract].createInstance(iid);
+            Assert.equal(stream.QueryInterface(Ci.nsIFileOutputStream), stream);
+            let destination;
+            return new Proxy(
+              {},
+              {
+                get(unused, method) {
+                  if (method == "init") {
+                    return (file, ...args) => {
+                      stream.init(file, ...args);
+                      destination = file.clone();
+                    };
+                  }
+                  if (method == "write") {
+                    return (bytes, count) => {
+                      if (
+                        !reached &&
+                        destination.leafName.startsWith(
+                          input.target.leafName + ".copy"
+                        )
+                      ) {
+                        partial = destination.clone();
+                        reached = true;
+                        stream.write(bytes.substring(0, 1), 1);
+                        stream.close();
+                        try {
+                          return stream.write(bytes, count);
+                        } catch (error) {
+                          nativeFailure = error;
+                          throw error;
+                        }
+                      }
+                      return stream.write(bytes, count);
+                    };
+                  }
+                  const value = stream[method];
+                  return typeof value == "function"
+                    ? value.bind(stream)
+                    : value;
+                },
+              }
+            );
+          },
+        };
+      },
+    }
+  );
+  try {
+    let failure;
+    try {
+      await input.adopt();
+    } catch (error) {
+      failure = error;
+    } finally {
+      Object.defineProperty(global, "Cc", descriptor);
+    }
+    Assert.ok(
+      reached,
+      "Real native write reached after exclusive copy creation"
+    );
+    Assert.ok(nativeFailure, "Actual native closed-stream write failed");
+    Assert.ok(failure, "Original copy failure reaches the caller");
+    Assert.equal(
+      failure,
+      nativeFailure,
+      "First actual native write error object"
+    );
+    Assert.equal(failure.result, nativeFailure.result);
+    Assert.equal(failure.result, Cr.NS_BASE_STREAM_CLOSED);
+    Assert.ok(partial.exists());
+    Assert.equal(partial.fileSize, 1);
+    Assert.deepEqual(
+      await IOUtils.read(partial.path),
+      originalStage.slice(0, 1)
+    );
+    Assert.ok(
+      !input.target.exists(),
+      "No incomplete copy occupies the stable target"
+    );
+    Assert.equal(
+      JSON.parse(
+        Services.prefs.getStringPref(input.pref + ".panoramaMigration")
+      ).state,
+      "prepared"
+    );
+    Assert.deepEqual(input.events, []);
+    await assertMigrationStartupProfileHeld();
+
+    // A prepared record does not authorize deleting unrelated occupied data.
+    const foreignBytes = new TextEncoder().encode("unrelated occupied target");
+    await IOUtils.write(input.target.path, foreignBytes);
+    try {
+      await Assert.rejects(input.adopt(), /./);
+      Assert.deepEqual(await IOUtils.read(input.target.path), foreignBytes);
+      Assert.deepEqual(input.events, []);
+    } finally {
+      input.target.remove(false);
+    }
+
+    // The failed private copy also models an interruption before the final move.
+    // It remains byte-exact while a fresh exclusive sibling completes the retry.
+    assertMigrationPublication(input, await input.adopt());
+    Assert.deepEqual(
+      await IOUtils.read(partial.path),
+      originalStage.slice(0, 1)
+    );
+    Assert.deepEqual(
+      input.events.map(([topic]) => topic),
+      ["addrbook-directory-created"]
+    );
+    input.events.length = 0;
+    Assert.equal((await input.adopt()).reused, true);
+    Assert.deepEqual(input.events, []);
+    Assert.deepEqual(
+      await IOUtils.read(input.options.stageFile.path),
+      originalStage
+    );
+    await assertMigrationStartupProfileHeld();
+  } finally {
+    Object.defineProperty(global, "Cc", descriptor);
+    if (partial?.exists()) {
+      partial.remove(false);
+    }
+    await input.cleanup();
+  }
 }
 
 /**
@@ -937,14 +1198,12 @@ add_task(
         stageBytes,
         "Closed capability does not mutate the genuine original stage"
       );
-      // The operation actually unlocked before it returned its captured handle.
-      const reacquired = input.profile.lock({});
-      try {
-        Assert.ok(reacquired.directory.equals(do_get_profile()));
-      } finally {
-        reacquired.unlock();
-      }
+      await assertMigrationStartupProfileHeld();
+      Assert.ok(
+        migrationPublicationStartupLock.directory.equals(do_get_profile())
+      );
       assertMigrationPublication(input, await input.adopt());
+      await assertMigrationStartupProfileHeld();
     } finally {
       other.remove(false);
       await IOUtils.remove(otherRoot, { recursive: true });
@@ -1018,6 +1277,7 @@ add_task(
       Assert.ok(validated, "Actual original stage validator completed first");
       Assert.ok(failure, "Real input stream cannot open the moved stage");
       Assert.equal(failure.result, Cr.NS_ERROR_FILE_NOT_FOUND);
+      await assertMigrationStartupProfileHeld();
       Assert.deepEqual(input.events, []);
       Assert.equal(
         JSON.parse(
@@ -1042,6 +1302,7 @@ add_task(
       }
       await input.cleanup();
     }
+    await assertMigrationPrivateCopyFailure();
   }
 );
 
@@ -1383,9 +1644,13 @@ async function assertMigrationPreferenceSnapshotFailure(
  * Holds an actual backup completion while an owned callback has already ended.
  *
  * @param {boolean} callbackFails - Throw a real callback error before draining.
- * @returns {Promise<void>} Pending adoption, first failure and unlock checked.
+ * @param {boolean} [cancel=false] - Throw an actual aborted signal's reason.
+ * @returns {Promise<void>} Pending adoption, original error and startup lock checked.
  */
-async function assertMigrationOwnedPublicationSettlement(callbackFails) {
+async function assertMigrationOwnedPublicationSettlement(
+  callbackFails,
+  cancel = false
+) {
   const input = await migrationPublicationInput();
   const prefs = input.managerServices.prefs;
   const backup = prefs.backupPrefFile;
@@ -1403,7 +1668,11 @@ async function assertMigrationOwnedPublicationSettlement(callbackFails) {
   let adoption;
   let finished;
   let settled = false;
-  const callbackError = new Error("Actual owned publication callback failure");
+  const controller = new AbortController();
+  controller.abort();
+  const callbackError = cancel
+    ? controller.signal.reason
+    : new Error("Actual owned publication callback failure");
   try {
     input.managerServices.prefs = new Proxy(
       {},
@@ -1490,12 +1759,10 @@ async function assertMigrationOwnedPublicationSettlement(callbackFails) {
       await IOUtils.read(input.options.stageFile.path),
       originalStage
     );
-    const reacquired = input.profile.lock({});
-    try {
-      Assert.ok(reacquired.directory.equals(do_get_profile()));
-    } finally {
-      reacquired.unlock();
-    }
+    await assertMigrationStartupProfileHeld();
+    Assert.ok(
+      migrationPublicationStartupLock.directory.equals(do_get_profile())
+    );
     input.events.length = 0;
     Assert.equal((await input.adopt()).reused, true);
     Assert.deepEqual(input.events, []);
@@ -1513,6 +1780,7 @@ add_task(
   async function test_adoptMigrationAddressBookWithInterruptedPublication() {
     await assertMigrationOwnedPublicationSettlement(false);
     await assertMigrationOwnedPublicationSettlement(true);
+    await assertMigrationOwnedPublicationSettlement(true, true);
     await assertMigrationPreferenceWriteFailure(false);
     await assertMigrationPreferenceWriteFailure(true);
     for (const atPublished of [false, true]) {

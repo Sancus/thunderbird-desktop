@@ -424,7 +424,16 @@ async function subtest(action, expectedParent, expectedName) {
   // Check that the message was saved to the folder.
 
   const expectedMessageCount = folderCountBeforeTest + 1;
+  const folderLoaded = PromiseTestUtils.promiseFolderEvent(
+    folder,
+    "FolderLoaded"
+  );
   folder.updateFolder(window.msgWindow);
+  await folderLoaded;
+  if (folder.server instanceof Ci.nsIImapIncomingServer) {
+    await TestUtils.waitForCondition(() => folder.server.allConnectionsIdle);
+  }
+  info("Copy destination folder refresh completed");
   await TestUtils.waitForCondition(
     () =>
       folder.getTotalMessages(false) - folder.numPendingTotalMessages ==

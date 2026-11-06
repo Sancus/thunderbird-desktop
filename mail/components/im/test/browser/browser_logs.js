@@ -353,6 +353,8 @@ add_task(
       incoming: true,
       time,
     });
+    // Message appends are queued only after the new log header is initialized.
+    await writer._initialized;
     const paths = await IMServices.logs.getLogPathsForConversation(alpha);
     Assert.equal(paths.length, 2, "Inactivity creates a second real log file");
     Assert.notEqual(paths[0], paths[1]);

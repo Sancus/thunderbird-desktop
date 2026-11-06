@@ -545,6 +545,7 @@ const migrationPublicationOnly = () => ({
   skip_if: () => !AppConstants.NIGHTLY_BUILD,
 });
 let migrationPublicationSerial = 0;
+let migrationPublicationDirectoriesRegistered = false;
 
 /**
  * Creates a genuine closed stage and holds the actual current-profile lock.
@@ -561,11 +562,15 @@ async function migrationPublicationInput() {
   const { adoptMigrationAddressBook } = ChromeUtils.importESModule(
     "resource:///modules/AddrBookManager.sys.mjs"
   );
-  const provider = Cc["@mozilla.org/xre/directory-provider;1"]
-    .getService(Ci.nsIDirectoryServiceProvider)
-    .QueryInterface(Ci.nsIXREDirProvider);
-  for (const key of ["DefProfRt", "DefProfLRt", "UAppData"]) {
-    Services.dirsvc.set(key, provider.getFile(key, {}).clone());
+  // Directory-service registrations outlive each fixture's profile and lock.
+  if (!migrationPublicationDirectoriesRegistered) {
+    const provider = Cc["@mozilla.org/xre/directory-provider;1"]
+      .getService(Ci.nsIDirectoryServiceProvider)
+      .QueryInterface(Ci.nsIXREDirProvider);
+    for (const key of ["DefProfRt", "DefProfLRt", "UAppData"]) {
+      Services.dirsvc.set(key, provider.getFile(key, {}).clone());
+    }
+    migrationPublicationDirectoriesRegistered = true;
   }
   const profiles = Cc["@mozilla.org/toolkit/profile-service;1"].getService(
     Ci.nsIToolkitProfileService

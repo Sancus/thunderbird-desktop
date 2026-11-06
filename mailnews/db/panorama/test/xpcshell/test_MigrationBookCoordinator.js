@@ -1123,9 +1123,8 @@ async function publicationInput() {
     names: new Map([[id, "Actual imported book é"]]),
   };
   registerCleanupFunction(() => input.journal.close());
-  await input.journal.recordBackup(
-    await createMigrationBackup(profilePath, [], backupPath)
-  );
+  input.backup = await createMigrationBackup(profilePath, [], backupPath);
+  await input.journal.recordBackup(input.backup);
   return input;
 }
 
@@ -1147,10 +1146,15 @@ function watchBookPublication() {
   for (const topic of observed) {
     Services.obs.addObserver(observer, topic);
   }
+  let closed = false;
   const close = () => {
+    if (closed) {
+      return;
+    }
     for (const topic of observed) {
       Services.obs.removeObserver(observer, topic);
     }
+    closed = true;
   };
   registerCleanupFunction(close);
   return { topics, close };

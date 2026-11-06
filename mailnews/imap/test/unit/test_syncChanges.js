@@ -228,7 +228,7 @@ function reportRetainedOfflineOps(where) {
   };
   const paths = shortestPaths(
     alive.map(item => item.ref.deref()),
-    { maxNumPaths: 2 }
+    { maxNumPaths: 12 }
   );
   paths.forEach((set, index) => {
     set.forEach((path, n) => {
@@ -371,7 +371,7 @@ function queueIntent(folder, header, kind) {
   const db = folder.msgDatabase.QueryInterface(Ci.nsIMsgOfflineOpsDatabase);
   const op = trackOfflineOp(
     db.getOfflineOpForKey(header.messageKey, false),
-    "line 331"
+    `line 331 ${kind}`
   );
   Assert.ok(op);
   if (kind == "move") {

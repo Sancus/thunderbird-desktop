@@ -915,6 +915,7 @@ async function checkImapFcc(retry) {
   const body = "Exactly one SMTP delivery and one confirmed IMAP sent copy.";
   const sentCount = gSentMessages.length;
   let prompts = 0;
+  let protocolAlerts = 0;
   let recoveryDialog;
   let loaded = false;
   let cleaned = false;
@@ -972,36 +973,76 @@ async function checkImapFcc(retry) {
   let recovery = Promise.resolve();
   if (retry) {
     imap.daemon.commandToFail = "APPEND";
-    recovery = BrowserTestUtils.promiseAlertDialog(undefined, undefined, {
-      async callback(win) {
-        recoveryDialog = win;
-        await TestUtils.waitForTick();
-        prompts++;
-        Assert.equal(
-          prompts,
-          1,
-          "The real failed APPEND asks once for recovery"
-        );
-        Assert.stringContains(
-          win.document.getElementById("infoBody").textContent,
-          sent.localizedName,
-          "The real recovery dialog names the configured sent folder"
-        );
-        Assert.equal(
-          imap.daemon.getMailbox("ConfiguredSent")._messages.length,
-          0,
-          "A rejected APPEND has not published a sent message"
-        );
-        Assert.equal(
-          gSentMessages.length,
-          sentCount + 1,
-          "SMTP has already succeeded before copy recovery"
-        );
-        imap.daemon.commandToFail = "";
-        // Retry the copy, not the already delivered SMTP message.
-        win.document.querySelector("dialog").getButton("accept").click();
-      },
-    });
+    recovery = (async () => {
+      let retryDialog;
+      await BrowserTestUtils.promiseAlertDialog(undefined, undefined, {
+        async callback(win) {
+          recoveryDialog = win;
+          await TestUtils.waitForTick();
+          protocolAlerts++;
+          Assert.equal(
+            protocolAlerts,
+            1,
+            "The rejected APPEND reports one command error"
+          );
+          Assert.stringContains(
+            win.document.getElementById("infoBody").textContent,
+            "APPEND failed.",
+            "The original server rejection is shown before copy recovery"
+          );
+          Assert.equal(
+            imap.daemon.getMailbox("ConfiguredSent")._messages.length,
+            0,
+            "The original failed command has not stored an FCC"
+          );
+          Assert.equal(
+            gSentMessages.length,
+            sentCount + 1,
+            "The command error occurs after one SMTP send"
+          );
+          // Listen for FCC recovery before dismissing the preceding protocol alert.
+          retryDialog = BrowserTestUtils.promiseAlertDialog(
+            undefined,
+            undefined,
+            {
+              async callback(win) {
+                recoveryDialog = win;
+                await TestUtils.waitForTick();
+                prompts++;
+                Assert.equal(
+                  prompts,
+                  1,
+                  "The real failed APPEND asks once for recovery"
+                );
+                Assert.stringContains(
+                  win.document.getElementById("infoBody").textContent,
+                  sent.localizedName,
+                  "The real recovery dialog names the configured sent folder"
+                );
+                Assert.equal(
+                  imap.daemon.getMailbox("ConfiguredSent")._messages.length,
+                  0,
+                  "A rejected APPEND has not published a sent message"
+                );
+                Assert.equal(
+                  gSentMessages.length,
+                  sentCount + 1,
+                  "SMTP has already succeeded before copy recovery"
+                );
+                imap.daemon.commandToFail = "";
+                // Retry the copy, not the already delivered SMTP message.
+                win.document
+                  .querySelector("dialog")
+                  .getButton("accept")
+                  .click();
+              },
+            }
+          );
+          win.document.querySelector("dialog").getButton("accept").click();
+        },
+      });
+      await retryDialog;
+    })();
   }
   const extension = ExtensionTestUtils.loadExtension({
     files: {
@@ -1118,6 +1159,7 @@ async function checkImapFcc(retry) {
     Assert.deepEqual(gSentMessages.slice(sentCount), [messageId]);
     Assert.ok(gServer._daemon.post.includes(body));
     Assert.equal(prompts, retry ? 1 : 0);
+    Assert.equal(protocolAlerts, retry ? 1 : 0);
     extension.sendMessage();
   });
   await extension.startup();

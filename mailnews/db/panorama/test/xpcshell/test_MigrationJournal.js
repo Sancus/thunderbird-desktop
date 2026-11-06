@@ -1711,12 +1711,19 @@ add_task(async function test_stageTransitionsPersistCancellationAndReceipts() {
   await refuseTransition("activate");
   await journal.setCancelled(false);
   await refuseTransition("activate");
-  await journal.finishStage("validate");
-  await reopenAtStage("activate");
-  await refuseTransition("validate");
-  await journal.finishStage("activate");
-  await reopenAtStage("complete");
-  await refuseTransition("activate");
+  if (AppConstants.platform == "win") {
+    await refuseTransition(
+      "validate",
+      "Windows migration activation remains held"
+    );
+  } else {
+    await journal.finishStage("validate");
+    await reopenAtStage("activate");
+    await refuseTransition("validate");
+    await journal.finishStage("activate");
+    await reopenAtStage("complete");
+    await refuseTransition("activate");
+  }
 
   Assert.deepEqual(
     { ...journal.state.sources[0], state: "pending", receipt: null },

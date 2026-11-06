@@ -43,6 +43,9 @@ skip-if = ["os == 'win'"]
 
 ["test_MigrationRecovery.js"]
 
+["test_MigrationStartupBackup.js"]
+head = ""
+
 ["test_MigrationWindowsImport.js"]
 run-if = ["os == 'win'"]
 prefs = [

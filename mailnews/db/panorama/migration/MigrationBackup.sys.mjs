@@ -753,3 +753,458 @@ function checkCancellation(signal) {
     throw new DOMException("Migration backup cancelled", "AbortError");
   }
 }
+
+/**
+ * Copies the selected profile before ordinary profile startup notifications.
+ * The caller must run synchronously under startup's existing profile lock.
+ * This function does not pump the event loop or initialize mail services.
+ * Incomplete copies remain available for a retry with identical source bytes.
+ *
+ * @param {string} profilePath - Selected startup profile directory.
+ * @param {string[]} mailPaths - Persisted external message directories.
+ * @param {string} backupPath - Private destination outside every source tree.
+ * @param {AbortSignal} [signal] - Cancellation checked between stream reads.
+ * @returns {{path: string, sha256: string}} Complete manifest path and hash.
+ * @throws {Error} For cancellation, changed sources, unsafe paths or copy errors.
+ */
+export function createMigrationBackupAtStartup(
+  profilePath,
+  mailPaths,
+  backupPath,
+  signal
+) {
+  checkCancellation(signal);
+  const profile = physicalFile(profilePath);
+  const backup = physicalFile(backupPath);
+  const sources = [profile];
+  for (const path of mailPaths) {
+    const file = physicalFile(path);
+    if (sources.some(parent => parent.equals(file) || parent.contains(file))) {
+      continue;
+    }
+    if (file.contains(profile)) {
+      throw new Error("External mail root contains the profile");
+    }
+    for (let index = sources.length - 1; index > 0; index--) {
+      if (file.contains(sources[index])) {
+        sources.splice(index, 1);
+      }
+    }
+    sources.push(file);
+  }
+  if (
+    sources.some(source => source.equals(backup) || source.contains(backup))
+  ) {
+    throw new Error("Backup must be outside migration source trees");
+  }
+  // Do not replace an existing directory or silently reuse a foreign archive.
+  const manifestFile = backup.clone();
+  manifestFile.append("manifest.json");
+  const roots = sources.map((source, index) => {
+    if (!source.isDirectory()) {
+      throw new Error("Migration source root is not a directory");
+    }
+    return {
+      source: source.path,
+      directory: "root-" + index,
+      permissions: source.permissions,
+      lastModified: source.lastModifiedTime,
+      ...startupInventory(source, index == 0, signal),
+    };
+  });
+  const originalRoots =
+    AppConstants.platform == "win"
+      ? captureWindowsMigrationRoots([profilePath, ...mailPaths])
+      : null;
+  let manifest;
+  if (backup.exists()) {
+    physicalFile(manifestFile.path);
+    manifest = readStartupJSON(manifestFile);
+    if (
+      manifest.version != BACKUP_VERSION ||
+      JSON.stringify(manifest.roots) != JSON.stringify(roots) ||
+      (originalRoots &&
+        JSON.stringify(manifest.originalRoots) !=
+          JSON.stringify(originalRoots)) ||
+      ![false, true].includes(manifest.complete)
+    ) {
+      throw new Error(
+        "Backup source identity changed; keep the previous backup"
+      );
+    }
+  } else {
+    let requiredBytes = 0;
+    for (const root of roots) {
+      for (const entry of root.entries) {
+        requiredBytes += entry.size ?? 0;
+        if (!Number.isSafeInteger(requiredBytes)) {
+          throw new Error("Migration backup byte count exceeds the safe range");
+        }
+      }
+    }
+    if (backup.parent.diskSpaceAvailable < requiredBytes) {
+      throw new Error("Insufficient space for migration backup");
+    }
+    backup.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+    manifest = {
+      version: BACKUP_VERSION,
+      complete: false,
+      roots,
+      ...(originalRoots ? { originalRoots } : {}),
+    };
+    writeStartupJSON(manifestFile, manifest);
+  }
+  const scratch = backup.clone();
+  scratch.append("scratch");
+  if (!manifest.complete && !scratch.exists()) {
+    scratch.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+  }
+  physicalFile(scratch.path);
+  for (const root of roots) {
+    const destination = backup.clone();
+    destination.append(root.directory);
+    if (!destination.exists()) {
+      if (manifest.complete) {
+        throw new Error("A complete backup is missing a directory");
+      }
+      destination.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+    }
+    physicalFile(destination.path);
+    for (const entry of root.entries) {
+      checkCancellation(signal);
+      const target = new FileUtils.File(
+        childPath(destination.path, entry.parts)
+      );
+      if (entry.type == "directory") {
+        if (!target.exists()) {
+          if (manifest.complete) {
+            throw new Error("A complete backup is missing a directory");
+          }
+          target.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+        }
+        if (!target.isDirectory()) {
+          throw new Error("Migration backup directory is not a directory");
+        }
+      } else if (target.exists()) {
+        checkStartupCopy(target, entry, signal);
+      } else {
+        if (manifest.complete) {
+          throw new Error("A complete backup is missing a file");
+        }
+        const source = new FileUtils.File(childPath(root.source, entry.parts));
+        const temporary = scratch.clone();
+        temporary.append("copy-" + Services.uuid.generateUUID());
+        source.copyTo(scratch, temporary.leafName);
+        temporary.permissions = 0o600;
+        checkStartupCopy(temporary, entry, signal);
+        const output = Cc[
+          "@mozilla.org/network/file-output-stream;1"
+        ].createInstance(Ci.nsIFileOutputStream);
+        output.init(temporary, 0x02 | 0x10, 0o600, 0);
+        let flushError;
+        try {
+          output.flush();
+        } catch (error) {
+          flushError = error;
+          throw error;
+        } finally {
+          try {
+            output.close();
+          } catch (error) {
+            if (!flushError) {
+              throw error;
+            }
+            console.error("Additional migration copy close error", error);
+          }
+        }
+        temporary.lastModifiedTime = entry.lastModified;
+        temporary.permissions = entry.permissions;
+        checkCancellation(signal);
+        if (target.exists()) {
+          throw new Error("Migration backup destination appeared during copy");
+        }
+        temporary.moveTo(target.parent, target.leafName);
+      }
+    }
+  }
+  for (const [index, root] of roots.entries()) {
+    if (
+      JSON.stringify(startupInventory(sources[index], index == 0, signal)) !=
+      JSON.stringify({
+        entries: root.entries,
+        excluded: root.excluded,
+        ...(root.physicalIdentity
+          ? { physicalIdentity: root.physicalIdentity }
+          : {}),
+      })
+    ) {
+      throw new Error("Migration source changed during backup");
+    }
+    for (const entry of root.entries) {
+      if (entry.type == "regular") {
+        checkStartupCopy(
+          new FileUtils.File(
+            childPath(PathUtils.join(backup.path, root.directory), entry.parts)
+          ),
+          entry,
+          signal
+        );
+      }
+    }
+  }
+  checkCancellation(signal);
+  let sha256;
+  if (!manifest.complete) {
+    manifest.complete = true;
+    sha256 = writeStartupJSON(manifestFile, manifest);
+  } else {
+    sha256 = hashStartupFile(manifestFile, signal);
+  }
+  return { path: manifestFile.path, sha256 };
+}
+
+/**
+ * Reads directory metadata and file hashes without opening mail/NSS databases.
+ *
+ * @param {nsIFile} root - Canonical selected directory.
+ * @param {boolean} profile - Exclude ordinary profile lock files at the root.
+ * @param {AbortSignal} [signal] - Cancellation signal.
+ * @returns {{entries: object[], excluded: string[], physicalIdentity?: object}}
+ *   Ordered source inventory, compatible with ordinary backup verification.
+ */
+function startupInventory(root, profile, signal) {
+  const entries = [];
+  const excluded = [];
+  const pending = [{ file: root, parts: [] }];
+  while (pending.length) {
+    const { file, parts } = pending.pop();
+    const children = [...file.directoryEntries]
+      .map(child => child.QueryInterface(Ci.nsIFile))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    for (const child of children) {
+      checkCancellation(signal);
+      if (
+        profile &&
+        !parts.length &&
+        PROFILE_LOCKS.has(child.leafName) &&
+        (child.isSymlink() || child.isFile())
+      ) {
+        excluded.push(child.leafName);
+        continue;
+      }
+      physicalFile(child.path);
+      const entry = {
+        parts: [...parts, child.leafName],
+        type: child.isDirectory() ? "directory" : "regular",
+        permissions: child.permissions,
+        lastModified: child.lastModifiedTime,
+      };
+      if (AppConstants.platform == "win") {
+        entry.physicalIdentity = startupPhysicalIdentity(child);
+      }
+      if (child.isDirectory()) {
+        pending.push({ file: child, parts: entry.parts });
+      } else if (child.isFile()) {
+        entry.size = child.fileSize;
+        entry.sha256 = hashStartupFile(child, signal);
+        if (
+          entry.size != child.fileSize ||
+          entry.lastModified != child.lastModifiedTime
+        ) {
+          throw new Error("Migration source changed while hashing");
+        }
+      } else {
+        throw new Error("Unsupported special file in migration source");
+      }
+      entries.push(entry);
+    }
+  }
+  return {
+    entries,
+    excluded,
+    ...(AppConstants.platform == "win"
+      ? { physicalIdentity: startupPhysicalIdentity(root) }
+      : {}),
+  };
+}
+
+/**
+ * Reads an existing native physical identity on Windows.
+ *
+ * @param {nsIFile} file - Source file or directory.
+ * @returns {object} Existing migration filesystem identity.
+ */
+function startupPhysicalIdentity(file) {
+  const lease = admitWindowsMigrationPath(
+    file,
+    file.isDirectory()
+      ? Ci.nsIPanoramaMigrationFileSystem.KIND_DIRECTORY
+      : Ci.nsIPanoramaMigrationFileSystem.KIND_FILE
+  );
+  try {
+    return migrationPhysicalIdentity(lease);
+  } finally {
+    lease.close();
+  }
+}
+
+/**
+ * Hashes a regular file with bounded synchronous stream reads.
+ *
+ * @param {nsIFile} file - Canonical regular file.
+ * @param {AbortSignal} [signal] - Cancellation checked between reads.
+ * @returns {string} Lowercase SHA-256.
+ */
+function hashStartupFile(file, signal) {
+  physicalFile(file.path);
+  if (!file.isFile()) {
+    throw new Error("Migration hash source is not a regular file");
+  }
+  const size = file.fileSize;
+  const modified = file.lastModifiedTime;
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new Error("Unsupported migration hash file size");
+  }
+  const input = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
+    Ci.nsIFileInputStream
+  );
+  input.init(file, 0x01, 0, 0);
+  let firstError;
+  try {
+    const binary = Cc["@mozilla.org/binaryinputstream;1"].createInstance(
+      Ci.nsIBinaryInputStream
+    );
+    binary.setInputStream(input);
+    const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+      Ci.nsICryptoHash
+    );
+    hash.init(Ci.nsICryptoHash.SHA256);
+    for (let remaining = size; remaining > 0; ) {
+      checkCancellation(signal);
+      const count = Math.min(1024 * 1024, remaining);
+      const bytes = binary.readByteArray(count);
+      if (bytes.length != count) {
+        throw new Error("Migration file changed while hashing");
+      }
+      hash.update(bytes, bytes.length);
+      remaining -= count;
+    }
+    if (file.fileSize != size || file.lastModifiedTime != modified) {
+      throw new Error("Migration source changed while hashing");
+    }
+    return Array.from(hash.finish(false), byte =>
+      byte.charCodeAt(0).toString(16).padStart(2, "0")
+    ).join("");
+  } catch (error) {
+    firstError = error;
+    throw error;
+  } finally {
+    try {
+      input.close();
+    } catch (error) {
+      if (!firstError) {
+        throw error;
+      }
+      console.error("Additional migration input close error", error);
+    }
+  }
+}
+
+/**
+ * Checks a copied file against the full source hash and byte count.
+ *
+ * @param {nsIFile} file - Existing private copy.
+ * @param {{size: number, sha256: string}} entry - Recorded source identity.
+ * @param {AbortSignal} [signal] - Cancellation signal.
+ */
+function checkStartupCopy(file, entry, signal) {
+  if (
+    !file.isFile() ||
+    file.fileSize != entry.size ||
+    hashStartupFile(file, signal) != entry.sha256
+  ) {
+    throw new Error("Migration backup file differs from its source");
+  }
+}
+
+/**
+ * Reads a private backup manifest with ordinary synchronous UTF-8 streams.
+ *
+ * @param {nsIFile} file - Existing regular manifest.
+ * @returns {object} Parsed manifest.
+ */
+function readStartupJSON(file) {
+  if (!file.isFile()) {
+    throw new Error("Migration backup manifest is not a regular file");
+  }
+  const input = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(
+    Ci.nsIFileInputStream
+  );
+  input.init(file, 0x01, 0, 0);
+  let firstError;
+  try {
+    const converter = Cc[
+      "@mozilla.org/intl/converter-input-stream;1"
+    ].createInstance(Ci.nsIConverterInputStream);
+    converter.init(input, "UTF-8", 0, 0);
+    let text = "";
+    const part = {};
+    while (converter.readString(64 * 1024, part)) {
+      text += part.value;
+    }
+    return JSON.parse(text);
+  } catch (error) {
+    firstError = error;
+    throw error;
+  } finally {
+    try {
+      input.close();
+    } catch (error) {
+      if (!firstError) {
+        throw error;
+      }
+      console.error("Additional migration manifest close error", error);
+    }
+  }
+}
+
+/**
+ * Atomically writes and flushes a private backup manifest.
+ *
+ * @param {nsIFile} file - Manifest in the private backup directory.
+ * @param {object} value - Manifest state.
+ * @returns {string} SHA-256 of the exact UTF-8 bytes written and flushed.
+ */
+function writeStartupJSON(file, value) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const output = Cc[
+    "@mozilla.org/network/safe-file-output-stream;1"
+  ].createInstance(Ci.nsIFileOutputStream);
+  output.init(file, 0x02 | 0x08 | 0x20, 0o600, 0);
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(
+    Ci.nsICryptoHash
+  );
+  hash.init(Ci.nsICryptoHash.SHA256);
+  try {
+    for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
+      const chunk = bytes.subarray(offset, offset + 64 * 1024);
+      const count = output.write(String.fromCharCode(...chunk), chunk.length);
+      hash.update(chunk, chunk.length);
+      if (count != chunk.length) {
+        throw new Error("Incomplete migration manifest write");
+      }
+    }
+    const sha256 = Array.from(hash.finish(false), byte =>
+      byte.charCodeAt(0).toString(16).padStart(2, "0")
+    ).join("");
+    output.QueryInterface(Ci.nsISafeOutputStream).finish();
+    return sha256;
+  } catch (error) {
+    try {
+      output.close();
+    } catch (cleanupError) {
+      console.error("Additional migration output close error", cleanupError);
+    }
+    throw error;
+  }
+}

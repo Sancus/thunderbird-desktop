@@ -526,7 +526,7 @@ MailGlue.prototype = {
   // nsIObserver implementation
   observe(aSubject, aTopic, aData) {
     switch (aTopic) {
-      case "app-startup":
+      case "app-startup": {
         // Record the previously started version. This is used to check for
         // extensions that were disabled by an application update. We need to
         // read this pref before the Add-Ons Manager changes it.
@@ -534,7 +534,32 @@ MailGlue.prototype = {
           "extensions.lastAppVersion",
           "0"
         );
+        if (
+          aSubject instanceof Ci.nsICommandLine &&
+          aSubject.findFlag("panorama-backup", false) >= 0
+        ) {
+          try {
+            const destination = aSubject.handleFlagWithParam(
+              "panorama-backup",
+              false
+            );
+            if (!destination || !PathUtils.isAbsolute(destination)) {
+              throw new Error("Panorama backup destination must be absolute");
+            }
+            // Finish this optional copy before profile startup notifications.
+            // Failure leaves normal startup policy and incomplete data intact.
+            const { collectMigrationRoots, createMigrationBackupAtStartup } =
+              ChromeUtils.importESModule(
+                "resource:///modules/panorama/MigrationBackup.sys.mjs"
+              );
+            const { profilePath, mailPaths } = collectMigrationRoots();
+            createMigrationBackupAtStartup(profilePath, mailPaths, destination);
+          } catch (error) {
+            console.error("Panorama startup backup failed", error);
+          }
+        }
         break;
+      }
       case "command-line-startup": {
         // Check if this process is the developer toolbox process, and if it
         // is, stop MailGlue from doing anything more. Also sets a flag that

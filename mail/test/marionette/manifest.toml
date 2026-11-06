@@ -30,6 +30,9 @@ tags = ["panorama"]
 run-if = ["nightly_build"]
 tags = ["panorama"]
 
+["test_panorama_startup_backup.py"]
+run-if = ["debug || nightly_build"]
+
 ["test_sessionstore.py"]
 
 ["test_systemintegration.py"]

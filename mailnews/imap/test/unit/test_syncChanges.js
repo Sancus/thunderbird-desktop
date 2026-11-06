@@ -402,13 +402,15 @@ async function checkLivePendingSource(kind) {
   const key = header.messageKey;
   const bytes = storedBody(folder, header);
   Assert.ok(bytes.includes("Keep this exact pending source body."));
-  const op = queueIntent(folder, header, kind);
-  const intent = [
-    op.operation,
-    op.newFlags,
-    op.destinationFolderURI,
-    op.playingBack,
+  const readOp = queued => [
+    queued.operation,
+    queued.newFlags,
+    queued.destinationFolderURI,
+    queued.playingBack,
   ];
+  const intent = readOp(queueIntent(folder, header, kind));
+  await releaseOfflineOpWrappers();
+  reportRetainedOfflineOps(`after-queue-${kind}`);
   Assert.ok(db.containsKey(key));
   const added = [],
     deleted = [];
@@ -452,7 +454,7 @@ async function checkLivePendingSource(kind) {
       Assert.deepEqual(deleted, [removed.messageKey]);
       Assert.deepEqual(db.listAllOfflineOpIds(), [key]);
       Assert.deepEqual(
-        [op.operation, op.newFlags, op.destinationFolderURI, op.playingBack],
+        readOp(trackOfflineOp(db.getOfflineOpForKey(key, false), `loop ${kind}`)),
         intent
       );
       Assert.deepEqual(

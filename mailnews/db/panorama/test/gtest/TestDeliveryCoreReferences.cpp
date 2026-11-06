@@ -21485,7 +21485,9 @@ TEST_F(DeliveryCoreReferences,
     } else {
       ASSERT_EQ(NS_OK, AcceptedAppend(key, body, expected));
     }
-    uint32_t uid = 820000 + mode;
+    // Each negative variant retains its row; reserve uid + 1 for the
+    // deliberate UID mismatch without aliasing a later variant's setup.
+    uint32_t uid = 820000 + 2 * mode;
     bool bound = mode != 0 && mode != 20 && mode != 21;
     if (bound) {
       ServerMessageLocation mapping = OnlineSentinel();

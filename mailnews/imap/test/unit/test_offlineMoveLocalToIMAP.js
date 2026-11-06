@@ -415,14 +415,15 @@ async function checkUnresolvedAcceptedAppendStillUpdates(mode) {
     Assert.equal(appends, 1);
     Assert.equal(mailbox._messages.length, 1);
     const accepted = mailbox._messages[0];
+    const candidateUids = [accepted.uid];
     if (mode == "ambiguous") {
-      mailbox.addMessage(
-        new ImapMessage(
-          "data:text/plain," + encodeURI(accepted.getText()),
-          mailbox.uidnext++,
-          []
-        )
+      const duplicate = new ImapMessage(
+        "data:text/plain," + encodeURI(accepted.getText()),
+        mailbox.uidnext++,
+        []
       );
+      mailbox.addMessage(duplicate);
+      candidateUids.push(duplicate.uid);
     } else {
       mailbox._messages[0] = new ImapMessage(
         "data:text/plain," + encodeURI(accepted.getText() + "Different body\n"),
@@ -457,11 +458,18 @@ async function checkUnresolvedAcceptedAppendStillUpdates(mode) {
       await updated.promise;
       Assert.equal(stops, 1);
       const searches = gAcceptedAppendSearches.slice(searchStart);
-      Assert.equal(searches.length, 1);
-      Assert.equal(searches[0].length, mode == "ambiguous" ? 2 : 1);
+      Assert.greater(searches.length, 0, "The real discovery path was reached");
+      for (const candidates of searches) {
+        Assert.deepEqual(
+          candidates,
+          candidateUids,
+          "Every discovery, including reconnects, uses the exact genuine candidates"
+        );
+      }
       Assert.deepEqual(
         gAcceptedAppendBodyReads.slice(readStart),
-        mode == "ambiguous" ? [] : [accepted.uid]
+        searches.flatMap(() => (mode == "ambiguous" ? [] : [accepted.uid])),
+        "Each unique candidate is read completely; ambiguity grants no body selection"
       );
       const current = IMAPPump.inbox.msgDatabase.getMsgHdrForKey(key);
       Assert.equal(current.messageKey, key);
@@ -604,11 +612,33 @@ add_task(async function test_observedAcceptedAppendDoesNotStarveLaterWork() {
     IMAPPump.daemon.closing = false;
     Services.io.offline = false;
     IMAPPump.server.start();
-    const replayed = new PromiseTestUtils.PromiseUrlListener();
+    let replayStops = 0;
+    const replayed = new PromiseTestUtils.PromiseUrlListener({
+      OnStopRunningUrl() {
+        replayStops++;
+      },
+    });
+    const replayStatus = replayed.promise.then(
+      () => Cr.NS_OK,
+      error => Number(error.message)
+    );
     MailServices.imap.playbackAllOfflineOperations(null, replayed);
-    await replayed.promise;
+    Assert.equal(
+      await replayStatus,
+      Cr.NS_ERROR_NOT_AVAILABLE,
+      "UIDPLUS without APPENDUID preserves the actual missing-receipt error"
+    );
+    Assert.equal(replayStops, 1);
     const mailbox = IMAPPump.daemon.getMailbox("INBOX");
     Assert.equal(appends, 1);
+    Assert.equal(mailbox._messages.length, 1);
+    Assert.ok(!retained.properties.includes("uidOnServer"));
+    Assert.equal(retained.storeToken, token);
+    Assert.equal(readRetainedMoveBody(retained), bytes);
+    Assert.equal(
+      operations.getOfflineOpForKey(retainedKey, false).operation,
+      acceptedOperation
+    );
     const observed = new PromiseTestUtils.PromiseUrlListener();
     IMAPPump.inbox.updateFolderWithListener(null, observed);
     await observed.promise;
